@@ -158,8 +158,12 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     };
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
-    let summary =
+    let merged_summary =
         merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    // Compress the merged summary to bound its size (max 1200 chars / 24 lines by
+    // default). Without this, repeated compactions accumulate highlights and the
+    // summary grows unbounded, wasting tokens every subsequent turn.
+    let summary = crate::summary_compression::compress_summary_text(&merged_summary);
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -291,13 +295,18 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 
     let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
 
+    // Cap previous highlights to the most recent 9 lines (~3 compaction rounds).
+    // Without this cap, highlights accumulate across every compaction and the
+    // summary grows unbounded between compress_summary calls.
+    const MAX_PREVIOUS_HIGHLIGHT_LINES: usize = 9;
     if !previous_highlights.is_empty() {
         lines.push("- Previously compacted context:".to_string());
-        lines.extend(
+        let capped: Vec<String> = if previous_highlights.len() > MAX_PREVIOUS_HIGHLIGHT_LINES {
+            previous_highlights[previous_highlights.len() - MAX_PREVIOUS_HIGHLIGHT_LINES..].to_vec()
+        } else {
             previous_highlights
-                .into_iter()
-                .map(|line| format!("  {line}")),
-        );
+        };
+        lines.extend(capped.into_iter().map(|line| format!("  {line}")));
     }
 
     if !new_highlights.is_empty() {
@@ -564,7 +573,8 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 mod tests {
     use super::{
         collect_key_files, compact_session, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
+        get_compact_continuation_message, infer_pending_work, merge_compact_summaries,
+        should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -830,5 +840,91 @@ mod tests {
         ]);
         assert_eq!(pending.len(), 1);
         assert!(pending[0].contains("Next: update tests"));
+    }
+
+    #[test]
+    fn compact_session_summary_is_compressed_to_budget() {
+        // Build a session with many long messages so summarize_messages produces
+        // a summary exceeding the default compression budget (1200 chars).
+        let mut session = Session::new();
+        for i in 0..50 {
+            let long_text = format!(
+                "User message number {i} with a very long body. {}",
+                "x".repeat(200)
+            );
+            session.push_user_text(long_text).unwrap();
+            let assistant_msg = ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: format!(
+                        "Assistant response {i} with substantial content. {}",
+                        "y".repeat(200)
+                    ),
+                }],
+                usage: None,
+            };
+            session.push_message(assistant_msg).unwrap();
+        }
+
+        let config = CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 0, // force compaction
+        };
+        let result = compact_session(&session, config);
+        // compress_summary_text default budget is 1200 chars / 24 lines.
+        // The compressed summary should be within budget (allowing some slack
+        // for the continuation message wrapper).
+        assert!(
+            result.summary.chars().count() <= 2_000,
+            "summary should be compressed, got {} chars",
+            result.summary.chars().count()
+        );
+        assert!(
+            result.summary.lines().count() <= 30,
+            "summary should have bounded lines, got {} lines",
+            result.summary.lines().count()
+        );
+    }
+
+    #[test]
+    fn merge_compact_summaries_caps_previous_highlights() {
+        // Build an existing summary with more than 9 highlight lines.
+        let mut existing_lines = vec![
+            "<summary>".to_string(),
+            "Conversation summary:".to_string(),
+            "- Previously compacted context:".to_string(),
+        ];
+        for i in 0..20 {
+            existing_lines.push(format!("  highlight line {i}"));
+        }
+        existing_lines.push("</summary>".to_string());
+        let existing = existing_lines.join("\n");
+
+        let new_summary = "new content";
+        let merged = merge_compact_summaries(Some(&existing), new_summary);
+
+        // Count "highlight line" occurrences in the Previously compacted section.
+        let previously_section = merged
+            .split("- Previously compacted context:")
+            .nth(1)
+            .and_then(|s| s.split("- Newly compacted context:").next())
+            .unwrap_or("");
+        let highlight_count = previously_section
+            .lines()
+            .filter(|l| l.contains("highlight line"))
+            .count();
+        assert!(
+            highlight_count <= 9,
+            "previous highlights should be capped at 9, got {highlight_count}"
+        );
+        // The most recent highlights should be retained (lines 11-19, i.e., 9 lines)
+        assert!(
+            previously_section.contains("highlight line 19"),
+            "most recent highlight should be retained"
+        );
+        assert!(
+            !previously_section.contains("highlight line 0"),
+            "oldest highlight should be dropped"
+        );
     }
 }
