@@ -37,6 +37,7 @@ fn format_compact_boundary_marker(boundary: &CompactBoundary) -> String {
 }
 
 /// Parses the most recent [`CompactBoundary`] marker from a text block, if any.
+#[allow(dead_code)]
 fn parse_compact_boundary_from_text(text: &str) -> Option<CompactBoundary> {
     let marker_start = text.rfind(COMPACT_BOUNDARY_MARKER_PREFIX)?;
     let after_prefix = &text[marker_start + COMPACT_BOUNDARY_MARKER_PREFIX.len()..];
@@ -294,6 +295,7 @@ pub fn get_messages_after_compact_boundary(
 
 /// Extracts the most recent [`CompactBoundary`] from a message slice, if any.
 #[must_use]
+#[allow(dead_code)]
 pub fn extract_compact_boundary(messages: &[ConversationMessage]) -> Option<CompactBoundary> {
     messages
         .iter()
