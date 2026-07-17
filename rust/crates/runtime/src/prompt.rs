@@ -77,6 +77,39 @@ impl SystemPromptSplit {
     pub fn dynamic_render(&self) -> String {
         self.dynamic_sections.join("\n\n")
     }
+
+    /// Build a [`SystemPromptSplit`] from a flat list of sections that already
+    /// contains the `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` marker.
+    ///
+    /// This is the bridge for callers (like `ConversationRuntime`) that hold a
+    /// `Vec<String>` produced by `SystemPromptBuilder::build()` and need to
+    /// recover the static/dynamic partition without re-running the builder.
+    /// The boundary marker is dropped from both sides.
+    ///
+    /// If the boundary marker is absent, all sections end up in
+    /// `static_sections` (defensive — should not happen with the default
+    /// `build` implementation).
+    #[must_use]
+    pub fn from_sections(sections: Vec<String>) -> Self {
+        let mut static_sections = Vec::new();
+        let mut dynamic_sections = Vec::new();
+        let mut past_boundary = false;
+        for section in sections {
+            if section == SYSTEM_PROMPT_DYNAMIC_BOUNDARY {
+                past_boundary = true;
+                continue;
+            }
+            if past_boundary {
+                dynamic_sections.push(section);
+            } else {
+                static_sections.push(section);
+            }
+        }
+        Self {
+            static_sections,
+            dynamic_sections,
+        }
+    }
 }
 
 /// Human-readable default frontier model name embedded into generated prompts.
@@ -624,7 +657,7 @@ mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
         render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ModelFamilyIdentity, ProjectContext, SystemPromptBuilder,
+        ContextFile, ModelFamilyIdentity, ProjectContext, SystemPromptBuilder, SystemPromptSplit,
         SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
@@ -1193,5 +1226,45 @@ mod tests {
                 assert!(!static_rendered.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn from_sections_partitions_at_boundary() {
+        let sections = vec![
+            "static1".to_string(),
+            "static2".to_string(),
+            SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            "dynamic1".to_string(),
+        ];
+        let split = SystemPromptSplit::from_sections(sections);
+        assert_eq!(split.static_sections, vec!["static1", "static2"]);
+        assert_eq!(split.dynamic_sections, vec!["dynamic1"]);
+    }
+
+    #[test]
+    fn from_sections_without_boundary_all_static() {
+        // Defensive: if boundary marker is missing, everything goes to static.
+        let sections = vec!["a".to_string(), "b".to_string()];
+        let split = SystemPromptSplit::from_sections(sections);
+        assert_eq!(split.static_sections, vec!["a", "b"]);
+        assert!(split.dynamic_sections.is_empty());
+    }
+
+    #[test]
+    fn from_sections_empty_input() {
+        let split = SystemPromptSplit::from_sections(Vec::new());
+        assert!(split.static_sections.is_empty());
+        assert!(split.dynamic_sections.is_empty());
+    }
+
+    #[test]
+    fn from_sections_matches_build_split_output() {
+        let builder = SystemPromptBuilder::new()
+            .with_os("linux", "6.1.0")
+            .append_section("# appended");
+        let built = builder.build();
+        let from_sections = SystemPromptSplit::from_sections(built.clone());
+        let build_split = builder.build_split();
+        assert_eq!(from_sections, build_split);
     }
 }

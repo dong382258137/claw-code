@@ -12,6 +12,7 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
+use crate::prompt::SystemPromptSplit;
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
@@ -21,7 +22,7 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
-    pub system_prompt: Vec<String>,
+    pub system_prompt: SystemPromptSplit,
     pub messages: Vec<ConversationMessage>,
 }
 
@@ -354,7 +355,7 @@ where
             }
 
             let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt: SystemPromptSplit::from_sections(self.system_prompt.clone()),
                 messages: self.session.messages.clone(),
             };
             let events = match self.api_client.stream(request) {
@@ -846,7 +847,9 @@ mod tests {
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
     };
-    use crate::prompt::{ProjectContext, SystemPromptBuilder};
+    use crate::prompt::{
+        ProjectContext, SystemPromptBuilder, SystemPromptSplit, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    };
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
@@ -1862,5 +1865,20 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn api_request_carries_system_prompt_split() {
+        let split = SystemPromptSplit::from_sections(vec![
+            "static".to_string(),
+            SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            "dynamic".to_string(),
+        ]);
+        let request = ApiRequest {
+            system_prompt: split,
+            messages: Vec::new(),
+        };
+        assert_eq!(request.system_prompt.static_sections, vec!["static"]);
+        assert_eq!(request.system_prompt.dynamic_sections, vec!["dynamic"]);
     }
 }

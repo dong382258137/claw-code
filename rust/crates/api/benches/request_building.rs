@@ -16,7 +16,7 @@
 use api::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
     translate_message, InputContentBlock, InputMessage, MessageRequest, OpenAiCompatConfig,
-    ToolResultContentBlock,
+    SystemContent, ToolResultContentBlock,
 };
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use serde_json::json;
@@ -67,7 +67,7 @@ fn create_sample_request(message_count: usize) -> MessageRequest {
         max_tokens: 1024,
         messages,
         stream: false,
-        system: Some("You are a helpful assistant.".to_string()),
+        system: Some(SystemContent::from_text("You are a helpful assistant.")),
         temperature: Some(0.7),
         top_p: None,
         tools: None,

@@ -1615,7 +1615,7 @@ mod tests {
     use crate::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
         InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, StreamEvent,
-        ToolChoice, ToolDefinition, ToolResultContentBlock,
+        SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1642,7 +1642,7 @@ mod tests {
                         },
                     ],
                 }],
-                system: Some("be helpful".to_string()),
+                system: Some(SystemContent::from_text("be helpful")),
                 tools: Some(vec![ToolDefinition {
                     name: "weather".to_string(),
                     description: Some("Get weather".to_string()),

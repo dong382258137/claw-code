@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use api::{
     max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, SystemContent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -4734,8 +4734,8 @@ impl ApiClient for ProviderRuntimeClient {
             })
             .collect::<Vec<_>>();
         let messages = convert_messages(&request.messages);
-        let system =
-            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let rendered = request.system_prompt.render();
+        let system = (!rendered.is_empty()).then(|| SystemContent::from_text(rendered));
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;

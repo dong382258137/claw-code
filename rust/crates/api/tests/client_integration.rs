@@ -6,8 +6,8 @@ use std::time::Duration;
 use api::{
     AnthropicClient, ApiClient, ApiError, AuthSource, ContentBlockDelta, ContentBlockDeltaEvent,
     ContentBlockStartEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient, StreamEvent, ToolChoice,
-    ToolDefinition,
+    OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient, StreamEvent, SystemContent,
+    ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use telemetry::{ClientIdentity, MemoryTelemetrySink, SessionTracer, TelemetryEvent};
@@ -123,7 +123,7 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
                     text: "x".repeat(600_000),
                 }],
             }],
-            system: Some("Keep the answer short.".to_string()),
+            system: Some(SystemContent::from_text("Keep the answer short.")),
             tools: None,
             tool_choice: None,
             stream: false,
@@ -911,7 +911,7 @@ fn sample_request(stream: bool) -> MessageRequest {
                 },
             ],
         }],
-        system: Some("Use tools when needed".to_string()),
+        system: Some(SystemContent::from_text("Use tools when needed")),
         tools: Some(vec![ToolDefinition {
             name: "get_weather".to_string(),
             description: Some("Fetches the weather".to_string()),

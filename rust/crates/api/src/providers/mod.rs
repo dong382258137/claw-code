@@ -809,7 +809,7 @@ mod tests {
 
     use crate::error::ApiError;
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
+        InputContentBlock, InputMessage, MessageRequest, SystemContent, ToolChoice, ToolDefinition,
     };
 
     use super::{
@@ -1209,7 +1209,7 @@ mod tests {
                     text: "x".repeat(600_000),
                 }],
             }],
-            system: Some("Keep the answer short.".to_string()),
+            system: Some(SystemContent::from_text("Keep the answer short.")),
             tools: Some(vec![ToolDefinition {
                 name: "weather".to_string(),
                 description: Some("Fetches weather".to_string()),
@@ -1255,7 +1255,7 @@ mod tests {
                     text: "x".repeat(3_900_000),
                 }],
             }],
-            system: Some("Keep the answer short.".to_string()),
+            system: Some(SystemContent::from_text("Keep the answer short.")),
             tools: None,
             tool_choice: None,
             stream: true,
@@ -1344,7 +1344,7 @@ mod tests {
                     text: "x".repeat(1_000_000), // Large input to exceed context window
                 }],
             }],
-            system: Some("Keep the answer short.".to_string()),
+            system: Some(SystemContent::from_text("Keep the answer short.")),
             tools: None,
             tool_choice: None,
             stream: true,
