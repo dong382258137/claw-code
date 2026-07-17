@@ -39,7 +39,9 @@ pub struct TaskPacket {
     pub worktree: Option<String>,
     pub branch_policy: String,
     /// Legacy verification commands kept for compatibility with existing task packets.
-    #[serde(default)]
+    /// Cleared by `validate_packet` in favour of `acceptance_criteria` so the
+    /// canonical representation is the only one serialized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance_tests: Vec<String>,
     /// Human-readable acceptance criteria for the task objective.
     #[serde(default)]
@@ -184,6 +186,11 @@ pub fn validate_packet(packet: TaskPacket) -> Result<ValidatedPacket, TaskPacket
     }
 
     if errors.is_empty() {
+        // `acceptance_tests` is the legacy dual-track alias of `acceptance_criteria`.
+        // Clear it on the validated packet so only the canonical field is serialized,
+        // avoiding duplicate token cost while still accepting legacy input.
+        let mut packet = packet;
+        packet.acceptance_tests.clear();
         Ok(ValidatedPacket(packet))
     } else {
         Err(TaskPacketValidationError::new(errors))
@@ -259,8 +266,42 @@ mod tests {
     fn valid_packet_passes_validation() {
         let packet = sample_packet();
         let validated = validate_packet(packet.clone()).expect("packet should validate");
-        assert_eq!(validated.packet(), &packet);
-        assert_eq!(validated.into_inner(), packet);
+        // validate_packet clears the legacy acceptance_tests dual-track field;
+        // mirror that here so the equality check holds.
+        let mut expected = packet.clone();
+        expected.acceptance_tests.clear();
+        assert_eq!(validated.packet(), &expected);
+        assert_eq!(validated.into_inner(), expected);
+    }
+
+    #[test]
+    fn validate_packet_empties_legacy_dual_fields() {
+        // acceptance_tests (legacy) and acceptance_criteria (canonical) are a
+        // dual-track pair. validate_packet should clear the legacy field so
+        // only the canonical one is serialized.
+        let mut packet = sample_packet();
+        packet.acceptance_tests = vec!["legacy test 1".to_string(), "legacy test 2".to_string()];
+        packet.acceptance_criteria = vec!["canonical criteria".to_string()];
+
+        let validated = validate_packet(packet).expect("valid packet");
+        assert!(
+            validated.packet().acceptance_tests.is_empty(),
+            "legacy acceptance_tests should be cleared after validate_packet"
+        );
+        assert!(
+            !validated.packet().acceptance_criteria.is_empty(),
+            "canonical acceptance_criteria should be preserved"
+        );
+        // Serialized form should omit the empty legacy field entirely.
+        let json =
+            serde_json::to_value(validated.packet()).expect("validated packet should serialize");
+        assert!(
+            json.get("acceptance_tests").is_none()
+                || json["acceptance_tests"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty),
+            "acceptance_tests should be skipped in serialization when empty, got: {json}"
+        );
     }
 
     #[test]

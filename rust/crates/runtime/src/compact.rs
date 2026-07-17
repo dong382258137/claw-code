@@ -327,7 +327,14 @@ fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
         ContentBlock::Thinking { thinking, .. } => {
-            format!("thinking ({} chars)", thinking.chars().count())
+            const MAX_THINKING_SUMMARY_CHARS: usize = 200;
+            let trimmed = thinking.trim();
+            if trimmed.chars().count() <= MAX_THINKING_SUMMARY_CHARS {
+                format!("thinking: {trimmed}")
+            } else {
+                let truncated: String = trimmed.chars().take(MAX_THINKING_SUMMARY_CHARS).collect();
+                format!("thinking: {truncated}…")
+            }
         }
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult {
@@ -491,15 +498,19 @@ fn extract_tag_block(content: &str, tag: &str) -> Option<String> {
 fn strip_tag_block(content: &str, tag: &str) -> String {
     let start = format!("<{tag}>");
     let end = format!("</{tag}>");
-    if let (Some(start_index), Some(end_index_rel)) = (content.find(&start), content.find(&end)) {
-        let end_index = end_index_rel + end.len();
-        let mut stripped = String::new();
-        stripped.push_str(&content[..start_index]);
-        stripped.push_str(&content[end_index..]);
-        stripped
-    } else {
-        content.to_string()
+    let mut result = content.to_string();
+    while let Some(start_idx) = result.find(&start) {
+        let after_start = start_idx + start.len();
+        if let Some(end_offset) = result[after_start..].find(&end) {
+            let end_idx = after_start + end_offset + end.len();
+            result.replace_range(start_idx..end_idx, "");
+        } else {
+            // No closing tag — remove from start tag to end of string.
+            result.replace_range(start_idx.., "");
+            break;
+        }
     }
+    result
 }
 
 fn collapse_blank_lines(content: &str) -> String {
@@ -969,5 +980,66 @@ mod tests {
         // Old code would give CJK 36/4+1=10 vs ASCII 12/4+1=4, wrongly implying
         // CJK uses far more tokens per char than ASCII.
         assert!(ascii_estimated >= 5);
+    }
+
+    #[test]
+    fn summarize_block_preserves_thinking_content() {
+        let block = ContentBlock::Thinking {
+            thinking: "I should consider the edge case where input is empty.".to_string(),
+            signature: None,
+        };
+        let summary = super::summarize_block(&block);
+        assert!(
+            summary.contains("consider the edge case"),
+            "thinking content should be preserved in summary, got: {summary}"
+        );
+        assert!(
+            !summary.contains("chars"),
+            "should not use char count placeholder, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_block_truncates_long_thinking() {
+        let long_thinking = "x".repeat(500);
+        let block = ContentBlock::Thinking {
+            thinking: long_thinking,
+            signature: None,
+        };
+        let summary = super::summarize_block(&block);
+        // Should be truncated, not 500+ chars
+        assert!(
+            summary.chars().count() < 300,
+            "long thinking should be truncated, got {} chars",
+            summary.chars().count()
+        );
+    }
+
+    #[test]
+    fn strip_tag_block_removes_all_occurrences() {
+        let content = "before <foo>first</foo> middle <foo>second</foo> after";
+        let result = super::strip_tag_block(content, "foo");
+        assert_eq!(result, "before  middle  after");
+    }
+
+    #[test]
+    fn strip_tag_block_handles_single_occurrence() {
+        let content = "text <bar>block</bar> end";
+        let result = super::strip_tag_block(content, "bar");
+        assert_eq!(result, "text  end");
+    }
+
+    #[test]
+    fn strip_tag_block_handles_no_match() {
+        let content = "no tags here";
+        let result = super::strip_tag_block(content, "foo");
+        assert_eq!(result, "no tags here");
+    }
+
+    #[test]
+    fn strip_tag_block_handles_unclosed_tag() {
+        let content = "text <foo>unclosed rest";
+        let result = super::strip_tag_block(content, "foo");
+        assert_eq!(result, "text ");
     }
 }
