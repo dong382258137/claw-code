@@ -8725,6 +8725,17 @@ fn build_system_blocks(split: &SystemPromptSplit) -> Option<SystemContent> {
     }
 }
 
+/// Mark the last tool in a list with `cache_control: {type: "ephemeral"}` so
+/// the Anthropic API caches the tools array prefix. No-op for empty lists.
+///
+/// Tools definitions are large (JSON schemas) and stable across turns within
+/// a session, so caching them yields significant input-token savings.
+fn mark_last_tool_with_cache_control(tools: &mut [ToolDefinition]) {
+    if let Some(last) = tools.last_mut() {
+        last.cache_control = Some(CacheControl::ephemeral());
+    }
+}
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -8737,9 +8748,11 @@ impl ApiClient for AnthropicRuntimeClient {
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: build_system_blocks(&request.system_prompt),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            tools: self.enable_tools.then(|| {
+                let mut tools = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+                mark_last_tool_with_cache_control(&mut tools);
+                tools
+            }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
@@ -15187,5 +15200,72 @@ mod system_block_tests {
             cc_pos < dyn_pos,
             "cache_control should precede dynamic content"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_cache_tests {
+    use super::mark_last_tool_with_cache_control;
+    use api::{CacheControl, ToolDefinition};
+
+    #[test]
+    fn marks_last_tool_with_cache_control() {
+        let mut tools = vec![
+            ToolDefinition {
+                name: "tool_a".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            },
+            ToolDefinition {
+                name: "tool_b".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            },
+        ];
+        mark_last_tool_with_cache_control(&mut tools);
+        assert!(
+            tools[0].cache_control.is_none(),
+            "first tool must not be marked"
+        );
+        let cc = tools[1]
+            .cache_control
+            .as_ref()
+            .expect("last tool must be marked");
+        assert_eq!(cc.cache_type, "ephemeral");
+    }
+
+    #[test]
+    fn handles_empty_tool_list() {
+        let mut tools: Vec<ToolDefinition> = Vec::new();
+        // Should not panic
+        mark_last_tool_with_cache_control(&mut tools);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn handles_single_tool() {
+        let mut tools = vec![ToolDefinition {
+            name: "only".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            cache_control: None,
+        }];
+        mark_last_tool_with_cache_control(&mut tools);
+        assert!(tools[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn overwrites_existing_cache_control_on_last_tool() {
+        let mut tools = vec![ToolDefinition {
+            name: "tool".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            cache_control: Some(CacheControl::ephemeral()),
+        }];
+        // Idempotent — calling again should still leave it marked
+        mark_last_tool_with_cache_control(&mut tools);
+        assert!(tools[0].cache_control.is_some());
     }
 }

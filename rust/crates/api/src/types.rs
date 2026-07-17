@@ -122,6 +122,10 @@ pub struct ToolDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: Value,
+    /// Optional cache-control marker. Set on the last tool in a request to
+    /// enable Anthropic prompt caching for the tools array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Anthropic prompt-caching cache control directive.
@@ -561,5 +565,74 @@ mod tests {
         let round: super::SystemContent =
             serde_json::from_value(serde_json::to_value(&content).unwrap()).unwrap();
         assert_eq!(content, round);
+    }
+
+    #[test]
+    fn tool_definition_serializes_without_cache_control_by_default() {
+        let tool = super::ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("Reads a file".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            cache_control: None,
+        };
+        let serialized = serde_json::to_value(&tool).unwrap();
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "name": "read_file",
+                "description": "Reads a file",
+                "input_schema": {"type": "object"}
+            })
+        );
+        // cache_control must be absent (skip_serializing_if)
+        assert!(!serialized
+            .as_object()
+            .unwrap()
+            .contains_key("cache_control"));
+    }
+
+    #[test]
+    fn tool_definition_serializes_with_cache_control_when_set() {
+        let tool = super::ToolDefinition {
+            name: "last_tool".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            cache_control: Some(super::CacheControl::ephemeral()),
+        };
+        let serialized = serde_json::to_value(&tool).unwrap();
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "name": "last_tool",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"}
+            })
+        );
+        // description is None and should be skipped
+        assert!(!serialized.as_object().unwrap().contains_key("description"));
+    }
+
+    #[test]
+    fn tool_definition_deserializes_without_cache_control() {
+        let tool: super::ToolDefinition = serde_json::from_value(serde_json::json!({
+            "name": "read_file",
+            "input_schema": {"type": "object"}
+        }))
+        .unwrap();
+        assert_eq!(tool.name, "read_file");
+        assert!(tool.cache_control.is_none());
+    }
+
+    #[test]
+    fn tool_definition_deserializes_with_cache_control() {
+        let tool: super::ToolDefinition = serde_json::from_value(serde_json::json!({
+            "name": "read_file",
+            "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral"}
+        }))
+        .unwrap();
+        assert_eq!(tool.name, "read_file");
+        let cc = tool.cache_control.expect("cache_control present");
+        assert_eq!(cc.cache_type, "ephemeral");
     }
 }

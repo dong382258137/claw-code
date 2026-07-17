@@ -260,6 +260,7 @@ impl GlobalToolRegistry {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
                 input_schema: spec.input_schema,
+                cache_control: None,
             });
         let runtime = self
             .runtime_tools
@@ -269,6 +270,7 @@ impl GlobalToolRegistry {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 input_schema: tool.input_schema.clone(),
+                cache_control: None,
             });
         let plugin = self
             .plugin_tools
@@ -281,6 +283,7 @@ impl GlobalToolRegistry {
                 name: tool.definition().name.clone(),
                 description: tool.definition().description.clone(),
                 input_schema: tool.definition().input_schema.clone(),
+                cache_control: None,
             });
         builtin.chain(runtime).chain(plugin).collect()
     }
@@ -4731,6 +4734,7 @@ impl ApiClient for ProviderRuntimeClient {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
                 input_schema: spec.input_schema,
+                cache_control: None,
             })
             .collect::<Vec<_>>();
         let messages = convert_messages(&request.messages);

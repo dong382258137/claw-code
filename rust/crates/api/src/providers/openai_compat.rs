@@ -1647,6 +1647,7 @@ mod tests {
                     name: "weather".to_string(),
                     description: Some("Get weather".to_string()),
                     input_schema: json!({"type": "object"}),
+                    cache_control: None,
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
                 stream: false,
