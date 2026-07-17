@@ -28,6 +28,8 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod memory;
+pub mod memory_store;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -112,6 +114,11 @@ pub use mcp_lifecycle_hardened::{
     McpLifecycleValidator, McpPhaseResult,
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
+pub use memory::{
+    detect_conflicts, extract_nudge_actions, should_nudge, MemoryBlock, MemoryEntry,
+    NudgeAction, NudgeConfig, PersistentMemory, UNVERIFIED_THRESHOLD_MS,
+};
+pub use memory_store::MemoryStore;
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,
