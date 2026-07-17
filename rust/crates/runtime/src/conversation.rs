@@ -9,6 +9,9 @@ use crate::compact::{
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::memory::{
+    extract_nudge_actions, should_nudge, NudgeAction, NudgeConfig, PersistentMemory,
+};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
@@ -24,6 +27,35 @@ const MICROCOMPACT_PRESERVE_RECENT: usize = 4;
 /// More aggressive preserve window used when recovering from a prompt-too-long
 /// error. Only the two most recent tool results are kept verbatim.
 const REACTIVE_MICROCOMPACT_PRESERVE_RECENT: usize = 2;
+
+/// Tool specification for the `session_search` tool.
+///
+/// Exposed as a `pub const` so external integrators (e.g. `main.rs`'s
+/// tool registry) can register the tool with the model using the exact
+/// same schema the runtime expects when it intercepts the call. The
+/// runtime handles execution internally via
+/// [`ConversationRuntime::execute_session_search`]; the registry only
+/// needs to surface the tool's name, description, and input schema to
+/// the model.
+pub const SESSION_SEARCH_TOOL_SPEC: &str = r#"{
+    "name": "session_search",
+    "description": "Search the conversation history using full-text search. Use this to recall specific past discussions, decisions, or file references that may not be in the current context window. Returns ranked matches with session ID, role, and content snippet.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Full-text search query. Supports FTS5 syntax: phrases, AND, OR, NOT, and prefix queries (term*)."
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Maximum number of results to return (default: 10).",
+                "default": 10
+            }
+        },
+        "required": ["query"]
+    }
+}"#;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +212,13 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    /// Optional persistent memory surface. When present, the runtime runs a
+    /// rule-based nudge pass every `NudgeConfig::interval_turns` turns to keep
+    /// the memory layer fresh without an LLM call.
+    persistent_memory: Option<PersistentMemory>,
+    /// Turns elapsed since the last nudge fired. Reset to 0 whenever a nudge
+    /// runs.
+    turns_since_last_nudge: usize,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -229,6 +268,8 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            persistent_memory: None,
+            turns_since_last_nudge: 0,
         }
     }
 
@@ -263,6 +304,26 @@ where
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
         self
+    }
+
+    /// Attach a persistent memory surface to the runtime.
+    ///
+    /// When set, the runtime runs a rule-based nudge pass at the end of every
+    /// `NudgeConfig::interval_turns` turns, scanning recent user messages for
+    /// `remember` / `prefer` / correction phrases and applying them to the
+    /// memory layer. The snapshot captured at load time is the only view
+    /// surfaced to the system prompt within the current session, so mid-turn
+    /// mutations do not destabilize the prompt-cache prefix.
+    #[must_use]
+    pub fn with_persistent_memory(mut self, memory: PersistentMemory) -> Self {
+        self.persistent_memory = Some(memory);
+        self
+    }
+
+    /// Borrow the attached persistent memory surface, if any.
+    #[must_use]
+    pub fn persistent_memory(&self) -> Option<&PersistentMemory> {
+        self.persistent_memory.as_ref()
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -508,10 +569,24 @@ where
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
+                        // Intercept `session_search` and route it directly to
+                        // the session's `HistoryIndex`. The tool is implemented
+                        // inside the runtime (not registered with the external
+                        // `ToolExecutor`) so it can read from the session's
+                        // `Arc<HistoryIndex>` without going through a foreign
+                        // dispatcher. All other tool names fall through to the
+                        // standard executor.
                         let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
+                            if tool_name == "session_search" {
+                                match self.execute_session_search(&effective_input) {
+                                    Ok(output) => (output, false),
+                                    Err(error) => (error.to_string(), true),
+                                }
+                            } else {
+                                match self.tool_executor.execute(&tool_name, &effective_input) {
+                                    Ok(output) => (output, false),
+                                    Err(error) => (error.to_string(), true),
+                                }
                             };
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
@@ -581,7 +656,107 @@ where
         };
         self.record_turn_completed(&summary);
 
+        // Periodic nudge: if enough turns have elapsed and we have a
+        // persistent memory surface, scan recent messages for actionable
+        // patterns (user corrections, "remember" keywords, etc.) and apply
+        // them to the memory. This keeps the memory layer fresh without an
+        // LLM call. The frozen snapshot is not touched, so the prompt-cache
+        // prefix stays stable within the session — new facts only surface in
+        // the next session.
+        self.turns_since_last_nudge += 1;
+        let nudge_config = NudgeConfig::default();
+        if let Some(memory) = &mut self.persistent_memory {
+            if should_nudge(self.turns_since_last_nudge, &nudge_config) {
+                let lookback_msgs: Vec<_> = self
+                    .session
+                    .messages
+                    .iter()
+                    .rev()
+                    .take(nudge_config.lookback_turns * 2)
+                    .rev()
+                    .cloned()
+                    .collect();
+                let actions = extract_nudge_actions(&lookback_msgs, memory, &nudge_config);
+                for action in actions {
+                    match action {
+                        NudgeAction::Add { content, source } => {
+                            memory.add_entry(&content, &source);
+                        }
+                        NudgeAction::Replace {
+                            old_pattern,
+                            new_content,
+                            source,
+                        } => {
+                            memory.replace_entry(&old_pattern, &new_content, &source);
+                        }
+                        NudgeAction::Remove { pattern: _ } => {
+                            // Removal not implemented in the rule-based
+                            // version; skip silently.
+                        }
+                    }
+                }
+                self.turns_since_last_nudge = 0;
+            }
+        }
+
         Ok(summary)
+    }
+
+    /// Execute the `session_search` tool: query the FTS5 history index.
+    ///
+    /// Parses a JSON input of the form `{"query": "...", "top_k": 10}`,
+    /// forwards the query to the session's [`HistoryIndex`], and returns
+    /// a human-readable string of ranked matches. Each hit is rendered
+    /// with its session ID, role, FTS5 rank, and a content snippet
+    /// truncated to 500 characters so large tool outputs do not blow up
+    /// the model's context window.
+    ///
+    /// When no `HistoryIndex` is attached to the session, this returns a
+    /// soft-failure message (rather than an error) so the model can
+    /// gracefully fall back to other strategies. Hard errors (invalid
+    /// JSON, missing `query` field, SQLite failures) propagate as
+    /// `Err(Box<dyn Error>)` and the runtime converts them into error
+    /// tool results.
+    fn execute_session_search(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(history_index) = self.session.history_index.as_ref() else {
+            return Ok(
+                "session_search is not available: no history index configured.".to_string(),
+            );
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let query = parsed
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'query' field")?;
+        let top_k = parsed
+            .get("top_k")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as usize;
+
+        let hits = history_index.search(query, top_k)?;
+
+        if hits.is_empty() {
+            return Ok(format!("No matches found for query: '{query}'"));
+        }
+
+        let mut output = format!("Found {} matches for '{}':\n\n", hits.len(), query);
+        for (i, hit) in hits.iter().enumerate() {
+            let snippet: String = hit.content.chars().take(500).collect();
+            output.push_str(&format!(
+                "## Match {} (session: {}, role: {}, rank: {:.3})\n{}\n\n",
+                i + 1,
+                hit.session_id,
+                hit.role,
+                hit.rank,
+                snippet,
+            ));
+        }
+        Ok(output)
     }
 
     #[must_use]
@@ -904,10 +1079,12 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        SessionSearchToolSpec, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::memory::PersistentMemory;
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -2118,5 +2295,377 @@ mod tests {
             boundary.messages_summarized > 0,
             "reactive compaction should have removed at least one message"
         );
+    }
+
+    // ----- session_search tool tests -----
+    //
+    // The runtime intercepts `session_search` tool calls inside `run_turn`
+    // and routes them to the session's `HistoryIndex` (FTS5). The tests
+    // below cover both the direct `execute_session_search` helper and the
+    // end-to-end interception path through `run_turn`.
+
+    /// Minimal API client that never actually streams a real response —
+    /// used for tests that exercise `execute_session_search` directly
+    /// without driving a full `run_turn` loop.
+    struct NoopApi;
+    impl ApiClient for NoopApi {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![
+                AssistantEvent::TextDelta("noop".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    fn open_temp_history_index() -> (tempfile::NamedTempFile, crate::history_search::HistoryIndex)
+    {
+        let file = tempfile::NamedTempFile::new().expect("create temp db file");
+        let index =
+            crate::history_search::HistoryIndex::open(file.path()).expect("open history index");
+        (file, index)
+    }
+
+    #[test]
+    fn session_search_returns_message_when_no_history_index_configured() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        // With no `history_index` attached, the helper returns a soft
+        // failure message (Ok) rather than an Err so the model can recover.
+        let output = runtime
+            .execute_session_search(r#"{"query":"anything"}"#)
+            .expect("soft failure should not propagate as error");
+        assert!(
+            output.contains("session_search is not available"),
+            "missing 'not available' message: {output}"
+        );
+    }
+
+    #[test]
+    fn session_search_returns_results_when_indexed() {
+        let (_file, index) = open_temp_history_index();
+        index
+            .index_message(
+                "How do I configure the rust toolchain?",
+                "sess-a",
+                "user",
+                0,
+                1_000,
+            )
+            .expect("index msg 0");
+        index
+            .index_message(
+                "You can use rustup to configure the rust toolchain.",
+                "sess-a",
+                "assistant",
+                1,
+                2_000,
+            )
+            .expect("index msg 1");
+
+        let session = Session::new().with_history_index(Arc::new(index));
+        let runtime = ConversationRuntime::new(
+            session,
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let output = runtime
+            .execute_session_search(r#"{"query":"rust toolchain","top_k":5}"#)
+            .expect("search should succeed");
+        assert!(
+            output.contains("Found 2 matches"),
+            "expected 2 matches in output: {output}"
+        );
+        assert!(
+            output.contains("configure the rust toolchain"),
+            "user message missing from output: {output}"
+        );
+        assert!(
+            output.contains("rustup to configure"),
+            "assistant message missing from output: {output}"
+        );
+        assert!(
+            output.contains("session: sess-a"),
+            "session id missing from output: {output}"
+        );
+        assert!(
+            output.contains("role: user"),
+            "user role missing from output: {output}"
+        );
+        assert!(
+            output.contains("role: assistant"),
+            "assistant role missing from output: {output}"
+        );
+        // Each hit should carry a rank (FTS5 BM25 score).
+        assert!(
+            output.contains("rank:"),
+            "rank missing from output: {output}"
+        );
+    }
+
+    #[test]
+    fn session_search_handles_invalid_json() {
+        let (_file, index) = open_temp_history_index();
+
+        let session = Session::new().with_history_index(Arc::new(index));
+        let runtime = ConversationRuntime::new(
+            session,
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .execute_session_search("this is not json")
+            .expect_err("invalid JSON should propagate as error");
+        assert!(
+            error.to_string().contains("invalid input JSON"),
+            "expected invalid JSON error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn session_search_errors_when_query_field_missing() {
+        let (_file, index) = open_temp_history_index();
+
+        let session = Session::new().with_history_index(Arc::new(index));
+        let runtime = ConversationRuntime::new(
+            session,
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .execute_session_search(r#"{"top_k":5}"#)
+            .expect_err("missing 'query' field should propagate as error");
+        assert!(
+            error.to_string().contains("missing 'query' field"),
+            "expected missing 'query' error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn session_search_returns_no_matches_message_when_index_empty() {
+        let (_file, index) = open_temp_history_index();
+
+        let session = Session::new().with_history_index(Arc::new(index));
+        let runtime = ConversationRuntime::new(
+            session,
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let output = runtime
+            .execute_session_search(r#"{"query":"nonexistentterm"}"#)
+            .expect("empty results should be a soft success");
+        assert!(
+            output.contains("No matches found"),
+            "expected 'no matches' message: {output}"
+        );
+    }
+
+    /// End-to-end test: the API client emits a `session_search` tool_use,
+    /// the runtime intercepts it (bypassing `StaticToolExecutor` which has
+    /// no handler registered), routes it to the `HistoryIndex`, and
+    /// forwards the formatted result back to the model on the next call.
+    #[test]
+    fn run_turn_intercepts_session_search_tool_call() {
+        struct SearchApi {
+            calls: usize,
+        }
+        impl ApiClient for SearchApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "session_search".to_string(),
+                            input: r#"{"query":"rust toolchain"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        // The tool result must have been inserted with the
+                        // formatted FTS5 hits before the second API call.
+                        let last = request.messages.last().expect("tool result present");
+                        assert_eq!(last.role, MessageRole::Tool);
+                        let output = match &last.blocks[0] {
+                            ContentBlock::ToolResult { output, .. } => output.clone(),
+                            _ => panic!("expected tool result block"),
+                        };
+                        assert!(
+                            output.contains("Found 2 matches"),
+                            "expected matches in tool result: {output}"
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("here is what I found".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("unexpected extra API call"),
+                }
+            }
+        }
+
+        let (_file, index) = open_temp_history_index();
+        index
+            .index_message(
+                "configure the rust toolchain",
+                "sess-a",
+                "user",
+                0,
+                1_000,
+            )
+            .expect("index msg 0");
+        index
+            .index_message(
+                "use rustup to configure the rust toolchain",
+                "sess-a",
+                "assistant",
+                1,
+                2_000,
+            )
+            .expect("index msg 1");
+
+        let session = Session::new().with_history_index(Arc::new(index));
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SearchApi { calls: 0 },
+            // Intentionally empty: session_search must NOT fall through to
+            // this executor. If it did, StaticToolExecutor would return
+            // "unknown tool: session_search" and the test would fail.
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("find prior rust discussion", None)
+            .expect("turn should complete");
+
+        assert_eq!(summary.iterations, 2);
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(
+            !*is_error,
+            "session_search should not produce an error result: {output}"
+        );
+        assert!(
+            output.contains("Found 2 matches"),
+            "missing matches in tool result: {output}"
+        );
+    }
+
+    // ----- Periodic nudge integration with run_turn -----
+
+    #[test]
+    fn nudge_applies_remember_keyword_to_persistent_memory() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let memory_path = temp_session_path("nudge-memory");
+        let memory = PersistentMemory::empty(&memory_path);
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(memory);
+
+        // Pre-warm the turn counter so the very next turn triggers a nudge
+        // (NudgeConfig::default().interval_turns == 5).
+        runtime.turns_since_last_nudge = 4;
+
+        runtime
+            .run_turn("remember to use tabs not spaces", None)
+            .expect("turn should succeed");
+
+        let memory = runtime
+            .persistent_memory()
+            .expect("persistent memory should be attached");
+        let has_tabs_entry = memory
+            .entries()
+            .iter()
+            .any(|entry| entry.content.contains("tabs"));
+        assert!(
+            has_tabs_entry,
+            "persistent memory should contain a 'tabs' entry after nudge: {:?}",
+            memory.entries()
+        );
+
+        let _ = std::fs::remove_file(&memory_path);
+    }
+
+    #[test]
+    fn nudge_skips_when_no_persistent_memory() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        // No persistent_memory attached — the nudge branch must be skipped
+        // without panicking even after the interval elapses.
+
+        for i in 0..6 {
+            runtime
+                .run_turn(format!("turn {i}"), None)
+                .expect("turn should succeed");
+        }
+
+        // Sanity check: still no memory surface, and we did not panic.
+        assert!(runtime.persistent_memory().is_none());
     }
 }
