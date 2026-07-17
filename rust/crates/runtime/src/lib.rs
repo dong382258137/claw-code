@@ -38,6 +38,7 @@ mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
 mod remote;
+pub mod repomap;
 mod report_schema;
 pub mod sandbox;
 mod session;
