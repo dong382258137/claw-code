@@ -124,6 +124,100 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
+/// Anthropic prompt-caching cache control directive.
+///
+/// Currently only `{"type": "ephemeral"}` is supported by the Anthropic API.
+/// The 30-minute TTL is managed server-side; clients only need to mark the
+/// block boundary with this marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheControl {
+    /// Always `"ephemeral"` today. Renamed to `type` in JSON to match the
+    /// Anthropic wire format.
+    #[serde(rename = "type")]
+    pub cache_type: String,
+}
+
+impl CacheControl {
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        Self {
+            cache_type: "ephemeral".to_string(),
+        }
+    }
+}
+
+impl Default for CacheControl {
+    fn default() -> Self {
+        Self::ephemeral()
+    }
+}
+
+/// A single text block inside the `system` field of an Anthropic request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemBlock {
+    /// Block discriminator. Always `"text"` for now; kept explicit so future
+    /// block kinds (e.g. image) slot in without reshaping the wire format.
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl SystemBlock {
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            block_type: "text".to_string(),
+            text: text.into(),
+            cache_control: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_cache_control(mut self, cc: CacheControl) -> Self {
+        self.cache_control = Some(cc);
+        self
+    }
+}
+
+/// The `system` field of a `MessageRequest`, in either legacy plain-string
+/// form or the modern block-array form that can carry `cache_control`.
+///
+/// Uses `#[serde(untagged)]` so that:
+/// - `Text("...")` serializes to a bare JSON string `"..."` (backward compat)
+/// - `Blocks([...])` serializes to a JSON array of block objects
+///
+/// Deserialization tries `Blocks` first (array shape) then falls back to
+/// `Text` (string shape). This matches Anthropic's accepted request schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SystemContent {
+    Text(String),
+    Blocks(Vec<SystemBlock>),
+}
+
+impl SystemContent {
+    #[must_use]
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    #[must_use]
+    pub fn from_blocks(blocks: Vec<SystemBlock>) -> Self {
+        Self::Blocks(blocks)
+    }
+
+    /// True if the content carries no text (empty string or empty block list).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(s) => s.is_empty(),
+            Self::Blocks(blocks) => blocks.is_empty(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {
@@ -351,5 +445,121 @@ mod tests {
             })
         );
         assert_eq!(deserialized, block);
+    }
+
+    #[test]
+    fn cache_control_serializes_with_ephemeral_type() {
+        let cc = super::CacheControl::ephemeral();
+        let serialized = serde_json::to_value(&cc).unwrap();
+        assert_eq!(serialized, serde_json::json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn cache_control_default_is_ephemeral() {
+        let cc = super::CacheControl::default();
+        assert_eq!(cc.cache_type, "ephemeral");
+    }
+
+    #[test]
+    fn system_block_serializes_with_optional_cache_control() {
+        let block_without_cc = super::SystemBlock {
+            block_type: "text".to_string(),
+            text: "static rules".to_string(),
+            cache_control: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&block_without_cc).unwrap(),
+            serde_json::json!({"type": "text", "text": "static rules"})
+        );
+
+        let block_with_cc = super::SystemBlock {
+            block_type: "text".to_string(),
+            text: "dynamic context".to_string(),
+            cache_control: Some(super::CacheControl::ephemeral()),
+        };
+        assert_eq!(
+            serde_json::to_value(&block_with_cc).unwrap(),
+            serde_json::json!({
+                "type": "text",
+                "text": "dynamic context",
+                "cache_control": {"type": "ephemeral"}
+            })
+        );
+    }
+
+    #[test]
+    fn system_content_text_variant_serializes_as_plain_string() {
+        // SystemContent::Text must serialize as a bare JSON string to remain
+        // backward-compatible with Anthropic's `system: "..."` plain-string form.
+        let content = super::SystemContent::Text("hello".to_string());
+        let serialized = serde_json::to_value(&content).unwrap();
+        assert_eq!(serialized, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn system_content_blocks_variant_serializes_as_array() {
+        let content = super::SystemContent::Blocks(vec![
+            super::SystemBlock {
+                block_type: "text".to_string(),
+                text: "static".to_string(),
+                cache_control: None,
+            },
+            super::SystemBlock {
+                block_type: "text".to_string(),
+                text: "dynamic".to_string(),
+                cache_control: Some(super::CacheControl::ephemeral()),
+            },
+        ]);
+        let serialized = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            serialized,
+            serde_json::json!([
+                {"type": "text", "text": "static"},
+                {
+                    "type": "text",
+                    "text": "dynamic",
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn system_content_deserializes_from_plain_string() {
+        let content: super::SystemContent =
+            serde_json::from_value(serde_json::json!("hello")).unwrap();
+        assert_eq!(content, super::SystemContent::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn system_content_deserializes_from_block_array() {
+        let content: super::SystemContent = serde_json::from_value(serde_json::json!([
+            {"type": "text", "text": "a"},
+            {
+                "type": "text",
+                "text": "b",
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]))
+        .unwrap();
+        match content {
+            super::SystemContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].text, "a");
+                assert!(blocks[0].cache_control.is_none());
+                assert_eq!(blocks[1].text, "b");
+                assert!(blocks[1].cache_control.is_some());
+            }
+            other => panic!("expected Blocks variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_content_text_requires_non_empty_for_blocks_fallback() {
+        // Edge case: an empty string should round-trip as Text, not be rejected.
+        let content = super::SystemContent::Text(String::new());
+        let round: super::SystemContent =
+            serde_json::from_value(serde_json::to_value(&content).unwrap()).unwrap();
+        assert_eq!(content, round);
     }
 }
