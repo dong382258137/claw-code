@@ -4,8 +4,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::history_search::HistoryIndex;
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
 use serde::{Deserialize, Serialize};
@@ -130,6 +132,11 @@ pub struct Session {
     pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
     persistence: Option<SessionPersistence>,
+    /// Optional FTS5 history search index. When present, persisted messages
+    /// are mirrored into the index inside `append_persisted_message` so
+    /// callers can recall past turns via full-text search. The `Arc` allows
+    /// the index to be shared between the session and external readers.
+    pub history_index: Option<Arc<HistoryIndex>>,
 }
 
 impl PartialEq for Session {
@@ -199,6 +206,7 @@ impl Session {
             last_health_check_ms: None,
             model: None,
             persistence: None,
+            history_index: None,
         }
     }
 
@@ -216,6 +224,18 @@ impl Session {
     #[must_use]
     pub fn with_workspace_root(mut self, workspace_root: impl Into<PathBuf>) -> Self {
         self.workspace_root = Some(workspace_root.into());
+        self
+    }
+
+    /// Attach an FTS5 history search index to this session.
+    ///
+    /// When set, every message persisted via `push_message` is mirrored
+    /// into the index so callers can recall past turns via full-text
+    /// search. The index is shared via `Arc` so external readers (e.g.
+    /// a recall tool) can query the same handle concurrently.
+    #[must_use]
+    pub fn with_history_index(mut self, index: Arc<HistoryIndex>) -> Self {
+        self.history_index = Some(index);
         self
     }
 
@@ -332,6 +352,7 @@ impl Session {
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
             persistence: None,
+            history_index: None,
         }
     }
 
@@ -456,6 +477,7 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            history_index: None,
         })
     }
 
@@ -557,6 +579,7 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            history_index: None,
         })
     }
 
@@ -608,6 +631,31 @@ impl Session {
 
         let mut file = OpenOptions::new().append(true).open(path)?;
         writeln!(file, "{}", message_record(message).render())?;
+
+        // FTS5 history index hook: mirror the message into the full-text
+        // index so it can be recalled later via `HistoryIndex::search`.
+        // Errors are swallowed here because a failure to index must not
+        // break session persistence (the JSONL write above already
+        // succeeded).
+        if let Some(history_index) = &self.history_index {
+            let content = extract_indexable_text(message);
+            let role = match message.role {
+                MessageRole::System => "system",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Tool => "tool",
+            };
+            let message_index = self.messages.len().saturating_sub(1);
+            let timestamp_ms = self.updated_at_ms;
+            let _ = history_index.index_message(
+                &content,
+                &self.session_id,
+                role,
+                message_index,
+                timestamp_ms,
+            );
+        }
+
         Ok(())
     }
 
@@ -1007,6 +1055,34 @@ fn message_record(message: &ConversationMessage) -> JsonValue {
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
     object.insert("message".to_string(), persisted_message_json(message));
     JsonValue::Object(object)
+}
+
+/// Flatten a message's content blocks into a single searchable string for
+/// the FTS5 history index.
+///
+/// `Text`, `Thinking`, `ToolUse` (name + input), and `ToolResult` (tool
+/// name + output) blocks are all concatenated so that both natural
+/// language and tool I/O remain recallable. Blocks are joined with
+/// newlines.
+fn extract_indexable_text(message: &ConversationMessage) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for block in &message.blocks {
+        match block {
+            ContentBlock::Text { text } => parts.push(text.clone()),
+            ContentBlock::Thinking { thinking, .. } => parts.push(thinking.clone()),
+            ContentBlock::ToolUse { name, input, .. } => {
+                parts.push(name.clone());
+                parts.push(input.clone());
+            }
+            ContentBlock::ToolResult {
+                tool_name, output, ..
+            } => {
+                parts.push(tool_name.clone());
+                parts.push(output.clone());
+            }
+        }
+    }
+    parts.join("\n")
 }
 
 fn persisted_message_json(message: &ConversationMessage) -> JsonValue {

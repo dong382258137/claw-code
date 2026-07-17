@@ -18,6 +18,7 @@ pub mod g004_conformance;
 mod git_context;
 pub mod green_contract;
 mod hooks;
+pub mod history_search;
 mod json;
 mod lane_events;
 pub mod lsp_client;
@@ -87,6 +88,7 @@ pub use file_ops::{
     ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
+pub use history_search::{HistoryHit, HistoryIndex, HistoryIndexError};
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
