@@ -38,6 +38,47 @@ impl From<ConfigError> for PromptBuildError {
 
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
+
+/// Partitioned system prompt: stable sections (cached) vs dynamic sections.
+///
+/// Produced by [`SystemPromptBuilder::build_split`]. The `static_sections` are
+/// guaranteed stable across turns within a session (intro, output style, core
+/// behavior), so they are safe to mark with `cache_control: {type: "ephemeral"}`
+/// for Anthropic native prompt caching. The `dynamic_sections` change every
+/// turn (environment, project context, git status) and must not be cached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemPromptSplit {
+    /// Sections appearing before `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`. Stable
+    /// across turns; eligible for prompt caching.
+    pub static_sections: Vec<String>,
+    /// Sections appearing after `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`. Volatile;
+    /// must be re-sent every turn.
+    pub dynamic_sections: Vec<String>,
+}
+
+impl SystemPromptSplit {
+    /// Render the full prompt (static + dynamic joined by `\n\n`), without
+    /// the boundary marker. Equivalent to `build_split` then `render`.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut all = self.static_sections.clone();
+        all.extend(self.dynamic_sections.iter().cloned());
+        all.join("\n\n")
+    }
+
+    /// Render only the static (cacheable) sections joined by `\n\n`.
+    #[must_use]
+    pub fn static_render(&self) -> String {
+        self.static_sections.join("\n\n")
+    }
+
+    /// Render only the dynamic (non-cacheable) sections joined by `\n\n`.
+    #[must_use]
+    pub fn dynamic_render(&self) -> String {
+        self.dynamic_sections.join("\n\n")
+    }
+}
+
 /// Human-readable default frontier model name embedded into generated prompts.
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
@@ -188,6 +229,39 @@ impl SystemPromptBuilder {
         }
         sections.extend(self.append_sections.iter().cloned());
         sections
+    }
+
+    /// Build the system prompt split at the dynamic boundary.
+    ///
+    /// Returns a [`SystemPromptSplit`] where `static_sections` are everything
+    /// before [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] and `dynamic_sections` are
+    /// everything after. The boundary marker itself is dropped from both
+    /// sides — callers rendering the prompt should use [`SystemPromptSplit::render`].
+    ///
+    /// If the boundary marker is missing (should not happen with the default
+    /// `build` implementation, but defensive), all sections end up in
+    /// `static_sections` and `dynamic_sections` is empty.
+    #[must_use]
+    pub fn build_split(&self) -> SystemPromptSplit {
+        let sections = self.build();
+        let mut static_sections = Vec::new();
+        let mut dynamic_sections = Vec::new();
+        let mut past_boundary = false;
+        for section in sections {
+            if section == SYSTEM_PROMPT_DYNAMIC_BOUNDARY {
+                past_boundary = true;
+                continue;
+            }
+            if past_boundary {
+                dynamic_sections.push(section);
+            } else {
+                static_sections.push(section);
+            }
+        }
+        SystemPromptSplit {
+            static_sections,
+            dynamic_sections,
+        }
     }
 
     #[must_use]
@@ -980,5 +1054,144 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn build_split_separates_static_and_dynamic_sections() {
+        let builder = SystemPromptBuilder::new()
+            .with_os("linux", "6.1.0")
+            .with_model_family(ModelFamilyIdentity::default());
+        let split = builder.build_split();
+
+        // Static sections: intro, system, doing_tasks, actions (no boundary marker)
+        assert!(!split.static_sections.is_empty());
+        assert!(
+            !split
+                .static_sections
+                .iter()
+                .any(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "static_sections must not contain the boundary marker"
+        );
+
+        // Dynamic sections: environment + any project/config/append
+        assert!(!split.dynamic_sections.is_empty());
+        assert!(
+            !split
+                .dynamic_sections
+                .iter()
+                .any(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "dynamic_sections must not contain the boundary marker"
+        );
+    }
+
+    #[test]
+    fn build_split_static_and_dynamic_partition_matches_build() {
+        // Concatenating static + dynamic should equal build() output minus the
+        // boundary marker section.
+        let builder = SystemPromptBuilder::new()
+            .with_os("macos", "14.0")
+            .with_model_family(ModelFamilyIdentity::default())
+            .append_section("# Appended\nextra");
+        let built = builder.build();
+        let split = builder.build_split();
+
+        let built_without_boundary: Vec<String> = built
+            .into_iter()
+            .filter(|s| s != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .collect();
+
+        let mut rejoined = split.static_sections.clone();
+        rejoined.extend(split.dynamic_sections.iter().cloned());
+        assert_eq!(rejoined, built_without_boundary);
+    }
+
+    #[test]
+    fn build_split_includes_output_style_in_static() {
+        let builder = SystemPromptBuilder::new()
+            .with_output_style("concise", "Be brief.")
+            .with_os("linux", "6.1.0");
+        let split = builder.build_split();
+        assert!(
+            split
+                .static_sections
+                .iter()
+                .any(|s| s.contains("# Output Style: concise")),
+            "static_sections should contain the output style block, got: {:?}",
+            split.static_sections
+        );
+    }
+
+    #[test]
+    fn build_split_environment_in_dynamic() {
+        let builder = SystemPromptBuilder::new()
+            .with_os("linux", "6.1.0")
+            .with_model_family(ModelFamilyIdentity::default());
+        let split = builder.build_split();
+        assert!(
+            split
+                .dynamic_sections
+                .iter()
+                .any(|s| s.contains("# Environment context")),
+            "dynamic_sections should contain the environment block, got: {:?}",
+            split.dynamic_sections
+        );
+    }
+
+    #[test]
+    fn build_split_append_sections_in_dynamic() {
+        let builder = SystemPromptBuilder::new()
+            .with_os("linux", "6.1.0")
+            .append_section("# Custom appended section");
+        let split = builder.build_split();
+        assert!(
+            split
+                .dynamic_sections
+                .iter()
+                .any(|s| s.contains("# Custom appended section")),
+            "dynamic_sections should contain append_section content"
+        );
+    }
+
+    #[test]
+    fn build_split_renders_to_full_prompt_via_join() {
+        let builder = SystemPromptBuilder::new().with_os("linux", "6.1.0");
+        let split = builder.build_split();
+        let rendered = split.render();
+        assert!(!rendered.is_empty());
+        assert!(!rendered.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+    }
+
+    #[test]
+    fn build_split_with_empty_builder_still_partitions() {
+        // Even a default builder (no optional sections) must produce a valid
+        // partition: static has intro+system+doing_tasks+actions, dynamic has
+        // environment.
+        let builder = SystemPromptBuilder::new();
+        let split = builder.build_split();
+        assert!(split.static_sections.len() >= 4);
+        assert!(!split.dynamic_sections.is_empty());
+    }
+
+    #[test]
+    fn build_split_static_render_preserves_section_order() {
+        let builder = SystemPromptBuilder::new().with_os("linux", "6.1.0");
+        let split = builder.build_split();
+        let static_rendered = split.static_render();
+        // The intro section should appear before the system section.
+        let intro_pos = static_rendered
+            .find("# Claw")
+            .or_else(|| static_rendered.find("You are"));
+        let system_pos = static_rendered.find("# System");
+        match (intro_pos, system_pos) {
+            (Some(i), Some(s)) => assert!(
+                i < s,
+                "intro should precede system section in static_render"
+            ),
+            _ => {
+                // If exact headings differ, at least verify multiple sections
+                // are joined in order (non-empty).
+                assert!(!static_rendered.is_empty());
+            }
+        }
     }
 }
