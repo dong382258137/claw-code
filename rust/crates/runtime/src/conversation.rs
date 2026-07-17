@@ -18,6 +18,9 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+/// Number of recent tool results kept verbatim by the microcompact pass that
+/// runs at the end of every turn, before auto-compaction is considered.
+const MICROCOMPACT_PRESERVE_RECENT: usize = 4;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,6 +482,15 @@ where
                 tool_results.push(result_message);
             }
         }
+
+        // Apply microcompact to summarize aged tool results before considering
+        // full auto-compaction. This is a lighter pass that replaces old
+        // Read/Bash/Grep/Glob/LS outputs with one-line summaries, keeping the
+        // recent `MICROCOMPACT_PRESERVE_RECENT` tool results verbatim. Edit /
+        // Write / Delete and error results are always preserved.
+        let microcompacted =
+            crate::compact::microcompact(&self.session.messages, MICROCOMPACT_PRESERVE_RECENT);
+        self.session.messages = microcompacted;
 
         let auto_compaction = self.maybe_auto_compact();
 

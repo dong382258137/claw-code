@@ -1,5 +1,6 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
@@ -312,6 +313,123 @@ fn current_time_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
+}
+
+// ---- Microcompact: tool result summarization ----
+
+/// Tool names whose outputs are safe to summarize once they age out of the
+/// recent window. These tools produce large read-only payloads (file contents,
+/// command output, search hits) that are not needed verbatim in later turns.
+const SUMMARIZABLE_TOOLS: &[&str] = &["Read", "Bash", "Grep", "Glob", "LS"];
+
+/// Tool names whose results must never be summarized because the verbatim
+/// output is required for the model to reason about subsequent state changes.
+const CRITICAL_TOOLS: &[&str] = &["Edit", "Write", "Delete"];
+
+/// Returns true when `tool_name` produces high-volume read-only output that is
+/// safe to summarize.
+fn is_summarizable_tool(tool_name: &str) -> bool {
+    SUMMARIZABLE_TOOLS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(tool_name))
+}
+
+/// Returns true when `tool_name` performs state mutations whose results must be
+/// preserved verbatim.
+fn is_critical_tool(tool_name: &str) -> bool {
+    CRITICAL_TOOLS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(tool_name))
+}
+
+/// Returns true when `output` already looks like a microcompact summary, so we
+/// avoid re-summarizing an already-summarized result.
+fn is_already_summarized(output: &str) -> bool {
+    output.starts_with('[')
+        && output.contains(" output summarized: ")
+        && output.ends_with("…]")
+        && output.contains(" chars → ")
+}
+
+/// Builds the summary placeholder for an aged tool result.
+#[must_use]
+fn format_tool_result_summary(tool_name: &str, output: &str) -> String {
+    let original_len = output.chars().count();
+    let first_line = output.lines().next().unwrap_or("").trim();
+    format!("[{tool_name} output summarized: {original_len} chars → {first_line}…]")
+}
+
+/// Summarize old tool results to free context before full compaction.
+///
+/// - `Read`/`Bash`/`Grep`/`Glob`/`LS` results older than `preserve_recent`
+///   turns are replaced with a one-line summary placeholder.
+/// - `Edit`/`Write`/`Delete` results are kept verbatim so the model can still
+///   reason about state changes.
+/// - Tool results with `is_error = true` are always kept verbatim.
+/// - The most recent `preserve_recent` tool results (of any kind) are kept
+///   verbatim so the active working set remains visible.
+#[must_use]
+pub fn microcompact(
+    messages: &[ConversationMessage],
+    preserve_recent: usize,
+) -> Vec<ConversationMessage> {
+    // Collect the indices of messages that contain at least one ToolResult
+    // block. Each such message is treated as one "tool result unit" for the
+    // recency window.
+    let tool_result_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    // The most recent `preserve_recent` tool-result messages are kept intact.
+    // Older ones become candidates for summarization.
+    let preserve_count = preserve_recent.min(tool_result_indices.len());
+    let cutoff = tool_result_indices.len().saturating_sub(preserve_count);
+    let summarize_candidates: HashSet<usize> = tool_result_indices[..cutoff]
+        .iter()
+        .copied()
+        .collect();
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(idx, message)| {
+            if !summarize_candidates.contains(&idx) {
+                return message.clone();
+            }
+            let mut new_message = message.clone();
+            for block in &mut new_message.blocks {
+                let ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error,
+                    ..
+                } = block
+                else {
+                    continue;
+                };
+                // Critical tools (Edit/Write/Delete) and errors are always kept
+                // intact, even when old. Already-summarized outputs are left
+                // alone to avoid double-summarization.
+                if *is_error
+                    || is_critical_tool(tool_name)
+                    || !is_summarizable_tool(tool_name)
+                    || is_already_summarized(output)
+                {
+                    continue;
+                }
+                *output = format_tool_result_summary(tool_name, output);
+            }
+            new_message
+        })
+        .collect()
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {
@@ -723,7 +841,7 @@ mod tests {
         collect_key_files, compact_session, compact_session_with_trigger, estimate_message_tokens,
         extract_compact_boundary, format_compact_summary, get_compact_continuation_message,
         get_messages_after_compact_boundary, infer_pending_work, merge_compact_summaries,
-        should_compact, CompactBoundary, CompactTrigger, CompactionConfig,
+        microcompact, should_compact, CompactBoundary, CompactTrigger, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -1392,5 +1510,220 @@ mod tests {
             extracted.contains("earlier work summary"),
             "extracted summary should contain the summary text: {extracted}"
         );
+    }
+
+    // ---- P1-4: Microcompact tests ----
+
+    #[test]
+    fn microcompact_preserves_recent_tool_results() {
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result("1", "Read", "line1\nline2", false),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Read", "recent1\nrecent2", false),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("3", "Read", "newest\nnewest2", false),
+        ];
+
+        let result = microcompact(&messages, 2);
+        // The last 2 tool results must be preserved verbatim.
+        let tool_results: Vec<_> = result
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 3);
+        // Oldest one (index 0) should be summarized.
+        assert!(
+            tool_results[0].contains("summarized"),
+            "oldest tool result should be summarized, got: {}",
+            tool_results[0]
+        );
+        // Recent two should be intact.
+        assert_eq!(tool_results[1], "recent1\nrecent2");
+        assert_eq!(tool_results[2], "newest\nnewest2");
+    }
+
+    #[test]
+    fn microcompact_summarizes_old_read_results() {
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result(
+                "1",
+                "Read",
+                "file contents line 1\nfile contents line 2\nline 3",
+                false,
+            ),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Read", "recent", false),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("3", "Read", "newest", false),
+            ConversationMessage::user_text("q4"),
+            ConversationMessage::tool_result("4", "Read", "newest2", false),
+        ];
+
+        let result = microcompact(&messages, 2);
+        let old_tool_result = &result[1].blocks[0];
+        let ContentBlock::ToolResult {
+            tool_name,
+            output,
+            is_error,
+            ..
+        } = old_tool_result
+        else {
+            panic!("expected tool result");
+        };
+        assert_eq!(tool_name, "Read");
+        assert!(!*is_error);
+        assert!(
+            output.contains("[Read output summarized:"),
+            "old Read result should be summarized, got: {output}"
+        );
+        assert!(
+            output.contains("chars →"),
+            "summary should include char count and first line, got: {output}"
+        );
+        assert!(
+            output.contains("file contents line 1"),
+            "summary should include first line, got: {output}"
+        );
+    }
+
+    #[test]
+    fn microcompact_keeps_edit_write_results_intact() {
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result(
+                "1",
+                "Edit",
+                "The file has been updated successfully.",
+                false,
+            ),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Write", "File written.", false),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("3", "Read", "recent read", false),
+        ];
+
+        // preserve_recent=1 means only the last tool result is "recent".
+        // The Edit and Write results are old but must remain intact.
+        let result = microcompact(&messages, 1);
+        let edit_result = &result[1].blocks[0];
+        let ContentBlock::ToolResult { output, .. } = edit_result else {
+            panic!("expected edit tool result");
+        };
+        assert_eq!(
+            *output,
+            "The file has been updated successfully.",
+            "Edit result must be preserved verbatim even when old"
+        );
+
+        let write_result = &result[3].blocks[0];
+        let ContentBlock::ToolResult { output, .. } = write_result else {
+            panic!("expected write tool result");
+        };
+        assert_eq!(
+            *output,
+            "File written.",
+            "Write result must be preserved verbatim even when old"
+        );
+    }
+
+    #[test]
+    fn microcompact_preserves_error_results() {
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result("1", "Read", "Error: file not found", true),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Read", "recent", false),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("3", "Read", "newest", false),
+        ];
+
+        // preserve_recent=1: only the last Read is recent.
+        // The error result (index 1) is old but must be preserved.
+        let result = microcompact(&messages, 1);
+        let error_result = &result[1].blocks[0];
+        let ContentBlock::ToolResult {
+            output,
+            is_error,
+            ..
+        } = error_result
+        else {
+            panic!("expected tool result");
+        };
+        assert!(
+            *is_error,
+            "error flag must be preserved on old error results"
+        );
+        assert_eq!(
+            *output,
+            "Error: file not found",
+            "error tool result must be preserved verbatim even when old"
+        );
+    }
+
+    #[test]
+    fn microcompact_does_not_double_summarize() {
+        let already_summarized =
+            "[Read output summarized: 100 chars → first line…]";
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result("1", "Read", already_summarized, false),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Read", "recent", false),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("3", "Read", "newest", false),
+        ];
+
+        let result = microcompact(&messages, 2);
+        let old_result = &result[1].blocks[0];
+        let ContentBlock::ToolResult { output, .. } = old_result else {
+            panic!("expected tool result");
+        };
+        assert_eq!(
+            *output,
+            already_summarized,
+            "already-summarized output should not be re-summarized"
+        );
+    }
+
+    #[test]
+    fn microcompact_preserves_bash_and_grep_results_when_recent() {
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result("1", "Bash", "command output", false),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Grep", "grep match", false),
+        ];
+
+        // preserve_recent=2: both are recent, neither should be summarized.
+        let result = microcompact(&messages, 2);
+        let bash_output = match &result[1].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => panic!("expected bash result"),
+        };
+        assert_eq!(bash_output, "command output");
+        let grep_output = match &result[3].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => panic!("expected grep result"),
+        };
+        assert_eq!(grep_output, "grep match");
+    }
+
+    #[test]
+    fn microcompact_returns_unchanged_when_no_tool_results() {
+        let messages = vec![
+            ConversationMessage::user_text("hello"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }]),
+        ];
+
+        let result = microcompact(&messages, 4);
+        assert_eq!(result, messages);
     }
 }
