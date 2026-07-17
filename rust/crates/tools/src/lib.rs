@@ -4,10 +4,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
+    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError, CacheControl,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, SystemContent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent,
+    ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -27,7 +27,7 @@ use runtime::{
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
     PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
-    Session, TaskPacket, ToolError, ToolExecutor,
+    Session, SystemPromptSplit, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -4726,6 +4726,42 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
         })
 }
 
+/// Build a [`SystemContent`] from a [`SystemPromptSplit`] with prompt-caching
+/// markers, mirroring `AnthropicRuntimeClient::build_system_blocks` in
+/// `rusty-claude-cli/src/main.rs`.
+///
+/// The static (stable) sections are emitted as text blocks with
+/// `cache_control: {type: "ephemeral"}` on the **last** static block, marking
+/// the cache prefix boundary. Dynamic sections are emitted as plain text
+/// blocks (no cache marker) so they re-flow every turn.
+///
+/// Returns `None` if both static and dynamic sections are empty, so
+/// `MessageRequest.system` serializes to absent rather than `null`/`[]`.
+fn build_provider_system_blocks(split: &SystemPromptSplit) -> Option<SystemContent> {
+    let mut blocks: Vec<SystemBlock> = Vec::new();
+
+    // Static sections: mark the last one with cache_control.
+    let static_len = split.static_sections.len();
+    for (index, section) in split.static_sections.iter().enumerate() {
+        let mut block = SystemBlock::new(section.clone());
+        if index == static_len.saturating_sub(1) && static_len > 0 {
+            block = block.with_cache_control(CacheControl::ephemeral());
+        }
+        blocks.push(block);
+    }
+
+    // Dynamic sections: no cache marker.
+    for section in &split.dynamic_sections {
+        blocks.push(SystemBlock::new(section.clone()));
+    }
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(SystemContent::from_blocks(blocks))
+    }
+}
+
 impl ApiClient for ProviderRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
@@ -4738,8 +4774,7 @@ impl ApiClient for ProviderRuntimeClient {
             })
             .collect::<Vec<_>>();
         let messages = convert_messages(&request.messages);
-        let rendered = request.system_prompt.render();
-        let system = (!rendered.is_empty()).then(|| SystemContent::from_text(rendered));
+        let system = build_provider_system_blocks(&request.system_prompt);
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
@@ -10306,5 +10341,101 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_system_block_tests {
+    use super::build_provider_system_blocks;
+    use api::SystemContent;
+    use runtime::SystemPromptSplit;
+
+    #[test]
+    fn marks_last_static_section_with_cache_control() {
+        let split = SystemPromptSplit {
+            static_sections: vec!["static1".to_string(), "static2".to_string()],
+            dynamic_sections: vec!["dynamic1".to_string()],
+        };
+        let content = build_provider_system_blocks(&split).expect("non-empty");
+        match content {
+            SystemContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 3);
+                // First static: no cache_control
+                assert!(blocks[0].cache_control.is_none());
+                // Last static: has cache_control
+                let cc = blocks[1]
+                    .cache_control
+                    .as_ref()
+                    .expect("last static has cache_control");
+                assert_eq!(cc.cache_type, "ephemeral");
+                // Dynamic: no cache_control
+                assert!(blocks[2].cache_control.is_none());
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn returns_none_for_empty_split() {
+        let split = SystemPromptSplit {
+            static_sections: Vec::new(),
+            dynamic_sections: Vec::new(),
+        };
+        assert!(build_provider_system_blocks(&split).is_none());
+    }
+
+    #[test]
+    fn handles_static_only() {
+        let split = SystemPromptSplit {
+            static_sections: vec!["only".to_string()],
+            dynamic_sections: Vec::new(),
+        };
+        let content = build_provider_system_blocks(&split).expect("non-empty");
+        match content {
+            SystemContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(blocks[0].cache_control.is_some());
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handles_dynamic_only() {
+        let split = SystemPromptSplit {
+            static_sections: Vec::new(),
+            dynamic_sections: vec!["dyn".to_string()],
+        };
+        let content = build_provider_system_blocks(&split).expect("non-empty");
+        match content {
+            SystemContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(blocks[0].cache_control.is_none());
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serializes_with_cache_control_marker_in_json() {
+        let split = SystemPromptSplit {
+            static_sections: vec!["stable".to_string()],
+            dynamic_sections: vec!["volatile".to_string()],
+        };
+        let content = build_provider_system_blocks(&split).expect("non-empty");
+        let json = serde_json::to_string(&content).expect("serialize");
+        assert!(
+            json.contains(r#""cache_control":{"type":"ephemeral"}"#),
+            "JSON should contain cache_control marker: {json}"
+        );
+        // cache_control (on static block) should precede dynamic content.
+        let cc_pos = json
+            .find(r#""cache_control"#)
+            .expect("cache_control position");
+        let dyn_pos = json.find("volatile").expect("volatile position");
+        assert!(
+            cc_pos < dyn_pos,
+            "cache_control should precede dynamic content"
+        );
     }
 }
