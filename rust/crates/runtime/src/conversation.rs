@@ -325,9 +325,14 @@ where
                 return Err(error);
             }
 
-            let request = ApiRequest {
-                system_prompt: SystemPromptSplit::from_sections(self.system_prompt.clone()),
-                messages: self.session.messages.clone(),
+            let request = {
+                let sliced = crate::compact::get_messages_after_compact_boundary(
+                    &self.session.messages,
+                );
+                ApiRequest {
+                    system_prompt: SystemPromptSplit::from_sections(self.system_prompt.clone()),
+                    messages: sliced.to_vec(),
+                }
             };
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,

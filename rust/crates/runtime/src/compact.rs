@@ -1,9 +1,63 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
 const COMPACT_RECENT_MESSAGES_NOTE: &str = "Recent messages are preserved verbatim.";
 const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.";
+
+const COMPACT_BOUNDARY_MARKER_PREFIX: &str = "<!-- compact_boundary: ";
+const COMPACT_BOUNDARY_MARKER_SUFFIX: &str = " -->";
+
+/// Identifies what triggered a compaction pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactTrigger {
+    Auto,
+    Manual,
+    Reactive,
+}
+
+/// Metadata embedded in the post-compaction System message so downstream
+/// request construction can slice the transcript at the boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactBoundary {
+    pub trigger: CompactTrigger,
+    pub pre_tokens: usize,
+    pub messages_summarized: usize,
+    pub timestamp_ms: u64,
+}
+
+/// Formats a [`CompactBoundary`] as a machine-parseable HTML comment marker line.
+#[must_use]
+fn format_compact_boundary_marker(boundary: &CompactBoundary) -> String {
+    let json = serde_json::to_string(boundary).unwrap_or_else(|_| "{}".to_string());
+    format!("{COMPACT_BOUNDARY_MARKER_PREFIX}{json}{COMPACT_BOUNDARY_MARKER_SUFFIX}")
+}
+
+/// Parses the most recent [`CompactBoundary`] marker from a text block, if any.
+fn parse_compact_boundary_from_text(text: &str) -> Option<CompactBoundary> {
+    let marker_start = text.rfind(COMPACT_BOUNDARY_MARKER_PREFIX)?;
+    let after_prefix = &text[marker_start + COMPACT_BOUNDARY_MARKER_PREFIX.len()..];
+    let end = after_prefix.find(COMPACT_BOUNDARY_MARKER_SUFFIX)?;
+    let json_str = &after_prefix[..end];
+    serde_json::from_str(json_str).ok()
+}
+
+/// Returns true when the text contains a compact_boundary marker.
+fn has_compact_boundary_marker(text: &str) -> bool {
+    text.contains(COMPACT_BOUNDARY_MARKER_PREFIX)
+}
+
+/// Strips a trailing compact_boundary marker line from `text`, if present.
+fn strip_compact_boundary_marker(text: &str) -> &str {
+    if let Some(idx) = text.rfind(COMPACT_BOUNDARY_MARKER_PREFIX) {
+        let trimmed = text[..idx].trim_end_matches(['\n', '\r', ' ']);
+        trimmed
+    } else {
+        text
+    }
+}
 
 /// Thresholds controlling when and how a session is compacted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +146,24 @@ pub fn get_compact_continuation_message(
 }
 
 /// Compacts a session by summarizing older messages and preserving the recent tail.
+///
+/// This is the default entry point and records the compaction with
+/// [`CompactTrigger::Auto`]. Use [`compact_session_with_trigger`] to embed a
+/// different trigger in the boundary marker.
 #[must_use]
 pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
+    compact_session_with_trigger(session, config, CompactTrigger::Auto)
+}
+
+/// Compacts a session and embeds a [`CompactBoundary`] marker in the
+/// post-compaction System message so request construction can slice the
+/// transcript at the boundary (see [`get_messages_after_compact_boundary`]).
+#[must_use]
+pub fn compact_session_with_trigger(
+    session: &Session,
+    config: CompactionConfig,
+    trigger: CompactTrigger,
+) -> CompactionResult {
     if !should_compact(session, config) {
         return CompactionResult {
             summary: String::new(),
@@ -103,6 +173,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         };
     }
 
+    let pre_tokens = estimate_session_tokens(session);
     let existing_summary = session
         .messages
         .first()
@@ -167,9 +238,20 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
+    let boundary = CompactBoundary {
+        trigger,
+        pre_tokens,
+        messages_summarized: removed.len(),
+        timestamp_ms: current_time_millis(),
+    };
+    let continuation_with_marker =
+        format!("{continuation}\n{}", format_compact_boundary_marker(&boundary));
+
     let mut compacted_messages = vec![ConversationMessage {
         role: MessageRole::System,
-        blocks: vec![ContentBlock::Text { text: continuation }],
+        blocks: vec![ContentBlock::Text {
+            text: continuation_with_marker,
+        }],
         usage: None,
     }];
     compacted_messages.extend(preserved);
@@ -184,6 +266,52 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         compacted_session,
         removed_message_count: removed.len(),
     }
+}
+
+/// Returns the slice of `messages` starting from the most recent System message
+/// that contains a compact_boundary marker (inclusive) to the end. If no
+/// boundary marker is present, the entire slice is returned unchanged.
+///
+/// This lets request construction drop stale pre-compaction messages that may
+/// have been left in the transcript by partial writes or session restoration.
+#[must_use]
+pub fn get_messages_after_compact_boundary(
+    messages: &[ConversationMessage],
+) -> &[ConversationMessage] {
+    let boundary_idx = messages.iter().rposition(|message| {
+        message.role == MessageRole::System
+            && message.blocks.iter().any(|block| match block {
+                ContentBlock::Text { text } => has_compact_boundary_marker(text),
+                _ => false,
+            })
+    });
+    match boundary_idx {
+        Some(idx) => &messages[idx..],
+        None => messages,
+    }
+}
+
+/// Extracts the most recent [`CompactBoundary`] from a message slice, if any.
+#[must_use]
+pub fn extract_compact_boundary(messages: &[ConversationMessage]) -> Option<CompactBoundary> {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == MessageRole::System)
+        .find_map(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => parse_compact_boundary_from_text(text),
+                _ => None,
+            })
+        })
+}
+
+/// Returns the current wall-clock time in milliseconds since the Unix epoch.
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {
@@ -534,6 +662,7 @@ fn extract_existing_compacted_summary(message: &ConversationMessage) -> Option<S
     }
 
     let text = first_text_block(message)?;
+    let text = strip_compact_boundary_marker(text);
     let summary = text.strip_prefix(COMPACT_CONTINUATION_PREAMBLE)?;
     let summary = summary
         .split_once(&format!("\n\n{COMPACT_RECENT_MESSAGES_NOTE}"))
@@ -591,9 +720,10 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, estimate_message_tokens, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, merge_compact_summaries,
-        should_compact, CompactionConfig,
+        collect_key_files, compact_session, compact_session_with_trigger, estimate_message_tokens,
+        extract_compact_boundary, format_compact_summary, get_compact_continuation_message,
+        get_messages_after_compact_boundary, infer_pending_work, merge_compact_summaries,
+        should_compact, CompactBoundary, CompactTrigger, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -1041,5 +1171,226 @@ mod tests {
         let content = "text <foo>unclosed rest";
         let result = super::strip_tag_block(content, "foo");
         assert_eq!(result, "text ");
+    }
+
+    // ---- P0-2: Compact Boundary tests ----
+
+    #[test]
+    fn compact_boundary_marker_inserted_after_compaction() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("one ".repeat(200)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two ".repeat(200),
+            }]),
+            ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "recent".to_string(),
+                }],
+                usage: None,
+            },
+        ];
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+        );
+
+        assert!(
+            result.removed_message_count > 0,
+            "compaction must remove at least one message"
+        );
+        let system_message = &result.compacted_session.messages[0];
+        assert_eq!(system_message.role, MessageRole::System);
+        let ContentBlock::Text { text } = &system_message.blocks[0] else {
+            panic!("expected text block in system message");
+        };
+        assert!(
+            text.contains("<!-- compact_boundary:"),
+            "system message must contain boundary marker, got: {text}"
+        );
+
+        let boundary = extract_compact_boundary(&result.compacted_session.messages)
+            .expect("boundary should be parseable from compacted messages");
+        assert_eq!(boundary.trigger, CompactTrigger::Auto);
+        assert_eq!(boundary.messages_summarized, result.removed_message_count);
+        assert!(boundary.pre_tokens > 0);
+        assert!(boundary.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn compact_boundary_marker_carries_reactive_trigger() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("one ".repeat(200)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two ".repeat(200),
+            }]),
+            ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "recent".to_string(),
+                }],
+                usage: None,
+            },
+        ];
+
+        let result = compact_session_with_trigger(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+            CompactTrigger::Reactive,
+        );
+
+        let boundary = extract_compact_boundary(&result.compacted_session.messages)
+            .expect("boundary should be present");
+        assert_eq!(boundary.trigger, CompactTrigger::Reactive);
+    }
+
+    #[test]
+    fn get_messages_after_compact_boundary_slices_correctly() {
+        // Build a message list with a boundary marker in the middle.
+        let stale_user = ConversationMessage::user_text("stale before compaction");
+        let stale_assistant = ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "stale response".to_string(),
+        }]);
+        let boundary_text = format!(
+            "This session is being continued from a previous conversation.\n<!-- compact_boundary: {{\"trigger\":\"auto\",\"pre_tokens\":1000,\"messages_summarized\":2,\"timestamp_ms\":1700000000000}} -->"
+        );
+        let boundary_system = ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text {
+                text: boundary_text,
+            }],
+            usage: None,
+        };
+        let fresh_user = ConversationMessage::user_text("fresh question");
+        let fresh_assistant = ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "fresh response".to_string(),
+        }]);
+
+        let messages = vec![
+            stale_user,
+            stale_assistant,
+            boundary_system,
+            fresh_user,
+            fresh_assistant,
+        ];
+
+        let sliced = get_messages_after_compact_boundary(&messages);
+        // The slice should start at the boundary system message (index 2) and
+        // include everything after it.
+        assert_eq!(sliced.len(), 3);
+        assert_eq!(sliced[0].role, MessageRole::System);
+        assert!(matches!(
+            &sliced[1].blocks[0],
+            ContentBlock::Text { text } if text == "fresh question"
+        ));
+        assert!(matches!(
+            &sliced[2].blocks[0],
+            ContentBlock::Text { text } if text == "fresh response"
+        ));
+    }
+
+    #[test]
+    fn get_messages_after_compact_boundary_uses_most_recent_boundary() {
+        // When multiple boundaries exist, the most recent one wins.
+        let old_boundary = ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text {
+                text: "old summary\n<!-- compact_boundary: {\"trigger\":\"auto\",\"pre_tokens\":500,\"messages_summarized\":1,\"timestamp_ms\":1} -->".to_string(),
+            }],
+            usage: None,
+        };
+        let middle_user = ConversationMessage::user_text("middle");
+        let new_boundary = ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text {
+                text: "new summary\n<!-- compact_boundary: {\"trigger\":\"auto\",\"pre_tokens\":800,\"messages_summarized\":2,\"timestamp_ms\":2} -->".to_string(),
+            }],
+            usage: None,
+        };
+        let fresh_user = ConversationMessage::user_text("fresh");
+
+        let messages = vec![old_boundary, middle_user, new_boundary, fresh_user];
+        let sliced = get_messages_after_compact_boundary(&messages);
+        assert_eq!(sliced.len(), 2);
+        assert_eq!(sliced[0].role, MessageRole::System);
+        assert!(matches!(
+            &sliced[1].blocks[0],
+            ContentBlock::Text { text } if text == "fresh"
+        ));
+    }
+
+    #[test]
+    fn get_messages_after_compact_boundary_returns_all_when_no_boundary() {
+        let messages = vec![
+            ConversationMessage::user_text("hello"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }]),
+        ];
+
+        let sliced = get_messages_after_compact_boundary(&messages);
+        assert_eq!(sliced.len(), messages.len());
+        assert!(std::ptr::eq(sliced.as_ptr(), messages.as_ptr()));
+    }
+
+    #[test]
+    fn extract_compact_boundary_returns_none_when_absent() {
+        let messages = vec![ConversationMessage::user_text("no boundary here")];
+        assert!(extract_compact_boundary(&messages).is_none());
+    }
+
+    #[test]
+    fn extract_existing_summary_strips_boundary_marker() {
+        // When compacting a session whose existing system message already has
+        // a boundary marker, the extracted summary must not include the marker.
+        let mut session = Session::new();
+        let first_summary = "earlier work summary";
+        let continuation = super::get_compact_continuation_message(first_summary, true, true);
+        let boundary = CompactBoundary {
+            trigger: CompactTrigger::Auto,
+            pre_tokens: 500,
+            messages_summarized: 3,
+            timestamp_ms: 1,
+        };
+        let marked = format!(
+            "{continuation}\n{}",
+            super::format_compact_boundary_marker(&boundary)
+        );
+        session.messages = vec![
+            ConversationMessage {
+                role: MessageRole::System,
+                blocks: vec![ContentBlock::Text { text: marked }],
+                usage: None,
+            },
+            ConversationMessage::user_text("follow up"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "response".to_string(),
+            }]),
+        ];
+
+        let extracted = session
+            .messages
+            .first()
+            .and_then(super::extract_existing_compacted_summary)
+            .expect("summary should extract");
+        assert!(
+            !extracted.contains("compact_boundary"),
+            "extracted summary must not contain boundary marker: {extracted}"
+        );
+        assert!(
+            extracted.contains("earlier work summary"),
+            "extracted summary should contain the summary text: {extracted}"
+        );
     }
 }
