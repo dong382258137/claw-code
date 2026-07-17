@@ -386,6 +386,20 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
+const MAX_GIT_DIFF_CHARS: usize = 8_000;
+const GIT_DIFF_TRUNCATION_MARKER: &str = "… [git diff truncated to keep prompt budget]";
+
+fn truncate_diff_to_budget(joined: &str, max_chars: usize) -> String {
+    if joined.chars().count() <= max_chars {
+        joined.to_string()
+    } else {
+        // Truncate by char count (not bytes) to avoid splitting multi-byte
+        // CJK characters. Append a marker so the model knows context was cut.
+        let truncated: String = joined.chars().take(max_chars).collect();
+        format!("{truncated}\n{GIT_DIFF_TRUNCATION_MARKER}")
+    }
+}
+
 fn read_git_diff(cwd: &Path) -> Option<String> {
     let mut sections = Vec::new();
 
@@ -400,10 +414,10 @@ fn read_git_diff(cwd: &Path) -> Option<String> {
     }
 
     if sections.is_empty() {
-        None
-    } else {
-        Some(sections.join("\n\n"))
+        return None;
     }
+    let joined = sections.join("\n\n");
+    Some(truncate_diff_to_budget(&joined, MAX_GIT_DIFF_CHARS))
 }
 
 fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -656,9 +670,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ModelFamilyIdentity, ProjectContext, SystemPromptBuilder, SystemPromptSplit,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, truncate_diff_to_budget,
+        truncate_instruction_content, ContextFile, ModelFamilyIdentity, ProjectContext,
+        SystemPromptBuilder, SystemPromptSplit, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -1266,5 +1280,19 @@ mod tests {
         let from_sections = SystemPromptSplit::from_sections(built.clone());
         let build_split = builder.build_split();
         assert_eq!(from_sections, build_split);
+    }
+
+    #[test]
+    fn truncate_diff_to_budget_preserves_short_input() {
+        let result = truncate_diff_to_budget("short", 100);
+        assert_eq!(result, "short");
+    }
+
+    #[test]
+    fn truncate_diff_to_budget_truncates_long_input() {
+        let long: String = "x".repeat(200);
+        let result = truncate_diff_to_budget(&long, 50);
+        assert!(result.chars().count() < 200);
+        assert!(result.contains("truncated"));
     }
 }

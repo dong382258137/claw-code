@@ -535,13 +535,13 @@ where
             return None;
         }
 
-        let result = compact_session(
-            &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
-        );
+        // Use the default CompactionConfig (max_estimated_tokens: 10_000) so that
+        // small sessions are not pointlessly compacted. The auto-compact trigger
+        // above (input_tokens >= threshold) already decided compaction is needed;
+        // max_estimated_tokens just prevents compacting a session whose estimated
+        // token footprint is still small (which would generate a summary for no
+        // benefit). With CJK-aware estimation (Task 10), this check is now reliable.
+        let result = compact_session(&self.session, CompactionConfig::default());
 
         if result.removed_message_count == 0 {
             return None;
@@ -1512,8 +1512,12 @@ mod tests {
         }
 
         let mut session = Session::new();
+        // The first user message is intentionally large so the session's
+        // estimated token count exceeds CompactionConfig::default()
+        // (max_estimated_tokens: 10_000). With CJK-aware estimation
+        // (chars().count()/2+1), 20_000 chars → 10_001 tokens.
         session.messages = vec![
-            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::user_text("x".repeat(20_000)),
             crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "two".to_string(),
             }]),

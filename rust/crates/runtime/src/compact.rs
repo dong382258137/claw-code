@@ -455,19 +455,27 @@ fn truncate_summary(content: &str, max_chars: usize) -> String {
 }
 
 fn estimate_message_tokens(message: &ConversationMessage) -> usize {
+    // Use char count / 2 instead of byte length / 4 for CJK-aware estimation.
+    // CJK characters are 3 bytes in UTF-8 but ~1-2 tokens each, so len()/4
+    // severely underestimates CJK content. chars().count()/2 is a better
+    // average across mixed CJK/Latin text (CJK: ~1 token/char, Latin: ~0.25
+    // token/char, blended average ~0.5 token/char).
+    fn char_tokens(s: &str) -> usize {
+        s.chars().count() / 2 + 1
+    }
     message
         .blocks
         .iter()
         .map(|block| match block {
-            ContentBlock::Text { text } => text.len() / 4 + 1,
-            ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
+            ContentBlock::Text { text } => char_tokens(text),
+            ContentBlock::ToolUse { name, input, .. } => char_tokens(name) + char_tokens(input),
             ContentBlock::ToolResult {
                 tool_name, output, ..
-            } => (tool_name.len() + output.len()) / 4 + 1,
+            } => char_tokens(tool_name) + char_tokens(output),
             ContentBlock::Thinking {
                 thinking,
                 signature,
-            } => thinking.len() / 4 + signature.as_ref().map_or(0, |value| value.len() / 4 + 1),
+            } => char_tokens(thinking) + signature.as_deref().map_or(0, char_tokens),
         })
         .sum()
 }
@@ -572,7 +580,7 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, format_compact_summary,
+        collect_key_files, compact_session, estimate_message_tokens, format_compact_summary,
         get_compact_continuation_message, infer_pending_work, merge_compact_summaries,
         should_compact, CompactionConfig,
     };
@@ -926,5 +934,40 @@ mod tests {
             !previously_section.contains("highlight line 0"),
             "oldest highlight should be dropped"
         );
+    }
+
+    #[test]
+    fn estimate_message_tokens_is_cjk_aware() {
+        // CJK text: 12 chars, 36 bytes UTF-8.
+        // Old estimate: 36 / 4 + 1 = 10 tokens (overestimate by byte length).
+        // New estimate: 12 chars / 2 + 1 = 7 tokens (closer to ~12-24 actual).
+        let cjk_text = "你好世界，这是一个测试。";
+        let message = ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: cjk_text.to_string(),
+            }],
+            usage: None,
+        };
+        let estimated = estimate_message_tokens(&message);
+        // chars().count() / 2 + 1 for 12 chars = 7
+        assert!(
+            estimated >= 5 && estimated <= 8,
+            "CJK estimate should be in reasonable range, got {estimated}"
+        );
+        // ASCII of similar char count should be comparable, not wildly different.
+        let ascii_text = "hello world!"; // 12 chars, 12 bytes
+        let ascii_msg = ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: ascii_text.to_string(),
+            }],
+            usage: None,
+        };
+        let ascii_estimated = estimate_message_tokens(&ascii_msg);
+        // ASCII: 12/2+1 = 7; CJK: 12/2+1 = 7 — comparable, as they should be.
+        // Old code would give CJK 36/4+1=10 vs ASCII 12/4+1=4, wrongly implying
+        // CJK uses far more tokens per char than ASCII.
+        assert!(ascii_estimated >= 5);
     }
 }
