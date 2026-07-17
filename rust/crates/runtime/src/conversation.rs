@@ -21,6 +21,9 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 /// Number of recent tool results kept verbatim by the microcompact pass that
 /// runs at the end of every turn, before auto-compaction is considered.
 const MICROCOMPACT_PRESERVE_RECENT: usize = 4;
+/// More aggressive preserve window used when recovering from a prompt-too-long
+/// error. Only the two most recent tool results are kept verbatim.
+const REACTIVE_MICROCOMPACT_PRESERVE_RECENT: usize = 2;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +106,24 @@ impl RuntimeError {
             message: message.into(),
         }
     }
+
+    /// Returns true when the error message indicates the upstream API rejected
+    /// the request because the prompt exceeded its maximum length. Used by the
+    /// reactive-compaction recovery path in [`ConversationRuntime::run_turn`].
+    #[must_use]
+    pub fn is_prompt_too_long(&self) -> bool {
+        let lowered = self.message.to_ascii_lowercase();
+        lowered.contains("prompt")
+            && (lowered.contains("too long")
+                || lowered.contains("exceeds")
+                || lowered.contains("maximum"))
+    }
+
+    /// Returns the underlying error message, primarily for test assertions.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl Display for RuntimeError {
@@ -128,6 +149,21 @@ pub struct TurnSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
+}
+
+/// Tracks how far the reactive-compaction recovery has progressed within a
+/// single [`ConversationRuntime::run_turn`] call. The state machine prevents
+/// infinite retry loops when the upstream API keeps returning prompt-too-long
+/// errors despite compaction attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactiveCompactState {
+    /// No recovery attempted yet — microcompact is the first step.
+    NotAttempted,
+    /// Aggressive microcompact has been applied; full compaction is next.
+    MicrocompactDone,
+    /// Full compaction has been applied; no further recovery attempts will be
+    /// made for this turn. Any further prompt-too-long error is returned as-is.
+    FullCompactDone,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -317,6 +353,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut reactive_state = ReactiveCompactState::NotAttempted;
 
         loop {
             iterations += 1;
@@ -340,8 +377,48 @@ where
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
                 Err(error) => {
-                    self.record_turn_failed(iterations, &error);
-                    return Err(error);
+                    // Non-recoverable errors propagate immediately.
+                    if !error.is_prompt_too_long() {
+                        self.record_turn_failed(iterations, &error);
+                        return Err(error);
+                    }
+                    // Reactive compaction recovery: progressively shrink the
+                    // transcript until the upstream accepts it or we exhaust
+                    // the recovery steps.
+                    match reactive_state {
+                        ReactiveCompactState::NotAttempted => {
+                            // Step 1: aggressive microcompact (preserve_recent=2).
+                            let microcompacted = crate::compact::microcompact(
+                                &self.session.messages,
+                                REACTIVE_MICROCOMPACT_PRESERVE_RECENT,
+                            );
+                            self.session.messages = microcompacted;
+                            reactive_state = ReactiveCompactState::MicrocompactDone;
+                            continue;
+                        }
+                        ReactiveCompactState::MicrocompactDone => {
+                            // Step 2: full compaction with Reactive trigger.
+                            let result = crate::compact::compact_session_with_trigger(
+                                &self.session,
+                                CompactionConfig::default(),
+                                crate::compact::CompactTrigger::Reactive,
+                            );
+                            if result.removed_message_count > 0 {
+                                self.session = result.compacted_session;
+                                reactive_state = ReactiveCompactState::FullCompactDone;
+                                continue;
+                            }
+                            // Compaction removed nothing — nothing more we can do.
+                            self.record_turn_failed(iterations, &error);
+                            return Err(error);
+                        }
+                        ReactiveCompactState::FullCompactDone => {
+                            // Already exhausted recovery steps; bail out to
+                            // prevent an infinite retry loop.
+                            self.record_turn_failed(iterations, &error);
+                            return Err(error);
+                        }
+                    }
                 }
             };
             let (assistant_message, usage, turn_prompt_cache_events) =
@@ -1790,5 +1867,256 @@ mod tests {
         };
         assert_eq!(request.system_prompt.static_sections, vec!["static"]);
         assert_eq!(request.system_prompt.dynamic_sections, vec!["dynamic"]);
+    }
+
+    #[test]
+    fn reactive_compact_retries_on_prompt_too_long() {
+        // API returns prompt-too-long on the first call, then succeeds after
+        // reactive microcompact summarizes the aged Read tool results.
+        struct RetryAfterMicrocompactApi {
+            call_count: usize,
+        }
+        impl ApiClient for RetryAfterMicrocompactApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => Err(RuntimeError::new(
+                        "prompt is too long for the model context window",
+                    )),
+                    2 => Ok(vec![
+                        AssistantEvent::TextDelta("recovered".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => unreachable!("unexpected extra API call"),
+                }
+            }
+        }
+
+        // Build a session with four Read tool-result turns. The reactive
+        // microcompact (preserve_recent=2) should summarize the two oldest
+        // results while keeping the two most recent verbatim.
+        let big_output = "line-of-content\n".repeat(200);
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "Read".to_string(),
+                input: "old-file-a.txt".to_string(),
+            }]),
+            crate::session::ConversationMessage::tool_result(
+                "tool-1",
+                "Read",
+                big_output.clone(),
+                false,
+            ),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "tool-2".to_string(),
+                name: "Read".to_string(),
+                input: "old-file-b.txt".to_string(),
+            }]),
+            crate::session::ConversationMessage::tool_result(
+                "tool-2",
+                "Read",
+                big_output.clone(),
+                false,
+            ),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "tool-3".to_string(),
+                name: "Read".to_string(),
+                input: "recent-file-c.txt".to_string(),
+            }]),
+            crate::session::ConversationMessage::tool_result(
+                "tool-3",
+                "Read",
+                big_output.clone(),
+                false,
+            ),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "tool-4".to_string(),
+                name: "Read".to_string(),
+                input: "recent-file-d.txt".to_string(),
+            }]),
+            crate::session::ConversationMessage::tool_result(
+                "tool-4",
+                "Read",
+                big_output,
+                false,
+            ),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            RetryAfterMicrocompactApi { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed after reactive microcompact");
+
+        // API called twice: first failed, second succeeded after microcompact.
+        assert_eq!(runtime.api_client_mut().call_count, 2);
+        assert_eq!(summary.iterations, 2);
+
+        // The two oldest Read results should be summarized; the two most
+        // recent should be preserved verbatim.
+        let tool_result_outputs: Vec<&str> = runtime
+            .session()
+            .messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_result_outputs.len(), 4);
+        assert!(
+            tool_result_outputs[0].contains("output summarized"),
+            "oldest tool result should be summarized"
+        );
+        assert!(
+            tool_result_outputs[1].contains("output summarized"),
+            "second-oldest tool result should be summarized"
+        );
+        assert!(
+            tool_result_outputs[2].contains("line-of-content"),
+            "third tool result should be verbatim"
+        );
+        assert!(
+            tool_result_outputs[3].contains("line-of-content"),
+            "most recent tool result should be verbatim"
+        );
+    }
+
+    #[test]
+    fn reactive_compact_does_not_loop_infinitely() {
+        // API always returns prompt-too-long. The reactive state machine
+        // should exhaust both recovery steps (microcompact + full compact)
+        // and bail out instead of retrying forever.
+        struct AlwaysPromptTooLongApi {
+            call_count: usize,
+        }
+        impl ApiClient for AlwaysPromptTooLongApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                Err(RuntimeError::new(
+                    "prompt exceeds maximum context length",
+                ))
+            }
+        }
+
+        // Small session: should_compact returns false, so full compaction
+        // removes nothing and the recovery bails after two API calls.
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("small"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "response".to_string(),
+            }]),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            AlwaysPromptTooLongApi { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("trigger", None)
+            .expect_err("turn should fail when prompt stays too long");
+
+        // The state machine should have stopped after two attempts, not
+        // retried indefinitely.
+        assert_eq!(runtime.api_client_mut().call_count, 2);
+        assert!(error.is_prompt_too_long());
+    }
+
+    #[test]
+    fn reactive_compact_falls_back_to_full_compaction() {
+        // API fails twice then succeeds: microcompact is tried first, then
+        // full compaction, then the request finally goes through.
+        struct FailTwiceThenSucceedApi {
+            call_count: usize,
+        }
+        impl ApiClient for FailTwiceThenSucceedApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 | 2 => Err(RuntimeError::new("prompt is too long for the model")),
+                    3 => Ok(vec![
+                        AssistantEvent::TextDelta("recovered".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => unreachable!("unexpected extra API call"),
+                }
+            }
+        }
+
+        // Large session: even after microcompact (which has no tool results
+        // to summarize here), should_compact still returns true so the full
+        // compaction step actually removes messages.
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("x".repeat(20_000)),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("five"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "six".to_string(),
+            }]),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            FailTwiceThenSucceedApi { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed after full reactive compaction");
+
+        // Three API calls: fail → microcompact → fail → full compact → succeed.
+        assert_eq!(runtime.api_client_mut().call_count, 3);
+        assert_eq!(summary.iterations, 3);
+
+        // The reactive full compaction should have embedded a boundary marker
+        // with the Reactive trigger in the session's System message.
+        let boundary = crate::compact::extract_compact_boundary(&runtime.session().messages);
+        assert!(
+            boundary.is_some(),
+            "session should contain a compact boundary marker after reactive compaction"
+        );
+        let boundary = boundary.expect("boundary checked above");
+        assert_eq!(
+            boundary.trigger,
+            crate::compact::CompactTrigger::Reactive,
+            "boundary trigger should be Reactive"
+        );
+        assert!(
+            boundary.messages_summarized > 0,
+            "reactive compaction should have removed at least one message"
+        );
     }
 }
