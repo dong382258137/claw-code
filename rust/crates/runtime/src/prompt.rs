@@ -195,6 +195,10 @@ pub struct SystemPromptBuilder {
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
     persistent_memory: Option<PersistentMemory>,
+    // Stored as a plain `String` (rather than `RepoMap`) to avoid
+    // `PartialEq`/`Eq` derive issues with `RepoMap`'s internal
+    // `HashMap`/`SystemTime` fields. Callers pre-render via `RepoMap::render()`.
+    repomap_rendered: Option<String>,
 }
 
 impl SystemPromptBuilder {
@@ -248,6 +252,23 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Attach a pre-rendered repository map string to be injected as a static
+    /// section in the system prompt. The map should be pre-rendered via
+    /// `RepoMap::render()` before calling this method.
+    ///
+    /// Stored as a plain `String` to avoid `PartialEq`/`Eq` derive issues with
+    /// `RepoMap`'s internal `HashMap`/`SystemTime` fields. The section is
+    /// emitted in `static_sections` (before the
+    /// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] marker) so it benefits from prompt
+    /// caching. The caller is responsible for re-rendering the map when files
+    /// change; within a session the cached snapshot keeps the cache prefix
+    /// stable.
+    #[must_use]
+    pub fn with_repomap(mut self, rendered_map: impl Into<String>) -> Self {
+        self.repomap_rendered = Some(rendered_map.into());
+        self
+    }
+
     #[must_use]
     pub fn append_section(mut self, section: impl Into<String>) -> Self {
         self.append_sections.push(section.into());
@@ -267,6 +288,12 @@ impl SystemPromptBuilder {
         sections.push(get_memory_verification_section());
         if let Some(memory) = &self.persistent_memory {
             sections.push(render_persistent_memory_section(memory));
+        }
+        if let Some(map) = &self.repomap_rendered {
+            let section = render_repomap_section(map);
+            if !section.is_empty() {
+                sections.push(section);
+            }
         }
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
@@ -701,6 +728,20 @@ fn get_memory_verification_section() -> String {
 /// session even as new entries are written to disk.
 fn render_persistent_memory_section(memory: &PersistentMemory) -> String {
     memory.frozen_render()
+}
+
+/// Render the repository map as a system prompt section.
+///
+/// Placed in `static_sections` (before the boundary marker) so it benefits
+/// from prompt caching. The caller is responsible for re-rendering the map
+/// when files change; within a session the cached snapshot keeps the cache
+/// prefix stable. Returns an empty `String` when the input is empty/whitespace
+/// so the caller can skip pushing an empty section.
+fn render_repomap_section(rendered_map: &str) -> String {
+    if rendered_map.trim().is_empty() {
+        return String::new();
+    }
+    format!("## Repository Map\n{rendered_map}")
 }
 
 #[cfg(test)]
@@ -1261,6 +1302,72 @@ mod tests {
         assert!(
             !rendered.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
             "rendered prompt must not leak the boundary marker"
+        );
+    }
+
+    #[test]
+    fn repomap_section_is_in_static_part() {
+        // The Repository Map must live in the cacheable static sections
+        // (before SYSTEM_PROMPT_DYNAMIC_BOUNDARY) so it benefits from prompt
+        // caching and stays out of the volatile dynamic sections.
+        let builder = SystemPromptBuilder::new()
+            .with_repomap("src/main.rs (refs: 5)\n  fn main");
+        let split = builder.build_split();
+        assert!(
+            split
+                .static_sections
+                .iter()
+                .any(|s| s.contains("Repository Map") && s.contains("src/main.rs")),
+            "static_sections should contain the Repository Map block, got: {:?}",
+            split.static_sections
+        );
+        assert!(
+            split
+                .dynamic_sections
+                .iter()
+                .all(|s| !s.contains("Repository Map")),
+            "dynamic_sections must NOT contain the Repository Map block"
+        );
+    }
+
+    #[test]
+    fn repomap_section_present_in_build_split() {
+        // build_split().render() must surface the Repository Map section in
+        // the final rendered prompt text (no boundary marker leakage).
+        let builder = SystemPromptBuilder::new()
+            .with_repomap("src/lib.rs (refs: 3)\n  fn helper");
+        let rendered = builder.build_split().render();
+        assert!(
+            rendered.contains("## Repository Map"),
+            "rendered prompt should contain '## Repository Map' heading"
+        );
+        assert!(
+            rendered.contains("src/lib.rs"),
+            "rendered prompt should contain the map content"
+        );
+        assert!(
+            !rendered.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "rendered prompt must not leak the boundary marker"
+        );
+    }
+
+    #[test]
+    fn empty_repomap_not_injected() {
+        // An empty/whitespace-only map must not produce a section — neither
+        // in static_sections nor in the rendered prompt.
+        let builder = SystemPromptBuilder::new().with_repomap("");
+        let split = builder.build_split();
+        assert!(
+            split
+                .static_sections
+                .iter()
+                .all(|s| !s.contains("Repository Map")),
+            "empty repomap should not be injected"
+        );
+        let rendered = split.render();
+        assert!(
+            !rendered.contains("## Repository Map"),
+            "empty repomap should not produce a heading in the rendered prompt"
         );
     }
 
