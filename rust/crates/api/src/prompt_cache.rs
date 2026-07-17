@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{MessageRequest, MessageResponse, Usage};
 
-const DEFAULT_COMPLETION_TTL_SECS: u64 = 30;
+const DEFAULT_COMPLETION_TTL_SECS: u64 = 300;
 const DEFAULT_PROMPT_TTL_SECS: u64 = 5 * 60;
 const DEFAULT_BREAK_MIN_DROP: u32 = 2_000;
 const MAX_SANITIZED_LENGTH: usize = 80;

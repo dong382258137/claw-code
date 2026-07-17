@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
-const MAX_JSONL_FIELD_CHARS: usize = 16 * 1024;
+const MAX_JSONL_FIELD_CHARS: usize = 4 * 1024;
 const JSONL_TRUNCATION_MARKER: &str = "… [truncated for session JSONL]";
 const JSONL_REDACTION_MARKER: &str = "[redacted]";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -144,6 +144,7 @@ impl PartialEq for Session {
             && self.workspace_root == other.workspace_root
             && self.prompt_history == other.prompt_history
             && self.last_health_check_ms == other.last_health_check_ms
+            && self.model == other.model
     }
 }
 
@@ -1397,6 +1398,26 @@ mod tests {
 
         assert!(first < second);
         assert!(second < third);
+    }
+
+    #[test]
+    fn session_partial_eq_compares_model_field() {
+        let mut s1 = Session::new();
+        let mut s2 = Session::new();
+        // Same session_id so other fields can be equal
+        s2.session_id = s1.session_id.clone();
+        s2.created_at_ms = s1.created_at_ms;
+        s2.updated_at_ms = s1.updated_at_ms;
+        assert_eq!(s1, s2, "two new sessions with same fields should be equal");
+
+        // Different model should make them unequal
+        s1.model = Some("claude-sonnet-4".to_string());
+        s2.model = Some("claude-opus-4".to_string());
+        assert_ne!(s1, s2, "sessions with different model should be unequal");
+
+        // One None, one Some
+        s2.model = None;
+        assert_ne!(s1, s2, "session with model vs without should be unequal");
     }
 
     #[test]
