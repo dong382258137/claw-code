@@ -1079,7 +1079,7 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        SessionSearchToolSpec, StaticToolExecutor, ToolExecutor,
+        SESSION_SEARCH_TOOL_SPEC, StaticToolExecutor, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
@@ -2578,6 +2578,35 @@ mod tests {
         assert!(
             output.contains("Found 2 matches"),
             "missing matches in tool result: {output}"
+        );
+    }
+
+    #[test]
+    fn session_search_tool_spec_is_valid_json_with_expected_fields() {
+        // The tool spec is exposed as a `pub const` so external registrars
+        // (e.g. main.rs's tool registry) can register it with the model.
+        // Verify it parses as valid JSON and carries the schema fields the
+        // runtime's `execute_session_search` expects to find in the input.
+        let spec: serde_json::Value = serde_json::from_str(SESSION_SEARCH_TOOL_SPEC)
+            .expect("SESSION_SEARCH_TOOL_SPEC must be valid JSON");
+        assert_eq!(spec["name"], "session_search");
+        assert!(
+            spec["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("history")),
+            "description should mention history: {spec}"
+        );
+        assert_eq!(spec["input_schema"]["type"], "object");
+        assert_eq!(spec["input_schema"]["properties"]["query"]["type"], "string");
+        assert_eq!(
+            spec["input_schema"]["properties"]["top_k"]["type"],
+            "integer"
+        );
+        assert!(
+            spec["input_schema"]["required"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|v| v == "query")),
+            "'query' must be in required array: {spec}"
         );
     }
 
