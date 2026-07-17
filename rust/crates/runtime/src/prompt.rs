@@ -621,7 +621,22 @@ fn collapse_blank_lines(content: &str) -> String {
     result
 }
 
+/// Optional extras injected into the system prompt alongside the standard
+/// config-driven sections. Defaults to "no extras" so legacy callers of
+/// [`load_system_prompt`] behave exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct SystemPromptExtras {
+    /// Persistent memory surface whose frozen snapshot is injected as a
+    /// static section (prompt-cache friendly).
+    pub persistent_memory: Option<PersistentMemory>,
+    /// Pre-rendered repository map string injected as a static section.
+    pub repomap: Option<String>,
+}
+
 /// Loads config and project context, then renders the system prompt text.
+///
+/// This is the legacy entry point with no extras. Equivalent to calling
+/// [`load_system_prompt_with_extras`] with [`SystemPromptExtras::default`].
 pub fn load_system_prompt(
     cwd: impl Into<PathBuf>,
     current_date: impl Into<String>,
@@ -629,15 +644,42 @@ pub fn load_system_prompt(
     os_version: impl Into<String>,
     model_family: ModelFamilyIdentity,
 ) -> Result<Vec<String>, PromptBuildError> {
+    load_system_prompt_with_extras(
+        cwd,
+        current_date,
+        os_name,
+        os_version,
+        model_family,
+        SystemPromptExtras::default(),
+    )
+}
+
+/// Loads config, project context, and optional extras (persistent memory,
+/// repository map), then renders the system prompt text.
+#[must_use]
+pub fn load_system_prompt_with_extras(
+    cwd: impl Into<PathBuf>,
+    current_date: impl Into<String>,
+    os_name: impl Into<String>,
+    os_version: impl Into<String>,
+    model_family: ModelFamilyIdentity,
+    extras: SystemPromptExtras,
+) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let config = ConfigLoader::default_for(&cwd).load()?;
-    Ok(SystemPromptBuilder::new()
+    let mut builder = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_model_family(model_family)
         .with_project_context(project_context)
-        .with_runtime_config(config)
-        .build())
+        .with_runtime_config(config);
+    if let Some(memory) = extras.persistent_memory {
+        builder = builder.with_persistent_memory(memory);
+    }
+    if let Some(map) = extras.repomap {
+        builder = builder.with_repomap(map);
+    }
+    Ok(builder.build())
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {

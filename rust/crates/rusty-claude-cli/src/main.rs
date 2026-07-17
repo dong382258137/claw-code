@@ -45,12 +45,13 @@ use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, BaseCommitState, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, SystemPromptSplit, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    load_system_prompt, load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
+    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
+    ConversationRuntime, HistoryIndex, McpServer, McpServerManager, McpServerSpec, McpTool,
+    MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    RepoMap, ResolvedPermissionMode, RuntimeError, Session, SystemPromptExtras,
+    SystemPromptSplit, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -5984,7 +5985,16 @@ fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::
 }
 
 fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
-    Ok(Session::new().with_workspace_root(env::current_dir()?))
+    let cwd = env::current_dir()?;
+    let mut session = Session::new().with_workspace_root(cwd.clone());
+    // Attach a SQLite FTS5 history index so the `session_search` tool can
+    // recall past messages. Best-effort: if the DB cannot be opened (e.g.
+    // permission denied), the session still works — only search is disabled.
+    let db_path = cwd.join(".claw").join("history.db");
+    if let Ok(index) = HistoryIndex::open(&db_path) {
+        session = session.with_history_index(std::sync::Arc::new(index));
+    }
+    Ok(session)
 }
 
 fn create_managed_session_handle(
@@ -7958,13 +7968,46 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
-        env::current_dir()?,
+    let cwd = env::current_dir()?;
+    let extras = load_prompt_extras(&cwd);
+    Ok(load_system_prompt_with_extras(
+        cwd,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
         model_family_identity_for(model),
+        extras,
     )?)
+}
+
+/// Load optional system prompt extras (persistent memory + repository map).
+///
+/// Both are best-effort: if the memory file does not exist or the RepoMap
+/// fails to render, we silently fall back to no extras rather than blocking
+/// startup. The persistent memory is loaded-and-frozen so its snapshot stays
+/// byte-stable for the session (preserving the prompt-cache prefix).
+fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
+    let persistent_memory = {
+        let memory_path = cwd.join(".claw").join("memory.json");
+        if memory_path.exists() {
+            Some(runtime::PersistentMemory::load_and_freeze(&memory_path))
+        } else {
+            None
+        }
+    };
+    let repomap = {
+        let mut map = RepoMap::new(cwd).with_max_tokens(1024);
+        let rendered = map.render();
+        if rendered.trim().is_empty() {
+            None
+        } else {
+            Some(rendered)
+        }
+    };
+    SystemPromptExtras {
+        persistent_memory,
+        repomap,
+    }
 }
 
 struct PluginsCommandPayload {
@@ -8044,7 +8087,36 @@ fn build_runtime_plugin_state_with_loader(
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
+    let (mcp_state, mut runtime_tools) = build_runtime_mcp_state(runtime_config)?;
+    // Register the session_search tool. Its execution is intercepted by
+    // ConversationRuntime::run_turn (routed to HistoryIndex), not handled by
+    // CliToolExecutor — but the spec must be in the registry so the model
+    // knows the tool exists and can call it.
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "session_search".to_string(),
+        description: Some(
+            "Search the conversation history using full-text search. Use this \
+             to recall specific past discussions, decisions, or file references \
+             that may not be in the current context window."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Full-text search query. Supports FTS5 syntax."
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Maximum number of results (default: 10).",
+                    "default": 10
+                }
+            },
+            "required": ["query"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    });
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {
@@ -8505,6 +8577,17 @@ fn build_runtime_with_plugin_state(
     );
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
+    }
+    // Attach persistent memory for nudge curation. Loaded-and-frozen so the
+    // nudge layer can write new entries to disk while the prompt's frozen
+    // snapshot (loaded separately in load_prompt_extras) stays byte-stable
+    // for the session — preserving the prompt-cache prefix.
+    if let Ok(cwd) = env::current_dir() {
+        let memory_path = cwd.join(".claw").join("memory.json");
+        if memory_path.exists() {
+            let memory = runtime::PersistentMemory::load_and_freeze(&memory_path);
+            runtime = runtime.with_persistent_memory(memory);
+        }
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
