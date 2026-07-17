@@ -8743,11 +8743,20 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+
+        // Extract system-role messages so they route through MessageRequest.system
+        // (eligible for prompt caching) instead of being flattened into messages.
+        let (system_text, filtered_messages) = extract_system_messages(&request.messages);
+        let mut split = request.system_prompt;
+        if !system_text.is_empty() {
+            split.dynamic_sections.push(system_text);
+        }
+
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: build_system_blocks(&request.system_prompt),
+            messages: convert_messages(&filtered_messages),
+            system: build_system_blocks(&split),
             tools: self.enable_tools.then(|| {
                 let mut tools = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
                 mark_last_tool_with_cache_control(&mut tools);
@@ -10018,6 +10027,36 @@ fn permission_policy(
             policy.with_tool_requirement(name, required_permission)
         },
     ))
+}
+
+/// Extract system-role messages from a conversation and merge their text
+/// content into a single string. Returns `(system_text, non_system_messages)`.
+///
+/// The system text is joined with `\n\n` separators. Non-system messages
+/// (User/Assistant/Tool) are returned in their original order, with ownership
+/// transferred.
+///
+/// This lets `stream()` route system content through `MessageRequest.system`
+/// (where it can be prompt-cached) instead of flattening it into the messages
+/// array as a fake "user" turn.
+fn extract_system_messages(messages: &[ConversationMessage]) -> (String, Vec<ConversationMessage>) {
+    let mut system_texts: Vec<String> = Vec::new();
+    let mut rest: Vec<ConversationMessage> = Vec::new();
+    for message in messages {
+        if message.role == MessageRole::System {
+            for block in &message.blocks {
+                if let ContentBlock::Text { text } = block {
+                    if !text.is_empty() {
+                        system_texts.push(text.clone());
+                    }
+                }
+            }
+        } else {
+            rest.push(message.clone());
+        }
+    }
+    let system_text = system_texts.join("\n\n");
+    (system_text, rest)
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -15267,5 +15306,123 @@ mod tool_cache_tests {
         // Idempotent — calling again should still leave it marked
         mark_last_tool_with_cache_control(&mut tools);
         assert!(tools[0].cache_control.is_some());
+    }
+}
+
+#[cfg(test)]
+mod system_extraction_tests {
+    use super::{convert_messages, extract_system_messages};
+    use runtime::{ContentBlock, ConversationMessage, MessageRole};
+
+    fn system_text(text: &str) -> ConversationMessage {
+        ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: None,
+        }
+    }
+
+    fn user_text(text: &str) -> ConversationMessage {
+        ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: None,
+        }
+    }
+
+    fn assistant_text(text: &str) -> ConversationMessage {
+        ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn extracts_system_messages_and_returns_filtered_rest() {
+        let messages = vec![
+            system_text("system rule 1"),
+            user_text("hello"),
+            system_text("system rule 2"),
+            assistant_text("hi"),
+        ];
+        let (system_text, rest) = extract_system_messages(&messages);
+        assert!(system_text.contains("system rule 1"));
+        assert!(system_text.contains("system rule 2"));
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].role, MessageRole::User);
+        assert_eq!(rest[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn returns_empty_string_when_no_system_messages() {
+        let messages = vec![user_text("hi"), assistant_text("hello")];
+        let (system_text, rest) = extract_system_messages(&messages);
+        assert!(system_text.is_empty());
+        assert_eq!(rest.len(), 2);
+    }
+
+    #[test]
+    fn handles_empty_input() {
+        let messages: Vec<ConversationMessage> = Vec::new();
+        let (system_text, rest) = extract_system_messages(&messages);
+        assert!(system_text.is_empty());
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn preserves_order_of_non_system_messages() {
+        let messages = vec![
+            system_text("s1"),
+            user_text("u1"),
+            system_text("s2"),
+            user_text("u2"),
+            assistant_text("a1"),
+        ];
+        let (_, rest) = extract_system_messages(&messages);
+        assert_eq!(rest.len(), 3);
+        assert_eq!(rest[0].role, MessageRole::User);
+        assert_eq!(rest[1].role, MessageRole::User);
+        assert_eq!(rest[2].role, MessageRole::Assistant);
+        // Verify text content preserved
+        match &rest[0].blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "u1"),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn system_text_concatenates_multiple_system_messages() {
+        let messages = vec![
+            system_text("first rule"),
+            user_text("hi"),
+            system_text("second rule"),
+        ];
+        let (system_text, _) = extract_system_messages(&messages);
+        // Both rules should be present, joined by some separator
+        assert!(system_text.contains("first rule"));
+        assert!(system_text.contains("second rule"));
+    }
+
+    #[test]
+    fn extracted_messages_convert_without_system_role() {
+        // After extraction, convert_messages should produce no "system" role entries.
+        let messages = vec![system_text("s1"), user_text("u1"), assistant_text("a1")];
+        let (_, rest) = extract_system_messages(&messages);
+        let converted = convert_messages(&rest);
+        // All converted messages should have role "user" or "assistant", never "system"
+        for msg in &converted {
+            assert!(
+                msg.role == "user" || msg.role == "assistant",
+                "unexpected role: {}",
+                msg.role
+            );
+        }
     }
 }
