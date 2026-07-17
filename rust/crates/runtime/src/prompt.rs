@@ -5,6 +5,7 @@ use std::process::Command;
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::git_context::GitContext;
+use crate::memory::PersistentMemory;
 
 /// Errors raised while assembling the final system prompt.
 #[derive(Debug)]
@@ -193,6 +194,7 @@ pub struct SystemPromptBuilder {
     append_sections: Vec<String>,
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
+    persistent_memory: Option<PersistentMemory>,
 }
 
 impl SystemPromptBuilder {
@@ -233,6 +235,19 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Attach a [`PersistentMemory`] surface so its frozen snapshot is
+    /// injected as a static section in the system prompt.
+    ///
+    /// The section is emitted in `static_sections` (i.e. before the
+    /// `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` marker) so it benefits from prompt
+    /// caching. The frozen snapshot stays byte-stable for the lifetime of
+    /// the session, which keeps the cache prefix stable.
+    #[must_use]
+    pub fn with_persistent_memory(mut self, memory: PersistentMemory) -> Self {
+        self.persistent_memory = Some(memory);
+        self
+    }
+
     #[must_use]
     pub fn append_section(mut self, section: impl Into<String>) -> Self {
         self.append_sections.push(section.into());
@@ -249,6 +264,10 @@ impl SystemPromptBuilder {
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
+        sections.push(get_memory_verification_section());
+        if let Some(memory) = &self.persistent_memory {
+            sections.push(render_persistent_memory_section(memory));
+        }
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
         if let Some(project_context) = &self.project_context {
@@ -664,6 +683,24 @@ fn get_actions_section() -> String {
         "Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user or durable workspace instructions.".to_string(),
     ]
     .join("\n")
+}
+
+fn get_memory_verification_section() -> String {
+    "## Memory Verification\n\
+     - Retrieved memories and conversation history are hints, not facts.\n\
+     - Before modifying code based on a memory, you MUST first read the actual file to verify the memory is still accurate.\n\
+     - If a memory conflicts with the current file contents, trust the file contents and update the memory."
+        .to_string()
+}
+
+/// Render the persistent memory snapshot as a static system-prompt section.
+///
+/// The section is only emitted when a [`PersistentMemory`] has been attached
+/// to the builder. The content comes from [`PersistentMemory::frozen_render`]
+/// so the prompt-cache prefix stays byte-stable across turns within a
+/// session even as new entries are written to disk.
+fn render_persistent_memory_section(memory: &PersistentMemory) -> String {
+    memory.frozen_render()
 }
 
 #[cfg(test)]
@@ -1165,6 +1202,65 @@ mod tests {
                 .any(|s| s.contains("# Output Style: concise")),
             "static_sections should contain the output style block, got: {:?}",
             split.static_sections
+        );
+    }
+
+    #[test]
+    fn test_memory_verification_section_is_in_static_part() {
+        // The Memory Verification principle must live in the cacheable static
+        // sections (before SYSTEM_PROMPT_DYNAMIC_BOUNDARY) so it is included
+        // in the ephemeral-cached prefix and stays stable across turns.
+        let builder = SystemPromptBuilder::new().with_os("linux", "6.1.0");
+        let split = builder.build_split();
+
+        assert!(
+            split
+                .static_sections
+                .iter()
+                .any(|s| s.contains("Memory Verification")),
+            "static_sections should contain the Memory Verification block, got: {:?}",
+            split.static_sections
+        );
+        assert!(
+            split
+                .static_sections
+                .iter()
+                .any(|s| s.contains("hints, not facts")),
+            "static_sections should contain the 'hints, not facts' line"
+        );
+        assert!(
+            split
+                .static_sections
+                .iter()
+                .any(|s| s.contains("MUST first read the actual file")),
+            "static_sections should instruct the model to read the actual file before modifying"
+        );
+        assert!(
+            split
+                .dynamic_sections
+                .iter()
+                .all(|s| !s.contains("Memory Verification")),
+            "dynamic_sections must NOT contain the Memory Verification block"
+        );
+    }
+
+    #[test]
+    fn test_memory_verification_section_present_in_build_split() {
+        // build_split().render() must surface the Memory Verification section
+        // in the final rendered prompt text (no boundary marker leakage).
+        let builder = SystemPromptBuilder::new().with_os("linux", "6.1.0");
+        let split = builder.build_split();
+        let rendered = split.render();
+
+        assert!(
+            rendered.contains("## Memory Verification"),
+            "rendered prompt should contain the '## Memory Verification' heading"
+        );
+        assert!(rendered.contains("hints, not facts"));
+        assert!(rendered.contains("trust the file contents"));
+        assert!(
+            !rendered.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "rendered prompt must not leak the boundary marker"
         );
     }
 
