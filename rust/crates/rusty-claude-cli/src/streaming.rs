@@ -221,6 +221,14 @@ impl AnthropicRuntimeClient {
         self
     }
 
+    /// Attach a status emitter callback to an already-constructed client.
+    /// This is the `&mut self` counterpart to `with_status_emitter` — used
+    /// when the client is already wrapped inside a `ConversationRuntime`
+    /// and we only have `api_client_mut()` access.
+    pub(crate) fn set_status_emitter(&mut self, emitter: StatusEmitter) {
+        self.status_emitter = Some(emitter);
+    }
+
     /// Emit a status event if an emitter is attached. No-op otherwise.
     fn emit_status(&self, event: StatusEvent) {
         if let Some(emitter) = &self.status_emitter {
