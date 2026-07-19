@@ -1,0 +1,244 @@
+//! Paste handling: clipboard reading, paste folding, placeholder expansion.
+//!
+//! 参考 claude-code-best-source 的 pasteStore + usePasteHandler 机制：
+//! - 粘贴超阈值（500 字符 / 3 行）时，把原始内容存到 paste-cache 目录
+//! - 显示用占位符 `[Pasted text #1 +N lines]` 替代原始多行内容
+//! - 提交给 LLM 时展开占位符为原始内容
+//!
+//! 与 claude-code-best-source 的差异：
+//! - claude-code-best-source 在 paste 事件发生时即时拦截（React/Ink 层）
+//! - claw 在 Submit 时后处理（rustyline 已显示原始内容，但提交后清除并显示占位符卡片）
+//! - 视觉效果：用户看到原始多行 → 回车 → 原始内容被清除 → 显示折叠占位符卡片
+
+use std::path::{Path, PathBuf};
+
+/// 粘贴折叠阈值：超过此字符数或行数则折叠为占位符。
+/// 方案 A（激进，小粘贴也折叠）：500 字符 / 3 行。
+pub(crate) const PASTE_FOLD_CHAR_THRESHOLD: usize = 500;
+pub(crate) const PASTE_FOLD_LINE_THRESHOLD: usize = 3;
+
+/// paste-cache 根目录：`%USERPROFILE%\.claw\paste-cache\`。
+/// 与 sessions 目录平级，存放超阈值粘贴的原始内容。
+pub(crate) fn paste_cache_root() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".claw").join("paste-cache"))
+}
+
+/// 确保某个 paste-cache 文件名可用：返回完整路径。
+/// 文件名格式：`<session_id>_<paste_id>.txt`，paste_id 在本会话内自增。
+pub(crate) fn paste_cache_path(session_id: &str, paste_id: u32) -> Option<PathBuf> {
+    let root = paste_cache_root()?;
+    Some(root.join(format!("{session_id}_{paste_id}.txt")))
+}
+
+/// 计算字符串的"额外行数"（与 claude-code-best-source 的 getPastedTextRefNumLines 对齐）：
+/// 换行符数量（即 `line1\nline2\nline3` 视为 +2 lines，不是 3 lines）。
+pub(crate) fn pasted_text_ref_num_lines(text: &str) -> usize {
+    text.chars().filter(|c| matches!(c, '\n' | '\r')).count()
+}
+
+/// 生成 `[Pasted text #<id> +<num_lines> lines]` 占位符。
+/// num_lines 为 0 时省略 `+N lines` 部分。
+pub(crate) fn format_pasted_text_ref(id: u32, num_lines: usize) -> String {
+    if num_lines == 0 {
+        format!("[Pasted text #{id}]")
+    } else {
+        format!("[Pasted text #{id} +{num_lines} lines]")
+    }
+}
+
+/// 判断 input 是否应被折叠为 paste 占位符。
+/// 触发条件：字符数 > 阈值 **或** 行数 > 阈值。
+pub(crate) fn should_fold_paste(input: &str) -> bool {
+    let char_count = input.chars().count();
+    let line_count = input.lines().count();
+    char_count > PASTE_FOLD_CHAR_THRESHOLD || line_count > PASTE_FOLD_LINE_THRESHOLD
+}
+
+/// 把超阈值的粘贴内容存到 paste-cache，返回占位符字符串。
+/// 存储失败时（如磁盘满），退化为不折叠（返回原始内容）。
+pub(crate) fn store_paste_and_make_placeholder(
+    input: &str,
+    session_id: &str,
+    paste_id: u32,
+) -> String {
+    let Some(path) = paste_cache_path(session_id, paste_id) else {
+        // 无 USERPROFILE/HOME 环境变量，无法存储，退化为不折叠。
+        return input.to_string();
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        eprintln!("[paste-store] create_dir_all failed: {error}; fallback to inline");
+        return input.to_string();
+    }
+    if let Err(error) = std::fs::write(&path, input) {
+        eprintln!("[paste-store] write failed: {error}; fallback to inline");
+        return input.to_string();
+    }
+    let num_lines = pasted_text_ref_num_lines(input);
+    format_pasted_text_ref(paste_id, num_lines)
+}
+
+/// P3 主入口：处理用户输入，返回 (display_text, expanded_text)。
+/// - display_text: 用于 user 卡片显示（可能含占位符）
+/// - expanded_text: 实际发送给 LLM 的内容（始终是原始展开内容）
+///
+/// 对于 slash 命令（以 `/` 开头），不进行折叠（命令本身不会很长）。
+/// 对于 bare skill 触发，也不折叠（skill 名通常很短）。
+///
+/// `paste_id_gen` 是本会话的自增 paste id 生成器（&mut u32）。
+pub(crate) fn fold_pasted_input(
+    input: &str,
+    session_id: &str,
+    paste_id_gen: &mut u32,
+) -> (String, String) {
+    // slash 命令不折叠
+    if input.trim_start().starts_with('/') {
+        return (input.to_string(), input.to_string());
+    }
+    if !should_fold_paste(input) {
+        return (input.to_string(), input.to_string());
+    }
+    *paste_id_gen += 1;
+    let paste_id = *paste_id_gen;
+    let display = store_paste_and_make_placeholder(input, session_id, paste_id);
+    // expanded_text 始终是原始内容（LLM 需要看到完整粘贴）
+    (display, input.to_string())
+}
+
+/// 展开输入中的所有 `[Pasted text #N +M lines]` 占位符为原始内容。
+/// 从 paste-cache 读取对应文件。如果文件不存在（已被清理），占位符保留原样。
+///
+/// 用简单字符串解析替代正则（避免引入 regex 依赖）。
+/// 占位符格式：`[Pasted text #<id>]` 或 `[Pasted text #<id> +<n> lines]`。
+pub(crate) fn expand_paste_placeholders(input: &str, session_id: &str) -> String {
+    const PREFIX: &str = "[Pasted text #";
+    let mut result = String::new();
+    let mut remaining = input;
+    loop {
+        let Some(start) = remaining.find(PREFIX) else {
+            result.push_str(remaining);
+            break;
+        };
+        // 把 prefix 之前的内容原样追加
+        result.push_str(&remaining[..start]);
+        let after_prefix = &remaining[start + PREFIX.len()..];
+        // 找到占位符的闭合 `]`
+        let Some(end) = after_prefix.find(']') else {
+            // 没有闭合，原样追加剩余
+            result.push_str(&remaining[start..]);
+            break;
+        };
+        let inner = &after_prefix[..end];
+        // inner 格式：`<id>` 或 `<id> +<n> lines`
+        let id_str = inner.split_whitespace().next().unwrap_or("");
+        let paste_id: u32 = id_str.parse().unwrap_or(0);
+        if paste_id == 0 {
+            // 解析失败，保留原占位符
+            result.push_str(&remaining[start..=start + PREFIX.len() + end]);
+        } else {
+            let replacement = paste_cache_path(session_id, paste_id)
+                .and_then(|path| std::fs::read_to_string(&path).ok())
+                .unwrap_or_else(|| {
+                    // 文件不存在，保留原占位符
+                    remaining[start..=start + PREFIX.len() + end].to_string()
+                });
+            result.push_str(&replacement);
+        }
+        remaining = &after_prefix[end + 1..];
+    }
+    result
+}
+
+/// 读取 Windows 剪贴板文本内容。
+/// 用 PowerShell `Get-Clipboard` 命令获取，绕过终端粘贴机制。
+/// 适用于 cmd.exe/conhost 等不支持 bracketed paste 的终端。
+///
+/// 返回剪贴板的原始文本（可能含多行）。如果剪贴板里是图片或其他非文本格式，
+/// 返回空字符串。
+pub(crate) fn read_clipboard_text() -> Result<String, Box<dyn std::error::Error>> {
+    // 关键修复：PowerShell 默认输出编码是系统 ANSI 代码页（中文系统是 GBK/CP936），
+    // 中文字符会被编码为多字节 GBK。Rust 的 `String::from_utf8_lossy` 会把无效
+    // UTF-8 字节替换为 U+FFFD，导致后续字符串匹配失败（例如 `try_auto_expand_clipboard`
+    // 里 `first_line != user_input` 永远成立，自动剪贴板检测不触发）。
+    //
+    // 修复：在 PowerShell 命令前显式设置 `[Console]::OutputEncoding = UTF8`，
+    // 让 PowerShell 以 UTF-8 输出到 stdout，并 strip 掉可能的 UTF-8 BOM。
+    let ps_script =
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw";
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Get-Clipboard failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let mut bytes = output.stdout;
+    // PowerShell UTF-8 输出可能带 BOM（EF BB BF），strip 掉以免干扰字符串匹配。
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    // Get-Clipboard -Raw 保留原始换行，但可能尾部有额外换行，trim 一下尾部。
+    Ok(text.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// P3 自动剪贴板检测：检查剪贴板是否有多行内容，且第一行等于用户输入。
+/// 如果匹配，用剪贴板完整内容替换用户输入，并填充 pending_paste_lines
+/// 以便主循环丢弃后续被 conhost 逐行发送的行。
+///
+/// 返回 `Some((display, expanded))` 如果触发了剪贴板替换；`None` 表示未触发。
+///
+/// 触发条件（全部满足）：
+/// 1. 剪贴板内容是多行（行数 > 1）
+/// 2. 剪贴板第一行（trim 后）等于用户输入（trim 后）
+///
+/// 无论是否超折叠阈值，都替换为完整内容（fold_pasted_input 内部决定是否折叠）。
+///
+/// 性能考虑：此函数会调用 PowerShell Get-Clipboard（~100ms 开销）。
+/// 只在用户输入是单行、不以 / 开头、且 pending_paste_lines 为空时调用。
+pub(crate) fn try_auto_expand_clipboard(
+    user_input: &str,
+    session_id: &str,
+    paste_id_gen: &mut u32,
+    pending_paste_lines: &mut Vec<String>,
+) -> Option<(String, String)> {
+    eprintln!("[paste-dbg] user_input={:?}", user_input);
+    let clipboard = match read_clipboard_text() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[paste-dbg] read_clipboard_text failed: {e}");
+            return None;
+        }
+    };
+    eprintln!("[paste-dbg] clipboard len={} lines={}", clipboard.chars().count(), clipboard.lines().count());
+    if clipboard.is_empty() {
+        eprintln!("[paste-dbg] clipboard empty, skip");
+        return None;
+    }
+    let clipboard_lines: Vec<&str> = clipboard.lines().collect();
+    // 必须是多行内容（>1 行）才触发
+    if clipboard_lines.len() <= 1 {
+        eprintln!("[paste-dbg] only {} lines, skip", clipboard_lines.len());
+        return None;
+    }
+    // 第一行必须等于用户输入（trim 后比较，兼容尾部空白差异）
+    let first_line = clipboard_lines[0].trim();
+    eprintln!("[paste-dbg] first_line={:?} user_input={:?}", first_line, user_input.trim());
+    if first_line != user_input.trim() {
+        eprintln!("[paste-dbg] first line mismatch, skip");
+        return None;
+    }
+    // 触发剪贴板替换：用完整内容走折叠流程（fold_pasted_input 内部决定是否折叠）
+    let (display, expanded) = fold_pasted_input(&clipboard, session_id, paste_id_gen);
+    // 把剩余行填入 pending_paste_lines，主循环会丢弃匹配的后续 Submit
+    *pending_paste_lines = clipboard_lines[1..]
+        .iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    eprintln!("[paste-dbg] triggered! pending={} lines", pending_paste_lines.len());
+    Some((display, expanded))
+}
