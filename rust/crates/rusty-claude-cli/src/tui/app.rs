@@ -234,31 +234,67 @@ fn handle_submit(
     output_view: &mut OutputView,
     status_state: &Arc<Mutex<StatusBarState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Mark streaming start
-    {
-        let mut guard = status_state.lock().expect("StatusBarState poisoned");
-        guard.reset_turn();
-    }
+    use crate::streaming::{StatusEmitter, StatusEvent};
 
-    // Call the existing run_turn path. Output goes to stdout in this MVP;
-    // a future Phase 2 task will route it through OutputView by passing
-    // &mut *output_view as the `out` sink to AnthropicRuntimeClient.
-    // Similarly, the StatusEmitter hook added in Task 7 is not yet wired
-    // through build_runtime — that requires changing build_runtime's
-    // signature to accept an optional emitter. For MVP, the status bar
-    // updates after each turn completes (sync_status_from_cli below).
-    let _ = output_view; // suppress unused warning for now
+    // Phase 2: Construct a StatusEmitter that updates OutputView + StatusBarState
+    // in real time as streaming events arrive. The emitter is injected into LiveCli
+    // via set_status_emitter, and prepare_turn_runtime will forward it to the
+    // freshly-built AnthropicRuntimeClient.
+    let output_handle = output_view.shared_handle();
+    let status_handle = Arc::clone(status_state);
+    let emitter: StatusEmitter = Arc::new(move |event: StatusEvent| {
+        match event {
+            StatusEvent::TextDelta(text) => {
+                if let Ok(mut buf) = output_handle.lock() {
+                    buf.append(&text);
+                }
+            }
+            StatusEvent::Usage(usage) => {
+                if let Ok(mut guard) = status_handle.lock() {
+                    guard.turn_usage.input_tokens += usage.input_tokens;
+                    guard.turn_usage.output_tokens += usage.output_tokens;
+                    guard.turn_usage.cache_creation_input_tokens +=
+                        usage.cache_creation_input_tokens;
+                    guard.turn_usage.cache_read_input_tokens +=
+                        usage.cache_read_input_tokens;
+                }
+            }
+            StatusEvent::StreamStart => {
+                if let Ok(mut guard) = status_handle.lock() {
+                    guard.reset_turn();
+                }
+            }
+            StatusEvent::MessageStop => {
+                if let Ok(mut guard) = status_handle.lock() {
+                    if guard.streaming {
+                        guard.finish_turn();
+                    }
+                }
+            }
+            StatusEvent::ToolUse { .. } => {
+                // Tool use events don't directly update the status bar or output view;
+                // the rendered tool call display is written to stdout by consume_stream,
+                // which TUI mode suppresses via set_tui_mode(true). For MVP, TUI shows
+                // only TextDelta content; tool call cards are a future enhancement.
+            }
+        }
+    });
+    cli.set_status_emitter(emitter);
+    cli.set_tui_mode(true);
+
+    // Call the existing run_turn path. StatusEmitter callback will fire
+    // during streaming, updating output_view and status_state in real time.
+    // set_tui_mode(true) makes prepare_turn_runtime use emit_output=false,
+    // so consume_stream writes to io::sink instead of stdout — preventing
+    // duplicate output under TUI's alternate screen.
     let result = cli.run_turn(line);
 
-    // Mark streaming done
-    {
-        let mut guard = status_state.lock().expect("StatusBarState poisoned");
-        if guard.streaming {
-            guard.finish_turn();
-        }
-    }
+    // Detach emitter and reset TUI mode so next turn starts clean
+    cli.clear_status_emitter();
+    cli.set_tui_mode(false);
 
-    // After turn, sync cumulative usage from cli (the authoritative source)
+    // After turn, sync the authoritative cumulative_usage from cli (the
+    // emitter only saw turn_usage deltas; cumulative is still tracked by LiveCli).
     sync_status_from_cli(status_state, cli);
 
     result?;

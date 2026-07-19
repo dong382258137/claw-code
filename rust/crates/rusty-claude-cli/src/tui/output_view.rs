@@ -21,12 +21,42 @@ pub(crate) struct OutputView {
 }
 
 #[derive(Debug, Default)]
-struct OutputBuffer {
+pub(crate) struct OutputBuffer {
     buffer: String,
     /// Total bytes ever written (for diagnostics; not capped).
     total_written: u64,
     /// True if any output was truncated (buffer overflowed).
     truncated: bool,
+}
+
+impl OutputBuffer {
+    /// Append text to the buffer, trimming to MAX_BUFFER_BYTES if needed.
+    /// Shared between `OutputView::write` (io::Write impl) and the TUI's
+    /// StatusEmitter TextDelta callback so ring-buffer trimming stays DRY.
+    pub(crate) fn append(&mut self, text: &str) {
+        self.buffer.push_str(text);
+        self.total_written += text.len() as u64;
+        if self.buffer.len() > MAX_BUFFER_BYTES {
+            let overflow = self.buffer.len() - MAX_BUFFER_BYTES;
+            self.buffer = self.buffer.split_off(overflow);
+            self.truncated = true;
+        }
+    }
+
+    /// Read-only access to the buffer content.
+    pub(crate) fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Read-only access to total_written.
+    pub(crate) fn total_written(&self) -> u64 {
+        self.total_written
+    }
+
+    /// Read-only access to truncated flag.
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 impl OutputView {
@@ -77,13 +107,7 @@ impl Write for OutputView {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let text = String::from_utf8_lossy(bytes);
         let mut guard = self.inner.lock().expect("OutputBuffer mutex poisoned");
-        guard.buffer.push_str(&text);
-        guard.total_written += bytes.len() as u64;
-        if guard.buffer.len() > MAX_BUFFER_BYTES {
-            let overflow = guard.buffer.len() - MAX_BUFFER_BYTES;
-            guard.buffer = guard.buffer.split_off(overflow);
-            guard.truncated = true;
-        }
+        guard.append(&text);
         Ok(bytes.len())
     }
 
