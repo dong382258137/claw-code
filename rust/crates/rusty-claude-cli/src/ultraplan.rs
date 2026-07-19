@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{
+use crate::tool_display::{
     extract_tool_path, first_visible_line, summarize_tool_payload, truncate_for_summary,
 };
 
