@@ -7,7 +7,8 @@ use crate::render::{OutputVerbosity, TerminalRenderer};
 use runtime::{ToolError, ToolExecutor};
 use tools::GlobalToolRegistry;
 
-use crate::{AllowedToolSet, RuntimeMcpState};
+use crate::AllowedToolSet;
+use crate::plugin_state::RuntimeMcpState;
 
 /// 工具卡片左边框（ANSI 245 灰色）。用于卡片体内每行前缀，视觉上把
 /// "调用详情"和"工具结果"框在同一个卡片容器里。
