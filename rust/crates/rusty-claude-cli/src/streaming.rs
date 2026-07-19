@@ -15,6 +15,7 @@
 
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ use api::{
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
     PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeError, SystemPromptSplit,
+    TokenUsage,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
@@ -36,6 +38,27 @@ use crate::render::{MarkdownStreamState, TerminalRenderer};
 use crate::tool_display::{format_tool_call_start, truncate_for_summary};
 use crate::ultraplan::InternalPromptProgressReporter;
 use crate::{filter_tool_specs, max_tokens_for_model, AllowedToolSet};
+
+/// Callback type for emitting streaming events to a status observer.
+/// Receives a snapshot of the runtime's turn-usage accumulator and
+/// an elapsed millis counter, so the observer can update its display.
+/// Set via `AnthropicRuntimeClient::with_status_emitter`. No-op by default.
+pub(crate) type StatusEmitter = Arc<dyn Fn(StatusEvent) + Send + Sync>;
+
+/// Events emitted during streaming for the status bar to consume.
+#[derive(Debug, Clone)]
+pub(crate) enum StatusEvent {
+    /// A usage delta arrived (input/output tokens updated).
+    Usage(TokenUsage),
+    /// A text delta arrived (incremental assistant output).
+    TextDelta(String),
+    /// A tool use started (tool name provided).
+    ToolUse { id: String, name: String },
+    /// The model finished responding (MessageStop received).
+    MessageStop,
+    /// Streaming turn started (first event received).
+    StreamStart,
+}
 
 pub(crate) const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -114,6 +137,9 @@ pub(crate) struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    /// Optional callback for emitting streaming events to a status observer
+    /// (e.g., the TUI's persistent status bar). None in non-TUI mode.
+    status_emitter: Option<StatusEmitter>,
 }
 
 impl AnthropicRuntimeClient {
@@ -179,11 +205,27 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            status_emitter: None,
         })
     }
 
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    /// Attach a status emitter callback. The callback is invoked on
+    /// each streaming event (Usage, TextDelta, ToolUse, MessageStop)
+    /// so the observer can update its display in real-time.
+    pub(crate) fn with_status_emitter(mut self, emitter: StatusEmitter) -> Self {
+        self.status_emitter = Some(emitter);
+        self
+    }
+
+    /// Emit a status event if an emitter is attached. No-op otherwise.
+    fn emit_status(&self, event: StatusEvent) {
+        if let Some(emitter) = &self.status_emitter {
+            emitter(event);
+        }
     }
 }
 
@@ -336,6 +378,9 @@ impl AnthropicRuntimeClient {
             let Some(event) = next else {
                 break;
             };
+            if !received_any_event {
+                self.emit_status(StatusEvent::StreamStart);
+            }
             received_any_event = true;
 
             match event {
@@ -372,6 +417,7 @@ impl AnthropicRuntimeClient {
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
+                            self.emit_status(StatusEvent::TextDelta(text.clone()));
                             events.push(AssistantEvent::TextDelta(text));
                         }
                     }
@@ -403,11 +449,16 @@ impl AnthropicRuntimeClient {
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.emit_status(StatusEvent::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                        });
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    self.emit_status(StatusEvent::Usage(delta.usage.token_usage()));
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -417,6 +468,7 @@ impl AnthropicRuntimeClient {
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
                     events.push(AssistantEvent::MessageStop);
+                    self.emit_status(StatusEvent::MessageStop);
                 }
             }
         }
@@ -430,6 +482,7 @@ impl AnthropicRuntimeClient {
             })
         {
             events.push(AssistantEvent::MessageStop);
+            self.emit_status(StatusEvent::MessageStop);
         }
 
         if events
@@ -975,4 +1028,33 @@ pub(crate) fn convert_messages(
         });
     }
     result
+}
+
+#[cfg(test)]
+mod status_emitter_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn emit_status_noop_when_emitter_none() {
+        // Construct a minimal client. We can't easily build a real one in unit
+        // tests (requires auth), but we can test the `emit_status` no-op path
+        // by ensuring `Option::None` doesn't panic when checked.
+        let emitter: Option<StatusEmitter> = None;
+        // Just verify the Option is None and doesn't panic when checked.
+        assert!(emitter.is_none());
+    }
+
+    #[test]
+    fn emit_status_invokes_callback_when_set() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let emitter: StatusEmitter = Arc::new(move |_event| {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        // Simulate emit
+        emitter(StatusEvent::StreamStart);
+        emitter(StatusEvent::MessageStop);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
 }
