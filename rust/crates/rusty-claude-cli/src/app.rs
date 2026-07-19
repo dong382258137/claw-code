@@ -450,6 +450,17 @@ pub(crate) struct LiveCli {
     // 在 run_turn 调 runtime.run_turn 之前 prepend goal 前缀；
     // 网络错误时 pause；GoalTool 失败时 record_blocked。
     goal_manager: runtime::GoalManager,
+    // Phase 2: feature-gated status_emitter holder. When set (by TuiApp
+    // via set_status_emitter), prepare_turn_runtime injects it into the
+    // freshly-constructed AnthropicRuntimeClient so streaming events drive
+    // the TUI's StatusBarState + OutputView in real time.
+    #[cfg(feature = "full-tui")]
+    status_emitter: Option<crate::streaming::StatusEmitter>,
+    /// Phase 2: When true, run_turn suppresses emit_output (consume_stream
+    /// writes to io::sink instead of stdout). TUI captures content via the
+    /// status_emitter's TextDelta callback. Set by TuiApp via set_tui_mode.
+    #[cfg(feature = "full-tui")]
+    tui_mode: bool,
 }
 
 pub(crate) struct BuiltRuntime {
@@ -596,6 +607,10 @@ impl LiveCli {
             prompt_history: Vec::new(),
             cumulative_usage: runtime::TokenUsage::default(),
             goal_manager,
+            #[cfg(feature = "full-tui")]
+            status_emitter: None,
+            #[cfg(feature = "full-tui")]
+            tui_mode: false,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -722,6 +737,15 @@ impl LiveCli {
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         runtime.set_tool_verbosity(self.output_verbosity);
+        // Phase 2: if a status_emitter is attached (TUI mode), inject it
+        // into the freshly-built AnthropicRuntimeClient so streaming events
+        // drive the TUI's StatusBarState + OutputView in real time.
+        #[cfg(feature = "full-tui")]
+        if let Some(emitter) = &self.status_emitter {
+            if let Some(rt) = runtime.runtime.as_mut() {
+                rt.api_client_mut().set_status_emitter(Arc::clone(emitter));
+            }
+        }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
@@ -734,7 +758,17 @@ impl LiveCli {
     }
 
     pub(crate) fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        // Phase 2: in TUI mode, suppress emit_output so consume_stream writes
+        // to io::sink instead of stdout — preventing duplicate output under
+        // the TUI's alternate screen. Streaming content is captured via the
+        // status_emitter's TextDelta callback.
+        let emit_output = {
+            #[cfg(feature = "full-tui")]
+            { !self.tui_mode }
+            #[cfg(not(feature = "full-tui"))]
+            { true }
+        };
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(emit_output)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -1815,6 +1849,32 @@ impl LiveCli {
     #[cfg(feature = "full-tui")]
     pub(crate) fn session_id_snapshot(&self) -> &str {
         &self.session.id
+    }
+
+    /// Phase 2: Attach a StatusEmitter that will be injected into every
+    /// subsequently-built AnthropicRuntimeClient via prepare_turn_runtime.
+    /// The emitter receives streaming events (TextDelta, Usage, MessageStop,
+    /// StreamStart, ToolUse) and should update the caller's shared state
+    /// (e.g., TuiApp's OutputView + StatusBarState).
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn set_status_emitter(&mut self, emitter: crate::streaming::StatusEmitter) {
+        self.status_emitter = Some(emitter);
+    }
+
+    /// Phase 2: Detach any previously-attached status emitter. Useful for
+    /// cleanup or switching emitters between sessions.
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn clear_status_emitter(&mut self) {
+        self.status_emitter = None;
+    }
+
+    /// Phase 2: Toggle TUI mode. When on, run_turn calls prepare_turn_runtime
+    /// with emit_output=false so consume_stream's `out` goes to io::sink()
+    /// instead of stdout — preventing duplicate output in alternate screen.
+    /// Streaming content is captured via the status_emitter's TextDelta callback.
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn set_tui_mode(&mut self, on: bool) {
+        self.tui_mode = on;
     }
 }
 
