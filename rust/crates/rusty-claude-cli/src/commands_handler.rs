@@ -140,6 +140,12 @@ pub(crate) enum CliAction {
         /// 启用 full-tui 模式：使用 ratatui 全屏 TUI 替代 inline REPL。
         /// 仅当 `full-tui` Cargo feature 启用时生效；否则报错。
         tui: bool,
+        /// 启用 Plan/Execute/Review 三段循环(Step 2.1)。
+        /// 启用后,复杂用户输入(>200 字符或含 "refactor"/"多文件" 等关键词)
+        /// 会触发 PlanArtifact 创建,末尾追加到 system_prompt 的变动区。
+        /// 详见 `docs/harness-engineering-optimization-plan.md` Step 2.1 与 §5.2。
+        /// 预期 DeepSeek V4 PRO 缓存命中率从 95% 降至 88-92%。
+        enable_plan_mode: bool,
     },
     HelpTopic {
         topic: LocalHelpTopic,
@@ -187,9 +193,13 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // `--verbose`/`--quiet`/`--silent` 设定的输出冗度。默认 `Full`。
     // 多次出现时后覆盖先，与多数 CLI 工具行为一致。
     let mut output_verbosity = OutputVerbosity::default();
-    // `--tui`：启用 full-tui 模式（ratatui 全屏 TUI 替代 inline REPL）。
-    // 仅当 `full-tui` Cargo feature 启用时生效；否则在 dispatch 阶段报错。
-    let mut tui = false;
+    // TUI 模式默认启用（default = ["full-tui"] 编译时）。
+    // `--no-tui` 显式回退到旧 rustyline inline REPL。
+    // `--tui` 仍然支持（冗余但便于脚本明确意图）。
+    let mut tui = true;
+    // `--enable-plan-mode`：启用 Plan/Execute/Review 三段循环(Step 2.1)。
+    // 默认关闭。详见 `docs/harness-engineering-optimization-plan.md` Step 2.1。
+    let mut enable_plan_mode = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -309,6 +319,14 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 tui = true;
                 index += 1;
             }
+            "--no-tui" => {
+                tui = false;
+                index += 1;
+            }
+            "--enable-plan-mode" => {
+                enable_plan_mode = true;
+                index += 1;
+            }
             "--quiet" => {
                 output_verbosity = OutputVerbosity::Compact;
                 index += 1;
@@ -370,7 +388,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
                     additional_workspace_roots: additional_workspace_roots.clone(),
-                    output_verbosity: output_verbosity.clone(),
+                    output_verbosity,
                 });
             }
             "--print" => {
@@ -448,7 +466,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     reasoning_effort,
                     allow_broad_cwd,
                     additional_workspace_roots: additional_workspace_roots.clone(),
-                    output_verbosity: output_verbosity.clone(),
+                    output_verbosity,
                 });
             }
         }
@@ -460,8 +478,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
             additional_workspace_roots: additional_workspace_roots.clone(),
-            output_verbosity: output_verbosity.clone(),
+            output_verbosity,
             tui,
+            enable_plan_mode,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -577,7 +596,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
                     additional_workspace_roots: additional_workspace_roots.clone(),
-                    output_verbosity: output_verbosity.clone(),
+                    output_verbosity,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -606,7 +625,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 reasoning_effort: reasoning_effort.clone(),
                 allow_broad_cwd,
                 additional_workspace_roots: additional_workspace_roots.clone(),
-                output_verbosity: output_verbosity.clone(),
+                output_verbosity,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -620,7 +639,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             reasoning_effort,
             allow_broad_cwd,
             additional_workspace_roots.clone(),
-            output_verbosity.clone(),
+            output_verbosity,
         ),
         other => {
             if rest.len() == 1 && looks_like_subcommand_typo(other) {
@@ -660,7 +679,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 reasoning_effort: reasoning_effort.clone(),
                 allow_broad_cwd,
                 additional_workspace_roots: additional_workspace_roots.clone(),
-                output_verbosity: output_verbosity.clone(),
+                output_verbosity,
             })
         }
     }
@@ -882,7 +901,7 @@ pub(crate) fn parse_direct_slash_cli_action(
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
                     additional_workspace_roots: additional_workspace_roots.clone(),
-                    output_verbosity: output_verbosity.clone(),
+                    output_verbosity,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1313,15 +1332,17 @@ pub(crate) fn slash_command_completion_candidates_with_sessions(
     completions.into_iter().collect()
 }
 
-/// P2 富状态栏：渲染单行紧凑状态信息。
-/// 格式：`model | 📁 cwd | 🔢 tokens | 💰 cost`
-/// 在每次回合完成后打印，作为本回合的"尾部状态摘要"。
-/// 不持久占用屏幕底部（持久底部栏需要 ratatui 全屏模式，与 rustyline 冲突）。
-///
-/// `cwd` 传入已缩短的显示路径（避免过长路径撑爆状态栏）。
-/// `usage` 是累计 usage（cumulative across turns）。
-///
-/// Tier S #3 穷鬼模式：激活时追加 `🪙 poor` 标记，提醒用户非核心特性被跳过。
+// P2 富状态栏：渲染单行紧凑状态信息。
+// 格式：`model | 📁 cwd | 🔢 tokens | 💰 cost`
+// 在每次回合完成后打印，作为本回合的"尾部状态摘要"。
+// 不持久占用屏幕底部（持久底部栏需要 ratatui 全屏模式，与 rustyline 冲突）。
+//
+// `cwd` 传入已缩短的显示路径（避免过长路径撑爆状态栏）。
+// `usage` 是累计 usage（cumulative across turns）。
+//
+// Tier S #3 穷鬼模式：激活时追加 `🪙 poor` 标记，提醒用户非核心特性被跳过。
+// (注：原为 `///` doc comment，但对应 item 在 app.rs 中，悬空 doc 触发 clippy
+//  `empty_line_after_doc_comment`，改为普通注释。)
 
 /// Tier S #1 Goal 持续驱动：处理 `/goal` 命令的 args 参数，返回用户可见消息。
 ///

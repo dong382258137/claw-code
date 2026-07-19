@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn emitter_textdelta_appends_to_output_view() {
-        let mut output_view = OutputView::new();
+        let output_view = OutputView::new();
         let handle = output_view.shared_handle();
         let status = StatusBarState::shared();
         let emitter = build_test_emitter(handle, Arc::clone(&status));
