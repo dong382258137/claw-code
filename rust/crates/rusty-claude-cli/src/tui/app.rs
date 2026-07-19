@@ -1,1 +1,297 @@
-//! Placeholder — implemented in Task 8.
+//! TuiApp — main ratatui event loop integrating with LiveCli.
+//!
+//! Owns the alternate-screen Terminal, InputLine, SlashMenu, OutputView,
+//! and shared StatusBarState. Routes keyboard events to InputLine / Menu,
+//! submits Enter to `LiveCli::run_turn` (capturing output via OutputView
+//! sink + StatusEmitter callback for live status updates).
+
+#![allow(dead_code, unused_imports, unused_variables, unused_assignments, clippy::too_many_lines)]
+
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Terminal;
+
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+
+use crate::app::LiveCli;
+use crate::tui::input_line::{InputAction, InputLine};
+use crate::tui::output_view::OutputView;
+use crate::tui::slash_menu::{format_menu_item, SlashMenu};
+use crate::tui::status_bar::{StatusBar, StatusBarState};
+
+/// Entry point: run the TUI REPL until user exits.
+pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = io::stdout();
+    enable_raw_mode()?;
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = run_event_loop(&mut terminal, cli);
+
+    // Restore terminal on exit.
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut cli: LiveCli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = InputLine::new();
+    let mut menu = SlashMenu::new();
+    let mut output_view = OutputView::new();
+    let status_state = StatusBarState::shared();
+    // Initialize status fields from cli state
+    initialize_status(&status_state, &cli);
+
+    let mut turn_start: Option<Instant> = None;
+
+    loop {
+        // Render
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),     // output area
+                    Constraint::Length(3),   // input + popup area
+                    Constraint::Length(1),   // status bar
+                ])
+                .split(f.area());
+
+            // Output area
+            let output_text = output_view.snapshot();
+            let output_paragraph = Paragraph::new(output_text)
+                .block(Block::default().borders(Borders::TOP).title("Output"))
+                .wrap(Wrap { trim: false });
+            f.render_widget(output_paragraph, chunks[0]);
+
+            // Input area
+            let input_line = format!("> {}", input.buffer());
+            let input_paragraph = Paragraph::new(input_line)
+                .block(Block::default().borders(Borders::TOP).title("Input"));
+            f.render_widget(input_paragraph, chunks[1]);
+
+            // Slash menu popup (overlays below input line)
+            if input.menu_open() {
+                let below_input_y = chunks[1].y.saturating_add(chunks[1].height);
+                let available = f
+                    .area()
+                    .height
+                    .saturating_sub(below_input_y)
+                    .saturating_sub(1);
+                let menu_height = 12u16.min(available);
+                let menu_area = Rect {
+                    x: chunks[1].x,
+                    y: below_input_y,
+                    width: chunks[1].width,
+                    height: menu_height,
+                };
+                if let Some(query) = input.menu_query() {
+                    menu.set_query(&query);
+                }
+                render_menu(&mut menu, f, menu_area);
+            }
+
+            // Status bar
+            let state_snapshot = {
+                let guard = status_state.lock().expect("StatusBarState poisoned");
+                guard.clone()
+            };
+            let status_widget = StatusBar { state: &state_snapshot };
+            f.render_widget(status_widget, chunks[2]);
+        })?;
+
+        // Poll for events (200ms timeout for status refresh)
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                let action = route_key(&mut input, key);
+                match action {
+                    InputAction::Exit => break,
+                    InputAction::Submit(line) => {
+                        turn_start = Some(Instant::now());
+                        handle_submit(&mut cli, &line, &mut output_view, &status_state)?;
+                        turn_start = None;
+                    }
+                    InputAction::MenuUp => menu.move_up(),
+                    InputAction::MenuDown => menu.move_down(),
+                    InputAction::MenuAccept => {
+                        if let Some(spec) = menu.selected_spec() {
+                            let completion = format!("/{}", spec.name);
+                            input.accept_menu_completion(&completion);
+                        }
+                    }
+                    InputAction::CloseMenu => {
+                        // menu state already updated in input.handle_key
+                    }
+                    InputAction::Continue | InputAction::Ignore => {}
+                }
+            }
+        }
+
+        // Refresh status: update turn_elapsed_ms if streaming
+        {
+            let mut guard = status_state.lock().expect("StatusBarState poisoned");
+            if guard.streaming {
+                if let Some(start) = turn_start {
+                    guard.turn_elapsed_ms = start.elapsed().as_millis() as u64;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn route_key(input: &mut InputLine, key: KeyEvent) -> InputAction {
+    let modifiers_name = if key.modifiers.contains(KeyModifiers::CONTROL) {
+        "Ctrl"
+    } else {
+        ""
+    };
+
+    // Ctrl+C / Ctrl+D — handle before char dispatch
+    if modifiers_name == "Ctrl" {
+        if let KeyCode::Char(c) = key.code {
+            let lower = c.to_ascii_lowercase();
+            if lower == 'c' || lower == 'd' {
+                return input.handle_key(None, "CtrlC");
+            }
+        }
+    }
+
+    // Map KeyCode to logical name expected by InputLine::handle_key
+    let logical = match key.code {
+        KeyCode::Char(c) => return input.handle_key(Some(c), ""),
+        KeyCode::Enter => "Enter",
+        KeyCode::Esc => "Esc",
+        KeyCode::BackTab => "Tab",
+        KeyCode::Backspace => "Backspace",
+        KeyCode::Left => "Left",
+        KeyCode::Right => "Right",
+        KeyCode::Tab => "Tab",
+        KeyCode::Up => "Up",
+        KeyCode::Down => "Down",
+        _ => return InputAction::Ignore,
+    };
+    input.handle_key(None, logical)
+}
+
+fn render_menu(
+    menu: &mut SlashMenu,
+    f: &mut ratatui::Frame,
+    area: Rect,
+) {
+    let visible = menu.visible_window();
+    let selected_idx = menu.selected_index();
+    let scroll = menu.scroll_offset();
+
+    let lines: Vec<Line> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let abs_idx = scroll + i;
+            let is_selected = Some(abs_idx) == selected_idx;
+            let text = format_menu_item(spec);
+            if is_selected {
+                Line::from(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(text)
+            }
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Commands ({}/{})", menu.total_count(), menu.all_items_count()));
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn handle_submit(
+    cli: &mut LiveCli,
+    line: &str,
+    output_view: &mut OutputView,
+    status_state: &Arc<Mutex<StatusBarState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Mark streaming start
+    {
+        let mut guard = status_state.lock().expect("StatusBarState poisoned");
+        guard.reset_turn();
+    }
+
+    // Call the existing run_turn path. Output goes to stdout in this MVP;
+    // a future Phase 2 task will route it through OutputView by passing
+    // &mut *output_view as the `out` sink to AnthropicRuntimeClient.
+    // Similarly, the StatusEmitter hook added in Task 7 is not yet wired
+    // through build_runtime — that requires changing build_runtime's
+    // signature to accept an optional emitter. For MVP, the status bar
+    // updates after each turn completes (sync_status_from_cli below).
+    let _ = output_view; // suppress unused warning for now
+    let result = cli.run_turn(line);
+
+    // Mark streaming done
+    {
+        let mut guard = status_state.lock().expect("StatusBarState poisoned");
+        if guard.streaming {
+            guard.finish_turn();
+        }
+    }
+
+    // After turn, sync cumulative usage from cli (the authoritative source)
+    sync_status_from_cli(status_state, cli);
+
+    result?;
+    Ok(())
+}
+
+fn initialize_status(state: &Arc<Mutex<StatusBarState>>, cli: &LiveCli) {
+    let mut guard = state.lock().expect("StatusBarState poisoned");
+    guard.model = cli.model_snapshot().to_string();
+    guard.permission_mode = cli.permission_mode_label().to_string();
+    guard.session_id = cli.session_id_snapshot().to_string();
+    sync_status_from_cli_inner(&mut guard, cli);
+}
+
+fn sync_status_from_cli(state: &Arc<Mutex<StatusBarState>>, cli: &LiveCli) {
+    let mut guard = state.lock().expect("StatusBarState poisoned");
+    sync_status_from_cli_inner(&mut guard, cli);
+}
+
+fn sync_status_from_cli_inner(guard: &mut StatusBarState, cli: &LiveCli) {
+    guard.cumulative_usage = cli.cumulative_usage_snapshot();
+    if let Ok(cwd) = std::env::current_dir() {
+        guard.cwd = format!("{}", cwd.display());
+    }
+    if let Some(branch) = cli.git_branch_snapshot() {
+        guard.git_branch = branch;
+    }
+    if let Some(badge) = cli.goal_badge_snapshot() {
+        guard.goal_badge = badge;
+    } else {
+        guard.goal_badge.clear();
+    }
+    guard.poor_mode = runtime::poor_mode::is_active();
+    guard.provider =
+        crate::provider_label(api::detect_provider_kind(cli.model_snapshot())).to_string();
+}

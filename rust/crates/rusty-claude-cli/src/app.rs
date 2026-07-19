@@ -712,7 +712,7 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -1750,6 +1750,50 @@ impl LiveCli {
     fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", format_issue_report(context));
         Ok(())
+    }
+
+    // ===== TUI status bar snapshot accessors =====
+    // These are read-only views into LiveCli state for the TUI StatusBar to
+    // render. They are feature-gated to avoid dead-code warnings when full-tui
+    // is disabled.
+
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn model_snapshot(&self) -> &str {
+        &self.model
+    }
+
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn cumulative_usage_snapshot(&self) -> runtime::TokenUsage {
+        self.cumulative_usage
+    }
+
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn permission_mode_label(&self) -> &'static str {
+        self.permission_mode.as_str()
+    }
+
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn git_branch_snapshot(&self) -> Option<String> {
+        crate::format::status_context(None).ok().and_then(|c| c.git_branch)
+    }
+
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn goal_badge_snapshot(&self) -> Option<String> {
+        // Return plain text (no ANSI codes) for TUI rendering.
+        // ratatui applies its own styling via Span::styled.
+        let goal = self.goal_manager.active()?;
+        match &goal.state {
+            runtime::GoalState::Active => Some("🎯 goal".to_string()),
+            runtime::GoalState::Blocked { .. } => {
+                Some(format!("⚠ goal ({}/3)", goal.blocked_count))
+            }
+            runtime::GoalState::Paused { .. } => None,
+        }
+    }
+
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn session_id_snapshot(&self) -> &str {
+        &self.session.id
     }
 }
 
