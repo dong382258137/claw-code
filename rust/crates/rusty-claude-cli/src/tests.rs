@@ -375,6 +375,7 @@ fn defaults_to_repl_when_no_args() {
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
+            tui: false,
         }
     );
 }
@@ -848,6 +849,7 @@ fn parses_permission_mode_flag() {
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
+            tui: false,
         }
     );
 }
@@ -871,6 +873,7 @@ fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
+            tui: false,
         }
     );
 }
@@ -932,6 +935,7 @@ fn parses_allowed_tools_flags_with_aliases_and_lists() {
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
+            tui: false,
         }
     );
 }

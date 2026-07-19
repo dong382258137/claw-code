@@ -137,6 +137,9 @@ pub(crate) enum CliAction {
         additional_workspace_roots: Vec<PathBuf>,
         /// 启动时设定的输出冗度（由 `--verbose`/`--quiet`/`--silent` 设置）。
         output_verbosity: OutputVerbosity,
+        /// 启用 full-tui 模式：使用 ratatui 全屏 TUI 替代 inline REPL。
+        /// 仅当 `full-tui` Cargo feature 启用时生效；否则报错。
+        tui: bool,
     },
     HelpTopic {
         topic: LocalHelpTopic,
@@ -184,6 +187,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // `--verbose`/`--quiet`/`--silent` 设定的输出冗度。默认 `Full`。
     // 多次出现时后覆盖先，与多数 CLI 工具行为一致。
     let mut output_verbosity = OutputVerbosity::default();
+    // `--tui`：启用 full-tui 模式（ratatui 全屏 TUI 替代 inline REPL）。
+    // 仅当 `full-tui` Cargo feature 启用时生效；否则在 dispatch 阶段报错。
+    let mut tui = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -297,6 +303,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             // 冗度控制：后覆盖先。`--verbose` 显式回到 Full（覆盖之前的 --quiet）。
             "--verbose" => {
                 output_verbosity = OutputVerbosity::Full;
+                index += 1;
+            }
+            "--tui" => {
+                tui = true;
                 index += 1;
             }
             "--quiet" => {
@@ -451,6 +461,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allow_broad_cwd,
             additional_workspace_roots: additional_workspace_roots.clone(),
             output_verbosity: output_verbosity.clone(),
+            tui,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {

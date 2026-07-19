@@ -264,6 +264,29 @@ pub(crate) fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
+/// Shared LiveCli construction for both inline REPL and TUI modes.
+/// Returns the constructed LiveCli with reasoning effort set.
+pub(crate) fn build_live_cli_for_repl(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    additional_workspace_roots: Vec<PathBuf>,
+    output_verbosity: OutputVerbosity,
+    reasoning_effort: Option<String>,
+) -> Result<LiveCli, Box<dyn std::error::Error>> {
+    let resolved_model = resolve_repl_model(model);
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        additional_workspace_roots,
+        output_verbosity,
+    )?;
+    cli.set_reasoning_effort(reasoning_effort);
+    Ok(cli)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn run_repl(
     model: String,
@@ -284,18 +307,16 @@ pub(crate) fn run_repl(
     // conhost 右键粘贴会逐行发送，第一行 Submit 后，后续行会快速触发 Submit。
     // claw 用此 Vec 丢弃后续行（与剪贴板剩余行匹配）。
     let mut pending_paste_lines: Vec<String> = Vec::new();
-    let resolved_model = resolve_repl_model(model);
     let t0 = std::time::Instant::now();
-    let mut cli = LiveCli::new(
-        resolved_model,
-        true,
+    let mut cli = build_live_cli_for_repl(
+        model,
         allowed_tools,
         permission_mode,
         additional_workspace_roots,
         output_verbosity,
+        reasoning_effort,
     )?;
     let t_cli = t0.elapsed();
-    cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     let t_editor = t0.elapsed();

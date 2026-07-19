@@ -452,6 +452,33 @@ pub(crate) fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> 
     })
 }
 
+/// Entry point for `claw --tui`: construct LiveCli via the shared helper and
+/// hand off to `tui::run_tui_repl`. Only compiled when `full-tui` feature is on;
+/// without the feature, the dispatch in `run()` prints an error and exits.
+#[cfg(feature = "full-tui")]
+fn run_tui_repl_entry(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+    additional_workspace_roots: Vec<PathBuf>,
+    output_verbosity: OutputVerbosity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    run_stale_base_preflight(base_commit.as_deref());
+    let cli = build_live_cli_for_repl(
+        model,
+        allowed_tools,
+        permission_mode,
+        additional_workspace_roots,
+        output_verbosity,
+        reasoning_effort,
+    )?;
+    tui::app::run_tui_repl(cli)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -587,16 +614,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_broad_cwd,
             additional_workspace_roots,
             output_verbosity,
-        } => run_repl(
-            model,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-            additional_workspace_roots,
-            output_verbosity,
-        )?,
+            tui,
+        } => {
+            if tui {
+                #[cfg(feature = "full-tui")]
+                {
+                    return run_tui_repl_entry(
+                        model,
+                        allowed_tools,
+                        permission_mode,
+                        base_commit,
+                        reasoning_effort,
+                        allow_broad_cwd,
+                        additional_workspace_roots,
+                        output_verbosity,
+                    );
+                }
+                #[cfg(not(feature = "full-tui"))]
+                {
+                    eprintln!(
+                        "error: --tui requires the `full-tui` Cargo feature.\n\
+                         Rebuild with: cargo build --release --features full-tui"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            run_repl(
+                model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort,
+                allow_broad_cwd,
+                additional_workspace_roots,
+                output_verbosity,
+            )?
+        }
         CliAction::HelpTopic {
             topic,
             output_format,
