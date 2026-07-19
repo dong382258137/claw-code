@@ -21,6 +21,9 @@ mod commands_handler;
 mod format;
 mod app;
 
+#[cfg(feature = "full-tui")]
+mod tui;
+
 #[cfg(test)]
 mod tests;
 
