@@ -331,3 +331,134 @@ fn sync_status_from_cli_inner(guard: &mut StatusBarState, cli: &LiveCli) {
     guard.provider =
         crate::provider_label(api::detect_provider_kind(cli.model_snapshot())).to_string();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streaming::{StatusEmitter, StatusEvent};
+    use crate::tui::output_view::{OutputBuffer, OutputView};
+    use crate::tui::status_bar::StatusBarState;
+    use runtime::TokenUsage;
+    use std::sync::{Arc, Mutex};
+
+    /// Build an emitter identical to the one handle_submit constructs, for
+    /// direct testing without spinning up a full LiveCli.
+    fn build_test_emitter(
+        output_handle: Arc<Mutex<OutputBuffer>>,
+        status_handle: Arc<Mutex<StatusBarState>>,
+    ) -> StatusEmitter {
+        Arc::new(move |event: StatusEvent| {
+            match event {
+                StatusEvent::TextDelta(text) => {
+                    if let Ok(mut buf) = output_handle.lock() {
+                        buf.append(&text);
+                    }
+                }
+                StatusEvent::Usage(usage) => {
+                    if let Ok(mut guard) = status_handle.lock() {
+                        guard.turn_usage.input_tokens += usage.input_tokens;
+                        guard.turn_usage.output_tokens += usage.output_tokens;
+                        guard.turn_usage.cache_creation_input_tokens +=
+                            usage.cache_creation_input_tokens;
+                        guard.turn_usage.cache_read_input_tokens +=
+                            usage.cache_read_input_tokens;
+                    }
+                }
+                StatusEvent::StreamStart => {
+                    if let Ok(mut guard) = status_handle.lock() {
+                        guard.reset_turn();
+                    }
+                }
+                StatusEvent::MessageStop => {
+                    if let Ok(mut guard) = status_handle.lock() {
+                        if guard.streaming {
+                            guard.finish_turn();
+                        }
+                    }
+                }
+                StatusEvent::ToolUse { .. } => {}
+            }
+        })
+    }
+
+    #[test]
+    fn emitter_textdelta_appends_to_output_view() {
+        let mut output_view = OutputView::new();
+        let handle = output_view.shared_handle();
+        let status = StatusBarState::shared();
+        let emitter = build_test_emitter(handle, Arc::clone(&status));
+
+        emitter(StatusEvent::TextDelta("Hello ".to_string()));
+        emitter(StatusEvent::TextDelta("world!".to_string()));
+
+        assert_eq!(output_view.snapshot(), "Hello world!");
+    }
+
+    #[test]
+    fn emitter_usage_accumulates_into_turn_usage() {
+        let output_view = OutputView::new();
+        let handle = output_view.shared_handle();
+        let status = StatusBarState::shared();
+        let emitter = build_test_emitter(handle, Arc::clone(&status));
+
+        let usage1 = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        let usage2 = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 75,
+            ..Default::default()
+        };
+        emitter(StatusEvent::Usage(usage1));
+        emitter(StatusEvent::Usage(usage2));
+
+        let guard = status.lock().unwrap();
+        assert_eq!(guard.turn_usage.input_tokens, 300);
+        assert_eq!(guard.turn_usage.output_tokens, 125);
+    }
+
+    #[test]
+    fn emitter_streamstart_then_messagestop_folds_turn_into_cumulative() {
+        let output_view = OutputView::new();
+        let handle = output_view.shared_handle();
+        let status = StatusBarState::shared();
+        let emitter = build_test_emitter(handle, Arc::clone(&status));
+
+        emitter(StatusEvent::StreamStart);
+        {
+            let guard = status.lock().unwrap();
+            assert!(guard.streaming);
+        }
+
+        let usage = TokenUsage {
+            input_tokens: 500,
+            output_tokens: 250,
+            ..Default::default()
+        };
+        emitter(StatusEvent::Usage(usage));
+
+        emitter(StatusEvent::MessageStop);
+        {
+            let guard = status.lock().unwrap();
+            assert!(!guard.streaming);
+            assert_eq!(guard.cumulative_usage.input_tokens, 500);
+            assert_eq!(guard.cumulative_usage.output_tokens, 250);
+            assert_eq!(guard.turn_usage.total_tokens(), 0);
+        }
+    }
+
+    #[test]
+    fn emitter_does_not_panic_under_normal_usage() {
+        // Verify the emitter doesn't panic when called without lock contention.
+        let output_view = OutputView::new();
+        let handle = output_view.shared_handle();
+        let status = StatusBarState::shared();
+        let emitter = build_test_emitter(handle, status);
+
+        emitter(StatusEvent::StreamStart);
+        emitter(StatusEvent::TextDelta("safe".to_string()));
+        emitter(StatusEvent::MessageStop);
+    }
+}
