@@ -7,6 +7,11 @@
 //!
 //! Rendering to a ratatui `Frame` happens in `render_status_bar` (added in Task 4).
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Widget;
 use std::sync::{Arc, Mutex};
 
 use runtime::TokenUsage;
@@ -75,6 +80,90 @@ impl StatusBarState {
     }
 }
 
+/// Ratatui widget that renders the persistent status bar.
+///
+/// Renders a single line at the bottom of the terminal showing:
+/// `│ model via provider │ 📁 cwd │ 🌿 branch │ 🔢 tokens │ 💰 cost │ 🎯 goal │`
+pub(crate) struct StatusBar<'a> {
+    pub state: &'a StatusBarState,
+}
+
+impl<'a> Widget for StatusBar<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let style_dim = Style::default().fg(Color::DarkGray);
+        let style_model = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let style_provider = Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC);
+        let style_tokens = Style::default().fg(Color::Yellow);
+        let style_cost = Style::default().fg(Color::Green);
+        let style_branch = Style::default().fg(Color::Magenta);
+        let style_goal = if self.state.goal_badge.contains("⚠") {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        let style_poor = Style::default().fg(Color::Yellow);
+        let style_streaming = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled("│ ", style_dim));
+        spans.push(Span::styled(&self.state.model, style_model));
+        spans.push(Span::styled(" via ", style_dim));
+        spans.push(Span::styled(&self.state.provider, style_provider));
+
+        spans.push(Span::styled(" │ ", style_dim));
+        spans.push(Span::styled("📁 ", style_dim));
+        spans.push(Span::styled(&self.state.cwd, style_dim));
+
+        if !self.state.git_branch.is_empty() {
+            spans.push(Span::styled(" │ ", style_dim));
+            spans.push(Span::styled("🌿 ", style_dim));
+            spans.push(Span::styled(&self.state.git_branch, style_branch));
+        }
+
+        spans.push(Span::styled(" │ ", style_dim));
+        spans.push(Span::styled("🔢 ", style_dim));
+        spans.push(Span::styled(self.state.total_tokens().to_string(), style_tokens));
+        spans.push(Span::styled(" tok", style_dim));
+
+        spans.push(Span::styled(" │ ", style_dim));
+        spans.push(Span::styled("💰 ", style_dim));
+        // Cost formatting: $0.0000 for precision
+        let cost = estimate_cost(&self.state.cumulative_usage, &self.state.model);
+        spans.push(Span::styled(format!("${cost:.4}"), style_cost));
+
+        if self.state.streaming {
+            spans.push(Span::styled(" │ ", style_dim));
+            let elapsed_s = self.state.turn_elapsed_ms / 1000;
+            spans.push(Span::styled(format!("⏱ {elapsed_s}s"), style_streaming));
+        }
+
+        if !self.state.goal_badge.is_empty() {
+            spans.push(Span::styled(" │ ", style_dim));
+            spans.push(Span::styled(&self.state.goal_badge, style_goal));
+        }
+
+        if self.state.poor_mode {
+            spans.push(Span::styled(" │ ", style_dim));
+            spans.push(Span::styled("🪙 poor", style_poor));
+        }
+
+        spans.push(Span::styled(" │", style_dim));
+
+        let line = Line::from(spans);
+        Widget::render(line, area, buf);
+    }
+}
+
+/// Cost estimate helper — delegates to runtime's pricing logic.
+/// For TUI display only; the authoritative cost calc lives in `format_status_bar`.
+fn estimate_cost(usage: &TokenUsage, model: &str) -> f64 {
+    let pricing = runtime::pricing_for_model(model);
+    pricing.map_or_else(
+        || usage.estimate_cost_usd().total_cost_usd(),
+        |p| usage.estimate_cost_usd_with_pricing(p).total_cost_usd(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +202,52 @@ mod tests {
         state.cumulative_usage.input_tokens = 1000;
         state.turn_usage.input_tokens = 200;
         assert_eq!(state.total_tokens(), 1200);
+    }
+
+    #[test]
+    fn status_bar_renders_without_panic() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut state = StatusBarState::default();
+        state.model = "claude-opus-4-6".to_string();
+        state.provider = "Anthropic".to_string();
+        state.cwd = "~/claw".to_string();
+        state.git_branch = "main".to_string();
+        state.cumulative_usage.input_tokens = 1000;
+        state.cumulative_usage.output_tokens = 500;
+        state.goal_badge = "🎯 goal".to_string();
+
+        let widget = StatusBar { state: &state };
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        // Verify the buffer contains the model name somewhere
+        let content = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(content.contains("claude-opus-4-6"));
+        assert!(content.contains("Anthropic"));
+        assert!(content.contains("~/claw"));
+        assert!(content.contains("main"));
+    }
+
+    #[test]
+    fn status_bar_shows_streaming_indicator_when_streaming() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut state = StatusBarState::default();
+        state.model = "test-model".to_string();
+        state.streaming = true;
+        state.turn_elapsed_ms = 5000;
+
+        let widget = StatusBar { state: &state };
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        let content = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(content.contains("⏱"));
+        assert!(content.contains("5s"));
     }
 }
