@@ -375,6 +375,21 @@ pub struct ConversationRuntime<C, T> {
     /// LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
     /// 详见 docs/harness-engineering-optimization-plan.md Step 3.2。
     multi_agent_coordinator: Option<MultiAgentCoordinator>,
+    /// P0-3:NOTEBOOK 刷新提醒 flag。
+    ///
+    /// 当 microcompact / auto_compaction / reactive compaction 压缩了
+    /// tool result 后置 true,下一次 request 构造时在 system_prompt
+    /// 变动区追加提醒,引导 LLM 调用 `notebook_update` 刷新 `<plan>` 和
+    /// `<subagents>` 段,确保关键信息不丢失。LLM 调用 notebook_update
+    /// 后清除。
+    ///
+    /// 论文依据:Anthropic Multi-Agent Research System — "The LeadResearcher
+    /// begins by thinking through the approach and saving its plan to Memory
+    /// to persist the context, since if the context window exceeds 200,000
+    /// tokens it will be truncated and it is important to retain the plan."
+    /// CompactionRL (arXiv:2607.05378) — summary 必须保留 original goal /
+    /// completed actions / unresolved errors / current state。
+    notebook_refresh_pending: bool,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -438,6 +453,7 @@ where
             trace_analyzer: None,
             turn_start: Cell::new(None),
             multi_agent_coordinator: None,
+            notebook_refresh_pending: false,
         }
     }
 
@@ -923,6 +939,24 @@ where
                     // 导致整个 agent 无法运行),但记录到 stderr 供排查。
                     // 实际加载错误在 else 分支已经被静默忽略(load 返回 Ok(empty)),
                     // 只有 parse 错误才会进入 Err,这里不额外日志。
+
+                    // P0-3:压缩后 NOTEBOOK 刷新提醒。
+                    // 当 microcompact / auto_compaction / reactive compaction
+                    // 压缩了 tool result 后,flag 被置 true。这里注入提醒,
+                    // 引导 LLM 主动调用 notebook_update 刷新 <plan> 和 <subagents>
+                    // 段,确保关键信息(决策、子智能体注册表)在后续压缩中不丢失。
+                    // LLM 调用 notebook_update 后,execute_notebook_update 清除 flag。
+                    if self.notebook_refresh_pending {
+                        system_split.dynamic_sections.push(
+                            "# ⚠️ Context Compaction Detected — NOTEBOOK Refresh Required\n\
+                             上下文刚刚被压缩,部分旧 tool result 已被摘要替换。\n\
+                             **请立即调用 `notebook_update` 工具**刷新以下段:\n\
+                             - `<plan>`:当前任务的关键决策、约束、进度(若已变化)\n\
+                             - `<subagents>`:已 dispatch 的子智能体注册表(防止重复 dispatch)\n\
+                             - `<attempted>`:已尝试的方案(防止重复尝试失败方案)\n\
+                             这是防止长程任务中关键信息丢失的关键步骤。".to_string()
+                        );
+                    }
                 }
                 if let Some(assembler) = &self.context_assembler {
                     // 统一注入路径:把所有动态内容通过 assembler 收集。
@@ -983,10 +1017,22 @@ where
                     match reactive_state {
                         ReactiveCompactState::NotAttempted => {
                             // Step 1: aggressive microcompact (preserve_recent=2).
+                            let before_len = crate::conversation::tool_result_output_len(
+                                &self.session.messages,
+                            );
                             let microcompacted = crate::compact::microcompact(
                                 &self.session.messages,
                                 REACTIVE_MICROCOMPACT_PRESERVE_RECENT,
                             );
+                            let after_len = crate::conversation::tool_result_output_len(
+                                &microcompacted,
+                            );
+                            // P0-3:reactive microcompact 发生压缩,置 flag。
+                            // continue 后回到 loop 顶部,request 重新构造,
+                            // system_prompt 会注入 NOTEBOOK 刷新提醒。
+                            if after_len < before_len {
+                                self.notebook_refresh_pending = true;
+                            }
                             self.session.messages = microcompacted;
                             reactive_state = ReactiveCompactState::MicrocompactDone;
                             continue;
@@ -1000,6 +1046,8 @@ where
                             );
                             if result.removed_message_count > 0 {
                                 self.session = result.compacted_session;
+                                // P0-3:reactive full compact 删除了消息,置 flag。
+                                self.notebook_refresh_pending = true;
                                 reactive_state = ReactiveCompactState::FullCompactDone;
                                 continue;
                             }
@@ -1325,6 +1373,14 @@ where
         // Write / Delete and error results are always preserved.
         let microcompacted =
             crate::compact::microcompact(&self.session.messages, MICROCOMPACT_PRESERVE_RECENT);
+        // P0-3:检测 microcompact 是否发生了实质性压缩(旧 tool result 被替换)。
+        // 比较前后 tool result blocks 的总 output 长度,若减少则置刷新 flag,
+        // 下个 turn 的 system_prompt 会注入 NOTEBOOK 刷新提醒。
+        if crate::conversation::tool_result_output_len(&microcompacted)
+            < crate::conversation::tool_result_output_len(&self.session.messages)
+        {
+            self.notebook_refresh_pending = true;
+        }
         self.session.messages = microcompacted;
 
         let auto_compaction = self.maybe_auto_compact();
@@ -1629,7 +1685,7 @@ where
     /// 流程:委托 [`notebook::execute_notebook_update`] 处理。
     /// 需要 `workspace_root` 已通过 [`set_workspace_root`] 设置。
     fn execute_notebook_update(
-        &self,
+        &mut self,
         input: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let Some(workspace_root) = &self.workspace_root else {
@@ -1639,7 +1695,12 @@ where
                     .to_string(),
             );
         };
-        match crate::notebook::execute_notebook_update(workspace_root, input) {
+        let result = crate::notebook::execute_notebook_update(workspace_root, input);
+        // P0-3:无论成功失败,只要 LLM 调用了 notebook_update,说明它已响应
+        // 刷新提醒,清除 flag 避免重复提醒。失败时 LLM 会从返回消息看到错误
+        // 并自行决定下一步,不需要继续提醒。
+        self.notebook_refresh_pending = false;
+        match result {
             Ok(message) => Ok(message),
             Err(error) => Ok(format!("notebook_update failed: {error}")),
         }
@@ -1714,6 +1775,10 @@ where
         }
 
         self.session = result.compacted_session;
+        // P0-3:大压缩发生(删除了消息),提醒 LLM 下个 turn 刷新 NOTEBOOK。
+        // auto_compaction 比 microcompact 更激进,会删除整条消息而非替换,
+        // 关键信息丢失风险更高,因此必须刷新 NOTEBOOK。
+        self.notebook_refresh_pending = true;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
@@ -1885,6 +1950,25 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
             .ok()
             .as_deref(),
     )
+}
+
+/// P0-3 辅助:计算 messages 中所有 ToolResult block 的 output 总长度。
+///
+/// 用于检测 microcompact 前后是否发生了实质性压缩(旧 tool result 被替换)。
+/// 只统计 `role == Tool` 消息中 `ContentBlock::ToolResult` 的 output 字段,
+/// 因为 microcompact 只替换这些 block,其他内容不变。
+#[must_use]
+pub fn tool_result_output_len(messages: &[ConversationMessage]) -> usize {
+    use crate::session::ContentBlock;
+    messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .flat_map(|m| m.blocks.iter())
+        .map(|block| match block {
+            ContentBlock::ToolResult { output, .. } => output.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 #[must_use]
@@ -4103,5 +4187,109 @@ mod tests {
 
         // Sanity check: still no memory surface, and we did not panic.
         assert!(runtime.persistent_memory().is_none());
+    }
+
+    // ----- P0-3: NOTEBOOK 刷新提醒测试 -----
+    //
+    // 验证 tool_result_output_len 辅助函数能正确统计 ToolResult output 长度,
+    // 用于检测 microcompact 前后是否发生实质性压缩。
+
+    #[test]
+    fn tool_result_output_len_counts_only_tool_result_blocks() {
+        use crate::session::{ContentBlock, ConversationMessage, MessageRole};
+        let messages = vec![
+            ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![ContentBlock::Text {
+                    text: "user query".to_string(),
+                }],
+                usage: None,
+            },
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "1".to_string(),
+                    tool_name: "Read".to_string(),
+                    output: "line1\nline2\nline3".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "2".to_string(),
+                        tool_name: "Bash".to_string(),
+                        output: "output2".to_string(),
+                        is_error: false,
+                    },
+                    // 非 ToolResult block 不计入
+                    ContentBlock::Text {
+                        text: "ignored".to_string(),
+                    },
+                ],
+                usage: None,
+            },
+        ];
+        // "line1\nline2\nline3" (17) + "output2" (7) = 24
+        assert_eq!(
+            super::tool_result_output_len(&messages),
+            17 + 7,
+            "should sum only ToolResult output lengths"
+        );
+    }
+
+    #[test]
+    fn tool_result_output_len_zero_for_empty() {
+        use crate::session::{ConversationMessage, MessageRole};
+        let empty: Vec<ConversationMessage> = vec![];
+        assert_eq!(super::tool_result_output_len(&empty), 0);
+
+        let no_tool = vec![ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![crate::session::ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            usage: None,
+        }];
+        assert_eq!(super::tool_result_output_len(&no_tool), 0);
+    }
+
+    #[test]
+    fn tool_result_output_len_decreases_after_microcompact() {
+        // 模拟 microcompact 行为:旧 tool result 的 output 被替换成短 summary。
+        // 验证 tool_result_output_len 能检测到长度减少。
+        use crate::session::{ContentBlock, ConversationMessage, MessageRole};
+        let long_output = "very long file content\n".repeat(100);
+        let before = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "1".to_string(),
+                tool_name: "Read".to_string(),
+                output: long_output.clone(),
+                is_error: false,
+            }],
+            usage: None,
+        }];
+        let after = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "1".to_string(),
+                tool_name: "Read".to_string(),
+                output: "Read: file.rs (summarized)".to_string(),
+                is_error: false,
+            }],
+            usage: None,
+        }];
+        let before_len = super::tool_result_output_len(&before);
+        let after_len = super::tool_result_output_len(&after);
+        assert!(
+            after_len < before_len,
+            "microcompact should reduce tool_result output length: {after_len} < {before_len}"
+        );
+        // 这个差值就是 P0-3 flag 触发的依据
+        assert!(before_len > 1000, "before should be long: {before_len}");
+        assert!(after_len < 100, "after should be short: {after_len}");
     }
 }
