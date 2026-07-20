@@ -4,13 +4,18 @@
 //!
 //! 架构:
 //! - [`TraceRecord`]:简化的本地 trace 记录类型(一行 CSV 对应一条记录)。
-//! - [`TraceAnalyzer`]:加载/导出 CSV,计算基础统计,简单失败聚类。
+//! - [`TraceAnalyzer`]:加载/导出 CSV,计算基础统计,失败聚类。
 //! - [`TraceStats`]:turn latency / tool call count / compact 触发率等指标直方图。
-//! - [`FailureCluster`]:按 `failure_kind` 简单分桶(阶段 4 替换为 K-means on embeddings)。
+//! - [`FailureCluster`]:失败聚类结果。
+//! - 双模式聚类:
+//!   - [`TraceAnalyzer::cluster_failures`]:按 `failure_kind` 简单分桶(向后兼容)。
+//!   - [`TraceAnalyzer::cluster_failures_kmeans`]:K-means on
+//!     `(failure_kind, error_message_embedding)` — Step 3.3 真正实现。
+//!     需注入 [`EmbeddingProvider`](crate::memory_semantic::EmbeddingProvider);
+//!     `None` 时退化为按 `failure_kind` 分桶。
 //!
 //! **不在本步骤实现**(留到阶段 4 Self-Improving Harness):
 //! - OTLP exporter(默认 CSV exporter 已足够支撑阶段 4 入口)
-//! - 真正的 K-means 聚类(需要 `error_message` embedding)
 //! - 闭环反馈到 `RecoveryOrchestrator`
 //!
 //! **缓存影响**:无 — 纯观测层,不进入 prompt 稳定区/变动区。
@@ -21,11 +26,23 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory_semantic::{cosine_similarity, EmbeddingProvider};
+
 /// CSV 表头,固定顺序与 [`TraceRecord`] 字段一一对应。
 pub const CSV_HEADER: &str = "turn_id,latency_ms,tool_calls,compact_triggered,failure_kind,error_message";
 
 /// 每个聚类最多保留的样本错误消息条数,避免聚类膨胀。
 pub const MAX_SAMPLE_ERRORS_PER_CLUSTER: usize = 5;
+
+/// K-means 聚类时,每个 `failure_kind` 分组内的最大 cluster 数。
+///
+/// Step 3.3:同一 `failure_kind` 下用 K-means 二次切分,避免一个 kind 内
+/// 几十条样本全堆在一个 cluster。3 是经验值(网络/权限/超时等典型 kind
+/// 内部通常有 2-3 个语义子簇)。
+pub const MAX_KMEANS_CLUSTERS_PER_KIND: usize = 3;
+
+/// K-means 最大迭代次数。10 轮对 384 维 BGE-small 足够收敛。
+pub const KMEANS_MAX_ITERATIONS: usize = 10;
 
 /// 简化的本地 trace 记录类型 — 一行 CSV 对应一条记录。
 ///
@@ -77,12 +94,18 @@ impl TraceRecord {
     }
 }
 
-/// 失败聚类 — 按 `failure_kind` 简单分桶。
+/// 失败聚类 — 双模式聚类的统一输出类型。
 ///
-/// 阶段 4 将替换为 K-means on `(failure_kind, error_message_embedding)`。
+/// - **简单模式** [`TraceAnalyzer::cluster_failures`]:
+///   按 `failure_kind` 简单分桶,`label = failure_kind`。
+/// - **K-means 模式** [`TraceAnalyzer::cluster_failures_kmeans`] (Step 3.3):
+///   按 `(failure_kind, error_message_embedding)` 二次切分,
+///   `label = "{failure_kind}-{cluster_idx}"`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureCluster {
-    /// 聚类标签(等于 `failure_kind`)。
+    /// 聚类标签。
+    /// - 简单模式:等于 `failure_kind`。
+    /// - K-means 模式:`"{failure_kind}-{cluster_idx}"`。
     pub label: String,
     /// 该聚类下的样本数。
     pub count: u32,
@@ -236,10 +259,10 @@ impl TraceAnalyzer {
         }
     }
 
-    /// 简单失败聚类 — 按 `failure_kind` 分桶。
+    /// 简单失败聚类 — 按 `failure_kind` 分桶(向后兼容)。
     ///
-    /// 阶段 4 将替换为 K-means on `(failure_kind, error_message_embedding)`。
     /// 返回顺序:count 降序,label 升序(确保稳定输出便于断言)。
+    /// K-means 语义聚类见 [`cluster_failures_kmeans`](Self::cluster_failures_kmeans)。
     #[must_use]
     pub fn cluster_failures(&self) -> Vec<FailureCluster> {
         let mut buckets: HashMap<String, (u32, Vec<String>)> = HashMap::new();
@@ -267,6 +290,196 @@ impl TraceAnalyzer {
         clusters.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
         clusters
     }
+
+    /// K-means 失败聚类 — Step 3.3 真正实现。
+    ///
+    /// 算法:
+    /// 1. `provider = None` → 退化为 [`cluster_failures`](Self::cluster_failures)
+    ///    (按 `failure_kind` 简单分桶),保证无 embedding 环境下向后兼容。
+    /// 2. `provider = Some` → 按 `failure_kind` 分组,组内对 `error_message` 的
+    ///    embedding 跑 K-means,`K = min(MAX_KMEANS_CLUSTERS_PER_KIND, 组内样本数)`。
+    ///    - 单样本组直接成 1 个 cluster(`label = "{kind}-0"`)。
+    ///    - K-means 收敛条件:assignment 不再变化 或 `KMEANS_MAX_ITERATIONS` 轮。
+    ///    - label 格式:`"{failure_kind}-{cluster_idx}"`。
+    ///
+    /// **确定性**:初始 centroid 选组内前 K 个点(按 turn_id 排序),保证可测试。
+    ///
+    /// **降级**:若 `embed_batch` 失败(如 provider 故障),该 kind 退化为单 cluster。
+    ///
+    /// 返回顺序:count 降序,label 升序(与 [`cluster_failures`](Self::cluster_failures) 一致)。
+    #[must_use]
+    pub fn cluster_failures_kmeans(
+        &self,
+        provider: Option<&dyn EmbeddingProvider>,
+    ) -> Vec<FailureCluster> {
+        // 1. 无 provider → 退化为简单分桶。
+        let Some(provider) = provider else {
+            return self.cluster_failures();
+        };
+
+        // 2. 按 failure_kind 分组,组内收集 (turn_id, error_message) 用于排序与展示。
+        let mut groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for record in &self.records {
+            let Some(kind) = &record.failure_kind else { continue };
+            let msg = record.error_message.clone().unwrap_or_default();
+            groups
+                .entry(kind.clone())
+                .or_default()
+                .push((record.turn_id.clone(), msg));
+        }
+
+        let mut clusters: Vec<FailureCluster> = Vec::new();
+        for (kind, mut samples) in groups {
+            // 组内按 turn_id 排序,保证初始 centroid 选择稳定。
+            samples.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let n = samples.len();
+            let k = MAX_KMEANS_CLUSTERS_PER_KIND.min(n);
+
+            if k <= 1 {
+                // 单样本或 K=1:直接成单 cluster。
+                clusters.push(FailureCluster {
+                    label: format!("{kind}-0"),
+                    count: n as u32,
+                    sample_errors: take_sample_errors(&samples),
+                });
+                continue;
+            }
+
+            // 3. 计算 embeddings。失败时退化为单 cluster。
+            let texts: Vec<&str> = samples.iter().map(|(_, m)| m.as_str()).collect();
+            let embeddings = match provider.embed_batch(&texts) {
+                Ok(emb) => emb,
+                Err(_) => {
+                    clusters.push(FailureCluster {
+                        label: format!("{kind}-0"),
+                        count: n as u32,
+                        sample_errors: take_sample_errors(&samples),
+                    });
+                    continue;
+                }
+            };
+
+            // 4. K-means 聚类。
+            let assignments = kmeans_cluster(&embeddings, k, KMEANS_MAX_ITERATIONS);
+
+            // 5. 按 cluster_idx 分桶,生成 FailureCluster。
+            let mut bucket: HashMap<usize, (u32, Vec<String>)> = HashMap::new();
+            for (idx, assignment) in assignments.iter().enumerate() {
+                let entry = bucket.entry(*assignment).or_default();
+                entry.0 += 1;
+                let msg = &samples[idx].1;
+                if !msg.is_empty() && entry.1.len() < MAX_SAMPLE_ERRORS_PER_CLUSTER {
+                    entry.1.push(msg.clone());
+                }
+            }
+
+            let mut cluster_ids: Vec<usize> = bucket.keys().copied().collect();
+            cluster_ids.sort_unstable();
+            for cluster_idx in cluster_ids {
+                let (count, mut errors) = bucket.remove(&cluster_idx).unwrap_or_default();
+                errors.sort();
+                clusters.push(FailureCluster {
+                    label: format!("{kind}-{cluster_idx}"),
+                    count,
+                    sample_errors: errors,
+                });
+            }
+        }
+
+        // 6. 排序:count 降序,label 升序。
+        clusters.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+        clusters
+    }
+}
+
+/// 从组内样本中提取最多 [`MAX_SAMPLE_ERRORS_PER_CLUSTER`] 条非空错误消息(已排序)。
+fn take_sample_errors(samples: &[(String, String)]) -> Vec<String> {
+    let mut errors: Vec<String> = samples
+        .iter()
+        .map(|(_, m)| m.clone())
+        .filter(|m| !m.is_empty())
+        .take(MAX_SAMPLE_ERRORS_PER_CLUSTER)
+        .collect();
+    errors.sort();
+    errors
+}
+
+/// K-means 聚类 — 基于 cosine similarity 的简化实现。
+///
+/// - **初始化**:前 K 个点作为初始 centroid(确定性,便于测试)。
+/// - **Assign**:每个点分配到 cosine similarity 最大的 centroid。
+/// - **Update**:centroid = cluster 内点的均值(对 cosine similarity 排序保持等价,
+///   因为 cosine similarity 对正缩放不变)。
+/// - **收敛**:assignment 不变 或 达到 `max_iterations`。
+/// - **空 cluster**:保留旧 centroid(不重新初始化,保证确定性)。
+///
+/// 返回每个点的 cluster assignment index(0..k)。
+fn kmeans_cluster(points: &[Vec<f32>], k: usize, max_iterations: usize) -> Vec<usize> {
+    let n = points.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if k == 0 {
+        return vec![0; n];
+    }
+    // k >= n:每个点自成一类。
+    if k >= n {
+        return (0..n).collect();
+    }
+
+    let dim = points[0].len();
+    // 初始 centroid:前 K 个点。
+    let mut centroids: Vec<Vec<f32>> = points[..k].to_vec();
+    let mut assignments = vec![0usize; n];
+
+    for _ in 0..max_iterations {
+        let mut changed = false;
+
+        // Assign step:每个点找 cosine similarity 最大的 centroid。
+        for (i, point) in points.iter().enumerate() {
+            let mut best = 0usize;
+            let mut best_sim = f32::NEG_INFINITY;
+            for (j, centroid) in centroids.iter().enumerate() {
+                let sim = cosine_similarity(point, centroid);
+                if sim > best_sim {
+                    best_sim = sim;
+                    best = j;
+                }
+            }
+            if assignments[i] != best {
+                assignments[i] = best;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        // Update step:centroid = cluster 内点的均值。
+        let mut new_centroids: Vec<Vec<f32>> = vec![vec![0.0f32; dim]; k];
+        let mut counts: Vec<usize> = vec![0; k];
+        for (i, point) in points.iter().enumerate() {
+            let c = assignments[i];
+            counts[c] += 1;
+            for (j, v) in point.iter().enumerate() {
+                new_centroids[c][j] += v;
+            }
+        }
+        for (i, c) in new_centroids.iter_mut().enumerate() {
+            if counts[i] > 0 {
+                let cnt = counts[i] as f32;
+                for v in c.iter_mut() {
+                    *v /= cnt;
+                }
+                centroids[i] = std::mem::take(c);
+            }
+            // counts[i] == 0:保留旧 centroid(centroids[i] 不变)。
+        }
+    }
+
+    assignments
 }
 
 /// Nearest-rank percentile: `rank = ceil(p/100 * n)`, `index = rank - 1`(clamp 到 `[0, n-1]`)。
@@ -444,6 +657,7 @@ fn parse_csv_content(content: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_semantic::{EmbeddingError, HashEmbeddingProvider};
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -709,6 +923,316 @@ mod tests {
         // Best-effort cleanup of created parent directories.
         if let Some(grandparent) = path.parent().and_then(|p| p.parent()) {
             let _ = std::fs::remove_dir_all(grandparent);
+        }
+    }
+
+    // ========================================================================
+    // Step 3.3 K-means 失败聚类测试
+    // ========================================================================
+
+    /// Provider=None 时,cluster_failures_kmeans 退化为 cluster_failures。
+    #[test]
+    fn kmeans_falls_back_to_simple_bucketing_when_no_provider() {
+        let mut analyzer = TraceAnalyzer::new();
+        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "req timed out"));
+        analyzer.add_record(TraceRecord::new("t2", 200, 0).with_failure("timeout", "another timeout"));
+        analyzer.add_record(TraceRecord::new("t3", 300, 0).with_failure("auth", "401 unauthorized"));
+
+        let simple = analyzer.cluster_failures();
+        let kmeans_none = analyzer.cluster_failures_kmeans(None);
+
+        assert_eq!(
+            simple, kmeans_none,
+            "provider=None should produce identical output to cluster_failures()"
+        );
+    }
+
+    /// 单样本 kind 直接成单 cluster,label = "{kind}-0"。
+    #[test]
+    fn kmeans_single_sample_kind_produces_single_cluster() {
+        let mut analyzer = TraceAnalyzer::new();
+        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "req timed out"));
+
+        let provider = HashEmbeddingProvider::new(32);
+        let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
+
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].label, "timeout-0");
+        assert_eq!(clusters[0].count, 1);
+        assert_eq!(clusters[0].sample_errors, vec!["req timed out".to_string()]);
+    }
+
+    /// 多 kind 场景:每个 kind 至少产生 1 个 cluster,label 格式正确。
+    #[test]
+    fn kmeans_multiple_kinds_produce_labelled_clusters() {
+        let mut analyzer = TraceAnalyzer::new();
+        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "connection reset"));
+        analyzer.add_record(TraceRecord::new("t2", 200, 0).with_failure("timeout", "read timeout"));
+        analyzer.add_record(TraceRecord::new("t3", 300, 0).with_failure("auth", "401 unauthorized"));
+        analyzer.add_record(TraceRecord::new("t4", 400, 0).with_failure("auth", "token expired"));
+
+        let provider = HashEmbeddingProvider::new(32);
+        let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
+
+        // 至少 2 个 cluster(每个 kind 至少 1 个),且所有 label 都以 kind 开头。
+        assert!(clusters.len() >= 2, "expected >=2 clusters, got {clusters:?}");
+        for c in &clusters {
+            assert!(
+                c.label.starts_with("timeout-") || c.label.starts_with("auth-"),
+                "unexpected label: {}",
+                c.label
+            );
+        }
+        // 总样本数守恒:2 timeout + 2 auth = 4。
+        let total: u32 = clusters.iter().map(|c| c.count).sum();
+        assert_eq!(total, 4, "sample count should be conserved");
+    }
+
+    /// K 被 `MAX_KMEANS_CLUSTERS_PER_KIND` 上限封顶。
+    /// 当组内样本数远超 K_max 时,cluster 数应 <= K_max。
+    #[test]
+    fn kmeans_caps_k_to_max_clusters_per_kind() {
+        let mut analyzer = TraceAnalyzer::new();
+        // 同一 kind 下放 20 条不同错误消息,远超 MAX_KMEANS_CLUSTERS_PER_KIND。
+        for i in 0..20 {
+            analyzer.add_record(
+                TraceRecord::new(format!("t{i:02}"), 100, 0)
+                    .with_failure("network", format!("error variant #{i}")),
+            );
+        }
+
+        let provider = HashEmbeddingProvider::new(64);
+        let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
+
+        // 该 kind 下 cluster 数应 <= MAX_KMEANS_CLUSTERS_PER_KIND。
+        let network_clusters: Vec<&FailureCluster> =
+            clusters.iter().filter(|c| c.label.starts_with("network-")).collect();
+        assert!(
+            !network_clusters.is_empty(),
+            "expected at least 1 network-* cluster"
+        );
+        assert!(
+            network_clusters.len() <= MAX_KMEANS_CLUSTERS_PER_KIND,
+            "expected <= {} clusters, got {}",
+            MAX_KMEANS_CLUSTERS_PER_KIND,
+            network_clusters.len()
+        );
+        // 样本守恒:20 条全部归入 network-* clusters。
+        let total: u32 = network_clusters.iter().map(|c| c.count).sum();
+        assert_eq!(total, 20);
+    }
+
+    /// K-means 函数:空输入 → 空输出。
+    #[test]
+    fn kmeans_cluster_handles_empty_input() {
+        let assignments = kmeans_cluster(&[], 3, KMEANS_MAX_ITERATIONS);
+        assert!(assignments.is_empty());
+    }
+
+    /// K-means 函数:K=0 → 所有点归 cluster 0(避免除零)。
+    #[test]
+    fn kmeans_cluster_k_zero_returns_all_zero() {
+        let points = vec![vec![1.0f32, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
+        let assignments = kmeans_cluster(&points, 0, KMEANS_MAX_ITERATIONS);
+        assert_eq!(assignments, vec![0, 0, 0]);
+    }
+
+    /// K-means 函数:K >= n → 每个点自成一类。
+    #[test]
+    fn kmeans_cluster_k_ge_n_returns_identity() {
+        let points = vec![vec![1.0f32, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
+        // K == n
+        let assignments = kmeans_cluster(&points, 3, KMEANS_MAX_ITERATIONS);
+        assert_eq!(assignments, vec![0, 1, 2]);
+        // K > n
+        let assignments = kmeans_cluster(&points, 5, KMEANS_MAX_ITERATIONS);
+        assert_eq!(assignments, vec![0, 1, 2]);
+    }
+
+    /// K-means 函数:确定性 — 同样的输入两次调用得到同样的 assignment。
+    #[test]
+    fn kmeans_cluster_is_deterministic() {
+        let points: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        let a1 = kmeans_cluster(&points, 3, KMEANS_MAX_ITERATIONS);
+        let a2 = kmeans_cluster(&points, 3, KMEANS_MAX_ITERATIONS);
+        assert_eq!(a1, a2, "K-means should be deterministic given fixed init");
+        // 3 个清晰分离的 cluster:前 2 / 中 2 / 后 2 应分别归入同一 cluster。
+        assert_eq!(a1[0], a1[1], "points 0,1 should be in same cluster");
+        assert_eq!(a1[2], a1[3], "points 2,3 should be in same cluster");
+        assert_eq!(a1[4], a1[5], "points 4,5 should be in same cluster");
+        assert_ne!(a1[0], a1[2], "cluster 0,2 should differ");
+        assert_ne!(a1[0], a1[4], "cluster 0,4 should differ");
+        assert_ne!(a1[2], a1[4], "cluster 2,4 should differ");
+    }
+
+    /// K-means 函数:相同点应归入同一 cluster(余弦相似度 = 1)。
+    ///
+    /// 注:K 必须 < n,否则会触发 `k >= n` 早退路径(每个点自成一类)。
+    #[test]
+    fn kmeans_cluster_identical_points_collapse_to_one_cluster() {
+        // 4 个相同点,K=3 → K < n,K-means 实际运行。
+        let points: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+        ];
+        let assignments = kmeans_cluster(&points, 3, KMEANS_MAX_ITERATIONS);
+        // 初始 centroid = 前 3 个点(都相同)。第一轮所有点 cos sim to all centroids = 1,
+        // tie-break 选 cluster 0。Update 后 centroid 0 = 点本身,1/2 保持不变。
+        // 第二轮 assignment 不变 → 收敛。所有点归 cluster 0。
+        assert_eq!(assignments, vec![0, 0, 0, 0]);
+    }
+
+    /// K-means 函数:clearly separated 3-cluster 输入应得到 3 个 cluster,
+    /// 且每个 cluster 内点数正确。
+    ///
+    /// 注:初始 centroid = 前 K 个点,因此输入顺序必须让前 K 个点跨越所有 K 个组,
+    /// 否则 K-means 会因 init 不多样而陷入次优解。
+    #[test]
+    fn kmeans_cluster_separates_three_distinct_groups() {
+        // 3 组,每组 4 个相同点,组间正交。**交错排列**让前 3 个点分属 3 个组。
+        let mut points: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..4 {
+            points.push(vec![1.0, 0.0, 0.0]);
+            points.push(vec![0.0, 1.0, 0.0]);
+            points.push(vec![0.0, 0.0, 1.0]);
+        }
+
+        let assignments = kmeans_cluster(&points, 3, KMEANS_MAX_ITERATIONS);
+
+        // 统计每个 cluster 的点数。
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for a in &assignments {
+            *counts.entry(*a).or_default() += 1;
+        }
+        let mut sorted_counts: Vec<usize> = counts.values().copied().collect();
+        sorted_counts.sort_unstable();
+        // 3 个 cluster,每个 4 个点。
+        assert_eq!(sorted_counts, vec![4, 4, 4]);
+    }
+
+    /// cluster_failures_kmeans:provider.embed_batch 失败时,该 kind 退化为单 cluster。
+    #[test]
+    fn kmeans_degrades_to_single_cluster_when_embedding_fails() {
+        /// 故意失败的 provider,用于测试降级路径。
+        struct FailingProvider;
+        impl EmbeddingProvider for FailingProvider {
+            fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+                Err(EmbeddingError::Inference("simulated failure".to_string()))
+            }
+            fn dim(&self) -> usize {
+                8
+            }
+            fn name(&self) -> &str {
+                "failing"
+            }
+        }
+
+        let mut analyzer = TraceAnalyzer::new();
+        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "error a"));
+        analyzer.add_record(TraceRecord::new("t2", 200, 0).with_failure("timeout", "error b"));
+        analyzer.add_record(TraceRecord::new("t3", 300, 0).with_failure("timeout", "error c"));
+
+        let provider = FailingProvider;
+        let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
+
+        // embedding 失败 → 该 kind 退化为单 cluster。
+        assert_eq!(clusters.len(), 1, "expected 1 cluster on embed failure");
+        assert_eq!(clusters[0].label, "timeout-0");
+        assert_eq!(clusters[0].count, 3);
+    }
+
+    /// cluster_failures_kmeans:无 failure_kind 的记录被忽略。
+    #[test]
+    fn kmeans_ignores_records_without_failure_kind() {
+        let mut analyzer = TraceAnalyzer::new();
+        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "err"));
+        analyzer.add_record(TraceRecord::new("t2", 200, 0)); // 无 failure
+        analyzer.add_record(TraceRecord::new("t3", 300, 0)); // 无 failure
+
+        let provider = HashEmbeddingProvider::new(16);
+        let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
+
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].label, "timeout-0");
+        assert_eq!(clusters[0].count, 1);
+    }
+
+    /// cluster_failures_kmeans:空 analyzer 返回空 vec。
+    #[test]
+    fn kmeans_empty_analyzer_returns_empty() {
+        let analyzer = TraceAnalyzer::new();
+        let provider = HashEmbeddingProvider::new(16);
+        let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
+        assert!(clusters.is_empty());
+    }
+
+    /// cluster_failures_kmeans:sample_errors 被封顶到 MAX_SAMPLE_ERRORS_PER_CLUSTER。
+    #[test]
+    fn kmeans_caps_sample_errors_per_cluster() {
+        let mut analyzer = TraceAnalyzer::new();
+        // 同 kind、同 embedding → K-means 应归入 1 个 cluster(MAX_KMEANS=3,但
+        // 所有点相同,实际收敛到 1 个 cluster)。
+        for i in 0..(MAX_SAMPLE_ERRORS_PER_CLUSTER + 5) {
+            analyzer.add_record(
+                TraceRecord::new(format!("t{i:02}"), 100, 0)
+                    .with_failure("timeout", "identical error"),
+            );
+        }
+
+        let provider = HashEmbeddingProvider::new(32);
+        let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
+
+        // 总样本数守恒。
+        let total: u32 = clusters.iter().map(|c| c.count).sum();
+        assert_eq!(total, (MAX_SAMPLE_ERRORS_PER_CLUSTER + 5) as u32);
+        // 至少一个 cluster 的 sample_errors 被封顶(不一定所有 cluster 都触及上限)。
+        let max_sample_len = clusters.iter().map(|c| c.sample_errors.len()).max().unwrap_or(0);
+        assert!(
+            max_sample_len <= MAX_SAMPLE_ERRORS_PER_CLUSTER,
+            "sample_errors should be capped, got {max_sample_len}"
+        );
+    }
+
+    /// cluster_failures_kmeans:K-means 输出顺序遵循 count 降序、label 升序。
+    #[test]
+    fn kmeans_output_sorted_by_count_desc_then_label_asc() {
+        let mut analyzer = TraceAnalyzer::new();
+        // auth kind:5 条
+        for i in 0..5 {
+            analyzer.add_record(
+                TraceRecord::new(format!("a{i:02}"), 100, 0)
+                    .with_failure("auth", format!("auth error {i}")),
+            );
+        }
+        // timeout kind:2 条
+        for i in 0..2 {
+            analyzer.add_record(
+                TraceRecord::new(format!("t{i:02}"), 100, 0)
+                    .with_failure("timeout", format!("timeout error {i}")),
+            );
+        }
+
+        let provider = HashEmbeddingProvider::new(32);
+        let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
+
+        // 验证排序:count 降序,同 count 时 label 升序。
+        for w in clusters.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            assert!(
+                a.count > b.count || (a.count == b.count && a.label <= b.label),
+                "sort violation: {:?} before {:?}",
+                a,
+                b
+            );
         }
     }
 }
