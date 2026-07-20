@@ -469,6 +469,12 @@ impl AnthropicRuntimeClient {
                             redacted: false,
                         });
                     }
+                    events.push(AssistantEvent::Usage(
+                        start.message.usage.token_usage(),
+                    ));
+                    self.emit_status(StatusEvent::Usage(
+                        start.message.usage.token_usage(),
+                    ));
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
                     push_output_block(
