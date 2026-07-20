@@ -970,10 +970,27 @@ pub(crate) fn extract_system_messages(messages: &[ConversationMessage]) -> (Stri
 /// ≈ 135 k tokens）。本函数把这些状态变更型工具的输出剥离为简短人类可读消息；
 /// 完整结构化数据仍保留在 session 中用于展示与回放。
 ///
+/// 当 `is_error` 为 `true` 时，工具本身已经返回错误结果，此时不再套用“成功”模板，
+/// 而是原样返回错误内容（或从 JSON 错误对象中提取 `.error` 字段），避免把
+/// "old_string not found in file" 这种错误包装成 "The file unknown has been updated
+/// successfully." 的误导性消息。
+///
 /// 行为镜像 upstream Claude Code（TS 版）的 `mapToolResultToToolResultBlockParam`。
-pub(crate) fn compact_tool_output_for_model(tool_name: &str, output: &str) -> String {
+pub(crate) fn compact_tool_output_for_model(
+    tool_name: &str,
+    output: &str,
+    is_error: bool,
+) -> String {
     let parsed: serde_json::Value = serde_json::from_str(output)
         .unwrap_or(serde_json::Value::String(output.to_string()));
+
+    // 错误路径优先短路，防止错误结果被成功模板覆盖。
+    if is_error {
+        return parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| output.to_string(), |s| s.to_string());
+    }
 
     match tool_name {
         "edit_file" | "Edit" => {
@@ -1090,9 +1107,9 @@ pub(crate) fn convert_messages(
                 } => Some(InputContentBlock::ToolResult {
                     tool_use_id: tool_use_id.clone(),
                     content: vec![ToolResultContentBlock::Text {
-                        text: compact_tool_output_for_model(tool_name, output),
-                    }],
-                    is_error: *is_error,
+                    text: compact_tool_output_for_model(tool_name, output, *is_error),
+                }],
+                is_error: *is_error,
                 }),
             })
             .collect::<Vec<_>>();

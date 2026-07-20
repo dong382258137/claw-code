@@ -3977,7 +3977,7 @@ fn compact_tool_output_unwraps_web_search_json() {
     })
     .to_string();
 
-    let compacted = super::compact_tool_output_for_model("WebSearch", &web_search_json);
+    let compacted = super::compact_tool_output_for_model("WebSearch", &web_search_json, false);
     assert!(
         compacted.contains("Tokio"),
         "should extract commentary containing search results, got: {compacted}"
@@ -4004,7 +4004,7 @@ fn compact_tool_output_unwraps_web_fetch_json() {
     })
     .to_string();
 
-    let compacted = super::compact_tool_output_for_model("WebFetch", &web_fetch_json);
+    let compacted = super::compact_tool_output_for_model("WebFetch", &web_fetch_json, false);
     assert_eq!(
         compacted,
         "This page is about Rust programming language features."
@@ -4014,16 +4014,43 @@ fn compact_tool_output_unwraps_web_fetch_json() {
 #[test]
 fn compact_tool_output_passes_through_unknown_tools() {
     let output = "some raw tool output";
-    let compacted = super::compact_tool_output_for_model("Bash", output);
+    let compacted = super::compact_tool_output_for_model("Bash", output, false);
     assert_eq!(compacted, output);
 }
 
 #[test]
 fn compact_tool_output_falls_back_on_invalid_json() {
     let output = "not valid json at all";
-    let compacted = super::compact_tool_output_for_model("WebSearch", output);
+    let compacted = super::compact_tool_output_for_model("WebSearch", output, false);
     assert_eq!(compacted, output);
 }
+
+#[test]
+fn compact_tool_output_preserves_edit_file_error() {
+    // 当 edit_file 因为 old_string 不匹配等原因失败时，runtime 返回 is_error=true
+    // 且 output 通常是一个 JSON 错误对象。我们绝不能把它包装成成功消息，也不能
+    // 因为找不到 filePath 而把路径降级为 "unknown"。
+    let error_output = serde_json::json!({
+        "error": "old_string not found in file",
+        "filePath": "D:\\claw-code-src\\test.txt"
+    })
+    .to_string();
+    let compacted =
+        super::compact_tool_output_for_model("edit_file", &error_output, true);
+    assert!(
+        compacted.contains("old_string not found in file"),
+        "error message should be preserved, got: {compacted}"
+    );
+    assert!(
+        !compacted.contains("has been updated successfully"),
+        "should not claim success on error, got: {compacted}"
+    );
+    assert!(
+        !compacted.contains("unknown"),
+        "should not rewrite path to 'unknown', got: {compacted}"
+    );
+}
+
 #[test]
 fn repl_help_mentions_history_completion_and_multiline() {
     let help = render_repl_help();
