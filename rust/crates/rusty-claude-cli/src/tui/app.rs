@@ -378,9 +378,36 @@ fn run_event_loop(
             // .scroll((max_scroll, 0)). When Some(n), we scroll n lines
             // above the bottom. Paragraph's scroll takes the top-left
             // corner's (row, col); rows beyond the visible area are hidden.
+            //
+            // BUG fix：旧实现用 `output_rendered.lines.len()`（逻辑行数）算
+            // max_scroll，但启用了 `Wrap { trim: false }` 后长行会折成多个
+            // 显示行。若按逻辑行算 max_scroll，follow mode 时 scroll_y 不
+            // 足以滚到真正的底部，Paragraph 顶部渲染会把最后几显示行裁掉，
+            // 看起来像"最后一行被输入框盖住"。这里按显示行计算：
+            //   display_lines(line) = max(1, ceil(line_width / area_width))
+            // 累加得到总显示行数，再算 max_scroll。
             let visible_height = main_area.height.saturating_sub(1) as usize; // -1 for top border
-            let total_lines = output_rendered.lines.len();
-            let max_scroll = total_lines.saturating_sub(visible_height);
+            let area_width = main_area.width as usize;
+            use unicode_width::UnicodeWidthStr;
+            let total_display_lines: usize = output_rendered
+                .lines
+                .iter()
+                .map(|line| {
+                    // ratatui 的 Line 是 Vec<Span>，需要累加所有 span 的 width。
+                    // Span::content 是 Cow<str>，用 UnicodeWidthStr::width 计算视觉宽度。
+                    let w: usize = line
+                        .spans
+                        .iter()
+                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                        .sum();
+                    if w == 0 || area_width == 0 {
+                        1
+                    } else {
+                        ((w + area_width - 1) / area_width).max(1)
+                    }
+                })
+                .sum();
+            let max_scroll = total_display_lines.saturating_sub(visible_height);
             let scroll_y = match scroll_offset {
                 None => max_scroll,
                 Some(offset) => max_scroll.saturating_sub(offset),
@@ -418,7 +445,6 @@ fn run_event_loop(
             let prompt_prefix_len: usize = 2; // "> "
             let (line_idx, _byte_offset_in_line, line_content_before_cursor) =
                 input.cursor_line_and_column();
-            use unicode_width::UnicodeWidthStr;
             let line_display_width = UnicodeWidthStr::width(line_content_before_cursor);
             let cursor_x = prompt_prefix_len + line_display_width;
             // 输入区可见内容行数 = outer[1].height - 1（top border）。一般 = 2。
