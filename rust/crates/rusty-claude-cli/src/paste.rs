@@ -11,6 +11,25 @@
 //! - 视觉效果：用户看到原始多行 → 回车 → 原始内容被清除 → 显示折叠占位符卡片
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// TUI 模式静默标志：true 时禁用 eprintln! 调试日志（避免污染 alternate screen）。
+/// 由 TUI 入口在启动时设置为 true。
+static TUI_SILENT: AtomicBool = AtomicBool::new(false);
+
+/// 设置 TUI 静默模式：TUI 启动时调用 `set_tui_silent(true)`，退出时 `false`。
+pub(crate) fn set_tui_silent(silent: bool) {
+    TUI_SILENT.store(silent, Ordering::Relaxed);
+}
+
+/// 内部调试日志：TUI 模式下静默，CLI 模式下输出到 stderr。
+macro_rules! paste_log {
+    ($($arg:tt)*) => {
+        if !TUI_SILENT.load(Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 /// 粘贴折叠阈值：超过此字符数或行数则折叠为占位符。
 /// 方案 A（激进，小粘贴也折叠）：500 字符 / 3 行。
@@ -68,11 +87,11 @@ pub(crate) fn store_paste_and_make_placeholder(
     };
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if let Err(error) = std::fs::create_dir_all(parent) {
-        eprintln!("[paste-store] create_dir_all failed: {error}; fallback to inline");
+        paste_log!("[paste-store] create_dir_all failed: {error}; fallback to inline");
         return input.to_string();
     }
     if let Err(error) = std::fs::write(&path, input) {
-        eprintln!("[paste-store] write failed: {error}; fallback to inline");
+        paste_log!("[paste-store] write failed: {error}; fallback to inline");
         return input.to_string();
     }
     let num_lines = pasted_text_ref_num_lines(input);
@@ -206,30 +225,30 @@ pub(crate) fn try_auto_expand_clipboard(
     paste_id_gen: &mut u32,
     pending_paste_lines: &mut Vec<String>,
 ) -> Option<(String, String)> {
-    eprintln!("[paste-dbg] user_input={:?}", user_input);
+    paste_log!("[paste-dbg] user_input={:?}", user_input);
     let clipboard = match read_clipboard_text() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[paste-dbg] read_clipboard_text failed: {e}");
+            paste_log!("[paste-dbg] read_clipboard_text failed: {e}");
             return None;
         }
     };
-    eprintln!("[paste-dbg] clipboard len={} lines={}", clipboard.chars().count(), clipboard.lines().count());
+    paste_log!("[paste-dbg] clipboard len={} lines={}", clipboard.chars().count(), clipboard.lines().count());
     if clipboard.is_empty() {
-        eprintln!("[paste-dbg] clipboard empty, skip");
+        paste_log!("[paste-dbg] clipboard empty, skip");
         return None;
     }
     let clipboard_lines: Vec<&str> = clipboard.lines().collect();
     // 必须是多行内容（>1 行）才触发
     if clipboard_lines.len() <= 1 {
-        eprintln!("[paste-dbg] only {} lines, skip", clipboard_lines.len());
+        paste_log!("[paste-dbg] only {} lines, skip", clipboard_lines.len());
         return None;
     }
     // 第一行必须等于用户输入（trim 后比较，兼容尾部空白差异）
     let first_line = clipboard_lines[0].trim();
-    eprintln!("[paste-dbg] first_line={:?} user_input={:?}", first_line, user_input.trim());
+    paste_log!("[paste-dbg] first_line={:?} user_input={:?}", first_line, user_input.trim());
     if first_line != user_input.trim() {
-        eprintln!("[paste-dbg] first line mismatch, skip");
+        paste_log!("[paste-dbg] first line mismatch, skip");
         return None;
     }
     // 触发剪贴板替换：用完整内容走折叠流程（fold_pasted_input 内部决定是否折叠）
@@ -239,6 +258,6 @@ pub(crate) fn try_auto_expand_clipboard(
         .iter()
         .map(|s| s.trim().to_string())
         .collect();
-    eprintln!("[paste-dbg] triggered! pending={} lines", pending_paste_lines.len());
+    paste_log!("[paste-dbg] triggered! pending={} lines", pending_paste_lines.len());
     Some((display, expanded))
 }

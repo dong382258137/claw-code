@@ -103,6 +103,17 @@ impl InputLine {
         self.menu_open = false;
     }
 
+    /// Bug L1 修复：恢复 buffer 内容（用于 Submit 后发现不能提交时回填）。
+    /// InputLine::handle_key 在返回 Submit 前已 reset，但 app.rs 可能因
+    /// turn 正在运行而拒绝提交。此时用此方法把内容放回 buffer，避免丢失。
+    /// 光标位置设到末尾（用户刚敲完 Enter 的自然位置）。
+    pub(crate) fn restore_input(&mut self, content: String) {
+        self.buffer = content;
+        self.cursor = self.buffer.len();
+        // 不恢复 menu_open 状态：用户刚按 Enter 是要提交，不是要开菜单。
+        self.menu_open = false;
+    }
+
     /// Sync the slash menu's query with the current buffer (if menu is open).
     /// Returns the query to pass to `SlashMenu::set_query`.
     pub(crate) fn menu_query(&self) -> Option<String> {

@@ -40,9 +40,24 @@ use crate::tui::status_bar::{StatusBar, StatusBarState};
 // 斜杠命令本地分发：TUI 下 /help 等命令应在本地处理，而非发给 AI。
 // 修复"输入 /help 发送给 AI"的 bug。
 use commands::SlashCommand;
+// 多行粘贴兜底：当终端不支持 bracketed paste（如 conhost）或 Ctrl+V
+// 被终端拦截逐行发送时，用 try_auto_expand_clipboard 检测剪贴板内容。
+// 参考 CLI 路径 app.rs 的处理逻辑。
+use crate::paste::{fold_pasted_input, try_auto_expand_clipboard};
 
 /// Entry point: run the TUI REPL until user exits.
 pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    // 静默 paste.rs 中的 [paste-dbg] eprintln 日志，避免污染 alternate screen。
+    // 退出时恢复 false（用 drop guard 确保异常退出也恢复）。
+    struct TuiSilentGuard;
+    impl Drop for TuiSilentGuard {
+        fn drop(&mut self) {
+            crate::paste::set_tui_silent(false);
+        }
+    }
+    let _silence_guard = TuiSilentGuard;
+    crate::paste::set_tui_silent(true);
+
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     // 启用鼠标捕获（左键点击切换工具卡片折叠状态）和 bracketed paste
@@ -58,34 +73,31 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
         crossterm::event::EnableBracketedPaste
     )?;
 
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let backend = CrosstermBackend::new(io::stdout());
-        let mut terminal = Terminal::new(backend)?;
-        let result = run_event_loop(&mut terminal, cli);
-        // Restore terminal on exit (inside closure so it runs even on panic via ?).
-        disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste
-        )?;
-        terminal.show_cursor()?;
-        result
-    })();
-
-    // If the closure failed after EnterAlternateScreen but before the inner
-    // restore, we still need to clean up. Check if we're still in raw mode.
-    if result.is_err() {
-        let _ = disable_raw_mode();
-        // Best-effort: try to leave alternate screen (may already be gone).
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
-        let _ = execute!(stdout, crossterm::event::DisableMouseCapture);
-        let _ = execute!(stdout, crossterm::event::DisableBracketedPaste);
-        let _ = execute!(stdout, crossterm::cursor::Show);
+    // Bug L10 修复：用 TerminalGuard Drop 确保终端状态恢复。
+    // 旧实现用 closure + `?` 传播 Err，但 panic 会直接展开栈跳过 closure
+    // 和 `result.is_err()` 块，导致 raw mode / alternate screen / mouse
+    // capture / bracketed paste 残留，shell 不可用。
+    // Drop guard 在任何退出路径（正常返回、Err、panic）都会执行。
+    struct TerminalGuard;
+    impl Drop for TerminalGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let mut stdout = io::stdout();
+            let _ = execute!(
+                stdout,
+                LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+                crossterm::event::DisableBracketedPaste,
+                crossterm::cursor::Show
+            );
+        }
     }
+    let _terminal_guard = TerminalGuard;
 
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let result = run_event_loop(&mut terminal, cli);
+    // Drop guard 会恢复终端状态，这里直接返回结果。
     result
 }
 
@@ -290,6 +302,13 @@ fn run_event_loop(
     // keybindings are intercepted so the overlay behaves like a modal.
     let mut help_visible: bool = false;
 
+    // 多行粘贴兜底所需 state：
+    // - paste_id_gen：本会话自增的 paste id（用于 paste-cache 文件名）
+    // - pending_paste_lines：conhost 逐行发送时待丢弃的行（TUI 路径用不到，
+    //   但 try_auto_expand_clipboard 签名需要）
+    let mut paste_id_gen: u32 = 0;
+    let mut pending_paste_lines: Vec<String> = Vec::new();
+
     // 鼠标点击支持：把 draw 闭包内的 main_area 和 scroll_y 缓存到 loop 外，
     // 这样 Event::Mouse 分支可以访问它们，把点击坐标映射到逻辑行号。
     // draw 闭包每次渲染后更新这两个值。
@@ -379,7 +398,12 @@ fn run_event_loop(
                     .split(outer[0]);
                 // Render sidebar using the latest state + tool history.
                 let state_snapshot = {
-                    let guard = status_state.lock().expect("StatusBarState poisoned");
+                    // Bug L9 修复：mutex 毒化时容错访问，避免 draw 闭包 panic。
+                    // worker 线程持锁时 panic 会中毒 mutex，旧实现 expect 直接
+                    // 让 draw 闭包 panic → TUI 崩溃无恢复。改为访问中毒数据。
+                    let guard = status_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     guard.clone()
                 };
                 let history_snapshot = tool_history_shared
@@ -581,7 +605,7 @@ fn run_event_loop(
         if event::poll(poll_timeout)? {
             let ev = event::read()?;
             if let Event::Key(key) = ev {
-                let action = route_key(&mut input, key);
+                let action = route_key(&mut input, key, help_visible);
                 match action {
                     InputAction::Exit => break,
                     InputAction::ToggleHelp => {
@@ -665,6 +689,43 @@ fn run_event_loop(
                             scroll_offset = None;
                             turn_start = Some(Instant::now());
 
+                            // 多行粘贴兜底 + 折叠处理：
+                            // - 如果 line 不含 \n 且不以 / 开头，调用 try_auto_expand_clipboard
+                            //   检测剪贴板是否有多行内容且第一行匹配 line。如果匹配，用完整
+                            //   剪贴板内容替换 line（修复 conhost 不支持 bracketed paste 时
+                            //   多行粘贴被切成多次 Submit 的 bug）。
+                            // - 否则（line 已含 \n，说明 bracketed paste 已生效）直接 fold。
+                            // - fold_pasted_input 处理超长粘贴：超过阈值时存到 paste-cache，
+                            //   用占位符 [Pasted text #N +M lines] 替换 display。
+                            // - display 用于回显到 OutputView，expanded 用于发给 AI。
+                            // - slash 命令（以 / 开头）跳过所有处理，原样发送。
+                            let trimmed = line.trim();
+                            let session_id = cli_holder
+                                .as_ref()
+                                .map(|c| c.session_id_snapshot().to_string())
+                                .unwrap_or_default();
+                            let (display, expanded) = if trimmed.is_empty() {
+                                (line.clone(), line.clone())
+                            } else if trimmed.starts_with('/') {
+                                (line.clone(), line.clone())
+                            } else if !line.contains('\n')
+                                && pending_paste_lines.is_empty()
+                            {
+                                // 单行输入：尝试剪贴板检测
+                                try_auto_expand_clipboard(
+                                    trimmed,
+                                    &session_id,
+                                    &mut paste_id_gen,
+                                    &mut pending_paste_lines,
+                                )
+                                .unwrap_or_else(|| {
+                                    fold_pasted_input(&line, &session_id, &mut paste_id_gen)
+                                })
+                            } else {
+                                // 多行输入（bracketed paste 已触发）：直接 fold
+                                fold_pasted_input(&line, &session_id, &mut paste_id_gen)
+                            };
+
                             // Echo the user's message into the output view so
                             // the conversation history shows both sides (user
                             // + assistant). Without this the output area only
@@ -676,13 +737,16 @@ fn run_event_loop(
                             // 上次 turn 异常退出未触发 MessageStop，buffer 末尾
                             // 会残留 AI 文本）。echo 前检查 buffer 末尾，若非空
                             // 且不以 `\n` 结尾，先追加 `\n\n` 作为分隔。
+                            //
+                            // 回显用 display（折叠后的占位符），不用 expanded
+                            // （完整内容可能很长，污染输出区）。
                             let echo_handle = output_view.shared_handle();
                             if let Ok(mut buf) = echo_handle.lock() {
                                 let current = buf.buffer();
                                 if !current.is_empty() && !current.ends_with('\n') {
                                     buf.append("\n\n");
                                 }
-                                buf.append(&format!("> {line}\n\n"));
+                                buf.append(&format!("> {display}\n\n"));
                             }
 
                             let mut cli = cli_holder.take().unwrap();
@@ -695,7 +759,10 @@ fn run_event_loop(
                             // （如 /help 显示命令列表、/clear 清会话等），
                             // 而不是当作普通输入发给 AI。
                             // 修复"输入 /help 发送给 AI"的 bug。
-                            let slash_parsed = SlashCommand::parse(line.trim());
+                            //
+                            // 注意：用 expanded 而非原始 line 来解析，因为
+                            // 多行粘贴可能以非 / 开头但包含 / 命令（罕见但可能）。
+                            let slash_parsed = SlashCommand::parse(expanded.trim());
 
                             let (tx, rx) = mpsc::channel();
                             match slash_parsed {
@@ -703,29 +770,105 @@ fn run_event_loop(
                                     // 本地命令：设置 tui_output 捕获 println，
                                     // 在 worker 线程执行 handle_repl_command。
                                     cli.set_tui_output(Arc::clone(&output_handle));
+                                    let status_handle_for_panic = Arc::clone(&status_handle);
                                     std::thread::spawn(move || {
-                                        let result = execute_slash_command(cli, command);
-                                        let _ = tx.send(result);
+                                        // Bug L3 修复：用 catch_unwind 包裹，panic 时
+                                        // 仍通过 channel 返回 cli，避免 cli 永久丢失。
+                                        use std::panic::{catch_unwind, AssertUnwindSafe};
+                                        let mut cli = cli;
+                                        let cli_ref = &mut cli;
+                                        let result = catch_unwind(AssertUnwindSafe(move || {
+                                            execute_slash_command(cli_ref, command)
+                                        }));
+                                        let turn_result = match result {
+                                            Ok(r) => TurnResult { cli, result: r },
+                                            Err(payload) => {
+                                                let msg = payload
+                                                    .downcast_ref::<String>()
+                                                    .map(|s| s.clone())
+                                                    .or_else(|| {
+                                                        payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                                    })
+                                                    .unwrap_or_else(|| "<unknown panic>".to_string());
+                                                if let Ok(mut guard) = status_handle_for_panic.lock() {
+                                                    if guard.streaming {
+                                                        guard.finish_turn();
+                                                    }
+                                                }
+                                                TurnResult {
+                                                    cli,
+                                                    result: Err(format!(
+                                                        "worker thread panicked: {msg}"
+                                                    )),
+                                                }
+                                            }
+                                        };
+                                        let _ = tx.send(turn_result);
                                     });
                                 }
                                 Ok(None) | Err(_) => {
                                     // 普通对话：发给 AI。清空工具历史。
+                                    // 用 expanded（含完整粘贴内容）发送，而非 display（占位符）。
                                     if let Ok(mut h) = tool_history_shared.lock() {
                                         h.clear();
                                     }
+                                    let status_handle_for_panic = Arc::clone(&status_handle);
                                     std::thread::spawn(move || {
-                                        let result = execute_turn(
-                                            cli,
-                                            &line,
-                                            &output_handle,
-                                            &status_handle,
-                                            &tool_history_handle,
-                                        );
-                                        let _ = tx.send(result);
+                                        // Bug L3 修复：同上，catch_unwind 包裹。
+                                        use std::panic::{catch_unwind, AssertUnwindSafe};
+                                        let mut cli = cli;
+                                        let cli_ref = &mut cli;
+                                        let result = catch_unwind(AssertUnwindSafe(move || {
+                                            execute_turn(
+                                                cli_ref,
+                                                &expanded,
+                                                &output_handle,
+                                                &status_handle,
+                                                &tool_history_handle,
+                                            )
+                                        }));
+                                        let turn_result = match result {
+                                            Ok(r) => TurnResult { cli, result: r },
+                                            Err(payload) => {
+                                                let msg = payload
+                                                    .downcast_ref::<String>()
+                                                    .map(|s| s.clone())
+                                                    .or_else(|| {
+                                                        payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                                    })
+                                                    .unwrap_or_else(|| "<unknown panic>".to_string());
+                                                if let Ok(mut guard) = status_handle_for_panic.lock() {
+                                                    if guard.streaming {
+                                                        guard.finish_turn();
+                                                    }
+                                                }
+                                                TurnResult {
+                                                    cli,
+                                                    result: Err(format!(
+                                                        "worker thread panicked: {msg}"
+                                                    )),
+                                                }
+                                            }
+                                        };
+                                        let _ = tx.send(turn_result);
                                     });
                                 }
                             }
                             turn_rx = Some(rx);
+                            // Bug L2 修复：清空 pending_paste_lines。
+                            // try_auto_expand_clipboard 触发时会填充它（用于 CLI 路径
+                            // 的"丢弃后续逐行 Submit"机制），但 TUI 路径下没有该机制
+                            // （bracketed paste + Event::Paste 不会被切 Submit）。
+                            // 不清空会导致下次 Submit 守卫 `pending_paste_lines.is_empty()`
+                            // 永远为 false，conhost 多行粘贴兜底从此失效。
+                            pending_paste_lines.clear();
+                        } else {
+                            // Bug L1 修复：turn 正在运行时用户敲 Enter，InputLine
+                            // 在返回 Submit 前已 reset() 清空 buffer。如果不回填，
+                            // 用户输入会丢失（明明敲了字却看不到也发不出）。
+                            // 把 line 放回 buffer，等当前 turn 结束后再敲 Enter。
+                            // 不直接 queue 是因为 InputLine 不支持 queue（保持简单）。
+                            input.restore_input(line);
                         }
                     }
                     InputAction::MenuUp => menu.move_up(),
@@ -779,7 +922,10 @@ fn run_event_loop(
 
         // Refresh status: update turn_elapsed_ms if streaming
         {
-            let mut guard = status_state.lock().expect("StatusBarState poisoned");
+            // Bug L9 修复：mutex 毒化时容错访问。
+            let mut guard = status_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if guard.streaming {
                 if let Some(start) = turn_start {
                     guard.turn_elapsed_ms = start.elapsed().as_millis() as u64;
@@ -791,7 +937,7 @@ fn run_event_loop(
     Ok(())
 }
 
-fn route_key(input: &mut InputLine, key: KeyEvent) -> InputAction {
+fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool) -> InputAction {
     // Windows crossterm quirk: by default it emits *two* KeyEvents per key
     // press — one `Press` and one `Release`. Without filtering, every char
     // gets inserted twice (e.g., typing "你好" yields "你你好好"). Only handle
@@ -799,6 +945,35 @@ fn route_key(input: &mut InputLine, key: KeyEvent) -> InputAction {
     // On Unix/macOS crossterm always emits `Press`, so this filter is a no-op
     // there. This is the documented crossterm 0.28 behavior on Windows.
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return InputAction::Ignore;
+    }
+
+    // Bug L4 修复：help 浮层可见时，只允许少数键（?, Esc, Ctrl+C, Ctrl+D）
+    // 走特殊分支，其他键直接返回 Ignore，**不调用 input.handle_key**，
+    // 避免字符泄漏到 buffer（用户关掉浮层后会发现 buffer 里多了几个字符）。
+    // 原 bug：route_key 先调用 input.handle_key 处理 Char('a')，字符进了
+    // buffer，然后 main loop 的 `_ if help_visible` 分支吞掉 action —
+    // 但字符已经泄漏，无法挽回。
+    if help_visible {
+        // Ctrl+C / Ctrl+D → Exit（保留退出能力）
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char(c) = key.code {
+                let lower = c.to_ascii_lowercase();
+                if lower == 'c' || lower == 'd' {
+                    return InputAction::Exit;
+                }
+            }
+        }
+        // Esc → 关闭浮层（复用 CloseMenu action，main loop 的
+        // `InputAction::CloseMenu if help_visible` 分支会处理）
+        if matches!(key.code, KeyCode::Esc) {
+            return InputAction::CloseMenu;
+        }
+        // '?' → ToggleHelp（关闭浮层）
+        if let KeyCode::Char('?') = key.code {
+            return InputAction::ToggleHelp;
+        }
+        // 其他键（包括字母、数字、Enter、Backspace 等）全部吞掉
         return InputAction::Ignore;
     }
 
@@ -837,6 +1012,24 @@ fn route_key(input: &mut InputLine, key: KeyEvent) -> InputAction {
             // Ctrl+J → newline (multi-line input)
             if lower == 'j' {
                 return input.handle_key(None, "Newline");
+            }
+            // Bug L5 修复：Ctrl+V → 主动粘贴剪贴板内容。
+            // 在 conhost（Windows Console Host）下 bracketed paste
+            // (DECSET 2004) 不生效，Ctrl+V 被 crossterm 当作普通键事件，
+            // route_key 默认走 `KeyCode::Char('v')` 分支插入字面 'v'。
+            // 这里拦截 Ctrl+V，主动读剪贴板（PowerShell Get-Clipboard，
+            // ~100ms 开销，用户主动操作可接受）并 insert_paste 把整段
+            // 内容（含 \n）原子插入 buffer，避免多行被切成多次 Submit。
+            // Windows Terminal 等支持 bracketed paste 的终端会先触发
+            // Event::Paste（在 main loop 中处理），不会走到这里；
+            // 此分支仅作 conhost 兜底。
+            if lower == 'v' {
+                if let Ok(text) = crate::paste::read_clipboard_text() {
+                    if !text.is_empty() {
+                        input.insert_paste(&text);
+                    }
+                }
+                return InputAction::Continue;
             }
         }
     }
@@ -1003,16 +1196,21 @@ fn render_help_overlay(f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(paragraph, modal_area);
 }
 
-/// Execute a turn in a background thread. Returns the cli (for reuse) and the result.
+/// Execute a turn in a background thread. Returns the result.
 /// This runs on a worker thread so the main event loop can continue rendering
 /// and processing keyboard events (e.g., Ctrl+C to exit) during streaming.
+///
+/// **Bug L3 修复**：函数接收 `&mut LiveCli` 而非 own `LiveCli`，调用方
+/// （worker 线程闭包）保留 cli 的所有权。配合 `catch_unwind` 包裹调用，
+/// panic 时 cli 仍在 worker 线程的局部变量中，可以通过 channel 返回主线程，
+/// 避免每次 panic 都丢失 cli 导致 TUI 卡死在"turn 运行中"状态。
 fn execute_turn(
-    mut cli: LiveCli,
+    cli: &mut LiveCli,
     line: &str,
     output_handle: &Arc<Mutex<crate::tui::output_view::OutputBuffer>>,
     status_state: &Arc<Mutex<StatusBarState>>,
     tool_history_shared: &Arc<Mutex<ToolHistory>>,
-) -> TurnResult {
+) -> Result<(), String> {
     use crate::streaming::{StatusEmitter, StatusEvent};
 
     let output_handle = Arc::clone(output_handle);
@@ -1154,10 +1352,7 @@ fn execute_turn(
         }
     }
 
-    TurnResult {
-        cli,
-        result: result.map_err(|e| format!("{e}")),
-    }
+    result.map_err(|e| format!("{e}"))
 }
 
 /// 在 worker 线程执行本地斜杠命令（如 /help, /clear, /status）。
@@ -1167,7 +1362,10 @@ fn execute_turn(
 /// 捕获到 OutputBuffer（在调用前已由 Submit 分支设置）。
 ///
 /// 执行完成后清除 `tui_output`，避免后续轮次误捕获。
-fn execute_slash_command(mut cli: LiveCli, command: SlashCommand) -> TurnResult {
+///
+/// **Bug L3 修复**：接收 `&mut LiveCli` 而非 own，配合 `catch_unwind`
+/// 保证 panic 时 cli 仍可恢复。
+fn execute_slash_command(cli: &mut LiveCli, command: SlashCommand) -> Result<(), String> {
     let result = cli
         .handle_repl_command(command)
         .map(|should_persist| {
@@ -1178,7 +1376,7 @@ fn execute_slash_command(mut cli: LiveCli, command: SlashCommand) -> TurnResult 
         .map_err(|e| format!("{e}"));
     // 清除 tui_output，避免后续 AI 对话轮次误捕获 println
     cli.clear_tui_output();
-    TurnResult { cli, result }
+    result
 }
 
 fn initialize_status(state: &Arc<Mutex<StatusBarState>>, cli: &LiveCli) {

@@ -128,8 +128,19 @@ impl OutputBuffer {
 
     /// 追加一个结构化条目。
     pub(crate) fn push_entry(&mut self, entry: OutputEntry) {
+        // Bug L8 修复：ToolCard 的 input 字节数也计入 text_total_bytes，
+        // 防止大量工具调用 input（如长 bash 命令、大文件 write 内容）无限积累。
+        // result 到达时由 complete_tool_card 单独计入。
         if let OutputEntry::Text { content } = &entry {
             self.text_total_bytes += content.len();
+        } else if let OutputEntry::ToolCard { input, result: Some(r), .. } = &entry {
+            self.text_total_bytes += input.len() + r.len();
+        } else if let OutputEntry::ToolCard { input, result: None, .. } = &entry {
+            self.text_total_bytes += input.len();
+        } else if let OutputEntry::Thinking { summary } = &entry {
+            self.text_total_bytes += summary.len();
+        } else if let OutputEntry::Timeline { summary } = &entry {
+            self.text_total_bytes += summary.len();
         }
         self.entries.push(entry);
         self.trim_if_needed();
@@ -151,12 +162,17 @@ impl OutputBuffer {
             } = entry
             {
                 if id == tool_id && r.is_none() {
+                    // Bug L8 修复：result 字节数计入 text_total_bytes。
+                    // 工具结果可能很大（read 大文件、bash 大量输出），
+                    // 不计入会导致内存无限制增长。
+                    self.text_total_bytes += result.len();
                     *r = Some(result);
                     *e = is_error;
                     // 结果到达后默认折叠
                     if let OutputEntry::ToolCard { collapsed, .. } = entry {
                         *collapsed = true;
                     }
+                    self.trim_if_needed();
                     return true;
                 }
             }
@@ -285,10 +301,19 @@ impl OutputBuffer {
         self.truncated
     }
 
-    /// 当 Text 总字节数超限时，淘汰最早的 Text 条目。
+    /// 当 Text 总字节数超限时，淘汰最早的 Text 条目；
+    /// 若无 Text 条目可淘汰，则裁剪最早的 ToolCard 的 result。
+    ///
+    /// **Bug L8 修复**：原实现只淘汰 Text，ToolCard 的 result（可能几 MB）
+    /// 完全不计入限制，导致内存爆炸。现在：
+    /// - push_entry / complete_tool_card 把 ToolCard 的 input + result 字节数
+    ///   都计入 `text_total_bytes`。
+    /// - trim 时若仍超限且无 Text 可淘汰，把最早的 ToolCard 的 result 替换为
+    ///   `[trimmed: N bytes]` 占位符（保留 header 和 input 以维持工具调用历史，
+    ///   仅裁剪可能极大的 result 文本），并相应减少 text_total_bytes。
     fn trim_if_needed(&mut self) {
         while self.text_total_bytes > MAX_BUFFER_BYTES {
-            // 找到第一个 Text 条目并移除
+            // 优先淘汰最早的 Text 条目
             let first_text_idx = self.entries.iter().position(|e| matches!(e, OutputEntry::Text { .. }));
             if let Some(idx) = first_text_idx {
                 if let OutputEntry::Text { content } = &self.entries[idx] {
@@ -296,7 +321,28 @@ impl OutputBuffer {
                 }
                 self.entries.remove(idx);
                 self.truncated = true;
+                continue;
+            }
+            // Bug L8 修复：无 Text 可淘汰时，裁剪最早的 ToolCard 的 result。
+            // 把 result 替换为占位符，保留 header/input/工具调用记录。
+            let first_card_idx = self.entries.iter().position(|e| {
+                matches!(e, OutputEntry::ToolCard { result: Some(r), .. } if !r.is_empty())
+            });
+            if let Some(idx) = first_card_idx {
+                if let OutputEntry::ToolCard { result, .. } = &mut self.entries[idx] {
+                    if let Some(r) = result.take() {
+                        let trimmed_len = r.len();
+                        let placeholder = format!("[trimmed: {} bytes]", trimmed_len);
+                        self.text_total_bytes = self
+                            .text_total_bytes
+                            .saturating_sub(trimmed_len)
+                            .saturating_add(placeholder.len());
+                        *result = Some(placeholder);
+                        self.truncated = true;
+                    }
+                }
             } else {
+                // 既无 Text 也无可裁剪的 ToolCard，停止以避免死循环。
                 break;
             }
         }
