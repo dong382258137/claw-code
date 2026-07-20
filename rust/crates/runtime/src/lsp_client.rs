@@ -1002,6 +1002,169 @@ pub fn symbol_kind_to_str(kind: u32) -> &'static str {
     }
 }
 
+// ============================================================================
+// Step 4.2-c: lsp-types crate 类型转换
+// 用官方类型替代部分手搓 serde_json,提高协议层可靠性
+// ============================================================================
+
+/// 将 `lsp_types::SymbolKind`(newtype struct,内部为 u32)映射为可读字符串。
+///
+/// 注意:由于 orphan rule,无法为 `lsp_types::SymbolKind` 实现 `From<T> for &str`,
+/// 故用辅助函数替代。与 `symbol_kind_to_str(u32)` 保持一致。
+fn lsp_symbol_kind_to_str(kind: lsp_types::SymbolKind) -> &'static str {
+    use lsp_types::SymbolKind as SK;
+    // SymbolKind 在 lsp-types 0.95 中是 newtype struct,变体以 const 形式存在。
+    if kind == SK::FILE {
+        "file"
+    } else if kind == SK::MODULE {
+        "module"
+    } else if kind == SK::NAMESPACE {
+        "namespace"
+    } else if kind == SK::PACKAGE {
+        "package"
+    } else if kind == SK::CLASS {
+        "class"
+    } else if kind == SK::METHOD {
+        "method"
+    } else if kind == SK::PROPERTY {
+        "property"
+    } else if kind == SK::FIELD {
+        "field"
+    } else if kind == SK::CONSTRUCTOR {
+        "constructor"
+    } else if kind == SK::ENUM {
+        "enum"
+    } else if kind == SK::INTERFACE {
+        "interface"
+    } else if kind == SK::FUNCTION {
+        "function"
+    } else if kind == SK::VARIABLE {
+        "variable"
+    } else if kind == SK::CONSTANT {
+        "constant"
+    } else if kind == SK::STRING {
+        "string"
+    } else if kind == SK::NUMBER {
+        "number"
+    } else if kind == SK::BOOLEAN {
+        "boolean"
+    } else if kind == SK::ARRAY {
+        "array"
+    } else if kind == SK::OBJECT {
+        "object"
+    } else if kind == SK::KEY {
+        "key"
+    } else if kind == SK::NULL {
+        "null"
+    } else if kind == SK::ENUM_MEMBER {
+        "enum_member"
+    } else if kind == SK::STRUCT {
+        "struct"
+    } else if kind == SK::EVENT {
+        "event"
+    } else if kind == SK::OPERATOR {
+        "operator"
+    } else if kind == SK::TYPE_PARAMETER {
+        "type_parameter"
+    } else {
+        "unknown"
+    }
+}
+
+impl From<lsp_types::DocumentSymbol> for LspSymbol {
+    /// 将 `lsp_types::DocumentSymbol`(官方类型)转换为 `LspSymbol`。
+    ///
+    /// 注意:DocumentSymbol 不包含文件路径,转换后 `path` 为空,
+    /// 调用方需手动设置(参考 `parse_document_symbols_typed` 的实现)。
+    fn from(doc: lsp_types::DocumentSymbol) -> Self {
+        let kind_str = lsp_symbol_kind_to_str(doc.kind);
+        let position = doc.selection_range.start;
+        Self {
+            name: doc.name,
+            kind: kind_str.to_owned(),
+            path: String::new(), // 调用方填充
+            line: position.line,
+            character: position.character,
+        }
+    }
+}
+
+impl From<lsp_types::SymbolInformation> for LspSymbol {
+    /// 将 `lsp_types::SymbolInformation`(官方类型)转换为 `LspSymbol`。
+    ///
+    /// SymbolInformation 的 location.uri 提供文件路径,
+    /// location.range.start 提供位置。
+    fn from(info: lsp_types::SymbolInformation) -> Self {
+        let kind_str = lsp_symbol_kind_to_str(info.kind);
+        let position = info.location.range.start;
+        let path = info.location.uri.as_str().to_owned();
+        Self {
+            name: info.name,
+            kind: kind_str.to_owned(),
+            path,
+            line: position.line,
+            character: position.character,
+        }
+    }
+}
+
+/// Step 4.2-c:使用 `lsp_types` 官方类型解析 documentSymbol 响应。
+///
+/// 与 [`parse_document_symbols`](fn@parse_document_symbols) 功能相同,
+/// 但内部使用 `lsp_types::DocumentSymbol` / `lsp_types::SymbolInformation`
+/// 进行反序列化,类型更安全。
+///
+/// # 容错策略
+/// - 优先尝试用 `lsp_types` 反序列化
+/// - 若失败(LSP server 返回非标准字段),fallback 到 `parse_document_symbols`
+///   (serde_json 手动解析)
+///
+/// # 参数
+/// - `response`:LSP JSON-RPC 响应
+/// - `path`:文件路径(用于 DocumentSymbol 格式,SymbolInformation 自带 uri)
+#[must_use]
+pub fn parse_document_symbols_typed(response: &serde_json::Value, path: &str) -> Vec<LspSymbol> {
+    let result = response.get("result").unwrap_or(response);
+
+    // 尝试 1:DocumentSymbol[] 反序列化
+    if let Ok(doc_symbols) = serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(result.clone())
+    {
+        let mut symbols = Vec::new();
+        for doc in doc_symbols {
+            collect_document_symbols_typed(doc, path, &mut symbols);
+        }
+        return symbols;
+    }
+
+    // 尝试 2:SymbolInformation[] 反序列化
+    if let Ok(sym_infos) =
+        serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result.clone())
+    {
+        return sym_infos.into_iter().map(LspSymbol::from).collect();
+    }
+
+    // Fallback:serde_json 手动解析(容错)
+    parse_document_symbols(response, path)
+}
+
+/// 递归收集 DocumentSymbol 及其 children 为 LspSymbol 列表。
+fn collect_document_symbols_typed(
+    doc: lsp_types::DocumentSymbol,
+    path: &str,
+    out: &mut Vec<LspSymbol>,
+) {
+    let mut symbol: LspSymbol = doc.clone().into();
+    symbol.path = path.to_owned();
+    out.push(symbol);
+
+    // 递归处理 children
+    if let Some(children) = doc.children {
+        for child in children {
+            collect_document_symbols_typed(child, path, out);
+        }
+    }
+}
+
 /// Step 4.2:解析 `textDocument/documentSymbol` 响应为 `Vec<LspSymbol>`。
 ///
 /// LSP server 可能返回两种格式(参考 LSP spec 3.17 §3.11.2):
@@ -2269,5 +2432,168 @@ mod tests {
 
         let result = registry.get_symbols("src/main.rs");
         assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Step 4.2-c 测试:parse_document_symbols_typed(lsp-types 路径)
+    // ========================================================================
+
+    #[test]
+    fn parse_document_symbols_typed_handles_document_symbol_format() {
+        // DocumentSymbol[] 格式(嵌套,有 range/selectionRange/children)
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "name": "main_fn",
+                    "kind": 12, // Function
+                    "range": { "start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 1} },
+                    "selectionRange": { "start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9} },
+                    "children": [
+                        {
+                            "name": "inner_var",
+                            "kind": 13, // Variable
+                            "range": { "start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 20} },
+                            "selectionRange": { "start": {"line": 1, "character": 8}, "end": {"line": 1, "character": 16} }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let symbols = parse_document_symbols_typed(&response, "main.rs");
+        assert_eq!(symbols.len(), 2, "should flatten children");
+        assert_eq!(symbols[0].name, "main_fn");
+        assert_eq!(symbols[0].kind, "function");
+        assert_eq!(symbols[0].line, 0);
+        assert_eq!(symbols[0].character, 3);
+        assert_eq!(symbols[0].path, "main.rs");
+        assert_eq!(symbols[1].name, "inner_var");
+        assert_eq!(symbols[1].kind, "variable");
+        assert_eq!(symbols[1].line, 1);
+        assert_eq!(symbols[1].character, 8);
+    }
+
+    #[test]
+    fn parse_document_symbols_typed_handles_symbol_information_format() {
+        // SymbolInformation[] 格式(平铺,有 location)
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "name": "Foo",
+                    "kind": 23, // Struct
+                    "location": {
+                        "uri": "file:///workspace/main.rs",
+                        "range": { "start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10} }
+                    }
+                },
+                {
+                    "name": "bar",
+                    "kind": 12, // Function
+                    "location": {
+                        "uri": "file:///workspace/main.rs",
+                        "range": { "start": {"line": 10, "character": 4}, "end": {"line": 10, "character": 20} }
+                    }
+                }
+            ]
+        });
+
+        let symbols = parse_document_symbols_typed(&response, "main.rs");
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "Foo");
+        assert_eq!(symbols[0].kind, "struct");
+        assert_eq!(symbols[0].line, 5);
+        assert_eq!(symbols[0].character, 0);
+        assert_eq!(symbols[0].path, "file:///workspace/main.rs");
+        assert_eq!(symbols[1].name, "bar");
+        assert_eq!(symbols[1].kind, "function");
+    }
+
+    #[test]
+    fn parse_document_symbols_typed_handles_empty_result() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": []
+        });
+
+        let symbols = parse_document_symbols_typed(&response, "main.rs");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn parse_document_symbols_typed_handles_null_result() {
+        // 部分 LSP server 对空文件返回 null
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": null
+        });
+
+        let symbols = parse_document_symbols_typed(&response, "main.rs");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn parse_document_symbols_typed_falls_back_for_invalid_response() {
+        // 非 standard 字段类型(如 kind 为字符串),lsp-types 反序列化失败,
+        // 应 fallback 到 serde_json 手动解析
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "name": "weird",
+                    "kind": "not_a_number", // 非标准:kind 应为数字
+                    "range": { "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 10} },
+                    "selectionRange": { "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5} }
+                }
+            ]
+        });
+
+        // 不应 panic,fallback 路径应处理
+        let symbols = parse_document_symbols_typed(&response, "main.rs");
+        // fallback 解析时 kind_num=0 → "unknown"
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "weird");
+        assert_eq!(symbols[0].kind, "unknown");
+    }
+
+    #[test]
+    fn parse_document_symbols_typed_consistent_with_untyped() {
+        // 验证 typed 路径与 untyped 路径对标准响应返回一致结果
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "name": "func_a",
+                    "kind": 12,
+                    "range": { "start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1} },
+                    "selectionRange": { "start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9} }
+                },
+                {
+                    "name": "StructB",
+                    "kind": 23,
+                    "range": { "start": {"line": 7, "character": 0}, "end": {"line": 10, "character": 1} },
+                    "selectionRange": { "start": {"line": 7, "character": 7}, "end": {"line": 7, "character": 14} }
+                }
+            ]
+        });
+
+        let typed = parse_document_symbols_typed(&response, "main.rs");
+        let untyped = parse_document_symbols(&response, "main.rs");
+
+        assert_eq!(typed.len(), untyped.len(), "typed and untyped should return same count");
+        for (t, u) in typed.iter().zip(untyped.iter()) {
+            assert_eq!(t.name, u.name, "name mismatch");
+            assert_eq!(t.kind, u.kind, "kind mismatch for {}", t.name);
+            assert_eq!(t.line, u.line, "line mismatch for {}", t.name);
+            assert_eq!(t.character, u.character, "character mismatch for {}", t.name);
+            assert_eq!(t.path, u.path, "path mismatch for {}", t.name);
+        }
     }
 }
