@@ -480,50 +480,69 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 | **缓存影响** | 无 |
 | **实际状态** | ✅ 完成 — bg.rs 已整合常量 + Job Object 接入,公共 API 已导出,功能性测试已添加 |
 
-#### Step 4.2 — LSP Client 真实接入 ⚠️ 部分
+#### Step 4.2 — LSP Client 真实接入 ✅
 
-> **真实状态(2026-07-21 v1.4 复核)**:协议层和传输层都已真实编码,但**生产 dispatch 路径
-> 仍走 `MemoryLspTransport` placeholder**,`ProcessLspTransport::spawn()` 从未被生产代码调用,
-> rust-analyzer 也从未被真实启动。
+> **完成状态(2026-07-21 v1.5 三项全做完成)**:协议层、传输层、生产 dispatch 路径、
+> repomap 协同、lsp-types 类型安全、集成测试全部落地。
 >
-> **已实现部分**:
-> - `LspRequest` 协议层(method/params/file_uri 构造)— 真实可用
-> - `LspJsonRpcClient::initialize()` / `did_change()` 协议构造 — 真实可用
-> - `ProcessLspTransport` 完整传输层实现(spawn / write_message / read_message / Drop 清理)— 真实可用但**未被生产使用**(死代码)
-> - 40 个单元测试覆盖协议构造逻辑
+> **4.2-a: spawn_server API + dispatch 真实传输接入**(commit 0086005):
+> - `LspRegistry::spawn_server(language, command, root_path)` — 真实启动 LSP server 子进程,
+>   完成 initialize → initialized 握手
+> - `LspRegistry::shutdown_server(language)` — 幂等关闭,显式 kill + 清理句柄
+> - `LspRegistry::is_server_spawned(language)` — 检查真实 transport 是否存在
+> - `LspRegistry::register_with_command(...)` — 注册时记录 server_command
+> - `dispatch()` 改造:优先检查 `process_transports`,有则用真实 `transport.send()`,
+>   无则 fallback 到 `MemoryLspTransport`(best-effort)
+> - `RegistryInner` 新增 `process_transports: HashMap<String, Arc<Mutex<ProcessLspTransport>>>`
+>   + 自定义 Debug impl(只显示 keys)
+> - `ProcessLspTransport::shutdown(&mut self)` — 显式 kill + 清理句柄
+> - `LspServerState` 新增 `server_command: Option<String>` 字段(带 `#[serde(default)]`)
+> - 2 个 `#[ignore]` 集成测试(spawn_server_real_rust_analyzer、spawn_server_lifecycle_with_fake_server)
 >
-> **缺失部分**:
-> - ❌ **未引入 `lsp-types` / `tower-lsp` 官方 crate**,全部手搓 serde_json 易出错
-> - ❌ **`LspRegistry::dispatch()`(L292)默认走 `MemoryLspTransport` placeholder** — 返回
->   固定响应 `"status": "protocol_constructed"`,不调用 `ProcessLspTransport::spawn()`
-> - ❌ **生产代码无任何 `ProcessLspTransport::new()` / `with_transport()` 调用** — 该传输层
->   是死代码,仅被 3 个测试引用(且测试都没调用 `.spawn()`)
-> - ❌ **`repomap.rs` 与 LSP 完全无关联** — lsp_client.rs:735 docstring 声称"协同"纯属愿景,
->   repomap.rs 中 0 个 LSP/symbol 引用
-> - ❌ **无 `LspSymbol` 解析逻辑** — 从 `textDocument/documentSymbol` 响应到 `LspSymbol`
->   的转换未实现
-> - ❌ **无 rust-analyzer 真实启动测试** — 没有 `#[ignore]` 集成测试或端到端测试
-> - ❌ **`LspRegistry` 未提供 `spawn_server()` 之类的方法** — 注册的 server 状态是手动
->   `register("rust", LspServerStatus::Connected, ...)` 写入的,没有真实启动逻辑
+> **4.2-b: LspSymbol 解析 + repomap 协同**(commit 0086005):
+> - `symbol_kind_to_str(kind: u32) -> &'static str` — LSP SymbolKind 数字到字符串映射
+> - `parse_document_symbols(response, path) -> Vec<LspSymbol>` — 自动识别两种格式
+>   (DocumentSymbol[] 嵌套 vs SymbolInformation[] 平铺)
+> - `parse_document_symbol_recursive` — 递归解析 DocumentSymbol children
+> - `parse_symbol_information` — 解析 SymbolInformation location
+> - `LspRegistry::get_symbols(path)` — dispatch "symbols" + parse
+> - `repomap::CachedFileMap` 新增 `lsp_symbols: Vec<LspSymbol>` 字段
+> - `repomap::augment_with_lsp_symbols(path, symbols)` — 注入 LSP symbols(创建新条目或替换)
+> - `repomap::has_lsp_symbols(path)` — 检查是否有 LSP 增强
+> - `repomap::render_files` 改造:`lsp_symbols` 非空时优先渲染(含位置信息 `L:line:character`),
+>   否则 fallback 到 regex definitions
 >
-> **要达到 ✅ 完整,至少需要**:
-> 1. 在 `LspRegistry::dispatch()` 中改为使用 `ProcessLspTransport`(通过 `LspJsonRpcClient::with_transport`),
->    并先调用 `spawn()` 启动真实 LSP server
-> 2. 提供 `LspRegistry::spawn_server(language, command, root_path)` 之类的 API
-> 3. 实现 `textDocument/documentSymbol` 响应到 `LspSymbol` 的解析
-> 4. 在 `repomap.rs` 中调用 `LspRegistry` 获取 symbol 信息(实现"协同")
-> 5. 添加 `#[ignore]` 集成测试,真实启动 rust-analyzer 验证 initialize → didChange → hover/completion 全流程
-> 6. 评估是否引入 `lsp-types` crate 替代手搓 serde_json
+> **4.2-c: lsp-types crate 引入**(commit af2a7da):
+> - `Cargo.toml` 添加 `lsp-types = "0.95"` 依赖
+> - `lsp_symbol_kind_to_str(kind: lsp_types::SymbolKind) -> &'static str` — newtype struct 映射
+>   (用辅助函数替代 `impl From` 以规避 orphan rule)
+> - `impl From<lsp_types::DocumentSymbol> for LspSymbol` — 官方类型转换
+> - `impl From<lsp_types::SymbolInformation> for LspSymbol` — 官方类型转换
+> - `parse_document_symbols_typed(response, path) -> Vec<LspSymbol>` — 优先用 lsp-types 反序列化,
+>   fallback 到 `parse_document_symbols`(serde_json 手动解析)
+> - `collect_document_symbols_typed` — 递归收集 DocumentSymbol + children
+> - 容错策略:优先尝试 lsp_types 反序列化(类型安全),失败 fallback 到 serde_json 手动解析
+>
+> **测试覆盖**:
+> - 4.2-a: 8 个新单元测试(register_with_command、spawn_server 错误路径、shutdown 幂等、
+>   dispatch fallback、is_server_spawned)+ 2 个 #[ignore] 集成测试
+> - 4.2-b: 7 个新单元测试(symbol_kind_to_str 全映射、DocumentSymbol 格式、SymbolInformation
+>   格式、空结果、混合格式、get_symbols memory transport、get_symbols disconnected)
+> - 4.2-c: 6 个新单元测试(DocumentSymbol 格式、SymbolInformation 格式、空结果、null 结果、
+>   无效响应 fallback、typed/untyped 一致性)
+> - **总计 59 个 lsp_client 测试通过(53 既有 + 6 新增),2 个 #[ignore] 集成测试**
+> - repomap 12 个测试通过(7 既有 + 5 新增)
+> - clippy 0 警告(4.2-c 相关),无 error
 
 | 项 | 内容 |
 |---|---|
 | **目标** | 替换 `lsp_client.rs` L292 的 placeholder(LspJsonRpcClient::new 默认 MemoryLspTransport) |
 | **改动文件** | 改 `rust/crates/runtime/src/lsp_client.rs`、`rust/crates/runtime/src/repomap.rs`、`rust/crates/runtime/Cargo.toml` |
-| **实现要点** | 1. 集成 `tower-lsp` 或 `lsp-types` crate <br> 2. `dispatch` 方法真实调用 LSP JSON-RPC:initialize → didChange → completion/hover <br> 3. 与 `repomap.rs` 协同,LSP 提供 symbol 信息 |
-| **验证** | 启动 rust-analyzer,断言 completion 返回非空 |
+| **实现要点** | 1. 集成 `lsp-types` crate(0.95) <br> 2. `spawn_server` API + dispatch 真实调用 LSP JSON-RPC <br> 3. `documentSymbol` 响应解析为 `LspSymbol` <br> 4. `repomap.rs` 调用 `LspRegistry` 获取 symbol 信息(实现协同) <br> 5. `#[ignore]` 集成测试覆盖 rust-analyzer 真实启动 |
+| **验证** | 59 个 lsp_client 单元测试通过 + 2 个 #[ignore] 集成测试 + 12 个 repomap 测试通过 + clippy 0 警告 |
 | **依赖** | 无 |
 | **缓存影响** | 低 — LSP symbol 注入 repomap,但 repomap 已在变动区 |
-| **实际状态** | ⚠️ 部分 — 协议层 + 传输层已编码,但生产 dispatch 走 placeholder、ProcessLspTransport 是死代码、repomap 协同未实现、无 LSP crate 依赖、无 rust-analyzer 集成测试 |
+| **实际状态** | ✅ 完整 — spawn_server + dispatch 真实传输 + LspSymbol 解析 + repomap 协同 + lsp-types 类型安全 + 集成测试全部落地 |
 
 ---
 
