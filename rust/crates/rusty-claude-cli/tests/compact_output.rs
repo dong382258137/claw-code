@@ -1,3 +1,9 @@
+// Unix-only: run_claw uses env_clear() + PATH="/usr/bin:/bin", which on Windows
+// strips SystemRoot and other Winsock-required env vars, causing reqwest's
+// loopback TCP to 127.0.0.1 to fail with "error sending request" after 9 retries.
+// CI also only runs `cargo test --workspace` on ubuntu-latest (see
+// .github/workflows/rust-ci.yml test-workspace job).
+#![cfg(unix)]
 #![allow(clippy::while_let_on_iterator)]
 
 use std::fs;

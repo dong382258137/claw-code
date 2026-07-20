@@ -1,3 +1,10 @@
+// Unix-only: this test spawns `python3` with the `pty` module to simulate a
+// real terminal, and hardcodes `PATH="/usr/bin:/bin"`. Windows has no `python3`
+// alias, no `pty` module, and a different PATH layout — so the test is gated
+// to Unix. The `Fatal Python error: _Py_HashRandomization_Init` seen on
+// Windows is a symptom of the `python3` lookup failing in a degraded env.
+#![cfg(unix)]
+
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
