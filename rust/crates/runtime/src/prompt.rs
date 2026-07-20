@@ -184,7 +184,12 @@ impl ProjectContext {
 }
 
 /// Builder for the runtime system prompt and dynamic environment sections.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+//
+// Step 2.4: `Eq` derive 移除 — `persistent_memory: Option<PersistentMemory>` 字段
+// 依赖 PersistentMemory 的 Eq,但 PersistentMemory 内嵌 SemanticRecaller
+// (持有 `HashMap<String, Vec<f32>>` 向量索引,Vec<f32> 不 impl Eq)。
+// PartialEq 保留以维持测试断言能力。
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SystemPromptBuilder {
     output_style_name: Option<String>,
     output_style_prompt: Option<String>,

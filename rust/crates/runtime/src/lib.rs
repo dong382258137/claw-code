@@ -158,6 +158,12 @@ pub use memory::{
     NudgeAction, NudgeConfig, PersistentMemory, UNVERIFIED_THRESHOLD_MS,
 };
 pub use memory_store::MemoryStore;
+// Step 2.4: Memory 语义检索层 embedding provider 公开 API。
+pub use memory_semantic::{
+    cosine_similarity, EmbeddingError, EmbeddingProvider, HashEmbeddingProvider,
+};
+#[cfg(feature = "embedding")]
+pub use memory_semantic::FastembedProvider;
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,

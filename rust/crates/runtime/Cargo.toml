@@ -17,9 +17,18 @@ serde_json.workspace = true
 telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 walkdir = "2"
+# Step 2.4: 本地嵌入模型（BGE-small-en-v1.5,384 维）。
+# 默认关闭 — 启用后增加 ~50MB 二进制 + 首次运行下载模型。
+# SemanticRecaller 在 feature 关闭时退化到 keyword fallback。
+fastembed = { version = "5", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# Step 2.4: 启用本地 embedding 模型支持（fastembed + ONNX Runtime）。
+# 默认关闭以保持轻量构建。启用命令:`cargo build --features runtime/embedding`。
+embedding = ["dep:fastembed"]
 
 [lints]
 workspace = true

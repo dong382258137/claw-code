@@ -250,7 +250,10 @@ impl MemoryEntry {
 /// `entries` holds only currently-active facts. Superseded / expired
 /// entries are migrated to `archive` during [`PersistentMemory::consolidate`]
 /// so audit history is preserved without bloating the active view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Step 2.4: Eq derive 移除 — SemanticRecaller 持有 `HashMap<String, Vec<f32>>` 向量索引,
+// `Vec<f32>` 不 impl Eq(floating-point NaN 问题),导致 SemanticRecaller 也不能 impl Eq。
+// PartialEq 保留,测试用 `assert_eq!` 比较字段而非整体 struct 不受影响。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistentMemory {
     #[serde(default = "default_blocks")]
     blocks: [MemoryBlock; 3],
