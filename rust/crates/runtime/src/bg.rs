@@ -123,6 +123,11 @@ pub fn spawn(
     // Detached：立即 drop Child，让子进程独立运行。父进程退出不影响子进程。
     drop(child);
 
+    // Step 4.1 整合:Windows 上 spawn 后将子进程分配到 Job Object,
+    // 设置 CPU/memory 限制。失败不致命(best-effort)— 沙箱限制是增强,
+    // 不是阻断性功能,Job Object 设置失败时进程仍能正常运行(只是无限制)。
+    assign_job_object_best_effort(pid);
+
     // 重命名 log 文件为 <pid>.log。如果失败（极罕见，比如重名），fallback 到 pending 名。
     let final_log = log_path(cwd, pid);
     let final_log_str = if fs::rename(&pending_log, &final_log).is_ok() {
@@ -312,20 +317,51 @@ fn kill_process(pid: u32) -> Result<(), BgError> {
     }
 }
 
-/// 应用 detached flags（Windows 专用实现，Unix no-op）。
+/// 应用 detached flags(Windows 专用实现,Unix no-op)。
+///
+/// Step 4.1 整合:引用 sandbox.rs 的常量,消除硬编码重复。
+/// 之前硬编码 `0x0800_0208`,现在用 `CREATE_NO_WINDOW | DETACHED_PROCESS |
+/// CREATE_NEW_PROCESS_GROUP` 语义化表达,与 sandbox.rs 保持单一来源。
 #[cfg(windows)]
 fn apply_detached_flags(cmd: &mut Command) {
+    use crate::sandbox::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS};
     use std::os::windows::process::CommandExt;
-    // CREATE_NO_WINDOW        = 0x08000000  不创建控制台窗口
-    // DETACHED_PROCESS        = 0x00000008  脱离父进程控制台
-    // CREATE_NEW_PROCESS_GROUP = 0x00000200  新进程组（不受父 Ctrl+C 影响）
-    cmd.creation_flags(0x0800_0208);
+    let flags = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    cmd.creation_flags(flags);
 }
 
-/// Unix fallback：不调用 setsid（避免 libc 依赖），依赖进程组语义。
+/// Unix fallback:不调用 setsid(避免 libc 依赖),依赖进程组语义。
 /// 真正的 detached 在 Unix 上需要 `setsid claw <args>` 包装。
 #[cfg(not(windows))]
 fn apply_detached_flags(_cmd: &mut Command) {}
+
+/// Step 4.1:Windows 上将子进程分配到 Job Object,设置 CPU/memory 限制。
+///
+/// 这是 best-effort 操作:
+/// - 仅 Windows 生效,Unix 直接返回 Ok
+/// - 失败不致命:PowerShell 不可用、Job Object 创建失败等情况不阻断主流程
+/// - 失败原因通过 eprintln 输出到 stderr(仅用于调试,生产环境通常被重定向)
+///
+/// 实现委托给 `WindowsSandboxBuilder::assign_process_to_job_object`,
+/// 通过 PowerShell + C# 内联调用 Win32 API(CreateJobObjectW +
+/// SetInformationJobObject + AssignProcessToJobObject)。
+fn assign_job_object_best_effort(pid: u32) {
+    // Unix:无 Job Object 概念,直接返回
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+
+    // Windows:用默认配置(2GB 内存 + 80% CPU)创建 Job Object
+    let result = crate::sandbox::WindowsSandboxBuilder::default()
+        .assign_process_to_job_object(pid);
+    if let Err(e) = result {
+        // best-effort:记录失败但不阻断。使用 eprintln 而非 log,
+        // 因为 bg.rs 故意不引入 tracing/log 依赖(零依赖原则)。
+        // stderr 在 spawn 流程中已被重定向到 log 文件,所以这条消息
+        // 会出现在 <pid>.log 中,便于调试。
+        eprintln!("[bg] Job Object setup failed for pid {pid}: {e}");
+    }
+}
 
 fn save_record(path: &Path, record: &BgRecord) -> Result<(), BgError> {
     let json = serde_json::to_string_pretty(record)
@@ -647,5 +683,56 @@ mod tests {
             let _ = purge(&ws, record.pid);
         }
         // 如果 spawn 失败（极罕见），也接受——这只是验证 API 不 panic。
+    }
+
+    /// Step 4.1:验证 `assign_job_object_best_effort` 在 Unix 上是 no-op,
+    /// 在 Windows 上会尝试调用 PowerShell(可能失败,但不应 panic)。
+    ///
+    /// 这个测试不验证 Job Object 实际创建(那需要进程级集成测试),
+    /// 只验证函数契约:
+    /// - Unix:直接返回,不调用 PowerShell
+    /// - Windows:调用 PowerShell,可能成功或失败(取决于权限),不 panic
+    #[test]
+    fn assign_job_object_best_effort_does_not_panic_for_invalid_pid() {
+        // PID 99999999 几乎肯定不存在
+        // Unix:直接返回(无 Job Object 概念)
+        // Windows:PowerShell 会尝试 OpenProcess,失败返回错误,但不应 panic
+        assign_job_object_best_effort(99999999);
+        // 如果到达这里,说明函数没有 panic — 契约满足
+    }
+
+    /// Step 4.1:验证 `apply_detached_flags` 在 Unix 上是 no-op,
+    /// 在 Windows 上设置正确的 creation_flags。
+    ///
+    /// 注意:这个测试只验证函数不 panic,不验证 flags 实际设置
+    /// (那需要检查 Command 内部状态,std::process::Command 不暴露 flags getter)。
+    #[test]
+    fn apply_detached_flags_does_not_panic() {
+        let mut cmd = Command::new("echo");
+        apply_detached_flags(&mut cmd);
+        // Unix:no-op
+        // Windows:设置 CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        // 到达这里说明函数没有 panic
+    }
+
+    /// Step 4.1:验证 sandbox.rs 常量与 bg.rs 期望的 flags 值一致。
+    ///
+    /// 这确保 sandbox.rs 的常量定义没有意外变化,与 Windows API 文档对齐:
+    /// - CREATE_NO_WINDOW = 0x08000000
+    /// - DETACHED_PROCESS = 0x00000008
+    /// - CREATE_NEW_PROCESS_GROUP = 0x00000200
+    /// - 组合 = 0x0800_0208(与旧硬编码值一致,确保向后兼容)
+    #[test]
+    #[cfg(windows)]
+    fn sandbox_constants_match_expected_windows_flags() {
+        use crate::sandbox::{
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        };
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+        assert_eq!(DETACHED_PROCESS, 0x0000_0008);
+        assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x0000_0200);
+        // 组合值必须与旧硬编码 0x0800_0208 一致(向后兼容)
+        let combined = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        assert_eq!(combined, 0x0800_0208);
     }
 }

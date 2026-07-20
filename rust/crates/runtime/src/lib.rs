@@ -39,6 +39,11 @@ pub mod memory_semantic;
 // 跨压缩持久化的工作记忆,LLM 通过 `notebook_update` 工具主动维护。
 // 详见 docs/harness-engineering-optimization-plan.md P0-1。
 pub mod notebook;
+// P0:ToolResultArchive — microcompact 真无损化的 Layer 3 持久存储。
+// 在 microcompact 摘要前归档原始 tool result,LLM 可通过 `recall_full` 工具
+// 按 `tool_use_id` 主动检索原始内容。直击"AI 忘记原始 tool output 导致重复调用"
+// 的问题。详见 PiAgent 借鉴分析 P0 方案。
+pub mod tool_result_archive;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -172,6 +177,11 @@ pub use notebook::{
     execute_notebook_update, Notebook, NotebookError, NotebookUpdateInput, NOTEBOOK_FILENAME,
     NOTEBOOK_HEADER, NOTEBOOK_MAX_CHARS, NOTEBOOK_UPDATE_TOOL_SPEC, SECTION_TAGS,
 };
+pub use tool_result_archive::{
+    archive_path, archive_tool_result, list_archived_summary, prune_archive, recall_by_tool_name,
+    recall_tool_result, record_count, ArchivedToolResult, ArchiveError, ARCHIVE_FILENAME,
+    ARCHIVE_MAX_CHARS, ARCHIVE_RECORD_MAX_CHARS,
+};
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,
@@ -231,6 +241,10 @@ pub use sandbox::{
     resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
     FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
     SandboxRequest, SandboxStatus,
+    // Step 4.1:SandboxBuilder trait + 三平台实现 + 工厂函数 + 常量
+    MacOsSandboxBuilder, LinuxSandboxBuilder, SandboxBuilder, SandboxCommand,
+    WindowsSandboxBuilder, platform_sandbox_builder, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    DETACHED_PROCESS,
 };
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,

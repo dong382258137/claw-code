@@ -389,7 +389,11 @@ impl SandboxBuilder for LinuxSandboxBuilder {
 /// - `JOB_OBJECT_LIMIT_JOB_MEMORY`:限制 Job 总内存
 /// - `JOB_OBJECT_LIMIT_CPU_RATE`:限制 CPU 占比(Windows 8+)
 ///
-/// 当前实现:返回 `CREATE_NO_WINDOW` flags,Job Object 限制待集成 Win32 API。
+/// 当前实现:
+/// - 返回 `CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` flags
+/// - Job Object 限制通过 `assign_process_to_job_object(pid)` 在 spawn 后设置
+///   (PowerShell + C# 内联调用 Win32 API,见 `build_job_object_powershell`)
+/// - `bg.rs::spawn` 已整合:spawn 后调用 `assign_process_to_job_object` 设置限制
 pub struct WindowsSandboxBuilder {
     /// 内存上限(MB),None 表示不限制。
     pub memory_limit_mb: Option<u64>,
