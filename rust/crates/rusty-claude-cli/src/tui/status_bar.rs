@@ -43,6 +43,9 @@ pub(crate) struct StatusBarState {
     pub goal_badge: String,
     /// Poor-mode active flag.
     pub poor_mode: bool,
+    /// 当前 reasoning effort 设置（None=默认，Some("low"/"medium"/"high")=已设置）。
+    /// 由 /effort 命令或 --reasoning-effort CLI flag 设置，侧栏会显示。
+    pub reasoning_effort: Option<String>,
 }
 
 impl StatusBarState {

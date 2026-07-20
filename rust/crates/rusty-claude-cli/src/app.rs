@@ -639,6 +639,15 @@ impl LiveCli {
         }
     }
 
+    /// 读取当前 reasoning_effort 设置（供 TUI 侧栏显示）。
+    pub(crate) fn reasoning_effort(&self) -> Option<String> {
+        if let Some(rt) = self.runtime.runtime.as_ref() {
+            rt.api_client().reasoning_effort()
+        } else {
+            None
+        }
+    }
+
     /// P2 状态栏：累加本次回合的 usage 到 cumulative_usage。
     /// 在 run_turn / run_prompt_* 成功路径调用。
     fn accumulate_usage(&mut self, usage: runtime::TokenUsage) {
@@ -1172,6 +1181,42 @@ impl LiveCli {
                 }
                 false
             }
+            // /effort [low|medium|high|off] — 运行时调整 reasoning effort。
+            // 无参数：显示当前值；off：清除（恢复默认）；low/medium/high：设置。
+            // 设置后立即生效于下一次 API 请求，TUI 侧栏会同步显示。
+            SlashCommand::Effort { level } => {
+                let msg = match level.as_deref().map(str::trim) {
+                    None => {
+                        let current = self.reasoning_effort()
+                            .map(|v| format!("当前思考强度: {v}"))
+                            .unwrap_or_else(|| "当前思考强度: 默认（未设置）".to_string());
+                        format!("{current}\n用法: /effort low|medium|high|off")
+                    }
+                    Some("") => {
+                        let current = self.reasoning_effort()
+                            .map(|v| format!("当前思考强度: {v}"))
+                            .unwrap_or_else(|| "当前思考强度: 默认（未设置）".to_string());
+                        format!("{current}\n用法: /effort low|medium|high|off")
+                    }
+                    Some("off") | Some("default") | Some("none") => {
+                        self.set_reasoning_effort(None);
+                        "思考强度已清除（恢复默认）".to_string()
+                    }
+                    Some("low") | Some("medium") | Some("high") => {
+                        self.set_reasoning_effort(level.clone());
+                        format!("思考强度已设置为: {}", level.as_ref().unwrap())
+                    }
+                    Some(other) => {
+                        format!(
+                            "无效的思考强度: '{other}'\n有效值: low | medium | high | off\n用法: /effort low|medium|high|off"
+                        )
+                    }
+                };
+                if !self.tui_println(&msg) {
+                    println!("{msg}");
+                }
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
@@ -1203,7 +1248,6 @@ impl LiveCli {
             | SlashCommand::Hooks { .. }
             | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
-            | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
             | SlashCommand::Rewind { .. }
             | SlashCommand::Ide { .. }

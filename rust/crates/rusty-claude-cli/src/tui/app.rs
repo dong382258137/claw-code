@@ -1143,6 +1143,7 @@ fn sync_status_from_cli_inner(guard: &mut StatusBarState, cli: &LiveCli) {
     guard.poor_mode = runtime::poor_mode::is_active();
     guard.provider =
         crate::provider_label(api::detect_provider_kind(cli.model_snapshot())).to_string();
+    guard.reasoning_effort = cli.reasoning_effort();
 }
 
 #[cfg(test)]

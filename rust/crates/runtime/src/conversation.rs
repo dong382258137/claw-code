@@ -1330,6 +1330,11 @@ where
         &mut self.api_client
     }
 
+    /// 只读访问底层 API client（供查询状态如 reasoning_effort）。
+    pub fn api_client(&self) -> &C {
+        &self.api_client
+    }
+
     /// 返回工具执行器的可变引用，用于运行时调整 tool executor 的配置
     /// （例如 `output_verbosity`）。仅在需要动态修改执行器状态时使用。
     pub fn tool_executor_mut(&mut self) -> &mut T {

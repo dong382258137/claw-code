@@ -68,6 +68,15 @@ pub(crate) fn render_sidebar(area: Rect, buf: &mut Buffer, state: &StatusBarStat
 }
 
 fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
+    // 思考强度显示：None 显示"默认"，Some 显示具体值（low/medium/high）。
+    // 用颜色区分：默认=灰色，low=蓝色，medium=黄色，high=红色（强度越高越醒目）。
+    let effort_label = state.reasoning_effort.as_deref().unwrap_or("默认");
+    let effort_color = match effort_label {
+        "low" => Color::Blue,
+        "medium" => Color::Yellow,
+        "high" => Color::Red,
+        _ => Color::DarkGray,
+    };
     let lines = vec![
         Line::from(vec![
             Span::styled("模型 ", Style::default().fg(Color::DarkGray)),
@@ -76,6 +85,10 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
         Line::from(vec![
             Span::styled("提供商 ", Style::default().fg(Color::DarkGray)),
             Span::raw(&state.provider),
+        ]),
+        Line::from(vec![
+            Span::styled("思考强度 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(effort_label, Style::default().fg(effort_color).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
             Span::styled("分支 ", Style::default().fg(Color::DarkGray)),

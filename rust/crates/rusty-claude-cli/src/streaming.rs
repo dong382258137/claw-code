@@ -229,6 +229,12 @@ impl AnthropicRuntimeClient {
         self.reasoning_effort = effort;
     }
 
+    /// 读取当前 reasoning_effort 设置（供 TUI 侧栏显示）。
+    /// None 表示使用模型默认（不发送 reasoning_effort 字段到 API）。
+    pub(crate) fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort.clone()
+    }
+
     /// Attach a status emitter callback. The callback is invoked on
     /// each streaming event (Usage, TextDelta, ToolUse, MessageStop)
     /// so the observer can update its display in real-time.
