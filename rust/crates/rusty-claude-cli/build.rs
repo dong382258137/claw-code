@@ -51,7 +51,13 @@ fn main() {
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
-    // Rerun if git state changes
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+    // 修复:原本使用 `cargo:rerun-if-changed=.git/HEAD` 和 `.git/refs`,
+    // 但这两个路径相对于包目录(`crates/rusty-claude-cli`),而 git 仓库根
+    // 在更上层目录(`d:\claw-code-src\.git`),包目录下根本不存在 `.git/`,
+    // Cargo 认为"这些文件从未变化" → 永远复用缓存的 build script output
+    // → GIT_SHA 一直是首次构建时的值。
+    //
+    // 修复方案:不输出 rerun-if-changed,让 Cargo 在每次构建时都重新运行
+    // build.rs(默认行为)。代价是每次构建多花几十毫秒执行 `git rev-parse`,
+    // 但确保 GIT_SHA 始终与当前 HEAD 一致。
 }
