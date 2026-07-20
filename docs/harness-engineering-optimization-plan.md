@@ -192,7 +192,12 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 
 ### 阶段 2:P1 核心架构升级(1-2 周)
 
-#### Step 2.1 — Plan/Execute/Review 三段循环 ✅
+#### Step 2.1 — Plan/Execute/Review 三段循环 ⚠️ 部分
+
+> **真实状态（2026-07-20 校正）**：`planner/` 目录与 `PlanArtifact` schema 已落地，
+> 但 `rusty-claude-cli/src/ultraplan.rs` 仍是 progress reporter，未集成新 planner
+> 子模块的 Plan→Build→Verify→Fix 闭环。主循环 `run_turn` 不会触发 planner 子调用，
+> `PreCompletionChecklistMiddleware` 也未接入。Plan artifact 持久化路径存在但无写入方。
 
 | 项 | 内容 |
 |---|---|
@@ -228,7 +233,13 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 | **风险** | 中 — 先 dry-run mode 对比新旧 prompt diff |
 | **缓存影响** | **正向** — 固定注入顺序后,半稳定区更稳定,可能 +1-2% |
 
-#### Step 2.4 — Memory 语义检索层 ✅
+#### Step 2.4 — Memory 语义检索层 ⚠️ 部分
+
+> **真实状态（2026-07-20 校正）**：`memory/semantic.rs` 文件已存在，
+> 但 `memory_semantic.rs:161` 退化为 keyword 搜索，未集成 HNSW 向量索引。
+> `semantic_recall` 入口存在但走关键词匹配，无 embedding 调用。
+> L1/L2/L3 三级层级未落地，嵌入模型（OpenAI text-embedding-3-small）未接入。
+> fallback 到 rule-based 的设计已就位，但 fallback 路径就是当前唯一路径。
 
 | 项 | 内容 |
 |---|---|
@@ -244,7 +255,13 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 
 ### 阶段 3:P2 验证反馈与 Multi-Agent(2-3 周)
 
-#### Step 3.1 — Verifier Agent ✅
+#### Step 3.1 — Verifier Agent ⚠️ 部分
+
+> **真实状态（2026-07-20 校正）**：`verifier/` 目录与 `VerifierAgent` 骨架已落地，
+> 规则反馈（cargo test / clippy / fmt）已接入，但**视觉反馈与模型当裁判为 placeholder**：
+> - `verifier/visual.rs`：Playwright 截图对比未实现，函数返回占位结果
+> - `verifier/model_judge.rs`：子 agent 调用 LLM 评估 tool result 未实现，返回占位结果
+> `VerifierAgent::verify` 当前只走规则路径，且未注入主循环 `run_turn`（latent defect）。
 
 | 项 | 内容 |
 |---|---|
@@ -256,7 +273,13 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 | **风险** | 低 — 子 agent 独立 |
 | **缓存影响** | 无 — 子 agent 独立 LLM 请求,独立 prompt cache |
 
-#### Step 3.2 — 子 Agent 编排与 Multi-Agent Coordinator ✅
+#### Step 3.2 — 子 Agent 编排与 Multi-Agent Coordinator ⚠️ 部分
+
+> **真实状态（2026-07-20 校正）**：`multi_agent/` 目录骨架已落地，
+> `task_registry.rs` 已有 6 态 TaskStatus，但**消息总线未扩展**：
+> `lane_events.rs` 仍为原 19 事件，未新增 `SubagentHandoff` / `SubagentResult`。
+> Agent-to-agent tool call 路由未实现，子 agent 未作为 tool 暴露给主 agent。
+> `team_cron_registry.rs` 仍是 in-memory stub，无持久化和真实 cron 调度。
 
 | 项 | 内容 |
 |---|---|
@@ -268,7 +291,14 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 | **风险** | 中 — 主 agent 缓存可能在 handoff 点失效 |
 | **缓存影响** | 中 — 只在 handoff 点触发,正常流程不变 |
 
-#### Step 3.3 — Telemetry 导出与 Trace Analyzer 基础 ✅
+#### Step 3.3 — Telemetry 导出与 Trace Analyzer 基础 ⚠️ 部分
+
+> **真实状态（2026-07-20 校正）**：CSV exporter 已落地，`SessionTracer::record`
+> 已扩展，`TraceAnalyzer::load` 基础统计已实现。但**OTLP exporter 未实现**
+> （标注为可选，目前完全缺失）。失败聚类**退化为按 `failure_kind` 分桶**，
+> 未实现 K-means on (failure_kind, error_message_embedding) — 没有 embedding，
+> 无法做真正的向量聚类。Metrics histogram（turn latency / tool call count /
+> compact 触发率）部分实现。
 
 | 项 | 内容 |
 |---|---|
@@ -545,3 +575,4 @@ cd rust && cargo build && cp target/debug/claw.exe debug/claw.exe
 | 日期 | 版本 | 变更 |
 |---|---|---|
 | 2026-07-19 | v1.0 | 初始版本,涵盖阶段 1-4 + 缓存保护方案 |
+| 2026-07-20 | v1.1 | 校正 Step 状态：5 个原标 ✅ 的 Step 经代码核对实际为部分实现，改为 ⚠️ 部分（Step 2.1 / 2.4 / 3.1 / 3.2 / 3.3），并补充真实状态说明 |

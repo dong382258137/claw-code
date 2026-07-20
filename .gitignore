@@ -11,6 +11,8 @@ archive/
 .claw/history.db
 .claw/plugins/
 .clawhip/
+# TUI scratch TODOs (transient)
+.clawd-todos.json
 # Plugin local data (per-workspace)
 **/.claw/plugins/
 **/.claw/history.db
