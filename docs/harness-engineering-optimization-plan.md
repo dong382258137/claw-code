@@ -437,26 +437,81 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 
 ### 阶段 4:P3 平台兼容性与前沿(1 周)
 
-#### Step 4.1 — Sandbox Windows 实现 ✅
+#### Step 4.1 — Sandbox Windows 实现 ⚠️ 部分
+
+> **真实状态(2026-07-21 v1.4 复核)**:`SandboxBuilder` trait + `LinuxSandboxBuilder` /
+> `WindowsSandboxBuilder` / `MacOsSandboxBuilder` 三实现 structurally 存在(代码可编译,
+> 11 个单元测试覆盖 builder API),但**运行时无效**:
+> - `bg.rs::spawn()`(L89-124)完全绕过 `SandboxBuilder`,用自己的 `apply_detached_flags`
+>   (L316-323),常量 `0x0800_0208` 重复硬编码,未引用 sandbox.rs 常量
+> - `WindowsSandboxBuilder::assign_process_to_job_object(pid)`(sandbox.rs:471-494)
+>   是**死代码** — 从未被任何调用方调用,Job Object 在运行时实际不创建
+> - PowerShell + C# 内联的 Job Object 脚本(sandbox.rs:497-581)虽存在但从未执行
+> - `lib.rs` 公共导出(L239-244)不含 `SandboxBuilder` trait 与新类型,外部 crate 无法使用
+> - 无功能性测试 — Job Object 实际强制限制未验证、bg.rs spawn 走 SandboxBuilder 路径未验证
+> - sandbox.rs:392 注释过时(声称"Job Object 限制待集成 Win32 API",实际已有 PowerShell 实现)
+> - macOS 实现文档自述为 placeholder(sandbox.rs:315, 648)
+>
+> **要达到 ✅ 完整,至少需要**:
+> 1. `bg.rs::spawn` 改用 `platform_sandbox_builder().build(...)`,删除 `apply_detached_flags` 硬编码
+> 2. spawn 后取得 PID,调用 `WindowsSandboxBuilder::assign_process_to_job_object(pid)`
+> 3. `lib.rs` 导出 `SandboxBuilder`/`SandboxCommand`/`WindowsSandboxBuilder`/`MacOsSandboxBuilder`/`platform_sandbox_builder`
+> 4. 添加 Windows 集成测试,验证 Job Object 实际强制限制
+> 5. 修正 sandbox.rs:392 过时注释
 
 | 项 | 内容 |
 |---|---|
 | **目标** | 让 E(执行环境)层在 Windows 可用(本项目实际运行平台) |
-| **改动文件** | 改 `rust/crates/runtime/src/sandbox.rs` |
+| **改动文件** | 改 `rust/crates/runtime/src/sandbox.rs`、`rust/crates/runtime/src/bg.rs`、`rust/crates/runtime/src/lib.rs` |
 | **实现要点** | 1. Windows:`CREATE_NO_WINDOW` + Job Object 限制 CPU/memory <br> 2. macOS:`sandbox-exec` wrapper(可选,优先级低) <br> 3. 抽象 `SandboxBuilder` trait,Linux/Windows/macOS 三实现 <br> 4. 与 `bg.rs` 已有的 `CREATE_NO_WINDOW` flag 整合 |
 | **验证** | Windows 上跑 `cargo test sandbox` |
 | **缓存影响** | 无 |
+| **实际状态** | ⚠️ 部分 — trait + 三实现存在(可编译),但 bg.rs 未整合、Job Object 是死代码、公共 API 未导出、无功能性测试 |
 
-#### Step 4.2 — LSP Client 真实接入 ✅
+#### Step 4.2 — LSP Client 真实接入 ⚠️ 部分
+
+> **真实状态(2026-07-21 v1.4 复核)**:协议层和传输层都已真实编码,但**生产 dispatch 路径
+> 仍走 `MemoryLspTransport` placeholder**,`ProcessLspTransport::spawn()` 从未被生产代码调用,
+> rust-analyzer 也从未被真实启动。
+>
+> **已实现部分**:
+> - `LspRequest` 协议层(method/params/file_uri 构造)— 真实可用
+> - `LspJsonRpcClient::initialize()` / `did_change()` 协议构造 — 真实可用
+> - `ProcessLspTransport` 完整传输层实现(spawn / write_message / read_message / Drop 清理)— 真实可用但**未被生产使用**(死代码)
+> - 40 个单元测试覆盖协议构造逻辑
+>
+> **缺失部分**:
+> - ❌ **未引入 `lsp-types` / `tower-lsp` 官方 crate**,全部手搓 serde_json 易出错
+> - ❌ **`LspRegistry::dispatch()`(L292)默认走 `MemoryLspTransport` placeholder** — 返回
+>   固定响应 `"status": "protocol_constructed"`,不调用 `ProcessLspTransport::spawn()`
+> - ❌ **生产代码无任何 `ProcessLspTransport::new()` / `with_transport()` 调用** — 该传输层
+>   是死代码,仅被 3 个测试引用(且测试都没调用 `.spawn()`)
+> - ❌ **`repomap.rs` 与 LSP 完全无关联** — lsp_client.rs:735 docstring 声称"协同"纯属愿景,
+>   repomap.rs 中 0 个 LSP/symbol 引用
+> - ❌ **无 `LspSymbol` 解析逻辑** — 从 `textDocument/documentSymbol` 响应到 `LspSymbol`
+>   的转换未实现
+> - ❌ **无 rust-analyzer 真实启动测试** — 没有 `#[ignore]` 集成测试或端到端测试
+> - ❌ **`LspRegistry` 未提供 `spawn_server()` 之类的方法** — 注册的 server 状态是手动
+>   `register("rust", LspServerStatus::Connected, ...)` 写入的,没有真实启动逻辑
+>
+> **要达到 ✅ 完整,至少需要**:
+> 1. 在 `LspRegistry::dispatch()` 中改为使用 `ProcessLspTransport`(通过 `LspJsonRpcClient::with_transport`),
+>    并先调用 `spawn()` 启动真实 LSP server
+> 2. 提供 `LspRegistry::spawn_server(language, command, root_path)` 之类的 API
+> 3. 实现 `textDocument/documentSymbol` 响应到 `LspSymbol` 的解析
+> 4. 在 `repomap.rs` 中调用 `LspRegistry` 获取 symbol 信息(实现"协同")
+> 5. 添加 `#[ignore]` 集成测试,真实启动 rust-analyzer 验证 initialize → didChange → hover/completion 全流程
+> 6. 评估是否引入 `lsp-types` crate 替代手搓 serde_json
 
 | 项 | 内容 |
 |---|---|
-| **目标** | 替换 `lsp_client.rs` L285 的 placeholder |
-| **改动文件** | 改 `rust/crates/runtime/src/lsp_client.rs` |
+| **目标** | 替换 `lsp_client.rs` L292 的 placeholder(LspJsonRpcClient::new 默认 MemoryLspTransport) |
+| **改动文件** | 改 `rust/crates/runtime/src/lsp_client.rs`、`rust/crates/runtime/src/repomap.rs`、`rust/crates/runtime/Cargo.toml` |
 | **实现要点** | 1. 集成 `tower-lsp` 或 `lsp-types` crate <br> 2. `dispatch` 方法真实调用 LSP JSON-RPC:initialize → didChange → completion/hover <br> 3. 与 `repomap.rs` 协同,LSP 提供 symbol 信息 |
 | **验证** | 启动 rust-analyzer,断言 completion 返回非空 |
 | **依赖** | 无 |
 | **缓存影响** | 低 — LSP symbol 注入 repomap,但 repomap 已在变动区 |
+| **实际状态** | ⚠️ 部分 — 协议层 + 传输层已编码,但生产 dispatch 走 placeholder、ProcessLspTransport 是死代码、repomap 协同未实现、无 LSP crate 依赖、无 rust-analyzer 集成测试 |
 
 ---
 
@@ -701,3 +756,4 @@ cd rust && cargo build && cp target/debug/claw.exe debug/claw.exe
 | 2026-07-20 | v1.1 | 校正 Step 状态：5 个原标 ✅ 的 Step 经代码核对实际为部分实现，改为 ⚠️ 部分（Step 2.1 / 2.4 / 3.1 / 3.2 / 3.3），并补充真实状态说明 |
 | 2026-07-21 | v1.2 | 实施完成 4 个原 ⚠️ 部分 Step 并校正状态：Step 2.1 ✅(commit 083f4a9,/ultraplan 对接 runtime planner)、Step 2.4 ✅(commit 876f577,EmbeddingProvider trait + FastembedProvider)、Step 3.2 ✅(3.2-a/b/c 全部完成,commits 8322e88/a46a3b5/36d9721,subagent-as-tool 路由)、Step 3.3 ✅(commit 23c7c72,K-means 失败聚类)。Step 3.1 维持 ⚠️ 部分(规则反馈已够用,视觉/模型裁判留到阶段 4)。 |
 | 2026-07-21 | v1.3 | 新增阶段 3.5:三层信息持久化架构(基于论文调研)。基于 Anthropic《Effective Context Engineering》《Multi-Agent Research System》、CompactionRL (arXiv:2607.05378)、MIRIX (arXiv:2507.07957) 实施 5 个改进:P0-1 NOTEBOOK.md parse() 修复 + Structured Note-taking(commit 59f1663,26 测试)、P0-3 压缩前 NOTEBOOK 刷新 trigger(commit 8ea0c67,3 测试)、P0-2 子智能体真实化(同步阻塞 + 上下文隔离 + 文件持久化,commit c2e8f48,10 测试,修复 MultiAgentCoordinator 空壳问题)、P1 microcompact 结构化保留(子智能体指针 + 多行预览,commit a1ac0d1,5 测试)、P3 streaming stall 事件间超时(commit b7edada,337 测试全绿)。新增 37 个测试,总 918 passed。修复长程任务中"AI 忘记关键信息导致重复 dispatch"stall 问题。 |
+| 2026-07-21 | v1.4 | 代码核对复核 Step 4.1 / 4.2,校正状态从 ✅ 到 ⚠️ 部分。Step 4.1 Sandbox:SandboxBuilder trait + 三实现存在(可编译),但 bg.rs::spawn 完全绕过 SandboxBuilder、assign_process_to_job_object 是死代码、公共 API 未导出、无功能性测试。Step 4.2 LSP Client:协议层 + ProcessLspTransport 传输层已编码,但生产 dispatch 走 MemoryLspTransport placeholder、ProcessLspTransport 是死代码、repomap 协同未实现、无 lsp-types/tower-lsp 依赖、无 rust-analyzer 集成测试。两个 Step 都需要补齐"整合 + 功能性测试"才能达到 ✅ 完整。 |
