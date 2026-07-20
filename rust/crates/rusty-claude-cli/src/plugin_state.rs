@@ -434,6 +434,52 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         }),
         required_permission: PermissionMode::ReadOnly,
     });
+    // P0-1:注册 notebook_update 工具 — Anthropic《Effective Context
+    // Engineering for AI Agents》明确推荐的 structured note-taking 模式。
+    // LLM 通过此工具维护 NOTEBOOK.md(跨压缩持久化的工作记忆),记录:
+    // - 当前任务的关键决策、约束、进度(<plan>)
+    // - 已 dispatch 的子智能体注册表(<subagents>)
+    // - 已尝试的方案及结论(<attempted>)
+    // - 用户明确表达的偏好/约束(<preferences>)
+    // - 关键文件引用(<key_files>)
+    //
+    // 执行由 ConversationRuntime::run_turn 拦截,委托
+    // runtime::notebook::execute_notebook_update 处理(原子写 .claw/NOTEBOOK.md)。
+    // 直击"AI 忘记已 dispatch 过子智能体导致重复调用"的问题。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "notebook_update".to_string(),
+        description: Some(
+            "Update the persistent working memory (NOTEBOOK.md). This memory \
+             survives context compaction — use it to record key decisions, \
+             subagent registry, attempted approaches, user preferences, and \
+             key file references. CRITICAL: always record subagent dispatches \
+             here so you do not re-dispatch the same task later. Modes: 'set' \
+             (overwrite section) or 'append' (add a line). Sections: plan, \
+             subagents, attempted, preferences, key_files."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["set", "append"],
+                    "description": "Operation mode: 'set' overwrites the entire section; 'append' adds a single line."
+                },
+                "section": {
+                    "type": "string",
+                    "enum": ["plan", "subagents", "attempted", "preferences", "key_files"],
+                    "description": "Target section name."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "For 'set': full section content. For 'append': a single line to add."
+                }
+            },
+            "required": ["mode", "section", "content"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    });
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {

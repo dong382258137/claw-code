@@ -1603,7 +1603,11 @@ fn status_degrades_gracefully_on_malformed_mcp_config_143() {
 
     // Phase 1 contract: workspace/git/sandbox fields are still populated
     // (independent of config parse). Sandbox falls back to defaults.
-    assert_eq!(context.cwd, cwd.canonicalize().unwrap_or(cwd.clone()));
+    // Note: status_context returns cwd without canonicalization (format.rs:404),
+    // so the test must compare against the raw cwd, not canonicalize(). On
+    // Windows canonicalize() prepends the `\\?\` UNC prefix which would
+    // cause a spurious mismatch.
+    assert_eq!(context.cwd, cwd);
     assert_eq!(
         context.loaded_config_files, 0,
         "loaded_config_files should be 0 when config parse fails"
@@ -4585,6 +4589,9 @@ fn build_runtime_plugin_state_merges_plugin_hooks_into_runtime_features() {
     let _ = fs::remove_dir_all(source_root);
 }
 
+// Windows-incompatible: fixture uses `python3` shebang which is not a standard
+// alias on Windows (Python is installed as python.exe / py.exe). Unix-only.
+#[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
@@ -4755,6 +4762,9 @@ fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
     let _ = fs::remove_dir_all(workspace);
 }
 
+// Windows-incompatible: lifecycle fixtures are .sh scripts (`#!/bin/sh`),
+// which Windows cannot natively execute. Unix-only.
+#[cfg(unix)]
 #[test]
 fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
     // Serialize access to process-wide env vars so parallel tests that
@@ -4892,6 +4902,7 @@ fn stub_commands_absent_from_resume_safe_help() {
     assert!(resume_roots.contains(&"status"));
 }
 
+#[cfg(unix)]
 fn write_mcp_server_fixture(script_path: &Path) {
     let script = [
             "#!/usr/bin/env python3",

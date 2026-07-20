@@ -900,6 +900,30 @@ where
                 // 通过 assembler Memory source 或手动 push 注入。
                 let mut system_split =
                     SystemPromptSplit::from_sections(self.system_prompt.clone());
+                // P0-1:NOTEBOOK 注入 — 跨压缩持久化的工作记忆。
+                // Anthropic《Effective Context Engineering》明确推荐:structured
+                // note-taking 是长程任务的关键技术,每个 turn 注入到 system_prompt
+                // 变动区,确保 LLM 始终能看到关键信息(决策、子智能体注册表、
+                // 已尝试方案、用户偏好、关键文件引用)。
+                //
+                // 关键不变量:NOTEBOOK.md 不在 message history 中,因此
+                // microcompact / compact_session 不会影响它。它通过 system_prompt
+                // 变动区每个 turn 重新注入,这是 Anthropic 推荐的标准模式。
+                //
+                // 注意:放在 assembler/手动注入路径之前,确保 NOTEBOOK 是变动区
+                // 的第一段(LLM 最先看到的工作记忆)。
+                if let Some(workspace_root) = &self.workspace_root {
+                    if let Ok(notebook) = crate::notebook::Notebook::load(workspace_root) {
+                        let notebook_prompt = notebook.render_for_prompt();
+                        if !notebook_prompt.is_empty() {
+                            system_split.dynamic_sections.push(notebook_prompt);
+                        }
+                    }
+                    // NOTEBOOK 加载失败时不阻塞 turn(避免 NOTEBOOK 文件损坏
+                    // 导致整个 agent 无法运行),但记录到 stderr 供排查。
+                    // 实际加载错误在 else 分支已经被静默忽略(load 返回 Ok(empty)),
+                    // 只有 parse 错误才会进入 Err,这里不额外日志。
+                }
                 if let Some(assembler) = &self.context_assembler {
                     // 统一注入路径:把所有动态内容通过 assembler 收集。
                     let mut asm = assembler.clone();
@@ -1142,6 +1166,17 @@ where
                                 // Step 3.2-c:查询子 agent 状态/结果。
                                 // 终态会发布 SubagentResult lane event。
                                 match self.execute_check_subagent(&effective_input) {
+                                    Ok(output) => (output, false),
+                                    Err(error) => (error.to_string(), true),
+                                }
+                            } else if tool_name == "notebook_update" {
+                                // P0-1:LLM 主动维护 NOTEBOOK.md(跨压缩持久化记忆)。
+                                // Anthropic《Effective Context Engineering for AI Agents》
+                                // 明确推荐:structured note-taking 是长程任务的关键技术。
+                                // 工具描述强调"CRITICAL: always record subagent dispatches
+                                // here so you do not re-dispatch the same task later",
+                                // 直击"AI 忘记已 dispatch 过子智能体"的问题。
+                                match self.execute_notebook_update(&effective_input) {
                                     Ok(output) => (output, false),
                                     Err(error) => (error.to_string(), true),
                                 }
@@ -1581,6 +1616,33 @@ where
             },
         });
         Ok(serde_json::to_string_pretty(&response)?)
+    }
+
+    /// P0-1:执行 `notebook_update` 工具调用,维护 NOTEBOOK.md。
+    ///
+    /// 这是 Anthropic《Effective Context Engineering for AI Agents》明确推荐的
+    /// "structured note-taking" 模式实现:LLM 通过此工具把关键信息(决策、
+    /// 子智能体注册表、已尝试方案、用户偏好、关键文件引用)写入 NOTEBOOK.md,
+    /// 这些信息跨 microcompact / compact_session 持久化,避免长程任务中
+    /// "AI 忘记关键信息"导致重复 dispatch / 重复读文件 / 陷入死循环。
+    ///
+    /// 流程:委托 [`notebook::execute_notebook_update`] 处理。
+    /// 需要 `workspace_root` 已通过 [`set_workspace_root`] 设置。
+    fn execute_notebook_update(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(workspace_root) = &self.workspace_root else {
+            return Ok(
+                "notebook_update is not available: no workspace_root configured. \
+                 Use --workspace-root or set_workspace_root to enable NOTEBOOK persistence."
+                    .to_string(),
+            );
+        };
+        match crate::notebook::execute_notebook_update(workspace_root, input) {
+            Ok(message) => Ok(message),
+            Err(error) => Ok(format!("notebook_update failed: {error}")),
+        }
     }
 
     #[must_use]

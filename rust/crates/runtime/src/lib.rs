@@ -35,6 +35,10 @@ pub mod memory_store;
 // Harness C(上下文管理)层:Memory 语义检索(L1/L2/L3 三级层级 + keyword fallback)。
 // 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
 pub mod memory_semantic;
+// Harness C(上下文管理)层:NOTEBOOK — Structured Note-taking(Anthropic 推荐)。
+// 跨压缩持久化的工作记忆,LLM 通过 `notebook_update` 工具主动维护。
+// 详见 docs/harness-engineering-optimization-plan.md P0-1。
+pub mod notebook;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -164,6 +168,10 @@ pub use memory_semantic::{
 };
 #[cfg(feature = "embedding")]
 pub use memory_semantic::FastembedProvider;
+pub use notebook::{
+    execute_notebook_update, Notebook, NotebookError, NotebookUpdateInput, NOTEBOOK_FILENAME,
+    NOTEBOOK_HEADER, NOTEBOOK_MAX_CHARS, NOTEBOOK_UPDATE_TOOL_SPEC, SECTION_TAGS,
+};
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,
