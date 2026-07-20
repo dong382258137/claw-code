@@ -326,7 +326,19 @@ const SUMMARIZABLE_TOOLS: &[&str] = &["Read", "Bash", "Grep", "Glob", "LS"];
 
 /// Tool names whose results must never be summarized because the verbatim
 /// output is required for the model to reason about subsequent state changes.
-const CRITICAL_TOOLS: &[&str] = &["Edit", "Write", "Delete"];
+///
+/// P1 改进:新增 `dispatch_subagent` / `check_subagent` — 子智能体结果包含
+/// 关键指针(subagent_id + result_ref 路径),丢失会导致主 agent 无法引用
+/// 子智能体的工作产物。这些结果体积小(通常 < 200 字符),保留完整不会
+/// 显著增加上下文负担。与 NOTEBOOK 协同:NOTEBOOK.md 的 `<subagents>` 段
+/// 提供跨压缩持久化,但单 turn 内的指针仍需完整保留以避免"game of telephone"。
+const CRITICAL_TOOLS: &[&str] = &[
+    "Edit",
+    "Write",
+    "Delete",
+    "dispatch_subagent",
+    "check_subagent",
+];
 
 /// Returns true when `tool_name` produces high-volume read-only output that is
 /// safe to summarize.
@@ -354,11 +366,52 @@ fn is_already_summarized(output: &str) -> bool {
 }
 
 /// Builds the summary placeholder for an aged tool result.
+///
+/// P1 改进:从"只保留第一行"改为"保留前 N 行 + 行数信息",避免关键信息丢失。
+///
+/// 设计依据:
+/// - 旧格式只保留第一行,对于多行 tool results(如 Grep 匹配多文件、
+///   Read 多行文件内容)会导致关键信息丢失,LLM 无法判断是否需要 re-read。
+/// - 新格式保留前 N 行(N=3)作为指针,LLM 可根据内容判断是否需要
+///   重新调用工具获取完整结果。
+/// - 与 NOTEBOOK 协同:关键信息应已通过 `notebook_update` 持久化到
+///   NOTEBOOK.md,这里保留前 N 行作为"足够判断的指针"。
+/// - `is_already_summarized` 检测逻辑保持兼容(starts_with('[') +
+///   contains(" output summarized: ") + ends_with("…]") +
+///   contains(" chars → ")),避免重复摘要。
 #[must_use]
 fn format_tool_result_summary(tool_name: &str, output: &str) -> String {
     let original_len = output.chars().count();
-    let first_line = output.lines().next().unwrap_or("").trim();
-    format!("[{tool_name} output summarized: {original_len} chars → {first_line}…]")
+    let total_lines = output.lines().count();
+
+    // P1:保留前 N 行作为结构化预览,而非只保留第一行。
+    // N=3 是经验值:足够展示工具结果的开头结构(如文件路径 + 前几行内容,
+    // 或 Grep 匹配的前几个文件),同时控制摘要体积。
+    const MAX_PREVIEW_LINES: usize = 3;
+    const MAX_PREVIEW_CHARS: usize = 240;
+
+    let preview_lines: Vec<&str> = output.lines().take(MAX_PREVIEW_LINES).collect();
+    let mut preview = preview_lines.join("\n");
+
+    // 如果 preview 超过字符上限,截断并加省略号
+    if preview.chars().count() > MAX_PREVIEW_CHARS {
+        let truncated: String = preview.chars().take(MAX_PREVIEW_CHARS).collect();
+        preview = format!("{truncated}…");
+    }
+
+    // 行数信息:如果总行数 > 预览行数,附加 "(N lines total)" 提示
+    let line_info = if total_lines > MAX_PREVIEW_LINES {
+        format!(" ({total_lines} lines total)")
+    } else {
+        String::new()
+    };
+
+    // 格式保持 is_already_summarized 兼容:
+    // - starts_with('[') ✓
+    // - contains(" output summarized: ") ✓
+    // - contains(" chars → ") ✓ (chars → 后跟空格 + preview 第一行)
+    // - ends_with("…]") ✓
+    format!("[{tool_name} output summarized: {original_len} chars → {preview}{line_info}…]")
 }
 
 /// Summarize old tool results to free context before full compaction.
@@ -841,9 +894,10 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 mod tests {
     use super::{
         collect_key_files, compact_session, compact_session_with_trigger, estimate_message_tokens,
-        extract_compact_boundary, format_compact_summary, get_compact_continuation_message,
-        get_messages_after_compact_boundary, infer_pending_work, merge_compact_summaries,
-        microcompact, should_compact, CompactBoundary, CompactTrigger, CompactionConfig,
+        extract_compact_boundary, format_compact_summary, format_tool_result_summary,
+        get_compact_continuation_message, get_messages_after_compact_boundary, infer_pending_work,
+        is_already_summarized, merge_compact_summaries, microcompact, should_compact,
+        CompactBoundary, CompactTrigger, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -1725,5 +1779,173 @@ mod tests {
 
         let result = microcompact(&messages, 4);
         assert_eq!(result, messages);
+    }
+
+    /// P1:dispatch_subagent 结果必须保留完整(关键指针:subagent_id + result_ref)。
+    ///
+    /// 子智能体结果包含主 agent 后续读取所需的 result_ref 路径,
+    /// 即使很老也不能被摘要丢失。
+    #[test]
+    fn microcompact_preserves_dispatch_subagent_results() {
+        let dispatch_output = "Subagent `subagent-1` completed. Result written to: .claw/subagents/subagent-1.md\n\
+             Use Read tool to inspect the result. The subagent ran with an isolated context.";
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result("1", "dispatch_subagent", dispatch_output, false),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Read", "recent read", false),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("3", "Read", "newest read", false),
+        ];
+
+        // preserve_recent=2: 只有最后 2 条 tool result 是 recent。
+        // dispatch_subagent 是最老的,但因 P1 加入 CRITICAL_TOOLS,必须保留完整。
+        let result = microcompact(&messages, 2);
+        let dispatch_result = &result[1].blocks[0];
+        let ContentBlock::ToolResult {
+            tool_name,
+            output,
+            is_error,
+            ..
+        } = dispatch_result
+        else {
+            panic!("expected tool result");
+        };
+        assert_eq!(tool_name, "dispatch_subagent");
+        assert!(!*is_error);
+        assert_eq!(
+            *output, dispatch_output,
+            "P1: dispatch_subagent result must be preserved verbatim (contains critical result_ref pointer)"
+        );
+        assert!(
+            output.contains(".claw/subagents/subagent-1.md"),
+            "P1: result_ref path must be preserved: {output}"
+        );
+    }
+
+    /// P1:check_subagent 结果必须保留完整(关键指针:subagent_id + status + result)。
+    #[test]
+    fn microcompact_preserves_check_subagent_results() {
+        let check_output = r#"{
+  "subagent_id": "subagent-2",
+  "status": "completed",
+  "terminal": true,
+  "result": ".claw/subagents/subagent-2.md",
+  "name": "analyzer",
+  "mode": "fork"
+}"#;
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result("1", "check_subagent", check_output, false),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Read", "recent", false),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("3", "Read", "newest", false),
+        ];
+
+        let result = microcompact(&messages, 2);
+        let check_result = &result[1].blocks[0];
+        let ContentBlock::ToolResult {
+            tool_name,
+            output,
+            ..
+        } = check_result
+        else {
+            panic!("expected tool result");
+        };
+        assert_eq!(tool_name, "check_subagent");
+        assert_eq!(
+            *output, check_output,
+            "P1: check_subagent result must be preserved verbatim (contains critical status/result pointer)"
+        );
+    }
+
+    /// P1:format_tool_result_summary 从"只保留第一行"改为"保留前 N 行 + 行数信息"。
+    ///
+    /// 验证多行 Read 结果的摘要包含前 3 行 + 总行数提示,
+    /// 而非旧格式只包含第一行。
+    #[test]
+    fn format_tool_result_summary_preserves_multiple_lines() {
+        let multi_line_output = "line1: file header\nline2: import statement\nline3: function start\nline4: function body\nline5: function end";
+        let summary = format_tool_result_summary("Read", multi_line_output);
+
+        // 应包含前 3 行(不是只第一行)
+        assert!(
+            summary.contains("line1: file header"),
+            "summary should contain line1: {summary}"
+        );
+        assert!(
+            summary.contains("line2: import statement"),
+            "P1: summary should contain line2 (multi-line preview): {summary}"
+        );
+        assert!(
+            summary.contains("line3: function start"),
+            "P1: summary should contain line3 (multi-line preview): {summary}"
+        );
+        // 第 4、5 行不应在 preview 中(只保留前 3 行)
+        assert!(
+            !summary.contains("line4: function body"),
+            "summary should not contain line4 (beyond MAX_PREVIEW_LINES=3): {summary}"
+        );
+        // 应包含总行数提示(5 lines total)
+        assert!(
+            summary.contains("5 lines total"),
+            "P1: summary should include total line count: {summary}"
+        );
+        // 应包含原字符数
+        assert!(
+            summary.contains("chars →"),
+            "summary should include char count: {summary}"
+        );
+        // 应以 …] 结尾(保持 is_already_summarized 兼容)
+        assert!(
+            summary.ends_with("…]"),
+            "summary should end with '…]' for is_already_summarized compatibility: {summary}"
+        );
+    }
+
+    /// P1:验证 is_already_summarized 对新格式仍然有效(避免重复摘要)。
+    #[test]
+    fn is_already_summarized_recognizes_new_multi_line_format() {
+        let new_format = format_tool_result_summary("Read", "line1\nline2\nline3\nline4\nline5");
+        assert!(
+            is_already_summarized(&new_format),
+            "P1: is_already_summarized should recognize new multi-line format: {new_format}"
+        );
+
+        // 验证新格式不会被重复摘要
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result("1", "Read", new_format.clone(), false),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Read", "recent", false),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("3", "Read", "newest", false),
+        ];
+
+        let result = microcompact(&messages, 2);
+        let old_result = &result[1].blocks[0];
+        let ContentBlock::ToolResult { output, .. } = old_result else {
+            panic!("expected tool result");
+        };
+        assert_eq!(
+            *output, new_format,
+            "P1: new-format summary should not be re-summarized (is_already_summarized must return true)"
+        );
+    }
+
+    /// P1:短输出(≤ 3 行)的摘要不应附加 "(N lines total)" 提示。
+    #[test]
+    fn format_tool_result_summary_omits_line_count_for_short_output() {
+        let short_output = "only one line here";
+        let summary = format_tool_result_summary("Read", short_output);
+        assert!(
+            summary.contains("only one line here"),
+            "summary should contain the single line: {summary}"
+        );
+        assert!(
+            !summary.contains("lines total"),
+            "P1: short output (≤3 lines) should not include 'lines total' hint: {summary}"
+        );
     }
 }
