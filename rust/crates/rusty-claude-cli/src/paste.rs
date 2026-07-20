@@ -22,13 +22,60 @@ pub(crate) fn set_tui_silent(silent: bool) {
     TUI_SILENT.store(silent, Ordering::Relaxed);
 }
 
+/// 诊断日志文件路径：`%USERPROFILE%\.claw\paste-debug.log`。
+/// 用于排查 conhost 右键粘贴多行被切断的 BUG。无论 TUI 模式与否都写入文件，
+/// 避免污染 alternate screen。
+fn paste_diag_log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".claw").join("paste-debug.log"))
+}
+
+/// 诊断日志：追加写入 `~/.claw/paste-debug.log`，带时间戳。
+/// 用于排查 TUI 多行粘贴 BUG（conhost 右键粘贴场景）。
+/// 调用方应在关键路径加日志：Submit 入口、try_auto_expand_clipboard 触发前后、
+/// skip_submit 判断、Event::Paste 接收等。
+///
+/// BUG-2 修复：用 `CLAW_PASTE_DEBUG=1` 环境变量门控，避免生产环境每次键盘
+/// 事件都触发磁盘 I/O 与日志无限增长。环境变量只在首次调用时读取一次并缓存。
+pub(crate) fn paste_diag_log(msg: &str) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var_os("CLAW_PASTE_DEBUG")
+            .map(|v| v == "1" || v == "true" || v == "TRUE")
+            .unwrap_or(false)
+    });
+    if !enabled {
+        return;
+    }
+    let Some(path) = paste_diag_log_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[{timestamp}] {msg}");
+    }
+}
+
 /// 内部调试日志：TUI 模式下静默，CLI 模式下输出到 stderr。
+/// 同时追加到 `~/.claw/paste-debug.log` 用于诊断。
 macro_rules! paste_log {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        paste_diag_log(&msg);
         if !TUI_SILENT.load(Ordering::Relaxed) {
-            eprintln!($($arg)*);
+            eprintln!("{msg}");
         }
-    };
+    }};
 }
 
 /// 粘贴折叠阈值：超过此字符数或行数则折叠为占位符。
@@ -253,11 +300,71 @@ pub(crate) fn try_auto_expand_clipboard(
     }
     // 触发剪贴板替换：用完整内容走折叠流程（fold_pasted_input 内部决定是否折叠）
     let (display, expanded) = fold_pasted_input(&clipboard, session_id, paste_id_gen);
-    // 把剩余行填入 pending_paste_lines，主循环会丢弃匹配的后续 Submit
+    // 把剩余行填入 pending_paste_lines，主循环会丢弃匹配的后续 Submit。
+    //
+    // 过滤掉 trim 后为空的行：conhost 粘贴空行时发送空 Submit，
+    // 主循环 `if trimmed.is_empty() { continue; }` 会直接跳过，
+    // 如果 pending_paste_lines 包含空行，会导致下一个非空 Submit 不匹配。
+    // 所以这里主动过滤空行，让 pending_paste_lines 只包含非空行。
     *pending_paste_lines = clipboard_lines[1..]
         .iter()
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .collect();
     paste_log!("[paste-dbg] triggered! pending={} lines", pending_paste_lines.len());
     Some((display, expanded))
+}
+
+/// conhost TUI 路径专用：把剪贴板完整内容写到临时文件，返回 `@<文件路径>` 字符串。
+///
+/// **设计动机**：conhost 不支持 bracketed paste，Ctrl+V 粘贴多行文本时，crossterm
+/// 把剪贴板内容作为普通字符序列处理，第一行的 `\n` 必然触发 Submit。即使
+/// `try_auto_expand_clipboard` 能兜底发送完整内容，但用户无法"先编辑再发送"。
+///
+/// **新行为**：在 Submit 入口检测到 conhost 多行粘贴时，把完整剪贴板内容写到
+/// `%USERPROFILE%\.claw\paste-cache\clipboard_<timestamp>.txt`，返回 `@<文件路径>`。
+/// 主循环把 `@<路径>` 填充到 InputLine buffer，不发送给 AI。用户看到 `@<路径>`
+/// 后可以继续编辑或直接按 Enter 发送，AI 会看到 `@<路径>` 然后读取文件内容。
+///
+/// **参数**：
+/// - `clipboard`: 完整剪贴板内容
+/// - `session_id`: 会话 ID（用于日志）
+///
+/// **返回**：
+/// - `Ok(Some(path_str))`: 文件写入成功，返回 `@<路径>` 字符串
+/// - `Ok(None)`: 剪贴板为空或写入失败，主循环应回退到原行为
+pub(crate) fn write_clipboard_to_temp_file(
+    clipboard: &str,
+    session_id: &str,
+) -> Option<String> {
+    if clipboard.trim().is_empty() {
+        return None;
+    }
+
+    let root = paste_cache_root()?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let filename = format!("clipboard_{session_id}_{timestamp}.txt");
+    let path = root.join(&filename);
+
+    // 确保目录存在
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        paste_log!("[paste-dbg] write_clipboard_to_temp_file: create_dir_all 失败: {e}");
+        return None;
+    }
+
+    // 写入文件
+    if let Err(e) = std::fs::write(&path, clipboard) {
+        paste_log!("[paste-dbg] write_clipboard_to_temp_file: write 失败: {e}");
+        return None;
+    }
+
+    paste_log!("[paste-dbg] write_clipboard_to_temp_file: 已写入 {} 字节到 {:?}",
+        clipboard.len(), path);
+
+    // 返回 @<路径>
+    let path_str = path.to_string_lossy().to_string();
+    Some(format!("@{path_str}"))
 }

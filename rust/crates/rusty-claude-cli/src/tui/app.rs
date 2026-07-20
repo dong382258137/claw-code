@@ -35,6 +35,7 @@ use crossterm::terminal::{
 };
 // UnicodeWidthStr 用于按显示宽度计算 wrap 和光标定位（CJK 字符宽度为 2）。
 use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::LiveCli;
 use crate::tui::input_line::{InputAction, InputLine};
@@ -371,6 +372,47 @@ fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Li
     }
 }
 
+/// 按字符宽度 wrap 纯文本字符串到多个显示行。
+///
+/// 与 ratatui 的 WordWrapper 不同，此函数按字符宽度严格折行，
+/// 确保光标位置计算与渲染 100% 一致。"\n" 字符直接触发换行。
+///
+/// 边界情况：
+/// - `width == 0`：返回原始文本（不 wrap）
+/// - 零宽字符：不触发换行，追加到当前行
+/// - 单个字符宽度 > width：独占一行（会超出 width）
+fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width: usize = 0;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut current_line));
+            current_width = 0;
+            continue;
+        }
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch_width == 0 {
+            current_line.push(ch);
+            continue;
+        }
+        if current_width + ch_width > width && current_width > 0 {
+            lines.push(std::mem::take(&mut current_line));
+            current_width = 0;
+        }
+        current_line.push(ch);
+        current_width += ch_width;
+    }
+    // Push the last line (empty line if text ends with \n)
+    lines.push(current_line);
+
+    lines
+}
+
 /// Result of a turn executed in a background thread.
 struct TurnResult {
     cli: LiveCli,
@@ -506,11 +548,15 @@ fn run_event_loop(
             let input_area_width = f.area().width as usize;
             let input_content_lines: usize = {
                 let buf_str = input.buffer();
-                use unicode_width::UnicodeWidthStr;
                 buf_str
                     .split('\n')
-                    .map(|line| {
-                        let w = UnicodeWidthStr::width(line);
+                    .enumerate()
+                    .map(|(i, line)| {
+                        let mut w = UnicodeWidthStr::width(line);
+                        // 第 0 行有 "> " 前缀（2 列显示宽度）
+                        if i == 0 {
+                            w += 2;
+                        }
                         if w == 0 || input_area_width == 0 {
                             1
                         } else {
@@ -620,105 +666,55 @@ fn run_event_loop(
             f.render_widget(output_paragraph, main_area);
 
             // Input area
-            // 多行 buffer + wrap 支持：把整个 buffer（含 \n）交给 Paragraph 渲染，
-            // 启用 .wrap() 让长行自动折行。输入区高度已按 buffer 显示行数动态
-            // 扩展（见上方 input_height 计算），所以多行/长行都能完整显示。
-            let input_line = format!("> {}", input.buffer());
-            let input_paragraph = Paragraph::new(input_line)
-                .block(Block::default().borders(Borders::TOP).title("输入"))
-                .wrap(Wrap { trim: false });
+            // Bug fix（输入换行后光标位置不正确）：
+            // 旧实现用 Paragraph::new(input_line).wrap(Wrap{...}) 让 ratatui
+            // 的 WordWrapper 按 word 边界折行，但光标定位用字符级 wrap 计算。
+            // 两种折行策略不一致导致文本实际显示位置与光标计算位置不同：
+            // 输入换行后光标跑到错误的行/列。
+            //
+            // 彻底修复（与输出区修复一致）：自己按字符 wrap + 裁剪显示行，
+            // 传给 Paragraph 时不用 .wrap()。这样渲染与光标定位使用完全相同的
+            // wrap 策略，光标永远准确。
+            let input_text = format!("> {}", input.buffer());
+            let input_width = outer[1].width as usize;
+            let input_wrapped: Vec<String> = wrap_plain_text(&input_text, input_width);
+            // 裁剪：只取可见高度内的行（输入区可能不够高）
+            let input_content_height = outer[1].height.saturating_sub(1) as usize;
+            let visible_input_lines: Vec<Line<'static>> = input_wrapped
+                .iter()
+                .take(input_content_height)
+                .map(|s| Line::raw(s.clone()))
+                .collect();
+            let input_paragraph = Paragraph::new(Text::from(visible_input_lines))
+                .block(Block::default().borders(Borders::TOP).title("输入"));
             f.render_widget(input_paragraph, outer[1]);
 
-            // Position the visible cursor inside the input area.
-            // 多行 + wrap 光标定位：
-            // - Y 坐标 = 光标所在逻辑行之前所有行的显示行数（考虑 wrap）+ 当前行内的 wrap 偏移
-            // - X 坐标 = 当前行内光标左侧文本宽度 % area_width
+            // Cursor positioning：基于预折行结果计算，与渲染 100% 一致。
             //
-            // 旧实现的问题：
-            // 1. 输入区固定 3 行，多行/长行输入超出部分不可见
-            // 2. 没有 wrap，长行不会折行，光标 X 累加超出终端宽度
-            // 3. cursor_display_width() 累加所有行宽度，对 "hello\nworld" 返回 10
-            //    导致光标定位到第 1 行第 12 列（超出可见区域）
-            //
-            // **光标 wrap 行为说明**：
-            // 当内容刚好填满一行（effective_line_width == input_width 的整数倍），
-            // 终端光标会处于 wrap 状态，显示在下一行行首。所以：
-            // - row_in_line = effective_line_width / input_width（整数除法）
-            // - cursor_x = effective_line_width % input_width
-            // 当 effective_line_width=80, input_width=80 → row=1, x=0（下一行行首）
+            // 用 "> " + buffer 的完整文本中光标之前的子串做 wrap，
+            // 行数 - 1 即光标所在显示行号，最后一行的显示宽度即 X。
             let prompt_prefix_len: usize = 2; // "> "
-            let (line_idx, _byte_offset_in_line, line_content_before_cursor) =
-                input.cursor_line_and_column();
-            let input_width = outer[1].width as usize;
-            let line_display_width = UnicodeWidthStr::width(line_content_before_cursor);
-
-            // 计算光标所在逻辑行之前所有逻辑行的显示行数总和（含 prompt 前缀对第 0 行的影响）
-            // 第 0 行实际显示宽度 = prompt "> " (2) + 第 0 行内容宽度
-            let display_row_before_line: usize = if line_idx == 0 {
-                0
-            } else {
-                // 第 0 行：prompt 前缀占 2 列，第 0 行内容 + 2 后再 wrap
-                let buf_str = input.buffer();
-                let mut display_rows = 0usize;
-                for (i, line) in buf_str.split('\n').enumerate() {
-                    if i >= line_idx { break; }
-                    let line_w = if i == 0 {
-                        // 第 0 行有 "> " 前缀
-                        UnicodeWidthStr::width(line) + prompt_prefix_len
-                    } else {
-                        UnicodeWidthStr::width(line)
-                    };
-                    let rows = if line_w == 0 || input_width == 0 {
-                        1
-                    } else {
-                        ((line_w + input_width - 1) / input_width).max(1)
-                    };
-                    display_rows += rows;
-                }
-                display_rows
-            };
-
-            // 当前行内光标的显示行偏移（考虑 prompt 前缀对第 0 行的影响）
-            let effective_line_width = if line_idx == 0 {
-                line_display_width + prompt_prefix_len
-            } else {
-                line_display_width
-            };
-            let row_in_line = if effective_line_width == 0 || input_width == 0 {
-                0
-            } else {
-                effective_line_width / input_width
-            };
-
-            // X 坐标：当前行内光标左侧宽度对 input_width 取模
-            let cursor_x = if input_width == 0 {
-                0
-            } else if line_idx == 0 {
-                // 第 0 行：prompt + 内容
-                (prompt_prefix_len + line_display_width) % input_width
-            } else {
-                line_display_width % input_width
-            };
-
-            let display_row = display_row_before_line + row_in_line;
-            let input_content_height = outer[1].height.saturating_sub(1) as usize;
+            let cursor_byte = prompt_prefix_len + input.cursor();
+            let cursor_before = &input_text[..cursor_byte.min(input_text.len())];
+            let cursor_wrapped = wrap_plain_text(cursor_before, input_width);
+            let display_row = cursor_wrapped.len().saturating_sub(1);
+            let cursor_x =
+                UnicodeWidthStr::width(cursor_wrapped.last().map(String::as_str).unwrap_or(""));
             // 把 display_row 限制在可见区域内
             let visible_line_idx = display_row.min(input_content_height.saturating_sub(1));
             // 诊断日志：只在 buffer 非空且包含多行或长行时记录（排查 wrap 光标 BUG）
-            if !input.buffer().is_empty() && (input.buffer().contains('\n') || effective_line_width > input_width) {
+            if !input.buffer().is_empty()
+                && (input.buffer().contains('\n')
+                    || UnicodeWidthStr::width(input.buffer()) + prompt_prefix_len > input_width)
+            {
                 paste_diag_log(&format!(
-                    "光标计算: buf_len={} cursor={} line_idx={} line_w={} eff_w={} input_w={} row_before={} row_in_line={} cursor_x={} display_row={} visible_idx={}",
+                    "光标计算: buf_len={} cursor={} display_row={} cursor_x={} visible_idx={} input_w={}",
                     input.buffer().len(),
                     input.cursor(),
-                    line_idx,
-                    line_display_width,
-                    effective_line_width,
-                    input_width,
-                    display_row_before_line,
-                    row_in_line,
-                    cursor_x,
                     display_row,
+                    cursor_x,
                     visible_line_idx,
+                    input_width,
                 ));
             }
             f.set_cursor_position((
@@ -828,8 +824,11 @@ fn run_event_loop(
                 // InputLine buffer normalize 后等于 pending_paste_last_line normalize，
                 // 主动清空 buffer。normalize 是为了忽略 Tab 等空白差异。
                 if pending_paste_last_line.is_some() {
+                    // BUG-3 修复：normalize_whitespace 原本过滤所有空白，导致
+                    // "fn main()" 与 "fnmain()" 判等，误清空 buffer。改回 trim + 去 \r，
+                    // 仅处理 conhost 行尾差异（\r\n vs \n），保留内部空白。
                     let normalize_whitespace = |s: &str| -> String {
-                        s.chars().filter(|c| !c.is_whitespace()).collect::<String>()
+                        s.trim().replace('\r', "")
                     };
                     let normalized_buffer = normalize_whitespace(input.buffer());
                     let normalized_last = normalize_whitespace(pending_paste_last_line.as_deref().unwrap_or(""));
@@ -971,8 +970,9 @@ fn run_event_loop(
                         // 匹配 → 丢弃该 Submit，从 pending_paste_lines 移除该行。
                         // 不匹配且 !conhost_paste_intercepted → 粘贴已完成，清空并正常处理。
                         // 不匹配且 conhost_paste_intercepted → 仍丢弃（@路径或残留行）。
+                        // BUG-3 修复：normalize 改为 trim + 去 \r，保留内部空白。
                         let normalize_whitespace = |s: &str| -> String {
-                            s.chars().filter(|c| !c.is_whitespace()).collect::<String>()
+                            s.trim().replace('\r', "")
                         };
                         let skip_submit = if conhost_paste_intercepted {
                             // 方案 C 触发后，Windows Terminal 会把剪贴板内容作为字符流注入 stdin
@@ -989,7 +989,7 @@ fn run_event_loop(
                                 true
                             } else if !pending_paste_lines.is_empty() {
                                 let normalize_whitespace = |s: &str| -> String {
-                                    s.chars().filter(|c| !c.is_whitespace()).collect::<String>()
+                                    s.trim().replace('\r', "")
                                 };
                                 let normalized_line = normalize_whitespace(&line);
                                 let normalized_expected = normalize_whitespace(&pending_paste_lines[0]);
@@ -1002,6 +1002,11 @@ fn run_event_loop(
                                     ));
                                 }
                                 pending_paste_lines.remove(0);
+                                // BUG-4 修复：弹出最后一个元素时同步清理 pending_paste_last_line，
+                                // 防止残留状态导致后续用户输入被误清空 buffer。
+                                if pending_paste_lines.is_empty() {
+                                    pending_paste_last_line = None;
+                                }
                                 true
                             } else {
                                 paste_diag_log("  skip_submit=true (conhost 模式，pending_paste_lines 已空，最后兜底)");
@@ -1012,10 +1017,16 @@ fn run_event_loop(
                             let normalized_expected = normalize_whitespace(&pending_paste_lines[0]);
                             if !normalized_line.is_empty() && normalized_line == normalized_expected {
                                 pending_paste_lines.remove(0);
+                                // BUG-4 修复：同上，弹空时同步清理 pending_paste_last_line。
+                                if pending_paste_lines.is_empty() {
+                                    pending_paste_last_line = None;
+                                }
                                 paste_diag_log("  skip_submit=true (normalize 后匹配 pending_paste_lines[0]，丢弃)");
                                 true
                             } else {
                                 pending_paste_lines.clear();
+                                // BUG-4 修复：clear 时也清理 pending_paste_last_line。
+                                pending_paste_last_line = None;
                                 paste_diag_log(&format!(
                                     "  skip_submit=false (不匹配 normalized_line={:?} normalized_expected={:?})",
                                     normalized_line, normalized_expected
@@ -1032,6 +1043,10 @@ fn run_event_loop(
                             // conhost_paste_intercepted 只有在 pending_paste_lines 空时才重置。
                             if pending_paste_lines.is_empty() && conhost_paste_intercepted {
                                 conhost_paste_intercepted = false;
+                                // BUG-1 修复：conhost 模式通过"最后一行带 \n"路径结束时，
+                                // pending_paste_last_line 仍保留旧值，后续用户输入匹配旧值
+                                // 会被误清空 buffer。在此同步清理。
+                                pending_paste_last_line = None;
                                 paste_diag_log("  pending_paste_lines 清空，重置 conhost_paste_intercepted=false");
                                 // conhost 注入完毕，现在把 @路径填充到 buffer
                                 if let Some(at_path) = pending_at_path.take() {
@@ -1356,31 +1371,55 @@ fn run_event_loop(
                     InputAction::Continue | InputAction::Ignore => {}
                 }
             } else if let Event::Mouse(mouse) = ev {
-                // 鼠标左键点击：若命中输出区，切换该行所在的 ToolCard 折叠状态。
-                // 坐标映射：mouse.row 是终端绝对行号，需减去 main_area.y + 1
-                // （+1 为顶部 border）得到相对行号，再加 scroll_y 得到显示行号。
+                // 鼠标事件分发：
+                // - 左键单击：命中输出区时切换该行所在 ToolCard 的折叠状态
+                // - 滚轮上/下滚：调整 scroll_offset，复用 InputAction::ScrollUpLine /
+                //   ScrollDownLine 的语义，每次滚动 3 行（典型鼠标滚轮手感）
+                //
+                // 坐标映射（仅左键点击需要）：mouse.row 是终端绝对行号，需减去
+                // main_area.y + 1（+1 为顶部 border）得到相对行号，再加 scroll_y
+                // 得到显示行号。
                 //
                 // **P1-2 修复**：之前注释写"逻辑行号"，但 last_scroll_y 是显示行单位
                 // （Paragraph::scroll 按 Wrap 后的显示行计算），两者不一致导致长行
                 // 场景下点击坐标偏移。现在 toggle_tool_card_at_line 接收 area_width
                 // 参数，内部按显示行计算 [start, end) 区间，与 scroll 单位一致。
                 use crossterm::event::{MouseButton, MouseEventKind};
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && !help_visible
-                    && last_main_area.height > 0
-                {
-                    let content_top = last_main_area.y + 1; // +1 for top border
-                    let content_bottom = last_main_area.y + last_main_area.height;
-                    if mouse.row >= content_top && mouse.row < content_bottom {
-                        let relative_row = (mouse.row - content_top) as usize;
-                        let logical_row = relative_row + last_scroll_y as usize;
-                        // 输出区可见宽度 = area.width - 2（左右 border 各 1）
-                        let area_width = last_main_area.width.saturating_sub(2) as usize;
-                        let handle = output_view.shared_handle();
-                        if let Ok(mut buf) = handle.lock() {
-                            buf.toggle_tool_card_at_line(logical_row, area_width);
-                        };
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left)
+                        if !help_visible && last_main_area.height > 0 =>
+                    {
+                        let content_top = last_main_area.y + 1; // +1 for top border
+                        let content_bottom = last_main_area.y + last_main_area.height;
+                        if mouse.row >= content_top && mouse.row < content_bottom {
+                            let relative_row = (mouse.row - content_top) as usize;
+                            let logical_row = relative_row + last_scroll_y as usize;
+                            // 输出区可见宽度 = area.width - 2（左右 border 各 1）
+                            let area_width = last_main_area.width.saturating_sub(2) as usize;
+                            let handle = output_view.shared_handle();
+                            if let Ok(mut buf) = handle.lock() {
+                                buf.toggle_tool_card_at_line(logical_row, area_width);
+                            };
+                        }
                     }
+                    // 鼠标滚轮上滚：进入 manual-scroll 模式，每次上滚 3 行。
+                    // 与 InputAction::ScrollUpLine 行为一致（仅步长不同）。
+                    MouseEventKind::ScrollUp if !help_visible => {
+                        let current = scroll_offset.unwrap_or(0);
+                        scroll_offset = Some(current.saturating_add(3));
+                    }
+                    // 鼠标滚轮下滚：在 manual-scroll 模式下每次下滚 3 行；
+                    // 到 0 时回到 follow 模式。处于 follow 模式（None）时忽略。
+                    MouseEventKind::ScrollDown if !help_visible => {
+                        if let Some(offset) = scroll_offset {
+                            if offset <= 3 {
+                                scroll_offset = None; // back to follow mode
+                            } else {
+                                scroll_offset = Some(offset - 3);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             } else if let Event::Paste(text) = ev {
                 // Bracketed paste：整段粘贴作为一个事件投递。
