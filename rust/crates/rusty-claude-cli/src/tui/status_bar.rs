@@ -192,7 +192,14 @@ impl<'a> Widget for StatusBar<'a> {
         let mut spans: Vec<Span> = Vec::new();
         let mut used: usize = 0;
         for section in &sections {
-            let section_width: usize = section.iter().map(|s| s.content.len()).sum();
+            // P2-3 修复：用 UnicodeWidthStr 计算视觉宽度，而不是字节长度。
+            // 之前用 .len() 会高估含中文/emoji 的 section 实际占用宽度，
+            // 导致低优先级 section（cwd / git branch / streaming timer /
+            // goal badge / poor mode）在窄终端被错误跳过。
+            let section_width: usize = section
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
             if used + section_width > width && !spans.is_empty() {
                 break; // skip low-priority sections that don't fit
             }

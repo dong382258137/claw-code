@@ -709,6 +709,11 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
+        // P2-7 修复:在每个 turn 开始时重置 loop_detector,避免跨 turn 累积。
+        // 否则同一文件被多次编辑会触发 InjectContext/Abort,即使这些编辑分布在
+        // 不同 turn 中(误判 doom loop)。
+        self.loop_detector.reset();
+
         // BUG-9:记录 turn 开始时间,供 record_turn_* 计算 latency_ms。
         self.turn_start.set(Some(Instant::now()));
 
@@ -882,17 +887,42 @@ where
                                 continue;
                             }
                             // Compaction removed nothing — nothing more we can do.
-                            // 注:此处不再调用 try_recover_or_record_fail。
-                            // reactive_compact 本身就是 prompt_too_long 的恢复机制,
-                            // 再叠加 Provider 恢复会重置 reactive_state 导致 API 调用翻倍
-                            // (BUG-1 修复)。直接 record + 升级。
-                            self.record_turn_failed(iterations, &error);
+                            //
+                            // **P0-3 修复**：之前此分支直接 `record_turn_failed + return Err`，
+                            // 跳过 `try_recover_or_record_fail`。原注释称"避免 reactive_state
+                            // 重置导致 API 调用翻倍"，但实际上 `try_recover_or_record_fail`
+                            // 内部 `recovery_orchestrator.attempt()` 不会修改 `reactive_state`
+                            // （它是 `run_turn` 的局部变量，attempt 不持有其引用）。
+                            // 跳过 Provider 切换等恢复路径会让本可恢复的 prompt_too_long
+                            // 错误直接升级。现在调用恢复路径，让 Provider 切换等策略有机会生效。
+                            // 若恢复成功（如切换到支持更长 context 的 Provider），
+                            // reactive_state 仍为 MicrocompactDone 但下次循环会重新尝试。
+                            if self.try_recover_or_record_fail(
+                                iterations,
+                                WorkerFailureKind::Provider,
+                                &error,
+                            ) {
+                                // 恢复成功：保持 reactive_state 不变，让下次循环
+                                // 在新 Provider 下重新尝试 compaction。
+                                continue;
+                            }
                             return Err(error);
                         }
                         ReactiveCompactState::FullCompactDone => {
                             // Already exhausted recovery steps; bail out to
                             // prevent an infinite retry loop.
-                            // 注:此处不再调用 try_recover_or_record_fail,理由同上。
+                            //
+                            // **P0-3 修复**：同 MicrocompactDone 分支，调用恢复路径
+                            // 让 Provider 切换等策略有机会生效。reactive_state 是局部
+                            // 变量不会被 attempt 重置，注释中"避免 API 调用翻倍"的担忧
+                            // 不成立——attempt 只切换 Provider 配置，不影响 reactive_state。
+                            if self.try_recover_or_record_fail(
+                                iterations,
+                                WorkerFailureKind::Provider,
+                                &error,
+                            ) {
+                                continue;
+                            }
                             self.record_turn_failed(iterations, &error);
                             return Err(error);
                         }
@@ -2855,8 +2885,15 @@ mod tests {
     #[test]
     fn reactive_compact_does_not_loop_infinitely() {
         // API always returns prompt-too-long. The reactive state machine
-        // should exhaust both recovery steps (microcompact + full compact)
-        // and bail out instead of retrying forever.
+        // should exhaust all recovery steps (microcompact + full compact +
+        // one Provider recovery attempt) and bail out instead of retrying
+        // forever.
+        //
+        // **批次 6（P0-3）修复后**:removed==0 分支也调用
+        // `try_recover_or_record_fail`,让 Provider 恢复(如切换到更长 context
+        // 的 Provider)有机会生效。默认 RecoveryOrchestrator 第一次 attempt
+        // 总是 Recovered,所以会多一次 API 调用验证恢复是否真的解决问题。
+        // 第二次 attempt 后 escalation,流程终止。
         struct AlwaysPromptTooLongApi {
             call_count: usize,
         }
@@ -2873,7 +2910,11 @@ mod tests {
         }
 
         // Small session: should_compact returns false, so full compaction
-        // removes nothing and the recovery bails after two API calls.
+        // removes nothing and the recovery bails after three API calls:
+        //   1) initial attempt → prompt_too_long
+        //   2) after microcompact (still too long, removed==0 → Provider recovery)
+        //   3) recovery succeeded, retry under new Provider → still too long
+        //      → second Provider attempt → escalation → bail out.
         let mut session = Session::new();
         session.messages = vec![
             crate::session::ConversationMessage::user_text("small"),
@@ -2894,9 +2935,9 @@ mod tests {
             .run_turn("trigger", None)
             .expect_err("turn should fail when prompt stays too long");
 
-        // The state machine should have stopped after two attempts, not
-        // retried indefinitely.
-        assert_eq!(runtime.api_client_mut().call_count, 2);
+        // The state machine should have stopped after three attempts
+        // (initial + post-microcompact + post-recovery), not retried indefinitely.
+        assert_eq!(runtime.api_client_mut().call_count, 3);
         assert!(error.is_prompt_too_long());
     }
 

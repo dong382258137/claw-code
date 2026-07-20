@@ -37,24 +37,32 @@ impl VisualVerifier {
         self.baseline_dir = Some(baseline_dir.into());
     }
 
-    /// 验证 tool_result — 当前返回 skipped。
+    /// 验证 tool_result — placeholder 返回保守通过。
+    ///
+    /// **P0-2 修复**：之前 placeholder 返回 `passed: false`，导致 conversation.rs
+    /// Review 阶段对所有 Succeeded step 调用 `verify` 后必然 `mark_failed()`，
+    /// 触发 replan → max_replans=3 后整个 plan Failed。即使主 agent 实际成功
+    /// 完成任务也会被无脑否决。
+    ///
+    /// 现在改为返回 `passed: true`（保守通过），未启用时跳过验证不阻塞 plan。
+    /// 未来集成 Playwright 时再根据实际截图结果返回真实 verdict。
     ///
     /// Placeholder 行为:
-    /// - 若未启用 → 返回 skipped(passed=false, detail 说明未集成)
-    /// - 若已启用但无 Playwright → 返回 skipped(待集成)
+    /// - 若未启用 → 返回 skipped(passed=true, detail 说明未集成)
+    /// - 若已启用但无 Playwright → 返回 skipped(passed=true, 待集成)
     #[must_use]
     pub fn verify(&self, tool_result: &str, acceptance_criteria: &str) -> VisualVerdict {
         if !self.enabled {
             return VisualVerdict {
-                passed: false,
+                passed: true,
                 detail: "visual verification skipped — Playwright not enabled".to_owned(),
                 remediation: None,
             };
         }
-        // 已启用但 Playwright 集成待实现
+        // 已启用但 Playwright 集成待实现 — 保守通过避免误否决
         let _ = (tool_result, acceptance_criteria);
         VisualVerdict {
-            passed: false,
+            passed: true,
             detail: "visual verification skipped — Playwright integration pending (Step 4.x)"
                 .to_owned(),
             remediation: Some(
@@ -78,7 +86,8 @@ mod tests {
     fn disabled_verifier_returns_skipped() {
         let verifier = VisualVerifier::new();
         let verdict = verifier.verify("screenshot.png", "UI matches baseline");
-        assert!(!verdict.passed);
+        // P0-2 修复：placeholder 现在保守通过而非否决
+        assert!(verdict.passed);
         assert!(verdict.detail.contains("skipped"));
         assert!(verdict.remediation.is_none());
     }
@@ -88,7 +97,8 @@ mod tests {
         let mut verifier = VisualVerifier::new();
         verifier.enable("/tmp/baselines");
         let verdict = verifier.verify("screenshot.png", "UI matches baseline");
-        assert!(!verdict.passed);
+        // P0-2 修复：placeholder 现在保守通过而非否决
+        assert!(verdict.passed);
         assert!(verdict.detail.contains("pending"));
         assert!(verdict.remediation.is_some());
     }

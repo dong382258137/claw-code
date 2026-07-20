@@ -2333,6 +2333,23 @@ pub(crate) fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
+    // P1-6 修复：注入 harness V(验证)层和 O(可观测性)层组件。
+    // 之前 VerifierAgent / TraceAnalyzer 实现完整但从未注入主流程，
+    // 导致 conversation.rs 中 `self.verifier_agent` / `self.trace_analyzer`
+    // 永远为 None，相关代码分支永远走 else 路径，harness 层形同虚设。
+    //
+    // 现在无条件注入：
+    // - VerifierAgent：内含 Rule/Visual/ModelJudge 三种 verifier。
+    //   Rule 已实现，Visual/ModelJudge 是 placeholder（P0-2 修复后保守通过）。
+    //   只在 `plan_mode_enabled && !plan.steps.is_empty()` 时被调用，
+    //   未启用 plan mode 时不会有副作用。
+    // - TraceAnalyzer：记录每次 turn 的 trace 数据（latency / failure_kind 等），
+    //   未来可用于 CSV 导出和失败模式聚类。
+    // ContextAssembler 暂不注入（需要 TokenBudget 配置，避免破坏现有
+    // prompt 结构，留待未来配置化）。
+    runtime = runtime
+        .with_verifier_agent(runtime::VerifierAgent::new())
+        .with_trace_analyzer(runtime::TraceAnalyzer::new());
     // Attach persistent memory for nudge curation. Loaded-and-frozen so the
     // nudge layer can write new entries to disk while the prompt's frozen
     // snapshot (loaded separately in load_prompt_extras) stays byte-stable

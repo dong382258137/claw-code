@@ -225,26 +225,44 @@ impl OutputBuffer {
             .count()
     }
 
-    /// 返回每个 ToolCard 在 `render_all()` 输出中的逻辑行区间 `[start, end)`。
+    /// 返回每个 ToolCard 在 `render_all()` 输出中的**显示行**区间 `[start, end)`。
     ///
-    /// 鼠标点击场景：把点击的 row + scroll_y 映射到逻辑行号，
+    /// 鼠标点击场景：把点击的 row + scroll_y 映射到显示行号，
     /// 然后查这个表找出命中的 ToolCard entry。
     ///
-    /// **行号计算规则**（与 `render_all` 输出一致）：
-    /// - 累计每个 entry 的 `render()` 输出行数（`.lines().count()`）
-    /// - 若 render 输出以 `\n` 开头（前导空行），ToolCard 自身行号从 +1 开始
-    /// - 区间为 `[start, end)`，命中条件：`start <= line < end`
+    /// **行号计算规则**（与 `Paragraph::scroll` 单位一致，考虑 `Wrap`）：
+    /// - 对每个 entry 的 `render()` 输出，按 `area_width` 计算显示行数
+    ///   （每个逻辑行若超过 area_width 会折成多行显示行）
+    /// - 累计得到 entry 在显示行空间的 `[start, end)` 区间
+    /// - 区间命中条件：`start <= line < end`
     ///
-    /// **注意**：这是逻辑行号，未考虑 `Wrap { trim: false }` 的折行。
-    /// 长行折行会导致实际显示行数 > 逻辑行数。当前实现按逻辑行映射，
-    /// 对 ToolCard 卡片（行宽通常 <= 80）足够准确；超长行误差可接受。
-    pub(crate) fn tool_card_line_ranges(&self) -> Vec<(usize /*entry_idx*/, usize /*start*/, usize /*end*/)> {
+    /// **P1-2 修复**：之前用 `rendered.lines().count()` 计算逻辑行，
+    /// 但 `last_scroll_y` 是显示行单位（Paragraph::scroll 基于 Wrap 后的显示行），
+    /// 两者单位不一致导致长行场景下点击坐标偏移到错误 ToolCard。
+    /// 现在按显示行计算，与 `last_scroll_y` 单位一致。
+    pub(crate) fn tool_card_line_ranges(
+        &self,
+        area_width: usize,
+    ) -> Vec<(usize /*entry_idx*/, usize /*start*/, usize /*end*/)> {
         let mut ranges = Vec::new();
         let mut current_line: usize = 0;
+        let width = area_width.max(1);
         for (i, entry) in self.entries.iter().enumerate() {
             let rendered = entry.render();
-            // `.lines()` 会跳过末尾的 `\n`，前导 `\n` 产生一个空行
-            let line_count = rendered.lines().count();
+            // P1-2 修复：按显示行计算而非逻辑行。
+            // 每个逻辑行的显示行数 = max(1, ceil(line_visual_width / width))
+            // 其中 line_visual_width 用 UnicodeWidthStr 计算（处理 CJK/emoji 宽字符）。
+            let line_count: usize = rendered
+                .lines()
+                .map(|line| {
+                    let w = unicode_width::UnicodeWidthStr::width(line);
+                    if w == 0 {
+                        1
+                    } else {
+                        ((w + width - 1) / width).max(1)
+                    }
+                })
+                .sum();
             // 多数 ToolCard render 以 `\n` 开头（前导空行），把空行算作上一个 entry 的尾部
             let (start, end) = if rendered.starts_with('\n') {
                 let body_lines = line_count.saturating_sub(1);
@@ -260,10 +278,11 @@ impl OutputBuffer {
         ranges
     }
 
-    /// 按逻辑行号切换命中的 ToolCard 折叠状态。
+    /// 按显示行号切换命中的 ToolCard 折叠状态。
     /// 返回 true 表示成功切换。用于鼠标点击场景。
-    pub(crate) fn toggle_tool_card_at_line(&mut self, line: usize) -> bool {
-        let ranges = self.tool_card_line_ranges();
+    /// `area_width` 是输出区可见宽度（用于计算 wrap 折行后的显示行数）。
+    pub(crate) fn toggle_tool_card_at_line(&mut self, line: usize, area_width: usize) -> bool {
+        let ranges = self.tool_card_line_ranges(area_width);
         for (entry_idx, start, end) in ranges {
             if line >= start && line < end {
                 if let Some(OutputEntry::ToolCard { collapsed, result: Some(_), .. }) =

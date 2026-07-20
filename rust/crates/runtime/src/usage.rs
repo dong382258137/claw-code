@@ -55,6 +55,19 @@ impl UsageCostEstimate {
 }
 
 /// Returns pricing metadata for a known model alias or family.
+///
+/// 覆盖范围:
+/// - Anthropic 系列:`haiku`/`opus`/`sonnet`
+/// - OpenAI 系列:`gpt-5`/`gpt-4o`/`gpt-4o-mini`
+/// - xAI 系列:`grok-3`/`grok-2`
+/// - 阿里通义系列:`qwen-max`/`qwen-plus`/`qwen-turbo`
+/// - DeepSeek 系列:`deepseek-chat`/`deepseek-reasoner`
+///
+/// 非 Anthropic 系列不原生支持 prompt caching,
+/// `cache_creation`/`cache_read` 设为 `0.0`。
+///
+/// **注意**:价格为公开渠道截至 2025 年的估值,可能与最新官方价格有差异。
+/// 准确定价请以厂商官方公告为准。
 #[must_use]
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     let normalized = model.to_ascii_lowercase();
@@ -76,6 +89,96 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     }
     if normalized.contains("sonnet") {
         return Some(ModelPricing::default_sonnet_tier());
+    }
+    // OpenAI 系列
+    if normalized.contains("gpt-5") || normalized.contains("gpt5") {
+        return Some(ModelPricing {
+            input_cost_per_million: 5.0,
+            output_cost_per_million: 15.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    if normalized.contains("gpt-4o-mini") || normalized.contains("gpt4o-mini") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.15,
+            output_cost_per_million: 0.6,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    if normalized.contains("gpt-4o") || normalized.contains("gpt4o") {
+        return Some(ModelPricing {
+            input_cost_per_million: 2.5,
+            output_cost_per_million: 10.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    // xAI Grok 系列
+    if normalized.contains("grok-3") || normalized.contains("grok3") {
+        return Some(ModelPricing {
+            input_cost_per_million: 5.0,
+            output_cost_per_million: 15.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    if normalized.contains("grok-2") || normalized.contains("grok2") {
+        return Some(ModelPricing {
+            input_cost_per_million: 2.0,
+            output_cost_per_million: 10.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    // 阿里通义 Qwen 系列
+    if normalized.contains("qwen-max") || normalized.contains("qwenmax") {
+        return Some(ModelPricing {
+            input_cost_per_million: 2.5,
+            output_cost_per_million: 10.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    if normalized.contains("qwen-plus") || normalized.contains("qwenplus") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.4,
+            output_cost_per_million: 1.2,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    if normalized.contains("qwen-turbo") || normalized.contains("qwenturbo") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.05,
+            output_cost_per_million: 0.2,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    // DeepSeek 系列
+    if normalized.contains("deepseek-reasoner")
+        || normalized.contains("deepseek-r1")
+        || normalized.contains("deepseekr1")
+    {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.55,
+            output_cost_per_million: 2.19,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    if normalized.contains("deepseek-chat")
+        || normalized.contains("deepseek-v3")
+        || normalized.contains("deepseekv3")
+    {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.27,
+            output_cost_per_million: 1.1,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
     }
     None
 }
@@ -276,6 +379,49 @@ mod tests {
         let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
         assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
         assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
+    }
+
+    #[test]
+    fn supports_non_anthropic_model_pricing() {
+        // P2-6 扩展：验证非 Anthropic 系列模型定价能正确返回。
+        let gpt5 = pricing_for_model("gpt-5-2025-08-07").expect("gpt-5 pricing");
+        let gpt4o = pricing_for_model("gpt-4o-2024-08-06").expect("gpt-4o pricing");
+        let gpt4o_mini = pricing_for_model("gpt-4o-mini").expect("gpt-4o-mini pricing");
+        let grok3 = pricing_for_model("grok-3-latest").expect("grok-3 pricing");
+        let grok2 = pricing_for_model("grok-2-latest").expect("grok-2 pricing");
+        let qwen_max = pricing_for_model("qwen-max-2024-09-10").expect("qwen-max pricing");
+        let qwen_plus = pricing_for_model("qwen-plus").expect("qwen-plus pricing");
+        let qwen_turbo = pricing_for_model("qwen-turbo").expect("qwen-turbo pricing");
+        let ds_v3 = pricing_for_model("deepseek-chat").expect("deepseek-chat pricing");
+        let ds_r1 = pricing_for_model("deepseek-reasoner").expect("deepseek-reasoner pricing");
+
+        // 非 Anthropic 系列 cache 价格应为 0
+        assert_eq!(gpt5.cache_creation_cost_per_million, 0.0);
+        assert_eq!(gpt5.cache_read_cost_per_million, 0.0);
+        assert_eq!(grok3.cache_creation_cost_per_million, 0.0);
+        assert_eq!(qwen_max.cache_read_cost_per_million, 0.0);
+
+        // 验证输入/输出价格与设定一致
+        assert_eq!(gpt5.input_cost_per_million, 5.0);
+        assert_eq!(gpt5.output_cost_per_million, 15.0);
+        assert_eq!(gpt4o.input_cost_per_million, 2.5);
+        assert_eq!(gpt4o.output_cost_per_million, 10.0);
+        assert_eq!(gpt4o_mini.input_cost_per_million, 0.15);
+        assert_eq!(gpt4o_mini.output_cost_per_million, 0.6);
+        assert_eq!(grok3.input_cost_per_million, 5.0);
+        assert_eq!(grok2.input_cost_per_million, 2.0);
+        assert_eq!(qwen_max.input_cost_per_million, 2.5);
+        assert_eq!(qwen_plus.input_cost_per_million, 0.4);
+        assert_eq!(qwen_turbo.input_cost_per_million, 0.05);
+        assert_eq!(ds_v3.input_cost_per_million, 0.27);
+        assert_eq!(ds_r1.input_cost_per_million, 0.55);
+
+        // 验证别名也能命中（deepseek-v3 应等价于 deepseek-chat）
+        let ds_v3_alias = pricing_for_model("deepseek-v3").expect("deepseek-v3 alias");
+        assert_eq!(ds_v3_alias.input_cost_per_million, ds_v3.input_cost_per_million);
+
+        // 未知模型仍返回 None
+        assert!(pricing_for_model("some-unknown-model-v999").is_none());
     }
 
     #[test]

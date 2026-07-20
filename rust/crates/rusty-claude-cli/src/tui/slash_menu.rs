@@ -11,6 +11,8 @@ use std::borrow::Cow;
 
 use commands::{slash_command_specs, SlashCommandSpec};
 
+use crate::commands_handler::STUB_COMMANDS;
+
 /// Maximum items shown at once in the popup.
 const MAX_VISIBLE_ITEMS: usize = 10;
 
@@ -31,9 +33,16 @@ pub(crate) struct SlashMenu {
 
 impl SlashMenu {
     /// Build a menu from the static `slash_command_specs()` list.
+    ///
+    /// Filters out STUB_COMMANDS so the popup only surfaces actually
+    /// implemented commands (mirrors rustyline completion behavior in
+    /// `slash_command_completion_candidates_with_sessions`).
     #[must_use]
     pub(crate) fn new() -> Self {
-        let all_items = slash_command_specs().iter().collect::<Vec<_>>();
+        let all_items = slash_command_specs()
+            .iter()
+            .filter(|spec| !STUB_COMMANDS.contains(&spec.name))
+            .collect::<Vec<_>>();
         let selected = if all_items.is_empty() { None } else { Some(0) };
         let filtered_cache = all_items.clone();
         Self {
@@ -502,7 +511,17 @@ mod tests {
 
     #[test]
     fn all_items_count_matches_static_specs() {
+        // P2-2 修复：SlashMenu::new() 现在过滤 STUB_COMMANDS，
+        // 因此 all_items_count 应等于 specs 总数减去 STUB 数量。
         let menu = SlashMenu::new();
-        assert_eq!(menu.all_items_count(), slash_command_specs().len());
+        let non_stub_count = slash_command_specs()
+            .iter()
+            .filter(|spec| !STUB_COMMANDS.contains(&spec.name))
+            .count();
+        assert_eq!(menu.all_items_count(), non_stub_count);
+        // 过滤后所有 item 都不应是 STUB
+        for item in &menu.all_items {
+            assert!(!STUB_COMMANDS.contains(&item.name), "stub leaked: {}", item.name);
+        }
     }
 }

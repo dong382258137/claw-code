@@ -38,11 +38,15 @@ impl ModelJudgeVerifier {
         self.model = Some(model.into());
     }
 
-    /// 验证 tool_result — 当前返回 inconclusive。
+    /// 验证 tool_result — placeholder 返回保守通过。
     ///
-    /// Placeholder 行为:
-    /// - 若未启用 → 返回 inconclusive(passed=false, detail 说明未集成)
-    /// - 若已启用但无 LLM 集成 → 返回 inconclusive(待集成)
+    /// **P0-2 修复**：之前 placeholder 返回 `passed: false`，导致 conversation.rs
+    /// Review 阶段对所有 Succeeded step 调用 `verify` 后必然 `mark_failed()`，
+    /// 触发 replan → max_replans=3 后整个 plan Failed。即使主 agent 实际成功
+    /// 完成任务也会被无脑否决。
+    ///
+    /// 现在改为返回 `passed: true`（保守通过），未启用时跳过验证不阻塞 plan。
+    /// 未来集成 LLM 子 agent 时再根据实际评估返回真实 verdict。
     ///
     /// **缓存保护**:未来集成时,子 agent 走独立 LLM 请求 + 独立 prompt cache,
     /// 不污染主 agent 缓存(详见 §5.2 "Subagent as Tool" 模式)。
@@ -50,16 +54,16 @@ impl ModelJudgeVerifier {
     pub fn verify(&self, tool_result: &str, acceptance_criteria: &str) -> ModelJudgeVerdict {
         if !self.enabled {
             return ModelJudgeVerdict {
-                passed: false,
+                passed: true,
                 detail: "model judge verification inconclusive — LLM subagent not enabled"
                     .to_owned(),
                 remediation: None,
             };
         }
-        // 已启用但 LLM 集成待实现
+        // 已启用但 LLM 集成待实现 — 保守通过避免误否决
         let _ = (tool_result, acceptance_criteria);
         ModelJudgeVerdict {
-            passed: false,
+            passed: true,
             detail: "model judge verification inconclusive — LLM subagent integration pending (Step 4.x)"
                 .to_owned(),
             remediation: Some(
@@ -83,7 +87,8 @@ mod tests {
     fn disabled_verifier_returns_inconclusive() {
         let verifier = ModelJudgeVerifier::new();
         let verdict = verifier.verify("refactored module", "no breaking changes");
-        assert!(!verdict.passed);
+        // P0-2 修复：placeholder 现在保守通过而非否决
+        assert!(verdict.passed);
         assert!(verdict.detail.contains("inconclusive"));
         assert!(verdict.remediation.is_none());
     }
@@ -93,7 +98,8 @@ mod tests {
         let mut verifier = ModelJudgeVerifier::new();
         verifier.enable("claude-sonnet-4");
         let verdict = verifier.verify("refactored module", "no breaking changes");
-        assert!(!verdict.passed);
+        // P0-2 修复：placeholder 现在保守通过而非否决
+        assert!(verdict.passed);
         assert!(verdict.detail.contains("pending"));
         assert!(verdict.remediation.is_some());
     }

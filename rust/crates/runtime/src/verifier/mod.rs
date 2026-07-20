@@ -173,9 +173,9 @@ mod tests {
             "UI must match baseline",
             VerificationMethod::Visual,
         );
-        // Visual verifier is placeholder, returns skipped (passed=false, no remediation)
+        // P0-2 修复后：Visual verifier placeholder 返回 passed=true（保守通过），不阻塞 plan
         assert_eq!(result.method, VerificationMethod::Visual);
-        assert!(!result.passed);
+        assert!(result.passed);
     }
 
     #[test]

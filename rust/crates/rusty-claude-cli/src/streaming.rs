@@ -74,6 +74,15 @@ pub(crate) enum StatusEvent {
     MessageStop,
     /// Streaming turn started (first event received).
     StreamStart,
+    /// P0-1 修复：流式过程中发生错误（API 5xx / 网络断开 / 写入失败等）。
+    /// 之前所有错误返回路径都不 emit 事件，TUI 在错误发生时收不到任何信号，
+    /// `streaming: true` 一直保留导致 UI 假死。现在在每个 `return Err(...)` 前
+    /// emit 此事件，让 TUI 能即时调用 `finish_turn()` 并向用户显示错误。
+    /// `recoverable` 为 true 表示错误可重试（如 429 限流），false 表示致命错误。
+    StreamError {
+        message: String,
+        recoverable: bool,
+    },
 }
 
 pub(crate) const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -257,6 +266,19 @@ impl AnthropicRuntimeClient {
             emitter(event);
         }
     }
+
+    /// P0-1 修复：emit 一个 `StreamError` 事件并构造对应的 `RuntimeError`。
+    /// 在所有错误返回路径调用此方法，确保 TUI 能即时收到错误信号，
+    /// 调用 `finish_turn()` 退出 streaming 状态并向用户显示错误信息，
+    /// 避免状态栏永久显示 `streaming: true` 导致 UI 假死。
+    fn emit_stream_error(&self, message: impl Into<String>, recoverable: bool) -> RuntimeError {
+        let msg = message.into();
+        self.emit_status(StatusEvent::StreamError {
+            message: msg.clone(),
+            recoverable,
+        });
+        RuntimeError::new(msg)
+    }
 }
 
 pub(crate) fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
@@ -370,7 +392,9 @@ impl AnthropicRuntimeClient {
             .stream_message(message_request)
             .await
             .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                // P0-1 修复 #1/9：stream_message 失败（API 错误、网络断开等）。
+                let msg = format_user_visible_api_error(&self.session_id, &error);
+                self.emit_stream_error(msg, false)
             })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
@@ -391,17 +415,23 @@ impl AnthropicRuntimeClient {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
                     Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                        // P0-1 修复 #2/9：超时分支内 next_event 失败。
+                        let msg = format_user_visible_api_error(&self.session_id, &error);
+                        self.emit_stream_error(msg, false)
                     })?,
                     Err(_elapsed) => {
-                        return Err(RuntimeError::new(
+                        // P0-1 修复 #3/9：post-tool stall 超时（10s 内无事件）。
+                        return Err(self.emit_stream_error(
                             "post-tool stall: model did not respond within timeout",
+                            true,
                         ));
                     }
                 }
             } else {
                 stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    // P0-1 修复 #4/9：非超时分支 next_event 失败。
+                    let msg = format_user_visible_api_error(&self.session_id, &error);
+                    self.emit_stream_error(msg, false)
                 })?
             };
 
@@ -415,6 +445,11 @@ impl AnthropicRuntimeClient {
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
+                    // P2-5 修复：之前 for 循环每次迭代后都检查 block_has_thinking_summary
+                    // 并 emit，但 push_output_block 对非 thinking 块不 reset 标志，
+                    // 导致 [Thinking, Text, ToolUse] 序列会重复 emit 3 次 Thinking。
+                    // 现在改为先处理所有块，循环结束后只 emit 一次。
+                    let mut had_thinking_summary = false;
                     for block in start.message.content {
                         push_output_block(
                             block,
@@ -424,17 +459,15 @@ impl AnthropicRuntimeClient {
                             true,
                             &mut block_has_thinking_summary,
                         )?;
-                        // P1 修复：push_output_block 处理 Thinking/RedactedThinking
-                        // 块时只写到 `out`（TUI 模式下是 io::sink()），不 emit
-                        // StatusEvent::Thinking。在 caller 端检查标志并 emit，
-                        // 让 TUI 能在 MessageStart 携带 thinking 块的场景下显示
-                        // thinking 摘要（非流式响应或首批 content）。
                         if block_has_thinking_summary {
-                            self.emit_status(StatusEvent::Thinking {
-                                char_count: None,
-                                redacted: false,
-                            });
+                            had_thinking_summary = true;
                         }
+                    }
+                    if had_thinking_summary {
+                        self.emit_status(StatusEvent::Thinking {
+                            char_count: None,
+                            redacted: false,
+                        });
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
@@ -464,7 +497,10 @@ impl AnthropicRuntimeClient {
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                 write!(out, "{rendered}")
                                     .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    .map_err(|error| {
+                                        // P0-1 修复 #5/9：TextDelta 写入失败。
+                                        self.emit_stream_error(error.to_string(), false)
+                                    })?;
                             }
                             self.emit_status(StatusEvent::TextDelta(text.clone()));
                             events.push(AssistantEvent::TextDelta(text));
@@ -496,7 +532,10 @@ impl AnthropicRuntimeClient {
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            .map_err(|error| {
+                                // P0-1 修复 #6/9：ContentBlockStop markdown flush 失败。
+                                self.emit_stream_error(error.to_string(), false)
+                            })?;
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
@@ -505,7 +544,10 @@ impl AnthropicRuntimeClient {
                         // Display tool call now that input is fully accumulated
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            .map_err(|error| {
+                                // P0-1 修复 #7/9：ToolCall 显示写入失败。
+                                self.emit_stream_error(error.to_string(), false)
+                            })?;
                         self.emit_status(StatusEvent::ToolUse {
                             id: id.clone(),
                             name: name.clone(),
@@ -523,7 +565,10 @@ impl AnthropicRuntimeClient {
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            .map_err(|error| {
+                                // P0-1 修复 #8/9：MessageStop markdown flush 失败。
+                                self.emit_stream_error(error.to_string(), false)
+                            })?;
                     }
                     events.push(AssistantEvent::MessageStop);
                     self.emit_status(StatusEvent::MessageStop);
@@ -558,7 +603,9 @@ impl AnthropicRuntimeClient {
             })
             .await
             .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                // P0-1 修复 #9/9：fallback send_message 失败（流式未收到 stop 且回退到非流式也失败）。
+                let msg = format_user_visible_api_error(&self.session_id, &error);
+                self.emit_stream_error(msg, false)
             })?;
         let mut events = response_to_events(response, out)?;
         push_prompt_cache_record(&self.client, &mut events);
