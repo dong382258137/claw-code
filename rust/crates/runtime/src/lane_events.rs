@@ -47,6 +47,13 @@ pub enum LaneEventName {
     ShipMerged,
     #[serde(rename = "ship.pushed_main")]
     ShipPushedMain,
+    /// Multi-Agent subagent 事件 — Step 3.2
+    /// 主 agent 通过 tool call 将任务派发给子 agent。
+    #[serde(rename = "subagent.handoff")]
+    SubagentHandoff,
+    /// 子 agent 完成(成功/失败/取消)回主 agent。
+    #[serde(rename = "subagent.result")]
+    SubagentResult,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +87,8 @@ pub enum LaneFailureClass {
     ToolRuntime,
     WorkspaceMismatch,
     Infra,
+    /// Step 3.2:子 agent 失败(超时/崩溃/异常退出)。
+    SubagentFailure,
 }
 
 /// Provenance labels for event source classification.
@@ -1201,6 +1210,79 @@ impl LaneEvent {
         .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
+    /// Step 3.2:SubagentHandoff — 主 agent 将任务派发给子 agent。
+    ///
+    /// `subagent_id` 是 [`crate::multi_agent::MultiAgentCoordinator`] 分配的 ID。
+    /// `mode` 是 [`crate::multi_agent::CoordinationMode`] 的字符串形式
+    /// (`fork`/`teammate`/`worktree`)。`task` 是任务描述。
+    /// 缓存保护:子 agent 走独立 LLM 请求,不污染主 agent 缓存(§5.2)。
+    #[must_use]
+    pub fn subagent_handoff(
+        emitted_at: impl Into<String>,
+        subagent_id: impl Into<String>,
+        mode: &str,
+        task: impl Into<String>,
+    ) -> Self {
+        let task_str = task.into();
+        let data = serde_json::json!({
+            "subagent_id": subagent_id.into(),
+            "mode": mode,
+            "task": task_str,
+        });
+        Self::new(
+            LaneEventName::SubagentHandoff,
+            LaneEventStatus::Running,
+            emitted_at,
+        )
+        .with_data(data)
+    }
+
+    /// Step 3.2:SubagentResult — 子 agent 完成(成功/失败/取消)回主 agent。
+    ///
+    /// `status` 为 `completed`/`failed`/`cancelled`。
+    /// `result` 为子 agent 输出(成功)或错误信息(失败)。
+    /// 失败时自动设置 `failure_class = SubagentFailure`。
+    /// 注:`SubagentResult` 不是 lane 终态事件(lane 在子 agent 返回后继续),
+    /// 但仍设置 fingerprint 用于 subagent 维度的去重。
+    #[must_use]
+    pub fn subagent_result(
+        emitted_at: impl Into<String>,
+        subagent_id: impl Into<String>,
+        status: &str,
+        result: impl Into<String>,
+    ) -> Self {
+        let result_str = result.into();
+        let data = serde_json::json!({
+            "subagent_id": subagent_id.into(),
+            "status": status,
+            "result": result_str,
+        });
+        let lane_status = match status {
+            "completed" => LaneEventStatus::Completed,
+            "failed" => LaneEventStatus::Failed,
+            "cancelled" => LaneEventStatus::Closed,
+            _ => LaneEventStatus::Completed,
+        };
+        let mut event = Self::new(
+            LaneEventName::SubagentResult,
+            lane_status,
+            emitted_at,
+        )
+        .with_data(data);
+        if status == "failed" {
+            event = event.with_failure_class(LaneFailureClass::SubagentFailure);
+        }
+        // 手动设置 fingerprint(`SubagentResult` 不在 `is_terminal_event` 中,
+        // `with_terminal_fingerprint` 不会触发;但 subagent 维度需要去重)。
+        let fingerprint = compute_event_fingerprint(
+            &event.event,
+            &event.status,
+            event.data.as_ref(),
+        );
+        event.metadata.event_fingerprint = Some(fingerprint);
+        event
+    }
+
     #[must_use]
     pub fn with_failure_class(mut self, failure_class: LaneFailureClass) -> Self {
         self.failure_class = Some(failure_class);
@@ -1325,6 +1407,8 @@ mod tests {
             (LaneEventName::ShipCommitsSelected, "ship.commits_selected"),
             (LaneEventName::ShipMerged, "ship.merged"),
             (LaneEventName::ShipPushedMain, "ship.pushed_main"),
+            (LaneEventName::SubagentHandoff, "subagent.handoff"),
+            (LaneEventName::SubagentResult, "subagent.result"),
         ];
 
         for (event, expected) in cases {
@@ -1350,6 +1434,7 @@ mod tests {
             (LaneFailureClass::ToolRuntime, "tool_runtime"),
             (LaneFailureClass::WorkspaceMismatch, "workspace_mismatch"),
             (LaneFailureClass::Infra, "infra"),
+            (LaneFailureClass::SubagentFailure, "subagent_failure"),
         ];
 
         for (failure_class, expected) in cases {
