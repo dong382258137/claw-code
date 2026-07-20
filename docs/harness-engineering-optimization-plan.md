@@ -328,6 +328,113 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 
 ---
 
+### 阶段 3.5:三层信息持久化架构(基于论文调研,2026-07-21)
+
+> **背景**:2026-07-21 发现 AI 在 70+ tool calls 后重复 dispatch 子智能体分析"缠论线段定义",
+> 导致任务 stall。根因:context 压缩导致 AI 忘记已 dispatch 的子智能体,叠加
+> `MultiAgentCoordinator::start()` 只改状态不执行任务的"空壳"问题。经论文调研后
+> 实施三层信息持久化架构,彻底修复长程任务中关键信息丢失问题。
+
+#### 论文基础
+
+- **Anthropic《Effective Context Engineering for AI Agents》(2025)** — 推荐
+  "Structured Note-taking":agent 定期写笔记到 context window 外部,后续拉回注入
+- **Anthropic《Multi-Agent Research System》(2025)** — 4 要素:
+  "spawn fresh subagents with clean contexts" / "maintaining continuity through
+  careful handoffs" / "Subagent output to a filesystem" / "pass lightweight
+  references back to the coordinator"
+- **CompactionRL (arXiv:2607.05378)** — summary 必须保留 5 字段:
+  original goal / completed actions / unresolved errors / current state /
+  plausible next steps;公式 (9): `h̄_t = s ⊕ u_resume(S_t) ⊕ (z_{t-k+1}, ..., z_t)`, k=2
+- **MIRIX (arXiv:2507.07957)** — OS-inspired 分层内存,NOTEBOOK 作为"working context"
+
+#### 架构:三层信息持久化
+
+```text
+Layer 1: Main Context (LLM 推理窗口)
+         ↑↓ page in/out
+Layer 2: NOTEBOOK.md (跨压缩持久化) — 5 段 XML 结构
+         ↑↓ fetch/deref
+Layer 3: External Storage (.claw/subagents/*, trace CSV, ...)
+```
+
+NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
+- `<plan>` — original goal + current state
+- `<subagents>` — dispatched subagents registry(防重复 dispatch)
+- `<attempted>` — completed actions + unresolved errors
+- `<preferences>` — user constraints
+- `<key_files>` — plausible next steps 的文件引用
+
+#### P0-1 — NOTEBOOK.md parse() 修复 + Structured Note-taking ✅
+
+| 项 | 内容 |
+|---|---|
+| **目标** | 修复 parse() 误匹配 header 中 XML 字面引用 + 空段/单行 XML 处理失败;落地 Structured Note-taking 持久化工作记忆 |
+| **改动文件** | 新增 `rust/crates/runtime/src/notebook.rs`;改 `rust/crates/runtime/src/lib.rs`、`rusty-claude-cli/src/plugin_state.rs` |
+| **实现要点** | 1. `Notebook` 数据模型(`BTreeMap<String, String>`,5 段 XML 标签) <br> 2. parse() 逐字符扫描行首位置(open tag 严格要求行首,close tag 优先行首后退任意位置) <br> 3. 空段等价缺失段(与 set_section 语义一致,确保 round-trip) <br> 4. 原子写(`.tmp` + `rename`)+ `NOTEBOOK_MAX_CHARS=16_000` 上限 <br> 5. `execute_notebook_update` 工具暴露给 LLM,类似 TodoWrite 模式 <br> 6. 通过 system_prompt 变动区每个 turn 重新注入 |
+| **验证** | 26 个测试全绿(parse/save/round-trip/execute_notebook_update) |
+| **commit** | 59f1663 |
+| **缓存影响** | 低 — NOTEBOOK 在 system_prompt 变动区(末尾追加) |
+
+#### P0-3 — 压缩前 NOTEBOOK 刷新 trigger ✅
+
+| 项 | 内容 |
+|---|---|
+| **目标** | 压缩发生时提醒 LLM 立即刷新 NOTEBOOK,防止关键信息丢失 |
+| **改动文件** | 改 `rust/crates/runtime/src/conversation.rs` |
+| **实现要点** | 1. `notebook_refresh_pending: bool` flag <br> 2. 三个压缩点设置 flag:每 turn microcompact(比较前后 `tool_result_output_len`)、`maybe_auto_compact`、Reactive compaction <br> 3. 下个 iteration 的 system_prompt 变动区注入刷新提醒 <br> 4. LLM 调用 `notebook_update` 后清除 flag(无论成功失败) <br> 5. `tool_result_output_len` 辅助函数统计 ToolResult block output 总长度 |
+| **验证** | 3 个新测试全绿(flag 设置/清除/system_prompt 注入) |
+| **commit** | 8ea0c67 |
+| **缓存影响** | 无 — flag 只影响变动区 |
+
+#### P0-2 — 子智能体真实化(同步阻塞 + 上下文隔离 + 文件持久化)✅
+
+> **增强 Step 3.2**:修复 `MultiAgentCoordinator::start()` 只改状态不执行任务的"空壳"问题。
+> 这是长程任务 stall 的直接根因 — 子 agent 永远停留在 Running,主 agent 无限轮询。
+
+| 项 | 内容 |
+|---|---|
+| **目标** | 子智能体从"空壳"升级为真实执行(Anthropic Multi-Agent Research System 4 要素) |
+| **改动文件** | 改 `rust/crates/runtime/src/conversation.rs` |
+| **实现要点** | 1. `execute_dispatch_subagent` 改为 `&mut self`,spawn + start 后同步阻塞执行 <br> 2. `run_subagent_turn` 新方法:独立 system_prompt + task 作为 user message → `api_client.stream` → 解析 response → 原子写 `.claw/subagents/{id}.md` → 返回 result_ref 路径 <br> 3. 完全隔离:子智能体不共享主 agent 上下文,不污染主 session messages <br> 4. 根据结果调用 `coordinator.complete()` 或 `fail()` <br> 5. 发布终态 `SubagentResult` lane event <br> 6. 主 agent 只收到 result_ref 路径(轻量引用,非完整结果) |
+| **验证** | 10 个测试全绿(7 原有 + 3 新增:无 workspace_root 优雅失败 / 上下文隔离不污染主 session / id 递增 + 文件持久化) |
+| **commit** | c2e8f48 |
+| **缓存影响** | 无 — 子智能体走独立 LLM 请求 + 独立 prompt cache |
+
+#### P1 — microcompact 结构化保留(子智能体指针 + 多行预览)✅
+
+| 项 | 内容 |
+|---|---|
+| **目标** | 修复旧版 `format_tool_result_summary` 只保留第一行导致关键信息丢失 |
+| **改动文件** | 改 `rust/crates/runtime/src/compact.rs` |
+| **实现要点** | 1. `dispatch_subagent` / `check_subagent` 加入 `CRITICAL_TOOLS`(保留完整 result_ref 指针) <br> 2. `format_tool_result_summary` 从"只保留第一行"改为"保留前 3 行 + 行数信息"(240 字符上限) <br> 3. `is_already_summarized` 检测逻辑保持兼容(避免重复摘要) <br> 4. 与 NOTEBOOK 协同:关键信息应已持久化到 NOTEBOOK.md,这里保留前 N 行作为"足够判断的指针" |
+| **验证** | 37 个 compact 测试全绿(含 5 个新 P1 测试) |
+| **commit** | a1ac0d1 |
+| **缓存影响** | 无 — 只影响已压缩消息的摘要格式 |
+
+#### P3 — streaming stall 事件间超时 ✅
+
+| 项 | 内容 |
+|---|---|
+| **目标** | 修复 `consume_stream` 首事件后所有 `next_event` 调用无超时保护,导致网络静默挂起时无限等待 |
+| **改动文件** | 改 `rust/crates/rusty-claude-cli/src/streaming.rs` |
+| **实现要点** | 1. 新增 `INTER_EVENT_TIMEOUT = 60s` 常量 <br> 2. 统一 `tokio::time::timeout` 包装:post-tool 首事件 10s(严格),其他 60s(宽容,容纳 extended thinking) <br> 3. 区分两种 stall 错误消息:post-tool stall / inter-event stall <br> 4. 所有超时 `recoverable=true`,允许上层重试 <br> 5. 与 `http_client.rs` 故意不设 `.timeout()` 的设计协同(总请求超时会错误中止合法长流式) |
+| **验证** | 337 个 rusty-claude-cli 测试全绿(0 failed) |
+| **commit** | b7edada |
+| **缓存影响** | 无 — 只影响网络 I/O 超时检测 |
+
+#### 阶段 3.5 总结
+
+| 维度 | 改进 |
+|---|---|
+| **长程任务稳定性** | P0-1 + P0-3 + P0-2 联合修复"AI 忘记关键信息导致重复 dispatch"stall 问题 |
+| **上下文质量** | P1 保留子智能体指针 + 多行预览,LLM 可判断是否需要 re-read |
+| **网络鲁棒性** | P3 事件间超时保护,避免无限等待 |
+| **测试覆盖** | 新增 37 个测试(P0-1: 26 / P0-3: 3 / P0-2: 3 / P1: 5),总 918 passed / 12 pre-existing Windows failures |
+| **论文对标** | Anthropic Structured Note-taking + Multi-Agent 4 要素 + CompactionRL summary 5 字段 + MIRIX 分层内存 |
+
+---
+
 ### 阶段 4:P3 平台兼容性与前沿(1 周)
 
 #### Step 4.1 — Sandbox Windows 实现 ✅
@@ -593,3 +700,4 @@ cd rust && cargo build && cp target/debug/claw.exe debug/claw.exe
 | 2026-07-19 | v1.0 | 初始版本,涵盖阶段 1-4 + 缓存保护方案 |
 | 2026-07-20 | v1.1 | 校正 Step 状态：5 个原标 ✅ 的 Step 经代码核对实际为部分实现，改为 ⚠️ 部分（Step 2.1 / 2.4 / 3.1 / 3.2 / 3.3），并补充真实状态说明 |
 | 2026-07-21 | v1.2 | 实施完成 4 个原 ⚠️ 部分 Step 并校正状态：Step 2.1 ✅(commit 083f4a9,/ultraplan 对接 runtime planner)、Step 2.4 ✅(commit 876f577,EmbeddingProvider trait + FastembedProvider)、Step 3.2 ✅(3.2-a/b/c 全部完成,commits 8322e88/a46a3b5/36d9721,subagent-as-tool 路由)、Step 3.3 ✅(commit 23c7c72,K-means 失败聚类)。Step 3.1 维持 ⚠️ 部分(规则反馈已够用,视觉/模型裁判留到阶段 4)。 |
+| 2026-07-21 | v1.3 | 新增阶段 3.5:三层信息持久化架构(基于论文调研)。基于 Anthropic《Effective Context Engineering》《Multi-Agent Research System》、CompactionRL (arXiv:2607.05378)、MIRIX (arXiv:2507.07957) 实施 5 个改进:P0-1 NOTEBOOK.md parse() 修复 + Structured Note-taking(commit 59f1663,26 测试)、P0-3 压缩前 NOTEBOOK 刷新 trigger(commit 8ea0c67,3 测试)、P0-2 子智能体真实化(同步阻塞 + 上下文隔离 + 文件持久化,commit c2e8f48,10 测试,修复 MultiAgentCoordinator 空壳问题)、P1 microcompact 结构化保留(子智能体指针 + 多行预览,commit a1ac0d1,5 测试)、P3 streaming stall 事件间超时(commit b7edada,337 测试全绿)。新增 37 个测试,总 918 passed。修复长程任务中"AI 忘记关键信息导致重复 dispatch"stall 问题。 |
