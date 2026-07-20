@@ -814,8 +814,36 @@ fn run_event_loop(
                         }
                     }
                     InputAction::Submit(line) => {
-                        // Only submit if idle (no turn currently running)
-                        if cli_holder.is_some() && turn_rx.is_none() {
+                        // conhost 多行粘贴后续行丢弃：
+                        // try_auto_expand_clipboard 触发时会填充 pending_paste_lines
+                        // （剪贴板第 2 行到最后一行）。conhost 不支持 bracketed paste，
+                        // 粘贴会逐行触发 Submit，这里检查并丢弃后续行，避免每行被当作
+                        // 独立消息发送。
+                        //
+                        // 匹配规则：line（trim 后）== pending_paste_lines[0]（trim 后）。
+                        // 匹配 → 丢弃该 Submit，从 pending_paste_lines 移除该行。
+                        // 不匹配 → 粘贴已完成（用户手动输入或剪贴板变化），清空并正常处理。
+                        //
+                        // 边界情况：如果用户手动输入恰好等于 pending_paste_lines[0]，
+                        // 会被误丢弃。这种情况很罕见，用户重新输入即可。
+                        let skip_submit = if !pending_paste_lines.is_empty() {
+                            let trimmed_line = line.trim();
+                            let next_expected = pending_paste_lines[0].trim();
+                            if trimmed_line == next_expected {
+                                pending_paste_lines.remove(0);
+                                true
+                            } else {
+                                pending_paste_lines.clear();
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if skip_submit {
+                            // 丢弃该 Submit，等待下一行。
+                            // InputLine::handle_key 在返回 Submit 前已 reset()，buffer 为空。
+                        } else if cli_holder.is_some() && turn_rx.is_none() {
                             // Re-enter follow mode so the user sees new output.
                             scroll_offset = None;
                             turn_start = Some(Instant::now());
@@ -994,13 +1022,17 @@ fn run_event_loop(
                                 }
                             }
                             turn_rx = Some(rx);
-                            // Bug L2 修复：清空 pending_paste_lines。
-                            // try_auto_expand_clipboard 触发时会填充它（用于 CLI 路径
-                            // 的"丢弃后续逐行 Submit"机制），但 TUI 路径下没有该机制
-                            // （bracketed paste + Event::Paste 不会被切 Submit）。
-                            // 不清空会导致下次 Submit 守卫 `pending_paste_lines.is_empty()`
-                            // 永远为 false，conhost 多行粘贴兜底从此失效。
-                            pending_paste_lines.clear();
+                            // 注意：此处不再清空 pending_paste_lines。
+                            //
+                            // 原 Bug L2 修复（清空 pending_paste_lines）的注释假设
+                            // "TUI 路径下 bracketed paste + Event::Paste 不会被切 Submit"，
+                            // 但这仅在支持 bracketed paste 的终端（如 Windows Terminal）成立。
+                            // conhost 不支持 bracketed paste，粘贴会逐行触发 Submit，
+                            // 需要 pending_paste_lines 来识别并丢弃后续行。
+                            //
+                            // 新逻辑（见 Submit 分支开头）：每次 Submit 检查 line 是否匹配
+                            // pending_paste_lines[0]，匹配则丢弃并移除，不匹配则清空。
+                            // 因此这里不需要也不应该清空——清空会破坏 conhost 多行粘贴兜底。
                         } else if fatal_error {
                             // P0-4 修复：worker 线程已崩溃（Disconnected），
                             // cli_holder 已永久丢失。之前此分支静默丢弃输入，
