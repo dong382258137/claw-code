@@ -28,6 +28,10 @@ struct CachedFileMap {
     definitions: Vec<Definition>,
     references: Vec<String>,
     mtime: SystemTime,
+    /// Step 4.2:从 LSP 获取的 symbol 信息(可选)。
+    /// 若存在,render 时优先使用 LSP symbols(语义准确),
+    /// 否则 fallback 到 regex 提取的 definitions。
+    lsp_symbols: Vec<crate::lsp_client::LspSymbol>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +108,70 @@ impl RepoMap {
         refs
     }
 
+    /// Step 4.2:用 LSP symbols 增强 cache 中指定文件的 symbol 信息。
+    ///
+    /// LSP 提供的 symbols 比 regex 提取更准确(语义级别),
+    /// 且能识别 regex 难以处理的场景(如宏生成的定义、impl 块内的方法)。
+    ///
+    /// # 参数
+    /// - `path`:文件路径(绝对路径或相对 root 的路径)
+    /// - `symbols`:`LspRegistry::get_symbols()` 返回的 symbol 列表
+    ///
+    /// # 行为
+    /// - 若 path 不在 cache 中,创建一个空条目(仅含 LSP symbols,无 regex definitions)
+    /// - 若 path 已在 cache 中,替换其 `lsp_symbols` 字段
+    /// - 后续 `render()` 时,若 `lsp_symbols` 非空,优先渲染 LSP symbols
+    ///
+    /// # 与 LSP 协同
+    /// 典型流程:
+    /// 1. `LspRegistry::spawn_server("rust", "rust-analyzer", root)`
+    /// 2. 对每个文件:`let symbols = registry.get_symbols(path)?;`
+    /// 3. `repomap.augment_with_lsp_symbols(path, symbols)`
+    /// 4. `repomap.render()` — 输出包含 LSP symbols 的 repomap
+    pub fn augment_with_lsp_symbols(
+        &mut self,
+        path: &Path,
+        symbols: Vec<crate::lsp_client::LspSymbol>,
+    ) {
+        // 转换为绝对路径(cache 使用绝对路径作为 key)
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+
+        // 尝试获取文件 mtime(若文件不存在,使用 UNIX_EPOCH)
+        let mtime = std::fs::metadata(&abs_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+
+        self.cache
+            .entry(abs_path)
+            .and_modify(|cached| {
+                cached.lsp_symbols = symbols.clone();
+            })
+            .or_insert_with(|| CachedFileMap {
+                definitions: Vec::new(),
+                references: Vec::new(),
+                mtime,
+                lsp_symbols: symbols,
+            });
+    }
+
+    /// Step 4.2:检查指定文件是否有 LSP symbols 增强。
+    #[must_use]
+    pub fn has_lsp_symbols(&self, path: &Path) -> bool {
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        self.cache
+            .get(&abs_path)
+            .map(|c| !c.lsp_symbols.is_empty())
+            .unwrap_or(false)
+    }
+
     #[must_use]
     pub fn calculate_importance(&self) -> HashMap<PathBuf, usize> {
         let mut importance: HashMap<PathBuf, usize> = HashMap::new();
@@ -167,18 +235,29 @@ impl RepoMap {
                 .to_string();
             out.push_str(&format!("{} (refs: {})\n", rel, refs));
             if let Some(cached) = self.cache.get(path) {
-                for def in &cached.definitions {
-                    let kind_str = match def.kind {
-                        DefinitionKind::Function => "fn",
-                        DefinitionKind::Struct => "struct",
-                        DefinitionKind::Enum => "enum",
-                        DefinitionKind::Trait => "trait",
-                        DefinitionKind::Impl => "impl",
-                        DefinitionKind::Module => "mod",
-                        DefinitionKind::Const => "const",
-                        DefinitionKind::Type => "type",
-                    };
-                    out.push_str(&format!("  {} {}\n", kind_str, def.name));
+                // Step 4.2:若 lsp_symbols 非空,优先渲染 LSP symbols(语义更准确)
+                if !cached.lsp_symbols.is_empty() {
+                    for symbol in &cached.lsp_symbols {
+                        out.push_str(&format!(
+                            "  {} {} (L:{}:{})\n",
+                            symbol.kind, symbol.name, symbol.line, symbol.character
+                        ));
+                    }
+                } else {
+                    // Fallback:regex 提取的 definitions
+                    for def in &cached.definitions {
+                        let kind_str = match def.kind {
+                            DefinitionKind::Function => "fn",
+                            DefinitionKind::Struct => "struct",
+                            DefinitionKind::Enum => "enum",
+                            DefinitionKind::Trait => "trait",
+                            DefinitionKind::Impl => "impl",
+                            DefinitionKind::Module => "mod",
+                            DefinitionKind::Const => "const",
+                            DefinitionKind::Type => "type",
+                        };
+                        out.push_str(&format!("  {} {}\n", kind_str, def.name));
+                    }
                 }
             }
             out.push('\n');
@@ -249,6 +328,7 @@ impl RepoMap {
                     definitions,
                     references,
                     mtime,
+                    lsp_symbols: Vec::new(),
                 },
             );
         }
@@ -396,5 +476,152 @@ mod tests {
             map.cache.len() > initial_count,
             "cache should have been refreshed and picked up the new file"
         );
+    }
+
+    // ========================================================================
+    // Step 4.2 — LSP symbol 注入 repomap 测试
+    // ========================================================================
+
+    #[test]
+    fn augment_with_lsp_symbols_creates_new_cache_entry() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}").unwrap();
+
+        let mut map = RepoMap::new(temp.path());
+        // 初始 cache 为空
+        assert!(map.cache.is_empty());
+
+        // 注入 LSP symbols(文件可能不存在于 cache,应创建新条目)
+        let symbols = vec![
+            crate::lsp_client::LspSymbol {
+                name: "main".to_string(),
+                kind: "function".to_string(),
+                path: "a.rs".to_string(),
+                line: 0,
+                character: 3,
+            },
+            crate::lsp_client::LspSymbol {
+                name: "MyStruct".to_string(),
+                kind: "struct".to_string(),
+                path: "a.rs".to_string(),
+                line: 5,
+                character: 7,
+            },
+        ];
+        map.augment_with_lsp_symbols(Path::new("a.rs"), symbols);
+
+        // 验证 cache 中有该条目
+        let abs_path = temp.path().join("a.rs");
+        assert!(map.cache.contains_key(&abs_path));
+        assert!(map.has_lsp_symbols(Path::new("a.rs")));
+        let cached = &map.cache[&abs_path];
+        assert_eq!(cached.lsp_symbols.len(), 2);
+    }
+
+    #[test]
+    fn augment_with_lsp_symbols_replaces_existing_lsp_symbols() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("a.rs");
+        std::fs::write(&file_path, "pub fn func_a() {}").unwrap();
+
+        let mut map = RepoMap::new(temp.path());
+        map.refresh_cache_if_stale();
+
+        // 初始无 LSP symbols
+        assert!(!map.has_lsp_symbols(Path::new("a.rs")));
+
+        // 注入第一批 symbols
+        let symbols1 = vec![crate::lsp_client::LspSymbol {
+            name: "func_a".to_string(),
+            kind: "function".to_string(),
+            path: "a.rs".to_string(),
+            line: 0,
+            character: 7,
+        }];
+        map.augment_with_lsp_symbols(Path::new("a.rs"), symbols1);
+        assert!(map.has_lsp_symbols(Path::new("a.rs")));
+        assert_eq!(map.cache[&file_path].lsp_symbols.len(), 1);
+
+        // 注入第二批 symbols(应替换第一批)
+        let symbols2 = vec![
+            crate::lsp_client::LspSymbol {
+                name: "func_a".to_string(),
+                kind: "function".to_string(),
+                path: "a.rs".to_string(),
+                line: 0,
+                character: 7,
+            },
+            crate::lsp_client::LspSymbol {
+                name: "helper".to_string(),
+                kind: "function".to_string(),
+                path: "a.rs".to_string(),
+                line: 5,
+                character: 7,
+            },
+        ];
+        map.augment_with_lsp_symbols(Path::new("a.rs"), symbols2);
+        assert_eq!(map.cache[&file_path].lsp_symbols.len(), 2);
+    }
+
+    #[test]
+    fn render_uses_lsp_symbols_when_available() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("a.rs");
+        std::fs::write(&file_path, "pub fn func_a() {}").unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        map.refresh_cache_if_stale();
+
+        // 注入 LSP symbols(与 regex 提取的 definitions 不同,以便区分)
+        let symbols = vec![crate::lsp_client::LspSymbol {
+            name: "lsp_only_symbol".to_string(),
+            kind: "function".to_string(),
+            path: "a.rs".to_string(),
+            line: 10,
+            character: 5,
+        }];
+        map.augment_with_lsp_symbols(Path::new("a.rs"), symbols);
+
+        let rendered = map.render();
+        // 应渲染 LSP symbol(包含位置信息 L:10:5)
+        assert!(
+            rendered.contains("lsp_only_symbol"),
+            "rendered should contain LSP symbol: {rendered}"
+        );
+        assert!(
+            rendered.contains("L:10:5"),
+            "rendered should contain LSP position: {rendered}"
+        );
+        // 不应包含 regex 提取的 func_a(因为 LSP symbols 优先)
+        assert!(
+            !rendered.contains("fn func_a"),
+            "rendered should not contain regex definitions when LSP symbols present: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_falls_back_to_regex_when_no_lsp_symbols() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}").unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        map.refresh_cache_if_stale();
+
+        // 不注入 LSP symbols
+        assert!(!map.has_lsp_symbols(Path::new("a.rs")));
+
+        let rendered = map.render();
+        // 应使用 regex 提取的 definitions
+        assert!(
+            rendered.contains("fn func_a"),
+            "rendered should contain regex definitions: {rendered}"
+        );
+    }
+
+    #[test]
+    fn has_lsp_symbols_returns_false_for_unknown_path() {
+        let temp = tempdir().unwrap();
+        let map = RepoMap::new(temp.path());
+        assert!(!map.has_lsp_symbols(Path::new("nonexistent.rs")));
     }
 }

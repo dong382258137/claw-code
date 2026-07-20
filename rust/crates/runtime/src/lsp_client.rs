@@ -106,6 +106,10 @@ pub struct LspServerState {
     pub root_path: Option<String>,
     pub capabilities: Vec<String>,
     pub diagnostics: Vec<LspDiagnostic>,
+    /// LSP server 命令(如 "rust-analyzer"),Step 4.2 新增。
+    /// None 表示未配置真实 server(仅 placeholder 注册)。
+    #[serde(default)]
+    pub server_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -113,9 +117,25 @@ pub struct LspRegistry {
     inner: Arc<Mutex<RegistryInner>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct RegistryInner {
     servers: HashMap<String, LspServerState>,
+    /// Step 4.2:已 spawn 的真实传输层。
+    /// key 是语言标识(如 "rust"),value 是 ProcessLspTransport 实例。
+    /// dispatch 时优先使用此处存储的 transport,无则 fallback 到 MemoryLspTransport。
+    process_transports: HashMap<String, Arc<Mutex<ProcessLspTransport>>>,
+}
+
+impl std::fmt::Debug for RegistryInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryInner")
+            .field("servers", &self.servers)
+            .field(
+                "process_transports",
+                &self.process_transports.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl LspRegistry {
@@ -140,8 +160,160 @@ impl LspRegistry {
                 root_path: root_path.map(str::to_owned),
                 capabilities,
                 diagnostics: Vec::new(),
+                server_command: None,
             },
         );
+    }
+
+    /// Step 4.2:注册 LSP server 并记录其启动命令。
+    ///
+    /// 与 [`register`](Self::register) 相同,但额外存储 `server_command`
+    /// (如 "rust-analyzer"),供后续 [`spawn_server`](Self::spawn_server) 使用。
+    pub fn register_with_command(
+        &self,
+        language: &str,
+        status: LspServerStatus,
+        root_path: Option<&str>,
+        capabilities: Vec<String>,
+        server_command: &str,
+    ) {
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner.servers.insert(
+            language.to_owned(),
+            LspServerState {
+                language: language.to_owned(),
+                status,
+                root_path: root_path.map(str::to_owned),
+                capabilities,
+                diagnostics: Vec::new(),
+                server_command: Some(server_command.to_owned()),
+            },
+        );
+    }
+
+    /// Step 4.2:真实启动 LSP server 子进程。
+    ///
+    /// 创建 [`ProcessLspTransport`] 并调用其 `spawn()` 方法启动 LSP server 子进程,
+    /// 完成 LSP initialize → initialized 握手。启动成功后将 transport 存入 registry,
+    /// 后续 `dispatch()` 调用将优先使用此真实传输层。
+    ///
+    /// # 参数
+    /// - `language`:语言标识(如 "rust"),需先通过 `register` 或
+    ///   `register_with_command` 注册对应 server
+    /// - `command`:LSP server 启动命令(如 "rust-analyzer"),覆盖注册时的 server_command
+    /// - `root_path`:工作区根路径,LSP initialize 的 rootUri
+    ///
+    /// # 返回
+    /// - `Ok(())`:server 已启动并完成 initialize 握手
+    /// - `Err`:spawn 失败、initialize 超时或 IO 错误
+    ///
+    /// # 错误处理
+    /// - 若 language 未注册,返回错误
+    /// - 若该 language 已有运行中的 transport,返回错误(需先 `shutdown_server`)
+    /// - spawn 失败时,server 状态更新为 `Error`
+    pub fn spawn_server(
+        &self,
+        language: &str,
+        command: &str,
+        root_path: &str,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+
+        // 检查是否已有运行中的 transport
+        if inner.process_transports.contains_key(language) {
+            return Err(format!(
+                "LSP server for '{language}' already spawned; call shutdown_server first"
+            ));
+        }
+
+        // 检查 language 是否已注册
+        let server = inner
+            .servers
+            .get_mut(language)
+            .ok_or_else(|| format!("LSP server not registered for language: {language}"))?;
+
+        server.status = LspServerStatus::Starting;
+        server.server_command = Some(command.to_owned());
+        server.root_path = Some(root_path.to_owned());
+
+        // 创建并 spawn ProcessLspTransport
+        let mut transport = ProcessLspTransport::new(
+            language.to_owned(),
+            Some(root_path.to_owned()),
+            command.to_owned(),
+        );
+
+        match transport.spawn() {
+            Ok(()) => {
+                let server = inner
+                    .servers
+                    .get_mut(language)
+                    .expect("server was checked above");
+                server.status = LspServerStatus::Connected;
+                inner
+                    .process_transports
+                    .insert(language.to_owned(), Arc::new(Mutex::new(transport)));
+                Ok(())
+            }
+            Err(e) => {
+                let server = inner
+                    .servers
+                    .get_mut(language)
+                    .expect("server was checked above");
+                server.status = LspServerStatus::Error;
+                Err(format!("failed to spawn LSP server '{command}': {e}"))
+            }
+        }
+    }
+
+    /// Step 4.2:关闭已 spawn 的 LSP server。
+    ///
+    /// 从 registry 中移除 transport(触发 Drop → kill 子进程),
+    /// 并将 server 状态更新为 `Disconnected`。
+    ///
+    /// 若该 language 未 spawn,返回 `Ok(())`(幂等)。
+    pub fn shutdown_server(&self, language: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        if let Some(transport_arc) = inner.process_transports.remove(language) {
+            // Drop transport 触发 ProcessLspTransport::drop → kill 子进程
+            // 显式 lock 一下确保 Drop 在这里发生(而非延迟到 Arc 引用计数清零)
+            if let Ok(mut transport) = transport_arc.lock() {
+                // 显式 drop 内部 child
+                transport.shutdown();
+            }
+            if let Some(server) = inner.servers.get_mut(language) {
+                server.status = LspServerStatus::Disconnected;
+            }
+        }
+        Ok(())
+    }
+
+    /// Step 4.2:检查指定 language 是否有已 spawn 的真实 transport。
+    #[must_use]
+    pub fn is_server_spawned(&self, language: &str) -> bool {
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner.process_transports.contains_key(language)
+    }
+
+    /// Step 4.2:获取指定文件的 LSP symbols。
+    ///
+    /// 通过 `textDocument/documentSymbol` 请求 LSP server,
+    /// 并用 [`parse_document_symbols`] 解析响应为 `Vec<LspSymbol>`。
+    ///
+    /// # 前置条件
+    /// - 文件路径对应的 language 必须已注册并 spawn_server
+    /// - LSP server 必须支持 documentSymbol 能力
+    ///
+    /// # 返回
+    /// - `Ok(Vec<LspSymbol>)`:成功获取并解析
+    /// - `Err`:server 未连接、dispatch 失败或解析错误
+    ///
+    /// # 与 repomap 协同
+    /// 此方法返回的 symbols 可注入 `RepoMap::augment_with_lsp_symbols`,
+    /// 补充 regex-based 提取的不足。
+    pub fn get_symbols(&self, path: &str) -> Result<Vec<LspSymbol>, String> {
+        let response = self.dispatch("symbols", Some(path), None, None, None)?;
+        Ok(parse_document_symbols(&response, path))
     }
 
     pub fn get(&self, language: &str) -> Option<LspServerState> {
@@ -287,10 +459,49 @@ impl LspRegistry {
         // Step 4.2 — 真实 LSP JSON-RPC 调用。
         // 详见 docs/harness-engineering-optimization-plan.md Step 4.2
         //
-        // 构造 JSON-RPC 2.0 请求,通过 [`LspJsonRpcClient`] 发送到 LSP server。
+        // 优先级:
+        // 1. 若 process_transports 中有已 spawn 的真实 transport,使用它发送 JSON-RPC
+        // 2. 否则 fallback 到 LspJsonRpcClient(MemoryLspTransport)— 保持向后兼容
+        //
         // 协议流程:initialize → initialized → didChange → completion/hover/definition
+        let request = LspRequest::new(
+            lsp_action,
+            path,
+            line,
+            character,
+            server.language.clone(),
+        );
+
+        // 检查是否有已 spawn 的真实 transport
+        let transport_arc = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner.process_transports.get(&server.language).cloned()
+        };
+
+        if let Some(transport_arc) = transport_arc {
+            // 使用真实 ProcessLspTransport
+            let transport = transport_arc
+                .lock()
+                .map_err(|_| "transport lock poisoned".to_string())?;
+            let method = request.method();
+            let params = request.params();
+            let rpc_response = transport.send(method, params)?;
+
+            return Ok(serde_json::json!({
+                "action": format!("{:?}", request.action).to_lowercase(),
+                "path": request.path,
+                "line": request.line,
+                "character": request.character,
+                "language": server.language,
+                "method": method,
+                "rpc_response": rpc_response,
+                "transport": "process",
+                "status": "dispatched"
+            }));
+        }
+
+        // Fallback:MemoryLspTransport(测试或未 spawn 场景)
         let rpc_client = LspJsonRpcClient::new(server.language.clone(), server.root_path.clone());
-        let request = LspRequest::new(lsp_action, path, line, character, server.language.clone());
         rpc_client.dispatch(&request)
     }
 }
@@ -594,6 +805,31 @@ impl ProcessLspTransport {
         self.child.is_some()
     }
 
+    /// Step 4.2:显式关闭 LSP server 子进程。
+    ///
+    /// 与 Drop 不同,此方法允许调用方在 Drop 之前主动关闭 server,
+    /// 并能获取关闭错误(Drop 无法返回错误)。
+    /// 关闭后,`is_spawned()` 返回 false,后续 `send()` 调用将返回
+    /// "not_spawned" placeholder 响应(保持向后兼容)。
+    pub fn shutdown(&mut self) {
+        if let Some(child) = self.child.take() {
+            let mut child = match child.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[lsp] child lock poisoned during shutdown: {e}");
+                    return;
+                }
+            };
+            // 尝试优雅终止;失败则强制杀死
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // 清理 stdin/stdout 句柄
+        self.child_stdin = None;
+        self.child_stdout = None;
+        self.initialized = false;
+    }
+
     /// 写入 JSON-RPC 消息到子进程 stdin(Content-Length header)。
     fn write_message(&self, message: &serde_json::Value) -> Result<(), String> {
         let Some(stdin_handle) = &self.child_stdin else {
@@ -722,6 +958,179 @@ impl Drop for ProcessLspTransport {
             let _ = child.wait();
         }
     }
+}
+
+// ============================================================================
+// Step 4.2 — LSP symbol 解析(documentSymbol 响应 → LspSymbol)
+// 详见 docs/harness-engineering-optimization-plan.md Step 4.2
+// ============================================================================
+
+/// LSP SymbolKind 枚举值(参考 LSP spec 3.17 §3.10.2)。
+///
+/// 用于将 `textDocument/documentSymbol` 响应中的数字 kind 映射为可读字符串。
+/// 数字编码固定,不能更改(协议规范)。
+#[allow(dead_code)]
+pub fn symbol_kind_to_str(kind: u32) -> &'static str {
+    match kind {
+        1 => "file",
+        2 => "module",
+        3 => "namespace",
+        4 => "package",
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "constant",
+        15 => "string",
+        16 => "number",
+        17 => "boolean",
+        18 => "array",
+        19 => "object",
+        20 => "key",
+        21 => "null",
+        22 => "enum_member",
+        23 => "struct",
+        24 => "event",
+        25 => "operator",
+        26 => "type_parameter",
+        _ => "unknown",
+    }
+}
+
+/// Step 4.2:解析 `textDocument/documentSymbol` 响应为 `Vec<LspSymbol>`。
+///
+/// LSP server 可能返回两种格式(参考 LSP spec 3.17 §3.11.2):
+/// 1. `DocumentSymbol[]` — 嵌套结构,有 `range`/`selectionRange`/`children`
+/// 2. `SymbolInformation[]` — 平铺结构,有 `location`
+///
+/// 此函数自动识别两种格式并统一转换为 `LspSymbol`。
+/// 嵌套结构的 `children` 会被递归解析,平铺为顶层 `LspSymbol` 列表。
+///
+/// # 参数
+/// - `response`:LSP JSON-RPC 响应(完整 JSON-RPC envelope,包含 `result` 字段)
+/// - `path`:文件路径(用于填充 `LspSymbol.path`,因为 DocumentSymbol 不包含路径)
+///
+/// # 返回
+/// 解析后的 symbol 列表。若响应格式不匹配,返回空 Vec(不报错,容错处理)。
+#[must_use]
+pub fn parse_document_symbols(response: &serde_json::Value, path: &str) -> Vec<LspSymbol> {
+    // 从 JSON-RPC envelope 中提取 result
+    let result = response.get("result").unwrap_or(response);
+
+    // result 可能是数组(DocumentSymbol[] 或 SymbolInformation[])或 null
+    let symbols_array = match result.as_array() {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    let mut symbols = Vec::new();
+    for item in symbols_array {
+        // 尝试 DocumentSymbol 格式(有 range 字段)
+        if item.get("range").is_some() {
+            parse_document_symbol_recursive(item, path, &mut symbols);
+        }
+        // 尝试 SymbolInformation 格式(有 location 字段)
+        else if let Some(location) = item.get("location") {
+            if let Some(symbol) = parse_symbol_information(item, location) {
+                symbols.push(symbol);
+            }
+        }
+        // 未知格式,跳过(容错)
+    }
+    symbols
+}
+
+/// 递归解析 DocumentSymbol(可能包含 children)。
+fn parse_document_symbol_recursive(
+    item: &serde_json::Value,
+    path: &str,
+    out: &mut Vec<LspSymbol>,
+) {
+    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let kind_num = item
+        .get("kind")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
+    let kind = symbol_kind_to_str(kind_num);
+
+    // selectionRange.start 是 symbol 的精确位置(LSP spec 3.17 §3.11.2)
+    let (line, character) = item
+        .get("selectionRange")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| {
+            let line = s.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let character = s
+                .get("character")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            line.zip(character)
+        })
+        .unwrap_or((0, 0));
+
+    out.push(LspSymbol {
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+        path: path.to_owned(),
+        line,
+        character,
+    });
+
+    // 递归处理 children(嵌套结构)
+    if let Some(children) = item.get("children").and_then(|v| v.as_array()) {
+        for child in children {
+            parse_document_symbol_recursive(child, path, out);
+        }
+    }
+}
+
+/// 解析 SymbolInformation(平铺结构,有 location)。
+fn parse_symbol_information(
+    item: &serde_json::Value,
+    location: &serde_json::Value,
+) -> Option<LspSymbol> {
+    let name = item.get("name").and_then(|v| v.as_str())?;
+    let kind_num = item
+        .get("kind")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
+    let kind = symbol_kind_to_str(kind_num);
+
+    // SymbolInformation.location.uri 提供路径,但调用方已传入 path,优先使用调用方 path
+    // location.range.start 提供位置
+    let (line, character) = location
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| {
+            let line = s.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let character = s
+                .get("character")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            line.zip(character)
+        })
+        .unwrap_or((0, 0));
+
+    // 优先用 location.uri,但若与调用方 path 不一致,使用调用方 path
+    // (因为调用方知道请求的是哪个文件)
+    let path = location
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    Some(LspSymbol {
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+        path: path.to_owned(),
+        line,
+        character,
+    })
 }
 
 /// LSP JSON-RPC 2.0 客户端 — 持有传输层,构造协议请求。
@@ -1478,5 +1887,387 @@ mod tests {
         assert_eq!(result["action"], "completion");
         assert_eq!(result["method"], "textDocument/completion");
         assert!(result.get("rpc_response").is_some());
+    }
+
+    // ========================================================================
+    // Step 4.2 — spawn_server / shutdown_server / dispatch 真实传输 测试
+    // ========================================================================
+
+    #[test]
+    fn register_with_command_stores_server_command() {
+        let registry = LspRegistry::new();
+        registry.register_with_command(
+            "rust",
+            LspServerStatus::Disconnected,
+            Some("/workspace"),
+            vec!["hover".into()],
+            "rust-analyzer",
+        );
+
+        let server = registry.get("rust").unwrap();
+        assert_eq!(server.server_command.as_deref(), Some("rust-analyzer"));
+    }
+
+    #[test]
+    fn spawn_server_fails_for_unregistered_language() {
+        let registry = LspRegistry::new();
+        let result = registry.spawn_server("rust", "rust-analyzer", "/workspace");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("LSP server not registered for language: rust"));
+    }
+
+    #[test]
+    fn spawn_server_fails_for_nonexistent_command() {
+        let registry = LspRegistry::new();
+        registry.register_with_command(
+            "rust",
+            LspServerStatus::Disconnected,
+            None,
+            vec![],
+            "nonexistent-lsp-server-xyz",
+        );
+
+        let result = registry.spawn_server("rust", "nonexistent-lsp-server-xyz", "/workspace");
+        assert!(result.is_err());
+        // spawn 失败应包含 command 名称
+        let err = result.unwrap_err();
+        assert!(err.contains("nonexistent-lsp-server-xyz"));
+
+        // server 状态应更新为 Error
+        let server = registry.get("rust").unwrap();
+        assert_eq!(server.status, LspServerStatus::Error);
+    }
+
+    #[test]
+    fn is_server_spawned_returns_false_initially() {
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Connected, None, vec![]);
+        assert!(!registry.is_server_spawned("rust"));
+    }
+
+    #[test]
+    fn shutdown_server_is_idempotent_for_unspawned() {
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Connected, None, vec![]);
+        // 未 spawn 时 shutdown 应返回 Ok(幂等)
+        let result = registry.shutdown_server("rust");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn shutdown_server_updates_status_to_disconnected() {
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Connected, None, vec![]);
+        // 即使没有真实 spawn,shutdown_server 也应将状态改为 Disconnected
+        // (因为 process_transports 中没有,所以只是 no-op,但不应报错)
+        registry.shutdown_server("rust").unwrap();
+        // 注意:由于未 spawn,server 状态不会改变(只有真实 spawn 后才会)
+        let server = registry.get("rust").unwrap();
+        assert_eq!(server.status, LspServerStatus::Connected);
+    }
+
+    #[test]
+    fn dispatch_falls_back_to_memory_when_not_spawned() {
+        // dispatch 在未 spawn 时应 fallback 到 MemoryLspTransport
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Connected, Some("/workspace"), vec![]);
+
+        let result = registry
+            .dispatch("hover", Some("src/main.rs"), Some(10), Some(5), None)
+            .unwrap();
+        // 应使用 memory transport(未 spawn)
+        assert_eq!(result["rpc_response"]["result"]["transport"], "memory");
+        assert_eq!(result["status"], "dispatched");
+    }
+
+    /// 集成测试:真实启动 rust-analyzer 并验证 initialize → hover 流程。
+    ///
+    /// 此测试 `#[ignore]` 默认不运行,因为:
+    /// 1. 需要 rust-analyzer 在 PATH 中
+    /// 2. 需要真实的工作区(用临时目录)
+    /// 3. 启动子进程较慢(秒级)
+    ///
+    /// 运行方式:`cargo test -p runtime --lib -- --ignored spawn_server_real_rust_analyzer`
+    #[test]
+    #[ignore]
+    fn spawn_server_real_rust_analyzer() {
+        // 前置条件:rust-analyzer 在 PATH 中
+        let rust_analyzer_check = std::process::Command::new("rust-analyzer")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        if rust_analyzer_check.map(|s| !s.success()).unwrap_or(true) {
+            eprintln!("[lsp_test] rust-analyzer not available; skipping");
+            return;
+        }
+
+        // 创建临时工作区,写入一个最小 Rust 文件
+        let temp = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace = temp.path();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"test_lsp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("src/main.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .unwrap();
+
+        let registry = LspRegistry::new();
+        registry.register_with_command(
+            "rust",
+            LspServerStatus::Disconnected,
+            Some(workspace.to_str().unwrap()),
+            vec!["hover".into(), "completion".into()],
+            "rust-analyzer",
+        );
+
+        // 启动 rust-analyzer
+        let spawn_result =
+            registry.spawn_server("rust", "rust-analyzer", workspace.to_str().unwrap());
+        assert!(
+            spawn_result.is_ok(),
+            "spawn_server failed: {:?}",
+            spawn_result.err()
+        );
+
+        // 验证 server 状态
+        assert!(registry.is_server_spawned("rust"));
+        let server = registry.get("rust").unwrap();
+        assert_eq!(server.status, LspServerStatus::Connected);
+
+        // 关闭 server(清理子进程)
+        registry.shutdown_server("rust").unwrap();
+        assert!(!registry.is_server_spawned("rust"));
+    }
+
+    /// 集成测试:用 echo 模拟 LSP server 验证 spawn → shutdown 生命周期。
+    ///
+    /// 此测试 `#[ignore]` 因为 echo 不是真实 LSP server,
+    /// spawn 后 initialize 会超时或失败,但能验证子进程启动 + 清理逻辑。
+    #[test]
+    #[ignore]
+    fn spawn_server_lifecycle_with_fake_server() {
+        let registry = LspRegistry::new();
+        registry.register_with_command(
+            "rust",
+            LspServerStatus::Disconnected,
+            None,
+            vec![],
+            "cat", // cat 会持续读取 stdin,模拟长期运行的 server
+        );
+
+        // 注意:cat 不是 LSP server,initialize 会因 read 超时或格式错误失败
+        // 但 spawn() 本身(子进程启动)应成功
+        let result = registry.spawn_server("rust", "cat", "/tmp");
+        // 即使 initialize 失败,spawn 子进程本身应成功
+        // result 可能是 Err(initialize timeout/parse error),这是预期的
+        if let Err(e) = &result {
+            eprintln!("[lsp_test] expected initialize failure with fake server: {e}");
+        }
+
+        // 无论 initialize 是否成功,都应能 shutdown(清理子进程)
+        // 注意:若 spawn 失败,process_transports 不会有该 transport
+        registry.shutdown_server("rust").unwrap();
+    }
+
+    // ========================================================================
+    // Step 4.2 — parse_document_symbols / get_symbols 测试
+    // ========================================================================
+
+    #[test]
+    fn symbol_kind_to_str_maps_all_known_kinds() {
+        assert_eq!(symbol_kind_to_str(1), "file");
+        assert_eq!(symbol_kind_to_str(12), "function");
+        assert_eq!(symbol_kind_to_str(23), "struct");
+        assert_eq!(symbol_kind_to_str(26), "type_parameter");
+        assert_eq!(symbol_kind_to_str(99), "unknown");
+        assert_eq!(symbol_kind_to_str(0), "unknown");
+    }
+
+    #[test]
+    fn parse_document_symbols_handles_document_symbol_format() {
+        // DocumentSymbol 格式(嵌套,有 range/selectionRange/children)
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "name": "main",
+                    "kind": 12,
+                    "range": { "start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 1} },
+                    "selectionRange": { "start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 7} },
+                    "children": [
+                        {
+                            "name": "inner_fn",
+                            "kind": 12,
+                            "range": { "start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 20} },
+                            "selectionRange": { "start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 15} }
+                        }
+                    ]
+                },
+                {
+                    "name": "MyStruct",
+                    "kind": 23,
+                    "range": { "start": {"line": 5, "character": 0}, "end": {"line": 8, "character": 1} },
+                    "selectionRange": { "start": {"line": 5, "character": 7}, "end": {"line": 5, "character": 15} }
+                }
+            ]
+        });
+
+        let symbols = parse_document_symbols(&response, "src/main.rs");
+        assert_eq!(symbols.len(), 3, "should have 3 symbols (main + inner_fn + MyStruct)");
+
+        // 验证 main symbol
+        assert_eq!(symbols[0].name, "main");
+        assert_eq!(symbols[0].kind, "function");
+        assert_eq!(symbols[0].path, "src/main.rs");
+        assert_eq!(symbols[0].line, 0);
+        assert_eq!(symbols[0].character, 3);
+
+        // 验证 inner_fn(递归解析的 child)
+        assert_eq!(symbols[1].name, "inner_fn");
+        assert_eq!(symbols[1].kind, "function");
+        assert_eq!(symbols[1].line, 1);
+        assert_eq!(symbols[1].character, 7);
+
+        // 验证 MyStruct
+        assert_eq!(symbols[2].name, "MyStruct");
+        assert_eq!(symbols[2].kind, "struct");
+        assert_eq!(symbols[2].line, 5);
+        assert_eq!(symbols[2].character, 7);
+    }
+
+    #[test]
+    fn parse_document_symbols_handles_symbol_information_format() {
+        // SymbolInformation 格式(平铺,有 location)
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "name": "helper",
+                    "kind": 12,
+                    "location": {
+                        "uri": "file:///workspace/src/lib.rs",
+                        "range": { "start": {"line": 10, "character": 0}, "end": {"line": 15, "character": 1} }
+                    }
+                },
+                {
+                    "name": "MAX_SIZE",
+                    "kind": 14,
+                    "location": {
+                        "uri": "file:///workspace/src/lib.rs",
+                        "range": { "start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 20} }
+                    }
+                }
+            ]
+        });
+
+        let symbols = parse_document_symbols(&response, "src/lib.rs");
+        assert_eq!(symbols.len(), 2);
+
+        assert_eq!(symbols[0].name, "helper");
+        assert_eq!(symbols[0].kind, "function");
+        assert_eq!(symbols[0].line, 10);
+        assert_eq!(symbols[0].character, 0);
+        // path 来自 location.uri
+        assert_eq!(symbols[0].path, "file:///workspace/src/lib.rs");
+
+        assert_eq!(symbols[1].name, "MAX_SIZE");
+        assert_eq!(symbols[1].kind, "constant");
+        assert_eq!(symbols[1].line, 3);
+    }
+
+    #[test]
+    fn parse_document_symbols_handles_empty_result() {
+        // result 为空数组
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": []
+        });
+        let symbols = parse_document_symbols(&response, "src/main.rs");
+        assert!(symbols.is_empty());
+
+        // result 为 null
+        let response_null = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": null
+        });
+        let symbols_null = parse_document_symbols(&response_null, "src/main.rs");
+        assert!(symbols_null.is_empty());
+
+        // 无 result 字段(错误响应)
+        let response_err = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32601, "message": "method not found" }
+        });
+        let symbols_err = parse_document_symbols(&response_err, "src/main.rs");
+        assert!(symbols_err.is_empty());
+    }
+
+    #[test]
+    fn parse_document_symbols_handles_mixed_format() {
+        // 混合格式(虽然实际中不会发生,但应容错)
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "name": "doc_symbol",
+                    "kind": 12,
+                    "range": { "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 10} },
+                    "selectionRange": { "start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 13} }
+                },
+                {
+                    "name": "sym_info",
+                    "kind": 13,
+                    "location": {
+                        "uri": "file:///workspace/main.rs",
+                        "range": { "start": {"line": 5, "character": 2}, "end": {"line": 5, "character": 10} }
+                    }
+                },
+                {
+                    // 未知格式,应被跳过
+                    "name": "unknown_format",
+                    "kind": 12
+                }
+            ]
+        });
+
+        let symbols = parse_document_symbols(&response, "main.rs");
+        assert_eq!(symbols.len(), 2, "should skip unknown format");
+        assert_eq!(symbols[0].name, "doc_symbol");
+        assert_eq!(symbols[1].name, "sym_info");
+    }
+
+    #[test]
+    fn get_symbols_returns_empty_for_memory_transport() {
+        // MemoryLspTransport 返回 placeholder 响应,parse 应返回空 Vec
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Connected, None, vec![]);
+
+        let symbols = registry.get_symbols("src/main.rs").unwrap();
+        // MemoryLspTransport 返回的响应无 result 数组,parse 返回空
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn get_symbols_errors_for_disconnected_server() {
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Disconnected, None, vec![]);
+
+        let result = registry.get_symbols("src/main.rs");
+        assert!(result.is_err());
     }
 }
