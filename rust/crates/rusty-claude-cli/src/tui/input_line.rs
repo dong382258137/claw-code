@@ -30,6 +30,8 @@ pub(crate) enum InputAction {
     MenuAccept,
     /// User pressed F2 (or Ctrl+B) to toggle the right-hand sidebar.
     ToggleSidebar,
+    /// User pressed Ctrl+T to toggle the latest tool card's collapse state.
+    ToggleToolCard,
     /// User pressed PgUp to scroll the output view up one screen.
     ScrollUp,
     /// User pressed PgDn to scroll the output view down one screen.

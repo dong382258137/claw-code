@@ -353,6 +353,15 @@ fn run_event_loop(
                     InputAction::ToggleSidebar => {
                         sidebar_visible = !sidebar_visible;
                     }
+                    InputAction::ToggleToolCard => {
+                        // P1 重构：交互式折叠/展开最近一个工具卡片。
+                        // 配合结构化 OutputView，按 Ctrl+T 切换最新 ToolCard
+                        // 的 collapsed 字段，下次渲染时动态生成可见行。
+                        let handle = output_view.shared_handle();
+                        if let Ok(mut buf) = handle.lock() {
+                            buf.toggle_latest_tool_card();
+                        };
+                    }
                     InputAction::ScrollUp => {
                         // PgUp: enter manual-scroll mode and move up by ~half
                         // the visible height (or at least 5 lines). Don't
@@ -411,8 +420,18 @@ fn run_event_loop(
                             // + assistant). Without this the output area only
                             // contained assistant TextDelta events, making it
                             // impossible to tell what the user asked.
+                            //
+                            // P1 修复：从第二次发送开始，buffer 末尾可能不以
+                            // `\n` 结尾（如 MessageStop 已追加 `\n\n`，但若
+                            // 上次 turn 异常退出未触发 MessageStop，buffer 末尾
+                            // 会残留 AI 文本）。echo 前检查 buffer 末尾，若非空
+                            // 且不以 `\n` 结尾，先追加 `\n\n` 作为分隔。
                             let echo_handle = output_view.shared_handle();
                             if let Ok(mut buf) = echo_handle.lock() {
+                                let current = buf.buffer();
+                                if !current.is_empty() && !current.ends_with('\n') {
+                                    buf.append("\n\n");
+                                }
                                 buf.append(&format!("> {line}\n\n"));
                             }
 
@@ -531,6 +550,11 @@ fn route_key(input: &mut InputLine, key: KeyEvent) -> InputAction {
             // Ctrl+B → toggle sidebar (tmux convention)
             if lower == 'b' {
                 return InputAction::ToggleSidebar;
+            }
+            // Ctrl+T → toggle latest tool card collapse state.
+            // P1 重构：交互式折叠/展开，配合结构化 OutputView。
+            if lower == 't' {
+                return InputAction::ToggleToolCard;
             }
             // Ctrl+J → newline (multi-line input)
             if lower == 'j' {
@@ -660,6 +684,7 @@ fn render_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         ("PgUp / PgDn", "滚动输出视图 上 / 下 一屏"),
         ("/", "打开斜杠命令菜单（模糊过滤）"),
         ("F2 / Ctrl+B", "切换右侧侧栏"),
+        ("Ctrl+T", "折叠 / 展开最近一个工具卡片"),
         ("?", "切换此快捷键浮层"),
         ("/help", "在输出区显示完整帮助"),
         ("/session pick", "交互式会话选择器"),
@@ -719,6 +744,11 @@ fn execute_turn(
     let tool_history_for_closure = Arc::clone(&tool_history);
     let tool_history_for_sidebar = Arc::clone(&tool_history_shared);
     let output_for_closure = Arc::clone(&output_handle);
+    // P1 修复：tool input 缓存，供 ToolResult 时取回用于 edit_file diff 显示。
+    // key = tool_use_id, value = tool input json string
+    let tool_input_cache: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let tool_input_cache_for_closure = Arc::clone(&tool_input_cache);
 
     let emitter: StatusEmitter = Arc::new(move |event: StatusEvent| {
         match event {
@@ -728,10 +758,22 @@ fn execute_turn(
                 }
             }
             StatusEvent::ToolUse { id, name, input } => {
-                // Render tool call start card
-                let card = crate::tui::tool_card::render_tool_call_start(&name, &input);
+                // P1 修复：缓存 tool input，供 ToolResult 时取回用于 diff 显示。
+                if let Ok(mut cache) = tool_input_cache_for_closure.lock() {
+                    cache.insert(id.clone(), input.clone());
+                }
+                // P1 重构：用结构化 ToolCard entry 替代纯文本 append。
+                // ToolCard 默认 collapsed=false（执行中），result 到达后
+                // 由 complete_tool_card 设置 result 并切换为 collapsed=true。
                 if let Ok(mut buf) = output_handle.lock() {
-                    buf.append(&card);
+                    buf.push_entry(crate::tui::output_view::OutputEntry::ToolCard {
+                        tool_id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        result: None,
+                        is_error: false,
+                        collapsed: false,
+                    });
                 }
             }
             StatusEvent::ToolResult { id, name, output, is_error } => {
@@ -743,10 +785,11 @@ fn execute_turn(
                 if let Ok(mut sidebar_history) = tool_history_for_sidebar.lock() {
                     sidebar_history.push((name.clone(), is_error));
                 }
-                // Render collapsible tool result card
-                let card = crate::tui::tool_card::render_tool_result(&name, &output, is_error);
+                // P1 重构：用 complete_tool_card 更新已存在的 ToolCard entry，
+                // 设置 result 并切换为折叠状态。渲染时根据 collapsed 状态
+                // 动态生成可见行，支持 Tab 键交互式折叠/展开。
                 if let Ok(mut buf) = output_handle.lock() {
-                    buf.append(&card);
+                    buf.complete_tool_card(&id, output.clone(), is_error);
                 }
             }
             StatusEvent::Usage(usage) => {
@@ -763,21 +806,33 @@ fn execute_turn(
                 if let Ok(mut guard) = status_handle.lock() {
                     guard.reset_turn();
                 }
-                // Reset tool history for new turn
+                // Reset tool history for new turn (used for timeline summary)
                 if let Ok(mut history) = tool_history.lock() {
                     history.clear();
                 }
-                if let Ok(mut sidebar_history) = tool_history_for_sidebar.lock() {
-                    sidebar_history.clear();
-                }
+                // P1 修复：不再在 StreamStart 清空 sidebar 历史。
+                // 原因：StreamStart 在每个 turn 开始时触发，清空 sidebar 历史
+                // 导致用户看不到工具调用记录。sidebar 历史应在 Submit 新 turn
+                // 时清空（已在 Submit 分支 L454 处理），让用户在 turn 进行中
+                // 和结束后都能看到本次 turn 的工具调用记录。
             }
             StatusEvent::MessageStop => {
+                // P1 修复：AI 回复末尾追加换行分隔符，避免下次 Submit echo
+                // 的 `> {line}` 紧贴 AI 回复末尾。原 TextDelta 流式 append
+                // 没有 `\n` 结尾，导致从第二次发送开始用户消息与 AI 回复
+                // 混在一起没有分行。
+                if let Ok(mut buf) = output_for_closure.lock() {
+                    buf.append("\n\n");
+                }
                 // Render tool timeline summary if any tools were called
+                // P1 重构：用 Timeline entry 替代纯文本 append
                 if let Ok(history) = tool_history.lock() {
                     if !history.is_empty() {
                         let timeline = crate::tui::tool_card::render_tool_timeline(&history);
                         if let Ok(mut buf) = output_for_closure.lock() {
-                            buf.append(&timeline);
+                            buf.push_entry(crate::tui::output_view::OutputEntry::Timeline {
+                                summary: timeline,
+                            });
                         }
                     }
                 }

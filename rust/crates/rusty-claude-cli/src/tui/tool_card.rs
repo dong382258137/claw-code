@@ -8,25 +8,20 @@
 //! hint are shown; otherwise the full output is displayed.
 
 /// Default threshold: outputs with more than this many lines are collapsed.
-const COLLAPSE_THRESHOLD: usize = 15;
+/// P1 修复：从 15 降到 5，更激进地折叠工具输出，避免长输出占满输出区。
+const COLLAPSE_THRESHOLD: usize = 5;
 /// Number of lines to show when collapsed.
-const COLLAPSED_PREVIEW_LINES: usize = 5;
+const COLLAPSED_PREVIEW_LINES: usize = 3;
 
 /// Render a tool call start card (header only, result pending).
-/// For edit_file tools, includes a colored unified diff preview.
+/// P1 修复：start 卡片只显示一行 header，不显示 diff 和 running 状态。
+/// 原因：start 卡片中的 `├─ ⏳ running...\n` 会在 result 到来后仍留在
+/// buffer 中无法替换，导致输出区累积大量"running"残留。改为只显示
+/// 一行 header，等 result 到来时再显示完整卡片（含 diff/输出）。
+/// 对于 edit_file，diff 在 result 卡片中显示。
 pub(crate) fn render_tool_call_start(name: &str, input: &str) -> String {
     let summary = summarize_tool_input(name, input);
-    let mut card = format!("\n┌─ 🔧 {name} {summary}\n");
-
-    // For edit_file, render a colored diff preview
-    if name == "edit_file" || name == "Edit" {
-        if let Some(diff) = render_edit_diff(input) {
-            card.push_str(&diff);
-        }
-    }
-
-    card.push_str("├─ ⏳ running...\n");
-    card
+    format!("\n┌─ 🔧 {name} {summary} ⏳\n")
 }
 
 /// Render a colored unified diff for an edit_file tool call.
@@ -76,10 +71,19 @@ fn render_edit_diff(input: &str) -> Option<String> {
 /// If `output` has more than `COLLAPSE_THRESHOLD` lines, only the first
 /// `COLLAPSED_PREVIEW_LINES` lines are shown followed by an expand hint.
 /// Tool results are syntax-highlighted when the tool name implies code output.
-pub(crate) fn render_tool_result(name: &str, output: &str, is_error: bool) -> String {
+/// P1 修复：对 edit_file 工具，在 result 卡片中显示 diff（原 start 卡片
+/// 中的 diff 已移除）。
+pub(crate) fn render_tool_result(name: &str, output: &str, is_error: bool, input: Option<&str>) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let line_count = lines.len();
     let icon = if is_error { "❌" } else { "✅" };
+
+    // For edit_file, prepend a diff preview before the result body
+    let diff_prefix = if (name == "edit_file" || name == "Edit") && !is_error {
+        input.and_then(render_edit_diff).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     // Determine if this tool's output should be syntax-highlighted
     let language = detect_language_for_tool(name, output);
@@ -106,14 +110,14 @@ pub(crate) fn render_tool_result(name: &str, output: &str, is_error: bool) -> St
         let preview: String = highlighted_body(&lines[..COLLAPSED_PREVIEW_LINES.min(line_count)]);
         let hidden = line_count - COLLAPSED_PREVIEW_LINES;
         format!(
-            "├─ {icon} {name} ({line_count} lines, +{hidden} hidden)\n{preview}├─ [+] Expand ({hidden} more lines)\n└─\n"
+            "{diff_prefix}├─ {icon} {name} ({line_count} 行，+{hidden} 行已折叠)\n{preview}├─ [+] 展开（还有 {hidden} 行）\n└─\n"
         )
     } else if line_count == 0 {
-        format!("├─ {icon} {name} (empty)\n└─\n")
+        format!("{diff_prefix}├─ {icon} {name} (空)\n└─\n")
     } else {
         // Full view
         let body = highlighted_body(&lines);
-        format!("├─ {icon} {name} ({line_count} lines)\n{body}└─\n")
+        format!("{diff_prefix}├─ {icon} {name} ({line_count} 行)\n{body}└─\n")
     }
 }
 
@@ -172,11 +176,23 @@ pub(crate) fn render_tool_timeline(history: &[(String, bool)]) -> String {
         parts.push(colored);
     }
     let count = history.len();
-    let tool_word = if count == 1 { "tool" } else { "tools" };
+    let tool_word = if count == 1 { "个工具" } else { "个工具" };
     format!(
-        "\n┌─ 🔧 Timeline: {} ({count} {tool_word})\n└─\n",
+        "\n┌─ 🔧 时间线：{}（{count} {tool_word}）\n└─\n",
         parts.join(" | ")
     )
+}
+
+/// Summarize tool input to a short one-liner for the card header.
+/// P1 重构：公开接口供 OutputView::render() 调用。
+pub(crate) fn summarize_tool_input_public(name: &str, input: &str) -> String {
+    summarize_tool_input(name, input)
+}
+
+/// Render a tool result card (collapsible).
+/// P1 重构：公开接口供 OutputView::render() 调用（展开状态渲染）。
+pub(crate) fn render_tool_result_public(name: &str, output: &str, is_error: bool, input: Option<&str>) -> String {
+    render_tool_result(name, output, is_error, input)
 }
 
 /// Summarize tool input to a short one-liner for the card header.
@@ -284,36 +300,37 @@ mod tests {
     #[test]
     fn render_tool_result_short_output_full_view() {
         let output = "line1\nline2\nline3";
-        let card = render_tool_result("bash", output, false);
+        let card = render_tool_result("bash", output, false, None);
         assert!(card.contains("✅ bash"));
-        assert!(card.contains("3 lines"));
-        assert!(!card.contains("[+] Expand"));
+        assert!(card.contains("3 行"));
+        assert!(!card.contains("[+] 展开"));
     }
 
     #[test]
     fn render_tool_result_long_output_collapsed() {
+        // P1 修复：阈值从 15 降到 5，20 行输出会被折叠，只显示前 3 行
         let output = (1..=20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
-        let card = render_tool_result("bash", &output, false);
-        assert!(card.contains("20 lines"));
-        assert!(card.contains("[+] Expand"));
-        assert!(card.contains("15 more lines"));
-        // Preview should contain first 5 lines
+        let card = render_tool_result("bash", &output, false, None);
+        assert!(card.contains("20 行"));
+        assert!(card.contains("[+] 展开"));
+        assert!(card.contains("17 行"));
+        // Preview should contain first 3 lines (COLLAPSED_PREVIEW_LINES = 3)
         assert!(card.contains("line1"));
-        assert!(card.contains("line5"));
-        // Should not contain line 6 in preview
-        assert!(!card.contains("│ line6"));
+        assert!(card.contains("line3"));
+        // Should not contain line 4 in preview
+        assert!(!card.contains("│ line4"));
     }
 
     #[test]
     fn render_tool_result_error_shows_x_icon() {
-        let card = render_tool_result("bash", "command not found", true);
+        let card = render_tool_result("bash", "command not found", true, None);
         assert!(card.contains("❌ bash"));
     }
 
     #[test]
     fn render_tool_result_empty_output() {
-        let card = render_tool_result("bash", "", false);
-        assert!(card.contains("empty"));
+        let card = render_tool_result("bash", "", false, None);
+        assert!(card.contains("空"));
     }
 
     #[test]
@@ -343,11 +360,12 @@ mod tests {
 
     #[test]
     fn render_edit_diff_shows_red_and_green_lines() {
+        // P1 修复：diff 已从 start 卡片移到 result 卡片
         let input = r#"{"file_path":"src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#;
-        let card = render_tool_call_start("edit_file", input);
+        let card = render_tool_result("edit_file", "ok", false, Some(input));
         // Should contain red (removed) and green (added) ANSI codes
-        assert!(card.contains("\x1b[31m"), "should have red for removed line");
-        assert!(card.contains("\x1b[32m"), "should have green for added line");
+        assert!(card.contains("\x1b[31m"), "should have red for removed line: {card}");
+        assert!(card.contains("\x1b[32m"), "should have green for added line: {card}");
         assert!(card.contains("let x = 1"));
         assert!(card.contains("let x = 2"));
     }
@@ -355,7 +373,7 @@ mod tests {
     #[test]
     fn render_edit_diff_identical_strings_no_diff() {
         let input = r#"{"file_path":"src/main.rs","old_string":"same","new_string":"same"}"#;
-        let card = render_tool_call_start("edit_file", input);
+        let card = render_tool_result("edit_file", "ok", false, Some(input));
         // No diff lines should be rendered
         assert!(!card.contains("\x1b[31m"));
         assert!(!card.contains("\x1b[32m"));
@@ -364,7 +382,7 @@ mod tests {
     #[test]
     fn render_edit_diff_multi_line() {
         let input = r#"{"file_path":"test.rs","old_string":"line1\nline2\nline3","new_string":"line1\nmodified\nline3"}"#;
-        let card = render_tool_call_start("edit_file", input);
+        let card = render_tool_result("edit_file", "ok", false, Some(input));
         // line1 and line3 are context, line2 is removed, modified is added
         assert!(card.contains("line2"));
         assert!(card.contains("modified"));
@@ -377,7 +395,7 @@ mod tests {
         let history = vec![("bash".to_string(), false)];
         let timeline = render_tool_timeline(&history);
         assert!(timeline.contains("bash → ✓"));
-        assert!(timeline.contains("1 tool"));
+        assert!(timeline.contains("1 个工具"));
     }
 
     #[test]
@@ -391,7 +409,7 @@ mod tests {
         assert!(timeline.contains("bash → ✓"));
         assert!(timeline.contains("read_file → ✓"));
         assert!(timeline.contains("edit_file → ✗"));
-        assert!(timeline.contains("3 tools"));
+        assert!(timeline.contains("3 个工具"));
     }
 
     #[test]
