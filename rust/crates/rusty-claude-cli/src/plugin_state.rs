@@ -480,6 +480,51 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         }),
         required_permission: PermissionMode::ReadOnly,
     });
+    // P0:注册 recall_full 工具 — 从 ToolResultArchive 检索 microcompact
+    // 摘要前的原始 tool result。
+    //
+    // 当 LLM 在上下文中看到 `[Read output summarized: 1234 chars → ...]` 时,
+    // 无法判断原始内容是否仍需要。盲目重新调用 Read 会导致:
+    // - 重复读同一文件(浪费 token 和时间)
+    // - LLM 忘记之前已读过的内容(典型死循环模式)
+    //
+    // recall_full 让 LLM 主动按 tool_use_id 检索归档的原始输出,从而:
+    // - 节省重新调用工具的开销
+    // - 在归档存在时直接获取完整内容,无需重新 Read
+    //
+    // 执行由 ConversationRuntime::run_turn 拦截,委托
+    // runtime::tool_result_archive::recall_tool_result 处理。
+    // 归档由 microcompact_with_archiver 在摘要替换前自动写入。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "recall_full".to_string(),
+        description: Some(
+            "Retrieve the original (pre-summary) output of a tool result that \
+             was summarized by microcompact. When you see a placeholder like \
+             '[Read output summarized: 1234 chars → ...]' in the context and \
+             need the full content, call this tool with the tool_use_id from \
+             the corresponding tool_use block instead of re-invoking the \
+             original tool. Modes: (1) pass {\"tool_use_id\": \"call_xxx\"} \
+             to retrieve a specific archived result; (2) pass \
+             {\"list_only\": true} to list all archived ids with previews."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool_use_id": {
+                    "type": "string",
+                    "description": "The tool_use_id of the summarized tool result to retrieve. Required unless list_only=true."
+                },
+                "list_only": {
+                    "type": "boolean",
+                    "description": "If true, list all archived tool result ids with previews instead of retrieving a specific one. Default: false.",
+                    "default": false
+                }
+            },
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    });
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {

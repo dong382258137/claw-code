@@ -423,11 +423,52 @@ fn format_tool_result_summary(tool_name: &str, output: &str) -> String {
 /// - Tool results with `is_error = true` are always kept verbatim.
 /// - The most recent `preserve_recent` tool results (of any kind) are kept
 ///   verbatim so the active working set remains visible.
+///
+/// 这是 `microcompact_with_archiver` 的便捷包装,不进行归档。
+/// 需要归档原始 tool result 时,请使用 [`microcompact_with_archiver`]。
 #[must_use]
 pub fn microcompact(
     messages: &[ConversationMessage],
     preserve_recent: usize,
 ) -> Vec<ConversationMessage> {
+    microcompact_with_archiver(messages, preserve_recent, |_, _, _| {})
+}
+
+/// 与 [`microcompact`] 行为相同,但在替换 `ToolResult.output` 为摘要前,
+/// 调用 `archiver(tool_use_id, tool_name, original_output)` 让调用方归档原始内容。
+///
+/// # P0:真无损压缩
+///
+/// 旧版 microcompact 直接用 `format_tool_result_summary` 覆盖 `output`,
+/// 原始内容永久丢失。本函数在覆盖前调用 `archiver`,让调用方把原始内容
+/// 持久化到 `ToolResultArchive`(`.claw/tool_results_archive.jsonl`)。
+/// LLM 后续可通过 `recall_full` 工具按 `tool_use_id` 主动检索原始内容。
+///
+/// # archiver 调用时机
+///
+/// - 仅在被摘要的工具(`Read`/`Bash`/`Grep`/`Glob`/`LS`)上调用
+/// - 不会在 critical tool(Edit/Write/Delete)或 error 上调用
+/// - 不会在已摘要的 output 上重复调用(避免双重归档)
+///
+/// # archiver 错误处理
+///
+/// archiver 是 `FnMut(&str, &str, &str) -> ()`,不返回 Result。
+/// 调用方应在 archiver 内部吞掉错误(归档失败不阻断 microcompact):
+///
+/// ```ignore
+/// microcompact_with_archiver(messages, preserve_recent, |id, name, output| {
+///     let _ = archive_tool_result(&workspace_root, id, name, output);
+/// })
+/// ```
+#[must_use]
+pub fn microcompact_with_archiver<F>(
+    messages: &[ConversationMessage],
+    preserve_recent: usize,
+    mut archiver: F,
+) -> Vec<ConversationMessage>
+where
+    F: FnMut(&str, &str, &str),
+{
     // Collect the indices of messages that contain at least one ToolResult
     // block. Each such message is treated as one "tool result unit" for the
     // recency window.
@@ -462,10 +503,10 @@ pub fn microcompact(
             let mut new_message = message.clone();
             for block in &mut new_message.blocks {
                 let ContentBlock::ToolResult {
+                    tool_use_id,
                     tool_name,
                     output,
                     is_error,
-                    ..
                 } = block
                 else {
                     continue;
@@ -480,6 +521,8 @@ pub fn microcompact(
                 {
                     continue;
                 }
+                // P0:归档原始 output 到 ToolResultArchive,再替换为摘要。
+                archiver(tool_use_id, tool_name, output);
                 *output = format_tool_result_summary(tool_name, output);
             }
             new_message

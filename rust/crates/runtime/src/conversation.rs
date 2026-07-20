@@ -1020,9 +1020,19 @@ where
                             let before_len = crate::conversation::tool_result_output_len(
                                 &self.session.messages,
                             );
-                            let microcompacted = crate::compact::microcompact(
+                            // P0:reactive microcompact 同样归档原始 tool result,
+                            // 确保 reactive 压缩路径也走无损归档。
+                            let archive_root = self.workspace_root.clone();
+                            let microcompacted = crate::compact::microcompact_with_archiver(
                                 &self.session.messages,
                                 REACTIVE_MICROCOMPACT_PRESERVE_RECENT,
+                                |id, name, output| {
+                                    if let Some(root) = &archive_root {
+                                        let _ = crate::tool_result_archive::archive_tool_result(
+                                            root, id, name, output,
+                                        );
+                                    }
+                                },
                             );
                             let after_len = crate::conversation::tool_result_output_len(
                                 &microcompacted,
@@ -1228,6 +1238,15 @@ where
                                     Ok(output) => (output, false),
                                     Err(error) => (error.to_string(), true),
                                 }
+                            } else if tool_name == "recall_full" {
+                                // P0:从 ToolResultArchive 检索 microcompact 摘要前的
+                                // 原始 tool result。直击"AI 看到摘要后无法判断是否需要
+                                // 重新调用工具,导致重复调用"的问题。
+                                // 详见 tool_result_archive 模块文档。
+                                match self.execute_recall_full(&effective_input) {
+                                    Ok(output) => (output, false),
+                                    Err(error) => (error.to_string(), true),
+                                }
                             } else {
                                 match self.tool_executor.execute(&tool_name, &effective_input) {
                                     Ok(output) => (output, false),
@@ -1371,8 +1390,23 @@ where
         // Read/Bash/Grep/Glob/LS outputs with one-line summaries, keeping the
         // recent `MICROCOMPACT_PRESERVE_RECENT` tool results verbatim. Edit /
         // Write / Delete and error results are always preserved.
-        let microcompacted =
-            crate::compact::microcompact(&self.session.messages, MICROCOMPACT_PRESERVE_RECENT);
+        //
+        // P0:在摘要替换前,通过 `microcompact_with_archiver` 归档原始 tool result
+        // 到 `.claw/tool_results_archive.jsonl`。LLM 后续可通过 `recall_full` 工具
+        // 按 `tool_use_id` 主动检索原始内容,避免"看到摘要后重复调用工具"的问题。
+        // 归档失败不阻断 microcompact(吞掉错误)。
+        let archive_root = self.workspace_root.clone();
+        let microcompacted = crate::compact::microcompact_with_archiver(
+            &self.session.messages,
+            MICROCOMPACT_PRESERVE_RECENT,
+            |id, name, output| {
+                if let Some(root) = &archive_root {
+                    let _ = crate::tool_result_archive::archive_tool_result(
+                        root, id, name, output,
+                    );
+                }
+            },
+        );
         // P0-3:检测 microcompact 是否发生了实质性压缩(旧 tool result 被替换)。
         // 比较前后 tool result blocks 的总 output 长度,若减少则置刷新 flag,
         // 下个 turn 的 system_prompt 会注入 NOTEBOOK 刷新提醒。
@@ -1863,6 +1897,111 @@ where
         }
     }
 
+    /// P0:执行 `recall_full` 工具调用,从 ToolResultArchive 检索 microcompact
+    /// 摘要前的原始 tool result。
+    ///
+    /// # 工作流程
+    ///
+    /// 1. 解析 `tool_use_id` 参数(JSON: `{"tool_use_id": "call_xxx"}`)
+    /// 2. 调用 [`tool_result_archive::recall_tool_result`] 检索归档
+    /// 3. 找到 → 返回原始 output + tool_name + archived_at_ms
+    /// 4. 未找到 → 返回提示信息,引导 LLM 重新调用原工具
+    ///
+    /// # 与 microcompact 的关系
+    ///
+    /// microcompact 在摘要替换前会调用 [`compact::microcompact_with_archiver`]
+    /// 把原始 tool result 归档到 `.claw/tool_results_archive.jsonl`。LLM 在后续
+    /// turn 看到摘要 `[Read output summarized: 1234 chars → ...]` 时,可调用
+    /// `recall_full` 取回原始内容,避免盲目重新调用 Read。
+    ///
+    /// # 错误处理
+    ///
+    /// - `workspace_root` 未配置:返回提示信息(不报错,让 LLM 知道功能不可用)
+    /// - archive 文件不存在:返回"未找到"提示
+    /// - IO/解析错误:返回错误信息
+    fn execute_recall_full(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(workspace_root) = &self.workspace_root else {
+            return Ok(
+                "recall_full is not available: no workspace_root configured. \
+                 ToolResultArchive requires workspace_root to locate \
+                 .claw/tool_results_archive.jsonl."
+                    .to_string(),
+            );
+        };
+
+        // 解析 input JSON
+        let parsed: serde_json::Value = serde_json::from_str(input).map_err(|e| {
+            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "recall_full: invalid JSON input: {e}. Expected: {{\"tool_use_id\": \"call_xxx\"}} or {{\"list_only\": true}}"
+            ))
+        })?;
+
+        // 可选:list_only 模式 — 列出所有归档摘要,不返回具体内容。
+        // 此模式不需要 tool_use_id,所以先检查 list_only。
+        let list_only = parsed
+            .get("list_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if list_only {
+            let summaries = crate::tool_result_archive::list_archived_summary(workspace_root)?;
+            if summaries.is_empty() {
+                return Ok("recall_full (list_only): archive is empty.".to_string());
+            }
+            let mut lines = Vec::with_capacity(summaries.len() + 1);
+            lines.push(format!(
+                "recall_full (list_only): {} archived tool results:",
+                summaries.len()
+            ));
+            for (id, name, preview, ts_ms) in summaries {
+                lines.push(format!(
+                    "  - id={id} tool={name} ts={ts_ms} preview={preview}"
+                ));
+            }
+            lines.push(
+                "Call recall_full with a specific tool_use_id to retrieve the full output."
+                    .to_string(),
+            );
+            return Ok(lines.join("\n"));
+        }
+
+        // 非 list_only 模式:必须提供 tool_use_id
+        let tool_use_id = parsed
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(
+                    "recall_full: missing or invalid 'tool_use_id' field. \
+                     Expected: {\"tool_use_id\": \"call_xxx\"} or {\"list_only\": true}",
+                )
+            })?;
+
+        // 按 tool_use_id 检索
+        match crate::tool_result_archive::recall_tool_result(workspace_root, tool_use_id)? {
+            Some(record) => {
+                Ok(format!(
+                    "recall_full: retrieved archived tool result.\n\
+                     tool_use_id: {}\n\
+                     tool_name: {}\n\
+                     archived_at_ms: {}\n\
+                     --- original output ---\n\
+                     {}",
+                    record.tool_use_id, record.tool_name, record.archived_at_ms, record.output
+                ))
+            }
+            None => Ok(format!(
+                "recall_full: no archived tool result found for tool_use_id='{tool_use_id}'.\n\
+                 The tool result may not have been summarized yet, or the archive \
+                 file (.claw/tool_results_archive.jsonl) may have been pruned.\n\
+                 Hint: call recall_full with {{\"list_only\": true}} to see all archived ids, \
+                 or re-invoke the original tool to get fresh output."
+            )),
+        }
+    }
+
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
         compact_session(&self.session, config)
@@ -2306,7 +2445,7 @@ mod tests {
     use crate::prompt::{
         ProjectContext, SystemPromptBuilder, SystemPromptSplit, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use std::fs;
@@ -4644,5 +4783,328 @@ mod tests {
         // 这个差值就是 P0-3 flag 触发的依据
         assert!(before_len > 1000, "before should be long: {before_len}");
         assert!(after_len < 100, "after should be short: {after_len}");
+    }
+
+    // ============================================================================
+    // P0:recall_full 工具拦截 + ToolResultArchive 集成测试
+    // ============================================================================
+
+    #[test]
+    fn recall_full_returns_unavailable_when_no_workspace_root() {
+        // 不设置 workspace_root,recall_full 应返回不可用提示(不报错)
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let output = runtime
+            .execute_recall_full(r#"{"tool_use_id":"call_abc"}"#)
+            .expect("should not propagate as hard error");
+        assert!(
+            output.contains("not available"),
+            "expected 'not available' message: {output}"
+        );
+        assert!(
+            output.contains("workspace_root"),
+            "expected 'workspace_root' hint: {output}"
+        );
+    }
+
+    #[test]
+    fn recall_full_returns_not_found_for_unknown_tool_use_id() {
+        let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tempdir.path().to_path_buf());
+
+        let output = runtime
+            .execute_recall_full(r#"{"tool_use_id":"nonexistent"}"#)
+            .expect("should succeed with not-found message");
+        assert!(
+            output.contains("no archived tool result found"),
+            "expected 'not found' message: {output}"
+        );
+        assert!(
+            output.contains("list_only"),
+            "expected list_only hint: {output}"
+        );
+    }
+
+    #[test]
+    fn recall_full_retrieves_archived_tool_result() {
+        // 验证 recall_full 能从 archive 检索原始 tool result。
+        // 这是 P0 的核心测试:确保 microcompact 摘要的原始内容可被 LLM 取回。
+        let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace_root = tempdir.path().to_path_buf();
+
+        // 手动归档一条 tool result(模拟 microcompact_with_archiver 的行为)
+        let original_output = "line1\nline2\nline3\nline4\nline5\nimportant content";
+        crate::tool_result_archive::archive_tool_result(
+            &workspace_root,
+            "call_test_123",
+            "Read",
+            original_output,
+        )
+        .expect("archive should succeed");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(workspace_root);
+
+        let output = runtime
+            .execute_recall_full(r#"{"tool_use_id":"call_test_123"}"#)
+            .expect("recall should succeed");
+        assert!(
+            output.contains("retrieved archived tool result"),
+            "expected 'retrieved' message: {output}"
+        );
+        assert!(
+            output.contains("call_test_123"),
+            "expected tool_use_id in output: {output}"
+        );
+        assert!(
+            output.contains("Read"),
+            "expected tool_name 'Read' in output: {output}"
+        );
+        assert!(
+            output.contains(original_output),
+            "expected original output in result: {output}"
+        );
+    }
+
+    #[test]
+    fn recall_full_list_only_mode_returns_summary() {
+        let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace_root = tempdir.path().to_path_buf();
+
+        // 归档 3 条记录
+        crate::tool_result_archive::archive_tool_result(&workspace_root, "id_1", "Read", "content1").unwrap();
+        crate::tool_result_archive::archive_tool_result(&workspace_root, "id_2", "Bash", "content2").unwrap();
+        crate::tool_result_archive::archive_tool_result(&workspace_root, "id_3", "Grep", "content3").unwrap();
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(workspace_root);
+
+        let output = runtime
+            .execute_recall_full(r#"{"list_only":true}"#)
+            .expect("list_only should succeed");
+        assert!(
+            output.contains("3 archived tool results"),
+            "expected count '3': {output}"
+        );
+        assert!(output.contains("id_1"), "expected id_1: {output}");
+        assert!(output.contains("id_2"), "expected id_2: {output}");
+        assert!(output.contains("id_3"), "expected id_3: {output}");
+    }
+
+    #[test]
+    fn recall_full_handles_invalid_json() {
+        let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tempdir.path().to_path_buf());
+
+        let error = runtime
+            .execute_recall_full("not json")
+            .expect_err("invalid JSON should propagate as error");
+        assert!(
+            error.to_string().contains("invalid JSON input"),
+            "expected invalid JSON error: {error}"
+        );
+    }
+
+    #[test]
+    fn recall_full_errors_when_tool_use_id_missing() {
+        let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tempdir.path().to_path_buf());
+
+        let error = runtime
+            .execute_recall_full(r#"{"list_only":false}"#)
+            .expect_err("missing tool_use_id should propagate as error");
+        assert!(
+            error.to_string().contains("missing or invalid 'tool_use_id'"),
+            "expected missing tool_use_id error: {error}"
+        );
+    }
+
+    /// P0 端到端测试:验证 microcompact_with_archiver 归档的原始内容
+    /// 能被 recall_full 检索到。
+    ///
+    /// 测试流程:
+    /// 1. 构造 session 包含多个旧的 Read tool result
+    /// 2. 调用 microcompact_with_archiver(preserve_recent=1) 摘要旧 result
+    /// 3. 验证 archive 文件包含被摘要的原始内容
+    /// 4. 通过 recall_full 检索原始内容,验证完整性
+    #[test]
+    fn microcompact_archives_and_recall_full_retrieves_end_to_end() {
+        let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace_root = tempdir.path().to_path_buf();
+
+        // 构造 3 个 Read tool result,只有最后 1 个会被保留(preserve_recent=1)
+        let original_output_1 = "file1 content line1\nfile1 content line2\nfile1 content line3";
+        let original_output_2 = "file2 content line1\nfile2 content line2\nfile2 content line3";
+        let original_output_3 = "file3 content (recent, should be preserved verbatim)";
+
+        let messages = vec![
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_old_1".to_string(),
+                    tool_name: "Read".to_string(),
+                    output: original_output_1.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_old_2".to_string(),
+                    tool_name: "Read".to_string(),
+                    output: original_output_2.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_recent".to_string(),
+                    tool_name: "Read".to_string(),
+                    output: original_output_3.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+        ];
+
+        // 调用 microcompact_with_archiver,归档被摘要的原始内容
+        let archive_root = workspace_root.clone();
+        let microcompacted = crate::compact::microcompact_with_archiver(
+            &messages,
+            1, // preserve_recent=1:只保留最后 1 个 tool result
+            |id, name, output| {
+                let _ = crate::tool_result_archive::archive_tool_result(
+                    &archive_root, id, name, output,
+                );
+            },
+        );
+
+        // 验证 microcompact 确实摘要了前两个 tool result
+        let find_output = |messages: &[ConversationMessage], tool_use_id: &str| -> String {
+            for msg in messages {
+                for block in &msg.blocks {
+                    if let ContentBlock::ToolResult { tool_use_id: tuid, output, .. } = block {
+                        if tuid == tool_use_id {
+                            return output.clone();
+                        }
+                    }
+                }
+            }
+            String::new()
+        };
+
+        let output_1_after = find_output(&microcompacted, "call_old_1");
+        let output_2_after = find_output(&microcompacted, "call_old_2");
+        let output_3_after = find_output(&microcompacted, "call_recent");
+
+        // 前两个被摘要(包含 "summarized" 标记)
+        assert!(
+            output_1_after.contains("summarized"),
+            "call_old_1 should be summarized: {output_1_after}"
+        );
+        assert!(
+            output_2_after.contains("summarized"),
+            "call_old_2 should be summarized: {output_2_after}"
+        );
+        // 最后一个保持原样
+        assert_eq!(
+            output_3_after, original_output_3,
+            "call_recent should be preserved verbatim"
+        );
+
+        // 验证 archive 文件包含被摘要的原始内容
+        let recalled_1 = crate::tool_result_archive::recall_tool_result(
+            &workspace_root, "call_old_1",
+        )
+        .expect("recall should succeed")
+        .expect("call_old_1 should be archived");
+        assert_eq!(
+            recalled_1.output, original_output_1,
+            "archived output should match original"
+        );
+
+        let recalled_2 = crate::tool_result_archive::recall_tool_result(
+            &workspace_root, "call_old_2",
+        )
+        .expect("recall should succeed")
+        .expect("call_old_2 should be archived");
+        assert_eq!(
+            recalled_2.output, original_output_2,
+            "archived output should match original"
+        );
+
+        // call_recent 不应被归档(未被摘要)
+        let recalled_3 = crate::tool_result_archive::recall_tool_result(
+            &workspace_root, "call_recent",
+        )
+        .expect("recall should succeed");
+        assert!(
+            recalled_3.is_none(),
+            "call_recent should NOT be archived (not summarized)"
+        );
+
+        // 通过 ConversationRuntime.execute_recall_full 验证端到端检索
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(workspace_root);
+
+        let output = runtime
+            .execute_recall_full(r#"{"tool_use_id":"call_old_1"}"#)
+            .expect("recall_full should succeed");
+        assert!(
+            output.contains(original_output_1),
+            "recall_full should return original output: {output}"
+        );
+        assert!(
+            output.contains("call_old_1"),
+            "recall_full should include tool_use_id: {output}"
+        );
     }
 }
