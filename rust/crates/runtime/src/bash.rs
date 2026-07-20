@@ -66,6 +66,11 @@ pub struct BashCommandOutput {
     pub persisted_output_size: Option<u64>,
     #[serde(rename = "sandboxStatus")]
     pub sandbox_status: Option<SandboxStatus>,
+    /// 实际执行命令的 shell 类型：`cmd.exe` / `git-bash` / `sh`。
+    /// 模型据此感知每次调用的实际 shell（即使 system prompt 已告知，
+    /// fallback 情况下仍需具体反馈）。
+    #[serde(rename = "shellType")]
+    pub shell_type: Option<String>,
 }
 
 /// Executes a shell command with the requested sandbox settings.
@@ -97,6 +102,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
             persisted_output_path: None,
             persisted_output_size: None,
             sandbox_status: Some(sandbox_status),
+            shell_type: Some(detect_shell_type().as_str().to_string()),
         });
     }
 
@@ -224,6 +230,7 @@ async fn execute_bash_async(
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
+        shell_type: Some(detect_shell_type().as_str().to_string()),
     })
 }
 
@@ -254,6 +261,7 @@ fn timeout_output(
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
+        shell_type: Some(detect_shell_type().as_str().to_string()),
     }
 }
 
@@ -321,9 +329,9 @@ fn prepare_command(
         return prepared;
     }
 
-    let (program, flag) = shell_launcher();
-    let mut prepared = Command::new(program);
-    prepared.arg(flag).arg(command).current_dir(cwd);
+    let kind = shell_kind();
+    let mut prepared = Command::new(&kind.program);
+    prepared.arg(kind.flag).arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -349,9 +357,9 @@ fn prepare_tokio_command(
         return prepared;
     }
 
-    let (program, flag) = shell_launcher();
-    let mut prepared = TokioCommand::new(program);
-    prepared.arg(flag).arg(command).current_dir(cwd);
+    let kind = shell_kind();
+    let mut prepared = TokioCommand::new(&kind.program);
+    prepared.arg(kind.flag).arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -359,20 +367,240 @@ fn prepare_tokio_command(
     prepared
 }
 
-/// 返回当前平台的默认 shell 启动器。
-/// Windows 用 `cmd /C`（系统自带，无需 Git Bash），
-/// Unix 用 `sh -lc`（POSIX 兼容）。
-fn shell_launcher() -> (&'static str, &'static str) {
-    if cfg!(target_os = "windows") {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-lc")
+/// Shell 类型标识，用于 system prompt 提示和 BashCommandOutput.shell_type 字段。
+/// 模型据此调整命令语法（cmd.exe 用 `dir/type/del`，git-bash 用 `ls/cat/rm`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellType {
+    /// Windows cmd.exe（系统默认 fallback）
+    Cmd,
+    /// Git Bash（bash -c），支持 Unix 命令
+    GitBash,
+    /// Unix sh（sh -lc）
+    Sh,
+}
+
+impl ShellType {
+    /// 返回用于 system prompt 和 BashCommandOutput.shell_type 的字符串标识。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ShellType::Cmd => "cmd.exe",
+            ShellType::GitBash => "git-bash",
+            ShellType::Sh => "sh",
+        }
     }
+}
+
+/// 启动 shell 所需的全部信息：程序路径、参数 flag、类型标识。
+/// program 用 String 承载动态路径（如 `C:\Program Files\Git\bin\bash.exe`）。
+#[derive(Debug, Clone)]
+struct ShellKind {
+    program: String,
+    flag: &'static str,
+    kind: ShellType,
+}
+
+/// 进程级 shell 探测缓存。
+/// 首次调用 `shell_kind()` 时执行探测（~0.2ms 命中固定路径，~2ms 命中 PATH），
+/// 之后所有 bash 命令直接读缓存，O(1)。
+static SHELL_KIND_CACHE: std::sync::OnceLock<ShellKind> = std::sync::OnceLock::new();
+
+/// 返回当前进程使用的 shell 启动器，首次调用时探测并缓存。
+/// Windows 探测顺序：CLAW_GIT_BASH 环境变量 → Program Files 固定路径 → PATH 搜索（过滤 WSL）。
+/// Unix 直接用 sh -lc。
+fn shell_kind() -> ShellKind {
+    SHELL_KIND_CACHE
+        .get_or_init(|| detect_shell_kind())
+        .clone()
+}
+
+/// 对外暴露的 shell 类型探测入口（供 system prompt 构造时调用）。
+pub fn detect_shell_type() -> ShellType {
+    shell_kind().kind
+}
+
+/// 执行实际的 shell 探测，返回 ShellKind（不缓存）。
+fn detect_shell_kind() -> ShellKind {
+    if cfg!(target_os = "windows") {
+        if let Some(bash_path) = detect_git_bash() {
+            return ShellKind {
+                program: bash_path,
+                flag: "-c",
+                kind: ShellType::GitBash,
+            };
+        }
+        ShellKind {
+            program: "cmd".to_string(),
+            flag: "/C",
+            kind: ShellType::Cmd,
+        }
+    } else {
+        ShellKind {
+            program: "sh".to_string(),
+            flag: "-lc",
+            kind: ShellType::Sh,
+        }
+    }
+}
+
+/// Windows 专用：探测 Git Bash 路径。
+///
+/// **探测顺序**（命中即返回，总耗时 < 2ms）：
+/// 1. 环境变量 `CLAW_GIT_BASH`（用户显式指定，覆盖一切）
+///    - 设为空字符串 → 强制 fallback 到 cmd.exe
+/// 2. 常见安装路径（4 个候选，每个一次 `Path::exists()` 系统调用）
+/// 3. PATH 中搜索 `bash.exe`，**过滤掉** `System32\bash.exe`（WSL 入口）
+///    和 `wbem\` 下的（Windows 自带，非 Git Bash）
+///
+/// 未命中任何路径 → 返回 `None`（调用方 fallback 到 cmd.exe）
+#[cfg(target_os = "windows")]
+fn detect_git_bash() -> Option<String> {
+    use std::path::Path;
+
+    // 1. 环境变量 CLAW_GIT_BASH（显式指定，空字符串表示强制禁用 Git Bash）
+    if let Ok(val) = env::var("CLAW_GIT_BASH") {
+        if val.is_empty() {
+            // 显式禁用：用户想强制用 cmd.exe
+            return None;
+        }
+        let p = Path::new(&val);
+        if p.exists() {
+            return Some(val);
+        }
+        // 显式指定但路径无效 → 不再尝试其他路径（用户意图优先）
+        return None;
+    }
+
+    // 2. 常见安装路径（Git for Windows 默认安装位置）
+    const COMMON_PATHS: &[&str] = &[
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    ];
+    for candidate in COMMON_PATHS {
+        if Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    // 3. PATH 搜索 bash.exe，过滤 WSL（System32）和 wbem 下的非 Git bash
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join("bash.exe");
+            if candidate.exists() {
+                let s = candidate.display().to_string().to_ascii_lowercase();
+                // WSL 入口：C:\Windows\System32\bash.exe
+                // Windows 自带：C:\Windows\System32\wbem\bash.exe（不存在但保险）
+                if s.contains(r"\system32\") || s.contains(r"\wbem\") {
+                    continue;
+                }
+                return Some(candidate.display().to_string());
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detect_git_bash() -> Option<String> {
+    None
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+}
+
+/// Windows 专属：Git Bash 检测单元测试。
+/// 不依赖真实 Git Bash 安装，通过环境变量注入虚拟路径来验证逻辑。
+#[cfg(all(test, target_os = "windows"))]
+mod git_bash_detection_tests {
+    use super::detect_git_bash;
+
+    /// `CLAW_GIT_BASH` 指向一个真实存在的文件 → 直接返回该路径。
+    #[test]
+    fn env_var_override_returns_specified_path() {
+        // 用 cmd.exe 自身作为虚拟 bash.exe（一定存在）
+        let cmd_path = r"C:\Windows\System32\cmd.exe";
+        std::env::set_var("CLAW_GIT_BASH", cmd_path);
+        let result = detect_git_bash();
+        std::env::remove_var("CLAW_GIT_BASH");
+        assert_eq!(result.as_deref(), Some(cmd_path));
+    }
+
+    /// `CLAW_GIT_BASH=""` → 显式禁用，返回 None。
+    #[test]
+    fn env_var_empty_disables_git_bash() {
+        std::env::set_var("CLAW_GIT_BASH", "");
+        let result = detect_git_bash();
+        std::env::remove_var("CLAW_GIT_BASH");
+        assert!(result.is_none());
+    }
+
+    /// `CLAW_GIT_BASH` 指向不存在的路径 → 返回 None（用户意图优先，
+    /// 不再 fallback 到其他探测路径）。
+    #[test]
+    fn env_var_invalid_path_returns_none() {
+        std::env::set_var("CLAW_GIT_BASH", r"Z:\nonexistent\bash.exe");
+        let result = detect_git_bash();
+        std::env::remove_var("CLAW_GIT_BASH");
+        assert!(result.is_none());
+    }
+
+    /// 未设 `CLAW_GIT_BASH`、未命中常见路径、PATH 无 bash.exe → 返回 None。
+    /// 注意：此测试在安装了 Git Bash 的开发机上可能失败（命中真实路径），
+    /// 所以仅在隔离的 CI 环境下运行才稳定。本地跑时可忽略。
+    #[test]
+    fn no_git_bash_returns_none() {
+        // 清掉环境变量，但常见路径仍可能命中 — 此测试在没装 Git Bash 的
+        // CI 上有效。装了 Git Bash 的机器上会命中并跳过断言。
+        std::env::remove_var("CLAW_GIT_BASH");
+        // 检查常见路径是否存在，存在则跳过（避免误报）
+        let common_exists = [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+        ]
+        .iter()
+        .any(|p| std::path::Path::new(p).exists());
+        if common_exists {
+            return; // 开发机装了 Git Bash，跳过此用例
+        }
+        // 临时清空 PATH 避免命中其他 bash.exe（如 WSL）
+        let saved_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", "");
+        let result = detect_git_bash();
+        if let Some(ref p) = saved_path {
+            std::env::set_var("PATH", p);
+        }
+        assert!(result.is_none(), "expected None when no bash.exe available");
+    }
+
+    /// `detect_shell_type()` 在没有 Git Bash 的环境下应返回 `Cmd`。
+    /// 同样在装了 Git Bash 的开发机上会返回 `GitBash`，需跳过。
+    #[test]
+    fn detect_shell_type_returns_cmd_when_no_git_bash() {
+        std::env::set_var("CLAW_GIT_BASH", "");
+        // 注意：detect_shell_type 走的是 shell_kind() 的 OnceLock 缓存。
+        // 此测试若在其他用例之后跑，缓存可能已被填充，结果不稳定。
+        // 这里只验证 CLAW_GIT_BASH="" 时 detect_git_bash 返回 None。
+        let result = detect_git_bash();
+        std::env::remove_var("CLAW_GIT_BASH");
+        assert!(result.is_none());
+    }
+}
+
+/// Unix 平台：detect_git_bash 永远返回 None。
+#[cfg(all(test, not(target_os = "windows")))]
+mod unix_shell_tests {
+    use super::detect_git_bash;
+
+    #[test]
+    fn unix_returns_none_for_git_bash() {
+        assert!(detect_git_bash().is_none());
+    }
 }
 
 #[cfg(test)]

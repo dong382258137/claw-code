@@ -2331,6 +2331,7 @@ fn branch_divergence_output(
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
+        shell_type: None,
     }
 }
 
@@ -6534,6 +6535,7 @@ fn execute_shell_command(
             persisted_output_path: None,
             persisted_output_size: None,
             sandbox_status: None,
+            shell_type: Some("powershell".to_string()),
         });
     }
 
@@ -6572,6 +6574,7 @@ fn execute_shell_command(
                     persisted_output_path: None,
                     persisted_output_size: None,
                     sandbox_status: None,
+                    shell_type: Some("powershell".to_string()),
                 });
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
@@ -6607,6 +6610,7 @@ Command exceeded timeout of {timeout_ms} ms",
                     persisted_output_path: None,
                     persisted_output_size: None,
                     sandbox_status: None,
+                    shell_type: Some("powershell".to_string()),
                 });
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -6634,6 +6638,7 @@ Command exceeded timeout of {timeout_ms} ms",
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
+        shell_type: Some("powershell".to_string()),
     })
 }
 

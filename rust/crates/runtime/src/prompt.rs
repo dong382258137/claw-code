@@ -190,6 +190,9 @@ pub struct SystemPromptBuilder {
     output_style_prompt: Option<String>,
     os_name: Option<String>,
     os_version: Option<String>,
+    /// bash 工具实际使用的 shell 类型标识（`cmd.exe` / `git-bash` / `sh`）。
+    /// 模型据此选择正确的命令语法（cmd 用 `dir/type/del`，bash 用 `ls/cat/rm`）。
+    shell_type: Option<String>,
     model_family: Option<ModelFamilyIdentity>,
     append_sections: Vec<String>,
     project_context: Option<ProjectContext>,
@@ -218,6 +221,16 @@ impl SystemPromptBuilder {
     pub fn with_os(mut self, os_name: impl Into<String>, os_version: impl Into<String>) -> Self {
         self.os_name = Some(os_name.into());
         self.os_version = Some(os_version.into());
+        self
+    }
+
+    /// 设置 bash 工具使用的 shell 类型（`cmd.exe` / `git-bash` / `sh`）。
+    /// 该信息会出现在 system prompt 的 Environment context 中，模型据此
+    /// 选择正确的命令语法。Windows 下未检出 Git Bash 时传 `"cmd.exe"`，
+    /// 模型会看到对应提示改用 Windows 命令。
+    #[must_use]
+    pub fn with_shell(mut self, shell_type: impl Into<String>) -> Self {
+        self.shell_type = Some(shell_type.into());
         self
     }
 
@@ -359,7 +372,7 @@ impl SystemPromptBuilder {
         );
         let identity = self.model_family.unwrap_or_default();
         let mut lines = vec!["# Environment context".to_string()];
-        lines.extend(prepend_bullets(vec![
+        let mut bullets = vec![
             format!("Model family: {}", identity.family_label()),
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
@@ -368,7 +381,21 @@ impl SystemPromptBuilder {
                 self.os_name.as_deref().unwrap_or("unknown"),
                 self.os_version.as_deref().unwrap_or("unknown")
             ),
-        ]));
+        ];
+        // Shell 类型 + cmd.exe 专属提示：模型在 Windows cmd.exe 下需要
+        // 显式告知避免使用 Unix 命令（ls/cat/grep/rm 等会失败）。
+        // 检出 Git Bash 时只标类型，模型可正常使用 Unix 命令。
+        if let Some(shell) = self.shell_type.as_deref() {
+            bullets.push(format!("Shell: {shell}"));
+            if shell == "cmd.exe" {
+                bullets.push(
+                    "Note: Unix commands (ls, cat, grep, rm, head, printf, pwd) are unavailable. \
+                     Use Windows equivalents (dir, type, findstr, del, more, echo, cd)."
+                        .to_string(),
+                );
+            }
+        }
+        lines.extend(prepend_bullets(bullets));
         lines.join("\n")
     }
 }
@@ -667,8 +694,13 @@ pub fn load_system_prompt_with_extras(
     let cwd = cwd.into();
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let config = ConfigLoader::default_for(&cwd).load()?;
+    // 探测当前进程的 bash shell 类型并注入 system prompt。
+    // Windows 下会检测 Git Bash；未检出时模型会看到 "cmd.exe" + Unix 命令不可用提示。
+    // 探测结果在进程内缓存（OnceLock），此处调用 O(1)。
+    let shell_type = crate::bash::detect_shell_type();
     let mut builder = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
+        .with_shell(shell_type.as_str())
         .with_model_family(model_family)
         .with_project_context(project_context)
         .with_runtime_config(config);
