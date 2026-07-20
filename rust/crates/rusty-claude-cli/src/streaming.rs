@@ -87,6 +87,22 @@ pub(crate) enum StatusEvent {
 
 pub(crate) const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// P3:事件间超时 — 两个相邻 SSE 事件之间的最大等待时间。
+///
+/// 设计依据:
+/// - 流式响应(SSE)中,两个事件之间的间隔通常 < 1s(模型逐 token 生成)
+/// - 如果 60s 内无任何新事件,说明:
+///   * 网络静默挂起(TCP 连接存活但无数据)
+///   * 服务端处理卡住(模型推理死锁)
+///   * 中间代理(如 Cloudflare)缓冲异常
+/// - 60s 是经验值:足够宽容以容纳模型长思考(如 extended thinking),
+///   又足够严格以避免用户无限等待
+/// - 与 `http_client.rs` 故意不设 `.timeout()` 的设计协同:
+///   总请求超时会错误中止合法的长流式响应,而事件间超时只检测
+///   "卡住"状态,不影响正常的长流式传输
+/// - 超时标记为 recoverable=true,允许上层重试
+pub(crate) const INTER_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(crate) struct HookAbortMonitor {
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
@@ -412,27 +428,36 @@ impl AnthropicRuntimeClient {
         let mut received_any_event = false;
 
         loop {
-            let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        // P0-1 修复 #2/9：超时分支内 next_event 失败。
-                        let msg = format_user_visible_api_error(&self.session_id, &error);
-                        self.emit_stream_error(msg, false)
-                    })?,
-                    Err(_elapsed) => {
-                        // P0-1 修复 #3/9：post-tool stall 超时（10s 内无事件）。
-                        return Err(self.emit_stream_error(
-                            "post-tool stall: model did not respond within timeout",
-                            true,
-                        ));
-                    }
-                }
+            // P3:事件间超时保护 — 统一用 tokio::time::timeout 包装 next_event。
+            // - post-tool 场景的首事件:POST_TOOL_STALL_TIMEOUT(10s,严格)
+            //   理由:post-tool 续写应该很快开始,10s 足够
+            // - 其他所有情况(非 post-tool 首事件 + 所有后续事件):
+            //   INTER_EVENT_TIMEOUT(60s,宽容)
+            //   理由:模型可能进行长思考(extended thinking),60s 容纳正常长流式
+            let timeout_duration = if apply_stall_timeout && !received_any_event {
+                POST_TOOL_STALL_TIMEOUT
             } else {
-                stream.next_event().await.map_err(|error| {
-                    // P0-1 修复 #4/9：非超时分支 next_event 失败。
+                INTER_EVENT_TIMEOUT
+            };
+            let next = match tokio::time::timeout(timeout_duration, stream.next_event()).await {
+                Ok(inner) => inner.map_err(|error| {
+                    // P0-1 修复 #2/9：超时分支内 next_event 失败。
                     let msg = format_user_visible_api_error(&self.session_id, &error);
                     self.emit_stream_error(msg, false)
-                })?
+                })?,
+                Err(_elapsed) => {
+                    // P0-1 修复 #3/9 + P3 扩展:stall 超时。
+                    // 区分两种 stall 场景,提供更精确的错误消息:
+                    let msg = if apply_stall_timeout && !received_any_event {
+                        // post-tool 首事件 stall(10s 内无事件)
+                        "post-tool stall: model did not respond within timeout"
+                    } else {
+                        // P3 新增:事件间 stall(60s 内无新事件)
+                        // 这包括:非 post-tool 首事件 stall + 后续事件 stall
+                        "inter-event stall: stream stalled waiting for next event (60s timeout)"
+                    };
+                    return Err(self.emit_stream_error(msg, true));
+                }
             };
 
             let Some(event) = next else {
