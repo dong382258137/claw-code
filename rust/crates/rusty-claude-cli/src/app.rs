@@ -1025,8 +1025,10 @@ impl LiveCli {
                 false
             }
             SlashCommand::Ultraplan { task } => {
+                // Step 2.1:对接 runtime planner。
+                // 返回 true 表示 plan mode 状态变更,需要 persist session。
                 self.run_ultraplan(task.as_deref())?;
-                false
+                true
             }
             SlashCommand::Teleport { target } => {
                 Self::run_teleport(target.as_deref())?;
@@ -1958,8 +1960,54 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_ultraplan(&self, task: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_ultraplan_report(task));
+    /// Step 2.1:对接 `/ultraplan` CLI 命令到 runtime planner。
+    ///
+    /// 行为:
+    /// - 启用 plan mode(本会话内生效,无需 `--enable-plan-mode` CLI flag)。
+    /// - 设置 workspace_root(若未设置),用于 PlanArtifact 持久化到
+    ///   `<workspace>/.claw/plans/<id>.json`。
+    /// - 若提供 `task` → 立即触发 `run_turn(task)`,让 runtime 内部的
+    ///   `assess_complexity` 自动检测为 Complex 并创建 PlanArtifact。
+    ///   PlanArtifact 通过末尾追加到 dynamic_sections 注入,不污染缓存
+    ///   绝对/半稳定区(§5.2 缓存保护)。
+    /// - 若未提供 `task` → 仅打印提示信息,等用户后续输入触发 plan。
+    ///
+    /// 与 `--enable-plan-mode` CLI flag 的区别:
+    /// - `--enable-plan-mode`:整个会话启用 plan mode,所有复杂任务都触发。
+    /// - `/ultraplan`:本会话启用 plan mode,且若提供 task 则立即触发一次。
+    fn run_ultraplan(
+        &mut self,
+        task: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // 启用 plan mode(若已启用则幂等)。
+        self.runtime.set_plan_mode_enabled(true);
+        // 设置 workspace_root(若未设置)— 用于 PlanArtifact 持久化。
+        if self.runtime.active_plan().is_none() {
+            // 只有 runtime 没有活跃 plan 时才设置,避免覆盖已有 workspace。
+            // 通过检查 workspace_root 是否已设置决定。
+            // 注意:runtime 没有公开 workspace_root() getter,这里保守地
+            // 总是设置(若已设置会被相同值覆盖,无副作用)。
+            let cwd = std::env::current_dir()?;
+            self.runtime.set_workspace_root(cwd);
+        }
+
+        let plan_enabled_msg = "Plan mode enabled. Complex tasks (>200 chars or matching keywords) will trigger Plan→Execute→Review cycle.";
+        if !self.tui_println(plan_enabled_msg) {
+            println!("{plan_enabled_msg}");
+        }
+
+        if let Some(task) = task.map(str::trim).filter(|s| !s.is_empty()) {
+            // 有 task → 立即触发 run_turn,让 runtime 自动通过 assess_complexity
+            // 检测并创建 PlanArtifact。run_turn 会处理 plan 的整个生命周期
+            // (Plan → Execute → Review → Replan/AllPassed/Failed)。
+            self.run_turn(task)?;
+        } else {
+            // 无 task → 仅启用 plan mode,提示用户后续输入。
+            let hint = "Now enter your task. The runtime will auto-detect complexity and create a PlanArtifact for complex tasks.";
+            if !self.tui_println(hint) {
+                println!("{hint}");
+            }
+        }
         Ok(())
     }
 
