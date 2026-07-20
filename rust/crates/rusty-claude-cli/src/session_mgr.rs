@@ -521,6 +521,35 @@ pub(crate) fn run_resume_command(
                 json: Some(json),
             })
         }
+        SlashCommand::Search { query } => {
+            let q = query.as_deref().unwrap_or("");
+            let results = search_session_history(session, q);
+            let message = if results.is_empty() {
+                format!("Search\n  Query           {q}\n  Result           no matches found")
+            } else {
+                let mut msg = format!("Search\n  Query           {q}\n  Matches          {}\n\n", results.len());
+                for (i, (idx, preview)) in results.iter().take(20).enumerate() {
+                    msg.push_str(&format!("  {}. [msg {idx}] {preview}\n", i + 1));
+                }
+                if results.len() > 20 {
+                    msg.push_str(&format!("\n  ... and {} more matches\n", results.len() - 20));
+                }
+                msg
+            };
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: None,
+            })
+        }
+        SlashCommand::Undo => {
+            // Undo not supported in resume (non-interactive) mode
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some("Undo\n  Result           not available in resumed mode\n  Detail           start an interactive session to use /undo".to_string()),
+                json: None,
+            })
+        }
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_version_report()),
@@ -740,6 +769,173 @@ pub(crate) fn run_resume_command(
     }
 }
 
+/// Search the conversation history for a (case-insensitive) substring.
+///
+/// Returns a list of `(message_index, preview)` tuples for messages whose
+/// text content (Text/Thinking/ToolUse input/ToolResult output) contains the
+/// query. An empty query matches every message. Previews are truncated to
+/// 80 characters and collapse newlines so they render nicely on a single
+/// line in the result list.
+pub(crate) fn search_session_history(session: &Session, query: &str) -> Vec<(usize, String)> {
+    let needle = query.to_lowercase();
+    let mut hits = Vec::new();
+    for (idx, msg) in session.messages.iter().enumerate() {
+        let role_label = match msg.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+            MessageRole::System => "system",
+        };
+        for block in &msg.blocks {
+            let candidate: Option<String> = match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    Some(format!("[{name}] {input}"))
+                }
+                ContentBlock::ToolResult {
+                    tool_name, output, ..
+                } => Some(format!("[{tool_name} result] {output}")),
+            };
+            let Some(text) = candidate else { continue };
+            if needle.is_empty() || text.to_lowercase().contains(&needle) {
+                let preview = build_search_preview(role_label, &text);
+                hits.push((idx, preview));
+                break; // one preview per message
+            }
+        }
+    }
+    hits
+}
+
+fn build_search_preview(role_label: &str, text: &str) -> String {
+    let collapsed: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let trimmed = collapsed.trim();
+    const MAX_PREVIEW: usize = 80;
+    let truncated: String = trimmed.chars().take(MAX_PREVIEW).collect();
+    let suffix = if trimmed.chars().count() > MAX_PREVIEW {
+        "…"
+    } else {
+        ""
+    };
+    format!("[{role_label}] {truncated}{suffix}")
+}
+
+/// Undo the most recent file-editing tool call in the session.
+///
+/// Walks the message history backwards looking for the latest ToolUse whose
+/// name is `Edit` or `Write`, locates its ToolResult, parses the
+/// `originalFile` field from the result envelope, and restores the file to
+/// that pre-edit contents (or deletes it if `Write` created a new file).
+///
+/// Returns a human-readable status line describing what was undone.
+pub(crate) fn undo_last_file_edit(session: &Session) -> String {
+    // Walk blocks in reverse order across messages (newest first) to find
+    // the most recent file-editing ToolUse.
+    let mut target_tool_use_id: Option<String> = None;
+    let mut target_tool_name: Option<String> = None;
+    let mut target_input: Option<String> = None;
+    'outer: for msg in session.messages.iter().rev() {
+        for block in &msg.blocks {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                if name == "Edit" || name == "Write" {
+                    target_tool_use_id = Some(id.clone());
+                    target_tool_name = Some(name.clone());
+                    target_input = Some(input.clone());
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    let (Some(tool_use_id), Some(tool_name), Some(input_json)) =
+        (target_tool_use_id, target_tool_name, target_input)
+    else {
+        return "Undo\n  Result           nothing to undo\n  Detail           no file edits found in this session".to_string();
+    };
+
+    // Parse the input JSON for filePath.
+    let input_value: Value = match serde_json::from_str(&input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            return format!(
+                "Undo\n  Result           failed\n  Detail           could not parse tool input: {e}"
+            );
+        }
+    };
+    let file_path = input_value
+        .get("filePath")
+        .or_else(|| input_value.get("file_path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if file_path.is_empty() {
+        return "Undo\n  Result           failed\n  Detail           tool input missing filePath".to_string();
+    }
+
+    // Find the matching ToolResult and parse originalFile from its output.
+    let mut original_file: Option<Option<String>> = None; // outer Option = found; inner = had original
+    for msg in &session.messages {
+        for block in &msg.blocks {
+            if let ContentBlock::ToolResult {
+                tool_use_id: tuid,
+                output,
+                is_error,
+                ..
+            } = block
+            {
+                if tuid == &tool_use_id {
+                    if *is_error {
+                        return format!(
+                            "Undo\n  Result           skipped\n  Detail           original tool call errored; nothing to undo\n  File             {file_path}"
+                        );
+                    }
+                    let output_value: Value = serde_json::from_str(output).unwrap_or(Value::Null);
+                    // EditFileOutput.original_file is always present (String).
+                    // WriteFileOutput.original_file is Option<String> (null on create).
+                    if let Some(orig) = output_value.get("originalFile").and_then(|v| v.as_str()) {
+                        original_file = Some(Some(orig.to_string()));
+                    } else if output_value.get("originalFile").is_some() {
+                        // originalFile present but null → Write created a new file.
+                        original_file = Some(None);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let Some(maybe_original) = original_file else {
+        return format!(
+            "Undo\n  Result           failed\n  Detail           no tool result recorded for {tool_name} call\n  File             {file_path}"
+        );
+    };
+
+    match maybe_original {
+        Some(content) => match fs::write(file_path, content) {
+            Ok(()) => format!(
+                "Undo\n  Result           restored\n  Tool             {tool_name}\n  File             {file_path}"
+            ),
+            Err(e) => format!(
+                "Undo\n  Result           failed\n  Detail           could not write file: {e}\n  File             {file_path}"
+            ),
+        },
+        None => {
+            // Write created a new file → delete it.
+            match fs::remove_file(file_path) {
+                Ok(()) => format!(
+                    "Undo\n  Result           deleted (was a new file)\n  Tool             {tool_name}\n  File             {file_path}"
+                ),
+                Err(e) => format!(
+                    "Undo\n  Result           failed\n  Detail           could not delete file: {e}\n  File             {file_path}"
+                ),
+            }
+        }
+    }
+}
+
 pub(crate) fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(current_session_store()?.sessions_dir().to_path_buf())
 }
@@ -881,6 +1077,117 @@ pub(crate) fn confirm_session_deletion(session_id: &str) -> bool {
         return false;
     }
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+}
+
+/// Render a single session line for the interactive picker.
+fn render_session_picker_line(idx: usize, session: &ManagedSessionSummary, is_active: bool) -> String {
+    let marker = if is_active { "*" } else { " " };
+    let lineage = match (
+        session.branch_name.as_deref(),
+        session.parent_session_id.as_deref(),
+    ) {
+        (Some(branch_name), Some(parent_session_id)) => {
+            format!(" branch={branch_name} from={parent_session_id}")
+        }
+        (None, Some(parent_session_id)) => format!(" from={parent_session_id}"),
+        (Some(branch_name), None) => format!(" branch={branch_name}"),
+        (None, None) => String::new(),
+    };
+    format!(
+        "  {marker} [{idx:>3}] {id:<20} msgs={msgs:<4} modified={modified}{lineage}",
+        id = session.id,
+        msgs = session.message_count,
+        modified = format_session_modified_age(session.modified_epoch_millis),
+        lineage = lineage,
+    )
+}
+
+/// Substring (case-insensitive) fuzzy match against the session id,
+/// branch name, or parent session id.
+fn session_matches_filter(session: &ManagedSessionSummary, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let needle = filter.to_lowercase();
+    let haystacks = [
+        session.id.as_str(),
+        session
+            .branch_name
+            .as_deref()
+            .unwrap_or(""),
+        session
+            .parent_session_id
+            .as_deref()
+            .unwrap_or(""),
+    ];
+    haystacks
+        .iter()
+        .any(|haystack| haystack.to_lowercase().contains(&needle))
+}
+
+/// Interactive session picker.
+///
+/// Lists managed sessions sorted by most-recently-modified first, then loops
+/// reading user input:
+///   - empty input / "q" / "quit" → cancel, return None
+///   - a positive integer N       → pick filtered[N-1] and return it
+///   - any other text             → use as new fuzzy filter and re-render
+///
+/// The active session id is highlighted with `*` so the user knows where
+/// they currently are.
+pub(crate) fn interactive_session_pick(
+    active_session_id: &str,
+) -> Result<Option<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    let mut sessions = list_managed_sessions()?;
+    // Sort newest-first by modified_epoch_millis.
+    sessions.sort_by(|a, b| b.modified_epoch_millis.cmp(&a.modified_epoch_millis));
+
+    if sessions.is_empty() {
+        println!("No managed sessions saved yet.");
+        return Ok(None);
+    }
+
+    let mut filter = String::new();
+    loop {
+        let filtered: Vec<&ManagedSessionSummary> = sessions
+            .iter()
+            .filter(|s| session_matches_filter(s, &filter))
+            .collect();
+
+        println!();
+        println!("Sessions  (filter: {:?}, {} of {} shown)", filter, filtered.len(), sessions.len());
+        if filtered.is_empty() {
+            println!("  No sessions match the current filter.");
+        } else {
+            for (i, session) in filtered.iter().enumerate() {
+                let is_active = session.id == active_session_id;
+                println!("{}", render_session_picker_line(i + 1, session, is_active));
+            }
+        }
+        println!();
+        print!("filter or pick [1-{}] (empty=cancel, q=cancel): ", filtered.len());
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return Ok(None);
+        }
+        let trimmed = input.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("quit") {
+            return Ok(None);
+        }
+        // Numeric → pick
+        if let Ok(n) = trimmed.parse::<usize>() {
+            if n >= 1 && n <= filtered.len() {
+                let picked = filtered[n - 1].clone();
+                return Ok(Some(picked));
+            }
+            println!("  Index out of range (1-{}).", filtered.len());
+            continue;
+        }
+        // Otherwise treat as new filter.
+        filter = trimmed.to_string();
+    }
 }
 
 pub(crate) fn session_details_json(sessions: &[ManagedSessionSummary]) -> Vec<serde_json::Value> {
@@ -1440,4 +1747,311 @@ pub(crate) fn render_session_markdown(session: &Session, session_id: &str, sessi
         }
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime::{ConversationMessage, Session};
+
+    fn build_session_with_blocks(blocks: Vec<ContentBlock>, role: MessageRole) -> Session {
+        let mut session = Session::new();
+        session.messages.push(ConversationMessage {
+            role,
+            blocks,
+            usage: None,
+        });
+        session
+    }
+
+    fn text_block(text: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: text.to_string(),
+        }
+    }
+
+    fn tool_use_block(id: &str, name: &str, input: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: input.to_string(),
+        }
+    }
+
+    fn tool_result_block(id: &str, name: &str, output: &str, is_error: bool) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            tool_name: name.to_string(),
+            output: output.to_string(),
+            is_error,
+        }
+    }
+
+    #[test]
+    fn search_returns_empty_for_no_matches() {
+        let session = build_session_with_blocks(
+            vec![text_block("hello world")],
+            MessageRole::User,
+        );
+        let results = search_session_history(&session, "nonexistent");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_finds_case_insensitive_match() {
+        let session = build_session_with_blocks(
+            vec![text_block("Hello World")],
+            MessageRole::User,
+        );
+        let results = search_session_history(&session, "WORLD");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0);
+        // Preview preserves original casing.
+        assert!(results[0].1.contains("Hello World"));
+    }
+
+    #[test]
+    fn search_empty_query_matches_everything() {
+        let session = build_session_with_blocks(
+            vec![text_block("anything goes")],
+            MessageRole::Assistant,
+        );
+        let results = search_session_history(&session, "");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.starts_with("[assistant]"));
+    }
+
+    #[test]
+    fn search_matches_tool_use_input() {
+        let session = build_session_with_blocks(
+            vec![tool_use_block(
+                "tu_1",
+                "Edit",
+                r#"{"filePath":"/tmp/foo.rs","oldString":"a","newString":"b"}"#,
+            )],
+            MessageRole::Assistant,
+        );
+        let results = search_session_history(&session, "foo.rs");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("[Edit]"));
+    }
+
+    #[test]
+    fn search_one_preview_per_message_even_with_multiple_matches() {
+        let session = build_session_with_blocks(
+            vec![
+                text_block("first match here"),
+                text_block("second match here"),
+            ],
+            MessageRole::User,
+        );
+        let results = search_session_history(&session, "match");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_preview_truncates_long_text() {
+        let long_text = "a".repeat(200);
+        let session = build_session_with_blocks(
+            vec![text_block(&long_text)],
+            MessageRole::User,
+        );
+        let results = search_session_history(&session, "a");
+        assert_eq!(results.len(), 1);
+        // preview = "[user] " (7 chars) + 80 'a' + "…" = 88 chars
+        let preview = &results[0].1;
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview.chars().count(), 88);
+    }
+
+    #[test]
+    fn undo_nothing_to_undo_when_no_file_edits() {
+        let session = build_session_with_blocks(
+            vec![text_block("just chatting")],
+            MessageRole::User,
+        );
+        let message = undo_last_file_edit(&session);
+        assert!(message.contains("nothing to undo"));
+    }
+
+    #[test]
+    fn undo_skipped_when_tool_call_errored() {
+        let session = build_session_with_blocks(
+            vec![
+                tool_use_block(
+                    "tu_1",
+                    "Edit",
+                    r#"{"filePath":"/nonexistent/path.rs","oldString":"a","newString":"b"}"#,
+                ),
+                tool_result_block("tu_1", "Edit", "old_string not found in file", true),
+            ],
+            MessageRole::Assistant,
+        );
+        let message = undo_last_file_edit(&session);
+        assert!(message.contains("skipped"));
+        assert!(message.contains("errored"));
+    }
+
+    #[test]
+    fn undo_finds_latest_edit_among_multiple_tools() {
+        // Mix a Read (ignored) and two Edits; the latest Edit should be picked.
+        let mut session = Session::new();
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![
+                tool_use_block("tu_1", "Read", r#"{"filePath":"/tmp/a.rs"}"#),
+                tool_use_block(
+                    "tu_2",
+                    "Edit",
+                    r#"{"filePath":"/tmp/older.rs","oldString":"a","newString":"b"}"#,
+                ),
+            ],
+            usage: None,
+        });
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![tool_use_block(
+                "tu_3",
+                "Edit",
+                r#"{"filePath":"/tmp/newer.rs","oldString":"x","newString":"y"}"#,
+            )],
+            usage: None,
+        });
+        // Don't actually run undo (file doesn't exist on disk); instead
+        // verify we got past the "nothing to undo" guard and into the
+        // "no tool result recorded" branch for the newest tool.
+        let message = undo_last_file_edit(&session);
+        assert!(
+            message.contains("no tool result recorded") || message.contains("failed"),
+            "got: {message}"
+        );
+        assert!(message.contains("/tmp/newer.rs"));
+    }
+
+    #[test]
+    fn undo_missing_file_path_in_input_returns_failed() {
+        let session = build_session_with_blocks(
+            vec![
+                tool_use_block("tu_1", "Edit", r#"{"oldString":"a","newString":"b"}"#),
+                tool_result_block(
+                    "tu_1",
+                    "Edit",
+                    r#"{"filePath":"/tmp/x","originalFile":"a"}"#,
+                    false,
+                ),
+            ],
+            MessageRole::Assistant,
+        );
+        let message = undo_last_file_edit(&session);
+        assert!(message.contains("missing filePath"));
+    }
+
+    // ===== Session picker tests =====
+
+    fn picker_session(id: &str, modified: u128, branch: Option<&str>, parent: Option<&str>) -> ManagedSessionSummary {
+        ManagedSessionSummary {
+            id: id.to_string(),
+            path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            updated_at_ms: modified as u64,
+            modified_epoch_millis: modified,
+            message_count: 10,
+            parent_session_id: parent.map(str::to_string),
+            branch_name: branch.map(str::to_string),
+            lifecycle: SessionLifecycleSummary {
+                kind: SessionLifecycleKind::SavedOnly,
+                pane_id: None,
+                pane_command: None,
+                pane_path: None,
+                workspace_dirty: false,
+                abandoned: false,
+            },
+        }
+    }
+
+    #[test]
+    fn picker_filter_empty_matches_all() {
+        let sessions = vec![
+            picker_session("abc123", 1000, None, None),
+            picker_session("xyz789", 2000, Some("feature"), None),
+        ];
+        let filtered: Vec<_> = sessions
+            .iter()
+            .filter(|s| session_matches_filter(s, ""))
+            .collect();
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn picker_filter_matches_id_case_insensitive() {
+        let sessions = vec![
+            picker_session("Abc123", 1000, None, None),
+            picker_session("xyz789", 2000, None, None),
+        ];
+        let filtered: Vec<_> = sessions
+            .iter()
+            .filter(|s| session_matches_filter(s, "ABC"))
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "Abc123");
+    }
+
+    #[test]
+    fn picker_filter_matches_branch_name() {
+        let sessions = vec![
+            picker_session("abc123", 1000, None, None),
+            picker_session("xyz789", 2000, Some("feature-branch"), None),
+        ];
+        let filtered: Vec<_> = sessions
+            .iter()
+            .filter(|s| session_matches_filter(s, "feature"))
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "xyz789");
+    }
+
+    #[test]
+    fn picker_filter_matches_parent_session_id() {
+        let sessions = vec![
+            picker_session("abc123", 1000, None, None),
+            picker_session("fork-1", 2000, Some("dev"), Some("abc123")),
+        ];
+        let filtered: Vec<_> = sessions
+            .iter()
+            .filter(|s| session_matches_filter(s, "abc123"))
+            .collect();
+        // Both match: "abc123" by id, "fork-1" by parent_session_id.
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn picker_filter_no_matches_returns_empty() {
+        let sessions = vec![
+            picker_session("abc123", 1000, None, None),
+            picker_session("xyz789", 2000, None, None),
+        ];
+        let filtered: Vec<_> = sessions
+            .iter()
+            .filter(|s| session_matches_filter(s, "nonexistent"))
+            .collect();
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn picker_render_line_marks_active_session() {
+        let session = picker_session("abc123", 1000, None, None);
+        let active_line = render_session_picker_line(1, &session, true);
+        let inactive_line = render_session_picker_line(1, &session, false);
+        // Active uses '*', inactive uses ' '.
+        assert!(active_line.contains("* ["));
+        assert!(inactive_line.contains("  [") && !inactive_line.contains('*'));
+        assert!(active_line.contains("abc123"));
+    }
+
+    #[test]
+    fn picker_render_line_includes_lineage() {
+        let session = picker_session("fork-1", 1000, Some("dev"), Some("parent-1"));
+        let line = render_session_picker_line(1, &session, false);
+        assert!(line.contains("branch=dev"));
+        assert!(line.contains("from=parent-1"));
+    }
 }

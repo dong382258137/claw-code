@@ -2765,6 +2765,35 @@ fn completion_candidates_include_workflow_shortcuts_and_dynamic_sessions() {
 }
 
 #[test]
+fn completion_candidates_include_new_search_undo_pick_subcommands() {
+    let completions = slash_command_completion_candidates_with_sessions(
+        "sonnet",
+        Some("active"),
+        vec!["recent-1".to_string(), "recent-2".to_string()],
+    );
+
+    // New top-level commands
+    assert!(completions.contains(&"/search ".to_string()));
+    assert!(completions.contains(&"/undo".to_string()));
+
+    // /session pick is now a Tab-completable subcommand
+    assert!(completions.contains(&"/session pick".to_string()));
+    assert!(completions.contains(&"/session pick active".to_string()));
+    assert!(completions.contains(&"/session pick recent-1".to_string()));
+    assert!(completions.contains(&"/session pick recent-2".to_string()));
+
+    // /session exists and /session delete also gain per-session candidates
+    assert!(completions.contains(&"/session exists active".to_string()));
+    assert!(completions.contains(&"/session exists recent-1".to_string()));
+    assert!(completions.contains(&"/session delete recent-1".to_string()));
+    assert!(completions.contains(&"/session delete recent-2".to_string()));
+
+    // /session fork has both bare and arg-prefixed forms
+    assert!(completions.contains(&"/session fork".to_string()));
+    assert!(completions.contains(&"/session fork ".to_string()));
+}
+
+#[test]
 fn startup_banner_mentions_workflow_completions() {
     let _guard = env_lock();
     // Inject dummy credentials so LiveCli can construct without real Anthropic key

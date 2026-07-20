@@ -284,7 +284,25 @@ impl McpLifecycleValidator {
             | (McpLifecyclePhase::ErrorSurfacing, McpLifecyclePhase::Ready)
             | (McpLifecyclePhase::ErrorSurfacing, McpLifecyclePhase::Shutdown)
             | (McpLifecyclePhase::Shutdown, McpLifecyclePhase::Cleanup) => true,
-            (_, McpLifecyclePhase::Shutdown) => from != McpLifecyclePhase::Cleanup,
+            // BUG-P2-2: previously this arm was
+            //   `(_, McpLifecyclePhase::Shutdown) => from != McpLifecyclePhase::Cleanup`
+            // which allowed transitioning to Shutdown from *any* phase
+            // except Cleanup — including early phases like ConfigLoad /
+            // ServerRegistration that have no spawned resources to tear
+            // down. Skipping ErrorSurfacing from those phases loses the
+            // failure context. Now only phases that have actually
+            // spawned / initialized a server may go straight to Shutdown;
+            // early phases must route through ErrorSurfacing first.
+            (_, McpLifecyclePhase::Shutdown) => matches!(
+                from,
+                McpLifecyclePhase::SpawnConnect
+                    | McpLifecyclePhase::InitializeHandshake
+                    | McpLifecyclePhase::ToolDiscovery
+                    | McpLifecyclePhase::ResourceDiscovery
+                    | McpLifecyclePhase::Ready
+                    | McpLifecyclePhase::Invocation
+                    | McpLifecyclePhase::ErrorSurfacing
+            ),
             (_, McpLifecyclePhase::ErrorSurfacing) => {
                 from != McpLifecyclePhase::Cleanup && from != McpLifecyclePhase::Shutdown
             }

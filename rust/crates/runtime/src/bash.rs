@@ -104,12 +104,18 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
 }
 
-/// Detect git push to main and emit ship provenance event
+/// Detect git push to main and emit ship provenance event.
+///
+/// BUG-P2-3: previously the constructed `LaneEvent` was bound to `_event`
+/// and dropped immediately at the end of the `if` block — the event was
+/// never actually published to any sink. The `eprintln!` log line was
+/// the only observable side effect. We now push the event into the
+/// process-wide lane event sink (if configured) so downstream consumers
+/// (lane completion detector, ship dashboard, etc.) actually observe it.
 fn detect_and_emit_ship_prepared(command: &str) {
     let trimmed = command.trim();
     // Simple detection: git push with main/master
     if trimmed.contains("git push") && (trimmed.contains("main") || trimmed.contains("master")) {
-        // Emit ship.prepared event
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -123,12 +129,16 @@ fn detect_and_emit_ship_prepared(command: &str) {
             actor: get_git_actor().unwrap_or_else(|| "unknown".to_string()),
             pr_number: None,
         };
-        let _event = LaneEvent::ship_prepared(format!("{now}"), &provenance);
-        // Log to stderr as interim routing before event stream integration
-        eprintln!(
-            "[ship.prepared] branch={} -> main, commits={}, actor={}",
-            provenance.source_branch, provenance.commit_count, provenance.actor
-        );
+        let event = LaneEvent::ship_prepared(format!("{now}"), &provenance);
+        // Publish to the global lane event sink. If no sink is configured
+        // (e.g., in tests or standalone CLI use), fall back to stderr so
+        // the event is at least observable.
+        if !crate::lane_events::try_publish(event) {
+            eprintln!(
+                "[ship.prepared] (no sink) branch={} -> main, commits={}, actor={}",
+                provenance.source_branch, provenance.commit_count, provenance.actor
+            );
+        }
     }
 }
 
@@ -311,8 +321,9 @@ fn prepare_command(
         return prepared;
     }
 
-    let mut prepared = Command::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    let (program, flag) = shell_launcher();
+    let mut prepared = Command::new(program);
+    prepared.arg(flag).arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -338,13 +349,25 @@ fn prepare_tokio_command(
         return prepared;
     }
 
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    let (program, flag) = shell_launcher();
+    let mut prepared = TokioCommand::new(program);
+    prepared.arg(flag).arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
     prepared
+}
+
+/// 返回当前平台的默认 shell 启动器。
+/// Windows 用 `cmd /C`（系统自带，无需 Git Bash），
+/// Unix 用 `sh -lc`（POSIX 兼容）。
+fn shell_launcher() -> (&'static str, &'static str) {
+    if cfg!(target_os = "windows") {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-lc")
+    }
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {

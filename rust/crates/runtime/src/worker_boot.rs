@@ -12,11 +12,14 @@
 //! detection/recovery all live above raw terminal transport.
 
 use std::collections::HashMap;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::mcp_lifecycle_hardened::McpLifecyclePhase;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -124,19 +127,118 @@ pub enum StartupFailureClassification {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartupHealthSummary {
-    /// Whether this subsystem appeared healthy at timeout.
+    /// Whether this subsystem appeared healthy at probe time.
     pub healthy: bool,
-    /// Stable placeholder/source string until deeper transport and MCP probes are wired in.
+    /// Stable `<kind>_<status>` summary string produced by [`StartupHealthSummary::observed`]
+    /// or [`StartupHealthSummary::probed`]. The `_placeholder` suffix that previously appeared
+    /// here has been removed (see `docs/harness-engineering-optimization-plan.md` Step 1.3);
+    /// callers reading this field can rely on the `kind_status` shape without further parsing.
     pub summary: String,
+    /// Optional probe detail supplied by real transport/MCP probes (e.g. "tcp connect ok in 12ms",
+    /// "mcp lifecycle phase=Running"). `None` for the legacy `observed` factory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl StartupHealthSummary {
+    /// Legacy factory: record a subsystem health observation without extra detail.
+    ///
+    /// Produces `summary = "{name}_{status}"` (e.g. `"transport_healthy"`, `"mcp_unhealthy"`).
+    /// Prefer [`StartupHealthSummary::probed`] when the caller has real probe output to attach.
     fn observed(name: &str, healthy: bool) -> Self {
         let status = if healthy { "healthy" } else { "unhealthy" };
         Self {
             healthy,
-            summary: format!("{name}_{status}_placeholder"),
+            summary: format!("{name}_{status}"),
+            detail: None,
         }
+    }
+
+    /// Factory for real probes: attaches a detail string describing what the probe observed.
+    ///
+    /// Use this when the caller has executed an actual probe (TCP connect, MCP lifecycle
+    /// validator query, etc.) and wants to surface the raw outcome alongside the
+    /// healthy boolean. The `summary` field is still `"{name}_{status}"` so downstream
+    /// parsers stay stable.
+    pub fn probed(name: &str, healthy: bool, detail: impl Into<String>) -> Self {
+        let status = if healthy { "healthy" } else { "unhealthy" };
+        Self {
+            healthy,
+            summary: format!("{name}_{status}"),
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+/// Probe transport health by attempting a TCP connection with a short timeout.
+///
+/// Returns a [`StartupHealthSummary`] via [`StartupHealthSummary::probed`] with
+/// the connect result and latency detail (e.g. `"tcp connect ok in 12ms"` or
+/// `"tcp connect failed: connection refused"`).
+///
+/// This is the real probe implementation called before
+/// [`WorkerRegistry::observe_startup_timeout`]; see
+/// `docs/harness-engineering-optimization-plan.md` Step 1.3.
+pub fn probe_transport_health(addr: &SocketAddr, timeout_ms: u64) -> StartupHealthSummary {
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let start = std::time::Instant::now();
+    match TcpStream::connect_timeout(addr, timeout) {
+        Ok(_) => {
+            let elapsed = start.elapsed();
+            StartupHealthSummary::probed(
+                "transport",
+                true,
+                format!("tcp connect ok in {}ms", elapsed.as_millis()),
+            )
+        }
+        Err(e) => StartupHealthSummary::probed(
+            "transport",
+            false,
+            format!("tcp connect failed: {e}"),
+        ),
+    }
+}
+
+/// Probe MCP health by checking whether each server's lifecycle has reached
+/// [`McpLifecyclePhase::Ready`] or [`McpLifecyclePhase::Invocation`].
+///
+/// `servers` is a slice of `(server_name, current_phase)` pairs. Returns
+/// [`StartupHealthSummary::probed`] with a summary like
+/// `"2/2 servers ready; phase=Ready"` or `"1/2 servers ready; unhealthy=api_gateway at Invocation"`.
+///
+/// This is the real probe implementation called before
+/// [`WorkerRegistry::observe_startup_timeout`]; see
+/// `docs/harness-engineering-optimization-plan.md` Step 1.3.
+pub fn probe_mcp_health(servers: &[(&str, McpLifecyclePhase)]) -> StartupHealthSummary {
+    use McpLifecyclePhase::{Invocation, Ready};
+    let total = servers.len();
+    let ready_count = servers
+        .iter()
+        .filter(|(_, phase)| matches!(phase, Ready | Invocation))
+        .count();
+    let healthy = total > 0 && ready_count == total;
+    if healthy {
+        let detail = if total == 1 {
+            format!("1/1 server ready; phase={:?}", servers[0].1)
+        } else {
+            format!("{ready_count}/{total} servers ready; phase=Ready")
+        };
+        StartupHealthSummary::probed("mcp", true, detail)
+    } else {
+        let unhealthy: Vec<&str> = servers
+            .iter()
+            .filter(|(_, phase)| !matches!(phase, Ready | Invocation))
+            .map(|(name, _)| *name)
+            .collect();
+        let detail = if unhealthy.is_empty() {
+            format!("0 servers registered")
+        } else {
+            format!(
+                "{ready_count}/{total} servers ready; unhealthy={}",
+                unhealthy.join(",")
+            )
+        };
+        StartupHealthSummary::probed("mcp", false, detail)
     }
 }
 
@@ -170,11 +272,13 @@ pub struct StartupEvidenceBundle {
     pub tool_permission_allow_scope: Option<ToolPermissionAllowScope>,
     /// Transport health summary (true = healthy/responsive)
     pub transport_healthy: bool,
-    /// Typed transport health placeholder for future concrete probes
+    /// Transport health summary produced by [`probe_transport_health`] or
+    /// [`StartupHealthSummary::observed`].
     pub transport_health: StartupHealthSummary,
     /// MCP health summary (true = all servers healthy)
     pub mcp_healthy: bool,
-    /// Typed MCP health placeholder for future concrete probes
+    /// MCP health summary produced by [`probe_mcp_health`] or
+    /// [`StartupHealthSummary::observed`].
     pub mcp_health: StartupHealthSummary,
     /// Seconds since worker creation
     pub elapsed_seconds: u64,
@@ -530,6 +634,32 @@ impl WorkerRegistry {
         Ok(worker.clone())
     }
 
+    /// BUG-4 修复:按需构造 `trust_resolver::TrustEvent` 供外部消费。
+    ///
+    /// 文档要求 worker_boot 的 TrustGate 分支接入 `TrustEvent::TrustRequired`
+    /// (Step 1.1)。原实现只 emit 自有的 `WorkerEventPayload::TrustPrompt`,
+    /// `trust_resolver` 模块在生产构建可见但无业务代码使用。本方法根据
+    /// worker 当前状态按需构造 TrustEvent:
+    /// - `TrustRequired` 状态 → `TrustEvent::TrustRequired`(含 cwd/repo/worktree)
+    /// - 其他状态 → None
+    ///
+    /// 不改变 worker_boot 内部决策逻辑,只补充结构化事件输出能力。
+    /// 详见 docs/harness-engineering-optimization-plan.md Step 1.1。
+    #[must_use]
+    pub fn pending_trust_event(&self, worker_id: &str) -> Option<crate::trust_resolver::TrustEvent> {
+        use crate::trust_resolver::TrustEvent;
+
+        let inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner.workers.get(worker_id)?;
+        if worker.status != WorkerStatus::TrustRequired {
+            return None;
+        }
+        let cwd = worker.cwd.clone();
+        let repo = crate::trust_resolver::extract_repo_name(&cwd);
+        let worktree = None; // worker_boot 当前不区分 worktree,留给未来扩展。
+        Some(TrustEvent::TrustRequired { cwd, repo, worktree })
+    }
+
     pub fn send_prompt(
         &self,
         worker_id: &str,
@@ -696,6 +826,19 @@ impl WorkerRegistry {
     }
 
     /// Handle startup timeout by emitting typed `worker.startup_no_evidence` event with evidence bundle.
+    ///
+    /// # Caller responsibility for `transport_healthy` / `mcp_healthy`
+    ///
+    /// These two booleans are produced by the **caller**, not by this method.
+    /// Production callers should use [`probe_transport_health`] and
+    /// [`probe_mcp_health`] to produce real [`StartupHealthSummary`] objects,
+    /// then call [`Self::observe_startup_timeout_with_probes`] instead.
+    ///
+    /// This legacy method uses [`StartupHealthSummary::observed`] which lacks
+    /// probe detail strings. Prefer the `_with_probes` variant in production.
+    ///
+    /// See `docs/harness-engineering-optimization-plan.md` Step 1.3.
+    ///
     /// Classifier attempts to down-rank the vague bucket into a specific failure classification.
     pub fn observe_startup_timeout(
         &self,
@@ -757,6 +900,104 @@ impl WorkerRegistry {
         let classification = classify_startup_failure(&evidence);
 
         // Emit failure with evidence
+        worker.last_error = Some(WorkerFailure {
+            kind: WorkerFailureKind::StartupNoEvidence,
+            message: format!(
+                "worker startup stalled after {elapsed}s — classified as {classification:?}"
+            ),
+            created_at: now,
+        });
+        worker.status = WorkerStatus::Failed;
+        worker.prompt_in_flight = false;
+
+        push_event(
+            worker,
+            WorkerEventKind::StartupNoEvidence,
+            WorkerStatus::Failed,
+            Some(format!(
+                "startup timeout with evidence: last_state={:?}, trust_detected={}, prompt_accepted={}",
+                evidence.last_lifecycle_state,
+                evidence.trust_prompt_detected,
+                evidence.prompt_acceptance_state
+            )),
+            Some(WorkerEventPayload::StartupNoEvidence {
+                evidence,
+                classification,
+            }),
+        );
+
+        Ok(worker.clone())
+    }
+
+    /// Handle startup timeout using pre-probed health summaries.
+    ///
+    /// This is the preferred entry point for production callers that have
+    /// already executed real probes via [`probe_transport_health`] and
+    /// [`probe_mcp_health`]. It replaces the `observed()` summaries in
+    /// [`Self::observe_startup_timeout`] with the richer `probed()` summaries
+    /// that carry `detail` strings (e.g. `"tcp connect ok in 12ms"`).
+    ///
+    /// See `docs/harness-engineering-optimization-plan.md` Step 1.3.
+    pub fn observe_startup_timeout_with_probes(
+        &self,
+        worker_id: &str,
+        pane_command: &str,
+        transport_health: StartupHealthSummary,
+        mcp_health: StartupHealthSummary,
+    ) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+
+        let now = now_secs();
+        let elapsed = now.saturating_sub(worker.created_at);
+        let latest_tool_permission_event = worker
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == WorkerEventKind::ToolPermissionRequired);
+        let tool_permission_allow_scope =
+            latest_tool_permission_event.and_then(|event| match &event.payload {
+                Some(WorkerEventPayload::ToolPermissionPrompt { allow_scope, .. }) => {
+                    Some(*allow_scope)
+                }
+                _ => None,
+            });
+
+        let transport_healthy = transport_health.healthy;
+        let mcp_healthy = mcp_health.healthy;
+
+        let evidence = StartupEvidenceBundle {
+            last_lifecycle_state: worker.status,
+            last_lifecycle_at: worker.updated_at,
+            pane_command: pane_command.to_string(),
+            pane_observed_at: now,
+            command_started_at: worker.created_at,
+            prompt_sent_at: worker.prompt_sent_at,
+            prompt_acceptance_state: worker.status == WorkerStatus::Running
+                && !worker.prompt_in_flight,
+            trust_prompt_detected: worker
+                .events
+                .iter()
+                .any(|e| e.kind == WorkerEventKind::TrustRequired),
+            tool_permission_prompt_detected: worker
+                .events
+                .iter()
+                .any(|e| e.kind == WorkerEventKind::ToolPermissionRequired),
+            tool_permission_prompt_age_seconds: latest_tool_permission_event
+                .map(|event| now.saturating_sub(event.timestamp)),
+            tool_permission_allow_scope,
+            transport_healthy,
+            transport_health,
+            mcp_healthy,
+            mcp_health,
+            elapsed_seconds: elapsed,
+        };
+
+        let classification = classify_startup_failure(&evidence);
+
         worker.last_error = Some(WorkerFailure {
             kind: WorkerFailureKind::StartupNoEvidence,
             message: format!(
@@ -2155,5 +2396,96 @@ mod tests {
 
         let classification = classify_startup_failure(&evidence);
         assert_eq!(classification, StartupFailureClassification::WorkerCrashed);
+    }
+
+    #[test]
+    fn probe_transport_health_returns_unhealthy_for_unreachable_port() {
+        // Use a port that's extremely unlikely to be listening
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let summary = probe_transport_health(&addr, 50);
+        assert!(!summary.healthy);
+        assert!(summary.summary.contains("transport_unhealthy"));
+        assert!(summary.detail.is_some());
+        assert!(summary.detail.as_ref().unwrap().contains("tcp connect failed"));
+    }
+
+    #[test]
+    fn probe_mcp_health_returns_healthy_when_all_ready() {
+        use crate::mcp_lifecycle_hardened::McpLifecyclePhase;
+        let servers: Vec<(&str, McpLifecyclePhase)> = vec![
+            ("memory", McpLifecyclePhase::Ready),
+            ("git", McpLifecyclePhase::Invocation),
+        ];
+        let summary = probe_mcp_health(&servers);
+        assert!(summary.healthy);
+        assert!(summary.summary.contains("mcp_healthy"));
+        assert!(summary.detail.as_ref().unwrap().contains("2/2 servers ready"));
+    }
+
+    #[test]
+    fn probe_mcp_health_returns_unhealthy_when_not_ready() {
+        use crate::mcp_lifecycle_hardened::McpLifecyclePhase;
+        let servers: Vec<(&str, McpLifecyclePhase)> = vec![
+            ("memory", McpLifecyclePhase::Ready),
+            ("api", McpLifecyclePhase::SpawnConnect),
+        ];
+        let summary = probe_mcp_health(&servers);
+        assert!(!summary.healthy);
+        assert!(summary.detail.as_ref().unwrap().contains("1/2 servers ready"));
+        assert!(summary.detail.as_ref().unwrap().contains("api"));
+    }
+
+    #[test]
+    fn observe_startup_timeout_with_probes_uses_probed_detail() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-probed", &[], true);
+
+        let transport = StartupHealthSummary::probed(
+            "transport",
+            false,
+            "tcp connect failed: connection refused",
+        );
+        let mcp = StartupHealthSummary::probed("mcp", true, "1/1 server ready; phase=Ready");
+
+        let timed_out = registry
+            .observe_startup_timeout_with_probes(
+                &worker.worker_id,
+                "claw prompt",
+                transport,
+                mcp,
+            )
+            .expect("startup timeout with probes should succeed");
+
+        assert_eq!(timed_out.status, WorkerStatus::Failed);
+        let event = timed_out
+            .events
+            .iter()
+            .find(|e| e.kind == WorkerEventKind::StartupNoEvidence)
+            .expect("startup no evidence event should exist");
+
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::StartupNoEvidence {
+                evidence,
+                classification,
+            }) => {
+                assert!(!evidence.transport_healthy);
+                assert!(evidence.mcp_healthy);
+                assert_eq!(*classification, StartupFailureClassification::TransportDead);
+                // Verify probed detail is preserved
+                assert!(evidence
+                    .transport_health
+                    .detail
+                    .as_ref()
+                    .unwrap()
+                    .contains("tcp connect failed"));
+                assert!(evidence
+                    .mcp_health
+                    .detail
+                    .as_ref()
+                    .unwrap()
+                    .contains("1/1 server ready"));
+            }
+            _ => panic!("expected StartupNoEvidence payload"),
+        }
     }
 }

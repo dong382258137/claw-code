@@ -1205,7 +1205,6 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "terminal-setup",
     "api-key",
     "reset",
-    "undo",
     "stop",
     "retry",
     "paste",
@@ -1298,11 +1297,17 @@ pub(crate) fn slash_command_completion_candidates_with_sessions(
         "/plugins list",
         "/pr ",
         "/resume ",
+        "/search ",
         "/session list",
+        "/session pick",
         "/session switch ",
+        "/session exists ",
         "/session fork ",
+        "/session fork",
+        "/session delete ",
         "/teleport ",
         "/ultraplan ",
+        "/undo",
         "/agents help",
         "/mcp help",
         "/skills help",
@@ -1318,8 +1323,14 @@ pub(crate) fn slash_command_completion_candidates_with_sessions(
     if let Some(active_session_id) = active_session_id.filter(|value| !value.trim().is_empty()) {
         completions.insert(format!("/resume {active_session_id}"));
         completions.insert(format!("/session switch {active_session_id}"));
+        completions.insert(format!("/session pick {active_session_id}"));
+        completions.insert(format!("/session exists {active_session_id}"));
     }
 
+    // Generate per-session candidates for the most recent N sessions so
+    // Tab-completion works for `/session switch <id>`, `/session pick <id>`,
+    // `/session exists <id>`, `/session delete <id>`, and `/resume <id>`.
+    // Cap at 10 to avoid flooding the completion menu on noisy workspaces.
     for session_id in recent_session_ids
         .into_iter()
         .filter(|value| !value.trim().is_empty())
@@ -1327,6 +1338,9 @@ pub(crate) fn slash_command_completion_candidates_with_sessions(
     {
         completions.insert(format!("/resume {session_id}"));
         completions.insert(format!("/session switch {session_id}"));
+        completions.insert(format!("/session pick {session_id}"));
+        completions.insert(format!("/session exists {session_id}"));
+        completions.insert(format!("/session delete {session_id}"));
     }
 
     completions.into_iter().collect()

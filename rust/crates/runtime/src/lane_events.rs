@@ -1015,6 +1015,54 @@ pub struct LaneEvent {
     pub metadata: LaneEventMetadata,
 }
 
+// ---- Global lane event sink (BUG-P2-3) ----
+//
+// `detect_and_emit_ship_prepared` previously constructed a `LaneEvent` and
+// immediately dropped it. We add a minimal process-wide sink so the event
+// is actually observable by downstream consumers (lane completion detector,
+// ship dashboard, etc.). The sink is a `Mutex<Vec<LaneEvent>>` protected
+// by a `OnceLock`; callers can `drain` it to consume buffered events.
+
+use std::sync::{Mutex, OnceLock};
+
+static LANE_EVENT_SINK: OnceLock<Mutex<Vec<LaneEvent>>> = OnceLock::new();
+
+fn lane_event_sink() -> &'static Mutex<Vec<LaneEvent>> {
+    LANE_EVENT_SINK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Publish a `LaneEvent` to the global sink.
+///
+/// Returns `true` if the event was successfully buffered (always —
+/// the sink is recovered even when poisoned, so publication never
+/// silently drops events). The boolean return is retained so callers
+/// can guard their fallback logging with `if !try_publish(event)`.
+pub fn try_publish(event: LaneEvent) -> bool {
+    match lane_event_sink().lock() {
+        Ok(mut buffer) => {
+            buffer.push(event);
+            true
+        }
+        Err(poisoned) => {
+            // Recover the buffer even when poisoned — a faulty consumer
+            // should not block future publishers.
+            poisoned.into_inner().push(event);
+            true
+        }
+    }
+}
+
+/// Drain all buffered lane events from the global sink.
+///
+/// Returns the events in emission order. Useful for tests or for a
+/// long-running consumer that periodically drains the sink.
+pub fn drain_lane_events() -> Vec<LaneEvent> {
+    match lane_event_sink().lock() {
+        Ok(mut buffer) => std::mem::take(&mut *buffer),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    }
+}
+
 impl LaneEvent {
     /// Create a new lane event with minimal metadata (seq=0, provenance=LiveLane)
     /// Use `LaneEventBuilder` for events requiring full metadata.

@@ -53,6 +53,184 @@ fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Re
     Ok(())
 }
 
+/// 在 Windows 上剥离 `\\?\`（Verbatim Disk）和 `\\?\UNC\`（Verbatim UNC）前缀。
+///
+/// 背景：`Path::canonicalize()` 在 Windows 上返回带 `\\?\` verbatim 前缀的路径
+/// （例如 `\\?\D:\foo\bar`），而 `std::env::current_dir()` 返回不带前缀的路径
+/// （例如 `D:\foo\bar`）。两类路径在 `starts_with` 比较时因前缀 component 不同
+/// 被判为不相干，导致合法路径被误判为越界。
+///
+/// 此函数把 verbatim 前缀转回普通磁盘/UNC 前缀，使比较两端格式统一。
+/// 在非 Windows 平台上为 no-op。
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut components = path.components();
+    let first = match components.next() {
+        Some(Component::Prefix(prefix)) => prefix,
+        _ => return path.to_path_buf(),
+    };
+
+    let rest: PathBuf = components.collect();
+    match first.kind() {
+        std::path::Prefix::VerbatimDisk(disk_byte) => {
+            // `\\?\D:\foo` -> `D:\foo`（disk_byte 是盘符 ASCII，例如 'D' = 68）
+            let disk_char = char::from_u32(disk_byte as u32).unwrap_or('?');
+            let mut result = PathBuf::from(format!("{}:", disk_char));
+            if !rest.as_os_str().is_empty() {
+                result.push(rest);
+            }
+            result
+        }
+        std::path::Prefix::VerbatimUNC(server, share) => {
+            // `\\?\UNC\server\share\foo` -> `\\server\share\foo`
+            let mut result = PathBuf::from(format!(
+                "\\\\{}\\{}",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            ));
+            if !rest.as_os_str().is_empty() {
+                result.push(rest);
+            }
+            result
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// 多根版本的工作区边界校验。任一根包含即放行，全部不包含才拒绝。
+/// 错误消息列出所有根，方便用户诊断。
+///
+/// 注意：错误消息保留 "escapes workspace" 子串，与单根版 `validate_workspace_boundary`
+/// 保持向后兼容（既有测试断言 `contains("escapes workspace")`）。
+///
+/// Windows 兼容：比较前对 `resolved` 和每个 root 都剥离 `\\?\` verbatim 前缀，
+/// 避免 `canonicalize()` 返回的 verbatim 路径与 `current_dir()` 返回的普通路径
+/// 因前缀 component 不同而 `starts_with` 失败。
+fn validate_workspace_boundary_multi(
+    resolved: &Path,
+    workspace_roots: &[PathBuf],
+) -> io::Result<()> {
+    if workspace_roots.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "path {} rejected: no workspace roots configured",
+                resolved.display()
+            ),
+        ));
+    }
+    let normalized_resolved = strip_verbatim_prefix(resolved);
+    let normalized_roots: Vec<PathBuf> = workspace_roots
+        .iter()
+        .map(|r| strip_verbatim_prefix(r))
+        .collect();
+    if normalized_roots
+        .iter()
+        .any(|root| normalized_resolved.starts_with(root))
+    {
+        return Ok(());
+    }
+    let roots_display: Vec<String> = normalized_roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect();
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "path {} escapes workspace boundaries [{}]",
+            normalized_resolved.display(),
+            roots_display.join(", ")
+        ),
+    ))
+}
+
+/// 将主工作区根与额外根合并为规范化（canonicalize）后的根列表。
+/// 主根始终在首位。空 `extra_roots` 时返回单元素列表。
+fn canonicalize_roots(workspace_root: &Path, extra_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = vec![canonicalize_workspace_root(workspace_root)];
+    for root in extra_roots {
+        roots.push(canonicalize_workspace_root(root));
+    }
+    roots
+}
+
+/// 多根工作区路径校验器。移植自 Python `path_scope.py::WorkspacePathScope`。
+///
+/// 支持多个工作区根目录，任一根包含即放行。用于 `--add-dir` CLI flag
+/// 允许用户在主工作区之外添加额外的允许目录。
+#[derive(Debug, Clone)]
+pub struct WorkspacePathScope {
+    /// 已解析（canonicalize）的工作区根目录列表。至少包含一个根。
+    roots: Vec<PathBuf>,
+}
+
+impl WorkspacePathScope {
+    /// 从单个根创建。根会被 canonicalize。
+    pub fn from_root(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let canonical = root.canonicalize().unwrap_or(root);
+        Self {
+            roots: vec![canonical],
+        }
+    }
+
+    /// 从多个根创建。每个根都会被 canonicalize，重复的会被去重。
+    pub fn from_roots(roots: Vec<PathBuf>) -> Self {
+        let mut canonical_roots: Vec<PathBuf> = roots
+            .into_iter()
+            .map(|r| r.canonicalize().unwrap_or(r))
+            .collect();
+        canonical_roots.sort();
+        canonical_roots.dedup();
+        if canonical_roots.is_empty() {
+            // 退化为当前目录，避免空根导致所有路径被拒
+            canonical_roots.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        }
+        Self {
+            roots: canonical_roots,
+        }
+    }
+
+    /// 返回工作区根列表的引用。
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// 校验已解析的路径是否在任一工作区根内。
+    pub fn validate_resolved(&self, resolved: &Path) -> io::Result<()> {
+        validate_workspace_boundary_multi(resolved, &self.roots)
+    }
+
+    /// 校验未解析的路径：先 normalize/canonicalize，再调用 `validate_resolved`。
+    /// `allow_missing` 为 true 时，对不存在的路径回退到父目录 canonicalize。
+    pub fn validate_path(&self, path: &str, allow_missing: bool) -> io::Result<PathBuf> {
+        let trimmed = path.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+            )
+        });
+        let candidate = PathBuf::from(trimmed);
+        let absolute = if candidate.is_absolute() {
+            candidate
+        } else {
+            std::env::current_dir().unwrap_or_default().join(candidate)
+        };
+        let resolved = if allow_missing {
+            absolute
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .map(|parent| parent.join(absolute.file_name().unwrap_or_default()))
+                .unwrap_or(absolute)
+        } else {
+            absolute.canonicalize().unwrap_or(absolute)
+        };
+        self.validate_resolved(&resolved)?;
+        Ok(resolved)
+    }
+}
+
 /// Text payload returned by file-reading operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextFilePayload {
@@ -307,22 +485,137 @@ pub fn edit_file(
 
 /// Expands a glob pattern and returns matching filenames.
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
-    glob_search_impl(pattern, path, None)
+    glob_search_impl(pattern, path, None, &[])
+}
+
+/// Refuse to write through a leaf symlink.
+///
+/// `symlink_metadata` does not follow symlinks, so a symlink at `path`
+/// will report `file_type().is_symlink() == true` and we reject it. This
+/// closes the TOCTOU window between the workspace-boundary check and the
+/// actual write (BUG-P1-5): an attacker who swaps the validated leaf for
+/// a symlink pointing outside the workspace cannot trick us into writing
+/// through it.
+fn reject_leaf_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to write through symlink at {} (TOCTOU defense)",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        // File does not exist yet — nothing to swap, safe to proceed.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Write `content` to `absolute_path`, refusing to follow a leaf symlink.
+///
+/// Mirrors [`write_file`]'s logic (size cap, dir creation, patch metadata)
+/// but operates on an already-validated canonical path and rejects symlink
+/// substitution at the leaf.
+fn write_file_at_checked(absolute_path: &Path, content: &str) -> io::Result<WriteFileOutput> {
+    if content.len() > MAX_WRITE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "content is too large ({} bytes, max {} bytes)",
+                content.len(),
+                MAX_WRITE_SIZE
+            ),
+        ));
+    }
+
+    reject_leaf_symlink(absolute_path)?;
+
+    let original_file = fs::read_to_string(absolute_path).ok();
+    if let Some(parent) = absolute_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(absolute_path, content)?;
+
+    Ok(WriteFileOutput {
+        kind: if original_file.is_some() {
+            String::from("update")
+        } else {
+            String::from("create")
+        },
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        content: content.to_owned(),
+        structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
+        original_file,
+        git_diff: None,
+    })
+}
+
+/// Edit the file at `absolute_path`, refusing to follow a leaf symlink.
+///
+/// Mirrors [`edit_file`]'s logic but operates on an already-validated
+/// canonical path and rejects symlink substitution at the leaf.
+fn edit_file_at_checked(
+    absolute_path: &Path,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> io::Result<EditFileOutput> {
+    reject_leaf_symlink(absolute_path)?;
+
+    let original_file = fs::read_to_string(absolute_path)?;
+    if old_string == new_string {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string and new_string must differ",
+        ));
+    }
+    if !original_file.contains(old_string) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "old_string not found in file",
+        ));
+    }
+
+    let updated = if replace_all {
+        original_file.replace(old_string, new_string)
+    } else {
+        original_file.replacen(old_string, new_string, 1)
+    };
+    fs::write(absolute_path, &updated)?;
+
+    Ok(EditFileOutput {
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        old_string: old_string.to_owned(),
+        new_string: new_string.to_owned(),
+        original_file: original_file.clone(),
+        structured_patch: make_patch(&original_file, &updated),
+        user_modified: false,
+        replace_all,
+        git_diff: None,
+    })
 }
 
 fn glob_search_impl(
     pattern: &str,
     path: Option<&str>,
     workspace_root: Option<&Path>,
+    extra_roots: &[PathBuf],
 ) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
-    let canonical_root = workspace_root.map(canonicalize_workspace_root);
-    if let Some(root) = canonical_root.as_deref() {
-        validate_workspace_boundary(&base_dir, root)?;
+    let canonical_roots: Vec<PathBuf> = workspace_root
+        .map(|root| canonicalize_roots(root, extra_roots))
+        .unwrap_or_default();
+    if !canonical_roots.is_empty() {
+        validate_workspace_boundary_multi(&base_dir, &canonical_roots)?;
     }
     let search_pattern = if Path::new(pattern).is_absolute() {
         pattern.to_owned()
@@ -341,11 +634,11 @@ fn glob_search_impl(
         let compiled = Pattern::new(pat)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let walk_root = derive_glob_walk_root(pat);
-        if let Some(root) = canonical_root.as_deref() {
+        if !canonical_roots.is_empty() {
             let canonical_walk_root = walk_root
                 .canonicalize()
                 .unwrap_or_else(|_| walk_root.clone());
-            validate_workspace_boundary(&canonical_walk_root, root)?;
+            validate_workspace_boundary_multi(&canonical_walk_root, &canonical_roots)?;
         }
         let entries = WalkDir::new(&walk_root)
             .into_iter()
@@ -356,9 +649,12 @@ fn glob_search_impl(
                 && compiled.matches_path(candidate)
                 && seen.insert(candidate.to_path_buf())
             {
-                if let Some(root) = canonical_root.as_deref() {
+                if !canonical_roots.is_empty() {
                     let canonical_candidate = candidate.canonicalize()?;
-                    validate_workspace_boundary(&canonical_candidate, root)?;
+                    validate_workspace_boundary_multi(
+                        &canonical_candidate,
+                        &canonical_roots,
+                    )?;
                 }
                 matches.push(candidate.to_path_buf());
             }
@@ -389,12 +685,13 @@ fn glob_search_impl(
 
 /// Runs a regex search over workspace files with optional context lines.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
-    grep_search_impl(input, None)
+    grep_search_impl(input, None, &[])
 }
 
 fn grep_search_impl(
     input: &GrepSearchInput,
     workspace_root: Option<&Path>,
+    extra_roots: &[PathBuf],
 ) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
@@ -402,9 +699,11 @@ fn grep_search_impl(
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
-    let canonical_root = workspace_root.map(canonicalize_workspace_root);
-    if let Some(root) = canonical_root.as_deref() {
-        validate_workspace_boundary(&base_path, root)?;
+    let canonical_roots: Vec<PathBuf> = workspace_root
+        .map(|root| canonicalize_roots(root, extra_roots))
+        .unwrap_or_default();
+    if !canonical_roots.is_empty() {
+        validate_workspace_boundary_multi(&base_path, &canonical_roots)?;
     }
 
     let regex = RegexBuilder::new(&input.pattern)
@@ -431,9 +730,9 @@ fn grep_search_impl(
     let mut total_matches = 0usize;
 
     for file_path in collect_search_files(&base_path)? {
-        if let Some(root) = canonical_root.as_deref() {
+        if !canonical_roots.is_empty() {
             let canonical_file = file_path.canonicalize()?;
-            validate_workspace_boundary(&canonical_file, root)?;
+            validate_workspace_boundary_multi(&canonical_file, &canonical_roots)?;
         }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
@@ -681,9 +980,22 @@ pub fn read_file_in_workspace(
     limit: Option<usize>,
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
+    read_file_in_workspace_with_roots(path, offset, limit, workspace_root, &[])
+}
+
+/// Read a file with multi-root workspace boundary enforcement.
+/// `extra_roots` 为 `--add-dir` 提供的额外允许根；路径落在主根或任一额外根内即放行。
+#[allow(dead_code)]
+pub fn read_file_in_workspace_with_roots(
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    workspace_root: &Path,
+    extra_roots: &[PathBuf],
+) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    let roots = canonicalize_roots(workspace_root, extra_roots);
+    validate_workspace_boundary_multi(&absolute_path, &roots)?;
     read_file(path, offset, limit)
 }
 
@@ -694,10 +1006,27 @@ pub fn write_file_in_workspace(
     content: &str,
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
+    write_file_in_workspace_with_roots(path, content, workspace_root, &[])
+}
+
+/// Write a file with multi-root workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn write_file_in_workspace_with_roots(
+    path: &str,
+    content: &str,
+    workspace_root: &Path,
+    extra_roots: &[PathBuf],
+) -> io::Result<WriteFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
-    let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    write_file(path, content)
+    let roots = canonicalize_roots(workspace_root, extra_roots);
+    validate_workspace_boundary_multi(&absolute_path, &roots)?;
+    // BUG-P1-5 (TOCTOU): previously this called `write_file(path)`, which
+    // re-normalized `path` and then `fs::write`-d. Between the boundary
+    // check above and the write below, an attacker could replace `path`
+    // with a symlink pointing outside the workspace, causing the write to
+    // land on the symlink target. We now write to the already-validated
+    // `absolute_path` directly and refuse to follow symlinks at the leaf.
+    write_file_at_checked(&absolute_path, content)
 }
 
 /// Edit a file with workspace boundary enforcement.
@@ -709,10 +1038,26 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
+    edit_file_in_workspace_with_roots(path, old_string, new_string, replace_all, workspace_root, &[])
+}
+
+/// Edit a file with multi-root workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn edit_file_in_workspace_with_roots(
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    workspace_root: &Path,
+    extra_roots: &[PathBuf],
+) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    edit_file(path, old_string, new_string, replace_all)
+    let roots = canonicalize_roots(workspace_root, extra_roots);
+    validate_workspace_boundary_multi(&absolute_path, &roots)?;
+    // BUG-P1-5 (TOCTOU): write to the already-validated `absolute_path`
+    // and refuse to follow symlinks at the leaf. See
+    // `write_file_in_workspace_with_roots` for the full rationale.
+    edit_file_at_checked(&absolute_path, old_string, new_string, replace_all)
 }
 
 /// Expand a glob pattern with workspace boundary enforcement.
@@ -722,7 +1067,18 @@ pub fn glob_search_in_workspace(
     path: Option<&str>,
     workspace_root: &Path,
 ) -> io::Result<GlobSearchOutput> {
-    glob_search_impl(pattern, path, Some(workspace_root))
+    glob_search_impl(pattern, path, Some(workspace_root), &[])
+}
+
+/// Expand a glob pattern with multi-root workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn glob_search_in_workspace_with_roots(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: &Path,
+    extra_roots: &[PathBuf],
+) -> io::Result<GlobSearchOutput> {
+    glob_search_impl(pattern, path, Some(workspace_root), extra_roots)
 }
 
 /// Search file contents with workspace boundary enforcement.
@@ -731,7 +1087,17 @@ pub fn grep_search_in_workspace(
     input: &GrepSearchInput,
     workspace_root: &Path,
 ) -> io::Result<GrepSearchOutput> {
-    grep_search_impl(input, Some(workspace_root))
+    grep_search_impl(input, Some(workspace_root), &[])
+}
+
+/// Search file contents with multi-root workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn grep_search_in_workspace_with_roots(
+    input: &GrepSearchInput,
+    workspace_root: &Path,
+    extra_roots: &[PathBuf],
+) -> io::Result<GrepSearchOutput> {
+    grep_search_impl(input, Some(workspace_root), extra_roots)
 }
 
 /// Check whether a path is a symlink that resolves outside the workspace.

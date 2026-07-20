@@ -109,6 +109,15 @@ impl LineEditor {
         let config = Config::builder()
             .completion_type(CompletionType::List)
             .edit_mode(EditMode::Emacs)
+            // 启用 bracketed paste mode：终端会用 `\e[200~` ... `\e[201~`
+            // 包裹粘贴内容，rustyline 据此把整段粘贴作为一个 `Cmd::Insert`
+            // 一次性插入，而不是逐行触发 `Cmd::AcceptLine`。
+            //
+            // 修复 Windows Terminal 右键粘贴多行文本时只粘贴第一行且立即提交的 bug。
+            // rustyline 默认仅在 unix platform 启用此模式，Windows 上需显式开启。
+            // Windows Terminal 自 2022 年起支持 DECSET 2004；旧版 conhost 不支持
+            // 时会优雅降级（行为与未启用时一致，不会更糟）。
+            .bracketed_paste(true)
             .build();
         let mut editor = Editor::<SlashCommandHelper, DefaultHistory>::with_config(config)
             .expect("rustyline editor should initialize");

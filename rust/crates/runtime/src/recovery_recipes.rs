@@ -7,6 +7,7 @@
 //! recovery event.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +84,107 @@ pub enum RecoveryStep {
     RestartPlugin { name: String },
     RestartWorker,
     EscalateToHuman { reason: String },
+}
+
+/// BUG-10:Step 执行器 trait — 让 RecoveryOrchestrator 可注入真实执行器。
+///
+/// 默认 `SimulatedStepExecutor` 只记录日志(保持原有行为)。
+/// 生产环境注入 `RealStepExecutor` 执行 `git rebase`/`cargo clean` 等真实命令。
+/// 测试可注入自定义 mock。
+///
+/// 详见 `docs/harness-engineering-optimization-plan.md` Step 1.2。
+pub trait RecoveryStepExecutor: Send + Sync {
+    /// 执行单个 recovery step,返回 (成功, 结果描述)。
+    fn execute(&self, step: &RecoveryStep, scenario: &FailureScenario) -> (bool, String);
+}
+
+/// 默认模拟执行器 — 所有 step 返回成功,与原有行为一致。
+#[derive(Debug, Clone, Default)]
+pub struct SimulatedStepExecutor;
+
+impl RecoveryStepExecutor for SimulatedStepExecutor {
+    fn execute(&self, step: &RecoveryStep, scenario: &FailureScenario) -> (bool, String) {
+        let desc = format!("{step:?} for {scenario}");
+        (true, format!("simulated: {desc} succeeded"))
+    }
+}
+
+/// 真实 step 执行器 — 调用系统命令。
+///
+/// - `RebaseBranch` → `git rebase`
+/// - `CleanBuild` → `cargo clean && cargo build`
+/// - `RestartWorker` → no-op(由上层 ConversationRuntime 重新创建 worker)
+/// - `RetryMcpHandshake` → no-op(MCP 重连由 transport 层处理)
+/// - 其他 step → 模拟(当前无真实命令)
+#[derive(Debug, Clone, Default)]
+pub struct RealStepExecutor;
+
+impl RecoveryStepExecutor for RealStepExecutor {
+    fn execute(&self, step: &RecoveryStep, scenario: &FailureScenario) -> (bool, String) {
+        match step {
+            RecoveryStep::RebaseBranch => {
+                let output = std::process::Command::new("git")
+                    .args(["rebase"])
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {
+                        (true, "git rebase succeeded".to_string())
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        (false, format!("git rebase failed: {stderr}"))
+                    }
+                    Err(e) => (false, format!("git rebase error: {e}")),
+                }
+            }
+            RecoveryStep::CleanBuild => {
+                // cargo clean
+                let clean = std::process::Command::new("cargo")
+                    .args(["clean"])
+                    .output();
+                match clean {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        return (false, format!("cargo clean failed: {stderr}"));
+                    }
+                    Err(e) => return (false, format!("cargo clean error: {e}")),
+                }
+                // cargo build
+                let build = std::process::Command::new("cargo")
+                    .args(["build"])
+                    .output();
+                match build {
+                    Ok(o) if o.status.success() => {
+                        (true, "cargo clean + build succeeded".to_string())
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        (false, format!("cargo build failed: {stderr}"))
+                    }
+                    Err(e) => (false, format!("cargo build error: {e}")),
+                }
+            }
+            RecoveryStep::RestartWorker => {
+                // RestartWorker 由上层 ConversationRuntime 重新创建 worker 进程处理,
+                // 此处返回成功占位。详见 conversation.rs try_recover_or_record_fail。
+                (true, format!("restart_worker delegated to runtime for {scenario}"))
+            }
+            RecoveryStep::RetryMcpHandshake { timeout } => {
+                // MCP 重连由 transport 层处理,此处为占位。
+                (true, format!("mcp_handshake retry (timeout={timeout}ms) delegated to transport for {scenario}"))
+            }
+            RecoveryStep::RestartPlugin { name } => {
+                (true, format!("restart_plugin({name}) delegated for {scenario}"))
+            }
+            // AcceptTrustPrompt / RedirectPromptToAgent / EscalateToHuman
+            // 属于交互/决策类 step,无法自动化,走模拟。
+            _ => {
+                let desc = format!("{step:?} for {scenario}");
+                (true, format!("simulated: {desc} succeeded"))
+            }
+        }
+    }
 }
 
 /// Policy governing what happens when automatic recovery is exhausted.
@@ -195,9 +297,10 @@ pub struct RecoveryStatusReport {
 /// Minimal context for tracking recovery state and emitting events.
 ///
 /// Holds per-scenario attempt counts, a structured event log, a recovery
-/// attempt ledger, and an optional simulation knob for controlling step
-/// outcomes during tests.
-#[derive(Debug, Clone, Default)]
+/// attempt ledger, an optional simulation knob for controlling step
+/// outcomes during tests, and an optional step executor for real
+/// command execution.
+#[derive(Clone, Default)]
 pub struct RecoveryContext {
     attempts: HashMap<FailureScenario, u32>,
     events: Vec<RecoveryEvent>,
@@ -206,6 +309,21 @@ pub struct RecoveryContext {
     /// Optional step index at which simulated execution fails.
     /// `None` means all steps succeed.
     fail_at_step: Option<usize>,
+    /// BUG-10:Step 执行器。`None` 时走模拟执行(保持原有行为)。
+    step_executor: Option<Arc<dyn RecoveryStepExecutor>>,
+}
+
+impl std::fmt::Debug for RecoveryContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryContext")
+            .field("attempts", &self.attempts)
+            .field("events", &self.events)
+            .field("ledger", &self.ledger)
+            .field("clock_tick", &self.clock_tick)
+            .field("fail_at_step", &self.fail_at_step)
+            .field("step_executor", &self.step_executor.as_ref().map(|_| "Some(RecoveryStepExecutor)"))
+            .finish()
+    }
 }
 
 impl RecoveryContext {
@@ -218,6 +336,13 @@ impl RecoveryContext {
     #[must_use]
     pub fn with_fail_at_step(mut self, index: usize) -> Self {
         self.fail_at_step = Some(index);
+        self
+    }
+
+    /// BUG-10:注入 step 执行器,启用真实命令执行(Step 1.2)。
+    #[must_use]
+    pub fn with_step_executor(mut self, executor: Arc<dyn RecoveryStepExecutor>) -> Self {
+        self.step_executor = Some(executor);
         self
     }
 
@@ -424,12 +549,30 @@ pub fn attempt_recovery(scenario: &FailureScenario, ctx: &mut RecoveryContext) -
             failed = true;
             break;
         }
-        executed.push(step.clone());
-        command_results.push(RecoveryCommandResult {
-            command: step.clone(),
-            status: RecoveryAttemptState::Succeeded,
-            result: format!("step {i} succeeded for {scenario}"),
-        });
+
+        // BUG-10:使用注入的 step executor(若有),否则走模拟。
+        let (success, result_msg) = if let Some(executor) = &ctx.step_executor {
+            executor.execute(step, scenario)
+        } else {
+            (true, format!("step {i} succeeded for {scenario}"))
+        };
+
+        if success {
+            executed.push(step.clone());
+            command_results.push(RecoveryCommandResult {
+                command: step.clone(),
+                status: RecoveryAttemptState::Succeeded,
+                result: result_msg,
+            });
+        } else {
+            command_results.push(RecoveryCommandResult {
+                command: step.clone(),
+                status: RecoveryAttemptState::Failed,
+                result: result_msg,
+            });
+            failed = true;
+            break;
+        }
     }
 
     let result = if failed {

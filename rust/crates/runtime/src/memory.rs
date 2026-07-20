@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::memory_semantic::SemanticRecaller;
 use crate::memory_store::MemoryStore;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole};
 
@@ -36,6 +37,18 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// Derive a stable L1 index id from entry content. Same content → same id,
+/// so duplicate entries collapse to a single L1 slot during dedup. Uses
+/// the std default hasher (no extra dependency) — collision resistance
+/// is sufficient for an in-memory index that is rebuilt on every load.
+fn entry_id(content: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("entry-{:016x}", hasher.finish())
 }
 
 /// One of the three typed memory blocks mirroring Letta's core memory model.
@@ -233,30 +246,61 @@ impl MemoryEntry {
 /// ever lands in the system prompt within that session — this keeps the
 /// prompt-cache prefix stable. New facts written mid-session land on disk
 /// immediately but only surface in the next session.
+///
+/// `entries` holds only currently-active facts. Superseded / expired
+/// entries are migrated to `archive` during [`PersistentMemory::consolidate`]
+/// so audit history is preserved without bloating the active view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistentMemory {
     #[serde(default = "default_blocks")]
     blocks: [MemoryBlock; 3],
     #[serde(default)]
     entries: Vec<MemoryEntry>,
+    /// Archived (superseded / expired) entries kept for audit history.
+    /// Excluded from rendering. Capped at [`ARCHIVE_MAX_ENTRIES`] during
+    /// consolidation; oldest entries are dropped first.
+    #[serde(default)]
+    archive: Vec<MemoryEntry>,
     /// Path of the on-disk JSON file. Not serialized.
     #[serde(skip)]
     file_path: PathBuf,
     /// Snapshot captured at session start. Not serialized.
     #[serde(skip)]
     frozen_snapshot: Option<String>,
+    /// Semantic recall layer (L1 index). Not serialized — rebuilt at
+    /// load time from the entries list. Lives on the memory surface so
+    /// the runtime can issue [`PersistentMemory::semantic_recall`] without
+    /// juggling a second handle.
+    #[serde(skip)]
+    semantic: SemanticRecaller,
 }
+
+/// Maximum number of archived (superseded / expired) entries to retain
+/// on disk. Older entries are pruned during consolidation to bound growth.
+pub const ARCHIVE_MAX_ENTRIES: usize = 200;
 
 impl PersistentMemory {
     /// Build an empty memory surface pointing at the given file path.
+    ///
+    /// Captures a `frozen_snapshot` immediately so subsequent calls to
+    /// [`PersistentMemory::frozen_render`] return a byte-stable view even
+    /// if the caller mutates `entries` before the next session. Previously
+    /// `frozen_snapshot` was `None` here and `frozen_render` fell back to
+    /// `render_current()` — which called `now_ms()` and could return a
+    /// different active-entries set on each call, silently breaking the
+    /// prompt-cache prefix stability guarantee (B4).
     #[must_use]
     pub fn empty(file_path: impl Into<PathBuf>) -> Self {
-        Self {
+        let mut memory = Self {
             blocks: default_blocks(),
             entries: Vec::new(),
+            archive: Vec::new(),
             file_path: file_path.into(),
             frozen_snapshot: None,
-        }
+            semantic: SemanticRecaller::new(),
+        };
+        memory.frozen_snapshot = Some(memory.render_current());
+        memory
     }
 
     /// Load the memory file from disk and freeze a snapshot for the session.
@@ -265,6 +309,11 @@ impl PersistentMemory {
     /// The snapshot is captured immediately after load so the prompt-cache
     /// prefix remains stable for the lifetime of the session, regardless of
     /// any in-memory mutations.
+    ///
+    /// Also rebuilds the in-memory semantic L1 index from the loaded
+    /// entries list (the L1 index is `#[serde(skip)]` because it is a
+    /// pure derivative of `entries` and we do not want to persist a
+    /// second copy that could drift out of sync).
     pub fn load_and_freeze(file_path: &Path) -> Self {
         let mut memory = match MemoryStore::new(file_path.to_path_buf()).load() {
             Ok(Some(loaded)) => loaded.with_file_path(file_path.to_path_buf()),
@@ -274,6 +323,17 @@ impl PersistentMemory {
             // overwrite the bad file.
             Err(_) => Self::empty(file_path),
         };
+        // Rebuild semantic L1 index from entries. Only active entries are
+        // indexed — superseded / expired ones are in `archive` and not
+        // useful for recall.
+        let now = now_ms();
+        let mut recaller = SemanticRecaller::new();
+        for entry in &memory.entries {
+            if entry.is_active(now) {
+                recaller.add_l1_entry(&entry_id(&entry.content), &entry.content, &entry.source);
+            }
+        }
+        memory.semantic = recaller;
         memory.frozen_snapshot = Some(memory.render_current());
         memory
     }
@@ -295,10 +355,21 @@ impl PersistentMemory {
         &mut self.blocks
     }
 
-    /// Borrow all stored entries (including superseded / expired ones).
+    /// Borrow all stored entries (active only; superseded / expired
+    /// are migrated to [`PersistentMemory::archive`] during consolidation).
     #[must_use]
     pub fn entries(&self) -> &[MemoryEntry] {
         &self.entries
+    }
+
+    /// Borrow the archived (superseded / expired) entries kept for audit.
+    ///
+    /// Archive entries are never rendered into the system prompt; they
+    /// exist only so callers can reach back into superseded facts when
+    /// debugging or auditing memory state.
+    #[must_use]
+    pub fn archive(&self) -> &[MemoryEntry] {
+        &self.archive
     }
 
     /// Borrow the on-disk file path.
@@ -359,14 +430,17 @@ impl PersistentMemory {
 
     /// Append a new entry to the in-memory store and persist to disk.
     ///
-    /// Does NOT mutate `frozen_snapshot` — the snapshot is the only view
+    /// Also mirrors the new entry into the semantic L1 index so subsequent
+    /// [`PersistentMemory::semantic_recall`] calls can surface it. The
+    /// frozen snapshot is NOT mutated — the snapshot is the only view
     /// surfaced to the system prompt within the current session, so new
     /// entries only appear in the next session.
     pub fn add_entry(&mut self, content: &str, source: &str) {
         let now = now_ms();
         self.entries
             .push(MemoryEntry::new(content.to_string(), source.to_string(), now));
-        let _ = self.persist();
+        self.semantic.add_l1_entry(&entry_id(content), content, source);
+        self.persist_or_warn("add_entry");
     }
 
     /// Replace the first entry whose content matches `old_content_pattern`
@@ -374,7 +448,8 @@ impl PersistentMemory {
     ///
     /// If no match is found, the new content is still appended as a fresh
     /// entry — replacement is a no-op on the entries list, but the new fact
-    /// still lands on disk.
+    /// still lands on disk. The new content is also mirrored into the
+    /// semantic L1 index for [`PersistentMemory::semantic_recall`].
     pub fn replace_entry(&mut self, old_content_pattern: &str, new_content: &str, source: &str) {
         let now = now_ms();
         for entry in &mut self.entries {
@@ -385,7 +460,31 @@ impl PersistentMemory {
         }
         self.entries
             .push(MemoryEntry::new(new_content.to_string(), source.to_string(), now));
-        let _ = self.persist();
+        self.semantic.add_l1_entry(&entry_id(new_content), new_content, source);
+        self.persist_or_warn("replace_entry");
+    }
+
+    /// Semantic recall — return the top-k entries whose L1 summary best
+    /// matches `query`. Default strategy is keyword fallback (no embedding
+    /// API required). Hits are intended to be appended to the prompt's
+    /// dynamic region (after the cacheable prefix), not injected into the
+    /// frozen snapshot — see [`PersistentMemory::frozen_render`].
+    #[must_use]
+    pub fn semantic_recall(&self, query: &str, k: usize) -> Vec<crate::memory_semantic::MemoryHit> {
+        self.semantic.semantic_recall(query, k)
+    }
+
+    /// Borrow the underlying semantic recaller. Exposed so callers can
+    /// persist the L1 index via [`SemanticRecaller::persist_l1_index`]
+    /// or reload it via [`SemanticRecaller::load_l1_index`].
+    #[must_use]
+    pub fn semantic(&self) -> &SemanticRecaller {
+        &self.semantic
+    }
+
+    /// Mutably borrow the underlying semantic recaller.
+    pub fn semantic_mut(&mut self) -> &mut SemanticRecaller {
+        &mut self.semantic
     }
 
     /// Whether any block has crossed the 80% capacity threshold and needs
@@ -404,39 +503,70 @@ impl PersistentMemory {
 
     /// Consolidate the memory surface.
     ///
-    /// Drops superseded and expired entries, deduplicates entries with
-    /// identical content (keeping the newest), and compresses any block
+    /// Migrates superseded / expired entries from `entries` into `archive`
+    /// (audit history), deduplicates active entries with identical content
+    /// (keeping the newest), deduplicates archive entries the same way, caps
+    /// the archive size at [`ARCHIVE_MAX_ENTRIES`], and compresses any block
     /// that has crossed its `max_chars` budget. The frozen snapshot is NOT
     /// touched — consolidation only affects future sessions.
+    ///
+    /// Unlike the previous implementation, superseded / expired entries are
+    /// **retained** on disk (in `archive`) rather than dropped, preserving
+    /// the audit trail promised by the module docs.
     pub fn consolidate(&mut self) {
-        // 1. Drop superseded / expired entries entirely.
         let now = now_ms();
-        self.entries.retain(|entry| entry.is_active(now));
 
-        // 2. Deduplicate by content, keeping the latest occurrence.
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut deduped: Vec<MemoryEntry> = Vec::new();
-        for entry in self.entries.iter().rev() {
-            if seen.insert(entry.content.clone()) {
-                deduped.push(entry.clone());
+        // 1. Partition: active stays in `entries`, others move to `archive`.
+        let mut still_active = Vec::with_capacity(self.entries.len());
+        for entry in std::mem::take(&mut self.entries) {
+            if entry.is_active(now) {
+                still_active.push(entry);
+            } else {
+                self.archive.push(entry);
             }
         }
-        deduped.reverse();
-        self.entries = deduped;
+        self.entries = still_active;
 
-        // 3. Compress any block that has crossed its budget.
+        // 2. Deduplicate active entries by content, keeping the latest
+        //    occurrence (entries are pushed in chronological order, so
+        //    reverse iteration picks the newest first).
+        self.entries = dedup_latest(self.entries.split_off(0));
+
+        // 3. Deduplicate archive the same way, then cap to ARCHIVE_MAX_ENTRIES.
+        self.archive = dedup_latest(self.archive.split_off(0));
+        if self.archive.len() > ARCHIVE_MAX_ENTRIES {
+            // Oldest first (chronological append order), drop from the front.
+            let drop_count = self.archive.len() - ARCHIVE_MAX_ENTRIES;
+            self.archive.drain(0..drop_count);
+        }
+
+        // 4. Compress any block that has crossed its budget.
         for block in &mut self.blocks {
             if block.is_over_capacity() {
                 compress_block_content(block);
             }
         }
 
-        let _ = self.persist();
+        self.persist_or_warn("consolidate");
     }
 
     /// Persist the current in-memory state to disk.
     fn persist(&self) -> std::io::Result<()> {
         MemoryStore::new(self.file_path.clone()).save(self)
+    }
+
+    /// Persist and surface failures via stderr instead of silently
+    /// dropping them. Memory writes happen mid-turn and cannot bubble
+    /// out of the nudge / replace_entry paths without restructuring,
+    /// but a warning is enough to flag disk-full / permission issues
+    /// without crashing the session.
+    fn persist_or_warn(&self, context: &str) {
+        if let Err(err) = self.persist() {
+            eprintln!(
+                "[memory] warning: persist failed ({context}): {err}; path={}",
+                self.file_path.display()
+            );
+        }
     }
 
     /// Return only entries that are still active at `now_ms`.
@@ -479,9 +609,55 @@ impl PersistentMemory {
         let now = now_ms();
         if let Some(entry) = self.entries.get_mut(index) {
             entry.supersede(new_content.to_string(), now);
-            let _ = self.persist();
+            self.persist_or_warn("supersede");
         }
     }
+
+    /// Remove the first active entry whose content contains `pattern`,
+    /// migrating it directly to `archive` (audit history). Unlike
+    /// [`PersistentMemory::replace_entry`], which leaves the superseded
+    /// entry in `entries` until the next [`PersistentMemory::consolidate`]
+    /// pass, `remove_entry` immediately moves the retired entry into
+    /// `archive` so callers can observe the retirement without waiting
+    /// for a consolidation trigger.
+    ///
+    /// Returns `true` if an entry was retired, `false` if no active entry
+    /// matched `pattern`.
+    pub fn remove_entry(&mut self, pattern: &str) -> bool {
+        let now = now_ms();
+        let mut found_idx: Option<usize> = None;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.is_active(now) && entry.content.contains(pattern) {
+                found_idx = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = found_idx {
+            let mut entry = self.entries.remove(idx);
+            // Use the pattern itself as `superseded_by` so the archive
+            // entry's audit trail records why it was retired.
+            entry.supersede(pattern.to_string(), now);
+            self.archive.push(entry);
+            self.persist_or_warn("remove_entry");
+            return true;
+        }
+        false
+    }
+}
+
+/// Deduplicate a list of [`MemoryEntry`] by content, keeping the latest
+/// occurrence of each duplicate. Entries are assumed to be in chronological
+/// (append) order, so reverse iteration picks the newest version first.
+fn dedup_latest(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped: Vec<MemoryEntry> = Vec::with_capacity(entries.len());
+    for entry in entries.into_iter().rev() {
+        if seen.insert(entry.content.clone()) {
+            deduped.push(entry);
+        }
+    }
+    deduped.reverse();
+    deduped
 }
 
 /// Detect entries that conflict with a proposed new entry.
@@ -507,28 +683,76 @@ pub fn detect_conflicts(new_entry: &MemoryEntry, existing: &[MemoryEntry]) -> Ve
     conflicts
 }
 
-/// Return a compiled regex for detecting memory keywords with optional
-/// conjugation suffixes. Compiled once and cached for the process lifetime.
-fn contradiction_regex() -> &'static Regex {
+/// Return a compiled regex for detecting English memory keywords with
+/// optional conjugation suffixes. Compiled once and cached for the process
+/// lifetime.
+fn contradiction_regex_en() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
             r"(?i)\b(prefer|always|never|use|like|hate)(?:s|ed|d)?\b\s+(.+?)(?:[.,;\n]|$)",
         )
-        .expect("contradiction regex should compile")
+        .expect("contradiction regex en should compile")
     })
 }
 
-/// Extract the (keyword, value) pair from a sentence like
-/// "user prefers dark mode" → ("prefer", "dark mode").
+/// Return a compiled regex for detecting Chinese memory keywords. Compiled
+/// once and cached for the process lifetime.
+///
+/// Chinese keywords are matched without word boundaries (since `\b` in
+/// the `regex` crate is ASCII-only and does not fire between adjacent
+/// Han characters). Values are bounded by sentence-ending punctuation
+/// (。、!?), commas, semicolons, or newlines — or end of string.
+fn contradiction_regex_zh() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Pairs mirror the English keyword set:
+        //   偏好 ≈ prefer, 总是 ≈ always, 从不 ≈ never,
+        //   使用 ≈ use, 喜欢 ≈ like, 不喜欢/讨厌 ≈ hate.
+        Regex::new(r"(偏好|总是|从不|使用|喜欢|不喜欢|讨厌)([^。、!?\n.,;]+)")
+            .expect("contradiction regex zh should compile")
+    })
+}
+
+/// Extract the (keyword, value) pair from a memory assertion.
+///
+/// English examples:
+/// * `"user prefers dark mode"` → `("prefer", "dark mode")`.
+///
+/// Chinese examples (B7 fix — previously Chinese memory assertions
+/// silently bypassed `detect_conflicts`, so contradicting preferences
+/// like "偏好深色模式" vs "偏好浅色模式" could coexist on disk):
+/// * `"用户偏好深色模式"` → `("偏好", "深色模式")`.
+/// * `"总是使用 tabs"` → `("总是", "使用 tabs")`.
 ///
 /// Returns `None` when no memory keyword is found or the captured value is
 /// empty.
 fn extract_keyword_value(text: &str) -> Option<(String, String)> {
-    let re = contradiction_regex();
+    // Try English regex first (case-insensitive, with word boundary).
+    if let Some((kw, val)) = extract_keyword_value_en(text) {
+        return Some((kw, val));
+    }
+    // Fall back to Chinese regex.
+    extract_keyword_value_zh(text)
+}
+
+fn extract_keyword_value_en(text: &str) -> Option<(String, String)> {
+    let re = contradiction_regex_en();
     let caps = re.captures(text)?;
     let kw = caps.get(1)?.as_str().to_lowercase();
     let val = caps.get(2)?.as_str().trim().to_lowercase();
+    if val.is_empty() {
+        None
+    } else {
+        Some((kw, val))
+    }
+}
+
+fn extract_keyword_value_zh(text: &str) -> Option<(String, String)> {
+    let re = contradiction_regex_zh();
+    let caps = re.captures(text)?;
+    let kw = caps.get(1)?.as_str().to_string();
+    let val = caps.get(2)?.as_str().trim().to_string();
     if val.is_empty() {
         None
     } else {
@@ -618,6 +842,8 @@ pub enum NudgeAction {
     /// Remove any fact whose content matches `pattern`.
     Remove {
         pattern: String,
+        /// Provenance tag for telemetry / debugging.
+        source: String,
     },
 }
 
@@ -651,25 +877,44 @@ const REMEMBER_KEYWORDS: &[&str] = &[
     "永恒",
 ];
 
+/// Trigger keywords that signal a request to forget / retire a fact.
+/// Matches produce [`NudgeAction::Remove`]. Like corrections, the actual
+/// retired entry is resolved via content match — the keyword itself is
+/// not used as the pattern.
+const FORGET_KEYWORDS: &[&str] = &["forget", "忘记", "别再记住", "stop remembering"];
+
 /// Extract candidate curation actions from the most recent conversation turns.
 ///
-/// Rule-based only — no LLM fork. Two passes:
-/// 1. Scan for correction phrases (`no, I meant`, `actually`, …). These
-///    produce [`NudgeAction::Replace`] suggestions so the old fact is
-///    superseded rather than contradicted on disk.
-/// 2. Scan for explicit memory keywords (`remember`, `prefer`, `always`,
-///    `never`, …). These produce [`NudgeAction::Add`] suggestions.
+/// Rule-based only — no LLM fork. Three passes (highest priority first):
+/// 1. Forget keywords (`forget`, `忘记`, …). For each, the post-keyword
+///    text is used as a content pattern to retire a matching active entry.
+///    Emits [`NudgeAction::Remove`].
+/// 2. Correction phrases (`no, I meant`, `actually`, …). For each,
+///    build a candidate [`MemoryEntry`] from the post-phrase text and call
+///    [`PersistentMemory::detect_conflicts`] to find the actual prior entry
+///    that contradicts the new statement. If a conflict is found, emit a
+///    [`NudgeAction::Replace`] whose `old_pattern` is the real old entry's
+///    content — so [`PersistentMemory::replace_entry`] can supersede it.
+///    If no conflict is found (e.g. correction without a prior fact), fall
+///    back to [`NudgeAction::Add`].
+/// 3. Explicit memory keywords (`remember`, `prefer`, `always`,
+///    `never`, …). These produce [`NudgeAction::Add`] suggestions. Before
+///    adding, we also check `detect_conflicts` so a contradicting keyword
+///    (e.g. `prefer light mode` while an existing entry says `prefer dark
+///    mode`) supersedes the old fact instead of producing two active
+///    contradictions on disk.
 ///
 /// At most `config.max_entries_per_nudge` actions are returned, prioritising
-/// corrections over adds.
+/// forgets, then corrections, then adds.
 #[must_use]
 pub fn extract_nudge_actions(
     recent_messages: &[ConversationMessage],
-    _existing_memory: &PersistentMemory,
+    existing_memory: &PersistentMemory,
     config: &NudgeConfig,
 ) -> Vec<NudgeAction> {
     let mut actions = Vec::new();
     let max = config.max_entries_per_nudge;
+    let now = now_ms();
 
     let mut scanned = 0usize;
     for msg in recent_messages.iter().rev() {
@@ -686,32 +931,93 @@ pub fn extract_nudge_actions(
         }
         let lower = text.to_lowercase();
 
-        // 1. Corrections first — higher priority.
-        for phrase in CORRECTION_PHRASES {
-            if lower.contains(phrase) {
-                let content = extract_after_phrase(&text, phrase).trim().to_string();
-                if !content.is_empty() {
-                    actions.push(NudgeAction::Replace {
-                        old_pattern: phrase.to_string(),
-                        new_content: content,
-                        source: "nudge-correction".to_string(),
-                    });
-                    if actions.len() >= max {
-                        return actions;
+        // 1. Forget keywords — highest priority.
+        for keyword in FORGET_KEYWORDS {
+            if lower.contains(keyword) {
+                let pattern = extract_after_phrase(&text, keyword).trim().to_string();
+                if !pattern.is_empty() {
+                    // Only emit Remove if an active entry actually matches
+                    // the pattern — otherwise the action would be a no-op.
+                    let matches = existing_memory
+                        .entries()
+                        .iter()
+                        .any(|e| e.is_active(now) && e.content.contains(&pattern));
+                    if matches {
+                        actions.push(NudgeAction::Remove {
+                            pattern,
+                            source: "nudge-forget".to_string(),
+                        });
+                        if actions.len() >= max {
+                            return actions;
+                        }
                     }
                 }
+                break; // one forget keyword per message
             }
         }
 
-        // 2. Explicit memory keywords.
+        // 2. Corrections — second priority. Multiple correction phrases may
+        //    fire on the same message (e.g. "No, I meant …" matches both
+        //    "no, i meant" and "i meant"); break after the first match to
+        //    avoid emitting duplicate actions for the same user turn.
+        //    A correction also subsumes any later "remember"/"prefer"
+        //    keyword in the same message — the correction phrase already
+        //    captured the user's intent.
+        let mut correction_emitted = false;
+        for phrase in CORRECTION_PHRASES {
+            if lower.contains(phrase) {
+                let content = extract_after_phrase(&text, phrase).trim().to_string();
+                if content.is_empty() {
+                    continue;
+                }
+                let new_entry = MemoryEntry::new(content.clone(), "nudge-correction", now);
+                let conflicts = existing_memory.detect_conflicts(&new_entry);
+                if let Some(&idx) = conflicts.first() {
+                    // Real prior fact found — supersede it.
+                    let old_content = existing_memory.entries()[idx].content.clone();
+                    actions.push(NudgeAction::Replace {
+                        old_pattern: old_content,
+                        new_content: content,
+                        source: "nudge-correction".to_string(),
+                    });
+                } else {
+                    // No prior fact to correct — treat as a fresh add.
+                    actions.push(NudgeAction::Add {
+                        content,
+                        source: "nudge-correction".to_string(),
+                    });
+                }
+                correction_emitted = true;
+                if actions.len() >= max {
+                    return actions;
+                }
+                break; // one correction per message
+            }
+        }
+        if correction_emitted {
+            continue; // next message — keyword pass subsumed by correction
+        }
+
+        // 3. Explicit memory keywords — lowest priority.
         for keyword in REMEMBER_KEYWORDS {
             if lower.contains(keyword) {
                 let content = extract_after_phrase(&text, keyword).trim().to_string();
                 if !content.is_empty() {
-                    actions.push(NudgeAction::Add {
-                        content,
-                        source: "nudge-keyword".to_string(),
-                    });
+                    let new_entry = MemoryEntry::new(content.clone(), "nudge-keyword", now);
+                    let conflicts = existing_memory.detect_conflicts(&new_entry);
+                    if let Some(&idx) = conflicts.first() {
+                        let old_content = existing_memory.entries()[idx].content.clone();
+                        actions.push(NudgeAction::Replace {
+                            old_pattern: old_content,
+                            new_content: content,
+                            source: "nudge-keyword".to_string(),
+                        });
+                    } else {
+                        actions.push(NudgeAction::Add {
+                            content,
+                            source: "nudge-keyword".to_string(),
+                        });
+                    }
                     if actions.len() >= max {
                         return actions;
                     }
@@ -798,6 +1104,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_captures_frozen_snapshot_for_byte_stability() {
+        // B4 regression guard: `empty()` previously left frozen_snapshot
+        // as None, so frozen_render() fell back to render_current() which
+        // calls now_ms() — meaning two calls could return different
+        // active-entries sets if an entry expired between them. The fix
+        // captures a snapshot at construction time.
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        let before = mem.frozen_render();
+        // Add an entry mid-session — snapshot must NOT pick it up.
+        mem.add_entry("user likes rust", "test");
+        let after = mem.frozen_render();
+        assert_eq!(before, after, "empty() must capture a stable snapshot");
+        assert!(!after.contains("user likes rust"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn add_entry_writes_to_disk_but_not_frozen_snapshot() {
         let path = temp_path();
         let mut mem = PersistentMemory::load_and_freeze(&path);
@@ -836,9 +1160,36 @@ mod tests {
         let before = mem.entries().len();
         assert_eq!(before, 3);
         mem.consolidate();
-        // Superseded entry is gone, duplicate is gone, distinct entry stays.
+        // Superseded entry is gone from `entries` (moved to `archive`),
+        // duplicate is deduped, distinct entry stays.
         assert!(mem.entries().len() < before);
         assert!(mem.entries().iter().any(|e| e.content == "works at acme"));
+        // B2 regression guard: superseded entry must be retained in `archive`
+        // for audit purposes — NOT dropped on the floor.
+        assert!(
+            mem.archive().iter().any(|e| e.content == "prefer dark mode"),
+            "superseded entries should be retained in archive: {:?}",
+            mem.archive()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_caps_archive_size() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        // Push well over ARCHIVE_MAX_ENTRIES superseded entries.
+        for i in 0..(ARCHIVE_MAX_ENTRIES + 50) {
+            mem.add_entry(&format!("stale fact {i}"), "s");
+            let idx = mem.entries.len() - 1;
+            mem.entries[idx].supersede("newer", now_ms());
+        }
+        mem.consolidate();
+        assert!(
+            mem.archive().len() <= ARCHIVE_MAX_ENTRIES,
+            "archive should be capped at ARCHIVE_MAX_ENTRIES, got {}",
+            mem.archive().len()
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -916,6 +1267,57 @@ mod tests {
     }
 
     #[test]
+    fn conflict_detection_finds_chinese_contradictory_entries() {
+        // B7 regression guard: previously the regex was ASCII-only, so
+        // Chinese preferences like 偏好深色模式 vs 偏好浅色模式 silently
+        // bypassed conflict detection and could coexist on disk.
+        let existing = vec![
+            MemoryEntry::new("用户偏好深色模式", "session-a", 1000),
+            MemoryEntry::new("用户喜欢 rust", "session-a", 1100),
+        ];
+        let new = MemoryEntry::new("用户偏好浅色模式", "session-b", 2000);
+        let conflicts = detect_conflicts(&new, &existing);
+        assert_eq!(conflicts, vec![0]);
+    }
+
+    #[test]
+    fn extract_keyword_value_chinese_extracts_preference() {
+        let (kw, val) = extract_keyword_value("用户偏好深色模式")
+            .expect("Chinese preference should extract");
+        assert_eq!(kw, "偏好");
+        assert!(val.contains("深色模式"));
+    }
+
+    #[test]
+    fn add_entry_mirrors_into_semantic_l1_index() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.add_entry("user prefers rust for systems programming", "test");
+        // L1 index should have one entry that recall can match.
+        let hits = mem.semantic_recall("rust systems programming", 5);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.summary.contains("rust"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_and_freeze_rebuilds_semantic_l1_index_from_entries() {
+        let path = temp_path();
+        {
+            let mut mem = PersistentMemory::empty(&path);
+            mem.add_entry("user prefers dark mode", "seed-1");
+            mem.add_entry("user likes rust language", "seed-2");
+        }
+        // Reload — the in-memory semantic field is `#[serde(skip)]` so it
+        // must be rebuilt from entries, otherwise recall returns nothing.
+        let mem = PersistentMemory::load_and_freeze(&path);
+        let hits = mem.semantic_recall("rust language", 5);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.summary.contains("rust"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn unverified_entries_marked_after_7_days() {
         let path = temp_path();
         let mut mem = PersistentMemory::empty(&path);
@@ -958,7 +1360,12 @@ mod tests {
 
     #[test]
     fn extract_nudge_actions_detects_correction() {
-        let mem = PersistentMemory::empty(temp_path());
+        // Pre-seed a contradicting fact so the correction has a real
+        // target to supersede. With no prior fact, the correction would
+        // fall back to Add (no prior fact to correct).
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.add_entry("user prefers dark mode", "seed");
         let cfg = NudgeConfig::default();
         let msgs = vec![ConversationMessage::user_text(
             "No, I meant I prefer light mode",
@@ -966,11 +1373,114 @@ mod tests {
         let actions = extract_nudge_actions(&msgs, &mem, &cfg);
         assert!(!actions.is_empty());
         match &actions[0] {
-            NudgeAction::Replace { new_content, .. } => {
+            NudgeAction::Replace {
+                old_pattern,
+                new_content,
+                ..
+            } => {
                 assert!(new_content.contains("light mode"));
+                // old_pattern must point at the real prior entry content,
+                // NOT at the trigger phrase "no, i meant" (B1 regression guard).
+                assert!(
+                    old_pattern.contains("dark mode"),
+                    "old_pattern should reference the superseded fact, got: {old_pattern}"
+                );
+                assert_ne!(old_pattern, "no, i meant");
             }
             other => panic!("expected Replace action, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_nudge_actions_correction_without_prior_fact_falls_back_to_add() {
+        // No prior fact to correct — should produce Add, not Replace
+        // with a meaningless old_pattern pointing at the trigger phrase.
+        let mem = PersistentMemory::empty(temp_path());
+        let cfg = NudgeConfig::default();
+        let msgs = vec![ConversationMessage::user_text(
+            "No, I meant I prefer light mode",
+        )];
+        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NudgeAction::Add { content, .. } => {
+                assert!(content.contains("light mode"));
+            }
+            other => panic!("expected Add action for correction-without-prior-fact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_nudge_actions_keyword_supersedes_contradicting_prior_entry() {
+        // "remember I prefer light mode" while an existing entry says
+        // "user prefers dark mode" — should produce Replace, not a
+        // second contradicting Add.
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.add_entry("user prefers dark mode", "seed");
+        let cfg = NudgeConfig::default();
+        let msgs = vec![ConversationMessage::user_text(
+            "Remember I prefer light mode",
+        )];
+        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NudgeAction::Replace { old_pattern, new_content, .. } => {
+                assert!(old_pattern.contains("dark mode"));
+                assert!(new_content.contains("light mode"));
+            }
+            other => panic!("expected Replace for contradicting keyword, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_nudge_actions_forget_keyword_emits_remove_when_entry_exists() {
+        // B8 regression guard: previously NudgeAction::Remove was a dead
+        // branch — extract never emitted it and conversation.rs silently
+        // skipped the match arm. Now forget keywords emit Remove and
+        // remove_entry retires the matching active entry into archive.
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.add_entry("user likes rust", "seed");
+        let cfg = NudgeConfig::default();
+        let msgs = vec![ConversationMessage::user_text("forget rust")];
+        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NudgeAction::Remove { pattern, .. } => {
+                assert!(pattern.contains("rust"));
+            }
+            other => panic!("expected Remove for forget keyword, got {other:?}"),
+        }
+        // Apply the action — entry should be retired into archive.
+        for action in actions {
+            if let NudgeAction::Remove { pattern, .. } = action {
+                assert!(mem.remove_entry(&pattern), "remove_entry should retire matching entry");
+            }
+        }
+        let now = now_ms();
+        assert!(
+            mem.entries().iter().all(|e| !e.is_active(now) || !e.content.contains("rust")),
+            "rust entry should no longer be active"
+        );
+        assert!(
+            mem.archive().iter().any(|e| e.content.contains("rust")),
+            "retired entry should be retained in archive"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_nudge_actions_forget_keyword_no_match_emits_nothing() {
+        // forget with no matching active entry should not emit Remove
+        // (avoids no-op actions clogging the nudge budget).
+        let mem = PersistentMemory::empty(temp_path());
+        let cfg = NudgeConfig::default();
+        let msgs = vec![ConversationMessage::user_text("forget non-existent thing")];
+        let actions = extract_nudge_actions(&msgs, &mem, &cfg);
+        assert!(actions.is_empty(), "expected no actions for unmatched forget");
     }
 
     #[test]

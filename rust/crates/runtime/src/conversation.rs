@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -16,8 +18,35 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::prompt::SystemPromptSplit;
-use crate::session::{ContentBlock, ConversationMessage, Session};
+// Harness L(生命周期)层接入:run_turn 失败分支调用 RecoveryOrchestrator 尝试一次自动恢复。
+// 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
+use crate::recovery_orchestrator::RecoveryOrchestrator;
+use crate::recovery_recipes::RecoveryResult;
+// Harness O(编排)层 + V(验证)层接入:Plan/Execute/Review 三段循环。
+// 默认不启用(plan_mode=false),需通过 CLI `--enable-plan-mode` 开启。
+// 缓存保护:PlanArtifact 末尾追加到 prompt 变动区(dynamic_sections),
+// 不污染 system_prompt + tools_schema 的"绝对稳定区"。详见
+// docs/harness-engineering-optimization-plan.md Step 2.1 与 §5.2。
+use crate::planner::{
+    assess_complexity, persist_plan_artifact, ComplexityAssessment, PlanArtifact,
+    PreCompletionChecklistMiddleware, ReviewResult,
+};
+// Harness O(可观测性)层接入:LoopDetectionMiddleware 打断 Doom Loop。
+// 在 PostToolUse hook 中调用 LoopDetector::record_edit,根据 LoopAction
+// 决定 Continue / InjectContext / Abort。详见
+// docs/harness-engineering-optimization-plan.md Step 2.2。
+use crate::loop_detection::{LoopAction, LoopDetector};
+// Harness C(Context Management)层接入:ContextAssembler 统一 prompt 注入。
+// 当注入时,PlanArtifact render 通过 assembler 收集到 Goal source,
+// 取 volatile_content() 作为 dynamic_sections。详见
+// docs/harness-engineering-optimization-plan.md Step 2.3。
+use crate::context_assembler::{ContextAssembler, ContextSource};
+use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::trace_analyzer::{TraceAnalyzer, TraceRecord};
 use crate::usage::{TokenUsage, UsageTracker};
+use crate::worker_boot::WorkerFailureKind;
+use std::cell::Cell;
+use std::path::PathBuf;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -37,6 +66,7 @@ const REACTIVE_MICROCOMPACT_PRESERVE_RECENT: usize = 2;
 /// [`ConversationRuntime::execute_session_search`]; the registry only
 /// needs to surface the tool's name, description, and input schema to
 /// the model.
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
 pub const SESSION_SEARCH_TOOL_SPEC: &str = r#"{
     "name": "session_search",
     "description": "Search the conversation history using full-text search. Use this to recall specific past discussions, decisions, or file references that may not be in the current context window. Returns ranked matches with session ID, role, and content snippet.",
@@ -210,7 +240,7 @@ pub struct ConversationRuntime<C, T> {
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
     hook_abort_signal: HookAbortSignal,
-    hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
+    hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
     session_tracer: Option<SessionTracer>,
     /// Optional persistent memory surface. When present, the runtime runs a
     /// rule-based nudge pass every `NudgeConfig::interval_turns` turns to keep
@@ -219,6 +249,67 @@ pub struct ConversationRuntime<C, T> {
     /// Turns elapsed since the last nudge fired. Reset to 0 whenever a nudge
     /// runs.
     turns_since_last_nudge: usize,
+    /// Recovery orchestrator invoked on the `run_turn` failure path. Wraps
+    /// `recovery_recipes` so callers can request recovery by
+    /// [`WorkerFailureKind`] without coupling to recipe lookup. Each scenario
+    /// enforces the recipe's `max_attempts` policy (default 1) before
+    /// escalation, preventing infinite retry loops.
+    recovery_orchestrator: RecoveryOrchestrator,
+    /// Harness O(编排)层:Plan/Execute/Review 三段循环开关。
+    /// 默认 `false`,需通过 CLI `--enable-plan-mode` 或 settings.json
+    /// `planMode: true` 开启。详见
+    /// `docs/harness-engineering-optimization-plan.md` Step 2.1。
+    plan_mode_enabled: bool,
+    /// 当前活跃的 PlanArtifact。`None` 表示当前 turn 无活跃 plan。
+    /// 当 `plan_mode_enabled=true` 且 `assess_complexity` 返回 `Complex` 时,
+    /// 在 `run_turn` 入口创建并 persist,turn 结束时清空(或 replan 时保留)。
+    active_plan: Option<PlanArtifact>,
+    /// Review 阶段中间件,决定 AllPassed / Replan / Failed。
+    /// 默认 `max_replans=3`,通过 `with_plan_reviewer` 可定制。
+    plan_reviewer: PreCompletionChecklistMiddleware,
+    /// 用于 `persist_plan_artifact` 的工作区根目录。
+    /// `None` 时跳过持久化(仅内存)。生产环境应通过
+    /// `with_workspace_root` 注入 `cwd`。
+    workspace_root: Option<PathBuf>,
+    /// Harness O(可观测性)层:Doom Loop 检测器。
+    /// 在 PostToolUse hook 中记录每次 Edit/Write/MultiEdit 工具的文件路径,
+    /// 同文件 5 次编辑触发 InjectContext,10 次触发 Abort。详见
+    /// docs/harness-engineering-optimization-plan.md Step 2.2。
+    loop_detector: LoopDetector,
+    /// Harness C(Context Management)层:统一 prompt 注入器。
+    /// `None` 时走原 SystemPromptSplit + 手动 push 逻辑;
+    /// `Some` 时 PlanArtifact render 通过 assembler 收集到 Goal source,
+    /// 取 volatile_content() 作为 dynamic_sections。详见
+    /// docs/harness-engineering-optimization-plan.md Step 2.3。
+    context_assembler: Option<ContextAssembler>,
+    /// BUG-6 修复:语义召回结果,在 run_turn 入口填充,request 构造时注入。
+    ///
+    /// 当 persistent_memory 存在时,run_turn 入口调用
+    /// `persistent_memory.semantic_recall(user_input, k=3)` 获取 top-3 记忆,
+    /// 渲染成文本块存到此字段。request 构造时通过 ContextAssembler Memory
+    /// source 或手动 push 注入到 dynamic_sections。turn 结束时清空。
+    /// 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
+    pending_semantic_context: Option<String>,
+    /// BUG-7 修复:Harness V(验证)层接入 — VerifierAgent。
+    ///
+    /// `None` 时 Review 阶段只检查 StepStatus(原逻辑);
+    /// `Some` 时对每个 Succeeded 状态的 step 调用
+    /// `verifier.verify(tool_result, acceptance_criteria, method)`,
+    /// verify 失败则把 step 状态改为 Failed,再走 plan_reviewer.review。
+    /// 详见 docs/harness-engineering-optimization-plan.md Step 3.1。
+    verifier_agent: Option<crate::verifier::VerifierAgent>,
+    /// BUG-9 修复:Harness O(可观测性)层接入 — TraceAnalyzer (Step 3.3)。
+    ///
+    /// `None` 时 run_turn 不记录 trace;
+    /// `Some` 时在 turn 成功/失败出口构造 [`TraceRecord`] 并 `add_record`,
+    /// 后续可通过 `trace_analyzer()` 拿到 handle 导出 CSV 或计算 stats。
+    /// 用 `Arc<Mutex<TraceAnalyzer>>` 提供 interior mutability,
+    /// 让 `&self` 的 `record_turn_*` 钩子能写入。详见
+    /// docs/harness-engineering-optimization-plan.md Step 3.3。
+    trace_analyzer: Option<Arc<Mutex<TraceAnalyzer>>>,
+    /// BUG-9:当前 turn 的开始时间,run_turn 入口 set,record_turn_* 读取。
+    /// 用 `Cell` 提供 interior mutability(Instant: Copy)。
+    turn_start: Cell<Option<Instant>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -270,6 +361,17 @@ where
             session_tracer: None,
             persistent_memory: None,
             turns_since_last_nudge: 0,
+            recovery_orchestrator: RecoveryOrchestrator::default(),
+            plan_mode_enabled: false,
+            active_plan: None,
+            plan_reviewer: PreCompletionChecklistMiddleware::default(),
+            workspace_root: None,
+            loop_detector: LoopDetector::new(),
+            context_assembler: None,
+            pending_semantic_context: None,
+            verifier_agent: None,
+            trace_analyzer: None,
+            turn_start: Cell::new(None),
         }
     }
 
@@ -294,7 +396,7 @@ where
     #[must_use]
     pub fn with_hook_progress_reporter(
         mut self,
-        hook_progress_reporter: Box<dyn HookProgressReporter>,
+        hook_progress_reporter: Box<dyn HookProgressReporter + Send>,
     ) -> Self {
         self.hook_progress_reporter = Some(hook_progress_reporter);
         self
@@ -326,6 +428,168 @@ where
         self.persistent_memory.as_ref()
     }
 
+    /// Replace the default recovery orchestrator with a custom one. Useful
+    /// for tests that need to inspect `RecoveryContext` after a failure, or
+    /// for callers that want to pre-seed attempt counters.
+    #[must_use]
+    pub fn with_recovery_orchestrator(mut self, orchestrator: RecoveryOrchestrator) -> Self {
+        self.recovery_orchestrator = orchestrator;
+        self
+    }
+
+    /// Borrow the recovery orchestrator (for introspection / tests).
+    #[must_use]
+    pub fn recovery_orchestrator(&self) -> &RecoveryOrchestrator {
+        &self.recovery_orchestrator
+    }
+
+    /// 启用 Plan/Execute/Review 三段循环(`--enable-plan-mode` 调用)。
+    /// 详见 `docs/harness-engineering-optimization-plan.md` Step 2.1。
+    /// 启用后,`run_turn` 会:
+    /// 1. 入口调用 `assess_complexity(user_input)` 判断复杂任务。
+    /// 2. Complex 时创建 `PlanArtifact` 并 persist 到
+    ///    `<workspace>/.claw/plans/<id>.json`。
+    /// 3. 把 PlanArtifact 末尾追加到 system_prompt 的 dynamic_sections
+    ///    (缓存保护,不污染绝对稳定区)。
+    /// 4. 主循环退出前调用 `PreCompletionChecklistMiddleware::review`,
+    ///    AllPassed/Replan/Failed 决定后续动作。
+    #[must_use]
+    pub fn with_plan_mode_enabled(mut self, enabled: bool) -> Self {
+        self.plan_mode_enabled = enabled;
+        self
+    }
+
+    /// 注入工作区根目录,用于 `persist_plan_artifact` 写入
+    /// `<workspace>/.claw/plans/<id>.json`。生产环境应注入 `cwd`。
+    #[must_use]
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
+        self
+    }
+
+    /// BUG-5 修复:注入 ContextAssembler,启用统一 prompt 注入路径。
+    ///
+    /// 注入后,每个 turn 构造 request 时会:
+    /// 1. clone 一份 assembler(避免污染状态);
+    /// 2. clear 所有 source;
+    /// 3. 把 PlanArtifact render 后 add 到 Goal source;
+    /// 4. 调用 assemble() 取 volatile_content() 作为 dynamic_sections。
+    ///
+    /// 不注入时走原 SystemPromptSplit + 手动 push 逻辑,保持向后兼容。
+    /// 详见 docs/harness-engineering-optimization-plan.md Step 2.3。
+    #[must_use]
+    pub fn with_context_assembler(mut self, assembler: ContextAssembler) -> Self {
+        self.context_assembler = Some(assembler);
+        self
+    }
+
+    /// `&mut self` 版本的 `with_context_assembler`,用于已构造的 runtime。
+    pub fn set_context_assembler(&mut self, assembler: ContextAssembler) {
+        self.context_assembler = Some(assembler);
+    }
+
+    /// BUG-7 修复:注入 VerifierAgent,启用 acceptance_criteria 真实校验。
+    ///
+    /// 注入后,Review 阶段会对每个 Succeeded 状态的 step 调用
+    /// `verifier.verify(tool_result, acceptance_criteria, method)`。
+    /// verify 失败则把 step 状态改为 Failed,再走 plan_reviewer.review。
+    /// 详见 docs/harness-engineering-optimization-plan.md Step 3.1。
+    #[must_use]
+    pub fn with_verifier_agent(mut self, agent: crate::verifier::VerifierAgent) -> Self {
+        self.verifier_agent = Some(agent);
+        self
+    }
+
+    /// `&mut self` 版本的 `with_verifier_agent`。
+    pub fn set_verifier_agent(&mut self, agent: crate::verifier::VerifierAgent) {
+        self.verifier_agent = Some(agent);
+    }
+
+    /// BUG-9 修复:注入 TraceAnalyzer,启用 telemetry 记录(Step 3.3)。
+    ///
+    /// 注入后,每个 turn 的成功/失败出口会构造一条 [`TraceRecord`] 并
+    /// `add_record`。返回的 `Arc<Mutex<TraceAnalyzer>>` 让调用方可继续
+    /// 读取(如导出 CSV、计算 stats)。详见
+    /// docs/harness-engineering-optimization-plan.md Step 3.3。
+    #[must_use]
+    pub fn with_trace_analyzer(mut self, analyzer: TraceAnalyzer) -> Self {
+        self.trace_analyzer = Some(Arc::new(Mutex::new(analyzer)));
+        self
+    }
+
+    /// `&mut self` 版本的 `with_trace_analyzer`。
+    pub fn set_trace_analyzer(&mut self, analyzer: TraceAnalyzer) {
+        self.trace_analyzer = Some(Arc::new(Mutex::new(analyzer)));
+    }
+
+    /// 获取已注入的 TraceAnalyzer handle(克隆 `Arc`)。
+    ///
+    /// 调用方可通过 `handle.lock().stats()` 或 `handle.lock().export_csv(path)`
+    /// 读取 trace 数据。`None` 表示未注入。
+    #[must_use]
+    pub fn trace_analyzer_handle(&self) -> Option<Arc<Mutex<TraceAnalyzer>>> {
+        self.trace_analyzer.clone()
+    }
+
+    /// `&mut self` 版本的 `with_plan_mode_enabled`,用于已构造的 runtime
+    /// (避免 move 出 `cli.runtime` 字段)。Step 2.1 接入时使用。
+    pub fn set_plan_mode_enabled(&mut self, enabled: bool) {
+        self.plan_mode_enabled = enabled;
+    }
+
+    /// `&mut self` 版本的 `with_workspace_root`,同上。
+    pub fn set_workspace_root(&mut self, root: PathBuf) {
+        self.workspace_root = Some(root);
+    }
+
+    /// 替换默认的 `PreCompletionChecklistMiddleware`(自定义 `max_replans`)。
+    #[must_use]
+    pub fn with_plan_reviewer(mut self, reviewer: PreCompletionChecklistMiddleware) -> Self {
+        self.plan_reviewer = reviewer;
+        self
+    }
+
+    /// Borrow 当前活跃的 PlanArtifact(供测试 / 诊断使用)。
+    #[must_use]
+    pub fn active_plan(&self) -> Option<&PlanArtifact> {
+        self.active_plan.as_ref()
+    }
+
+    /// 是否启用了 Plan 模式。
+    #[must_use]
+    pub fn plan_mode_enabled(&self) -> bool {
+        self.plan_mode_enabled
+    }
+
+    /// BUG-3 修复:统一的"先尝试恢复,失败再 record_turn_failed"流程。
+    ///
+    /// 文档要求所有 `record_turn_failed` 调用点都先经过 RecoveryOrchestrator
+    /// (Step 1.2)。原实现只在 stream error 分支接入了 Provider 场景恢复,
+    /// 其余 4 处失败分支(compaction 各阶段、build_assistant_message、
+    /// max_iterations 超限)直接升级,跳过恢复机会。本方法封装统一恢复逻辑,
+    /// 调用方只需:
+    ///   if self.try_recover_or_record_fail(iterations, kind, &error) {
+    ///       continue; // 恢复成功,重试当前操作
+    ///   }
+    ///   return Err(error); // 恢复失败,升级
+    ///
+    /// 每个 scenario 受 recipe max_attempts 硬上限保护(默认 1),不会无限重试。
+    /// 返回 `true` 表示已恢复(调用方应 `continue` 重试);
+    /// 返回 `false` 表示恢复失败,已调用 record_turn_failed,调用方应 `return Err`。
+    fn try_recover_or_record_fail(
+        &mut self,
+        iterations: usize,
+        failure_kind: WorkerFailureKind,
+        error: &RuntimeError,
+    ) -> bool {
+        let outcome = self.recovery_orchestrator.attempt(failure_kind);
+        if matches!(outcome.result, RecoveryResult::Recovered { .. }) {
+            return true;
+        }
+        self.record_turn_failed(iterations, error);
+        false
+    }
+
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
         if let Some(reporter) = self.hook_progress_reporter.as_mut() {
             self.hook_runner.run_pre_tool_use_with_context(
@@ -351,6 +615,46 @@ where
         output: &str,
         is_error: bool,
     ) -> HookRunResult {
+        // BUG-2 修复:在 PostToolUse hook 中接入 LoopDetector。
+        // 仅对会修改文件的工具有意义(Edit/Write/MultiEdit/NotebookEdit),
+        // 从 tool_input JSON 中提取 file_path 并记录到 loop_detector。
+        // 根据 LoopAction 决定:
+        // - Continue:正常流程,继续走原 hook_runner。
+        // - InjectContext:把警告消息附加到 hook 结果的 messages 中,
+        //   让主 agent 在下一轮看到"重新考虑方法"的提示。
+        // - Abort:返回 cancelled=true 的 HookRunResult,阻断当前 turn。
+        // 详见 docs/harness-engineering-optimization-plan.md Step 2.2。
+        if let Some(file_path) = extract_file_path_from_tool_input(tool_name, input) {
+            match self.loop_detector.record_edit(&file_path) {
+                LoopAction::Abort(reason) => {
+                    return HookRunResult::cancelled_with_message(reason);
+                }
+                LoopAction::InjectContext(msg) => {
+                    let mut base_result = if let Some(reporter) = self.hook_progress_reporter.as_mut() {
+                        self.hook_runner.run_post_tool_use_with_context(
+                            tool_name,
+                            input,
+                            output,
+                            is_error,
+                            Some(&self.hook_abort_signal),
+                            Some(reporter.as_mut()),
+                        )
+                    } else {
+                        self.hook_runner.run_post_tool_use_with_context(
+                            tool_name,
+                            input,
+                            output,
+                            is_error,
+                            Some(&self.hook_abort_signal),
+                            None,
+                        )
+                    };
+                    base_result.append_message(msg);
+                    return base_result;
+                }
+                LoopAction::Continue => {}
+            }
+        }
         if let Some(reporter) = self.hook_progress_reporter.as_mut() {
             self.hook_runner.run_post_tool_use_with_context(
                 tool_name,
@@ -405,10 +709,66 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
+        // BUG-9:记录 turn 开始时间,供 record_turn_* 计算 latency_ms。
+        self.turn_start.set(Some(Instant::now()));
+
         self.record_turn_started(&user_input);
         self.session
-            .push_user_text(user_input)
+            .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+
+        // BUG-6 修复:Harness C(Memory)层接入 — 语义召回。
+        // 当 persistent_memory 存在时,调用 semantic_recall 获取 top-3 相关记忆,
+        // 渲染成文本块存到 pending_semantic_context,供 request 构造时注入。
+        // 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
+        if let Some(memory) = &self.persistent_memory {
+            let hits = memory.semantic_recall(&user_input, 3);
+            if !hits.is_empty() {
+                let mut rendered = String::from("# Relevant Memories\n\n");
+                for (idx, hit) in hits.iter().enumerate() {
+                    rendered.push_str(&format!(
+                        "{}. [{}] {}\n   source: {}\n   score: {:.3}\n",
+                        idx + 1,
+                        hit.entry.id,
+                        hit.entry.summary,
+                        hit.entry.source,
+                        hit.score,
+                    ));
+                }
+                self.pending_semantic_context = Some(rendered);
+            }
+        }
+
+        // Harness O(编排)层接入:Plan/Execute/Review 三段循环入口。
+        // 详见 docs/harness-engineering-optimization-plan.md Step 2.1。
+        //
+        // 缓存保护(§5.2):PlanArtifact 通过末尾追加到 dynamic_sections 注入,
+        // 不污染绝对稳定区(system_prompt + tools_schema)与半稳定区
+        // (memory/goal/git_context)。预期命中率从 95% 降至 88-92%。
+        //
+        // 复杂任务检测:用户输入 > 200 字符或包含 "refactor"/"多文件" 等关键词。
+        // Complex 时创建空 PlanArtifact(steps 由后续 Stage 3.1 VerifierAgent
+        // 或主 agent 自身填充)。Simple 时跳过,不创建 artifact。
+        if self.plan_mode_enabled && self.active_plan.is_none() {
+            match assess_complexity(&user_input) {
+                ComplexityAssessment::Complex { reason: _ } => {
+                    let mut artifact = PlanArtifact::new(user_input.clone(), Vec::new());
+                    // 尝试持久化(workspace_root 为 None 时跳过,不阻断主流程)。
+                    if let Some(root) = &self.workspace_root {
+                        if let Err(err) = persist_plan_artifact(&artifact, root) {
+                            eprintln!(
+                                "warning: failed to persist plan artifact: {err}"
+                            );
+                        }
+                    }
+                    artifact.transition_to_executing();
+                    self.active_plan = Some(artifact);
+                }
+                ComplexityAssessment::Simple => {
+                    // 简单任务,无需 plan。主 agent 走原生 ReAct 循环。
+                }
+            }
+        }
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -430,8 +790,49 @@ where
                 let sliced = crate::compact::get_messages_after_compact_boundary(
                     &self.session.messages,
                 );
+                // Harness O(编排)层:PlanArtifact 末尾追加到 system_prompt。
+                // 缓存保护(§5.2):把 PlanArtifact 渲染成文本块,
+                // 末尾追加到 dynamic_sections,不破坏前面 4 层缓存。
+                //
+                // BUG-5 修复:当注入 ContextAssembler 时,通过 assembler
+                // 收集 PlanArtifact render 到 Goal source,取 volatile_content()
+                // 作为 dynamic_sections;否则走原手动 push 逻辑。
+                //
+                // BUG-6 修复:语义召回结果(pending_semantic_context)同样
+                // 通过 assembler Memory source 或手动 push 注入。
+                let mut system_split =
+                    SystemPromptSplit::from_sections(self.system_prompt.clone());
+                if let Some(assembler) = &self.context_assembler {
+                    // 统一注入路径:把所有动态内容通过 assembler 收集。
+                    let mut asm = assembler.clone();
+                    asm.clear();
+                    if let Some(memory_ctx) = &self.pending_semantic_context {
+                        asm.add_auto(ContextSource::Memory, memory_ctx.clone());
+                    }
+                    if let Some(plan) = &self.active_plan {
+                        let rendered = plan.render_for_prompt();
+                        if !rendered.is_empty() {
+                            asm.add_auto(ContextSource::Goal, rendered);
+                        }
+                    }
+                    let volatile = asm.assemble().volatile_content();
+                    if !volatile.is_empty() {
+                        system_split.dynamic_sections.push(volatile);
+                    }
+                } else {
+                    // 原生路径:手动 push 到 dynamic_sections。
+                    if let Some(memory_ctx) = &self.pending_semantic_context {
+                        system_split.dynamic_sections.push(memory_ctx.clone());
+                    }
+                    if let Some(plan) = &self.active_plan {
+                        let rendered = plan.render_for_prompt();
+                        if !rendered.is_empty() {
+                            system_split.dynamic_sections.push(rendered);
+                        }
+                    }
+                }
                 ApiRequest {
-                    system_prompt: SystemPromptSplit::from_sections(self.system_prompt.clone()),
+                    system_prompt: system_split,
                     messages: sliced.to_vec(),
                 }
             };
@@ -440,7 +841,18 @@ where
                 Err(error) => {
                     // Non-recoverable errors propagate immediately.
                     if !error.is_prompt_too_long() {
-                        self.record_turn_failed(iterations, &error);
+                        // Harness L(生命周期)层接入:对非 prompt_too_long 的 API
+                        // 错误尝试一次自动恢复(默认 ProviderFailure 场景)。
+                        // 恢复成功 → continue 重新发请求;失败 → record + 升级。
+                        // 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
+                        // BUG-3 修复:用统一辅助方法,确保所有失败分支都经过 orchestrator。
+                        if self.try_recover_or_record_fail(
+                            iterations,
+                            WorkerFailureKind::Provider,
+                            &error,
+                        ) {
+                            continue;
+                        }
                         return Err(error);
                     }
                     // Reactive compaction recovery: progressively shrink the
@@ -470,13 +882,31 @@ where
                                 continue;
                             }
                             // Compaction removed nothing — nothing more we can do.
-                            self.record_turn_failed(iterations, &error);
+                            // BUG-3 修复:compaction 末端失败也尝试一次 Provider 恢复
+                            // (上游可能临时不可用,恢复后重试可能成功)。
+                            if self.try_recover_or_record_fail(
+                                iterations,
+                                WorkerFailureKind::Provider,
+                                &error,
+                            ) {
+                                // 重置 reactive_state,重新走 compaction 流程。
+                                reactive_state = ReactiveCompactState::NotAttempted;
+                                continue;
+                            }
                             return Err(error);
                         }
                         ReactiveCompactState::FullCompactDone => {
                             // Already exhausted recovery steps; bail out to
                             // prevent an infinite retry loop.
-                            self.record_turn_failed(iterations, &error);
+                            // BUG-3 修复:同样尝试一次 Provider 恢复,失败再升级。
+                            if self.try_recover_or_record_fail(
+                                iterations,
+                                WorkerFailureKind::Provider,
+                                &error,
+                            ) {
+                                reactive_state = ReactiveCompactState::NotAttempted;
+                                continue;
+                            }
                             return Err(error);
                         }
                     }
@@ -486,7 +916,15 @@ where
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
-                        self.record_turn_failed(iterations, &error);
+                        // BUG-3 修复:SSE events 解析失败也尝试一次 Protocol 恢复,
+                        // 恢复成功后 continue 重新发请求(原 events 已消耗,无法重用)。
+                        if self.try_recover_or_record_fail(
+                            iterations,
+                            WorkerFailureKind::Protocol,
+                            &error,
+                        ) {
+                            continue;
+                        }
                         return Err(error);
                     }
                 };
@@ -635,6 +1073,91 @@ where
             }
         }
 
+        // Harness O(编排)层 + V(验证)层接入:Plan/Execute/Review 中的 Review 阶段。
+        // 主循环退出后,若 active_plan 存在且 steps 非空,调用
+        // PreCompletionChecklistMiddleware 决定后续:
+        // - AllPassed:清空 active_plan,正常返回 TurnSummary。
+        // - ReplanTriggered:保留 active_plan(已 reset Failed → Pending),
+        //   清空会在下次 turn 的入口评估后处理。当前 turn 仍正常返回。
+        // - Failed:返回 RuntimeError,上层(RecoveryOrchestrator)决定升级。
+        //
+        // 注:当 active_plan.steps 为空时(plan 创建但主 agent 未填充 steps),
+        // 跳过 Review,直接清空 active_plan — 避免空 plan 阻塞后续 turn。
+        //
+        // BUG-7 修复:在 plan_reviewer.review 之前,若注入了 verifier_agent,
+        // 对每个 Succeeded 状态的 step 调用 verify(tool_result, acceptance_criteria, method),
+        // verify 失败则把 step 状态改为 Failed,再走 plan_reviewer.review。
+        // 详见 docs/harness-engineering-optimization-plan.md Step 3.1。
+        if let Some(mut plan) = self.active_plan.take() {
+            if !plan.steps.is_empty() {
+                // BUG-7 修复:VerifierAgent 真实校验 acceptance_criteria。
+                if let Some(verifier) = &self.verifier_agent {
+                    // 用本轮 tool_results 拼接作为 tool_result 上下文。
+                    // PlanStep 当前不存储关联的 tool_result,这是简化处理。
+                    // 提取每个 message 的 ToolResult output 文本作为上下文。
+                    let tool_result_ctx: String = tool_results
+                        .iter()
+                        .flat_map(|m| {
+                            m.blocks.iter().filter_map(|b| match b {
+                                crate::session::ContentBlock::ToolResult { output, .. } => {
+                                    Some(output.as_str())
+                                }
+                                _ => None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    for step in &mut plan.steps {
+                        if step.status == crate::planner::StepStatus::Succeeded {
+                            let method = match step.verification_method {
+                                crate::planner::VerificationMethod::Rule => {
+                                    crate::verifier::VerificationMethod::Rule
+                                }
+                                crate::planner::VerificationMethod::Visual => {
+                                    crate::verifier::VerificationMethod::Visual
+                                }
+                                crate::planner::VerificationMethod::ModelJudge => {
+                                    crate::verifier::VerificationMethod::ModelJudge
+                                }
+                            };
+                            let result = verifier.verify(
+                                &tool_result_ctx,
+                                &step.acceptance_criteria,
+                                method,
+                            );
+                            if !result.passed {
+                                step.mark_failed();
+                            }
+                        }
+                    }
+                }
+                match self.plan_reviewer.review(&mut plan) {
+                    ReviewResult::AllPassed => {
+                        // Plan 完成。可选 persist 最终状态。
+                        if let Some(root) = &self.workspace_root {
+                            let _ = persist_plan_artifact(&plan, root);
+                        }
+                    }
+                    ReviewResult::ReplanTriggered { .. } => {
+                        // 保留 plan,下次 turn 重新执行 reset 后的 steps。
+                        self.active_plan = Some(plan);
+                    }
+                    ReviewResult::Failed {
+                        failed_step_ids,
+                        replan_count,
+                    } => {
+                        let error = RuntimeError::new(format!(
+                            "plan failed after {replan_count} replans; failed steps: {}",
+                            failed_step_ids.join(", ")
+                        ));
+                        self.record_turn_failed(iterations, &error);
+                        return Err(error);
+                    }
+                }
+            }
+            // else: 空 plan(steps 为空)直接丢弃,不阻塞。
+        }
+
         // Apply microcompact to summarize aged tool results before considering
         // full auto-compaction. This is a lighter pass that replaces old
         // Read/Bash/Grep/Glob/LS outputs with one-line summaries, keeping the
@@ -656,6 +1179,10 @@ where
         };
         self.record_turn_completed(&summary);
 
+        // BUG-6 修复:turn 结束时清空 pending_semantic_context,
+        // 下一 turn 重新召回,避免陈旧记忆污染。
+        self.pending_semantic_context = None;
+
         // Periodic nudge: if enough turns have elapsed and we have a
         // persistent memory surface, scan recent messages for actionable
         // patterns (user corrections, "remember" keywords, etc.) and apply
@@ -663,39 +1190,72 @@ where
         // LLM call. The frozen snapshot is not touched, so the prompt-cache
         // prefix stays stable within the session — new facts only surface in
         // the next session.
-        self.turns_since_last_nudge += 1;
-        let nudge_config = NudgeConfig::default();
-        if let Some(memory) = &mut self.persistent_memory {
-            if should_nudge(self.turns_since_last_nudge, &nudge_config) {
-                let lookback_msgs: Vec<_> = self
-                    .session
-                    .messages
-                    .iter()
-                    .rev()
-                    .take(nudge_config.lookback_turns * 2)
-                    .rev()
-                    .cloned()
-                    .collect();
-                let actions = extract_nudge_actions(&lookback_msgs, memory, &nudge_config);
-                for action in actions {
-                    match action {
-                        NudgeAction::Add { content, source } => {
-                            memory.add_entry(&content, &source);
+        //
+        // Tier S #3 穷鬼模式：激活时整体跳过 nudge（虽然 nudge 当前是规则驱动
+        // 不消耗 LLM token，但仍会写入 memory.json 增加后续 prompt 体积；
+        // 穷鬼模式下用户明确希望最小化副作用）。
+        if !crate::poor_mode::is_active() {
+            self.turns_since_last_nudge += 1;
+            let nudge_config = NudgeConfig::default();
+            if let Some(memory) = &mut self.persistent_memory {
+                if should_nudge(self.turns_since_last_nudge, &nudge_config) {
+                    // B3 fix: previously used `take(lookback_turns * 2)`
+                    // assuming 1 turn = 2 messages. With tool calls one turn
+                    // can produce 5-10 messages (user → assistant tool_use →
+                    // tool_result → ... → assistant text), so `* 2` only
+                    // covered the most recent turn and missed the previous
+                    // user input entirely. Iterate from the newest message
+                    // backwards, counting only `MessageRole::User` messages
+                    // until we've collected `lookback_turns` of them.
+                    let lookback_msgs: Vec<_> = {
+                        let mut picked: Vec<&ConversationMessage> = Vec::new();
+                        let mut user_seen = 0usize;
+                        for msg in self.session.messages.iter().rev() {
+                            picked.push(msg);
+                            if msg.role == MessageRole::User {
+                                user_seen += 1;
+                                if user_seen >= nudge_config.lookback_turns {
+                                    break;
+                                }
+                            }
                         }
-                        NudgeAction::Replace {
-                            old_pattern,
-                            new_content,
-                            source,
-                        } => {
-                            memory.replace_entry(&old_pattern, &new_content, &source);
-                        }
-                        NudgeAction::Remove { pattern: _ } => {
-                            // Removal not implemented in the rule-based
-                            // version; skip silently.
+                        picked.into_iter().rev().cloned().collect()
+                    };
+                    let actions = extract_nudge_actions(&lookback_msgs, memory, &nudge_config);
+                    for action in actions {
+                        match action {
+                            NudgeAction::Add { content, source } => {
+                                memory.add_entry(&content, &source);
+                            }
+                            NudgeAction::Replace {
+                                old_pattern,
+                                new_content,
+                                source,
+                            } => {
+                                memory.replace_entry(&old_pattern, &new_content, &source);
+                            }
+                            NudgeAction::Remove { pattern, source: _ } => {
+                                // B8 fix: retire the matching active entry
+                                // into `archive` (audit history) rather
+                                // than leaving the variant as dead code.
+                                // No-op if nothing matches.
+                                memory.remove_entry(&pattern);
+                            }
                         }
                     }
+                    // After applying actions, run consolidation if the
+                    // surface has crossed a capacity threshold. This
+                    // migrates superseded / expired entries into the
+                    // archive sub-table (preserving audit history) and
+                    // compresses any over-budget block. Without this hook,
+                    // `needs_consolidation` / `consolidate` were dead code
+                    // and superseded entries accumulated indefinitely in
+                    // `entries` (bloating the on-disk file).
+                    if memory.needs_consolidation() {
+                        memory.consolidate();
+                    }
+                    self.turns_since_last_nudge = 0;
                 }
-                self.turns_since_last_nudge = 0;
             }
         }
 
@@ -781,6 +1341,12 @@ where
 
     pub fn api_client_mut(&mut self) -> &mut C {
         &mut self.api_client
+    }
+
+    /// 返回工具执行器的可变引用，用于运行时调整 tool executor 的配置
+    /// （例如 `output_verbosity`）。仅在需要动态修改执行器状态时使用。
+    pub fn tool_executor_mut(&mut self) -> &mut T {
+        &mut self.tool_executor
     }
 
     pub fn session_mut(&mut self) -> &mut Session {
@@ -894,6 +1460,14 @@ where
     }
 
     fn record_turn_completed(&self, summary: &TurnSummary) {
+        // BUG-9:TraceAnalyzer 记录 — 独立于 session_tracer,无条件执行。
+        self.record_trace(
+            summary.iterations,
+            summary.tool_results.len() as u32,
+            summary.auto_compaction.is_some(),
+            None,
+        );
+
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };
@@ -919,6 +1493,16 @@ where
     }
 
     fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
+        // BUG-9:TraceAnalyzer 记录 — 失败 turn。
+        // tool_calls/compact 在失败路径无法准确获取,记 0/false。
+        let error_msg = error.to_string();
+        self.record_trace(
+            iteration,
+            0,
+            false,
+            Some(("runtime_error", error_msg.as_str())),
+        );
+
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };
@@ -927,6 +1511,38 @@ where
         attributes.insert("iteration".to_string(), Value::from(iteration as u64));
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
+    }
+
+    /// BUG-9:构造一条 [`TraceRecord`] 并写入 `trace_analyzer`(若注入)。
+    ///
+    /// `failure` 为 `Some((kind, msg))` 时记录失败 turn;`None` 记录成功 turn。
+    /// 写入后清空 `turn_start`,防止下一 turn 未设置时读到旧值。
+    fn record_trace(
+        &self,
+        iterations: usize,
+        tool_calls: u32,
+        compact_triggered: bool,
+        failure: Option<(&str, &str)>,
+    ) {
+        let Some(handle) = &self.trace_analyzer else {
+            return;
+        };
+        let latency_ms = self
+            .turn_start
+            .get()
+            .map(|start| start.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let turn_id = format!("{}-{}", self.session.session_id, iterations);
+        let mut record =
+            TraceRecord::new(turn_id, latency_ms, tool_calls).with_compact_triggered(compact_triggered);
+        if let Some((kind, msg)) = failure {
+            record = record.with_failure(kind, msg);
+        }
+        if let Ok(mut analyzer) = handle.lock() {
+            analyzer.add_record(record);
+        }
+        // 清空 turn_start,防止下一 turn 未设置时读到旧值。
+        self.turn_start.set(None);
     }
 }
 
@@ -1039,6 +1655,32 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     };
     sections.push(format!("{label}:\n{}", messages.join("\n")));
     sections.join("\n\n")
+}
+
+/// BUG-2 修复:从 tool_input JSON 中提取文件路径,供 LoopDetector 跟踪。
+///
+/// 仅对会修改文件的工具有意义:
+/// - Edit / Write / NotebookEdit → `file_path` 字段
+/// - MultiEdit → `file_path` 字段(单文件多编辑)
+/// - 其他工具(Read/Grep/Bash/LS 等)→ 返回 None(不计数)
+///
+/// tool_input 期望是 JSON 字符串(如 `{"file_path": "/abs/path", ...}`)。
+/// 解析失败或字段缺失时返回 None,不阻断主流程。
+fn extract_file_path_from_tool_input(tool_name: &str, tool_input: &str) -> Option<String> {
+    // 只关心会修改文件的工具,避免 Read/Grep 等只读工具误计数。
+    let modifying_tools = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+    if !modifying_tools.contains(&tool_name) {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(tool_input).ok()?;
+    // 优先 file_path,次选 path(部分工具历史字段名)。
+    if let Some(path) = parsed.get("file_path").and_then(|v| v.as_str()) {
+        return Some(path.to_owned());
+    }
+    if let Some(path) = parsed.get("path").and_then(|v| v.as_str()) {
+        return Some(path.to_owned());
+    }
+    None
 }
 
 type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
@@ -2029,6 +2671,53 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn trace_analyzer_records_failed_turn() {
+        use crate::trace_analyzer::TraceAnalyzer;
+
+        struct FailingApi;
+
+        impl ApiClient for FailingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Err(RuntimeError::new("upstream failed"))
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FailingApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_trace_analyzer(TraceAnalyzer::new());
+
+        let handle = runtime
+            .trace_analyzer_handle()
+            .expect("trace analyzer should be injected");
+
+        // run_turn 失败后,record_turn_failed 应写入一条 trace 记录。
+        let _ = runtime.run_turn("hello", None).expect_err("should fail");
+
+        let records = handle.lock().unwrap().records.clone();
+        assert_eq!(records.len(), 1, "exactly one trace record expected");
+        let record = &records[0];
+        assert!(
+            record.turn_id.starts_with(&runtime.session.session_id),
+            "turn_id should be prefixed with session_id"
+        );
+        assert!(record.failure_kind.is_some());
+        assert_eq!(record.failure_kind.as_deref(), Some("runtime_error"));
+        assert!(record
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("upstream failed"));
     }
 
     #[test]

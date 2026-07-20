@@ -7,6 +7,7 @@
 mod approval_tokens;
 mod bash;
 pub mod bash_validation;
+pub mod bg;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
@@ -15,6 +16,7 @@ pub mod config_validate;
 mod conversation;
 mod file_ops;
 pub mod g004_conformance;
+pub mod goal;
 mod git_context;
 pub mod green_contract;
 mod hooks;
@@ -30,13 +32,43 @@ mod mcp_stdio;
 pub mod mcp_tool_bridge;
 pub mod memory;
 pub mod memory_store;
+// Harness C(上下文管理)层:Memory 语义检索(L1/L2/L3 三级层级 + keyword fallback)。
+// 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
+pub mod memory_semantic;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
 pub mod plugin_lifecycle;
 mod policy_engine;
+pub mod poor_mode;
 mod prompt;
+// Harness L(生命周期)层接入:在 run_turn 失败分支提供"最多 1 次自动恢复后升级"机制。
+// 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
+pub mod recovery_orchestrator;
 pub mod recovery_recipes;
+// Harness O(编排)层 + V(验证)层:Plan/Execute/Review 三段循环。
+// 默认不启用,需通过 CLI `--enable-plan-mode` 或 settings.json `planMode: true` 开启。
+// 缓存保护:PlanArtifact 末尾追加到 prompt 变动区,详见 docs/harness-engineering-optimization-plan.md §5.2。
+pub mod planner;
+// Harness C(上下文管理)层:统一 prompt 注入优先级栈,缓存保护(固定顺序,运行时不可变)。
+// 详见 docs/harness-engineering-optimization-plan.md Step 2.3。
+pub mod context_assembler;
+// Harness O(可观测性)层:LoopDetectionMiddleware 打断 Doom Loop(同文件 10+ 次编辑)。
+// 详见 docs/harness-engineering-optimization-plan.md Step 2.2。
+pub mod loop_detection;
+// Harness V(验证)层:VerifierAgent 规则/视觉/模型当裁判三种验证反馈。
+// 详见 docs/harness-engineering-optimization-plan.md Step 3.1。
+// 子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
+pub mod verifier;
+// Harness M(多 agent)层:MultiAgentCoordinator — Fork/Teammate/Worktree 三模式。
+// 详见 docs/harness-engineering-optimization-plan.md Step 3.2。
+// 每个子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
+pub mod multi_agent;
+// Harness O(可观测性)层:TraceAnalyzer 加载/导出 CSV、计算 turn latency /
+// tool call count / compact 触发率直方图,简单失败聚类。
+// 详见 docs/harness-engineering-optimization-plan.md Step 3.3。
+// 阶段 4 将在此之上接入 K-means + Self-Improving Harness 闭环。
+pub mod trace_analyzer;
 mod remote;
 pub mod repomap;
 mod report_schema;
@@ -51,8 +83,9 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
-#[cfg(test)]
-mod trust_resolver;
+// 生产构建解锁:之前 #[cfg(test)] 导致信任层仅在测试可用,违反 Harness G(治理)层要求。
+// 详见 docs/harness-engineering-optimization-plan.md Step 1.1。
+pub mod trust_resolver;
 mod usage;
 pub mod worker_boot;
 
@@ -61,6 +94,7 @@ pub use approval_tokens::{
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use bg::{bg_dir, BgError, BgRecord, BgStatus};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
@@ -85,12 +119,16 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
-    grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
-    write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
-    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    edit_file, edit_file_in_workspace, edit_file_in_workspace_with_roots, glob_search,
+    glob_search_in_workspace, glob_search_in_workspace_with_roots, grep_search,
+    grep_search_in_workspace, grep_search_in_workspace_with_roots, read_file,
+    read_file_in_workspace, read_file_in_workspace_with_roots, strip_verbatim_prefix,
+    write_file, write_file_in_workspace, write_file_in_workspace_with_roots, EditFileOutput,
+    GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk,
+    TextFilePayload, WorkspacePathScope, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
+pub use goal::{goal_json_path, Goal, GoalError, GoalManager, GoalState};
 pub use history_search::{HistoryHit, HistoryIndex, HistoryIndexError};
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
@@ -156,6 +194,7 @@ pub use prompt::{
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use repomap::RepoMap;
+pub use recovery_orchestrator::{RecoveryOrchestrator, RecoveryOutcome};
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,
     RecoveryAttemptType, RecoveryCommandResult, RecoveryContext, RecoveryEvent,
@@ -196,14 +235,33 @@ pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskResource, ValidatedPacket,
 };
 pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat};
-#[cfg(test)]
-pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
+// 生产构建解锁:见 L59 模块注释。补齐 TrustAllowlistEntry/TrustResolution/
+// detect_trust_prompt,让 worker_boot 的 TrustGate 分支可在生产构建接入信任层。
+pub use trust_resolver::{
+    detect_trust_prompt, TrustAllowlistEntry, TrustConfig, TrustDecision, TrustEvent,
+    TrustPolicy, TrustResolution, TrustResolver,
+};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
 pub use worker_boot::{
+    probe_mcp_health, probe_transport_health, StartupHealthSummary,
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
     WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
+};
+pub use loop_detection::{
+    LoopAction, LoopDetector, ABORT_THRESHOLD, MCP_TOOLS_MAX, SKILLS_MAX, WARN_THRESHOLD,
+};
+pub use trace_analyzer::{
+    FailureCluster, TraceAnalyzer, TraceRecord, TraceStats, CSV_HEADER as TRACE_CSV_HEADER,
+    MAX_SAMPLE_ERRORS_PER_CLUSTER,
+};
+pub use verifier::{
+    ModelJudgeVerifier, ModelJudgeVerdict, RuleVerifier, RuleVerdict, VerificationMethod,
+    VerificationResult, VerifierAgent, VisualVerifier, VisualVerdict,
+};
+pub use multi_agent::{
+    CoordinationMode, JoinStats, MultiAgentCoordinator, Subagent, SubagentStatus,
 };
 
 #[cfg(test)]

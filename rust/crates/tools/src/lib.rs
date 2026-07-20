@@ -12,17 +12,19 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
-    glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace_with_roots,
+    execute_bash, glob_search_in_workspace_with_roots, grep_search_in_workspace_with_roots,
+    load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace,
+    read_file_in_workspace_with_roots,
+    strip_verbatim_prefix,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    write_file_in_workspace_with_roots, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
@@ -111,6 +113,10 @@ pub struct GlobalToolRegistry {
     plugin_tools: Vec<PluginTool>,
     runtime_tools: Vec<RuntimeToolDefinition>,
     enforcer: Option<PermissionEnforcer>,
+    /// 多根工作区白名单（来自 `Session::workspace_roots()`）。
+    /// 为空时 `classify_*_permission_with_roots` 退化为单根 cwd 行为。
+    /// 非空时，路径落在任一根内即视为工作区内，允许 WorkspaceWrite/ReadOnly。
+    workspace_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +134,7 @@ impl GlobalToolRegistry {
             plugin_tools: Vec::new(),
             runtime_tools: Vec::new(),
             enforcer: None,
+            workspace_roots: Vec::new(),
         }
     }
 
@@ -154,6 +161,7 @@ impl GlobalToolRegistry {
             plugin_tools,
             runtime_tools: Vec::new(),
             enforcer: None,
+            workspace_roots: Vec::new(),
         })
     }
 
@@ -188,6 +196,20 @@ impl GlobalToolRegistry {
     pub fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
         self.set_enforcer(enforcer);
         self
+    }
+
+    /// 设置工作区根白名单。传入空 Vec 等价于不调用（退化为单根 cwd 行为）。
+    /// 来自 `Session::workspace_roots()`，通常包含主 cwd 根 + `--add-dir` 额外根。
+    #[must_use]
+    pub fn with_workspace_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.workspace_roots = roots;
+        self
+    }
+
+    /// 返回工作区根白名单的引用。
+    #[must_use]
+    pub fn workspace_roots(&self) -> &[PathBuf] {
+        &self.workspace_roots
     }
 
     pub fn normalize_allowed_tools(
@@ -349,7 +371,17 @@ impl GlobalToolRegistry {
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+            let roots = if self.workspace_roots.is_empty() {
+                None
+            } else {
+                Some(self.workspace_roots.as_slice())
+            };
+            return execute_tool_with_enforcer_and_roots(
+                self.enforcer.as_ref(),
+                name,
+                input,
+                roots,
+            );
         }
         self.plugin_tools
             .iter()
@@ -1166,6 +1198,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        #[cfg(test)]
         ToolSpec {
             name: "TestingPermission",
             description: "Test-only tool for verifying permission enforcement behavior.",
@@ -1201,6 +1234,69 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+/// 与 [`execute_tool_with_enforcer`] 相同，但接受工作区根白名单。
+/// `extra_roots` 为 None 或空时，行为完全等价于 [`execute_tool_with_enforcer`]。
+/// 非空时，路径校验使用 `classify_*_permission_with_roots` 变体，任一根包含即放行。
+///
+/// 设计意图：让 `--add-dir` 添加的额外工作区根真正在工具执行路径生效，
+/// 而不是只在 Session 上记录。
+#[allow(clippy::too_many_lines)]
+fn execute_tool_with_enforcer_and_roots(
+    enforcer: Option<&PermissionEnforcer>,
+    name: &str,
+    input: &Value,
+    extra_roots: Option<&[PathBuf]>,
+) -> Result<String, String> {
+    // 无额外根时直接走原路径，保持行为完全等价
+    if extra_roots.is_none_or(|roots| roots.is_empty()) {
+        return execute_tool_with_enforcer(enforcer, name, input);
+    }
+    match name {
+        "bash" => {
+            let bash_input: BashCommandInput = from_value(input)?;
+            let classified_mode = classify_bash_permission(&bash_input.command);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            validate_bash_before_run(&bash_input.command, enforcer)?;
+            run_bash(bash_input)
+        }
+        "read_file" => {
+            let file_input: ReadFileInput = from_value(input)?;
+            let required_mode =
+                classify_read_path_permission_with_roots(&file_input.path, false, extra_roots);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_read_file(file_input, extra_roots)
+        }
+        "write_file" => {
+            let file_input: WriteFileInput = from_value(input)?;
+            let required_mode =
+                classify_file_path_permission_with_roots(&file_input.path, true, extra_roots);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_write_file(file_input, extra_roots)
+        }
+        "edit_file" => {
+            let file_input: EditFileInput = from_value(input)?;
+            let required_mode =
+                classify_file_path_permission_with_roots(&file_input.path, false, extra_roots);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_edit_file(file_input, extra_roots)
+        }
+        "glob_search" => {
+            let glob_input: GlobSearchInputValue = from_value(input)?;
+            let required_mode = classify_glob_permission_with_roots(&glob_input, extra_roots);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_glob_search(glob_input, extra_roots)
+        }
+        "grep_search" => {
+            let grep_input: GrepSearchInput = from_value(input)?;
+            let required_mode = classify_grep_permission_with_roots(&grep_input, extra_roots);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_grep_search(grep_input, extra_roots)
+        }
+        // 非路径类工具不受 extra_roots 影响，直接走原路径
+        _ => execute_tool_with_enforcer(enforcer, name, input),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
@@ -1213,37 +1309,38 @@ fn execute_tool_with_enforcer(
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            validate_bash_before_run(&bash_input.command, enforcer)?;
             run_bash(bash_input)
         }
         "read_file" => {
             let file_input: ReadFileInput = from_value(input)?;
             let required_mode = classify_read_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_read_file(file_input)
+            run_read_file(file_input, None)
         }
         "write_file" => {
             let file_input: WriteFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, true);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_write_file(file_input)
+            run_write_file(file_input, None)
         }
         "edit_file" => {
             let file_input: EditFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_edit_file(file_input)
+            run_edit_file(file_input, None)
         }
         "glob_search" => {
             let glob_input: GlobSearchInputValue = from_value(input)?;
             let required_mode = classify_glob_permission(&glob_input);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_glob_search(glob_input)
+            run_glob_search(glob_input, None)
         }
         "grep_search" => {
             let grep_input: GrepSearchInput = from_value(input)?;
             let required_mode = classify_grep_permission(&grep_input);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_grep_search(grep_input)
+            run_grep_search(grep_input, None)
         }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
@@ -1305,6 +1402,7 @@ fn execute_tool_with_enforcer(
         "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
         "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
         "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
+        #[cfg(test)]
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
@@ -1754,6 +1852,14 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     let method = input.method.unwrap_or_else(|| "GET".to_string());
+
+    // SSRF defense: reject URLs that target private networks, loopback, or
+    // cloud-metadata endpoints. This blocks `http://169.254.169.254/`,
+    // `http://localhost/`, `http://10.x/`, etc.
+    if let Some(reason) = ssrf_block_reason(&input.url) {
+        return Err(format!("URL rejected by SSRF protection: {reason}"));
+    }
+
     let client = Client::new();
 
     let mut request = match method.to_uppercase().as_str() {
@@ -1790,9 +1896,15 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
             let truncated_body = if body.len() > 8192 {
+                // Truncate at a valid UTF-8 char boundary to avoid panic on
+                // multi-byte sequences that straddle the 8192-byte cut.
+                let mut end = 8192;
+                while end > 0 && !body.is_char_boundary(end) {
+                    end -= 1;
+                }
                 format!(
                     "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
+                    &body[..end],
                     body.len()
                 )
             } else {
@@ -1815,6 +1927,69 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     }
 }
 
+/// Return a reason string if the URL should be blocked for SSRF protection,
+/// or `None` if the URL is safe to fetch.
+///
+/// Blocks:
+/// - Non-http(s) schemes (`file://`, `ftp://`, etc.)
+/// - Loopback addresses (`127.0.0.0/8`, `::1`, `localhost`)
+/// - Private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
+/// - Link-local (`169.254.0.0/16`) — includes cloud metadata endpoints
+/// - Unspecified (`0.0.0.0`, `::`)
+/// - IPv6 unique-local (`fc00::/7`)
+fn ssrf_block_reason(url_str: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url_str).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Some(format!("scheme '{}' not allowed (only http/https)", parsed.scheme()));
+    }
+    let host = parsed.host_str()?.to_lowercase();
+    let blocked_host_names = ["localhost", "metadata.google.internal"];
+    if blocked_host_names.contains(&host.as_str()) {
+        return Some(format!("host '{host}' is blocked"));
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        // Domain name — not a direct IP. We can't fully defend against DNS
+        // rebinding here, but we allow it. IP-literal checks below cover the
+        // common SSRF vectors.
+        return None;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                return Some(format!("host '{host}' is loopback"));
+            }
+            if v4.is_private() {
+                return Some(format!("host '{host}' is in a private range"));
+            }
+            if v4.is_link_local() {
+                return Some(format!("host '{host}' is link-local (cloud metadata?)"));
+            }
+            if v4.is_unspecified() {
+                return Some(format!("host '{host}' is unspecified (0.0.0.0)"));
+            }
+            if v4.is_broadcast() {
+                return Some(format!("host '{host}' is broadcast"));
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return Some(format!("host '{host}' is IPv6 loopback"));
+            }
+            if v6.is_unspecified() {
+                return Some(format!("host '{host}' is IPv6 unspecified (::)"));
+            }
+            if v6.is_multicast() {
+                return Some(format!("host '{host}' is IPv6 multicast"));
+            }
+            let segments = v6.segments();
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return Some(format!("host '{host}' is IPv6 unique-local (fc00::/7)"));
+            }
+        }
+    }
+    None
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
     let registry = global_mcp_registry();
@@ -1835,6 +2010,7 @@ fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::needless_pass_by_value)]
 fn run_testing_permission(input: TestingPermissionInput) -> Result<String, String> {
     to_pretty_json(json!({
@@ -1850,6 +2026,10 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 /// Classify bash command permission based on command type and path.
 /// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
 /// all others remain `DangerFullAccess`.
+///
+/// Scans **every** sub-command in the chain (split on `;`, `|`, `&&`, `||`,
+/// `&`) so that bypasses like `cat README.md && rm workspace_file.txt` are
+/// detected: any non-read-only sub-command forces `DangerFullAccess`.
 fn classify_bash_permission(command: &str) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
@@ -1858,28 +2038,45 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
         "pwd", "echo", "printf",
     ];
 
-    // Get the base command (first word before any args or pipes)
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
+    // Walk every sub-command in the chain. Any non-read-only sub-command
+    // (or any sub-command with dangerous paths) forces DangerFullAccess.
+    for sub in runtime::bash_validation::split_command_chain(command) {
+        let trimmed = sub.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
-    // Check if it's a read-only command
-    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
-    let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
+        // Extract the first token and strip any path prefix (e.g. `/usr/bin/cat`).
+        let base_cmd = trimmed.split_whitespace().next().unwrap_or("");
+        let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
 
-    if !is_read_only {
-        return PermissionMode::DangerFullAccess;
-    }
+        if !READ_ONLY_COMMANDS.contains(&cmd_name) {
+            return PermissionMode::DangerFullAccess;
+        }
 
-    // Check if any path argument is outside workspace
-    // Simple heuristic: check for absolute paths not starting with CWD
-    if has_dangerous_paths(command) {
-        return PermissionMode::DangerFullAccess;
+        // `sed -i` writes in place — treat as non-read-only.
+        if cmd_name == "sed" && has_sed_inplace(trimmed) {
+            return PermissionMode::DangerFullAccess;
+        }
+
+        // Check if any path argument in this sub-command is outside workspace.
+        if has_dangerous_paths(trimmed) {
+            return PermissionMode::DangerFullAccess;
+        }
     }
 
     PermissionMode::WorkspaceWrite
+}
+
+/// Detect `sed -i` (in-place editing) in a sed command, handling variants
+/// like `sed -i`, `sed -i''`, `sed -i ''`, `sed --in-place`, `sed -iE`.
+fn has_sed_inplace(sed_command: &str) -> bool {
+    sed_command.split_whitespace().any(|tok| {
+        tok == "-i"
+            || tok == "--in-place"
+            || tok.starts_with("-i")
+            || tok.starts_with("--in-place=")
+    })
 }
 
 /// Check if command has dangerous paths (outside workspace).
@@ -1912,9 +2109,15 @@ fn has_dangerous_paths(command: &str) -> bool {
 
         // Check for absolute paths
         if token.starts_with('/') || token.starts_with("~/") {
-            // Check if it's within CWD
-            let path =
-                PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
+            // Expand a leading `~` to $HOME. Only the prefix is expanded —
+            // `replace('~', home)` would mangle `~/foo~bar` into a wrong path.
+            let path_str = if let Some(rest) = token.strip_prefix('~') {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}{rest}")
+            } else {
+                token.to_string()
+            };
+            let path = PathBuf::from(path_str);
             if let Some(cwd) = cwd.as_ref() {
                 let resolved = path.canonicalize().unwrap_or(path);
                 if !resolved.starts_with(cwd) {
@@ -1962,6 +2165,28 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
     }
     serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
+}
+
+/// Run the bash validation pipeline (mode/sed/destructive/path checks) on
+/// every sub-command in the chain. `Block` results reject execution. The
+/// active permission mode is taken from the enforcer when available, falling
+/// back to `WorkspaceWrite` for the no-enforcer path.
+fn validate_bash_before_run(
+    command: &str,
+    enforcer: Option<&PermissionEnforcer>,
+) -> Result<(), String> {
+    let active_mode = enforcer
+        .map(|e| e.active_mode())
+        .unwrap_or(PermissionMode::WorkspaceWrite);
+    let workspace = std::env::current_dir()
+        .map(|cwd| cwd.canonicalize().unwrap_or(cwd))
+        .unwrap_or_else(|_| PathBuf::from("."));
+    if let runtime::bash_validation::ValidationResult::Block { reason } =
+        runtime::bash_validation::validate_command(command, active_mode, &workspace)
+    {
+        return Err(format!("Command blocked by validation: {reason}"));
+    }
+    Ok(())
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -2110,50 +2335,72 @@ fn branch_divergence_output(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput) -> Result<String, String> {
+fn run_read_file(
+    input: ReadFileInput,
+    extra_roots: Option<&[PathBuf]>,
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    let extra = extra_roots.unwrap_or(&[]);
     to_pretty_json(
-        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
+        read_file_in_workspace_with_roots(&input.path, input.offset, input.limit, &workspace, extra)
             .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
+fn run_write_file(
+    input: WriteFileInput,
+    extra_roots: Option<&[PathBuf]>,
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    let extra = extra_roots.unwrap_or(&[]);
     to_pretty_json(
-        write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?,
+        write_file_in_workspace_with_roots(&input.path, &input.content, &workspace, extra)
+            .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+fn run_edit_file(
+    input: EditFileInput,
+    extra_roots: Option<&[PathBuf]>,
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    let extra = extra_roots.unwrap_or(&[]);
     to_pretty_json(
-        edit_file_in_workspace(
+        edit_file_in_workspace_with_roots(
             &input.path,
             &input.old_string,
             &input.new_string,
             input.replace_all.unwrap_or(false),
             &workspace,
+            extra,
         )
         .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
+fn run_glob_search(
+    input: GlobSearchInputValue,
+    extra_roots: Option<&[PathBuf]>,
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    let extra = extra_roots.unwrap_or(&[]);
     to_pretty_json(
-        glob_search_in_workspace(&input.pattern, input.path.as_deref(), &workspace)
+        glob_search_in_workspace_with_roots(&input.pattern, input.path.as_deref(), &workspace, extra)
             .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
+fn run_grep_search(
+    input: GrepSearchInput,
+    extra_roots: Option<&[PathBuf]>,
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    to_pretty_json(grep_search_in_workspace(&input, &workspace).map_err(io_to_string)?)
+    let extra = extra_roots.unwrap_or(&[]);
+    to_pretty_json(grep_search_in_workspace_with_roots(&input, &workspace, extra).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2215,7 +2462,15 @@ fn run_repl(input: ReplInput) -> Result<String, String> {
 }
 
 fn classify_file_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
-    if path_within_current_workspace(path, allow_missing) {
+    classify_file_path_permission_with_roots(path, allow_missing, None)
+}
+
+fn classify_file_path_permission_with_roots(
+    path: &str,
+    allow_missing: bool,
+    extra_roots: Option<&[PathBuf]>,
+) -> PermissionMode {
+    if path_within_workspace_roots(path, allow_missing, extra_roots) {
         PermissionMode::WorkspaceWrite
     } else {
         PermissionMode::DangerFullAccess
@@ -2223,7 +2478,15 @@ fn classify_file_path_permission(path: &str, allow_missing: bool) -> PermissionM
 }
 
 fn classify_read_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
-    if path_within_current_workspace(path, allow_missing) {
+    classify_read_path_permission_with_roots(path, allow_missing, None)
+}
+
+fn classify_read_path_permission_with_roots(
+    path: &str,
+    allow_missing: bool,
+    extra_roots: Option<&[PathBuf]>,
+) -> PermissionMode {
+    if path_within_workspace_roots(path, allow_missing, extra_roots) {
         PermissionMode::ReadOnly
     } else {
         PermissionMode::DangerFullAccess
@@ -2231,11 +2494,18 @@ fn classify_read_path_permission(path: &str, allow_missing: bool) -> PermissionM
 }
 
 fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
+    classify_glob_permission_with_roots(input, None)
+}
+
+fn classify_glob_permission_with_roots(
+    input: &GlobSearchInputValue,
+    extra_roots: Option<&[PathBuf]>,
+) -> PermissionMode {
     let base_allowed = input
         .path
         .as_deref()
-        .is_none_or(|path| path_within_current_workspace(path, false));
-    let pattern_allowed = path_within_current_workspace(&input.pattern, true);
+        .is_none_or(|path| path_within_workspace_roots(path, false, extra_roots));
+    let pattern_allowed = path_within_workspace_roots(&input.pattern, true, extra_roots);
     if base_allowed && pattern_allowed {
         PermissionMode::ReadOnly
     } else {
@@ -2244,10 +2514,17 @@ fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
 }
 
 fn classify_grep_permission(input: &GrepSearchInput) -> PermissionMode {
+    classify_grep_permission_with_roots(input, None)
+}
+
+fn classify_grep_permission_with_roots(
+    input: &GrepSearchInput,
+    extra_roots: Option<&[PathBuf]>,
+) -> PermissionMode {
     if input
         .path
         .as_deref()
-        .is_none_or(|path| path_within_current_workspace(path, false))
+        .is_none_or(|path| path_within_workspace_roots(path, false, extra_roots))
     {
         PermissionMode::ReadOnly
     } else {
@@ -2255,21 +2532,30 @@ fn classify_grep_permission(input: &GrepSearchInput) -> PermissionMode {
     }
 }
 
-fn path_within_current_workspace(path: &str, allow_missing: bool) -> bool {
+/// 多根版本的工作区路径校验。`extra_roots` 为 None 或空时退化为单根（cwd）行为。
+/// `extra_roots` 非空时，路径在 cwd 或任一 extra_root 内都算放行。
+///
+/// Windows 兼容：比较前两端都 `strip_verbatim_prefix`，避免 `canonicalize()` 返回的
+/// `\\?\D:\...` 与 `current_dir()` 返回的 `D:\...` 因前缀 component 不同而 `starts_with` 失败。
+/// 此前的 `looks_like_windows_absolute_path` 守卫会对所有 Windows 绝对路径直接返回 false，
+/// 导致在 cwd 内的绝对路径（如 `C:\...\workspace\file.txt`）被误判为越界——已移除。
+fn path_within_workspace_roots(
+    path: &str,
+    allow_missing: bool,
+    extra_roots: Option<&[PathBuf]>,
+) -> bool {
     let trimmed = path.trim_matches(|ch: char| {
         matches!(
             ch,
             '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
         )
     });
-    if looks_like_windows_absolute_path(trimmed) {
-        return false;
-    }
 
-    let Ok(cwd) = std::env::current_dir() else {
+    let Ok(cwd_raw) = std::env::current_dir() else {
         return false;
     };
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let cwd = cwd_raw.canonicalize().unwrap_or(cwd_raw);
+
     let candidate = PathBuf::from(trimmed);
     let absolute = if candidate.is_absolute() {
         candidate
@@ -2290,7 +2576,31 @@ fn path_within_current_workspace(path: &str, allow_missing: bool) -> bool {
         }
     };
 
-    resolved.starts_with(cwd)
+    resolved_within_any_root(&resolved, &cwd, extra_roots)
+}
+
+/// 检查 resolved 路径是否落在 cwd 或任一 extra_root 内。
+/// 比较前两端都 strip verbatim 前缀，避免 Windows 上 `\\?\` 与无前缀路径不匹配。
+fn resolved_within_any_root(
+    resolved: &Path,
+    cwd: &Path,
+    extra_roots: Option<&[PathBuf]>,
+) -> bool {
+    let resolved_stripped = strip_verbatim_prefix(resolved);
+    let cwd_stripped = strip_verbatim_prefix(cwd);
+    if resolved_stripped.starts_with(&cwd_stripped) {
+        return true;
+    }
+    if let Some(roots) = extra_roots {
+        for root in roots {
+            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let root_stripped = strip_verbatim_prefix(&canonical_root);
+            if resolved_stripped.starts_with(&root_stripped) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Classify `PowerShell` command permission based on command type and path.
@@ -2351,6 +2661,11 @@ fn extract_powershell_path(command: &str) -> Option<String> {
 }
 
 /// Check if a path is within the current workspace.
+///
+/// Windows 兼容：比较前两端都 `strip_verbatim_prefix`，避免 `canonicalize()` 返回的
+/// `\\?\D:\...` 与 `current_dir()` 返回的 `D:\...` 因前缀 component 不同而 `starts_with` 失败。
+/// 此前的 `looks_like_windows_absolute_path` 守卫会对所有 Windows 绝对路径直接返回 false，
+/// 导致在 cwd 内的绝对路径被误判为越界——已移除。
 fn is_within_workspace(path: &str) -> bool {
     let trimmed = path.trim_matches(|ch: char| {
         matches!(
@@ -2358,9 +2673,6 @@ fn is_within_workspace(path: &str) -> bool {
             '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
         )
     });
-    if looks_like_windows_absolute_path(trimmed) {
-        return false;
-    }
 
     let path = PathBuf::from(trimmed);
 
@@ -2369,7 +2681,9 @@ fn is_within_workspace(path: &str) -> bool {
         if let Ok(cwd) = std::env::current_dir() {
             let cwd = cwd.canonicalize().unwrap_or(cwd);
             let resolved = path.canonicalize().unwrap_or(path);
-            return resolved.starts_with(&cwd);
+            let resolved_stripped = strip_verbatim_prefix(&resolved);
+            let cwd_stripped = strip_verbatim_prefix(&cwd);
+            return resolved_stripped.starts_with(&cwd_stripped);
         }
     }
 
@@ -2690,6 +3004,7 @@ struct McpToolInput {
     arguments: Option<Value>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct TestingPermissionInput {
     action: String,
@@ -6168,11 +6483,22 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
+    if cfg!(target_os = "windows") {
+        // Windows 没有 sh，用 where.exe 检测命令是否存在。
+        // where.exe 是 cmd 内置工具，能搜索 PATH 中的可执行文件。
+        std::process::Command::new("where")
+            .arg(command)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    } else {
+        std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(format!("command -v {command} >/dev/null 2>&1"))
+            .status()
+            .is_ok_and(|status| status.success())
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7003,6 +7329,92 @@ mod tests {
             restarted_output["trust_gate_cleared"], false,
             "restart clears trust — next observe loop must re-acquire trust"
         );
+    }
+
+    #[test]
+    fn global_tool_registry_workspace_roots_allow_read_file_in_extra_root() {
+        // 验证 `--add-dir` 在工具执行路径上真正生效（端到端）：
+        // 1. 在 cwd 之外创建临时目录与文件
+        // 2. 用 ReadOnly 策略 + extra_roots 构建 registry
+        // 3. read_file 应成功（路径分类为 ReadOnly，被策略放行）
+        // 4. 对照组：不设置 extra_roots 时同一文件应被拒绝（DangerFullAccess）
+        let _guard = env_guard();
+        let extra_root = temp_path("ws-roots-extra-root");
+        std::fs::create_dir_all(&extra_root).expect("create extra root");
+        let file_path = extra_root.join("hello.txt");
+        std::fs::write(&file_path, "hello world").expect("write file");
+        let file_path_str = file_path.to_str().expect("utf-8").to_string();
+
+        // 1) 设置 extra_roots：read_file 应被分类为 ReadOnly 并放行
+        let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
+        let registry = GlobalToolRegistry::builtin()
+            .with_enforcer(PermissionEnforcer::new(policy))
+            .with_workspace_roots(vec![extra_root.clone()]);
+        let result = registry.execute("read_file", &json!({ "path": file_path_str }));
+        assert!(
+            result.is_ok(),
+            "read_file in extra root should succeed with --add-dir: {:?}",
+            result
+        );
+
+        // 2) 对照组：不设置 extra_roots，同一文件应被分类为 DangerFullAccess 并拒绝
+        let policy2 = permission_policy_for_mode(PermissionMode::ReadOnly);
+        let registry2 = GlobalToolRegistry::builtin()
+            .with_enforcer(PermissionEnforcer::new(policy2));
+        let result2 = registry2.execute("read_file", &json!({ "path": file_path_str }));
+        assert!(
+            result2.is_err(),
+            "read_file outside cwd without --add-dir should be denied under ReadOnly policy: {:?}",
+            result2
+        );
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&extra_root);
+    }
+
+    #[test]
+    fn global_tool_registry_workspace_roots_allow_write_file_in_extra_root() {
+        // 验证 write_file 在 extra_root 内被分类为 WorkspaceWrite（而非 DangerFullAccess）：
+        // - 用 WorkspaceWrite 策略：应放行 extra_root 内的写操作
+        // - 用 ReadOnly 策略：应拒绝（因为 write_file 需要 WorkspaceWrite）
+        let _guard = env_guard();
+        let extra_root = temp_path("ws-roots-write-root");
+        std::fs::create_dir_all(&extra_root).expect("create extra root");
+        let file_path = extra_root.join("out.txt");
+        let file_path_str = file_path.to_str().expect("utf-8").to_string();
+
+        // 1) WorkspaceWrite 策略 + extra_roots：write_file 应成功
+        let policy = permission_policy_for_mode(PermissionMode::WorkspaceWrite);
+        let registry = GlobalToolRegistry::builtin()
+            .with_enforcer(PermissionEnforcer::new(policy))
+            .with_workspace_roots(vec![extra_root.clone()]);
+        let result = registry.execute(
+            "write_file",
+            &json!({ "path": file_path_str, "content": "written via --add-dir" }),
+        );
+        assert!(
+            result.is_ok(),
+            "write_file in extra root should succeed under WorkspaceWrite policy: {:?}",
+            result
+        );
+
+        // 2) ReadOnly 策略 + extra_roots：write_file 应被拒绝（策略不足以放行 WorkspaceWrite）
+        let policy2 = permission_policy_for_mode(PermissionMode::ReadOnly);
+        let registry2 = GlobalToolRegistry::builtin()
+            .with_enforcer(PermissionEnforcer::new(policy2))
+            .with_workspace_roots(vec![extra_root.clone()]);
+        let result2 = registry2.execute(
+            "write_file",
+            &json!({ "path": file_path_str, "content": "should be denied" }),
+        );
+        assert!(
+            result2.is_err(),
+            "write_file should still be denied under ReadOnly policy even with --add-dir: {:?}",
+            result2
+        );
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&extra_root);
     }
 
     #[test]

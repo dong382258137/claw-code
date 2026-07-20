@@ -1213,7 +1213,7 @@ mod tests {
         let estimated = estimate_message_tokens(&message);
         // chars().count() / 2 + 1 for 12 chars = 7
         assert!(
-            estimated >= 5 && estimated <= 8,
+            (5..=8).contains(&estimated),
             "CJK estimate should be in reasonable range, got {estimated}"
         );
         // ASCII of similar char count should be comparable, not wildly different.
@@ -1382,9 +1382,7 @@ mod tests {
         let stale_assistant = ConversationMessage::assistant(vec![ContentBlock::Text {
             text: "stale response".to_string(),
         }]);
-        let boundary_text = format!(
-            "This session is being continued from a previous conversation.\n<!-- compact_boundary: {{\"trigger\":\"auto\",\"pre_tokens\":1000,\"messages_summarized\":2,\"timestamp_ms\":1700000000000}} -->"
-        );
+        let boundary_text = "This session is being continued from a previous conversation.\n<!-- compact_boundary: {\"trigger\":\"auto\",\"pre_tokens\":1000,\"messages_summarized\":2,\"timestamp_ms\":1700000000000} -->".to_string();
         let boundary_system = ConversationMessage {
             role: MessageRole::System,
             blocks: vec![ContentBlock::Text {

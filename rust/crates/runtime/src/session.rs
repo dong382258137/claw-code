@@ -125,6 +125,9 @@ pub struct Session {
     pub compaction: Option<SessionCompaction>,
     pub fork: Option<SessionFork>,
     pub workspace_root: Option<PathBuf>,
+    /// 额外允许的工作区根目录（由 `--add-dir` CLI flag 添加）。
+    /// 与 `workspace_root` 一起构成完整的工作区根集合，用于多根路径校验。
+    pub additional_workspace_roots: Vec<PathBuf>,
     pub prompt_history: Vec<SessionPromptEntry>,
     /// The model used in this session, persisted so resumed sessions can
     /// report which model was originally used.
@@ -149,6 +152,7 @@ impl PartialEq for Session {
             && self.compaction == other.compaction
             && self.fork == other.fork
             && self.workspace_root == other.workspace_root
+            && self.additional_workspace_roots == other.additional_workspace_roots
             && self.prompt_history == other.prompt_history
             && self.last_health_check_ms == other.last_health_check_ms
             && self.model == other.model
@@ -202,6 +206,7 @@ impl Session {
             compaction: None,
             fork: None,
             workspace_root: None,
+            additional_workspace_roots: Vec::new(),
             prompt_history: Vec::new(),
             last_health_check_ms: None,
             model: None,
@@ -239,9 +244,36 @@ impl Session {
         self
     }
 
+    /// 添加一个额外的工作区根目录（来自 `--add-dir` CLI flag）。
+    /// 重复的根会被 `WorkspacePathScope::from_roots` 去重，这里无需手动检查。
+    #[must_use]
+    pub fn with_additional_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.additional_workspace_roots.push(root.into());
+        self
+    }
+
+    /// 添加多个额外的工作区根目录。
+    #[must_use]
+    pub fn with_additional_workspace_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.additional_workspace_roots.extend(roots);
+        self
+    }
+
     #[must_use]
     pub fn workspace_root(&self) -> Option<&Path> {
         self.workspace_root.as_deref()
+    }
+
+    /// 返回所有工作区根（主根 + 额外根）。若主根为 None，仅返回额外根。
+    /// 用于多根路径校验（`WorkspacePathScope`）。
+    #[must_use]
+    pub fn workspace_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(main) = &self.workspace_root {
+            roots.push(main.clone());
+        }
+        roots.extend(self.additional_workspace_roots.iter().cloned());
+        roots
     }
 
     #[must_use]
@@ -348,6 +380,7 @@ impl Session {
                 branch_name: normalize_optional_string(branch_name),
             }),
             workspace_root: self.workspace_root.clone(),
+            additional_workspace_roots: self.additional_workspace_roots.clone(),
             prompt_history: self.prompt_history.clone(),
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
@@ -393,6 +426,21 @@ impl Session {
             object.insert(
                 "workspace_root".to_string(),
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
+            );
+        }
+        if !self.additional_workspace_roots.is_empty() {
+            object.insert(
+                "additional_workspace_roots".to_string(),
+                JsonValue::Array(
+                    self.additional_workspace_roots
+                        .iter()
+                        .map(|r| {
+                            workspace_root_to_string(r)
+                                .map(JsonValue::String)
+                                .unwrap_or(JsonValue::String(r.to_string_lossy().into_owned()))
+                        })
+                        .collect(),
+                ),
             );
         }
         if !self.prompt_history.is_empty() {
@@ -450,6 +498,15 @@ impl Session {
             .get("workspace_root")
             .and_then(JsonValue::as_str)
             .map(PathBuf::from);
+        let additional_workspace_roots = object
+            .get("additional_workspace_roots")
+            .and_then(JsonValue::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(PathBuf::from))
+                    .collect()
+            })
+            .unwrap_or_default();
         let prompt_history = object
             .get("prompt_history")
             .and_then(JsonValue::as_array)
@@ -473,6 +530,7 @@ impl Session {
             compaction,
             fork,
             workspace_root,
+            additional_workspace_roots,
             prompt_history,
             last_health_check_ms: None,
             model,
@@ -490,6 +548,7 @@ impl Session {
         let mut compaction = None;
         let mut fork = None;
         let mut workspace_root = None;
+        let mut additional_workspace_roots: Vec<PathBuf> = Vec::new();
         let mut model = None;
         let mut prompt_history = Vec::new();
 
@@ -530,6 +589,15 @@ impl Session {
                         .get("workspace_root")
                         .and_then(JsonValue::as_str)
                         .map(PathBuf::from);
+                    if let Some(arr) = object
+                        .get("additional_workspace_roots")
+                        .and_then(JsonValue::as_array)
+                    {
+                        additional_workspace_roots = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(PathBuf::from))
+                            .collect();
+                    }
                     model = object
                         .get("model")
                         .and_then(JsonValue::as_str)
@@ -575,6 +643,7 @@ impl Session {
             compaction,
             fork,
             workspace_root,
+            additional_workspace_roots,
             prompt_history,
             last_health_check_ms: None,
             model,
@@ -707,6 +776,21 @@ impl Session {
             object.insert(
                 "workspace_root".to_string(),
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
+            );
+        }
+        if !self.additional_workspace_roots.is_empty() {
+            object.insert(
+                "additional_workspace_roots".to_string(),
+                JsonValue::Array(
+                    self.additional_workspace_roots
+                        .iter()
+                        .map(|r| {
+                            workspace_root_to_string(r)
+                                .map(JsonValue::String)
+                                .unwrap_or(JsonValue::String(r.to_string_lossy().into_owned()))
+                        })
+                        .collect(),
+                ),
             );
         }
         if let Some(model) = &self.model {

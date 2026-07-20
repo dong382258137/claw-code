@@ -67,6 +67,107 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
     assert_eq!(body["tools"][0]["type"], json!("function"));
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compat_reads_deepseek_native_cache_fields_non_streaming() {
+    // DeepSeek 在 usage 对象直接平铺 prompt_cache_hit_tokens / prompt_cache_miss_tokens,
+    // 不放在 prompt_tokens_details.cached_tokens 里。CCB/claw 之前完全忽略这两个字段,
+    // 导致状态栏始终显示 cache_read=0。验证修复后能正确读到 DeepSeek 的命中数。
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_deepseek\",",
+        "\"model\":\"deepseek-chat\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"hi\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{",
+        "\"prompt_tokens\":50000,",
+        "\"completion_tokens\":120,",
+        "\"total_tokens\":50120,",
+        "\"prompt_cache_hit_tokens\":49500,",
+        "\"prompt_cache_miss_tokens\":500",
+        "}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client =
+        OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::openai())
+            .with_base_url(server.base_url());
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("deepseek request should succeed");
+
+    // DeepSeek 语义：hit → cache_read，miss → input_tokens (非缓存部分)
+    assert_eq!(response.usage.cache_read_input_tokens, 49500);
+    assert_eq!(response.usage.input_tokens, 500);
+    assert_eq!(response.usage.cache_creation_input_tokens, 0);
+    assert_eq!(response.usage.output_tokens, 120);
+    // total = hit + miss + output = 49500 + 500 + 120 = 50120
+    assert_eq!(response.total_tokens(), 50120);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compat_reads_deepseek_native_cache_fields_streaming() {
+    // 流式路径：DeepSeek 在 trailing usage chunk 中携带 prompt_cache_hit_tokens。
+    // 这是用户最常观察到的场景 —— 状态栏命中数始终为 0 的根因。
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_ds_stream\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_ds_stream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl_ds_stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":30011,\"completion_tokens\":190,\"total_tokens\":30201,\"prompt_cache_hit_tokens\":19904,\"prompt_cache_miss_tokens\":10107}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            sse,
+            &[("x-request-id", "req_ds_stream")],
+        )],
+    )
+    .await;
+
+    let client =
+        OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::openai())
+            .with_base_url(server.base_url());
+    let request = MessageRequest {
+        model: "deepseek-chat".to_string(),
+        stream: true,
+        ..sample_request(false)
+    };
+    let mut stream = client
+        .stream_message(&request)
+        .await
+        .expect("deepseek stream should start");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    // 找到 MessageDelta 事件，验证 DeepSeek 缓存字段已正确映射
+    let delta_event = events.iter().rev().find(|e| {
+        matches!(e, StreamEvent::MessageDelta(MessageDeltaEvent { .. }))
+    });
+    let delta_event = match delta_event {
+        Some(StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. })) => usage,
+        _ => panic!("expected MessageDelta event with usage"),
+    };
+    assert_eq!(delta_event.cache_read_input_tokens, 19904);
+    assert_eq!(delta_event.input_tokens, 10107);
+    assert_eq!(delta_event.output_tokens, 190);
+    assert_eq!(delta_event.cache_creation_input_tokens, 0);
+}
+
 #[tokio::test]
 async fn send_message_passes_optional_openai_compatible_parameters_on_wire() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));

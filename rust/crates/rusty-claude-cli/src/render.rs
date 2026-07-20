@@ -910,6 +910,59 @@ fn strip_ansi(input: &str) -> String {
     output
 }
 
+/// CLI 输出冗度级别。控制工具调用结果、错误、进度等信息的打印量。
+///
+/// 通过 `/output-style [style]` 斜杠命令切换，或由 `CliToolExecutor` 在
+/// `format_tool_result` / `show_tool_results` / `show_tool_errors` 路径上消费。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputVerbosity {
+    /// 完整输出：工具调用、结果、错误全部打印（带截断常量）。
+    #[default]
+    Full,
+    /// 紧凑输出：工具结果折叠为一行成功标记，仅错误打印详情。
+    Compact,
+    /// 静默输出：不打印任何工具结果与错误，仅保留流式助手文本。
+    Silent,
+    /// 最小输出：仅打印关键工具（read/write/edit/bash）的一行摘要。
+    Minimal,
+}
+
+impl OutputVerbosity {
+    /// 从字符串参数解析冗度级别。接受 `full`/`compact`/`silent`/`minimal`，
+    /// 大小写不敏感；其他输入返回 `None` 由调用方回退到当前级别或打印帮助。
+    pub fn from_style_arg(arg: &str) -> Option<Self> {
+        match arg.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(OutputVerbosity::Full),
+            "compact" => Some(OutputVerbosity::Compact),
+            "silent" => Some(OutputVerbosity::Silent),
+            "minimal" => Some(OutputVerbosity::Minimal),
+            _ => None,
+        }
+    }
+
+    /// 返回人类可读的级别标签，用于 `/output-style` 命令回显。
+    pub fn label(&self) -> &'static str {
+        match self {
+            OutputVerbosity::Full => "full",
+            OutputVerbosity::Compact => "compact",
+            OutputVerbosity::Silent => "silent",
+            OutputVerbosity::Minimal => "minimal",
+        }
+    }
+
+    /// 是否打印工具成功结果的完整 Markdown 渲染。
+    /// `Full` 放行；`Compact`/`Minimal` 走折叠分支；`Silent` 全部抑制。
+    pub fn show_tool_results(&self) -> bool {
+        matches!(self, OutputVerbosity::Full)
+    }
+
+    /// 是否打印工具错误结果，或紧凑模式下的成功标记。
+    /// `Silent` 完全静默；其他级别都允许错误输出。
+    pub fn show_tool_errors(&self) -> bool {
+        !matches!(self, OutputVerbosity::Silent)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};

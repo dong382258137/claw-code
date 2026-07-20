@@ -156,6 +156,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "search",
+        aliases: &[],
+        summary: "Search conversation history by keyword",
+        argument_hint: Some("<query>"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "undo",
+        aliases: &[],
+        summary: "Undo the last file edit (restore from originalFile backup)",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "version",
         aliases: &[],
         summary: "Show CLI version and build information",
@@ -515,6 +529,27 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Add an additional directory to the context",
         argument_hint: Some("<path>"),
         resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "poor",
+        aliases: &[],
+        summary: "Toggle poor mode (skip non-essential token usage like nudge)",
+        argument_hint: Some("[on|off|status]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "goal",
+        aliases: &[],
+        summary: "Manage persistent goal driver (set/clear/pause/resume/status)",
+        argument_hint: Some("[set <text>|clear|pause|resume|status]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "bg",
+        aliases: &[],
+        summary: "Manage background claw sessions (spawn/ps/logs/kill/purge)",
+        argument_hint: Some("[ps|logs <pid>|kill <pid>|purge <pid>|spawn <prompt>]"),
+        resume_supported: true,
     },
     SlashCommandSpec {
         name: "allowed-tools",
@@ -1082,6 +1117,10 @@ pub enum SlashCommand {
     Memory,
     Init,
     Diff,
+    Search {
+        query: Option<String>,
+    },
+    Undo,
     Version,
     Export {
         path: Option<String>,
@@ -1178,6 +1217,18 @@ pub enum SlashCommand {
     },
     History {
         count: Option<String>,
+    },
+    /// Tier S #3 穷鬼模式：`/poor` 切换、`/poor on|off` 设置、`/poor status` 查询。
+    Poor {
+        action: Option<String>,
+    },
+    /// Tier S #1 Goal 持续驱动：`/goal` 查询、`/goal set <text>`、`/goal clear`、`/goal pause|resume`。
+    Goal {
+        args: Option<String>,
+    },
+    /// Tier S #2 后台会话：`/bg ps`、`/bg logs <pid>`、`/bg kill <pid>`、`/bg purge <pid>`、`/bg spawn <prompt>`。
+    Bg {
+        args: Option<String>,
     },
     Unknown(String),
 }
@@ -1277,6 +1328,9 @@ impl SlashCommand {
             Self::Tag { .. } => "/tag",
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
+            Self::Poor { .. } => "/poor",
+            Self::Goal { .. } => "/goal",
+            Self::Bg { .. } => "/bg",
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -1369,6 +1423,11 @@ pub fn validate_slash_command_input(
         "diff" => {
             validate_no_args(command, &args)?;
             SlashCommand::Diff
+        }
+        "search" => SlashCommand::Search { query: remainder },
+        "undo" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Undo
         }
         "version" => {
             validate_no_args(command, &args)?;
@@ -1488,6 +1547,9 @@ pub fn validate_slash_command_input(
         "tag" => SlashCommand::Tag { label: remainder },
         "output-style" => SlashCommand::OutputStyle { style: remainder },
         "add-dir" => SlashCommand::AddDir { path: remainder },
+        "poor" => SlashCommand::Poor { action: remainder },
+        "goal" => SlashCommand::Goal { args: remainder },
+        "bg" => SlashCommand::Bg { args: remainder },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
@@ -4312,6 +4374,11 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
+        | SlashCommand::Poor { .. }
+        | SlashCommand::Goal { .. }
+        | SlashCommand::Bg { .. }
+        | SlashCommand::Search { .. }
+        | SlashCommand::Undo
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -4914,8 +4981,8 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
-        assert!(resume_supported_slash_commands().len() >= 39);
+        assert_eq!(slash_command_specs().len(), 142);
+        assert!(resume_supported_slash_commands().len() >= 42);
     }
 
     #[test]

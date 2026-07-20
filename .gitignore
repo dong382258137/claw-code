@@ -11,6 +11,9 @@ archive/
 .claw/history.db
 .claw/plugins/
 .clawhip/
+# Plugin local data (per-workspace)
+**/.claw/plugins/
+**/.claw/history.db
 status-help.txt
 # Legacy Python port session scratch artifacts
 .port_sessions/

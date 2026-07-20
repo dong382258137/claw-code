@@ -1,6 +1,6 @@
 # Parity Status — claw-code Rust Port
 
-Last updated: 2026-04-03
+Last updated: 2026-07-18
 
 ## Summary
 
@@ -143,6 +143,97 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - Harness scenarios validate `write_file_denied`, `bash_permission_prompt_approved`, and `bash_permission_prompt_denied`.
 - `PermissionEnforcer::check()` delegates to `PermissionPolicy::authorize()` and returns structured allow/deny results.
 - `check_file_write()` enforces workspace boundaries and read-only denial; `check_bash()` denies mutating commands in read-only mode and blocks prompt-mode bash without confirmation.
+
+## Multi-root workspace & Windows verbatim prefix (fork → upstream merge)
+
+This section documents the fork-side local enhancements that were re-implemented onto upstream `main` (HEAD `df97136`) on 2026-07-18. The fork (claw-code) carried 5 enhancement areas; all 5 were ported while preserving upstream's 26 newer commits (HistoryIndex, PersistentMemory, RepoMap, SystemPromptSplit, memory_store, history_search).
+
+### 1. `--add-dir` CLI flag
+
+- **Files:** `rust/crates/rusty-claude-cli/src/main.rs`
+- **Behavior:** parses `--add-dir <path>` and `--add-dir=<path>` (repeatable) from argv, collects the paths into a `Vec<PathBuf>`, and threads them through every `CliAction` construction site (Prompt + Repl variants) as `additional_workspace_roots`.
+- **New helper:** `new_cli_session_with_roots()` — mirrors upstream `new_cli_session()` (including the full HistoryIndex wiring at `cwd.join(".claw").join("history.db")`), and additionally calls `Session::with_additional_workspace_roots()`.
+
+### 2. `additional_workspace_roots` field on `Session`
+
+- **Files:** `rust/crates/runtime/src/session.rs`
+- **Behavior:** `Session` struct gains `additional_workspace_roots: Vec<PathBuf>`. The field flows through `PartialEq`, `new()`, `fork()`, `to_json()`, `from_json()`, `from_jsonl()` (including `session_meta` parsing), and the JSONL snapshot serializer.
+- **New builders:** `with_additional_workspace_root()` (single) and `with_additional_workspace_roots()` (batch).
+- **New getter:** `workspace_roots()` returns the main root + additional roots as a single `Vec<PathBuf>` for `WorkspacePathScope::from_roots()`.
+- **Preserved:** upstream's `history_index: Option<Arc<HistoryIndex>>` field and `with_history_index()` builder are untouched.
+
+### 3. `WorkspacePathScope` & multi-root validation in `file_ops.rs`
+
+- **Files:** `rust/crates/runtime/src/file_ops.rs`, `rust/crates/runtime/src/lib.rs`
+- **New types/functions:**
+  - `WorkspacePathScope` — multi-root path validator (mirrors Python `path_scope.py::WorkspacePathScope`). `from_root()` / `from_roots()` canonicalize and dedup roots; `validate_resolved()` / `validate_path()` check membership.
+  - `validate_workspace_boundary_multi()` — multi-root boundary check; any root containing the path passes.
+  - `canonicalize_roots()` — merges main root + extra roots into a canonical list.
+  - 5 public `*_in_workspace_with_roots` functions: `read_file`, `write_file`, `edit_file`, `glob_search`, `grep_search`. Each takes `extra_roots: &[PathBuf]` and delegates to `WorkspacePathScope`.
+  - `strip_verbatim_prefix()` — Windows-only helper that strips `\\?\` (Verbatim Disk) and `\\?\UNC\` (Verbatim UNC) prefixes. See §4 below.
+- **Signature changes:** `glob_search_impl` and `grep_search_impl` now accept `extra_roots: &[PathBuf]`.
+- **Backward compat:** the original single-root `*_in_workspace` functions remain; `*_with_roots` variants are additive.
+
+### 4. Windows `\\?\` verbatim prefix strip
+
+- **Files:** `rust/crates/runtime/src/file_ops.rs`
+- **Problem:** `Path::canonicalize()` on Windows returns paths with the `\\?\` verbatim prefix (e.g. `\\?\D:\foo\bar`), while `std::env::current_dir()` returns plain paths (e.g. `D:\foo\bar`). The two formats compare unequal under `starts_with()` because their first `Component` differs (`Prefix::VerbatimDisk` vs `Prefix::Disk`), causing legitimate paths to be misclassified as workspace-boundary escapes.
+- **Fix:** `strip_verbatim_prefix()` rewrites `VerbatimDisk(d)` → `D:` and `VerbatimUNC(server, share)` → `\\server\share` before comparison. `validate_workspace_boundary_multi()` applies the strip to both the resolved path and every root.
+- **No-op on non-Windows** (the function returns the input unchanged when no `Prefix` component is present).
+
+### 5. Tool dispatch & permission classification with roots
+
+- **Files:** `rust/crates/tools/src/lib.rs`
+- **New state:** `GlobalToolRegistry` gains `workspace_roots: Vec<PathBuf>` field + `with_workspace_roots()` builder + `workspace_roots()` getter.
+- **New dispatch:** `execute_tool_with_enforcer_and_roots()` — like `execute_tool_with_enforcer()` but threads `workspace_roots` into every `run_*` handler.
+- **Routed tools:** `read_file`, `write_file`, `edit_file`, `glob_search`, `grep_search` now call their `*_with_roots` runtime counterparts.
+- **Permission classification:** 4 new `classify_*_permission_with_roots()` variants mirror the single-root classifiers but use `path_within_workspace_roots()` (replaces `path_within_current_workspace()`) and `resolved_within_any_root()` helpers.
+- **Behavior change:** `is_within_workspace()` no longer early-returns `false` on Windows absolute paths — this was the fork's core bugfix. Paths are now normalized via `canonicalize` + `strip_verbatim_prefix` before `starts_with` comparison.
+
+### Validation
+
+- `cargo build --release --workspace` — exit 0 (3m 16s on Windows).
+- `cargo check -p runtime --lib` / `-p tools --lib` / `-p rusty-claude-cli` — all exit 0.
+- `python rust/scripts/run_mock_parity_diff.py --no-run` — 12/12 scenarios `[MAPPED]`, all `parity_refs` present in `PARITY.md`.
+- Mock parity harness itself is `#![cfg(unix)]` and cannot run on Windows; validated on Unix-side via the `--no-run` manifest check.
+- Test deltas vs pre-merge baseline (Windows):
+  - `runtime --lib file_ops`: 3 pre-existing failures unchanged (Windows glob quirks, unrelated to multi-root).
+  - `tools --lib`: 17 failures post-merge vs 20 pre-merge — **3 tests fixed** by the multi-root + verbatim-prefix work.
+  - `rusty-claude-cli --bin claw`: 3 pre-existing failures unchanged; 3 additional failures were test-isolation residue from `.claw/plugins/installed/` and pass after clearing that directory.
+
+## CLI experience & context-compression enhancements (fork → upstream merge, 2026-07-18 round 2)
+
+Three additional fork enhancements were ported onto upstream `main` on 2026-07-18 (round 2 of the merge). All three are independent of the multi-root work above and were evaluated as worth porting in a separate audit (`#3` + `#4` are bound together; `#1` is standalone).
+
+### 1. `output_verbosity` CLI flag & REPL control
+
+- **Files:** `rust/crates/runtime/src/conversation.rs`, `rust/crates/rusty-claude-cli/src/render.rs`, `rust/crates/rusty-claude-cli/src/main.rs`
+- **Behavior:** new `OutputVerbosity` enum (`Full`/`Compact`/`Silent`/`Minimal`) controls how much tool-call output the CLI prints. Set via `--verbose` / `--quiet` / `--silent` / `--output-verbosity=<level>` CLI flags, or via `/output-style [level]` slash command at runtime (the slash command variant already existed in upstream as a stub; this wires it to real behavior).
+- **New runtime hook:** `ConversationRuntime::tool_executor_mut()` exposes the tool executor mutably so `BuiltRuntime::set_tool_verbosity()` can inject the level into `CliToolExecutor` at turn-prepare time.
+- **New render helpers:** `format_tool_result_compact()` produces a one-line success marker for key tools in Compact/Minimal mode; `format_tool_result()` gains a `verbosity` parameter for future error-detail trimming.
+- **Dispatch behavior:** `CliToolExecutor::execute()` now gates the full Markdown render on `show_tool_results()` (Full only), falls through to the compact summary on `show_tool_errors()` (Compact/Minimal), and suppresses everything in Silent.
+- **Coverage:** 5 new tests for flag parsing + override semantics + invalid-value rejection; all existing tests updated to pass `OutputVerbosity::default()` / `OutputVerbosity::Full`.
+
+### 2. `compact_tool_output_for_model` — context-token saver
+
+- **Files:** `rust/crates/rusty-claude-cli/src/main.rs`
+- **Behavior:** a new function strips the JSON envelope from state-changing tool results before they are sent back to the model. `edit_file`/`write_file`/`NotebookEdit` are reduced to a single status sentence; `WebSearch` returns only the commentary string; `WebFetch` returns only the AI summary `result` field. Other tools (`read_file`, `bash`, `grep_search`, etc.) pass through unchanged. This mirrors upstream Claude Code's TS `mapToolResultToToolResultBlockParam` and saves up to ~135 k tokens per large-file edit.
+- **Independence:** complementary to — not overlapping with — upstream `runtime::compact::microcompact`, which targets old read-only tool results during compaction events, not state-changing tool results on every request.
+- **Coverage:** 4 new tests (WebSearch unwrap, WebFetch unwrap, unknown-tool pass-through, invalid-JSON fallback).
+
+### 3. `convert_messages` signature + Thinking-block preservation
+
+- **Files:** `rust/crates/rusty-claude-cli/src/main.rs`
+- **Behavior:** `convert_messages()` now takes `(messages, model)` instead of `(messages)`. For models where `model_requires_reasoning_content_in_history(model)` returns true (currently `deepseek-v4*`), assistant `Thinking` blocks are preserved as empty `Thinking { thinking: "", signature: None }` so the model can echo back prior reasoning as `reasoning_content`. For other models the original "drop Thinking" behavior is preserved.
+- **Helper reuse:** `model_requires_reasoning_content_in_history()` already existed in upstream `api/src/providers/openai_compat.rs` with identical implementation — no new helper was needed, only the import in `main.rs`.
+- **ToolResult binding:** the `ContentBlock::ToolResult` match arm now binds `tool_name` explicitly (instead of `..`) so it can be passed to `compact_tool_output_for_model()`.
+- **Call sites updated:** 1 production call (`AnthropicRuntimeClient::stream`) and 2 test calls now pass the model name.
+
+### Validation (round 2)
+
+- `cargo build --release --bin claw` — exit 0 (49.84s on Windows). `target/release/claw.exe` (16.6 MB) generated and verified via `--help`.
+- `cargo check -p runtime --lib` / `-p rusty-claude-cli` / `--tests` — all exit 0.
+- Test result: 216 passed / 3 failed (same 3 pre-existing failures; **zero regression**). 9 new tests added (5 verbosity + 4 compact_tool_output) all pass.
 
 ## Tool Surface: 40 exposed tool specs on `main`
 

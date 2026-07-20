@@ -656,7 +656,6 @@ pub fn load_system_prompt(
 
 /// Loads config, project context, and optional extras (persistent memory,
 /// repository map), then renders the system prompt text.
-#[must_use]
 pub fn load_system_prompt_with_extras(
     cwd: impl Into<PathBuf>,
     current_date: impl Into<String>,

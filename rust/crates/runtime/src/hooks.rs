@@ -55,7 +55,7 @@ pub enum HookProgressEvent {
     },
 }
 
-pub trait HookProgressReporter {
+pub trait HookProgressReporter: Send {
     fn on_event(&mut self, event: &HookProgressEvent);
 }
 
@@ -148,6 +148,31 @@ impl HookRunResult {
     #[must_use]
     pub fn updated_input_json(&self) -> Option<&str> {
         self.updated_input()
+    }
+
+    /// 构造一个 cancelled=true 的 HookRunResult,携带单条消息。
+    ///
+    /// BUG-2 修复:LoopDetectionMiddleware 检测到 Doom Loop 时调用此方法,
+    /// 阻断当前 turn。详见 docs/harness-engineering-optimization-plan.md Step 2.2。
+    #[must_use]
+    pub fn cancelled_with_message(message: String) -> Self {
+        Self {
+            denied: false,
+            failed: false,
+            cancelled: true,
+            messages: vec![message],
+            permission_override: None,
+            permission_reason: None,
+            updated_input: None,
+        }
+    }
+
+    /// 追加一条消息到现有 HookRunResult(不改变 denied/failed/cancelled 状态)。
+    ///
+    /// BUG-2 修复:LoopDetectionMiddleware 触发 InjectContext 时,
+    /// 把警告消息附加到 hook 结果,让主 agent 在下一轮看到提示。
+    pub fn append_message(&mut self, message: String) {
+        self.messages.push(message);
     }
 }
 

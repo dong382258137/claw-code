@@ -26,6 +26,15 @@ use crate::mcp_stdio::{
     McpToolCallResult,
 };
 
+/// Maximum accepted `Content-Length` for a single inbound JSON-RPC frame.
+///
+/// Bounds the allocation in [`read_frame`] so a malformed or hostile peer
+/// cannot trigger an out-of-memory condition by sending an oversized
+/// `Content-Length` header (BUG-P1-2). 64 MiB is far above any legitimate
+/// MCP message (typical payloads are a few KiB) but small enough that we
+/// fail fast before exhausting the process budget.
+pub const MCP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// Protocol version the server advertises during `initialize`.
 ///
 /// Matches the version used by the built-in client in
@@ -280,6 +289,15 @@ async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>
     let content_length = content_length.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
     })?;
+    if content_length > MCP_MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "MCP frame Content-Length {content_length} exceeds maximum {} bytes",
+                MCP_MAX_FRAME_BYTES
+            ),
+        ));
+    }
     let mut payload = vec![0_u8; content_length];
     reader.read_exact(&mut payload).await?;
     Ok(Some(payload))

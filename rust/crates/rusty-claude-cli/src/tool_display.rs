@@ -60,6 +60,10 @@ pub(crate) struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// Optional status emitter for TUI mode. When set, ToolResult events are
+    /// emitted so the TUI can render collapsible tool cards.
+    #[cfg(feature = "full-tui")]
+    status_emitter: Option<crate::streaming::StatusEmitter>,
 }
 
 impl CliToolExecutor {
@@ -76,7 +80,19 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            #[cfg(feature = "full-tui")]
+            status_emitter: None,
         }
+    }
+
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn set_status_emitter(&mut self, emitter: crate::streaming::StatusEmitter) {
+        self.status_emitter = Some(emitter);
+    }
+
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn clear_status_emitter(&mut self) {
+        self.status_emitter = None;
     }
 
     pub(crate) fn with_verbosity(mut self, verbosity: OutputVerbosity) -> Self {
@@ -169,6 +185,16 @@ impl ToolExecutor for CliToolExecutor {
         };
         match result {
             Ok(output) => {
+                // Emit ToolResult event for TUI consumption (regardless of emit_output)
+                #[cfg(feature = "full-tui")]
+                if let Some(emitter) = &self.status_emitter {
+                    emitter(crate::streaming::StatusEvent::ToolResult {
+                        id: String::new(),
+                        name: tool_name.to_string(),
+                        output: output.clone(),
+                        is_error: false,
+                    });
+                }
                 if self.emit_output && self.output_verbosity.show_tool_results() {
                     // Full 模式：用卡片闭合（带左边框对齐 + 底部边框），
                     // 把工具结果嵌入到 format_tool_call_start 开的卡片容器内。
@@ -192,6 +218,16 @@ impl ToolExecutor for CliToolExecutor {
                 Ok(output)
             }
             Err(error) => {
+                // Emit ToolResult error event for TUI consumption
+                #[cfg(feature = "full-tui")]
+                if let Some(emitter) = &self.status_emitter {
+                    emitter(crate::streaming::StatusEvent::ToolResult {
+                        id: String::new(),
+                        name: tool_name.to_string(),
+                        output: error.to_string(),
+                        is_error: true,
+                    });
+                }
                 if self.emit_output && self.output_verbosity.show_tool_errors() {
                     // Full 模式：错误结果也嵌入卡片容器（闭合）。
                     // Compact/Minimal 模式：format_tool_result 会输出完整错误（错误不折叠）。
@@ -362,7 +398,7 @@ pub(crate) fn clear_rustyline_echo(input: &str) {
     let prompt_width = 2; // "> "
     let input_width = estimate_display_width(input);
     let total_width = prompt_width + input_width;
-    let wrapped_lines = ((total_width + cols - 1) / cols).max(1);
+    let wrapped_lines = total_width.div_ceil(cols).max(1);
     let mut stdout = io::stdout();
     for _ in 0..wrapped_lines {
         // \x1b[A = 光标上移一行, \x1b[2K = 清除整行

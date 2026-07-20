@@ -65,6 +65,10 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    /// Tier S #3 穷鬼模式：true 时跳过 nudge / prompt_suggestion 等非核心 token 消耗。
+    /// 进程启动时由 LiveCli 读取并写入全局 `poor_mode` AtomicBool，运行时通过
+    /// `/poor` 命令切换并立即生效（无需重启）。
+    poor_mode: Option<bool>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -316,6 +320,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            poor_mode: parse_optional_poor_mode(&merged_value),
         };
 
         Ok(RuntimeConfig {
@@ -500,6 +505,12 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
         merge_trusted_roots(self.trusted_roots(), per_call_roots)
+    }
+
+    /// 返回 `settings.poorMode` 配置值。`None` 表示未配置，由调用方决定默认值。
+    #[must_use]
+    pub fn poor_mode(&self) -> Option<bool> {
+        self.poor_mode
     }
 }
 
@@ -946,6 +957,14 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
         optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
             .unwrap_or_default(),
     )
+}
+
+/// 读取 `settings.poorMode` 布尔字段。未配置时返回 `None`，由调用方决定默认值
+/// （LiveCli 启动时会用 `false` 作为默认，运行时通过 `/poor` 命令切换）。
+fn parse_optional_poor_mode(root: &JsonValue) -> Option<bool> {
+    root.as_object()
+        .and_then(|object| object.get("poorMode"))
+        .and_then(JsonValue::as_bool)
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {

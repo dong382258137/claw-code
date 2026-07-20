@@ -456,6 +456,7 @@ pub(crate) fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> 
 /// hand off to `tui::run_tui_repl`. Only compiled when `full-tui` feature is on;
 /// without the feature, the dispatch in `run()` prints an error and exits.
 #[cfg(feature = "full-tui")]
+#[allow(clippy::too_many_arguments)] // Stage 1 验收:8 参数超 clippy 默认上限 7,与 run_repl 同策略,重构参数到 struct 待 Stage 2 处理。
 fn run_tui_repl_entry(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -590,7 +591,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         CliAction::Diff { output_format } => match output_format {
             CliOutputFormat::Text => {
-                println!("{}", render_diff_report()?);
+                page_long_output(&render_diff_report()?);
             }
             CliOutputFormat::Json => {
                 let cwd = env::current_dir()?;
@@ -615,6 +616,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             additional_workspace_roots,
             output_verbosity,
             tui,
+            enable_plan_mode,
         } => {
             if tui {
                 #[cfg(feature = "full-tui")]
@@ -648,6 +650,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 allow_broad_cwd,
                 additional_workspace_roots,
                 output_verbosity,
+                enable_plan_mode,
             )?
         }
         CliAction::HelpTopic {

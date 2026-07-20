@@ -12,7 +12,7 @@ use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
     MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 use super::{preflight_message_request, Provider, ProviderFuture};
@@ -781,6 +781,12 @@ struct OpenAiUsage {
     completion_tokens: u32,
     #[serde(default)]
     prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    // DeepSeek 原生字段：直接平铺在 usage 对象上，不在 prompt_tokens_details 里。
+    // 优先级高于 OpenAI 标准 cached_tokens，因为它是 DeepSeek 自己的命中计数。
+    #[serde(default)]
+    prompt_cache_hit_tokens: u32,
+    #[serde(default)]
+    prompt_cache_miss_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -791,15 +797,28 @@ struct OpenAiPromptTokensDetails {
 
 impl OpenAiUsage {
     fn normalized(&self) -> Usage {
-        let cached_tokens = self
-            .prompt_tokens_details
-            .as_ref()
-            .map_or(0, |details| details.cached_tokens);
-        Usage {
-            input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: cached_tokens,
-            output_tokens: self.completion_tokens,
+        // DeepSeek 原生字段优先：当 hit 或 miss > 0 时，直接用 DeepSeek 的语义。
+        // - cache_read_input_tokens = prompt_cache_hit_tokens
+        // - input_tokens (非缓存输入) = prompt_cache_miss_tokens
+        // 否则回退到 OpenAI 标准：从 prompt_tokens_details.cached_tokens 推导。
+        if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
+            Usage {
+                input_tokens: self.prompt_cache_miss_tokens,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: self.prompt_cache_hit_tokens,
+                output_tokens: self.completion_tokens,
+            }
+        } else {
+            let cached_tokens = self
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens);
+            Usage {
+                input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: cached_tokens,
+                output_tokens: self.completion_tokens,
+            }
         }
     }
 }
@@ -1002,17 +1021,85 @@ pub fn build_chat_completion_request(
     build_chat_completion_request_for_base_url(request, config, &read_base_url(config))
 }
 
+/// 将 `SystemContent` 转换为 1~2 个 OpenAI 兼容的 system message。
+///
+/// 专为 DeepSeek 等隐式前缀缓存模型优化：
+/// - `SystemContent::Text`：单字符串，作为单个 system message。
+/// - `SystemContent::Blocks`：按 `cache_control` 标记位置拆分。最后一个带
+///   `cache_control` 的 block 视为静态/动态边界（Anthropic 路径的
+///   `build_system_blocks` 在最后一个 static block 上标 `cache_control`）。
+///   静态段（含该标记 block 及其之前的所有 block）拼成第一个 system message
+///   —— token 序列稳定，命中 DeepSeek 前缀缓存；动态段（标记之后的 blocks）
+///   拼成第二个 system message —— 内容会变化，但放在静态段之后不破坏前缀。
+///
+/// 此外，OpenAI/DeepSeek 的 system message `content` 必须是 string，不能是
+/// `SystemBlock` 数组。直接 `content: system` 会让 `SystemContent::Blocks`
+/// 序列化成数组，导致 400 错误或被强制 stringify（增加 token 浪费 + 破坏前缀
+/// 缓存）。本函数显式提取每个 block 的 `text` 字段并用 `\n\n` 拼接成字符串。
+fn split_system_content_to_openai_messages(
+    system: &Option<SystemContent>,
+) -> Vec<Value> {
+    let Some(content) = system.as_ref().filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    match content {
+        SystemContent::Text(text) => {
+            if text.is_empty() {
+                return Vec::new();
+            }
+            vec![json!({ "role": "system", "content": text })]
+        }
+        SystemContent::Blocks(blocks) => {
+            if blocks.is_empty() {
+                return Vec::new();
+            }
+            // 找到最后一个带 cache_control 的 block 作为静态/动态边界。
+            // 没有任何 cache_control 标记时，全部视为静态段（单个 system message）。
+            let boundary = blocks.iter().rposition(|b| b.cache_control.is_some());
+            match boundary {
+                None => {
+                    let text = blocks
+                        .iter()
+                        .map(|b| b.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    vec![json!({ "role": "system", "content": text })]
+                }
+                Some(idx) => {
+                    let static_text = blocks
+                        .iter()
+                        .take(idx + 1)
+                        .map(|b| b.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let dynamic_text = blocks
+                        .iter()
+                        .skip(idx + 1)
+                        .map(|b| b.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let mut result = Vec::with_capacity(2);
+                    if !static_text.is_empty() {
+                        result.push(json!({ "role": "system", "content": static_text }));
+                    }
+                    if !dynamic_text.is_empty() {
+                        result.push(json!({ "role": "system", "content": dynamic_text }));
+                    }
+                    result
+                }
+            }
+        }
+    }
+}
+
 fn build_chat_completion_request_for_base_url(
     request: &MessageRequest,
     config: OpenAiCompatConfig,
     base_url: &str,
 ) -> Value {
     let mut messages = Vec::new();
-    if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
-        messages.push(json!({
-            "role": "system",
-            "content": system,
-        }));
+    for system_message in split_system_content_to_openai_messages(&request.system) {
+        messages.push(system_message);
     }
     // Resolve the transport routing prefix into the wire model. Custom
     // OpenAI-compatible gateways may require slash-containing slugs intact.

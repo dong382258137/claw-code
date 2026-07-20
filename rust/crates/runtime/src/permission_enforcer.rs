@@ -37,10 +37,20 @@ impl PermissionEnforcer {
     /// Check whether a tool can be executed under the current permission policy.
     /// Auto-denies when prompting is required but no prompter is provided.
     pub fn check(&self, tool_name: &str, input: &str) -> EnforcementResult {
-        // When the active mode is Prompt, defer to the caller's interactive
-        // prompt flow rather than hard-denying (the enforcer has no prompter).
+        // In Prompt mode the enforcer has no prompter, so we must hard-deny.
+        // Callers that want interactive prompting should inspect `active_mode()`
+        // themselves and run their own prompter flow before calling `check`.
         if self.policy.active_mode() == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
+            let active_mode = self.policy.active_mode();
+            let required_mode = self.policy.required_mode_for(tool_name);
+            return EnforcementResult::Denied {
+                tool: tool_name.to_owned(),
+                active_mode: active_mode.as_str().to_owned(),
+                required_mode: required_mode.as_str().to_owned(),
+                reason: format!(
+                    "'{tool_name}' requires confirmation in prompt mode, but no interactive prompter is configured"
+                ),
+            };
         }
 
         let outcome = self.policy.authorize(tool_name, input, None);
@@ -73,10 +83,18 @@ impl PermissionEnforcer {
         input: &str,
         required_mode: PermissionMode,
     ) -> EnforcementResult {
-        // When the active mode is Prompt, defer to the caller's interactive
-        // prompt flow rather than hard-denying.
+        // In Prompt mode the enforcer has no prompter, so we must hard-deny.
+        // See `check` for rationale.
         if self.policy.active_mode() == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
+            let active_mode = self.policy.active_mode();
+            return EnforcementResult::Denied {
+                tool: tool_name.to_owned(),
+                active_mode: active_mode.as_str().to_owned(),
+                required_mode: required_mode.as_str().to_owned(),
+                reason: format!(
+                    "'{tool_name}' requires confirmation in prompt mode, but no interactive prompter is configured"
+                ),
+            };
         }
 
         let active_mode = self.policy.active_mode();
@@ -173,24 +191,108 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Workspace boundary check using path-component comparison.
+///
+/// BUG-P1-6: the previous implementation used raw string `starts_with`
+/// on the normalized path, which was safe against the `/app` vs `/app-x`
+/// case only because it appended a trailing `/`. But it was still
+/// vulnerable to:
+///   * `..` traversal: `/workspace/../../etc/passwd` would pass the
+///     prefix check while resolving outside the workspace.
+///   * Mixed separators on Windows (`\` vs `/`).
+///   * Case-insensitivity on Windows (NTFS treats `Foo` and `foo` as
+///     the same path; a string compare does not).
+///
+/// We now lexically normalize the candidate (resolving `.` and `..`
+/// components without touching the filesystem) and compare component
+/// lists, so `..` traversal is rejected and separator / case issues
+/// are handled by `Path`'s own normalization on each platform.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
-        path.to_owned()
+    use std::path::{Component, Path};
+
+    let candidate = if Path::new(path).is_absolute() {
+        Path::new(path).to_path_buf()
     } else {
-        format!("{workspace_root}/{path}")
+        Path::new(workspace_root).join(path)
     };
 
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
-    } else {
-        format!("{workspace_root}/")
-    };
+    // Lexically resolve `.` and `..` without touching the filesystem.
+    // This mirrors what `std::fs::canonicalize` would do for existing
+    // paths, but works for not-yet-created files too.
+    let mut normalized_components: Vec<Component<'_>> = Vec::new();
+    for component in candidate.components() {
+        match component {
+            Component::CurDir => {} // skip `.`
+            Component::ParentDir => {
+                // Pop the last normal component, but never pop past a
+                // root/prefix — `..` above the root is meaningless.
+                if let Some(last) = normalized_components.last() {
+                    if matches!(last, Component::Normal(_)) {
+                        normalized_components.pop();
+                    }
+                }
+            }
+            other => normalized_components.push(other),
+        }
+    }
 
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+    let root_path = Path::new(workspace_root);
+    let mut root_components: Vec<Component<'_>> = Vec::new();
+    for component in root_path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(last) = root_components.last() {
+                    if matches!(last, Component::Normal(_)) {
+                        root_components.pop();
+                    }
+                }
+            }
+            other => root_components.push(other),
+        }
+    }
+
+    // The candidate is inside the workspace iff the workspace's component
+    // list is a prefix of the candidate's component list (and both share
+    // the same root/prefix). Component equality is platform-aware: on
+    // Windows `Path` uses the OsStr, which preserves case — we add a
+    // case-insensitive fallback below for the Windows common case.
+    if normalized_components.len() < root_components.len() {
+        return false;
+    }
+    for (candidate_part, root_part) in
+        normalized_components.iter().zip(root_components.iter())
+    {
+        if !components_equal(candidate_part, root_part) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compare two path components, case-insensitively on Windows.
+#[cfg(windows)]
+fn components_equal<'a>(a: &std::path::Component<'a>, b: &std::path::Component<'a>) -> bool {
+    use std::path::Component;
+    match (a, b) {
+        (Component::Normal(a_str), Component::Normal(b_str)) => {
+            a_str.eq_ignore_ascii_case(b_str)
+        }
+        _ => a == b,
+    }
+}
+
+#[cfg(not(windows))]
+fn components_equal<'a>(a: &std::path::Component<'a>, b: &std::path::Component<'a>) -> bool {
+    a == b
 }
 
 /// Conservative heuristic: is this bash command read-only?
+///
+/// Excludes commands that can execute arbitrary code (`python`, `node`,
+/// `ruby`, `cargo`, `rustc`), modify files (`tee`, `sed -i`), or mutate
+/// repository state (`git`, `gh`). Callers needing git/python/etc. must
+/// upgrade to `WorkspaceWrite` or higher.
 fn is_read_only_command(command: &str) -> bool {
     let first_token = command
         .split_whitespace()
@@ -200,6 +302,10 @@ fn is_read_only_command(command: &str) -> bool {
         .next()
         .unwrap_or("");
 
+    // Only purely-readonly commands are whitelisted here. Commands that can
+    // execute arbitrary code (python/node/ruby/cargo), write files (tee/sed -i),
+    // or mutate repo state (git/gh) are intentionally excluded — they must
+    // go through the higher permission tiers.
     matches!(
         first_token,
         "cat"
@@ -213,7 +319,6 @@ fn is_read_only_command(command: &str) -> bool {
             | "grep"
             | "rg"
             | "awk"
-            | "sed"
             | "echo"
             | "printf"
             | "which"
@@ -237,7 +342,6 @@ fn is_read_only_command(command: &str) -> bool {
             | "tr"
             | "cut"
             | "paste"
-            | "tee"
             | "xargs"
             | "test"
             | "true"
@@ -257,18 +361,37 @@ fn is_read_only_command(command: &str) -> bool {
             | "tree"
             | "jq"
             | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
-            | "git"
-            | "gh"
-    ) && !command.contains("-i ")
-        && !command.contains("--in-place")
-        && !command.contains(" > ")
-        && !command.contains(" >> ")
+    ) && !has_write_redirection(command)
+}
+
+/// Detect write redirections (`>`, `>>`, `>&`) and `sed -i` / `--in-place`
+/// that turn an otherwise read-only command into a write operation.
+fn has_write_redirection(command: &str) -> bool {
+    // Scan tokens so `>` inside a quoted argument is not misclassified.
+    // This is a heuristic — a fully correct parser would need shell quoting.
+    for tok in command.split_whitespace() {
+        if tok.starts_with('>') || tok == ">" || tok == ">>" || tok.starts_with(">&") {
+            return true;
+        }
+    }
+    // `sed -i` in any form (`-i`, `-i''`, `-iE`, `--in-place`, `--in-place=...`).
+    if command.split_whitespace().any(|tok| {
+        tok == "-i"
+            || tok == "--in-place"
+            || tok.starts_with("-i")
+            || tok.starts_with("--in-place=")
+    }) {
+        // Only treat as a write if the command actually is `sed`.
+        if command
+            .split_whitespace()
+            .next()
+            .map(|c| c.rsplit('/').next().unwrap_or(c) == "sed")
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -369,10 +492,16 @@ mod tests {
     fn read_only_command_heuristic() {
         assert!(is_read_only_command("cat file.txt"));
         assert!(is_read_only_command("grep pattern file"));
-        assert!(is_read_only_command("git log --oneline"));
+        // `git` is excluded from the read-only whitelist because subcommands
+        // like `checkout`/`reset --hard` mutate the workspace.
+        assert!(!is_read_only_command("git log --oneline"));
         assert!(!is_read_only_command("rm file.txt"));
         assert!(!is_read_only_command("echo test > file.txt"));
         assert!(!is_read_only_command("sed -i 's/a/b/' file"));
+        // `tee`, `python`, `cargo` are excluded — they can write or exec code.
+        assert!(!is_read_only_command("tee out.txt"));
+        assert!(!is_read_only_command("python -c 'print(1)'"));
+        assert!(!is_read_only_command("cargo build"));
     }
 
     #[test]
@@ -477,15 +606,16 @@ mod tests {
     fn bash_heuristic_full_path_prefix() {
         // given
         let full_path_command = "/usr/bin/cat Cargo.toml";
-        let git_path_command = "/usr/local/bin/git status";
+        // `git` is no longer treated as read-only; use `ls` instead.
+        let ls_path_command = "/usr/local/bin/ls -la";
 
         // when
         let cat_result = is_read_only_command(full_path_command);
-        let git_result = is_read_only_command(git_path_command);
+        let ls_result = is_read_only_command(ls_path_command);
 
         // then
         assert!(cat_result);
-        assert!(git_result);
+        assert!(ls_result);
     }
 
     #[test]

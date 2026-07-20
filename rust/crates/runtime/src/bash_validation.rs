@@ -528,11 +528,49 @@ const SYSTEM_ADMIN_COMMANDS: &[&str] = &[
 
 /// Classify the semantic intent of a bash command.
 ///
+/// Scans **every** sub-command in the chain and returns the most dangerous
+/// intent encountered, so that `cat foo && rm -rf /` is classified as
+/// `Destructive` rather than `ReadOnly`.
+///
 /// Corresponds to upstream `tools/BashTool/commandSemantics.ts`.
 #[must_use]
 pub fn classify_command(command: &str) -> CommandIntent {
-    let first = extract_first_command(command);
-    classify_by_first_command(&first, command)
+    let mut max_intent = CommandIntent::ReadOnly;
+    for sub in split_command_chain(command) {
+        let trimmed = sub.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let first = extract_first_command(trimmed);
+        let intent = classify_by_first_command(&first, trimmed);
+        max_intent = upgrade_intent(max_intent, intent);
+    }
+    // If any sub-command was Unknown, the whole chain is treated as Unknown
+    // so that downstream permission classification degrades to the safest
+    // (most privileged) mode.
+    max_intent
+}
+
+/// Pick the more dangerous of two intents. `Unknown` is treated as the most
+/// dangerous so that unclassifiable commands force a permission upgrade.
+fn upgrade_intent(a: CommandIntent, b: CommandIntent) -> CommandIntent {
+    const fn rank(i: CommandIntent) -> u8 {
+        match i {
+            CommandIntent::ReadOnly => 0,
+            CommandIntent::Write => 1,
+            CommandIntent::Network
+            | CommandIntent::ProcessManagement
+            | CommandIntent::PackageManagement => 2,
+            CommandIntent::SystemAdmin => 3,
+            CommandIntent::Destructive => 4,
+            CommandIntent::Unknown => 5,
+        }
+    }
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
 }
 
 fn classify_by_first_command(first: &str, command: &str) -> CommandIntent {
@@ -590,28 +628,129 @@ fn classify_git_command(command: &str) -> CommandIntent {
 /// Run the full validation pipeline on a bash command.
 ///
 /// Returns the first non-Allow result, or Allow if all validations pass.
+///
+/// Scans **every** sub-command in the chain (split on `;`, `|`, `&&`, `||`,
+/// trailing `&`) so that bypasses like `cat README.md && rm -rf /` cannot
+/// slip past validation by hiding the dangerous command behind a benign prefix.
 #[must_use]
 pub fn validate_command(command: &str, mode: PermissionMode, workspace: &Path) -> ValidationResult {
-    // 1. Mode-level validation (includes read-only checks).
-    let result = validate_mode(command, mode);
-    if result != ValidationResult::Allow {
-        return result;
+    // 0. Destructive patterns may span the whole command line (e.g. fork bombs,
+    //    `rm -rf /` with mixed separators). Check the raw input first, but only
+    //    short-circuit on Block-level findings. Warn-level findings are deferred
+    //    so that stricter mode checks (e.g. ReadOnly blocking writes) take
+    //    precedence — `rm -rf /tmp/x` in ReadOnly must be Blocked, not Warned.
+    let destructive = check_destructive(command);
+    if matches!(destructive, ValidationResult::Block { .. }) {
+        return destructive;
     }
 
-    // 2. Sed-specific validation.
-    let result = validate_sed(command, mode);
-    if result != ValidationResult::Allow {
-        return result;
+    // 1. For each sub-command in the chain, run mode/sed/path validations.
+    //    This catches pipe/semicolon/&& bypasses like "cat x && rm y".
+    for sub in split_command_chain(command) {
+        let trimmed = sub.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let result = validate_mode(trimmed, mode);
+        if result != ValidationResult::Allow {
+            return result;
+        }
+
+        let result = validate_sed(trimmed, mode);
+        if result != ValidationResult::Allow {
+            return result;
+        }
+
+        let result = validate_paths(trimmed, workspace);
+        if result != ValidationResult::Allow {
+            return result;
+        }
     }
 
-    // 3. Destructive command warnings.
-    let result = check_destructive(command);
-    if result != ValidationResult::Allow {
-        return result;
+    // 2. No mode/sed/path check blocked the command; surface any deferred
+    //    destructive warning now so it is still visible to the caller.
+    if matches!(destructive, ValidationResult::Warn { .. }) {
+        return destructive;
     }
 
-    // 4. Path validation.
-    validate_paths(command, workspace)
+    ValidationResult::Allow
+}
+
+/// Split a bash command line into its constituent sub-commands.
+///
+/// Handles `;`, `|`, `&&`, `||`, and trailing `&` separators while respecting
+/// single/double quotes, backticks, and backslash escapes. Sub-commands that
+/// are empty after trimming are filtered out.
+#[must_use]
+pub fn split_command_chain(command: &str) -> Vec<String> {
+    let mut subcommands: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            current.push(ch);
+            if ch == '\\' {
+                if let Some(&next) = chars.peek() {
+                    current.push(next);
+                    chars.next();
+                }
+                continue;
+            }
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' | '`' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '\\' => {
+                current.push(ch);
+                if let Some(&next) = chars.peek() {
+                    current.push(next);
+                    chars.next();
+                }
+            }
+            ';' | '|' | '&' => {
+                // Consume runs of `|` and `&` to handle `&&`, `||`, `|&`, etc.
+                // These separator characters are NOT pushed to `current` — they
+                // mark the boundary between sub-commands.
+                while let Some(&next) = chars.peek() {
+                    if next == '|' || next == '&' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    // Push the trimmed sub-command, not the raw `current`
+                    // (which may have leading/trailing whitespace from the
+                    // separator scan). Previously this pushed `current`
+                    // verbatim, leaving stray leading spaces in downstream
+                    // sub-commands (e.g. `"ls "` instead of `"ls"`).
+                    subcommands.push(trimmed.to_owned());
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    let trimmed_tail = current.trim();
+    if !trimmed_tail.is_empty() {
+        subcommands.push(trimmed_tail.to_owned());
+    }
+
+    subcommands
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,5 +1139,128 @@ mod tests {
     #[test]
     fn extracts_plain_command() {
         assert_eq!(extract_first_command("grep -r pattern ."), "grep");
+    }
+
+    // --- split_command_chain ---
+
+    #[test]
+    fn splits_semicolon_chain() {
+        let parts = split_command_chain("echo a; echo b; ls");
+        assert_eq!(parts, vec!["echo a", "echo b", "ls"]);
+    }
+
+    #[test]
+    fn splits_pipe_chain() {
+        let parts = split_command_chain("cat foo | grep bar | wc -l");
+        assert_eq!(parts, vec!["cat foo", "grep bar", "wc -l"]);
+    }
+
+    #[test]
+    fn splits_and_or_chains() {
+        let parts = split_command_chain("ls && rm foo || echo failed");
+        assert_eq!(parts, vec!["ls", "rm foo", "echo failed"]);
+    }
+
+    #[test]
+    fn respects_quotes_in_split() {
+        // Single-quoted `;` must not be treated as a separator.
+        let parts = split_command_chain("echo 'a;b;c'; ls");
+        assert_eq!(parts, vec!["echo 'a;b;c'", "ls"]);
+    }
+
+    #[test]
+    fn respects_double_quotes_in_split() {
+        let parts = split_command_chain(r#"echo "a && b" && rm x"#);
+        assert_eq!(parts, vec![r#"echo "a && b""#, "rm x"]);
+    }
+
+    #[test]
+    fn respects_escapes_in_split() {
+        let parts = split_command_chain(r"echo a\;b; ls");
+        assert_eq!(parts, vec![r"echo a\;b", "ls"]);
+    }
+
+    // --- pipeline: pipe/chain bypass regression tests ---
+
+    #[test]
+    fn pipeline_blocks_pipe_bypass_in_read_only() {
+        // `cat foo && rm bar` must be blocked in read-only mode because of
+        // the `rm` sub-command, not allowed because `cat` is read-only.
+        let workspace = PathBuf::from("/workspace");
+        assert!(matches!(
+            validate_command(
+                "cat README.md && rm workspace_file.txt",
+                PermissionMode::ReadOnly,
+                &workspace
+            ),
+            ValidationResult::Block { reason } if reason.contains("rm")
+        ));
+    }
+
+    #[test]
+    fn pipeline_warns_destructive_behind_pipe() {
+        // `ls . && rm -rf /` must trigger the destructive warning even though
+        // `rm -rf /` is the second sub-command. The destructive-pattern scan
+        // runs on the whole command line, so it must catch this.
+        let workspace = PathBuf::from("/workspace");
+        assert!(matches!(
+            validate_command(
+                "ls . && rm -rf /",
+                PermissionMode::WorkspaceWrite,
+                &workspace,
+            ),
+            ValidationResult::Warn { .. }
+        ));
+    }
+
+    #[test]
+    fn pipeline_blocks_semicolon_bypass_in_read_only() {
+        let workspace = PathBuf::from("/workspace");
+        assert!(matches!(
+            validate_command(
+                "ls . ; rm -rf /tmp/x",
+                PermissionMode::ReadOnly,
+                &workspace
+            ),
+            ValidationResult::Block { .. }
+        ));
+    }
+
+    // --- classify_command: pipe/chain bypass regression tests ---
+
+    #[test]
+    fn classify_chain_upgrades_to_most_dangerous() {
+        // `cat foo && rm bar` → Destructive (not ReadOnly)
+        assert_eq!(
+            classify_command("cat foo && rm bar"),
+            CommandIntent::Destructive
+        );
+        // `ls . && curl http://x` → Network (not ReadOnly)
+        assert_eq!(
+            classify_command("ls . && curl http://x"),
+            CommandIntent::Network
+        );
+        // `echo a && cargo build` → PackageManagement (echo=ReadOnly, cargo=PackageManagement)
+        assert_eq!(
+            classify_command("echo a && cargo build"),
+            CommandIntent::PackageManagement
+        );
+    }
+
+    #[test]
+    fn classify_chain_with_unknown_upgrades() {
+        // `ls . && some-unknown-cmd` → Unknown
+        assert_eq!(
+            classify_command("ls . && some-unknown-cmd"),
+            CommandIntent::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_pure_readonly_chain_stays_readonly() {
+        assert_eq!(
+            classify_command("cat foo | grep bar | wc -l"),
+            CommandIntent::ReadOnly
+        );
     }
 }

@@ -13,6 +13,7 @@
 //! connect to MCP servers and invoke their capabilities.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::mcp::mcp_tool_name;
@@ -70,10 +71,29 @@ pub struct McpServerState {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct McpToolRegistry {
     inner: Arc<Mutex<HashMap<String, McpServerState>>>,
     manager: Arc<OnceLock<Arc<Mutex<McpServerManager>>>>,
+    /// Set to `true` after the first successful `discover_tools()` call.
+    /// Subsequent `call_tool` invocations skip discovery and reuse the
+    /// already-initialized MCP server processes. This fixes BUG-P1-1:
+    /// previously every `call_tool` re-discovered, re-initialized, then
+    /// shut down every server, forcing a fresh spawn on the next call.
+    discovered: Arc<AtomicBool>,
+}
+
+impl Clone for McpToolRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            manager: Arc::clone(&self.manager),
+            // Cloned registries share the discovered flag so that a
+            // discovery performed through one handle is visible to the
+            // other.
+            discovered: Arc::clone(&self.discovered),
+        }
+    }
 }
 
 impl McpToolRegistry {
@@ -97,7 +117,15 @@ impl McpToolRegistry {
         resources: Vec<McpResourceInfo>,
         server_info: Option<String>,
     ) {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         inner.insert(
             server_name.to_owned(),
             McpServerState {
@@ -112,17 +140,41 @@ impl McpToolRegistry {
     }
 
     pub fn get_server(&self, server_name: &str) -> Option<McpServerState> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         inner.get(server_name).cloned()
     }
 
     pub fn list_servers(&self) -> Vec<McpServerState> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         inner.values().cloned().collect()
     }
 
     pub fn list_resources(&self, server_name: &str) -> Result<Vec<McpResourceInfo>, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         match inner.get(server_name) {
             Some(state) => {
                 if state.status != McpConnectionStatus::Connected {
@@ -138,7 +190,15 @@ impl McpToolRegistry {
     }
 
     pub fn read_resource(&self, server_name: &str, uri: &str) -> Result<McpResourceInfo, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         let state = inner
             .get(server_name)
             .ok_or_else(|| format!("server '{}' not found", server_name))?;
@@ -159,7 +219,15 @@ impl McpToolRegistry {
     }
 
     pub fn list_tools(&self, server_name: &str) -> Result<Vec<McpToolInfo>, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         match inner.get(server_name) {
             Some(state) => {
                 if state.status != McpConnectionStatus::Connected {
@@ -176,6 +244,7 @@ impl McpToolRegistry {
 
     fn spawn_tool_call(
         manager: Arc<Mutex<McpServerManager>>,
+        discovered: Arc<AtomicBool>,
         qualified_tool_name: String,
         arguments: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
@@ -192,21 +261,26 @@ impl McpToolRegistry {
                         let mut manager = manager
                             .lock()
                             .map_err(|_| "mcp server manager lock poisoned".to_string())?;
+
+                        // BUG-P1-1 fix: only discover (which spawns + initializes
+                        // every server) on the first call. Subsequent calls
+                        // reuse the already-initialized processes — `call_tool`
+                        // internally calls `ensure_server_ready`, which will
+                        // respawn a crashed process on demand. Previously the
+                        // `shutdown()` below tore down every server after each
+                        // call, forcing a fresh spawn next time.
+                        if !discovered.load(Ordering::Acquire) {
+                            manager
+                                .discover_tools()
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            discovered.store(true, Ordering::Release);
+                        }
+
                         manager
-                            .discover_tools()
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let response = manager
                             .call_tool(&qualified_tool_name, arguments)
                             .await
-                            .map_err(|error| error.to_string());
-                        let shutdown = manager.shutdown().await.map_err(|error| error.to_string());
-
-                        match (response, shutdown) {
-                            (Ok(response), Ok(())) => Ok(response),
-                            (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
-                            (Ok(_), Err(error)) => Err(error),
-                        }
+                            .map_err(|error| error.to_string())
                     }?;
 
                     if let Some(error) = response.error {
@@ -243,7 +317,15 @@ impl McpToolRegistry {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         let state = inner
             .get(server_name)
             .ok_or_else(|| format!("server '{}' not found", server_name))?;
@@ -272,6 +354,7 @@ impl McpToolRegistry {
 
         Self::spawn_tool_call(
             manager,
+            Arc::clone(&self.discovered),
             mcp_tool_name(server_name, tool_name),
             (!arguments.is_null()).then(|| arguments.clone()),
         )
@@ -283,7 +366,15 @@ impl McpToolRegistry {
         server_name: &str,
         status: McpConnectionStatus,
     ) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         let state = inner
             .get_mut(server_name)
             .ok_or_else(|| format!("server '{}' not found", server_name))?;
@@ -293,14 +384,30 @@ impl McpToolRegistry {
 
     /// Disconnect / remove a server.
     pub fn disconnect(&self, server_name: &str) -> Option<McpServerState> {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         inner.remove(server_name)
     }
 
     /// Number of registered servers.
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            // BUG-P1-4: previously a poisoned mutex (caused by a panic in
+            // another thread while holding the lock) would propagate as a
+            // process-wide panic here. Recover the inner data instead — the
+            // worst case is reading slightly stale registry state, which is
+            // strictly better than tearing down the whole runtime.
+            eprintln!("[mcp-tool-bridge] registry lock was poisoned, recovering inner data");
+            poisoned.into_inner()
+        });
         inner.len()
     }
 

@@ -436,7 +436,12 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 /// Extract repository name from a path for event context.
-fn extract_repo_name(cwd: &str) -> Option<String> {
+/// 从 cwd 路径中提取仓库名。
+///
+/// BUG-4 修复:改为 `pub(crate)` 以便 worker_boot 在构造
+/// `TrustEvent::TrustRequired` 时复用,避免重复实现。
+/// 详见 docs/harness-engineering-optimization-plan.md Step 1.1。
+pub(crate) fn extract_repo_name(cwd: &str) -> Option<String> {
     let path = Path::new(cwd);
     // Try to find a .git directory to identify repo root
     let mut current = Some(path);

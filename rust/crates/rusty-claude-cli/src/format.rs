@@ -1056,6 +1056,57 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
             ));
         }
     }
+
+    // Persistent memory surface (Persona / Human / Tasks blocks + active entries).
+    // Loaded-and-frozen so the rendered snapshot matches what the runtime
+    // injects into the system prompt for the current session. Silently
+    // skipped when no memory.json exists yet — keeps the command usable
+    // on fresh workspaces.
+    let memory_path = cwd.join(".claw").join("memory.json");
+    if memory_path.exists() {
+        let memory = runtime::PersistentMemory::load_and_freeze(&memory_path);
+        lines.push(String::new());
+        lines.push("Persistent memory".to_string());
+        lines.push(format!("  File {}", memory_path.display()));
+        // Block summary: label + capacity ratio.
+        for block in memory.blocks() {
+            let cur = block.content().chars().count();
+            let max = block.max_chars();
+            let ratio = if max == 0 { 0.0 } else { cur as f64 / max as f64 * 100.0 };
+            let preview = block.content().lines().next().unwrap_or("").trim();
+            let preview = if preview.is_empty() { "<empty>" } else { preview };
+            lines.push(format!(
+                "  {} {}/{} chars ({:.0}%) preview={}",
+                block.label(),
+                cur,
+                max,
+                ratio,
+                preview
+            ));
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let active = memory.active_entries(now_ms);
+        lines.push(format!("  Active entries {}", active.len()));
+        if !active.is_empty() {
+            for entry in active.iter().take(10) {
+                let marker = if entry.is_unverified(now_ms) {
+                    "[unverified] "
+                } else {
+                    ""
+                };
+                let preview = entry.content.lines().next().unwrap_or("").trim();
+                lines.push(format!("    - {marker}{preview}"));
+            }
+            if active.len() > 10 {
+                lines.push(format!("    ... and {} more", active.len() - 10));
+            }
+        }
+        lines.push(format!("  Archived entries {}", memory.archive().len()));
+    }
+
     Ok(lines.join(
         "
 ",
@@ -1076,11 +1127,56 @@ pub(crate) fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::err
             })
         })
         .collect();
+
+    // Surface persistent memory state alongside instruction files so the
+    // JSON output matches the text report. Returns `null` for the
+    // `persistent_memory` field when no memory.json exists yet.
+    let memory_path = cwd.join(".claw").join("memory.json");
+    let persistent_memory = if memory_path.exists() {
+        let memory = runtime::PersistentMemory::load_and_freeze(&memory_path);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let active = memory.active_entries(now_ms);
+        let blocks: Vec<_> = memory
+            .blocks()
+            .iter()
+            .map(|b| {
+                json!({
+                    "label": b.label(),
+                    "chars": b.content().chars().count(),
+                    "max_chars": b.max_chars(),
+                })
+            })
+            .collect();
+        let active_entries: Vec<_> = active
+            .iter()
+            .map(|e| {
+                json!({
+                    "content": e.content,
+                    "source": e.source,
+                    "unverified": e.is_unverified(now_ms),
+                })
+            })
+            .collect();
+        Some(json!({
+            "file": memory_path.display().to_string(),
+            "blocks": blocks,
+            "active_entries": active_entries,
+            "active_count": active.len(),
+            "archived_count": memory.archive().len(),
+        }))
+    } else {
+        None
+    };
+
     Ok(json!({
         "kind": "memory",
         "cwd": cwd.display().to_string(),
         "instruction_files": files.len(),
         "files": files,
+        "persistent_memory": persistent_memory,
     }))
 }
 
@@ -1159,13 +1255,104 @@ pub(crate) fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::
 
     let mut sections = Vec::new();
     if !staged.trim().is_empty() {
-        sections.push(format!("Staged changes:\n{}", staged.trim_end()));
+        sections.push(format!("Staged changes:\n{}", colorize_diff(&staged)));
     }
     if !unstaged.trim().is_empty() {
-        sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
+        sections.push(format!("Unstaged changes:\n{}", colorize_diff(&unstaged)));
     }
 
     Ok(format!("Diff\n\n{}", sections.join("\n\n")))
+}
+
+/// Colorize a git diff output: green for additions, red for deletions,
+/// cyan for diff headers (diff --git, index, @@ hunk markers).
+fn colorize_diff(diff: &str) -> String {
+    let mut result = String::with_capacity(diff.len());
+    for line in diff.lines() {
+        if line.starts_with("diff --git") || line.starts_with("index ") || line.starts_with("---") || line.starts_with("+++") {
+            // File headers
+            result.push_str(&format!("\x1b[36m{line}\x1b[0m\n"));
+        } else if line.starts_with("@@") {
+            // Hunk headers
+            result.push_str(&format!("\x1b[1;36m{line}\x1b[0m\n"));
+        } else if line.starts_with('+') {
+            // Additions
+            result.push_str(&format!("\x1b[32m{line}\x1b[0m\n"));
+        } else if line.starts_with('-') {
+            // Deletions
+            result.push_str(&format!("\x1b[31m{line}\x1b[0m\n"));
+        } else {
+            // Context lines
+            result.push_str(&format!("{line}\n"));
+        }
+    }
+    result.trim_end().to_string()
+}
+
+/// Page long output through an external pager (`$PAGER` or `less`/`more`).
+/// If output is short enough (fits in terminal height), prints directly.
+/// Falls back to direct println on any pager failure.
+pub(crate) fn page_long_output(content: &str) {
+    // Get terminal height
+    let term_height = crossterm::terminal::size()
+        .map(|(_, h)| h as usize)
+        .unwrap_or(24);
+
+    let line_count = content.lines().count();
+
+    // If content fits in terminal, print directly
+    if line_count <= term_height.saturating_sub(2) {
+        println!("{content}");
+        return;
+    }
+
+    // Try external pager
+    let pager = env::var("PAGER").ok().unwrap_or_else(|| "less".to_string());
+
+    // For `less`, add flags: -R (raw control chars for colors), -F (quit if one screen), -X (no clear)
+    let (cmd, args) = if pager == "less" {
+        ("less", vec!["-R", "-F", "-X"])
+    } else if pager == "more" {
+        ("more", vec![])
+    } else {
+        // Custom pager: try to split on whitespace for command + args
+        let parts: Vec<&str> = pager.split_whitespace().collect();
+        if parts.is_empty() {
+            println!("{content}");
+            return;
+        }
+        (parts[0], parts[1..].to_vec())
+    };
+
+    let result = Command::new(cmd)
+        .args(&args)
+        .env("LESS", "RFX") // Ensure less respects colors
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+
+    match result {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                if let Err(e) = stdin.write_all(content.as_bytes()) {
+                    // Failed to write to pager, fall back to direct print
+                    eprintln!("warning: pager write failed ({e}), printing directly");
+                    println!("{content}");
+                    return;
+                }
+            }
+            match child.wait() {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("warning: pager wait failed ({e}), printing directly");
+                    println!("{content}");
+                }
+            }
+        }
+        Err(_) => {
+            // Pager not available, fall back to direct print
+            println!("{content}");
+        }
+    }
 }
 
 pub(crate) fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {

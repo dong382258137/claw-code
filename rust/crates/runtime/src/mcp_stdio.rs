@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -22,6 +23,13 @@ use crate::mcp_lifecycle_hardened::{
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
+
+/// Maximum accepted `Content-Length` for a single inbound JSON-RPC frame
+/// read by [`McpStdioProcess::read_frame`]. Bounds the allocation so a
+/// malformed or hostile MCP server cannot trigger OOM by claiming a huge
+/// body size (BUG-P1-2). 64 MiB is far above any legitimate MCP message
+/// (typical payloads are a few KiB).
+pub const MCP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
@@ -73,6 +81,32 @@ pub struct JsonRpcResponse<T = JsonValue> {
     pub result: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+}
+
+/// JSON-RPC 2.0 notification — a message without an `id` field.
+///
+/// Per the spec, notifications cannot be answered with a response; the
+/// receiver simply consumes them. MCP servers emit these mid-flight to
+/// stream progress, log messages, resource updates, etc. Without explicit
+/// notification routing, a `request` waiting on a response would try to
+/// deserialize the notification as the response and fail (BUG-S1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonRpcNotification<T = JsonValue> {
+    pub jsonrpc: String,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<T>,
+}
+
+/// Generic envelope used by the dispatcher to distinguish a response from
+/// a notification without re-parsing the raw bytes. Detection is based on
+/// presence of the `id` field: responses always carry `id`, notifications
+/// never do (JSON-RPC 2.0 §4).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum JsonRpcInbound {
+    Response(JsonRpcResponse<JsonValue>),
+    Notification(JsonRpcNotification<JsonValue>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1159,11 +1193,33 @@ impl McpServerManager {
     }
 }
 
-#[derive(Debug)]
+/// Handler invoked when a JSON-RPC notification arrives while waiting for
+/// a response. The handler receives the raw `JsonRpcNotification` and may
+/// log, queue, or forward it. Errors are logged but do not abort the
+/// dispatcher loop (a misbehaving handler should not poison the transport).
+pub type NotificationHandler = Arc<dyn Fn(JsonRpcNotification) + Send + Sync>;
+
 pub struct McpStdioProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Optional sink for notifications observed mid-request. When `None`,
+    /// notifications are logged and dropped (preserves prior behavior).
+    notification_handler: Option<NotificationHandler>,
+}
+
+impl std::fmt::Debug for McpStdioProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Child / ChildStdin / ChildStdout do not implement Debug, so we
+        // emit a structural placeholder. Required because `ManagedMcpServer`
+        // derives Debug and contains `Option<McpStdioProcess>`.
+        f.debug_struct("McpStdioProcess")
+            .field("child", &"<Child>")
+            .field("stdin", &"<ChildStdin>")
+            .field("stdout", &"<BufReader<ChildStdout>>")
+            .field("notification_handler", &self.notification_handler.is_some())
+            .finish()
+    }
 }
 
 impl McpStdioProcess {
@@ -1173,7 +1229,12 @@ impl McpStdioProcess {
             .args(&transport.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            // Ensure the child is killed when the handle is dropped without
+            // an explicit `terminate`. BUG-P1-3: previously the child could
+            // outlive the handle, leaking OS processes (orphans on Unix,
+            // zombie handles on Windows).
+            .kill_on_drop(true);
         apply_env(&mut command, &transport.env);
 
         let mut child = command.spawn()?;
@@ -1190,7 +1251,15 @@ impl McpStdioProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            notification_handler: None,
         })
+    }
+
+    /// Install a handler that will be invoked for every JSON-RPC notification
+    /// received while the dispatcher is waiting for a response. Replaces any
+    /// previously installed handler.
+    pub fn set_notification_handler(&mut self, handler: NotificationHandler) {
+        self.notification_handler = Some(handler);
     }
 
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -1243,7 +1312,11 @@ impl McpStdioProcess {
                     "MCP stdio stream closed while reading headers",
                 ));
             }
-            if line == "\r\n" {
+            // BUG-P2-1: previously this only accepted CRLF (`\r\n`) as the
+            // header terminator, while `mcp_server::read_frame` accepted
+            // both CRLF and LF. A server emitting bare LF (common on Unix
+            // when stdout is not a TTY) would hang here. Accept both.
+            if line == "\r\n" || line == "\n" {
                 break;
             }
             let header = line.trim_end_matches(['\r', '\n']);
@@ -1261,6 +1334,15 @@ impl McpStdioProcess {
         let content_length = content_length.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
         })?;
+        if content_length > MCP_MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP frame Content-Length {content_length} exceeds maximum {} bytes",
+                    MCP_MAX_FRAME_BYTES
+                ),
+            ));
+        }
         let mut payload = vec![0_u8; content_length];
         self.stdout.read_exact(&mut payload).await?;
         Ok(payload)
@@ -1289,6 +1371,85 @@ impl McpStdioProcess {
         self.read_jsonrpc_message().await
     }
 
+    /// Read the next inbound frame and dispatch it.
+    ///
+    /// Loops until a `JsonRpcResponse` is observed; any `JsonRpcNotification`
+    /// received in the meantime is forwarded to the installed
+    /// [`NotificationHandler`] (or logged and dropped if no handler is set).
+    /// This fixes BUG-S1: previously `request` called `read_response` once
+    /// and assumed the next frame would be the response — if the server had
+    /// emitted a notification first (progress/log/resource update), the
+    /// frame was mis-parsed as a response and the request failed.
+    async fn read_next_response<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        expected_id: &JsonRpcId,
+    ) -> io::Result<JsonRpcResponse<T>> {
+        loop {
+            let payload = self.read_frame().await?;
+            let inbound: JsonRpcInbound = serde_json::from_slice(&payload).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("MCP inbound frame for {method} failed to parse: {error}"),
+                )
+            })?;
+
+            match inbound {
+                JsonRpcInbound::Notification(notification) => {
+                    let method_name = notification.method.clone();
+                    if let Some(handler) = &self.notification_handler {
+                        // Handler errors are logged but never propagated:
+                        // a faulty observer must not tear down the transport.
+                        let handler = Arc::clone(handler);
+                        // Invoke synchronously. Handlers are expected to be
+                        // cheap (log/queue). Heavy work should be pushed onto
+                        // a channel by the handler itself.
+                        handler(notification);
+                    } else {
+                        eprintln!(
+                            "[mcp-stdio] dropping notification (no handler): method={method_name}"
+                        );
+                    }
+                    continue;
+                }
+                JsonRpcInbound::Response(raw) => {
+                    if raw.jsonrpc != "2.0" {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "MCP response for {method} used unsupported jsonrpc version `{}`",
+                                raw.jsonrpc
+                            ),
+                        ));
+                    }
+                    if raw.id != *expected_id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "MCP response for {method} used mismatched id: expected {expected_id:?}, got {:?}",
+                                raw.id
+                            ),
+                        ));
+                    }
+                    // Re-serialize the generic response and deserialize into
+                    // the caller's expected `T`. This round-trip is the cost
+                    // of dispatching on an untyped envelope first.
+                    let bytes = serde_json::to_vec(&raw).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error)
+                    })?;
+                    let typed: JsonRpcResponse<T> = serde_json::from_slice(&bytes)
+                        .map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("MCP response for {method} failed typed decode: {error}"),
+                            )
+                        })?;
+                    return Ok(typed);
+                }
+            }
+        }
+    }
+
     pub async fn request<TParams: Serialize, TResult: DeserializeOwned>(
         &mut self,
         id: JsonRpcId,
@@ -1298,29 +1459,7 @@ impl McpStdioProcess {
         let method = method.into();
         let request = JsonRpcRequest::new(id.clone(), method.clone(), params);
         self.send_request(&request).await?;
-        let response = self.read_response().await?;
-
-        if response.jsonrpc != "2.0" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "MCP response for {method} used unsupported jsonrpc version `{}`",
-                    response.jsonrpc
-                ),
-            ));
-        }
-
-        if response.id != id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "MCP response for {method} used mismatched id: expected {id:?}, got {:?}",
-                    response.id
-                ),
-            ));
-        }
-
-        Ok(response)
+        self.read_next_response::<TResult>(&method, &id).await
     }
 
     pub async fn initialize(
@@ -1364,7 +1503,19 @@ impl McpStdioProcess {
     }
 
     pub async fn terminate(&mut self) -> io::Result<()> {
-        self.child.kill().await
+        // BUG-P1-3: previously `terminate` only sent SIGKILL via `kill().await`
+        // without reaping the exit status, leaving zombie processes on Unix
+        // and unclosed handles on Windows. Now we kill *and* wait so the
+        // process is fully reaped before returning.
+        self.child.kill().await?;
+        self.child.wait().await.map(|_| ())
+    }
+
+    /// Synchronously attempt to reap the child's exit status without
+    /// blocking. Used by [`Drop`] to clean up zombies left behind when
+    /// the process was killed by `kill_on_drop` but never `wait`ed on.
+    fn try_reap(&mut self) {
+        let _ = self.child.try_wait();
     }
 
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
@@ -1385,6 +1536,19 @@ impl McpStdioProcess {
         }
         let _ = self.child.wait().await?;
         Ok(())
+    }
+}
+
+impl Drop for McpStdioProcess {
+    fn drop(&mut self) {
+        // `kill_on_drop(true)` on the Command already ensures SIGKILL is
+        // sent when the Child handle is dropped. We additionally do one
+        // non-blocking `try_wait` here to reap the zombie synchronously
+        // (BUG-P1-3). If the child has not exited yet, the OS will reap
+        // it when the parent process eventually exits — but the common
+        // case is that `terminate` or `kill_on_drop` has already sent
+        // the signal and the process is exiting, so this reaps it.
+        self.try_reap();
     }
 }
 
