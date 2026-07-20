@@ -48,7 +48,9 @@ use commands::SlashCommand;
 // 多行粘贴兜底：当终端不支持 bracketed paste（如 conhost）或 Ctrl+V
 // 被终端拦截逐行发送时，用 try_auto_expand_clipboard 检测剪贴板内容。
 // 参考 CLI 路径 app.rs 的处理逻辑。
-use crate::paste::{fold_pasted_input, try_auto_expand_clipboard};
+use crate::paste::{
+    fold_pasted_input, paste_diag_log, try_auto_expand_clipboard, write_clipboard_to_temp_file,
+};
 
 /// Entry point: run the TUI REPL until user exits.
 pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
@@ -423,8 +425,19 @@ fn run_event_loop(
     // - paste_id_gen：本会话自增的 paste id（用于 paste-cache 文件名）
     // - pending_paste_lines：conhost 逐行发送时待丢弃的行（TUI 路径用不到，
     //   但 try_auto_expand_clipboard 签名需要）
+    // - pending_paste_last_line：conhost 粘贴最后一行（不带 \n）的残留内容，
+    //   用于清理 InputLine buffer。详见 main loop 中的清理逻辑。
+    // - conhost_paste_intercepted：conhost 多行粘贴方案 C 标志，true 表示
+    //   已写文件，待 conhost 注入完所有行后填充 @路径到 buffer。
+    // - pending_at_path：方案 C 待填充的 @路径。方案 C 触发时不立即
+    //   insert_paste（避免 conhost 后续注入的字符与 @路径拼接），
+    //   而是保存到这个变量，等 pending_paste_lines 为空（conhost 注入完毕）
+    //   后再 insert_paste 到 buffer。
     let mut paste_id_gen: u32 = 0;
     let mut pending_paste_lines: Vec<String> = Vec::new();
+    let mut pending_paste_last_line: Option<String> = None;
+    let mut conhost_paste_intercepted: bool = false;
+    let mut pending_at_path: Option<String> = None;
 
     // 鼠标点击支持：把 draw 闭包内的 main_area 和 scroll_y 缓存到 loop 外，
     // 这样 Event::Mouse 分支可以访问它们，把点击坐标映射到逻辑行号。
@@ -432,7 +445,7 @@ fn run_event_loop(
     let mut last_main_area: Rect = Rect::default();
     let mut last_scroll_y: u16 = 0;
 
-    loop {
+    'main_loop: loop {
         // Check if a running turn has completed
         if let Some(ref rx) = turn_rx {
             match rx.try_recv() {
@@ -571,7 +584,7 @@ fn run_event_loop(
             //
             // 性能：按字符 wrap 比按 word wrap 略快（不需查 word 边界），
             // 且只需遍历一次 graphemes。对 64KB buffer（~1000 行）单次 < 2ms。
-            let visible_height = main_area.height.saturating_sub(1) as usize; // -1 for top border
+            let visible_height = main_area.height.saturating_sub(2) as usize; // -1 border, -1 safety margin
             let content_width = main_area.width as usize; // Block 只有 TOP border，无左右 border
             let wrapped_lines: Vec<Line<'static>> = output_rendered
                 .lines
@@ -626,6 +639,13 @@ fn run_event_loop(
             // 2. 没有 wrap，长行不会折行，光标 X 累加超出终端宽度
             // 3. cursor_display_width() 累加所有行宽度，对 "hello\nworld" 返回 10
             //    导致光标定位到第 1 行第 12 列（超出可见区域）
+            //
+            // **光标 wrap 行为说明**：
+            // 当内容刚好填满一行（effective_line_width == input_width 的整数倍），
+            // 终端光标会处于 wrap 状态，显示在下一行行首。所以：
+            // - row_in_line = effective_line_width / input_width（整数除法）
+            // - cursor_x = effective_line_width % input_width
+            // 当 effective_line_width=80, input_width=80 → row=1, x=0（下一行行首）
             let prompt_prefix_len: usize = 2; // "> "
             let (line_idx, _byte_offset_in_line, line_content_before_cursor) =
                 input.cursor_line_and_column();
@@ -671,17 +691,36 @@ fn run_event_loop(
             };
 
             // X 坐标：当前行内光标左侧宽度对 input_width 取模
-            let cursor_x = if line_idx == 0 {
+            let cursor_x = if input_width == 0 {
+                0
+            } else if line_idx == 0 {
                 // 第 0 行：prompt + 内容
-                (prompt_prefix_len + line_display_width) % input_width.max(1)
+                (prompt_prefix_len + line_display_width) % input_width
             } else {
-                line_display_width % input_width.max(1)
+                line_display_width % input_width
             };
 
             let display_row = display_row_before_line + row_in_line;
             let input_content_height = outer[1].height.saturating_sub(1) as usize;
             // 把 display_row 限制在可见区域内
             let visible_line_idx = display_row.min(input_content_height.saturating_sub(1));
+            // 诊断日志：只在 buffer 非空且包含多行或长行时记录（排查 wrap 光标 BUG）
+            if !input.buffer().is_empty() && (input.buffer().contains('\n') || effective_line_width > input_width) {
+                paste_diag_log(&format!(
+                    "光标计算: buf_len={} cursor={} line_idx={} line_w={} eff_w={} input_w={} row_before={} row_in_line={} cursor_x={} display_row={} visible_idx={}",
+                    input.buffer().len(),
+                    input.cursor(),
+                    line_idx,
+                    line_display_width,
+                    effective_line_width,
+                    input_width,
+                    display_row_before_line,
+                    row_in_line,
+                    cursor_x,
+                    display_row,
+                    visible_line_idx,
+                ));
+            }
             f.set_cursor_position((
                 outer[1].x + cursor_x as u16,
                 outer[1].y + 1 + visible_line_idx as u16, // +1 for the top border
@@ -735,8 +774,88 @@ fn run_event_loop(
         };
         if event::poll(poll_timeout)? {
             let ev = event::read()?;
+            // 诊断日志：记录所有收到的 Event 类型（特别是 KeyEvent 和 Paste），
+            // 用于确认 Windows Terminal 中 Ctrl+V 粘贴时 crossterm 收到的事件序列。
+            // 只记录关键事件（ESC、Ctrl+V、Enter、Char），避免日志过大。
+            match &ev {
+                Event::Key(k) => {
+                    let key_desc = match k.code {
+                        KeyCode::Char(c) => {
+                            let mods = if k.modifiers.contains(KeyModifiers::CONTROL) {
+                                "Ctrl+"
+                            } else {
+                                ""
+                            };
+                            format!("{mods}{c:?}")
+                        }
+                        KeyCode::Enter => "Enter".to_string(),
+                        KeyCode::Esc => "Esc".to_string(),
+                        _ => format!("{:?}", k.code),
+                    };
+                    // 只记录关键事件，避免日志过大
+                    if matches!(k.code, KeyCode::Esc | KeyCode::Enter)
+                        || (matches!(k.code, KeyCode::Char(_))
+                            && (k.modifiers.contains(KeyModifiers::CONTROL)
+                                || k.code == KeyCode::Char('\u{1b}')))
+                    {
+                        paste_diag_log(&format!(
+                            "KeyEvent 收到: kind={:?} code={} mods={:?}",
+                            k.kind, key_desc, k.modifiers
+                        ));
+                    }
+                }
+                Event::Paste(text) => {
+                    paste_diag_log(&format!(
+                        "Event::Paste 收到: {} 字节, {} 行",
+                        text.len(),
+                        text.lines().count()
+                    ));
+                }
+                _ => {}
+            }
             if let Event::Key(key) = ev {
                 let action = route_key(&mut input, key, help_visible);
+
+                // conhost 多行粘贴最后一行残留清理：
+                //
+                // BUG 现象：conhost 不支持 bracketed paste，Ctrl+V 粘贴多行文本时，
+                // crossterm 把剪贴板内容作为普通字符序列处理，每行 \n 触发 Submit。
+                // try_auto_expand_clipboard 兜底机制能正确处理前 N-1 行（首行触发替换，
+                // 后续行 skip_submit 丢弃），但最后一行（不带 \n）作为普通字符插入
+                // InputLine buffer，导致"发送后输入框填充最后一行内容"。
+                //
+                // 修复：每次处理完键盘事件后，如果 pending_paste_last_line 非空且
+                // InputLine buffer normalize 后等于 pending_paste_last_line normalize，
+                // 主动清空 buffer。normalize 是为了忽略 Tab 等空白差异。
+                if pending_paste_last_line.is_some() {
+                    let normalize_whitespace = |s: &str| -> String {
+                        s.chars().filter(|c| !c.is_whitespace()).collect::<String>()
+                    };
+                    let normalized_buffer = normalize_whitespace(input.buffer());
+                    let normalized_last = normalize_whitespace(pending_paste_last_line.as_deref().unwrap_or(""));
+                    if !normalized_buffer.is_empty() && normalized_buffer == normalized_last {
+                        paste_diag_log(&format!(
+                            "  清理最后一行残留: buffer={:?} == pending_paste_last_line, 清空 buffer",
+                            input.buffer()
+                        ));
+                        input.reset();
+                        pending_paste_last_line = None;
+                        // 方案 C：最后一行被清理意味着 conhost 注入完毕，
+                        // 清空 pending_paste_lines 并填充 @路径到 buffer
+                        if conhost_paste_intercepted {
+                            pending_paste_lines.clear();
+                            conhost_paste_intercepted = false;
+                            paste_diag_log("  conhost 注入完毕（最后一行清理触发），重置 conhost_paste_intercepted=false");
+                            if let Some(at_path) = pending_at_path.take() {
+                                paste_diag_log(&format!(
+                                    "  conhost 注入完毕，填充 @路径到 buffer={:?}",
+                                    at_path
+                                ));
+                                input.insert_paste(&at_path);
+                            }
+                        }
+                    }
+                }
                 match action {
                     InputAction::Exit => break,
                     InputAction::ToggleHelp => {
@@ -814,26 +933,93 @@ fn run_event_loop(
                         }
                     }
                     InputAction::Submit(line) => {
+                        // 重置 conhost_paste_intercepted 标志（每次 Submit 入口）
+                        // 注意：如果上次设置了 conhost_paste_intercepted，后续的
+                        // pending_paste_lines 仍需被丢弃，所以这里不能简单重置。
+                        // 真正的重置在 pending_paste_lines 清空后。
+                        // 诊断日志：记录每次 Submit 入口，用于排查 conhost 多行粘贴 BUG。
+                        paste_diag_log(&format!(
+                            "Submit 入口: line={:?} ({} 字节), pending_paste_lines.len()={}, cli_holder.is_some()={}, turn_rx.is_some()={}",
+                            line,
+                            line.len(),
+                            pending_paste_lines.len(),
+                            cli_holder.is_some(),
+                            turn_rx.is_some()
+                        ));
+                        if !pending_paste_lines.is_empty() {
+                            paste_diag_log(&format!(
+                                "  pending_paste_lines[0]={:?}, line.trim()={:?}",
+                                pending_paste_lines[0], line.trim()
+                            ));
+                        }
                         // conhost 多行粘贴后续行丢弃：
                         // try_auto_expand_clipboard 触发时会填充 pending_paste_lines
                         // （剪贴板第 2 行到最后一行）。conhost 不支持 bracketed paste，
                         // 粘贴会逐行触发 Submit，这里检查并丢弃后续行，避免每行被当作
                         // 独立消息发送。
                         //
-                        // 匹配规则：line（trim 后）== pending_paste_lines[0]（trim 后）。
-                        // 匹配 → 丢弃该 Submit，从 pending_paste_lines 移除该行。
-                        // 不匹配 → 粘贴已完成（用户手动输入或剪贴板变化），清空并正常处理。
+                        // 匹配规则：line（normalize 后）== pending_paste_lines[0]（normalize 后）。
+                        // normalize = 去除所有空白字符（包括 Tab、空格、\r 等），因为
+                        // conhost 可能把 Tab 解释为 Tab 键事件而非字面字符，导致
+                        // InputLine 收到的内容与剪贴板原始内容不匹配。
                         //
-                        // 边界情况：如果用户手动输入恰好等于 pending_paste_lines[0]，
-                        // 会被误丢弃。这种情况很罕见，用户重新输入即可。
-                        let skip_submit = if !pending_paste_lines.is_empty() {
-                            let trimmed_line = line.trim();
-                            let next_expected = pending_paste_lines[0].trim();
-                            if trimmed_line == next_expected {
+                        // 特殊情况：conhost_paste_intercepted=true 时（方案 C 已写文件 + 填充 @路径），
+                        // 后续所有 Submit 都应丢弃（包括 @路径本身），因为 conhost 还在
+                        // 逐行发送剪贴板内容。此时不匹配 pending_paste_lines[0] 也丢弃，
+                        // 但仍消费 pending_paste_lines 以维持计数。
+                        //
+                        // 匹配 → 丢弃该 Submit，从 pending_paste_lines 移除该行。
+                        // 不匹配且 !conhost_paste_intercepted → 粘贴已完成，清空并正常处理。
+                        // 不匹配且 conhost_paste_intercepted → 仍丢弃（@路径或残留行）。
+                        let normalize_whitespace = |s: &str| -> String {
+                            s.chars().filter(|c| !c.is_whitespace()).collect::<String>()
+                        };
+                        let skip_submit = if conhost_paste_intercepted {
+                            // 方案 C 触发后，Windows Terminal 会把剪贴板内容作为字符流注入 stdin
+                            // （不是 Event::Paste），每行 \n 触发 Enter 事件。
+                            // 这里需要 skip 所有这些 Submit，直到 pending_paste_lines 为空。
+                            //
+                            // - @路径 Submit：我们插入的，skip 但不移除 pending_paste_lines
+                            // - 匹配 pending_paste_lines[0]：skip 并移除
+                            // - 不匹配且不以 @ 开头：可能是剩余行被 conhost 修改了编码，
+                            //   保守 skip 并移除 pending_paste_lines[0]
+                            // - pending_paste_lines 为空：重置 conhost_paste_intercepted
+                            if line.trim().starts_with('@') {
+                                paste_diag_log("  skip_submit=true (conhost 拦截后的 @路径，保留 pending_paste_lines)");
+                                true
+                            } else if !pending_paste_lines.is_empty() {
+                                let normalize_whitespace = |s: &str| -> String {
+                                    s.chars().filter(|c| !c.is_whitespace()).collect::<String>()
+                                };
+                                let normalized_line = normalize_whitespace(&line);
+                                let normalized_expected = normalize_whitespace(&pending_paste_lines[0]);
+                                if !normalized_line.is_empty() && normalized_line == normalized_expected {
+                                    paste_diag_log("  skip_submit=true (conhost 模式，匹配 pending_paste_lines[0]，移除)");
+                                } else {
+                                    paste_diag_log(&format!(
+                                        "  skip_submit=true (conhost 模式，不匹配但保守丢弃 line={:?})",
+                                        line.trim()
+                                    ));
+                                }
                                 pending_paste_lines.remove(0);
                                 true
                             } else {
+                                paste_diag_log("  skip_submit=true (conhost 模式，pending_paste_lines 已空，最后兜底)");
+                                true
+                            }
+                        } else if !pending_paste_lines.is_empty() {
+                            let normalized_line = normalize_whitespace(&line);
+                            let normalized_expected = normalize_whitespace(&pending_paste_lines[0]);
+                            if !normalized_line.is_empty() && normalized_line == normalized_expected {
+                                pending_paste_lines.remove(0);
+                                paste_diag_log("  skip_submit=true (normalize 后匹配 pending_paste_lines[0]，丢弃)");
+                                true
+                            } else {
                                 pending_paste_lines.clear();
+                                paste_diag_log(&format!(
+                                    "  skip_submit=false (不匹配 normalized_line={:?} normalized_expected={:?})",
+                                    normalized_line, normalized_expected
+                                ));
                                 false
                             }
                         } else {
@@ -843,6 +1029,19 @@ fn run_event_loop(
                         if skip_submit {
                             // 丢弃该 Submit，等待下一行。
                             // InputLine::handle_key 在返回 Submit 前已 reset()，buffer 为空。
+                            // conhost_paste_intercepted 只有在 pending_paste_lines 空时才重置。
+                            if pending_paste_lines.is_empty() && conhost_paste_intercepted {
+                                conhost_paste_intercepted = false;
+                                paste_diag_log("  pending_paste_lines 清空，重置 conhost_paste_intercepted=false");
+                                // conhost 注入完毕，现在把 @路径填充到 buffer
+                                if let Some(at_path) = pending_at_path.take() {
+                                    paste_diag_log(&format!(
+                                        "  conhost 注入完毕，填充 @路径到 buffer={:?}",
+                                        at_path
+                                    ));
+                                    input.insert_paste(&at_path);
+                                }
+                            }
                         } else if cli_holder.is_some() && turn_rx.is_none() {
                             // Re-enter follow mode so the user sees new output.
                             scroll_offset = None;
@@ -872,26 +1071,111 @@ fn run_event_loop(
                                 .map(|c| c.session_id_snapshot().to_string())
                                 .unwrap_or_default();
                             let (display, expanded) = if trimmed.is_empty() {
+                                paste_diag_log("  分支: trimmed.is_empty() → 原样发送");
                                 (line.clone(), line.clone())
                             } else if trimmed.starts_with('/') {
+                                paste_diag_log("  分支: trimmed.starts_with('/') → 原样发送");
                                 (line.clone(), line.clone())
                             } else if !line.contains('\n')
                                 && pending_paste_lines.is_empty()
                             {
                                 // 单行输入：尝试剪贴板检测
-                                try_auto_expand_clipboard(
+                                paste_diag_log(&format!(
+                                    "  分支: 单行输入 → 调用 try_auto_expand_clipboard (trimmed={:?})",
+                                    trimmed
+                                ));
+                                let result = try_auto_expand_clipboard(
                                     trimmed,
                                     &session_id,
                                     &mut paste_id_gen,
                                     &mut pending_paste_lines,
-                                )
-                                .unwrap_or_else(|| {
-                                    fold_pasted_input(&line, &session_id, &mut paste_id_gen)
-                                })
+                                );
+                                paste_diag_log(&format!(
+                                    "  try_auto_expand_clipboard 返回: {}",
+                                    if result.is_some() { "Some(触发替换)" } else { "None(未触发)" }
+                                ));
+                                paste_diag_log(&format!(
+                                    "  调用后 pending_paste_lines.len()={}",
+                                    pending_paste_lines.len()
+                                ));
+
+                                // conhost 多行粘贴新方案（方案 C）：
+                                // 如果 try_auto_expand_clipboard 触发（说明 conhost 多行粘贴），
+                                // 不直接发送给 AI，而是把完整剪贴板内容写到临时文件，
+                                // 在 InputLine buffer 填充 `@<路径>`，让用户决定是否发送。
+                                // 这样用户可以编辑后再发送，避免"粘贴后直接发送出去"。
+                                //
+                                // **关键修复**：不立即 insert_paste @路径到 buffer，因为
+                                // conhost 还会继续注入剩余行字符，会与 @路径拼接成
+                                // "@路径第二行内容"。而是把 @路径保存到 pending_at_path，
+                                // 等 pending_paste_lines 为空（conhost 注入完毕）后再
+                                // insert_paste 到 buffer。
+                                if result.is_some() && !pending_paste_lines.is_empty() {
+                                    // 读取完整剪贴板内容（再读一次，因为 try_auto_expand 没返回）
+                                    match crate::paste::read_clipboard_text() {
+                                        Ok(clipboard_content) => {
+                                            // 写入临时文件，返回 @<路径>
+                                            if let Some(at_path) = write_clipboard_to_temp_file(
+                                                &clipboard_content,
+                                                &session_id,
+                                            ) {
+                                                paste_diag_log(&format!(
+                                                    "  conhost 方案 C: 写文件成功，@路径暂存（不立即填充 buffer）={:?}",
+                                                    at_path
+                                                ));
+                                                // 不立即 insert_paste，保存到 pending_at_path
+                                                // 等 pending_paste_lines 为空后再填充
+                                                pending_at_path = Some(at_path.clone());
+                                                // 记录最后一行用于清理残留
+                                                pending_paste_last_line = Some(
+                                                    pending_paste_lines.last().unwrap().clone(),
+                                                );
+                                                // 设置标志，跳过 run_turn
+                                                conhost_paste_intercepted = true;
+                                                (at_path.clone(), String::new())
+                                            } else {
+                                                paste_diag_log("  写文件失败，回退到原行为");
+                                                result.unwrap_or_else(|| {
+                                                    fold_pasted_input(&line, &session_id, &mut paste_id_gen)
+                                                })
+                                            }
+                                        }
+                                        Err(e) => {
+                                            paste_diag_log(&format!(
+                                                "  读取剪贴板失败: {e}，回退到原行为"
+                                            ));
+                                            result.unwrap_or_else(|| {
+                                                fold_pasted_input(&line, &session_id, &mut paste_id_gen)
+                                            })
+                                        }
+                                    }
+                                } else {
+                                    // 未触发或触发但 pending 为空，走原逻辑
+                                    result.unwrap_or_else(|| {
+                                        paste_diag_log("  fallback 到 fold_pasted_input (单行)");
+                                        fold_pasted_input(&line, &session_id, &mut paste_id_gen)
+                                    })
+                                }
                             } else {
                                 // 多行输入（bracketed paste 已触发）：直接 fold
+                                paste_diag_log(&format!(
+                                    "  分支: 多行输入 (含\\n={}) → 直接 fold_pasted_input",
+                                    line.contains('\n')
+                                ));
                                 fold_pasted_input(&line, &session_id, &mut paste_id_gen)
                             };
+
+                            // conhost 方案 C：如果 conhost 多行粘贴被拦截（写文件 + 填充 @路径），
+                            // 不发送给 AI，直接跳过 run_turn。用户看到 InputLine buffer 中的
+                            // @<路径> 后，可以编辑或直接按 Enter 发送。
+                            //
+                            // **注意**：方案 C 触发时不 echo display 到输出区，因为
+                            // @路径还未填充到 buffer（等 conhost 注入完毕后才填充），
+                            // 此时 echo 会显示一个孤立的 @路径，造成混淆。
+                            if conhost_paste_intercepted {
+                                paste_diag_log("  conhost_paste_intercepted=true，跳过 echo 和 run_turn");
+                                continue 'main_loop;
+                            }
 
                             // Echo the user's message into the output view so
                             // the conversation history shows both sides (user
@@ -916,10 +1200,11 @@ fn run_event_loop(
                                 buf.append(&format!("> {display}\n\n"));
                             }
 
-                            let mut cli = cli_holder.take().unwrap();
                             let output_handle = output_view.shared_handle();
                             let status_handle = Arc::clone(&status_state);
                             let tool_history_handle = Arc::clone(&tool_history_shared);
+
+                            let mut cli = cli_holder.take().unwrap();
 
                             // 斜杠命令本地分发：先尝试解析为 SlashCommand。
                             // 如果是斜杠命令，本地执行 handle_repl_command
@@ -1102,8 +1387,19 @@ fn run_event_loop(
                 // 参考 CLI 路径 input.rs 的 `.bracketed_paste(true)` 行为：
                 // 把粘贴内容原子地插入到当前光标位置，保留所有 \n，不触发 Submit。
                 // 修复"多行粘贴被切成多次 Submit"的 bug。
+                paste_diag_log(&format!(
+                    "Event::Paste 收到: {} 字节, {} 行, help_visible={}",
+                    text.len(),
+                    text.lines().count(),
+                    help_visible
+                ));
                 if !help_visible {
                     input.insert_paste(&text);
+                    paste_diag_log(&format!(
+                        "  insert_paste 后 buffer={:?} ({} 字节)",
+                        input.buffer(),
+                        input.buffer().len()
+                    ));
                 }
             }
         }
@@ -1212,10 +1508,24 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool) -> InputA
             // Event::Paste（在 main loop 中处理），不会走到这里；
             // 此分支仅作 conhost 兜底。
             if lower == 'v' {
+                paste_diag_log("Ctrl+V 按键事件触发，读取剪贴板");
                 if let Ok(text) = crate::paste::read_clipboard_text() {
+                    paste_diag_log(&format!(
+                        "  剪贴板读取成功: {} 字节, {} 行",
+                        text.len(),
+                        text.lines().count()
+                    ));
                     if !text.is_empty() {
                         input.insert_paste(&text);
+                        paste_diag_log(&format!(
+                            "  insert_paste 后 buffer={} 字节",
+                            input.buffer().len()
+                        ));
+                    } else {
+                        paste_diag_log("  剪贴板为空，不插入");
                     }
+                } else {
+                    paste_diag_log("  剪贴板读取失败");
                 }
                 return InputAction::Continue;
             }
