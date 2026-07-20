@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -326,7 +326,11 @@ pub fn parse_oauth_callback_query(query: &str) -> Result<OAuthCallbackParams, St
 
 fn generate_random_token(bytes: usize) -> io::Result<String> {
     let mut buffer = vec![0_u8; bytes];
-    File::open("/dev/urandom")?.read_exact(&mut buffer)?;
+    // Windows 兼容:`/dev/urandom` 在 Windows 上不存在,改用 `getrandom` crate
+    // (Unix 上调用 getrandom(2)/urandom,Windows 上调用 BCryptGenRandom)。
+    // 详见 BUG-W2 修复。
+    getrandom::getrandom(&mut buffer)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
     Ok(base64url_encode(&buffer))
 }
 

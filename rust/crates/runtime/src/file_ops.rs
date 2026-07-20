@@ -622,6 +622,16 @@ fn glob_search_impl(
     } else {
         base_dir.join(pattern).to_string_lossy().into_owned()
     };
+    // Windows 兼容(BUG-W1 修复):
+    // 1. canonicalize() 返回 \\?\ 前缀的扩展路径语法,替换 \ 后会变成 //?/ 导致路径失效,
+    //    需要先去掉 \\?\ 前缀。
+    // 2. glob::Pattern 把 `\` 当作转义字符而非路径分隔符,需要规范化为 `/` 才能正确匹配。
+    //    Rust 的 `Path` 在 Windows 上同时支持两种分隔符,后续 derive_glob_walk_root 和
+    //    WalkDir 都能正确处理 `/` 分隔符。
+    let search_pattern = search_pattern
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&search_pattern)
+        .replace('\\', "/");
 
     // The `glob` crate does not support brace expansion ({a,b,c}).
     // Expand braces into multiple patterns so patterns like
@@ -1407,19 +1417,21 @@ mod tests {
             glob_search("**/AGENTS.md", Some(dir.to_str().unwrap())).expect("glob should succeed");
 
         assert_eq!(result.num_files, 2, "ignored dirs should be pruned");
+        // 用 Path::ends_with 而非 str::ends_with,以兼容 Windows 的 \ 分隔符。
         assert!(result
             .filenames
             .iter()
-            .any(|path| path.ends_with("src/AGENTS.md")));
+            .any(|path| std::path::Path::new(path).ends_with("src/AGENTS.md")));
         assert!(result
             .filenames
             .iter()
-            .any(|path| path.ends_with("docs/AGENTS.md")));
+            .any(|path| std::path::Path::new(path).ends_with("docs/AGENTS.md")));
         assert!(!result
             .filenames
             .iter()
             .any(|path| path.contains("node_modules")
                 || path.contains(".build")
+                || path.contains("\\target\\")
                 || path.contains("/target/")));
 
         let _ = std::fs::remove_dir_all(&dir);
