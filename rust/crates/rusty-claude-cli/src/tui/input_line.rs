@@ -236,6 +236,48 @@ impl InputLine {
         self.menu_open = false;
     }
 
+    /// 在当前光标位置插入粘贴的文本（支持多行）。
+    ///
+    /// **设计动机**：参考 CLI 路径（`input.rs` 的 `rustyline` + `.bracketed_paste(true)`）
+    /// 把整段粘贴作为一个原子操作插入缓冲区，而不是逐字符触发 `Event::Key` ——
+    /// 后者会让粘贴的 `\n` 被当作 `Enter` 立即提交，导致一段多行文本被切成多次 Submit。
+    ///
+    /// TUI 路径此前完全没有处理 `Event::Paste`，多行粘贴只能靠 `Ctrl+J` 手动逐行
+    /// 重组，体验极差。配合 `crossterm::event::EnableBracketedPaste`（在
+    /// `run_tui_repl` 中启用），整段粘贴会作为单个 `Event::Paste(String)` 投递，
+    /// 这里一次性插入到 buffer，保留所有原始换行符。
+    ///
+    /// 插入后光标移动到粘贴文本末尾，菜单状态按新 buffer 重新计算。
+    pub(crate) fn insert_paste(&mut self, text: &str) {
+        // 粘贴内容可能含任意字符（包括 `\n`、`\t`、CJK、emoji），
+        // 全部按原样插入。debug_assert 检查光标在字符边界。
+        debug_assert!(
+            self.buffer.is_char_boundary(self.cursor),
+            "cursor {} is not a char boundary in buffer of len {}",
+            self.cursor,
+            self.buffer.len()
+        );
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.update_menu_state();
+    }
+
+    /// 返回光标所在的"当前行"内容及在该行中的字节偏移。
+    ///
+    /// 用于多行 buffer 的光标定位：渲染时只显示当前行，光标 Y 坐标
+    /// 固定在输入框第一行，X 坐标按当前行左侧文本的显示宽度计算。
+    /// 这样多行粘贴或 `Ctrl+J` 多行编辑时光标位置始终正确。
+    pub(crate) fn cursor_line_and_column(&self) -> (usize /*line_idx*/, usize /*byte_offset_in_line*/, &str /*line_content_before_cursor*/) {
+        let left = &self.buffer[..self.cursor];
+        // 计算光标前有多少个 \n，决定当前是第几行
+        let line_idx = left.matches('\n').count();
+        // 当前行的起点：最后一个 \n 之后
+        let line_start = left.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let byte_offset_in_line = self.cursor - line_start;
+        let line_content_before_cursor = &left[line_start..self.cursor];
+        (line_idx, byte_offset_in_line, line_content_before_cursor)
+    }
+
     fn update_menu_state(&mut self) {
         self.menu_open = self.buffer.starts_with('/');
     }

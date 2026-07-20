@@ -209,6 +209,58 @@ impl OutputBuffer {
             .count()
     }
 
+    /// 返回每个 ToolCard 在 `render_all()` 输出中的逻辑行区间 `[start, end)`。
+    ///
+    /// 鼠标点击场景：把点击的 row + scroll_y 映射到逻辑行号，
+    /// 然后查这个表找出命中的 ToolCard entry。
+    ///
+    /// **行号计算规则**（与 `render_all` 输出一致）：
+    /// - 累计每个 entry 的 `render()` 输出行数（`.lines().count()`）
+    /// - 若 render 输出以 `\n` 开头（前导空行），ToolCard 自身行号从 +1 开始
+    /// - 区间为 `[start, end)`，命中条件：`start <= line < end`
+    ///
+    /// **注意**：这是逻辑行号，未考虑 `Wrap { trim: false }` 的折行。
+    /// 长行折行会导致实际显示行数 > 逻辑行数。当前实现按逻辑行映射，
+    /// 对 ToolCard 卡片（行宽通常 <= 80）足够准确；超长行误差可接受。
+    pub(crate) fn tool_card_line_ranges(&self) -> Vec<(usize /*entry_idx*/, usize /*start*/, usize /*end*/)> {
+        let mut ranges = Vec::new();
+        let mut current_line: usize = 0;
+        for (i, entry) in self.entries.iter().enumerate() {
+            let rendered = entry.render();
+            // `.lines()` 会跳过末尾的 `\n`，前导 `\n` 产生一个空行
+            let line_count = rendered.lines().count();
+            // 多数 ToolCard render 以 `\n` 开头（前导空行），把空行算作上一个 entry 的尾部
+            let (start, end) = if rendered.starts_with('\n') {
+                let body_lines = line_count.saturating_sub(1);
+                (current_line + 1, current_line + 1 + body_lines)
+            } else {
+                (current_line, current_line + line_count)
+            };
+            if matches!(entry, OutputEntry::ToolCard { .. }) {
+                ranges.push((i, start, end));
+            }
+            current_line += line_count;
+        }
+        ranges
+    }
+
+    /// 按逻辑行号切换命中的 ToolCard 折叠状态。
+    /// 返回 true 表示成功切换。用于鼠标点击场景。
+    pub(crate) fn toggle_tool_card_at_line(&mut self, line: usize) -> bool {
+        let ranges = self.tool_card_line_ranges();
+        for (entry_idx, start, end) in ranges {
+            if line >= start && line < end {
+                if let Some(OutputEntry::ToolCard { collapsed, result: Some(_), .. }) =
+                    self.entries.get_mut(entry_idx)
+                {
+                    *collapsed = !*collapsed;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// 渲染所有条目为单个字符串。
     pub(crate) fn render_all(&self) -> String {
         let mut out = String::new();
