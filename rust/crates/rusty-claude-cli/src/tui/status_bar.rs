@@ -104,49 +104,100 @@ impl<'a> Widget for StatusBar<'a> {
         let style_poor = Style::default().fg(Color::Yellow);
         let style_streaming = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
-        let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled("│ ", style_dim));
-        spans.push(Span::styled(&self.state.model, style_model));
-        spans.push(Span::styled(" via ", style_dim));
-        spans.push(Span::styled(&self.state.provider, style_provider));
+        // Build sections in priority order. Each section is a Vec<Span>.
+        // We add sections until we exceed the available width, then stop.
+        let width = area.width as usize;
 
-        spans.push(Span::styled(" │ ", style_dim));
-        spans.push(Span::styled("📁 ", style_dim));
-        spans.push(Span::styled(&self.state.cwd, style_dim));
+        let mut sections: Vec<Vec<Span>> = Vec::new();
 
+        // P1: Model + provider (always shown)
+        sections.push(vec![
+            Span::styled("│ ", style_dim),
+            Span::styled(&self.state.model, style_model),
+            Span::styled(" 经由 ", style_dim),
+            Span::styled(&self.state.provider, style_provider),
+        ]);
+
+        // P2: Tokens (always shown)
+        sections.push(vec![
+            Span::styled(" │ ", style_dim),
+            Span::styled("🔢 ", style_dim),
+            Span::styled(self.state.total_tokens().to_string(), style_tokens),
+            Span::styled(" 令牌", style_dim),
+        ]);
+
+        // P3: Cost
+        let combined_usage = TokenUsage {
+            input_tokens: self.state.cumulative_usage.input_tokens
+                + self.state.turn_usage.input_tokens,
+            output_tokens: self.state.cumulative_usage.output_tokens
+                + self.state.turn_usage.output_tokens,
+            cache_creation_input_tokens: self.state.cumulative_usage.cache_creation_input_tokens
+                + self.state.turn_usage.cache_creation_input_tokens,
+            cache_read_input_tokens: self.state.cumulative_usage.cache_read_input_tokens
+                + self.state.turn_usage.cache_read_input_tokens,
+        };
+        let cost = estimate_cost(&combined_usage, &self.state.model);
+        sections.push(vec![
+            Span::styled(" │ ", style_dim),
+            Span::styled("💰 ", style_dim),
+            Span::styled(format!("${cost:.4}"), style_cost),
+        ]);
+
+        // P4: Cwd
+        sections.push(vec![
+            Span::styled(" │ ", style_dim),
+            Span::styled("📁 ", style_dim),
+            Span::styled(&self.state.cwd, style_dim),
+        ]);
+
+        // P5: Git branch
         if !self.state.git_branch.is_empty() {
-            spans.push(Span::styled(" │ ", style_dim));
-            spans.push(Span::styled("🌿 ", style_dim));
-            spans.push(Span::styled(&self.state.git_branch, style_branch));
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled("🌿 ", style_dim),
+                Span::styled(&self.state.git_branch, style_branch),
+            ]);
         }
 
-        spans.push(Span::styled(" │ ", style_dim));
-        spans.push(Span::styled("🔢 ", style_dim));
-        spans.push(Span::styled(self.state.total_tokens().to_string(), style_tokens));
-        spans.push(Span::styled(" tok", style_dim));
-
-        spans.push(Span::styled(" │ ", style_dim));
-        spans.push(Span::styled("💰 ", style_dim));
-        // Cost formatting: $0.0000 for precision
-        let cost = estimate_cost(&self.state.cumulative_usage, &self.state.model);
-        spans.push(Span::styled(format!("${cost:.4}"), style_cost));
-
+        // P6: Streaming timer
         if self.state.streaming {
-            spans.push(Span::styled(" │ ", style_dim));
             let elapsed_s = self.state.turn_elapsed_ms / 1000;
-            spans.push(Span::styled(format!("⏱ {elapsed_s}s"), style_streaming));
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled(format!("⏱ {elapsed_s}s"), style_streaming),
+            ]);
         }
 
+        // P7: Goal badge
         if !self.state.goal_badge.is_empty() {
-            spans.push(Span::styled(" │ ", style_dim));
-            spans.push(Span::styled(&self.state.goal_badge, style_goal));
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled(&self.state.goal_badge, style_goal),
+            ]);
         }
 
+        // P8: Poor mode
         if self.state.poor_mode {
-            spans.push(Span::styled(" │ ", style_dim));
-            spans.push(Span::styled("🪙 poor", style_poor));
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled("🪙 穷人模式", style_poor),
+            ]);
         }
 
+        // Flatten sections up to available width
+        let mut spans: Vec<Span> = Vec::new();
+        let mut used: usize = 0;
+        for section in &sections {
+            let section_width: usize = section.iter().map(|s| s.content.len()).sum();
+            if used + section_width > width && !spans.is_empty() {
+                break; // skip low-priority sections that don't fit
+            }
+            used += section_width;
+            spans.extend(section.iter().cloned());
+        }
+
+        // Closing delimiter
         spans.push(Span::styled(" │", style_dim));
 
         let line = Line::from(spans);
@@ -209,14 +260,19 @@ mod tests {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
 
-        let mut state = StatusBarState::default();
-        state.model = "claude-opus-4-6".to_string();
-        state.provider = "Anthropic".to_string();
-        state.cwd = "~/claw".to_string();
-        state.git_branch = "main".to_string();
-        state.cumulative_usage.input_tokens = 1000;
-        state.cumulative_usage.output_tokens = 500;
-        state.goal_badge = "🎯 goal".to_string();
+        let state = StatusBarState {
+            model: "claude-opus-4-6".to_string(),
+            provider: "Anthropic".to_string(),
+            cwd: "~/claw".to_string(),
+            git_branch: "main".to_string(),
+            cumulative_usage: TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+                ..Default::default()
+            },
+            goal_badge: "🎯 goal".to_string(),
+            ..Default::default()
+        };
 
         let widget = StatusBar { state: &state };
         let area = Rect::new(0, 0, 120, 1);
@@ -236,10 +292,12 @@ mod tests {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
 
-        let mut state = StatusBarState::default();
-        state.model = "test-model".to_string();
-        state.streaming = true;
-        state.turn_elapsed_ms = 5000;
+        let state = StatusBarState {
+            model: "test-model".to_string(),
+            streaming: true,
+            turn_elapsed_ms: 5000,
+            ..Default::default()
+        };
 
         let widget = StatusBar { state: &state };
         let area = Rect::new(0, 0, 120, 1);

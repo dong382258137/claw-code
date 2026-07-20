@@ -15,8 +15,10 @@
 pub(crate) mod app;
 pub(crate) mod input_line;
 pub(crate) mod output_view;
+pub(crate) mod sidebar;
 pub(crate) mod slash_menu;
 pub(crate) mod status_bar;
+pub(crate) mod tool_card;
 
 #[cfg(test)]
 mod tests;

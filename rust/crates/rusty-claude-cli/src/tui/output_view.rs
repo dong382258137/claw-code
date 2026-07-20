@@ -37,8 +37,12 @@ impl OutputBuffer {
         self.buffer.push_str(text);
         self.total_written += text.len() as u64;
         if self.buffer.len() > MAX_BUFFER_BYTES {
-            let overflow = self.buffer.len() - MAX_BUFFER_BYTES;
-            self.buffer = self.buffer.split_off(overflow);
+            let mut cut = self.buffer.len() - MAX_BUFFER_BYTES;
+            // Advance to the next valid UTF-8 char boundary to avoid split_off panic
+            while cut < self.buffer.len() && !self.buffer.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.buffer = self.buffer.split_off(cut);
             self.truncated = true;
         }
     }

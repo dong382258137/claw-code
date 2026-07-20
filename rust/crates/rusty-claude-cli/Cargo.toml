@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 api = { path = "../api" }
+ansi-to-tui = { version = "7", optional = true }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
 crossterm = "0.28"
@@ -24,6 +25,7 @@ syntect = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm"] }
 tools = { path = "../tools" }
+unicode-width = "0.2"
 
 [lints]
 workspace = true
@@ -35,5 +37,5 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [features]
 default = ["full-tui"]
-full-tui = ["dep:ratatui"]
+full-tui = ["dep:ratatui", "dep:ansi-to-tui"]
 

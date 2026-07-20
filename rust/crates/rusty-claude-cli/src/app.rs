@@ -116,6 +116,7 @@ use crate::session_mgr::{
     civil_from_days, collect_session_prompt_history, confirm_session_deletion,
     create_managed_session_handle, current_session_store, default_export_filename,
     delete_managed_session, format_history_timestamp, format_session_modified_age,
+    interactive_session_pick,
     latest_managed_session, list_managed_sessions, load_session_reference,
     looks_like_slash_command_token, new_cli_session, new_cli_session_with_roots,
     parse_history_count, recent_user_context, render_prompt_history_report,
@@ -288,6 +289,7 @@ pub(crate) fn build_live_cli_for_repl(
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)] // Stage 1 验收:9 参数超 clippy 默认上限 7,重构参数到 struct 待 Stage 2 处理。
 pub(crate) fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -297,6 +299,7 @@ pub(crate) fn run_repl(
     allow_broad_cwd: bool,
     additional_workspace_roots: Vec<PathBuf>,
     output_verbosity: OutputVerbosity,
+    enable_plan_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
@@ -316,6 +319,13 @@ pub(crate) fn run_repl(
         output_verbosity,
         reasoning_effort,
     )?;
+    // Harness O(编排)层:Plan/Execute/Review 三段循环接入(Step 2.1)。
+    // `--enable-plan-mode` 时启用,默认关闭。详见
+    // `docs/harness-engineering-optimization-plan.md` Step 2.1。
+    if enable_plan_mode {
+        cli.runtime.set_plan_mode_enabled(true);
+        cli.runtime.set_workspace_root(std::env::current_dir()?);
+    }
     let t_cli = t0.elapsed();
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -461,6 +471,11 @@ pub(crate) struct LiveCli {
     /// status_emitter's TextDelta callback. Set by TuiApp via set_tui_mode.
     #[cfg(feature = "full-tui")]
     tui_mode: bool,
+    /// TUI 本地命令输出捕获：当设置时，`tui_println` 会把内容追加到此
+    /// buffer 而不是打印到 stdout（避免破坏 alternate screen）。
+    /// 由 TuiApp 在执行斜杠命令前设置，执行后清除。
+    #[cfg(feature = "full-tui")]
+    tui_output: Option<std::sync::Arc<std::sync::Mutex<crate::tui::output_view::OutputBuffer>>>,
 }
 
 pub(crate) struct BuiltRuntime {
@@ -611,6 +626,8 @@ impl LiveCli {
             status_emitter: None,
             #[cfg(feature = "full-tui")]
             tui_mode: false,
+            #[cfg(feature = "full-tui")]
+            tui_output: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -744,6 +761,8 @@ impl LiveCli {
         if let Some(emitter) = &self.status_emitter {
             if let Some(rt) = runtime.runtime.as_mut() {
                 rt.api_client_mut().set_status_emitter(Arc::clone(emitter));
+                // Also inject into CliToolExecutor so ToolResult events are emitted
+                rt.tool_executor_mut().set_status_emitter(Arc::clone(emitter));
             }
         }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -762,21 +781,43 @@ impl LiveCli {
         // to io::sink instead of stdout — preventing duplicate output under
         // the TUI's alternate screen. Streaming content is captured via the
         // status_emitter's TextDelta callback.
+        //
+        // BUG 1 fix: in TUI mode we must also suppress *all* direct stdout/stderr
+        // writes from this function (spinner, println, print_status_bar, eprintln),
+        // because stdout/stderr are bound to the alternate-screen terminal and any
+        // stray write will corrupt the TUI render. State updates (accumulate_usage,
+        // goal_manager.record_tokens, persist_session, replace_runtime) still run.
         let emit_output = {
             #[cfg(feature = "full-tui")]
             { !self.tui_mode }
             #[cfg(not(feature = "full-tui"))]
             { true }
         };
+        #[cfg(feature = "full-tui")]
+        let tui_mode = self.tui_mode;
+        #[cfg(not(feature = "full-tui"))]
+        let tui_mode = false;
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(emit_output)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        if !tui_mode {
+            spinner.tick(
+                "🦀 Thinking...",
+                TerminalRenderer::new().color_theme(),
+                &mut stdout,
+            )?;
+        }
+        // BUG 2 fix: in TUI mode the crossterm event loop owns stdin (raw mode),
+        // so a blocking `io::stdin().read_line()` inside CliPermissionPrompter
+        // would either hang forever or read garbage. Use a non-interactive
+        // prompter that auto-denies (with a clear reason) so the turn fails
+        // fast instead of wedging the TUI. The user can re-run the prompt in
+        // non-TUI mode to approve interactively.
+        let mut permission_prompter: Box<dyn runtime::PermissionPrompter> = if tui_mode {
+            Box::new(TuiSilentPermissionPrompter::new(self.permission_mode))
+        } else {
+            Box::new(CliPermissionPrompter::new(self.permission_mode))
+        };
         // Tier S #1 Goal 持续驱动：在调 runtime.run_turn 之前 prepend goal 前缀。
         // 前缀包含 goal 文本、状态（active/blocked）、blocked 计数、token 用量。
         // LLM 每轮都看到 goal 上下文，驱动持续工作。Paused 状态不注入。
@@ -785,26 +826,28 @@ impl LiveCli {
             Some(prefix) => format!("{prefix}{input}"),
             None => input.to_string(),
         };
-        let result = runtime.run_turn(&full_input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(&full_input, Some(&mut *permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
-                    println!("{final_text}");
-                }
-                println!();
-                if let Some(event) = summary.auto_compaction {
-                    println!(
-                        "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
-                    );
+                if !tui_mode {
+                    spinner.finish(
+                        "✨ Done",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                    let final_text = final_assistant_text(&summary);
+                    if !final_text.is_empty() {
+                        println!("{final_text}");
+                    }
+                    println!();
+                    if let Some(event) = summary.auto_compaction {
+                        println!(
+                            "{}",
+                            format_auto_compaction_notice(event.removed_message_count)
+                        );
+                    }
                 }
                 // P2 富状态栏：累加本次 usage 并打印状态行。
                 // run_turn 只在 REPL 交互模式被调用（非交互走 run_prompt_*），
@@ -814,18 +857,22 @@ impl LiveCli {
                 // 用于 budget 跟踪。失败不阻断主流程。
                 let turn_tokens = u64::from(summary.usage.total_tokens());
                 let _ = self.goal_manager.record_tokens(turn_tokens);
-                self.print_status_bar();
-                println!();
+                if !tui_mode {
+                    self.print_status_bar();
+                    println!();
+                }
                 self.persist_session()?;
                 Ok(())
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                if !tui_mode {
+                    spinner.fail(
+                        "❌ Request failed",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                }
                 // Tier S #1 Goal 持续驱动：检测网络错误关键词，自动 pause goal。
                 // 避免网络中断期间 goal 持续注入无效 prompt。
                 let error_str = error.to_string().to_ascii_lowercase();
@@ -834,9 +881,11 @@ impl LiveCli {
                     .any(|kw| error_str.contains(kw));
                 if is_network_error {
                     let _ = self.goal_manager.pause("network error");
-                    eprintln!(
-                        "\x1b[33m⚠ Goal auto-paused due to network error. Use /goal resume when network is restored.\x1b[0m"
-                    );
+                    if !tui_mode {
+                        eprintln!(
+                            "\x1b[33m⚠ Goal auto-paused due to network error. Use /goal resume when network is restored.\x1b[0m"
+                        );
+                    }
                 }
                 Err(Box::new(error))
             }
@@ -934,13 +983,16 @@ impl LiveCli {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn handle_repl_command(
+    pub(crate) fn handle_repl_command(
         &mut self,
         command: SlashCommand,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
             SlashCommand::Help => {
-                println!("{}", render_repl_help());
+                let help = render_repl_help();
+                if !self.tui_println(&help) {
+                    println!("{help}");
+                }
                 false
             }
             SlashCommand::Status => {
@@ -1017,6 +1069,42 @@ impl LiveCli {
                 Self::print_diff()?;
                 false
             }
+            SlashCommand::Search { query } => {
+                let q = query.as_deref().unwrap_or("");
+                let session = self.runtime.session();
+                let results = crate::session_mgr::search_session_history(session, q);
+                let output = if results.is_empty() {
+                    format!("Search\n  Query           {q}\n  Result           no matches found")
+                } else {
+                    let mut s = format!(
+                        "Search\n  Query           {q}\n  Matches          {}\n\n",
+                        results.len()
+                    );
+                    for (i, (idx, preview)) in results.iter().take(20).enumerate() {
+                        s.push_str(&format!("  {}. [msg {idx}] {preview}\n", i + 1));
+                    }
+                    if results.len() > 20 {
+                        s.push_str(&format!("\n  ... and {} more matches", results.len() - 20));
+                    }
+                    s
+                };
+                if !self.tui_println(&output) {
+                    println!("{output}");
+                }
+                false
+            }
+            SlashCommand::Undo => {
+                let session = self.runtime.session();
+                let message = crate::session_mgr::undo_last_file_edit(session);
+                if !self.tui_println(&message) {
+                    println!("{message}");
+                }
+                // Persist session so any subsequent re-loads see a consistent
+                // state (the undo wrote to disk; nothing changes in the
+                // session history itself, but saving keeps timestamps fresh).
+                let _ = self.persist_session();
+                false
+            }
             SlashCommand::Version => {
                 Self::print_version(CliOutputFormat::Text);
                 false
@@ -1054,17 +1142,24 @@ impl LiveCli {
             }
             SlashCommand::Stats => {
                 let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
-                println!("{}", format_cost_report(usage));
+                let report = format_cost_report(usage);
+                if !self.tui_println(&report) {
+                    println!("{report}");
+                }
                 false
             }
             SlashCommand::Poor { action } => {
                 let (_, message) = handle_poor_mode_action(action.as_deref());
-                println!("{message}");
+                if !self.tui_println(&message) {
+                    println!("{message}");
+                }
                 false
             }
             SlashCommand::Goal { args } => {
                 let message = handle_goal_command(&mut self.goal_manager, args.as_deref());
-                println!("{message}");
+                if !self.tui_println(&message) {
+                    println!("{message}");
+                }
                 false
             }
             SlashCommand::Bg { args } => {
@@ -1072,7 +1167,9 @@ impl LiveCli {
                 // 与 resume 模式共用 handle_bg_command，通过文件系统通信。
                 let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let (message, _json) = handle_bg_command(args.as_deref(), &cwd);
-                println!("{message}");
+                if !self.tui_println(&message) {
+                    println!("{message}");
+                }
                 false
             }
             SlashCommand::Login
@@ -1113,7 +1210,10 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::AddDir { .. } => {
                 let cmd_name = command.slash_name();
-                eprintln!("{cmd_name} is not yet implemented in this build.");
+                let msg = format!("{cmd_name} is not yet implemented in this build.");
+                if !self.tui_println(&msg) {
+                    eprintln!("{msg}");
+                }
                 false
             }
             SlashCommand::OutputStyle { style } => {
@@ -1122,24 +1222,35 @@ impl LiveCli {
                     .and_then(OutputVerbosity::from_style_arg)
                 {
                     self.output_verbosity = verbosity;
-                    println!("Output style set to: {}", verbosity.label());
+                    let msg = format!("Output style set to: {}", verbosity.label());
+                    if !self.tui_println(&msg) {
+                        println!("{msg}");
+                    }
                 } else {
                     let current = self.output_verbosity.label();
-                    println!("Current output style: {current}");
-                    println!(
-                        "Available styles: full, compact, silent, minimal\nUsage: /output-style [style]"
+                    let msg = format!(
+                        "Current output style: {current}\nAvailable styles: full, compact, silent, minimal\nUsage: /output-style [style]"
                     );
+                    if !self.tui_println(&msg) {
+                        println!("Current output style: {current}");
+                        println!(
+                            "Available styles: full, compact, silent, minimal\nUsage: /output-style [style]"
+                        );
+                    }
                 }
                 false
             }
             SlashCommand::Unknown(name) => {
-                eprintln!("{}", format_unknown_slash_command(&name));
+                let msg = format_unknown_slash_command(&name);
+                if !self.tui_println(&msg) {
+                    eprintln!("{msg}");
+                }
                 false
             }
         })
     }
 
-    fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.session().save_to_path(&self.session.path)?;
         Ok(())
     }
@@ -1530,6 +1641,52 @@ impl LiveCli {
                 println!("{}", render_session_list(&self.session.id)?);
                 Ok(false)
             }
+            Some("pick") => {
+                // Interactive fuzzy-filter picker. Falls back to /session list
+                // behavior when stdin is not a tty (e.g. piped scripts).
+                if !io::stdin().is_terminal() {
+                    println!("{}", render_session_list(&self.session.id)?);
+                    return Ok(false);
+                }
+                match interactive_session_pick(&self.session.id)? {
+                    Some(picked) => {
+                        let target_id = picked.id.clone();
+                        let target_path = picked.path.clone();
+                        // Reuse the existing switch logic by delegating to
+                        // load_session_reference + replace_runtime.
+                        let (handle, session) = load_session_reference(&target_id)?;
+                        let message_count = session.messages.len();
+                        let session_id = session.session_id.clone();
+                        let runtime = build_runtime(
+                            session,
+                            &handle.id,
+                            self.model.clone(),
+                            self.system_prompt.clone(),
+                            true,
+                            true,
+                            self.allowed_tools.clone(),
+                            self.permission_mode,
+                            None,
+                        )?;
+                        self.replace_runtime(runtime)?;
+                        self.session = SessionHandle {
+                            id: session_id,
+                            path: handle.path,
+                        };
+                        println!(
+                            "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
+                            self.session.id,
+                            target_path.display(),
+                            message_count,
+                        );
+                        Ok(true)
+                    }
+                    None => {
+                        println!("Session pick cancelled.");
+                        Ok(false)
+                    }
+                }
+            }
             Some("exists") => {
                 let Some(target) = target else {
                     println!("Usage: /session exists <session-id>");
@@ -1876,6 +2033,45 @@ impl LiveCli {
     pub(crate) fn set_tui_mode(&mut self, on: bool) {
         self.tui_mode = on;
     }
+
+    /// TUI 模式下设置本地命令输出捕获 buffer。设置后，`tui_println` 会把
+    /// 内容追加到此 buffer 而非 stdout，避免破坏 alternate screen。
+    /// 由 TuiApp 在执行斜杠命令前调用。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn set_tui_output(
+        &mut self,
+        handle: std::sync::Arc<std::sync::Mutex<crate::tui::output_view::OutputBuffer>>,
+    ) {
+        self.tui_output = Some(handle);
+    }
+
+    /// 清除 TUI 输出捕获 buffer，后续 `tui_println` 回退到 stdout。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn clear_tui_output(&mut self) {
+        self.tui_output = None;
+    }
+
+    /// TUI 感知的 println：若设置了 tui_output，把 msg + '\n' 追加到 buffer
+    /// 并返回 true；否则返回 false，调用方应 fallback 到 `println!`。
+    /// 用于 `handle_repl_command` 中简单 println 分支，让斜杠命令在 TUI
+    /// 模式下能把输出显示在输出区而非破坏 alternate screen。
+    #[cfg(feature = "full-tui")]
+    fn tui_println(&self, msg: &str) -> bool {
+        if let Some(handle) = &self.tui_output {
+            if let Ok(mut buf) = handle.lock() {
+                buf.append(msg);
+                buf.append("\n");
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(feature = "full-tui"))]
+    fn tui_println(&self, _msg: &str) -> bool {
+        false
+    }
 }
 
 
@@ -2155,16 +2351,24 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        // Enhanced permission prompt with box-drawing and colored tool name
         println!();
-        println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
+        println!("\x1b[33m┌─ ⚠ Permission approval required \x1b[0m");
+        println!("\x1b[33m│\x1b[0m Tool             \x1b[1;36m{}\x1b[0m", request.tool_name);
+        println!("\x1b[33m│\x1b[0m Current mode     {}", self.current_mode.as_str());
+        println!("\x1b[33m│\x1b[0m Required mode    \x1b[1;31m{}\x1b[0m", request.required_mode.as_str());
         if let Some(reason) = &request.reason {
-            println!("  Reason           {reason}");
+            println!("\x1b[33m│\x1b[0m Reason           {reason}");
         }
-        println!("  Input            {}", request.input);
-        print!("Approve this tool call? [y/N]: ");
+        // Truncate very long inputs for display (UTF-8 safe)
+        let input_display = if request.input.chars().count() > 200 {
+            let truncated: String = request.input.chars().take(200).collect();
+            format!("{truncated}… (truncated)")
+        } else {
+            request.input.clone()
+        };
+        println!("\x1b[33m│\x1b[0m Input            {input_display}");
+        println!("\x1b[33m└─\x1b[0m Approve this tool call? [y/N]: ");
         let _ = io::stdout().flush();
 
         let mut response = String::new();
@@ -2185,6 +2389,48 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
             Err(error) => runtime::PermissionPromptDecision::Deny {
                 reason: format!("permission approval failed: {error}"),
             },
+        }
+    }
+}
+
+/// Non-interactive permission prompter for TUI mode.
+///
+/// BUG 2 fix: `CliPermissionPrompter::decide` calls `io::stdin().read_line`
+/// which blocks waiting for line input. In TUI mode, crossterm's event loop
+/// already owns stdin in raw mode, so a blocking `read_line` would either
+/// hang the TUI forever or read raw-mode escape sequences as garbage. Instead
+/// of fighting for stdin, this prompter auto-denies every request with a
+/// clear reason pointing the user back to non-TUI mode for interactive
+/// approval. This keeps the TUI responsive and the turn fails fast.
+///
+/// Recommended workflow: use `danger-full-access` permission mode in TUI if
+/// you want tools to run without prompts, or run the same prompt in non-TUI
+/// REPL mode when interactive approval is required.
+pub(crate) struct TuiSilentPermissionPrompter {
+    current_mode: PermissionMode,
+}
+
+impl TuiSilentPermissionPrompter {
+    fn new(current_mode: PermissionMode) -> Self {
+        Self { current_mode }
+    }
+}
+
+impl runtime::PermissionPrompter for TuiSilentPermissionPrompter {
+    fn decide(
+        &mut self,
+        request: &runtime::PermissionRequest,
+    ) -> runtime::PermissionPromptDecision {
+        // Never block on stdin. Surface a deny decision with an actionable
+        // reason so the user knows to either switch permission mode or re-run
+        // the prompt outside the TUI.
+        let _ = self.current_mode; // suppress unused_field warning
+        runtime::PermissionPromptDecision::Deny {
+            reason: format!(
+                "tool '{}' requires permission approval (mode '{}'), which is not available in TUI mode. Re-run `claw` without --tui to approve interactively, or use --permission-mode danger-full-access.",
+                request.tool_name,
+                request.required_mode.as_str()
+            ),
         }
     }
 }

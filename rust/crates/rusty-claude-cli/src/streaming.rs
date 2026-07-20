@@ -52,8 +52,24 @@ pub(crate) enum StatusEvent {
     Usage(TokenUsage),
     /// A text delta arrived (incremental assistant output).
     TextDelta(String),
-    /// A tool use started (tool name provided).
-    ToolUse { id: String, name: String },
+    /// A tool use started (tool name + input JSON provided).
+    ToolUse { id: String, name: String, input: String },
+    /// A tool finished executing (id, name, output, is_error).
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+    /// A thinking block was observed during streaming. `char_count` is the
+    /// number of thinking chars hidden from the user (None when the provider
+    /// redacted the content entirely). `redacted` is true for
+    /// `RedactedThinking` blocks. The TUI renders a short summary like
+    /// "▶ Thinking (N chars hidden)" so users know reasoning happened.
+    Thinking {
+        char_count: Option<usize>,
+        redacted: bool,
+    },
     /// The model finished responding (MessageStop received).
     MessageStop,
     /// Streaming turn started (first event received).
@@ -402,6 +418,17 @@ impl AnthropicRuntimeClient {
                             true,
                             &mut block_has_thinking_summary,
                         )?;
+                        // P1 修复：push_output_block 处理 Thinking/RedactedThinking
+                        // 块时只写到 `out`（TUI 模式下是 io::sink()），不 emit
+                        // StatusEvent::Thinking。在 caller 端检查标志并 emit，
+                        // 让 TUI 能在 MessageStart 携带 thinking 块的场景下显示
+                        // thinking 摘要（非流式响应或首批 content）。
+                        if block_has_thinking_summary {
+                            self.emit_status(StatusEvent::Thinking {
+                                char_count: None,
+                                redacted: false,
+                            });
+                        }
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
@@ -413,6 +440,14 @@ impl AnthropicRuntimeClient {
                         true,
                         &mut block_has_thinking_summary,
                     )?;
+                    // P1 修复：同 MessageStart 分支，ContentBlockStart 携带完整
+                    // thinking 块时也需 emit Thinking 事件给 TUI。
+                    if block_has_thinking_summary {
+                        self.emit_status(StatusEvent::Thinking {
+                            char_count: None,
+                            redacted: false,
+                        });
+                    }
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
@@ -438,6 +473,14 @@ impl AnthropicRuntimeClient {
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
+                            // Phase 3: notify TUI that a thinking block is
+                            // happening. char_count is None because streaming
+                            // deltas don't give us the total (matches the
+                            // stdout summary which also says "hidden").
+                            self.emit_status(StatusEvent::Thinking {
+                                char_count: None,
+                                redacted: false,
+                            });
                         }
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
@@ -460,6 +503,7 @@ impl AnthropicRuntimeClient {
                         self.emit_status(StatusEvent::ToolUse {
                             id: id.clone(),
                             name: name.clone(),
+                            input: input.clone(),
                         });
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
