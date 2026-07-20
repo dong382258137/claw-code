@@ -1547,7 +1547,7 @@ where
     /// **缓存保护**(§5.2):子 agent 走独立 LLM 请求 + 独立 prompt cache,
     /// 不污染主 agent 缓存。本方法只做派发登记,不阻塞等待子 agent 完成。
     fn execute_dispatch_subagent(
-        &self,
+        &mut self,
         input: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let Some(coordinator) = &self.multi_agent_coordinator else {
@@ -1589,17 +1589,174 @@ where
             .map_err(|e| format!("failed to start subagent: {e}"))?;
 
         // 发布 SubagentHandoff lane event — 主 agent → 子 agent 任务派发记录。
-        // emitted_at 使用 unix timestamp 字符串(与其他 LaneEvent helper 一致)。
         let emitted_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
             .unwrap_or_else(|_| "0".to_string());
-        let event = LaneEvent::subagent_handoff(emitted_at, &subagent_id, mode_str, task);
+        let event = LaneEvent::subagent_handoff(emitted_at.clone(), &subagent_id, mode_str, task);
         publish_lane_event(event);
 
-        Ok(format!(
-            "Dispatched subagent `{subagent_id}` (mode: {mode_str}). Use check_subagent with subagent_id=`{subagent_id}` to poll for completion."
-        ))
+        // P0-2:子智能体真实化 — 同步阻塞执行独立 LLM 请求。
+        //
+        // 论文依据:Anthropic Multi-Agent Research System
+        // - "spawn fresh subagents with clean contexts" — 完全隔离(独立 Session)
+        // - "maintaining continuity through careful handoffs" — task 作为 user message
+        // - "Subagent output to a filesystem" — 写到 .claw/subagents/{id}.md
+        // - "pass lightweight references back" — 主 agent 只收到 result_ref 路径
+        //
+        // 子智能体走单轮 LLM 请求(不循环 tool calls),结果写到文件。
+        // 主 agent 同步等待,完成后收到 result_ref,可后续读取文件内容。
+        let subagent_result = self.run_subagent_turn(&subagent_id, name, task);
+
+        // 根据执行结果标记 coordinator 状态
+        let coordinator = self.multi_agent_coordinator.as_ref().expect("coordinator checked above");
+        match &subagent_result {
+            Ok(result_ref) => {
+                let _ = coordinator.complete(&subagent_id, result_ref.as_str());
+            }
+            Err(error) => {
+                let _ = coordinator.fail(&subagent_id, error.as_str());
+            }
+        }
+
+        // 发布终态 SubagentResult lane event
+        let terminal_status = if subagent_result.is_ok() { "completed" } else { "failed" };
+        let terminal_result = subagent_result.as_deref().unwrap_or_else(|e| e.as_str());
+        let event = LaneEvent::subagent_result(
+            emitted_at,
+            &subagent_id,
+            terminal_status,
+            terminal_result,
+        );
+        publish_lane_event(event);
+
+        // 返回给主 agent:成功返回 result_ref 路径,失败返回错误
+        match subagent_result {
+            Ok(result_ref) => Ok(format!(
+                "Subagent `{subagent_id}` completed. Result written to: {result_ref}\n\
+                 Use Read tool to inspect the result. \
+                 The subagent ran with an isolated context — it did not pollute your context window."
+            )),
+            Err(error) => Ok(format!(
+                "Subagent `{subagent_id}` failed: {error}\n\
+                 You may retry with a different task description or approach the task directly."
+            )),
+        }
+    }
+
+    /// P0-2:执行子智能体的独立 LLM 请求(单轮,完全隔离)。
+    ///
+    /// 子智能体拥有:
+    /// - 独立 Session(空 messages,只有 task 作为 user message)
+    /// - 独立 system_prompt(子智能体专用,不包含主 agent 的上下文)
+    /// - 独立 prompt cache(不污染主 agent 缓存)
+    ///
+    /// 执行流程:
+    /// 1. 构造子智能体 system_prompt + task 作为 user message
+    /// 2. 调用 api_client.stream(复用主 agent 的 client,但请求隔离)
+    /// 3. 解析 assistant response,提取 text 内容
+    /// 4. 写到 `.claw/subagents/{id}.md`
+    /// 5. 返回 result_ref 路径
+    fn run_subagent_turn(
+        &mut self,
+        subagent_id: &str,
+        name: &str,
+        task: &str,
+    ) -> Result<String, String> {
+        let workspace_root = self.workspace_root.as_ref().ok_or_else(|| {
+            "workspace_root not configured — subagent requires filesystem access for result persistence".to_string()
+        })?;
+
+        // 构造子智能体 system_prompt — 完全隔离,不包含主 agent 上下文
+        let subagent_system_prompt = SystemPromptSplit::from_sections(vec![
+            format!(
+                "# Subagent: {name} ({subagent_id})\n\
+                 \n\
+                 你是一个子智能体,由主智能体派发执行独立任务。\n\
+                 \n\
+                 ## 任务\n\
+                 {task}\n\
+                 \n\
+                 ## 约束\n\
+                 - 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
+                 - 你的响应将被写入文件,主智能体会后续读取\n\
+                 - 请提供完整、自包含的分析结果\n\
+                 - 不需要调用工具,直接给出你的分析和结论\n\
+                 \n\
+                 ## 输出格式\n\
+                 请直接输出你的分析结果,使用 Markdown 格式。包含:\n\
+                 1. 任务理解(简要复述)\n\
+                 2. 分析过程\n\
+                 3. 关键发现\n\
+                 4. 结论和建议"
+            )
+        ]);
+
+        // 构造子智能体的 user message — task 作为唯一输入
+        let user_message = ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: format!("请执行以下任务:\n\n{task}"),
+            }],
+            usage: None,
+        };
+
+        let request = ApiRequest {
+            system_prompt: subagent_system_prompt,
+            messages: vec![user_message],
+        };
+
+        // 同步阻塞调用 LLM — 复用主 agent 的 api_client(无状态,请求隔离)
+        let events = self.api_client.stream(request).map_err(|e| {
+            format!("subagent LLM request failed: {e}")
+        })?;
+
+        // 解析 assistant response
+        let (assistant_message, _usage, _cache_events) = build_assistant_message(events)
+            .map_err(|e| format!("subagent response parsing failed: {e}"))?;
+
+        // 提取 text 内容
+        let mut text_content = String::new();
+        for block in &assistant_message.blocks {
+            if let ContentBlock::Text { text } = block {
+                text_content.push_str(text);
+                text_content.push('\n');
+            }
+        }
+        if text_content.trim().is_empty() {
+            return Err("subagent produced no text content".to_string());
+        }
+
+        // 写到 .claw/subagents/{id}.md(原子写)
+        let subagents_dir = workspace_root.join(".claw").join("subagents");
+        std::fs::create_dir_all(&subagents_dir)
+            .map_err(|e| format!("failed to create subagents dir: {e}"))?;
+        let result_path = subagents_dir.join(format!("{subagent_id}.md"));
+        let tmp_path = subagents_dir.join(format!("{subagent_id}.md.tmp"));
+
+        let file_content = format!(
+            "# Subagent Result: {name} ({subagent_id})\n\
+             \n\
+             **Task:** {task}\n\
+             **Timestamp:** {}\n\
+             \n\
+             ---\n\
+             \n\
+             {text_content}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| format!("{} (unix epoch)", d.as_secs()))
+                .unwrap_or_else(|_| "unknown".to_string())
+        );
+
+        std::fs::write(&tmp_path, &file_content)
+            .map_err(|e| format!("failed to write subagent result tmp file: {e}"))?;
+        std::fs::rename(&tmp_path, &result_path)
+            .map_err(|e| format!("failed to rename subagent result file: {e}"))?;
+
+        // 返回相对路径(便于主 agent 在 tool result 中阅读)
+        let result_ref = format!(".claw/subagents/{subagent_id}.md");
+        Ok(result_ref)
     }
 
     /// Step 3.2-c:Execute the `check_subagent` tool — 查询子 agent 状态/结果。
@@ -3773,7 +3930,7 @@ mod tests {
 
     #[test]
     fn dispatch_subagent_returns_message_when_no_coordinator_configured() {
-        let runtime = runtime_without_coordinator();
+        let mut runtime = runtime_without_coordinator();
         let output = runtime
             .execute_dispatch_subagent(r#"{"name":"a","task":"b"}"#)
             .expect("soft failure should not propagate as error");
@@ -3790,7 +3947,10 @@ mod tests {
         // 用唯一的 task 字符串标识本测试的事件,避免并行运行时其他测试干扰。
         let unique_task = "Refactor auth module [test-dispatch-spawn-uuid-7c3a]";
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let runtime = runtime_with_coordinator(coordinator.clone());
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        // P0-2:子智能体真实化需要 workspace_root 来持久化结果到 .claw/subagents/{id}.md
+        let tempdir = tempfile::tempdir().expect("failed to create temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
 
         let input = serde_json::json!({
             "name": "refactor-auth",
@@ -3801,13 +3961,18 @@ mod tests {
         let output = runtime
             .execute_dispatch_subagent(&input)
             .expect("dispatch should succeed");
+        // P0-2:同步执行后,成功消息包含 "completed" 和 result_ref 路径
         assert!(
-            output.contains("Dispatched subagent"),
-            "missing 'Dispatched subagent' prefix: {output}"
+            output.contains("Subagent `") && output.contains("completed"),
+            "missing 'Subagent `...` completed' marker: {output}"
+        );
+        assert!(
+            output.contains(".claw/subagents/"),
+            "missing result_ref path: {output}"
         );
         // 提取 subagent_id — 形如 `subagent-1`。
         let subagent_id = output
-            .split("Dispatched subagent `")
+            .split("Subagent `")
             .nth(1)
             .and_then(|s| s.split('`').next())
             .expect("should extract subagent_id from output");
@@ -3816,14 +3981,32 @@ mod tests {
             "unexpected subagent_id: {subagent_id}"
         );
 
-        // 验证 coordinator 中子 agent 状态为 Running。
+        // P0-2:同步执行后,coordinator 中子 agent 状态应为 Completed(不再是 Running)。
         let agent = coordinator
             .get(subagent_id)
             .expect("subagent should be registered");
-        assert_eq!(agent.status, crate::multi_agent::SubagentStatus::Running);
+        assert_eq!(agent.status, crate::multi_agent::SubagentStatus::Completed);
         assert_eq!(agent.name, "refactor-auth");
         assert_eq!(agent.task, unique_task);
         assert_eq!(agent.mode, crate::multi_agent::CoordinationMode::Fork);
+        // result 字段应包含 result_ref 路径
+        assert!(
+            agent.result.as_deref().unwrap_or("").contains(".claw/subagents/"),
+            "coordinator.result should contain result_ref path: {:?}",
+            agent.result
+        );
+
+        // 验证结果文件确实写入磁盘(P0-2 核心不变量:"Subagent output to a filesystem")
+        let result_file = tempdir.path().join(".claw").join("subagents").join(format!("{subagent_id}.md"));
+        assert!(
+            result_file.exists(),
+            "subagent result file should exist at {result_file:?}"
+        );
+        let file_content = std::fs::read_to_string(&result_file).expect("read result file");
+        assert!(
+            file_content.contains(&unique_task),
+            "result file should contain the task: {file_content}"
+        );
 
         // 验证 SubagentHandoff lane event 已发布。用 task 字段过滤,避免并行竞争。
         let events = crate::lane_events::drain_lane_events();
@@ -3845,13 +4028,30 @@ mod tests {
         assert_eq!(data["subagent_id"], subagent_id);
         assert_eq!(data["mode"], "fork");
         assert_eq!(data["task"], unique_task);
+
+        // P0-2:还应发布 SubagentResult 终态事件
+        let result_event = events.iter().find(|e| {
+            e.event == crate::lane_events::LaneEventName::SubagentResult
+                && e.data
+                    .as_ref()
+                    .and_then(|d| d.get("subagent_id"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t == subagent_id)
+        });
+        assert!(
+            result_event.is_some(),
+            "SubagentResult terminal event should be published after P0-2 sync execution"
+        );
     }
 
     #[test]
     fn dispatch_subagent_defaults_mode_to_fork() {
         let unique_task = "test-defaults-mode-uuid-9f2b";
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
+        // P0-2:子智能体真实化需要 workspace_root
+        let tempdir = tempfile::tempdir().expect("failed to create temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
 
         let input = serde_json::json!({
             "name": "a",
@@ -3861,16 +4061,21 @@ mod tests {
         let output = runtime
             .execute_dispatch_subagent(&input)
             .expect("dispatch should succeed");
+        // P0-2:默认 mode 为 fork,同步执行应成功完成
         assert!(
-            output.contains("mode: fork"),
-            "default mode should be fork: {output}"
+            output.contains("Subagent `") && output.contains("completed"),
+            "default mode should succeed with 'completed' status: {output}"
+        );
+        assert!(
+            output.contains(".claw/subagents/"),
+            "missing result_ref path: {output}"
         );
     }
 
     #[test]
     fn dispatch_subagent_handles_invalid_json() {
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
 
         let error = runtime
             .execute_dispatch_subagent("not json")
@@ -3884,7 +4089,7 @@ mod tests {
     #[test]
     fn dispatch_subagent_errors_when_name_missing() {
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
 
         let error = runtime
             .execute_dispatch_subagent(r#"{"task":"b"}"#)
@@ -3898,7 +4103,7 @@ mod tests {
     #[test]
     fn dispatch_subagent_errors_when_task_missing() {
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
 
         let error = runtime
             .execute_dispatch_subagent(r#"{"name":"a"}"#)
@@ -3912,7 +4117,7 @@ mod tests {
     #[test]
     fn dispatch_subagent_errors_when_mode_invalid() {
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
 
         let error = runtime
             .execute_dispatch_subagent(r#"{"name":"a","task":"b","mode":"bogus"}"#)
@@ -3923,9 +4128,157 @@ mod tests {
         );
     }
 
+    /// P0-2:子智能体真实化 — 无 workspace_root 时应优雅失败,coordinator 标记为 Failed。
+    ///
+    /// 这是 P0-2 的关键不变量:子智能体需要文件系统持久化(Anthropic 推荐),
+    /// 没有 workspace_root 就无法写 result 文件,应返回错误而非静默降级。
+    #[test]
+    fn dispatch_subagent_fails_gracefully_without_workspace_root() {
+        let _guard = acquire_lane_event_lock();
+        let unique_task = "test-no-workspace-uuid-p0-2-fail";
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        // 故意不设置 workspace_root — 验证优雅失败
+
+        let input = serde_json::json!({
+            "name": "no-workspace-agent",
+            "task": unique_task,
+            "mode": "fork"
+        })
+        .to_string();
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("dispatch should not propagate as hard error");
+        // 应返回失败消息给主 agent
+        assert!(
+            output.contains("Subagent `") && output.contains("failed"),
+            "missing 'failed' marker: {output}"
+        );
+        assert!(
+            output.contains("workspace_root not configured"),
+            "missing 'workspace_root not configured' reason: {output}"
+        );
+
+        // 提取 subagent_id 并验证 coordinator 状态为 Failed
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("should extract subagent_id");
+        let agent = coordinator
+            .get(subagent_id)
+            .expect("subagent should be registered despite failure");
+        assert_eq!(agent.status, crate::multi_agent::SubagentStatus::Failed);
+        assert!(
+            agent.result.as_deref().unwrap_or("").contains("workspace_root not configured"),
+            "coordinator.result should contain failure reason: {:?}",
+            agent.result
+        );
+
+        // 验证 SubagentResult 终态事件已发布(status=failed)
+        let events = crate::lane_events::drain_lane_events();
+        let result_event = events.iter().find(|e| {
+            e.event == crate::lane_events::LaneEventName::SubagentResult
+                && e.data
+                    .as_ref()
+                    .and_then(|d| d.get("subagent_id"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t == subagent_id)
+        });
+        assert!(result_event.is_some(), "SubagentResult event should be published");
+        let result_event = result_event.unwrap();
+        assert_eq!(result_event.status, crate::lane_events::LaneEventStatus::Failed);
+    }
+
+    /// P0-2:子智能体真实化 — 验证主 agent 上下文不被污染。
+    ///
+    /// 这是 P0-2 的核心设计目标(Anthropic Multi-Agent Research System):
+    /// "spawn fresh subagents with clean contexts" — 子智能体执行不应
+    /// 在主 agent 的 session messages 中留下任何痕迹。
+    #[test]
+    fn dispatch_subagent_does_not_pollute_main_session_messages() {
+        let _guard = acquire_lane_event_lock();
+        let unique_task = "test-context-isolation-uuid-p0-2-iso";
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("failed to create temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        // 记录执行前的 session messages 数量
+        let messages_before = runtime.session().messages.len();
+
+        let input = serde_json::json!({
+            "name": "isolated-agent",
+            "task": unique_task,
+            "mode": "fork"
+        })
+        .to_string();
+        let _output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("dispatch should succeed");
+
+        // P0-2 核心不变量:子智能体的 LLM 请求和响应完全隔离,
+        // 不应在主 agent 的 session messages 中添加任何消息。
+        let messages_after = runtime.session().messages.len();
+        assert_eq!(
+            messages_before, messages_after,
+            "P0-2 violation: subagent execution polluted main session messages \
+             (before={messages_before}, after={messages_after}). \
+             Subagent must run with isolated context."
+        );
+    }
+
+    /// P0-2:子智能体真实化 — 验证多次 dispatch 产生递增的 subagent_id。
+    ///
+    /// 确保 id_counter 正确递增,主 agent 可以引用不同的 subagent_id。
+    #[test]
+    fn dispatch_subagent_increments_id_across_calls() {
+        let _guard = acquire_lane_event_lock();
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("failed to create temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        let extract_id = |output: &str| -> String {
+            output
+                .split("Subagent `")
+                .nth(1)
+                .and_then(|s| s.split('`').next())
+                .expect("should extract subagent_id")
+                .to_string()
+        };
+
+        let input1 = serde_json::json!({"name":"a","task":"task-1","mode":"fork"}).to_string();
+        let output1 = runtime.execute_dispatch_subagent(&input1).expect("first dispatch");
+        let id1 = extract_id(&output1);
+
+        let input2 = serde_json::json!({"name":"b","task":"task-2","mode":"fork"}).to_string();
+        let output2 = runtime.execute_dispatch_subagent(&input2).expect("second dispatch");
+        let id2 = extract_id(&output2);
+
+        assert!(
+            id1 != id2,
+            "subagent_ids should differ across dispatches: id1={id1}, id2={id2}"
+        );
+        // 验证 id 格式递增(subagent-1, subagent-2, ...)
+        assert!(
+            id1.starts_with("subagent-") && id2.starts_with("subagent-"),
+            "ids should follow subagent-N pattern: id1={id1}, id2={id2}"
+        );
+        let n1: u64 = id1.strip_prefix("subagent-").unwrap().parse().unwrap();
+        let n2: u64 = id2.strip_prefix("subagent-").unwrap().parse().unwrap();
+        assert_eq!(n2, n1 + 1, "id counter should increment by 1: n1={n1}, n2={n2}");
+
+        // 两个结果文件都应存在
+        let file1 = tempdir.path().join(".claw").join("subagents").join(format!("{id1}.md"));
+        let file2 = tempdir.path().join(".claw").join("subagents").join(format!("{id2}.md"));
+        assert!(file1.exists(), "result file 1 should exist: {file1:?}");
+        assert!(file2.exists(), "result file 2 should exist: {file2:?}");
+    }
+
     #[test]
     fn check_subagent_returns_message_when_no_coordinator_configured() {
-        let runtime = runtime_without_coordinator();
+        let mut runtime = runtime_without_coordinator();
         let output = runtime
             .execute_check_subagent(r#"{"subagent_id":"x"}"#)
             .expect("soft failure should not propagate as error");
@@ -3945,7 +4298,7 @@ mod tests {
         let id = coordinator.spawn("a", unique_task, crate::multi_agent::CoordinationMode::Fork);
         coordinator.start(&id).expect("start should succeed");
 
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
         let output = runtime
             .execute_check_subagent(&format!(r#"{{"subagent_id":"{id}"}}"#))
             .expect("check should succeed");
@@ -3989,7 +4342,7 @@ mod tests {
             .complete(&id, unique_result)
             .expect("complete should succeed");
 
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
         let output = runtime
             .execute_check_subagent(&format!(r#"{{"subagent_id":"{id}"}}"#))
             .expect("check should succeed");
@@ -4039,7 +4392,7 @@ mod tests {
             .fail(&id, unique_error)
             .expect("fail should succeed");
 
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
         let output = runtime
             .execute_check_subagent(&format!(r#"{{"subagent_id":"{id}"}}"#))
             .expect("check should succeed");
@@ -4076,7 +4429,7 @@ mod tests {
     #[test]
     fn check_subagent_errors_when_subagent_id_missing() {
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
 
         let error = runtime
             .execute_check_subagent(r#"{}"#)
@@ -4090,7 +4443,7 @@ mod tests {
     #[test]
     fn check_subagent_errors_when_subagent_not_found() {
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let runtime = runtime_with_coordinator(coordinator);
+        let mut runtime = runtime_with_coordinator(coordinator);
 
         let error = runtime
             .execute_check_subagent(r#"{"subagent_id":"nonexistent"}"#)
