@@ -882,31 +882,18 @@ where
                                 continue;
                             }
                             // Compaction removed nothing — nothing more we can do.
-                            // BUG-3 修复:compaction 末端失败也尝试一次 Provider 恢复
-                            // (上游可能临时不可用,恢复后重试可能成功)。
-                            if self.try_recover_or_record_fail(
-                                iterations,
-                                WorkerFailureKind::Provider,
-                                &error,
-                            ) {
-                                // 重置 reactive_state,重新走 compaction 流程。
-                                reactive_state = ReactiveCompactState::NotAttempted;
-                                continue;
-                            }
+                            // 注:此处不再调用 try_recover_or_record_fail。
+                            // reactive_compact 本身就是 prompt_too_long 的恢复机制,
+                            // 再叠加 Provider 恢复会重置 reactive_state 导致 API 调用翻倍
+                            // (BUG-1 修复)。直接 record + 升级。
+                            self.record_turn_failed(iterations, &error);
                             return Err(error);
                         }
                         ReactiveCompactState::FullCompactDone => {
                             // Already exhausted recovery steps; bail out to
                             // prevent an infinite retry loop.
-                            // BUG-3 修复:同样尝试一次 Provider 恢复,失败再升级。
-                            if self.try_recover_or_record_fail(
-                                iterations,
-                                WorkerFailureKind::Provider,
-                                &error,
-                            ) {
-                                reactive_state = ReactiveCompactState::NotAttempted;
-                                continue;
-                            }
+                            // 注:此处不再调用 try_recover_or_record_fail,理由同上。
+                            self.record_turn_failed(iterations, &error);
                             return Err(error);
                         }
                     }
