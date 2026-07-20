@@ -1,8 +1,23 @@
 use crate::error::ApiError;
+use std::time::Duration;
 
 const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
 const HTTPS_PROXY_KEYS: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 const NO_PROXY_KEYS: [&str; 2] = ["NO_PROXY", "no_proxy"];
+
+/// Default connection-establishment timeout applied to every outbound HTTP
+/// request. This guards against the "TCP silently hangs during connect" failure
+/// mode where a provider endpoint is unreachable but the OS does not surface a
+/// connection refused error quickly enough.
+///
+/// This is intentionally a *connect* timeout rather than a total request
+/// timeout: streaming responses (SSE for `stream_message`, long-running tool
+/// turns) can legitimately remain open for minutes, and a total timeout would
+/// incorrectly abort them. Read-level stalls for non-streaming requests are
+/// already surfaced through the retry layer's `is_timeout` classification once
+/// reqwest's own per-request timeout fires (set via the request builder when
+/// needed, not at client construction).
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Snapshot of the proxy-related environment variables that influence the
 /// outbound HTTP client. Captured up front so callers can inspect, log, and
@@ -81,7 +96,12 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
-    let mut builder = reqwest::Client::builder().no_proxy();
+    // Connect timeout guards against silently-hung TCP handshakes without
+    // capping the total request duration — see `DEFAULT_CONNECT_TIMEOUT` for
+    // the rationale on why we deliberately avoid `.timeout()` here.
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT);
 
     let no_proxy = config
         .no_proxy

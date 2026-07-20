@@ -207,6 +207,7 @@ impl OpenAiCompatClient {
                         reqwest::StatusCode::from_u16(code.unwrap_or(400))
                             .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
                     ),
+                    retry_after: None,
                 });
             }
         }
@@ -260,7 +261,15 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+            // Honour the server's `Retry-After` advisory when present; only
+            // fall back to local exponential backoff when the response did not
+            // carry one. This keeps us aligned with provider rate-limit windows
+            // instead of guessing.
+            let sleep_duration = retryable_error
+                .retry_after()
+                .map(Ok)
+                .unwrap_or_else(|| self.jittered_backoff_for_attempt(attempts))?;
+            tokio::time::sleep(sleep_duration).await;
         };
 
         Err(ApiError::RetriesExhausted {
@@ -1575,6 +1584,7 @@ fn parse_sse_frame(
                 body: payload.clone(),
                 retryable: false,
                 suggested_action: suggested_action_for_status(status),
+                retry_after: None,
             });
         }
     }
@@ -1621,13 +1631,33 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
+/// Parse the `Retry-After` header into a `Duration`. Only the delta-seconds
+/// form is supported (the form OpenAI/Anthropic emit). Negative, non-numeric,
+/// or overflowing values are ignored so the caller falls back to exponential
+/// backoff. Values are clamped to one hour to prevent a misbehaving gateway
+/// from stalling the retry loop indefinitely.
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let header_value = headers.get(reqwest::header::RETRY_AFTER)?;
+    let text = header_value.to_str().ok()?;
+    let trimmed = text.trim();
+    let seconds: u64 = trimmed.parse().ok()?;
+    if trimmed.starts_with('-') {
+        return None;
+    }
+    Some(Duration::from_secs(seconds.min(3_600)))
+}
+
 async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
 
-    let request_id = request_id_from_headers(response.headers());
+    // Read headers before `text()` consumes the response so we can honour the
+    // server's `Retry-After` advisory during the retry loop.
+    let headers = response.headers().clone();
+    let request_id = request_id_from_headers(&headers);
+    let retry_after = retry_after_from_headers(&headers);
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
@@ -1646,6 +1676,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action,
+        retry_after,
     })
 }
 

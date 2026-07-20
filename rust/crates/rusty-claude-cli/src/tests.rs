@@ -86,6 +86,7 @@ fn opaque_provider_wrapper_surfaces_failure_class_session_and_trace() {
         body: String::new(),
         retryable: true,
         suggested_action: None,
+        retry_after: None,
     };
 
     let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -109,6 +110,7 @@ fn retry_exhaustion_uses_retry_failure_class_for_generic_provider_wrapper() {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         }),
     };
 
@@ -173,6 +175,7 @@ fn provider_context_window_errors_are_reframed_with_same_guidance() {
         body: String::new(),
         retryable: false,
         suggested_action: None,
+        retry_after: None,
     };
 
     let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -206,6 +209,7 @@ fn openai_configured_limit_errors_are_rendered_as_context_window_guidance() {
         body: String::new(),
         retryable: false,
         suggested_action: None,
+        retry_after: None,
     };
 
     let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -240,6 +244,7 @@ fn retry_wrapped_context_window_errors_keep_recovery_guidance() {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         }),
     };
 

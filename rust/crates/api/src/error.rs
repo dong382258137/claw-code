@@ -20,6 +20,7 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "completion tokens",
     "prompt tokens",
     "request is too large",
+    "no parseable body",
 ];
 
 #[derive(Debug)]
@@ -60,6 +61,10 @@ pub enum ApiError {
         retryable: bool,
         /// Suggested user action based on error type (e.g., "Reduce prompt size" for 413)
         suggested_action: Option<String>,
+        /// Parsed `Retry-After` header value for 429/503 responses.
+        /// When present, overrides the exponential backoff delay so the client
+        /// honours the server's requested cooldown instead of guessing.
+        retry_after: Option<Duration>,
     },
     RetriesExhausted {
         attempts: u32,
@@ -124,6 +129,20 @@ impl ApiError {
             model: model.into(),
             body_snippet: truncate_body_snippet(body, 200),
             source,
+        }
+    }
+
+    /// Return the `Retry-After` delay if this error came from a response that
+    /// included a `retry-after` header. Callers should prefer this value over
+    /// the computed exponential backoff when present. The lookup recurses
+    /// through `RetriesExhausted` so the final retry sleep can honour the
+    /// server's last advisory delay.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { retry_after, .. } => *retry_after,
+            Self::RetriesExhausted { last_error, .. } => last_error.retry_after(),
+            _ => None,
         }
     }
 
@@ -496,6 +515,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         assert!(error.is_generic_fatal_wrapper());
@@ -519,6 +539,7 @@ mod tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
+                retry_after: None,
             }),
         };
 
@@ -540,6 +561,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         assert!(error.is_context_window_failure());
@@ -560,6 +582,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         assert!(error.is_context_window_failure());

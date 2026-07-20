@@ -454,7 +454,16 @@ impl AnthropicClient {
                 break;
             }
 
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+            // Honour the server's `Retry-After` advisory when present; only
+            // fall back to local exponential backoff when the response did not
+            // carry one. This keeps us aligned with provider rate-limit windows
+            // instead of guessing.
+            let sleep_duration = last_error
+                .as_ref()
+                .and_then(ApiError::retry_after)
+                .map(Ok)
+                .unwrap_or_else(|| self.jittered_backoff_for_attempt(attempts))?;
+            tokio::time::sleep(sleep_duration).await;
         }
 
         Err(ApiError::RetriesExhausted {
@@ -775,6 +784,25 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
+/// Parse the `Retry-After` header into a `Duration`. Per RFC 7231 the value
+/// may be either an integer number of seconds or an HTTP-date; only the
+/// delta-seconds form is supported here because Anthropic/OpenAI emit that
+/// form. Negative values, non-numeric values, and values that would overflow
+/// `u64` seconds are ignored so the caller falls back to exponential backoff.
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let header_value = headers.get(reqwest::header::RETRY_AFTER)?;
+    let text = header_value.to_str().ok()?;
+    let trimmed = text.trim();
+    let seconds: u64 = trimmed.parse().ok()?;
+    // Reject negative-looking values (e.g. "-1") that slipped through as
+    // unsigned underflow; also clamp absurdly large values to one hour so a
+    // misbehaving gateway cannot stall the retry loop indefinitely.
+    if trimmed.starts_with('-') {
+        return None;
+    }
+    Some(Duration::from_secs(seconds.min(3_600)))
+}
+
 impl Provider for AnthropicClient {
     type Stream = MessageStream;
 
@@ -868,7 +896,12 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
-    let request_id = request_id_from_headers(response.headers());
+    // Read headers before `text()` consumes the response — `Retry-After` is
+    // only meaningful on retryable status codes (429/503) but parsing it
+    // unconditionally keeps the helper self-contained and future-proof.
+    let headers = response.headers().clone();
+    let request_id = request_id_from_headers(&headers);
+    let retry_after = retry_after_from_headers(&headers);
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
@@ -885,6 +918,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action: None,
+        retry_after,
     })
 }
 
@@ -910,6 +944,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         body,
         retryable,
         suggested_action,
+        retry_after,
     } = error
     else {
         return error;
@@ -923,6 +958,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     let Some(bearer_token) = auth.bearer_token() else {
@@ -934,6 +970,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     };
     if !bearer_token.starts_with("sk-ant-") {
@@ -945,6 +982,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     // Only append the hint when the AuthSource is pure BearerToken. If both
@@ -960,6 +998,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     let enriched_message = match message {
@@ -974,6 +1013,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         body,
         retryable,
         suggested_action,
+        retry_after,
     }
 }
 
@@ -1562,6 +1602,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1603,6 +1644,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1632,6 +1674,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1660,6 +1703,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1685,6 +1729,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
