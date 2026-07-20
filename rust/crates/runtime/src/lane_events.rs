@@ -1031,8 +1031,20 @@ pub struct LaneEvent {
 // is actually observable by downstream consumers (lane completion detector,
 // ship dashboard, etc.). The sink is a `Mutex<Vec<LaneEvent>>` protected
 // by a `OnceLock`; callers can `drain` it to consume buffered events.
+//
+// **架构现状(2026-07-21 阶段 3.5 评估)**:
+// - 发布端已接入:4 处生产调用(SubagentHandoff × 1、SubagentResult × 2、ShipPrepared × 1)
+// - 消费端:仅测试代码调用 `drain_lane_events`(5 处,均在 `#[cfg(test)]` 内)
+// - 生产消费者尚未接入:TUI Sidebar 消费 ToolHistory、TraceAnalyzer 消费 TraceRecord,
+//   均不订阅 LaneEvent 流
+// - `drain_lane_events` 标记 `#[allow(dead_code)]` 与文件中其他预留 API 风格一致
+// - sink 容量上限保护(512 条):防止生产运行中无人 drain 导致内存无限增长
+// - 未来升级路径:升级为 `tokio::sync::broadcast` 订阅架构,支持多消费者(方案 C)
 
 use std::sync::{Mutex, OnceLock};
+
+/// Sink 容量上限。超过时自动丢弃最旧的一半事件,防止内存无限增长。
+const LANE_EVENT_SINK_MAX_CAPACITY: usize = 512;
 
 static LANE_EVENT_SINK: OnceLock<Mutex<Vec<LaneEvent>>> = OnceLock::new();
 
@@ -1046,16 +1058,30 @@ fn lane_event_sink() -> &'static Mutex<Vec<LaneEvent>> {
 /// the sink is recovered even when poisoned, so publication never
 /// silently drops events). The boolean return is retained so callers
 /// can guard their fallback logging with `if !try_publish(event)`.
+///
+/// **容量保护**:当 sink 超过 `LANE_EVENT_SINK_MAX_CAPACITY`(512)时,
+/// 自动丢弃最旧的一半事件。这防止生产运行中无人 drain 导致内存无限增长。
+/// 事件丢失是可接受的 — lane events 是可观测性辅助数据,不是业务关键路径。
 pub fn try_publish(event: LaneEvent) -> bool {
     match lane_event_sink().lock() {
         Ok(mut buffer) => {
             buffer.push(event);
+            // 容量保护:超过上限时丢弃最旧的一半
+            if buffer.len() > LANE_EVENT_SINK_MAX_CAPACITY {
+                let drop_count = buffer.len() / 2;
+                buffer.drain(0..drop_count);
+            }
             true
         }
         Err(poisoned) => {
             // Recover the buffer even when poisoned — a faulty consumer
             // should not block future publishers.
-            poisoned.into_inner().push(event);
+            let mut buffer = poisoned.into_inner();
+            buffer.push(event);
+            if buffer.len() > LANE_EVENT_SINK_MAX_CAPACITY {
+                let drop_count = buffer.len() / 2;
+                buffer.drain(0..drop_count);
+            }
             true
         }
     }
@@ -1065,6 +1091,11 @@ pub fn try_publish(event: LaneEvent) -> bool {
 ///
 /// Returns the events in emission order. Useful for tests or for a
 /// long-running consumer that periodically drains the sink.
+///
+/// **注意**:当前生产路径无消费者调用此函数(预留 API)。
+/// 生产运行中 sink 通过 `try_publish` 内部的容量上限保护自动丢弃旧事件。
+/// 测试代码通过此函数验证事件发布正确性。
+#[allow(dead_code)]
 pub fn drain_lane_events() -> Vec<LaneEvent> {
     match lane_event_sink().lock() {
         Ok(mut buffer) => std::mem::take(&mut *buffer),
@@ -1371,10 +1402,11 @@ mod tests {
         classify_event_terminality, compute_event_fingerprint, dedupe_superseded_commit_events,
         dedupe_terminal_events, events_materially_differ, filter_by_confidence,
         filter_by_environment, filter_by_provenance, is_live_lane_event, is_terminal_event,
-        is_test_event, reconcile_terminal_events, BlockedSubphase, ConfidenceLevel,
-        EventProvenance, EventTerminality, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-        LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus, LaneFailureClass,
-        LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance, WatcherAction,
+        is_test_event, reconcile_terminal_events, drain_lane_events, try_publish,
+        BlockedSubphase, ConfidenceLevel, EventProvenance, EventTerminality,
+        LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventBuilder, LaneEventMetadata,
+        LaneEventName, LaneEventStatus, LaneFailureClass, LaneOwnership, SessionIdentity,
+        ShipMergeMethod, ShipProvenance, WatcherAction, LANE_EVENT_SINK_MAX_CAPACITY,
     };
 
     #[test]
@@ -2690,5 +2722,76 @@ mod tests {
                 .watcher_action,
             WatcherAction::Ignore
         );
+    }
+
+    /// 容量保护:当 sink 超过 `LANE_EVENT_SINK_MAX_CAPACITY` 时,
+    /// 自动丢弃最旧的一半事件,防止内存无限增长。
+    ///
+    /// 注意:全局 sink 被所有测试共享,并行测试可能插入额外事件。
+    /// 本测试不依赖精确计数,只验证:
+    /// 1. 发生了丢弃(drained.len() < total_to_publish)
+    /// 2. sink 长度被控制在合理范围(≤ MAX_CAPACITY + 容忍量)
+    /// 3. 最新事件被保留
+    #[test]
+    fn sink_capacity_protection_drops_oldest_half() {
+        // 先 drain 清空 sink
+        let _ = drain_lane_events();
+
+        // 发布远超 MAX_CAPACITY 的事件数,确保容量保护多次触发
+        let total_to_publish = LANE_EVENT_SINK_MAX_CAPACITY * 4;
+        for i in 0..total_to_publish {
+            let event = LaneEvent::new(
+                LaneEventName::Started,
+                LaneEventStatus::Running,
+                format!("2026-07-21T00:00:{i:05}Z"),
+            );
+            assert!(try_publish(event));
+        }
+
+        let drained = drain_lane_events();
+
+        // 验证 1:发生了丢弃(2048 条发布,但 sink 不可能全部保留)
+        assert!(
+            drained.len() < total_to_publish,
+            "capacity protection should have dropped events: published {total_to_publish}, retained {}",
+            drained.len()
+        );
+
+        // 验证 2:sink 长度被控制在 MAX_CAPACITY 附近
+        // (并行测试可能插入少量额外事件,允许 20% 容忍量)
+        let upper_bound = LANE_EVENT_SINK_MAX_CAPACITY + (LANE_EVENT_SINK_MAX_CAPACITY / 5);
+        assert!(
+            drained.len() <= upper_bound,
+            "sink should be bounded near MAX_CAPACITY: got {}, expected <= {}",
+            drained.len(),
+            upper_bound
+        );
+
+        // 验证 3:最新事件被保留(容量保护丢弃最旧的,保留最新的)
+        let last_event = drained.last().expect("should have events");
+        let expected_last_ts = format!("2026-07-21T00:00:{:05}Z", total_to_publish - 1);
+        assert_eq!(
+            last_event.emitted_at,
+            expected_last_ts,
+            "last event should be the newest one (capacity protection keeps newest)"
+        );
+
+        // 清理:drain 剩余事件
+        let _ = drain_lane_events();
+    }
+
+    /// `drain_lane_events` 清空 sink 后,后续 drain 返回空 Vec。
+    #[test]
+    fn drain_returns_empty_after_drain() {
+        let _ = drain_lane_events();
+        try_publish(LaneEvent::new(
+            LaneEventName::Started,
+            LaneEventStatus::Running,
+            "2026-07-21T00:00:00Z",
+        ));
+        let first = drain_lane_events();
+        assert_eq!(first.len(), 1);
+        let second = drain_lane_events();
+        assert!(second.is_empty(), "second drain should return empty Vec");
     }
 }
