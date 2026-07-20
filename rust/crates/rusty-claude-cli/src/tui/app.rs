@@ -333,12 +333,37 @@ fn run_event_loop(
         // Render
         terminal.draw(|f| {
             // Top-level vertical layout: main row (output+input) + status bar.
+            // 动态输入区高度：根据当前 buffer 的显示行数调整。
+            // - 最少 3 行（1 border + 至少 2 内容行）
+            // - 最多 8 行（避免输入区挤占输出区过多空间）
+            // - 内容行数 = buffer 中所有行的显示行数（考虑 wrap）总和
+            //   每行显示行数 = max(1, ceil(line_width / area_width))
+            // 这样长输入或多行粘贴时输入区会自动扩展，不会出现"看不全"的问题。
+            let input_area_width = f.area().width as usize;
+            let input_content_lines: usize = {
+                let buf_str = input.buffer();
+                use unicode_width::UnicodeWidthStr;
+                buf_str
+                    .split('\n')
+                    .map(|line| {
+                        let w = UnicodeWidthStr::width(line);
+                        if w == 0 || input_area_width == 0 {
+                            1
+                        } else {
+                            ((w + input_area_width - 1) / input_area_width).max(1)
+                        }
+                    })
+                    .sum()
+            };
+            // +1 for top border, +1 for safety margin（避免光标在最后一行被裁）
+            let input_height = (input_content_lines + 2).clamp(3, 8) as u16;
+
             let outer = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(3),     // main row (output + optional sidebar)
-                    Constraint::Length(3),   // input + popup area
-                    Constraint::Length(1),   // status bar
+                    Constraint::Min(3),                // main row (output + optional sidebar)
+                    Constraint::Length(input_height),   // input + popup area (动态)
+                    Constraint::Length(1),              // status bar
                 ])
                 .split(f.area());
 
@@ -427,30 +452,81 @@ fn run_event_loop(
             f.render_widget(output_paragraph, main_area);
 
             // Input area
-            // 多行 buffer 支持：把整个 buffer（含 \n）交给 Paragraph 渲染。
-            // 输入区高度为 3 行（outer[1]），减去 1 行 top border 后还有 2 行
-            // 内容区。若 buffer 超过 2 行，超出部分不可见，但 Enter 仍能提交
-            // 完整内容。这是 MVP 取舍：保证粘贴/多行编辑功能正确，渲染可见性
-            // 后续可改为动态扩展输入区高度。
+            // 多行 buffer + wrap 支持：把整个 buffer（含 \n）交给 Paragraph 渲染，
+            // 启用 .wrap() 让长行自动折行。输入区高度已按 buffer 显示行数动态
+            // 扩展（见上方 input_height 计算），所以多行/长行都能完整显示。
             let input_line = format!("> {}", input.buffer());
             let input_paragraph = Paragraph::new(input_line)
-                .block(Block::default().borders(Borders::TOP).title("输入"));
+                .block(Block::default().borders(Borders::TOP).title("输入"))
+                .wrap(Wrap { trim: false });
             f.render_widget(input_paragraph, outer[1]);
 
             // Position the visible cursor inside the input area.
-            // 多行 buffer 光标定位：Y 坐标按光标所在行号（capped to visible area），
-            // X 坐标按当前行内光标左侧文本的显示宽度（不累加其他行）。
-            // 旧实现用 `cursor_display_width()` 累加所有行宽度，对 "hello\nworld"
-            // 返回 10，导致光标被定位到第 1 行第 12 列（超出可见区域）。
+            // 多行 + wrap 光标定位：
+            // - Y 坐标 = 光标所在逻辑行之前所有行的显示行数（考虑 wrap）+ 当前行内的 wrap 偏移
+            // - X 坐标 = 当前行内光标左侧文本宽度 % area_width
+            //
+            // 旧实现的问题：
+            // 1. 输入区固定 3 行，多行/长行输入超出部分不可见
+            // 2. 没有 wrap，长行不会折行，光标 X 累加超出终端宽度
+            // 3. cursor_display_width() 累加所有行宽度，对 "hello\nworld" 返回 10
+            //    导致光标定位到第 1 行第 12 列（超出可见区域）
             let prompt_prefix_len: usize = 2; // "> "
             let (line_idx, _byte_offset_in_line, line_content_before_cursor) =
                 input.cursor_line_and_column();
+            let input_width = outer[1].width as usize;
             let line_display_width = UnicodeWidthStr::width(line_content_before_cursor);
-            let cursor_x = prompt_prefix_len + line_display_width;
-            // 输入区可见内容行数 = outer[1].height - 1（top border）。一般 = 2。
+
+            // 计算光标所在逻辑行之前所有逻辑行的显示行数总和（含 prompt 前缀对第 0 行的影响）
+            // 第 0 行实际显示宽度 = prompt "> " (2) + 第 0 行内容宽度
+            let display_row_before_line: usize = if line_idx == 0 {
+                0
+            } else {
+                // 第 0 行：prompt 前缀占 2 列，第 0 行内容 + 2 后再 wrap
+                let buf_str = input.buffer();
+                let mut display_rows = 0usize;
+                for (i, line) in buf_str.split('\n').enumerate() {
+                    if i >= line_idx { break; }
+                    let line_w = if i == 0 {
+                        // 第 0 行有 "> " 前缀
+                        UnicodeWidthStr::width(line) + prompt_prefix_len
+                    } else {
+                        UnicodeWidthStr::width(line)
+                    };
+                    let rows = if line_w == 0 || input_width == 0 {
+                        1
+                    } else {
+                        ((line_w + input_width - 1) / input_width).max(1)
+                    };
+                    display_rows += rows;
+                }
+                display_rows
+            };
+
+            // 当前行内光标的显示行偏移（考虑 prompt 前缀对第 0 行的影响）
+            let effective_line_width = if line_idx == 0 {
+                line_display_width + prompt_prefix_len
+            } else {
+                line_display_width
+            };
+            let row_in_line = if effective_line_width == 0 || input_width == 0 {
+                0
+            } else {
+                effective_line_width / input_width
+            };
+
+            // X 坐标：当前行内光标左侧宽度对 input_width 取模
+            let cursor_x = if line_idx == 0 {
+                // 第 0 行：prompt + 内容
+                (prompt_prefix_len + line_display_width) % input_width.max(1)
+            } else {
+                line_display_width % input_width.max(1)
+            };
+
+            let display_row = display_row_before_line + row_in_line;
             let input_content_height = outer[1].height.saturating_sub(1) as usize;
-            // 把 line_idx 限制在可见区域内：超过则光标停在最后一行可见行。
-            let visible_line_idx = line_idx.min(input_content_height.saturating_sub(1));
+            // 把 display_row 限制在可见区域内
+            let visible_line_idx = display_row.min(input_content_height.saturating_sub(1));
             f.set_cursor_position((
                 outer[1].x + cursor_x as u16,
                 outer[1].y + 1 + visible_line_idx as u16, // +1 for the top border
