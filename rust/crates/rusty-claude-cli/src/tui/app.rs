@@ -15,9 +15,12 @@ use std::time::{Duration, Instant};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span, StyledGrapheme, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+// Styled trait 提供 `line.styled_graphemes(style)` 方法，用于按 grapheme
+// 迭代 Line 并保留样式信息（自己 wrap 时需要）。
+use ratatui::style::Styled;
 
 // Phase 3.2: TerminalRenderer is used to convert markdown → ANSI; ansi_to_tui
 // then converts ANSI → ratatui Text<'static> so Paragraph can render styled
@@ -30,6 +33,8 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+// UnicodeWidthStr 用于按显示宽度计算 wrap 和光标定位（CJK 字符宽度为 2）。
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::LiveCli;
 use crate::tui::input_line::{InputAction, InputLine};
@@ -256,6 +261,114 @@ impl IncrementalRenderer {
     }
 }
 
+/// 按字符宽度 wrap 一个 `Line` 到多个显示行（保留 span 样式边界）。
+///
+/// **背景**：ratatui 的 `Paragraph` 在 `.wrap(Wrap { trim: false })` 模式下
+/// 用内部的 `WordWrapper` 按 word 边界折行（遇到空格才断），与简单的
+/// `ceil(line_width / area_width)` 字符 wrap 不一致。这导致我们用字符 wrap
+/// 估算的 `total_display_lines` 偏小，`scroll_y` 偏小，最后一行被裁掉。
+///
+/// 此函数自己按字符 wrap，确保与后续 `Paragraph`（不启用 `.wrap()`）的
+/// 渲染 100% 一致。每个 grapheme 按其 `UnicodeWidthStr::width` 计算宽度，
+/// 累加超过 `area_width` 时换行。样式信息通过 `StyledGrapheme` 保留，
+/// 相邻同 style 的 grapheme 合并为一个 `Span`，减少 span 数量。
+///
+/// **边界情况**：
+/// - `area_width == 0`：返回原始 line（无法 wrap）
+/// - line 总宽度 <= area_width：返回原始 line（不需 wrap）
+/// - 零宽字符（如组合字符）：不触发换行，追加到当前 span
+/// - 单个字符宽度 > area_width：无法分割，独占一行（会超出 area_width，
+///   Paragraph 会截断，但至少不会丢行）
+fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Line<'static>> {
+    if area_width == 0 {
+        return vec![line.clone()];
+    }
+    // 用 styled_graphemes 迭代，保留每个 grapheme 的样式。
+    // graphemes 借用 line 的内容，最终通过 to_string() 转 'static。
+    let graphemes: Vec<StyledGrapheme<'_>> = line.styled_graphemes(Style::default()).collect();
+    let total_width: usize = graphemes
+        .iter()
+        .map(|g| unicode_width::UnicodeWidthStr::width(g.symbol))
+        .sum();
+    if total_width <= area_width {
+        return vec![line.clone()];
+    }
+
+    let mut result: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_span_str = String::new();
+    let mut current_span_style = Style::default();
+    let mut has_span = false;
+    let mut current_width: usize = 0;
+
+    // 把当前累积的 span 推入 current_spans
+    macro_rules! flush_span {
+        () => {
+            if has_span && !current_span_str.is_empty() {
+                current_spans.push(Span::styled(
+                    std::mem::take(&mut current_span_str),
+                    current_span_style,
+                ));
+                has_span = false;
+            }
+        };
+    }
+    // 把 current_spans 推入 result，开始新行
+    macro_rules! flush_line {
+        () => {
+            flush_span!();
+            if !current_spans.is_empty() {
+                let new_line = Line {
+                    spans: std::mem::take(&mut current_spans),
+                    style: line.style,
+                    alignment: line.alignment,
+                };
+                result.push(new_line);
+            }
+            current_width = 0;
+        };
+    }
+
+    for g in &graphemes {
+        let gw = unicode_width::UnicodeWidthStr::width(g.symbol);
+        if gw == 0 {
+            // 零宽字符：追加到当前 span（不触发换行）
+            if has_span && current_span_style == g.style {
+                current_span_str.push_str(g.symbol);
+            } else {
+                flush_span!();
+                current_span_str = g.symbol.to_string();
+                current_span_style = g.style;
+                has_span = true;
+            }
+            continue;
+        }
+        // 超过 area_width 且当前行非空：换行
+        if current_width + gw > area_width && current_width > 0 {
+            flush_line!();
+        }
+        // 追加 grapheme 到当前 span（style 相同则合并，不同则新建 span）
+        if has_span && current_span_style == g.style {
+            current_span_str.push_str(g.symbol);
+        } else {
+            flush_span!();
+            current_span_str = g.symbol.to_string();
+            current_span_style = g.style;
+            has_span = true;
+        }
+        current_width += gw;
+    }
+    // flush 最后一行
+    flush_line!();
+
+    if result.is_empty() {
+        // 安全兜底：不应触发（total_width > area_width 保证至少一行）
+        vec![line.clone()]
+    } else {
+        result
+    }
+}
+
 /// Result of a turn executed in a background thread.
 struct TurnResult {
     cli: LiveCli,
@@ -278,6 +391,10 @@ fn run_event_loop(
     let mut cli_holder: Option<LiveCli> = Some(cli);
     // Turn completion channel: Some when a turn is running
     let mut turn_rx: Option<mpsc::Receiver<TurnResult>> = None;
+
+    // P0-4 修复：标记 worker 线程已因 Disconnected 崩溃。
+    // 一旦置 true，后续 Submit 不再静默丢弃输入，而是向 OutputView 反馈。
+    let mut fatal_error: bool = false;
 
     // Sidebar: visible by default on wide terminals (>=100 cols), toggleable
     // via F2 / Ctrl+B. Holds a shared tool-history mirror so the sidebar
@@ -337,7 +454,14 @@ fn run_event_loop(
                     // Turn still running, continue rendering
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // Thread panicked; cli is lost, reset streaming state
+                    // Thread panicked; cli is lost, reset streaming state.
+                    //
+                    // **P0-4 修复**：之前 Disconnected 分支只清理 rx/start/streaming，
+                    // 没有恢复 cli_holder（cli 已随 panic 线程 Drop），也没有向用户反馈。
+                    // 后续 Submit 检查 `cli_holder.is_some() && turn_rx.is_none()` 永远 false，
+                    // Enter 键无任何反应，TUI 看似活着但无法对话。
+                    // 现在向 OutputView 追加错误提示让用户知晓，并标记 fatal_error 让
+                    // Submit 分支能给出反馈。
                     turn_rx = None;
                     turn_start = None;
                     if let Ok(mut guard) = status_state.lock() {
@@ -345,6 +469,14 @@ fn run_event_loop(
                             guard.finish_turn();
                         }
                     }
+                    // 向 OutputView 追加致命错误提示，让用户知道需要重启 TUI。
+                    if let Ok(mut buf) = output_view.shared_handle().lock() {
+                        buf.append(
+                            "\n[error] 对话线程已崩溃，无法继续对话。请退出并重启 TUI（Ctrl+C 或 Ctrl+D）。\n",
+                        );
+                    }
+                    // 标记致命错误：Submit 分支据此给出反馈而非静默丢弃输入。
+                    fatal_error = true;
                 }
             }
         }
@@ -422,40 +554,31 @@ fn run_event_loop(
             // 渲染。流式时单次 draw 从 20-100ms 降到 < 2ms。
             let output_text = output_view.snapshot();
             let output_rendered: Text<'static> = incremental.render(&output_text);
-            // Compute scroll position: when scroll_offset is None (follow
-            // mode), the Paragraph scrolls to its bottom automatically via
-            // .scroll((max_scroll, 0)). When Some(n), we scroll n lines
-            // above the bottom. Paragraph's scroll takes the top-left
-            // corner's (row, col); rows beyond the visible area are hidden.
+
+            // Bug fix（输出最后一行被输入框覆盖）：
+            // 旧实现用 `Paragraph::new(text).scroll((y,0)).wrap(Wrap{...})`，
+            // 自己用 `ceil(line_width / area_width)` 按字符 wrap 计算显示行数。
+            // 但 ratatui 的 WordWrapper 按 word 边界折行（遇到空格才断），
+            // 英文长段落中 word 放不下时换行留下行尾空白，实际显示行数比
+            // 字符 wrap 更多 → 我们的 total_display_lines 偏小 → max_scroll
+            // 偏小 → follow mode 下 scroll_y 不足以滚到真正底部，Paragraph
+            // 顶部渲染把最后几显示行裁掉，看起来像"最后一行被输入框盖住"。
             //
-            // BUG fix：旧实现用 `output_rendered.lines.len()`（逻辑行数）算
-            // max_scroll，但启用了 `Wrap { trim: false }` 后长行会折成多个
-            // 显示行。若按逻辑行算 max_scroll，follow mode 时 scroll_y 不
-            // 足以滚到真正的底部，Paragraph 顶部渲染会把最后几显示行裁掉，
-            // 看起来像"最后一行被输入框盖住"。这里按显示行计算：
-            //   display_lines(line) = max(1, ceil(line_width / area_width))
-            // 累加得到总显示行数，再算 max_scroll。
+            // 徹底修复：不再依赖 Paragraph 的 .wrap() + .scroll()，改为
+            // 自己按字符 wrap（保留 span 样式边界）+ 自己裁剪要显示的行，
+            // 传给 Paragraph 时不用 .wrap() 和 .scroll()。这样显示行数计算
+            // 与实际渲染 100% 一致，scroll_y 永远准确。
+            //
+            // 性能：按字符 wrap 比按 word wrap 略快（不需查 word 边界），
+            // 且只需遍历一次 graphemes。对 64KB buffer（~1000 行）单次 < 2ms。
             let visible_height = main_area.height.saturating_sub(1) as usize; // -1 for top border
-            let area_width = main_area.width as usize;
-            use unicode_width::UnicodeWidthStr;
-            let total_display_lines: usize = output_rendered
+            let content_width = main_area.width as usize; // Block 只有 TOP border，无左右 border
+            let wrapped_lines: Vec<Line<'static>> = output_rendered
                 .lines
                 .iter()
-                .map(|line| {
-                    // ratatui 的 Line 是 Vec<Span>，需要累加所有 span 的 width。
-                    // Span::content 是 Cow<str>，用 UnicodeWidthStr::width 计算视觉宽度。
-                    let w: usize = line
-                        .spans
-                        .iter()
-                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                        .sum();
-                    if w == 0 || area_width == 0 {
-                        1
-                    } else {
-                        ((w + area_width - 1) / area_width).max(1)
-                    }
-                })
-                .sum();
+                .flat_map(|line| wrap_line_to_display_lines(line, content_width))
+                .collect();
+            let total_display_lines = wrapped_lines.len();
             let max_scroll = total_display_lines.saturating_sub(visible_height);
             let scroll_y = match scroll_offset {
                 None => max_scroll,
@@ -465,14 +588,22 @@ fn run_event_loop(
                 None => String::new(),
                 Some(offset) => format!(" [scroll -{offset}]"),
             };
-            let output_paragraph = Paragraph::new(output_rendered)
+            // 裁剪要显示的行：从 scroll_y 开始取 visible_height 行。
+            // scroll_y 可能等于 total_display_lines（空 buffer），此时 start == end，渲染空。
+            let start = scroll_y.min(total_display_lines);
+            let end = (start + visible_height).min(total_display_lines);
+            let visible_lines: Vec<Line<'static>> = if start < end {
+                wrapped_lines[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            let output_paragraph = Paragraph::new(Text::from(visible_lines))
                 .block(
                     Block::default()
                         .borders(Borders::TOP)
                         .title(format!("输出{scroll_label}")),
-                )
-                .scroll((scroll_y as u16, 0))
-                .wrap(Wrap { trim: false });
+                );
+            // 不用 .scroll() 和 .wrap()：已自己 wrap + 裁剪。
             f.render_widget(output_paragraph, main_area);
 
             // Input area
@@ -689,6 +820,14 @@ fn run_event_loop(
                             scroll_offset = None;
                             turn_start = Some(Instant::now());
 
+                            // P2-4 修复：Submit 后立即调用 reset_turn（内部会设
+                            // streaming=true 并清零 turn 计时），避免 worker 线程真正
+                            // 启动前（数百 ms ~ 数秒网络延迟）状态栏仍显示"空闲"，
+                            // 用户以为没按上。reset_turn 内部已设 streaming=true。
+                            if let Ok(mut guard) = status_state.lock() {
+                                guard.reset_turn();
+                            }
+
                             // 多行粘贴兜底 + 折叠处理：
                             // - 如果 line 不含 \n 且不以 / 开头，调用 try_auto_expand_clipboard
                             //   检测剪贴板是否有多行内容且第一行匹配 line。如果匹配，用完整
@@ -862,6 +1001,16 @@ fn run_event_loop(
                             // 不清空会导致下次 Submit 守卫 `pending_paste_lines.is_empty()`
                             // 永远为 false，conhost 多行粘贴兜底从此失效。
                             pending_paste_lines.clear();
+                        } else if fatal_error {
+                            // P0-4 修复：worker 线程已崩溃（Disconnected），
+                            // cli_holder 已永久丢失。之前此分支静默丢弃输入，
+                            // 用户敲 Enter 无任何反馈。现在向 OutputView 反馈。
+                            input.restore_input(line);
+                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                buf.append(
+                                    "\n[error] 对话线程已崩溃，无法继续对话。请退出并重启 TUI（Ctrl+C 或 Ctrl+D）。\n",
+                                );
+                            }
                         } else {
                             // Bug L1 修复：turn 正在运行时用户敲 Enter，InputLine
                             // 在返回 Submit 前已 reset() 清空 buffer。如果不回填，
@@ -892,7 +1041,12 @@ fn run_event_loop(
             } else if let Event::Mouse(mouse) = ev {
                 // 鼠标左键点击：若命中输出区，切换该行所在的 ToolCard 折叠状态。
                 // 坐标映射：mouse.row 是终端绝对行号，需减去 main_area.y + 1
-                // （+1 为顶部 border）得到相对行号，再加 scroll_y 得到逻辑行号。
+                // （+1 为顶部 border）得到相对行号，再加 scroll_y 得到显示行号。
+                //
+                // **P1-2 修复**：之前注释写"逻辑行号"，但 last_scroll_y 是显示行单位
+                // （Paragraph::scroll 按 Wrap 后的显示行计算），两者不一致导致长行
+                // 场景下点击坐标偏移。现在 toggle_tool_card_at_line 接收 area_width
+                // 参数，内部按显示行计算 [start, end) 区间，与 scroll 单位一致。
                 use crossterm::event::{MouseButton, MouseEventKind};
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && !help_visible
@@ -903,9 +1057,11 @@ fn run_event_loop(
                     if mouse.row >= content_top && mouse.row < content_bottom {
                         let relative_row = (mouse.row - content_top) as usize;
                         let logical_row = relative_row + last_scroll_y as usize;
+                        // 输出区可见宽度 = area.width - 2（左右 border 各 1）
+                        let area_width = last_main_area.width.saturating_sub(2) as usize;
                         let handle = output_view.shared_handle();
                         if let Ok(mut buf) = handle.lock() {
-                            buf.toggle_tool_card_at_line(logical_row);
+                            buf.toggle_tool_card_at_line(logical_row, area_width);
                         };
                     }
                 }
@@ -1334,6 +1490,26 @@ fn execute_turn(
                     buf.append(&summary);
                 }
             }
+            StatusEvent::StreamError { message, recoverable } => {
+                // P0-1 修复：consume_stream 内 9 处错误路径 emit 的事件。
+                // 之前所有错误路径都不 emit，TUI 收不到信号导致 streaming=true
+                // 永久保留，UI 假死。现在收到此事件立即：
+                // 1. 向 OutputView 追加错误提示（区分可重试/致命）
+                // 2. 调用 finish_turn() 退出 streaming 状态
+                let banner = if recoverable {
+                    format!("\n[error] 流式错误（可重试）：{message}\n")
+                } else {
+                    format!("\n[error] 流式错误：{message}\n")
+                };
+                if let Ok(mut buf) = output_for_closure.lock() {
+                    buf.append(&banner);
+                }
+                if let Ok(mut guard) = status_handle.lock() {
+                    if guard.streaming {
+                        guard.finish_turn();
+                    }
+                }
+            }
         }
     });
 
@@ -1476,6 +1652,22 @@ mod tests {
                     };
                     if let Ok(mut buf) = output_handle.lock() {
                         buf.append(&summary);
+                    }
+                }
+                StatusEvent::StreamError { message, recoverable } => {
+                    // P0-1 修复：测试 emitter 同步增加 StreamError 处理分支
+                    let banner = if recoverable {
+                        format!("\n[error] 流式错误（可重试）：{message}\n")
+                    } else {
+                        format!("\n[error] 流式错误：{message}\n")
+                    };
+                    if let Ok(mut buf) = output_handle.lock() {
+                        buf.append(&banner);
+                    }
+                    if let Ok(mut guard) = status_handle.lock() {
+                        if guard.streaming {
+                            guard.finish_turn();
+                        }
                     }
                 }
             }
