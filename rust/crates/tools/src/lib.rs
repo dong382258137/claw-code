@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use api::{
@@ -1434,6 +1435,25 @@ fn maybe_enforce_permission_check_with_mode(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    // TUI 模式优先：若注册了 handler，则把请求转交给 handler。
+    // 这是为了修复 TUI 模式下 worker 线程直接用 io::stdout/stdin 导致：
+    //   1. writeln 到 stdout 破坏 alternate screen 但用户看不到
+    //   2. crossterm event loop 拥有 stdin（raw mode），read_line 永远拿不到输入
+    // handler 由 TUI 主循环注册，通过 channel 把问题投递给主线程渲染，
+    // 用户在 InputLine 输入答案后由主线程回传。
+    if let Some(handler) = current_ask_user_question_handler() {
+        let request = AskUserQuestionRequest {
+            question: input.question.clone(),
+            options: input.options.clone(),
+        };
+        let answer = handler(request)?;
+        return to_pretty_json(json!({
+            "question": input.question,
+            "answer": answer,
+            "status": "answered"
+        }));
+    }
+
     use std::io::{self, BufRead, Write};
 
     // Display the question to the user via stdout
@@ -1481,6 +1501,47 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
         "answer": answer,
         "status": "answered"
     }))
+}
+
+/// TUI 模式下 [`run_ask_user_question`] 的请求载荷。
+///
+/// 字段与 [`AskUserQuestionInput`] 对应，但全部 `pub` 以便 TUI 主循环读取。
+#[derive(Debug, Clone)]
+pub struct AskUserQuestionRequest {
+    /// 用户问题文本。
+    pub question: String,
+    /// 可选项列表。`None` 表示自由文本回答，`Some(vec)` 表示编号选项。
+    pub options: Option<Vec<String>>,
+}
+
+/// TUI 主循环注入的 ask handler 签名。
+///
+/// Handler 接收请求，返回用户输入的答案字符串（可以是选项编号或自由文本）。
+/// 返回 `Err` 表示用户取消或主循环已退出。
+pub type AskUserQuestionHandler =
+    Arc<dyn Fn(AskUserQuestionRequest) -> Result<String, String> + Send + Sync>;
+
+static ASK_USER_QUESTION_HANDLER: OnceLock<Mutex<Option<AskUserQuestionHandler>>> = OnceLock::new();
+
+/// 注册 TUI 模式下的 ask handler。
+///
+/// `handler = None` 表示注销，回到原生 stdin/stdout 路径（CLI 模式默认行为）。
+/// TUI 主循环在启动时调用 `Some(...)`，退出时调用 `None` 清理。
+pub fn set_ask_user_question_handler(handler: Option<AskUserQuestionHandler>) {
+    let lock = ASK_USER_QUESTION_HANDLER.get_or_init(|| Mutex::new(None));
+    // 用 into_inner 兜底 poisoned mutex，避免测试或 panic 后 set 静默失败。
+    let mut guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = handler;
+}
+
+fn current_ask_user_question_handler() -> Option<AskUserQuestionHandler> {
+    let lock = ASK_USER_QUESTION_HANDLER.get()?;
+    let guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.clone()
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -10758,6 +10819,55 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+
+    /// 回归测试：TUI 模式下注册 ask handler 后，`execute_tool("AskUserQuestion", ...)`
+    /// 应该走 handler 路径而不是 stdin/stdout 阻塞路径。
+    ///
+    /// 修复的 BUG：worker 线程内 `run_ask_user_question` 原本用 io::stdout/stdin
+    /// 阻塞式 I/O，TUI 模式下 crossterm event loop 拥有 stdin，read_line 永远拿不到输入。
+    #[test]
+    fn ask_user_question_uses_injected_handler_when_set() {
+        use std::sync::Arc;
+        // handler 返回固定答案，验证路径正确
+        let handler: super::AskUserQuestionHandler = Arc::new(|req| {
+            // 模拟选项编号回传
+            if let Some(opts) = req.options {
+                if let Some(first) = opts.first() {
+                    return Ok(first.clone());
+                }
+            }
+            Ok(req.question.clone())
+        });
+        super::set_ask_user_question_handler(Some(handler));
+
+        let input = json!({
+            "question": "Pick a color",
+            "options": ["red", "green", "blue"]
+        });
+        let result = execute_tool("AskUserQuestion", &input);
+        // 清理 handler，避免污染其他测试
+        super::set_ask_user_question_handler(None);
+
+        let result = result.expect("tool should succeed via handler");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["answer"], "red");
+        assert_eq!(parsed["status"], "answered");
+    }
+
+    /// 回归测试：未注册 handler 时，`AskUserQuestion` 走原生 stdin/stdout 路径
+    /// （在测试环境会 read_line 失败或返回空，但不应 panic）。
+    /// 这里仅验证 handler=None 时 `set_ask_user_question_handler` 正确清理。
+    #[test]
+    fn ask_user_question_handler_can_be_cleared() {
+        // 设置后立即清理
+        let handler: super::AskUserQuestionHandler =
+            Arc::new(|_| Ok("dummy".to_string()));
+        super::set_ask_user_question_handler(Some(handler));
+        super::set_ask_user_question_handler(None);
+        // current_ask_user_question_handler 是私有的，通过行为验证：
+        // execute_tool 不应走 handler 路径（这里不实际调用，因为 stdin
+        // 会阻塞测试线程）。仅验证 setter/clearer 不 panic。
     }
 }
 

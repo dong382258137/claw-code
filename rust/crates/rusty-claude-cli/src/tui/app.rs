@@ -66,6 +66,43 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
     let _silence_guard = TuiSilentGuard;
     crate::paste::set_tui_silent(true);
 
+    // 注册 TUI 模式下的 AskUserQuestion handler。
+    //
+    // 修复 BUG：worker 线程内 `run_ask_user_question` 原本用 io::stdout/stdin
+    // 阻塞式 I/O。但 TUI 模式下 stdout 处于 alternate screen（writeln 破坏渲染
+    // 且用户看不到），stdin 处于 raw mode 被 crossterm event loop 拥有
+    // （read_line 永远拿不到输入）。结果就是用户看到 AI 输出的 "Enter choice"
+    // 提示但无法输入数字或选择选项。
+    //
+    // 解决方案：handler 通过 channel 把请求投递给主循环，主循环把问题显示到
+    // OutputView 并设 pending_ask，下一次 Submit 时把 InputLine 内容作为答案
+    // 通过 resp_tx 回传给 worker 线程，handler 返回，run_ask_user_question 继续。
+    let (ask_tx, ask_rx) = mpsc::channel::<AskRequest>();
+    let ask_tx_for_handler = ask_tx;
+    tools::set_ask_user_question_handler(Some(Arc::new(
+        move |req: tools::AskUserQuestionRequest| {
+            let (resp_tx, resp_rx) = mpsc::channel::<String>();
+            ask_tx_for_handler
+                .send(AskRequest {
+                    question: req.question,
+                    options: req.options,
+                    resp_tx,
+                })
+                .map_err(|_| "TUI 主循环已退出，AskUserQuestion 无法投递".to_string())?;
+            resp_rx
+                .recv()
+                .map_err(|_| "TUI 响应通道关闭".to_string())
+        },
+    )));
+
+    struct AskHandlerGuard;
+    impl Drop for AskHandlerGuard {
+        fn drop(&mut self) {
+            tools::set_ask_user_question_handler(None);
+        }
+    }
+    let _ask_handler_guard = AskHandlerGuard;
+
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     // 启用鼠标捕获（左键点击切换工具卡片折叠状态）和 bracketed paste
@@ -104,9 +141,19 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run_event_loop(&mut terminal, cli);
+    let result = run_event_loop(&mut terminal, cli, ask_rx);
     // Drop guard 会恢复终端状态，这里直接返回结果。
     result
+}
+
+/// TUI 主循环内 AskUserQuestion 请求载荷。
+///
+/// 由 worker 线程通过 ask handler 投递，主循环消费后通过 `resp_tx`
+/// 把用户输入的答案回传给 worker 线程。
+struct AskRequest {
+    question: String,
+    options: Option<Vec<String>>,
+    resp_tx: mpsc::Sender<String>,
 }
 
 /// 快速字符串 hash（无需新依赖，对 64KB 字符串 ~100ns）。
@@ -422,6 +469,7 @@ struct TurnResult {
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: LiveCli,
+    ask_rx: mpsc::Receiver<AskRequest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = InputLine::new();
     let mut menu = SlashMenu::new();
@@ -481,6 +529,14 @@ fn run_event_loop(
     let mut conhost_paste_intercepted: bool = false;
     let mut pending_at_path: Option<String> = None;
 
+    // AskUserQuestion 协作状态：
+    // - `Some` 表示 worker 线程正在等待用户回答（通过 AskUserQuestion 工具），
+    //   InputLine 的下一次 Submit 会把内容作为答案通过 resp_tx 回传。
+    // - `None` 表示没有待回答的问题，Submit 走正常 AI 对话流程。
+    // 主循环每次 iteration 从 ask_rx try_recv 新请求，收到时把问题显示到
+    // OutputView 并设 pending_ask = Some(...)。
+    let mut pending_ask: Option<AskRequest> = None;
+
     // 鼠标点击支持：把 draw 闭包内的 main_area 和 scroll_y 缓存到 loop 外，
     // 这样 Event::Mouse 分支可以访问它们，把点击坐标映射到逻辑行号。
     // draw 闭包每次渲染后更新这两个值。
@@ -488,6 +544,35 @@ fn run_event_loop(
     let mut last_scroll_y: u16 = 0;
 
     'main_loop: loop {
+        // 处理 AskUserQuestion 请求：worker 线程通过 ask handler 投递的待回答问题。
+        //
+        // 只在 pending_ask 为空（没有正在等待回答的问题）时 try_recv 新请求。
+        // 一次 turn 内最多有一个 pending ask（worker 线程同步阻塞等答案，
+        // 不会并发投递多个问题）。
+        if pending_ask.is_none() {
+            if let Ok(req) = ask_rx.try_recv() {
+                // 把问题渲染到 OutputView，让用户能看到 AI 在问什么。
+                let mut prompt = String::from("\n[Question] ");
+                prompt.push_str(&req.question);
+                prompt.push_str("\n");
+                if let Some(ref opts) = req.options {
+                    for (i, opt) in opts.iter().enumerate() {
+                        prompt.push_str(&format!("  {}. {}\n", i + 1, opt));
+                    }
+                    prompt.push_str(&format!(
+                        "请输入选项编号 (1-{}) 或自定义文本后回车：\n",
+                        opts.len()
+                    ));
+                } else {
+                    prompt.push_str("请输入回答后回车：\n");
+                }
+                if let Ok(mut buf) = output_view.shared_handle().lock() {
+                    buf.append(&prompt);
+                }
+                pending_ask = Some(req);
+            }
+        }
+
         // Check if a running turn has completed
         if let Some(ref rx) = turn_rx {
             match rx.try_recv() {
@@ -974,7 +1059,12 @@ fn run_event_loop(
                         let normalize_whitespace = |s: &str| -> String {
                             s.trim().replace('\r', "")
                         };
-                        let skip_submit = if conhost_paste_intercepted {
+                        // AskUserQuestion 模式下强制 skip_submit=false，
+                        // 避免 conhost paste 残留状态误把 ask 答案丢弃。
+                        let in_ask_mode = pending_ask.is_some();
+                        let skip_submit = if in_ask_mode {
+                            false
+                        } else if conhost_paste_intercepted {
                             // 方案 C 触发后，Windows Terminal 会把剪贴板内容作为字符流注入 stdin
                             // （不是 Event::Paste），每行 \n 触发 Enter 事件。
                             // 这里需要 skip 所有这些 Submit，直到 pending_paste_lines 为空。
@@ -1057,6 +1147,37 @@ fn run_event_loop(
                                     input.insert_paste(&at_path);
                                 }
                             }
+                        } else if let Some(ask) = pending_ask.take() {
+                            // AskUserQuestion 协作路径：worker 线程正在等待用户回答。
+                            // 把 InputLine 的内容作为答案通过 resp_tx 回传，
+                            // **不**触发 execute_turn。worker 线程拿到答案后，
+                            // run_ask_user_question 会返回，整个 turn 继续执行。
+                            //
+                            // 输入处理：
+                            // - 选项模式：用户输入数字 → 解析为对应选项文本回传；
+                            //   若超出范围或非数字 → 原样回传（让 LLM 看到用户的自由文本）。
+                            // - 自由文本模式：原样回传。
+                            let answer = if let Some(ref opts) = ask.options {
+                                let trimmed = line.trim();
+                                if let Ok(idx) = trimmed.parse::<usize>() {
+                                    if idx >= 1 && idx <= opts.len() {
+                                        opts[idx - 1].clone()
+                                    } else {
+                                        line.clone()
+                                    }
+                                } else {
+                                    line.clone()
+                                }
+                            } else {
+                                line.clone()
+                            };
+                            // 把用户答案作为 echo 显示到 OutputView，保持对话上下文清晰。
+                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                buf.append(&format!("> {answer}\n\n"));
+                            }
+                            // 回传答案。失败说明 worker 线程已退出（极少见），忽略。
+                            let _ = ask.resp_tx.send(answer);
+                            // pending_ask 已被 take() 清空，下一次 Submit 走正常对话流程。
                         } else if cli_holder.is_some() && turn_rx.is_none() {
                             // Re-enter follow mode so the user sees new output.
                             scroll_offset = None;
