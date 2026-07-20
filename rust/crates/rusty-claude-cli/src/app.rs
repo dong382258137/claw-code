@@ -2147,13 +2147,12 @@ pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn st
 /// persistent_memory 不受影响（只是读一个 JSON 文件）。
 pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
     let t0 = std::time::Instant::now();
+    // load_and_freeze 内部已处理文件不存在的情况（返回空记忆），
+    // 始终构造 PersistentMemory 以启用 nudge → add_entry → persist 链路，
+    // 否则 memory.json 永远不会被创建（chicken-and-egg deadlock）。
     let persistent_memory = {
         let memory_path = cwd.join(".claw").join("memory.json");
-        if memory_path.exists() {
-            Some(runtime::PersistentMemory::load_and_freeze(&memory_path))
-        } else {
-            None
-        }
+        Some(runtime::PersistentMemory::load_and_freeze(&memory_path))
     };
     let t_mem = t0.elapsed();
 
@@ -2356,10 +2355,11 @@ pub(crate) fn build_runtime_with_plugin_state(
     // for the session — preserving the prompt-cache prefix.
     if let Ok(cwd) = env::current_dir() {
         let memory_path = cwd.join(".claw").join("memory.json");
-        if memory_path.exists() {
-            let memory = runtime::PersistentMemory::load_and_freeze(&memory_path);
-            runtime = runtime.with_persistent_memory(memory);
-        }
+        // load_and_freeze 内部已处理文件不存在的情况（返回空记忆），
+        // 始终注入 PersistentMemory 以启用 nudge → add_entry → persist 链路，
+        // 否则 memory.json 永远不会被创建（chicken-and-egg deadlock）。
+        let memory = runtime::PersistentMemory::load_and_freeze(&memory_path);
+        runtime = runtime.with_persistent_memory(memory);
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
