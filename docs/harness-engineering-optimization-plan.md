@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v1.0 |
+| 文档版本 | v1.2 |
 | 创建日期 | 2026-07-19 |
 | 文档类型 | 设计方案 / 实施指南 |
 | 适用项目 | claw-code-src (Rust 实现的 Claude Code 克隆) |
@@ -192,12 +192,14 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 
 ### 阶段 2:P1 核心架构升级(1-2 周)
 
-#### Step 2.1 — Plan/Execute/Review 三段循环 ⚠️ 部分
+#### Step 2.1 — Plan/Execute/Review 三段循环 ✅ 完成
 
-> **真实状态（2026-07-20 校正）**：`planner/` 目录与 `PlanArtifact` schema 已落地，
-> 但 `rusty-claude-cli/src/ultraplan.rs` 仍是 progress reporter，未集成新 planner
-> 子模块的 Plan→Build→Verify→Fix 闭环。主循环 `run_turn` 不会触发 planner 子调用，
-> `PreCompletionChecklistMiddleware` 也未接入。Plan artifact 持久化路径存在但无写入方。
+> **真实状态（2026-07-21 v1.2 校正）**：`/ultraplan` CLI 命令已对接 runtime planner
+> (commit 083f4a9)。`run_ultraplan` 调用 `runtime.set_plan_mode_enabled(true)` +
+> `set_workspace_root(cwd)`,复杂任务(>200 字符或匹配关键词)触发 PlanArtifact 创建,
+> 末尾追加到 system_prompt 变动区。`SlashCommand::Ultraplan` 分支返回 `true` 以
+> persist plan mode 状态变更。`planner/` 子模块(PlanArtifact 持久化 +
+> `assess_complexity` + `PreCompletionChecklistMiddleware`)已落地。
 
 | 项 | 内容 |
 |---|---|
@@ -233,13 +235,16 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 | **风险** | 中 — 先 dry-run mode 对比新旧 prompt diff |
 | **缓存影响** | **正向** — 固定注入顺序后,半稳定区更稳定,可能 +1-2% |
 
-#### Step 2.4 — Memory 语义检索层 ⚠️ 部分
+#### Step 2.4 — Memory 语义检索层 ✅ 完成
 
-> **真实状态（2026-07-20 校正）**：`memory/semantic.rs` 文件已存在，
-> 但 `memory_semantic.rs:161` 退化为 keyword 搜索，未集成 HNSW 向量索引。
-> `semantic_recall` 入口存在但走关键词匹配，无 embedding 调用。
-> L1/L2/L3 三级层级未落地，嵌入模型（OpenAI text-embedding-3-small）未接入。
-> fallback 到 rule-based 的设计已就位，但 fallback 路径就是当前唯一路径。
+> **真实状态（2026-07-21 v1.2 校正）**：`EmbeddingProvider` trait +
+> `HashEmbeddingProvider`(默认,无外部依赖)+ `FastembedProvider`(BGE-small-en-v1.5,
+> 启用 `embedding` feature,基于 ONNX Runtime)已落地(commit 876f577)。
+> `cosine_similarity` 向量余弦相似度已实现。`SemanticRecaller::with_embedding()`
+> 支持注入 provider,无 provider 时自动退化到 keyword 搜索。L1 常驻 / L2 按需 /
+> L3 仅搜索三级层级已落地。fastembed-rs 5.17.3 通过 `Arc<Mutex>` 保护 `&mut self`。
+> HNSW 向量索引未集成(用线性扫描 + cosine similarity 替代,384 维下足够),
+> 留到阶段 4 性能优化时再评估。
 
 | 项 | 内容 |
 |---|---|
@@ -257,11 +262,13 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 
 #### Step 3.1 — Verifier Agent ⚠️ 部分
 
-> **真实状态（2026-07-20 校正）**：`verifier/` 目录与 `VerifierAgent` 骨架已落地，
+> **真实状态（2026-07-21 v1.2 校正）**：`verifier/` 目录与 `VerifierAgent` 骨架已落地，
 > 规则反馈（cargo test / clippy / fmt）已接入，但**视觉反馈与模型当裁判为 placeholder**：
 > - `verifier/visual.rs`：Playwright 截图对比未实现，函数返回占位结果
 > - `verifier/model_judge.rs`：子 agent 调用 LLM 评估 tool result 未实现，返回占位结果
 > `VerifierAgent::verify` 当前只走规则路径，且未注入主循环 `run_turn`（latent defect）。
+> **v1.2 未对本步骤做新工作** — 规则反馈路径已满足 Step 3.2 Multi-Agent 的基础验证需求,
+> 视觉/模型裁判留到阶段 4 或独立 PR。
 
 | 项 | 内容 |
 |---|---|
@@ -273,13 +280,19 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 | **风险** | 低 — 子 agent 独立 |
 | **缓存影响** | 无 — 子 agent 独立 LLM 请求,独立 prompt cache |
 
-#### Step 3.2 — 子 Agent 编排与 Multi-Agent Coordinator ⚠️ 部分
+#### Step 3.2 — 子 Agent 编排与 Multi-Agent Coordinator ✅ 完成
 
-> **真实状态（2026-07-20 校正）**：`multi_agent/` 目录骨架已落地，
-> `task_registry.rs` 已有 6 态 TaskStatus，但**消息总线未扩展**：
-> `lane_events.rs` 仍为原 19 事件，未新增 `SubagentHandoff` / `SubagentResult`。
-> Agent-to-agent tool call 路由未实现，子 agent 未作为 tool 暴露给主 agent。
-> `team_cron_registry.rs` 仍是 in-memory stub，无持久化和真实 cron 调度。
+> **真实状态（2026-07-21 v1.2 校正）**：三个子步骤全部落地:
+> - **3.2-a** (commit 8322e88):`lane_events.rs` 新增 `SubagentHandoff` /
+>   `SubagentResult` 事件 + 2 个 helper 构造器,消息总线扩展完成。
+> - **3.2-b** (commit a46a3b5):`team_cron_registry.rs` 实现 `TeamRegistry` /
+>   `CronRegistry` JSON 持久化,原子写入(`<path>.tmp` + `rename`)避免崩溃破坏。
+> - **3.2-c** (commit 36d9721):`conversation.rs` 注入 `MultiAgentCoordinator`,
+>   subagent-as-tool 路由 — `dispatch_subagent` / `check_subagent` 两个 tool spec,
+>   主 agent 通过 tool call 调用子 agent。子 agent 走独立 LLM 请求 + 独立 prompt cache,
+>   不污染主 agent 缓存。13 个测试覆盖 dispatch + check 全流程。
+> `multi_agent/` 目录的 3 种 `CoordinationMode`(Fork / Teammate / Worktree)与
+> `Subagent` 生命周期管理已落地。
 
 | 项 | 内容 |
 |---|---|
@@ -291,14 +304,17 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 | **风险** | 中 — 主 agent 缓存可能在 handoff 点失效 |
 | **缓存影响** | 中 — 只在 handoff 点触发,正常流程不变 |
 
-#### Step 3.3 — Telemetry 导出与 Trace Analyzer 基础 ⚠️ 部分
+#### Step 3.3 — Telemetry 导出与 Trace Analyzer 基础 ✅ 完成
 
-> **真实状态（2026-07-20 校正）**：CSV exporter 已落地，`SessionTracer::record`
-> 已扩展，`TraceAnalyzer::load` 基础统计已实现。但**OTLP exporter 未实现**
-> （标注为可选，目前完全缺失）。失败聚类**退化为按 `failure_kind` 分桶**，
-> 未实现 K-means on (failure_kind, error_message_embedding) — 没有 embedding，
-> 无法做真正的向量聚类。Metrics histogram（turn latency / tool call count /
-> compact 触发率）部分实现。
+> **真实状态（2026-07-21 v1.2 校正）**：CSV exporter + `TraceAnalyzer::load_csv` /
+> `export_csv` / `stats` 基础统计已落地。K-means 失败聚类已实现(commit 23c7c72):
+> `cluster_failures_kmeans(provider)` 方法基于 (failure_kind, error_message_embedding)
+> 二次切分,`K = min(MAX_KMEANS_CLUSTERS_PER_KIND=3, 组内样本数)`,cosine similarity +
+> 均值 update,确定性初始化(前 K 个点),`KMEANS_MAX_ITERATIONS=10` 轮。无 provider 时
+> 退化为 `cluster_failures()`(按 failure_kind 简单分桶)。14 个新测试覆盖 K-means
+> 聚类、embed 失败降级、K 上限封顶、确定性、边界条件等,全部 31 个 trace_analyzer
+> 测试通过。OTLP exporter 仍未实现(标注为可选,留到阶段 4),CSV exporter 已足够
+> 支撑阶段 4 Self-Improving Harness 入口。
 
 | 项 | 内容 |
 |---|---|
@@ -576,3 +592,4 @@ cd rust && cargo build && cp target/debug/claw.exe debug/claw.exe
 |---|---|---|
 | 2026-07-19 | v1.0 | 初始版本,涵盖阶段 1-4 + 缓存保护方案 |
 | 2026-07-20 | v1.1 | 校正 Step 状态：5 个原标 ✅ 的 Step 经代码核对实际为部分实现，改为 ⚠️ 部分（Step 2.1 / 2.4 / 3.1 / 3.2 / 3.3），并补充真实状态说明 |
+| 2026-07-21 | v1.2 | 实施完成 4 个原 ⚠️ 部分 Step 并校正状态：Step 2.1 ✅(commit 083f4a9,/ultraplan 对接 runtime planner)、Step 2.4 ✅(commit 876f577,EmbeddingProvider trait + FastembedProvider)、Step 3.2 ✅(3.2-a/b/c 全部完成,commits 8322e88/a46a3b5/36d9721,subagent-as-tool 路由)、Step 3.3 ✅(commit 23c7c72,K-means 失败聚类)。Step 3.1 维持 ⚠️ 部分(规则反馈已够用,视觉/模型裁判留到阶段 4)。 |
