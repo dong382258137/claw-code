@@ -107,6 +107,13 @@ pub(crate) enum CliAction {
     Acp {
         output_format: CliOutputFormat,
     },
+    /// `claw acp serve`:启动 stdio ACP 服务器,通过 stdin/stdout 与外部
+    /// ACP 客户端(Zed / VS Code 等)通信。阻塞调用,直到 stdin EOF 或 cancel。
+    AcpServe {
+        model: String,
+        permission_mode: PermissionMode,
+        output_format: CliOutputFormat,
+    },
     State {
         output_format: CliOutputFormat,
     },
@@ -605,7 +612,12 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
-        "acp" => parse_acp_args(&rest[1..], output_format),
+        "acp" => parse_acp_args(
+            &rest[1..],
+            model.clone(),
+            permission_mode_override,
+            output_format,
+        ),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
@@ -826,10 +838,22 @@ pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
     )
 }
 
-pub(crate) fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+pub(crate) fn parse_acp_args(
+    args: &[String],
+    model: String,
+    permission_mode_override: Option<PermissionMode>,
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
     match args {
+        // `claw acp` / `claw --acp` / `claw -acp`:仅打印状态(向后兼容)
         [] => Ok(CliAction::Acp { output_format }),
-        [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
+        // `claw acp serve`:启动 stdio ACP 服务器
+        [subcommand] if subcommand == "serve" => Ok(CliAction::AcpServe {
+            model,
+            permission_mode,
+            output_format,
+        }),
         _ => Err(String::from(
             "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
         )),

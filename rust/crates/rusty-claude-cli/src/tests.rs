@@ -1343,7 +1343,9 @@ fn parses_acp_command_surfaces() {
     );
     assert_eq!(
         parse_args(&["acp".to_string(), "serve".to_string()]).expect("acp serve should parse"),
-        CliAction::Acp {
+        CliAction::AcpServe {
+            model: DEFAULT_MODEL.to_string(),
+            permission_mode: default_permission_mode(),
             output_format: CliOutputFormat::Text,
         }
     );
@@ -1367,7 +1369,9 @@ fn parses_acp_command_surfaces() {
             "json".to_string()
         ])
         .expect("acp serve json should parse"),
-        CliAction::Acp {
+        CliAction::AcpServe {
+            model: DEFAULT_MODEL.to_string(),
+            permission_mode: default_permission_mode(),
             output_format: CliOutputFormat::Json,
         }
     );
@@ -1377,23 +1381,26 @@ fn parses_acp_command_surfaces() {
 }
 
 #[test]
-fn acp_status_json_is_truthful_unsupported_contract() {
+fn acp_status_json_reflects_stdio_server_contract() {
     let value = acp_status_json();
-    assert_eq!(value["schema_version"], "1.0");
+    assert_eq!(value["schema_version"], "1.1");
     assert_eq!(value["kind"], "acp");
-    assert_eq!(value["status"], "unsupported");
-    assert_eq!(value["phase"], "discoverability_only");
-    assert_eq!(value["supported"], false);
+    assert_eq!(value["status"], "supported");
+    assert_eq!(value["phase"], "stdio_server");
+    assert_eq!(value["supported"], true);
     assert_eq!(value["exit_code"], 0);
-    assert_eq!(value["serve_alias_only"], true);
-    assert_eq!(value["protocol"]["json_rpc"], false);
+    assert_eq!(value["serve_alias_only"], false);
+    assert_eq!(value["launch_command"], "claw acp serve");
+    assert_eq!(value["protocol"]["json_rpc"], true);
+    assert_eq!(value["protocol"]["transport"], "newline_delimited_json");
     assert_eq!(value["protocol"]["daemon"], false);
+    assert_eq!(value["protocol"]["endpoint"], "stdio");
     assert_eq!(value["protocol"]["serve_starts_daemon"], false);
-    assert!(value["protocol"]["endpoint"].is_null());
     assert_eq!(
         value["contracts"]["unsupported_invocation_kind"],
         "unsupported_acp_invocation"
     );
+    assert_eq!(value["contracts"]["serve_subcommand"], "claw acp serve");
 }
 
 #[test]

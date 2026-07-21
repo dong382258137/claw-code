@@ -1,0 +1,26 @@
+[package]
+name = "claw-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "ACP shell layer: spawns the claw agent runtime and exposes it via ACP channels"
+
+[dependencies]
+claw-acp = { path = "../claw-acp" }
+runtime = { path = "../runtime" }
+agent-client-protocol = { version = "0.10.4", features = ["unstable"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

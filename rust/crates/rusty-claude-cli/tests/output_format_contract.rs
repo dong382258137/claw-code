@@ -124,25 +124,26 @@ fn acp_guidance_emits_json_when_requested() {
 
     let acp = assert_json_command(&root, &["--output-format", "json", "acp"]);
     assert_eq!(acp["kind"], "acp");
-    assert_eq!(acp["schema_version"], "1.0");
-    assert_eq!(acp["status"], "unsupported");
-    assert_eq!(acp["phase"], "discoverability_only");
-    assert_eq!(acp["supported"], false);
+    assert_eq!(acp["schema_version"], "1.1");
+    assert_eq!(acp["status"], "supported");
+    assert_eq!(acp["phase"], "stdio_server");
+    assert_eq!(acp["supported"], true);
     assert_eq!(acp["exit_code"], 0);
-    assert_eq!(acp["serve_alias_only"], true);
-    assert_eq!(acp["protocol"]["json_rpc"], false);
-    assert_eq!(acp["protocol"]["daemon"], false);
-    assert!(acp["protocol"]["endpoint"].is_null());
+    assert_eq!(acp["serve_alias_only"], false);
+    assert_eq!(acp["protocol"]["json_rpc"], true);
+    assert_eq!(acp["protocol"]["transport"], "newline_delimited_json");
+    assert_eq!(acp["protocol"]["endpoint"], "stdio");
+    assert_eq!(acp["protocol"]["version"], 1);
+    assert_eq!(acp["launch_command"], "claw acp serve");
     assert_eq!(
         acp["contracts"]["unsupported_invocation_kind"],
         "unsupported_acp_invocation"
     );
-    assert_eq!(acp["discoverability_tracking"], "ROADMAP #64a");
     assert_eq!(acp["tracking"], "ROADMAP #76 / #3033 / #3004");
     assert!(acp["message"]
         .as_str()
         .expect("acp message")
-        .contains("discoverability alias"));
+        .contains("stdio ACP"));
 }
 
 #[test]

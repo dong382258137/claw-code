@@ -656,13 +656,14 @@ pub(crate) fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          /doctor · claw --resume latest /doctor"
             .to_string(),
-        LocalHelpTopic::Acp => "ACP / Zed
+        LocalHelpTopic::Acp => "ACP (Agent Client Protocol)
   Usage            claw acp [serve] [--output-format <format>]
   Aliases          claw --acp · claw -acp
-  Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
-  Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
+  Purpose          `claw acp serve` starts a stdio ACP JSON-RPC server for editor integration
+  Status           supported (stdio server, newline-delimited JSON-RPC over stdin/stdout)
+  Connect          spawn `claw acp serve` as the agent process from ACP-compatible editors (Zed, etc.)
   Formats          text (default), json
-  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
+  Related          claw status · claw doctor · claw --help"
             .to_string(),
         LocalHelpTopic::Init => "Init
   Usage            claw init [--output-format <format>]
@@ -806,40 +807,42 @@ pub(crate) fn print_help_topic(
 }
 
 pub(crate) fn acp_status_message() -> &'static str {
-    "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon, JSON-RPC endpoint, or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support."
+    "`claw acp serve` launches a stdio ACP (Agent Client Protocol) JSON-RPC server. \
+     Connect from ACP-compatible editors (Zed, VS Code extensions, etc.) by spawning \
+     `claw acp serve` as the editor's agent process; it speaks newline-delimited JSON-RPC \
+     over stdin/stdout and supports initialize/authenticate/new_session/prompt. \
+     `claw acp` (without `serve`) prints this status surface only."
 }
 
 pub(crate) fn acp_status_json() -> serde_json::Value {
     json!({
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "kind": "acp",
-        "status": "unsupported",
-        "phase": "discoverability_only",
-        "supported": false,
+        "status": "supported",
+        "phase": "stdio_server",
+        "supported": true,
         "exit_code": 0,
-        "serve_alias_only": true,
+        "serve_alias_only": false,
         "message": acp_status_message(),
-        "launch_command": serde_json::Value::Null,
+        "launch_command": "claw acp serve",
         "protocol": {
-            "name": "ACP/Zed",
-            "json_rpc": false,
+            "name": "ACP",
+            "version": 1,
+            "json_rpc": true,
+            "transport": "newline_delimited_json",
             "daemon": false,
-            "endpoint": serde_json::Value::Null,
+            "endpoint": "stdio",
             "serve_starts_daemon": false
         },
         "contracts": {
-            "blocking_gates": [
-                "task_packet_schema",
-                "session_control_schema",
-                "event_report_schema"
-            ],
             "stable_status_surface": "claw acp [serve] --output-format json",
-            "unsupported_invocation_kind": "unsupported_acp_invocation"
+            "unsupported_invocation_kind": "unsupported_acp_invocation",
+            "serve_subcommand": "claw acp serve"
         },
         "aliases": ["acp", "--acp", "-acp"],
-        "discoverability_tracking": "ROADMAP #64a",
         "tracking": "ROADMAP #76 / #3033 / #3004",
         "recommended_workflows": [
+            "claw acp serve",
             "claw prompt TEXT",
             "claw",
             "claw doctor"
@@ -851,7 +854,7 @@ pub(crate) fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box
     match output_format {
         CliOutputFormat::Text => {
             println!(
-                "ACP / Zed\n  Status           unsupported (discoverability only)\n  Exit code        0 for status queries; unsupported invocations exit 1\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon or JSON-RPC endpoint is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76 / #3033 / #3004\n  Message          {}",
+                "ACP (Agent Client Protocol)\n  Status           supported (stdio server)\n  Transport        newline-delimited JSON-RPC over stdin/stdout\n  Protocol version 1\n  Launch           `claw acp serve` starts the stdio ACP server\n  Status surface   `claw acp` / `claw --acp` / `claw -acp` print this report\n  Connect          spawn `claw acp serve` from ACP-compatible editors (Zed, etc.)\n  Today            use `claw prompt`, the REPL, or `claw doctor` for non-ACP workflows\n  Tracking         ROADMAP #76 / #3033 / #3004\n  Message          {}",
                 acp_status_message()
             );
         }
@@ -1756,7 +1759,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw acp [serve]")?;
     writeln!(
         out,
-        "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
+        "      `claw acp serve` starts a stdio ACP JSON-RPC server for editor integration; aliases: --acp, -acp"
     )?;
     writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
     writeln!(
