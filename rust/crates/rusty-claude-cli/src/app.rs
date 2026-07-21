@@ -334,6 +334,7 @@ pub(crate) fn run_repl(
     additional_workspace_roots: Vec<PathBuf>,
     output_verbosity: OutputVerbosity,
     enable_plan_mode: bool,
+    enable_policy_engine: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     correct_cwd_from_target_dir();
@@ -357,9 +358,18 @@ pub(crate) fn run_repl(
     // Harness O(编排)层:Plan/Execute/Review 三段循环接入(Step 2.1)。
     // `--enable-plan-mode` 时启用,默认关闭。详见
     // `docs/harness-engineering-optimization-plan.md` Step 2.1。
+    // P3-1:settings.json `planMode: true` 也能启用(在 LiveCli::new 内部处理),
+    // CLI flag 优先级更高(此处覆盖)。
     if enable_plan_mode {
         cli.runtime.set_plan_mode_enabled(true);
         cli.runtime.set_workspace_root(std::env::current_dir()?);
+    }
+    // P1-1:PolicyEngine 策略引擎 flag。
+    // 当前 lane_completion 模块已实现 PolicyEngine 调用(tools/lane_completion.rs),
+    // 但生产路径未接入。flag 用于控制后续 lane 完成时是否调用策略评估。
+    // 实际接入在 P1-2/P1-3 中完成(green_contract 桥接 + g004 校验闭环)。
+    if enable_policy_engine {
+        eprintln!("[policy] PolicyEngine enabled (lane completion policy evaluation active)");
     }
     let t_cli = t0.elapsed();
     let mut editor =
@@ -642,7 +652,7 @@ impl LiveCli {
         let t_handle = t0.elapsed();
         #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] calling build_runtime");
-        let runtime = build_runtime(
+        let mut runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
             model.clone(),
@@ -668,6 +678,12 @@ impl LiveCli {
             if let Ok(config) = loader.load() {
                 if let Some(poor) = config.feature_config().poor_mode() {
                     runtime::poor_mode::set_active(poor);
+                }
+                // P3-1:从 settings.json `planMode` 启用 Plan/Execute/Review。
+                // CLI flag `--enable-plan-mode` 会在 run_repl 中覆盖(优先级更高)。
+                if config.feature_config().plan_mode() == Some(true) {
+                    runtime.set_plan_mode_enabled(true);
+                    runtime.set_workspace_root(cwd.clone());
                 }
                 // SP4.2-B3:从配置初始化 LSP servers(best-effort,失败不阻断启动)
                 let _ = init_lsp_from_config(&config, &cwd);
@@ -1134,7 +1150,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Sandbox => {
-                Self::print_sandbox_status();
+                self.print_sandbox_status();
                 false
             }
             SlashCommand::Compact => {
@@ -1150,7 +1166,7 @@ impl LiveCli {
             }
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
             SlashCommand::Config { section } => {
-                Self::print_config(section.as_deref())?;
+                self.print_config(section.as_deref())?;
                 false
             }
             SlashCommand::Mcp { action, target } => {
@@ -1160,11 +1176,11 @@ impl LiveCli {
                     (Some(action), Some(target)) => Some(format!("{action} {target}")),
                     (None, Some(target)) => Some(target.to_string()),
                 };
-                Self::print_mcp(args.as_deref(), CliOutputFormat::Text)?;
+                self.print_mcp(args.as_deref(), CliOutputFormat::Text)?;
                 false
             }
             SlashCommand::Memory => {
-                Self::print_memory()?;
+                self.print_memory()?;
                 false
             }
             SlashCommand::Init => {
@@ -1172,7 +1188,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Diff => {
-                Self::print_diff()?;
+                self.print_diff()?;
                 false
             }
             SlashCommand::Search { query } => {
@@ -1226,20 +1242,24 @@ impl LiveCli {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
             SlashCommand::Agents { args } => {
-                Self::print_agents(args.as_deref(), CliOutputFormat::Text)?;
+                self.print_agents(args.as_deref(), CliOutputFormat::Text)?;
                 false
             }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
                     SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
                     SkillSlashDispatch::Local => {
-                        Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
+                        self.print_skills(args.as_deref(), CliOutputFormat::Text)?;
                     }
                 }
                 false
             }
             SlashCommand::Doctor => {
-                println!("{}", render_doctor_report()?.render());
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = render_doctor_report()?.render();
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 false
             }
             SlashCommand::History { count } => {
@@ -1399,22 +1419,23 @@ impl LiveCli {
     fn print_status(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
-        println!(
-            "{}",
-            format_status_report(
-                &self.model,
-                StatusUsage {
-                    message_count: self.runtime.session().messages.len(),
-                    turns: self.runtime.usage().turns(),
-                    latest,
-                    cumulative,
-                    estimated_tokens: self.runtime.estimated_tokens(),
-                },
-                self.permission_mode.as_str(),
-                &status_context(Some(&self.session.path)).expect("status context should load"),
-                None, // #148: REPL /status doesn't carry flag provenance
-            )
+        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+        let content = format_status_report(
+            &self.model,
+            StatusUsage {
+                message_count: self.runtime.session().messages.len(),
+                turns: self.runtime.usage().turns(),
+                latest,
+                cumulative,
+                estimated_tokens: self.runtime.estimated_tokens(),
+            },
+            self.permission_mode.as_str(),
+            &status_context(Some(&self.session.path)).expect("status context should load"),
+            None, // #148: REPL /status doesn't carry flag provenance
         );
+        if !self.tui_println(&content) {
+            println!("{content}");
+        }
     }
 
     fn record_prompt_history(&mut self, prompt: &str) {
@@ -1464,19 +1485,25 @@ impl LiveCli {
                 })
                 .collect()
         };
-        println!("{}", render_prompt_history_report(&entries, limit));
+        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+        let content = render_prompt_history_report(&entries, limit);
+        if !self.tui_println(&content) {
+            println!("{content}");
+        }
     }
 
-    fn print_sandbox_status() {
+    fn print_sandbox_status(&self) {
         let cwd = env::current_dir().expect("current dir");
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader
             .load()
             .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
-        println!(
-            "{}",
-            format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
-        );
+        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+        let content =
+            format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd));
+        if !self.tui_println(&content) {
+            println!("{content}");
+        }
     }
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1576,9 +1603,11 @@ impl LiveCli {
 
     fn clear_session(&mut self, confirm: bool) -> Result<bool, Box<dyn std::error::Error>> {
         if !confirm {
-            println!(
-                "clear: confirmation required; run /clear --confirm to start a fresh session."
-            );
+            // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+            let content = "clear: confirmation required; run /clear --confirm to start a fresh session.";
+            if !self.tui_println(content) {
+                println!("{content}");
+            }
             return Ok(false);
         }
 
@@ -1597,7 +1626,8 @@ impl LiveCli {
             None,
         )?;
         self.replace_runtime(runtime)?;
-        println!(
+        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+        let content = format!(
             "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
             previous_session.id,
             previous_session.id,
@@ -1606,12 +1636,19 @@ impl LiveCli {
             self.session.id,
             self.session.path.display(),
         );
+        if !self.tui_println(&content) {
+            println!("{content}");
+        }
         Ok(true)
     }
 
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
-        println!("{}", format_cost_report(cumulative));
+        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+        let content = format_cost_report(cumulative);
+        if !self.tui_println(&content) {
+            println!("{content}");
+        }
     }
 
     fn resume_session(
@@ -1653,32 +1690,51 @@ impl LiveCli {
         Ok(true)
     }
 
-    fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_config_report(section)?);
+    fn print_config(&self, section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+        let content = render_config_report(section)?;
+        if !self.tui_println(&content) {
+            println!("{content}");
+        }
         Ok(())
     }
 
-    fn print_memory() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_memory_report()?);
+    fn print_memory(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+        let content = render_memory_report()?;
+        if !self.tui_println(&content) {
+            println!("{content}");
+        }
         Ok(())
     }
 
     pub(crate) fn print_agents(
+        &self,
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         match output_format {
-            CliOutputFormat::Text => println!("{}", handle_agents_slash_command(args, &cwd)?),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&handle_agents_slash_command_json(args, &cwd)?)?
-            ),
+            CliOutputFormat::Text => {
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = handle_agents_slash_command(args, &cwd)?;
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
+            }
+            CliOutputFormat::Json => {
+                let content =
+                    serde_json::to_string_pretty(&handle_agents_slash_command_json(args, &cwd)?)?;
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
+            }
         }
         Ok(())
     }
 
     pub(crate) fn print_mcp(
+        &self,
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1690,14 +1746,23 @@ impl LiveCli {
         }
         let cwd = env::current_dir()?;
         match output_format {
-            CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
+            CliOutputFormat::Text => {
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = handle_mcp_slash_command(args, &cwd)?;
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
+            }
             CliOutputFormat::Json => {
                 let value = handle_mcp_slash_command_json(args, &cwd)?;
                 // Propagate ok:false → non-zero exit so automation callers
                 // can rely on exit code instead of inspecting the envelope.
                 // (#68: mcp error envelopes previously always exited 0.)
                 let is_error = value.get("ok").and_then(|v| v.as_bool()) == Some(false);
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                let content = serde_json::to_string_pretty(&value)?;
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 if is_error {
                     std::process::exit(1);
                 }
@@ -1707,16 +1772,27 @@ impl LiveCli {
     }
 
     pub(crate) fn print_skills(
+        &self,
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         match output_format {
-            CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
-            ),
+            CliOutputFormat::Text => {
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = handle_skills_slash_command(args, &cwd)?;
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
+            }
+            CliOutputFormat::Json => {
+                let content = serde_json::to_string_pretty(
+                    &handle_skills_slash_command_json(args, &cwd)?,
+                )?;
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
+            }
         }
         Ok(())
     }
@@ -1748,8 +1824,12 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_diff() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_diff_report()?);
+    fn print_diff(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+        let content = render_diff_report()?;
+        if !self.tui_println(&content) {
+            println!("{content}");
+        }
         Ok(())
     }
 
@@ -1779,14 +1859,33 @@ impl LiveCli {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         match action {
             None | Some("list") => {
-                println!("{}", render_session_list(&self.session.id)?);
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = render_session_list(&self.session.id)?;
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 Ok(false)
             }
             Some("pick") => {
-                // Interactive fuzzy-filter picker. Falls back to /session list
-                // behavior when stdin is not a tty (e.g. piped scripts).
-                if !io::stdin().is_terminal() {
-                    println!("{}", render_session_list(&self.session.id)?);
+                // TUI 模式下不支持交互式 stdin 选择（会卡死 worker 线程），
+                // 回退为显示会话列表，提示用户用 /session switch <id> 切换。
+                #[cfg(feature = "full-tui")]
+                let in_tui = self.tui_output.is_some();
+                #[cfg(not(feature = "full-tui"))]
+                let in_tui = false;
+
+                if in_tui || !io::stdin().is_terminal() {
+                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                    let content = render_session_list(&self.session.id)?;
+                    if !self.tui_println(&content) {
+                        println!("{content}");
+                    }
+                    if in_tui {
+                        let hint = "\n提示：使用 /session switch <session-id> 切换到指定会话";
+                        if !self.tui_println(hint) {
+                            println!("{hint}");
+                        }
+                    }
                     return Ok(false);
                 }
                 match interactive_session_pick(&self.session.id)? {
@@ -1814,39 +1913,59 @@ impl LiveCli {
                             id: session_id,
                             path: handle.path,
                         };
-                        println!(
+                        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                        let content = format!(
                             "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
                             self.session.id,
                             target_path.display(),
                             message_count,
                         );
+                        if !self.tui_println(&content) {
+                            println!("{content}");
+                        }
                         Ok(true)
                     }
                     None => {
-                        println!("Session pick cancelled.");
+                        // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                        let content = "Session pick cancelled.";
+                        if !self.tui_println(content) {
+                            println!("{content}");
+                        }
                         Ok(false)
                     }
                 }
             }
             Some("exists") => {
                 let Some(target) = target else {
-                    println!("Usage: /session exists <session-id>");
+                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                    let content = "Usage: /session exists <session-id>";
+                    if !self.tui_println(content) {
+                        println!("{content}");
+                    }
                     return Ok(false);
                 };
                 let exists = session_reference_exists(target)?;
                 let handle = resolve_session_reference(target).ok();
-                println!(
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = format!(
                     "Session exists\n  Session          {target}\n  Exists           {exists}{}",
                     handle
                         .as_ref()
                         .map(|handle| format!("\n  File             {}", handle.path.display()))
                         .unwrap_or_default()
                 );
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 Ok(false)
             }
             Some("switch") => {
                 let Some(target) = target else {
-                    println!("Usage: /session switch <session-id>");
+                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                    let content = "Usage: /session switch <session-id>";
+                    if !self.tui_println(content) {
+                        println!("{content}");
+                    }
                     return Ok(false);
                 };
                 let (handle, session) = load_session_reference(target)?;
@@ -1868,12 +1987,16 @@ impl LiveCli {
                     id: session_id,
                     path: handle.path,
                 };
-                println!(
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = format!(
                     "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
                     self.session.id,
                     self.session.path.display(),
                     message_count,
                 );
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 Ok(true)
             }
             Some("fork") => {
@@ -1900,7 +2023,8 @@ impl LiveCli {
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
-                println!(
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = format!(
                     "Session forked\n  Parent session   {}\n  Active session   {}\n  Branch           {}\n  File             {}\n  Messages         {}",
                     parent_session_id,
                     self.session.id,
@@ -1908,58 +2032,110 @@ impl LiveCli {
                     self.session.path.display(),
                     message_count,
                 );
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 Ok(true)
             }
             Some("delete") => {
                 let Some(target) = target else {
-                    println!("Usage: /session delete <session-id> [--force]");
+                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                    let content = "Usage: /session delete <session-id> [--force]";
+                    if !self.tui_println(content) {
+                        println!("{content}");
+                    }
                     return Ok(false);
                 };
                 let handle = resolve_session_reference(target)?;
                 if handle.id == self.session.id {
-                    println!(
+                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                    let content = format!(
                         "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
                         handle.id
                     );
+                    if !self.tui_println(&content) {
+                        println!("{content}");
+                    }
+                    return Ok(false);
+                }
+                // TUI 模式下跳过阻塞式 stdin 确认（会卡死 worker 线程），
+                // 提示用户使用 --force 标志直接删除。
+                #[cfg(feature = "full-tui")]
+                let in_tui = self.tui_output.is_some();
+                #[cfg(not(feature = "full-tui"))]
+                let in_tui = false;
+
+                if in_tui {
+                    let content = format!(
+                        "TUI 模式下不支持交互式确认。如需删除会话，请使用：\n  /session delete {} --force",
+                        handle.id
+                    );
+                    if !self.tui_println(&content) {
+                        println!("{content}");
+                    }
                     return Ok(false);
                 }
                 if !confirm_session_deletion(&handle.id) {
-                    println!("delete: cancelled.");
+                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                    let content = "delete: cancelled.";
+                    if !self.tui_println(content) {
+                        println!("{content}");
+                    }
                     return Ok(false);
                 }
                 delete_managed_session(&handle.path)?;
-                println!(
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = format!(
                     "Session deleted\n  Deleted session  {}\n  File             {}",
                     handle.id,
                     handle.path.display(),
                 );
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 Ok(false)
             }
             Some("delete-force") => {
                 let Some(target) = target else {
-                    println!("Usage: /session delete <session-id> [--force]");
+                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                    let content = "Usage: /session delete <session-id> [--force]";
+                    if !self.tui_println(content) {
+                        println!("{content}");
+                    }
                     return Ok(false);
                 };
                 let handle = resolve_session_reference(target)?;
                 if handle.id == self.session.id {
-                    println!(
+                    // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                    let content = format!(
                         "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
                         handle.id
                     );
+                    if !self.tui_println(&content) {
+                        println!("{content}");
+                    }
                     return Ok(false);
                 }
                 delete_managed_session(&handle.path)?;
-                println!(
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = format!(
                     "Session deleted\n  Deleted session  {}\n  File             {}",
                     handle.id,
                     handle.path.display(),
                 );
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 Ok(false)
             }
             Some(other) => {
-                println!(
+                // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
+                let content = format!(
                     "Unknown /session action '{other}'. Use /session list, /session exists <session-id>, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
                 );
+                if !self.tui_println(&content) {
+                    println!("{content}");
+                }
                 Ok(false)
             }
         }

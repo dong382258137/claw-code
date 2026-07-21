@@ -845,8 +845,13 @@ fn run_event_loop(
                     .saturating_sub(1);
                 let actual_height = menu_height.min(available_above);
                 if actual_height > 0 {
-                    if let Some(query) = input.menu_query() {
-                        menu.set_query(&query);
+                    // 根据层级选 query：Sub 用 sub_menu_query（空格后内容）
+                    let query = match menu.level() {
+                        crate::tui::slash_menu::MenuLevel::Sub => input.sub_menu_query(),
+                        crate::tui::slash_menu::MenuLevel::Top => input.menu_query(),
+                    };
+                    if let Some(q) = query {
+                        menu.set_query(&q);
                     }
                     let menu_area = Rect {
                         x: outer[1].x,
@@ -1655,18 +1660,56 @@ fn run_event_loop(
                     InputAction::MenuUp => menu.move_up(),
                     InputAction::MenuDown => menu.move_down(),
                     InputAction::MenuAccept => {
-                        // Fill the input buffer with the selected command, then
-                        // close the menu so the next Enter submits it. This
-                        // gives the "select → Enter fills → Enter sends" UX:
-                        // the user can review the completed command before
-                        // sending, or edit it (e.g., add args to /search).
-                        if let Some(spec) = menu.selected_spec() {
-                            let completion = format!("/{}", spec.name);
-                            input.accept_menu_completion(&completion);
+                        // 二级菜单支持：根据当前层级分叉
+                        match menu.level() {
+                            crate::tui::slash_menu::MenuLevel::Sub => {
+                                // Sub 层级：选中子选项，拼成 `父+子` 填入 buffer
+                                if let (Some(parent), Some(sub)) =
+                                    (menu.parent_name(), menu.selected_sub_option())
+                                {
+                                    // 子选项需要额外参数：填到空格后等用户手敲
+                                    // 不需要参数：填入后等用户 Enter 提交
+                                    let completion = if sub.requires_arg {
+                                        format!("/{parent} {} ", sub.value)
+                                    } else {
+                                        format!("/{parent} {}", sub.value)
+                                    };
+                                    input.accept_menu_completion(&completion);
+                                    menu.exit_sub_menu();
+                                }
+                            }
+                            crate::tui::slash_menu::MenuLevel::Top => {
+                                // Top 层级：选中父命令
+                                // 若有子选项 → 进入二级菜单
+                                // 若无子选项 → 填入 buffer 等用户 Enter
+                                if let Some(spec) = menu.selected_spec() {
+                                    let name_static: &'static str = spec.name;
+                                    if menu.enter_sub_menu(name_static) {
+                                        // 进入二级菜单：菜单保持打开显示子选项。
+                                        // buffer 设为 `/parent `，用户可直接输入参数
+                                        // 或用上下键选子选项后 Enter。
+                                        // 不调用 accept_menu_completion（那会 menu_locked），
+                                        // 而是手动设 buffer+关闭一级菜单显示。
+                                        input.set_buffer_for_sub_menu(&format!("/{name_static} "));
+                                        // 关键：menu_open 保持 true，渲染层会根据
+                                        // menu.level()=Sub 显示二级菜单而非一级。
+                                    } else {
+                                        // 无子选项：填入命令名，等用户 Enter
+                                        let completion = format!("/{}", spec.name);
+                                        input.accept_menu_completion(&completion);
+                                    }
+                                }
+                            }
                         }
                     }
                     InputAction::CloseMenu => {
                         // menu state already updated in input.handle_key
+                        // Sub 层级下 Esc 返回 Top，不直接关闭菜单
+                        if menu.level() == crate::tui::slash_menu::MenuLevel::Sub {
+                            menu.exit_sub_menu();
+                            // 同时清空 buffer 中的 `/parent ` 让用户重新选
+                            input.reset();
+                        }
                     }
                     InputAction::Continue | InputAction::Ignore => {}
                 }
@@ -1940,6 +1983,13 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
 }
 
 fn render_menu(menu: &mut SlashMenu, f: &mut ratatui::Frame, area: Rect) {
+    match menu.level() {
+        crate::tui::slash_menu::MenuLevel::Sub => render_sub_menu(menu, f, area),
+        crate::tui::slash_menu::MenuLevel::Top => render_top_menu(menu, f, area),
+    }
+}
+
+fn render_top_menu(menu: &mut SlashMenu, f: &mut ratatui::Frame, area: Rect) {
     let visible = menu.visible_window();
     let selected_idx = menu.selected_index();
     let scroll = menu.scroll_offset();
@@ -1969,6 +2019,64 @@ fn render_menu(menu: &mut SlashMenu, f: &mut ratatui::Frame, area: Rect) {
         "命令 ({}/{})",
         menu.total_count(),
         menu.all_items_count()
+    ));
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
+}
+
+/// 二级菜单渲染：显示父命令的子选项列表。
+/// 每行格式：`  值  中文标签  [参数提示]`
+fn render_sub_menu(menu: &mut SlashMenu, f: &mut ratatui::Frame, area: Rect) {
+    let visible = menu.sub_visible_window();
+    let selected_idx = menu.sub_selected_index();
+    let scroll = menu.sub_scroll_offset();
+    let parent = menu.parent_name().unwrap_or("");
+
+    let lines: Vec<Line> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            let abs_idx = scroll + i;
+            let is_selected = Some(abs_idx) == selected_idx;
+            // 格式：`  list  列出所有...  [需参数: 服务器名]`
+            let mut spans = vec![Span::raw("  ")];
+            spans.push(Span::styled(
+                format!("{:<12}", opt.value),
+                Style::default().fg(Color::Yellow),
+            ));
+            spans.push(Span::raw("  "));
+            spans.push(Span::raw(opt.label));
+            if opt.requires_arg {
+                if let Some(hint) = opt.arg_hint {
+                    spans.push(Span::styled(
+                        format!("  [需参数: {hint}]"),
+                        Style::default().fg(Color::Magenta),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        "  [需参数]",
+                        Style::default().fg(Color::Magenta),
+                    ));
+                }
+            }
+            let line = Line::from(spans);
+            if is_selected {
+                Line::from(vec![Span::styled(
+                    line.to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )])
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " /{parent} 子选项 ({}) — Esc 返回 ",
+        menu.sub_total_count()
     ));
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);

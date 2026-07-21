@@ -1,11 +1,15 @@
 #![cfg(feature = "full-tui")]
 
-//! Slash command popup menu with fuzzy filtering.
+//! Slash command popup menu with fuzzy filtering + nested sub-option menu.
 //!
 //! When the user types a `/`-prefixed query, `SlashMenu` filters the
 //! available `SlashCommandSpec` list and tracks the currently selected
 //! item. Up/Down arrow keys move the selection; Enter submits the
 //! selected command; Esc closes the menu.
+//!
+//! 二级菜单：选中一级命令后若有子选项（如 `/mcp list/show/help`），
+//! 菜单自动切换到 Sub 层级展示子选项列表，用户继续用 Up/Down/Enter
+//! 选中。Esc 在 Sub 层级返回上一级（不直接关闭菜单）。
 
 use std::borrow::Cow;
 
@@ -15,6 +19,29 @@ use crate::commands_handler::STUB_COMMANDS;
 
 /// Maximum items shown at once in the popup.
 const MAX_VISIBLE_ITEMS: usize = 10;
+
+/// 菜单当前层级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuLevel {
+    /// 顶层：显示所有斜杠命令。
+    Top,
+    /// 二级：显示某父命令的子选项（如 `/mcp` 下的 list/show/help）。
+    Sub,
+}
+
+/// 二级菜单的子选项描述。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubOptionSpec {
+    /// 子选项值（如 `list`、`show`、`read-only`）。选中后拼到父命令后。
+    pub value: &'static str,
+    /// 中文标签（菜单显示用）。
+    pub label: &'static str,
+    /// 是否需要额外参数（如 `show <server>` 中的 `<server>`）。
+    /// true：选中后填到空格后等用户手敲；false：选中后直接可提交。
+    pub requires_arg: bool,
+    /// 额外参数的中文提示（仅当 requires_arg=true 时有意义）。
+    pub arg_hint: Option<&'static str>,
+}
 
 /// A slash command menu with fuzzy-filtered items.
 #[derive(Debug, Clone)]
@@ -29,6 +56,20 @@ pub(crate) struct SlashMenu {
     scroll: usize,
     /// Cached filtered list (invalidated on query change).
     filtered_cache: Vec<&'static SlashCommandSpec>,
+
+    // === 二级菜单状态 ===
+    /// 当前层级（Top 或 Sub）。
+    level: MenuLevel,
+    /// Sub 层级下的父命令名（如 "mcp"）。Top 层级为 None。
+    parent: Option<&'static str>,
+    /// Sub 层级下的全部子选项（来自 sub_options_for()）。
+    sub_all: Vec<SubOptionSpec>,
+    /// Sub 层级下的过滤后子选项缓存。
+    sub_filtered: Vec<SubOptionSpec>,
+    /// Sub 层级下的当前选中索引。
+    sub_selected: Option<usize>,
+    /// Sub 层级下的滚动偏移。
+    sub_scroll: usize,
 }
 
 impl SlashMenu {
@@ -51,48 +92,142 @@ impl SlashMenu {
             selected,
             scroll: 0,
             filtered_cache,
+            level: MenuLevel::Top,
+            parent: None,
+            sub_all: Vec::new(),
+            sub_filtered: Vec::new(),
+            sub_selected: None,
+            sub_scroll: 0,
         }
+    }
+
+    /// 当前层级。
+    pub(crate) fn level(&self) -> MenuLevel {
+        self.level
+    }
+
+    /// 进入二级菜单：以 `parent_name` 为父命令加载子选项。
+    /// 若父命令无子选项则返回 false（调用方应回退为直接 accept）。
+    pub(crate) fn enter_sub_menu(&mut self, parent_name: &'static str) -> bool {
+        let subs = sub_options_for(parent_name);
+        if subs.is_empty() {
+            return false;
+        }
+        self.level = MenuLevel::Sub;
+        self.parent = Some(parent_name);
+        self.sub_all = subs;
+        self.sub_filtered = self.sub_all.clone();
+        self.sub_selected = if self.sub_filtered.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        self.sub_scroll = 0;
+        true
+    }
+
+    /// 退出二级菜单回到顶层（Esc 或选中后调用）。
+    pub(crate) fn exit_sub_menu(&mut self) {
+        self.level = MenuLevel::Top;
+        self.parent = None;
+        self.sub_all.clear();
+        self.sub_filtered.clear();
+        self.sub_selected = None;
+        self.sub_scroll = 0;
+    }
+
+    /// 当前父命令名（仅 Sub 层级有意义）。
+    pub(crate) fn parent_name(&self) -> Option<&'static str> {
+        self.parent
     }
 
     /// Update the filter query (text typed after `/`). Resets selection
     /// to the first item. Empty query shows all commands.
     pub(crate) fn set_query(&mut self, query: &str) {
-        if self.query == query {
-            return;
+        match self.level {
+            MenuLevel::Top => {
+                if self.query == query {
+                    return;
+                }
+                self.query = query.to_string();
+                self.filtered_cache = self.compute_filtered();
+                self.selected = if self.filtered_cache.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                self.scroll = 0;
+            }
+            MenuLevel::Sub => {
+                // Sub 层级下也支持按子选项 value/label 过滤
+                if self.query == query {
+                    return;
+                }
+                self.query = query.to_string();
+                self.sub_filtered = self.compute_sub_filtered();
+                self.sub_selected = if self.sub_filtered.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                self.sub_scroll = 0;
+            }
         }
-        self.query = query.to_string();
-        self.filtered_cache = self.compute_filtered();
-        self.selected = if self.filtered_cache.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
-        self.scroll = 0;
     }
 
     /// Move selection up by one (wraps to bottom).
     pub(crate) fn move_up(&mut self) {
-        if let Some(idx) = self.selected {
-            let len = self.filtered().len();
-            if len == 0 {
-                return;
+        match self.level {
+            MenuLevel::Top => {
+                if let Some(idx) = self.selected {
+                    let len = self.filtered().len();
+                    if len == 0 {
+                        return;
+                    }
+                    let new_idx = if idx == 0 { len - 1 } else { idx - 1 };
+                    self.selected = Some(new_idx);
+                    self.adjust_scroll();
+                }
             }
-            let new_idx = if idx == 0 { len - 1 } else { idx - 1 };
-            self.selected = Some(new_idx);
-            self.adjust_scroll();
+            MenuLevel::Sub => {
+                if let Some(idx) = self.sub_selected {
+                    let len = self.sub_filtered.len();
+                    if len == 0 {
+                        return;
+                    }
+                    let new_idx = if idx == 0 { len - 1 } else { idx - 1 };
+                    self.sub_selected = Some(new_idx);
+                    self.adjust_sub_scroll();
+                }
+            }
         }
     }
 
     /// Move selection down by one (wraps to top).
     pub(crate) fn move_down(&mut self) {
-        if let Some(idx) = self.selected {
-            let len = self.filtered().len();
-            if len == 0 {
-                return;
+        match self.level {
+            MenuLevel::Top => {
+                if let Some(idx) = self.selected {
+                    let len = self.filtered().len();
+                    if len == 0 {
+                        return;
+                    }
+                    let new_idx = if idx + 1 >= len { 0 } else { idx + 1 };
+                    self.selected = Some(new_idx);
+                    self.adjust_scroll();
+                }
             }
-            let new_idx = if idx + 1 >= len { 0 } else { idx + 1 };
-            self.selected = Some(new_idx);
-            self.adjust_scroll();
+            MenuLevel::Sub => {
+                if let Some(idx) = self.sub_selected {
+                    let len = self.sub_filtered.len();
+                    if len == 0 {
+                        return;
+                    }
+                    let new_idx = if idx + 1 >= len { 0 } else { idx + 1 };
+                    self.sub_selected = Some(new_idx);
+                    self.adjust_sub_scroll();
+                }
+            }
         }
     }
 
@@ -100,6 +235,12 @@ impl SlashMenu {
     pub(crate) fn selected_spec(&self) -> Option<&'static SlashCommandSpec> {
         let idx = self.selected?;
         self.filtered().get(idx).copied()
+    }
+
+    /// 当前选中的子选项（仅 Sub 层级）。
+    pub(crate) fn selected_sub_option(&self) -> Option<SubOptionSpec> {
+        let idx = self.sub_selected?;
+        self.sub_filtered.get(idx).copied()
     }
 
     /// Reset to initial state (clear query, select first).
@@ -112,6 +253,7 @@ impl SlashMenu {
             Some(0)
         };
         self.scroll = 0;
+        self.exit_sub_menu();
     }
 
     /// Filtered command list based on current query (cached).
@@ -119,6 +261,11 @@ impl SlashMenu {
     /// OR aliases OR summary contains the query (case-insensitive).
     pub(crate) fn filtered(&self) -> &[&'static SlashCommandSpec] {
         &self.filtered_cache
+    }
+
+    /// 二级菜单的过滤后子选项列表。
+    pub(crate) fn sub_filtered(&self) -> &[SubOptionSpec] {
+        &self.sub_filtered
     }
 
     /// Compute the filtered list from scratch (called on query change).
@@ -142,10 +289,33 @@ impl SlashMenu {
             .collect()
     }
 
+    fn compute_sub_filtered(&self) -> Vec<SubOptionSpec> {
+        if self.query.is_empty() {
+            return self.sub_all.clone();
+        }
+        let q = self.query.to_ascii_lowercase();
+        self.sub_all
+            .iter()
+            .filter(|opt| {
+                opt.value.to_ascii_lowercase().contains(&q)
+                    || opt.label.to_ascii_lowercase().contains(&q)
+            })
+            .copied()
+            .collect()
+    }
+
     /// Visible window of items (paginated by `MAX_VISIBLE_ITEMS`).
     pub(crate) fn visible_window(&self) -> Vec<&'static SlashCommandSpec> {
         let filtered = self.filtered();
         let start = self.scroll.min(filtered.len().saturating_sub(1));
+        let end = (start + MAX_VISIBLE_ITEMS).min(filtered.len());
+        filtered[start..end].to_vec()
+    }
+
+    /// 二级菜单的可见窗口。
+    pub(crate) fn sub_visible_window(&self) -> Vec<SubOptionSpec> {
+        let filtered = &self.sub_filtered;
+        let start = self.sub_scroll.min(filtered.len().saturating_sub(1));
         let end = (start + MAX_VISIBLE_ITEMS).min(filtered.len());
         filtered[start..end].to_vec()
     }
@@ -155,14 +325,26 @@ impl SlashMenu {
         self.scroll
     }
 
+    pub(crate) fn sub_scroll_offset(&self) -> usize {
+        self.sub_scroll
+    }
+
     /// Total filtered count (for rendering "N of M").
     pub(crate) fn total_count(&self) -> usize {
         self.filtered().len()
     }
 
+    pub(crate) fn sub_total_count(&self) -> usize {
+        self.sub_filtered.len()
+    }
+
     /// Currently selected index (None if nothing selected).
     pub(crate) fn selected_index(&self) -> Option<usize> {
         self.selected
+    }
+
+    pub(crate) fn sub_selected_index(&self) -> Option<usize> {
+        self.sub_selected
     }
 
     /// Index within the visible window (None if out of view).
@@ -190,11 +372,311 @@ impl SlashMenu {
             }
         }
     }
+
+    fn adjust_sub_scroll(&mut self) {
+        if let Some(idx) = self.sub_selected {
+            if idx < self.sub_scroll {
+                self.sub_scroll = idx;
+            } else if idx >= self.sub_scroll + MAX_VISIBLE_ITEMS {
+                self.sub_scroll = idx + 1 - MAX_VISIBLE_ITEMS;
+            }
+        }
+    }
 }
 
 impl Default for SlashMenu {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 返回某父命令的子选项列表。空切片表示该命令无子选项（直接执行）。
+///
+/// 仅覆盖已实现命令中有明确枚举/子命令的；参数为任意值的命令
+/// （如 `/model <model>`、`/resume <path>`）不在此列，按"填入后手敲"处理。
+fn sub_options_for(name: &str) -> Vec<SubOptionSpec> {
+    match name {
+        "permissions" => vec![
+            SubOptionSpec {
+                value: "read-only",
+                label: "只读模式（仅允许读取，不可写）",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "workspace-write",
+                label: "工作区可写（仅当前目录）",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "danger-full-access",
+                label: "完全访问（危险，无限制）",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
+        "config" => vec![
+            SubOptionSpec {
+                value: "env",
+                label: "查看环境变量配置",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "hooks",
+                label: "查看 hooks 配置",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "model",
+                label: "查看模型配置",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "plugins",
+                label: "查看插件配置",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
+        "mcp" => vec![
+            SubOptionSpec {
+                value: "list",
+                label: "列出所有已配置的 MCP 服务器",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "show",
+                label: "查看某 MCP 服务器详情",
+                requires_arg: true,
+                arg_hint: Some("服务器名"),
+            },
+            SubOptionSpec {
+                value: "help",
+                label: "查看 MCP 帮助",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
+        "plugin" => vec![
+            SubOptionSpec {
+                value: "list",
+                label: "列出已安装的插件",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "install",
+                label: "从路径安装插件",
+                requires_arg: true,
+                arg_hint: Some("插件路径"),
+            },
+            SubOptionSpec {
+                value: "enable",
+                label: "启用某插件",
+                requires_arg: true,
+                arg_hint: Some("插件名"),
+            },
+            SubOptionSpec {
+                value: "disable",
+                label: "禁用某插件",
+                requires_arg: true,
+                arg_hint: Some("插件名"),
+            },
+            SubOptionSpec {
+                value: "uninstall",
+                label: "卸载某插件",
+                requires_arg: true,
+                arg_hint: Some("插件 ID"),
+            },
+            SubOptionSpec {
+                value: "update",
+                label: "更新某插件",
+                requires_arg: true,
+                arg_hint: Some("插件 ID"),
+            },
+        ],
+        "session" => vec![
+            SubOptionSpec {
+                value: "list",
+                label: "列出所有受管会话",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "exists",
+                label: "检查某会话是否存在",
+                requires_arg: true,
+                arg_hint: Some("会话 ID"),
+            },
+            SubOptionSpec {
+                value: "switch",
+                label: "切换到某会话",
+                requires_arg: true,
+                arg_hint: Some("会话 ID"),
+            },
+            SubOptionSpec {
+                value: "fork",
+                label: "分叉当前会话",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "delete",
+                label: "删除某会话",
+                requires_arg: true,
+                arg_hint: Some("会话 ID"),
+            },
+        ],
+        "agents" => vec![
+            SubOptionSpec {
+                value: "list",
+                label: "列出已配置的 agents",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "help",
+                label: "查看 agents 帮助",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
+        "skills" => vec![
+            SubOptionSpec {
+                value: "list",
+                label: "列出已安装的 skills",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "install",
+                label: "从路径安装 skill",
+                requires_arg: true,
+                arg_hint: Some("skill 路径"),
+            },
+            SubOptionSpec {
+                value: "help",
+                label: "查看 skills 帮助",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
+        "effort" => vec![
+            SubOptionSpec {
+                value: "low",
+                label: "低推理强度（快速、省 token）",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "medium",
+                label: "中等推理强度（默认）",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "high",
+                label: "高推理强度（深度思考）",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
+        "poor" => vec![
+            SubOptionSpec {
+                value: "on",
+                label: "开启经济模式",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "off",
+                label: "关闭经济模式",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "status",
+                label: "查看经济模式状态",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
+        "goal" => vec![
+            SubOptionSpec {
+                value: "set",
+                label: "设置目标",
+                requires_arg: true,
+                arg_hint: Some("目标文本"),
+            },
+            SubOptionSpec {
+                value: "clear",
+                label: "清除目标",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "pause",
+                label: "暂停目标",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "resume",
+                label: "恢复目标",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "status",
+                label: "查看目标状态",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
+        "bg" => vec![
+            SubOptionSpec {
+                value: "ps",
+                label: "列出后台任务",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "logs",
+                label: "查看后台任务日志",
+                requires_arg: true,
+                arg_hint: Some("任务 PID"),
+            },
+            SubOptionSpec {
+                value: "kill",
+                label: "杀掉后台任务",
+                requires_arg: true,
+                arg_hint: Some("任务 PID"),
+            },
+            SubOptionSpec {
+                value: "purge",
+                label: "清理后台任务记录",
+                requires_arg: true,
+                arg_hint: Some("任务 PID"),
+            },
+            SubOptionSpec {
+                value: "spawn",
+                label: "启动新的后台任务",
+                requires_arg: true,
+                arg_hint: Some("任务提示词"),
+            },
+        ],
+        "clear" => vec![SubOptionSpec {
+            value: "--confirm",
+            label: "确认开启新会话（跳过二次确认）",
+            requires_arg: false,
+            arg_hint: None,
+        }],
+        _ => Vec::new(),
     }
 }
 

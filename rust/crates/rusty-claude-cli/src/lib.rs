@@ -508,15 +508,66 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Agents {
             args,
             output_format,
-        } => LiveCli::print_agents(args.as_deref(), output_format)?,
+        } => {
+            // CLI 模式直接 println; LiveCli::print_agents 现已改为实例方法(走 tui_println)
+            let cwd = env::current_dir()?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("{}", handle_agents_slash_command(args.as_deref(), &cwd)?)
+                }
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&handle_agents_slash_command_json(
+                        args.as_deref(),
+                        &cwd,
+                    )?)?
+                ),
+            }
+        }
         CliAction::Mcp {
             args,
             output_format,
-        } => LiveCli::print_mcp(args.as_deref(), output_format)?,
+        } => {
+            // CLI 模式直接 println; LiveCli::print_mcp 现已改为实例方法(走 tui_println)
+            let args_ref = args.as_deref();
+            if matches!(args_ref.map(str::trim), Some("serve")) {
+                run_mcp_serve()?;
+            } else {
+                let cwd = env::current_dir()?;
+                match output_format {
+                    CliOutputFormat::Text => {
+                        println!("{}", handle_mcp_slash_command(args_ref, &cwd)?)
+                    }
+                    CliOutputFormat::Json => {
+                        let value = handle_mcp_slash_command_json(args_ref, &cwd)?;
+                        let is_error = value.get("ok").and_then(|v| v.as_bool()) == Some(false);
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                        if is_error {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
         CliAction::Skills {
             args,
             output_format,
-        } => LiveCli::print_skills(args.as_deref(), output_format)?,
+        } => {
+            // CLI 模式直接 println; LiveCli::print_skills 现已改为实例方法(走 tui_println)
+            let cwd = env::current_dir()?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("{}", handle_skills_slash_command(args.as_deref(), &cwd)?)
+                }
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&handle_skills_slash_command_json(
+                        args.as_deref(),
+                        &cwd,
+                    )?)?
+                ),
+            }
+        }
         CliAction::Plugins {
             action,
             target,
@@ -639,6 +690,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_verbosity,
             tui,
             enable_plan_mode,
+            enable_policy_engine,
         } => {
             if tui {
                 #[cfg(feature = "full-tui")]
@@ -673,6 +725,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 additional_workspace_roots,
                 output_verbosity,
                 enable_plan_mode,
+                enable_policy_engine,
             )?
         }
         CliAction::HelpTopic {

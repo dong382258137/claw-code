@@ -194,19 +194,19 @@ pub(crate) fn format_auto_compaction_notice(removed: usize) -> String {
 
 pub(crate) fn render_repl_help() -> String {
     [
-        "REPL".to_string(),
-        "  /exit                Quit the REPL".to_string(),
-        "  /quit                Quit the REPL".to_string(),
-        "  Up/Down              Navigate prompt history".to_string(),
-        "  Ctrl-R               Reverse-search prompt history".to_string(),
-        "  Tab                  Complete commands, modes, and recent sessions".to_string(),
-        "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
-        "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
+        "REPL 交互模式".to_string(),
+        "  /exit                退出 REPL".to_string(),
+        "  /quit                退出 REPL".to_string(),
+        "  ↑/↓                  浏览历史输入".to_string(),
+        "  Ctrl-R               反向搜索历史输入".to_string(),
+        "  Tab                  补全命令、模式和最近会话".to_string(),
+        "  Ctrl-C               清空输入（空行时退出）".to_string(),
+        "  Shift+Enter/Ctrl+J   插入换行".to_string(),
+        "  自动保存             .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
             .to_string(),
-        "  Resume latest        /resume latest".to_string(),
-        "  Browse sessions      /session list".to_string(),
-        "  Show prompt history  /history [count]".to_string(),
+        "  恢复最近会话         /resume latest".to_string(),
+        "  浏览所有会话         /session list".to_string(),
+        "  查看输入历史         /history [数量]".to_string(),
         String::new(),
         render_slash_command_help_filtered(STUB_COMMANDS),
     ]

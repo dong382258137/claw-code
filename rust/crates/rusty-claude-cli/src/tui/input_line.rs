@@ -55,6 +55,10 @@ pub(crate) struct InputLine {
     cursor: usize,
     /// True when slash menu is currently shown (buffer starts with `/`).
     menu_open: bool,
+    /// Accept 后锁定菜单自动重开，避免 Backspace 编辑已确认命令时菜单反复弹出。
+    /// 只有用户主动输入新的 `/` 才解锁。
+    /// false=正常状态；true=刚 accept 完，编辑不应触发菜单。
+    menu_locked: bool,
 }
 
 impl InputLine {
@@ -64,6 +68,7 @@ impl InputLine {
             buffer: String::new(),
             cursor: 0,
             menu_open: false,
+            menu_locked: false,
         }
     }
 
@@ -107,6 +112,7 @@ impl InputLine {
         self.buffer.clear();
         self.cursor = 0;
         self.menu_open = false;
+        self.menu_locked = false;
     }
 
     /// Bug L1 修复：恢复 buffer 内容（用于 Submit 后发现不能提交时回填）。
@@ -118,15 +124,35 @@ impl InputLine {
         self.cursor = self.buffer.len();
         // 不恢复 menu_open 状态：用户刚按 Enter 是要提交，不是要开菜单。
         self.menu_open = false;
+        self.menu_locked = false;
     }
 
     /// Sync the slash menu's query with the current buffer (if menu is open).
     /// Returns the query to pass to `SlashMenu::set_query`.
+    ///
+    /// 注意：Sub 层级下 buffer 形如 `/mcp `，`/` 后的内容是 `mcp `，
+    /// 这不是子选项的过滤 query。调用方（app.rs）应根据 menu.level() 判断
+    /// 是否使用此 query。Sub 层级下通常传空 query 显示全部子选项。
     pub(crate) fn menu_query(&self) -> Option<String> {
         if !self.menu_open {
             return None;
         }
         self.buffer.strip_prefix('/').map(|rest| rest.to_string())
+    }
+
+    /// 二级菜单专用 query：返回最后一个空格之后的内容作为子选项过滤词。
+    /// 如 `/mcp li` → query=`li`（过滤出 list）；`/mcp ` → query=空（显示全部）。
+    pub(crate) fn sub_menu_query(&self) -> Option<String> {
+        if !self.menu_open {
+            return None;
+        }
+        let after_slash = self.buffer.strip_prefix('/')?;
+        let last_space = after_slash.rfind(' ');
+        Some(
+            last_space
+                .map(|p| after_slash[p + 1..].to_string())
+                .unwrap_or_default(),
+        )
     }
 
     /// Handle a key event. `c` is the typed character (if any); `key` is the
@@ -246,11 +272,23 @@ impl InputLine {
 
     /// Accept a menu selection: replace buffer with the selected command
     /// (e.g., `/help`), position cursor at end, close menu.
+    /// 同时进入 menu_locked 状态：Backspace 编辑已 accept 的命令不会自动重开菜单，
+    /// 只有用户主动输入新的 `/` 才解锁。修复"选中后无法删除"问题。
     pub(crate) fn accept_menu_completion(&mut self, completion: &str) {
         self.buffer.clear();
         self.buffer.push_str(completion);
         self.cursor = self.buffer.len();
         self.menu_open = false;
+        self.menu_locked = true;
+    }
+
+    /// 进入二级菜单时设置 buffer（如 `/mcp `），保持 menu_open=true
+    /// 且不进入 menu_locked，让用户能继续编辑或用上下键选子选项。
+    pub(crate) fn set_buffer_for_sub_menu(&mut self, content: &str) {
+        self.buffer = content.to_string();
+        self.cursor = self.buffer.len();
+        self.menu_open = true;
+        self.menu_locked = false;
     }
 
     /// 在当前光标位置插入粘贴的文本（支持多行）。
@@ -302,6 +340,30 @@ impl InputLine {
     }
 
     fn update_menu_state(&mut self) {
+        // 修复"选中后无法删除"问题：
+        // - accept_menu_completion 后 menu_locked=true，buffer 形如 `/help`
+        // - 此时 Backspace 编辑不应重开菜单（否则用户改不动已选命令）
+        // - 只有当 buffer 不再以 `/` 开头（删到 / 之前），或重新清空后输入新 `/` 时才解锁
+        // 检测"用户主动输入新 /"：buffer 变成单个 `/` 或 `/` 后跟新字符
+        if self.menu_locked {
+            // 解锁条件：buffer 不以 `/` 开头（用户已删到 / 之前）
+            if !self.buffer.starts_with('/') {
+                self.menu_locked = false;
+                self.menu_open = false;
+                return;
+            }
+            // 解锁条件：buffer 仅剩 `/`（用户删完了 `/xxx`，重新进入输入态）
+            // 此时如果用户继续输入字符，应重新弹菜单
+            if self.buffer == "/" {
+                self.menu_locked = false;
+                self.menu_open = true;
+                return;
+            }
+            // 锁定态下保持菜单关闭
+            self.menu_open = false;
+            return;
+        }
+        // 非锁定态：buffer 以 `/` 开头则开菜单
         self.menu_open = self.buffer.starts_with('/');
     }
 }

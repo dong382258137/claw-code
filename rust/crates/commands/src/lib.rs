@@ -2069,19 +2069,20 @@ pub fn suggest_slash_commands(input: &str, limit: usize) -> Vec<String> {
 /// Pass an empty slice to include all commands.
 pub fn render_slash_command_help_filtered(exclude: &[&str]) -> String {
     let mut lines = vec![
-        "Slash commands".to_string(),
-        "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
-        "  [resume]          also works with --resume SESSION.jsonl".to_string(),
+        "斜杠命令".to_string(),
+        "  从这里开始         /status, /diff, /agents, /skills, /commit".to_string(),
+        "  [resume]           也支持 --resume SESSION.jsonl".to_string(),
         String::new(),
     ];
 
     let categories = ["Session", "Tools", "Config", "Debug"];
+    let category_labels = ["会话", "工具", "配置", "调试"];
 
-    for category in categories {
-        lines.push(category.to_string());
+    for (category, label) in categories.iter().zip(category_labels.iter()) {
+        lines.push(label.to_string());
         for spec in slash_command_specs()
             .iter()
-            .filter(|spec| slash_command_category(spec.name) == category)
+            .filter(|spec| slash_command_category(spec.name) == *category)
             .filter(|spec| !exclude.contains(&spec.name))
         {
             lines.push(format_slash_command_help_line(spec));
@@ -2102,30 +2103,31 @@ pub fn render_slash_command_help_filtered(exclude: &[&str]) -> String {
 
 pub fn render_slash_command_help() -> String {
     let mut lines = vec![
-        "Slash commands".to_string(),
-        "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
-        "  [resume]          also works with --resume SESSION.jsonl".to_string(),
+        "斜杠命令".to_string(),
+        "  从这里开始         /status, /diff, /agents, /skills, /commit".to_string(),
+        "  [resume]           也支持 --resume SESSION.jsonl".to_string(),
         String::new(),
     ];
 
     let categories = ["Session", "Tools", "Config", "Debug"];
+    let category_labels = ["会话", "工具", "配置", "调试"];
 
-    for category in categories {
-        lines.push(category.to_string());
+    for (category, label) in categories.iter().zip(category_labels.iter()) {
+        lines.push(label.to_string());
         for spec in slash_command_specs()
             .iter()
-            .filter(|spec| slash_command_category(spec.name) == category)
+            .filter(|spec| slash_command_category(spec.name) == *category)
         {
             lines.push(format_slash_command_help_line(spec));
         }
         lines.push(String::new());
     }
 
-    lines.push("Keyboard shortcuts".to_string());
-    lines.push("  Up/Down              Navigate prompt history".to_string());
-    lines.push("  Tab                  Complete commands, modes, and recent sessions".to_string());
-    lines.push("  Ctrl-C               Clear input (or exit on empty prompt)".to_string());
-    lines.push("  Shift+Enter/Ctrl+J   Insert a newline".to_string());
+    lines.push("快捷键".to_string());
+    lines.push("  ↑/↓                  浏览历史输入".to_string());
+    lines.push("  Tab                  补全命令、模式和最近会话".to_string());
+    lines.push("  Ctrl-C               清空输入（空行时退出）".to_string());
+    lines.push("  Shift+Enter/Ctrl+J   插入换行".to_string());
 
     lines
         .into_iter()
