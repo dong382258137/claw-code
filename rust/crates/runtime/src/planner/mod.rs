@@ -20,8 +20,11 @@
 pub mod artifact;
 pub mod reviewer;
 
-pub use artifact::{PlanArtifact, PlanPhase, PlanStep, StepStatus, VerificationMethod};
-pub use reviewer::{PreCompletionChecklistMiddleware, ReviewResult, DEFAULT_MAX_REPLANS};
+pub use artifact::{PlanArtifact, PlanPhase, PlanStep, StepStatus};
+pub use reviewer::{
+    render_remediation_prompt, FailedVerification, PreCompletionChecklistMiddleware, ReviewResult,
+    DEFAULT_MAX_REPLANS,
+};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -178,7 +181,6 @@ mod tests {
                 "s1",
                 "step 1",
                 "criteria",
-                VerificationMethod::Rule,
             )],
         );
         let path = persist_plan_artifact(&artifact, &temp).expect("persist should succeed");
@@ -230,7 +232,7 @@ mod tests {
 
         let mut artifact = PlanArtifact::new(
             "task",
-            vec![PlanStep::new("s1", "step", "c", VerificationMethod::Rule)],
+            vec![PlanStep::new("s1", "step", "c")],
         );
         let path = persist_plan_artifact(&artifact, &temp).unwrap();
 

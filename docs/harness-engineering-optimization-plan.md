@@ -260,25 +260,37 @@ Harness 是包裹在模型之外的**所有管控、调度、校验、反馈基�
 
 ### 阶段 3:P2 验证反馈与 Multi-Agent(2-3 周)
 
-#### Step 3.1 — Verifier Agent ⚠️ 部分
+#### Step 3.1 — Verifier Agent ✅ v2.0 完成(方向纠正)
 
-> **真实状态（2026-07-21 v1.2 校正）**：`verifier/` 目录与 `VerifierAgent` 骨架已落地，
-> 规则反馈（cargo test / clippy / fmt）已接入，但**视觉反馈与模型当裁判为 placeholder**：
-> - `verifier/visual.rs`：Playwright 截图对比未实现，函数返回占位结果
-> - `verifier/model_judge.rs`：子 agent 调用 LLM 评估 tool result 未实现，返回占位结果
-> `VerifierAgent::verify` 当前只走规则路径，且未注入主循环 `run_turn`（latent defect）。
-> **v1.2 未对本步骤做新工作** — 规则反馈路径已满足 Step 3.2 Multi-Agent 的基础验证需求,
-> 视觉/模型裁判留到阶段 4 或独立 PR。
+> **真实状态(2026-07-21 v2.0 方向纠正)**:v1.0 设计存在 4 个结构性缺陷,
+> v2.0 进行了方向纠正而非补全 placeholder:
+>
+> **v1.0 缺陷**:
+> 1. Rule Verifier 是"文本启发式"关键词匹配,误报率高(`"error handling improved"` 被误判为失败)
+> 2. Visual / ModelJudge placeholder 返回 `passed: true` = 无效验证
+> 3. `remediation` 字段完全丢失 — 主 agent 盲目重试,必然陷入 doom loop
+> 4. `tool_result` 全量拼接,信号被噪音淹没(step1 的验证被 step2/3 的输出污染)
+>
+> **v2.0 改动**:
+> - **删除** `VisualVerifier` / `ModelJudgeVerifier` 两个 placeholder 模块(无消费者,维护负担)
+> - **删除** `VerificationMethod` 枚举(只剩 Rule 无意义)
+> - `RuleVerifier` 改为**真正执行命令** + 检查 exit_code + 解析结构化输出
+> - `PlanStep` 新增 `verify_command: Option<String>` + `last_tool_use_id: Option<String>`
+> - `ReviewResult::ReplanTriggered` 携带 `failed_verifications`(remediation 不再丢失)
+> - 主 agent 下次 turn 入口把 remediation 拼入 system prompt(修复 remediation 丢失缺陷)
+> - `conversation.rs` Review 接入点用 `step.last_tool_use_id` 精准查找 tool_result(修复全量拼接噪音)
+>
+> **设计决策**:未来若需 LLM 裁判,走 `dispatch_subagent`(已实现)而非新建 ModelJudgeVerifier。
 
 | 项 | 内容 |
 |---|---|
 | **目标** | 实现 V(验证)层,产出质量 ×2-3 |
-| **改动文件** | 新增 `rust/crates/runtime/src/verifier/` 目录;改 `task_registry.rs` |
-| **实现要点** | 1. 三种验证反馈: <br> &nbsp;&nbsp; 规则反馈:`cargo test` / `cargo clippy` / `scripts/fmt.sh --check` <br> &nbsp;&nbsp; 视觉反馈:Playwright 截图对比(可选,先做规则) <br> &nbsp;&nbsp; 模型当裁判:子 agent 调用 LLM 评估 tool result <br> 2. `VerifierAgent::verify(tool_result) -> VerificationResult` <br> 3. 与 Step 2.1 PlanArtifact 的 `acceptance_criteria` 对接 <br> 4. 失败时触发 replan |
-| **验证** | 模拟失败 tool result,断言 VerifierAgent 检测到 |
+| **改动文件** | 删除 `verifier/visual.rs` / `verifier/model_judge.rs`;重写 `verifier/mod.rs` / `verifier/rule.rs`;改 `planner/artifact.rs` / `planner/reviewer.rs` / `planner/mod.rs` / `conversation.rs` |
+| **实现要点** | 1. RuleVerifier 执行 verify_command(如 `cargo test --no-fail-fast`),检查 exit_code <br> 2. PlanStep.verify_command 字段配置验证命令 <br> 3. PlanStep.last_tool_use_id 精准关联 tool_result <br> 4. FailedVerification 携带 remediation 透传到 ReviewResult <br> 5. pending_remediation 注入下轮 system_prompt |
+| **验证** | 47 个 verifier+planner 测试通过(含 exit_code 0/非0/命令不存在/超时等场景) |
 | **依赖** | Step 2.1 |
-| **风险** | 低 — 子 agent 独立 |
-| **缓存影响** | 无 — 子 agent 独立 LLM 请求,独立 prompt cache |
+| **风险** | 低 — 命令执行走子进程,不调 LLM,不影响主 agent 缓存 |
+| **缓存影响** | 无 — RuleVerifier 执行命令,不调 LLM |
 
 #### Step 3.2 — 子 Agent 编排与 Multi-Agent Coordinator ✅ 完成
 
@@ -437,8 +449,25 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 
 ### 阶段 4:P3 平台兼容性与前沿(1 周)
 
-#### Step 4.1 — Sandbox Windows 实现 ✅ 完成
+#### Step 4.1 — Sandbox Windows 实现 ⚠️ 部分(审查后降级)
 
+> **审查状态(2026-07-21 SP4.1 审查)**:经代码审查发现 2 个 P0 级 BUG 已修复(commit 1fd6cc9),
+> 但 `SandboxBuilder` trait 抽象仍为死代码 — bg.rs 直接调用 `assign_process_to_job_object`,
+> 未通过 trait 接口。Step 状态从 ✅ 降级为 ⚠️ 部分。
+>
+> **已修复的 BUG**:
+> - ✅ Job Object flag 值错误:`0x00000004`(JOB_TIME)→ `0x00000100`(PROCESS_MEMORY)
+> - ✅ Win32 结构体错误:`JobObjectBasicLimitInformation`(Class=2,无 ProcessMemoryLimit)
+>   → `JobObjectExtendedLimitInformation`(Class=9, 144 bytes)
+> - ✅ CpuRateControl InfoClass 错误:Class=9 → Class=15
+> - ✅ bg.rs spawn 非原子性:spawn 失败时清理 pending log,save_record 失败时 kill 子进程
+> - ✅ bg.rs stderr 注释错误:eprintln 在父进程执行(非子进程 log),改为返回 Result 写入 log
+>
+> **剩余问题(降级原因)**:
+> - ⚠️ `SandboxBuilder` trait + `WindowsSandboxBuilder::build()` 仍为死代码
+>   (bg.rs 调 `assign_process_to_job_object` 直接方法,绕过 trait)
+> - ⚠️ 生产路径未通过 `SandboxBuilder` trait 抽象配置驱动 spawn
+>
 > **完成状态(2026-07-21 sp4.1 整合)**:5 项整合清单全部完成,Job Object 不再是死代码,
 > bg.rs spawn 路径已接入沙箱限制,公共 API 已导出,功能性测试已添加。
 >
@@ -478,10 +507,45 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 | **实现要点** | 1. Windows:`CREATE_NO_WINDOW` + Job Object 限制 CPU/memory <br> 2. macOS:`sandbox-exec` wrapper(可选,优先级低) <br> 3. 抽象 `SandboxBuilder` trait,Linux/Windows/macOS 三实现 <br> 4. 与 `bg.rs` 已有的 `CREATE_NO_WINDOW` flag 整合 |
 | **验证** | Windows 上跑 `cargo test sandbox` — 20 bg:: + 14 sandbox:: 全绿 |
 | **缓存影响** | 无 |
-| **实际状态** | ✅ 完成 — bg.rs 已整合常量 + Job Object 接入,公共 API 已导出,功能性测试已添加 |
+| **实际状态** | ⚠️ 部分 — Job Object BUG 已修复(commit 1fd6cc9),但 SandboxBuilder trait 仍为死代码,bg.rs 绕过 trait 直接调用 assign_process_to_job_object |
 
 #### Step 4.2 — LSP Client 真实接入 ✅
 
+> **审查修复(2026-07-21 SP4.2 审查后修复)**:经代码审查发现 6 个 P0/P1 级 BUG,
+> 全部修复完成。Step 状态维持 ✅。
+>
+> **SP4.2-B1: ProcessLspTransport 传输层重写**:
+> - 删除 `child_stdout_to_file`(使用 unsafe `FromRawHandle`,workspace 禁用 unsafe_code)
+> - `read_message` 重写:线程+channel 超时方案替代 `set_read_timeout`(`ChildStdout` 不支持)
+> - 新增 `send_lock: Mutex<()>` 确保 write+read 原子性
+> - 新增 `read_response_for_id`:循环读取直到 id 匹配,过滤通知(publishDiagnostics 等)
+>
+> **SP4.2-B2: didOpen 通知 + dispatch 前置**:
+> - `ensure_did_open(path, language_id)`:跟踪已 open 文件,读取内容,发 didOpen 通知
+> - `dispatch()` 在 send 前调 `ensure_did_open`(LSP 协议要求)
+> - `language_id_from_extension(path)`:文件扩展名到 LSP languageId 映射
+>
+> **SP4.2-B3: 配置驱动的 spawn_server**:
+> - `config.rs` 新增 `LspServerConfig` + `LspConfigCollection`(镜像 MCP 配置模式)
+> - `RuntimeFeatureConfig` 新增 `lsp` 字段
+> - `merge_lsp_servers` 解析 `lspServers` JSON key
+> - `tools::init_lsp_from_config(config, workspace_root)`:从配置注册+spawn LSP servers
+> - `app.rs` 启动时调用 `init_lsp_from_config`(best-effort,失败不阻断)
+>
+> **SP4.2-B4: Diagnostics 映射 + 路径一致性**:
+> - `LspAction::Diagnostics` method 返回 `""`(走缓存,非 JSON-RPC)
+> - `uri_to_path(uri)`:统一 `file:///C:/path` → `C:/path` 转换
+> - `From<lsp_types::SymbolInformation>` + `parse_symbol_information` 使用 `uri_to_path`
+>
+> **SP4.2-B5: repomap LSP symbols 保留 + 生产接入**:
+> - `refresh_cache_if_stale` re-parse 时保留已有 `lsp_symbols`(不再清空)
+> - 新增 `refresh_lsp_symbols(registry)`:从 LSP registry 获取 symbols 注入 cache
+> - 新增 `render_with_lsp(registry)`:refresh + LSP augment + render
+>
+> **SP4.2-B6: parse_document_symbols_typed 接入**:
+> - `get_symbols` 改用 `parse_document_symbols_typed`(lsp-types 0.95 类型安全)
+> - fallback 到 `parse_document_symbols`(serde_json 手动解析)
+>
 > **完成状态(2026-07-21 v1.5 三项全做完成)**:协议层、传输层、生产 dispatch 路径、
 > repomap 协同、lsp-types 类型安全、集成测试全部落地。
 >
@@ -543,6 +607,125 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 | **依赖** | 无 |
 | **缓存影响** | 低 — LSP symbol 注入 repomap,但 repomap 已在变动区 |
 | **实际状态** | ✅ 完整 — spawn_server + dispatch 真实传输 + LspSymbol 解析 + repomap 协同 + lsp-types 类型安全 + 集成测试全部落地 |
+
+---
+
+### 阶段 A:ACP 协议层(借鉴 grok-build 架构,2026-07-21)
+
+#### 背景与目标
+
+借鉴上游 `xai-grok-shell`(grok-build)架构,为 Claw Code 引入 **ACP (Agent Communication Protocol)** 协议层,使 `claw` 能作为 stdio ACP server 被 Zed / VS Code 等 ACP 编辑器直接驱动。
+
+**核心动机**:
+1. **协议标准化** — ACP 是 JSON-RPC over stdio 的开放协议,锁定 `agent-client-protocol = 0.10.4`
+2. **解耦 UI 与 agent** — 编辑器不再需要 fork 内部 TUI,直接通过 ACP 协议交互
+3. **二元化产品形态** — `claw`(完整 CLI)+ `claw-headless`(最小 stdio ACP server)
+
+#### Step A1 — `claw-acp` crate ✅ 完成
+
+新建 `rust/crates/claw-acp`,封装 ACP 桥接层:
+- `AcpGatewaySender<acp::AgentSide>`:agent → client 推送通道
+- `AcpGatewayReceiver`:消费 agent 推送的 `AcpClientMessage`(SessionNotification 等),转发到 `AgentSideConnection`
+- `spawn_stdin_line_reader`:专用 OS 线程读取 stdin,通过 mpsc 投递(避免阻塞 async runtime)
+- 锁定 `agent-client-protocol = 0.10.4`(API 与 1.3.0 不兼容,详见 Step A6 教训)
+
+#### Step A2 — `claw-shell` crate ✅ 完成
+
+新建 `rust/crates/claw-shell`,实现 `acp::Agent` trait:
+- `ClawAgent<C>`:`Rc<RefCell<...>>` 持有 runtime,非 `Send`(需 LocalSet)
+- `ClawAgentBuilder`:隔离非 Send 类型,提供 `build(gateway)` 构造
+- `spawn_claw_shell`:在独立线程 + `current_thread + LocalSet` 上跑 agent,通过 mpsc channel 与前端通信
+- 线程生命周期由 `CancellationToken` 管理
+
+#### Step A3 — `rusty-claude-cli` 接入 ACP(stdio server)✅ 完成
+
+- `app.rs::run_acp_serve`:入口函数,调用 `claw_shell::run_stdio_agent`
+- `format.rs::acp_status_json()`:返回 supported 契约(`status: "supported"`, `phase: "stdio_server"`, `launch_command: "claw acp serve"`)
+- 新增 `claw acp serve` 子命令,启动 stdio ACP server
+- 新增 3 个 stdio.rs 测试(initialize handshake、EOF 退出、cancel 退出)
+- 更新 `output_format_contract.rs` ACP status 期望从 `unsupported` → `supported`
+- `clippy` 0 警告,337/337 测试通过
+
+#### Step A4 — `claw-headless` binary ✅ 完成
+
+- `src/main.rs`:极简入口(仅 `parse_args` + dispatch)
+- `src/bin/headless.rs`:`claw-headless` 入口,直接调用 `run_acp_serve`,无 REPL/TUI/subcommands
+- `Cargo.toml` 注册 `[[bin]] name = "claw-headless"`
+- **lib + bin 重构**:`rusty-claude-cli` 同时提供 lib(供两个 bin 共享)+ 两个 binary
+- **可见性修正**:4 个 `parse_xxx_args` 函数从 `pub` 改回 `pub(crate)`(返回 `pub(crate) CliAction`,binary 不直接引用)
+- 产物:`claw.exe`(33MB,完整 CLI)+ `claw-headless.exe`(24MB,最小 ACP server)
+
+#### Step A5 — 移除 tui_mode gating ⏸️ 推迟
+
+**状态**:推迟,基于 A6 结果决策,可能降级为文档化。
+
+**评估结论**(2026-07-21):
+- `tui_mode` gating 有 4 个职责:`emit_output` / `spinner` / `stdout/stderr` / `permission_prompter`
+- 这些都是**功能必需**(crossterm 拥有终端时必须 gate stdout),非纯技术债
+- "TUI 走 ACP 路径" 的 prerequisites 均不存在:
+  - in-process transport(未实现)
+  - ACP 稳定性验证(需 A6 端到端测试先过)
+  - SessionNotification 事件映射(未实现)
+  - Permission via ACP(未实现)
+- **决策**:保留 tui_mode gating,过早重写 TUI 核心入口风险过高。待 ACP 协议层生产验证后再评估。
+
+#### Step A6 — 端到端测试 + 文档 ✅ 完成
+
+##### A6.1 — 审查现有 ACP 测试覆盖范围 ✅
+
+确认 A1-A3 阶段已覆盖:
+- `claw-acp`:gateway sender/receiver 单元测试
+- `claw-shell/spawn.rs`:`initialize_handshake_works`、`full_handshake_and_prompt_works`、`spawn_and_cancel_exits_cleanly`
+- `claw-shell/stdio.rs`:`line_reader_stream_*`(3 个)、`run_agent_on_io_handles_initialize_handshake`、`run_agent_on_io_exits_cleanly_on_eof`、`run_agent_on_io_exits_cleanly_on_cancel`
+
+##### A6.2 — 修复测试冲突 ✅
+
+- **`output_format_contract.rs`**:ACP status 期望从 `unsupported` → `supported`(`phase: "stdio_server"`, `launch_command: "claw acp serve"`)
+- **runtime crate 预存破损修复**(阻断所有下游测试):
+  - `lsp_client.rs`:移除 `unsafe` raw handle 转换(workspace `unsafe_code = "forbid"`),重写 `read_message` 用线程 + `recv_timeout`(替代 `set_read_timeout` on `MutexGuard<File>`)
+  - `verifier/rule.rs:150`:`{criteria}` → `{acceptance_criteria}`(变量名不匹配)
+  - `conversation.rs:1337`:移除 v1.0 `VerificationMethod` 枚举匹配,改为 v2.0 直接调用 `verifier.verify()`
+  - `lib.rs:289`:移除已删除类型的 re-export(`ModelJudgeVerifier` 等)
+  - `planner/mod.rs`:添加 `FailedVerification` 导出
+
+##### A6.3 — Cancel 取消测试 ✅
+
+`spawn.rs` 新增 `cancel_notification_returns_ok_without_active_prompt`:
+- 验证 `CancelNotification` 能被 agent 接收并返回 `Ok(())`
+- **固化 stub 契约**:`ClawAgent::cancel` 当前是 stub(`agent.rs:305`),仅记录日志并返回 `Ok(())`,不实际中断正在进行的 `run_turn`
+- 此测试验证协议层路径完整(channel 路由 + response 回传),并暴露 stub 限制
+
+##### A6.4 — 错误路径测试 ✅
+
+`stdio.rs` 新增 3 个测试。**关键发现:ACP 0.10.4 与 1.3.0 错误处理行为不同**:
+
+| 场景 | ACP 0.10.4 行为 | ACP 1.3.0 行为 |
+|---|---|---|
+| invalid JSON | `log::error!` + **silent drop**(不发送 error response) | 返回 `-32700` parse_error |
+| missing `method` field | 当作 Response 查找 pending_responses,找不到则 silent drop | 返回 `-32601` method_not_found |
+| unknown method | `Local::decode_request` 失败 → **发送 `-32601` error response** | 返回 `-32601` method_not_found |
+
+测试列表:
+- `run_agent_on_io_silently_drops_invalid_json` — 验证 invalid JSON 后 agent 不崩溃 + 仍能处理合法请求
+- `run_agent_on_io_silently_drops_missing_method_field` — 验证 missing method 后 agent 不崩溃 + 仍能处理合法请求
+- `run_agent_on_io_returns_error_on_unknown_method` — 验证未知 method 返回 `-32601` error response
+
+##### A6.5 — 文档更新 ✅
+
+本节即为 A6.5 产出。
+
+#### 阶段 A 验证结果
+
+- **claw-shell 测试**:13 passed / 0 failed / 0 ignored
+- **clippy**:`claw-shell` 本身 0 警告(runtime 依赖有 17 个预存警告,与本阶段无关)
+- **产物**:`claw.exe` v0.2.0(Git SHA `9014d5f`)+ `claw-headless.exe`
+
+#### 阶段 A 遗留技术债
+
+1. **`ClawAgent::cancel` 是 stub**(`agent.rs:305`):仅记录日志,不实际中断 `run_turn`。需在未来实现真正的取消机制(可能需要 `CancellationToken` 注入到 `run_turn` 主循环)
+2. **`tui_mode` gating 保留**:4 个职责都是功能必需,推迟到 ACP 协议层生产验证后再评估移除
+3. **ACP 0.10.4 silent drop 行为**:invalid JSON 和 missing method 不返回 error response,可能导致客户端误以为请求被接受。未来升级到 1.3.0 可改善,但需评估 API 兼容性
+4. **claw-shell 的 `CancelNotification` 仅协议层验证**:未验证有活跃 prompt 时的取消行为(因 stub 限制)
 
 ---
 
@@ -788,3 +971,4 @@ cd rust && cargo build && cp target/debug/claw.exe debug/claw.exe
 | 2026-07-21 | v1.2 | 实施完成 4 个原 ⚠️ 部分 Step 并校正状态：Step 2.1 ✅(commit 083f4a9,/ultraplan 对接 runtime planner)、Step 2.4 ✅(commit 876f577,EmbeddingProvider trait + FastembedProvider)、Step 3.2 ✅(3.2-a/b/c 全部完成,commits 8322e88/a46a3b5/36d9721,subagent-as-tool 路由)、Step 3.3 ✅(commit 23c7c72,K-means 失败聚类)。Step 3.1 维持 ⚠️ 部分(规则反馈已够用,视觉/模型裁判留到阶段 4)。 |
 | 2026-07-21 | v1.3 | 新增阶段 3.5:三层信息持久化架构(基于论文调研)。基于 Anthropic《Effective Context Engineering》《Multi-Agent Research System》、CompactionRL (arXiv:2607.05378)、MIRIX (arXiv:2507.07957) 实施 5 个改进:P0-1 NOTEBOOK.md parse() 修复 + Structured Note-taking(commit 59f1663,26 测试)、P0-3 压缩前 NOTEBOOK 刷新 trigger(commit 8ea0c67,3 测试)、P0-2 子智能体真实化(同步阻塞 + 上下文隔离 + 文件持久化,commit c2e8f48,10 测试,修复 MultiAgentCoordinator 空壳问题)、P1 microcompact 结构化保留(子智能体指针 + 多行预览,commit a1ac0d1,5 测试)、P3 streaming stall 事件间超时(commit b7edada,337 测试全绿)。新增 37 个测试,总 918 passed。修复长程任务中"AI 忘记关键信息导致重复 dispatch"stall 问题。 |
 | 2026-07-21 | v1.4 | 代码核对复核 Step 4.1 / 4.2,校正状态从 ✅ 到 ⚠️ 部分。Step 4.1 Sandbox:SandboxBuilder trait + 三实现存在(可编译),但 bg.rs::spawn 完全绕过 SandboxBuilder、assign_process_to_job_object 是死代码、公共 API 未导出、无功能性测试。Step 4.2 LSP Client:协议层 + ProcessLspTransport 传输层已编码,但生产 dispatch 走 MemoryLspTransport placeholder、ProcessLspTransport 是死代码、repomap 协同未实现、无 lsp-types/tower-lsp 依赖、无 rust-analyzer 集成测试。两个 Step 都需要补齐"整合 + 功能性测试"才能达到 ✅ 完整。 |
+| 2026-07-21 | v1.5 | 新增阶段 A:ACP 协议层(借鉴 grok-build 架构)。完成 Step A1-A4 + A6(A5 推迟):A1 claw-acp crate(锁定 agent-client-protocol 0.10.4)、A2 claw-shell crate(ClawAgent 实现 acp::Agent trait)、A3 rusty-claude-cli 接入 stdio ACP server(337 测试)、A4 claw-headless binary(lib + bin 重构,33MB + 24MB 双产物)、A6 端到端测试(13 claw-shell 测试,关键发现 ACP 0.10.4 对 invalid JSON/missing method 是 silent drop,仅 unknown method 返回 -32601)。修复 runtime crate 5 处预存破损(lsp_client unsafe、verifier typo、conversation v2.0 同步、lib.rs re-export、planner mod 导出)。遗留技术债:ClawAgent::cancel 是 stub、tui_mode gating 保留、ACP 0.10.4 silent drop 行为、活跃 prompt 下 cancel 未验证。 |

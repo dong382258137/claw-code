@@ -77,6 +77,22 @@ impl RepoMap {
         self.build_map_with_budget(&ranked)
     }
 
+    /// SP4.2-B5:render with LSP symbols augmentation.
+    ///
+    /// 先 `refresh_cache_if_stale`(regex 提取 + 保留已有 LSP symbols),
+    /// 再 `refresh_lsp_symbols`(从 LSP server 获取最新 symbols),
+    /// 最后 render。
+    ///
+    /// 若 registry 中无已 spawn 的 server,退化为普通 `render()`。
+    pub fn render_with_lsp(&mut self, registry: &crate::lsp_client::LspRegistry) -> String {
+        self.refresh_cache_if_stale();
+        self.refresh_lsp_symbols(registry);
+        let importance = self.calculate_importance();
+        let mut ranked: Vec<(PathBuf, usize)> = importance.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        self.build_map_with_budget(&ranked)
+    }
+
     #[must_use]
     pub fn extract_definitions(content: &str) -> Vec<Definition> {
         let mut defs = Vec::new();
@@ -322,13 +338,24 @@ impl RepoMap {
             let definitions = Self::extract_definitions(&content);
             let references = Self::extract_references(&content);
 
+            // SP4.2-B5:re-parse 时保留已有的 LSP symbols(避免 refresh 清空)
+            // LSP symbols 由 augment_with_lsp_symbols 单独注入,refresh_cache_if_stale
+            // 不负责重新获取 LSP symbols(那需要调用 LSP server,开销大且可能阻塞)。
+            // 保留策略:文件 mtime 变化时,regex 提取结果更新,但 LSP symbols 保留
+            // (略有过期,但比清空好;下次 augment_with_lsp_symbols 调用会刷新)。
+            let existing_lsp_symbols = self
+                .cache
+                .get(path)
+                .map(|c| c.lsp_symbols.clone())
+                .unwrap_or_default();
+
             self.cache.insert(
                 path.to_path_buf(),
                 CachedFileMap {
                     definitions,
                     references,
                     mtime,
-                    lsp_symbols: Vec::new(),
+                    lsp_symbols: existing_lsp_symbols,
                 },
             );
         }
@@ -337,6 +364,53 @@ impl RepoMap {
         self.cache.retain(|p, _| p.exists());
 
         self.cache_time = Some(now);
+    }
+
+    /// SP4.2-B5:从 LSP registry 刷新所有缓存文件的 LSP symbols。
+    ///
+    /// 遍历 cache 中每个文件,若对应语言有已 spawn 的 LSP server,
+    /// 调用 `get_symbols` 获取语义 symbols 并注入 cache。
+    ///
+    /// 这是 best-effort 操作:单个文件获取失败不阻断其他文件,
+    /// 失败的文件保持原有 lsp_symbols(可能为空)。
+    ///
+    /// # 参数
+    /// - `registry`:LSP registry(需已 spawn 对应语言的 server)
+    ///
+    /// # 返回
+    /// 成功刷新的文件数量
+    pub fn refresh_lsp_symbols(&mut self, registry: &crate::lsp_client::LspRegistry) -> usize {
+        let mut refreshed = 0usize;
+        let paths: Vec<PathBuf> = self.cache.keys().cloned().collect();
+
+        for path in paths {
+            let path_str = match path.to_str() {
+                Some(s) => s.to_owned(),
+                None => continue,
+            };
+
+            // 检查该文件是否有对应的 LSP server
+            if registry.find_server_for_path(&path_str).is_none() {
+                continue;
+            }
+
+            match registry.get_symbols(&path_str) {
+                Ok(symbols) if !symbols.is_empty() => {
+                    if let Some(cached) = self.cache.get_mut(&path) {
+                        cached.lsp_symbols = symbols;
+                        refreshed += 1;
+                    }
+                }
+                Ok(_) => {
+                    // 空符号列表 — 保留现有(可能是 server 还在索引)
+                }
+                Err(_) => {
+                    // 获取失败 — 保留现有(不阻断其他文件)
+                }
+            }
+        }
+
+        refreshed
     }
 }
 

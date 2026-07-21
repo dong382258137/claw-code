@@ -390,6 +390,15 @@ pub struct ConversationRuntime<C, T> {
     /// CompactionRL (arXiv:2607.05378) — summary 必须保留 original goal /
     /// completed actions / unresolved errors / current state。
     notebook_refresh_pending: bool,
+    /// v2.0 VerifierAgent remediation 注入 — 上一轮 verify 失败的修正建议。
+    ///
+    /// Review 阶段若 VerifierAgent 检测到失败,把 `FailedVerification` 列表
+    /// 序列化为文本存到此字段,下一次 request 构造时在 system_prompt
+    /// 变动区追加,引导 LLM 针对性修复(而非盲目重试)。LLM 下轮开始后清除。
+    ///
+    /// 修复 v1.0 缺陷:`remediation` 字段完全丢失 — 主 agent 不知道
+    /// 上一次 verify 为什么失败,只能盲目重试 → 必然陷入 doom loop。
+    pending_remediation: Option<String>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -454,6 +463,7 @@ where
             turn_start: Cell::new(None),
             multi_agent_coordinator: None,
             notebook_refresh_pending: false,
+            pending_remediation: None,
         }
     }
 
@@ -965,6 +975,10 @@ where
                     if let Some(memory_ctx) = &self.pending_semantic_context {
                         asm.add_auto(ContextSource::Memory, memory_ctx.clone());
                     }
+                    if let Some(remediation) = &self.pending_remediation {
+                        // v2.0:注入上一轮 verify 失败的 remediation。
+                        asm.add_auto(ContextSource::Goal, remediation.clone());
+                    }
                     if let Some(plan) = &self.active_plan {
                         let rendered = plan.render_for_prompt();
                         if !rendered.is_empty() {
@@ -979,6 +993,10 @@ where
                     // 原生路径:手动 push 到 dynamic_sections。
                     if let Some(memory_ctx) = &self.pending_semantic_context {
                         system_split.dynamic_sections.push(memory_ctx.clone());
+                    }
+                    if let Some(remediation) = &self.pending_remediation {
+                        // v2.0:注入上一轮 verify 失败的 remediation。
+                        system_split.dynamic_sections.push(remediation.clone());
                     }
                     if let Some(plan) = &self.active_plan {
                         let rendered = plan.render_for_prompt();
@@ -1312,17 +1330,37 @@ where
         // 跳过 Review,直接清空 active_plan — 避免空 plan 阻塞后续 turn。
         //
         // BUG-7 修复:在 plan_reviewer.review 之前,若注入了 verifier_agent,
-        // 对每个 Succeeded 状态的 step 调用 verify(tool_result, acceptance_criteria, method),
+        // 对每个 Succeeded 状态的 step 调用 verify(tool_result, acceptance_criteria, verify_command),
         // verify 失败则把 step 状态改为 Failed,再走 plan_reviewer.review。
+        // v2.0 改动:
+        // 1. 用 step.last_tool_use_id 精准查找 tool_result(修复全量拼接噪音问题)
+        // 2. 收集 FailedVerification 列表,透传给 reviewer.review()
+        // 3. ReplanTriggered 分支把 remediation 保存到 pending_remediation,
+        //    下次 request 构造时注入 system_prompt(修复 remediation 丢失缺陷)
         // 详见 docs/harness-engineering-optimization-plan.md Step 3.1。
         if let Some(mut plan) = self.active_plan.take() {
             if !plan.steps.is_empty() {
-                // BUG-7 修复:VerifierAgent 真实校验 acceptance_criteria。
+                // v2.0:收集失败 step 的验证详情,供 reviewer 透传 + 下轮 prompt 注入。
+                let mut failed_verifications: Vec<crate::planner::FailedVerification> = Vec::new();
+
                 if let Some(verifier) = &self.verifier_agent {
-                    // 用本轮 tool_results 拼接作为 tool_result 上下文。
-                    // PlanStep 当前不存储关联的 tool_result,这是简化处理。
-                    // 提取每个 message 的 ToolResult output 文本作为上下文。
-                    let tool_result_ctx: String = tool_results
+                    // v2.0:构建 tool_use_id → output 索引,支持精准查找。
+                    // step.last_tool_use_id 关联的主 agent 调用的 tool,
+                    // 其 tool_result 通过 user message 中的 ToolResult block 返回。
+                    let tool_result_index: std::collections::HashMap<&str, &str> = tool_results
+                        .iter()
+                        .flat_map(|m| {
+                            m.blocks.iter().filter_map(|b| match b {
+                                crate::session::ContentBlock::ToolResult {
+                                    tool_use_id, output, ..
+                                } => Some((tool_use_id.as_str(), output.as_str())),
+                                _ => None,
+                            })
+                        })
+                        .collect();
+
+                    // 全量 fallback:无 last_tool_use_id 时用全量拼接(v1.0 兼容)。
+                    let all_tool_results: String = tool_results
                         .iter()
                         .flat_map(|m| {
                             m.blocks.iter().filter_map(|b| match b {
@@ -1334,47 +1372,73 @@ where
                         })
                         .collect::<Vec<_>>()
                         .join("\n\n");
+
                     for step in &mut plan.steps {
                         if step.status == crate::planner::StepStatus::Succeeded {
-                            let method = match step.verification_method {
-                                crate::planner::VerificationMethod::Rule => {
-                                    crate::verifier::VerificationMethod::Rule
-                                }
-                                crate::planner::VerificationMethod::Visual => {
-                                    crate::verifier::VerificationMethod::Visual
-                                }
-                                crate::planner::VerificationMethod::ModelJudge => {
-                                    crate::verifier::VerificationMethod::ModelJudge
-                                }
-                            };
+                            // v2.0:优先用 step.last_tool_use_id 精准查找,
+                            // 无关联则 fallback 到全量拼接。
+                            let tool_result_ctx: &str = step
+                                .last_tool_use_id
+                                .as_deref()
+                                .and_then(|id| tool_result_index.get(id).copied())
+                                .unwrap_or(&all_tool_results);
+
                             let result = verifier.verify(
-                                &tool_result_ctx,
+                                tool_result_ctx,
                                 &step.acceptance_criteria,
-                                method,
+                                step.verify_command.as_deref(),
                             );
                             if !result.passed {
                                 step.mark_failed();
+                                failed_verifications.push(crate::planner::FailedVerification {
+                                    step_id: step.id.clone(),
+                                    step_description: step.description.clone(),
+                                    acceptance_criteria: step.acceptance_criteria.clone(),
+                                    detail: result.detail,
+                                    remediation: result.remediation.unwrap_or_default(),
+                                });
                             }
                         }
                     }
                 }
-                match self.plan_reviewer.review(&mut plan) {
+
+                match self.plan_reviewer.review(&mut plan, failed_verifications) {
                     ReviewResult::AllPassed => {
                         // Plan 完成。可选 persist 最终状态。
                         if let Some(root) = &self.workspace_root {
                             let _ = persist_plan_artifact(&plan, root);
                         }
                     }
-                    ReviewResult::ReplanTriggered { .. } => {
+                    ReviewResult::ReplanTriggered {
+                        failed_verifications,
+                        ..
+                    } => {
                         // 保留 plan,下次 turn 重新执行 reset 后的 steps。
                         self.active_plan = Some(plan);
+                        // v2.0:把失败详情序列化为 remediation prompt,
+                        // 下次 request 构造时注入 system_prompt 变动区。
+                        if !failed_verifications.is_empty() {
+                            self.pending_remediation = Some(
+                                crate::planner::render_remediation_prompt(&failed_verifications),
+                            );
+                        }
                     }
                     ReviewResult::Failed {
                         failed_step_ids,
                         replan_count,
+                        failed_verifications,
                     } => {
+                        // v2.0:把失败详情拼入错误消息,让用户看到 remediation。
+                        let remediation_hint = if failed_verifications.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "\n\n{}",
+                                crate::planner::render_remediation_prompt(&failed_verifications)
+                            )
+                        };
                         let error = RuntimeError::new(format!(
-                            "plan failed after {replan_count} replans; failed steps: {}",
+                            "plan failed after {replan_count} replans; failed steps: {}{remediation_hint}",
                             failed_step_ids.join(", ")
                         ));
                         self.record_turn_failed(iterations, &error);
@@ -1432,6 +1496,11 @@ where
         // BUG-6 修复:turn 结束时清空 pending_semantic_context,
         // 下一 turn 重新召回,避免陈旧记忆污染。
         self.pending_semantic_context = None;
+
+        // v2.0 VerifierAgent:turn 结束时清空 pending_remediation。
+        // 下一轮若再次 verify 失败,会重新填充。
+        // 若 verify 通过或无 verify_command,remediation 不会被设置。
+        self.pending_remediation = None;
 
         // Periodic nudge: if enough turns have elapsed and we have a
         // persistent memory surface, scan recent messages for actionable

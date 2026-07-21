@@ -42,6 +42,65 @@ fn global_lsp_registry() -> &'static LspRegistry {
     REGISTRY.get_or_init(LspRegistry::new)
 }
 
+/// SP4.2-B3:从配置初始化全局 LSP registry。
+///
+/// 读取 `RuntimeConfig` 中的 `lspServers` 配置,为每个语言注册并 spawn LSP server。
+/// 这是 best-effort 操作:单个 server spawn 失败不阻断其他 server,
+/// 失败原因通过 stderr 输出(非 TUI 模式下可见)。
+///
+/// # 参数
+/// - `config`:已加载的 RuntimeConfig
+/// - `workspace_root`:工作区根路径,作为 LSP server 的 rootPath
+///
+/// # 返回
+/// - `Ok(())`:配置中无 LSP server,或所有 server 都已尝试 spawn(无论成功失败)
+/// - `Err`:仅在配置读取严重错误时返回(目前总是 Ok)
+pub fn init_lsp_from_config(
+    config: &runtime::RuntimeConfig,
+    workspace_root: &std::path::Path,
+) -> Result<(), String> {
+    let lsp_config = config.lsp();
+    if lsp_config.is_empty() {
+        return Ok(());
+    }
+
+    let registry = global_lsp_registry();
+    let root_str = workspace_root.to_str().unwrap_or(".");
+
+    for (language, server_cfg) in lsp_config.servers() {
+        // 注册 server 元数据
+        registry.register_with_command(
+            language,
+            runtime::lsp_client::LspServerStatus::Disconnected,
+            Some(root_str),
+            vec![],
+            &server_cfg.command,
+        );
+
+        // 尝试 spawn 真实 server 子进程
+        let effective_root = server_cfg
+            .root_path
+            .as_deref()
+            .unwrap_or(root_str);
+
+        match registry.spawn_server(language, &server_cfg.command, effective_root) {
+            Ok(()) => {
+                eprintln!("[lsp] spawned '{language}' server: {}", server_cfg.command);
+            }
+            Err(e) => {
+                // spawn 失败不阻断:server 仍注册为 Disconnected,
+                // dispatch 时会返回 "not connected" 错误
+                eprintln!(
+                    "[lsp] failed to spawn '{language}' server '{}': {e}",
+                    server_cfg.command
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn global_mcp_registry() -> &'static McpToolRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<McpToolRegistry> = OnceLock::new();

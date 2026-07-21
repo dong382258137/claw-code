@@ -57,6 +57,8 @@ pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
+    /// SP4.2-B3: configured LSP servers, populated from `lspServers` JSON key.
+    lsp: LspConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
     aliases: BTreeMap<String, String>,
@@ -100,6 +102,48 @@ pub struct RuntimePermissionRuleConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct McpConfigCollection {
     servers: BTreeMap<String, ScopedMcpServerConfig>,
+}
+
+/// SP4.2-B3: Collection of configured LSP servers after scope-aware merging.
+///
+/// Mirrors [`McpConfigCollection`] but for LSP servers. Each entry is keyed
+/// by language identifier (e.g. "rust", "python") and maps to a command
+/// that launches the corresponding language server.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LspConfigCollection {
+    servers: BTreeMap<String, LspServerConfig>,
+}
+
+/// SP4.2-B3: Configuration for an LSP server launched as a local stdio process.
+///
+/// LSP servers are always local stdio processes (unlike MCP which supports
+/// multiple transport families), so this is a single struct rather than an enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    /// Language identifier (e.g. "rust", "python", "typescript").
+    pub language: String,
+    /// Command to launch the LSP server (e.g. "rust-analyzer", "pylsp").
+    pub command: String,
+    /// Optional working directory root path for the LSP server.
+    /// If None, uses the workspace root.
+    pub root_path: Option<String>,
+}
+
+impl LspConfigCollection {
+    #[must_use]
+    pub fn servers(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.servers
+    }
+
+    #[must_use]
+    pub fn get(&self, language: &str) -> Option<&LspServerConfig> {
+        self.servers.get(language)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
 }
 
 /// MCP server config paired with the scope that defined it.
@@ -277,6 +321,7 @@ impl ConfigLoader {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
+        let mut lsp_servers = BTreeMap::new();
         let mut all_warnings = Vec::new();
 
         for entry in self.discover() {
@@ -296,6 +341,7 @@ impl ConfigLoader {
             all_warnings.extend(validation.warnings);
             validate_optional_hooks_config(&parsed.object, &entry.path)?;
             merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            merge_lsp_servers(&mut lsp_servers, &parsed.object, &entry.path)?;
             deep_merge_objects(&mut merged, &parsed.object);
             loaded_entries.push(entry);
         }
@@ -311,6 +357,9 @@ impl ConfigLoader {
             plugins: parse_optional_plugin_config(&merged_value)?,
             mcp: McpConfigCollection {
                 servers: mcp_servers,
+            },
+            lsp: LspConfigCollection {
+                servers: lsp_servers,
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
@@ -369,6 +418,12 @@ impl RuntimeConfig {
     #[must_use]
     pub fn mcp(&self) -> &McpConfigCollection {
         &self.feature_config.mcp
+    }
+
+    /// SP4.2-B3: Access configured LSP servers.
+    #[must_use]
+    pub fn lsp(&self) -> &LspConfigCollection {
+        &self.feature_config.lsp
     }
 
     #[must_use]
@@ -772,6 +827,46 @@ fn merge_mcp_servers(
                 .unwrap_or(false),
                 scope: source,
                 config: parsed,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// SP4.2-B3: Merge `lspServers` from a config file into the target map.
+///
+/// Expected JSON format:
+/// ```json
+/// {
+///   "lspServers": {
+///     "rust": { "command": "rust-analyzer" },
+///     "python": { "command": "pylsp", "rootPath": "." }
+///   }
+/// }
+/// ```
+fn merge_lsp_servers(
+    target: &mut BTreeMap<String, LspServerConfig>,
+    root: &BTreeMap<String, JsonValue>,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    let Some(lsp_servers) = root.get("lspServers") else {
+        return Ok(());
+    };
+    let servers = expect_object(lsp_servers, &format!("{}: lspServers", path.display()))?;
+    for (language, value) in servers {
+        let context = format!("{}: lspServers.{language}", path.display());
+        let obj = expect_object(value, &context)?;
+        let command = optional_string(obj, "command", &context)?
+            .ok_or_else(|| ConfigError::Parse(format!("{context}: missing 'command' field")))?;
+        let root_path = optional_string(obj, "rootPath", &context)?
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        target.insert(
+            language.clone(),
+            LspServerConfig {
+                language: language.clone(),
+                command: command.to_owned(),
+                root_path,
             },
         );
     }

@@ -4,8 +4,8 @@
 //! 1. **末尾追加**:PlanArtifact 在 prompt 的"变动区"末尾追加,不污染
 //!    "绝对稳定区"(system_prompt + tools_schema)与"半稳定区"(memory/goal/git_context)。
 //! 2. **可持久化**:写入 `<workspace>/.claw/plans/<timestamp>.json`,可跨会话恢复。
-//! 3. **可校验**:每个 step 含 `acceptance_criteria` + `verification_method`,
-//!    与 Stage 3.1 VerifierAgent 对接。
+//! 3. **可校验**:每个 step 含 `acceptance_criteria` + `verify_command`,
+//!    与 Stage 3.1 VerifierAgent 对接(v2.0:执行命令检查 exit_code)。
 //! 4. **可重规划**:失败 step 触发 `Replan` 重新生成剩余步骤。
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,17 +42,6 @@ pub enum StepStatus {
     Skipped,
 }
 
-/// 如何校验一个 step 是否成功 — 与 Stage 3.1 VerifierAgent 的三种反馈对应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VerificationMethod {
-    /// 规则反馈:`cargo test` / `cargo clippy` / `scripts/fmt.sh --check`。
-    Rule,
-    /// 视觉反馈:Playwright 截图对比(可选,先做规则)。
-    Visual,
-    /// 模型当裁判:子 agent 调用 LLM 评估 tool result。
-    ModelJudge,
-}
-
 /// Plan 中的一个原子步骤。
 ///
 /// 一个 step 对应主 agent 的一组连续 tool calls,粒度由 planner 决定
@@ -65,8 +54,16 @@ pub struct PlanStep {
     pub description: String,
     /// 完成判定标准(自然语言或结构化),供 VerifierAgent 校验。
     pub acceptance_criteria: String,
-    /// 校验方式,见 [`VerificationMethod`]。
-    pub verification_method: VerificationMethod,
+    /// v2.0:验证命令(如 `cargo test --no-fail-fast` / `cargo clippy -- -D warnings`)。
+    /// `None` → 跳过验证(保守通过,不阻塞 plan)。
+    /// `Some(cmd)` → VerifierAgent 执行 cmd,检查 exit_code。
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    /// v2.0:该 step 最近一次执行关联的 tool_use_id(用于精准查找 tool_result)。
+    /// `None` 表示尚未执行或主 agent 未关联。
+    /// 解决 v1.0 "tool_result 全量拼接,信号被噪音淹没" 问题。
+    #[serde(default)]
+    pub last_tool_use_id: Option<String>,
     /// 当前状态,见 [`StepStatus`]。
     pub status: StepStatus,
     /// 已尝试次数(含 replan 后的重试)。0 表示未开始,1+ 表示已尝试过。
@@ -79,16 +76,29 @@ impl PlanStep {
         id: impl Into<String>,
         description: impl Into<String>,
         acceptance_criteria: impl Into<String>,
-        verification_method: VerificationMethod,
     ) -> Self {
         Self {
             id: id.into(),
             description: description.into(),
             acceptance_criteria: acceptance_criteria.into(),
-            verification_method,
+            verify_command: None,
+            last_tool_use_id: None,
             status: StepStatus::Pending,
             attempts: 0,
         }
+    }
+
+    /// 带验证命令的构造器(v2.0 推荐)。
+    #[must_use]
+    pub fn with_verify_command(
+        id: impl Into<String>,
+        description: impl Into<String>,
+        acceptance_criteria: impl Into<String>,
+        verify_command: impl Into<String>,
+    ) -> Self {
+        let mut step = Self::new(id, description, acceptance_criteria);
+        step.verify_command = Some(verify_command.into());
+        step
     }
 
     /// 标记此 step 开始执行。`attempts` 自增。
@@ -112,6 +122,11 @@ impl PlanStep {
     /// 标记此 step 被跳过(前置依赖 Failed)。
     pub fn mark_skipped(&mut self) {
         self.status = StepStatus::Skipped;
+    }
+
+    /// v2.0:关联最近一次 tool_use_id(用于 Review 阶段精准查找 tool_result)。
+    pub fn set_last_tool_use_id(&mut self, tool_use_id: impl Into<String>) {
+        self.last_tool_use_id = Some(tool_use_id.into());
     }
 }
 
@@ -279,12 +294,12 @@ impl PlanArtifact {
                 StepStatus::Skipped => "⊘ skipped",
             };
             out.push_str(&format!(
-                "{}. [{}] {}\n   acceptance: {}\n   verify: {:?} (attempts: {})\n",
+                "{}. [{}] {}\n   acceptance: {}\n   verify: {} (attempts: {})\n",
                 idx + 1,
                 status_label,
                 step.description,
                 step.acceptance_criteria,
-                step.verification_method,
+                step.verify_command.as_deref().unwrap_or("(skip)"),
                 step.attempts,
             ));
         }
@@ -324,8 +339,8 @@ mod tests {
 
     fn sample_steps() -> Vec<PlanStep> {
         vec![
-            PlanStep::new("s1", "Read file", "file read", VerificationMethod::Rule),
-            PlanStep::new("s2", "Edit file", "edit applied", VerificationMethod::Rule),
+            PlanStep::new("s1", "Read file", "file read"),
+            PlanStep::new("s2", "Edit file", "edit applied"),
         ]
     }
 
@@ -429,7 +444,7 @@ mod tests {
 
     #[test]
     fn mark_executing_increments_attempts_only_on_state_change() {
-        let mut step = PlanStep::new("s1", "d", "c", VerificationMethod::Rule);
+        let mut step = PlanStep::new("s1", "d", "c");
         step.mark_executing();
         assert_eq!(step.attempts, 1);
         // 第二次调用(已经是 Executing),attempts 不变。

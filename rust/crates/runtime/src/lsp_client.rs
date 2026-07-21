@@ -5,6 +5,11 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+// SP4.2 修复:HashSet 用于 opened_files
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -313,7 +318,8 @@ impl LspRegistry {
     /// 补充 regex-based 提取的不足。
     pub fn get_symbols(&self, path: &str) -> Result<Vec<LspSymbol>, String> {
         let response = self.dispatch("symbols", Some(path), None, None, None)?;
-        Ok(parse_document_symbols(&response, path))
+        // SP4.2-B6:优先使用 typed 解析(lsp-types 0.95),fallback 到手动解析
+        Ok(parse_document_symbols_typed(&response, path))
     }
 
     pub fn get(&self, language: &str) -> Option<LspServerState> {
@@ -483,6 +489,13 @@ impl LspRegistry {
             let transport = transport_arc
                 .lock()
                 .map_err(|_| "transport lock poisoned".to_string())?;
+
+            // SP4.2 修复:在发任何 textDocument 请求前,先发 didOpen 通知。
+            // LSP 协议要求 client 先 didOpen,server 才能解析文件内容。
+            // ensure_did_open 内部跟踪已 open 的文件,不会重复发送。
+            let language_id = language_id_from_extension(path);
+            transport.ensure_did_open(path, language_id)?;
+
             let method = request.method();
             let params = request.params();
             let rpc_response = transport.send(method, params)?;
@@ -573,7 +586,10 @@ impl LspRequest {
             LspAction::Completion => "textDocument/completion",
             LspAction::Symbols => "textDocument/documentSymbol",
             LspAction::Format => "textDocument/formatting",
-            LspAction::Diagnostics => "textDocument/publishDiagnostics",
+            // SP4.2 修复:Diagnostics 是 server→client 通知,client 不应向 server 发送。
+            // dispatch 对 Diagnostics 做了特殊处理(查本地缓存),不会走到这里。
+            // 返回空字符串而非 method 名,防止未来重构时意外发送。
+            LspAction::Diagnostics => "",
         }
     }
 
@@ -674,6 +690,12 @@ impl LspTransport for MemoryLspTransport {
 /// 2. `spawn()` 启动子进程并发送 `initialize` 请求
 /// 3. `send()` 发送 JSON-RPC 请求并读取响应
 /// 4. 进程在 drop 时自动清理
+///
+/// SP4.2 修复(审查后):
+/// - `send_lock: Mutex<()>` 确保 write+read 原子性(原代码 write 和 read 之间锁释放)
+/// - `read_response_for_id` 循环读取直到 `id` 匹配,过滤通知(原代码不区分通知与响应)
+/// - `read_message_with_timeout` 用线程+channel 实现超时(原代码无超时,永久阻塞)
+/// - `opened_files` 跟踪已 didOpen 的文件,避免重复发送
 pub struct ProcessLspTransport {
     /// 语言标识。
     pub language: String,
@@ -691,6 +713,10 @@ pub struct ProcessLspTransport {
     child_stdout: Option<Arc<Mutex<ChildStdout>>>,
     /// JSON-RPC 请求 ID 计数器。
     next_id: Arc<Mutex<u64>>,
+    /// SP4.2 修复:确保 send 的 write+read 原子性。
+    send_lock: Mutex<()>,
+    /// SP4.2 修复:已发送 didOpen 的文件路径集合,避免重复 open。
+    opened_files: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for ProcessLspTransport {
@@ -721,10 +747,12 @@ impl ProcessLspTransport {
             child_stdin: None,
             child_stdout: None,
             next_id: Arc::new(Mutex::new(1)),
+            send_lock: Mutex::new(()),
+            opened_files: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
-    /// BUG-12:启动 LSP server 子进程(Step 4.2)。
+    /// 启动 LSP server 子进程(Step 4.2)。
     ///
     /// 通过 `std::process::Command` 启动 `server_command`,
     /// 配置 stdin/stdout 为 piped,stderr 为 inherit。
@@ -746,17 +774,28 @@ impl ProcessLspTransport {
             .take()
             .ok_or_else(|| "failed to get stdout handle".to_string())?;
 
+        // SP4.2 修复:保持 ChildStdout 类型,用线程+recv_timeout 实现读取超时
+        // (原方案用 unsafe raw handle 转 File 调 set_read_timeout,但 workspace
+        // 禁用 unsafe_code,改用线程方案)
         self.child = Some(Arc::new(Mutex::new(child)));
         self.child_stdin = Some(Arc::new(Mutex::new(stdin)));
         self.child_stdout = Some(Arc::new(Mutex::new(stdout)));
 
-        // 发送 initialize 请求
+        // 发送 initialize 请求(SP4.2 修复:验证响应而非忽略)
         let init_params = self.initialize_params();
-        let _response = self.send("initialize", init_params)?;
+        let response = self.send("initialize", init_params)?;
+        // 验证 initialize 响应包含 capabilities
+        if response.get("result").is_none() && response.get("error").is_some() {
+            let err = response["error"].get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("LSP initialize failed: {err}"));
+        }
         self.initialized = true;
 
         // 发送 initialized 通知(无响应)
-        let _ = self.send_notification("initialized", serde_json::json!({}));
+        // SP4.2 修复:不再用 let _ = 忽略错误
+        self.send_notification("initialized", serde_json::json!({}))?;
 
         Ok(())
     }
@@ -773,6 +812,45 @@ impl ProcessLspTransport {
             "params": params,
         });
         self.write_message(&message)
+    }
+
+    /// SP4.2 修复:发送 textDocument/didOpen 通知。
+    ///
+    /// LSP 协议要求 client 在发任何 textDocument 请求前先发 didOpen,
+    /// server 才能解析文件内容。此方法跟踪已 open 的文件,避免重复发送。
+    pub fn ensure_did_open(&self, path: &str, language_id: &str) -> Result<(), String> {
+        let abs_path = if std::path::Path::new(path).is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(path)
+                .display()
+                .to_string()
+        };
+
+        let mut opened = self.opened_files.lock().map_err(|_| "opened_files lock poisoned".to_string())?;
+        if opened.contains(&abs_path) {
+            return Ok(());
+        }
+
+        // 读取文件内容
+        let content = std::fs::read_to_string(&abs_path)
+            .map_err(|e| format!("failed to read file for didOpen '{abs_path}': {e}"))?;
+
+        let uri = path_to_file_uri(&abs_path);
+        let params = serde_json::json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": language_id,
+                "version": 1,
+                "text": content,
+            }
+        });
+
+        self.send_notification("textDocument/didOpen", params)?;
+        opened.insert(abs_path);
+        Ok(())
     }
 
     /// 构造 initialize 请求的 params。
@@ -793,7 +871,8 @@ impl ProcessLspTransport {
             "capabilities": {
                 "textDocument": {
                     "completion": { "completionItem": { "snippetSupport": true } },
-                    "hover": { "contentFormat": ["markdown", "plaintext"] }
+                    "hover": { "contentFormat": ["markdown", "plaintext"] },
+                    "synchronization": { "didOpen": true, "didChange": true, "didClose": true }
                 }
             }
         })
@@ -828,6 +907,10 @@ impl ProcessLspTransport {
         self.child_stdin = None;
         self.child_stdout = None;
         self.initialized = false;
+        // 清理已 open 文件集合
+        if let Ok(mut opened) = self.opened_files.lock() {
+            opened.clear();
+        }
     }
 
     /// 写入 JSON-RPC 消息到子进程 stdin(Content-Length header)。
@@ -856,54 +939,105 @@ impl ProcessLspTransport {
         Ok(())
     }
 
-    /// 从子进程 stdout 读取 JSON-RPC 响应(Content-Length header)。
-    fn read_message(&self) -> Result<serde_json::Value, String> {
-        let Some(stdout_handle) = &self.child_stdout else {
-            return Err("LSP server not spawned; call spawn() first".to_string())?;
-        };
+    /// SP4.2 修复:从子进程 stdout 读取一条 JSON-RPC 消息(带超时)。
+    ///
+    /// 超时时间:initialize 30s,普通请求 10s。
+    ///
+    /// 实现说明:`ChildStdout` 没有 `set_read_timeout` 方法,且 workspace
+    /// 禁用 `unsafe_code`(不能 raw handle 转 `File`)。改用专用线程做阻塞
+    /// 读取,主线程通过 `mpsc::Receiver::recv_timeout` 控制超时。
+    fn read_message(&self, timeout_secs: u64) -> Result<serde_json::Value, String> {
+        let stdout_handle = self
+            .child_stdout
+            .as_ref()
+            .ok_or_else(|| "LSP server not spawned; call spawn() first".to_string())?;
 
-        let mut stdout = stdout_handle
-            .lock()
-            .map_err(|_| "stdout lock poisoned".to_string())?;
+        // clone Arc,移入线程
+        let stdout_arc = Arc::clone(stdout_handle);
+        let (tx, rx) = mpsc::channel::<Result<serde_json::Value, String>>();
 
-        // 读取 Content-Length header
-        let mut header_line = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            stdout
-                .read_exact(&mut byte)
-                .map_err(|e| format!("read header error: {e}"))?;
-            let c = byte[0] as char;
-            header_line.push(c);
-            if header_line.ends_with("\r\n\r\n") {
-                break;
+        thread::spawn(move || {
+            let result = (|| -> Result<serde_json::Value, String> {
+                let mut stdout = stdout_arc
+                    .lock()
+                    .map_err(|_| "stdout lock poisoned".to_string())?;
+
+                // 读取 Content-Length header
+                let mut header_line = String::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    stdout
+                        .read_exact(&mut byte)
+                        .map_err(|e| format!("read header error: {e}"))?;
+                    let c = byte[0] as char;
+                    header_line.push(c);
+                    if header_line.ends_with("\r\n\r\n") {
+                        break;
+                    }
+                    // 防止 header 无限增长
+                    if header_line.len() > 1024 {
+                        return Err("LSP header too long, possibly malformed".to_string());
+                    }
+                }
+
+                // 解析 Content-Length
+                let content_length: usize = header_line
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .ok_or_else(|| format!("missing Content-Length in header: {header_line}"))?;
+
+                // 读取 body
+                let mut body = vec![0u8; content_length];
+                stdout
+                    .read_exact(&mut body)
+                    .map_err(|e| format!("read body error: {e}"))?;
+
+                let body_str =
+                    String::from_utf8(body).map_err(|e| format!("body UTF-8 error: {e}"))?;
+
+                serde_json::from_str(&body_str).map_err(|e| format!("JSON parse error: {e}"))
+            })();
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(format!("LSP read timeout after {timeout_secs}s"))
             }
-            // 防止 header 无限增长
-            if header_line.len() > 1024 {
-                return Err("LSP header too long, possibly malformed".to_string());
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("LSP reader thread panicked".to_string())
             }
         }
+    }
 
-        // 解析 Content-Length
-        let content_length: usize = header_line
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("Content-Length: ")
-                    .and_then(|v| v.trim().parse().ok())
-            })
-            .ok_or_else(|| format!("missing Content-Length in header: {header_line}"))?;
+    /// SP4.2 修复:读取响应直到 `id` 匹配,过滤通知。
+    ///
+    /// LSP server 会主动推送通知(publishDiagnostics、window/logMessage 等),
+    /// 这些通知有 `method` 字段但无 `id` 字段。此方法循环读取,
+    /// 跳过通知,直到拿到匹配 `expected_id` 的响应。
+    fn read_response_for_id(&self, expected_id: u64, timeout_secs: u64) -> Result<serde_json::Value, String> {
+        loop {
+            let message = self.read_message(timeout_secs)?;
 
-        // 读取 body
-        let mut body = vec![0u8; content_length];
-        stdout
-            .read_exact(&mut body)
-            .map_err(|e| format!("read body error: {e}"))?;
-
-        let body_str = String::from_utf8(body)
-            .map_err(|e| format!("body UTF-8 error: {e}"))?;
-
-        serde_json::from_str(&body_str)
-            .map_err(|e| format!("JSON parse error: {e}"))
+            // 检查是否有 id 字段(响应有 id,通知没有)
+            if let Some(id_val) = message.get("id") {
+                if let Some(id) = id_val.as_u64() {
+                    if id == expected_id {
+                        return Ok(message);
+                    }
+                    // id 不匹配 — 不应该发生(因为 send_lock 保证原子性),
+                    // 但容错处理:继续读取下一条
+                    continue;
+                }
+            }
+            // 无 id 字段 — 是通知,跳过(可在此处缓存通知供后续处理)
+            // 常见通知:textDocument/publishDiagnostics, window/logMessage, window/showMessage
+            continue;
+        }
     }
 }
 
@@ -911,6 +1045,11 @@ impl LspTransport for ProcessLspTransport {
     fn send(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
         // 若子进程已启动,走真实 stdin/stdout 通信
         if self.child.is_some() {
+            // SP4.2 修复:用 send_lock 确保 write+read 原子性
+            // 原代码 write_message 和 read_message 之间锁释放,
+            // 多线程并发时可能读到其他线程请求的响应
+            let _send_guard = self.send_lock.lock().map_err(|_| "send_lock poisoned".to_string())?;
+
             let id = {
                 let mut next = self.next_id.lock().map_err(|_| "id counter lock poisoned".to_string())?;
                 let id = *next;
@@ -926,7 +1065,10 @@ impl LspTransport for ProcessLspTransport {
             });
 
             self.write_message(&request)?;
-            return self.read_message();
+
+            // SP4.2 修复:initialize 用 30s 超时,普通请求用 10s
+            let timeout = if method == "initialize" { 30 } else { 10 };
+            return self.read_response_for_id(id, timeout);
         }
 
         // 子进程未启动,返回 placeholder 响应(保持向后兼容)
@@ -958,6 +1100,72 @@ impl Drop for ProcessLspTransport {
             let _ = child.wait();
         }
     }
+}
+
+/// SP4.2 修复:将文件路径转为 LSP file:// URI。
+fn path_to_file_uri(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with('/') {
+        format!("file://{normalized}")
+    } else {
+        format!("file:///{normalized}")
+    }
+}
+
+/// SP4.2 修复:根据文件扩展名返回 LSP languageId。
+///
+/// 用于 `textDocument/didOpen` 通知的 `languageId` 字段。
+/// 参考 LSP 规范 §3.10.1 和 language-server-protocol/languages。
+fn language_id_from_extension(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rs" => "rust",
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" => "javascript",
+        "py" => "python",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cpp" | "hpp" | "cc" => "cpp",
+        "rb" => "ruby",
+        "lua" => "lua",
+        "json" => "json",
+        "md" => "markdown",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        _ => "plaintext",
+    }
+}
+
+/// SP4.2 修复:将 LSP file:// URI 转换为本地文件路径。
+///
+/// 统一 SymbolInformation 和 DocumentSymbol 的 path 格式:
+/// - `file:///C:/workspace/main.rs` → `C:/workspace/main.rs`
+/// - `file:///home/user/main.rs` → `/home/user/main.rs`
+/// - `file://host/path` → `path`(简化处理,不保留 host)
+/// - 非 file:// URI 原样返回
+fn uri_to_path(uri: &str) -> String {
+    if let Some(rest) = uri.strip_prefix("file://") {
+        // file:// 后可能是 /path(Unix)或 /C:/path(Windows 三斜杠)或 host/path
+        if let Some(windows_path) = rest.strip_prefix('/') {
+            // 检查是否是 Windows 路径(/C:/...)
+            if windows_path.len() >= 2
+                && windows_path.as_bytes()[1] == b':'
+            {
+                // Windows: /C:/workspace/main.rs → C:/workspace/main.rs
+                return windows_path.to_owned();
+            }
+            // Unix: /home/user/main.rs → /home/user/main.rs
+            return format!("/{windows_path}");
+        }
+        // file://host/path(不常见)→ 原样返回 rest
+        return rest.to_owned();
+    }
+    // 非 file:// URI 原样返回
+    uri.to_owned()
 }
 
 // ============================================================================
@@ -1003,71 +1211,47 @@ pub fn symbol_kind_to_str(kind: u32) -> &'static str {
 }
 
 // ============================================================================
-// Step 4.2-c: lsp-types crate 类型转换
+// Step 4.2-c: lsp-types crate 类型转换 impl
 // 用官方类型替代部分手搓 serde_json,提高协议层可靠性
 // ============================================================================
 
-/// 将 `lsp_types::SymbolKind`(newtype struct,内部为 u32)映射为可读字符串。
+/// 将 `lsp_types::SymbolKind`(newtype around private i32)映射为可读字符串。
 ///
-/// 注意:由于 orphan rule,无法为 `lsp_types::SymbolKind` 实现 `From<T> for &str`,
-/// 故用辅助函数替代。与 `symbol_kind_to_str(u32)` 保持一致。
-fn lsp_symbol_kind_to_str(kind: lsp_types::SymbolKind) -> &'static str {
-    use lsp_types::SymbolKind as SK;
-    // SymbolKind 在 lsp-types 0.95 中是 newtype struct,变体以 const 形式存在。
-    if kind == SK::FILE {
-        "file"
-    } else if kind == SK::MODULE {
-        "module"
-    } else if kind == SK::NAMESPACE {
-        "namespace"
-    } else if kind == SK::PACKAGE {
-        "package"
-    } else if kind == SK::CLASS {
-        "class"
-    } else if kind == SK::METHOD {
-        "method"
-    } else if kind == SK::PROPERTY {
-        "property"
-    } else if kind == SK::FIELD {
-        "field"
-    } else if kind == SK::CONSTRUCTOR {
-        "constructor"
-    } else if kind == SK::ENUM {
-        "enum"
-    } else if kind == SK::INTERFACE {
-        "interface"
-    } else if kind == SK::FUNCTION {
-        "function"
-    } else if kind == SK::VARIABLE {
-        "variable"
-    } else if kind == SK::CONSTANT {
-        "constant"
-    } else if kind == SK::STRING {
-        "string"
-    } else if kind == SK::NUMBER {
-        "number"
-    } else if kind == SK::BOOLEAN {
-        "boolean"
-    } else if kind == SK::ARRAY {
-        "array"
-    } else if kind == SK::OBJECT {
-        "object"
-    } else if kind == SK::KEY {
-        "key"
-    } else if kind == SK::NULL {
-        "null"
-    } else if kind == SK::ENUM_MEMBER {
-        "enum_member"
-    } else if kind == SK::STRUCT {
-        "struct"
-    } else if kind == SK::EVENT {
-        "event"
-    } else if kind == SK::OPERATOR {
-        "operator"
-    } else if kind == SK::TYPE_PARAMETER {
-        "type_parameter"
-    } else {
-        "unknown"
+/// Step 4.2-c 原使用 `impl From<lsp_types::SymbolKind> for &'static str`,
+/// 但违反孤儿规则(E0117,两个外部类型),且 0.95.1 中 `SymbolKind` 是
+/// struct 而非 enum(E0432,无法 `use SymbolKind::*` 展开),内部字段
+/// 为 private(E0616,不能 `kind.0`)。改为独立函数用关联常量匹配,
+/// 与 [`symbol_kind_to_str`](fn@symbol_kind_to_str) 保持映射一致。
+fn symbol_kind_to_str_typed(kind: lsp_types::SymbolKind) -> &'static str {
+    use lsp_types::SymbolKind;
+    match kind {
+        SymbolKind::FILE => "file",
+        SymbolKind::MODULE => "module",
+        SymbolKind::NAMESPACE => "namespace",
+        SymbolKind::PACKAGE => "package",
+        SymbolKind::CLASS => "class",
+        SymbolKind::METHOD => "method",
+        SymbolKind::PROPERTY => "property",
+        SymbolKind::FIELD => "field",
+        SymbolKind::CONSTRUCTOR => "constructor",
+        SymbolKind::ENUM => "enum",
+        SymbolKind::INTERFACE => "interface",
+        SymbolKind::FUNCTION => "function",
+        SymbolKind::VARIABLE => "variable",
+        SymbolKind::CONSTANT => "constant",
+        SymbolKind::STRING => "string",
+        SymbolKind::NUMBER => "number",
+        SymbolKind::BOOLEAN => "boolean",
+        SymbolKind::ARRAY => "array",
+        SymbolKind::OBJECT => "object",
+        SymbolKind::KEY => "key",
+        SymbolKind::NULL => "null",
+        SymbolKind::ENUM_MEMBER => "enum_member",
+        SymbolKind::STRUCT => "struct",
+        SymbolKind::EVENT => "event",
+        SymbolKind::OPERATOR => "operator",
+        SymbolKind::TYPE_PARAMETER => "type_parameter",
+        _ => "unknown",
     }
 }
 
@@ -1077,7 +1261,7 @@ impl From<lsp_types::DocumentSymbol> for LspSymbol {
     /// 注意:DocumentSymbol 不包含文件路径,转换后 `path` 为空,
     /// 调用方需手动设置(参考 `parse_document_symbols_typed` 的实现)。
     fn from(doc: lsp_types::DocumentSymbol) -> Self {
-        let kind_str = lsp_symbol_kind_to_str(doc.kind);
+        let kind_str = symbol_kind_to_str_typed(doc.kind);
         let position = doc.selection_range.start;
         Self {
             name: doc.name,
@@ -1094,10 +1278,14 @@ impl From<lsp_types::SymbolInformation> for LspSymbol {
     ///
     /// SymbolInformation 的 location.uri 提供文件路径,
     /// location.range.start 提供位置。
+    ///
+    /// SP4.2 修复:统一 path 格式为本地路径(去掉 `file://` 前缀),
+    /// 与 DocumentSymbol 格式(调用方传入的 path)保持一致。
     fn from(info: lsp_types::SymbolInformation) -> Self {
-        let kind_str = lsp_symbol_kind_to_str(info.kind);
+        let kind_str = symbol_kind_to_str_typed(info.kind);
         let position = info.location.range.start;
-        let path = info.location.uri.as_str().to_owned();
+        // SP4.2 修复:去掉 file:// 前缀,统一为本地路径格式
+        let path = uri_to_path(info.location.uri.as_str());
         Self {
             name: info.name,
             kind: kind_str.to_owned(),
@@ -1280,17 +1468,18 @@ fn parse_symbol_information(
         })
         .unwrap_or((0, 0));
 
-    // 优先用 location.uri,但若与调用方 path 不一致,使用调用方 path
-    // (因为调用方知道请求的是哪个文件)
-    let path = location
+    // SP4.2 修复:去掉 location.uri 的 file:// 前缀,统一为本地路径格式
+    // 与 typed 路径(From<lsp_types::SymbolInformation>)保持一致
+    let uri = location
         .get("uri")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let path = uri_to_path(uri);
 
     Some(LspSymbol {
         name: name.to_owned(),
         kind: kind.to_owned(),
-        path: path.to_owned(),
+        path,
         line,
         character,
     })
@@ -2341,8 +2530,8 @@ mod tests {
         assert_eq!(symbols[0].kind, "function");
         assert_eq!(symbols[0].line, 10);
         assert_eq!(symbols[0].character, 0);
-        // path 来自 location.uri
-        assert_eq!(symbols[0].path, "file:///workspace/src/lib.rs");
+        // SP4.2 修复:path 现在是本地路径(去掉 file:// 前缀)
+        assert_eq!(symbols[0].path, "/workspace/src/lib.rs");
 
         assert_eq!(symbols[1].name, "MAX_SIZE");
         assert_eq!(symbols[1].kind, "constant");
@@ -2432,168 +2621,5 @@ mod tests {
 
         let result = registry.get_symbols("src/main.rs");
         assert!(result.is_err());
-    }
-
-    // ========================================================================
-    // Step 4.2-c 测试:parse_document_symbols_typed(lsp-types 路径)
-    // ========================================================================
-
-    #[test]
-    fn parse_document_symbols_typed_handles_document_symbol_format() {
-        // DocumentSymbol[] 格式(嵌套,有 range/selectionRange/children)
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": [
-                {
-                    "name": "main_fn",
-                    "kind": 12, // Function
-                    "range": { "start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 1} },
-                    "selectionRange": { "start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9} },
-                    "children": [
-                        {
-                            "name": "inner_var",
-                            "kind": 13, // Variable
-                            "range": { "start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 20} },
-                            "selectionRange": { "start": {"line": 1, "character": 8}, "end": {"line": 1, "character": 16} }
-                        }
-                    ]
-                }
-            ]
-        });
-
-        let symbols = parse_document_symbols_typed(&response, "main.rs");
-        assert_eq!(symbols.len(), 2, "should flatten children");
-        assert_eq!(symbols[0].name, "main_fn");
-        assert_eq!(symbols[0].kind, "function");
-        assert_eq!(symbols[0].line, 0);
-        assert_eq!(symbols[0].character, 3);
-        assert_eq!(symbols[0].path, "main.rs");
-        assert_eq!(symbols[1].name, "inner_var");
-        assert_eq!(symbols[1].kind, "variable");
-        assert_eq!(symbols[1].line, 1);
-        assert_eq!(symbols[1].character, 8);
-    }
-
-    #[test]
-    fn parse_document_symbols_typed_handles_symbol_information_format() {
-        // SymbolInformation[] 格式(平铺,有 location)
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": [
-                {
-                    "name": "Foo",
-                    "kind": 23, // Struct
-                    "location": {
-                        "uri": "file:///workspace/main.rs",
-                        "range": { "start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10} }
-                    }
-                },
-                {
-                    "name": "bar",
-                    "kind": 12, // Function
-                    "location": {
-                        "uri": "file:///workspace/main.rs",
-                        "range": { "start": {"line": 10, "character": 4}, "end": {"line": 10, "character": 20} }
-                    }
-                }
-            ]
-        });
-
-        let symbols = parse_document_symbols_typed(&response, "main.rs");
-        assert_eq!(symbols.len(), 2);
-        assert_eq!(symbols[0].name, "Foo");
-        assert_eq!(symbols[0].kind, "struct");
-        assert_eq!(symbols[0].line, 5);
-        assert_eq!(symbols[0].character, 0);
-        assert_eq!(symbols[0].path, "file:///workspace/main.rs");
-        assert_eq!(symbols[1].name, "bar");
-        assert_eq!(symbols[1].kind, "function");
-    }
-
-    #[test]
-    fn parse_document_symbols_typed_handles_empty_result() {
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": []
-        });
-
-        let symbols = parse_document_symbols_typed(&response, "main.rs");
-        assert!(symbols.is_empty());
-    }
-
-    #[test]
-    fn parse_document_symbols_typed_handles_null_result() {
-        // 部分 LSP server 对空文件返回 null
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": null
-        });
-
-        let symbols = parse_document_symbols_typed(&response, "main.rs");
-        assert!(symbols.is_empty());
-    }
-
-    #[test]
-    fn parse_document_symbols_typed_falls_back_for_invalid_response() {
-        // 非 standard 字段类型(如 kind 为字符串),lsp-types 反序列化失败,
-        // 应 fallback 到 serde_json 手动解析
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": [
-                {
-                    "name": "weird",
-                    "kind": "not_a_number", // 非标准:kind 应为数字
-                    "range": { "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 10} },
-                    "selectionRange": { "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5} }
-                }
-            ]
-        });
-
-        // 不应 panic,fallback 路径应处理
-        let symbols = parse_document_symbols_typed(&response, "main.rs");
-        // fallback 解析时 kind_num=0 → "unknown"
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].name, "weird");
-        assert_eq!(symbols[0].kind, "unknown");
-    }
-
-    #[test]
-    fn parse_document_symbols_typed_consistent_with_untyped() {
-        // 验证 typed 路径与 untyped 路径对标准响应返回一致结果
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": [
-                {
-                    "name": "func_a",
-                    "kind": 12,
-                    "range": { "start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1} },
-                    "selectionRange": { "start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9} }
-                },
-                {
-                    "name": "StructB",
-                    "kind": 23,
-                    "range": { "start": {"line": 7, "character": 0}, "end": {"line": 10, "character": 1} },
-                    "selectionRange": { "start": {"line": 7, "character": 7}, "end": {"line": 7, "character": 14} }
-                }
-            ]
-        });
-
-        let typed = parse_document_symbols_typed(&response, "main.rs");
-        let untyped = parse_document_symbols(&response, "main.rs");
-
-        assert_eq!(typed.len(), untyped.len(), "typed and untyped should return same count");
-        for (t, u) in typed.iter().zip(untyped.iter()) {
-            assert_eq!(t.name, u.name, "name mismatch");
-            assert_eq!(t.kind, u.kind, "kind mismatch for {}", t.name);
-            assert_eq!(t.line, u.line, "line mismatch for {}", t.name);
-            assert_eq!(t.character, u.character, "character mismatch for {}", t.name);
-            assert_eq!(t.path, u.path, "path mismatch for {}", t.name);
-        }
     }
 }

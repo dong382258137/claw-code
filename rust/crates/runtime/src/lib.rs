@@ -112,12 +112,12 @@ pub use compact::{
     CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, LspConfigCollection, LspServerConfig,
+    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
+    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
+    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -286,8 +286,7 @@ pub use trace_analyzer::{
     MAX_SAMPLE_ERRORS_PER_CLUSTER,
 };
 pub use verifier::{
-    ModelJudgeVerifier, ModelJudgeVerdict, RuleVerifier, RuleVerdict, VerificationMethod,
-    VerificationResult, VerifierAgent, VisualVerifier, VisualVerdict,
+    RuleVerifier, RuleVerdict, VerificationResult, VerifierAgent,
 };
 pub use multi_agent::{
     CoordinationMode, JoinStats, MultiAgentCoordinator, Subagent, SubagentStatus,
