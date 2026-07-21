@@ -118,7 +118,14 @@ pub fn spawn(
     cmd.stdout(Stdio::from(stdout_handle));
     cmd.stderr(Stdio::from(stderr_handle));
 
-    let child = cmd.spawn().map_err(|e| BgError::Spawn(e.to_string()))?;
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // SP4.1 修复:spawn 失败时清理 pending log,避免文件残留
+            let _ = fs::remove_file(&pending_log);
+            return Err(BgError::Spawn(e.to_string()));
+        }
+    };
     let pid = child.id();
     // Detached：立即 drop Child，让子进程独立运行。父进程退出不影响子进程。
     drop(child);
@@ -126,7 +133,16 @@ pub fn spawn(
     // Step 4.1 整合:Windows 上 spawn 后将子进程分配到 Job Object,
     // 设置 CPU/memory 限制。失败不致命(best-effort)— 沙箱限制是增强,
     // 不是阻断性功能,Job Object 设置失败时进程仍能正常运行(只是无限制)。
-    assign_job_object_best_effort(pid);
+    // SP4.1 修复:失败原因写入 log 文件(而非 eprintln 到父进程 stderr)。
+    if let Err(job_err) = assign_job_object_best_effort(pid) {
+        use std::io::Write;
+        if let Ok(mut log) = fs::OpenOptions::new().append(true).open(&pending_log) {
+            let _ = writeln!(
+                log,
+                "[bg] Job Object setup failed for pid {pid}: {job_err}"
+            );
+        }
+    }
 
     // 重命名 log 文件为 <pid>.log。如果失败（极罕见，比如重名），fallback 到 pending 名。
     let final_log = log_path(cwd, pid);
@@ -146,7 +162,13 @@ pub fn spawn(
         status: BgStatus::Running,
     };
 
-    save_record(&record_path(cwd, pid), &record)?;
+    // SP4.1 修复:save_record 失败时 kill 子进程并清理 log,
+    // 避免产生无 BgRecord 记录的孤儿子进程(用户无法通过 /bg list 追踪)
+    if let Err(e) = save_record(&record_path(cwd, pid), &record) {
+        let _ = kill_process(pid);
+        let _ = fs::remove_file(&final_log);
+        return Err(e);
+    }
     Ok(record)
 }
 
@@ -340,27 +362,26 @@ fn apply_detached_flags(_cmd: &mut Command) {}
 /// 这是 best-effort 操作:
 /// - 仅 Windows 生效,Unix 直接返回 Ok
 /// - 失败不致命:PowerShell 不可用、Job Object 创建失败等情况不阻断主流程
-/// - 失败原因通过 eprintln 输出到 stderr(仅用于调试,生产环境通常被重定向)
+/// - 失败原因写入 `<pid>.log`(append 模式),便于调试
 ///
 /// 实现委托给 `WindowsSandboxBuilder::assign_process_to_job_object`,
 /// 通过 PowerShell + C# 内联调用 Win32 API(CreateJobObjectW +
 /// SetInformationJobObject + AssignProcessToJobObject)。
-fn assign_job_object_best_effort(pid: u32) {
-    // Unix:无 Job Object 概念,直接返回
+///
+/// SP4.1 修复(审查后):
+/// - 原代码用 `eprintln!` 输出到父进程 stderr,注释错误地声称会出现在 `<pid>.log`。
+///   实际上 `cmd.stderr(Stdio::from(stderr_handle))` 重定向的是**子进程**的 stderr,
+///   父进程的 `eprintln!` 走父进程 stderr(TUI 模式下被 alternate screen 吞掉)。
+/// - 改为返回 `Result<(), String>`,由调用方写入 log 文件。
+fn assign_job_object_best_effort(pid: u32) -> Result<(), String> {
+    // Unix:无 Job Object 概念,直接返回 Ok
     if !cfg!(target_os = "windows") {
-        return;
+        return Ok(());
     }
 
     // Windows:用默认配置(2GB 内存 + 80% CPU)创建 Job Object
-    let result = crate::sandbox::WindowsSandboxBuilder::default()
-        .assign_process_to_job_object(pid);
-    if let Err(e) = result {
-        // best-effort:记录失败但不阻断。使用 eprintln 而非 log,
-        // 因为 bg.rs 故意不引入 tracing/log 依赖(零依赖原则)。
-        // stderr 在 spawn 流程中已被重定向到 log 文件,所以这条消息
-        // 会出现在 <pid>.log 中,便于调试。
-        eprintln!("[bg] Job Object setup failed for pid {pid}: {e}");
-    }
+    crate::sandbox::WindowsSandboxBuilder::default()
+        .assign_process_to_job_object(pid)
 }
 
 fn save_record(path: &Path, record: &BgRecord) -> Result<(), BgError> {

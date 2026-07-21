@@ -498,6 +498,16 @@ impl WindowsSandboxBuilder {
     }
 
     /// 生成设置 Job Object 的 PowerShell + C# 内联脚本。
+    ///
+    /// SP4.1 修复(审查后):
+    /// - 改用 `JobObjectExtendedLimitInformation`(Class=9,144 bytes on x64)
+    ///   替代 `JobObjectBasicLimitInformation`(Class=2,64 bytes)
+    ///   前者才包含 `ProcessMemoryLimit` 字段,真正限制进程内存
+    /// - 修正 `JOB_OBJECT_LIMIT_PROCESS_MEMORY` flag:0x00000100(原代码误用 0x00000004,
+    ///   实际是 JOB_OBJECT_LIMIT_JOB_TIME,导致内存限制完全失效)
+    /// - 修正 CpuRateControl InfoClass:15(原代码误用 9,会污染 ExtendedLimitInformation)
+    /// - 加 try/finally 确保 AllocHGlobal 内存和句柄在异常时也释放
+    /// - 显式 CloseHandle($job)(原代码依赖 OS 隐式回收)
     fn build_job_object_powershell(&self, pid: u32) -> String {
         let mem_limit_bytes = self.memory_limit_mb.unwrap_or(0) * 1024 * 1024;
         let cpu_rate = self.cpu_rate_limit.unwrap_or(0);
@@ -529,54 +539,93 @@ public class Win32JobObject {{
 $job = [Win32JobObject]::CreateJobObjectW([IntPtr]::Zero, "ClawSandboxJob")
 if ($job -eq [IntPtr]::Zero) {{ throw "CreateJobObjectW failed" }}
 
-# Basic Limits: JobObjectBasicLimitInformation (Class=2)
-# STRUCT fields: PerProcessUserTimeLimit, PerJobUserTimeLimit, LimitFlags, MinWorkingSet, MaxWorkingSet, ActiveProcessLimit, Affinity, PriorityClass, SchedulingClass
-# Total size = 64 bytes on x64
-$basicInfo = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(64)
-[System.Runtime.InteropServices.Marshal]::WriteInt64($basicInfo, 0)           # PerProcessUserTimeLimit
-[System.Runtime.InteropServices.Marshal]::WriteInt64($basicInfo, 8, 0)        # PerJobUserTimeLimit
-$limitFlags = 0
-if ({mem_limit_bytes} -gt 0) {{ $limitFlags = $limitFlags -bor 0x00000004 }}  # JOB_OBJECT_LIMIT_PROCESS_MEMORY
-[System.Runtime.InteropServices.Marshal]::WriteInt32($basicInfo, 16, $limitFlags)
-[System.Runtime.InteropServices.Marshal]::WriteInt64($basicInfo, 24, [IntPtr]::Zero) # MinWorkingSet
-if ({mem_limit_bytes} -gt 0) {{
-    [System.Runtime.InteropServices.Marshal]::WriteInt64($basicInfo, 32, [long]{mem_limit_bytes}) # MaxWorkingSet
-}} else {{
-    [System.Runtime.InteropServices.Marshal]::WriteInt64($basicInfo, 32, [IntPtr]::Zero)
-}}
-[System.Runtime.InteropServices.Marshal]::WriteInt32($basicInfo, 40, 0)       # ActiveProcessLimit
-[System.Runtime.InteropServices.Marshal]::WriteInt64($basicInfo, 48, 0)       # Affinity
-[System.Runtime.InteropServices.Marshal]::WriteInt32($basicInfo, 56, 0)       # PriorityClass
-[System.Runtime.InteropServices.Marshal]::WriteInt32($basicInfo, 60, 0)       # SchedulingClass
+try {{
+    # Extended Limits: JobObjectExtendedLimitInformation (Class=9)
+    # Layout on x64 (144 bytes total):
+    #   0-63:   BasicLimitInformation (64 bytes)
+    #     0-7:    PerProcessUserTimeLimit (LARGE_INTEGER)
+    #     8-15:   PerJobUserTimeLimit (LARGE_INTEGER)
+    #     16-19:  LimitFlags (DWORD)
+    #     20-23:  padding
+    #     24-31:  MinimumWorkingSetSize (SIZE_T)
+    #     32-39:  MaximumWorkingSetSize (SIZE_T)
+    #     40-43:  ActiveProcessLimit (DWORD)
+    #     44-47:  padding
+    #     48-55:  Affinity (ULONG_PTR)
+    #     56-59:  PriorityClass (DWORD)
+    #     60-63:  SchedulingClass (DWORD)
+    #   64-111:  IoInfo (IO_COUNTERS, 48 bytes, all zero)
+    #   112-119: ProcessMemoryLimit (SIZE_T) — requires JOB_OBJECT_LIMIT_PROCESS_MEMORY flag
+    #   120-127: JobMemoryLimit (SIZE_T)
+    #   128-135: PeakProcessMemoryUsed (SIZE_T)
+    #   136-143: PeakJobMemoryUsed (SIZE_T)
+    $extInfo = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(144)
+    try {{
+        # Zero the entire buffer first(确保 padding 和 IoInfo 为 0)
+        for ($i = 0; $i -lt 144; $i += 8) {{
+            [System.Runtime.InteropServices.Marshal]::WriteInt64($extInfo, $i, 0)
+        }}
 
-if (-not [Win32JobObject]::SetInformationJobObject($job, 2, $basicInfo, 64)) {{
-    throw "SetInformationJobObject(Basic) failed"
-}}
-[System.Runtime.InteropServices.Marshal]::FreeHGlobal($basicInfo)
+        # BasicLimitInformation.LimitFlags (offset 16, DWORD)
+        $limitFlags = 0
+        if ({mem_limit_bytes} -gt 0) {{
+            # JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100(原代码误用 0x00000004)
+            # JOB_OBJECT_LIMIT_WORKINGSET = 0x00000001(若设 MaxWorkingSet 需同时设此 flag)
+            $limitFlags = $limitFlags -bor 0x00000100 -bor 0x00000001
+        }}
+        [System.Runtime.InteropServices.Marshal]::WriteInt32($extInfo, 16, $limitFlags)
 
-# CPU Rate Control: JobObjectCpuRateControlInformation (Class=9) — Windows 8+
-if ({cpu_rate} -gt 0) {{
-    $cpuInfo = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(8)
-    # CpuRateControlFlags = 0x00000004 (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP)
-    $cpuFlags = 0x00000004 -bor 0x00000001
-    [System.Runtime.InteropServices.Marshal]::WriteInt32($cpuInfo, 0, $cpuFlags)
-    # CpuRate = rate * 100 (hundredths of percent)
-    [System.Runtime.InteropServices.Marshal]::WriteInt32($cpuInfo, 4, {cpu_rate} * 100)
-    if (-not [Win32JobObject]::SetInformationJobObject($job, 9, $cpuInfo, 8)) {{
-        # CPU rate control may not be supported; ignore error
+        # BasicLimitInformation.MaximumWorkingSetSize (offset 32, SIZE_T)
+        if ({mem_limit_bytes} -gt 0) {{
+            [System.Runtime.InteropServices.Marshal]::WriteInt64($extInfo, 32, [long]{mem_limit_bytes})
+        }}
+
+        # ProcessMemoryLimit (offset 112, SIZE_T) — 真正限制进程提交的虚拟内存
+        if ({mem_limit_bytes} -gt 0) {{
+            [System.Runtime.InteropServices.Marshal]::WriteInt64($extInfo, 112, [long]{mem_limit_bytes})
+        }}
+
+        if (-not [Win32JobObject]::SetInformationJobObject($job, 9, $extInfo, 144)) {{
+            throw "SetInformationJobObject(Extended, Class=9) failed"
+        }}
+    }} finally {{
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($extInfo)
     }}
-    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($cpuInfo)
-}}
 
-# Assign process to job
-$PROCESS_SET_QUOTA = 0x0100
-$PROCESS_TERMINATE = 0x0001
-$hProc = [Win32JobObject]::OpenProcess($PROCESS_SET_QUOTA -bor $PROCESS_TERMINATE, $false, {pid})
-if ($hProc -eq [IntPtr]::Zero) {{ throw "OpenProcess({pid}) failed" }}
-if (-not [Win32JobObject]::AssignProcessToJobObject($job, $hProc)) {{
-    throw "AssignProcessToJobObject failed"
+    # CPU Rate Control: JobObjectCpuRateControlInformation (Class=15) — Windows 8+
+    # 原代码误用 Class=9(ExtendedLimitInformation),会污染 BasicLimitInformation
+    if ({cpu_rate} -gt 0) {{
+        $cpuInfo = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(8)
+        try {{
+            # JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
+            # JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
+            $cpuFlags = 0x1 -bor 0x4
+            [System.Runtime.InteropServices.Marshal]::WriteInt32($cpuInfo, 0, $cpuFlags)
+            # CpuRate = rate * 100(hundredths of percent,如 80 表示 80%)
+            [System.Runtime.InteropServices.Marshal]::WriteInt32($cpuInfo, 4, {cpu_rate} * 100)
+            if (-not [Win32JobObject]::SetInformationJobObject($job, 15, $cpuInfo, 8)) {{
+                # CPU rate control may not be supported(Windows 7 或更早);忽略错误
+            }}
+        }} finally {{
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($cpuInfo)
+        }}
+    }}
+
+    # Assign process to job
+    $PROCESS_SET_QUOTA = 0x0100
+    $PROCESS_TERMINATE = 0x0001
+    $hProc = [Win32JobObject]::OpenProcess($PROCESS_SET_QUOTA -bor $PROCESS_TERMINATE, $false, {pid})
+    if ($hProc -eq [IntPtr]::Zero) {{ throw "OpenProcess({pid}) failed" }}
+    try {{
+        if (-not [Win32JobObject]::AssignProcessToJobObject($job, $hProc)) {{
+            throw "AssignProcessToJobObject failed"
+        }}
+    }} finally {{
+        [Win32JobObject]::CloseHandle($hProc)
+    }}
+}} finally {{
+    [Win32JobObject]::CloseHandle($job)
 }}
-[Win32JobObject]::CloseHandle($hProc)
 "#,
             mem_limit_bytes = mem_limit_bytes,
             cpu_rate = cpu_rate,
