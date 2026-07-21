@@ -34,8 +34,14 @@ impl HistoryIndex {
     /// Open or create the FTS5 index at the given path.
     ///
     /// Creates the `history` virtual table if it does not already exist.
-    /// The file's parent directory must already exist.
+    /// The file's parent directory is created if it does not exist.
     pub fn open(db_path: &Path) -> Result<Self, HistoryIndexError> {
+        // Create parent directory (e.g. `.claw/`) if missing — prevents
+        // silent failure where history_index stays None and session_search
+        // becomes permanently unavailable for the session.
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let conn = Connection::open(db_path)?;
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS history USING fts5(

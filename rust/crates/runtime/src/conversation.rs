@@ -1616,10 +1616,6 @@ where
         &self,
         input: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(history_index) = self.session.history_index.as_ref() else {
-            return Ok("session_search is not available: no history index configured.".to_string());
-        };
-
         let parsed: serde_json::Value =
             serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
         let query = parsed
@@ -1628,25 +1624,66 @@ where
             .ok_or("missing 'query' field")?;
         let top_k = parsed.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-        let hits = history_index.search(query, top_k)?;
-
-        if hits.is_empty() {
-            return Ok(format!("No matches found for query: '{query}'"));
+        // Primary: search FTS5 history index
+        if let Some(history_index) = self.session.history_index.as_ref() {
+            let hits = history_index.search(query, top_k)?;
+            if !hits.is_empty() {
+                let mut output = format!("Found {} matches for '{}':\n\n", hits.len(), query);
+                for (i, hit) in hits.iter().enumerate() {
+                    let snippet: String = hit.content.chars().take(500).collect();
+                    output.push_str(&format!(
+                        "## Match {} (session: {}, role: {}, rank: {:.3})\n{}\n\n",
+                        i + 1,
+                        hit.session_id,
+                        hit.role,
+                        hit.rank,
+                        snippet,
+                    ));
+                }
+                return Ok(output);
+            }
         }
 
-        let mut output = format!("Found {} matches for '{}':\n\n", hits.len(), query);
-        for (i, hit) in hits.iter().enumerate() {
-            let snippet: String = hit.content.chars().take(500).collect();
-            output.push_str(&format!(
-                "## Match {} (session: {}, role: {}, rank: {:.3})\n{}\n\n",
-                i + 1,
-                hit.session_id,
-                hit.role,
-                hit.rank,
-                snippet,
-            ));
+        // Fallback: search tool_result_archive for compacted tool outputs
+        if let Some(workspace_root) = &self.workspace_root {
+            let summaries = crate::tool_result_archive::list_archived_summary(workspace_root)?;
+            let query_lower = query.to_lowercase();
+            let matches: Vec<_> = summaries
+                .iter()
+                .filter(|(_, name, preview, _)| {
+                    preview.to_lowercase().contains(&query_lower)
+                        || name.to_lowercase().contains(&query_lower)
+                })
+                .take(top_k)
+                .collect();
+            if !matches.is_empty() {
+                let mut output = format!(
+                    "Found {} archived tool results matching '{}':\n\n",
+                    matches.len(),
+                    query
+                );
+                for (i, (id, name, preview, ts)) in matches.iter().enumerate() {
+                    output.push_str(&format!(
+                        "## Archive {} (tool: {}, ts: {})\npreview: {}\nid: {}\n\n",
+                        i + 1,
+                        name,
+                        ts,
+                        preview,
+                        id,
+                    ));
+                }
+                output.push_str(
+                    "Use recall_full with a specific tool_use_id to retrieve the full output.",
+                );
+                return Ok(output);
+            }
         }
-        Ok(output)
+
+        Ok(format!(
+            "No matches found for query: '{query}'. \
+             Tip: try different keywords, or use recall_full with {{\"list_only\": true}} \
+             to browse all archived tool outputs."
+        ))
     }
 
     /// Step 3.2-c:Execute the `dispatch_subagent` tool — subagent-as-tool 路由。

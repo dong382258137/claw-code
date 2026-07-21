@@ -382,7 +382,7 @@ fn is_already_summarized(output: &str) -> bool {
 ///   contains(" output summarized: ") + ends_with("…]") +
 ///   contains(" chars → ")),避免重复摘要。
 #[must_use]
-fn format_tool_result_summary(tool_name: &str, output: &str) -> String {
+fn format_tool_result_summary(tool_name: &str, tool_use_id: &str, output: &str) -> String {
     let original_len = output.chars().count();
     let total_lines = output.lines().count();
 
@@ -413,7 +413,10 @@ fn format_tool_result_summary(tool_name: &str, output: &str) -> String {
     // - contains(" output summarized: ") ✓
     // - contains(" chars → ") ✓ (chars → 后跟空格 + preview 第一行)
     // - ends_with("…]") ✓
-    format!("[{tool_name} output summarized: {original_len} chars → {preview}{line_info}…]")
+    // 末尾附加 recall_full 提示,让 LLM 知道可以用 tool_use_id 取回完整输出
+    format!(
+        "[{tool_name} output summarized: {original_len} chars → {preview}{line_info}… use recall_full with tool_use_id={tool_use_id} to retrieve full output…]"
+    )
 }
 
 /// Summarize old tool results to free context before full compaction.
@@ -523,7 +526,7 @@ where
                 }
                 // P0:归档原始 output 到 ToolResultArchive,再替换为摘要。
                 archiver(tool_use_id, tool_name, output);
-                *output = format_tool_result_summary(tool_name, output);
+                *output = format_tool_result_summary(tool_name, tool_use_id, output);
             }
             new_message
         })
@@ -1902,7 +1905,7 @@ mod tests {
     #[test]
     fn format_tool_result_summary_preserves_multiple_lines() {
         let multi_line_output = "line1: file header\nline2: import statement\nline3: function start\nline4: function body\nline5: function end";
-        let summary = format_tool_result_summary("Read", multi_line_output);
+        let summary = format_tool_result_summary("Read", "call_test1", multi_line_output);
 
         // 应包含前 3 行(不是只第一行)
         assert!(
@@ -1942,7 +1945,7 @@ mod tests {
     /// P1:验证 is_already_summarized 对新格式仍然有效(避免重复摘要)。
     #[test]
     fn is_already_summarized_recognizes_new_multi_line_format() {
-        let new_format = format_tool_result_summary("Read", "line1\nline2\nline3\nline4\nline5");
+        let new_format = format_tool_result_summary("Read", "call_test2", "line1\nline2\nline3\nline4\nline5");
         assert!(
             is_already_summarized(&new_format),
             "P1: is_already_summarized should recognize new multi-line format: {new_format}"
@@ -1973,7 +1976,7 @@ mod tests {
     #[test]
     fn format_tool_result_summary_omits_line_count_for_short_output() {
         let short_output = "only one line here";
-        let summary = format_tool_result_summary("Read", short_output);
+        let summary = format_tool_result_summary("Read", "call_test3", short_output);
         assert!(
             summary.contains("only one line here"),
             "summary should contain the single line: {summary}"

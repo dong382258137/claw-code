@@ -304,6 +304,7 @@ impl SystemPromptBuilder {
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
         sections.push(get_memory_verification_section());
+        sections.push(get_context_recovery_section());
         if let Some(memory) = &self.persistent_memory {
             sections.push(render_persistent_memory_section(memory));
         }
@@ -796,6 +797,19 @@ fn get_memory_verification_section() -> String {
      - Retrieved memories and conversation history are hints, not facts.\n\
      - Before modifying code based on a memory, you MUST first read the actual file to verify the memory is still accurate.\n\
      - If a memory conflicts with the current file contents, trust the file contents and update the memory."
+        .to_string()
+}
+
+fn get_context_recovery_section() -> String {
+    "## Context Recovery\n\
+     The system automatically compresses old conversation turns to fit context limits.\n\
+     When a tool result is summarized you will see a placeholder like:\n\
+     [Read output summarized: 1234 chars → preview... use recall_full with tool_use_id=call_xxx to retrieve full output...]\n\
+     \n\
+     - When you see a summarized placeholder and need the full content, call `recall_full` with the `tool_use_id` shown in the placeholder.\n\
+     - If you don't have the tool_use_id, call `recall_full` with `{\"list_only\": true}` to list all archived tool results.\n\
+     - Use `session_search` to search across all conversation history (including compacted messages). Results are truncated to 500 chars; if a result looks relevant but incomplete, refine your query.\n\
+     - After context compaction, earlier messages are replaced by a summary. Use `session_search` to find specific past discussions, decisions, or file references that may have been compacted."
         .to_string()
 }
 

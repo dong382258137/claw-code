@@ -670,8 +670,12 @@ mod tests {
     }
 }
 
-/// Maximum output bytes before truncation (16 KiB, matching upstream).
-const MAX_OUTPUT_BYTES: usize = 16_384;
+/// Maximum output bytes before truncation (64 KiB).
+///
+/// Previous 16 KiB limit caused permanent loss of `cargo test` / `cargo build`
+/// output before microcompact could archive it. 64 KiB provides enough headroom
+/// for typical compiler/test output while still bounding context usage.
+const MAX_OUTPUT_BYTES: usize = 65_536;
 
 /// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
 fn truncate_output(s: &str) -> String {
@@ -684,7 +688,9 @@ fn truncate_output(s: &str) -> String {
         end -= 1;
     }
     let mut truncated = s[..end].to_string();
-    truncated.push_str("\n\n[output truncated — exceeded 16384 bytes]");
+    truncated.push_str(&format!(
+        "\n\n[output truncated — exceeded {MAX_OUTPUT_BYTES} bytes. Use a more targeted command or redirect to a file.]"
+    ));
     truncated
 }
 
@@ -700,10 +706,11 @@ mod truncation_tests {
 
     #[test]
     fn long_output_truncated() {
-        let s = "x".repeat(20_000);
+        let s = "x".repeat(70_000);
         let result = truncate_output(&s);
-        assert!(result.len() < 20_000);
-        assert!(result.ends_with("[output truncated — exceeded 16384 bytes]"));
+        assert!(result.len() < 70_000);
+        assert!(result.contains("[output truncated"));
+        assert!(result.contains("Use a more targeted command"));
     }
 
     #[test]
