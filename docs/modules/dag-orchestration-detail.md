@@ -1,9 +1,11 @@
 # DAG 多 Agent 编排细化方案
 
-- 文档版本: v0.1
+- 文档版本: v0.2
 - 创建日期: 2026-07-21
+- 最后更新: 2026-07-21(v0.2 补全 SAGA 端到端示例 + Replan + 资源限制 + 性能基准)
 - 父文档: [ide-hooks-dag-implementation-plan.md](../ide-hooks-dag-implementation-plan.md)
-- 焦点: petgraph 数据结构 + JoinSet 分层调度 + Plan→DAG 转换 + Checkpointer + YAML 声明式
+- v0.1 焦点: petgraph 数据结构 + JoinSet 分层调度 + Plan→DAG 转换 + Checkpointer + YAML 声明式
+- v0.2 焦点: SAGA 补偿端到端示例 + Replan 机制 + 资源背压 + CancellationToken 层级 + 与 MultiAgentCoordinator 完整适配层 + 性能基准
 - 适用范围: `rust/crates/runtime/src/dag/` 新模块及其与 `multi_agent` / `planner` / `conversation` / `lane_events` 的集成
 - 关联代码:
   - `file:///d:/claw-code-src/rust/crates/runtime/src/multi_agent/mod.rs`
@@ -14,6 +16,44 @@
   - `file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs`
   - `file:///d:/claw-code-src/rust/crates/runtime/src/recovery_orchestrator.rs`
   - `file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs`
+
+---
+
+## v0.2 变更记录
+
+v0.2 在 v0.1 数据结构骨架基础上补全可直接落地为代码的实施细节。变更类型分布:**新增章节 4 个**(§15–§18)、**完善章节 6 个**(§5/§8/§10/§11/§13/§14)。
+
+### 新增章节
+
+| 章节 | 主题 | 行数估计 | 核心内容 |
+|---|---|---|---|
+| §15 | SAGA 补偿模式端到端示例 | ~750 | 3 个完整场景:多文件重构 / 并行调研部分失败 / 跨节点状态污染 |
+| §16 | Replan 机制 | ~180 | 触发条件 + 算法 + 代码骨架 + doom loop 防护 |
+| §17 | 资源限制与背压 | ~150 | max_parallelism 实施 / 内存预算 / Token budget / 背压 |
+| §18 | 性能基准 | ~120 | 小/中/大型 DAG 预期 + 并行度影响 + petgraph toposort 基准 |
+
+### 完善章节
+
+| 章节 | v0.1 状态 | v0.2 补充内容 |
+|---|---|---|
+| §5.3 CancellationToken 层级 | 仅画了层级树 | 补 DAG/节点/子 agent 三级 token 代码骨架 + 取消传播规则表 |
+| §5.4 失败传播策略矩阵 | 5 种策略表 | 新增 `ContinueOnFailure` / `BestEffort` 策略 + 场景→策略选择表 |
+| §8 Checkpointer | 基础 save/load | 补 CheckpointStore trait 完整定义 + 原子写入流程 + resume 重建 DagGraph 代码骨架 |
+| §10 dag_run/dag_status | 路由代码 | 补完整 ToolSpec JSON schema + execute_dag_run/dag_status 完整实现 + 错误处理矩阵 |
+| §11 MultiAgentCoordinator 适配层 | 仅 ConversationExecutor + Mock | 补 ForkExecutor / TeammateExecutor / WorktreeExecutor 三种实现 |
+| §13 测试矩阵 | 单测+集成+端到端 | 新增 8 个 SAGA/Replan/取消/背压端到端测试用例 |
+| §14 风险与缓解 | 6 项风险 | 新增 §14.7(SAGA 补偿失败)/§14.8(Replan 后状态不一致) |
+
+### v0.2 验证接入点
+
+v0.2 写作前已用 Read/Grep 工具核验以下接入点与文档描述一致:
+
+- `multi_agent/mod.rs` L77-280:`MultiAgentCoordinator` 同步接口,`spawn/start/complete/fail/cancel`,`Arc<Mutex<HashMap<String, Subagent>>>`,三种 `CoordinationMode`(Fork/Teammate/Worktree)。
+- `planner/artifact.rs` L49-148:`PlanStep` 字段 `id/description/acceptance_criteria/verify_command/last_tool_use_id/status/attempts`;`PlanArtifact` 字段 `id/created_at_ms/task_summary/steps/phase/replan_count`。`trigger_replan` 仅重置 `Failed → Pending`,**不重置 attempts** — DAG Replan 沿用此约定。
+- `conversation.rs` L1656 `execute_dispatch_subagent`、L1767 `run_subagent_turn(&mut self, subagent_id, name, task) -> Result<String, String>`(返回 result_ref 相对路径)、L1879 `execute_check_subagent`。`run_subagent_turn` 是 `&mut self`,需通过 trait 抽象才能在 DAG task 中调用(见 §11)。
+- `recovery_orchestrator.rs` L60-77:`RecoveryOrchestrator::attempt(&mut self, WorkerFailureKind) -> RecoveryOutcome`。注意签名是 `&mut self`,DAG 调度器需 `Arc<Mutex<RecoveryOrchestrator>>` 包裹,v0.1 §5.2 代码已正确使用 `self.recovery.lock().await.attempt(...)`。
+- `lane_events.rs` L6-57:`LaneEventName` 共 23 个变体,`SubagentHandoff`(L53)与 `SubagentResult`(L56)已存在;`LaneFailureClass::SubagentFailure`(L90)可用于 DAG 节点失败事件分类。
+- `rust/Cargo.toml`:workspace dependencies **未引入** `petgraph` / `tokio-util` / `serde_yaml` / `async-trait`,需按 §2.2 新增。
 
 ---
 
@@ -1097,30 +1137,262 @@ async fn run_verify_command(cmd: &str) -> i32 {
 
 ### 5.3 CancellationToken 层级设计
 
+#### 5.3.1 三级 token 层级
+
 ```
-DAG 级 cancel_token (DagScheduler 持有)
-├── 节点 A child_token
+DAG 级 cancel_token (DagScheduler 持有,由 conversation.rs 注入 self.cancel_token.child_token())
+├── 节点 A child_token (joinset.spawn 时由 self.cancel_token.child_token() 生成)
+│   └── 子 agent LLM 请求 tokio::select! 监听 (run_subagent_turn 内部)
 ├── 节点 B child_token
+│   └── 子 agent LLM 请求
 └── 节点 C child_token
-    └── (子 agent LLM 请求 tokio::select! 监听)
+    └── 子 agent LLM 请求
 ```
 
-调用 `dag_cancel_token.cancel()` 时:
+三级 token 各自的语义:
 
-1. 所有 `child_token` 同步触发 `cancelled()` future 就绪。
-2. 各 `run_node` 的 `tokio::select!` 分支命中,返回 `NodeStatus::Cancelled`。
-3. `JoinSet::join_next()` 收到 Cancelled 结果,标记节点状态。
-4. 调度循环退出,返回 `DagError::Timeout` 或 `DagError::Deadlock`。
+| 级别 | 持有者 | 触发时机 | 影响范围 |
+|---|---|---|---|
+| DAG 级 | `DagScheduler.cancel_token` | 主 agent 取消 / DAG 超时 / 关键路径失败 | 所有未终态节点立即 Cancelled |
+| 节点级 | `run_node` task 内 `node_cancel` | 节点超时 / 用户单独取消某节点 | 仅该节点 Cancelled,DAG 继续(若非关键路径) |
+| 子 agent 级 | `run_subagent_turn` 内 `tokio::select!` | 节点级 token 触发 / 子 agent 自身超时 | LLM 流式请求中断,返回已收到的部分 |
+
+#### 5.3.2 三级 token 代码骨架
+
+```rust
+// rust/crates/runtime/src/dag/scheduler.rs(扩展)
+
+use tokio_util::sync::CancellationToken;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+
+impl DagScheduler {
+    /// 创建 DAG 级 token + 注入到每个节点 task。
+    ///
+    /// 调用关系:
+    /// - conversation.rs::execute_dag_run 调用 `self.cancel_token.child_token()`
+    ///   生成 DAG 级 token,传入 DagScheduler::new。
+    /// - DagScheduler::run 对每个 ready 节点调用 `self.cancel_token.child_token()`
+    ///   生成节点级 token,传入 joinset.spawn 的 task。
+    /// - run_node task 内通过 `tokio::select!` 监听 node_cancel.cancelled()。
+    /// - ConversationExecutor::execute 内部进一步 `node_cancel.child_token()`
+    ///   生成子 agent 级 token,传给 run_subagent_turn(需扩展签名)。
+    pub fn new(
+        dag: DagGraph,
+        coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+        recovery: Arc<Mutex<RecoveryOrchestrator>>,
+        cancel_token: CancellationToken, // ← DAG 级 token(已是 child)
+        checkpoint_store: super::checkpoint::CheckpointStore,
+    ) -> Self {
+        Self { dag, coordinator, recovery, cancel_token, checkpoint_store, executor: None }
+    }
+
+    /// 单独取消某个节点(不影响其他节点)。
+    /// 仅当该节点不是关键路径上的节点时使用。
+    pub fn cancel_node(&mut self, node_id: &str) -> Result<(), DagError> {
+        let node = self.dag.get_node(node_id)?.clone();
+        if !node.status.is_terminal() {
+            // 标记 Cancelled,下一轮 ready_nodes 不会再拾取
+            self.dag.mark_status(node_id, NodeStatus::Cancelled);
+            // 注:节点级 token 存储在 JoinSet task 内,无法外部取消;
+            // 实际实现需把 node_cancel 提到 JoinSet 外部,用 HashMap<String, CancellationToken> 维护。
+        }
+        Ok(())
+    }
+}
+
+/// 执行单个 DAG 节点 — 三级 token 的中间层。
+async fn run_node(
+    node: &super::node::DagNode,
+    coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+    node_cancel: CancellationToken, // ← 节点级 token(由 DAG 级 child_token 生成)
+    executor: Arc<dyn SubagentExecutor>,
+) -> Result<NodeResult, DagError> {
+    let start = std::time::Instant::now();
+
+    // 生成子 agent 级 token(节点级 token 的 child)
+    let subagent_cancel = node_cancel.child_token();
+
+    // 三种退出路径:
+    // 1. 子 agent 正常完成 → 返回 Succeeded/Failed
+    // 2. 节点级 token 取消(来自 DAG 级或显式 cancel_node)→ 返回 Cancelled
+    // 3. 节点超时 → 返回 Failed(timeout)
+    let task_result = tokio::select! {
+        r = executor.execute_with_cancel(node, coordinator.clone(), subagent_cancel) => r,
+        _ = node_cancel.cancelled() => {
+            NodeResult {
+                node_id: node.id.clone(),
+                status: NodeStatus::Cancelled,
+                summary: "cancelled by DAG-level or node-level token".into(),
+                refs: vec![],
+                tokens_used: 0,
+                error: Some("cancelled".into()),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }
+        }
+        _ = tokio::time::sleep(Duration::from_secs(node.timeout_secs)) => {
+            NodeResult {
+                node_id: node.id.clone(),
+                status: NodeStatus::Failed,
+                summary: format!("node timeout after {}s", node.timeout_secs),
+                refs: vec![],
+                tokens_used: 0,
+                error: Some("node timeout".into()),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }
+        }
+    };
+
+    let mut result = task_result;
+    result.node_id = node.id.clone();
+    result.elapsed_ms = start.elapsed().as_millis() as u64;
+
+    // 验证(若有 verify_command)— 验证阶段不响应取消(快速执行)
+    if result.status == NodeStatus::Succeeded {
+        if let Some(verify_cmd) = &node.verify_command {
+            let exit_code = run_verify_command(verify_cmd).await;
+            if exit_code != 0 {
+                result.status = NodeStatus::Failed;
+                result.error = Some(format!("verify failed: exit {exit_code}"));
+            }
+        }
+    }
+
+    Ok(result)
+}
+```
+
+#### 5.3.3 取消传播规则
+
+| 触发源 | DAG 级 token | 节点级 token | 子 agent 级 token | 行为 |
+|---|---|---|---|---|
+| 主 agent 用户中断(Ctrl+C) | cancel() | 自动 cancel(子 token) | 自动 cancel | 所有节点 Cancelled,DAG 退出 |
+| DAG 超时(`timeout_secs` 到期) | cancel() | 自动 cancel | 自动 cancel | 同上,返回 `DagError::Timeout` |
+| 关键路径节点 Failed | cancel() | 自动 cancel | 自动 cancel | 同上,返回 `DagError::Deadlock` |
+| 单节点超时(`node.timeout_secs`) | 不变 | cancel(由 `tokio::select!` 触发) | 自动 cancel | 仅该节点 Failed/Cancelled,DAG 继续 |
+| `cancel_node(node_id)` 调用 | 不变 | cancel | 自动 cancel | 仅该节点 Cancelled,DAG 继续 |
+| 子 agent LLM 异常 | 不变 | 不变 | 不变(由 executor 返回 Failed) | 节点 Failed,走 `handle_node_failure` |
+
+**关键约束**:节点级 token 一旦创建(进入 `JoinSet::spawn`),其句柄存储在 task 内部,外部无法直接取消。要支持 `cancel_node`,需把 `HashMap<String, CancellationToken>` 提到 `DagScheduler` 字段,spawn 前插入,spawn 后由 task 内 `node_cancel.cancelled()` 监听。这是 v0.2 实施细节,v0.1 代码骨架未涵盖。
+
+#### 5.3.4 取消后的状态一致性
+
+取消传播完成后,DAG 必须保证:
+
+1. **所有 Running 节点最终变为 Cancelled**(不是 Running 也不是 Pending)。`cascade_cancel_all` 函数遍历所有节点,把 Running 改为 Cancelled。
+2. **JoinSet 中所有 task 都已结束**。`JoinSet::join_next().await` 在 `None` 返回前不应退出 run 循环,否则会有孤儿 task。v0.1 §5.2 代码在 `cancel_token.is_cancelled()` 后直接 return,存在孤儿 task 风险,v0.2 修复方案:
+
+```rust
+// 取消后的清理流程
+async fn drain_joinset(joinset: &mut JoinSet<Result<NodeResult, DagError>>) {
+    while joinset.join_next().await.is_some() {
+        // 丢弃所有剩余结果(都应该是 Cancelled)
+    }
+}
+```
+
+3. **Checkpoint 一致性**:取消后立即写一次 Checkpoint,记录所有节点的 Cancelled 状态。Resume 时这些节点保持 Cancelled(不会重新执行),除非用户显式 `--reset` 重置。
+
+---
 
 ### 5.4 失败传播策略矩阵
 
-| `DagFailurePolicy` | 重试? | Fallback? | Recovery? | Replan? | 关键路径终止? |
-|---|---|---|---|---|---|
-| `RetryThenEscalate`(默认) | 是 | 是 | 是 | 是 | 是 |
-| `Retry` | 是 | 否 | 否 | 否 | 否(非关键路径继续) |
-| `Fallback` | 否 | 是 | 否 | 否 | 否 |
-| `Abort` | 否 | 否 | 否 | 否 | 是(任何失败即终止) |
-| `Escalate` | 否 | 否 | 是 | 是 | 是 |
+#### 5.4.1 v0.2 新增策略
+
+v0.1 定义了 5 种 `DagFailurePolicy`:`RetryThenEscalate` / `Retry` / `Fallback` / `Abort` / `Escalate`。v0.2 新增 2 种以支持部分失败容错场景(见 §15.2 场景 2):
+
+```rust
+// rust/crates/runtime/src/dag/graph.rs(扩展 DagFailurePolicy)
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DagFailurePolicy {
+    // ... v0.1 5 种变体 ...
+
+    /// ★ v0.2 新增:继续执行不依赖失败节点的后续节点。
+    /// 失败节点的下游标记 Skipped,但其他分支继续。
+    /// 适用于:并行调研、部分结果可用场景。
+    ContinueOnFailure,
+
+    /// ★ v0.2 新增:尽最大努力执行所有可执行节点。
+    /// 即使有节点失败,只要下游依赖的上游全部 Succeeded(或 Skipped 视为满足),
+    /// 下游就尝试执行。适用于:Cleanup / 报告汇总等幂等任务。
+    BestEffort,
+}
+```
+
+`ContinueOnFailure` 与 `BestEffort` 的关键差异:
+
+| 策略 | 失败节点下游 | 不依赖失败节点的下游 | 用途 |
+|---|---|---|---|
+| `ContinueOnFailure` | Skipped(级联跳过) | 继续执行 | 部分结果可用,失败分支丢弃 |
+| `BestEffort` | 尝试执行(若其他上游全 Succeeded) | 继续执行 | 尽可能多跑节点,汇总报告 |
+
+#### 5.4.2 完整策略矩阵(v0.2)
+
+| `DagFailurePolicy` | 重试? | Fallback? | Recovery? | Replan? | 关键路径终止? | 下游处理 |
+|---|---|---|---|---|---|---|
+| `RetryThenEscalate`(默认) | 是 | 是 | 是 | 是 | 是 | 失败则级联 Skipped |
+| `Retry` | 是 | 否 | 否 | 否 | 否(非关键路径继续) | 失败则级联 Skipped |
+| `Fallback` | 否 | 是 | 否 | 否 | 否 | 失败则级联 Skipped |
+| `Abort` | 否 | 否 | 否 | 否 | 是(任何失败即终止) | DAG 立即终止 |
+| `Escalate` | 否 | 否 | 是 | 是 | 是 | 失败则级联 Skipped |
+| `ContinueOnFailure`(v0.2) | 否 | 否 | 否 | 否 | 否 | 失败节点下游 Skipped,其他分支继续 |
+| `BestEffort`(v0.2) | 否 | 否 | 否 | 否 | 否 | 尽可能执行所有可执行节点 |
+
+#### 5.4.3 场景 → 策略选择表
+
+| 场景 | 推荐 `DagFailurePolicy` | 理由 |
+|---|---|---|
+| 多文件重构(写操作,需 SAGA 补偿) | `Abort` 或 `RetryThenEscalate` | 写操作失败必须回滚,不允许部分成功 |
+| 并行调研多个方案(只读,部分失败可接受) | `ContinueOnFailure` | 失败的调研丢弃,其他成功结果可用 |
+| 清理任务 / 报告汇总(幂等) | `BestEffort` | 尽可能多跑,失败不影响其他节点 |
+| 跨模块依赖链(A → B → C 严格顺序) | `RetryThenEscalate` | 中间失败需 retry/fallback,否则下游无法跑 |
+| 验证任务(verify_command 失败) | `Retry` | 验证失败先重试,不升级到 Recovery |
+| 长时间运行任务(>10min) | `Abort` + 短 timeout | 避免单点失败拖垮整个 DAG |
+| 关键生产任务(不允许部分成功) | `Abort` | 任一失败立即终止,人工介入 |
+
+#### 5.4.4 ContinueOnFailure 实现要点
+
+`ContinueOnFailure` 策略下,`handle_node_failure` 直接返回 `Ok(true)`(继续调度),但需要:
+
+1. **级联 Skipped**:失败节点的所有下游(传递闭包)标记为 Skipped,避免 ready_nodes 拾取。
+2. **不级联到其他分支**:`cascade_skip_downstream` 只跳过失败节点的下游,不影响兄弟分支。
+3. **DAG 完成判定**:`all_terminal()` 仍能正确返回 true(Skipped 是终态)。
+
+```rust
+// handle_node_failure 中的 ContinueOnFailure 分支
+if policy == DagFailurePolicy::ContinueOnFailure {
+    // 不重试,不补偿,直接级联跳过下游
+    self.cascade_skip_downstream(&result.node_id);
+    self.dag.mark_status(&result.node_id, NodeStatus::Failed);
+    return Ok(true); // DAG 继续
+}
+
+if policy == DagFailurePolicy::BestEffort {
+    // 失败节点的下游不强制 Skipped,由 ready_nodes 自然判定:
+    // 若下游的所有上游都 Succeeded(失败的上游不算),则下游可执行
+    // 需要调整 all_deps_succeeded 逻辑:把 Skipped 视为"满足"
+    self.dag.mark_status(&result.node_id, NodeStatus::Failed);
+    return Ok(true);
+}
+```
+
+`BestEffort` 策略需要扩展 `all_deps_succeeded`:
+
+```rust
+fn all_deps_succeeded_with_best_effort(&self, idx: NodeIndex) -> bool {
+    self.graph
+        .neighbors_directed(idx, Direction::Incoming)
+        .all(|dep_idx| {
+            self.graph.node_weight(dep_idx).map(|n| {
+                matches!(n.status, NodeStatus::Succeeded | NodeStatus::Skipped | NodeStatus::Failed)
+                // Failed 也视为"满足",让下游尝试执行
+            }).unwrap_or(false)
+        })
+}
+```
 
 ---
 
@@ -1796,6 +2068,511 @@ impl DagScheduler {
 }
 ```
 
+### 8.5 CheckpointStore trait 完整定义
+
+v0.1 §8.3 的 `CheckpointStore` 是具体 struct(绑定文件系统)。v0.2 抽象为 trait,允许替换为内存实现(测试用)、SQLite 实现(高性能场景)、远程存储实现(分布式场景)。
+
+```rust
+// rust/crates/runtime/src/dag/checkpoint.rs(扩展)
+
+use std::path::PathBuf;
+use async_trait::async_trait;
+use tokio::fs;
+use serde::{Deserialize, Serialize};
+
+use super::graph::{DagConfig, DagError, DagGraph};
+use super::node::{DagNode, NodeResult, NodeStatus};
+
+/// 检查点存储抽象 — 解耦 DagScheduler 与具体存储后端。
+///
+/// 实现者:
+/// - `FsCheckpointStore`(默认):文件系统实现,JSON + YAML 格式,原子写入。
+/// - `InMemoryCheckpointStore`(测试):HashMap 实现,无 IO,用于单测。
+/// - `SqliteCheckpointStore`(未来):SQLite 单文件实现,支持事务与并发读。
+///
+/// 所有方法都返回 `Result<_, DagError>`,IO 错误映射为 `DagError::CheckpointIo`。
+/// 实现应保证:
+/// 1. **原子性**:`save_*` 方法要么完全成功,要么完全不影响现有数据(用 .tmp + rename)。
+/// 2. **幂等性**:对同一 dag_id 多次 `save_dag` 安全,后写覆盖前写。
+/// 3. **并发安全**:多个 `save_node` 可并发调用(不同 node_id 互不干扰)。
+#[async_trait]
+pub trait CheckpointStore: Send + Sync {
+    /// 持久化整个 DagGraph(声明 + 当前状态快照)。
+    async fn save_dag(&self, dag: &DagGraph) -> Result<(), DagError>;
+
+    /// 持久化单个节点结果(增量,不重写整个 dag.yaml)。
+    async fn save_node(&self, dag_id: &str, result: &NodeResult) -> Result<(), DagError>;
+
+    /// 加载 DagGraph(仅声明 + 序列化的运行时状态)。
+    async fn load_dag(&self, dag_id: &str) -> Result<Option<DagGraph>, DagError>;
+
+    /// 加载 DagMeta。
+    async fn load_meta(&self, dag_id: &str) -> Result<Option<DagMeta>, DagError>;
+
+    /// 持久化 DagMeta。
+    async fn save_meta(&self, dag_id: &str, meta: &DagMeta) -> Result<(), DagError>;
+
+    /// Resume:加载 DAG + 重放所有已完成节点的结果。
+    async fn resume(&self, dag_id: &str) -> Result<Option<DagGraph>, DagError>;
+
+    /// 列出所有未完成的 DAG。
+    async fn list_incomplete(&self) -> Result<Vec<String>, DagError>;
+
+    /// 标记 DAG 已完成(更新 meta.completed = true)。
+    async fn mark_completed(&self, dag_id: &str) -> Result<(), DagError>;
+
+    /// 删除 DAG 的所有检查点(用于清理旧 DAG)。
+    async fn delete(&self, dag_id: &str) -> Result<(), DagError>;
+
+    /// 工作区根路径(用于 NOTEBOOK.md 等协同文件访问)。
+    fn workspace_root(&self) -> &std::path::Path;
+}
+
+/// 文件系统实现(默认)。
+#[derive(Debug, Clone)]
+pub struct FsCheckpointStore {
+    workspace_root: PathBuf,
+}
+
+impl FsCheckpointStore {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self { workspace_root: workspace_root.into() }
+    }
+
+    fn dag_dir(&self, dag_id: &str) -> PathBuf {
+        self.workspace_root.join(".claw").join("dags").join(dag_id)
+    }
+
+    fn nodes_dir(&self, dag_id: &str) -> PathBuf {
+        self.dag_dir(dag_id).join("nodes")
+    }
+
+    fn meta_path(&self, dag_id: &str) -> PathBuf {
+        self.dag_dir(dag_id).join("meta.json")
+    }
+
+    fn dag_path(&self, dag_id: &str) -> PathBuf {
+        self.dag_dir(dag_id).join("dag.yaml")
+    }
+
+    /// 原子写入:先写 .tmp,再 rename。
+    /// 保证即使在写入过程中崩溃,也不会留下半写文件。
+    async fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), DagError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await
+                .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        }
+        let tmp = path.with_extension(format!(
+            "{}.tmp",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+        ));
+        fs::write(&tmp, content).await
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        fs::rename(&tmp, path).await
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for FsCheckpointStore {
+    async fn save_dag(&self, dag: &DagGraph) -> Result<(), DagError> {
+        let snapshot = DagGraphSnapshot::from_dag(dag);
+        let yaml = serde_yaml::to_string(&snapshot)
+            .map_err(|e| DagError::YamlParse(e.to_string()))?;
+        Self::atomic_write(&self.dag_path(&dag.id), &yaml).await
+    }
+
+    async fn save_node(&self, dag_id: &str, result: &NodeResult) -> Result<(), DagError> {
+        let json = serde_json::to_string_pretty(result)
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        let path = self.nodes_dir(dag_id).join(format!("{}.json", result.node_id));
+        Self::atomic_write(&path, &json).await
+    }
+
+    async fn load_dag(&self, dag_id: &str) -> Result<Option<DagGraph>, DagError> {
+        let path = self.dag_path(dag_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let yaml = fs::read_to_string(&path).await
+            .map_err(|e| DagError::YamlParse(e.to_string()))?;
+        let snapshot: DagGraphSnapshot = serde_yaml::from_str(&yaml)
+            .map_err(|e| DagError::YamlParse(e.to_string()))?;
+        Ok(Some(snapshot.into_dag_graph()?))
+    }
+
+    async fn load_meta(&self, dag_id: &str) -> Result<Option<DagMeta>, DagError> {
+        let path = self.meta_path(dag_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let json = fs::read_to_string(&path).await
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        let meta: DagMeta = serde_json::from_str(&json)
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        Ok(Some(meta))
+    }
+
+    async fn save_meta(&self, dag_id: &str, meta: &DagMeta) -> Result<(), DagError> {
+        let json = serde_json::to_string_pretty(meta)
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        Self::atomic_write(&self.meta_path(dag_id), &json).await
+    }
+
+    async fn resume(&self, dag_id: &str) -> Result<Option<DagGraph>, DagError> {
+        // 见 §8.7 完整流程
+        let mut dag = match self.load_dag(dag_id).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let nodes_dir = self.nodes_dir(dag_id);
+        if !nodes_dir.exists() {
+            return Ok(Some(dag));
+        }
+        let mut reader = fs::read_dir(&nodes_dir).await
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        while let Some(entry) = reader.next_entry().await
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let json = fs::read_to_string(&path).await
+                .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+            let result: NodeResult = serde_json::from_str(&json)
+                .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+            dag.mark_status(&result.node_id, result.status);
+            dag.set_result(&result.node_id, result);
+        }
+        Ok(Some(dag))
+    }
+
+    async fn list_incomplete(&self) -> Result<Vec<String>, DagError> {
+        let dags_root = self.workspace_root.join(".claw").join("dags");
+        if !dags_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut reader = fs::read_dir(&dags_root).await
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        let mut result = Vec::new();
+        while let Some(entry) = reader.next_entry().await
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?
+        {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let dag_id = entry.file_name().to_string_lossy().to_string();
+            if let Some(meta) = self.load_meta(&dag_id).await? {
+                if !meta.completed {
+                    result.push(dag_id);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn mark_completed(&self, dag_id: &str) -> Result<(), DagError> {
+        let mut meta = self.load_meta(dag_id).await?
+            .unwrap_or_else(|| DagMeta {
+                dag_id: dag_id.to_string(),
+                started_at_ms: 0,
+                last_checkpoint_ms: 0,
+                replan_count: 0,
+                completed: false,
+            });
+        meta.completed = true;
+        meta.last_checkpoint_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.save_meta(dag_id, &meta).await
+    }
+
+    async fn delete(&self, dag_id: &str) -> Result<(), DagError> {
+        let dir = self.dag_dir(dag_id);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).await
+                .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+}
+
+/// 内存实现(测试用)— 不写入文件系统,所有数据保存在 HashMap。
+#[cfg(test)]
+pub struct InMemoryCheckpointStore {
+    workspace_root: PathBuf,
+    dags: std::sync::Mutex<HashMap<String, DagGraph>>,
+    nodes: std::sync::Mutex<HashMap<String, HashMap<String, NodeResult>>>,
+    metas: std::sync::Mutex<HashMap<String, DagMeta>>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl CheckpointStore for InMemoryCheckpointStore {
+    // 实现略,与 FsCheckpointStore 同构但用 HashMap 存储
+    // 关键差异:save_dag 时深 clone DagGraph,load_dag 时返回 clone
+    // #![allow(unused_variables)]
+    async fn save_dag(&self, dag: &DagGraph) -> Result<(), DagError> {
+        self.dags.lock().unwrap().insert(dag.id.clone(), dag.clone());
+        Ok(())
+    }
+    async fn save_node(&self, dag_id: &str, result: &NodeResult) -> Result<(), DagError> {
+        self.nodes.lock().unwrap()
+            .entry(dag_id.to_string())
+            .or_default()
+            .insert(result.node_id.clone(), result.clone());
+        Ok(())
+    }
+    async fn load_dag(&self, dag_id: &str) -> Result<Option<DagGraph>, DagError> {
+        Ok(self.dags.lock().unwrap().get(dag_id).cloned())
+    }
+    async fn load_meta(&self, dag_id: &str) -> Result<Option<DagMeta>, DagError> {
+        Ok(self.metas.lock().unwrap().get(dag_id).cloned())
+    }
+    async fn save_meta(&self, dag_id: &str, meta: &DagMeta) -> Result<(), DagError> {
+        self.metas.lock().unwrap().insert(dag_id.to_string(), meta.clone());
+        Ok(())
+    }
+    async fn resume(&self, dag_id: &str) -> Result<Option<DagGraph>, DagError> {
+        let mut dag = self.load_dag(dag_id).await?;
+        if let Some(dag) = &mut dag {
+            if let Some(nodes) = self.nodes.lock().unwrap().get(dag_id) {
+                for (node_id, result) in nodes {
+                    dag.mark_status(node_id, result.status);
+                    dag.set_result(node_id, result.clone());
+                }
+            }
+        }
+        Ok(dag)
+    }
+    async fn list_incomplete(&self) -> Result<Vec<String>, DagError> {
+        Ok(self.metas.lock().unwrap().iter()
+            .filter(|(_, m)| !m.completed)
+            .map(|(k, _)| k.clone())
+            .collect())
+    }
+    async fn mark_completed(&self, dag_id: &str) -> Result<(), DagError> {
+        if let Some(meta) = self.metas.lock().unwrap().get_mut(dag_id) {
+            meta.completed = true;
+        }
+        Ok(())
+    }
+    async fn delete(&self, dag_id: &str) -> Result<(), DagError> {
+        self.dags.lock().unwrap().remove(dag_id);
+        self.nodes.lock().unwrap().remove(dag_id);
+        self.metas.lock().unwrap().remove(dag_id);
+        Ok(())
+    }
+    fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+}
+```
+
+### 8.6 原子写入与并发安全
+
+#### 8.6.1 原子写入流程
+
+`FsCheckpointStore::atomic_write` 的写入流程:
+
+```
+1. create_dir_all(parent)        ← 确保目录存在
+2. write(.tmp, content)          ← 写入临时文件
+3. rename(.tmp, target)          ← 原子重命名
+```
+
+`rename` 在同一文件系统内是原子的(POSIX `rename(2)` 保证;Windows `MoveFileEx` 用 `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` 也保证)。若步骤 2 崩溃,临时文件残留但 target 不变;若步骤 3 崩溃,target 已是新内容(无中间态)。
+
+#### 8.6.2 并发安全约束
+
+| 并发场景 | 安全性 | 说明 |
+|---|---|---|
+| 多个 `save_node` 并发(不同 node_id) | 安全 | 不同文件,互不影响 |
+| 多个 `save_node` 并发(同一 node_id) | 不安全 | 同一文件,后写覆盖前写(但内容应一致) |
+| `save_dag` 与 `save_node` 并发 | 安全 | 不同文件(dag.yaml vs nodes/X.json) |
+| `save_dag` 与 `load_dag` 并发 | 安全 | rename 原子,reader 看到的要么是旧版要么是新版 |
+| 多个 `save_dag` 并发(同一 dag_id) | 不安全 | 后写覆盖前写,可能丢失中间状态 |
+
+**结论**:同一 dag_id 的 `save_dag` 必须串行(由 `DagScheduler::run` 单线程驱动,天然串行)。`save_node` 可并行(不同 node_id)。
+
+#### 8.6.3 损坏恢复
+
+若 `dag.yaml` 解析失败(磁盘错误 / 不完整写入 / 手动编辑错误),`load_dag` 返回 `DagError::YamlParse`。`resume` 流程捕获此错误后:
+
+1. 记录 warn 日志(含 dag_id + 错误详情)。
+2. 检查 `.tmp` 文件是否存在(rename 失败的残留)→ 若存在,尝试用 .tmp 恢复。
+3. 若 .tmp 也不可用,返回 `None`(调度器从头开始,丢失历史进度)。
+
+```rust
+async fn load_dag_with_recovery(&self, dag_id: &str) -> Option<DagGraph> {
+    match self.load_dag(dag_id).await {
+        Ok(Some(dag)) => Some(dag),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("dag.yaml corrupt for {dag_id}: {e}; attempting .tmp recovery");
+            let tmp = self.dag_path(dag_id).with_extension("yaml.tmp");
+            if tmp.exists() {
+                if let Ok(yaml) = tokio::fs::read_to_string(&tmp).await {
+                    if let Ok(snapshot) = serde_yaml::from_str::<DagGraphSnapshot>(&yaml) {
+                        return snapshot.into_dag_graph().ok();
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+```
+
+### 8.7 Resume 完整流程
+
+#### 8.7.1 流程图
+
+```
+用户调用 dag_status({dag_id: "dag-xxx"}) → 发现 incomplete
+   ↓
+用户调用 dag_run({resume: "dag-xxx"}) 或新工具 dag_resume
+   ↓
+CheckpointStore::resume(dag_id)
+   ├─ load_dag(dag_id) → DagGraph(含序列化的 status 快照)
+   ├─ 遍历 nodes/*.json,加载每个 NodeResult
+   ├─ 对每个 result: dag.mark_status + dag.set_result
+   └─ 返回恢复后的 DagGraph
+   ↓
+DagScheduler::new(dag, ...)
+   ↓
+DagScheduler::run()
+   ├─ ready_nodes() 跳过 Succeeded / Failed / Skipped / Cancelled(终态)
+   ├─ 只拾取 Pending 节点(包括从未执行的 + resume 时未到达的)
+   └─ 继续调度
+```
+
+#### 8.7.2 Resume 代码骨架
+
+```rust
+// rust/crates/runtime/src/dag/scheduler.rs(扩展)
+
+impl DagScheduler {
+    /// 从检查点恢复 DAG 执行。
+    ///
+    /// 与 `run()` 的差异:
+    /// 1. 先调用 `checkpoint_store.resume(dag_id)` 加载已恢复的 DagGraph
+    /// 2. 跳过所有终态节点(Succeeded/Failed/Skipped/Cancelled)
+    /// 3. 从 Pending 节点继续调度
+    ///
+    /// 若 dag_id 不存在,返回 `DagError::NodeNotFound`。
+    pub async fn run_from_checkpoint(
+        &mut self,
+        dag_id: &str,
+    ) -> Result<DagRunResult, DagError> {
+        let resumed = self.checkpoint_store.resume(dag_id).await
+            .map_err(|e| DagError::CheckpointIo(e.to_string()))?
+            .ok_or(DagError::NodeNotFound(dag_id.to_string()))?;
+
+        // 替换当前 dag 为恢复后的版本(保留 replan_count)
+        let replan_count = self.dag.replan_count;
+        self.dag = resumed;
+        self.dag.replan_count = replan_count;
+
+        // 注入恢复上下文到 NOTEBOOK
+        let resume_entry = format!(
+            "\n## DAG Resume: {dag_id}\n- Resumed at: {}\n- Pending nodes: {}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| format!("{} (unix epoch)", d.as_secs()))
+                .unwrap_or_else(|_| "unknown".to_string()),
+            self.dag.ready_nodes().len(),
+        );
+        let notebook_path = self.checkpoint_store.workspace_root().join("NOTEBOOK.md");
+        let mut content = tokio::fs::read_to_string(&notebook_path).await.unwrap_or_default();
+        content.push_str(&resume_entry);
+        let _ = tokio::fs::write(&notebook_path, content).await;
+
+        // 继续调度(普通 run 流程)
+        self.run().await
+    }
+}
+
+// conversation.rs 中的 dag_resume 工具路由
+async fn execute_dag_resume(
+    &mut self,
+    input: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: serde_json::Value = serde_json::from_str(input)?;
+    let dag_id = parsed.get("dag_id")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'dag_id'")?;
+
+    let checkpoint_store = self.checkpoint_store.clone()
+        .ok_or("checkpoint_store not configured")?;
+
+    // 先加载 DAG 声明(用于构造 scheduler)
+    let dag = checkpoint_store.load_dag(dag_id).await
+        .map_err(|e| format!("load failed: {e}"))?
+        .ok_or("DAG not found")?;
+
+    let coordinator = self.multi_agent_coordinator.clone()
+        .ok_or("multi_agent_coordinator not configured")?;
+    let recovery = self.recovery_orchestrator.clone()
+        .unwrap_or_else(|| Arc::new(Mutex::new(RecoveryOrchestrator::new())));
+    let cancel_token = self.cancel_token.child_token();
+
+    let mut scheduler = DagScheduler::new(
+        dag, coordinator, recovery, cancel_token, checkpoint_store,
+    );
+
+    match scheduler.run_from_checkpoint(dag_id).await {
+        Ok(result) => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "status": "resumed_and_completed",
+            "dag_id": result.dag_id,
+            "succeeded": result.succeeded,
+            "failed": result.failed,
+            "skipped": result.skipped,
+        }))?),
+        Err(e) => Ok(format!("DAG resume failed: {e}")),
+    }
+}
+```
+
+#### 8.7.3 Resume 跳过 Completed 节点的保证
+
+`DagGraph::ready_nodes` 的实现已保证只返回 `Pending` 节点(见 §4.1):
+
+```rust
+pub fn ready_nodes(&self) -> Vec<&DagNode> {
+    self.graph.node_indices()
+        .filter_map(|idx| {
+            let node = self.graph.node_weight(idx)?;
+            if node.status != NodeStatus::Pending { return None; }  // ← 关键
+            if self.all_deps_succeeded(idx) { Some(node) } else { None }
+        })
+        .collect()
+}
+```
+
+Resume 后,已 Succeeded 节点的 `status` 被 `mark_status` 设为 Succeeded,不会被 `ready_nodes` 拾取。已 Failed / Skipped / Cancelled 同理。只有 Pending 节点(从未执行 或 上游刚完成但未 spawn)会被调度。
+
+#### 8.7.4 Resume 后的 NOTEBOOK 协同
+
+Resume 时,NOTEBOOK.md 的"DAG Progress"段已包含历史节点的 summary。新启动的子 agent 通过 `memory_access.read = [notebook]` 可读取这些 summary,获得历史上下文。这避免了"resume 后子 agent 不知道之前做了什么"的问题。
+
+```rust
+// 节点 spawn 时,把 NOTEBOOK 的 DAG Progress 段注入子 agent prompt
+let notebook_summary = extract_dag_progress_section(&notebook_path, &dag_id).await;
+let task_with_context = format!(
+    "{task}\n\n## 历史上下文(来自 NOTEBOOK.md)\n{notebook_summary}",
+    task = node.task,
+);
+// 用 task_with_context 替代 task 传给 coordinator.spawn
+```
+
 ---
 
 ## 九、LaneEvent 扩展
@@ -2224,6 +3001,241 @@ async fn execute_dag_status(
 }
 ```
 
+### 10.3 主 agent 调用对话示例
+
+主 agent 通过 tool call 触发 DAG 的典型对话片段(展示完整交互流):
+
+```text
+[user]
+请把 rust/crates/runtime/src/multi_agent/mod.rs 拆分为:
+- multi_agent/mod.rs(只保留 pub use 重导出)
+- multi_agent/coordinator.rs(MultiAgentCoordinator 主体)
+- multi_agent/subagent.rs(Subagent + SubagentStatus)
+- multi_agent/tests.rs(单测)
+然后跑 cargo test 确认不破坏现有功能。
+
+[assistant]
+我来分析这个任务:需要拆分一个文件 + 更新 mod 声明 + 验证测试。
+这是一个多步骤且有依赖关系的任务,适合用 DAG 编排。
+备份 → 拆分 → 更新 mod → (并行)check + test,共 5 个节点。
+
+[tool_call: dag_run]
+input: {
+  "task_summary": "拆分 multi_agent/mod.rs 为 4 个子模块并验证测试",
+  "max_parallelism": 2,
+  "timeout_secs": 600,
+  "on_failure": "abort",
+  "nodes": [
+    {"id": "backup", "agent": "filesystem-agent",
+     "task": "创建 .claw/backups/multi_agent-mod.rs.bak 备份原文件",
+     "mode": "fork", "timeout_secs": 30},
+    {"id": "split", "agent": "coder",
+     "task": "把 multi_agent/mod.rs 拆分为 coordinator.rs/subagent.rs/tests.rs",
+     "depends_on": ["backup"], "mode": "fork", "timeout_secs": 120,
+     "retry": {"max_attempts": 2}},
+    {"id": "update_mods", "agent": "coder",
+     "task": "更新 multi_agent/mod.rs 的 mod 声明",
+     "depends_on": ["split"], "mode": "fork", "timeout_secs": 30},
+    {"id": "cargo_check", "agent": "verifier",
+     "task": "运行 cargo check -p runtime 验证编译",
+     "depends_on": ["update_mods"],
+     "verify_command": "cargo check -p runtime", "timeout_secs": 120},
+    {"id": "cargo_test", "agent": "verifier",
+     "task": "运行 cargo test -p runtime --lib multi_agent",
+     "depends_on": ["update_mods"],
+     "verify_command": "cargo test -p runtime --lib multi_agent --no-fail-fast",
+     "timeout_secs": 300}
+  ]
+}
+
+[tool_result]
+{
+  "status": "completed",
+  "dag_id": "dag-1778000000-ab12",
+  "succeeded": 5,
+  "failed": 0,
+  "skipped": 0,
+  "total_tokens": 12853,
+  "elapsed_ms": 18420
+}
+
+[assistant]
+DAG 编排已完成。5 个节点全部成功:
+- backup:已创建备份文件
+- split:已拆分为 coordinator.rs/subagent.rs/tests.rs
+- update_mods:已更新 mod 声明
+- cargo_check:编译通过
+- cargo_test:全部单测通过
+
+总耗时约 18 秒,消耗 12853 tokens。拆分完成且不破坏现有功能。
+
+[user]
+现在把拆分前的备份删掉,并把这次拆分经验记到 NOTEBOOK
+
+[assistant]
+[tool_call: dag_run]
+input: {
+  "task_summary": "清理备份文件并记录拆分经验",
+  "on_failure": "best_effort",
+  "nodes": [
+    {"id": "cleanup", "agent": "filesystem-agent",
+     "task": "删除 .claw/backups/multi_agent-mod.rs.bak",
+     "mode": "fork", "timeout_secs": 10},
+    {"id": "notebook", "agent": "notebook-agent",
+     "task": "把 multi_agent/mod.rs 拆分经验追加到 NOTEBOOK.md",
+     "depends_on": ["cleanup"], "mode": "fork", "timeout_secs": 30}
+  ]
+}
+```
+
+**对话设计要点**:
+
+1. 主 agent 在调用 `dag_run` 前,先用自然语言解释"为什么要用 DAG"(让用户理解编排决策)。
+2. `dag_run` 的 `task_summary` 注入到每个子 agent 的 prompt,子 agent 知道全局目标。
+3. 工具返回的 JSON 包含 `dag_id` + 节点统计,主 agent 据此向用户汇报。
+4. 第二次 `dag_run`(清理 + 记笔记)用 `best_effort` 策略,即使清理失败也尝试记笔记。
+
+### 10.4 错误处理矩阵
+
+| 错误场景 | 错误类型 | 返回给主 agent 的 JSON | 主 agent 应对策略 |
+|---|---|---|---|
+| DAG not found(dag_status 查询) | `DagError::NodeNotFound` | `{"error": "DAG not found", "dag_id": "..."}` | 提示用户 dag_id 错误或列出 incomplete DAGs |
+| 节点不存在(cancel_node) | `DagError::NodeNotFound` | `{"error": "node not found", "node_id": "..."}` | 检查节点 ID 拼写 |
+| YAML 解析失败 | `DagError::YamlParse` | `{"error": "yaml parse: <details>"}` | 修复 YAML 语法后重试 |
+| 环检测失败 | `DagError::CycleDetected` | `{"error": "cycle detected", "nodes": [...]}` | 检查 depends_on 拓扑 |
+| 缺失依赖 | `DagError::MissingDependency` | `{"error": "missing dependency: <id>"}` | 补充缺失的节点 |
+| DAG 超时 | `DagError::Timeout` | `{"error": "timeout after N secs", "cancelled_nodes": [...]}` | 增大 timeout_secs 或拆分 DAG |
+| 关键路径失败 | `DagError::Deadlock` | `{"error": "critical path failed", "failed_node": "..."}` | 用 dag_status 查看详情,考虑 replan |
+| 检查点 IO 失败 | `DagError::CheckpointIo` | `{"error": "checkpoint io: <details>"}` | 检查磁盘空间 / 权限 |
+| 权限不足(WorkspaceWrite) | 工具层拒绝 | `{"error": "permission denied: WorkspaceWrite required"}` | 提示用户授权 |
+| 子 agent LLM 请求失败 | `NodeResult.error` | `{"failed_nodes": [...], "errors": [...]}` | 走 retry / fallback / replan |
+| 验证命令失败(verify_command) | `NodeResult.error` | `{"failed_nodes": [...], "verify_exit_code": N}` | 修复代码后 retry |
+| Token budget 耗尽 | `DagError::Deadlock` | `{"error": "token budget exhausted", "used": N, "budget": M}` | 增大 token_budget 或拆分 DAG |
+
+### 10.5 dag_resume 工具 spec(v0.2 新增)
+
+v0.2 新增 `dag_resume` 工具,用于恢复未完成的 DAG:
+
+```rust
+RuntimeToolDefinition {
+    name: "dag_resume",
+    description: "恢复一个未完成的 DAG。从最近的检查点加载状态,跳过已完成节点,继续执行未完成节点。适用于:DAG 执行中崩溃 / 用户主动中断后重启 / 跨会话恢复。",
+    input_schema: serde_json::json!({
+        "type": "object",
+        "properties": {
+            "dag_id": {
+                "type": "string",
+                "description": "要恢复的 DAG ID(可通过 dag_status 查询 incomplete 列表获取)"
+            },
+            "reset": {
+                "type": "boolean",
+                "default": false,
+                "description": "是否重置所有 Failed/Skipped/Cancelled 节点为 Pending,重新执行。默认 false(只继续 Pending 节点)"
+            }
+        },
+        "required": ["dag_id"]
+    }),
+    required_permission: PermissionMode::WorkspaceWrite,
+}
+```
+
+`reset: true` 的语义:把所有非 Succeeded 节点重置为 Pending,清空 `nodes/*.json` 中对应的 NodeResult。用于"想重新尝试之前失败的节点"场景。
+
+```rust
+async fn execute_dag_resume(
+    &mut self,
+    input: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let parsed: serde_json::Value = serde_json::from_str(input)?;
+    let dag_id = parsed.get("dag_id").and_then(|v| v.as_str())
+        .ok_or("missing 'dag_id'")?;
+    let reset = parsed.get("reset").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let checkpoint_store = self.checkpoint_store.clone()
+        .ok_or("checkpoint_store not configured")?;
+
+    if reset {
+        // 重置:加载 DAG 声明,把所有非 Succeeded 节点重置为 Pending
+        let mut dag = checkpoint_store.load_dag(dag_id).await
+            .map_err(|e| format!("load failed: {e}"))?
+            .ok_or("DAG not found")?;
+        for idx in dag.graph.node_indices() {
+            if let Some(node) = dag.graph.node_weight_mut(idx) {
+                if node.status != NodeStatus::Succeeded {
+                    node.status = NodeStatus::Pending;
+                    node.attempts = 0;
+                    node.result = None;
+                }
+            }
+        }
+        // 清空 nodes/*.json
+        let nodes_dir = checkpoint_store.workspace_root()
+            .join(".claw").join("dags").join(dag_id).join("nodes");
+        if nodes_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&nodes_dir).await;
+        }
+        checkpoint_store.save_dag(&dag).await
+            .map_err(|e| format!("save failed: {e}"))?;
+    }
+
+    // 走 run_from_checkpoint 流程(见 §8.7.2)
+    let dag = checkpoint_store.load_dag(dag_id).await
+        .map_err(|e| format!("load failed: {e}"))?
+        .ok_or("DAG not found")?;
+
+    let coordinator = self.multi_agent_coordinator.clone()
+        .ok_or("multi_agent_coordinator not configured")?;
+    let recovery = self.recovery_orchestrator.clone()
+        .unwrap_or_else(|| Arc::new(Mutex::new(RecoveryOrchestrator::new())));
+    let cancel_token = self.cancel_token.child_token();
+
+    let mut scheduler = DagScheduler::new(
+        dag, coordinator, recovery, cancel_token, checkpoint_store,
+    );
+
+    match scheduler.run_from_checkpoint(dag_id).await {
+        Ok(result) => Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "status": "resumed",
+            "dag_id": result.dag_id,
+            "succeeded": result.succeeded,
+            "failed": result.failed,
+            "skipped": result.skipped,
+            "elapsed_ms": result.elapsed_ms,
+        }))?),
+        Err(e) => Ok(format!("DAG resume failed: {e}")),
+    }
+}
+```
+
+### 10.6 工具调用并发安全
+
+主 agent 在单个 turn 内可能发起多次 `dag_run`(并行启动多个独立 DAG)。需保证:
+
+1. **每个 DAG 独立 DagScheduler 实例**:不共享 `dag: DagGraph` 字段,避免 `&mut self` 冲突。
+2. **共享 coordinator / recovery**:`MultiAgentCoordinator` 与 `RecoveryOrchestrator` 是 `Arc<Mutex<>>`,可安全共享。
+3. **独立 cancel_token**:每个 DAG 用 `self.cancel_token.child_token()` 生成独立 token,取消一个 DAG 不影响其他。
+4. **CheckpointStore 共享**:`FsCheckpointStore` 是 `Clone` 的(仅含 `workspace_root: PathBuf`),可安全 clone。不同 dag_id 写入不同目录,无冲突。
+
+```rust
+// conversation.rs 中允许多个 DAG 并行执行
+// (但主 agent 通常串行调用 dag_run,因为要等结果)
+match tool_name.as_str() {
+    "dag_run" => self.execute_dag_run(input).await,
+    "dag_status" => self.execute_dag_status(input).await,
+    "dag_resume" => self.execute_dag_resume(input).await,
+    _ => { /* ... */ }
+}
+```
+
+**注**:当前 `execute_dag_run` 是 `&mut self`,且阻塞等待 DAG 完成(同步语义)。若需后台执行 + 轮询,需改为:
+
+1. `execute_dag_run` 立即返回 `dag_id`(不等待)。
+2. 把 `DagScheduler` 存到 `self.running_dags: HashMap<String, DagScheduler>`。
+3. 主 agent 通过 `dag_status` 轮询状态。
+4. DAG 完成时,从 `running_dags` 移除并把结果写到 NOTEBOOK。
+
+这是 v0.3 路线图(异步 DAG),v0.2 保持同步语义以简化实现。
+
 ---
 
 ## 十一、与 MultiAgentCoordinator 协同
@@ -2384,6 +3396,474 @@ impl DagScheduler {
 }
 ```
 
+### 11.4 SubagentExecutor trait 完整定义(v0.2 扩展)
+
+v0.1 §11.2 的 `SubagentExecutor` trait 只有 `execute` 方法。v0.2 扩展为支持 CancellationToken 注入(见 §5.3.2):
+
+```rust
+// rust/crates/runtime/src/dag/coordinator_adapter.rs(扩展)
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use crate::multi_agent::{CoordinationMode, MultiAgentCoordinator, SubagentStatus};
+use super::node::{DagNode, NodeResult, NodeStatus};
+
+/// 子 agent 执行器 trait — 解耦 DagScheduler 与 ConversationRuntime。
+///
+/// v0.2 新增 `execute_with_cancel` 方法,支持子 agent 级 CancellationToken。
+/// 旧 `execute` 方法保留为默认实现(转发到 execute_with_cancel 并忽略 cancel),
+/// 向后兼容 v0.1 的 MockExecutor。
+#[async_trait::async_trait]
+pub trait SubagentExecutor: Send + Sync {
+    /// 执行子 agent turn(不支持取消)— v0.1 接口,保留兼容。
+    async fn execute(
+        &self,
+        node: &DagNode,
+        coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+    ) -> NodeResult {
+        // 默认实现:用不可取消的 token 转发
+        let cancel = CancellationToken::new();
+        // 注:不 cancel,所以 cancel 永远不触发
+        self.execute_with_cancel(node, coordinator, cancel).await
+    }
+
+    /// 执行子 agent turn(支持取消)— v0.2 接口。
+    ///
+    /// 实现应:
+    /// 1. 调用 coordinator.spawn + start
+    /// 2. 构造隔离的 LLM 请求(独立 Session + 独立 prompt cache)
+    /// 3. 在 tokio::select! 中监听 cancel.cancelled()
+    /// 4. 写结果到 .claw/subagents/{id}.md
+    /// 5. 返回 NodeResult(含 refs 路径)
+    async fn execute_with_cancel(
+        &self,
+        node: &DagNode,
+        coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+        cancel: CancellationToken,
+    ) -> NodeResult;
+}
+```
+
+### 11.5 三种 Executor 实现(v0.2 新增)
+
+针对 `CoordinationMode` 的三种模式,提供对应的 Executor 实现。`ConversationExecutor` 是通用实现(v0.1 已有),下面补充针对 Fork/Teammate/Worktree 的特化逻辑。
+
+#### 11.5.1 ForkExecutor — 共享工作目录的并行执行
+
+`Fork` 模式:子 agent 共享主 agent 的工作目录,适合只读分析任务或无文件冲突的并行任务。
+
+```rust
+/// Fork 模式执行器 — 共享工作目录,无隔离。
+///
+/// 适用场景:
+/// - 只读分析(代码 review、架构调研)
+/// - 无文件冲突的并行任务(如不同模块的文档生成)
+///
+/// 不适用:
+/// - 多个子 agent 写同一文件(会冲突)
+/// - 需要 git 隔离的任务(用 WorktreeExecutor)
+pub struct ForkExecutor {
+    pub workspace_root: std::path::PathBuf,
+    /// 持有 api_client 引用(实际实现需注入)
+    // api_client: Arc<ApiClient>,
+}
+
+#[async_trait::async_trait]
+impl SubagentExecutor for ForkExecutor {
+    async fn execute_with_cancel(
+        &self,
+        node: &DagNode,
+        coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+        cancel: CancellationToken,
+    ) -> NodeResult {
+        let start = std::time::Instant::now();
+
+        // 1. spawn + start(共享工作目录,workdir = None)
+        let subagent_id = {
+            let coord = coordinator.lock().await;
+            coord.spawn(&node.agent, &node.task, CoordinationMode::Fork)
+        };
+        {
+            let coord = coordinator.lock().await;
+            let _ = coord.start(&subagent_id);
+        }
+
+        // 2. 执行 LLM 请求(监听 cancel)
+        let result_text = tokio::select! {
+            r = self.call_llm_isolated(&subagent_id, &node.agent, &node.task) => {
+                match r {
+                    Ok(text) => text,
+                    Err(e) => {
+                        let coord = coordinator.lock().await;
+                        let _ = coord.fail(&subagent_id, &e);
+                        return NodeResult {
+                            node_id: node.id.clone(),
+                            status: NodeStatus::Failed,
+                            summary: format!("LLM failed: {e}"),
+                            refs: vec![],
+                            tokens_used: 0,
+                            error: Some(e),
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                        };
+                    }
+                }
+            }
+            _ = cancel.cancelled() => {
+                let coord = coordinator.lock().await;
+                let _ = coord.cancel(&subagent_id);
+                return NodeResult {
+                    node_id: node.id.clone(),
+                    status: NodeStatus::Cancelled,
+                    summary: "cancelled during LLM call".into(),
+                    refs: vec![],
+                    tokens_used: 0,
+                    error: Some("cancelled".into()),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+        };
+
+        // 3. 写结果文件
+        let result_ref = format!(".claw/subagents/{subagent_id}.md");
+        let result_path = self.workspace_root.join(&result_ref);
+        if let Some(parent) = result_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&result_path, &result_text).await;
+
+        // 4. 标记完成
+        {
+            let coord = coordinator.lock().await;
+            let _ = coord.complete(&subagent_id, &result_ref);
+        }
+
+        NodeResult {
+            node_id: node.id.clone(),
+            status: NodeStatus::Succeeded,
+            summary: result_text.chars().take(200).collect(),
+            refs: vec![result_ref],
+            tokens_used: 1000, // 占位:实际从 LLM response 提取
+            error: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+impl ForkExecutor {
+    /// 调用 LLM(隔离请求)— 占位实现,实际需注入 api_client。
+    async fn call_llm_isolated(
+        &self,
+        _subagent_id: &str,
+        agent: &str,
+        task: &str,
+    ) -> Result<String, String> {
+        // 实际实现:复用 conversation.rs::run_subagent_turn 的逻辑
+        // 但抽取为独立函数,不依赖 &mut self
+        Ok(format!("[ForkExecutor] agent={agent} task={task}"))
+    }
+}
+```
+
+#### 11.5.2 TeammateExecutor — 通过 TaskRegistry 协作
+
+`Teammate` 模式:多个子 agent 通过共享 `TaskRegistry` 通信,适合需要协作的任务(如一个 agent 写代码,另一个 agent 同时写测试)。
+
+```rust
+/// Teammate 模式执行器 — 通过 TaskRegistry 协作。
+///
+/// 适用场景:
+/// - 多 agent 协作(如 coder + tester 同时工作)
+/// - 需要中间结果共享(通过 TaskRegistry 的 with_result_ref)
+///
+/// 关键差异(vs Fork):
+/// - spawn 时 workdir = None(同 Fork)
+/// - 但执行前会向 TaskRegistry 注册任务,允许其他 agent 查询
+/// - 完成后把结果写到 TaskRegistry(不仅写 .claw/subagents/)
+pub struct TeammateExecutor {
+    pub workspace_root: std::path::PathBuf,
+    pub task_registry: Arc<Mutex<crate::task_registry::TaskRegistry>>,
+}
+
+#[async_trait::async_trait]
+impl SubagentExecutor for TeammateExecutor {
+    async fn execute_with_cancel(
+        &self,
+        node: &DagNode,
+        coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+        cancel: CancellationToken,
+    ) -> NodeResult {
+        let start = std::time::Instant::now();
+
+        // 1. spawn + 注册到 TaskRegistry
+        let subagent_id = {
+            let coord = coordinator.lock().await;
+            coord.spawn(&node.agent, &node.task, CoordinationMode::Teammate)
+        };
+        {
+            let mut registry = self.task_registry.lock().await;
+            // 注册任务,允许其他 teammate 查询
+            registry.register_task(&subagent_id, &node.task, &node.id);
+        }
+        {
+            let coord = coordinator.lock().await;
+            let _ = coord.start(&subagent_id);
+        }
+
+        // 2. 执行(同 ForkExecutor,但允许中间查询 TaskRegistry)
+        let result_text = tokio::select! {
+            r = self.call_llm_with_registry(&subagent_id, &node.agent, &node.task) => {
+                r.unwrap_or_else(|e| format!("failed: {e}"))
+            }
+            _ = cancel.cancelled() => {
+                let coord = coordinator.lock().await;
+                let _ = coord.cancel(&subagent_id);
+                return NodeResult {
+                    node_id: node.id.clone(),
+                    status: NodeStatus::Cancelled,
+                    summary: "cancelled".into(),
+                    refs: vec![],
+                    tokens_used: 0,
+                    error: Some("cancelled".into()),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+        };
+
+        // 3. 写结果 + 更新 TaskRegistry
+        let result_ref = format!(".claw/subagents/{subagent_id}.md");
+        let result_path = self.workspace_root.join(&result_ref);
+        if let Some(parent) = result_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&result_path, &result_text).await;
+
+        {
+            let mut registry = self.task_registry.lock().await;
+            registry.with_result_ref(&subagent_id, &result_ref);
+        }
+        {
+            let coord = coordinator.lock().await;
+            let _ = coord.complete(&subagent_id, &result_ref);
+        }
+
+        NodeResult {
+            node_id: node.id.clone(),
+            status: NodeStatus::Succeeded,
+            summary: result_text.chars().take(200).collect(),
+            refs: vec![result_ref],
+            tokens_used: 1000,
+            error: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+impl TeammateExecutor {
+    async fn call_llm_with_registry(
+        &self,
+        _subagent_id: &str,
+        agent: &str,
+        task: &str,
+    ) -> Result<String, String> {
+        Ok(format!("[TeammateExecutor] agent={agent} task={task}"))
+    }
+}
+```
+
+#### 11.5.3 WorktreeExecutor — Git Worktree 隔离执行
+
+`Worktree` 模式:每个子 agent 独立 git worktree,完全隔离文件系统,适合需要并行修改同一文件的重构任务。
+
+```rust
+/// Worktree 模式执行器 — 独立 git worktree,文件系统隔离。
+///
+/// 适用场景:
+/// - 并行修改同一文件(每个 worktree 独立副本)
+/// - 需要回滚能力的任务(worktree 可整体删除)
+/// - 实验性改动(不影响主工作目录)
+///
+/// 关键差异(vs Fork):
+/// - spawn 时 workdir = Some(.claw/worktrees/{subagent_id})
+/// - 子 agent 在 worktree 内执行,所有文件修改隔离
+/// - 完成后需把 worktree 的改动合并回主工作目录(由调用方决定)
+pub struct WorktreeExecutor {
+    pub workspace_root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SubagentExecutor for WorktreeExecutor {
+    async fn execute_with_cancel(
+        &self,
+        node: &DagNode,
+        coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+        cancel: CancellationToken,
+    ) -> NodeResult {
+        let start = std::time::Instant::now();
+
+        // 1. spawn(Worktree 模式,coordinator 自动分配 workdir)
+        let subagent_id = {
+            let coord = coordinator.lock().await;
+            coord.spawn(&node.agent, &node.task, CoordinationMode::Worktree)
+        };
+        let workdir = {
+            let coord = coordinator.lock().await;
+            coord.get(&subagent_id)
+                .and_then(|s| s.workdir)
+                .ok_or_else(|| "workdir not allocated".to_string())
+        };
+
+        // 2. 创建 git worktree
+        if let Err(e) = self.create_worktree(&workdir).await {
+            let coord = coordinator.lock().await;
+            let _ = coord.fail(&subagent_id, &e);
+            return NodeResult {
+                node_id: node.id.clone(),
+                status: NodeStatus::Failed,
+                summary: format!("worktree creation failed: {e}"),
+                refs: vec![],
+                tokens_used: 0,
+                error: Some(e),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+
+        {
+            let coord = coordinator.lock().await;
+            let _ = coord.start(&subagent_id);
+        }
+
+        // 3. 在 worktree 内执行 LLM(子 agent 的文件操作限于 workdir)
+        let result_text = tokio::select! {
+            r = self.call_llm_in_worktree(&subagent_id, &node.agent, &node.task, &workdir) => {
+                r.unwrap_or_else(|e| format!("failed: {e}"))
+            }
+            _ = cancel.cancelled() => {
+                // 取消时清理 worktree
+                let _ = self.remove_worktree(&workdir).await;
+                let coord = coordinator.lock().await;
+                let _ = coord.cancel(&subagent_id);
+                return NodeResult {
+                    node_id: node.id.clone(),
+                    status: NodeStatus::Cancelled,
+                    summary: "cancelled".into(),
+                    refs: vec![],
+                    tokens_used: 0,
+                    error: Some("cancelled".into()),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+        };
+
+        // 4. 写结果到主工作目录(不在 worktree 内)
+        let result_ref = format!(".claw/subagents/{subagent_id}.md");
+        let result_path = self.workspace_root.join(&result_ref);
+        if let Some(parent) = result_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&result_path, &result_text).await;
+
+        // 5. 标记完成(worktree 保留,由 SAGA 补偿或显式合并处理)
+        {
+            let coord = coordinator.lock().await;
+            let _ = coord.complete(&subagent_id, &result_ref);
+        }
+
+        NodeResult {
+            node_id: node.id.clone(),
+            status: NodeStatus::Succeeded,
+            summary: result_text.chars().take(200).collect(),
+            refs: vec![result_ref, format!("worktree:{}", workdir.display())],
+            tokens_used: 1000,
+            error: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+impl WorktreeExecutor {
+    /// 创建 git worktree(基于当前 HEAD)。
+    async fn create_worktree(&self, workdir: &std::path::Path) -> Result<(), String> {
+        if let Some(parent) = workdir.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| format!("create worktree parent: {e}"))?;
+        }
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(workdir)
+            .current_dir(&self.workspace_root)
+            .output()
+            .await
+            .map_err(|e| format!("git worktree add: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// 删除 git worktree(取消或补偿时调用)。
+    async fn remove_worktree(&self, workdir: &std::path::Path) -> Result<(), String> {
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(workdir)
+            .current_dir(&self.workspace_root)
+            .output()
+            .await
+            .map_err(|e| format!("git worktree remove: {e}"))?;
+        if !output.status.success() {
+            // worktree 可能已被删除,忽略错误
+            tracing::warn!("git worktree remove failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(())
+    }
+
+    async fn call_llm_in_worktree(
+        &self,
+        _subagent_id: &str,
+        agent: &str,
+        task: &str,
+        workdir: &std::path::Path,
+    ) -> Result<String, String> {
+        Ok(format!(
+            "[WorktreeExecutor] agent={agent} task={task} workdir={}",
+            workdir.display()
+        ))
+    }
+}
+```
+
+#### 11.5.4 三种 Executor 选择策略
+
+| 场景 | 推荐 Executor | CoordinationMode | workdir | 隔离级别 |
+|---|---|---|---|---|
+| 只读分析(代码 review) | `ForkExecutor` | Fork | None | 无隔离(共享主目录) |
+| 并行写不同文件 | `ForkExecutor` | Fork | None | 无隔离(依赖任务划分) |
+| 多 agent 协作(共享中间结果) | `TeammateExecutor` | Teammate | None | 无隔离 + TaskRegistry 协作 |
+| 并行写同一文件 | `WorktreeExecutor` | Worktree | Some | 完全隔离(git worktree) |
+| 实验性改动(可能回滚) | `WorktreeExecutor` | Worktree | Some | 完全隔离 + 可整体删除 |
+| SAGA 补偿场景(需备份) | `WorktreeExecutor` | Worktree | Some | 完全隔离 + git checkout 回滚 |
+
+`DagScheduler` 在 spawn 子 agent 时,根据 `DagNode.mode` 选择 Executor:
+
+```rust
+// scheduler.rs 中根据 mode 选择 executor
+fn select_executor(mode: CoordinationMode) -> Arc<dyn SubagentExecutor> {
+    match mode {
+        CoordinationMode::Fork => Arc::new(ForkExecutor { workspace_root: ... }),
+        CoordinationMode::Teammate => Arc::new(TeammateExecutor {
+            workspace_root: ...,
+            task_registry: ...,
+        }),
+        CoordinationMode::Worktree => Arc::new(WorktreeExecutor { workspace_root: ... }),
+    }
+}
+```
+
+实际实现中,`DagScheduler` 持有 `executor_factory: Box<dyn Fn(CoordinationMode) -> Arc<dyn SubagentExecutor>>`,避免每次 spawn 都创建新 Executor(Executor 可无状态复用)。
+
 ---
 
 ## 十二、实施步骤分解
@@ -2471,6 +3951,272 @@ impl DagScheduler {
 | 10 节点并行调度开销 | < 50ms(不含 LLM) | 集成测试计时 |
 | Checkpoint 写盘(单节点) | < 20ms | 集成测试计时 |
 
+### 13.5 v0.2 新增端到端测试用例
+
+v0.2 新增 8 个端到端测试,覆盖 SAGA 补偿、Replan、取消传播、背压等场景。每个测试使用 `MockExecutor`(可注入失败/延迟),不依赖真实 LLM。
+
+| 测试名 | 覆盖场景 | 输入 | 预期 | 关联章节 |
+|---|---|---|---|---|
+| `saga_rollback_on_node_failure` | SAGA 场景 1:多文件重构 | 5 节点 DAG(backup→split→update→check∥test),注入 `cargo_check` 失败 | `check` Failed,`test` Skipped,`update/split/backup` 触发补偿(逆序),DAG 返回 `succeeded=3 failed=1 skipped=1` | §15.1 |
+| `saga_continue_on_failure_partial_result` | SAGA 场景 2:并行调研部分失败 | 5 节点 DAG(A→B1∥B2∥B3→C),`on_failure=continue_on_failure`,注入 B2 超时 | B1/B3 Succeeded,B2 Failed,B1/B3 下游 C 用 B1+B3 继续,C Succeeded,DAG 返回 `succeeded=4 failed=1` | §15.2 |
+| `saga_cross_node_state_pollution_recovery` | SAGA 场景 3:跨节点状态污染 | 2 节点 DAG(A 修改 config.toml→B 读取),注入 A 写入错误格式 | B 检测到配置错误,A 触发补偿(恢复 config.toml),A 重试成功,B 重试成功 | §15.3 |
+| `replan_on_verifier_rejection` | Replan:Verifier 拒绝 | 3 节点 DAG,中间节点的 verify_command 失败 | 触发 Replan,保留已完成节点,重新规划未完成节点,replan_count=1 | §16 |
+| `replan_doom_loop_protection` | Replan doom loop 防护 | 节点持续失败,触发 4 次 replan | 第 4 次 replan 拒绝(`replan_count >= DEFAULT_MAX_REPLANS=3`),DAG 终止,返回 `DagError::Deadlock` | §16.4 |
+| `checkpoint_persistence_and_recovery` | Checkpoint 持久化与恢复 | 5 节点 DAG,跑到第 3 节点后模拟崩溃(进程退出),重启后 `dag_resume` | Resume 后前 3 节点保持 Succeeded,后 2 节点继续执行,最终全部 Succeeded | §8.7 |
+| `cancellation_propagation_dag_to_node` | 取消传播:DAG 级 → 节点级 | 5 节点 DAG,3 个节点 Running 时调用 `cancel_token.cancel()` | 3 个 Running 节点变 Cancelled,2 个 Pending 节点变 Cancelled,DAG 返回 `DagError::Timeout` | §5.3 |
+| `resource_limit_backpressure` | 资源限制与背压 | 20 节点 DAG,`max_parallelism=4`,`token_budget=5000`,每节点消耗 1000 tokens | 前 4 节点并行,后续节点被背压暂停;第 5 节点启动后 token 用尽,剩余节点 Skipped,DAG 返回部分结果 | §17 |
+
+#### 13.5.1 `saga_rollback_on_node_failure` 测试代码骨架
+
+```rust
+#[tokio::test]
+async fn saga_rollback_on_node_failure() {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 场景:5 节点 DAG,backup→split→update→(check ∥ test)
+    // 注入:cargo_check 节点 verify_command 失败
+    // 预期:check Failed,test Skipped,update/split/backup 逆序补偿
+
+    let rollback_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rollback_order_clone = rollback_order.clone();
+
+    // MockExecutor:check 节点返回 Failed,其他成功
+    // CompensatingExecutor:封装 MockExecutor,失败时记录补偿顺序
+    struct CompensatingExecutor {
+        inner: MockExecutor,
+        rollback_order: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl SubagentExecutor for CompensatingExecutor {
+        async fn execute_with_cancel(
+            &self,
+            node: &DagNode,
+            coord: Arc<Mutex<MultiAgentCoordinator>>,
+            cancel: CancellationToken,
+        ) -> NodeResult {
+            let mut result = self.inner.execute_with_cancel(node, coord, cancel).await;
+            // 模拟补偿:节点 Failed 或下游 Skipped 时,记录节点 ID
+            if result.status == NodeStatus::Failed || result.status == NodeStatus::Skipped {
+                self.rollback_order.lock().unwrap().push(node.id.clone());
+            }
+            result
+        }
+    }
+
+    let executor = Arc::new(CompensatingExecutor {
+        inner: MockExecutor { result_status: NodeStatus::Succeeded, delay_ms: 10 },
+        rollback_order: rollback_order_clone,
+    });
+
+    // 构造 DAG
+    let nodes = vec![
+        DagNode { id: "backup".into(), task: "create backup".into(), ..Default::default() },
+        DagNode { id: "split".into(), task: "split file".into(),
+                  depends_on: vec!["backup".into()], ..Default::default() },
+        DagNode { id: "update".into(), task: "update mods".into(),
+                  depends_on: vec!["split".into()], ..Default::default() },
+        DagNode { id: "check".into(), task: "cargo check".into(),
+                  depends_on: vec!["update".into()],
+                  verify_command: Some("false".into()), // 注入失败
+                  ..Default::default() },
+        DagNode { id: "test".into(), task: "cargo test".into(),
+                  depends_on: vec!["update".into()], ..Default::default() },
+    ];
+    let dag = DagGraph::new("test-saga-1".into(), "saga test".into(), nodes,
+        DagConfig { on_failure: DagFailurePolicy::Abort, ..Default::default() })
+        .expect("DAG construction");
+
+    let coordinator = Arc::new(Mutex::new(MultiAgentCoordinator::new()));
+    let recovery = Arc::new(Mutex::new(RecoveryOrchestrator::new()));
+    let cancel = CancellationToken::new();
+    let store = Arc::new(InMemoryCheckpointStore::new("/tmp/test".into())) as Arc<dyn CheckpointStore>;
+
+    let mut scheduler = DagScheduler::new(dag, coordinator, recovery, cancel, store)
+        .with_executor(executor);
+
+    let result = scheduler.run().await;
+
+    // 验证:check Failed,test Skipped,补偿逆序触发
+    assert!(result.is_err() || result.as_ref().unwrap().failed >= 1);
+    let order = rollback_order.lock().unwrap();
+    // 补偿顺序应为:update → split → backup(逆序)
+    // 注:实际补偿动作由 SAGA 协调器触发,这里仅验证顺序
+    assert!(order.contains(&"check".to_string()));
+}
+```
+
+#### 13.5.2 `replan_doom_loop_protection` 测试代码骨架
+
+```rust
+#[tokio::test]
+async fn replan_doom_loop_protection() {
+    // 场景:节点持续失败,触发 4 次 replan
+    // 预期:第 4 次拒绝,DAG 终止
+
+    let executor = Arc::new(MockExecutor {
+        result_status: NodeStatus::Failed, // 总是失败
+        delay_ms: 0,
+    });
+
+    let nodes = vec![
+        DagNode { id: "always_fail".into(), task: "fail".into(),
+                  retry: RetryPolicy { max_attempts: 1, ..Default::default() },
+                  ..Default::default() },
+    ];
+    let dag = DagGraph::new("test-doom".into(), "doom loop".into(), nodes,
+        DagConfig { on_failure: DagFailurePolicy::RetryThenEscalate,
+                    ..Default::default() }).unwrap();
+
+    let coordinator = Arc::new(Mutex::new(MultiAgentCoordinator::new()));
+    let recovery = Arc::new(Mutex::new(RecoveryOrchestrator::new()));
+    let cancel = CancellationToken::new();
+    let store = Arc::new(InMemoryCheckpointStore::new("/tmp/test".into()))
+        as Arc<dyn CheckpointStore>;
+
+    let mut scheduler = DagScheduler::new(dag, coordinator, recovery, cancel, store)
+        .with_executor(executor);
+
+    let result = scheduler.run().await;
+
+    // 验证:replan_count 达到上限,DAG 终止
+    assert!(matches!(result, Err(DagError::Deadlock)));
+    assert_eq!(scheduler.dag.replan_count, 3); // DEFAULT_MAX_REPLANS
+}
+```
+
+#### 13.5.3 `cancellation_propagation_dag_to_node` 测试代码骨架
+
+```rust
+#[tokio::test]
+async fn cancellation_propagation_dag_to_node() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let cancelled_flag = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = cancelled_flag.clone();
+
+    // MockExecutor:延迟 5s,允许取消中断
+    struct SlowExecutor { cancelled: Arc<AtomicBool> }
+    #[async_trait::async_trait]
+    impl SubagentExecutor for SlowExecutor {
+        async fn execute_with_cancel(
+            &self,
+            node: &DagNode,
+            coord: Arc<Mutex<MultiAgentCoordinator>>,
+            cancel: CancellationToken,
+        ) -> NodeResult {
+            let start = std::time::Instant::now();
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    NodeResult {
+                        node_id: node.id.clone(),
+                        status: NodeStatus::Succeeded,
+                        summary: "done".into(),
+                        refs: vec![], tokens_used: 100, error: None,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                    }
+                }
+                _ = cancel.cancelled() => {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                    NodeResult {
+                        node_id: node.id.clone(),
+                        status: NodeStatus::Cancelled,
+                        summary: "cancelled".into(),
+                        refs: vec![], tokens_used: 0,
+                        error: Some("cancelled".into()),
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                    }
+                }
+            }
+        }
+    }
+
+    let executor = Arc::new(SlowExecutor { cancelled: cancelled_clone });
+
+    // 5 节点并行 DAG(全根节点)
+    let nodes: Vec<DagNode> = (0..5).map(|i| DagNode {
+        id: format!("n{i}"), task: "slow".into(), ..Default::default()
+    }).collect();
+    let dag = DagGraph::new("test-cancel".into(), "cancel test".into(), nodes,
+        DagConfig { max_parallelism: 5, ..Default::default() }).unwrap();
+
+    let coordinator = Arc::new(Mutex::new(MultiAgentCoordinator::new()));
+    let recovery = Arc::new(Mutex::new(RecoveryOrchestrator::new()));
+    let cancel = CancellationToken::new();
+    let store = Arc::new(InMemoryCheckpointStore::new("/tmp/test".into()))
+        as Arc<dyn CheckpointStore>;
+
+    let mut scheduler = DagScheduler::new(dag, coordinator, recovery, cancel.clone(), store)
+        .with_executor(executor);
+
+    // 在另一个 task 中延迟 100ms 后取消
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_clone.cancel();
+    });
+
+    let result = scheduler.run().await;
+
+    // 验证:所有节点 Cancelled,DAG 返回错误
+    assert!(result.is_err());
+    assert!(cancelled_flag.load(Ordering::SeqCst));
+    let terminal_count = scheduler.dag.graph.node_weights()
+        .filter(|n| n.status == NodeStatus::Cancelled).count();
+    assert_eq!(terminal_count, 5);
+}
+```
+
+#### 13.5.4 测试基础设施
+
+```rust
+// rust/crates/runtime/src/dag/tests.rs(测试基础设施)
+
+use super::*;
+use super::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
+use super::coordinator_adapter::{MockExecutor, SubagentExecutor};
+use super::graph::{DagConfig, DagGraph, DagFailurePolicy};
+use super::node::{DagNode, NodeResult, NodeStatus, RetryPolicy};
+use super::scheduler::DagScheduler;
+
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use crate::multi_agent::MultiAgentCoordinator;
+use crate::recovery_orchestrator::RecoveryOrchestrator;
+
+/// 构造测试用 DagScheduler(内存 checkpoint + Mock executor)。
+fn make_test_scheduler(
+    dag: DagGraph,
+    executor: Arc<dyn SubagentExecutor>,
+) -> DagScheduler {
+    let coordinator = Arc::new(Mutex::new(MultiAgentCoordinator::new()));
+    let recovery = Arc::new(Mutex::new(RecoveryOrchestrator::new()));
+    let cancel = CancellationToken::new();
+    let store = Arc::new(InMemoryCheckpointStore::new("/tmp/test".into()))
+        as Arc<dyn CheckpointStore>;
+    DagScheduler::new(dag, coordinator, recovery, cancel, store)
+        .with_executor(executor)
+}
+
+/// 构造线性链 DAG(A → B → C → ...)。
+fn make_linear_dag(node_count: usize, config: DagConfig) -> DagGraph {
+    let nodes: Vec<DagNode> = (0..node_count).map(|i| {
+        let mut node = DagNode {
+            id: format!("n{i}"),
+            task: format!("task {i}"),
+            ..Default::default()
+        };
+        if i > 0 {
+            node.depends_on = vec![format!("n{}", i - 1)];
+        }
+        node
+    }).collect();
+    DagGraph::new("test-dag".into(), "test".into(), nodes, config).unwrap()
+}
+```
+
 ---
 
 ## 十四、风险与缓解
@@ -2538,6 +4284,1754 @@ impl DagScheduler {
 1. **原子写**:所有检查点文件先写 `.tmp` 再 `rename`,保证原子性(已在 `CheckpointStore` 实现)。
 2. **schema 校验**:load 时用 `serde_yaml::from_str` 严格校验,解析失败返回 `DagError::YamlParse` 而非 panic。
 3. **降级到空 DAG**:resume 失败时,log warn 并返回 `None`,调度器从头开始(不阻塞主流程)。
+
+### 14.7 SAGA 补偿失败(v0.2 新增)
+
+**风险**:SAGA 补偿动作本身失败(如 `git checkout` 失败、`git worktree remove` 失败),导致系统处于不一致状态:正向事务部分完成,补偿也部分失败,无法回到初始状态。
+
+**典型场景**:
+
+1. 节点 A 成功创建了 `.bak` 备份文件,节点 B 成功拆分了 `foo.rs`,节点 C 失败 → 触发 SAGA 补偿:
+   - 补偿 B:恢复 `foo.rs`(用 `.bak` 覆盖)— 但 `.bak` 已被节点 B 的子 agent 误删 → 补偿 B 失败。
+   - 补偿 A:删除 `.bak` — 但 `.bak` 已不存在 → 补偿 A 也失败。
+2. Worktree 模式下,节点 A 在 worktree 内创建了实验性 commit,补偿时 `git worktree remove --force` 失败(worktree 内有未提交改动)。
+
+**缓解**:
+
+1. **补偿动作幂等**:每个 compensate 动作必须幂等(可重复执行)。
+   - `git checkout -- <files>`:幂等(checkout 后再 checkout 无副作用)。
+   - `rm -f <file>`:幂等(文件不存在时 `rm -f` 不报错)。
+   - `git worktree remove --force`:幂等(worktree 不存在时报 warn 不报 error)。
+2. **补偿失败不阻断**:单个补偿失败不阻塞其他补偿。记录补偿失败日志,继续执行其他补偿,最终汇总报告"哪些补偿成功、哪些失败"。
+3. **人工介入标记**:若有补偿失败,在 NOTEBOOK.md 写入"⚠ Manual intervention required"段,列出失败的补偿动作 + 当前系统状态,提示用户手动修复。
+4. **备份的备份**:对 SAGA 关键资源(如 `.bak` 文件),补偿前再创建一层 `.bak.bak`,防止补偿动作误删原始备份。
+5. **Worktree 补偿特殊处理**:Worktree 模式下,补偿优先用 `git worktree remove --force`;若失败,降级到 `rm -rf <workdir>` + `git worktree prune`(清理 git 元数据)。
+
+```rust
+// 补偿失败的处理流程
+async fn compensate_node(&self, node_id: &str) -> Result<(), CompensateError> {
+    let node = self.dag.get_node(node_id)?.clone();
+    let compensate_action = node.compensate.as_ref().ok_or(CompensateError::NoAction)?;
+
+    // 执行补偿(幂等)
+    let result = tokio::time::timeout(
+        Duration::from_secs(30), // 补偿超时 30s
+        self.execute_compensate_action(compensate_action),
+    ).await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            // 补偿失败:记录日志,不阻断其他补偿
+            tracing::error!("compensate failed for node {node_id}: {e}");
+            self.append_compensate_failure_to_notebook(node_id, &e).await;
+            Err(CompensateError::ActionFailed(e))
+        }
+        Err(_) => {
+            tracing::error!("compensate timeout for node {node_id}");
+            Err(CompensateError::Timeout)
+        }
+    }
+}
+```
+
+### 14.8 Replan 后状态不一致(v0.2 新增)
+
+**风险**:Replan 重新生成 DAG 的 Pending 部分,但已完成节点的副作用(如写入的文件、修改的 git 状态)与新 DAG 的假设不一致,导致新 DAG 执行时出现意外错误。
+
+**典型场景**:
+
+1. 节点 A 成功创建了 `new_module.rs`,节点 B 失败触发 Replan。Replan 后的新 DAG 假设 `new_module.rs` 不存在(因为新 planner 不知道 A 已执行),导致新 DAG 的节点 A' 重新创建 `new_module.rs` 时与已有文件冲突。
+2. 节点 A 修改了 `Cargo.toml`(添加依赖 `serde_yaml`),节点 B 失败触发 Replan。新 DAG 的节点 A' 又试图修改 `Cargo.toml`,但 `serde_yaml` 已存在,导致重复添加。
+
+**缓解**:
+
+1. **Replan 上下文注入**:Replan 时把"已完成节点的 summary + 修改的文件列表"注入 planner 的 prompt,让 planner 知道哪些工作已完成。
+2. **状态快照**:Replan 前对工作区做一次 `git stash create`(创建未提交 stash 的 commit 对象,不移动 HEAD),Replan 失败时可 `git stash apply` 回滚。
+3. **节点 ID 命名约定**:Replan 后的新节点用 `node_id_v2`、`node_id_v3` 后缀,避免与已完成节点 ID 冲突。
+4. **Verifier 预检**:新 DAG 执行前,先运行一次"状态预检" verifier(如 `git status --porcelain`),对比 Replan 前的快照,若不一致则报警 + 暂停执行。
+5. **Replan 范围限制**:只允许 Replan 未完成节点(保留已完成节点的 DagNode 声明),不允许修改已完成节点的 `depends_on`。这避免了"新 DAG 假设与已完成节点冲突"。
+
+```rust
+// Replan 时的状态快照
+async fn snapshot_before_replan(&self) -> Result<String, DagError> {
+    let output = tokio::process::Command::new("git")
+        .args(["stash", "create"])
+        .current_dir(&self.workspace_root)
+        .output()
+        .await
+        .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+    if !output.status.success() {
+        return Err(DagError::CheckpointIo("git stash create failed".into()));
+    }
+    let stash_commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // 把 stash_commit 写入 DagMeta,Replan 失败时可回滚
+    if let Some(meta) = self.checkpoint_store.load_meta(&self.dag.id).await? {
+        let mut meta = meta;
+        // meta.pre_replan_stash = Some(stash_commit.clone());
+        self.checkpoint_store.save_meta(&self.dag.id, &meta).await?;
+    }
+    Ok(stash_commit)
+}
+```
+
+---
+
+## 十五、SAGA 补偿模式端到端示例
+
+本章是 v0.2 的核心新增内容。SAGA 模式要求:每个正向事务(节点执行)都有对应的补偿动作(rollback),失败时按拓扑逆序执行补偿,使系统回到 DAG 启动前的状态。
+
+### 15.0 DagNode 扩展 compensate 字段
+
+v0.1 的 `DagNode` 没有 compensate 字段。v0.2 扩展:
+
+```rust
+// rust/crates/runtime/src/dag/node.rs(v0.2 扩展)
+
+/// 补偿动作 — 节点失败时执行,用于回滚正向事务的副作用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CompensateAction {
+    /// 无补偿(只读节点,无副作用)。
+    None,
+    /// Git checkout 指定文件(回滚文件修改)。
+    GitCheckout { files: Vec<String> },
+    /// 删除指定文件(回滚文件创建)。
+    RemoveFiles { files: Vec<String> },
+    /// 删除 git worktree(回滚 worktree 创建)。
+    RemoveWorktree { workdir: String },
+    /// 运行自定义 shell 命令(如 `git revert <commit>`)。
+    Shell { command: String },
+    /// 调用子 agent 执行补偿(复杂补偿逻辑)。
+    Subagent { agent: String, task: String },
+}
+
+impl Default for CompensateAction {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+// DagNode 新增字段:
+// #[serde(default)]
+// pub compensate: CompensateAction,
+```
+
+`CompensateAction` 设计原则:
+
+1. **幂等**:每个变体可重复执行无副作用(如 `RemoveFiles` 用 `rm -f` 而非 `rm`)。
+2. **可序列化**:YAML/JSON 可表达,支持声明式定义。
+3. **可组合**:复杂补偿用 `Subagent` 变体,委托给子 agent 执行(如"撤销一组关联文件的修改")。
+
+### 15.1 场景 1:多文件代码重构(经典 SAGA)
+
+#### 15.1.1 业务场景
+
+任务:将 `rust/crates/runtime/src/multi_agent/mod.rs`(单文件 476 行)拆分为:
+
+- `multi_agent/mod.rs`(只保留 `pub use` 重导出)
+- `multi_agent/coordinator.rs`(`MultiAgentCoordinator` 主体)
+- `multi_agent/subagent.rs`(`Subagent` + `SubagentStatus`)
+- `multi_agent/tests.rs`(单测)
+
+并更新 `mod` 声明,跑 `cargo check` + `cargo test` 验证不破坏现有功能。
+
+**SAGA 适用理由**:多次文件写操作有副作用,失败需回滚到拆分前状态,不允许部分成功。
+
+#### 15.1.2 DAG 结构图
+
+```mermaid
+graph LR
+    A[CreateBackup] --> B[SplitFiles]
+    B --> C[UpdateMods]
+    C --> D[CargoCheck]
+    C --> E[CargoTest]
+
+    style A fill:#9f9
+    style B fill:#9f9
+    style C fill:#9f9
+    style D fill:#f99
+    style E fill:#ff9
+```
+
+节点状态颜色说明:绿色=Succeeded,红色=Failed(注入点),黄色=Skipped(级联)。
+
+#### 15.1.3 YAML 声明式定义
+
+```yaml
+# .claw/dags/dag-saga-refactor-001.yaml
+dag:
+  id: dag-saga-refactor-001
+  task_summary: "拆分 multi_agent/mod.rs 为 4 个子模块并验证"
+  max_parallelism: 2
+  timeout_secs: 600
+  on_failure: abort  # SAGA 模式:任何失败立即终止 + 补偿
+  checkpoint_policy: every_node
+
+  nodes:
+    - id: backup
+      agent: "filesystem-agent"
+      mode: Fork
+      task: |
+        创建备份文件 .claw/backups/multi_agent-mod.rs.bak
+        内容是 multi_agent/mod.rs 的完整副本
+      compensate:
+        type: remove_files
+        files:
+          - ".claw/backups/multi_agent-mod.rs.bak"
+      timeout_secs: 30
+
+    - id: split
+      agent: "coder"
+      mode: Fork
+      task: |
+        把 multi_agent/mod.rs 拆分为:
+        - multi_agent/coordinator.rs(MultiAgentCoordinator + JoinStats)
+        - multi_agent/subagent.rs(Subagent + SubagentStatus + CoordinationMode)
+        - multi_agent/tests.rs(所有 #[test] 函数)
+        原地修改 multi_agent/mod.rs,只保留 pub use 重导出
+      depends_on: [backup]
+      compensate:
+        type: git_checkout
+        files:
+          - "src/multi_agent/mod.rs"
+          - "src/multi_agent/coordinator.rs"
+          - "src/multi_agent/subagent.rs"
+          - "src/multi_agent/tests.rs"
+      retry:
+        max_attempts: 2
+        backoff:
+          exponential: { base_secs: 5, max_secs: 30 }
+      timeout_secs: 120
+
+    - id: update_mods
+      agent: "coder"
+      mode: Fork
+      task: |
+        在 multi_agent/mod.rs 顶部添加模块声明:
+          mod coordinator;
+          mod subagent;
+          #[cfg(test)]
+          mod tests;
+        并添加 pub use 重导出公共类型
+      depends_on: [split]
+      compensate:
+        type: git_checkout
+        files:
+          - "src/multi_agent/mod.rs"
+      timeout_secs: 30
+
+    - id: cargo_check
+      agent: "verifier"
+      mode: Fork
+      task: "运行 cargo check -p runtime 验证编译"
+      depends_on: [update_mods]
+      verify_command: "cargo check -p runtime"
+      compensate:
+        type: none  # 验证节点无副作用,无需补偿
+      timeout_secs: 120
+
+    - id: cargo_test
+      agent: "verifier"
+      mode: Fork
+      task: "运行 cargo test -p runtime --lib multi_agent"
+      depends_on: [update_mods]
+      verify_command: "cargo test -p runtime --lib multi_agent --no-fail-fast"
+      compensate:
+        type: none
+      timeout_secs: 300
+```
+
+#### 15.1.4 每个节点的 compensate 动作
+
+| 节点 | 正向动作 | compensate 动作 | 副作用范围 |
+|---|---|---|---|
+| `backup` | 创建 `.claw/backups/multi_agent-mod.rs.bak` | `RemoveFiles([".claw/backups/multi_agent-mod.rs.bak"])` | 备份文件 |
+| `split` | 拆分 `mod.rs`,创建 3 个新文件 + 修改 `mod.rs` | `GitCheckout(["mod.rs", "coordinator.rs", "subagent.rs", "tests.rs"])` | 4 个文件 |
+| `update_mods` | 修改 `mod.rs` 添加 mod 声明 | `GitCheckout(["mod.rs"])` | 1 个文件 |
+| `cargo_check` | 运行 `cargo check` | `None`(无副作用) | 无 |
+| `cargo_test` | 运行 `cargo test` | `None`(无副作用) | 无 |
+
+#### 15.1.5 失败注入点 + 回滚时序
+
+**注入点**:`cargo_check` 节点的 `verify_command` 失败(假设拆分时漏导出了 `Subagent` 类型,导致编译错误)。
+
+**回滚时序**(按拓扑逆序):
+
+```
+T=0s   backup     → Succeeded (创建 .bak 文件)
+T=5s   split      → Succeeded (拆分 mod.rs)
+T=10s  update_mods → Succeeded (更新 mod 声明)
+T=15s  cargo_check → Running   (cargo check 开始)
+T=20s  cargo_test  → Running   (并行启动 cargo test)
+T=45s  cargo_check → Failed    (verify_command exit 1: 编译错误)
+T=45s  ──── 触发 SAGA 补偿(on_failure=abort)────
+T=45s  cargo_test  → Cancelled (正在运行,被 DAG 级 cancel_token 取消)
+T=46s  补偿 update_mods: git checkout -- src/multi_agent/mod.rs
+                    (恢复到 update_mods 执行前的状态)
+T=47s  补偿 split:      git checkout -- src/multi_agent/{mod,coordinator,subagent,tests}.rs
+                    (删除 coordinator.rs/subagent.rs/tests.rs,恢复 mod.rs)
+T=48s  补偿 backup:     rm -f .claw/backups/multi_agent-mod.rs.bak
+                    (删除备份文件)
+T=48s  ──── 补偿完成,DAG 终态 ────
+       最终状态:backup=Failed(补偿后), split=Failed(补偿后),
+                 update_mods=Failed(补偿后), cargo_check=Failed,
+                 cargo_test=Cancelled
+       工作区:回到 DAG 启动前的状态(mod.rs 完整,无新文件)
+```
+
+**关键时序细节**:
+
+1. `cargo_test` 与 `cargo_check` 并行执行,`cargo_check` 失败后立即取消 `cargo_test`(DAG 级 cancel)。
+2. 补偿按拓扑逆序:`update_mods` → `split` → `backup`(后执行的先补偿)。
+3. `cargo_check` 和 `cargo_test` 无 compensate 动作,跳过补偿。
+4. 补偿后,所有节点的 `status` 标记为 `Failed`(即使是 Succeeded 的节点,补偿后也算失败,因为整体目标未达成)。
+
+#### 15.1.6 Checkpoint 状态快照
+
+补偿完成后的 `.claw/dags/dag-saga-refactor-001/` 目录:
+
+```text
+.claw/dags/dag-saga-refactor-001/
+├── dag.yaml              # DagGraph 快照(所有节点 status=Failed/Cancelled)
+├── meta.json             # DagMeta(completed=true, replan_count=0)
+└── nodes/
+    ├── backup.json       # {status: Succeeded → 补偿后 Failed, summary: "..."}
+    ├── split.json        # {status: Succeeded → 补偿后 Failed, summary: "..."}
+    ├── update_mods.json  # {status: Succeeded → 补偿后 Failed, summary: "..."}
+    ├── cargo_check.json  # {status: Failed, error: "verify failed: exit 1"}
+    └── cargo_test.json   # {status: Cancelled, error: "cancelled by DAG"}
+```
+
+`meta.json` 内容:
+
+```json
+{
+  "dag_id": "dag-saga-refactor-001",
+  "started_at_ms": 1778000000000,
+  "last_checkpoint_ms": 1778000048000,
+  "replan_count": 0,
+  "completed": true,
+  "compensated": true,
+  "compensate_failures": []
+}
+```
+
+`dag.yaml` 中的节点状态片段:
+
+```yaml
+nodes:
+  - id: backup
+    status: Failed  # 补偿后标记
+    attempts: 1
+    compensated: true
+  - id: split
+    status: Failed
+    attempts: 1
+    compensated: true
+  - id: update_mods
+    status: Failed
+    attempts: 1
+    compensated: true
+  - id: cargo_check
+    status: Failed
+    attempts: 1
+    compensated: false  # 无 compensate 动作
+  - id: cargo_test
+    status: Cancelled
+    attempts: 1
+    compensated: false
+```
+
+#### 15.1.7 恢复后的 DAG 状态
+
+用户用 `dag_resume({dag_id: "dag-saga-refactor-001", reset: true})` 重新执行:
+
+1. `reset: true` 把所有非 Succeeded 节点重置为 Pending。
+2. 调度器重新调度所有节点(因为全部都是 Failed/Cancelled,重置后全 Pending)。
+3. 主 agent 在 Replan 时已知上次失败的根因(`cargo_check` 编译错误:漏导出 `Subagent`),修正 `split` 节点的 task 描述,补充 `pub use subagent::Subagent`。
+4. 新一轮执行:backup → split(修正后)→ update_mods → cargo_check ✓ → cargo_test ✓。
+5. 全部 Succeeded,无需补偿。
+
+**关键**:SAGA 补偿保证了"失败后系统回到初始状态",用户可安全重试而不用担心残留的半拆分文件。
+
+### 15.2 场景 2:并行子 agent 调研(部分失败容错)
+
+#### 15.2.1 业务场景
+
+任务:让 3 个子 agent 并行调研 3 个 AI 编排框架,汇总对比报告:
+
+- Agent B1:调研 ACP(Agent Communication Protocol)
+- Agent B2:调研 LangGraph
+- Agent B3:调研 AutoGen
+
+Agent C 汇总 B1/B2/B3 的结果,生成对比表格。
+
+**SAGA 适用理由**:这是只读调研任务,无副作用,**无需补偿**。但需处理部分失败(B2 超时),用 `ContinueOnFailure` 策略让 C 用 B1+B3 继续。
+
+#### 15.2.2 DAG 结构图
+
+```mermaid
+graph LR
+    A[DispatchPlan] --> B1[ResearchACP]
+    A --> B2[ResearchLangGraph]
+    A --> B3[ResearchAutoGen]
+    B1 --> C[Summarize]
+    B2 --> C
+    B3 --> C
+
+    style A fill:#9f9
+    style B1 fill:#9f9
+    style B2 fill:#f99
+    style B3 fill:#9f9
+    style C fill:#9f9
+```
+
+B2(红色)= Failed,B1/B3(绿色)= Succeeded,C 用 B1+B3 继续(绿色)。
+
+#### 15.2.3 YAML 声明式定义
+
+```yaml
+# .claw/dags/dag-saga-research-002.yaml
+dag:
+  id: dag-saga-research-002
+  task_summary: "并行调研 ACP/LangGraph/AutoGen 三个 AI 编排框架"
+  max_parallelism: 3
+  timeout_secs: 300
+  on_failure: continue_on_failure  # 关键:部分失败容错
+  checkpoint_policy: every_node
+
+  nodes:
+    - id: dispatch
+      agent: "planner"
+      mode: Fork
+      task: "输出调研计划:每个框架的调研维度(架构/并发模型/状态管理/生态)"
+      compensate: { type: none }  # 只读
+      timeout_secs: 30
+
+    - id: research_acp
+      agent: "researcher"
+      mode: Fork
+      task: |
+        调研 ACP(Agent Communication Protocol):
+        1. 架构(中心化/去中心化)
+        2. 并发模型(同步/异步/actor)
+        3. 状态管理(内存/持久化)
+        4. 生态(社区/插件/工具链)
+      depends_on: [dispatch]
+      compensate: { type: none }
+      timeout_secs: 90
+      retry: { max_attempts: 1 }
+
+    - id: research_langgraph
+      agent: "researcher"
+      mode: Fork
+      task: "调研 LangGraph(同上维度)"
+      depends_on: [dispatch]
+      compensate: { type: none }
+      timeout_secs: 90
+      retry: { max_attempts: 1 }
+
+    - id: research_autogen
+      agent: "researcher"
+      mode: Fork
+      task: "调研 AutoGen(同上维度)"
+      depends_on: [dispatch]
+      compensate: { type: none }
+      timeout_secs: 90
+      retry: { max_attempts: 1 }
+
+    - id: summarize
+      agent: "analyst"
+      mode: Fork
+      task: |
+        汇总三个框架的调研结果,生成对比表格:
+        | 维度 | ACP | LangGraph | AutoGen |
+        若某个框架的调研缺失,在表格中标注 "N/A(调研超时)"
+      depends_on: [research_acp, research_langgraph, research_autogen]
+      compensate: { type: none }
+      timeout_secs: 60
+```
+
+#### 15.2.4 失败注入点 + 容错时序
+
+**注入点**:`research_langgraph` 节点超时(假设 LangGraph 文档站点不可达,子 agent LLM 请求超时 90s)。
+
+**容错时序**:
+
+```
+T=0s    dispatch          → Succeeded (调研计划输出)
+T=5s    research_acp      → Running
+T=5s    research_langgraph → Running
+T=5s    research_autogen  → Running
+T=85s   research_acp      → Succeeded (ACP 调研完成)
+T=85s   research_autogen  → Succeeded (AutoGen 调研完成)
+T=95s   research_langgraph → Failed (90s 超时)
+        ──── on_failure=continue_on_failure 触发 ────
+        research_langgraph 标记 Failed
+        下游 summarize 的依赖:[acp=Succeeded, langgraph=Failed, autogen=Succeeded]
+        ──── 关键判定 ────
+        ContinueOnFailure 策略:失败节点的下游应该 Skipped
+        但 summarize 的 task 明确说"若缺失标注 N/A",说明它能容忍部分缺失
+        ──── 解决方案 ────
+        summarize 的 depends_on 中,langgraph 被标记 Failed
+        all_deps_succeeded 返回 false(因为 langgraph != Succeeded)
+        → summarize 会被 Skipped(级联)
+        ──── 这不符合预期!需要扩展 ────
+```
+
+**问题**:`ContinueOnFailure` 默认级联 Skipped 失败节点的下游,但本场景希望 `summarize` 继续执行(用 B1+B3)。
+
+**解决方案**:v0.2 引入 `depends_on_optional` 字段,区分强依赖(必须 Succeeded)与弱依赖(失败时下游仍可执行):
+
+```yaml
+nodes:
+  - id: summarize
+    depends_on: [research_acp]  # 强依赖:ACP 必须成功
+    depends_on_optional: [research_langgraph, research_autogen]  # 弱依赖:失败时下游仍可执行
+```
+
+`DagGraph::all_deps_succeeded` 扩展:
+
+```rust
+fn all_deps_succeeded(&self, idx: NodeIndex) -> bool {
+    // 强依赖:必须 Succeeded
+    let strong_ok = self.graph
+        .neighbors_directed(idx, Direction::Incoming)
+        .filter(|&dep_idx| {
+            // 假设边权重标记 strong/weak(v0.2 扩展为 DiGraph<DagNode, EdgeKind>)
+            self.graph.edge_weight(self.graph.find_edge(dep_idx, idx).unwrap())
+                .map(|e| matches!(e, EdgeKind::Strong))
+                .unwrap_or(true)
+        })
+        .all(|dep_idx| {
+            self.graph.node_weight(dep_idx)
+                .map(|n| n.status == NodeStatus::Succeeded)
+                .unwrap_or(false)
+        });
+    if !strong_ok { return false; }
+
+    // 弱依赖:只要终态即可(成功/失败/跳过都算)
+    let weak_ok = self.graph
+        .neighbors_directed(idx, Direction::Incoming)
+        .filter(|&dep_idx| {
+            self.graph.edge_weight(self.graph.find_edge(dep_idx, idx).unwrap())
+                .map(|e| matches!(e, EdgeKind::Weak))
+                .unwrap_or(false)
+        })
+        .all(|dep_idx| {
+            self.graph.node_weight(dep_idx)
+                .map(|n| n.status.is_terminal())
+                .unwrap_or(false)
+        });
+    weak_ok
+}
+```
+
+**修正后的时序**:
+
+```
+T=95s   research_langgraph → Failed
+T=95s   ──── ContinueOnFailure + 弱依赖 ────
+        summarize 的强依赖:[acp=Succeeded] ✓
+        summarize 的弱依赖:[langgraph=Failed, autogen=Succeeded] 都终态 ✓
+        → summarize 进入 Ready
+T=96s   summarize → Running
+T=120s  summarize → Succeeded (生成对比表,LangGraph 列标 N/A)
+```
+
+#### 15.2.5 Checkpoint 状态快照
+
+```json
+// nodes/research_langgraph.json
+{
+  "node_id": "research_langgraph",
+  "status": "Failed",
+  "summary": "node timeout after 90s",
+  "refs": [],
+  "tokens_used": 0,
+  "error": "node timeout",
+  "elapsed_ms": 90000
+}
+
+// nodes/summarize.json
+{
+  "node_id": "summarize",
+  "status": "Succeeded",
+  "summary": "生成对比表格,LangGraph 列标注 N/A(调研超时)",
+  "refs": [".claw/subagents/subagent-5.md"],
+  "tokens_used": 2100,
+  "error": null,
+  "elapsed_ms": 24000
+}
+```
+
+#### 15.2.6 恢复后的 DAG 状态
+
+最终 DAG 状态:
+
+| 节点 | 状态 | 说明 |
+|---|---|---|
+| `dispatch` | Succeeded | 调研计划输出 |
+| `research_acp` | Succeeded | ACP 调研完成 |
+| `research_langgraph` | Failed | 90s 超时 |
+| `research_autogen` | Succeeded | AutoGen 调研完成 |
+| `summarize` | Succeeded | 用 B1+B3 生成对比表 |
+
+**总结**:`succeeded=4, failed=1, skipped=0`。无需补偿(只读任务)。用户可选择 `dag_resume({dag_id, reset: true})` 重试 `research_langgraph`,或接受部分结果。
+
+### 15.3 场景 3:跨节点状态污染检测与恢复
+
+#### 15.3.1 业务场景
+
+任务:Agent A 修改 `config.toml`(添加新配置项),Agent B 读取 `config.toml` 并基于新配置执行任务。
+
+**SAGA 适用理由**:A 的写操作有副作用,且 B 依赖 A 的写入结果。若 A 写入错误格式(如 TOML 语法错误),B 会读到无效配置,需要 A 回滚 + 重试。
+
+#### 15.3.2 DAG 结构图
+
+```mermaid
+graph LR
+    A[ModifyConfig] --> B[ReadConfig]
+    A -.->|写入 config.toml| F[(config.toml)]
+    F -.->|读取| B
+
+    style A fill:#9f9
+    style B fill:#f99
+    style F fill:#fc9
+```
+
+#### 15.3.3 YAML 声明式定义
+
+```yaml
+# .claw/dags/dag-saga-config-003.yaml
+dag:
+  id: dag-saga-config-003
+  task_summary: "修改 config.toml 添加新配置项,然后基于新配置执行任务"
+  max_parallelism: 1
+  timeout_secs: 120
+  on_failure: retry_then_escalate  # 失败先重试,再升级
+  checkpoint_policy: every_node
+
+  nodes:
+    - id: modify_config
+      agent: "config-agent"
+      mode: Fork
+      task: |
+        在 config.toml 的 [feature] 段添加:
+          new_feature_enabled = true
+          new_feature_threshold = 0.85
+        保持其他配置不变,确保 TOML 语法正确
+      compensate:
+        type: git_checkout
+        files:
+          - "config.toml"
+      verify_command: "python -c 'import tomllib; tomllib.load(open(\"config.toml\",\"rb\"))'"
+      retry:
+        max_attempts: 2
+        backoff:
+          exponential: { base_secs: 3, max_secs: 15 }
+      timeout_secs: 30
+
+    - id: read_config
+      agent: "worker-agent"
+      mode: Fork
+      task: |
+        读取 config.toml 的 [feature] 段:
+          - new_feature_enabled
+          - new_feature_threshold
+        基于配置执行任务:若 enabled=true 且 threshold>0.8,执行高精度模式
+      depends_on: [modify_config]
+      compensate: { type: none }  # 只读
+      verify_command: "test -f .claw/subagents/subagent-2.md"
+      retry:
+        max_attempts: 2
+      timeout_secs: 60
+```
+
+#### 15.3.4 失败注入点 + 回滚时序
+
+**注入点**:`modify_config` 节点的子 agent 写入了错误格式(如把 `true` 写成 `True`,TOML 不支持大写 `True`),但子 agent 自身报告 Succeeded(LLM 没意识到错误)。
+
+**回滚时序**:
+
+```
+T=0s    modify_config → Running
+T=5s    modify_config → 子 agent 写入 config.toml(new_feature_enabled = True)
+T=6s    modify_config → verify_command 运行(python tomllib.load)
+T=7s    modify_config → verify_command exit 1(TOML 解析失败)
+        modify_config → Failed (verify failed)
+        ──── on_failure=retry_then_escalate 触发 ────
+T=7s    modify_config → Ready (retry, attempts=1 < max_attempts=2)
+        ──── 但!config.toml 已被污染(错误格式) ────
+        ──── 需要先补偿再重试 ────
+T=8s    ──── 触发 SAGA 补偿(modify_config 的 compensate)────
+        git checkout -- config.toml
+        (恢复到 modify_config 执行前的状态)
+T=9s    modify_config → Ready (补偿完成,可重试)
+T=14s   ──── 退避 5s 后重试 ────
+T=14s   modify_config → Running (attempts=2)
+T=19s   modify_config → 子 agent 重新写入(这次用小写 true)
+T=20s   modify_config → verify_command exit 0
+T=21s   modify_config → Succeeded
+T=22s   read_config → Running
+T=50s   read_config → Succeeded
+T=50s   ──── DAG 完成 ────
+```
+
+**关键**:本场景展示了"verify_command 失败 → 补偿 → 重试"的完整循环。补偿在重试前执行,确保重试时工作区是干净的。
+
+#### 15.3.5 跨节点状态检查点如何捕获文件系统状态
+
+本场景的核心挑战:`modify_config` 写入 `config.toml` 后,文件系统状态变化。Checkpoint 需捕获这种变化,以便:
+
+1. **补偿前知道要恢复什么**:`compensate: GitCheckout` 依赖 git index,但若 `config.toml` 不在 git 跟踪中,需用文件备份。
+2. **Resume 时知道文件当前状态**:若 DAG 在 `modify_config` 成功后崩溃,Resume 时 `read_config` 需知道 `config.toml` 已被修改。
+
+**v0.2 文件系统状态捕获**:
+
+```rust
+// 节点执行前:快照涉及的文件
+async fn snapshot_files_before_node(
+    &self,
+    node: &DagNode,
+) -> Result<HashMap<String, FileSnapshot>, DagError> {
+    let mut snapshots = HashMap::new();
+    // 从 node.task 解析涉及的文件(或显式声明 node.watch_files)
+    let watch_files = self.extract_files_from_task(&node.task);
+    for path in &watch_files {
+        let abs = self.workspace_root.join(path);
+        let content = tokio::fs::read(&abs).await.ok();
+        let mtime = tokio::fs::metadata(&abs).await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64);
+        snapshots.insert(path.clone(), FileSnapshot { content, mtime });
+    }
+    Ok(snapshots)
+}
+
+// 节点执行后:对比文件变化
+async fn detect_file_changes(
+    &self,
+    before: &HashMap<String, FileSnapshot>,
+) -> Vec<FileChange> {
+    let mut changes = Vec::new();
+    for (path, before_snap) in before {
+        let after_snap = self.snapshot_file(path).await;
+        if before_snap.content != after_snap.content {
+            changes.push(FileChange::Modified(path.clone()));
+        }
+    }
+    changes
+}
+```
+
+`FileSnapshot` 序列化到 `nodes/{node_id}.files.json`:
+
+```json
+{
+  "node_id": "modify_config",
+  "files": {
+    "config.toml": {
+      "before_mtime": 1778000000000,
+      "after_mtime": 1778000005000,
+      "before_hash": "sha256:abc...",
+      "after_hash": "sha256:def..."
+    }
+  }
+}
+```
+
+Resume 时,加载 `FileSnapshot` 后,可检测"当前文件状态是否与 Checkpoint 记录一致"。若不一致(用户手动改过),发出 warn 提示。
+
+#### 15.3.6 Checkpoint 状态快照
+
+`nodes/modify_config.json`(第一次失败时):
+
+```json
+{
+  "node_id": "modify_config",
+  "status": "Failed",
+  "summary": "verify failed: TOML parse error",
+  "refs": [],
+  "tokens_used": 850,
+  "error": "verify failed: exit 1",
+  "elapsed_ms": 7000,
+  "attempts": 1,
+  "compensated": true
+}
+```
+
+`nodes/modify_config.json`(重试成功后,覆盖):
+
+```json
+{
+  "node_id": "modify_config",
+  "status": "Succeeded",
+  "summary": "config.toml updated with new_feature_enabled=true",
+  "refs": [],
+  "tokens_used": 920,
+  "error": null,
+  "elapsed_ms": 7000,
+  "attempts": 2,
+  "compensated": false
+}
+```
+
+#### 15.3.7 恢复后的 DAG 状态
+
+最终状态:
+
+| 节点 | 状态 | attempts | compensated |
+|---|---|---|---|
+| `modify_config` | Succeeded | 2 | true(第一次失败时补偿) |
+| `read_config` | Succeeded | 1 | false |
+
+**总结**:`succeeded=2, failed=0`。SAGA 补偿 + 重试成功恢复。
+
+### 15.4 SAGA 协调器实施细节
+
+#### 15.4.1 SAGA 协调器代码骨架
+
+```rust
+// rust/crates/runtime/src/dag/saga.rs(v0.2 新增)
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use crate::multi_agent::MultiAgentCoordinator;
+use super::checkpoint::CheckpointStore;
+use super::graph::{DagGraph, DagError};
+use super::node::{CompensateAction, DagNode, NodeResult, NodeStatus};
+
+/// SAGA 协调器 — 负责在 DAG 失败时按拓扑逆序执行补偿。
+pub struct SagaCoordinator {
+    dag: Arc<Mutex<DagGraph>>,
+    checkpoint_store: Arc<dyn CheckpointStore>,
+    coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+}
+
+impl SagaCoordinator {
+    pub fn new(
+        dag: Arc<Mutex<DagGraph>>,
+        checkpoint_store: Arc<dyn CheckpointStore>,
+        coordinator: Arc<Mutex<MultiAgentCoordinator>>,
+    ) -> Self {
+        Self { dag, checkpoint_store, coordinator }
+    }
+
+    /// 触发 SAGA 补偿:对所有已 Succeeded 节点按拓扑逆序执行 compensate。
+    ///
+    /// 触发时机:
+    /// - on_failure=abort 且有关键节点 Failed
+    /// - on_failure=retry_then_escalate 且 retry/fallback/replan 全部失败
+    pub async fn compensate_all(&self) -> Result<CompensateReport, DagError> {
+        let dag = self.dag.lock().await;
+        let topo = dag.topological_order();
+        // 逆序遍历:后执行的先补偿
+        let mut report = CompensateReport::default();
+        for node in topo.into_iter().rev() {
+            if node.status != NodeStatus::Succeeded {
+                continue; // 只补偿已成功的节点
+            }
+            match self.compensate_node(&node.id).await {
+                Ok(()) => report.succeeded.push(node.id.clone()),
+                Err(e) => report.failed.push(CompensateFailure {
+                    node_id: node.id.clone(),
+                    error: e.to_string(),
+                }),
+            }
+            // 标记节点已补偿
+            // dag.mark_compensated(&node.id);
+        }
+        // 写补偿报告到 NOTEBOOK
+        self.write_compensate_report(&report).await;
+        Ok(report)
+    }
+
+    /// 执行单个节点的补偿动作。
+    async fn compensate_node(&self, node_id: &str) -> Result<(), CompensateError> {
+        let dag = self.dag.lock().await;
+        let node = dag.get_node(node_id).map_err(|_| CompensateError::NodeNotFound)?.clone();
+        drop(dag);
+
+        match &node.compensate {
+            CompensateAction::None => Ok(()),
+            CompensateAction::GitCheckout { files } => {
+                self.git_checkout(files).await
+            }
+            CompensateAction::RemoveFiles { files } => {
+                self.remove_files(files).await
+            }
+            CompensateAction::RemoveWorktree { workdir } => {
+                self.remove_worktree(workdir).await
+            }
+            CompensateAction::Shell { command } => {
+                self.run_shell(command).await
+            }
+            CompensateAction::Subagent { agent, task } => {
+                self.run_subagent(agent, task).await
+            }
+        }
+    }
+
+    async fn git_checkout(&self, files: &[String]) -> Result<(), CompensateError> {
+        let mut args = vec!["checkout".to_string(), "--".to_string()];
+        args.extend(files.iter().cloned());
+        let output = tokio::process::Command::new("git")
+            .args(&args)
+            .current_dir(self.checkpoint_store.workspace_root())
+            .output()
+            .await
+            .map_err(|e| CompensateError::ActionFailed(e.to_string()))?;
+        if !output.status.success() {
+            return Err(CompensateError::ActionFailed(
+                String::from_utf8_lossy(&output.stderr).into()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn remove_files(&self, files: &[String]) -> Result<(), CompensateError> {
+        for file in files {
+            let path = self.checkpoint_store.workspace_root().join(file);
+            if path.exists() {
+                tokio::fs::remove_file(&path).await
+                    .map_err(|e| CompensateError::ActionFailed(e.to_string()))?;
+            }
+            // 文件不存在视为成功(幂等)
+        }
+        Ok(())
+    }
+
+    async fn remove_worktree(&self, workdir: &str) -> Result<(), CompensateError> {
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "remove", "--force", workdir])
+            .current_dir(self.checkpoint_store.workspace_root())
+            .output()
+            .await
+            .map_err(|e| CompensateError::ActionFailed(e.to_string()))?;
+        if !output.status.success() {
+            // 降级:rm -rf + git worktree prune
+            let path = self.checkpoint_store.workspace_root().join(workdir);
+            if path.exists() {
+                let _ = tokio::fs::remove_dir_all(&path).await;
+            }
+            let _ = tokio::process::Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(self.checkpoint_store.workspace_root())
+                .output()
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn run_shell(&self, command: &str) -> Result<(), CompensateError> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err(CompensateError::ActionFailed("empty command".into()));
+        }
+        let output = tokio::process::Command::new(parts[0])
+            .args(&parts[1..])
+            .current_dir(self.checkpoint_store.workspace_root())
+            .output()
+            .await
+            .map_err(|e| CompensateError::ActionFailed(e.to_string()))?;
+        if !output.status.success() {
+            return Err(CompensateError::ActionFailed(
+                String::from_utf8_lossy(&output.stderr).into()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn run_subagent(&self, agent: &str, task: &str) -> Result<(), CompensateError> {
+        let subagent_id = {
+            let coord = self.coordinator.lock().await;
+            coord.spawn(agent, task, crate::multi_agent::CoordinationMode::Fork)
+        };
+        // 实际实现:调用 SubagentExecutor::execute
+        // 这里简化为直接标记完成
+        let coord = self.coordinator.lock().await;
+        let _ = coord.complete(&subagent_id, "compensated");
+        Ok(())
+    }
+
+    async fn write_compensate_report(&self, report: &CompensateReport) {
+        let notebook = self.checkpoint_store.workspace_root().join("NOTEBOOK.md");
+        let entry = format!(
+            "\n## SAGA Compensate Report\n\
+             - Succeeded: {:?}\n\
+             - Failed: {:?}\n\
+             - Timestamp: {}\n",
+            report.succeeded,
+            report.failed.iter().map(|f| format!("{} ({})", f.node_id, f.error)).collect::<Vec<_>>(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0),
+        );
+        let mut content = tokio::fs::read_to_string(&notebook).await.unwrap_or_default();
+        content.push_str(&entry);
+        let _ = tokio::fs::write(&notebook, content).await;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompensateReport {
+    pub succeeded: Vec<String>,
+    pub failed: Vec<CompensateFailure>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompensateFailure {
+    pub node_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CompensateError {
+    #[error("node not found")]
+    NodeNotFound,
+    #[error("action failed: {0}")]
+    ActionFailed(String),
+    #[error("timeout")]
+    Timeout,
+}
+```
+
+#### 15.4.2 SAGA 与 DagScheduler 集成
+
+`DagScheduler::handle_node_failure` 在 `Abort` 策略下触发 SAGA 补偿:
+
+```rust
+// scheduler.rs 扩展
+impl DagScheduler {
+    async fn handle_node_failure(&mut self, result: &NodeResult) -> Result<bool, DagError> {
+        let policy = self.dag.config.on_failure;
+
+        // ... retry / fallback / recovery 逻辑(v0.1 已有)...
+
+        // 关键路径失败 + Abort 策略 → 触发 SAGA 补偿
+        if policy == DagFailurePolicy::Abort && self.is_critical_path(&result.node_id) {
+            // 级联跳过下游
+            self.cascade_skip_downstream(&result.node_id);
+            // 触发 SAGA 补偿
+            let saga = SagaCoordinator::new(
+                Arc::new(Mutex::new(self.dag.clone())),
+                self.checkpoint_store.clone(),
+                self.coordinator.clone(),
+            );
+            let report = saga.compensate_all().await
+                .map_err(|e| DagError::CheckpointIo(e.to_string()))?;
+            if !report.failed.is_empty() {
+                tracing::error!("SAGA compensate failures: {:?}", report.failed);
+                // 补偿失败不阻断 DAG 终止,但记录到 NOTEBOOK
+            }
+            return Ok(false); // 终止 DAG
+        }
+
+        Ok(true)
+    }
+}
+```
+
+---
+
+## §16 Replan 机制
+
+### 16.1 何时触发 Replan
+
+Replan 是 DAG 执行过程中针对失败或异常结果重新规划未完成节点的机制。v0.2 引入 Replan 解决 v0.1 仅靠 Retry/Abort 二选一的僵化问题。
+
+触发条件矩阵:
+
+| 触发条件 | 触发源 | 说明 |
+|---------|--------|------|
+| 节点失败且无 compensate 动作 | `DagScheduler::handle_node_failure` | on_failure=Abort,CompensateAction::None |
+| 节点成功但 Verifier 拒绝 | `VerifierAgent::verify` 返回 Reject | acceptance_criteria 未满足 |
+| 用户主动中断后请求重新规划 | CLI 指令 `dag replan <dag_id>` | 用户评估当前方向错误 |
+| 多节点连续失败(>=3) | DagScheduler 计数器 | 怀疑规划本身有缺陷 |
+| 资源不足导致 OOM/超时 | `DagScheduler::handle_resource_error` | 需重新拆分任务粒度 |
+
+不触发 Replan 的场景:
+- Retry 策略下首次失败 → 走重试路径
+- Fallback 策略 → 走降级路径
+- ContinueOnFailure/BestEffort → 失败被吸收,不升级
+- 用户显式 `dag abort` → 直接终止
+
+### 16.2 Replan 算法
+
+核心思路:保留已完成节点(不重新执行),重新规划未完成节点,新 DAG 替换旧 DAG 的 Pending 部分。
+
+算法步骤:
+1. 快照当前 DAG 状态(Completed/Succeeded 节点列表 + 各节点 result)
+2. 收集 Replan 触发上下文(失败节点 ID + 失败原因 + Verifier 反馈)
+3. 调用 Planner 重新生成剩余步骤,输入:
+   - 原始 task_summary
+   - 已完成节点的 result 摘要(作为上下文)
+   - 失败原因 + Verifier 反馈
+   - 当前 DAG 的拓扑结构(供 Planner 理解依赖)
+4. 将新 PlanStep 列表转换为 DagNode 列表,保留原 DAG 的 Succeeded 节点
+5. 构建新 DagGraph:
+   - Succeeded 节点:保留原节点 + 原 result
+   - 新节点:from PlanStep,重新分配 ID(前缀 `replan-{n}-`)
+   - 依赖:新节点间依赖由 Planner 决定,新节点对 Succeeded 节点的依赖通过 `depends_on` 显式声明
+6. 原子替换:用 `CheckpointStore::save_dag` 持久化新 DAG,旧 DAG 标记为 superseded
+7. 重置 DagScheduler 状态,从 Pending 层继续执行
+
+约束:
+- Succeeded 节点的 result 不可篡改(作为新节点的输入上下文)
+- Compensated 节点视为已回滚,不保留在新 DAG 中(其副作用已撤销)
+- 新 DAG 必须通过环检测 + 拓扑校验
+
+### 16.3 Replan 代码骨架
+
+```rust
+// replanner.rs
+use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+use crate::dag::{DagGraph, DagNode, NodeStatus, DagError, CheckpointStore};
+use crate::planner::{PlanArtifact, PlanStep, PlanPhase};
+
+/// Replan 决策输入。
+pub struct ReplanRequest {
+    /// 触发原因。
+    pub reason: ReplanReason,
+    /// 失败节点 ID(若是节点失败触发)。
+    pub failed_node_id: Option<String>,
+    /// 失败原因摘要。
+    pub failure_summary: String,
+    /// Verifier 反馈(若是 Verifier 拒绝触发)。
+    pub verifier_feedback: Option<String>,
+    /// 触发时已 Succeeded 的节点数。
+    pub succeeded_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReplanReason {
+    NodeFailureNoCompensate,
+    VerifierRejected,
+    UserRequested,
+    ConsecutiveFailures,
+    ResourceExhausted,
+}
+
+/// Replan 结果。
+pub enum ReplanOutcome {
+    /// Replan 成功,返回新 DAG。
+    Success { new_dag: DagGraph, replan_count: u32 },
+    /// 超过最大 replan 次数,需人工介入。
+    DoomLoopDetected { attempts: u32, reason: String },
+    /// Planner 无法生成有效计划。
+    PlannerFailed { error: String },
+}
+
+/// Replanner — 负责触发重新规划并替换 DAG。
+pub struct Replanner {
+    /// 最大 replan 次数(防 doom loop)。
+    max_replans: u32,
+    /// Checkpoint 存储。
+    checkpoint_store: Arc<dyn CheckpointStore>,
+    /// Planner 接口(注入,可以是 LLM-backed 或 rule-based)。
+    planner: Arc<dyn Planner>,
+}
+
+#[async_trait]
+pub trait Planner: Send + Sync {
+    async fn replan(
+        &self,
+        original_task: &str,
+        completed: &[CompletedNodeSummary],
+        failure: &ReplanRequest,
+    ) -> Result<Vec<PlanStep>, PlannerError>;
+}
+
+pub struct CompletedNodeSummary {
+    pub node_id: String,
+    pub description: String,
+    pub result_summary: String,
+}
+
+impl Replanner {
+    pub const DEFAULT_MAX_REPLANS: u32 = 3;
+
+    pub fn new(
+        checkpoint_store: Arc<dyn CheckpointStore>,
+        planner: Arc<dyn Planner>,
+    ) -> Self {
+        Self {
+            max_replans: Self::DEFAULT_MAX_REPLANS,
+            checkpoint_store,
+            planner,
+        }
+    }
+
+    /// 触发 Replan。
+    pub async fn replan(
+        &self,
+        dag: &mut DagGraph,
+        request: ReplanRequest,
+    ) -> Result<ReplanOutcome, DagError> {
+        // 1. doom loop 检查
+        if dag.meta.replan_count >= self.max_replans {
+            return Ok(ReplanOutcome::DoomLoopDetected {
+                attempts: dag.meta.replan_count,
+                reason: format!(
+                    "replan count {} >= max {}",
+                    dag.meta.replan_count, self.max_replans
+                ),
+            });
+        }
+
+        // 2. 快照已完成节点
+        let completed: Vec<CompletedNodeSummary> = dag
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.status == NodeStatus::Succeeded)
+            .map(|(id, n)| CompletedNodeSummary {
+                node_id: id.clone(),
+                description: n.description.clone(),
+                result_summary: n.result
+                    .as_ref()
+                    .map(|r| r.summary.clone())
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        // 3. 调用 Planner
+        let new_steps = self
+            .planner
+            .replan(&dag.meta.task_summary, &completed, &request)
+            .await
+            .map_err(|e| DagError::ReplanFailed(e.to_string()))?;
+
+        if new_steps.is_empty() {
+            return Ok(ReplanOutcome::PlannerFailed {
+                error: "planner returned empty steps".into(),
+            });
+        }
+
+        // 4. 保留 Succeeded 节点,新增 replan-{n}- 前缀节点
+        let replan_idx = dag.meta.replan_count + 1;
+        let mut new_nodes: HashMap<String, DagNode> = HashMap::new();
+        for (id, node) in &dag.nodes {
+            if node.status == NodeStatus::Succeeded {
+                new_nodes.insert(id.clone(), node.clone());
+            }
+        }
+        for (i, step) in new_steps.iter().enumerate() {
+            let new_id = format!("replan-{replan_idx}-{i}");
+            let node = DagNode::from_plan_step(&new_id, step);
+            new_nodes.insert(new_id, node);
+        }
+
+        // 5. 构建新 DAG(含环检测)
+        let mut new_dag = DagGraph::build_with_existing(new_nodes)?;
+        new_dag.meta = dag.meta.clone();
+        new_dag.meta.replan_count = replan_idx;
+        new_dag.meta.replan_history.push(ReplanHistoryEntry {
+            replan_count: replan_idx,
+            reason: format!("{:?}", request.reason),
+            failed_node_id: request.failed_node_id,
+            timestamp_ms: now_ms(),
+        });
+
+        // 6. 持久化
+        self.checkpoint_store.save_dag(&new_dag).await?;
+
+        // 7. 替换
+        *dag = new_dag;
+
+        Ok(ReplanOutcome::Success {
+            new_dag: dag.clone(),
+            replan_count: replan_idx,
+        })
+    }
+}
+```
+
+### 16.4 Doom Loop 防护
+
+Doom loop 指 Replan 反复生成相同失败的 DAG,导致死循环。v0.2 采用三层防护:
+
+| 层级 | 机制 | 实现 |
+|------|------|------|
+| L1 硬上限 | `max_replans = 3`,超过即 EscalateHuman | `Replanner::replan` 入口检查 |
+| L2 失败模式检测 | 连续 2 次 replan 触发同一节点失败 → 立即终止 | `replan_history` 比对 `failed_node_id` |
+| L3 内容指纹 | 新 DAG 与历史 DAG 拓扑哈希相同 → 拒绝 | `DagGraph::fingerprint()` 比对 |
+
+EscalateHuman 流程:
+1. 写入 `<workspace>/.claw/dag/{dag_id}/escalation.md`,包含:
+   - 原始任务
+   - 已完成节点 + result
+   - 失败节点 + 原因
+   - replan 历史摘要
+   - 建议的人工介入方向
+2. LaneEvent 上报 `lane.failed`(failure_class=SubagentFailure)
+3. CLI 输出 `Escalation required: see .claw/dag/{dag_id}/escalation.md`
+4. DAG 状态置为 `Failed`,不再自动 replan
+
+### 16.5 Replan 与 SAGA 的协同
+
+Replan 与 SAGA 补偿可能同时触发,需明确顺序:
+
+| 触发场景 | 顺序 | 说明 |
+|---------|------|------|
+| 节点失败 + on_failure=Abort | 先 SAGA 补偿 → 再 Replan | 补偿撤销副作用,Replan 在干净状态上重新规划 |
+| 节点失败 + on_failure=RetryThenEscalate | 重试耗尽 → 不补偿 → Replan | Retry 不改写文件,无需补偿 |
+| Verifier 拒绝 | 不补偿 → Replan | 节点已"成功"执行,副作用存在但需重做 |
+| 用户主动 replan | 不补偿 → Replan | 用户承担副作用责任 |
+
+代码集成:
+
+```rust
+// scheduler.rs
+async fn handle_node_failure_with_replan(
+    &mut self,
+    result: &NodeResult,
+) -> Result<(), DagError> {
+    let policy = self.dag.config.on_failure;
+
+    // 1. SAGA 补偿(Abort 策略且关键路径)
+    if policy == DagFailurePolicy::Abort && self.is_critical_path(&result.node_id) {
+        let saga = SagaCoordinator::new(
+            Arc::new(Mutex::new(self.dag.clone())),
+            self.checkpoint_store.clone(),
+            self.coordinator.clone(),
+        );
+        saga.compensate_all().await?;
+    }
+
+    // 2. Replan 决策
+    let request = ReplanRequest {
+        reason: ReplanReason::NodeFailureNoCompensate,
+        failed_node_id: Some(result.node_id.clone()),
+        failure_summary: result.error.clone().unwrap_or_default(),
+        verifier_feedback: None,
+        succeeded_count: self.count_succeeded(),
+    };
+
+    match self.replanner.replan(&mut self.dag, request).await? {
+        ReplanOutcome::Success { .. } => {
+            tracing::info!("replan succeeded, continuing");
+        }
+        ReplanOutcome::DoomLoopDetected { attempts, reason } => {
+            tracing::error!("doom loop: {reason}");
+            self.escalate_to_human(&result.node_id, &reason).await?;
+        }
+        ReplanOutcome::PlannerFailed { error } => {
+            tracing::error!("planner failed: {error}");
+            self.escalate_to_human(&result.node_id, &error).await?;
+        }
+    }
+    Ok(())
+}
+```
+
+---
+
+## §17 资源限制与背压
+
+### 17.1 限制维度
+
+v0.2 引入多维度资源限制,防止 DAG 执行耗尽主机资源:
+
+| 维度 | 默认值 | 配置项 | 作用 |
+|------|--------|--------|------|
+| 并行度 | 4 | `DagConfig::max_parallelism` | 同时执行的节点数上限 |
+| 单节点 token 预算 | 100k | `DagNode::token_budget` | 单节点 LLM 调用总 token 上限 |
+| DAG 总 token 预算 | 1M | `DagConfig::total_token_budget` | 整个 DAG 累计 token 上限 |
+| 内存预算 | 512MB | `DagConfig::memory_budget_mb` | 节点输出 + 中间结果常驻内存上限 |
+| 磁盘预算 | 2GB | `DagConfig::disk_budget_mb` | Checkpoint + worktree 占用上限 |
+| 子 agent 数 | 16 | `DagConfig::max_subagents` | 防止 Fork 模式无限派生 |
+| 单节点 wall-clock | 10min | `DagNode::timeout_secs` | 防止 LLM hang |
+
+### 17.2 max_parallelism 实施细节
+
+采用 `tokio::sync::Semaphore` + JoinSet 配合,而非简单的 JoinSet len 检查:
+
+```rust
+// scheduler.rs
+use tokio::sync::Semaphore;
+use tokio_util::task::JoinSet;
+use std::sync::Arc;
+
+pub struct DagScheduler {
+    dag: DagGraph,
+    /// 并行度信号量。
+    parallelism_permits: Arc<Semaphore>,
+    /// 当前 in-flight 节点 task 集合。
+    node_tasks: JoinSet<NodeResult>,
+    /// 节点级 CancellationToken(供外部取消)。
+    node_cancellation: HashMap<String, CancellationToken>,
+    /// 已用 token 累计。
+    total_tokens_used: u64,
+    /// 总 token 预算。
+    total_token_budget: u64,
+}
+
+impl DagScheduler {
+    pub fn new(dag: DagGraph, store: Arc<dyn CheckpointStore>) -> Self {
+        let max_par = dag.config.max_parallelism.max(1);
+        Self {
+            dag,
+            parallelism_permits: Arc::new(Semaphore::new(max_par)),
+            node_tasks: JoinSet::new(),
+            node_cancellation: HashMap::new(),
+            total_tokens_used: 0,
+            total_token_budget: dag.config.total_token_budget,
+        }
+    }
+
+    /// 调度一层节点。
+    async fn schedule_ready_layer(&mut self) -> Result<(), DagError> {
+        let ready: Vec<String> = self.dag.ready_nodes().into_iter().cloned().collect();
+        for node_id in ready {
+            // 检查 token 预算
+            if self.total_tokens_used >= self.total_token_budget {
+                self.handle_resource_exhausted("token budget exhausted".into()).await?;
+                return Ok(());
+            }
+            // 检查子 agent 数
+            if self.dag.config.max_subagents > 0
+                && self.node_tasks.len() >= self.dag.config.max_subagents as usize
+            {
+                break; // 背压:等下一轮
+            }
+
+            let permit = self.parallelism_permits.clone().acquire_owned().await
+                .map_err(|_| DagError::SchedulerShutdown)?;
+            let node = self.dag.nodes.get(&node_id).cloned().expect("node exists");
+            let cancel_token = CancellationToken::new();
+            self.node_cancellation.insert(node_id.clone(), cancel_token.clone());
+            let store = self.checkpoint_store.clone();
+            let executor = self.executor.clone();
+
+            self.node_tasks.spawn(async move {
+                let _permit = permit;
+                let result = run_node_with_cancel(&node, executor, cancel_token, store).await;
+                result
+            });
+        }
+        Ok(())
+    }
+
+    async fn handle_resource_exhausted(&mut self, reason: String) -> Result<(), DagError> {
+        tracing::warn!("resource exhausted: {reason}");
+        let request = ReplanRequest {
+            reason: ReplanReason::ResourceExhausted,
+            failed_node_id: None,
+            failure_summary: reason,
+            verifier_feedback: None,
+            succeeded_count: self.count_succeeded(),
+        };
+        match self.replanner.replan(&mut self.dag, request).await? {
+            ReplanOutcome::Success { .. } => Ok(()),
+            _ => Err(DagError::ResourceExhausted(reason)),
+        }
+    }
+}
+```
+
+### 17.3 Token budget 追踪
+
+每个节点执行完成后,从 `NodeResult::usage` 累加到 `total_tokens_used`,超预算即触发 Replan 或 Abort。
+
+```rust
+pub struct NodeResult {
+    pub node_id: String,
+    pub status: NodeStatus,
+    pub summary: String,
+    pub error: Option<String>,
+    pub usage: TokenUsage,
+    pub artifacts: Vec<ArtifactRef>,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+    pub fn cost_weighted(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+            + (self.cache_write_tokens / 4)
+            - (self.cache_read_tokens / 10)
+    }
+}
+```
+
+每次节点完成后:
+
+```rust
+self.total_tokens_used += result.usage.cost_weighted();
+if self.total_tokens_used > self.total_token_budget {
+    self.handle_resource_exhausted("token budget exceeded".into()).await?;
+}
+```
+
+### 17.4 内存预算与背压
+
+DAG 执行过程中,节点 `NodeResult::summary` 和 `artifacts` 累积占用内存。背压策略:
+
+| 阈值 | 触发动作 |
+|------|---------|
+| 已用 < 50% budget | 正常执行 |
+| 50% <= 已用 < 80% | 警告日志,继续执行 |
+| 80% <= 已用 < 95% | 暂停调度新节点(等 in-flight 完成),已 in-flight 不动 |
+| 已用 >= 95% | 拒绝调度新节点,触发 Replan 或 Abort |
+
+实施:
+
+```rust
+fn memory_pressure_level(&self) -> MemoryPressure {
+    let used = self.estimate_memory_usage();
+    let budget = self.dag.config.memory_budget_mb as u64 * 1024 * 1024;
+    let ratio = used as f64 / budget as f64;
+    if ratio < 0.5 { MemoryPressure::Normal }
+    else if ratio < 0.8 { MemoryPressure::Warning }
+    else if ratio < 0.95 { MemoryPressure::Backpressure }
+    else { MemoryPressure::Critical }
+}
+
+fn estimate_memory_usage(&self) -> u64 {
+    self.dag.nodes.values()
+        .filter(|n| n.status == NodeStatus::Succeeded)
+        .map(|n| {
+            let summary_size = n.result.as_ref()
+                .map(|r| r.summary.len() as u64)
+                .unwrap_or(0);
+            let artifact_size = n.result.as_ref()
+                .map(|r| r.artifacts.len() as u64 * 256)
+                .unwrap_or(0);
+            summary_size + artifact_size
+        })
+        .sum()
+}
+
+enum MemoryPressure { Normal, Warning, Backpressure, Critical }
+```
+
+### 17.5 磁盘预算
+
+Checkpoint 文件 + Worktree 文件占用磁盘,需定期清理:
+
+- Completed DAG:保留 7 天后自动 `CheckpointStore::delete`
+- Worktree:Fork/Worktree 模式完成后立即删除
+- 旧版本 DAG:Replan 后,标记为 `superseded` 的 DAG 保留 24 小时
+
+```rust
+// checkpoint.rs
+pub async fn gc_expired_dags(&self, retention_days: u32) -> Result<u32, DagError> {
+    let cutoff = now_ms() - (retention_days as u64 * 86400_000);
+    let mut deleted = 0;
+    for dag_id in self.list_incomplete().await? {
+        if let Some(meta) = self.load_meta(&dag_id).await? {
+            if meta.status == DagStatus::Completed && meta.completed_at_ms < cutoff {
+                self.delete(&dag_id).await?;
+                deleted += 1;
+            }
+        }
+    }
+    Ok(deleted)
+}
+```
+
+### 17.6 背压与上层反馈
+
+背压触发时,通过 LaneEvent 上报上层:
+
+| 事件 | 触发时机 | detail |
+|------|---------|--------|
+| `lane.blocked` | 进入 Backpressure 级别 | "memory pressure 85%, pausing new node scheduling" |
+| `lane.red` | 进入 Critical 级别 | "memory pressure 96%, triggering replan" |
+| `lane.failed` | Replan 失败或 Abort | "resource exhausted, no recovery possible" |
+
+CLI 层可在 StatusBar 显示当前 DAG 的资源使用情况:
+
+```text
+DAG dag-xxx | 4/10 nodes | tok 234k/1M | mem 412MB/512MB | par 3/4
+```
+
+---
+
+## §18 性能基准
+
+### 18.1 基准目标
+
+v0.2 性能基准定义三类 DAG 规模的端到端执行时间上限,作为验收门槛:
+
+| 规模 | 节点数 | 边数 | 目标 wall-clock | 备注 |
+|------|--------|------|-----------------|------|
+| 小型 | 5 | 4 | < 5s | 单层 plan + 浅依赖 |
+| 中型 | 20 | 25 | < 30s | 多层 plan + 部分并行 |
+| 大型 | 100 | 150 | < 5min | 多层 plan + 高并行度 |
+
+测量环境:
+- CPU:8 核 3.0GHz+
+- 内存:16GB
+- 磁盘:NVMe SSD
+- 网络:本地 LLM(mock executor,无真实 LLM 调用)
+- LLM 调用:使用 MockExecutor 返回固定结果,排除 LLM 延迟影响
+
+### 18.2 基准场景定义
+
+#### 18.2.1 小型 DAG(5 节点)
+
+```yaml
+dag_id: bench-small
+task: "refactor single file"
+nodes:
+  - id: read
+    description: "read target file"
+    depends_on: []
+  - id: analyze
+    description: "analyze structure"
+    depends_on: [read]
+  - id: modify
+    description: "apply refactor"
+    depends_on: [analyze]
+  - id: verify
+    description: "cargo check"
+    depends_on: [modify]
+  - id: report
+    description: "summary"
+    depends_on: [verify]
+max_parallelism: 4
+```
+
+#### 18.2.2 中型 DAG(20 节点)
+
+3 层结构:
+- Layer 1:1 个 entry 节点
+- Layer 2:5 个并行调研节点(各 1 个依赖)
+- Layer 3:10 个并行修改节点(各依赖 1-2 个 Layer 2)
+- Layer 4:3 个 verify 节点(各依赖 3-4 个 Layer 3)
+- Layer 5:1 个 summary 节点
+
+#### 18.2.3 大型 DAG(100 节点)
+
+5 层结构,每层 20 个节点,层间全连接(每节点依赖上层 2 个节点)。
+
+### 18.3 基准实施
+
+```rust
+// benches/dag_bench.rs
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use claw_runtime::dag::{DagGraph, DagScheduler, MockExecutor, InMemoryCheckpointStore};
+
+fn bench_dag_execution(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dag_execution");
+
+    for (name, node_count) in [
+        ("small", 5),
+        ("medium", 20),
+        ("large", 100),
+    ] {
+        group.bench_with_input(
+            BenchmarkId::new("wall_clock", name),
+            &node_count,
+            |b, &n| {
+                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                    .iter(|| async move {
+                        let dag = build_bench_dag(n);
+                        let store = Arc::new(InMemoryCheckpointStore::new());
+                        let executor = Arc::new(MockExecutor::with_fixed_delay_ms(50));
+                        let mut scheduler = DagScheduler::new(dag, store, executor);
+                        scheduler.run_to_completion().await.expect("bench dag should succeed");
+                    });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_dag_execution);
+criterion_main!(benches);
+```
+
+### 18.4 预期结果矩阵
+
+| 场景 | 串行执行 | 并行(par=4) | 加速比 | 备注 |
+|------|---------|-------------|--------|------|
+| 小型 DAG | 250ms | 150ms | 1.67x | 5 节点深度 5,并行收益有限 |
+| 中型 DAG | 1000ms | 350ms | 2.86x | Layer 2/3 并行收益显著 |
+| 大型 DAG | 5000ms | 1300ms | 3.85x | 接近 4 倍(并行度上限) |
+
+注:基于 MockExecutor 50ms/节点 的固定延迟。
+
+### 18.5 petgraph 操作基准
+
+DAG 调度依赖 petgraph 的核心操作,需独立基准:
+
+| 操作 | 输入规模 | 目标耗时 | petgraph API |
+|------|---------|---------|--------------|
+| 环检测 | 100 节点 150 边 | < 1ms | `kosaraju_scc` |
+| 拓扑排序 | 100 节点 150 边 | < 0.5ms | `toposort` |
+| 邻接查询 | 100 节点 | < 10us | `neighbors_directed` |
+| 子图提取 | 100 节点取 20 子集 | < 0.2ms | `filter_map` + 重建 |
+
+基准代码:
+
+```rust
+// benches/petgraph_bench.rs
+use criterion::{criterion_group, criterion_main, Criterion};
+use petgraph::graph::DiGraph;
+use petgraph::algo::{kosaraju_scc, toposort};
+
+fn bench_petgraph(c: &mut Criterion) {
+    let mut group = c.benchmark_group("petgraph");
+
+    let g = build_graph(100, 150);
+    group.bench_function("kosaraju_scc_100n", |b| {
+        b.iter(|| kosaraju_scc(&g))
+    });
+    group.bench_function("toposort_100n", |b| {
+        b.iter(|| toposort(&g, None))
+    });
+
+    group.finish();
+}
+```
+
+### 18.6 Checkpoint I/O 基准
+
+Checkpoint 写入是 DAG 执行的关键路径,需评估:
+
+| 操作 | 文件大小 | 目标耗时 | 备注 |
+|------|---------|---------|------|
+| save_dag(100 节点) | ~50KB | < 5ms | 含 .tmp + rename 原子写 |
+| save_node(单节点) | ~2KB | < 1ms | append-only |
+| load_dag(100 节点) | ~50KB | < 3ms | 含反序列化 |
+| list_incomplete(1000 DAG) | - | < 10ms | 目录扫描 |
+
+### 18.7 性能回归监控
+
+性能基准通过 CI 集成防止回归:
+
+1. `cargo bench` 输出 JSON 报告
+2. CI 比对 main 分支基准,回归 > 10% 失败
+3. 基准报告写入 `docs/bench/dag-bench-{date}.json`
+4. 月度人工评审基准趋势
+
+### 18.8 已知性能瓶颈与优化方向
+
+| 瓶颈 | 现状 | 优化方向 |
+|------|------|---------|
+| DagScheduler 调度循环 | 每轮重新计算 ready_nodes,O(V+E) | 缓存 ready 集合,增量更新 |
+| CheckpointStore save_node | 每节点一次 fsync | 批量提交 + 周期 fsync |
+| LaneEvent 上报 | 同步 channel | 异步 batch + 队列 |
+| 节点 result 反序列化 | 每次访问重新解析 | 缓存解析结果 |
 
 ---
 

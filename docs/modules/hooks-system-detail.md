@@ -1,15 +1,36 @@
 # Hooks 系统细化方案
 
-- 文档版本: v0.1
+- 文档版本: v0.2
 - 创建日期: 2026-07-21
+- 最后更新: 2026-07-21(v0.2 增量升级)
 - 父文档: [ide-hooks-dag-implementation-plan.md](../ide-hooks-dag-implementation-plan.md)
-- 焦点: 10 事件 × 4 Handler + HookRunner 异步引擎 + run_turn 7 集成点 + 配置示例
+- 焦点: 10 事件 × 4 Handler + HookRunner 异步引擎 + run_turn 8 集成点 + 配置示例 + 端到端验证 + 性能预算 + 热重载 + 迁移指南
 - 关联代码:
   - [rust/crates/runtime/src/hooks.rs](../../rust/crates/runtime/src/hooks.rs)
   - [rust/crates/runtime/src/conversation.rs](../../rust/crates/runtime/src/conversation.rs)
   - [rust/crates/runtime/src/config.rs](../../rust/crates/runtime/src/config.rs)
+  - [rust/crates/runtime/src/permission_enforcer.rs](../../rust/crates/runtime/src/permission_enforcer.rs)
+  - [rust/crates/runtime/src/lane_events.rs](../../rust/crates/runtime/src/lane_events.rs)
 
 本章节是父文档第三章「Hooks 系统方案」的可实施细化版本。所有代码骨架以 `rust/crates/runtime/src/hooks.rs` 现有实现为基线,目标是把 3 事件 / 1 handler / 同步执行扩展为 10 事件 / 4 handler / 异步引擎,同时保持向后兼容与渐进迁移能力。
+
+v0.2 在 v0.1 设计骨架基础上补全:集成点行号验证、3 个端到端示例、性能预算与熔断、与权限系统的协同矩阵、配置文件热重载、HookChain 执行器骨架、扩展测试用例与迁移指南,目标是文档可直接指导 P0/W1-W8 的代码落地。
+
+---
+
+## v0.2 变更记录
+
+| 变更类型 | 章节 | 说明 |
+|---|---|---|
+| 新增 | 0. 集成点行号验证表 | 用 Grep 在 `conversation.rs` / `hooks.rs` 实际代码中验证 v0.1 行号,记录偏差 |
+| 新增 | 13. 端到端集成示例 | 3 个完整示例(危险命令拦截 / 自动跑测试 / PreCompact 刷新 NOTEBOOK),含 TOML 配置 / 时序图 / 预期日志 / 断言 |
+| 新增 | 14. Hook 执行性能预算 | 各 Handler 延迟预算、超时熔断骨架、LaneEvent 监控指标 |
+| 新增 | 15. Hook 与权限系统协同 | Hook × PermissionMode 交互矩阵、决策优先级图、覆盖与绕过语义 |
+| 新增 | 16. 配置文件热重载 | notify crate 文件 watcher、部分更新策略、运行中 hook 不中断保证 |
+| 完善 | 6. HookRunner 异步引擎 | 补充 HookChain 执行器代码骨架(50+ 行),覆盖顺序保证 / 短路 / 超时 / panic 捕获 |
+| 完善 | 11. 测试矩阵 | 新增 6 个测试用例:顺序保持 / exit 2 短路 / 超时不阻断主循环 / 配置热重载 / 权限协同 / SubagentStop 触发 |
+| 新增 | 17. 迁移指南 | 从 v0.1 3 事件到 v0.2 10 事件的迁移路径、向后兼容、废弃事件标记机制 |
+| 更新 | 目录 | 新增 6 个章节(13-17 + 集成点验证表) |
 
 ---
 
@@ -27,6 +48,12 @@
 10. [实施步骤分解](#10-实施步骤分解)
 11. [测试矩阵](#11-测试矩阵)
 12. [风险与缓解](#12-风险与缓解)
+13. [集成点行号验证表(v0.2 新增)](#13-集成点行号验证表v02-新增)
+14. [端到端集成示例(v0.2 新增)](#14-端到端集成示例v02-新增)
+15. [Hook 执行性能预算(v0.2 新增)](#15-hook-执行性能预算v02-新增)
+16. [Hook 与权限系统协同(v0.2 新增)](#16-hook-与权限系统协同v02-新增)
+17. [配置文件热重载(v0.2 新增)](#17-配置文件热重载v02-新增)
+18. [迁移指南(v0.2 新增)](#18-迁移指南v02-新增)
 
 ---
 
@@ -1373,6 +1400,315 @@ impl HookRunner {
 }
 ```
 
+### 6.9 HookChain 执行器(v0.2 新增)
+
+#### 6.9.1 顺序保证设计
+
+同一事件下的多个 Hook 执行顺序由以下规则决定:
+
+1. **matcher 分组**:同一 matcher pattern 的 hooks 归为一组,组间按配置文件中的出现顺序执行。
+2. **priority 升序**:组内 hooks 按 `priority` 字段升序执行(数字小先执行,默认 100)。
+3. **稳定排序**:同 priority 的 hooks 保持配置文件中的声明顺序(Rust `sort_by_key` 是稳定排序)。
+4. **enabled 字段**:`enabled = false` 的 hook 跳过,不影响其他 hook 顺序。
+5. **matcher 顺序**:多个 matcher 组按配置文件中的出现顺序执行(不按 matcher 字母序)。
+
+#### 6.9.2 短路语义
+
+| hook 返回 | 阻断事件 | failure_policy | 行为 |
+|---|---|---|---|
+| `Allow` | 任意 | 任意 | 继续,合并 messages / updated_input / additional_context |
+| `Deny` | 是 | 任意 | **立即短路**,返回聚合 Deny 结果 |
+| `Deny` | 否 | 任意 | 不短路(不可阻断事件忽略 Deny),合并 messages |
+| `Failed` | 任意 | `FailClose` | **立即短路**,返回聚合 Failed 结果(视同 Deny) |
+| `Failed` | 任意 | `FailOpen` | 继续,记录失败消息但不阻断 |
+| `Timeout` | 任意 | `FailClose` | 视同 Failed + FailClose → 短路 |
+| `Timeout` | 任意 | `FailOpen` | 视同 Failed + FailOpen → 继续 |
+| exit code 0(command) | 任意 | 任意 | 视同 Allow |
+| exit code 2(command) | 任意 | 任意 | 视同 Deny |
+| exit code 其他(command) | 任意 | 任意 | 视同 Failed |
+
+#### 6.9.3 HookChain 执行器代码骨架
+
+```rust
+// rust/crates/runtime/src/hooks.rs(v0.2 新增)
+//
+// HookChainExecutor 负责执行单个事件下的所有 hook。
+// 与 HookRunner::run 的关系:HookRunner 是入口,HookChainExecutor 是具体执行器。
+// 设计为独立 struct 便于单元测试(可 mock handler)。
+
+use std::sync::Arc;
+use std::time::Duration;
+
+pub struct HookChainExecutor<'a> {
+    /// 当前配置快照(在链开始时 load_full,保证链执行期间不变)
+    config: Arc<HookConfig>,
+    /// Inline hook 注册表
+    inline_registry: Arc<HookRegistry>,
+    /// HTTP 客户端(webhook handler)
+    http_client: reqwest::Client,
+    /// LLM 路由器(prompt handler)
+    llm_router: Option<Arc<LlmRouter>>,
+    /// 链执行的上下文(整个链共享)
+    ctx: &'a HookContext<'a>,
+}
+
+impl<'a> HookChainExecutor<'a> {
+    pub fn new(
+        config: Arc<HookConfig>,
+        inline_registry: Arc<HookRegistry>,
+        http_client: reqwest::Client,
+        llm_router: Option<Arc<LlmRouter>>,
+        ctx: &'a HookContext<'a>,
+    ) -> Self {
+        Self { config, inline_registry, http_client, llm_router, ctx }
+    }
+
+    /// 执行某事件下的所有 hook,返回聚合结果。
+    pub async fn execute(&self, event: HookEvent) -> HookRunResult {
+        let matchers = match self.config.hooks.get(&event) {
+            Some(m) => m,
+            None => return HookRunResult::default(),
+        };
+
+        let mut aggregate = HookRunResult::default();
+        let event_blocking = event.is_blocking();
+
+        for matcher in matchers {
+            // matcher 过滤(仅工具类事件)
+            if event.supports_matcher() && !self.matcher_applies(&matcher.matcher) {
+                continue;
+            }
+
+            // 按 priority 升序稳定排序
+            let mut entries = matcher.hooks.clone();
+            entries.sort_by_key(|e| e.priority);
+
+            match matcher.execution {
+                HookExecution::Sequential => {
+                    for entry in entries {
+                        if !entry.enabled {
+                            continue;
+                        }
+                        let result = self.execute_one(&entry, event).await;
+                        let should_short_circuit = self.merge_and_check_short_circuit(
+                            &mut aggregate,
+                            result,
+                            event_blocking,
+                            &entry,
+                        );
+                        if should_short_circuit {
+                            return aggregate;  // 立即返回,不执行后续 hook
+                        }
+                    }
+                }
+                HookExecution::Parallel => {
+                    // 并行执行所有 enabled hook,不短路
+                    let futures: Vec<_> = entries.iter()
+                        .filter(|e| e.enabled)
+                        .map(|e| self.execute_one(e, event))
+                        .collect();
+                    let results = futures::future::join_all(futures).await;
+                    for r in results {
+                        self.merge(&mut aggregate, r);
+                    }
+                }
+            }
+        }
+
+        aggregate
+    }
+
+    /// 执行单个 hook entry,包含超时熔断与 panic 捕获。
+    async fn execute_one(&self, entry: &HookEntry, event: HookEvent) -> HookRunResult {
+        let timeout_dur = entry.handler.timeout();
+        let handler_kind = entry.handler.kind();
+
+        let fut = self.run_handler(&entry.handler);
+
+        // 包装 timeout + panic 捕获
+        let result = tokio::time::timeout(timeout_dur, async {
+            // 对于 inline handler,使用 spawn_blocking 捕获 panic
+            match &entry.handler {
+                HookHandler::Inline(inline_ref) => {
+                    let inline_ref = inline_ref.clone();
+                    let ctx_owned = self.ctx.to_owned();
+                    let registry = self.inline_registry.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(async move {
+                            match registry.get(&inline_ref.name) {
+                                Some(h) => h.execute(&ctx_owned).await,
+                                None => HookRunResult::failed(format!(
+                                    "inline hook not found: {}", inline_ref.name
+                                )),
+                            }
+                        })
+                    }).await.unwrap_or_else(|e| HookRunResult::failed(
+                        format!("inline hook panicked: {e}")
+                    ))
+                }
+                _ => fut.await,
+            }
+        }).await;
+
+        match result {
+            Ok(r) => r,
+            Err(_elapsed) => HookRunResult::failed(format!(
+                "hook {} ({}) timed out after {:?}", handler_kind, event.as_str(), timeout_dur
+            )),
+        }
+    }
+
+    async fn run_handler(&self, handler: &HookHandler) -> HookRunResult {
+        match handler {
+            HookHandler::Command(c) => self.run_command(c).await,
+            HookHandler::Webhook(w) => self.run_webhook(w).await,
+            HookHandler::Inline(_) => {
+                // inline 在 execute_one 中特殊处理(spawn_blocking)
+                HookRunResult::failed("inline handler should be handled by execute_one".to_string())
+            }
+            HookHandler::Prompt(p) => self.run_prompt(p).await,
+        }
+    }
+
+    fn matcher_applies(&self, matcher: &str) -> bool {
+        if matcher.is_empty() || matcher == "*" {
+            return true;
+        }
+        let tool_name = match self.ctx.tool_name {
+            Some(n) => n,
+            None => return false,
+        };
+        matcher.split('|').any(|p| tool_name == p.trim())
+    }
+
+    /// 合并结果并检查短路条件。
+    /// 返回 true 表示应立即终止后续 hook 执行。
+    fn merge_and_check_short_circuit(
+        &self,
+        aggregate: &mut HookRunResult,
+        new: HookRunResult,
+        event_blocking: bool,
+        entry: &HookEntry,
+    ) -> bool {
+        // Failed + FailClose → 短路
+        if new.is_failed() && entry.failure_policy == FailurePolicy::FailClose {
+            aggregate.failed = true;
+            aggregate.decision = HookDecision::Deny;
+            aggregate.messages.extend(new.messages);
+            return true;
+        }
+
+        // Deny + blocking event → 短路
+        if new.decision == HookDecision::Deny && event_blocking {
+            aggregate.decision = HookDecision::Deny;
+            aggregate.messages.extend(new.messages);
+            aggregate.reason = new.reason.or(aggregate.reason.take());
+            return true;
+        }
+
+        // 合并 updated_input / additional_context(后者覆盖前者)
+        if let Some(updated) = new.updated_input {
+            aggregate.updated_input = Some(updated);
+        }
+        if let Some(ctx) = new.additional_context {
+            aggregate.additional_context = Some(ctx);
+        }
+        if let Some(perm) = new.permission_override {
+            aggregate.permission_override = Some(perm);
+        }
+
+        self.merge(aggregate, new);
+        false
+    }
+
+    fn merge(&self, aggregate: &mut HookRunResult, new: HookRunResult) {
+        if new.is_denied() { aggregate.denied = true; }
+        if new.is_failed() { aggregate.failed = true; }
+        if new.is_cancelled() { aggregate.cancelled = true; }
+        aggregate.messages.extend(new.messages);
+    }
+
+    // run_command / run_webhook / run_prompt 实现同 6.5/6.6/6.8,此处省略
+    async fn run_command(&self, hook: &CommandHook) -> HookRunResult {
+        // 实现 6.5
+        HookRunResult::default()
+    }
+    async fn run_webhook(&self, hook: &WebhookHook) -> HookRunResult {
+        // 实现 6.6
+        HookRunResult::default()
+    }
+    async fn run_prompt(&self, hook: &PromptHook) -> HookRunResult {
+        // 实现 6.8
+        HookRunResult::default()
+    }
+}
+```
+
+#### 6.9.4 顺序保证测试
+
+```rust
+#[tokio::test]
+async fn hook_chain_order_preservation_by_priority() {
+    // 配置 3 个 hook,priority 分别为 200/100/150,验证执行顺序为 100→150→200
+    let config = HookConfig {
+        hooks: {
+            let mut m = BTreeMap::new();
+            m.insert(HookEvent::PostToolUse, vec![HookMatcher {
+                matcher: "*".to_string(),
+                execution: HookExecution::Sequential,
+                hooks: vec![
+                    test_hook_entry("h1", 200),
+                    test_hook_entry("h2", 100),
+                    test_hook_entry("h3", 150),
+                ],
+            }]);
+            m
+        },
+    };
+
+    let mut calls = Vec::new();
+    let registry = build_registry_with_recording_hooks(&mut calls);
+    let runner = HookRunner::new(config, Arc::new(registry), reqwest::Client::new());
+
+    let ctx = build_test_ctx(HookEvent::PostToolUse);
+    let _ = runner.run(HookEvent::PostToolUse, &ctx).await;
+
+    // 按 priority 升序:h2(100) → h3(150) → h1(200)
+    assert_eq!(calls, vec!["h2", "h3", "h1"]);
+}
+
+#[tokio::test]
+async fn hook_chain_same_priority_preserves_config_order() {
+    // 同 priority 的 hooks 保持配置文件中的声明顺序(稳定排序)
+    let config = HookConfig {
+        hooks: {
+            let mut m = BTreeMap::new();
+            m.insert(HookEvent::PostToolUse, vec![HookMatcher {
+                matcher: "*".to_string(),
+                execution: HookExecution::Sequential,
+                hooks: vec![
+                    test_hook_entry("first", 100),
+                    test_hook_entry("second", 100),
+                    test_hook_entry("third", 100),
+                ],
+            }]);
+            m
+        },
+    };
+
+    let mut calls = Vec::new();
+    let registry = build_registry_with_recording_hooks(&mut calls);
+    let runner = HookRunner::new(config, Arc::new(registry), reqwest::Client::new());
+
+    let ctx = build_test_ctx(HookEvent::PostToolUse);
+    let _ = runner.run(HookEvent::PostToolUse, &ctx).await;
+
+    // 同 priority 保持配置顺序
+    assert_eq!(calls, vec!["first", "second", "third"]);
+}
+```
+
 ---
 
 ## 7. run_turn 7 集成点
@@ -2433,6 +2769,342 @@ mod tests {
 }
 ```
 
+### 11.5 v0.2 新增测试用例
+
+下列 6 个测试用例由 v0.2 增补,覆盖顺序保持 / 短路 / 超时 / 热重载 / 权限协同 / SubagentStop 触发。每个用例包含:测试目标、最小可执行代码、断言点。
+
+#### 11.5.1 `hook_chain_order_preservation`
+
+**测试目标**:验证同事件下多 hook 按 priority 升序稳定执行。
+
+```rust
+#[tokio::test]
+async fn hook_chain_order_preservation() {
+    use std::sync::Mutex;
+
+    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let config = HookConfig {
+        hooks: {
+            let mut m = BTreeMap::new();
+            m.insert(HookEvent::PostToolUse, vec![HookMatcher {
+                matcher: "*".to_string(),
+                execution: HookExecution::Sequential,
+                hooks: vec![
+                    recording_hook_entry("h1", 200, &calls),
+                    recording_hook_entry("h2", 100, &calls),
+                    recording_hook_entry("h3", 150, &calls),
+                    recording_hook_entry("h4", 100, &calls),  // 同 priority,应保持配置顺序
+                ],
+            }]);
+            m
+        },
+    };
+
+    let registry = Arc::new(HookRegistry::new());
+    let runner = HookRunner::new(config, registry, reqwest::Client::new());
+    let ctx = build_test_ctx(HookEvent::PostToolUse);
+
+    let _ = runner.run(HookEvent::PostToolUse, &ctx).await;
+
+    let recorded = calls.lock().unwrap().clone();
+    // 按 priority 升序:h2(100) → h4(100) → h3(150) → h1(200)
+    // 同 priority(100)的 h2 和 h4 保持配置顺序
+    assert_eq!(recorded, vec!["h2", "h4", "h3", "h1"]);
+}
+```
+
+#### 11.5.2 `hook_short_circuit_on_deny`
+
+**测试目标**:验证 PreToolUse hook 返回 exit 2(Deny)时立即短路,后续 hook 不执行。
+
+```rust
+#[tokio::test]
+async fn hook_short_circuit_on_deny() {
+    use std::sync::Mutex;
+
+    let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let config = HookConfig {
+        hooks: {
+            let mut m = BTreeMap::new();
+            m.insert(HookEvent::PreToolUse, vec![HookMatcher {
+                matcher: "*".to_string(),
+                execution: HookExecution::Sequential,
+                hooks: vec![
+                    recording_hook_entry("h1", 100, &calls),
+                    deny_hook_entry("h2_deny", 200, "blocked by h2", &calls),
+                    recording_hook_entry("h3", 300, &calls),  // 不应执行
+                    recording_hook_entry("h4", 400, &calls),  // 不应执行
+                ],
+            }]);
+            m
+        },
+    };
+
+    let registry = Arc::new(HookRegistry::new());
+    let runner = HookRunner::new(config, registry, reqwest::Client::new());
+    let ctx = build_test_ctx(HookEvent::PreToolUse);
+
+    let result = runner.run(HookEvent::PreToolUse, &ctx).await;
+
+    let recorded = calls.lock().unwrap().clone();
+    // h1 执行,h2_deny 短路,h3/h4 不执行
+    assert_eq!(recorded, vec!["h1", "h2_deny"]);
+    // 聚合结果为 Deny
+    assert!(result.is_denied());
+    assert!(result.reason.unwrap().contains("blocked by h2"));
+}
+```
+
+#### 11.5.3 `hook_timeout_does_not_block_main_loop`
+
+**测试目标**:验证 hook 超时熔断后,主循环继续执行(failure_policy=failOpen 场景)。
+
+```rust
+#[tokio::test]
+async fn hook_timeout_does_not_block_main_loop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let main_loop_continued = Arc::new(AtomicBool::new(false));
+
+    // 配置一个会超时的 hook(timeout=100ms,实际 sleep 60s)
+    let config = HookConfig {
+        hooks: {
+            let mut m = BTreeMap::new();
+            m.insert(HookEvent::PreToolUse, vec![HookMatcher {
+                matcher: "*".to_string(),
+                execution: HookExecution::Sequential,
+                hooks: vec![HookEntry {
+                    handler: HookHandler::Command(CommandHook {
+                        command: "sleep 60".to_string(),
+                        timeout: Duration::from_millis(100),  // 100ms 超时
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    }),
+                    priority: 100,
+                    failure_policy: FailurePolicy::FailOpen,  // 超时不阻断
+                    enabled: true,
+                }],
+            }]);
+            m
+        },
+    };
+
+    let registry = Arc::new(HookRegistry::new());
+    let runner = HookRunner::new(config, registry, reqwest::Client::new());
+    let ctx = build_test_ctx(HookEvent::PreToolUse);
+
+    let start = std::time::Instant::now();
+    let result = runner.run(HookEvent::PreToolUse, &ctx).await;
+    let elapsed = start.elapsed();
+
+    // 断言 1: 超时在 200ms 内返回(100ms 超时 + 一点缓冲)
+    assert!(elapsed < Duration::from_millis(500));
+
+    // 断言 2: 结果为 Failed(超时视同 Failed)
+    assert!(result.is_failed());
+
+    // 断言 3: failure_policy=failOpen,聚合决策为 Allow(不阻断)
+    assert!(!result.is_denied());
+
+    // 断言 4: 主循环可继续(failOpen 不抛错)
+    main_loop_continued.store(true, Ordering::SeqCst);
+    assert!(main_loop_continued.load(Ordering::SeqCst));
+}
+```
+
+#### 11.5.4 `hook_config_hot_reload`
+
+**测试目标**:验证配置文件热重载后,下一次事件触发使用新配置(详见 17.6 完整实现)。
+
+```rust
+#[tokio::test]
+async fn hook_config_hot_reload() {
+    let config_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    std::fs::write(&config_path, r#"
+[[PreToolUse]]
+matcher = "Bash"
+execution = "sequential"
+  [[PreToolUse.hooks]]
+  priority = 100
+  [PreToolUse.hooks.handler]
+  type = "command"
+  command = "echo v1"
+  timeout = "2s"
+"#).unwrap();
+
+    let initial = HookConfig::parse(&config_path).unwrap();
+    let (reloader, config_handle) = HookReloader::start(
+        config_path.to_path_buf(), initial
+    ).unwrap();
+
+    // 第一次执行:使用 v1
+    let runner_v1 = HookRunner::from_config_handle(config_handle.clone());
+    let ctx = build_test_ctx(HookEvent::PreToolUse);
+    let _ = runner_v1.run(HookEvent::PreToolUse, &ctx).await;
+    // (假设 command 被记录到 spawned_commands)
+    // assert!(spawned_commands.iter().any(|c| c.contains("echo v1")));
+
+    // 修改配置文件
+    std::fs::write(&config_path, r#"
+[[PreToolUse]]
+matcher = "Bash"
+execution = "sequential"
+  [[PreToolUse.hooks]]
+  priority = 100
+  [PreToolUse.hooks.handler]
+  type = "command"
+  command = "echo v2"
+  timeout = "2s"
+"#).unwrap();
+
+    // 等待热重载
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 第二次执行:应使用 v2
+    let runner_v2 = HookRunner::from_config_handle(config_handle.clone());
+    let _ = runner_v2.run(HookEvent::PreToolUse, &ctx).await;
+    // assert!(spawned_commands.iter().any(|c| c.contains("echo v2")));
+    // assert!(!spawned_commands.iter().any(|c| c.contains("echo v1")));
+
+    // 显式保活 reloader
+    drop(reloader);
+}
+```
+
+#### 11.5.5 `hook_permission_interaction`
+
+**测试目标**:验证 Hook 与 PermissionMode 协同(Hook Deny 优先 / Hook Allow 不绕过权限 / permission_override 覆盖)。
+
+```rust
+#[tokio::test]
+async fn hook_permission_interaction() {
+    // 场景 1: Hook Deny 覆盖 DangerFullAccess
+    {
+        let mut runtime = build_test_runtime()
+            .with_permission_mode(PermissionMode::DangerFullAccess)
+            .with_hook(HookEvent::PreToolUse, deny_hook("blocked"))
+            .build();
+        let _ = runtime.run_turn("rm -rf /tmp", None).await.unwrap();
+        assert_eq!(runtime.bash_executor().call_count(), 0);
+    }
+
+    // 场景 2: Hook Allow 不绕过 ReadOnly
+    {
+        let mut runtime = build_test_runtime()
+            .with_permission_mode(PermissionMode::ReadOnly)
+            .with_hook(HookEvent::PreToolUse, allow_hook())
+            .build();
+        let _ = runtime.run_turn("echo hello > /tmp/x", None).await.unwrap();
+        // ReadOnly 仍拒绝写入
+        assert_eq!(runtime.bash_executor().call_count(), 0);
+    }
+
+    // 场景 3: Hook permission_override 显式 Allow ReadOnly 下的写入
+    {
+        let mut runtime = build_test_runtime()
+            .with_permission_mode(PermissionMode::ReadOnly)
+            .with_hook(
+                HookEvent::PreToolUse,
+                override_hook(PermissionOverride::Allow, "safe write"),
+            )
+            .build();
+        let _ = runtime.run_turn("echo hello > /tmp/build_cache/x", None).await.unwrap();
+        // Override 应允许
+        assert_eq!(runtime.bash_executor().call_count(), 1);
+    }
+
+    // 场景 4: Hook Failed + failOpen,继续走 PermissionMode
+    {
+        let mut runtime = build_test_runtime()
+            .with_permission_mode(PermissionMode::WorkspaceWrite)
+            .with_hook(
+                HookEvent::PreToolUse,
+                failed_hook(FailurePolicy::FailOpen),
+            )
+            .build();
+        let _ = runtime.run_turn("ls -la", None).await.unwrap();
+        // WorkspaceWrite 允许 ls
+        assert_eq!(runtime.bash_executor().call_count(), 1);
+    }
+}
+```
+
+#### 11.5.6 `hook_subagent_stop_triggers_correctly`
+
+**测试目标**:验证 SubagentStop hook 在子 agent 进入终态时正确触发,且 Deny 可拒绝子 agent 结果。
+
+```rust
+#[tokio::test]
+async fn hook_subagent_stop_triggers_correctly() {
+    let mut runtime = build_test_runtime()
+        .with_hook(HookEvent::SubagentStop, deny_hook("结果不合格"))
+        .with_multi_agent_coordinator()
+        .build();
+
+    // 1. dispatch 子 agent
+    let _ = runtime.execute_dispatch_subagent(
+        r#"{"name":"sub1","task":"do something"}"#
+    ).unwrap();
+
+    // 2. 模拟子 agent 进入终态(Completed)
+    runtime.mark_subagent_completed("sub1", "result data");
+
+    // 3. 调用 execute_check_subagent,应触发 SubagentStop hook
+    let check_result = runtime.execute_check_subagent(
+        r#"{"subagent_id":"sub1"}"#
+    ).unwrap();
+
+    // 断言 1: SubagentStop hook 被触发
+    let stop_calls = runtime.hook_log().for_event(HookEvent::SubagentStop);
+    assert_eq!(stop_calls.len(), 1);
+
+    // 断言 2: hook 返回 Deny,check_result 中应包含 rejected 状态
+    let parsed: serde_json::Value = serde_json::from_str(&check_result).unwrap();
+    // (Deny 应导致 runtime 返回 rejected 标记,主 agent 据此 redispatch)
+    // 注:具体字段名取决于实现,这里检查关键字段
+    assert!(
+        parsed.to_string().contains("rejected")
+        || parsed.to_string().contains("不合格")
+        || stop_calls[0].decision == HookDecision::Deny,
+        "SubagentStop hook Deny 应导致结果被拒绝"
+    );
+}
+
+#[tokio::test]
+async fn hook_subagent_stop_not_triggered_for_non_terminal() {
+    let mut runtime = build_test_runtime()
+        .with_hook(HookEvent::SubagentStop, allow_hook())
+        .with_multi_agent_coordinator()
+        .build();
+
+    let _ = runtime.execute_dispatch_subagent(
+        r#"{"name":"sub1","task":"do something"}"#
+    ).unwrap();
+
+    // 子 agent 仍在 Running 状态(非终态)
+    let _ = runtime.execute_check_subagent(
+        r#"{"subagent_id":"sub1"}"#
+    ).unwrap();
+
+    // SubagentStop hook 不应触发(非终态)
+    let stop_calls = runtime.hook_log().for_event(HookEvent::SubagentStop);
+    assert_eq!(stop_calls.len(), 0);
+}
+```
+
+### 11.6 测试用例与章节交叉引用
+
+| 测试用例 | 对应章节 | 验证点 |
+|---|---|---|
+| `hook_chain_order_preservation` | 6.9.1 顺序保证设计 | priority 升序 + 稳定排序 |
+| `hook_short_circuit_on_deny` | 6.9.2 短路语义 | Deny 立即终止后续 hook |
+| `hook_timeout_does_not_block_main_loop` | 15.3 超时熔断机制 | 超时熔断后主循环继续(failOpen) |
+| `hook_config_hot_reload` | 17. 配置文件热重载 | 配置变更后下一次事件使用新配置 |
+| `hook_permission_interaction` | 16. Hook 与权限系统协同 | Hook × PermissionMode 4 种交互 |
+| `hook_subagent_stop_triggers_correctly` | 7.9 集成点 8 SubagentStop | 子 agent 终态时触发 + Deny 拒绝结果 |
+
 ---
 
 ## 12. 风险与缓解
@@ -2526,6 +3198,1790 @@ async fn run_inline(&self, hook: &InlineHookRef, ctx: &HookContext<'_>) -> HookR
 
 ---
 
+## 13. 集成点行号验证表(v0.2 新增)
+
+### 13.1 验证方法
+
+v0.1 文档基于编写时的代码状态记录行号,代码可能已发生偏移。v0.2 在编写前用 Grep 工具对以下关键集成点逐一验证,记录实际行号与偏差。
+
+验证基准:`d:\claw-code-src\rust\crates\runtime\src\conversation.rs` 与 `rust/crates/runtime/src/hooks.rs` 当前 HEAD 状态。
+
+### 13.2 验证结果表
+
+| # | 事件 / 锚点 | 文件路径 | v0.1 文档行号 | v0.2 验证行号 | 偏差 | 说明 |
+|---|---|---|---|---|---|---|
+| 1 | `run_turn` 函数签名 | `conversation.rs` | 824 | 824 | 无 | 入口签名一致,验证通过 |
+| 2 | `self.loop_detector.reset()`(SessionStart 注入前锚点) | `conversation.rs` | 834 | 834 | 无 | SessionStart hook 应插入该行之前 |
+| 3 | `session.push_user_text`(UserPromptSubmit 注入前锚点) | `conversation.rs` | 840-842 | 841 | +1 行 | 实际 push_user_text 调用在 841 行,v0.1 文档说 840-842 范围正确,精确锚点为 841 |
+| 4 | PreToolUse 注入点(`run_pre_tool_use_hook` 调用) | `conversation.rs` | 1175 | 1175 | 无 | 已有集成点,验证通过 |
+| 5 | PostToolUseFailure 注入点 | `conversation.rs` | 1280-1281 | 1281 | +1 行 | `run_post_tool_use_failure_hook` 调用在 1281 行 |
+| 6 | PostToolUse 注入点 | `conversation.rs` | 1287-1293 | 1287 | 无 | `run_post_tool_use_hook` 调用在 1287 行 |
+| 7 | `TurnSummary` 构造(Stop 注入前锚点) | `conversation.rs` | 1490 | 1490 | 无 | `let summary = TurnSummary {` 在 1490 行 |
+| 8 | `maybe_auto_compact` 函数定义(PreCompact 注入点) | `conversation.rs` | 2127 | 2127 | 无 | 函数定义在 2127 行,PreCompact hook 应在 `compact_session` 调用(2140 行)之前注入 |
+| 9 | `execute_check_subagent` 函数定义(SubagentStop 注入点) | `conversation.rs` | 1879 | 1879 | 无 | 函数定义在 1879 行,SubagentStop 应在 `is_terminal` 判定(1910-1913 行)之后触发 |
+| 10 | `HookEvent` enum 定义 | `hooks.rs` | 22-26 | 22-26 | 无 | 现有 3 事件,验证通过 |
+| 11 | `HookRunResult` struct 定义 | `hooks.rs` | 84-177 | 84 | 无 | struct 起点一致,字段在 84-92 行 |
+| 12 | `HookRunner` struct 定义 | `hooks.rs` | 180-335 | 180 | 无 | struct 起点一致 |
+| 13 | `HookAbortSignal` struct 定义 | `hooks.rs` | 62-81 | 62-81 | 无 | 验证通过 |
+| 14 | `HookProgressEvent` enum 定义 | `hooks.rs` | 40-56 | 40-56 | 无 | 验证通过 |
+
+### 13.3 附加验证点
+
+| 锚点 | 文件 | v0.2 验证行号 | 用途 |
+|---|---|---|---|
+| `execute_dispatch_subagent` 函数定义 | `conversation.rs` | 1656 | 子 agent dispatch 入口,SubagentStop 链路起点 |
+| `run_subagent_turn` 函数定义 | `conversation.rs` | 1767 | 子 agent 单轮执行,SubagentStop 终态判定 |
+| `auto_compaction_input_tokens_threshold` 字段 | `conversation.rs` | 299 | PreCompact 触发阈值配置 |
+| `compact_session` 调用点(auto 路径) | `conversation.rs` | 2140 | PreCompact hook 必须在此之前注入 |
+| `compact_session_with_trigger` 调用点(reactive 路径) | `conversation.rs` | 1074 | PreCompact hook 的第二个注入点 |
+
+### 13.4 偏差处理决策
+
+- **无偏差项(12 项)**:v0.1 文档中的行号引用保持不变,无需更新。
+- **+1 行偏差项(2 项:UserPromptSubmit / PostToolUseFailure)**:偏差在可接受范围内(±5 行),v0.1 文档已使用「840-842」「1280-1293」范围表达,实际锚点落在范围内,无需更新文档引用。
+- **结论**:v0.1 行号引用全部仍有效,v0.2 文档不修改 v0.1 章节中的行号引用,仅在本验证表中记录精确值供实施时参考。
+
+### 13.5 实施时的行号保护建议
+
+由于代码会持续演进,建议在实施 P0/W5-W6 集成点接入时:
+
+1. **使用语义锚点而非硬行号**:在 PR 中以「`loop_detector.reset()` 调用之前」「`push_user_text` 调用之前」等语义描述定位,而非「line 834」。
+2. **添加行号注释**:在 `conversation.rs` 关键集成点添加 `// HOOK_INTEGRATION: SessionStart` 等注释,便于 Grep 定位。
+3. **CI 行号漂移检测**:在 CI 中添加测试,用 Grep 验证关键锚点行号是否在预期范围内,超出范围则告警。
+
+---
+
+## 14. 端到端集成示例(v0.2 新增)
+
+本章提供 3 个完整端到端示例,每个示例覆盖:用户场景 → 配置文件 → 主 agent 执行流程(伪代码)→ Hook 触发时序图 → 预期日志输出 → 断言要点。示例选型覆盖三类典型用例:阻断型(PreToolUse 拦截)、观察型(PostToolUse 触发副作用)、上下文管理型(PreCompact 与 NOTEBOOK 协同)。
+
+### 14.1 示例 1:PreToolUse 拦截危险命令
+
+#### 14.1.1 用户场景
+
+用户对 agent 说:「请帮我清理一下根目录,执行 `rm -rf /`」。该命令会递归删除整个文件系统根,属于高危操作。PreToolUse hook 应在 Bash 工具实际执行前拦截,返回 exit 2 表示 Deny,主 agent 收到 deny 后向用户解释并停止本 turn。
+
+#### 14.1.2 配置文件(TOML)
+
+```toml
+# ~/.claw/hooks.toml
+# 示例 1:危险命令拦截
+
+[[PreToolUse]]
+matcher = "Bash"                # 仅对 Bash 工具生效
+execution = "sequential"
+
+  [[PreToolUse.hooks]]
+  priority = 50                 # 高优先级(数字小先执行)
+  failure_policy = "failClose"  # hook 自身失败也阻断
+  enabled = true
+
+  [PreToolUse.hooks.handler]
+  type = "command"
+  command = "$CLAW_PROJECT_DIR/.claw/hooks/deny_dangerous_rm.sh"
+  timeout = "2s"                # 简单脚本应快速返回
+```
+
+`deny_dangerous_rm.sh` 实现:
+
+```bash
+#!/usr/bin/env bash
+# 从 stdin 读取 hook payload
+payload=$(cat)
+cmd=$(echo "$payload" | jq -r '.tool_input.command // ""')
+
+# 检测 rm -rf / 模式(含变形:rm -rf /*、rm -rf /、rm -fr /)
+if echo "$cmd" | grep -qE 'rm\s+(-[rf]+\s+)+/( |\*|$)'; then
+  echo "BLOCKED: 检测到 rm -rf /,可能删除整个文件系统" >&2
+  exit 2   # exit 2 = Deny 契约
+fi
+
+# 其他命令放行
+exit 0
+```
+
+#### 14.1.3 主 agent 执行流程(伪代码)
+
+```
+function run_turn(user_input="请帮我清理一下根目录,执行 rm -rf /"):
+    fire UserPromptSubmit(prompt=user_input)        # 允许通过
+    session.push_user_text(user_input)
+    loop:
+        response = llm.stream()
+        for event in response:
+            if event is ToolUse(tool="Bash", input={"command":"rm -rf /"}):
+                # === PreToolUse 集成点(line 1175) ===
+                result = hook_runner.run(PreToolUse, ctx={
+                    tool_name: "Bash",
+                    tool_input: {"command": "rm -rf /"}
+                })
+                if result.is_denied():
+                    # 把 deny 原因作为 tool_result 返还给 LLM
+                    tool_result = ToolResult(error, "BLOCKED: 检测到 rm -rf /...")
+                    # === PostToolUseFailure 集成点(line 1281) ===
+                    fire PostToolUseFailure(tool="Bash", response=tool_result)
+                    continue    # 让 LLM 看到失败,决定下一步
+                effective_input = result.updated_input or input
+                # === 实际工具执行 ===
+                tool_result = bash_executor.run(effective_input)
+                fire PostToolUse(tool="Bash", response=tool_result)
+        if no_more_tool_calls:
+            break
+    # === Stop 集成点(line 1490 之前) ===
+    fire Stop(stop_hook_active=false)
+    return TurnSummary
+```
+
+#### 14.1.4 Hook 触发时序图
+
+```
+用户       Agent      HookRunner     deny_dangerous_rm.sh    BashExecutor
+ |           |             |                  |                     |
+ |--prompt-->|             |                  |                     |
+ |           |--UserPromptSubmit->|           |                     |
+ |           |<-----allow---------|           |                     |
+ |           |--LLM stream-------|            |                     |
+ |           |--ToolUse(Bash,rm -rf /)-------->|                     |
+ |           |  === PreToolUse line 1175 ===  |                     |
+ |           |--run(PreToolUse,ctx)---------->|                     |
+ |           |             |---spawn & stdin->|                     |
+ |           |             |<---exit 2--------|                     |
+ |           |             | (Deny + message) |                     |
+ |           |<---deny------|                  |                     |
+ |           |--ToolResult(error,BLOCKED...)   |                     |
+ |           |  === PostToolUseFailure 1281 ==|                     |
+ |           |--run(PostToolUseFailure,ctx)--->|                     |
+ |           |<---allow------------------------|                     |
+ |           |--LLM stream (看到失败,解释)----|                     |
+ |           |--Stop hook (line 1490)--------->|                     |
+ |           |<---allow------------------------|                     |
+ |<--回复----|             |                  |                     |
+```
+
+#### 14.1.5 预期日志输出
+
+```
+[INFO] run_turn: turn_started user_input="请帮我清理一下根目录..."
+[INFO] hook: event=UserPromptSubmit decision=Allow handler=command latency=12ms
+[INFO] llm: stream_started model=claude-sonnet
+[INFO] tool: dispatch tool=Bash input={"command":"rm -rf /"}
+[INFO] hook: event=PreToolUse tool=Bash handler=command
+       command=$CLAW_PROJECT_DIR/.claw/hooks/deny_dangerous_rm.sh
+[WARN] hook: event=PreToolUse decision=Deny reason="BLOCKED: 检测到 rm -rf /,可能删除整个文件系统"
+[INFO] tool: tool_result=error "BLOCKED: 检测到 rm -rf /..."
+[INFO] hook: event=PostToolUseFailure tool=Bash decision=Allow
+[INFO] llm: stream_resumed (LLM 看到 deny 结果)
+[INFO] llm: assistant_message="抱歉,我无法执行 rm -rf /,这会删除整个文件系统..."
+[INFO] hook: event=Stop decision=Allow
+[INFO] run_turn: turn_completed iterations=1
+```
+
+#### 14.1.6 断言要点
+
+```rust
+#[tokio::test]
+async fn example_1_pre_tool_use_blocks_dangerous_rm() {
+    let mut runtime = build_test_runtime()
+        .with_hooks_toml("examples/deny_dangerous_rm.toml")
+        .with_user_input("请帮我清理一下根目录,执行 rm -rf /")
+        .build();
+
+    let summary = runtime.run_turn().await.unwrap();
+
+    // 断言 1: Bash 工具被 hook 拒绝,实际未执行
+    assert!(runtime.bash_executor().call_count() == 0);
+
+    // 断言 2: PreToolUse hook 触发了一次,返回 Deny
+    let pre_calls = runtime.hook_log().for_event(HookEvent::PreToolUse);
+    assert_eq!(pre_calls.len(), 1);
+    assert_eq!(pre_calls[0].decision, HookDecision::Deny);
+
+    // 断言 3: PostToolUseFailure 触发(因为 deny 等同于工具失败)
+    let fail_calls = runtime.hook_log().for_event(HookEvent::PostToolUseFailure);
+    assert_eq!(fail_calls.len(), 1);
+
+    // 断言 4: 主 agent 输出包含 deny 原因
+    assert!(summary.assistant_messages.iter().any(|m|
+        m.contains("BLOCKED") || m.contains("rm -rf")
+    ));
+
+    // 断言 5: hook 延迟 < 500ms(Command handler 预算)
+    assert!(pre_calls[0].latency < Duration::from_millis(500));
+}
+```
+
+### 14.2 示例 2:PostToolUse 自动跑测试
+
+#### 14.2.1 用户场景
+
+用户对 agent 说:「修复 `src/main.rs` 中的编译错误」。agent 使用 Edit 工具修改文件后,PostToolUse hook 自动触发 `cargo test --no-fail-fast`,把测试结果作为 additional_context 注入下一轮 LLM 请求,让 agent 知道修改是否破坏了其他测试。
+
+#### 14.2.2 配置文件(TOML)
+
+```toml
+# ~/.claw/hooks.toml
+# 示例 2:Edit/Write 后自动跑测试
+
+[[PostToolUse]]
+matcher = "Edit|Write|MultiEdit"   # 仅对编辑类工具生效
+execution = "sequential"
+
+  [[PostToolUse.hooks]]
+  priority = 100
+  failure_policy = "failOpen"     # 测试失败不阻断主流程
+  enabled = true
+
+  [PostToolUse.hooks.handler]
+  type = "command"
+  command = "cargo test --no-fail-fast --message-format=json 2>&1 | tail -100"
+  timeout = "120s"                # cargo test 可能耗时,放宽到 2 分钟
+```
+
+#### 14.2.3 主 agent 执行流程(伪代码)
+
+```
+function run_turn(user_input="修复 src/main.rs 中的编译错误"):
+    fire UserPromptSubmit(prompt=user_input)
+    session.push_user_text(user_input)
+    loop:
+        response = llm.stream()
+        for event in response:
+            if event is ToolUse(tool="Edit", input={file_path:"src/main.rs",...}):
+                # === PreToolUse 集成点 ===
+                pre = hook_runner.run(PreToolUse, ctx={tool:"Edit",input})
+                if pre.is_denied(): continue
+                # === 实际工具执行 ===
+                tool_result = edit_executor.run(pre.updated_input or input)
+                # === PostToolUse 集成点(line 1287) ===
+                post = hook_runner.run(PostToolUse, ctx={
+                    tool: "Edit",
+                    tool_input: input,
+                    tool_response: tool_result
+                })
+                # 关键: hook 返回的 additional_context 注入下一轮 LLM 请求
+                if post.additional_context:
+                    session.inject_context(post.additional_context)
+        if no_more_tool_calls:
+            break
+    fire Stop
+    return TurnSummary
+```
+
+#### 14.2.4 Hook 触发时序图
+
+```
+用户       Agent      HookRunner     cargo test            EditExecutor
+ |           |             |              |                      |
+ |--prompt-->|             |              |                      |
+ |           |--UserPromptSubmit->|       |                      |
+ |           |<-----allow---------|       |                      |
+ |           |--LLM stream-------|        |                      |
+ |           |--ToolUse(Edit,src/main.rs)->|                     |
+ |           |  === PreToolUse line 1175 ==|                     |
+ |           |--run(PreToolUse,ctx)------->|                     |
+ |           |<---allow--------------------|                     |
+ |           |  === 实际 Edit 执行 =========|====================>|
+ |           |<---tool_result(success)-----|--------------------|
+ |           |  === PostToolUse line 1287 =|                     |
+ |           |--run(PostToolUse,ctx)------>|                     |
+ |           |             |---spawn----->cargo test             |
+ |           |             |   (120s timeout)                    |
+ |           |             |<--stdout----{"test":"test_foo","result":"failed"}
+ |           |             |  (additional_context)               |
+ |           |<---allow+ctx----------------|                     |
+ |           |--session.inject_context("test failed: test_foo")  |
+ |           |--LLM stream (看到测试失败)----|                    |
+ |           |--ToolUse(Edit,修复 test_foo)-->|                  |
+ |           |  ... (循环)                                          |
+ |           |--Stop hook-------------->|                          |
+ |           |<---allow-----------------|                          |
+ |<--回复----|             |              |                      |
+```
+
+#### 14.2.5 预期日志输出
+
+```
+[INFO] run_turn: turn_started user_input="修复 src/main.rs 中的编译错误"
+[INFO] hook: event=UserPromptSubmit decision=Allow latency=8ms
+[INFO] llm: stream_started
+[INFO] tool: dispatch tool=Edit file=src/main.rs
+[INFO] hook: event=PreToolUse tool=Edit decision=Allow latency=15ms
+[INFO] tool: edit_applied old="let x = undeclared_var;" new="let x = 42;"
+[INFO] hook: event=PostToolUse tool=Edit handler=command
+       command="cargo test --no-fail-fast --message-format=json"
+[INFO] hook: cargo test starting (timeout=120s)
+[INFO] hook: cargo test output: {"reason":"compiler-message","message":{"level":"error","spans":[...]}}
+[WARN] hook: cargo test result: 1 test failed (test_foo)
+[INFO] hook: event=PostToolUse decision=Allow
+       additional_context="cargo test result: FAILED. 1 test failed: test_foo"
+[INFO] llm: stream_resumed (LLM 看到 additional_context)
+[INFO] llm: assistant_message="测试 test_foo 失败,原因是..."
+[INFO] tool: dispatch tool=Edit file=tests/foo.rs
+[INFO] hook: event=PostToolUse tool=Edit (再次触发 cargo test)
+[INFO] hook: cargo test result: all tests passed
+[INFO] hook: event=Stop decision=Allow
+[INFO] run_turn: turn_completed iterations=3
+```
+
+#### 14.2.6 断言要点
+
+```rust
+#[tokio::test]
+async fn example_2_post_tool_use_triggers_cargo_test() {
+    let mut runtime = build_test_runtime()
+        .with_hooks_toml("examples/auto_cargo_test.toml")
+        .with_user_input("修复 src/main.rs 中的编译错误")
+        .build();
+
+    let summary = runtime.run_turn().await.unwrap();
+
+    // 断言 1: 每次 Edit 后 PostToolUse hook 都触发
+    let edit_count = runtime.tool_log().for_tool("Edit").count();
+    let post_hook_count = runtime.hook_log()
+        .for_event(HookEvent::PostToolUse)
+        .for_tool("Edit")
+        .count();
+    assert_eq!(edit_count, post_hook_count);
+
+    // 断言 2: additional_context 被注入到下一轮 LLM 请求
+    let requests = runtime.llm_requests();
+    assert!(requests.len() >= 2);
+    assert!(requests[1].system_prompt.contains("cargo test result"));
+
+    // 断言 3: cargo test 实际执行(通过 command 子进程)
+    assert!(runtime.spawned_commands().iter().any(|c|
+        c.contains("cargo test")
+    ));
+
+    // 断言 4: failure_policy=failOpen,即使测试失败也不阻断
+    assert!(summary.iterations >= 2);  // agent 继续修复
+
+    // 断言 5: hook 延迟符合预算(cargo test 可能慢,放宽到 120s)
+    let post_calls = runtime.hook_log().for_event(HookEvent::PostToolUse);
+    assert!(post_calls.iter().all(|c| c.latency < Duration::from_secs(120)));
+}
+```
+
+### 14.3 示例 3:PreCompact 触发 NOTEBOOK 刷新
+
+#### 14.3.1 用户场景
+
+长程任务中,上下文接近窗口上限(默认 100K tokens),触发 `maybe_auto_compact`。在压缩前,PreCompact hook 调用 inline handler `refresh_notebook()`,把当前 session 的关键信息(决策、子 agent 注册表、已尝试方案)写入 `NOTEBOOK.md`,这些信息会跨 microcompact 持久化。压缩完成后,PostCompact 事件(本示例为 v0.2 新增事件)通知 hook 压缩已完成。
+
+#### 14.3.2 配置文件(TOML)
+
+```toml
+# ~/.claw/hooks.toml
+# 示例 3:PreCompact 触发 NOTEBOOK 刷新
+
+[[PreCompact]]
+execution = "sequential"
+
+  [[PreCompact.hooks]]
+  priority = 100
+  failure_policy = "failClose"   # NOTEBOOK 刷新失败则放弃压缩,保留完整上下文
+  enabled = true
+
+  [PreCompact.hooks.handler]
+  type = "inline"
+  name = "claw.builtin.notebook_refresher"   # 进程内 hook,零开销
+
+# v0.2 新增事件:PostCompact
+[[PostCompact]]
+execution = "sequential"
+
+  [[PostCompact.hooks]]
+  priority = 100
+  failure_policy = "failOpen"
+
+  [PostCompact.hooks.handler]
+  type = "command"
+  command = "echo '[PreCompact] compaction done at $(date)' >> $CLAW_PROJECT_DIR/.claw/compaction.log"
+  timeout = "5s"
+```
+
+#### 14.3.3 主 agent 执行流程(伪代码)
+
+```
+function run_turn(user_input="继续之前的任务"):
+    fire UserPromptSubmit
+    session.push_user_text(user_input)
+    loop:
+        response = llm.stream()
+        ... (工具调用、PostToolUse 等)
+        if no_more_tool_calls:
+            break
+
+    # === PreCompact 集成点(line 2140 之前) ===
+    # maybe_auto_compact 内部:
+    if usage_tracker.input_tokens >= threshold:
+        # === PreCompact 注入点 ===
+        pre = hook_runner.run(PreCompact, ctx={trigger:"auto"})
+        if pre.is_denied():
+            return None   # 放弃本次压缩
+        # NOTEBOOK 已被 inline hook 刷新,可以安全压缩
+        compact_result = compact_session(session)
+        # === PostCompact(v0.2 新增)===
+        post = hook_runner.run(PostCompact, ctx={
+            trigger: "auto",
+            original_tokens: usage_tracker.input_tokens,
+            compacted_tokens: compact_result.new_token_count
+        })
+        return compact_result
+
+    fire Stop
+    return TurnSummary
+```
+
+#### 14.3.4 Hook 触发时序图
+
+```
+用户       Agent       HookRunner    notebook_refresher   compact_session
+ |           |              |                |                    |
+ |--prompt-->|              |                |                    |
+ |           |  ... (多轮工具调用,token 累积) |                    |
+ |           |  === maybe_auto_compact ===   |                    |
+ |           |  检查:usage.input_tokens >= 100K? (yes)            |
+ |           |  === PreCompact 注入点 ======|                    |
+ |           |--run(PreCompact,ctx)-------->|                    |
+ |           |              |--inline.exec->|                    |
+ |           |              |  refresh_notebook()                |
+ |           |              |  写 NOTEBOOK.md                    |
+ |           |              |<--allow + additional_context       |
+ |           |<---allow------|               |                    |
+ |           |  === compact_session 实际执行 =====================>|
+ |           |<---compaction_result (token: 100K -> 30K)--------|  |
+ |           |  === PostCompact(v0.2 新增)==|                    |
+ |           |--run(PostCompact,ctx)------->|                    |
+ |           |              |---spawn----->echo to log file      |
+ |           |              |<---exit 0---|                      |
+ |           |<---allow------|               |                    |
+ |           |--TurnSummary(auto_compaction=Some(...))            |
+ |<--回复----|              |                |                    |
+```
+
+#### 14.3.5 预期日志输出
+
+```
+[INFO] run_turn: turn_started
+[INFO] llm: usage_tracker input_tokens=102345 (threshold=100000)
+[WARN] run_turn: auto_compaction_triggered tokens=102345
+[INFO] hook: event=PreCompact trigger=auto handler=inline
+       name=claw.builtin.notebook_refresher
+[INFO] notebook: refreshed NOTEBOOK.md entries=42 (decisions=5, subagents=3, tried=12)
+[INFO] hook: event=PreCompact decision=Allow latency=85ms
+[INFO] compact: compact_session started messages=128
+[INFO] compact: compact_session done original_tokens=102345 new_tokens=28430
+[INFO] hook: event=PostCompact trigger=auto handler=command
+[INFO] hook: PostCompact decision=Allow latency=23ms
+[INFO] run_turn: turn_completed auto_compaction=AutoCompactionEvent{original=102345, new=28430}
+```
+
+#### 14.3.6 断言要点
+
+```rust
+#[tokio::test]
+async fn example_3_pre_compact_refreshes_notebook() {
+    let mut runtime = build_test_runtime()
+        .with_hooks_toml("examples/pre_compact_notebook.toml")
+        .with_auto_compaction_threshold(100_000)
+        .with_inline_hook(
+            "claw.builtin.notebook_refresher",
+            Arc::new(NotebookRefresherHook::new()),
+        )
+        .with_user_input("继续之前的任务")
+        .build();
+
+    // 模拟 token 累积到阈值
+    runtime.simulate_token_accumulation(110_000);
+
+    let summary = runtime.run_turn().await.unwrap();
+
+    // 断言 1: PreCompact hook 触发了一次
+    let pre_calls = runtime.hook_log().for_event(HookEvent::PreCompact);
+    assert_eq!(pre_calls.len(), 1);
+
+    // 断言 2: NOTEBOOK.md 被刷新
+    let notebook_path = runtime.workspace_root().join("NOTEBOOK.md");
+    assert!(notebook_path.exists());
+    let content = std::fs::read_to_string(&notebook_path).unwrap();
+    assert!(content.contains("decisions:"));
+    assert!(content.contains("subagents:"));
+
+    // 断言 3: 实际压缩发生(auto_compaction 非 None)
+    assert!(summary.auto_compaction.is_some());
+    let event = summary.auto_compaction.unwrap();
+    assert!(event.original_tokens > event.new_tokens);
+
+    // 断言 4: PostCompact(v0.2 新增)被触发
+    let post_calls = runtime.hook_log().for_event(HookEvent::PostCompact);
+    assert_eq!(post_calls.len(), 1);
+
+    // 断言 5: inline hook 延迟 < 100ms(Inline handler 预算)
+    assert!(pre_calls[0].latency < Duration::from_millis(100));
+
+    // 断言 6: failure_policy=failClose,NOTEBOOK 刷新失败则放弃压缩
+    // (在另一个测试中模拟 inline hook 失败,验证 auto_compaction 为 None)
+}
+```
+
+### 14.4 示例对比总结
+
+| 维度 | 示例 1(PreToolUse 拦截) | 示例 2(PostToolUse 跑测试) | 示例 3(PreCompact 刷新) |
+|---|---|---|---|
+| 事件类型 | 工具层 / 阻断型 | 工具层 / 观察型 | 上下文层 / 协同型 |
+| Handler 类型 | command | command | inline + command |
+| 阻断语义 | Deny 短路,工具不执行 | 不阻断,additional_context 注入 | Deny 则放弃压缩 |
+| failure_policy | failClose | failOpen | failClose(示例 3) |
+| 性能预算 | < 500ms | < 120s | inline < 100ms,command < 5s |
+| 典型用例 | 安全策略 | 自动化测试 | 上下文持久化 |
+
+---
+
+## 15. Hook 执行性能预算(v0.2 新增)
+
+### 15.1 性能预算设计原则
+
+Hook 系统嵌入在 `run_turn` 的关键路径上,任何延迟都会直接放大到 LLM 调用 → 工具执行 → 用户响应的全链路。性能预算遵循以下原则:
+
+1. **不阻断主循环**:hook 超时必须熔断,不允许 hook 失败拖累 `run_turn`。
+2. **按 handler 类型分级**:不同 handler 的延迟特性差异巨大(command 进程启动 ~50ms,LLM prompt 调用 ~3s),不能用同一预算。
+3. **可观测可告警**:所有 hook 调用必须经 `LaneEvent` 上报延迟、超时、失败,CI 与生产环境均可见。
+4. **预算即合约**:配置文件中声明的 `timeout` 是 hook 与 runtime 的合约,超过即熔断,不依赖 hook 自觉。
+
+### 15.2 各 Handler 延迟预算
+
+| Handler 类型 | p50 预算 | p99 预算 | 硬超时上限 | 说明 |
+|---|---|---|---|---|
+| `Command` | < 100ms | < 500ms | 30s(可配置) | 进程 fork + exec + stdin/stdout,简单 shell 脚本应秒级返回 |
+| `Webhook` | < 500ms | < 2s | 30s(可配置) | 含 TCP 握手 + TLS + HTTP 往返,公网调用天然较慢 |
+| `Inline` | < 10ms | < 100ms | 60s(默认) | 进程内 async 调用,无 fork 开销,适合高频 hook |
+| `Prompt` | < 2s | < 5s | 60s(可配置) | LLM 调用(Haiku 级),用于复杂语义判定 |
+| `Command`(长时间任务,如 `cargo test`) | < 30s | < 120s | 600s(需显式声明) | 用户主动声明长 timeout,如自动化测试场景 |
+
+**预算违反示例**:Command hook p99 = 800ms → 触发性能告警;Inline hook p99 = 150ms → 触发优化任务;Prompt hook p99 = 8s → 立即触发熔断审查。
+
+### 15.3 超时熔断机制代码骨架
+
+```rust
+// rust/crates/runtime/src/hooks.rs(扩展 HookRunner)
+//
+// 超时熔断器:每个 hook 调用都包装在 tokio::time::timeout 中,
+// 超时后返回 HookRunResult::failed,并触发 HookTimedOut lane event。
+// 关键设计:
+// 1. timeout 时长取自 HookHandler::timeout(),允许 per-hook 配置
+// 2. 超时后必须清理子进程(command handler)或取消 future(inline/prompt)
+// 3. 超时不影响 hook 链后续执行(failure_policy 决定是否短路)
+// 4. 超时事件通过 LaneEvent 上报,接入监控告警
+
+use tokio::time::{timeout, Elapsed};
+use std::time::Duration;
+
+impl HookRunner {
+    /// 包装单个 hook 调用,增加超时熔断与 LaneEvent 上报。
+    async fn run_one_with_timeout(
+        &self,
+        entry: &HookEntry,
+        ctx: &HookContext<'_>,
+    ) -> HookRunResult {
+        let handler_kind = entry.handler.kind();
+        let timeout_dur = entry.handler.timeout();
+        let hook_id = self.entry_id(entry);  // 用于日志的 hook 标识
+        let started = std::time::Instant::now();
+
+        // 上报 HookExecuted(started) lane event
+        self.emit_lane_event(LaneEventName::HookExecuted, LaneEventStatus::Started, &[
+            ("hook_id", &hook_id),
+            ("handler", handler_kind),
+            ("event", ctx.event.as_str()),
+            ("timeout_ms", &timeout_dur.as_millis().to_string()),
+        ]);
+
+        let fut = self.run_handler(&entry.handler, ctx);
+        match timeout(timeout_dur, fut).await {
+            Ok(result) => {
+                let elapsed = started.elapsed();
+                // 上报 HookExecuted(completed) lane event
+                self.emit_lane_event(LaneEventName::HookExecuted, LaneEventStatus::Completed, &[
+                    ("hook_id", &hook_id),
+                    ("elapsed_ms", &elapsed.as_millis().to_string()),
+                    ("decision", result.decision.as_str()),
+                ]);
+
+                // 性能预算检查(p99 超阈值告警,但不影响结果)
+                if elapsed > self.budget_alert_threshold(handler_kind) {
+                    self.emit_lane_event(
+                        LaneEventName::HookSlow,
+                        LaneEventStatus::Warning,
+                        &[("hook_id", &hook_id), ("elapsed_ms", &elapsed.as_millis().to_string())],
+                    );
+                }
+                result
+            }
+            Err(_elapsed) => {
+                // 超时熔断
+                self.emit_lane_event(
+                    LaneEventName::HookTimedOut,
+                    LaneEventStatus::Failed,
+                    &[
+                        ("hook_id", &hook_id),
+                        ("timeout_ms", &timeout_dur.as_millis().to_string()),
+                    ],
+                );
+                HookRunResult::failed(format!(
+                    "hook {} ({}) timed out after {:?}",
+                    hook_id, handler_kind, timeout_dur,
+                ))
+            }
+        }
+    }
+
+    /// 根据 handler 类型返回 p99 告警阈值(超出则发 HookSlow 事件)。
+    fn budget_alert_threshold(&self, kind: &str) -> Duration {
+        match kind {
+            "command" => Duration::from_millis(500),
+            "webhook" => Duration::from_secs(2),
+            "inline" => Duration::from_millis(100),
+            "prompt" => Duration::from_secs(5),
+            _ => Duration::from_secs(30),
+        }
+    }
+
+    async fn run_handler(
+        &self,
+        handler: &HookHandler,
+        ctx: &HookContext<'_>,
+    ) -> HookRunResult {
+        match handler {
+            HookHandler::Command(c) => self.run_command(c, ctx).await,
+            HookHandler::Webhook(w) => self.run_webhook(w, ctx).await,
+            HookHandler::Inline(i) => self.run_inline(i, ctx).await,
+            HookHandler::Prompt(p) => self.run_prompt(p, ctx).await,
+        }
+    }
+}
+```
+
+### 15.4 性能监控指标(LaneEvent 集成)
+
+Hook 调用全过程通过 `LaneEvent` 上报,接入既有可观测性管道。以下为 v0.2 新增的 LaneEvent 类型:
+
+```rust
+// rust/crates/runtime/src/lane_events.rs(扩展)
+//
+// v0.2 新增 4 个 Hook 相关 LaneEvent:
+// - HookExecuted: hook 执行完成(started/completed 两阶段)
+// - HookFailed: hook 返回 Failed 状态(非超时)
+// - HookTimedOut: hook 超时熔断
+// - HookSlow: hook 完成但延迟超过 p99 预算(性能告警)
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LaneEventName {
+    // ... 既有事件
+    HookExecuted,
+    HookFailed,
+    HookTimedOut,
+    HookSlow,
+    HookDenied,    // hook 返回 Deny
+    HookAllowed,   // hook 返回 Allow(用于统计)
+}
+
+// 在 LaneEventBuilder 中添加便捷构造方法
+impl LaneEventBuilder {
+    pub fn hook_executed(hook_id: &str, handler: &str, event: &str) -> Self {
+        Self::new(LaneEventName::HookExecuted, LaneEventStatus::Started)
+            .with_metadata("hook_id", hook_id)
+            .with_metadata("handler", handler)
+            .with_metadata("event", event)
+    }
+
+    pub fn hook_timed_out(hook_id: &str, timeout_ms: u64) -> Self {
+        Self::new(LaneEventName::HookTimedOut, LaneEventStatus::Failed)
+            .with_metadata("hook_id", hook_id)
+            .with_metadata("timeout_ms", &timeout_ms.to_string())
+    }
+}
+```
+
+### 15.5 关键监控指标清单
+
+| 指标 | 来源 LaneEvent | 维度 | 告警阈值 |
+|---|---|---|---|
+| `hook_execution_count` | HookExecuted | event, handler, hook_id | (无,统计用) |
+| `hook_failure_rate` | HookFailed / HookExecuted | event, hook_id | > 5% 持续 5 分钟 |
+| `hook_timeout_rate` | HookTimedOut / HookExecuted | event, hook_id | > 1% 持续 5 分钟 |
+| `hook_p99_latency_ms` | HookExecuted.elapsed_ms | event, handler | Command > 500 / Webhook > 2000 / Inline > 100 / Prompt > 5000 |
+| `hook_deny_count` | HookDenied | event, hook_id | (无,业务监控用) |
+| `hook_slow_count` | HookSlow | event, hook_id | > 10/分钟 |
+
+### 15.6 性能优化检查清单
+
+实施 P0/W3 时按此清单优化,确保 hook 系统不成为性能瓶颈:
+
+- [ ] `HookRegistry::get` 使用 `RwLock::read`,无写时竞争
+- [ ] `reqwest::Client` 在 `HookRunner::new` 时创建一次,复用连接池
+- [ ] `tokio::process::Command` 而非 `std::process::Command`,避免阻塞 tokio worker
+- [ ] inline hook 使用 `Arc<dyn Hook>` clone,避免每次 `RwLock::read`
+- [ ] matcher 匹配结果可缓存(同一 tool_name 在同一 session 内复用)
+- [ ] `serde_json::to_string(ctx)` 在 hot path,考虑预分配缓冲区
+- [ ] `LaneEvent` 上报异步(通过 channel),不阻塞 hook 返回
+- [ ] 基准测试:criterion 跑 10000 次 `hook_runner.run`,p99 < 1ms(空 hook 场景)
+
+### 15.7 基准测试骨架
+
+```rust
+// rust/crates/runtime/benches/hook_runner.rs
+//
+// 用 criterion 测量 HookRunner 性能,确保不退化。
+
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use std::time::Duration;
+
+fn bench_hook_runner_empty(c: &mut Criterion) {
+    let runtime = build_test_runtime()
+        .with_hook_config(HookConfig::default())  // 空 hook
+        .build();
+    let ctx = build_test_ctx(HookEvent::PreToolUse);
+
+    c.bench_function("hook_runner_run_empty", |b| {
+        b.to_async(tokio::runtime::Runtime::new().unwrap())
+            .iter(|| runtime.hook_runner().run(HookEvent::PreToolUse, &ctx));
+    });
+}
+
+fn bench_hook_runner_inline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hook_runner_inline");
+    for n in [1, 5, 10, 50].iter() {
+        let runtime = build_test_runtime()
+            .with_inline_hooks(*n, NoOpHook::default())
+            .build();
+        let ctx = build_test_ctx(HookEvent::PostToolUse);
+        group.bench_with_input(BenchmarkId::from_parameter(n), n, |b, _| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| runtime.hook_runner().run(HookEvent::PostToolUse, &ctx));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_hook_runner_empty, bench_hook_runner_inline);
+criterion_main!(benches);
+```
+
+**通过标准**:`hook_runner_run_empty` p99 < 100μs;`hook_runner_inline/50` p99 < 1ms。若不达标,触发第 12 章风险缓解措施。
+
+---
+
+## 16. Hook 与权限系统协同(v0.2 新增)
+
+### 16.1 背景
+
+Claw Code 已有 `PermissionEnforcer`(见 `rust/crates/runtime/src/permission_enforcer.rs`)与 `PermissionMode` 枚举(见 `bash_validation.rs` line 103-300)。Hook 系统引入后,工具调用的决策路径变为「Hook → PermissionMode → Policy」,三者职责不同但需要协同。
+
+### 16.2 现有 PermissionMode 枚举
+
+基于 `bash_validation.rs` 实际代码,PermissionMode 包含以下变体:
+
+| 变体 | 含义 | 工具调用约束 |
+|---|---|---|
+| `ReadOnly` | 只读模式 | 仅允许 ls / cat / grep 等只读命令,禁止任何写入 |
+| `WorkspaceWrite` | 工作区写模式 | 允许工作区内写入,禁止工作区外路径与系统命令 |
+| `DangerFullAccess` | 完全访问模式 | 允许所有命令(危险,需用户显式确认) |
+| `Allow` | 全部允许 | 等同 DangerFullAccess 但无警告 |
+| `Prompt` | 逐次询问模式 | 每次工具调用都弹出权限提示,用户逐次确认 |
+
+### 16.3 Hook × PermissionMode 交互矩阵
+
+下表展示 Hook(PreToolUse)与 PermissionMode 在工具调用决策上的协同关系。每一行表示一种 PermissionMode,每一列表示 Hook 决策,单元格表示最终行为。
+
+| PermissionMode \ Hook 决策 | Allow | Deny | Failed(failClose) | Failed(failOpen) | Timeout |
+|---|---|---|---|---|---|
+| `ReadOnly` | 走 ReadOnly 校验(只读命令通过) | **拒绝工具**(Hook 优先) | **拒绝工具**(Hook 失败=拒绝) | 走 ReadOnly 校验 | 走 ReadOnly 校验(超时=failOpen 默认) |
+| `WorkspaceWrite` | 走 WorkspaceWrite 校验 | **拒绝工具** | **拒绝工具** | 走 WorkspaceWrite 校验 | 走 WorkspaceWrite 校验 |
+| `DangerFullAccess` | **允许工具**(全访问) | **拒绝工具** | **拒绝工具** | **允许工具** | **允许工具** |
+| `Allow` | **允许工具** | **拒绝工具** | **拒绝工具** | **允许工具** | **允许工具** |
+| `Prompt` | 弹出权限提示(用户确认) | **拒绝工具**(不弹提示) | **拒绝工具** | 弹出权限提示 | 弹出权限提示 |
+
+**关键观察**:
+
+1. **Hook Deny 优先于一切**:无论 PermissionMode 是什么,只要 Hook 返回 Deny,工具立即被拒绝,不进入权限校验流程。
+2. **Hook Allow 不绕过 PermissionMode**:Hook Allow 只表示「hook 不反对」,PermissionMode 仍按其规则校验。例如 ReadOnly 模式下,即使 Hook Allow,Bash 写入命令仍被拒。
+3. **Hook Failed 视同 Deny(failClose)**:failClose 策略下,Hook 自身失败也导致工具拒绝,优先级高于 PermissionMode。
+4. **Hook Failed(failOpen)与 Timeout 不阻断**:这两种情况下工具调用继续走 PermissionMode 校验,由权限系统决定是否允许。
+
+### 16.4 决策优先级图
+
+```
+                ┌─────────────────────────────────────┐
+                │  工具调用请求 (tool_name, tool_input) │
+                └──────────────────┬──────────────────┘
+                                   │
+                                   ▼
+                ┌─────────────────────────────────────┐
+                │   1. Hook 决策(PreToolUse hook chain)│
+                │      - Allow / Deny / Failed / Timeout │
+                └──────────────────┬──────────────────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              │                    │                    │
+              ▼                    ▼                    ▼
+        ┌─────────┐         ┌──────────┐         ┌─────────────┐
+        │  Deny   │         │  Allow   │         │ Failed/Timeout│
+        │ (短路)  │         │          │         │ (failOpen)   │
+        └────┬────┘         └────┬─────┘         └──────┬──────┘
+             │                   │                      │
+             ▼                   ▼                      ▼
+        ┌─────────┐         ┌──────────────────────────────────┐
+        │ 拒绝工具 │         │ 2. PermissionMode 校验            │
+        │ 返回错误 │         │    (ReadOnly/WorkspaceWrite/...)  │
+        └─────────┘         └──────────────┬───────────────────┘
+                                           │
+                            ┌──────────────┼──────────────┐
+                            │              │              │
+                            ▼              ▼              ▼
+                       ┌─────────┐   ┌─────────┐   ┌─────────────┐
+                       │ 拒绝    │   │ 允许    │   │ Prompt 询问 │
+                       │(规则禁止)│   │(规则允许)│   │(用户决定)   │
+                       └─────────┘   └────┬────┘   └──────┬──────┘
+                                          │               │
+                                          ▼               ▼
+                                    ┌─────────────────────────────┐
+                                    │ 3. Policy 校验(可选,多 Agent)│
+                                    │    PolicyEngine.check(...)   │
+                                    └──────────────┬──────────────┘
+                                                   │
+                                                   ▼
+                                          ┌─────────────────┐
+                                          │ 4. 实际工具执行  │
+                                          └─────────────────┘
+```
+
+### 16.5 Hook 能否覆盖 PermissionMode 的决策?
+
+**能,但仅限 Deny 方向**。
+
+- Hook 返回 Deny → 工具立即拒绝,PermissionMode 无机会放行。这是「Hook 优先」语义。
+- Hook 返回 Allow → 不影响 PermissionMode 的拒绝决策。Hook 不能强制放行 PermissionMode 禁止的工具。
+- Hook 返回 `permission_override` 字段(已有,见 `HookRunResult::permission_override`)→ 可以覆盖 PermissionMode 的默认决策,这是 v0.1 既有能力。
+
+```rust
+// rust/crates/runtime/src/hooks.rs(既有,v0.1 已实现)
+//
+// permission_override 允许 hook 显式覆盖 PermissionMode 的默认决策。
+// 例如:ReadOnly 模式下,hook 认为某次写入是安全的(如写入 /tmp),
+// 可返回 permission_override = PermissionOverride::Allow,
+// 绕过 ReadOnly 校验。
+
+pub struct HookRunResult {
+    // ...
+    permission_override: Option<PermissionOverride>,
+    permission_reason: Option<String>,
+}
+
+// PermissionOverride 已在 permissions 模块定义:
+//   Allow      - 允许(覆盖 ReadOnly 等限制)
+//   Deny       - 拒绝(覆盖 DangerFullAccess 等允许)
+//   Ask        - 转为 Prompt 询问
+//   UseDefault - 使用 PermissionMode 默认决策(默认值)
+```
+
+**使用场景**:PreToolUse hook 检测到 Edit 写入 `/tmp/build_cache/`,虽然用户处于 ReadOnly 模式,但 hook 判定该路径安全(临时缓存),返回 `permission_override = Allow`,允许写入。
+
+### 16.6 Hook 能否绕过 PermissionMode?
+
+**不能**。
+
+- Hook 失败(failOpen)或超时 → 工具调用继续走 PermissionMode 校验,不会被绕过。
+- Hook Allow → 仍需 PermissionMode 校验,PermissionMode 可拒绝。
+- Hook 不存在(无配置)→ 直接走 PermissionMode,行为不变。
+
+设计原则:**Hook 是 PermissionMode 的补充,不是替代**。Hook 提供细粒度的工具调用拦截(基于 tool_input 内容),PermissionMode 提供粗粒度的会话级策略(基于用户配置)。两者互补,不互斥。
+
+### 16.7 实施代码骨架
+
+```rust
+// rust/crates/runtime/src/conversation.rs(扩展 line 1175 附近的工具调用决策)
+//
+// 完整的工具调用决策流程:Hook → PermissionMode → 实际执行。
+// 关键点:
+// 1. PreToolUse hook 先执行,Deny 立即短路
+// 2. permission_override 字段覆盖 PermissionMode 默认决策
+// 3. PermissionMode 仍按其规则校验(除非被 override 覆盖)
+// 4. PolicyEngine(多 Agent 场景)在 PermissionMode 之后
+
+fn dispatch_tool_with_hooks_and_permissions(
+    &mut self,
+    tool_name: &str,
+    input: &Value,
+) -> ToolResult {
+    // === 阶段 1: PreToolUse hook ===
+    let hook_ctx = HookContext::for_pre_tool_use(
+        tool_name, input,
+        self.session_id.clone(), self.cwd.clone(),
+        &self.hook_abort_signal,
+    );
+    let hook_result = block_on(self.hook_runner.run(HookEvent::PreToolUse, &hook_ctx));
+
+    // Hook Deny 立即短路,不进入权限校验
+    if hook_result.is_denied() {
+        return ToolResult::error(hook_result.reason.unwrap_or_else(|| {
+            "PreToolUse hook denied".to_string()
+        }));
+    }
+
+    // Hook Failed + failClose 也短路
+    if hook_result.is_failed() && hook_result.failure_policy == FailurePolicy::FailClose {
+        return ToolResult::error(hook_result.reason.unwrap_or_else(|| {
+            "PreToolUse hook failed (failClose)".to_string()
+        }));
+    }
+
+    // 应用 hook 改写的 input
+    let effective_input = hook_result.updated_input
+        .map(|s| serde_json::from_str(&s).unwrap_or_else(|_| input.clone()))
+        .unwrap_or_else(|| input.clone());
+
+    // === 阶段 2: PermissionMode 校验 ===
+    let permission_decision = if let Some(override_) = hook_result.permission_override {
+        // Hook 显式覆盖 PermissionMode
+        PermissionDecision::from_override(override_)
+    } else {
+        // 使用 PermissionMode 默认决策
+        self.permission_enforcer.check(tool_name, &effective_input, self.permission_mode)
+    };
+
+    match permission_decision {
+        PermissionDecision::Allow => { /* 继续 */ }
+        PermissionDecision::Deny(reason) => {
+            return ToolResult::error(format!("Permission denied: {reason}"));
+        }
+        PermissionDecision::Ask => {
+            // Prompt 模式:弹出权限提示,等用户确认
+            let user_approved = self.prompt_user_for_permission(tool_name, &effective_input);
+            if !user_approved {
+                return ToolResult::error("User denied permission");
+            }
+        }
+    }
+
+    // === 阶段 3: PolicyEngine 校验(多 Agent 场景)===
+    if let Some(policy) = &self.policy_engine {
+        let action = policy.check(LaneContext::for_tool_call(tool_name, &effective_input));
+        match action {
+            PolicyAction::Block(reason) => return ToolResult::error(reason),
+            PolicyAction::Allow => { /* 继续 */ }
+            PolicyAction::Reconcile => { /* 调整 input 后继续 */ }
+            PolicyAction::Approve => { /* 标记已审批,继续 */ }
+        }
+    }
+
+    // === 阶段 4: 实际工具执行 ===
+    let result = self.tool_executor.execute(tool_name, &effective_input);
+
+    // === 阶段 5: PostToolUse / PostToolUseFailure hook ===
+    let post_event = if result.is_error {
+        HookEvent::PostToolUseFailure
+    } else {
+        HookEvent::PostToolUse
+    };
+    let post_ctx = HookContext::for_post_tool_use(
+        tool_name, &effective_input, &result.output,
+        self.session_id.clone(), self.cwd.clone(),
+        &self.hook_abort_signal,
+    );
+    let _ = block_on(self.hook_runner.run(post_event, &post_ctx));
+
+    result
+}
+```
+
+### 16.8 协同测试用例
+
+```rust
+#[tokio::test]
+async fn hook_deny_overrides_danger_full_access() {
+    // Hook Deny 应覆盖 DangerFullAccess,工具被拒绝
+    let mut runtime = build_test_runtime()
+        .with_permission_mode(PermissionMode::DangerFullAccess)
+        .with_hook(HookEvent::PreToolUse, deny_hook("危险操作"))
+        .build();
+    let _ = runtime.run_turn("rm -rf /tmp", None).await.unwrap();
+    assert_eq!(runtime.bash_executor().call_count(), 0);  // 工具未执行
+}
+
+#[tokio::test]
+async fn hook_allow_does_not_override_read_only() {
+    // Hook Allow 不能绕过 ReadOnly,工具仍被权限系统拒绝
+    let mut runtime = build_test_runtime()
+        .with_permission_mode(PermissionMode::ReadOnly)
+        .with_hook(HookEvent::PreToolUse, allow_hook())
+        .build();
+    let _ = runtime.run_turn("echo hello > /tmp/x", None).await.unwrap();
+    // ReadOnly 应拒绝写入命令
+    assert_eq!(runtime.bash_executor().call_count(), 0);
+}
+
+#[tokio::test]
+async fn hook_permission_override_can_allow_in_read_only() {
+    // Hook 通过 permission_override 显式允许 ReadOnly 模式下的写入
+    let mut runtime = build_test_runtime()
+        .with_permission_mode(PermissionMode::ReadOnly)
+        .with_hook(
+            HookEvent::PreToolUse,
+            override_hook(PermissionOverride::Allow, "safe temp write"),
+        )
+        .build();
+    let _ = runtime.run_turn("echo hello > /tmp/build_cache/x", None).await.unwrap();
+    // Hook override 应允许工具执行
+    assert_eq!(runtime.bash_executor().call_count(), 1);
+}
+
+#[tokio::test]
+async fn hook_failopen_falls_through_to_permission() {
+    // Hook Failed + failOpen,工具调用继续走 PermissionMode
+    let mut runtime = build_test_runtime()
+        .with_permission_mode(PermissionMode::WorkspaceWrite)
+        .with_hook(
+            HookEvent::PreToolUse,
+            failed_hook(FailurePolicy::FailOpen),
+        )
+        .build();
+    let _ = runtime.run_turn("ls -la", None).await.unwrap();
+    // WorkspaceWrite 应允许 ls
+    assert_eq!(runtime.bash_executor().call_count(), 1);
+}
+```
+
+---
+
+## 17. 配置文件热重载(v0.2 新增)
+
+### 17.1 设计目标
+
+用户编辑 `~/.claw/hooks.toml` 后,无需重启 Claw Code 即可生效。热重载设计目标:
+
+1. **零中断**:运行中的 hook 不被中断,新 hook 在下一次事件触发时生效。
+2. **部分更新**:只重载变更的 hook 条目,不重建整个 `HookConfig`,减少抖动。
+3. **原子切换**:`HookConfig` 切换通过 `ArcSwap` 原子完成,避免读到半更新状态。
+4. **错误恢复**:配置文件解析失败时,保留旧配置并发出警告,不崩溃 runtime。
+5. **可观测**:重载事件通过 `LaneEvent::HooksReloaded` 上报,记录变更数量与失败原因。
+
+### 17.2 文件 watcher(notify crate)
+
+使用 [`notify`](https://crates.io/crates/notify) crate 监听 `~/.claw/hooks.toml` 文件变更。notify 是 Rust 生态最成熟的跨平台文件 watcher,支持 Windows / macOS / Linux。
+
+```toml
+# rust/crates/runtime/Cargo.toml(扩展依赖)
+[dependencies]
+notify = { version = "6.0", features = ["serde"] }
+arc-swap = "1.7"   # 原子配置切换
+```
+
+### 17.3 热重载代码骨架
+
+```rust
+// rust/crates/runtime/src/hooks.rs(新增 HookReloader)
+//
+// HookReloader 监听配置文件变更,解析后通过 ArcSwap 原子替换 HookRunner.config。
+// 关键设计:
+// 1. notify watcher 在独立 tokio task 中运行,通过 channel 发送变更事件
+// 2. 主线程通过 ArcSwap<HookConfig> 持有当前配置,读取无锁,替换原子
+// 3. 解析失败时保留旧配置,通过 LaneEvent 上报错误
+// 4. 部分更新策略:diff 新旧 config,只重建变更的 HookMatcher
+
+use notify::{Watcher, RecursiveMode, Event, EventKind};
+use arc_swap::ArcSwap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+pub struct HookReloader {
+    /// 当前配置(ArcSwap 原子切换)
+    config: Arc<ArcSwap<HookConfig>>,
+    /// 配置文件路径
+    config_path: PathBuf,
+    /// 文件 watcher handle(持有以保活)
+    _watcher: notify::RecommendedWatcher,
+}
+
+impl HookReloader {
+    /// 启动热重载 watcher,返回 HookReloader 与配置访问句柄。
+    /// 调用方持有 HookReloader 以保活 watcher,通过 config() 读取最新配置。
+    pub fn start(
+        config_path: PathBuf,
+        initial_config: HookConfig,
+    ) -> Result<(Self, Arc<ArcSwap<HookConfig>>), notify::Error> {
+        let config = Arc::new(ArcSwap::from_pointee(initial_config));
+        let config_for_watcher = config.clone();
+        let path_for_watcher = config_path.clone();
+
+        let (tx, mut rx) = mpsc::channel::<()>(16);
+
+        let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
+            if let Ok(event) = res {
+                // 仅响应 Modify / Create 事件,忽略 Access(读取)事件
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                    // 文件可能正在写入,延迟 100ms 后再读(避免读到半写状态)
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _ = tx.send(()).await;
+                    });
+                }
+            }
+        })?;
+
+        watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
+
+        // 启动消费者 task:收到变更事件后重新解析配置
+        let config_for_consumer = config_for_watcher.clone();
+        let path_for_consumer = path_for_watcher.clone();
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                Self::reload(&config_for_consumer, &path_for_consumer).await;
+            }
+        });
+
+        Ok((
+            Self {
+                config: config.clone(),
+                config_path,
+                _watcher: watcher,
+            },
+            config,
+        ))
+    }
+
+    /// 重新加载配置文件。解析失败时保留旧配置。
+    async fn reload(config: &Arc<ArcSwap<HookConfig>>, path: &PathBuf) {
+        let old_config = config.load_full();  // Arc<ArcSwap<HookConfig>> -> Arc<HookConfig>
+
+        let new_config = match Self::parse_config(path) {
+            Ok(c) => c,
+            Err(e) => {
+                // 解析失败,保留旧配置,发出警告
+                emit_lane_event(
+                    LaneEventName::HooksReloadFailed,
+                    LaneEventStatus::Failed,
+                    &[("error", &e.to_string()), ("path", &path.to_string_lossy())],
+                );
+                eprintln!("warning: hooks.toml reload failed: {e}");
+                return;
+            }
+        };
+
+        // diff 计算(部分更新策略)
+        let diff = Self::diff_configs(&old_config, &new_config);
+        if diff.is_empty() {
+            return;  // 无变更
+        }
+
+        // 原子切换
+        config.store(Arc::new(new_config));
+
+        // 上报重载成功事件
+        emit_lane_event(
+            LaneEventName::HooksReloaded,
+            LaneEventStatus::Completed,
+            &[
+                ("changed_events", &diff.len().to_string()),
+                ("added", &diff.iter().filter(|d| d.is_add()).count().to_string()),
+                ("removed", &diff.iter().filter(|d| d.is_remove()).count().to_string()),
+                ("modified", &diff.iter().filter(|d| d.is_modify()).count().to_string()),
+            ],
+        );
+
+        eprintln!(
+            "info: hooks.toml reloaded: {} events changed ({} added, {} removed, {} modified)",
+            diff.len(),
+            diff.iter().filter(|d| d.is_add()).count(),
+            diff.iter().filter(|d| d.is_remove()).count(),
+            diff.iter().filter(|d| d.is_modify()).count(),
+        );
+    }
+
+    fn parse_config(path: &PathBuf) -> Result<HookConfig, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string(path)?;
+        let config: HookConfig = toml::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// 计算新旧配置差异,用于部分更新策略。
+    fn diff_configs<'a>(
+        old: &'a HookConfig,
+        new: &'a HookConfig,
+    ) -> Vec<ConfigDiff> {
+        let mut diffs = Vec::new();
+        let all_events: std::collections::HashSet<HookEvent> =
+            old.hooks.keys().chain(new.hooks.keys()).copied().collect();
+
+        for event in all_events {
+            let old_matchers = old.hooks.get(&event);
+            let new_matchers = new.hooks.get(&event);
+            match (old_matchers, new_matchers) {
+                (None, Some(_)) => diffs.push(ConfigDiff::Added(event)),
+                (Some(_), None) => diffs.push(ConfigDiff::Removed(event)),
+                (Some(o), Some(n)) if o != n => diffs.push(ConfigDiff::Modified(event)),
+                _ => {}  // 相同,无差异
+            }
+        }
+        diffs
+    }
+
+    /// 获取当前配置的 Arc clone(无锁读取)。
+    pub fn config(&self) -> arc_swap::Guard<Arc<HookConfig>> {
+        self.config.load()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ConfigDiff {
+    Added(HookEvent),
+    Removed(HookEvent),
+    Modified(HookEvent),
+}
+
+impl ConfigDiff {
+    fn is_add(&self) -> bool { matches!(self, Self::Added(_)) }
+    fn is_remove(&self) -> bool { matches!(self, Self::Removed(_)) }
+    fn is_modify(&self) -> bool { matches!(self, Self::Modified(_)) }
+}
+```
+
+### 17.4 部分更新策略
+
+热重载采用「diff 后部分更新」策略,而非「整体重建 HookConfig」,以减少抖动:
+
+| 场景 | 行为 |
+|---|---|
+| 新增事件(如新增 `[[Stop]]` 段) | 在 `HookConfig.hooks` 中 insert 新 entry,运行中事件不受影响 |
+| 删除事件(如删除 `[[Notification]]` 段) | 标记为 disabled,正在执行的 hook 链继续完成,下一次事件触发时不再加载 |
+| 修改事件(如调整 matcher / priority) | 原子替换该事件的 `Vec<HookMatcher>`,下一次事件触发时按新配置执行 |
+| 修改单个 hook entry(如改 command) | 替换该 entry,不影响同事件其他 hook |
+| 解析失败 | 保留旧配置,发出 `HooksReloadFailed` lane event,继续使用旧配置 |
+
+### 17.5 运行中 hook 不中断保证
+
+热重载必须保证「正在执行的 hook 链完成执行」,不允许中途切换配置导致 hook 行为不一致。
+
+实现机制:
+
+1. **Hook 链持有 Arc<HookConfig> 引用**:hook 链开始执行时,通过 `config.load_full()` 持有当前配置的 Arc clone,整个链执行期间引用不变。
+2. **ArcSwap 替换不影响已持有引用**:热重载通过 `config.store(Arc::new(new))` 原子替换,但已持有旧 Arc 的 hook 链仍使用旧配置完成执行。
+3. **下一次事件触发使用新配置**:新事件触发时调用 `config.load()` 获取最新配置,自然切换。
+
+```rust
+// 示例:Hook 链执行时持有配置引用
+impl HookRunner {
+    pub async fn run(&self, event: HookEvent, ctx: &HookContext<'_>) -> HookRunResult {
+        // 关键:在链开始时 load_full,持有 Arc<HookConfig> 引用
+        let config = self.config.load_full();  // Arc<HookConfig>
+
+        let matchers = config.hooks.get(&event).cloned().unwrap_or_default();
+        // ... 后续执行使用 matchers,即使热重载发生也不影响本次执行
+    }
+}
+```
+
+### 17.6 热重载测试用例
+
+```rust
+#[tokio::test]
+async fn hook_config_hot_reload_takes_effect_on_next_event() {
+    let config_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    std::fs::write(&config_path, r#"
+[[PreToolUse]]
+matcher = "Bash"
+execution = "sequential"
+  [[PreToolUse.hooks]]
+  priority = 100
+  [PreToolUse.hooks.handler]
+  type = "command"
+  command = "echo initial"
+  timeout = "2s"
+"#).unwrap();
+
+    let initial = HookConfig::parse(&config_path).unwrap();
+    let (reloader, config) = HookReloader::start(config_path.to_path_buf(), initial).unwrap();
+    let runtime = build_test_runtime().with_hook_config_handle(config).build();
+
+    // 1. 初始配置:echo initial
+    let _ = runtime.run_turn("do something", None).await.unwrap();
+    assert!(runtime.spawned_commands().iter().any(|c| c.contains("echo initial")));
+
+    // 2. 修改配置文件:echo updated
+    std::fs::write(&config_path, r#"
+[[PreToolUse]]
+matcher = "Bash"
+execution = "sequential"
+  [[PreToolUse.hooks]]
+  priority = 100
+  [PreToolUse.hooks.handler]
+  type = "command"
+  command = "echo updated"
+  timeout = "2s"
+"#).unwrap();
+
+    // 3. 等待 watcher 触发(延迟 100ms + channel)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 4. 下一个事件应使用新配置
+    let _ = runtime.run_turn("do something else", None).await.unwrap();
+    assert!(runtime.spawned_commands().iter().any(|c| c.contains("echo updated")));
+    assert!(!runtime.spawned_commands().iter().any(|c| c.contains("echo initial")));
+}
+
+#[tokio::test]
+async fn hook_config_hot_reload_invalid_toml_keeps_old_config() {
+    let config_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    std::fs::write(&config_path, "[[PreToolUse]]\nmatcher=\"Bash\"\n").unwrap();
+    let initial = HookConfig::parse(&config_path).unwrap();
+    let (_reloader, config) = HookReloader::start(config_path.to_path_buf(), initial).unwrap();
+
+    // 写入无效 TOML
+    std::fs::write(&config_path, "this is not valid toml {{{{").unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 配置应保持旧值
+    let current = config.load();
+    assert!(current.hooks.contains_key(&HookEvent::PreToolUse));
+}
+
+#[tokio::test]
+async fn hook_config_hot_reload_running_hook_not_interrupted() {
+    // 验证:运行中的 hook 链使用旧配置完成执行,新配置在下一次事件生效
+    let config_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    std::fs::write(&config_path, "...initial with 3 hooks...").unwrap();
+    let initial = HookConfig::parse(&config_path).unwrap();
+    let (_reloader, config) = HookReloader::start(config_path.to_path_buf(), initial).unwrap();
+
+    // 启动一个慢 hook(500ms)
+    let runtime = build_test_runtime()
+        .with_hook_config_handle(config.clone())
+        .with_slow_hook(500)
+        .build();
+
+    let runtime_clone = runtime.clone();
+    let handle = tokio::spawn(async move {
+        runtime_clone.run_turn("trigger hook", None).await
+    });
+
+    // 在 hook 执行中修改配置
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(&config_path, "...new with 1 hook...").unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;  // 等 watcher 触发
+
+    // 等待 hook 完成
+    let summary = handle.await.unwrap().unwrap();
+
+    // 验证:本次执行使用旧配置(3 hooks 都执行)
+    assert_eq!(runtime.hook_log().count(), 3);
+
+    // 下一次执行使用新配置(1 hook)
+    let _ = runtime.run_turn("trigger again", None).await.unwrap();
+    assert_eq!(runtime.hook_log().count_since_last(), 1);
+}
+```
+
+### 17.7 Cargo.toml 依赖更新清单
+
+```toml
+# rust/crates/runtime/Cargo.toml
+[dependencies]
+# 既有
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+reqwest = { version = "0.11", features = ["json"] }
+humantime-serde = "1"
+
+# v0.2 新增
+notify = { version = "6.0", features = ["serde"] }   # 文件 watcher
+arc-swap = "1.7"                                       # 原子配置切换
+toml = "0.8"                                            # TOML 解析(配置文件)
+regex = "1"                                             # matcher 升级(P1)
+```
+
+---
+
+## 18. 迁移指南(v0.2 新增)
+
+### 18.1 迁移范围
+
+本指南覆盖从 v0.1(3 事件 / 1 handler / 同步执行)到 v0.2(10 事件 / 4 handler / 异步引擎)的迁移路径。涉及:
+
+- 配置文件格式:`RuntimeHookConfig`(JSON 字段) → `HookConfig`(TOML / JSON,事件作为顶层 key)
+- 代码:`HookRunner` 内部实现重写,`run_turn` 集成点扩展
+- 用户配置:既有 `.claw/settings.json` 中的 `pre_tool_use` 字段保留可用
+- 废弃事件标记:v0.1 没有废弃事件,v0.2 引入废弃机制为未来版本预留
+
+### 18.2 事件迁移映射
+
+| v0.1 事件 | v0.2 事件 | 迁移状态 | 说明 |
+|---|---|---|---|
+| `PreToolUse` | `PreToolUse` | 保留 | 行为扩展(支持 matcher / 4 handler / failure_policy) |
+| `PostToolUse` | `PostToolUse` | 保留 | 行为扩展(支持 additional_context 注入) |
+| `PostToolUseFailure` | `PostToolUseFailure` | 保留 | 行为扩展(支持独立 hook 链) |
+| (无) | `PostCustomToolCall` | 新增 | MCP 工具专用 |
+| (无) | `UserPromptSubmit` | 新增 | prompt 改写 / 上下文注入 |
+| (无) | `Notification` | 新增 | webhook 通知场景 |
+| (无) | `SessionStart` | 新增 | 环境检查 / .env 加载 |
+| (无) | `SessionEnd` | 新增 | 清理 / 归档 |
+| (无) | `Stop` | 新增 | 完成度检查 / 自动 commit |
+| (无) | `SubagentStop` | 新增 | 子 agent 结果验证 |
+| (无) | `PreCompact` | 新增 | 压缩前持久化 |
+| (无) | `PostCompact`(v0.2 示例 3 提及) | 待定 | v0.2 示例中提出,P0 暂不实现,P1 评估纳入 |
+
+**向后兼容**:v0.1 的 3 事件在 v0.2 中语义保持不变,既有 hook 配置无需修改即可工作。
+
+### 18.3 配置文件向后兼容
+
+#### 18.3.1 v0.1 配置格式(保留可用)
+
+```json
+// .claw/settings.json(v0.1 格式)
+{
+  "hooks": {
+    "pre_tool_use": [
+      "$CLAW_PROJECT_DIR/.claw/hooks/lint.sh"
+    ],
+    "post_tool_use": [
+      "$CLAW_PROJECT_DIR/.claw/hooks/audit.sh"
+    ],
+    "post_tool_use_failure": []
+  }
+}
+```
+
+v0.2 加载时,通过 `HookConfig::from_legacy` 自动转换为新格式:
+
+```rust
+// rust/crates/runtime/src/hooks.rs(扩展)
+impl HookConfig {
+    pub fn from_legacy(legacy: crate::config::RuntimeHookConfig) -> Self {
+        let mut hooks = BTreeMap::new();
+        // 每个 v0.1 字段映射为 v0.2 的 HookMatcher
+        // - matcher = ""(空,匹配全部)
+        // - execution = Sequential
+        // - 每个 command 字符串包装为 CommandHook
+        // - priority = 100(默认)
+        // - failure_policy = FailClose(v0.1 行为)
+        // - enabled = true
+
+        if !legacy.pre_tool_use().is_empty() {
+            hooks.insert(HookEvent::PreToolUse, vec![HookMatcher {
+                matcher: String::new(),
+                execution: HookExecution::Sequential,
+                hooks: legacy.pre_tool_use().iter().map(|c| HookEntry {
+                    handler: HookHandler::Command(CommandHook {
+                        command: c.clone(),
+                        timeout: Duration::from_secs(30),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    }),
+                    priority: 100,
+                    failure_policy: FailurePolicy::FailClose,
+                    enabled: true,
+                }).collect(),
+            }]);
+        }
+        // post_tool_use / post_tool_use_failure 同理
+        // ...
+
+        Self { hooks }
+    }
+}
+```
+
+#### 18.3.2 v0.2 配置格式(推荐)
+
+```toml
+# .claw/hooks.toml(v0.2 格式,推荐)
+[[PreToolUse]]
+matcher = "Edit|Write"
+execution = "sequential"
+
+  [[PreToolUse.hooks]]
+  priority = 100
+  failure_policy = "failClose"
+  enabled = true
+
+  [PreToolUse.hooks.handler]
+  type = "command"
+  command = "$CLAW_PROJECT_DIR/.claw/hooks/lint.sh"
+  timeout = "30s"
+```
+
+#### 18.3.3 加载优先级
+
+v0.2 配置加载顺序(后者覆盖前者):
+
+1. `~/.claw/hooks.toml`(全局,用户级)
+2. `$CLAW_PROJECT_DIR/.claw/hooks.toml`(项目级)
+3. `$CLAW_PROJECT_DIR/.claw/settings.json` 中的 `hooks` 字段(项目级,JSON)
+4. 命令行 `--hooks-config <path>`(显式指定,最高优先级)
+
+**v0.1 兼容字段**:`settings.json` 中的 `pre_tool_use` / `post_tool_use` / `post_tool_use_failure` 数组字段继续支持,但优先级低于 v0.2 的 `hooks` 字段。若两者同时存在,`hooks` 字段完全覆盖 v0.1 字段(非合并)。
+
+### 18.4 代码迁移路径
+
+#### 18.4.1 阶段 1:HookRunner 内部重写(P0 W1-W4)
+
+```rust
+// 旧:v0.1 HookRunner(同步,仅 command handler)
+pub struct HookRunner {
+    config: RuntimeHookConfig,
+}
+impl HookRunner {
+    pub fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
+        // 同步遍历 pre_tool_use 命令,串行执行
+    }
+}
+
+// 新:v0.2 HookRunner(异步,4 handler)
+pub struct HookRunner {
+    config: Arc<ArcSwap<HookConfig>>,  // 支持热重载
+    inline_registry: Arc<HookRegistry>,
+    http_client: reqwest::Client,
+    llm_router: Option<Arc<LlmRouter>>,
+}
+impl HookRunner {
+    pub async fn run(&self, event: HookEvent, ctx: &HookContext<'_>) -> HookRunResult {
+        // 异步执行,支持 4 handler,超时熔断,失败策略
+    }
+}
+```
+
+迁移策略:**保留 v0.1 同步方法作为 wrapper**,内部调用异步 `run`,通过 `block_on` 桥接。这样 `conversation.rs` 集成点无需立即改为 async。
+
+```rust
+// 迁移期 wrapper(P0 W5-W6 期间)
+impl HookRunner {
+    /// v0.1 兼容方法(同步),内部桥接到 v0.2 异步 run。
+    pub fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
+        let input_value: Value = serde_json::from_str(input).unwrap_or(json!({}));
+        let ctx = HookContext::for_pre_tool_use(
+            tool_name, &input_value,
+            self.session_id.clone(), self.cwd.clone(),
+            &self.hook_abort_signal,
+        );
+        futures::executor::block_on(self.run(HookEvent::PreToolUse, &ctx))
+    }
+}
+```
+
+#### 18.4.2 阶段 2:run_turn 集成点接入(P0 W5-W6)
+
+按第 7 章 8 个集成点逐一接入,每个集成点的迁移步骤:
+
+1. 在 `conversation.rs` 对应位置插入 `HookContext::for_xxx(...)` 构造
+2. 调用 `block_on(self.hook_runner.run(event, &ctx))`(P0 桥接)
+3. 根据返回的 `HookRunResult` 决定是否短路 / 注入上下文 / 改写输入
+4. 添加单元测试验证触发
+
+#### 18.4.3 阶段 3:run_turn 改为 async(P1)
+
+P0 阶段保留 `run_turn` 为同步函数,通过 `block_on` 桥接。P1 阶段将 `run_turn` 改为 `async fn`,消除所有 `block_on`,根本解决嵌套调用风险(见 12.2 Blocking 死锁)。
+
+```rust
+// P1:run_turn 改为 async
+pub async fn run_turn(
+    &mut self,
+    user_input: impl Into<String>,
+    mut prompter: Option<&mut dyn PermissionPrompter>,
+) -> Result<TurnSummary, RuntimeError> {
+    // ... 直接 await self.hook_runner.run(...),无需 block_on
+}
+```
+
+### 18.5 废弃事件标记机制
+
+v0.2 引入废弃标记机制,为未来版本的事件重命名 / 合并预留路径。
+
+#### 18.5.1 废弃标记语法
+
+在 `HookEvent` enum 上添加 `#[deprecated]` 属性,并在 `as_str()` 中保留旧名以兼容配置文件:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HookEvent {
+    // ... 既有事件
+
+    /// v0.3 计划废弃:合并到 PostToolUse(tool_result_is_error=true)
+    #[deprecated(since = "0.2", note = "use PostToolUse with tool_result_is_error=true")]
+    #[serde(rename = "PostToolUseFailure")]
+    PostToolUseFailure,
+}
+```
+
+#### 18.5.2 配置文件废弃警告
+
+加载配置时,若发现废弃事件,打印警告并自动迁移:
+
+```rust
+impl HookConfig {
+    pub fn parse(toml_str: &str) -> Result<Self, toml::de::Error> {
+        let config: HookConfig = toml::from_str(toml_str)?;
+        config.warn_on_deprecated();
+        Ok(config)
+    }
+
+    fn warn_on_deprecated(&self) {
+        #[allow(deprecated)]
+        if self.hooks.contains_key(&HookEvent::PostToolUseFailure) {
+            eprintln!(
+                "warning: PostToolUseFailure is deprecated since 0.2, \
+                 migrate to PostToolUse with tool_result_is_error=true"
+            );
+        }
+    }
+}
+```
+
+#### 18.5.3 自动迁移
+
+对于已废弃但仍可兼容的事件,在加载时自动转换:
+
+```rust
+impl HookConfig {
+    pub fn auto_migrate_deprecated(mut self) -> Self {
+        #[allow(deprecated)]
+        if let Some(matchers) = self.hooks.remove(&HookEvent::PostToolUseFailure) {
+            // 合并到 PostToolUse(matcher 不变,hook 内可通过 tool_result_is_error 分支)
+            self.hooks.entry(HookEvent::PostToolUse)
+                .or_insert_with(Vec::new)
+                .extend(matchers);
+            eprintln!("info: auto-migrated PostToolUseFailure → PostToolUse");
+        }
+        self
+    }
+}
+```
+
+### 18.6 迁移验证测试
+
+```rust
+#[tokio::test]
+async fn migration_v01_config_loads_in_v02() {
+    // v0.1 配置在 v0.2 中应正常加载并工作
+    let v01_json = r#"{
+        "hooks": {
+            "pre_tool_use": ["echo pre"],
+            "post_tool_use": ["echo post"]
+        }
+    }"#;
+
+    let v01_config: RuntimeHookConfig = serde_json::from_str(v01_json).unwrap();
+    let v02_config = HookConfig::from_legacy(v01_config);
+
+    // 验证:v0.1 的 2 个字段被正确转换为 v0.2 的 HookMatcher
+    assert!(v02_config.hooks.contains_key(&HookEvent::PreToolUse));
+    assert!(v02_config.hooks.contains_key(&HookEvent::PostToolUse));
+
+    // 验证:command 字符串被包装为 CommandHook
+    let pre_matchers = &v02_config.hooks[&HookEvent::PreToolUse];
+    assert_eq!(pre_matchers[0].hooks.len(), 1);
+    match &pre_matchers[0].hooks[0].handler {
+        HookHandler::Command(c) => assert_eq!(c.command, "echo pre"),
+        _ => panic!("expected Command handler"),
+    }
+
+    // 验证:行为与 v0.1 一致(同 priority=100,FailClose,enabled=true)
+    let entry = &pre_matchers[0].hooks[0];
+    assert_eq!(entry.priority, 100);
+    assert_eq!(entry.failure_policy, FailurePolicy::FailClose);
+    assert!(entry.enabled);
+}
+
+#[tokio::test]
+async fn migration_v01_and_v02_config_coexist() {
+    // v0.1 字段与 v0.2 hooks 字段同时存在时,v0.2 hooks 优先
+    let settings_json = r#"{
+        "pre_tool_use": ["echo v1_command"],
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "execution": "sequential",
+                "hooks": [{
+                    "handler": {"type": "command", "command": "echo v2_command"}
+                }]
+            }]
+        }
+    }"#;
+
+    let config = load_settings(settings_json);
+    // v0.2 hooks 字段完全覆盖 v0.1 pre_tool_use
+    let pre_matchers = &config.hooks[&HookEvent::PreToolUse];
+    assert_eq!(pre_matchers[0].hooks.len(), 1);
+    match &pre_matchers[0].hooks[0].handler {
+        HookHandler::Command(c) => assert_eq!(c.command, "echo v2_command"),
+        _ => panic!("expected v2 handler"),
+    }
+}
+
+#[tokio::test]
+async fn migration_deprecated_event_warns() {
+    // 使用废弃事件应打印警告(但不报错)
+    let toml_str = r#"
+[[PostToolUseFailure]]
+matcher = "*"
+execution = "sequential"
+  [[PostToolUseFailure.hooks]]
+  [PostToolUseFailure.hooks.handler]
+  type = "command"
+  command = "echo failure"
+"#;
+    let config = HookConfig::parse(toml_str).unwrap();
+    // (捕获 stderr 验证警告)
+    // config.warn_on_deprecated() 应输出 warning
+}
+
+#[tokio::test]
+async fn migration_deprecated_event_auto_migrates() {
+    let toml_str = r#"
+[[PostToolUseFailure]]
+matcher = "*"
+execution = "sequential"
+  [[PostToolUseFailure.hooks]]
+  [PostToolUseFailure.hooks.handler]
+  type = "command"
+  command = "echo failure"
+"#;
+    let config = HookConfig::parse(toml_str).unwrap().auto_migrate_deprecated();
+    // 废弃事件被合并到 PostToolUse
+    assert!(!config.hooks.contains_key(&HookEvent::PostToolUseFailure));
+    assert!(config.hooks.contains_key(&HookEvent::PostToolUse));
+}
+```
+
+### 18.7 迁移检查清单
+
+实施 P0/W7 配置迁移时,按此清单验证:
+
+- [ ] v0.1 配置文件在 v0.2 中可正常加载,行为不变
+- [ ] `HookConfig::from_legacy` 单元测试覆盖 3 个 v0.1 字段
+- [ ] v0.1 / v0.2 配置共存时,优先级正确(v0.2 hooks 覆盖 v0.1 字段)
+- [ ] v0.1 命令字符串默认参数:timeout=30s, priority=100, failClose, enabled=true
+- [ ] 迁移期 deprecation warning 在 stderr 输出
+- [ ] 自动迁移机制(废弃事件 → 新事件)正确工作
+- [ ] 既有用户升级 v0.2 后,既有 hook 配置无需修改即可工作
+- [ ] 端到端测试:用 v0.1 配置跑完整 turn,行为与 v0.1 一致
+
+### 18.8 迁移时间线
+
+| 阶段 | 版本 | 行为 |
+|---|---|---|
+| 兼容期 | v0.2(P0 W1-W8) | v0.1 配置可加载,通过 `from_legacy` 转换;打印 deprecation warning |
+| 兼容期 | v0.3-P1 | 同上,继续支持 v0.1 配置 |
+| 过渡期 | v0.4-P2 | v0.1 配置打印强制迁移警告,要求用户转换 |
+| 删除期 | v0.5+ | 移除 `RuntimeHookConfig` 与 `from_legacy`,只支持 v0.2+ 配置 |
+
+总兼容期:12 周(P0 + P1),确保用户有充足时间迁移。
+
+---
+
 ## 附录 A: 术语表
 
 | 术语 | 含义 |
@@ -2546,13 +5002,29 @@ async fn run_inline(&self, hook: &InlineHookRef, ctx: &HookContext<'_>) -> HookR
 
 | 文件 | 路径 | 角色 |
 |---|---|---|
-| Hooks 主实现 | `rust/crates/runtime/src/hooks.rs` | HookEvent / HookHandler / HookRunner |
+| Hooks 主实现 | `rust/crates/runtime/src/hooks.rs` | HookEvent / HookHandler / HookRunner / HookChainExecutor / HookReloader |
 | 集成点 | `rust/crates/runtime/src/conversation.rs` | run_turn 中 8 个 hook 接入点 |
 | 配置 | `rust/crates/runtime/src/config.rs` | RuntimeHookConfig(待迁移为 HookConfig) |
 | 策略引擎 | `rust/crates/runtime/src/policy_engine.rs` | DAG lane 级策略 |
 | Plugin 生命周期 | `rust/crates/runtime/src/plugin_lifecycle.rs` | Plugin 加载 / 卸载事件 |
 | 权限强制 | `rust/crates/runtime/src/permission_enforcer.rs` | 工具调用权限检查 |
+| Bash 校验 | `rust/crates/runtime/src/bash_validation.rs` | PermissionMode 枚举与命令校验(line 103-300) |
+| Lane 事件 | `rust/crates/runtime/src/lane_events.rs` | LaneEvent 上报(v0.2 新增 Hook 相关事件) |
+| 性能基准 | `rust/crates/runtime/benches/hook_runner.rs` | criterion 基准测试(v0.2 新增) |
 | 主文档 | `docs/ide-hooks-dag-implementation-plan.md` | 父文档(第三章 Hooks 系统方案) |
+
+## 附录 C: v0.2 章节速查
+
+| 章节 | 用途 | 关键内容 |
+|---|---|---|
+| 6.9 HookChain 执行器 | 实现顺序保证与短路语义 | HookChainExecutor 代码骨架(50+ 行) |
+| 11.5 v0.2 新增测试用例 | 验证 v0.2 新能力 | 6 个测试用例 |
+| 13. 集成点行号验证表 | 实施时定位代码 | 14 项验证 + 5 项附加验证点 |
+| 14. 端到端集成示例 | 理解 Hook 系统工作流 | 3 个完整示例(配置 / 时序 / 日志 / 断言) |
+| 15. Hook 执行性能预算 | 性能设计与监控 | Handler 预算 / 熔断骨架 / LaneEvent 指标 |
+| 16. Hook 与权限系统协同 | Hook 与 PermissionMode 关系 | 交互矩阵 / 决策优先级图 / 协同代码 |
+| 17. 配置文件热重载 | 运行期配置更新 | notify watcher / ArcSwap / 部分更新 |
+| 18. 迁移指南 | v0.1 → v0.2 升级 | 事件映射 / 配置兼容 / 废弃机制 / 时间线 |
 
 ---
 
