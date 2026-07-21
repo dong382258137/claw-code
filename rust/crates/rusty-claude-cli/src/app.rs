@@ -516,6 +516,17 @@ pub(crate) struct LiveCli {
     /// 由 TuiApp 在执行斜杠命令前设置，执行后清除。
     #[cfg(feature = "full-tui")]
     tui_output: Option<std::sync::Arc<std::sync::Mutex<crate::tui::output_view::OutputBuffer>>>,
+    /// TUI 中断支持：当前 turn 的 abort signal handle。
+    /// run_turn 开始时设置，turn 结束（成功/失败/中断）时清空。
+    /// TUI 层 Ctrl+C（busy 时）通过此 handle 取消当前 turn。
+    #[cfg(feature = "full-tui")]
+    current_abort_signal: Option<runtime::HookAbortSignal>,
+    /// TUI 中断支持：外部注入的 abort signal。
+    /// TUI 层在启动 worker thread 前设置（保留 clone 用于 Ctrl+C abort），
+    /// prepare_turn_runtime 优先使用此 signal（而非创建新的），
+    /// 让 TUI 主线程能取消正在执行的 turn。
+    #[cfg(feature = "full-tui")]
+    external_abort_signal: Option<runtime::HookAbortSignal>,
 }
 
 pub(crate) struct BuiltRuntime {
@@ -682,6 +693,10 @@ impl LiveCli {
             tui_mode: false,
             #[cfg(feature = "full-tui")]
             tui_output: None,
+            #[cfg(feature = "full-tui")]
+            current_abort_signal: None,
+            #[cfg(feature = "full-tui")]
+            external_abort_signal: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -802,7 +817,13 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
-    ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
+    ) -> Result<(BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal), Box<dyn std::error::Error>> {
+        // TUI 中断支持：优先使用外部注入的 abort signal（由 TUI 层在 spawn
+        // worker thread 前设置），让 TUI 主线程能通过 Ctrl+C 取消当前 turn。
+        // 非中断模式（CLI/JSON 等）创建新的 signal。
+        #[cfg(feature = "full-tui")]
+        let hook_abort_signal = self.external_abort_signal.clone().unwrap_or_default();
+        #[cfg(not(feature = "full-tui"))]
         let hook_abort_signal = runtime::HookAbortSignal::new();
         let mut runtime = build_runtime(
             self.runtime.session().clone(),
@@ -829,9 +850,9 @@ impl LiveCli {
                     .set_status_emitter(Arc::clone(emitter));
             }
         }
-        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
+        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal.clone());
 
-        Ok((runtime, hook_abort_monitor))
+        Ok((runtime, hook_abort_monitor, hook_abort_signal))
     }
 
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
@@ -865,7 +886,12 @@ impl LiveCli {
         let tui_mode = self.tui_mode;
         #[cfg(not(feature = "full-tui"))]
         let tui_mode = false;
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(emit_output)?;
+        let (mut runtime, hook_abort_monitor, abort_signal) = self.prepare_turn_runtime(emit_output)?;
+        // TUI 中断支持：保存 abort signal handle，让 TUI 层 Ctrl+C 能取消当前 turn。
+        #[cfg(feature = "full-tui")]
+        {
+            self.current_abort_signal = Some(abort_signal.clone());
+        }
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         if !tui_mode {
@@ -930,6 +956,11 @@ impl LiveCli {
                     println!();
                 }
                 self.persist_session()?;
+                // TUI 中断支持：turn 成功结束后清空 abort signal handle。
+                #[cfg(feature = "full-tui")]
+                {
+                    self.current_abort_signal = None;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -955,6 +986,11 @@ impl LiveCli {
                         );
                     }
                 }
+                // TUI 中断支持：turn 结束（含错误/中断）后清空 abort signal handle。
+                #[cfg(feature = "full-tui")]
+                {
+                    self.current_abort_signal = None;
+                }
                 Err(Box::new(error))
             }
         }
@@ -975,7 +1011,7 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -988,7 +1024,7 @@ impl LiveCli {
     }
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -1013,7 +1049,7 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -2182,6 +2218,36 @@ impl LiveCli {
         self.status_emitter = None;
     }
 
+    /// TUI 中断支持：取消当前正在执行的 turn。
+    /// 通过 abort hook_abort_signal，agent loop 在下一次迭代顶部检测到
+    /// 后退出。正在进行的 API 流式请求无法中断（阻塞 IO），但可以阻止
+    /// 下一轮迭代（不再发起新请求、不再执行新工具）。
+    /// 返回 true 表示已发送取消信号，false 表示当前没有正在执行的 turn。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn abort_current_turn(&mut self) -> bool {
+        if let Some(signal) = &self.current_abort_signal {
+            signal.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// TUI 中断支持：设置外部 abort signal。
+    /// TUI 层在启动 worker thread 前调用此方法，传入 abort signal 的 clone。
+    /// prepare_turn_runtime 会优先使用此 signal，让 TUI 主线程能通过保留的
+    /// clone 取消当前 turn。turn 结束后由 clear_external_abort_signal 清空。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn set_external_abort_signal(&mut self, signal: runtime::HookAbortSignal) {
+        self.external_abort_signal = Some(signal);
+    }
+
+    /// TUI 中断支持：清空外部 abort signal（turn 结束后调用）。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn clear_external_abort_signal(&mut self) {
+        self.external_abort_signal = None;
+    }
+
     /// Phase 2: Toggle TUI mode. When on, run_turn calls prepare_turn_runtime
     /// with emit_output=false so consume_stream's `out` goes to io::sink()
     /// instead of stdout — preventing duplicate output in alternate screen.
@@ -2487,6 +2553,22 @@ pub(crate) fn build_runtime_with_plugin_state(
     runtime = runtime
         .with_verifier_agent(runtime::VerifierAgent::new())
         .with_trace_analyzer(runtime::TraceAnalyzer::new());
+    // Epic 2:注入 MultiAgentCoordinator,启用 subagent-as-tool 路由。
+    // 注入后,主 agent 可通过 dispatch_subagent tool 派发子 agent,
+    // 通过 check_subagent tool 查询状态/结果。子 agent 走独立 LLM 请求 +
+    // 独立 prompt cache,不污染主 agent 缓存(§5.2)。
+    // 详见 plan.md §9.2 Epic 2。
+    //
+    // Epic 3:同时构造 TaskRegistry 并共享同一份 coordinator 引用,
+    // 使 task 级元数据(状态/heartbeat/output)与 subagent 生命周期打通,
+    // 为 LaneBoard 监控和后续 Epic 4 lane_events 提供数据源。
+    // 详见 plan.md §9.2 Epic 3。
+    let coordinator = runtime::MultiAgentCoordinator::new();
+    let task_registry = runtime::task_registry::TaskRegistry::new()
+        .with_multi_agent_coordinator(coordinator.clone());
+    runtime = runtime
+        .with_multi_agent_coordinator(coordinator)
+        .with_task_registry(task_registry);
     // 根据模型 context window 动态设置 compaction 阈值。
     // 1M 模型(DeepSeek V4/GPT-5.4)阈值 650K,200K 模型(Claude)阈值 130K,
     // 避免 100K 一刀切对长上下文模型过度激进压缩。

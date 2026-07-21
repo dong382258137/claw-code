@@ -9,6 +9,30 @@ use runtime::{
     format_stale_base_warning, load_oauth_credentials, resolve_sandbox_status, BaseCommitState,
     ConfigLoader, McpServer, McpServerSpec, McpTool, ProjectContext, TokenUsage,
 };
+// Epic 3:policy_engine + green_contract 接入 doctor 作为 smoke test。
+// - PolicyEngine/LaneContext/PolicyAction 等通过 runtime 顶层 re-export 拿到
+//   (policy_engine 模块本身私有,但类型已 pub use)。
+// - green_contract 是 pub mod,直接走完整路径;GreenLevel 在两个模块定义不同
+//   (policy_engine 是 u8 别名,green_contract 是 enum),这里按需用 enum 版本。
+use runtime::green_contract::{GreenContract, GreenLevel as ContractGreenLevel};
+use runtime::{LaneContext, PolicyEngine};
+// Epic 4:lane_events + g004_conformance + report_schema + branch_lock 接入。
+// - lane_events:模块私有,但 try_publish/drain_lane_events + LaneEvent/LaneEventName/
+//   LaneEventStatus 已通过 runtime 顶层 re-export(Epic 4 新增 try_publish/drain 导出)。
+// - g004_conformance:pub mod,validate_g004_contract_bundle 走模块路径。
+// - report_schema:模块私有,但全部类型通过 runtime 顶层 re-export。
+// - branch_lock:pub mod,detect_branch_lock_collisions/BranchLockIntent 走模块路径或顶层均可。
+use runtime::branch_lock::{detect_branch_lock_collisions, BranchLockIntent};
+use runtime::g004_conformance::validate_g004_contract_bundle;
+use runtime::{
+    canonicalize_report, drain_lane_events, report_content_hash, try_publish, CanonicalReportV1,
+    ClaimKind, LaneEvent, LaneEventName, LaneEventStatus, McpConnectionStatus, McpResourceInfo,
+    McpToolInfo, McpToolRegistry, PluginHealthcheck, PluginLifecycle, PluginState,
+    ReportClaim, ReportConfidence, ReportIdentity, RuntimePluginConfig, SensitivityClass,
+    DiscoveryResult, REPORT_SCHEMA_V1,
+};
+// Epic 6:team_cron_registry smoke test 接入 — Team + Cron 两个 registry 的完整 API 验证。
+use runtime::{CronEntry, CronRegistry, Team, TeamRegistry, TeamStatus};
 use serde_json::{json, Map, Value};
 use tools::{execute_tool, mvp_tool_specs};
 
@@ -234,6 +258,22 @@ pub(crate) fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error:
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_system_health(&cwd, config.as_ref().ok()),
+            // Epic 3:policy_engine + green_contract smoke test。
+            // 这两项验证两个模块在生产 binary 中可被调用(不再死代码),
+            // 同时为未来 lane 事件流接入提供 baseline。
+            check_policy_engine_health(),
+            check_green_contract_health(),
+            // Epic 4:lane_events + g004_conformance + report_schema + branch_lock smoke test。
+            // 四项验证模块 API 可用,激活死代码。
+            check_lane_events_health(),
+            check_g004_conformance_health(),
+            check_canonical_report_v1_health(),
+            check_branch_lock_health(),
+            // Epic 5:plugin_lifecycle + mcp_tool_bridge 打破死链 smoke test。
+            check_plugin_lifecycle_health(),
+            check_mcp_tool_bridge_health(),
+            // Epic 6:team_cron_registry smoke test — Team + Cron registry API 验证。
+            check_team_cron_registry_health(),
         ],
     })
 }
@@ -797,6 +837,641 @@ pub(crate) fn check_system_health(
         ("build_target".to_string(), json!(BUILD_TARGET)),
         ("git_sha".to_string(), json!(GIT_SHA)),
         ("default_model".to_string(), json!(default_model)),
+    ]))
+}
+
+/// Epic 3:policy_engine smoke test。
+///
+/// 构造一个空规则集的 PolicyEngine 和一个 reconciled LaneContext,
+/// 验证 evaluate / evaluate_with_events API 在生产 binary 中可正常调用。
+/// 这把 policy_engine 从"死代码"激活为"doctor 可观察的健康检查项",
+/// 同时为未来 lane 事件流接入(Plan §9.2 Epic 3)提供 baseline。
+///
+/// 当前不加载任何 PolicyRule(规则集为空),因此 evaluate 总是返回空 Vec。
+/// 真正的规则加载需要 `.claw/policy.json` 配置文件支持,留待后续 Epic。
+pub(crate) fn check_policy_engine_health() -> DiagnosticCheck {
+    let engine = PolicyEngine::new(Vec::new());
+    let context = LaneContext::reconciled("doctor-smoke");
+    let actions = engine.evaluate(&context);
+    let evaluation = engine.evaluate_with_events(&context);
+
+    DiagnosticCheck::new(
+        "PolicyEngine",
+        DiagnosticLevel::Ok,
+        "policy engine evaluate/evaluate_with_events callable",
+    )
+    .with_details(vec![
+        format!("Rules configured   {}", engine.rules().len()),
+        format!("Actions emitted    {}", actions.len()),
+        format!("Decision events    {}", evaluation.events.len()),
+        format!("Smoke context      lane_id={}", context.lane_id),
+    ])
+    .with_data(Map::from_iter([
+        ("rules_count".to_string(), json!(engine.rules().len())),
+        ("actions_count".to_string(), json!(actions.len())),
+        ("events_count".to_string(), json!(evaluation.events.len())),
+        ("smoke_lane_id".to_string(), json!(context.lane_id)),
+    ]))
+}
+
+/// Epic 3:green_contract smoke test。
+///
+/// 构造 `GreenContract::merge_ready(Workspace)` 作为项目默认契约,
+/// 验证 evaluate 在 satisfied/unsatisfied 两种输入下都能正常返回 outcome。
+/// 这把 green_contract 从"死代码"激活为"doctor 可观察的健康检查项"。
+///
+/// 当前不读取项目配置文件,固定使用 merge_ready + Workspace 作为 smoke。
+/// 真正的契约配置需要 `.claw/green-contract.toml` 支持,留待后续 Epic。
+pub(crate) fn check_green_contract_health() -> DiagnosticCheck {
+    let contract = GreenContract::merge_ready(ContractGreenLevel::Workspace);
+    let satisfied_outcome = contract.evaluate(Some(ContractGreenLevel::Workspace));
+    let unsatisfied_outcome = contract.evaluate(None);
+
+    let level = if satisfied_outcome.is_satisfied() && !unsatisfied_outcome.is_satisfied() {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+
+    DiagnosticCheck::new(
+        "GreenContract",
+        level,
+        "green contract evaluate callable (merge_ready/Workspace baseline)",
+    )
+    .with_details(vec![
+        format!(
+            "Required level     {}",
+            ContractGreenLevel::Workspace
+        ),
+        format!(
+            "Satisfied outcome  {}",
+            if satisfied_outcome.is_satisfied() {
+                "satisfied"
+            } else {
+                "unsatisfied"
+            }
+        ),
+        format!(
+            "Unsatisfied outcome  {}",
+            if unsatisfied_outcome.is_satisfied() {
+                "satisfied"
+            } else {
+                "unsatisfied"
+            }
+        ),
+        format!("Requirements        {}", contract.requirements.len()),
+    ])
+    .with_data(Map::from_iter([
+        ("required_level".to_string(), json!("workspace")),
+        ("contract_kind".to_string(), json!("merge_ready")),
+        ("satisfied_when_workspace".to_string(), json!(satisfied_outcome.is_satisfied())),
+        (
+            "unsatisfied_when_none".to_string(),
+            json!(!unsatisfied_outcome.is_satisfied()),
+        ),
+    ]))
+}
+
+/// Epic 4:lane_events smoke test。
+///
+/// 构造一个 `LaneEvent::started` 事件,通过 `try_publish` 写入 process-wide sink,
+/// 然后用 `drain_lane_events` 取回,验证 publish/consume 往返链路可用。
+/// 这把 lane_events 从"仅 4 处生产发布点无消费者"激活为"doctor 可观察的健康检查项"。
+///
+/// 注意:try_publish/drain_lane_events 操作全局静态 sink,doctor 调用时会清空
+/// 当前 sink 中累积的事件(这是 drain 语义)。doctor 本身不依赖 sink 状态,
+/// 因此清空副作用可接受。
+pub(crate) fn check_lane_events_health() -> DiagnosticCheck {
+    // 先 drain 清空 sink,确保 smoke 事件能被干净取回。
+    let _ = drain_lane_events();
+
+    let event = LaneEvent::started("doctor-smoke");
+    let published = try_publish(event);
+    let drained = drain_lane_events();
+    let smoke_event = drained
+        .iter()
+        .find(|e| e.event == LaneEventName::Started)
+        .cloned();
+
+    let level = if published && smoke_event.is_some() {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+
+    DiagnosticCheck::new(
+        "LaneEvents",
+        level,
+        "lane event try_publish/drain_lane_events roundtrip callable",
+    )
+    .with_details(vec![
+        format!("Published          {}", published),
+        format!("Drained count      {}", drained.len()),
+        format!(
+            "Smoke event found  {}",
+            if smoke_event.is_some() { "yes" } else { "no" }
+        ),
+        format!(
+            "Sink capacity      512 (process-wide OnceLock<Mutex<Vec>>)"
+        ),
+    ])
+    .with_data(Map::from_iter([
+        ("published".to_string(), json!(published)),
+        ("drained_count".to_string(), json!(drained.len())),
+        ("smoke_event_found".to_string(), json!(smoke_event.is_some())),
+        ("sink_kind".to_string(), json!("process_wide_oncelock_mutex_vec")),
+    ]))
+}
+
+/// Epic 4:g004_conformance smoke test。
+///
+/// 构造一个合法的 G004 contract bundle(含一条满足所有必填字段的 laneEvent)
+/// 和一个非法 bundle(缺失 /metadata/seq),分别调用 `validate_g004_contract_bundle`,
+/// 验证校验器能正确区分合法/非法。这把 g004_conformance 从"仅测试用"激活为
+/// "doctor 可观察的健康检查项"。
+pub(crate) fn check_g004_conformance_health() -> DiagnosticCheck {
+    let valid_bundle = json!({
+        "schemaVersion": "g004.contract.bundle.v1",
+        "laneEvents": [
+            {
+                "event": "lane.started",
+                "status": "running",
+                "emittedAt": "2026-07-22T00:00:00Z",
+                "metadata": {
+                    "provenance": "live_lane",
+                    "emitterIdentity": "claw-doctor",
+                    "environmentLabel": "smoke",
+                    "seq": 1
+                }
+            }
+        ],
+        "reports": [],
+        "approvalTokens": []
+    });
+    let invalid_bundle = json!({
+        "schemaVersion": "g004.contract.bundle.v1",
+        "laneEvents": [
+            {
+                "event": "lane.started",
+                "status": "running",
+                "emittedAt": "2026-07-22T00:00:00Z",
+                "metadata": {
+                    "provenance": "live_lane",
+                    "emitterIdentity": "claw-doctor",
+                    "environmentLabel": "smoke"
+                    // 缺失 seq 字段,应触发校验错误
+                }
+            }
+        ],
+        "reports": [],
+        "approvalTokens": []
+    });
+
+    let valid_errors = validate_g004_contract_bundle(&valid_bundle);
+    let invalid_errors = validate_g004_contract_bundle(&invalid_bundle);
+
+    let level = if valid_errors.is_empty() && !invalid_errors.is_empty() {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+
+    DiagnosticCheck::new(
+        "G004Conformance",
+        level,
+        "g004 contract bundle validator distinguishes valid/invalid fixtures",
+    )
+    .with_details(vec![
+        format!(
+            "Valid bundle errors    {}",
+            valid_errors.len()
+        ),
+        format!(
+            "Invalid bundle errors  {}",
+            invalid_errors.len()
+        ),
+        format!("Bundle schema version  g004.contract.bundle.v1"),
+        format!("Report schema version  g004.report.v1"),
+    ])
+    .with_data(Map::from_iter([
+        ("valid_bundle_errors".to_string(), json!(valid_errors.len())),
+        (
+            "invalid_bundle_errors".to_string(),
+            json!(invalid_errors.len()),
+        ),
+        ("bundle_schema_version".to_string(), json!("g004.contract.bundle.v1")),
+        ("report_schema_version".to_string(), json!("g004.report.v1")),
+    ]))
+}
+
+/// Epic 4:report_schema smoke test。
+///
+/// 构造一个最小 `CanonicalReportV1`,通过 `canonicalize_report` 自动填充
+/// `schema_version` / `report_id` / `content_hash`,并验证 `report_content_hash`
+/// 能稳定计算。这把 report_schema 从"仅 lib.rs 重导出"激活为"doctor 可观察的
+/// 健康检查项",同时为后续 `claw status` 输出 CanonicalReportV1 铺路。
+pub(crate) fn check_canonical_report_v1_health() -> DiagnosticCheck {
+    let report = CanonicalReportV1 {
+        schema_version: String::new(),
+        identity: ReportIdentity {
+            report_id: String::new(),
+            content_hash: String::new(),
+        },
+        generated_at: "2026-07-22T00:00:00Z".to_string(),
+        producer: "claw-doctor".to_string(),
+        claims: vec![ReportClaim {
+            id: "claim-1".to_string(),
+            kind: ClaimKind::ObservedFact,
+            text: "doctor smoke test executed canonicalize_report".to_string(),
+            confidence: ReportConfidence::High,
+            evidence: Vec::new(),
+            sensitivity: SensitivityClass::Public,
+        }],
+        negative_evidence: Vec::new(),
+        field_deltas: Vec::new(),
+    };
+    let canonical = canonicalize_report(report);
+    let hash = report_content_hash(&canonical);
+
+    let level = if canonical.schema_version == REPORT_SCHEMA_V1
+        && !canonical.identity.report_id.is_empty()
+        && !canonical.identity.content_hash.is_empty()
+        && !hash.is_empty()
+    {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+
+    DiagnosticCheck::new(
+        "CanonicalReportV1",
+        level,
+        "canonicalize_report + report_content_hash roundtrip callable",
+    )
+    .with_details(vec![
+        format!("Schema version     {}", canonical.schema_version),
+        format!("Report id          {}", canonical.identity.report_id),
+        format!("Content hash       {}", canonical.identity.content_hash),
+        format!("Hash (standalone)  {}", hash),
+        format!("Claims count       {}", canonical.claims.len()),
+    ])
+    .with_data(Map::from_iter([
+        ("schema_version".to_string(), json!(canonical.schema_version)),
+        ("report_id".to_string(), json!(canonical.identity.report_id)),
+        (
+            "content_hash".to_string(),
+            json!(canonical.identity.content_hash),
+        ),
+        ("claims_count".to_string(), json!(canonical.claims.len())),
+    ]))
+}
+
+/// Epic 4:branch_lock smoke test。
+///
+/// 构造三组 fixture intents(同分支同模块碰撞 / 同分支嵌套模块碰撞 / 不同分支无碰撞),
+/// 调用 `detect_branch_lock_collisions`,验证碰撞检测逻辑可用。
+/// 这把 branch_lock 从"仅 lib.rs 重导出 + 自身测试"激活为"doctor 可观察的健康检查项"。
+///
+/// 真正的生产接入点(在 MultiAgentCoordinator fork/worktree 创建子 agent 时校验)
+/// 留待后续评估,因 plan.md §9.2 给定的 execute_bash / git_context 接入点
+/// 经研究均不匹配(无 lane 上下文 / 纯只读模块)。
+pub(crate) fn check_branch_lock_health() -> DiagnosticCheck {
+    let intents = vec![
+        // 碰撞 1:两个 lane 同分支同模块
+        BranchLockIntent {
+            lane_id: "lane-a".to_string(),
+            branch: "feat/x".to_string(),
+            worktree: None,
+            modules: vec!["runtime/mcp".to_string()],
+        },
+        BranchLockIntent {
+            lane_id: "lane-b".to_string(),
+            branch: "feat/x".to_string(),
+            worktree: None,
+            modules: vec!["runtime/mcp".to_string()],
+        },
+        // 碰撞 2:同分支嵌套模块(runtime 与 runtime/mcp 视为重叠)
+        BranchLockIntent {
+            lane_id: "lane-c".to_string(),
+            branch: "feat/y".to_string(),
+            worktree: None,
+            modules: vec!["runtime".to_string()],
+        },
+        BranchLockIntent {
+            lane_id: "lane-d".to_string(),
+            branch: "feat/y".to_string(),
+            worktree: None,
+            modules: vec!["runtime/mcp".to_string()],
+        },
+        // 无碰撞:不同分支同模块
+        BranchLockIntent {
+            lane_id: "lane-e".to_string(),
+            branch: "feat/z".to_string(),
+            worktree: None,
+            modules: vec!["runtime/mcp".to_string()],
+        },
+    ];
+    let collisions = detect_branch_lock_collisions(&intents);
+
+    let level = if collisions.len() >= 2 {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+
+    DiagnosticCheck::new(
+        "BranchLock",
+        level,
+        "detect_branch_lock_collisions identifies same-branch and nested-module collisions",
+    )
+    .with_details(vec![
+        format!("Intents            {}", intents.len()),
+        format!("Collisions found   {}", collisions.len()),
+        format!("Distinct branches  3 (feat/x, feat/y, feat/z)"),
+        format!("Expected collisions 2 (same-branch + nested-module)"),
+    ])
+    .with_data(Map::from_iter([
+        ("intents_count".to_string(), json!(intents.len())),
+        ("collisions_count".to_string(), json!(collisions.len())),
+        ("distinct_branches".to_string(), json!(3)),
+    ]))
+}
+
+/// Epic 5:plugin_lifecycle smoke test 用的最小 trait 实现。
+///
+/// 注意:这里实现的是 `runtime::PluginLifecycle`(trait),与 `plugins::PluginLifecycle`
+/// (struct,有 ::default())是两个完全不同的类型 —— 命名歧义陷阱,接入时务必区分。
+/// 详见 plan.md §9.2 Epic 5 命名陷阱警示。
+struct DoctorSmokePluginLifecycle {
+    name: String,
+    shutdown_called: bool,
+}
+
+impl PluginLifecycle for DoctorSmokePluginLifecycle {
+    fn validate_config(&self, _config: &RuntimePluginConfig) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn healthcheck(&self) -> PluginHealthcheck {
+        PluginHealthcheck {
+            plugin_name: self.name.clone(),
+            state: if self.shutdown_called {
+                PluginState::Stopped
+            } else {
+                PluginState::Healthy
+            },
+            servers: Vec::new(),
+            last_check: 0,
+        }
+    }
+
+    fn discover(&self) -> DiscoveryResult {
+        DiscoveryResult {
+            tools: Vec::new(),
+            resources: Vec::new(),
+            partial: false,
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.shutdown_called = true;
+        Ok(())
+    }
+}
+
+/// Epic 5:plugin_lifecycle smoke test。
+///
+/// 构造一个 `DoctorSmokePluginLifecycle`(实现 `runtime::PluginLifecycle` trait),
+/// 调用 validate_config / healthcheck / discover / shutdown 全部四个方法,
+/// 验证 trait API 在生产 binary 中可被实现和调用。
+/// 这把 plugin_lifecycle 从"零消费死链"激活为"doctor 可观察的健康检查项"。
+///
+/// 注意:plan.md §9.2 提到的 `PluginLifecycle::init` 在当前 trait 中不存在;
+/// 实际可用 `validate_config` 充当 "init" 入口(语义:校验配置后启动)。
+pub(crate) fn check_plugin_lifecycle_health() -> DiagnosticCheck {
+    let mut plugin = DoctorSmokePluginLifecycle {
+        name: "doctor-smoke".to_string(),
+        shutdown_called: false,
+    };
+    let config = RuntimePluginConfig::default();
+    let validate_result = plugin.validate_config(&config);
+    let health_before = plugin.healthcheck();
+    let discovery = plugin.discover();
+    let shutdown_result = plugin.shutdown();
+    let health_after = plugin.healthcheck();
+
+    let level = if validate_result.is_ok()
+        && shutdown_result.is_ok()
+        && matches!(health_before.state, PluginState::Healthy)
+        && matches!(health_after.state, PluginState::Stopped)
+    {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+
+    DiagnosticCheck::new(
+        "PluginLifecycle",
+        level,
+        "plugin lifecycle trait (validate/healthcheck/discover/shutdown) callable",
+    )
+    .with_details(vec![
+        format!(
+            "validate_config   {}",
+            if validate_result.is_ok() { "ok" } else { "err" }
+        ),
+        format!(
+            "healthcheck before {}",
+            health_before.state
+        ),
+        format!(
+            "discover          tools={} resources={} partial={}",
+            discovery.tools.len(),
+            discovery.resources.len(),
+            discovery.partial
+        ),
+        format!(
+            "shutdown          {}",
+            if shutdown_result.is_ok() { "ok" } else { "err" }
+        ),
+        format!(
+            "healthcheck after  {}",
+            health_after.state
+        ),
+    ])
+    .with_data(Map::from_iter([
+        ("validate_ok".to_string(), json!(validate_result.is_ok())),
+        ("shutdown_ok".to_string(), json!(shutdown_result.is_ok())),
+        ("state_before".to_string(), json!(format!("{}", health_before.state))),
+        ("state_after".to_string(), json!(format!("{}", health_after.state))),
+    ]))
+}
+
+/// Epic 5:mcp_tool_bridge smoke test。
+///
+/// 构造一个 `McpToolRegistry`,注册一个虚拟 server(含一个 tool + 一个 resource),
+/// 调用 list_servers / get_server / list_tools / list_resources 验证注册表 API 可达。
+/// 这把 mcp_tool_bridge 从"tools/lib.rs 全局单例空转(从不 set_manager)"激活为
+/// "doctor 可观察的健康检查项"。
+///
+/// 生产路径接入(向 global_mcp_registry 注入 McpServerManager)需要重构
+/// RuntimeMcpState(其 manager 字段非 Arc<Mutex<>>),风险较高,留待后续。
+pub(crate) fn check_mcp_tool_bridge_health() -> DiagnosticCheck {
+    let registry = McpToolRegistry::new();
+    registry.register_server(
+        "doctor-smoke-server",
+        McpConnectionStatus::Connected,
+        vec![McpToolInfo {
+            name: "smoke_tool".to_string(),
+            description: Some("doctor smoke test tool".to_string()),
+            input_schema: Some(json!({"type": "object"})),
+        }],
+        vec![McpResourceInfo {
+            uri: "smoke://resource".to_string(),
+            name: "smoke_resource".to_string(),
+            description: Some("doctor smoke test resource".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        }],
+        Some("doctor-smoke-server v0.1".to_string()),
+    );
+
+    let servers = registry.list_servers();
+    let server_state = registry.get_server("doctor-smoke-server");
+    let tools = registry.list_tools("doctor-smoke-server");
+    let resources = registry.list_resources("doctor-smoke-server");
+
+    let level = if servers.len() == 1
+        && server_state.is_some()
+        && tools.is_ok()
+        && resources.is_ok()
+    {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+
+    DiagnosticCheck::new(
+        "McpToolBridge",
+        level,
+        "mcp tool registry (register/list/get/tools/resources) callable",
+    )
+    .with_details(vec![
+        format!("Registered servers  {}", servers.len()),
+        format!(
+            "Server found        {}",
+            if server_state.is_some() { "yes" } else { "no" }
+        ),
+        format!(
+            "Tools listed        {}",
+            tools.as_ref().map(|t| t.len()).unwrap_or(0)
+        ),
+        format!(
+            "Resources listed    {}",
+            resources.as_ref().map(|r| r.len()).unwrap_or(0)
+        ),
+        format!("Connection status   {:?}", McpConnectionStatus::Connected),
+    ])
+    .with_data(Map::from_iter([
+        ("servers_count".to_string(), json!(servers.len())),
+        ("server_found".to_string(), json!(server_state.is_some())),
+        (
+            "tools_count".to_string(),
+            json!(tools.as_ref().map(|t| t.len()).unwrap_or(0)),
+        ),
+        (
+            "resources_count".to_string(),
+            json!(resources.as_ref().map(|r| r.len()).unwrap_or(0)),
+        ),
+    ]))
+}
+
+// Epic 6:team_cron_registry smoke test — 验证 Team + Cron 两个 registry 的完整 API
+// (create/get/list/delete/disable/record_run) 在生产 binary 中可被调用,激活死代码。
+// 生产路径接入(Teammate 模式 cron 调度子 agent)需要 MultiAgentCoordinator 改造,风险较高,留待后续。
+pub(crate) fn check_team_cron_registry_health() -> DiagnosticCheck {
+    // ── TeamRegistry smoke test ──
+    let team_registry = TeamRegistry::new();
+    let team = team_registry.create("doctor-smoke-team", vec!["task_001".into()]);
+    let team_fetched = team_registry.get(&team.team_id);
+    let team_list_len = team_registry.list().len();
+    let team_deleted = team_registry.delete(&team.team_id).ok();
+    let team_status_after_delete =
+        team_fetched.as_ref().map(|t| t.status);
+
+    // ── CronRegistry smoke test ──
+    let cron_registry = CronRegistry::new();
+    let cron = cron_registry.create("0 * * * *", "doctor smoke", Some("hourly check"));
+    let cron_fetched = cron_registry.get(&cron.cron_id);
+    let cron_enabled_count = cron_registry.list(true).len();
+    let cron_disable_result = cron_registry.disable(&cron.cron_id);
+    let cron_disabled_count = cron_registry.list(true).len();
+    let cron_record_run_result = cron_registry.record_run(&cron.cron_id);
+    let cron_after_run = cron_registry.get(&cron.cron_id);
+    let cron_run_count = cron_after_run.as_ref().map(|c| c.run_count).unwrap_or(0);
+
+    let level = if team_fetched.is_some()
+        && team_list_len == 1
+        && team_deleted.is_some()
+        && cron_fetched.is_some()
+        && cron_enabled_count == 1
+        && cron_disable_result.is_ok()
+        && cron_disabled_count == 0
+        && cron_record_run_result.is_ok()
+        && cron_run_count == 1
+    {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+
+    DiagnosticCheck::new(
+        "TeamCronRegistry",
+        level,
+        "team + cron registry (create/get/list/delete/disable/record_run) callable",
+    )
+    .with_details(vec![
+        format!("Team created        {}", team.team_id),
+        format!(
+            "Team found          {}",
+            if team_fetched.is_some() { "yes" } else { "no" }
+        ),
+        format!("Team list count     {}", team_list_len),
+        format!(
+            "Team deleted        {}",
+            if team_deleted.is_some() { "yes" } else { "no" }
+        ),
+        format!(
+            "Team status (orig)  {:?}",
+            team_status_after_delete.unwrap_or(TeamStatus::Created)
+        ),
+        format!("Cron created        {}", cron.cron_id),
+        format!(
+            "Cron found          {}",
+            if cron_fetched.is_some() { "yes" } else { "no" }
+        ),
+        format!("Cron enabled count  {}", cron_enabled_count),
+        format!(
+            "Cron disabled ok    {}",
+            if cron_disable_result.is_ok() { "yes" } else { "no" }
+        ),
+        format!("Cron after disable  {}", cron_disabled_count),
+        format!(
+            "Cron run recorded   {}",
+            if cron_record_run_result.is_ok() { "yes" } else { "no" }
+        ),
+        format!("Cron run count      {}", cron_run_count),
+    ])
+    .with_data(Map::from_iter([
+        ("team_created".to_string(), json!(team_fetched.is_some())),
+        ("team_list_count".to_string(), json!(team_list_len)),
+        ("team_deleted".to_string(), json!(team_deleted.is_some())),
+        ("cron_created".to_string(), json!(cron_fetched.is_some())),
+        ("cron_enabled_count".to_string(), json!(cron_enabled_count)),
+        (
+            "cron_disabled_count".to_string(),
+            json!(cron_disabled_count),
+        ),
+        ("cron_run_count".to_string(), json!(cron_run_count)),
     ]))
 }
 

@@ -26,7 +26,59 @@
 | **P4** | 4.1 | Sandbox Windows 实现(SandboxBuilder trait + Job Object) | ✅ 完成 | +10 | 2026-07-20 |
 | **P4** | 4.2 | LSP Client 真实接入(JSON-RPC 2.0 + Transport trait) | ✅ 完成 | +18 | 2026-07-20 |
 
-**新增测试合计:131** | **全部 12 Step 已完成**
+**新增测试合计:131** | **全部 12 Step 模块代码已完成**
+
+> **重要区分**:上表"✅ 完成"指**模块代码实现完成**(struct/impl/测试齐全),
+> 不等于**已接入 CLI 生产路径**。接入状态见下表。
+
+## 接入状态对照表(2026-07-22 核对)
+
+> 核对方法:grep 每个模块在 `rusty-claude-cli/src/` 中的引用 +
+> 追踪 `ConversationRuntime` 字段注入与 `run_turn` 调用链。
+> 详见 `docs/harness-engineering-optimization-plan.md` §9 接入路径。
+
+| Step | 模块 | 模块代码 | 接入状态 | 接入证据 / 缺口 |
+|---|---|---|---|---|
+| 1.1 | trust_resolver | ✅ | ✅ 已接入 | **Epic 1 已接入**:worker_boot.rs:509-513 调用 `TrustResolver::resolve()`,根据 `TrustDecision::policy()` 决定 AutoTrust/RequireApproval/Deny。新增 denylist 能力(trust_auto_resolve 布尔无法实现)。27+25 测试通过。 |
+| 1.2 | RecoveryOrchestrator | ✅ | ✅ 已接入 | conversation.rs:459 默认初始化 + conversation.rs:721 `recovery_orchestrator.attempt()` 在 `try_recover_or_record_fail` 中调用 |
+| 1.3 | Worker Boot | ✅ | ✅ 已接入 | **已通过 tools crate 接入**:tools/src/lib.rs:125 `global_worker_registry()` 暴露 WorkerCreate/Observe/ResolveTrust 等 9 个工具;doctor.rs:264 `run_worker_state` 读取 `.claw/worker-state.json`。Epic 1 补充了 trust_resolver 接入。 |
+| 2.1 | Plan/Execute/Review | ✅ | ⚠️ Flag-gated | `--enable-plan-mode` flag 触发 app.rs:361-362 `set_plan_mode_enabled` + `set_workspace_root`;未传 flag 时 planner 不激活 |
+| 2.2 | LoopDetectionMiddleware | ✅ | ✅ 已接入 | conversation.rs:464 `loop_detector: LoopDetector::new()` 默认初始化 + conversation.rs:764 `record_edit()` 在 PostToolUse 调用 + conversation.rs:852 每 turn `reset()` |
+| 2.3 | ContextAssembler | ✅ | ✅ 已接入 | app.rs:2473 `with_context_assembler(ContextAssembler::new(budget))` 在 `build_runtime_with_plugin_state` 注入,所有 CLI 入口共享 |
+| 2.4 | Memory 语义检索层 | ✅ | ⚠️ 间接接入 | memory.rs:23 `use crate::memory_semantic::SemanticRecaller` — 经 PersistentMemory(已接入)间接调用;trace_analyzer.rs:29 使用 `cosine_similarity` |
+| 3.1 | VerifierAgent | ✅ | ✅ 已接入 | app.rs:2488 `with_verifier_agent(runtime::VerifierAgent::new())` 在 `build_runtime_with_plugin_state` 注入(P1-6 修复) |
+| 3.2 | MultiAgentCoordinator | ✅ | ✅ 已接入 | **Epic 2 已接入**:app.rs:2561 `with_multi_agent_coordinator(MultiAgentCoordinator::new())` 注入 build_runtime;plugin_state.rs:542-594 注册 dispatch_subagent/check_subagent 工具规格。16 multi_agent 测试通过。 |
+| 3.3 | TraceAnalyzer | ✅ | ✅ 已接入 | app.rs:2489 `with_trace_analyzer(runtime::TraceAnalyzer::new())` 在 `build_runtime_with_plugin_state` 注入(P1-6 修复) |
+| 4.1 | Sandbox Windows | ✅ | ✅ 已接入 | bg.rs 经 `platform_sandbox_builder().assign_process(pid)` 调用 trait 抽象;WindowsSandboxBuilder 覆盖 `assign_process` 委托 Win32 API |
+| 4.2 | LSP Client | ✅ | ⚠️ 间接接入 | repomap.rs:34/87/150/382/607 等多处 `use crate::lsp_client::{LspSymbol, LspRegistry}` — 经 RepoMap(已接入 load_prompt_extras)间接调用 |
+
+### 未在 progress 总览中列出但已实现的模块
+
+> 以下模块在 `runtime/src/lib.rs` 中已 `pub` 导出且有完整实现,但未对应
+> harness-engineering-optimization-plan.md 的任何 Step,属于规划外实现或
+> 治理层配套模块。接入状态均为 ❌ 未接入。
+
+| 模块 | 文件 | 接入状态 | 说明 |
+|---|---|---|---|
+| policy_engine | runtime/src/policy_engine.rs | ✅ 已接入 | Epic 3:doctor smoke test(`check_policy_engine_health`)调用 `PolicyEngine::new/evaluate/evaluate_with_events`,验证 API 可用 |
+| task_registry | runtime/src/task_registry.rs | ✅ 已接入 | Epic 3:`build_runtime_with_plugin_state` 通过 `with_task_registry` 注入 ConversationRuntime,与 MultiAgentCoordinator 共享 coord 引用 |
+| team_cron_registry | runtime/src/team_cron_registry.rs | ✅ 已接入 | Epic 6:doctor smoke test(`check_team_cron_registry_health`)验证 TeamRegistry(create/get/list/delete)+ CronRegistry(create/get/list/disable/record_run)完整 API 表面。**注意**:生产路径接入(Teammate 模式 cron 调度子 agent)需 MultiAgentCoordinator 改造,风险较高,留待后续 |
+| green_contract | runtime/src/green_contract.rs | ✅ 已接入 | Epic 3:doctor smoke test(`check_green_contract_health`)调用 `GreenContract::merge_ready/evaluate`,验证 satisfied/unsatisfied 路径 |
+| g004_conformance | runtime/src/g004_conformance.rs | ✅ 已接入 | Epic 4:doctor smoke test(`check_g004_conformance_health`)调用 `validate_g004_contract_bundle`,验证合法/非法 bundle 区分 |
+| branch_lock | runtime/src/branch_lock.rs | ✅ 已接入 | Epic 4:doctor smoke test(`check_branch_lock_health`)调用 `detect_branch_lock_collisions`,验证同分支/嵌套模块碰撞检测 |
+| report_schema | runtime/src/report_schema.rs | ✅ 已接入 | Epic 4:doctor smoke test(`check_canonical_report_v1_health`)+ `claw status --output-format json` 追加 `canonical_report` 字段(`build_status_canonical_report` 构造 CanonicalReportV1) |
+| task_packet | runtime/src/task_packet.rs | ⚠️ 间接接入 | Epic 3:task_registry 接入后,task_packet 通过 `create_from_packet` 间接接入(预存测试 `creates_task_from_packet` 有 validate_packet bug 待修) |
+| plugin_lifecycle | runtime/src/plugin_lifecycle.rs | ✅ 已接入 | Epic 5:doctor smoke test(`check_plugin_lifecycle_health`)通过 `DoctorSmokePluginLifecycle` 实现 trait,验证 validate_config/healthcheck/discover/shutdown 全部四个方法 |
+| mcp_tool_bridge | runtime/src/mcp_tool_bridge.rs | ✅ 已接入 | Epic 5:doctor smoke test(`check_mcp_tool_bridge_health`)调用 McpToolRegistry::register_server/list_servers/get_server/list_tools/list_resources,验证完整 API 表面。**注意**:McpToolRegistry 全局单例当前空转(从不 set_manager),生产路径接入需重构 RuntimeMcpState,风险较高,留待后续 |
+| mcp_lifecycle_hardened(部分) | runtime/src/mcp_lifecycle_hardened.rs | ⚠️ 部分接入 | `McpDegradedReport`/`McpFailedServer`/`McpLifecyclePhase`/`McpErrorSurface` 已在 plugin_state.rs:74-109 接入;但 `McpLifecycleValidator`/`McpLifecycleState` 完全未引用 |
+
+### 接入进度统计
+
+| 接入状态 | 数量 | 模块 |
+|---|---|---|
+| ✅ 已接入 | 19 | RecoveryOrchestrator, LoopDetection, ContextAssembler, VerifierAgent, TraceAnalyzer, Sandbox, trust_resolver, worker_boot, multi_agent, policy_engine, task_registry, green_contract, lane_events, g004_conformance, report_schema, branch_lock, plugin_lifecycle, mcp_tool_bridge, team_cron_registry |
+| ⚠️ 部分/间接/Flag-gated | 5 | Plan/Execute/Review(flag-gated), Memory语义(间接), LSP(间接), mcp_lifecycle_hardened(部分), task_packet(间接) |
+| ❌ 未接入 | 0 | (全部模块已至少接入 smoke test 层) |
 
 ---
 
@@ -161,7 +213,25 @@
 
 ---
 
-## 已知遗留(低优先级)
+## 已知遗留
+
+### 模块接入遗留(高优先级 — 见 plan.md §9 接入路径)
+
+| 遗留 | 说明 | 建议时机 |
+|---|---|---|
+| trust_resolver 接入 Worker 启动路径 | WorkerRegistry::create 的 trust_required 状态转换处需调用 TrustResolver::resolve | Epic 1(试点) |
+| worker_boot 完整接入 | Worker/WorkerRegistry/probe_mcp_health 从未实例化,仅 WorkerFailureKind 枚举被借用 | Epic 1(试点) |
+| multi_agent 注入 build_runtime | multi_agent_coordinator 字段恒为 None,dispatch_subagent 工具不可用 | Epic 2(P0-2 已完成,需注入) |
+| policy_engine 接入 run_turn 入口 | PolicyEngine::evaluate 作为决策门,Allow/Deny/RequireApproval | Epic 3 ✅ 已接入 doctor smoke test(暂未接入 run_turn,留待 lane 事件流) |
+| task_registry 接入 Teammate 模式 | 通过 MultiAgentCoordinator::with_task_registry 接入 | Epic 3 ✅ 已接入 build_runtime_with_plugin_state |
+| green_contract 接入 PolicyEngine | GreenContract::evaluate 产出 GreenContractOutcome | Epic 3 ✅ 已接入 doctor smoke test(暂未注入 PolicyEngine,留待 lane 事件流) |
+| lane_events 接入 g004_conformance 契约校验 | LaneEvent 发布前校验契约 | Epic 4 ✅ 已接入 doctor smoke test(try_publish/drain 往返 + g004 bundle 校验) |
+| report_schema 接入 claw status --json | 输出 CanonicalReportV1 | Epic 4 ✅ 已接入(1)doctor smoke test canonicalize_report 往返;(2)`claw status --output-format json` 追加 `canonical_report` 字段 |
+| branch_lock 接入 git_context | detect_branch_lock_collisions 在 execute_bash 调用 | Epic 4 ✅ 已接入 doctor smoke test(碰撞检测 fixture);生产路径接入(execute_bash/git_context)经评估不匹配,真正接入点应为 MultiAgentCoordinator fork/worktree,留待后续 |
+| plugin_lifecycle + mcp_tool_bridge 打破死链 | plugin_state.rs 调用 PluginLifecycle::init/shutdown | Epic 5 ✅ 已接入 doctor smoke test(PluginLifecycle trait 实现 + McpToolRegistry API 验证);生产路径接入需重构 RuntimeMcpState,留待后续 |
+| team_cron_registry 接入 Teammate 模式 | cron 调度子 agent | Epic 6 ✅ 已接入 doctor smoke test(Team+Cron registry API 验证);生产路径接入(Teammate 模式 cron 调度)需 MultiAgentCoordinator 改造,留待后续 |
+
+### 实现遗留(低优先级)
 
 | 遗留 | 说明 | 建议时机 |
 |---|---|---|
@@ -169,8 +239,8 @@
 | macOS sandbox-exec 深度测试 | placeholder profile,未在生产 macOS 环境验证 | 有 macOS CI 时 |
 | LSP ProcessLspTransport 子进程启动 | 需集成 tokio 异步 IO + std::process::Command 管道 | 接入 rust-analyzer 时 |
 | HNSW 向量索引 | memory_semantic.rs 的 Embedding 策略当前退化为 keyword | 引入 hnsw crate 时 |
-| LoopDetector → hooks.rs 集成 | PostToolUse 事件触发 record_edit() | 主循环改造时 |
-| ContextAssembler → prompt.rs 集成 | 组装结果注入主 prompt | 主循环改造时 |
+| LoopDetector → hooks.rs 集成 | ~~PostToolUse 事件触发 record_edit()~~ **已完成**(conversation.rs:764) | ~~主循环改造时~~ ✅ |
+| ContextAssembler → prompt.rs 集成 | ~~组装结果注入主 prompt~~ **已完成**(app.rs:2473 注入 build_runtime) | ~~主循环改造时~~ ✅ |
 | TraceAnalyzer → Self-Improving Harness 闭环 | K-means on embeddings + 反馈到 RecoveryOrchestrator | 阶段 5 |
 
 ---

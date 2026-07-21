@@ -149,10 +149,10 @@ pub use hooks::{
 };
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
-    is_terminal_event, BlockedSubphase, EventProvenance, LaneCommitProvenance, LaneEvent,
-    LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus,
-    LaneFailureClass, LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance,
-    WatcherAction,
+    drain_lane_events, is_terminal_event, try_publish, BlockedSubphase, EventProvenance,
+    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventBuilder, LaneEventMetadata,
+    LaneEventName, LaneEventStatus, LaneFailureClass, LaneOwnership, SessionIdentity,
+    ShipMergeMethod, ShipProvenance, WatcherAction,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
@@ -205,6 +205,10 @@ pub use permissions::{
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,
     PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
+};
+// Epic 5:mcp_tool_bridge 类型顶层 re-export(模块私有,但类型需被 doctor smoke test 消费)。
+pub use mcp_tool_bridge::{
+    McpConnectionStatus, McpResourceInfo, McpServerState, McpToolInfo, McpToolRegistry,
 };
 pub use policy_engine::{
     evaluate, evaluate_with_events, ApprovalToken, DiffScope, GreenLevel, LaneBlocker, LaneContext,
@@ -275,7 +279,11 @@ pub use stale_branch::{
 pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskResource, ValidatedPacket,
 };
-pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat};
+pub use task_registry::{
+    LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat, Task, TaskRegistry, TaskStatus,
+};
+// Epic 6:team_cron_registry 类型顶层 re-export(pub mod,但类型需被 doctor smoke test 消费)。
+pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry, TeamStatus};
 pub use tool_result_archive::{
     archive_path, archive_tool_result, list_archived_summary, prune_archive, recall_by_tool_name,
     recall_tool_result, record_count, ArchiveError, ArchivedToolResult, ARCHIVE_FILENAME,

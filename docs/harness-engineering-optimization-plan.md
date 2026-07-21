@@ -969,7 +969,132 @@ cd rust && cargo build && cp target/debug/claw.exe debug/claw.exe
 
 ---
 
-## 九、变更记录
+## 九、接入路径(2026-07-22 新增)
+
+> **背景**:2026-07-22 核对发现 13 个模块代码实现完整但未接入 CLI 生产路径。
+> 本章节逐一说明每个模块该走哪个注入点,作为 Epic 1-6 接入工作的设计依据。
+> 接入状态对照表见 `harness-engineering-optimization-progress.md`。
+
+### 9.1 接入点架构总览
+
+CLI 生产路径的核心入口是 `build_runtime_with_plugin_state()`(app.rs:2405),
+它在所有 CLI 路径(Repl / Prompt / Tui / Doctor / AcpServe)中被 `build_runtime()` 调用。
+该函数构造 `ConversationRuntime`,通过 `with_*` builder 方法注入各层组件。
+
+```
+CLI 入口(run())
+  └─ build_runtime()  [app.rs:634/807/1475/1521/1551/1592/1947/1991]
+       └─ build_runtime_with_plugin_state()  [app.rs:2405]
+            └─ ConversationRuntime::new()
+                 ├─ with_context_assembler()     ✅ 已接入 (app.rs:2473)
+                 ├─ with_verifier_agent()         ✅ 已接入 (app.rs:2488)
+                 ├─ with_trace_analyzer()         ✅ 已接入 (app.rs:2489)
+                 ├─ with_persistent_memory()      ✅ 已接入 (app.rs:2505)
+                 ├─ with_multi_agent_coordinator() ❌ 待接入 (Epic 2)
+                 ├─ with_recovery_orchestrator()   ✅ 已接入 (默认初始化)
+                 └─ loop_detector                  ✅ 已接入 (默认初始化)
+```
+
+### 9.2 各模块接入路径
+
+#### Epic 1 — trust_resolver + worker_boot(试点)
+
+| 模块 | 接入点 | 接入方式 |
+|---|---|---|
+| trust_resolver | `worker_boot.rs::WorkerRegistry::create` | 在 `spawning → trust_required` 状态转换处调用 `TrustResolver::resolve(path)`,根据 `TrustDecision` 决定是否继续 |
+| worker_boot | `doctor.rs::run_doctor` + 未来子进程启动路径 | doctor 命令调用 `probe_mcp_health` 展示 worker 健康状态;`WorkerRegistry::create` 实例化替代当前空引用 |
+
+**关键约束**:
+- TrustResolver 的 `path_matches_trusted_root` 需注意前缀匹配 hazard(g003 文档已标注)
+- Worker 启动路径需与 `ConfigLoader::trusted_roots()` 合并(g003 文档已设计)
+
+#### Epic 2 — multi_agent(核心)
+
+| 模块 | 接入点 | 接入方式 |
+|---|---|---|
+| multi_agent | `app.rs::build_runtime_with_plugin_state` | 增加 `.with_multi_agent_coordinator(MultiAgentCoordinator::new())`,默认启用 |
+
+**前置条件**:P0-2(commit c2e8f48)已修复 `MultiAgentCoordinator::start()` 空壳问题,
+`execute_dispatch_subagent` 已实现同步阻塞 + 上下文隔离 + 文件持久化。接入工作只需
+在 `build_runtime_with_plugin_state` 中注入 coordinator。
+
+**P0-2 论文调研结论(2026-07-22)**:P0-2 的"同步阻塞 + 上下文隔离 + 文件持久化"设计
+与 Anthropic《Multi-Agent Research System》(2025-06)及 Claude Code 2026 实践高度一致,
+**无需推翻重做**。需在 v2 阶段补齐的 5 项能力(见调研报告):
+1. system_prompt 中 `{name}`/`{subagent_id}` 移到变动区(保持前缀缓存稳定)
+2. 子 agent resume 能力(Claude Code `SendMessage` 机制)
+3. 并行 spawn(`spawn_parallel` 真并行)
+4. Worktree/Fork 模式真实行为差异化(当前三模式行为相同)
+5. 子 agent 递归 spawn 防护(Claude Code 限制递归深度)
+
+#### Epic 3 — policy_engine + green_contract + task_registry
+
+| 模块 | 接入点 | 接入方式 |
+|---|---|---|
+| policy_engine | `conversation.rs::run_turn` 入口 | `PolicyEngine::evaluate(context)` 作为决策门,`PolicyAction::Allow/Deny/RequireApproval` 决定是否继续 |
+| green_contract | `policy_engine.rs::evaluate` 内部 | `GreenContract::evaluate(observed_level)` 产出 `GreenContractOutcome`,注入 `PolicyEvaluation` |
+| task_registry | `MultiAgentCoordinator::with_task_registry` | Teammate 模式下通过共享 TaskRegistry 通信;task_packet 经 task_registry 自动接入 |
+
+**关键约束**:
+- PolicyEngine 可能阻断 turn,需设计 fallback 策略避免生产环境卡死
+- task_packet → task_registry → multi_agent 形成完整链路,需按依赖顺序接入
+
+#### Epic 4 — lane_events + g004_conformance + report_schema + branch_lock
+
+| 模块 | 接入点 | 接入方式 |
+|---|---|---|
+| g004_conformance | `lane_events.rs::try_publish` 前置 | LaneEvent 发布前校验契约 |
+| report_schema | `rusty-claude-cli/src/lib.rs::print_status_snapshot` | `claw status --output-format json` 输出 `CanonicalReportV1` |
+| branch_lock | `runtime/src/bash.rs::execute_bash` 或 `git_context.rs` | `detect_branch_lock_collisions` 在 git 分支操作前调用 |
+
+**关键约束**:
+- lane_events 已间接接入(bash.rs:191 + conversation.rs:1747),g004_conformance 是在其上增加契约校验层
+- report_schema 需与现有 `claw status` JSON 格式向后兼容
+
+#### Epic 5 — plugin_lifecycle + mcp_tool_bridge + mcp_lifecycle_hardened(剩余)
+
+| 模块 | 接入点 | 接入方式 |
+|---|---|---|
+| plugin_lifecycle | `plugin_state.rs::build_runtime_plugin_state` | 调用 `PluginLifecycle::init` / `shutdown`,替代当前仅构造 `McpDegradedReport` 的部分接入 |
+| mcp_tool_bridge | 经 plugin_lifecycle 自动接入 | 打破 `plugin_lifecycle ↔ mcp_tool_bridge` 死链 |
+| mcp_lifecycle_hardened | `plugin_state.rs::build_runtime_plugin_state` | 补齐 `McpLifecycleValidator` / `McpLifecycleState` 接入(当前仅 4 个类型接入) |
+
+**关键约束**:
+- 插件 init/shutdown 命令执行可能影响启动延迟,需异步执行或超时保护
+
+#### Epic 6 — team_cron_registry
+
+| 模块 | 接入点 | 接入方式 |
+|---|---|---|
+| team_cron_registry | `MultiAgentCoordinator` + 新增 `claw cron` 子命令 | Teammate 模式下按 cron 调度子 agent |
+
+**关键约束**:
+- cron 调度可能引入时序竞争,需设计幂等性保护
+- 依赖 Epic 2(multi_agent)和 Epic 3(task_registry)完成
+
+### 9.3 接入顺序与依赖关系
+
+```
+Epic 0(文档对齐) ✅ 已完成
+  └─ Epic 1(trust_resolver + worker_boot)  [试点,低风险]
+       └─ Epic 2(multi_agent)  [核心,需 P0-2 论文调研已完成]
+            ├─ Epic 3(policy_engine + green_contract + task_registry)  [依赖 Epic 2]
+            │    └─ Epic 6(team_cron_registry)  [依赖 Epic 2 + 3]
+            └─ Epic 5(plugin_lifecycle + mcp_tool_bridge)  [依赖 Epic 1 的 probe_mcp_health]
+       └─ Epic 4(lane_events + g004_conformance + report_schema + branch_lock)  [依赖 Epic 3]
+```
+
+### 10.4 接入验收标准
+
+每个 Epic 完成后需通过:
+1. `cargo test --workspace` 全绿
+2. `scripts/run_mock_parity_harness.sh` PARITY 验证通过
+3. 缓存命中率监控:`cache_read_input_tokens` 占比 ≥ 88%(低于 85% 触发回滚,见 §5.3)
+4. 接入模块在 `rusty-claude-cli/src/` 中有真实调用点(非仅类型注解)
+
+---
+
+## 十、变更记录
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
@@ -979,3 +1104,4 @@ cd rust && cargo build && cp target/debug/claw.exe debug/claw.exe
 | 2026-07-21 | v1.3 | 新增阶段 3.5:三层信息持久化架构(基于论文调研)。基于 Anthropic《Effective Context Engineering》《Multi-Agent Research System》、CompactionRL (arXiv:2607.05378)、MIRIX (arXiv:2507.07957) 实施 5 个改进:P0-1 NOTEBOOK.md parse() 修复 + Structured Note-taking(commit 59f1663,26 测试)、P0-3 压缩前 NOTEBOOK 刷新 trigger(commit 8ea0c67,3 测试)、P0-2 子智能体真实化(同步阻塞 + 上下文隔离 + 文件持久化,commit c2e8f48,10 测试,修复 MultiAgentCoordinator 空壳问题)、P1 microcompact 结构化保留(子智能体指针 + 多行预览,commit a1ac0d1,5 测试)、P3 streaming stall 事件间超时(commit b7edada,337 测试全绿)。新增 37 个测试,总 918 passed。修复长程任务中"AI 忘记关键信息导致重复 dispatch"stall 问题。 |
 | 2026-07-21 | v1.4 | 代码核对复核 Step 4.1 / 4.2,校正状态从 ✅ 到 ⚠️ 部分。Step 4.1 Sandbox:SandboxBuilder trait + 三实现存在(可编译),但 bg.rs::spawn 完全绕过 SandboxBuilder、assign_process_to_job_object 是死代码、公共 API 未导出、无功能性测试。Step 4.2 LSP Client:协议层 + ProcessLspTransport 传输层已编码,但生产 dispatch 走 MemoryLspTransport placeholder、ProcessLspTransport 是死代码、repomap 协同未实现、无 lsp-types/tower-lsp 依赖、无 rust-analyzer 集成测试。两个 Step 都需要补齐"整合 + 功能性测试"才能达到 ✅ 完整。 |
 | 2026-07-21 | v1.5 | 新增阶段 A:ACP 协议层(借鉴 grok-build 架构)。完成 Step A1-A4 + A6(A5 推迟):A1 claw-acp crate(锁定 agent-client-protocol 0.10.4)、A2 claw-shell crate(ClawAgent 实现 acp::Agent trait)、A3 rusty-claude-cli 接入 stdio ACP server(337 测试)、A4 claw-headless binary(lib + bin 重构,33MB + 24MB 双产物)、A6 端到端测试(13 claw-shell 测试,关键发现 ACP 0.10.4 对 invalid JSON/missing method 是 silent drop,仅 unknown method 返回 -32601)。修复 runtime crate 5 处预存破损(lsp_client unsafe、verifier typo、conversation v2.0 同步、lib.rs re-export、planner mod 导出)。遗留技术债:ClawAgent::cancel 是 stub、tui_mode gating 保留、ACP 0.10.4 silent drop 行为、活跃 prompt 下 cancel 未验证。 |
+| 2026-07-22 | v1.6 | 新增 §9 接入路径章节:Epic 0-6 接入计划。核对 13 个"模块代码完成但未接入 CLI 生产路径"的模块,在 progress.md 增加接入状态对照表。P0-2 论文调研结论:同步阻塞 + 上下文隔离 + 文件持久化设计与 Anthropic《Multi-Agent Research System》及 Claude Code 2026 实践高度一致,无需推翻重做,v2 需补齐 5 项能力(system_prompt 前缀缓存优化、子 agent resume、并行 spawn、Worktree/Fork 差异化、递归 spawn 防护)。 |

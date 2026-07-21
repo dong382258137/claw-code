@@ -296,15 +296,20 @@ pub(crate) fn try_auto_expand_clipboard(
         paste_log!("[paste-dbg] only {} lines, skip", clipboard_lines.len());
         return None;
     }
-    // 第一行必须等于用户输入（trim 后比较，兼容尾部空白差异）
+    // 剪贴板首行必须匹配用户输入的**尾部**（trim 后比较）。
+    // 支持两种场景：
+    // 1. 空输入粘贴：user_input == first_line（精确匹配）
+    // 2. 有前缀文字粘贴：user_input = "前缀文字" + first_line（结尾匹配）
+    //    例如用户先输入"这段代码有什么问题："再粘贴代码
     let first_line = clipboard_lines[0].trim();
+    let user_trimmed = user_input.trim();
     paste_log!(
         "[paste-dbg] first_line={:?} user_input={:?}",
         first_line,
-        user_input.trim()
+        user_trimmed
     );
-    if first_line != user_input.trim() {
-        paste_log!("[paste-dbg] first line mismatch, skip");
+    if first_line.is_empty() || !user_trimmed.ends_with(first_line) {
+        paste_log!("[paste-dbg] first line mismatch (not suffix), skip");
         return None;
     }
     // 触发剪贴板替换：用完整内容走折叠流程（fold_pasted_input 内部决定是否折叠）

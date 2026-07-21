@@ -485,6 +485,15 @@ fn run_event_loop(
     // Turn completion channel: Some when a turn is running
     let mut turn_rx: Option<mpsc::Receiver<TurnResult>> = None;
 
+    // TUI 中断支持：当前 turn 的 abort signal handle（TUI 主线程保留的 clone）。
+    // spawn worker thread 前创建，设置到 cli（通过 set_external_abort_signal），
+    // Ctrl+C（busy 时）通过此 handle 取消当前 turn。
+    let mut current_abort_signal: Option<runtime::HookAbortSignal> = None;
+
+    // TUI 插话支持：busy 时用户输入的待处理队列。
+    // turn 完成（含中断）后自动检查并提交，实现"任务间隙插话"。
+    let mut pending_input: Option<String> = None;
+
     // P0-4 修复：标记 worker 线程已因 Disconnected 崩溃。
     // 一旦置 true，后续 Submit 不再静默丢弃输入，而是向 OutputView 反馈。
     let mut fatal_error: bool = false;
@@ -579,17 +588,31 @@ fn run_event_loop(
         if let Some(ref rx) = turn_rx {
             match rx.try_recv() {
                 Ok(turn_result) => {
-                    if let Err(e) = turn_result.result {
+                    if let Err(e) = &turn_result.result {
                         let handle = output_view.shared_handle();
                         if let Ok(mut buf) = handle.lock() {
-                            buf.append(&format!("\n[error] {e}\n"));
+                            // 区分用户中断和真实错误
+                            if e.contains("turn interrupted by user") {
+                                buf.append("\n[interrupt] 任务已取消。\n");
+                            } else {
+                                buf.append(&format!("\n[error] {e}\n"));
+                            }
                         };
                     }
                     cli_holder = Some(turn_result.cli);
                     turn_rx = None;
                     turn_start = None;
+                    current_abort_signal = None;
                     if let Some(ref cli) = cli_holder {
                         sync_status_from_cli(&status_state, cli);
+                    }
+                    // TUI 插话支持：turn 完成（含中断）后检查 pending_input，
+                    // 如果有排队输入则回填到 InputLine buffer，用户按 Enter 即可发送。
+                    if let Some(pending) = pending_input.take() {
+                        input.restore_input(pending);
+                        if let Ok(mut buf) = output_view.shared_handle().lock() {
+                            buf.append("\n[ready] 排队的输入已恢复，按 Enter 发送。\n");
+                        }
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -937,7 +960,8 @@ fn run_event_loop(
             }
 
             if let Event::Key(key) = ev {
-                let action = route_key(&mut input, key, help_visible);
+                let busy = turn_rx.is_some();
+                let action = route_key(&mut input, key, help_visible, busy);
 
                 // 方案 C drain phase 修复：
                 // conhost_suppress_input 抑制字符输入后 buffer 始终为空，
@@ -1009,6 +1033,18 @@ fn run_event_loop(
                 }
                 match action {
                     InputAction::Exit => break,
+                    InputAction::InterruptTurn => {
+                        // TUI 中断支持：Ctrl+C 在 busy 时取消当前 turn。
+                        // abort signal 让 agent loop 在下一次迭代顶部退出。
+                        // 正在进行的 API 流式请求无法中断（阻塞 IO），但可以阻止
+                        // 下一轮迭代（不再发起新请求、不再执行新工具）。
+                        if let Some(ref signal) = current_abort_signal {
+                            signal.abort();
+                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                buf.append("\n[interrupt] 正在取消当前任务...\n");
+                            }
+                        }
+                    }
                     InputAction::ToggleHelp => {
                         help_visible = !help_visible;
                     }
@@ -1326,21 +1362,40 @@ fn run_event_loop(
                                                 &clipboard_content,
                                                 &session_id,
                                             ) {
-                                                paste_diag_log(&format!(
-                                                    "  conhost 方案 C: 写文件成功，@路径暂存（不立即填充 buffer）={:?}",
+                                                // 提取用户前缀文字：
+                                                // Submit 内容 = "前缀" + 剪贴板首行
+                                                // drain phase 填充 buffer 时需要保留前缀，
+                                                // 否则用户输入的引导文字会丢失。
+                                                let clip_first = clipboard_content
+                                                    .lines()
+                                                    .next()
+                                                    .unwrap_or("")
+                                                    .trim();
+                                                let prefix = if !clip_first.is_empty()
+                                                    && trimmed.ends_with(clip_first)
+                                                {
+                                                    trimmed[..trimmed.len() - clip_first.len()]
+                                                        .trim()
+                                                        .to_string()
+                                                } else {
+                                                    String::new()
+                                                };
+                                                let composed = if prefix.is_empty() {
                                                     at_path
+                                                } else {
+                                                    format!("{prefix} {at_path}")
+                                                };
+                                                paste_diag_log(&format!(
+                                                    "  conhost 方案 C: 写文件成功，@路径暂存 prefix={:?} composed={:?}",
+                                                    prefix, composed
                                                 ));
-                                                // 不立即 insert_paste，保存到 pending_at_path
-                                                // 等 pending_paste_lines 为空后再填充
-                                                pending_at_path = Some(at_path.clone());
+                                                pending_at_path = Some(composed.clone());
                                                 conhost_suppress_input = true;
-                                                // 记录最后一行用于清理残留
                                                 pending_paste_last_line = Some(
                                                     pending_paste_lines.last().unwrap().clone(),
                                                 );
-                                                // 设置标志，跳过 run_turn
                                                 conhost_paste_intercepted = true;
-                                                (at_path.clone(), String::new())
+                                                (composed, String::new())
                                             } else {
                                                 paste_diag_log("  写文件失败，回退到原行为");
                                                 result.unwrap_or_else(|| {
@@ -1492,6 +1547,11 @@ fn run_event_loop(
                                     if let Ok(mut h) = tool_history_shared.lock() {
                                         h.clear();
                                     }
+                                    // TUI 中断支持：创建 abort signal，设置到 cli，
+                                    // 保留 clone 用于 Ctrl+C 取消。
+                                    let abort_signal = runtime::HookAbortSignal::new();
+                                    cli.set_external_abort_signal(abort_signal.clone());
+                                    current_abort_signal = Some(abort_signal);
                                     let status_handle_for_panic = Arc::clone(&status_handle);
                                     std::thread::spawn(move || {
                                         // Bug L3 修复：同上，catch_unwind 包裹。
@@ -1563,12 +1623,14 @@ fn run_event_loop(
                                 );
                             }
                         } else {
-                            // Bug L1 修复：turn 正在运行时用户敲 Enter，InputLine
-                            // 在返回 Submit 前已 reset() 清空 buffer。如果不回填，
-                            // 用户输入会丢失（明明敲了字却看不到也发不出）。
-                            // 把 line 放回 buffer，等当前 turn 结束后再敲 Enter。
-                            // 不直接 queue 是因为 InputLine 不支持 queue（保持简单）。
-                            input.restore_input(line);
+                            // TUI 插话支持：turn 正在运行时用户敲 Enter，输入进入
+                            // pending_input 队列。turn 完成（含中断）后自动提交，
+                            // 实现"任务间隙插话"。InputLine 已 reset() 清空 buffer，
+                            // 用户可以继续输入新的内容。
+                            pending_input = Some(line);
+                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                buf.append("\n[queued] 输入已排队，当前任务结束后自动发送。\n");
+                            }
                         }
                     }
                     InputAction::MenuUp => menu.move_up(),
@@ -1677,7 +1739,7 @@ fn run_event_loop(
     Ok(())
 }
 
-fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool) -> InputAction {
+fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: bool) -> InputAction {
     // Windows crossterm quirk: by default it emits *two* KeyEvents per key
     // press — one `Press` and one `Release`. Without filtering, every char
     // gets inserted twice (e.g., typing "你好" yields "你你好好"). Only handle
@@ -1738,6 +1800,11 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool) -> InputA
         if let KeyCode::Char(c) = key.code {
             let lower = c.to_ascii_lowercase();
             if lower == 'c' || lower == 'd' {
+                // TUI 中断支持：busy 时 Ctrl+C 取消当前 turn（不退出 TUI）；
+                // idle 时 Ctrl+C 退出 TUI（原行为）。
+                if busy && lower == 'c' {
+                    return InputAction::InterruptTurn;
+                }
                 return input.handle_key(None, "CtrlC");
             }
             // Ctrl+B → toggle sidebar (tmux convention)

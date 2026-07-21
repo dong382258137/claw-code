@@ -49,6 +49,9 @@ pub(crate) struct StatusBarState {
     /// 累计 AI 思考轮次（每个 turn +1）。由 sync_status_from_cli_inner
     /// 从 `LiveCli::turns_snapshot()` 同步。
     pub turn_count: u32,
+    /// 标记当前 turn 是否已开始（用于多轮工具调用中避免重复 reset）。
+    /// 由 reset_turn 置 true，finish_turn 置 false。
+    pub turn_in_progress: bool,
 }
 
 impl StatusBarState {
@@ -66,15 +69,29 @@ impl StatusBarState {
     }
 
     /// Reset turn-scoped fields at the start of each turn.
+    ///
+    /// **缓存命中率修复**：多轮工具调用中，每个 agent loop 迭代都会 emit
+    /// `StreamStart`。如果每次都 reset，会清空前几轮迭代累积的 cache 数据，
+    /// 导致缓存命中率计算失效（hit/miss 被清零）。现在用 `turn_in_progress`
+    /// 标志确保只在本 turn 首次 StreamStart 时 reset，后续 StreamStart 只
+    /// 刷新 streaming 状态。
     pub(crate) fn reset_turn(&mut self) {
+        if self.turn_in_progress {
+            // 本 turn 已开始（多轮工具调用的后续迭代），只刷新 streaming 状态，
+            // 不清空 turn_usage，保留前几轮累积的 cache 数据。
+            self.streaming = true;
+            return;
+        }
         self.turn_usage = TokenUsage::default();
         self.turn_elapsed_ms = 0;
         self.streaming = true;
+        self.turn_in_progress = true;
     }
 
     /// Mark the turn as finished.
     pub(crate) fn finish_turn(&mut self) {
         self.streaming = false;
+        self.turn_in_progress = false;
         // Fold turn delta into cumulative.
         self.cumulative_usage.input_tokens += self.turn_usage.input_tokens;
         self.cumulative_usage.output_tokens += self.turn_usage.output_tokens;
@@ -97,103 +114,39 @@ pub(crate) struct StatusBar<'a> {
 impl<'a> Widget for StatusBar<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let style_dim = Style::default().fg(Color::DarkGray);
-        let style_model = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-        let style_provider = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::ITALIC);
-        let style_tokens = Style::default().fg(Color::Yellow);
-        let style_cost = Style::default().fg(Color::Green);
-        let style_branch = Style::default().fg(Color::Magenta);
-        let style_goal = if self.state.goal_badge.contains("⚠") {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Green)
-        };
-        let style_poor = Style::default().fg(Color::Yellow);
+        let style_version = Style::default().fg(Color::DarkGray);
         let style_streaming = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
 
         // Build sections in priority order. Each section is a Vec<Span>.
         // We add sections until we exceed the available width, then stop.
+        //
+        // 去重策略：底栏只显示侧栏没有的信息（cwd、版本号）+ 执行状态指示（streaming timer）。
+        // model/provider/tokens/cost/branch/goal/poor mode 已在侧栏详细显示，此处不再重复。
         let width = area.width as usize;
 
         let mut sections: Vec<Vec<Span>> = Vec::new();
 
-        // P1: Model + provider (always shown)
+        // P1: Cwd (侧栏不显示)
         sections.push(vec![
             Span::styled("│ ", style_dim),
-            Span::styled(&self.state.model, style_model),
-            Span::styled(" 经由 ", style_dim),
-            Span::styled(&self.state.provider, style_provider),
-        ]);
-
-        // P2: Tokens (always shown)
-        sections.push(vec![
-            Span::styled(" │ ", style_dim),
-            Span::styled("🔢 ", style_dim),
-            Span::styled(self.state.total_tokens().to_string(), style_tokens),
-            Span::styled(" 令牌", style_dim),
-        ]);
-
-        // P3: Cost
-        let combined_usage = TokenUsage {
-            input_tokens: self.state.cumulative_usage.input_tokens
-                + self.state.turn_usage.input_tokens,
-            output_tokens: self.state.cumulative_usage.output_tokens
-                + self.state.turn_usage.output_tokens,
-            cache_creation_input_tokens: self.state.cumulative_usage.cache_creation_input_tokens
-                + self.state.turn_usage.cache_creation_input_tokens,
-            cache_read_input_tokens: self.state.cumulative_usage.cache_read_input_tokens
-                + self.state.turn_usage.cache_read_input_tokens,
-        };
-        let cost = estimate_cost(&combined_usage, &self.state.model);
-        sections.push(vec![
-            Span::styled(" │ ", style_dim),
-            Span::styled("💰 ", style_dim),
-            Span::styled(format!("${cost:.4}"), style_cost),
-        ]);
-
-        // P4: Cwd
-        sections.push(vec![
-            Span::styled(" │ ", style_dim),
             Span::styled("📁 ", style_dim),
             Span::styled(&self.state.cwd, style_dim),
         ]);
 
-        // P5: Git branch
-        if !self.state.git_branch.is_empty() {
-            sections.push(vec![
-                Span::styled(" │ ", style_dim),
-                Span::styled("🌿 ", style_dim),
-                Span::styled(&self.state.git_branch, style_branch),
-            ]);
-        }
+        // P2: Version (侧栏不显示，新增)
+        sections.push(vec![
+            Span::styled(" │ ", style_dim),
+            Span::styled(format!("v{}", crate::VERSION), style_version),
+        ]);
 
-        // P6: Streaming timer
+        // P3: Streaming timer (执行状态指示，侧栏虽有但底栏需要快速判断是否在执行)
         if self.state.streaming {
             let elapsed_s = self.state.turn_elapsed_ms / 1000;
             sections.push(vec![
                 Span::styled(" │ ", style_dim),
-                Span::styled(format!("⏱ {elapsed_s}s"), style_streaming),
-            ]);
-        }
-
-        // P7: Goal badge
-        if !self.state.goal_badge.is_empty() {
-            sections.push(vec![
-                Span::styled(" │ ", style_dim),
-                Span::styled(&self.state.goal_badge, style_goal),
-            ]);
-        }
-
-        // P8: Poor mode
-        if self.state.poor_mode {
-            sections.push(vec![
-                Span::styled(" │ ", style_dim),
-                Span::styled("🪙 穷人模式", style_poor),
+                Span::styled(format!("⏳ {elapsed_s}s"), style_streaming),
             ]);
         }
 

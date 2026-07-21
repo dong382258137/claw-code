@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::init::initialize_repo;
 use crate::session_mgr::{LATEST_SESSION_REFERENCE, PRIMARY_SESSION_EXTENSION};
@@ -13,8 +13,10 @@ use crate::suggestion::suggest_slash_commands;
 use api::detect_provider_kind;
 use commands::{render_slash_command_help_filtered, resume_supported_slash_commands};
 use runtime::{
-    format_usd, pricing_for_model, resolve_sandbox_status, ConfigLoader, ConfigSource,
-    ContentBlock, MessageRole, PermissionMode, ProjectContext, RuntimeConfig, Session, TokenUsage,
+    canonicalize_report, format_usd, pricing_for_model, resolve_sandbox_status, CanonicalReportV1,
+    ClaimKind, ConfigLoader, ConfigSource, ContentBlock, MessageRole, PermissionMode,
+    ProjectContext, ReportClaim, ReportConfidence, ReportIdentity, RuntimeConfig, SensitivityClass,
+    Session, TokenUsage, REPORT_SCHEMA_V1,
 };
 
 use crate::commands_handler::{
@@ -288,6 +290,11 @@ pub(crate) fn status_json_value(
     let model_source = provenance.map(|p| p.source.as_str());
     let model_raw = provenance.and_then(|p| p.raw.clone());
     let allowed_tool_entries = allowed_tools.map(|tools| tools.iter().cloned().collect::<Vec<_>>());
+    // Epic 4:report_schema 接入 claw status --output-format json。
+    // 在现有 status JSON 基础上追加 `canonical_report` 字段(不替换现有字段,
+    // 保持向后兼容),让 report_schema 模块有生产输出路径。详见 plan.md §9.2 Epic 4。
+    let canonical_report = build_status_canonical_report(model, permission_mode, context);
+    let canonical_value = serde_json::to_value(&canonical_report).unwrap_or(Value::Null);
     json!({
         "kind": "status",
         "status": if degraded { "degraded" } else { "ok" },
@@ -361,8 +368,62 @@ pub(crate) fn status_json_value(
             "allowed_mounts": context.sandbox_status.allowed_mounts,
             "markers": context.sandbox_status.container_markers,
             "fallback_reason": context.sandbox_status.fallback_reason,
-        }
+        },
+        "canonical_report": canonical_value,
     })
+}
+
+/// Epic 4:为 `claw status` 构造一个 `CanonicalReportV1`,作为 report_schema 模块
+/// 的生产输出载体。报告包含 model / permission / workspace 三个 ObservedFact claim,
+/// 经 `canonicalize_report` 自动填充 schema_version / report_id / content_hash。
+///
+/// 当前不填充 negative_evidence / field_deltas(留待后续 lane 事件流接入)。
+fn build_status_canonical_report(
+    model: Option<&str>,
+    permission_mode: &str,
+    context: &StatusContext,
+) -> CanonicalReportV1 {
+    let mut claims = Vec::new();
+    if let Some(model) = model {
+        claims.push(ReportClaim {
+            id: "claim-model".to_string(),
+            kind: ClaimKind::ObservedFact,
+            text: format!("active model: {model}"),
+            confidence: ReportConfidence::High,
+            evidence: Vec::new(),
+            sensitivity: SensitivityClass::Internal,
+        });
+    }
+    claims.push(ReportClaim {
+        id: "claim-permission".to_string(),
+        kind: ClaimKind::ObservedFact,
+        text: format!("permission mode: {permission_mode}"),
+        confidence: ReportConfidence::High,
+        evidence: Vec::new(),
+        sensitivity: SensitivityClass::Internal,
+    });
+    claims.push(ReportClaim {
+        id: "claim-workspace".to_string(),
+        kind: ClaimKind::ObservedFact,
+        text: format!("cwd: {}", context.cwd.display()),
+        confidence: ReportConfidence::High,
+        evidence: Vec::new(),
+        sensitivity: SensitivityClass::Internal,
+    });
+    let report = CanonicalReportV1 {
+        schema_version: String::new(),
+        identity: ReportIdentity {
+            report_id: String::new(),
+            content_hash: String::new(),
+        },
+        generated_at: crate::DEFAULT_DATE.to_string(),
+        producer: "claw-status".to_string(),
+        claims,
+        negative_evidence: Vec::new(),
+        field_deltas: Vec::new(),
+    };
+    let _ = REPORT_SCHEMA_V1; // 确保常量被引用(canonicalize 内部会用)
+    canonicalize_report(report)
 }
 
 pub(crate) fn status_context(

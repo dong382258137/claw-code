@@ -97,7 +97,7 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
         "high" => Color::Red,
         _ => Color::DarkGray,
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("模型 ", Style::default().fg(Color::DarkGray)),
             Span::raw(&state.model),
@@ -131,29 +131,28 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
             Span::styled("权限 ", Style::default().fg(Color::DarkGray)),
             Span::raw(&state.permission_mode),
         ]),
-        Line::from(vec![
-            Span::styled("目标 ", Style::default().fg(Color::DarkGray)),
-            Span::raw(if state.goal_badge.is_empty() {
-                "（无）"
-            } else {
-                &state.goal_badge
-            }),
-        ]),
-        Line::from(vec![
-            Span::styled("穷人模式 ", Style::default().fg(Color::DarkGray)),
-            Span::raw(if state.poor_mode { "启用" } else { "关闭" }),
-        ]),
-        // 新增：累计思考轮次统计（每个 turn +1）
-        Line::from(vec![
-            Span::styled("轮次 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} 累计", state.turn_count),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
     ];
+    // 目标行：仅在设置了 goal 时显示，避免无 goal 时长期显示"（无）"造成噪音。
+    if !state.goal_badge.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("目标 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&state.goal_badge),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("经济模式 ", Style::default().fg(Color::DarkGray)),
+        Span::raw(if state.poor_mode { "启用" } else { "关闭" }),
+    ]));
+    // 新增：累计思考轮次统计（每个 turn +1）
+    lines.push(Line::from(vec![
+        Span::styled("轮次 ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} 累计", state.turn_count),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
     paragraph.render(area, buf);
 }

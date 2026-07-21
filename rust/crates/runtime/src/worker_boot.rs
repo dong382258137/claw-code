@@ -20,6 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::mcp_lifecycle_hardened::McpLifecyclePhase;
+use crate::trust_resolver::{
+    TrustAllowlistEntry, TrustConfig, TrustDecision, TrustPolicy, TrustResolver,
+};
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -374,6 +377,10 @@ pub struct WorkerRegistry {
 struct WorkerRegistryInner {
     workers: HashMap<String, Worker>,
     counter: u64,
+    /// Per-worker TrustConfig stored at create time, used by observe() to call
+    /// TrustResolver::resolve() instead of the legacy trust_auto_resolve boolean.
+    /// Keyed by worker_id. See plan.md §9.2 Epic 1.
+    trust_configs: HashMap<String, TrustConfig>,
 }
 
 impl WorkerRegistry {
@@ -396,6 +403,18 @@ impl WorkerRegistry {
         let trust_auto_resolve = trusted_roots
             .iter()
             .any(|root| path_matches_allowlist(cwd, root));
+
+        // Epic 1 接入:用 trusted_roots 构造 TrustConfig,存入 trust_configs。
+        // observe() 的 trust prompt 分支会取出 config,构造 TrustResolver,
+        // 调用 resolve() 获取结构化 TrustDecision(AutoTrust/RequireApproval/Deny)。
+        // 这比原 trust_auto_resolve 布尔多了 denylist + glob pattern matching 能力。
+        // 详见 plan.md §9.2 Epic 1。
+        let mut trust_config = TrustConfig::default();
+        for root in trusted_roots {
+            trust_config.allowlisted.push(TrustAllowlistEntry::new(root));
+        }
+        // TODO: denylist 当前为空,后续可从 ConfigLoader::denied_roots() 注入。
+
         let mut worker = Worker {
             worker_id: worker_id.clone(),
             cwd: cwd.to_owned(),
@@ -421,7 +440,8 @@ impl WorkerRegistry {
             Some("worker created".to_string()),
             None,
         );
-        inner.workers.insert(worker_id, worker.clone());
+        inner.workers.insert(worker_id.clone(), worker.clone());
+        inner.trust_configs.insert(worker_id, trust_config);
         worker
     }
 
@@ -433,6 +453,12 @@ impl WorkerRegistry {
 
     pub fn observe(&self, worker_id: &str, screen_text: &str) -> Result<Worker, String> {
         let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        // Epic 1: 先取出 trust_config,避免与 worker 的可变借用冲突。
+        let trust_config = inner
+            .trust_configs
+            .get(worker_id)
+            .cloned()
+            .unwrap_or_default();
         let worker = inner
             .workers
             .get_mut(worker_id)
@@ -480,22 +506,67 @@ impl WorkerRegistry {
                 }),
             );
 
-            if worker.trust_auto_resolve {
-                worker.trust_gate_cleared = true;
-                worker.last_error = None;
-                worker.status = WorkerStatus::Spawning;
-                push_event(
-                    worker,
-                    WorkerEventKind::TrustResolved,
-                    WorkerStatus::Spawning,
-                    Some("allowlisted repo auto-resolved trust prompt".to_string()),
-                    Some(WorkerEventPayload::TrustPrompt {
-                        cwd: worker.cwd.clone(),
-                        resolution: Some(WorkerTrustResolution::AutoAllowlisted),
-                    }),
-                );
-            } else {
-                return Ok(worker.clone());
+            // Epic 1 接入:用 TrustResolver::resolve() 替代 trust_auto_resolve 布尔。
+            // trust_config 已在 observe 入口处从 inner 取出(避免借用冲突)。
+            // 详见 plan.md §9.2 Epic 1。
+            let resolver = TrustResolver::new(trust_config);
+            let decision = resolver.resolve(&worker.cwd, None, screen_text);
+
+            match decision {
+                TrustDecision::NotRequired => {
+                    // 不应发生(已检测到 trust prompt),但防御性处理:继续等待
+                    return Ok(worker.clone());
+                }
+                TrustDecision::Required {
+                    policy: TrustPolicy::AutoTrust,
+                    ..
+                } => {
+                    // Allowlist 匹配:自动清除 trust gate
+                    worker.trust_gate_cleared = true;
+                    worker.last_error = None;
+                    worker.status = WorkerStatus::Spawning;
+                    push_event(
+                        worker,
+                        WorkerEventKind::TrustResolved,
+                        WorkerStatus::Spawning,
+                        Some("allowlisted repo auto-resolved trust prompt".to_string()),
+                        Some(WorkerEventPayload::TrustPrompt {
+                            cwd: worker.cwd.clone(),
+                            resolution: Some(WorkerTrustResolution::AutoAllowlisted),
+                        }),
+                    );
+                }
+                TrustDecision::Required {
+                    policy: TrustPolicy::Deny,
+                    ..
+                } => {
+                    // Denylist 匹配:直接失败(新增能力,trust_auto_resolve 布尔无法实现)
+                    worker.trust_gate_cleared = false;
+                    worker.last_error = Some(WorkerFailure {
+                        kind: WorkerFailureKind::TrustGate,
+                        message: "trust denied: cwd matches denied trust root".to_string(),
+                        created_at: now_secs(),
+                    });
+                    worker.status = WorkerStatus::Failed;
+                    push_event(
+                        worker,
+                        WorkerEventKind::Failed,
+                        WorkerStatus::Failed,
+                        Some("trust denied by denylist".to_string()),
+                        Some(WorkerEventPayload::TrustPrompt {
+                            cwd: worker.cwd.clone(),
+                            resolution: None,
+                        }),
+                    );
+                    return Ok(worker.clone());
+                }
+                TrustDecision::Required {
+                    policy: TrustPolicy::RequireApproval,
+                    ..
+                } => {
+                    // 需要手动审批:卡在 TrustRequired 状态
+                    return Ok(worker.clone());
+                }
             }
         }
 
@@ -1619,6 +1690,44 @@ mod tests {
                 cwd: "/tmp/repo-b".to_string(),
                 resolution: Some(WorkerTrustResolution::ManualApproval),
             })
+        );
+    }
+
+    #[test]
+    fn denied_trust_root_fails_worker_on_trust_prompt() {
+        // Epic 1 接入验证:TrustResolver 的 denylist 能力。
+        // 当 cwd 匹配 denied 路径时,trust prompt 应直接导致 WorkerStatus::Failed,
+        // 而不是卡在 TrustRequired 等待手动审批。这是 trust_auto_resolve 布尔无法实现的能力。
+        // 详见 plan.md §9.2 Epic 1。
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/evil-repo", &[], false);
+
+        // 手动注入 denied 路径(模拟 ConfigLoader::denied_roots())
+        {
+            let mut inner = registry.inner.lock().expect("lock poisoned");
+            inner
+                .trust_configs
+                .get_mut(&worker.worker_id)
+                .expect("trust_config should exist")
+                .denied
+                .push(PathBuf::from("/tmp/evil-repo"));
+        }
+
+        let result = registry
+            .observe(
+                &worker.worker_id,
+                "Do you trust the files in this folder?\n1. Yes, proceed\n2. No",
+            )
+            .expect("observe should succeed");
+
+        assert_eq!(result.status, WorkerStatus::Failed);
+        assert!(!result.trust_gate_cleared);
+        let failure = result.last_error.expect("should have failure");
+        assert_eq!(failure.kind, WorkerFailureKind::TrustGate);
+        assert!(
+            failure.message.contains("trust denied"),
+            "message should mention denial: {}",
+            failure.message
         );
     }
 

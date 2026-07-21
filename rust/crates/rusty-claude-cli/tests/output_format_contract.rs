@@ -421,7 +421,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(summary["failures"].as_u64().is_some());
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 7);
+    assert_eq!(checks.len(), 16);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -440,7 +440,20 @@ fn doctor_and_resume_status_emit_json_when_requested() {
             "workspace",
             "boot preflight",
             "sandbox",
-            "system"
+            "system",
+            // Epic 3:policy_engine + green_contract smoke test 接入。
+            "policyengine",
+            "greencontract",
+            // Epic 4:lane_events + g004_conformance + report_schema + branch_lock smoke test 接入。
+            "laneevents",
+            "g004conformance",
+            "canonicalreportv1",
+            "branchlock",
+            // Epic 5:plugin_lifecycle + mcp_tool_bridge 打破死链 smoke test 接入。
+            "pluginlifecycle",
+            "mcptoolbridge",
+            // Epic 6:team_cron_registry smoke test 接入。
+            "teamcronregistry"
         ]
     );
 

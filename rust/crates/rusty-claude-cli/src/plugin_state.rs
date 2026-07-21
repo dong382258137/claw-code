@@ -533,6 +533,65 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         }),
         required_permission: PermissionMode::ReadOnly,
     });
+    // Epic 2:注册 dispatch_subagent / check_subagent 工具 — subagent-as-tool 路由。
+    // 主 agent 通过 dispatch_subagent 派发子 agent(独立 LLM 请求 + 独立 prompt cache,
+    // 不污染主 agent 缓存,详见 plan.md §5.2)。check_subagent 查询状态/结果。
+    // 执行由 ConversationRuntime::run_turn 拦截,路由到
+    // execute_dispatch_subagent / execute_check_subagent。
+    // 详见 plan.md §9.2 Epic 2。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "dispatch_subagent".to_string(),
+        description: Some(
+            "Dispatch a sub-task to a sub-agent. The sub-agent runs independently \
+             with its own LLM request and prompt cache, so the main agent's cache \
+             prefix is not polluted. Use this for parallelizable work, isolated \
+             refactors, or verification tasks. Returns the subagent_id immediately; \
+             use check_subagent to poll for completion."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Human-readable name for the sub-agent (e.g. 'refactor-auth', 'test-runner')."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The task description / prompt to send to the sub-agent."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["fork", "teammate", "worktree"],
+                    "description": "Coordination mode: 'fork' (shared workdir, parallel), 'teammate' (shared TaskRegistry), 'worktree' (isolated git worktree).",
+                    "default": "fork"
+                }
+            },
+            "required": ["name", "task"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    });
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "check_subagent".to_string(),
+        description: Some(
+            "Check the status of a previously dispatched sub-agent. Returns the \
+             current status (created/running/completed/failed/cancelled) and, if \
+             terminal, the result payload. Completed/failed results also emit a \
+             SubagentResult lane event for observability."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": {
+                    "type": "string",
+                    "description": "The subagent_id returned by dispatch_subagent."
+                }
+            },
+            "required": ["subagent_id"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    });
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {

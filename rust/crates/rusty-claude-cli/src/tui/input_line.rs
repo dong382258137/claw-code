@@ -38,6 +38,8 @@ pub(crate) enum InputAction {
     ScrollDown,
     /// User pressed `?` (with empty input) to toggle the keybindings overlay.
     ToggleHelp,
+    /// User pressed Ctrl+C while a turn is running (interrupt, not exit).
+    InterruptTurn,
     /// No-op (key not handled).
     Ignore,
 }

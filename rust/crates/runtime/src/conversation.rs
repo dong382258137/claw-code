@@ -380,6 +380,12 @@ pub struct ConversationRuntime<C, T> {
     /// LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
     /// 详见 docs/harness-engineering-optimization-plan.md Step 3.2。
     multi_agent_coordinator: Option<MultiAgentCoordinator>,
+    /// Epic 3:TaskRegistry — 子 agent 任务注册表。
+    ///
+    /// `Some` 时子 agent 任务可通过 TaskRegistry 追踪状态/心跳/团队分配。
+    /// 与 multi_agent_coordinator 配合使用:coordinator 管理子 agent 生命周期,
+    /// registry 管理 task 级元数据。详见 plan.md §9.2 Epic 3。
+    task_registry: Option<crate::task_registry::TaskRegistry>,
     /// P0-3:NOTEBOOK 刷新提醒 flag。
     ///
     /// 当 microcompact / auto_compaction / reactive compaction 压缩了
@@ -468,6 +474,7 @@ where
             trace_analyzer: None,
             turn_start: Cell::new(None),
             multi_agent_coordinator: None,
+            task_registry: None,
             notebook_refresh_pending: false,
             pending_remediation: None,
         }
@@ -649,6 +656,26 @@ where
     /// `&mut self` 版本的 `with_multi_agent_coordinator`。
     pub fn set_multi_agent_coordinator(&mut self, coordinator: MultiAgentCoordinator) {
         self.multi_agent_coordinator = Some(coordinator);
+    }
+
+    /// Epic 3:注入 TaskRegistry,启用子 agent 任务追踪。
+    ///
+    /// 注入后,子 agent 的 task 级元数据(状态/心跳/团队分配)可通过
+    /// TaskRegistry 追踪。与 multi_agent_coordinator 配合使用。
+    /// 详见 plan.md §9.2 Epic 3。
+    #[must_use]
+    pub fn with_task_registry(
+        mut self,
+        registry: crate::task_registry::TaskRegistry,
+    ) -> Self {
+        self.task_registry = Some(registry);
+        self
+    }
+
+    /// 获取已注入的 TaskRegistry 引用(若已注入)。
+    #[must_use]
+    pub fn task_registry(&self) -> Option<&crate::task_registry::TaskRegistry> {
+        self.task_registry.as_ref()
     }
 
     /// Step 3.2-c:获取 `MultiAgentCoordinator` 引用(若已注入)。
@@ -924,6 +951,15 @@ where
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
+            }
+
+            // 用户中断检查：TUI 层 Ctrl+C（busy 时）会 abort hook_abort_signal。
+            // 在每次 agent loop 迭代顶部检查，让用户能在工具调用间隙打断 AI。
+            // 注意：正在进行的 API 流式请求无法中断（阻塞 IO），但可以阻止
+            // 下一轮迭代（不再发起新请求、不再执行新工具）。
+            if self.hook_abort_signal.is_aborted() {
+                self.record_turn_failed(iterations, &RuntimeError::new("turn interrupted by user"));
+                return Err(RuntimeError::new("turn interrupted by user"));
             }
 
             let request = {
