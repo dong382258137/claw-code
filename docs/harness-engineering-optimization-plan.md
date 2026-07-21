@@ -452,7 +452,7 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 #### Step 4.1 — Sandbox Windows 实现 ✅(审查后修复 + trait 接入收尾)
 
 > **审查状态(2026-07-21 SP4.1 审查 + 收尾)**:经代码审查发现 2 个 P0 级 BUG 已修复(commit 1fd6cc9),
-> 后续 `SandboxBuilder` trait 接入收尾完成(commit 待填),Step 状态从 ⚠️ 部分升级为 ✅。
+> 后续 `SandboxBuilder` trait 接入收尾完成(commit acceac9),Step 状态从 ⚠️ 部分升级为 ✅。
 >
 > **已修复的 BUG**:
 > - ✅ Job Object flag 值错误:`0x00000004`(JOB_TIME)→ `0x00000100`(PROCESS_MEMORY)
@@ -514,7 +514,7 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 | **实现要点** | 1. Windows:`CREATE_NO_WINDOW` + Job Object 限制 CPU/memory <br> 2. macOS:`sandbox-exec` wrapper(可选,优先级低) <br> 3. 抽象 `SandboxBuilder` trait,Linux/Windows/macOS 三实现 <br> 4. 与 `bg.rs` 已有的 `CREATE_NO_WINDOW` flag 整合 |
 | **验证** | Windows 上跑 `cargo test sandbox` — 20 bg:: + 19 sandbox:: 全绿 |
 | **缓存影响** | 无 |
-| **实际状态** | ✅ 完成 — Job Object BUG 已修复(commit 1fd6cc9),SandboxBuilder trait 已接入生产路径(commit 待填),后置分配方案通过 `platform_sandbox_builder().assign_process(pid)` 调用 |
+| **实际状态** | ✅ 完成 — Job Object BUG 已修复(commit 1fd6cc9),SandboxBuilder trait 已接入生产路径(commit acceac9),后置分配方案通过 `platform_sandbox_builder().assign_process(pid)` 调用 |
 
 #### Step 4.2 — LSP Client 真实接入 ✅
 
