@@ -22,11 +22,16 @@ use crate::tui::status_bar::StatusBarState;
 pub(crate) type ToolHistory = Vec<(String, bool)>;
 
 /// Render the sidebar into `area` using `state` + `tool_history`.
+///
+/// `tools_scroll` 控制工具历史段的滚动：
+/// - `None`：跟随底部（显示最新 N 条，N = 可见行数）
+/// - `Some(n)`：从底部往上偏移 n 行（手动滚动查看更早的工具调用）
 pub(crate) fn render_sidebar(
     area: Rect,
     buf: &mut Buffer,
     state: &StatusBarState,
     tool_history: &ToolHistory,
+    tools_scroll: Option<usize>,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " 侧栏 ",
@@ -69,6 +74,7 @@ pub(crate) fn render_sidebar(
             },
             buf,
             tool_history,
+            tools_scroll,
         );
         y = y.saturating_add(tools_h);
     }
@@ -157,8 +163,21 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
     paragraph.render(area, buf);
 }
 
-fn render_tools_section(area: Rect, buf: &mut Buffer, tool_history: &ToolHistory) {
-    let title = format!(" 工具 ({}) ", tool_history.len());
+fn render_tools_section(
+    area: Rect,
+    buf: &mut Buffer,
+    tool_history: &ToolHistory,
+    tools_scroll: Option<usize>,
+) {
+    // 标题：显示总数 + 滚动位置提示。
+    // 跟随模式：`工具 (N)`；手动模式：`工具 (N) ↑k` 表示上方还有 k 条。
+    let total = tool_history.len();
+    let scroll_up_hidden = tools_scroll.unwrap_or(0);
+    let title = if scroll_up_hidden > 0 {
+        format!(" 工具 ({total}) ↑{scroll_up_hidden} ")
+    } else {
+        format!(" 工具 ({total}) ")
+    };
     let block = Block::default().borders(Borders::TOP).title(Span::styled(
         title,
         Style::default()
@@ -177,10 +196,27 @@ fn render_tools_section(area: Rect, buf: &mut Buffer, tool_history: &ToolHistory
         return;
     }
 
-    // Show most-recent-last (natural reading order); cap to available lines.
+    // 自适应滚动：根据 inner.height 截取要显示的窗口。
+    // - visible = 可见行数（受窗口大小影响，自适应）
+    // - 跟随模式（tools_scroll=None 或 0）：显示最后 visible 条（最新工具调用）
+    // - 手动模式（tools_scroll=Some(n)）：窗口从 `total - visible - n` 开始
+    //   n 越大越往上看更早的记录
+    let visible = inner.height as usize;
+    let total = tool_history.len();
+
+    let (start, _) = if total <= visible {
+        (0, total)
+    } else {
+        let scroll = tools_scroll.unwrap_or(0).min(total - visible);
+        let start = total - visible - scroll;
+        (start, visible)
+    };
+
     let items: Vec<ListItem> = tool_history
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(i, (name, is_error))| {
             let icon = if *is_error { "x" } else { "v" };
             let color = if *is_error { Color::Red } else { Color::Green };
@@ -190,6 +226,8 @@ fn render_tools_section(area: Rect, buf: &mut Buffer, tool_history: &ToolHistory
             ]))
         })
         .collect();
+
+    // 如果下方还有更早记录被隐藏，最后一行加提示（仅手动滚动到底时显示）
     let list = List::new(items);
     list.render(inner, buf);
 }
@@ -394,6 +432,7 @@ mod tests {
             &mut buf,
             &state,
             &history,
+            None,
         );
         // Just verifying no panic; content checks would require inspecting buf.
     }
@@ -422,6 +461,7 @@ mod tests {
             &mut buf,
             &state,
             &history,
+            None,
         );
     }
 
@@ -452,6 +492,7 @@ mod tests {
             &mut buf,
             &state,
             &history,
+            None,
         );
     }
 
@@ -476,6 +517,7 @@ mod tests {
             &mut buf,
             &state,
             &history,
+            None,
         );
     }
 

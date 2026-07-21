@@ -504,6 +504,10 @@ fn run_event_loop(
     let mut sidebar_visible: bool = terminal.size().map(|s| s.width >= 100).unwrap_or(false);
     let tool_history_shared: Arc<Mutex<ToolHistory>> = Arc::new(Mutex::new(Vec::new()));
 
+    // 侧栏工具历史滚动状态：None=跟随底部（显示最新），Some(n)=从底部往上偏移 n 行。
+    // Alt+Up 增加 n（看更早），Alt+Down 减少 n（回到最新），新工具到来时自动归零。
+    let mut sidebar_tools_scroll: Option<usize> = None;
+
     // Output view scroll state. `None` means "follow bottom" (auto-scroll on
     // new output). `Some(n)` means "manual scroll n lines above the bottom";
     // new output does NOT auto-scroll while the user is in manual mode.
@@ -712,7 +716,7 @@ fn run_event_loop(
                     .map(|h| h.clone())
                     .unwrap_or_default();
                 let sidebar_buf = f.buffer_mut();
-                render_sidebar(cols[1], sidebar_buf, &state_snapshot, &history_snapshot);
+                render_sidebar(cols[1], sidebar_buf, &state_snapshot, &history_snapshot, sidebar_tools_scroll);
                 cols[0]
             } else {
                 outer[0]
@@ -1063,6 +1067,21 @@ fn run_event_loop(
                     }
                     InputAction::ToggleSidebar => {
                         sidebar_visible = !sidebar_visible;
+                    }
+                    InputAction::SidebarScrollUp => {
+                        // Alt+Up：侧栏工具历史往上滚（看更早的记录）。
+                        // 每次 +3 行，进入手动模式。新工具到来时会归零。
+                        let cur = sidebar_tools_scroll.unwrap_or(0);
+                        sidebar_tools_scroll = Some(cur.saturating_add(3));
+                    }
+                    InputAction::SidebarScrollDown => {
+                        // Alt+Down：侧栏工具历史往下滚（回到最新）。
+                        // 偏移归零后进入跟随模式（None），新工具自动显示。
+                        match sidebar_tools_scroll {
+                            None => {}
+                            Some(0) => sidebar_tools_scroll = None,
+                            Some(n) => sidebar_tools_scroll = Some(n.saturating_sub(3)),
+                        }
                     }
                     InputAction::ToggleToolCard => {
                         // P1 重构：交互式折叠/展开最近一个工具卡片。
@@ -1869,6 +1888,18 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
         return InputAction::ScrollDown;
     }
 
+    // Alt+Up / Alt+Down → 滚动侧栏工具历史。
+    // 与 output_view 的 Up/Down 单行滚动区分：Alt 修饰符专属 sidebar。
+    // 让用户能在工具调用很多时回看更早的记录，松开 Alt 后自动跟随底部。
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        if matches!(key.code, KeyCode::Up) {
+            return InputAction::SidebarScrollUp;
+        }
+        if matches!(key.code, KeyCode::Down) {
+            return InputAction::SidebarScrollDown;
+        }
+    }
+
     // `?` (Shift+/) when the input buffer is empty → toggle help overlay.
     // We check `input.buffer()` so users can still type `?` inside a prompt
     // they've already started composing.
@@ -1974,8 +2005,10 @@ fn render_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         ("PgUp / PgDn", "滚动输出视图 上 / 下 一屏"),
         ("/", "打开斜杠命令菜单（模糊过滤）"),
         ("F2 / Ctrl+B", "切换右侧侧栏"),
+        ("Alt+Up / Alt+Down", "滚动侧栏工具历史（看更早 / 回最新）"),
         ("Ctrl+T", "折叠 / 展开最近一个工具卡片"),
         ("鼠标左键", "点击工具卡片切换折叠 / 展开"),
+        ("Shift+鼠标拖拽", "终端原生选中复制（绕过程序鼠标捕获）"),
         (
             "粘贴 (Ctrl+V)",
             "整段粘贴（含多行）作为一个块插入，不立即提交",

@@ -416,6 +416,15 @@ pub fn detect_shell_type() -> ShellType {
     shell_kind().kind
 }
 
+/// P11-2:返回当前 shell 的 (program, flag),供 hooks 等模块复用。
+/// 避免各模块各自硬编码 cmd/sh,导致行为不一致。
+/// Windows:Git Bash 可用时返回 ("bash.exe", "-c"),否则 ("cmd", "/C")。
+/// Unix:返回 ("sh", "-lc")。
+pub fn shell_launcher() -> (String, &'static str) {
+    let kind = shell_kind();
+    (kind.program, kind.flag)
+}
+
 /// 执行实际的 shell 探测，返回 ShellKind（不缓存）。
 fn detect_shell_kind() -> ShellKind {
     if cfg!(target_os = "windows") {
@@ -516,9 +525,17 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 mod git_bash_detection_tests {
     use super::detect_git_bash;
 
+    // P11-2:这些测试共享环境变量 CLAW_GIT_BASH 和 PATH,Rust 默认多线程并行
+    // 跑测试会导致竞态。用模块级 Mutex 串行化所有环境变量修改。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `CLAW_GIT_BASH` 指向一个真实存在的文件 → 直接返回该路径。
     #[test]
     fn env_var_override_returns_specified_path() {
+        let _guard = env_lock();
         // 用 cmd.exe 自身作为虚拟 bash.exe（一定存在）
         let cmd_path = r"C:\Windows\System32\cmd.exe";
         std::env::set_var("CLAW_GIT_BASH", cmd_path);
@@ -530,6 +547,7 @@ mod git_bash_detection_tests {
     /// `CLAW_GIT_BASH=""` → 显式禁用，返回 None。
     #[test]
     fn env_var_empty_disables_git_bash() {
+        let _guard = env_lock();
         std::env::set_var("CLAW_GIT_BASH", "");
         let result = detect_git_bash();
         std::env::remove_var("CLAW_GIT_BASH");
@@ -540,6 +558,7 @@ mod git_bash_detection_tests {
     /// 不再 fallback 到其他探测路径）。
     #[test]
     fn env_var_invalid_path_returns_none() {
+        let _guard = env_lock();
         std::env::set_var("CLAW_GIT_BASH", r"Z:\nonexistent\bash.exe");
         let result = detect_git_bash();
         std::env::remove_var("CLAW_GIT_BASH");
@@ -551,6 +570,7 @@ mod git_bash_detection_tests {
     /// 所以仅在隔离的 CI 环境下运行才稳定。本地跑时可忽略。
     #[test]
     fn no_git_bash_returns_none() {
+        let _guard = env_lock();
         // 清掉环境变量，但常见路径仍可能命中 — 此测试在没装 Git Bash 的
         // CI 上有效。装了 Git Bash 的机器上会命中并跳过断言。
         std::env::remove_var("CLAW_GIT_BASH");
@@ -580,6 +600,7 @@ mod git_bash_detection_tests {
     /// 同样在装了 Git Bash 的开发机上会返回 `GitBash`，需跳过。
     #[test]
     fn detect_shell_type_returns_cmd_when_no_git_bash() {
+        let _guard = env_lock();
         std::env::set_var("CLAW_GIT_BASH", "");
         // 注意：detect_shell_type 走的是 shell_kind() 的 OnceLock 缓存。
         // 此测试若在其他用例之后跑，缓存可能已被填充，结果不稳定。

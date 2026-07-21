@@ -160,7 +160,7 @@ impl ProjectContext {
         current_date: impl Into<String>,
     ) -> std::io::Result<Self> {
         let cwd = cwd.into();
-        let instruction_files = discover_instruction_files(&cwd)?;
+        let instruction_files = discover_instruction_files(&cwd, None)?;
         Ok(Self {
             cwd,
             current_date: current_date.into(),
@@ -180,6 +180,26 @@ impl ProjectContext {
         context.git_diff = read_git_diff(&context.cwd);
         context.git_context = GitContext::detect(&context.cwd);
         Ok(context)
+    }
+
+    /// P11-2:测试专用的 discover 变体,接受 root_boundary 限制祖先链遍历范围。
+    /// 避免测试环境中的用户 CLAUDE.md 污染测试结果。
+    #[cfg(test)]
+    pub(crate) fn discover_with_boundary(
+        cwd: impl Into<PathBuf>,
+        current_date: impl Into<String>,
+        root_boundary: &Path,
+    ) -> std::io::Result<Self> {
+        let cwd = cwd.into();
+        let instruction_files = discover_instruction_files(&cwd, Some(root_boundary))?;
+        Ok(Self {
+            cwd,
+            current_date: current_date.into(),
+            git_status: None,
+            git_diff: None,
+            git_context: None,
+            instruction_files,
+        })
     }
 }
 
@@ -412,11 +432,19 @@ pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
     items.into_iter().map(|item| format!(" - {item}")).collect()
 }
 
-fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+fn discover_instruction_files(
+    cwd: &Path,
+    root_boundary: Option<&Path>,
+) -> std::io::Result<Vec<ContextFile>> {
     let mut directories = Vec::new();
     let mut cursor = Some(cwd);
     while let Some(dir) = cursor {
         directories.push(dir.to_path_buf());
+        // P11-2:root_boundary 用于测试隔离,避免祖先链遍历到用户目录
+        // (如 C:\Users\{user}\CLAUDE.md)污染测试结果。生产代码传 None。
+        if root_boundary.is_some_and(|boundary| dir == boundary) {
+            break;
+        }
         cursor = dir.parent();
     }
     directories.reverse();
@@ -894,7 +922,10 @@ mod tests {
         )
         .expect("write nested instructions");
 
-        let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
+        // P11-2:使用 discover_with_boundary 限制祖先链到 root,避免用户目录
+        // C:\Users\{user}\CLAUDE.md 污染测试结果。
+        let context = ProjectContext::discover_with_boundary(&nested, "2026-03-31", &root)
+            .expect("context should load");
         let contents = context
             .instruction_files
             .iter()
@@ -923,7 +954,9 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "same rules\n\n").expect("write root");
         fs::write(nested.join("CLAUDE.md"), "same rules\n").expect("write nested");
 
-        let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
+        // P11-2:使用 discover_with_boundary 限制祖先链到 root。
+        let context = ProjectContext::discover_with_boundary(&nested, "2026-03-31", &root)
+            .expect("context should load");
         assert_eq!(context.instruction_files.len(), 1);
         assert_eq!(
             normalize_instruction_content(&context.instruction_files[0].content),

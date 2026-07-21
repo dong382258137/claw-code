@@ -1660,6 +1660,15 @@ where
             .ok_or("missing 'query' field")?;
         let top_k = parsed.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
+        // P11-2:当 history_index 和 workspace_root 均未配置时,返回 not available 消息,
+        // 与其他工具(dispatch_subagent/check_subagent/recall_full)的行为一致。
+        if self.session.history_index.is_none() && self.workspace_root.is_none() {
+            return Ok(
+                "session_search is not available: no history index or workspace_root configured."
+                    .to_string(),
+            );
+        }
+
         // Primary: search FTS5 history index
         if let Some(history_index) = self.session.history_index.as_ref() {
             let hits = history_index.search(query, top_k)?;

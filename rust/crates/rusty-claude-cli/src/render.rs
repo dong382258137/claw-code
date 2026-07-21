@@ -885,7 +885,12 @@ fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
 }
 
 fn visible_width(input: &str) -> usize {
-    strip_ansi(input).chars().count()
+    // BUG fix: 之前用 `chars().count()` 按 Unicode code point 计数，
+    // 导致 CJK / emoji 等宽字符在表格列对齐时 padding 计算不足，边框错位。
+    // 改用 unicode-width 按实际显示列宽计算，与 TUI 其它路径
+    // (input_line.rs / status_bar.rs / output_view.rs / app.rs wrap) 保持一致。
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(strip_ansi(input).as_str())
 }
 
 fn strip_ansi(input: &str) -> String {

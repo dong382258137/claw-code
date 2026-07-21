@@ -619,10 +619,15 @@ mod tests {
 
         assert_eq!(task.prompt, packet.objective);
         assert_eq!(task.description.as_deref(), Some("runtime/task system"));
-        assert_eq!(task.task_packet, Some(packet.clone()));
+        // P3-5:validate_packet 会清空 legacy acceptance_tests,只保留 canonical
+        // acceptance_criteria。因此 task.task_packet 与原始 packet 不同,
+        // 需要比较 validated 后的版本。
+        let mut validated_packet = packet.clone();
+        validated_packet.acceptance_tests.clear();
+        assert_eq!(task.task_packet, Some(validated_packet.clone()));
 
         let fetched = registry.get(&task.task_id).expect("task should exist");
-        assert_eq!(fetched.task_packet, Some(packet));
+        assert_eq!(fetched.task_packet, Some(validated_packet));
     }
 
     #[test]

@@ -761,21 +761,13 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 }
 
 fn shell_command(command: &str) -> CommandWithStdin {
-    #[cfg(windows)]
-    let command_builder = {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
-        CommandWithStdin::new(command_builder)
-    };
-
-    #[cfg(not(windows))]
-    let command_builder = {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg("-lc").arg(command);
-        CommandWithStdin::new(command_builder)
-    };
-
-    command_builder
+    // P11-2:复用 bash::shell_launcher() 的 shell 探测逻辑(Git Bash 优先),
+    // 避免 hooks 与 execute_bash 行为不一致(之前硬编码 cmd /C 导致
+    // printf/sleep 等 Unix 命令在 Windows 上失败)。
+    let (program, flag) = crate::bash::shell_launcher();
+    let mut command_builder = Command::new(&program);
+    command_builder.arg(flag).arg(command);
+    CommandWithStdin::new(command_builder)
 }
 
 struct CommandWithStdin {
@@ -1130,8 +1122,12 @@ mod tests {
     }
 
     #[cfg(windows)]
+    // P11-2:shell_command 现在复用 shell_launcher()(Git Bash 优先),
+    // bash 能正确处理单引号,不需要做单引号→双引号替换。
+    // 之前的替换会破坏 JSON 结构(如 printf '%s' '{"key":"value"}' 中的
+    // JSON 内部双引号与替换后的外层双引号冲突)。
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        script.to_string()
     }
 
     #[cfg(not(windows))]

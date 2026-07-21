@@ -40,6 +40,10 @@ pub(crate) enum InputAction {
     ToggleHelp,
     /// User pressed Ctrl+C while a turn is running (interrupt, not exit).
     InterruptTurn,
+    /// User pressed Alt+Up to scroll the sidebar tool history up (earlier).
+    SidebarScrollUp,
+    /// User pressed Alt+Down to scroll the sidebar tool history down (newer).
+    SidebarScrollDown,
     /// No-op (key not handled).
     Ignore,
 }
