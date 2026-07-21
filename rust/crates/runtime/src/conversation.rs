@@ -2137,9 +2137,11 @@ where
     /// 2. 按 `context_window` 动态计算 (65% 比例,上限 800K) >
     /// 3. 回退到 `auto_compaction_input_tokens_threshold` (默认 100K)
     fn effective_compaction_threshold(&self) -> u32 {
-        // 环境变量覆盖始终优先
-        let env_threshold = auto_compaction_threshold_from_env();
-        if env_threshold != DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD {
+        // 环境变量覆盖始终优先。
+        // 修复:用 `Option::is_some()` 判定 env 是否被显式设置,
+        // 而非 `!= DEFAULT`。否则用户显式设置 env=100K(与默认相同)时,
+        // 会被误判为"未设置"并跳过 context_window 动态计算。
+        if let Some(env_threshold) = auto_compaction_threshold_from_env_opt() {
             return env_threshold;
         }
         // 按模型 context window 动态计算
@@ -2337,13 +2339,26 @@ where
 }
 
 /// Reads the automatic compaction threshold from the environment.
+///
+/// 返回 `DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD` 当环境变量未设置或解析失败时。
+/// 如需区分"env 未设置"和"env 设置为默认值",使用 [`auto_compaction_threshold_from_env_opt`]。
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
-    parse_auto_compaction_threshold(
-        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-            .ok()
-            .as_deref(),
-    )
+    auto_compaction_threshold_from_env_opt()
+        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+/// 读取环境变量中的 compaction 阈值,只在 env 被显式设置且有效时返回 `Some`。
+///
+/// 与 [`auto_compaction_threshold_from_env`] 的区别:
+/// - `from_env()` 返回 `u32`,无法区分"未设置"和"显式设置为默认值"
+/// - `from_env_opt()` 返回 `Option<u32>`,允许调用方准确判定 env 是否被显式设置
+///
+/// 这是 `effective_compaction_threshold` 优先级链的关键判定依据:
+/// 只有 env 被显式设置时才覆盖 context_window 动态计算,否则让 context_window 优先。
+#[must_use]
+pub fn auto_compaction_threshold_from_env_opt() -> Option<u32> {
+    parse_auto_compaction_threshold_opt(std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).ok().as_deref())
 }
 
 /// 根据模型 context window 动态计算 compaction 阈值。
@@ -2386,12 +2401,26 @@ pub fn tool_result_output_len(messages: &[ConversationMessage]) -> usize {
         .sum()
 }
 
+/// 旧版解析函数,保留供测试验证向后兼容性。
+/// 生产代码请使用 [`parse_auto_compaction_threshold_opt`]。
+#[cfg(test)]
 #[must_use]
 fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
+    parse_auto_compaction_threshold_opt(value)
+        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+/// 解析 compaction 阈值,只在输入有效(非零正整数)时返回 `Some`。
+///
+/// 返回 `None` 的情况:
+/// - `value == None`(env 未设置)
+/// - 解析失败(非数字)
+/// - 值为 0(无效阈值)
+#[must_use]
+fn parse_auto_compaction_threshold_opt(value: Option<&str>) -> Option<u32> {
     value
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
-        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
 fn build_assistant_message(
@@ -2550,8 +2579,8 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, compaction_threshold_for_context_window,
-        parse_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, ApiClient, ApiRequest,
+        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
         SESSION_SEARCH_TOOL_SPEC,
     };
@@ -3357,6 +3386,33 @@ mod tests {
         assert_eq!(
             parse_auto_compaction_threshold(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+    }
+
+    /// 验证 `_opt` 版本能区分"未设置"和"显式设置为默认值",
+    /// 这是 `effective_compaction_threshold` 优先级链修复的关键依据。
+    #[test]
+    fn parse_auto_compaction_threshold_opt_distinguishes_unset_from_default() {
+        // env 未设置 → None(让 context_window 动态计算生效)
+        assert_eq!(parse_auto_compaction_threshold_opt(None), None);
+        // 显式设置为默认值 → Some(让 env 覆盖 context_window)
+        assert_eq!(
+            parse_auto_compaction_threshold_opt(Some("100000")),
+            Some(100_000)
+        );
+        // 有效值 → Some
+        assert_eq!(parse_auto_compaction_threshold_opt(Some("4321")), Some(4321));
+        // 0 无效 → None(回退到 context_window 动态计算)
+        assert_eq!(parse_auto_compaction_threshold_opt(Some("0")), None);
+        // 非数字 → None
+        assert_eq!(
+            parse_auto_compaction_threshold_opt(Some("not-a-number")),
+            None
+        );
+        // 带空白的有效值 → Some
+        assert_eq!(
+            parse_auto_compaction_threshold_opt(Some("  50000  ")),
+            Some(50_000)
         );
     }
 
