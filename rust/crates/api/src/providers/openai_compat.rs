@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::http_client::build_http_client_or_default;
+use crate::http_client::{build_http_client_or_default, build_http_client_with_opts, ProxyConfig, TimeoutConfig};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -162,6 +162,29 @@ impl OpenAiCompatClient {
         self.max_retries = max_retries;
         self.initial_backoff = initial_backoff;
         self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Replace the underlying `reqwest::Client` with one built from the
+    /// provided [`TimeoutConfig`] (and the current process proxy config).
+    /// This is the config-file-driven counterpart to the env-var-based
+    /// defaults applied by `build_http_client_or_default`.
+    ///
+    /// Errors only occur when the proxy configuration is malformed; in that
+    /// case the previous client is retained and the error is logged to stderr
+    /// so the caller retains a working client.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: &TimeoutConfig) -> Self {
+        match build_http_client_with_opts(&ProxyConfig::from_env(), timeout) {
+            Ok(client) => self.http = client,
+            Err(error) => {
+                eprintln!(
+                    "warn: failed to apply custom TimeoutConfig (connect={:?}, request={:?}): {error}; keeping existing client",
+                    timeout.connect_timeout,
+                    timeout.request_timeout
+                );
+            }
+        }
         self
     }
 
@@ -1640,10 +1663,15 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Dura
     let header_value = headers.get(reqwest::header::RETRY_AFTER)?;
     let text = header_value.to_str().ok()?;
     let trimmed = text.trim();
-    let seconds: u64 = trimmed.parse().ok()?;
+    // Reject negative-looking values (e.g. "-1") before parsing — u64::parse
+    // would also reject them, but checking explicitly makes the intent obvious
+    // and survives any future relaxation of the numeric type.
     if trimmed.starts_with('-') {
         return None;
     }
+    // Clamp absurdly large values to one hour so a misbehaving gateway
+    // cannot stall the retry loop indefinitely.
+    let seconds: u64 = trimmed.parse().ok()?;
     Some(Duration::from_secs(seconds.min(3_600)))
 }
 

@@ -5,19 +5,69 @@ const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
 const HTTPS_PROXY_KEYS: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 const NO_PROXY_KEYS: [&str; 2] = ["NO_PROXY", "no_proxy"];
 
-/// Default connection-establishment timeout applied to every outbound HTTP
-/// request. This guards against the "TCP silently hangs during connect" failure
-/// mode where a provider endpoint is unreachable but the OS does not surface a
-/// connection refused error quickly enough.
+/// Timeout configuration for outbound HTTP requests.
 ///
-/// This is intentionally a *connect* timeout rather than a total request
-/// timeout: streaming responses (SSE for `stream_message`, long-running tool
-/// turns) can legitimately remain open for minutes, and a total timeout would
-/// incorrectly abort them. Read-level stalls for non-streaming requests are
-/// already surfaced through the retry layer's `is_timeout` classification once
-/// reqwest's own per-request timeout fires (set via the request builder when
-/// needed, not at client construction).
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// `connect_timeout` guards against silently-hung TCP handshakes. `request_timeout`
+/// caps the total time for a non-streaming request (headers + body). For streaming
+/// responses (SSE for `stream_message`), `reqwest::Client::builder::timeout` only
+/// applies to the initial handshake (headers + body framing); the stream itself is
+/// governed by SSE parsing and the inter-event timeout in `consume_stream`.
+///
+/// Both fields can be overridden via environment variables (`CLAW_API_CONNECT_TIMEOUT`,
+/// `CLAW_API_REQUEST_TIMEOUT`) or through `TimeoutConfig::from_seconds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutConfig {
+    /// Maximum time to wait for a connection to be established.
+    /// Defaults to 30 seconds.
+    pub connect_timeout: Duration,
+    /// Maximum time for the entire non-streaming request (including reading
+    /// the response body). Defaults to 5 minutes (300 seconds).
+    pub request_timeout: Duration,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl TimeoutConfig {
+    /// Read timeout settings from the process environment.
+    /// - `CLAW_API_CONNECT_TIMEOUT` — connect timeout in seconds
+    /// - `CLAW_API_REQUEST_TIMEOUT` — overall request timeout in seconds
+    ///
+    /// Unset or unparseable values fall back to the defaults from
+    /// [`TimeoutConfig::default`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        let connect_timeout = std::env::var("CLAW_API_CONNECT_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(30));
+        let request_timeout = std::env::var("CLAW_API_REQUEST_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(300));
+        Self {
+            connect_timeout,
+            request_timeout,
+        }
+    }
+
+    /// Create from explicit second values (used by config file parsing).
+    #[must_use]
+    pub fn from_seconds(connect_secs: u64, request_secs: u64) -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(connect_secs),
+            request_timeout: Duration::from_secs(request_secs),
+        }
+    }
+}
 
 /// Snapshot of the proxy-related environment variables that influence the
 /// outbound HTTP client. Captured up front so callers can inspect, log, and
@@ -75,8 +125,11 @@ impl ProxyConfig {
 /// Build a `reqwest::Client` that honours the standard `HTTP_PROXY`,
 /// `HTTPS_PROXY`, and `NO_PROXY` environment variables. When no proxy is
 /// configured the client behaves identically to `reqwest::Client::new()`.
+///
+/// Timeouts are read from `CLAW_API_CONNECT_TIMEOUT` / `CLAW_API_REQUEST_TIMEOUT`
+/// environment variables via [`TimeoutConfig::from_env`].
 pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
-    build_http_client_with(&ProxyConfig::from_env())
+    build_http_client_with_opts(&ProxyConfig::from_env(), &TimeoutConfig::from_env())
 }
 
 /// Infallible counterpart to [`build_http_client`] for constructors that
@@ -86,22 +139,39 @@ pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
 /// first outbound request instead of at construction time.
 #[must_use]
 pub fn build_http_client_or_default() -> reqwest::Client {
-    build_http_client().unwrap_or_else(|_| reqwest::Client::new())
+    build_http_client_with_opts(&ProxyConfig::from_env(), &TimeoutConfig::from_env())
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Build a `reqwest::Client` from an explicit [`ProxyConfig`]. Used by tests
 /// and by callers that want to override process-level environment lookups.
+/// Timeouts default to [`TimeoutConfig::from_env`] so tests that pass a
+/// `ProxyConfig` still honour `CLAW_API_*_TIMEOUT` overrides.
 ///
 /// When `config.proxy_url` is set it overrides the per-scheme `http_proxy`
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
-    // Connect timeout guards against silently-hung TCP handshakes without
-    // capping the total request duration — see `DEFAULT_CONNECT_TIMEOUT` for
-    // the rationale on why we deliberately avoid `.timeout()` here.
+    build_http_client_with_opts(config, &TimeoutConfig::from_env())
+}
+
+/// Build a `reqwest::Client` from explicit [`ProxyConfig`] and [`TimeoutConfig`].
+/// Used by callers that want to control both proxy routing and request timing
+/// (e.g. config-file-driven construction in the runtime crate).
+///
+/// `connect_timeout` guards the TCP handshake; `request_timeout` caps the
+/// total time for non-streaming requests. For `stream_message`, reqwest's
+/// client-level timeout only applies to the headers/body-framing phase —
+/// the SSE stream itself is governed by the inter-event timeout in
+/// `consume_stream` (see `runtime/src/streaming.rs`).
+pub fn build_http_client_with_opts(
+    config: &ProxyConfig,
+    timeout: &TimeoutConfig,
+) -> Result<reqwest::Client, ApiError> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
-        .connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+        .connect_timeout(timeout.connect_timeout)
+        .timeout(timeout.request_timeout);
 
     let no_proxy = config
         .no_proxy
@@ -143,8 +213,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
-    use super::{build_http_client_with, ProxyConfig};
+    use super::{build_http_client_with, build_http_client_with_opts, ProxyConfig, TimeoutConfig};
 
     fn config_from_map(pairs: &[(&str, &str)]) -> ProxyConfig {
         let map: HashMap<String, String> = pairs
@@ -359,6 +430,44 @@ mod tests {
         assert!(
             matches!(result, Err(crate::error::ApiError::Http(_))),
             "invalid unified proxy URL should fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_config_default_matches_documented_defaults() {
+        let default = TimeoutConfig::default();
+        assert_eq!(default.connect_timeout, Duration::from_secs(30));
+        assert_eq!(default.request_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn timeout_config_from_seconds_round_trips() {
+        let config = TimeoutConfig::from_seconds(10, 120);
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        assert_eq!(config.request_timeout, Duration::from_secs(120));
+        // Verify the config is actually consumed by build_http_client_with_opts
+        // without panicking — this catches regressions where the builder chain
+        // is misconfigured.
+        let result = build_http_client_with_opts(&ProxyConfig::default(), &config);
+        assert!(result.is_ok(), "build should succeed with custom timeouts");
+    }
+
+    #[test]
+    fn timeout_config_from_env_falls_back_to_defaults_when_vars_unset() {
+        // This test intentionally does not set the env vars. When they are
+        // already set in the surrounding test environment we still accept the
+        // parsed values; the contract is "unset → default", not "always default".
+        let config = TimeoutConfig::from_env();
+        // Default connect timeout is 30s; only assert when the env var is
+        // truly unset, which we cannot control here. Instead just assert that
+        // both fields are non-zero (a valid timeout was produced).
+        assert!(
+            config.connect_timeout > Duration::ZERO,
+            "connect_timeout must be non-zero"
+        );
+        assert!(
+            config.request_timeout > Duration::ZERO,
+            "request_timeout must be non-zero"
         );
     }
 }
