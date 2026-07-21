@@ -19,7 +19,8 @@ use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace_with_roots, strip_verbatim_prefix,
+    read_file_in_workspace_with_roots, replace_lines_in_workspace_with_roots,
+    run_cargo_check_for_file, strip_verbatim_prefix,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
@@ -545,6 +546,22 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "replace_all": { "type": "boolean" }
                 },
                 "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "replace_lines",
+            description: "Replace a range of lines in a workspace file by 1-based line numbers.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "start_line": { "type": "integer", "minimum": 1 },
+                    "end_line": { "type": "integer", "minimum": 1 },
+                    "new_content": { "type": "string" }
+                },
+                "required": ["path", "start_line", "end_line", "new_content"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -1336,6 +1353,13 @@ fn execute_tool_with_enforcer_and_roots(
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_edit_file(file_input, extra_roots)
         }
+        "replace_lines" => {
+            let replace_input: ReplaceLinesInput = from_value(input)?;
+            let required_mode =
+                classify_file_path_permission_with_roots(&replace_input.path, true, extra_roots);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_replace_lines(replace_input, extra_roots)
+        }
         "glob_search" => {
             let glob_input: GlobSearchInputValue = from_value(input)?;
             let required_mode = classify_glob_permission_with_roots(&glob_input, extra_roots);
@@ -1385,6 +1409,12 @@ fn execute_tool_with_enforcer(
             let required_mode = classify_file_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_edit_file(file_input, None)
+        }
+        "replace_lines" => {
+            let replace_input: ReplaceLinesInput = from_value(input)?;
+            let required_mode = classify_file_path_permission(&replace_input.path, true);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            run_replace_lines(replace_input, None)
         }
         "glob_search" => {
             let glob_input: GlobSearchInputValue = from_value(input)?;
@@ -2477,27 +2507,59 @@ fn run_write_file(
 ) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let extra = extra_roots.unwrap_or(&[]);
-    to_pretty_json(
-        write_file_in_workspace_with_roots(&input.path, &input.content, &workspace, extra)
-            .map_err(io_to_string)?,
-    )
+    let result = write_file_in_workspace_with_roots(&input.path, &input.content, &workspace, extra)
+        .map_err(io_to_string)?;
+    let mut output = to_pretty_json(&result)?;
+    if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
+        output.push_str("\n\n--- cargo check ---\n");
+        output.push_str(&check_output);
+    }
+    Ok(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput, extra_roots: Option<&[PathBuf]>) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let extra = extra_roots.unwrap_or(&[]);
-    to_pretty_json(
-        edit_file_in_workspace_with_roots(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-            &workspace,
-            extra,
-        )
-        .map_err(io_to_string)?,
+    let result = edit_file_in_workspace_with_roots(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        input.replace_all.unwrap_or(false),
+        &workspace,
+        extra,
     )
+    .map_err(io_to_string)?;
+    let mut output = to_pretty_json(&result)?;
+    if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
+        output.push_str("\n\n--- cargo check ---\n");
+        output.push_str(&check_output);
+    }
+    Ok(output)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_replace_lines(
+    input: ReplaceLinesInput,
+    extra_roots: Option<&[PathBuf]>,
+) -> Result<String, String> {
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    let extra = extra_roots.unwrap_or(&[]);
+    let result = replace_lines_in_workspace_with_roots(
+        &input.path,
+        input.start_line,
+        input.end_line,
+        &input.new_content,
+        &workspace,
+        extra,
+    )
+    .map_err(io_to_string)?;
+    let mut output = to_pretty_json(&result)?;
+    if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
+        output.push_str("\n\n--- cargo check ---\n");
+        output.push_str(&check_output);
+    }
+    Ok(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2846,6 +2908,14 @@ struct EditFileInput {
     old_string: String,
     new_string: String,
     replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplaceLinesInput {
+    path: String,
+    start_line: usize,
+    end_line: usize,
+    new_content: String,
 }
 
 #[derive(Debug, Deserialize)]

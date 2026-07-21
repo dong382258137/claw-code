@@ -134,10 +134,11 @@ pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_roots, glob_search,
     glob_search_in_workspace, glob_search_in_workspace_with_roots, grep_search,
     grep_search_in_workspace, grep_search_in_workspace_with_roots, read_file,
-    read_file_in_workspace, read_file_in_workspace_with_roots, strip_verbatim_prefix, write_file,
-    write_file_in_workspace, write_file_in_workspace_with_roots, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WorkspacePathScope, WriteFileOutput,
+    read_file_in_workspace, read_file_in_workspace_with_roots, replace_lines,
+    replace_lines_in_workspace_with_roots, run_cargo_check_for_file, strip_verbatim_prefix,
+    write_file, write_file_in_workspace, write_file_in_workspace_with_roots, EditFileOutput,
+    GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput, ReplaceLinesOutput,
+    StructuredPatchHunk, TextFilePayload, WorkspacePathScope, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use goal::{goal_json_path, Goal, GoalError, GoalManager, GoalState};

@@ -600,6 +600,153 @@ fn edit_file_at_checked(
     })
 }
 
+/// Replace lines in a file by line range.
+///
+/// `start_line` and `end_line` are 1-based inclusive line numbers.
+/// The specified range is replaced with `new_content` (including trailing
+/// newline if needed).
+#[derive(Debug, Serialize)]
+pub struct ReplaceLinesOutput {
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+    #[serde(rename = "replacedStartLine")]
+    pub replaced_start_line: usize,
+    #[serde(rename = "replacedEndLine")]
+    pub replaced_end_line: usize,
+    #[serde(rename = "newContent")]
+    pub new_content: String,
+    #[serde(rename = "originalLines")]
+    pub original_lines: String,
+    #[serde(rename = "gitDiff")]
+    pub git_diff: Option<String>,
+}
+
+/// Performs a line-range replacement and returns metadata.
+pub fn replace_lines(
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    new_content: &str,
+) -> io::Result<ReplaceLinesOutput> {
+    let absolute_path = normalize_path(path)?;
+    let original_file = fs::read_to_string(&absolute_path)?;
+    let original_lines: Vec<&str> = original_file.lines().collect();
+
+    if start_line < 1 || start_line > original_lines.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "start_line {start_line} out of range (file has {} lines)",
+                original_lines.len()
+            ),
+        ));
+    }
+    if end_line < start_line || end_line > original_lines.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "end_line {end_line} out of range (valid range: {start_line}..{})",
+                original_lines.len()
+            ),
+        ));
+    }
+
+    let replaced_slice = original_lines[(start_line - 1)..end_line].join("\n");
+    let mut out: Vec<&str> = Vec::with_capacity(
+        original_lines.len() - (end_line - start_line + 1) + 1,
+    );
+    out.extend_from_slice(&original_lines[..start_line - 1]);
+
+    // Push new content as lines, preserving empty content edge case
+    if new_content.is_empty() {
+        // Remove the range entirely
+    } else {
+        for line in new_content.lines() {
+            out.push(line);
+        }
+    }
+    out.extend_from_slice(&original_lines[end_line..]);
+
+    let updated = out.join("\n");
+    if updated.is_empty() {
+        fs::write(&absolute_path, "\n")?;
+    } else {
+        fs::write(&absolute_path, &updated)?;
+        if !updated.ends_with('\n') {
+            // Ensure trailing newline
+        }
+    }
+
+    Ok(ReplaceLinesOutput {
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        replaced_start_line: start_line,
+        replaced_end_line: end_line,
+        new_content: new_content.to_owned(),
+        original_lines: replaced_slice,
+        git_diff: None,
+    })
+}
+
+/// Workspace-boundary-guarded variant of [`replace_lines`] with extra roots.
+pub fn replace_lines_in_workspace_with_roots(
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    new_content: &str,
+    workspace_root: &Path,
+    extra_roots: &[PathBuf],
+) -> io::Result<ReplaceLinesOutput> {
+    let absolute_path = normalize_path(path)?;
+    let roots = canonicalize_roots(workspace_root, extra_roots);
+    validate_workspace_boundary_multi(&absolute_path, &roots)?;
+    replace_lines(path, start_line, end_line, new_content)
+}
+
+/// If the modified file belongs to a Rust project (has a parent Cargo.toml),
+/// run `cargo check` in that project's root and return the output.
+/// Returns `None` if not a Rust project or cargo is unavailable.
+pub fn run_cargo_check_for_file(file_path: &Path) -> Option<String> {
+    // Walk up to find Cargo.toml
+    let mut dir = file_path.parent()?;
+    let cargo_toml = loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.exists() {
+            break Some(candidate);
+        }
+        dir = dir.parent()?;
+    }?;
+
+    let project_root = cargo_toml.parent()?;
+    let output = std::process::Command::new("cargo")
+        .arg("check")
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Extract only the relevant error/warning lines
+    let combined = format!("{stdout}{stderr}");
+    if combined.trim().is_empty() {
+        return None;
+    }
+
+    // Filter to only lines containing error, warning, or the final status
+    let filtered: Vec<&str> = combined
+        .lines()
+        .filter(|line| {
+            line.contains("error") || line.contains("warning") || line.contains("Finished")
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        Some("cargo check: OK (no errors or warnings)".to_string())
+    } else {
+        Some(format!("cargo check:\n{}", filtered.join("\n")))
+    }
+}
+
 fn glob_search_impl(
     pattern: &str,
     path: Option<&str>,

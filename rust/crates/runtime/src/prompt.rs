@@ -774,6 +774,8 @@ fn get_simple_doing_tasks_section() -> String {
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
+        "On Windows, all file content read/write/replace operations MUST use Python with `encoding='utf-8'` to avoid PowerShell GBK corruption of non-ASCII characters.".to_string(),
+        "Always check `cwd` at the start of a turn; use absolute paths from workspace root when reading or writing files to avoid boundary-violation errors.".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())

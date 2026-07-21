@@ -529,6 +529,7 @@ fn run_event_loop(
     let mut pending_paste_last_line: Option<String> = None;
     let mut conhost_paste_intercepted: bool = false;
     let mut pending_at_path: Option<String> = None;
+    let mut conhost_suppress_input: bool = false;
 
     // AskUserQuestion 协作状态：
     // - `Some` 表示 worker 线程正在等待用户回答（通过 AskUserQuestion 工具），
@@ -854,6 +855,24 @@ fn run_event_loop(
         } else {
             Duration::from_millis(200)
         };
+        // conhost drain phase: after all Enter events consumed, wait for
+        // remaining key events (last line chars) to be delivered.
+        // Use short poll timeout to detect when input stream goes idle.
+        if conhost_suppress_input && pending_paste_lines.is_empty() {
+            if event::poll(Duration::from_millis(50))? {
+                // Still receiving events - consume and discard
+                let _ = event::read()?;
+                continue;
+            }
+            // Input stream idle - conhost injection complete
+            paste_diag_log("  conhost drain phase: poll timeout, injection complete");
+            conhost_suppress_input = false;
+            if let Some(at_path) = pending_at_path.take() {
+                paste_diag_log(&format!("  drain done: insert @path={:?}", at_path));
+                input.insert_paste(&at_path);
+            }
+        }
+
         if event::poll(poll_timeout)? {
             let ev = event::read()?;
             // 诊断日志：记录所有收到的 Event 类型（特别是 KeyEvent 和 Paste），
@@ -895,8 +914,45 @@ fn run_event_loop(
                 }
                 _ => {}
             }
+            // conhost_suppress_input: suppress non-Enter key events to
+            // prevent clipboard characters from appearing in InputLine
+            // during conhost multi-line paste.
+            if conhost_suppress_input {
+                if let Event::Key(key) = &ev {
+                    if !matches!(key.code, KeyCode::Enter) || key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                }
+            }
+
             if let Event::Key(key) = ev {
                 let action = route_key(&mut input, key, help_visible);
+
+                // 方案 C drain phase 修复：
+                // conhost_suppress_input 抑制字符输入后 buffer 始终为空，
+                // Enter 被 handle_key 返回 Continue 而非 Submit，
+                // 导致 pending_paste_lines 永远不消费、@路径永远不填充。
+                // 在 drain 模式下对空 buffer 的 Enter 手动消费 pending_paste_lines。
+                if matches!(action, InputAction::Continue)
+                    && conhost_suppress_input
+                    && matches!(key.code, KeyCode::Enter)
+                    && key.kind == KeyEventKind::Press
+                {
+                    if !pending_paste_lines.is_empty() {
+                        paste_diag_log(&format!(
+                            "  conhost drain Continue→Enter: 手动消费 pending[0]={:?}, 剩余 {} 行",
+                            pending_paste_lines[0],
+                            pending_paste_lines.len() - 1
+                        ));
+                        pending_paste_lines.remove(0);
+                        if pending_paste_lines.is_empty() {
+                            conhost_paste_intercepted = false;
+                            pending_paste_last_line = None;
+                            paste_diag_log("  conhost drain Continue→Enter: pending 清空，conhost_paste_intercepted=false，等待 drain phase 填充 @路径");
+                        }
+                    }
+                    continue 'main_loop;
+                }
 
                 // conhost 多行粘贴最后一行残留清理：
                 //
@@ -1136,19 +1192,14 @@ fn run_event_loop(
                             // conhost_paste_intercepted 只有在 pending_paste_lines 空时才重置。
                             if pending_paste_lines.is_empty() && conhost_paste_intercepted {
                                 conhost_paste_intercepted = false;
+                                // Keep conhost_suppress_input = true
+                                // (drain phase will handle @path insertion)
                                 // BUG-1 修复：conhost 模式通过"最后一行带 \n"路径结束时，
                                 // pending_paste_last_line 仍保留旧值，后续用户输入匹配旧值
                                 // 会被误清空 buffer。在此同步清理。
                                 pending_paste_last_line = None;
-                                paste_diag_log("  pending_paste_lines 清空，重置 conhost_paste_intercepted=false");
-                                // conhost 注入完毕，现在把 @路径填充到 buffer
-                                if let Some(at_path) = pending_at_path.take() {
-                                    paste_diag_log(&format!(
-                                        "  conhost 注入完毕，填充 @路径到 buffer={:?}",
-                                        at_path
-                                    ));
-                                    input.insert_paste(&at_path);
-                                }
+                                paste_diag_log("  pending_paste_lines 清空，重置 conhost_paste_intercepted=false, keep suppress_input=true");
+                                // @路径延后到 drain phase 填充
                             }
                         } else if let Some(ask) = pending_ask.take() {
                             // AskUserQuestion 协作路径：worker 线程正在等待用户回答。
@@ -1271,6 +1322,7 @@ fn run_event_loop(
                                                 // 不立即 insert_paste，保存到 pending_at_path
                                                 // 等 pending_paste_lines 为空后再填充
                                                 pending_at_path = Some(at_path.clone());
+                                                conhost_suppress_input = true;
                                                 // 记录最后一行用于清理残留
                                                 pending_paste_last_line = Some(
                                                     pending_paste_lines.last().unwrap().clone(),
