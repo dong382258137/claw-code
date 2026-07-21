@@ -117,7 +117,9 @@ pub use config::{
     McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+    RuntimePluginConfig, ScopedMcpServerConfig, WizardSettings, CLAW_SETTINGS_SCHEMA_NAME,
+    bootstrapped_sentinel_path, is_bootstrapped, load_wizard_settings, mark_bootstrapped,
+    save_wizard_settings,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

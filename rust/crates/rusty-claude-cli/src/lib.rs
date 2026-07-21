@@ -412,7 +412,25 @@ pub fn run_tui_repl_entry(
     additional_workspace_roots: Vec<PathBuf>,
     output_verbosity: OutputVerbosity,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    // ---- First-run wizard pre-check ----------------------------------------
+    //
+    // On first launch, present the configuration wizard. Once the user
+    // completes it, create a sentinel file so subsequent runs skip the wizard.
+    // If the user quits the wizard, propagate the error to exit cleanly.
+    if !runtime::is_bootstrapped() {
+        // If settings.json has wizard config but we're missing the sentinel
+        // (e.g. config was copied from another machine), inject env vars and
+        // create the sentinel without showing the wizard again.
+        if let Some(saved) = runtime::load_wizard_settings() {
+            inject_wizard_env_vars(&saved);
+            let _ = runtime::mark_bootstrapped();
+        } else {
+            tui::wizard::run_first_run_wizard()?;
+        }
+    }
+    // ---- End wizard pre-check -------------------------------------------
+
+        enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let cli = build_live_cli_for_repl(
         model,
@@ -424,6 +442,29 @@ pub fn run_tui_repl_entry(
     )?;
     tui::app::run_tui_repl(cli)
 }
+
+
+/// Inject wizard-saved credentials as environment variables for the current
+/// process so that downstream auth resolution picks them up transparently.
+#[cfg(feature = "full-tui")]
+fn inject_wizard_env_vars(settings: &runtime::WizardSettings) {
+    match settings.provider.as_str() {
+        "anthropic" => {
+            std::env::set_var("ANTHROPIC_API_KEY", &settings.api_key);
+        }
+        "openai" => {
+            std::env::set_var("OPENAI_API_KEY", &settings.api_key);
+        }
+        "xai" => {
+            std::env::set_var("XAI_API_KEY", &settings.api_key);
+        }
+        "dashscope" => {
+            std::env::set_var("DASHSCOPE_API_KEY", &settings.api_key);
+        }
+        _ => {}
+    }
+}
+
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();

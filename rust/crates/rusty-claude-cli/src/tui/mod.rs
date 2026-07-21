@@ -20,5 +20,7 @@ pub(crate) mod slash_menu;
 pub(crate) mod status_bar;
 pub(crate) mod tool_card;
 
+pub(crate) mod wizard;
+
 #[cfg(test)]
 mod tests;

@@ -1389,6 +1389,87 @@ fn push_unique(target: &mut Vec<String>, value: String) {
     }
 }
 
+// ---- First-run wizard helpers --------------------------------------------
+
+/// Sentinel file created when the user completes the first-run wizard.
+const BOOTSTRAPPED_FILE: &str = ".bootstrapped";
+
+/// Path to the bootstrapped sentinel file inside the config home.
+#[must_use]
+pub fn bootstrapped_sentinel_path() -> PathBuf {
+    default_config_home().join(BOOTSTRAPPED_FILE)
+}
+
+/// Returns `true` if the first-run wizard has already been completed.
+#[must_use]
+pub fn is_bootstrapped() -> bool {
+    bootstrapped_sentinel_path().is_file()
+}
+
+/// Create the sentinel file so the wizard won't appear on next startup.
+///
+/// # Errors
+/// Returns an error when the parent directory cannot be created or the
+/// sentinel file cannot be written.
+pub fn mark_bootstrapped() -> std::io::Result<()> {
+    let path = bootstrapped_sentinel_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, "v1\n")
+}
+
+/// Settings stored by the first-run wizard into `settings.json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WizardSettings {
+    pub provider: String,
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+}
+
+/// Key used to store wizard settings inside the merged `settings.json`.
+const WIZARD_SETTINGS_KEY: &str = "_wizard";
+
+/// Save first-run wizard settings into `~/.claw/settings.json`.
+///
+/// Existing content in the file is preserved; only the `_wizard` key is
+/// inserted or replaced.  If the file doesn't exist it is created.
+///
+/// # Errors
+/// Returns an error when the config directory cannot be created or the file
+/// cannot be written.
+pub fn save_wizard_settings(settings: &WizardSettings) -> std::io::Result<()> {
+    let config_home = default_config_home();
+    fs::create_dir_all(&config_home)?;
+    let settings_path = config_home.join("settings.json");
+
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        match fs::read_to_string(&settings_path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => serde_json::Map::new(),
+        };
+
+    let wizard_value = serde_json::to_value(settings).unwrap_or_default();
+    map.insert(WIZARD_SETTINGS_KEY.to_string(), wizard_value);
+
+    let updated = serde_json::to_string_pretty(&map).map_err(std::io::Error::from)?;
+    fs::write(&settings_path, format!("{updated}\n"))
+}
+
+/// Load wizard settings from `~/.claw/settings.json`.
+///
+/// Returns `None` when the file is missing, unreadable, or doesn't contain
+/// a valid `_wizard` key.
+#[must_use]
+pub fn load_wizard_settings() -> Option<WizardSettings> {
+    let config_home = default_config_home();
+    let settings_path = config_home.join("settings.json");
+    let text = fs::read_to_string(&settings_path).ok()?;
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
+    let wizard_value = map.get(WIZARD_SETTINGS_KEY)?;
+    serde_json::from_value(wizard_value.clone()).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
