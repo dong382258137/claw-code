@@ -975,15 +975,17 @@ where
                     if let Some(memory_ctx) = &self.pending_semantic_context {
                         asm.add_auto(ContextSource::Memory, memory_ctx.clone());
                     }
-                    if let Some(remediation) = &self.pending_remediation {
-                        // v2.0:注入上一轮 verify 失败的 remediation。
-                        asm.add_auto(ContextSource::Goal, remediation.clone());
-                    }
                     if let Some(plan) = &self.active_plan {
                         let rendered = plan.render_for_prompt();
                         if !rendered.is_empty() {
                             asm.add_auto(ContextSource::Goal, rendered);
                         }
+                    }
+                    if let Some(remediation) = &self.pending_remediation {
+                        // v2.0:注入上一轮 verify 失败的 remediation。
+                        // 顺序:放在 plan 之后(变动区最末尾),
+                        // 让最易变的内容放最后,最大化前缀缓存命中率。
+                        asm.add_auto(ContextSource::Goal, remediation.clone());
                     }
                     let volatile = asm.assemble().volatile_content();
                     if !volatile.is_empty() {
@@ -994,15 +996,17 @@ where
                     if let Some(memory_ctx) = &self.pending_semantic_context {
                         system_split.dynamic_sections.push(memory_ctx.clone());
                     }
-                    if let Some(remediation) = &self.pending_remediation {
-                        // v2.0:注入上一轮 verify 失败的 remediation。
-                        system_split.dynamic_sections.push(remediation.clone());
-                    }
                     if let Some(plan) = &self.active_plan {
                         let rendered = plan.render_for_prompt();
                         if !rendered.is_empty() {
                             system_split.dynamic_sections.push(rendered);
                         }
+                    }
+                    if let Some(remediation) = &self.pending_remediation {
+                        // v2.0:注入上一轮 verify 失败的 remediation。
+                        // 顺序:放在 plan 之后(变动区最末尾),
+                        // 让最易变的内容放最后,最大化前缀缓存命中率。
+                        system_split.dynamic_sections.push(remediation.clone());
                     }
                 }
                 ApiRequest {
