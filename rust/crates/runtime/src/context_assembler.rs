@@ -352,6 +352,32 @@ impl TokenBudget {
             ]),
         }
     }
+
+    /// 根据模型 context window 缩放预算。
+    ///
+    /// - `<= 200K`: 返回 `default_claude()`(120K 全局)
+    /// - `> 200K`:  按比例缩放,上限 `default_claude()` × 4
+    pub fn for_context_window(context_window: u32) -> Self {
+        if context_window <= 200_000 {
+            return Self::default_claude();
+        }
+        // 按比例缩放,最小保持 default_claude
+        let scale = ((context_window as f64) / 200_000.0).min(4.0);
+        let max_total = (120_000.0 * scale) as usize;
+        let scale_factor = |base: usize| -> usize { ((base as f64) * scale) as usize };
+        Self {
+            max_total,
+            per_source: HashMap::from([
+                (ContextSource::System, scale_factor(8_000)),
+                (ContextSource::Tools, scale_factor(16_000)),
+                (ContextSource::Memory, scale_factor(6_000)),
+                (ContextSource::Goal, scale_factor(4_000)),
+                (ContextSource::GitContext, scale_factor(12_000)),
+                (ContextSource::History, scale_factor(50_000)),
+                (ContextSource::User, scale_factor(24_000)),
+            ]),
+        }
+    }
 }
 
 impl Default for TokenBudget {
@@ -1038,5 +1064,31 @@ mod tests {
         let json = serde_json::to_string_pretty(&budget).unwrap();
         let deserialized: TokenBudget = serde_json::from_str(&json).unwrap();
         assert_eq!(budget.max_total, deserialized.max_total);
+    }
+
+    #[test]
+    fn test_budget_for_context_window_default_for_200k() {
+        let budget = TokenBudget::for_context_window(200_000);
+        assert_eq!(budget.max_total, 120_000);
+    }
+
+    #[test]
+    fn test_budget_for_context_window_scales_for_1m() {
+        // 1M context → scale = 5.0, capped at 4.0
+        let budget = TokenBudget::for_context_window(1_000_000);
+        // max_total = 120_000 × 4 = 480_000
+        assert_eq!(budget.max_total, 480_000);
+        // Memory: 6_000 × 4 = 24_000
+        assert_eq!(budget.limit_for(ContextSource::Memory), Some(24_000));
+        // History: 50_000 × 4 = 200_000
+        assert_eq!(budget.limit_for(ContextSource::History), Some(200_000));
+    }
+
+    #[test]
+    fn test_budget_for_context_window_scales_for_400k() {
+        // 400K context → scale = 2.0
+        let budget = TokenBudget::for_context_window(400_000);
+        assert_eq!(budget.max_total, 240_000);
+        assert_eq!(budget.limit_for(ContextSource::Memory), Some(12_000));
     }
 }

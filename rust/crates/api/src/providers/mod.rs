@@ -640,6 +640,22 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
+        // DeepSeek V4 系列 — 1M 上下文窗口
+        // Source: https://api-docs.deepseek.com/
+        "deepseek-v4-pro" | "deepseek-v4-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 1_000_000,
+        }),
+        // DeepSeek V3 (deepseek-chat) — 64K 上下文窗口
+        "deepseek-chat" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 64_000,
+        }),
+        // DeepSeek R1 (deepseek-reasoner) — 128K 上下文窗口
+        "deepseek-reasoner" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 128_000,
+        }),
         _ => None,
     }
 }
@@ -860,6 +876,83 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn returns_context_window_metadata_for_deepseek_models() {
+        // deepseek-v4-pro — 1M context
+        let v4pro = model_token_limit("deepseek-v4-pro")
+            .expect("deepseek-v4-pro should have token limit metadata");
+        assert_eq!(v4pro.max_output_tokens, 32_000);
+        assert_eq!(v4pro.context_window_tokens, 1_000_000);
+
+        // deepseek-v4-flash — 1M context
+        let v4flash = model_token_limit("deepseek-v4-flash")
+            .expect("deepseek-v4-flash should have token limit metadata");
+        assert_eq!(v4flash.max_output_tokens, 32_000);
+        assert_eq!(v4flash.context_window_tokens, 1_000_000);
+
+        // deepseek-chat (V3) — 64K context
+        let v3 = model_token_limit("deepseek-chat")
+            .expect("deepseek-chat should have token limit metadata");
+        assert_eq!(v3.max_output_tokens, 8_192);
+        assert_eq!(v3.context_window_tokens, 64_000);
+
+        // deepseek-reasoner (R1) — 128K context
+        let r1 = model_token_limit("deepseek-reasoner")
+            .expect("deepseek-reasoner should have token limit metadata");
+        assert_eq!(r1.max_output_tokens, 8_192);
+        assert_eq!(r1.context_window_tokens, 128_000);
+    }
+
+    #[test]
+    fn preflight_blocks_oversized_requests_for_deepseek_v4_models() {
+        // 5M chars → ~1.25M estimated tokens → exceeds 1M context window
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 32_000,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "x".repeat(5_000_000), // ~1.25M estimated tokens
+                }],
+            }],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            ..Default::default()
+        };
+
+        let error = preflight_message_request(&request)
+            .expect_err("oversized request should be rejected for deepseek-v4 models");
+
+        match error {
+            ApiError::ContextWindowExceeded {
+                model,
+                context_window_tokens,
+                ..
+            } => {
+                assert_eq!(model, "deepseek-v4-pro");
+                assert_eq!(context_window_tokens, 1_000_000);
+            }
+            other => panic!("expected context-window preflight failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deepseek_v4_with_openai_prefix_resolves_context_window() {
+        // openai/deepseek-v4-pro 和 deepseek/deepseek-v4-pro 前缀应都能解析
+        for prefixed in &[
+            "openai/deepseek-v4-pro",
+            "deepseek/deepseek-v4-pro",
+        ] {
+            let limit = model_token_limit(prefixed)
+                .unwrap_or_else(|| panic!("{prefixed} should resolve to deepseek-v4-pro limits"));
+            assert_eq!(
+                limit.context_window_tokens, 1_000_000,
+                "{prefixed} should have 1M context window"
+            );
+        }}
 
     #[test]
     fn resolves_grok_aliases() {

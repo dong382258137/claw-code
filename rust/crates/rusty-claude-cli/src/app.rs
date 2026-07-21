@@ -96,10 +96,11 @@ use crate::ultraplan::{
 };
 use api::{
     detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
-    resolve_startup_auth_source, AnthropicClient, AuthSource, CacheControl, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
-    SystemBlock, SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    model_token_limit, resolve_startup_auth_source, AnthropicClient, AuthSource, CacheControl,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -115,11 +116,12 @@ use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, HistoryIndex, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    RepoMap, ResolvedPermissionMode, RuntimeError, Session, SystemPromptExtras, SystemPromptSplit,
-    TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ContextAssembler,
+    ConversationMessage, ConversationRuntime, HistoryIndex, McpServer, McpServerManager,
+    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
+    ProjectContext, PromptCacheEvent, RepoMap, ResolvedPermissionMode, RuntimeError, Session,
+    SystemPromptExtras, SystemPromptSplit, TokenBudget, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -2356,6 +2358,10 @@ pub(crate) fn build_runtime_with_plugin_state(
     if session.model.is_none() {
         session.model = Some(model.clone());
     }
+    // 根据模型 context window 提前获取 compaction 阈值,
+    // 在 model 被 move 到 AnthropicRuntimeClient 之前完成。
+    let context_window = model_token_limit(&model)
+        .map(|limit| limit.context_window_tokens);
     // 从 session 提取工作区根白名单（主 cwd 根 + `--add-dir` 额外根），
     // 注入到 tool_registry，让 `classify_*_permission_with_roots` 在工具执行路径生效。
     let workspace_roots = session.workspace_roots();
@@ -2393,6 +2399,19 @@ pub(crate) fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
+    // Harness C(Context Management)层接入:ContextAssembler 统一 prompt 注入。
+    // 收集 Memory/Goal/Plan/remediation 等动态内容到 assembler,
+    // 由 assemble() 按 7 级优先级栈排序,TokenBudget 控制各源上限。
+    // 1M 模型(DeepSeek V4/GPT-5.4)使用缩放预算(480K 全局),
+    // 200K 模型(Claude)使用标准预算(120K 全局)。
+    // 详见 docs/harness-engineering-optimization-plan.md Step 2.3。
+    {
+        let budget = match context_window {
+            Some(cw) => TokenBudget::for_context_window(cw),
+            None => TokenBudget::default_claude(),
+        };
+        runtime = runtime.with_context_assembler(ContextAssembler::new(budget));
+    }
     // P1-6 修复：注入 harness V(验证)层和 O(可观测性)层组件。
     // 之前 VerifierAgent / TraceAnalyzer 实现完整但从未注入主流程，
     // 导致 conversation.rs 中 `self.verifier_agent` / `self.trace_analyzer`
@@ -2405,11 +2424,15 @@ pub(crate) fn build_runtime_with_plugin_state(
     //   未启用 plan mode 时不会有副作用。
     // - TraceAnalyzer：记录每次 turn 的 trace 数据（latency / failure_kind 等），
     //   未来可用于 CSV 导出和失败模式聚类。
-    // ContextAssembler 暂不注入（需要 TokenBudget 配置，避免破坏现有
-    // prompt 结构，留待未来配置化）。
     runtime = runtime
         .with_verifier_agent(runtime::VerifierAgent::new())
         .with_trace_analyzer(runtime::TraceAnalyzer::new());
+    // 根据模型 context window 动态设置 compaction 阈值。
+    // 1M 模型(DeepSeek V4/GPT-5.4)阈值 650K,200K 模型(Claude)阈值 130K,
+    // 避免 100K 一刀切对长上下文模型过度激进压缩。
+    if let Some(cw) = context_window {
+        runtime = runtime.with_context_window(cw);
+    }
     // Attach persistent memory for nudge curation. Loaded-and-frozen so the
     // nudge layer can write new entries to disk while the prompt's frozen
     // snapshot (loaded separately in load_prompt_extras) stays byte-stable

@@ -297,6 +297,11 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    /// 模型 context window 大小,用于动态计算 compaction 阈值。
+    /// 设置后 `maybe_auto_compact` 会根据 context window
+    /// 计算合适的压缩点,而非使用硬编码的 100K 默认值。
+    /// `None` 时回退到 `auto_compaction_input_tokens_threshold`。
+    context_window: Option<u32>,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
     session_tracer: Option<SessionTracer>,
@@ -445,6 +450,7 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            context_window: None,
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -476,6 +482,20 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    /// 注入模型 context window 大小,启用动态 compaction 阈值计算。
+    ///
+    /// 设置后 `maybe_auto_compact` 使用 `compaction_threshold_for_context_window()`
+    /// 替代硬编码的 100K:
+    /// - 1M (DeepSeek V4/GPT-5.4): 阈值 = 650K
+    /// - 200K (Claude): 阈值 = 130K
+    /// - 256K (Kimi): 阈值 = 166K
+    /// - 未设置: 回退到 `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` 或 100K
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: u32) -> Self {
+        self.context_window = Some(context_window);
         self
     }
 
@@ -2110,10 +2130,29 @@ where
         self.session
     }
 
+    /// 计算当前有效的 compaction 阈值。
+    ///
+    /// 优先级:
+    /// 1. 环境变量 `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` (显式覆盖) >
+    /// 2. 按 `context_window` 动态计算 (65% 比例,上限 800K) >
+    /// 3. 回退到 `auto_compaction_input_tokens_threshold` (默认 100K)
+    fn effective_compaction_threshold(&self) -> u32 {
+        // 环境变量覆盖始终优先
+        let env_threshold = auto_compaction_threshold_from_env();
+        if env_threshold != DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD {
+            return env_threshold;
+        }
+        // 按模型 context window 动态计算
+        if let Some(context_window) = self.context_window {
+            compaction_threshold_for_context_window(context_window)
+        } else {
+            self.auto_compaction_input_tokens_threshold
+        }
+    }
+
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+        let threshold = self.effective_compaction_threshold();
+        if self.usage_tracker.cumulative_usage().input_tokens < threshold {
             return None;
         }
 
@@ -2307,6 +2346,27 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
     )
 }
 
+/// 根据模型 context window 动态计算 compaction 阈值。
+///
+/// 规则:
+/// - context_window >= 1M: 使用 65% 即 ~650K
+/// - context_window >= 200K: 使用 65% 即 ~130K
+/// - 其他已知窗口: 使用 65%
+/// - 0 (未知): 回退到 100K
+///
+/// 上限 800K,防止极端情况。
+#[must_use]
+pub fn compaction_threshold_for_context_window(context_window: u32) -> u32 {
+    if context_window == 0 {
+        return DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD;
+    }
+
+    // 使用 context window 的 65% 作为压缩阈值
+    let ratio = ((context_window as u64) * 65 / 100) as u32;
+    // 上限 800K,保留足够空间给 output + 安全余量
+    ratio.min(800_000)
+}
+
 /// P0-3 辅助:计算 messages 中所有 ToolResult block 的 output 总长度。
 ///
 /// 用于检测 microcompact 前后是否发生了实质性压缩(旧 tool result 被替换)。
@@ -2489,8 +2549,9 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        build_assistant_message, compaction_threshold_for_context_window,
+        parse_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
         SESSION_SEARCH_TOOL_SPEC,
     };
@@ -3295,6 +3356,47 @@ mod tests {
         );
         assert_eq!(
             parse_auto_compaction_threshold(Some("not-a-number")),
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn compaction_threshold_scales_with_context_window() {
+        // 1M context window → 650K threshold (65%)
+        assert_eq!(
+            compaction_threshold_for_context_window(1_000_000),
+            650_000
+        );
+        // 200K context window → 130K threshold (65%)
+        assert_eq!(
+            compaction_threshold_for_context_window(200_000),
+            130_000
+        );
+        // 256K context window → 166K threshold (65%)
+        assert_eq!(
+            compaction_threshold_for_context_window(256_000),
+            166_400
+        );
+        // 131K context window → ~85K threshold
+        assert_eq!(
+            compaction_threshold_for_context_window(131_072),
+            85_196
+        );
+    }
+
+    #[test]
+    fn compaction_threshold_capped_at_800k() {
+        // 2M window → should cap at 800K, not 1.3M
+        assert_eq!(
+            compaction_threshold_for_context_window(2_000_000),
+            800_000
+        );
+    }
+
+    #[test]
+    fn compaction_threshold_zero_falls_back_to_default() {
+        assert_eq!(
+            compaction_threshold_for_context_window(0),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
     }

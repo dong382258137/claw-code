@@ -111,6 +111,7 @@ pub use compact::{
     get_compact_continuation_message, microcompact, microcompact_with_archiver, should_compact,
     CompactionConfig, CompactionResult,
 };
+pub use context_assembler::{AssembledPrompt, CacheStrategy, ContextAssembler, ContextBlock, ContextSource, TokenBudget};
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, LspConfigCollection, LspServerConfig,
     McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
@@ -118,8 +119,8 @@ pub use config::{
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, ScopedMcpServerConfig, WizardSettings, CLAW_SETTINGS_SCHEMA_NAME,
-    bootstrapped_sentinel_path, is_bootstrapped, load_wizard_settings, mark_bootstrapped,
-    save_wizard_settings,
+    bootstrapped_sentinel_path, default_config_home, is_bootstrapped, load_wizard_settings, mark_bootstrapped,
+    save_wizard_settings, strip_wizard_settings,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
