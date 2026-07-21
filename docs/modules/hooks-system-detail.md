@@ -2263,7 +2263,7 @@ execution = "sequential"
 
   [PostToolUse.hooks.handler]
   type = "webhook"
-  url = "https://audit.internal/api/bash_executed"
+  url = "https://audit.example.com/api/bash_executed"
   timeout = "10s"
   secret = "audit-secret"
 
@@ -2356,7 +2356,7 @@ execution = "sequential"
 
   [SessionEnd.hooks.handler]
   type = "webhook"
-  url = "https://audit.internal/api/session_end"
+  url = "https://audit.example.com/api/session_end"
   timeout = "10s"
 
 # ───────────────────────────────────────────────────────────────

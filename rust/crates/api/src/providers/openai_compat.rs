@@ -2373,7 +2373,7 @@ mod tests {
             tool_calls: Vec<super::DeltaToolCall>,
         }
 
-        // Simulate the exact shape observed in the wild (gaebal-gajae repro 2026-04-09)
+        // Simulate the exact shape observed in the wild (internal repro 2026-04-09)
         let json = r#"{
             "content": "",
             "function_call": null,
@@ -2392,7 +2392,7 @@ mod tests {
     /// Regression: when building a multi-turn request where a prior assistant
     /// turn has no tool calls, the serialized assistant message must NOT include
     /// `tool_calls: []`. Some providers reject requests that carry an empty
-    /// `tool_calls` array on assistant turns (gaebal-gajae repro 2026-04-09).
+    /// `tool_calls` array on assistant turns (internal repro 2026-04-09).
     #[test]
     fn assistant_message_without_tool_calls_omits_tool_calls_field() {
         use crate::types::{InputContentBlock, InputMessage};
@@ -2456,7 +2456,7 @@ mod tests {
 
     /// Orphaned tool messages (no preceding assistant `tool_calls`) must be
     /// dropped by the request-builder sanitizer. Regression for the second
-    /// layer of the tool-pairing invariant fix (gaebal-gajae 2026-04-10).
+    /// layer of the tool-pairing invariant fix (internal repro 2026-04-10).
     #[test]
     fn sanitize_drops_orphaned_tool_messages() {
         use super::sanitize_tool_message_pairing;

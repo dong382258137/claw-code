@@ -1539,7 +1539,7 @@ mod tests {
             commit_count: 6,
             commit_range: "dd73962..c956f78".to_string(),
             merge_method: ShipMergeMethod::DirectPush,
-            actor: "Jobdori".to_string(),
+            actor: "test-actor".to_string(),
             pr_number: None,
         };
 

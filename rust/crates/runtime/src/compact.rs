@@ -1126,7 +1126,7 @@ mod tests {
     /// Regression: compaction must not split an assistant(ToolUse) /
     /// user(ToolResult) pair at the boundary. An orphaned tool-result message
     /// without the preceding assistant `tool_calls` causes a 400 on the
-    /// OpenAI-compat path (gaebal-gajae repro 2026-04-09).
+    /// OpenAI-compat path (internal repro 2026-04-09).
     #[test]
     fn compaction_does_not_split_tool_use_tool_result_pair() {
         use crate::session::{ContentBlock, Session};

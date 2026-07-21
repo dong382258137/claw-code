@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     fn ready_detection_ignores_plain_shell_prompts() {
-        assert!(!detect_ready_for_prompt("bellman@host %", "bellman@host %"));
+        assert!(!detect_ready_for_prompt("user@host %", "user@host %"));
         assert!(!detect_ready_for_prompt("/tmp/repo $", "/tmp/repo $"));
         assert!(detect_ready_for_prompt("│ >", "│ >"));
     }

@@ -3875,17 +3875,6 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
             SkillLookupOrigin::LegacyCommandsDir,
         );
     }
-    push_skill_lookup_root(
-        &mut roots,
-        std::path::PathBuf::from("/home/bellman/.claw/skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-    push_skill_lookup_root(
-        &mut roots,
-        std::path::PathBuf::from("/home/bellman/.codex/skills"),
-        SkillLookupOrigin::SkillsDir,
-    );
-
     roots
 }
 
