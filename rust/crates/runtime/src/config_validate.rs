@@ -382,6 +382,12 @@ fn validate_object_keys(
             }
         } else if DEPRECATED_FIELDS.iter().any(|d| d.name == key) {
             // Deprecated key — handled separately, not an unknown-key error.
+        } else if key.starts_with('_') {
+            // Internal/reserved keys (e.g. `_wizard` written by the first-run
+            // wizard) are tolerated so transient bookkeeping fields don't
+            // break ConfigLoader. This is the "source control" fix: instead
+            // of stripping `_wizard` after the wizard completes, we simply
+            // don't reject underscore-prefixed keys at the validator layer.
         } else {
             // Unknown key.
             let suggestion = suggest_field(key, &known_names);
@@ -772,6 +778,26 @@ mod tests {
             } => assert_eq!(s, "model"),
             other => panic!("expected suggestion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tolerates_underscore_prefixed_keys() {
+        // given — `_wizard` is written by the first-run wizard and must not
+        // be rejected by the validator (source-control fix: tolerate `_`-prefixed
+        // internal keys instead of stripping them after the wizard completes).
+        let source = r#"{"_wizard": {"provider": "anthropic"}, "model": "sonnet"}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        // when
+        let result = validate_config_file(object, source, &test_path());
+
+        // then
+        assert!(
+            result.is_ok(),
+            "underscore-prefixed key should be tolerated, got errors: {:?}",
+            result.errors
+        );
     }
 
     #[test]

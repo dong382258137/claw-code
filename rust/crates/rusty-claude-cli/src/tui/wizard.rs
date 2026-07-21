@@ -156,31 +156,40 @@ pub(crate) fn run_first_run_wizard() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let outcome = run_wizard_loop(&mut terminal, &detected)?;
+    let outcome = run_wizard_loop(&mut terminal, &detected);
+
+    let finalise = |provider_slug: &str, api_key: &str| -> Result<(), Box<dyn std::error::Error>> {
+        let settings = WizardSettings {
+            provider: provider_slug.to_string(),
+            api_key: api_key.to_string(),
+        };
+        save_wizard_settings(&settings)?;
+        inject_api_key(provider_slug, api_key);
+        runtime::mark_bootstrapped()?;
+        Ok(())
+    };
 
     match outcome {
-        WizardOutcome::Configured {
+        Ok(WizardOutcome::Configured {
             provider_slug,
             api_key,
-        } => {
-            // Persist to settings.json.
-            let settings = WizardSettings {
-                provider: provider_slug.clone(),
-                api_key: api_key.clone(),
-            };
-            save_wizard_settings(&settings)?;
-
-            // Inject into current process so downstream auth picks it up.
-            inject_api_key(&provider_slug, &api_key);
-
-            // Create sentinel file.
-            runtime::mark_bootstrapped()?;
-
-            Ok(())
-        }
-        WizardOutcome::Quit => {
-            // User bailed — exit the application gracefully.
+        }) => match finalise(&provider_slug, &api_key) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Render the error on the alternate screen so the user can
+                // read it before the terminal is restored and the process exits.
+                render_error_screen(&mut terminal, &e.to_string());
+                Err(e)
+            }
+        },
+        Ok(WizardOutcome::Quit) => {
             Err("Configuration cancelled by user.".into())
+        }
+        Err(e) => {
+            // If the wizard loop itself errored (crossterm I/O), also show
+            // the error on-screen before teardown.
+            render_error_screen(&mut terminal, &e.to_string());
+            Err(e)
         }
     }
 }
@@ -200,6 +209,50 @@ fn inject_api_key(provider_slug: &str, api_key: &str) {
             std::env::set_var("DASHSCOPE_API_KEY", api_key);
         }
         _ => {}
+    }
+}
+
+// ── Error screen (rendered before terminal teardown) ───────────────────────
+
+/// Render an error message on the alternate screen and wait for a keypress.
+///
+/// This gives the user time to read the error before the terminal is restored
+/// and the process exits. Without this, on Windows the console window closes
+/// immediately after printing the error to stderr, making it look like a
+/// "flash crash".
+fn render_error_screen(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    message: &str,
+) {
+    let _ = terminal.draw(|f| {
+        let area = centered_rect(64, 10, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Error ")
+            .style(Style::default().fg(Color::Red));
+        f.render_widget(
+            Paragraph::new(format!(
+                "Configuration failed:\n\n{}\n\nPress any key to exit...",
+                message
+            ))
+            .block(block)
+            .style(Style::default().fg(Color::White))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+            area,
+        );
+    });
+    // Drain any buffered events, then wait for a keypress.
+    while event::poll(std::time::Duration::from_millis(10)).unwrap_or(false) {
+        let _ = event::read();
+    }
+    loop {
+        match event::read() {
+            Ok(Event::Key(_)) => break,
+            Err(_) => break, // stdin broken — don't loop forever
+            _ => {}           // non-key event — keep waiting
+        }
     }
 }
 

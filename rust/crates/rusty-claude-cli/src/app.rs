@@ -167,6 +167,44 @@ pub(crate) fn detect_broad_cwd() -> Option<PathBuf> {
     }
 }
 
+/// Detect if cwd is inside a `target/debug` or `target/release` directory
+/// and walk up to the project root (parent of `target/`). This prevents
+/// workspace-boundary errors when the binary is launched from its build output.
+///
+/// Returns the corrected path if a fix-up was applied, `None` otherwise.
+pub(crate) fn correct_cwd_from_target_dir() -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?;
+
+    // Check if the last two components are target/<profile>
+    let components: Vec<&std::ffi::OsStr> = cwd
+        .components()
+        .map(std::path::Component::as_os_str)
+        .collect();
+    let n = components.len();
+    if n < 2 {
+        return None;
+    }
+    let parent = components[n - 2];
+    let leaf = components[n - 1];
+    if parent == std::ffi::OsStr::new("target")
+        && (leaf == std::ffi::OsStr::new("debug")
+            || leaf == std::ffi::OsStr::new("release"))
+    {
+        // Walk up to the directory containing `target/`
+        let project_root = cwd
+            .ancestors()
+            .nth(2) // skip leaf + "target"
+            .map(Path::to_path_buf);
+        if let Some(ref root) = project_root {
+            if root.join("Cargo.toml").exists() || root.join(".git").exists() {
+                let _ = env::set_current_dir(root);
+                return Some(root.clone());
+            }
+        }
+    }
+    None
+}
+
 /// Enforce the broad-CWD policy: when running from home or root, either
 /// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
 /// or exit with an error (non-interactive).
@@ -298,6 +336,7 @@ pub(crate) fn run_repl(
     enable_plan_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    correct_cwd_from_target_dir();
     run_stale_base_preflight(base_commit.as_deref());
     // P3 多行粘贴折叠：本会话的 paste id 自增生成器。
     // 每次超阈值粘贴时 +1，用于 paste-cache 文件名和占位符编号。

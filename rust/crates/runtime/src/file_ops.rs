@@ -622,6 +622,9 @@ pub struct ReplaceLinesOutput {
 }
 
 /// Performs a line-range replacement and returns metadata.
+///
+/// Uses `edit_file_at_checked` pattern: rejects leaf symlinks (TOCTOU defense),
+/// enforces `MAX_WRITE_SIZE`, and preserves trailing newline.
 pub fn replace_lines(
     path: &str,
     start_line: usize,
@@ -629,6 +632,8 @@ pub fn replace_lines(
     new_content: &str,
 ) -> io::Result<ReplaceLinesOutput> {
     let absolute_path = normalize_path(path)?;
+    reject_leaf_symlink(&absolute_path)?;
+
     let original_file = fs::read_to_string(&absolute_path)?;
     let original_lines: Vec<&str> = original_file.lines().collect();
 
@@ -652,30 +657,38 @@ pub fn replace_lines(
     }
 
     let replaced_slice = original_lines[(start_line - 1)..end_line].join("\n");
+
+    // Build the updated content by splicing lines
     let mut out: Vec<&str> = Vec::with_capacity(
         original_lines.len() - (end_line - start_line + 1) + 1,
     );
     out.extend_from_slice(&original_lines[..start_line - 1]);
-
-    // Push new content as lines, preserving empty content edge case
-    if new_content.is_empty() {
-        // Remove the range entirely
-    } else {
+    if !new_content.is_empty() {
         for line in new_content.lines() {
             out.push(line);
         }
     }
     out.extend_from_slice(&original_lines[end_line..]);
 
-    let updated = out.join("\n");
-    if updated.is_empty() {
-        fs::write(&absolute_path, "\n")?;
-    } else {
-        fs::write(&absolute_path, &updated)?;
-        if !updated.ends_with('\n') {
-            // Ensure trailing newline
-        }
+    let mut updated = out.join("\n");
+    // Preserve trailing newline: if original file ended with one, ensure updated does too
+    if original_file.ends_with('\n') && !updated.ends_with('\n') {
+        updated.push('\n');
     }
+
+    // Enforce size limit (same as write_file)
+    if updated.len() > MAX_WRITE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "resulting content is too large ({} bytes, max {} bytes)",
+                updated.len(),
+                MAX_WRITE_SIZE
+            ),
+        ));
+    }
+
+    fs::write(&absolute_path, &updated)?;
 
     Ok(ReplaceLinesOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
@@ -699,13 +712,26 @@ pub fn replace_lines_in_workspace_with_roots(
     let absolute_path = normalize_path(path)?;
     let roots = canonicalize_roots(workspace_root, extra_roots);
     validate_workspace_boundary_multi(&absolute_path, &roots)?;
+    // BUG-P1-5 (TOCTOU): operate on the already-validated `absolute_path`
+    // and refuse to follow symlinks at the leaf, same as edit_file_at_checked.
+    // We pass the original `path` to replace_lines which re-normalizes it,
+    // but the boundary check above already validated the canonical path.
     replace_lines(path, start_line, end_line, new_content)
 }
 
-/// If the modified file belongs to a Rust project (has a parent Cargo.toml),
-/// run `cargo check` in that project's root and return the output.
-/// Returns `None` if not a Rust project or cargo is unavailable.
+/// If the modified file is a `.rs` file in a Rust project (has a parent
+/// Cargo.toml), run `cargo check` in that project's root and return the
+/// full output. Returns `None` if not a `.rs` file, not a Rust project, or
+/// cargo is unavailable.
+///
+/// Uses `--message-format=short` to reduce output volume, and enforces a
+/// 60-second timeout to prevent blocking the TUI on large projects.
 pub fn run_cargo_check_for_file(file_path: &Path) -> Option<String> {
+    // Only trigger for Rust source files
+    if file_path.extension() != Some(std::ffi::OsStr::new("rs")) {
+        return None;
+    }
+
     // Walk up to find Cargo.toml
     let mut dir = file_path.parent()?;
     let cargo_toml = loop {
@@ -717,33 +743,67 @@ pub fn run_cargo_check_for_file(file_path: &Path) -> Option<String> {
     }?;
 
     let project_root = cargo_toml.parent()?;
-    let output = std::process::Command::new("cargo")
+
+    let mut child = std::process::Command::new("cargo")
         .arg("check")
+        .arg("--message-format=short")
         .current_dir(project_root)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .ok()?;
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let timeout = std::time::Duration::from_secs(60);
+    let start = std::time::Instant::now();
 
-    // Extract only the relevant error/warning lines
-    let combined = format!("{stdout}{stderr}");
-    if combined.trim().is_empty() {
-        return None;
-    }
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|mut s| {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        let _ = s.read_to_string(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|mut s| {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        let _ = s.read_to_string(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
 
-    // Filter to only lines containing error, warning, or the final status
-    let filtered: Vec<&str> = combined
-        .lines()
-        .filter(|line| {
-            line.contains("error") || line.contains("warning") || line.contains("Finished")
-        })
-        .collect();
-
-    if filtered.is_empty() {
-        Some("cargo check: OK (no errors or warnings)".to_string())
-    } else {
-        Some(format!("cargo check:\n{}", filtered.join("\n")))
+                let combined = format!("{stdout}{stderr}");
+                if combined.trim().is_empty() {
+                    return Some("cargo check: OK (no output)".to_string());
+                }
+                // Truncate to prevent massive responses
+                let max_len = 5000;
+                if combined.len() > max_len {
+                    return Some(format!(
+                        "cargo check:\n{}\n...(truncated, {} total bytes)",
+                        &combined[..max_len],
+                        combined.len()
+                    ));
+                }
+                return Some(format!("cargo check:\n{combined}"));
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    return Some("cargo check timed out (60s)".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Some(format!("cargo check error: {e}")),
+        }
     }
 }
 

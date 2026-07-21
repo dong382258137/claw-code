@@ -431,6 +431,7 @@ pub fn run_tui_repl_entry(
     // ---- End wizard pre-check -------------------------------------------
 
         enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    correct_cwd_from_target_dir();
     run_stale_base_preflight(base_commit.as_deref());
     let cli = build_live_cli_for_repl(
         model,

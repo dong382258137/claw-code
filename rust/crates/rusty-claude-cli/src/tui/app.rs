@@ -858,15 +858,26 @@ fn run_event_loop(
         // conhost drain phase: after all Enter events consumed, wait for
         // remaining key events (last line chars) to be delivered.
         // Use short poll timeout to detect when input stream goes idle.
-        if conhost_suppress_input && pending_paste_lines.is_empty() {
+        //
+        // 两种进入条件：
+        // 1. pending_paste_lines 为空：所有 Enter 已消费，等待残留字符排空后填 @路径
+        // 2. pending_paste_lines 非空：最后一行不带 \n，字符被 suppress 后无 Enter
+        //    触发消费。靠 poll 超时判定 conhost 注入完毕，强制清空并填 @路径。
+        if conhost_suppress_input {
             if event::poll(Duration::from_millis(50))? {
-                // Still receiving events - consume and discard
+                // 仍在接收事件 — 丢弃并等待
                 let _ = event::read()?;
                 continue;
             }
-            // Input stream idle - conhost injection complete
-            paste_diag_log("  conhost drain phase: poll timeout, injection complete");
+            // 事件流空闲 — conhost 注入完毕
+            paste_diag_log(&format!(
+                "  conhost drain phase: poll timeout, injection complete (pending_paste_lines.len()={})",
+                pending_paste_lines.len()
+            ));
             conhost_suppress_input = false;
+            conhost_paste_intercepted = false;
+            pending_paste_lines.clear();
+            pending_paste_last_line = None;
             if let Some(at_path) = pending_at_path.take() {
                 paste_diag_log(&format!("  drain done: insert @path={:?}", at_path));
                 input.insert_paste(&at_path);
