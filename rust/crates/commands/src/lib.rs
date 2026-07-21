@@ -237,7 +237,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "List, check, switch, fork, or delete managed local sessions",
         argument_hint: Some(
-            "[list|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+            "[list|pick|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
         ),
         resume_supported: true,
     },
@@ -1650,6 +1650,10 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
         }),
         ["list"] => Ok(SlashCommand::Session {
             action: Some("list".to_string()),
+            target: None,
+        }),
+        ["pick"] => Ok(SlashCommand::Session {
+            action: Some("pick".to_string()),
             target: None,
         }),
         ["list", ..] => Err(usage_error("session", "[list|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]")),

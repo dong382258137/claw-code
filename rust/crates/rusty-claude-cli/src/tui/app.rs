@@ -508,6 +508,11 @@ fn run_event_loop(
     // Alt+Up 增加 n（看更早），Alt+Down 减少 n（回到最新），新工具到来时自动归零。
     let mut sidebar_tools_scroll: Option<usize> = None;
 
+    // TUI 原生会话选择器状态：
+    // - Some：/session pick 打开了选择器，键盘事件被拦截路由到选择器
+    // - None：正常对话/命令模式
+    let mut session_picker: Option<SessionPickerState> = None;
+
     // Output view scroll state. `None` means "follow bottom" (auto-scroll on
     // new output). `Some(n)` means "manual scroll n lines above the bottom";
     // new output does NOT auto-scroll while the user is in manual mode.
@@ -876,6 +881,12 @@ fn run_event_loop(
                 render_help_overlay(f, f.area());
             }
 
+            // SessionPicker overlay（/session pick 触发）。
+            // 在 help overlay 之上渲染，确保选择器可见。
+            if let Some(ref picker) = session_picker {
+                render_session_picker(picker, f, main_area);
+            }
+
             // 缓存 main_area 和 scroll_y 到 loop 外变量，供 Event::Mouse 分支使用。
             last_main_area = main_area;
             last_scroll_y = scroll_y as u16;
@@ -969,6 +980,64 @@ fn run_event_loop(
             }
 
             if let Event::Key(key) = ev {
+                // SessionPicker 打开时拦截所有键盘事件
+                if let Some(ref mut picker) = session_picker {
+                    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Up => picker.move_up(),
+                        KeyCode::Down => picker.move_down(),
+                        KeyCode::Enter => {
+                            // 确认切换：取出选中会话，执行 switch
+                            let picked_id = picker
+                                .selected_session()
+                                .map(|s| s.id.clone());
+                            session_picker = None; // 关闭选择器
+                            if let Some(target_id) = picked_id {
+                                // 在主线程执行 switch（需要 cli）
+                                if let Some(mut cli) = cli_holder.take() {
+                                    let output_handle = output_view.shared_handle();
+                                    cli.set_tui_output(Arc::clone(&output_handle));
+                                    let result = cli.handle_repl_command(
+                                        commands::SlashCommand::Session {
+                                            action: Some("switch".to_string()),
+                                            target: Some(target_id),
+                                        },
+                                    );
+                                    cli.clear_tui_output();
+                                    // 刷新 status bar
+                                    sync_status_from_cli(&status_state, &cli);
+                                    cli_holder = Some(cli);
+                                    if let Err(e) = result {
+                                        if let Ok(mut buf) = output_handle.lock() {
+                                            buf.push_entry(
+                                                crate::tui::output_view::OutputEntry::text(
+                                                    format!("[error] 切换会话失败: {e}\n\n"),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        KeyCode::Esc => {
+                            // 取消选择
+                            session_picker = None;
+                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                buf.push_entry(
+                                    crate::tui::output_view::OutputEntry::text(
+                                        "[info] 会话选择已取消。\n\n".to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                        _ => {} // 忽略其他键
+                    }
+                    continue;
+                }
+
                 let busy = turn_rx.is_some();
                 let action = route_key(&mut input, key, help_visible, busy);
 
@@ -1506,6 +1575,53 @@ fn run_event_loop(
                             let tool_history_handle = Arc::clone(&tool_history_shared);
 
                             let mut cli = cli_holder.take().unwrap();
+
+                            // TUI 原生选择列表拦截：/session pick 在 TUI 下不走 worker 线程，
+                            // 而是打开 SessionPicker overlay，用上下键选中会话后 Enter 确认。
+                            // 选中后直接在主线程执行 switch（需要 &mut cli）。
+                            let trimmed_expanded = expanded.trim();
+                            if trimmed_expanded == "/session pick"
+                                || trimmed_expanded == "/session"
+                            {
+                                // 尝试加载会话列表
+                                match crate::session_mgr::list_managed_sessions() {
+                                    Ok(mut sessions) => {
+                                        // 按修改时间倒序（最新在前）
+                                        sessions.sort_by_key(|s| {
+                                            std::cmp::Reverse(s.modified_epoch_millis)
+                                        });
+                                        if sessions.is_empty() {
+                                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                                buf.push_entry(
+                                                    crate::tui::output_view::OutputEntry::text(
+                                                        "[info] 暂无受管会话。\n\n".to_string(),
+                                                    ),
+                                                );
+                                            }
+                                        } else {
+                                            // 打开 SessionPicker overlay
+                                            session_picker = Some(SessionPickerState::new(
+                                                sessions,
+                                                cli.session_id_snapshot().to_string(),
+                                            ));
+                                            // cli 放回 holder，不执行后续逻辑
+                                            cli_holder = Some(cli);
+                                            continue 'main_loop;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                            buf.push_entry(
+                                                crate::tui::output_view::OutputEntry::text(
+                                                    format!("[error] 加载会话列表失败: {e}\n\n"),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                                cli_holder = Some(cli);
+                                continue 'main_loop;
+                            }
 
                             // 斜杠命令本地分发：先尝试解析为 SlashCommand。
                             // 如果是斜杠命令，本地执行 handle_repl_command
@@ -2368,6 +2484,134 @@ fn execute_slash_command(cli: &mut LiveCli, command: SlashCommand) -> Result<(),
     // 清除 tui_output，避免后续 AI 对话轮次误捕获 println
     cli.clear_tui_output();
     result
+}
+
+/// TUI 原生会话选择器状态。
+///
+/// 由 `/session pick` 触发：从 list_managed_sessions 加载会话列表，
+/// 在主区域上 overlay 一个 ratatui List widget，用户用上下键选中、
+/// Enter 确认切换、Esc 取消。选中后通过 `pending_switch_target` 传回
+/// 主循环执行 switch 逻辑。
+struct SessionPickerState {
+    /// 全部候选会话（按修改时间倒序）。
+    sessions: Vec<crate::session_mgr::ManagedSessionSummary>,
+    /// 当前活动会话 ID（用于高亮标记）。
+    active_session_id: String,
+    /// 当前选中的索引。
+    selected: usize,
+    /// 滚动偏移。
+    scroll: usize,
+}
+
+impl SessionPickerState {
+    fn new(
+        sessions: Vec<crate::session_mgr::ManagedSessionSummary>,
+        active_session_id: String,
+    ) -> Self {
+        // 默认选中活动会话（若存在），否则选第一个
+        let selected = sessions
+            .iter()
+            .position(|s| s.id == active_session_id)
+            .unwrap_or(0);
+        Self {
+            sessions,
+            active_session_id,
+            selected,
+            scroll: 0,
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.selected == 0 {
+            self.selected = self.sessions.len().saturating_sub(1);
+        } else {
+            self.selected -= 1;
+        }
+        self.adjust_scroll();
+    }
+
+    fn move_down(&mut self) {
+        if self.selected + 1 >= self.sessions.len() {
+            self.selected = 0;
+        } else {
+            self.selected += 1;
+        }
+        self.adjust_scroll();
+    }
+
+    fn adjust_scroll(&mut self) {
+        const MAX_VISIBLE: usize = 12;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + MAX_VISIBLE {
+            self.scroll = self.selected + 1 - MAX_VISIBLE;
+        }
+    }
+
+    /// 当前选中的会话（用于 Enter 确认后取出执行 switch）。
+    fn selected_session(&self) -> Option<&crate::session_mgr::ManagedSessionSummary> {
+        self.sessions.get(self.selected)
+    }
+}
+
+/// 渲染会话选择器 overlay。
+fn render_session_picker(
+    state: &SessionPickerState,
+    f: &mut ratatui::Frame,
+    area: Rect,
+) {
+    use ratatui::widgets::{List, ListItem, ListState};
+
+    // 居中显示，占主区域 80% 宽、最多 20 行高
+    let popup_width = (area.width as usize * 8 / 10).max(40) as u16;
+    let popup_height = area.height.min(20);
+    let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    let items: Vec<ListItem> = state
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let is_active = s.id == state.active_session_id;
+            let marker = if is_active { "*" } else { " " };
+            let modified_age = crate::session_mgr::format_session_modified_age(
+                s.modified_epoch_millis,
+            );
+            let branch = s
+                .branch_name
+                .as_deref()
+                .unwrap_or("-");
+            let line = format!(
+                " {marker} [{i:>3}] {:<24} msgs={:<4} modified={modified_age} branch={branch}",
+                s.id, s.message_count
+            );
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 选择会话 — ↑/↓ 选中，Enter 切换，Esc 取消 "),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+    f.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
 fn initialize_status(state: &Arc<Mutex<StatusBarState>>, cli: &LiveCli) {

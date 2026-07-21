@@ -508,6 +508,12 @@ fn sub_options_for(name: &str) -> Vec<SubOptionSpec> {
                 arg_hint: None,
             },
             SubOptionSpec {
+                value: "pick",
+                label: "交互式选择会话（上下键选中+Enter 确认）",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
                 value: "exists",
                 label: "检查某会话是否存在",
                 requires_arg: true,

@@ -50,11 +50,21 @@ pub(crate) enum DiagnosticLevel {
 }
 
 impl DiagnosticLevel {
+    // 文本渲染用的中文标签;JSON 仍走 label() 以保持机器可读兼容性。
     fn label(self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::Warn => "warn",
             Self::Fail => "fail",
+        }
+    }
+
+    // 用户可见的中文状态标签,用于文本报告渲染。
+    fn display_label(self) -> &'static str {
+        match self {
+            Self::Ok => "正常",
+            Self::Warn => "警告",
+            Self::Fail => "失败",
         }
     }
 
@@ -161,9 +171,9 @@ impl DoctorReport {
     pub(crate) fn render(&self) -> String {
         let (ok_count, warn_count, fail_count) = self.counts();
         let mut lines = vec![
-            "Doctor".to_string(),
+            "Doctor 诊断报告".to_string(),
             format!(
-                "Summary\n  OK               {ok_count}\n  Warnings         {warn_count}\n  Failures         {fail_count}"
+                "摘要\n  正常             {ok_count}\n  警告             {warn_count}\n  失败             {fail_count}"
             ),
         ];
         lines.extend(self.checks.iter().map(render_diagnostic_check));
@@ -196,13 +206,13 @@ impl DoctorReport {
 
 pub(crate) fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
     let mut lines = vec![format!(
-        "{}\n  Status           {}\n  Summary          {}",
+        "{}\n  状态             {}\n  摘要             {}",
         check.name,
-        check.level.label(),
+        check.level.display_label(),
         check.summary
     )];
     if !check.details.is_empty() {
-        lines.push("  Details".to_string());
+        lines.push("  详情".to_string());
         lines.extend(check.details.iter().map(|detail| format!("    - {detail}")));
     }
     lines.join("\n")
@@ -288,7 +298,7 @@ pub(crate) fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn s
         }
     }
     if report.has_failures() {
-        return Err("doctor found failing checks".into());
+        return Err("doctor 发现失败的检查项".into());
     }
     Ok(())
 }
@@ -321,7 +331,7 @@ pub(crate) fn run_worker_state(
         //     Or:    claw prompt <text> # run one non-interactive turn
         //     Then rerun: claw state [--output-format json]
         return Err(format!(
-            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   claw               # start the REPL (writes state on first turn)\n  Or:    claw prompt <text> # run one non-interactive turn\n  Then rerun: claw state [--output-format json]",
+            "未找到 worker 状态文件:{path}\n  提示:worker 状态由交互式 REPL 或非交互式 prompt 写入。\n  运行:  claw               # 启动 REPL(首次对话时写入状态)\n  或:    claw prompt <text> # 运行一次非交互式对话\n  然后重试:claw state [--output-format json]",
             path = state_path.display()
         )
         .into());
@@ -377,12 +387,12 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
     let env_details = format!(
-        "Environment       api_key={} auth_token={}",
-        if api_key_present { "present" } else { "absent" },
+        "环境变量          api_key={} auth_token={}",
+        if api_key_present { "已配置" } else { "缺失" },
         if auth_token_present {
-            "present"
+            "已配置"
         } else {
-            "absent"
+            "缺失"
         }
     );
 
@@ -395,30 +405,30 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
                 DiagnosticLevel::Warn
             },
             if api_key_present || auth_token_present {
-                "supported auth env vars are configured; legacy saved OAuth is ignored"
+                "支持的认证环境变量已配置;旧的已保存 OAuth 凭证将被忽略"
             } else {
-                "legacy saved OAuth credentials are present but unsupported"
+                "存在旧的已保存 OAuth 凭证,但不再支持"
             },
         )
         .with_details(vec![
             env_details,
             format!(
-                "Legacy OAuth      expires_at={} refresh_token={} scopes={}",
+                "旧版 OAuth        expires_at={} refresh_token={} scopes={}",
                 token_set
                     .expires_at
-                    .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
+                    .map_or_else(|| "<无>".to_string(), |value| value.to_string()),
                 if token_set.refresh_token.is_some() {
-                    "present"
+                    "已配置"
                 } else {
-                    "absent"
+                    "缺失"
                 },
                 if token_set.scopes.is_empty() {
-                    "<none>".to_string()
+                    "<无>".to_string()
                 } else {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `claw login` is removed"
+            "建议操作          设置 ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN;`claw login` 已移除"
                 .to_string(),
         ])
         .with_data(Map::from_iter([
@@ -443,9 +453,9 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
                 DiagnosticLevel::Warn
             },
             if api_key_present || auth_token_present {
-                "supported auth env vars are configured"
+                "支持的认证环境变量已配置"
             } else {
-                "no supported auth env vars were found"
+                "未找到支持的认证环境变量"
             },
         )
         .with_details(vec![env_details])
@@ -460,7 +470,7 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         Err(error) => DiagnosticCheck::new(
             "Auth",
             DiagnosticLevel::Fail,
-            format!("failed to inspect legacy saved credentials: {error}"),
+            format!("检查旧版已保存凭证失败: {error}"),
         )
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
@@ -500,32 +510,32 @@ pub(crate) fn check_config_health(
             let loaded_count = loaded_entries.len();
             let present_count = present_paths.len();
             let mut details = vec![format!(
-                "Config files      loaded {}/{}",
+                "配置文件          已加载 {}/{}",
                 loaded_count, present_count
             )];
             if let Some(model) = runtime_config.model() {
-                details.push(format!("Resolved model    {model}"));
+                details.push(format!("解析的模型        {model}"));
             }
             details.push(format!(
-                "MCP servers       {}",
+                "MCP 服务器        {}",
                 runtime_config.mcp().servers().len()
             ));
             if present_paths.is_empty() {
-                details.push("Discovered files  <none> (defaults active)".to_string());
+                details.push("发现的文件        <无>(使用默认配置)".to_string());
             } else {
                 details.extend(
                     present_paths
                         .iter()
-                        .map(|path| format!("Discovered file   {path}")),
+                        .map(|path| format!("发现的文件        {path}")),
                 );
             }
             DiagnosticCheck::new(
                 "Config",
                 DiagnosticLevel::Ok,
                 if present_count == 0 {
-                    "no config files present; defaults are active"
+                    "没有配置文件;使用默认配置"
                 } else {
-                    "runtime config loaded successfully"
+                    "运行时配置加载成功"
                 },
             )
             .with_details(details)
@@ -543,14 +553,14 @@ pub(crate) fn check_config_health(
         Err(error) => DiagnosticCheck::new(
             "Config",
             DiagnosticLevel::Fail,
-            format!("runtime config failed to load: {error}"),
+            format!("运行时配置加载失败: {error}"),
         )
         .with_details(if discovered_paths.is_empty() {
-            vec!["Discovered files  <none>".to_string()]
+            vec!["发现的文件        <无>".to_string()]
         } else {
             discovered_paths
                 .iter()
-                .map(|path| format!("Discovered file   {path}"))
+                .map(|path| format!("发现的文件        {path}"))
                 .collect()
         })
         .with_data(Map::from_iter([
@@ -572,15 +582,15 @@ pub(crate) fn check_install_source_health() -> DiagnosticCheck {
         "Install source",
         DiagnosticLevel::Ok,
         format!(
-            "official source of truth is {OFFICIAL_REPO_SLUG}; avoid `{DEPRECATED_INSTALL_COMMAND}`"
+            "官方来源是 {OFFICIAL_REPO_SLUG};避免使用 `{DEPRECATED_INSTALL_COMMAND}`"
         ),
     )
     .with_details(vec![
-        format!("Official repo     {OFFICIAL_REPO_URL}"),
-        "Recommended path  build from this repo or use the upstream binary documented in README.md"
+        format!("官方仓库          {OFFICIAL_REPO_URL}"),
+        "推荐路径          从本仓库构建或使用 README.md 中记录的上游二进制"
             .to_string(),
         format!(
-            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `claw` binary"
+            "已弃用的 crate    `{DEPRECATED_INSTALL_COMMAND}` 安装的是已弃用的占位包,不提供 `claw` 二进制"
         )
             .to_string(),
     ])
@@ -609,35 +619,35 @@ pub(crate) fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck
         },
         if in_repo {
             format!(
-                "project root detected on branch {}",
-                context.git_branch.as_deref().unwrap_or("unknown")
+                "在分支 {} 上检测到项目根目录",
+                context.git_branch.as_deref().unwrap_or("未知")
             )
         } else {
-            "current directory is not inside a git project".to_string()
+            "当前目录不在 git 项目内".to_string()
         },
     )
     .with_details(vec![
-        format!("Cwd              {}", context.cwd.display()),
+        format!("当前目录          {}", context.cwd.display()),
         format!(
-            "Project root     {}",
+            "项目根目录        {}",
             context
                 .project_root
                 .as_ref()
-                .map_or_else(|| "<none>".to_string(), |path| path.display().to_string())
+                .map_or_else(|| "<无>".to_string(), |path| path.display().to_string())
         ),
         format!(
-            "Git branch       {}",
-            context.git_branch.as_deref().unwrap_or("unknown")
+            "Git 分支          {}",
+            context.git_branch.as_deref().unwrap_or("未知")
         ),
-        format!("Git state        {}", context.git_summary.headline()),
-        format!("Changed files    {}", context.git_summary.changed_files),
+        format!("Git 状态          {}", context.git_summary.headline()),
+        format!("已更改文件        {}", context.git_summary.changed_files),
         format!(
-            "Memory files     {} · config files loaded {}/{}",
+            "Memory 文件       {} · 配置文件已加载 {}/{}",
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
         format!(
-            "Stale base      {}",
-            stale_base_warning.as_deref().unwrap_or("ok")
+            "Stale base        {}",
+            stale_base_warning.as_deref().unwrap_or("正常")
         ),
     ])
     .with_data(Map::from_iter([
@@ -691,40 +701,40 @@ pub(crate) fn check_boot_preflight_health(context: &StatusContext) -> Diagnostic
         .iter()
         .map(|socket| {
             format!(
-                "Control socket  {} configured={} exists={} path={}",
+                "控制套接字        {} configured={} exists={} path={}",
                 socket.name,
                 socket.configured,
                 socket.exists,
-                socket.path.as_deref().unwrap_or("<none>")
+                socket.path.as_deref().unwrap_or("<无>")
             )
         })
         .collect::<Vec<_>>();
     let mut details = vec![
-        format!("Repo exists      {}", preflight.repo_exists),
-        format!("Worktree exists  {}", preflight.worktree_exists),
-        format!("Git dir exists   {}", preflight.git_dir_exists),
-        format!("Branch behind    {}", preflight.branch_freshness.behind),
-        format!("Trust allowlist  {:?}", preflight.trust_gate_allowed),
-        format!("Trusted roots    {}", preflight.trusted_roots_count),
+        format!("仓库存在          {}", preflight.repo_exists),
+        format!("工作树存在        {}", preflight.worktree_exists),
+        format!("Git 目录存在      {}", preflight.git_dir_exists),
+        format!("分支落后          {}", preflight.branch_freshness.behind),
+        format!("信任白名单        {:?}", preflight.trust_gate_allowed),
+        format!("受信任根数        {}", preflight.trusted_roots_count),
         format!(
-            "MCP eligible     {} · servers {}",
+            "MCP 可启动        {} · 服务器 {}",
             preflight.mcp_startup_eligible, preflight.mcp_servers_configured
         ),
         format!(
-            "Plugin eligible  {} · configured {}",
+            "插件可启动        {} · 已配置 {}",
             preflight.plugin_startup_eligible, preflight.plugins_configured
         ),
         format!(
-            "Last failed boot {}",
+            "上次启动失败原因  {}",
             preflight
                 .last_failed_boot_reason
                 .as_deref()
-                .unwrap_or("<none>")
+                .unwrap_or("<无>")
         ),
     ];
     details.extend(preflight.required_binaries.iter().map(|binary| {
         format!(
-            "Required binary {} available={}",
+            "必需二进制        {} available={}",
             binary.name, binary.available
         )
     }));
@@ -748,14 +758,14 @@ pub(crate) fn check_boot_preflight_health(context: &StatusContext) -> Diagnostic
 pub(crate) fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
     let degraded = status.enabled && !status.active;
     let mut details = vec![
-        format!("Enabled          {}", status.enabled),
-        format!("Active           {}", status.active),
-        format!("Supported        {}", status.supported),
-        format!("Filesystem mode  {}", status.filesystem_mode.as_str()),
-        format!("Filesystem live  {}", status.filesystem_active),
+        format!("已启用            {}", status.enabled),
+        format!("已激活            {}", status.active),
+        format!("受支持            {}", status.supported),
+        format!("文件系统模式      {}", status.filesystem_mode.as_str()),
+        format!("文件系统已激活    {}", status.filesystem_active),
     ];
     if let Some(reason) = &status.fallback_reason {
-        details.push(format!("Fallback reason  {reason}"));
+        details.push(format!("降级原因          {reason}"));
     }
     DiagnosticCheck::new(
         "Sandbox",
@@ -765,11 +775,11 @@ pub(crate) fn check_sandbox_health(status: &runtime::SandboxStatus) -> Diagnosti
             DiagnosticLevel::Ok
         },
         if degraded {
-            "sandbox was requested but is not currently active"
+            "已请求沙箱,但当前未激活"
         } else if status.active {
-            "sandbox protections are active"
+            "沙箱保护已激活"
         } else {
-            "sandbox is not active for this session"
+            "当前会话未激活沙箱"
         },
     )
     .with_details(details)
@@ -814,19 +824,19 @@ pub(crate) fn check_system_health(
 ) -> DiagnosticCheck {
     let default_model = config.and_then(runtime::RuntimeConfig::model);
     let mut details = vec![
-        format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
-        format!("Working dir      {}", cwd.display()),
-        format!("Version          {}", VERSION),
-        format!("Build target     {}", BUILD_TARGET.unwrap_or("<unknown>")),
-        format!("Git SHA          {}", GIT_SHA.unwrap_or("<unknown>")),
+        format!("操作系统          {} {}", env::consts::OS, env::consts::ARCH),
+        format!("工作目录          {}", cwd.display()),
+        format!("版本              {}", VERSION),
+        format!("构建目标          {}", BUILD_TARGET.unwrap_or("<未知>")),
+        format!("Git SHA           {}", GIT_SHA.unwrap_or("<未知>")),
     ];
     if let Some(model) = default_model {
-        details.push(format!("Default model    {model}"));
+        details.push(format!("默认模型          {model}"));
     }
     DiagnosticCheck::new(
         "System",
         DiagnosticLevel::Ok,
-        "captured local runtime metadata",
+        "已捕获本地运行时元数据",
     )
     .with_details(details)
     .with_data(Map::from_iter([
@@ -858,13 +868,13 @@ pub(crate) fn check_policy_engine_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "PolicyEngine",
         DiagnosticLevel::Ok,
-        "policy engine evaluate/evaluate_with_events callable",
+        "policy 引擎 evaluate/evaluate_with_events 可调用",
     )
     .with_details(vec![
-        format!("Rules configured   {}", engine.rules().len()),
-        format!("Actions emitted    {}", actions.len()),
-        format!("Decision events    {}", evaluation.events.len()),
-        format!("Smoke context      lane_id={}", context.lane_id),
+        format!("已配置规则数      {}", engine.rules().len()),
+        format!("已发出动作数      {}", actions.len()),
+        format!("决策事件数        {}", evaluation.events.len()),
+        format!("smoke 上下文      lane_id={}", context.lane_id),
     ])
     .with_data(Map::from_iter([
         ("rules_count".to_string(), json!(engine.rules().len())),
@@ -896,30 +906,30 @@ pub(crate) fn check_green_contract_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "GreenContract",
         level,
-        "green contract evaluate callable (merge_ready/Workspace baseline)",
+        "green 契约 evaluate 可调用(merge_ready/Workspace 基线)",
     )
     .with_details(vec![
         format!(
-            "Required level     {}",
+            "要求的等级        {}",
             ContractGreenLevel::Workspace
         ),
         format!(
-            "Satisfied outcome  {}",
+            "满足时结果        {}",
             if satisfied_outcome.is_satisfied() {
-                "satisfied"
+                "已满足"
             } else {
-                "unsatisfied"
+                "未满足"
             }
         ),
         format!(
-            "Unsatisfied outcome  {}",
+            "不满足时结果      {}",
             if unsatisfied_outcome.is_satisfied() {
-                "satisfied"
+                "已满足"
             } else {
-                "unsatisfied"
+                "未满足"
             }
         ),
-        format!("Requirements        {}", contract.requirements.len()),
+        format!("要求数量          {}", contract.requirements.len()),
     ])
     .with_data(Map::from_iter([
         ("required_level".to_string(), json!("workspace")),
@@ -962,17 +972,17 @@ pub(crate) fn check_lane_events_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "LaneEvents",
         level,
-        "lane event try_publish/drain_lane_events roundtrip callable",
+        "lane 事件 try_publish/drain_lane_events 往返链路可调用",
     )
     .with_details(vec![
-        format!("Published          {}", published),
-        format!("Drained count      {}", drained.len()),
+        format!("已发布            {}", published),
+        format!("已取出数量        {}", drained.len()),
         format!(
-            "Smoke event found  {}",
-            if smoke_event.is_some() { "yes" } else { "no" }
+            "smoke 事件已找到  {}",
+            if smoke_event.is_some() { "是" } else { "否" }
         ),
         format!(
-            "Sink capacity      512 (process-wide OnceLock<Mutex<Vec>>)"
+            "sink 容量         512 (进程级 OnceLock<Mutex<Vec>>)"
         ),
     ])
     .with_data(Map::from_iter([
@@ -1039,19 +1049,19 @@ pub(crate) fn check_g004_conformance_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "G004Conformance",
         level,
-        "g004 contract bundle validator distinguishes valid/invalid fixtures",
+        "g004 契约包校验器可区分合法/非法 fixture",
     )
     .with_details(vec![
         format!(
-            "Valid bundle errors    {}",
+            "合法包错误数          {}",
             valid_errors.len()
         ),
         format!(
-            "Invalid bundle errors  {}",
+            "非法包错误数          {}",
             invalid_errors.len()
         ),
-        format!("Bundle schema version  g004.contract.bundle.v1"),
-        format!("Report schema version  g004.report.v1"),
+        format!("Bundle schema 版本    g004.contract.bundle.v1"),
+        format!("Report schema 版本    g004.report.v1"),
     ])
     .with_data(Map::from_iter([
         ("valid_bundle_errors".to_string(), json!(valid_errors.len())),
@@ -1106,14 +1116,14 @@ pub(crate) fn check_canonical_report_v1_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "CanonicalReportV1",
         level,
-        "canonicalize_report + report_content_hash roundtrip callable",
+        "canonicalize_report + report_content_hash 往返链路可调用",
     )
     .with_details(vec![
-        format!("Schema version     {}", canonical.schema_version),
-        format!("Report id          {}", canonical.identity.report_id),
-        format!("Content hash       {}", canonical.identity.content_hash),
-        format!("Hash (standalone)  {}", hash),
-        format!("Claims count       {}", canonical.claims.len()),
+        format!("Schema 版本       {}", canonical.schema_version),
+        format!("报告 ID           {}", canonical.identity.report_id),
+        format!("内容哈希          {}", canonical.identity.content_hash),
+        format!("独立哈希          {}", hash),
+        format!("claim 数量        {}", canonical.claims.len()),
     ])
     .with_data(Map::from_iter([
         ("schema_version".to_string(), json!(canonical.schema_version)),
@@ -1182,13 +1192,13 @@ pub(crate) fn check_branch_lock_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "BranchLock",
         level,
-        "detect_branch_lock_collisions identifies same-branch and nested-module collisions",
+        "detect_branch_lock_collisions 可识别同分支与嵌套模块碰撞",
     )
     .with_details(vec![
-        format!("Intents            {}", intents.len()),
-        format!("Collisions found   {}", collisions.len()),
-        format!("Distinct branches  3 (feat/x, feat/y, feat/z)"),
-        format!("Expected collisions 2 (same-branch + nested-module)"),
+        format!("intent 数量        {}", intents.len()),
+        format!("发现碰撞数        {}", collisions.len()),
+        format!("不同分支          3 (feat/x, feat/y, feat/z)"),
+        format!("预期碰撞数        2 (同分支 + 嵌套模块)"),
     ])
     .with_data(Map::from_iter([
         ("intents_count".to_string(), json!(intents.len())),
@@ -1273,15 +1283,15 @@ pub(crate) fn check_plugin_lifecycle_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "PluginLifecycle",
         level,
-        "plugin lifecycle trait (validate/healthcheck/discover/shutdown) callable",
+        "插件生命周期 trait (validate/healthcheck/discover/shutdown) 可调用",
     )
     .with_details(vec![
         format!(
             "validate_config   {}",
-            if validate_result.is_ok() { "ok" } else { "err" }
+            if validate_result.is_ok() { "正常" } else { "错误" }
         ),
         format!(
-            "healthcheck before {}",
+            "healthcheck 前    {}",
             health_before.state
         ),
         format!(
@@ -1292,10 +1302,10 @@ pub(crate) fn check_plugin_lifecycle_health() -> DiagnosticCheck {
         ),
         format!(
             "shutdown          {}",
-            if shutdown_result.is_ok() { "ok" } else { "err" }
+            if shutdown_result.is_ok() { "正常" } else { "错误" }
         ),
         format!(
-            "healthcheck after  {}",
+            "healthcheck 后    {}",
             health_after.state
         ),
     ])
@@ -1353,23 +1363,23 @@ pub(crate) fn check_mcp_tool_bridge_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "McpToolBridge",
         level,
-        "mcp tool registry (register/list/get/tools/resources) callable",
+        "mcp 工具注册表 (register/list/get/tools/resources) 可调用",
     )
     .with_details(vec![
-        format!("Registered servers  {}", servers.len()),
+        format!("已注册服务器数      {}", servers.len()),
         format!(
-            "Server found        {}",
-            if server_state.is_some() { "yes" } else { "no" }
+            "服务器已找到        {}",
+            if server_state.is_some() { "是" } else { "否" }
         ),
         format!(
-            "Tools listed        {}",
+            "已列出工具数        {}",
             tools.as_ref().map(|t| t.len()).unwrap_or(0)
         ),
         format!(
-            "Resources listed    {}",
+            "已列出资源数        {}",
             resources.as_ref().map(|r| r.len()).unwrap_or(0)
         ),
-        format!("Connection status   {:?}", McpConnectionStatus::Connected),
+        format!("连接状态            {:?}", McpConnectionStatus::Connected),
     ])
     .with_data(Map::from_iter([
         ("servers_count".to_string(), json!(servers.len())),
@@ -1427,39 +1437,39 @@ pub(crate) fn check_team_cron_registry_health() -> DiagnosticCheck {
     DiagnosticCheck::new(
         "TeamCronRegistry",
         level,
-        "team + cron registry (create/get/list/delete/disable/record_run) callable",
+        "team + cron 注册表 (create/get/list/delete/disable/record_run) 可调用",
     )
     .with_details(vec![
-        format!("Team created        {}", team.team_id),
+        format!("Team 已创建         {}", team.team_id),
         format!(
-            "Team found          {}",
-            if team_fetched.is_some() { "yes" } else { "no" }
+            "Team 已找到         {}",
+            if team_fetched.is_some() { "是" } else { "否" }
         ),
-        format!("Team list count     {}", team_list_len),
+        format!("Team 列表数量       {}", team_list_len),
         format!(
-            "Team deleted        {}",
-            if team_deleted.is_some() { "yes" } else { "no" }
+            "Team 已删除         {}",
+            if team_deleted.is_some() { "是" } else { "否" }
         ),
         format!(
-            "Team status (orig)  {:?}",
+            "Team 状态(原始)    {:?}",
             team_status_after_delete.unwrap_or(TeamStatus::Created)
         ),
-        format!("Cron created        {}", cron.cron_id),
+        format!("Cron 已创建         {}", cron.cron_id),
         format!(
-            "Cron found          {}",
-            if cron_fetched.is_some() { "yes" } else { "no" }
+            "Cron 已找到         {}",
+            if cron_fetched.is_some() { "是" } else { "否" }
         ),
-        format!("Cron enabled count  {}", cron_enabled_count),
+        format!("Cron 启用数量       {}", cron_enabled_count),
         format!(
-            "Cron disabled ok    {}",
-            if cron_disable_result.is_ok() { "yes" } else { "no" }
+            "Cron 禁用成功       {}",
+            if cron_disable_result.is_ok() { "是" } else { "否" }
         ),
-        format!("Cron after disable  {}", cron_disabled_count),
+        format!("Cron 禁用后数量     {}", cron_disabled_count),
         format!(
-            "Cron run recorded   {}",
-            if cron_record_run_result.is_ok() { "yes" } else { "no" }
+            "Cron 运行已记录     {}",
+            if cron_record_run_result.is_ok() { "是" } else { "否" }
         ),
-        format!("Cron run count      {}", cron_run_count),
+        format!("Cron 运行次数       {}", cron_run_count),
     ])
     .with_data(Map::from_iter([
         ("team_created".to_string(), json!(team_fetched.is_some())),
@@ -1631,17 +1641,17 @@ impl BootPreflightSnapshot {
             .trust_gate_allowed
             .map(|value| {
                 if value {
-                    "allowlisted"
+                    "已加入白名单"
                 } else {
-                    "not allowlisted"
+                    "未加入白名单"
                 }
             })
-            .unwrap_or("unknown");
+            .unwrap_or("未知");
         let freshness = self
             .branch_freshness
             .fresh
-            .map(|fresh| if fresh { "fresh" } else { "behind" })
-            .unwrap_or("no upstream");
+            .map(|fresh| if fresh { "最新" } else { "落后" })
+            .unwrap_or("无上游");
         format!(
             "repo={} worktree={} branch={} trust={} mcp={} plugins={} last_failed={}",
             self.repo_exists,
@@ -1650,7 +1660,7 @@ impl BootPreflightSnapshot {
             trust,
             self.mcp_startup_eligible,
             self.plugin_startup_eligible,
-            self.last_failed_boot_reason.as_deref().unwrap_or("none")
+            self.last_failed_boot_reason.as_deref().unwrap_or("无")
         )
     }
 }
@@ -1688,23 +1698,23 @@ impl GitWorkspaceSummary {
 
     pub(crate) fn headline(self) -> String {
         if self.is_clean() {
-            "clean".to_string()
+            "干净".to_string()
         } else {
             let mut details = Vec::new();
             if self.staged_files > 0 {
-                details.push(format!("{} staged", self.staged_files));
+                details.push(format!("{} 已暂存", self.staged_files));
             }
             if self.unstaged_files > 0 {
-                details.push(format!("{} unstaged", self.unstaged_files));
+                details.push(format!("{} 未暂存", self.unstaged_files));
             }
             if self.untracked_files > 0 {
-                details.push(format!("{} untracked", self.untracked_files));
+                details.push(format!("{} 未跟踪", self.untracked_files));
             }
             if self.conflicted_files > 0 {
-                details.push(format!("{} conflicted", self.conflicted_files));
+                details.push(format!("{} 有冲突", self.conflicted_files));
             }
             format!(
-                "dirty · {} files · {}",
+                "脏 · {} 个文件 · {}",
                 self.changed_files,
                 details.join(", ")
             )

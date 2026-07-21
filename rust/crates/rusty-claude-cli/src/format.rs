@@ -132,13 +132,13 @@ pub(crate) fn format_permissions_switch_report(previous: &str, next: &str) -> St
 pub(crate) fn format_cost_report(usage: TokenUsage) -> String {
     let estimated_cost = usage.estimate_cost_usd();
     format!(
-        "Cost
-  Input tokens     {}
-  Output tokens    {}
-  Cache create     {}
-  Cache read       {}
-  Total tokens     {}
-  Estimated cost   {}",
+        "成本
+  输入 tokens      {}
+  输出 tokens      {}
+  缓存创建         {}
+  缓存读取         {}
+  总 tokens        {}
+  预估成本         {}",
         usage.input_tokens,
         usage.output_tokens,
         usage.cache_creation_input_tokens,
@@ -501,46 +501,46 @@ pub(crate) fn format_status_report(
     // the body below still reports everything that could be resolved without
     // config (workspace, git, sandbox defaults, etc.).
     let status_line = if context.config_load_error.is_some() {
-        "Status (degraded)"
+        "状态 (降级)"
     } else {
-        "Status"
+        "状态"
     };
     let mut blocks: Vec<String> = Vec::new();
     if let Some(err) = context.config_load_error.as_deref() {
         blocks.push(format!(
-            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
+            "配置加载错误\n  状态             失败\n  摘要             运行时配置加载失败;仅报告部分状态\n  详情             {err}\n  提示             `claw doctor` 会分类配置解析错误;修复列出的字段后重新运行"
         ));
     }
-    // #148: render Model source line after Model, showing where the string
-    // came from (flag / env / config / default) and the raw input if any.
+    // #148:在 Model 之后渲染 Model source 行,显示字符串来源
+    // (flag / env / config / default)以及原始输入(如有)。
     let model_source_line = provenance
         .map(|p| match &p.raw {
             Some(raw) if raw != model => {
-                format!("\n  Model source     {} (raw: {raw})", p.source.as_str())
+                format!("\n  模型来源         {} (原始: {raw})", p.source.as_str())
             }
-            Some(_) => format!("\n  Model source     {}", p.source.as_str()),
-            None => format!("\n  Model source     {}", p.source.as_str()),
+            Some(_) => format!("\n  模型来源         {}", p.source.as_str()),
+            None => format!("\n  模型来源         {}", p.source.as_str()),
         })
         .unwrap_or_default();
     blocks.extend([
         format!(
             "{status_line}
-  Model            {model}{model_source_line}
-  Permission mode  {permission_mode}
-  Messages         {}
-  Turns            {}
-  Estimated tokens {}",
+  模型             {model}{model_source_line}
+  权限模式         {permission_mode}
+  消息数           {}
+  轮次             {}
+  预估 tokens      {}",
             usage.message_count, usage.turns, usage.estimated_tokens,
         ),
         format!(
-            "Usage
-  Latest total     {}
-  Cumulative input {}
-  Cumulative output {}
-  Cache create     {}
-  Cache read       {}
-  Cumulative total {}
-  Estimated cost   {}",
+            "用量
+  本次总量         {}
+  累计输入         {}
+  累计输出         {}
+  缓存创建         {}
+  缓存读取         {}
+  累计总量         {}
+  预估成本         {}",
             usage.latest.total_tokens(),
             usage.cumulative.input_tokens,
             usage.cumulative.output_tokens,
@@ -550,28 +550,28 @@ pub(crate) fn format_status_report(
             format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()),
         ),
         format!(
-            "Workspace
-  Cwd              {}
-  Project root     {}
-  Git branch       {}
-  Git state        {}
-  Changed files    {}
-  Staged           {}
-  Unstaged         {}
-  Untracked        {}
-  Session          {}
-  Lifecycle        {}
-  Branch fresh     {}
-  Boot preflight   {}
-  Config files     loaded {}/{}
-  Memory files     {}
-  Suggested flow   /status → /diff → /commit",
+            "工作区
+  当前目录         {}
+  项目根目录       {}
+  Git 分支         {}
+  Git 状态         {}
+  已更改文件       {}
+  已暂存           {}
+  未暂存           {}
+  未跟踪           {}
+  会话             {}
+  生命周期         {}
+  分支最新         {}
+  启动预检         {}
+  配置文件         已加载 {}/{}
+  Memory 文件      {}
+  建议流程         /status → /diff → /commit",
             context.cwd.display(),
             context
                 .project_root
                 .as_ref()
-                .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
-            context.git_branch.as_deref().unwrap_or("unknown"),
+                .map_or_else(|| "未知".to_string(), |path| path.display().to_string()),
+            context.git_branch.as_deref().unwrap_or("未知"),
             context.git_summary.headline(),
             context.git_summary.changed_files,
             context.git_summary.staged_files,
@@ -585,8 +585,8 @@ pub(crate) fn format_status_report(
             context
                 .branch_freshness
                 .fresh
-                .map(|fresh| if fresh { "yes" } else { "behind" })
-                .unwrap_or("no upstream"),
+                .map(|fresh| if fresh { "是" } else { "落后" })
+                .unwrap_or("无上游"),
             context.boot_preflight.summary(),
             context.loaded_config_files,
             context.discovered_config_files,
@@ -599,20 +599,20 @@ pub(crate) fn format_status_report(
 
 pub(crate) fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
     format!(
-        "Sandbox
-  Enabled           {}
-  Active            {}
-  Supported         {}
-  In container      {}
-  Requested ns      {}
-  Active ns         {}
-  Requested net     {}
-  Active net        {}
-  Filesystem mode   {}
-  Filesystem active {}
-  Allowed mounts    {}
-  Markers           {}
-  Fallback reason   {}",
+        "Sandbox 沙箱
+  已启用            {}
+  已激活            {}
+  受支持            {}
+  在容器中          {}
+  请求的命名空间    {}
+  激活的命名空间    {}
+  请求的网络隔离    {}
+  激活的网络        {}
+  文件系统模式      {}
+  文件系统已激活    {}
+  允许的挂载        {}
+  容器标记          {}
+  降级原因          {}",
         status.enabled,
         status.active,
         status.supported,
@@ -624,19 +624,19 @@ pub(crate) fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
         status.filesystem_mode.as_str(),
         status.filesystem_active,
         if status.allowed_mounts.is_empty() {
-            "<none>".to_string()
+            "<无>".to_string()
         } else {
             status.allowed_mounts.join(", ")
         },
         if status.container_markers.is_empty() {
-            "<none>".to_string()
+            "<无>".to_string()
         } else {
             status.container_markers.join(", ")
         },
         status
             .fallback_reason
             .clone()
-            .unwrap_or_else(|| "<none>".to_string()),
+            .unwrap_or_else(|| "<无>".to_string()),
     )
 }
 
@@ -948,15 +948,15 @@ pub(crate) fn render_config_report(
 
     let mut lines = vec![
         format!(
-            "Config
-  Working directory {}
-  Loaded files      {}
-  Merged keys       {}",
+            "Config 配置
+  工作目录         {}
+  已加载文件       {}
+  合并键数         {}",
             cwd.display(),
             runtime_config.loaded_entries().len(),
             runtime_config.merged().len()
         ),
-        "Discovered files".to_string(),
+        "发现的文件".to_string(),
     ];
     for entry in discovered {
         let source = match entry.source {
@@ -969,9 +969,9 @@ pub(crate) fn render_config_report(
             .iter()
             .any(|loaded_entry| loaded_entry.path == entry.path)
         {
-            "loaded"
+            "已加载"
         } else {
-            "missing"
+            "缺失"
         };
         lines.push(format!(
             "  {source:<7} {status:<7} {}",
@@ -980,7 +980,7 @@ pub(crate) fn render_config_report(
     }
 
     if let Some(section) = section {
-        lines.push(format!("Merged section: {section}"));
+        lines.push(format!("合并的节: {section}"));
         let value = match section {
             "env" => runtime_config.get("env"),
             "hooks" => runtime_config.get("hooks"),
@@ -990,7 +990,7 @@ pub(crate) fn render_config_report(
                 .or_else(|| runtime_config.get("enabledPlugins")),
             other => {
                 lines.push(format!(
-                    "  Unsupported config section '{other}'. Use env, hooks, model, or plugins."
+                    "  不支持的配置节 '{other}'。请使用 env、hooks、model 或 plugins。"
                 ));
                 return Ok(lines.join(
                     "
@@ -1002,7 +1002,7 @@ pub(crate) fn render_config_report(
             "  {}",
             match value {
                 Some(value) => value.render(),
-                None => "<unset>".to_string(),
+                None => "<未设置>".to_string(),
             }
         ));
         return Ok(lines.join(
@@ -1011,7 +1011,7 @@ pub(crate) fn render_config_report(
         ));
     }
 
-    lines.push("Merged JSON".to_string());
+    lines.push("合并的 JSON".to_string());
     lines.push(format!("  {}", runtime_config.as_json().render()));
     Ok(lines.join(
         "
@@ -1075,7 +1075,7 @@ pub(crate) fn render_config_json(
                     "kind": "config",
                     "section": other,
                     "ok": false,
-                    "error": format!("Unsupported config section '{other}'. Use env, hooks, model, or plugins."),
+                    "error": format!("不支持的配置节 '{other}'。请使用 env、hooks、model 或 plugins。"),
                     "cwd": cwd.display().to_string(),
                     "loaded_files": loaded_paths.len(),
                     "files": files,
@@ -1105,48 +1105,46 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
     let cwd = env::current_dir()?;
     let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
     let mut lines = vec![format!(
-        "Memory
-  Working directory {}
-  Instruction files {}",
+        "Memory 记忆
+  工作目录         {}
+  指令文件数       {}",
         cwd.display(),
         project_context.instruction_files.len()
     )];
     if project_context.instruction_files.is_empty() {
-        lines.push("Discovered files".to_string());
+        lines.push("发现的文件".to_string());
         lines.push(
-            "  No CLAUDE instruction files discovered in the current directory ancestry."
+            "  在当前目录的祖先目录中未发现 CLAUDE 指令文件。"
                 .to_string(),
         );
     } else {
-        lines.push("Discovered files".to_string());
+        lines.push("发现的文件".to_string());
         for (index, file) in project_context.instruction_files.iter().enumerate() {
             let preview = file.content.lines().next().unwrap_or("").trim();
             let preview = if preview.is_empty() {
-                "<empty>"
+                "<空>"
             } else {
                 preview
             };
             lines.push(format!("  {}. {}", index + 1, file.path.display(),));
             lines.push(format!(
-                "     lines={} preview={}",
+                "     行数={} 预览={}",
                 file.content.lines().count(),
                 preview
             ));
         }
     }
 
-    // Persistent memory surface (Persona / Human / Tasks blocks + active entries).
-    // Loaded-and-frozen so the rendered snapshot matches what the runtime
-    // injects into the system prompt for the current session. Silently
-    // skipped when no memory.json exists yet — keeps the command usable
-    // on fresh workspaces.
+    // 持久化记忆面(Persona / Human / Tasks 块 + 活跃条目)。
+    // 加载并冻结,使渲染的快照与运行时注入当前会话系统提示的内容一致。
+    // 当 memory.json 尚不存在时静默跳过 — 保持命令在全新工作区可用。
     let memory_path = cwd.join(".claw").join("memory.json");
     if memory_path.exists() {
         let memory = runtime::PersistentMemory::load_and_freeze(&memory_path);
         lines.push(String::new());
-        lines.push("Persistent memory".to_string());
-        lines.push(format!("  File {}", memory_path.display()));
-        // Block summary: label + capacity ratio.
+        lines.push("持久化记忆".to_string());
+        lines.push(format!("  文件 {}", memory_path.display()));
+        // 块摘要:标签 + 容量占比。
         for block in memory.blocks() {
             let cur = block.content().chars().count();
             let max = block.max_chars();
@@ -1157,12 +1155,12 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
             };
             let preview = block.content().lines().next().unwrap_or("").trim();
             let preview = if preview.is_empty() {
-                "<empty>"
+                "<空>"
             } else {
                 preview
             };
             lines.push(format!(
-                "  {} {}/{} chars ({:.0}%) preview={}",
+                "  {} {}/{} 字符 ({:.0}%) 预览={}",
                 block.label(),
                 cur,
                 max,
@@ -1175,11 +1173,11 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
             .unwrap_or_default()
             .as_millis() as i64;
         let active = memory.active_entries(now_ms);
-        lines.push(format!("  Active entries {}", active.len()));
+        lines.push(format!("  活跃条目         {}", active.len()));
         if !active.is_empty() {
             for entry in active.iter().take(10) {
                 let marker = if entry.is_unverified(now_ms) {
-                    "[unverified] "
+                    "[未验证] "
                 } else {
                     ""
                 };
@@ -1187,10 +1185,10 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
                 lines.push(format!("    - {marker}{preview}"));
             }
             if active.len() > 10 {
-                lines.push(format!("    ... and {} more", active.len() - 10));
+                lines.push(format!("    ... 还有 {} 条", active.len() - 10));
             }
         }
-        lines.push(format!("  Archived entries {}", memory.archive().len()));
+        lines.push(format!("  归档条目         {}", memory.archive().len()));
     }
 
     Ok(lines.join(
@@ -1318,9 +1316,9 @@ pub(crate) fn render_diff_report() -> Result<String, Box<dyn std::error::Error>>
 }
 
 pub(crate) fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    // Verify we are inside a git repository before calling `git diff`.
-    // Running `git diff --cached` outside a git tree produces a misleading
-    // "unknown option `cached`" error because git falls back to --no-index mode.
+    // 在调用 `git diff` 之前先确认我们在 git 仓库内。
+    // 在 git 仓库外运行 `git diff --cached` 会产生误导性的
+    // "unknown option `cached`" 错误,因为 git 会回退到 --no-index 模式。
     let in_git_repo = std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
@@ -1329,7 +1327,7 @@ pub(crate) fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::
         .unwrap_or(false);
     if !in_git_repo {
         return Ok(format!(
-            "Diff\n  Result           no git repository\n  Detail           {} is not inside a git project",
+            "Diff\n  结果             无 git 仓库\n  详情             {} 不在 git 项目内",
             cwd.display()
         ));
     }
@@ -1337,17 +1335,17 @@ pub(crate) fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::
     let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
     if staged.trim().is_empty() && unstaged.trim().is_empty() {
         return Ok(
-            "Diff\n  Result           clean working tree\n  Detail           no current changes"
+            "Diff\n  结果             干净的工作树\n  详情             当前没有更改"
                 .to_string(),
         );
     }
 
     let mut sections = Vec::new();
     if !staged.trim().is_empty() {
-        sections.push(format!("Staged changes:\n{}", colorize_diff(&staged)));
+        sections.push(format!("已暂存的更改:\n{}", colorize_diff(&staged)));
     }
     if !unstaged.trim().is_empty() {
-        sections.push(format!("Unstaged changes:\n{}", colorize_diff(&unstaged)));
+        sections.push(format!("未暂存的更改:\n{}", colorize_diff(&unstaged)));
     }
 
     Ok(format!("Diff\n\n{}", sections.join("\n\n")))
@@ -1461,7 +1459,7 @@ pub(crate) fn render_diff_json_for(
         return Ok(serde_json::json!({
             "kind": "diff",
             "result": "no_git_repo",
-            "detail": format!("{} is not inside a git project", cwd.display()),
+            "detail": format!("{} 不在 git 项目内", cwd.display()),
         }));
     }
     let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
