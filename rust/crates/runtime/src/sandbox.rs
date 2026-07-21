@@ -490,10 +490,7 @@ impl WindowsSandboxBuilder {
     ///
     /// 返回 `Ok(())` 表示 Job Object 已创建并设置限制。
     /// 返回 `Err` 表示设置失败(非致命,不阻断主流程)。
-    pub fn assign_process_to_job_object(
-        &self,
-        pid: u32,
-    ) -> Result<(), String> {
+    pub fn assign_process_to_job_object(&self, pid: u32) -> Result<(), String> {
         if !cfg!(target_os = "windows") {
             return Ok(());
         }
@@ -770,7 +767,13 @@ impl SandboxBuilder for MacOsSandboxBuilder {
 
         Ok(SandboxCommand {
             program: "sandbox-exec".to_string(),
-            args: vec!["-p".to_string(), profile, "sh".to_string(), "-c".to_string(), command.to_string()],
+            args: vec![
+                "-p".to_string(),
+                profile,
+                "sh".to_string(),
+                "-c".to_string(),
+                command.to_string(),
+            ],
             env,
             creation_flags: 0,
         })
@@ -797,8 +800,8 @@ pub fn platform_sandbox_builder() -> Box<dyn SandboxBuilder> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_linux_sandbox_command, detect_container_environment_from, FilesystemIsolationMode,
-        platform_sandbox_builder, SandboxBuilder, SandboxConfig, SandboxCommand,
+        build_linux_sandbox_command, detect_container_environment_from, platform_sandbox_builder,
+        FilesystemIsolationMode, SandboxBuilder, SandboxCommand, SandboxConfig,
         SandboxDetectionInputs, WindowsSandboxBuilder, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
         DETACHED_PROCESS,
     };
@@ -923,7 +926,8 @@ mod tests {
     #[test]
     fn windows_sandbox_builder_returns_create_no_window_flags() {
         let builder = WindowsSandboxBuilder::new();
-        let status = super::resolve_sandbox_status(&SandboxConfig::default(), Path::new("/workspace"));
+        let status =
+            super::resolve_sandbox_status(&SandboxConfig::default(), Path::new("/workspace"));
         let result = builder.build("echo hi", Path::new("/workspace"), &status);
 
         // 在非 Windows 平台应返回 Err
@@ -940,8 +944,11 @@ mod tests {
 
     #[test]
     fn windows_sandbox_builder_env_includes_limits() {
-        let builder = WindowsSandboxBuilder::new().with_memory_limit(8192).with_cpu_rate(50);
-        let status = super::resolve_sandbox_status(&SandboxConfig::default(), Path::new("/workspace"));
+        let builder = WindowsSandboxBuilder::new()
+            .with_memory_limit(8192)
+            .with_cpu_rate(50);
+        let status =
+            super::resolve_sandbox_status(&SandboxConfig::default(), Path::new("/workspace"));
 
         if cfg!(target_os = "windows") {
             let cmd = builder

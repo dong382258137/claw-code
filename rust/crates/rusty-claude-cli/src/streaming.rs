@@ -22,9 +22,9 @@ use std::time::Duration;
 use api::{
     detect_provider_kind, model_requires_reasoning_content_in_history, resolve_startup_auth_source,
     AnthropicClient, AuthSource, CacheControl, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock,
+    SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
@@ -53,7 +53,11 @@ pub(crate) enum StatusEvent {
     /// A text delta arrived (incremental assistant output).
     TextDelta(String),
     /// A tool use started (tool name + input JSON provided).
-    ToolUse { id: String, name: String, input: String },
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
     /// A tool finished executing (id, name, output, is_error).
     ToolResult {
         id: String,
@@ -79,10 +83,7 @@ pub(crate) enum StatusEvent {
     /// `streaming: true` 一直保留导致 UI 假死。现在在每个 `return Err(...)` 前
     /// emit 此事件，让 TUI 能即时调用 `finish_turn()` 并向用户显示错误。
     /// `recoverable` 为 true 表示错误可重试（如 429 限流），false 表示致命错误。
-    StreamError {
-        message: String,
-        recoverable: bool,
-    },
+    StreamError { message: String, recoverable: bool },
 }
 
 pub(crate) const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -494,12 +495,8 @@ impl AnthropicRuntimeClient {
                             redacted: false,
                         });
                     }
-                    events.push(AssistantEvent::Usage(
-                        start.message.usage.token_usage(),
-                    ));
-                    self.emit_status(StatusEvent::Usage(
-                        start.message.usage.token_usage(),
-                    ));
+                    events.push(AssistantEvent::Usage(start.message.usage.token_usage()));
+                    self.emit_status(StatusEvent::Usage(start.message.usage.token_usage()));
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
                     push_output_block(
@@ -672,7 +669,10 @@ pub(crate) fn format_user_visible_api_error(session_id: &str, error: &api::ApiEr
     }
 }
 
-pub(crate) fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
+pub(crate) fn format_context_window_blocked_error(
+    session_id: &str,
+    error: &api::ApiError,
+) -> String {
     let mut lines = vec![
         "Context window blocked".to_string(),
         "  Failure class    context_window_blocked".to_string(),
@@ -800,7 +800,9 @@ pub(crate) fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_
         .collect()
 }
 
-pub(crate) fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+pub(crate) fn collect_prompt_cache_events(
+    summary: &runtime::TurnSummary,
+) -> Vec<serde_json::Value> {
     summary
         .prompt_cache_events
         .iter()
@@ -925,7 +927,10 @@ pub(crate) fn response_to_events(
     Ok(events)
 }
 
-pub(crate) fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
+pub(crate) fn push_prompt_cache_record(
+    client: &ApiProviderClient,
+    events: &mut Vec<AssistantEvent>,
+) {
     // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
     // to the Anthropic variant and returns `None` for OpenAI-compat /
     // xAI variants, which do not have a prompt cache. So this helper
@@ -974,7 +979,9 @@ pub(crate) fn permission_policy(
 /// This lets `stream()` route system content through `MessageRequest.system`
 /// (where it can be prompt-cached) instead of flattening it into the messages
 /// array as a fake "user" turn.
-pub(crate) fn extract_system_messages(messages: &[ConversationMessage]) -> (String, Vec<ConversationMessage>) {
+pub(crate) fn extract_system_messages(
+    messages: &[ConversationMessage],
+) -> (String, Vec<ConversationMessage>) {
     let mut system_texts: Vec<String> = Vec::new();
     let mut rest: Vec<ConversationMessage> = Vec::new();
     for message in messages {
@@ -1012,8 +1019,8 @@ pub(crate) fn compact_tool_output_for_model(
     output: &str,
     is_error: bool,
 ) -> String {
-    let parsed: serde_json::Value = serde_json::from_str(output)
-        .unwrap_or(serde_json::Value::String(output.to_string()));
+    let parsed: serde_json::Value =
+        serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
 
     // 错误路径优先短路，防止错误结果被成功模板覆盖。
     if is_error {
@@ -1096,10 +1103,7 @@ pub(crate) fn compact_tool_output_for_model(
     }
 }
 
-pub(crate) fn convert_messages(
-    messages: &[ConversationMessage],
-    model: &str,
-) -> Vec<InputMessage> {
+pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) -> Vec<InputMessage> {
     let keep_thinking = model_requires_reasoning_content_in_history(model);
     let mut result: Vec<InputMessage> = Vec::with_capacity(messages.len());
     for message in messages {
@@ -1111,9 +1115,7 @@ pub(crate) fn convert_messages(
             .blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => {
-                    Some(InputContentBlock::Text { text: text.clone() })
-                }
+                ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
                 ContentBlock::Thinking { .. } => {
                     if keep_thinking {
                         Some(InputContentBlock::Thinking {
@@ -1138,9 +1140,9 @@ pub(crate) fn convert_messages(
                 } => Some(InputContentBlock::ToolResult {
                     tool_use_id: tool_use_id.clone(),
                     content: vec![ToolResultContentBlock::Text {
-                    text: compact_tool_output_for_model(tool_name, output, *is_error),
-                }],
-                is_error: *is_error,
+                        text: compact_tool_output_for_model(tool_name, output, *is_error),
+                    }],
+                    is_error: *is_error,
                 }),
             })
             .collect::<Vec<_>>();
@@ -1158,8 +1160,9 @@ pub(crate) fn convert_messages(
         // 且前一条已生成的 InputMessage 也是 user 消息且只含 ToolResult blocks，
         // 则把当前的 ToolResult blocks 合并到前一条 InputMessage 里。
         if role == "user" && message.role == MessageRole::Tool {
-            let current_is_tool_only =
-                content.iter().all(|b| matches!(b, InputContentBlock::ToolResult { .. }));
+            let current_is_tool_only = content
+                .iter()
+                .all(|b| matches!(b, InputContentBlock::ToolResult { .. }));
             if current_is_tool_only {
                 if let Some(last) = result.last_mut() {
                     let last_is_user = last.role == "user";

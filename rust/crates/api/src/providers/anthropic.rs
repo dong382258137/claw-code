@@ -13,7 +13,9 @@ use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
-use crate::http_client::{build_http_client_or_default, build_http_client_with_opts, ProxyConfig, TimeoutConfig};
+use crate::http_client::{
+    build_http_client_or_default, build_http_client_with_opts, ProxyConfig, TimeoutConfig,
+};
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{

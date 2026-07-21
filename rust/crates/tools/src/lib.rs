@@ -19,8 +19,7 @@ use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace_with_roots,
-    strip_verbatim_prefix,
+    read_file_in_workspace_with_roots, strip_verbatim_prefix,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
@@ -78,10 +77,7 @@ pub fn init_lsp_from_config(
         );
 
         // 尝试 spawn 真实 server 子进程
-        let effective_root = server_cfg
-            .root_path
-            .as_deref()
-            .unwrap_or(root_str);
+        let effective_root = server_cfg.root_path.as_deref().unwrap_or(root_str);
 
         match registry.spawn_server(language, &server_cfg.command, effective_root) {
             Ok(()) => {
@@ -2060,7 +2056,10 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
 fn ssrf_block_reason(url_str: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url_str).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Some(format!("scheme '{}' not allowed (only http/https)", parsed.scheme()));
+        return Some(format!(
+            "scheme '{}' not allowed (only http/https)",
+            parsed.scheme()
+        ));
     }
     let host = parsed.host_str()?.to_lowercase();
     let blocked_host_names = ["localhost", "metadata.google.internal"];
@@ -2456,15 +2455,18 @@ fn branch_divergence_output(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_file(
-    input: ReadFileInput,
-    extra_roots: Option<&[PathBuf]>,
-) -> Result<String, String> {
+fn run_read_file(input: ReadFileInput, extra_roots: Option<&[PathBuf]>) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let extra = extra_roots.unwrap_or(&[]);
     to_pretty_json(
-        read_file_in_workspace_with_roots(&input.path, input.offset, input.limit, &workspace, extra)
-            .map_err(io_to_string)?,
+        read_file_in_workspace_with_roots(
+            &input.path,
+            input.offset,
+            input.limit,
+            &workspace,
+            extra,
+        )
+        .map_err(io_to_string)?,
     )
 }
 
@@ -2482,10 +2484,7 @@ fn run_write_file(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(
-    input: EditFileInput,
-    extra_roots: Option<&[PathBuf]>,
-) -> Result<String, String> {
+fn run_edit_file(input: EditFileInput, extra_roots: Option<&[PathBuf]>) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let extra = extra_roots.unwrap_or(&[]);
     to_pretty_json(
@@ -2509,8 +2508,13 @@ fn run_glob_search(
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let extra = extra_roots.unwrap_or(&[]);
     to_pretty_json(
-        glob_search_in_workspace_with_roots(&input.pattern, input.path.as_deref(), &workspace, extra)
-            .map_err(io_to_string)?,
+        glob_search_in_workspace_with_roots(
+            &input.pattern,
+            input.path.as_deref(),
+            &workspace,
+            extra,
+        )
+        .map_err(io_to_string)?,
     )
 }
 
@@ -2521,7 +2525,9 @@ fn run_grep_search(
 ) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let extra = extra_roots.unwrap_or(&[]);
-    to_pretty_json(grep_search_in_workspace_with_roots(&input, &workspace, extra).map_err(io_to_string)?)
+    to_pretty_json(
+        grep_search_in_workspace_with_roots(&input, &workspace, extra).map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2702,11 +2708,7 @@ fn path_within_workspace_roots(
 
 /// 检查 resolved 路径是否落在 cwd 或任一 extra_root 内。
 /// 比较前两端都 strip verbatim 前缀，避免 Windows 上 `\\?\` 与无前缀路径不匹配。
-fn resolved_within_any_root(
-    resolved: &Path,
-    cwd: &Path,
-    extra_roots: Option<&[PathBuf]>,
-) -> bool {
+fn resolved_within_any_root(resolved: &Path, cwd: &Path, extra_roots: Option<&[PathBuf]>) -> bool {
     let resolved_stripped = strip_verbatim_prefix(resolved);
     let cwd_stripped = strip_verbatim_prefix(cwd);
     if resolved_stripped.starts_with(&cwd_stripped) {
@@ -7473,8 +7475,8 @@ mod tests {
 
         // 2) 对照组：不设置 extra_roots，同一文件应被分类为 DangerFullAccess 并拒绝
         let policy2 = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let registry2 = GlobalToolRegistry::builtin()
-            .with_enforcer(PermissionEnforcer::new(policy2));
+        let registry2 =
+            GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy2));
         let result2 = registry2.execute("read_file", &json!({ "path": file_path_str }));
         assert!(
             result2.is_err(),
@@ -10909,8 +10911,7 @@ printf 'pwsh:%s' "$1"
     #[test]
     fn ask_user_question_handler_can_be_cleared() {
         // 设置后立即清理
-        let handler: super::AskUserQuestionHandler =
-            Arc::new(|_| Ok("dummy".to_string()));
+        let handler: super::AskUserQuestionHandler = Arc::new(|_| Ok("dummy".to_string()));
         super::set_ask_user_question_handler(Some(handler));
         super::set_ask_user_question_handler(None);
         // current_ask_user_question_handler 是私有的，通过行为验证：

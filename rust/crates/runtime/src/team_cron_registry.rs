@@ -792,7 +792,10 @@ mod tests {
 
         registry.create("First", vec![]);
         // mutation 后文件应该被创建
-        assert!(path.exists(), "persistence file should be created after mutation");
+        assert!(
+            path.exists(),
+            "persistence file should be created after mutation"
+        );
 
         let json = std::fs::read_to_string(&path).unwrap();
         assert!(json.contains("\"counter\": 1"));
@@ -872,7 +875,8 @@ mod tests {
         let path = temp_path("team-nonexist");
         let _ = std::fs::remove_file(&path);
         // 路径不存在时应返回 Ok,registry 为空且 file_path=Some(path)
-        let registry = TeamRegistry::with_persistence(&path).expect("nonexistent path should be ok");
+        let registry =
+            TeamRegistry::with_persistence(&path).expect("nonexistent path should be ok");
         assert!(registry.is_persistent());
         assert!(registry.is_empty());
         std::fs::remove_file(&path).ok();

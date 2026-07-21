@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 
-use claw_acp::{AcpGatewayReceiver, AcpGatewaySender, spawn_stdin_line_reader};
+use claw_acp::{spawn_stdin_line_reader, AcpGatewayReceiver, AcpGatewaySender};
 
 use crate::agent::ClawAgentBuilder;
 
@@ -165,8 +165,7 @@ where
     //    c) AgentSideConnection::new(agent, outgoing, incoming, spawn_fn) 返回 (conn, handle_io)
     //    d) AcpGatewayReceiver::new(rx, conn) 在此 move conn,spawn run()
     let (gw_tx, gw_rx) = mpsc::unbounded_channel();
-    let client_gateway =
-        AcpGatewaySender::<acp::AgentSide>::new(gw_tx).with_tracing(true);
+    let client_gateway = AcpGatewaySender::<acp::AgentSide>::new(gw_tx).with_tracing(true);
 
     // 2. 构造 agent(builder.build 在 LocalSet 内完成,因 StaticToolExecutor 非 Send)
     let agent = builder.build(client_gateway);
@@ -176,14 +175,9 @@ where
     //    - agent_rc 实现 acp::Agent → 自动实现 MessageHandler<AgentSide>
     //    - spawn_fn 用 spawn_local(LocalSet 上)
     //    - incoming/outgoing 已是 futures::io::{AsyncRead, AsyncWrite}
-    let (conn, handle_io) = acp::AgentSideConnection::new(
-        agent_rc,
-        outgoing,
-        incoming,
-        |fut| {
-            tokio::task::spawn_local(fut);
-        },
-    );
+    let (conn, handle_io) = acp::AgentSideConnection::new(agent_rc, outgoing, incoming, |fut| {
+        tokio::task::spawn_local(fut);
+    });
 
     // 4. spawn GatewayReceiver:消费 agent 推送的 AcpClientMessage,转发到 conn
     //    AcpGatewayReceiver::new(rx, conn) 在此 move conn
@@ -364,8 +358,7 @@ mod tests {
                     },
                     "id": 1
                 });
-                let req_line =
-                    format!("{}\n", serde_json::to_string(&init_req).unwrap());
+                let req_line = format!("{}\n", serde_json::to_string(&init_req).unwrap());
                 client_tx.write_all(req_line.as_bytes()).await.unwrap();
                 client_tx.flush().await.unwrap();
 
@@ -400,10 +393,7 @@ mod tests {
                     resp
                 );
                 assert!(
-                    !resp["result"]["authMethods"]
-                        .as_array()
-                        .unwrap()
-                        .is_empty(),
+                    !resp["result"]["authMethods"].as_array().unwrap().is_empty(),
                     "authMethods should not be empty: {}",
                     resp
                 );
@@ -446,11 +436,8 @@ mod tests {
                     run_agent_on_io(builder, cancel, incoming, outgoing).await
                 });
 
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    agent_task,
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), agent_task).await;
 
                 assert!(result.is_ok(), "agent should exit within 3s on EOF");
                 let join_result = result.unwrap();
@@ -491,11 +478,8 @@ mod tests {
                 cancel.cancel();
 
                 // 4. 等待退出(带超时)
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    agent_task,
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), agent_task).await;
 
                 assert!(result.is_ok(), "agent should exit within 3s on cancel");
                 let join_result = result.unwrap();
@@ -717,13 +701,19 @@ mod tests {
                     reader.read_line(&mut line),
                 )
                 .await;
-                assert!(read_result.is_ok(), "should receive error response within 5s");
+                assert!(
+                    read_result.is_ok(),
+                    "should receive error response within 5s"
+                );
 
-                let resp: serde_json::Value = serde_json::from_str(line.trim())
-                    .expect("error response should be valid JSON");
+                let resp: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("error response should be valid JSON");
                 assert_eq!(resp["jsonrpc"], "2.0");
                 assert_eq!(resp["id"], 42, "id should match request: {resp}");
-                assert!(resp.get("error").is_some(), "should have error field: {resp}");
+                assert!(
+                    resp.get("error").is_some(),
+                    "should have error field: {resp}"
+                );
                 // Method not found code is -32601
                 assert_eq!(
                     resp["error"]["code"], -32601,

@@ -73,7 +73,12 @@ fn render_edit_diff(input: &str) -> Option<String> {
 /// Tool results are syntax-highlighted when the tool name implies code output.
 /// P1 修复：对 edit_file 工具，在 result 卡片中显示 diff（原 start 卡片
 /// 中的 diff 已移除）。
-pub(crate) fn render_tool_result(name: &str, output: &str, is_error: bool, input: Option<&str>) -> String {
+pub(crate) fn render_tool_result(
+    name: &str,
+    output: &str,
+    is_error: bool,
+    input: Option<&str>,
+) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let line_count = lines.len();
     let icon = if is_error { "❌" } else { "✅" };
@@ -93,15 +98,9 @@ pub(crate) fn render_tool_result(name: &str, output: &str, is_error: bool, input
             let renderer = crate::render::TerminalRenderer::new();
             let highlighted = renderer.highlight_code(&text, &lang);
             // Add card prefix to each line
-            highlighted
-                .lines()
-                .map(|l| format!("│ {l}\n"))
-                .collect()
+            highlighted.lines().map(|l| format!("│ {l}\n")).collect()
         } else {
-            slice
-                .iter()
-                .map(|l| format!("│ {l}\n"))
-                .collect()
+            slice.iter().map(|l| format!("│ {l}\n")).collect()
         }
     };
 
@@ -176,7 +175,7 @@ pub(crate) fn render_tool_timeline(history: &[(String, bool)]) -> String {
         parts.push(colored);
     }
     let count = history.len();
-    let tool_word = if count == 1 { "个工具" } else { "个工具" };
+    let tool_word = "个工具";
     format!(
         "\n┌─ 🔧 时间线：{}（{count} {tool_word}）\n└─\n",
         parts.join(" | ")
@@ -191,14 +190,19 @@ pub(crate) fn summarize_tool_input_public(name: &str, input: &str) -> String {
 
 /// Render a tool result card (collapsible).
 /// P1 重构：公开接口供 OutputView::render() 调用（展开状态渲染）。
-pub(crate) fn render_tool_result_public(name: &str, output: &str, is_error: bool, input: Option<&str>) -> String {
+pub(crate) fn render_tool_result_public(
+    name: &str,
+    output: &str,
+    is_error: bool,
+    input: Option<&str>,
+) -> String {
     render_tool_result(name, output, is_error, input)
 }
 
 /// Summarize tool input to a short one-liner for the card header.
 fn summarize_tool_input(name: &str, input: &str) -> String {
-    let parsed: serde_json::Value = serde_json::from_str(input)
-        .unwrap_or(serde_json::Value::String(input.to_string()));
+    let parsed: serde_json::Value =
+        serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
 
     match name {
         "bash" | "Bash" => {
@@ -309,7 +313,10 @@ mod tests {
     #[test]
     fn render_tool_result_long_output_collapsed() {
         // P1 修复：阈值从 15 降到 5，20 行输出会被折叠，只显示前 3 行
-        let output = (1..=20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let output = (1..=20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let card = render_tool_result("bash", &output, false, None);
         assert!(card.contains("20 行"));
         assert!(card.contains("[+] 展开"));
@@ -339,7 +346,10 @@ mod tests {
         let input = format!(r#"{{"command":"{long_cmd}"}}"#);
         let summary = summarize_tool_input("bash", &input);
         // Summary is wrapped in backticks: `<truncated>…`
-        assert!(summary.contains('…'), "summary should contain ellipsis: {summary}");
+        assert!(
+            summary.contains('…'),
+            "summary should contain ellipsis: {summary}"
+        );
         assert!(summary.len() < 70);
     }
 
@@ -361,11 +371,18 @@ mod tests {
     #[test]
     fn render_edit_diff_shows_red_and_green_lines() {
         // P1 修复：diff 已从 start 卡片移到 result 卡片
-        let input = r#"{"file_path":"src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#;
+        let input =
+            r#"{"file_path":"src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#;
         let card = render_tool_result("edit_file", "ok", false, Some(input));
         // Should contain red (removed) and green (added) ANSI codes
-        assert!(card.contains("\x1b[31m"), "should have red for removed line: {card}");
-        assert!(card.contains("\x1b[32m"), "should have green for added line: {card}");
+        assert!(
+            card.contains("\x1b[31m"),
+            "should have red for removed line: {card}"
+        );
+        assert!(
+            card.contains("\x1b[32m"),
+            "should have green for added line: {card}"
+        );
         assert!(card.contains("let x = 1"));
         assert!(card.contains("let x = 2"));
     }

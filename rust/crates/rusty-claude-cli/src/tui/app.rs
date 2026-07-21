@@ -5,7 +5,13 @@
 //! submits Enter to `LiveCli::run_turn` (capturing output via OutputView
 //! sink + StatusEmitter callback for live status updates).
 
-#![allow(dead_code, unused_imports, unused_variables, unused_assignments, clippy::too_many_lines)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    unused_assignments,
+    clippy::too_many_lines
+)]
 
 use std::io::{self, Write};
 use std::sync::mpsc;
@@ -25,8 +31,8 @@ use ratatui::style::Styled;
 // Phase 3.2: TerminalRenderer is used to convert markdown → ANSI; ansi_to_tui
 // then converts ANSI → ratatui Text<'static> so Paragraph can render styled
 // spans (headings, code blocks, bold/italic, etc.) instead of raw text.
-use ansi_to_tui::IntoText;
 use crate::render::TerminalRenderer;
+use ansi_to_tui::IntoText;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -34,8 +40,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 // UnicodeWidthStr 用于按显示宽度计算 wrap 和光标定位（CJK 字符宽度为 2）。
-use unicode_width::UnicodeWidthStr;
 use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::LiveCli;
 use crate::tui::input_line::{InputAction, InputLine};
@@ -89,9 +95,7 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
                     resp_tx,
                 })
                 .map_err(|_| "TUI 主循环已退出，AskUserQuestion 无法投递".to_string())?;
-            resp_rx
-                .recv()
-                .map_err(|_| "TUI 响应通道关闭".to_string())
+            resp_rx.recv().map_err(|_| "TUI 响应通道关闭".to_string())
         },
     )));
 
@@ -222,10 +226,7 @@ impl IncrementalRenderer {
 
         // 找到最后一个段落分隔符 `\n\n` 的位置（+2 跳过 \n\n）。
         // 这是 markdown 的"安全边界"——之前的段落已完整，可以缓存。
-        let split_pos = snapshot
-            .rfind("\n\n")
-            .map(|p| p + 2)
-            .unwrap_or(0);
+        let split_pos = snapshot.rfind("\n\n").map(|p| p + 2).unwrap_or(0);
 
         // 检测 buffer 被裁剪/清空：
         // - snapshot.len() < completed_bytes：buffer 缩短（trim 触发）
@@ -554,7 +555,7 @@ fn run_event_loop(
                 // 把问题渲染到 OutputView，让用户能看到 AI 在问什么。
                 let mut prompt = String::from("\n[Question] ");
                 prompt.push_str(&req.question);
-                prompt.push_str("\n");
+                prompt.push('\n');
                 if let Some(ref opts) = req.options {
                     for (i, opt) in opts.iter().enumerate() {
                         prompt.push_str(&format!("  {}. {}\n", i + 1, opt));
@@ -645,7 +646,7 @@ fn run_event_loop(
                         if w == 0 || input_area_width == 0 {
                             1
                         } else {
-                            ((w + input_area_width - 1) / input_area_width).max(1)
+                            w.div_ceil(input_area_width)
                         }
                     })
                     .sum()
@@ -912,11 +913,10 @@ fn run_event_loop(
                     // BUG-3 修复：normalize_whitespace 原本过滤所有空白，导致
                     // "fn main()" 与 "fnmain()" 判等，误清空 buffer。改回 trim + 去 \r，
                     // 仅处理 conhost 行尾差异（\r\n vs \n），保留内部空白。
-                    let normalize_whitespace = |s: &str| -> String {
-                        s.trim().replace('\r', "")
-                    };
+                    let normalize_whitespace = |s: &str| -> String { s.trim().replace('\r', "") };
                     let normalized_buffer = normalize_whitespace(input.buffer());
-                    let normalized_last = normalize_whitespace(pending_paste_last_line.as_deref().unwrap_or(""));
+                    let normalized_last =
+                        normalize_whitespace(pending_paste_last_line.as_deref().unwrap_or(""));
                     if !normalized_buffer.is_empty() && normalized_buffer == normalized_last {
                         paste_diag_log(&format!(
                             "  清理最后一行残留: buffer={:?} == pending_paste_last_line, 清空 buffer",
@@ -1033,7 +1033,8 @@ fn run_event_loop(
                         if !pending_paste_lines.is_empty() {
                             paste_diag_log(&format!(
                                 "  pending_paste_lines[0]={:?}, line.trim()={:?}",
-                                pending_paste_lines[0], line.trim()
+                                pending_paste_lines[0],
+                                line.trim()
                             ));
                         }
                         // conhost 多行粘贴后续行丢弃：
@@ -1056,9 +1057,8 @@ fn run_event_loop(
                         // 不匹配且 !conhost_paste_intercepted → 粘贴已完成，清空并正常处理。
                         // 不匹配且 conhost_paste_intercepted → 仍丢弃（@路径或残留行）。
                         // BUG-3 修复：normalize 改为 trim + 去 \r，保留内部空白。
-                        let normalize_whitespace = |s: &str| -> String {
-                            s.trim().replace('\r', "")
-                        };
+                        let normalize_whitespace =
+                            |s: &str| -> String { s.trim().replace('\r', "") };
                         // AskUserQuestion 模式下强制 skip_submit=false，
                         // 避免 conhost paste 残留状态误把 ask 答案丢弃。
                         let in_ask_mode = pending_ask.is_some();
@@ -1078,12 +1078,14 @@ fn run_event_loop(
                                 paste_diag_log("  skip_submit=true (conhost 拦截后的 @路径，保留 pending_paste_lines)");
                                 true
                             } else if !pending_paste_lines.is_empty() {
-                                let normalize_whitespace = |s: &str| -> String {
-                                    s.trim().replace('\r', "")
-                                };
+                                let normalize_whitespace =
+                                    |s: &str| -> String { s.trim().replace('\r', "") };
                                 let normalized_line = normalize_whitespace(&line);
-                                let normalized_expected = normalize_whitespace(&pending_paste_lines[0]);
-                                if !normalized_line.is_empty() && normalized_line == normalized_expected {
+                                let normalized_expected =
+                                    normalize_whitespace(&pending_paste_lines[0]);
+                                if !normalized_line.is_empty()
+                                    && normalized_line == normalized_expected
+                                {
                                     paste_diag_log("  skip_submit=true (conhost 模式，匹配 pending_paste_lines[0]，移除)");
                                 } else {
                                     paste_diag_log(&format!(
@@ -1105,7 +1107,8 @@ fn run_event_loop(
                         } else if !pending_paste_lines.is_empty() {
                             let normalized_line = normalize_whitespace(&line);
                             let normalized_expected = normalize_whitespace(&pending_paste_lines[0]);
-                            if !normalized_line.is_empty() && normalized_line == normalized_expected {
+                            if !normalized_line.is_empty() && normalized_line == normalized_expected
+                            {
                                 pending_paste_lines.remove(0);
                                 // BUG-4 修复：同上，弹空时同步清理 pending_paste_last_line。
                                 if pending_paste_lines.is_empty() {
@@ -1216,9 +1219,7 @@ fn run_event_loop(
                             } else if trimmed.starts_with('/') {
                                 paste_diag_log("  分支: trimmed.starts_with('/') → 原样发送");
                                 (line.clone(), line.clone())
-                            } else if !line.contains('\n')
-                                && pending_paste_lines.is_empty()
-                            {
+                            } else if !line.contains('\n') && pending_paste_lines.is_empty() {
                                 // 单行输入：尝试剪贴板检测
                                 paste_diag_log(&format!(
                                     "  分支: 单行输入 → 调用 try_auto_expand_clipboard (trimmed={:?})",
@@ -1232,7 +1233,11 @@ fn run_event_loop(
                                 );
                                 paste_diag_log(&format!(
                                     "  try_auto_expand_clipboard 返回: {}",
-                                    if result.is_some() { "Some(触发替换)" } else { "None(未触发)" }
+                                    if result.is_some() {
+                                        "Some(触发替换)"
+                                    } else {
+                                        "None(未触发)"
+                                    }
                                 ));
                                 paste_diag_log(&format!(
                                     "  调用后 pending_paste_lines.len()={}",
@@ -1276,7 +1281,11 @@ fn run_event_loop(
                                             } else {
                                                 paste_diag_log("  写文件失败，回退到原行为");
                                                 result.unwrap_or_else(|| {
-                                                    fold_pasted_input(&line, &session_id, &mut paste_id_gen)
+                                                    fold_pasted_input(
+                                                        &line,
+                                                        &session_id,
+                                                        &mut paste_id_gen,
+                                                    )
                                                 })
                                             }
                                         }
@@ -1285,7 +1294,11 @@ fn run_event_loop(
                                                 "  读取剪贴板失败: {e}，回退到原行为"
                                             ));
                                             result.unwrap_or_else(|| {
-                                                fold_pasted_input(&line, &session_id, &mut paste_id_gen)
+                                                fold_pasted_input(
+                                                    &line,
+                                                    &session_id,
+                                                    &mut paste_id_gen,
+                                                )
                                             })
                                         }
                                     }
@@ -1313,7 +1326,9 @@ fn run_event_loop(
                             // @路径还未填充到 buffer（等 conhost 注入完毕后才填充），
                             // 此时 echo 会显示一个孤立的 @路径，造成混淆。
                             if conhost_paste_intercepted {
-                                paste_diag_log("  conhost_paste_intercepted=true，跳过 echo 和 run_turn");
+                                paste_diag_log(
+                                    "  conhost_paste_intercepted=true，跳过 echo 和 run_turn",
+                                );
                                 continue 'main_loop;
                             }
 
@@ -1381,12 +1396,18 @@ fn run_event_loop(
                                             Err(payload) => {
                                                 let msg = payload
                                                     .downcast_ref::<String>()
-                                                    .map(|s| s.clone())
+                                                    .cloned()
                                                     .or_else(|| {
-                                                        payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                                        payload
+                                                            .downcast_ref::<&str>()
+                                                            .map(|s| s.to_string())
                                                     })
-                                                    .unwrap_or_else(|| "<unknown panic>".to_string());
-                                                if let Ok(mut guard) = status_handle_for_panic.lock() {
+                                                    .unwrap_or_else(|| {
+                                                        "<unknown panic>".to_string()
+                                                    });
+                                                if let Ok(mut guard) =
+                                                    status_handle_for_panic.lock()
+                                                {
                                                     if guard.streaming {
                                                         guard.finish_turn();
                                                     }
@@ -1428,12 +1449,18 @@ fn run_event_loop(
                                             Err(payload) => {
                                                 let msg = payload
                                                     .downcast_ref::<String>()
-                                                    .map(|s| s.clone())
+                                                    .cloned()
                                                     .or_else(|| {
-                                                        payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                                        payload
+                                                            .downcast_ref::<&str>()
+                                                            .map(|s| s.to_string())
                                                     })
-                                                    .unwrap_or_else(|| "<unknown panic>".to_string());
-                                                if let Ok(mut guard) = status_handle_for_panic.lock() {
+                                                    .unwrap_or_else(|| {
+                                                        "<unknown panic>".to_string()
+                                                    });
+                                                if let Ok(mut guard) =
+                                                    status_handle_for_panic.lock()
+                                                {
                                                     if guard.streaming {
                                                         guard.finish_turn();
                                                     }
@@ -1575,9 +1602,7 @@ fn run_event_loop(
         // Refresh status: update turn_elapsed_ms if streaming
         {
             // Bug L9 修复：mutex 毒化时容错访问。
-            let mut guard = status_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
             if guard.streaming {
                 if let Some(start) = turn_start {
                     guard.turn_elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1753,11 +1778,7 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool) -> InputA
     input.handle_key(None, logical)
 }
 
-fn render_menu(
-    menu: &mut SlashMenu,
-    f: &mut ratatui::Frame,
-    area: Rect,
-) {
+fn render_menu(menu: &mut SlashMenu, f: &mut ratatui::Frame, area: Rect) {
     let visible = menu.visible_window();
     let selected_idx = menu.selected_index();
     let scroll = menu.scroll_offset();
@@ -1783,9 +1804,11 @@ fn render_menu(
         })
         .collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!("命令 ({}/{})", menu.total_count(), menu.all_items_count()));
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "命令 ({}/{})",
+        menu.total_count(),
+        menu.all_items_count()
+    ));
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
 }
@@ -1823,7 +1846,10 @@ fn render_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         ("F2 / Ctrl+B", "切换右侧侧栏"),
         ("Ctrl+T", "折叠 / 展开最近一个工具卡片"),
         ("鼠标左键", "点击工具卡片切换折叠 / 展开"),
-        ("粘贴 (Ctrl+V)", "整段粘贴（含多行）作为一个块插入，不立即提交"),
+        (
+            "粘贴 (Ctrl+V)",
+            "整段粘贴（含多行）作为一个块插入，不立即提交",
+        ),
         ("?", "切换此快捷键浮层"),
         ("/help", "在输出区显示完整帮助"),
         ("/session pick", "交互式会话选择器"),
@@ -1918,7 +1944,12 @@ fn execute_turn(
                     ));
                 }
             }
-            StatusEvent::ToolResult { id, name, output, is_error } => {
+            StatusEvent::ToolResult {
+                id,
+                name,
+                output,
+                is_error,
+            } => {
                 // Track for timeline
                 if let Ok(mut history) = tool_history_for_closure.lock() {
                     history.push((name.clone(), is_error));
@@ -1940,8 +1971,7 @@ fn execute_turn(
                     guard.turn_usage.output_tokens += usage.output_tokens;
                     guard.turn_usage.cache_creation_input_tokens +=
                         usage.cache_creation_input_tokens;
-                    guard.turn_usage.cache_read_input_tokens +=
-                        usage.cache_read_input_tokens;
+                    guard.turn_usage.cache_read_input_tokens += usage.cache_read_input_tokens;
                 }
             }
             StatusEvent::StreamStart => {
@@ -1972,9 +2002,9 @@ fn execute_turn(
                     if !history.is_empty() {
                         let timeline = crate::tui::tool_card::render_tool_timeline(&history);
                         if let Ok(mut buf) = output_for_closure.lock() {
-                            buf.push_entry(
-                                crate::tui::output_view::OutputEntry::timeline(timeline),
-                            );
+                            buf.push_entry(crate::tui::output_view::OutputEntry::timeline(
+                                timeline,
+                            ));
                         }
                     }
                 }
@@ -1984,7 +2014,10 @@ fn execute_turn(
                     }
                 }
             }
-            StatusEvent::Thinking { char_count, redacted } => {
+            StatusEvent::Thinking {
+                char_count,
+                redacted,
+            } => {
                 // Phase 3: render a short thinking-block summary into the
                 // output view, mirroring the stdout path in streaming.rs.
                 let summary = if redacted {
@@ -1998,7 +2031,10 @@ fn execute_turn(
                     buf.append(&summary);
                 }
             }
-            StatusEvent::StreamError { message, recoverable } => {
+            StatusEvent::StreamError {
+                message,
+                recoverable,
+            } => {
                 // P0-1 修复：consume_stream 内 9 处错误路径 emit 的事件。
                 // 之前所有错误路径都不 emit，TUI 收不到信号导致 streaming=true
                 // 永久保留，UI 假死。现在收到此事件立即：
@@ -2133,8 +2169,7 @@ mod tests {
                         guard.turn_usage.output_tokens += usage.output_tokens;
                         guard.turn_usage.cache_creation_input_tokens +=
                             usage.cache_creation_input_tokens;
-                        guard.turn_usage.cache_read_input_tokens +=
-                            usage.cache_read_input_tokens;
+                        guard.turn_usage.cache_read_input_tokens += usage.cache_read_input_tokens;
                     }
                 }
                 StatusEvent::StreamStart => {
@@ -2151,7 +2186,10 @@ mod tests {
                 }
                 StatusEvent::ToolUse { .. } => {}
                 StatusEvent::ToolResult { .. } => {}
-                StatusEvent::Thinking { char_count, redacted } => {
+                StatusEvent::Thinking {
+                    char_count,
+                    redacted,
+                } => {
                     let summary = if redacted {
                         "\n▶ Thinking block hidden by provider\n".to_string()
                     } else if let Some(char_count) = char_count {
@@ -2163,7 +2201,10 @@ mod tests {
                         buf.append(&summary);
                     }
                 }
-                StatusEvent::StreamError { message, recoverable } => {
+                StatusEvent::StreamError {
+                    message,
+                    recoverable,
+                } => {
                     // P0-1 修复：测试 emitter 同步增加 StreamError 处理分支
                     let banner = if recoverable {
                         format!("\n[error] 流式错误（可重试）：{message}\n")
@@ -2270,12 +2311,15 @@ mod tests {
     fn emitter_thinking_hidden_renders_summary_without_char_count() {
         // Phase 3: streaming ThinkingDelta carries no char_count — the
         // emitter should render the "hidden" variant of the summary.
-        let mut output_view = OutputView::new();
+        let output_view = OutputView::new();
         let handle = output_view.shared_handle();
         let status = StatusBarState::shared();
         let emitter = build_test_emitter(handle, status);
 
-        emitter(StatusEvent::Thinking { char_count: None, redacted: false });
+        emitter(StatusEvent::Thinking {
+            char_count: None,
+            redacted: false,
+        });
 
         let snapshot = output_view.snapshot();
         assert!(
@@ -2291,12 +2335,15 @@ mod tests {
     #[test]
     fn emitter_thinking_with_char_count_renders_counted_summary() {
         // Phase 3: non-streaming Thinking block carries a concrete char_count.
-        let mut output_view = OutputView::new();
+        let output_view = OutputView::new();
         let handle = output_view.shared_handle();
         let status = StatusBarState::shared();
         let emitter = build_test_emitter(handle, status);
 
-        emitter(StatusEvent::Thinking { char_count: Some(42), redacted: false });
+        emitter(StatusEvent::Thinking {
+            char_count: Some(42),
+            redacted: false,
+        });
 
         let snapshot = output_view.snapshot();
         assert!(
@@ -2309,12 +2356,15 @@ mod tests {
     fn emitter_thinking_redacted_renders_provider_redacted_summary() {
         // Phase 3: RedactedThinking blocks should surface the provider-side
         // redaction so users know why content is missing.
-        let mut output_view = OutputView::new();
+        let output_view = OutputView::new();
         let handle = output_view.shared_handle();
         let status = StatusBarState::shared();
         let emitter = build_test_emitter(handle, status);
 
-        emitter(StatusEvent::Thinking { char_count: None, redacted: true });
+        emitter(StatusEvent::Thinking {
+            char_count: None,
+            redacted: true,
+        });
 
         let snapshot = output_view.snapshot();
         assert!(
@@ -2330,10 +2380,13 @@ mod tests {
         //   ansi_to_tui::IntoText::into_text → ratatui Text<'static>.
         // The conversion must not drop plain text content and must produce
         // at least one styled span for markdown constructs (e.g. headings).
-        let markdown = "# Heading\n\nSome **bold** text and a code block:\n\n```rust\nfn main() {}\n```";
+        let markdown =
+            "# Heading\n\nSome **bold** text and a code block:\n\n```rust\nfn main() {}\n```";
         let renderer = TerminalRenderer::new();
         let ansi = renderer.markdown_to_ansi(markdown);
-        let text = ansi.into_text().expect("ansi-to-tui conversion should succeed");
+        let text = ansi
+            .into_text()
+            .expect("ansi-to-tui conversion should succeed");
         // Flatten all spans into a single string for content checks.
         let flattened: String = text
             .lines
@@ -2490,6 +2543,9 @@ mod tests {
         let result2 = r.render("pending text");
         let flat1 = flatten_text(&result1);
         let flat2 = flatten_text(&result2);
-        assert_eq!(flat1, flat2, "unchanged snapshot should yield identical text");
+        assert_eq!(
+            flat1, flat2,
+            "unchanged snapshot should yield identical text"
+        );
     }
 }

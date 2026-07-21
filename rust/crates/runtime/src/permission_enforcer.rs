@@ -260,9 +260,7 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
     if normalized_components.len() < root_components.len() {
         return false;
     }
-    for (candidate_part, root_part) in
-        normalized_components.iter().zip(root_components.iter())
-    {
+    for (candidate_part, root_part) in normalized_components.iter().zip(root_components.iter()) {
         if !components_equal(candidate_part, root_part) {
             return false;
         }
@@ -275,9 +273,7 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
 fn components_equal<'a>(a: &std::path::Component<'a>, b: &std::path::Component<'a>) -> bool {
     use std::path::Component;
     match (a, b) {
-        (Component::Normal(a_str), Component::Normal(b_str)) => {
-            a_str.eq_ignore_ascii_case(b_str)
-        }
+        (Component::Normal(a_str), Component::Normal(b_str)) => a_str.eq_ignore_ascii_case(b_str),
         _ => a == b,
     }
 }

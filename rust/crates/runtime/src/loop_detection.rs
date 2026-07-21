@@ -3,7 +3,7 @@
 //! 设计文档:`docs/harness-engineering-optimization-plan.md` Step 2.2
 //!
 //! 架构:
-//! - [`LoopDetector`]:跟踪每个文件的编辑次数,在阈值处触发注入上下文或中止。
+//! - [`LoopDetector`][]:跟踪每个文件的编辑次数,在阈值处触发注入上下文或中止。
 //! - [`LoopAction`]:中间件输出 — Continue / InjectContext / Abort。
 //! - 与 [`RecoveryOrchestrator`](crate::recovery_orchestrator) 对接:Abort
 //!   走 `WorkerFailureKind::Protocol` 恢复路径。
@@ -92,7 +92,8 @@ impl LoopDetector {
         {
             self.warned.insert(file_path.to_owned(), true);
             LoopAction::InjectContext(
-                "consider reconsidering your approach — this file has been edited many times".to_owned(),
+                "consider reconsidering your approach — this file has been edited many times"
+                    .to_owned(),
             )
         } else {
             LoopAction::Continue
@@ -163,7 +164,7 @@ mod tests {
     fn record_edit_returns_inject_context_at_warn_threshold() {
         let mut detector = LoopDetector::new();
         for _ in 0..WARN_THRESHOLD - 1 {
-            detector.record_edit("src/main.rs");
+            let _ = detector.record_edit("src/main.rs");
         }
         let action = detector.record_edit("src/main.rs");
         assert!(matches!(action, LoopAction::InjectContext(_)));
@@ -176,7 +177,7 @@ mod tests {
     fn record_edit_returns_abort_at_abort_threshold() {
         let mut detector = LoopDetector::new();
         for _ in 0..ABORT_THRESHOLD - 1 {
-            detector.record_edit("src/main.rs");
+            let _ = detector.record_edit("src/main.rs");
         }
         let action = detector.record_edit("src/main.rs");
         assert!(matches!(action, LoopAction::Abort(_)));
@@ -190,7 +191,7 @@ mod tests {
     fn different_files_tracked_independently() {
         let mut detector = LoopDetector::new();
         for _ in 0..WARN_THRESHOLD {
-            detector.record_edit("src/a.rs");
+            let _ = detector.record_edit("src/a.rs");
         }
         // a.rs 已达 WARN,但 b.rs 仍 Continue
         let action = detector.record_edit("src/b.rs");
@@ -203,7 +204,7 @@ mod tests {
     fn reset_clears_counts() {
         let mut detector = LoopDetector::new();
         for _ in 0..WARN_THRESHOLD + 2 {
-            detector.record_edit("src/main.rs");
+            let _ = detector.record_edit("src/main.rs");
         }
         detector.reset();
         assert_eq!(detector.edit_count("src/main.rs"), 0);
@@ -218,7 +219,7 @@ mod tests {
         let mut detector = LoopDetector::new();
         // Edit up to WARN_THRESHOLD → InjectContext
         for _ in 0..WARN_THRESHOLD {
-            detector.record_edit("src/main.rs");
+            let _ = detector.record_edit("src/main.rs");
         }
         // Next edit (WARN+1) should be Continue, not another InjectContext
         let action = detector.record_edit("src/main.rs");
@@ -232,7 +233,7 @@ mod tests {
     fn abort_triggers_on_every_edit_above_threshold() {
         let mut detector = LoopDetector::new();
         for _ in 0..ABORT_THRESHOLD {
-            detector.record_edit("src/main.rs");
+            let _ = detector.record_edit("src/main.rs");
         }
         // ABORT_THRESHOLD + 1 should also abort
         let action = detector.record_edit("src/main.rs");
@@ -242,9 +243,9 @@ mod tests {
     #[test]
     fn total_edits_tracks_across_files() {
         let mut detector = LoopDetector::new();
-        detector.record_edit("a.rs");
-        detector.record_edit("b.rs");
-        detector.record_edit("a.rs");
+        let _ = detector.record_edit("a.rs");
+        let _ = detector.record_edit("b.rs");
+        let _ = detector.record_edit("a.rs");
         assert_eq!(detector.total_edits(), 3);
     }
 

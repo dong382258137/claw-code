@@ -191,11 +191,9 @@ pub fn probe_transport_health(addr: &SocketAddr, timeout_ms: u64) -> StartupHeal
                 format!("tcp connect ok in {}ms", elapsed.as_millis()),
             )
         }
-        Err(e) => StartupHealthSummary::probed(
-            "transport",
-            false,
-            format!("tcp connect failed: {e}"),
-        ),
+        Err(e) => {
+            StartupHealthSummary::probed("transport", false, format!("tcp connect failed: {e}"))
+        }
     }
 }
 
@@ -231,7 +229,7 @@ pub fn probe_mcp_health(servers: &[(&str, McpLifecyclePhase)]) -> StartupHealthS
             .map(|(name, _)| *name)
             .collect();
         let detail = if unhealthy.is_empty() {
-            format!("0 servers registered")
+            "0 servers registered".to_string()
         } else {
             format!(
                 "{ready_count}/{total} servers ready; unhealthy={}",
@@ -646,7 +644,10 @@ impl WorkerRegistry {
     /// 不改变 worker_boot 内部决策逻辑,只补充结构化事件输出能力。
     /// 详见 docs/harness-engineering-optimization-plan.md Step 1.1。
     #[must_use]
-    pub fn pending_trust_event(&self, worker_id: &str) -> Option<crate::trust_resolver::TrustEvent> {
+    pub fn pending_trust_event(
+        &self,
+        worker_id: &str,
+    ) -> Option<crate::trust_resolver::TrustEvent> {
         use crate::trust_resolver::TrustEvent;
 
         let inner = self.inner.lock().expect("worker registry lock poisoned");
@@ -657,7 +658,11 @@ impl WorkerRegistry {
         let cwd = worker.cwd.clone();
         let repo = crate::trust_resolver::extract_repo_name(&cwd);
         let worktree = None; // worker_boot 当前不区分 worktree,留给未来扩展。
-        Some(TrustEvent::TrustRequired { cwd, repo, worktree })
+        Some(TrustEvent::TrustRequired {
+            cwd,
+            repo,
+            worktree,
+        })
     }
 
     pub fn send_prompt(
@@ -2406,7 +2411,11 @@ mod tests {
         assert!(!summary.healthy);
         assert!(summary.summary.contains("transport_unhealthy"));
         assert!(summary.detail.is_some());
-        assert!(summary.detail.as_ref().unwrap().contains("tcp connect failed"));
+        assert!(summary
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains("tcp connect failed"));
     }
 
     #[test]
@@ -2419,7 +2428,11 @@ mod tests {
         let summary = probe_mcp_health(&servers);
         assert!(summary.healthy);
         assert!(summary.summary.contains("mcp_healthy"));
-        assert!(summary.detail.as_ref().unwrap().contains("2/2 servers ready"));
+        assert!(summary
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains("2/2 servers ready"));
     }
 
     #[test]
@@ -2431,7 +2444,11 @@ mod tests {
         ];
         let summary = probe_mcp_health(&servers);
         assert!(!summary.healthy);
-        assert!(summary.detail.as_ref().unwrap().contains("1/2 servers ready"));
+        assert!(summary
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains("1/2 servers ready"));
         assert!(summary.detail.as_ref().unwrap().contains("api"));
     }
 
@@ -2448,12 +2465,7 @@ mod tests {
         let mcp = StartupHealthSummary::probed("mcp", true, "1/1 server ready; phase=Ready");
 
         let timed_out = registry
-            .observe_startup_timeout_with_probes(
-                &worker.worker_id,
-                "claw prompt",
-                transport,
-                mcp,
-            )
+            .observe_startup_timeout_with_probes(&worker.worker_id, "claw prompt", transport, mcp)
             .expect("startup timeout with probes should succeed");
 
         assert_eq!(timed_out.status, WorkerStatus::Failed);

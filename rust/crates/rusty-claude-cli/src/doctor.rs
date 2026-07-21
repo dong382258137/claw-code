@@ -6,16 +6,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use runtime::{
-    BaseCommitState, ConfigLoader, McpServer, McpServerSpec, McpTool, ProjectContext, TokenUsage,
-    format_stale_base_warning, load_oauth_credentials, resolve_sandbox_status,
+    format_stale_base_warning, load_oauth_credentials, resolve_sandbox_status, BaseCommitState,
+    ConfigLoader, McpServer, McpServerSpec, McpTool, ProjectContext, TokenUsage,
 };
 use serde_json::{json, Map, Value};
 use tools::{execute_tool, mvp_tool_specs};
 
 use crate::session_mgr::{SessionLifecycleKind, SessionLifecycleSummary};
 use crate::{
-    BUILD_TARGET, CliOutputFormat, DEFAULT_DATE, DEPRECATED_INSTALL_COMMAND, GIT_SHA,
-    OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL, VERSION, stale_base_json_value, stale_base_state_for,
+    stale_base_json_value, stale_base_state_for, CliOutputFormat, BUILD_TARGET, DEFAULT_DATE,
+    DEPRECATED_INSTALL_COMMAND, GIT_SHA, OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL, VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

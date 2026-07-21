@@ -3,7 +3,7 @@ use std::fmt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    common::{AcpChannelFailure, AcpResult, acp_channel_failure_error},
+    common::{acp_channel_failure_error, AcpChannelFailure, AcpResult},
     message::{AcpAgentMessage, AcpArgs, AcpClientMessage, AcpMethod, AcpRequest},
 };
 
@@ -61,7 +61,7 @@ where
 #[cfg(test)]
 mod acp_send_failure_tests {
     use super::acp_send;
-    use crate::common::{AcpChannelFailure, acp_channel_failure};
+    use crate::common::{acp_channel_failure, AcpChannelFailure};
     use crate::message::AcpAgentMessage;
     use agent_client_protocol as acp;
     use tokio::sync::mpsc;

@@ -8,9 +8,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::{
-    AcpMethod, acp_send,
+    acp_send,
     common::AcpResult,
     message::{AcpAgentMessage, AcpArgs, AcpClientMessage, AcpRequest, AcpSide},
+    AcpMethod,
 };
 
 type SpawnFn = Rc<dyn Fn(Pin<Box<dyn Future<Output = ()>>>)>;
@@ -437,7 +438,10 @@ impl acp::Client for AcpGatewaySender<acp::AgentSide> {
         self.forward(args).await
     }
 
-    async fn kill_terminal(&self, args: acp::KillTerminalRequest) -> AcpResult<acp::KillTerminalResponse> {
+    async fn kill_terminal(
+        &self,
+        args: acp::KillTerminalRequest,
+    ) -> AcpResult<acp::KillTerminalResponse> {
         self.forward(args).await
     }
 
@@ -480,11 +484,17 @@ impl acp::Agent for AcpGatewaySender<acp::ClientSide> {
         self.forward(args).await
     }
 
-    async fn new_session(&self, args: acp::NewSessionRequest) -> AcpResult<acp::NewSessionResponse> {
+    async fn new_session(
+        &self,
+        args: acp::NewSessionRequest,
+    ) -> AcpResult<acp::NewSessionResponse> {
         self.forward(args).await
     }
 
-    async fn load_session(&self, args: acp::LoadSessionRequest) -> AcpResult<acp::LoadSessionResponse> {
+    async fn load_session(
+        &self,
+        args: acp::LoadSessionRequest,
+    ) -> AcpResult<acp::LoadSessionResponse> {
         self.forward(args).await
     }
 

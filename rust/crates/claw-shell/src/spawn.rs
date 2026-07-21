@@ -12,7 +12,7 @@ use std::thread;
 
 use tokio_util::sync::CancellationToken;
 
-use claw_acp::{AcpClientChannel, AcpGatewayReceiver, AcpGatewaySender, acp_channels};
+use claw_acp::{acp_channels, AcpClientChannel, AcpGatewayReceiver, AcpGatewaySender};
 
 use crate::agent::ClawAgentBuilder;
 
@@ -104,8 +104,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use claw_acp::acp_send;
     use agent_client_protocol as acp;
+    use claw_acp::acp_send;
     use runtime::{
         ApiClient, ApiRequest, AssistantEvent, PermissionMode, PermissionPolicy, RuntimeError,
     };
@@ -278,9 +278,12 @@ mod tests {
         let tx = spawned.channel.tx.clone();
 
         // 1. initialize
-        let _ = acp_send(acp::InitializeRequest::new(acp::ProtocolVersion::LATEST), &tx)
-            .await
-            .expect("initialize should succeed");
+        let _ = acp_send(
+            acp::InitializeRequest::new(acp::ProtocolVersion::LATEST),
+            &tx,
+        )
+        .await
+        .expect("initialize should succeed");
 
         // 2. authenticate
         let _ = acp_send(

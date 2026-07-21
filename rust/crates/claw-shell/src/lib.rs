@@ -17,5 +17,5 @@ mod spawn;
 mod stdio;
 
 pub use self::agent::{ClawAgent, ClawAgentBuilder, ClawAgentConfig};
-pub use self::spawn::{SpawnedAgent, spawn_claw_shell};
+pub use self::spawn::{spawn_claw_shell, SpawnedAgent};
 pub use self::stdio::{run_agent_on_io, run_stdio_agent};

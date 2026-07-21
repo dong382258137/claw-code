@@ -59,18 +59,13 @@ pub enum RecallLevel {
 }
 
 /// 语义召回策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecallStrategy {
     /// 嵌入向量语义搜索(需要嵌入 API)。
     Embedding,
     /// 关键词匹配 fallback(不需要外部 API)。
+    #[default]
     Keyword,
-}
-
-impl Default for RecallStrategy {
-    fn default() -> Self {
-        Self::Keyword
-    }
 }
 
 /// 语义召回器 — 持有 L1 索引和(可选)向量索引。
@@ -222,8 +217,8 @@ impl SemanticRecaller {
                 if match_count == 0 {
                     return None;
                 }
-                let score = (match_count as f32 / query_tokens.len().max(1) as f32)
-                    .max(KEYWORD_MIN_SCORE);
+                let score =
+                    (match_count as f32 / query_tokens.len().max(1) as f32).max(KEYWORD_MIN_SCORE);
                 Some(MemoryHit {
                     entry: entry.clone(),
                     score,
@@ -233,7 +228,11 @@ impl SemanticRecaller {
             .collect();
 
         // 按相似度降序排序,取 top-k。
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(k);
         hits
     }
@@ -285,7 +284,7 @@ impl SemanticRecaller {
         // 批量嵌入以减少 ONNX 推理开销。
         let texts: Vec<&str> = entries_to_embed.iter().map(|(_, s)| s.as_str()).collect();
         let vectors = provider.embed_batch(&texts)?;
-        for ((id, _), vec) in entries_to_embed.into_iter().zip(vectors.into_iter()) {
+        for ((id, _), vec) in entries_to_embed.into_iter().zip(vectors) {
             self.vectors.insert(id, vec);
             computed += 1;
         }
@@ -293,10 +292,7 @@ impl SemanticRecaller {
     }
 
     /// 持久化 L1 索引到 `<workspace>/.claw/memory-l1-index.json`。
-    pub fn persist_l1_index(
-        &self,
-        workspace: &Path,
-    ) -> Result<PathBuf, std::io::Error> {
+    pub fn persist_l1_index(&self, workspace: &Path) -> Result<PathBuf, std::io::Error> {
         let dir = workspace.join(".claw");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("memory-l1-index.json");
@@ -307,10 +303,7 @@ impl SemanticRecaller {
     }
 
     /// 从文件加载 L1 索引。
-    pub fn load_l1_index(
-        &mut self,
-        workspace: &Path,
-    ) -> Result<usize, std::io::Error> {
+    pub fn load_l1_index(&mut self, workspace: &Path) -> Result<usize, std::io::Error> {
         let path = workspace.join(".claw").join("memory-l1-index.json");
         let content = std::fs::read_to_string(&path)?;
         let entries: Vec<L1IndexEntry> = serde_json::from_str(&content)
@@ -461,7 +454,7 @@ impl HashEmbeddingProvider {
     /// 把 token hash 映射到向量索引和符号(+1 / -1)。
     fn hash_to_index_sign(&self, hash: u64) -> (usize, f32) {
         let idx = (hash % self.dim as u64) as usize;
-        let sign = if (hash / self.dim as u64) % 2 == 0 {
+        let sign = if (hash / self.dim as u64).is_multiple_of(2) {
             1.0
         } else {
             -1.0
@@ -689,7 +682,9 @@ mod tests {
         recaller.add_l1_entry("1", "test entry one", "doc1");
         recaller.add_l1_entry("2", "test entry two", "doc2");
 
-        let path = recaller.persist_l1_index(&temp).expect("persist should succeed");
+        let path = recaller
+            .persist_l1_index(&temp)
+            .expect("persist should succeed");
         assert!(path.exists());
 
         let mut loaded = SemanticRecaller::new();
@@ -732,7 +727,10 @@ mod tests {
         let provider = HashEmbeddingProvider::default_dim();
         let vec = provider.embed("hello world foo bar baz").unwrap();
         let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "L2 norm should be 1.0, got {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "L2 norm should be 1.0, got {norm}"
+        );
     }
 
     #[test]
@@ -755,7 +753,10 @@ mod tests {
     fn cosine_similarity_handles_identical_vectors() {
         let v = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity(&v, &v);
-        assert!((sim - 1.0).abs() < 1e-5, "identical vectors should have cos=1.0");
+        assert!(
+            (sim - 1.0).abs() < 1e-5,
+            "identical vectors should have cos=1.0"
+        );
     }
 
     #[test]
@@ -817,11 +818,8 @@ mod tests {
         recaller.index_embeddings(&provider).unwrap();
 
         // 完全相同的查询 → 应该命中(余弦相似度 = 1.0 ≥ EMBEDDING_MIN_SCORE)。
-        let hits = recaller.semantic_recall_with_provider(
-            "Rust programming language",
-            5,
-            &provider,
-        );
+        let hits =
+            recaller.semantic_recall_with_provider("Rust programming language", 5, &provider);
         assert!(!hits.is_empty(), "should find at least one hit");
         assert!(hits[0].score >= EMBEDDING_MIN_SCORE);
     }
@@ -834,11 +832,8 @@ mod tests {
         recaller.index_embeddings(&provider).unwrap();
 
         // 完全不相关的查询 → 向量相似度低 → 命中为空,但 keyword 也无匹配 → 空结果。
-        let hits = recaller.semantic_recall_with_provider(
-            "completely unrelated xyz123",
-            5,
-            &provider,
-        );
+        let hits =
+            recaller.semantic_recall_with_provider("completely unrelated xyz123", 5, &provider);
         assert!(hits.is_empty());
     }
 

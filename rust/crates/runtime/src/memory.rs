@@ -59,18 +59,9 @@ fn entry_id(content: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum MemoryBlock {
-    Persona {
-        content: String,
-        max_chars: usize,
-    },
-    Human {
-        content: String,
-        max_chars: usize,
-    },
-    Tasks {
-        content: String,
-        max_chars: usize,
-    },
+    Persona { content: String, max_chars: usize },
+    Human { content: String, max_chars: usize },
+    Tasks { content: String, max_chars: usize },
 }
 
 impl MemoryBlock {
@@ -166,7 +157,11 @@ impl MemoryBlock {
 
 /// Default constructor used by serde when a block is missing on disk.
 fn default_blocks() -> [MemoryBlock; 3] {
-    [MemoryBlock::persona(), MemoryBlock::human(), MemoryBlock::tasks()]
+    [
+        MemoryBlock::persona(),
+        MemoryBlock::human(),
+        MemoryBlock::tasks(),
+    ]
 }
 
 /// One memory fact with a temporal validity envelope.
@@ -440,9 +435,13 @@ impl PersistentMemory {
     /// entries only appear in the next session.
     pub fn add_entry(&mut self, content: &str, source: &str) {
         let now = now_ms();
-        self.entries
-            .push(MemoryEntry::new(content.to_string(), source.to_string(), now));
-        self.semantic.add_l1_entry(&entry_id(content), content, source);
+        self.entries.push(MemoryEntry::new(
+            content.to_string(),
+            source.to_string(),
+            now,
+        ));
+        self.semantic
+            .add_l1_entry(&entry_id(content), content, source);
         self.persist_or_warn("add_entry");
     }
 
@@ -461,9 +460,13 @@ impl PersistentMemory {
                 break;
             }
         }
-        self.entries
-            .push(MemoryEntry::new(new_content.to_string(), source.to_string(), now));
-        self.semantic.add_l1_entry(&entry_id(new_content), new_content, source);
+        self.entries.push(MemoryEntry::new(
+            new_content.to_string(),
+            source.to_string(),
+            now,
+        ));
+        self.semantic
+            .add_l1_entry(&entry_id(new_content), new_content, source);
         self.persist_or_warn("replace_entry");
     }
 
@@ -692,10 +695,8 @@ pub fn detect_conflicts(new_entry: &MemoryEntry, existing: &[MemoryEntry]) -> Ve
 fn contradiction_regex_en() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)\b(prefer|always|never|use|like|hate)(?:s|ed|d)?\b\s+(.+?)(?:[.,;\n]|$)",
-        )
-        .expect("contradiction regex en should compile")
+        Regex::new(r"(?i)\b(prefer|always|never|use|like|hate)(?:s|ed|d)?\b\s+(.+?)(?:[.,;\n]|$)")
+            .expect("contradiction regex en should compile")
     })
 }
 
@@ -832,10 +833,7 @@ impl Default for NudgeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NudgeAction {
     /// Append a brand-new fact.
-    Add {
-        content: String,
-        source: String,
-    },
+    Add { content: String, source: String },
     /// Replace an existing fact matching `old_pattern` with `new_content`.
     Replace {
         old_pattern: String,
@@ -870,14 +868,7 @@ const CORRECTION_PHRASES: &[&str] = &[
 
 /// Trigger keywords that signal an explicit memory request.
 const REMEMBER_KEYWORDS: &[&str] = &[
-    "remember",
-    "记住",
-    "prefer",
-    "always",
-    "never",
-    "不要",
-    "总是",
-    "永恒",
+    "remember", "记住", "prefer", "always", "never", "不要", "总是", "永恒",
 ];
 
 /// Trigger keywords that signal a request to forget / retire a fact.
@@ -1058,7 +1049,10 @@ fn extract_after_phrase(text: &str, phrase: &str) -> String {
         return String::new();
     };
     let after = start + phrase.len();
-    text.get(after..).unwrap_or("").trim_start_matches([':', ' ']).to_string()
+    text.get(after..)
+        .unwrap_or("")
+        .trim_start_matches([':', ' '])
+        .to_string()
 }
 
 #[cfg(test)]
@@ -1101,7 +1095,10 @@ mod tests {
         let after = mem.frozen_render();
         // The frozen snapshot must NOT include the new entry — it was
         // captured at session start.
-        assert_eq!(before, after, "frozen snapshot must stay stable within session");
+        assert_eq!(
+            before, after,
+            "frozen snapshot must stay stable within session"
+        );
         assert!(!after.contains("user lives in Berlin"));
         let _ = std::fs::remove_file(&path);
     }
@@ -1170,7 +1167,9 @@ mod tests {
         // B2 regression guard: superseded entry must be retained in `archive`
         // for audit purposes — NOT dropped on the floor.
         assert!(
-            mem.archive().iter().any(|e| e.content == "prefer dark mode"),
+            mem.archive()
+                .iter()
+                .any(|e| e.content == "prefer dark mode"),
             "superseded entries should be retained in archive: {:?}",
             mem.archive()
         );
@@ -1285,8 +1284,8 @@ mod tests {
 
     #[test]
     fn extract_keyword_value_chinese_extracts_preference() {
-        let (kw, val) = extract_keyword_value("用户偏好深色模式")
-            .expect("Chinese preference should extract");
+        let (kw, val) =
+            extract_keyword_value("用户偏好深色模式").expect("Chinese preference should extract");
         assert_eq!(kw, "偏好");
         assert!(val.contains("深色模式"));
     }
@@ -1429,7 +1428,11 @@ mod tests {
         let actions = extract_nudge_actions(&msgs, &mem, &cfg);
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            NudgeAction::Replace { old_pattern, new_content, .. } => {
+            NudgeAction::Replace {
+                old_pattern,
+                new_content,
+                ..
+            } => {
                 assert!(old_pattern.contains("dark mode"));
                 assert!(new_content.contains("light mode"));
             }
@@ -1460,12 +1463,17 @@ mod tests {
         // Apply the action — entry should be retired into archive.
         for action in actions {
             if let NudgeAction::Remove { pattern, .. } = action {
-                assert!(mem.remove_entry(&pattern), "remove_entry should retire matching entry");
+                assert!(
+                    mem.remove_entry(&pattern),
+                    "remove_entry should retire matching entry"
+                );
             }
         }
         let now = now_ms();
         assert!(
-            mem.entries().iter().all(|e| !e.is_active(now) || !e.content.contains("rust")),
+            mem.entries()
+                .iter()
+                .all(|e| !e.is_active(now) || !e.content.contains("rust")),
             "rust entry should no longer be active"
         );
         assert!(
@@ -1483,7 +1491,10 @@ mod tests {
         let cfg = NudgeConfig::default();
         let msgs = vec![ConversationMessage::user_text("forget non-existent thing")];
         let actions = extract_nudge_actions(&msgs, &mem, &cfg);
-        assert!(actions.is_empty(), "expected no actions for unmatched forget");
+        assert!(
+            actions.is_empty(),
+            "expected no actions for unmatched forget"
+        );
     }
 
     #[test]

@@ -192,9 +192,7 @@ impl RuleVerifier {
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null());
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn failed: {e}"))?;
+        let child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
 
         // 简单超时:用 wait_timeout 跨平台 crate 会引入依赖,
         // 这里用 std 的 wait + thread 简化处理(实际超时由调用方控制)
@@ -223,7 +221,11 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
     let start = s.len().saturating_sub(max_chars);
     // 对齐到 char 边界
-    let start = s.char_indices().skip_while(|(i, _)| *i < start).next().map(|(i, _)| i).unwrap_or(start);
+    let start = s
+        .char_indices()
+        .find(|&(i, _)| i >= start)
+        .map(|(i, _)| i)
+        .unwrap_or(start);
     let truncated = &s[start..];
     format!("...{truncated}")
 }

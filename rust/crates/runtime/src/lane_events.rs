@@ -1294,22 +1294,15 @@ impl LaneEvent {
             "cancelled" => LaneEventStatus::Closed,
             _ => LaneEventStatus::Completed,
         };
-        let mut event = Self::new(
-            LaneEventName::SubagentResult,
-            lane_status,
-            emitted_at,
-        )
-        .with_data(data);
+        let mut event =
+            Self::new(LaneEventName::SubagentResult, lane_status, emitted_at).with_data(data);
         if status == "failed" {
             event = event.with_failure_class(LaneFailureClass::SubagentFailure);
         }
         // 手动设置 fingerprint(`SubagentResult` 不在 `is_terminal_event` 中,
         // `with_terminal_fingerprint` 不会触发;但 subagent 维度需要去重)。
-        let fingerprint = compute_event_fingerprint(
-            &event.event,
-            &event.status,
-            event.data.as_ref(),
-        );
+        let fingerprint =
+            compute_event_fingerprint(&event.event, &event.status, event.data.as_ref());
         event.metadata.event_fingerprint = Some(fingerprint);
         event
     }
@@ -1400,13 +1393,13 @@ mod tests {
 
     use super::{
         classify_event_terminality, compute_event_fingerprint, dedupe_superseded_commit_events,
-        dedupe_terminal_events, events_materially_differ, filter_by_confidence,
+        dedupe_terminal_events, drain_lane_events, events_materially_differ, filter_by_confidence,
         filter_by_environment, filter_by_provenance, is_live_lane_event, is_terminal_event,
-        is_test_event, reconcile_terminal_events, drain_lane_events, try_publish,
-        BlockedSubphase, ConfidenceLevel, EventProvenance, EventTerminality,
-        LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventBuilder, LaneEventMetadata,
-        LaneEventName, LaneEventStatus, LaneFailureClass, LaneOwnership, SessionIdentity,
-        ShipMergeMethod, ShipProvenance, WatcherAction, LANE_EVENT_SINK_MAX_CAPACITY,
+        is_test_event, reconcile_terminal_events, try_publish, BlockedSubphase, ConfidenceLevel,
+        EventProvenance, EventTerminality, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+        LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus, LaneFailureClass,
+        LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance, WatcherAction,
+        LANE_EVENT_SINK_MAX_CAPACITY,
     };
 
     #[test]
@@ -2771,8 +2764,7 @@ mod tests {
         let last_event = drained.last().expect("should have events");
         let expected_last_ts = format!("2026-07-21T00:00:{:05}Z", total_to_publish - 1);
         assert_eq!(
-            last_event.emitted_at,
-            expected_last_ts,
+            last_event.emitted_at, expected_last_ts,
             "last event should be the newest one (capacity protection keeps newest)"
         );
 

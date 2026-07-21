@@ -1217,11 +1217,7 @@ mod tests {
     fn pipeline_blocks_semicolon_bypass_in_read_only() {
         let workspace = PathBuf::from("/workspace");
         assert!(matches!(
-            validate_command(
-                "ls . ; rm -rf /tmp/x",
-                PermissionMode::ReadOnly,
-                &workspace
-            ),
+            validate_command("ls . ; rm -rf /tmp/x", PermissionMode::ReadOnly, &workspace),
             ValidationResult::Block { .. }
         ));
     }

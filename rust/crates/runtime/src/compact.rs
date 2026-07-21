@@ -246,8 +246,10 @@ pub fn compact_session_with_trigger(
         messages_summarized: removed.len(),
         timestamp_ms: current_time_millis(),
     };
-    let continuation_with_marker =
-        format!("{continuation}\n{}", format_compact_boundary_marker(&boundary));
+    let continuation_with_marker = format!(
+        "{continuation}\n{}",
+        format_compact_boundary_marker(&boundary)
+    );
 
     let mut compacted_messages = vec![ConversationMessage {
         role: MessageRole::System,
@@ -488,10 +490,8 @@ where
     // Older ones become candidates for summarization.
     let preserve_count = preserve_recent.min(tool_result_indices.len());
     let cutoff = tool_result_indices.len().saturating_sub(preserve_count);
-    let summarize_candidates: HashSet<usize> = tool_result_indices[..cutoff]
-        .iter()
-        .copied()
-        .collect();
+    let summarize_candidates: HashSet<usize> =
+        tool_result_indices[..cutoff].iter().copied().collect();
 
     messages
         .iter()
@@ -1713,8 +1713,7 @@ mod tests {
             panic!("expected edit tool result");
         };
         assert_eq!(
-            *output,
-            "The file has been updated successfully.",
+            *output, "The file has been updated successfully.",
             "Edit result must be preserved verbatim even when old"
         );
 
@@ -1723,8 +1722,7 @@ mod tests {
             panic!("expected write tool result");
         };
         assert_eq!(
-            *output,
-            "File written.",
+            *output, "File written.",
             "Write result must be preserved verbatim even when old"
         );
     }
@@ -1745,9 +1743,7 @@ mod tests {
         let result = microcompact(&messages, 1);
         let error_result = &result[1].blocks[0];
         let ContentBlock::ToolResult {
-            output,
-            is_error,
-            ..
+            output, is_error, ..
         } = error_result
         else {
             panic!("expected tool result");
@@ -1757,16 +1753,14 @@ mod tests {
             "error flag must be preserved on old error results"
         );
         assert_eq!(
-            *output,
-            "Error: file not found",
+            *output, "Error: file not found",
             "error tool result must be preserved verbatim even when old"
         );
     }
 
     #[test]
     fn microcompact_does_not_double_summarize() {
-        let already_summarized =
-            "[Read output summarized: 100 chars → first line…]";
+        let already_summarized = "[Read output summarized: 100 chars → first line…]";
         let messages = vec![
             ConversationMessage::user_text("q1"),
             ConversationMessage::tool_result("1", "Read", already_summarized, false),
@@ -1782,8 +1776,7 @@ mod tests {
             panic!("expected tool result");
         };
         assert_eq!(
-            *output,
-            already_summarized,
+            *output, already_summarized,
             "already-summarized output should not be re-summarized"
         );
     }
@@ -1830,7 +1823,8 @@ mod tests {
     /// 即使很老也不能被摘要丢失。
     #[test]
     fn microcompact_preserves_dispatch_subagent_results() {
-        let dispatch_output = "Subagent `subagent-1` completed. Result written to: .claw/subagents/subagent-1.md\n\
+        let dispatch_output =
+            "Subagent `subagent-1` completed. Result written to: .claw/subagents/subagent-1.md\n\
              Use Read tool to inspect the result. The subagent ran with an isolated context.";
         let messages = vec![
             ConversationMessage::user_text("q1"),
@@ -1889,9 +1883,7 @@ mod tests {
         let result = microcompact(&messages, 2);
         let check_result = &result[1].blocks[0];
         let ContentBlock::ToolResult {
-            tool_name,
-            output,
-            ..
+            tool_name, output, ..
         } = check_result
         else {
             panic!("expected tool result");

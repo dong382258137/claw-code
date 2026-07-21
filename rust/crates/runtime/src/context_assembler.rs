@@ -370,11 +370,12 @@ impl Default for TokenBudget {
 /// regions. Stable content (before the break point) rarely changes and is
 /// suitable for caching. Volatile content (after the break point) changes
 /// frequently and should not be cached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheStrategy {
     /// Cache break point is after all stable sources (System, Tools, Memory, Goal, GitContext).
     /// History and User are considered volatile.
+    #[default]
     StablePrefix,
     /// Cache break point is after System only. Everything else is volatile.
     /// Most conservative — smallest cacheable region.
@@ -382,12 +383,6 @@ pub enum CacheStrategy {
     /// No cache break point — entire prompt is treated as volatile.
     /// Useful for debugging or when caching is not desired.
     None,
-}
-
-impl Default for CacheStrategy {
-    fn default() -> Self {
-        CacheStrategy::StablePrefix
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,11 +715,7 @@ mod tests {
 
     #[test]
     fn test_context_block_no_truncation_needed() {
-        let block = ContextBlock::new(
-            ContextSource::System,
-            "Short text".to_string(),
-            5,
-        );
+        let block = ContextBlock::new(ContextSource::System, "Short text".to_string(), 5);
 
         let truncated = block.truncate_to(10);
         assert_eq!(truncated.token_estimate, 5);
@@ -821,7 +812,10 @@ mod tests {
         assert!(prompt.total_token_estimate <= 25);
         assert_eq!(prompt.blocks[0].source, ContextSource::System);
         assert_eq!(prompt.blocks[1].source, ContextSource::Tools);
-        assert!(prompt.blocks.iter().any(|b| b.source == ContextSource::User));
+        assert!(prompt
+            .blocks
+            .iter()
+            .any(|b| b.source == ContextSource::User));
     }
 
     #[test]
@@ -843,9 +837,8 @@ mod tests {
 
     #[test]
     fn test_cache_break_point_stable_prefix() {
-        let mut assembler =
-            ContextAssembler::new(TokenBudget::new(10000))
-                .with_cache_strategy(CacheStrategy::StablePrefix);
+        let mut assembler = ContextAssembler::new(TokenBudget::new(10000))
+            .with_cache_strategy(CacheStrategy::StablePrefix);
 
         assembler.add(ContextSource::System, "System".to_string(), 10);
         assembler.add(ContextSource::Tools, "Tools".to_string(), 10);
@@ -872,9 +865,8 @@ mod tests {
 
     #[test]
     fn test_cache_break_point_system_only() {
-        let mut assembler =
-            ContextAssembler::new(TokenBudget::new(10000))
-                .with_cache_strategy(CacheStrategy::SystemOnly);
+        let mut assembler = ContextAssembler::new(TokenBudget::new(10000))
+            .with_cache_strategy(CacheStrategy::SystemOnly);
 
         assembler.add(ContextSource::System, "System".to_string(), 10);
         assembler.add(ContextSource::Tools, "Tools".to_string(), 10);
@@ -890,8 +882,7 @@ mod tests {
     #[test]
     fn test_cache_break_point_none() {
         let mut assembler =
-            ContextAssembler::new(TokenBudget::new(10000))
-                .with_cache_strategy(CacheStrategy::None);
+            ContextAssembler::new(TokenBudget::new(10000)).with_cache_strategy(CacheStrategy::None);
 
         assembler.add(ContextSource::System, "System".to_string(), 10);
         assembler.add(ContextSource::User, "User".to_string(), 10);

@@ -7,8 +7,8 @@ use crate::render::{OutputVerbosity, TerminalRenderer};
 use runtime::{ToolError, ToolExecutor};
 use tools::GlobalToolRegistry;
 
-use crate::AllowedToolSet;
 use crate::plugin_state::RuntimeMcpState;
+use crate::AllowedToolSet;
 
 /// 工具卡片左边框（ANSI 245 灰色）。用于卡片体内每行前缀，视觉上把
 /// "调用详情"和"工具结果"框在同一个卡片容器里。
@@ -198,11 +198,7 @@ impl ToolExecutor for CliToolExecutor {
                 if self.emit_output && self.output_verbosity.show_tool_results() {
                     // Full 模式：用卡片闭合（带左边框对齐 + 底部边框），
                     // 把工具结果嵌入到 format_tool_call_start 开的卡片容器内。
-                    let markdown = format_tool_result_card_close(
-                        tool_name,
-                        &output,
-                        false,
-                    );
+                    let markdown = format_tool_result_card_close(tool_name, &output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
@@ -232,11 +228,7 @@ impl ToolExecutor for CliToolExecutor {
                     // Full 模式：错误结果也嵌入卡片容器（闭合）。
                     // Compact/Minimal 模式：format_tool_result 会输出完整错误（错误不折叠）。
                     let markdown = if self.output_verbosity.show_tool_results() {
-                        format_tool_result_card_close(
-                            tool_name,
-                            &error.to_string(),
-                            true,
-                        )
+                        format_tool_result_card_close(tool_name, &error.to_string(), true)
                     } else {
                         format_tool_result(
                             tool_name,
@@ -338,9 +330,7 @@ pub(crate) fn format_tool_call_start(name: &str, input: &str) -> String {
     // 顶部边框宽度对齐 name + 4 (两侧空格) + 4 (装饰 ╭─ ─╮)
     let border = "─".repeat(name.len() + 8);
     let indented_detail = indent_with_card_prefix(&detail);
-    format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n{indented_detail}"
-    )
+    format!("\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n{indented_detail}")
 }
 
 /// 渲染工具卡片的闭合部分：工具结果（带左边框对齐）+ 底部边框。
@@ -480,8 +470,13 @@ pub(crate) fn format_tool_result_compact(name: &str) -> String {
     // Minimal: 仅关键工具显示摘要，其他工具完全静默。
     if !matches!(
         name,
-        "read_file" | "write_file" | "edit_file" | "bash" | "bash_command"
-            | "glob_search" | "grep_search"
+        "read_file"
+            | "write_file"
+            | "edit_file"
+            | "bash"
+            | "bash_command"
+            | "glob_search"
+            | "grep_search"
     ) {
         return String::new();
     }
@@ -747,7 +742,11 @@ pub(crate) fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> Stri
     }
 }
 
-pub(crate) fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value) -> String {
+pub(crate) fn format_generic_tool_result(
+    icon: &str,
+    name: &str,
+    parsed: &serde_json::Value,
+) -> String {
     let rendered_output = match parsed {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Null => String::new(),
@@ -789,7 +788,11 @@ pub(crate) fn truncate_for_summary(value: &str, limit: usize) -> String {
     }
 }
 
-pub(crate) fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize) -> String {
+pub(crate) fn truncate_output_for_display(
+    content: &str,
+    max_lines: usize,
+    max_chars: usize,
+) -> String {
     let original = content.trim_end_matches('\n');
     if original.is_empty() {
         return String::new();

@@ -25,7 +25,7 @@
 
 pub mod rule;
 
-pub use rule::{RuleVerifier, RuleVerdict};
+pub use rule::{RuleVerdict, RuleVerifier};
 
 use serde::{Deserialize, Serialize};
 
@@ -192,6 +192,9 @@ mod tests {
     fn verify_records_elapsed_time() {
         let agent = VerifierAgent::new();
         let result = agent.verify("tests passed", "tests pass", Some("cmd /c exit 0"));
-        assert!(result.elapsed_ms < 5000, "should complete in under 5 seconds");
+        assert!(
+            result.elapsed_ms < 5000,
+            "should complete in under 5 seconds"
+        );
     }
 }

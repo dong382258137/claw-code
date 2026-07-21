@@ -23,13 +23,83 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::commands_handler::*;
+use crate::doctor::*;
+use crate::format::*;
+use crate::init::initialize_repo;
+use crate::input;
+use crate::paste::{
+    expand_paste_placeholders, fold_pasted_input, format_pasted_text_ref, paste_cache_path,
+    paste_cache_root, pasted_text_ref_num_lines, read_clipboard_text, should_fold_paste,
+    store_paste_and_make_placeholder, try_auto_expand_clipboard, PASTE_FOLD_CHAR_THRESHOLD,
+    PASTE_FOLD_LINE_THRESHOLD,
+};
+use crate::plugin_state::{
+    build_plugin_manager, build_runtime_mcp_state, build_runtime_plugin_state,
+    build_runtime_plugin_state_with_loader, mcp_annotation_flag, mcp_runtime_tool_definition,
+    mcp_wrapper_tool_definitions, permission_mode_for_mcp_tool, plugins_command_payload_for,
+    plugins_command_payload_from_result, resolve_plugin_path,
+    runtime_hook_config_from_plugin_hooks, RuntimeMcpState, RuntimePluginState,
+    RuntimePluginStateBuildOutput,
+};
+use crate::render::{MarkdownStreamState, OutputVerbosity, Spinner, TerminalRenderer};
+use crate::session_mgr::{
+    civil_from_days, collect_session_prompt_history, confirm_session_deletion,
+    create_managed_session_handle, current_session_store, default_export_filename,
+    delete_managed_session, format_history_timestamp, format_session_modified_age,
+    interactive_session_pick, latest_managed_session, list_managed_sessions,
+    load_session_reference, looks_like_slash_command_token, new_cli_session,
+    new_cli_session_with_roots, parse_history_count, recent_user_context,
+    render_prompt_history_report, render_session_list, render_session_markdown,
+    resolve_export_path, resolve_managed_session_path, resolve_session_reference,
+    resume_command_can_absorb_token, resume_session, run_export, run_resume_command,
+    run_resumed_session_command, session_clear_backup_path, session_details_json,
+    session_exists_json, session_reference_exists, sessions_dir,
+    summarize_tool_payload_for_markdown, write_session_clear_backup, ManagedSessionSummary,
+    PromptHistoryEntry, ResumeCommandOutcome, SessionHandle, SessionLifecycleKind,
+    SessionLifecycleSummary, DEFAULT_HISTORY_LIMIT, LATEST_SESSION_REFERENCE,
+    LEGACY_SESSION_EXTENSION, PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT,
+    SESSION_REFERENCE_ALIASES,
+};
+use crate::streaming::{
+    build_system_blocks, collect_prompt_cache_events, collect_tool_results, collect_tool_uses,
+    compact_tool_output_for_model, convert_messages, extract_system_messages, final_assistant_text,
+    format_context_window_blocked_error, format_user_visible_api_error,
+    mark_last_tool_with_cache_control, permission_policy, prompt_cache_record_to_runtime_event,
+    push_output_block, push_prompt_cache_record, render_thinking_block_summary,
+    request_ends_with_tool_result, resolve_cli_auth_source, resolve_cli_auth_source_for_cwd,
+    response_to_events, AnthropicRuntimeClient, HookAbortMonitor, NETWORK_ERROR_KEYWORDS,
+    POST_TOOL_STALL_TIMEOUT,
+};
+use crate::suggestion::{
+    common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
+    render_suggestion_line, suggest_closest_term, suggest_similar_subcommand,
+    suggest_slash_commands, CLI_OPTION_SUGGESTIONS,
+};
+use crate::tool_display::{
+    clear_rustyline_echo, estimate_display_width, extract_tool_path, first_visible_line,
+    format_bash_call, format_bash_result, format_edit_result, format_generic_tool_result,
+    format_glob_result, format_grep_result, format_patch_preview, format_read_result,
+    format_search_start, format_structured_patch_preview, format_tool_call_start,
+    format_tool_result, format_tool_result_card_close, format_tool_result_compact,
+    format_user_message_card, format_write_result, indent_with_card_prefix, is_wide_char,
+    print_user_card, short_tool_id, summarize_tool_payload, truncate_for_summary,
+    truncate_output_for_display, CliToolExecutor, ListMcpResourcesRequest, McpToolRequest,
+    ReadMcpResourceRequest, ToolSearchRequest, DISPLAY_TRUNCATION_NOTICE, READ_DISPLAY_MAX_CHARS,
+    READ_DISPLAY_MAX_LINES, TOOL_CARD_PREFIX, TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+    TOOL_OUTPUT_DISPLAY_MAX_LINES, USER_CARD_PREFIX,
+};
+use crate::ultraplan::{
+    describe_tool_progress, format_internal_prompt_progress_line, InternalPromptProgressEvent,
+    InternalPromptProgressReporter, InternalPromptProgressRun, InternalPromptProgressShared,
+    InternalPromptProgressState, INTERNAL_PROGRESS_HEARTBEAT_INTERVAL,
+};
 use api::{
-    detect_provider_kind, model_family_identity_for,
-    model_requires_reasoning_content_in_history, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, CacheControl, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, CacheControl, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    PromptCache, ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
+    SystemBlock, SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -40,10 +110,7 @@ use commands::{
     SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
-use crate::init::initialize_repo;
-use crate::input;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use crate::render::{MarkdownStreamState, OutputVerbosity, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
@@ -51,111 +118,33 @@ use runtime::{
     CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
     ConversationRuntime, HistoryIndex, McpServer, McpServerManager, McpServerSpec, McpTool,
     MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    RepoMap, ResolvedPermissionMode, RuntimeError, Session, SystemPromptExtras,
-    SystemPromptSplit, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    RepoMap, ResolvedPermissionMode, RuntimeError, Session, SystemPromptExtras, SystemPromptSplit,
+    TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    execute_tool, init_lsp_from_config, mvp_tool_specs, GlobalToolRegistry,
-    RuntimeToolDefinition, ToolSearchOutput,
+    execute_tool, init_lsp_from_config, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition,
+    ToolSearchOutput,
 };
-use crate::paste::{
-    expand_paste_placeholders, fold_pasted_input, format_pasted_text_ref, paste_cache_path,
-    paste_cache_root, pasted_text_ref_num_lines, read_clipboard_text, should_fold_paste,
-    store_paste_and_make_placeholder, try_auto_expand_clipboard, PASTE_FOLD_CHAR_THRESHOLD,
-    PASTE_FOLD_LINE_THRESHOLD,
-};
-use crate::suggestion::{
-    common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
-    render_suggestion_line, suggest_closest_term, suggest_similar_subcommand,
-    suggest_slash_commands, CLI_OPTION_SUGGESTIONS,
-};
-use crate::ultraplan::{
-    describe_tool_progress, format_internal_prompt_progress_line,
-    INTERNAL_PROGRESS_HEARTBEAT_INTERVAL, InternalPromptProgressEvent,
-    InternalPromptProgressReporter, InternalPromptProgressRun, InternalPromptProgressShared,
-    InternalPromptProgressState,
-};
-use crate::tool_display::{
-    CliToolExecutor, ToolSearchRequest, McpToolRequest, ListMcpResourcesRequest,
-    ReadMcpResourceRequest,
-    format_tool_call_start, format_tool_result_card_close, format_tool_result,
-    format_tool_result_compact, format_user_message_card, print_user_card,
-    clear_rustyline_echo, estimate_display_width, is_wide_char, indent_with_card_prefix,
-    extract_tool_path, format_search_start, format_patch_preview, format_bash_call,
-    first_visible_line, format_bash_result, format_read_result, format_write_result,
-    format_structured_patch_preview, format_edit_result, format_glob_result,
-    format_grep_result, format_generic_tool_result, summarize_tool_payload,
-    truncate_for_summary, truncate_output_for_display, short_tool_id,
-    TOOL_CARD_PREFIX, USER_CARD_PREFIX, DISPLAY_TRUNCATION_NOTICE,
-    READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS,
-    TOOL_OUTPUT_DISPLAY_MAX_LINES, TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-};
-use crate::plugin_state::{
-    RuntimePluginState, RuntimeMcpState, RuntimePluginStateBuildOutput,
-    build_runtime_mcp_state, mcp_runtime_tool_definition, mcp_wrapper_tool_definitions,
-    permission_mode_for_mcp_tool, mcp_annotation_flag,
-    plugins_command_payload_for, plugins_command_payload_from_result,
-    build_runtime_plugin_state, build_runtime_plugin_state_with_loader,
-    build_plugin_manager, resolve_plugin_path, runtime_hook_config_from_plugin_hooks,
-};
-use crate::streaming::{
-    AnthropicRuntimeClient, HookAbortMonitor,
-    resolve_cli_auth_source, resolve_cli_auth_source_for_cwd,
-    build_system_blocks, mark_last_tool_with_cache_control,
-    request_ends_with_tool_result, format_user_visible_api_error,
-    format_context_window_blocked_error, final_assistant_text,
-    collect_tool_uses, collect_tool_results, collect_prompt_cache_events,
-    render_thinking_block_summary, push_output_block, response_to_events,
-    push_prompt_cache_record, prompt_cache_record_to_runtime_event,
-    permission_policy, extract_system_messages,
-    compact_tool_output_for_model, convert_messages,
-    POST_TOOL_STALL_TIMEOUT, NETWORK_ERROR_KEYWORDS,
-};
-use crate::session_mgr::{
-    civil_from_days, collect_session_prompt_history, confirm_session_deletion,
-    create_managed_session_handle, current_session_store, default_export_filename,
-    delete_managed_session, format_history_timestamp, format_session_modified_age,
-    interactive_session_pick,
-    latest_managed_session, list_managed_sessions, load_session_reference,
-    looks_like_slash_command_token, new_cli_session, new_cli_session_with_roots,
-    parse_history_count, recent_user_context, render_prompt_history_report,
-    render_session_list, render_session_markdown, resume_command_can_absorb_token,
-    resume_session, resolve_export_path, resolve_managed_session_path,
-    resolve_session_reference, run_export, run_resumed_session_command,
-    run_resume_command, session_clear_backup_path, session_details_json,
-    session_exists_json, session_reference_exists, sessions_dir,
-    summarize_tool_payload_for_markdown, write_session_clear_backup,
-    DEFAULT_HISTORY_LIMIT, LEGACY_SESSION_EXTENSION, LATEST_SESSION_REFERENCE,
-    PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT,
-    SESSION_REFERENCE_ALIASES, ManagedSessionSummary, PromptHistoryEntry,
-    ResumeCommandOutcome, SessionHandle, SessionLifecycleKind, SessionLifecycleSummary,
-};
-use crate::doctor::*;
-use crate::commands_handler::*;
-use crate::format::*;
 
 // ACP stdio server:把 ClawAgent 通过 stdin/stdout JSON-RPC 暴露给外部编辑器
-use claw_shell::{ClawAgentBuilder, run_stdio_agent};
+use claw_shell::{run_stdio_agent, ClawAgentBuilder};
 use tokio_util::sync::CancellationToken;
 
 // 从 crate root 引入共享符号（CliOutputFormat、ModelProvenance、共享 helper 等）
 use crate::{
-    CliOutputFormat, ModelProvenance, ModelSource, DEFAULT_MODEL, DEFAULT_DATE, VERSION,
-    BUILD_TARGET, GIT_SHA, OFFICIAL_REPO_URL, OFFICIAL_REPO_SLUG,
-    DEPRECATED_INSTALL_COMMAND, AllowedToolSet,
-    resolve_model_alias, resolve_model_alias_with_config, validate_model_syntax,
-    config_alias_for_current_dir, normalize_allowed_tools, current_tool_registry,
-    parse_permission_mode_arg, permission_mode_from_label, permission_mode_from_resolved,
-    default_permission_mode, config_permission_mode_for_current_dir,
-    config_model_for_current_dir, resolve_repl_model, provider_label,
-    format_connected_line, filter_tool_specs, parse_system_prompt_args,
-    parse_export_args, parse_dump_manifests_args, parse_resume_args,
-    plugin_summary_json, plugin_load_failure_json,
-    git_output, git_status_ok, command_exists, write_temp_text_file,
-    classify_error_kind, split_error_hint, read_piped_stdin,
-    merge_prompt_with_stdin, plugin_command_json,
+    classify_error_kind, command_exists, config_alias_for_current_dir,
+    config_model_for_current_dir, config_permission_mode_for_current_dir, current_tool_registry,
+    default_permission_mode, filter_tool_specs, format_connected_line, git_output, git_status_ok,
+    merge_prompt_with_stdin, normalize_allowed_tools, parse_dump_manifests_args, parse_export_args,
+    parse_permission_mode_arg, parse_resume_args, parse_system_prompt_args,
+    permission_mode_from_label, permission_mode_from_resolved, plugin_command_json,
+    plugin_load_failure_json, plugin_summary_json, provider_label, read_piped_stdin,
+    resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model, split_error_hint,
+    validate_model_syntax, write_temp_text_file, AllowedToolSet, CliOutputFormat, ModelProvenance,
+    ModelSource, BUILD_TARGET, DEFAULT_DATE, DEFAULT_MODEL, DEPRECATED_INSTALL_COMMAND, GIT_SHA,
+    OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL, VERSION,
 };
 
 // ===== Block A: detect_broad_cwd .. impl LiveCli (main.rs lines 987-2584) =====
@@ -414,10 +403,15 @@ pub(crate) fn run_repl(
                     && !trimmed.starts_with('/')
                     && pending_paste_lines.is_empty()
                 {
-                    try_auto_expand_clipboard(&trimmed, &cli.session.id, &mut paste_id_gen, &mut pending_paste_lines)
-                        .unwrap_or_else(|| {
-                            fold_pasted_input(&trimmed, &cli.session.id, &mut paste_id_gen)
-                        })
+                    try_auto_expand_clipboard(
+                        &trimmed,
+                        &cli.session.id,
+                        &mut paste_id_gen,
+                        &mut pending_paste_lines,
+                    )
+                    .unwrap_or_else(|| {
+                        fold_pasted_input(&trimmed, &cli.session.id, &mut paste_id_gen)
+                    })
                 } else {
                     fold_pasted_input(&trimmed, &cli.session.id, &mut paste_id_gen)
                 };
@@ -686,9 +680,9 @@ impl LiveCli {
     fn render_goal_badge(&self) -> Option<String> {
         let goal = self.goal_manager.active()?;
         match &goal.state {
-            runtime::GoalState::Active => Some(
-                "\x1b[38;5;240m │ \x1b[32m🎯 goal\x1b[0;38;5;240m".to_string(),
-            ),
+            runtime::GoalState::Active => {
+                Some("\x1b[38;5;240m │ \x1b[32m🎯 goal\x1b[0;38;5;240m".to_string())
+            }
             runtime::GoalState::Blocked { .. } => Some(format!(
                 "\x1b[38;5;240m │ \x1b[33m⚠ goal ({}/3)\x1b[0;38;5;240m",
                 goal.blocked_count
@@ -778,7 +772,8 @@ impl LiveCli {
             if let Some(rt) = runtime.runtime.as_mut() {
                 rt.api_client_mut().set_status_emitter(Arc::clone(emitter));
                 // Also inject into CliToolExecutor so ToolResult events are emitted
-                rt.tool_executor_mut().set_status_emitter(Arc::clone(emitter));
+                rt.tool_executor_mut()
+                    .set_status_emitter(Arc::clone(emitter));
             }
         }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -805,9 +800,13 @@ impl LiveCli {
         // goal_manager.record_tokens, persist_session, replace_runtime) still run.
         let emit_output = {
             #[cfg(feature = "full-tui")]
-            { !self.tui_mode }
+            {
+                !self.tui_mode
+            }
             #[cfg(not(feature = "full-tui"))]
-            { true }
+            {
+                true
+            }
         };
         #[cfg(feature = "full-tui")]
         let tui_mode = self.tui_mode;
@@ -1196,13 +1195,15 @@ impl LiveCli {
             SlashCommand::Effort { level } => {
                 let msg = match level.as_deref().map(str::trim) {
                     None => {
-                        let current = self.reasoning_effort()
+                        let current = self
+                            .reasoning_effort()
                             .map(|v| format!("当前思考强度: {v}"))
                             .unwrap_or_else(|| "当前思考强度: 默认（未设置）".to_string());
                         format!("{current}\n用法: /effort low|medium|high|off")
                     }
                     Some("") => {
-                        let current = self.reasoning_effort()
+                        let current = self
+                            .reasoning_effort()
                             .map(|v| format!("当前思考强度: {v}"))
                             .unwrap_or_else(|| "当前思考强度: 默认（未设置）".to_string());
                         format!("{current}\n用法: /effort low|medium|high|off")
@@ -1270,9 +1271,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::OutputStyle { style } => {
-                if let Some(verbosity) = style
-                    .as_deref()
-                    .and_then(OutputVerbosity::from_style_arg)
+                if let Some(verbosity) = style.as_deref().and_then(OutputVerbosity::from_style_arg)
                 {
                     self.output_verbosity = verbosity;
                     let msg = format!("Output style set to: {}", verbosity.label());
@@ -1982,10 +1981,7 @@ impl LiveCli {
     /// 与 `--enable-plan-mode` CLI flag 的区别:
     /// - `--enable-plan-mode`:整个会话启用 plan mode,所有复杂任务都触发。
     /// - `/ultraplan`:本会话启用 plan mode,且若提供 task 则立即触发一次。
-    fn run_ultraplan(
-        &mut self,
-        task: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_ultraplan(&mut self, task: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         // 启用 plan mode(若已启用则幂等)。
         self.runtime.set_plan_mode_enabled(true);
         // 设置 workspace_root(若未设置)— 用于 PlanArtifact 持久化。
@@ -2085,7 +2081,9 @@ impl LiveCli {
 
     #[cfg(feature = "full-tui")]
     pub(crate) fn git_branch_snapshot(&self) -> Option<String> {
-        crate::format::status_context(None).ok().and_then(|c| c.git_branch)
+        crate::format::status_context(None)
+            .ok()
+            .and_then(|c| c.git_branch)
     }
 
     #[cfg(feature = "full-tui")]
@@ -2180,7 +2178,6 @@ impl LiveCli {
     }
 }
 
-
 // ===== Block B: build_system_prompt / load_prompt_extras / is_broad_working_directory (main.rs lines 2626-2750) =====
 
 pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -2240,7 +2237,10 @@ pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
     let t_map = t0.elapsed();
     eprintln!(
         "[timing] load_prompt_extras: memory={:?} repomap={:?} broad_cwd={} (cwd={})",
-        t_mem, t_map, is_broad_cwd, cwd.display()
+        t_mem,
+        t_map,
+        is_broad_cwd,
+        cwd.display()
     );
     SystemPromptExtras {
         persistent_memory,
@@ -2307,7 +2307,6 @@ pub(crate) fn is_broad_working_directory(cwd: &Path) -> bool {
         .any(|marker| cwd.join(marker).exists());
     !has_project_marker
 }
-
 
 // ===== Block C: build_runtime / build_runtime_with_plugin_state / CliHookProgressReporter / CliPermissionPrompter (main.rs lines 2761-2938) =====
 
@@ -2477,9 +2476,18 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         // Enhanced permission prompt with box-drawing and colored tool name
         println!();
         println!("\x1b[33m┌─ ⚠ Permission approval required \x1b[0m");
-        println!("\x1b[33m│\x1b[0m Tool             \x1b[1;36m{}\x1b[0m", request.tool_name);
-        println!("\x1b[33m│\x1b[0m Current mode     {}", self.current_mode.as_str());
-        println!("\x1b[33m│\x1b[0m Required mode    \x1b[1;31m{}\x1b[0m", request.required_mode.as_str());
+        println!(
+            "\x1b[33m│\x1b[0m Tool             \x1b[1;36m{}\x1b[0m",
+            request.tool_name
+        );
+        println!(
+            "\x1b[33m│\x1b[0m Current mode     {}",
+            self.current_mode.as_str()
+        );
+        println!(
+            "\x1b[33m│\x1b[0m Required mode    \x1b[1;31m{}\x1b[0m",
+            request.required_mode.as_str()
+        );
         if let Some(reason) = &request.reason {
             println!("\x1b[33m│\x1b[0m Reason           {reason}");
         }
@@ -2605,7 +2613,7 @@ pub fn run_acp_serve(
         false, // emit_output(stdio 模式禁止 CLI 打印)
         None,  // allowed_tools
         tool_registry.clone(),
-        None,  // progress_reporter
+        None, // progress_reporter
     )?;
 
     // 5. 构造 system_prompt
@@ -2621,4 +2629,3 @@ pub fn run_acp_serve(
 
     Ok(())
 }
-

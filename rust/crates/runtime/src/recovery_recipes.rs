@@ -123,13 +123,9 @@ impl RecoveryStepExecutor for RealStepExecutor {
     fn execute(&self, step: &RecoveryStep, scenario: &FailureScenario) -> (bool, String) {
         match step {
             RecoveryStep::RebaseBranch => {
-                let output = std::process::Command::new("git")
-                    .args(["rebase"])
-                    .output();
+                let output = std::process::Command::new("git").args(["rebase"]).output();
                 match output {
-                    Ok(o) if o.status.success() => {
-                        (true, "git rebase succeeded".to_string())
-                    }
+                    Ok(o) if o.status.success() => (true, "git rebase succeeded".to_string()),
                     Ok(o) => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
                         (false, format!("git rebase failed: {stderr}"))
@@ -139,9 +135,7 @@ impl RecoveryStepExecutor for RealStepExecutor {
             }
             RecoveryStep::CleanBuild => {
                 // cargo clean
-                let clean = std::process::Command::new("cargo")
-                    .args(["clean"])
-                    .output();
+                let clean = std::process::Command::new("cargo").args(["clean"]).output();
                 match clean {
                     Ok(o) if o.status.success() => {}
                     Ok(o) => {
@@ -151,9 +145,7 @@ impl RecoveryStepExecutor for RealStepExecutor {
                     Err(e) => return (false, format!("cargo clean error: {e}")),
                 }
                 // cargo build
-                let build = std::process::Command::new("cargo")
-                    .args(["build"])
-                    .output();
+                let build = std::process::Command::new("cargo").args(["build"]).output();
                 match build {
                     Ok(o) if o.status.success() => {
                         (true, "cargo clean + build succeeded".to_string())
@@ -168,15 +160,19 @@ impl RecoveryStepExecutor for RealStepExecutor {
             RecoveryStep::RestartWorker => {
                 // RestartWorker 由上层 ConversationRuntime 重新创建 worker 进程处理,
                 // 此处返回成功占位。详见 conversation.rs try_recover_or_record_fail。
-                (true, format!("restart_worker delegated to runtime for {scenario}"))
+                (
+                    true,
+                    format!("restart_worker delegated to runtime for {scenario}"),
+                )
             }
             RecoveryStep::RetryMcpHandshake { timeout } => {
                 // MCP 重连由 transport 层处理,此处为占位。
                 (true, format!("mcp_handshake retry (timeout={timeout}ms) delegated to transport for {scenario}"))
             }
-            RecoveryStep::RestartPlugin { name } => {
-                (true, format!("restart_plugin({name}) delegated for {scenario}"))
-            }
+            RecoveryStep::RestartPlugin { name } => (
+                true,
+                format!("restart_plugin({name}) delegated for {scenario}"),
+            ),
             // AcceptTrustPrompt / RedirectPromptToAgent / EscalateToHuman
             // 属于交互/决策类 step,无法自动化,走模拟。
             _ => {
@@ -321,7 +317,13 @@ impl std::fmt::Debug for RecoveryContext {
             .field("ledger", &self.ledger)
             .field("clock_tick", &self.clock_tick)
             .field("fail_at_step", &self.fail_at_step)
-            .field("step_executor", &self.step_executor.as_ref().map(|_| "Some(RecoveryStepExecutor)"))
+            .field(
+                "step_executor",
+                &self
+                    .step_executor
+                    .as_ref()
+                    .map(|_| "Some(RecoveryStepExecutor)"),
+            )
             .finish()
     }
 }

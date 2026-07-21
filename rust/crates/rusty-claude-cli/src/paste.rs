@@ -48,7 +48,9 @@ pub(crate) fn paste_diag_log(msg: &str) {
     if !enabled {
         return;
     }
-    let Some(path) = paste_diag_log_path() else { return };
+    let Some(path) = paste_diag_log_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -230,8 +232,7 @@ pub(crate) fn read_clipboard_text() -> Result<String, Box<dyn std::error::Error>
     //
     // 修复：在 PowerShell 命令前显式设置 `[Console]::OutputEncoding = UTF8`，
     // 让 PowerShell 以 UTF-8 输出到 stdout，并 strip 掉可能的 UTF-8 BOM。
-    let ps_script =
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw";
+    let ps_script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw";
     let output = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
         .output()?;
@@ -280,7 +281,11 @@ pub(crate) fn try_auto_expand_clipboard(
             return None;
         }
     };
-    paste_log!("[paste-dbg] clipboard len={} lines={}", clipboard.chars().count(), clipboard.lines().count());
+    paste_log!(
+        "[paste-dbg] clipboard len={} lines={}",
+        clipboard.chars().count(),
+        clipboard.lines().count()
+    );
     if clipboard.is_empty() {
         paste_log!("[paste-dbg] clipboard empty, skip");
         return None;
@@ -293,7 +298,11 @@ pub(crate) fn try_auto_expand_clipboard(
     }
     // 第一行必须等于用户输入（trim 后比较，兼容尾部空白差异）
     let first_line = clipboard_lines[0].trim();
-    paste_log!("[paste-dbg] first_line={:?} user_input={:?}", first_line, user_input.trim());
+    paste_log!(
+        "[paste-dbg] first_line={:?} user_input={:?}",
+        first_line,
+        user_input.trim()
+    );
     if first_line != user_input.trim() {
         paste_log!("[paste-dbg] first line mismatch, skip");
         return None;
@@ -311,7 +320,10 @@ pub(crate) fn try_auto_expand_clipboard(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    paste_log!("[paste-dbg] triggered! pending={} lines", pending_paste_lines.len());
+    paste_log!(
+        "[paste-dbg] triggered! pending={} lines",
+        pending_paste_lines.len()
+    );
     Some((display, expanded))
 }
 
@@ -333,10 +345,7 @@ pub(crate) fn try_auto_expand_clipboard(
 /// **返回**：
 /// - `Ok(Some(path_str))`: 文件写入成功，返回 `@<路径>` 字符串
 /// - `Ok(None)`: 剪贴板为空或写入失败，主循环应回退到原行为
-pub(crate) fn write_clipboard_to_temp_file(
-    clipboard: &str,
-    session_id: &str,
-) -> Option<String> {
+pub(crate) fn write_clipboard_to_temp_file(clipboard: &str, session_id: &str) -> Option<String> {
     if clipboard.trim().is_empty() {
         return None;
     }
@@ -361,8 +370,11 @@ pub(crate) fn write_clipboard_to_temp_file(
         return None;
     }
 
-    paste_log!("[paste-dbg] write_clipboard_to_temp_file: 已写入 {} 字节到 {:?}",
-        clipboard.len(), path);
+    paste_log!(
+        "[paste-dbg] write_clipboard_to_temp_file: 已写入 {} 字节到 {:?}",
+        clipboard.len(),
+        path
+    );
 
     // 返回 @<路径>
     let path_str = path.to_string_lossy().to_string();

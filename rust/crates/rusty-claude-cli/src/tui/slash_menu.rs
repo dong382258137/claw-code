@@ -62,7 +62,11 @@ impl SlashMenu {
         }
         self.query = query.to_string();
         self.filtered_cache = self.compute_filtered();
-        self.selected = if self.filtered_cache.is_empty() { None } else { Some(0) };
+        self.selected = if self.filtered_cache.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
         self.scroll = 0;
     }
 
@@ -102,7 +106,11 @@ impl SlashMenu {
     pub(crate) fn reset(&mut self) {
         self.query.clear();
         self.filtered_cache = self.all_items.clone();
-        self.selected = if self.all_items.is_empty() { None } else { Some(0) };
+        self.selected = if self.all_items.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
         self.scroll = 0;
     }
 
@@ -124,7 +132,10 @@ impl SlashMenu {
             .filter(|spec| {
                 let name = spec.name.to_ascii_lowercase();
                 let summary = spec.summary.to_ascii_lowercase();
-                let aliases_match = spec.aliases.iter().any(|a| a.to_ascii_lowercase().contains(&q));
+                let aliases_match = spec
+                    .aliases
+                    .iter()
+                    .any(|a| a.to_ascii_lowercase().contains(&q));
                 name.contains(&q) || summary.contains(&q) || aliases_match
             })
             .copied()
@@ -377,7 +388,10 @@ mod tests {
     #[test]
     fn new_menu_has_all_specs_and_first_selected() {
         let menu = SlashMenu::new();
-        assert!(!menu.all_items.is_empty(), "slash_command_specs should return commands");
+        assert!(
+            !menu.all_items.is_empty(),
+            "slash_command_specs should return commands"
+        );
         assert_eq!(menu.selected, Some(0));
         assert_eq!(menu.scroll, 0);
     }
@@ -394,11 +408,17 @@ mod tests {
         let mut menu = SlashMenu::new();
         menu.set_query("hel");
         let filtered = menu.filtered();
-        assert!(filtered.iter().any(|s| s.name == "help"), "should find 'help'");
+        assert!(
+            filtered.iter().any(|s| s.name == "help"),
+            "should find 'help'"
+        );
         for spec in filtered {
             let name_lower = spec.name.to_ascii_lowercase();
             let summary_lower = spec.summary.to_ascii_lowercase();
-            let alias_match = spec.aliases.iter().any(|a| a.to_ascii_lowercase().contains("hel"));
+            let alias_match = spec
+                .aliases
+                .iter()
+                .any(|a| a.to_ascii_lowercase().contains("hel"));
             assert!(
                 name_lower.contains("hel") || summary_lower.contains("hel") || alias_match,
                 "filtered item '{}' should match query 'hel'",
@@ -478,7 +498,10 @@ mod tests {
                 menu.scroll + MAX_VISIBLE_ITEMS > big_idx,
                 "scroll should make selected visible"
             );
-            assert!(menu.visible_index().is_some(), "selected should be in visible window");
+            assert!(
+                menu.visible_index().is_some(),
+                "selected should be in visible window"
+            );
         }
     }
 
@@ -521,7 +544,11 @@ mod tests {
         assert_eq!(menu.all_items_count(), non_stub_count);
         // 过滤后所有 item 都不应是 STUB
         for item in &menu.all_items {
-            assert!(!STUB_COMMANDS.contains(&item.name), "stub leaked: {}", item.name);
+            assert!(
+                !STUB_COMMANDS.contains(&item.name),
+                "stub leaked: {}",
+                item.name
+            );
         }
     }
 }

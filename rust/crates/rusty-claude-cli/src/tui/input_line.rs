@@ -278,7 +278,13 @@ impl InputLine {
     /// 用于多行 buffer 的光标定位：渲染时只显示当前行，光标 Y 坐标
     /// 固定在输入框第一行，X 坐标按当前行左侧文本的显示宽度计算。
     /// 这样多行粘贴或 `Ctrl+J` 多行编辑时光标位置始终正确。
-    pub(crate) fn cursor_line_and_column(&self) -> (usize /*line_idx*/, usize /*byte_offset_in_line*/, &str /*line_content_before_cursor*/) {
+    pub(crate) fn cursor_line_and_column(
+        &self,
+    ) -> (
+        usize, /*line_idx*/
+        usize, /*byte_offset_in_line*/
+        &str,  /*line_content_before_cursor*/
+    ) {
         let left = &self.buffer[..self.cursor];
         // 计算光标前有多少个 \n，决定当前是第几行
         let line_idx = left.matches('\n').count();
@@ -376,7 +382,10 @@ mod tests {
             let (c, k) = char_key(ch);
             line.handle_key(c, k);
         }
-        assert_eq!(line.handle_key(None, "Enter"), InputAction::Submit("hello".to_string()));
+        assert_eq!(
+            line.handle_key(None, "Enter"),
+            InputAction::Submit("hello".to_string())
+        );
         assert_eq!(line.buffer(), "");
     }
 

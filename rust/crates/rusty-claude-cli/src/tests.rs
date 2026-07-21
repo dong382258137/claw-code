@@ -12,23 +12,22 @@ use crate::{
     format_model_switch_report, format_permissions_report, format_permissions_switch_report,
     format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
     format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-    format_unknown_slash_command_message, format_user_visible_api_error,
-    merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-    parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-    parse_history_count, permission_policy, print_help_to, push_output_block,
-    render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-    render_help_topic_json, render_memory_report, render_prompt_history_report,
-    render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-    resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-    resolve_session_reference, response_to_events, resume_supported_slash_commands,
-    run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-    split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-    try_resolve_bare_skill_prompt, validate_no_args, CliAction,
-    CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-    InternalPromptProgressState, LiveCli, LocalHelpTopic, OutputVerbosity,
-    PromptHistoryEntry,
-    SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-    DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+    format_unknown_slash_command_message, format_user_visible_api_error, merge_prompt_with_stdin,
+    normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
+    parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+    permission_policy, print_help_to, push_output_block, render_config_report, render_diff_report,
+    render_diff_report_for, render_help_topic, render_help_topic_json, render_memory_report,
+    render_prompt_history_report, render_repl_help, render_resume_usage, render_session_list,
+    render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+    resolve_repl_model, resolve_session_reference, response_to_events,
+    resume_supported_slash_commands, run_resume_command, short_tool_id,
+    slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+    status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+    validate_no_args, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+    InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+    OutputVerbosity, PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary,
+    SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+    STUB_COMMANDS,
 };
 use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
 use plugins::{
@@ -185,8 +184,7 @@ fn provider_context_window_errors_are_reframed_with_same_guidance() {
         "{rendered}"
     );
     assert!(
-        rendered
-            .contains("Detail           This model's maximum context length is 200000 tokens"),
+        rendered.contains("Detail           This model's maximum context length is 200000 tokens"),
         "{rendered}"
     );
     assert!(rendered.contains("Compact          /compact"), "{rendered}");
@@ -256,8 +254,7 @@ fn retry_wrapped_context_window_errors_keep_recovery_guidance() {
         "{rendered}"
     );
     assert!(
-        rendered
-            .contains("Detail           Request is too large for this model's context window."),
+        rendered.contains("Detail           Request is too large for this model's context window."),
         "{rendered}"
     );
     assert!(rendered.contains("Compact          /compact"), "{rendered}");
@@ -626,7 +623,9 @@ fn parses_quiet_flag_sets_compact_verbosity() {
     ];
     let parsed = parse_args(&args).expect("args should parse");
     match parsed {
-        CliAction::Prompt { output_verbosity, .. } => {
+        CliAction::Prompt {
+            output_verbosity, ..
+        } => {
             assert_eq!(output_verbosity, OutputVerbosity::Compact);
         }
         other => panic!("expected Prompt, got {other:?}"),
@@ -644,7 +643,9 @@ fn parses_silent_flag_sets_silent_verbosity() {
     ];
     let parsed = parse_args(&args).expect("args should parse");
     match parsed {
-        CliAction::Prompt { output_verbosity, .. } => {
+        CliAction::Prompt {
+            output_verbosity, ..
+        } => {
             assert_eq!(output_verbosity, OutputVerbosity::Silent);
         }
         other => panic!("expected Prompt, got {other:?}"),
@@ -663,7 +664,9 @@ fn verbose_overrides_quiet_when_applied_after() {
     ];
     let parsed = parse_args(&args).expect("args should parse");
     match parsed {
-        CliAction::Prompt { output_verbosity, .. } => {
+        CliAction::Prompt {
+            output_verbosity, ..
+        } => {
             assert_eq!(output_verbosity, OutputVerbosity::Full);
         }
         other => panic!("expected Prompt, got {other:?}"),
@@ -681,7 +684,9 @@ fn parses_output_verbosity_eq_flag() {
     ];
     let parsed = parse_args(&args).expect("args should parse");
     match parsed {
-        CliAction::Prompt { output_verbosity, .. } => {
+        CliAction::Prompt {
+            output_verbosity, ..
+        } => {
             assert_eq!(output_verbosity, OutputVerbosity::Minimal);
         }
         other => panic!("expected Prompt, got {other:?}"),
@@ -691,11 +696,8 @@ fn parses_output_verbosity_eq_flag() {
 #[test]
 fn rejects_invalid_output_verbosity_value() {
     let _guard = env_lock();
-    let err = parse_args(&[
-        "--output-verbosity=loud".to_string(),
-        "hi".to_string(),
-    ])
-    .expect_err("invalid verbosity should be rejected");
+    let err = parse_args(&["--output-verbosity=loud".to_string(), "hi".to_string()])
+        .expect_err("invalid verbosity should be rejected");
     assert!(err.contains("invalid value for --output-verbosity"));
     assert!(err.contains("loud"));
 }
@@ -1194,8 +1196,7 @@ fn removed_login_and_logout_subcommands_error_helpfully() {
         }
     );
     assert_eq!(
-        parse_args(&["config".to_string(), "env".to_string()])
-            .expect("config env should parse"),
+        parse_args(&["config".to_string(), "env".to_string()]).expect("config env should parse"),
         CliAction::Config {
             section: Some("env".to_string()),
             output_format: CliOutputFormat::Text,
@@ -1414,8 +1415,7 @@ fn local_command_help_flags_stay_on_the_local_parser_path() {
         }
     );
     assert_eq!(
-        parse_args(&["sandbox".to_string(), "-h".to_string()])
-            .expect("sandbox help should parse"),
+        parse_args(&["sandbox".to_string(), "-h".to_string()]).expect("sandbox help should parse"),
         CliAction::HelpTopic {
             topic: LocalHelpTopic::Sandbox,
             output_format: CliOutputFormat::Text,
@@ -1458,8 +1458,8 @@ fn subcommand_help_flag_has_one_contract_across_all_subcommands_141() {
     ];
     for (subcommand, expected_topic) in cases {
         for flag in ["--help", "-h"] {
-            let parsed = parse_args(&[subcommand.to_string(), flag.to_string()])
-                .unwrap_or_else(|error| {
+            let parsed =
+                parse_args(&[subcommand.to_string(), flag.to_string()]).unwrap_or_else(|error| {
                     panic!("`{subcommand} {flag}` should parse as help but errored: {error}")
                 });
             assert_eq!(
@@ -2082,8 +2082,8 @@ fn parse_export_args_helper_defaults_to_latest_reference_and_no_output() {
     let args: Vec<String> = vec![];
 
     // when
-    let parsed = parse_export_args(&args, CliOutputFormat::Text)
-        .expect("empty export args should parse");
+    let parsed =
+        parse_export_args(&args, CliOutputFormat::Text).expect("empty export args should parse");
 
     // then
     assert_eq!(
@@ -2165,8 +2165,7 @@ fn render_session_markdown_marks_tool_errors_and_skips_empty_summaries() {
     }];
 
     // when
-    let markdown =
-        render_session_markdown(&session, "errs", std::path::Path::new("errs.jsonl"));
+    let markdown = render_session_markdown(&session, "errs", std::path::Path::new("errs.jsonl"));
 
     // then
     assert!(markdown.contains("**Tool result** `read_file` _(id `short`, error)_"));
@@ -2314,8 +2313,7 @@ fn parses_direct_agents_mcp_and_skills_slash_commands() {
         }
     );
     assert_eq!(
-        parse_args(&["/skill".to_string(), "list".to_string()])
-            .expect("/skill list should parse"),
+        parse_args(&["/skill".to_string(), "list".to_string()]).expect("/skill list should parse"),
         CliAction::Skills {
             args: Some("list".to_string()),
             output_format: CliOutputFormat::Text,
@@ -2748,8 +2746,9 @@ fn repl_help_includes_shared_commands_and_exit() {
     assert!(help.contains("/export [file]"));
     // Batch 5 added `/session delete`; match on the stable core rather than
     // the trailing bracket so future additions don't re-break this.
-    assert!(help
-        .contains("/session [list|exists <session-id>|switch <session-id>|fork [branch-name]"));
+    assert!(
+        help.contains("/session [list|exists <session-id>|switch <session-id>|fork [branch-name]")
+    );
     assert!(help.contains(
         "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
     ));
@@ -3128,17 +3127,13 @@ fn status_line_reports_model_and_token_totals() {
     assert!(status.contains("Cwd              /tmp/project"));
     assert!(status.contains("Project root     /tmp"));
     assert!(status.contains("Git branch       main"));
-    assert!(
-        status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked")
-    );
+    assert!(status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked"));
     assert!(status.contains("Changed files    3"));
     assert!(status.contains("Staged           1"));
     assert!(status.contains("Unstaged         1"));
     assert!(status.contains("Untracked        1"));
     assert!(status.contains("Session          session.jsonl"));
-    assert!(
-        status.contains("Lifecycle        idle shell · dirty worktree · abandoned? · cmd=zsh")
-    );
+    assert!(status.contains("Lifecycle        idle shell · dirty worktree · abandoned? · cmd=zsh"));
     assert!(status.contains("Config files     loaded 2/3"));
     assert!(status.contains("Memory files     4"));
     assert!(status.contains("Suggested flow   /status → /diff → /commit"));
@@ -3356,8 +3351,7 @@ fn boot_preflight_snapshot_reports_machine_readable_contract_fields() {
     git(&["config", "user.email", "tests@example.com"], &workspace);
     git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
     fs::write(workspace.join("tracked.txt"), "hello\n").expect("write tracked");
-    fs::write(workspace.join(".claw.json"), r#"{"trustedRoots": ["."]}"#)
-        .expect("write config");
+    fs::write(workspace.join(".claw.json"), r#"{"trustedRoots": ["."]}"#).expect("write config");
     git(&["add", "tracked.txt"], &workspace);
     git(&["commit", "-m", "init", "--quiet"], &workspace);
 
@@ -3405,8 +3399,9 @@ fn commit_reports_surface_workspace_context() {
 fn commit_skipped_report_points_to_next_steps() {
     let report = format_commit_skipped_report();
     assert!(report.contains("Reason           no workspace changes"));
-    assert!(report
-        .contains("Action           create a git commit from the current workspace changes"));
+    assert!(
+        report.contains("Action           create a git commit from the current workspace changes")
+    );
     assert!(report.contains("/status to inspect context"));
     assert!(report.contains("/diff to inspect repo changes"));
 }
@@ -3554,8 +3549,7 @@ fn render_diff_report_includes_staged_and_unstaged_sections() {
 
     fs::write(root.join("tracked.txt"), "hello\nstaged\n").expect("update file");
     git(&["add", "tracked.txt"], &root);
-    fs::write(root.join("tracked.txt"), "hello\nstaged\nunstaged\n")
-        .expect("update file twice");
+    fs::write(root.join("tracked.txt"), "hello\nstaged\nunstaged\n").expect("update file twice");
 
     let report = render_diff_report_for(&root).expect("diff report should render");
     assert!(report.contains("Staged changes:"));
@@ -4051,8 +4045,7 @@ fn compact_tool_output_preserves_edit_file_error() {
         "filePath": "D:\\claw-code-src\\test.txt"
     })
     .to_string();
-    let compacted =
-        super::compact_tool_output_for_model("edit_file", &error_output, true);
+    let compacted = super::compact_tool_output_for_model("edit_file", &error_output, true);
     assert!(
         compacted.contains("old_string not found in file"),
         "error message should be preserved, got: {compacted}"

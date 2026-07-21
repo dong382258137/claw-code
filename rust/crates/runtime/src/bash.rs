@@ -408,9 +408,7 @@ static SHELL_KIND_CACHE: std::sync::OnceLock<ShellKind> = std::sync::OnceLock::n
 /// Windows 探测顺序：CLAW_GIT_BASH 环境变量 → Program Files 固定路径 → PATH 搜索（过滤 WSL）。
 /// Unix 直接用 sh -lc。
 fn shell_kind() -> ShellKind {
-    SHELL_KIND_CACHE
-        .get_or_init(|| detect_shell_kind())
-        .clone()
+    SHELL_KIND_CACHE.get_or_init(detect_shell_kind).clone()
 }
 
 /// 对外暴露的 shell 类型探测入口（供 system prompt 构造时调用）。

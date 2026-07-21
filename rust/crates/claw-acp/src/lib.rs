@@ -14,15 +14,16 @@ mod gateway;
 mod message;
 pub mod stdio;
 
+pub use self::stdio::spawn_stdin_line_reader;
 pub use self::{
-    channel::{AcpAgentChannel, AcpChannel, AcpClientChannel, acp_channels, acp_send},
+    channel::{acp_channels, acp_send, AcpAgentChannel, AcpChannel, AcpClientChannel},
     common::{
-        AcpAgentRx, AcpAgentTx, AcpChannelFailure, AcpClientRx, AcpClientTx, AcpResult, AcpRxo,
-        AcpTxo, acp_channel_failure, acp_internal_error,
+        acp_channel_failure, acp_internal_error, AcpAgentRx, AcpAgentTx, AcpChannelFailure,
+        AcpClientRx, AcpClientTx, AcpResult, AcpRxo, AcpTxo,
     },
     gateway::{
-        AcpAgentGatewayReceiver, AcpAgentGatewaySender, AcpClientGatewayReceiver,
-        AcpClientGatewaySender, AcpGatewayReceiver, AcpGatewaySender, acp_gateway,
+        acp_gateway, AcpAgentGatewayReceiver, AcpAgentGatewaySender, AcpClientGatewayReceiver,
+        AcpClientGatewaySender, AcpGatewayReceiver, AcpGatewaySender,
     },
     message::{
         AcpAgentMessage, AcpAgentMessageBox, AcpAgentMessageGeneric, AcpArgs, AcpArgsBox,
@@ -30,7 +31,6 @@ pub use self::{
         AcpSide, Boxed, StorageMarker, Unboxed,
     },
 };
-pub use self::stdio::spawn_stdin_line_reader;
 
 #[doc(hidden)]
 pub use self::common::compact_json;

@@ -196,9 +196,19 @@ impl OutputBuffer {
         // timestamp 字段长度不计入（恒为 8 字节，可忽略）。
         if let OutputEntry::Text { content, .. } = &entry {
             self.text_total_bytes += content.len();
-        } else if let OutputEntry::ToolCard { input, result: Some(r), .. } = &entry {
+        } else if let OutputEntry::ToolCard {
+            input,
+            result: Some(r),
+            ..
+        } = &entry
+        {
             self.text_total_bytes += input.len() + r.len();
-        } else if let OutputEntry::ToolCard { input, result: None, .. } = &entry {
+        } else if let OutputEntry::ToolCard {
+            input,
+            result: None,
+            ..
+        } = &entry
+        {
             self.text_total_bytes += input.len();
         } else if let OutputEntry::Thinking { summary, .. } = &entry {
             self.text_total_bytes += summary.len();
@@ -284,7 +294,15 @@ impl OutputBuffer {
     pub(crate) fn completed_tool_card_count(&self) -> usize {
         self.entries
             .iter()
-            .filter(|e| matches!(e, OutputEntry::ToolCard { result: Some(_), .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    OutputEntry::ToolCard {
+                        result: Some(_),
+                        ..
+                    }
+                )
+            })
             .count()
     }
 
@@ -306,7 +324,11 @@ impl OutputBuffer {
     pub(crate) fn tool_card_line_ranges(
         &self,
         area_width: usize,
-    ) -> Vec<(usize /*entry_idx*/, usize /*start*/, usize /*end*/)> {
+    ) -> Vec<(
+        usize, /*entry_idx*/
+        usize, /*start*/
+        usize, /*end*/
+    )> {
         let mut ranges = Vec::new();
         let mut current_line: usize = 0;
         let width = area_width.max(1);
@@ -322,7 +344,7 @@ impl OutputBuffer {
                     if w == 0 {
                         1
                     } else {
-                        ((w + width - 1) / width).max(1)
+                        w.div_ceil(width)
                     }
                 })
                 .sum();
@@ -348,8 +370,11 @@ impl OutputBuffer {
         let ranges = self.tool_card_line_ranges(area_width);
         for (entry_idx, start, end) in ranges {
             if line >= start && line < end {
-                if let Some(OutputEntry::ToolCard { collapsed, result: Some(_), .. }) =
-                    self.entries.get_mut(entry_idx)
+                if let Some(OutputEntry::ToolCard {
+                    collapsed,
+                    result: Some(_),
+                    ..
+                }) = self.entries.get_mut(entry_idx)
                 {
                     *collapsed = !*collapsed;
                     return true;
@@ -411,7 +436,10 @@ impl OutputBuffer {
                 break;
             }
             // 优先淘汰最早的 Text 条目
-            let first_text_idx = self.entries.iter().position(|e| matches!(e, OutputEntry::Text { .. }));
+            let first_text_idx = self
+                .entries
+                .iter()
+                .position(|e| matches!(e, OutputEntry::Text { .. }));
             if let Some(idx) = first_text_idx {
                 if let OutputEntry::Text { content, .. } = &self.entries[idx] {
                     self.text_total_bytes = self.text_total_bytes.saturating_sub(content.len());
@@ -433,9 +461,7 @@ impl OutputBuffer {
                         let placeholder = format!("[trimmed: {} bytes]", trimmed_len);
                         // 占位符自身从 text_total_bytes 中扣除，避免占位符
                         // 又被下一轮迭代命中（占位符不算业务文本）。
-                        self.text_total_bytes = self
-                            .text_total_bytes
-                            .saturating_sub(trimmed_len);
+                        self.text_total_bytes = self.text_total_bytes.saturating_sub(trimmed_len);
                         *result = Some(placeholder);
                         self.truncated = true;
                     }
@@ -586,7 +612,7 @@ mod tests {
 
     #[test]
     fn complete_tool_card_sets_result() {
-        let mut view = OutputView::new();
+        let view = OutputView::new();
         {
             let mut guard = view.inner.lock().unwrap();
             guard.push_entry(OutputEntry::tool_card_start(
@@ -608,7 +634,7 @@ mod tests {
 
     #[test]
     fn toggle_latest_tool_card_switches_collapsed() {
-        let mut view = OutputView::new();
+        let view = OutputView::new();
         {
             let mut guard = view.inner.lock().unwrap();
             guard.push_entry(OutputEntry::ToolCard {
@@ -633,7 +659,7 @@ mod tests {
 
     #[test]
     fn completed_tool_card_count_excludes_pending() {
-        let mut view = OutputView::new();
+        let view = OutputView::new();
         {
             let mut guard = view.inner.lock().unwrap();
             guard.push_entry(OutputEntry::ToolCard {

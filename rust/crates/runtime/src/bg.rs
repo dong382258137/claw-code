@@ -97,9 +97,7 @@ pub fn spawn(
 
     let now = current_time_millis();
     let mut cmd = Command::new(&exe);
-    cmd.args(command_args)
-        .current_dir(cwd)
-        .stdin(Stdio::null());
+    cmd.args(command_args).current_dir(cwd).stdin(Stdio::null());
 
     apply_detached_flags(&mut cmd);
 
@@ -137,10 +135,7 @@ pub fn spawn(
     if let Err(job_err) = assign_job_object_best_effort(pid) {
         use std::io::Write;
         if let Ok(mut log) = fs::OpenOptions::new().append(true).open(&pending_log) {
-            let _ = writeln!(
-                log,
-                "[bg] Job Object setup failed for pid {pid}: {job_err}"
-            );
+            let _ = writeln!(log, "[bg] Job Object setup failed for pid {pid}: {job_err}");
         }
     }
 
@@ -320,9 +315,7 @@ fn kill_process(pid: u32) -> Result<(), BgError> {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(BgError::Kill(format!(
-                "taskkill failed: {stderr}{stdout}"
-            )));
+            return Err(BgError::Kill(format!("taskkill failed: {stderr}{stdout}")));
         }
         Ok(())
     }
@@ -382,8 +375,8 @@ fn assign_job_object_best_effort(pid: u32) -> Result<(), String> {
 }
 
 fn save_record(path: &Path, record: &BgRecord) -> Result<(), BgError> {
-    let json = serde_json::to_string_pretty(record)
-        .map_err(|e| BgError::Serialize(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(record).map_err(|e| BgError::Serialize(e.to_string()))?;
     fs::write(path, json).map_err(|e| BgError::Io(e.to_string()))?;
     Ok(())
 }
@@ -715,7 +708,7 @@ mod tests {
         // PID 99999999 几乎肯定不存在
         // Unix:直接返回(无 Job Object 概念)
         // Windows:PowerShell 会尝试 OpenProcess,失败返回错误,但不应 panic
-        assign_job_object_best_effort(99999999);
+        let _ = assign_job_object_best_effort(99999999);
         // 如果到达这里,说明函数没有 panic — 契约满足
     }
 
@@ -743,9 +736,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn sandbox_constants_match_expected_windows_flags() {
-        use crate::sandbox::{
-            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
-        };
+        use crate::sandbox::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS};
         assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
         assert_eq!(DETACHED_PROCESS, 0x0000_0008);
         assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x0000_0200);

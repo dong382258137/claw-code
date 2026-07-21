@@ -90,7 +90,11 @@ pub struct ArchivedToolResult {
 impl ArchivedToolResult {
     /// 构造一条新记录,自动填充 `archived_at_ms`。
     #[must_use]
-    pub fn new(tool_use_id: impl Into<String>, tool_name: impl Into<String>, output: impl Into<String>) -> Self {
+    pub fn new(
+        tool_use_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
         let output = truncate_output(output.into());
         Self {
             tool_use_id: tool_use_id.into(),
@@ -104,8 +108,7 @@ impl ArchivedToolResult {
     ///
     /// 失败时返回 Err(理论上不会失败,因为 ArchivedToolResult 只有 String 字段)。
     pub fn to_jsonl(&self) -> Result<String, ArchiveError> {
-        serde_json::to_string(self)
-            .map_err(|e| ArchiveError::Serialize(e.to_string()))
+        serde_json::to_string(self).map_err(|e| ArchiveError::Serialize(e.to_string()))
     }
 
     /// 从 JSONL 一行反序列化。
@@ -133,7 +136,9 @@ impl std::fmt::Display for ArchiveError {
             Self::Serialize(msg) => write!(f, "archive serialize error: {msg}"),
             Self::Deserialize(msg) => write!(f, "archive deserialize error: {msg}"),
             Self::Io(msg) => write!(f, "archive io error: {msg}"),
-            Self::NoWorkspaceRoot => write!(f, "workspace_root not configured — archive unavailable"),
+            Self::NoWorkspaceRoot => {
+                write!(f, "workspace_root not configured — archive unavailable")
+            }
         }
     }
 }
@@ -333,7 +338,7 @@ pub fn prune_archive(archive_path: &Path) -> Result<usize, ArchiveError> {
     }
 
     // 按 archived_at_ms 降序排序(最新在前)
-    records.sort_by(|a, b| b.archived_at_ms.cmp(&a.archived_at_ms));
+    records.sort_by_key(|b| std::cmp::Reverse(b.archived_at_ms));
 
     // 保留最新 N 条(N = ARCHIVE_MAX_CHARS / 平均记录大小,经验值 500)
     const KEEP_RECORDS: usize = 500;
@@ -342,13 +347,15 @@ pub fn prune_archive(archive_path: &Path) -> Result<usize, ArchiveError> {
     // 覆盖写回(原子写:.tmp + rename)
     let tmp_path = archive_path.with_extension("jsonl.tmp");
     {
-        let mut tmp_file = fs::File::create(&tmp_path)
-            .map_err(|e| ArchiveError::Io(e.to_string()))?;
+        let mut tmp_file =
+            fs::File::create(&tmp_path).map_err(|e| ArchiveError::Io(e.to_string()))?;
         for record in &records {
             let line = record.to_jsonl()?;
             writeln!(tmp_file, "{line}").map_err(|e| ArchiveError::Io(e.to_string()))?;
         }
-        tmp_file.flush().map_err(|e| ArchiveError::Io(e.to_string()))?;
+        tmp_file
+            .flush()
+            .map_err(|e| ArchiveError::Io(e.to_string()))?;
     }
     fs::rename(&tmp_path, archive_path).map_err(|e| ArchiveError::Io(e.to_string()))?;
 
@@ -468,8 +475,8 @@ mod tests {
         archive_tool_result(workspace_root, "call_1", "Read", "contents")
             .expect("archive should succeed");
 
-        let result = recall_tool_result(workspace_root, "nonexistent")
-            .expect("recall should succeed");
+        let result =
+            recall_tool_result(workspace_root, "nonexistent").expect("recall should succeed");
         assert!(result.is_none());
     }
 
@@ -511,9 +518,15 @@ mod tests {
         archive_tool_result(workspace_root, "call_2", "Bash", "cmd1").unwrap();
         archive_tool_result(workspace_root, "call_3", "Grep", "match1").unwrap();
 
-        let r1 = recall_tool_result(workspace_root, "call_1").unwrap().unwrap();
-        let r2 = recall_tool_result(workspace_root, "call_2").unwrap().unwrap();
-        let r3 = recall_tool_result(workspace_root, "call_3").unwrap().unwrap();
+        let r1 = recall_tool_result(workspace_root, "call_1")
+            .unwrap()
+            .unwrap();
+        let r2 = recall_tool_result(workspace_root, "call_2")
+            .unwrap()
+            .unwrap();
+        let r3 = recall_tool_result(workspace_root, "call_3")
+            .unwrap()
+            .unwrap();
 
         assert_eq!(r1.tool_name, "Read");
         assert_eq!(r1.output, "file1");
@@ -645,7 +658,9 @@ mod tests {
         assert_eq!(record_count(workspace_root).unwrap(), 10);
 
         // 验证 recall 仍正常工作
-        let r = recall_tool_result(workspace_root, "call_5").unwrap().unwrap();
+        let r = recall_tool_result(workspace_root, "call_5")
+            .unwrap()
+            .unwrap();
         assert_eq!(r.output, "content_5");
     }
 
@@ -653,7 +668,10 @@ mod tests {
     fn archive_path_returns_correct_location() {
         let workspace = Path::new("/tmp/test_workspace");
         let path = archive_path(workspace);
-        assert_eq!(path, Path::new("/tmp/test_workspace/.claw/tool_results_archive.jsonl"));
+        assert_eq!(
+            path,
+            Path::new("/tmp/test_workspace/.claw/tool_results_archive.jsonl")
+        );
     }
 
     #[test]

@@ -6,20 +6,20 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+pub mod app;
+pub mod commands_handler;
+pub mod doctor;
+pub mod format;
 pub mod init;
 pub mod input;
 pub mod paste;
+pub mod plugin_state;
 pub mod render;
+pub mod session_mgr;
 pub mod streaming;
 pub mod suggestion;
-pub mod ultraplan;
 pub mod tool_display;
-pub mod plugin_state;
-pub mod session_mgr;
-pub mod doctor;
-pub mod commands_handler;
-pub mod format;
-pub mod app;
+pub mod ultraplan;
 
 #[cfg(feature = "full-tui")]
 pub mod tui;
@@ -41,14 +41,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, model_family_identity_for,
-    model_requires_reasoning_content_in_history, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, CacheControl, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, CacheControl, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    PromptCache, ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
+    SystemBlock, SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
+use app::*;
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
@@ -57,8 +57,25 @@ use commands::{
     slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
     SlashCommand,
 };
+use commands_handler::*;
 use compat_harness::{extract_manifest, UpstreamPaths};
+use doctor::*;
+use format::*;
 use init::initialize_repo;
+use paste::{
+    expand_paste_placeholders, fold_pasted_input, format_pasted_text_ref, paste_cache_path,
+    paste_cache_root, pasted_text_ref_num_lines, read_clipboard_text, should_fold_paste,
+    store_paste_and_make_placeholder, try_auto_expand_clipboard, PASTE_FOLD_CHAR_THRESHOLD,
+    PASTE_FOLD_LINE_THRESHOLD,
+};
+use plugin_state::{
+    build_plugin_manager, build_runtime_mcp_state, build_runtime_plugin_state,
+    build_runtime_plugin_state_with_loader, mcp_annotation_flag, mcp_runtime_tool_definition,
+    mcp_wrapper_tool_definitions, permission_mode_for_mcp_tool, plugins_command_payload_for,
+    plugins_command_payload_from_result, resolve_plugin_path,
+    runtime_hook_config_from_plugin_hooks, RuntimeMcpState, RuntimePluginState,
+    RuntimePluginStateBuildOutput,
+};
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, OutputVerbosity, Spinner, TerminalRenderer};
 use runtime::{
@@ -68,89 +85,64 @@ use runtime::{
     CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
     ConversationRuntime, HistoryIndex, McpServer, McpServerManager, McpServerSpec, McpTool,
     MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    RepoMap, ResolvedPermissionMode, RuntimeError, Session, SystemPromptExtras,
-    SystemPromptSplit, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    RepoMap, ResolvedPermissionMode, RuntimeError, Session, SystemPromptExtras, SystemPromptSplit,
+    TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
-};
-use paste::{
-    expand_paste_placeholders, fold_pasted_input, format_pasted_text_ref, paste_cache_path,
-    paste_cache_root, pasted_text_ref_num_lines, read_clipboard_text, should_fold_paste,
-    store_paste_and_make_placeholder, try_auto_expand_clipboard, PASTE_FOLD_CHAR_THRESHOLD,
-    PASTE_FOLD_LINE_THRESHOLD,
-};
-use suggestion::{
-    common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
-    render_suggestion_line, suggest_closest_term, suggest_similar_subcommand,
-    suggest_slash_commands, CLI_OPTION_SUGGESTIONS,
-};
-use ultraplan::{
-    describe_tool_progress, format_internal_prompt_progress_line,
-    INTERNAL_PROGRESS_HEARTBEAT_INTERVAL, InternalPromptProgressEvent,
-    InternalPromptProgressReporter, InternalPromptProgressRun, InternalPromptProgressShared,
-    InternalPromptProgressState,
-};
-use tool_display::{
-    CliToolExecutor, ToolSearchRequest, McpToolRequest, ListMcpResourcesRequest,
-    ReadMcpResourceRequest,
-    format_tool_call_start, format_tool_result_card_close, format_tool_result,
-    format_tool_result_compact, format_user_message_card, print_user_card,
-    clear_rustyline_echo, estimate_display_width, is_wide_char, indent_with_card_prefix,
-    extract_tool_path, format_search_start, format_patch_preview, format_bash_call,
-    first_visible_line, format_bash_result, format_read_result, format_write_result,
-    format_structured_patch_preview, format_edit_result, format_glob_result,
-    format_grep_result, format_generic_tool_result, summarize_tool_payload,
-    truncate_for_summary, truncate_output_for_display, short_tool_id,
-    TOOL_CARD_PREFIX, USER_CARD_PREFIX, DISPLAY_TRUNCATION_NOTICE,
-    READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS,
-    TOOL_OUTPUT_DISPLAY_MAX_LINES, TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-};
-use plugin_state::{
-    RuntimePluginState, RuntimeMcpState, RuntimePluginStateBuildOutput,
-    build_runtime_mcp_state, mcp_runtime_tool_definition, mcp_wrapper_tool_definitions,
-    permission_mode_for_mcp_tool, mcp_annotation_flag,
-    plugins_command_payload_for, plugins_command_payload_from_result,
-    build_runtime_plugin_state, build_runtime_plugin_state_with_loader,
-    build_plugin_manager, resolve_plugin_path, runtime_hook_config_from_plugin_hooks,
-};
-use streaming::{
-    AnthropicRuntimeClient, HookAbortMonitor,
-    resolve_cli_auth_source, resolve_cli_auth_source_for_cwd,
-    build_system_blocks, mark_last_tool_with_cache_control,
-    request_ends_with_tool_result, format_user_visible_api_error,
-    format_context_window_blocked_error, final_assistant_text,
-    collect_tool_uses, collect_tool_results, collect_prompt_cache_events,
-    render_thinking_block_summary, push_output_block, response_to_events,
-    push_prompt_cache_record, prompt_cache_record_to_runtime_event,
-    permission_policy, extract_system_messages,
-    compact_tool_output_for_model, convert_messages,
-    POST_TOOL_STALL_TIMEOUT, NETWORK_ERROR_KEYWORDS,
-};
 use session_mgr::{
     civil_from_days, collect_session_prompt_history, confirm_session_deletion,
     create_managed_session_handle, current_session_store, default_export_filename,
     delete_managed_session, format_history_timestamp, format_session_modified_age,
     latest_managed_session, list_managed_sessions, load_session_reference,
     looks_like_slash_command_token, new_cli_session, new_cli_session_with_roots,
-    parse_history_count, recent_user_context, render_prompt_history_report,
-    render_session_list, render_session_markdown, resume_command_can_absorb_token,
-    resume_session, resolve_export_path, resolve_managed_session_path,
-    resolve_session_reference, run_export, run_resumed_session_command,
-    run_resume_command, session_clear_backup_path, session_details_json,
-    session_exists_json, session_reference_exists, sessions_dir,
-    summarize_tool_payload_for_markdown, write_session_clear_backup,
-    DEFAULT_HISTORY_LIMIT, LEGACY_SESSION_EXTENSION, LATEST_SESSION_REFERENCE,
-    PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT,
-    SESSION_REFERENCE_ALIASES, ManagedSessionSummary, PromptHistoryEntry,
-    ResumeCommandOutcome, SessionHandle, SessionLifecycleKind, SessionLifecycleSummary,
+    parse_history_count, recent_user_context, render_prompt_history_report, render_session_list,
+    render_session_markdown, resolve_export_path, resolve_managed_session_path,
+    resolve_session_reference, resume_command_can_absorb_token, resume_session, run_export,
+    run_resume_command, run_resumed_session_command, session_clear_backup_path,
+    session_details_json, session_exists_json, session_reference_exists, sessions_dir,
+    summarize_tool_payload_for_markdown, write_session_clear_backup, ManagedSessionSummary,
+    PromptHistoryEntry, ResumeCommandOutcome, SessionHandle, SessionLifecycleKind,
+    SessionLifecycleSummary, DEFAULT_HISTORY_LIMIT, LATEST_SESSION_REFERENCE,
+    LEGACY_SESSION_EXTENSION, PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT,
+    SESSION_REFERENCE_ALIASES,
 };
-use doctor::*;
-use commands_handler::*;
-use format::*;
-use app::*;
+use streaming::{
+    build_system_blocks, collect_prompt_cache_events, collect_tool_results, collect_tool_uses,
+    compact_tool_output_for_model, convert_messages, extract_system_messages, final_assistant_text,
+    format_context_window_blocked_error, format_user_visible_api_error,
+    mark_last_tool_with_cache_control, permission_policy, prompt_cache_record_to_runtime_event,
+    push_output_block, push_prompt_cache_record, render_thinking_block_summary,
+    request_ends_with_tool_result, resolve_cli_auth_source, resolve_cli_auth_source_for_cwd,
+    response_to_events, AnthropicRuntimeClient, HookAbortMonitor, NETWORK_ERROR_KEYWORDS,
+    POST_TOOL_STALL_TIMEOUT,
+};
+use suggestion::{
+    common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
+    render_suggestion_line, suggest_closest_term, suggest_similar_subcommand,
+    suggest_slash_commands, CLI_OPTION_SUGGESTIONS,
+};
+use tool_display::{
+    clear_rustyline_echo, estimate_display_width, extract_tool_path, first_visible_line,
+    format_bash_call, format_bash_result, format_edit_result, format_generic_tool_result,
+    format_glob_result, format_grep_result, format_patch_preview, format_read_result,
+    format_search_start, format_structured_patch_preview, format_tool_call_start,
+    format_tool_result, format_tool_result_card_close, format_tool_result_compact,
+    format_user_message_card, format_write_result, indent_with_card_prefix, is_wide_char,
+    print_user_card, short_tool_id, summarize_tool_payload, truncate_for_summary,
+    truncate_output_for_display, CliToolExecutor, ListMcpResourcesRequest, McpToolRequest,
+    ReadMcpResourceRequest, ToolSearchRequest, DISPLAY_TRUNCATION_NOTICE, READ_DISPLAY_MAX_CHARS,
+    READ_DISPLAY_MAX_LINES, TOOL_CARD_PREFIX, TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+    TOOL_OUTPUT_DISPLAY_MAX_LINES, USER_CARD_PREFIX,
+};
+use tools::{
+    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+};
+use ultraplan::{
+    describe_tool_progress, format_internal_prompt_progress_line, InternalPromptProgressEvent,
+    InternalPromptProgressReporter, InternalPromptProgressRun, InternalPromptProgressShared,
+    InternalPromptProgressState, INTERNAL_PROGRESS_HEARTBEAT_INTERVAL,
+};
 
 pub const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
@@ -620,8 +612,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliOutputFormat {
     Text,
@@ -639,7 +629,6 @@ impl CliOutputFormat {
         }
     }
 }
-
 
 pub fn resolve_model_alias(model: &str) -> &str {
     match model {
@@ -875,7 +864,10 @@ pub(crate) fn parse_system_prompt_args(
     })
 }
 
-pub(crate) fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+pub(crate) fn parse_export_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
     let mut output_path: Option<PathBuf> = None;
     let mut index = 0;
@@ -957,7 +949,10 @@ pub(crate) fn parse_dump_manifests_args(
     })
 }
 
-pub(crate) fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+pub(crate) fn parse_resume_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
         Some(first) if looks_like_slash_command_token(first) => {
@@ -1042,7 +1037,6 @@ pub fn write_temp_text_file(
     Ok(path)
 }
 
-
 pub struct PluginsCommandPayload {
     pub message: String,
     pub reload_runtime: bool,
@@ -1051,8 +1045,3 @@ pub struct PluginsCommandPayload {
     pub plugins: Vec<Value>,
     pub load_failures: Vec<Value>,
 }
-
-
-
-
-

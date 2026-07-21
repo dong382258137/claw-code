@@ -661,10 +661,7 @@ fn glob_search_impl(
             {
                 if !canonical_roots.is_empty() {
                     let canonical_candidate = candidate.canonicalize()?;
-                    validate_workspace_boundary_multi(
-                        &canonical_candidate,
-                        &canonical_roots,
-                    )?;
+                    validate_workspace_boundary_multi(&canonical_candidate, &canonical_roots)?;
                 }
                 matches.push(candidate.to_path_buf());
             }
@@ -1048,7 +1045,14 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
-    edit_file_in_workspace_with_roots(path, old_string, new_string, replace_all, workspace_root, &[])
+    edit_file_in_workspace_with_roots(
+        path,
+        old_string,
+        new_string,
+        replace_all,
+        workspace_root,
+        &[],
+    )
 }
 
 /// Edit a file with multi-root workspace boundary enforcement.

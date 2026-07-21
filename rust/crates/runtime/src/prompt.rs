@@ -1388,8 +1388,7 @@ mod tests {
         // The Repository Map must live in the cacheable static sections
         // (before SYSTEM_PROMPT_DYNAMIC_BOUNDARY) so it benefits from prompt
         // caching and stays out of the volatile dynamic sections.
-        let builder = SystemPromptBuilder::new()
-            .with_repomap("src/main.rs (refs: 5)\n  fn main");
+        let builder = SystemPromptBuilder::new().with_repomap("src/main.rs (refs: 5)\n  fn main");
         let split = builder.build_split();
         assert!(
             split
@@ -1412,8 +1411,7 @@ mod tests {
     fn repomap_section_present_in_build_split() {
         // build_split().render() must surface the Repository Map section in
         // the final rendered prompt text (no boundary marker leakage).
-        let builder = SystemPromptBuilder::new()
-            .with_repomap("src/lib.rs (refs: 3)\n  fn helper");
+        let builder = SystemPromptBuilder::new().with_repomap("src/lib.rs (refs: 3)\n  fn helper");
         let rendered = builder.build_split().render();
         assert!(
             rendered.contains("## Repository Map"),

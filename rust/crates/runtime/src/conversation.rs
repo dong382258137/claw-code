@@ -621,10 +621,7 @@ where
     /// 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
     /// 详见 docs/harness-engineering-optimization-plan.md Step 3.2。
     #[must_use]
-    pub fn with_multi_agent_coordinator(
-        mut self,
-        coordinator: MultiAgentCoordinator,
-    ) -> Self {
+    pub fn with_multi_agent_coordinator(mut self, coordinator: MultiAgentCoordinator) -> Self {
         self.multi_agent_coordinator = Some(coordinator);
         self
     }
@@ -749,25 +746,26 @@ where
                     return HookRunResult::cancelled_with_message(reason);
                 }
                 LoopAction::InjectContext(msg) => {
-                    let mut base_result = if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-                        self.hook_runner.run_post_tool_use_with_context(
-                            tool_name,
-                            input,
-                            output,
-                            is_error,
-                            Some(&self.hook_abort_signal),
-                            Some(reporter.as_mut()),
-                        )
-                    } else {
-                        self.hook_runner.run_post_tool_use_with_context(
-                            tool_name,
-                            input,
-                            output,
-                            is_error,
-                            Some(&self.hook_abort_signal),
-                            None,
-                        )
-                    };
+                    let mut base_result =
+                        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
+                            self.hook_runner.run_post_tool_use_with_context(
+                                tool_name,
+                                input,
+                                output,
+                                is_error,
+                                Some(&self.hook_abort_signal),
+                                Some(reporter.as_mut()),
+                            )
+                        } else {
+                            self.hook_runner.run_post_tool_use_with_context(
+                                tool_name,
+                                input,
+                                output,
+                                is_error,
+                                Some(&self.hook_abort_signal),
+                                None,
+                            )
+                        };
                     base_result.append_message(msg);
                     return base_result;
                 }
@@ -880,9 +878,7 @@ where
                     // 尝试持久化(workspace_root 为 None 时跳过,不阻断主流程)。
                     if let Some(root) = &self.workspace_root {
                         if let Err(err) = persist_plan_artifact(&artifact, root) {
-                            eprintln!(
-                                "warning: failed to persist plan artifact: {err}"
-                            );
+                            eprintln!("warning: failed to persist plan artifact: {err}");
                         }
                     }
                     artifact.transition_to_executing();
@@ -911,9 +907,8 @@ where
             }
 
             let request = {
-                let sliced = crate::compact::get_messages_after_compact_boundary(
-                    &self.session.messages,
-                );
+                let sliced =
+                    crate::compact::get_messages_after_compact_boundary(&self.session.messages);
                 // Harness O(编排)层:PlanArtifact 末尾追加到 system_prompt。
                 // 缓存保护(§5.2):把 PlanArtifact 渲染成文本块,
                 // 末尾追加到 dynamic_sections,不破坏前面 4 层缓存。
@@ -924,8 +919,7 @@ where
                 //
                 // BUG-6 修复:语义召回结果(pending_semantic_context)同样
                 // 通过 assembler Memory source 或手动 push 注入。
-                let mut system_split =
-                    SystemPromptSplit::from_sections(self.system_prompt.clone());
+                let mut system_split = SystemPromptSplit::from_sections(self.system_prompt.clone());
                 // P0-1:NOTEBOOK 注入 — 跨压缩持久化的工作记忆。
                 // Anthropic《Effective Context Engineering》明确推荐:structured
                 // note-taking 是长程任务的关键技术,每个 turn 注入到 system_prompt
@@ -964,7 +958,8 @@ where
                              - `<plan>`:当前任务的关键决策、约束、进度(若已变化)\n\
                              - `<subagents>`:已 dispatch 的子智能体注册表(防止重复 dispatch)\n\
                              - `<attempted>`:已尝试的方案(防止重复尝试失败方案)\n\
-                             这是防止长程任务中关键信息丢失的关键步骤。".to_string()
+                             这是防止长程任务中关键信息丢失的关键步骤。"
+                                .to_string(),
                         );
                     }
                 }
@@ -1039,9 +1034,8 @@ where
                     match reactive_state {
                         ReactiveCompactState::NotAttempted => {
                             // Step 1: aggressive microcompact (preserve_recent=2).
-                            let before_len = crate::conversation::tool_result_output_len(
-                                &self.session.messages,
-                            );
+                            let before_len =
+                                crate::conversation::tool_result_output_len(&self.session.messages);
                             // P0:reactive microcompact 同样归档原始 tool result,
                             // 确保 reactive 压缩路径也走无损归档。
                             let archive_root = self.workspace_root.clone();
@@ -1056,9 +1050,8 @@ where
                                     }
                                 },
                             );
-                            let after_len = crate::conversation::tool_result_output_len(
-                                &microcompacted,
-                            );
+                            let after_len =
+                                crate::conversation::tool_result_output_len(&microcompacted);
                             // P0-3:reactive microcompact 发生压缩,置 flag。
                             // continue 后回到 loop 顶部,request 重新构造,
                             // system_prompt 会注入 NOTEBOOK 刷新提醒。
@@ -1228,53 +1221,52 @@ where
                         // `Arc<HistoryIndex>` without going through a foreign
                         // dispatcher. All other tool names fall through to the
                         // standard executor.
-                        let (mut output, mut is_error) =
-                            if tool_name == "session_search" {
-                                match self.execute_session_search(&effective_input) {
-                                    Ok(output) => (output, false),
-                                    Err(error) => (error.to_string(), true),
-                                }
-                            } else if tool_name == "dispatch_subagent" {
-                                // Step 3.2-c:subagent-as-tool 路由。
-                                // 主 agent 通过 tool call 派发子 agent,走独立 LLM 请求,
-                                // 不污染主 agent 的 prompt cache(§5.2 缓存保护)。
-                                match self.execute_dispatch_subagent(&effective_input) {
-                                    Ok(output) => (output, false),
-                                    Err(error) => (error.to_string(), true),
-                                }
-                            } else if tool_name == "check_subagent" {
-                                // Step 3.2-c:查询子 agent 状态/结果。
-                                // 终态会发布 SubagentResult lane event。
-                                match self.execute_check_subagent(&effective_input) {
-                                    Ok(output) => (output, false),
-                                    Err(error) => (error.to_string(), true),
-                                }
-                            } else if tool_name == "notebook_update" {
-                                // P0-1:LLM 主动维护 NOTEBOOK.md(跨压缩持久化记忆)。
-                                // Anthropic《Effective Context Engineering for AI Agents》
-                                // 明确推荐:structured note-taking 是长程任务的关键技术。
-                                // 工具描述强调"CRITICAL: always record subagent dispatches
-                                // here so you do not re-dispatch the same task later",
-                                // 直击"AI 忘记已 dispatch 过子智能体"的问题。
-                                match self.execute_notebook_update(&effective_input) {
-                                    Ok(output) => (output, false),
-                                    Err(error) => (error.to_string(), true),
-                                }
-                            } else if tool_name == "recall_full" {
-                                // P0:从 ToolResultArchive 检索 microcompact 摘要前的
-                                // 原始 tool result。直击"AI 看到摘要后无法判断是否需要
-                                // 重新调用工具,导致重复调用"的问题。
-                                // 详见 tool_result_archive 模块文档。
-                                match self.execute_recall_full(&effective_input) {
-                                    Ok(output) => (output, false),
-                                    Err(error) => (error.to_string(), true),
-                                }
-                            } else {
-                                match self.tool_executor.execute(&tool_name, &effective_input) {
-                                    Ok(output) => (output, false),
-                                    Err(error) => (error.to_string(), true),
-                                }
-                            };
+                        let (mut output, mut is_error) = if tool_name == "session_search" {
+                            match self.execute_session_search(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "dispatch_subagent" {
+                            // Step 3.2-c:subagent-as-tool 路由。
+                            // 主 agent 通过 tool call 派发子 agent,走独立 LLM 请求,
+                            // 不污染主 agent 的 prompt cache(§5.2 缓存保护)。
+                            match self.execute_dispatch_subagent(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "check_subagent" {
+                            // Step 3.2-c:查询子 agent 状态/结果。
+                            // 终态会发布 SubagentResult lane event。
+                            match self.execute_check_subagent(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "notebook_update" {
+                            // P0-1:LLM 主动维护 NOTEBOOK.md(跨压缩持久化记忆)。
+                            // Anthropic《Effective Context Engineering for AI Agents》
+                            // 明确推荐:structured note-taking 是长程任务的关键技术。
+                            // 工具描述强调"CRITICAL: always record subagent dispatches
+                            // here so you do not re-dispatch the same task later",
+                            // 直击"AI 忘记已 dispatch 过子智能体"的问题。
+                            match self.execute_notebook_update(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "recall_full" {
+                            // P0:从 ToolResultArchive 检索 microcompact 摘要前的
+                            // 原始 tool result。直击"AI 看到摘要后无法判断是否需要
+                            // 重新调用工具,导致重复调用"的问题。
+                            // 详见 tool_result_archive 模块文档。
+                            match self.execute_recall_full(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else {
+                            match self.tool_executor.execute(&tool_name, &effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        };
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         let post_hook_result = if is_error {
@@ -1356,7 +1348,9 @@ where
                         .flat_map(|m| {
                             m.blocks.iter().filter_map(|b| match b {
                                 crate::session::ContentBlock::ToolResult {
-                                    tool_use_id, output, ..
+                                    tool_use_id,
+                                    output,
+                                    ..
                                 } => Some((tool_use_id.as_str(), output.as_str())),
                                 _ => None,
                             })
@@ -1469,9 +1463,7 @@ where
             MICROCOMPACT_PRESERVE_RECENT,
             |id, name, output| {
                 if let Some(root) = &archive_root {
-                    let _ = crate::tool_result_archive::archive_tool_result(
-                        root, id, name, output,
-                    );
+                    let _ = crate::tool_result_archive::archive_tool_result(root, id, name, output);
                 }
             },
         );
@@ -1605,9 +1597,7 @@ where
         input: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let Some(history_index) = self.session.history_index.as_ref() else {
-            return Ok(
-                "session_search is not available: no history index configured.".to_string(),
-            );
+            return Ok("session_search is not available: no history index configured.".to_string());
         };
 
         let parsed: serde_json::Value =
@@ -1616,10 +1606,7 @@ where
             .get("query")
             .and_then(|v| v.as_str())
             .ok_or("missing 'query' field")?;
-        let top_k = parsed
-            .get("top_k")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10) as usize;
+        let top_k = parsed.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
         let hits = history_index.search(query, top_k)?;
 
@@ -1716,7 +1703,10 @@ where
         let subagent_result = self.run_subagent_turn(&subagent_id, name, task);
 
         // 根据执行结果标记 coordinator 状态
-        let coordinator = self.multi_agent_coordinator.as_ref().expect("coordinator checked above");
+        let coordinator = self
+            .multi_agent_coordinator
+            .as_ref()
+            .expect("coordinator checked above");
         match &subagent_result {
             Ok(result_ref) => {
                 let _ = coordinator.complete(&subagent_id, result_ref.as_str());
@@ -1727,14 +1717,14 @@ where
         }
 
         // 发布终态 SubagentResult lane event
-        let terminal_status = if subagent_result.is_ok() { "completed" } else { "failed" };
+        let terminal_status = if subagent_result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
         let terminal_result = subagent_result.as_deref().unwrap_or_else(|e| e.as_str());
-        let event = LaneEvent::subagent_result(
-            emitted_at,
-            &subagent_id,
-            terminal_status,
-            terminal_result,
-        );
+        let event =
+            LaneEvent::subagent_result(emitted_at, &subagent_id, terminal_status, terminal_result);
         publish_lane_event(event);
 
         // 返回给主 agent:成功返回 result_ref 路径,失败返回错误
@@ -1775,9 +1765,8 @@ where
         })?;
 
         // 构造子智能体 system_prompt — 完全隔离,不包含主 agent 上下文
-        let subagent_system_prompt = SystemPromptSplit::from_sections(vec![
-            format!(
-                "# Subagent: {name} ({subagent_id})\n\
+        let subagent_system_prompt = SystemPromptSplit::from_sections(vec![format!(
+            "# Subagent: {name} ({subagent_id})\n\
                  \n\
                  你是一个子智能体,由主智能体派发执行独立任务。\n\
                  \n\
@@ -1796,8 +1785,7 @@ where
                  2. 分析过程\n\
                  3. 关键发现\n\
                  4. 结论和建议"
-            )
-        ]);
+        )]);
 
         // 构造子智能体的 user message — task 作为唯一输入
         let user_message = ConversationMessage {
@@ -1814,9 +1802,10 @@ where
         };
 
         // 同步阻塞调用 LLM — 复用主 agent 的 api_client(无状态,请求隔离)
-        let events = self.api_client.stream(request).map_err(|e| {
-            format!("subagent LLM request failed: {e}")
-        })?;
+        let events = self
+            .api_client
+            .stream(request)
+            .map_err(|e| format!("subagent LLM request failed: {e}"))?;
 
         // 解析 assistant response
         let (assistant_message, _usage, _cache_events) = build_assistant_message(events)
@@ -1917,8 +1906,7 @@ where
                 .map(|d| d.as_secs().to_string())
                 .unwrap_or_else(|_| "0".to_string());
             let result_str = agent.result.as_deref().unwrap_or("");
-            let event =
-                LaneEvent::subagent_result(emitted_at, subagent_id, status_str, result_str);
+            let event = LaneEvent::subagent_result(emitted_at, subagent_id, status_str, result_str);
             publish_lane_event(event);
         }
 
@@ -2054,17 +2042,15 @@ where
 
         // 按 tool_use_id 检索
         match crate::tool_result_archive::recall_tool_result(workspace_root, tool_use_id)? {
-            Some(record) => {
-                Ok(format!(
-                    "recall_full: retrieved archived tool result.\n\
+            Some(record) => Ok(format!(
+                "recall_full: retrieved archived tool result.\n\
                      tool_use_id: {}\n\
                      tool_name: {}\n\
                      archived_at_ms: {}\n\
                      --- original output ---\n\
                      {}",
-                    record.tool_use_id, record.tool_name, record.archived_at_ms, record.output
-                ))
-            }
+                record.tool_use_id, record.tool_name, record.archived_at_ms, record.output
+            )),
             None => Ok(format!(
                 "recall_full: no archived tool result found for tool_use_id='{tool_use_id}'.\n\
                  The tool result may not have been summarized yet, or the archive \
@@ -2298,8 +2284,8 @@ where
             .map(|start| start.elapsed().as_millis() as u64)
             .unwrap_or(0);
         let turn_id = format!("{}-{}", self.session.session_id, iterations);
-        let mut record =
-            TraceRecord::new(turn_id, latency_ms, tool_calls).with_compact_triggered(compact_triggered);
+        let mut record = TraceRecord::new(turn_id, latency_ms, tool_calls)
+            .with_compact_triggered(compact_triggered);
         if let Some((kind, msg)) = failure {
             record = record.with_failure(kind, msg);
         }
@@ -2505,8 +2491,8 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        SESSION_SEARCH_TOOL_SPEC, StaticToolExecutor, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        SESSION_SEARCH_TOOL_SPEC,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -3602,12 +3588,7 @@ mod tests {
                 name: "Read".to_string(),
                 input: "recent-file-d.txt".to_string(),
             }]),
-            crate::session::ConversationMessage::tool_result(
-                "tool-4",
-                "Read",
-                big_output,
-                false,
-            ),
+            crate::session::ConversationMessage::tool_result("tool-4", "Read", big_output, false),
         ];
 
         let mut runtime = ConversationRuntime::new(
@@ -3678,9 +3659,7 @@ mod tests {
                 _request: ApiRequest,
             ) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.call_count += 1;
-                Err(RuntimeError::new(
-                    "prompt exceeds maximum context length",
-                ))
+                Err(RuntimeError::new("prompt exceeds maximum context length"))
             }
         }
 
@@ -3806,10 +3785,7 @@ mod tests {
     /// without driving a full `run_turn` loop.
     struct NoopApi;
     impl ApiClient for NoopApi {
-        fn stream(
-            &mut self,
-            _request: ApiRequest,
-        ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
             Ok(vec![
                 AssistantEvent::TextDelta("noop".to_string()),
                 AssistantEvent::MessageStop,
@@ -3817,8 +3793,7 @@ mod tests {
         }
     }
 
-    fn open_temp_history_index() -> (tempfile::NamedTempFile, crate::history_search::HistoryIndex)
-    {
+    fn open_temp_history_index() -> (tempfile::NamedTempFile, crate::history_search::HistoryIndex) {
         let file = tempfile::NamedTempFile::new().expect("create temp db file");
         let index =
             crate::history_search::HistoryIndex::open(file.path()).expect("open history index");
@@ -3987,10 +3962,7 @@ mod tests {
             calls: usize,
         }
         impl ApiClient for SearchApi {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.calls += 1;
                 match self.calls {
                     1 => Ok(vec![
@@ -4026,13 +3998,7 @@ mod tests {
 
         let (_file, index) = open_temp_history_index();
         index
-            .index_message(
-                "configure the rust toolchain",
-                "sess-a",
-                "user",
-                0,
-                1_000,
-            )
+            .index_message("configure the rust toolchain", "sess-a", "user", 0, 1_000)
             .expect("index msg 0");
         index
             .index_message(
@@ -4094,7 +4060,10 @@ mod tests {
             "description should mention history: {spec}"
         );
         assert_eq!(spec["input_schema"]["type"], "object");
-        assert_eq!(spec["input_schema"]["properties"]["query"]["type"], "string");
+        assert_eq!(
+            spec["input_schema"]["properties"]["query"]["type"],
+            "string"
+        );
         assert_eq!(
             spec["input_schema"]["properties"]["top_k"]["type"],
             "integer"
@@ -4203,20 +4172,28 @@ mod tests {
         assert_eq!(agent.mode, crate::multi_agent::CoordinationMode::Fork);
         // result 字段应包含 result_ref 路径
         assert!(
-            agent.result.as_deref().unwrap_or("").contains(".claw/subagents/"),
+            agent
+                .result
+                .as_deref()
+                .unwrap_or("")
+                .contains(".claw/subagents/"),
             "coordinator.result should contain result_ref path: {:?}",
             agent.result
         );
 
         // 验证结果文件确实写入磁盘(P0-2 核心不变量:"Subagent output to a filesystem")
-        let result_file = tempdir.path().join(".claw").join("subagents").join(format!("{subagent_id}.md"));
+        let result_file = tempdir
+            .path()
+            .join(".claw")
+            .join("subagents")
+            .join(format!("{subagent_id}.md"));
         assert!(
             result_file.exists(),
             "subagent result file should exist at {result_file:?}"
         );
         let file_content = std::fs::read_to_string(&result_file).expect("read result file");
         assert!(
-            file_content.contains(&unique_task),
+            file_content.contains(unique_task),
             "result file should contain the task: {file_content}"
         );
 
@@ -4382,7 +4359,11 @@ mod tests {
             .expect("subagent should be registered despite failure");
         assert_eq!(agent.status, crate::multi_agent::SubagentStatus::Failed);
         assert!(
-            agent.result.as_deref().unwrap_or("").contains("workspace_root not configured"),
+            agent
+                .result
+                .as_deref()
+                .unwrap_or("")
+                .contains("workspace_root not configured"),
             "coordinator.result should contain failure reason: {:?}",
             agent.result
         );
@@ -4397,9 +4378,15 @@ mod tests {
                     .and_then(|v| v.as_str())
                     .is_some_and(|t| t == subagent_id)
         });
-        assert!(result_event.is_some(), "SubagentResult event should be published");
+        assert!(
+            result_event.is_some(),
+            "SubagentResult event should be published"
+        );
         let result_event = result_event.unwrap();
-        assert_eq!(result_event.status, crate::lane_events::LaneEventStatus::Failed);
+        assert_eq!(
+            result_event.status,
+            crate::lane_events::LaneEventStatus::Failed
+        );
     }
 
     /// P0-2:子智能体真实化 — 验证主 agent 上下文不被污染。
@@ -4461,11 +4448,15 @@ mod tests {
         };
 
         let input1 = serde_json::json!({"name":"a","task":"task-1","mode":"fork"}).to_string();
-        let output1 = runtime.execute_dispatch_subagent(&input1).expect("first dispatch");
+        let output1 = runtime
+            .execute_dispatch_subagent(&input1)
+            .expect("first dispatch");
         let id1 = extract_id(&output1);
 
         let input2 = serde_json::json!({"name":"b","task":"task-2","mode":"fork"}).to_string();
-        let output2 = runtime.execute_dispatch_subagent(&input2).expect("second dispatch");
+        let output2 = runtime
+            .execute_dispatch_subagent(&input2)
+            .expect("second dispatch");
         let id2 = extract_id(&output2);
 
         assert!(
@@ -4479,18 +4470,30 @@ mod tests {
         );
         let n1: u64 = id1.strip_prefix("subagent-").unwrap().parse().unwrap();
         let n2: u64 = id2.strip_prefix("subagent-").unwrap().parse().unwrap();
-        assert_eq!(n2, n1 + 1, "id counter should increment by 1: n1={n1}, n2={n2}");
+        assert_eq!(
+            n2,
+            n1 + 1,
+            "id counter should increment by 1: n1={n1}, n2={n2}"
+        );
 
         // 两个结果文件都应存在
-        let file1 = tempdir.path().join(".claw").join("subagents").join(format!("{id1}.md"));
-        let file2 = tempdir.path().join(".claw").join("subagents").join(format!("{id2}.md"));
+        let file1 = tempdir
+            .path()
+            .join(".claw")
+            .join("subagents")
+            .join(format!("{id1}.md"));
+        let file2 = tempdir
+            .path()
+            .join(".claw")
+            .join("subagents")
+            .join(format!("{id2}.md"));
         assert!(file1.exists(), "result file 1 should exist: {file1:?}");
         assert!(file2.exists(), "result file 2 should exist: {file2:?}");
     }
 
     #[test]
     fn check_subagent_returns_message_when_no_coordinator_configured() {
-        let mut runtime = runtime_without_coordinator();
+        let runtime = runtime_without_coordinator();
         let output = runtime
             .execute_check_subagent(r#"{"subagent_id":"x"}"#)
             .expect("soft failure should not propagate as error");
@@ -4510,7 +4513,7 @@ mod tests {
         let id = coordinator.spawn("a", unique_task, crate::multi_agent::CoordinationMode::Fork);
         coordinator.start(&id).expect("start should succeed");
 
-        let mut runtime = runtime_with_coordinator(coordinator);
+        let runtime = runtime_with_coordinator(coordinator);
         let output = runtime
             .execute_check_subagent(&format!(r#"{{"subagent_id":"{id}"}}"#))
             .expect("check should succeed");
@@ -4554,7 +4557,7 @@ mod tests {
             .complete(&id, unique_result)
             .expect("complete should succeed");
 
-        let mut runtime = runtime_with_coordinator(coordinator);
+        let runtime = runtime_with_coordinator(coordinator);
         let output = runtime
             .execute_check_subagent(&format!(r#"{{"subagent_id":"{id}"}}"#))
             .expect("check should succeed");
@@ -4580,7 +4583,10 @@ mod tests {
             "SubagentResult event should be published for completed subagent"
         );
         let result_event = result_event.unwrap();
-        assert_eq!(result_event.status, crate::lane_events::LaneEventStatus::Completed);
+        assert_eq!(
+            result_event.status,
+            crate::lane_events::LaneEventStatus::Completed
+        );
         let data = result_event.data.as_ref().expect("result event has data");
         assert_eq!(data["subagent_id"], id);
         assert_eq!(data["status"], "completed");
@@ -4604,7 +4610,7 @@ mod tests {
             .fail(&id, unique_error)
             .expect("fail should succeed");
 
-        let mut runtime = runtime_with_coordinator(coordinator);
+        let runtime = runtime_with_coordinator(coordinator);
         let output = runtime
             .execute_check_subagent(&format!(r#"{{"subagent_id":"{id}"}}"#))
             .expect("check should succeed");
@@ -4630,7 +4636,10 @@ mod tests {
             "SubagentResult event should be published for failed subagent"
         );
         let result_event = result_event.unwrap();
-        assert_eq!(result_event.status, crate::lane_events::LaneEventStatus::Failed);
+        assert_eq!(
+            result_event.status,
+            crate::lane_events::LaneEventStatus::Failed
+        );
         // failed 必须设置 failure_class = SubagentFailure。
         assert_eq!(
             result_event.failure_class,
@@ -4641,7 +4650,7 @@ mod tests {
     #[test]
     fn check_subagent_errors_when_subagent_id_missing() {
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let mut runtime = runtime_with_coordinator(coordinator);
+        let runtime = runtime_with_coordinator(coordinator);
 
         let error = runtime
             .execute_check_subagent(r#"{}"#)
@@ -4655,7 +4664,7 @@ mod tests {
     #[test]
     fn check_subagent_errors_when_subagent_not_found() {
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        let mut runtime = runtime_with_coordinator(coordinator);
+        let runtime = runtime_with_coordinator(coordinator);
 
         let error = runtime
             .execute_check_subagent(r#"{"subagent_id":"nonexistent"}"#)
@@ -4964,9 +4973,27 @@ mod tests {
         let workspace_root = tempdir.path().to_path_buf();
 
         // 归档 3 条记录
-        crate::tool_result_archive::archive_tool_result(&workspace_root, "id_1", "Read", "content1").unwrap();
-        crate::tool_result_archive::archive_tool_result(&workspace_root, "id_2", "Bash", "content2").unwrap();
-        crate::tool_result_archive::archive_tool_result(&workspace_root, "id_3", "Grep", "content3").unwrap();
+        crate::tool_result_archive::archive_tool_result(
+            &workspace_root,
+            "id_1",
+            "Read",
+            "content1",
+        )
+        .unwrap();
+        crate::tool_result_archive::archive_tool_result(
+            &workspace_root,
+            "id_2",
+            "Bash",
+            "content2",
+        )
+        .unwrap();
+        crate::tool_result_archive::archive_tool_result(
+            &workspace_root,
+            "id_3",
+            "Grep",
+            "content3",
+        )
+        .unwrap();
 
         let runtime = ConversationRuntime::new(
             Session::new(),
@@ -5026,7 +5053,9 @@ mod tests {
             .execute_recall_full(r#"{"list_only":false}"#)
             .expect_err("missing tool_use_id should propagate as error");
         assert!(
-            error.to_string().contains("missing or invalid 'tool_use_id'"),
+            error
+                .to_string()
+                .contains("missing or invalid 'tool_use_id'"),
             "expected missing tool_use_id error: {error}"
         );
     }
@@ -5089,7 +5118,10 @@ mod tests {
             1, // preserve_recent=1:只保留最后 1 个 tool result
             |id, name, output| {
                 let _ = crate::tool_result_archive::archive_tool_result(
-                    &archive_root, id, name, output,
+                    &archive_root,
+                    id,
+                    name,
+                    output,
                 );
             },
         );
@@ -5098,7 +5130,12 @@ mod tests {
         let find_output = |messages: &[ConversationMessage], tool_use_id: &str| -> String {
             for msg in messages {
                 for block in &msg.blocks {
-                    if let ContentBlock::ToolResult { tool_use_id: tuid, output, .. } = block {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id: tuid,
+                        output,
+                        ..
+                    } = block
+                    {
                         if tuid == tool_use_id {
                             return output.clone();
                         }
@@ -5128,31 +5165,28 @@ mod tests {
         );
 
         // 验证 archive 文件包含被摘要的原始内容
-        let recalled_1 = crate::tool_result_archive::recall_tool_result(
-            &workspace_root, "call_old_1",
-        )
-        .expect("recall should succeed")
-        .expect("call_old_1 should be archived");
+        let recalled_1 =
+            crate::tool_result_archive::recall_tool_result(&workspace_root, "call_old_1")
+                .expect("recall should succeed")
+                .expect("call_old_1 should be archived");
         assert_eq!(
             recalled_1.output, original_output_1,
             "archived output should match original"
         );
 
-        let recalled_2 = crate::tool_result_archive::recall_tool_result(
-            &workspace_root, "call_old_2",
-        )
-        .expect("recall should succeed")
-        .expect("call_old_2 should be archived");
+        let recalled_2 =
+            crate::tool_result_archive::recall_tool_result(&workspace_root, "call_old_2")
+                .expect("recall should succeed")
+                .expect("call_old_2 should be archived");
         assert_eq!(
             recalled_2.output, original_output_2,
             "archived output should match original"
         );
 
         // call_recent 不应被归档(未被摘要)
-        let recalled_3 = crate::tool_result_archive::recall_tool_result(
-            &workspace_root, "call_recent",
-        )
-        .expect("recall should succeed");
+        let recalled_3 =
+            crate::tool_result_archive::recall_tool_result(&workspace_root, "call_recent")
+                .expect("recall should succeed");
         assert!(
             recalled_3.is_none(),
             "call_recent should NOT be archived (not summarized)"

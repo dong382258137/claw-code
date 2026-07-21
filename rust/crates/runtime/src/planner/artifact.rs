@@ -167,7 +167,11 @@ impl PlanArtifact {
         self.steps
             .iter()
             .find(|step| step.status == StepStatus::Executing)
-            .or_else(|| self.steps.iter().find(|step| step.status == StepStatus::Pending))
+            .or_else(|| {
+                self.steps
+                    .iter()
+                    .find(|step| step.status == StepStatus::Pending)
+            })
     }
 
     /// 当前正在执行的 step 的可变引用。

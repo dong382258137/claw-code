@@ -5,13 +5,13 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+use crate::render::OutputVerbosity;
 use api::model_family_identity_for;
 use commands::{
     classify_skills_slash_command, resolve_skill_invocation, slash_command_specs,
     SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
-use crate::render::OutputVerbosity;
 use runtime::{load_system_prompt, PermissionMode};
 use serde_json::json;
 
@@ -21,14 +21,14 @@ use crate::suggestion::{
     suggest_similar_subcommand, suggest_slash_commands, CLI_OPTION_SUGGESTIONS,
 };
 use crate::{
-    AllowedToolSet, BUILD_TARGET, CliOutputFormat, DEFAULT_DATE, DEFAULT_MODEL, GIT_SHA, VERSION,
     config_alias_for_current_dir, config_model_for_current_dir,
     config_permission_mode_for_current_dir, current_tool_registry, default_permission_mode,
     format_connected_line, normalize_allowed_tools, parse_dump_manifests_args, parse_export_args,
     parse_permission_mode_arg, parse_resume_args, parse_system_prompt_args,
     permission_mode_from_label, permission_mode_from_resolved, provider_label,
     render_version_report, resolve_model_alias, resolve_model_alias_with_config,
-    resolve_repl_model, validate_model_syntax,
+    resolve_repl_model, validate_model_syntax, AllowedToolSet, CliOutputFormat, BUILD_TARGET,
+    DEFAULT_DATE, DEFAULT_MODEL, GIT_SHA, VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,10 +298,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     .ok_or_else(|| "missing value for --add-dir".to_string())?;
                 let path = PathBuf::from(value);
                 if !path.exists() {
-                    return Err(format!(
-                        "--add-dir path does not exist: {}",
-                        path.display()
-                    ));
+                    return Err(format!("--add-dir path does not exist: {}", path.display()));
                 }
                 additional_workspace_roots.push(path);
                 index += 2;
@@ -309,10 +306,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             flag if flag.starts_with("--add-dir=") => {
                 let path = PathBuf::from(&flag[10..]);
                 if !path.exists() {
-                    return Err(format!(
-                        "--add-dir path does not exist: {}",
-                        path.display()
-                    ));
+                    return Err(format!("--add-dir path does not exist: {}", path.display()));
                 }
                 additional_workspace_roots.push(path);
                 index += 1;
@@ -1079,7 +1073,9 @@ pub(crate) fn dump_manifests_at_path(
     }
 }
 
-pub(crate) fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn print_bootstrap_plan(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let phases = runtime::BootstrapPlan::claude_code_default()
         .phases()
         .iter()
@@ -1134,7 +1130,9 @@ pub(crate) fn print_system_prompt(
     Ok(())
 }
 
-pub(crate) fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn print_version(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     match output_format {
         CliOutputFormat::Text => println!("{}", render_version_report()),
         CliOutputFormat::Json => {
@@ -1561,7 +1559,9 @@ pub(crate) fn handle_poor_mode_action(action: Option<&str>) -> (bool, String) {
             let state = if current { "ACTIVE" } else { "inactive" };
             (
                 current,
-                format!("{icon} Poor mode: {state}\n\x1b[2mToggle with /poor, or /poor on|off\x1b[0m"),
+                format!(
+                    "{icon} Poor mode: {state}\n\x1b[2mToggle with /poor, or /poor on|off\x1b[0m"
+                ),
             )
         }
         Some(other) => (

@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 // SP4.2 修复:HashSet 用于 opened_files
@@ -470,13 +470,7 @@ impl LspRegistry {
         // 2. 否则 fallback 到 LspJsonRpcClient(MemoryLspTransport)— 保持向后兼容
         //
         // 协议流程:initialize → initialized → didChange → completion/hover/definition
-        let request = LspRequest::new(
-            lsp_action,
-            path,
-            line,
-            character,
-            server.language.clone(),
-        );
+        let request = LspRequest::new(lsp_action, path, line, character, server.language.clone());
 
         // 检查是否有已 spawn 的真实 transport
         let transport_arc = {
@@ -786,7 +780,8 @@ impl ProcessLspTransport {
         let response = self.send("initialize", init_params)?;
         // 验证 initialize 响应包含 capabilities
         if response.get("result").is_none() && response.get("error").is_some() {
-            let err = response["error"].get("message")
+            let err = response["error"]
+                .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
             return Err(format!("LSP initialize failed: {err}"));
@@ -801,11 +796,7 @@ impl ProcessLspTransport {
     }
 
     /// 发送 JSON-RPC 通知(无 id,不等待响应)。
-    fn send_notification(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<(), String> {
+    fn send_notification(&self, method: &str, params: serde_json::Value) -> Result<(), String> {
         let message = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -829,7 +820,10 @@ impl ProcessLspTransport {
                 .to_string()
         };
 
-        let mut opened = self.opened_files.lock().map_err(|_| "opened_files lock poisoned".to_string())?;
+        let mut opened = self
+            .opened_files
+            .lock()
+            .map_err(|_| "opened_files lock poisoned".to_string())?;
         if opened.contains(&abs_path) {
             return Ok(());
         }
@@ -919,8 +913,8 @@ impl ProcessLspTransport {
             return Err("LSP server not spawned; call spawn() first".to_string());
         };
 
-        let body = serde_json::to_string(message)
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
+        let body =
+            serde_json::to_string(message).map_err(|e| format!("JSON serialization error: {e}"))?;
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
         let mut stdin = stdin_handle
@@ -932,9 +926,7 @@ impl ProcessLspTransport {
         stdin
             .write_all(body.as_bytes())
             .map_err(|e| format!("write body error: {e}"))?;
-        stdin
-            .flush()
-            .map_err(|e| format!("flush error: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush error: {e}"))?;
 
         Ok(())
     }
@@ -1019,7 +1011,11 @@ impl ProcessLspTransport {
     /// LSP server 会主动推送通知(publishDiagnostics、window/logMessage 等),
     /// 这些通知有 `method` 字段但无 `id` 字段。此方法循环读取,
     /// 跳过通知,直到拿到匹配 `expected_id` 的响应。
-    fn read_response_for_id(&self, expected_id: u64, timeout_secs: u64) -> Result<serde_json::Value, String> {
+    fn read_response_for_id(
+        &self,
+        expected_id: u64,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, String> {
         loop {
             let message = self.read_message(timeout_secs)?;
 
@@ -1048,10 +1044,16 @@ impl LspTransport for ProcessLspTransport {
             // SP4.2 修复:用 send_lock 确保 write+read 原子性
             // 原代码 write_message 和 read_message 之间锁释放,
             // 多线程并发时可能读到其他线程请求的响应
-            let _send_guard = self.send_lock.lock().map_err(|_| "send_lock poisoned".to_string())?;
+            let _send_guard = self
+                .send_lock
+                .lock()
+                .map_err(|_| "send_lock poisoned".to_string())?;
 
             let id = {
-                let mut next = self.next_id.lock().map_err(|_| "id counter lock poisoned".to_string())?;
+                let mut next = self
+                    .next_id
+                    .lock()
+                    .map_err(|_| "id counter lock poisoned".to_string())?;
                 let id = *next;
                 *next += 1;
                 id
@@ -1152,9 +1154,7 @@ fn uri_to_path(uri: &str) -> String {
         // file:// 后可能是 /path(Unix)或 /C:/path(Windows 三斜杠)或 host/path
         if let Some(windows_path) = rest.strip_prefix('/') {
             // 检查是否是 Windows 路径(/C:/...)
-            if windows_path.len() >= 2
-                && windows_path.as_bytes()[1] == b':'
-            {
+            if windows_path.len() >= 2 && windows_path.as_bytes()[1] == b':' {
                 // Windows: /C:/workspace/main.rs → C:/workspace/main.rs
                 return windows_path.to_owned();
             }
@@ -1315,7 +1315,8 @@ pub fn parse_document_symbols_typed(response: &serde_json::Value, path: &str) ->
     let result = response.get("result").unwrap_or(response);
 
     // 尝试 1:DocumentSymbol[] 反序列化
-    if let Ok(doc_symbols) = serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(result.clone())
+    if let Ok(doc_symbols) =
+        serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(result.clone())
     {
         let mut symbols = Vec::new();
         for doc in doc_symbols {
@@ -1397,11 +1398,7 @@ pub fn parse_document_symbols(response: &serde_json::Value, path: &str) -> Vec<L
 }
 
 /// 递归解析 DocumentSymbol(可能包含 children)。
-fn parse_document_symbol_recursive(
-    item: &serde_json::Value,
-    path: &str,
-    out: &mut Vec<LspSymbol>,
-) {
+fn parse_document_symbol_recursive(item: &serde_json::Value, path: &str, out: &mut Vec<LspSymbol>) {
     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let kind_num = item
         .get("kind")
@@ -1470,10 +1467,7 @@ fn parse_symbol_information(
 
     // SP4.2 修复:去掉 location.uri 的 file:// 前缀,统一为本地路径格式
     // 与 typed 路径(From<lsp_types::SymbolInformation>)保持一致
-    let uri = location
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let uri = location.get("uri").and_then(|v| v.as_str()).unwrap_or("");
     let path = uri_to_path(uri);
 
     Some(LspSymbol {
@@ -2075,31 +2069,67 @@ mod tests {
 
     #[test]
     fn lsp_request_file_uri_converts_unix_path() {
-        let req = LspRequest::new(LspAction::Hover, "/workspace/src/main.rs", None, None, "rust");
+        let req = LspRequest::new(
+            LspAction::Hover,
+            "/workspace/src/main.rs",
+            None,
+            None,
+            "rust",
+        );
         assert_eq!(req.file_uri(), "file:///workspace/src/main.rs");
     }
 
     #[test]
     fn lsp_request_file_uri_converts_windows_path() {
-        let req = LspRequest::new(LspAction::Hover, r"C:\workspace\main.rs", None, None, "rust");
+        let req = LspRequest::new(
+            LspAction::Hover,
+            r"C:\workspace\main.rs",
+            None,
+            None,
+            "rust",
+        );
         assert_eq!(req.file_uri(), "file:///C:/workspace/main.rs");
     }
 
     #[test]
     fn lsp_request_file_uri_preserves_existing_file_uri() {
-        let req = LspRequest::new(LspAction::Hover, "file:///workspace/main.rs", None, None, "rust");
+        let req = LspRequest::new(
+            LspAction::Hover,
+            "file:///workspace/main.rs",
+            None,
+            None,
+            "rust",
+        );
         // 已是 file:// URI 时应原样返回
         assert_eq!(req.file_uri(), "file:///workspace/main.rs");
     }
 
     #[test]
     fn lsp_request_method_maps_correctly() {
-        assert_eq!(LspRequest::new(LspAction::Hover, "", None, None, "").method(), "textDocument/hover");
-        assert_eq!(LspRequest::new(LspAction::Definition, "", None, None, "").method(), "textDocument/definition");
-        assert_eq!(LspRequest::new(LspAction::Completion, "", None, None, "").method(), "textDocument/completion");
-        assert_eq!(LspRequest::new(LspAction::References, "", None, None, "").method(), "textDocument/references");
-        assert_eq!(LspRequest::new(LspAction::Symbols, "", None, None, "").method(), "textDocument/documentSymbol");
-        assert_eq!(LspRequest::new(LspAction::Format, "", None, None, "").method(), "textDocument/formatting");
+        assert_eq!(
+            LspRequest::new(LspAction::Hover, "", None, None, "").method(),
+            "textDocument/hover"
+        );
+        assert_eq!(
+            LspRequest::new(LspAction::Definition, "", None, None, "").method(),
+            "textDocument/definition"
+        );
+        assert_eq!(
+            LspRequest::new(LspAction::Completion, "", None, None, "").method(),
+            "textDocument/completion"
+        );
+        assert_eq!(
+            LspRequest::new(LspAction::References, "", None, None, "").method(),
+            "textDocument/references"
+        );
+        assert_eq!(
+            LspRequest::new(LspAction::Symbols, "", None, None, "").method(),
+            "textDocument/documentSymbol"
+        );
+        assert_eq!(
+            LspRequest::new(LspAction::Format, "", None, None, "").method(),
+            "textDocument/formatting"
+        );
     }
 
     #[test]
@@ -2121,7 +2151,13 @@ mod tests {
 
     #[test]
     fn lsp_request_params_references_includes_context() {
-        let req = LspRequest::new(LspAction::References, "src/main.rs", Some(1), Some(0), "rust");
+        let req = LspRequest::new(
+            LspAction::References,
+            "src/main.rs",
+            Some(1),
+            Some(0),
+            "rust",
+        );
         let params = req.params();
         assert_eq!(params["context"]["includeDeclaration"], true);
     }
@@ -2137,7 +2173,9 @@ mod tests {
     #[test]
     fn memory_lsp_transport_returns_protocol_constructed() {
         let transport = MemoryLspTransport::new("rust", None);
-        let result = transport.send("textDocument/hover", serde_json::json!({})).unwrap();
+        let result = transport
+            .send("textDocument/hover", serde_json::json!({}))
+            .unwrap();
         assert_eq!(result["result"]["transport"], "memory");
         assert_eq!(result["result"]["language"], "rust");
         assert_eq!(result["result"]["status"], "protocol_constructed");
@@ -2145,7 +2183,8 @@ mod tests {
 
     #[test]
     fn process_lsp_transport_returns_not_spawned() {
-        let transport = ProcessLspTransport::new("rust", Some("/workspace".to_string()), "rust-analyzer");
+        let transport =
+            ProcessLspTransport::new("rust", Some("/workspace".to_string()), "rust-analyzer");
         let result = transport.send("initialize", serde_json::json!({})).unwrap();
         assert_eq!(result["result"]["transport"], "process");
         assert_eq!(result["result"]["server_command"], "rust-analyzer");
@@ -2154,11 +2193,16 @@ mod tests {
 
     #[test]
     fn process_lsp_transport_initialize_params_includes_root_uri() {
-        let transport = ProcessLspTransport::new("rust", Some("/workspace".to_string()), "rust-analyzer");
+        let transport =
+            ProcessLspTransport::new("rust", Some("/workspace".to_string()), "rust-analyzer");
         let params = transport.initialize_params();
         assert_eq!(params["rootPath"], "/workspace");
         assert_eq!(params["rootUri"], "file:///workspace");
-        assert_eq!(params["capabilities"]["textDocument"]["completion"]["completionItem"]["snippetSupport"], true);
+        assert_eq!(
+            params["capabilities"]["textDocument"]["completion"]["completionItem"]
+                ["snippetSupport"],
+            true
+        );
     }
 
     #[test]
@@ -2205,16 +2249,30 @@ mod tests {
     fn lsp_json_rpc_client_with_transport_uses_custom_transport() {
         let transport = Box::new(ProcessLspTransport::new("rust", None, "rust-analyzer"));
         let client = LspJsonRpcClient::with_transport("rust", None, transport);
-        let request = LspRequest::new(LspAction::Completion, "src/main.rs", Some(1), Some(0), "rust");
+        let request = LspRequest::new(
+            LspAction::Completion,
+            "src/main.rs",
+            Some(1),
+            Some(0),
+            "rust",
+        );
         let result = client.dispatch(&request).unwrap();
         assert_eq!(result["rpc_response"]["result"]["transport"], "process");
-        assert_eq!(result["rpc_response"]["result"]["server_command"], "rust-analyzer");
+        assert_eq!(
+            result["rpc_response"]["result"]["server_command"],
+            "rust-analyzer"
+        );
     }
 
     #[test]
     fn dispatch_hover_action_uses_json_rpc_client() {
         let registry = LspRegistry::new();
-        registry.register("rust", LspServerStatus::Connected, Some("/workspace"), vec![]);
+        registry.register(
+            "rust",
+            LspServerStatus::Connected,
+            Some("/workspace"),
+            vec![],
+        );
 
         let result = registry
             .dispatch("hover", Some("src/main.rs"), Some(10), Some(5), None)
@@ -2324,7 +2382,12 @@ mod tests {
     fn dispatch_falls_back_to_memory_when_not_spawned() {
         // dispatch 在未 spawn 时应 fallback 到 MemoryLspTransport
         let registry = LspRegistry::new();
-        registry.register("rust", LspServerStatus::Connected, Some("/workspace"), vec![]);
+        registry.register(
+            "rust",
+            LspServerStatus::Connected,
+            Some("/workspace"),
+            vec![],
+        );
 
         let result = registry
             .dispatch("hover", Some("src/main.rs"), Some(10), Some(5), None)
@@ -2475,7 +2538,11 @@ mod tests {
         });
 
         let symbols = parse_document_symbols(&response, "src/main.rs");
-        assert_eq!(symbols.len(), 3, "should have 3 symbols (main + inner_fn + MyStruct)");
+        assert_eq!(
+            symbols.len(),
+            3,
+            "should have 3 symbols (main + inner_fn + MyStruct)"
+        );
 
         // 验证 main symbol
         assert_eq!(symbols[0].name, "main");

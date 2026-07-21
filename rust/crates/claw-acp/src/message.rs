@@ -2,7 +2,7 @@ use std::{borrow::Borrow, fmt, ops::Deref};
 
 use agent_client_protocol as acp;
 use derive_more::From;
-use serde::{Deserialize, Serialize, ser::SerializeStruct};
+use serde::{ser::SerializeStruct, Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::common::AcpResult;
@@ -125,7 +125,7 @@ impl StorageMarker for Boxed {
 }
 
 mod client {
-    use futures::{FutureExt as _, future::LocalBoxFuture};
+    use futures::{future::LocalBoxFuture, FutureExt as _};
 
     use super::*;
 
@@ -350,7 +350,7 @@ mod client {
 }
 
 mod agent {
-    use futures::{FutureExt as _, future::LocalBoxFuture};
+    use futures::{future::LocalBoxFuture, FutureExt as _};
 
     use super::*;
 

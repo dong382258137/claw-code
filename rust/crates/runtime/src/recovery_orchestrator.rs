@@ -125,7 +125,10 @@ impl RecoveryOrchestrator {
     /// 注入后,`attempt` 将调用 executor.execute(step, scenario) 执行
     /// 真实命令(如 `git rebase`、`cargo clean`),而非模拟。
     #[must_use]
-    pub fn with_step_executor(mut self, executor: std::sync::Arc<dyn RecoveryStepExecutor>) -> Self {
+    pub fn with_step_executor(
+        mut self,
+        executor: std::sync::Arc<dyn RecoveryStepExecutor>,
+    ) -> Self {
         let ctx = std::mem::take(&mut self.ctx);
         self.ctx = ctx.with_step_executor(executor);
         self
@@ -179,8 +182,7 @@ mod tests {
 
     #[test]
     fn context_mut_exposes_simulation_knobs() {
-        let mut orchestrator =
-            RecoveryOrchestrator::new().with_fail_at_step(0);
+        let mut orchestrator = RecoveryOrchestrator::new().with_fail_at_step(0);
         let outcome = orchestrator.attempt(WorkerFailureKind::Protocol);
         // Failed at first step -> EscalationRequired.
         assert!(outcome.escalated());

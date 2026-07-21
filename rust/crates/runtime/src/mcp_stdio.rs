@@ -1434,11 +1434,10 @@ impl McpStdioProcess {
                     // Re-serialize the generic response and deserialize into
                     // the caller's expected `T`. This round-trip is the cost
                     // of dispatching on an untyped envelope first.
-                    let bytes = serde_json::to_vec(&raw).map_err(|error| {
-                        io::Error::new(io::ErrorKind::InvalidData, error)
-                    })?;
-                    let typed: JsonRpcResponse<T> = serde_json::from_slice(&bytes)
-                        .map_err(|error| {
+                    let bytes = serde_json::to_vec(&raw)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    let typed: JsonRpcResponse<T> =
+                        serde_json::from_slice(&bytes).map_err(|error| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("MCP response for {method} failed typed decode: {error}"),

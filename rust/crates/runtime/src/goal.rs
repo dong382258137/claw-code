@@ -35,16 +35,10 @@ pub enum GoalState {
     Active,
     /// 暂停（通常是网络中断或用户手动暂停）。不再注入 prompt 前缀，
     /// 但保留状态供恢复。`reason` 记录暂停原因，`paused_at_ms` 记录时间戳。
-    Paused {
-        reason: String,
-        paused_at_ms: u64,
-    },
+    Paused { reason: String, paused_at_ms: u64 },
     /// 阻塞中（连续失败但未达 3 次阈值）。仍会注入 prompt 前缀，
     /// 但会附带阻塞计数提醒 LLM 改变策略。
-    Blocked {
-        reason: String,
-        blocked_at_ms: u64,
-    },
+    Blocked { reason: String, blocked_at_ms: u64 },
 }
 
 /// 一个活跃 goal 的完整状态。
@@ -80,10 +74,7 @@ impl GoalManager {
     /// 创建空的 GoalManager（不加载文件）。用于新建会话或测试。
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self {
-            active: None,
-            path,
-        }
+        Self { active: None, path }
     }
 
     /// 从文件加载 GoalManager。文件不存在或解析失败时返回空管理器
@@ -269,7 +260,10 @@ impl Goal {
             .get("blocked_count")
             .and_then(JsonValue::as_i64)
             .unwrap_or(0) as u32;
-        let token_budget = object.get("token_budget").and_then(JsonValue::as_i64).map(|v| v as u64);
+        let token_budget = object
+            .get("token_budget")
+            .and_then(JsonValue::as_i64)
+            .map(|v| v as u64);
         let tokens_used = object
             .get("tokens_used")
             .and_then(JsonValue::as_i64)
@@ -538,7 +532,9 @@ mod tests {
         let dir = temp_dir();
         let mut manager = GoalManager::new(dir.join("goal.json"));
         manager.set("Goal", None).unwrap();
-        manager.record_blocked("tool failure: permission denied").unwrap();
+        manager
+            .record_blocked("tool failure: permission denied")
+            .unwrap();
 
         let prefix = manager.render_prompt_prefix().unwrap();
         assert!(prefix.contains("blocked:"));

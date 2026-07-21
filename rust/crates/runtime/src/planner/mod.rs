@@ -104,9 +104,7 @@ pub fn persist_plan_artifact(
 }
 
 /// 从文件加载 PlanArtifact(用于跨会话恢复 plan 状态)。
-pub fn load_plan_artifact(
-    path: &Path,
-) -> Result<PlanArtifact, Box<dyn std::error::Error>> {
+pub fn load_plan_artifact(path: &Path) -> Result<PlanArtifact, Box<dyn std::error::Error>> {
     let contents = fs::read_to_string(path)?;
     let artifact: PlanArtifact = serde_json::from_str(&contents)?;
     Ok(artifact)
@@ -175,14 +173,8 @@ mod tests {
         ));
         fs::create_dir_all(&temp).unwrap();
 
-        let artifact = PlanArtifact::new(
-            "test task",
-            vec![PlanStep::new(
-                "s1",
-                "step 1",
-                "criteria",
-            )],
-        );
+        let artifact =
+            PlanArtifact::new("test task", vec![PlanStep::new("s1", "step 1", "criteria")]);
         let path = persist_plan_artifact(&artifact, &temp).expect("persist should succeed");
         assert!(path.exists());
 
@@ -230,10 +222,7 @@ mod tests {
         ));
         fs::create_dir_all(&temp).unwrap();
 
-        let mut artifact = PlanArtifact::new(
-            "task",
-            vec![PlanStep::new("s1", "step", "c")],
-        );
+        let mut artifact = PlanArtifact::new("task", vec![PlanStep::new("s1", "step", "c")]);
         let path = persist_plan_artifact(&artifact, &temp).unwrap();
 
         // 模拟 replan:同一 id,但 step 状态改变。

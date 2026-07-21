@@ -7,28 +7,27 @@ use std::process::Command;
 
 use serde_json::json;
 
+use crate::init::initialize_repo;
+use crate::session_mgr::{LATEST_SESSION_REFERENCE, PRIMARY_SESSION_EXTENSION};
+use crate::suggestion::suggest_slash_commands;
 use api::detect_provider_kind;
 use commands::{render_slash_command_help_filtered, resume_supported_slash_commands};
-use crate::init::initialize_repo;
 use runtime::{
     format_usd, pricing_for_model, resolve_sandbox_status, ConfigLoader, ConfigSource,
     ContentBlock, MessageRole, PermissionMode, ProjectContext, RuntimeConfig, Session, TokenUsage,
 };
-use crate::session_mgr::{LATEST_SESSION_REFERENCE, PRIMARY_SESSION_EXTENSION};
-use crate::suggestion::suggest_slash_commands;
 
 use crate::commands_handler::{
-    LocalHelpTopic, STUB_COMMANDS, omc_compatibility_note_for_unknown_slash_command,
+    omc_compatibility_note_for_unknown_slash_command, LocalHelpTopic, STUB_COMMANDS,
 };
 use crate::doctor::{
-    BranchFreshness, GitWorkspaceSummary, StatusContext, StatusUsage,
     build_boot_preflight_snapshot, classify_session_lifecycle_for, parse_git_status_metadata,
-    parse_git_workspace_summary,
+    parse_git_workspace_summary, BranchFreshness, GitWorkspaceSummary, StatusContext, StatusUsage,
 };
 use crate::{
-    AllowedToolSet, BUILD_TARGET, CliOutputFormat, DEFAULT_DATE, DEPRECATED_INSTALL_COMMAND,
-    GIT_SHA, ModelProvenance, ModelSource, OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL, VERSION,
-    provider_label, stale_base_state_for,
+    provider_label, stale_base_state_for, AllowedToolSet, CliOutputFormat, ModelProvenance,
+    ModelSource, BUILD_TARGET, DEFAULT_DATE, DEPRECATED_INSTALL_COMMAND, GIT_SHA,
+    OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL, VERSION,
 };
 
 #[cfg(test)]
@@ -61,7 +60,11 @@ Usage
     )
 }
 
-pub(crate) fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
+pub(crate) fn format_model_switch_report(
+    previous: &str,
+    next: &str,
+    message_count: usize,
+) -> String {
     format!(
         "Model updated
   Previous         {previous}
@@ -161,7 +164,11 @@ pub(crate) fn render_resume_usage() -> String {
     )
 }
 
-pub(crate) fn format_compact_report(removed: usize, resulting_messages: usize, skipped: bool) -> String {
+pub(crate) fn format_compact_report(
+    removed: usize,
+    resulting_messages: usize,
+    skipped: bool,
+) -> String {
     if skipped {
         format!(
             "Compact
@@ -572,7 +579,10 @@ pub(crate) fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
     )
 }
 
-pub(crate) fn format_commit_preflight_report(branch: Option<&str>, summary: GitWorkspaceSummary) -> String {
+pub(crate) fn format_commit_preflight_report(
+    branch: Option<&str>,
+    summary: GitWorkspaceSummary,
+) -> String {
     format!(
         "Commit
   Result           ready
@@ -850,7 +860,9 @@ pub(crate) fn acp_status_json() -> serde_json::Value {
     })
 }
 
-pub(crate) fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn print_acp_status(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     match output_format {
         CliOutputFormat::Text => {
             println!(
@@ -865,7 +877,9 @@ pub(crate) fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box
     Ok(())
 }
 
-pub(crate) fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn render_config_report(
+    section: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let discovered = loader.discover();
@@ -1075,9 +1089,17 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
         for block in memory.blocks() {
             let cur = block.content().chars().count();
             let max = block.max_chars();
-            let ratio = if max == 0 { 0.0 } else { cur as f64 / max as f64 * 100.0 };
+            let ratio = if max == 0 {
+                0.0
+            } else {
+                cur as f64 / max as f64 * 100.0
+            };
             let preview = block.content().lines().next().unwrap_or("").trim();
-            let preview = if preview.is_empty() { "<empty>" } else { preview };
+            let preview = if preview.is_empty() {
+                "<empty>"
+            } else {
+                preview
+            };
             lines.push(format!(
                 "  {} {}/{} chars ({:.0}%) preview={}",
                 block.label(),
@@ -1204,7 +1226,10 @@ pub(crate) fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std
 
 /// #142: emit first-class structured fields alongside the legacy `message`
 /// string so claws can detect per-artifact state without substring matching.
-pub(crate) fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_json::Value {
+pub(crate) fn init_json_value(
+    report: &crate::init::InitReport,
+    message: &str,
+) -> serde_json::Value {
     use crate::init::InitStatus;
     json!({
         "kind": "init",
@@ -1272,7 +1297,11 @@ pub(crate) fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::
 fn colorize_diff(diff: &str) -> String {
     let mut result = String::with_capacity(diff.len());
     for line in diff.lines() {
-        if line.starts_with("diff --git") || line.starts_with("index ") || line.starts_with("---") || line.starts_with("+++") {
+        if line.starts_with("diff --git")
+            || line.starts_with("index ")
+            || line.starts_with("---")
+            || line.starts_with("+++")
+        {
             // File headers
             result.push_str(&format!("\x1b[36m{line}\x1b[0m\n"));
         } else if line.starts_with("@@") {
@@ -1358,7 +1387,9 @@ pub(crate) fn page_long_output(content: &str) {
     }
 }
 
-pub(crate) fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+pub(crate) fn render_diff_json_for(
+    cwd: &Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let in_git_repo = std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
@@ -1447,7 +1478,9 @@ pub(crate) fn render_teleport_report(target: &str) -> Result<String, Box<dyn std
     Ok(lines.join("\n"))
 }
 
-pub(crate) fn render_last_tool_debug_report(session: &Session) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn render_last_tool_debug_report(
+    session: &Session,
+) -> Result<String, Box<dyn std::error::Error>> {
     let last_tool_use = session
         .messages
         .iter()

@@ -9,8 +9,8 @@
 
 use api::build_chat_completion_request;
 use api::{
-    CacheControl, InputContentBlock, InputMessage, MessageRequest, OpenAiCompatConfig,
-    SystemBlock, SystemContent,
+    CacheControl, InputContentBlock, InputMessage, MessageRequest, OpenAiCompatConfig, SystemBlock,
+    SystemContent,
 };
 use serde_json::json;
 
@@ -150,10 +150,8 @@ fn empty_system_content_emits_no_system_message() {
     );
     assert_eq!(payload["messages"][0]["role"], json!("user"));
 
-    let payload = build_chat_completion_request(
-        &sample_request(None),
-        OpenAiCompatConfig::openai(),
-    );
+    let payload =
+        build_chat_completion_request(&sample_request(None), OpenAiCompatConfig::openai());
     assert_eq!(payload["messages"][0]["role"], json!("user"));
 }
 
@@ -172,9 +170,7 @@ fn cache_control_marker_does_not_leak_into_openai_payload() {
     // content 必须是纯字符串，不能是带 cache_control 字段的对象数组
     assert!(system_msg["content"].is_string());
     assert!(system_msg.get("cache_control").is_none());
-    assert!(
-        system_msg["content"]
-            .as_str()
-            .is_some_and(|s| !s.contains("cache_control"))
-    );
+    assert!(system_msg["content"]
+        .as_str()
+        .is_some_and(|s| !s.contains("cache_control")));
 }

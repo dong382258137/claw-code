@@ -6,7 +6,7 @@
 //! - [`TraceRecord`]:简化的本地 trace 记录类型(一行 CSV 对应一条记录)。
 //! - [`TraceAnalyzer`]:加载/导出 CSV,计算基础统计,失败聚类。
 //! - [`TraceStats`]:turn latency / tool call count / compact 触发率等指标直方图。
-//! - [`FailureCluster`]:失败聚类结果。
+//! - [`FailureCluster`][]:失败聚类结果。
 //! - 双模式聚类:
 //!   - [`TraceAnalyzer::cluster_failures`]:按 `failure_kind` 简单分桶(向后兼容)。
 //!   - [`TraceAnalyzer::cluster_failures_kmeans`]:K-means on
@@ -29,7 +29,8 @@ use serde::{Deserialize, Serialize};
 use crate::memory_semantic::{cosine_similarity, EmbeddingProvider};
 
 /// CSV 表头,固定顺序与 [`TraceRecord`] 字段一一对应。
-pub const CSV_HEADER: &str = "turn_id,latency_ms,tool_calls,compact_triggered,failure_kind,error_message";
+pub const CSV_HEADER: &str =
+    "turn_id,latency_ms,tool_calls,compact_triggered,failure_kind,error_message";
 
 /// 每个聚类最多保留的样本错误消息条数,避免聚类膨胀。
 pub const MAX_SAMPLE_ERRORS_PER_CLUSTER: usize = 5;
@@ -227,11 +228,8 @@ impl TraceAnalyzer {
             return TraceStats::default();
         }
         let total_tool_calls: u64 = self.records.iter().map(|r| u64::from(r.tool_calls)).sum();
-        let compact_trigger_count: u64 = self
-            .records
-            .iter()
-            .filter(|r| r.compact_triggered)
-            .count() as u64;
+        let compact_trigger_count: u64 =
+            self.records.iter().filter(|r| r.compact_triggered).count() as u64;
         let total_latency: u64 = self.records.iter().map(|r| r.latency_ms).sum();
         let avg_turn_latency_ms = total_latency as f64 / total_turns as f64;
         let mut latencies: Vec<u64> = self.records.iter().map(|r| r.latency_ms).collect();
@@ -267,7 +265,9 @@ impl TraceAnalyzer {
     pub fn cluster_failures(&self) -> Vec<FailureCluster> {
         let mut buckets: HashMap<String, (u32, Vec<String>)> = HashMap::new();
         for record in &self.records {
-            let Some(kind) = &record.failure_kind else { continue };
+            let Some(kind) = &record.failure_kind else {
+                continue;
+            };
             let (count, errors) = buckets.entry(kind.clone()).or_default();
             *count += 1;
             if let Some(msg) = &record.error_message {
@@ -320,7 +320,9 @@ impl TraceAnalyzer {
         // 2. 按 failure_kind 分组,组内收集 (turn_id, error_message) 用于排序与展示。
         let mut groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for record in &self.records {
-            let Some(kind) = &record.failure_kind else { continue };
+            let Some(kind) = &record.failure_kind else {
+                continue;
+            };
             let msg = record.error_message.clone().unwrap_or_default();
             groups
                 .entry(kind.clone())
@@ -532,11 +534,7 @@ fn is_header_row(fields: &[String]) -> bool {
         "failure_kind",
         "error_message",
     ];
-    fields.len() == expected.len()
-        && fields
-            .iter()
-            .zip(expected.iter())
-            .all(|(f, e)| f == e)
+    fields.len() == expected.len() && fields.iter().zip(expected.iter()).all(|(f, e)| f == e)
 }
 
 /// 将一行 CSV 字段解析为 [`TraceRecord`]。
@@ -723,7 +721,9 @@ mod tests {
         let mut analyzer = TraceAnalyzer::new();
         for i in 1..=10 {
             let triggered = i % 3 == 0; // i = 3, 6, 9 → 3 次
-            analyzer.add_record(TraceRecord::new(format!("t{i}"), i * 10, 0).with_compact_triggered(triggered));
+            analyzer.add_record(
+                TraceRecord::new(format!("t{i}"), i * 10, 0).with_compact_triggered(triggered),
+            );
         }
         let stats = analyzer.stats();
         assert_eq!(stats.compact_trigger_count, 3);
@@ -734,14 +734,22 @@ mod tests {
     #[test]
     fn cluster_failures_groups_by_failure_kind() {
         let mut analyzer = TraceAnalyzer::new();
-        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "req timed out"));
-        analyzer.add_record(TraceRecord::new("t2", 200, 0).with_failure("timeout", "another timeout"));
-        analyzer.add_record(TraceRecord::new("t3", 300, 0).with_failure("auth", "401 unauthorized"));
+        analyzer
+            .add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "req timed out"));
+        analyzer
+            .add_record(TraceRecord::new("t2", 200, 0).with_failure("timeout", "another timeout"));
+        analyzer
+            .add_record(TraceRecord::new("t3", 300, 0).with_failure("auth", "401 unauthorized"));
         analyzer.add_record(TraceRecord::new("t4", 400, 0)); // no failure
-        analyzer.add_record(TraceRecord::new("t5", 500, 0).with_failure("timeout", "third timeout"));
+        analyzer
+            .add_record(TraceRecord::new("t5", 500, 0).with_failure("timeout", "third timeout"));
 
         let clusters = analyzer.cluster_failures();
-        assert_eq!(clusters.len(), 2, "expected 2 failure kinds, got {clusters:?}");
+        assert_eq!(
+            clusters.len(),
+            2,
+            "expected 2 failure kinds, got {clusters:?}"
+        );
         // timeout (count=3) should be first due to count desc.
         assert_eq!(clusters[0].label, "timeout");
         assert_eq!(clusters[0].count, 3);
@@ -761,7 +769,10 @@ mod tests {
         }
         let clusters = analyzer.cluster_failures();
         assert_eq!(clusters.len(), 1);
-        assert_eq!(clusters[0].count, (MAX_SAMPLE_ERRORS_PER_CLUSTER + 3) as u32);
+        assert_eq!(
+            clusters[0].count,
+            (MAX_SAMPLE_ERRORS_PER_CLUSTER + 3) as u32
+        );
         assert_eq!(
             clusters[0].sample_errors.len(),
             MAX_SAMPLE_ERRORS_PER_CLUSTER,
@@ -788,7 +799,10 @@ mod tests {
         assert_eq!(lines[0], CSV_HEADER);
         assert_eq!(lines[1], "t1,100,3,false,\"\",\"\"");
         // error_message contains comma → quoted
-        assert_eq!(lines[2], "t2,250,5,true,timeout,\"req timed out, retry exhausted\"");
+        assert_eq!(
+            lines[2],
+            "t2,250,5,true,timeout,\"req timed out, retry exhausted\""
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -832,7 +846,10 @@ mod tests {
 
         let loaded = TraceAnalyzer::load_csv(&path).expect("load should succeed");
         assert_eq!(loaded.records.len(), 1);
-        assert_eq!(loaded.records[0].error_message.as_deref(), Some("line1\nline2"));
+        assert_eq!(
+            loaded.records[0].error_message.as_deref(),
+            Some("line1\nline2")
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -934,9 +951,12 @@ mod tests {
     #[test]
     fn kmeans_falls_back_to_simple_bucketing_when_no_provider() {
         let mut analyzer = TraceAnalyzer::new();
-        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "req timed out"));
-        analyzer.add_record(TraceRecord::new("t2", 200, 0).with_failure("timeout", "another timeout"));
-        analyzer.add_record(TraceRecord::new("t3", 300, 0).with_failure("auth", "401 unauthorized"));
+        analyzer
+            .add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "req timed out"));
+        analyzer
+            .add_record(TraceRecord::new("t2", 200, 0).with_failure("timeout", "another timeout"));
+        analyzer
+            .add_record(TraceRecord::new("t3", 300, 0).with_failure("auth", "401 unauthorized"));
 
         let simple = analyzer.cluster_failures();
         let kmeans_none = analyzer.cluster_failures_kmeans(None);
@@ -951,7 +971,8 @@ mod tests {
     #[test]
     fn kmeans_single_sample_kind_produces_single_cluster() {
         let mut analyzer = TraceAnalyzer::new();
-        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "req timed out"));
+        analyzer
+            .add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "req timed out"));
 
         let provider = HashEmbeddingProvider::new(32);
         let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
@@ -966,16 +987,21 @@ mod tests {
     #[test]
     fn kmeans_multiple_kinds_produce_labelled_clusters() {
         let mut analyzer = TraceAnalyzer::new();
-        analyzer.add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "connection reset"));
+        analyzer
+            .add_record(TraceRecord::new("t1", 100, 0).with_failure("timeout", "connection reset"));
         analyzer.add_record(TraceRecord::new("t2", 200, 0).with_failure("timeout", "read timeout"));
-        analyzer.add_record(TraceRecord::new("t3", 300, 0).with_failure("auth", "401 unauthorized"));
+        analyzer
+            .add_record(TraceRecord::new("t3", 300, 0).with_failure("auth", "401 unauthorized"));
         analyzer.add_record(TraceRecord::new("t4", 400, 0).with_failure("auth", "token expired"));
 
         let provider = HashEmbeddingProvider::new(32);
         let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
 
         // 至少 2 个 cluster(每个 kind 至少 1 个),且所有 label 都以 kind 开头。
-        assert!(clusters.len() >= 2, "expected >=2 clusters, got {clusters:?}");
+        assert!(
+            clusters.len() >= 2,
+            "expected >=2 clusters, got {clusters:?}"
+        );
         for c in &clusters {
             assert!(
                 c.label.starts_with("timeout-") || c.label.starts_with("auth-"),
@@ -1005,8 +1031,10 @@ mod tests {
         let clusters = analyzer.cluster_failures_kmeans(Some(&provider));
 
         // 该 kind 下 cluster 数应 <= MAX_KMEANS_CLUSTERS_PER_KIND。
-        let network_clusters: Vec<&FailureCluster> =
-            clusters.iter().filter(|c| c.label.starts_with("network-")).collect();
+        let network_clusters: Vec<&FailureCluster> = clusters
+            .iter()
+            .filter(|c| c.label.starts_with("network-"))
+            .collect();
         assert!(
             !network_clusters.is_empty(),
             "expected at least 1 network-* cluster"
@@ -1195,7 +1223,11 @@ mod tests {
         let total: u32 = clusters.iter().map(|c| c.count).sum();
         assert_eq!(total, (MAX_SAMPLE_ERRORS_PER_CLUSTER + 5) as u32);
         // 至少一个 cluster 的 sample_errors 被封顶(不一定所有 cluster 都触及上限)。
-        let max_sample_len = clusters.iter().map(|c| c.sample_errors.len()).max().unwrap_or(0);
+        let max_sample_len = clusters
+            .iter()
+            .map(|c| c.sample_errors.len())
+            .max()
+            .unwrap_or(0);
         assert!(
             max_sample_len <= MAX_SAMPLE_ERRORS_PER_CLUSTER,
             "sample_errors should be capped, got {max_sample_len}"

@@ -35,11 +35,9 @@ pub fn set_active(active: bool) {
 
 /// 切换穷鬼模式运行时状态。`/poor` 无参数命令调用此函数，返回切换后的新状态。
 pub fn toggle() -> bool {
-    let previous = POOR_MODE_ACTIVE.fetch_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |current| Some(!current),
-    );
+    let previous = POOR_MODE_ACTIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(!current)
+    });
     // fetch_update 返回 Ok(old) 表示成功，Err(old) 也表示当前值（不会发生因为闭包总返回 Some）。
     let old = previous.unwrap_or_else(|old| old);
     !old

@@ -329,8 +329,7 @@ fn generate_random_token(bytes: usize) -> io::Result<String> {
     // Windows 兼容:`/dev/urandom` 在 Windows 上不存在,改用 `getrandom` crate
     // (Unix 上调用 getrandom(2)/urandom,Windows 上调用 BCryptGenRandom)。
     // 详见 BUG-W2 修复。
-    getrandom::getrandom(&mut buffer)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    getrandom::getrandom(&mut buffer).map_err(|err| io::Error::other(err.to_string()))?;
     Ok(base64url_encode(&buffer))
 }
 

@@ -188,17 +188,19 @@ impl TaskRegistry {
 
     /// 启动 task 关联的 subagent。
     pub fn start_subagent(&self, subagent_id: &str) -> Result<(), String> {
-        let coord = self.coordinator.as_ref().ok_or_else(|| {
-            "multi-agent coordinator not configured".to_string()
-        })?;
+        let coord = self
+            .coordinator
+            .as_ref()
+            .ok_or_else(|| "multi-agent coordinator not configured".to_string())?;
         coord.start(subagent_id)
     }
 
     /// 标记 subagent 完成,并把结果写回关联的 task.output。
     pub fn complete_subagent(&self, subagent_id: &str, result: &str) -> Result<(), String> {
-        let coord = self.coordinator.as_ref().ok_or_else(|| {
-            "multi-agent coordinator not configured".to_string()
-        })?;
+        let coord = self
+            .coordinator
+            .as_ref()
+            .ok_or_else(|| "multi-agent coordinator not configured".to_string())?;
         coord.complete(subagent_id, result)?;
 
         if let Some(task_id) = self.find_task_for_subagent(subagent_id) {
@@ -209,9 +211,10 @@ impl TaskRegistry {
 
     /// 标记 subagent 失败,并把错误写回关联的 task.messages。
     pub fn fail_subagent(&self, subagent_id: &str, error: &str) -> Result<(), String> {
-        let coord = self.coordinator.as_ref().ok_or_else(|| {
-            "multi-agent coordinator not configured".to_string()
-        })?;
+        let coord = self
+            .coordinator
+            .as_ref()
+            .ok_or_else(|| "multi-agent coordinator not configured".to_string())?;
         coord.fail(subagent_id, error)?;
 
         if let Some(task_id) = self.find_task_for_subagent(subagent_id) {
@@ -222,9 +225,10 @@ impl TaskRegistry {
 
     /// 取消 subagent。
     pub fn cancel_subagent(&self, subagent_id: &str) -> Result<(), String> {
-        let coord = self.coordinator.as_ref().ok_or_else(|| {
-            "multi-agent coordinator not configured".to_string()
-        })?;
+        let coord = self
+            .coordinator
+            .as_ref()
+            .ok_or_else(|| "multi-agent coordinator not configured".to_string())?;
         coord.cancel(subagent_id)
     }
 
@@ -236,12 +240,13 @@ impl TaskRegistry {
         };
         let subagent_ids = {
             let inner = self.inner.lock().expect("registry lock poisoned");
-            inner.task_subagents.get(task_id).cloned().unwrap_or_default()
+            inner
+                .task_subagents
+                .get(task_id)
+                .cloned()
+                .unwrap_or_default()
         };
-        subagent_ids
-            .iter()
-            .filter_map(|id| coord.get(id))
-            .collect()
+        subagent_ids.iter().filter_map(|id| coord.get(id)).collect()
     }
 
     /// 查找 subagent 关联的 task_id(若存在)。
@@ -500,9 +505,8 @@ mod tests {
 
     #[test]
     fn spawn_subagent_for_task_unknown_task_fails() {
-        let registry = TaskRegistry::new().with_multi_agent_coordinator(
-            MultiAgentCoordinator::new(),
-        );
+        let registry =
+            TaskRegistry::new().with_multi_agent_coordinator(MultiAgentCoordinator::new());
         let err = registry
             .spawn_subagent_for_task("task_does_not_exist", "worker", CoordinationMode::Fork)
             .expect_err("should fail for unknown task");
@@ -511,8 +515,8 @@ mod tests {
 
     #[test]
     fn spawn_subagent_for_task_links_task_to_subagent() {
-        let registry = TaskRegistry::new()
-            .with_multi_agent_coordinator(MultiAgentCoordinator::new());
+        let registry =
+            TaskRegistry::new().with_multi_agent_coordinator(MultiAgentCoordinator::new());
         let task = registry.create("Refactor auth module", None);
 
         let subagent_id = registry
@@ -534,8 +538,8 @@ mod tests {
 
     #[test]
     fn complete_subagent_writes_result_back_to_task_output() {
-        let registry = TaskRegistry::new()
-            .with_multi_agent_coordinator(MultiAgentCoordinator::new());
+        let registry =
+            TaskRegistry::new().with_multi_agent_coordinator(MultiAgentCoordinator::new());
         let task = registry.create("Run tests", None);
         let subagent_id = registry
             .spawn_subagent_for_task(&task.task_id, "runner", CoordinationMode::Fork)
@@ -554,8 +558,8 @@ mod tests {
 
     #[test]
     fn fail_subagent_writes_error_back_to_task_messages() {
-        let registry = TaskRegistry::new()
-            .with_multi_agent_coordinator(MultiAgentCoordinator::new());
+        let registry =
+            TaskRegistry::new().with_multi_agent_coordinator(MultiAgentCoordinator::new());
         let task = registry.create("Build feature", None);
         let subagent_id = registry
             .spawn_subagent_for_task(&task.task_id, "builder", CoordinationMode::Worktree)
@@ -569,10 +573,10 @@ mod tests {
 
         // task.messages 应包含失败信息
         let task_after = registry.get(&task.task_id).expect("task should exist");
-        assert!(task_after.messages.iter().any(|m| m
-            .content
-            .contains("subagent")
-            && m.content.contains("compilation error")));
+        assert!(task_after
+            .messages
+            .iter()
+            .any(|m| m.content.contains("subagent") && m.content.contains("compilation error")));
     }
 
     #[test]

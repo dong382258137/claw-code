@@ -126,8 +126,7 @@ impl HistoryIndex {
     /// Total indexed message count across all sessions.
     pub fn count(&self) -> Result<usize, HistoryIndexError> {
         let conn = self.conn.lock().expect("history index mutex poisoned");
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 }
@@ -244,7 +243,9 @@ mod tests {
         // frequency) but both must be present.
         let contents: Vec<&str> = hits.iter().map(|h| h.content.as_str()).collect();
         assert!(
-            contents.iter().any(|c| c.contains("configure the rust toolchain")),
+            contents
+                .iter()
+                .any(|c| c.contains("configure the rust toolchain")),
             "user message should be among hits: {contents:?}"
         );
         assert!(
@@ -332,9 +333,7 @@ mod tests {
             )
             .expect("index msg");
 
-        let hits = index
-            .search("quick", 10)
-            .expect("search quick");
+        let hits = index.search("quick", 10).expect("search quick");
         assert_eq!(hits.len(), 1);
         let hit = &hits[0];
         assert_eq!(hit.content, "the quick brown fox");

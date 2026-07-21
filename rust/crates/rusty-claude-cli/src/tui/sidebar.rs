@@ -22,13 +22,18 @@ use crate::tui::status_bar::StatusBarState;
 pub(crate) type ToolHistory = Vec<(String, bool)>;
 
 /// Render the sidebar into `area` using `state` + `tool_history`.
-pub(crate) fn render_sidebar(area: Rect, buf: &mut Buffer, state: &StatusBarState, tool_history: &ToolHistory) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " 侧栏 ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
+pub(crate) fn render_sidebar(
+    area: Rect,
+    buf: &mut Buffer,
+    state: &StatusBarState,
+    tool_history: &ToolHistory,
+) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " 侧栏 ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -43,7 +48,12 @@ pub(crate) fn render_sidebar(area: Rect, buf: &mut Buffer, state: &StatusBarStat
 
     let mut y = inner.y;
     render_session_section(
-        Rect { x: inner.x, y, width: inner.width, height: session_h },
+        Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: session_h,
+        },
         buf,
         state,
     );
@@ -51,7 +61,12 @@ pub(crate) fn render_sidebar(area: Rect, buf: &mut Buffer, state: &StatusBarStat
 
     if tools_h > 0 {
         render_tools_section(
-            Rect { x: inner.x, y, width: inner.width, height: tools_h },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: tools_h,
+            },
             buf,
             tool_history,
         );
@@ -60,7 +75,12 @@ pub(crate) fn render_sidebar(area: Rect, buf: &mut Buffer, state: &StatusBarStat
 
     if usage_h > 0 {
         render_usage_section(
-            Rect { x: inner.x, y, width: inner.width, height: usage_h },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: usage_h,
+            },
             buf,
             state,
         );
@@ -88,7 +108,12 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
         ]),
         Line::from(vec![
             Span::styled("思考强度 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(effort_label, Style::default().fg(effort_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                effort_label,
+                Style::default()
+                    .fg(effort_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("分支 ", Style::default().fg(Color::DarkGray)),
@@ -123,7 +148,9 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
             Span::styled("轮次 ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{} 累计", state.turn_count),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
     ];
@@ -133,12 +160,12 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
 
 fn render_tools_section(area: Rect, buf: &mut Buffer, tool_history: &ToolHistory) {
     let title = format!(" 工具 ({}) ", tool_history.len());
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .title(Span::styled(
-            title,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ));
+    let block = Block::default().borders(Borders::TOP).title(Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -157,11 +184,7 @@ fn render_tools_section(area: Rect, buf: &mut Buffer, tool_history: &ToolHistory
         .enumerate()
         .map(|(i, (name, is_error))| {
             let icon = if *is_error { "x" } else { "v" };
-            let color = if *is_error {
-                Color::Red
-            } else {
-                Color::Green
-            };
+            let color = if *is_error { Color::Red } else { Color::Green };
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {icon} "), Style::default().fg(color)),
                 Span::raw(format!("{i:>2}. {name}")),
@@ -194,11 +217,20 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     let lines = vec![
         Line::from(Span::styled(
             " 用量 ",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
             Span::styled("状态    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(streaming_label, Style::default().fg(if state.streaming { Color::Green } else { Color::DarkGray })),
+            Span::styled(
+                streaming_label,
+                Style::default().fg(if state.streaming {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            ),
             Span::raw("  "),
             Span::styled(&timer, Style::default().fg(Color::Cyan)),
         ]),
@@ -239,8 +271,16 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
 }
 
 fn format_in_out(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage, is_input: bool) -> String {
-    let c = if is_input { cum.input_tokens } else { cum.output_tokens };
-    let t = if is_input { turn.input_tokens } else { turn.output_tokens };
+    let c = if is_input {
+        cum.input_tokens
+    } else {
+        cum.output_tokens
+    };
+    let t = if is_input {
+        turn.input_tokens
+    } else {
+        turn.output_tokens
+    };
     if t > 0 {
         format!("{c} (+{t})")
     } else {
@@ -273,7 +313,9 @@ fn cache_hit_rate_style(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage) -
     }
     let rate = (hit as f64 / total as f64) * 100.0;
     if rate >= 85.0 {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
     } else if rate >= 60.0 {
         Style::default().fg(Color::Yellow)
     } else {
@@ -291,10 +333,7 @@ fn cache_hit_rate_style(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage) -
 /// `ModelPricing` and delegates to `TokenUsage::estimate_cost_usd_with_pricing`
 /// — the same path used by `status_bar.rs::estimate_cost` and the JSON output
 /// in `run_prompt_json`.
-fn estimated_cost(
-    usage: &runtime::TokenUsage,
-    pricing: Option<&runtime::ModelPricing>,
-) -> f64 {
+fn estimated_cost(usage: &runtime::TokenUsage, pricing: Option<&runtime::ModelPricing>) -> f64 {
     match pricing {
         Some(p) => usage.estimate_cost_usd_with_pricing(*p),
         None => usage.estimate_cost_usd(),
@@ -318,6 +357,7 @@ mod tests {
     use super::*;
     use ratatui::buffer::Buffer;
 
+    #[allow(clippy::field_reassign_with_default)]
     fn make_state() -> StatusBarState {
         let mut s = StatusBarState::default();
         s.model = "claude-sonnet-4-6".to_string();
@@ -330,7 +370,6 @@ mod tests {
             output_tokens: 500,
             cache_creation_input_tokens: 200,
             cache_read_input_tokens: 800,
-            ..Default::default()
         };
         s.streaming = false;
         s
@@ -339,10 +378,20 @@ mod tests {
     #[test]
     fn render_sidebar_does_not_panic_with_empty_history() {
         let state = make_state();
-        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 40, height: 20 });
+        let mut buf = Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        });
         let history: ToolHistory = Vec::new();
         render_sidebar(
-            Rect { x: 0, y: 0, width: 40, height: 20 },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 20,
+            },
             &mut buf,
             &state,
             &history,
@@ -353,14 +402,24 @@ mod tests {
     #[test]
     fn render_sidebar_does_not_panic_with_tools() {
         let state = make_state();
-        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 40, height: 20 });
+        let mut buf = Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        });
         let history: ToolHistory = vec![
             ("Read".to_string(), false),
             ("Edit".to_string(), false),
             ("Bash".to_string(), true),
         ];
         render_sidebar(
-            Rect { x: 0, y: 0, width: 40, height: 20 },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 20,
+            },
             &mut buf,
             &state,
             &history,
@@ -377,10 +436,20 @@ mod tests {
             output_tokens: 100,
             ..Default::default()
         };
-        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 40, height: 20 });
+        let mut buf = Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        });
         let history: ToolHistory = Vec::new();
         render_sidebar(
-            Rect { x: 0, y: 0, width: 40, height: 20 },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 20,
+            },
             &mut buf,
             &state,
             &history,
@@ -390,11 +459,21 @@ mod tests {
     #[test]
     fn render_sidebar_handles_tiny_area() {
         let state = make_state();
-        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 10, height: 3 });
+        let mut buf = Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 3,
+        });
         // Should not panic even when there's no room to render all sections.
         let history: ToolHistory = vec![("Edit".to_string(), false)];
         render_sidebar(
-            Rect { x: 0, y: 0, width: 10, height: 3 },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 3,
+            },
             &mut buf,
             &state,
             &history,
@@ -422,7 +501,6 @@ mod tests {
             output_tokens: 1_000_000,
             cache_creation_input_tokens: 1_000_000,
             cache_read_input_tokens: 1_000_000,
-            ..Default::default()
         };
         let cost = estimated_cost(&usage, None);
         // 15 + 75 + 18.75 + 1.5 = 110.25
@@ -444,7 +522,6 @@ mod tests {
             output_tokens: 1_000_000,
             cache_creation_input_tokens: 1_000_000,
             cache_read_input_tokens: 1_000_000,
-            ..Default::default()
         };
         let cost_with_custom = estimated_cost(&usage, Some(&custom_pricing));
         // With custom pricing: 3 + 15 + 3.75 + 0.30 = 22.05

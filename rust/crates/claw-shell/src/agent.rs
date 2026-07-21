@@ -17,9 +17,7 @@ use std::cell::RefCell;
 
 use agent_client_protocol as acp;
 use async_trait::async_trait;
-use runtime::{
-    ApiClient, ConversationRuntime, PermissionPolicy, Session, StaticToolExecutor,
-};
+use runtime::{ApiClient, ConversationRuntime, PermissionPolicy, Session, StaticToolExecutor};
 
 use claw_acp::AcpGatewaySender;
 
@@ -95,10 +93,7 @@ where
     ///
     /// `client_gateway` 由 `spawn_claw_shell` 从 ACP gateway 中取出注入。
     /// `StaticToolExecutor` 在此创建(非 Send,必须在线程内)。
-    pub(crate) fn build(
-        self,
-        client_gateway: AcpGatewaySender<acp::AgentSide>,
-    ) -> ClawAgent<C> {
+    pub(crate) fn build(self, client_gateway: AcpGatewaySender<acp::AgentSide>) -> ClawAgent<C> {
         ClawAgent {
             runtime: RefCell::new(None),
             config: self.config,
@@ -240,10 +235,7 @@ where
         &self,
         arguments: acp::PromptRequest,
     ) -> Result<acp::PromptResponse, acp::Error> {
-        tracing::debug!(
-            "claw-agent: prompt session_id={:?}",
-            arguments.session_id.0
-        );
+        tracing::debug!("claw-agent: prompt session_id={:?}", arguments.session_id.0);
 
         // 取出 runtime(短暂持有 RefCell 借用)
         let runtime_opt = self.runtime.borrow_mut().take();

@@ -3,14 +3,14 @@
 //! 设计依据:
 //! - Anthropic《Effective Context Engineering for AI Agents》(2025):
 //!   "Structured note-taking, or agentic memory, is a technique where the
-//!    agent regularly writes notes persisted to memory outside of the
-//!    context window. These notes get pulled back into the context window
-//!    at later times."
+//!   agent regularly writes notes persisted to memory outside of the
+//!   context window. These notes get pulled back into the context window
+//!   at later times."
 //! - Anthropic《Multi-Agent Research System》(2025):
 //!   "The LeadResearcher begins by thinking through the approach and
-//!    saving its plan to Memory to persist the context, since if the
-//!    context window exceeds 200,000 tokens it will be truncated and it
-//!    is important to retain the plan."
+//!   saving its plan to Memory to persist the context, since if the
+//!   context window exceeds 200,000 tokens it will be truncated and it
+//!   is important to retain the plan."
 //! - MemGPT (arXiv:2310.08560):OS-inspired 分层内存,NOTEBOOK 作为
 //!   "working context"(L1 cache),跨压缩持久化。
 //!
@@ -182,8 +182,7 @@ impl Notebook {
             let mut search_from = 0;
             while let Some(pos) = content[search_from..].find(&open_tag) {
                 let abs_pos = search_from + pos;
-                let at_line_start =
-                    abs_pos == 0 || bytes.get(abs_pos - 1) == Some(&b'\n');
+                let at_line_start = abs_pos == 0 || bytes.get(abs_pos - 1) == Some(&b'\n');
                 if at_line_start {
                     open_pos = Some(abs_pos);
                     break;
@@ -207,8 +206,7 @@ impl Notebook {
             let bytes_after = content_after_open.as_bytes();
             while let Some(pos) = content_after_open[search_from..].find(&close_tag) {
                 let abs_pos = search_from + pos;
-                let at_line_start =
-                    abs_pos == 0 || bytes_after.get(abs_pos - 1) == Some(&b'\n');
+                let at_line_start = abs_pos == 0 || bytes_after.get(abs_pos - 1) == Some(&b'\n');
                 if at_line_start {
                     close_pos = Some(abs_pos);
                     break;
@@ -286,7 +284,8 @@ impl Notebook {
         if content.trim().is_empty() {
             self.sections.remove(tag);
         } else {
-            self.sections.insert(tag.to_string(), content.trim().to_string());
+            self.sections
+                .insert(tag.to_string(), content.trim().to_string());
         }
     }
 
@@ -312,9 +311,7 @@ impl Notebook {
     /// NOTEBOOK 是否完全为空(所有段都缺失或空)。
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sections
-            .values()
-            .all(|s| s.trim().is_empty())
+        self.sections.values().all(|s| s.trim().is_empty())
     }
 }
 
@@ -333,7 +330,9 @@ impl std::fmt::Display for NotebookError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(path, msg) => write!(f, "notebook io error at {}: {msg}", path.display()),
-            Self::Parse(path, msg) => write!(f, "notebook parse error at {}: {msg}", path.display()),
+            Self::Parse(path, msg) => {
+                write!(f, "notebook parse error at {}: {msg}", path.display())
+            }
             Self::TooLarge { actual, max } => write!(
                 f,
                 "notebook content too large: {actual} chars > {max} chars"
@@ -393,10 +392,7 @@ pub const NOTEBOOK_UPDATE_TOOL_SPEC: &str = r#"{
 /// 流程:解析 JSON 输入 → 加载 NOTEBOOK → 修改 → 原子写回 → 返回成功消息。
 ///
 /// 返回值:面向 LLM 的可读消息(成功 / 失败 + 原因)。
-pub fn execute_notebook_update(
-    workspace_root: &Path,
-    input: &str,
-) -> Result<String, String> {
+pub fn execute_notebook_update(workspace_root: &Path, input: &str) -> Result<String, String> {
     let parsed: NotebookUpdateInput = serde_json::from_str(input)
         .map_err(|e| format!("invalid notebook_update input JSON: {e}"))?;
     // 验证 section 名
@@ -407,8 +403,8 @@ pub fn execute_notebook_update(
         ));
     }
     // 加载现有 NOTEBOOK
-    let mut notebook = Notebook::load(workspace_root)
-        .map_err(|e| format!("failed to load notebook: {e}"))?;
+    let mut notebook =
+        Notebook::load(workspace_root).map_err(|e| format!("failed to load notebook: {e}"))?;
     // 应用更新
     match parsed.mode.as_str() {
         "set" => {
@@ -542,9 +538,8 @@ mod tests {
 
     #[test]
     fn notebook_parse_handles_missing_sections() {
-        let content = format!(
-            "{NOTEBOOK_HEADER}\n<plan>\nonly plan\n</plan>\n<subagents>\n</subagents>\n"
-        );
+        let content =
+            format!("{NOTEBOOK_HEADER}\n<plan>\nonly plan\n</plan>\n<subagents>\n</subagents>\n");
         let parsed = Notebook::parse(&content).expect("parse should succeed");
         assert_eq!(parsed.get_section("plan"), Some("only plan"));
         // 空段等价于缺失段(与 set_section 语义一致:空内容 = 删除)
@@ -615,7 +610,10 @@ mod tests {
 
         // 第一次写入后,.tmp 文件应该已被 rename,不应该存在
         let tmp_path = path.with_extension("md.tmp");
-        assert!(!tmp_path.exists(), "temp file should not exist after atomic save");
+        assert!(
+            !tmp_path.exists(),
+            "temp file should not exist after atomic save"
+        );
 
         // 再次写入
         nb.set_section("plan", "second version");

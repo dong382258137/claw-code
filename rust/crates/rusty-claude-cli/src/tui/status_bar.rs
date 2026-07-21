@@ -97,8 +97,12 @@ pub(crate) struct StatusBar<'a> {
 impl<'a> Widget for StatusBar<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let style_dim = Style::default().fg(Color::DarkGray);
-        let style_model = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-        let style_provider = Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC);
+        let style_model = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let style_provider = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::ITALIC);
         let style_tokens = Style::default().fg(Color::Yellow);
         let style_cost = Style::default().fg(Color::Green);
         let style_branch = Style::default().fg(Color::Magenta);
@@ -108,7 +112,9 @@ impl<'a> Widget for StatusBar<'a> {
             Style::default().fg(Color::Green)
         };
         let style_poor = Style::default().fg(Color::Yellow);
-        let style_streaming = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let style_streaming = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
 
         // Build sections in priority order. Each section is a Vec<Span>.
         // We add sections until we exceed the available width, then stop.

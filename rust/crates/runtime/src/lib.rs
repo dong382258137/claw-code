@@ -16,11 +16,11 @@ pub mod config_validate;
 mod conversation;
 mod file_ops;
 pub mod g004_conformance;
-pub mod goal;
 mod git_context;
+pub mod goal;
 pub mod green_contract;
-mod hooks;
 pub mod history_search;
+mod hooks;
 mod json;
 mod lane_events;
 pub mod lsp_client;
@@ -43,7 +43,6 @@ pub mod notebook;
 // 在 microcompact 摘要前归档原始 tool result,LLM 可通过 `recall_full` 工具
 // 按 `tool_use_id` 主动检索原始内容。直击"AI 忘记原始 tool output 导致重复调用"
 // 的问题。详见 PiAgent 借鉴分析 P0 方案。
-pub mod tool_result_archive;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -51,6 +50,7 @@ pub mod plugin_lifecycle;
 mod policy_engine;
 pub mod poor_mode;
 mod prompt;
+pub mod tool_result_archive;
 // Harness L(生命周期)层接入:在 run_turn 失败分支提供"最多 1 次自动恢复后升级"机制。
 // 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
 pub mod recovery_orchestrator;
@@ -77,13 +77,13 @@ pub mod multi_agent;
 // tool call count / compact 触发率直方图,简单失败聚类。
 // 详见 docs/harness-engineering-optimization-plan.md Step 3.3。
 // 阶段 4 将在此之上接入 K-means + Self-Improving Harness 闭环。
-pub mod trace_analyzer;
 mod remote;
 pub mod repomap;
 mod report_schema;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod trace_analyzer;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
@@ -132,10 +132,10 @@ pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_roots, glob_search,
     glob_search_in_workspace, glob_search_in_workspace_with_roots, grep_search,
     grep_search_in_workspace, grep_search_in_workspace_with_roots, read_file,
-    read_file_in_workspace, read_file_in_workspace_with_roots, strip_verbatim_prefix,
-    write_file, write_file_in_workspace, write_file_in_workspace_with_roots, EditFileOutput,
-    GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk,
-    TextFilePayload, WorkspacePathScope, WriteFileOutput,
+    read_file_in_workspace, read_file_in_workspace_with_roots, strip_verbatim_prefix, write_file,
+    write_file_in_workspace, write_file_in_workspace_with_roots, EditFileOutput, GlobSearchOutput,
+    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
+    WorkspacePathScope, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use goal::{goal_json_path, Goal, GoalError, GoalManager, GoalState};
@@ -164,25 +164,11 @@ pub use mcp_lifecycle_hardened::{
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use memory::{
-    detect_conflicts, extract_nudge_actions, should_nudge, MemoryBlock, MemoryEntry,
-    NudgeAction, NudgeConfig, PersistentMemory, UNVERIFIED_THRESHOLD_MS,
+    detect_conflicts, extract_nudge_actions, should_nudge, MemoryBlock, MemoryEntry, NudgeAction,
+    NudgeConfig, PersistentMemory, UNVERIFIED_THRESHOLD_MS,
 };
 pub use memory_store::MemoryStore;
 // Step 2.4: Memory 语义检索层 embedding provider 公开 API。
-pub use memory_semantic::{
-    cosine_similarity, EmbeddingError, EmbeddingProvider, HashEmbeddingProvider,
-};
-#[cfg(feature = "embedding")]
-pub use memory_semantic::FastembedProvider;
-pub use notebook::{
-    execute_notebook_update, Notebook, NotebookError, NotebookUpdateInput, NOTEBOOK_FILENAME,
-    NOTEBOOK_HEADER, NOTEBOOK_MAX_CHARS, NOTEBOOK_UPDATE_TOOL_SPEC, SECTION_TAGS,
-};
-pub use tool_result_archive::{
-    archive_path, archive_tool_result, list_archived_summary, prune_archive, recall_by_tool_name,
-    recall_tool_result, record_count, ArchivedToolResult, ArchiveError, ARCHIVE_FILENAME,
-    ARCHIVE_MAX_CHARS, ARCHIVE_RECORD_MAX_CHARS,
-};
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,
@@ -191,6 +177,15 @@ pub use mcp_stdio::{
     McpResource, McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess,
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
+};
+#[cfg(feature = "embedding")]
+pub use memory_semantic::FastembedProvider;
+pub use memory_semantic::{
+    cosine_similarity, EmbeddingError, EmbeddingProvider, HashEmbeddingProvider,
+};
+pub use notebook::{
+    execute_notebook_update, Notebook, NotebookError, NotebookUpdateInput, NOTEBOOK_FILENAME,
+    NOTEBOOK_HEADER, NOTEBOOK_MAX_CHARS, NOTEBOOK_UPDATE_TOOL_SPEC, SECTION_TAGS,
 };
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
@@ -214,11 +209,9 @@ pub use policy_engine::{
 };
 pub use prompt::{
     load_system_prompt, load_system_prompt_with_extras, prepend_bullets, ContextFile,
-    ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
-    SystemPromptExtras, SystemPromptSplit, FRONTIER_MODEL_NAME,
-    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder, SystemPromptExtras,
+    SystemPromptSplit, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
-pub use repomap::RepoMap;
 pub use recovery_orchestrator::{RecoveryOrchestrator, RecoveryOutcome};
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,
@@ -230,6 +223,7 @@ pub use remote::{
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
+pub use repomap::RepoMap;
 pub use report_schema::{
     canonicalize_report, project_report, report_content_hash, report_schema_v1_registry,
     CanonicalReportV1, ClaimKind, ConsumerCapabilities, FieldDelta, FieldDeltaState,
@@ -238,13 +232,27 @@ pub use report_schema::{
     ReportSchemaRegistry, SensitivityClass, DEFAULT_PROJECTION_POLICY_V1, REPORT_SCHEMA_V1,
 };
 pub use sandbox::{
-    build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
-    resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
-    FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
-    SandboxRequest, SandboxStatus,
+    build_linux_sandbox_command,
+    detect_container_environment,
+    detect_container_environment_from,
+    platform_sandbox_builder,
+    resolve_sandbox_status,
+    resolve_sandbox_status_for_request,
+    ContainerEnvironment,
+    FilesystemIsolationMode,
+    LinuxSandboxBuilder,
+    LinuxSandboxCommand,
     // Step 4.1:SandboxBuilder trait + 三平台实现 + 工厂函数 + 常量
-    MacOsSandboxBuilder, LinuxSandboxBuilder, SandboxBuilder, SandboxCommand,
-    WindowsSandboxBuilder, platform_sandbox_builder, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    MacOsSandboxBuilder,
+    SandboxBuilder,
+    SandboxCommand,
+    SandboxConfig,
+    SandboxDetectionInputs,
+    SandboxRequest,
+    SandboxStatus,
+    WindowsSandboxBuilder,
+    CREATE_NEW_PROCESS_GROUP,
+    CREATE_NO_WINDOW,
     DETACHED_PROCESS,
 };
 pub use session::{
@@ -264,32 +272,35 @@ pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskResource, ValidatedPacket,
 };
 pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat};
+pub use tool_result_archive::{
+    archive_path, archive_tool_result, list_archived_summary, prune_archive, recall_by_tool_name,
+    recall_tool_result, record_count, ArchiveError, ArchivedToolResult, ARCHIVE_FILENAME,
+    ARCHIVE_MAX_CHARS, ARCHIVE_RECORD_MAX_CHARS,
+};
 // 生产构建解锁:见 L59 模块注释。补齐 TrustAllowlistEntry/TrustResolution/
 // detect_trust_prompt,让 worker_boot 的 TrustGate 分支可在生产构建接入信任层。
-pub use trust_resolver::{
-    detect_trust_prompt, TrustAllowlistEntry, TrustConfig, TrustDecision, TrustEvent,
-    TrustPolicy, TrustResolution, TrustResolver,
-};
-pub use usage::{
-    format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
-};
-pub use worker_boot::{
-    probe_mcp_health, probe_transport_health, StartupHealthSummary,
-    Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
-    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
-};
 pub use loop_detection::{
     LoopAction, LoopDetector, ABORT_THRESHOLD, MCP_TOOLS_MAX, SKILLS_MAX, WARN_THRESHOLD,
+};
+pub use multi_agent::{
+    CoordinationMode, JoinStats, MultiAgentCoordinator, Subagent, SubagentStatus,
 };
 pub use trace_analyzer::{
     FailureCluster, TraceAnalyzer, TraceRecord, TraceStats, CSV_HEADER as TRACE_CSV_HEADER,
     MAX_SAMPLE_ERRORS_PER_CLUSTER,
 };
-pub use verifier::{
-    RuleVerifier, RuleVerdict, VerificationResult, VerifierAgent,
+pub use trust_resolver::{
+    detect_trust_prompt, TrustAllowlistEntry, TrustConfig, TrustDecision, TrustEvent, TrustPolicy,
+    TrustResolution, TrustResolver,
 };
-pub use multi_agent::{
-    CoordinationMode, JoinStats, MultiAgentCoordinator, Subagent, SubagentStatus,
+pub use usage::{
+    format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
+};
+pub use verifier::{RuleVerdict, RuleVerifier, VerificationResult, VerifierAgent};
+pub use worker_boot::{
+    probe_mcp_health, probe_transport_health, StartupHealthSummary, Worker, WorkerEvent,
+    WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind, WorkerPromptTarget,
+    WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
 };
 
 #[cfg(test)]

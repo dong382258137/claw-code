@@ -64,8 +64,7 @@ pub(crate) fn acp_channel_failure_error(
     message: impl Into<String>,
     kind: AcpChannelFailure,
 ) -> acp::Error {
-    acp_internal_error(message)
-        .data(serde_json::json!({ AcpChannelFailure::DATA_KEY: kind.tag() }))
+    acp_internal_error(message).data(serde_json::json!({ AcpChannelFailure::DATA_KEY: kind.tag() }))
 }
 
 /// Recover the [`AcpChannelFailure`] kind from an error, or `None` if the error
@@ -90,7 +89,7 @@ pub fn compact_json<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod channel_failure_tests {
     use super::{
-        AcpChannelFailure, acp, acp_channel_failure, acp_channel_failure_error, acp_internal_error,
+        acp, acp_channel_failure, acp_channel_failure_error, acp_internal_error, AcpChannelFailure,
     };
 
     #[test]

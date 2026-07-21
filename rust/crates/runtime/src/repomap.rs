@@ -426,14 +426,38 @@ static REFERENCE_REGEXES: OnceLock<RefRegexVec> = OnceLock::new();
 
 fn init_definition_regexes() -> DefRegexVec {
     vec![
-        (DefinitionKind::Function, Regex::new(r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap()),
-        (DefinitionKind::Struct, Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap()),
-        (DefinitionKind::Enum, Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap()),
-        (DefinitionKind::Trait, Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap()),
-        (DefinitionKind::Impl, Regex::new(r"impl(?:<[^>]+>)?\s+(\w+)").unwrap()),
-        (DefinitionKind::Module, Regex::new(r"(?:pub\s+)?mod\s+(\w+)").unwrap()),
-        (DefinitionKind::Const, Regex::new(r"(?:pub\s+)?const\s+(\w+)").unwrap()),
-        (DefinitionKind::Type, Regex::new(r"(?:pub\s+)?type\s+(\w+)").unwrap()),
+        (
+            DefinitionKind::Function,
+            Regex::new(r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap(),
+        ),
+        (
+            DefinitionKind::Struct,
+            Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap(),
+        ),
+        (
+            DefinitionKind::Enum,
+            Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap(),
+        ),
+        (
+            DefinitionKind::Trait,
+            Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap(),
+        ),
+        (
+            DefinitionKind::Impl,
+            Regex::new(r"impl(?:<[^>]+>)?\s+(\w+)").unwrap(),
+        ),
+        (
+            DefinitionKind::Module,
+            Regex::new(r"(?:pub\s+)?mod\s+(\w+)").unwrap(),
+        ),
+        (
+            DefinitionKind::Const,
+            Regex::new(r"(?:pub\s+)?const\s+(\w+)").unwrap(),
+        ),
+        (
+            DefinitionKind::Type,
+            Regex::new(r"(?:pub\s+)?type\s+(\w+)").unwrap(),
+        ),
     ]
 }
 
@@ -452,7 +476,8 @@ mod tests {
 
     #[test]
     fn test_extract_definitions_finds_functions() {
-        let code = "pub fn main() {}\nfn helper() {}\npub async fn fetch() -> Result<String, Error> {}";
+        let code =
+            "pub fn main() {}\nfn helper() {}\npub async fn fetch() -> Result<String, Error> {}";
         let defs = RepoMap::extract_definitions(code);
         assert_eq!(defs.len(), 3);
         assert_eq!(defs[0].name, "main");
@@ -463,8 +488,12 @@ mod tests {
     fn test_extract_definitions_finds_structs_and_enums() {
         let code = "pub struct Foo {}\nenum Bar { A, B }";
         let defs = RepoMap::extract_definitions(code);
-        assert!(defs.iter().any(|d| d.name == "Foo" && d.kind == DefinitionKind::Struct));
-        assert!(defs.iter().any(|d| d.name == "Bar" && d.kind == DefinitionKind::Enum));
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "Foo" && d.kind == DefinitionKind::Struct));
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "Bar" && d.kind == DefinitionKind::Enum));
     }
 
     #[test]
@@ -501,7 +530,12 @@ mod tests {
         let mut map = RepoMap::new(temp.path()).with_max_tokens(50);
         let rendered = map.render();
         let tokens = rendered.chars().count() / 2 + 1;
-        assert!(tokens <= 50, "exceeds budget: {} (rendered: {:?})", tokens, rendered);
+        assert!(
+            tokens <= 50,
+            "exceeds budget: {} (rendered: {:?})",
+            tokens,
+            rendered
+        );
     }
 
     #[test]
@@ -537,7 +571,10 @@ mod tests {
         let mut map = RepoMap::new(temp.path());
         map.refresh_cache_if_stale();
         let initial_count = map.cache.len();
-        assert!(initial_count > 0, "cache should be populated on first refresh");
+        assert!(
+            initial_count > 0,
+            "cache should be populated on first refresh"
+        );
 
         // Force the cache to appear stale.
         map.cache_time = Some(SystemTime::now() - Duration::from_secs(CACHE_TTL_SECS + 10));

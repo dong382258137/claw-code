@@ -7,14 +7,13 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use commands::{
-    classify_skills_slash_command, handle_agents_slash_command,
-    handle_agents_slash_command_json, handle_mcp_slash_command,
-    handle_mcp_slash_command_json, handle_skills_slash_command,
+    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
+    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_skills_slash_command,
     handle_skills_slash_command_json, slash_command_specs, SkillSlashDispatch, SlashCommand,
 };
 use runtime::{
-    CompactionConfig, ConfigLoader, ContentBlock, format_usd, HistoryIndex, MessageRole,
-    resolve_sandbox_status, Session, SessionStore, UsageTracker,
+    format_usd, resolve_sandbox_status, CompactionConfig, ConfigLoader, ContentBlock, HistoryIndex,
+    MessageRole, Session, SessionStore, UsageTracker,
 };
 use serde_json::{json, Value};
 
@@ -23,12 +22,12 @@ use crate::tool_display::{short_tool_id, truncate_for_summary};
 use crate::{
     classify_error_kind, classify_session_lifecycle_for, default_permission_mode,
     format_compact_report, format_cost_report, format_sandbox_report, format_status_report,
-    format_unknown_slash_command, handle_bg_command, handle_goal_command,
-    handle_poor_mode_action, init_json_value, render_config_json, render_config_report,
-    render_diff_json_for, render_diff_report_for, render_doctor_report, render_export_text,
-    render_memory_json, render_memory_report, render_repl_help, render_version_report,
-    sandbox_json_value, split_error_hint, status_context, status_json_value, version_json_value,
-    CliOutputFormat, StatusUsage, STUB_COMMANDS,
+    format_unknown_slash_command, handle_bg_command, handle_goal_command, handle_poor_mode_action,
+    init_json_value, render_config_json, render_config_report, render_diff_json_for,
+    render_diff_report_for, render_doctor_report, render_export_text, render_memory_json,
+    render_memory_report, render_repl_help, render_version_report, sandbox_json_value,
+    split_error_hint, status_context, status_json_value, version_json_value, CliOutputFormat,
+    StatusUsage, STUB_COMMANDS,
 };
 
 pub(crate) const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
@@ -156,7 +155,11 @@ pub(crate) fn looks_like_slash_command_token(token: &str) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
+pub(crate) fn resume_session(
+    session_path: &Path,
+    commands: &[String],
+    output_format: CliOutputFormat,
+) {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -527,12 +530,18 @@ pub(crate) fn run_resume_command(
             let message = if results.is_empty() {
                 format!("Search\n  Query           {q}\n  Result           no matches found")
             } else {
-                let mut msg = format!("Search\n  Query           {q}\n  Matches          {}\n\n", results.len());
+                let mut msg = format!(
+                    "Search\n  Query           {q}\n  Matches          {}\n\n",
+                    results.len()
+                );
                 for (i, (idx, preview)) in results.iter().take(20).enumerate() {
                     msg.push_str(&format!("  {}. [msg {idx}] {preview}\n", i + 1));
                 }
                 if results.len() > 20 {
-                    msg.push_str(&format!("\n  ... and {} more matches\n", results.len() - 20));
+                    msg.push_str(&format!(
+                        "\n  ... and {} more matches\n",
+                        results.len() - 20
+                    ));
                 }
                 msg
             };
@@ -790,9 +799,7 @@ pub(crate) fn search_session_history(session: &Session, query: &str) -> Vec<(usi
             let candidate: Option<String> = match block {
                 ContentBlock::Text { text } => Some(text.clone()),
                 ContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
-                ContentBlock::ToolUse { name, input, .. } => {
-                    Some(format!("[{name}] {input}"))
-                }
+                ContentBlock::ToolUse { name, input, .. } => Some(format!("[{name}] {input}")),
                 ContentBlock::ToolResult {
                     tool_name, output, ..
                 } => Some(format!("[{tool_name} result] {output}")),
@@ -872,7 +879,8 @@ pub(crate) fn undo_last_file_edit(session: &Session) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if file_path.is_empty() {
-        return "Undo\n  Result           failed\n  Detail           tool input missing filePath".to_string();
+        return "Undo\n  Result           failed\n  Detail           tool input missing filePath"
+            .to_string();
     }
 
     // Find the matching ToolResult and parse originalFile from its output.
@@ -988,7 +996,9 @@ pub(crate) fn create_managed_session_handle(
     })
 }
 
-pub(crate) fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+pub(crate) fn resolve_session_reference(
+    reference: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
     let handle = current_session_store()?
         .resolve_reference(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -998,17 +1008,22 @@ pub(crate) fn resolve_session_reference(reference: &str) -> Result<SessionHandle
     })
 }
 
-pub(crate) fn session_reference_exists(reference: &str) -> Result<bool, Box<dyn std::error::Error>> {
+pub(crate) fn session_reference_exists(
+    reference: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(current_session_store()?.session_exists(reference))
 }
 
-pub(crate) fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn resolve_managed_session_path(
+    session_id: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     current_session_store()?
         .resolve_managed_path(session_id)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-pub(crate) fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+pub(crate) fn list_managed_sessions(
+) -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
     let store = current_session_store()?;
     let lifecycle = classify_session_lifecycle_for(store.workspace_root());
     Ok(store
@@ -1028,7 +1043,8 @@ pub(crate) fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<
         .collect())
 }
 
-pub(crate) fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
+pub(crate) fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>>
+{
     let store = current_session_store()?;
     let lifecycle = classify_session_lifecycle_for(store.workspace_root());
     let session = store
@@ -1080,7 +1096,11 @@ pub(crate) fn confirm_session_deletion(session_id: &str) -> bool {
 }
 
 /// Render a single session line for the interactive picker.
-fn render_session_picker_line(idx: usize, session: &ManagedSessionSummary, is_active: bool) -> String {
+fn render_session_picker_line(
+    idx: usize,
+    session: &ManagedSessionSummary,
+    is_active: bool,
+) -> String {
     let marker = if is_active { "*" } else { " " };
     let lineage = match (
         session.branch_name.as_deref(),
@@ -1111,14 +1131,8 @@ fn session_matches_filter(session: &ManagedSessionSummary, filter: &str) -> bool
     let needle = filter.to_lowercase();
     let haystacks = [
         session.id.as_str(),
-        session
-            .branch_name
-            .as_deref()
-            .unwrap_or(""),
-        session
-            .parent_session_id
-            .as_deref()
-            .unwrap_or(""),
+        session.branch_name.as_deref().unwrap_or(""),
+        session.parent_session_id.as_deref().unwrap_or(""),
     ];
     haystacks
         .iter()
@@ -1140,7 +1154,7 @@ pub(crate) fn interactive_session_pick(
 ) -> Result<Option<ManagedSessionSummary>, Box<dyn std::error::Error>> {
     let mut sessions = list_managed_sessions()?;
     // Sort newest-first by modified_epoch_millis.
-    sessions.sort_by(|a, b| b.modified_epoch_millis.cmp(&a.modified_epoch_millis));
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.modified_epoch_millis));
 
     if sessions.is_empty() {
         println!("No managed sessions saved yet.");
@@ -1155,7 +1169,12 @@ pub(crate) fn interactive_session_pick(
             .collect();
 
         println!();
-        println!("Sessions  (filter: {:?}, {} of {} shown)", filter, filtered.len(), sessions.len());
+        println!(
+            "Sessions  (filter: {:?}, {} of {} shown)",
+            filter,
+            filtered.len(),
+            sessions.len()
+        );
         if filtered.is_empty() {
             println!("  No sessions match the current filter.");
         } else {
@@ -1165,7 +1184,10 @@ pub(crate) fn interactive_session_pick(
             }
         }
         println!();
-        print!("filter or pick [1-{}] (empty=cancel, q=cancel): ", filtered.len());
+        print!(
+            "filter or pick [1-{}] (empty=cancel, q=cancel): ",
+            filtered.len()
+        );
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -1173,7 +1195,10 @@ pub(crate) fn interactive_session_pick(
             return Ok(None);
         }
         let trimmed = input.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("quit") {
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("q")
+            || trimmed.eq_ignore_ascii_case("quit")
+        {
             return Ok(None);
         }
         // Numeric → pick
@@ -1324,7 +1349,9 @@ pub(crate) fn run_resumed_session_command(
     }
 }
 
-pub(crate) fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn render_session_list(
+    active_session_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let sessions = list_managed_sessions()?;
     let mut lines = vec![
         "Sessions".to_string(),
@@ -1658,7 +1685,11 @@ pub(crate) fn run_export(
     Ok(())
 }
 
-pub(crate) fn render_session_markdown(session: &Session, session_id: &str, session_path: &Path) -> String {
+pub(crate) fn render_session_markdown(
+    session: &Session,
+    session_id: &str,
+    session_path: &Path,
+) -> String {
     let mut lines = vec![
         "# Conversation Export".to_string(),
         String::new(),
@@ -1789,20 +1820,14 @@ mod tests {
 
     #[test]
     fn search_returns_empty_for_no_matches() {
-        let session = build_session_with_blocks(
-            vec![text_block("hello world")],
-            MessageRole::User,
-        );
+        let session = build_session_with_blocks(vec![text_block("hello world")], MessageRole::User);
         let results = search_session_history(&session, "nonexistent");
         assert!(results.is_empty());
     }
 
     #[test]
     fn search_finds_case_insensitive_match() {
-        let session = build_session_with_blocks(
-            vec![text_block("Hello World")],
-            MessageRole::User,
-        );
+        let session = build_session_with_blocks(vec![text_block("Hello World")], MessageRole::User);
         let results = search_session_history(&session, "WORLD");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
@@ -1812,10 +1837,8 @@ mod tests {
 
     #[test]
     fn search_empty_query_matches_everything() {
-        let session = build_session_with_blocks(
-            vec![text_block("anything goes")],
-            MessageRole::Assistant,
-        );
+        let session =
+            build_session_with_blocks(vec![text_block("anything goes")], MessageRole::Assistant);
         let results = search_session_history(&session, "");
         assert_eq!(results.len(), 1);
         assert!(results[0].1.starts_with("[assistant]"));
@@ -1852,10 +1875,7 @@ mod tests {
     #[test]
     fn search_preview_truncates_long_text() {
         let long_text = "a".repeat(200);
-        let session = build_session_with_blocks(
-            vec![text_block(&long_text)],
-            MessageRole::User,
-        );
+        let session = build_session_with_blocks(vec![text_block(&long_text)], MessageRole::User);
         let results = search_session_history(&session, "a");
         assert_eq!(results.len(), 1);
         // preview = "[user] " (7 chars) + 80 'a' + "…" = 88 chars
@@ -1866,10 +1886,8 @@ mod tests {
 
     #[test]
     fn undo_nothing_to_undo_when_no_file_edits() {
-        let session = build_session_with_blocks(
-            vec![text_block("just chatting")],
-            MessageRole::User,
-        );
+        let session =
+            build_session_with_blocks(vec![text_block("just chatting")], MessageRole::User);
         let message = undo_last_file_edit(&session);
         assert!(message.contains("nothing to undo"));
     }
@@ -1948,7 +1966,12 @@ mod tests {
 
     // ===== Session picker tests =====
 
-    fn picker_session(id: &str, modified: u128, branch: Option<&str>, parent: Option<&str>) -> ManagedSessionSummary {
+    fn picker_session(
+        id: &str,
+        modified: u128,
+        branch: Option<&str>,
+        parent: Option<&str>,
+    ) -> ManagedSessionSummary {
         ManagedSessionSummary {
             id: id.to_string(),
             path: PathBuf::from(format!("/tmp/{id}.jsonl")),
@@ -1970,7 +1993,7 @@ mod tests {
 
     #[test]
     fn picker_filter_empty_matches_all() {
-        let sessions = vec![
+        let sessions = [
             picker_session("abc123", 1000, None, None),
             picker_session("xyz789", 2000, Some("feature"), None),
         ];
@@ -1983,7 +2006,7 @@ mod tests {
 
     #[test]
     fn picker_filter_matches_id_case_insensitive() {
-        let sessions = vec![
+        let sessions = [
             picker_session("Abc123", 1000, None, None),
             picker_session("xyz789", 2000, None, None),
         ];
@@ -1997,7 +2020,7 @@ mod tests {
 
     #[test]
     fn picker_filter_matches_branch_name() {
-        let sessions = vec![
+        let sessions = [
             picker_session("abc123", 1000, None, None),
             picker_session("xyz789", 2000, Some("feature-branch"), None),
         ];
@@ -2011,7 +2034,7 @@ mod tests {
 
     #[test]
     fn picker_filter_matches_parent_session_id() {
-        let sessions = vec![
+        let sessions = [
             picker_session("abc123", 1000, None, None),
             picker_session("fork-1", 2000, Some("dev"), Some("abc123")),
         ];
@@ -2025,7 +2048,7 @@ mod tests {
 
     #[test]
     fn picker_filter_no_matches_returns_empty() {
-        let sessions = vec![
+        let sessions = [
             picker_session("abc123", 1000, None, None),
             picker_session("xyz789", 2000, None, None),
         ];

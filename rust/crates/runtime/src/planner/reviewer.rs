@@ -174,7 +174,10 @@ pub fn render_remediation_prompt(failures: &[FailedVerification]) -> String {
             f.step_id,
             f.step_description
         ));
-        out.push_str(&format!("- Acceptance criteria: {}\n", f.acceptance_criteria));
+        out.push_str(&format!(
+            "- Acceptance criteria: {}\n",
+            f.acceptance_criteria
+        ));
         out.push_str(&format!("- Failure detail: {}\n", f.detail));
         if !f.remediation.is_empty() {
             out.push_str(&format!("- Remediation:\n{}\n", f.remediation));
@@ -265,9 +268,7 @@ mod tests {
         let middleware = PreCompletionChecklistMiddleware::default();
         let result = middleware.review(&mut artifact, empty_verifications());
         match result {
-            ReviewResult::ReplanTriggered {
-                reset_step_ids, ..
-            } => {
+            ReviewResult::ReplanTriggered { reset_step_ids, .. } => {
                 assert!(reset_step_ids.is_empty());
             }
             other => panic!("expected ReplanTriggered with empty resets, got {other:?}"),
