@@ -177,6 +177,7 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     if normalized.contains("deepseek-chat")
         || normalized.contains("deepseek-v3")
         || normalized.contains("deepseekv3")
+        || normalized.contains("deepseek-v4")
     {
         return Some(ModelPricing {
             input_cost_per_million: 0.27,
@@ -423,7 +424,10 @@ mod tests {
 
         // 验证别名也能命中（deepseek-v3 应等价于 deepseek-chat）
         let ds_v3_alias = pricing_for_model("deepseek-v3").expect("deepseek-v3 alias");
-        assert_eq!(ds_v3_alias.input_cost_per_million, ds_v3.input_cost_per_million);
+        assert_eq!(
+            ds_v3_alias.input_cost_per_million,
+            ds_v3.input_cost_per_million
+        );
 
         // 未知模型仍返回 None
         assert!(pricing_for_model("some-unknown-model-v999").is_none());

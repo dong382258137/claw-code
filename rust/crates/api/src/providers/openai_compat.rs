@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::http_client::{build_http_client_or_default, build_http_client_with_opts, ProxyConfig, TimeoutConfig};
+use crate::http_client::{
+    build_http_client_or_default, build_http_client_with_opts, ProxyConfig, TimeoutConfig,
+};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -258,7 +260,7 @@ impl OpenAiCompatClient {
             parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
             pending: VecDeque::new(),
             done: false,
-            state: StreamState::new(request.model.clone()),
+            state: StreamState::new(request.model.clone(), self.base_url.clone()),
         })
     }
 
@@ -480,6 +482,7 @@ impl OpenAiSseParser {
 #[derive(Debug)]
 struct StreamState {
     model: String,
+    base_url: String,
     message_started: bool,
     text_started: bool,
     text_finished: bool,
@@ -492,9 +495,10 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new(model: String) -> Self {
+    fn new(model: String, base_url: String) -> Self {
         Self {
             model,
+            base_url,
             message_started: false,
             text_started: false,
             text_finished: false,
@@ -533,7 +537,7 @@ impl StreamState {
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(usage.normalized());
+            self.usage = Some(usage.normalized(Some(&self.model), Some(&self.base_url)));
         }
 
         for choice in chunk.choices {
@@ -812,6 +816,8 @@ struct OpenAiUsage {
     #[serde(default)]
     completion_tokens: u32,
     #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
     prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
     // DeepSeek 原生字段：直接平铺在 usage 对象上，不在 prompt_tokens_details 里。
     // 优先级高于 OpenAI 标准 cached_tokens，因为它是 DeepSeek 自己的命中计数。
@@ -828,22 +834,31 @@ struct OpenAiPromptTokensDetails {
 }
 
 impl OpenAiUsage {
-    fn normalized(&self) -> Usage {
-        // DeepSeek 原生字段优先：当 hit 或 miss > 0 时，直接用 DeepSeek 的语义。
+    pub(crate) fn normalized(&self, model: Option<&str>, base_url: Option<&str>) -> Usage {
+        // DeepSeek 原生字段优先：当 hit > 0 时直接用 DeepSeek 的语义。
         // - cache_read_input_tokens = prompt_cache_hit_tokens (命中缓存读取)
-        // - cache_creation_input_tokens = prompt_cache_miss_tokens (未命中,会被写入缓存供下次使用)
-        // - input_tokens = 0 (DeepSeek 的 prompt 全部归入 hit + miss,没有"既不缓存也不读"的裸输入)
+        // - cache_creation_input_tokens = miss (未命中写入缓存,用于命中率统计)
+        // - input_tokens = 0 (DeepSeek 的 prompt 全归入 hit+miss,无"既不缓存也不读"的裸输入)
         //
-        // 这样映射使 total_tokens = hit + miss + output 与 DeepSeek 官方 total_tokens 一致,
-        // 同时让 cache_creation_input_tokens 反映缓存写入量,用于命中率统计与 "+X" 显示。
-        // 成本侧:DeepSeek miss 按 input 价计费,在 usage.rs 中 cache_creation_cost_per_million
-        // 设为与 input_cost_per_million 相同的值,使成本计算正确。
+        // prompt_cache_miss_tokens 兼容:部分 API 版本只返回 hit 不返回 miss,
+        // 此时从 prompt_tokens - hit 反推 miss; 若 prompt_tokens 也为 0 (流式
+        // trailing chunk 可能不包含), 则从 total_tokens - completion_tokens - hit 兜底。
         //
         // 否则回退到 OpenAI 标准：从 prompt_tokens_details.cached_tokens 推导。
-        if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
+        if self.prompt_cache_hit_tokens > 0 {
+            let miss = if self.prompt_cache_miss_tokens > 0 {
+                self.prompt_cache_miss_tokens
+            } else if self.prompt_tokens > 0 {
+                self.prompt_tokens
+                    .saturating_sub(self.prompt_cache_hit_tokens)
+            } else {
+                self.total_tokens
+                    .saturating_sub(self.completion_tokens)
+                    .saturating_sub(self.prompt_cache_hit_tokens)
+            };
             Usage {
                 input_tokens: 0,
-                cache_creation_input_tokens: self.prompt_cache_miss_tokens,
+                cache_creation_input_tokens: miss,
                 cache_read_input_tokens: self.prompt_cache_hit_tokens,
                 output_tokens: self.completion_tokens,
             }
@@ -852,11 +867,26 @@ impl OpenAiUsage {
                 .prompt_tokens_details
                 .as_ref()
                 .map_or(0, |details| details.cached_tokens);
-            Usage {
-                input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: cached_tokens,
-                output_tokens: self.completion_tokens,
+            // DeepSeek V4 uses OpenAI-standard cached_tokens field but
+            // semantically all prompt tokens are either cache-hit or
+            // cache-miss — there is no "uncategorised" input bucket.
+            let is_deepseek = model
+                .is_some_and(|name| name.to_ascii_lowercase().contains("deepseek"))
+                || base_url.is_some_and(|url| url.to_ascii_lowercase().contains("deepseek"));
+            if is_deepseek {
+                Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
+                    cache_read_input_tokens: cached_tokens,
+                    output_tokens: self.completion_tokens,
+                }
+            } else {
+                Usage {
+                    input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: cached_tokens,
+                    output_tokens: self.completion_tokens,
+                }
             }
         }
     }
@@ -1075,9 +1105,7 @@ pub fn build_chat_completion_request(
 /// `SystemBlock` 数组。直接 `content: system` 会让 `SystemContent::Blocks`
 /// 序列化成数组，导致 400 错误或被强制 stringify（增加 token 浪费 + 破坏前缀
 /// 缓存）。本函数显式提取每个 block 的 `text` 字段并用 `\n\n` 拼接成字符串。
-fn split_system_content_to_openai_messages(
-    system: &Option<SystemContent>,
-) -> Vec<Value> {
+fn split_system_content_to_openai_messages(system: &Option<SystemContent>) -> Vec<Value> {
     let Some(content) = system.as_ref().filter(|value| !value.is_empty()) else {
         return Vec::new();
     };
@@ -1492,6 +1520,7 @@ fn normalize_response(
     model: &str,
     response: ChatCompletionResponse,
 ) -> Result<MessageResponse, ApiError> {
+
     let choice = response
         .choices
         .into_iter()
@@ -1521,6 +1550,12 @@ fn normalize_response(
         });
     }
 
+    // Extract response model before move for usage normalization
+    let response_model = if response.model.is_empty() {
+        model.to_string()
+    } else {
+        response.model.clone()
+    };
     Ok(MessageResponse {
         id: response.id,
         kind: "message".to_string(),
@@ -1531,10 +1566,9 @@ fn normalize_response(
             .finish_reason
             .map(|value| normalize_finish_reason(&value)),
         stop_sequence: None,
-        usage: response
-            .usage
-            .as_ref()
-            .map_or_else(Usage::default, OpenAiUsage::normalized),
+        usage: response.usage.as_ref().map_or_else(Usage::default, |u| {
+            u.normalized(Some(&response_model), None)
+        }),
         request_id: None,
     })
 }
@@ -1938,7 +1972,10 @@ mod tests {
     #[test]
     fn streaming_chunks_with_reasoning_content_emit_thinking_block_events_before_text() {
         // Given streaming chunks with reasoning_content followed by text.
-        let mut state = StreamState::new("deepseek-v4-pro".to_string());
+        let mut state = StreamState::new(
+            "deepseek-v4-pro".to_string(),
+            "https://api.deepseek.com/v1".to_string(),
+        );
         let mut events = state
             .ingest_chunk(super::ChatCompletionChunk {
                 id: "chatcmpl_stream_reasoning".to_string(),

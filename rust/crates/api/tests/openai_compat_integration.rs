@@ -97,9 +97,8 @@ async fn openai_compat_reads_deepseek_native_cache_fields_non_streaming() {
     )
     .await;
 
-    let client =
-        OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::openai())
-            .with_base_url(server.base_url());
+    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
     let response = client
         .send_message(&sample_request(false))
         .await
@@ -139,9 +138,8 @@ async fn openai_compat_reads_deepseek_native_cache_fields_streaming() {
     )
     .await;
 
-    let client =
-        OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::openai())
-            .with_base_url(server.base_url());
+    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
     let request = MessageRequest {
         model: "deepseek-chat".to_string(),
         stream: true,
@@ -157,9 +155,10 @@ async fn openai_compat_reads_deepseek_native_cache_fields_streaming() {
     }
 
     // 找到 MessageDelta 事件，验证 DeepSeek 缓存字段已正确映射
-    let delta_event = events.iter().rev().find(|e| {
-        matches!(e, StreamEvent::MessageDelta(MessageDeltaEvent { .. }))
-    });
+    let delta_event = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e, StreamEvent::MessageDelta(MessageDeltaEvent { .. })));
     let delta_event = match delta_event {
         Some(StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. })) => usage,
         _ => panic!("expected MessageDelta event with usage"),
@@ -853,6 +852,58 @@ fn sample_request(stream: bool) -> MessageRequest {
         stream,
         ..Default::default()
     }
+}
+
+/// DeepSeek V4 models may return usage in OpenAI-standard format using
+/// `prompt_tokens_details.cached_tokens` instead of the top-level
+/// `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` fields.
+/// The `normalized()` method must still apply DeepSeek semantics:
+/// `input_tokens = 0`, `cache_creation = prompt_tokens - cached_tokens`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn deepseek_v4_openai_format_cached_tokens_applies_deepseek_semantics() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    // Simulate DeepSeek V4 API that returns OpenAI-standard format
+    // with prompt_tokens_details.cached_tokens but NOT the native
+    // prompt_cache_hit_tokens / prompt_cache_miss_tokens fields.
+    let body = serde_json::to_string(&serde_json::json!({
+        "id": "chatcmpl_dsv4_openai",
+        "model": "deepseek-v4-pro",
+        "choices": [{
+            "message": {"role": "assistant", "content": "ok", "tool_calls": []},
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 50000,
+            "completion_tokens": 50,
+            "total_tokens": 50050,
+            "prompt_tokens_details": {"cached_tokens": 40000}
+        }
+    }))
+    .unwrap();
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", &body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("ds-v4-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("deepseek-v4 request should succeed");
+
+    // DeepSeek V4 via OpenAI format:
+    //   cached_tokens = 40000 -> cache_read (hit)
+    //   prompt_tokens - cached_tokens = 10000 -> cache_creation (miss)
+    //   input_tokens = 0 (all prompt tokens are cache-hit or cache-miss)
+    assert_eq!(response.usage.cache_read_input_tokens, 40000);
+    assert_eq!(response.usage.input_tokens, 0);
+    assert_eq!(response.usage.cache_creation_input_tokens, 10000);
+    assert_eq!(response.usage.output_tokens, 50);
+    // total = 0 + 10000 + 40000 + 50 = 50050
+    assert_eq!(response.total_tokens(), 50050);
 }
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {

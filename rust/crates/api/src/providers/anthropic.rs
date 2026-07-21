@@ -862,6 +862,36 @@ pub struct MessageStream {
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
+
+/// DeepSeek Anthropic-compatible API doesn't return cache_creation_input_tokens,
+/// only input_tokens (cache miss) and cache_read_input_tokens (cache hit).
+/// Normalize by moving input_tokens → cache_creation_input_tokens so sidebar
+/// hit-rate = hit/(hit+miss) displays correctly. Billing is unaffected
+/// because cache_creation and input share the same price tier.
+fn normalize_deepseek_usage(event: StreamEvent, is_deepseek: bool) -> StreamEvent {
+    if !is_deepseek {
+        return event;
+    }
+    match event {
+        StreamEvent::MessageDelta(MessageDeltaEvent { delta, usage }) => {
+            if usage.cache_creation_input_tokens == 0 && usage.input_tokens > 0 {
+                StreamEvent::MessageDelta(MessageDeltaEvent {
+                    delta,
+                    usage: Usage {
+                        input_tokens: 0,
+                        cache_creation_input_tokens: usage.input_tokens,
+                        cache_read_input_tokens: usage.cache_read_input_tokens,
+                        output_tokens: usage.output_tokens,
+                    },
+                })
+            } else {
+                StreamEvent::MessageDelta(MessageDeltaEvent { delta, usage })
+            }
+        }
+        other => other,
+    }
+}
+
 impl MessageStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
@@ -877,7 +907,8 @@ impl MessageStream {
 
             if self.done {
                 let remaining = self.parser.finish()?;
-                self.pending.extend(remaining);
+                let is_ds = self.request.model.to_ascii_lowercase().contains("deepseek");
+                self.pending.extend(remaining.into_iter().map(|e| normalize_deepseek_usage(e, is_ds)));
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(Some(event));
                 }
@@ -886,7 +917,8 @@ impl MessageStream {
 
             match self.response.chunk().await? {
                 Some(chunk) => {
-                    self.pending.extend(self.parser.push(&chunk)?);
+                    let is_ds = self.request.model.to_ascii_lowercase().contains("deepseek");
+                    self.pending.extend(self.parser.push(&chunk)?.into_iter().map(|e| normalize_deepseek_usage(e, is_ds)));
                 }
                 None => {
                     self.done = true;
