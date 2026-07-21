@@ -332,6 +332,24 @@ pub trait SandboxBuilder: Send + Sync {
         cwd: &Path,
         status: &SandboxStatus,
     ) -> Result<SandboxCommand, String>;
+
+    /// SP4.1 收尾:将已 spawn 的进程分配到沙箱(后置分配方案)。
+    ///
+    /// 与 `build()` 的"前置包装"方案不同,此方法用于在子进程已经 spawn
+    /// 后(拿到 pid),通过平台原生机制(如 Win32 Job Object)将进程
+    /// 分配到沙箱限制组。适用于需要直接控制子进程 stdin/stdout/stderr
+    /// 的场景(如 bg.rs 的后台任务 spawn),无法用 cmd.exe / powershell
+    /// wrapper 包装命令的情况。
+    ///
+    /// # 默认实现
+    /// Linux/macOS 无 Job Object 概念,默认返回 `Ok(())`(no-op)。
+    /// Windows 实现覆盖此方法,委托给 `assign_process_to_job_object`。
+    ///
+    /// # 错误处理
+    /// 失败应返回 `Err(String)`,调用方(best-effort 路径)记录日志后继续。
+    fn assign_process(&self, _pid: u32) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// 平台无关的沙箱命令描述符。
@@ -646,6 +664,15 @@ impl SandboxBuilder for WindowsSandboxBuilder {
 
     fn is_supported(&self) -> bool {
         cfg!(target_os = "windows")
+    }
+
+    /// SP4.1 收尾:覆盖默认 no-op,委托给 `assign_process_to_job_object`。
+    ///
+    /// 通过 PowerShell + C# 内联调用 Win32 API(CreateJobObjectW +
+    /// SetInformationJobObject + AssignProcessToJobObject)将 pid 对应的
+    /// 进程分配到新创建的 Job Object,设置 CPU/memory 限制。
+    fn assign_process(&self, pid: u32) -> Result<(), String> {
+        self.assign_process_to_job_object(pid)
     }
 
     fn build(

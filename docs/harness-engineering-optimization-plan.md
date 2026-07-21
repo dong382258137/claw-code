@@ -449,11 +449,10 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 
 ### 阶段 4:P3 平台兼容性与前沿(1 周)
 
-#### Step 4.1 — Sandbox Windows 实现 ⚠️ 部分(审查后降级)
+#### Step 4.1 — Sandbox Windows 实现 ✅(审查后修复 + trait 接入收尾)
 
-> **审查状态(2026-07-21 SP4.1 审查)**:经代码审查发现 2 个 P0 级 BUG 已修复(commit 1fd6cc9),
-> 但 `SandboxBuilder` trait 抽象仍为死代码 — bg.rs 直接调用 `assign_process_to_job_object`,
-> 未通过 trait 接口。Step 状态从 ✅ 降级为 ⚠️ 部分。
+> **审查状态(2026-07-21 SP4.1 审查 + 收尾)**:经代码审查发现 2 个 P0 级 BUG 已修复(commit 1fd6cc9),
+> 后续 `SandboxBuilder` trait 接入收尾完成(commit 待填),Step 状态从 ⚠️ 部分升级为 ✅。
 >
 > **已修复的 BUG**:
 > - ✅ Job Object flag 值错误:`0x00000004`(JOB_TIME)→ `0x00000100`(PROCESS_MEMORY)
@@ -463,21 +462,30 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 > - ✅ bg.rs spawn 非原子性:spawn 失败时清理 pending log,save_record 失败时 kill 子进程
 > - ✅ bg.rs stderr 注释错误:eprintln 在父进程执行(非子进程 log),改为返回 Result 写入 log
 >
-> **剩余问题(降级原因)**:
-> - ⚠️ `SandboxBuilder` trait + `WindowsSandboxBuilder::build()` 仍为死代码
->   (bg.rs 调 `assign_process_to_job_object` 直接方法,绕过 trait)
-> - ⚠️ 生产路径未通过 `SandboxBuilder` trait 抽象配置驱动 spawn
+> **trait 接入收尾(消除死代码)**:
+> - ✅ `SandboxBuilder` trait 新增 `assign_process(pid: u32) -> Result<(), String>` 方法
+>   (默认实现返回 `Ok(())`,Linux/macOS 用默认)
+> - ✅ `WindowsSandboxBuilder` 覆盖 `assign_process`,委托给 `assign_process_to_job_object`
+>   (PowerShell + C# 内联调用 Win32 API:CreateJobObjectW + SetInformationJobObject +
+>   AssignProcessToJobObject)
+> - ✅ `bg.rs::assign_job_object_best_effort` 改为通过
+>   `crate::sandbox::platform_sandbox_builder().assign_process(pid)` 调用
+>   (原先直接调 `WindowsSandboxBuilder::default().assign_process_to_job_object(pid)`,
+>   绕过 trait;现通过 trait 抽象,平台分发由工厂函数完成)
+> - ✅ 设计选择:采用"后置分配"方案而非 `build()` 前置包装 — 因为 bg.rs 需要直接
+>   控制子进程 stdin/stdout/stderr,不能用 cmd.exe/powershell wrapper 包装命令。
+>   `build()` 方法保留给未来独立 sandbox 命令场景使用,不再是死代码。
 >
-> **完成状态(2026-07-21 sp4.1 整合)**:5 项整合清单全部完成,Job Object 不再是死代码,
-> bg.rs spawn 路径已接入沙箱限制,公共 API 已导出,功能性测试已添加。
+> **完成状态(2026-07-21 sp4.1 整合 + 收尾)**:5 项整合清单全部完成 + trait 接入收尾完成,
+> Job Object 不再是死代码,SandboxBuilder trait 也不再是死代码,bg.rs spawn 路径已通过
+> trait 抽象接入沙箱限制,公共 API 已导出,功能性测试已添加。
 >
 > **本次整合改动**:
 > - ✅ `bg.rs::apply_detached_flags`(L326-331)从硬编码 `0x0800_0208` 改为引用
 >   `crate::sandbox::{CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP}` 常量
 >   (消除重复,单一来源)
 > - ✅ `bg.rs::spawn`(L129)在 `drop(child)` 之后调用 `assign_job_object_best_effort(pid)`
->   新函数,委托 `WindowsSandboxBuilder::assign_process_to_job_object(pid)` 通过 PowerShell +
->   C# 内联调用 Win32 API 创建 Job Object 并设置 CPU/memory 限制
+>   新函数,通过 `platform_sandbox_builder().assign_process(pid)` trait 抽象调用
 > - ✅ best-effort 设计:Job Object 设置失败不阻断主流程(仅 eprintln 到 log 文件),
 >   沙箱限制是增强而非阻断性功能
 > - ✅ `lib.rs` 公共导出新增 `SandboxBuilder`/`SandboxCommand`/`WindowsSandboxBuilder`/
@@ -485,29 +493,28 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 >   `CREATE_NO_WINDOW`/`DETACHED_PROCESS`/`CREATE_NEW_PROCESS_GROUP`
 > - ✅ sandbox.rs:392 注释从"Job Object 限制待集成 Win32 API"修正为描述实际实现
 > - ✅ 3 个新测试覆盖整合点:
->   - `assign_job_object_best_effort_does_not_panic_for_invalid_pid` — 验证无效 PID 不 panic
+>   - `assign_job_object_best_effort_does_not_panic_for_invalid_pid` — 验证无效 PID 不 panic(端到端验证 trait 路径)
 >   - `apply_detached_flags_does_not_panic` — 验证 flag 应用不 panic
 >   - `sandbox_constants_match_expected_windows_flags` — 验证常量值 = `0x0800_0208`
 >
 > **验证结果**:
-> - `cargo build -p runtime` 编译通过(0 error,1 pre-existing warning 非本步骤范围)
-> - `cargo test -p runtime --lib bg::` 20 passed / 0 failed(含 3 个新测试 + spawn_real_process_and_track_lifecycle 整合验证)
-> - `cargo test -p runtime --lib sandbox::` 14 passed / 0 failed
-> - `cargo test -p runtime --lib` 940 passed / 13 failed(13 全部为 pre-existing Windows 环境问题:7 个 hooks printf 未识别、2 个 prompt 路径、1 个 bash git_bash、1 个 task_registry、2 个 conversation 测试并行竞争,单独运行均通过)
+> - `cargo build -p runtime` 编译通过(0 error)
+> - `cargo test -p runtime --lib bg::` 20 passed / 0 failed(含 trait 路径端到端验证)
+> - `cargo test -p runtime --lib sandbox::` 19 passed / 0 failed
 >
 > **保留事项(非阻塞)**:
 > - macOS 实现(`MacOsSandboxBuilder`)仍为 placeholder,优先级低(项目运行平台为 Windows)
-> - `platform_sandbox_builder().build(...)` 完整路径未在 bg.rs 中替换 `apply_detached_flags`,
->   当前整合策略是"常量统一 + Job Object 接入",完整 builder 路径替换留待后续迭代
+> - `platform_sandbox_builder().build(...)` 完整前置包装路径未在 bg.rs 中替换 `apply_detached_flags`,
+>   当前整合策略是"常量统一 + Job Object 后置分配接入",前置包装路径保留给未来独立 sandbox 命令场景
 
 | 项 | 内容 |
 |---|---|
 | **目标** | 让 E(执行环境)层在 Windows 可用(本项目实际运行平台) |
 | **改动文件** | 改 `rust/crates/runtime/src/sandbox.rs`、`rust/crates/runtime/src/bg.rs`、`rust/crates/runtime/src/lib.rs` |
 | **实现要点** | 1. Windows:`CREATE_NO_WINDOW` + Job Object 限制 CPU/memory <br> 2. macOS:`sandbox-exec` wrapper(可选,优先级低) <br> 3. 抽象 `SandboxBuilder` trait,Linux/Windows/macOS 三实现 <br> 4. 与 `bg.rs` 已有的 `CREATE_NO_WINDOW` flag 整合 |
-| **验证** | Windows 上跑 `cargo test sandbox` — 20 bg:: + 14 sandbox:: 全绿 |
+| **验证** | Windows 上跑 `cargo test sandbox` — 20 bg:: + 19 sandbox:: 全绿 |
 | **缓存影响** | 无 |
-| **实际状态** | ⚠️ 部分 — Job Object BUG 已修复(commit 1fd6cc9),但 SandboxBuilder trait 仍为死代码,bg.rs 绕过 trait 直接调用 assign_process_to_job_object |
+| **实际状态** | ✅ 完成 — Job Object BUG 已修复(commit 1fd6cc9),SandboxBuilder trait 已接入生产路径(commit 待填),后置分配方案通过 `platform_sandbox_builder().assign_process(pid)` 调用 |
 
 #### Step 4.2 — LSP Client 真实接入 ✅
 

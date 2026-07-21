@@ -360,13 +360,14 @@ fn apply_detached_flags(_cmd: &mut Command) {}
 /// Step 4.1:Windows 上将子进程分配到 Job Object,设置 CPU/memory 限制。
 ///
 /// 这是 best-effort 操作:
-/// - 仅 Windows 生效,Unix 直接返回 Ok
+/// - 仅 Windows 生效,Unix 直接返回 Ok(trait 默认实现)
 /// - 失败不致命:PowerShell 不可用、Job Object 创建失败等情况不阻断主流程
 /// - 失败原因写入 `<pid>.log`(append 模式),便于调试
 ///
-/// 实现委托给 `WindowsSandboxBuilder::assign_process_to_job_object`,
-/// 通过 PowerShell + C# 内联调用 Win32 API(CreateJobObjectW +
-/// SetInformationJobObject + AssignProcessToJobObject)。
+/// SP4.1 收尾:通过 `platform_sandbox_builder()` 工厂函数 + `SandboxBuilder` trait
+/// 调用,消除"trait 死代码"问题。trait 的 `assign_process` 方法在 Windows 上
+/// 委托给 `WindowsSandboxBuilder::assign_process_to_job_object`(PowerShell +
+/// C# 内联调用 Win32 API),其他平台默认 no-op。
 ///
 /// SP4.1 修复(审查后):
 /// - 原代码用 `eprintln!` 输出到父进程 stderr,注释错误地声称会出现在 `<pid>.log`。
@@ -374,14 +375,10 @@ fn apply_detached_flags(_cmd: &mut Command) {}
 ///   父进程的 `eprintln!` 走父进程 stderr(TUI 模式下被 alternate screen 吞掉)。
 /// - 改为返回 `Result<(), String>`,由调用方写入 log 文件。
 fn assign_job_object_best_effort(pid: u32) -> Result<(), String> {
-    // Unix:无 Job Object 概念,直接返回 Ok
-    if !cfg!(target_os = "windows") {
-        return Ok(());
-    }
-
+    // SP4.1 收尾:通过 trait 抽象调用,平台分发由 platform_sandbox_builder() 完成。
     // Windows:用默认配置(2GB 内存 + 80% CPU)创建 Job Object
-    crate::sandbox::WindowsSandboxBuilder::default()
-        .assign_process_to_job_object(pid)
+    // Linux/macOS:trait 默认实现返回 Ok(())
+    crate::sandbox::platform_sandbox_builder().assign_process(pid)
 }
 
 fn save_record(path: &Path, record: &BgRecord) -> Result<(), BgError> {
