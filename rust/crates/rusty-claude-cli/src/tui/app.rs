@@ -1172,8 +1172,12 @@ fn run_event_loop(
                                 line.clone()
                             };
                             // 把用户答案作为 echo 显示到 OutputView，保持对话上下文清晰。
+                            // 用 push_entry 而非 append，让 echo 成为独立 Text entry
+                            // 并获得自己的时间戳（与上一条 AI 回复分开）。
                             if let Ok(mut buf) = output_view.shared_handle().lock() {
-                                buf.append(&format!("> {answer}\n\n"));
+                                buf.push_entry(crate::tui::output_view::OutputEntry::text(
+                                    format!("> {answer}\n\n"),
+                                ));
                             }
                             // 回传答案。失败说明 worker 线程已退出（极少见），忽略。
                             let _ = ask.resp_tx.send(answer);
@@ -1333,7 +1337,11 @@ fn run_event_loop(
                                 if !current.is_empty() && !current.ends_with('\n') {
                                     buf.append("\n\n");
                                 }
-                                buf.append(&format!("> {display}\n\n"));
+                                // 用 push_entry 让用户 echo 成为独立 Text entry
+                                // 并获得自己的时间戳（与 AI 回复分开）。
+                                buf.push_entry(crate::tui::output_view::OutputEntry::text(
+                                    format!("> {display}\n\n"),
+                                ));
                             }
 
                             let output_handle = output_view.shared_handle();
@@ -1901,15 +1909,13 @@ fn execute_turn(
                 // P1 重构：用结构化 ToolCard entry 替代纯文本 append。
                 // ToolCard 默认 collapsed=false（执行中），result 到达后
                 // 由 complete_tool_card 设置 result 并切换为 collapsed=true。
+                // timestamp 由工厂方法自动填充（消息时间戳）。
                 if let Ok(mut buf) = output_handle.lock() {
-                    buf.push_entry(crate::tui::output_view::OutputEntry::ToolCard {
-                        tool_id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                        result: None,
-                        is_error: false,
-                        collapsed: false,
-                    });
+                    buf.push_entry(crate::tui::output_view::OutputEntry::tool_card_start(
+                        id.clone(),
+                        name.clone(),
+                        input.clone(),
+                    ));
                 }
             }
             StatusEvent::ToolResult { id, name, output, is_error } => {
@@ -1966,9 +1972,9 @@ fn execute_turn(
                     if !history.is_empty() {
                         let timeline = crate::tui::tool_card::render_tool_timeline(&history);
                         if let Ok(mut buf) = output_for_closure.lock() {
-                            buf.push_entry(crate::tui::output_view::OutputEntry::Timeline {
-                                summary: timeline,
-                            });
+                            buf.push_entry(
+                                crate::tui::output_view::OutputEntry::timeline(timeline),
+                            );
                         }
                     }
                 }
@@ -2096,6 +2102,7 @@ fn sync_status_from_cli_inner(guard: &mut StatusBarState, cli: &LiveCli) {
     guard.provider =
         crate::provider_label(api::detect_provider_kind(cli.model_snapshot())).to_string();
     guard.reasoning_effort = cli.reasoning_effort();
+    guard.turn_count = cli.turns_snapshot();
 }
 
 #[cfg(test)]
@@ -2186,7 +2193,9 @@ mod tests {
         emitter(StatusEvent::TextDelta("Hello ".to_string()));
         emitter(StatusEvent::TextDelta("world!".to_string()));
 
-        assert_eq!(output_view.snapshot(), "Hello world!");
+        // Text 渲染会带时间戳前缀 [HH:MM:SS]
+        let snap = output_view.snapshot();
+        assert!(snap.contains("Hello world!"));
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub(crate) struct StatusBarState {
     /// 当前 reasoning effort 设置（None=默认，Some("low"/"medium"/"high")=已设置）。
     /// 由 /effort 命令或 --reasoning-effort CLI flag 设置，侧栏会显示。
     pub reasoning_effort: Option<String>,
+    /// 累计 AI 思考轮次（每个 turn +1）。由 sync_status_from_cli_inner
+    /// 从 `LiveCli::turns_snapshot()` 同步。
+    pub turn_count: u32,
 }
 
 impl StatusBarState {

@@ -16,6 +16,7 @@ path = "src/bin/headless.rs"
 [dependencies]
 api = { path = "../api" }
 ansi-to-tui = { version = "7", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 claw-shell = { path = "../claw-shell" }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }

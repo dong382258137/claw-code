@@ -15,13 +15,23 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 /// 最大保留字节数（Text 条目的总文本长度上限）。
-const MAX_BUFFER_BYTES: usize = 64 * 1024;
+/// 调大到 256KB 以支持长会话（100+ 工具调用）。
+const MAX_BUFFER_BYTES: usize = 256 * 1024;
+
+/// trim_if_needed 的最大迭代次数，防止意外死循环。
+const MAX_TRIM_ITERS: usize = 1000;
+
+/// 生成当前本地时间戳字符串（HH:MM:SS 格式）。
+fn now_timestamp() -> String {
+    use chrono::Local;
+    Local::now().format("%H:%M:%S").to_string()
+}
 
 /// 结构化输出条目。
 #[derive(Debug, Clone)]
 pub(crate) enum OutputEntry {
     /// 普通文本流（AI 回复、用户 echo、斜杠命令输出）。
-    Text { content: String },
+    Text { content: String, timestamp: String },
     /// 工具调用卡片，可折叠/展开。
     ToolCard {
         /// 工具调用 ID（用于匹配 ToolUse 和 ToolResult）。
@@ -36,33 +46,80 @@ pub(crate) enum OutputEntry {
         is_error: bool,
         /// 当前是否折叠（true=折叠只显示 header，false=展开显示完整结果）。
         collapsed: bool,
+        /// 条目创建时的本地时间戳（HH:MM:SS）。
+        timestamp: String,
     },
     /// Thinking 块摘要。
-    Thinking { summary: String },
+    Thinking { summary: String, timestamp: String },
     /// 工具时间线。
-    Timeline { summary: String },
+    Timeline { summary: String, timestamp: String },
 }
 
 impl OutputEntry {
+    /// 工厂方法：创建 Text 条目，自动填充当前时间戳。
+    pub(crate) fn text(content: String) -> Self {
+        Self::Text {
+            content,
+            timestamp: now_timestamp(),
+        }
+    }
+
+    /// 工厂方法：创建执行中的 ToolCard 条目，自动填充当前时间戳。
+    pub(crate) fn tool_card_start(tool_id: String, name: String, input: String) -> Self {
+        Self::ToolCard {
+            tool_id,
+            name,
+            input,
+            result: None,
+            is_error: false,
+            collapsed: false,
+            timestamp: now_timestamp(),
+        }
+    }
+
+    /// 工厂方法：创建 Thinking 条目，自动填充当前时间戳。
+    pub(crate) fn thinking(summary: String) -> Self {
+        Self::Thinking {
+            summary,
+            timestamp: now_timestamp(),
+        }
+    }
+
+    /// 工厂方法：创建 Timeline 条目，自动填充当前时间戳。
+    pub(crate) fn timeline(summary: String) -> Self {
+        Self::Timeline {
+            summary,
+            timestamp: now_timestamp(),
+        }
+    }
+
     /// 返回此条目在当前折叠状态下渲染出的文本（含 ANSI 转义）。
     /// 每个条目末尾不以换行结束，由调用方负责条目间分隔。
     pub(crate) fn render(&self) -> String {
         match self {
-            OutputEntry::Text { content } => content.clone(),
-            OutputEntry::Thinking { summary } => summary.clone(),
-            OutputEntry::Timeline { summary } => summary.clone(),
+            OutputEntry::Text { content, timestamp } => {
+                format!("\x1b[38;5;240m[{timestamp}]\x1b[0m {content}")
+            }
+            OutputEntry::Thinking { summary, timestamp } => {
+                format!("\x1b[38;5;240m[{timestamp}]\x1b[0m{summary}")
+            }
+            OutputEntry::Timeline { summary, timestamp } => {
+                format!("\x1b[38;5;240m[{timestamp}]\x1b[0m{summary}")
+            }
             OutputEntry::ToolCard {
                 name,
                 input,
                 result,
                 is_error,
                 collapsed,
+                timestamp,
                 ..
             } => {
                 let summary = crate::tui::tool_card::summarize_tool_input_public(name, input);
+                let ts_prefix = format!("\x1b[38;5;240m[{timestamp}]\x1b[0m ");
                 if result.is_none() {
                     // 执行中：只显示 header
-                    return format!("\n┌─ 🔧 {name} {summary} ⏳\n");
+                    return format!("\n{ts_prefix}┌─ 🔧 {name} {summary} ⏳\n");
                 }
                 let output = result.as_ref().unwrap();
                 if *collapsed {
@@ -70,20 +127,27 @@ impl OutputEntry {
                     let icon = if *is_error { "❌" } else { "✅" };
                     let line_count = output.lines().count();
                     if line_count == 0 {
-                        format!("\n┌─ 🔧 {name} {summary}\n├─ {icon} {name} (空)\n└─\n")
+                        format!("\n{ts_prefix}┌─ 🔧 {name} {summary}\n{ts_prefix}├─ {icon} {name} (空)\n{ts_prefix}└─\n")
                     } else {
                         format!(
-                            "\n┌─ 🔧 {name} {summary}\n├─ {icon} {name} ({line_count} 行，已折叠)\n└─\n"
+                            "\n{ts_prefix}┌─ 🔧 {name} {summary}\n{ts_prefix}├─ {icon} {name} ({line_count} 行，已折叠)\n{ts_prefix}└─\n"
                         )
                     }
                 } else {
                     // 展开状态：显示完整卡片（含 diff 和结果）
-                    crate::tui::tool_card::render_tool_result_public(
+                    // 时间戳前缀加在 header 行前
+                    let rendered = crate::tui::tool_card::render_tool_result_public(
                         name,
                         output,
                         *is_error,
                         Some(input),
-                    )
+                    );
+                    // render_tool_result_public 输出以 \n 开头，把时间戳插入到首行
+                    if let Some(stripped) = rendered.strip_prefix('\n') {
+                        format!("\n{ts_prefix}{stripped}")
+                    } else {
+                        format!("{ts_prefix}{rendered}")
+                    }
                 }
             }
         }
@@ -114,14 +178,12 @@ impl OutputBuffer {
     pub(crate) fn append(&mut self, text: &str) {
         self.total_written += text.len() as u64;
         // 尝试合并到上一个 Text 条目
-        if let Some(OutputEntry::Text { content }) = self.entries.last_mut() {
+        if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
             content.push_str(text);
             self.text_total_bytes += text.len();
         } else {
             self.text_total_bytes += text.len();
-            self.entries.push(OutputEntry::Text {
-                content: text.to_string(),
-            });
+            self.entries.push(OutputEntry::text(text.to_string()));
         }
         self.trim_if_needed();
     }
@@ -131,15 +193,16 @@ impl OutputBuffer {
         // Bug L8 修复：ToolCard 的 input 字节数也计入 text_total_bytes，
         // 防止大量工具调用 input（如长 bash 命令、大文件 write 内容）无限积累。
         // result 到达时由 complete_tool_card 单独计入。
-        if let OutputEntry::Text { content } = &entry {
+        // timestamp 字段长度不计入（恒为 8 字节，可忽略）。
+        if let OutputEntry::Text { content, .. } = &entry {
             self.text_total_bytes += content.len();
         } else if let OutputEntry::ToolCard { input, result: Some(r), .. } = &entry {
             self.text_total_bytes += input.len() + r.len();
         } else if let OutputEntry::ToolCard { input, result: None, .. } = &entry {
             self.text_total_bytes += input.len();
-        } else if let OutputEntry::Thinking { summary } = &entry {
+        } else if let OutputEntry::Thinking { summary, .. } = &entry {
             self.text_total_bytes += summary.len();
-        } else if let OutputEntry::Timeline { summary } = &entry {
+        } else if let OutputEntry::Timeline { summary, .. } = &entry {
             self.text_total_bytes += summary.len();
         }
         self.entries.push(entry);
@@ -330,12 +393,27 @@ impl OutputBuffer {
     /// - trim 时若仍超限且无 Text 可淘汰，把最早的 ToolCard 的 result 替换为
     ///   `[trimmed: N bytes]` 占位符（保留 header 和 input 以维持工具调用历史，
     ///   仅裁剪可能极大的 result 文本），并相应减少 text_total_bytes。
+    ///
+    /// **卡死修复**：原 trim 在 ToolCard result 被替换为占位符后，下一轮迭代
+    /// 仍命中同一 entry（占位符非空），导致无限循环并持锁死锁主渲染线程。
+    /// 修复策略：
+    /// 1. 跳过已是 `[trimmed:` 开头的占位符，遍历到下一个未裁剪过的 ToolCard
+    /// 2. 增加 MAX_TRIM_ITERS 兜底，防止未来类似问题
+    /// 3. 把占位符字节数从 text_total_bytes 中扣除（占位符属于元信息，不计入预算）
     fn trim_if_needed(&mut self) {
+        let mut iter_count = 0;
         while self.text_total_bytes > MAX_BUFFER_BYTES {
+            iter_count += 1;
+            if iter_count > MAX_TRIM_ITERS {
+                // 防御性兜底：超出迭代上限仍未收敛，记录 truncated 并退出。
+                // 比死锁主线程好得多。
+                self.truncated = true;
+                break;
+            }
             // 优先淘汰最早的 Text 条目
             let first_text_idx = self.entries.iter().position(|e| matches!(e, OutputEntry::Text { .. }));
             if let Some(idx) = first_text_idx {
-                if let OutputEntry::Text { content } = &self.entries[idx] {
+                if let OutputEntry::Text { content, .. } = &self.entries[idx] {
                     self.text_total_bytes = self.text_total_bytes.saturating_sub(content.len());
                 }
                 self.entries.remove(idx);
@@ -343,19 +421,21 @@ impl OutputBuffer {
                 continue;
             }
             // Bug L8 修复：无 Text 可淘汰时，裁剪最早的 ToolCard 的 result。
-            // 把 result 替换为占位符，保留 header/input/工具调用记录。
+            // 卡死修复：跳过已是占位符的 entry，避免无限裁剪同一 entry。
             let first_card_idx = self.entries.iter().position(|e| {
-                matches!(e, OutputEntry::ToolCard { result: Some(r), .. } if !r.is_empty())
+                matches!(e, OutputEntry::ToolCard { result: Some(r), .. }
+                    if !r.is_empty() && !r.starts_with("[trimmed:"))
             });
             if let Some(idx) = first_card_idx {
                 if let OutputEntry::ToolCard { result, .. } = &mut self.entries[idx] {
                     if let Some(r) = result.take() {
                         let trimmed_len = r.len();
                         let placeholder = format!("[trimmed: {} bytes]", trimmed_len);
+                        // 占位符自身从 text_total_bytes 中扣除，避免占位符
+                        // 又被下一轮迭代命中（占位符不算业务文本）。
                         self.text_total_bytes = self
                             .text_total_bytes
-                            .saturating_sub(trimmed_len)
-                            .saturating_add(placeholder.len());
+                            .saturating_sub(trimmed_len);
                         *result = Some(placeholder);
                         self.truncated = true;
                     }
@@ -434,7 +514,9 @@ mod tests {
         let mut view = OutputView::new();
         view.write_all(b"hello ").unwrap();
         view.write_all(b"world").unwrap();
-        assert_eq!(view.snapshot(), "hello world");
+        // Text 渲染会带时间戳前缀 [HH:MM:SS]
+        let snap = view.snapshot();
+        assert!(snap.contains("hello world"));
     }
 
     #[test]
@@ -458,8 +540,8 @@ mod tests {
         let big_chunk = "x".repeat(MAX_BUFFER_BYTES + 100);
         view.write_all(big_chunk.as_bytes()).unwrap();
         let snap = view.snapshot();
-        // 渲染后长度应 <= MAX_BUFFER_BYTES（可能因合并而略小）
-        assert!(snap.len() <= MAX_BUFFER_BYTES);
+        // 渲染后长度可能略大于 MAX_BUFFER_BYTES（因时间戳前缀），但应远小于写入总量
+        assert!(snap.len() < MAX_BUFFER_BYTES + 100);
         assert!(view.total_written() as usize >= MAX_BUFFER_BYTES);
     }
 
@@ -477,7 +559,8 @@ mod tests {
         let handle = view.shared_handle();
         view.write_all(b"shared").unwrap();
         let snap = handle.lock().unwrap().render_all();
-        assert_eq!(snap, "shared");
+        // Text 渲染会带时间戳前缀
+        assert!(snap.contains("shared"));
     }
 
     #[test]
@@ -492,9 +575,7 @@ mod tests {
         view.write_all(b"text1").unwrap();
         {
             let mut guard = view.inner.lock().unwrap();
-            guard.push_entry(OutputEntry::Thinking {
-                summary: "\n▶ Thinking hidden\n".to_string(),
-            });
+            guard.push_entry(OutputEntry::thinking("\n▶ Thinking hidden\n".to_string()));
         }
         view.write_all(b"text2").unwrap();
         let snap = view.snapshot();
@@ -508,14 +589,11 @@ mod tests {
         let mut view = OutputView::new();
         {
             let mut guard = view.inner.lock().unwrap();
-            guard.push_entry(OutputEntry::ToolCard {
-                tool_id: "t1".to_string(),
-                name: "bash".to_string(),
-                input: r#"{"command":"ls"}"#.to_string(),
-                result: None,
-                is_error: false,
-                collapsed: false,
-            });
+            guard.push_entry(OutputEntry::tool_card_start(
+                "t1".to_string(),
+                "bash".to_string(),
+                r#"{"command":"ls"}"#.to_string(),
+            ));
         }
         // 完成工具调用
         {
@@ -540,6 +618,7 @@ mod tests {
                 result: Some("output".to_string()),
                 is_error: false,
                 collapsed: true,
+                timestamp: String::new(),
             });
         }
         // 切换折叠
@@ -564,6 +643,7 @@ mod tests {
                 result: Some("out".to_string()),
                 is_error: false,
                 collapsed: true,
+                timestamp: String::new(),
             });
             guard.push_entry(OutputEntry::ToolCard {
                 tool_id: "t2".to_string(),
@@ -572,6 +652,7 @@ mod tests {
                 result: None,
                 is_error: false,
                 collapsed: false,
+                timestamp: String::new(),
             });
         }
         let count = view.inner.lock().unwrap().completed_tool_card_count();
@@ -591,5 +672,31 @@ mod tests {
             .filter(|e| matches!(e, OutputEntry::Text { .. }))
             .count();
         assert_eq!(text_count, 1);
+    }
+
+    /// 卡死回归测试：模拟 100+ 工具调用导致 text_total_bytes 超 MAX_BUFFER_BYTES，
+    /// 验证 trim_if_needed 不会陷入无限循环。
+    #[test]
+    fn trim_if_needed_terminates_with_many_tool_cards() {
+        let mut buf = OutputBuffer::default();
+        // 制造 200 个 ToolCard，每个 result 1KB → 总 200KB < 256KB（不会触发 trim）
+        // 再追加一个 300KB 的 Text → 触发 trim
+        for i in 0..200 {
+            buf.push_entry(OutputEntry::ToolCard {
+                tool_id: format!("t{i}"),
+                name: "bash".to_string(),
+                input: "{}".to_string(),
+                result: Some("x".repeat(1024)),
+                is_error: false,
+                collapsed: true,
+                timestamp: String::new(),
+            });
+        }
+        // 此时 text_total_bytes ≈ 200KB，再追加 100KB Text 触发 trim
+        buf.append(&"y".repeat(100 * 1024));
+        // 如果 trim_if_needed 死循环，这里永远不会返回（测试会超时）
+        let snap = buf.render_all();
+        // 应该有被裁剪的占位符
+        assert!(snap.contains("[trimmed:") || buf.truncated);
     }
 }

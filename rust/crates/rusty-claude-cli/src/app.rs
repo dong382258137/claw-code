@@ -2107,6 +2107,13 @@ impl LiveCli {
         &self.session.id
     }
 
+    /// TUI 侧栏轮次统计：返回累计 AI 思考轮次（每个 turn +1）。
+    /// 底层由 `runtime::UsageTracker::turns()` 维护。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn turns_snapshot(&self) -> u32 {
+        self.runtime.usage().turns()
+    }
+
     /// Phase 2: Attach a StatusEmitter that will be injected into every
     /// subsequently-built AnthropicRuntimeClient via prepare_turn_runtime.
     /// The emitter receives streaming events (TextDelta, Usage, MessageStop,

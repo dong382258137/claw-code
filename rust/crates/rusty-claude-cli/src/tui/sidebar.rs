@@ -36,8 +36,8 @@ pub(crate) fn render_sidebar(area: Rect, buf: &mut Buffer, state: &StatusBarStat
     // Use fixed-ish proportions: usage section gets priority since it has
     // the most variable content.
     let total_h = inner.height;
-    // Reserve 6 lines for session, 4 for usage, rest for tools.
-    let session_h = total_h.min(8);
+    // Reserve 9 lines for session (新增"轮次"行), 8 for usage, rest for tools.
+    let session_h = total_h.min(9);
     let usage_h = total_h.saturating_sub(session_h).min(8);
     let tools_h = total_h.saturating_sub(session_h + usage_h);
 
@@ -117,6 +117,14 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
         Line::from(vec![
             Span::styled("穷人模式 ", Style::default().fg(Color::DarkGray)),
             Span::raw(if state.poor_mode { "启用" } else { "关闭" }),
+        ]),
+        // 新增：累计思考轮次统计（每个 turn +1）
+        Line::from(vec![
+            Span::styled("轮次 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} 累计", state.turn_count),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
