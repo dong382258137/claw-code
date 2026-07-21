@@ -1,7 +1,8 @@
 # Contributing to Claw Code
 
-Thanks for helping improve Claw Code. This repository is a Rust-first CLI
-workspace with supporting docs and compatibility fixtures.
+Thanks for helping improve Claw Code. This repository is a fork of
+[ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) (MIT License),
+maintained at [dong382258137/claw-code](https://github.com/dong382258137/claw-code).
 
 ## Ground rules
 
@@ -18,7 +19,7 @@ workspace with supporting docs and compatibility fixtures.
 ## Local setup
 
 ```bash
-git clone https://github.com/ultraworkers/claw-code
+git clone https://github.com/dong382258137/claw-code
 cd claw-code/rust
 cargo build --workspace
 cargo test --workspace
@@ -28,39 +29,38 @@ On Windows PowerShell, build from the same `rust` workspace and run the binary
 with the `.exe` suffix:
 
 ```powershell
-cd claw-code\rust
+git clone https://github.com/dong382258137/claw-code
+cd claw-code/rust
 cargo build --workspace
-.\target\debug\claw.exe --help
-```
-
-## Checks before opening a pull request
-
-Run the smallest relevant tests for your change, then the broader checks when
-you touch shared runtime, CLI, or docs surfaces:
-
-```bash
-cd rust
-cargo fmt --all --check
 cargo test --workspace
-cargo clippy --workspace
+.\target\debug\claw.exe doctor
 ```
 
-For documentation and release-readiness changes, also run:
+## Contribution workflow
 
-```bash
-python .github/scripts/check_doc_source_of_truth.py
-python .github/scripts/check_release_readiness.py
-```
+1. Open an issue describing what you want to change and why.
+2. Fork this repository and create a feature branch.
+3. Make your changes, adding or updating tests as needed.
+4. Run `cargo test --workspace` and `cargo clippy --workspace -- -D warnings`
+   before pushing.
+5. Open a pull request against the `main` branch with a clear description.
 
-## Pull request guidance
+## Code style
 
-- Describe the user-visible reason for the change.
-- List the commands you ran and any known gaps.
-- Call out compatibility risks for CLI output, JSON schemas, plugin contracts,
-  provider behavior, or Windows/PowerShell examples.
-- Keep unrelated cleanup out of feature or fix pull requests.
+- Follow the conventions already in use in each crate.
+- Use `cargo fmt` for Rust formatting.
+- Keep comments concise and useful — explain *why*, not *what*.
+- Prefer `expect` with a clear message over `unwrap` in production paths.
 
-## License
+## Testing
 
-By contributing, you agree that your contributions are licensed under the
-project's [MIT License](./LICENSE).
+- New tool or provider behavior should include at least one test.
+- Use the mock service harness (`mock-anthropic-service`) for provider-related
+  tests that need deterministic responses.
+- Tests that shell out to external commands should be gated behind
+  `#[cfg(unix)]` or `#[cfg(target_os = "windows")]` as appropriate.
+
+## Questions
+
+For questions that aren't covered here, open a GitHub Discussion or issue on
+the repository.
