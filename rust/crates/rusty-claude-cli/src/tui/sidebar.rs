@@ -217,10 +217,14 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
         Line::from(vec![
             Span::styled("  缓存  ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!(
-                "+{} / 读{}",
+                "+{} / 读{} ",
                 cum.cache_creation_input_tokens + turn.cache_creation_input_tokens,
                 cum.cache_read_input_tokens + turn.cache_read_input_tokens,
             )),
+            Span::styled(
+                format_cache_hit_rate(cum, turn),
+                cache_hit_rate_style(cum, turn),
+            ),
         ]),
         Line::from(vec![
             Span::styled("成本    ", Style::default().fg(Color::DarkGray)),
@@ -241,6 +245,39 @@ fn format_in_out(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage, is_input
         format!("{c} (+{t})")
     } else {
         format!("{c}")
+    }
+}
+
+/// 计算缓存命中率文本 (含括号),如 "(95.2%)"。
+/// 命中率 = hit / (hit + miss) * 100。
+/// 当 hit + miss = 0 (尚无缓存数据) 时返回 "(—)"。
+fn format_cache_hit_rate(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage) -> String {
+    let hit = (cum.cache_read_input_tokens as u64) + (turn.cache_read_input_tokens as u64);
+    let miss = (cum.cache_creation_input_tokens as u64) + (turn.cache_creation_input_tokens as u64);
+    let total = hit + miss;
+    if total == 0 {
+        return "(—)".to_string();
+    }
+    let rate = (hit as f64 / total as f64) * 100.0;
+    format!("({rate:.1}%)")
+}
+
+/// 命中率颜色:>=85% 绿色,60-85% 黄色,<60% 红色,无数据灰色。
+/// DeepSeek 文档建议命中率 >=85% 为良好(对应 input 价格的 1/20 计费)。
+fn cache_hit_rate_style(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage) -> Style {
+    let hit = (cum.cache_read_input_tokens as u64) + (turn.cache_read_input_tokens as u64);
+    let miss = (cum.cache_creation_input_tokens as u64) + (turn.cache_creation_input_tokens as u64);
+    let total = hit + miss;
+    if total == 0 {
+        return Style::default().fg(Color::DarkGray);
+    }
+    let rate = (hit as f64 / total as f64) * 100.0;
+    if rate >= 85.0 {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else if rate >= 60.0 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Red)
     }
 }
 
@@ -435,5 +472,80 @@ mod tests {
         assert_eq!(format_in_out(&cum, &turn_nonzero, true), "1000 (+200)");
         assert_eq!(format_in_out(&cum, &turn_zero, false), "500");
         assert_eq!(format_in_out(&cum, &turn_nonzero, false), "500 (+100)");
+    }
+
+    #[test]
+    fn format_cache_hit_rate_handles_zero_total() {
+        // 无缓存数据时显示 "—"
+        let cum = runtime::TokenUsage::default();
+        let turn = runtime::TokenUsage::default();
+        assert_eq!(format_cache_hit_rate(&cum, &turn), "(—)");
+    }
+
+    #[test]
+    fn format_cache_hit_rate_computes_percentage() {
+        // DeepSeek 场景:hit=49500, miss=500 → 命中率 99.0%
+        let cum = runtime::TokenUsage {
+            input_tokens: 0,
+            cache_creation_input_tokens: 500, // miss
+            cache_read_input_tokens: 49500,   // hit
+            ..Default::default()
+        };
+        let turn = runtime::TokenUsage::default();
+        assert_eq!(format_cache_hit_rate(&cum, &turn), "(99.0%)");
+    }
+
+    #[test]
+    fn format_cache_hit_rate_sums_cumulative_and_turn() {
+        // 累计 + 当前 turn 共同计算
+        let cum = runtime::TokenUsage {
+            cache_creation_input_tokens: 1000, // miss
+            cache_read_input_tokens: 9000,     // hit
+            ..Default::default()
+        };
+        let turn = runtime::TokenUsage {
+            cache_creation_input_tokens: 500, // miss
+            cache_read_input_tokens: 500,     // hit
+            ..Default::default()
+        };
+        // 命中率 = (9000 + 500) / (1000 + 9000 + 500 + 500) = 9500 / 11000 ≈ 86.4%
+        assert_eq!(format_cache_hit_rate(&cum, &turn), "(86.4%)");
+    }
+
+    #[test]
+    fn cache_hit_rate_style_returns_correct_color() {
+        use ratatui::style::Color;
+
+        // 无数据 → 灰色
+        let empty = runtime::TokenUsage::default();
+        let style = cache_hit_rate_style(&empty, &empty);
+        assert_eq!(style.fg, Some(Color::DarkGray));
+
+        // 高命中率 (>=85%) → 绿色 + 粗体
+        let high_hit = runtime::TokenUsage {
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: 900,
+            ..Default::default()
+        };
+        let style = cache_hit_rate_style(&high_hit, &empty);
+        assert_eq!(style.fg, Some(Color::Green));
+
+        // 中等命中率 (60-85%) → 黄色
+        let mid_hit = runtime::TokenUsage {
+            cache_creation_input_tokens: 400,
+            cache_read_input_tokens: 600,
+            ..Default::default()
+        };
+        let style = cache_hit_rate_style(&mid_hit, &empty);
+        assert_eq!(style.fg, Some(Color::Yellow));
+
+        // 低命中率 (<60%) → 红色
+        let low_hit = runtime::TokenUsage {
+            cache_creation_input_tokens: 800,
+            cache_read_input_tokens: 200,
+            ..Default::default()
+        };
+        let style = cache_hit_rate_style(&low_hit, &empty);
+        assert_eq!(style.fg, Some(Color::Red));
     }
 }

@@ -105,12 +105,14 @@ async fn openai_compat_reads_deepseek_native_cache_fields_non_streaming() {
         .await
         .expect("deepseek request should succeed");
 
-    // DeepSeek 语义：hit → cache_read，miss → input_tokens (非缓存部分)
+    // DeepSeek 语义：hit → cache_read，miss → cache_creation_input_tokens
+    // (miss 既是 LLM 实际处理的输入按 input 价计费,也是写入缓存的 token 用于命中率统计;
+    //  input_tokens 设为 0,因为 DeepSeek 的 prompt 全部归入 hit + miss,无裸输入)
     assert_eq!(response.usage.cache_read_input_tokens, 49500);
-    assert_eq!(response.usage.input_tokens, 500);
-    assert_eq!(response.usage.cache_creation_input_tokens, 0);
+    assert_eq!(response.usage.input_tokens, 0);
+    assert_eq!(response.usage.cache_creation_input_tokens, 500);
     assert_eq!(response.usage.output_tokens, 120);
-    // total = hit + miss + output = 49500 + 500 + 120 = 50120
+    // total = 0 (input) + 500 (cache_creation) + 49500 (cache_read) + 120 (output) = 50120
     assert_eq!(response.total_tokens(), 50120);
 }
 
@@ -163,9 +165,9 @@ async fn openai_compat_reads_deepseek_native_cache_fields_streaming() {
         _ => panic!("expected MessageDelta event with usage"),
     };
     assert_eq!(delta_event.cache_read_input_tokens, 19904);
-    assert_eq!(delta_event.input_tokens, 10107);
+    assert_eq!(delta_event.input_tokens, 0);
     assert_eq!(delta_event.output_tokens, 190);
-    assert_eq!(delta_event.cache_creation_input_tokens, 0);
+    assert_eq!(delta_event.cache_creation_input_tokens, 10107);
 }
 
 #[tokio::test]

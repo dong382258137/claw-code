@@ -158,6 +158,11 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
         });
     }
     // DeepSeek 系列
+    // DeepSeek 的 prompt_cache_hit_tokens 按 input 价格的 1/20 计费 (cache_read_cost = 0.014),
+    // prompt_cache_miss_tokens 按 input 价计费。
+    // 映射上 miss 同时填入 input_tokens=0 + cache_creation_input_tokens=miss (见 openai_compat.rs),
+    // 所以 cache_creation_cost_per_million 必须等于 input_cost_per_million,
+    // 否则 miss 部分不计费会导致成本严重低估。
     if normalized.contains("deepseek-reasoner")
         || normalized.contains("deepseek-r1")
         || normalized.contains("deepseekr1")
@@ -165,8 +170,8 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
         return Some(ModelPricing {
             input_cost_per_million: 0.55,
             output_cost_per_million: 2.19,
-            cache_creation_cost_per_million: 0.0,
-            cache_read_cost_per_million: 0.0,
+            cache_creation_cost_per_million: 0.55,
+            cache_read_cost_per_million: 0.014,
         });
     }
     if normalized.contains("deepseek-chat")
@@ -176,8 +181,8 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
         return Some(ModelPricing {
             input_cost_per_million: 0.27,
             output_cost_per_million: 1.1,
-            cache_creation_cost_per_million: 0.0,
-            cache_read_cost_per_million: 0.0,
+            cache_creation_cost_per_million: 0.27,
+            cache_read_cost_per_million: 0.014,
         });
     }
     None

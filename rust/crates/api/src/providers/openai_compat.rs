@@ -830,13 +830,20 @@ struct OpenAiPromptTokensDetails {
 impl OpenAiUsage {
     fn normalized(&self) -> Usage {
         // DeepSeek 原生字段优先：当 hit 或 miss > 0 时，直接用 DeepSeek 的语义。
-        // - cache_read_input_tokens = prompt_cache_hit_tokens
-        // - input_tokens (非缓存输入) = prompt_cache_miss_tokens
+        // - cache_read_input_tokens = prompt_cache_hit_tokens (命中缓存读取)
+        // - cache_creation_input_tokens = prompt_cache_miss_tokens (未命中,会被写入缓存供下次使用)
+        // - input_tokens = 0 (DeepSeek 的 prompt 全部归入 hit + miss,没有"既不缓存也不读"的裸输入)
+        //
+        // 这样映射使 total_tokens = hit + miss + output 与 DeepSeek 官方 total_tokens 一致,
+        // 同时让 cache_creation_input_tokens 反映缓存写入量,用于命中率统计与 "+X" 显示。
+        // 成本侧:DeepSeek miss 按 input 价计费,在 usage.rs 中 cache_creation_cost_per_million
+        // 设为与 input_cost_per_million 相同的值,使成本计算正确。
+        //
         // 否则回退到 OpenAI 标准：从 prompt_tokens_details.cached_tokens 推导。
         if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
             Usage {
-                input_tokens: self.prompt_cache_miss_tokens,
-                cache_creation_input_tokens: 0,
+                input_tokens: 0,
+                cache_creation_input_tokens: self.prompt_cache_miss_tokens,
                 cache_read_input_tokens: self.prompt_cache_hit_tokens,
                 output_tokens: self.completion_tokens,
             }
