@@ -20,6 +20,26 @@
 
 ---
 
+## 模块细化分支索引
+
+> 本主文档作为 v1.0 基线(commit `3cbe180`),三大模块各拆分为独立细化文档进行竖叉分支迭代。
+> 主文档保持架构总览与协同设计不变,各分支文档承载具体的 API 设计、代码骨架、测试用例与实施细节。
+
+| 分支 | 文档路径 | 状态 | 当前版本 | 焦点 |
+|:-:|---|:-:|:-:|---|
+| **IDE 集成** | [docs/modules/ide-integration-detail.md](./modules/ide-integration-detail.md) | 🚧 v0.1 | — | ACP 1.5 升级路径 + ClawAgent 扩展 + LaneEvent 桥接 + VS Code 扩展骨架 |
+| **Hooks 系统** | [docs/modules/hooks-system-detail.md](./modules/hooks-system-detail.md) | 🚧 v0.1 | — | 10 事件 × 4 Handler + HookRunner 异步引擎 + run_turn 7 集成点 + 配置示例 |
+| **DAG 编排** | [docs/modules/dag-orchestration-detail.md](./modules/dag-orchestration-detail.md) | 🚧 v0.1 | — | petgraph 数据结构 + JoinSet 分层调度 + Plan→DAG 转换 + Checkpointer + YAML 声明式 |
+
+### 分支迭代策略
+
+1. **独立演进**:每个分支文档独立版本号(v0.1 → v1.0),不强制与主文档同步
+2. **回写机制**:分支稳定后,关键决策回写主文档对应章节(标注 `[synced from <branch> v<x.x>]`)
+3. **冲突优先**:分支与主文档冲突时,以分支为准(分支承载最新设计)
+4. **合并节点**:三分支均达 v1.0 后,合并为 v2.0 主文档,启动 P0 实现阶段
+
+---
+
 ## 一、总体架构与设计原则
 
 ### 1.1 三模块定位
