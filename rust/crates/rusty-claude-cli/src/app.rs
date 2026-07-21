@@ -612,13 +612,25 @@ impl LiveCli {
         additional_workspace_roots: Vec<PathBuf>,
         output_verbosity: OutputVerbosity,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(feature = "full-tui")]
+        crate::diag_log(&format!("[LiveCli::new] start, model={model}"));
         let t0 = std::time::Instant::now();
+        #[cfg(feature = "full-tui")]
+        crate::diag_log("[LiveCli::new] calling build_system_prompt");
         let system_prompt = build_system_prompt(&model)?;
+        #[cfg(feature = "full-tui")]
+        crate::diag_log("[LiveCli::new] build_system_prompt OK");
         let t_sp = t0.elapsed();
         let session_state = new_cli_session_with_roots(additional_workspace_roots)?;
+        #[cfg(feature = "full-tui")]
+        crate::diag_log("[LiveCli::new] new_cli_session_with_roots OK");
         let t_sess = t0.elapsed();
         let session = create_managed_session_handle(&session_state.session_id)?;
+        #[cfg(feature = "full-tui")]
+        crate::diag_log("[LiveCli::new] create_managed_session_handle OK");
         let t_handle = t0.elapsed();
+        #[cfg(feature = "full-tui")]
+        crate::diag_log("[LiveCli::new] calling build_runtime");
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
@@ -2222,16 +2234,25 @@ impl LiveCli {
 // ===== Block B: build_system_prompt / load_prompt_extras / is_broad_working_directory (main.rs lines 2626-2750) =====
 
 pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "full-tui")]
+    crate::diag_log(&format!("[build_system_prompt] start, model={model}"));
     let cwd = env::current_dir()?;
+    #[cfg(feature = "full-tui")]
+    crate::diag_log(&format!("[build_system_prompt] cwd={}", cwd.display()));
     let extras = load_prompt_extras(&cwd);
-    Ok(load_system_prompt_with_extras(
+    #[cfg(feature = "full-tui")]
+    crate::diag_log("[build_system_prompt] load_prompt_extras OK, calling load_system_prompt_with_extras");
+    let result = load_system_prompt_with_extras(
         cwd,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
         model_family_identity_for(model),
         extras,
-    )?)
+    )?;
+    #[cfg(feature = "full-tui")]
+    crate::diag_log("[build_system_prompt] load_system_prompt_with_extras OK");
+    Ok(result)
 }
 
 /// Load optional system prompt extras (persistent memory + repository map).

@@ -8,6 +8,42 @@
 use rusty_claude_cli::{classify_error_kind, run, split_error_hint};
 
 fn main() {
+    // 诊断：注册 panic hook，落盘到 ~/.claw/claw-crash.log
+    // 双击运行时 stderr 不可见，panic hook 是唯一能确认"是否 panic"的可靠信号。
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic>".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let claw_dir = home.join(".claw");
+        let _ = std::fs::create_dir_all(&claw_dir);
+        let crash_path = claw_dir.join("claw-crash.log");
+        let _ = std::fs::write(
+            &crash_path,
+            format!(
+                "PANIC at {location}\nMessage: {msg}\nTimestamp: {}\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ),
+        );
+        eprintln!("thread panicked at {location}: {msg}");
+        eprintln!("Crash log: {}", crash_path.display());
+    }));
+
     if let Err(error) = run() {
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream

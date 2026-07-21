@@ -401,6 +401,26 @@ pub fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
 /// hand off to `tui::run_tui_repl`. Only compiled when `full-tui` feature is on;
 /// without the feature, the dispatch in `run()` prints an error and exits.
 #[cfg(feature = "full-tui")]
+pub(crate) fn diag_log(msg: &str) {
+    use std::io::Write;
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let claw_dir = home.join(".claw");
+    let _ = std::fs::create_dir_all(&claw_dir);
+    let path = claw_dir.join("claw-diag.log");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{ts}] {msg}");
+        let _ = f.flush();
+    }
+}
+
+#[cfg(feature = "full-tui")]
 #[allow(clippy::too_many_arguments)] // Stage 1 验收:8 参数超 clippy 默认上限 7,与 run_repl 同策略,重构参数到 struct 待 Stage 2 处理。
 pub fn run_tui_repl_entry(
     model: String,
@@ -412,27 +432,36 @@ pub fn run_tui_repl_entry(
     additional_workspace_roots: Vec<PathBuf>,
     output_verbosity: OutputVerbosity,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    diag_log("run_tui_repl_entry start");
     // ---- First-run wizard pre-check ----------------------------------------
     //
     // On first launch, present the configuration wizard. Once the user
     // completes it, create a sentinel file so subsequent runs skip the wizard.
     // If the user quits the wizard, propagate the error to exit cleanly.
     if !runtime::is_bootstrapped() {
+        diag_log("not bootstrapped, checking wizard settings");
         // If settings.json has wizard config but we're missing the sentinel
         // (e.g. config was copied from another machine), inject env vars and
         // create the sentinel without showing the wizard again.
         if let Some(saved) = runtime::load_wizard_settings() {
+            diag_log("found saved wizard settings, injecting env vars");
             inject_wizard_env_vars(&saved);
             let _ = runtime::mark_bootstrapped();
         } else {
+            diag_log("no saved settings, running first-run wizard");
             tui::wizard::run_first_run_wizard()?;
+            diag_log("wizard completed OK");
         }
     }
     // ---- End wizard pre-check -------------------------------------------
 
+    diag_log("calling enforce_broad_cwd_policy");
         enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    diag_log("calling correct_cwd_from_target_dir");
     correct_cwd_from_target_dir();
+    diag_log("calling run_stale_base_preflight");
     run_stale_base_preflight(base_commit.as_deref());
+    diag_log("calling build_live_cli_for_repl");
     let cli = build_live_cli_for_repl(
         model,
         allowed_tools,
@@ -441,6 +470,7 @@ pub fn run_tui_repl_entry(
         output_verbosity,
         reasoning_effort,
     )?;
+    diag_log("build_live_cli_for_repl OK, entering TUI");
     tui::app::run_tui_repl(cli)
 }
 

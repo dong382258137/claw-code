@@ -651,10 +651,22 @@ impl RuntimePluginConfig {
 
 #[must_use]
 /// Returns the default per-user config directory used by the runtime.
+///
+/// Resolution order:
+/// 1. `CLAW_CONFIG_HOME` env var (explicit override)
+/// 2. `HOME` env var + `.claw` (Unix convention, also set by Git Bash / MSYS2)
+/// 3. `USERPROFILE` env var + `.claw` (Windows convention — `HOME` is rarely
+///    set on native Windows, so without this fallback we'd get a relative
+///    `.claw` path that depends on cwd, causing config files to scatter
+///    across different working directories and wizard sentinel files to
+///    be lost. This was the root cause of the "double-click claw.exe crashes
+///    after wizard" bug.)
+/// 4. Relative `.claw` (last resort — only if none of the above are set)
 pub fn default_config_home() -> PathBuf {
     std::env::var_os("CLAW_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".claw")))
         .unwrap_or_else(|| PathBuf::from(".claw"))
 }
 
