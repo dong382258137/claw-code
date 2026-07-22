@@ -690,7 +690,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
     runtime_tools.push(RuntimeToolDefinition {
         name: "log_decision".to_string(),
         description: Some(
-            "Record a software repair decision into the persistent decision log.              Stores the problem signature, root cause hypothesis, applied solution,              affected files, and verification result for future reference.              Use this after you have applied a fix and verified it works, so future              sessions can learn from this experience.".to_string(),
+            "Record a software repair decision into the persistent decision log (.claw/decision_log.db, survives across sessions). MUST call after applying a non-trivial fix AND verifying it works (tests pass / user confirms / command succeeds). Stores problem_signature, root_cause_hypothesis, applied_solution, affected_files, verification_result. Also call with verification_result='Refuted' for failed attempts — negative experience is equally valuable. Skip for trivial changes (typo/formatting/rename). Future sessions search this log to avoid repeating diagnosis work.".to_string(),
         ),
         input_schema: serde_json::json!({
             "type": "object",
@@ -739,7 +739,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
     runtime_tools.push(RuntimeToolDefinition {
         name: "search_past_decisions".to_string(),
         description: Some(
-            "Search past software repair decisions using full-text search.              Returns matching decisions with the problem signature, root cause hypothesis,              applied solution, affected files, verification result, and success rate.              Use this before attempting a fix to check if a similar problem was solved              before, saving time and avoiding repeated mistakes.".to_string(),
+            "Search past software repair decisions using full-text search (BM25-ranked). SHOULD call BEFORE attempting any non-trivial fix — pass a short problem signature as query. Returns matching decisions with problem_signature, root_cause_hypothesis, applied_solution, affected_files, verification_result, and success_rate. If a match exists with high success_rate, reuse the solution instead of rediscovering it; if matches show 'Refuted' solutions, avoid those approaches. Saves time and avoids repeating past mistakes.".to_string(),
         ),
         input_schema: serde_json::json!({
             "type": "object",

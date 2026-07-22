@@ -274,7 +274,9 @@ impl Notebook {
             "# Working Memory (NOTEBOOK.md)\n\
              以下是持久化的工作记忆,跨压缩不会丢失。\
              使用 `notebook_update` 工具维护本记忆。\n\n\
-             {}",
+             {}\n\n\
+             提示:完成非平凡修复后,调用 `log_decision` 持久化经验(问题签名+根因+方案+验证结果);\
+             开始非平凡修复前,先 `search_past_decisions` 查是否遇到过类似问题。",
             parts.join("\n\n")
         )
     }

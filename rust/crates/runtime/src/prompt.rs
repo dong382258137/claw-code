@@ -325,6 +325,7 @@ impl SystemPromptBuilder {
         sections.push(get_actions_section());
         sections.push(get_memory_verification_section());
         sections.push(get_context_recovery_section());
+        sections.push(get_decision_log_section());
         if let Some(memory) = &self.persistent_memory {
             sections.push(render_persistent_memory_section(memory));
         }
@@ -855,6 +856,26 @@ fn get_context_recovery_section() -> String {
      - If you don't have the tool_use_id, call `recall_full` with `{\"list_only\": true}` to list all archived tool results.\n\
      - Use `session_search` to search across all conversation history (including compacted messages). Results are truncated to 500 chars; if a result looks relevant but incomplete, refine your query.\n\
      - After context compaction, earlier messages are replaced by a summary. Use `session_search` to find specific past discussions, decisions, or file references that may have been compacted."
+        .to_string()
+}
+
+/// DecisionLog 工具使用教程段(Phase 4-D 信号通道修复)。
+///
+/// 与 `get_context_recovery_section` 同模式:静态注入到 system prompt,
+/// 让 LLM 知道 **何时** 应该调用 `log_decision` / `search_past_decisions`。
+/// 修复 DecisionLog"有基础设施无引导"的问题:之前 LLM 只能在 tool list 的
+/// description 里看到这两个工具,信号过弱导致几乎从不主动调用。
+///
+/// 放在 boundary 之前(静态段),与 `get_context_recovery_section` 一同构成
+/// "工具使用教程"区,且 session 内字节稳定,不影响 prompt cache。
+fn get_decision_log_section() -> String {
+    "## Decision Experience (DecisionLog)\n\
+     You have access to a persistent repair decision log (`.claw/decision_log.db`) that survives across sessions.\n\
+     \n\
+     - BEFORE attempting a non-trivial fix (especially for errors, bugs, or root-cause analysis), call `search_past_decisions` with a short problem signature to check if a similar problem was solved before. If a match exists with high success_rate, reuse the solution instead of rediscovering it.\n\
+     - AFTER applying a fix AND verifying it works (tests pass / user confirms / command succeeds), call `log_decision` with: `problem_signature`, `root_cause_hypothesis`, `applied_solution`, `affected_files`, and `verification_result`. This records the experience for future sessions.\n\
+     - Even if a fix FAILED, still call `log_decision` with `verification_result=\"Refuted\"` — negative experience is equally valuable for avoiding repeated mistakes.\n\
+     - Skip `log_decision` for trivial changes (typo fixes, formatting, rename) — it is meant for non-obvious repairs that took diagnosis."
         .to_string()
 }
 
