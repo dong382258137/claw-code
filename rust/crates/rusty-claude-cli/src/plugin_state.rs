@@ -791,6 +791,20 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
     });
 
+    // Phase 4-C: register rollback_transaction + transaction_status tools.
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "rollback_transaction".to_string(),
+        description: Some("Rollback all file modifications made in the current turn. Restores the working tree to its pre-turn state using git stash or file snapshots. Use when you realize the current approach is wrong and want to start fresh.".to_string()),
+        input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        required_permission: PermissionMode::WorkspaceWrite,
+    });
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "transaction_status".to_string(),
+        description: Some("Check the current transaction status: whether a snapshot is active, which files have been modified this turn, and whether the environment supports rollback (git repo / detached HEAD / non-git).".to_string()),
+        input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        required_permission: PermissionMode::ReadOnly,
+    });
+
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {

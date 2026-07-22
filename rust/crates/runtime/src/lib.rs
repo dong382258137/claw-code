@@ -61,6 +61,7 @@ pub mod tool_result_archive;
 pub mod project_topology;
 pub mod recovery_orchestrator;
 pub mod recovery_recipes;
+pub mod vcs_snapshot;
 // Harness O(编排)层 + V(验证)层:Plan/Execute/Review 三段循环。
 // 默认不启用,需通过 CLI `--enable-plan-mode` 或 settings.json `planMode: true` 开启。
 // 缓存保护:PlanArtifact 末尾追加到 prompt 变动区,详见 docs/harness-engineering-optimization-plan.md §5.2。
@@ -133,6 +134,8 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use decision_log::{compute_simhash, hamming_distance, DecisionLog, DecisionLogError};
+pub use vcs_snapshot::{RefactorTransaction, TransactionStatus, VcsError};
+
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_from_env_opt, ApiClient,
     ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,

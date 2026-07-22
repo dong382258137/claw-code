@@ -415,6 +415,7 @@ pub struct ConversationRuntime<C, T> {
     pending_remediation: Option<String>,
     decision_log: Option<crate::decision_log::DecisionLog>,
     project_topology: Option<std::sync::Arc<crate::project_topology::ProjectTopology>>,
+    refactor_tx: Option<crate::vcs_snapshot::RefactorTransaction>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -485,6 +486,7 @@ where
             pending_remediation: None,
             decision_log: None,
             project_topology: None,
+            refactor_tx: None,
         }
     }
 
@@ -622,6 +624,12 @@ where
         topo: std::sync::Arc<crate::project_topology::ProjectTopology>,
     ) -> Self {
         self.project_topology = Some(topo);
+        self
+    }
+
+    #[must_use]
+    pub fn with_refactor_transaction(mut self, tx: crate::vcs_snapshot::RefactorTransaction) -> Self {
+        self.refactor_tx = Some(tx);
         self
     }
 
@@ -1441,6 +1449,16 @@ where
                             }
                         } else if tool_name == "get_symbol_info" {
                             match self.execute_get_symbol_info(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "rollback_transaction" {
+                            match self.execute_rollback_transaction() {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "transaction_status" {
+                            match self.execute_transaction_status() {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
@@ -2387,6 +2405,29 @@ where
         t.get_symbol_info(s)
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
     }
+
+    fn execute_rollback_transaction(
+        &mut self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(tx) = &mut self.refactor_tx else {
+            return Ok("rollback_transaction not available.".to_string());
+        };
+        tx.rollback()
+            .map(|s| s)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+    }
+
+    fn execute_transaction_status(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(tx) = &self.refactor_tx else {
+            return Ok("transaction_status not available.".to_string());
+        };
+        let status = tx.status();
+        Ok(serde_json::to_string_pretty(&status)
+            .unwrap_or_else(|e| format!("status serialization error: {e}")))
+    }
+
 
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
