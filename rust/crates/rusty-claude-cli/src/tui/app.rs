@@ -166,102 +166,95 @@ fn fast_hash(s: &str) -> u64 {
     std::hash::Hash::hash(s, &mut hasher);
     std::hash::Hasher::finish(&hasher)
 }
-
-/// 增量 markdown 渲染器 — 解决流式输出性能瓶颈。
+/// 增量 markdown 渲染器 v2 — Arc 共享 + 折行缓存。
 ///
-/// **核心思路**：markdown 段落以 `\n\n` 为安全边界。已完成的段落
-/// （最后一个 `\n\n` 之前的部分）只渲染一次并缓存；未完成的段落
-/// （最后一个 `\n\n` 之后的部分）每次重新渲染，但通常很短（< 1KB），
-/// 渲染耗时 < 1ms。
-///
-/// **性能对比**（64KB buffer，每 50ms 一次 draw）：
-/// - 旧方案：每次全量 pulldown-cmark + syntect 高亮，单次 ~20-100ms
-/// - 新方案：增量路径 O(1) 命中缓存 / 未完成段落 < 1ms，单次 < 2ms
-///
-/// **正确性**：
-/// - 段落边界推进时，新增段落渲染并 append 到 completed_lines
-/// - pending 部分每次重新渲染（短），并做 hash 缓存避免短时间重复
-/// - buffer 被 trim/清空时（snapshot.len() < completed_bytes 或
-///   split_pos < completed_bytes）自动重置
-/// - 整个 snapshot 未变时（hash 命中）直接返回缓存的 Text
+/// v2 优化：
+/// - completed_lines 用 Arc 存储，帧间零拷贝
+/// - 显示行折行按 width 缓存，避免每帧 O(N) 重折
+/// - 完整缓存命中时（snapshot + width 均未变），所有路径 O(1)
 struct IncrementalRenderer {
     renderer: TerminalRenderer,
-    /// 已渲染完成的段落行（已处理到 `completed_bytes` 字节位置）。
-    completed_lines: Vec<Line<'static>>,
-    /// 已处理的字节位置（指向最后一个 `\n\n` 之后）。
+    /// 已完成段落行（Arc 共享，帧间零拷贝）。
+    completed_lines: Arc<Vec<Line<'static>>>,
     completed_bytes: usize,
-    /// 未完成段落的 hash 缓存，避免短时间重复渲染。
     pending_cache: Option<(u64, Vec<Line<'static>>)>,
-    /// 上次完整渲染的 hash + Text。整个 snapshot 未变时直接 clone 返回。
     full_cache: Option<(u64, Text<'static>)>,
+    /// (content_width, wrapped_lines) 折行缓存
+    wrapped_cache: Option<(usize, Arc<Vec<Line<'static>>>)>,
 }
 
 impl IncrementalRenderer {
     fn new() -> Self {
         Self {
             renderer: TerminalRenderer::new(),
-            completed_lines: Vec::new(),
+            completed_lines: Arc::new(Vec::new()),
             completed_bytes: 0,
             pending_cache: None,
             full_cache: None,
+            wrapped_cache: None,
         }
     }
 
-    /// 渲染当前 snapshot 为 ratatui Text。
-    fn render(&mut self, snapshot: &str) -> Text<'static> {
-        // 空快照：重置并返回空 Text。
+    /// 渲染并返回 (Text, 已折行 Arc)。content_width 变化时自动重建折行缓存。
+    fn render_wrapped(
+        &mut self,
+        snapshot: &str,
+        content_width: usize,
+    ) -> (Text<'static>, Arc<Vec<Line<'static>>>) {
         if snapshot.is_empty() {
             self.reset();
-            return Text::default();
+            return (Text::default(), Arc::new(Vec::new()));
         }
 
-        // 快速路径：整个 snapshot hash 相同 → 返回完整缓存。
-        // 流式等待 API 响应、用户滚动时 snapshot 不变，此路径命中。
         let total_hash = fast_hash(snapshot);
+
+        // 完整缓存命中：snapshot + width 均未变 → 两个缓存都直接返回。
         if let Some((h, ref text)) = self.full_cache {
             if h == total_hash {
-                return text.clone();
+                if let Some((w, ref wrapped)) = self.wrapped_cache {
+                    if w == content_width {
+                        return (text.clone(), Arc::clone(wrapped));
+                    }
+                }
+                // snapshot 未变但 width 变了：Text 可复用，但 wrapping 需重建。
+                let lines: Vec<Line<'static>> = text
+                    .lines
+                    .iter()
+                    .flat_map(|line| wrap_line_to_display_lines(line, content_width))
+                    .collect();
+                let wrapped = Arc::new(lines);
+                self.wrapped_cache = Some((content_width, Arc::clone(&wrapped)));
+                return (text.clone(), wrapped);
             }
         }
 
-        // 找到最后一个段落分隔符 `\n\n` 的位置（+2 跳过 \n\n）。
-        // 这是 markdown 的"安全边界"——之前的段落已完整，可以缓存。
         let split_pos = snapshot.rfind("\n\n").map(|p| p + 2).unwrap_or(0);
-
-        // 检测 buffer 被裁剪/清空：
-        // - snapshot.len() < completed_bytes：buffer 缩短（trim 触发）
-        // - split_pos < completed_bytes：段落边界回退（buffer 头部被改）
         if snapshot.len() < self.completed_bytes || split_pos < self.completed_bytes {
             self.reset();
         }
 
-        // 处理新增的完成段落：从 completed_bytes 到 split_pos。
-        // 这部分文本已经完整（以 \n\n 结尾），渲染一次后永久缓存。
         if split_pos > self.completed_bytes {
             let new_completed = &snapshot[self.completed_bytes..split_pos];
             if !new_completed.is_empty() {
                 let ansi = self.renderer.markdown_to_ansi(new_completed);
-                match ansi.into_text() {
-                    Ok(text) => self.completed_lines.extend(text.lines),
-                    Err(_) => self
-                        .completed_lines
-                        .push(Line::raw(new_completed.to_string())),
-                }
+                let new_lines: Vec<Line<'static>> = match ansi.into_text() {
+                    Ok(text) => text.lines,
+                    Err(_) => vec![Line::raw(new_completed.to_string())],
+                };
+                let completed = Arc::make_mut(&mut self.completed_lines);
+                completed.extend(new_lines);
             }
             self.completed_bytes = split_pos;
-            // 段落边界推进，pending 缓存失效。
             self.pending_cache = None;
         }
 
-        // 限制 completed 行数（防止超长对话导致无限增长）。
-        // 超过上限时从头部淘汰（旧对话历史）。
         const MAX_COMPLETED_LINES: usize = 2000;
         if self.completed_lines.len() > MAX_COMPLETED_LINES {
             let drain = self.completed_lines.len() - MAX_COMPLETED_LINES;
-            self.completed_lines.drain(0..drain);
+            let completed = Arc::make_mut(&mut self.completed_lines);
+            completed.drain(0..drain);
         }
 
-        // 渲染未完成段落（split_pos 之后的部分，通常 < 1KB）。
         let pending = &snapshot[self.completed_bytes..];
         let pending_lines: Vec<Line<'static>> = if pending.is_empty() {
             Vec::new()
@@ -280,18 +273,27 @@ impl IncrementalRenderer {
             }
         };
 
-        // 合并 completed + pending。
-        let mut all_lines = self.completed_lines.clone();
-        all_lines.extend(pending_lines);
+        let mut all_lines: Vec<Line<'static>> = (*self.completed_lines).clone();
+        all_lines.extend(pending_lines.clone());
         let result = Text::from(all_lines);
-
-        // 缓存完整结果（下次 snapshot 未变时直接 clone 返回）。
         self.full_cache = Some((total_hash, result.clone()));
 
-        result
+        // Build wrapped lines for this frame
+        let wrapped_vec: Vec<Line<'static>> = result
+            .lines
+            .iter()
+            .flat_map(|line| wrap_line_to_display_lines(line, content_width))
+            .collect();
+        let wrapped = Arc::new(wrapped_vec);
+
+        // Cache wrapped lines when pending is empty (stable state)
+        if pending_lines.is_empty() {
+            self.wrapped_cache = Some((content_width, Arc::clone(&wrapped)));
+        }
+
+        (result, wrapped)
     }
 
-    /// markdown 字符串 → ratatui Vec<Line>（失败时降级为纯文本）。
     fn render_to_lines(&self, text: &str) -> Vec<Line<'static>> {
         if text.is_empty() {
             return Vec::new();
@@ -303,12 +305,12 @@ impl IncrementalRenderer {
         }
     }
 
-    /// 重置所有缓存（buffer 被裁剪/清空时调用）。
     fn reset(&mut self) {
-        self.completed_lines.clear();
+        self.completed_lines = Arc::new(Vec::new());
         self.completed_bytes = 0;
         self.pending_cache = None;
         self.full_cache = None;
+        self.wrapped_cache = None;
     }
 }
 
@@ -562,6 +564,7 @@ fn run_event_loop(
     // draw 闭包每次渲染后更新这两个值。
     let mut last_main_area: Rect = Rect::default();
     let mut last_scroll_y: u16 = 0;
+    let mut needs_redraw: bool = true;
 
     'main_loop: loop {
         // 处理 AskUserQuestion 请求：worker 线程通过 ask handler 投递的待回答问题。
@@ -744,8 +747,12 @@ fn run_event_loop(
             }
         }
 
-        // Render
-        terminal.draw(|f| {
+        // Render — only when needed or streaming
+        {
+            let streaming = turn_rx.is_some();
+            if needs_redraw || streaming {
+                needs_redraw = false;
+                terminal.draw(|f| {
             // Top-level vertical layout: main row (output+input) + status bar.
             // 动态输入区高度：根据当前 buffer 的显示行数调整。
             // - 最少 3 行（1 border + 至少 2 内容行）
@@ -816,36 +823,14 @@ fn run_event_loop(
                 outer[0]
             };
 
-            // Output area
-            // 增量渲染：已完成段落永久缓存，只有最后一个未完成段落重新
-            // 渲染。流式时单次 draw 从 20-100ms 降到 < 2ms。
+            // Output area — 增量渲染 v2
             let output_text = output_view.snapshot();
-            let output_rendered: Text<'static> = incremental.render(&output_text);
+            let visible_height = main_area.height.saturating_sub(2) as usize;
+            let content_width = main_area.width as usize;
+            let (_output_rendered, wrapped_lines_arc) =
+                incremental.render_wrapped(&output_text, content_width);
 
-            // Bug fix（输出最后一行被输入框覆盖）：
-            // 旧实现用 `Paragraph::new(text).scroll((y,0)).wrap(Wrap{...})`，
-            // 自己用 `ceil(line_width / area_width)` 按字符 wrap 计算显示行数。
-            // 但 ratatui 的 WordWrapper 按 word 边界折行（遇到空格才断），
-            // 英文长段落中 word 放不下时换行留下行尾空白，实际显示行数比
-            // 字符 wrap 更多 → 我们的 total_display_lines 偏小 → max_scroll
-            // 偏小 → follow mode 下 scroll_y 不足以滚到真正底部，Paragraph
-            // 顶部渲染把最后几显示行裁掉，看起来像"最后一行被输入框盖住"。
-            //
-            // 徹底修复：不再依赖 Paragraph 的 .wrap() + .scroll()，改为
-            // 自己按字符 wrap（保留 span 样式边界）+ 自己裁剪要显示的行，
-            // 传给 Paragraph 时不用 .wrap() 和 .scroll()。这样显示行数计算
-            // 与实际渲染 100% 一致，scroll_y 永远准确。
-            //
-            // 性能：按字符 wrap 比按 word wrap 略快（不需查 word 边界），
-            // 且只需遍历一次 graphemes。对 64KB buffer（~1000 行）单次 < 2ms。
-            let visible_height = main_area.height.saturating_sub(2) as usize; // -1 border, -1 safety margin
-            let content_width = main_area.width as usize; // Block 只有 TOP border，无左右 border
-            let wrapped_lines: Vec<Line<'static>> = output_rendered
-                .lines
-                .iter()
-                .flat_map(|line| wrap_line_to_display_lines(line, content_width))
-                .collect();
-            let total_display_lines = wrapped_lines.len();
+            let total_display_lines = wrapped_lines_arc.len();
             let max_scroll = total_display_lines.saturating_sub(visible_height);
             let scroll_y = match scroll_offset {
                 None => max_scroll,
@@ -855,15 +840,14 @@ fn run_event_loop(
                 None => String::new(),
                 Some(offset) => format!(" [scroll -{offset}]"),
             };
-            // 裁剪要显示的行：从 scroll_y 开始取 visible_height 行。
-            // scroll_y 可能等于 total_display_lines（空 buffer），此时 start == end，渲染空。
             let start = scroll_y.min(total_display_lines);
             let end = (start + visible_height).min(total_display_lines);
             let visible_lines: Vec<Line<'static>> = if start < end {
-                wrapped_lines[start..end].to_vec()
+                wrapped_lines_arc[start..end].to_vec()
             } else {
                 Vec::new()
             };
+            // scroll_y 可能等于 total_display_lines（空 buffer），此时 start == end，渲染空。
             let output_paragraph = Paragraph::new(Text::from(visible_lines))
                 .block(
                     Block::default()
@@ -980,6 +964,8 @@ fn run_event_loop(
             last_main_area = main_area;
             last_scroll_y = scroll_y as u16;
         })?;
+            }
+        }
 
         // Poll for events (shorter timeout during streaming for responsive rendering)
         let poll_timeout = if turn_rx.is_some() {
@@ -1014,10 +1000,12 @@ fn run_event_loop(
                 paste_diag_log(&format!("  drain done: insert @path={:?}", at_path));
                 input.insert_paste(&at_path);
             }
+            needs_redraw = true;
         }
 
         if event::poll(poll_timeout)? {
             let ev = event::read()?;
+            needs_redraw = true;
             // 诊断日志：记录所有收到的 Event 类型（特别是 KeyEvent 和 Paste），
             // 用于确认 Windows Terminal 中 Ctrl+V 粘贴时 crossterm 收到的事件序列。
             // 只记录关键事件（ESC、Ctrl+V、Enter、Char），避免日志过大。
@@ -3053,7 +3041,7 @@ mod tests {
     #[test]
     fn incremental_renderer_empty_snapshot_yields_empty_text() {
         let mut r = IncrementalRenderer::new();
-        let text = r.render("");
+        let text = r.render_wrapped("", 80).0;
         assert!(
             text.lines.is_empty(),
             "empty snapshot should yield empty Text, got: {text:?}"
@@ -3065,8 +3053,8 @@ mod tests {
         // 同一 snapshot 渲染两次：第二次应命中 hash 缓存，返回相同内容。
         let mut r = IncrementalRenderer::new();
         let snapshot = "# Heading\n\nSome **bold** text.\n\n";
-        let first = r.render(snapshot);
-        let second = r.render(snapshot);
+        let first = r.render_wrapped(snapshot, 80).0;
+        let second = r.render_wrapped(snapshot, 80).0;
         let first_flat = flatten_text(&first);
         let second_flat = flatten_text(&second);
         assert_eq!(
@@ -3083,11 +3071,11 @@ mod tests {
         // 只有新增段落触发渲染。最终内容应等于全量渲染。
         let mut r = IncrementalRenderer::new();
         let part1 = "# First Heading\n\nFirst paragraph.\n\n";
-        let _ = r.render(part1);
+        let _ = r.render_wrapped(part1, 80).0;
 
         // 追加第二个段落（模拟流式 TextDelta 到达）。
         let part2 = format!("{part1}## Second Heading\n\nSecond paragraph.\n\n");
-        let incremental_result = r.render(&part2);
+        let incremental_result = r.render_wrapped(&part2, 80).0;
 
         // 全量渲染作为对照基准。
         let renderer = TerminalRenderer::new();
@@ -3117,8 +3105,8 @@ mod tests {
         // 没有 \n\n 结尾的未完成段落，每次都重新渲染。
         // 模拟流式输出：先 "Hello"，再 "Hello world"。
         let mut r = IncrementalRenderer::new();
-        let _ = r.render("Hello");
-        let result = r.render("Hello world");
+        let _ = r.render_wrapped("Hello", 80).0;
+        let result = r.render_wrapped("Hello world", 80).0;
         let flat = flatten_text(&result);
         assert!(
             flat.contains("Hello world"),
@@ -3130,9 +3118,9 @@ mod tests {
     fn incremental_renderer_resets_when_buffer_shrinks() {
         // buffer 被 trim 后缩短：completed_bytes > snapshot.len()，应重置。
         let mut r = IncrementalRenderer::new();
-        let _ = r.render("# Long Heading\n\nLong paragraph.\n\n");
+        let _ = r.render_wrapped("# Long Heading\n\nLong paragraph.\n\n", 80).0;
         // 模拟 trim 后 buffer 缩短到只有 "Short"
-        let result = r.render("Short");
+        let result = r.render_wrapped("Short", 80).0;
         let flat = flatten_text(&result);
         assert!(
             flat.contains("Short"),
@@ -3150,11 +3138,11 @@ mod tests {
         // 当只有 pending 部分未变但 completed 推进时，pending_cache 应命中。
         let mut r = IncrementalRenderer::new();
         // 第一次：未完成段落 "pending text"
-        let _ = r.render("pending text");
+        let _ = r.render_wrapped("pending text", 80).0;
         // 第二次：仍为 "pending text"（整体 hash 命中）
-        let result1 = r.render("pending text");
+        let result1 = r.render_wrapped("pending text", 80).0;
         // 第三次：仍然不变
-        let result2 = r.render("pending text");
+        let result2 = r.render_wrapped("pending text", 80).0;
         let flat1 = flatten_text(&result1);
         let flat2 = flatten_text(&result2);
         assert_eq!(

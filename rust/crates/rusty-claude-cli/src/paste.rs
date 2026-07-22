@@ -218,6 +218,67 @@ pub(crate) fn expand_paste_placeholders(input: &str, session_id: &str) -> String
     result
 }
 
+/// 读取 Windows 剪贴板中的图片，保存为 PNG 到 paste-cache，返回 `@<路径>` 字符串。
+///
+/// 使用 PowerShell + System.Windows.Forms 检测剪贴板是否包含图片。
+/// 需要 STA 线程模式（PowerShell 默认），否则 OLE 剪贴板操作可能失败。
+///
+/// **返回值**：
+/// - `Ok(Some("@path"))`: 检测到图片并成功保存
+/// - `Ok(None)`: 剪贴板中无图片
+/// - `Err(...)`: 检测过程出错（如 PowerShell 不可用）
+pub(crate) fn read_clipboard_image(
+    session_id: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let root = match paste_cache_root() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let filename = format!("clipboard_img_{session_id}_{timestamp}.png");
+    let path = root.join(&filename);
+
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        paste_log!("[paste-img] create_dir_all 失败: {e}");
+        return Ok(None);
+    }
+
+    let path_str = path.to_string_lossy().to_string();
+    let ps_script = format!(
+        "\
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
+    $img = [System.Windows.Forms.Clipboard]::GetImage()
+    $img.Save('{}')
+    Write-Output 'IMAGE_OK'
+}} else {{
+    Write-Output 'NO_IMAGE'
+}}",
+        path_str.replace('\'', "''")
+    );
+
+    let output = std::process::Command::new("powershell")
+        .args(["-STA", "-NoProfile", "-NonInteractive", "-Command", &ps_script])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        paste_log!("[paste-img] PowerShell 失败: {}", String::from_utf8_lossy(&output.stderr));
+        return Ok(None);
+    }
+
+    if stdout == "IMAGE_OK" {
+        paste_log!("[paste-img] 图片已保存到 {:?}", path);
+        Ok(Some(format!("@{path_str}")))
+    } else {
+        Ok(None)
+    }
+}
+
 /// 读取 Windows 剪贴板文本内容。
 /// 用 PowerShell `Get-Clipboard` 命令获取，绕过终端粘贴机制。
 /// 适用于 cmd.exe/conhost 等不支持 bracketed paste 的终端。

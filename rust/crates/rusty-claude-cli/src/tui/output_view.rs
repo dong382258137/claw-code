@@ -159,8 +159,7 @@ impl OutputEntry {
 pub(crate) struct OutputView {
     inner: Arc<Mutex<OutputBuffer>>,
 }
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct OutputBuffer {
     /// 结构化条目列表（按追加顺序）。
     entries: Vec<OutputEntry>,
@@ -170,12 +169,29 @@ pub(crate) struct OutputBuffer {
     total_written: u64,
     /// 是否发生过淘汰。
     truncated: bool,
+    /// render_all 结果缓存。dirty 为 false 时直接返回此缓存。
+    dirty: bool,
+    cached_snapshot: String,
+}
+
+impl Default for OutputBuffer {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            text_total_bytes: 0,
+            total_written: 0,
+            truncated: false,
+            dirty: true,
+            cached_snapshot: String::new(),
+        }
+    }
 }
 
 impl OutputBuffer {
     /// 追加文本到当前条目。如果最后一个条目是 Text，则合并；
     /// 否则新建一个 Text 条目。
     pub(crate) fn append(&mut self, text: &str) {
+        self.dirty = true;
         self.total_written += text.len() as u64;
         // 尝试合并到上一个 Text 条目
         if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
@@ -190,6 +206,7 @@ impl OutputBuffer {
 
     /// 追加一个结构化条目。
     pub(crate) fn push_entry(&mut self, entry: OutputEntry) {
+        self.dirty = true;
         // Bug L8 修复：ToolCard 的 input 字节数也计入 text_total_bytes，
         // 防止大量工具调用 input（如长 bash 命令、大文件 write 内容）无限积累。
         // result 到达时由 complete_tool_card 单独计入。
@@ -235,7 +252,7 @@ impl OutputBuffer {
             } = entry
             {
                 if id == tool_id && r.is_none() {
-                    // Bug L8 修复：result 字节数计入 text_total_bytes。
+                    self.dirty = true;
                     // 工具结果可能很大（read 大文件、bash 大量输出），
                     // 不计入会导致内存无限制增长。
                     self.text_total_bytes += result.len();
@@ -264,6 +281,7 @@ impl OutputBuffer {
             } = entry
             {
                 *collapsed = !*collapsed;
+                self.dirty = true;
                 return true;
             }
         }
@@ -282,6 +300,7 @@ impl OutputBuffer {
             {
                 if count == index {
                     *collapsed = !*collapsed;
+                    self.dirty = true;
                     return true;
                 }
                 count += 1;
@@ -377,6 +396,7 @@ impl OutputBuffer {
                 }) = self.entries.get_mut(entry_idx)
                 {
                     *collapsed = !*collapsed;
+                    self.dirty = true;
                     return true;
                 }
             }
@@ -384,17 +404,24 @@ impl OutputBuffer {
         false
     }
 
-    /// 渲染所有条目为单个字符串。
-    pub(crate) fn render_all(&self) -> String {
+    /// 渲染所有条目为单个字符串（带脏标记缓存优化）。
+    /// dirty=true 时重新渲染并更新缓存，否则返回缓存。
+    pub(crate) fn render_all(&mut self) -> String {
+        if !self.dirty {
+            return self.cached_snapshot.clone();
+        }
         let mut out = String::new();
         for entry in &self.entries {
             out.push_str(&entry.render());
         }
+        self.cached_snapshot = out.clone();
+        self.dirty = false;
         out
     }
 
     /// 保留向后兼容：返回渲染后的文本（等价于 render_all）。
-    pub(crate) fn buffer(&self) -> String {
+    /// 注意：此方法需要 &mut self 因为 render_all 会更新缓存。
+    pub(crate) fn buffer(&mut self) -> String {
         self.render_all()
     }
 
@@ -501,6 +528,8 @@ impl OutputView {
         guard.entries.clear();
         guard.text_total_bytes = 0;
         guard.truncated = false;
+        guard.dirty = true;
+        guard.cached_snapshot = String::new();
     }
 
     /// 总写入字节数。
