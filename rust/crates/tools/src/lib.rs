@@ -3816,6 +3816,52 @@ fn extract_title(content: &str, raw_body: &str, content_type: &str) -> Option<St
 }
 
 fn html_to_text(html: &str) -> String {
+    let cleaned = strip_script_style(html);
+    html_to_plain_text(&cleaned)
+}
+
+fn strip_script_style(html: &str) -> String {
+    let lower = html.to_lowercase();
+    let mut result = String::with_capacity(html.len());
+    let mut pos = 0;
+    while pos < html.len() {
+        let rem = &lower[pos..];
+        let sc_pos = rem.find("<script");
+        let st_pos = rem.find("<style");
+        let (tag_start, tag_name) = match (sc_pos, st_pos) {
+            (Some(s), Some(y)) if s <= y => (pos + s, "script"),
+            (Some(s), _) => (pos + s, "script"),
+            (_, Some(y)) => (pos + y, "style"),
+            (None, None) => { result.push_str(&html[pos..]); break; }
+        };
+        let after_name = tag_start + 1 + tag_name.len();
+        if after_name >= html.len() || !is_html_tag_boundary(html.as_bytes()[after_name]) {
+            result.push(html.as_bytes()[tag_start] as char);
+            pos = tag_start + 1;
+            continue;
+        }
+        result.push_str(&html[pos..tag_start]);
+        let close_pat = format!("</{}", tag_name);
+        if let Some(close_idx) = lower[tag_start..].find(&close_pat) {
+            let abs_close = tag_start + close_idx;
+            if let Some(gt) = html[abs_close..].find('>') {
+                pos = abs_close + gt + 1;
+            } else {
+                pos = abs_close + close_pat.len();
+            }
+        } else {
+            if let Some(gt) = html[tag_start..].find('>') { pos = tag_start + gt + 1; }
+            else { pos = tag_start + 1; }
+        }
+    }
+    result
+}
+
+fn is_html_tag_boundary(c: u8) -> bool {
+    matches!(c, b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/')
+}
+
+fn html_to_plain_text(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut previous_was_space = false;
@@ -3845,6 +3891,10 @@ fn html_to_text(html: &str) -> String {
     collapse_whitespace(&decode_html_entities(&text))
 }
 
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn decode_html_entities(input: &str) -> String {
     input
         .replace("&amp;", "&")
@@ -3855,10 +3905,6 @@ fn decode_html_entities(input: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-fn collapse_whitespace(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn preview_text(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -3866,7 +3912,6 @@ fn preview_text(input: &str, max_chars: usize) -> String {
     let shortened = input.chars().take(max_chars).collect::<String>();
     format!("{}…", shortened.trim_end())
 }
-
 fn extract_search_hits(html: &str) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     let mut remaining = html;
@@ -10169,10 +10214,13 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        // 用 Path::ends_with 而非 str::ends_with,以兼容 Windows 的 \ 分隔符。
+        assert!(std::path::Path::new(
+            globbed_output["filenames"][0]
+                .as_str()
+                .expect("filename")
+        )
+        .ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");

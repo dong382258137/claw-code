@@ -21,24 +21,103 @@ const JSONL_REDACTION_MARKER: &str = "[redacted]";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
-/// 工具输出截断上限（32KB）。超过此限制时保留头部和尾部，
+/// 工具输出截断上限。超过此限制时按工具类型分档截断，
 /// 防止单个工具产生数 MB 输出导致 TUI 卡死。
-const TOOL_OUTPUT_MAX_BYTES: usize = 32_768; // 32 KiB
-const TOOL_OUTPUT_HEAD_BYTES: usize = 3_000;
-const TOOL_OUTPUT_TAIL_BYTES: usize = 1_500;
+///
+/// # 分档策略(v4.3,对齐 Claude Code / Codex CLI 行业实践)
+///
+/// | 工具类型 | 策略 | 理由 |
+/// |---------|------|------|
+/// | diff 类(edit/write/delete) | 不截断 | diff 必须字节精确,截断破坏语义 |
+/// | read 类(read_file) | 按行截断(head 200 + tail 50) | 源码必须保完整行,字节截断产生残行 |
+/// | 其他(bash/grep 等) | 按字节 head/tail 截断 | 文本流,按字节可接受 |
+///
+/// 阈值 50KB 对齐 Claude Code 的 50K 字符上限。
+const TOOL_OUTPUT_MAX_BYTES: usize = 50_000; // 50 KB(对齐 Claude Code)
+const TOOL_OUTPUT_HEAD_BYTES: usize = 30_000;
+const TOOL_OUTPUT_TAIL_BYTES: usize = 15_000;
 
-/// 截断过长的工具输出，保留首尾并插入提示。
-fn truncate_tool_output(output: String) -> String {
+/// read 类工具:按行截断的 head/tail 行数。
+const READ_TOOL_HEAD_LINES: usize = 200;
+const READ_TOOL_TAIL_LINES: usize = 50;
+
+/// 截断策略分类。
+enum TruncatePolicy {
+    /// diff 类工具:不截断(保字节精确)。
+    NoTruncate,
+    /// read 类工具:按行截断,保留完整行。
+    LineBased { head_lines: usize, tail_lines: usize },
+    /// 其他工具:按字节 head/tail 截断。
+    ByteBased { head_bytes: usize, tail_bytes: usize },
+}
+
+/// 根据工具名选择截断策略。
+fn policy_for_tool(tool_name: &str) -> TruncatePolicy {
+    match tool_name {
+        // diff 类:字节精确,不截断
+        "edit_file" | "write_file" | "delete_file" | "Edit" | "Write" | "Delete" => {
+            TruncatePolicy::NoTruncate
+        }
+        // read 类:按行截断(Claude Code 同款,2000 行硬上限 → 50KB 内按行 head/tail)
+        "read_file" | "Read" => TruncatePolicy::LineBased {
+            head_lines: READ_TOOL_HEAD_LINES,
+            tail_lines: READ_TOOL_TAIL_LINES,
+        },
+        // 其他:按字节 head/tail 截断(bash/grep/glob/session_search 等)
+        _ => TruncatePolicy::ByteBased {
+            head_bytes: TOOL_OUTPUT_HEAD_BYTES,
+            tail_bytes: TOOL_OUTPUT_TAIL_BYTES,
+        },
+    }
+}
+
+/// 截断过长的工具输出,按工具类型分档保留首尾并插入提示。
+fn truncate_tool_output(tool_name: &str, output: String) -> String {
     if output.len() <= TOOL_OUTPUT_MAX_BYTES {
         return output;
     }
-    // 在字符边界安全截断头部
-    let mut head_end = TOOL_OUTPUT_HEAD_BYTES;
+    match policy_for_tool(tool_name) {
+        TruncatePolicy::NoTruncate => output,
+        TruncatePolicy::LineBased {
+            head_lines,
+            tail_lines,
+        } => truncate_by_lines(&output, head_lines, tail_lines),
+        TruncatePolicy::ByteBased {
+            head_bytes,
+            tail_bytes,
+        } => truncate_by_bytes(&output, head_bytes, tail_bytes),
+    }
+}
+
+/// 按行截断:保留 head N 行 + tail M 行,中间插入截断提示。
+/// 保证不会切断行中间(对齐 Claude Code FileReadTool 行为)。
+fn truncate_by_lines(output: &str, head_lines: usize, tail_lines: usize) -> String {
+    let all_lines: Vec<&str> = output.lines().collect();
+    let total = all_lines.len();
+    if total <= head_lines + tail_lines {
+        return output.to_string();
+    }
+    let head: Vec<&str> = all_lines.iter().take(head_lines).copied().collect();
+    let tail: Vec<&str> = all_lines
+        .iter()
+        .skip(total.saturating_sub(tail_lines))
+        .copied()
+        .collect();
+    let omitted_lines = total - head.len() - tail.len();
+    format!(
+        "{}\n\n[... 输出过长已截断，省略 {omitted_lines} 行（共 {total} 行）。建议：使用 read_file 的 offset/limit 参数分页读取目标区段。]\n\n{}",
+        head.join("\n"),
+        tail.join("\n")
+    )
+}
+
+/// 按字节截断:保留 head N 字节 + tail M 字节,在字符边界安全切。
+fn truncate_by_bytes(output: &str, head_bytes: usize, tail_bytes: usize) -> String {
+    let mut head_end = head_bytes.min(output.len());
     while head_end > 0 && !output.is_char_boundary(head_end) {
         head_end -= 1;
     }
-    // 从末尾向前找到尾部安全边界
-    let tail_start = output.len().saturating_sub(TOOL_OUTPUT_TAIL_BYTES);
+    let tail_start = output.len().saturating_sub(tail_bytes);
     let mut tail_start = tail_start;
     while tail_start < output.len() && !output.is_char_boundary(tail_start) {
         tail_start += 1;
@@ -871,16 +950,18 @@ impl ConversationMessage {
     #[must_use]
     pub fn tool_result(
         tool_use_id: impl Into<String>,
-        tool_name: impl Into<String>,
+        tool_name: impl Into<String> + AsRef<str>,
         output: impl Into<String>,
         is_error: bool,
     ) -> Self {
+        // 先借用 tool_name 做分档截断,再 into 消费
+        let truncated_output = truncate_tool_output(tool_name.as_ref(), output.into());
         Self {
             role: MessageRole::Tool,
             blocks: vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
                 tool_name: tool_name.into(),
-                output: truncate_tool_output(output.into()),
+                output: truncated_output,
                 is_error,
             }],
             usage: None,
@@ -1782,6 +1863,91 @@ mod tests {
         assert!(output.contains(super::JSONL_REDACTION_MARKER));
         assert!(output.ends_with(super::JSONL_TRUNCATION_MARKER));
         assert!(output.chars().count() <= super::MAX_JSONL_FIELD_CHARS);
+    }
+
+    // ---- 痛点 2:分档截断测试 ----
+
+    #[test]
+    fn truncate_small_output_passthrough_unchanged() {
+        // 小于 50KB 阈值,任何工具都不截断
+        let out = super::truncate_tool_output("read_file", "small content".to_string());
+        assert_eq!(out, "small content");
+    }
+
+    #[test]
+    fn truncate_diff_tools_never_truncate() {
+        // edit_file/write_file 即使超阈值也不截断(保字节精确)
+        let big = "x".repeat(super::TOOL_OUTPUT_MAX_BYTES + 1000);
+        for tool in &["edit_file", "write_file", "delete_file", "Edit", "Write"] {
+            let out = super::truncate_tool_output(tool, big.clone());
+            assert_eq!(
+                out.len(),
+                big.len(),
+                "{tool} 不应截断 diff 输出"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_read_file_uses_line_based_truncation() {
+        // 构造 300 行,每行 200 字节(总 60KB > 50KB 阈值)
+        // head 200 行 + tail 50 行,省略 50 行
+        let lines: Vec<String> = (0..300).map(|i| format!("line_{i:03} {}", "x".repeat(180))).collect();
+        let big = lines.join("\n");
+        assert!(big.len() > super::TOOL_OUTPUT_MAX_BYTES);
+
+        let out = super::truncate_tool_output("read_file", big);
+        // 应包含截断提示(按行)
+        assert!(out.contains("省略 50 行（共 300 行）"), "应报告省略行数");
+        // head 应包含前 200 行的首行
+        assert!(out.contains("line_000"));
+        assert!(out.contains("line_199"));
+        // tail 应包含最后 50 行的首行(第 250 行)
+        assert!(out.contains("line_250"));
+        assert!(out.contains("line_299"));
+        // 不应包含被省略的中间行
+        assert!(!out.contains("line_200\n"));
+    }
+
+    #[test]
+    fn truncate_read_file_preserves_complete_lines() {
+        // 关键:按行截断不会切断行中间
+        let lines: Vec<String> = (0..300).map(|i| format!("fn func_{i}() -> i32 {{ {i} }}")).collect();
+        let big = lines.join("\n");
+        let out = super::truncate_tool_output("read_file", big);
+        // 每行都应是完整的(以 } 结尾),不会有残行
+        for line in out.lines() {
+            if line.starts_with("fn func_") {
+                assert!(line.ends_with("}"), "行被截断: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_bash_uses_byte_based_truncation() {
+        // bash 走字节截断,报告"省略 N 字节"而非"省略 N 行"
+        let big = "x".repeat(super::TOOL_OUTPUT_MAX_BYTES + 5000);
+        let out = super::truncate_tool_output("bash", big);
+        assert!(out.contains("省略"), "应有截断提示");
+        assert!(out.contains("字节"), "bash 应按字节截断: {out}");
+        assert!(!out.contains("行（共"), "bash 不应按行截断");
+    }
+
+    #[test]
+    fn truncate_grep_uses_byte_based_truncation() {
+        let big = "match_line\n".repeat(6000); // ~66KB
+        let out = super::truncate_tool_output("grep_search", big);
+        assert!(out.contains("字节"), "grep 应按字节截断");
+    }
+
+    #[test]
+    fn truncate_read_file_below_threshold_not_truncated() {
+        // 300 行但每行很短,总字节数 < 50KB,不截断
+        let lines: Vec<String> = (0..300).map(|i| format!("line_{i}")).collect();
+        let small = lines.join("\n");
+        assert!(small.len() < super::TOOL_OUTPUT_MAX_BYTES);
+        let out = super::truncate_tool_output("read_file", small.clone());
+        assert_eq!(out, small, "低于阈值不应截断");
     }
 
     #[test]
