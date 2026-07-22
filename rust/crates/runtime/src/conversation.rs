@@ -1462,6 +1462,21 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
+                        } else if tool_name == "refactor_algorithm_topo" {
+                            // Phase 4-B:建议模式符号重命名。不修改文件,
+                            // 基于 ProjectTopology SymbolIndex 生成建议列表,
+                            // LLM 拿到建议后用 edit_file 逐个应用。
+                            match self.execute_refactor_algorithm_topo(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "benchmark_compare" {
+                            // Phase 4-B:运行命令多次并报告计时统计(avg/median/min/max/stddev),
+                            // 支持 warmup/sample_size/timeout。
+                            match self.execute_benchmark_compare(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
                         } else {
                             match self.tool_executor.execute(&tool_name, &effective_input) {
                                 Ok(output) => (output, false),
@@ -2426,6 +2441,72 @@ where
         let status = tx.status();
         Ok(serde_json::to_string_pretty(&status)
             .unwrap_or_else(|e| format!("status serialization error: {e}")))
+    }
+
+    /// Phase 4-B:执行 `refactor_algorithm_topo` 工具调用。
+    ///
+    /// 建议模式:不修改文件,基于 ProjectTopology SymbolIndex 生成符号重命名建议列表。
+    /// 无 ProjectTopology 时返回提示信息(不报错),引导 LLM 改用 grep_search。
+    fn execute_refactor_algorithm_topo(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let target_symbol = parsed
+            .get("target_symbol")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'target_symbol' field")?;
+        let new_name = parsed.get("new_name").and_then(|v| v.as_str());
+        let reason = parsed.get("reason").and_then(|v| v.as_str());
+
+        let Some(t) = &self.project_topology else {
+            return Ok(
+                "refactor_algorithm_topo is not available: no ProjectTopology configured. \
+                 Use --workspace-root or set_workspace_root to enable topology queries, \
+                 or use grep_search to find references manually."
+                    .to_string(),
+            );
+        };
+        crate::domain_algorithm::refactor_algorithm_topo(t, target_symbol, new_name, reason)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+    }
+
+    /// Phase 4-B:执行 `benchmark_compare` 工具调用。
+    ///
+    /// 运行命令多次并报告计时统计。工作目录使用 `workspace_root`(若已配置)。
+    fn execute_benchmark_compare(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let command = parsed
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'command' field")?;
+        let timeout_seconds = parsed
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60);
+        let sample_size = parsed
+            .get("sample_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20) as usize;
+        let warmup_runs = parsed
+            .get("warmup_runs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as usize;
+
+        let cwd = self.workspace_root.as_deref();
+        crate::domain_algorithm::benchmark_compare(
+            command,
+            cwd,
+            timeout_seconds,
+            sample_size,
+            warmup_runs,
+        )
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
     }
 
 

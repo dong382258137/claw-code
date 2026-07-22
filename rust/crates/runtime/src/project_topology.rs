@@ -828,8 +828,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn project_topology_initial_state() {
         let topo = ProjectTopology::new(PathBuf::from("."));
         let state = topo.state();

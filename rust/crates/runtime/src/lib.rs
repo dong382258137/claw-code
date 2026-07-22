@@ -62,6 +62,8 @@ pub mod project_topology;
 pub mod recovery_orchestrator;
 pub mod recovery_recipes;
 pub mod vcs_snapshot;
+// Phase 4-B:DomainTools — 算法级重构建议(建议模式)+ 基准对比。无状态。
+pub mod domain_algorithm;
 // Harness O(编排)层 + V(验证)层:Plan/Execute/Review 三段循环。
 // 默认不启用,需通过 CLI `--enable-plan-mode` 或 settings.json `planMode: true` 开启。
 // 缓存保护:PlanArtifact 末尾追加到 prompt 变动区,详见 docs/harness-engineering-optimization-plan.md §5.2。
