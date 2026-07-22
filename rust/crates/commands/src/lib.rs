@@ -4947,12 +4947,12 @@ mod tests {
     #[test]
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
-        assert!(help.contains("Start here        /status, /diff, /agents, /skills, /commit"));
-        assert!(help.contains("[resume]          also works with --resume SESSION.jsonl"));
-        assert!(help.contains("Session"));
-        assert!(help.contains("Tools"));
-        assert!(help.contains("Config"));
-        assert!(help.contains("Debug"));
+        assert!(help.contains("从这里开始         /status, /diff, /agents, /skills, /commit"));
+        assert!(help.contains("[resume]           也支持 --resume SESSION.jsonl"));
+        assert!(help.contains("会话"));
+        assert!(help.contains("工具"));
+        assert!(help.contains("配置"));
+        assert!(help.contains("调试"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
@@ -4987,14 +4987,14 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 142);
+        assert_eq!(slash_command_specs().len(), 144);
         assert!(resume_supported_slash_commands().len() >= 42);
     }
 
     #[test]
     fn renders_help_with_grouped_categories_and_keyboard_shortcuts() {
         // given
-        let categories = ["Session", "Tools", "Config", "Debug"];
+        let categories = ["会话", "工具", "配置", "调试"];
 
         // when
         let help = render_slash_command_help();
@@ -5006,19 +5006,19 @@ mod tests {
                 "expected help to contain category {category}"
             );
         }
-        let session_index = help.find("Session").expect("Session header should exist");
-        let tools_index = help.find("Tools").expect("Tools header should exist");
-        let config_index = help.find("Config").expect("Config header should exist");
-        let debug_index = help.find("Debug").expect("Debug header should exist");
+        let session_index = help.find("会话").expect("会话 header should exist");
+        let tools_index = help.find("工具").expect("工具 header should exist");
+        let config_index = help.find("配置").expect("配置 header should exist");
+        let debug_index = help.find("调试").expect("调试 header should exist");
         assert!(session_index < tools_index);
         assert!(tools_index < config_index);
         assert!(config_index < debug_index);
 
-        assert!(help.contains("Keyboard shortcuts"));
-        assert!(help.contains("Up/Down              Navigate prompt history"));
-        assert!(help.contains("Tab                  Complete commands, modes, and recent sessions"));
-        assert!(help.contains("Ctrl-C               Clear input (or exit on empty prompt)"));
-        assert!(help.contains("Shift+Enter/Ctrl+J   Insert a newline"));
+        assert!(help.contains("快捷键"));
+        assert!(help.contains("↑/↓                  浏览历史输入"));
+        assert!(help.contains("Tab                  补全命令、模式和最近会话"));
+        assert!(help.contains("Ctrl-C               清空输入（空行时退出）"));
+        assert!(help.contains("Shift+Enter/Ctrl+J   插入换行"));
 
         // every command should still render with a summary line
         for spec in slash_command_specs() {
@@ -5135,7 +5135,7 @@ mod tests {
         let result = handle_slash_command("/help", &session, CompactionConfig::default())
             .expect("help command should be handled");
         assert_eq!(result.session, session);
-        assert!(result.message.contains("Slash commands"));
+        assert!(result.message.contains("斜杠命令"));
     }
 
     #[test]
