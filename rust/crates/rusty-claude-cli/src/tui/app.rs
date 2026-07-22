@@ -177,6 +177,11 @@ struct IncrementalRenderer {
     /// 已完成段落行（Arc 共享，帧间零拷贝）。
     completed_lines: Arc<Vec<Line<'static>>>,
     completed_bytes: usize,
+    /// 已完成行经 wrap 后的显示行缓存。新增 completed 行时只 wrap 新增部分，
+    /// 避免每帧对全部 2000 行做全量 wrap（方案A：增量 wrap）。
+    wrapped_completed: Arc<Vec<Line<'static>>>,
+    /// wrapped_completed 对应的 content_width，变化时需全量重建。
+    wrapped_completed_width: usize,
     pending_cache: Option<(u64, Vec<Line<'static>>)>,
     full_cache: Option<(u64, Text<'static>)>,
     /// (content_width, wrapped_lines) 折行缓存
@@ -189,6 +194,8 @@ impl IncrementalRenderer {
             renderer: TerminalRenderer::new(),
             completed_lines: Arc::new(Vec::new()),
             completed_bytes: 0,
+            wrapped_completed: Arc::new(Vec::new()),
+            wrapped_completed_width: 0,
             pending_cache: None,
             full_cache: None,
             wrapped_cache: None,
@@ -196,6 +203,9 @@ impl IncrementalRenderer {
     }
 
     /// 渲染并返回 (Text, 已折行 Arc)。content_width 变化时自动重建折行缓存。
+    ///
+    /// 方案A 优化：维护 wrapped_completed 缓存，新增 completed 行时只 wrap
+    /// 新增部分，避免每帧对全部 2000 行做全量 wrap（200ms → ~1ms）。
     fn render_wrapped(
         &mut self,
         snapshot: &str,
@@ -216,15 +226,8 @@ impl IncrementalRenderer {
                         return (text.clone(), Arc::clone(wrapped));
                     }
                 }
-                // snapshot 未变但 width 变了：Text 可复用，但 wrapping 需重建。
-                let lines: Vec<Line<'static>> = text
-                    .lines
-                    .iter()
-                    .flat_map(|line| wrap_line_to_display_lines(line, content_width))
-                    .collect();
-                let wrapped = Arc::new(lines);
-                self.wrapped_cache = Some((content_width, Arc::clone(&wrapped)));
-                return (text.clone(), wrapped);
+                // snapshot 未变但 width 变了：不提前返回，走下面的统一逻辑
+                // 让 wrapped_completed 因 width 变化全量重建。
             }
         }
 
@@ -233,6 +236,7 @@ impl IncrementalRenderer {
             self.reset();
         }
 
+        // 处理 completed 部分：新增段落行时增量 wrap
         if split_pos > self.completed_bytes {
             let new_completed = &snapshot[self.completed_bytes..split_pos];
             if !new_completed.is_empty() {
@@ -241,6 +245,14 @@ impl IncrementalRenderer {
                     Ok(text) => text.lines,
                     Err(_) => vec![Line::raw(new_completed.to_string())],
                 };
+                // 增量 wrap：仅当 width 未变时追加到 wrapped_completed。
+                // width 变化时下面会全量重建，这里跳过。
+                if self.wrapped_completed_width == content_width {
+                    let wrapped = Arc::make_mut(&mut self.wrapped_completed);
+                    for line in &new_lines {
+                        wrapped.extend(wrap_line_to_display_lines(line, content_width));
+                    }
+                }
                 let completed = Arc::make_mut(&mut self.completed_lines);
                 completed.extend(new_lines);
             }
@@ -248,11 +260,29 @@ impl IncrementalRenderer {
             self.pending_cache = None;
         }
 
+        // width 变化时全量重建 wrapped_completed
+        if self.wrapped_completed_width != content_width {
+            let wrapped: Vec<Line<'static>> = self
+                .completed_lines
+                .iter()
+                .flat_map(|line| wrap_line_to_display_lines(line, content_width))
+                .collect();
+            self.wrapped_completed = Arc::new(wrapped);
+            self.wrapped_completed_width = content_width;
+        }
+
+        // MAX_COMPLETED_LINES 裁剪：同步重建 wrapped_completed
         const MAX_COMPLETED_LINES: usize = 2000;
         if self.completed_lines.len() > MAX_COMPLETED_LINES {
             let drain = self.completed_lines.len() - MAX_COMPLETED_LINES;
             let completed = Arc::make_mut(&mut self.completed_lines);
             completed.drain(0..drain);
+            // 无法精确对应 completed 行与 wrapped 显示行的映射，全量重建。
+            let wrapped: Vec<Line<'static>> = completed
+                .iter()
+                .flat_map(|line| wrap_line_to_display_lines(line, content_width))
+                .collect();
+            self.wrapped_completed = Arc::new(wrapped);
         }
 
         let pending = &snapshot[self.completed_bytes..];
@@ -273,18 +303,19 @@ impl IncrementalRenderer {
             }
         };
 
+        // 构建 Text（用于 full_cache）
         let mut all_lines: Vec<Line<'static>> = (*self.completed_lines).clone();
         all_lines.extend(pending_lines.clone());
         let result = Text::from(all_lines);
         self.full_cache = Some((total_hash, result.clone()));
 
-        // Build wrapped lines for this frame
-        let wrapped_vec: Vec<Line<'static>> = result
-            .lines
-            .iter()
-            .flat_map(|line| wrap_line_to_display_lines(line, content_width))
-            .collect();
-        let wrapped = Arc::new(wrapped_vec);
+        // 组合 wrapped_completed + wrap(pending_lines)
+        // 不再对全部行做全量 wrap，只 wrap pending 部分（通常很小）。
+        let mut all_wrapped: Vec<Line<'static>> = (*self.wrapped_completed).clone();
+        for line in &pending_lines {
+            all_wrapped.extend(wrap_line_to_display_lines(line, content_width));
+        }
+        let wrapped = Arc::new(all_wrapped);
 
         // Cache wrapped lines when pending is empty (stable state)
         if pending_lines.is_empty() {
@@ -308,6 +339,8 @@ impl IncrementalRenderer {
     fn reset(&mut self) {
         self.completed_lines = Arc::new(Vec::new());
         self.completed_bytes = 0;
+        self.wrapped_completed = Arc::new(Vec::new());
+        self.wrapped_completed_width = 0;
         self.pending_cache = None;
         self.full_cache = None;
         self.wrapped_cache = None;

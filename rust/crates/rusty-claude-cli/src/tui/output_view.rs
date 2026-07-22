@@ -169,8 +169,11 @@ pub(crate) struct OutputBuffer {
     total_written: u64,
     /// 是否发生过淘汰。
     truncated: bool,
-    /// render_all 结果缓存。dirty 为 false 时直接返回此缓存。
-    dirty: bool,
+    /// 每个条目在 cached_snapshot 中对应的文本长度。与 entries 等长，
+    /// 用于 recompute_snapshot_tail 增量更新时定位截断点。
+    rendered_lengths: Vec<usize>,
+    /// 渲染后的完整文本缓存。由 recompute_snapshot_tail 增量维护，
+    /// snapshot() 直接 clone 此字段，持锁时间 O(n) 纯 memcpy 无业务逻辑。
     cached_snapshot: String,
 }
 
@@ -181,7 +184,7 @@ impl Default for OutputBuffer {
             text_total_bytes: 0,
             total_written: 0,
             truncated: false,
-            dirty: true,
+            rendered_lengths: Vec::new(),
             cached_snapshot: String::new(),
         }
     }
@@ -191,22 +194,24 @@ impl OutputBuffer {
     /// 追加文本到当前条目。如果最后一个条目是 Text，则合并；
     /// 否则新建一个 Text 条目。
     pub(crate) fn append(&mut self, text: &str) {
-        self.dirty = true;
         self.total_written += text.len() as u64;
         // 尝试合并到上一个 Text 条目
-        if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
+        let from_idx = if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
             content.push_str(text);
             self.text_total_bytes += text.len();
+            self.entries.len() - 1
         } else {
             self.text_total_bytes += text.len();
             self.entries.push(OutputEntry::text(text.to_string()));
-        }
+            self.entries.len() - 1
+        };
+        // 增量更新 cached_snapshot：只重渲染受影响的最后一个条目。
+        self.recompute_snapshot_tail(from_idx);
         self.trim_if_needed();
     }
 
     /// 追加一个结构化条目。
     pub(crate) fn push_entry(&mut self, entry: OutputEntry) {
-        self.dirty = true;
         // Bug L8 修复：ToolCard 的 input 字节数也计入 text_total_bytes，
         // 防止大量工具调用 input（如长 bash 命令、大文件 write 内容）无限积累。
         // result 到达时由 complete_tool_card 单独计入。
@@ -233,6 +238,9 @@ impl OutputBuffer {
             self.text_total_bytes += summary.len();
         }
         self.entries.push(entry);
+        // 增量更新 cached_snapshot：只重渲染新增的最后一个条目。
+        let from_idx = self.entries.len() - 1;
+        self.recompute_snapshot_tail(from_idx);
         self.trim_if_needed();
     }
 
@@ -243,29 +251,29 @@ impl OutputBuffer {
         result: String,
         is_error: bool,
     ) -> bool {
-        for entry in self.entries.iter_mut() {
+        // 先查找目标索引，避免在 iter_mut 期间调用 recompute_snapshot_tail 的借用冲突。
+        let found_idx = self.entries.iter().position(|e| {
+            matches!(e, OutputEntry::ToolCard { tool_id: id, result: r, .. } if id == tool_id && r.is_none())
+        });
+        if let Some(idx) = found_idx {
+            // 工具结果可能很大（read 大文件、bash 大量输出），
+            // 不计入会导致内存无限制增长。
+            self.text_total_bytes += result.len();
             if let OutputEntry::ToolCard {
-                tool_id: id,
                 result: r,
                 is_error: e,
+                collapsed,
                 ..
-            } = entry
+            } = &mut self.entries[idx]
             {
-                if id == tool_id && r.is_none() {
-                    self.dirty = true;
-                    // 工具结果可能很大（read 大文件、bash 大量输出），
-                    // 不计入会导致内存无限制增长。
-                    self.text_total_bytes += result.len();
-                    *r = Some(result);
-                    *e = is_error;
-                    // 结果到达后默认折叠
-                    if let OutputEntry::ToolCard { collapsed, .. } = entry {
-                        *collapsed = true;
-                    }
-                    self.trim_if_needed();
-                    return true;
-                }
+                *r = Some(result);
+                *e = is_error;
+                *collapsed = true;
             }
+            // 增量更新 cached_snapshot：从 idx 开始重渲染。
+            self.recompute_snapshot_tail(idx);
+            self.trim_if_needed();
+            return true;
         }
         false
     }
@@ -273,17 +281,15 @@ impl OutputBuffer {
     /// 切换最近一个 ToolCard 的折叠/展开状态。
     /// 返回 true 表示成功切换。
     pub(crate) fn toggle_latest_tool_card(&mut self) -> bool {
-        for entry in self.entries.iter_mut().rev() {
-            if let OutputEntry::ToolCard {
-                collapsed,
-                result: Some(_),
-                ..
-            } = entry
-            {
+        let found_idx = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
+            matches!(e, OutputEntry::ToolCard { result: Some(_), .. }).then_some(idx)
+        });
+        if let Some(idx) = found_idx {
+            if let OutputEntry::ToolCard { collapsed, .. } = &mut self.entries[idx] {
                 *collapsed = !*collapsed;
-                self.dirty = true;
-                return true;
             }
+            self.recompute_snapshot_tail(idx);
+            return true;
         }
         false
     }
@@ -291,20 +297,21 @@ impl OutputBuffer {
     /// 切换指定索引处 ToolCard 的折叠状态。
     pub(crate) fn toggle_tool_card_at(&mut self, index: usize) -> bool {
         let mut count = 0;
-        for entry in self.entries.iter_mut() {
-            if let OutputEntry::ToolCard {
-                collapsed,
-                result: Some(_),
-                ..
-            } = entry
-            {
+        let found_idx = self.entries.iter().enumerate().find_map(|(idx, e)| {
+            if matches!(e, OutputEntry::ToolCard { result: Some(_), .. }) {
                 if count == index {
-                    *collapsed = !*collapsed;
-                    self.dirty = true;
-                    return true;
+                    return Some(idx);
                 }
                 count += 1;
             }
+            None
+        });
+        if let Some(idx) = found_idx {
+            if let OutputEntry::ToolCard { collapsed, .. } = &mut self.entries[idx] {
+                *collapsed = !*collapsed;
+            }
+            self.recompute_snapshot_tail(idx);
+            return true;
         }
         false
     }
@@ -396,7 +403,8 @@ impl OutputBuffer {
                 }) = self.entries.get_mut(entry_idx)
                 {
                     *collapsed = !*collapsed;
-                    self.dirty = true;
+                    // 增量更新 cached_snapshot：从 entry_idx 开始重渲染。
+                    self.recompute_snapshot_tail(entry_idx);
                     return true;
                 }
             }
@@ -404,24 +412,39 @@ impl OutputBuffer {
         false
     }
 
-    /// 渲染所有条目为单个字符串（带脏标记缓存优化）。
-    /// dirty=true 时重新渲染并更新缓存，否则返回缓存。
-    pub(crate) fn render_all(&mut self) -> String {
-        if !self.dirty {
-            return self.cached_snapshot.clone();
+    /// 从 from_idx 开始重新渲染条目，增量更新 cached_snapshot 和 rendered_lengths。
+    /// 用于 entries 被修改后的增量更新：只重渲染受影响的尾部，避免全量遍历。
+    ///
+    /// 复杂度：O(entries.len() - from_idx) 的 render 调用 + O(cached_snapshot.len())
+    /// 的 truncate。对于高频的 append 合并（from_idx = len-1），只重渲染 1 个条目。
+    fn recompute_snapshot_tail(&mut self, from_idx: usize) {
+        // 计算 from_idx 之前所有条目的 render 长度之和（cached_snapshot 中的起始字节位置）
+        let start_byte: usize = self
+            .rendered_lengths
+            .iter()
+            .take(from_idx)
+            .sum();
+        // 截断 cached_snapshot 到 start_byte
+        self.cached_snapshot.truncate(start_byte);
+        // 截断 rendered_lengths 到 from_idx
+        self.rendered_lengths.truncate(from_idx);
+        // 重新渲染 from_idx 之后的条目
+        for i in from_idx..self.entries.len() {
+            let rendered = self.entries[i].render();
+            let len = rendered.len();
+            self.cached_snapshot.push_str(&rendered);
+            self.rendered_lengths.push(len);
         }
-        let mut out = String::new();
-        for entry in &self.entries {
-            out.push_str(&entry.render());
-        }
-        self.cached_snapshot = out.clone();
-        self.dirty = false;
-        out
+    }
+
+    /// 返回 cached_snapshot 的 clone。
+    /// 增量维护模式下 cached_snapshot 始终最新，无需全量遍历。
+    pub(crate) fn render_all(&self) -> String {
+        self.cached_snapshot.clone()
     }
 
     /// 保留向后兼容：返回渲染后的文本（等价于 render_all）。
-    /// 注意：此方法需要 &mut self 因为 render_all 会更新缓存。
-    pub(crate) fn buffer(&mut self) -> String {
+    pub(crate) fn buffer(&self) -> String {
         self.render_all()
     }
 
@@ -473,6 +496,8 @@ impl OutputBuffer {
                 }
                 self.entries.remove(idx);
                 self.truncated = true;
+                // 删除条目后增量更新 cached_snapshot：从 idx 开始重渲染。
+                self.recompute_snapshot_tail(idx);
                 continue;
             }
             // Bug L8 修复：无 Text 可淘汰时，裁剪最早的 ToolCard 的 result。
@@ -493,6 +518,8 @@ impl OutputBuffer {
                         self.truncated = true;
                     }
                 }
+                // result 被替换为占位符后增量更新 cached_snapshot。
+                self.recompute_snapshot_tail(idx);
             } else {
                 // 既无 Text 也无可裁剪的 ToolCard，停止以避免死循环。
                 break;
@@ -515,11 +542,13 @@ impl OutputView {
     }
 
     /// 快照当前渲染后的文本内容（克隆）。
+    /// 增量维护模式下 cached_snapshot 始终最新，持锁期间只做 String clone。
     pub(crate) fn snapshot(&self) -> String {
         self.inner
             .lock()
             .expect("OutputBuffer mutex poisoned")
-            .render_all()
+            .cached_snapshot
+            .clone()
     }
 
     /// 清空所有条目。
@@ -528,8 +557,8 @@ impl OutputView {
         guard.entries.clear();
         guard.text_total_bytes = 0;
         guard.truncated = false;
-        guard.dirty = true;
-        guard.cached_snapshot = String::new();
+        guard.rendered_lengths.clear();
+        guard.cached_snapshot.clear();
     }
 
     /// 总写入字节数。
