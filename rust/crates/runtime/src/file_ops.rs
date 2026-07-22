@@ -35,6 +35,41 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
     Ok(buffer[..bytes_read].contains(&0))
 }
 
+/// `read_file_for_search` 的跳过原因(诊断用,非致命错误)。
+/// 调用方统一计数为 skipped_files,不区分具体原因(LLM 只需知道
+/// "有 N 个文件被跳过,结果可能不完整")。
+enum ReadForSearchError {
+    /// 文件过大(超过 MAX_READ_SIZE),跳过避免 OOM。
+    TooLarge,
+    /// 文件被识别为二进制(含 NUL 字节),无文本匹配价值。
+    Binary,
+    /// 读取失败(权限/IO 错误等)。
+    Io,
+}
+
+/// 读取文件内容用于 grep 搜索。
+///
+/// 与 `fs::read_to_string` 的关键差异:
+/// - 使用字节读取 + `String::from_utf8_lossy`,使含 BOM 或部分非 UTF-8
+///   字节的源码文件也能被搜索(痛点 1 根因修复)。
+/// - 跳过二进制文件(含 NUL 字节)而非整文件静默丢失。
+/// - 跳过超大文件(超过 MAX_READ_SIZE)避免 OOM。
+/// - 任何跳过都返回 `ReadForSearchError` 供调用方计数,而非静默 `continue`。
+fn read_file_for_search(path: &Path) -> Result<String, ReadForSearchError> {
+    // 先检查大小,避免把 10MB+ 的二进制全读进内存
+    let metadata = fs::metadata(path).map_err(|_| ReadForSearchError::Io)?;
+    if metadata.len() > MAX_READ_SIZE {
+        return Err(ReadForSearchError::TooLarge);
+    }
+    // 二进制文件(含 NUL)无文本搜索价值,跳过
+    if matches!(is_binary_file(path), Ok(true)) {
+        return Err(ReadForSearchError::Binary);
+    }
+    // 字节读取 + lossy 转换:UTF-8 错误不再致命
+    let bytes = fs::read(path).map_err(|_| ReadForSearchError::Io)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Validate that a resolved path stays within the given workspace root.
 /// Returns the canonical path on success, or an error if the path escapes
 /// the workspace boundary (e.g. via `../` traversal or symlink).
@@ -357,6 +392,15 @@ pub struct GrepSearchOutput {
     pub applied_limit: Option<usize>,
     #[serde(rename = "appliedOffset")]
     pub applied_offset: Option<usize>,
+    /// 截断前的真实匹配文件总数(用于诊断"是否被 head_limit 截断")。
+    /// 与 `num_files` 不同:`num_files` 是返回的文件数,本字段是
+    /// 应用 limit/offset 前的全部匹配数。None 表示未跟踪(向后兼容)。
+    #[serde(rename = "totalFilesBeforeLimit", default, skip_serializing_if = "Option::is_none")]
+    pub total_files_before_limit: Option<usize>,
+    /// 读取失败/被跳过的文件数(用于诊断"静默跳过"问题)。
+    /// 当文件过大、读取错误、或被识别为二进制时计入。
+    #[serde(rename = "skippedFiles", default, skip_serializing_if = "Option::is_none")]
+    pub skipped_files: Option<usize>,
 }
 
 /// Reads a text file and returns a line-windowed payload.
@@ -942,6 +986,7 @@ fn grep_search_impl(
     let mut filenames = Vec::new();
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
+    let mut skipped_files = 0usize;
 
     for file_path in collect_search_files(&base_path)? {
         if !canonical_roots.is_empty() {
@@ -952,8 +997,17 @@ fn grep_search_impl(
             continue;
         }
 
-        let Ok(file_contents) = fs::read_to_string(&file_path) else {
-            continue;
+        // 读取失败根因修复(痛点 1):
+        // 原实现用 read_to_string,遇到 BOM/非 UTF-8/二进制字节会整文件
+        // 静默跳过,导致"明明有匹配却返回 0"的错误结论。
+        // 改为字节读取 + from_utf8_lossy,使含 BOM/部分非 UTF-8 的源码
+        // 文件也能被正常搜索;真正的二进制文件(含 NUL 字节)跳过但计数。
+        let file_contents = match read_file_for_search(&file_path) {
+            Ok(c) => c,
+            Err(_) => {
+                skipped_files += 1;
+                continue;
+            }
         };
 
         if output_mode == "count" {
@@ -995,6 +1049,7 @@ fn grep_search_impl(
         }
     }
 
+    let total_files_before_limit = filenames.len();
     let (filenames, applied_limit, applied_offset) =
         apply_limit(filenames, input.head_limit, input.offset);
     if output_mode == "content" {
@@ -1004,6 +1059,8 @@ fn grep_search_impl(
             content_lines,
             input.head_limit,
             input.offset,
+            total_files_before_limit,
+            skipped_files,
         ));
     }
 
@@ -1016,6 +1073,10 @@ fn grep_search_impl(
         num_matches: (output_mode == "count").then_some(total_matches),
         applied_limit,
         applied_offset,
+        // 截断前的真实匹配总数(诊断"假阴性"用)
+        total_files_before_limit: Some(total_files_before_limit),
+        // 跳过文件数 > 0 时才上报,避免污染常规输出
+        skipped_files: (skipped_files > 0).then_some(skipped_files),
     })
 }
 
@@ -1025,6 +1086,8 @@ fn build_grep_content_output(
     content_lines: Vec<String>,
     head_limit: Option<usize>,
     offset: Option<usize>,
+    total_files_before_limit: usize,
+    skipped_files: usize,
 ) -> GrepSearchOutput {
     let (lines, limit, offset) = apply_limit(content_lines, head_limit, offset);
     GrepSearchOutput {
@@ -1036,6 +1099,8 @@ fn build_grep_content_output(
         num_matches: None,
         applied_limit: limit,
         applied_offset: offset,
+        total_files_before_limit: Some(total_files_before_limit),
+        skipped_files: (skipped_files > 0).then_some(skipped_files),
     }
 }
 
@@ -1084,7 +1149,12 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    // 复用 glob_search 的目录过滤逻辑,避免爬 .git/target/node_modules 等重目录,
+    // 这些目录既拖慢搜索又易触发 250 文件上限导致真实匹配被截断丢失。
+    for entry in WalkDir::new(base_path)
+        .into_iter()
+        .filter_entry(|e| !should_skip_glob_dir(e))
+    {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
@@ -1655,5 +1725,145 @@ mod tests {
         assert!(component_contains_glob("**"));
         assert!(component_contains_glob("*.rs"));
         assert!(!component_contains_glob("src"));
+    }
+
+    // ---- 痛点 1 回归测试:grep 静默跳过 bug 修复 ----
+
+    /// 辅助:构造 GrepSearchInput(files_with_matches 模式)
+    fn grep_files_with_matches(pattern: &str, path: &str, glob: Option<&str>) -> GrepSearchInput {
+        GrepSearchInput {
+            pattern: pattern.to_string(),
+            path: Some(path.to_string()),
+            glob: glob.map(str::to_string),
+            output_mode: Some("files_with_matches".to_string()),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: None,
+            case_insensitive: None,
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        }
+    }
+
+    /// 回归:含 BOM 的 UTF-8 文件必须能被搜索到(原 read_to_string 会跳过)。
+    #[test]
+    fn grep_finds_matches_in_bom_prefixed_file() {
+        let dir = temp_path("grep-bom");
+        std::fs::create_dir_all(&dir).expect("dir");
+        // UTF-8 BOM (EF BB BF) + "fn hello()"
+        let bom_content: &[u8] = b"\xEF\xBB\xBFfn hello() {\n    println!(\"hello\");\n}\n";
+        let file = dir.join("bom.rs");
+        std::fs::write(&file, bom_content).expect("write");
+
+        let out = grep_search(&grep_files_with_matches("hello", dir.to_str().unwrap(), Some("*.rs")))
+            .expect("grep");
+        assert_eq!(
+            out.num_files, 1,
+            "BOM 文件必须被搜索到(痛点 1 根因);skipped={:?}",
+            out.skipped_files
+        );
+        assert!(out.filenames.iter().any(|f| f.contains("bom.rs")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:含少量非 UTF-8 字节的文件也应被搜索(lossy 解码)。
+    #[test]
+    fn grep_finds_matches_in_partially_invalid_utf8_file() {
+        let dir = temp_path("grep-invalid-utf8");
+        std::fs::create_dir_all(&dir).expect("dir");
+        // "fn broken() {" + 无效 UTF-8 字节 FF FE + " // hello marker"
+        let mut content: Vec<u8> = b"fn broken() {\n".to_vec();
+        content.extend_from_slice(b"\xFF\xFE"); // 无效 UTF-8
+        content.extend_from_slice(b"    // hello marker\n}\n");
+        let file = dir.join("broken.rs");
+        std::fs::write(&file, &content).expect("write");
+
+        let out = grep_search(&grep_files_with_matches("hello", dir.to_str().unwrap(), Some("*.rs")))
+            .expect("grep");
+        assert_eq!(
+            out.num_files, 1,
+            "部分非 UTF-8 文件应通过 lossy 解码被搜索;skipped={:?}",
+            out.skipped_files
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:二进制文件应被跳过并计入 skipped_files(而非静默丢失)。
+    #[test]
+    fn grep_skips_binary_file_and_reports_count() {
+        let dir = temp_path("grep-binary");
+        std::fs::create_dir_all(&dir).expect("dir");
+        // 一个二进制文件(含 NUL)+ 一个正常文本文件,两者都含 "hello"
+        std::fs::write(dir.join("bin.dat"), b"\x00\x01hello\x00\x02").expect("write bin");
+        std::fs::write(dir.join("text.rs"), "fn hello() {}").expect("write text");
+
+        let out = grep_search(&grep_files_with_matches("hello", dir.to_str().unwrap(), None))
+            .expect("grep");
+        // 文本文件应被找到
+        assert_eq!(out.num_files, 1, "应只匹配文本文件");
+        assert!(
+            out.filenames.iter().any(|f| f.contains("text.rs")),
+            "应找到 text.rs"
+        );
+        // 二进制跳过应在 skipped_files 中上报
+        assert_eq!(
+            out.skipped_files,
+            Some(1),
+            "二进制文件跳过必须上报(痛点 1:不再静默)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:.git/target/node_modules 等重目录应被 grep 过滤(原 collect_search_files 不过滤)。
+    #[test]
+    fn grep_prunes_heavy_directories() {
+        let dir = temp_path("grep-prune");
+        std::fs::create_dir_all(dir.join("src")).expect("src");
+        std::fs::create_dir_all(dir.join("target/debug")).expect("target");
+        std::fs::create_dir_all(dir.join("node_modules/pkg")).expect("node_modules");
+
+        std::fs::write(dir.join("src/real.rs"), "fn marker() {}").expect("write src");
+        std::fs::write(dir.join("target/debug/junk.rs"), "fn marker() {}").expect("write target");
+        std::fs::write(dir.join("node_modules/pkg/deps.rs"), "fn marker() {}").expect("write nm");
+
+        let out = grep_search(&grep_files_with_matches("marker", dir.to_str().unwrap(), Some("*.rs")))
+            .expect("grep");
+        assert_eq!(
+            out.num_files, 1,
+            "应只匹配 src/real.rs,target/node_modules 应被过滤"
+        );
+        assert!(
+            out.filenames.iter().any(|f| f.contains("src") && f.contains("real.rs")),
+            "应找到 src/real.rs;实际: {:?}",
+            out.filenames
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:totalFilesBeforeLimit 在截断时上报真实总数(诊断假阴性)。
+    #[test]
+    fn grep_reports_total_before_limit_when_truncated() {
+        let dir = temp_path("grep-truncate");
+        std::fs::create_dir_all(&dir).expect("dir");
+        // 创建 3 个匹配文件,但 head_limit=1
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("f{i}.rs")), "fn marker() {}").expect("write");
+        }
+
+        let mut input = grep_files_with_matches("marker", dir.to_str().unwrap(), Some("*.rs"));
+        input.head_limit = Some(1);
+        let out = grep_search(&input).expect("grep");
+        assert_eq!(out.num_files, 1, "head_limit=1 应只返回 1 个");
+        assert_eq!(
+            out.total_files_before_limit,
+            Some(3),
+            "应上报截断前真实总数 3(诊断假阴性)"
+        );
+        assert_eq!(out.applied_limit, Some(1), "应上报 applied_limit=1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
