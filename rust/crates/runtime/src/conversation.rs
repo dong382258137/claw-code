@@ -414,6 +414,7 @@ pub struct ConversationRuntime<C, T> {
     /// 上一次 verify 为什么失败,只能盲目重试 → 必然陷入 doom loop。
     pending_remediation: Option<String>,
     decision_log: Option<crate::decision_log::DecisionLog>,
+    project_topology: Option<std::sync::Arc<crate::project_topology::ProjectTopology>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -483,6 +484,7 @@ where
             notebook_refresh_pending: false,
             pending_remediation: None,
             decision_log: None,
+            project_topology: None,
         }
     }
 
@@ -612,6 +614,14 @@ where
     #[must_use]
     pub fn with_decision_log(mut self, decision_log: crate::decision_log::DecisionLog) -> Self {
         self.decision_log = Some(decision_log);
+        self
+    }
+
+    pub fn with_project_topology(
+        mut self,
+        topo: std::sync::Arc<crate::project_topology::ProjectTopology>,
+    ) -> Self {
+        self.project_topology = Some(topo);
         self
     }
 
@@ -1416,6 +1426,21 @@ where
                             // Phase 4-A:搜索历史修复决策(FTS5 全文检索)。
                             // LLM 在遇到问题时可先查历史,避免重复犯错。
                             match self.execute_search_past_decisions(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "query_project_graph" {
+                            match self.execute_query_project_graph() {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "find_boundary_crossings" {
+                            match self.execute_find_boundary_crossings(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "get_symbol_info" {
+                            match self.execute_get_symbol_info(&effective_input) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
@@ -2323,6 +2348,44 @@ where
         decision_log
             .search_decisions(query, top_k)
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+    }
+
+    fn execute_query_project_graph(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(t) = &self.project_topology else {
+            return Ok("query_project_graph not available.".to_string());
+        };
+        t.query_project_graph()
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+    }
+
+    fn execute_find_boundary_crossings(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(t) = &self.project_topology else {
+            return Ok("find_boundary_crossings not available.".to_string());
+        };
+        let p: serde_json::Value = serde_json::from_str(input)
+            .map_err(|e| format!("invalid JSON: {e}"))?;
+        let q = p.get("query").and_then(|v| v.as_str());
+        t.find_boundary_crossings(q)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+    }
+
+    fn execute_get_symbol_info(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(t) = &self.project_topology else {
+            return Ok("get_symbol_info not available.".to_string());
+        };
+        let p: serde_json::Value = serde_json::from_str(input)
+            .map_err(|e| format!("invalid JSON: {e}"))?;
+        let s = p.get("symbol").and_then(|v| v.as_str()).ok_or("missing symbol")?;
+        t.get_symbol_info(s)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
     }
 
     #[must_use]

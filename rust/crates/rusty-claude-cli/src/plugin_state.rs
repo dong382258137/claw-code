@@ -758,6 +758,39 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         }),
         required_permission: PermissionMode::ReadOnly,
     });
+    // Phase 4-B: ProjectTopology + DomainTools registration.
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "query_project_graph".to_string(),
+        description: Some("Query the cargo workspace crate dependency graph. Returns all crates, dependencies, source paths, and reverse-dependency info.".to_string()),
+        input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        required_permission: PermissionMode::ReadOnly,
+    });
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "find_boundary_crossings".to_string(),
+        description: Some("Find cross-crate symbol/call-site boundaries. Optional query to filter by crate name. If ProjectTopology is building, do NOT retry - use read/grep instead.".to_string()),
+        input_schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}, "additionalProperties": false}),
+        required_permission: PermissionMode::ReadOnly,
+    });
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "get_symbol_info".to_string(),
+        description: Some("Look up a symbol in the project topology index. Returns definition location, call sites, and crate membership. Best-effort; use grep_search for exhaustive results.".to_string()),
+        input_schema: serde_json::json!({"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"], "additionalProperties": false}),
+        required_permission: PermissionMode::ReadOnly,
+    });
+    // DomainTools: stateless algorithm tools.
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "refactor_algorithm_topo".to_string(),
+        description: Some("Suggestion-mode refactoring: returns a list of suggested edits (file + line + old/new signature) for renaming a symbol. Does NOT modify any files. Review suggestions then use edit_file to apply.".to_string()),
+        input_schema: serde_json::json!({"type": "object", "properties": {"target_symbol": {"type": "string"}, "new_name": {"type": "string"}, "reason": {"type": "string"}}, "required": ["target_symbol"], "additionalProperties": false}),
+        required_permission: PermissionMode::ReadOnly,
+    });
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "benchmark_compare".to_string(),
+        description: Some("Run a command multiple times and report timing statistics (avg, median, min, max, stddev). Supports warmup runs, configurable sample size, and per-sample exit code tracking.".to_string()),
+        input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}, "timeout_seconds": {"type": "integer", "default": 60}, "sample_size": {"type": "integer", "default": 20}, "warmup_runs": {"type": "integer", "default": 2}}, "required": ["command"], "additionalProperties": false}),
+        required_permission: PermissionMode::ReadOnly,
+    });
+
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {

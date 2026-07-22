@@ -176,6 +176,12 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
+        } else if tool_name == "refactor_algorithm_topo" {
+            tools::domain_algorithm::refactor_algorithm_topo(input)
+                .map_err(|e| ToolError::new(e))
+        } else if tool_name == "benchmark_compare" {
+            tools::domain_algorithm::benchmark_compare(input)
+                .map_err(|e| ToolError::new(e))
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
         } else {

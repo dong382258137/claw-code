@@ -228,7 +228,7 @@ pub fn benchmark_compare(json_input: &str) -> Result<String, String> {
         .get("command")
         .and_then(|v| v.as_str())
         .ok_or("missing 'command' field")?;
-    let timeout_seconds = parsed
+    let _timeout_seconds = parsed
         .get("timeout_seconds")
         .and_then(|v| v.as_u64())
         .unwrap_or(60);
