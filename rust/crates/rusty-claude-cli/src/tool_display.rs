@@ -64,6 +64,9 @@ pub(crate) struct CliToolExecutor {
     /// emitted so the TUI can render collapsible tool cards.
     #[cfg(feature = "full-tui")]
     status_emitter: Option<crate::streaming::StatusEmitter>,
+    /// Phase 4 认知外骨骼：共享 ProjectTopology 实例，用于 refactor_algorithm_topo。
+    /// 与 ConversationRuntime 共享同一个 Arc，避免重复构建。
+    topology: Option<Arc<runtime::project_topology::ProjectTopology>>,
 }
 
 impl CliToolExecutor {
@@ -82,7 +85,17 @@ impl CliToolExecutor {
             mcp_state,
             #[cfg(feature = "full-tui")]
             status_emitter: None,
+            topology: None,
         }
+    }
+
+    /// Phase 4：注入 ProjectTopology 实例，启用 refactor_algorithm_topo 工具。
+    pub(crate) fn with_project_topology(
+        mut self,
+        topology: Option<Arc<runtime::project_topology::ProjectTopology>>,
+    ) -> Self {
+        self.topology = topology;
+        self
     }
 
     #[cfg(feature = "full-tui")]
@@ -117,6 +130,75 @@ impl CliToolExecutor {
             mcp_degraded,
         ))
         .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    /// Phase 4：refactor_algorithm_topo 工具执行入口。
+    ///
+    /// 解析 JSON 输入后调用 runtime::domain_algorithm 版本（与 TUI 主路径一致），
+    /// 消除双实现分歧。如果没有 topology 实例，从 cwd 临时构造一个。
+    fn execute_refactor_algorithm_topo(&self, input: &str) -> Result<String, ToolError> {
+        let parsed: serde_json::Value = serde_json::from_str(input)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let target_symbol = parsed
+            .get("target_symbol")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::new("missing 'target_symbol' field".to_string()))?;
+        let new_name = parsed.get("new_name").and_then(|v| v.as_str());
+        let reason = parsed.get("reason").and_then(|v| v.as_str());
+
+        // 如果有共享的 topology 实例，直接使用；否则从 cwd 临时构造。
+        if let Some(topo) = &self.topology {
+            runtime::domain_algorithm::refactor_algorithm_topo(
+                topo,
+                target_symbol,
+                new_name,
+                reason,
+            )
+            .map_err(ToolError::new)
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let topo = runtime::project_topology::ProjectTopology::new(cwd);
+            runtime::domain_algorithm::refactor_algorithm_topo(
+                &topo,
+                target_symbol,
+                new_name,
+                reason,
+            )
+            .map_err(ToolError::new)
+        }
+    }
+
+    /// Phase 4：benchmark_compare 工具执行入口。
+    ///
+    /// 解析 JSON 输入后调用 runtime::domain_algorithm 版本（带真正的 timeout + kill）。
+    fn execute_benchmark_compare(&self, input: &str) -> Result<String, ToolError> {
+        let parsed: serde_json::Value = serde_json::from_str(input)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let command = parsed
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::new("missing 'command' field".to_string()))?;
+        let timeout_seconds = parsed
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60);
+        let sample_size = parsed
+            .get("sample_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20) as usize;
+        let warmup_runs = parsed
+            .get("warmup_runs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3) as usize;
+        let cwd = std::env::current_dir().ok();
+        runtime::domain_algorithm::benchmark_compare(
+            command,
+            cwd.as_deref(),
+            timeout_seconds,
+            sample_size,
+            warmup_runs,
+        )
+        .map_err(ToolError::new)
     }
 
     fn execute_runtime_tool(
@@ -177,11 +259,9 @@ impl ToolExecutor for CliToolExecutor {
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if tool_name == "refactor_algorithm_topo" {
-            tools::domain_algorithm::refactor_algorithm_topo(input)
-                .map_err(|e| ToolError::new(e))
+            self.execute_refactor_algorithm_topo(input)
         } else if tool_name == "benchmark_compare" {
-            tools::domain_algorithm::benchmark_compare(input)
-                .map_err(|e| ToolError::new(e))
+            self.execute_benchmark_compare(input)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
         } else {

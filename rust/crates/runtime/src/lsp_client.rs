@@ -4,8 +4,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 // SP4.2 修复:HashSet 用于 opened_files
@@ -247,6 +248,9 @@ impl LspRegistry {
             Some(root_path.to_owned()),
             command.to_owned(),
         );
+        // 注入 registry inner 的弱引用,供后台 reader 线程推送 publishDiagnostics
+        // 弱引用避免 ProcessLspTransport ↔ LspRegistry 的循环强引用
+        transport.set_registry_inner(Arc::downgrade(&self.inner));
 
         match transport.spawn() {
             Ok(()) => {
@@ -703,14 +707,26 @@ pub struct ProcessLspTransport {
     child: Option<Arc<Mutex<Child>>>,
     /// 子进程 stdin(用于写入请求)。
     child_stdin: Option<Arc<Mutex<ChildStdin>>>,
-    /// 子进程 stdout(用于读取响应)。
+    /// 子进程 stdout(由后台 reader 线程独占读取)。
     child_stdout: Option<Arc<Mutex<ChildStdout>>>,
     /// JSON-RPC 请求 ID 计数器。
     next_id: Arc<Mutex<u64>>,
-    /// SP4.2 修复:确保 send 的 write+read 原子性。
-    send_lock: Mutex<()>,
+    /// 只锁 write,不再锁 read(reader 线程独占 stdout 读取)。
+    /// 替代旧 send_lock,使并发请求不再因读等待而串行化。
+    write_lock: Mutex<()>,
     /// SP4.2 修复:已发送 didOpen 的文件路径集合,避免重复 open。
     opened_files: Mutex<HashSet<String>>,
+    /// 后台 reader 线程停止信号。
+    /// Drop/shutdown 时置 true;reader 线程在下次循环检查时退出
+    /// (若阻塞在 read_exact,则由 child kill 导致 EOF 退出)。
+    reader_stop: Arc<AtomicBool>,
+    /// pending requests: 请求 id → 响应 channel sender。
+    /// send() 注册后等待,reader 线程读到匹配 id 的响应时通过 channel 发送。
+    pending_responses: Arc<Mutex<HashMap<u64, mpsc::Sender<Result<serde_json::Value, String>>>>>,
+    /// LspRegistry inner 的弱引用,reader 线程用于推送 publishDiagnostics 到缓存。
+    /// 弱引用避免 ProcessLspTransport ↔ LspRegistry 的循环强引用。
+    /// None 表示未关联 registry(如单元测试中独立构造的 transport)。
+    registry_inner: Option<Weak<Mutex<RegistryInner>>>,
 }
 
 impl std::fmt::Debug for ProcessLspTransport {
@@ -741,9 +757,20 @@ impl ProcessLspTransport {
             child_stdin: None,
             child_stdout: None,
             next_id: Arc::new(Mutex::new(1)),
-            send_lock: Mutex::new(()),
+            write_lock: Mutex::new(()),
             opened_files: Mutex::new(std::collections::HashSet::new()),
+            reader_stop: Arc::new(AtomicBool::new(false)),
+            pending_responses: Arc::new(Mutex::new(HashMap::new())),
+            registry_inner: None,
         }
+    }
+
+    /// 关联 LspRegistry inner 的弱引用,供后台 reader 线程推送 publishDiagnostics。
+    ///
+    /// 必须在 [`spawn`](Self::spawn) 之前调用,否则 reader 线程无法更新 diagnostics 缓存。
+    /// 通常由 [`LspRegistry::spawn_server`] 在创建 transport 后自动设置。
+    fn set_registry_inner(&mut self, weak: Weak<Mutex<RegistryInner>>) {
+        self.registry_inner = Some(weak);
     }
 
     /// 启动 LSP server 子进程(Step 4.2)。
@@ -775,6 +802,11 @@ impl ProcessLspTransport {
         self.child_stdin = Some(Arc::new(Mutex::new(stdin)));
         self.child_stdout = Some(Arc::new(Mutex::new(stdout)));
 
+        // 启动后台 reader 线程:独占 stdout 读取,分发响应到 pending channel,
+        // 并将 publishDiagnostics 通知推送到 LspRegistry 缓存。
+        // 必须在 send("initialize") 之前启动,否则响应无人消费。
+        self.start_reader_thread();
+
         // 发送 initialize 请求(SP4.2 修复:验证响应而非忽略)
         let init_params = self.initialize_params();
         let response = self.send("initialize", init_params)?;
@@ -793,6 +825,106 @@ impl ProcessLspTransport {
         self.send_notification("initialized", serde_json::json!({}))?;
 
         Ok(())
+    }
+
+    /// 启动后台 reader 线程。
+    ///
+    /// reader 线程独占 `child_stdout` 的读取,循环读取 JSON-RPC 消息:
+    /// - **响应**(有 `id` 字段):通过 `pending_responses` channel 分发给对应的 `send()` 调用
+    /// - **通知**(无 `id` 字段):`textDocument/publishDiagnostics` 推送到 LspRegistry 缓存
+    ///
+    /// 线程退出条件:
+    /// - `reader_stop` 被置 true(Drop/shutdown 触发),且当前未阻塞在 read
+    /// - `read_one_message` 返回错误(通常是子进程关闭导致 EOF)
+    ///
+    /// # 并发模型
+    /// 旧实现中 `send_lock` 把 write+read 绑定为原子操作,导致并发请求串行化。
+    /// 新实现中 reader 线程独立消费响应,`send()` 只用 `write_lock` 保护写入,
+    /// 多个请求可并发 write(排队) + 并发等待响应(各自 channel),互不阻塞。
+    fn start_reader_thread(&self) {
+        let stdout = match &self.child_stdout {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+        let stop = Arc::clone(&self.reader_stop);
+        let pending = Arc::clone(&self.pending_responses);
+        let registry_weak = self.registry_inner.clone();
+        let language = self.language.clone();
+
+        thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                match read_one_message(&stdout) {
+                    Ok(msg) => {
+                        // 响应:有 id 字段,分发给 pending request
+                        if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
+                            if let Some(tx) = pending
+                                .lock()
+                                .ok()
+                                .and_then(|mut p| p.remove(&id))
+                            {
+                                let _ = tx.send(Ok(msg));
+                            }
+                            // 无 pending:可能是 send() 超时已移除,丢弃
+                        } else {
+                            // 通知:检查是否为 publishDiagnostics
+                            let is_publish_diag = msg
+                                .get("method")
+                                .and_then(|m| m.as_str())
+                                .map(|m| m == "textDocument/publishDiagnostics")
+                                .unwrap_or(false);
+                            if is_publish_diag {
+                                let diags = parse_publish_diagnostics(&msg);
+                                // LSP 语义:publishDiagnostics 是某文件的全量诊断推送。
+                                // 需按 path 替换(而非追加),先清除该 path 的旧诊断再 extend。
+                                if let Some(path) =
+                                    diags.first().map(|d| d.path.clone())
+                                {
+                                    if let Some(weak) = &registry_weak {
+                                        if let Some(arc) = weak.upgrade() {
+                                            if let Ok(mut inner) = arc.lock() {
+                                                if let Some(server) =
+                                                    inner.servers.get_mut(&language)
+                                                {
+                                                    server.diagnostics.retain(|d| d.path != path);
+                                                    server.diagnostics.extend(diags);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // 空诊断数组:清除该文件的所有诊断
+                                    if let Some(uri) = msg
+                                        .get("params")
+                                        .and_then(|p| p.get("uri"))
+                                        .and_then(|u| u.as_str())
+                                    {
+                                        let path = uri_to_path(uri);
+                                        if let Some(weak) = &registry_weak {
+                                            if let Some(arc) = weak.upgrade() {
+                                                if let Ok(mut inner) = arc.lock() {
+                                                    if let Some(server) =
+                                                        inner.servers.get_mut(&language)
+                                                    {
+                                                        server
+                                                            .diagnostics
+                                                            .retain(|d| d.path != path);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // 其他通知(window/logMessage 等):忽略
+                        }
+                    }
+                    Err(_) => {
+                        // EOF 或读取错误(通常是子进程关闭),退出循环
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// 发送 JSON-RPC 通知(无 id,不等待响应)。
@@ -885,6 +1017,8 @@ impl ProcessLspTransport {
     /// 关闭后,`is_spawned()` 返回 false,后续 `send()` 调用将返回
     /// "not_spawned" placeholder 响应(保持向后兼容)。
     pub fn shutdown(&mut self) {
+        // 先通知 reader 线程停止
+        self.reader_stop.store(true, Ordering::Release);
         if let Some(child) = self.child.take() {
             let mut child = match child.lock() {
                 Ok(c) => c,
@@ -894,6 +1028,7 @@ impl ProcessLspTransport {
                 }
             };
             // 尝试优雅终止;失败则强制杀死
+            // kill 后 reader 线程的 read_exact 因 EOF 返回错误,自然退出
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -931,124 +1066,14 @@ impl ProcessLspTransport {
         Ok(())
     }
 
-    /// SP4.2 修复:从子进程 stdout 读取一条 JSON-RPC 消息(带超时)。
-    ///
-    /// 超时时间:initialize 30s,普通请求 10s。
-    ///
-    /// 实现说明:`ChildStdout` 没有 `set_read_timeout` 方法,且 workspace
-    /// 禁用 `unsafe_code`(不能 raw handle 转 `File`)。改用专用线程做阻塞
-    /// 读取,主线程通过 `mpsc::Receiver::recv_timeout` 控制超时。
-    fn read_message(&self, timeout_secs: u64) -> Result<serde_json::Value, String> {
-        let stdout_handle = self
-            .child_stdout
-            .as_ref()
-            .ok_or_else(|| "LSP server not spawned; call spawn() first".to_string())?;
-
-        // clone Arc,移入线程
-        let stdout_arc = Arc::clone(stdout_handle);
-        let (tx, rx) = mpsc::channel::<Result<serde_json::Value, String>>();
-
-        thread::spawn(move || {
-            let result = (|| -> Result<serde_json::Value, String> {
-                let mut stdout = stdout_arc
-                    .lock()
-                    .map_err(|_| "stdout lock poisoned".to_string())?;
-
-                // 读取 Content-Length header
-                let mut header_line = String::new();
-                let mut byte = [0u8; 1];
-                loop {
-                    stdout
-                        .read_exact(&mut byte)
-                        .map_err(|e| format!("read header error: {e}"))?;
-                    let c = byte[0] as char;
-                    header_line.push(c);
-                    if header_line.ends_with("\r\n\r\n") {
-                        break;
-                    }
-                    // 防止 header 无限增长
-                    if header_line.len() > 1024 {
-                        return Err("LSP header too long, possibly malformed".to_string());
-                    }
-                }
-
-                // 解析 Content-Length
-                let content_length: usize = header_line
-                    .lines()
-                    .find_map(|line| {
-                        line.strip_prefix("Content-Length: ")
-                            .and_then(|v| v.trim().parse().ok())
-                    })
-                    .ok_or_else(|| format!("missing Content-Length in header: {header_line}"))?;
-
-                // 读取 body
-                let mut body = vec![0u8; content_length];
-                stdout
-                    .read_exact(&mut body)
-                    .map_err(|e| format!("read body error: {e}"))?;
-
-                let body_str =
-                    String::from_utf8(body).map_err(|e| format!("body UTF-8 error: {e}"))?;
-
-                serde_json::from_str(&body_str).map_err(|e| format!("JSON parse error: {e}"))
-            })();
-            let _ = tx.send(result);
-        });
-
-        match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(format!("LSP read timeout after {timeout_secs}s"))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("LSP reader thread panicked".to_string())
-            }
-        }
-    }
-
-    /// SP4.2 修复:读取响应直到 `id` 匹配,过滤通知。
-    ///
-    /// LSP server 会主动推送通知(publishDiagnostics、window/logMessage 等),
-    /// 这些通知有 `method` 字段但无 `id` 字段。此方法循环读取,
-    /// 跳过通知,直到拿到匹配 `expected_id` 的响应。
-    fn read_response_for_id(
-        &self,
-        expected_id: u64,
-        timeout_secs: u64,
-    ) -> Result<serde_json::Value, String> {
-        loop {
-            let message = self.read_message(timeout_secs)?;
-
-            // 检查是否有 id 字段(响应有 id,通知没有)
-            if let Some(id_val) = message.get("id") {
-                if let Some(id) = id_val.as_u64() {
-                    if id == expected_id {
-                        return Ok(message);
-                    }
-                    // id 不匹配 — 不应该发生(因为 send_lock 保证原子性),
-                    // 但容错处理:继续读取下一条
-                    continue;
-                }
-            }
-            // 无 id 字段 — 是通知,跳过(可在此处缓存通知供后续处理)
-            // 常见通知:textDocument/publishDiagnostics, window/logMessage, window/showMessage
-            continue;
-        }
-    }
+    // (read_message / read_response_for_id 已删除,改由后台 reader 线程 +
+    // `read_one_message` 模块函数 + `pending_responses` channel 替代。)
 }
 
 impl LspTransport for ProcessLspTransport {
     fn send(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
         // 若子进程已启动,走真实 stdin/stdout 通信
         if self.child.is_some() {
-            // SP4.2 修复:用 send_lock 确保 write+read 原子性
-            // 原代码 write_message 和 read_message 之间锁释放,
-            // 多线程并发时可能读到其他线程请求的响应
-            let _send_guard = self
-                .send_lock
-                .lock()
-                .map_err(|_| "send_lock poisoned".to_string())?;
-
             let id = {
                 let mut next = self
                     .next_id
@@ -1066,32 +1091,73 @@ impl LspTransport for ProcessLspTransport {
                 "params": params,
             });
 
-            self.write_message(&request)?;
+            // 注册 pending response channel,reader 线程读到匹配 id 的响应时通过它发送
+            let (tx, rx) = mpsc::channel::<Result<serde_json::Value, String>>();
+            self.pending_responses
+                .lock()
+                .map_err(|_| "pending_responses lock poisoned".to_string())?
+                .insert(id, tx);
 
-            // SP4.2 修复:initialize 用 30s 超时,普通请求用 10s
-            let timeout = if method == "initialize" { 30 } else { 10 };
-            return self.read_response_for_id(id, timeout);
-        }
-
-        // 子进程未启动,返回 placeholder 响应(保持向后兼容)
-        Ok(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "transport": "process",
-                "language": self.language,
-                "server_command": self.server_command,
-                "method": method,
-                "params": params,
-                "status": "not_spawned",
-                "message": "ProcessLspTransport not spawned — call spawn() for actual responses"
+            // 只锁 write(不锁 read),reader 线程独占 stdout 读取
+            let write_result = {
+                let _w = self
+                    .write_lock
+                    .lock()
+                    .map_err(|_| "write_lock poisoned".to_string())?;
+                self.write_message(&request)
+            };
+            if let Err(e) = write_result {
+                // write 失败:清理 pending,避免泄漏
+                self.pending_responses
+                    .lock()
+                    .ok()
+                    .and_then(|mut p| p.remove(&id));
+                return Err(e);
             }
-        }))
+
+            // 等待 reader 线程通过 channel 投递响应(带超时)
+            let timeout = if method == "initialize" { 30 } else { 10 };
+            match rx.recv_timeout(Duration::from_secs(timeout)) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.pending_responses
+                        .lock()
+                        .ok()
+                        .and_then(|mut p| p.remove(&id));
+                    Err(format!("LSP request {id} ({method}) timeout after {timeout}s"))
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.pending_responses
+                        .lock()
+                        .ok()
+                        .and_then(|mut p| p.remove(&id));
+                    Err("LSP reader thread terminated (server closed?)".to_string())
+                }
+            }
+        } else {
+            // 子进程未启动,返回 placeholder 响应(保持向后兼容)
+            Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "transport": "process",
+                    "language": self.language,
+                    "server_command": self.server_command,
+                    "method": method,
+                    "params": params,
+                    "status": "not_spawned",
+                    "message": "ProcessLspTransport not spawned — call spawn() for actual responses"
+                }
+            }))
+        }
     }
 }
 
 impl Drop for ProcessLspTransport {
     fn drop(&mut self) {
+        // 先通知 reader 线程停止
+        self.reader_stop.store(true, Ordering::Release);
+        // kill 子进程:reader 线程的 read_exact 会因 EOF 返回错误并退出循环
         if let Some(child) = self.child.take() {
             let mut child = match child.lock() {
                 Ok(c) => c,
@@ -1102,6 +1168,132 @@ impl Drop for ProcessLspTransport {
             let _ = child.wait();
         }
     }
+}
+
+/// 从 LSP server stdout 读取一条 JSON-RPC 消息(后台 reader 线程调用)。
+///
+/// 阻塞读取 Content-Length header + body,返回解析后的 JSON。
+/// 与旧 `read_message` 的区别:
+/// - 无超时(由 reader 线程的 stop 信号 + 子进程 EOF 控制退出)
+/// - 不每次 spawn 新线程(reader 线程本身就是长期运行的)
+///
+/// # 错误
+/// - 子进程关闭 stdout → `read_exact` 返回 EOF 错误,reader 线程据此退出
+/// - 协议格式错误(缺 Content-Length、JSON 解析失败)→ 返回 Err
+fn read_one_message(stdout: &Mutex<ChildStdout>) -> Result<serde_json::Value, String> {
+    let mut stdout = stdout
+        .lock()
+        .map_err(|_| "stdout lock poisoned".to_string())?;
+
+    // 读取 Content-Length header
+    let mut header_line = String::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stdout
+            .read_exact(&mut byte)
+            .map_err(|e| format!("read header error: {e}"))?;
+        header_line.push(byte[0] as char);
+        if header_line.ends_with("\r\n\r\n") {
+            break;
+        }
+        // 防止 header 无限增长
+        if header_line.len() > 1024 {
+            return Err("LSP header too long, possibly malformed".to_string());
+        }
+    }
+
+    // 解析 Content-Length
+    let content_length: usize = header_line
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length: ")
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .ok_or_else(|| format!("missing Content-Length in header: {header_line}"))?;
+
+    // 读取 body
+    let mut body = vec![0u8; content_length];
+    stdout
+        .read_exact(&mut body)
+        .map_err(|e| format!("read body error: {e}"))?;
+
+    let body_str = String::from_utf8(body).map_err(|e| format!("body UTF-8 error: {e}"))?;
+
+    serde_json::from_str(&body_str).map_err(|e| format!("JSON parse error: {e}"))
+}
+
+/// 解析 `textDocument/publishDiagnostics` 通知为 `Vec<LspDiagnostic>`。
+///
+/// LSP 通知格式:
+/// ```json
+/// {
+///   "method": "textDocument/publishDiagnostics",
+///   "params": {
+///     "uri": "file:///path/to/file.rs",
+///     "diagnostics": [
+///       { "range": {...}, "severity": 1, "message": "...", "source": "rust-analyzer" }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// severity 映射:1=error, 2=warning, 3=info, 4=hint
+fn parse_publish_diagnostics(msg: &serde_json::Value) -> Vec<LspDiagnostic> {
+    let uri = msg
+        .get("params")
+        .and_then(|p| p.get("uri"))
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    let path = uri_to_path(uri);
+
+    msg.get("params")
+        .and_then(|p| p.get("diagnostics"))
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    let line = d
+                        .get("range")
+                        .and_then(|r| r.get("start"))
+                        .and_then(|s| s.get("line"))
+                        .and_then(|l| l.as_u64())
+                        .unwrap_or(0) as u32;
+                    let character = d
+                        .get("range")
+                        .and_then(|r| r.get("start"))
+                        .and_then(|s| s.get("character"))
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(0) as u32;
+                    let severity = d
+                        .get("severity")
+                        .and_then(|s| s.as_u64())
+                        .map(|s| match s {
+                            1 => "error",
+                            2 => "warning",
+                            3 => "info",
+                            4 => "hint",
+                            _ => "unknown",
+                        })
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let message = d
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let source = d.get("source").and_then(|s| s.as_str()).map(str::to_owned);
+                    Some(LspDiagnostic {
+                        path: path.clone(),
+                        line,
+                        character,
+                        severity,
+                        message,
+                        source,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// SP4.2 修复:将文件路径转为 LSP file:// URI。
@@ -2688,5 +2880,88 @@ mod tests {
 
         let result = registry.get_symbols("src/main.rs");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_publish_diagnostics_extracts_severity_and_position() {
+        let msg = serde_json::json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///workspace/src/main.rs",
+                "diagnostics": [
+                    {
+                        "range": { "start": {"line": 10, "character": 5}, "end": {"line": 10, "character": 15} },
+                        "severity": 1,
+                        "message": "mismatched types",
+                        "source": "rust-analyzer"
+                    },
+                    {
+                        "range": { "start": {"line": 20, "character": 0}, "end": {"line": 20, "character": 3} },
+                        "severity": 2,
+                        "message": "unused variable: x",
+                        "source": "rust-analyzer"
+                    }
+                ]
+            }
+        });
+
+        let diags = parse_publish_diagnostics(&msg);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].path, "/workspace/src/main.rs");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[0].character, 5);
+        assert_eq!(diags[0].severity, "error");
+        assert_eq!(diags[0].message, "mismatched types");
+        assert_eq!(diags[0].source.as_deref(), Some("rust-analyzer"));
+        assert_eq!(diags[1].severity, "warning");
+    }
+
+    #[test]
+    fn parse_publish_diagnostics_handles_empty_diagnostics() {
+        let msg = serde_json::json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///workspace/src/main.rs",
+                "diagnostics": []
+            }
+        });
+
+        let diags = parse_publish_diagnostics(&msg);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn parse_publish_diagnostics_handles_unknown_severity() {
+        let msg = serde_json::json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///workspace/main.rs",
+                "diagnostics": [
+                    {
+                        "range": { "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1} },
+                        "severity": 99,
+                        "message": "weird"
+                    }
+                ]
+            }
+        });
+
+        let diags = parse_publish_diagnostics(&msg);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, "unknown");
+        assert!(diags[0].source.is_none());
+    }
+
+    #[test]
+    fn parse_publish_diagnostics_handles_missing_diagnostics_field() {
+        let msg = serde_json::json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///workspace/main.rs"
+            }
+        });
+
+        let diags = parse_publish_diagnostics(&msg);
+        assert!(diags.is_empty());
     }
 }

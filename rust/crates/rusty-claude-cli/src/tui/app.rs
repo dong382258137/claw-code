@@ -599,6 +599,20 @@ fn run_event_loop(
     let mut last_scroll_y: u16 = 0;
     let mut needs_redraw: bool = true;
 
+    // 闪烁优化：跟踪上次 draw 时的内容版本号 + 状态栏关键状态，
+    // streaming 时只在内容或秒级计时器变化时才重绘。
+    //
+    // 根因：旧实现 `if needs_redraw || streaming` 在 streaming 时无论
+    // OutputBuffer 是否更新都每 50ms 全量 draw 一次（20fps），而 LLM
+    // 流式输出有大量"空帧"（50ms 内无新 delta），导致无意义重绘 + 闪烁。
+    //
+    // 优化：用 OutputBuffer::total_written（每次 append 单调递增）作为
+    // 内容版本号，用 turn_elapsed_ms / 1000 作为秒级计时器。两者均未
+    // 变化时跳过 draw，把无 delta 帧的开销从 ~5ms 降到 ~0。
+    let mut last_drawn_version: u64 = u64::MAX; // 初始 MAX 确保首帧必绘
+    let mut last_drawn_elapsed_s: u64 = 0;
+    let mut last_drawn_streaming: bool = false;
+
     'main_loop: loop {
         // 处理 AskUserQuestion 请求：worker 线程通过 ask handler 投递的待回答问题。
         //
@@ -780,11 +794,33 @@ fn run_event_loop(
             }
         }
 
-        // Render — only when needed or streaming
+        // Render — only when content or status actually changed.
+        //
+        // 闪烁优化核心：streaming 时不再无条件每帧重绘。
+        // 仅在以下情况触发 draw：
+        //   1. needs_redraw：键盘/鼠标事件、submit、turn 结束等显式标记
+        //   2. 内容变化：OutputBuffer::total_written 改变（有新 TextDelta/ToolCard）
+        //   3. 秒级计时器变化：turn_elapsed_ms / 1000 改变（状态栏 ⏳ Ns 更新）
+        //   4. streaming 状态切换：开始/结束 streaming
+        // 这样 LLM 流式输出间隙（无 delta 的 50ms 窗口）直接跳过 draw，
+        // 消除"空帧重绘"导致的闪烁。
         {
             let streaming = turn_rx.is_some();
-            if needs_redraw || streaming {
+            let current_version = output_view.total_written();
+            let (current_elapsed_s, current_streaming) = {
+                let guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
+                (guard.turn_elapsed_ms / 1000, guard.streaming)
+            };
+            let content_changed = current_version != last_drawn_version;
+            let elapsed_changed = current_elapsed_s != last_drawn_elapsed_s;
+            let streaming_flag_changed = current_streaming != last_drawn_streaming;
+            let should_draw = needs_redraw
+                || (streaming && (content_changed || elapsed_changed || streaming_flag_changed));
+            if should_draw {
                 needs_redraw = false;
+                last_drawn_version = current_version;
+                last_drawn_elapsed_s = current_elapsed_s;
+                last_drawn_streaming = current_streaming;
                 terminal.draw(|f| {
             // Top-level vertical layout: main row (output+input) + status bar.
             // 动态输入区高度：根据当前 buffer 的显示行数调整。
@@ -1000,9 +1036,15 @@ fn run_event_loop(
             }
         }
 
-        // Poll for events (shorter timeout during streaming for responsive rendering)
+        // Poll for events.
+        //
+        // 闪烁优化：streaming 时从 50ms (20fps) 调整为 100ms (10fps)。
+        // 配合上面的"内容变化检测"，无 delta 的空帧直接跳过 draw，
+        // 100ms poll 只影响"有新内容时多久能渲染到屏幕"的延迟，
+        // 对文本流式输出 10fps 完全够用（人眼对文本刷新不敏感），
+        // 且 CPU 唤醒频率减半。
         let poll_timeout = if turn_rx.is_some() {
-            Duration::from_millis(50)
+            Duration::from_millis(100)
         } else {
             Duration::from_millis(200)
         };

@@ -135,7 +135,9 @@ pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
 };
-pub use decision_log::{compute_simhash, hamming_distance, DecisionLog, DecisionLogError};
+pub use decision_log::{
+    compute_simhash, hamming_distance, DecisionLog, DecisionLogError, DecisionVerification,
+};
 pub use vcs_snapshot::{RefactorTransaction, TransactionStatus, VcsError};
 
 pub use conversation::{

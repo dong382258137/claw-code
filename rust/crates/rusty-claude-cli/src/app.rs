@@ -687,6 +687,7 @@ impl LiveCli {
                 // CLI flag `--enable-plan-mode` 会在 run_repl 中覆盖(优先级更高)。
                 if config.feature_config().plan_mode() == Some(true) {
                     runtime.set_plan_mode_enabled(true);
+                    runtime.set_workspace_root(cwd.clone());
                 }
                 // SP4.2-B3:从配置初始化 LSP servers(best-effort,失败不阻断启动)
                 let _ = init_lsp_from_config(&config, &cwd);
@@ -2703,6 +2704,13 @@ pub(crate) fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    // Phase 4：提前创建 ProjectTopology 实例，供 CliToolExecutor 和 ConversationRuntime 共享。
+    // 之前 CliToolExecutor 和 ConversationRuntime 各自独立，topology 只在 runtime 构造后注入，
+    // 导致 CliToolExecutor 调用 refactor_algorithm_topo 时没有 topology 实例可用。
+    // 现在提前创建，共享同一个 Arc。
+    let shared_topology = env::current_dir().ok().map(|cwd| {
+        std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(cwd))
+    });
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -2719,7 +2727,8 @@ pub(crate) fn build_runtime_with_plugin_state(
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
-        ),
+        )
+        .with_project_topology(shared_topology.clone()),
         policy,
         system_prompt,
         &feature_config,
@@ -2789,36 +2798,21 @@ pub(crate) fn build_runtime_with_plugin_state(
         let memory = runtime::PersistentMemory::load_and_freeze(&memory_path);
         runtime = runtime.with_persistent_memory(memory);
 
-        // 无条件注入 workspace_root —— 这是 9 个工具(notebook_update / recall_full /
-        // log_decision / search_past_decisions / dispatch_subagent / query_project_graph /
-        // find_boundary_crossings / rollback_transaction / refactor_algorithm_topo)的
-        // 基础设施依赖,不应被任何 feature flag 门控。
-        // 历史Bug:P3-1 接入时误将 set_workspace_root 放进 plan_mode 分支,导致默认配置下
-        // workspace_root=None,recall_full/notebook_update 等全部报 "no workspace_root configured"。
-        runtime.set_workspace_root(cwd.clone());
-
-        // 认知外骨骼注入（方案 docs/agent-cognitive-exoskeleton-plan.md 第五章）。
-        // 注入前 conversation.rs 中 9 个新工具（log_decision /
-        // search_past_decisions / query_project_graph / find_boundary_crossings /
-        // get_symbol_info / rollback_transaction / transaction_status /
-        // refactor_algorithm_topo / benchmark_compare）会永远返回 "not available"。
-        // - DecisionLog: SQLite + FTS5 决策经验库（best-effort，失败仅警告）
-        // - ProjectTopology: 项目语义拓扑图（Arc 共享，lazy 加载）
-        // - RefactorTransaction: turn 级 VCS 事务（pre_turn_snapshot + mark_dirty）
-        match runtime::decision_log::DecisionLog::open(&cwd) {
-            Ok(decision_log) => {
-                runtime = runtime.with_decision_log(decision_log);
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to open DecisionLog at {}: {e}",
-                    cwd.display()
-                );
-            }
+        // Phase 4 认知外骨骼：注入 DecisionLog / ProjectTopology / RefactorTransaction。
+        // 之前三个 with_* builder 已经定义但从未被调用，导致 LLM 调用 9 个新工具时
+        // 全部返回 "not available" 降级字符串。现在无条件注入三个实例。
+        // 详见 docs/agent-cognitive-exoskeleton-plan.md 第五章。
+        //
+        // DecisionLog：SQLite 决策库，失败时降级为 None（不阻断启动）。
+        if let Ok(decision_log) = runtime::DecisionLog::open(&cwd) {
+            runtime = runtime.with_decision_log(decision_log);
         }
-        let topology = Arc::new(runtime::project_topology::ProjectTopology::new(cwd.clone()));
-        runtime = runtime.with_project_topology(topology);
-        let tx = runtime::vcs_snapshot::RefactorTransaction::new(cwd.clone());
+        // ProjectTopology：复用提前创建的 shared_topology（与 CliToolExecutor 共享同一个 Arc）。
+        if let Some(topo) = shared_topology.clone() {
+            runtime = runtime.with_project_topology(topo);
+        }
+        // RefactorTransaction：非 git 仓库自动进入 Disabled 状态，安全无副作用。
+        let tx = runtime::RefactorTransaction::new(cwd.clone());
         runtime = runtime.with_refactor_transaction(tx);
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))

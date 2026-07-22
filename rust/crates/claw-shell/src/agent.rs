@@ -211,6 +211,20 @@ where
             self.config.system_prompt.clone(),
         );
 
+        // Phase 4 认知外骨骼：ACP 路径同样注入三个实例，确保 ACP 客户端
+        // 也能使用 DecisionLog / ProjectTopology / RefactorTransaction 工具。
+        // 详见 docs/agent-cognitive-exoskeleton-plan.md 第五章。
+        let mut runtime = runtime;
+        if let Ok(decision_log) = runtime::DecisionLog::open(&arguments.cwd) {
+            runtime = runtime.with_decision_log(decision_log);
+        }
+        let topology = std::sync::Arc::new(
+            runtime::project_topology::ProjectTopology::new(arguments.cwd.clone()),
+        );
+        runtime = runtime.with_project_topology(topology);
+        let tx = runtime::RefactorTransaction::new(arguments.cwd.clone());
+        runtime = runtime.with_refactor_transaction(tx);
+
         *self.runtime.borrow_mut() = Some(runtime);
 
         Ok(acp::NewSessionResponse::new(session_id))

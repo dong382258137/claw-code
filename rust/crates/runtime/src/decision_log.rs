@@ -189,6 +189,70 @@ impl From<rusqlite::Error> for DecisionLogError {
 }
 
 // ---------------------------------------------------------------------------
+// DecisionVerification
+// ---------------------------------------------------------------------------
+
+/// 决策验证结果(用于 `verify_decision` 学习环)。
+///
+/// 对应计划 §4.4 的 success_rate 学习公式:
+/// - `Confirmed` — 决策成功复现,success_rate 增加趋近 1.0
+/// - `Refuted`   — 决策被证伪,success_rate 衰减趋近 0.0
+/// - `Partial`   — 部分有效,success_rate 介于两者之间
+/// - `Pending`   — 重置为未验证状态,不更新统计(用于撤销之前的错误验证)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionVerification {
+    Confirmed,
+    Refuted,
+    Partial,
+    Pending,
+}
+
+impl DecisionVerification {
+    /// 从字符串解析(接受大小写不敏感的 "confirmed"/"refuted"/"partial"/"pending")。
+    pub fn from_str_ic(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "confirmed" => Some(Self::Confirmed),
+            "refuted" => Some(Self::Refuted),
+            "partial" => Some(Self::Partial),
+            "pending" => Some(Self::Pending),
+            _ => None,
+        }
+    }
+
+    /// 序列化为 schema 中存储的字符串值(首字母大写形式)。
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Confirmed => "Confirmed",
+            Self::Refuted => "Refuted",
+            Self::Partial => "Partial",
+            Self::Pending => "Pending",
+        }
+    }
+
+    /// 学习增量:每次验证对 success_rate 的"信号值"贡献。
+    ///
+    /// 对应公式 `(success_rate * verify_count + signal) / (verify_count + 1)`:
+    /// - Confirmed: signal = 1.0(完全成功)
+    /// - Partial:   signal = 0.5(部分成功)
+    /// - Refuted:   signal = 0.0(完全失败)
+    /// - Pending:   不参与统计更新,signal 不被使用
+    pub fn signal(&self) -> f64 {
+        match self {
+            Self::Confirmed => 1.0,
+            Self::Partial => 0.5,
+            Self::Refuted => 0.0,
+            Self::Pending => 0.0,
+        }
+    }
+
+    /// 是否更新统计字段(verify_count / success_rate)。
+    /// Pending 用于"撤销"语义,不增加验证计数。
+    pub fn updates_stats(&self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DecisionRecord
 // ---------------------------------------------------------------------------
 
@@ -496,6 +560,166 @@ impl DecisionLog {
         output.push_str("Use log_decision to record new decisions after verification.");
         Ok(output)
     }
+
+    /// 验证已有决策,更新 success_rate 学习环(计划 §4.4)。
+    ///
+    /// 接受 decision_id 和验证结果(Confirmed/Refuted/Partial/Pending),
+    /// 原子地更新 verify_count、success_rate、verified_at_ms、
+    /// verification_result、verification_evidence 字段。
+    ///
+    /// # Success Rate 公式
+    ///
+    /// 对 Confirmed/Partial/Refuted 三种"实质性验证":
+    /// ```text
+    /// new_success_rate = (old_success_rate * old_verify_count + signal)
+    ///                  / (old_verify_count + 1);
+    /// new_verify_count = old_verify_count + 1;
+    /// ```
+    /// 其中 `signal` 取值:Confirmed=1.0, Partial=0.5, Refuted=0.0。
+    /// 这等价于把"是否成功"作为一个 Bernoulli 观测,以 running mean 形式
+    /// 维护经验成功率,具有数学上的无偏性(多次 Confirmed 后趋近 1.0,
+    /// 多次 Refuted 后趋近 0.0)。
+    ///
+    /// 对 Pending:只重置 verification_result/verified_at_ms,
+    /// **不**更新 verify_count/success_rate(用于撤销之前的误验证)。
+    ///
+    /// # 事务原子性
+    ///
+    /// 整个更新过程包在 `BEGIN IMMEDIATE` 事务中,
+    /// 防止并发 search_decisions 读到中间状态(verify_count 已更新但
+    /// success_rate 未更新)。FTS5 同步触发器 `decisions_au` 在 UPDATE
+    /// 时自动同步 FTS 索引,无需手动维护。
+    ///
+    /// # 参数
+    ///
+    /// - `decision_id` — 目标决策的 SQLite rowid(由 log_decision 返回)。
+    /// - `result` — 验证结果枚举。
+    /// - `evidence` — 可选的证据文本(测试输出、用户反馈等)。
+    ///
+    /// # 返回
+    ///
+    /// 成功时返回描述性字符串(含更新后的统计值),便于 LLM 上下文呈现。
+    /// 决策不存在时返回 `DecisionLogError::InvalidInput`。
+    pub fn verify_decision(
+        &self,
+        decision_id: i64,
+        result: DecisionVerification,
+        evidence: Option<&str>,
+    ) -> Result<String, DecisionLogError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+
+        // BEGIN IMMEDIATE 立刻获取写锁,避免 BEGIN DEFERRED 升级时的死锁。
+        // SQLite 在 IMMEDIATE 事务中,其他 reader 会被阻塞直到 COMMIT,
+        // 保证我们读到的 (verify_count, success_rate) 与最终写入一致。
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+
+        // 用 transaction scope 保证任何错误路径都能自动 ROLLBACK。
+        let outcome: Result<(), DecisionLogError> = (|| {
+            // 先读取当前统计值(SELECT ... FOR UPDATE 语义,IMMEDIATE 锁已保证)。
+            let row = conn
+                .query_row(
+                    "SELECT verify_count, success_rate FROM decisions WHERE id = ?1",
+                    params![decision_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, f64>(1)?,
+                        ))
+                    },
+                )
+                .map_err(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => DecisionLogError::InvalidInput(
+                        format!("decision id={decision_id} not found"),
+                    ),
+                    other => DecisionLogError::Sqlite(other),
+                })?;
+
+            let (old_count, old_rate) = row;
+
+            let (new_count, new_rate) = if result.updates_stats() {
+                let signal = result.signal();
+                let new_count = old_count + 1;
+                // 注意 old_count 是 i64,需转 f64 防止整型除法丢失精度。
+                let new_rate =
+                    (old_rate * old_count as f64 + signal) / (new_count as f64);
+                // 钳位 [0.0, 1.0],防止浮点误差导致轻微越界。
+                let new_rate = new_rate.clamp(0.0, 1.0);
+                (new_count, new_rate)
+            } else {
+                // Pending: 不更新统计字段
+                (old_count, old_rate)
+            };
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+
+            // UPDATE 语句:即使 result == Pending,也要更新 verification_result/
+            // verified_at_ms/verification_evidence 三个字段(语义:撤销原验证状态)。
+            // 注意:此处 UPDATE 会触发 FTS5 触发器 decisions_au,
+            // 但 FTS5 表只索引 problem_signature/root_cause_hypothesis/applied_solution
+            // 三个字段,这些字段我们没改,触发器会以 new.* 形式重新插入索引行,
+            // 行为是幂等的(no-op effect on FTS content)。
+            let updated = conn.execute(
+                "UPDATE decisions SET
+                    verify_count = ?1,
+                    success_rate = ?2,
+                    verified_at_ms = ?3,
+                    verification_result = ?4,
+                    verification_evidence = ?5
+                 WHERE id = ?6",
+                params![
+                    new_count,
+                    new_rate,
+                    now_ms,
+                    result.as_db_str(),
+                    evidence,
+                    decision_id,
+                ],
+            )?;
+
+            if updated == 0 {
+                // 极端情况:查询时存在,UPDATE 时已被并发 DELETE。
+                // 事务会自动 ROLLBACK,这里返回错误。
+                return Err(DecisionLogError::InvalidInput(format!(
+                    "decision id={decision_id} vanished during verify_decision"
+                )));
+            }
+
+            Ok(())
+        })();
+
+        match outcome {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                // COMMIT 后再读取一次,得到最终状态用于返回消息。
+                // 也可以直接用 new_count/new_rate,但重新读取能验证事务真的提交了。
+                let (final_count, final_rate, final_result) = conn
+                    .query_row(
+                        "SELECT verify_count, success_rate, verification_result
+                         FROM decisions WHERE id = ?1",
+                        params![decision_id],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?)),
+                    )
+                    .map_err(|e| DecisionLogError::Sqlite(e))?;
+
+                Ok(format!(
+                    "decision_verified id={decision_id} result={final_result} \
+                     verify_count={final_count} success_rate={:.6} \
+                     evidence_provided={}",
+                    final_rate,
+                    if evidence.is_some() { "yes" } else { "no" },
+                ))
+            }
+            Err(e) => {
+                // 任何错误都先尝试 ROLLBACK;若 ROLLBACK 失败则用原始错误报告,
+                // 因为连接已经处于不一致状态,后续操作都会失败。
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
 }
 
 /// 对 FTS5 查询字符串进行基本转义,防止语法错误。
@@ -515,7 +739,20 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        // UTF-8 安全截断：用 floor_char_boundary 找到不超过 max_len 的最大字符边界。
+        // 如果 max_len 落在多字节字符中间，回退到上一个字符边界。
+        // std::str::floor_char_boundary 在 Rust 1.82+ 稳定；
+        // 为了兼容旧版本，手动实现等价逻辑。
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            // max_len 太小，连一个字符都放不下，返回省略号
+            "...".to_string()
+        } else {
+            format!("{}...", &s[..end])
+        }
     }
 }
 
@@ -574,6 +811,27 @@ fn migrate_schema(conn: &Connection) -> Result<(), DecisionLogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_str_handles_multibyte_utf8_safely() {
+        // ASCII：正常截断
+        assert_eq!(truncate_str("hello world", 5), "hello...");
+        // 不需要截断
+        assert_eq!(truncate_str("short", 200), "short");
+        // 中文：3 字节字符，max_len 落在字符中间不应 panic
+        let chinese = "你好世界测试字符串";
+        let result = truncate_str(chinese, 7); // 7 落在第二个中文字符（字节 3-5）的中间
+        assert!(result.ends_with("..."));
+        assert!(!result.is_empty());
+        // 结果应该是 "你好..."（截到字节 6，即第二个完整中文字符之后）
+        assert_eq!(result, "你好...");
+        // Emoji：4 字节字符
+        let emoji = "a🎉b🎊c";
+        let result = truncate_str(emoji, 2); // 2 落在 emoji（字节 1-4）中间
+        assert_eq!(result, "a...");
+        // max_len = 0 的极端情况
+        assert_eq!(truncate_str("hello", 0), "...");
+    }
 
     #[test]
     fn simhash_same_text_produces_same_hash() {
@@ -807,5 +1065,520 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "expected 1 file association");
+    }
+
+    // -----------------------------------------------------------------
+    // DecisionVerification 枚举测试
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn decision_verification_from_str_ic_handles_case_variants() {
+        assert_eq!(
+            DecisionVerification::from_str_ic("Confirmed"),
+            Some(DecisionVerification::Confirmed)
+        );
+        assert_eq!(
+            DecisionVerification::from_str_ic("REFUTED"),
+            Some(DecisionVerification::Refuted)
+        );
+        assert_eq!(
+            DecisionVerification::from_str_ic("partial"),
+            Some(DecisionVerification::Partial)
+        );
+        assert_eq!(
+            DecisionVerification::from_str_ic("  pending  "),
+            Some(DecisionVerification::Pending)
+        );
+        assert_eq!(DecisionVerification::from_str_ic("bogus"), None);
+        assert_eq!(DecisionVerification::from_str_ic(""), None);
+    }
+
+    #[test]
+    fn decision_verification_as_db_str_round_trips() {
+        for v in [
+            DecisionVerification::Confirmed,
+            DecisionVerification::Refuted,
+            DecisionVerification::Partial,
+            DecisionVerification::Pending,
+        ] {
+            let s = v.as_db_str();
+            assert_eq!(DecisionVerification::from_str_ic(s), Some(v));
+        }
+    }
+
+    #[test]
+    fn decision_verification_signal_and_updates_stats_consistency() {
+        // 实质性验证必须 updates_stats == true 且 signal 在 [0, 1]
+        for v in [
+            DecisionVerification::Confirmed,
+            DecisionVerification::Partial,
+            DecisionVerification::Refuted,
+        ] {
+            assert!(v.updates_stats(), "{v:?} should update stats");
+            let sig = v.signal();
+            assert!(
+                (0.0..=1.0).contains(&sig),
+                "{v:?} signal {sig} out of [0,1]"
+            );
+        }
+        // Pending 不更新统计
+        assert!(!DecisionVerification::Pending.updates_stats());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_decision 单元测试
+    // -----------------------------------------------------------------
+
+    /// 辅助函数:从 log_decision 的返回字符串 "decision_logged id=N" 中解析出 id。
+    fn parse_decision_id(s: &str) -> i64 {
+        // 形如 "decision_logged id=42"
+        s.split("id=")
+            .nth(1)
+            .expect("missing id= in log_decision output")
+            .trim()
+            .parse::<i64>()
+            .expect("id is not a valid i64")
+    }
+
+    /// 辅助函数:从 verify_decision 返回字符串中解析 success_rate。
+    fn parse_success_rate(s: &str) -> f64 {
+        // 形如 "decision_verified id=1 result=Confirmed verify_count=1 success_rate=1.0000 evidence_provided=no"
+        let part = s
+            .split("success_rate=")
+            .nth(1)
+            .expect("missing success_rate= in verify_decision output");
+        let token = part.split_whitespace().next().expect("empty rate token");
+        token.parse::<f64>().expect("rate is not a valid f64")
+    }
+
+    /// 辅助函数:从 verify_decision 返回字符串中解析 verify_count。
+    fn parse_verify_count(s: &str) -> i64 {
+        let part = s
+            .split("verify_count=")
+            .nth(1)
+            .expect("missing verify_count= in verify_decision output");
+        let token = part.split_whitespace().next().expect("empty count token");
+        token.parse::<i64>().expect("count is not a valid i64")
+    }
+
+    #[test]
+    fn verify_decision_confirmed_increments_rate_toward_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let id = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "verify-test",
+                    "problem_signature": "test confirmed",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": [],
+                    "verification_result": "Pending"
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        // 初始: verify_count=0, success_rate=0.0
+        let out1 = log
+            .verify_decision(id, DecisionVerification::Confirmed, Some("tests pass"))
+            .unwrap();
+        // 公式: (0.0 * 0 + 1.0) / (0 + 1) = 1.0
+        assert_eq!(parse_verify_count(&out1), 1);
+        assert!(
+            (parse_success_rate(&out1) - 1.0).abs() < 1e-5,
+            "Confirmed #1: rate should be 1.0, got {out1}"
+        );
+
+        // 再次 Confirmed: (1.0 * 1 + 1.0) / 2 = 1.0
+        let out2 = log
+            .verify_decision(id, DecisionVerification::Confirmed, None)
+            .unwrap();
+        assert_eq!(parse_verify_count(&out2), 2);
+        assert!(
+            (parse_success_rate(&out2) - 1.0).abs() < 1e-5,
+            "Confirmed #2: rate should remain 1.0, got {out2}"
+        );
+    }
+
+    #[test]
+    fn verify_decision_refuted_decays_rate_toward_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let id = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "verify-test",
+                    "problem_signature": "test refuted",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": []
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        // Confirmed 一次: rate = 1.0
+        log.verify_decision(id, DecisionVerification::Confirmed, None)
+            .unwrap();
+
+        // Refuted: (1.0 * 1 + 0.0) / 2 = 0.5
+        let out = log
+            .verify_decision(id, DecisionVerification::Refuted, Some("tests fail"))
+            .unwrap();
+        assert_eq!(parse_verify_count(&out), 2);
+        assert!(
+            (parse_success_rate(&out) - 0.5).abs() < 1e-5,
+            "Refuted after Confirmed: rate should be 0.5, got {out}"
+        );
+
+        // 再 Refuted: (0.5 * 2 + 0.0) / 3 = 1/3 ≈ 0.3333
+        let out2 = log
+            .verify_decision(id, DecisionVerification::Refuted, None)
+            .unwrap();
+        assert_eq!(parse_verify_count(&out2), 3);
+        assert!(
+            (parse_success_rate(&out2) - 1.0 / 3.0).abs() < 1e-5,
+            "Refuted #2: rate should be 1/3, got {out2}"
+        );
+    }
+
+    #[test]
+    fn verify_decision_partial_yields_half_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let id = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "verify-test",
+                    "problem_signature": "test partial",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": []
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        // Partial 单次: (0.0 * 0 + 0.5) / 1 = 0.5
+        let out = log
+            .verify_decision(id, DecisionVerification::Partial, Some("flaky"))
+            .unwrap();
+        assert_eq!(parse_verify_count(&out), 1);
+        assert!(
+            (parse_success_rate(&out) - 0.5).abs() < 1e-5,
+            "Partial #1: rate should be 0.5, got {out}"
+        );
+
+        // 再次 Partial: (0.5 * 1 + 0.5) / 2 = 0.5
+        let out2 = log
+            .verify_decision(id, DecisionVerification::Partial, None)
+            .unwrap();
+        assert_eq!(parse_verify_count(&out2), 2);
+        assert!(
+            (parse_success_rate(&out2) - 0.5).abs() < 1e-5,
+            "Partial #2: rate should remain 0.5, got {out2}"
+        );
+    }
+
+    #[test]
+    fn verify_decision_pending_does_not_touch_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let id = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "verify-test",
+                    "problem_signature": "test pending",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": [],
+                    "verification_result": "Confirmed"
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        // 先 Confirmed 提升到 1.0
+        log.verify_decision(id, DecisionVerification::Confirmed, None)
+            .unwrap();
+        // 现在 verify_count=1, success_rate=1.0
+
+        // Pending: 不应改 verify_count/success_rate,但应改 verification_result
+        let out = log
+            .verify_decision(id, DecisionVerification::Pending, None)
+            .unwrap();
+        assert!(
+            out.contains("result=Pending"),
+            "Pending should reset verification_result, got {out}"
+        );
+        assert_eq!(
+            parse_verify_count(&out),
+            1,
+            "Pending must NOT increment verify_count, got {out}"
+        );
+        assert!(
+            (parse_success_rate(&out) - 1.0).abs() < 1e-5,
+            "Pending must NOT change success_rate, got {out}"
+        );
+
+        // 直接 SQL 验证 verified_at_ms 被更新为非空
+        let conn = log.conn.lock().unwrap();
+        let verified_at: Option<i64> = conn
+            .query_row(
+                "SELECT verified_at_ms FROM decisions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(verified_at.is_some(), "verified_at_ms should be set");
+    }
+
+    #[test]
+    fn verify_decision_nonexistent_id_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let err = log
+            .verify_decision(99999, DecisionVerification::Confirmed, None)
+            .unwrap_err();
+        match err {
+            DecisionLogError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("not found") || msg.contains("99999"),
+                    "error should mention id 99999, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_decision_evidence_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let id = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "verify-test",
+                    "problem_signature": "evidence test",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": []
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        log.verify_decision(
+            id,
+            DecisionVerification::Confirmed,
+            Some("cargo test passed: 42 passed, 0 failed"),
+        )
+        .unwrap();
+
+        let conn = log.conn.lock().unwrap();
+        let evidence: Option<String> = conn
+            .query_row(
+                "SELECT verification_evidence FROM decisions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            evidence.as_deref(),
+            Some("cargo test passed: 42 passed, 0 failed"),
+            "evidence should be persisted verbatim"
+        );
+    }
+
+    #[test]
+    fn verify_decision_search_still_works_after_update() {
+        // 验证 FTS5 触发器 decisions_au 在 UPDATE 后仍保持索引一致。
+        // 之前 UPDATE 会触发 trigger 重新同步 FTS,如果 trigger 在
+        // 事务中失败,COMMIT 会回滚整个 verify_decision。
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let id = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "verify-test",
+                    "problem_signature": "fts trigger test unique_marker_alpha",
+                    "root_cause_hypothesis": "hypothesis_marker_beta",
+                    "applied_solution": "solution_marker_gamma",
+                    "affected_files": []
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        // 更新统计字段(会触发 decisions_au)
+        log.verify_decision(id, DecisionVerification::Confirmed, None)
+            .unwrap();
+
+        // 验证 FTS5 索引仍可检索(说明 trigger 没有破坏索引)
+        let result = log.search_decisions("unique_marker_alpha", 10).unwrap();
+        assert!(
+            result.contains("unique_marker_alpha"),
+            "FTS5 search after verify_decision should still find the record, got: {result}"
+        );
+        // 同时验证 success_rate 在 search 结果中显示为新值
+        assert!(
+            result.contains("100%"),
+            "search should display updated success_rate=100%, got: {result}"
+        );
+    }
+
+    #[test]
+    fn verify_decision_multiple_mixed_sequence_matches_running_mean() {
+        // 模拟真实场景:Confuted → Refuted → Confirmed → Confirmed → Partial
+        // 期望 success_rate 等价于对 [1.0, 0.0, 1.0, 1.0, 0.5] 求 running mean。
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let id = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "verify-test",
+                    "problem_signature": "mixed sequence running mean",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": []
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        // 预期序列: rate = (0*0+1)/1=1.0, (1*1+0)/2=0.5, (0.5*2+1)/3=2/3,
+        //           (2/3*3+1)/4 = 0.75, (0.75*4+0.5)/5 = 0.7
+        let sequence = [
+            (DecisionVerification::Confirmed, 1.0_f64),
+            (DecisionVerification::Refuted, 0.5),
+            (DecisionVerification::Confirmed, 2.0 / 3.0),
+            (DecisionVerification::Confirmed, 0.75),
+            (DecisionVerification::Partial, 0.7),
+        ];
+
+        let mut expected_count = 0_i64;
+        for (i, (v, expected_rate)) in sequence.iter().enumerate() {
+            let out = log.verify_decision(id, *v, None).unwrap();
+            expected_count += 1;
+            let got_count = parse_verify_count(&out);
+            let got_rate = parse_success_rate(&out);
+            assert_eq!(
+                got_count, expected_count,
+                "step {i}: count mismatch"
+            );
+            // {:.6} 格式精度上限误差为 5e-7,1e-5 提供 20x 安全裕度。
+            assert!(
+                (got_rate - expected_rate).abs() < 1e-5,
+                "step {i}: expected rate {expected_rate}, got {got_rate} (full: {out})"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_decision_transaction_rollback_on_missing_id() {
+        // 验证 BEGIN IMMEDIATE + ROLLBACK 路径:对不存在的 id 调用后,
+        // 后续操作(包括新的 log_decision)应能正常执行,
+        // 说明连接没卡在事务中。
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        // 先创建一条决策,后续会用它来确认连接仍可用
+        let id1 = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "rollback-test",
+                    "problem_signature": "first decision",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": []
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        // 触发错误路径(不存在的 id)
+        let _ = log
+            .verify_decision(999999, DecisionVerification::Confirmed, None)
+            .unwrap_err();
+
+        // 连接应该已经 ROLLBACK,可以继续正常操作
+        let out = log
+            .verify_decision(id1, DecisionVerification::Confirmed, None)
+            .unwrap();
+        assert!(
+            out.contains("result=Confirmed"),
+            "post-rollback verify should succeed, got {out}"
+        );
+
+        // 同时验证可以继续插入新决策
+        let id2 = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "rollback-test",
+                    "problem_signature": "second decision post-rollback",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": []
+                }"#,
+            )
+            .unwrap(),
+        );
+        assert_ne!(id1, id2, "new decision should get a fresh id");
+    }
+
+    #[test]
+    fn verify_decision_clamps_floating_point_drift() {
+        // 大量 Confirmed 后 success_rate 应严格在 [0,1],
+        // 不会有浮点误差导致 > 1.0 的情况。
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let id = parse_decision_id(
+            &log.log_decision(
+                r#"{
+                    "session_id": "clamp-test",
+                    "problem_signature": "clamp",
+                    "root_cause_hypothesis": "h",
+                    "applied_solution": "s",
+                    "affected_files": []
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        for _ in 0..50 {
+            log.verify_decision(id, DecisionVerification::Confirmed, None)
+                .unwrap();
+        }
+        // 50 次 Confirmed 后 rate 应该 = 1.0(不会因浮点变成 1.0000000001)
+        let conn = log.conn.lock().unwrap();
+        let rate: f64 = conn
+            .query_row(
+                "SELECT success_rate FROM decisions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(
+            rate <= 1.0,
+            "rate should not exceed 1.0 (clamp), got {rate}"
+        );
+        assert!(
+            (rate - 1.0).abs() < 1e-9,
+            "rate should be exactly 1.0 after 50 Confirmed, got {rate}"
+        );
     }
 }

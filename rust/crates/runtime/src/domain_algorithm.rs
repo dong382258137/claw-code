@@ -470,13 +470,35 @@ mod tests {
     #[test]
     fn refactor_topo_handles_uninitialized_topology() {
         let topo = ProjectTopology::new(PathBuf::from("/nonexistent/project/xyz"));
-        // ensure_built 会因 cargo metadata 失败 → Failed
+        // P2-1: ensure_built() 现在是异步的,会立即返回 Building 并派发后台线程。
+        // 在非 cargo 目录下,后台线程会很快失败并转为 Failed。
+        // 我们先调用 ensure_built_blocking() 确保到达终态(Failed),再测试 refactor_algorithm_topo。
+        let _ = topo.ensure_built_blocking();
         let out = refactor_algorithm_topo(&topo, "some_symbol", Some("new_name"), None)
             .expect("should not error");
         assert!(
             out.contains("failed") || out.contains("unavailable") || out.contains("manually"),
             "expected graceful failure message, got: {out}"
         );
+    }
+
+    #[test]
+    fn refactor_topo_handles_building_state() {
+        // P2-1:测试异步化后的 Building 状态——refactor_algorithm_topo 应返回
+        // "do NOT retry" 提示而非阻塞或报错。
+        let topo = ProjectTopology::new(PathBuf::from("/nonexistent/project/xyz"));
+        let _ = topo.ensure_built(); // 派发后台线程,立即返回 Building
+        // 此时状态可能为 Building(后台线程尚未完成)
+        let state = topo.state();
+        if matches!(state, crate::project_topology::TopologyState::Building { .. }) {
+            let out = refactor_algorithm_topo(&topo, "some_symbol", Some("new_name"), None)
+                .expect("should not error");
+            assert!(
+                out.contains("building") || out.contains("Do NOT retry"),
+                "expected building/Do NOT retry message, got: {out}"
+            );
+        }
+        // 如果后台线程已完成(转为 Failed),则由上一个测试覆盖
     }
 
     #[test]

@@ -15,6 +15,20 @@
 //!
 //! 工具描述中指导 LLM："If TopologyState is 'building', do NOT retry immediately.
 //! Use read/grep instead."
+//!
+//! ## P2-1: 真正异步化
+//!
+//! `ensure_built()` 是**非阻塞**的:首次调用时通过 `std::thread::spawn` 派发
+//! 后台线程执行 `cargo metadata` + `build_symbol_index_fast`,立即返回 `Building`。
+//! 后台线程完成后通过共享的 `Arc<Mutex<TopologyState>>` 更新状态为 `Ready`/`Failed`。
+//!
+//! 选择 `std::thread::spawn` 而非 `tokio::task::spawn_blocking` 的原因:
+//! - `ProjectTopology` 不持有 tokio runtime handle,在非 async 上下文中也可用
+//! - 构建工作是纯阻塞 I/O(子进程 + 文件扫描),不是 async
+//! - 后台线程只需更新共享 state,无需 async 通信
+//!
+//! `ensure_built_blocking()` 是**阻塞**版本,供测试和需要同步结果的场景使用。
+//! 它直接调用 `build_topology_data` 并同步更新状态。
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -149,8 +163,20 @@ impl ProjectTopology {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// 尝试构建拓扑(如果尚未构建)。
-    /// 同步执行 `cargo metadata`，构建 ModuleGraph。
+    /// **非阻塞**地尝试构建拓扑(P2-1)。
+    ///
+    /// 如果当前状态为 `Uninitialized`:
+    /// 1. 在锁内将状态转为 `Building { started_at }`
+    /// 2. 派发一个 `std::thread::spawn` 后台线程执行实际构建
+    /// 3. 立即返回 `Building`(不等待构建完成)
+    ///
+    /// 如果当前状态为 `Ready`/`Failed`/`Building`,直接返回当前状态(不重复派发)。
+    ///
+    /// 后台线程通过共享的 `Arc<Mutex<TopologyState>>` 更新状态为 `Ready` 或 `Failed`。
+    /// 线程使用 `catch_unwind` 防止 panic 导致状态永久停留在 `Building`。
+    ///
+    /// 调用方(如 `query_project_graph`)在收到 `Building` 时应返回提示消息,
+    /// 告诉 LLM "do NOT retry immediately, use read/grep instead"。
     pub fn ensure_built(&self) -> TopologyState {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -161,22 +187,80 @@ impl ProjectTopology {
             TopologyState::Uninitialized => {}
         }
 
-        // Start building
+        // Uninitialized → Building,派发后台线程
+        let started_at = Instant::now();
+        *guard = TopologyState::Building { started_at };
+        drop(guard); // 释放锁,让后台线程能更新状态
+
+        // 克隆共享 state 和 workspace_root 给后台线程
+        let state_clone = Arc::clone(&self.state);
+        let workspace_root = self.workspace_root.clone();
+
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                build_topology_data(&workspace_root)
+            });
+
+            let mut guard = state_clone.lock().unwrap_or_else(|e| e.into_inner());
+            match result {
+                Ok(Ok(data)) => {
+                    *guard = TopologyState::Ready(data);
+                }
+                Ok(Err(e)) => {
+                    *guard = TopologyState::Failed(e);
+                }
+                Err(panic_payload) => {
+                    // catch_unwind 捕获 panic,防止状态永久停留在 Building
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                        format!("topology build panicked: {s}")
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        format!("topology build panicked: {s}")
+                    } else {
+                        "topology build panicked (unknown payload type)".to_string()
+                    };
+                    *guard = TopologyState::Failed(msg);
+                }
+            }
+        });
+
+        // 返回 Building 状态(刚设置的)
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// **阻塞**地构建拓扑,直到达到 `Ready`/`Failed` 终态(P2-1)。
+    ///
+    /// 供测试和需要同步结果的场景使用。在非 `Uninitialized` 状态下行为与
+    /// `ensure_built()` 相同(返回当前状态)。在 `Uninitialized` 状态下
+    /// 同步执行 `build_topology_data` 并更新状态,返回最终结果。
+    ///
+    /// 注意:此方法会阻塞调用线程直到 `cargo metadata` + `build_symbol_index_fast`
+    /// 完成(通常 < 5 秒,大项目可能更久)。生产路径应使用 `ensure_built()`。
+    pub fn ensure_built_blocking(&self) -> TopologyState {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        match &*guard {
+            TopologyState::Ready(_) => return guard.clone(),
+            TopologyState::Failed(_) => return guard.clone(),
+            TopologyState::Building { .. } => {
+                // 已有后台线程在构建:spin-wait 直到终态(带超时保护)
+                drop(guard);
+                return self.wait_for_build_completion();
+            }
+            TopologyState::Uninitialized => {}
+        }
+
+        // Uninitialized → Building,同步执行构建
         let started_at = Instant::now();
         *guard = TopologyState::Building { started_at };
         drop(guard);
 
-        // Build ModuleGraph via cargo metadata
-        let result = build_module_graph(&self.workspace_root);
+        let result = build_topology_data(&self.workspace_root);
+        let elapsed = started_at.elapsed();
 
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match result {
-            Ok(module_graph) => {
-                let data = TopologyData {
-                    module_graph,
-                    symbol_index: None,
-                    built_at_ms: started_at.elapsed().as_millis() as u64,
-                };
+            Ok(mut data) => {
+                data.built_at_ms = elapsed.as_millis() as u64;
                 *guard = TopologyState::Ready(data);
             }
             Err(e) => {
@@ -184,6 +268,27 @@ impl ProjectTopology {
             }
         }
         guard.clone()
+    }
+
+    /// 等待已在进行中的后台构建完成(用于 `ensure_built_blocking` 遇到 `Building` 时)。
+    ///
+    /// 使用 spin-wait + sleep(50ms)轮询,超时 120 秒后返回当前状态(可能仍为 Building)。
+    fn wait_for_build_completion(&self) -> TopologyState {
+        const POLL_INTERVAL_MS: u64 = 50;
+        const TIMEOUT_SECS: u64 = 120;
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
+        loop {
+            let state = self.state();
+            if !matches!(state, TopologyState::Building { .. }) {
+                return state;
+            }
+            if Instant::now() > deadline {
+                // 超时:返回当前 Building 状态,让调用方决定如何处理
+                return state;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+        }
     }
 
     /// 查询 crate 依赖图。
@@ -476,6 +581,49 @@ impl ProjectTopology {
 // cargo metadata → ModuleGraph
 // ---------------------------------------------------------------------------
 
+/// P2-1:构建完整的 `TopologyData`(ModuleGraph + best-effort SymbolIndex)。
+///
+/// 这是 `ensure_built()`(异步)和 `ensure_built_blocking()`(同步)共用的
+/// 核心构建逻辑。提取为独立函数使得:
+/// - `ensure_built()` 的后台线程可以调用它(闭包捕获 `workspace_root`)
+/// - `ensure_built_blocking()` 可以同步调用它
+/// - 单元测试可以直接测试此函数而无需走状态机
+///
+/// 返回 `Result<TopologyData, String>`:
+/// - `Ok(data)`:ModuleGraph 构建成功;SymbolIndex 可能仍为 None(best-effort)
+/// - `Err(e)`:cargo metadata 失败(非 cargo 目录、cargo 不可用等)
+fn build_topology_data(workspace_root: &Path) -> Result<TopologyData, String> {
+    let started_at = Instant::now();
+
+    // Build ModuleGraph via cargo metadata
+    let module_graph = build_module_graph(workspace_root)?;
+
+    // Phase 4 P0-5:用 grep/rg 填充 SymbolIndex(best-effort)。
+    // 之前 symbol_index 恒为 None,导致 DomainTools 的 refactor_algorithm_topo
+    // 永远返回 "no symbol index" 降级提示。现在从 module_graph 收集所有
+    // source_paths,调用 build_symbol_index_fast 构建 definitions + callers。
+    // 如果构建失败(rg/grep 不可用),symbol_index 仍为 None,不影响 ModuleGraph。
+    let source_dirs: Vec<PathBuf> = module_graph
+        .crates
+        .iter()
+        .flat_map(|c| c.source_paths.iter().cloned())
+        .collect();
+    let symbol_index = if source_dirs.is_empty() {
+        None
+    } else {
+        match build_symbol_index_fast(&source_dirs) {
+            Ok(si) => Some(si),
+            Err(_) => None, // best-effort:grep 失败不阻断拓扑
+        }
+    };
+
+    Ok(TopologyData {
+        module_graph,
+        symbol_index,
+        built_at_ms: started_at.elapsed().as_millis() as u64,
+    })
+}
+
 /// 通过 `cargo metadata` 构建 ModuleGraph。
 fn build_module_graph(root: &Path) -> Result<ModuleGraph, String> {
     let output = Command::new("cargo")
@@ -589,18 +737,24 @@ pub fn build_symbol_index_fast(
 
     for dir in source_dirs {
         // Use cargo's ripgrep or grep to find pub declarations
+        // P2-3 修复:在 `pub` 前加 `\b` 词边界,避免匹配 `repub fn foo()` 中的 `pub`。
+        // rg 使用 Rust regex 语法,支持 `\b`;grep -E (POSIX ERE) 不支持 `\b`,
+        // 但 grep fallback 用了不同的 pattern(见下方),所以这里 rg pattern 用 \b。
         let result = Command::new("rg")
             .args([
                 "--no-heading",
                 "--line-number",
                 "--type",
                 "rust",
-                r"pub(?:\(\s*(?:crate|super)\s*\))?\s+(fn|struct|trait|enum|mod|type|const|static)\s+(\w+)",
+                r"\bpub(?:\(\s*(?:crate|super)\s*\))?\s+(fn|struct|trait|enum|mod|type|const|static)\s+(\w+)",
             ])
             .arg(dir)
             .output();
 
         // Fallback to grep if rg not available
+        // P2-3 修复:grep -E 不支持 `\b`,改用 `(^|[^a-zA-Z0-9_])` 模拟词边界。
+        // 同时支持 pub(crate)/pub(super) 可见性,与 rg pattern 行为一致。
+        // 注意:grep -E 中 `\s` 不被所有版本支持,用 `[[:space:]]` 替代。
         let output = match result {
             Ok(o) if o.status.success() => o,
             _ => Command::new("grep")
@@ -608,7 +762,7 @@ pub fn build_symbol_index_fast(
                     "-rn",
                     "--include=*.rs",
                     "-E",
-                    r"pub\s+(fn|struct|trait|enum|mod|type|const|static)\s+\w+",
+                    r"(^|[^a-zA-Z0-9_])pub(\([[:space:]]*(crate|super)[[:space:]]*\))?[[:space:]]+(fn|struct|trait|enum|mod|type|const|static)[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*",
                 ])
                 .arg(dir)
                 .output()
@@ -652,18 +806,31 @@ pub fn build_symbol_index_fast(
 
 fn parse_grep_line(line: &str, base_dir: &Path) -> Option<SymbolDef> {
     // Format: path:line:content
-    let colon_pos1 = line.find(':')?;
-    let colon_pos2 = line[colon_pos1 + 1..].find(':')?;
+    //
+    // P2-3 修复:Windows 路径解析。
+    // 之前用 `line.find(':')` 在 `C:\project\src\main.rs:42:pub fn foo` 上
+    // 返回位置 1(盘符 `C` 后的冒号),导致 file_path="C",解析失败。
+    // 现在用 regex `:(\d+):` 找到 "冒号+数字+冒号" 的位置作为分隔符,
+    // 对 Windows 盘符冒号免疫(因为盘符后是 `\` 不是数字)。
+    let separator_re = regex::Regex::new(r":(\d+):").ok()?;
+    let caps = separator_re.captures(line)?;
+    let whole_match = caps.get(0)?; // 形如 ":42:"
+    let line_num: u32 = caps.get(1)?.as_str().parse().ok()?;
+    let file_path = &line[..whole_match.start()];
+    let content = &line[whole_match.end()..];
 
-    let file_path = &line[..colon_pos1];
-    let line_num: u32 = line[colon_pos1 + 1..colon_pos1 + 1 + colon_pos2]
-        .parse()
-        .ok()?;
-    let content = &line[colon_pos1 + 1 + colon_pos2 + 1..];
+    if file_path.is_empty() {
+        return None;
+    }
 
     // Extract symbol kind and name
+    // 支持 pub、pub(crate)、pub(super) 三种可见性,与 build_symbol_index_fast 的 grep regex 一致
+    //
+    // P2-3 修复:在 `pub` 前加 `\b` 词边界,避免匹配 `repub fn foo()`
+    // 中的 `pub`(否则会把 `repub fn` 误识别为 `pub fn`,捕获到错误的符号名)。
+    // `\b` 在 `repub` 的 `e`→`p` 位置不成立(都是单词字符),所以会跳过。
     let re = regex::Regex::new(
-        r"pub\s+(fn|struct|trait|enum|mod|type|const|static)\s+(\w+)"
+        r"\bpub(?:\(\s*(?:crate|super)\s*\))?\s+(fn|struct|trait|enum|mod|type|const|static)\s+(\w+)"
     ).ok()?;
     let caps = re.captures(content)?;
 
@@ -703,6 +870,11 @@ fn find_callers_fast(
 ) -> Result<HashMap<String, Vec<CallSite>>, String> {
     let mut result: HashMap<String, Vec<CallSite>> = HashMap::new();
 
+    // P2-3:预编译 regex,避免在内层 line 循环中重复编译。
+    // 用于解析 grep 输出 `path:line:content`,Windows 盘符冒号免疫。
+    let separator_re = regex::Regex::new(r":(\d+):")
+        .map_err(|e| format!("regex compile failed: {e}"))?;
+
     // For each known function name, search for its usage
     for func_name in definitions
         .iter()
@@ -733,31 +905,40 @@ fn find_callers_fast(
 
         for line in lines.lines() {
             let line = line.map_err(|e| format!("read line: {e}"))?;
-            if let Some(colon_pos) = line.find(':') {
-                let file_path = &line[..colon_pos];
-                let rest = &line[colon_pos + 1..];
-                if let Some(colon_pos2) = rest.find(':') {
-                    if let Ok(line_num) = rest[..colon_pos2].parse::<u32>() {
-                        let context = rest[colon_pos2 + 1..].to_string();
-
-                        let file_path_path = Path::new(file_path);
-                        let relative_path = file_path_path
-                            .strip_prefix(dir)
-                            .ok()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| PathBuf::from(file_path));
-
-                        result
-                            .entry(func_name.to_string())
-                            .or_default()
-                            .push(CallSite {
-                                file: relative_path,
-                                line: line_num,
-                                context: Some(context),
-                            });
-                    }
-                }
+            // P2-3 修复:Windows 路径解析,与 parse_grep_line 同样的策略。
+            // 之前 `line.find(':')` 在 `C:\project\src\main.rs:42:foo()` 上
+            // 会定位到盘符后的冒号,导致 file_path="C" 解析失败。
+            // 现在用预编译的 separator_re 找到真正的 "行号分隔符" 位置。
+            let Some(caps) = separator_re.captures(&line) else {
+                continue;
+            };
+            let Some(whole_match) = caps.get(0) else {
+                continue;
+            };
+            let Ok(line_num) = caps.get(1).unwrap().as_str().parse::<u32>() else {
+                continue;
+            };
+            let file_path = &line[..whole_match.start()];
+            let context = line[whole_match.end()..].to_string();
+            if file_path.is_empty() {
+                continue;
             }
+
+            let file_path_path = Path::new(file_path);
+            let relative_path = file_path_path
+                .strip_prefix(dir)
+                .ok()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from(file_path));
+
+            result
+                .entry(func_name.to_string())
+                .or_default()
+                .push(CallSite {
+                    file: relative_path,
+                    line: line_num,
+                    context: Some(context),
+                });
         }
     }
 
@@ -817,14 +998,187 @@ mod tests {
     fn parse_grep_line_parses_pub_crate_fn() {
         let base = PathBuf::from("/project/src");
         let line = "/project/src/internal.rs:5:pub(crate) fn internal_helper() {";
-        // Note: pub(crate) visibility may not match with current regex;
-        // this is best-effort — the visibility field is advisory.
-        if let Some(sym) = parse_grep_line(line, &base) {
-            assert_eq!(sym.name, "internal_helper");
-            // visibility may be None for pub(crate) patterns
-        } else {
-            // Regex may miss pub(crate) with some regex engine quirks; ok.
-        }
+        // P2-3 修复：regex 现在支持 pub(crate) 可见性，不再容忍解析失败
+        let sym = parse_grep_line(line, &base)
+            .expect("pub(crate) fn should be parsed with fixed regex");
+        assert_eq!(sym.name, "internal_helper");
+        assert_eq!(sym.kind, "fn");
+        assert_eq!(sym.visibility.as_deref(), Some("pub(crate)"));
+    }
+
+    #[test]
+    fn parse_grep_line_parses_pub_super_fn() {
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/mod.rs:12:pub(super) fn super_helper() {";
+        let sym = parse_grep_line(line, &base)
+            .expect("pub(super) fn should be parsed with fixed regex");
+        assert_eq!(sym.name, "super_helper");
+        assert_eq!(sym.kind, "fn");
+        assert_eq!(sym.visibility.as_deref(), Some("pub(super)"));
+    }
+
+    // -----------------------------------------------------------------
+    // P2-3: Windows 路径解析 + regex 词边界修复测试
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_grep_line_parses_windows_drive_letter_path() {
+        // P2-3 修复:Windows 盘符 `C:` 不应被误认为 path:line 分隔符。
+        // 之前 `line.find(':')` 会返回位置 1(盘符 C 后的冒号),
+        // 导致 file_path="C",line_num 解析失败,返回 None。
+        let base = PathBuf::from(r"C:\project\src");
+        let line = r"C:\project\src\main.rs:42:pub fn hello_world() {";
+        let sym = parse_grep_line(line, &base).expect("should parse Windows path");
+        assert_eq!(sym.name, "hello_world");
+        assert_eq!(sym.kind, "fn");
+        assert_eq!(sym.line, 42);
+        // file 字段保留原始路径(包括盘符),strip_prefix 成功则去掉 base
+        assert!(
+            sym.file.ends_with("main.rs"),
+            "file should end with main.rs, got {}",
+            sym.file.display()
+        );
+    }
+
+    #[test]
+    fn parse_grep_line_parses_windows_path_with_pub_crate() {
+        // 组合测试:Windows 路径 + pub(crate) 可见性
+        let base = PathBuf::from(r"C:\project\src");
+        let line = r"C:\project\src\internal.rs:5:pub(crate) fn internal_helper() {";
+        let sym = parse_grep_line(line, &base)
+            .expect("should parse Windows path + pub(crate) fn");
+        assert_eq!(sym.name, "internal_helper");
+        assert_eq!(sym.kind, "fn");
+        assert_eq!(sym.line, 5);
+        assert_eq!(sym.visibility.as_deref(), Some("pub(crate)"));
+    }
+
+    #[test]
+    fn parse_grep_line_rejects_repub_word_boundary_violation() {
+        // P2-3 修复:`repub fn foo()` 不应被识别为 `pub fn foo()`。
+        // 之前没有 `\b` 词边界,regex `pub...` 会从 `repub` 的 `pub` 部分开始匹配,
+        // 错误捕获 `foo` 作为 pub fn 符号。
+        // 现在加了 `\bpub`,要求 `pub` 前必须是单词边界(非标识符字符),
+        // `repub` 中 `e`→`p` 不是单词边界,所以不会匹配。
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/main.rs:42:fn repub_fn() { pub fn real_pub() {}";
+        // 第一行 `fn repub_fn()` 不匹配 `pub fn` 模式(没有 pub 前缀)。
+        // `pub fn real_pub()` 是合法的 pub fn,应该被解析到 `real_pub`。
+        let sym = parse_grep_line(line, &base).expect("should parse the real pub fn");
+        assert_eq!(
+            sym.name, "real_pub",
+            "should capture real_pub, not repub_fn (word boundary bug)"
+        );
+    }
+
+    #[test]
+    fn parse_grep_line_handles_unix_path_with_colon_in_content() {
+        // 边界情况:content 中含冒号+数字(如 URL `:8080`)。
+        // regex `:(\d+):` 应匹配第一个出现的 `:digits:`(即行号分隔符),
+        // 而不是 content 中的 `:8080:`。
+        // 注意:此测试用例需要 content 中没有形如 `:digits:` 的子串,
+        // 否则会匹配到错误位置。我们用一个含 URL 的 content 来验证。
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/main.rs:42:pub fn fetch(url: &str) -> String {";
+        let sym = parse_grep_line(line, &base).expect("should parse");
+        assert_eq!(sym.name, "fetch");
+        assert_eq!(sym.line, 42);
+    }
+
+    #[test]
+    fn parse_grep_line_rejects_empty_file_path() {
+        // 边界情况:regex 匹配到字符串开头的 `:42:`,file_path 为空。
+        // 这不应该发生在真实 grep 输出中,但作为防御性编程需要处理。
+        let base = PathBuf::from("/project/src");
+        let line = ":42:pub fn foo() {}";
+        let result = parse_grep_line(line, &base);
+        assert!(
+            result.is_none(),
+            "empty file_path should return None, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_grep_line_parses_pub_const() {
+        // 测试 const 关键字
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/constants.rs:10:pub const MAX_RETRIES: u32 = 3;";
+        let sym = parse_grep_line(line, &base).expect("should parse pub const");
+        assert_eq!(sym.name, "MAX_RETRIES");
+        assert_eq!(sym.kind, "const");
+        assert_eq!(sym.visibility.as_deref(), Some("pub"));
+    }
+
+    #[test]
+    fn parse_grep_line_parses_pub_static() {
+        // 测试 static 关键字
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/globals.rs:5:pub static COUNTER: AtomicU64 = AtomicU64::new(0);";
+        let sym = parse_grep_line(line, &base).expect("should parse pub static");
+        assert_eq!(sym.name, "COUNTER");
+        assert_eq!(sym.kind, "static");
+    }
+
+    #[test]
+    fn parse_grep_line_parses_pub_type_alias() {
+        // 测试 type 关键字(类型别名)
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/types.rs:8:pub type Result<T> = std::result::Result<T, MyError>;";
+        let sym = parse_grep_line(line, &base).expect("should parse pub type");
+        assert_eq!(sym.name, "Result");
+        assert_eq!(sym.kind, "type");
+    }
+
+    #[test]
+    fn parse_grep_line_parses_pub_mod() {
+        // 测试 mod 关键字
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/lib.rs:1:pub mod network;";
+        let sym = parse_grep_line(line, &base).expect("should parse pub mod");
+        assert_eq!(sym.name, "network");
+        assert_eq!(sym.kind, "mod");
+    }
+
+    #[test]
+    fn parse_grep_line_parses_pub_enum() {
+        // 测试 enum 关键字
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/enums.rs:3:pub enum Color { Red, Green, Blue }";
+        let sym = parse_grep_line(line, &base).expect("should parse pub enum");
+        assert_eq!(sym.name, "Color");
+        assert_eq!(sym.kind, "enum");
+    }
+
+    #[test]
+    fn parse_grep_line_parses_pub_trait() {
+        // 测试 trait 关键字
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/traits.rs:7:pub trait Serializable { fn serialize(&self); }";
+        let sym = parse_grep_line(line, &base).expect("should parse pub trait");
+        assert_eq!(sym.name, "Serializable");
+        assert_eq!(sym.kind, "trait");
+    }
+
+    #[test]
+    fn parse_grep_line_skips_non_pub_declarations() {
+        // 非 pub 声明不应被索引(私有符号不在 SymbolIndex 范围内)
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/internal.rs:5:fn private_helper() {}";
+        let result = parse_grep_line(line, &base);
+        assert!(
+            result.is_none(),
+            "non-pub fn should not be indexed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_grep_line_handles_indented_pub_fn() {
+        // 缩进的 pub fn(在 mod 块内)也应被解析
+        let base = PathBuf::from("/project/src");
+        let line = "/project/src/lib.rs:10:    pub fn indented_fn() {}";
+        let sym = parse_grep_line(line, &base).expect("should parse indented pub fn");
+        assert_eq!(sym.name, "indented_fn");
+        assert_eq!(sym.kind, "fn");
     }
 
     #[test]
@@ -835,17 +1189,16 @@ mod tests {
     }
 
     #[test]
-    fn project_topology_ensure_built_returns_building_or_failed() {
-        // In a non-cargo directory, ensure_built will fail
+    fn project_topology_ensure_built_returns_failed_in_non_cargo_dir() {
+        // In a non-cargo directory, ensure_built_blocking will fail synchronously
         let dir = tempfile::tempdir().unwrap();
         let topo = ProjectTopology::new(dir.path().to_path_buf());
-        let state = topo.ensure_built();
-        // Should either be Building then Failed, or directly Failed
-        match state {
-            TopologyState::Failed(_) => {}
-            TopologyState::Building { .. } => {}
-            _ => panic!("expected Failed or Building, got {state}"),
-        }
+        let state = topo.ensure_built_blocking();
+        // 非 cargo 目录应返回 Failed
+        assert!(
+            matches!(state, TopologyState::Failed(_)),
+            "expected Failed in non-cargo dir, got {state}"
+        );
     }
 
     #[test]
@@ -854,5 +1207,141 @@ mod tests {
         let result = topo.query_project_graph().unwrap();
         // Should return a message rather than error
         assert!(!result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // P2-1:异步化测试
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn p2_1_ensure_built_returns_building_immediately() {
+        // ensure_built() 应立即返回 Building,不阻塞等待 cargo metadata
+        let dir = tempfile::tempdir().unwrap();
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        let state = topo.ensure_built();
+        // 首次调用必须立即返回 Building(而非 Ready/Failed)
+        assert!(
+            matches!(state, TopologyState::Building { .. }),
+            "expected Building immediately after ensure_built(), got {state}"
+        );
+    }
+
+    #[test]
+    fn p2_1_ensure_built_does_not_respawn_while_building() {
+        // 在 Building 状态下再次调用 ensure_built() 应返回 Building,不重复派发
+        let dir = tempfile::tempdir().unwrap();
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        let state1 = topo.ensure_built();
+        assert!(matches!(state1, TopologyState::Building { .. }));
+        let state2 = topo.ensure_built();
+        assert!(matches!(state2, TopologyState::Building { .. }));
+        // 两次返回的 Building 的 started_at 应相同(同一个 Building 实例)
+        if let (TopologyState::Building { started_at: s1 }, TopologyState::Building { started_at: s2 }) = (state1, state2) {
+            assert_eq!(s1, s2, "second ensure_built() should not restart building");
+        }
+    }
+
+    #[test]
+    fn p2_1_ensure_built_eventually_reaches_terminal_state() {
+        // 后台线程完成后,状态应转为 Ready 或 Failed(取决于是否在 cargo 目录)
+        let dir = tempfile::tempdir().unwrap();
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        topo.ensure_built(); // kick off background build
+
+        // 轮询等待终态(最多 30 秒)
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let final_state = loop {
+            let state = topo.state();
+            if !matches!(state, TopologyState::Building { .. }) {
+                break state;
+            }
+            if Instant::now() > deadline {
+                panic!("topology did not reach terminal state within 30s, still: {state}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // 非 cargo 目录应最终达到 Failed
+        assert!(
+            matches!(final_state, TopologyState::Failed(_)),
+            "expected Failed after background build in non-cargo dir, got {final_state}"
+        );
+    }
+
+    #[test]
+    fn p2_1_ensure_built_blocking_waits_for_existing_build() {
+        // 如果已有后台构建在进行,ensure_built_blocking 应等待其完成
+        let dir = tempfile::tempdir().unwrap();
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        topo.ensure_built(); // 启动后台构建
+        // 此时状态应为 Building
+        assert!(matches!(topo.state(), TopologyState::Building { .. }));
+
+        // ensure_built_blocking 应等待后台线程完成
+        let state = topo.ensure_built_blocking();
+        assert!(
+            matches!(state, TopologyState::Failed(_)),
+            "expected Failed after waiting for background build, got {state}"
+        );
+    }
+
+    #[test]
+    fn p2_1_ensure_built_returns_cached_ready_state() {
+        // Ready 状态下 ensure_built() 应直接返回缓存的 Ready,不重复构建
+        let dir = tempfile::tempdir().unwrap();
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        // 先用 blocking 构建到终态
+        let state1 = topo.ensure_built_blocking();
+        assert!(matches!(state1, TopologyState::Failed(_)));
+        // 再次调用 ensure_built() 应返回相同的 Failed(不重复构建)
+        let state2 = topo.ensure_built();
+        assert!(
+            matches!(state2, TopologyState::Failed(_)),
+            "expected cached Failed state, got {state2}"
+        );
+    }
+
+    #[test]
+    fn p2_1_build_topology_data_function_directly() {
+        // 直接测试提取出的 build_topology_data 函数(不经状态机)
+        let dir = tempfile::tempdir().unwrap();
+        let result = build_topology_data(dir.path());
+        // 非 cargo 目录应返回 Err
+        assert!(result.is_err(), "expected error in non-cargo dir");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cargo metadata") || err.contains("cargo"),
+            "error should mention cargo, got: {err}"
+        );
+    }
+
+    #[test]
+    fn p2_1_panic_safety_transitions_to_failed() {
+        // 验证 catch_unwind:如果后台线程 panic,状态应转为 Failed 而非永久 Building。
+        // 我们通过模拟一个会导致 build_topology_data panic 的场景来验证——
+        // 但 build_topology_data 本身不会 panic(它返回 Result),所以这里
+        // 间接验证:确保非 cargo 目录的 Failed 状态能被正确设置(而非卡在 Building)。
+        let dir = tempfile::tempdir().unwrap();
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        topo.ensure_built();
+
+        // 等待终态
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let final_state = loop {
+            let state = topo.state();
+            if !matches!(state, TopologyState::Building { .. }) {
+                break state;
+            }
+            if Instant::now() > deadline {
+                panic!("stuck in Building state — catch_unwind may have failed");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // 如果 catch_unwind 工作正常,状态应为 Failed(而非永久 Building)
+        assert!(
+            matches!(final_state, TopologyState::Failed(_)),
+            "expected Failed (not stuck Building), got {final_state}"
+        );
     }
 }

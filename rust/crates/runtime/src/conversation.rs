@@ -935,6 +935,22 @@ where
         // 不同 turn 中(误判 doom loop)。
         self.loop_detector.reset();
 
+        // Phase 4 P1-1：turn 级事务快照。
+        // 在 turn 开始时创建 git stash 快照，以便 turn 内的修改可以通过
+        // rollback_transaction 工具回滚。非 git 仓库自动进入 Disabled 状态。
+        // 详见 docs/agent-cognitive-exoskeleton-plan.md 第三章。
+        if let Some(tx) = &mut self.refactor_tx {
+            let turn_id = format!(
+                "{}-{}",
+                self.session.session_id,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            let _ = tx.pre_turn_snapshot(&turn_id);
+        }
+
         // BUG-9:记录 turn 开始时间,供 record_turn_* 计算 latency_ms。
         self.turn_start.set(Some(Instant::now()));
 
@@ -1437,6 +1453,15 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
+                        } else if tool_name == "verify_decision" {
+                            // Phase 4-A P1-4:闭合 success_rate 学习环。
+                            // LLM 在重新验证历史决策(成功/失败/部分成功)后调用,
+                            // 原子更新 verify_count/success_rate/verified_at_ms。
+                            // 详见 docs/agent-cognitive-exoskeleton-plan.md §4.4。
+                            match self.execute_verify_decision(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
                         } else if tool_name == "query_project_graph" {
                             match self.execute_query_project_graph() {
                                 Ok(output) => (output, false),
@@ -1484,6 +1509,21 @@ where
                             }
                         };
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
+
+                        // Phase 4 P1-1：文件修改工具执行后调用 mark_dirty，
+                        // 记录被修改的文件路径到事务管理器，以便 rollback 时恢复。
+                        // 仅对非 error 的文件修改工具（write_file/edit_file）生效。
+                        if !is_error && (tool_name == "write_file" || tool_name == "edit_file") {
+                            if let Some(tx) = &mut self.refactor_tx {
+                                // 从 effective_input JSON 中提取 path 字段
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&effective_input) {
+                                    if let Some(path_str) = parsed.get("path").and_then(|v| v.as_str()) {
+                                        let file_path = std::path::PathBuf::from(path_str);
+                                        tx.mark_dirty(&[file_path]);
+                                    }
+                                }
+                            }
+                        }
 
                         let post_hook_result = if is_error {
                             self.run_post_tool_use_failure_hook(
@@ -2380,6 +2420,72 @@ where
 
         decision_log
             .search_decisions(query, top_k)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+    }
+
+    /// Phase 4-A P1-4:执行 `verify_decision` 工具调用,闭合 success_rate 学习环。
+    ///
+    /// 从输入 JSON 解析 `decision_id`(必需,整数)、`verification_result`
+    /// (必需,枚举字符串)、`verification_evidence`(可选,字符串),
+    /// 委托给 [`DecisionLog::verify_decision`] 处理 SQLite 事务性更新。
+    ///
+    /// # 输入示例
+    ///
+    /// ```json
+    /// {
+    ///   "decision_id": 42,
+    ///   "verification_result": "Confirmed",
+    ///   "verification_evidence": "cargo test: 87 passed, 0 failed"
+    /// }
+    /// ```
+    ///
+    /// # 错误处理
+    ///
+    /// - `decision_log` 未配置:返回降级字符串(与 log_decision /
+    ///   search_past_decisions 一致,不阻断 LLM 工作流)
+    /// - 输入 JSON 无效:返回错误
+    /// - `decision_id` 缺失/非整数:返回错误
+    /// - `verification_result` 缺失/非法:返回错误
+    /// - 目标决策不存在:由 `verify_decision` 返回 `InvalidInput`,
+    ///   此处透传错误消息
+    fn execute_verify_decision(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(decision_log) = &self.decision_log else {
+            return Ok(
+                "verify_decision is not available: no DecisionLog configured.                  Use --workspace-root or set_workspace_root to enable decision verification."
+                    .to_string(),
+            );
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+
+        let decision_id = parsed
+            .get("decision_id")
+            .and_then(|v| v.as_i64())
+            .ok_or("missing or non-integer 'decision_id' field")?;
+
+        let result_str = parsed
+            .get("verification_result")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'verification_result' field")?;
+
+        let verification = crate::decision_log::DecisionVerification::from_str_ic(result_str)
+            .ok_or_else(|| {
+                format!(
+                    "invalid 'verification_result' value: '{result_str}'. \
+                     Must be one of: Confirmed, Refuted, Partial, Pending (case-insensitive)."
+                )
+            })?;
+
+        let evidence = parsed
+            .get("verification_evidence")
+            .and_then(|v| v.as_str());
+
+        decision_log
+            .verify_decision(decision_id, verification, evidence)
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
     }
 

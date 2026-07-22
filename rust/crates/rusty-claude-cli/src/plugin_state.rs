@@ -359,7 +359,28 @@ pub(crate) fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> Run
             .clone()
             .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true })),
         required_permission: permission_mode_for_mcp_tool(&tool.tool),
+        // P2-2:MCP 发现的工具统一打 "mcp" 标签。qualified_name 形如
+        // `mcp__<server>__<tool>`,server name 可作为次级标签(便于按 MCP
+        // server 分组召回,如 `+github` 召回所有 GitHub MCP 工具)。
+        domain_tags: mcp_domain_tags_for(&tool.qualified_name),
     }
+}
+
+/// P2-2:从 `mcp__<server>__<tool>` 形式的 qualified_name 派生领域标签。
+///
+/// 始终包含 `"mcp"`,如果 server name 可解析则追加 `"mcp:<server>"`,
+/// 使 LLM 能用 `+mcp:github` 召回特定 server 的工具。
+fn mcp_domain_tags_for(qualified_name: &str) -> Vec<String> {
+    let mut tags = vec!["mcp".to_string()];
+    // qualified_name 形如 "mcp__<server>__<tool>":取第二段作为 server name。
+    let parts: Vec<&str> = qualified_name.split("__").collect();
+    if parts.len() >= 3 && parts[0] == "mcp" {
+        let server = parts[1];
+        if !server.is_empty() {
+            tags.push(format!("mcp:{server}"));
+        }
+    }
+    tags
 }
 
 pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
@@ -379,6 +400,7 @@ pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
+            domain_tags: vec!["mcp".to_string(), "mcp:wrapper".to_string()],
         },
         RuntimeToolDefinition {
             name: "ListMcpResourcesTool".to_string(),
@@ -394,6 +416,7 @@ pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
+            domain_tags: vec!["mcp".to_string(), "mcp:wrapper".to_string(), "mcp:resources".to_string()],
         },
         RuntimeToolDefinition {
             name: "ReadMcpResourceTool".to_string(),
@@ -408,6 +431,7 @@ pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
+            domain_tags: vec!["mcp".to_string(), "mcp:wrapper".to_string(), "mcp:resources".to_string()],
         },
     ]
 }
@@ -532,6 +556,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
             "required": ["query"]
         }),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["memory".to_string(), "conversation-history".to_string()],
     });
     // P0-1:注册 notebook_update 工具 — Anthropic《Effective Context
     // Engineering for AI Agents》明确推荐的 structured note-taking 模式。
@@ -578,6 +603,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
             "required": ["mode", "section", "content"]
         }),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["memory".to_string(), "notebook".to_string()],
     });
     // P0:注册 recall_full 工具 — 从 ToolResultArchive 检索 microcompact
     // 摘要前的原始 tool result。
@@ -623,6 +649,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
             "additionalProperties": false
         }),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["memory".to_string(), "tool-result-archive".to_string()],
     });
     // Epic 2:注册 dispatch_subagent / check_subagent 工具 — subagent-as-tool 路由。
     // 主 agent 通过 dispatch_subagent 派发子 agent(独立 LLM 请求 + 独立 prompt cache,
@@ -661,6 +688,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
             "required": ["name", "task"]
         }),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["orchestration".to_string(), "subagent".to_string()],
     });
     runtime_tools.push(RuntimeToolDefinition {
         name: "check_subagent".to_string(),
@@ -682,6 +710,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
             "required": ["subagent_id"]
         }),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["orchestration".to_string(), "subagent".to_string()],
     });
 // Phase 4-A:DecisionLog — register log_decision and search_past_decisions tools.
     // Logs repair decisions (problem signature, root cause hypothesis, applied solution,
@@ -735,6 +764,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
             "required": ["session_id", "problem_signature", "root_cause_hypothesis", "applied_solution"]
         }),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["decision-log".to_string(), "memory".to_string()],
     });
     runtime_tools.push(RuntimeToolDefinition {
         name: "search_past_decisions".to_string(),
@@ -757,6 +787,47 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
             "required": ["query"]
         }),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["decision-log".to_string(), "memory".to_string()],
+    });
+    // Phase 4-A P1-4: verify_decision — closes the success_rate learning loop.
+    //
+    // 之前 log_decision 只在写入时设置一次 verification_result,
+    // 之后即使 LLM 在后续会话中再次遇到同问题并验证(成功/失败),
+    // success_rate 也不会更新,search_past_decisions 永远显示 0% —
+    // 学习环未闭合。verify_decision 让 LLM 在重新验证历史决策后调用,
+    // 原子地更新 verify_count / success_rate / verified_at_ms。
+    //
+    // 公式(计划 §4.4):
+    //   Confirmed: rate = (rate * count + 1.0) / (count + 1)
+    //   Partial:   rate = (rate * count + 0.5) / (count + 1)
+    //   Refuted:   rate = (rate * count + 0.0) / (count + 1)
+    //   Pending:   不更新统计,只重置 verification_result(用于撤销误验证)
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "verify_decision".to_string(),
+        description: Some(
+            "Verify a past decision after re-encountering the same problem in a new session, closing the success_rate learning loop. Call AFTER you have either confirmed (solution worked again), refuted (solution failed this time), or partially verified (solution worked but needed tweaks) a decision returned by search_past_decisions. Updates verify_count, success_rate, verified_at_ms, verification_result, and verification_evidence atomically (BEGIN IMMEDIATE transaction). Use 'Pending' to revoke a previously incorrect verification without altering statistics. Higher success_rate decisions will be ranked higher in future search_past_decisions results, so accurate verification improves future diagnosis quality.".to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "decision_id": {
+                    "type": "integer",
+                    "description": "The id of the decision to verify, as returned by search_past_decisions (the 'id=N' field)."
+                },
+                "verification_result": {
+                    "type": "string",
+                    "enum": ["Confirmed", "Refuted", "Partial", "Pending"],
+                    "description": "Verification outcome. Confirmed=solution worked as-is; Refuted=solution failed; Partial=worked with modifications; Pending=revoke previous verification without changing stats."
+                },
+                "verification_evidence": {
+                    "type": "string",
+                    "description": "Optional evidence: test output, error message, user feedback, command exit code, etc. Stored verbatim and surfaced in future search results."
+                }
+            },
+            "required": ["decision_id", "verification_result"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["decision-log".to_string(), "memory".to_string()],
     });
     // Phase 4-B: ProjectTopology + DomainTools registration.
     runtime_tools.push(RuntimeToolDefinition {
@@ -764,18 +835,21 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         description: Some("Query the cargo workspace crate dependency graph. Returns all crates, dependencies, source paths, and reverse-dependency info.".to_string()),
         input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["topology".to_string(), "analysis".to_string()],
     });
     runtime_tools.push(RuntimeToolDefinition {
         name: "find_boundary_crossings".to_string(),
         description: Some("Find cross-crate symbol/call-site boundaries. Optional query to filter by crate name. If ProjectTopology is building, do NOT retry - use read/grep instead.".to_string()),
         input_schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}, "additionalProperties": false}),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["topology".to_string(), "analysis".to_string()],
     });
     runtime_tools.push(RuntimeToolDefinition {
         name: "get_symbol_info".to_string(),
         description: Some("Look up a symbol in the project topology index. Returns definition location, call sites, and crate membership. Best-effort; use grep_search for exhaustive results.".to_string()),
         input_schema: serde_json::json!({"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"], "additionalProperties": false}),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["topology".to_string(), "analysis".to_string()],
     });
     // DomainTools: stateless algorithm tools.
     runtime_tools.push(RuntimeToolDefinition {
@@ -783,12 +857,14 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         description: Some("Suggestion-mode refactoring: returns a list of suggested edits (file + line + old/new signature) for renaming a symbol. Does NOT modify any files. Review suggestions then use edit_file to apply.".to_string()),
         input_schema: serde_json::json!({"type": "object", "properties": {"target_symbol": {"type": "string"}, "new_name": {"type": "string"}, "reason": {"type": "string"}}, "required": ["target_symbol"], "additionalProperties": false}),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["topology".to_string(), "refactor".to_string()],
     });
     runtime_tools.push(RuntimeToolDefinition {
         name: "benchmark_compare".to_string(),
         description: Some("Run a command multiple times and report timing statistics (avg, median, min, max, stddev). Supports warmup runs, configurable sample size, and per-sample exit code tracking.".to_string()),
         input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}, "timeout_seconds": {"type": "integer", "default": 60}, "sample_size": {"type": "integer", "default": 20}, "warmup_runs": {"type": "integer", "default": 2}}, "required": ["command"], "additionalProperties": false}),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["benchmark".to_string(), "analysis".to_string()],
     });
 
     // Phase 4-C: register rollback_transaction + transaction_status tools.
@@ -797,12 +873,14 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         description: Some("Rollback all file modifications made in the current turn. Restores the working tree to its pre-turn state using git stash or file snapshots. Use when you realize the current approach is wrong and want to start fresh.".to_string()),
         input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
         required_permission: PermissionMode::WorkspaceWrite,
+        domain_tags: vec!["transaction".to_string(), "vcs".to_string()],
     });
     runtime_tools.push(RuntimeToolDefinition {
         name: "transaction_status".to_string(),
         description: Some("Check the current transaction status: whether a snapshot is active, which files have been modified this turn, and whether the environment supports rollback (git repo / detached HEAD / non-git).".to_string()),
         input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
         required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["transaction".to_string(), "vcs".to_string()],
     });
 
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?

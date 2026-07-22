@@ -407,6 +407,21 @@ pub struct RuntimeToolDefinition {
     pub description: Option<String>,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
+    /// P2-2:工具所属的领域标签(用于按域过滤、增强 tool_search 相关性)。
+    ///
+    /// 标签是稳定的小写 kebab-case 标识符,例如 `["decision-log", "memory"]`、
+    /// `["topology", "analysis"]`、`["orchestration", "subagent"]`、`["mcp"]`。
+    ///
+    /// 这些标签由工具注册方(MCP 发现层、phase 4 模块)在构造 `RuntimeToolDefinition`
+    /// 时提供,空 Vec 表示工具未归类(向后兼容)。
+    ///
+    /// 当前使用方:
+    /// - `GlobalToolRegistry::searchable_tool_specs()` 把 domain_tags 注入到
+    ///   `SearchableToolSpec` 中,`search_tool_specs()` 把它们加入 haystack,
+    ///   使 LLM 在 `tool_search` 查询中能用 `+decision` 这类术语约束召回。
+    /// - `GlobalToolRegistry::definitions_by_domain()` 按标签过滤工具定义,
+    ///   供 UI/TUI 分组渲染工具列表时使用。
+    pub domain_tags: Vec<String>,
 }
 
 impl GlobalToolRegistry {
@@ -679,16 +694,101 @@ impl GlobalToolRegistry {
             .map(|spec| SearchableToolSpec {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
+                domain_tags: builtin_domain_tags_for(spec.name),
             });
         let runtime = self.runtime_tools.iter().map(|tool| SearchableToolSpec {
             name: tool.name.clone(),
             description: tool.description.clone().unwrap_or_default(),
+            domain_tags: tool.domain_tags.clone(),
         });
         let plugin = self.plugin_tools.iter().map(|tool| SearchableToolSpec {
             name: tool.definition().name.clone(),
             description: tool.definition().description.clone().unwrap_or_default(),
+            domain_tags: Vec::new(),
         });
         builtin.chain(runtime).chain(plugin).collect()
+    }
+
+    /// P2-2:按领域标签过滤工具定义,返回与给定任一标签匹配的工具
+    /// (OR 语义,空 `tags` 返回空 Vec,而非"所有工具"——避免误用)。
+    ///
+    /// 用于 UI/TUI 分组渲染工具列表(例如"显示所有 decision-log 相关工具"),
+    /// 或 LLM 提示中按域总结可用工具("You have the following topology tools: ...")。
+    ///
+    /// 标签匹配大小写不敏感;`allowed_tools` 行为与 `definitions()` 一致。
+    #[must_use]
+    pub fn definitions_by_domain(
+        &self,
+        tags: &[&str],
+        allowed_tools: Option<&BTreeSet<String>>,
+    ) -> Vec<ToolDefinition> {
+        if tags.is_empty() {
+            return Vec::new();
+        }
+        let normalized_tags: BTreeSet<String> = tags
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if normalized_tags.is_empty() {
+            return Vec::new();
+        }
+        self.runtime_tools
+            .iter()
+            .filter(|tool| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str()))
+            })
+            .filter(|tool| {
+                tool.domain_tags.iter().any(|tag| {
+                    normalized_tags.contains(&tag.to_ascii_lowercase())
+                })
+            })
+            .map(|tool| ToolDefinition {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+                cache_control: None,
+            })
+            .collect()
+    }
+
+    /// P2-2:返回所有已注册工具的 `(name, domain_tags)` 快照,供诊断/调试使用。
+    ///
+    /// 仅包含 runtime_tools(plugin_tools 暂未打标);用于 `claw doctor` 类
+    /// 工具渲染标签 → 工具反向索引。
+    #[must_use]
+    pub fn runtime_tool_domain_index(&self) -> Vec<(String, Vec<String>)> {
+        self.runtime_tools
+            .iter()
+            .map(|tool| (tool.name.clone(), tool.domain_tags.clone()))
+            .collect()
+    }
+}
+
+/// P2-2:返回 builtin 工具的静态领域标签。
+///
+/// 这些标签与 `RuntimeToolDefinition::domain_tags` 共享语义,用于在
+/// `tool_search` 中按域过滤 builtin 工具(如 `+memory` 召回
+/// `read_file`/`write_file`/`edit_file`,而 `+search` 召回 `glob_search`/
+/// `grep_search`)。Builtin 工具不通过 `RuntimeToolDefinition` 注册,
+/// 因此需要单独的静态映射。
+fn builtin_domain_tags_for(name: &str) -> Vec<String> {
+    match name {
+        "read_file" | "write_file" | "edit_file" | "multi_edit_file" => {
+            vec!["filesystem".to_string(), "io".to_string()]
+        }
+        "glob_search" | "grep_search" => vec!["search".to_string(), "filesystem".to_string()],
+        "bash" => vec!["shell".to_string(), "execution".to_string()],
+        "tool_search" => vec!["meta".to_string(), "discovery".to_string()],
+        "task" | "exit_plan_mode" | "ask_followup_question" | "attempt_completion" => {
+            vec!["meta".to_string(), "interaction".to_string()]
+        }
+        "web_search" | "web_fetch" => vec!["web".to_string(), "io".to_string()],
+        "notebook_read" | "notebook_write" => vec!["memory".to_string(), "notebook".to_string()],
+        "dispatch_subagent_builtin" | "check_subagent_builtin" => {
+            vec!["orchestration".to_string(), "subagent".to_string()]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -3598,6 +3698,10 @@ struct PlanModeOutput {
 struct SearchableToolSpec {
     name: String,
     description: String,
+    /// P2-2:领域标签,从 `RuntimeToolDefinition::domain_tags` 或 builtin spec 的
+    /// 静态分组派生,空 Vec 表示工具未归类。`search_tool_specs` 将它们拼入
+    /// haystack,使 `+decision`、`+topology` 等术语能召回对应工具。
+    domain_tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5945,11 +6049,15 @@ fn search_tool_specs(query: &str, max_results: usize, specs: &[SearchableToolSpe
             let name = spec.name.to_lowercase();
             let canonical_name = canonical_tool_token(&spec.name);
             let normalized_description = normalize_tool_search_query(&spec.description);
+            // P2-2:把 domain_tags 拼入 haystack,使 `+decision`、`+topology` 等
+            // 标签术语能召回对应工具;同时也参与评分匹配。
+            let tags_str = spec.domain_tags.join(" ");
+            let tags_lower = tags_str.to_lowercase();
             let haystack = format!(
-                "{name} {} {canonical_name}",
+                "{name} {} {canonical_name} {tags_lower}",
                 spec.description.to_lowercase()
             );
-            let normalized_haystack = format!("{canonical_name} {normalized_description}");
+            let normalized_haystack = format!("{canonical_name} {normalized_description} {tags_str}");
             if required.iter().any(|term| !haystack.contains(term)) {
                 return None;
             }
@@ -5971,6 +6079,11 @@ fn search_tool_specs(query: &str, max_results: usize, specs: &[SearchableToolSpe
                 }
                 if normalized_haystack.contains(&canonical_term) {
                     score += 3;
+                }
+                // P2-2:精确标签命中给较高权重——标签是用户/LLM 主动声明的意图,
+                // 比描述里碰巧出现的子串更可信。
+                if spec.domain_tags.iter().any(|tag| tag == term) {
+                    score += 6;
                 }
             }
 
@@ -7182,7 +7295,6 @@ fn parse_skill_description(contents: &str) -> Option<String> {
     None
 }
 
-pub mod domain_algorithm;
 pub mod lane_completion;
 pub mod pdf_extract;
 
@@ -8109,6 +8221,7 @@ mod tests {
                     "additionalProperties": false
                 }),
                 required_permission: runtime::PermissionMode::ReadOnly,
+                domain_tags: vec!["mcp".to_string(), "demo".to_string()],
             }])
             .expect("runtime tools should register");
 
@@ -8161,6 +8274,43 @@ mod tests {
             output["mcp_degraded"]["failed_servers"][0]["phase"],
             "tool_discovery"
         );
+
+        // P2-2:验证 domain_tags 已注入 SearchableToolSpec,并影响 search 召回。
+        // `+demo` 是 required 约束:只有 domain_tags 含 "demo" 的工具才被召回。
+        let tag_search = registry.search("+demo echo", 5, None, None);
+        let tag_output = serde_json::to_value(tag_search).expect("tag search should serialize");
+        assert_eq!(tag_output["matches"][0], "mcp__demo__echo");
+
+        // 验证不存在的标签会过滤掉所有工具
+        let no_match = registry.search("+nonexistent-tag", 5, None, None);
+        let no_match_output = serde_json::to_value(no_match).expect("no-match search should serialize");
+        assert!(
+            no_match_output["matches"].as_array().map_or(true, |arr| arr.is_empty()),
+            "no tool should match a nonexistent tag"
+        );
+
+        // 验证 definitions_by_domain 能按标签过滤
+        let by_domain = registry.definitions_by_domain(&["demo"], Some(&allowed));
+        assert_eq!(by_domain.len(), 1);
+        assert_eq!(by_domain[0].name, "mcp__demo__echo");
+
+        // 验证 OR 语义:任一标签匹配即返回
+        let by_domain_or = registry.definitions_by_domain(&["demo", "no-such-tag"], Some(&allowed));
+        assert_eq!(by_domain_or.len(), 1);
+
+        // 验证大小写不敏感
+        let by_domain_ci = registry.definitions_by_domain(&["DEMO"], Some(&allowed));
+        assert_eq!(by_domain_ci.len(), 1);
+
+        // 验证空标签列表返回空(而非所有工具)
+        let by_domain_empty = registry.definitions_by_domain(&[], Some(&allowed));
+        assert!(by_domain_empty.is_empty());
+
+        // 验证 runtime_tool_domain_index 返回所有 runtime 工具的标签快照
+        let domain_index = registry.runtime_tool_domain_index();
+        assert_eq!(domain_index.len(), 1);
+        assert_eq!(domain_index[0].0, "mcp__demo__echo");
+        assert_eq!(domain_index[0].1, vec!["mcp".to_string(), "demo".to_string()]);
     }
 
     #[test]
