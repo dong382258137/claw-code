@@ -54,6 +54,11 @@ mod prompt;
 pub mod tool_result_archive;
 // Harness L(生命周期)层接入:在 run_turn 失败分支提供"最多 1 次自动恢复后升级"机制。
 // 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
+// Harness O(编排)层 + V(验证)层:Plan/Execute/Review 三段循环。
+// 默认不启用,需通过 CLI `--enable-plan-mode` 或 settings.json `planMode: true` 开启。
+// 缓存保护:PlanArtifact 末尾追加到 prompt 变动区,详见
+// docs/harness-engineering-optimization-plan.md §5.2。
+pub mod project_topology;
 pub mod recovery_orchestrator;
 pub mod recovery_recipes;
 // Harness O(编排)层 + V(验证)层:Plan/Execute/Review 三段循环。
