@@ -683,6 +683,81 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         }),
         required_permission: PermissionMode::ReadOnly,
     });
+// Phase 4-A:DecisionLog — register log_decision and search_past_decisions tools.
+    // Logs repair decisions (problem signature, root cause hypothesis, applied solution,
+    // verification result) into a SQLite + FTS5-backed decision log. The runtime intercepts
+    // calls and routes them to DecisionLog::log_decision / search_decisions.
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "log_decision".to_string(),
+        description: Some(
+            "Record a software repair decision into the persistent decision log.              Stores the problem signature, root cause hypothesis, applied solution,              affected files, and verification result for future reference.              Use this after you have applied a fix and verified it works, so future              sessions can learn from this experience.".to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Current session identifier."
+                },
+                "problem_signature": {
+                    "type": "string",
+                    "description": "Concise description of the problem encountered (e.g. 'null pointer dereference in auth_handler')."
+                },
+                "root_cause_hypothesis": {
+                    "type": "string",
+                    "description": "Your hypothesis about what caused the problem."
+                },
+                "applied_solution": {
+                    "type": "string",
+                    "description": "What you did to fix it."
+                },
+                "affected_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of file paths modified by the fix."
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional tags for categorization (e.g. ['null-pointer', 'auth'])."
+                },
+                "verification_result": {
+                    "type": "string",
+                    "enum": ["Confirmed", "Refuted", "Partial", "Pending"],
+                    "description": "Verification status. Use 'Confirmed' only when fix is verified; 'Pending' otherwise.",
+                    "default": "Pending"
+                },
+                "verification_evidence": {
+                    "type": "string",
+                    "description": "Optional evidence for the verification result."
+                }
+            },
+            "required": ["session_id", "problem_signature", "root_cause_hypothesis", "applied_solution"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    });
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "search_past_decisions".to_string(),
+        description: Some(
+            "Search past software repair decisions using full-text search.              Returns matching decisions with the problem signature, root cause hypothesis,              applied solution, affected files, verification result, and success rate.              Use this before attempting a fix to check if a similar problem was solved              before, saving time and avoiding repeated mistakes.".to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Full-text search query for finding relevant past decisions."
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Maximum number of results (default: 10).",
+                    "default": 10
+                }
+            },
+            "required": ["query"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    });
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {

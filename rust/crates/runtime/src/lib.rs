@@ -11,6 +11,7 @@ pub mod bg;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
+pub mod decision_log;
 mod config;
 pub mod config_validate;
 mod conversation;
@@ -126,6 +127,7 @@ pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
 };
+pub use decision_log::{compute_simhash, hamming_distance, DecisionLog, DecisionLogError};
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_from_env_opt, ApiClient,
     ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,

@@ -413,6 +413,7 @@ pub struct ConversationRuntime<C, T> {
     /// 修复 v1.0 缺陷:`remediation` 字段完全丢失 — 主 agent 不知道
     /// 上一次 verify 为什么失败,只能盲目重试 → 必然陷入 doom loop。
     pending_remediation: Option<String>,
+    decision_log: Option<crate::decision_log::DecisionLog>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -481,6 +482,7 @@ where
             task_registry: None,
             notebook_refresh_pending: false,
             pending_remediation: None,
+            decision_log: None,
         }
     }
 
@@ -600,6 +602,16 @@ where
     #[must_use]
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = Some(root);
+        self
+    }
+    /// Phase 4-A:注入 DecisionLog,启用修复经验记录和检索。
+    ///
+    /// 注入后 LLM 可通过  记录修复决策,通过
+    ///  搜索历史决策。
+    /// 数据库存储在 ,与 NOTEBOOK.md 互补。
+    #[must_use]
+    pub fn with_decision_log(mut self, decision_log: crate::decision_log::DecisionLog) -> Self {
+        self.decision_log = Some(decision_log);
         self
     }
 
@@ -1390,6 +1402,20 @@ where
                             // 重新调用工具,导致重复调用"的问题。
                             // 详见 tool_result_archive 模块文档。
                             match self.execute_recall_full(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "log_decision" {
+                            // Phase 4-A:记录修复决策到 DecisionLog(SQLite + FTS5)。
+                            // LLM 在完成修复并验证后调用,以便未来会话能从经验中学习。
+                            match self.execute_log_decision(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "search_past_decisions" {
+                            // Phase 4-A:搜索历史修复决策(FTS5 全文检索)。
+                            // LLM 在遇到问题时可先查历史,避免重复犯错。
+                            match self.execute_search_past_decisions(&effective_input) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
@@ -2251,6 +2277,52 @@ where
                  or re-invoke the original tool to get fresh output."
             )),
         }
+    }
+
+    /// Phase 4-A:执行  工具调用,将修复决策记录到 DecisionLog。
+    ///
+    /// 委托 [] 处理 SQLite 写入
+    /// 和 FTS5 索引同步。
+    fn execute_log_decision(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(decision_log) = &self.decision_log else {
+            return Ok(
+                "log_decision is not available: no DecisionLog configured.                  Use --workspace-root or set_workspace_root to enable decision logging."
+                    .to_string(),
+            );
+        };
+        decision_log
+            .log_decision(input)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+    }
+
+    /// Phase 4-A:执行  工具调用,搜索历史修复决策。
+    ///
+    /// 使用 FTS5 全文检索 + simhash 去重,返回 top-k 匹配决策。
+    fn execute_search_past_decisions(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(decision_log) = &self.decision_log else {
+            return Ok(
+                "search_past_decisions is not available: no DecisionLog configured.                  Use --workspace-root or set_workspace_root to enable decision search."
+                    .to_string(),
+            );
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let query = parsed
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'query' field")?;
+        let top_k = parsed.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+        decision_log
+            .search_decisions(query, top_k)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
     }
 
     #[must_use]
