@@ -261,6 +261,31 @@ impl LaneContext {
         self
     }
 
+    /// P1-2:从 GreenContractOutcome 桥接设置 green_contract_satisfied + green_level。
+    ///
+    /// 解决类型断层:GreenContractOutcome(green_contract.rs enum)与
+    /// LaneContext(policy_engine.rs u8)之间的桥接。
+    /// - Satisfied → green_contract_satisfied=true, green_level=observed_level.as_u8()
+    /// - Unsatisfied → green_contract_satisfied=false, green_level=observed_level.as_u8()(或 0)
+    #[must_use]
+    pub fn with_green_contract_outcome(
+        mut self,
+        outcome: &crate::green_contract::GreenContractOutcome,
+    ) -> Self {
+        use crate::green_contract::GreenContractOutcome;
+        match outcome {
+            GreenContractOutcome::Satisfied { observed_level, .. } => {
+                self.green_contract_satisfied = true;
+                self.green_level = observed_level.as_u8();
+            }
+            GreenContractOutcome::Unsatisfied { observed_level, .. } => {
+                self.green_contract_satisfied = false;
+                self.green_level = observed_level.map_or(0, |l| l.as_u8());
+            }
+        }
+        self
+    }
+
     #[must_use]
     pub fn with_retry_state(mut self, retry_count: u32, retry_limit: u32) -> Self {
         self.retry_count = retry_count;

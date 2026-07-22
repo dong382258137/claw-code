@@ -4564,6 +4564,8 @@ mod tests {
     #[test]
     fn dispatch_subagent_fails_gracefully_without_workspace_root() {
         let _guard = acquire_lane_event_lock();
+        // P0-2:清空可能残留的 lane events,避免并行测试污染。
+        let _ = crate::lane_events::drain_lane_events();
         let unique_task = "test-no-workspace-uuid-p0-2-fail";
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
         let mut runtime = runtime_with_coordinator(coordinator.clone());

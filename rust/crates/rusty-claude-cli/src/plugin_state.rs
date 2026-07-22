@@ -27,22 +27,36 @@ pub(crate) struct RuntimePluginState {
 
 pub(crate) struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
-    manager: McpServerManager,
+    /// P2-1:用 `Arc<Mutex<McpServerManager>>` 包装,使全局 `McpToolRegistry`
+    /// 单例能持有一份 Arc clone,从而 `MCPTool` 等 wrapper 工具直接调用
+    /// `McpServerManager::call_tool` 等方法,无需经 `RuntimeMcpState` 中转。
+    manager: Arc<Mutex<McpServerManager>>,
     pending_servers: Vec<String>,
     degraded_report: Option<runtime::McpDegradedReport>,
+    /// P3-4:MCP 生命周期 FSM 校验器,记录 phase 转移历史 + 校验合法性。
+    lifecycle: runtime::McpLifecycleValidator,
 }
 
 impl RuntimeMcpState {
     pub(crate) fn new(
         runtime_config: &runtime::RuntimeConfig,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
+        // P3-4:用 McpLifecycleValidator 驱动 phase 转移,记录生命周期历史。
+        let mut lifecycle = runtime::McpLifecycleValidator::new();
+        lifecycle.run_phase(runtime::McpLifecyclePhase::ConfigLoad);
+        lifecycle.run_phase(runtime::McpLifecyclePhase::ServerRegistration);
+
         let mut manager = McpServerManager::from_runtime_config(runtime_config);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
         }
 
         let runtime = tokio::runtime::Runtime::new()?;
+        lifecycle.run_phase(runtime::McpLifecyclePhase::SpawnConnect);
+        lifecycle.run_phase(runtime::McpLifecyclePhase::InitializeHandshake);
+
         let discovery = runtime.block_on(manager.discover_tools_best_effort());
+        lifecycle.run_phase(runtime::McpLifecyclePhase::ToolDiscovery);
         let pending_servers = discovery
             .failed_servers
             .iter()
@@ -114,19 +128,43 @@ impl RuntimeMcpState {
             )
         });
 
+        // P3-4:discovery 有失败时,记录到 lifecycle validator;否则进入 Ready。
+        if !pending_servers.is_empty() {
+            for failure in &discovery.failed_servers {
+                lifecycle.record_failure(runtime::McpErrorSurface::new(
+                    runtime::McpLifecyclePhase::ToolDiscovery,
+                    Some(failure.server_name.clone()),
+                    failure.error.clone(),
+                    std::collections::BTreeMap::new(),
+                    true,
+                ));
+            }
+        } else {
+            lifecycle.run_phase(runtime::McpLifecyclePhase::Ready);
+        }
+
         Ok(Some((
             Self {
                 runtime,
-                manager,
+                manager: Arc::new(Mutex::new(manager)),
                 pending_servers,
                 degraded_report,
+                lifecycle,
             },
             discovery,
         )))
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.block_on(self.manager.shutdown())?;
+        // P3-4:记录 Shutdown → Cleanup phase 转移。
+        self.lifecycle.run_phase(runtime::McpLifecyclePhase::Shutdown);
+        self.runtime.block_on(
+            self.manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .shutdown(),
+        )?;
+        self.lifecycle.run_phase(runtime::McpLifecyclePhase::Cleanup);
         Ok(())
     }
 
@@ -138,8 +176,37 @@ impl RuntimeMcpState {
         self.degraded_report.clone()
     }
 
+    /// P3-4:返回 MCP 生命周期校验器的状态引用(只读)。
+    pub(crate) fn lifecycle(&self) -> &runtime::McpLifecycleValidator {
+        &self.lifecycle
+    }
+
+    /// P2-1:将内部 McpServerManager + discovery 结果分享到全局 McpToolRegistry 单例。
+    ///
+    /// 分两步:
+    /// 1. `set_global_mcp_manager` —— 注入 `Arc<Mutex<McpServerManager>>`,
+    ///    使 `McpToolRegistry::call_tool` 在 `inner` 命中后能通过 manager
+    ///    实际派发调用。
+    /// 2. `populate_global_mcp_registry_from_discovery` —— 把 discovery 结果
+    ///    按 server 分组注册到 `inner`,使 base 工具(`MCP`/`ListMcpResources`/
+    ///    `ReadMcpResource`)能通过 `server_name` 查找到 server。
+    ///
+    /// **注意**:wrapper 工具(`MCPTool`/`ListMcpResourcesTool`/`ReadMcpResourceTool`)
+    /// 仍通过 `RuntimeMcpState::call_tool` 中转,不走全局 registry。本方法
+    /// 使能的是 base 工具路径(经 `tools::global_mcp_registry()`)。
+    pub(crate) fn share_manager_to_global_registry(
+        &self,
+        discovery: &runtime::McpToolDiscoveryReport,
+    ) {
+        tools::set_global_mcp_manager(Arc::clone(&self.manager));
+        tools::populate_global_mcp_registry_from_discovery(discovery);
+    }
+
     pub(crate) fn server_names(&self) -> Vec<String> {
-        self.manager.server_names()
+        self.manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .server_names()
     }
 
     pub(crate) fn call_tool(
@@ -149,7 +216,12 @@ impl RuntimeMcpState {
     ) -> Result<String, ToolError> {
         let response = self
             .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
+            .block_on(
+                self.manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .call_tool(qualified_tool_name, arguments),
+            )
             .map_err(|error| ToolError::new(error.to_string()))?;
         if let Some(error) = response.error {
             return Err(ToolError::new(format!(
@@ -172,7 +244,12 @@ impl RuntimeMcpState {
     ) -> Result<String, ToolError> {
         let result = self
             .runtime
-            .block_on(self.manager.list_resources(server_name))
+            .block_on(
+                self.manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .list_resources(server_name),
+            )
             .map_err(|error| ToolError::new(error.to_string()))?;
         serde_json::to_string_pretty(&json!({
             "server": server_name,
@@ -186,10 +263,12 @@ impl RuntimeMcpState {
         let mut failures = Vec::new();
 
         for server_name in self.server_names() {
-            match self
-                .runtime
-                .block_on(self.manager.list_resources(&server_name))
-            {
+            match self.runtime.block_on(
+                self.manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .list_resources(&server_name),
+            ) {
                 Ok(result) => resources.push(json!({
                     "server": server_name,
                     "resources": result.resources,
@@ -224,7 +303,12 @@ impl RuntimeMcpState {
     ) -> Result<String, ToolError> {
         let result = self
             .runtime
-            .block_on(self.manager.read_resource(server_name, uri))
+            .block_on(
+                self.manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .read_resource(server_name, uri),
+            )
             .map_err(|error| ToolError::new(error.to_string()))?;
         serde_json::to_string_pretty(&json!({
             "server": server_name,
@@ -240,6 +324,13 @@ pub(crate) fn build_runtime_mcp_state(
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, Vec::new()));
     };
+
+    // P2-1:在 `Arc::new(Mutex::new(mcp_state))` 包装前 share manager +
+    // discovery 结果到全局 McpToolRegistry 单例。使 base 工具
+    // (`MCP`/`ListMcpResources`/`ReadMcpResource`)能通过
+    // `tools::global_mcp_registry()` 查找到 server 并派发到 manager。
+    // wrapper 工具(`MCPTool` 等)仍走 `RuntimeMcpState::call_tool` 中转路径。
+    mcp_state.share_manager_to_global_registry(&discovery);
 
     let mut runtime_tools = discovery
         .tools

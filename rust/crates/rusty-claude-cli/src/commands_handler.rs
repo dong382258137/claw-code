@@ -153,6 +153,11 @@ pub(crate) enum CliAction {
         /// 详见 `docs/harness-engineering-optimization-plan.md` Step 2.1 与 §5.2。
         /// 预期 DeepSeek V4 PRO 缓存命中率从 95% 降至 88-92%。
         enable_plan_mode: bool,
+        /// P1-1:启用 PolicyEngine 策略引擎。
+        /// 启用后,lane 完成时会调用 PolicyEngine::evaluate 产出策略动作
+        /// (CloseoutLane/CleanupSession 等),发布到 lane_events。
+        /// 默认关闭,向后兼容。
+        enable_policy_engine: bool,
     },
     HelpTopic {
         topic: LocalHelpTopic,
@@ -207,6 +212,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // `--enable-plan-mode`：启用 Plan/Execute/Review 三段循环(Step 2.1)。
     // 默认关闭。详见 `docs/harness-engineering-optimization-plan.md` Step 2.1。
     let mut enable_plan_mode = false;
+    // P1-1:`--enable-policy-engine` — 启用 PolicyEngine 策略引擎。
+    // 默认关闭。启用后 lane 完成时调用 PolicyEngine::evaluate。
+    let mut enable_policy_engine = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -326,6 +334,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--enable-plan-mode" => {
                 enable_plan_mode = true;
+                index += 1;
+            }
+            "--enable-policy-engine" => {
+                enable_policy_engine = true;
                 index += 1;
             }
             "--quiet" => {
@@ -482,6 +494,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_verbosity,
             tui,
             enable_plan_mode,
+            enable_policy_engine,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {

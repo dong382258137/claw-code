@@ -19,6 +19,18 @@ impl GreenLevel {
             Self::MergeReady => "merge_ready",
         }
     }
+
+    /// P1-2:将 GreenLevel enum 转换为 u8,与 policy_engine::GreenLevel(u8) 桥接。
+    /// 数值越大表示绿色级别越高(0=TargetedTests, 3=MergeReady)。
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::TargetedTests => 0,
+            Self::Package => 1,
+            Self::Workspace => 2,
+            Self::MergeReady => 3,
+        }
+    }
 }
 
 impl std::fmt::Display for GreenLevel {

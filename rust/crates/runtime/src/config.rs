@@ -71,6 +71,9 @@ pub struct RuntimeFeatureConfig {
     /// 进程启动时由 LiveCli 读取并写入全局 `poor_mode` AtomicBool，运行时通过
     /// `/poor` 命令切换并立即生效（无需重启）。
     poor_mode: Option<bool>,
+    /// P3-1:Plan/Execute/Review 模式开关。`Some(true)` 启用 planner,
+    /// `None` 或 `Some(false)` 关闭。CLI flag `--enable-plan-mode` 优先级更高。
+    plan_mode: Option<bool>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -370,6 +373,7 @@ impl ConfigLoader {
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             poor_mode: parse_optional_poor_mode(&merged_value),
+            plan_mode: parse_optional_plan_mode(&merged_value),
         };
 
         Ok(RuntimeConfig {
@@ -566,6 +570,13 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn poor_mode(&self) -> Option<bool> {
         self.poor_mode
+    }
+
+    /// P3-1:返回 `settings.planMode` 配置值。`None` 表示未配置(默认关闭),
+    /// CLI flag `--enable-plan-mode` 优先级更高。
+    #[must_use]
+    pub fn plan_mode(&self) -> Option<bool> {
+        self.plan_mode
     }
 }
 
@@ -1071,6 +1082,13 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
 fn parse_optional_poor_mode(root: &JsonValue) -> Option<bool> {
     root.as_object()
         .and_then(|object| object.get("poorMode"))
+        .and_then(JsonValue::as_bool)
+}
+
+/// P3-1:解析 `settings.planMode` 布尔配置项。
+fn parse_optional_plan_mode(root: &JsonValue) -> Option<bool> {
+    root.as_object()
+        .and_then(|object| object.get("planMode"))
         .and_then(JsonValue::as_bool)
 }
 

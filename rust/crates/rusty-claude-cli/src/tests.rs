@@ -379,6 +379,7 @@ fn defaults_to_repl_when_no_args() {
             output_verbosity: OutputVerbosity::default(),
             tui: true,
             enable_plan_mode: false,
+            enable_policy_engine: false,
         }
     );
 }
@@ -859,6 +860,7 @@ fn parses_permission_mode_flag() {
             output_verbosity: OutputVerbosity::default(),
             tui: true,
             enable_plan_mode: false,
+            enable_policy_engine: false,
         }
     );
 }
@@ -884,6 +886,7 @@ fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
             output_verbosity: OutputVerbosity::default(),
             tui: true,
             enable_plan_mode: false,
+            enable_policy_engine: false,
         }
     );
 }
@@ -947,6 +950,7 @@ fn parses_allowed_tools_flags_with_aliases_and_lists() {
             output_verbosity: OutputVerbosity::default(),
             tui: true,
             enable_plan_mode: false,
+            enable_policy_engine: false,
         }
     );
 }

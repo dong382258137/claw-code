@@ -18,6 +18,7 @@ use runtime::{
     load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
+    McpServerManager,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_in_workspace_with_roots, replace_lines_in_workspace_with_roots,
     run_cargo_check_for_file, strip_verbatim_prefix,
@@ -102,6 +103,230 @@ fn global_mcp_registry() -> &'static McpToolRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<McpToolRegistry> = OnceLock::new();
     REGISTRY.get_or_init(McpToolRegistry::new)
+}
+
+/// P2-1:将 `McpServerManager` 注入全局 `McpToolRegistry` 单例。
+///
+/// 在 `RuntimeMcpState::new` 完成后调用。仅注入 manager 所有权(Arc clone),
+/// 使 `McpToolRegistry::call_tool` 等方法在 `inner` 命中后能通过 manager
+/// 实际派发调用。**仅注入 manager 不够** —— 还需配合
+/// [`populate_global_mcp_registry_from_discovery`] 把 discovery 结果注册到
+/// `inner`,base 工具(`MCP`/`ListMcpResources`/`ReadMcpResource`)才能
+/// 通过 `server_name` 查找到 server 并走到 manager 调用路径。
+pub fn set_global_mcp_manager(manager: Arc<Mutex<McpServerManager>>) {
+    let _ = global_mcp_registry().set_manager(manager);
+}
+
+/// P2-1:把 discovery 结果注册到全局 `McpToolRegistry.inner`。
+///
+/// `McpToolRegistry::call_tool` / `list_resources` / `read_resource` 在
+/// 派发到 manager 之前,会先在 `inner` HashMap 中按 `server_name` 查找
+/// `McpServerState`。若 `inner` 为空(生产路径中 `register_server` 从未
+/// 被调用),base 工具会直接返回 `"server not found"`。
+///
+/// 本函数按 `server_name` 分组 discovery.tools,对每个成功发现的 server
+/// 调用 `register_server(Connected, tools, ...)`,对失败/不支持的 server
+/// 注册为 `Error` 状态并附带错误信息。在 `set_global_mcp_manager` 之后调用。
+pub fn populate_global_mcp_registry_from_discovery(
+    discovery: &runtime::McpToolDiscoveryReport,
+) {
+    populate_mcp_registry_from_discovery(global_mcp_registry(), discovery);
+}
+
+/// P2-1:`populate_global_mcp_registry_from_discovery` 的核心逻辑,
+/// 接受任意 `&McpToolRegistry` 实例(便于单元测试,不污染全局单例)。
+pub fn populate_mcp_registry_from_discovery(
+    registry: &McpToolRegistry,
+    discovery: &runtime::McpToolDiscoveryReport,
+) {
+    use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo};
+
+    // 按server分组discovery.tools,转换为McpToolInfo
+    let mut by_server: BTreeMap<String, Vec<McpToolInfo>> = BTreeMap::new();
+    for tool in &discovery.tools {
+        by_server
+            .entry(tool.server_name.clone())
+            .or_default()
+            .push(McpToolInfo {
+                name: tool.raw_name.clone(),
+                description: tool.tool.description.clone(),
+                input_schema: tool.tool.input_schema.clone(),
+            });
+    }
+    for (server_name, tools) in by_server {
+        registry.register_server(
+            &server_name,
+            McpConnectionStatus::Connected,
+            tools,
+            Vec::new(),
+            None,
+        );
+    }
+    // 失败的server注册为Error状态,附带错误信息
+    for failure in &discovery.failed_servers {
+        registry.register_server(
+            &failure.server_name,
+            McpConnectionStatus::Error,
+            Vec::new(),
+            Vec::new(),
+            Some(failure.error.clone()),
+        );
+    }
+    for unsupported in &discovery.unsupported_servers {
+        registry.register_server(
+            &unsupported.server_name,
+            McpConnectionStatus::Error,
+            Vec::new(),
+            Vec::new(),
+            Some(unsupported.reason.clone()),
+        );
+    }
+}
+
+#[cfg(test)]
+mod p2_1_mcp_bridge_tests {
+    use super::populate_mcp_registry_from_discovery;
+    use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolRegistry};
+    use runtime::{
+        ManagedMcpTool, McpDiscoveryFailure, McpLifecyclePhase, McpTool, McpToolDiscoveryReport,
+        UnsupportedMcpServer,
+    };
+    use std::collections::BTreeMap;
+
+    fn make_managed_tool(server: &str, raw_name: &str) -> ManagedMcpTool {
+        ManagedMcpTool {
+            server_name: server.to_string(),
+            qualified_name: format!("mcp__{server}__{raw_name}"),
+            raw_name: raw_name.to_string(),
+            tool: McpTool {
+                name: raw_name.to_string(),
+                description: Some(format!("tool {raw_name} on {server}")),
+                input_schema: Some(serde_json::json!({"type": "object"})),
+                annotations: None,
+                meta: None,
+            },
+        }
+    }
+
+    #[test]
+    fn registers_connected_servers_with_tools_grouped_by_server() {
+        let registry = McpToolRegistry::new();
+        let discovery = McpToolDiscoveryReport {
+            tools: vec![
+                make_managed_tool("alpha", "echo"),
+                make_managed_tool("alpha", "ping"),
+                make_managed_tool("beta", "compute"),
+            ],
+            failed_servers: vec![],
+            unsupported_servers: vec![],
+            degraded_startup: None,
+        };
+        populate_mcp_registry_from_discovery(&registry, &discovery);
+
+        let servers = registry.list_servers();
+        assert_eq!(servers.len(), 2);
+        let alpha = servers.iter().find(|s| s.server_name == "alpha").unwrap();
+        assert_eq!(alpha.status, McpConnectionStatus::Connected);
+        assert_eq!(alpha.tools.len(), 2);
+        assert!(alpha.tools.iter().any(|t| t.name == "echo"));
+        assert!(alpha.tools.iter().any(|t| t.name == "ping"));
+        let beta = servers.iter().find(|s| s.server_name == "beta").unwrap();
+        assert_eq!(beta.tools.len(), 1);
+        assert_eq!(beta.tools[0].name, "compute");
+    }
+
+    #[test]
+    fn registers_failed_servers_as_error_with_message() {
+        let registry = McpToolRegistry::new();
+        let discovery = McpToolDiscoveryReport {
+            tools: vec![],
+            failed_servers: vec![McpDiscoveryFailure {
+                server_name: "gamma".to_string(),
+                phase: McpLifecyclePhase::ToolDiscovery,
+                required: true,
+                error: "connection refused".to_string(),
+                recoverable: false,
+                context: BTreeMap::new(),
+            }],
+            unsupported_servers: vec![],
+            degraded_startup: None,
+        };
+        populate_mcp_registry_from_discovery(&registry, &discovery);
+
+        let gamma = registry.get_server("gamma").expect("gamma registered");
+        assert_eq!(gamma.status, McpConnectionStatus::Error);
+        // register_server 把第5个参数存到 server_info(非 error_message,
+        // 后者被硬编码为 None)。错误信息通过 server_info 字段传递。
+        assert_eq!(gamma.server_info.as_deref(), Some("connection refused"));
+        assert!(gamma.tools.is_empty());
+    }
+
+    #[test]
+    fn registers_unsupported_servers_as_error_with_reason() {
+        let registry = McpToolRegistry::new();
+        let discovery = McpToolDiscoveryReport {
+            tools: vec![],
+            failed_servers: vec![],
+            unsupported_servers: vec![UnsupportedMcpServer {
+                server_name: "delta".to_string(),
+                transport: runtime::McpTransport::Sse,
+                required: false,
+                reason: "SSE not supported on this platform".to_string(),
+            }],
+            degraded_startup: None,
+        };
+        populate_mcp_registry_from_discovery(&registry, &discovery);
+
+        let delta = registry.get_server("delta").expect("delta registered");
+        assert_eq!(delta.status, McpConnectionStatus::Error);
+        assert!(delta.server_info.as_deref().unwrap().contains("SSE"));
+    }
+
+    #[test]
+    fn empty_discovery_leaves_registry_empty() {
+        let registry = McpToolRegistry::new();
+        let discovery = McpToolDiscoveryReport {
+            tools: vec![],
+            failed_servers: vec![],
+            unsupported_servers: vec![],
+            degraded_startup: None,
+        };
+        populate_mcp_registry_from_discovery(&registry, &discovery);
+        assert!(registry.list_servers().is_empty());
+    }
+
+    #[test]
+    fn call_tool_returns_server_not_found_when_inner_empty() {
+        // 验证base工具路径的"server not found"错误:
+        // inner为空时,call_tool在查找阶段就失败,不会走到manager派发。
+        let registry = McpToolRegistry::new();
+        let args = serde_json::json!({});
+        let result = registry.call_tool("nonexistent", "tool", &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn call_tool_returns_manager_not_configured_when_inner_hit_but_no_manager() {
+        // inner命中后,McpToolRegistry::call_tool尝试读取manager OnceLock。
+        // 未调用set_manager时,应返回"MCP server manager is not configured"。
+        let registry = McpToolRegistry::new();
+        registry.register_server(
+            "alpha",
+            McpConnectionStatus::Connected,
+            vec![runtime::mcp_tool_bridge::McpToolInfo {
+                name: "echo".to_string(),
+                description: None,
+                input_schema: None,
+            }],
+            vec![],
+            None,
+        );
+        let args = serde_json::json!({});
+        let result = registry.call_tool("alpha", "echo", &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not configured"));
+    }
 }
 
 fn global_team_registry() -> &'static TeamRegistry {

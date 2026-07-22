@@ -1063,6 +1063,23 @@ fn lane_event_sink() -> &'static Mutex<Vec<LaneEvent>> {
 /// 自动丢弃最旧的一半事件。这防止生产运行中无人 drain 导致内存无限增长。
 /// 事件丢失是可接受的 — lane events 是可观测性辅助数据,不是业务关键路径。
 pub fn try_publish(event: LaneEvent) -> bool {
+    // P1-3:对 ShipPrepared 等关键事件做 G004 契约校验(宽松模式)。
+    // 校验失败时记录警告日志,不阻止发布(向后兼容)。
+    if matches!(event.event, LaneEventName::ShipPrepared) {
+        if let Some(data) = &event.data {
+            let bundle = serde_json::json!({
+                "schemaVersion": "g004.contract.bundle.v1",
+                "laneEvents": [data],
+            });
+            let errors = crate::g004_conformance::validate_g004_contract_bundle(&bundle);
+            if !errors.is_empty() {
+                eprintln!(
+                    "[g004] ShipPrepared event failed G004 conformance check ({} errors), publishing anyway",
+                    errors.len()
+                );
+            }
+        }
+    }
     match lane_event_sink().lock() {
         Ok(mut buffer) => {
             buffer.push(event);

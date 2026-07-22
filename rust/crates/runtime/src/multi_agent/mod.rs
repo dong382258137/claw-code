@@ -107,6 +107,8 @@ impl MultiAgentCoordinator {
         task: impl Into<String>,
         mode: CoordinationMode,
     ) -> String {
+        let name = name.into();
+        let task = task.into();
         let mut counter = self.id_counter.lock().expect("id counter lock poisoned");
         *counter += 1;
         let id = format!("subagent-{}", *counter);
@@ -117,11 +119,30 @@ impl MultiAgentCoordinator {
             _ => None,
         };
 
+        // P2-2:Worktree 模式下检测 branch lock 碰撞(宽松模式)。
+        // 碰撞时记录警告到 stderr(不阻止 spawn,向后兼容)。
+        if mode == CoordinationMode::Worktree {
+            let intent = crate::branch_lock::BranchLockIntent {
+                lane_id: id.clone(),
+                branch: format!("worktree-{}", id),
+                worktree: workdir.as_ref().map(|p| p.to_string_lossy().to_string()),
+                modules: Vec::new(),
+            };
+            let collisions = crate::branch_lock::detect_branch_lock_collisions(&[intent]);
+            if !collisions.is_empty() {
+                eprintln!(
+                    "[branch_lock] {} collision(s) detected for worktree spawn {}, proceeding anyway",
+                    collisions.len(),
+                    id
+                );
+            }
+        }
+
         let subagent = Subagent {
             id: id.clone(),
-            name: name.into(),
+            name,
             mode,
-            task: task.into(),
+            task,
             status: SubagentStatus::Created,
             workdir,
             created_at: now_secs(),
