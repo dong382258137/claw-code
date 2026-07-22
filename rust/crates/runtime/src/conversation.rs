@@ -304,6 +304,9 @@ pub struct ConversationRuntime<C, T> {
     context_window: Option<u32>,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
+    /// 细粒度诊断回调：在 `run_turn` 关键路径埋点，帮助定位"会话卡死"问题。
+    /// 每个事件自动带时间戳，回调签名 `Fn(String) + Send`。
+    diag_callback: Option<Box<dyn Fn(String) + Send>>,
     session_tracer: Option<SessionTracer>,
     /// Optional persistent memory surface. When present, the runtime runs a
     /// rule-based nudge pass every `NudgeConfig::interval_turns` turns to keep
@@ -459,6 +462,7 @@ where
             context_window: None,
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
+            diag_callback: None,
             session_tracer: None,
             persistent_memory: None,
             turns_since_last_nudge: 0,
@@ -518,6 +522,19 @@ where
         hook_progress_reporter: Box<dyn HookProgressReporter + Send>,
     ) -> Self {
         self.hook_progress_reporter = Some(hook_progress_reporter);
+        self
+    }
+
+    /// 注入细粒度诊断回调，在 `run_turn` 关键路径埋点。
+    ///
+    /// 回调在每个 checkpoint 被调用一次，参数为 `[tag] key=val ...` 格式的
+    /// 单行消息。上层（TUI）可接入 `diag_log` 写入 `claw-diag.log`。
+    #[must_use]
+    pub fn with_diag_callback(
+        mut self,
+        diag_callback: Box<dyn Fn(String) + Send>,
+    ) -> Self {
+        self.diag_callback = Some(diag_callback);
         self
     }
 
@@ -722,6 +739,16 @@ where
     #[must_use]
     pub fn plan_mode_enabled(&self) -> bool {
         self.plan_mode_enabled
+    }
+
+    /// Emit a fine-grained diagnostic event through the optional callback.
+    ///
+    /// Format: `[diag] {tag} ts={ms_since_turn_start} ...`
+    /// Calling code appends key=value pairs after the tag.
+    fn emit_diag(&self, msg: String) {
+        if let Some(ref cb) = self.diag_callback {
+            cb(msg);
+        }
     }
 
     /// BUG-3 修复:统一的"先尝试恢复,失败再 record_turn_failed"流程。
@@ -945,6 +972,7 @@ where
 
         loop {
             iterations += 1;
+            self.emit_diag(format!("[diag] loop_start iter={iterations}"));
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
                     "conversation loop exceeded the maximum number of iterations",
@@ -1065,8 +1093,12 @@ where
                     messages: sliced.to_vec(),
                 }
             };
+            self.emit_diag("[diag] api_stream_start".to_string());
             let events = match self.api_client.stream(request) {
-                Ok(events) => events,
+                Ok(events) => {
+                    self.emit_diag("[diag] api_stream_done".to_string());
+                    events
+                }
                 Err(error) => {
                     // Non-recoverable errors propagate immediately.
                     if !error.is_prompt_too_long() {
@@ -1191,6 +1223,14 @@ where
                         return Err(error);
                     }
                 };
+            // 细粒度中断检查：API 流式调用（可能长达数十秒）完成后立即检查 abort。
+            // 用户在流式响应期间按 Ctrl+C 无法中断阻塞 IO，但可以在此处立即返回，
+            // 避免继续处理 assistant message 和执行工具。
+            if self.hook_abort_signal.is_aborted() {
+                self.record_turn_failed(iterations, &RuntimeError::new("turn interrupted by user"));
+                return Err(RuntimeError::new("turn interrupted by user"));
+            }
+
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
@@ -1205,6 +1245,18 @@ where
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            self.emit_diag(format!(
+                "[diag] events_parsed iter={iterations} tool_count={} text_len={}",
+                pending_tool_uses.len(),
+                assistant_message
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.len()),
+                        _ => None,
+                    })
+                    .sum::<usize>()
+            ));
             self.record_assistant_iteration(
                 iterations,
                 &assistant_message,
@@ -1220,7 +1272,28 @@ where
                 break;
             }
 
+            // 细粒度中断检查：在工具循环入口检查 abort signal。
+            // 若 API 流式调用期间用户按下 Ctrl+C，abort flag 已被设置，
+            // 在进入工具循环时即可返回，无需等待所有工具执行完毕。
+            if self.hook_abort_signal.is_aborted() {
+                self.record_turn_failed(iterations, &RuntimeError::new("turn interrupted by user"));
+                return Err(RuntimeError::new("turn interrupted by user"));
+            }
+
+            let tool_count = pending_tool_uses.len();
+            self.emit_diag(format!("[diag] tool_loop_enter iter={iterations} tool_count={tool_count}"));
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                // 细粒度中断检查：执行下一个工具前检查 abort signal。
+                // 若上一个工具执行时间较长（如 cargo build），用户在等待期间
+                // 按了 Ctrl+C，此检查能阻止后续工具继续执行。
+                if self.hook_abort_signal.is_aborted() {
+                    self.record_turn_failed(
+                        iterations,
+                        &RuntimeError::new("turn interrupted by user"),
+                    );
+                    return Err(RuntimeError::new("turn interrupted by user"));
+                }
+
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -1269,6 +1342,9 @@ where
 
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
+                        self.emit_diag(format!(
+                            "[diag] tool_start iter={iterations} name={tool_name}"
+                        ));
                         self.record_tool_started(iterations, &tool_name);
                         // Intercept `session_search` and route it directly to
                         // the session's `HistoryIndex`. The tool is implemented
@@ -1366,6 +1442,20 @@ where
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
+                {
+                    // 提取 tool_name 和 is_error 用于 diag 日志
+                    let tn = result_message.blocks.iter().find_map(|b| match b {
+                        ContentBlock::ToolResult {
+                            tool_name, is_error, ..
+                        } => Some((tool_name.clone(), *is_error)),
+                        _ => None,
+                    });
+                    if let Some((name, is_err)) = tn {
+                        self.emit_diag(format!(
+                            "[diag] tool_done iter={iterations} name={name} is_error={is_err}"
+                        ));
+                    }
+                }
                 tool_results.push(result_message);
             }
         }

@@ -199,7 +199,15 @@ async fn execute_bash_async(
             return Ok(timeout_output(&input, timeout_ms, sandbox_status));
         }
     } else {
-        (command.output().await?, false)
+        // 默认超时保护：防止未限范围的命令（如全仓库 grep 无 glob）
+        // 执行数十分钟导致 TUI 卡死。120 秒足够覆盖绝大多数合法操作。
+        const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+        if let Ok(result) = timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS), command.output()).await
+        {
+            (result?, false)
+        } else {
+            return Ok(timeout_output(&input, DEFAULT_TIMEOUT_MS, sandbox_status));
+        }
     };
 
     let (output, interrupted) = output_result;
@@ -241,9 +249,29 @@ fn timeout_output(
 ) -> BashCommandOutput {
     let is_test = is_test_command(&input.command);
     let return_code_interpretation = if is_test { "test.hung" } else { "timeout" };
+    let guidance = if input.command.contains("grep") || input.command.contains("rg") {
+        "\n\n[Retry guidance] The command timed out, likely due to a broad search scope. Suggestions:\n\
+         - Add a file-type filter (e.g. `--glob='*.rs'` / `-g '*.rs'` for ripgrep, `--include='*.rs'` for grep)\n\
+         - Use `-l` / `--files-with-matches` first to gauge scope, then re-run with a narrower target\n\
+         - Restrict to a specific subdirectory instead of searching the entire repo\n\
+         - Add `--max-depth N` (ripgrep) to limit directory traversal depth\n\
+         - Pipe to `head -n 100` or use `-m 100` (ripgrep) to limit matches\n\
+         - For targeted work: `find . -name '*.ext' | xargs grep ...` instead of recursive grep"
+    } else if input.command.contains("find") || input.command.contains(" ls -") || input.command.starts_with("ls ") {
+        "\n\n[Retry guidance] The command timed out. For `find`/`ls`: start with a shallow listing first:\n\
+         - `ls -la` (single directory) or `ls -la | head -n 20` before recursive\n\
+         - `find . -maxdepth 1 -name '*.rs' | wc -l` to count candidate files before a full scan\n\
+         - Restrict to a specific subdirectory\n\
+         - Use `-maxdepth N` on find to limit tree-walk depth"
+    } else {
+        "\n\n[Retry guidance] The command timed out. Consider:\n\
+         - Narrowing the scope (specific directory, file pattern, or target)\n\
+         - Breaking the work into smaller steps\n\
+         - Checking if a simpler approach can achieve the same goal"
+    };
     BashCommandOutput {
         stdout: String::new(),
-        stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
+        stderr: format!("Command exceeded timeout of {timeout_ms} ms{guidance}"),
         raw_output_path: None,
         interrupted: true,
         is_image: None,

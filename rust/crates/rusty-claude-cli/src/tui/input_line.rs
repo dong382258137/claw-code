@@ -303,8 +303,15 @@ impl InputLine {
     /// 这里一次性插入到 buffer，保留所有原始换行符。
     ///
     /// 插入后光标移动到粘贴文本末尾，菜单状态按新 buffer 重新计算。
+    ///
+    /// **安全加固**：粘贴内容在插入前经过 ANSI 转义序列和 C0 控制字符过滤，
+    /// 防止从终端复制含 ratatui 渲染码的文本后粘贴导致 input buffer 被污染。
     pub(crate) fn insert_paste(&mut self, text: &str) {
-        // 粘贴内容可能含任意字符（包括 `\n`、`\t`、CJK、emoji），
+        let text = strip_ansi_and_control(text);
+        if text.is_empty() {
+            return;
+        }
+        // 粘贴内容可能含任意合法字符（包括 `\n`、`\t`、CJK、emoji），
         // 全部按原样插入。debug_assert 检查光标在字符边界。
         debug_assert!(
             self.buffer.is_char_boundary(self.cursor),
@@ -312,7 +319,7 @@ impl InputLine {
             self.cursor,
             self.buffer.len()
         );
-        self.buffer.insert_str(self.cursor, text);
+        self.buffer.insert_str(self.cursor, &text);
         self.cursor += text.len();
         self.update_menu_state();
     }
@@ -372,6 +379,48 @@ impl Default for InputLine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 从粘贴文本中剥离 ANSI 转义序列和 C0 控制字符。
+///
+/// 防止从终端复制含 ratatui 渲染码（SGR 颜色、光标定位等）的文本后
+/// 粘贴导致 input buffer 被 ANSI 序列污染，出现不可删除/不可发送的垃圾数据。
+///
+/// 处理规则：
+/// - `\x1b[` 开头的 CSI 序列 → 跳过直到终止字母
+/// - `\x1b` 及紧随的非 `[` 字符（如 `\x1b]` OSC 序列）→ 移除
+/// - C0 控制字符（0x00-0x1F）→ 移除（保留 \n、\t、\r）
+fn strip_ansi_and_control(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => {
+                // ESC 序列：如果下一个是 `[`，跳过整个 CSI 序列
+                if chars.peek() == Some(&'[') {
+                    chars.next(); // consume `[`
+                    // 跳过参数部分（数字、分号、问号等），直到终止字母
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_alphabetic() || c == '~' {
+                            chars.next(); // consume terminator
+                            break;
+                        }
+                        chars.next(); // consume parameter char
+                    }
+                }
+                // 否则只是孤立的 ESC，直接跳过
+            }
+            // 保留合法空白字符
+            '\n' | '\t' | '\r' => result.push(ch),
+            // 拒绝其他 C0 控制字符
+            c if (c as u32) < 0x20 => {}
+            // 正常字符
+            _ => result.push(ch),
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -705,5 +754,106 @@ mod tests {
         let action = line.handle_key(None, "Enter");
         assert_eq!(action, InputAction::Submit("line1\nline2".to_string()));
         assert_eq!(line.buffer(), "");
+    }
+
+    // ── strip_ansi_and_control 测试 ──
+
+    #[test]
+    fn strip_sgr_leaves_plain_text() {
+        // 模拟从终端复制含 SGR 颜色码的文本
+        let input = "\x1b[38;5;240m[10:26:08]\x1b[0m \x1b[1m\x1b[38;5;3m模型 deepseek-v4-pro\x1b[0m";
+        let result = super::strip_ansi_and_control(input);
+        assert_eq!(result, "[10:26:08] 模型 deepseek-v4-pro");
+    }
+
+    #[test]
+    fn strip_cup_and_cursor_sequences() {
+        // 模拟光标定位序列（用户报告中出现的模式）
+        let input = "\x1b[39m\x1b[49m\x1b[0m\x1b[?25h\x1b[46;3H\x1b[11;139H\x1b[1mhello";
+        let result = super::strip_ansi_and_control(input);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn strip_lone_escape() {
+        assert_eq!(super::strip_ansi_and_control("\x1bhello"), "hello");
+    }
+
+    #[test]
+    fn strip_c0_control_chars_except_newline_tab_cr() {
+        assert_eq!(
+            super::strip_ansi_and_control("hello\x00world\x07!\n"),
+            "helloworld!\n"
+        );
+    }
+
+    #[test]
+    fn preserve_newline_tab_cr() {
+        assert_eq!(
+            super::strip_ansi_and_control("line1\nline2\tindented\r"),
+            "line1\nline2\tindented\r"
+        );
+    }
+
+    #[test]
+    fn plain_text_passes_through() {
+        assert_eq!(super::strip_ansi_and_control("hello world"), "hello world");
+    }
+
+    #[test]
+    fn empty_string_stays_empty() {
+        assert_eq!(super::strip_ansi_and_control(""), "");
+    }
+
+    #[test]
+    fn mixed_ansi_and_control_chars_full_cleanup() {
+        // 真实场景：终端复制含 SGR + CUP + 控制字符
+        let input = concat!(
+            "\x1b[39m\x1b[49m\x1b[0m\x1b[?25h",
+            "\x1b[46;3H\x1b[11;139H",
+            "\x1b[1m\x1b[38;5;3;49m20\x1b[12;135H",
+            "\x1b[22m\x1b[39;49m6\x1b[12;138Hedit",
+            "\x1b[13;135H7\x1b[13;138Hread",
+        );
+        let result = super::strip_ansi_and_control(input);
+        assert!(!result.contains('\x1b'));
+        assert!(!result.contains('['));
+        // 应该只保留可见文本
+        assert_eq!(result, "206edit7read");
+    }
+
+    #[test]
+    fn insert_paste_strips_ansi() {
+        let mut line = InputLine::new();
+        let dirty = "\x1b[38;5;240m[10:26:08]\x1b[0m hello \x1b[1mworld\x1b[0m";
+        line.insert_paste(dirty);
+        assert_eq!(line.buffer(), "[10:26:08] hello world");
+    }
+
+    #[test]
+    fn insert_paste_preserves_multiline() {
+        let mut line = InputLine::new();
+        line.insert_paste("line1\nline2\nline3");
+        assert_eq!(line.buffer(), "line1\nline2\nline3");
+        // 确认 Enter 后整段作为一次 Submit 发送，而非逐行
+        let action = line.handle_key(None, "Enter");
+        assert_eq!(
+            action,
+            InputAction::Submit("line1\nline2\nline3".to_string())
+        );
+    }
+
+    #[test]
+    fn insert_paste_preserves_crlf() {
+        let mut line = InputLine::new();
+        line.insert_paste("line1\r\nline2\r\nline3");
+        assert_eq!(line.buffer(), "line1\r\nline2\r\nline3");
+    }
+
+    #[test]
+    fn insert_paste_multiline_with_ansi_stripped() {
+        let mut line = InputLine::new();
+        line.insert_paste("\x1b[32mline1\x1b[0m\n\x1b[31mline2\x1b[0m");
+        assert_eq!(line.buffer(), "line1\nline2");
     }
 }

@@ -819,6 +819,8 @@ fn get_simple_doing_tasks_section() -> String {
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
         "On Windows, prefer built-in tools (read_file, write_file, edit_file, replace_lines) for file I/O — they handle UTF-8 correctly. Only when using bash/PowerShell commands on files with non-ASCII content, set `$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8` first or pipe through `python -c \"import sys; sys.stdout.reconfigure(encoding='utf-8')\"`.".to_string(),
+        "Reconnaissance-before-execution: before running expensive commands (grep_search, find, recursive ls, cargo build, git diff on large repos), first do a lightweight check — e.g. list large files with `ls -la`, check directory size with `du -sh`, or count candidate files with `find . -name '*.rs' | wc -l`. Use `git diff --stat` before `git diff`, and restrict scope with glob/subdirectory. This prevents multi-minute hangs from scanning giant files or deeply nested directories.".to_string(),
+        "When using grep_search, ALWAYS specify a 'glob' parameter (e.g. '*.rs') to restrict file types. For broad searches, use `output_mode: \"files_with_matches\"` first to gauge scope, then narrow. Use '-n' and 'head_limit' to cap output. Avoid '-C' with high context values (> 3) on broad searches; prefer targeted '-A'/'-B' or re-read the matched file directly.".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())

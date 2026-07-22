@@ -597,6 +597,12 @@ fn run_event_loop(
         if let Some(ref rx) = turn_rx {
             match rx.try_recv() {
                 Ok(turn_result) => {
+                    let elapsed = turn_start.map(|s| s.elapsed().as_millis()).unwrap_or(0);
+                    let status = if turn_result.result.is_ok() { "ok" } else { "err" };
+                    crate::diag_log(&format!(
+                        "[turn-end] result={status} elapsed_ms={elapsed} pending_input={}",
+                        pending_input.is_some()
+                    ));
                     if let Err(e) = &turn_result.result {
                         let handle = output_view.shared_handle();
                         if let Ok(mut buf) = handle.lock() {
@@ -615,12 +621,94 @@ fn run_event_loop(
                     if let Some(ref cli) = cli_holder {
                         sync_status_from_cli(&status_state, cli);
                     }
-                    // TUI 插话支持：turn 完成（含中断）后检查 pending_input，
-                    // 如果有排队输入则回填到 InputLine buffer，用户按 Enter 即可发送。
+                    // TUI 插话支持：turn 完成（含中断）后检查 pending_input。
+                    // 如果有排队输入，自动提交（不等待用户再次按 Enter），
+                    // 实现"任务间隙插话后无缝继续对话"。
                     if let Some(pending) = pending_input.take() {
-                        input.restore_input(pending);
-                        if let Ok(mut buf) = output_view.shared_handle().lock() {
-                            buf.append("\n[ready] 排队的输入已恢复，按 Enter 发送。\n");
+                        // 回显排队消息到 OutputView（保持对话连贯性）。
+                        {
+                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                let current = buf.buffer();
+                                if !current.is_empty() && !current.ends_with('\n') {
+                                    buf.append("\n\n");
+                                }
+                                buf.push_entry(
+                                    crate::tui::output_view::OutputEntry::text(format!(
+                                        "> {pending}\n\n"
+                                    )),
+                                );
+                            }
+                        }
+
+                        if let Some(mut cli) = cli_holder.take() {
+                            crate::diag_log(&format!(
+                                "[turn-start] auto_submit pending_input len={}",
+                                pending.len()
+                            ));
+                            // 清空上一轮的工具历史，避免污染。
+                            if let Ok(mut h) = tool_history_shared.lock() {
+                                h.clear();
+                            }
+
+                            // 设置状态栏为 streaming（turn 开始）。
+                            if let Ok(mut guard) = status_state.lock() {
+                                guard.reset_turn();
+                            }
+
+                            let output_handle = output_view.shared_handle();
+                            let status_handle = Arc::clone(&status_state);
+                            let tool_history_handle = Arc::clone(&tool_history_shared);
+
+                            turn_start = Some(Instant::now());
+
+                            let (tx, rx) = mpsc::channel();
+                            let abort_signal = runtime::HookAbortSignal::new();
+                            cli.set_external_abort_signal(abort_signal.clone());
+                            current_abort_signal = Some(abort_signal);
+                            let status_handle_for_panic = Arc::clone(&status_handle);
+
+                            std::thread::spawn(move || {
+                                use std::panic::{catch_unwind, AssertUnwindSafe};
+                                let mut cli = cli;
+                                let cli_ref = &mut cli;
+                                let result = catch_unwind(AssertUnwindSafe(move || {
+                                    execute_turn(
+                                        cli_ref,
+                                        &pending,
+                                        &output_handle,
+                                        &status_handle,
+                                        &tool_history_handle,
+                                    )
+                                }));
+                                let turn_result = match result {
+                                    Ok(r) => TurnResult { cli, result: r },
+                                    Err(payload) => {
+                                        let msg = payload
+                                            .downcast_ref::<String>()
+                                            .cloned()
+                                            .or_else(|| {
+                                                payload
+                                                    .downcast_ref::<&str>()
+                                                    .map(|s| s.to_string())
+                                            })
+                                            .unwrap_or_else(|| "<unknown panic>".to_string());
+                                        if let Ok(mut guard) = status_handle_for_panic.lock() {
+                                            if guard.streaming {
+                                                guard.finish_turn();
+                                            }
+                                        }
+                                        TurnResult {
+                                            cli,
+                                            result: Err(format!(
+                                                "worker thread panicked: {msg}"
+                                            )),
+                                        }
+                                    }
+                                };
+                                let _ = tx.send(turn_result);
+                            });
+
+                            turn_rx = Some(rx);
                         }
                     }
                 }
@@ -636,6 +724,7 @@ fn run_event_loop(
                     // Enter 键无任何反应，TUI 看似活着但无法对话。
                     // 现在向 OutputView 追加错误提示让用户知晓，并标记 fatal_error 让
                     // Submit 分支能给出反馈。
+                    crate::diag_log("[turn-panic] worker thread disconnected (panic)");
                     turn_rx = None;
                     turn_start = None;
                     if let Ok(mut guard) = status_state.lock() {
@@ -1116,6 +1205,7 @@ fn run_event_loop(
                         // abort signal 让 agent loop 在下一次迭代顶部退出。
                         // 正在进行的 API 流式请求无法中断（阻塞 IO），但可以阻止
                         // 下一轮迭代（不再发起新请求、不再执行新工具）。
+                        crate::diag_log("[turn-abort] Ctrl+C interrupt signal sent");
                         if let Some(ref signal) = current_abort_signal {
                             signal.abort();
                             if let Ok(mut buf) = output_view.shared_handle().lock() {
@@ -1692,6 +1782,10 @@ fn run_event_loop(
                                     let abort_signal = runtime::HookAbortSignal::new();
                                     cli.set_external_abort_signal(abort_signal.clone());
                                     current_abort_signal = Some(abort_signal);
+                                    crate::diag_log(&format!(
+                                        "[turn-start] normal len={}",
+                                        expanded.len()
+                                    ));
                                     let status_handle_for_panic = Arc::clone(&status_handle);
                                     std::thread::spawn(move || {
                                         // Bug L3 修复：同上，catch_unwind 包裹。
@@ -2447,11 +2541,16 @@ fn execute_turn(
     cli.set_status_emitter(emitter);
     cli.set_tui_mode(true);
 
+    // 细粒度诊断：注入 diag callback，在 run_turn 关键路径埋点写入 claw-diag.log。
+    cli.set_diag_callback(Box::new(|msg| {
+        crate::diag_log(&msg);
+    }));
+
     let result = cli.run_turn(line);
 
+    cli.clear_diag_callback();
     cli.clear_status_emitter();
     cli.set_tui_mode(false);
-
     // Ensure streaming is marked as finished even on error
     if let Ok(mut guard) = status_state.lock() {
         if guard.streaming {

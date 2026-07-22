@@ -534,9 +534,13 @@ pub(crate) struct LiveCli {
     /// TUI 中断支持：外部注入的 abort signal。
     /// TUI 层在启动 worker thread 前设置（保留 clone 用于 Ctrl+C abort），
     /// prepare_turn_runtime 优先使用此 signal（而非创建新的），
+    /// prepare_turn_runtime 优先使用此 signal（而非创建新的），
     /// 让 TUI 主线程能取消正在执行的 turn。
     #[cfg(feature = "full-tui")]
     external_abort_signal: Option<runtime::HookAbortSignal>,
+    /// 细粒度诊断回调：在 run_turn 关键路径埋点，写入 claw-diag.log。
+    #[cfg(feature = "full-tui")]
+    diag_callback: Option<Box<dyn Fn(String) + Send>>,
 }
 
 pub(crate) struct BuiltRuntime {
@@ -713,6 +717,8 @@ impl LiveCli {
             current_abort_signal: None,
             #[cfg(feature = "full-tui")]
             external_abort_signal: None,
+            #[cfg(feature = "full-tui")]
+            diag_callback: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -831,7 +837,7 @@ impl LiveCli {
     }
 
     fn prepare_turn_runtime(
-        &self,
+        &mut self,
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal), Box<dyn std::error::Error>> {
         // TUI 中断支持：优先使用外部注入的 abort signal（由 TUI 层在 spawn
@@ -864,6 +870,14 @@ impl LiveCli {
                 // Also inject into CliToolExecutor so ToolResult events are emitted
                 rt.tool_executor_mut()
                     .set_status_emitter(Arc::clone(emitter));
+            }
+        }
+        // 细粒度诊断：将 TUI 层的 diag callback 注入 runtime，在 run_turn
+        // 关键路径埋点，写入 claw-diag.log 帮助定位"会话卡死"问题。
+        #[cfg(feature = "full-tui")]
+        if let Some(cb) = self.diag_callback.take() {
+            if let Some(rt) = runtime.runtime.take() {
+                runtime.runtime = Some(rt.with_diag_callback(cb));
             }
         }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal.clone());
@@ -2422,6 +2436,19 @@ impl LiveCli {
     #[cfg(feature = "full-tui")]
     pub(crate) fn clear_external_abort_signal(&mut self) {
         self.external_abort_signal = None;
+    }
+
+    /// 细粒度诊断支持：设置 diag callback，在 run_turn 关键路径埋点。
+    /// callback 接收 `[diag] ...` 格式的消息，应写入 claw-diag.log。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn set_diag_callback(&mut self, cb: Box<dyn Fn(String) + Send>) {
+        self.diag_callback = Some(cb);
+    }
+
+    /// 细粒度诊断支持：清空 diag callback（turn 结束后调用）。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn clear_diag_callback(&mut self) {
+        self.diag_callback = None;
     }
 
     /// Phase 2: Toggle TUI mode. When on, run_turn calls prepare_turn_runtime

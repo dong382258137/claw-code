@@ -21,6 +21,36 @@ const JSONL_REDACTION_MARKER: &str = "[redacted]";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
+/// 工具输出截断上限（32KB）。超过此限制时保留头部和尾部，
+/// 防止单个工具产生数 MB 输出导致 TUI 卡死。
+const TOOL_OUTPUT_MAX_BYTES: usize = 32_768; // 32 KiB
+const TOOL_OUTPUT_HEAD_BYTES: usize = 3_000;
+const TOOL_OUTPUT_TAIL_BYTES: usize = 1_500;
+
+/// 截断过长的工具输出，保留首尾并插入提示。
+fn truncate_tool_output(output: String) -> String {
+    if output.len() <= TOOL_OUTPUT_MAX_BYTES {
+        return output;
+    }
+    // 在字符边界安全截断头部
+    let mut head_end = TOOL_OUTPUT_HEAD_BYTES;
+    while head_end > 0 && !output.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    // 从末尾向前找到尾部安全边界
+    let tail_start = output.len().saturating_sub(TOOL_OUTPUT_TAIL_BYTES);
+    let mut tail_start = tail_start;
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let head = &output[..head_end];
+    let tail = &output[tail_start..];
+    let skipped = output.len() - head_end - (output.len() - tail_start);
+    format!(
+        "{head}\n\n[... 输出过长已截断，省略 {skipped} 字节。建议：先使用 output_mode: \"files_with_matches\" 探明范围再细化；缩小 glob 范围或指定子目录收敛；使用 head_limit 限制结果数；避免大范围 -C / context 参数；若仍需完整上下文，改用 read_file 精读目标文件。]\n\n{tail}"
+    )
+}
+
 /// Speaker role associated with a persisted conversation message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
@@ -850,7 +880,7 @@ impl ConversationMessage {
             blocks: vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
                 tool_name: tool_name.into(),
-                output: output.into(),
+                output: truncate_tool_output(output.into()),
                 is_error,
             }],
             usage: None,

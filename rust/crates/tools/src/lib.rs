@@ -732,13 +732,13 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a text file from the workspace. Use 'offset' and 'limit' (especially handy for long files), but it's recommended to read the whole file by not providing these parameters.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "offset": { "type": "integer", "minimum": 0, "description": "Line number to start reading from. Use together with 'limit' for large files." },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Maximum lines to read. Recommended for files >500 lines to avoid response bloat." }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -807,26 +807,27 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Search file contents with a regex pattern.",
+            description:
+                "Search file contents with a regex pattern. IMPORTANT: 'glob' is REQUIRED to avoid searching large binary files. Always specify a file extension pattern like '*.rs', '*.ts', '*.py'. For broad searches, use `output_mode: \"files_with_matches\"` first to gauge scope, then narrow with `head_limit` and line-number output (`\"-n\": true`). Avoid `-C` (or `context`) with high values on broad searches; prefer targeted `-A`/`-B` or re-read the matched file directly.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
                     "path": { "type": "string" },
-                    "glob": { "type": "string" },
-                    "output_mode": { "type": "string" },
+                    "glob": { "type": "string", "description": "REQUIRED: file extension pattern (e.g. '*.rs', '*.ts'). Prevents searching binary/large files." },
+                    "output_mode": { "type": "string", "description": "Output mode: 'content' (default, shows matching lines), 'files_with_matches' (file paths only — use first for broad searches to gauge scope), 'count' (match counts per file)." },
                     "-B": { "type": "integer", "minimum": 0 },
                     "-A": { "type": "integer", "minimum": 0 },
-                    "-C": { "type": "integer", "minimum": 0 },
-                    "context": { "type": "integer", "minimum": 0 },
-                    "-n": { "type": "boolean" },
+                    "-C": { "type": "integer", "minimum": 0, "description": "Context lines before and after each match. Keep low (≤ 3) on broad searches; prefer re-reading the file directly for larger context." },
+                    "context": { "type": "integer", "minimum": 0, "description": "Alias for -C. Same caveat: avoid large values on broad searches." },
+                    "-n": { "type": "boolean", "description": "Show line numbers in output (recommended for traceability)." },
                     "-i": { "type": "boolean" },
                     "type": { "type": "string" },
-                    "head_limit": { "type": "integer", "minimum": 1 },
+                    "head_limit": { "type": "integer", "minimum": 1, "description": "Maximum result count across all files. Use to cap output on broad searches." },
                     "offset": { "type": "integer", "minimum": 0 },
                     "multiline": { "type": "boolean" }
                 },
-                "required": ["pattern"],
+                "required": ["pattern", "glob"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
