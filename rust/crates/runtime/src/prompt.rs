@@ -334,16 +334,31 @@ impl SystemPromptBuilder {
                 sections.push(section);
             }
         }
-        sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
+        // 缓存优化：以下三个 section 在 session 内字节完全稳定（build()
+        // 只在 session 初始化时调用一次），放在 boundary 之前以利用 Anthropic
+        // prompt caching。原本在 boundary 之后，每轮作为 dynamic token 重读。
+        //
+        //  - environment_section: cwd / date / os / shell / model family
+        //  - render_config_section: 运行时配置 JSON（settings.json 等）
+        //  - render_instruction_files: CLAUDE.md 等指令文件内容
+        //
+        // 真正的 dynamic 内容（per-turn 变化）在 conversation.rs 中通过
+        // dynamic_sections.push() 追加：NOTEBOOK、语义召回、PlanArtifact、
+        // remediation 等。
         sections.push(self.environment_section());
+        if let Some(config) = &self.config {
+            sections.push(render_config_section(config));
+        }
         if let Some(project_context) = &self.project_context {
-            sections.push(render_project_context(project_context));
             if !project_context.instruction_files.is_empty() {
                 sections.push(render_instruction_files(&project_context.instruction_files));
             }
         }
-        if let Some(config) = &self.config {
-            sections.push(render_config_section(config));
+        sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
+        // 项目 git 快照留在 dynamic：语义上属于"项目快照"（git status/diff/
+        // commits），虽 build() 时一次性捕获，但将来可能支持 turn 间刷新。
+        if let Some(project_context) = &self.project_context {
+            sections.push(render_project_context(project_context));
         }
         sections.extend(self.append_sections.iter().cloned());
         sections
@@ -1314,7 +1329,8 @@ mod tests {
             .with_model_family(ModelFamilyIdentity::default());
         let split = builder.build_split();
 
-        // Static sections: intro, system, doing_tasks, actions (no boundary marker)
+        // Static sections: intro, system, doing_tasks, actions, memory_verification,
+        // context_recovery, environment（无 boundary marker）
         assert!(!split.static_sections.is_empty());
         assert!(
             !split
@@ -1324,8 +1340,7 @@ mod tests {
             "static_sections must not contain the boundary marker"
         );
 
-        // Dynamic sections: environment + any project/config/append
-        assert!(!split.dynamic_sections.is_empty());
+        // Dynamic sections: 空 builder 时可能为空（无 project_context / append_sections）
         assert!(
             !split
                 .dynamic_sections
@@ -1496,18 +1511,21 @@ mod tests {
     }
 
     #[test]
-    fn build_split_environment_in_dynamic() {
+    fn build_split_environment_in_static() {
+        // 缓存优化：environment_section 现在放在 static_sections 中
+        // （cwd/date/os/shell/model 在 session 内字节稳定），
+        // 而非 dynamic_sections。
         let builder = SystemPromptBuilder::new()
             .with_os("linux", "6.1.0")
             .with_model_family(ModelFamilyIdentity::default());
         let split = builder.build_split();
         assert!(
             split
-                .dynamic_sections
+                .static_sections
                 .iter()
                 .any(|s| s.contains("# Environment context")),
-            "dynamic_sections should contain the environment block, got: {:?}",
-            split.dynamic_sections
+            "static_sections should contain the environment block, got: {:?}",
+            split.static_sections
         );
     }
 
@@ -1537,13 +1555,14 @@ mod tests {
 
     #[test]
     fn build_split_with_empty_builder_still_partitions() {
-        // Even a default builder (no optional sections) must produce a valid
-        // partition: static has intro+system+doing_tasks+actions, dynamic has
-        // environment.
+        // 默认 builder（无可选 section）:
+        // static: intro + system + doing_tasks + actions + memory_verification
+        //   + context_recovery + environment = 7
+        // dynamic: 空（无 project_context、无 append_sections）
         let builder = SystemPromptBuilder::new();
         let split = builder.build_split();
-        assert!(split.static_sections.len() >= 4);
-        assert!(!split.dynamic_sections.is_empty());
+        assert!(split.static_sections.len() >= 7);
+        // 空 dynamic 是合法的 — from_sections 已防御性处理
     }
 
     #[test]
