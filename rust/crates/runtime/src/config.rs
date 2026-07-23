@@ -127,6 +127,10 @@ pub struct LspServerConfig {
     pub language: String,
     /// Command to launch the LSP server (e.g. "rust-analyzer", "pylsp").
     pub command: String,
+    /// Optional command-line arguments passed to the LSP server
+    /// (e.g. `["--stdio"]` for `typescript-language-server`).
+    /// Empty vec means no arguments.
+    pub args: Vec<String>,
     /// Optional working directory root path for the LSP server.
     /// If None, uses the workspace root.
     pub root_path: Option<String>,
@@ -863,7 +867,8 @@ fn merge_mcp_servers(
 /// {
 ///   "lspServers": {
 ///     "rust": { "command": "rust-analyzer" },
-///     "python": { "command": "pylsp", "rootPath": "." }
+///     "python": { "command": "pylsp", "rootPath": "." },
+///     "typescript": { "command": "typescript-language-server", "args": ["--stdio"] }
 ///   }
 /// }
 /// ```
@@ -881,6 +886,7 @@ fn merge_lsp_servers(
         let obj = expect_object(value, &context)?;
         let command = optional_string(obj, "command", &context)?
             .ok_or_else(|| ConfigError::Parse(format!("{context}: missing 'command' field")))?;
+        let args = optional_string_array(obj, "args", &context)?.unwrap_or_default();
         let root_path = optional_string(obj, "rootPath", &context)?
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
@@ -889,6 +895,7 @@ fn merge_lsp_servers(
             LspServerConfig {
                 language: language.clone(),
                 command: command.to_owned(),
+                args,
                 root_path,
             },
         );
@@ -1505,7 +1512,7 @@ mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
         McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME, LspServerConfig,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -2424,5 +2431,50 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn lsp_servers_config_parses_args_field() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+  "lspServers": {
+    "rust": { "command": "rust-analyzer" },
+    "typescript": { "command": "typescript-language-server", "args": ["--stdio"] }
+  }
+}"#,
+        )
+        .expect("write settings");
+
+        let cfg = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should parse");
+
+        let rust = cfg.lsp().get("rust").expect("rust server configured");
+        assert_eq!(rust.command, "rust-analyzer");
+        assert!(rust.args.is_empty(), "rust should have no args");
+
+        let ts = cfg.lsp().get("typescript").expect("typescript server configured");
+        assert_eq!(ts.command, "typescript-language-server");
+        assert_eq!(ts.args, vec!["--stdio".to_string()], "typescript should have --stdio arg");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn lsp_servers_config_defaults_args_when_absent() {
+        // 验证 LspServerConfig::default 行为:args 缺省时为空 Vec
+        let cfg = LspServerConfig {
+            language: "rust".to_string(),
+            command: "rust-analyzer".to_string(),
+            args: Vec::new(),
+            root_path: None,
+        };
+        assert!(cfg.args.is_empty());
     }
 }

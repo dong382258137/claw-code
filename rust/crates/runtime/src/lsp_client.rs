@@ -207,6 +207,7 @@ impl LspRegistry {
     /// - `language`:语言标识(如 "rust"),需先通过 `register` 或
     ///   `register_with_command` 注册对应 server
     /// - `command`:LSP server 启动命令(如 "rust-analyzer"),覆盖注册时的 server_command
+    /// - `args`:LSP server 命令行参数(如 `["--stdio"]`),无参数传空切片
     /// - `root_path`:工作区根路径,LSP initialize 的 rootUri
     ///
     /// # 返回
@@ -221,6 +222,7 @@ impl LspRegistry {
         &self,
         language: &str,
         command: &str,
+        args: &[String],
         root_path: &str,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
@@ -243,10 +245,11 @@ impl LspRegistry {
         server.root_path = Some(root_path.to_owned());
 
         // 创建并 spawn ProcessLspTransport
-        let mut transport = ProcessLspTransport::new(
+        let mut transport = ProcessLspTransport::with_args(
             language.to_owned(),
             Some(root_path.to_owned()),
             command.to_owned(),
+            args.to_vec(),
         );
         // 注入 registry inner 的弱引用,供后台 reader 线程推送 publishDiagnostics
         // 弱引用避免 ProcessLspTransport ↔ LspRegistry 的循环强引用
@@ -455,14 +458,72 @@ impl LspRegistry {
 
         // For other actions, we need a connected server for the given file
         let path = path.ok_or("path is required for this LSP action")?;
-        let server = self
-            .find_server_for_path(path)
-            .ok_or_else(|| format!("no LSP server available for path: {path}"))?;
+
+        // 分层错误诊断:区分三种无 server 可用的情形,给出针对性修复指引。
+        //
+        // 1. 文件扩展名未识别 → 提示支持的扩展名
+        // 2. 扩展名已识别但该语言未在 lspServers 中配置 → 提示加配置
+        // 3. 已配置但 spawn 失败或正在启动 → 提示检查命令/等待启动
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let language = match ext {
+            "rs" => "rust",
+            "ts" | "tsx" => "typescript",
+            "js" | "jsx" => "javascript",
+            "py" => "python",
+            "go" => "go",
+            "java" => "java",
+            "c" | "h" => "c",
+            "cpp" | "hpp" | "cc" => "cpp",
+            "rb" => "ruby",
+            "lua" => "lua",
+            _ => {
+                return Err(format!(
+                    "unsupported file extension '.{}': LSP supports rust(.rs), typescript(.ts/.tsx), javascript(.js/.jsx), python(.py), go(.go), java(.java), c(.c/.h), cpp(.cpp/.hpp/.cc), ruby(.rb), lua(.lua); path: {path}",
+                    if ext.is_empty() { "<none>" } else { ext }
+                ));
+            }
+        };
+
+        let server = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner.servers.get(language).cloned()
+        };
+
+        let server = match server {
+            Some(s) => s,
+            None => {
+                return Err(format!(
+                    "no LSP server configured for language '{language}' (file: {path}) — add \"lspServers\" to settings.json, e.g. {{\"lspServers\": {{\"{language}\": {{\"language\": \"{language}\", \"command\": \"<server-command>\"}}}}}}"
+                ));
+            }
+        };
 
         if server.status != LspServerStatus::Connected {
+            // 根据状态给出更具体的诊断
+            let hint = match server.status {
+                LspServerStatus::Starting => "server is still starting up, retry in a few seconds (rust-analyzer indexing may take 30-60s on first run)".to_string(),
+                LspServerStatus::Error => {
+                    let mut msg = "server failed to start — check that the command exists in PATH and the root_path is a valid project (see startup log '[lsp] failed to spawn ...')".to_string();
+                    // 附加安装提示(如果有)
+                    if let Some(cmd) = &server.server_command {
+                        if let Some(install_hint) = install_hint_for_command(cmd) {
+                            msg.push_str(&format!("\n  {install_hint}"));
+                        }
+                    }
+                    msg
+                }
+                LspServerStatus::Disconnected => "server was registered but never spawned, or was shut down — restart the process to re-run init_lsp_from_config".to_string(),
+                LspServerStatus::Connected => String::new(),
+            };
             return Err(format!(
-                "LSP server for '{}' is not connected (status: {})",
-                server.language, server.status
+                "LSP server for '{}' is not connected (status: {}){}",
+                server.language,
+                server.status,
+                if hint.is_empty() { String::new() } else { format!(" — {hint}") }
             ));
         }
 
@@ -677,6 +738,29 @@ impl LspTransport for MemoryLspTransport {
     }
 }
 
+/// 根据已配置的 LSP server 命令名,返回安装提示。
+///
+/// 覆盖第一档语言(有标准包管理器安装方式)的主流 LSP server。
+/// 返回 `None` 表示该 server 无标准安装方式(如需手动下载二进制)。
+///
+/// 这些提示会附加到 spawn 失败和 dispatch 未连接的错误信息中,
+/// 让 AI 能看到安装命令并主动协助用户执行(通过 bash 工具,需用户确认)。
+fn install_hint_for_command(command: &str) -> Option<&'static str> {
+    match command {
+        "rust-analyzer" => Some("install with: `rustup component add rust-analyzer` (requires rustup)"),
+        "pylsp" => Some("install with: `pip install python-lsp-server` (requires pip)"),
+        "pyright" => Some("install with: `npm install -g pyright` (requires npm)"),
+        "ruff-lsp" => Some("install with: `pip install ruff-lsp` (requires pip)"),
+        "gopls" => Some("install with: `go install golang.org/x/tools/gopls@latest` (requires go)"),
+        "typescript-language-server" => Some("install with: `npm install -g typescript-language-server typescript` (requires npm)"),
+        "clangd" => Some("install via system package manager: `apt install clangd` (Debian/Ubuntu), `winget install LLVM.LLVM` (Windows), or `brew install llvm` (macOS)"),
+        "solargraph" => Some("install with: `gem install solargraph` (requires ruby/gem)"),
+        "lua-language-server" => Some("download from https://github.com/LuaLS/lua-language-server/releases and add to PATH"),
+        "jdtls" => Some("download from https://download.eclipse.org/jdtls/snapshots/ (requires JDK 17+, complex setup)"),
+        _ => None,
+    }
+}
+
 /// 进程传输层 — 启动 LSP server 子进程,通过 stdin/stdout 通信。
 ///
 /// BUG-12:实现真实子进程启动(Step 4.2)。
@@ -701,6 +785,9 @@ pub struct ProcessLspTransport {
     pub root_path: Option<String>,
     /// LSP server 命令(如 "rust-analyzer")。
     pub server_command: String,
+    /// LSP server 命令行参数(如 `["--stdio"]`)。
+    /// 空 Vec 表示无参数。
+    pub server_args: Vec<String>,
     /// 是否已初始化(已发送 initialize 请求)。
     pub initialized: bool,
     /// 已启动的子进程(若存在)。
@@ -748,10 +835,25 @@ impl ProcessLspTransport {
         root_path: Option<String>,
         server_command: impl Into<String>,
     ) -> Self {
+        Self::with_args(language, root_path, server_command, Vec::new())
+    }
+
+    /// 创建带命令行参数的 transport。
+    ///
+    /// `args` 会在 spawn 时追加到 `server_command` 之后,
+    /// 例如 `typescript-language-server --stdio`。
+    #[must_use]
+    pub fn with_args(
+        language: impl Into<String>,
+        root_path: Option<String>,
+        server_command: impl Into<String>,
+        args: Vec<String>,
+    ) -> Self {
         Self {
             language: language.into(),
             root_path,
             server_command: server_command.into(),
+            server_args: args,
             initialized: false,
             child: None,
             child_stdin: None,
@@ -779,12 +881,23 @@ impl ProcessLspTransport {
     /// 配置 stdin/stdout 为 piped,stderr 为 inherit。
     /// 启动后自动发送 `initialize` 请求并等待响应。
     pub fn spawn(&mut self) -> Result<(), String> {
-        let mut child = Command::new(&self.server_command)
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new(&self.server_command);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("failed to spawn LSP server '{}': {e}", self.server_command))?;
+            .stderr(Stdio::inherit());
+        if !self.server_args.is_empty() {
+            cmd.args(&self.server_args);
+        }
+        let mut child = cmd.spawn().map_err(|e| {
+            let base = format!("failed to spawn LSP server '{}': {e}", self.server_command);
+            // 命令不存在时附加安装提示,让 AI 能看到安装命令并主动协助
+            if e.kind() == std::io::ErrorKind::NotFound {
+                if let Some(hint) = install_hint_for_command(&self.server_command) {
+                    return format!("{base}\n  {hint}");
+                }
+            }
+            base
+        })?;
 
         let stdin = child
             .stdin
@@ -2060,8 +2173,52 @@ mod tests {
         let result = registry.dispatch("hover", Some("notes.md"), Some(1), Some(0), None);
 
         // then
-        let error = result.expect_err("missing server should fail");
-        assert!(error.contains("no LSP server available for path: notes.md"));
+        // .md 扩展名不在 LSP 支持列表中,返回 unsupported extension 错误
+        let error = result.expect_err("unsupported extension should fail");
+        assert!(error.contains("unsupported file extension '.md'"), "got: {error}");
+        assert!(error.contains("notes.md"));
+    }
+
+    #[test]
+    fn dispatch_unsupported_extension_error_includes_supported_list() {
+        // given
+        let registry = LspRegistry::new();
+
+        // when
+        let result = registry.dispatch("hover", Some("data.csv"), Some(1), Some(0), None);
+
+        // then
+        let error = result.expect_err("unsupported extension should fail");
+        assert!(error.contains("unsupported file extension '.csv'"));
+        assert!(error.contains(".rs"), "should list supported extensions");
+    }
+
+    #[test]
+    fn dispatch_no_extension_error_is_clear() {
+        // given
+        let registry = LspRegistry::new();
+
+        // when — 无扩展名文件
+        let result = registry.dispatch("hover", Some("Makefile"), Some(1), Some(0), None);
+
+        // then
+        let error = result.expect_err("no extension should fail");
+        assert!(error.contains("unsupported file extension"));
+    }
+
+    #[test]
+    fn dispatch_unconfigured_language_error_gives_config_hint() {
+        // given — registry 为空,.rs 扩展名被识别但 rust 语言未配置
+        let registry = LspRegistry::new();
+
+        // when
+        let result = registry.dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None);
+
+        // then
+        let error = result.expect_err("unconfigured language should fail with hint");
+        assert!(error.contains("no LSP server configured for language 'rust'"));
+        assert!(error.contains("lspServers"), "should mention config key");
+        assert!(error.contains("settings.json"), "should mention config file");
     }
 
     #[test]
@@ -2384,6 +2541,45 @@ mod tests {
     }
 
     #[test]
+    fn process_lsp_transport_with_args_stores_args() {
+        // 验证 with_args 正确存储参数(不 spawn,只检查字段)
+        let transport = ProcessLspTransport::with_args(
+            "typescript",
+            Some("/workspace".to_string()),
+            "typescript-language-server",
+            vec!["--stdio".to_string()],
+        );
+        assert_eq!(transport.server_command, "typescript-language-server");
+        assert_eq!(transport.server_args, vec!["--stdio".to_string()]);
+    }
+
+    #[test]
+    fn process_lsp_transport_new_defaults_to_empty_args() {
+        let transport =
+            ProcessLspTransport::new("rust", Some("/workspace".to_string()), "rust-analyzer");
+        assert!(transport.server_args.is_empty(), "new() should default to empty args");
+    }
+
+    #[test]
+    fn install_hint_covers_mainstream_servers() {
+        // 主流 server 应有安装提示
+        assert!(install_hint_for_command("rust-analyzer").is_some());
+        assert!(install_hint_for_command("pylsp").is_some());
+        assert!(install_hint_for_command("gopls").is_some());
+        assert!(install_hint_for_command("typescript-language-server").is_some());
+        assert!(install_hint_for_command("clangd").is_some());
+        assert!(install_hint_for_command("solargraph").is_some());
+        // 未知命令应返回 None
+        assert!(install_hint_for_command("my-custom-lsp-server").is_none());
+    }
+
+    #[test]
+    fn install_hint_for_rust_contains_rustup() {
+        let hint = install_hint_for_command("rust-analyzer").unwrap();
+        assert!(hint.contains("rustup"), "rust-analyzer hint should mention rustup");
+    }
+
+    #[test]
     fn process_lsp_transport_initialize_params_includes_root_uri() {
         let transport =
             ProcessLspTransport::new("rust", Some("/workspace".to_string()), "rust-analyzer");
@@ -2513,7 +2709,7 @@ mod tests {
     #[test]
     fn spawn_server_fails_for_unregistered_language() {
         let registry = LspRegistry::new();
-        let result = registry.spawn_server("rust", "rust-analyzer", "/workspace");
+        let result = registry.spawn_server("rust", "rust-analyzer", &[], "/workspace");
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2531,7 +2727,7 @@ mod tests {
             "nonexistent-lsp-server-xyz",
         );
 
-        let result = registry.spawn_server("rust", "nonexistent-lsp-server-xyz", "/workspace");
+        let result = registry.spawn_server("rust", "nonexistent-lsp-server-xyz", &[], "/workspace");
         assert!(result.is_err());
         // spawn 失败应包含 command 名称
         let err = result.unwrap_err();
@@ -2638,7 +2834,7 @@ mod tests {
 
         // 启动 rust-analyzer
         let spawn_result =
-            registry.spawn_server("rust", "rust-analyzer", workspace.to_str().unwrap());
+            registry.spawn_server("rust", "rust-analyzer", &[], workspace.to_str().unwrap());
         assert!(
             spawn_result.is_ok(),
             "spawn_server failed: {:?}",
@@ -2673,7 +2869,7 @@ mod tests {
 
         // 注意:cat 不是 LSP server,initialize 会因 read 超时或格式错误失败
         // 但 spawn() 本身(子进程启动)应成功
-        let result = registry.spawn_server("rust", "cat", "/tmp");
+        let result = registry.spawn_server("rust", "cat", &[], "/tmp");
         // 即使 initialize 失败,spawn 子进程本身应成功
         // result 可能是 Err(initialize timeout/parse error),这是预期的
         if let Err(e) = &result {

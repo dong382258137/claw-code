@@ -166,6 +166,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
     },
     FieldSpec {
+        name: "lspServers",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "oauth",
         expected: FieldType::Object,
     },

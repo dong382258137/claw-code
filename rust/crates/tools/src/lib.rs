@@ -81,13 +81,14 @@ pub fn init_lsp_from_config(
         // 尝试 spawn 真实 server 子进程
         let effective_root = server_cfg.root_path.as_deref().unwrap_or(root_str);
 
-        match registry.spawn_server(language, &server_cfg.command, effective_root) {
+        match registry.spawn_server(language, &server_cfg.command, &server_cfg.args, effective_root) {
             Ok(()) => {
-                eprintln!("[lsp] spawned '{language}' server: {}", server_cfg.command);
+                eprintln!("[lsp] spawned '{language}' server: {} {}", server_cfg.command, server_cfg.args.join(" "));
             }
             Err(e) => {
                 // spawn 失败不阻断:server 仍注册为 Disconnected,
                 // dispatch 时会返回 "not connected" 错误
+                // 错误信息中已包含安装提示(如果命令不存在)
                 eprintln!(
                     "[lsp] failed to spawn '{language}' server '{}': {e}",
                     server_cfg.command

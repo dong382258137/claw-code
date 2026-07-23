@@ -2,7 +2,7 @@
 //!
 //! # Design (v4.2)
 //!
-//! - [`refactor_algorithm_topo`]:**建议模式**,不直接修改文件。基于
+//! - [`refactor_algorithm_topo`] — **建议模式**,不直接修改文件。基于
 //!   [`ProjectTopology`](crate::project_topology::ProjectTopology) 的 SymbolIndex
 //!   (definitions + callers) 生成"建议修改列表"(file + line + old/new text),
 //!   并附调用点覆盖率报告。LLM 拿到建议后用 `edit_file` 逐个应用。
@@ -10,7 +10,7 @@
 //!   原因:SymbolIndex 是 best-effort,LSP 可能遗漏宏展开/条件编译调用点,
 //!   直接批量修改存在"部分成功、部分遗漏"风险。
 //!
-//! - [`benchmark_compare`]:运行命令多次,报告计时统计
+//! - [`benchmark_compare`] — 运行命令多次,报告计时统计
 //!   (avg/median/min/max/stddev),支持 warmup runs、可配置 sample_size、
 //!   per-sample exit code 跟踪,`timeout_seconds` 控制单次运行上限。
 
@@ -540,8 +540,9 @@ mod tests {
     #[test]
     fn benchmark_compare_runs_fast_command() {
         // 快速命令,1 次采样,无预热
+        // echo 在 Windows(cmd) 和 Unix(shell)下都可用,无需平台分支
         let out = benchmark_compare(
-            if cfg!(windows) { "echo hello" } else { "echo hello" },
+            "echo hello",
             None,
             10,
             2,
