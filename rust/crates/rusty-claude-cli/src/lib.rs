@@ -598,6 +598,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools.as_ref(),
         )?,
+        CliAction::ForkSession { session_id, .. } => {
+            eprintln!("fork-session: {} -- session forking not yet implemented", session_id);
+        }
+        CliAction::ListSessions { .. } => {
+            eprintln!("list-sessions: session listing not yet implemented");
+        }
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,

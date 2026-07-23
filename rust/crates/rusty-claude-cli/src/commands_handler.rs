@@ -4,6 +4,13 @@ use std::collections::BTreeSet;
 use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static CLI_MAX_TURNS: AtomicU32 = AtomicU32::new(0);
+pub(crate) fn take_max_turns() -> Option<u32> {
+    let v = CLI_MAX_TURNS.swap(0, Ordering::Relaxed);
+    if v == 0 { None } else { Some(v) }
+}
 
 use crate::render::OutputVerbosity;
 use api::model_family_identity_for;
@@ -137,6 +144,13 @@ pub(crate) enum CliAction {
     Export {
         session_reference: String,
         output_path: Option<PathBuf>,
+        output_format: CliOutputFormat,
+    },
+    ForkSession {
+        session_id: String,
+        output_format: CliOutputFormat,
+    },
+    ListSessions {
         output_format: CliOutputFormat,
     },
     Repl {
@@ -509,6 +523,13 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             enable_plan_mode,
             enable_policy_engine,
         });
+    }
+    if rest.first().map(String::as_str) == Some("--fork-session") {
+        let session_id = rest.get(1).cloned().unwrap_or_default();
+        return Ok(CliAction::ForkSession { session_id, output_format });
+    }
+    if rest.first().map(String::as_str) == Some("--list-sessions") {
+        return Ok(CliAction::ListSessions { output_format });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..], output_format);
