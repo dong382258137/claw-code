@@ -5,6 +5,11 @@ const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;
 const DEFAULT_CACHE_CREATION_COST_PER_MILLION: f64 = 18.75;
 const DEFAULT_CACHE_READ_COST_PER_MILLION: f64 = 1.5;
 
+/// CNY 兑 USD 汇率（用于本地化显示）。
+/// 内部存储始终用 USD，仅在显示层根据地区转换为 CNY。
+/// 取值 7.2（2026-07 近似汇率）。
+pub const CNY_TO_USD_RATE: f64 = 7.2;
+
 /// Per-million-token pricing used for cost estimation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPricing {
@@ -157,33 +162,46 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_cost_per_million: 0.0,
         });
     }
-    // DeepSeek 系列
-    // DeepSeek 的 prompt_cache_hit_tokens 按 input 价格的 1/20 计费 (cache_read_cost = 0.014),
-    // prompt_cache_miss_tokens 按 input 价计费。
-    // 映射上 miss 同时填入 input_tokens=0 + cache_creation_input_tokens=miss (见 openai_compat.rs),
+    // DeepSeek 系列（2026-07 官方价目，按汇率 7.2 CNY/USD 换算）
+    // 官方价格页：https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+    //
+    // prompt_cache_miss_tokens 按 input 价计费，映射上 miss 同时填入
+    // input_tokens=0 + cache_creation_input_tokens=miss (见 openai_compat.rs),
     // 所以 cache_creation_cost_per_million 必须等于 input_cost_per_million,
     // 否则 miss 部分不计费会导致成本严重低估。
+    //
+    // v4-pro (原 deepseek-reasoner, 思考模式):
+    //   官方: ¥3/M input miss, ¥0.025/M cache hit, ¥6/M output
+    //   换算: $0.417 / $0.00347 / $0.833
+    //   缓存命中 = input 价的 1/120
     if normalized.contains("deepseek-reasoner")
         || normalized.contains("deepseek-r1")
         || normalized.contains("deepseekr1")
+        || normalized.contains("deepseek-v4-pro")
+        || normalized.contains("deepseekv4-pro")
     {
         return Some(ModelPricing {
-            input_cost_per_million: 0.55,
-            output_cost_per_million: 2.19,
-            cache_creation_cost_per_million: 0.55,
-            cache_read_cost_per_million: 0.014,
+            input_cost_per_million: 0.417,
+            output_cost_per_million: 0.833,
+            cache_creation_cost_per_million: 0.417,
+            cache_read_cost_per_million: 0.00347,
         });
     }
+    // v4-flash (原 deepseek-chat, 非思考模式):
+    //   官方: ¥1/M input miss, ¥0.02/M cache hit, ¥2/M output
+    //   换算: $0.139 / $0.00278 / $0.278
+    //   缓存命中 = input 价的 1/50
     if normalized.contains("deepseek-chat")
         || normalized.contains("deepseek-v3")
         || normalized.contains("deepseekv3")
-        || normalized.contains("deepseek-v4")
+        || normalized.contains("deepseek-v4-flash")
+        || normalized.contains("deepseekv4-flash")
     {
         return Some(ModelPricing {
-            input_cost_per_million: 0.27,
-            output_cost_per_million: 1.1,
-            cache_creation_cost_per_million: 0.27,
-            cache_read_cost_per_million: 0.014,
+            input_cost_per_million: 0.139,
+            output_cost_per_million: 0.278,
+            cache_creation_cost_per_million: 0.139,
+            cache_read_cost_per_million: 0.00278,
         });
     }
     None
@@ -271,6 +289,23 @@ fn cost_for_tokens(tokens: u32, usd_per_million_tokens: f64) -> f64 {
 /// Formats a dollar-denominated value for CLI display.
 pub fn format_usd(amount: f64) -> String {
     format!("${amount:.4}")
+}
+
+/// 根据地区格式化费用显示。
+///
+/// 内部存储始终为 USD，此函数仅在显示层做转换：
+/// - `use_cny = true`（中国大陆地区）：转换为 CNY，显示为 `¥X.XXXX`
+/// - `use_cny = false`（其他地区）：保持 USD，显示为 `$X.XXXX`
+///
+/// 转换使用 [`CNY_TO_USD_RATE`] 常量汇率。
+#[must_use]
+pub fn format_cost_localized(usd_amount: f64, use_cny: bool) -> String {
+    if use_cny {
+        let cny = usd_amount * CNY_TO_USD_RATE;
+        format!("¥{cny:.4}")
+    } else {
+        format!("${usd_amount:.4}")
+    }
 }
 
 /// Aggregates token usage across a running session.
@@ -398,8 +433,12 @@ mod tests {
         let qwen_max = pricing_for_model("qwen-max-2024-09-10").expect("qwen-max pricing");
         let qwen_plus = pricing_for_model("qwen-plus").expect("qwen-plus pricing");
         let qwen_turbo = pricing_for_model("qwen-turbo").expect("qwen-turbo pricing");
-        let ds_v3 = pricing_for_model("deepseek-chat").expect("deepseek-chat pricing");
-        let ds_r1 = pricing_for_model("deepseek-reasoner").expect("deepseek-reasoner pricing");
+        // DeepSeek v4-flash（原 deepseek-chat）和 v4-pro（原 deepseek-reasoner）
+        let ds_flash = pricing_for_model("deepseek-chat").expect("deepseek-chat pricing");
+        let ds_pro = pricing_for_model("deepseek-reasoner").expect("deepseek-reasoner pricing");
+        let ds_v4_flash =
+            pricing_for_model("deepseek-v4-flash").expect("deepseek-v4-flash pricing");
+        let ds_v4_pro = pricing_for_model("deepseek-v4-pro").expect("deepseek-v4-pro pricing");
 
         // 非 Anthropic 系列 cache 价格应为 0
         assert_eq!(gpt5.cache_creation_cost_per_million, 0.0);
@@ -419,18 +458,48 @@ mod tests {
         assert_eq!(qwen_max.input_cost_per_million, 2.5);
         assert_eq!(qwen_plus.input_cost_per_million, 0.4);
         assert_eq!(qwen_turbo.input_cost_per_million, 0.05);
-        assert_eq!(ds_v3.input_cost_per_million, 0.27);
-        assert_eq!(ds_r1.input_cost_per_million, 0.55);
 
-        // 验证别名也能命中（deepseek-v3 应等价于 deepseek-chat）
+        // DeepSeek 2026-07 官方价目（按汇率 7.2 换算）
+        // v4-flash: ¥1/M input, ¥2/M output, ¥0.02/M cache hit
+        assert_eq!(ds_flash.input_cost_per_million, 0.139);
+        assert_eq!(ds_flash.output_cost_per_million, 0.278);
+        assert_eq!(ds_flash.cache_read_cost_per_million, 0.00278);
+        assert_eq!(ds_flash.cache_creation_cost_per_million, 0.139); // miss = input 价
+        // v4-pro: ¥3/M input, ¥6/M output, ¥0.025/M cache hit
+        assert_eq!(ds_pro.input_cost_per_million, 0.417);
+        assert_eq!(ds_pro.output_cost_per_million, 0.833);
+        assert_eq!(ds_pro.cache_read_cost_per_million, 0.00347);
+        assert_eq!(ds_pro.cache_creation_cost_per_million, 0.417);
+
+        // 验证别名映射：旧名等价新名
+        assert_eq!(
+            ds_v4_flash.input_cost_per_million,
+            ds_flash.input_cost_per_million
+        );
+        assert_eq!(
+            ds_v4_pro.input_cost_per_million,
+            ds_pro.input_cost_per_million
+        );
+        // deepseek-v3 仍映射到 flash 价（向后兼容）
         let ds_v3_alias = pricing_for_model("deepseek-v3").expect("deepseek-v3 alias");
         assert_eq!(
             ds_v3_alias.input_cost_per_million,
-            ds_v3.input_cost_per_million
+            ds_flash.input_cost_per_million
         );
+        // deepseek-v4 裸名已删除，应返回 None（避免歧义）
+        assert!(pricing_for_model("deepseek-v4").is_none());
 
         // 未知模型仍返回 None
         assert!(pricing_for_model("some-unknown-model-v999").is_none());
+    }
+
+    #[test]
+    fn formats_cost_localized_by_region() {
+        // USD 显示
+        assert_eq!(super::format_cost_localized(1.0, false), "$1.0000");
+        // CNY 显示（汇率 7.2）
+        assert_eq!(super::format_cost_localized(1.0, true), "¥7.2000");
+        assert_eq!(super::format_cost_localized(0.0, true), "¥0.0000");
     }
 
     #[test]

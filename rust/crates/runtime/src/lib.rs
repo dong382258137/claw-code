@@ -323,7 +323,8 @@ pub use trust_resolver::{
     TrustResolution, TrustResolver,
 };
 pub use usage::{
-    format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
+    format_cost_localized, format_usd, pricing_for_model, CNY_TO_USD_RATE, ModelPricing,
+    TokenUsage, UsageCostEstimate, UsageTracker,
 };
 pub use verifier::{RuleVerdict, RuleVerifier, VerificationResult, VerifierAgent};
 pub use worker_boot::{

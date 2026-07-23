@@ -241,9 +241,10 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     // wrong costs for Opus / Haiku / third-party providers. The status bar
     // (status_bar.rs) already did this; the sidebar now matches.
     let pricing = runtime::pricing_for_model(&state.model);
-    let cost = runtime::format_usd(
-        estimated_cost(cum, pricing.as_ref()) + estimated_cost(turn, pricing.as_ref()),
-    );
+    let cost_usd =
+        estimated_cost(cum, pricing.as_ref()) + estimated_cost(turn, pricing.as_ref());
+    // 根据系统 locale 决定显示 CNY（中国大陆）还是 USD（其他地区）
+    let cost = runtime::format_cost_localized(cost_usd, crate::locale::is_cny_region());
     let timer = if state.streaming {
         format_elapsed_ms(state.turn_elapsed_ms)
     } else {
