@@ -1113,19 +1113,12 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
     )];
     if project_context.instruction_files.is_empty() {
         lines.push("发现的文件".to_string());
-        lines.push(
-            "  在当前目录的祖先目录中未发现 CLAUDE 指令文件。"
-                .to_string(),
-        );
+        lines.push("  在当前目录的祖先目录中未发现 CLAUDE 指令文件。".to_string());
     } else {
         lines.push("发现的文件".to_string());
         for (index, file) in project_context.instruction_files.iter().enumerate() {
             let preview = file.content.lines().next().unwrap_or("").trim();
-            let preview = if preview.is_empty() {
-                "<空>"
-            } else {
-                preview
-            };
+            let preview = if preview.is_empty() { "<空>" } else { preview };
             lines.push(format!("  {}. {}", index + 1, file.path.display(),));
             lines.push(format!(
                 "     行数={} 预览={}",
@@ -1154,11 +1147,7 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
                 cur as f64 / max as f64 * 100.0
             };
             let preview = block.content().lines().next().unwrap_or("").trim();
-            let preview = if preview.is_empty() {
-                "<空>"
-            } else {
-                preview
-            };
+            let preview = if preview.is_empty() { "<空>" } else { preview };
             lines.push(format!(
                 "  {} {}/{} 字符 ({:.0}%) 预览={}",
                 block.label(),
@@ -1266,12 +1255,15 @@ pub(crate) fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::err
 
 pub(crate) fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    Ok(initialize_repo(&cwd)?.render())
+    Ok(initialize_repo(&cwd, false)?.render())
 }
 
-pub(crate) fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_init(
+    output_format: CliOutputFormat,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let report = initialize_repo(&cwd)?;
+    let report = initialize_repo(&cwd, force)?;
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
@@ -1296,6 +1288,7 @@ pub(crate) fn init_json_value(
         "created": report.artifacts_with_status(InitStatus::Created),
         "updated": report.artifacts_with_status(InitStatus::Updated),
         "skipped": report.artifacts_with_status(InitStatus::Skipped),
+        "overwritten": report.artifacts_with_status(InitStatus::Overwritten),
         "artifacts": report.artifact_json_entries(),
         "next_step": crate::init::InitReport::NEXT_STEP,
         "message": message,
@@ -1335,8 +1328,7 @@ pub(crate) fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::
     let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
     if staged.trim().is_empty() && unstaged.trim().is_empty() {
         return Ok(
-            "Diff\n  结果             干净的工作树\n  详情             当前没有更改"
-                .to_string(),
+            "Diff\n  结果             干净的工作树\n  详情             当前没有更改".to_string(),
         );
     }
 
@@ -2017,4 +2009,3 @@ pub(crate) fn json_error_envelope(message: &str) -> String {
     })
     .unwrap_or_else(|_| serde_json::json!({"type":"error","error":message}).to_string())
 }
-

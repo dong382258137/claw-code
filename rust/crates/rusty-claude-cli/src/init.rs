@@ -16,6 +16,8 @@ pub(crate) enum InitStatus {
     Created,
     Updated,
     Skipped,
+    /// 仅在 `--force` 模式下出现：文件已存在但被预置模板覆盖。
+    Overwritten,
 }
 
 impl InitStatus {
@@ -25,6 +27,7 @@ impl InitStatus {
             Self::Created => "created",
             Self::Updated => "updated",
             Self::Skipped => "skipped (already exists)",
+            Self::Overwritten => "overwritten (forced)",
         }
     }
 
@@ -37,6 +40,7 @@ impl InitStatus {
             Self::Created => "created",
             Self::Updated => "updated",
             Self::Skipped => "skipped",
+            Self::Overwritten => "overwritten",
         }
     }
 }
@@ -119,7 +123,10 @@ struct RepoDetection {
     rust_dir: bool,
 }
 
-pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::error::Error>> {
+pub(crate) fn initialize_repo(
+    cwd: &Path,
+    force: bool,
+) -> Result<InitReport, Box<dyn std::error::Error>> {
     let mut artifacts = Vec::new();
 
     let claw_dir = cwd.join(".claw");
@@ -131,7 +138,7 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
     let claw_json = cwd.join(".claw.json");
     artifacts.push(InitArtifact {
         name: ".claw.json",
-        status: write_file_if_missing(&claw_json, STARTER_CLAW_JSON)?,
+        status: write_file_if_missing(&claw_json, STARTER_CLAW_JSON, force)?,
     });
 
     let gitignore = cwd.join(".gitignore");
@@ -144,7 +151,7 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
     let content = render_init_claude_md(cwd);
     artifacts.push(InitArtifact {
         name: "CLAUDE.md",
-        status: write_file_if_missing(&claude_md, &content)?,
+        status: write_file_if_missing(&claude_md, &content, force)?,
     });
 
     Ok(InitReport {
@@ -161,9 +168,17 @@ fn ensure_dir(path: &Path) -> Result<InitStatus, std::io::Error> {
     Ok(InitStatus::Created)
 }
 
-fn write_file_if_missing(path: &Path, content: &str) -> Result<InitStatus, std::io::Error> {
+fn write_file_if_missing(
+    path: &Path,
+    content: &str,
+    force: bool,
+) -> Result<InitStatus, std::io::Error> {
     if path.exists() {
-        return Ok(InitStatus::Skipped);
+        if !force {
+            return Ok(InitStatus::Skipped);
+        }
+        fs::write(path, content)?;
+        return Ok(InitStatus::Overwritten);
     }
     fs::write(path, content)?;
     Ok(InitStatus::Created)
@@ -396,7 +411,7 @@ mod tests {
         fs::create_dir_all(root.join("rust")).expect("create rust dir");
         fs::write(root.join("rust").join("Cargo.toml"), "[workspace]\n").expect("write cargo");
 
-        let report = initialize_repo(&root).expect("init should succeed");
+        let report = initialize_repo(&root, false).expect("init should succeed");
         let rendered = report.render();
         assert!(rendered.contains(".claw/"));
         assert!(rendered.contains(".claw.json"));
@@ -434,11 +449,11 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "custom guidance\n").expect("write existing claude md");
         fs::write(root.join(".gitignore"), ".claw/settings.local.json\n").expect("write gitignore");
 
-        let first = initialize_repo(&root).expect("first init should succeed");
+        let first = initialize_repo(&root, false).expect("first init should succeed");
         assert!(first
             .render()
             .contains("CLAUDE.md        skipped (already exists)"));
-        let second = initialize_repo(&root).expect("second init should succeed");
+        let second = initialize_repo(&root, false).expect("second init should succeed");
         let second_rendered = second.render();
         assert!(second_rendered.contains(".claw/"));
         assert!(second_rendered.contains(".claw.json"));
@@ -465,7 +480,7 @@ mod tests {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("create root");
 
-        let fresh = initialize_repo(&root).expect("fresh init should succeed");
+        let fresh = initialize_repo(&root, false).expect("fresh init should succeed");
         let created_names = fresh.artifacts_with_status(InitStatus::Created);
         assert_eq!(
             created_names,
@@ -482,7 +497,7 @@ mod tests {
             "fresh init should have no skipped artifacts"
         );
 
-        let second = initialize_repo(&root).expect("second init should succeed");
+        let second = initialize_repo(&root, false).expect("second init should succeed");
         let skipped_names = second.artifacts_with_status(InitStatus::Skipped);
         assert_eq!(
             skipped_names,
@@ -531,6 +546,85 @@ mod tests {
         assert!(rendered.contains("Frameworks/tooling markers: Next.js, React."));
         assert!(rendered.contains("pyproject.toml"));
         assert!(rendered.contains("Next.js detected"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn force_init_overwrites_existing_claude_md_and_claw_json() {
+        // `--force` / `/init-force`: 已存在的 CLAUDE.md 和 .claw.json 应被预置模板
+        // 覆盖，状态标记为 Overwritten；.claw/ 目录已存在则保持 Skipped。
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("CLAUDE.md"), "# custom\nuser-authored content\n")
+            .expect("write existing claude md");
+        fs::write(root.join(".claw.json"), "{\"old\":\"config\"}\n")
+            .expect("write existing claw json");
+
+        let report = initialize_repo(&root, true).expect("force init should succeed");
+        let rendered = report.render();
+
+        // CLAUDE.md 与 .claw.json 应被覆盖
+        assert!(
+            rendered.contains("CLAUDE.md        overwritten (forced)"),
+            "CLAUDE.md should be overwritten under force, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(".claw.json       overwritten (forced)"),
+            ".claw.json should be overwritten under force, got: {rendered}"
+        );
+
+        // .claw/ 目录已创建（本次为首次），状态为 Created
+        assert!(rendered.contains(".claw/           created"));
+
+        // 文件内容应已替换为预置模板
+        let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read overwritten claude md");
+        assert!(
+            claude_md.contains("# CLAUDE.md"),
+            "CLAUDE.md content should be the starter template, got: {claude_md}"
+        );
+        assert!(!claude_md.contains("user-authored content"));
+
+        let claw_json = fs::read_to_string(root.join(".claw.json")).expect("read overwritten claw json");
+        assert!(
+            claw_json.contains("\"defaultMode\": \"dontAsk\""),
+            ".claw.json should be the starter template, got: {claw_json}"
+        );
+
+        // 结构化字段：overwritten[] 应包含两者
+        let overwritten = report.artifacts_with_status(InitStatus::Overwritten);
+        assert_eq!(
+            overwritten,
+            vec![".claw.json".to_string(), "CLAUDE.md".to_string()],
+            "overwritten[] should list .claw.json and CLAUDE.md"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn force_init_keeps_skipped_dir_and_handles_idempotent_force() {
+        // 二次 force init：.claw/ 目录已存在 → Skipped；CLAUDE.md/.claw.json 再次 Overwritten。
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("create root");
+
+        // 第一次 force init（文件不存在，Created）
+        let first = initialize_repo(&root, true).expect("first force init");
+        assert!(first.artifacts_with_status(InitStatus::Created).len() >= 3);
+
+        // 第二次 force init（目录 Skipped，文件 Overwritten）
+        let second = initialize_repo(&root, true).expect("second force init");
+        let skipped = second.artifacts_with_status(InitStatus::Skipped);
+        assert!(
+            skipped.contains(&".claw/".to_string()),
+            ".claw/ should be Skipped on second force init, got skipped={skipped:?}"
+        );
+        let overwritten = second.artifacts_with_status(InitStatus::Overwritten);
+        assert_eq!(
+            overwritten,
+            vec![".claw.json".to_string(), "CLAUDE.md".to_string()],
+            "second force init should overwrite .claw.json and CLAUDE.md"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

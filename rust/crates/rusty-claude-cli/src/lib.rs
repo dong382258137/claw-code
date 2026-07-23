@@ -415,7 +415,11 @@ pub(crate) fn diag_log(msg: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "[{ts}] {msg}");
         let _ = f.flush();
     }
@@ -457,7 +461,7 @@ pub fn run_tui_repl_entry(
     // ---- End wizard pre-check -------------------------------------------
 
     diag_log("calling enforce_broad_cwd_policy");
-        enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     diag_log("calling correct_cwd_from_target_dir");
     correct_cwd_from_target_dir();
     diag_log("calling run_stale_base_preflight");
@@ -474,7 +478,6 @@ pub fn run_tui_repl_entry(
     diag_log("build_live_cli_for_repl OK, entering TUI");
     tui::app::run_tui_repl(cli)
 }
-
 
 /// Inject wizard-saved credentials as environment variables for the current
 /// process so that downstream auth resolution picks them up transparently.
@@ -496,7 +499,6 @@ fn inject_wizard_env_vars(settings: &runtime::WizardSettings) {
         _ => {}
     }
 }
-
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -600,7 +602,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools.as_ref(),
         )?,
         CliAction::ForkSession { session_id, .. } => {
-            eprintln!("fork-session: {} -- session forking not yet implemented", session_id);
+            eprintln!(
+                "fork-session: {} -- session forking not yet implemented",
+                session_id
+            );
         }
         CliAction::ListSessions { .. } => {
             eprintln!("list-sessions: session listing not yet implemented");
@@ -654,7 +659,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format: _output_format,
         } => run_acp_serve(model, permission_mode)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
-        CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Init {
+            output_format,
+            force,
+        } => run_init(output_format, force)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
         // corresponding _json helpers already exposed for resume sessions.

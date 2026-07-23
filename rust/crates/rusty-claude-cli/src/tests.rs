@@ -1057,6 +1057,23 @@ fn removed_login_and_logout_subcommands_error_helpfully() {
         parse_args(&["init".to_string()]).expect("init should parse"),
         CliAction::Init {
             output_format: CliOutputFormat::Text,
+            force: false,
+        }
+    );
+    assert_eq!(
+        parse_args(&["init".to_string(), "--force".to_string()])
+            .expect("init --force should parse"),
+        CliAction::Init {
+            output_format: CliOutputFormat::Text,
+            force: true,
+        }
+    );
+    assert_eq!(
+        parse_args(&["init".to_string(), "-f".to_string()])
+            .expect("init -f should parse"),
+        CliAction::Init {
+            output_format: CliOutputFormat::Text,
+            force: true,
         }
     );
     assert_eq!(

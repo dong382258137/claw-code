@@ -506,7 +506,18 @@ pub(crate) fn run_resume_command(
             // #142: run the init once, then render both text + structured JSON
             // from the same InitReport so both surfaces stay in sync.
             let cwd = env::current_dir()?;
-            let report = crate::init::initialize_repo(&cwd)?;
+            let report = crate::init::initialize_repo(&cwd, false)?;
+            let message = report.render();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message.clone()),
+                json: Some(init_json_value(&report, &message)),
+            })
+        }
+        SlashCommand::InitForce => {
+            // `/init-force`: 覆盖现有 CLAUDE.md（等价于 `claw init --force`）。
+            let cwd = env::current_dir()?;
+            let report = crate::init::initialize_repo(&cwd, true)?;
             let message = report.render();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),

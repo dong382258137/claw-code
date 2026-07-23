@@ -187,8 +187,7 @@ pub(crate) fn correct_cwd_from_target_dir() -> Option<PathBuf> {
     let parent = components[n - 2];
     let leaf = components[n - 1];
     if parent == std::ffi::OsStr::new("target")
-        && (leaf == std::ffi::OsStr::new("debug")
-            || leaf == std::ffi::OsStr::new("release"))
+        && (leaf == std::ffi::OsStr::new("debug") || leaf == std::ffi::OsStr::new("release"))
     {
         // Walk up to the directory containing `target/`
         let project_root = cwd
@@ -256,8 +255,7 @@ pub(crate) fn enforce_broad_cwd_policy(
             CliOutputFormat::Json => {
                 eprintln!("{}", json_error_envelope(&message));
             }
-            CliOutputFormat::Text => {
-            }
+            CliOutputFormat::Text => {}
         }
         std::process::exit(1);
     }
@@ -832,7 +830,10 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &mut self,
         emit_output: bool,
-    ) -> Result<(BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal), Box<dyn std::error::Error>> {
+    ) -> Result<
+        (BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal),
+        Box<dyn std::error::Error>,
+    > {
         // TUI 中断支持：优先使用外部注入的 abort signal（由 TUI 层在 spawn
         // worker thread 前设置），让 TUI 主线程能通过 Ctrl+C 取消当前 turn。
         // 非中断模式（CLI/JSON 等）创建新的 signal。
@@ -909,7 +910,8 @@ impl LiveCli {
         let tui_mode = self.tui_mode;
         #[cfg(not(feature = "full-tui"))]
         let tui_mode = false;
-        let (mut runtime, hook_abort_monitor, abort_signal) = self.prepare_turn_runtime(emit_output)?;
+        let (mut runtime, hook_abort_monitor, abort_signal) =
+            self.prepare_turn_runtime(emit_output)?;
         // TUI 中断支持：保存 abort signal handle，让 TUI 层 Ctrl+C 能取消当前 turn。
         #[cfg(feature = "full-tui")]
         {
@@ -1191,7 +1193,11 @@ impl LiveCli {
                 false
             }
             SlashCommand::Init => {
-                run_init(CliOutputFormat::Text)?;
+                run_init(CliOutputFormat::Text, false)?;
+                false
+            }
+            SlashCommand::InitForce => {
+                run_init(CliOutputFormat::Text, true)?;
                 false
             }
             SlashCommand::Diff => {
@@ -1611,7 +1617,8 @@ impl LiveCli {
     fn clear_session(&mut self, confirm: bool) -> Result<bool, Box<dyn std::error::Error>> {
         if !confirm {
             // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
-            let content = "clear: confirmation required; run /clear --confirm to start a fresh session.";
+            let content =
+                "clear: confirmation required; run /clear --confirm to start a fresh session.";
             if !self.tui_println(content) {
                 println!("{content}");
             }
@@ -1793,9 +1800,8 @@ impl LiveCli {
                 }
             }
             CliOutputFormat::Json => {
-                let content = serde_json::to_string_pretty(
-                    &handle_skills_slash_command_json(args, &cwd)?,
-                )?;
+                let content =
+                    serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?;
                 if !self.tui_println(&content) {
                     println!("{content}");
                 }
@@ -2503,7 +2509,9 @@ pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn st
     crate::diag_log(&format!("[build_system_prompt] cwd={}", cwd.display()));
     let extras = load_prompt_extras(&cwd);
     #[cfg(feature = "full-tui")]
-    crate::diag_log("[build_system_prompt] load_prompt_extras OK, calling load_system_prompt_with_extras");
+    crate::diag_log(
+        "[build_system_prompt] load_prompt_extras OK, calling load_system_prompt_with_extras",
+    );
     let result = load_system_prompt_with_extras(
         cwd,
         DEFAULT_DATE,
@@ -2682,8 +2690,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     }
     // 根据模型 context window 提前获取 compaction 阈值,
     // 在 model 被 move 到 AnthropicRuntimeClient 之前完成。
-    let context_window = model_token_limit(&model)
-        .map(|limit| limit.context_window_tokens);
+    let context_window = model_token_limit(&model).map(|limit| limit.context_window_tokens);
     // 从 session 提取工作区根白名单（主 cwd 根 + `--add-dir` 额外根），
     // 注入到 tool_registry，让 `classify_*_permission_with_roots` 在工具执行路径生效。
     let workspace_roots = session.workspace_roots();
@@ -2701,9 +2708,9 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 之前 CliToolExecutor 和 ConversationRuntime 各自独立，topology 只在 runtime 构造后注入，
     // 导致 CliToolExecutor 调用 refactor_algorithm_topo 时没有 topology 实例可用。
     // 现在提前创建，共享同一个 Arc。
-    let shared_topology = env::current_dir().ok().map(|cwd| {
-        std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(cwd))
-    });
+    let shared_topology = env::current_dir()
+        .ok()
+        .map(|cwd| std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(cwd)));
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(

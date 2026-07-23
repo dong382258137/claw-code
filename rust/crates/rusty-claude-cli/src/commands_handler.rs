@@ -9,7 +9,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static CLI_MAX_TURNS: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn take_max_turns() -> Option<u32> {
     let v = CLI_MAX_TURNS.swap(0, Ordering::Relaxed);
-    if v == 0 { None } else { Some(v) }
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 use crate::render::OutputVerbosity;
@@ -131,6 +135,7 @@ pub(crate) enum CliAction {
     },
     Init {
         output_format: CliOutputFormat,
+        force: bool,
     },
     // #146: `claw config` and `claw diff` are pure-local read-only
     // introspection commands; wire them as standalone CLI subcommands.
@@ -526,7 +531,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
     if rest.first().map(String::as_str) == Some("--fork-session") {
         let session_id = rest.get(1).cloned().unwrap_or_default();
-        return Ok(CliAction::ForkSession { session_id, output_format });
+        return Ok(CliAction::ForkSession {
+            session_id,
+            output_format,
+        });
     }
     if rest.first().map(String::as_str) == Some("--list-sessions") {
         return Ok(CliAction::ListSessions { output_format });
@@ -661,7 +669,24 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
         ),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
-        "init" => Ok(CliAction::Init { output_format }),
+        "init" => {
+            let mut force = false;
+            for arg in &rest[1..] {
+                match arg.as_str() {
+                    "--force" | "-f" => force = true,
+                    _ => {
+                        return Err(format!(
+                            "unexpected argument `{arg}` for `claw init`. \
+                             Supported flags: --force / -f (overwrite existing CLAUDE.md)"
+                        ));
+                    }
+                }
+            }
+            Ok(CliAction::Init {
+                output_format,
+                force,
+            })
+        }
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
             let prompt = rest[1..].join(" ");

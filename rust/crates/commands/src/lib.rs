@@ -149,6 +149,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "init-force",
+        aliases: &[],
+        summary: "Overwrite existing CLAUDE.md with the starter template",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "diff",
         aliases: &[],
         summary: "Show git diff for current workspace changes",
@@ -1116,6 +1123,7 @@ pub enum SlashCommand {
     },
     Memory,
     Init,
+    InitForce,
     Diff,
     Search {
         query: Option<String>,
@@ -1281,6 +1289,7 @@ impl SlashCommand {
             Self::Pr { .. } => "/pr",
             Self::Issue { .. } => "/issue",
             Self::Init => "/init",
+            Self::InitForce => "/init-force",
             Self::Bughunter { .. } => "/bughunter",
             Self::Ultraplan { .. } => "/ultraplan",
             Self::Teleport { .. } => "/teleport",
@@ -1419,6 +1428,10 @@ pub fn validate_slash_command_input(
         "init" => {
             validate_no_args(command, &args)?;
             SlashCommand::Init
+        }
+        "init-force" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::InitForce
         }
         "diff" => {
             validate_no_args(command, &args)?;
@@ -4332,6 +4345,7 @@ pub fn handle_slash_command(
         | SlashCommand::Mcp { .. }
         | SlashCommand::Memory
         | SlashCommand::Init
+        | SlashCommand::InitForce
         | SlashCommand::Diff
         | SlashCommand::Version
         | SlashCommand::Export { .. }
@@ -4659,6 +4673,10 @@ mod tests {
             Ok(Some(SlashCommand::Memory))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
+        assert_eq!(
+            SlashCommand::parse("/init-force"),
+            Ok(Some(SlashCommand::InitForce))
+        );
         assert_eq!(SlashCommand::parse("/diff"), Ok(Some(SlashCommand::Diff)));
         assert_eq!(
             SlashCommand::parse("/version"),
