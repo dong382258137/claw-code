@@ -130,6 +130,9 @@ struct RegistryInner {
     /// key 是语言标识(如 "rust"),value 是 ProcessLspTransport 实例。
     /// dispatch 时优先使用此处存储的 transport,无则 fallback 到 MemoryLspTransport。
     process_transports: HashMap<String, Arc<Mutex<ProcessLspTransport>>>,
+    /// 默认工作区根路径,供 auto-start 时使用。
+    /// 由 init_lsp_from_config 在启动时设置(即使 lspServers 为空也会设置)。
+    default_root_path: Option<String>,
 }
 
 impl std::fmt::Debug for RegistryInner {
@@ -148,6 +151,15 @@ impl LspRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 设置默认工作区根路径,供 auto-start 时使用。
+    ///
+    /// 应在 `init_lsp_from_config` 中调用,即使 lspServers 配置为空也会设置,
+    /// 这样 dispatch 时遇到未配置但有预置默认的语言仍能 auto-start。
+    pub fn set_default_root_path(&self, root_path: &str) {
+        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner.default_root_path = Some(root_path.to_owned());
     }
 
     pub fn register(
@@ -305,6 +317,58 @@ impl LspRegistry {
     pub fn is_server_spawned(&self, language: &str) -> bool {
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
         inner.process_transports.contains_key(language)
+    }
+
+    /// 尝试为未配置的语言自动启动预置默认 LSP server(lazy auto-start)。
+    ///
+    /// 当 dispatch 发现某语言未注册时调用此方法。流程:
+    /// 1. 查找 `default_lsp_server_for_language` 预置配置
+    /// 2. 若无预置 → 返回 Err("no default")
+    /// 3. 检测命令是否在 PATH 中(`is_command_available`)
+    /// 4. 不在 PATH → 返回 Err(含安装提示)
+    /// 5. 在 PATH → 注册 + spawn,返回 Ok
+    ///
+    /// 这是"拆包即用"的核心:用户无需配置 settings.json,
+    /// 只要系统装了对应的 LSP server(如 rust-analyzer),
+    /// claw 就能在首次调用时自动启动它。
+    fn try_auto_start(&self, language: &str) -> Result<(), String> {
+        let (command, args) = default_lsp_server_for_language(language)
+            .ok_or_else(|| format!("no default LSP server for language '{language}'"))?;
+
+        if !is_command_available(command) {
+            let hint = install_hint_for_command(command)
+                .unwrap_or("install the corresponding LSP server and add it to PATH");
+            return Err(format!(
+                "LSP server '{command}' for language '{language}' is not in PATH — {hint}"
+            ));
+        }
+
+        // 获取 default_root_path(由 init_lsp_from_config 设置)
+        let root_path = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner.default_root_path.clone().unwrap_or_else(|| ".".to_string())
+        };
+
+        // 注册 + spawn
+        self.register_with_command(
+            language,
+            LspServerStatus::Disconnected,
+            Some(&root_path),
+            vec![],
+            command,
+        );
+
+        let args_vec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        match self.spawn_server(language, command, &args_vec, &root_path) {
+            Ok(()) => {
+                eprintln!(
+                    "[lsp] auto-started '{language}' server: {command} {} (no explicit config, using built-in default)",
+                    args_vec.join(" ")
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Step 4.2:获取指定文件的 LSP symbols。
@@ -496,9 +560,30 @@ impl LspRegistry {
         let server = match server {
             Some(s) => s,
             None => {
-                return Err(format!(
-                    "no LSP server configured for language '{language}' (file: {path}) — add \"lspServers\" to settings.json, e.g. {{\"lspServers\": {{\"{language}\": {{\"language\": \"{language}\", \"command\": \"<server-command>\"}}}}}}"
-                ));
+                // 预置默认配置:尝试 auto-start
+                // 如果该语言有预置默认 LSP server 且在 PATH 中,自动注册并启动
+                // 如果不在 PATH 中,返回含安装提示的错误
+                // 如果无预置默认,返回含配置模板的错误
+                if default_lsp_server_for_language(language).is_some() {
+                    match self.try_auto_start(language) {
+                        Ok(()) => {
+                            // auto-start 成功,重新读取 server 状态
+                            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+                            inner.servers.get(language).cloned().ok_or_else(|| {
+                                "auto-start succeeded but server not found in registry".to_string()
+                            })?
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "auto-start failed for language '{language}' (file: {path}) — {e}"
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(format!(
+                        "no LSP server configured for language '{language}' (file: {path}) — add \"lspServers\" to settings.json, e.g. {{\"lspServers\": {{\"{language}\": {{\"language\": \"{language}\", \"command\": \"<server-command>\"}}}}}}"
+                    ));
+                }
             }
         };
 
@@ -757,6 +842,41 @@ fn install_hint_for_command(command: &str) -> Option<&'static str> {
         "solargraph" => Some("install with: `gem install solargraph` (requires ruby/gem)"),
         "lua-language-server" => Some("download from https://github.com/LuaLS/lua-language-server/releases and add to PATH"),
         "jdtls" => Some("download from https://download.eclipse.org/jdtls/snapshots/ (requires JDK 17+, complex setup)"),
+        _ => None,
+    }
+}
+
+/// 检测命令是否在 PATH 中可用。
+///
+/// Windows 用 `where`,Unix 用 `which`。
+/// 返回 `true` 表示命令存在且可执行。
+fn is_command_available(command: &str) -> bool {
+    let checker = if cfg!(windows) { "where" } else { "which" };
+    Command::new(checker)
+        .arg(command)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// 预置的 LSP server 默认配置。
+///
+/// 当用户未在 settings.json 中配置 `lspServers` 时,
+/// dispatch 会根据此表自动推断常见语言应使用的 LSP server。
+/// 仅当对应 server 命令在 PATH 中可用时才会自动启动(lazy auto-start)。
+///
+/// 返回 `(command, args)` 元组。`args` 为空切片表示无参数。
+fn default_lsp_server_for_language(language: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match language {
+        "rust" => Some(("rust-analyzer", &[])),
+        "python" => Some(("pylsp", &[])),
+        "typescript" | "javascript" => Some(("typescript-language-server", &["--stdio"])),
+        "go" => Some(("gopls", &[])),
+        "c" | "cpp" => Some(("clangd", &[])),
+        "ruby" => Some(("solargraph", &["stdio"])),
+        "lua" => Some(("lua-language-server", &[])),
         _ => None,
     }
 }
@@ -2208,15 +2328,15 @@ mod tests {
 
     #[test]
     fn dispatch_unconfigured_language_error_gives_config_hint() {
-        // given — registry 为空,.rs 扩展名被识别但 rust 语言未配置
+        // given — registry 为空,.java 扩展名被识别但 java 语言无预置默认且未配置
         let registry = LspRegistry::new();
 
         // when
-        let result = registry.dispatch("hover", Some("src/main.rs"), Some(1), Some(0), None);
+        let result = registry.dispatch("hover", Some("src/Main.java"), Some(1), Some(0), None);
 
-        // then
+        // then — java 无预置默认,返回"未配置"错误(含配置模板)
         let error = result.expect_err("unconfigured language should fail with hint");
-        assert!(error.contains("no LSP server configured for language 'rust'"));
+        assert!(error.contains("no LSP server configured for language 'java'"));
         assert!(error.contains("lspServers"), "should mention config key");
         assert!(error.contains("settings.json"), "should mention config file");
     }
@@ -2577,6 +2697,79 @@ mod tests {
     fn install_hint_for_rust_contains_rustup() {
         let hint = install_hint_for_command("rust-analyzer").unwrap();
         assert!(hint.contains("rustup"), "rust-analyzer hint should mention rustup");
+    }
+
+    #[test]
+    fn default_lsp_server_covers_mainstream_languages() {
+        // 主流语言应有预置默认
+        assert_eq!(default_lsp_server_for_language("rust").unwrap().0, "rust-analyzer");
+        assert_eq!(default_lsp_server_for_language("python").unwrap().0, "pylsp");
+        assert_eq!(default_lsp_server_for_language("typescript").unwrap().0, "typescript-language-server");
+        assert_eq!(default_lsp_server_for_language("go").unwrap().0, "gopls");
+        assert_eq!(default_lsp_server_for_language("c").unwrap().0, "clangd");
+        assert_eq!(default_lsp_server_for_language("ruby").unwrap().0, "solargraph");
+        // 未知语言应返回 None
+        assert!(default_lsp_server_for_language("brainfuck").is_none());
+    }
+
+    #[test]
+    fn default_lsp_server_typescript_has_stdio_arg() {
+        let (_, args) = default_lsp_server_for_language("typescript").unwrap();
+        assert_eq!(args, &["--stdio"]);
+    }
+
+    #[test]
+    fn default_lsp_server_rust_has_no_args() {
+        let (_, args) = default_lsp_server_for_language("rust").unwrap();
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn is_command_available_detects_known_command() {
+        // cargo 几乎肯定在 PATH 中(我们在 Rust 项目里)
+        assert!(is_command_available("cargo") || is_command_available("cargo.exe"),
+            "cargo should be in PATH");
+    }
+
+    #[test]
+    fn is_command_available_rejects_unknown_command() {
+        assert!(!is_command_available("nonexistent-command-xyz-12345"),
+            "nonexistent command should not be in PATH");
+    }
+
+    #[test]
+    fn set_default_root_path_stores_root() {
+        let registry = LspRegistry::new();
+        registry.set_default_root_path("/my/workspace");
+        let inner = registry.inner.lock().unwrap();
+        assert_eq!(inner.default_root_path.as_deref(), Some("/my/workspace"));
+    }
+
+    #[test]
+    fn try_auto_start_returns_error_for_no_default_language() {
+        let registry = LspRegistry::new();
+        registry.set_default_root_path("/workspace");
+        let result = registry.try_auto_start("brainfuck");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no default LSP server"));
+    }
+
+    #[test]
+    fn try_auto_start_returns_error_when_command_not_in_path() {
+        // rust-analyzer 在 CI 中可能未安装,但如果安装了则不会触发此路径
+        // 用一个肯定不存在的命令来测试:先检查默认命令是否存在
+        // 这里测试的是 "命令不在 PATH" 的错误路径
+        // 注意:如果 rust-analyzer 恰好在 PATH 中,这个测试会跳过
+        let registry = LspRegistry::new();
+        registry.set_default_root_path("/workspace");
+        // solargraph 在大多数环境中未安装
+        if !is_command_available("solargraph") {
+            let result = registry.try_auto_start("ruby");
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("not in PATH"), "error should mention PATH: {err}");
+            assert!(err.contains("gem install"), "error should include install hint: {err}");
+        }
     }
 
     #[test]

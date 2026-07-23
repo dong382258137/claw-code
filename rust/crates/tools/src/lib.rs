@@ -61,12 +61,17 @@ pub fn init_lsp_from_config(
     workspace_root: &std::path::Path,
 ) -> Result<(), String> {
     let lsp_config = config.lsp();
-    if lsp_config.is_empty() {
-        return Ok(());
-    }
-
     let registry = global_lsp_registry();
     let root_str = workspace_root.to_str().unwrap_or(".");
+
+    // 无论是否配置了 lspServers,都设置 default_root_path,
+    // 供 dispatch 时的 lazy auto-start 使用
+    registry.set_default_root_path(root_str);
+
+    if lsp_config.is_empty() {
+        // 无显式配置,但 dispatch 时仍可通过预置默认配置 auto-start
+        return Ok(());
+    }
 
     for (language, server_cfg) in lsp_config.servers() {
         // 注册 server 元数据
