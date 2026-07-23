@@ -254,16 +254,9 @@ pub(crate) fn enforce_broad_cwd_policy(
         );
         match output_format {
             CliOutputFormat::Json => {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "type": "error",
-                        "error": message,
-                    })
-                );
+                eprintln!("{}", json_error_envelope(&message));
             }
             CliOutputFormat::Text => {
-                eprintln!("error: {message}");
             }
         }
         std::process::exit(1);

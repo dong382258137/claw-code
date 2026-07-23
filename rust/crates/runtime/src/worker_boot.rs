@@ -1240,7 +1240,17 @@ fn emit_state_file(worker: &Worker) {
 fn path_matches_allowlist(cwd: &str, trusted_root: &str) -> bool {
     let cwd = normalize_path(cwd);
     let trusted_root = normalize_path(trusted_root);
-    cwd == trusted_root || cwd.starts_with(&trusted_root)
+    // G6.3 fix: case-insensitive prefix matching for Windows.
+    #[cfg(windows)]
+    {
+        let cwd_str = cwd.to_string_lossy().to_lowercase();
+        let root_str = trusted_root.to_string_lossy().to_lowercase();
+        cwd_str == root_str || cwd_str.starts_with(&root_str)
+    }
+    #[cfg(not(windows))]
+    {
+        cwd == trusted_root || cwd.starts_with(&trusted_root)
+    }
 }
 
 fn normalize_path(path: &str) -> PathBuf {

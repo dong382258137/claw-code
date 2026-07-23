@@ -1975,3 +1975,46 @@ pub(crate) fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn s
     }
     Ok(())
 }
+
+/// G1.22: Typed JSON error envelope contract.
+///
+/// Produces `{"type":"error","error":{"kind":...,"hint":...,"retryable":...}}`.
+#[derive(serde::Serialize)]
+pub(crate) struct TypedErrorEnvelope {
+    #[serde(rename = "type")]
+    pub envelope_type: String,
+    pub error: TypedErrorDetail,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct TypedErrorDetail {
+    pub kind: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errno: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    pub retryable: bool,
+}
+
+#[must_use]
+pub(crate) fn json_error_envelope(message: &str) -> String {
+    serde_json::to_string(&TypedErrorEnvelope {
+        envelope_type: "error".to_string(),
+        error: TypedErrorDetail {
+            kind: "execution".to_string(),
+            message: message.to_string(),
+            operation: None,
+            target: None,
+            errno: None,
+            hint: None,
+            retryable: false,
+        },
+    })
+    .unwrap_or_else(|_| serde_json::json!({"type":"error","error":message}).to_string())
+}
+
