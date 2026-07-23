@@ -14,6 +14,11 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+use ansi_to_tui::IntoText;
+use ratatui::text::Line;
+
+use crate::render::TerminalRenderer;
+
 /// 最大保留字节数（Text 条目的总文本长度上限）。
 /// 调大到 256KB 以支持长会话（100+ 工具调用）。
 const MAX_BUFFER_BYTES: usize = 256 * 1024;
@@ -155,6 +160,16 @@ impl OutputEntry {
 }
 
 /// 线程安全的结构化输出缓冲区。
+fn ansi_to_lines(ansi: &str) -> Vec<Line<'static>> {
+    if ansi.is_empty() {
+        return Vec::new();
+    }
+    match ansi.into_text() {
+        Ok(text) => text.lines,
+        Err(_) => ansi.lines().map(|l| Line::raw(l.to_string())).collect(),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct OutputView {
     inner: Arc<Mutex<OutputBuffer>>,
@@ -175,9 +190,22 @@ pub(crate) struct OutputBuffer {
     /// 渲染后的完整文本缓存。由 recompute_snapshot_tail 增量维护，
     /// snapshot() 直接 clone 此字段，持锁时间 O(n) 纯 memcpy 无业务逻辑。
     cached_snapshot: String,
+    cached_lines: Option<Arc<Vec<Line<'static>>>>,
+    renderer: TerminalRenderer,
 }
 
 impl OutputBuffer {
+    fn invalidate_lines_cache(&mut self) {
+        self.cached_lines = None;
+    }
+
+    fn snapshot_lines(&mut self) -> Arc<Vec<Line<'static>>> {
+        if self.cached_lines.is_none() {
+            let lines = ansi_to_lines(&self.cached_snapshot);
+            self.cached_lines = Some(Arc::new(lines));
+        }
+        Arc::clone(self.cached_lines.as_ref().unwrap())
+    }
 }
 
 impl OutputBuffer {
@@ -425,6 +453,7 @@ impl OutputBuffer {
             self.cached_snapshot.push_str(&rendered);
             self.rendered_lengths.push(len);
         }
+        self.invalidate_lines_cache();
     }
 
     /// 返回 cached_snapshot 的 clone。
@@ -541,6 +570,11 @@ impl OutputView {
             .clone()
     }
 
+    pub(crate) fn snapshot_lines(&self) -> Arc<Vec<Line<'static>>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.snapshot_lines()
+    }
+
     /// 清空所有条目。
     pub(crate) fn clear(&mut self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -549,6 +583,7 @@ impl OutputView {
         guard.truncated = false;
         guard.rendered_lengths.clear();
         guard.cached_snapshot.clear();
+        guard.cached_lines = None;
     }
 
     /// 总写入字节数。
