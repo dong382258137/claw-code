@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::cache_alignment::DynamicValueExtractor;
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::git_context::GitContext;
 use crate::memory::PersistentMemory;
@@ -392,8 +393,24 @@ impl SystemPromptBuilder {
                 static_sections.push(section);
             }
         }
+        // Cache Aligner (Phase 1): scan static sections for dynamic values
+        // (dates, UUIDs, timestamps, hex IDs), replace them with stable
+        // placeholders, and append the original values to the dynamic section.
+        // This is defense-in-depth — static sections are already byte-stable
+        // within a session because build() is called only once, but extracting
+        // dynamic values prevents accidental cache poisoning when new code
+        // embeds time/path/ID values in what should be stable text.
+        let mut extractor = DynamicValueExtractor::new();
+        let cleaned_static: Vec<String> = static_sections
+            .into_iter()
+            .map(|s| extractor.extract_replace(&s).into_owned())
+            .collect();
+        let extracted_summary = extractor.collect_section();
+        if !extracted_summary.is_empty() {
+            dynamic_sections.insert(0, extracted_summary);
+        }
         SystemPromptSplit {
-            static_sections,
+            static_sections: cleaned_static,
             dynamic_sections,
         }
     }

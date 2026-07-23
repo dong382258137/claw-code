@@ -72,6 +72,40 @@ impl PromptCachePaths {
     }
 }
 
+/// Breakdown of cache break events by root cause.
+///
+/// Added in Phase 1 Cache Aligner — breaks caused by `system_prompt_changed`
+/// or `tool_definitions_changed` indicate dynamic values leaking into static
+/// sections and are candidates for alignment improvements.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheBreakReasons {
+    /// Count of breaks caused by model change.
+    pub model_changed: u64,
+    /// Count of breaks caused by system prompt hash change.
+    pub system_prompt_changed: u64,
+    /// Count of breaks caused by tool definition hash change.
+    pub tool_definitions_changed: u64,
+    /// Count of breaks caused by message payload change (normal per-turn).
+    pub message_payload_changed: u64,
+    /// Count of breaks that appear to be provider-side TTL expiry.
+    pub ttl_expiry: u64,
+    /// Count of breaks with no identifiable cause.
+    pub unknown: u64,
+}
+
+impl CacheBreakReasons {
+    /// Total number of classified cache break events.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.model_changed
+            + self.system_prompt_changed
+            + self.tool_definitions_changed
+            + self.message_payload_changed
+            + self.ttl_expiry
+            + self.unknown
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptCacheStats {
     pub tracked_requests: u64,
@@ -88,6 +122,9 @@ pub struct PromptCacheStats {
     pub last_completion_cache_key: Option<String>,
     pub last_break_reason: Option<String>,
     pub last_cache_source: Option<String>,
+    /// Per-reason breakdown of cache break events (Phase 1 Cache Aligner).
+    #[serde(default)]
+    pub break_reasons: CacheBreakReasons,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +264,11 @@ impl PromptCache {
                 inner.stats.expected_invalidations += 1;
             }
             inner.stats.last_break_reason = Some(event.reason.clone());
+            // Phase 1 Cache Aligner: classify the break reason for detailed
+            // monitoring. This lets `claw doctor --cache-stats` show which
+            // cache break causes dominate (e.g. system_prompt_changed may
+            // indicate dynamic values leaking into static sections).
+            classify_break_reason(&event.reason, &mut inner.stats.break_reasons);
         }
 
         inner.previous = Some(current);
@@ -379,6 +421,32 @@ fn detect_cache_break(
         current_cache_read_input_tokens: current.cache_read_input_tokens,
         token_drop,
     })
+}
+
+/// Classifies a cache break reason string and increments the appropriate
+/// counter in [`CacheBreakReasons`].
+///
+/// This provides detailed monitoring for cache alignment tuning.
+fn classify_break_reason(reason: &str, reasons: &mut CacheBreakReasons) {
+    if reason.contains("model changed") {
+        reasons.model_changed += 1;
+    }
+    if reason.contains("system prompt changed") {
+        reasons.system_prompt_changed += 1;
+    }
+    if reason.contains("tool definitions changed") {
+        reasons.tool_definitions_changed += 1;
+    }
+    if reason.contains("message payload changed") {
+        reasons.message_payload_changed += 1;
+    }
+    if reason.contains("TTL") || reason.contains("expir") {
+        reasons.ttl_expiry += 1;
+    }
+    if reason.contains("stable") {
+        // "cache read tokens dropped while prompt fingerprint remained stable"
+        reasons.unknown += 1;
+    }
 }
 
 fn apply_usage_to_stats(

@@ -10,6 +10,7 @@ pub mod bash_validation;
 pub mod bg;
 mod bootstrap;
 pub mod branch_lock;
+pub mod cache_alignment;
 mod compact;
 pub mod decision_log;
 mod config;
