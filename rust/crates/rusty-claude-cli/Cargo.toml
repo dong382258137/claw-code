@@ -36,8 +36,20 @@ tools = { path = "../tools" }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
-[lints]
-workspace = true
+[lints.rust]
+# stderr_guard.rs 需要 Win32 FFI（CreatePipe / SetStdHandle / ReadFile）
+# 来在 TUI 模式下重定向 stderr。这是经过审查的边界防护代码，
+# 安全不变量已在 Drop 中保证。
+unsafe_code = "allow"
+
+[lints.clippy]
+# 从 workspace 继承的 clippy 规则（workspace=true 与手动 lint
+# 覆盖不兼容，故在此显式列出）
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
 
 [dev-dependencies]
 mock-anthropic-service = { path = "../mock-anthropic-service" }

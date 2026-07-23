@@ -18,6 +18,7 @@ pub(crate) mod output_view;
 pub(crate) mod sidebar;
 pub(crate) mod slash_menu;
 pub(crate) mod status_bar;
+pub(crate) mod stderr_guard;
 pub(crate) mod tool_card;
 
 pub(crate) mod wizard;

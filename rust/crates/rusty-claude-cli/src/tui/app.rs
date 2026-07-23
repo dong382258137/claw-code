@@ -72,6 +72,11 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
     let _silence_guard = TuiSilentGuard;
     crate::paste::set_tui_silent(true);
 
+    // TUI 边界防护：将 stderr 重定向到匿名 pipe，防止任何
+    // eprintln! / 第三方库日志 / 子进程 stderr 泄漏污染 alternate
+    // screen。退出时（含 panic）自动恢复原始 stderr 并 flush buffer。
+    let _stderr_guard = crate::tui::stderr_guard::StderrGuard::new()?;
+
     // 注册 TUI 模式下的 AskUserQuestion handler。
     //
     // 修复 BUG：worker 线程内 `run_ask_user_question` 原本用 io::stdout/stdin
@@ -183,7 +188,12 @@ fn has_instruction_files_in_cwd() -> bool {
         Err(_) => return false,
     };
     for ancestor in cwd.ancestors() {
-        for candidate in ["CLAUDE.md", "CLAUDE.local.md", ".claw/CLAUDE.md", ".claw/instructions.md"] {
+        for candidate in [
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+            ".claw/CLAUDE.md",
+            ".claw/instructions.md",
+        ] {
             if ancestor.join(candidate).is_file() {
                 return true;
             }
@@ -404,7 +414,6 @@ fn run_event_loop(
     // Any ScrollDown that brings n back to 0 re-enters follow mode.
     let mut scroll_offset: Option<usize> = None;
 
-
     // `?` toggles a centered keybindings overlay. While visible, most other
     // keybindings are intercepted so the overlay behaves like a modal.
     let mut help_visible: bool = false;
@@ -492,7 +501,11 @@ fn run_event_loop(
             match rx.try_recv() {
                 Ok(turn_result) => {
                     let elapsed = turn_start.map(|s| s.elapsed().as_millis()).unwrap_or(0);
-                    let status = if turn_result.result.is_ok() { "ok" } else { "err" };
+                    let status = if turn_result.result.is_ok() {
+                        "ok"
+                    } else {
+                        "err"
+                    };
                     crate::diag_log(&format!(
                         "[turn-end] result={status} elapsed_ms={elapsed} pending_input={}",
                         pending_input.is_some()
@@ -526,11 +539,9 @@ fn run_event_loop(
                                 if !current.is_empty() && !current.ends_with('\n') {
                                     buf.append("\n\n");
                                 }
-                                buf.push_entry(
-                                    crate::tui::output_view::OutputEntry::text(format!(
-                                        "> {pending}\n\n"
-                                    )),
-                                );
+                                buf.push_entry(crate::tui::output_view::OutputEntry::text(
+                                    format!("> {pending}\n\n"),
+                                ));
                             }
                         }
 
@@ -593,9 +604,7 @@ fn run_event_loop(
                                         }
                                         TurnResult {
                                             cli,
-                                            result: Err(format!(
-                                                "worker thread panicked: {msg}"
-                                            )),
+                                            result: Err(format!("worker thread panicked: {msg}")),
                                         }
                                     }
                                 };
@@ -986,21 +995,18 @@ fn run_event_loop(
                         KeyCode::Down => picker.move_down(),
                         KeyCode::Enter => {
                             // 确认切换：取出选中会话，执行 switch
-                            let picked_id = picker
-                                .selected_session()
-                                .map(|s| s.id.clone());
+                            let picked_id = picker.selected_session().map(|s| s.id.clone());
                             session_picker = None; // 关闭选择器
                             if let Some(target_id) = picked_id {
                                 // 在主线程执行 switch（需要 cli）
                                 if let Some(mut cli) = cli_holder.take() {
                                     let output_handle = output_view.shared_handle();
                                     cli.set_tui_output(Arc::clone(&output_handle));
-                                    let result = cli.handle_repl_command(
-                                        commands::SlashCommand::Session {
+                                    let result =
+                                        cli.handle_repl_command(commands::SlashCommand::Session {
                                             action: Some("switch".to_string()),
                                             target: Some(target_id),
-                                        },
-                                    );
+                                        });
                                     cli.clear_tui_output();
                                     // 刷新 status bar
                                     sync_status_from_cli(&status_state, &cli);
@@ -1022,11 +1028,9 @@ fn run_event_loop(
                             // 取消选择
                             session_picker = None;
                             if let Ok(mut buf) = output_view.shared_handle().lock() {
-                                buf.push_entry(
-                                    crate::tui::output_view::OutputEntry::text(
-                                        "[info] 会话选择已取消。\n\n".to_string(),
-                                    ),
-                                );
+                                buf.push_entry(crate::tui::output_view::OutputEntry::text(
+                                    "[info] 会话选择已取消。\n\n".to_string(),
+                                ));
                             }
                         }
                         _ => {} // 忽略其他键
@@ -1577,8 +1581,7 @@ fn run_event_loop(
                             // 而是打开 SessionPicker overlay，用上下键选中会话后 Enter 确认。
                             // 选中后直接在主线程执行 switch（需要 &mut cli）。
                             let trimmed_expanded = expanded.trim();
-                            if trimmed_expanded == "/session pick"
-                                || trimmed_expanded == "/session"
+                            if trimmed_expanded == "/session pick" || trimmed_expanded == "/session"
                             {
                                 // 尝试加载会话列表
                                 match crate::session_mgr::list_managed_sessions() {
@@ -1588,7 +1591,8 @@ fn run_event_loop(
                                             std::cmp::Reverse(s.modified_epoch_millis)
                                         });
                                         if sessions.is_empty() {
-                                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                            if let Ok(mut buf) = output_view.shared_handle().lock()
+                                            {
                                                 buf.push_entry(
                                                     crate::tui::output_view::OutputEntry::text(
                                                         "[info] 暂无受管会话。\n\n".to_string(),
@@ -2561,11 +2565,7 @@ impl SessionPickerState {
 }
 
 /// 渲染会话选择器 overlay。
-fn render_session_picker(
-    state: &SessionPickerState,
-    f: &mut ratatui::Frame,
-    area: Rect,
-) {
+fn render_session_picker(state: &SessionPickerState, f: &mut ratatui::Frame, area: Rect) {
     use ratatui::widgets::{List, ListItem, ListState};
 
     // 居中显示，占主区域 80% 宽、最多 20 行高
@@ -2587,13 +2587,9 @@ fn render_session_picker(
         .map(|(i, s)| {
             let is_active = s.id == state.active_session_id;
             let marker = if is_active { "*" } else { " " };
-            let modified_age = crate::session_mgr::format_session_modified_age(
-                s.modified_epoch_millis,
-            );
-            let branch = s
-                .branch_name
-                .as_deref()
-                .unwrap_or("-");
+            let modified_age =
+                crate::session_mgr::format_session_modified_age(s.modified_epoch_millis);
+            let branch = s.branch_name.as_deref().unwrap_or("-");
             let line = format!(
                 " {marker} [{i:>3}] {:<24} msgs={:<4} modified={modified_age} branch={branch}",
                 s.id, s.message_count
@@ -2942,5 +2938,4 @@ mod tests {
             "empty markdown should yield empty text, got: {text:?}"
         );
     }
-
 }
