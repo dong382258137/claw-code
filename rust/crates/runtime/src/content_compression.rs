@@ -31,6 +31,7 @@ pub fn format_summary(tool_name: &str, tool_use_id: &str, output: &str) -> Strin
     match content_type {
         ContentType::Json => format_json_summary(tool_name, tool_use_id, output),
         ContentType::Code(lang) => format_code_summary(tool_name, tool_use_id, output, lang),
+        ContentType::Log => format_log_summary(tool_name, tool_use_id, output),
         ContentType::Tabular => format_tabular_summary(tool_name, tool_use_id, output),
         ContentType::Text => format_text_summary(tool_name, tool_use_id, output),
     }
@@ -420,6 +421,217 @@ pub fn format_text_summary(tool_name: &str, tool_use_id: &str, output: &str) -> 
     )
 }
 
+// ============================================================================
+// Log 压缩器(Headroom LogCompressor 对标)
+// ============================================================================
+
+/// 保留的重要日志级别(大小写不敏感匹配,词边界)。
+const LOG_CRITICAL_LEVELS: &[&str] = &["ERROR", "FATAL", "PANIC", "FAILED"];
+const LOG_WARNING_LEVELS: &[&str] = &["WARN", "WARNING"];
+
+/// 每种"重复模式"最多保留的首次出现行数。超过此阈值的相似行折叠为计数摘要。
+const MAX_REPEATED_PATTERN_KEEP: usize = 3;
+/// 保留的尾部行数(结果摘要通常在末尾)。
+const LOG_TAIL_LINES: usize = 5;
+/// 压缩后预览的最大字符数,避免摘要本身过长。
+const LOG_PREVIEW_MAX_CHARS: usize = 800;
+
+/// Log 压缩器:保留 ERROR/WARN + 首次出现模式 + 尾部摘要。
+///
+/// 策略(对标 Headroom LogCompressor,压缩率 80-94%):
+/// 1. 保留所有 ERROR/FATAL/PANIC/FAILED 行(硬约束,不经过折叠)
+/// 2. 保留所有 WARN/WARNING 行
+/// 3. 对其他行按"模式"分组,每组保留前 3 行 + 折叠计数
+/// 4. 保留最后 5 行(构建/测试结果摘要通常在末尾)
+/// 5. 去重合并,保持原始顺序
+///
+/// 输出示例:
+/// ```text
+/// [Bash Log summarized: 5000 chars → [ERROR] connection refused
+/// [WARN] slow query 1.2s
+/// Compiling proc-macro2 v1.0.81
+/// Compiling unicode-ident v1.0.12
+/// Compiling libc v0.2.153
+/// … 47 similar Compiling lines …
+///     Finished release [optimized] target(s) in 42.88s (5 critical, 1 warning, 50 info, 12 patterns)… use recall_full with tool_use_id=call_xxx to retrieve full output…]
+/// ```
+#[must_use]
+pub fn format_log_summary(tool_name: &str, tool_use_id: &str, output: &str) -> String {
+    let original_len = output.chars().count();
+    let lines: Vec<&str> = output.lines().collect();
+    let total_lines = lines.len();
+
+    if total_lines == 0 {
+        return format_text_summary(tool_name, tool_use_id, output);
+    }
+
+    // 1. 分类:critical / warning / other
+    let mut critical_lines: Vec<(usize, &str)> = Vec::new(); // (原行号, 行内容)
+    let mut warning_lines: Vec<(usize, &str)> = Vec::new();
+    let mut other_lines: Vec<(usize, &str)> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let upper = line.to_uppercase();
+        if matches_log_level(&upper, LOG_CRITICAL_LEVELS) {
+            critical_lines.push((idx, line));
+        } else if matches_log_level(&upper, LOG_WARNING_LEVELS) {
+            warning_lines.push((idx, line));
+        } else {
+            other_lines.push((idx, line));
+        }
+    }
+
+    // 2. 对 other_lines 按模式分组 + 折叠
+    let mut folded_others: Vec<(usize, String)> = Vec::new();
+    let mut pattern_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut current_pattern: Option<String> = None;
+    let mut current_count = 0usize;
+    let mut current_first_idx = 0usize;
+
+    for (idx, line) in &other_lines {
+        let pattern = extract_log_pattern(line);
+        if Some(&pattern) == current_pattern.as_ref() {
+            current_count += 1;
+        } else {
+            // flush previous pattern
+            if current_count > 0 {
+                if let Some(ref p) = current_pattern {
+                    pattern_counts.entry(p.clone()).or_insert(0);
+                    *pattern_counts.get_mut(p).unwrap() += current_count;
+                }
+                let keep = current_count.min(MAX_REPEATED_PATTERN_KEEP);
+                for i in 0..keep {
+                    let src_idx = current_first_idx + i;
+                    if src_idx < other_lines.len() {
+                        folded_others.push((other_lines[src_idx].0, other_lines[src_idx].1.to_string()));
+                    }
+                }
+                if current_count > keep {
+                    let omitted = current_count - keep;
+                    let last_kept_idx = folded_others.last().map(|(i, _)| *i).unwrap_or(0);
+                    let p = current_pattern.as_deref().unwrap_or("unknown");
+                    folded_others.push((last_kept_idx, format!("… {omitted} similar {p} lines …")));
+                }
+            }
+            current_pattern = Some(pattern);
+            current_count = 1;
+            current_first_idx = other_lines.iter().position(|(i, _)| i == idx).unwrap_or(0);
+        }
+    }
+    // flush last pattern
+    if current_count > 0 {
+        if let Some(ref p) = current_pattern {
+            *pattern_counts.entry(p.clone()).or_insert(0) += current_count;
+        }
+        let keep = current_count.min(MAX_REPEATED_PATTERN_KEEP);
+        for i in 0..keep {
+            let src_idx = current_first_idx + i;
+            if src_idx < other_lines.len() {
+                folded_others.push((other_lines[src_idx].0, other_lines[src_idx].1.to_string()));
+            }
+        }
+        if current_count > keep {
+            let omitted = current_count - keep;
+            let last_kept_idx = folded_others.last().map(|(i, _)| *i).unwrap_or(0);
+            let p = current_pattern.as_deref().unwrap_or("unknown");
+            folded_others.push((last_kept_idx, format!("… {omitted} similar {p} lines …")));
+        }
+    }
+
+    // 3. 合并所有保留行 + 按原行号排序 + 去重
+    let mut kept: Vec<(usize, String)> = Vec::new();
+    kept.extend(critical_lines.iter().map(|(i, l)| (*i, l.to_string())));
+    kept.extend(warning_lines.iter().map(|(i, l)| (*i, l.to_string())));
+    kept.extend(folded_others.iter().cloned());
+
+    // 4. 追加尾部行(结果摘要)
+    let tail_start = total_lines.saturating_sub(LOG_TAIL_LINES);
+    for (idx, line) in lines.iter().enumerate() {
+        if idx >= tail_start {
+            kept.push((idx, line.to_string()));
+        }
+    }
+
+    // 按原行号排序 + 去重(折叠消息不参与去重,因为它们与最后保留行共享索引)
+    kept.sort_by_key(|(i, _)| *i);
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    kept.retain(|(idx, s)| {
+        let is_fold_message = s.contains(" similar ");
+        is_fold_message || seen.insert(*idx)
+    });
+
+    // 5. 组装预览,截断到 LOG_PREVIEW_MAX_CHARS
+    let preview_lines: Vec<String> = kept.iter().map(|(_, s)| s.clone()).collect();
+    let mut preview = preview_lines.join("\n");
+    if preview.chars().count() > LOG_PREVIEW_MAX_CHARS {
+        let truncated: String = preview.chars().take(LOG_PREVIEW_MAX_CHARS).collect();
+        preview = format!("{truncated}…");
+    }
+
+    // 6. 统计信息
+    let critical_count = critical_lines.len();
+    let warning_count = warning_lines.len();
+    let info_count = other_lines.len();
+    let pattern_count = pattern_counts.len();
+    let stats = format!(
+        "({critical_count} critical, {warning_count} warning, {info_count} info, {pattern_count} patterns)"
+    );
+
+    format!(
+        "[{tool_name} Log summarized: {original_len} chars → {preview} {stats}… use recall_full with tool_use_id={tool_use_id} to retrieve full output…]"
+    )
+}
+
+/// 检查日志行是否包含指定的级别关键字(词边界匹配)。
+fn matches_log_level(upper_line: &str, levels: &[&str]) -> bool {
+    levels.iter().any(|level| {
+        if let Some(idx) = upper_line.find(level) {
+            let before_ok = idx == 0
+                || !upper_line.as_bytes().get(idx - 1).is_some_and(|c| c.is_ascii_alphabetic());
+            let after_idx = idx + level.len();
+            let after_ok = after_idx >= upper_line.len()
+                || !upper_line.as_bytes().get(after_idx).is_some_and(|c| c.is_ascii_alphabetic());
+            before_ok && after_ok
+        } else {
+            false
+        }
+    })
+}
+
+/// 提取日志行的"模式签名"用于重复折叠。
+///
+/// 规则:取行首第一个词作为模式(如 "Compiling"、"Finished"、"test"、"[2026-07-23")。
+/// 同模式的连续行折叠为 "N similar X lines"。
+fn extract_log_pattern(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return "blank".to_string();
+    }
+    // 取第一个 token(到空格或 `[`/`]` 边界)
+    let first_token: String = trimmed
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    // 如果第一个 token 是时间戳类(以 `[` 开头),用第二个 token 作模式
+    if first_token.starts_with('[') {
+        let after_bracket = trimmed
+            .find(']')
+            .map(|i| trimmed[i + 1..].trim_start())
+            .unwrap_or(trimmed);
+        let second_token: String = after_bracket
+            .chars()
+            .take_while(|c| !c.is_whitespace())
+            .collect();
+        if second_token.is_empty() {
+            first_token
+        } else {
+            second_token
+        }
+    } else {
+        first_token
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +768,62 @@ mod tests {
         let input = "only one line\n";
         let result = format_text_summary("Read", "call_c", input);
         assert!(!result.contains("lines total"));
+    }
+
+    // ---- Log 压缩器测试 ----
+
+    #[test]
+    fn log_summary_preserves_error_lines() {
+        let input = "INFO starting\nINFO processing\nINFO processing\nINFO processing\nINFO processing\nERROR something broke\nINFO cleanup\n";
+        let result = format_log_summary("Bash", "call_log1", input);
+        assert!(result.contains("Log summarized"));
+        assert!(result.contains("ERROR something broke"), "ERROR 行必须保留");
+    }
+
+    #[test]
+    fn log_summary_preserves_warn_lines() {
+        let input = "INFO a\nINFO b\nINFO c\nINFO d\nINFO e\nWARN slow query\nINFO f\n";
+        let result = format_log_summary("Bash", "call_log2", input);
+        assert!(result.contains("WARN slow query"), "WARN 行必须保留");
+    }
+
+    #[test]
+    fn log_summary_folds_repeated_patterns() {
+        let mut input = String::new();
+        for i in 0..20 {
+            input.push_str(&format!("Compiling crate_{i} v0.1.0\n"));
+        }
+        input.push_str("    Finished release [optimized] target(s)\n");
+        let result = format_log_summary("Bash", "call_log3", &input);
+        assert!(result.contains("similar Compiling"), "重复 Compiling 行应被折叠");
+        assert!(result.contains("Finished"), "结果摘要应保留");
+    }
+
+    #[test]
+    fn log_summary_preserves_tail_lines() {
+        let mut input = String::new();
+        for i in 0..30 {
+            input.push_str(&format!("INFO line {i}\n"));
+        }
+        input.push_str("test result: ok. 30 passed;\n");
+        let result = format_log_summary("Bash", "call_log4", &input);
+        assert!(result.contains("test result"), "尾部结果行应保留");
+    }
+
+    #[test]
+    fn log_summary_includes_stats() {
+        let input = "INFO a\nINFO b\nINFO c\nINFO d\nERROR e\nWARN f\n";
+        let result = format_log_summary("Bash", "call_log5", input);
+        assert!(result.contains("1 critical"), "应统计 critical 数");
+        assert!(result.contains("1 warning"), "应统计 warning 数");
+        assert!(result.contains("patterns"), "应统计 pattern 数");
+    }
+
+    #[test]
+    fn log_summary_routes_from_format_summary() {
+        let input = "   Compiling proc-macro2 v1.0.81\n   Compiling libc v0.2.153\n    Finished dev [unoptimized] target(s)\n     Running `target/debug/test`\nerror[E0308]: mismatched types\n";
+        let result = format_summary("Bash", "call_log6", input);
+        assert!(result.contains("Log summarized"), "构建日志应路由到 Log 压缩器");
     }
 
     // ---- 路由入口测试 ----

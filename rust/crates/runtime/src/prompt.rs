@@ -398,6 +398,9 @@ impl SystemPromptBuilder {
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
+        // 破局提示词段：元认知触发器，紧随 # Executing actions with care 之后，
+        // 与 # Doing tasks 形成"如何做"→"何时停"的对照。
+        sections.push(get_framework_switching_section());
         sections.push(get_memory_verification_section());
         sections.push(get_context_recovery_section());
         sections.push(get_decision_log_section());
@@ -428,7 +431,15 @@ impl SystemPromptBuilder {
         if let Some(project_context) = &self.project_context {
             if !project_context.instruction_files.is_empty() {
                 sections.push(render_instruction_files(&project_context.instruction_files));
+            } else {
+                // 分层兜底：无 CLAUDE.md 时注入内存态默认指令段。
+                // 不落盘，避免目录污染和误检测导致的错误指令持久化。
+                // 用户可通过 `claw init` 生成物理 CLAUDE.md 覆盖此默认段。
+                sections.push(get_default_project_instructions());
             }
+        } else {
+            // 无 project_context（极端情况，如测试环境）同样注入默认指令。
+            sections.push(get_default_project_instructions());
         }
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         // 项目 git 快照留在 dynamic：语义上属于"项目快照"（git status/diff/
@@ -939,6 +950,64 @@ fn get_actions_section() -> String {
         "Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user or durable workspace instructions.".to_string(),
     ]
     .join("\n")
+}
+
+/// 破局提示词段（Framework Switching）。
+///
+/// 设计动机：AI 在面对问题时存在强烈的"路径依赖"——一旦识别出一个
+/// 可行解（补丁），就会沿这条路径继续优化，而不会主动跳出。这是上下文
+/// 惯性 + 训练偏好（倾向给出"最安全最小"修改）共同作用的结果。
+///
+/// 该段作为"元认知触发器"，在以下场景强制框架切换：
+/// 1. 补丁思维：连续多次小修补未解决根因
+/// 2. 过度工程：为简单问题设计复杂抽象
+/// 3. 症状循环：在症状层反复修复，根因未触及
+/// 4. 重复造轮子：忽略已有基础设施
+///
+/// 放在 boundary 之前（静态段），与 `# Doing tasks` 形成"如何做"→
+/// "何时停"的对照，且 session 内字节稳定，不影响 prompt cache。
+fn get_framework_switching_section() -> String {
+    "## Framework Switching (元认知触发)\n\
+     When you notice any of the following patterns, STOP and re-examine the problem definition before continuing:\n\
+     - **Patch thinking**: You have applied 2+ small fixes to the same area without resolving the root cause. Re-derive the solution from first principles instead of adding another patch.\n\
+     - **Over-engineering**: You are adding abstractions, compatibility shims, or config flags for a simple change. Prefer the minimum change that solves the actual problem.\n\
+     - **Symptom loop**: The same error recurs after a fix. The fix addressed a symptom, not the cause. Re-analyze the root cause before the next attempt.\n\
+     - **Wheel reinvention**: You are building something that may already exist in the codebase. Search for existing utilities/patterns first.\n\
+     \n\
+     Trigger protocol:\n\
+     1. State the current problem definition explicitly.\n\
+     2. State the current approach and why it might be wrong.\n\
+     3. Re-derive from first principles: what is the essential constraint? What does the architecture require?\n\
+     4. Only after re-deriving, decide whether to continue the current approach or switch.\n\
+     \n\
+     This is not about being conservative — it is about catching architectural bugs that patch-level thinking cannot reach."
+        .to_string()
+}
+
+/// 默认项目指令段（内存态兜底）。
+///
+/// 当项目根目录及祖先链均无 CLAUDE.md / CLAUDE.local.md /
+/// .claw/CLAUDE.md / .claw/instructions.md 时，注入此段作为基础工作约定。
+///
+/// 设计原则：
+/// - 内存态，不落盘，避免目录污染和误检测导致的错误指令持久化
+/// - 内容仅包含通用、跨语言的工作约定，不包含 stack 特定指令
+/// - 用户可通过 `claw init` 生成物理 CLAUDE.md 覆盖此默认段
+/// - session 内字节稳定（硬编码），不影响 prompt cache
+fn get_default_project_instructions() -> String {
+    "# Claude instructions (built-in defaults)\n\
+     No project-level `CLAUDE.md` was found. The following built-in defaults apply. Run `/init` to generate a project-specific template.\n\
+     \n\
+     ## Verification\n\
+     - Before claiming a task is complete, run the project's verification commands (fmt / clippy / tests / build).\n\
+     - If verification was not run or failed, state so explicitly.\n\
+     \n\
+     ## Working agreement\n\
+     - Prefer small, reviewable changes tightly scoped to the request.\n\
+     - Do not add speculative abstractions, compatibility shims, or unrelated cleanup.\n\
+     - Do not create files unless they are required to complete the task.\n\
+     - If an approach fails, diagnose the failure before switching tactics (see Framework Switching)."
+        .to_string()
 }
 
 fn get_memory_verification_section() -> String {

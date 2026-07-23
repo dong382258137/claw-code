@@ -370,6 +370,17 @@ impl ApiClient for AnthropicRuntimeClient {
             split.dynamic_sections.push(system_text);
         }
 
+        // Effort routing (Headroom Output Token Reduction 对标):
+        // 当当前 turn 是工具结果续写(is_post_tool)且用户未显式要求 high effort 时,
+        // 自动降低 reasoning_effort 到 "low"。模型读完工具结果后的续写通常不需要
+        // 深度推理,降低 effort 可节省 output token 和延迟。
+        // 新问题或用户显式设置 high 时保持全力。
+        let effective_effort = if is_post_tool && self.reasoning_effort.as_deref() != Some("high") {
+            Some("low".to_string())
+        } else {
+            self.reasoning_effort.clone()
+        };
+
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
@@ -382,7 +393,7 @@ impl ApiClient for AnthropicRuntimeClient {
             }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
-            reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_effort: effective_effort,
             ..Default::default()
         };
 

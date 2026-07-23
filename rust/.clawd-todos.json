@@ -1,1 +1,32 @@
-[]
+[
+  {
+    "content": "Group A: cache_alignment, TUI panic, streaming, bash validation",
+    "activeForm": "Completed Group A",
+    "status": "completed"
+  },
+  {
+    "content": "Group B: Planner + CLI flags + JSON envelope + WorkerCreate path",
+    "activeForm": "Completed Group B",
+    "status": "completed"
+  },
+  {
+    "content": "G5.12: LSP formatting action → ToolSpec registration",
+    "activeForm": "Fixing G5.12 LSP formatting ToolSpec",
+    "status": "in_progress"
+  },
+  {
+    "content": "Group D1: Multi-agent/DAG (5 items)",
+    "activeForm": "Building D1 multi-agent/DAG",
+    "status": "pending"
+  },
+  {
+    "content": "Group D2: Hooks subsystem (7 items)",
+    "activeForm": "Building D2 hooks",
+    "status": "pending"
+  },
+  {
+    "content": "Group E: Global cleanup (6 items)",
+    "activeForm": "Running global cleanup",
+    "status": "pending"
+  }
+]

@@ -16,7 +16,10 @@ pub enum ContentType {
     Code(CodeLanguage),
     /// 多条目结构化输出(如 Grep 结果、`ls -la` 表格)。保留表头 + 代表性行。
     Tabular,
-    /// 普通文本/日志/混合。走原"前 3 行 + 240 chars"逻辑。
+    /// 日志输出(构建日志/运行日志)。保留 ERROR/WARN + 首次出现模式 + 尾部摘要。
+    /// 识别:含日志级别关键字(ERROR/WARN/INFO/DEBUG/FATAL/PANIC)且 ≥ 5 行。
+    Log,
+    /// 普通文本/混合。走原"前 3 行 + 240 chars"逻辑。
     Text,
 }
 
@@ -37,8 +40,9 @@ pub enum CodeLanguage {
 /// 判断顺序(首个命中胜出):
 /// 1. JSON — 以 `{` 或 `[` 开头且整体可解析为 JSON
 /// 2. Code — 含已知编程语言关键字/模式
-/// 3. Tabular — ≥5 行且每行模式相同(分隔符对齐)
-/// 4. Text — 兜底
+/// 3. Log — 含日志级别关键字且 ≥ 5 行(优先于 Tabular,避免日志被误判为表格)
+/// 4. Tabular — ≥5 行且每行模式相同(分隔符对齐)
+/// 5. Text — 兜底
 #[must_use]
 pub fn classify(content: &str) -> ContentType {
     let trimmed = content.trim_start();
@@ -50,6 +54,9 @@ pub fn classify(content: &str) -> ContentType {
     }
     if looks_like_code(content) {
         return ContentType::Code(detect_language(content));
+    }
+    if looks_like_log(content) {
+        return ContentType::Log;
     }
     if is_tabular(content) {
         return ContentType::Tabular;
@@ -152,6 +159,59 @@ fn detect_language(content: &str) -> CodeLanguage {
     }
     CodeLanguage::Unknown
 }
+
+/// 判断内容是否像日志输出(构建日志/运行日志/服务日志)。
+///
+/// 启发式(两个条件都满足):
+/// 1. ≥ 5 行非空内容(短输出不按日志处理)
+/// 2. ≥ 30% 的行含日志级别关键字之一:
+///    ERROR/WARN(ING)/INFO/DEBUG/TRACE/FATAL/PANIC
+///    (大小写不敏感,需词边界,避免误判 "information" 等)
+///
+/// 典型命中场景:
+/// - `cargo build` 输出(Compiling/Finished/warning/error)
+/// - 服务日志 `[2026-07-23 10:00:00] INFO ...`
+/// - 测试输出 `running 10 tests ... test result: ok`
+fn looks_like_log(content: &str) -> bool {
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() < 5 {
+        return false;
+    }
+    // 日志级别关键字(大写匹配,词边界)
+    // 覆盖:cargo 输出(error/warning/Compiling/Finished)、
+    //       服务日志(INFO/WARN/ERROR/DEBUG/TRACE/FATAL/PANIC)、
+    //       测试输出(test/PASSED/FAILED/ok/FAILED)
+    let level_markers: &[&str] = &[
+        "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE", "FATAL", "PANIC",
+        "error", "warning", "Compiling", "Finished", "running", "test result",
+        "PASSED", "FAILED",
+    ];
+    let mut matched = 0usize;
+    for line in &lines {
+        let upper = line.to_uppercase();
+        // 词边界检查:级别关键字应作为独立词出现
+        let has_level = level_markers.iter().any(|m| {
+            let m_upper = m.to_uppercase();
+            // 简单词边界:前面是非字母或行首,后面是非字母或行尾
+            if let Some(idx) = upper.find(&m_upper) {
+                let before_ok = idx == 0
+                    || !upper.as_bytes().get(idx - 1).is_some_and(|c| c.is_ascii_alphabetic());
+                let after_idx = idx + m_upper.len();
+                let after_ok = after_idx >= upper.len()
+                    || !upper.as_bytes().get(after_idx).is_some_and(|c| c.is_ascii_alphabetic());
+                before_ok && after_ok
+            } else {
+                false
+            }
+        });
+        if has_level {
+            matched += 1;
+        }
+    }
+    let ratio = matched as f64 / lines.len() as f64;
+    ratio >= 0.3
+}
+
 
 /// 判断内容是否为表格状(多条目结构化输出)。
 ///
@@ -298,8 +358,34 @@ mod tests {
     }
 
     #[test]
-    fn classifies_log_lines_as_text() {
+    fn classifies_short_log_as_text() {
+        // 只有 3 行,不满足 Log 的 ≥5 行阈值,降级为 Text
         let content = "[2026-07-23 10:00:00] INFO Starting server\n[2026-07-23 10:00:01] INFO Listening on :8080\n[2026-07-23 10:00:02] WARN Slow query\n";
+        assert_eq!(classify(content), ContentType::Text);
+    }
+
+    #[test]
+    fn classifies_build_log_as_log() {
+        let content = "   Compiling proc-macro2 v1.0.81\n   Compiling unicode-ident v1.0.12\n   Compiling libc v0.2.153\n    Finished release [optimized] target(s) in 42.88s\n     Running `target/release/claw`\n";
+        assert_eq!(classify(content), ContentType::Log);
+    }
+
+    #[test]
+    fn classifies_service_log_as_log() {
+        let content = "[2026-07-23 10:00:00] INFO Server starting on port 8080\n[2026-07-23 10:00:01] INFO Database connected\n[2026-07-23 10:00:02] DEBUG Cache warmed: 1024 entries\n[2026-07-23 10:00:03] WARN Slow query: 1.2s\n[2026-07-23 10:00:04] ERROR Failed to parse request body\n[2026-07-23 10:00:05] INFO Retry attempt 1/3\n";
+        assert_eq!(classify(content), ContentType::Log);
+    }
+
+    #[test]
+    fn classifies_test_output_as_log() {
+        let content = "running 10 tests\ntest tests::test_1 ... ok\ntest tests::test_2 ... ok\ntest tests::test_3 ... FAILED\ntest result: FAILED. 9 passed; 1 failed;\n";
+        assert_eq!(classify(content), ContentType::Log);
+    }
+
+    #[test]
+    fn does_not_classify_natural_text_with_info_as_log() {
+        // "information" 不应匹配 INFO(词边界检查)
+        let content = "This is some general information about the project.\nIt has multiple lines of text.\nBut no actual log levels here.\nJust regular documentation.\nAnd some more lines too.\n";
         assert_eq!(classify(content), ContentType::Text);
     }
 

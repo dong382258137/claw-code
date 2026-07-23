@@ -1136,6 +1136,13 @@ where
                         // 让最易变的内容放最后,最大化前缀缓存命中率。
                         system_split.dynamic_sections.push(remediation.clone());
                     }
+                    // Verbosity steering(Headroom Output Token Reduction 对标):
+                    // 在 dynamic 区末尾追加简洁指令,引导模型减少 output token。
+                    // 放 dynamic 区不影响 static 缓存前缀;内容常量,不破坏隐式前缀缓存。
+                    // 不复述上下文中已有的代码/文件内容,直接给出结论和行动。
+                    system_split.dynamic_sections.push(
+                        "Be concise. Do not restate context, repeat code already shown, or preface actions with restatements. Lead with the answer or the change.".to_string()
+                    );
                 }
                 ApiRequest {
                     system_prompt: system_split,
