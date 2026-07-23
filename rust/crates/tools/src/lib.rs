@@ -1518,11 +1518,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "LSP",
-            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
+            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics, definition, hover, format, completion).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover"] },
+                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover", "format", "completion"] },
                     "path": { "type": "string" },
                     "line": { "type": "integer", "minimum": 0 },
                     "character": { "type": "integer", "minimum": 0 },
