@@ -28,7 +28,7 @@ use crate::recovery_recipes::RecoveryResult;
 // 不污染 system_prompt + tools_schema 的"绝对稳定区"。详见
 // docs/harness-engineering-optimization-plan.md Step 2.1 与 §5.2。
 use crate::planner::{
-    assess_complexity, persist_plan_artifact, ComplexityAssessment, PlanArtifact,
+    assess_complexity, decompose_task, persist_plan_artifact, ComplexityAssessment, PlanArtifact,
     PreCompletionChecklistMiddleware, ReviewResult,
 };
 // Harness M(多 agent)层接入:MultiAgentCoordinator — Step 3.2-c。
@@ -994,7 +994,10 @@ where
         if self.plan_mode_enabled && self.active_plan.is_none() {
             match assess_complexity(&user_input) {
                 ComplexityAssessment::Complex { reason: _ } => {
-                    let mut artifact = PlanArtifact::new(user_input.clone(), Vec::new());
+                    // G10.7 fix: heuristic task decomposition fills steps
+                    // (full LLM decomposition deferred to Group D1)
+                    let steps = decompose_task(&user_input);
+                    let mut artifact = PlanArtifact::new(user_input.clone(), steps);
                     // 尝试持久化(workspace_root 为 None 时跳过,不阻断主流程)。
                     if let Some(root) = &self.workspace_root {
                         if let Err(err) = persist_plan_artifact(&artifact, root) {

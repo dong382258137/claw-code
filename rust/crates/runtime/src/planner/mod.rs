@@ -110,6 +110,106 @@ pub fn load_plan_artifact(path: &Path) -> Result<PlanArtifact, Box<dyn std::erro
     Ok(artifact)
 }
 
+/// Heuristic task decomposition — converts a complex user request into
+/// Heuristic task decomposition — converts a complex user request into
+/// concrete `PlanStep`s without calling an LLM sub-agent.
+///
+/// Returns at least 1 step even when no patterns match.
+#[must_use]
+pub fn decompose_task(user_input: &str) -> Vec<PlanStep> {
+    let mut steps: Vec<PlanStep> = Vec::new();
+    let mut step_id = 0u32;
+
+    // 1. Check for multi-file operations — one step per detected file path.
+    for file_path in extract_file_paths(user_input) {
+        step_id += 1;
+        steps.push(PlanStep::new(
+            format!("step_{step_id}"),
+            format!("Modify `{file_path}`"),
+            format!("Verify {file_path} compiles and passes tests"),
+        ));
+    }
+
+    // 2. Check for sequential markers.
+    let sequential_markers = ["first", "then", "after that", "next", "finally"];
+    let input_lower = user_input.to_lowercase();
+    let has_markers = sequential_markers
+        .iter()
+        .any(|m| input_lower.contains(m));
+
+    // 3. Sentence-level decomposition for long or sequential input.
+    if steps.is_empty() && (has_markers || user_input.len() > 300) {
+        for sentence in split_into_sentences(user_input) {
+            let trimmed = sentence.trim();
+            if trimmed.is_empty() || trimmed.len() < 10 {
+                continue;
+            }
+            step_id += 1;
+            let short = if trimmed.len() > 80 {
+                format!("{}…", &trimmed[..80])
+            } else {
+                trimmed.to_string()
+            };
+            steps.push(PlanStep::new(
+                format!("step_{step_id}"),
+                short,
+                "Verify the step completed correctly".to_string(),
+            ));
+        }
+        steps.truncate(10);
+    }
+
+    // 4. Fallback: at minimum one step.
+    if steps.is_empty() {
+        step_id += 1;
+        let summary = if user_input.len() > 120 {
+            format!("{}…", &user_input[..120])
+        } else {
+            user_input.to_string()
+        };
+        steps.push(PlanStep::new(
+            format!("step_{step_id}"),
+            format!("Execute: {summary}"),
+            "Task completed and verified".to_string(),
+        ));
+    }
+
+    steps
+}
+
+fn extract_file_paths(text: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| {
+            c == '`' || c == '"' || c == '\'' || c == ',' || c == '.'
+        });
+        if is_likely_path(clean) && seen.insert(clean.to_string()) {
+            paths.push(clean.to_string());
+        }
+    }
+    paths
+}
+
+fn is_likely_path(s: &str) -> bool {
+    let has_sep = s.contains('/') || s.contains('\\');
+    let has_ext = s.ends_with(".rs")
+        || s.ends_with(".toml")
+        || s.ends_with(".md")
+        || s.ends_with(".json")
+        || s.ends_with(".ts")
+        || s.ends_with(".py")
+        || s.ends_with(".js");
+    has_sep && has_ext && s.len() >= 5 && s.len() <= 120
+}
+
+fn split_into_sentences(text: &str) -> Vec<String> {
+    text.split_inclusive(&['.', '!', '?', '\n'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
