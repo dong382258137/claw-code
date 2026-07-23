@@ -250,7 +250,9 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     }
 
     lines.push("## Working agreement".to_string());
-    lines.push("- Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.".to_string());
+    // 注意：通用工程原则（小改动、不创建不必要文件等）已由系统内置提示词的
+    // `# Doing tasks` 段覆盖，此处只保留项目特定约定，避免重复。
+    lines.push("- Keep generated bootstrap files aligned with actual repo workflows.".to_string());
     lines.push("- Keep shared defaults in `.claw.json`; reserve `.claw/settings.local.json` for machine-local overrides.".to_string());
     lines.push("- Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.".to_string());
     lines.push(String::new());

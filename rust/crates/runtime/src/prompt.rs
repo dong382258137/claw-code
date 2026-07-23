@@ -958,23 +958,33 @@ fn get_actions_section() -> String {
 /// 可行解（补丁），就会沿这条路径继续优化，而不会主动跳出。这是上下文
 /// 惯性 + 训练偏好（倾向给出"最安全最小"修改）共同作用的结果。
 ///
-/// 该段作为"元认知触发器"，在以下场景强制框架切换：
-/// 1. 补丁思维：连续多次小修补未解决根因
-/// 2. 过度工程：为简单问题设计复杂抽象
-/// 3. 症状循环：在症状层反复修复，根因未触及
-/// 4. 重复造轮子：忽略已有基础设施
+/// 该段作为"元认知触发器"，分两层防护：
+/// - 事前预防（Pre-commitment protocol）：承诺方案前生成多假设，避免过早承诺
+/// - 事后补救（Pattern triggers）：识别路径依赖模式后强制框架切换
+///
+/// 吸收自 Thinking-Claude v5.1 的两个高价值机制：
+/// - P1 多假设生成：避免过早承诺单一解释/方案
+/// - P2 思考中纠错：意识到错误方向时显式承认并重新推导
 ///
 /// 放在 boundary 之前（静态段），与 `# Doing tasks` 形成"如何做"→
 /// "何时停"的对照，且 session 内字节稳定，不影响 prompt cache。
 fn get_framework_switching_section() -> String {
     "## Framework Switching (元认知触发)\n\
+     \n\
+     Pre-commitment protocol (before settling on any non-trivial approach):\n\
+     - Generate 2+ candidate interpretations or solution approaches before committing.\n\
+     - Briefly state the trade-offs of each candidate (cost, risk, reversibility).\n\
+     - Only commit after explicit comparison — never commit to the first feasible option just because it is feasible.\n\
+     - This prevents the root cause of patch thinking: premature commitment to the first identified solution.\n\
+     \n\
      When you notice any of the following patterns, STOP and re-examine the problem definition before continuing:\n\
      - **Patch thinking**: You have applied 2+ small fixes to the same area without resolving the root cause. Re-derive the solution from first principles instead of adding another patch.\n\
      - **Over-engineering**: You are adding abstractions, compatibility shims, or config flags for a simple change. Prefer the minimum change that solves the actual problem.\n\
      - **Symptom loop**: The same error recurs after a fix. The fix addressed a symptom, not the cause. Re-analyze the root cause before the next attempt.\n\
      - **Wheel reinvention**: You are building something that may already exist in the codebase. Search for existing utilities/patterns first.\n\
+     - **Stubborn direction**: When you realize mid-thinking that your current approach may be wrong, explicitly acknowledge it and re-derive. Do not defend a flawed direction to save face — admitting a wrong turn mid-thinking is a sign of rigor, not weakness.\n\
      \n\
-     Trigger protocol:\n\
+     Trigger protocol (when any pattern above is detected):\n\
      1. State the current problem definition explicitly.\n\
      2. State the current approach and why it might be wrong.\n\
      3. Re-derive from first principles: what is the essential constraint? What does the architecture require?\n\
@@ -991,22 +1001,19 @@ fn get_framework_switching_section() -> String {
 ///
 /// 设计原则：
 /// - 内存态，不落盘，避免目录污染和误检测导致的错误指令持久化
-/// - 内容仅包含通用、跨语言的工作约定，不包含 stack 特定指令
+/// - 只包含 CLAUDE.md 模板会覆盖的项目特定约定，不重复 Doing tasks 段的通用工程原则
 /// - 用户可通过 `claw init` 生成物理 CLAUDE.md 覆盖此默认段
 /// - session 内字节稳定（硬编码），不影响 prompt cache
 fn get_default_project_instructions() -> String {
     "# Claude instructions (built-in defaults)\n\
-     No project-level `CLAUDE.md` was found. The following built-in defaults apply. Run `/init` to generate a project-specific template.\n\
+     No project-level `CLAUDE.md` was found. The following built-in defaults apply. Run `claw init` (or the `init` slash command in TUI) to generate a project-specific template.\n\
      \n\
      ## Verification\n\
      - Before claiming a task is complete, run the project's verification commands (fmt / clippy / tests / build).\n\
      - If verification was not run or failed, state so explicitly.\n\
      \n\
      ## Working agreement\n\
-     - Prefer small, reviewable changes tightly scoped to the request.\n\
-     - Do not add speculative abstractions, compatibility shims, or unrelated cleanup.\n\
-     - Do not create files unless they are required to complete the task.\n\
-     - If an approach fails, diagnose the failure before switching tactics (see Framework Switching)."
+     - Keep shared defaults in `.claw.json`; reserve `.claw/settings.local.json` for machine-local overrides."
         .to_string()
 }
 

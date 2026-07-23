@@ -166,6 +166,31 @@ fn fast_hash(s: &str) -> u64 {
     std::hash::Hash::hash(s, &mut hasher);
     std::hash::Hasher::finish(&hasher)
 }
+
+/// 检测当前工作目录及祖先链是否存在 CLAUDE.md 系列指令文件。
+///
+/// 与 `prompt.rs::discover_instruction_files` 的发现逻辑保持一致，
+/// 但只做存在性检查，不读取文件内容，用于 TUI 启动时的一次性提示。
+///
+/// 候选文件（按优先级）：
+/// 1. CLAUDE.md
+/// 2. CLAUDE.local.md
+/// 3. .claw/CLAUDE.md
+/// 4. .claw/instructions.md
+fn has_instruction_files_in_cwd() -> bool {
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    for ancestor in cwd.ancestors() {
+        for candidate in ["CLAUDE.md", "CLAUDE.local.md", ".claw/CLAUDE.md", ".claw/instructions.md"] {
+            if ancestor.join(candidate).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
 fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Line<'static>> {
     if area_width == 0 {
         return vec![line.clone()];
@@ -325,6 +350,19 @@ fn run_event_loop(
     let status_state = StatusBarState::shared();
     // Initialize status fields from cli state
     initialize_status(&status_state, &cli);
+
+    // 分层兜底提示：检测项目根目录及祖先链是否有 CLAUDE.md 系列文件。
+    // 如果没有，向 OutputView 推送一次性汉化提示，引导用户运行 /init。
+    //
+    // 注意：这只是 UI 层提示，系统提示词层已有 `get_default_project_instructions()`
+    // 内存态兜底，即使不运行 /init，AI 也能获得基础工作约定。
+    if !has_instruction_files_in_cwd() {
+        if let Ok(mut buf) = output_view.shared_handle().lock() {
+            buf.push_entry(crate::tui::output_view::OutputEntry::text(
+                "ℹ️ 未找到 CLAUDE.md。运行 `/init` 可生成项目专属模板，或继续使用内置默认指令。\n\n".to_string(),
+            ));
+        }
+    }
 
     let mut turn_start: Option<Instant> = None;
     // cli_holder: Some when idle, None when a turn is running in a thread
