@@ -159,7 +159,7 @@ impl OutputEntry {
 pub(crate) struct OutputView {
     inner: Arc<Mutex<OutputBuffer>>,
 }
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct OutputBuffer {
     /// 结构化条目列表（按追加顺序）。
     entries: Vec<OutputEntry>,
@@ -177,17 +177,7 @@ pub(crate) struct OutputBuffer {
     cached_snapshot: String,
 }
 
-impl Default for OutputBuffer {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            text_total_bytes: 0,
-            total_written: 0,
-            truncated: false,
-            rendered_lengths: Vec::new(),
-            cached_snapshot: String::new(),
-        }
-    }
+impl OutputBuffer {
 }
 
 impl OutputBuffer {

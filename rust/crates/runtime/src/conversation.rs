@@ -2496,7 +2496,7 @@ where
             return Ok("query_project_graph not available.".to_string());
         };
         t.query_project_graph()
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
 
     fn execute_find_boundary_crossings(
@@ -2510,7 +2510,7 @@ where
             .map_err(|e| format!("invalid JSON: {e}"))?;
         let q = p.get("query").and_then(|v| v.as_str());
         t.find_boundary_crossings(q)
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
 
     fn execute_get_symbol_info(
@@ -2524,7 +2524,7 @@ where
             .map_err(|e| format!("invalid JSON: {e}"))?;
         let s = p.get("symbol").and_then(|v| v.as_str()).ok_or("missing symbol")?;
         t.get_symbol_info(s)
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
 
     fn execute_rollback_transaction(
@@ -2534,7 +2534,7 @@ where
             return Ok("rollback_transaction not available.".to_string());
         };
         tx.rollback()
-            .map(|s| s)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
     }
 
@@ -2575,7 +2575,7 @@ where
             );
         };
         crate::domain_algorithm::refactor_algorithm_topo(t, target_symbol, new_name, reason)
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
 
     /// Phase 4-B:执行 `benchmark_compare` 工具调用。
@@ -2612,7 +2612,7 @@ where
             sample_size,
             warmup_runs,
         )
-        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
 
 

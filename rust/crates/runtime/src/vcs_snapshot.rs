@@ -196,7 +196,7 @@ impl RefactorTransaction {
     ///    a. `git checkout -- .` 恢复所有 tracked 文件到 HEAD（丢弃 turn 内修改）
     ///    b. `git stash apply <hash>` 恢复用户原始修改
     ///    c. 如果 apply 冲突：**不 drop stash**，保留 stash 让 LLM 决策，
-    ///       报告冲突文件列表
+    ///    报告冲突文件列表
     /// 2. 如果没有 stash_ref（pre_turn 时是 clean tree）：
     ///    a. `git checkout -- <modified_files>` 恢复 turn 内修改的文件
     ///    b. `git clean -fd <modified_files>` 清理 turn 内创建的新文件（带路径限制）

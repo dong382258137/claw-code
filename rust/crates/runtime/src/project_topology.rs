@@ -50,7 +50,7 @@ pub enum TopologyState {
     Building {
         started_at: Instant,
     },
-    Ready(TopologyData),
+    Ready(Box<TopologyData>),
     Failed(String),
 }
 
@@ -204,7 +204,7 @@ impl ProjectTopology {
             let mut guard = state_clone.lock().unwrap_or_else(|e| e.into_inner());
             match result {
                 Ok(Ok(data)) => {
-                    *guard = TopologyState::Ready(data);
+                    *guard = TopologyState::Ready(Box::new(data));
                 }
                 Ok(Err(e)) => {
                     *guard = TopologyState::Failed(e);
@@ -261,7 +261,7 @@ impl ProjectTopology {
         match result {
             Ok(mut data) => {
                 data.built_at_ms = elapsed.as_millis() as u64;
-                *guard = TopologyState::Ready(data);
+                *guard = TopologyState::Ready(Box::new(data));
             }
             Err(e) => {
                 *guard = TopologyState::Failed(e);
@@ -393,13 +393,12 @@ impl ProjectTopology {
                         }
                     }
                 }
-
                 if crossings.is_empty() {
                     if query.is_some() {
-                        out.push_str(&format!(
+                        out.push_str(
                             "No cross-crate boundary crossings found matching the query. \
                              Try `query_project_graph` to see all crates and their dependencies.\n"
-                        ));
+                        );
                     } else {
                         out.push_str("No cross-crate dependencies found in workspace.\n");
                     }
@@ -602,7 +601,6 @@ fn build_topology_data(workspace_root: &Path) -> Result<TopologyData, String> {
     // 之前 symbol_index 恒为 None,导致 DomainTools 的 refactor_algorithm_topo
     // 永远返回 "no symbol index" 降级提示。现在从 module_graph 收集所有
     // source_paths,调用 build_symbol_index_fast 构建 definitions + callers。
-    // 如果构建失败(rg/grep 不可用),symbol_index 仍为 None,不影响 ModuleGraph。
     let source_dirs: Vec<PathBuf> = module_graph
         .crates
         .iter()
@@ -611,10 +609,7 @@ fn build_topology_data(workspace_root: &Path) -> Result<TopologyData, String> {
     let symbol_index = if source_dirs.is_empty() {
         None
     } else {
-        match build_symbol_index_fast(&source_dirs) {
-            Ok(si) => Some(si),
-            Err(_) => None, // best-effort:grep 失败不阻断拓扑
-        }
+        build_symbol_index_fast(&source_dirs).ok()
     };
 
     Ok(TopologyData {
@@ -957,7 +952,7 @@ mod tests {
     fn topology_state_display() {
         assert_eq!(TopologyState::Uninitialized.to_string(), "uninitialized");
         assert_eq!(
-            TopologyState::Ready(TopologyData {
+            TopologyState::Ready(Box::new(TopologyData {
                 module_graph: ModuleGraph {
                     workspace_root: PathBuf::from("/test"),
                     crates: vec![],
@@ -965,7 +960,7 @@ mod tests {
                 },
                 symbol_index: None,
                 built_at_ms: 0,
-            })
+            }))
             .to_string(),
             "ready"
         );

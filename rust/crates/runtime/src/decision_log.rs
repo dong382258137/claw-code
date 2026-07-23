@@ -79,15 +79,14 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 
 /// 更新 simhash 权重向量。
 fn update_weights(weights: &mut [i64; 64], hash: u64) {
-    for i in 0..64 {
+    for (i, item) in weights.iter_mut().enumerate() {
         if (hash >> i) & 1 == 1 {
-            weights[i] += 1;
+            *item += 1;
         } else {
-            weights[i] -= 1;
+            *item -= 1;
         }
     }
 }
-
 /// 汉明距离(两个 64 位值的不同 bit 数)。
 pub fn hamming_distance(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
@@ -702,7 +701,7 @@ impl DecisionLog {
                         params![decision_id],
                         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?)),
                     )
-                    .map_err(|e| DecisionLogError::Sqlite(e))?;
+                    .map_err(DecisionLogError::Sqlite)?;
 
                 Ok(format!(
                     "decision_verified id={decision_id} result={final_result} \
@@ -726,15 +725,10 @@ impl DecisionLog {
 fn escape_fts5_query(query: &str) -> String {
     // FTS5 特殊字符: " * ( ) : ^ ~ - + 以及引号
     // 简单策略:用双引号包围整个查询短语
-    let cleaned = query
-        .replace('"', "")
-        .replace('\'', "")
-        .replace('\\', "");
+    let cleaned = query.replace(['\"', '\'', '\\'], "");
     // 添加前缀 * 以支持子串匹配
     format!("\"{}\"", cleaned.trim())
 }
-
-/// 截断字符串到指定长度。
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
@@ -760,6 +754,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 // SearchHit
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct SearchHit {
     id: i64,
     session_id: String,

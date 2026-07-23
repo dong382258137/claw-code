@@ -8291,7 +8291,7 @@ mod tests {
         let no_match = registry.search("+nonexistent-tag", 5, None, None);
         let no_match_output = serde_json::to_value(no_match).expect("no-match search should serialize");
         assert!(
-            no_match_output["matches"].as_array().map_or(true, |arr| arr.is_empty()),
+            no_match_output["matches"].as_array().is_none_or(|arr| arr.is_empty()),
             "no tool should match a nonexistent tag"
         );
 

@@ -346,7 +346,10 @@ impl LspRegistry {
         // 获取 default_root_path(由 init_lsp_from_config 设置)
         let root_path = {
             let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            inner.default_root_path.clone().unwrap_or_else(|| ".".to_string())
+            inner
+                .default_root_path
+                .clone()
+                .unwrap_or_else(|| ".".to_string())
         };
 
         // 注册 + spawn
@@ -371,6 +374,76 @@ impl LspRegistry {
         }
     }
 
+    /// 当 dispatch 遇到 Error/Disconnected 状态的已注册 server 时,尝试重新 spawn。
+    ///
+    /// 与 [`try_auto_start`](Self::try_auto_start) 不同,此方法针对"已注册但状态异常"的场景,
+    /// 无需重新 register,直接清理旧 transport 并重新 spawn。
+    ///
+    /// 流程:
+    /// 1. 获取 server_command(优先已注册的,fallback 到预置默认)
+    /// 2. 检测命令是否在 PATH 中
+    /// 3. 清理旧 transport(通过 [`shutdown_server`](Self::shutdown_server))
+    /// 4. 更新 server_command 并重新 spawn
+    fn try_retry_spawn(&self, language: &str) -> Result<(), String> {
+        // 1. 获取 command:优先使用已注册的 server_command,fallback 到预置默认
+        let (command, args): (String, Vec<String>) = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if let Some(cmd) = inner
+                .servers
+                .get(language)
+                .and_then(|s| s.server_command.clone())
+            {
+                drop(inner);
+                (cmd, vec![])
+            } else {
+                drop(inner);
+                let (cmd, args) = default_lsp_server_for_language(language).ok_or_else(|| {
+                    format!(
+                        "no server_command configured and no default LSP server for language '{language}' — add it to lspServers in settings.json"
+                    )
+                })?;
+                (cmd.to_owned(), args.iter().map(|s| s.to_string()).collect())
+            }
+        };
+
+        // 2. 检测命令是否在 PATH 中
+        if !is_command_available(&command) {
+            let hint = install_hint_for_command(&command)
+                .unwrap_or("install the corresponding LSP server and add it to PATH");
+            return Err(format!(
+                "LSP server '{command}' for language '{language}' is not in PATH — {hint}"
+            ));
+        }
+
+        // 3. 获取 root_path
+        let root_path = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner
+                .default_root_path
+                .clone()
+                .unwrap_or_else(|| ".".to_string())
+        };
+
+        // 4. 清理旧 transport(对 Error 状态可能有残留的僵尸 transport)
+        let _ = self.shutdown_server(language);
+
+        // 5. 确保 server_command 为最新值(用于再次重试和错误诊断)
+        {
+            let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+            if let Some(server) = inner.servers.get_mut(language) {
+                server.server_command = Some(command.clone());
+            }
+        }
+
+        // 6. 重新 spawn
+        self.spawn_server(language, &command, &args, &root_path)?;
+
+        eprintln!(
+            "[lsp] retry-spawned '{language}' server: {command} (previously in error/disconnected state)"
+        );
+
+        Ok(())
+    }
     /// Step 4.2:获取指定文件的 LSP symbols。
     ///
     /// 通过 `textDocument/documentSymbol` 请求 LSP server,
@@ -557,7 +630,7 @@ impl LspRegistry {
             inner.servers.get(language).cloned()
         };
 
-        let server = match server {
+        let mut server = match server {
             Some(s) => s,
             None => {
                 // 预置默认配置:尝试 auto-start
@@ -586,30 +659,44 @@ impl LspRegistry {
                 }
             }
         };
-
+        // 对于 Error/Disconnected 状态,尝试重新 spawn 一次再继续 dispatch,
+        // 而非直接报错(之前的 spawn 可能因临时原因失败,如命令未安装)。
+        // Starting 状态无法干预,仍需等待。
         if server.status != LspServerStatus::Connected {
-            // 根据状态给出更具体的诊断
-            let hint = match server.status {
-                LspServerStatus::Starting => "server is still starting up, retry in a few seconds (rust-analyzer indexing may take 30-60s on first run)".to_string(),
-                LspServerStatus::Error => {
-                    let mut msg = "server failed to start — check that the command exists in PATH and the root_path is a valid project (see startup log '[lsp] failed to spawn ...')".to_string();
-                    // 附加安装提示(如果有)
-                    if let Some(cmd) = &server.server_command {
-                        if let Some(install_hint) = install_hint_for_command(cmd) {
-                            msg.push_str(&format!("\n  {install_hint}"));
-                        }
+            if server.status == LspServerStatus::Error
+                || server.status == LspServerStatus::Disconnected
+            {
+                // 尝试重试 spawn
+                match self.try_retry_spawn(language) {
+                    Ok(()) => {
+                        // 重试成功,重新读取 server 状态并继续 dispatch
+                        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+                        server = inner.servers.get(language).cloned().ok_or_else(|| {
+                            "retry spawn succeeded but server not found in registry".to_string()
+                        })?;
                     }
-                    msg
+                    Err(retry_err) => {
+                        let status_label = server.status.to_string();
+                        let hint = if server.status == LspServerStatus::Error {
+                            format!(
+                                "server previously failed to start; retry also failed: {retry_err}"
+                            )
+                        } else {
+                            format!("server was disconnected; retry also failed: {retry_err}")
+                        };
+                        return Err(format!(
+                            "LSP server for '{}' is not connected (status: {status_label}) — {hint}",
+                            server.language,
+                        ));
+                    }
                 }
-                LspServerStatus::Disconnected => "server was registered but never spawned, or was shut down — restart the process to re-run init_lsp_from_config".to_string(),
-                LspServerStatus::Connected => String::new(),
-            };
-            return Err(format!(
-                "LSP server for '{}' is not connected (status: {}){}",
-                server.language,
-                server.status,
-                if hint.is_empty() { String::new() } else { format!(" — {hint}") }
-            ));
+            } else {
+                // Starting 状态:无法干预,提示等待
+                return Err(format!(
+                    "LSP server for '{}' is still starting up, retry in a few seconds (rust-analyzer indexing may take 30-60s on first run)",
+                    server.language,
+                ));
+            }
         }
 
         // Step 4.2 — 真实 LSP JSON-RPC 调用。
@@ -868,7 +955,9 @@ fn is_command_available(command: &str) -> bool {
 /// 仅当对应 server 命令在 PATH 中可用时才会自动启动(lazy auto-start)。
 ///
 /// 返回 `(command, args)` 元组。`args` 为空切片表示无参数。
-fn default_lsp_server_for_language(language: &str) -> Option<(&'static str, &'static [&'static str])> {
+fn default_lsp_server_for_language(
+    language: &str,
+) -> Option<(&'static str, &'static [&'static str])> {
     match language {
         "rust" => Some(("rust-analyzer", &[])),
         "python" => Some(("pylsp", &[])),
@@ -929,6 +1018,7 @@ pub struct ProcessLspTransport {
     reader_stop: Arc<AtomicBool>,
     /// pending requests: 请求 id → 响应 channel sender。
     /// send() 注册后等待,reader 线程读到匹配 id 的响应时通过 channel 发送。
+    #[allow(clippy::type_complexity)]
     pending_responses: Arc<Mutex<HashMap<u64, mpsc::Sender<Result<serde_json::Value, String>>>>>,
     /// LspRegistry inner 的弱引用,reader 线程用于推送 publishDiagnostics 到缓存。
     /// 弱引用避免 ProcessLspTransport ↔ LspRegistry 的循环强引用。
@@ -1090,11 +1180,7 @@ impl ProcessLspTransport {
                     Ok(msg) => {
                         // 响应:有 id 字段,分发给 pending request
                         if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
-                            if let Some(tx) = pending
-                                .lock()
-                                .ok()
-                                .and_then(|mut p| p.remove(&id))
-                            {
+                            if let Some(tx) = pending.lock().ok().and_then(|mut p| p.remove(&id)) {
                                 let _ = tx.send(Ok(msg));
                             }
                             // 无 pending:可能是 send() 超时已移除,丢弃
@@ -1109,9 +1195,7 @@ impl ProcessLspTransport {
                                 let diags = parse_publish_diagnostics(&msg);
                                 // LSP 语义:publishDiagnostics 是某文件的全量诊断推送。
                                 // 需按 path 替换(而非追加),先清除该 path 的旧诊断再 extend。
-                                if let Some(path) =
-                                    diags.first().map(|d| d.path.clone())
-                                {
+                                if let Some(path) = diags.first().map(|d| d.path.clone()) {
                                     if let Some(weak) = &registry_weak {
                                         if let Some(arc) = weak.upgrade() {
                                             if let Ok(mut inner) = arc.lock() {
@@ -1357,7 +1441,9 @@ impl LspTransport for ProcessLspTransport {
                         .lock()
                         .ok()
                         .and_then(|mut p| p.remove(&id));
-                    Err(format!("LSP request {id} ({method}) timeout after {timeout}s"))
+                    Err(format!(
+                        "LSP request {id} ({method}) timeout after {timeout}s"
+                    ))
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.pending_responses
@@ -1484,7 +1570,7 @@ fn parse_publish_diagnostics(msg: &serde_json::Value) -> Vec<LspDiagnostic> {
         .and_then(|d| d.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|d| {
+                .map(|d| {
                     let line = d
                         .get("range")
                         .and_then(|r| r.get("start"))
@@ -1515,14 +1601,14 @@ fn parse_publish_diagnostics(msg: &serde_json::Value) -> Vec<LspDiagnostic> {
                         .unwrap_or("")
                         .to_string();
                     let source = d.get("source").and_then(|s| s.as_str()).map(str::to_owned);
-                    Some(LspDiagnostic {
+                    LspDiagnostic {
                         path: path.clone(),
                         line,
                         character,
                         severity,
                         message,
                         source,
-                    })
+                    }
                 })
                 .collect()
         })
@@ -2295,7 +2381,10 @@ mod tests {
         // then
         // .md 扩展名不在 LSP 支持列表中,返回 unsupported extension 错误
         let error = result.expect_err("unsupported extension should fail");
-        assert!(error.contains("unsupported file extension '.md'"), "got: {error}");
+        assert!(
+            error.contains("unsupported file extension '.md'"),
+            "got: {error}"
+        );
         assert!(error.contains("notes.md"));
     }
 
@@ -2338,7 +2427,10 @@ mod tests {
         let error = result.expect_err("unconfigured language should fail with hint");
         assert!(error.contains("no LSP server configured for language 'java'"));
         assert!(error.contains("lspServers"), "should mention config key");
-        assert!(error.contains("settings.json"), "should mention config file");
+        assert!(
+            error.contains("settings.json"),
+            "should mention config file"
+        );
     }
 
     #[test]
@@ -2677,7 +2769,10 @@ mod tests {
     fn process_lsp_transport_new_defaults_to_empty_args() {
         let transport =
             ProcessLspTransport::new("rust", Some("/workspace".to_string()), "rust-analyzer");
-        assert!(transport.server_args.is_empty(), "new() should default to empty args");
+        assert!(
+            transport.server_args.is_empty(),
+            "new() should default to empty args"
+        );
     }
 
     #[test]
@@ -2696,18 +2791,33 @@ mod tests {
     #[test]
     fn install_hint_for_rust_contains_rustup() {
         let hint = install_hint_for_command("rust-analyzer").unwrap();
-        assert!(hint.contains("rustup"), "rust-analyzer hint should mention rustup");
+        assert!(
+            hint.contains("rustup"),
+            "rust-analyzer hint should mention rustup"
+        );
     }
 
     #[test]
     fn default_lsp_server_covers_mainstream_languages() {
         // 主流语言应有预置默认
-        assert_eq!(default_lsp_server_for_language("rust").unwrap().0, "rust-analyzer");
-        assert_eq!(default_lsp_server_for_language("python").unwrap().0, "pylsp");
-        assert_eq!(default_lsp_server_for_language("typescript").unwrap().0, "typescript-language-server");
+        assert_eq!(
+            default_lsp_server_for_language("rust").unwrap().0,
+            "rust-analyzer"
+        );
+        assert_eq!(
+            default_lsp_server_for_language("python").unwrap().0,
+            "pylsp"
+        );
+        assert_eq!(
+            default_lsp_server_for_language("typescript").unwrap().0,
+            "typescript-language-server"
+        );
         assert_eq!(default_lsp_server_for_language("go").unwrap().0, "gopls");
         assert_eq!(default_lsp_server_for_language("c").unwrap().0, "clangd");
-        assert_eq!(default_lsp_server_for_language("ruby").unwrap().0, "solargraph");
+        assert_eq!(
+            default_lsp_server_for_language("ruby").unwrap().0,
+            "solargraph"
+        );
         // 未知语言应返回 None
         assert!(default_lsp_server_for_language("brainfuck").is_none());
     }
@@ -2727,14 +2837,18 @@ mod tests {
     #[test]
     fn is_command_available_detects_known_command() {
         // cargo 几乎肯定在 PATH 中(我们在 Rust 项目里)
-        assert!(is_command_available("cargo") || is_command_available("cargo.exe"),
-            "cargo should be in PATH");
+        assert!(
+            is_command_available("cargo") || is_command_available("cargo.exe"),
+            "cargo should be in PATH"
+        );
     }
 
     #[test]
     fn is_command_available_rejects_unknown_command() {
-        assert!(!is_command_available("nonexistent-command-xyz-12345"),
-            "nonexistent command should not be in PATH");
+        assert!(
+            !is_command_available("nonexistent-command-xyz-12345"),
+            "nonexistent command should not be in PATH"
+        );
     }
 
     #[test]
@@ -2767,8 +2881,14 @@ mod tests {
             let result = registry.try_auto_start("ruby");
             assert!(result.is_err());
             let err = result.unwrap_err();
-            assert!(err.contains("not in PATH"), "error should mention PATH: {err}");
-            assert!(err.contains("gem install"), "error should include install hint: {err}");
+            assert!(
+                err.contains("not in PATH"),
+                "error should mention PATH: {err}"
+            );
+            assert!(
+                err.contains("gem install"),
+                "error should include install hint: {err}"
+            );
         }
     }
 
