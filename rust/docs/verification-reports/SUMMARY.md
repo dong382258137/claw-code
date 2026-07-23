@@ -5,7 +5,7 @@
 **Tool**: `scripts/verify-design.ps1` driven by `claw` (claude-opus-4-6)  
 **Total Cost**: ~6M tokens, ~$26 USD  
 **Duration**: ~75 min (4 batches × 3 groups)  
-**Last Updated**: 2025-07-24 02:00 (Group B: CLI flags done)
+**Last Updated**: 2025-07-24 02:30 (Groups A/B/C complete; D1/D2/E pending for next session)
 
 ---
 
@@ -15,11 +15,11 @@
 |-------|-------|-------|------|-----------|--------|
 | A | Atomic fixes | 4 | **4** | 0 | ✅ |
 | B | Single-crate features | 4 | **2** | 2 | 🔄 |
-| C | Cross-crate integration | 1 | 0 | 1 | ⏳ |
+| C | Cross-crate integration | 1 | **1** | 0 | ✅ |
 | D1 | Multi-agent/DAG subsystem | 5 | 0 | 5 | ⏳ |
 | D2 | Hooks subsystem | 7 | 0 | 7 | ⏳ |
 | E | Global cleanup | 6 | 0 | 6 | ⏳ |
-| **Total** | — | **27** | **6** | **21** | — |
+| **Total** | — | **27** | **9** | **18** | — |
 
 > **修订说明 (2026-07-23)**：G1.2 (`--resume`) 和 G1.4 (`--output-format json`) 经核实已实现，从待修复项移除。待修复总数仍为 26（这两项从未进入"已修复"统计，移除不影响 Done 计数）。
 
