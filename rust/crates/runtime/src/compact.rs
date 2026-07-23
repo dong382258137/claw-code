@@ -360,63 +360,38 @@ fn is_critical_tool(tool_name: &str) -> bool {
 
 /// Returns true when `output` already looks like a microcompact summary, so we
 /// avoid re-summarizing an already-summarized result.
+///
+/// Phase 2 内容感知路由:兼容新旧两种格式。
+/// - 旧格式:`[{tool_name} output summarized: ... chars → ...…]`
+/// - 新格式:`[{tool_name} {Text|JSON|Code|Tabular} summarized: ... chars → ...…]`
+///
+/// 统一检测子串 `" summarized: "`(去掉前缀的 tool_name 部分),让新旧格式
+/// 都能被识别。`starts_with('[')` + `ends_with("…]")` + `contains(" chars → ")`
+/// 三个条件联合保证不会误判正常 tool result(以 `[` 开头且以 `…]` 结尾且
+/// 含特殊字符的 tool result 极罕见)。
 fn is_already_summarized(output: &str) -> bool {
     output.starts_with('[')
-        && output.contains(" output summarized: ")
+        && output.contains(" summarized: ")
         && output.ends_with("…]")
         && output.contains(" chars → ")
 }
 
 /// Builds the summary placeholder for an aged tool result.
 ///
-/// P1 改进:从"只保留第一行"改为"保留前 N 行 + 行数信息",避免关键信息丢失。
+/// Phase 2 内容感知路由:此函数现在是路由入口,委托给
+/// `content_compression::format_summary`,根据内容类型(JSON/Code/Tabular/Text)
+/// 选择对应的压缩器。详见 `docs/design-headroom-absorption.md` 第 2 节。
 ///
-/// 设计依据:
-/// - 旧格式只保留第一行,对于多行 tool results(如 Grep 匹配多文件、
-///   Read 多行文件内容)会导致关键信息丢失,LLM 无法判断是否需要 re-read。
-/// - 新格式保留前 N 行(N=3)作为指针,LLM 可根据内容判断是否需要
-///   重新调用工具获取完整结果。
-/// - 与 NOTEBOOK 协同:关键信息应已通过 `notebook_update` 持久化到
-///   NOTEBOOK.md,这里保留前 N 行作为"足够判断的指针"。
-/// - `is_already_summarized` 检测逻辑保持兼容(starts_with('[') +
-///   contains(" output summarized: ") + ends_with("…]") +
-///   contains(" chars → ")),避免重复摘要。
+/// 各压缩器输出统一格式的 placeholder(以 `[` 开头,`…]` 结尾,含
+/// `" summarized: "` 和 `" chars → "`),确保 `is_already_summarized` 兼容。
+///
+/// - JSON 压缩器:保留完整 JSON 结构,压缩叶子值(string 截断、数组省略)
+/// - Code 压缩器:保留签名(fn/impl/struct/use),折叠实现体
+/// - Tabular 压缩器:保留表头 + 前 3 行代表性行
+/// - Text 压缩器:原"前 3 行 + 240 chars"逻辑(兜底)
 #[must_use]
 fn format_tool_result_summary(tool_name: &str, tool_use_id: &str, output: &str) -> String {
-    let original_len = output.chars().count();
-    let total_lines = output.lines().count();
-
-    // P1:保留前 N 行作为结构化预览,而非只保留第一行。
-    // N=3 是经验值:足够展示工具结果的开头结构(如文件路径 + 前几行内容,
-    // 或 Grep 匹配的前几个文件),同时控制摘要体积。
-    const MAX_PREVIEW_LINES: usize = 3;
-    const MAX_PREVIEW_CHARS: usize = 240;
-
-    let preview_lines: Vec<&str> = output.lines().take(MAX_PREVIEW_LINES).collect();
-    let mut preview = preview_lines.join("\n");
-
-    // 如果 preview 超过字符上限,截断并加省略号
-    if preview.chars().count() > MAX_PREVIEW_CHARS {
-        let truncated: String = preview.chars().take(MAX_PREVIEW_CHARS).collect();
-        preview = format!("{truncated}…");
-    }
-
-    // 行数信息:如果总行数 > 预览行数,附加 "(N lines total)" 提示
-    let line_info = if total_lines > MAX_PREVIEW_LINES {
-        format!(" ({total_lines} lines total)")
-    } else {
-        String::new()
-    };
-
-    // 格式保持 is_already_summarized 兼容:
-    // - starts_with('[') ✓
-    // - contains(" output summarized: ") ✓
-    // - contains(" chars → ") ✓ (chars → 后跟空格 + preview 第一行)
-    // - ends_with("…]") ✓
-    // 末尾附加 recall_full 提示,让 LLM 知道可以用 tool_use_id 取回完整输出
-    format!(
-        "[{tool_name} output summarized: {original_len} chars → {preview}{line_info}… use recall_full with tool_use_id={tool_use_id} to retrieve full output…]"
-    )
+    crate::content_compression::format_summary(tool_name, tool_use_id, output)
 }
 
 /// Summarize old tool results to free context before full compaction.
@@ -1679,7 +1654,7 @@ mod tests {
         assert_eq!(tool_name, "Read");
         assert!(!*is_error);
         assert!(
-            output.contains("[Read output summarized:"),
+            output.contains("[Read ") && output.contains(" summarized:"),
             "old Read result should be summarized, got: {output}"
         );
         assert!(

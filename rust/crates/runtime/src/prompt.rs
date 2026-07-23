@@ -112,6 +112,80 @@ impl SystemPromptSplit {
             dynamic_sections,
         }
     }
+
+    /// Returns indices into `static_sections` that should carry
+    /// `cache_control: {type: "ephemeral"}` markers for tiered prompt caching.
+    ///
+    /// Uses up to 3 layered breakpoints (Anthropic allows at most 4 total;
+    /// the tools array typically uses 1, leaving 3 for system blocks):
+    ///
+    /// - **BP1** (instruction tier): after the stable instruction sections
+    ///   (intro/system/doing_tasks/...) and before the snapshot tier
+    ///   (persistent_memory/repomap). Caches the most stable instructions.
+    /// - **BP2** (snapshot tier): after persistent_memory/repomap and before
+    ///   the config tier (environment/config/instructions). Caches session-
+    ///   level snapshots separately from instructions.
+    /// - **BP3** (config tier): the last static section. Caches the full
+    ///   static prefix.
+    ///
+    /// If a tier is absent (e.g. no persistent_memory), its breakpoint is
+    /// skipped. Duplicate indices are deduplicated.
+    #[must_use]
+    pub fn static_cache_breakpoints(&self) -> Vec<usize> {
+        const MAX_SYSTEM_BREAKPOINTS: usize = 3;
+        let n = self.static_sections.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let mut breakpoints = Vec::new();
+
+        // Identify tier boundaries by section heading.
+        // Config tier starts at "# Environment context" (always present —
+        // build() unconditionally pushes environment_section()).
+        let config_start = self
+            .static_sections
+            .iter()
+            .position(|s| s.starts_with("# Environment context"));
+
+        // Snapshot tier starts at "# Persistent Memory" or "## Repository Map".
+        let snapshot_start = self.static_sections.iter().position(|s| {
+            s.starts_with("# Persistent Memory") || s.starts_with("## Repository Map")
+        });
+
+        // BP1: end of instruction tier (section just before snapshot tier).
+        // Only valid if snapshot tier exists and precedes config tier.
+        if let Some(ss) = snapshot_start {
+            if ss > 0 && ss < config_start.unwrap_or(n) {
+                breakpoints.push(ss - 1);
+            }
+        }
+
+        // BP2: end of snapshot tier (section just before config tier).
+        if let Some(cs) = config_start {
+            if cs > 0 {
+                let bp = cs - 1;
+                if !breakpoints.contains(&bp) {
+                    breakpoints.push(bp);
+                }
+            }
+        }
+
+        // BP3: last static section (always — caches the full static prefix).
+        let last = n - 1;
+        if !breakpoints.contains(&last) {
+            breakpoints.push(last);
+        }
+
+        // Cap at MAX_SYSTEM_BREAKPOINTS (keep last N — later breakpoints
+        // cache more content and are more valuable).
+        if breakpoints.len() > MAX_SYSTEM_BREAKPOINTS {
+            let start = breakpoints.len() - MAX_SYSTEM_BREAKPOINTS;
+            breakpoints = breakpoints[start..].to_vec();
+        }
+
+        breakpoints
+    }
 }
 
 /// Human-readable default frontier model name embedded into generated prompts.
@@ -777,7 +851,19 @@ pub fn load_system_prompt_with_extras(
     if let Some(map) = extras.repomap {
         builder = builder.with_repomap(map);
     }
-    Ok(builder.build())
+    // Cache Aligner (Phase 1):走 build_split() 路径而非 build()，
+    // 让 DynamicValueExtractor 对 static sections 提取动态值并用占位符替换，
+    // 提取出的原值追加到 dynamic sections 末尾。这样 static 区字节稳定，
+    // 提升 Anthropic prompt cache 和 OpenAI/DeepSeek 隐式前缀缓存的命中率。
+    //
+    // 重新组装为含 boundary 标记的 Vec<String>，保持 ConversationRuntime
+    // 既有的 `from_sections()` 分割语义不变。
+    // 详见 docs/design-headroom-absorption.md §1.2.2。
+    let split = builder.build_split();
+    let mut sections = split.static_sections;
+    sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
+    sections.extend(split.dynamic_sections);
+    Ok(sections)
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {
@@ -1666,6 +1752,139 @@ mod tests {
         let from_sections = SystemPromptSplit::from_sections(built.clone());
         let build_split = builder.build_split();
         assert_eq!(from_sections, build_split);
+    }
+
+    #[test]
+    fn cache_breakpoints_three_tiers_with_snapshot() {
+        // Full 3-tier layout: instructions → snapshot → config
+        let split = SystemPromptSplit {
+            static_sections: vec![
+                "# Intro".to_string(),
+                "# System".to_string(),
+                "# Persistent Memory".to_string(),
+                "## Repository Map".to_string(),
+                "# Environment context".to_string(),
+                "# Runtime config".to_string(),
+            ],
+            dynamic_sections: Vec::new(),
+        };
+        let bps = split.static_cache_breakpoints();
+        // BP1: index 1 (end of instructions, before Persistent Memory)
+        // BP2: index 3 (end of snapshot, before Environment context)
+        // BP3: index 5 (last static)
+        assert_eq!(bps, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn cache_breakpoints_two_tiers_without_snapshot() {
+        // No persistent_memory/repomap → only config tier boundary + last
+        let split = SystemPromptSplit {
+            static_sections: vec![
+                "# Intro".to_string(),
+                "# System".to_string(),
+                "# Environment context".to_string(),
+                "# Runtime config".to_string(),
+            ],
+            dynamic_sections: Vec::new(),
+        };
+        let bps = split.static_cache_breakpoints();
+        // BP2: index 1 (before Environment context)
+        // BP3: index 3 (last static)
+        assert_eq!(bps, vec![1, 3]);
+    }
+
+    #[test]
+    fn cache_breakpoints_only_last_when_no_tier_markers() {
+        // No tier markers at all → only the last static section gets a breakpoint
+        let split = SystemPromptSplit {
+            static_sections: vec![
+                "# Intro".to_string(),
+                "# System".to_string(),
+            ],
+            dynamic_sections: Vec::new(),
+        };
+        let bps = split.static_cache_breakpoints();
+        assert_eq!(bps, vec![1]);
+    }
+
+    #[test]
+    fn cache_breakpoints_empty_static() {
+        let split = SystemPromptSplit {
+            static_sections: Vec::new(),
+            dynamic_sections: vec!["dynamic".to_string()],
+        };
+        assert!(split.static_cache_breakpoints().is_empty());
+    }
+
+    #[test]
+    fn cache_breakpoints_single_static_section() {
+        let split = SystemPromptSplit {
+            static_sections: vec!["# Environment context".to_string()],
+            dynamic_sections: Vec::new(),
+        };
+        let bps = split.static_cache_breakpoints();
+        // Only one section → only BP3 (last)
+        assert_eq!(bps, vec![0]);
+    }
+
+    #[test]
+    fn cache_breakpoints_snapshot_without_config() {
+        // Snapshot tier exists but no Environment context (edge case)
+        let split = SystemPromptSplit {
+            static_sections: vec![
+                "# Intro".to_string(),
+                "# Persistent Memory".to_string(),
+            ],
+            dynamic_sections: Vec::new(),
+        };
+        let bps = split.static_cache_breakpoints();
+        // BP1: index 0 (before Persistent Memory)
+        // BP3: index 1 (last static)
+        // No BP2 because no config_start
+        assert_eq!(bps, vec![0, 1]);
+    }
+
+    #[test]
+    fn cache_breakpoints_max_three() {
+        // More than 3 natural breakpoints → capped at 3 (keep last 3)
+        let split = SystemPromptSplit {
+            static_sections: vec![
+                "# Intro".to_string(),
+                "# Persistent Memory".to_string(),
+                "## Repository Map".to_string(),
+                "# Extra snapshot".to_string(),
+                "# Environment context".to_string(),
+                "# Runtime config".to_string(),
+                "# Instructions".to_string(),
+            ],
+            dynamic_sections: Vec::new(),
+        };
+        let bps = split.static_cache_breakpoints();
+        // BP1: index 0 (before Persistent Memory)
+        // BP2: index 3 (before Environment context)
+        // BP3: index 6 (last)
+        // Only 3 breakpoints, no capping needed
+        assert_eq!(bps.len(), 3);
+        assert!(bps.contains(&6)); // last always present
+    }
+
+    #[test]
+    fn cache_breakpoints_dedup_adjacent() {
+        // Snapshot tier is just 1 section → BP1 and BP2 may be adjacent
+        let split = SystemPromptSplit {
+            static_sections: vec![
+                "# Intro".to_string(),
+                "# System".to_string(),
+                "# Persistent Memory".to_string(),
+                "# Environment context".to_string(),
+            ],
+            dynamic_sections: Vec::new(),
+        };
+        let bps = split.static_cache_breakpoints();
+        // BP1: index 1 (before Persistent Memory)
+        // BP2: index 2 (before Environment context)
+        // BP3: index 3 (last)
+        assert_eq!(bps, vec![1, 2, 3]);
     }
 
     #[test]

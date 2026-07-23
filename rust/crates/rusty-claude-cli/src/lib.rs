@@ -636,7 +636,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
-        CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::Doctor {
+            output_format,
+            cache_stats,
+        } => run_doctor(output_format, cache_stats)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::AcpServe {
             model,

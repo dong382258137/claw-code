@@ -1033,6 +1033,7 @@ fn removed_login_and_logout_subcommands_error_helpfully() {
         parse_args(&["doctor".to_string()]).expect("doctor should parse"),
         CliAction::Doctor {
             output_format: CliOutputFormat::Text,
+            cache_stats: false,
         }
     );
     assert_eq!(
@@ -4554,8 +4555,13 @@ fn response_to_events_renders_collapsed_thinking_summary() {
     )
     .expect("response conversion should succeed");
 
+    // G10.5 fix: Thinking now emitted before Text in non-streaming path
     assert!(matches!(
         &events[0],
+        AssistantEvent::Thinking { thinking, .. } if thinking == "step 1"
+    ));
+    assert!(matches!(
+        &events[1],
         AssistantEvent::TextDelta(text) if text == "Final answer"
     ));
     let rendered = String::from_utf8(out).expect("utf8");
@@ -5237,6 +5243,52 @@ mod system_block_tests {
             cc_pos < dyn_pos,
             "cache_control should precede dynamic content"
         );
+    }
+
+    #[test]
+    fn build_system_blocks_tiered_cache_breakpoints() {
+        // Verify that tiered cache breakpoints are applied: sections at
+        // instruction/snapshot/config tier boundaries get cache_control.
+        let split = SystemPromptSplit {
+            static_sections: vec![
+                "# Intro".to_string(),
+                "# System".to_string(),
+                "# Persistent Memory".to_string(),
+                "## Repository Map".to_string(),
+                "# Environment context".to_string(),
+                "# Runtime config".to_string(),
+            ],
+            dynamic_sections: vec!["dynamic".to_string()],
+        };
+        let content = build_system_blocks(&split).expect("non-empty");
+        match content {
+            SystemContent::Blocks(blocks) => {
+                // 6 static + 1 dynamic = 7 blocks
+                assert_eq!(blocks.len(), 7);
+                // BP1 at index 1 (end of instructions)
+                assert!(
+                    blocks[1].cache_control.is_some(),
+                    "instruction tier boundary should have cache_control"
+                );
+                // BP2 at index 3 (end of snapshot tier)
+                assert!(
+                    blocks[3].cache_control.is_some(),
+                    "snapshot tier boundary should have cache_control"
+                );
+                // BP3 at index 5 (last static — config tier)
+                assert!(
+                    blocks[5].cache_control.is_some(),
+                    "last static block should have cache_control"
+                );
+                // Non-breakpoint static blocks: no cache_control
+                assert!(blocks[0].cache_control.is_none());
+                assert!(blocks[2].cache_control.is_none());
+                assert!(blocks[4].cache_control.is_none());
+                // Dynamic block: no cache_control
+                assert!(blocks[6].cache_control.is_none());
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        }
     }
 }
 

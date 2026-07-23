@@ -1012,7 +1012,7 @@ fn run_event_loop(
 
             // Status bar
             let state_snapshot = {
-                let guard = status_state.lock().expect("StatusBarState poisoned");
+                let guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
                 guard.clone()
             };
             let status_widget = StatusBar { state: &state_snapshot };
@@ -2777,7 +2777,7 @@ fn render_session_picker(
 }
 
 fn initialize_status(state: &Arc<Mutex<StatusBarState>>, cli: &LiveCli) {
-    let mut guard = state.lock().expect("StatusBarState poisoned");
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
     guard.model = cli.model_snapshot().to_string();
     guard.permission_mode = cli.permission_mode_label().to_string();
     guard.session_id = cli.session_id_snapshot().to_string();
@@ -2785,7 +2785,7 @@ fn initialize_status(state: &Arc<Mutex<StatusBarState>>, cli: &LiveCli) {
 }
 
 fn sync_status_from_cli(state: &Arc<Mutex<StatusBarState>>, cli: &LiveCli) {
-    let mut guard = state.lock().expect("StatusBarState poisoned");
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
     sync_status_from_cli_inner(&mut guard, cli);
 }
 

@@ -103,6 +103,11 @@ pub(crate) enum CliAction {
     },
     Doctor {
         output_format: CliOutputFormat,
+        /// `claw doctor --cache-stats`:仅输出 Cache Aligner 监控指标
+        /// (按原因分类的 cache break 计数 + completion 缓存命中统计),
+        /// 跳过常规健康检查。底层读取 `~/.claude/cache/prompt-cache/*/stats.json`
+        /// 并跨 session 汇总。
+        cache_stats: bool,
     },
     Acp {
         output_format: CliOutputFormat,
@@ -215,6 +220,8 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // P1-1:`--enable-policy-engine` — 启用 PolicyEngine 策略引擎。
     // 默认关闭。启用后 lane 完成时调用 PolicyEngine::evaluate。
     let mut enable_policy_engine = false;
+    // `--cache-stats`:仅对 `claw doctor` 生效,切换到 Cache Aligner 监控视图。
+    let mut cache_stats = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -287,6 +294,12 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--compact" => {
                 compact = true;
+                index += 1;
+            }
+            "--cache-stats" => {
+                // `claw doctor --cache-stats`:切换到 Cache Aligner 监控视图。
+                // 仅 `doctor` 子命令消费此 flag;其他子命令会忽略它。
+                cache_stats = true;
                 index += 1;
             }
             "--base-commit" => {
@@ -510,6 +523,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         permission_mode_override,
         output_format,
         allowed_tools.clone(),
+        cache_stats,
     ) {
         return action;
     }
@@ -748,6 +762,8 @@ pub(crate) fn parse_single_word_command_alias(
     permission_mode_override: Option<PermissionMode>,
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
+    // `--cache-stats` flag,仅对 `doctor` 子命令生效。其他诊断动词忽略。
+    cache_stats: bool,
 ) -> Option<Result<CliAction, String>> {
     if rest.is_empty() {
         return None;
@@ -767,17 +783,25 @@ pub(crate) fn parse_single_word_command_alias(
             // "doctor --help" is valid, routed to parse_local_help_action() instead
             return None;
         }
-        // Unrecognized suffix like "--json"
-        let mut msg = format!(
-            "unrecognized argument `{}` for subcommand `{}`",
-            rest[1], verb
-        );
-        // #152: common mistake — users type `--json` expecting JSON output.
-        // Hint at the correct flag so they don't have to re-read --help.
-        if rest[1] == "--json" {
-            msg.push_str("\nDid you mean `--output-format json`?");
+        // `doctor --cache-stats` 是合法形式。--cache-stats 在主解析循环中
+        // 已被消费并设置 cache_stats=true,所以正常情况下 rest 里不会出现它。
+        // 这里兜底处理:若用户输入 `doctor --cache-stats`(且未被主循环捕获),
+        // 视为合法,继续走 doctor 分支。
+        if verb == "doctor" && rest.len() == 2 && rest[1] == "--cache-stats" {
+            // fall through 到下面的 doctor 分支
+        } else {
+            // Unrecognized suffix like "--json"
+            let mut msg = format!(
+                "unrecognized argument `{}` for subcommand `{}`",
+                rest[1], verb
+            );
+            // #152: common mistake — users type `--json` expecting JSON output.
+            // Hint at the correct flag so they don't have to re-read --help.
+            if rest[1] == "--json" {
+                msg.push_str("\nDid you mean `--output-format json`?");
+            }
+            return Some(Err(msg));
         }
-        return Some(Err(msg));
     }
 
     if rest.len() != 1 {
@@ -795,7 +819,10 @@ pub(crate) fn parse_single_word_command_alias(
             allowed_tools,
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
-        "doctor" => Some(Ok(CliAction::Doctor { output_format })),
+        "doctor" => Some(Ok(CliAction::Doctor {
+            output_format,
+            cache_stats,
+        })),
         "state" => Some(Ok(CliAction::State { output_format })),
         // #146: let `config` and `diff` fall through to parse_subcommand
         // where they are wired as pure-local introspection, instead of

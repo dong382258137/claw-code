@@ -4314,11 +4314,11 @@ mod tests {
             .collect();
         assert_eq!(tool_result_outputs.len(), 4);
         assert!(
-            tool_result_outputs[0].contains("output summarized"),
+            tool_result_outputs[0].contains(" summarized:"),
             "oldest tool result should be summarized"
         );
         assert!(
-            tool_result_outputs[1].contains("output summarized"),
+            tool_result_outputs[1].contains(" summarized:"),
             "second-oldest tool result should be summarized"
         );
         assert!(

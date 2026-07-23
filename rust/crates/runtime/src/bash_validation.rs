@@ -1,12 +1,15 @@
 //! Bash command validation submodules.
 //!
-//! Ports the upstream `BashTool` validation pipeline:
+//! Ports the upstream `BashTool` validation pipeline (9 layers):
 //! - `readOnlyValidation` — block write-like commands in read-only mode
 //! - `destructiveCommandWarning` — flag dangerous destructive commands
 //! - `modeValidation` — enforce permission mode constraints on commands
 //! - `sedValidation` — validate sed expressions before execution
 //! - `pathValidation` — detect suspicious path patterns
 //! - `commandSemantics` — classify command intent
+//! - `bashPermissions` — reject commands that need DangerFullAccess
+//! - `bashSecurity` — block pipe-to-interpreter, eval, reverse-shell
+//! - `shouldUseSandbox` — decide whether to sandbox the command
 
 use std::path::Path;
 
@@ -622,16 +625,156 @@ fn classify_git_command(command: &str) -> CommandIntent {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// bashPermissions — permission-level requirements for commands
+// ---------------------------------------------------------------------------
+
+/// Commands that unconditionally require `DangerFullAccess`.
+const DANGER_FULL_ACCESS_COMMANDS: &[&str] = &[
+    "sudo", "su", "reboot", "shutdown", "halt", "poweroff", "init",
+];
+
+/// Return `Block` when the command requires a higher permission mode than
+/// what is currently active.
+#[must_use]
+pub fn validate_permissions(command: &str, mode: PermissionMode) -> ValidationResult {
+    let first = extract_first_command(command);
+
+    for &cmd in DANGER_FULL_ACCESS_COMMANDS {
+        if first == cmd {
+            return ValidationResult::Block {
+                reason: format!(
+                    "'{cmd}' requires danger-full-access — current mode is {mode:?}"
+                ),
+            };
+        }
+    }
+
+    ValidationResult::Allow
+}
+
+// ---------------------------------------------------------------------------
+// bashSecurity — security threat scanning
+// ---------------------------------------------------------------------------
+
+/// Interpreter names commonly used in pipe-to-shell attacks.
+const INTERPRETERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "python", "python3",
+    "perl", "ruby", "node", "lua", "php",
+];
+
+/// Scan the command for dangerous security patterns.
+///
+/// Covered: pipe-to-interpreter, eval/exec, /dev/tcp reverse-shell,
+/// chmod 777 warnings.
+#[must_use]
+pub fn validate_security(command: &str) -> ValidationResult {
+    // 1. Pipe-to-interpreter: `curl … | sh`, `wget … | bash`, etc.
+    if let Some(pipe_pos) = command.rfind('|') {
+        let after_pipe = command[pipe_pos + 1..].trim();
+        let first_word = after_pipe.split_whitespace().next().unwrap_or("");
+        for &interp in INTERPRETERS {
+            if first_word == interp {
+                return ValidationResult::Block {
+                    reason: format!(
+                        "piping to '{interp}' is blocked; write to a file and execute instead"
+                    ),
+                };
+            }
+        }
+    }
+
+    // 2. eval / exec with arguments
+    let first = extract_first_command(command);
+    if first == "eval" || first == "exec" {
+        return ValidationResult::Block {
+            reason: format!(
+                "'{first}' with dynamic arguments is blocked"
+            ),
+        };
+    }
+
+    // 3. /dev/tcp reverse-shell
+    if command.contains("/dev/tcp/") {
+        return ValidationResult::Block {
+            reason: "reverse-shell pattern (/dev/tcp/) is blocked".to_string(),
+        };
+    }
+
+    // 4. chmod 777 warning
+    if first == "chmod" && (command.contains("777") || command.contains("o+w")) {
+        return ValidationResult::Warn {
+            message: "setting world-writable permissions (777) is discouraged"
+                .to_string(),
+        };
+    }
+
+    ValidationResult::Allow
+}
+
+// ---------------------------------------------------------------------------
+// shouldUseSandbox — sandbox dispatch decision
+// ---------------------------------------------------------------------------
+
+/// Decide whether this command should execute inside a sandbox.
+///
+/// Returns `true` for network commands (curl, wget, ssh, etc.) and
+/// destructive commands (rm, shred, etc.) when the permission mode is
+/// below `DangerFullAccess`.
+#[must_use]
+pub fn should_use_sandbox(command: &str, mode: PermissionMode) -> bool {
+    if mode == PermissionMode::DangerFullAccess {
+        return false;
+    }
+
+    let first = extract_first_command(command);
+
+    const NETWORK_COMMANDS: &[&str] = &[
+        "curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "telnet",
+        "nslookup", "dig", "host", "ftp",
+    ];
+    for &net_cmd in NETWORK_COMMANDS {
+        if first == net_cmd {
+            return true;
+        }
+    }
+
+    const DESTRUCTIVE_COMMANDS: &[&str] = &[
+        "rm", "shred", "truncate", "mkfs", "fdisk", "parted",
+        "wipefs", "sfdisk",
+    ];
+    for &dest_cmd in DESTRUCTIVE_COMMANDS {
+        if first == dest_cmd {
+            return true;
+        }
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline: run all validations
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
 /// Run the full validation pipeline on a bash command.
 ///
 /// Returns the first non-Allow result, or Allow if all validations pass.
-///
 /// Scans **every** sub-command in the chain (split on `;`, `|`, `&&`, `||`,
 /// trailing `&`) so that bypasses like `cat README.md && rm -rf /` cannot
 /// slip past validation by hiding the dangerous command behind a benign prefix.
+///
+/// Validation layers (9 total):
+/// 0. `check_destructive`    — block destructive patterns at raw-input level
+/// 1. `validate_permissions` — block commands that need DangerFullAccess
+/// 2. `validate_mode`        — enforce ReadOnly / WorkspaceWrite constraints
+/// 3. `validate_sed`         — validate sed expressions
+/// 4. `validate_paths`       — block path-traversal / suspicious paths
+/// 5. `validate_security`    — block pipe-to-interpreter, eval, reverse-shell
+/// 6. `should_use_sandbox`   — sandbox dispatch (separate API, not in pipeline)
+/// 7. `validate_read_only`   — called via `validate_mode` when in ReadOnly mode
+/// 8. `check_destructive` (deferred warn) — surface non-blocking destructive warnings
 #[must_use]
 pub fn validate_command(command: &str, mode: PermissionMode, workspace: &Path) -> ValidationResult {
     // 0. Destructive patterns may span the whole command line (e.g. fork bombs,
@@ -644,12 +787,23 @@ pub fn validate_command(command: &str, mode: PermissionMode, workspace: &Path) -
         return destructive;
     }
 
-    // 1. For each sub-command in the chain, run mode/sed/path validations.
+    // Also check security on the full command line (pipe-to-shell spans pipes).
+    let security = validate_security(command);
+    if matches!(security, ValidationResult::Block { .. }) {
+        return security;
+    }
+
+    // 1. For each sub-command in the chain, run all validation layers.
     //    This catches pipe/semicolon/&& bypasses like "cat x && rm y".
     for sub in split_command_chain(command) {
         let trimmed = sub.trim();
         if trimmed.is_empty() {
             continue;
+        }
+
+        let result = validate_permissions(trimmed, mode);
+        if result != ValidationResult::Allow {
+            return result;
         }
 
         let result = validate_mode(trimmed, mode);
@@ -668,10 +822,12 @@ pub fn validate_command(command: &str, mode: PermissionMode, workspace: &Path) -
         }
     }
 
-    // 2. No mode/sed/path check blocked the command; surface any deferred
-    //    destructive warning now so it is still visible to the caller.
+    // 2. No validation blocked the command; surface any deferred warnings.
     if matches!(destructive, ValidationResult::Warn { .. }) {
         return destructive;
+    }
+    if matches!(security, ValidationResult::Warn { .. }) {
+        return security;
     }
 
     ValidationResult::Allow

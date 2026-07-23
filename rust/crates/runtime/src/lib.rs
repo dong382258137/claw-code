@@ -12,6 +12,8 @@ mod bootstrap;
 pub mod branch_lock;
 pub mod cache_alignment;
 mod compact;
+pub mod content_classifier;
+pub mod content_compression;
 pub mod decision_log;
 mod config;
 pub mod config_validate;

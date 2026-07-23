@@ -536,14 +536,14 @@ impl OutputView {
     pub(crate) fn snapshot(&self) -> String {
         self.inner
             .lock()
-            .expect("OutputBuffer mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .cached_snapshot
             .clone()
     }
 
     /// 清空所有条目。
     pub(crate) fn clear(&mut self) {
-        let mut guard = self.inner.lock().expect("OutputBuffer mutex poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.entries.clear();
         guard.text_total_bytes = 0;
         guard.truncated = false;
@@ -555,7 +555,7 @@ impl OutputView {
     pub(crate) fn total_written(&self) -> u64 {
         self.inner
             .lock()
-            .expect("OutputBuffer mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .total_written
     }
 }
@@ -569,7 +569,7 @@ impl Default for OutputView {
 impl Write for OutputView {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let text = String::from_utf8_lossy(bytes);
-        let mut guard = self.inner.lock().expect("OutputBuffer mutex poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.append(&text);
         Ok(bytes.len())
     }

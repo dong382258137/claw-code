@@ -5605,24 +5605,22 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 }
 
 /// Build a [`SystemContent`] from a [`SystemPromptSplit`] with prompt-caching
-/// markers, mirroring `AnthropicRuntimeClient::build_system_blocks` in
-/// `rusty-claude-cli/src/main.rs`.
+/// markers, mirroring `build_system_blocks` in `rusty-claude-cli/src/streaming.rs`.
 ///
-/// The static (stable) sections are emitted as text blocks with
-/// `cache_control: {type: "ephemeral"}` on the **last** static block, marking
-/// the cache prefix boundary. Dynamic sections are emitted as plain text
-/// blocks (no cache marker) so they re-flow every turn.
+/// Uses tiered cache breakpoints (up to 3) computed by
+/// [`SystemPromptSplit::static_cache_breakpoints`] to enable layered caching.
+/// Dynamic sections are emitted as plain text blocks (no cache marker) so
+/// they re-flow every turn.
 ///
 /// Returns `None` if both static and dynamic sections are empty, so
 /// `MessageRequest.system` serializes to absent rather than `null`/`[]`.
 fn build_provider_system_blocks(split: &SystemPromptSplit) -> Option<SystemContent> {
     let mut blocks: Vec<SystemBlock> = Vec::new();
 
-    // Static sections: mark the last one with cache_control.
-    let static_len = split.static_sections.len();
+    let breakpoints = split.static_cache_breakpoints();
     for (index, section) in split.static_sections.iter().enumerate() {
         let mut block = SystemBlock::new(section.clone());
-        if index == static_len.saturating_sub(1) && static_len > 0 {
+        if breakpoints.contains(&index) {
             block = block.with_cache_control(CacheControl::ephemeral());
         }
         blocks.push(block);

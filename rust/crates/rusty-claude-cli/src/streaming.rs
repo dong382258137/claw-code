@@ -310,21 +310,22 @@ pub(crate) fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiEr
 /// Convert a [`SystemPromptSplit`] into an Anthropic-compatible
 /// [`SystemContent`] with prompt-caching markers.
 ///
-/// The static (stable) sections are emitted as text blocks with
-/// `cache_control: {type: "ephemeral"}` on the **last** static block,
-/// marking the cache prefix boundary. Dynamic sections are emitted as
-/// plain text blocks (no cache marker) so they re-flow every turn.
+/// Uses tiered cache breakpoints (up to 3) computed by
+/// [`SystemPromptSplit::static_cache_breakpoints`] to enable layered caching:
+/// instruction tier, snapshot tier, and config tier are cached independently,
+/// so changes in a later tier don't invalidate the cache of earlier tiers.
+/// Dynamic sections are emitted as plain text blocks (no cache marker) so
+/// they re-flow every turn.
 ///
 /// Returns `None` if both static and dynamic sections are empty, so
 /// `MessageRequest.system` serializes to absent rather than `null`/`[]`.
 pub(crate) fn build_system_blocks(split: &SystemPromptSplit) -> Option<SystemContent> {
     let mut blocks: Vec<SystemBlock> = Vec::new();
 
-    // Static sections: mark the last one with cache_control.
-    let static_len = split.static_sections.len();
+    let breakpoints = split.static_cache_breakpoints();
     for (index, section) in split.static_sections.iter().enumerate() {
         let mut block = SystemBlock::new(section.clone());
-        if index == static_len.saturating_sub(1) && static_len > 0 {
+        if breakpoints.contains(&index) {
             block = block.with_cache_control(CacheControl::ephemeral());
         }
         blocks.push(block);
@@ -891,6 +892,15 @@ pub(crate) fn push_output_block(
         OutputContentBlock::Thinking { thinking, .. } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
+            // G10.5 fix: non-streaming fallback path must emit Thinking
+            // event so downstream consumers (planner, TUI status) receive
+            // the full event stream — mirrors tools/lib.rs push_output_block.
+            if !streaming_tool_input {
+                events.push(AssistantEvent::Thinking {
+                    thinking,
+                    signature: None,
+                });
+            }
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
