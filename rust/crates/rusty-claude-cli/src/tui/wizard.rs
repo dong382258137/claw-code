@@ -1,4 +1,4 @@
-//! First-run configuration wizard for the Claw Code TUI.
+﻿//! First-run configuration wizard for the Claw Plus TUI.
 //!
 //! When the bootstrapped sentinel file is missing, this module presents a
 //! two-step ratatui screen that lets the user select a provider and enter an
@@ -488,7 +488,7 @@ fn render_detected_screen(
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                "Claw Code",
+                "Claw Plus",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -592,7 +592,7 @@ fn render_manual_input(
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                "Claw Code",
+                "Claw Plus",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

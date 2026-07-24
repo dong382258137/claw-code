@@ -1324,6 +1324,14 @@ impl LiveCli {
                 }
                 false
             }
+            SlashCommand::Im { args } => {
+                // IM Bridge: show status, config, or startup instructions.
+                let (message, _json) = handle_im_command(args.as_deref());
+                if !self.tui_println(&message) {
+                    println!("{message}");
+                }
+                false
+            }
             // /effort [low|medium|high|off] — 运行时调整 reasoning effort。
             // 无参数：显示当前值；off：清除（恢复默认）；low/medium/high：设置。
             // 设置后立即生效于下一次 API 请求，TUI 侧栏会同步显示。

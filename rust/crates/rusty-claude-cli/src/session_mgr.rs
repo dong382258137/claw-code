@@ -22,7 +22,8 @@ use crate::tool_display::{short_tool_id, truncate_for_summary};
 use crate::{
     classify_error_kind, classify_session_lifecycle_for, default_permission_mode,
     format_compact_report, format_cost_report, format_sandbox_report, format_status_report,
-    format_unknown_slash_command, handle_bg_command, handle_goal_command, handle_poor_mode_action,
+    format_unknown_slash_command, handle_bg_command, handle_goal_command, handle_im_command,
+    handle_poor_mode_action,
     init_json_value, render_config_json, render_config_report, render_diff_json_for,
     render_diff_report_for, render_doctor_report, render_export_text, render_memory_json,
     render_memory_report, render_repl_help, render_version_report, sandbox_json_value,
@@ -725,6 +726,15 @@ pub(crate) fn run_resume_command(
             // 通过文件系统通信，不需要 LiveCli 实例。
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let (message, json_value) = handle_bg_command(args.as_deref(), &cwd);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(json_value),
+            })
+        }
+        SlashCommand::Im { args } => {
+            // IM Bridge: status/config/start via resume mode.
+            let (message, json_value) = handle_im_command(args.as_deref());
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(message),

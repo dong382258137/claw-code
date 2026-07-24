@@ -682,6 +682,26 @@ fn sub_options_for(name: &str) -> Vec<SubOptionSpec> {
             requires_arg: false,
             arg_hint: None,
         }],
+        "im" => vec![
+            SubOptionSpec {
+                value: "status",
+                label: "View IM Bridge config status",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "config",
+                label: "View full IM Bridge config",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "start",
+                label: "Show IM Bridge startup command",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
         _ => Vec::new(),
     }
 }
@@ -791,6 +811,7 @@ fn chinese_summary(name: &str) -> Option<&'static str> {
         "poor" => "切换穷人模式（省 token）",
         "goal" => "设置或查看目标",
         "bg" => "后台任务管理",
+        "im" => "IM Bridge (企业微信/飞书) 管理",
         "allowed-tools" => "查看/管理允许的工具",
         "hooks" => "查看 hooks 配置",
         "format" => "设置输出格式",

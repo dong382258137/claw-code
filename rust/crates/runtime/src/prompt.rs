@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -890,7 +890,7 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
         lines.extend(prepend_bullets(vec![
-            "No Claw Code settings files loaded.".to_string()
+            "No Claw Plus settings files loaded.".to_string()
         ]));
         return lines.join("\n");
     }

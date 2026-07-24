@@ -1,4 +1,4 @@
-//! Output formatting: reports, JSON, status bar, help text, diff rendering.
+﻿//! Output formatting: reports, JSON, status bar, help text, diff rendering.
 
 use std::env;
 use std::io::{self, Write};
@@ -1675,7 +1675,7 @@ pub(crate) fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Plus\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 

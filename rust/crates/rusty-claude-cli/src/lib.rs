@@ -249,8 +249,8 @@ const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 pub const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
-pub const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
-pub const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
+pub const OFFICIAL_REPO_URL: &str = "https://github.com/dong382258137/claw-code";
+pub const OFFICIAL_REPO_SLUG: &str = "dong382258137/claw-code";
 pub const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
 
 pub type AllowedToolSet = BTreeSet<String>;

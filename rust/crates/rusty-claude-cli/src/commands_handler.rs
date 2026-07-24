@@ -1,4 +1,4 @@
-//! CLI argument parsing and slash command handler helpers.
+﻿//! CLI argument parsing and slash command handler helpers.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -416,7 +416,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
-                // Claw Code compat: -p "prompt" = one-shot prompt
+                // Claw Plus compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
                 if prompt.trim().is_empty() {
                     return Err("-p requires a prompt string".to_string());
@@ -437,7 +437,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 });
             }
             "--print" => {
-                // Claw Code compat: --print makes output non-interactive
+                // Claw Plus compat: --print makes output non-interactive
                 output_format = CliOutputFormat::Text;
                 index += 1;
             }
@@ -1418,6 +1418,9 @@ pub(crate) fn slash_command_completion_candidates_with_sessions(
         "/agents help",
         "/mcp help",
         "/skills help",
+        "/im status",
+        "/im config",
+        "/im start",
     ] {
         completions.insert(candidate.to_string());
     }
@@ -1864,4 +1867,265 @@ pub(crate) fn handle_bg_command(args: Option<&str>, cwd: &Path) -> (String, serd
             serde_json::json!({"kind": "bg", "error": format!("unknown subcommand: {other}")}),
         ),
     }
+}
+
+/// Handle `/im` slash command: IM Bridge (WeCom/Feishu BOT) management.
+///
+/// Supported args:
+/// - None / "status" / "show": read `~/.claw/im-bridge.toml` and show config status
+/// - "config": show full config file contents
+/// - "start": show startup instructions for `claw-im-bridge`
+/// - other: return usage hint
+///
+/// Returns (user-visible message, JSON structured output).
+pub(crate) fn handle_im_command(args: Option<&str>) -> (String, serde_json::Value) {
+    let trimmed = args.unwrap_or("").trim();
+    let (subcommand, _rest) = split_first_word(trimmed);
+
+    let config_path = im_bridge_config_path();
+    let config_exists = config_path.exists();
+
+    match subcommand {
+        "" | "status" | "show" => render_im_status(&config_path, config_exists),
+        "config" => render_im_config(&config_path, config_exists),
+        "start" => render_im_start_command(),
+        other => (
+            format!(
+                "Unknown im subcommand: '{other}'.\n\x1b[2mUsage: /im [status|config|start]\x1b[0m"
+            ),
+            serde_json::json!({"kind": "im", "error": format!("unknown subcommand: {other}")}),
+        ),
+    }
+}
+
+fn im_bridge_config_path() -> std::path::PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".claw").join("im-bridge.toml")
+}
+
+fn render_im_status(
+    config_path: &std::path::Path,
+    config_exists: bool,
+) -> (String, serde_json::Value) {
+    let mut lines = vec!["\u{1f916} IM Bridge Status".to_string()];
+    lines.push(format!(
+        "  \x1b[2mConfig path\x1b[0m: {}",
+        config_path.display()
+    ));
+
+    if !config_exists {
+        lines.push("  \x1b[2mStatus\x1b[0m:       \x1b[33m\u{26a0} Not configured\x1b[0m".to_string());
+        lines.push(String::new());
+        lines.push("\x1b[2mCreate ~/.claw/im-bridge.toml to enable IM bridging:\x1b[0m".to_string());
+        lines.push(String::new());
+        lines.push("  For WeCom (\u{4f01}\u{4e1a}\u{5fae}\u{4fe1}):".to_string());
+        lines.push("    [wecom]".to_string());
+        lines.push("    corp_id = \"YOUR_CORP_ID\"".to_string());
+        lines.push("    secret = \"YOUR_SECRET\"".to_string());
+        lines.push("    token = \"YOUR_TOKEN\"".to_string());
+        lines.push("    encoding_aes_key = \"YOUR_43_CHAR_AES_KEY\"".to_string());
+        lines.push("    webhook_url = \"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx\"".to_string());
+        lines.push(String::new());
+        lines.push("  For Feishu (\u{98de}\u{4e66}):".to_string());
+        lines.push("    [feishu]".to_string());
+        lines.push("    app_id = \"YOUR_APP_ID\"".to_string());
+        lines.push("    app_secret = \"YOUR_APP_SECRET\"".to_string());
+        lines.push(String::new());
+        lines.push("\x1b[2mThen run \x1b[1mclaw-im-bridge\x1b[0m\x1b[2m to start the bridge.\x1b[0m".to_string());
+
+        return (
+            lines.join("\n"),
+            serde_json::json!({
+                "kind": "im",
+                "action": "status",
+                "configured": false,
+                "config_path": config_path.display().to_string(),
+                "platforms": [],
+            }),
+        );
+    }
+
+    // Read and parse config
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => {
+            let mut platforms = Vec::new();
+            let wecom_configured = content.contains("[wecom]");
+            let feishu_configured = content.contains("[feishu]");
+
+            lines.push("  \x1b[2mStatus\x1b[0m:       \x1b[32m\u{2705} Configured\x1b[0m".to_string());
+            lines.push(String::new());
+            lines.push("  \x1b[2mPlatforms:\x1b[0m".to_string());
+
+            if wecom_configured {
+                platforms.push("wecom".to_string());
+                lines.push("    \u{1f7e2} WeCom (\u{4f01}\u{4e1a}\u{5fae}\u{4fe1})".to_string());
+                // Try to extract webhook_url for info
+                for line in content.lines() {
+                    if line.trim().starts_with("webhook_url") {
+                        let val = line
+                            .trim()
+                            .trim_start_matches("webhook_url")
+                            .trim_start_matches('=')
+                            .trim()
+                            .trim_matches('"');
+                        // Show truncated URL for privacy
+                        let display = if val.len() > 60 {
+                            format!("{}...", &val[..60])
+                        } else {
+                            val.to_string()
+                        };
+                        lines.push(format!("      \x1b[2mwebhook\x1b[0m: {display}"));
+                    } else if line.trim().starts_with("agent_id") {
+                        let val = line
+                            .trim()
+                            .trim_start_matches("agent_id")
+                            .trim_start_matches('=')
+                            .trim();
+                        lines.push(format!("      \x1b[2magent_id\x1b[0m: {val}"));
+                    }
+                }
+            }
+
+            if feishu_configured {
+                platforms.push("feishu".to_string());
+                lines.push("    \u{1f7e2} Feishu (\u{98de}\u{4e66}/Lark)".to_string());
+            }
+
+            if platforms.is_empty() {
+                lines.push("    \x1b[33m\u{26a0} No platform sections detected\x1b[0m".to_string());
+            }
+
+            lines.push(String::new());
+            lines.push("  Commands:".to_string());
+            lines.push("    \x1b[2m/im config\x1b[0m    \u{2014} view full config".to_string());
+            lines.push("    \x1b[2m/im start\x1b[0m     \u{2014} show startup instructions".to_string());
+            lines.push("    \x1b[2mclaw-im-bridge\x1b[0m \u{2014} start directly".to_string());
+
+            (
+                lines.join("\n"),
+                serde_json::json!({
+                    "kind": "im",
+                    "action": "status",
+                    "configured": true,
+                    "config_path": config_path.display().to_string(),
+                    "platforms": platforms,
+                }),
+            )
+        }
+        Err(e) => (
+            format!(
+                "\u{1f916} IM Bridge\n  \x1b[2mConfig path\x1b[0m: {}\n  \x1b[31mError\x1b[0m: failed to read config: {e}",
+                config_path.display()
+            ),
+            serde_json::json!({
+                "kind": "im",
+                "action": "status",
+                "configured": false,
+                "config_path": config_path.display().to_string(),
+                "error": e.to_string(),
+            }),
+        ),
+    }
+}
+
+fn render_im_config(
+    config_path: &std::path::Path,
+    config_exists: bool,
+) -> (String, serde_json::Value) {
+    if !config_exists {
+        return (
+            format!(
+                "\u{1f916} IM Bridge Config\n  \x1b[2mPath\x1b[0m: {}\n  \x1b[33m\u{26a0} Config file not found\x1b[0m\n\n\x1b[2mUse /im status to see setup instructions.\x1b[0m",
+                config_path.display()
+            ),
+            serde_json::json!({
+                "kind": "im",
+                "action": "config",
+                "exists": false,
+                "config_path": config_path.display().to_string(),
+            }),
+        );
+    }
+
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let line_count = lines.len();
+            let mut output = vec![
+                format!(
+                    "\u{1f916} IM Bridge Config \u{2014} {}",
+                    config_path.display()
+                ),
+                format!("  \x1b[2mLines\x1b[0m: {line_count}"),
+                String::new(),
+                "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} config begin \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".to_string(),
+            ];
+            output.extend(lines.iter().map(|l| l.to_string()));
+            output.push("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} config end \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".to_string());
+            output.push(String::new());
+            output.push("\x1b[2mEdit this file directly.\x1b[0m".to_string());
+
+            (
+                output.join("\n"),
+                serde_json::json!({
+                    "kind": "im",
+                    "action": "config",
+                    "exists": true,
+                    "config_path": config_path.display().to_string(),
+                    "lines": line_count,
+                    "content": content,
+                }),
+            )
+        }
+        Err(e) => (
+            format!(
+                "\u{1f916} IM Bridge Config\n  \x1b[2mPath\x1b[0m: {}\n  \x1b[31mError\x1b[0m: {e}",
+                config_path.display()
+            ),
+            serde_json::json!({
+                "kind": "im",
+                "action": "config",
+                "exists": false,
+                "config_path": config_path.display().to_string(),
+                "error": e.to_string(),
+            }),
+        ),
+    }
+}
+
+fn render_im_start_command() -> (String, serde_json::Value) {
+    let message = [
+        "\u{1f916} Starting IM Bridge",
+        "",
+        "  The IM Bridge runs as a standalone process:",
+        "",
+        "    \x1b[1mclaw-im-bridge\x1b[0m",
+        "",
+        "  Or with cargo:",
+        "",
+        "    \x1b[1mcargo run --bin claw-im-bridge\x1b[0m",
+        "",
+        "  Prerequisites:",
+        "    1. Create \x1b[2m~/.claw/im-bridge.toml\x1b[0m with platform config",
+        "    2. Set \x1b[2mANTHROPIC_API_KEY\x1b[0m (or equivalent) in env",
+        "    3. Configure bot webhook URL in WeCom/Feishu admin panel",
+        "",
+        "  The bridge will start an HTTP server at \x1b[2m127.0.0.1:3456\x1b[0m (configurable).",
+        "  Press Ctrl+C to stop.",
+        "",
+        "  \x1b[2mUse /im status to check your configuration first.\x1b[0m",
+    ]
+    .join("\n");
+
+    (
+        message,
+        serde_json::json!({
+            "kind": "im",
+            "action": "start",
+            "command": "claw-im-bridge",
+        }),
+    )
 }

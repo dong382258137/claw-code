@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+﻿use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -251,7 +251,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "plugin",
         aliases: &["plugins", "marketplace"],
-        summary: "Manage Claw Code plugins",
+        summary: "Manage Claw Plus plugins",
         argument_hint: Some(
             "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
         ),
@@ -556,6 +556,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Manage background claw sessions (spawn/ps/logs/kill/purge)",
         argument_hint: Some("[ps|logs <pid>|kill <pid>|purge <pid>|spawn <prompt>]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "im",
+        aliases: &[],
+        summary: "Manage IM Bridge (WeCom/Feishu bot status, config, startup)",
+        argument_hint: Some("[status|config|start]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1238,6 +1245,10 @@ pub enum SlashCommand {
     Bg {
         args: Option<String>,
     },
+    /// IM Bridge 管理：`/im` 查看状态、`/im config` 查看配置、`/im start` 查看启动指引。
+    Im {
+        args: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -1340,6 +1351,7 @@ impl SlashCommand {
             Self::Poor { .. } => "/poor",
             Self::Goal { .. } => "/goal",
             Self::Bg { .. } => "/bg",
+            Self::Im { .. } => "/im",
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -1563,6 +1575,7 @@ pub fn validate_slash_command_input(
         "poor" => SlashCommand::Poor { action: remainder },
         "goal" => SlashCommand::Goal { args: remainder },
         "bg" => SlashCommand::Bg { args: remainder },
+        "im" => SlashCommand::Im { args: remainder },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
@@ -4397,6 +4410,7 @@ pub fn handle_slash_command(
         | SlashCommand::Poor { .. }
         | SlashCommand::Goal { .. }
         | SlashCommand::Bg { .. }
+        | SlashCommand::Im { .. }
         | SlashCommand::Search { .. }
         | SlashCommand::Undo
         | SlashCommand::Unknown(_) => None,
@@ -5005,7 +5019,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 145);
+        assert_eq!(slash_command_specs().len(), 146);
         assert!(resume_supported_slash_commands().len() >= 42);
     }
 
@@ -5066,7 +5080,7 @@ mod tests {
 
         // then
         assert!(help.contains("/plugin"));
-        assert!(help.contains("Summary          Manage Claw Code plugins"));
+        assert!(help.contains("Summary          Manage Claw Plus plugins"));
         assert!(help.contains("Aliases          /plugins, /marketplace"));
         assert!(help.contains("Category         Tools"));
     }
