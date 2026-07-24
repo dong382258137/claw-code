@@ -1,4 +1,4 @@
-# CLAW 多 Agent 编排硬化方案
+﻿# CLAW 多 Agent 编排硬化方案
 
 > **状态**：设计草案(v3 — 含现状核实 / 状态机 / spike / 泛化抽象 / MVP 范围 / 成本门禁 / LlmJudgeGate / checkpoint)
 > **日期**：2026-07-22
@@ -1941,7 +1941,7 @@ cargo test -p api --release model_tier            # 验证能力分级
 
 # 3. 运行时验证
 $env:CLAW_DIAG=1
-./target/release/claw.exe
+./target/release/claw-plus.exe
 # 检查 ~/.claw/claw-diag.log 是否生成
 
 # 4. panic hook 验证
@@ -2167,7 +2167,7 @@ cargo test -p api --release provider_client_integration -- --nocapture
 
 # 手动 spike(需设置 OPENAI_API_KEY / OPENAI_BASE_URL 指向 deepseek)
 $env:CLAW_DIAG=1
-./target/release/claw.exe --model deepseek-v4-flash --diag
+./target/release/claw-plus.exe --model deepseek-v4-flash --diag
 # 检查 ~/.claw/claw-diag.log 中 "constructing dedicated client" 日志
 ```
 

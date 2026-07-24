@@ -1,8 +1,8 @@
-# CLAW Design Verification Report
+﻿# CLAW Design Verification Report
 
 **Date**: 2025-07-23  
 **Scope**: 12 groups, full coverage (G1–G12)  
-**Tool**: `scripts/verify-design.ps1` driven by `claw` (claude-opus-4-6)  
+**Tool**: `scripts/verify-design.ps1` driven by `claw-plus` (claude-opus-4-6)  
 **Total Cost**: ~6M tokens, ~$26 USD  
 **Duration**: ~75 min (4 batches × 3 groups)  
 **Last Updated**: 2025-07-24 02:30 (Groups A/B/C complete; D1/D2/E pending for next session)

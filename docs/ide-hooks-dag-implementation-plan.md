@@ -1,8 +1,8 @@
-# Claw Code 三大模块实现方案:IDE 集成 / Hooks 系统 / DAG 多 Agent 编排
+﻿# Claw Plus 三大模块实现方案:IDE 集成 / Hooks 系统 / DAG 多 Agent 编排
 
 > 文档版本:v1.0
 > 制定日期:2026-07-21
-> 适用对象:Claw Code v0.2.0(SHA `8af738a`)
+> 适用对象:Claw Plus v0.2.0(SHA `8af738a`)
 > 调研基础:ACP 1.5 / Claude Code Hooks / LangGraph / Anthropic Multi-Agent Research System / MIRIX / CompactionRL / GuardAgent
 
 ---
@@ -46,12 +46,12 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Claw Code Runtime                        │
+│                    Claw Plus Runtime                        │
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  IDE 集成层(ACP 1.5 stdio server)                   │  │
 │  │  - 协议层:agent-client-protocol crate               │  │
-│  │  - 入口:claw acp serve / claw-headless              │  │
+│  │  - 入口:claw acp serve / claw-plus-headless              │  │
 │  │  - 扩展点:SessionNotification / fs/* / permission   │  │
 │  └──────────────────────────────────────────────────────┘  │
 │                          ↕                                  │
@@ -102,7 +102,7 @@
 
 ### 2.1 核心结论
 
-**Claw Code 已具备 IDE 集成基础设施**(Phase A 完成的 `claw acp serve`),需要做的:
+**Claw Plus 已具备 IDE 集成基础设施**(Phase A 完成的 `claw acp serve`),需要做的:
 
 1. **升级 ACP 协议版本**:0.10.4 → 1.5(获取 v2 diff/permission 能力)
 2. **补齐协议方法**:fs/read_text_file / fs/write_text_file / session/request_permission / session/load / session/resume
@@ -408,7 +408,7 @@ pub enum HookEvent {
     PreToolUse,
     #[serde(rename = "PostToolUse")]
     PostToolUse,
-    /// Claw Code 特色:保留独立失败事件(优于 Claude Code 并入 PostToolUse)
+    /// Claw Plus 特色:保留独立失败事件(优于 Claude Code 并入 PostToolUse)
     #[serde(rename = "PostToolUseFailure")]
     PostToolUseFailure,
     /// MCP 工具专用,可改 updatedOutput

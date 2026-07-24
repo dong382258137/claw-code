@@ -1,6 +1,6 @@
-# G011 ACP/Zed and JSON-RPC status contract
+﻿# G011 ACP/Zed and JSON-RPC status contract
 
-Claw Code 2.0 keeps ACP/Zed and JSON-RPC serving behind the stable task,
+Claw Plus 2.0 keeps ACP/Zed and JSON-RPC serving behind the stable task,
 session-control, and event/report contracts from the roadmap. The current public
 surface is therefore a **truthful unsupported status**, not a hidden daemon.
 

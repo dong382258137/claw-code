@@ -1,6 +1,6 @@
-# Navigation and file context guide
+﻿# Navigation and file context guide
 
-This guide answers the common “how do I browse output?” and “how do I submit a file?” questions for Claw Code. Claw is an agent CLI, not a full file manager: terminal navigation comes from your shell or terminal, while file context is passed explicitly in prompts.
+This guide answers the common “how do I browse output?” and “how do I submit a file?” questions for Claw Plus. Claw is an agent CLI, not a full file manager: terminal navigation comes from your shell or terminal, while file context is passed explicitly in prompts.
 
 ## Prompt and terminal navigation
 

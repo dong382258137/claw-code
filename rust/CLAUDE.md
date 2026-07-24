@@ -1,6 +1,6 @@
-# CLAUDE.md
+﻿# CLAUDE.md
 
-This file provides guidance to Claw Code (clawcode.dev) when working with code in this repository.
+This file provides guidance to Claw Plus (clawcode.dev) when working with code in this repository.
 
 ## Detected stack
 - Languages: Rust.

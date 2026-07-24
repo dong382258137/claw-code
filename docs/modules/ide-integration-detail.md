@@ -1,11 +1,11 @@
-# IDE 集成细化方案:ACP 1.5 升级 + ClawAgent 扩展 + LaneEvent 桥接
+﻿# IDE 集成细化方案:ACP 1.5 升级 + ClawAgent 扩展 + LaneEvent 桥接
 
 > 文档版本:v0.2
 > 创建日期:2026-07-21
 > 最后更新:2026-07-21(从 v0.1 细化,新增 PoC 验证与双版本兼容)
 > 父文档:[ide-hooks-dag-implementation-plan.md](../ide-hooks-dag-implementation-plan.md)
 > 焦点:ACP 1.5 升级路径 + PoC 验证 + 双版本兼容 + ClawAgent 扩展 + LaneEvent 桥接 + VS Code 扩展骨架
-> 适用对象:Claw Code v0.2.0(SHA `8af738a`)
+> 适用对象:Claw Plus v0.2.0(SHA `8af738a`)
 > 调研基础:`agent-client-protocol` 0.10.4(已实现,Cargo.lock 锁定 0.10.4)/ 1.3.0(过渡)/ 1.5.0(目标)
 
 ---
@@ -55,7 +55,7 @@
 
 ### 1.1 已实现基础设施
 
-Claw Code 在 Phase A(`commit 8af738a`)已完成 ACP 0.10.4 接入层,核心代码组织如下:
+Claw Plus 在 Phase A(`commit 8af738a`)已完成 ACP 0.10.4 接入层,核心代码组织如下:
 
 | 模块 | 路径 | 职责 |
 |------|------|------|
@@ -63,7 +63,7 @@ Claw Code 在 Phase A(`commit 8af738a`)已完成 ACP 0.10.4 接入层,核心代�
 | `claw-shell::agent` | [agent.rs](file:///d:/claw-code-src/rust/crates/claw-shell/src/agent.rs) | `ClawAgent<C>` 实现 `acp::Agent` trait |
 | `claw-shell::spawn` | [spawn.rs](file:///d:/claw-code-src/rust/crates/claw-shell/src/spawn.rs) | 独立线程 + `LocalSet` 启动模式 |
 | `claw-shell::stdio` | [stdio.rs](file:///d:/claw-code-src/rust/crates/claw-shell/src/stdio.rs) | `run_stdio_agent` / `run_agent_on_io`(可测试核心) |
-| `claw-headless` binary | [headless.rs](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs) | 极简 stdio ACP 服务器入口,供 Zed 等 spawn |
+| `claw-plus-headless` binary | [headless.rs](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs) | 极简 stdio ACP 服务器入口,供 Zed 等 spawn |
 | `runtime::lane_events` | [lane_events.rs](file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs) | 23 种 `LaneEventName` + 全局 sink(`Mutex<Vec<LaneEvent>>`) |
 
 ### 1.2 已实现的 ACP 方法清单(0.10.4)
@@ -323,21 +323,21 @@ diff <(grep "^test result" /tmp/baseline-0_10_4.log) <(grep "^test result" /tmp/
 
 #### Phase 4:端到端验证(1 天)
 
-**目标**:用真实 Zed 编辑器连接 PoC 分支构建的 `claw-headless`,验证完整 ACP 流程。
+**目标**:用真实 Zed 编辑器连接 PoC 分支构建的 `claw-plus-headless`,验证完整 ACP 流程。
 
 **前置准备**:
 
 ```bash
-# 1. 在 PoC 分支构建 1.5 版本的 claw-headless
+# 1. 在 PoC 分支构建 1.5 版本的 claw-plus-headless
 cd d:\claw-code-src\rust
-cargo build --release --bin claw-headless --features unstable-v2
+cargo build --release --bin claw-plus-headless --features unstable-v2
 
 # 2. 复制到独立目录(避免覆盖 0.10.4 版本)
 mkdir -p C:\Users\38225\.cargo\bin\poc-1-5\
-copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\poc-1-5\claw-headless-1-5.exe
+copy target\release\claw-plus-headless.exe C:\Users\38225\.cargo\bin\poc-1-5\claw-plus-headless-1-5.exe
 
 # 3. 验证版本
-C:\Users\38225\.cargo\bin\poc-1-5\claw-headless-1-5.exe --version
+C:\Users\38225\.cargo\bin\poc-1-5\claw-plus-headless-1-5.exe --version
 # 期望输出包含 "acp-protocol: 1.5"
 ```
 
@@ -345,13 +345,13 @@ C:\Users\38225\.cargo\bin\poc-1-5\claw-headless-1-5.exe --version
 
 | # | 步骤 | 预期结果 | 通过? |
 |---|------|---------|--------|
-| 1 | Zed 启动,读取 agents.json(指向 1.5 binary) | "Claw Code" 出现在 agent 列表 | [ ] |
-| 2 | 选 "Claw Code",发 "hello" prompt | 收到 assistant 回复(AgentMessageChunk) | [ ] |
+| 1 | Zed 启动,读取 agents.json(指向 1.5 binary) | "Claw Plus" 出现在 agent 列表 | [ ] |
+| 2 | 选 "Claw Plus",发 "hello" prompt | 收到 assistant 回复(AgentMessageChunk) | [ ] |
 | 3 | 让 Claw 读当前打开的文件 | `fs/read_text_file` 反向请求成功 | [ ] |
 | 4 | 让 Claw 写文件(覆盖现有内容) | `fs/write_text_file` 返回 `written: true` | [ ] |
 | 5 | 让 Claw 执行 Bash 命令(`ls`) | `session/request_permission` 弹窗 + 用户允许后执行 | [ ] |
 | 6 | prompt 中途按 Esc | `session/cancel` 通知送达(P0 stub 返回 Ok) | [ ] |
-| 7 | 关闭 Zed | `claw-headless-1-5.exe` 进程退出(Task Manager 检查) | [ ] |
+| 7 | 关闭 Zed | `claw-plus-headless-1-5.exe` 进程退出(Task Manager 检查) | [ ] |
 
 **验收门 G4**:
 - 7 步全部通过 → PoC 成功
@@ -514,10 +514,10 @@ acp-1_5 = ["claw-acp/acp-1_5", "claw-shell/acp-1_5"]
 
 ```bash
 # 生产构建(默认 0.10.4)
-cargo build --release --bin claw-headless
+cargo build --release --bin claw-plus-headless
 
 # PoC / 开发构建(1.5)
-cargo build --release --bin claw-headless --features claw-shell/acp-1_5
+cargo build --release --bin claw-plus-headless --features claw-shell/acp-1_5
 
 # 测试两个版本
 cargo test --workspace                              # 0.10.4
@@ -1309,7 +1309,7 @@ where
 
 #### 与现有 Read tool 的关系(v0.2 新增)
 
-Claw Code 现有 `Read` tool(在 [rust/crates/runtime/src/tools/](file:///d:/claw-code-src/rust/crates/runtime/src/tools/) 下)是 **agent 主动调用**的工具,直接通过 `tokio::fs::read_to_string` 读磁盘。
+Claw Plus 现有 `Read` tool(在 [rust/crates/runtime/src/tools/](file:///d:/claw-code-src/rust/crates/runtime/src/tools/) 下)是 **agent 主动调用**的工具,直接通过 `tokio::fs::read_to_string` 读磁盘。
 
 **两条读路径的对比**:
 
@@ -1655,7 +1655,7 @@ Step 6: Agent 根据 outcome 决定后续
 
 #### 与现有 PermissionMode 的协同(v0.2 新增)
 
-Claw Code 现有 `PermissionMode`(Readonly / WorkspaceWrite / DangerFullAccess)在 `new_session` 时由 client 指定,控制 agent 的整体权限级别。`session/request_permission` 是更细粒度的 per-tool 审批,两者协同:
+Claw Plus 现有 `PermissionMode`(Readonly / WorkspaceWrite / DangerFullAccess)在 `new_session` 时由 client 指定,控制 agent 的整体权限级别。`session/request_permission` 是更细粒度的 per-tool 审批,两者协同:
 
 | PermissionMode | 是否调用 request_permission | 理由 |
 |---------------|---------------------------|------|
@@ -2679,7 +2679,7 @@ where
 VS Code 扩展采用**薄客户端**模式:
 
 1. 不实现 agent 逻辑,只做 UI 桥接
-2. 通过 `child_process.spawn` 启动 `claw-headless` binary
+2. 通过 `child_process.spawn` 启动 `claw-plus-headless` binary
 3. 通过 stdin/stdout 传 JSON-RPC,与 ACP 协议完全对齐
 4. 复用 `vscode-languageserver/node` 的 `createConnection` 处理 JSON-RPC framing
 
@@ -2688,7 +2688,7 @@ VS Code 扩展采用**薄客户端**模式:
 ```json
 {
   "name": "claw-code",
-  "displayName": "Claw Code",
+  "displayName": "Claw Plus",
   "description": "ACP-compatible AI coding agent for VS Code",
   "version": "0.1.0",
   "engines": { "vscode": "^1.85.0" },
@@ -2705,12 +2705,12 @@ VS Code 扩展采用**薄客户端**模式:
       { "command": "claw.sendPrompt", "title": "Claw: Send Prompt" }
     ],
     "configuration": {
-      "title": "Claw Code",
+      "title": "Claw Plus",
       "properties": {
         "claw.binaryPath": {
           "type": "string",
-          "default": "claw-headless",
-          "description": "Path to claw-headless binary"
+          "default": "claw-plus-headless",
+          "description": "Path to claw-plus-headless binary"
         },
         "claw.model": {
           "type": "string",
@@ -2729,7 +2729,7 @@ VS Code 扩展采用**薄客户端**模式:
       {
         "id": "claw",
         "name": "claw",
-        "description": "Claw Code AI agent",
+        "description": "Claw Plus AI agent",
         "isSticky": true,
         "commands": [
           { "name": "plan", "description": "Plan mode (read-only)" },
@@ -2755,7 +2755,7 @@ VS Code 扩展采用**薄客户端**模式:
 // vscode-claw-extension/src/extension.ts
 //
 // 薄客户端架构:
-// - spawn claw-headless 子进程
+// - spawn claw-plus-headless 子进程
 // - 用 vscode-languageserver 的 createConnection 桥接 stdin/stdout
 // - 注册 fs/read_text_file / fs/write_text_file / session/request_permission 反向 handler
 
@@ -2768,7 +2768,7 @@ let outputChannel: vscode.OutputChannel;
 let connection: any = null;
 
 export function activate(context: vscode.ExtensionContext) {
-    outputChannel = vscode.window.createOutputChannel('Claw Code');
+    outputChannel = vscode.window.createOutputChannel('Claw Plus');
 
     // 注册命令:启动 Claw ACP server
     context.subscriptions.push(
@@ -2801,11 +2801,11 @@ async function startClawServer() {
     }
 
     const config = vscode.workspace.getConfiguration('claw');
-    const binaryPath = config.get<string>('binaryPath', 'claw-headless');
+    const binaryPath = config.get<string>('binaryPath', 'claw-plus-headless');
     const model = config.get<string>('model', 'claude-sonnet-4-5');
     const permissionMode = config.get<string>('permissionMode', 'workspace-write');
 
-    // spawn claw-headless 子进程
+    // spawn claw-plus-headless 子进程
     clawProcess = spawn(binaryPath, [
         '--model', model,
         '--permission-mode', permissionMode,
@@ -2953,7 +2953,7 @@ export function deactivate() {
 ```typescript
 // vscode-claw-extension/src/acp-transport.ts
 //
-// ACP 传输层:封装 claw-headless 子进程的 stdin/stdout 管道,
+// ACP 传输层:封装 claw-plus-headless 子进程的 stdin/stdout 管道,
 // 处理 JSON-RPC framing(每行一条 NDJSON)。
 //
 // 设计原则:
@@ -3005,7 +3005,7 @@ export class AcpTransport extends EventEmitter {
         super();
     }
 
-    /** 启动 claw-headless 子进程,初始化 JSON-RPC 通道 */
+    /** 启动 claw-plus-headless 子进程,初始化 JSON-RPC 通道 */
     async start(): Promise<void> {
         if (this.process) {
             throw new Error('Transport already started');
@@ -3029,7 +3029,7 @@ export class AcpTransport extends EventEmitter {
         // 进程退出:emit 'exit' 事件,reject 所有 pending 请求
         this.process.on('exit', (code, signal) => {
             this.emit('exit', { code, signal });
-            const err = new Error(`claw-headless exited: code=${code} signal=${signal}`);
+            const err = new Error(`claw-plus-headless exited: code=${code} signal=${signal}`);
             for (const { reject } of this.pending.values()) {
                 reject(err);
             }
@@ -3150,7 +3150,7 @@ import { AcpTransport } from './acp-transport';
 
 async function startClawServer() {
     const transport = new AcpTransport({
-        binaryPath: config.get('binaryPath', 'claw-headless'),
+        binaryPath: config.get('binaryPath', 'claw-plus-headless'),
         args: ['--model', config.get('model', 'claude-sonnet-4-5')],
         cwd: vscode.workspace.rootPath,
     });
@@ -3192,7 +3192,7 @@ VS Code 扩展需处理以下错误场景,确保任一错误不导致 VS Code �
 
 | # | 错误场景 | 触发原因 | 处理策略 | 用户感知 |
 |---|---------|---------|---------|---------|
-| 1 | 子进程崩溃(exit code ≠ 0) | claw-headless panic / OOM | 自动重启(最多 3 次,间隔 5s);超限提示用户检查 binary | "Claw server crashed, restarting..." |
+| 1 | 子进程崩溃(exit code ≠ 0) | claw-plus-headless panic / OOM | 自动重启(最多 3 次,间隔 5s);超限提示用户检查 binary | "Claw server crashed, restarting..." |
 | 2 | 子进程无法启动(ENOENT) | binaryPath 配置错误 | 提示用户检查设置,提供"打开设置"按钮 | "Binary not found at {path}" |
 | 3 | stdin EOF(用户关闭窗口) | VS Code 关闭 | 优雅关闭 transport,杀子进程 | 无(后台清理) |
 | 4 | stdout 解析失败(非 JSON) | 协议不兼容 / binary 输出脏数据 | log error,丢弃该行,继续 | "Failed to parse message: {line}" |
@@ -3271,7 +3271,7 @@ export class ErrorRecovery {
 // vscode-claw-extension/src/extension.ts(完整版,200+ 行)
 //
 // 完整功能:
-// 1. spawn claw-headless 子进程(走 §6.5 AcpTransport)
+// 1. spawn claw-plus-headless 子进程(走 §6.5 AcpTransport)
 // 2. 创建 ACP client(JSON-RPC over stdio)
 // 3. 注册命令(claw.start / claw.stop / claw.sendPrompt / claw.cancelPrompt)
 // 4. 实现_webviewPanel UI(对话窗口,自定义而非 chat participant)
@@ -3289,12 +3289,12 @@ let statusBarItem: vscode.StatusBarItem;
 const sessions = new Map<string, { panel: vscode.WebviewPanel; sessionId: string }>();
 
 export function activate(context: vscode.ExtensionContext) {
-    outputChannel = vscode.window.createOutputChannel('Claw Code');
+    outputChannel = vscode.window.createOutputChannel('Claw Plus');
     errorRecovery = new ErrorRecovery();
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.command = 'claw.showStatus';
     statusBarItem.text = '$(comment-discussion) Claw';
-    statusBarItem.tooltip = 'Claw Code:点击管理';
+    statusBarItem.tooltip = 'Claw Plus:点击管理';
     statusBarItem.show();
 
     context.subscriptions.push(
@@ -3320,7 +3320,7 @@ async function startClawServer() {
     }
     const config = vscode.workspace.getConfiguration('claw');
     transport = new AcpTransport({
-        binaryPath: config.get('binaryPath', 'claw-headless'),
+        binaryPath: config.get('binaryPath', 'claw-plus-headless'),
         args: [
             '--model', config.get('model', 'claude-sonnet-4-5'),
             '--permission-mode', config.get('permissionMode', 'workspace-write'),
@@ -3388,7 +3388,7 @@ async function openChatPanel() {
     // 创建 webview panel
     const panel = vscode.window.createWebviewPanel(
         'clawChat',
-        'Claw Code',
+        'Claw Plus',
         vscode.ViewColumn.Beside,
         { enableScripts: true }
     );
@@ -3516,7 +3516,7 @@ export function deactivate() {
 
 **本骨架的完整性检查**:
 
-- [x] spawn claw-headless 子进程
+- [x] spawn claw-plus-headless 子进程
 - [x] 创建 ACP client(JSON-RPC over stdio)
 - [x] 注册命令(claw.start / claw.stop / claw.sendPrompt / claw.cancelPrompt)
 - [x] 实现_webviewPanel UI(对话窗口)
@@ -3539,9 +3539,9 @@ Zed 通过 `~/.config/zed/agents.json`(macOS)/ `%APPDATA%\Zed\agents.json`(Windo
 {
   "agent_servers": {
     "claw": {
-      "name": "Claw Code",
+      "name": "Claw Plus",
       "command": {
-        "binary": "claw-headless",
+        "binary": "claw-plus-headless",
         "args": ["--model", "claude-sonnet-4-5", "--permission-mode", "workspace-write"],
         "env": {
           "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
@@ -3561,15 +3561,15 @@ Zed 通过 `~/.config/zed/agents.json`(macOS)/ `%APPDATA%\Zed\agents.json`(Windo
 ### 7.2 启动命令
 
 ```bash
-# 1. 编译 claw-headless binary
+# 1. 编译 claw-plus-headless binary
 cd d:\claw-code-src\rust
-cargo build --release --bin claw-headless
+cargo build --release --bin claw-plus-headless
 
 # 2. 复制到 PATH(Windows)
-copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\
+copy target\release\claw-plus-headless.exe C:\Users\38225\.cargo\bin\
 
 # 3. 配置 Zed agents.json(见上)
-# 4. 重启 Zed,在 Assistant panel 选择 "Claw Code" agent
+# 4. 重启 Zed,在 Assistant panel 选择 "Claw Plus" agent
 # 5. 发送测试 prompt 验证
 ```
 
@@ -3577,12 +3577,12 @@ copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\
 
 | # | 步骤 | 预期结果 | 验证方式 |
 |---|------|---------|---------|
-| 1 | Zed 启动,打开 Assistant panel | "Claw Code" 出现在 agent 选择列表 | UI 检查 |
-| 2 | 选 "Claw Code",发 "hello" | 收到 assistant 回复 | 看到消息气泡 |
+| 1 | Zed 启动,打开 Assistant panel | "Claw Plus" 出现在 agent 选择列表 | UI 检查 |
+| 2 | 选 "Claw Plus",发 "hello" | 收到 assistant 回复 | 看到消息气泡 |
 | 3 | 让 Claw 读当前打开的文件 | editor buffer 被读取 | 日志看到 `fs/read_text_file` 调用 |
 | 4 | 让 Claw 写文件 | 弹出权限确认对话框 | 选 Allow 后文件被修改 |
 | 5 | 让 Claw 执行 Bash 命令 | 弹出权限确认 | 选 Allow 后命令执行,输出推送回 IDE |
-| 6 | 关闭 Zed | claw-headless 进程退出 | Task Manager 检查 |
+| 6 | 关闭 Zed | claw-plus-headless 进程退出 | Task Manager 检查 |
 | 7 | 重启 Zed | session 恢复(P1 验证) | 历史消息可见 |
 
 ### 7.4 完整 agents.json(全部字段,v0.2 新增)
@@ -3594,11 +3594,11 @@ copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\
   "$schema": "https://zed.dev/schemas/agents.json",
   "agent_servers": {
     "claw": {
-      "name": "Claw Code",
+      "name": "Claw Plus",
       "version": "0.2.0",
       "description": "ACP-compatible AI coding agent with LaneEvent streaming",
       "command": {
-        "binary": "claw-headless",
+        "binary": "claw-plus-headless",
         "args": [
           "--model", "claude-sonnet-4-5",
           "--permission-mode", "workspace-write",
@@ -3664,7 +3664,7 @@ copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\
 # 用法:.\scripts\test-zed-integration.ps1 [-AcpVersion "0_10"|"1_5"]
 #
 # 功能:
-# 1. 构建 claw-headless(默认 0.10.4 / 1.5)
+# 1. 构建 claw-plus-headless(默认 0.10.4 / 1.5)
 # 2. 部署到独立目录(避免覆盖生产版本)
 # 3. 写入 agents.json
 # 4. 启动 Zed,等待用户手动验证 §7.3 清单
@@ -3695,14 +3695,14 @@ if (-not (Test-Path $DeployDir)) {
     Write-Host "[1/5] Deploy directory exists" -ForegroundColor Yellow
 }
 
-# 2. 构建 claw-headless
-Write-Host "[2/5] Building claw-headless ($AcpVersion)..." -ForegroundColor Cyan
+# 2. 构建 claw-plus-headless
+Write-Host "[2/5] Building claw-plus-headless ($AcpVersion)..." -ForegroundColor Cyan
 Push-Location $RustDir
 try {
     if ($AcpVersion -eq "1_5") {
-        cargo build --release --bin claw-headless --features claw-shell/acp-1_5
+        cargo build --release --bin claw-plus-headless --features claw-shell/acp-1_5
     } else {
-        cargo build --release --bin claw-headless
+        cargo build --release --bin claw-plus-headless
     }
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed with exit code $LASTEXITCODE"
@@ -3713,8 +3713,8 @@ try {
 }
 
 # 3. 部署 binary
-$BinaryName = if ($AcpVersion -eq "1_5") { "claw-headless-1-5.exe" } else { "claw-headless.exe" }
-$SourceBinary = Join-Path $RustDir "target\release\claw-headless.exe"
+$BinaryName = if ($AcpVersion -eq "1_5") { "claw-plus-headless-1-5.exe" } else { "claw-plus-headless.exe" }
+$SourceBinary = Join-Path $RustDir "target\release\claw-plus-headless.exe"
 $DestBinary = Join-Path $DeployDir $BinaryName
 Copy-Item -Path $SourceBinary -Destination $DestBinary -Force
 Write-Host "[3/5] Deployed binary: $DestBinary" -ForegroundColor Green
@@ -3727,7 +3727,7 @@ if (-not (Test-Path $ZedConfigDir)) {
 $AgentsJson = @{
     agent_servers = @{
         claw = @{
-            name = "Claw Code ($AcpVersion)"
+            name = "Claw Plus ($AcpVersion)"
             version = "0.2.0"
             description = "ACP $AcpVersion - PoC build"
             command = @{
@@ -3765,12 +3765,12 @@ if (-not (Test-Path $ZedExe)) {
 
 Write-Host ""
 Write-Host "=== 验证清单(参照 §7.3)===" -ForegroundColor Cyan
-Write-Host "1. Zed 启动 → Assistant panel → 看到 'Claw Code ($AcpVersion)'"
+Write-Host "1. Zed 启动 → Assistant panel → 看到 'Claw Plus ($AcpVersion)'"
 Write-Host "2. 发 'hello' prompt → 收到回复"
 Write-Host "3. 让 Claw 读当前文件 → 验证 fs/read_text_file"
 Write-Host "4. 让 Claw 写文件 → 验证权限弹窗 + fs/write_text_file"
 Write-Host "5. 让 Claw 执行 Bash → 验证 session/request_permission"
-Write-Host "6. 关闭 Zed → claw-headless.exe 进程退出(Task Manager 检查)"
+Write-Host "6. 关闭 Zed → claw-plus-headless.exe 进程退出(Task Manager 检查)"
 Write-Host ""
 Write-Host "完成后请填写 §7.3 表格的 '通过?' 列" -ForegroundColor Yellow
 ```
@@ -3791,7 +3791,7 @@ PoC Phase 4 端到端验证的完整清单,每项需明确通过 / 失败,失败
 
 | # | 验证项 | 详细步骤 | 预期结果 | 通过? | 失败根因 |
 |---|--------|---------|---------|-------|---------|
-| 1 | Zed 发现 agent | 启动 Zed → Assistant panel → 检查 agent 列表 | "Claw Code (1_5)" 出现 | [ ] | |
+| 1 | Zed 发现 agent | 启动 Zed → Assistant panel → 检查 agent 列表 | "Claw Plus (1_5)" 出现 | [ ] | |
 | 2 | initialize 握手 | 选 agent,看 Zed log | `protocolVersion: 1.5` 协商成功 | [ ] | |
 | 3 | session/new 创建 | 输入 "hello" → 回车 | Zed 显示新会话,无错误 | [ ] | |
 | 4 | session/prompt 简单回复 | 发 "What is 2+2?" | 收到 AgentMessageChunk 文本回复 | [ ] | |
@@ -3800,7 +3800,7 @@ PoC Phase 4 端到端验证的完整清单,每项需明确通过 / 失败,失败
 | 7 | session/request_permission 触发 | 让 Claw 执行 Bash `ls` | 弹出权限对话框,选 Allow 后执行 | [ ] | |
 | 8 | SessionNotification 推送 | 让 Claw 执行需要多步的 task | 看到 ToolCall 状态变化(Pending → Completed) | [ ] | |
 | 9 | session/cancel 通知 | prompt 中途按 Esc | 当前 prompt 中止(0.10.4 stub 返回 Ok) | [ ] | |
-| 10 | 关闭 Zed 干净退出 | 关闭 Zed 窗口 | Task Manager 中 claw-headless-1-5.exe 消失 | [ ] | |
+| 10 | 关闭 Zed 干净退出 | 关闭 Zed 窗口 | Task Manager 中 claw-plus-headless-1-5.exe 消失 | [ ] | |
 | 11 | 重启 Zed 恢复(可选,P1) | 重启 Zed → Assistant panel | 历史会话可见(P1 session/load) | [ ] | |
 | 12 | 长时间运行稳定性 | 连续 5 个 prompt 不退出 Zed | 无内存泄漏 / 无崩溃 | [ ] | |
 
@@ -3941,7 +3941,7 @@ impl Default for V2FeatureFlags {
 
 | 测试 | 环境 | 验证点 | 优先级 |
 |------|------|--------|--------|
-| Zed + claw-headless | Zed dev build | 7 步测试(见 §7.3) | P0 |
+| Zed + claw-plus-headless | Zed dev build | 7 步测试(见 §7.3) | P0 |
 | VS Code + extension | VS Code 1.85+ | spawn + initialize + prompt | P1 |
 | 多 session 恢复 | Zed 重启 | session/load 后历史可见 | P1 |
 | cancel 中断 | 长时间 prompt | cancel 后 StopReason::Cancelled | P1 |
@@ -4062,7 +4062,7 @@ mod dual_version_tests {
 #[tokio::test]
 #[ignore = "manual: requires Zed running"]
 async fn acp_zed_integration_e2e() {
-    // 此测试需手动启动 Zed + claw-headless-1-5.exe
+    // 此测试需手动启动 Zed + claw-plus-headless-1-5.exe
     // 步骤:
     // 1. 跑 .\scripts\test-zed-integration.ps1 -AcpVersion "1_5"
     // 2. 在 Zed 中执行 §7.6 验证清单 12 项
@@ -4172,7 +4172,7 @@ v0.2 新增性能基准,作为 PoC Phase 4 的辅助验证(非阻塞门),并在 
 | 8 | 大文件写入延迟(1MB) | < 500ms | 同指标 6 但文件 1MB | > 1000ms 报警 |
 | 9 | 并发 session 数 | ≥ 10 | 同时 `session/new` 10 次,全部成功 | < 5 报警 |
 | 10 | LaneEvent sink 高水位 | < 256 | `lane_event_sink_len` 峰值 | ≥ 384 报警(见 §5.7) |
-| 11 | 内存占用(单 session) | < 200MB RSS | `claw-headless` 进程 RSS | > 500MB 报警 |
+| 11 | 内存占用(单 session) | < 200MB RSS | `claw-plus-headless` 进程 RSS | > 500MB 报警 |
 | 12 | 1.5 升级后编译时间增量 | < 30% | `cargo build --features acp-1_5` vs 默认 | > 50% 报警 |
 
 ### 12.2 测量方法
@@ -4242,9 +4242,9 @@ param([int]$Iterations = 10)
 $results = @()
 for ($i = 0; $i -lt $Iterations; $i++) {
     $start = Get-Date
-    # 调用 claw-headless --bench initialize
-    # 实际实现需 claw-headless 支持 --bench 子命令(P1)
-    $output = & "claw-headless.exe" --bench initialize 2>&1
+    # 调用 claw-plus-headless --bench initialize
+    # 实际实现需 claw-plus-headless 支持 --bench 子命令(P1)
+    $output = & "claw-plus-headless.exe" --bench initialize 2>&1
     $elapsed = (Get-Date) - $start
     $results += @{
         iteration = $i
@@ -4322,7 +4322,7 @@ acp-1_5 = ["agent-client-protocol/unstable-v2"]
 # 验证默认构建为 1.5
 cd d:\claw-code-src\rust
 cargo build --workspace
-# 期望:claw-headless 输出 "acp-protocol: 1.5"
+# 期望:claw-plus-headless 输出 "acp-protocol: 1.5"
 ```
 
 #### Step 2:移除 0.10.4 兼容代码(P1 末)
@@ -4401,10 +4401,10 @@ grep -A 2 'name = "agent-client-protocol"' rust/Cargo.lock
 git revert <merge-commit>  # 撤销 1.5 切换 PR
 
 # 2. 重新构建
-cargo build --release --bin claw-headless
+cargo build --release --bin claw-plus-headless
 
 # 3. 部署回滚版本
-copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\
+copy target\release\claw-plus-headless.exe C:\Users\38225\.cargo\bin\
 
 # 4. 通知用户(Zed / VS Code 自动重连)
 ```
@@ -4433,7 +4433,7 @@ copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\
 - [JetBrains ACP plugin](https://github.com/kendru/agent-client-protocol-jetbrains) — JetBrains 集成参考
 - [CodeCompanion.nvim](https://github.com/olimorris/codecompanion.nvim) — Neovim ACP 适配器
 
-### 11.3 Claw Code 内部参考
+### 11.3 Claw Plus 内部参考
 
 - [主文档:IDE 集成方案](file:///d:/claw-code-src/docs/ide-hooks-dag-implementation-plan.md) — 父文档
 - [agent.rs:ClawAgent 实现](file:///d:/claw-code-src/rust/crates/claw-shell/src/agent.rs) — 当前 ACP Agent trait 实现
@@ -4441,7 +4441,7 @@ copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\
 - [stdio.rs:run_agent_on_io](file:///d:/claw-code-src/rust/crates/claw-shell/src/stdio.rs) — stdio ACP 服务器核心
 - [gateway.rs:AcpGatewaySender](file:///d:/claw-code-src/rust/crates/claw-acp/src/gateway.rs) — Gateway 转发层
 - [lane_events.rs:LaneEvent](file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs) — 23 种内部事件定义
-- [headless.rs:claw-headless](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs) — stdio 服务器入口 binary
+- [headless.rs:claw-plus-headless](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs) — stdio 服务器入口 binary
 - [claw-acp Cargo.toml](file:///d:/claw-code-src/rust/crates/claw-acp/Cargo.toml) — 0.10.4 版本锁定位置
 
 ### 11.4 相关 RFC 与设计文档
@@ -4467,7 +4467,7 @@ copy target\release\claw-headless.exe C:\Users\38225\.cargo\bin\
 |------|------|------|
 | ACP | Agent Client Protocol | 编辑器与 AI agent 通信协议 |
 | IDE | Integrated Development Environment | 集成开发环境(VS Code / Zed / JetBrains 等) |
-| LaneEvent | Lane Event | Claw Code 内部事件总线事件 |
+| LaneEvent | Lane Event | Claw Plus 内部事件总线事件 |
 | SessionNotification | ACP Session Notification | agent → IDE 的推送消息 |
 | LocalSet | tokio::task::LocalSet | tokio 中运行非 Send future 的执行环境 |
 | silent drop | Silent Drop | ACP 0.10.4 中错误消息被静默丢弃的行为 |

@@ -1,4 +1,4 @@
-# Hooks 系统细化方案
+﻿# Hooks 系统细化方案
 
 - 文档版本: v0.2
 - 创建日期: 2026-07-21
@@ -138,7 +138,7 @@ pub enum HookEvent {
     /// 工具成功后,可观察 tool_response,不可阻断
     #[serde(rename = "PostToolUse")]
     PostToolUse,
-    /// Claw Code 特色:工具失败独立事件(优于 Claude Code 并入 PostToolUse)
+    /// Claw Plus 特色:工具失败独立事件(优于 Claude Code 并入 PostToolUse)
     #[serde(rename = "PostToolUseFailure")]
     PostToolUseFailure,
     /// MCP 工具专用,可改 updatedOutput(对应 Claude Code 1.0+ 的 PostCustomToolCall)
@@ -546,7 +546,7 @@ execution = "parallel"
 
 ### 3.5 与 Claude Code 官方实现对比
 
-| 维度 | Claude Code | Claw Code(本方案) |
+| 维度 | Claude Code | Claw Plus(本方案) |
 |---|---|---|
 | Handler 类型 | command + prompt(1.0+) | command + webhook + inline + prompt |
 | 事件数量 | 9 | 10(保留 PostToolUseFailure) |
@@ -2221,7 +2221,7 @@ async fn test_subagent_stop_can_reject_result() {
 ```toml
 # .claw/hooks.toml
 #
-# Claw Code Hooks 配置
+# Claw Plus Hooks 配置
 # 父文档: docs/ide-hooks-dag-implementation-plan.md
 # 本文档: docs/modules/hooks-system-detail.md
 #
@@ -3976,7 +3976,7 @@ criterion_main!(benches);
 
 ### 16.1 背景
 
-Claw Code 已有 `PermissionEnforcer`(见 `rust/crates/runtime/src/permission_enforcer.rs`)与 `PermissionMode` 枚举(见 `bash_validation.rs` line 103-300)。Hook 系统引入后,工具调用的决策路径变为「Hook → PermissionMode → Policy」,三者职责不同但需要协同。
+Claw Plus 已有 `PermissionEnforcer`(见 `rust/crates/runtime/src/permission_enforcer.rs`)与 `PermissionMode` 枚举(见 `bash_validation.rs` line 103-300)。Hook 系统引入后,工具调用的决策路径变为「Hook → PermissionMode → Policy」,三者职责不同但需要协同。
 
 ### 16.2 现有 PermissionMode 枚举
 
@@ -4258,7 +4258,7 @@ async fn hook_failopen_falls_through_to_permission() {
 
 ### 17.1 设计目标
 
-用户编辑 `~/.claw/hooks.toml` 后,无需重启 Claw Code 即可生效。热重载设计目标:
+用户编辑 `~/.claw/hooks.toml` 后,无需重启 Claw Plus 即可生效。热重载设计目标:
 
 1. **零中断**:运行中的 hook 不被中断,新 hook 在下一次事件触发时生效。
 2. **部分更新**:只重载变更的 hook 条目,不重建整个 `HookConfig`,减少抖动。

@@ -1,6 +1,6 @@
-# Contributing to Claw Code
+﻿# Contributing to Claw Plus
 
-Thanks for helping improve Claw Code. This repository is a fork of
+Thanks for helping improve Claw Plus. This repository is a fork of
 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) (MIT License),
 maintained at [dong382258137/claw-code](https://github.com/dong382258137/claw-code).
 
@@ -33,7 +33,7 @@ git clone https://github.com/dong382258137/claw-code
 cd claw-code/rust
 cargo build --workspace
 cargo test --workspace
-.\target\debug\claw.exe doctor
+.\target\debug\claw-plus.exe doctor
 ```
 
 ## Contribution workflow

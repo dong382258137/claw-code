@@ -1,4 +1,4 @@
-# Claw Code Harness Engineering 分阶段优化方案
+﻿# Claw Plus Harness Engineering 分阶段优化方案
 
 | 项 | 值 |
 |---|---|
@@ -621,12 +621,12 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 
 #### 背景与目标
 
-借鉴上游 `xai-grok-shell`(grok-build)架构,为 Claw Code 引入 **ACP (Agent Communication Protocol)** 协议层,使 `claw` 能作为 stdio ACP server 被 Zed / VS Code 等 ACP 编辑器直接驱动。
+借鉴上游 `xai-grok-shell`(grok-build)架构,为 Claw Plus 引入 **ACP (Agent Communication Protocol)** 协议层,使 `claw-plus` 能作为 stdio ACP server 被 Zed / VS Code 等 ACP 编辑器直接驱动。
 
 **核心动机**:
 1. **协议标准化** — ACP 是 JSON-RPC over stdio 的开放协议,锁定 `agent-client-protocol = 0.10.4`
 2. **解耦 UI 与 agent** — 编辑器不再需要 fork 内部 TUI,直接通过 ACP 协议交互
-3. **二元化产品形态** — `claw`(完整 CLI)+ `claw-headless`(最小 stdio ACP server)
+3. **二元化产品形态** — `claw-plus`(完整 CLI)+ `claw-plus-headless`(最小 stdio ACP server)
 
 #### Step A1 — `claw-acp` crate ✅ 完成
 
@@ -653,14 +653,14 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 - 更新 `output_format_contract.rs` ACP status 期望从 `unsupported` → `supported`
 - `clippy` 0 警告,337/337 测试通过
 
-#### Step A4 — `claw-headless` binary ✅ 完成
+#### Step A4 — `claw-plus-headless` binary ✅ 完成
 
 - `src/main.rs`:极简入口(仅 `parse_args` + dispatch)
-- `src/bin/headless.rs`:`claw-headless` 入口,直接调用 `run_acp_serve`,无 REPL/TUI/subcommands
-- `Cargo.toml` 注册 `[[bin]] name = "claw-headless"`
+- `src/bin/headless.rs`:`claw-plus-headless` 入口,直接调用 `run_acp_serve`,无 REPL/TUI/subcommands
+- `Cargo.toml` 注册 `[[bin]] name = "claw-plus-headless"`
 - **lib + bin 重构**:`rusty-claude-cli` 同时提供 lib(供两个 bin 共享)+ 两个 binary
 - **可见性修正**:4 个 `parse_xxx_args` 函数从 `pub` 改回 `pub(crate)`(返回 `pub(crate) CliAction`,binary 不直接引用)
-- 产物:`claw.exe`(33MB,完整 CLI)+ `claw-headless.exe`(24MB,最小 ACP server)
+- 产物:`claw.exe`(33MB,完整 CLI)+ `claw-plus-headless.exe`(24MB,最小 ACP server)
 
 #### Step A5 — 移除 tui_mode gating ⏸️ 推迟
 
@@ -725,7 +725,7 @@ NOTEBOOK.md 5 段结构对应 CompactionRL 的 summary 必备字段:
 
 - **claw-shell 测试**:13 passed / 0 failed / 0 ignored
 - **clippy**:`claw-shell` 本身 0 警告(runtime 依赖有 17 个预存警告,与本阶段无关)
-- **产物**:`claw.exe` v0.2.0(Git SHA `9014d5f`)+ `claw-headless.exe`
+- **产物**:`claw.exe` v0.2.0(Git SHA `9014d5f`)+ `claw-plus-headless.exe`
 
 #### 阶段 A 遗留技术债
 
@@ -1103,5 +1103,5 @@ Epic 0(文档对齐) ✅ 已完成
 | 2026-07-21 | v1.2 | 实施完成 4 个原 ⚠️ 部分 Step 并校正状态：Step 2.1 ✅(commit 083f4a9,/ultraplan 对接 runtime planner)、Step 2.4 ✅(commit 876f577,EmbeddingProvider trait + FastembedProvider)、Step 3.2 ✅(3.2-a/b/c 全部完成,commits 8322e88/a46a3b5/36d9721,subagent-as-tool 路由)、Step 3.3 ✅(commit 23c7c72,K-means 失败聚类)。Step 3.1 维持 ⚠️ 部分(规则反馈已够用,视觉/模型裁判留到阶段 4)。 |
 | 2026-07-21 | v1.3 | 新增阶段 3.5:三层信息持久化架构(基于论文调研)。基于 Anthropic《Effective Context Engineering》《Multi-Agent Research System》、CompactionRL (arXiv:2607.05378)、MIRIX (arXiv:2507.07957) 实施 5 个改进:P0-1 NOTEBOOK.md parse() 修复 + Structured Note-taking(commit 59f1663,26 测试)、P0-3 压缩前 NOTEBOOK 刷新 trigger(commit 8ea0c67,3 测试)、P0-2 子智能体真实化(同步阻塞 + 上下文隔离 + 文件持久化,commit c2e8f48,10 测试,修复 MultiAgentCoordinator 空壳问题)、P1 microcompact 结构化保留(子智能体指针 + 多行预览,commit a1ac0d1,5 测试)、P3 streaming stall 事件间超时(commit b7edada,337 测试全绿)。新增 37 个测试,总 918 passed。修复长程任务中"AI 忘记关键信息导致重复 dispatch"stall 问题。 |
 | 2026-07-21 | v1.4 | 代码核对复核 Step 4.1 / 4.2,校正状态从 ✅ 到 ⚠️ 部分。Step 4.1 Sandbox:SandboxBuilder trait + 三实现存在(可编译),但 bg.rs::spawn 完全绕过 SandboxBuilder、assign_process_to_job_object 是死代码、公共 API 未导出、无功能性测试。Step 4.2 LSP Client:协议层 + ProcessLspTransport 传输层已编码,但生产 dispatch 走 MemoryLspTransport placeholder、ProcessLspTransport 是死代码、repomap 协同未实现、无 lsp-types/tower-lsp 依赖、无 rust-analyzer 集成测试。两个 Step 都需要补齐"整合 + 功能性测试"才能达到 ✅ 完整。 |
-| 2026-07-21 | v1.5 | 新增阶段 A:ACP 协议层(借鉴 grok-build 架构)。完成 Step A1-A4 + A6(A5 推迟):A1 claw-acp crate(锁定 agent-client-protocol 0.10.4)、A2 claw-shell crate(ClawAgent 实现 acp::Agent trait)、A3 rusty-claude-cli 接入 stdio ACP server(337 测试)、A4 claw-headless binary(lib + bin 重构,33MB + 24MB 双产物)、A6 端到端测试(13 claw-shell 测试,关键发现 ACP 0.10.4 对 invalid JSON/missing method 是 silent drop,仅 unknown method 返回 -32601)。修复 runtime crate 5 处预存破损(lsp_client unsafe、verifier typo、conversation v2.0 同步、lib.rs re-export、planner mod 导出)。遗留技术债:ClawAgent::cancel 是 stub、tui_mode gating 保留、ACP 0.10.4 silent drop 行为、活跃 prompt 下 cancel 未验证。 |
+| 2026-07-21 | v1.5 | 新增阶段 A:ACP 协议层(借鉴 grok-build 架构)。完成 Step A1-A4 + A6(A5 推迟):A1 claw-acp crate(锁定 agent-client-protocol 0.10.4)、A2 claw-shell crate(ClawAgent 实现 acp::Agent trait)、A3 rusty-claude-cli 接入 stdio ACP server(337 测试)、A4 claw-plus-headless binary(lib + bin 重构,33MB + 24MB 双产物)、A6 端到端测试(13 claw-shell 测试,关键发现 ACP 0.10.4 对 invalid JSON/missing method 是 silent drop,仅 unknown method 返回 -32601)。修复 runtime crate 5 处预存破损(lsp_client unsafe、verifier typo、conversation v2.0 同步、lib.rs re-export、planner mod 导出)。遗留技术债:ClawAgent::cancel 是 stub、tui_mode gating 保留、ACP 0.10.4 silent drop 行为、活跃 prompt 下 cancel 未验证。 |
 | 2026-07-22 | v1.6 | 新增 §9 接入路径章节:Epic 0-6 接入计划。核对 13 个"模块代码完成但未接入 CLI 生产路径"的模块,在 progress.md 增加接入状态对照表。P0-2 论文调研结论:同步阻塞 + 上下文隔离 + 文件持久化设计与 Anthropic《Multi-Agent Research System》及 Claude Code 2026 实践高度一致,无需推翻重做,v2 需补齐 5 项能力(system_prompt 前缀缓存优化、子 agent resume、并行 spawn、Worktree/Fork 差异化、递归 spawn 防护)。 |
