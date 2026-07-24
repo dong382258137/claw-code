@@ -270,9 +270,8 @@ pub struct DecisionRecord {
 
 impl DecisionRecord {
     fn from_json(input: &str) -> Result<Self, DecisionLogError> {
-        let parsed: serde_json::Value = serde_json::from_str(input).map_err(|e| {
-            DecisionLogError::InvalidInput(format!("invalid JSON: {e}"))
-        })?;
+        let parsed: serde_json::Value = serde_json::from_str(input)
+            .map_err(|e| DecisionLogError::InvalidInput(format!("invalid JSON: {e}")))?;
 
         let session_id = parsed
             .get("session_id")
@@ -283,9 +282,7 @@ impl DecisionRecord {
         let problem_signature = parsed
             .get("problem_signature")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                DecisionLogError::InvalidInput("missing 'problem_signature'".into())
-            })?
+            .ok_or_else(|| DecisionLogError::InvalidInput("missing 'problem_signature'".into()))?
             .to_string();
 
         let root_cause_hypothesis = parsed
@@ -299,9 +296,7 @@ impl DecisionRecord {
         let applied_solution = parsed
             .get("applied_solution")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                DecisionLogError::InvalidInput("missing 'applied_solution'".into())
-            })?
+            .ok_or_else(|| DecisionLogError::InvalidInput("missing 'applied_solution'".into()))?
             .to_string();
 
         let affected_files: Vec<String> = parsed
@@ -394,8 +389,8 @@ impl DecisionLog {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        let affected_files_json = serde_json::to_string(&record.affected_files)
-            .unwrap_or_else(|_| "[]".to_string());
+        let affected_files_json =
+            serde_json::to_string(&record.affected_files).unwrap_or_else(|_| "[]".to_string());
 
         // Combine key fields for simhash
         let simhash_text = format!(
@@ -456,11 +451,7 @@ impl DecisionLog {
     /// 搜索历史决策。
     ///
     /// 使用 FTS5 全文检索 + simhash 去重,返回 top-k 匹配。
-    pub fn search_decisions(
-        &self,
-        query: &str,
-        top_k: usize,
-    ) -> Result<String, DecisionLogError> {
+    pub fn search_decisions(&self, query: &str, top_k: usize) -> Result<String, DecisionLogError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         // FTS5 search with BM25 ranking
@@ -518,11 +509,7 @@ impl DecisionLog {
         }
 
         // Format output
-        let mut output = format!(
-            "Found {} past decision(s) for '{}':\n\n",
-            rows.len(),
-            query
-        );
+        let mut output = format!("Found {} past decision(s) for '{}':\n\n", rows.len(), query);
 
         for (i, hit) in rows.iter().enumerate() {
             output.push_str(&format!(
@@ -619,12 +606,7 @@ impl DecisionLog {
                 .query_row(
                     "SELECT verify_count, success_rate FROM decisions WHERE id = ?1",
                     params![decision_id],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, f64>(1)?,
-                        ))
-                    },
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
                 )
                 .map_err(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => DecisionLogError::InvalidInput(
@@ -639,8 +621,7 @@ impl DecisionLog {
                 let signal = result.signal();
                 let new_count = old_count + 1;
                 // 注意 old_count 是 i64,需转 f64 防止整型除法丢失精度。
-                let new_rate =
-                    (old_rate * old_count as f64 + signal) / (new_count as f64);
+                let new_rate = (old_rate * old_count as f64 + signal) / (new_count as f64);
                 // 钳位 [0.0, 1.0],防止浮点误差导致轻微越界。
                 let new_rate = new_rate.clamp(0.0, 1.0);
                 (new_count, new_rate)
@@ -699,7 +680,13 @@ impl DecisionLog {
                         "SELECT verify_count, success_rate, verification_result
                          FROM decisions WHERE id = ?1",
                         params![decision_id],
-                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?)),
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, f64>(1)?,
+                                r.get::<_, String>(2)?,
+                            ))
+                        },
                     )
                     .map_err(DecisionLogError::Sqlite)?;
 
@@ -837,18 +824,11 @@ mod tests {
 
     #[test]
     fn simhash_similar_texts_have_low_hamming_distance() {
-        let a = compute_simhash(
-            "fix null pointer dereference in auth module by adding null check",
-        );
-        let b = compute_simhash(
-            "fix null pointer dereference in auth module add null check",
-        );
+        let a = compute_simhash("fix null pointer dereference in auth module by adding null check");
+        let b = compute_simhash("fix null pointer dereference in auth module add null check");
         let dist = hamming_distance(a, b);
         // Similar texts should have distance ≤ 12 (lenient for short text)
-        assert!(
-            dist <= 12,
-            "Expected hamming distance <= 12, got {dist}"
-        );
+        assert!(dist <= 12, "Expected hamming distance <= 12, got {dist}");
     }
 
     #[test]
@@ -856,10 +836,7 @@ mod tests {
         let a = compute_simhash("fix null pointer dereference in auth module");
         let b = compute_simhash("implement new caching layer for database queries");
         let dist = hamming_distance(a, b);
-        assert!(
-            dist >= 3,
-            "Expected hamming distance >= 3, got {dist}"
-        );
+        assert!(dist >= 3, "Expected hamming distance >= 3, got {dist}");
     }
 
     #[test]
@@ -892,11 +869,7 @@ mod tests {
                 "verification_result": "Confirmed"
             }"#,
         );
-        assert!(
-            result.is_ok(),
-            "log_decision failed: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "log_decision failed: {:?}", result.err());
         assert!(result.unwrap().starts_with("decision_logged id="));
     }
 
@@ -1469,10 +1442,7 @@ mod tests {
             expected_count += 1;
             let got_count = parse_verify_count(&out);
             let got_rate = parse_success_rate(&out);
-            assert_eq!(
-                got_count, expected_count,
-                "step {i}: count mismatch"
-            );
+            assert_eq!(got_count, expected_count, "step {i}: count mismatch");
             // {:.6} 格式精度上限误差为 5e-7,1e-5 提供 20x 安全裕度。
             assert!(
                 (got_rate - expected_rate).abs() < 1e-5,

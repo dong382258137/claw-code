@@ -42,8 +42,13 @@ fn proxy_config_from_env_reads_uppercase_proxy_vars() {
     let _http = EnvVarGuard::set("HTTP_PROXY", Some("http://proxy.corp:3128"));
     let _https = EnvVarGuard::set("HTTPS_PROXY", Some("http://secure.corp:3129"));
     let _no = EnvVarGuard::set("NO_PROXY", Some("localhost,127.0.0.1"));
+    // On Windows, env vars are case-insensitive — clearing the lowercase
+    // spelling would also destroy the uppercase one we just set.
+    #[cfg(not(windows))]
     let _http_lower = EnvVarGuard::set("http_proxy", None);
+    #[cfg(not(windows))]
     let _https_lower = EnvVarGuard::set("https_proxy", None);
+    #[cfg(not(windows))]
     let _no_lower = EnvVarGuard::set("no_proxy", None);
 
     // when
@@ -130,8 +135,12 @@ fn build_client_with_env_proxy_config_succeeds() {
     let _http = EnvVarGuard::set("HTTP_PROXY", Some("http://proxy.corp:3128"));
     let _https = EnvVarGuard::set("HTTPS_PROXY", Some("http://secure.corp:3129"));
     let _no = EnvVarGuard::set("NO_PROXY", Some("localhost"));
+    // On Windows, these are the same keys — avoid destroying what we set.
+    #[cfg(not(windows))]
     let _http_lower = EnvVarGuard::set("http_proxy", None);
+    #[cfg(not(windows))]
     let _https_lower = EnvVarGuard::set("https_proxy", None);
+    #[cfg(not(windows))]
     let _no_lower = EnvVarGuard::set("no_proxy", None);
     let config = ProxyConfig::from_env();
 
@@ -154,7 +163,10 @@ fn build_client_with_proxy_url_config_succeeds() {
     assert!(result.is_ok());
 }
 
+// On Windows, env vars are case-insensitive — HTTP_PROXY and http_proxy are
+// the same key. This test fundamentally requires case-sensitive env vars.
 #[test]
+#[cfg_attr(windows, ignore)]
 fn proxy_config_from_env_prefers_uppercase_over_lowercase() {
     // given
     let _lock = env_lock();

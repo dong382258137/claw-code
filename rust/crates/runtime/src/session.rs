@@ -46,9 +46,15 @@ enum TruncatePolicy {
     /// diff 类工具:不截断(保字节精确)。
     NoTruncate,
     /// read 类工具:按行截断,保留完整行。
-    LineBased { head_lines: usize, tail_lines: usize },
+    LineBased {
+        head_lines: usize,
+        tail_lines: usize,
+    },
     /// 其他工具:按字节 head/tail 截断。
-    ByteBased { head_bytes: usize, tail_bytes: usize },
+    ByteBased {
+        head_bytes: usize,
+        tail_bytes: usize,
+    },
 }
 
 /// 根据工具名选择截断策略。
@@ -1880,11 +1886,7 @@ mod tests {
         let big = "x".repeat(super::TOOL_OUTPUT_MAX_BYTES + 1000);
         for tool in &["edit_file", "write_file", "delete_file", "Edit", "Write"] {
             let out = super::truncate_tool_output(tool, big.clone());
-            assert_eq!(
-                out.len(),
-                big.len(),
-                "{tool} 不应截断 diff 输出"
-            );
+            assert_eq!(out.len(), big.len(), "{tool} 不应截断 diff 输出");
         }
     }
 
@@ -1892,7 +1894,9 @@ mod tests {
     fn truncate_read_file_uses_line_based_truncation() {
         // 构造 300 行,每行 200 字节(总 60KB > 50KB 阈值)
         // head 200 行 + tail 50 行,省略 50 行
-        let lines: Vec<String> = (0..300).map(|i| format!("line_{i:03} {}", "x".repeat(180))).collect();
+        let lines: Vec<String> = (0..300)
+            .map(|i| format!("line_{i:03} {}", "x".repeat(180)))
+            .collect();
         let big = lines.join("\n");
         assert!(big.len() > super::TOOL_OUTPUT_MAX_BYTES);
 
@@ -1912,7 +1916,9 @@ mod tests {
     #[test]
     fn truncate_read_file_preserves_complete_lines() {
         // 关键:按行截断不会切断行中间
-        let lines: Vec<String> = (0..300).map(|i| format!("fn func_{i}() -> i32 {{ {i} }}")).collect();
+        let lines: Vec<String> = (0..300)
+            .map(|i| format!("fn func_{i}() -> i32 {{ {i} }}"))
+            .collect();
         let big = lines.join("\n");
         let out = super::truncate_tool_output("read_file", big);
         // 每行都应是完整的(以 } 结尾),不会有残行

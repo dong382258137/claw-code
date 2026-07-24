@@ -25,7 +25,10 @@ use std::process::Command;
 pub enum VcsError {
     NotGitRepo,
     StashFailed(String),
-    StashPopConflict { conflicted: Vec<PathBuf>, message: String },
+    StashPopConflict {
+        conflicted: Vec<PathBuf>,
+        message: String,
+    },
     DetachedHead,
     Io(std::io::Error),
     FileSnapshotFailed(String),
@@ -36,8 +39,15 @@ impl std::fmt::Display for VcsError {
         match self {
             Self::NotGitRepo => write!(f, "not a git repository"),
             Self::StashFailed(msg) => write!(f, "git stash failed: {msg}"),
-            Self::StashPopConflict { conflicted, message } => {
-                write!(f, "stash pop conflict in {} files: {message}", conflicted.len())
+            Self::StashPopConflict {
+                conflicted,
+                message,
+            } => {
+                write!(
+                    f,
+                    "stash pop conflict in {} files: {message}",
+                    conflicted.len()
+                )
             }
             Self::DetachedHead => write!(f, "detached HEAD — cannot use stash"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
@@ -161,7 +171,9 @@ impl RefactorTransaction {
             .output()
             .map_err(|e| VcsError::StashFailed(format!("git stash create failed: {e}")))?;
 
-        let stash_ref = String::from_utf8_lossy(&stash_output.stdout).trim().to_string();
+        let stash_ref = String::from_utf8_lossy(&stash_output.stdout)
+            .trim()
+            .to_string();
 
         if stash_ref.is_empty() {
             // stash create 返回空表示没有可 stash 的修改（可能都是 untracked 文件）
@@ -255,7 +267,8 @@ impl RefactorTransaction {
         // 直接 checkout modified_files 恢复到 HEAD 状态
         if !self.modified_files.is_empty() {
             // 恢复 tracked 文件
-            let tracked_files: Vec<&str> = self.modified_files
+            let tracked_files: Vec<&str> = self
+                .modified_files
                 .iter()
                 .filter_map(|p| p.to_str())
                 .collect();
@@ -272,10 +285,8 @@ impl RefactorTransaction {
             // 通过 git status 检测哪些是 untracked 的。
             let untracked_files = self.get_untracked_files();
             if !untracked_files.is_empty() {
-                let clean_files: Vec<&str> = untracked_files
-                    .iter()
-                    .filter_map(|p| p.to_str())
-                    .collect();
+                let clean_files: Vec<&str> =
+                    untracked_files.iter().filter_map(|p| p.to_str()).collect();
                 let _ = Command::new("git")
                     .args(["clean", "-fd", "--"])
                     .args(&clean_files)
@@ -326,7 +337,10 @@ impl RefactorTransaction {
     /// Get current transaction status.
     pub fn status(&self) -> TransactionStatus {
         let (state, reason) = if !self.is_git_repo {
-            ("disabled".to_string(), Some("not a git repository".to_string()))
+            (
+                "disabled".to_string(),
+                Some("not a git repository".to_string()),
+            )
         } else if self.is_detached {
             ("detached".to_string(), None)
         } else if self.has_snapshot {
@@ -429,7 +443,9 @@ impl RefactorTransaction {
 
         self.has_snapshot = false;
         self.modified_files.clear();
-        Ok(format!("rollback: restored {restored} files from file snapshot"))
+        Ok(format!(
+            "rollback: restored {restored} files from file snapshot"
+        ))
     }
 }
 
@@ -441,7 +457,7 @@ impl RefactorTransaction {
 ///
 /// P2-3 修复：
 /// - 处理重命名格式 `R  old -> new`（取 new 路径）
-/// - 剥离含特殊字符路径的引号 `"..."` 
+/// - 剥离含特殊字符路径的引号 `"..."`
 /// - 过滤 `.claw/` 管理文件（不应被 stash）
 /// - 统一路径分隔符为 POSIX 风格（避免 Windows 路径混用导致去重失效）
 fn parse_modified_files(status_output: &str) -> Vec<PathBuf> {
@@ -466,11 +482,12 @@ fn parse_modified_files(status_output: &str) -> Vec<PathBuf> {
         };
 
         // 剥离引号（git status --porcelain 对含特殊字符的路径用 "..." 包裹）
-        let path_str = if path_str.starts_with('"') && path_str.ends_with('"') && path_str.len() >= 2 {
-            &path_str[1..path_str.len() - 1]
-        } else {
-            path_str
-        };
+        let path_str =
+            if path_str.starts_with('"') && path_str.ends_with('"') && path_str.len() >= 2 {
+                &path_str[1..path_str.len() - 1]
+            } else {
+                path_str
+            };
 
         // 过滤 .claw/ 管理文件
         if path_str.starts_with(".claw/") || path_str.starts_with(".claw\\") {

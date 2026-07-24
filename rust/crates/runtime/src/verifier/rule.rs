@@ -14,6 +14,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 /// 规则验证结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,12 +33,25 @@ pub struct RuleVerdict {
 ///
 /// v2.0:不再做文本关键词匹配,改为真正执行命令。
 /// 命令通过 `PlanStep.verify_command` 字段配置。
-#[derive(Debug, Clone, Default)]
+///
+/// v2.1:修复超时 bug — 原实现用阻塞 `wait_with_output()`,timeout_secs 字段
+/// 声明了但从未生效。改用 `thread + mpsc::channel + recv_timeout` 真正限制
+/// 命令执行时长,超时后 kill 子进程。
+#[derive(Debug, Clone)]
 pub struct RuleVerifier {
     /// 命令执行超时(秒),默认 120 秒。
     timeout_secs: u64,
     /// 工作目录(默认继承父进程)。
     working_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for RuleVerifier {
+    fn default() -> Self {
+        Self {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            working_dir: None,
+        }
+    }
 }
 
 /// 默认超时:120 秒(避免 cargo test 大项目卡死)。
@@ -168,6 +184,9 @@ impl RuleVerifier {
 
     /// 执行命令,捕获 stdout/stderr/exit_code。
     ///
+    /// v2.1:用 `thread + mpsc::channel + recv_timeout` 实现真正的超时。
+    /// 超时后 kill 子进程,避免卡死命令无限阻塞主 agent。
+    ///
     /// Windows: `cmd /C <command>`
     /// Unix: `sh -c <command>`
     fn execute_command(&self, command: &str) -> Result<CommandOutput, String> {
@@ -193,18 +212,31 @@ impl RuleVerifier {
             .stdin(std::process::Stdio::null());
 
         let child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+        let child_id = child.id();
 
-        // 简单超时:用 wait_timeout 跨平台 crate 会引入依赖,
-        // 这里用 std 的 wait + thread 简化处理(实际超时由调用方控制)
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("wait failed: {e}"))?;
+        // 在独立线程中等待子进程完成,主线程通过 channel recv_timeout 限制时长。
+        let (tx, rx) = mpsc::channel::<Result<std::process::Output, std::io::Error>>();
+        thread::spawn(move || {
+            let result = child.wait_with_output();
+            let _ = tx.send(result);
+        });
 
-        Ok(CommandOutput {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        let timeout = Duration::from_secs(self.timeout_secs.max(1));
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(output)) => Ok(CommandOutput {
+                exit_code: output.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }),
+            Ok(Err(e)) => Err(format!("wait failed: {e}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                kill_process(child_id);
+                Err(format!("timeout after {}s", self.timeout_secs))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("worker thread disconnected".to_owned())
+            }
+        }
     }
 }
 
@@ -228,6 +260,31 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
         .unwrap_or(start);
     let truncated = &s[start..];
     format!("...{truncated}")
+}
+
+/// 超时后 kill 子进程 — 跨平台。
+///
+/// Windows: `taskkill /PID <pid> /F /T`(强制终止整个进程树)
+/// Unix: `kill -9 <pid>`(SIGKILL)
+fn kill_process(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F", "/T"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
 }
 
 #[cfg(test)]
@@ -365,5 +422,35 @@ mod tests {
         let cmd = "echo 'tests passed' && true";
         let verdict = v.verify("test output", "tests pass", Some(cmd));
         assert!(verdict.passed);
+    }
+
+    #[test]
+    fn default_timeout_is_120_secs() {
+        let v = RuleVerifier::new();
+        assert_eq!(v.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(v.timeout_secs, 120);
+    }
+
+    #[test]
+    fn timeout_kills_hung_command() {
+        // 1 秒超时 + sleep 10 秒的命令 → 应在 ~1 秒后 timeout
+        let v = RuleVerifier::new().with_timeout(1);
+        #[cfg(windows)]
+        let cmd = "cmd /C timeout /T 10 /NOBREAK";
+        #[cfg(not(windows))]
+        let cmd = "sleep 10";
+        let start = std::time::Instant::now();
+        let verdict = v.verify("output", "criteria", Some(cmd));
+        let elapsed = start.elapsed();
+        // 应在 ~1 秒内返回(给 3 秒余量处理 kill + 线程开销)
+        assert!(
+            elapsed.as_secs() < 5,
+            "timeout should trigger within ~1s, took {:?}",
+            elapsed
+        );
+        assert!(!verdict.passed);
+        assert!(verdict.remediation.is_some());
+        let rem = verdict.remediation.unwrap();
+        assert!(rem.contains("timeout") || rem.contains("Error"));
     }
 }

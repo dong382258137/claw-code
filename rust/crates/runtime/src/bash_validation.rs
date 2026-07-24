@@ -644,9 +644,7 @@ pub fn validate_permissions(command: &str, mode: PermissionMode) -> ValidationRe
     for &cmd in DANGER_FULL_ACCESS_COMMANDS {
         if first == cmd {
             return ValidationResult::Block {
-                reason: format!(
-                    "'{cmd}' requires danger-full-access — current mode is {mode:?}"
-                ),
+                reason: format!("'{cmd}' requires danger-full-access — current mode is {mode:?}"),
             };
         }
     }
@@ -660,8 +658,7 @@ pub fn validate_permissions(command: &str, mode: PermissionMode) -> ValidationRe
 
 /// Interpreter names commonly used in pipe-to-shell attacks.
 const INTERPRETERS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "python", "python3",
-    "perl", "ruby", "node", "lua", "php",
+    "sh", "bash", "zsh", "dash", "ksh", "python", "python3", "perl", "ruby", "node", "lua", "php",
 ];
 
 /// Scan the command for dangerous security patterns.
@@ -689,9 +686,7 @@ pub fn validate_security(command: &str) -> ValidationResult {
     let first = extract_first_command(command);
     if first == "eval" || first == "exec" {
         return ValidationResult::Block {
-            reason: format!(
-                "'{first}' with dynamic arguments is blocked"
-            ),
+            reason: format!("'{first}' with dynamic arguments is blocked"),
         };
     }
 
@@ -705,8 +700,7 @@ pub fn validate_security(command: &str) -> ValidationResult {
     // 4. chmod 777 warning
     if first == "chmod" && (command.contains("777") || command.contains("o+w")) {
         return ValidationResult::Warn {
-            message: "setting world-writable permissions (777) is discouraged"
-                .to_string(),
+            message: "setting world-writable permissions (777) is discouraged".to_string(),
         };
     }
 
@@ -731,8 +725,8 @@ pub fn should_use_sandbox(command: &str, mode: PermissionMode) -> bool {
     let first = extract_first_command(command);
 
     const NETWORK_COMMANDS: &[&str] = &[
-        "curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "telnet",
-        "nslookup", "dig", "host", "ftp",
+        "curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "telnet", "nslookup", "dig", "host",
+        "ftp",
     ];
     for &net_cmd in NETWORK_COMMANDS {
         if first == net_cmd {
@@ -741,8 +735,7 @@ pub fn should_use_sandbox(command: &str, mode: PermissionMode) -> bool {
     }
 
     const DESTRUCTIVE_COMMANDS: &[&str] = &[
-        "rm", "shred", "truncate", "mkfs", "fdisk", "parted",
-        "wipefs", "sfdisk",
+        "rm", "shred", "truncate", "mkfs", "fdisk", "parted", "wipefs", "sfdisk",
     ];
     for &dest_cmd in DESTRUCTIVE_COMMANDS {
         if first == dest_cmd {

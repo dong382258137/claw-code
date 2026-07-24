@@ -42,6 +42,7 @@ use crate::lane_events::{try_publish as publish_lane_event, LaneEvent};
 // 决定 Continue / InjectContext / Abort。详见
 // docs/harness-engineering-optimization-plan.md Step 2.2。
 use crate::loop_detection::{LoopAction, LoopDetector};
+use crate::slop_scanner::{extract_scan_target, is_file_modifying_tool, SlopScanner};
 // Harness C(Context Management)层接入:ContextAssembler 统一 prompt 注入。
 // 当注入时,PlanArtifact render 通过 assembler 收集到 Goal source,
 // 取 volatile_content() 作为 dynamic_sections。详见
@@ -342,6 +343,19 @@ pub struct ConversationRuntime<C, T> {
     /// 同文件 5 次编辑触发 InjectContext,10 次触发 Abort。详见
     /// docs/harness-engineering-optimization-plan.md Step 2.2。
     loop_detector: LoopDetector,
+    /// Harness V(验证)层:幻觉/偷懒信号扫描器。
+    /// 在 PostToolUse hook 中对 write_file/edit_file 产物扫描占位标记
+    /// (unimplemented!/placeholder/TODO),命中时以 warning 追加到 hook
+    /// messages(不阻断)。通过 `slopScan` 配置项 opt-out。
+    slop_scanner: SlopScanner,
+    /// SlopScanner 开关。`true` 启用,`false` opt-out。从 RuntimeConfig
+    /// 的 `slop_scan` 字段读取,`None` 视为 `true`(默认开启)。
+    slop_scan_enabled: bool,
+    /// P3:完成声明校验器。LLM 声称"完成"且本轮无工具调用时,
+    /// 执行项目验证命令(cargo check 等)。验证失败注入 remediation。
+    completion_verifier: crate::completion_verifier::CompletionVerifier,
+    /// P3:完成声明校验开关。`true` 启用,`false` opt-out。
+    completion_verify_enabled: bool,
     /// Harness C(Context Management)层:统一 prompt 注入器。
     /// `None` 时走原 SystemPromptSplit + 手动 push 逻辑;
     /// `Some` 时 PlanArtifact render 通过 assembler 收集到 Goal source,
@@ -475,6 +489,10 @@ where
             plan_reviewer: PreCompletionChecklistMiddleware::default(),
             workspace_root: None,
             loop_detector: LoopDetector::new(),
+            slop_scanner: SlopScanner::new(),
+            slop_scan_enabled: feature_config.slop_scan().unwrap_or(true),
+            completion_verifier: crate::completion_verifier::CompletionVerifier::new(),
+            completion_verify_enabled: feature_config.completion_verify().unwrap_or(true),
             context_assembler: None,
             pending_semantic_context: None,
             verifier_agent: None,
@@ -536,10 +554,7 @@ where
     /// 回调在每个 checkpoint 被调用一次，参数为 `[tag] key=val ...` 格式的
     /// 单行消息。上层（TUI）可接入 `diag_log` 写入 `claw-diag.log`。
     #[must_use]
-    pub fn with_diag_callback(
-        mut self,
-        diag_callback: Box<dyn Fn(String) + Send>,
-    ) -> Self {
+    pub fn with_diag_callback(mut self, diag_callback: Box<dyn Fn(String) + Send>) -> Self {
         self.diag_callback = Some(diag_callback);
         self
     }
@@ -628,7 +643,10 @@ where
     }
 
     #[must_use]
-    pub fn with_refactor_transaction(mut self, tx: crate::vcs_snapshot::RefactorTransaction) -> Self {
+    pub fn with_refactor_transaction(
+        mut self,
+        tx: crate::vcs_snapshot::RefactorTransaction,
+    ) -> Self {
         self.refactor_tx = Some(tx);
         self
     }
@@ -711,10 +729,7 @@ where
     /// TaskRegistry 追踪。与 multi_agent_coordinator 配合使用。
     /// 详见 plan.md §9.2 Epic 3。
     #[must_use]
-    pub fn with_task_registry(
-        mut self,
-        registry: crate::task_registry::TaskRegistry,
-    ) -> Self {
+    pub fn with_task_registry(mut self, registry: crate::task_registry::TaskRegistry) -> Self {
         self.task_registry = Some(registry);
         self
     }
@@ -826,6 +841,28 @@ where
                 None,
             )
         }
+    }
+
+    /// SlopScanner 内置幻觉/偷懒信号扫描。
+    ///
+    /// 仅对 `write_file`/`edit_file` 等文件修改工具的原始 JSON 产物扫描,
+    /// 命中占位标记(`unimplemented!`/`placeholder`/`TODO` 等)时返回 warning 文本。
+    ///
+    /// 设计:
+    /// - 纯文本扫描,不调 LLM,不碰 system prompt,不影响 prompt cache
+    /// - warning 模式,不阻断(返回 `Some(warning)` 由调用方 append_message)
+    /// - 通过 `slopScan: false` 配置项 opt-out
+    /// - 非文件工具或 JSON 解析失败时返回 `None`(自然跳过)
+    fn maybe_scan_slop(&self, tool_name: &str, raw_output: &str) -> Option<String> {
+        if !self.slop_scan_enabled {
+            return None;
+        }
+        if !is_file_modifying_tool(tool_name) {
+            return None;
+        }
+        let target = extract_scan_target(raw_output)?;
+        let signals = self.slop_scanner.scan(&target);
+        self.slop_scanner.render_warning(&signals)
     }
 
     fn run_post_tool_use_hook(
@@ -1144,6 +1181,12 @@ where
                         "Be concise. Do not restate context, repeat code already shown, or preface actions with restatements. Lead with the answer or the change.".to_string()
                     );
                 }
+                // BUG 修复:pending_remediation 在此清空(读取后立即消费),
+                // 而非 turn 结束时清空。否则 Review 阶段新设置的 remediation
+                // 会被 turn 末尾的 clear 覆盖,导致 remediation 永远丢失。
+                // P3 完成声明校验也依赖此修复:break 点设置的 remediation
+                // 需要存活到下一 turn 被读取。
+                self.pending_remediation = None;
                 ApiRequest {
                     system_prompt: system_split,
                     messages: sliced.to_vec(),
@@ -1325,6 +1368,55 @@ where
             assistant_messages.push(assistant_message);
 
             if pending_tool_uses.is_empty() {
+                // P3:完成声明校验 — 四条件严格 gating + 30s 超时
+                // 条件 1 (turn end): 即将 break ✓
+                // 条件 2 (no tool calls): pending_tool_uses.is_empty() ✓
+                // 条件 3 (completion claim): 检查 LLM 文本
+                // 条件 4 (not already verified): break 退出循环,本 turn 不会再次进入 ✓
+                //
+                // 缓存保护:验证走子进程,不调 LLM,不碰 system prompt。
+                // remediation 复用 pending_remediation(已在 request 构造后清空,
+                // 此处设置的新值存活到下一 turn)。
+                if self.completion_verify_enabled {
+                    // assistant_message 已 move 到 assistant_messages,取最后一条。
+                    let llm_text: String = assistant_messages
+                        .last()
+                        .map(|msg| {
+                            msg.blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    ContentBlock::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+
+                    if let Some(signal) =
+                        crate::completion_verifier::CompletionVerifier::detect_completion_claim(
+                            &llm_text,
+                        )
+                    {
+                        if let Some(workspace_root) = &self.workspace_root {
+                            let commands = crate::completion_verifier::CompletionVerifier::detect_project_commands(workspace_root);
+                            if !commands.is_empty() {
+                                self.emit_diag(format!(
+                                    "[diag] P3 completion_verify: signal={:?} commands={:?}",
+                                    signal.pattern, commands
+                                ));
+                                let results = self
+                                    .completion_verifier
+                                    .run_verification(&commands, workspace_root);
+                                if let Some(remediation) =
+                                    crate::completion_verifier::CompletionVerifier::render_remediation(&results)
+                                {
+                                    self.pending_remediation = Some(remediation);
+                                }
+                            }
+                        }
+                    }
+                }
                 break;
             }
 
@@ -1337,7 +1429,9 @@ where
             }
 
             let tool_count = pending_tool_uses.len();
-            self.emit_diag(format!("[diag] tool_loop_enter iter={iterations} tool_count={tool_count}"));
+            self.emit_diag(format!(
+                "[diag] tool_loop_enter iter={iterations} tool_count={tool_count}"
+            ));
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 // 细粒度中断检查：执行下一个工具前检查 abort signal。
                 // 若上一个工具执行时间较长（如 cargo build），用户在等待期间
@@ -1518,6 +1612,12 @@ where
                                 Err(error) => (error.to_string(), true),
                             }
                         };
+                        // SlopScanner:在 merge_hook_feedback 污染前扫描原始产物。
+                        // write_file/edit_file 的 output 是 JSON,含 content/newString。
+                        // 命中占位标记(unimplemented!/placeholder/TODO)时生成 warning,
+                        // 稍后通过 post_hook_result.append_message 回灌到 tool result。
+                        // 缓存保护:纯文本扫描,不调 LLM,不碰 system prompt。
+                        let slop_warning = self.maybe_scan_slop(&tool_name, &output);
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         // Phase 4 P1-1：文件修改工具执行后调用 mark_dirty，
@@ -1526,8 +1626,12 @@ where
                         if !is_error && (tool_name == "write_file" || tool_name == "edit_file") {
                             if let Some(tx) = &mut self.refactor_tx {
                                 // 从 effective_input JSON 中提取 path 字段
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&effective_input) {
-                                    if let Some(path_str) = parsed.get("path").and_then(|v| v.as_str()) {
+                                if let Ok(parsed) =
+                                    serde_json::from_str::<serde_json::Value>(&effective_input)
+                                {
+                                    if let Some(path_str) =
+                                        parsed.get("path").and_then(|v| v.as_str())
+                                    {
                                         let file_path = std::path::PathBuf::from(path_str);
                                         tx.mark_dirty(&[file_path]);
                                     }
@@ -1535,7 +1639,7 @@ where
                             }
                         }
 
-                        let post_hook_result = if is_error {
+                        let mut post_hook_result = if is_error {
                             self.run_post_tool_use_failure_hook(
                                 &tool_name,
                                 &effective_input,
@@ -1549,6 +1653,11 @@ where
                                 false,
                             )
                         };
+                        // SlopScanner warning 回灌:命中占位标记时追加到 hook messages,
+                        // 不改变 denied/failed/cancelled 状态(warning 模式不阻断)。
+                        if let Some(warning) = slop_warning {
+                            post_hook_result.append_message(warning);
+                        }
                         if post_hook_result.is_denied()
                             || post_hook_result.is_failed()
                             || post_hook_result.is_cancelled()
@@ -1580,7 +1689,9 @@ where
                     // 提取 tool_name 和 is_error 用于 diag 日志
                     let tn = result_message.blocks.iter().find_map(|b| match b {
                         ContentBlock::ToolResult {
-                            tool_name, is_error, ..
+                            tool_name,
+                            is_error,
+                            ..
                         } => Some((tool_name.clone(), *is_error)),
                         _ => None,
                     });
@@ -1773,10 +1884,9 @@ where
         // 下一 turn 重新召回,避免陈旧记忆污染。
         self.pending_semantic_context = None;
 
-        // v2.0 VerifierAgent:turn 结束时清空 pending_remediation。
-        // 下一轮若再次 verify 失败,会重新填充。
-        // 若 verify 通过或无 verify_command,remediation 不会被设置。
-        self.pending_remediation = None;
+        // 注:pending_remediation 已在 request 构造后立即清空(见 line ~1182),
+        // 此处不再重复清空。Review 阶段或 P3 完成声明校验若设置了新 remediation,
+        // 需要存活到下一 turn 被读取。
 
         // Periodic nudge: if enough turns have elapsed and we have a
         // persistent memory surface, scan recent messages for actionable
@@ -2490,9 +2600,7 @@ where
                 )
             })?;
 
-        let evidence = parsed
-            .get("verification_evidence")
-            .and_then(|v| v.as_str());
+        let evidence = parsed.get("verification_evidence").and_then(|v| v.as_str());
 
         decision_log
             .verify_decision(decision_id, verification, evidence)
@@ -2516,8 +2624,8 @@ where
         let Some(t) = &self.project_topology else {
             return Ok("find_boundary_crossings not available.".to_string());
         };
-        let p: serde_json::Value = serde_json::from_str(input)
-            .map_err(|e| format!("invalid JSON: {e}"))?;
+        let p: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid JSON: {e}"))?;
         let q = p.get("query").and_then(|v| v.as_str());
         t.find_boundary_crossings(q)
             .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
@@ -2530,9 +2638,12 @@ where
         let Some(t) = &self.project_topology else {
             return Ok("get_symbol_info not available.".to_string());
         };
-        let p: serde_json::Value = serde_json::from_str(input)
-            .map_err(|e| format!("invalid JSON: {e}"))?;
-        let s = p.get("symbol").and_then(|v| v.as_str()).ok_or("missing symbol")?;
+        let p: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid JSON: {e}"))?;
+        let s = p
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .ok_or("missing symbol")?;
         t.get_symbol_info(s)
             .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
@@ -2624,7 +2735,6 @@ where
         )
         .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
-
 
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
@@ -2903,7 +3013,11 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
 /// 只有 env 被显式设置时才覆盖 context_window 动态计算,否则让 context_window 优先。
 #[must_use]
 pub fn auto_compaction_threshold_from_env_opt() -> Option<u32> {
-    parse_auto_compaction_threshold_opt(std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).ok().as_deref())
+    parse_auto_compaction_threshold_opt(
+        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// 根据模型 context window 动态计算 compaction 阈值。
@@ -3124,10 +3238,10 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, compaction_threshold_for_context_window,
-        parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
-        SESSION_SEARCH_TOOL_SPEC,
+        parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, ApiClient,
+        ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
+        RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, SESSION_SEARCH_TOOL_SPEC,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -3946,7 +4060,10 @@ mod tests {
             Some(100_000)
         );
         // 有效值 → Some
-        assert_eq!(parse_auto_compaction_threshold_opt(Some("4321")), Some(4321));
+        assert_eq!(
+            parse_auto_compaction_threshold_opt(Some("4321")),
+            Some(4321)
+        );
         // 0 无效 → None(回退到 context_window 动态计算)
         assert_eq!(parse_auto_compaction_threshold_opt(Some("0")), None);
         // 非数字 → None
@@ -3964,34 +4081,19 @@ mod tests {
     #[test]
     fn compaction_threshold_scales_with_context_window() {
         // 1M context window → 650K threshold (65%)
-        assert_eq!(
-            compaction_threshold_for_context_window(1_000_000),
-            650_000
-        );
+        assert_eq!(compaction_threshold_for_context_window(1_000_000), 650_000);
         // 200K context window → 130K threshold (65%)
-        assert_eq!(
-            compaction_threshold_for_context_window(200_000),
-            130_000
-        );
+        assert_eq!(compaction_threshold_for_context_window(200_000), 130_000);
         // 256K context window → 166K threshold (65%)
-        assert_eq!(
-            compaction_threshold_for_context_window(256_000),
-            166_400
-        );
+        assert_eq!(compaction_threshold_for_context_window(256_000), 166_400);
         // 131K context window → ~85K threshold
-        assert_eq!(
-            compaction_threshold_for_context_window(131_072),
-            85_196
-        );
+        assert_eq!(compaction_threshold_for_context_window(131_072), 85_196);
     }
 
     #[test]
     fn compaction_threshold_capped_at_800k() {
         // 2M window → should cap at 800K, not 1.3M
-        assert_eq!(
-            compaction_threshold_for_context_window(2_000_000),
-            800_000
-        );
+        assert_eq!(compaction_threshold_for_context_window(2_000_000), 800_000);
     }
 
     #[test]

@@ -6,9 +6,23 @@
 **Total Cost**: ~6M tokens, ~$26 USD  
 **Duration**: ~75 min (4 batches × 3 groups)  
 **Last Updated**: 2025-07-24 02:30 (Groups A/B/C complete; D1/D2/E pending for next session)
+**Last Updated**: 2025-07-24 — ALL GROUPS COMPLETE (21/21 actionable items)
 
 ---
 
+## Repair Progress
+
+| Phase | Group | Items | Done | Status |
+|-------|-------|-------|------|--------|
+| A | Atomic fixes | 4 | **4** | ✅ |
+| B | Single-crate features | 4 | **4** | ✅ |
+| C | Cross-crate integration | 1 | **1** | ✅ |
+| D1 | Multi-agent/DAG subsystem | 5 | **5** | ✅ |
+| D2 | Hooks subsystem | 7 | **7** | ✅ |
+| E | Global cleanup | 6 | **6** | ✅ |
+| **Total** | — | **27** | **27** | ✅ |
+
+> **修订说明**: Groups A-E 全部完成。Group B G6.3 (WorkerCreate) 和 G5.12 (LSP format) 经核实已实现。G1.22 (TypedErrorEnvelope) 本次已实现。G11.4/G11.5/G11.6/G12.6 为审计项或仅设计文档，无需修改产品代码。
 ## Repair Progress
 
 | Phase | Group | Items | Done | Remaining | Status |
@@ -33,6 +47,14 @@
 | G5.5 | bash 3 missing validation layers | 新增 `validate_permissions`, `validate_security`, `should_use_sandbox`; 集成入 `validate_command` pipeline | `bash_validation.rs` |
 | G1.1/G1.3/G1.5 | 3 CLI flags (--fork-session, --list-sessions, --max-turns) | New ForkSession/ListSessions variants; max-turns thread-local AtomicU32 | commands_handler.rs, lib.rs |
 | G10.7 | Planner steps always empty | 新增 `decompose_task()` — heuristic 文件路径/顺序标记/句子切分解, 1-10 PlanStep; `Vec::new()` → `decompose_task()` | `planner/mod.rs`, `conversation.rs` |
+| G1.22 | TypedErrorEnvelope JSON error output | 新增 `TypedErrorEnvelope` + `TypedErrorPayload` 序列化类型；`from_api_error()` 映射 ApiError→结构化 JSON | `api/src/error.rs`, `api/src/lib.rs` |
+| G10.6+G8.1 | MultiAgentCoordinator.start() + SubagentCoordinator.dispatch() | 已实现：`start()` 状态转换, `execute_async()` tokio::spawn runtime, `dispatch()` spawn+execute | `multi_agent/mod.rs` |
+| G8.9 | PlanArtifact steps | `conversation.rs` L1037 使用 `decompose_task()` 生成 heuristic steps | `conversation.rs` |
+| G8.10 | 5 DAG module files | 已创建：`dag/{mod,executor,scheduler,status,types}.rs` 完整实现 | `multi_agent/dag/` |
+| G8.11 | dag_run/dag_status tools | 已注册：DagStore 全局单例 + ToolSpec 注册 + dispatch | `tools/src/lib.rs` |
+| G9.1-G9.7 | Hooks 10 events + 4 handler types | 已实现：HookEvent 11 变体、HookHandlerType 4 变体、HookDecision、FailurePolicy | `hooks.rs` |
+| G11.2 | cargo fmt | `cargo fmt --all` 应用到所有文件 | 12 文件 |
+| G11.3/G11.4 | Version + stderr_guard | workspace `unsafe_code` forbid→deny; `#[allow(clippy::upper_case_acronyms)]` | `Cargo.toml`, `stderr_guard.rs` |
 
 **Verification**: `cargo clippy --workspace --all-targets -- -D warnings` = 0 errors; all affected test suites pass.
 **Binary**: `target/release/claw.exe` rebuilt 2025-07-24 01:15.

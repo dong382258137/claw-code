@@ -12,12 +12,12 @@ mod bootstrap;
 pub mod branch_lock;
 pub mod cache_alignment;
 mod compact;
-pub mod content_classifier;
-pub mod content_compression;
-pub mod decision_log;
 mod config;
 pub mod config_validate;
+pub mod content_classifier;
+pub mod content_compression;
 mod conversation;
+pub mod decision_log;
 mod file_ops;
 pub mod g004_conformance;
 mod git_context;
@@ -77,6 +77,14 @@ pub mod context_assembler;
 // Harness O(可观测性)层:LoopDetectionMiddleware 打断 Doom Loop(同文件 10+ 次编辑)。
 // 详见 docs/harness-engineering-optimization-plan.md Step 2.2。
 pub mod loop_detection;
+// Harness V(验证)层:SlopScanner 内置幻觉/偷懒信号扫描,write_file/edit_file 后
+// 扫产物占位标记(unimplemented!/placeholder/TODO),warning 不阻断。
+// 仿照 LoopDetectionMiddleware 模式,纯文本扫描不调 LLM,不影响 prompt cache。
+pub mod slop_scanner;
+// Harness V(验证)层:P3 完成声明校验。LLM 声称"完成"且本轮无工具调用时,
+// 自动执行项目验证命令(cargo check 等),失败注入 remediation。
+// 四条件严格 gating + 30s 超时,纯子进程执行不调 LLM,不影响 prompt cache。
+pub mod completion_verifier;
 // Harness V(验证)层:VerifierAgent 规则/视觉/模型当裁判三种验证反馈。
 // 详见 docs/harness-engineering-optimization-plan.md Step 3.1。
 // 子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
@@ -123,20 +131,22 @@ pub use compact::{
     get_compact_continuation_message, microcompact, microcompact_with_archiver, should_compact,
     CompactionConfig, CompactionResult,
 };
-pub use context_assembler::{AssembledPrompt, CacheStrategy, ContextAssembler, ContextBlock, ContextSource, TokenBudget};
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, LspConfigCollection, LspServerConfig,
-    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
-    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
-    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, ScopedMcpServerConfig, WizardSettings, CLAW_SETTINGS_SCHEMA_NAME,
-    bootstrapped_sentinel_path, default_config_home, is_bootstrapped, load_wizard_settings, mark_bootstrapped,
-    save_wizard_settings,
+    bootstrapped_sentinel_path, default_config_home, is_bootstrapped, load_wizard_settings,
+    mark_bootstrapped, save_wizard_settings, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
+    LspConfigCollection, LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig,
+    McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
+    McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
+    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    WizardSettings, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
+};
+pub use context_assembler::{
+    AssembledPrompt, CacheStrategy, ContextAssembler, ContextBlock, ContextSource, TokenBudget,
 };
 pub use decision_log::{
     compute_simhash, hamming_distance, DecisionLog, DecisionLogError, DecisionVerification,
@@ -323,8 +333,8 @@ pub use trust_resolver::{
     TrustResolution, TrustResolver,
 };
 pub use usage::{
-    format_cost_localized, format_usd, pricing_for_model, CNY_TO_USD_RATE, ModelPricing,
-    TokenUsage, UsageCostEstimate, UsageTracker,
+    format_cost_localized, format_usd, pricing_for_model, ModelPricing, TokenUsage,
+    UsageCostEstimate, UsageTracker, CNY_TO_USD_RATE,
 };
 pub use verifier::{RuleVerdict, RuleVerifier, VerificationResult, VerifierAgent};
 pub use worker_boot::{

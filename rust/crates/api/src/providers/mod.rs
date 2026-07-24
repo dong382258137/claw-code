@@ -942,17 +942,15 @@ mod tests {
     #[test]
     fn deepseek_v4_with_openai_prefix_resolves_context_window() {
         // openai/deepseek-v4-pro 和 deepseek/deepseek-v4-pro 前缀应都能解析
-        for prefixed in &[
-            "openai/deepseek-v4-pro",
-            "deepseek/deepseek-v4-pro",
-        ] {
+        for prefixed in &["openai/deepseek-v4-pro", "deepseek/deepseek-v4-pro"] {
             let limit = model_token_limit(prefixed)
                 .unwrap_or_else(|| panic!("{prefixed} should resolve to deepseek-v4-pro limits"));
             assert_eq!(
                 limit.context_window_tokens, 1_000_000,
                 "{prefixed} should have 1M context window"
             );
-        }}
+        }
+    }
 
     #[test]
     fn resolves_grok_aliases() {

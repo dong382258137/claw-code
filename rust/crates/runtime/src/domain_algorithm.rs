@@ -78,18 +78,14 @@ pub fn refactor_algorithm_topo(
             ));
         }
         TopologyState::Building { .. } => {
-            return Ok(
-                "refactor_algorithm_topo: topology is still building. \
+            return Ok("refactor_algorithm_topo: topology is still building. \
                  Do NOT retry immediately — use grep_search/read_file instead."
-                    .to_string(),
-            );
+                .to_string());
         }
         TopologyState::Uninitialized => {
-            return Ok(
-                "refactor_algorithm_topo: topology not initialized. \
+            return Ok("refactor_algorithm_topo: topology not initialized. \
                  Use grep_search/read_file to find references."
-                    .to_string(),
-            );
+                .to_string());
         }
     };
 
@@ -101,7 +97,11 @@ pub fn refactor_algorithm_topo(
         ));
     };
 
-    let defs = si.definitions.get(target_symbol).cloned().unwrap_or_default();
+    let defs = si
+        .definitions
+        .get(target_symbol)
+        .cloned()
+        .unwrap_or_default();
     let callers = si.callers.get(target_symbol).cloned().unwrap_or_default();
     let call_site_count = callers.len();
 
@@ -109,7 +109,13 @@ pub fn refactor_algorithm_topo(
 
     // 定义点建议
     for def in &defs {
-        let old_text = format!("{} {} ({}:{})", def.kind, def.name, def.file.display(), def.line);
+        let old_text = format!(
+            "{} {} ({}:{})",
+            def.kind,
+            def.name,
+            def.file.display(),
+            def.line
+        );
         let new_text = match new_name {
             Some(nn) => format!("{} {} ({}:{})", def.kind, nn, def.file.display(), def.line),
             None => old_text.clone(),
@@ -126,9 +132,10 @@ pub fn refactor_algorithm_topo(
     // 调用点建议:对上下文行做 target_symbol → new_name 替换
     let mut covered = 0usize;
     for cs in &callers {
-        let old_text = cs.context.clone().unwrap_or_else(|| {
-            format!("{}:{}", cs.file.display(), cs.line)
-        });
+        let old_text = cs
+            .context
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", cs.file.display(), cs.line));
         let new_text = match new_name {
             Some(nn) => replace_symbol_occurrences(&old_text, target_symbol, nn),
             None => old_text.clone(),
@@ -169,8 +176,7 @@ pub fn refactor_algorithm_topo(
         topology_state: topo_state_str,
     };
 
-    serde_json::to_string_pretty(&suggestion)
-        .map_err(|e| format!("serialization error: {e}"))
+    serde_json::to_string_pretty(&suggestion).map_err(|e| format!("serialization error: {e}"))
 }
 
 /// 在文本行中将 `target` 作为整词替换为 `new_name`。
@@ -185,7 +191,8 @@ fn replace_symbol_occurrences(text: &str, target: &str, new_name: &str) -> Strin
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
     while i < bytes.len() {
-        if i + target_bytes.len() <= bytes.len() && &bytes[i..i + target_bytes.len()] == target_bytes
+        if i + target_bytes.len() <= bytes.len()
+            && &bytes[i..i + target_bytes.len()] == target_bytes
         {
             let before = if i > 0 { bytes[i - 1] } else { b' ' };
             let after = if i + target_bytes.len() < bytes.len() {
@@ -340,12 +347,16 @@ pub fn benchmark_compare(
         note,
     };
 
-    serde_json::to_string_pretty(&result)
-        .map_err(|e| format!("serialization error: {e}"))
+    serde_json::to_string_pretty(&result).map_err(|e| format!("serialization error: {e}"))
 }
 
 /// 运行单次命令(经 shell 包装以支持管道/参数),带超时 kill。
-fn run_one(command: &str, cwd: Option<&Path>, timeout: Duration, index: usize) -> Result<Sample, String> {
+fn run_one(
+    command: &str,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    index: usize,
+) -> Result<Sample, String> {
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/c").arg(command);
@@ -359,7 +370,9 @@ fn run_one(command: &str, cwd: Option<&Path>, timeout: Duration, index: usize) -
         cmd.current_dir(dir);
     }
     // 丢弃输出,避免缓冲区阻塞;只关心计时与退出码。
-    cmd.stdout(Stdio::null()).stderr(Stdio::null()).stdin(Stdio::null());
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
 
     let mut child = cmd
         .spawn()
@@ -417,8 +430,11 @@ fn compute_stats(times: &[u64]) -> Stats {
     } else {
         (sorted[count / 2 - 1] as f64 + sorted[count / 2] as f64) / 2.0
     };
-    let variance: f64 =
-        sorted.iter().map(|t| (*t as f64 - avg).powi(2)).sum::<f64>() / count as f64;
+    let variance: f64 = sorted
+        .iter()
+        .map(|t| (*t as f64 - avg).powi(2))
+        .sum::<f64>()
+        / count as f64;
     Stats {
         avg_ms: avg,
         median_ms: median,
@@ -488,9 +504,12 @@ mod tests {
         // "do NOT retry" 提示而非阻塞或报错。
         let topo = ProjectTopology::new(PathBuf::from("/nonexistent/project/xyz"));
         let _ = topo.ensure_built(); // 派发后台线程,立即返回 Building
-        // 此时状态可能为 Building(后台线程尚未完成)
+                                     // 此时状态可能为 Building(后台线程尚未完成)
         let state = topo.state();
-        if matches!(state, crate::project_topology::TopologyState::Building { .. }) {
+        if matches!(
+            state,
+            crate::project_topology::TopologyState::Building { .. }
+        ) {
             let out = refactor_algorithm_topo(&topo, "some_symbol", Some("new_name"), None)
                 .expect("should not error");
             assert!(
@@ -541,14 +560,7 @@ mod tests {
     fn benchmark_compare_runs_fast_command() {
         // 快速命令,1 次采样,无预热
         // echo 在 Windows(cmd) 和 Unix(shell)下都可用,无需平台分支
-        let out = benchmark_compare(
-            "echo hello",
-            None,
-            10,
-            2,
-            0,
-        )
-        .expect("should succeed");
+        let out = benchmark_compare("echo hello", None, 10, 2, 0).expect("should succeed");
         assert!(out.contains("\"sample_size\": 2"));
         assert!(out.contains("\"valid_count\": 2"));
         assert!(out.contains("\"timeout_count\": 0"));

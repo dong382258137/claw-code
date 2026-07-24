@@ -49,6 +49,7 @@ impl Drop for StderrGuard {
 // ── Windows 实现 ──────────────────────────────────────────────
 
 #[cfg(windows)]
+#[allow(clippy::upper_case_acronyms)]
 mod win32 {
     use std::ffi::c_void;
     pub type HANDLE = *mut c_void;

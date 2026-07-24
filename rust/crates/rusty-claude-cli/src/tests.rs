@@ -1069,8 +1069,7 @@ fn removed_login_and_logout_subcommands_error_helpfully() {
         }
     );
     assert_eq!(
-        parse_args(&["init".to_string(), "-f".to_string()])
-            .expect("init -f should parse"),
+        parse_args(&["init".to_string(), "-f".to_string()]).expect("init -f should parse"),
         CliAction::Init {
             output_format: CliOutputFormat::Text,
             force: true,
@@ -4607,7 +4606,7 @@ fn build_runtime_plugin_state_merges_plugin_hooks_into_runtime_features() {
     let pre_hooks = state.feature_config.hooks().pre_tool_use();
     assert_eq!(pre_hooks.len(), 1);
     assert!(
-        pre_hooks[0].ends_with("hooks/pre.sh"),
+        pre_hooks[0].value.ends_with("hooks/pre.sh"),
         "expected installed plugin hook path, got {pre_hooks:?}"
     );
 

@@ -1520,7 +1520,6 @@ fn normalize_response(
     model: &str,
     response: ChatCompletionResponse,
 ) -> Result<MessageResponse, ApiError> {
-
     let choice = response
         .choices
         .into_iter()

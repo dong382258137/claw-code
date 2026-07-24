@@ -262,12 +262,21 @@ if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
     );
 
     let output = std::process::Command::new("powershell")
-        .args(["-STA", "-NoProfile", "-NonInteractive", "-Command", &ps_script])
+        .args([
+            "-STA",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &ps_script,
+        ])
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() {
-        paste_log!("[paste-img] PowerShell 失败: {}", String::from_utf8_lossy(&output.stderr));
+        paste_log!(
+            "[paste-img] PowerShell 失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         return Ok(None);
     }
 

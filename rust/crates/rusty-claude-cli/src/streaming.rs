@@ -511,6 +511,7 @@ impl AnthropicRuntimeClient {
                     self.emit_status(StatusEvent::Usage(start.message.usage.token_usage()));
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
+                    let pre_len = events.len();
                     push_output_block(
                         start.content_block,
                         out,
@@ -519,6 +520,14 @@ impl AnthropicRuntimeClient {
                         true,
                         &mut block_has_thinking_summary,
                     )?;
+                    // P0 修复：OpenAI-compatible 提供商（DeepSeek 等）可能在
+                    // ContentBlockStart 中携带完整文本块。push_output_block 只写入
+                    // out（TUI 下为 io::sink），需额外 emit TextDelta 给 TUI 渲染。
+                    for event in &events[pre_len..] {
+                        if let AssistantEvent::TextDelta(text) = event {
+                            self.emit_status(StatusEvent::TextDelta(text.clone()));
+                        }
+                    }
                     // P1 修复：同 MessageStart 分支，ContentBlockStart 携带完整
                     // thinking 块时也需 emit Thinking 事件给 TUI。
                     if block_has_thinking_summary {

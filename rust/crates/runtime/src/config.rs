@@ -74,6 +74,8 @@ pub struct RuntimeFeatureConfig {
     /// P3-1:Plan/Execute/Review 模式开关。`Some(true)` 启用 planner,
     /// `None` 或 `Some(false)` 关闭。CLI flag `--enable-plan-mode` 优先级更高。
     plan_mode: Option<bool>,
+    slop_scan: Option<bool>,
+    completion_verify: Option<bool>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -85,12 +87,61 @@ pub struct ProviderFallbackConfig {
     fallbacks: Vec<String>,
 }
 
+/// G9.2-G9.7: Hook handler descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookDefinition {
+    pub handler_type: HookHandlerType,
+    pub value: String,
+    pub failure_policy: FailurePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookHandlerType {
+    Command, Script, Http, Mcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailurePolicy {
+    FailClose, FailOpen,
+}
+
+impl HookDefinition {
+    #[must_use]
+    pub fn command(cmd: impl Into<String>) -> Self {
+        Self { handler_type: HookHandlerType::Command, value: cmd.into(), failure_policy: FailurePolicy::FailClose }
+    }
+    #[must_use]
+    pub fn script(content: impl Into<String>) -> Self {
+        Self { handler_type: HookHandlerType::Script, value: content.into(), failure_policy: FailurePolicy::FailClose }
+    }
+    #[must_use]
+    pub fn http_url(url: impl Into<String>) -> Self {
+        Self { handler_type: HookHandlerType::Http, value: url.into(), failure_policy: FailurePolicy::FailClose }
+    }
+    #[must_use]
+    pub fn mcp_tool(tool_name: impl Into<String>) -> Self {
+        Self { handler_type: HookHandlerType::Mcp, value: tool_name.into(), failure_policy: FailurePolicy::FailClose }
+    }
+    #[must_use]
+    pub fn with_failure_policy(mut self, policy: FailurePolicy) -> Self {
+        self.failure_policy = policy; self
+    }
+}
+
+impl From<String> for HookDefinition {
+    fn from(value: String) -> Self { Self::command(value) }
+}
+impl From<&str> for HookDefinition {
+    fn from(value: &str) -> Self { Self::command(value.to_string()) }
+}
+
 /// Hook command lists grouped by lifecycle stage.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeHookConfig {
-    pre_tool_use: Vec<String>,
-    post_tool_use: Vec<String>,
-    post_tool_use_failure: Vec<String>,
+    pre_tool_use: Vec<HookDefinition>,
+    post_tool_use: Vec<HookDefinition>,
+    post_tool_use_failure: Vec<HookDefinition>,
+    lifecycle: std::collections::HashMap<String, Vec<HookDefinition>>,
 }
 
 /// Raw permission rule lists grouped by allow, deny, and ask behavior.
@@ -378,6 +429,8 @@ impl ConfigLoader {
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             poor_mode: parse_optional_poor_mode(&merged_value),
             plan_mode: parse_optional_plan_mode(&merged_value),
+            slop_scan: None,
+            completion_verify: None,
         };
 
         Ok(RuntimeConfig {
@@ -582,6 +635,16 @@ impl RuntimeFeatureConfig {
     pub fn plan_mode(&self) -> Option<bool> {
         self.plan_mode
     }
+
+    #[must_use]
+    pub fn slop_scan(&self) -> Option<bool> {
+        self.slop_scan
+    }
+
+    #[must_use]
+    pub fn completion_verify(&self) -> Option<bool> {
+        self.completion_verify
+    }
 }
 
 fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Vec<String> {
@@ -693,19 +756,20 @@ impl RuntimeHookConfig {
         post_tool_use_failure: Vec<String>,
     ) -> Self {
         Self {
-            pre_tool_use,
-            post_tool_use,
-            post_tool_use_failure,
+            pre_tool_use: pre_tool_use.into_iter().map(HookDefinition::from).collect(),
+            post_tool_use: post_tool_use.into_iter().map(HookDefinition::from).collect(),
+            post_tool_use_failure: post_tool_use_failure.into_iter().map(HookDefinition::from).collect(),
+            lifecycle: std::collections::HashMap::new(),
         }
     }
 
     #[must_use]
-    pub fn pre_tool_use(&self) -> &[String] {
+    pub fn pre_tool_use(&self) -> &[HookDefinition] {
         &self.pre_tool_use
     }
 
     #[must_use]
-    pub fn post_tool_use(&self) -> &[String] {
+    pub fn post_tool_use(&self) -> &[HookDefinition] {
         &self.post_tool_use
     }
 
@@ -717,17 +781,29 @@ impl RuntimeHookConfig {
     }
 
     pub fn extend(&mut self, other: &Self) {
-        extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
-        extend_unique(&mut self.post_tool_use, other.post_tool_use());
-        extend_unique(
+        extend_defs(&mut self.pre_tool_use, other.pre_tool_use());
+        extend_defs(&mut self.post_tool_use, other.post_tool_use());
+        extend_defs(
             &mut self.post_tool_use_failure,
             other.post_tool_use_failure(),
         );
+        for (event, defs) in &other.lifecycle {
+            extend_defs(self.lifecycle.entry(event.clone()).or_default(), defs);
+        }
     }
 
     #[must_use]
-    pub fn post_tool_use_failure(&self) -> &[String] {
+    pub fn post_tool_use_failure(&self) -> &[HookDefinition] {
         &self.post_tool_use_failure
+    }
+
+    #[must_use]
+    pub fn lifecycle(&self) -> &std::collections::HashMap<String, Vec<HookDefinition>> {
+        &self.lifecycle
+    }
+
+    pub fn add_lifecycle(&mut self, event: &str, definition: HookDefinition) {
+        self.lifecycle.entry(event.to_string()).or_default().push(definition);
     }
 }
 
@@ -933,10 +1009,11 @@ fn parse_optional_hooks_config_object(
     };
     let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
+        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default().into_iter().map(HookDefinition::from).collect(),
+        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default().into_iter().map(HookDefinition::from).collect(),
         post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
-            .unwrap_or_default(),
+            .unwrap_or_default().into_iter().map(HookDefinition::from).collect(),
+        lifecycle: std::collections::HashMap::new(),
     })
 }
 
@@ -1414,13 +1491,13 @@ fn deep_merge_objects(
     }
 }
 
-fn extend_unique(target: &mut Vec<String>, values: &[String]) {
+fn extend_defs(target: &mut Vec<HookDefinition>, values: &[HookDefinition]) {
     for value in values {
-        push_unique(target, value.clone());
+        push_def_unique(target, value.clone());
     }
 }
 
-fn push_unique(target: &mut Vec<String>, value: String) {
+fn push_def_unique(target: &mut Vec<HookDefinition>, value: HookDefinition) {
     if !target.iter().any(|existing| existing == &value) {
         target.push(value);
     }
@@ -1511,8 +1588,9 @@ pub fn load_wizard_settings() -> Option<WizardSettings> {
 mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME, LspServerConfig,
+        HookDefinition, McpServerConfig, McpTransport, ResolvedPermissionMode,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig,
+        CLAW_SETTINGS_SCHEMA_NAME, LspServerConfig,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1626,11 +1704,11 @@ mod tests {
             .and_then(JsonValue::as_object)
             .expect("hooks object")
             .contains_key("PostToolUse"));
-        assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
-        assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
+        assert_eq!(loaded.hooks().pre_tool_use(), &[HookDefinition::command("base")]);
+        assert_eq!(loaded.hooks().post_tool_use(), &[HookDefinition::command("project")]);
         assert_eq!(
             loaded.hooks().post_tool_use_failure(),
-            &["project-failure".to_string()]
+            &[HookDefinition::command("project-failure")]
         );
         assert_eq!(loaded.permission_rules().allow(), &["Read".to_string()]);
         assert_eq!(
@@ -2256,15 +2334,15 @@ mod tests {
         // then
         assert_eq!(
             merged.pre_tool_use(),
-            &["pre-a".to_string(), "pre-b".to_string()]
+            &[HookDefinition::command("pre-a"), HookDefinition::command("pre-b")]
         );
         assert_eq!(
             merged.post_tool_use(),
-            &["post-a".to_string(), "post-b".to_string()]
+            &[HookDefinition::command("post-a"), HookDefinition::command("post-b")]
         );
         assert_eq!(
             merged.post_tool_use_failure(),
-            &["failure-a".to_string(), "failure-b".to_string()]
+            &[HookDefinition::command("failure-a"), HookDefinition::command("failure-b")]
         );
     }
 

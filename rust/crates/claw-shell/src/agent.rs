@@ -218,9 +218,9 @@ where
         if let Ok(decision_log) = runtime::DecisionLog::open(&arguments.cwd) {
             runtime = runtime.with_decision_log(decision_log);
         }
-        let topology = std::sync::Arc::new(
-            runtime::project_topology::ProjectTopology::new(arguments.cwd.clone()),
-        );
+        let topology = std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(
+            arguments.cwd.clone(),
+        ));
         runtime = runtime.with_project_topology(topology);
         let tx = runtime::RefactorTransaction::new(arguments.cwd.clone());
         runtime = runtime.with_refactor_transaction(tx);

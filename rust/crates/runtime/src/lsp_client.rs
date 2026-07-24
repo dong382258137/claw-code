@@ -363,13 +363,7 @@ impl LspRegistry {
 
         let args_vec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         match self.spawn_server(language, command, &args_vec, &root_path) {
-            Ok(()) => {
-                eprintln!(
-                    "[lsp] auto-started '{language}' server: {command} {} (no explicit config, using built-in default)",
-                    args_vec.join(" ")
-                );
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -437,10 +431,6 @@ impl LspRegistry {
 
         // 6. 重新 spawn
         self.spawn_server(language, &command, &args, &root_path)?;
-
-        eprintln!(
-            "[lsp] retry-spawned '{language}' server: {command} (previously in error/disconnected state)"
-        );
 
         Ok(())
     }
@@ -1094,7 +1084,7 @@ impl ProcessLspTransport {
         let mut cmd = Command::new(&self.server_command);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::null());
         if !self.server_args.is_empty() {
             cmd.args(&self.server_args);
         }
@@ -1339,8 +1329,8 @@ impl ProcessLspTransport {
         if let Some(child) = self.child.take() {
             let mut child = match child.lock() {
                 Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[lsp] child lock poisoned during shutdown: {e}");
+                Err(_e) => {
+                    // TUI 模式下 stderr 输出会污染终端界面，静默处理。
                     return;
                 }
             };

@@ -411,7 +411,9 @@ impl WorkerRegistry {
         // 详见 plan.md §9.2 Epic 1。
         let mut trust_config = TrustConfig::default();
         for root in trusted_roots {
-            trust_config.allowlisted.push(TrustAllowlistEntry::new(root));
+            trust_config
+                .allowlisted
+                .push(TrustAllowlistEntry::new(root));
         }
         // TODO: denylist 当前为空,后续可从 ConfigLoader::denied_roots() 注入。
 

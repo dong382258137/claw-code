@@ -1920,7 +1920,8 @@ mod tests {
     /// P1:验证 is_already_summarized 对新格式仍然有效(避免重复摘要)。
     #[test]
     fn is_already_summarized_recognizes_new_multi_line_format() {
-        let new_format = format_tool_result_summary("Read", "call_test2", "line1\nline2\nline3\nline4\nline5");
+        let new_format =
+            format_tool_result_summary("Read", "call_test2", "line1\nline2\nline3\nline4\nline5");
         assert!(
             is_already_summarized(&new_format),
             "P1: is_already_summarized should recognize new multi-line format: {new_format}"

@@ -400,7 +400,7 @@ fn strip_ansi_and_control(text: &str) -> String {
                 // ESC 序列：如果下一个是 `[`，跳过整个 CSI 序列
                 if chars.peek() == Some(&'[') {
                     chars.next(); // consume `[`
-                    // 跳过参数部分（数字、分号、问号等），直到终止字母
+                                  // 跳过参数部分（数字、分号、问号等），直到终止字母
                     while let Some(&c) = chars.peek() {
                         if c.is_ascii_alphabetic() || c == '~' {
                             chars.next(); // consume terminator
@@ -761,7 +761,8 @@ mod tests {
     #[test]
     fn strip_sgr_leaves_plain_text() {
         // 模拟从终端复制含 SGR 颜色码的文本
-        let input = "\x1b[38;5;240m[10:26:08]\x1b[0m \x1b[1m\x1b[38;5;3m模型 deepseek-v4-pro\x1b[0m";
+        let input =
+            "\x1b[38;5;240m[10:26:08]\x1b[0m \x1b[1m\x1b[38;5;3m模型 deepseek-v4-pro\x1b[0m";
         let result = super::strip_ansi_and_control(input);
         assert_eq!(result, "[10:26:08] 模型 deepseek-v4-pro");
     }

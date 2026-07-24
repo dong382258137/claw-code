@@ -135,7 +135,11 @@ pub(crate) fn run_first_run_wizard() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, crossterm::event::EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    )?;
 
     // Drop guard for terminal cleanup on any exit path.
     struct Guard;
@@ -182,9 +186,7 @@ pub(crate) fn run_first_run_wizard() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e)
             }
         },
-        Ok(WizardOutcome::Quit) => {
-            Err("Configuration cancelled by user.".into())
-        }
+        Ok(WizardOutcome::Quit) => Err("Configuration cancelled by user.".into()),
         Err(e) => {
             // If the wizard loop itself errored (crossterm I/O), also show
             // the error on-screen before teardown.
@@ -220,10 +222,7 @@ fn inject_api_key(provider_slug: &str, api_key: &str) {
 /// and the process exits. Without this, on Windows the console window closes
 /// immediately after printing the error to stderr, making it look like a
 /// "flash crash".
-fn render_error_screen(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    message: &str,
-) {
+fn render_error_screen(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, message: &str) {
     let _ = terminal.draw(|f| {
         let area = centered_rect(64, 10, f.area());
         f.render_widget(Clear, area);
@@ -251,7 +250,7 @@ fn render_error_screen(
         match event::read() {
             Ok(Event::Key(_)) => break,
             Err(_) => break, // stdin broken — don't loop forever
-            _ => {}           // non-key event — keep waiting
+            _ => {}          // non-key event — keep waiting
         }
     }
 }
@@ -294,7 +293,9 @@ fn run_wizard_loop(
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => return Ok(WizardOutcome::Quit),
                 KeyCode::Char('c')
-                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     return Ok(WizardOutcome::Quit);
                 }
@@ -322,9 +323,7 @@ fn run_wizard_loop(
 #[derive(Clone)]
 enum WizardStep {
     /// Display detected keys + "Manual config..." as a selectable list.
-    SelectDetected {
-        selected: usize,
-    },
+    SelectDetected { selected: usize },
     /// User chose "Manual config..." or no keys were detected.
     ManualInput {
         provider_idx: usize,
@@ -439,12 +438,7 @@ fn handle_key(step: &WizardStep, key: KeyCode, detected: &[DetectedKey]) -> Wiza
 
 const HELP_TEXT: &str = "\u{2191}/\u{2193} Navigate   Enter Confirm   Esc Quit";
 
-fn render_wizard(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    step: &WizardStep,
-    detected: &[DetectedKey],
-) {
+fn render_wizard(f: &mut ratatui::Frame, area: Rect, step: &WizardStep, detected: &[DetectedKey]) {
     match step {
         WizardStep::SelectDetected { selected } => {
             render_detected_screen(f, area, *selected, detected);
@@ -474,17 +468,19 @@ fn render_detected_screen(
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(1),  // title
-            Constraint::Length(1),  // spacer
-            Constraint::Length(1),  // subtitle
-            Constraint::Length(1),  // spacer
-            Constraint::Min(3),     // list
-            Constraint::Length(1),  // spacer
-            Constraint::Length(1),  // help
+            Constraint::Length(1), // title
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // subtitle
+            Constraint::Length(1), // spacer
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // help
         ])
         .split(centered);
 
-    let title_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let subtitle_style = Style::default().fg(Color::Gray);
     let help_style = Style::default().fg(Color::DarkGray);
 
@@ -493,7 +489,9 @@ fn render_detected_screen(
         Paragraph::new(Line::from(vec![
             Span::styled(
                 "Claw Code",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" \u{2014} First Run Setup"),
         ]))
@@ -544,7 +542,9 @@ fn render_detected_screen(
 
     // Help
     f.render_widget(
-        Paragraph::new(HELP_TEXT).style(help_style).alignment(Alignment::Center),
+        Paragraph::new(HELP_TEXT)
+            .style(help_style)
+            .alignment(Alignment::Center),
         chunks[6],
     );
 
@@ -569,19 +569,21 @@ fn render_manual_input(
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(1),  // title
-            Constraint::Length(1),  // spacer
-            Constraint::Length(1),  // provider selector label
-            Constraint::Length(1),  // provider list
-            Constraint::Length(1),  // spacer
-            Constraint::Length(1),  // key label
-            Constraint::Length(3),  // key input
-            Constraint::Length(1),  // error
-            Constraint::Length(1),  // help
+            Constraint::Length(1), // title
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // provider selector label
+            Constraint::Length(1), // provider list
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // key label
+            Constraint::Length(3), // key input
+            Constraint::Length(1), // error
+            Constraint::Length(1), // help
         ])
         .split(centered);
 
-    let title_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let label_style = Style::default().fg(Color::Gray);
     let help_style = Style::default().fg(Color::DarkGray);
     let error_style = Style::default().fg(Color::Red);
@@ -591,7 +593,9 @@ fn render_manual_input(
         Paragraph::new(Line::from(vec![
             Span::styled(
                 "Claw Code",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" \u{2014} API Key Configuration"),
         ]))

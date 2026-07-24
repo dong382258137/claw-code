@@ -182,9 +182,22 @@ fn looks_like_log(content: &str) -> bool {
     //       服务日志(INFO/WARN/ERROR/DEBUG/TRACE/FATAL/PANIC)、
     //       测试输出(test/PASSED/FAILED/ok/FAILED)
     let level_markers: &[&str] = &[
-        "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE", "FATAL", "PANIC",
-        "error", "warning", "Compiling", "Finished", "running", "test result",
-        "PASSED", "FAILED",
+        "ERROR",
+        "WARN",
+        "WARNING",
+        "INFO",
+        "DEBUG",
+        "TRACE",
+        "FATAL",
+        "PANIC",
+        "error",
+        "warning",
+        "Compiling",
+        "Finished",
+        "running",
+        "test result",
+        "PASSED",
+        "FAILED",
     ];
     let mut matched = 0usize;
     for line in &lines {
@@ -195,10 +208,16 @@ fn looks_like_log(content: &str) -> bool {
             // 简单词边界:前面是非字母或行首,后面是非字母或行尾
             if let Some(idx) = upper.find(&m_upper) {
                 let before_ok = idx == 0
-                    || !upper.as_bytes().get(idx - 1).is_some_and(|c| c.is_ascii_alphabetic());
+                    || !upper
+                        .as_bytes()
+                        .get(idx - 1)
+                        .is_some_and(|c| c.is_ascii_alphabetic());
                 let after_idx = idx + m_upper.len();
                 let after_ok = after_idx >= upper.len()
-                    || !upper.as_bytes().get(after_idx).is_some_and(|c| c.is_ascii_alphabetic());
+                    || !upper
+                        .as_bytes()
+                        .get(after_idx)
+                        .is_some_and(|c| c.is_ascii_alphabetic());
                 before_ok && after_ok
             } else {
                 false
@@ -211,7 +230,6 @@ fn looks_like_log(content: &str) -> bool {
     let ratio = matched as f64 / lines.len() as f64;
     ratio >= 0.3
 }
-
 
 /// 判断内容是否为表格状(多条目结构化输出)。
 ///
@@ -255,10 +273,7 @@ fn detect_tabular_delimiter(lines: &[&str]) -> Option<char> {
     // 取前 5 行作为样本
     let sample: Vec<&str> = lines.iter().take(5).copied().collect();
     // 优先级:`|` > `\t` > 多空格
-    let pipe_count = sample
-        .iter()
-        .filter(|l| l.contains('|'))
-        .count();
+    let pipe_count = sample.iter().filter(|l| l.contains('|')).count();
     if pipe_count > sample.len() / 2 {
         return Some('|');
     }
@@ -267,10 +282,7 @@ fn detect_tabular_delimiter(lines: &[&str]) -> Option<char> {
         return Some('\t');
     }
     // 多空格对齐:≥3 个连续空格,且 ≥ 半数行命中
-    let space_count = sample
-        .iter()
-        .filter(|l| l.contains("   "))
-        .count();
+    let space_count = sample.iter().filter(|l| l.contains("   ")).count();
     if space_count > sample.len() / 2 {
         return Some(' ');
     }
@@ -313,7 +325,8 @@ mod tests {
 
     #[test]
     fn classifies_rust_code() {
-        let content = "//! Module doc\nuse std::collections::HashMap;\npub fn foo(x: i32) -> i32 { x + 1 }\n";
+        let content =
+            "//! Module doc\nuse std::collections::HashMap;\npub fn foo(x: i32) -> i32 { x + 1 }\n";
         assert_eq!(classify(content), ContentType::Code(CodeLanguage::Rust));
     }
 
@@ -334,7 +347,8 @@ mod tests {
 
     #[test]
     fn classifies_go_code() {
-        let content = "package main\n\nimport \"fmt\"\n\nfunc main() {\n    fmt.Println(\"hi\")\n}\n";
+        let content =
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n    fmt.Println(\"hi\")\n}\n";
         assert_eq!(classify(content), ContentType::Code(CodeLanguage::Go));
     }
 

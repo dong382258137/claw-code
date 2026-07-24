@@ -42,6 +42,19 @@ pub enum StepStatus {
     Skipped,
 }
 
+/// Step 的风险级别,驱动 Pre-commitment protocol 注入。
+///
+/// P2:仅 High risk step 在 render_for_prompt 时追加 Pre-commitment 指令,
+/// 要求 LLM 承诺方案前生成 2+ 候选并比较 trade-off。Low risk step 不额外约束。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StepRisk {
+    /// 常规变更,无额外约束。
+    #[default]
+    Low,
+    /// 高风险(删除/强制/生产/安全/不可逆/权限),触发 Pre-commitment。
+    High,
+}
+
 /// Plan 中的一个原子步骤。
 ///
 /// 一个 step 对应主 agent 的一组连续 tool calls,粒度由 planner 决定
@@ -68,6 +81,10 @@ pub struct PlanStep {
     pub status: StepStatus,
     /// 已尝试次数(含 replan 后的重试)。0 表示未开始,1+ 表示已尝试过。
     pub attempts: u32,
+    /// P2:风险级别,驱动 Pre-commitment protocol 注入。
+    /// High risk step 在 render 时追加"承诺前生成 2+ 候选"指令。
+    #[serde(default)]
+    pub risk_level: StepRisk,
 }
 
 impl PlanStep {
@@ -85,6 +102,7 @@ impl PlanStep {
             last_tool_use_id: None,
             status: StepStatus::Pending,
             attempts: 0,
+            risk_level: StepRisk::Low,
         }
     }
 
@@ -297,15 +315,31 @@ impl PlanArtifact {
                 StepStatus::Failed => "✗ failed",
                 StepStatus::Skipped => "⊘ skipped",
             };
+            let risk_tag = if step.risk_level == StepRisk::High {
+                " ⚠ high-risk"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "{}. [{}] {}\n   acceptance: {}\n   verify: {} (attempts: {})\n",
+                "{}. [{}]{} {}\n   acceptance: {}\n   verify: {} (attempts: {})\n",
                 idx + 1,
                 status_label,
+                risk_tag,
                 step.description,
                 step.acceptance_criteria,
                 step.verify_command.as_deref().unwrap_or("(skip)"),
                 step.attempts,
             ));
+            // P2:Pre-commitment protocol — 仅 High risk step 注入。
+            // 缓存保护:PlanArtifact 在 dynamic_sections,不影响 static cache。
+            // 上下文膨胀:仅 High risk step 多 ~100 tokens,Low risk 无额外开销。
+            if step.risk_level == StepRisk::High {
+                out.push_str(
+                    "   ⚠ PRE-COMMITMENT REQUIRED: This step is high-risk (destructive/irreversible/security-sensitive).\n   \
+                     Before implementing, generate 2+ candidate approaches and briefly state trade-offs (cost, risk, reversibility).\n   \
+                     Only commit after explicit comparison — never commit to the first feasible option just because it is feasible.\n",
+                );
+            }
         }
         out.push_str("\nFocus on the current step. Do not skip ahead.");
         out
@@ -458,5 +492,37 @@ mod tests {
         step.mark_failed();
         step.mark_executing();
         assert_eq!(step.attempts, 2);
+    }
+
+    // ── P2:Pre-commitment protocol 测试 ──
+
+    #[test]
+    fn new_step_defaults_to_low_risk() {
+        let step = PlanStep::new("s1", "Read file", "file read");
+        assert_eq!(step.risk_level, StepRisk::Low);
+    }
+
+    #[test]
+    fn render_for_prompt_marks_high_risk_step_with_warning() {
+        let mut step = PlanStep::new("s1", "Delete production database", "db dropped");
+        step.risk_level = StepRisk::High;
+        let artifact = PlanArtifact::new("destructive task", vec![step]);
+        let rendered = artifact.render_for_prompt();
+        assert!(rendered.contains("⚠ high-risk"));
+        assert!(rendered.contains("PRE-COMMITMENT REQUIRED"));
+        assert!(rendered.contains("2+ candidate approaches"));
+    }
+
+    #[test]
+    fn render_for_prompt_omits_precommitment_for_low_risk() {
+        let artifact = PlanArtifact::new("safe task", sample_steps());
+        let rendered = artifact.render_for_prompt();
+        assert!(!rendered.contains("PRE-COMMITMENT REQUIRED"));
+        assert!(!rendered.contains("high-risk"));
+    }
+
+    #[test]
+    fn step_risk_default_is_low() {
+        assert_eq!(StepRisk::default(), StepRisk::Low);
     }
 }

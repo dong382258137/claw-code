@@ -300,7 +300,14 @@ impl OutputBuffer {
     /// 返回 true 表示成功切换。
     pub(crate) fn toggle_latest_tool_card(&mut self) -> bool {
         let found_idx = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
-            matches!(e, OutputEntry::ToolCard { result: Some(_), .. }).then_some(idx)
+            matches!(
+                e,
+                OutputEntry::ToolCard {
+                    result: Some(_),
+                    ..
+                }
+            )
+            .then_some(idx)
         });
         if let Some(idx) = found_idx {
             if let OutputEntry::ToolCard { collapsed, .. } = &mut self.entries[idx] {
@@ -316,7 +323,13 @@ impl OutputBuffer {
     pub(crate) fn toggle_tool_card_at(&mut self, index: usize) -> bool {
         let mut count = 0;
         let found_idx = self.entries.iter().enumerate().find_map(|(idx, e)| {
-            if matches!(e, OutputEntry::ToolCard { result: Some(_), .. }) {
+            if matches!(
+                e,
+                OutputEntry::ToolCard {
+                    result: Some(_),
+                    ..
+                }
+            ) {
                 if count == index {
                     return Some(idx);
                 }
@@ -437,11 +450,7 @@ impl OutputBuffer {
     /// 的 truncate。对于高频的 append 合并（from_idx = len-1），只重渲染 1 个条目。
     fn recompute_snapshot_tail(&mut self, from_idx: usize) {
         // 计算 from_idx 之前所有条目的 render 长度之和（cached_snapshot 中的起始字节位置）
-        let start_byte: usize = self
-            .rendered_lengths
-            .iter()
-            .take(from_idx)
-            .sum();
+        let start_byte: usize = self.rendered_lengths.iter().take(from_idx).sum();
         // 截断 cached_snapshot 到 start_byte
         self.cached_snapshot.truncate(start_byte);
         // 截断 rendered_lengths 到 from_idx

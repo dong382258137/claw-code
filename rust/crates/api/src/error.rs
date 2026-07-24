@@ -403,6 +403,93 @@ impl From<VarError> for ApiError {
     }
 }
 
+// ── G1.22: TypedErrorEnvelope ──────────────────────────────────
+
+/// Structured JSON error envelope for `--output-format json`.
+///
+/// When CLI diagnostics run with `--output-format json`, errors are
+/// serialized through this type so that downstream tooling receives
+/// predictable, typed error payloads instead of prose.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct TypedErrorEnvelope {
+    #[serde(rename = "type")]
+    pub envelope_type: &'static str,
+    pub error: TypedErrorPayload,
+    /// Echo the `--output-format` value so that callers can detect
+    /// whether the error came from a JSON-capable CLI invocation.
+    pub output_format: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct TypedErrorPayload {
+    pub kind: String,
+    pub message: String,
+    /// Machine-readable error code (e.g. "AUTH_MISSING", "IO_ENOENT").
+    pub code: Option<String>,
+    /// Suggested user action or remediation hint.
+    pub hint: Option<String>,
+    /// Whether the caller SHOULD retry after applying the hint.
+    pub retryable: bool,
+    /// Request trace id, if the upstream API included one.
+    pub request_id: Option<String>,
+}
+
+impl TypedErrorEnvelope {
+    #[must_use]
+    pub fn from_api_error(error: &ApiError) -> Self {
+        let kind = error.safe_failure_class().to_string();
+        let message = error.to_string();
+        let retryable = error.is_retryable();
+        let request_id = error.request_id().map(ToOwned::to_owned);
+
+        let (code, hint) = match error {
+            ApiError::MissingCredentials { .. } | ApiError::ExpiredOAuthToken => {
+                (Some("AUTH_MISSING".to_string()), None)
+            }
+            ApiError::Auth(_) => (Some("AUTH_REJECTED".to_string()), None),
+            ApiError::InvalidApiKeyEnv(_) => (Some("AUTH_BAD_ENV".to_string()), None),
+            ApiError::ContextWindowExceeded { .. } => (Some("CONTEXT_WINDOW".to_string()), None),
+            ApiError::Api { status, .. } if status.as_u16() == 429 => {
+                (Some("RATE_LIMITED".to_string()), Some("Wait and retry".to_string()))
+            }
+            ApiError::Http(_) | ApiError::InvalidSseFrame(_) | ApiError::BackoffOverflow { .. } => {
+                (Some("TRANSPORT".to_string()), Some("Check network connectivity".to_string()))
+            }
+            ApiError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (Some("IO_ENOENT".to_string()), Some("Check file path exists".to_string()))
+            }
+            ApiError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                (Some("IO_PERMISSION".to_string()), Some("Check file permissions".to_string()))
+            }
+            ApiError::Io(_) => {
+                (Some("IO_ERROR".to_string()), None)
+            }
+            ApiError::Json { .. } => (Some("JSON_PARSE".to_string()), None),
+            ApiError::RetriesExhausted { .. } => (Some("RETRIES_EXHAUSTED".to_string()), None),
+            ApiError::RequestBodySizeExceeded { .. } => {
+                (Some("REQUEST_TOO_LARGE".to_string()), Some("Reduce prompt size".to_string()))
+            }
+            // Generic API error — non-retryable by default unless is_retryable() says so.
+            ApiError::Api { .. } => (None, None),
+        };
+
+        Self {
+            envelope_type: "error",
+            error: TypedErrorPayload {
+                kind,
+                message,
+                code,
+                hint,
+                retryable,
+                request_id,
+            },
+            output_format: "json",
+        }
+    }
+}
+
 fn looks_like_generic_fatal_wrapper(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     GENERIC_FATAL_WRAPPER_MARKERS

@@ -20,7 +20,7 @@
 pub mod artifact;
 pub mod reviewer;
 
-pub use artifact::{PlanArtifact, PlanPhase, PlanStep, StepStatus};
+pub use artifact::{PlanArtifact, PlanPhase, PlanStep, StepRisk, StepStatus};
 pub use reviewer::{
     render_remediation_prompt, FailedVerification, PreCompletionChecklistMiddleware, ReviewResult,
     DEFAULT_MAX_REPLANS,
@@ -42,6 +42,52 @@ pub const COMPLEX_TASK_KEYWORDS: &[&str] = &[
     "多文件",
     "分步",
     "重构",
+];
+
+/// P2:高风险操作关键词,匹配任一则 step 标记为 High risk。
+///
+/// 覆盖 6 类高风险操作:
+/// - 删除/移除:delete, drop, remove, truncate
+/// - 强制操作:force, --force, -f
+/// - 生产/部署:production, deploy, release, publish
+/// - 安全/凭证:security, auth, password, token, secret, credential
+/// - 不可逆:migrate, irreversible
+/// - 权限:permission, privilege, chmod, chown
+const HIGH_RISK_KEYWORDS: &[&str] = &[
+    "delete",
+    "drop",
+    "remove",
+    "truncate",
+    "force",
+    "--force",
+    "production",
+    "deploy",
+    "release",
+    "publish",
+    "security",
+    "auth",
+    "password",
+    "token",
+    "secret",
+    "credential",
+    "migrate",
+    "irreversible",
+    "permission",
+    "privilege",
+    "chmod",
+    "chown",
+    "删除",
+    "移除",
+    "强制",
+    "生产环境",
+    "部署",
+    "发布",
+    "安全",
+    "密码",
+    "令牌",
+    "凭证",
+    "迁移",
+    "权限",
 ];
 
 /// 复杂任务检测结果 — 用于决定是否触发 planner 子调用。
@@ -110,7 +156,20 @@ pub fn load_plan_artifact(path: &Path) -> Result<PlanArtifact, Box<dyn std::erro
     Ok(artifact)
 }
 
-/// Heuristic task decomposition — converts a complex user request into
+/// P2:评估单个 step 的风险级别。
+///
+/// 检查 step 描述是否包含高风险关键词(删除/强制/生产/安全/不可逆/权限)。
+/// 命中任一返回 `High`,否则 `Low`。用于驱动 Pre-commitment protocol 注入。
+#[must_use]
+pub fn assess_step_risk(description: &str) -> StepRisk {
+    let lowered = description.to_ascii_lowercase();
+    if HIGH_RISK_KEYWORDS.iter().any(|kw| lowered.contains(kw)) {
+        StepRisk::High
+    } else {
+        StepRisk::Low
+    }
+}
+
 /// Heuristic task decomposition — converts a complex user request into
 /// concrete `PlanStep`s without calling an LLM sub-agent.
 ///
@@ -133,9 +192,7 @@ pub fn decompose_task(user_input: &str) -> Vec<PlanStep> {
     // 2. Check for sequential markers.
     let sequential_markers = ["first", "then", "after that", "next", "finally"];
     let input_lower = user_input.to_lowercase();
-    let has_markers = sequential_markers
-        .iter()
-        .any(|m| input_lower.contains(m));
+    let has_markers = sequential_markers.iter().any(|m| input_lower.contains(m));
 
     // 3. Sentence-level decomposition for long or sequential input.
     if steps.is_empty() && (has_markers || user_input.len() > 300) {
@@ -174,16 +231,121 @@ pub fn decompose_task(user_input: &str) -> Vec<PlanStep> {
         ));
     }
 
+    // P2:对每个 step 评估风险级别,High risk step 在 render 时注入 Pre-commitment。
+    // 检查 step description + 原始 user_input(兜底:泛化 description 时从任务上下文捕获风险)。
+    let input_lower = user_input.to_ascii_lowercase();
+    let input_is_high_risk = HIGH_RISK_KEYWORDS.iter().any(|kw| input_lower.contains(kw));
+    let is_fallback_single_step = steps.len() == 1;
+    for step in &mut steps {
+        step.risk_level = assess_step_risk(&step.description);
+        // 若 step description 未命中但整体任务命中,且 step 是兜底单步,继承 high-risk。
+        if step.risk_level == StepRisk::Low && input_is_high_risk && is_fallback_single_step {
+            step.risk_level = StepRisk::High;
+        }
+    }
+
     steps
+}
+
+/// Update an existing [`PlanArtifact`] with new or modified steps (G8.9).
+///
+/// Parses a structured or natural-language update description and applies
+/// it to the plan. Supports:
+/// - Adding new steps: `"add: Verify auth module compiles"`
+/// - Marking steps done: `"done: step_1"`
+/// - Marking steps failed: `"fail: step_2, reason: compilation error"`
+/// - Replanning: resets Failed steps to Pending
+///
+/// Returns the number of changes applied.
+pub fn update_plan(artifact: &mut PlanArtifact, update: &str) -> usize {
+    let mut changes = 0usize;
+    let trimmed = update.trim();
+
+    // ── Pattern: "add: <description>" ──
+    if let Some(desc) = trimmed
+        .strip_prefix("add:")
+        .or_else(|| trimmed.strip_prefix("Add:"))
+        .or_else(|| trimmed.strip_prefix("ADD:"))
+    {
+        let desc = desc.trim();
+        if !desc.is_empty() {
+            let next_id = format!("step_{}", artifact.steps.len() + 1);
+            artifact.steps.push(PlanStep::new(
+                next_id,
+                desc,
+                "Verify step completed correctly".to_string(),
+            ));
+            changes += 1;
+            return changes;
+        }
+    }
+
+    // ── Pattern: "done: <step_id>" ──
+    if let Some(step_id) = trimmed
+        .strip_prefix("done:")
+        .or_else(|| trimmed.strip_prefix("Done:"))
+        .or_else(|| trimmed.strip_prefix("DONE:"))
+    {
+        let step_id = step_id.trim();
+        if let Some(step) = artifact.steps.iter_mut().find(|s| s.id == step_id) {
+            step.mark_succeeded();
+            changes += 1;
+        }
+        return changes;
+    }
+
+    // ── Pattern: "fail: <step_id>[, reason: <text>]" ──
+    if let Some(rest) = trimmed
+        .strip_prefix("fail:")
+        .or_else(|| trimmed.strip_prefix("Fail:"))
+        .or_else(|| trimmed.strip_prefix("FAIL:"))
+    {
+        let rest = rest.trim();
+        let step_id = rest.split(',').next().map(str::trim).unwrap_or(rest);
+        if let Some(step) = artifact.steps.iter_mut().find(|s| s.id == step_id) {
+            step.mark_failed();
+            changes += 1;
+        }
+        return changes;
+    }
+
+    // ── Pattern: "replan" ──
+    if trimmed.eq_ignore_ascii_case("replan") {
+        if artifact.trigger_replan(3).is_some() {
+            changes += 1;
+        }
+        return changes;
+    }
+
+    // ── Fallback: sentence-level decomposition appended as new steps ──
+    for sentence in split_into_sentences(trimmed) {
+        let s = sentence.trim();
+        if s.is_empty() || s.len() < 10 {
+            continue;
+        }
+        let next_id = format!("step_{}", artifact.steps.len() + 1);
+        let short = if s.len() > 80 {
+            format!("{}…", &s[..80])
+        } else {
+            s.to_string()
+        };
+        artifact.steps.push(PlanStep::new(
+            next_id,
+            short,
+            "Verify step completed correctly".to_string(),
+        ));
+        changes += 1;
+    }
+
+    changes
 }
 
 fn extract_file_paths(text: &str) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for word in text.split_whitespace() {
-        let clean = word.trim_matches(|c: char| {
-            c == '`' || c == '"' || c == '\'' || c == ',' || c == '.'
-        });
+        let clean =
+            word.trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c == ',' || c == '.');
         if is_likely_path(clean) && seen.insert(clean.to_string()) {
             paths.push(clean.to_string());
         }
@@ -337,5 +499,71 @@ mod tests {
         assert_eq!(files.len(), 1, "should overwrite, not create new file");
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    // ── P2:Pre-commitment risk 评估测试 ──
+
+    #[test]
+    fn assess_step_risk_returns_high_for_delete() {
+        assert_eq!(assess_step_risk("Delete the user table"), StepRisk::High);
+    }
+
+    #[test]
+    fn assess_step_risk_returns_high_for_production_deploy() {
+        assert_eq!(
+            assess_step_risk("Deploy to production environment"),
+            StepRisk::High
+        );
+    }
+
+    #[test]
+    fn assess_step_risk_returns_high_for_security_keywords() {
+        assert_eq!(assess_step_risk("Update auth token"), StepRisk::High);
+        assert_eq!(assess_step_risk("Rotate password"), StepRisk::High);
+        assert_eq!(
+            assess_step_risk("Fix security vulnerability"),
+            StepRisk::High
+        );
+    }
+
+    #[test]
+    fn assess_step_risk_returns_high_for_chinese_keywords() {
+        assert_eq!(assess_step_risk("删除用户数据"), StepRisk::High);
+        assert_eq!(assess_step_risk("部署到生产环境"), StepRisk::High);
+        assert_eq!(assess_step_risk("修改权限配置"), StepRisk::High);
+    }
+
+    #[test]
+    fn assess_step_risk_returns_low_for_safe_operations() {
+        assert_eq!(assess_step_risk("Read configuration file"), StepRisk::Low);
+        assert_eq!(assess_step_risk("Add unit tests"), StepRisk::Low);
+        assert_eq!(assess_step_risk("Update documentation"), StepRisk::Low);
+    }
+
+    #[test]
+    fn assess_step_risk_is_case_insensitive() {
+        assert_eq!(assess_step_risk("DELETE all rows"), StepRisk::High);
+        assert_eq!(assess_step_risk("Force Push"), StepRisk::High);
+    }
+
+    #[test]
+    fn decompose_task_marks_high_risk_steps() {
+        // 包含 "delete" 关键词的输入,分解后的 step 应标记 High risk
+        let steps = decompose_task("delete the migration files and refactor auth");
+        assert!(steps.iter().any(|s| s.risk_level == StepRisk::High));
+    }
+
+    #[test]
+    fn decompose_task_keeps_low_risk_for_safe_input() {
+        let steps = decompose_task("read the config and update the docs");
+        assert!(steps.iter().all(|s| s.risk_level == StepRisk::Low));
+    }
+
+    #[test]
+    fn decompose_task_fallback_inherits_high_risk_from_input() {
+        // 兜底单步(无法拆分)时,若整体任务命中高风险,继承 High
+        let steps = decompose_task("force deploy");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].risk_level, StepRisk::High);
     }
 }

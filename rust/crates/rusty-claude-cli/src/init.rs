@@ -578,14 +578,16 @@ mod tests {
         assert!(rendered.contains(".claw/           created"));
 
         // 文件内容应已替换为预置模板
-        let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read overwritten claude md");
+        let claude_md =
+            fs::read_to_string(root.join("CLAUDE.md")).expect("read overwritten claude md");
         assert!(
             claude_md.contains("# CLAUDE.md"),
             "CLAUDE.md content should be the starter template, got: {claude_md}"
         );
         assert!(!claude_md.contains("user-authored content"));
 
-        let claw_json = fs::read_to_string(root.join(".claw.json")).expect("read overwritten claw json");
+        let claw_json =
+            fs::read_to_string(root.join(".claw.json")).expect("read overwritten claw json");
         assert!(
             claw_json.contains("\"defaultMode\": \"dontAsk\""),
             ".claw.json should be the starter template, got: {claw_json}"

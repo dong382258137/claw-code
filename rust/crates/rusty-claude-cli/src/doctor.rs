@@ -26,10 +26,10 @@ use runtime::branch_lock::{detect_branch_lock_collisions, BranchLockIntent};
 use runtime::g004_conformance::validate_g004_contract_bundle;
 use runtime::{
     canonicalize_report, drain_lane_events, report_content_hash, try_publish, CanonicalReportV1,
-    ClaimKind, LaneEvent, LaneEventName, LaneEventStatus, McpConnectionStatus, McpResourceInfo,
-    McpToolInfo, McpToolRegistry, PluginHealthcheck, PluginLifecycle, PluginState,
+    ClaimKind, DiscoveryResult, LaneEvent, LaneEventName, LaneEventStatus, McpConnectionStatus,
+    McpResourceInfo, McpToolInfo, McpToolRegistry, PluginHealthcheck, PluginLifecycle, PluginState,
     ReportClaim, ReportConfidence, ReportIdentity, RuntimePluginConfig, SensitivityClass,
-    DiscoveryResult, REPORT_SCHEMA_V1,
+    REPORT_SCHEMA_V1,
 };
 // Epic 6:team_cron_registry smoke test 接入 — Team + Cron 两个 registry 的完整 API 验证。
 use runtime::{CronEntry, CronRegistry, Team, TeamRegistry, TeamStatus};
@@ -368,8 +368,10 @@ fn run_doctor_cache_stats(
             session_count += 1;
             aggregated_breaks.model_changed += stats.break_reasons.model_changed;
             aggregated_breaks.system_prompt_changed += stats.break_reasons.system_prompt_changed;
-            aggregated_breaks.tool_definitions_changed += stats.break_reasons.tool_definitions_changed;
-            aggregated_breaks.message_payload_changed += stats.break_reasons.message_payload_changed;
+            aggregated_breaks.tool_definitions_changed +=
+                stats.break_reasons.tool_definitions_changed;
+            aggregated_breaks.message_payload_changed +=
+                stats.break_reasons.message_payload_changed;
             aggregated_breaks.ttl_expiry += stats.break_reasons.ttl_expiry;
             aggregated_breaks.unknown += stats.break_reasons.unknown;
             aggregated_hits += stats.completion_cache_hits;
@@ -394,19 +396,47 @@ fn run_doctor_cache_stats(
                 println!("  {}", root.display());
                 return Ok(());
             }
-            println!("Cache Aligner 监控(汇总 {} 个 session,根目录 {})", session_count, root.display());
+            println!(
+                "Cache Aligner 监控(汇总 {} 个 session,根目录 {})",
+                session_count,
+                root.display()
+            );
             println!();
             println!("== Cache Break 原因分布 ==");
             let total_breaks = aggregated_breaks.total();
             println!("  总 break 事件:{}", total_breaks);
             if total_breaks > 0 {
                 let pct = |n: u64| (n as f64 * 100.0 / total_breaks as f64).round() as u64;
-                println!("    model_changed           : {:>5} ({:>3}%)", aggregated_breaks.model_changed, pct(aggregated_breaks.model_changed));
-                println!("    system_prompt_changed   : {:>5} ({:>3}%)  ← Cache Aligner 关注项", aggregated_breaks.system_prompt_changed, pct(aggregated_breaks.system_prompt_changed));
-                println!("    tool_definitions_changed: {:>5} ({:>3}%)  ← Cache Aligner 关注项", aggregated_breaks.tool_definitions_changed, pct(aggregated_breaks.tool_definitions_changed));
-                println!("    message_payload_changed : {:>5} ({:>3}%)  (正常,每 turn 都变)", aggregated_breaks.message_payload_changed, pct(aggregated_breaks.message_payload_changed));
-                println!("    ttl_expiry              : {:>5} ({:>3}%)  (provider 侧 TTL)", aggregated_breaks.ttl_expiry, pct(aggregated_breaks.ttl_expiry));
-                println!("    unknown                 : {:>5} ({:>3}%)", aggregated_breaks.unknown, pct(aggregated_breaks.unknown));
+                println!(
+                    "    model_changed           : {:>5} ({:>3}%)",
+                    aggregated_breaks.model_changed,
+                    pct(aggregated_breaks.model_changed)
+                );
+                println!(
+                    "    system_prompt_changed   : {:>5} ({:>3}%)  ← Cache Aligner 关注项",
+                    aggregated_breaks.system_prompt_changed,
+                    pct(aggregated_breaks.system_prompt_changed)
+                );
+                println!(
+                    "    tool_definitions_changed: {:>5} ({:>3}%)  ← Cache Aligner 关注项",
+                    aggregated_breaks.tool_definitions_changed,
+                    pct(aggregated_breaks.tool_definitions_changed)
+                );
+                println!(
+                    "    message_payload_changed : {:>5} ({:>3}%)  (正常,每 turn 都变)",
+                    aggregated_breaks.message_payload_changed,
+                    pct(aggregated_breaks.message_payload_changed)
+                );
+                println!(
+                    "    ttl_expiry              : {:>5} ({:>3}%)  (provider 侧 TTL)",
+                    aggregated_breaks.ttl_expiry,
+                    pct(aggregated_breaks.ttl_expiry)
+                );
+                println!(
+                    "    unknown                 : {:>5} ({:>3}%)",
+                    aggregated_breaks.unknown,
+                    pct(aggregated_breaks.unknown)
+                );
             }
             println!();
             println!("== Completion 缓存 ==");
@@ -415,29 +445,47 @@ fn run_doctor_cache_stats(
             println!("  writes : {}", aggregated_writes);
             let completion_total = aggregated_hits + aggregated_misses;
             if completion_total > 0 {
-                let hit_rate = (aggregated_hits as f64 * 100.0 / completion_total as f64).round() as u64;
+                let hit_rate =
+                    (aggregated_hits as f64 * 100.0 / completion_total as f64).round() as u64;
                 println!("  命中率 : {}%", hit_rate);
             }
             println!();
             println!("== Token 流量 ==");
-            println!("  cache_creation_input_tokens : {}", aggregated_creation_tokens);
+            println!(
+                "  cache_creation_input_tokens : {}",
+                aggregated_creation_tokens
+            );
             println!("  cache_read_input_tokens     : {}", aggregated_read_tokens);
-            println!("  tracked_requests            : {}", aggregated_tracked_requests);
-            println!("  unexpected_cache_breaks     : {}", aggregated_unexpected_breaks);
-            println!("  expected_invalidations       : {}", aggregated_expected_invalidations);
+            println!(
+                "  tracked_requests            : {}",
+                aggregated_tracked_requests
+            );
+            println!(
+                "  unexpected_cache_breaks     : {}",
+                aggregated_unexpected_breaks
+            );
+            println!(
+                "  expected_invalidations       : {}",
+                aggregated_expected_invalidations
+            );
             if let Some(reason) = last_break_reason {
                 println!("  last_break_reason           : {}", reason);
             }
             println!();
             // 验收标准提示:system_prompt_changed + tool_definitions_changed 占比应 < 5%
-            let aligner_target = aggregated_breaks.system_prompt_changed + aggregated_breaks.tool_definitions_changed;
+            let aligner_target = aggregated_breaks.system_prompt_changed
+                + aggregated_breaks.tool_definitions_changed;
             if total_breaks > 0 && aligner_target * 20 > total_breaks {
                 // > 5% 时提示
-                println!("⚠ Cache Aligner 关注项占比 {:.1}% > 5%,static 区可能仍有动态值泄漏",
-                    aligner_target as f64 * 100.0 / total_breaks as f64);
+                println!(
+                    "⚠ Cache Aligner 关注项占比 {:.1}% > 5%,static 区可能仍有动态值泄漏",
+                    aligner_target as f64 * 100.0 / total_breaks as f64
+                );
             } else if total_breaks > 0 {
-                println!("✓ Cache Aligner 关注项占比 {:.1}% ≤ 5%,static 区缓存稳定",
-                    aligner_target as f64 * 100.0 / total_breaks as f64);
+                println!(
+                    "✓ Cache Aligner 关注项占比 {:.1}% ≤ 5%,static 区缓存稳定",
+                    aligner_target as f64 * 100.0 / total_breaks as f64
+                );
             }
         }
         CliOutputFormat::Json => {
@@ -558,7 +606,11 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         .is_some_and(|value| !value.trim().is_empty());
     let env_details = format!(
         "环境变量          api_key={} auth_token={}",
-        if api_key_present { "已配置" } else { "缺失" },
+        if api_key_present {
+            "已配置"
+        } else {
+            "缺失"
+        },
         if auth_token_present {
             "已配置"
         } else {
@@ -649,7 +701,10 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), Value::Null),
             ("legacy_scopes".to_string(), Value::Null),
-            ("legacy_saved_oauth_error".to_string(), json!(error.to_string())),
+            (
+                "legacy_saved_oauth_error".to_string(),
+                json!(error.to_string()),
+            ),
         ])),
     }
 }
@@ -994,7 +1049,11 @@ pub(crate) fn check_system_health(
 ) -> DiagnosticCheck {
     let default_model = config.and_then(runtime::RuntimeConfig::model);
     let mut details = vec![
-        format!("操作系统          {} {}", env::consts::OS, env::consts::ARCH),
+        format!(
+            "操作系统          {} {}",
+            env::consts::OS,
+            env::consts::ARCH
+        ),
         format!("工作目录          {}", cwd.display()),
         format!("版本              {}", VERSION),
         format!("构建目标          {}", BUILD_TARGET.unwrap_or("<未知>")),
@@ -1003,21 +1062,17 @@ pub(crate) fn check_system_health(
     if let Some(model) = default_model {
         details.push(format!("默认模型          {model}"));
     }
-    DiagnosticCheck::new(
-        "System",
-        DiagnosticLevel::Ok,
-        "已捕获本地运行时元数据",
-    )
-    .with_details(details)
-    .with_data(Map::from_iter([
-        ("os".to_string(), json!(env::consts::OS)),
-        ("arch".to_string(), json!(env::consts::ARCH)),
-        ("working_dir".to_string(), json!(cwd.display().to_string())),
-        ("version".to_string(), json!(VERSION)),
-        ("build_target".to_string(), json!(BUILD_TARGET)),
-        ("git_sha".to_string(), json!(GIT_SHA)),
-        ("default_model".to_string(), json!(default_model)),
-    ]))
+    DiagnosticCheck::new("System", DiagnosticLevel::Ok, "已捕获本地运行时元数据")
+        .with_details(details)
+        .with_data(Map::from_iter([
+            ("os".to_string(), json!(env::consts::OS)),
+            ("arch".to_string(), json!(env::consts::ARCH)),
+            ("working_dir".to_string(), json!(cwd.display().to_string())),
+            ("version".to_string(), json!(VERSION)),
+            ("build_target".to_string(), json!(BUILD_TARGET)),
+            ("git_sha".to_string(), json!(GIT_SHA)),
+            ("default_model".to_string(), json!(default_model)),
+        ]))
 }
 
 /// Epic 3:policy_engine smoke test。
@@ -1079,10 +1134,7 @@ pub(crate) fn check_green_contract_health() -> DiagnosticCheck {
         "green 契约 evaluate 可调用(merge_ready/Workspace 基线)",
     )
     .with_details(vec![
-        format!(
-            "要求的等级        {}",
-            ContractGreenLevel::Workspace
-        ),
+        format!("要求的等级        {}", ContractGreenLevel::Workspace),
         format!(
             "满足时结果        {}",
             if satisfied_outcome.is_satisfied() {
@@ -1104,7 +1156,10 @@ pub(crate) fn check_green_contract_health() -> DiagnosticCheck {
     .with_data(Map::from_iter([
         ("required_level".to_string(), json!("workspace")),
         ("contract_kind".to_string(), json!("merge_ready")),
-        ("satisfied_when_workspace".to_string(), json!(satisfied_outcome.is_satisfied())),
+        (
+            "satisfied_when_workspace".to_string(),
+            json!(satisfied_outcome.is_satisfied()),
+        ),
         (
             "unsatisfied_when_none".to_string(),
             json!(!unsatisfied_outcome.is_satisfied()),
@@ -1151,15 +1206,19 @@ pub(crate) fn check_lane_events_health() -> DiagnosticCheck {
             "smoke 事件已找到  {}",
             if smoke_event.is_some() { "是" } else { "否" }
         ),
-        format!(
-            "sink 容量         512 (进程级 OnceLock<Mutex<Vec>>)"
-        ),
+        format!("sink 容量         512 (进程级 OnceLock<Mutex<Vec>>)"),
     ])
     .with_data(Map::from_iter([
         ("published".to_string(), json!(published)),
         ("drained_count".to_string(), json!(drained.len())),
-        ("smoke_event_found".to_string(), json!(smoke_event.is_some())),
-        ("sink_kind".to_string(), json!("process_wide_oncelock_mutex_vec")),
+        (
+            "smoke_event_found".to_string(),
+            json!(smoke_event.is_some()),
+        ),
+        (
+            "sink_kind".to_string(),
+            json!("process_wide_oncelock_mutex_vec"),
+        ),
     ]))
 }
 
@@ -1222,14 +1281,8 @@ pub(crate) fn check_g004_conformance_health() -> DiagnosticCheck {
         "g004 契约包校验器可区分合法/非法 fixture",
     )
     .with_details(vec![
-        format!(
-            "合法包错误数          {}",
-            valid_errors.len()
-        ),
-        format!(
-            "非法包错误数          {}",
-            invalid_errors.len()
-        ),
+        format!("合法包错误数          {}", valid_errors.len()),
+        format!("非法包错误数          {}", invalid_errors.len()),
         format!("Bundle schema 版本    g004.contract.bundle.v1"),
         format!("Report schema 版本    g004.report.v1"),
     ])
@@ -1239,7 +1292,10 @@ pub(crate) fn check_g004_conformance_health() -> DiagnosticCheck {
             "invalid_bundle_errors".to_string(),
             json!(invalid_errors.len()),
         ),
-        ("bundle_schema_version".to_string(), json!("g004.contract.bundle.v1")),
+        (
+            "bundle_schema_version".to_string(),
+            json!("g004.contract.bundle.v1"),
+        ),
         ("report_schema_version".to_string(), json!("g004.report.v1")),
     ]))
 }
@@ -1296,7 +1352,10 @@ pub(crate) fn check_canonical_report_v1_health() -> DiagnosticCheck {
         format!("claim 数量        {}", canonical.claims.len()),
     ])
     .with_data(Map::from_iter([
-        ("schema_version".to_string(), json!(canonical.schema_version)),
+        (
+            "schema_version".to_string(),
+            json!(canonical.schema_version),
+        ),
         ("report_id".to_string(), json!(canonical.identity.report_id)),
         (
             "content_hash".to_string(),
@@ -1458,12 +1517,13 @@ pub(crate) fn check_plugin_lifecycle_health() -> DiagnosticCheck {
     .with_details(vec![
         format!(
             "validate_config   {}",
-            if validate_result.is_ok() { "正常" } else { "错误" }
+            if validate_result.is_ok() {
+                "正常"
+            } else {
+                "错误"
+            }
         ),
-        format!(
-            "healthcheck 前    {}",
-            health_before.state
-        ),
+        format!("healthcheck 前    {}", health_before.state),
         format!(
             "discover          tools={} resources={} partial={}",
             discovery.tools.len(),
@@ -1472,18 +1532,25 @@ pub(crate) fn check_plugin_lifecycle_health() -> DiagnosticCheck {
         ),
         format!(
             "shutdown          {}",
-            if shutdown_result.is_ok() { "正常" } else { "错误" }
+            if shutdown_result.is_ok() {
+                "正常"
+            } else {
+                "错误"
+            }
         ),
-        format!(
-            "healthcheck 后    {}",
-            health_after.state
-        ),
+        format!("healthcheck 后    {}", health_after.state),
     ])
     .with_data(Map::from_iter([
         ("validate_ok".to_string(), json!(validate_result.is_ok())),
         ("shutdown_ok".to_string(), json!(shutdown_result.is_ok())),
-        ("state_before".to_string(), json!(format!("{}", health_before.state))),
-        ("state_after".to_string(), json!(format!("{}", health_after.state))),
+        (
+            "state_before".to_string(),
+            json!(format!("{}", health_before.state)),
+        ),
+        (
+            "state_after".to_string(),
+            json!(format!("{}", health_after.state)),
+        ),
     ]))
 }
 
@@ -1520,15 +1587,12 @@ pub(crate) fn check_mcp_tool_bridge_health() -> DiagnosticCheck {
     let tools = registry.list_tools("doctor-smoke-server");
     let resources = registry.list_resources("doctor-smoke-server");
 
-    let level = if servers.len() == 1
-        && server_state.is_some()
-        && tools.is_ok()
-        && resources.is_ok()
-    {
-        DiagnosticLevel::Ok
-    } else {
-        DiagnosticLevel::Warn
-    };
+    let level =
+        if servers.len() == 1 && server_state.is_some() && tools.is_ok() && resources.is_ok() {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warn
+        };
 
     DiagnosticCheck::new(
         "McpToolBridge",
@@ -1575,8 +1639,7 @@ pub(crate) fn check_team_cron_registry_health() -> DiagnosticCheck {
     let team_fetched = team_registry.get(&team.team_id);
     let team_list_len = team_registry.list().len();
     let team_deleted = team_registry.delete(&team.team_id).ok();
-    let team_status_after_delete =
-        team_fetched.as_ref().map(|t| t.status);
+    let team_status_after_delete = team_fetched.as_ref().map(|t| t.status);
 
     // ── CronRegistry smoke test ──
     let cron_registry = CronRegistry::new();
@@ -1632,12 +1695,20 @@ pub(crate) fn check_team_cron_registry_health() -> DiagnosticCheck {
         format!("Cron 启用数量       {}", cron_enabled_count),
         format!(
             "Cron 禁用成功       {}",
-            if cron_disable_result.is_ok() { "是" } else { "否" }
+            if cron_disable_result.is_ok() {
+                "是"
+            } else {
+                "否"
+            }
         ),
         format!("Cron 禁用后数量     {}", cron_disabled_count),
         format!(
             "Cron 运行已记录     {}",
-            if cron_record_run_result.is_ok() { "是" } else { "否" }
+            if cron_record_run_result.is_ok() {
+                "是"
+            } else {
+                "否"
+            }
         ),
         format!("Cron 运行次数       {}", cron_run_count),
     ])

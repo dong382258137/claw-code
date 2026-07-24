@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(ds_flash.output_cost_per_million, 0.278);
         assert_eq!(ds_flash.cache_read_cost_per_million, 0.00278);
         assert_eq!(ds_flash.cache_creation_cost_per_million, 0.139); // miss = input 价
-        // v4-pro: ¥3/M input, ¥6/M output, ¥0.025/M cache hit
+                                                                     // v4-pro: ¥3/M input, ¥6/M output, ¥0.025/M cache hit
         assert_eq!(ds_pro.input_cost_per_million, 0.417);
         assert_eq!(ds_pro.output_cost_per_million, 0.833);
         assert_eq!(ds_pro.cache_read_cost_per_million, 0.00347);

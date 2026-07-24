@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use std::sync::{Arc, Mutex};
 
+use api;
 use runtime::TokenUsage;
 
 /// Snapshot of everything the status bar displays.
@@ -167,14 +168,18 @@ impl<'a> Widget for StatusBar<'a> {
         ]);
 
         // P3: Cost (从侧栏移到底栏)
+        // 成本计算与进度条保持一致：累计 + 当前轮 delta。
+        // 使用 total_tokens() 确保 streaming 期间也能看到实时成本变化。
         let pricing = runtime::pricing_for_model(&self.state.model);
         let total_usage = TokenUsage {
-            input_tokens: (self.state.cumulative_usage.input_tokens as u128)
-                .min(u32::MAX as u128) as u32,
-            output_tokens: (self.state.cumulative_usage.output_tokens as u128)
-                .min(u32::MAX as u128) as u32,
-            cache_creation_input_tokens: self.state.cumulative_usage.cache_creation_input_tokens,
-            cache_read_input_tokens: self.state.cumulative_usage.cache_read_input_tokens,
+            input_tokens: self.state.cumulative_usage.input_tokens
+                .saturating_add(self.state.turn_usage.input_tokens),
+            output_tokens: self.state.cumulative_usage.output_tokens
+                .saturating_add(self.state.turn_usage.output_tokens),
+            cache_creation_input_tokens: self.state.cumulative_usage.cache_creation_input_tokens
+                .saturating_add(self.state.turn_usage.cache_creation_input_tokens),
+            cache_read_input_tokens: self.state.cumulative_usage.cache_read_input_tokens
+                .saturating_add(self.state.turn_usage.cache_read_input_tokens),
         };
         let cost_usd = pricing.map_or_else(
             || total_usage.estimate_cost_usd().total_cost_usd(),
@@ -295,19 +300,15 @@ fn shorten_model_name(model: &str) -> String {
     }
 }
 
-/// 根据模型名估算上下文窗口大小（tokens）。
+/// 根据模型名查询上下文窗口大小（tokens）。
+///
+/// 使用 `api::model_token_limit()` 获取精确容量，避免硬编码。
+/// 注意：此函数与 `compaction_threshold_for_context_window()` 共享同一数据源，
+/// 确保显示端和计算端使用相同的 context_window 值，形成闭环。
 fn context_window_for_model(model: &str) -> u128 {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("haiku") || lower.contains("sonnet") || lower.contains("opus") {
-        200_000
-    } else if lower.contains("gpt") || lower.contains("grok") {
-        128_000
-    } else if lower.contains("deepseek") || lower.contains("qwen") {
-        128_000
-    } else {
-        // fallback: 200K for unknown models
-        200_000
-    }
+    api::model_token_limit(model)
+        .map(|limit| limit.context_window_tokens as u128)
+        .unwrap_or(200_000) // fallback: 200K for unknown models
 }
 
 /// 10格 Unicode 进度条: █████▌░░░░
@@ -391,8 +392,13 @@ mod tests {
     fn context_window_returns_correct_size() {
         assert_eq!(context_window_for_model("claude-sonnet-4"), 200_000);
         assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
-        assert_eq!(context_window_for_model("gpt-5"), 128_000);
-        assert_eq!(context_window_for_model("deepseek-chat"), 128_000);
+        // GPT-5.4 has 1M context window
+        assert_eq!(context_window_for_model("gpt-5.4"), 1_000_000);
+        // DeepSeek V3 (deepseek-chat) has 64K context window
+        assert_eq!(context_window_for_model("deepseek-chat"), 64_000);
+        // DeepSeek V4 has 1M context window
+        assert_eq!(context_window_for_model("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(context_window_for_model("deepseek-v4-flash"), 1_000_000);
         assert_eq!(context_window_for_model("unknown-model"), 200_000);
     }
 

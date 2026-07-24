@@ -157,14 +157,16 @@ impl RuntimeMcpState {
 
     pub(crate) fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // P3-4:记录 Shutdown → Cleanup phase 转移。
-        self.lifecycle.run_phase(runtime::McpLifecyclePhase::Shutdown);
+        self.lifecycle
+            .run_phase(runtime::McpLifecyclePhase::Shutdown);
         self.runtime.block_on(
             self.manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .shutdown(),
         )?;
-        self.lifecycle.run_phase(runtime::McpLifecyclePhase::Cleanup);
+        self.lifecycle
+            .run_phase(runtime::McpLifecyclePhase::Cleanup);
         Ok(())
     }
 
@@ -416,7 +418,11 @@ pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
-            domain_tags: vec!["mcp".to_string(), "mcp:wrapper".to_string(), "mcp:resources".to_string()],
+            domain_tags: vec![
+                "mcp".to_string(),
+                "mcp:wrapper".to_string(),
+                "mcp:resources".to_string(),
+            ],
         },
         RuntimeToolDefinition {
             name: "ReadMcpResourceTool".to_string(),
@@ -431,7 +437,11 @@ pub(crate) fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
-            domain_tags: vec!["mcp".to_string(), "mcp:wrapper".to_string(), "mcp:resources".to_string()],
+            domain_tags: vec![
+                "mcp".to_string(),
+                "mcp:wrapper".to_string(),
+                "mcp:resources".to_string(),
+            ],
         },
     ]
 }
@@ -712,7 +722,7 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["orchestration".to_string(), "subagent".to_string()],
     });
-// Phase 4-A:DecisionLog — register log_decision and search_past_decisions tools.
+    // Phase 4-A:DecisionLog — register log_decision and search_past_decisions tools.
     // Logs repair decisions (problem signature, root cause hypothesis, applied solution,
     // verification result) into a SQLite + FTS5-backed decision log. The runtime intercepts
     // calls and routes them to DecisionLog::log_decision / search_decisions.

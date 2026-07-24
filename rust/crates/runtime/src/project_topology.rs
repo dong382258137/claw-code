@@ -47,9 +47,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub enum TopologyState {
     Uninitialized,
-    Building {
-        started_at: Instant,
-    },
+    Building { started_at: Instant },
     Ready(Box<TopologyData>),
     Failed(String),
 }
@@ -96,7 +94,7 @@ pub struct ModuleGraph {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolDef {
     pub name: String,
-    pub kind: String,           // "fn", "struct", "trait", "enum", "mod", etc.
+    pub kind: String, // "fn", "struct", "trait", "enum", "mod", etc.
     pub file: PathBuf,
     pub line: u32,
     pub crate_name: Option<String>,
@@ -108,7 +106,7 @@ pub struct SymbolDef {
 pub struct CallSite {
     pub file: PathBuf,
     pub line: u32,
-    pub context: Option<String>,  // surrounding line for quick reference
+    pub context: Option<String>, // surrounding line for quick reference
 }
 
 /// 符号交叉引用索引(best-effort, LSP 可能遗漏宏展开/条件编译)。
@@ -197,9 +195,7 @@ impl ProjectTopology {
         let workspace_root = self.workspace_root.clone();
 
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| {
-                build_topology_data(&workspace_root)
-            });
+            let result = std::panic::catch_unwind(|| build_topology_data(&workspace_root));
 
             let mut guard = state_clone.lock().unwrap_or_else(|e| e.into_inner());
             match result {
@@ -303,14 +299,8 @@ impl ProjectTopology {
                     g.crates.len(),
                 );
                 for c in &g.crates {
-                    out.push_str(&format!(
-                        "## crate `{}` v{}\n",
-                        c.name, c.version
-                    ));
-                    out.push_str(&format!(
-                        "   manifest: {}\n",
-                        c.manifest_path.display()
-                    ));
+                    out.push_str(&format!("## crate `{}` v{}\n", c.name, c.version));
+                    out.push_str(&format!("   manifest: {}\n", c.manifest_path.display()));
                     out.push_str(&format!(
                         "   sources: [{}]\n",
                         c.source_paths
@@ -320,40 +310,32 @@ impl ProjectTopology {
                             .join(", ")
                     ));
                     if !c.dependencies.is_empty() {
-                        out.push_str(&format!(
-                            "   deps: [{}]\n",
-                            c.dependencies.join(", ")
-                        ));
+                        out.push_str(&format!("   deps: [{}]\n", c.dependencies.join(", ")));
                     }
                     if let Some(reverse) = g.reverse_deps.get(&c.name) {
                         if !reverse.is_empty() {
-                            out.push_str(&format!(
-                                "   dependants: [{}]\n",
-                                reverse.join(", ")
-                            ));
+                            out.push_str(&format!("   dependants: [{}]\n", reverse.join(", ")));
                         }
                     }
                     out.push('\n');
                 }
-                out.push_str("Use `find_boundary_crossings` to find cross-crate symbol references, \
-                       or `get_symbol_info` to look up a specific symbol.\n");
+                out.push_str(
+                    "Use `find_boundary_crossings` to find cross-crate symbol references, \
+                       or `get_symbol_info` to look up a specific symbol.\n",
+                );
                 Ok(out)
             }
-            TopologyState::Building { .. } => {
-                Ok("ProjectTopology is still building (cargo metadata + crate graph). \
+            TopologyState::Building { .. } => Ok(
+                "ProjectTopology is still building (cargo metadata + crate graph). \
                     This usually takes < 5 seconds. Do NOT retry immediately. \
                     Use read/grep/search tools instead to find what you need."
-                    .to_string())
-            }
-            TopologyState::Failed(e) => {
-                Ok(format!(
-                    "ProjectTopology failed to build: {e}. \
+                    .to_string(),
+            ),
+            TopologyState::Failed(e) => Ok(format!(
+                "ProjectTopology failed to build: {e}. \
                      Use read/grep/search tools instead."
-                ))
-            }
-            TopologyState::Uninitialized => {
-                Ok("ProjectTopology is uninitialized.".to_string())
-            }
+            )),
+            TopologyState::Uninitialized => Ok("ProjectTopology is uninitialized.".to_string()),
         }
     }
 
@@ -397,7 +379,7 @@ impl ProjectTopology {
                     if query.is_some() {
                         out.push_str(
                             "No cross-crate boundary crossings found matching the query. \
-                             Try `query_project_graph` to see all crates and their dependencies.\n"
+                             Try `query_project_graph` to see all crates and their dependencies.\n",
                         );
                     } else {
                         out.push_str("No cross-crate dependencies found in workspace.\n");
@@ -408,9 +390,7 @@ impl ProjectTopology {
                         crossings.len()
                     ));
                     for (consumer, provider, source_paths) in &crossings {
-                        out.push_str(&format!(
-                            "## {consumer} → {provider}\n",
-                        ));
+                        out.push_str(&format!("## {consumer} → {provider}\n",));
                         out.push_str(&format!(
                             "   provider sources: [{}]\n\n",
                             source_paths
@@ -442,7 +422,9 @@ impl ProjectTopology {
                                 ));
                             }
                         } else {
-                            out.push_str("   (no symbol index matches — symbol index is best-effort)\n");
+                            out.push_str(
+                                "   (no symbol index matches — symbol index is best-effort)\n",
+                            );
                         }
                     }
                 }
@@ -454,12 +436,8 @@ impl ProjectTopology {
                  Use read/grep/search tools instead."
                     .to_string(),
             ),
-            TopologyState::Failed(e) => Ok(format!(
-                "ProjectTopology failed to build: {e}"
-            )),
-            TopologyState::Uninitialized => Ok(
-                "ProjectTopology is uninitialized.".to_string()
-            ),
+            TopologyState::Failed(e) => Ok(format!("ProjectTopology failed to build: {e}")),
+            TopologyState::Uninitialized => Ok("ProjectTopology is uninitialized.".to_string()),
         }
     }
 
@@ -478,14 +456,8 @@ impl ProjectTopology {
                 for c in &g.crates {
                     if c.name == symbol {
                         found_crate = true;
-                        out.push_str(&format!(
-                            "## Crate `{}` v{}\n",
-                            c.name, c.version
-                        ));
-                        out.push_str(&format!(
-                            "   manifest: {}\n",
-                            c.manifest_path.display()
-                        ));
+                        out.push_str(&format!("## Crate `{}` v{}\n", c.name, c.version));
+                        out.push_str(&format!("   manifest: {}\n", c.manifest_path.display()));
                         out.push_str(&format!(
                             "   sources: [{}]\n",
                             c.source_paths
@@ -502,10 +474,7 @@ impl ProjectTopology {
                         }
                         if let Some(reverse) = g.reverse_deps.get(&c.name) {
                             if !reverse.is_empty() {
-                                out.push_str(&format!(
-                                    "   dependants: [{}]\n",
-                                    reverse.join(", ")
-                                ));
+                                out.push_str(&format!("   dependants: [{}]\n", reverse.join(", ")));
                             }
                         }
                         out.push('\n');
@@ -533,16 +502,9 @@ impl ProjectTopology {
                             }
                         }
                         if let Some(callers) = si.callers.get(symbol) {
-                            out.push_str(&format!(
-                                "   call sites ({}):\n",
-                                callers.len()
-                            ));
+                            out.push_str(&format!("   call sites ({}):\n", callers.len()));
                             for cs in callers {
-                                out.push_str(&format!(
-                                    "      {}:{}\n",
-                                    cs.file.display(),
-                                    cs.line
-                                ));
+                                out.push_str(&format!("      {}:{}\n", cs.file.display(), cs.line));
                             }
                         }
                     } else if !found_crate {
@@ -563,15 +525,11 @@ impl ProjectTopology {
 
                 Ok(out)
             }
-            TopologyState::Building { .. } => Ok(
-                "ProjectTopology is still building. Do NOT retry immediately.".to_string(),
-            ),
-            TopologyState::Failed(e) => Ok(format!(
-                "ProjectTopology failed to build: {e}"
-            )),
-            TopologyState::Uninitialized => Ok(
-                "ProjectTopology is uninitialized.".to_string()
-            ),
+            TopologyState::Building { .. } => {
+                Ok("ProjectTopology is still building. Do NOT retry immediately.".to_string())
+            }
+            TopologyState::Failed(e) => Ok(format!("ProjectTopology failed to build: {e}")),
+            TopologyState::Uninitialized => Ok("ProjectTopology is uninitialized.".to_string()),
         }
     }
 }
@@ -650,17 +608,9 @@ fn build_module_graph(root: &Path) -> Result<ModuleGraph, String> {
     let mut crates = Vec::new();
 
     for pkg in packages {
-        let name = pkg["name"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
-        let version = pkg["version"]
-            .as_str()
-            .unwrap_or("0.0.0")
-            .to_string();
-        let manifest_path = PathBuf::from(
-            pkg["manifest_path"].as_str().unwrap_or(""),
-        );
+        let name = pkg["name"].as_str().unwrap_or("unknown").to_string();
+        let version = pkg["version"].as_str().unwrap_or("0.0.0").to_string();
+        let manifest_path = PathBuf::from(pkg["manifest_path"].as_str().unwrap_or(""));
 
         let dependencies: Vec<String> = pkg["dependencies"]
             .as_array()
@@ -724,9 +674,7 @@ fn build_module_graph(root: &Path) -> Result<ModuleGraph, String> {
 /// 这是 best-effort 实现:使用 `grep -rn` 搜 Rust 符号定义
 /// (`pub fn`, `pub struct`, `pub trait`, `pub enum`, `pub mod` 等)。
 /// 比 LSP 快但不支持宏展开/条件编译。
-pub fn build_symbol_index_fast(
-    source_dirs: &[PathBuf],
-) -> Result<SymbolIndex, String> {
+pub fn build_symbol_index_fast(source_dirs: &[PathBuf]) -> Result<SymbolIndex, String> {
     let mut definitions: HashMap<String, Vec<SymbolDef>> = HashMap::new();
     let mut file_symbols: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
@@ -867,8 +815,8 @@ fn find_callers_fast(
 
     // P2-3:预编译 regex,避免在内层 line 循环中重复编译。
     // 用于解析 grep 输出 `path:line:content`,Windows 盘符冒号免疫。
-    let separator_re = regex::Regex::new(r":(\d+):")
-        .map_err(|e| format!("regex compile failed: {e}"))?;
+    let separator_re =
+        regex::Regex::new(r":(\d+):").map_err(|e| format!("regex compile failed: {e}"))?;
 
     // For each known function name, search for its usage
     for func_name in definitions
@@ -994,8 +942,8 @@ mod tests {
         let base = PathBuf::from("/project/src");
         let line = "/project/src/internal.rs:5:pub(crate) fn internal_helper() {";
         // P2-3 修复：regex 现在支持 pub(crate) 可见性，不再容忍解析失败
-        let sym = parse_grep_line(line, &base)
-            .expect("pub(crate) fn should be parsed with fixed regex");
+        let sym =
+            parse_grep_line(line, &base).expect("pub(crate) fn should be parsed with fixed regex");
         assert_eq!(sym.name, "internal_helper");
         assert_eq!(sym.kind, "fn");
         assert_eq!(sym.visibility.as_deref(), Some("pub(crate)"));
@@ -1005,8 +953,8 @@ mod tests {
     fn parse_grep_line_parses_pub_super_fn() {
         let base = PathBuf::from("/project/src");
         let line = "/project/src/mod.rs:12:pub(super) fn super_helper() {";
-        let sym = parse_grep_line(line, &base)
-            .expect("pub(super) fn should be parsed with fixed regex");
+        let sym =
+            parse_grep_line(line, &base).expect("pub(super) fn should be parsed with fixed regex");
         assert_eq!(sym.name, "super_helper");
         assert_eq!(sym.kind, "fn");
         assert_eq!(sym.visibility.as_deref(), Some("pub(super)"));
@@ -1040,8 +988,7 @@ mod tests {
         // 组合测试:Windows 路径 + pub(crate) 可见性
         let base = PathBuf::from(r"C:\project\src");
         let line = r"C:\project\src\internal.rs:5:pub(crate) fn internal_helper() {";
-        let sym = parse_grep_line(line, &base)
-            .expect("should parse Windows path + pub(crate) fn");
+        let sym = parse_grep_line(line, &base).expect("should parse Windows path + pub(crate) fn");
         assert_eq!(sym.name, "internal_helper");
         assert_eq!(sym.kind, "fn");
         assert_eq!(sym.line, 5);
@@ -1231,7 +1178,11 @@ mod tests {
         let state2 = topo.ensure_built();
         assert!(matches!(state2, TopologyState::Building { .. }));
         // 两次返回的 Building 的 started_at 应相同(同一个 Building 实例)
-        if let (TopologyState::Building { started_at: s1 }, TopologyState::Building { started_at: s2 }) = (state1, state2) {
+        if let (
+            TopologyState::Building { started_at: s1 },
+            TopologyState::Building { started_at: s2 },
+        ) = (state1, state2)
+        {
             assert_eq!(s1, s2, "second ensure_built() should not restart building");
         }
     }
@@ -1269,7 +1220,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let topo = ProjectTopology::new(dir.path().to_path_buf());
         topo.ensure_built(); // 启动后台构建
-        // 此时状态应为 Building
+                             // 此时状态应为 Building
         assert!(matches!(topo.state(), TopologyState::Building { .. }));
 
         // ensure_built_blocking 应等待后台线程完成

@@ -142,19 +142,13 @@ impl DynamicValueExtractor {
 
 /// Returns true when `s` looks like a placeholder we generated.
 fn is_already_placeholder(s: &str) -> bool {
-    s.starts_with('<')
-        && s.ends_with('>')
-        && s.len() > 4
-        && s[1..s.len() - 1].contains('_')
+    s.starts_with('<') && s.ends_with('>') && s.len() > 4 && s[1..s.len() - 1].contains('_')
 }
 
 /// Classifies a dynamic value into a short label used in placeholder names.
 fn classify_dynamic_value(s: &str) -> &'static str {
     // Date-only: 2026-07-23 (10 chars)
-    if s.len() >= 10
-        && s.as_bytes().get(4) == Some(&b'-')
-        && s.as_bytes().get(7) == Some(&b'-')
-    {
+    if s.len() >= 10 && s.as_bytes().get(4) == Some(&b'-') && s.as_bytes().get(7) == Some(&b'-') {
         return "datetime";
     }
     if s.len() >= 19 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-') {
@@ -277,14 +271,9 @@ fn try_iso_datetime(text: &str, pos: usize) -> Option<Span> {
         && bytes[11..13].iter().all(u8::is_ascii_digit)
     {
         end = pos + 13;
-        if rest.len() >= 16
-            && bytes[13] == b':'
-            && bytes[14..16].iter().all(u8::is_ascii_digit)
-        {
+        if rest.len() >= 16 && bytes[13] == b':' && bytes[14..16].iter().all(u8::is_ascii_digit) {
             end = pos + 16;
-            if rest.len() >= 19
-                && bytes[16] == b':'
-                && bytes[17..19].iter().all(u8::is_ascii_digit)
+            if rest.len() >= 19 && bytes[16] == b':' && bytes[17..19].iter().all(u8::is_ascii_digit)
             {
                 end = pos + 19;
             }
@@ -361,9 +350,8 @@ fn try_hex(text: &str, pos: usize) -> Option<Span> {
             let prev = text.as_bytes()[pos - 1];
             !prev.is_ascii_alphanumeric()
         };
-        let followed_by_boundary = end >= text.len() || {
-            !text.as_bytes()[end].is_ascii_alphanumeric()
-        };
+        let followed_by_boundary =
+            end >= text.len() || { !text.as_bytes()[end].is_ascii_alphanumeric() };
         if preceded_by_boundary && followed_by_boundary {
             return Some(Span { start: pos, end });
         }

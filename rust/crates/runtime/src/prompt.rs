@@ -1873,10 +1873,7 @@ mod tests {
     fn cache_breakpoints_only_last_when_no_tier_markers() {
         // No tier markers at all → only the last static section gets a breakpoint
         let split = SystemPromptSplit {
-            static_sections: vec![
-                "# Intro".to_string(),
-                "# System".to_string(),
-            ],
+            static_sections: vec!["# Intro".to_string(), "# System".to_string()],
             dynamic_sections: Vec::new(),
         };
         let bps = split.static_cache_breakpoints();
@@ -1907,10 +1904,7 @@ mod tests {
     fn cache_breakpoints_snapshot_without_config() {
         // Snapshot tier exists but no Environment context (edge case)
         let split = SystemPromptSplit {
-            static_sections: vec![
-                "# Intro".to_string(),
-                "# Persistent Memory".to_string(),
-            ],
+            static_sections: vec!["# Intro".to_string(), "# Persistent Memory".to_string()],
             dynamic_sections: Vec::new(),
         };
         let bps = split.static_cache_breakpoints();

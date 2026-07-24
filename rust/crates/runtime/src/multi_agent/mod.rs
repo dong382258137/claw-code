@@ -15,12 +15,16 @@
 //! 每个子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存。
 //! "Subagent as Tool" 模式 — 主 agent 通过 tool call 接口调用子 agent。
 
+pub mod dag;
+pub use dag::DagStore;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 /// 多 agent 编排模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +175,72 @@ impl MultiAgentCoordinator {
         Ok(())
     }
 
+    /// 异步执行子 agent(G10.6:tokio::spawn runtime)。
+    ///
+    /// 与同步 [`start`](Self::start) 不同,此方法在后台 tokio task 中
+    /// 执行用户提供的闭包,自动管理状态转换:
+    /// 1. 调用 `start()` 转换 Created → Running
+    /// 2. 在 tokio::spawn 中执行 `executor` 闭包
+    /// 3. 成功时自动标记 Completed,失败时自动标记 Failed
+    ///
+    /// 返回后子 agent 立即进入 Running 状态,实际结果在后台异步填充。
+    /// 调用方可通过 [`get`](Self::get) 或 [`join_all`](Self::join_all) 轮询结果。
+    ///
+    /// # 参数
+    /// - `subagent_id`:已 spawn 的子 agent ID
+    /// - `executor`:实际执行逻辑(接收 id + task,返回 Ok(result) 或 Err(error))
+    ///
+    /// # 返回
+    /// - `Ok(join_handle)`:异步任务已 spawn,可 await 获取最终结果
+    /// - `Err(msg)`:子 agent 不存在或状态不允许启动
+    pub fn execute_async<F, Fut>(
+        &self,
+        subagent_id: &str,
+        executor: F,
+    ) -> Result<JoinHandle<Result<String, String>>, String>
+    where
+        F: FnOnce(String, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
+    {
+        let agent = self
+            .get(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+        let task = agent.task.clone();
+        let id = subagent_id.to_string();
+
+        self.start(&id)?;
+
+        let coord = self.clone();
+        let handle = tokio::spawn(async move {
+            match executor(id.clone(), task).await {
+                Ok(result) => {
+                    let mut agents = coord.subagents.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(agent) = agents.get_mut(&id) {
+                        if agent.status == SubagentStatus::Running {
+                            agent.status = SubagentStatus::Completed;
+                            agent.completed_at = Some(now_secs());
+                            agent.result = Some(result.clone());
+                        }
+                    }
+                    Ok(result)
+                }
+                Err(error) => {
+                    let mut agents = coord.subagents.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(agent) = agents.get_mut(&id) {
+                        if agent.status == SubagentStatus::Running {
+                            agent.status = SubagentStatus::Failed;
+                            agent.completed_at = Some(now_secs());
+                            agent.result = Some(format!("error: {}", &error));
+                        }
+                    }
+                    Err(error)
+                }
+            }
+        });
+
+        Ok(handle)
+    }
+
     /// 标记子 agent 完成(成功)。
     pub fn complete(&self, subagent_id: &str, result: impl Into<String>) -> Result<(), String> {
         let mut agents = self.subagents.lock().expect("subagents lock poisoned");
@@ -297,6 +367,96 @@ impl MultiAgentCoordinator {
             running,
             cancelled,
         }
+    }
+}
+
+/// 子 agent 协调器(G8.1:dispatch 逻辑)。
+///
+/// 在 [`MultiAgentCoordinator`] 之上提供高层 dispatch 逻辑:
+/// - 根据 [`CoordinationMode`] 选择执行策略
+/// - Fork/Teammate 模式:共享工作目录,主 agent 收集结果
+/// - Worktree 模式:独立 git worktree,避免文件冲突
+/// - 批量 spawn + dispatch + join 工作流
+#[derive(Debug, Clone, Default)]
+pub struct SubagentCoordinator {
+    inner: MultiAgentCoordinator,
+}
+
+impl SubagentCoordinator {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: MultiAgentCoordinator::new(),
+        }
+    }
+
+    /// 获取内部 [`MultiAgentCoordinator`] 引用。
+    #[must_use]
+    pub fn inner(&self) -> &MultiAgentCoordinator {
+        &self.inner
+    }
+
+    /// 派生子 agent(委托到 inner.spawn)。
+    pub fn spawn(
+        &self,
+        name: impl Into<String>,
+        task: impl Into<String>,
+        mode: CoordinationMode,
+    ) -> String {
+        self.inner.spawn(name, task, mode)
+    }
+
+    /// 派生子 agent 并立即异步执行。
+    ///
+    /// 这是最常见的 dispatch 模式:spawn + execute_async 组合,
+    /// 子 agent 在后台异步执行,调用方通过 `get`/`join_all` 轮询结果。
+    ///
+    /// # 参数
+    /// - `name`:人类可读名称
+    /// - `task`:任务描述
+    /// - `mode`:编排模式
+    /// - `executor`:异步执行闭包
+    ///
+    /// # 返回
+    /// - `Ok((subagent_id, join_handle))`:spawn + dispatch 成功
+    /// - `Err(msg)`:状态不允许启动
+    pub fn dispatch<F, Fut>(
+        &self,
+        name: impl Into<String>,
+        task: impl Into<String>,
+        mode: CoordinationMode,
+        executor: F,
+    ) -> Result<(String, JoinHandle<Result<String, String>>), String>
+    where
+        F: FnOnce(String, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
+    {
+        let id = self.inner.spawn(name, task, mode);
+        let handle = self.inner.execute_async(&id, executor)?;
+        Ok((id, handle))
+    }
+
+    /// 获取子 agent 状态。
+    #[must_use]
+    pub fn get(&self, subagent_id: &str) -> Option<Subagent> {
+        self.inner.get(subagent_id)
+    }
+
+    /// 获取所有子 agent。
+    #[must_use]
+    pub fn list(&self) -> Vec<Subagent> {
+        self.inner.list()
+    }
+
+    /// 取消子 agent。
+    pub fn cancel(&self, subagent_id: &str) -> Result<(), String> {
+        self.inner.cancel(subagent_id)
+    }
+
+    /// 等待所有子 agent 完成。
+    #[must_use]
+    pub fn join_all(&self) -> JoinStats {
+        self.inner.join_all()
     }
 }
 

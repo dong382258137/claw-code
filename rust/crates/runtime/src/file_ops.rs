@@ -395,11 +395,19 @@ pub struct GrepSearchOutput {
     /// 截断前的真实匹配文件总数(用于诊断"是否被 head_limit 截断")。
     /// 与 `num_files` 不同:`num_files` 是返回的文件数,本字段是
     /// 应用 limit/offset 前的全部匹配数。None 表示未跟踪(向后兼容)。
-    #[serde(rename = "totalFilesBeforeLimit", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "totalFilesBeforeLimit",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub total_files_before_limit: Option<usize>,
     /// 读取失败/被跳过的文件数(用于诊断"静默跳过"问题)。
     /// 当文件过大、读取错误、或被识别为二进制时计入。
-    #[serde(rename = "skippedFiles", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "skippedFiles",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub skipped_files: Option<usize>,
 }
 
@@ -703,9 +711,8 @@ pub fn replace_lines(
     let replaced_slice = original_lines[(start_line - 1)..end_line].join("\n");
 
     // Build the updated content by splicing lines
-    let mut out: Vec<&str> = Vec::with_capacity(
-        original_lines.len() - (end_line - start_line + 1) + 1,
-    );
+    let mut out: Vec<&str> =
+        Vec::with_capacity(original_lines.len() - (end_line - start_line + 1) + 1);
     out.extend_from_slice(&original_lines[..start_line - 1]);
     if !new_content.is_empty() {
         for line in new_content.lines() {
@@ -1759,8 +1766,12 @@ mod tests {
         let file = dir.join("bom.rs");
         std::fs::write(&file, bom_content).expect("write");
 
-        let out = grep_search(&grep_files_with_matches("hello", dir.to_str().unwrap(), Some("*.rs")))
-            .expect("grep");
+        let out = grep_search(&grep_files_with_matches(
+            "hello",
+            dir.to_str().unwrap(),
+            Some("*.rs"),
+        ))
+        .expect("grep");
         assert_eq!(
             out.num_files, 1,
             "BOM 文件必须被搜索到(痛点 1 根因);skipped={:?}",
@@ -1782,8 +1793,12 @@ mod tests {
         let file = dir.join("broken.rs");
         std::fs::write(&file, &content).expect("write");
 
-        let out = grep_search(&grep_files_with_matches("hello", dir.to_str().unwrap(), Some("*.rs")))
-            .expect("grep");
+        let out = grep_search(&grep_files_with_matches(
+            "hello",
+            dir.to_str().unwrap(),
+            Some("*.rs"),
+        ))
+        .expect("grep");
         assert_eq!(
             out.num_files, 1,
             "部分非 UTF-8 文件应通过 lossy 解码被搜索;skipped={:?}",
@@ -1801,8 +1816,12 @@ mod tests {
         std::fs::write(dir.join("bin.dat"), b"\x00\x01hello\x00\x02").expect("write bin");
         std::fs::write(dir.join("text.rs"), "fn hello() {}").expect("write text");
 
-        let out = grep_search(&grep_files_with_matches("hello", dir.to_str().unwrap(), None))
-            .expect("grep");
+        let out = grep_search(&grep_files_with_matches(
+            "hello",
+            dir.to_str().unwrap(),
+            None,
+        ))
+        .expect("grep");
         // 文本文件应被找到
         assert_eq!(out.num_files, 1, "应只匹配文本文件");
         assert!(
@@ -1830,14 +1849,20 @@ mod tests {
         std::fs::write(dir.join("target/debug/junk.rs"), "fn marker() {}").expect("write target");
         std::fs::write(dir.join("node_modules/pkg/deps.rs"), "fn marker() {}").expect("write nm");
 
-        let out = grep_search(&grep_files_with_matches("marker", dir.to_str().unwrap(), Some("*.rs")))
-            .expect("grep");
+        let out = grep_search(&grep_files_with_matches(
+            "marker",
+            dir.to_str().unwrap(),
+            Some("*.rs"),
+        ))
+        .expect("grep");
         assert_eq!(
             out.num_files, 1,
             "应只匹配 src/real.rs,target/node_modules 应被过滤"
         );
         assert!(
-            out.filenames.iter().any(|f| f.contains("src") && f.contains("real.rs")),
+            out.filenames
+                .iter()
+                .any(|f| f.contains("src") && f.contains("real.rs")),
             "应找到 src/real.rs;实际: {:?}",
             out.filenames
         );

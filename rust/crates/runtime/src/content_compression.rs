@@ -345,7 +345,11 @@ pub fn format_tabular_summary(tool_name: &str, tool_use_id: &str, output: &str) 
     } else {
         String::new()
     };
-    let header_info = if header_detected { ", header detected" } else { "" };
+    let header_info = if header_detected {
+        ", header detected"
+    } else {
+        ""
+    };
     let cols_info = if cols > 0 {
         format!(" × {cols} cols{header_info}")
     } else {
@@ -382,7 +386,9 @@ fn is_likely_header(line: &str) -> bool {
         return false;
     }
     // 所有 token 都不是纯数字 → 可能是表头
-    tokens.iter().all(|t| !t.is_empty() && t.parse::<f64>().is_err())
+    tokens
+        .iter()
+        .all(|t| !t.is_empty() && t.parse::<f64>().is_err())
 }
 
 // ============================================================================
@@ -483,7 +489,8 @@ pub fn format_log_summary(tool_name: &str, tool_use_id: &str, output: &str) -> S
 
     // 2. 对 other_lines 按模式分组 + 折叠
     let mut folded_others: Vec<(usize, String)> = Vec::new();
-    let mut pattern_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut pattern_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut current_pattern: Option<String> = None;
     let mut current_count = 0usize;
     let mut current_first_idx = 0usize;
@@ -503,7 +510,8 @@ pub fn format_log_summary(tool_name: &str, tool_use_id: &str, output: &str) -> S
                 for i in 0..keep {
                     let src_idx = current_first_idx + i;
                     if src_idx < other_lines.len() {
-                        folded_others.push((other_lines[src_idx].0, other_lines[src_idx].1.to_string()));
+                        folded_others
+                            .push((other_lines[src_idx].0, other_lines[src_idx].1.to_string()));
                     }
                 }
                 if current_count > keep {
@@ -587,10 +595,16 @@ fn matches_log_level(upper_line: &str, levels: &[&str]) -> bool {
     levels.iter().any(|level| {
         if let Some(idx) = upper_line.find(level) {
             let before_ok = idx == 0
-                || !upper_line.as_bytes().get(idx - 1).is_some_and(|c| c.is_ascii_alphabetic());
+                || !upper_line
+                    .as_bytes()
+                    .get(idx - 1)
+                    .is_some_and(|c| c.is_ascii_alphabetic());
             let after_idx = idx + level.len();
             let after_ok = after_idx >= upper_line.len()
-                || !upper_line.as_bytes().get(after_idx).is_some_and(|c| c.is_ascii_alphabetic());
+                || !upper_line
+                    .as_bytes()
+                    .get(after_idx)
+                    .is_some_and(|c| c.is_ascii_alphabetic());
             before_ok && after_ok
         } else {
             false
@@ -608,10 +622,7 @@ fn extract_log_pattern(line: &str) -> String {
         return "blank".to_string();
     }
     // 取第一个 token(到空格或 `[`/`]` 边界)
-    let first_token: String = trimmed
-        .chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
+    let first_token: String = trimmed.chars().take_while(|c| !c.is_whitespace()).collect();
     // 如果第一个 token 是时间戳类(以 `[` 开头),用第二个 token 作模式
     if first_token.starts_with('[') {
         let after_bracket = trimmed
@@ -642,7 +653,10 @@ mod tests {
     fn json_summary_preserves_structure() {
         // bio 超过 80 字符,验证截断
         let long_bio = "Likes Rust and writes very long biographies that easily exceed the eighty character limit for testing";
-        assert!(long_bio.chars().count() > 80, "test bio must exceed 80 chars");
+        assert!(
+            long_bio.chars().count() > 80,
+            "test bio must exceed 80 chars"
+        );
         let input = format!(r#"{{"name":"Alice","bio":"{long_bio}"}}"#);
         let result = format_json_summary("Bash", "call_1", &input);
         assert!(result.starts_with("[Bash JSON summarized:"));
@@ -718,7 +732,8 @@ mod tests {
 
     #[test]
     fn tabular_summary_preserves_header_and_preview() {
-        let input = "name | age\n---- | ---\nAlice | 30\nBob | 25\nCarol | 40\nDave | 35\nEve | 28\n";
+        let input =
+            "name | age\n---- | ---\nAlice | 30\nBob | 25\nCarol | 40\nDave | 35\nEve | 28\n";
         let result = format_tabular_summary("Grep", "call_8", input);
         assert!(result.starts_with("[Grep Tabular summarized:"));
         assert!(result.contains("rows"));
@@ -795,7 +810,10 @@ mod tests {
         }
         input.push_str("    Finished release [optimized] target(s)\n");
         let result = format_log_summary("Bash", "call_log3", &input);
-        assert!(result.contains("similar Compiling"), "重复 Compiling 行应被折叠");
+        assert!(
+            result.contains("similar Compiling"),
+            "重复 Compiling 行应被折叠"
+        );
         assert!(result.contains("Finished"), "结果摘要应保留");
     }
 
@@ -823,7 +841,10 @@ mod tests {
     fn log_summary_routes_from_format_summary() {
         let input = "   Compiling proc-macro2 v1.0.81\n   Compiling libc v0.2.153\n    Finished dev [unoptimized] target(s)\n     Running `target/debug/test`\nerror[E0308]: mismatched types\n";
         let result = format_summary("Bash", "call_log6", input);
-        assert!(result.contains("Log summarized"), "构建日志应路由到 Log 压缩器");
+        assert!(
+            result.contains("Log summarized"),
+            "构建日志应路由到 Log 压缩器"
+        );
     }
 
     // ---- 路由入口测试 ----

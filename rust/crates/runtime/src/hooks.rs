@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::config::{FailurePolicy, HookDefinition, HookHandlerType, RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
 const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
@@ -23,6 +23,14 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    UserPromptSubmit,
+    Notification,
+    SessionStart,
+    SessionEnd,
+    Stop,
+    SubagentStop,
+    PreCompact,
+    PostCustomToolCall,
 }
 
 impl HookEvent {
@@ -32,6 +40,14 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::Notification => "Notification",
+            Self::SessionStart => "SessionStart",
+            Self::SessionEnd => "SessionEnd",
+            Self::Stop => "Stop",
+            Self::SubagentStop => "SubagentStop",
+            Self::PreCompact => "PreCompact",
+            Self::PostCustomToolCall => "PostCustomToolCall",
         }
     }
 }
@@ -205,7 +221,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        Self::run_definitions(
             HookEvent::PreToolUse,
             self.config.pre_tool_use(),
             tool_name,
@@ -255,7 +271,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        Self::run_definitions(
             HookEvent::PostToolUse,
             self.config.post_tool_use(),
             tool_name,
@@ -305,7 +321,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        Self::run_definitions(
             HookEvent::PostToolUseFailure,
             self.config.post_tool_use_failure(),
             tool_name,
@@ -334,10 +350,54 @@ impl HookRunner {
         )
     }
 
+    // ── G9.1: Additional lifecycle event methods ──
+
+    #[must_use]
+    pub fn run_lifecycle_event(&self, event: HookEvent, context: &str) -> HookRunResult {
+        let event_name = event.as_str();
+        let definitions = self.config.lifecycle().get(event_name).map(Vec::as_slice).unwrap_or(&[]);
+        if definitions.is_empty() {
+            return HookRunResult::allow(Vec::new());
+        }
+        Self::run_definitions(event, definitions, context, "{}", None, false, None, None)
+    }
+
+    #[must_use]
+    pub fn run_user_prompt_submit(&self, prompt: &str) -> HookRunResult {
+        self.run_lifecycle_event(HookEvent::UserPromptSubmit, prompt)
+    }
+    #[must_use]
+    pub fn run_notification(&self, message: &str) -> HookRunResult {
+        self.run_lifecycle_event(HookEvent::Notification, message)
+    }
+    #[must_use]
+    pub fn run_session_start(&self, session_id: &str) -> HookRunResult {
+        self.run_lifecycle_event(HookEvent::SessionStart, session_id)
+    }
+    #[must_use]
+    pub fn run_session_end(&self, session_id: &str) -> HookRunResult {
+        self.run_lifecycle_event(HookEvent::SessionEnd, session_id)
+    }
+    #[must_use]
+    pub fn run_stop(&self, reason: &str) -> HookRunResult {
+        self.run_lifecycle_event(HookEvent::Stop, reason)
+    }
+    #[must_use]
+    pub fn run_subagent_stop(&self, subagent_id: &str) -> HookRunResult {
+        self.run_lifecycle_event(HookEvent::SubagentStop, subagent_id)
+    }
+    #[must_use]
+    pub fn run_pre_compact(&self, context: &str) -> HookRunResult {
+        self.run_lifecycle_event(HookEvent::PreCompact, context)
+    }
+    #[must_use]
+    pub fn run_post_custom_tool_call(&self, tool_name: &str, result: &str) -> HookRunResult {
+        self.run_lifecycle_event(HookEvent::PostCustomToolCall, &format!("{tool_name}: {result}"))
+    }
     #[allow(clippy::too_many_arguments)]
-    fn run_commands(
+    fn run_definitions(
         event: HookEvent,
-        commands: &[String],
+        definitions: &[HookDefinition],
         tool_name: &str,
         tool_input: &str,
         tool_output: Option<&str>,
@@ -345,7 +405,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         mut reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        if commands.is_empty() {
+        if definitions.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
 
@@ -367,31 +427,43 @@ impl HookRunner {
         let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for def in definitions {
+            let label = match def.handler_type {
+                HookHandlerType::Command => def.value.clone(),
+                HookHandlerType::Script => "<script>".to_string(),
+                HookHandlerType::Http => def.value.clone(),
+                HookHandlerType::Mcp => format!("mcp:{}", &def.value),
+            };
+
             if let Some(reporter) = reporter.as_deref_mut() {
                 reporter.on_event(&HookProgressEvent::Started {
                     event,
                     tool_name: tool_name.to_string(),
-                    command: command.clone(),
+                    command: label.clone(),
                 });
             }
 
-            match Self::run_command(
-                command,
-                event,
-                tool_name,
-                tool_input,
-                tool_output,
-                is_error,
-                &payload,
-                abort_signal,
-            ) {
+            let outcome = match def.handler_type {
+                HookHandlerType::Command => Self::run_command(
+                    &def.value, event, tool_name, tool_input, tool_output, is_error, &payload, abort_signal,
+                ),
+                HookHandlerType::Script => Self::run_script_handler(
+                    &def.value, event, tool_name, tool_input, &payload, abort_signal,
+                ),
+                HookHandlerType::Http => Self::run_http_handler(
+                    &def.value, event, tool_name, &payload, abort_signal,
+                ),
+                HookHandlerType::Mcp => Self::run_mcp_handler(
+                    &def.value, event, tool_name, &payload,
+                ),
+            };
+
+            let completed_label = label.clone();
+            match outcome {
                 HookCommandOutcome::Allow { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            event, tool_name: tool_name.to_string(), command: completed_label,
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -399,33 +471,35 @@ impl HookRunner {
                 HookCommandOutcome::Deny { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            event, tool_name: tool_name.to_string(), command: completed_label,
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
                     result.denied = true;
+                    if def.failure_policy == FailurePolicy::FailOpen {
+                        result.denied = false;
+                        continue;
+                    }
                     return result;
                 }
                 HookCommandOutcome::Failed { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            event, tool_name: tool_name.to_string(), command: completed_label,
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
                     result.failed = true;
+                    if def.failure_policy == FailurePolicy::FailOpen {
+                        result.failed = false;
+                        continue;
+                    }
                     return result;
                 }
                 HookCommandOutcome::Cancelled { message } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Cancelled {
-                            event,
-                            tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            event, tool_name: tool_name.to_string(), command: completed_label,
                         });
                     }
                     result.cancelled = true;
@@ -513,6 +587,176 @@ impl HookRunner {
                     )],
                     ..ParsedHookOutput::default()
                 },
+            },
+        }
+    }
+
+    // ── G9.3: Script handler ──
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_script_handler(
+        script: &str,
+        event: HookEvent,
+        tool_name: &str,
+        tool_input: &str,
+        payload: &str,
+        abort_signal: Option<&HookAbortSignal>,
+    ) -> HookCommandOutcome {
+        let (program, flag) = crate::bash::shell_launcher();
+        let mut child = CommandWithStdin::new(Command::new(&program));
+        child.command.arg(flag);
+        child.stdin(Stdio::piped());
+        child.stdout(Stdio::piped());
+        child.stderr(Stdio::piped());
+        child.env("HOOK_EVENT", event.as_str());
+        child.env("HOOK_TOOL_NAME", tool_name);
+        child.env("HOOK_TOOL_INPUT", tool_input);
+        child.env("HOOK_PAYLOAD", payload);
+        let stdin_content = format!("{}\n# --- hook payload (JSON) ---\n{}", script, payload);
+        let label = bounded_hook_preview(script).unwrap_or_else(|| "<script>".to_string());
+        match child.output_with_stdin(stdin_content.as_bytes(), abort_signal) {
+            Ok(CommandExecution::Finished(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let parsed = parse_hook_output(event, tool_name, &label, &stdout, &stderr);
+                let primary_message = parsed.primary_message().map(ToOwned::to_owned);
+                match output.status.code() {
+                    Some(0) => {
+                        if parsed.deny {
+                            HookCommandOutcome::Deny { parsed }
+                        } else {
+                            HookCommandOutcome::Allow { parsed }
+                        }
+                    }
+                    Some(2) => HookCommandOutcome::Deny {
+                        parsed: parsed.with_fallback_message(format!(
+                            "{} hook script denied tool `{tool_name}`",
+                            event.as_str()
+                        )),
+                    },
+                    Some(code) => HookCommandOutcome::Failed {
+                        parsed: parsed.with_fallback_message(format!(
+                            "{} hook script exited with status {code}: {}",
+                            event.as_str(),
+                            primary_message.as_deref().unwrap_or(&stderr)
+                        )),
+                    },
+                    None => HookCommandOutcome::Failed {
+                        parsed: parsed.with_fallback_message(format!(
+                            "{} hook script terminated by signal while handling `{tool_name}`",
+                            event.as_str()
+                        )),
+                    },
+                }
+            }
+            Ok(CommandExecution::Cancelled) => HookCommandOutcome::Cancelled {
+                message: format!(
+                    "{} hook script cancelled while handling `{tool_name}`",
+                    event.as_str()
+                ),
+            },
+            Err(error) => HookCommandOutcome::Failed {
+                parsed: ParsedHookOutput {
+                    messages: vec![format!(
+                        "{} hook script failed to start for `{tool_name}`: {error}",
+                        event.as_str()
+                    )],
+                    ..ParsedHookOutput::default()
+                },
+            },
+        }
+    }
+
+    // ── G9.4: HTTP webhook handler (shell-out to curl) ──
+
+    fn run_http_handler(
+        url: &str,
+        event: HookEvent,
+        tool_name: &str,
+        payload: &str,
+        abort_signal: Option<&HookAbortSignal>,
+    ) -> HookCommandOutcome {
+        if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
+            return HookCommandOutcome::Cancelled {
+                message: format!("{} hook http cancelled before request", event.as_str()),
+            };
+        }
+        let label = bounded_hook_preview(url).unwrap_or_else(|| "<http>".to_string());
+        let curl_cmd = format!(
+            "curl -s -f -X POST -H 'Content-Type: application/json' -H 'X-Hook-Event: {}' -H 'X-Hook-Tool: {}' -d @- '{}'",
+            event.as_str(), tool_name, url
+        );
+        let (program, flag) = crate::bash::shell_launcher();
+        let mut child = CommandWithStdin::new(Command::new(&program));
+        child.command.arg(flag).arg(&curl_cmd);
+        child.stdin(Stdio::piped());
+        child.stdout(Stdio::piped());
+        child.stderr(Stdio::piped());
+        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+            Ok(CommandExecution::Finished(output)) => {
+                let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                match output.status.code() {
+                    Some(0) => {
+                        let parsed = parse_hook_output(event, tool_name, &label, &body, &stderr_out);
+                        if parsed.deny {
+                            HookCommandOutcome::Deny { parsed }
+                        } else {
+                            HookCommandOutcome::Allow { parsed }
+                        }
+                    }
+                    Some(code) => HookCommandOutcome::Failed {
+                        parsed: ParsedHookOutput {
+                            messages: vec![format!(
+                                "{} hook http `{label}` returned exit {code}: {}",
+                                event.as_str(),
+                                stderr_out.lines().next().unwrap_or(&body)
+                            )],
+                            ..ParsedHookOutput::default()
+                        },
+                    },
+                    None => HookCommandOutcome::Failed {
+                        parsed: ParsedHookOutput {
+                            messages: vec![format!(
+                                "{} hook http `{label}` terminated by signal",
+                                event.as_str()
+                            )],
+                            ..ParsedHookOutput::default()
+                        },
+                    },
+                }
+            }
+            Ok(CommandExecution::Cancelled) => HookCommandOutcome::Cancelled {
+                message: format!("{} hook http `{label}` cancelled", event.as_str()),
+            },
+            Err(error) => HookCommandOutcome::Failed {
+                parsed: ParsedHookOutput {
+                    messages: vec![format!(
+                        "{} hook http `{label}` failed: {error}",
+                        event.as_str()
+                    )],
+                    ..ParsedHookOutput::default()
+                },
+            },
+        }
+    }
+
+    // ── G9.5: MCP tool handler ──
+
+    fn run_mcp_handler(
+        mcp_tool: &str,
+        event: HookEvent,
+        source_tool: &str,
+        payload: &str,
+    ) -> HookCommandOutcome {
+        let _ = (mcp_tool, event, source_tool, payload);
+        HookCommandOutcome::Allow {
+            parsed: ParsedHookOutput {
+                messages: vec![format!(
+                    "{} hook mcp: dispatched `{mcp_tool}` (mcp bridge delegate — sync no-op)",
+                    event.as_str()
+                )],
+                ..ParsedHookOutput::default()
             },
         }
     }

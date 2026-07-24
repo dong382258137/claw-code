@@ -862,7 +862,6 @@ pub struct MessageStream {
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
-
 /// DeepSeek Anthropic-compatible API doesn't return cache_creation_input_tokens,
 /// only input_tokens (cache miss) and cache_read_input_tokens (cache hit).
 /// Normalize by moving input_tokens → cache_creation_input_tokens so sidebar
@@ -908,7 +907,11 @@ impl MessageStream {
             if self.done {
                 let remaining = self.parser.finish()?;
                 let is_ds = self.request.model.to_ascii_lowercase().contains("deepseek");
-                self.pending.extend(remaining.into_iter().map(|e| normalize_deepseek_usage(e, is_ds)));
+                self.pending.extend(
+                    remaining
+                        .into_iter()
+                        .map(|e| normalize_deepseek_usage(e, is_ds)),
+                );
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(Some(event));
                 }
@@ -918,7 +921,12 @@ impl MessageStream {
             match self.response.chunk().await? {
                 Some(chunk) => {
                     let is_ds = self.request.model.to_ascii_lowercase().contains("deepseek");
-                    self.pending.extend(self.parser.push(&chunk)?.into_iter().map(|e| normalize_deepseek_usage(e, is_ds)));
+                    self.pending.extend(
+                        self.parser
+                            .push(&chunk)?
+                            .into_iter()
+                            .map(|e| normalize_deepseek_usage(e, is_ds)),
+                    );
                 }
                 None => {
                     self.done = true;

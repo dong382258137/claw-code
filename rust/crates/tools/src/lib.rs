@@ -12,13 +12,13 @@ use api::{
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
+use runtime::multi_agent::dag;
 use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace_with_roots,
     execute_bash, glob_search_in_workspace_with_roots, grep_search_in_workspace_with_roots,
     load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
-    McpServerManager,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_in_workspace_with_roots, replace_lines_in_workspace_with_roots,
     run_cargo_check_for_file, strip_verbatim_prefix,
@@ -29,9 +29,9 @@ use runtime::{
     write_file_in_workspace_with_roots, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
-    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
-    Session, SystemPromptSplit, TaskPacket, ToolError, ToolExecutor,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, McpServerManager,
+    MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig,
+    RuntimeError, Session, SystemPromptSplit, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -86,9 +86,18 @@ pub fn init_lsp_from_config(
         // 尝试 spawn 真实 server 子进程
         let effective_root = server_cfg.root_path.as_deref().unwrap_or(root_str);
 
-        match registry.spawn_server(language, &server_cfg.command, &server_cfg.args, effective_root) {
+        match registry.spawn_server(
+            language,
+            &server_cfg.command,
+            &server_cfg.args,
+            effective_root,
+        ) {
             Ok(()) => {
-                eprintln!("[lsp] spawned '{language}' server: {} {}", server_cfg.command, server_cfg.args.join(" "));
+                eprintln!(
+                    "[lsp] spawned '{language}' server: {} {}",
+                    server_cfg.command,
+                    server_cfg.args.join(" ")
+                );
             }
             Err(e) => {
                 // spawn 失败不阻断:server 仍注册为 Disconnected,
@@ -133,9 +142,7 @@ pub fn set_global_mcp_manager(manager: Arc<Mutex<McpServerManager>>) {
 /// 本函数按 `server_name` 分组 discovery.tools,对每个成功发现的 server
 /// 调用 `register_server(Connected, tools, ...)`,对失败/不支持的 server
 /// 注册为 `Error` 状态并附带错误信息。在 `set_global_mcp_manager` 之后调用。
-pub fn populate_global_mcp_registry_from_discovery(
-    discovery: &runtime::McpToolDiscoveryReport,
-) {
+pub fn populate_global_mcp_registry_from_discovery(discovery: &runtime::McpToolDiscoveryReport) {
     populate_mcp_registry_from_discovery(global_mcp_registry(), discovery);
 }
 
@@ -345,6 +352,13 @@ fn global_cron_registry() -> &'static CronRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<CronRegistry> = OnceLock::new();
     REGISTRY.get_or_init(CronRegistry::new)
+}
+
+/// Global DAG store (G8.11) — manages DAG definitions and runs.
+fn global_dag_store() -> &'static dag::DagStore {
+    use std::sync::OnceLock;
+    static STORE: OnceLock<dag::DagStore> = OnceLock::new();
+    STORE.get_or_init(dag::DagStore::new)
 }
 
 fn global_task_registry() -> &'static TaskRegistry {
@@ -741,13 +755,11 @@ impl GlobalToolRegistry {
         }
         self.runtime_tools
             .iter()
+            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
             .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str()))
-            })
-            .filter(|tool| {
-                tool.domain_tags.iter().any(|tag| {
-                    normalized_tags.contains(&tag.to_ascii_lowercase())
-                })
+                tool.domain_tags
+                    .iter()
+                    .any(|tag| normalized_tags.contains(&tag.to_ascii_lowercase()))
             })
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
@@ -1517,6 +1529,33 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "dag_run",
+            description: "Start or continue a DAG (Directed Acyclic Graph) execution run. Use action: 'start' to begin, or action: 'continue' to resume.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "dag_id": { "type": "string" },
+                    "action": { "type": "string" }
+                },
+                "required": ["dag_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "dag_status",
+            description: "Report the current status of a DAG execution run, including per-node progress.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string" }
+                },
+                "required": ["run_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "LSP",
             description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics, definition, hover, format, completion).",
             input_schema: json!({
@@ -1812,6 +1851,8 @@ fn execute_tool_with_enforcer(
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
+        "dag_run" => from_value::<dag::DagRunInput>(input).and_then(run_dag_run),
+        "dag_status" => from_value::<dag::DagStatusInput>(input).and_then(run_dag_status),
         "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
         "ListMcpResources" => {
             from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
@@ -3364,6 +3405,100 @@ struct ConfigInput {
 #[serde(default)]
 struct EnterPlanModeInput {}
 
+#[allow(clippy::needless_pass_by_value)]
+fn run_dag_run(input: dag::DagRunInput) -> Result<String, String> {
+    let store = global_dag_store();
+    match input.action.as_deref().unwrap_or("start") {
+        "continue" => {
+            // Return existing runs for this DAG
+            let runs: Vec<_> = store
+                .list_runs()
+                .into_iter()
+                .filter(|r| r.dag_id == input.dag_id)
+                .collect();
+            if runs.is_empty() {
+                return Err(format!("no runs found for DAG '{}'", input.dag_id));
+            }
+            to_pretty_json(serde_json::json!({
+                "dag_id": input.dag_id,
+                "runs": runs,
+                "count": runs.len()
+            }))
+        }
+        _ => {
+            // Start a new run
+            let run = store.start_run(&input.dag_id)?;
+            to_pretty_json(serde_json::json!({
+                "dag_id": input.dag_id,
+                "run_id": run.id,
+                "status": format!("{:?}", run.status),
+                "node_count": run.node_statuses.len()
+            }))
+        }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_dag_status(input: dag::DagStatusInput) -> Result<String, String> {
+    let store = global_dag_store();
+    let run = store
+        .get_run(&input.run_id)
+        .ok_or_else(|| format!("DAG run not found: {}", input.run_id))?;
+    let dag = store.dag_for_run(&input.run_id);
+    let summary = dag
+        .as_ref()
+        .map(|d| {
+            let mut s = format!(
+                "DAG '{}' ({})
+",
+                d.name, d.id
+            );
+            s.push_str(&format!(
+                "Status: {:?}
+",
+                run.status
+            ));
+            s.push_str(&format!(
+                "Run ID: {}
+",
+                run.id
+            ));
+            s.push_str(
+                "
+Nodes:
+",
+            );
+            for node in &d.nodes {
+                let status = run
+                    .node_status(&node.id)
+                    .unwrap_or(runtime::multi_agent::dag::types::DagNodeStatus::Pending);
+                s.push_str(&format!(
+                    "  {:?} {} - {}
+",
+                    status, node.id, node.label
+                ));
+            }
+            s
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Run {} (DAG id: {})
+Status: {:?}",
+                run.id, run.dag_id, run.status
+            )
+        });
+
+    to_pretty_json(serde_json::json!({
+        "run_id": run.id,
+        "dag_id": run.dag_id,
+        "status": format!("{:?}", run.status),
+        "summary": summary,
+        "node_statuses": run.node_statuses.iter().map(|(id, s)| {
+            serde_json::json!({ "node_id": id, "status": format!("{:?}", s) })
+        }).collect::<Vec<_>>()
+    }))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ExitPlanModeInput {}
@@ -3942,7 +4077,10 @@ fn strip_script_style(html: &str) -> String {
             (Some(s), Some(y)) if s <= y => (pos + s, "script"),
             (Some(s), _) => (pos + s, "script"),
             (_, Some(y)) => (pos + y, "style"),
-            (None, None) => { result.push_str(&html[pos..]); break; }
+            (None, None) => {
+                result.push_str(&html[pos..]);
+                break;
+            }
         };
         let after_name = tag_start + 1 + tag_name.len();
         if after_name >= html.len() || !is_html_tag_boundary(html.as_bytes()[after_name]) {
@@ -3960,8 +4098,11 @@ fn strip_script_style(html: &str) -> String {
                 pos = abs_close + close_pat.len();
             }
         } else {
-            if let Some(gt) = html[tag_start..].find('>') { pos = tag_start + gt + 1; }
-            else { pos = tag_start + 1; }
+            if let Some(gt) = html[tag_start..].find('>') {
+                pos = tag_start + gt + 1;
+            } else {
+                pos = tag_start + 1;
+            }
         }
     }
     result
@@ -6061,7 +6202,8 @@ fn search_tool_specs(query: &str, max_results: usize, specs: &[SearchableToolSpe
                 "{name} {} {canonical_name} {tags_lower}",
                 spec.description.to_lowercase()
             );
-            let normalized_haystack = format!("{canonical_name} {normalized_description} {tags_str}");
+            let normalized_haystack =
+                format!("{canonical_name} {normalized_description} {tags_str}");
             if required.iter().any(|term| !haystack.contains(term)) {
                 return None;
             }
@@ -8287,9 +8429,12 @@ mod tests {
 
         // 验证不存在的标签会过滤掉所有工具
         let no_match = registry.search("+nonexistent-tag", 5, None, None);
-        let no_match_output = serde_json::to_value(no_match).expect("no-match search should serialize");
+        let no_match_output =
+            serde_json::to_value(no_match).expect("no-match search should serialize");
         assert!(
-            no_match_output["matches"].as_array().is_none_or(|arr| arr.is_empty()),
+            no_match_output["matches"]
+                .as_array()
+                .is_none_or(|arr| arr.is_empty()),
             "no tool should match a nonexistent tag"
         );
 
@@ -8314,7 +8459,10 @@ mod tests {
         let domain_index = registry.runtime_tool_domain_index();
         assert_eq!(domain_index.len(), 1);
         assert_eq!(domain_index[0].0, "mcp__demo__echo");
-        assert_eq!(domain_index[0].1, vec!["mcp".to_string(), "demo".to_string()]);
+        assert_eq!(
+            domain_index[0].1,
+            vec!["mcp".to_string(), "demo".to_string()]
+        );
     }
 
     #[test]
@@ -10369,12 +10517,10 @@ mod tests {
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
         // 用 Path::ends_with 而非 str::ends_with,以兼容 Windows 的 \ 分隔符。
-        assert!(std::path::Path::new(
-            globbed_output["filenames"][0]
-                .as_str()
-                .expect("filename")
-        )
-        .ends_with("nested/lib.rs"));
+        assert!(
+            std::path::Path::new(globbed_output["filenames"][0].as_str().expect("filename"))
+                .ends_with("nested/lib.rs")
+        );
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
