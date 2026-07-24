@@ -2809,7 +2809,10 @@ where
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
         let threshold = self.effective_compaction_threshold();
-        if self.usage_tracker.cumulative_usage().input_tokens < threshold {
+        // 使用 context_tokens() 而非 input_tokens：
+        // DeepSeek 风格的 API 返回 input_tokens=0，所有 prompt tokens 在 cache 字段中。
+        // context_tokens() 通过 max(input_tokens, cache_creation + cache_read) 统一处理。
+        if self.usage_tracker.cumulative_usage().context_tokens() < threshold {
             return None;
         }
 

@@ -216,6 +216,22 @@ impl TokenUsage {
             + self.cache_read_input_tokens
     }
 
+    /// 估算当前消耗的上下文窗口 Token 数（不含 output tokens）。
+    ///
+    /// 兼容两种 API 语义：
+    /// - Anthropic 风格：`input_tokens` 已包含 cache 子字段，
+    ///   `cache_creation` + `cache_read` 是其子集。
+    /// - DeepSeek 风格：`input_tokens` 恒为 0，
+    ///   所有 prompt tokens 都在 `cache_creation` + `cache_read` 中。
+    ///
+    /// 取 `input_tokens.max(cache_creation + cache_read)` 统一处理，
+    /// 确保 output tokens 不计入上下文窗口用量。
+    #[must_use]
+    pub fn context_tokens(self) -> u32 {
+        self.input_tokens
+            .max(self.cache_creation_input_tokens + self.cache_read_input_tokens)
+    }
+
     #[must_use]
     pub fn estimate_cost_usd(self) -> UsageCostEstimate {
         self.estimate_cost_usd_with_pricing(ModelPricing::default_sonnet_tier())
@@ -491,6 +507,35 @@ mod tests {
 
         // 未知模型仍返回 None
         assert!(pricing_for_model("some-unknown-model-v999").is_none());
+    }
+
+    #[test]
+    fn context_tokens_excludes_output_tokens() {
+        // Anthropic 风格：input_tokens 已包含 cache 子字段
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 200,
+        };
+        // output_tokens 不计入 context，cache 是 input 的子集，不应重复计数
+        assert_eq!(usage.context_tokens(), 1000);
+        // total_tokens 仍包含 output
+        assert_eq!(usage.total_tokens(), 2000);
+    }
+
+    #[test]
+    fn context_tokens_handles_deepseek_style() {
+        // DeepSeek 风格：input_tokens=0，cache 字段承载所有 prompt tokens
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 400,
+            cache_creation_input_tokens: 800,
+            cache_read_input_tokens: 200,
+        };
+        assert_eq!(usage.context_tokens(), 1000);
+        // total_tokens 包含 output
+        assert_eq!(usage.total_tokens(), 1400);
     }
 
     #[test]

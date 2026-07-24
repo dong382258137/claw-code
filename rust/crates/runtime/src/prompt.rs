@@ -397,13 +397,22 @@ impl SystemPromptBuilder {
         }
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
-        sections.push(get_actions_section());
         // 破局提示词段：元认知触发器，紧随 # Executing actions with care 之后，
         // 与 # Doing tasks 形成"如何做"→"何时停"的对照。
         sections.push(get_framework_switching_section());
+        // P1: 事务保护 — Framework Switching 协议的执行工具（rollback）。
+        // 紧接破局段之后，构成"意识到错误→执行回滚"的完整闭环。
+        sections.push(get_transaction_safety_section());
         sections.push(get_memory_verification_section());
         sections.push(get_context_recovery_section());
         sections.push(get_decision_log_section());
+        // ── P0+P1: 多 Agent 编排工具教程区（类 Decision Experience 模式）──
+        // P0: 编排四件套 + 三种模式 + DAG 工作流
+        sections.push(get_multi_agent_orchestration_section());
+        // P0: Agent 子智能体类型指南（Explore / Plan / Verification）
+        sections.push(get_agent_subagent_types_section());
+        // P1: Worker 生命周期（9 步状态机）
+        sections.push(get_worker_lifecycle_section());
         if let Some(memory) = &self.persistent_memory {
             sections.push(render_persistent_memory_section(memory));
         }
@@ -933,9 +942,8 @@ fn get_simple_doing_tasks_section() -> String {
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
-        "On Windows, prefer built-in tools (read_file, write_file, edit_file, replace_lines) for file I/O — they handle UTF-8 correctly. Only when using bash/PowerShell commands on files with non-ASCII content, set `$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8` first or pipe through `python -c \"import sys; sys.stdout.reconfigure(encoding='utf-8')\"`.".to_string(),
-        "Reconnaissance-before-execution: before running expensive commands (grep_search, find, recursive ls, cargo build, git diff on large repos), first do a lightweight check — e.g. list large files with `ls -la`, check directory size with `du -sh`, or count candidate files with `find . -name '*.rs' | wc -l`. Use `git diff --stat` before `git diff`, and restrict scope with glob/subdirectory. This prevents multi-minute hangs from scanning giant files or deeply nested directories.".to_string(),
-        "When using grep_search, ALWAYS specify a 'glob' parameter (e.g. '*.rs') to restrict file types. For broad searches, use `output_mode: \"files_with_matches\"` first to gauge scope, then narrow. Use '-n' and 'head_limit' to cap output. Avoid '-C' with high context values (> 3) on broad searches; prefer targeted '-A'/'-B' or re-read the matched file directly.".to_string(),
+        "On Windows, prefer built-in tools (read_file, write_file, edit_file, replace_lines) for file I/O — they handle UTF-8 correctly. Only when using bash/PowerShell commands on files with non-ASCII content, set `$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8` first or pipe through `python -c \\\"import sys; sys.stdout.reconfigure(encoding='utf-8')\\\"`.".to_string(),
+        "Reconnaissance-before-execution: before expensive commands (large grep, recursive ls, cargo build, git diff), do a lightweight check first (e.g. `ls -la`, `du -sh`, `git diff --stat`). Restrict scope with glob/subdirectory. This prevents multi-minute hangs.".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())
@@ -971,26 +979,44 @@ fn get_actions_section() -> String {
 fn get_framework_switching_section() -> String {
     "## Framework Switching (元认知触发)\n\
      \n\
-     Pre-commitment protocol (before settling on any non-trivial approach):\n\
-     - Generate 2+ candidate interpretations or solution approaches before committing.\n\
-     - Briefly state the trade-offs of each candidate (cost, risk, reversibility).\n\
-     - Only commit after explicit comparison — never commit to the first feasible option just because it is feasible.\n\
-     - This prevents the root cause of patch thinking: premature commitment to the first identified solution.\n\
+     Pre-commitment: generate 2+ solution approaches before committing; \
+     compare trade-offs (cost, risk, reversibility); only commit after \
+     explicit comparison. This prevents premature commitment to the first \
+     identified solution.\n\
      \n\
-     When you notice any of the following patterns, STOP and re-examine the problem definition before continuing:\n\
-     - **Patch thinking**: You have applied 2+ small fixes to the same area without resolving the root cause. Re-derive the solution from first principles instead of adding another patch.\n\
-     - **Over-engineering**: You are adding abstractions, compatibility shims, or config flags for a simple change. Prefer the minimum change that solves the actual problem.\n\
-     - **Symptom loop**: The same error recurs after a fix. The fix addressed a symptom, not the cause. Re-analyze the root cause before the next attempt.\n\
-     - **Wheel reinvention**: You are building something that may already exist in the codebase. Search for existing utilities/patterns first.\n\
-     - **Stubborn direction**: When you realize mid-thinking that your current approach may be wrong, explicitly acknowledge it and re-derive. Do not defend a flawed direction to save face — admitting a wrong turn mid-thinking is a sign of rigor, not weakness.\n\
+     STOP and re-examine when you notice:\n\
+     - **Patch thinking**: 2+ small fixes to the same area without resolving \
+     root cause. Re-derive from first principles.\n\
+     - **Over-engineering**: Adding abstractions or config flags for a simple \
+     change. Prefer the minimum change.\n\
+     - **Symptom loop**: Same error recurs. Fix addressed symptom, not cause.\n\
+     - **Wheel reinvention**: Building something that already exists. Search first.\n\
+     - **Stubborn direction**: Current approach feels wrong. Explicitly acknowledge \
+     and re-derive — admitting a wrong turn is rigor, not weakness.\n\
      \n\
-     Trigger protocol (when any pattern above is detected):\n\
-     1. State the current problem definition explicitly.\n\
-     2. State the current approach and why it might be wrong.\n\
-     3. Re-derive from first principles: what is the essential constraint? What does the architecture require?\n\
-     4. Only after re-deriving, decide whether to continue the current approach or switch.\n\
+     Trigger protocol:\n\
+     1. State the problem definition explicitly.\n\
+     2. State current approach and why it might be wrong.\n\
+     3. Re-derive from first principles: essential constraint? architectural requirement?\n\
+     4. Only then decide to continue or switch.\n\
      \n\
-     This is not about being conservative — it is about catching architectural bugs that patch-level thinking cannot reach."
+     This catches architectural bugs that patch-level thinking cannot reach."
+        .to_string()
+}
+fn get_transaction_safety_section() -> String {
+    "## Transaction Safety (事务保护)\n\
+     \n\
+     Each turn begins with an automatic file snapshot. If you realize your \
+     current approach is fundamentally wrong (see Framework Switching above):\n\
+     \n\
+     - Call `transaction_status` to see which files have been modified this turn.\n\
+     - Call `rollback_transaction` to revert ALL file changes made this turn \
+     in a single operation. This is faster and safer than manually reverting \
+     each file — especially when you have touched 5+ files.\n\
+     \n\
+     Use `rollback_transaction` as the execution arm of the Framework Switching \
+     trigger protocol. When you detect \"Stubborn direction\" or \"Patch thinking\", \
+     roll back first, then re-derive from first principles on a clean slate."
         .to_string()
 }
 
@@ -1024,17 +1050,13 @@ fn get_memory_verification_section() -> String {
      - If a memory conflicts with the current file contents, trust the file contents and update the memory."
         .to_string()
 }
-
 fn get_context_recovery_section() -> String {
     "## Context Recovery\n\
-     The system automatically compresses old conversation turns to fit context limits.\n\
-     When a tool result is summarized you will see a placeholder like:\n\
-     [Read output summarized: 1234 chars → preview... use recall_full with tool_use_id=call_xxx to retrieve full output...]\n\
-     \n\
-     - When you see a summarized placeholder and need the full content, call `recall_full` with the `tool_use_id` shown in the placeholder.\n\
-     - If you don't have the tool_use_id, call `recall_full` with `{\"list_only\": true}` to list all archived tool results.\n\
-     - Use `session_search` to search across all conversation history (including compacted messages). Results are truncated to 500 chars; if a result looks relevant but incomplete, refine your query.\n\
-     - After context compaction, earlier messages are replaced by a summary. Use `session_search` to find specific past discussions, decisions, or file references that may have been compacted."
+     The system automatically compresses old conversation turns to fit context limits. \
+     Summarized tool results show a `recall_full` hint with the `tool_use_id` — \
+     call that tool to retrieve the full original output. Use `session_search` to \
+     search across all conversation history (including compacted messages) for past \
+     discussions or decisions that may have been summarized away."
         .to_string()
 }
 
@@ -1059,10 +1081,110 @@ fn get_decision_log_section() -> String {
 }
 
 /// Render the persistent memory snapshot as a static system-prompt section.
+/// P0: 多 Agent 编排工具教程 — 教会模型正确选择 Fork/Teammate/Worktree 模式，
+/// 以及 dispatch_subagent / TeamCreate / dag_run 的组合使用方法。
 ///
-/// The section is only emitted when a [`PersistentMemory`] has been attached
-/// to the builder. The content comes from [`PersistentMemory::frozen_render`]
-/// so the prompt-cache prefix stays byte-stable across turns within a
+/// 放在 Decision Experience 段之后，与 Context Recovery / Decision Experience
+/// 共同构成"工具使用教程区"，三个段均位于 instruction tier 的尾部。
+fn get_multi_agent_orchestration_section() -> String {
+    "## Multi-Agent Orchestration (多智能体编排)\n\
+     \n\
+     You have access to a multi-agent system for decomposing and parallelizing \
+     complex tasks. The core tools are `dispatch_subagent`, `check_subagent`, \
+     `TeamCreate`, `dag_run`, and `dag_status`.\n\
+     \n\
+     ### Coordination Modes (mode parameter)\n\
+     \n\
+     Choose the mode based on file conflict risk:\n\
+     \n\
+     - **`fork`** (default): Shared working directory. Use for read-only parallel \
+     exploration (e.g. searching multiple code areas, fetching multiple URLs). \
+     Do NOT use when two agents may write to overlapping files — concurrent \
+     writes to the same file will conflict.\n\
+     \n\
+     - **`teammate`**: Shared working directory + shared `TaskRegistry` for \
+     inter-agent awareness. Use when agents need to coordinate (e.g. one \
+     writes a module, another writes its tests).\n\
+     \n\
+     - **`worktree`**: Each agent gets an isolated git worktree at \
+     `.claw/worktrees/{id}`. Use when agents may touch overlapping files — \
+     each works independently, eliminating conflicts. This is the SAFE \
+     default for any parallel write task.\n\
+     \n\
+     ### Tool Selection Guide\n\
+     \n\
+     | Tool | When to Use |\n\
+     |------|-------------|\n\
+     | `dispatch_subagent` | Async sub-task: returns `subagent_id` immediately; poll with `check_subagent` for completion and results. |\n\
+     | `check_subagent` | Poll a dispatched sub-agent; returns status (created/running/completed/failed/cancelled) + result if terminal. |\n\
+     | `TeamCreate` | Group multiple tasks into a named team for collective monitoring via `TaskList`. |\n\
+     | `dag_run` | Execute a dependency graph: call with `dag_id` + `action: \"start\"`. Nodes with satisfied `depends_on` run in parallel (up to 4). |\n\
+     | `dag_status` | Check progress of a DAG run: per-node status, overall completion. |\n\
+     \n\
+     ### DAG Workflow Pattern\n\
+     \n\
+     1. Analyze the task → decompose into independent and sequential work items.\n\
+     2. Call `TeamCreate` with individual task objects (each containing `prompt`).\n\
+     3. Call `dag_run` with `dag_id` + `action: \"start\"` — the scheduler \
+     automatically respects `depends_on` and runs ready nodes in parallel.\n\
+     4. Call `dag_status` with the returned `run_id` to monitor progress.\n\
+     5. If a node fails, its downstream dependents are automatically skipped.\n\
+     \n\
+     ### Parallelism Decision Tree\n\
+     \n\
+     ```\n\
+     Can sub-tasks edit the same files?\n\
+     ├─ Yes → Use worktree mode (or serialize them)\n\
+     └─ No → Are all tasks read-only?\n\
+              ├─ Yes → Use fork mode (lightweight, fast)\n\
+              └─ No, but they touch different files → Use fork mode\n\
+     ```\n\
+     \n\
+     **Default rule**: prefer `worktree` for any multi-agent write task unless \
+     you are certain the files do not overlap. A file conflict between two \
+     fork-mode agents can cause data loss."
+        .to_string()
+}
+
+/// P0: Agent 子智能体类型指南 — 教会模型 Explore / Plan / Verification 三种
+/// subagent_type 各自能使用的工具集和适用场景。
+fn get_agent_subagent_types_section() -> String {
+    "## Agent Subagent Types (子智能体类型)\n\
+     \n\
+     When using the `Agent` tool, the `subagent_type` parameter selects a \
+     pre-configured tool set. Choose the right type for the task:\n\
+     \n\
+     | subagent_type | Tools Available | Best For |\n\
+     |--------------|-----------------|----------|\n\
+     | `Explore` | `read_file`, `glob_search`, `grep_search`, `WebFetch`, `WebSearch`, `Skill`, `StructuredOutput` | Read-only code exploration, finding patterns, researching docs |\n\
+     | `Plan` | Explore tools + `TodoWrite`, `SendUserMessage` | Breaking down tasks, designing approaches, writing plans |\n\
+     | `Verification` | `bash`, `read_file`, `glob_search`, `grep_search`, `WebFetch`, `WebSearch`, `TodoWrite`, `SendUserMessage` | Running tests, verifying builds, checking correctness |\n\
+     \n\
+     **Note**: Only `Verification` has `bash` access — use it for any task that \
+     needs to run commands (build, test, lint). Use `Explore` when you just need \
+     to understand code without modifying it. Use `Plan` when you need structured \
+     planning output.\n\
+     \n\
+     The `Agent` tool is fire-and-forget: it launches and runs to completion \
+     autonomously. Use `dispatch_subagent` + `check_subagent` instead when you \
+     need to poll for intermediate status or chain multiple sub-tasks."
+        .to_string()
+}
+
+/// P1: Worker 生命周期 — 9 个 Worker* 工具组成的 boot→trust-gate→ready-handshake→
+/// prompt→complete 状态机。仅面向高级用例（coding worker 启动 + prompt 投递），
+/// 避免模型在常规任务中滥用。
+fn get_worker_lifecycle_section() -> String {
+    "## Worker Lifecycle (高级编码工作器)\n\
+     \n\
+     The 9 `Worker*` tools implement a full coding-worker lifecycle \
+     (WorkerCreate → WorkerObserve → WorkerResolveTrust → WorkerAwaitReady \
+     → WorkerSendPrompt → WorkerObserveCompletion, plus WorkerGet/Restart/\
+     Terminate). This is an advanced workflow for programmatic agent control. \
+     Most tasks should use `Agent` (fire-and-forget) or `dispatch_subagent` \
+     (async with polling) instead."
+        .to_string()
+}
 /// session even as new entries are written to disk.
 fn render_persistent_memory_section(memory: &PersistentMemory) -> String {
     memory.frozen_render()

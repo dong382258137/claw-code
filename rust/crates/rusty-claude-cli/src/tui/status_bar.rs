@@ -60,6 +60,9 @@ pub(crate) struct StatusBarState {
     pub tool_success_count: u32,
     /// 本会话累计失败工具调用次数。
     pub tool_error_count: u32,
+    /// 上一轮完成时的 context token 数（用于 idle 状态显示，
+    /// 避免 `cumulative.context_tokens()` 跨 turn 重复计数导致 100% 误报）。
+    pub last_ctx: u128,
 }
 
 impl StatusBarState {
@@ -72,6 +75,26 @@ impl StatusBarState {
         let cumulative = self.cumulative_usage.total_tokens() as u128;
         let turn = self.turn_usage.total_tokens() as u128;
         cumulative + turn
+    }
+
+    /// 上下文窗口实际消耗的 Token 数（不含 output tokens）。
+    ///
+    /// 与进度条分母 `context_window_tokens` 口径一致：
+    /// 只计 prompt 侧 token（input + cache），排除 completion 侧。
+    ///
+    /// **修正（2026-08）**：原实现返回 `cumulative.context_tokens() + turn.context_tokens()`，
+    /// 但每次 API 返回的 `context_tokens()` 已是该 turn 的**完整 prompt 量**（包含全部历史）。
+    /// 按 turn 累加会导致对话历史被重复计数 N 次，在 ~15 轮后误报 100%。
+    /// 修正：使用当前 turn 的 `context_tokens()` 作为上下文窗口占用量，
+    /// 空闲时使用上一轮完成时保存的快照。
+    pub(crate) fn context_tokens(&self) -> u128 {
+        if self.turn_in_progress {
+            // 流式输出中：turn_usage 有最新一轮 API 报告的实际 prompt 量
+            self.turn_usage.context_tokens() as u128
+        } else {
+            // 空闲态：复用上一轮完成时保存的实际 context 用量
+            self.last_ctx
+        }
     }
 
     pub(crate) fn reset_turn(&mut self) {
@@ -93,6 +116,8 @@ impl StatusBarState {
         self.cumulative_usage.cache_creation_input_tokens +=
             self.turn_usage.cache_creation_input_tokens;
         self.cumulative_usage.cache_read_input_tokens += self.turn_usage.cache_read_input_tokens;
+        // 保存本轮 context 用量到快照，用于 idle 状态的 ctx% 显示
+        self.last_ctx = self.turn_usage.context_tokens() as u128;
         self.turn_usage = TokenUsage::default();
         self.turn_elapsed_ms = 0;
     }
@@ -193,10 +218,12 @@ impl<'a> Widget for StatusBar<'a> {
         ]);
 
         // P4: Context usage % + progress bar
-        let total_tokens = self.state.total_tokens();
+        // 使用 context_tokens() 而非 total_tokens()：
+        // output tokens 不消耗上下文窗口，不计入进度条。
+        let context_tokens = self.state.context_tokens();
         let ctx_window = context_window_for_model(&self.state.model);
         let usage_pct = if ctx_window > 0 {
-            ((total_tokens as f64 / ctx_window as f64) * 100.0).min(100.0)
+            ((context_tokens as f64 / ctx_window as f64) * 100.0).min(100.0)
         } else {
             0.0
         };
