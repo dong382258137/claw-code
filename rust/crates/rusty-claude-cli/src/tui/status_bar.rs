@@ -89,12 +89,17 @@ impl StatusBarState {
     /// 空闲时使用上一轮完成时保存的快照。
     pub(crate) fn context_tokens(&self) -> u128 {
         if self.turn_in_progress {
-            // 流式输出中：turn_usage 有最新一轮 API 报告的实际 prompt 量
-            self.turn_usage.context_tokens() as u128
-        } else {
-            // 空闲态：复用上一轮完成时保存的实际 context 用量
-            self.last_ctx
+            // 流式输出中：以 API 返回的最新 prompt 量为准。
+            let turn_ctx = self.turn_usage.context_tokens() as u128;
+            if turn_ctx > 0 {
+                return turn_ctx;
+            }
+            // turn 刚开始、API 尚未返回 Usage 事件时，turn_usage 被
+            // reset_turn() 清零了。此时兜底用上一轮完成时的快照，
+            // 避免 CTX% 进度条短暂跳变到 0%，视觉上像"每发一次就重置"。
         }
+        // 空闲态，或 turn 刚开始尚无 API 数据时：复用上一轮快照。
+        self.last_ctx
     }
 
     pub(crate) fn reset_turn(&mut self) {
@@ -367,6 +372,35 @@ fn progress_bar_10(pct: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_tokens_falls_back_to_last_ctx_when_turn_starts() {
+        // 模拟 turn 刚开始但 API 尚未返回 Usage 事件：
+        // turn_in_progress=true 但 turn_usage 全 0，应兜底用 last_ctx。
+        let mut state = StatusBarState::default();
+        // 先完成一轮：模拟 API 返回了 50000 个 prompt tokens
+        state.reset_turn();
+        state.turn_usage.input_tokens = 50_000;
+        state.finish_turn();
+        assert_eq!(state.context_tokens(), 50_000);
+
+        // 新一轮开始（reset_turn 清零 turn_usage），API 尚未响应
+        state.reset_turn();
+        assert!(state.turn_in_progress);
+        assert_eq!(state.turn_usage.context_tokens(), 0);
+        // 关键断言：应该用 last_ctx（50_000），而不是 0
+        assert_eq!(state.context_tokens(), 50_000);
+    }
+
+    #[test]
+    fn context_tokens_uses_turn_usage_when_available() {
+        // 流式输出收到 API Usage 后，应以最新值为准。
+        let mut state = StatusBarState::default();
+        state.reset_turn();
+        state.last_ctx = 40_000;
+        state.turn_usage.input_tokens = 55_000; // API 返回新的 prompt tokens
+        assert_eq!(state.context_tokens(), 55_000);
+    }
 
     #[test]
     fn default_state_is_idle() {
