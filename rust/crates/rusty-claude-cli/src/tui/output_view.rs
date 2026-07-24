@@ -296,6 +296,43 @@ impl OutputBuffer {
         false
     }
 
+    /// 按工具名称匹配最近一个未完成的 ToolCard（用于 tool_display.rs
+    /// 无法获取 tool_use_id 时的兜底匹配）。
+    /// 返回 true 表示成功匹配并更新。
+    pub(crate) fn complete_tool_card_by_name(
+        &mut self,
+        tool_name: &str,
+        result: String,
+        is_error: bool,
+    ) -> bool {
+        let found_idx = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
+            match e {
+                OutputEntry::ToolCard {
+                    name, result: r, ..
+                } if name == tool_name && r.is_none() => Some(idx),
+                _ => None,
+            }
+        });
+        if let Some(idx) = found_idx {
+            self.text_total_bytes += result.len();
+            if let OutputEntry::ToolCard {
+                result: r,
+                is_error: e,
+                collapsed,
+                ..
+            } = &mut self.entries[idx]
+            {
+                *r = Some(result);
+                *e = is_error;
+                *collapsed = true;
+            }
+            self.recompute_snapshot_tail(idx);
+            self.trim_if_needed();
+            return true;
+        }
+        false
+    }
+
     /// 切换最近一个 ToolCard 的折叠/展开状态。
     /// 返回 true 表示成功切换。
     pub(crate) fn toggle_latest_tool_card(&mut self) -> bool {

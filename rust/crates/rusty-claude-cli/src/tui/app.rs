@@ -761,7 +761,7 @@ fn run_event_loop(
 
             // Output area — write-time rendered lines (zero display render cost)
             let output_lines = output_view.snapshot_lines();
-            let visible_height = main_area.height.saturating_sub(2) as usize;
+            let visible_height = main_area.height.saturating_sub(1) as usize; // Borders::TOP = 1 line
             let content_width = main_area.width as usize;
             let wrapped_lines_arc =
                 wrap_lines_for_width(&output_lines, content_width);
@@ -2346,6 +2346,17 @@ fn execute_turn(
                 if let Ok(mut cache) = tool_input_cache_for_closure.lock() {
                     cache.insert(id.clone(), input.clone());
                 }
+                // Skill 工具：直接从 ToolUse input 提取 skill 名称推入侧栏，
+                // 不依赖 ToolResult（ToolResult 的 id 可能为空，无法通过缓存查找）。
+                if name == "Skill" {
+                    let skill_name = serde_json::from_str::<serde_json::Value>(&input)
+                        .ok()
+                        .and_then(|v| v.get("skill").and_then(|s| s.as_str().map(String::from)))
+                        .unwrap_or_else(|| String::from("Skill"));
+                    if let Ok(mut sidebar_skills) = skill_history_for_sidebar.lock() {
+                        sidebar_skills.push((skill_name, false));
+                    }
+                }
                 // P1 重构：用结构化 ToolCard entry 替代纯文本 append。
                 // ToolCard 默认 collapsed=false（执行中），result 到达后
                 // 由 complete_tool_card 设置 result 并切换为 collapsed=true。
@@ -2372,24 +2383,39 @@ fn execute_turn(
                 if let Ok(mut sidebar_history) = tool_history_for_sidebar.lock() {
                     sidebar_history.push((name.clone(), is_error));
                 }
-                // Track skills separately: parse Skill tool input to extract skill name
-                if name == "Skill" {
-                    let skill_name = tool_input_cache_for_closure
-                        .lock()
-                        .ok()
-                        .and_then(|cache| {
-                            cache.get(&id).and_then(|input_json| {
-                                serde_json::from_str::<serde_json::Value>(input_json)
-                                    .ok()
-                                    .and_then(|v| {
-                                        v.get("skill")
-                                            .and_then(|s| s.as_str().map(String::from))
-                                    })
+                // Skill 工具：ToolUse 阶段已从 input JSON 提取 skill 名称推入侧栏。
+                // 这里仅更新错误标记（ToolResult 的 id 可能为空，无法通过缓存查找）。
+                if name == "Skill" && is_error {
+                    // 尝试从缓存提取 skill 名称（优先用缓存，失败时用工具名）
+                    let skill_name = if !id.is_empty() {
+                        tool_input_cache_for_closure
+                            .lock()
+                            .ok()
+                            .and_then(|cache| {
+                                cache.get(&id).and_then(|input_json| {
+                                    serde_json::from_str::<serde_json::Value>(input_json)
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("skill")
+                                                .and_then(|s| s.as_str().map(String::from))
+                                        })
+                                })
                             })
-                        })
-                        .unwrap_or_else(|| String::from("Skill"));
+                            .unwrap_or_else(|| String::from("Skill"))
+                    } else {
+                        String::from("Skill")
+                    };
                     if let Ok(mut sidebar_skills) = skill_history_for_sidebar.lock() {
-                        sidebar_skills.push((skill_name, is_error));
+                        // 标记最后一个匹配条目为错误
+                        if let Some(last) = sidebar_skills
+                            .iter_mut()
+                            .rev()
+                            .find(|(sn, _)| sn == &skill_name)
+                        {
+                            last.1 = true;
+                        } else {
+                            sidebar_skills.push((skill_name, true));
+                        }
                     }
                 }
                 // Accumulate tool success/error counts for stats display
@@ -2401,20 +2427,29 @@ fn execute_turn(
                         guard.tool_success_count += 1;
                     }
                 }
-                // P1 重构：用 complete_tool_card 更新已存在的 ToolCard entry，
-                // 设置 result 并切换为折叠状态。渲染时根据 collapsed 状态
-                // 动态生成可见行，支持 Tab 键交互式折叠/展开。
+                // P1 重构：用 complete_tool_card 更新已存在的 ToolCard entry。
+                // 工具执行器可能传入空 id（tool_display.rs 无 tool_use_id 上下文），
+                // 此时按名称匹配最近一个未完成的 ToolCard。
                 if let Ok(mut buf) = output_handle.lock() {
-                    buf.complete_tool_card(&id, output.clone(), is_error);
+                    if !id.is_empty() {
+                        buf.complete_tool_card(&id, output.clone(), is_error);
+                    } else {
+                        buf.complete_tool_card_by_name(&name, output.clone(), is_error);
+                    }
                 }
             }
             StatusEvent::Usage(usage) => {
                 if let Ok(mut guard) = status_handle.lock() {
-                    guard.turn_usage.input_tokens += usage.input_tokens;
-                    guard.turn_usage.output_tokens += usage.output_tokens;
-                    guard.turn_usage.cache_creation_input_tokens +=
-                        usage.cache_creation_input_tokens;
-                    guard.turn_usage.cache_read_input_tokens += usage.cache_read_input_tokens;
+                    // 使用赋值（=）而非累加（+=），因为每个 StatusEvent::Usage
+                    // 携带的是 API 返回的**累计快照**（全量，非增量）。
+                    // 原 += 实现导致 Anthropic stream normalizer 从
+                    // MessageDelta 重映射到 cache_creation_input_tokens
+                    // 的值被重复计数，CTX% 从 12% 跳到 24%（翻倍）。
+                    // 同理 output_tokens 也是累计值，用 = 避免成本虚高。
+                    guard.turn_usage.input_tokens = usage.input_tokens;
+                    guard.turn_usage.output_tokens = usage.output_tokens;
+                    guard.turn_usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                    guard.turn_usage.cache_read_input_tokens = usage.cache_read_input_tokens;
                 }
             }
             StatusEvent::StreamStart => {
@@ -2822,11 +2857,10 @@ mod tests {
                 }
                 StatusEvent::Usage(usage) => {
                     if let Ok(mut guard) = status_handle.lock() {
-                        guard.turn_usage.input_tokens += usage.input_tokens;
-                        guard.turn_usage.output_tokens += usage.output_tokens;
-                        guard.turn_usage.cache_creation_input_tokens +=
-                            usage.cache_creation_input_tokens;
-                        guard.turn_usage.cache_read_input_tokens += usage.cache_read_input_tokens;
+                        guard.turn_usage.input_tokens = usage.input_tokens;
+                        guard.turn_usage.output_tokens = usage.output_tokens;
+                        guard.turn_usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                        guard.turn_usage.cache_read_input_tokens = usage.cache_read_input_tokens;
                     }
                 }
                 StatusEvent::StreamStart => {
@@ -2897,7 +2931,9 @@ mod tests {
     }
 
     #[test]
-    fn emitter_usage_accumulates_into_turn_usage() {
+    fn emitter_usage_sets_turn_usage_to_latest_snapshot() {
+        // 语义变更：API 每次上报的是累计快照（全量），不是增量。
+        // 因此 handler 用赋值（=）而非累加（+=），最终值等于最后一次上报。
         let output_view = OutputView::new();
         let handle = output_view.shared_handle();
         let status = StatusBarState::shared();
@@ -2917,8 +2953,8 @@ mod tests {
         emitter(StatusEvent::Usage(usage2));
 
         let guard = status.lock().unwrap();
-        assert_eq!(guard.turn_usage.input_tokens, 300);
-        assert_eq!(guard.turn_usage.output_tokens, 125);
+        assert_eq!(guard.turn_usage.input_tokens, 200);
+        assert_eq!(guard.turn_usage.output_tokens, 75);
     }
 
     #[test]

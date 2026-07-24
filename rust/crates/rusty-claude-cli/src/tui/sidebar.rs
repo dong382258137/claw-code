@@ -101,7 +101,7 @@ pub(crate) fn render_sidebar(
     let remaining = inner
         .height
         .saturating_sub(y.saturating_sub(inner.y));
-    let reserve_for_bottom = 9u16; // 2 stat lines + 7 usage lines minimum
+    let reserve_for_bottom = 12u16; // 10 usage lines + 1 top border + 1 margin
     let tools_h = remaining.saturating_sub(reserve_for_bottom);
     if tools_h > 0 {
         take_section(&mut y, inner, tools_h)
