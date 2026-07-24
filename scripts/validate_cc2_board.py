@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""Validate the generated Claw Code 2.0 board coverage and schema."""
+﻿#!/usr/bin/env python3
+"""Validate the generated Claw Plus 2.0 board coverage and schema."""
 from __future__ import annotations
 
 import argparse

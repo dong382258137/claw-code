@@ -1,25 +1,34 @@
-__pycache__/
+﻿__pycache__/
 archive/
 .omx/
-.clawd-agents/
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
-# Claw Code local artifacts
+# Claw Plus local artifacts
 .claw/settings.local.json
 .claw/sessions/
 .claw/history.db
 .claw/plugins/
+.claw/decision_log.db*
+.claw/tool_results_archive.jsonl
 .clawhip/
+# Local sandbox runtime state (transient, per-machine)
+.sandbox-home/
 # TUI scratch TODOs (transient)
 .clawd-todos.json
-# Plugin local data (per-workspace)
+# Agent dispatch cache (transient)
+.clawd-agents/
+# Per-workspace claw artifacts (subdirectory mirrors of root entries above)
 **/.claw/plugins/
 **/.claw/history.db
+**/.claw/sessions/
+**/.claw/decision_log.db*
+**/.claw/tool_results_archive.jsonl
+**/.clawd-todos.json
+**/.clawd-agents/
 status-help.txt
 # Legacy Python port session scratch artifacts
 .port_sessions/
 # Build artifacts
 *.exe
 target/
-

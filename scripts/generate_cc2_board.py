@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""Generate the canonical Claw Code 2.0 execution board from frozen roadmap evidence."""
+﻿#!/usr/bin/env python3
+"""Generate the canonical Claw Plus 2.0 execution board from frozen roadmap evidence."""
 from __future__ import annotations
 
 import argparse
@@ -356,7 +356,7 @@ def summarize_counts(items: list[dict[str, Any]], key: str) -> dict[str, int]:
 
 def render_markdown(board: dict[str, Any]) -> str:
     lines = [
-        "# Claw Code 2.0 Canonical Board",
+        "# Claw Plus 2.0 Canonical Board",
         "",
         f"Generated: `{board['generated_at']}`",
         f"Roadmap SHA-256 prefix: `{board['sources']['roadmap']['sha256_prefix']}`",
