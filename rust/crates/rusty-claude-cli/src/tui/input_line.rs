@@ -49,6 +49,19 @@ pub(crate) enum InputAction {
 }
 
 /// Single-line input state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CsiState {
+    /// Normal mode: inserting characters into buffer.
+    Normal,
+    /// Just saw \\x1b, waiting for `[` or `]` to enter CSI/OSC consumption.
+    ExpectingCsi,
+    /// Inside a CSI sequence (\\x1b[...), consuming all chars until terminator.
+    ConsumingCsi,
+    /// Inside an OSC sequence (\\x1b]...), consuming all chars until ST or BEL.
+    ConsumingOsc,
+}
+
+/// Single-line input state.
 #[derive(Debug, Clone)]
 pub(crate) struct InputLine {
     buffer: String,
@@ -59,6 +72,9 @@ pub(crate) struct InputLine {
     /// 只有用户主动输入新的 `/` 才解锁。
     /// false=正常状态；true=刚 accept 完，编辑不应触发菜单。
     menu_locked: bool,
+    /// CSI 消费状态机：防止逐字符路径（无 bracketed paste 终端）中
+    /// ANSI 转义序列字符污染 input buffer。见 handle_key 中的消费逻辑。
+    csi_state: CsiState,
 }
 
 impl InputLine {
@@ -69,6 +85,7 @@ impl InputLine {
             cursor: 0,
             menu_open: false,
             menu_locked: false,
+            csi_state: CsiState::Normal,
         }
     }
 
@@ -113,6 +130,7 @@ impl InputLine {
         self.cursor = 0;
         self.menu_open = false;
         self.menu_locked = false;
+        self.csi_state = CsiState::Normal;
     }
 
     /// Bug L1 修复：恢复 buffer 内容（用于 Submit 后发现不能提交时回填）。
@@ -125,6 +143,7 @@ impl InputLine {
         // 不恢复 menu_open 状态：用户刚按 Enter 是要提交，不是要开菜单。
         self.menu_open = false;
         self.menu_locked = false;
+        self.csi_state = CsiState::Normal;
     }
 
     /// Sync the slash menu's query with the current buffer (if menu is open).
@@ -253,17 +272,82 @@ impl InputLine {
             }
             return InputAction::Continue;
         }
-
         if let Some(ch) = c {
-            debug_assert!(
-                self.buffer.is_char_boundary(self.cursor),
-                "cursor {} is not a char boundary in buffer of len {}",
-                self.cursor,
-                self.buffer.len()
-            );
-            self.buffer.insert(self.cursor, ch);
-            self.cursor += ch.len_utf8();
-            self.update_menu_state();
+            // BUG 修复：逐字符路径的 ANSI 转义序列过滤（状态机方案）。
+            //
+            // 当终端不支持 bracketed paste 时，粘贴的文本（含 ANSI 转义序列
+            // 如 \x1b[2;3H）会作为普通 KeyCode::Char 事件逐字符投递。
+            // 单纯过滤 \x1b 不够——CSI 序列的其余字符（[, 数字, ;, H 等）
+            // 是普通可打印字符，仍会进入 buffer 造成污染和渲染崩溃。
+            //
+            // 这里用 CsiState 状态机追踪 ANSI 序列的消费：
+            //   Normal → \x1b → ExpectingCsi → [ → ConsumingCsi → H → Normal
+            //                                → ] → ConsumingOsc → BEL → Normal
+            //
+            // insert_paste 路径（Event::Paste / Ctrl+V）已有
+            // strip_ansi_and_control 过滤，此修复补上逐字符路径的缺口。
+            match self.csi_state {
+                CsiState::ConsumingCsi => {
+                    // 在 CSI 序列中：消费所有参数字符直到终止字母或 ~。
+                    // 参数包括数字、分号、问号、空格、!、#、$、" 等中间字符。
+                    if ch.is_ascii_alphabetic() || ch == '~' {
+                        self.csi_state = CsiState::Normal; // 序列结束
+                    }
+                    // 中间字符或终止符：都不插入 buffer
+                }
+                CsiState::ConsumingOsc => {
+                    // 在 OSC 序列中：\\x1b]...\\a 或 \\x1b]...\\x1b\\
+                    if ch == '\x07' {
+                        self.csi_state = CsiState::Normal; // BEL 终止
+                    } else if ch == '\x1b' {
+                        self.csi_state = CsiState::ExpectingCsi; // 等 \\ 确认 ST
+                    }
+                    // 其他字符：消费，不插入 buffer
+                }
+                CsiState::ExpectingCsi => {
+                    // 刚看到 \\x1b，判断是 CSI（[）、OSC（]）还是孤立的 ESC
+                    if ch == '[' {
+                        self.csi_state = CsiState::ConsumingCsi;
+                    } else if ch == ']' {
+                        self.csi_state = CsiState::ConsumingOsc;
+                    } else {
+                        // 孤立的 \\x1b（如误触 Esc 键），回到 Normal
+                        self.csi_state = CsiState::Normal;
+                        // 如果这个非 [ / ] 字符是正常字符，需要插入 buffer
+                        // 但通常 ESC 来自键盘而后续字符来自粘贴，重叠概率极低
+                        // 保守处理：不插入，避免把 CSI 参数字符误插入
+                    }
+                }
+                CsiState::Normal => {
+                    // 正常模式：如果是 \\x1b（ESC 字符），进入状态机
+                    if ch == '\x1b' {
+                        self.csi_state = CsiState::ExpectingCsi;
+                    } else {
+                        // 过滤其他 C0 控制字符（0x00-0x1F）和 DEL（0x7F）
+                        let cu = ch as u32;
+                        if cu < 0x20 || cu == 0x7F {
+                            // \\n / \\t / \\r 在 crossterm 中映射为 KeyCode::Enter / Tab，
+                            // 理论上不会走 Some(ch) 分支，防御性保留
+                            if ch == '\n' || ch == '\t' || ch == '\r' {
+                                self.buffer.insert(self.cursor, ch);
+                                self.cursor += ch.len_utf8();
+                                self.update_menu_state();
+                            }
+                            // 其他 C0 字符：吐掉
+                        } else {
+                            debug_assert!(
+                                self.buffer.is_char_boundary(self.cursor),
+                                "cursor {} is not a char boundary in buffer of len {}",
+                                self.cursor,
+                                self.buffer.len()
+                            );
+                            self.buffer.insert(self.cursor, ch);
+                            self.cursor += ch.len_utf8();
+                            self.update_menu_state();
+                        }
+                    }
+                }
+            }
             return InputAction::Continue;
         }
 
@@ -856,5 +940,96 @@ mod tests {
         let mut line = InputLine::new();
         line.insert_paste("\x1b[32mline1\x1b[0m\n\x1b[31mline2\x1b[0m");
         assert_eq!(line.buffer(), "line1\nline2");
+    }
+
+    // ── C0 控制字符过滤测试（handle_key 逐字符路径） ──
+
+    #[test]
+    fn handle_key_filters_esc_character_from_buffer() {
+        // ESC 字符 (U+001B) 不应进入 buffer。
+        // 模拟逐字符粘贴含 ANSI 转义序列的文本（无 bracketed paste 终端）。
+        let mut line = InputLine::new();
+        // 粘贴 "\x1b[2;3Hhello" 逐字符
+        for ch in "\x1b[2;3Hhello".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        // ESC + CSI 序列应被过滤，只剩 "hello"
+        assert_eq!(line.buffer(), "hello");
+    }
+
+    #[test]
+    fn handle_key_filters_c0_control_chars() {
+        // NUL (0x00), BEL (0x07), BS (0x08), FF (0x0C) 等 C0 字符应被过滤
+        let mut line = InputLine::new();
+        for ch in "a\x00b\x07c\x08d\x0ce".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        assert_eq!(line.buffer(), "abcde");
+    }
+
+    #[test]
+    fn handle_key_filters_del_character() {
+        // DEL (0x7F) 不应进入 buffer
+        let mut line = InputLine::new();
+        for ch in "x\x7fy".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        assert_eq!(line.buffer(), "xy");
+    }
+
+    #[test]
+    fn handle_key_normal_characters_still_work() {
+        // 正常字符（含中文、emoji）不受 C0 过滤影响
+        let mut line = InputLine::new();
+        for ch in "你好🦀世界".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        assert_eq!(line.buffer(), "你好🦀世界");
+        assert_eq!(line.cursor_char_offset(), 5);
+    }
+
+    #[test]
+    fn handle_key_backspace_works_after_c0_filtering() {
+        // Backspace 删除应在 C0 过滤后仍正常工作
+        let mut line = InputLine::new();
+        for ch in "ab\x1b[31mc".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        // 期望: "abc" (ANSI 序列被过滤)
+        assert_eq!(line.buffer(), "abc");
+        // Backspace 删掉 'c'
+        line.handle_key(None, "Backspace");
+        assert_eq!(line.buffer(), "ab");
+    }
+
+    #[test]
+    fn handle_key_simulated_ansi_paste_from_terminal() {
+        // 真实场景模拟：从终端窗口复制含 CUP 光标定位序列 + SGR 颜色码的文本
+        // "\x1b[2;3HWorkspace 版\x1b[2;15H本为 `2026.7.0`"
+        let mut line = InputLine::new();
+        let dirty = "\x1b[2;3HWorkspace 版\x1b[2;15H本为 `2026.7.0`";
+        for ch in dirty.chars() {
+            line.handle_key(Some(ch), "");
+        }
+        // CSI 序列的全部字符（\x1b, [, 数字, ;, H）被过滤，只剩可见文本
+        assert_eq!(line.buffer(), "Workspace 版本为 `2026.7.0`");
+    }
+
+    #[test]
+    fn handle_key_cursor_stays_correct_after_c0_filter() {
+        // 过滤控制字符后光标位置应正确（跳过被滤掉的字节）。
+        // 注意：\x1b 后的第一个非 [ / ] 字符也会被状态机消费（防止 CSI
+        // 参数字符泄漏），因此 "a\x1bc" 实际留在 buffer 的只有 "a"。
+        let mut line = InputLine::new();
+        for ch in "a\x1bc".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        // \x1b 进入 ExpectingCsi，c 被消费（非 [ 非 ] → 回到 Normal 但不插入）
+        assert_eq!(line.buffer(), "a");
+        assert_eq!(line.cursor(), 1);
+        // 再插入正常字符，应正确追加
+        line.handle_key(Some('d'), "");
+        assert_eq!(line.buffer(), "ad");
+        assert_eq!(line.cursor(), 2);
     }
 }
