@@ -19,9 +19,9 @@ use runtime::TokenUsage;
 /// Snapshot of everything the status bar displays.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StatusBarState {
-    /// Resolved model name (e.g. `claude-opus-4-6`).
+    /// Resolved model name (e.g. `claude-opus-4-6`). 显示在底栏。
     pub model: String,
-    /// Provider label (e.g. `Anthropic`, `OpenAI`, `xAI`).
+    /// Provider label (e.g. `Anthropic`, `OpenAI`, `xAI`). 保留字段但不再在 TUI 显示。
     pub provider: String,
     /// Short cwd path (e.g. `~/projects/claw`).
     pub cwd: String,
@@ -44,19 +44,14 @@ pub(crate) struct StatusBarState {
     /// Poor-mode active flag.
     pub poor_mode: bool,
     /// 当前 reasoning effort 设置（None=默认，Some("low"/"medium"/"high")=已设置）。
-    /// 由 /effort 命令或 --reasoning-effort CLI flag 设置，侧栏会显示。
     pub reasoning_effort: Option<String>,
-    /// 累计 AI 思考轮次（每个 turn +1）。由 sync_status_from_cli_inner
-    /// 从 `LiveCli::turns_snapshot()` 同步。
+    /// 累计 AI 思考轮次（每个 turn +1）。
     pub turn_count: u32,
     /// 标记当前 turn 是否已开始（用于多轮工具调用中避免重复 reset）。
-    /// 由 reset_turn 置 true，finish_turn 置 false。
     pub turn_in_progress: bool,
 }
 
 impl StatusBarState {
-    /// Create a shared, thread-safe handle suitable for passing to
-    /// `StatusEmitter` callbacks and the TUI render loop.
     pub(crate) fn shared() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self::default()))
     }
@@ -68,17 +63,8 @@ impl StatusBarState {
         cumulative + turn
     }
 
-    /// Reset turn-scoped fields at the start of each turn.
-    ///
-    /// **缓存命中率修复**：多轮工具调用中，每个 agent loop 迭代都会 emit
-    /// `StreamStart`。如果每次都 reset，会清空前几轮迭代累积的 cache 数据，
-    /// 导致缓存命中率计算失效（hit/miss 被清零）。现在用 `turn_in_progress`
-    /// 标志确保只在本 turn 首次 StreamStart 时 reset，后续 StreamStart 只
-    /// 刷新 streaming 状态。
     pub(crate) fn reset_turn(&mut self) {
         if self.turn_in_progress {
-            // 本 turn 已开始（多轮工具调用的后续迭代），只刷新 streaming 状态，
-            // 不清空 turn_usage，保留前几轮累积的 cache 数据。
             self.streaming = true;
             return;
         }
@@ -88,11 +74,9 @@ impl StatusBarState {
         self.turn_in_progress = true;
     }
 
-    /// Mark the turn as finished.
     pub(crate) fn finish_turn(&mut self) {
         self.streaming = false;
         self.turn_in_progress = false;
-        // Fold turn delta into cumulative.
         self.cumulative_usage.input_tokens += self.turn_usage.input_tokens;
         self.cumulative_usage.output_tokens += self.turn_usage.output_tokens;
         self.cumulative_usage.cache_creation_input_tokens +=
@@ -106,7 +90,7 @@ impl StatusBarState {
 /// Ratatui widget that renders the persistent status bar.
 ///
 /// Renders a single line at the bottom of the terminal showing:
-/// `│ model via provider │ 📁 cwd │ 🌿 branch │ 🔢 tokens │ 💰 cost │ 🎯 goal │`
+/// `│ 🤖 model │ 📁 cwd │ 💰 cost │ ctx: 45% ████▌░░░░░ │ ⏳ 5s │ vX.Y.Z │`
 pub(crate) struct StatusBar<'a> {
     pub state: &'a StatusBarState,
 }
@@ -114,34 +98,88 @@ pub(crate) struct StatusBar<'a> {
 impl<'a> Widget for StatusBar<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let style_dim = Style::default().fg(Color::DarkGray);
-        let style_version = Style::default().fg(Color::DarkGray);
+        let style_model = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let style_cost = Style::default().fg(Color::Green);
         let style_streaming = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
+        let style_version = Style::default().fg(Color::DarkGray);
 
-        // Build sections in priority order. Each section is a Vec<Span>.
-        // We add sections until we exceed the available width, then stop.
-        //
-        // 去重策略：底栏只显示侧栏没有的信息（cwd、版本号）+ 执行状态指示（streaming timer）。
-        // model/provider/tokens/cost/branch/goal/poor mode 已在侧栏详细显示，此处不再重复。
         let width = area.width as usize;
-
         let mut sections: Vec<Vec<Span>> = Vec::new();
 
-        // P1: Cwd (侧栏不显示)
+        // P1: Model name (从侧栏移到底栏)
+        let model_short = shorten_model_name(&self.state.model);
         sections.push(vec![
             Span::styled("│ ", style_dim),
-            Span::styled("📁 ", style_dim),
-            Span::styled(&self.state.cwd, style_dim),
+            Span::styled("🤖 ", style_dim),
+            Span::styled(model_short, style_model),
         ]);
 
-        // P2: Version (侧栏不显示，新增)
+        // P2: Cwd
+        let cwd_short = crate::shorten_cwd_for_statusbar(
+            &std::path::PathBuf::from(&self.state.cwd),
+        );
         sections.push(vec![
             Span::styled(" │ ", style_dim),
-            Span::styled(format!("v{}", crate::VERSION), style_version),
+            Span::styled("📁 ", style_dim),
+            Span::styled(cwd_short, style_dim),
         ]);
 
-        // P3: Streaming timer (执行状态指示，侧栏虽有但底栏需要快速判断是否在执行)
+        // P3: Cost (从侧栏移到底栏)
+        let pricing = runtime::pricing_for_model(&self.state.model);
+        let total_usage = TokenUsage {
+            input_tokens: (self.state.cumulative_usage.input_tokens as u128)
+                .min(u32::MAX as u128) as u32,
+            output_tokens: (self.state.cumulative_usage.output_tokens as u128)
+                .min(u32::MAX as u128) as u32,
+            cache_creation_input_tokens: self.state.cumulative_usage.cache_creation_input_tokens,
+            cache_read_input_tokens: self.state.cumulative_usage.cache_read_input_tokens,
+        };
+        let cost_usd = pricing.map_or_else(
+            || total_usage.estimate_cost_usd().total_cost_usd(),
+            |p| total_usage.estimate_cost_usd_with_pricing(p).total_cost_usd(),
+        );
+        let cost = runtime::format_cost_localized(cost_usd, crate::locale::is_cny_region());
+        sections.push(vec![
+            Span::styled(" │ ", style_dim),
+            Span::styled("💰 ", style_dim),
+            Span::styled(cost, style_cost),
+        ]);
+
+        // P4: Context usage % + progress bar
+        let total_tokens = self.state.total_tokens();
+        let ctx_window = context_window_for_model(&self.state.model);
+        let usage_pct = if ctx_window > 0 {
+            ((total_tokens as f64 / ctx_window as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        let bar = progress_bar_10(usage_pct);
+        let pct_style = if usage_pct < 50.0 {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else if usage_pct < 80.0 {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD)
+        };
+        sections.push(vec![
+            Span::styled(" │ ", style_dim),
+            Span::styled("ctx:", style_dim),
+            Span::styled(format!("{usage_pct:.0}%"), pct_style),
+            Span::raw(" "),
+            Span::raw(bar),
+        ]);
+
+        // P5: Streaming timer
         if self.state.streaming {
             let elapsed_s = self.state.turn_elapsed_ms / 1000;
             sections.push(vec![
@@ -150,26 +188,27 @@ impl<'a> Widget for StatusBar<'a> {
             ]);
         }
 
+        // P6: Version
+        sections.push(vec![
+            Span::styled(" │ ", style_dim),
+            Span::styled(format!("v{}", crate::VERSION), style_version),
+        ]);
+
         // Flatten sections up to available width
         let mut spans: Vec<Span> = Vec::new();
         let mut used: usize = 0;
         for section in &sections {
-            // P2-3 修复：用 UnicodeWidthStr 计算视觉宽度，而不是字节长度。
-            // 之前用 .len() 会高估含中文/emoji 的 section 实际占用宽度，
-            // 导致低优先级 section（cwd / git branch / streaming timer /
-            // goal badge / poor mode）在窄终端被错误跳过。
             let section_width: usize = section
                 .iter()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                 .sum();
             if used + section_width > width && !spans.is_empty() {
-                break; // skip low-priority sections that don't fit
+                break;
             }
             used += section_width;
             spans.extend(section.iter().cloned());
         }
 
-        // Closing delimiter
         spans.push(Span::styled(" │", style_dim));
 
         let line = Line::from(spans);
@@ -177,14 +216,86 @@ impl<'a> Widget for StatusBar<'a> {
     }
 }
 
-/// Cost estimate helper — delegates to runtime's pricing logic.
-/// For TUI display only; the authoritative cost calc lives in `format_status_bar`.
-fn estimate_cost(usage: &TokenUsage, model: &str) -> f64 {
-    let pricing = runtime::pricing_for_model(model);
-    pricing.map_or_else(
-        || usage.estimate_cost_usd().total_cost_usd(),
-        |p| usage.estimate_cost_usd_with_pricing(p).total_cost_usd(),
-    )
+/// 缩短模型名显示：去掉 provider 前缀和版本后缀，只保留核心型号。
+fn shorten_model_name(model: &str) -> String {
+    // 提取核心模型名: claude-sonnet-4-20250514 → sonnet
+    // 或用更短的别名
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("claude-opus") || lower.contains("opus") {
+        "opus".to_string()
+    } else if lower.contains("claude-sonnet") || lower.contains("sonnet") {
+        "sonnet".to_string()
+    } else if lower.contains("claude-haiku") || lower.contains("haiku") {
+        "haiku".to_string()
+    } else if lower.contains("gpt-5") || lower.contains("gpt5") {
+        "gpt-5".to_string()
+    } else if lower.contains("gpt-4o-mini") || lower.contains("gpt4o-mini") {
+        "gpt-4o-mini".to_string()
+    } else if lower.contains("gpt-4o") || lower.contains("gpt4o") {
+        "gpt-4o".to_string()
+    } else if lower.contains("grok-3") || lower.contains("grok3") {
+        "grok-3".to_string()
+    } else if lower.contains("grok-2") || lower.contains("grok2") {
+        "grok-2".to_string()
+    } else if lower.contains("deepseek-reasoner") || lower.contains("deepseek-r1") || lower.contains("deepseek-v4-pro") {
+        "ds-v4-pro".to_string()
+    } else if lower.contains("deepseek-chat") || lower.contains("deepseek-v3") || lower.contains("deepseek-v4-flash") {
+        "ds-v4-flash".to_string()
+    } else if lower.contains("qwen-max") {
+        "qwen-max".to_string()
+    } else if lower.contains("qwen-plus") {
+        "qwen-plus".to_string()
+    } else if lower.contains("qwen-turbo") {
+        "qwen-turbo".to_string()
+    } else {
+        // 未知模型：截断到40字符
+        if model.len() > 40 {
+            format!("{}…", &model[..39])
+        } else {
+            model.to_string()
+        }
+    }
+}
+
+/// 根据模型名估算上下文窗口大小（tokens）。
+fn context_window_for_model(model: &str) -> u128 {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("haiku") || lower.contains("sonnet") || lower.contains("opus") {
+        200_000
+    } else if lower.contains("gpt") || lower.contains("grok") {
+        128_000
+    } else if lower.contains("deepseek") || lower.contains("qwen") {
+        128_000
+    } else {
+        // fallback: 200K for unknown models
+        200_000
+    }
+}
+
+/// 10格 Unicode 进度条: █████▌░░░░
+/// 颜色由调用方设置（根据百分比），此处只返回纯文本字符。
+fn progress_bar_10(pct: f64) -> String {
+    let filled = (pct / 10.0).clamp(0.0, 10.0);
+    let full_blocks = filled.floor() as usize;
+    let remainder = filled - filled.floor();
+    let partial_char = if remainder >= 0.75 {
+        "▊"
+    } else if remainder >= 0.5 {
+        "▌"
+    } else if remainder >= 0.25 {
+        "▎"
+    } else {
+        ""
+    };
+    let empty = if partial_char.is_empty() {
+        10 - full_blocks
+    } else {
+        9 - full_blocks
+    };
+    let mut s = "█".repeat(full_blocks);
+    s.push_str(partial_char);
+    s.push_str(&"░".repeat(empty));
+    s
 }
 
 #[cfg(test)]
@@ -228,21 +339,48 @@ mod tests {
     }
 
     #[test]
+    fn shorten_model_name_detects_families() {
+        assert_eq!(shorten_model_name("claude-opus-4-6-20251014"), "opus");
+        assert_eq!(shorten_model_name("claude-sonnet-4-20250514"), "sonnet");
+        assert_eq!(shorten_model_name("claude-haiku-4-5-20251001"), "haiku");
+        assert_eq!(shorten_model_name("gpt-5-2025-08-07"), "gpt-5");
+        assert_eq!(shorten_model_name("gpt-4o-2024-08-06"), "gpt-4o");
+        assert_eq!(shorten_model_name("deepseek-chat"), "ds-v4-flash");
+        assert_eq!(shorten_model_name("deepseek-reasoner"), "ds-v4-pro");
+    }
+
+    #[test]
+    fn context_window_returns_correct_size() {
+        assert_eq!(context_window_for_model("claude-sonnet-4"), 200_000);
+        assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
+        assert_eq!(context_window_for_model("gpt-5"), 128_000);
+        assert_eq!(context_window_for_model("deepseek-chat"), 128_000);
+        assert_eq!(context_window_for_model("unknown-model"), 200_000);
+    }
+
+    #[test]
+    fn progress_bar_10_correct() {
+        assert_eq!(progress_bar_10(0.0), "░░░░░░░░░░");
+        assert_eq!(progress_bar_10(100.0), "██████████");
+        assert_eq!(progress_bar_10(45.0), "████▌░░░░░");
+        assert_eq!(progress_bar_10(72.0), "███████░░░");
+        assert_eq!(progress_bar_10(78.0), "███████▊░░");
+    }
+
+    #[test]
     fn status_bar_renders_without_panic() {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
 
         let state = StatusBarState {
             model: "claude-opus-4-6".to_string(),
-            provider: "Anthropic".to_string(),
             cwd: "~/claw".to_string(),
-            git_branch: "main".to_string(),
             cumulative_usage: TokenUsage {
-                input_tokens: 1000,
-                output_tokens: 500,
-                ..Default::default()
+                input_tokens: 40_000,
+                output_tokens: 10_000,
+                cache_creation_input_tokens: 5_000,
+                cache_read_input_tokens: 45_000,
             },
-            goal_badge: "🎯 goal".to_string(),
             ..Default::default()
         };
 
@@ -251,12 +389,9 @@ mod tests {
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
 
-        // Verify the buffer contains the model name somewhere
-        let content = buf.content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(content.contains("claude-opus-4-6"));
-        assert!(content.contains("Anthropic"));
-        assert!(content.contains("~/claw"));
-        assert!(content.contains("main"));
+        let content: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("opus"), "should contain model: {content}");
+        assert!(content.contains("~/claw"), "should contain cwd: {content}");
     }
 
     #[test]
@@ -276,8 +411,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
 
-        let content = buf.content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(content.contains("⏱"));
-        assert!(content.contains("5s"));
+        let content: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("5s"), "should show elapsed: {content}");
     }
 }

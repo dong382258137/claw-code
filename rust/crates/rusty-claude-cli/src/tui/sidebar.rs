@@ -1,9 +1,9 @@
 //! Right-hand sidebar widget for the TUI split layout.
 //!
 //! Displays contextual information alongside the main output area:
-//! - Session metadata (id, model, provider, branch, cwd)
+//! - Session metadata (reasoning effort, branch, session id, permissions, goal, turns)
 //! - Current-turn tool call history (name + success/error marker)
-//! - Live token usage breakdown (input/output/cache) and estimated cost
+//! - Live token usage breakdown (input/output/cache hit/cache miss/cache hit rate)
 //! - Streaming timer
 //!
 //! All data is read from a shared `StatusBarState` snapshot plus an
@@ -43,12 +43,10 @@ pub(crate) fn render_sidebar(
     block.render(area, buf);
 
     // Split inner area into three stacked sections: Session, Tools, Usage.
-    // Use fixed-ish proportions: usage section gets priority since it has
-    // the most variable content.
+    // session 删除模型+提供商行(-2), usage 扩展缓存拆3行(+1), 成本移到底栏
     let total_h = inner.height;
-    // Reserve 9 lines for session (新增"轮次"行), 8 for usage, rest for tools.
-    let session_h = total_h.min(9);
-    let usage_h = total_h.saturating_sub(session_h).min(8);
+    let session_h = total_h.min(7);
+    let usage_h = total_h.saturating_sub(session_h).min(9);
     let tools_h = total_h.saturating_sub(session_h + usage_h);
 
     let mut y = inner.y;
@@ -95,7 +93,6 @@ pub(crate) fn render_sidebar(
 
 fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     // 思考强度显示：None 显示"默认"，Some 显示具体值（low/medium/high）。
-    // 用颜色区分：默认=灰色，low=蓝色，medium=黄色，high=红色（强度越高越醒目）。
     let effort_label = state.reasoning_effort.as_deref().unwrap_or("默认");
     let effort_color = match effort_label {
         "low" => Color::Blue,
@@ -103,15 +100,8 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
         "high" => Color::Red,
         _ => Color::DarkGray,
     };
+    // model/provider 已移到底栏，此处不再显示。
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("模型 ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&state.model),
-        ]),
-        Line::from(vec![
-            Span::styled("提供商 ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&state.provider),
-        ]),
         Line::from(vec![
             Span::styled("思考强度 ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -138,7 +128,6 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
             Span::raw(&state.permission_mode),
         ]),
     ];
-    // 目标行：仅在设置了 goal 时显示，避免无 goal 时长期显示"（无）"造成噪音。
     if !state.goal_badge.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("目标 ", Style::default().fg(Color::DarkGray)),
@@ -149,7 +138,6 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
         Span::styled("经济模式 ", Style::default().fg(Color::DarkGray)),
         Span::raw(if state.poor_mode { "启用" } else { "关闭" }),
     ]));
-    // 新增：累计思考轮次统计（每个 turn +1）
     lines.push(Line::from(vec![
         Span::styled("轮次 ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -169,8 +157,6 @@ fn render_tools_section(
     tool_history: &ToolHistory,
     tools_scroll: Option<usize>,
 ) {
-    // 标题：显示总数 + 滚动位置提示。
-    // 跟随模式：`工具 (N)`；手动模式：`工具 (N) ↑k` 表示上方还有 k 条。
     let total = tool_history.len();
     let scroll_up_hidden = tools_scroll.unwrap_or(0);
     let title = if scroll_up_hidden > 0 {
@@ -196,14 +182,8 @@ fn render_tools_section(
         return;
     }
 
-    // 自适应滚动：根据 inner.height 截取要显示的窗口。
-    // - visible = 可见行数（受窗口大小影响，自适应）
-    // - 跟随模式（tools_scroll=None 或 0）：显示最后 visible 条（最新工具调用）
-    // - 手动模式（tools_scroll=Some(n)）：窗口从 `total - visible - n` 开始
-    //   n 越大越往上看更早的记录
     let visible = inner.height as usize;
     let total = tool_history.len();
-
     let (start, _) = if total <= visible {
         (0, total)
     } else {
@@ -227,7 +207,6 @@ fn render_tools_section(
         })
         .collect();
 
-    // 如果下方还有更早记录被隐藏，最后一行加提示（仅手动滚动到底时显示）
     let list = List::new(items);
     list.render(inner, buf);
 }
@@ -236,15 +215,26 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     let turn = &state.turn_usage;
     let cum = &state.cumulative_usage;
 
-    // BUG 5 fix: use the authoritative pricing table (runtime::pricing_for_model)
-    // instead of hardcoded Sonnet-class rates. Previously the sidebar showed
-    // wrong costs for Opus / Haiku / third-party providers. The status bar
-    // (status_bar.rs) already did this; the sidebar now matches.
-    let pricing = runtime::pricing_for_model(&state.model);
-    let cost_usd =
-        estimated_cost(cum, pricing.as_ref()) + estimated_cost(turn, pricing.as_ref());
-    // 根据系统 locale 决定显示 CNY（中国大陆）还是 USD（其他地区）
-    let cost = runtime::format_cost_localized(cost_usd, crate::locale::is_cny_region());
+    // 缓存统计 (命中= cache_read, 未命中= cache_creation)
+    let hit_total = (cum.cache_read_input_tokens as u64) + (turn.cache_read_input_tokens as u64);
+    let miss_total =
+        (cum.cache_creation_input_tokens as u64) + (turn.cache_creation_input_tokens as u64);
+    let cache_sum = hit_total + miss_total;
+    let hit_rate = if cache_sum > 0 {
+        format!("{:.1}%", (hit_total as f64 / cache_sum as f64) * 100.0)
+    } else {
+        "—".to_string()
+    };
+    let hit_rate_color = if cache_sum == 0 {
+        Color::DarkGray
+    } else if hit_total as f64 / cache_sum as f64 >= 0.85 {
+        Color::Green
+    } else if hit_total as f64 / cache_sum as f64 >= 0.60 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
     let timer = if state.streaming {
         format_elapsed_ms(state.turn_elapsed_ms)
     } else {
@@ -285,20 +275,16 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
             Span::raw(format_in_out(cum, turn, false)),
         ]),
         Line::from(vec![
-            Span::styled("  缓存  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!(
-                "+{} / 读{} ",
-                cum.cache_creation_input_tokens + turn.cache_creation_input_tokens,
-                cum.cache_read_input_tokens + turn.cache_read_input_tokens,
-            )),
-            Span::styled(
-                format_cache_hit_rate(cum, turn),
-                cache_hit_rate_style(cum, turn),
-            ),
+            Span::styled("命中缓存", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{} tokens", hit_total)),
         ]),
         Line::from(vec![
-            Span::styled("成本    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(cost, Style::default().fg(Color::Green)),
+            Span::styled("未命中  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{} tokens", miss_total)),
+        ]),
+        Line::from(vec![
+            Span::styled("命中率  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&hit_rate, Style::default().fg(hit_rate_color).add_modifier(Modifier::BOLD)),
         ]),
     ];
     let block = Block::default().borders(Borders::TOP);
@@ -308,7 +294,11 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     p.render(inner, buf);
 }
 
-fn format_in_out(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage, is_input: bool) -> String {
+fn format_in_out(
+    cum: &runtime::TokenUsage,
+    turn: &runtime::TokenUsage,
+    is_input: bool,
+) -> String {
     let c = if is_input {
         cum.input_tokens
     } else {
@@ -324,59 +314,6 @@ fn format_in_out(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage, is_input
     } else {
         format!("{c}")
     }
-}
-
-/// 计算缓存命中率文本 (含括号),如 "(95.2%)"。
-/// 命中率 = hit / (hit + miss) * 100。
-/// 当 hit + miss = 0 (尚无缓存数据) 时返回 "(—)"。
-fn format_cache_hit_rate(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage) -> String {
-    let hit = (cum.cache_read_input_tokens as u64) + (turn.cache_read_input_tokens as u64);
-    let miss = (cum.cache_creation_input_tokens as u64) + (turn.cache_creation_input_tokens as u64);
-    let total = hit + miss;
-    if total == 0 {
-        return "(—)".to_string();
-    }
-    let rate = (hit as f64 / total as f64) * 100.0;
-    format!("({rate:.1}%)")
-}
-
-/// 命中率颜色:>=85% 绿色,60-85% 黄色,<60% 红色,无数据灰色。
-/// DeepSeek 文档建议命中率 >=85% 为良好(对应 input 价格的 1/20 计费)。
-fn cache_hit_rate_style(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage) -> Style {
-    let hit = (cum.cache_read_input_tokens as u64) + (turn.cache_read_input_tokens as u64);
-    let miss = (cum.cache_creation_input_tokens as u64) + (turn.cache_creation_input_tokens as u64);
-    let total = hit + miss;
-    if total == 0 {
-        return Style::default().fg(Color::DarkGray);
-    }
-    let rate = (hit as f64 / total as f64) * 100.0;
-    if rate >= 85.0 {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if rate >= 60.0 {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::Red)
-    }
-}
-
-/// Cost estimate (USD) for a single usage delta, using the model's pricing
-/// table when available. Falls back to `ModelPricing::default_sonnet_tier`
-/// when `pricing_for_model` returns None (unknown model).
-///
-/// BUG 5 fix: previously this function hard-coded $3/M input, $15/M output,
-/// $3.75/M cache write, $0.30/M cache read (Sonnet prices), producing wrong
-/// costs for Opus / Haiku / third-party providers. It now accepts an optional
-/// `ModelPricing` and delegates to `TokenUsage::estimate_cost_usd_with_pricing`
-/// — the same path used by `status_bar.rs::estimate_cost` and the JSON output
-/// in `run_prompt_json`.
-fn estimated_cost(usage: &runtime::TokenUsage, pricing: Option<&runtime::ModelPricing>) -> f64 {
-    match pricing {
-        Some(p) => usage.estimate_cost_usd_with_pricing(*p),
-        None => usage.estimate_cost_usd(),
-    }
-    .total_cost_usd()
 }
 
 fn format_elapsed_ms(ms: u64) -> String {
@@ -435,7 +372,6 @@ mod tests {
             &history,
             None,
         );
-        // Just verifying no panic; content checks would require inspecting buf.
     }
 
     #[test]
@@ -506,7 +442,6 @@ mod tests {
             width: 10,
             height: 3,
         });
-        // Should not panic even when there's no room to render all sections.
         let history: ToolHistory = vec![("Edit".to_string(), false)];
         render_sidebar(
             Rect {
@@ -530,141 +465,5 @@ mod tests {
         assert_eq!(format_elapsed_ms(59_999), "59s");
         assert_eq!(format_elapsed_ms(60_000), "1m00s");
         assert_eq!(format_elapsed_ms(125_000), "2m05s");
-    }
-
-    #[test]
-    fn estimated_cost_scales_with_usage() {
-        // BUG 5 fix: estimated_cost now takes an optional ModelPricing.
-        // Without pricing (None) it falls back to TokenUsage::estimate_cost_usd
-        // which uses the runtime crate's default rates ($15/$75/$18.75/$1.5
-        // per M tokens — see runtime/src/usage.rs DEFAULT_*_COST_PER_MILLION).
-        let usage = runtime::TokenUsage {
-            input_tokens: 1_000_000,
-            output_tokens: 1_000_000,
-            cache_creation_input_tokens: 1_000_000,
-            cache_read_input_tokens: 1_000_000,
-        };
-        let cost = estimated_cost(&usage, None);
-        // 15 + 75 + 18.75 + 1.5 = 110.25
-        assert!((cost - 110.25).abs() < 0.001);
-    }
-
-    #[test]
-    fn estimated_cost_uses_provided_pricing() {
-        // BUG 5 regression test: when pricing is provided, cost must reflect
-        // those rates (not the runtime crate's defaults).
-        let custom_pricing = runtime::ModelPricing {
-            input_cost_per_million: 3.0,
-            output_cost_per_million: 15.0,
-            cache_creation_cost_per_million: 3.75,
-            cache_read_cost_per_million: 0.30,
-        };
-        let usage = runtime::TokenUsage {
-            input_tokens: 1_000_000,
-            output_tokens: 1_000_000,
-            cache_creation_input_tokens: 1_000_000,
-            cache_read_input_tokens: 1_000_000,
-        };
-        let cost_with_custom = estimated_cost(&usage, Some(&custom_pricing));
-        // With custom pricing: 3 + 15 + 3.75 + 0.30 = 22.05
-        assert!((cost_with_custom - 22.05).abs() < 0.001);
-        // And it must differ from the default-rate cost (110.25).
-        let cost_with_none = estimated_cost(&usage, None);
-        assert!((cost_with_none - 110.25).abs() < 0.001);
-        assert!((cost_with_custom - cost_with_none).abs() > 0.001);
-    }
-
-    #[test]
-    fn format_in_output_shows_delta_only_when_nonzero() {
-        let cum = runtime::TokenUsage {
-            input_tokens: 1000,
-            output_tokens: 500,
-            ..Default::default()
-        };
-        let turn_zero = runtime::TokenUsage::default();
-        let turn_nonzero = runtime::TokenUsage {
-            input_tokens: 200,
-            output_tokens: 100,
-            ..Default::default()
-        };
-        assert_eq!(format_in_out(&cum, &turn_zero, true), "1000");
-        assert_eq!(format_in_out(&cum, &turn_nonzero, true), "1000 (+200)");
-        assert_eq!(format_in_out(&cum, &turn_zero, false), "500");
-        assert_eq!(format_in_out(&cum, &turn_nonzero, false), "500 (+100)");
-    }
-
-    #[test]
-    fn format_cache_hit_rate_handles_zero_total() {
-        // 无缓存数据时显示 "—"
-        let cum = runtime::TokenUsage::default();
-        let turn = runtime::TokenUsage::default();
-        assert_eq!(format_cache_hit_rate(&cum, &turn), "(—)");
-    }
-
-    #[test]
-    fn format_cache_hit_rate_computes_percentage() {
-        // DeepSeek 场景:hit=49500, miss=500 → 命中率 99.0%
-        let cum = runtime::TokenUsage {
-            input_tokens: 0,
-            cache_creation_input_tokens: 500, // miss
-            cache_read_input_tokens: 49500,   // hit
-            ..Default::default()
-        };
-        let turn = runtime::TokenUsage::default();
-        assert_eq!(format_cache_hit_rate(&cum, &turn), "(99.0%)");
-    }
-
-    #[test]
-    fn format_cache_hit_rate_sums_cumulative_and_turn() {
-        // 累计 + 当前 turn 共同计算
-        let cum = runtime::TokenUsage {
-            cache_creation_input_tokens: 1000, // miss
-            cache_read_input_tokens: 9000,     // hit
-            ..Default::default()
-        };
-        let turn = runtime::TokenUsage {
-            cache_creation_input_tokens: 500, // miss
-            cache_read_input_tokens: 500,     // hit
-            ..Default::default()
-        };
-        // 命中率 = (9000 + 500) / (1000 + 9000 + 500 + 500) = 9500 / 11000 ≈ 86.4%
-        assert_eq!(format_cache_hit_rate(&cum, &turn), "(86.4%)");
-    }
-
-    #[test]
-    fn cache_hit_rate_style_returns_correct_color() {
-        use ratatui::style::Color;
-
-        // 无数据 → 灰色
-        let empty = runtime::TokenUsage::default();
-        let style = cache_hit_rate_style(&empty, &empty);
-        assert_eq!(style.fg, Some(Color::DarkGray));
-
-        // 高命中率 (>=85%) → 绿色 + 粗体
-        let high_hit = runtime::TokenUsage {
-            cache_creation_input_tokens: 100,
-            cache_read_input_tokens: 900,
-            ..Default::default()
-        };
-        let style = cache_hit_rate_style(&high_hit, &empty);
-        assert_eq!(style.fg, Some(Color::Green));
-
-        // 中等命中率 (60-85%) → 黄色
-        let mid_hit = runtime::TokenUsage {
-            cache_creation_input_tokens: 400,
-            cache_read_input_tokens: 600,
-            ..Default::default()
-        };
-        let style = cache_hit_rate_style(&mid_hit, &empty);
-        assert_eq!(style.fg, Some(Color::Yellow));
-
-        // 低命中率 (<60%) → 红色
-        let low_hit = runtime::TokenUsage {
-            cache_creation_input_tokens: 800,
-            cache_read_input_tokens: 200,
-            ..Default::default()
-        };
-        let style = cache_hit_rate_style(&low_hit, &empty);
-        assert_eq!(style.fg, Some(Color::Red));
     }
 }

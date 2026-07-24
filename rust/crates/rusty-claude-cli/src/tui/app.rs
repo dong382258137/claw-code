@@ -396,7 +396,7 @@ fn run_event_loop(
     // Sidebar: visible by default on wide terminals (>=100 cols), toggleable
     // via F2 / Ctrl+B. Holds a shared tool-history mirror so the sidebar
     // can show live tool-call progress during a streaming turn.
-    let mut sidebar_visible: bool = terminal.size().map(|s| s.width >= 100).unwrap_or(false);
+    let mut sidebar_visible: bool = terminal.size().map(|s| s.width >= 88).unwrap_or(false);
     let tool_history_shared: Arc<Mutex<ToolHistory>> = Arc::new(Mutex::new(Vec::new()));
 
     // 侧栏工具历史滚动状态：None=跟随底部（显示最新），Some(n)=从底部往上偏移 n 行。
@@ -525,6 +525,9 @@ fn run_event_loop(
                     turn_rx = None;
                     turn_start = None;
                     current_abort_signal = None;
+                    // P0 修复：turn 完成后强制重绘，确保最终内容（如错误信息、
+                    // TextDelta 尾部等）在 streaming 标志清零后仍能渲染到屏幕。
+                    needs_redraw = true;
                     if let Some(ref cli) = cli_holder {
                         sync_status_from_cli(&status_state, cli);
                     }
@@ -668,7 +671,8 @@ fn run_event_loop(
             let elapsed_changed = current_elapsed_s != last_drawn_elapsed_s;
             let streaming_flag_changed = current_streaming != last_drawn_streaming;
             let should_draw = needs_redraw
-                || (streaming && (content_changed || elapsed_changed || streaming_flag_changed));
+                || content_changed
+                || (streaming && (elapsed_changed || streaming_flag_changed));
             if should_draw {
                 needs_redraw = false;
                 last_drawn_version = current_version;
@@ -720,8 +724,8 @@ fn run_event_loop(
                 let cols = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Min(40),    // output
-                        Constraint::Length(36),  // sidebar
+                        Constraint::Min(50),    // output (增加以补偿侧栏变窄)
+                        Constraint::Length(24),  // sidebar (从36缩小1/3→24)
                     ])
                     .split(outer[0]);
                 // Render sidebar using the latest state + tool history.
@@ -2652,6 +2656,7 @@ fn sync_status_from_cli_inner(guard: &mut StatusBarState, cli: &LiveCli) {
         guard.goal_badge.clear();
     }
     guard.poor_mode = runtime::poor_mode::is_active();
+    // provider 不再在 TUI 显示（已从侧栏和底栏移除），但仍更新字段以备非 TUI 路径使用
     guard.provider =
         crate::provider_label(api::detect_provider_kind(cli.model_snapshot())).to_string();
     guard.reasoning_effort = cli.reasoning_effort();

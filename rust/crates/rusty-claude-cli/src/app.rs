@@ -351,9 +351,11 @@ pub(crate) fn run_repl(
     // `docs/harness-engineering-optimization-plan.md` Step 2.1。
     // P3-1:settings.json `planMode: true` 也能启用(在 LiveCli::new 内部处理),
     // CLI flag 优先级更高(此处覆盖)。
+    // workspace_root 对所有工具路径都需要(notebook_update/recall_full/subagent 等),
+    // 不应仅绑定在 plan_mode 内。
+    cli.runtime.set_workspace_root(std::env::current_dir()?);
     if enable_plan_mode {
         cli.runtime.set_plan_mode_enabled(true);
-        cli.runtime.set_workspace_root(std::env::current_dir()?);
     }
     // P1-1:PolicyEngine 策略引擎 flag。
     // 当前 lane_completion 模块已实现 PolicyEngine 调用(tools/lane_completion.rs),
@@ -676,9 +678,10 @@ impl LiveCli {
                 }
                 // P3-1:从 settings.json `planMode` 启用 Plan/Execute/Review。
                 // CLI flag `--enable-plan-mode` 会在 run_repl 中覆盖(优先级更高)。
+                // workspace_root 对所有工具路径都需要,不应仅绑定在 plan_mode 内。
+                runtime.set_workspace_root(cwd.clone());
                 if config.feature_config().plan_mode() == Some(true) {
                     runtime.set_plan_mode_enabled(true);
-                    runtime.set_workspace_root(cwd.clone());
                 }
                 // SP4.2-B3:从配置初始化 LSP servers(best-effort,失败不阻断启动)
                 let _ = init_lsp_from_config(&config, &cwd);
@@ -1193,11 +1196,21 @@ impl LiveCli {
                 false
             }
             SlashCommand::Init => {
-                run_init(CliOutputFormat::Text, false)?;
+                let cwd = env::current_dir()?;
+                let report = initialize_repo(&cwd, false)?;
+                let message = report.render();
+                if !self.tui_println(&message) {
+                    println!("{message}");
+                }
                 false
             }
             SlashCommand::InitForce => {
-                run_init(CliOutputFormat::Text, true)?;
+                let cwd = env::current_dir()?;
+                let report = initialize_repo(&cwd, true)?;
+                let message = report.render();
+                if !self.tui_println(&message) {
+                    println!("{message}");
+                }
                 false
             }
             SlashCommand::Diff => {
@@ -1670,7 +1683,10 @@ impl LiveCli {
         session_path: Option<String>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(session_ref) = session_path else {
-            println!("{}", render_resume_usage());
+            let usage = render_resume_usage();
+            if !self.tui_println(&usage) {
+                println!("{usage}");
+            }
             return Ok(false);
         };
 
@@ -1693,14 +1709,14 @@ impl LiveCli {
             id: session_id,
             path: handle.path,
         };
-        println!(
-            "{}",
-            format_resume_report(
-                &self.session.path.display().to_string(),
-                message_count,
-                self.runtime.usage().turns(),
-            )
+        let report = format_resume_report(
+            &self.session.path.display().to_string(),
+            message_count,
+            self.runtime.usage().turns(),
         );
+        if !self.tui_println(&report) {
+            println!("{report}");
+        }
         Ok(true)
     }
 
