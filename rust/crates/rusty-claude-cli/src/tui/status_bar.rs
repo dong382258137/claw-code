@@ -49,6 +49,16 @@ pub(crate) struct StatusBarState {
     pub turn_count: u32,
     /// 标记当前 turn 是否已开始（用于多轮工具调用中避免重复 reset）。
     pub turn_in_progress: bool,
+    /// Git 工作区摘要（e.g. "clean", "±3", "±3 a:1 b:2"）。空表示未获取。
+    pub git_status: String,
+    /// 会话启动时间戳（毫秒，TUI 启动时设一次）。
+    pub session_start_ms: u64,
+    /// 本会话累计消息数（user + assistant）。
+    pub message_count: u32,
+    /// 本会话累计成功工具调用次数。
+    pub tool_success_count: u32,
+    /// 本会话累计失败工具调用次数。
+    pub tool_error_count: u32,
 }
 
 impl StatusBarState {
@@ -116,6 +126,34 @@ impl<'a> Widget for StatusBar<'a> {
             Span::styled("│ ", style_dim),
             Span::styled("🤖 ", style_dim),
             Span::styled(model_short, style_model),
+        ]);
+
+        // P1.1: Reasoning effort icon (从侧栏移到底栏，仅非默认时显示)
+        if let Some(ref effort) = self.state.reasoning_effort {
+            let (icon, effort_style) = match effort.as_str() {
+                "low" => ("🧠L", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                "medium" => ("🧠M", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                "high" => ("🧠H", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                _ => ("🧠", style_model),
+            };
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled(icon, effort_style),
+            ]);
+        }
+
+        // P1.2: Poor-mode indicator (从侧栏移到底栏，仅启用时显示)
+        if self.state.poor_mode {
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled("🪙", style_cost),
+            ]);
+        }
+
+        // P1.3: Turn count (从侧栏移到底栏)
+        sections.push(vec![
+            Span::styled(" │ ", style_dim),
+            Span::styled(format!("#{}", self.state.turn_count), style_dim),
         ]);
 
         // P2: Cwd
@@ -375,6 +413,7 @@ mod tests {
         let state = StatusBarState {
             model: "claude-opus-4-6".to_string(),
             cwd: "~/claw".to_string(),
+            turn_count: 12,
             cumulative_usage: TokenUsage {
                 input_tokens: 40_000,
                 output_tokens: 10_000,
@@ -392,6 +431,7 @@ mod tests {
         let content: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(content.contains("opus"), "should contain model: {content}");
         assert!(content.contains("~/claw"), "should contain cwd: {content}");
+        assert!(content.contains("#12"), "should contain turn count: {content}");
     }
 
     #[test]

@@ -1,14 +1,15 @@
 //! Right-hand sidebar widget for the TUI split layout.
 //!
 //! Displays contextual information alongside the main output area:
-//! - Session metadata (reasoning effort, branch, session id, permissions, goal, turns)
+//! - Session metadata (branch, session id, permissions, goal, git status)
+//! - Current-turn skill invocations
 //! - Current-turn tool call history (name + success/error marker)
+//! - Session statistics (message count, success rate, duration)
 //! - Live token usage breakdown (input/output/cache hit/cache miss/cache hit rate)
 //! - Streaming timer
 //!
-//! All data is read from a shared `StatusBarState` snapshot plus an
-//! optional `ToolHistory` (Vec of (tool_name, is_error)) captured by the
-//! TUI event loop during the current turn.
+//! All data is read from a shared `StatusBarState` snapshot plus
+//! `ToolHistory` and `SkillHistory` captured by the TUI event loop.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
@@ -21,7 +22,34 @@ use crate::tui::status_bar::StatusBarState;
 /// Snapshot of tool calls for the sidebar.
 pub(crate) type ToolHistory = Vec<(String, bool)>;
 
-/// Render the sidebar into `area` using `state` + `tool_history`.
+/// Snapshot of skill invocations for the sidebar (skill_name, is_error).
+pub(crate) type SkillHistory = Vec<(String, bool)>;
+
+// ---- layout helpers ----
+
+/// Section allocation: carve an area of `height` rows from `inner`, returning
+/// the sub-area and updating `y`. Returns None when height == 0.
+fn take_section(y: &mut u16, inner: Rect, height: u16) -> Option<Rect> {
+    if height == 0 {
+        return None;
+    }
+    let h = height.min(inner.height.saturating_sub(y.saturating_sub(inner.y)));
+    if h == 0 {
+        return None;
+    }
+    let area = Rect {
+        x: inner.x,
+        y: *y,
+        width: inner.width,
+        height: h,
+    };
+    *y = y.saturating_add(h);
+    Some(area)
+}
+
+// ---- main render entry ----
+
+/// Render the sidebar into `area` using `state` + `tool_history` + `skill_history`.
 ///
 /// `tools_scroll` 控制工具历史段的滚动：
 /// - `None`：跟随底部（显示最新 N 条，N = 可见行数）
@@ -31,6 +59,7 @@ pub(crate) fn render_sidebar(
     buf: &mut Buffer,
     state: &StatusBarState,
     tool_history: &ToolHistory,
+    skill_history: &SkillHistory,
     tools_scroll: Option<usize>,
 ) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
@@ -42,75 +71,58 @@ pub(crate) fn render_sidebar(
     let inner = block.inner(area);
     block.render(area, buf);
 
-    // Split inner area into three stacked sections: Session, Tools, Usage.
-    // session 删除模型+提供商行(-2), usage 扩展缓存拆3行(+1), 成本移到底栏
     let total_h = inner.height;
-    let session_h = total_h.min(7);
-    let usage_h = total_h.saturating_sub(session_h).min(9);
-    let tools_h = total_h.saturating_sub(session_h + usage_h);
-
     let mut y = inner.y;
-    render_session_section(
-        Rect {
-            x: inner.x,
-            y,
-            width: inner.width,
-            height: session_h,
-        },
-        buf,
-        state,
-    );
-    y = y.saturating_add(session_h);
 
-    if tools_h > 0 {
-        render_tools_section(
-            Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: tools_h,
-            },
-            buf,
-            tool_history,
-            tools_scroll,
-        );
-        y = y.saturating_add(tools_h);
+    // Section layout (top→bottom):
+    //  Session: 5-6 lines (branch, session, permissions, goal?, git)
+    //  Skills:  dynamic (if any skill invocations)
+    //  Tools:   dynamic
+    //  Stats+Usage: remaining → 2 stat lines + usage details
+
+    let session_h = total_h.min(6);
+    take_section(&mut y, inner, session_h).map(|a| render_session_section(a, buf, state));
+
+    // Skills section: show only when there are skill invocations
+    if !skill_history.is_empty() {
+        let skills_visible = skill_history.len().min(6) as u16 + 2; // +2 for border
+        let remaining = inner
+            .height
+            .saturating_sub(y.saturating_sub(inner.y));
+        if remaining >= 4 {
+            // Need at least 4 rows (1 header + 1 item + 2 borders)
+            let skills_h = skills_visible.min(remaining);
+            take_section(&mut y, inner, skills_h)
+                .map(|a| render_skills_section(a, buf, skill_history));
+        }
     }
 
-    if usage_h > 0 {
-        render_usage_section(
-            Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: usage_h,
-            },
-            buf,
-            state,
-        );
+    // Tools section: carve remaining space, leaving at least 9 rows for stats+usage
+    let remaining = inner
+        .height
+        .saturating_sub(y.saturating_sub(inner.y));
+    let reserve_for_bottom = 9u16; // 2 stat lines + 7 usage lines minimum
+    let tools_h = remaining.saturating_sub(reserve_for_bottom);
+    if tools_h > 0 {
+        take_section(&mut y, inner, tools_h)
+            .map(|a| render_tools_section(a, buf, tool_history, tools_scroll));
+    }
+
+    // Stats + Usage section: remaining space
+    let remaining = inner
+        .height
+        .saturating_sub(y.saturating_sub(inner.y));
+    if remaining > 0 {
+        take_section(&mut y, inner, remaining)
+            .map(|a| render_usage_section(a, buf, state));
     }
 }
 
+// ---- session section ----
+
 fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
-    // 思考强度显示：None 显示"默认"，Some 显示具体值（low/medium/high）。
-    let effort_label = state.reasoning_effort.as_deref().unwrap_or("默认");
-    let effort_color = match effort_label {
-        "low" => Color::Blue,
-        "medium" => Color::Yellow,
-        "high" => Color::Red,
-        _ => Color::DarkGray,
-    };
-    // model/provider 已移到底栏，此处不再显示。
+    // 思考强度、经济模式、轮次 已移到底栏，此处不再显示。
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("思考强度 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                effort_label,
-                Style::default()
-                    .fg(effort_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
         Line::from(vec![
             Span::styled("分支 ", Style::default().fg(Color::DarkGray)),
             Span::raw(if state.git_branch.is_empty() {
@@ -134,22 +146,72 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
             Span::raw(&state.goal_badge),
         ]));
     }
+    // Git 工作区状态
+    let (git_label, git_color) = if state.git_status.is_empty() {
+        ("…".to_string(), Color::DarkGray)
+    } else if state.git_status == "clean" {
+        ("clean".to_string(), Color::Green)
+    } else {
+        (state.git_status.clone(), Color::Yellow)
+    };
     lines.push(Line::from(vec![
-        Span::styled("经济模式 ", Style::default().fg(Color::DarkGray)),
-        Span::raw(if state.poor_mode { "启用" } else { "关闭" }),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("轮次 ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Git  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{} 累计", state.turn_count),
+            git_label,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(git_color)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
     paragraph.render(area, buf);
 }
+
+// ---- skills section (new) ----
+
+fn render_skills_section(area: Rect, buf: &mut Buffer, skill_history: &SkillHistory) {
+    let total = skill_history.len();
+    let block = Block::default().borders(Borders::TOP).title(Span::styled(
+        format!(" 技能 ({total}) "),
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let visible = inner.height as usize;
+    if visible == 0 {
+        return;
+    }
+
+    let start = if total <= visible {
+        0
+    } else {
+        total - visible
+    };
+    let take = total.saturating_sub(start).min(visible);
+
+    let items: Vec<ListItem> = skill_history
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(take)
+        .map(|(_i, (name, is_error))| {
+            let icon = if *is_error { "✗" } else { "⚡" };
+            let color = if *is_error { Color::Red } else { Color::LightBlue };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {icon} "), Style::default().fg(color)),
+                Span::raw(name.clone()),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items);
+    list.render(inner, buf);
+}
+
+// ---- tools section ----
 
 fn render_tools_section(
     area: Rect,
@@ -211,6 +273,8 @@ fn render_tools_section(
     list.render(inner, buf);
 }
 
+// ---- usage + stats section ----
+
 fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     let turn = &state.turn_usage;
     let cum = &state.cumulative_usage;
@@ -242,6 +306,36 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     };
     let streaming_label = if state.streaming { "流式" } else { "空闲" };
 
+    // 会话时长
+    let session_duration = if state.session_start_ms > 0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let elapsed_ms = now_ms.saturating_sub(state.session_start_ms);
+        format_elapsed_ms(elapsed_ms)
+    } else {
+        "—".to_string()
+    };
+
+    // 工具总数与成功率
+    let tool_total = state.tool_success_count + state.tool_error_count;
+    let success_rate = if tool_total > 0 {
+        let rate = (state.tool_success_count as f64 / tool_total as f64) * 100.0;
+        format!("{rate:.0}%")
+    } else {
+        "—".to_string()
+    };
+    let rate_color = if tool_total == 0 {
+        Color::DarkGray
+    } else if state.tool_error_count == 0 {
+        Color::Green
+    } else if state.tool_success_count as f64 / tool_total as f64 >= 0.75 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
     let lines = vec![
         Line::from(Span::styled(
             " 用量 ",
@@ -265,6 +359,20 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
         Line::from(vec![
             Span::styled("令牌    ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{} 总计", state.total_tokens())),
+        ]),
+        // 消息数 + 会话时长（紧凑一行）
+        Line::from(vec![
+            Span::styled("消息    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                "{}轮  时长 {}",
+                state.message_count, session_duration
+            )),
+        ]),
+        // 工具统计 + 成功率（紧凑一行）
+        Line::from(vec![
+            Span::styled("工具    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}次  成功率 ", tool_total)),
+            Span::styled(&success_rate, Style::default().fg(rate_color).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
             Span::styled("  输入  ", Style::default().fg(Color::DarkGray)),
@@ -340,6 +448,11 @@ mod tests {
         s.git_branch = "main".to_string();
         s.session_id = "abc-123".to_string();
         s.permission_mode = "workspace-write".to_string();
+        s.git_status = "clean".to_string();
+        s.session_start_ms = 0; // will show "—" for duration
+        s.message_count = 8;
+        s.tool_success_count = 10;
+        s.tool_error_count = 2;
         s.cumulative_usage = runtime::TokenUsage {
             input_tokens: 1000,
             output_tokens: 500,
@@ -357,19 +470,21 @@ mod tests {
             x: 0,
             y: 0,
             width: 40,
-            height: 20,
+            height: 30,
         });
         let history: ToolHistory = Vec::new();
+        let skills: SkillHistory = Vec::new();
         render_sidebar(
             Rect {
                 x: 0,
                 y: 0,
                 width: 40,
-                height: 20,
+                height: 30,
             },
             &mut buf,
             &state,
             &history,
+            &skills,
             None,
         );
     }
@@ -381,23 +496,54 @@ mod tests {
             x: 0,
             y: 0,
             width: 40,
-            height: 20,
+            height: 30,
         });
         let history: ToolHistory = vec![
             ("Read".to_string(), false),
             ("Edit".to_string(), false),
             ("Bash".to_string(), true),
         ];
+        let skills: SkillHistory = Vec::new();
         render_sidebar(
             Rect {
                 x: 0,
                 y: 0,
                 width: 40,
-                height: 20,
+                height: 30,
             },
             &mut buf,
             &state,
             &history,
+            &skills,
+            None,
+        );
+    }
+
+    #[test]
+    fn render_sidebar_does_not_panic_with_skills() {
+        let state = make_state();
+        let mut buf = Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 30,
+        });
+        let history: ToolHistory = Vec::new();
+        let skills: SkillHistory = vec![
+            ("plan-mode".to_string(), false),
+            ("refactor".to_string(), false),
+        ];
+        render_sidebar(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 30,
+            },
+            &mut buf,
+            &state,
+            &history,
+            &skills,
             None,
         );
     }
@@ -416,19 +562,21 @@ mod tests {
             x: 0,
             y: 0,
             width: 40,
-            height: 20,
+            height: 30,
         });
         let history: ToolHistory = Vec::new();
+        let skills: SkillHistory = Vec::new();
         render_sidebar(
             Rect {
                 x: 0,
                 y: 0,
                 width: 40,
-                height: 20,
+                height: 30,
             },
             &mut buf,
             &state,
             &history,
+            &skills,
             None,
         );
     }
@@ -443,6 +591,7 @@ mod tests {
             height: 3,
         });
         let history: ToolHistory = vec![("Edit".to_string(), false)];
+        let skills: SkillHistory = vec![("test-skill".to_string(), false)];
         render_sidebar(
             Rect {
                 x: 0,
@@ -453,6 +602,7 @@ mod tests {
             &mut buf,
             &state,
             &history,
+            &skills,
             None,
         );
     }
@@ -465,5 +615,27 @@ mod tests {
         assert_eq!(format_elapsed_ms(59_999), "59s");
         assert_eq!(format_elapsed_ms(60_000), "1m00s");
         assert_eq!(format_elapsed_ms(125_000), "2m05s");
+    }
+
+    #[test]
+    fn usage_section_shows_stats_lines() {
+        let state = make_state();
+        let mut buf = Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 16,
+        });
+        let usage_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 16,
+        };
+        render_usage_section(usage_area, &mut buf, &state);
+        let content: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("8轮"), "should show message count: {content}");
+        assert!(content.contains("12次"), "should show tool total: {content}");
+        assert!(content.contains("83%"), "should show success rate: {content}");
     }
 }

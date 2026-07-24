@@ -46,7 +46,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::LiveCli;
 use crate::tui::input_line::{InputAction, InputLine};
 use crate::tui::output_view::OutputView;
-use crate::tui::sidebar::{render_sidebar, ToolHistory};
+use crate::tui::sidebar::{render_sidebar, SkillHistory, ToolHistory};
 use crate::tui::slash_menu::{format_menu_item, SlashMenu};
 use crate::tui::status_bar::{StatusBar, StatusBarState};
 // 斜杠命令本地分发：TUI 下 /help 等命令应在本地处理，而非发给 AI。
@@ -398,6 +398,7 @@ fn run_event_loop(
     // can show live tool-call progress during a streaming turn.
     let mut sidebar_visible: bool = terminal.size().map(|s| s.width >= 88).unwrap_or(false);
     let tool_history_shared: Arc<Mutex<ToolHistory>> = Arc::new(Mutex::new(Vec::new()));
+    let skill_history_shared: Arc<Mutex<SkillHistory>> = Arc::new(Mutex::new(Vec::new()));
 
     // 侧栏工具历史滚动状态：None=跟随底部（显示最新），Some(n)=从底部往上偏移 n 行。
     // Alt+Up 增加 n（看更早），Alt+Down 减少 n（回到最新），新工具到来时自动归零。
@@ -553,8 +554,11 @@ fn run_event_loop(
                                 "[turn-start] auto_submit pending_input len={}",
                                 pending.len()
                             ));
-                            // 清空上一轮的工具历史，避免污染。
+                            // 清空上一轮的工具历史和技能历史，避免污染。
                             if let Ok(mut h) = tool_history_shared.lock() {
+                                h.clear();
+                            }
+                            if let Ok(mut h) = skill_history_shared.lock() {
                                 h.clear();
                             }
 
@@ -566,6 +570,7 @@ fn run_event_loop(
                             let output_handle = output_view.shared_handle();
                             let status_handle = Arc::clone(&status_state);
                             let tool_history_handle = Arc::clone(&tool_history_shared);
+                            let skill_history_handle = Arc::clone(&skill_history_shared);
 
                             turn_start = Some(Instant::now());
 
@@ -586,6 +591,7 @@ fn run_event_loop(
                                         &output_handle,
                                         &status_handle,
                                         &tool_history_handle,
+                                        &skill_history_handle,
                                     )
                                 }));
                                 let turn_result = match result {
@@ -742,8 +748,12 @@ fn run_event_loop(
                     .lock()
                     .map(|h| h.clone())
                     .unwrap_or_default();
+                let skill_snapshot = skill_history_shared
+                    .lock()
+                    .map(|h| h.clone())
+                    .unwrap_or_default();
                 let sidebar_buf = f.buffer_mut();
-                render_sidebar(cols[1], sidebar_buf, &state_snapshot, &history_snapshot, sidebar_tools_scroll);
+                render_sidebar(cols[1], sidebar_buf, &state_snapshot, &history_snapshot, &skill_snapshot, sidebar_tools_scroll);
                 cols[0]
             } else {
                 outer[0]
@@ -1578,6 +1588,7 @@ fn run_event_loop(
                             let output_handle = output_view.shared_handle();
                             let status_handle = Arc::clone(&status_state);
                             let tool_history_handle = Arc::clone(&tool_history_shared);
+                            let skill_history_handle = Arc::clone(&skill_history_shared);
 
                             let mut cli = cli_holder.take().unwrap();
 
@@ -1687,9 +1698,12 @@ fn run_event_loop(
                                     });
                                 }
                                 Ok(None) | Err(_) => {
-                                    // 普通对话：发给 AI。清空工具历史。
+                                    // 普通对话：发给 AI。清空工具历史和技能历史。
                                     // 用 expanded（含完整粘贴内容）发送，而非 display（占位符）。
                                     if let Ok(mut h) = tool_history_shared.lock() {
+                                        h.clear();
+                                    }
+                                    if let Ok(mut h) = skill_history_shared.lock() {
                                         h.clear();
                                     }
                                     // TUI 中断支持：创建 abort signal，设置到 cli，
@@ -1714,6 +1728,7 @@ fn run_event_loop(
                                                 &output_handle,
                                                 &status_handle,
                                                 &tool_history_handle,
+                                                &skill_history_handle,
                                             )
                                         }));
                                         let turn_result = match result {
@@ -2298,17 +2313,20 @@ fn execute_turn(
     output_handle: &Arc<Mutex<crate::tui::output_view::OutputBuffer>>,
     status_state: &Arc<Mutex<StatusBarState>>,
     tool_history_shared: &Arc<Mutex<ToolHistory>>,
+    skill_history_shared: &Arc<Mutex<SkillHistory>>,
 ) -> Result<(), String> {
     use crate::streaming::{StatusEmitter, StatusEvent};
 
     let output_handle = Arc::clone(output_handle);
     let status_handle = Arc::clone(status_state);
     let tool_history_shared = Arc::clone(tool_history_shared);
+    let skill_history_shared = Arc::clone(skill_history_shared);
     // Track tool calls during this turn for the timeline summary
     let tool_history: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let tool_history_for_closure = Arc::clone(&tool_history);
     let tool_history_for_sidebar = Arc::clone(&tool_history_shared);
+    let skill_history_for_sidebar = Arc::clone(&skill_history_shared);
     let output_for_closure = Arc::clone(&output_handle);
     // P1 修复：tool input 缓存，供 ToolResult 时取回用于 edit_file diff 显示。
     // key = tool_use_id, value = tool input json string
@@ -2353,6 +2371,35 @@ fn execute_turn(
                 // Mirror to shared sidebar state so it can render live progress
                 if let Ok(mut sidebar_history) = tool_history_for_sidebar.lock() {
                     sidebar_history.push((name.clone(), is_error));
+                }
+                // Track skills separately: parse Skill tool input to extract skill name
+                if name == "Skill" {
+                    let skill_name = tool_input_cache_for_closure
+                        .lock()
+                        .ok()
+                        .and_then(|cache| {
+                            cache.get(&id).and_then(|input_json| {
+                                serde_json::from_str::<serde_json::Value>(input_json)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("skill")
+                                            .and_then(|s| s.as_str().map(String::from))
+                                    })
+                            })
+                        })
+                        .unwrap_or_else(|| String::from("Skill"));
+                    if let Ok(mut sidebar_skills) = skill_history_for_sidebar.lock() {
+                        sidebar_skills.push((skill_name, is_error));
+                    }
+                }
+                // Accumulate tool success/error counts for stats display
+                {
+                    let mut guard = status_handle.lock().unwrap_or_else(|e| e.into_inner());
+                    if is_error {
+                        guard.tool_error_count += 1;
+                    } else {
+                        guard.tool_success_count += 1;
+                    }
                 }
                 // P1 重构：用 complete_tool_card 更新已存在的 ToolCard entry，
                 // 设置 result 并切换为折叠状态。渲染时根据 collapsed 状态
@@ -2408,6 +2455,8 @@ fn execute_turn(
                     if guard.streaming {
                         guard.finish_turn();
                     }
+                    // Increment message count: user turn + assistant turn = +2
+                    guard.message_count += 2;
                 }
             }
             StatusEvent::Thinking {
@@ -2625,6 +2674,10 @@ fn initialize_status(state: &Arc<Mutex<StatusBarState>>, cli: &LiveCli) {
     guard.model = cli.model_snapshot().to_string();
     guard.permission_mode = cli.permission_mode_label().to_string();
     guard.session_id = cli.session_id_snapshot().to_string();
+    guard.session_start_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     sync_status_from_cli_inner(&mut guard, cli);
 }
 
@@ -2661,6 +2714,88 @@ fn sync_status_from_cli_inner(guard: &mut StatusBarState, cli: &LiveCli) {
         crate::provider_label(api::detect_provider_kind(cli.model_snapshot())).to_string();
     guard.reasoning_effort = cli.reasoning_effort();
     guard.turn_count = cli.turns_snapshot();
+    // Git 工作区状态（简单缓存：3 秒内不重复调用 git）
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // 静态变量缓存上次查询时间
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_GIT_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+        static CACHED_GIT_STATUS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        let last = LAST_GIT_CHECK_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) > 3_000 {
+            let summary = compute_git_status_summary();
+            if let Ok(mut cached) = CACHED_GIT_STATUS.lock() {
+                *cached = summary;
+            }
+            LAST_GIT_CHECK_MS.store(now_ms, Ordering::Relaxed);
+        }
+        if let Ok(cached) = CACHED_GIT_STATUS.lock() {
+            guard.git_status.clone_from(&*cached);
+        }
+    }
+}
+
+/// Compute a compact git workspace summary (e.g. "clean", "±3", "±3 a:1").
+fn compute_git_status_summary() -> String {
+    use std::process::Command;
+    let output = match Command::new("git")
+        .args(["status", "--short", "--branch"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return String::new(),
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    // Parse: first two lines are branch info, rest are file status
+    let mut lines = stdout.lines();
+    let branch_line = lines.next().unwrap_or("");
+    let tracking_line = lines.next().unwrap_or("");
+    // Count changed files (staged + unstaged)
+    let changed = lines.filter(|l| !l.trim().is_empty()).count();
+    if changed == 0 {
+        return "clean".to_string();
+    }
+    let mut parts = vec![format!("±{changed}")];
+    // Parse ahead/behind
+    let ahead_behind = |line: &str| -> (i32, i32) {
+        let line = line.to_lowercase();
+        let ahead = if let Some(pos) = line.find("ahead") {
+            line[pos..]
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let behind = if let Some(pos) = line.find("behind") {
+            line[pos..]
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        (ahead, behind)
+    };
+    let (ahead, behind) = ahead_behind(tracking_line);
+    if ahead > 0 {
+        parts.push(format!("a:{ahead}"));
+    }
+    if behind > 0 {
+        parts.push(format!("b:{behind}"));
+    }
+    parts.join(" ")
 }
 
 #[cfg(test)]
