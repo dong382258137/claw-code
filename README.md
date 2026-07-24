@@ -30,7 +30,6 @@
 Anthropic Claude Code（概念来源 / 架构参考）
   └─ ultraworkers/claw-code（MIT License 开源实现）
        └─ dong382258137/claw-code → Claw Plus（本仓库）
-            ├─ 企业审计模块 (Enterprise Audit Module)
             ├─ IM 桥接集成 (IM Bridge)
             └─ 其他功能增强与定制
 ```
@@ -39,12 +38,12 @@ Anthropic Claude Code（概念来源 / 架构参考）
 |------|------|------|
 | 概念层 | [Anthropic Claude Code](https://claude.ai/code) | Anthropic 公司的闭源产品，CLI AI 编程助手的原始概念和架构参考 |
 | 实现层 | [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) | MIT License 开源实现，本项目直接 fork 的基座仓库 |
-| 扩展层 | **Claw Plus**（本仓库） | 在上游基础上增加企业审计模块、IM 桥接等功能的二次开发 |
+| 扩展层 | **Claw Plus**（本仓库） | 在上游基础上增加 IM 桥接等功能的二次开发 |
 
 > [!IMPORTANT]
 > **本仓库是 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) 的 fork（MIT License）。**
 > - 上游版权 © 2026 UltraWorkers and Claw Plus contributors
-> - 下游修改版权 © 2026 dong382258137（企业审计模块及下游改动）
+> - 下游修改版权 © 2026 dong382258137（IM 桥接及下游改动）
 > - "Claude" 和 "Claude Code" 是 Anthropic 的商标，本项目与 Anthropic 无关联，亦非其官方产品
 
 ## 参考与借鉴的项目 (Referenced Projects)
@@ -64,7 +63,6 @@ Anthropic Claude Code（概念来源 / 架构参考）
 
 在继承上游代码的基础上，本仓库增加了以下原创功能：
 
-- **企业审计模块 (Enterprise Audit Module)** — 参见 [`docs/enterprise-audit-module-design.md`](./docs/enterprise-audit-module-design.md)
 - **IM 桥接集成 (IM Bridge)** — 位于 `rust/crates/im-bridge/`
 - **多智能体 DAG 并行编排** — 依赖图调度、worktree 隔离、异步子智能体分发
 - **现代 TUI 终端界面** — 侧边栏、状态栏、上下文窗口进度条、工具卡片渲染
@@ -172,21 +170,6 @@ Multi-layered security from permission modes to sandbox isolation.
 - **Broad-CWD 防护 / Broad-CWD guardrail** — 检测并阻止从 `$HOME` 或根目录启动（防止意外全局扫描）
 - **Confirm-on-first-use** — 首次使用 MCP 服务器工具时弹出交互式权限提示
 
-### 🏢 企业级审计 / Enterprise Audit Module
-
-为企业合规需求设计的不可篡改审计日志系统。
-
-Tamper-evident audit logging system designed for enterprise compliance requirements.
-
-- **四维度审计 / Four audit dimensions** — 谁 (Who) 在何时 (When) 对什么资源 (What) 做了什么操作 (How)，结果如何
-- **Hash Chain 防篡改 / Hash chain tamper evidence** — 每条日志链式哈希，删除任意一条立即检测
-- **多 Sink 导出 / Multi-sink export** — 本地 JSONL、远程 HTTP、S3 对象存储
-- **合规导出 / Compliance export** — CSV / JSON / JSONL / CEF 格式，满足 GDPR、SOC2、ISO27001 审计要求
-- **字段脱敏 / Field redaction** — API Key、PII、敏感文件路径在采集点自动脱敏
-- **双轨授权 / Dual licensing** — 社区版本地审计（培养习惯），企业版远程 sink + 合规格式
-
-> 详见 [`docs/enterprise-audit-module-design.md`](./docs/enterprise-audit-module-design.md)
-
 ### 💬 IM 桥接 / IM Bridge
 
 通过 Discord 等即时通讯平台远程操控 Claw Plus，实现"人在手机上，代码在服务器上"的工作流。
@@ -260,7 +243,7 @@ project with additional features and modifications.
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
 - **`PHILOSOPHY.md`** — project intent and system-design framing
-- **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
+- **`src/` + `tests/`** — companion Python/reference workspace; not the primary runtime surface
 
 ## Quick start
 
@@ -426,7 +409,6 @@ cargo test --workspace
 - [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
 - [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
 - [`docs/g004-events-reports-contract.md`](./docs/g004-events-reports-contract.md) — Stream 2 lane event/report contract guidance for consumers
-- [`docs/enterprise-audit-module-design.md`](./docs/enterprise-audit-module-design.md) — enterprise audit module design (v1.0, fork-specific)
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`SECURITY.md`](./SECURITY.md), [`SUPPORT.md`](./SUPPORT.md), and [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) — contribution, vulnerability-reporting, support, and community policies
 - [`LICENSE`](./LICENSE) — MIT license for this repository
