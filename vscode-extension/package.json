@@ -1,0 +1,116 @@
+﻿{
+  "name": "claw-code-plus-plus",
+  "displayName": "Claw Plus",
+  "description": "ACP-compatible AI coding agent for VS Code",
+  "version": "2026.7.0",
+  "publisher": "claw-code-plus-plus",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Chat",
+    "Machine Learning"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onCommand:claw.startServer",
+    "onCommand:claw.openChat"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claw.startServer",
+        "title": "Claw: Start Server",
+        "category": "Claw"
+      },
+      {
+        "command": "claw.stopServer",
+        "title": "Claw: Stop Server",
+        "category": "Claw"
+      },
+      {
+        "command": "claw.openChat",
+        "title": "Claw: Open Chat",
+        "category": "Claw"
+      },
+      {
+        "command": "claw.cancelPrompt",
+        "title": "Claw: Cancel Active Prompt",
+        "category": "Claw"
+      },
+      {
+        "command": "claw.showStatus",
+        "title": "Claw: Show Status",
+        "category": "Claw"
+      }
+    ],
+    "configuration": {
+      "title": "Claw Plus",
+      "properties": {
+        "claw.binaryPath": {
+          "type": "string",
+          "default": "claw-headless",
+          "description": "Path to claw-headless binary"
+        },
+        "claw.model": {
+          "type": "string",
+          "default": "claude-sonnet-4-5",
+          "description": "Model to use"
+        },
+        "claw.permissionMode": {
+          "type": "string",
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "danger-full-access"
+          ],
+          "default": "workspace-write",
+          "enumDescriptions": [
+            "Agent can only read files, no write/execute",
+            "Agent can read and write within workspace",
+            "Agent has full access (use with caution)"
+          ],
+          "description": "Permission mode"
+        },
+        "claw.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start server on workspace open"
+        },
+        "claw.logLevel": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warn",
+            "info",
+            "debug"
+          ],
+          "default": "info",
+          "description": "Output channel log verbosity"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "@vscode/test-electron": "^2.4.0",
+    "eslint": "^8.56.0",
+    "mocha": "^10.2.0",
+    "typescript": "^5.3.3",
+    "@vscode/vsce": "^2.22.0"
+  }
+}

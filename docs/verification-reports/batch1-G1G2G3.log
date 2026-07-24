@@ -1,0 +1,7 @@
+D:\claw-code-src\scripts\verify-design.ps1 : Checklist not found: D:\claw-code-src\rust\docs\design-verification-checklist.md
+At line:1 char:1
++ & 'D:\claw-code-src\scripts\verify-design.ps1' -Groups 1,2,3 -ClawBin ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
+    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,verify-design.ps1
+ 

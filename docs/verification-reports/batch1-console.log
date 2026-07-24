@@ -1,0 +1,53 @@
+=== Claw Design Verification Driver ===
+Checklist : D:\claw-code-src\docs\design-verification-checklist.md
+Claw bin  : D:\claw-code-src\rust\target\release\claw.exe
+Output dir: D:\claw-code-src\docs\verification-reports
+Mode      : Grouped
+
+Parsed 12 groups from checklist.
+Will verify groups: 1, 2, 3
+
+[VERIFY] G1 — CLI 命令与 flag 验证（顶层行为契约）
+  Prompt size: 6034 chars
+  Output: D:\claw-code-src\docs\verification-reports\report-G1.md
+  Running claw... (this may take a while)
+  Elapsed: 05:47
+  Exit code: 0
+  Result: PASS=0 FAIL=0 BUG=0 SKIP=0 (total=0)
+
+[VERIFY] G2 — TUI 模式行为验证（已知 BUG 重灾区）
+  Prompt size: 6458 chars
+  Output: D:\claw-code-src\docs\verification-reports\report-G2.md
+  Running claw... (this may take a while)
+  Elapsed: 04:02
+  Exit code: 0
+  Result: PASS=0 FAIL=0 BUG=0 SKIP=0 (total=0)
+
+[VERIFY] G3 — Slash 命令验证
+  Prompt size: 4013 chars
+  Output: D:\claw-code-src\docs\verification-reports\report-G3.md
+  Running claw... (this may take a while)
+  Elapsed: 08:02
+  Exit code: 0
+  Result: PASS=0 FAIL=0 BUG=0 SKIP=0 (total=0)
+
+[SKIP] G4 — Provider 路由与模型兼容性验证 (not in -Groups)
+[SKIP] G5 — 工具系统验证（40 tools） (not in -Groups)
+[SKIP] G6 — 会话/状态/分支恢复验证 (not in -Groups)
+[SKIP] G7 — 安全/权限/沙箱验证 (not in -Groups)
+[SKIP] G8 — 多 agent / DAG / Plan 子系统验证 (not in -Groups)
+[SKIP] G9 — Hooks / Plugin / MCP 生命周期验证 (not in -Groups)
+[SKIP] G10 — 已知 BUG 复核（17 项） (not in -Groups)
+[SKIP] G11 — 测试套件基线验证 (not in -Groups)
+[SKIP] G12 — 文档/构建/发布产物验证 (not in -Groups)
+=== Merging final report ===
+
+=== Final Summary ===
+PASS       : 0
+FAIL       : 0
+BUG        : 0
+SKIP/DEFER : 0
+Total      : 0
+
+Final report: D:\claw-code-src\docs\verification-reports\final-report.md
+Per-group reports: D:\claw-code-src\docs\verification-reports\report-G*.md
