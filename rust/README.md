@@ -1,6 +1,8 @@
-# 🦞 Claw Code — Rust Implementation
+# 🦞 Claw Plus — Rust Implementation
 
-A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
+> 本项目基于 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（MIT License）的 Rust 实现，经二次开发增加企业审计模块、IM 桥接等功能。
+
+A high-performance Rust rewrite of the Claw Plus CLI agent harness. Built for speed, safety, and native tool execution.
 
 For a task-oriented guide with copy/paste examples, see [`../USAGE.md`](../USAGE.md).
 
@@ -188,7 +190,7 @@ rust/
     ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
     ├── plugins/            # Plugin metadata, manager, install/enable/disable surfaces
     ├── runtime/            # Session, config, permissions, MCP, prompts, auth/runtime loop
-    ├── rusty-claude-cli/   # Main CLI binary (`claw`)
+    ├── rusty-claude-cli/   # Main CLI binary (`claw-plus`)
     ├── telemetry/          # Session tracing and usage telemetry types
     └── tools/              # Built-in tools, skill resolution, tool search, agent runtime surfaces
 ```
@@ -209,7 +211,7 @@ rust/
 
 - **~20K lines** of Rust
 - **9 crates** in workspace
-- **Binary name:** `claw`
+- **Binary name:** `claw-plus`
 - **Default model:** `claude-opus-4-6`
 - **Default permissions:** `danger-full-access`
 

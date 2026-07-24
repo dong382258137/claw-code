@@ -1,6 +1,8 @@
-# Claw Code Usage
+# Claw Plus Usage
 
-This guide covers the current Rust workspace under `rust/` and the `claw` CLI binary. If you are brand new, make the doctor health check your first run: start `claw`, then run `/doctor`.
+> 本项目是 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（MIT License）的 fork，本使用指南经适配修改。
+
+This guide covers the current Rust workspace under `rust/` and the `claw-plus` CLI binary. If you are brand new, make the doctor health check your first run: start `claw-plus`, then run `/doctor`.
 
 ## Quick-start health check
 
@@ -9,12 +11,12 @@ Run this before prompts, sessions, or automation:
 ```bash
 cd rust
 cargo build --workspace
-./target/debug/claw
+./target/debug/claw-plus
 # first command inside the REPL
 /doctor
 ```
 
-`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `./target/debug/claw --resume latest /doctor`.
+`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `./target/debug/claw-plus --resume latest /doctor`.
 
 ## Prerequisites
 
@@ -31,7 +33,7 @@ cd rust
 cargo build --workspace
 ```
 
-The CLI binary is available at `rust/target/debug/claw` after a debug build (`rust\target\debug\claw.exe` on Windows). Make the doctor check above your first post-build step. For PowerShell-first install, release ZIP, PATH, provider-switching, and Windows/WSL notification examples, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
+The CLI binary is available at `rust/target/debug/claw-plus` after a debug build (`rust\target\debug\claw.exe` on Windows). Make the doctor check above your first post-build step. For PowerShell-first install, release ZIP, PATH, provider-switching, and Windows/WSL notification examples, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
 
 ## Quick start
 
@@ -39,7 +41,7 @@ The CLI binary is available at `rust/target/debug/claw` after a debug build (`ru
 
 ```bash
 cd rust
-./target/debug/claw
+./target/debug/claw-plus
 /doctor
 ```
 
@@ -47,7 +49,7 @@ Or run doctor directly with JSON output for scripting:
 
 ```bash
 cd rust
-./target/debug/claw doctor --output-format json
+./target/debug/claw-plus doctor --output-format json
 ```
 
 **Note:** Diagnostic verbs (`doctor`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
@@ -58,14 +60,14 @@ Set up a new repository with `.claw` config, `.claw.json`, `.gitignore` entries,
 
 ```bash
 cd /path/to/your/repo
-./target/debug/claw init
+./target/debug/claw-plus init
 ```
 
 Text mode (human-readable) shows artifact creation summary with project path and next steps. Idempotent — running multiple times in the same repo marks already-created files as "skipped".
 
 JSON mode for scripting:
 ```bash
-./target/debug/claw init --output-format json
+./target/debug/claw-plus init --output-format json
 ```
 
 Returns structured output with `project_path`, `created[]`, `updated[]`, `skipped[]` arrays (one per artifact), and `artifacts[]` carrying each file's `name` and machine-stable `status` tag. The legacy `message` field preserves backward compatibility.
@@ -76,44 +78,44 @@ Returns structured output with `project_path`, `created[]`, `updated[]`, `skippe
 
 ```bash
 cd rust
-./target/debug/claw
+./target/debug/claw-plus
 ```
 
 ### One-shot prompt
 
 ```bash
 cd rust
-./target/debug/claw prompt "summarize this repository"
+./target/debug/claw-plus prompt "summarize this repository"
 ```
 
 ### Shorthand prompt mode
 
 ```bash
 cd rust
-./target/debug/claw "explain rust/crates/runtime/src/lib.rs"
+./target/debug/claw-plus "explain rust/crates/runtime/src/lib.rs"
 ```
 
 ### JSON output for scripting
 
 ```bash
 cd rust
-./target/debug/claw --output-format json prompt "status"
+./target/debug/claw-plus --output-format json prompt "status"
 ```
 
 ### Inspect worker state
 
 The `claw state` command reads `.claw/worker-state.json`, which is written by the interactive REPL or a one-shot prompt when a worker executes a task. This file contains the worker ID, session reference, model, and permission mode.
 
-Prerequisite: You must run `claw` (interactive REPL) or `claw prompt <text>` at least once in the repository to produce the worker state file.
+Prerequisite: You must run `claw-plus` (interactive REPL) or `claw prompt <text>` at least once in the repository to produce the worker state file.
 
 ```bash
 cd rust
-./target/debug/claw state
+./target/debug/claw-plus state
 ```
 
 JSON mode:
 ```bash
-./target/debug/claw state --output-format json
+./target/debug/claw-plus state --output-format json
 ```
 
 If you run `claw state` before any worker has executed, you will see a helpful error:
@@ -127,7 +129,7 @@ error: no worker state file found at .claw/worker-state.json
 
 ## Advanced slash commands (Interactive REPL only)
 
-These commands are available inside the interactive REPL (`claw` with no args). They extend the assistant with workspace analysis, planning, and navigation features.
+These commands are available inside the interactive REPL (`claw-plus` with no args). They extend the assistant with workspace analysis, planning, and navigation features.
 
 ### `/ultraplan` — Deep planning with multi-step reasoning
 
@@ -183,10 +185,10 @@ Output: A list of suspicious patterns with explanations (e.g., "unchecked unwrap
 
 ```bash
 cd rust
-./target/debug/claw --model sonnet prompt "review this diff"
-./target/debug/claw --permission-mode read-only prompt "summarize Cargo.toml"
-./target/debug/claw --permission-mode workspace-write prompt "update README.md"
-./target/debug/claw --allowedTools read,glob "inspect the runtime crate"
+./target/debug/claw-plus --model sonnet prompt "review this diff"
+./target/debug/claw-plus --permission-mode read-only prompt "summarize Cargo.toml"
+./target/debug/claw-plus --permission-mode workspace-write prompt "update README.md"
+./target/debug/claw-plus --allowedTools read,glob "inspect the runtime crate"
 ```
 
 Supported permission modes:
@@ -218,7 +220,7 @@ export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 
 ### Which env var goes where
 
-`claw` accepts two Anthropic credential env vars and they are **not interchangeable** — the HTTP header Anthropic expects differs per credential shape. Putting the wrong value in the wrong slot is the most common 401 we see.
+`claw-plus` accepts two Anthropic credential env vars and they are **not interchangeable** — the HTTP header Anthropic expects differs per credential shape. Putting the wrong value in the wrong slot is the most common 401 we see.
 
 | Credential shape | Env var | HTTP header | Typical source |
 |---|---|---|---|
@@ -226,9 +228,9 @@ export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 | OAuth access token (opaque) | `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer ...` | an Anthropic-compatible proxy or OAuth flow that mints bearer tokens |
 | OpenRouter key (`sk-or-v1-*`) | `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://openrouter.ai/api/v1` | `Authorization: Bearer ...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
 
-**Why this matters:** if you paste an `sk-ant-*` key into `ANTHROPIC_AUTH_TOKEN`, Anthropic's API will return `401 Invalid bearer token` because `sk-ant-*` keys are rejected over the Bearer header. The fix is a one-line env var swap — move the key to `ANTHROPIC_API_KEY`. Recent `claw` builds detect this exact shape (401 + `sk-ant-*` in the Bearer slot) and append a hint to the error message pointing at the fix.
+**Why this matters:** if you paste an `sk-ant-*` key into `ANTHROPIC_AUTH_TOKEN`, Anthropic's API will return `401 Invalid bearer token` because `sk-ant-*` keys are rejected over the Bearer header. The fix is a one-line env var swap — move the key to `ANTHROPIC_API_KEY`. Recent `claw-plus` builds detect this exact shape (401 + `sk-ant-*` in the Bearer slot) and append a hint to the error message pointing at the fix.
 
-**If you meant a different provider:** if `claw` reports missing Anthropic credentials but you already have `OPENAI_API_KEY`, `XAI_API_KEY`, or `DASHSCOPE_API_KEY` exported, you most likely forgot to prefix the model name with the provider's routing prefix. Use `--model openai/gpt-4.1-mini` (OpenAI-compat / OpenRouter / Ollama), `--model grok` (xAI), or `--model qwen-plus` (DashScope) and the prefix router will select the right backend regardless of the ambient credentials. The error message now includes a hint that names the detected env var.
+**If you meant a different provider:** if `claw-plus` reports missing Anthropic credentials but you already have `OPENAI_API_KEY`, `XAI_API_KEY`, or `DASHSCOPE_API_KEY` exported, you most likely forgot to prefix the model name with the provider's routing prefix. Use `--model openai/gpt-4.1-mini` (OpenAI-compat / OpenRouter / Ollama), `--model grok` (xAI), or `--model qwen-plus` (DashScope) and the prefix router will select the right backend regardless of the ambient credentials. The error message now includes a hint that names the detected env var.
 
 
 ### Windows PowerShell provider switching
@@ -242,25 +244,25 @@ The same provider rules work in PowerShell. Use placeholder values in docs and t
 $env:ANTHROPIC_API_KEY = "sk-ant-REPLACE_ME"
 Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
 Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-.\target\debug\claw.exe --model "sonnet" prompt "reply with ready"
+.\target\debug\claw-plus.exe --model "sonnet" prompt "reply with ready"
 
 # OpenAI-compatible gateway / OpenRouter
 Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 $env:OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
 $env:OPENAI_API_KEY = "sk-or-v1-REPLACE_ME"
-.\target\debug\claw.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"
+.\target\debug\claw-plus.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"
 
 # Local OpenAI-compatible server
 $env:OPENAI_BASE_URL = "http://127.0.0.1:11434/v1"
 Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-.\target\debug\claw.exe --model "llama3.2" prompt "reply with ready"
+.\target\debug\claw-plus.exe --model "llama3.2" prompt "reply with ready"
 ```
 
 See the full [Windows install and release quickstart](./docs/windows-install-release.md) for release artifact setup, persistent `setx` usage, and WSL notes.
 
 ## Local Models
 
-`claw` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services. For copyable Ollama, llama.cpp, vLLM, raw `/v1/chat/completions`, and local skills install examples, see [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md).
+`claw-plus` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services. For copyable Ollama, llama.cpp, vLLM, raw `/v1/chat/completions`, and local skills install examples, see [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md).
 
 ### Anthropic-compatible endpoint
 
@@ -269,7 +271,7 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
 export ANTHROPIC_AUTH_TOKEN="local-dev-token"
 
 cd rust
-./target/debug/claw --model "claude-sonnet-4-6" prompt "reply with the word ready"
+./target/debug/claw-plus --model "claude-sonnet-4-6" prompt "reply with the word ready"
 ```
 
 ### OpenAI-compatible endpoint
@@ -279,7 +281,7 @@ export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
 export OPENAI_API_KEY="local-dev-token"
 
 cd rust
-./target/debug/claw --model "qwen2.5-coder" prompt "reply with the word ready"
+./target/debug/claw-plus --model "qwen2.5-coder" prompt "reply with the word ready"
 ```
 
 ### Ollama
@@ -289,7 +291,7 @@ export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
 unset OPENAI_API_KEY
 
 cd rust
-./target/debug/claw --model "llama3.2" prompt "summarize this repository in one sentence"
+./target/debug/claw-plus --model "llama3.2" prompt "summarize this repository in one sentence"
 ```
 
 ### OpenRouter
@@ -299,7 +301,7 @@ export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
 export OPENAI_API_KEY="sk-or-v1-..."
 
 cd rust
-./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
+./target/debug/claw-plus --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
 ```
 
 ### Alibaba DashScope (Qwen)
@@ -310,9 +312,9 @@ For Qwen models via Alibaba's native DashScope API (higher rate limits than Open
 export DASHSCOPE_API_KEY="sk-..."
 
 cd rust
-./target/debug/claw --model "qwen/qwen-max" prompt "hello"
+./target/debug/claw-plus --model "qwen/qwen-max" prompt "hello"
 # or bare:
-./target/debug/claw --model "qwen-plus" prompt "hello"
+./target/debug/claw-plus --model "qwen-plus" prompt "hello"
 ```
 
 Model names starting with `qwen/` or `qwen-` are automatically routed to the DashScope compatible-mode endpoint (`https://dashscope.aliyuncs.com/compatible-mode/v1`). You do **not** need to set `OPENAI_BASE_URL` or unset `ANTHROPIC_API_KEY` — the model prefix wins over the ambient credential sniffer.
@@ -321,7 +323,7 @@ Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `te
 
 ## Supported Providers & Models
 
-`claw` has three built-in provider backends. The provider is selected automatically based on the model name, falling back to whichever credential is present in the environment.
+`claw-plus` has three built-in provider backends. The provider is selected automatically based on the model name, falling back to whichever credential is present in the environment.
 
 ### Provider matrix
 
@@ -377,7 +379,7 @@ Local project settings override user-level settings. Aliases resolve through the
 3. If it starts with `openai/` or `gpt-` → OpenAI-compatible.
 4. If it starts with `qwen/`, `qwen-`, `kimi/`, or `kimi-` → DashScope-compatible OpenAI wire format.
 5. If `OPENAI_BASE_URL` and `OPENAI_API_KEY` are set, unknown model names route to the OpenAI-compatible client for local/gateway servers.
-6. Otherwise, `claw` checks which credential is set: Anthropic first, then OpenAI, then xAI. If only `OPENAI_BASE_URL` is set, it still routes to OpenAI-compatible for authless local servers.
+6. Otherwise, `claw-plus` checks which credential is set: Anthropic first, then OpenAI, then xAI. If only `OPENAI_BASE_URL` is set, it still routes to OpenAI-compatible for authless local servers.
 7. If nothing matches, it defaults to Anthropic.
 
 
@@ -393,23 +395,23 @@ Use `@path/to/file` in prompts to submit repository files as context, for exampl
 
 ## FAQ
 
-### Is Claw Code Claude-only?
+### Is Claw Plus Claude-only?
 
-No. Claw Code is a Claude-Code-shaped workflow/runtime, not a Claude-only product. It can target Anthropic and OpenAI-compatible/provider-routed/local models depending on config. Non-Claude providers may require stricter response-shape and tool-call compatibility, so some workflows can be rougher than first-party Anthropic/OpenAI paths; provider-specific identity leaks are bugs, not product intent. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) for local provider examples.
+No. Claw Plus is a Claude-Code-shaped workflow/runtime, not a Claude-only product. It can target Anthropic and OpenAI-compatible/provider-routed/local models depending on config. Non-Claude providers may require stricter response-shape and tool-call compatibility, so some workflows can be rougher than first-party Anthropic/OpenAI paths; provider-specific identity leaks are bugs, not product intent. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) for local provider examples.
 
 ### What about Codex?
 
-The name "codex" appears in the Claw Code ecosystem but it does **not** refer to OpenAI Codex (the code-generation model). Here is what it means in this project:
+The name "codex" appears in the Claw Plus ecosystem but it does **not** refer to OpenAI Codex (the code-generation model). Here is what it means in this project:
 
-- **`oh-my-codex` (OmX)** is the workflow and plugin layer that sits on top of `claw`. It provides planning modes, parallel multi-agent execution, notification routing, and other automation features. See [PHILOSOPHY.md](./PHILOSOPHY.md) and the [oh-my-codex repo](https://github.com/Yeachan-Heo/oh-my-codex).
-- **`.codex/` directories** (e.g. `.codex/skills`, `.codex/agents`, `.codex/commands`) are legacy lookup paths that `claw` still scans alongside the primary `.claw/` directories.
+- **`oh-my-codex` (OmX)** is the workflow and plugin layer that sits on top of `claw-plus`. It provides planning modes, parallel multi-agent execution, notification routing, and other automation features. See [PHILOSOPHY.md](./PHILOSOPHY.md) and the [oh-my-codex repo](https://github.com/Yeachan-Heo/oh-my-codex).
+- **`.codex/` directories** (e.g. `.codex/skills`, `.codex/agents`, `.codex/commands`) are legacy lookup paths that `claw-plus` still scans alongside the primary `.claw/` directories.
 - **`CODEX_HOME`** is an optional environment variable that points to a custom root for user-level skill and command lookups.
 
-`claw` does **not** support OpenAI Codex sessions, the Codex CLI, or Codex session import/export. If you need to use OpenAI models (like GPT-4.1), configure the OpenAI-compatible provider as shown above in the [OpenAI-compatible endpoint](#openai-compatible-endpoint) and [OpenRouter](#openrouter) sections.
+`claw-plus` does **not** support OpenAI Codex sessions, the Codex CLI, or Codex session import/export. If you need to use OpenAI models (like GPT-4.1), configure the OpenAI-compatible provider as shown above in the [OpenAI-compatible endpoint](#openai-compatible-endpoint) and [OpenRouter](#openrouter) sections.
 
 ## HTTP proxy support
 
-`claw` honours the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables (both upper- and lower-case spellings are accepted) when issuing outbound requests to Anthropic, OpenAI-, and xAI-compatible endpoints. Set them before launching the CLI and the underlying `reqwest` client will be configured automatically.
+`claw-plus` honours the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables (both upper- and lower-case spellings are accepted) when issuing outbound requests to Anthropic, OpenAI-, and xAI-compatible endpoints. Set them before launching the CLI and the underlying `reqwest` client will be configured automatically.
 
 ### Environment variables
 
@@ -419,7 +421,7 @@ export HTTP_PROXY="http://proxy.corp.example:3128"
 export NO_PROXY="localhost,127.0.0.1,.corp.example"
 
 cd rust
-./target/debug/claw prompt "hello via the corporate proxy"
+./target/debug/claw-plus prompt "hello via the corporate proxy"
 ```
 
 ### Programmatic `proxy_url` config option
@@ -448,7 +450,7 @@ let client = build_http_client_with(&config).expect("proxy client");
 - `proxy_url` is a unified alternative: when set, it applies to both `http://` and `https://` destinations, overriding the per-scheme fields.
 - `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
 - Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
-- If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
+- If a proxy URL cannot be parsed, `claw-plus` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
 
 ## Skills
 
@@ -466,12 +468,12 @@ If install succeeds but invocation fails with a provider HTTP error, treat provi
 
 ```bash
 cd rust
-./target/debug/claw status
-./target/debug/claw sandbox
-./target/debug/claw agents
-./target/debug/claw mcp
-./target/debug/claw skills
-./target/debug/claw system-prompt --cwd .. --date 2026-04-04
+./target/debug/claw-plus status
+./target/debug/claw-plus sandbox
+./target/debug/claw-plus agents
+./target/debug/claw-plus mcp
+./target/debug/claw-plus skills
+./target/debug/claw-plus system-prompt --cwd .. --date 2026-04-04
 ```
 
 ## Session management
@@ -480,8 +482,8 @@ REPL turns are persisted under `.claw/sessions/` in the current workspace.
 
 ```bash
 cd rust
-./target/debug/claw --resume latest
-./target/debug/claw --resume latest /status /diff
+./target/debug/claw-plus --resume latest
+./target/debug/claw-plus --resume latest /status /diff
 ```
 
 Useful interactive commands include `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions`, and `/export`.

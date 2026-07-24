@@ -1,5 +1,7 @@
 # Parity Status — claw-code Rust Port
 
+> 本文档继承自上游 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（MIT License），记录 Rust 移植的进度状态。
+
 Last updated: 2026-07-18
 
 ## Summary

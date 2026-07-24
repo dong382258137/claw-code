@@ -1,4 +1,9 @@
-# Claw Code Philosophy
+# Claw Plus Philosophy
+
+> [!NOTE]
+> **本文档继承自上游项目 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（MIT License），经本仓库适配修改。**
+>
+> 文档中提及的 [clawhip](https://github.com/Yeachan-Heo/clawhip)、[oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)、[oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) 为各自作者独立维护的开源项目，本仓库引用它们仅为说明多智能体协作生态的完整图景，并非声称对其拥有所有权。
 
 ## Stop Staring at the Files
 
@@ -6,7 +11,7 @@ If you only look at the generated files in this repository, you are looking at t
 
 The Python rewrite was a byproduct. The Rust rewrite was also a byproduct. The real thing worth studying is the **system that produced them**: a clawhip-based coordination loop where humans give direction and autonomous claws execute the work.
 
-Claw Code is not just a codebase. It is a public demonstration of what happens when:
+Claw Plus is not just a codebase. It is a public demonstration of what happens when:
 
 - a human provides clear direction,
 - multiple coding agents coordinate in parallel,
@@ -26,8 +31,10 @@ That is the philosophy: **humans set direction; claws perform the labor.**
 
 ## The Three-Part System
 
+> 以下三个项目为各自作者独立维护的开源项目，本仓库引用它们以说明完整的多智能体协作生态。
+
 ### 1. OmX (`oh-my-codex`)
-[oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) provides the workflow layer.
+[oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)（作者：[Yeachan-Heo](https://github.com/Yeachan-Heo)）provides the workflow layer.
 
 It turns short directives into structured execution:
 - planning keywords
@@ -38,7 +45,7 @@ It turns short directives into structured execution:
 This is the layer that converts a sentence into a repeatable work protocol.
 
 ### 2. clawhip
-[clawhip](https://github.com/Yeachan-Heo/clawhip) is the event and notification router.
+[clawhip](https://github.com/Yeachan-Heo/clawhip)（作者：[Yeachan-Heo](https://github.com/Yeachan-Heo)）is the event and notification router.
 
 It watches:
 - git commits
@@ -50,7 +57,7 @@ It watches:
 Its job is to keep monitoring and delivery **outside** the coding agent's context window so the agents can stay focused on implementation instead of status formatting and notification routing.
 
 ### 3. OmO (`oh-my-openagent`)
-[oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) handles multi-agent coordination.
+[oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)（作者：[code-yeongyu](https://github.com/code-yeongyu)）handles multi-agent coordination.
 
 This is where planning, handoffs, disagreement resolution, and verification loops happen across agents.
 
@@ -70,9 +77,9 @@ When agent systems can rebuild a codebase in hours, the scarce resource becomes:
 
 A fast agent team does not remove the need for thinking. It makes clear thinking even more valuable.
 
-## What Claw Code Demonstrates
+## What Claw Plus Demonstrates
 
-Claw Code demonstrates that a repository can be:
+Claw Plus demonstrates that a repository can be:
 
 - **autonomously built in public**
 - coordinated by claws/lobsters rather than human pair-programming alone
@@ -100,7 +107,7 @@ The job of the human is to decide what deserves to exist.
 
 ## Short Version
 
-**Claw Code is a demo of autonomous software development.**
+**Claw Plus is a demo of autonomous software development.**
 
 Humans provide direction.
 Claws coordinate, build, test, recover, and push.
