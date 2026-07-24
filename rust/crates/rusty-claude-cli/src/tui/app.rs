@@ -467,6 +467,14 @@ fn run_event_loop(
     let mut last_drawn_elapsed_s: u64 = 0;
     let mut last_drawn_streaming: bool = false;
 
+    // 折行缓存：避免每帧对全部 output lines 做 O(N) wrap 和 Arc 分配。
+    // output_view.snapshot_lines() 在内容未变时返回同一个 Arc，所以用
+    // Arc::as_ptr 做身份比较 (pointer identity)。仅在内容指针或宽度变化时
+    // 重新计算 wrap_lines_for_width。
+    let mut cached_wrap_ptr: *const Vec<Line<'static>> = std::ptr::null();
+    let mut cached_wrap_width: usize = 0;
+    let mut cached_wrapped: Arc<Vec<Line<'static>>> = Arc::new(Vec::new());
+
     'main_loop: loop {
         // 处理 AskUserQuestion 请求：worker 线程通过 ask handler 投递的待回答问题。
         //
@@ -763,8 +771,17 @@ fn run_event_loop(
             let output_lines = output_view.snapshot_lines();
             let visible_height = main_area.height.saturating_sub(1) as usize; // Borders::TOP = 1 line
             let content_width = main_area.width as usize;
-            let wrapped_lines_arc =
-                wrap_lines_for_width(&output_lines, content_width);
+            let output_ptr = Arc::as_ptr(&output_lines);
+            let wrapped_lines_arc = if output_ptr == cached_wrap_ptr && content_width == cached_wrap_width {
+                // 折行缓存命中：内容指针 + 宽度均未变，零开销复用
+                Arc::clone(&cached_wrapped)
+            } else {
+                let wrapped = wrap_lines_for_width(&output_lines, content_width);
+                cached_wrap_ptr = output_ptr;
+                cached_wrap_width = content_width;
+                cached_wrapped = Arc::clone(&wrapped);
+                wrapped
+            };
 
             let total_display_lines = wrapped_lines_arc.len();
             let max_scroll = total_display_lines.saturating_sub(visible_height);
