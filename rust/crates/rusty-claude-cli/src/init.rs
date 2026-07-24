@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const STARTER_CLAW_JSON: &str = concat!(
@@ -221,7 +221,8 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     let mut lines = vec![
         "# CLAUDE.md".to_string(),
         String::new(),
-        "This file provides guidance to Claw Plus when working with code in this repository.".to_string(),
+        "This file provides guidance to Claw Plus when working with code in this repository."
+            .to_string(),
         String::new(),
     ];
 

@@ -4,7 +4,10 @@
 //! provider, and converts the response back to `Vec<runtime::AssistantEvent>`.
 
 use api::{MessageRequest, ProviderClient, SystemBlock, SystemContent, ToolDefinition};
-use runtime::{ApiClient as RuntimeApiClient, ApiRequest, AssistantEvent, ConversationMessage, MessageRole, RuntimeError, TokenUsage};
+use runtime::{
+    ApiClient as RuntimeApiClient, ApiRequest, AssistantEvent, ConversationMessage, MessageRole,
+    RuntimeError, TokenUsage,
+};
 
 /// An `ApiClient` implementation that delegates to `api::ProviderClient`.
 pub struct BridgeApiClient {
@@ -18,7 +21,12 @@ pub struct BridgeApiClient {
 
 impl BridgeApiClient {
     pub fn new(client: ProviderClient, model: String, enable_tools: bool) -> Self {
-        Self { client, model, enable_tools, max_tokens: 4096 }
+        Self {
+            client,
+            model,
+            enable_tools,
+            max_tokens: 4096,
+        }
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
@@ -58,9 +66,9 @@ impl RuntimeApiClient for BridgeApiClient {
             extra_body: Default::default(),
         };
 
-        let response = rt.block_on(async {
-            self.client.send_message(&msg_request).await
-        }).map_err(|e| RuntimeError::new(format!("API error: {e}")))?;
+        let response = rt
+            .block_on(async { self.client.send_message(&msg_request).await })
+            .map_err(|e| RuntimeError::new(format!("API error: {e}")))?;
 
         Ok(Self::convert_response(&response))
     }
@@ -87,44 +95,54 @@ impl BridgeApiClient {
     }
 
     fn convert_messages(msgs: &[ConversationMessage]) -> Vec<api::InputMessage> {
-        msgs.iter().map(|msg| {
-            let role = match msg.role {
-                MessageRole::User => "user".to_string(),
-                MessageRole::Assistant => "assistant".to_string(),
-                MessageRole::System => "user".to_string(), // Map System to user (shouldn't happen in practice)
-                MessageRole::Tool => "user".to_string(),
-            };
+        msgs.iter()
+            .map(|msg| {
+                let role = match msg.role {
+                    MessageRole::User => "user".to_string(),
+                    MessageRole::Assistant => "assistant".to_string(),
+                    MessageRole::System => "user".to_string(), // Map System to user (shouldn't happen in practice)
+                    MessageRole::Tool => "user".to_string(),
+                };
 
-            let content = msg.blocks.iter().map(|block| match block {
-                runtime::ContentBlock::Text { text } => {
-                    api::InputContentBlock::Text { text: text.clone() }
-                }
-                runtime::ContentBlock::Thinking { thinking, signature } => {
-                    api::InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    }
-                }
-                runtime::ContentBlock::ToolUse { id, name, input } => {
-                    api::InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input).unwrap_or_default(),
-                    }
-                }
-                runtime::ContentBlock::ToolResult { tool_use_id, tool_name: _, output, is_error } => {
-                    api::InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![
-                            api::ToolResultContentBlock::Text { text: output.clone() },
-                        ],
-                        is_error: *is_error,
-                    }
-                }
-            }).collect();
+                let content = msg
+                    .blocks
+                    .iter()
+                    .map(|block| match block {
+                        runtime::ContentBlock::Text { text } => {
+                            api::InputContentBlock::Text { text: text.clone() }
+                        }
+                        runtime::ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        } => api::InputContentBlock::Thinking {
+                            thinking: thinking.clone(),
+                            signature: signature.clone(),
+                        },
+                        runtime::ContentBlock::ToolUse { id, name, input } => {
+                            api::InputContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::from_str(input).unwrap_or_default(),
+                            }
+                        }
+                        runtime::ContentBlock::ToolResult {
+                            tool_use_id,
+                            tool_name: _,
+                            output,
+                            is_error,
+                        } => api::InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: vec![api::ToolResultContentBlock::Text {
+                                text: output.clone(),
+                            }],
+                            is_error: *is_error,
+                        },
+                    })
+                    .collect();
 
-            api::InputMessage { role, content }
-        }).collect()
+                api::InputMessage { role, content }
+            })
+            .collect()
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -150,7 +168,10 @@ impl BridgeApiClient {
                         input: serde_json::to_string(input).unwrap_or_default(),
                     });
                 }
-                api::OutputContentBlock::Thinking { thinking, signature } => {
+                api::OutputContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
                     events.push(AssistantEvent::Thinking {
                         thinking: thinking.clone(),
                         signature: signature.clone(),

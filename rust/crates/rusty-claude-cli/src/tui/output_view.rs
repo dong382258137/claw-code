@@ -305,14 +305,17 @@ impl OutputBuffer {
         result: String,
         is_error: bool,
     ) -> bool {
-        let found_idx = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
-            match e {
+        let found_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, e)| match e {
                 OutputEntry::ToolCard {
                     name, result: r, ..
                 } if name == tool_name && r.is_none() => Some(idx),
                 _ => None,
-            }
-        });
+            });
         if let Some(idx) = found_idx {
             self.text_total_bytes += result.len();
             if let OutputEntry::ToolCard {

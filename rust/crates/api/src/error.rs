@@ -451,26 +451,31 @@ impl TypedErrorEnvelope {
             ApiError::Auth(_) => (Some("AUTH_REJECTED".to_string()), None),
             ApiError::InvalidApiKeyEnv(_) => (Some("AUTH_BAD_ENV".to_string()), None),
             ApiError::ContextWindowExceeded { .. } => (Some("CONTEXT_WINDOW".to_string()), None),
-            ApiError::Api { status, .. } if status.as_u16() == 429 => {
-                (Some("RATE_LIMITED".to_string()), Some("Wait and retry".to_string()))
-            }
+            ApiError::Api { status, .. } if status.as_u16() == 429 => (
+                Some("RATE_LIMITED".to_string()),
+                Some("Wait and retry".to_string()),
+            ),
             ApiError::Http(_) | ApiError::InvalidSseFrame(_) | ApiError::BackoffOverflow { .. } => {
-                (Some("TRANSPORT".to_string()), Some("Check network connectivity".to_string()))
+                (
+                    Some("TRANSPORT".to_string()),
+                    Some("Check network connectivity".to_string()),
+                )
             }
-            ApiError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                (Some("IO_ENOENT".to_string()), Some("Check file path exists".to_string()))
-            }
-            ApiError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                (Some("IO_PERMISSION".to_string()), Some("Check file permissions".to_string()))
-            }
-            ApiError::Io(_) => {
-                (Some("IO_ERROR".to_string()), None)
-            }
+            ApiError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => (
+                Some("IO_ENOENT".to_string()),
+                Some("Check file path exists".to_string()),
+            ),
+            ApiError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (
+                Some("IO_PERMISSION".to_string()),
+                Some("Check file permissions".to_string()),
+            ),
+            ApiError::Io(_) => (Some("IO_ERROR".to_string()), None),
             ApiError::Json { .. } => (Some("JSON_PARSE".to_string()), None),
             ApiError::RetriesExhausted { .. } => (Some("RETRIES_EXHAUSTED".to_string()), None),
-            ApiError::RequestBodySizeExceeded { .. } => {
-                (Some("REQUEST_TOO_LARGE".to_string()), Some("Reduce prompt size".to_string()))
-            }
+            ApiError::RequestBodySizeExceeded { .. } => (
+                Some("REQUEST_TOO_LARGE".to_string()),
+                Some("Reduce prompt size".to_string()),
+            ),
             // Generic API error — non-retryable by default unless is_retryable() says so.
             ApiError::Api { .. } => (None, None),
         };

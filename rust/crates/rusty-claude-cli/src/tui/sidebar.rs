@@ -86,9 +86,7 @@ pub(crate) fn render_sidebar(
     // Skills section: show only when there are skill invocations
     if !skill_history.is_empty() {
         let skills_visible = skill_history.len().min(6) as u16 + 2; // +2 for border
-        let remaining = inner
-            .height
-            .saturating_sub(y.saturating_sub(inner.y));
+        let remaining = inner.height.saturating_sub(y.saturating_sub(inner.y));
         if remaining >= 4 {
             // Need at least 4 rows (1 header + 1 item + 2 borders)
             let skills_h = skills_visible.min(remaining);
@@ -98,9 +96,7 @@ pub(crate) fn render_sidebar(
     }
 
     // Tools section: carve remaining space, leaving at least 9 rows for stats+usage
-    let remaining = inner
-        .height
-        .saturating_sub(y.saturating_sub(inner.y));
+    let remaining = inner.height.saturating_sub(y.saturating_sub(inner.y));
     let reserve_for_bottom = 12u16; // 10 usage lines + 1 top border + 1 margin
     let tools_h = remaining.saturating_sub(reserve_for_bottom);
     if tools_h > 0 {
@@ -109,12 +105,9 @@ pub(crate) fn render_sidebar(
     }
 
     // Stats + Usage section: remaining space
-    let remaining = inner
-        .height
-        .saturating_sub(y.saturating_sub(inner.y));
+    let remaining = inner.height.saturating_sub(y.saturating_sub(inner.y));
     if remaining > 0 {
-        take_section(&mut y, inner, remaining)
-            .map(|a| render_usage_section(a, buf, state));
+        take_section(&mut y, inner, remaining).map(|a| render_usage_section(a, buf, state));
     }
 }
 
@@ -158,9 +151,7 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
         Span::styled("Git  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             git_label,
-            Style::default()
-                .fg(git_color)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(git_color).add_modifier(Modifier::BOLD),
         ),
     ]));
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
@@ -185,11 +176,7 @@ fn render_skills_section(area: Rect, buf: &mut Buffer, skill_history: &SkillHist
         return;
     }
 
-    let start = if total <= visible {
-        0
-    } else {
-        total - visible
-    };
+    let start = if total <= visible { 0 } else { total - visible };
     let take = total.saturating_sub(start).min(visible);
 
     let items: Vec<ListItem> = skill_history
@@ -199,7 +186,11 @@ fn render_skills_section(area: Rect, buf: &mut Buffer, skill_history: &SkillHist
         .take(take)
         .map(|(_i, (name, is_error))| {
             let icon = if *is_error { "✗" } else { "⚡" };
-            let color = if *is_error { Color::Red } else { Color::LightBlue };
+            let color = if *is_error {
+                Color::Red
+            } else {
+                Color::LightBlue
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {icon} "), Style::default().fg(color)),
                 Span::raw(name.clone()),
@@ -372,7 +363,10 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
         Line::from(vec![
             Span::styled("工具    ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}次  成功率 ", tool_total)),
-            Span::styled(&success_rate, Style::default().fg(rate_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &success_rate,
+                Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  输入  ", Style::default().fg(Color::DarkGray)),
@@ -392,7 +386,12 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
         ]),
         Line::from(vec![
             Span::styled("命中率  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&hit_rate, Style::default().fg(hit_rate_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &hit_rate,
+                Style::default()
+                    .fg(hit_rate_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
     let block = Block::default().borders(Borders::TOP);
@@ -402,11 +401,7 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     p.render(inner, buf);
 }
 
-fn format_in_out(
-    cum: &runtime::TokenUsage,
-    turn: &runtime::TokenUsage,
-    is_input: bool,
-) -> String {
+fn format_in_out(cum: &runtime::TokenUsage, turn: &runtime::TokenUsage, is_input: bool) -> String {
     let c = if is_input {
         cum.input_tokens
     } else {
@@ -634,8 +629,17 @@ mod tests {
         };
         render_usage_section(usage_area, &mut buf, &state);
         let content: String = buf.content.iter().map(|c| c.symbol()).collect();
-        assert!(content.contains("8轮"), "should show message count: {content}");
-        assert!(content.contains("12次"), "should show tool total: {content}");
-        assert!(content.contains("83%"), "should show success rate: {content}");
+        assert!(
+            content.contains("8轮"),
+            "should show message count: {content}"
+        );
+        assert!(
+            content.contains("12次"),
+            "should show tool total: {content}"
+        );
+        assert!(
+            content.contains("83%"),
+            "should show success rate: {content}"
+        );
     }
 }

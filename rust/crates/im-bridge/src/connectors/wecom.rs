@@ -45,11 +45,7 @@ struct WeComTokenState {
 
 impl WeComClient {
     pub fn new(config: WeComConfig) -> Result<Self, String> {
-        let crypto = WeComCrypto::new(
-            &config.token,
-            &config.encoding_aes_key,
-            &config.corp_id,
-        )?;
+        let crypto = WeComCrypto::new(&config.token, &config.encoding_aes_key, &config.corp_id)?;
 
         Ok(Self {
             config: Arc::new(config),
@@ -102,7 +98,10 @@ impl WeComClient {
             &encrypted.time_stamp,
             &encrypted.nonce,
         ) {
-            if !self.crypto.verify_signature(ts, nonce, &encrypted.encrypt, sig) {
+            if !self
+                .crypto
+                .verify_signature(ts, nonce, &encrypted.encrypt, sig)
+            {
                 return Err("message callback: signature mismatch".to_string());
             }
         }
@@ -123,10 +122,7 @@ impl WeComClient {
     ///
     /// WeCom smart bot expects the response body to be the message reply.
     /// If we can't reply immediately, return empty ack and push later via webhook.
-    pub fn build_passive_response(
-        &self,
-        reply_text: Option<&str>,
-    ) -> Result<String, String> {
+    pub fn build_passive_response(&self, reply_text: Option<&str>) -> Result<String, String> {
         use rand::Rng;
 
         let inner_xml = build_passive_response_xml(reply_text);
@@ -139,9 +135,9 @@ impl WeComClient {
             .map(char::from)
             .collect();
 
-        let msg_signature =
-            self.crypto
-                .generate_signature(&timestamp, &nonce, &encrypted);
+        let msg_signature = self
+            .crypto
+            .generate_signature(&timestamp, &nonce, &encrypted);
 
         let response_xml = format!(
             r#"<xml><Encrypt><![CDATA[{encrypted}]]></Encrypt><MsgSignature><![CDATA[{msg_signature}]]></MsgSignature><TimeStamp>{timestamp}</TimeStamp><Nonce><![CDATA[{nonce}]]></Nonce></xml>"#
@@ -192,13 +188,10 @@ impl WeComClient {
             ));
         }
 
-        let token = resp
-            .access_token
-            .ok_or("no access_token in response")?;
+        let token = resp.access_token.ok_or("no access_token in response")?;
         let expires_in = resp.expires_in.unwrap_or(7200) as u64;
         state.token = token.clone();
-        state.expires_at =
-            std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
+        state.expires_at = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
 
         Ok(token)
     }
@@ -290,9 +283,7 @@ impl WeComClient {
             text: ApiText { content: text },
         };
 
-        let url = format!(
-            "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
-        );
+        let url = format!("https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}");
 
         #[derive(Deserialize)]
         struct ApiResponse {

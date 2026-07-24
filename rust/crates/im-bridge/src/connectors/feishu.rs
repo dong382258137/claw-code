@@ -176,7 +176,13 @@ impl FeishuClient {
     /// Verify the Feishu webhook signature (if verification_token is configured).
     ///
     /// Feishu signature format: SHA256(timestamp + nonce + verification_token)
-    pub fn verify_signature(&self, timestamp: &str, nonce: &str, body: &str, signature: &str) -> bool {
+    pub fn verify_signature(
+        &self,
+        timestamp: &str,
+        nonce: &str,
+        body: &str,
+        signature: &str,
+    ) -> bool {
         match &self.config.verification_token {
             Some(token) => {
                 let data = format!("{timestamp}{nonce}{token}{body}");
@@ -208,8 +214,7 @@ impl FeishuClient {
             .and_then(|s| s.open_id.clone().or_else(|| s.user_id.clone()))
             .unwrap_or_else(|| "unknown".to_string());
 
-        let content: FeishuMessageContent =
-            serde_json::from_str(&msg.content).ok()?;
+        let content: FeishuMessageContent = serde_json::from_str(&msg.content).ok()?;
         let text = content.text?;
 
         // Skip empty messages

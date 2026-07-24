@@ -306,26 +306,19 @@ async fn handle_im_message<F, Fut>(
     match state.session_manager.handle_command(&req).await {
         Ok(Some(cmd_response)) => {
             // Command handled — reply directly based on platform
-            tracing::info!(
-                "command '{}' handled for {platform} chat {chat_id}",
-                text
-            );
+            tracing::info!("command '{}' handled for {platform} chat {chat_id}", text);
 
             match platform {
                 "feishu" => {
                     if let Some(client) = &state.feishu_client {
-                        if let Err(e) =
-                            client.send_text_message(chat_id, &cmd_response).await
-                        {
+                        if let Err(e) = client.send_text_message(chat_id, &cmd_response).await {
                             tracing::error!("failed to send command response to feishu: {e}");
                         }
                     }
                 }
                 "wecom" => {
                     if let Some(client) = &state.wecom_client {
-                        if let Err(e) =
-                            client.push_text_message(chat_id, &cmd_response).await
-                        {
+                        if let Err(e) = client.push_text_message(chat_id, &cmd_response).await {
                             tracing::error!("failed to send command response to wecom: {e}");
                         }
                     }

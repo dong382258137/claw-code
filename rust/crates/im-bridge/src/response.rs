@@ -108,7 +108,8 @@ impl ResponseCollector {
                         if let Err(e) = client.send_text_message(chat_id, &text).await {
                             tracing::error!(
                                 "failed to send feishu response for session {}: {}",
-                                session_id, e
+                                session_id,
+                                e
                             );
                         }
                     }
@@ -116,7 +117,8 @@ impl ResponseCollector {
                         if let Err(e) = client.push_text_message(chat_id, &text).await {
                             tracing::error!(
                                 "failed to send wecom response for session {}: {}",
-                                session_id, e
+                                session_id,
+                                e
                             );
                         }
                     }

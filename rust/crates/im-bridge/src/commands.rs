@@ -53,8 +53,7 @@ pub async fn handle_command(
     session_count: usize,
 ) -> String {
     match cmd {
-        ChatCommand::Help => {
-            r#"**IM Bridge Commands**
+        ChatCommand::Help => r#"**IM Bridge Commands**
 
 `/help` — Show this help
 `/new` — Start a new session (clear conversation history)
@@ -62,8 +61,7 @@ pub async fn handle_command(
 `/history` — Show recent messages
 
 Just type a message to chat with claw-code AI."#
-                .to_string()
-        }
+            .to_string(),
         ChatCommand::NewSession => {
             "Starting a new session. Your next message will begin a fresh conversation.".to_string()
         }
@@ -89,7 +87,10 @@ mod tests {
     fn test_parse_help_command() {
         for variant in &["/help", "/h", "  /help  "] {
             let result = parse_command(variant);
-            assert!(matches!(result, CommandParseResult::Command(ChatCommand::Help)));
+            assert!(matches!(
+                result,
+                CommandParseResult::Command(ChatCommand::Help)
+            ));
         }
     }
 

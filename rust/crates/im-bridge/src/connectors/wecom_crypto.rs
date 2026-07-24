@@ -56,10 +56,7 @@ impl WeComCrypto {
         encrypt_msg: &str,
         signature: &str,
     ) -> bool {
-        let mut parts = [self.token.as_str(),
-            timestamp,
-            nonce,
-            encrypt_msg];
+        let mut parts = [self.token.as_str(), timestamp, nonce, encrypt_msg];
         parts.sort();
         let combined = parts.join("");
         let mut hasher = Sha1::new();
@@ -113,8 +110,9 @@ impl WeComCrypto {
             .map_err(|e| format!("UTF-8 decode failed: {e}"))?;
 
         // Verify corp_id suffix
-        let actual_corp_id =
-            String::from_utf8_lossy(&data[msg_end..]).trim_end_matches('\0').to_string();
+        let actual_corp_id = String::from_utf8_lossy(&data[msg_end..])
+            .trim_end_matches('\0')
+            .to_string();
         if actual_corp_id != expected_corp_id {
             tracing::warn!(
                 "corp_id mismatch: expected '{}', got '{}'",
@@ -165,16 +163,8 @@ impl WeComCrypto {
     }
 
     /// Generate a SHA1 signature for an encrypted message.
-    pub fn generate_signature(
-        &self,
-        timestamp: &str,
-        nonce: &str,
-        encrypted: &str,
-    ) -> String {
-        let mut parts = [self.token.as_str(),
-            timestamp,
-            nonce,
-            encrypted];
+    pub fn generate_signature(&self, timestamp: &str, nonce: &str, encrypted: &str) -> String {
+        let mut parts = [self.token.as_str(), timestamp, nonce, encrypted];
         parts.sort();
         let combined = parts.join("");
         let mut hasher = Sha1::new();
@@ -249,7 +239,9 @@ impl WeComMessage {
         Some(WeComUserMessage {
             chat_id: self.chat_id.unwrap_or_else(|| "unknown".to_string()),
             user_id: self.from_user.unwrap_or_else(|| "unknown".to_string()),
-            msg_id: self.msg_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            msg_id: self
+                .msg_id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             text,
             webhook_url,
         })

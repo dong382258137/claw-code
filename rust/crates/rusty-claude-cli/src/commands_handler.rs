@@ -1,4 +1,4 @@
-﻿//! CLI argument parsing and slash command handler helpers.
+//! CLI argument parsing and slash command handler helpers.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -1917,9 +1917,12 @@ fn render_im_status(
     ));
 
     if !config_exists {
-        lines.push("  \x1b[2mStatus\x1b[0m:       \x1b[33m\u{26a0} Not configured\x1b[0m".to_string());
+        lines.push(
+            "  \x1b[2mStatus\x1b[0m:       \x1b[33m\u{26a0} Not configured\x1b[0m".to_string(),
+        );
         lines.push(String::new());
-        lines.push("\x1b[2mCreate ~/.claw/im-bridge.toml to enable IM bridging:\x1b[0m".to_string());
+        lines
+            .push("\x1b[2mCreate ~/.claw/im-bridge.toml to enable IM bridging:\x1b[0m".to_string());
         lines.push(String::new());
         lines.push("  For WeCom (\u{4f01}\u{4e1a}\u{5fae}\u{4fe1}):".to_string());
         lines.push("    [wecom]".to_string());
@@ -1927,14 +1930,20 @@ fn render_im_status(
         lines.push("    secret = \"YOUR_SECRET\"".to_string());
         lines.push("    token = \"YOUR_TOKEN\"".to_string());
         lines.push("    encoding_aes_key = \"YOUR_43_CHAR_AES_KEY\"".to_string());
-        lines.push("    webhook_url = \"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx\"".to_string());
+        lines.push(
+            "    webhook_url = \"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx\""
+                .to_string(),
+        );
         lines.push(String::new());
         lines.push("  For Feishu (\u{98de}\u{4e66}):".to_string());
         lines.push("    [feishu]".to_string());
         lines.push("    app_id = \"YOUR_APP_ID\"".to_string());
         lines.push("    app_secret = \"YOUR_APP_SECRET\"".to_string());
         lines.push(String::new());
-        lines.push("\x1b[2mThen run \x1b[1mclaw-im-bridge\x1b[0m\x1b[2m to start the bridge.\x1b[0m".to_string());
+        lines.push(
+            "\x1b[2mThen run \x1b[1mclaw-im-bridge\x1b[0m\x1b[2m to start the bridge.\x1b[0m"
+                .to_string(),
+        );
 
         return (
             lines.join("\n"),

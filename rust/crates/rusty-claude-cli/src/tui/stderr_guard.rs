@@ -192,7 +192,7 @@ impl Drop for WindowsGuard {
                     let _ = real_stderr.write_all(&buf);
                     let _ = real_stderr.flush();
                 }
-                Ok(_) => {} // 空 buffer，无输出
+                Ok(_) => {}  // 空 buffer，无输出
                 Err(_) => {} // drain 线程 panic
             }
         }

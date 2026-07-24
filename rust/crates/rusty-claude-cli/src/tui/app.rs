@@ -2465,7 +2465,8 @@ fn execute_turn(
                     // 同理 output_tokens 也是累计值，用 = 避免成本虚高。
                     guard.turn_usage.input_tokens = usage.input_tokens;
                     guard.turn_usage.output_tokens = usage.output_tokens;
-                    guard.turn_usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                    guard.turn_usage.cache_creation_input_tokens =
+                        usage.cache_creation_input_tokens;
                     guard.turn_usage.cache_read_input_tokens = usage.cache_read_input_tokens;
                 }
             }
@@ -2876,7 +2877,8 @@ mod tests {
                     if let Ok(mut guard) = status_handle.lock() {
                         guard.turn_usage.input_tokens = usage.input_tokens;
                         guard.turn_usage.output_tokens = usage.output_tokens;
-                        guard.turn_usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                        guard.turn_usage.cache_creation_input_tokens =
+                            usage.cache_creation_input_tokens;
                         guard.turn_usage.cache_read_input_tokens = usage.cache_read_input_tokens;
                     }
                 }

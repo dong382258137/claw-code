@@ -95,8 +95,8 @@ impl SessionManager {
     where
         C: runtime::ApiClient + Send + 'static,
     {
-        let spawned = spawn_claw_shell(builder, &cancel)
-            .expect("failed to spawn claw agent for IM bridge");
+        let spawned =
+            spawn_claw_shell(builder, &cancel).expect("failed to spawn claw agent for IM bridge");
 
         let claw_acp::AcpClientChannel {
             rx: notification_rx,
@@ -175,8 +175,7 @@ impl SessionManager {
                 let response = match &cmd {
                     ChatCommand::NewSession => {
                         // Force a new session creation
-                        self.force_new_session(&req.chat_key, &req.user_id)
-                            .await?;
+                        self.force_new_session(&req.chat_key, &req.user_id).await?;
                         "✅ Started a new session. Your conversation history has been cleared."
                             .to_string()
                     }
@@ -186,9 +185,7 @@ impl SessionManager {
                             sessions
                                 .get(&req.chat_key)
                                 .map(|s| s.session_id.clone())
-                                .unwrap_or_else(|| {
-                                    acp::SessionId::new("no-active-session")
-                                })
+                                .unwrap_or_else(|| acp::SessionId::new("no-active-session"))
                         };
                         let count = self.session_count().await;
                         crate::commands::handle_command(&cmd, &session_id, count).await
@@ -226,10 +223,7 @@ impl SessionManager {
                     true
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "prompt send failed for session {}: {e}",
-                        sid
-                    );
+                    tracing::error!("prompt send failed for session {}: {e}", sid);
                     false
                 }
             };
@@ -240,7 +234,10 @@ impl SessionManager {
             });
 
             if !success {
-                tracing::error!("session {}: agent may have crashed, consider restarting", sid);
+                tracing::error!(
+                    "session {}: agent may have crashed, consider restarting",
+                    sid
+                );
             }
         });
 
@@ -252,15 +249,13 @@ impl SessionManager {
         let sessions = self.sessions.lock().await;
         sessions
             .iter()
-            .map(|(key, session)| {
-                PersistedSession {
-                    platform: key.platform.clone(),
-                    chat_id: key.chat_id.clone(),
-                    session_id: session.session_id.to_string(),
-                    cwd: session.cwd.display().to_string(),
-                    last_active_secs: session.last_active.elapsed().as_secs(),
-                    user_id: Some(session.user_id.clone()),
-                }
+            .map(|(key, session)| PersistedSession {
+                platform: key.platform.clone(),
+                chat_id: key.chat_id.clone(),
+                session_id: session.session_id.to_string(),
+                cwd: session.cwd.display().to_string(),
+                last_active_secs: session.last_active.elapsed().as_secs(),
+                user_id: Some(session.user_id.clone()),
             })
             .collect()
     }
@@ -293,10 +288,7 @@ impl SessionManager {
             if let Some(s) = sessions.get_mut(key) {
                 s.last_active = Instant::now();
             }
-            tracing::debug!(
-                "reusing existing session {} for chat {:?}",
-                sid, key
-            );
+            tracing::debug!("reusing existing session {} for chat {:?}", sid, key);
             return Ok(sid);
         }
 
@@ -325,7 +317,9 @@ impl SessionManager {
         let session_id = session_resp.session_id;
         tracing::info!(
             "created new session {} for chat {:?} (user: {})",
-            session_id, key, user_id
+            session_id,
+            key,
+            user_id
         );
 
         sessions.insert(
@@ -342,7 +336,11 @@ impl SessionManager {
     }
 
     /// Force creation of a new session, replacing any existing one.
-    async fn force_new_session(&self, key: &ChatKey, user_id: &str) -> Result<acp::SessionId, String> {
+    async fn force_new_session(
+        &self,
+        key: &ChatKey,
+        user_id: &str,
+    ) -> Result<acp::SessionId, String> {
         // Remove old session
         {
             let mut sessions = self.sessions.lock().await;

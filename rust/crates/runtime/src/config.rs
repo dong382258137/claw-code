@@ -97,42 +97,67 @@ pub struct HookDefinition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookHandlerType {
-    Command, Script, Http, Mcp,
+    Command,
+    Script,
+    Http,
+    Mcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailurePolicy {
-    FailClose, FailOpen,
+    FailClose,
+    FailOpen,
 }
 
 impl HookDefinition {
     #[must_use]
     pub fn command(cmd: impl Into<String>) -> Self {
-        Self { handler_type: HookHandlerType::Command, value: cmd.into(), failure_policy: FailurePolicy::FailClose }
+        Self {
+            handler_type: HookHandlerType::Command,
+            value: cmd.into(),
+            failure_policy: FailurePolicy::FailClose,
+        }
     }
     #[must_use]
     pub fn script(content: impl Into<String>) -> Self {
-        Self { handler_type: HookHandlerType::Script, value: content.into(), failure_policy: FailurePolicy::FailClose }
+        Self {
+            handler_type: HookHandlerType::Script,
+            value: content.into(),
+            failure_policy: FailurePolicy::FailClose,
+        }
     }
     #[must_use]
     pub fn http_url(url: impl Into<String>) -> Self {
-        Self { handler_type: HookHandlerType::Http, value: url.into(), failure_policy: FailurePolicy::FailClose }
+        Self {
+            handler_type: HookHandlerType::Http,
+            value: url.into(),
+            failure_policy: FailurePolicy::FailClose,
+        }
     }
     #[must_use]
     pub fn mcp_tool(tool_name: impl Into<String>) -> Self {
-        Self { handler_type: HookHandlerType::Mcp, value: tool_name.into(), failure_policy: FailurePolicy::FailClose }
+        Self {
+            handler_type: HookHandlerType::Mcp,
+            value: tool_name.into(),
+            failure_policy: FailurePolicy::FailClose,
+        }
     }
     #[must_use]
     pub fn with_failure_policy(mut self, policy: FailurePolicy) -> Self {
-        self.failure_policy = policy; self
+        self.failure_policy = policy;
+        self
     }
 }
 
 impl From<String> for HookDefinition {
-    fn from(value: String) -> Self { Self::command(value) }
+    fn from(value: String) -> Self {
+        Self::command(value)
+    }
 }
 impl From<&str> for HookDefinition {
-    fn from(value: &str) -> Self { Self::command(value.to_string()) }
+    fn from(value: &str) -> Self {
+        Self::command(value.to_string())
+    }
 }
 
 /// Hook command lists grouped by lifecycle stage.
@@ -757,8 +782,14 @@ impl RuntimeHookConfig {
     ) -> Self {
         Self {
             pre_tool_use: pre_tool_use.into_iter().map(HookDefinition::from).collect(),
-            post_tool_use: post_tool_use.into_iter().map(HookDefinition::from).collect(),
-            post_tool_use_failure: post_tool_use_failure.into_iter().map(HookDefinition::from).collect(),
+            post_tool_use: post_tool_use
+                .into_iter()
+                .map(HookDefinition::from)
+                .collect(),
+            post_tool_use_failure: post_tool_use_failure
+                .into_iter()
+                .map(HookDefinition::from)
+                .collect(),
             lifecycle: std::collections::HashMap::new(),
         }
     }
@@ -803,7 +834,10 @@ impl RuntimeHookConfig {
     }
 
     pub fn add_lifecycle(&mut self, event: &str, definition: HookDefinition) {
-        self.lifecycle.entry(event.to_string()).or_default().push(definition);
+        self.lifecycle
+            .entry(event.to_string())
+            .or_default()
+            .push(definition);
     }
 }
 
@@ -1009,10 +1043,21 @@ fn parse_optional_hooks_config_object(
     };
     let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default().into_iter().map(HookDefinition::from).collect(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default().into_iter().map(HookDefinition::from).collect(),
+        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(HookDefinition::from)
+            .collect(),
+        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(HookDefinition::from)
+            .collect(),
         post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
-            .unwrap_or_default().into_iter().map(HookDefinition::from).collect(),
+            .unwrap_or_default()
+            .into_iter()
+            .map(HookDefinition::from)
+            .collect(),
         lifecycle: std::collections::HashMap::new(),
     })
 }
@@ -1588,9 +1633,8 @@ pub fn load_wizard_settings() -> Option<WizardSettings> {
 mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        HookDefinition, McpServerConfig, McpTransport, ResolvedPermissionMode,
-        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig,
-        CLAW_SETTINGS_SCHEMA_NAME, LspServerConfig,
+        HookDefinition, LspServerConfig, McpServerConfig, McpTransport, ResolvedPermissionMode,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1704,8 +1748,14 @@ mod tests {
             .and_then(JsonValue::as_object)
             .expect("hooks object")
             .contains_key("PostToolUse"));
-        assert_eq!(loaded.hooks().pre_tool_use(), &[HookDefinition::command("base")]);
-        assert_eq!(loaded.hooks().post_tool_use(), &[HookDefinition::command("project")]);
+        assert_eq!(
+            loaded.hooks().pre_tool_use(),
+            &[HookDefinition::command("base")]
+        );
+        assert_eq!(
+            loaded.hooks().post_tool_use(),
+            &[HookDefinition::command("project")]
+        );
         assert_eq!(
             loaded.hooks().post_tool_use_failure(),
             &[HookDefinition::command("project-failure")]
@@ -2334,15 +2384,24 @@ mod tests {
         // then
         assert_eq!(
             merged.pre_tool_use(),
-            &[HookDefinition::command("pre-a"), HookDefinition::command("pre-b")]
+            &[
+                HookDefinition::command("pre-a"),
+                HookDefinition::command("pre-b")
+            ]
         );
         assert_eq!(
             merged.post_tool_use(),
-            &[HookDefinition::command("post-a"), HookDefinition::command("post-b")]
+            &[
+                HookDefinition::command("post-a"),
+                HookDefinition::command("post-b")
+            ]
         );
         assert_eq!(
             merged.post_tool_use_failure(),
-            &[HookDefinition::command("failure-a"), HookDefinition::command("failure-b")]
+            &[
+                HookDefinition::command("failure-a"),
+                HookDefinition::command("failure-b")
+            ]
         );
     }
 
@@ -2537,9 +2596,16 @@ mod tests {
         assert_eq!(rust.command, "rust-analyzer");
         assert!(rust.args.is_empty(), "rust should have no args");
 
-        let ts = cfg.lsp().get("typescript").expect("typescript server configured");
+        let ts = cfg
+            .lsp()
+            .get("typescript")
+            .expect("typescript server configured");
         assert_eq!(ts.command, "typescript-language-server");
-        assert_eq!(ts.args, vec!["--stdio".to_string()], "typescript should have --stdio arg");
+        assert_eq!(
+            ts.args,
+            vec!["--stdio".to_string()],
+            "typescript should have --stdio arg"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

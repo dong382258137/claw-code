@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::config::{FailurePolicy, HookDefinition, HookHandlerType, RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::config::{
+    FailurePolicy, HookDefinition, HookHandlerType, RuntimeFeatureConfig, RuntimeHookConfig,
+};
 use crate::permissions::PermissionOverride;
 
 const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
@@ -355,7 +357,12 @@ impl HookRunner {
     #[must_use]
     pub fn run_lifecycle_event(&self, event: HookEvent, context: &str) -> HookRunResult {
         let event_name = event.as_str();
-        let definitions = self.config.lifecycle().get(event_name).map(Vec::as_slice).unwrap_or(&[]);
+        let definitions = self
+            .config
+            .lifecycle()
+            .get(event_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if definitions.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
@@ -392,7 +399,10 @@ impl HookRunner {
     }
     #[must_use]
     pub fn run_post_custom_tool_call(&self, tool_name: &str, result: &str) -> HookRunResult {
-        self.run_lifecycle_event(HookEvent::PostCustomToolCall, &format!("{tool_name}: {result}"))
+        self.run_lifecycle_event(
+            HookEvent::PostCustomToolCall,
+            &format!("{tool_name}: {result}"),
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn run_definitions(
@@ -445,17 +455,29 @@ impl HookRunner {
 
             let outcome = match def.handler_type {
                 HookHandlerType::Command => Self::run_command(
-                    &def.value, event, tool_name, tool_input, tool_output, is_error, &payload, abort_signal,
+                    &def.value,
+                    event,
+                    tool_name,
+                    tool_input,
+                    tool_output,
+                    is_error,
+                    &payload,
+                    abort_signal,
                 ),
                 HookHandlerType::Script => Self::run_script_handler(
-                    &def.value, event, tool_name, tool_input, &payload, abort_signal,
+                    &def.value,
+                    event,
+                    tool_name,
+                    tool_input,
+                    &payload,
+                    abort_signal,
                 ),
-                HookHandlerType::Http => Self::run_http_handler(
-                    &def.value, event, tool_name, &payload, abort_signal,
-                ),
-                HookHandlerType::Mcp => Self::run_mcp_handler(
-                    &def.value, event, tool_name, &payload,
-                ),
+                HookHandlerType::Http => {
+                    Self::run_http_handler(&def.value, event, tool_name, &payload, abort_signal)
+                }
+                HookHandlerType::Mcp => {
+                    Self::run_mcp_handler(&def.value, event, tool_name, &payload)
+                }
             };
 
             let completed_label = label.clone();
@@ -463,7 +485,9 @@ impl HookRunner {
                 HookCommandOutcome::Allow { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event, tool_name: tool_name.to_string(), command: completed_label,
+                            event,
+                            tool_name: tool_name.to_string(),
+                            command: completed_label,
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -471,7 +495,9 @@ impl HookRunner {
                 HookCommandOutcome::Deny { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event, tool_name: tool_name.to_string(), command: completed_label,
+                            event,
+                            tool_name: tool_name.to_string(),
+                            command: completed_label,
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -485,7 +511,9 @@ impl HookRunner {
                 HookCommandOutcome::Failed { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Completed {
-                            event, tool_name: tool_name.to_string(), command: completed_label,
+                            event,
+                            tool_name: tool_name.to_string(),
+                            command: completed_label,
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -499,7 +527,9 @@ impl HookRunner {
                 HookCommandOutcome::Cancelled { message } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
                         reporter.on_event(&HookProgressEvent::Cancelled {
-                            event, tool_name: tool_name.to_string(), command: completed_label,
+                            event,
+                            tool_name: tool_name.to_string(),
+                            command: completed_label,
                         });
                     }
                     result.cancelled = true;
@@ -698,7 +728,8 @@ impl HookRunner {
                 let stderr_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 match output.status.code() {
                     Some(0) => {
-                        let parsed = parse_hook_output(event, tool_name, &label, &body, &stderr_out);
+                        let parsed =
+                            parse_hook_output(event, tool_name, &label, &body, &stderr_out);
                         if parsed.deny {
                             HookCommandOutcome::Deny { parsed }
                         } else {

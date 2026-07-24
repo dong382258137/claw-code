@@ -90,12 +90,10 @@ impl PersistenceManager {
     /// Returns empty data if the file doesn't exist or is corrupted.
     pub fn load(&self) -> PersistenceData {
         match std::fs::read_to_string(&self.path) {
-            Ok(content) => {
-                serde_json::from_str(&content).unwrap_or_else(|e| {
-                    tracing::warn!("failed to parse persistence file: {e}, starting fresh");
-                    PersistenceData::default()
-                })
-            }
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!("failed to parse persistence file: {e}, starting fresh");
+                PersistenceData::default()
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!("no existing persistence file, starting fresh");
                 PersistenceData::default()
@@ -120,10 +118,8 @@ impl PersistenceManager {
 
         // Atomic write: write to temp file, then rename
         let tmp_path = self.path.with_extension("tmp");
-        std::fs::write(&tmp_path, content)
-            .map_err(|e| format!("write failed: {e}"))?;
-        std::fs::rename(&tmp_path, &self.path)
-            .map_err(|e| format!("rename failed: {e}"))?;
+        std::fs::write(&tmp_path, content).map_err(|e| format!("write failed: {e}"))?;
+        std::fs::rename(&tmp_path, &self.path).map_err(|e| format!("rename failed: {e}"))?;
 
         tracing::debug!(
             "persisted {} sessions to {}",

@@ -162,9 +162,22 @@ impl<'a> Widget for StatusBar<'a> {
         // P1.1: Reasoning effort icon (从侧栏移到底栏，仅非默认时显示)
         if let Some(ref effort) = self.state.reasoning_effort {
             let (icon, effort_style) = match effort.as_str() {
-                "low" => ("🧠L", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
-                "medium" => ("🧠M", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                "high" => ("🧠H", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                "low" => (
+                    "🧠L",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                "medium" => (
+                    "🧠M",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                "high" => (
+                    "🧠H",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 _ => ("🧠", style_model),
             };
             sections.push(vec![
@@ -188,9 +201,8 @@ impl<'a> Widget for StatusBar<'a> {
         ]);
 
         // P2: Cwd
-        let cwd_short = crate::shorten_cwd_for_statusbar(
-            &std::path::PathBuf::from(&self.state.cwd),
-        );
+        let cwd_short =
+            crate::shorten_cwd_for_statusbar(&std::path::PathBuf::from(&self.state.cwd));
         sections.push(vec![
             Span::styled(" │ ", style_dim),
             Span::styled("📁 ", style_dim),
@@ -202,18 +214,34 @@ impl<'a> Widget for StatusBar<'a> {
         // 使用 total_tokens() 确保 streaming 期间也能看到实时成本变化。
         let pricing = runtime::pricing_for_model(&self.state.model);
         let total_usage = TokenUsage {
-            input_tokens: self.state.cumulative_usage.input_tokens
+            input_tokens: self
+                .state
+                .cumulative_usage
+                .input_tokens
                 .saturating_add(self.state.turn_usage.input_tokens),
-            output_tokens: self.state.cumulative_usage.output_tokens
+            output_tokens: self
+                .state
+                .cumulative_usage
+                .output_tokens
                 .saturating_add(self.state.turn_usage.output_tokens),
-            cache_creation_input_tokens: self.state.cumulative_usage.cache_creation_input_tokens
+            cache_creation_input_tokens: self
+                .state
+                .cumulative_usage
+                .cache_creation_input_tokens
                 .saturating_add(self.state.turn_usage.cache_creation_input_tokens),
-            cache_read_input_tokens: self.state.cumulative_usage.cache_read_input_tokens
+            cache_read_input_tokens: self
+                .state
+                .cumulative_usage
+                .cache_read_input_tokens
                 .saturating_add(self.state.turn_usage.cache_read_input_tokens),
         };
         let cost_usd = pricing.map_or_else(
             || total_usage.estimate_cost_usd().total_cost_usd(),
-            |p| total_usage.estimate_cost_usd_with_pricing(p).total_cost_usd(),
+            |p| {
+                total_usage
+                    .estimate_cost_usd_with_pricing(p)
+                    .total_cost_usd()
+            },
         );
         let cost = runtime::format_cost_localized(cost_usd, crate::locale::is_cny_region());
         sections.push(vec![
@@ -242,9 +270,7 @@ impl<'a> Widget for StatusBar<'a> {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         };
         sections.push(vec![
             Span::styled(" │ ", style_dim),
@@ -312,9 +338,15 @@ fn shorten_model_name(model: &str) -> String {
         "grok-3".to_string()
     } else if lower.contains("grok-2") || lower.contains("grok2") {
         "grok-2".to_string()
-    } else if lower.contains("deepseek-reasoner") || lower.contains("deepseek-r1") || lower.contains("deepseek-v4-pro") {
+    } else if lower.contains("deepseek-reasoner")
+        || lower.contains("deepseek-r1")
+        || lower.contains("deepseek-v4-pro")
+    {
         "ds-v4-pro".to_string()
-    } else if lower.contains("deepseek-chat") || lower.contains("deepseek-v3") || lower.contains("deepseek-v4-flash") {
+    } else if lower.contains("deepseek-chat")
+        || lower.contains("deepseek-v3")
+        || lower.contains("deepseek-v4-flash")
+    {
         "ds-v4-flash".to_string()
     } else if lower.contains("qwen-max") {
         "qwen-max".to_string()
@@ -498,7 +530,10 @@ mod tests {
         let content: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(content.contains("opus"), "should contain model: {content}");
         assert!(content.contains("~/claw"), "should contain cwd: {content}");
-        assert!(content.contains("#12"), "should contain turn count: {content}");
+        assert!(
+            content.contains("#12"),
+            "should contain turn count: {content}"
+        );
     }
 
     #[test]

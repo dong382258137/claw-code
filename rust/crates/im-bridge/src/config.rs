@@ -77,10 +77,10 @@ impl ImBridgeConfig {
                 path.display()
             ));
         }
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-        let config: Self =
-            toml::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let config: Self = toml::from_str(&content)
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
         config.validate()?;
         Ok(config)
     }
@@ -89,7 +89,8 @@ impl ImBridgeConfig {
     fn validate(&self) -> Result<(), String> {
         if self.feishu.is_none() && self.wecom.is_none() {
             return Err(
-                "At least one of [feishu] or [wecom] must be configured in im-bridge.toml".to_string(),
+                "At least one of [feishu] or [wecom] must be configured in im-bridge.toml"
+                    .to_string(),
             );
         }
         Ok(())
