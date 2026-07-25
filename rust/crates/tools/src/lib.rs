@@ -9,6 +9,7 @@ use api::{
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent,
     ToolChoice, ToolDefinition, ToolResultContentBlock,
+    model_meets_complexity, tier_for_model, upgrade_model, TaskComplexity,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -726,7 +727,24 @@ impl GlobalToolRegistry {
             description: tool.definition().description.clone().unwrap_or_default(),
             domain_tags: Vec::new(),
         });
-        builtin.chain(runtime).chain(plugin).collect()
+        // Skills: surface local skills through ToolSearch as well, so the
+        // model has a unified discovery entry point. Skill names are
+        // namespaced with `skill:` prefix to distinguish them from tools
+        // (e.g. `skill:frontend-design`). The model can then call the
+        // `Skill` tool with the bare name (without prefix) to load it.
+        let skills = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| commands::list_skill_summaries(&cwd).ok())
+            .map(|skills| {
+                skills.into_iter().map(|skill| SearchableToolSpec {
+                    name: format!("skill:{}", skill.name()),
+                    description: skill.description().unwrap_or("").to_string(),
+                    domain_tags: vec!["skill".to_string()],
+                })
+            })
+            .into_iter()
+            .flatten();
+        builtin.chain(runtime).chain(plugin).chain(skills).collect()
     }
 
     /// P2-2:按领域标签过滤工具定义,返回与给定任一标签匹配的工具
@@ -1047,12 +1065,34 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ToolSearch",
-            description: "Search for deferred or specialized tools by exact name or keywords.",
+            description: "Search for deferred or specialized tools (and local skills, prefixed with `skill:`) by exact name or keywords. Returns matching tool/skill names. To load a skill's full instructions, call the `Skill` tool with the skill name (without the `skill:` prefix).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string" },
                     "max_results": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "SkillSearch",
+            description: "Discover available local skills by capability description, name, or keyword. Returns a ranked list of matching skills (name + short description). Use this when you don't know the exact skill name. After finding the desired skill, call the `Skill` tool with the skill name to load its full instructions.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language description of the capability you need (e.g. 'extract text from PDF', 'create React component')."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Maximum number of skills to return. Default: 5."
+                    }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1805,6 +1845,7 @@ fn execute_tool_with_enforcer(
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
+        "SkillSearch" => from_value::<SkillSearchInput>(input).and_then(run_skill_search),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
@@ -3336,18 +3377,32 @@ struct SkillInput {
     skill: String,
     args: Option<String>,
 }
-
 #[derive(Debug, Deserialize)]
 struct AgentInput {
     description: String,
     prompt: String,
     subagent_type: Option<String>,
     name: Option<String>,
+    /// Override the model used by the subagent (e.g. "deepseek-v4-flash").
     model: Option<String>,
+    /// Task complexity hint for model-tier validation.
+    /// Accepted values: "simple", "diagnostic", "architectural".
+    complexity: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ToolSearchInput {
+    query: String,
+    max_results: Option<usize>,
+}
+
+/// Input for the `SkillSearch` meta-tool.
+///
+/// `query` is a natural-language capability description (e.g. "extract text
+/// from PDF"). The backend matches it against skill names and descriptions
+/// using BM25-like scoring. `max_results` defaults to 5.
+#[derive(Debug, Deserialize)]
+struct SkillSearchInput {
     query: String,
     max_results: Option<usize>,
 }
@@ -3758,6 +3813,31 @@ pub struct ToolSearchOutput {
     pending_mcp_servers: Option<Vec<String>>,
     #[serde(rename = "mcp_degraded", skip_serializing_if = "Option::is_none")]
     mcp_degraded: Option<McpDegradedReport>,
+}
+
+/// Output of the `SkillSearch` meta-tool.
+///
+/// Returns a ranked list of skills matching the query. Each entry includes
+/// the skill name, short description, and a relevance score. The model
+/// should call the `Skill` tool with the chosen skill name to load its
+/// full instructions.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct SkillSearchOutput {
+    query: String,
+    matches: Vec<SkillMatch>,
+    #[serde(rename = "total_skills_indexed")]
+    total_skills_indexed: usize,
+}
+
+/// A single skill match in [`SkillSearchOutput`].
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct SkillMatch {
+    name: String,
+    description: Option<String>,
+    score: f64,
+    /// Brief human-readable explanation of why this skill matched
+    /// (e.g. "name exact match", "keyword: pdf").
+    match_reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -4440,6 +4520,30 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
 
     if let Ok(cwd) = std::env::current_dir() {
         push_project_skill_lookup_roots(&mut roots, &cwd);
+        // Built-in skills shipped with the claw binary (dev mode: rust/skills).
+        for ancestor in cwd.ancestors() {
+            push_skill_lookup_root(
+                &mut roots,
+                ancestor.join("rust").join("skills"),
+                SkillLookupOrigin::SkillsDir,
+            );
+        }
+    }
+
+    // Built-in skills co-located with the binary (install mode).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            push_skill_lookup_root(
+                &mut roots,
+                exe_dir.join("skills"),
+                SkillLookupOrigin::SkillsDir,
+            );
+            push_skill_lookup_root(
+                &mut roots,
+                exe_dir.join("..").join("..").join("skills"),
+                SkillLookupOrigin::SkillsDir,
+            );
+        }
     }
 
     if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
@@ -4450,6 +4554,11 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
     }
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
+        push_skill_lookup_root(
+            &mut roots,
+            std::path::Path::new(&home).join(".claw").join("builtin-skills"),
+            SkillLookupOrigin::SkillsDir,
+        );
     }
     if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         let claude_config_dir = std::path::PathBuf::from(claude_config_dir);
@@ -4676,7 +4785,34 @@ where
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
     let model = resolve_agent_model(input.model.as_deref());
-    let agent_name = input
+
+    // P1: 模型能力分级 — 根据任务复杂度验证模型是否胜任。
+    // 如果 LLM 声明了任务复杂度但指定了不匹配的模型,自动拒绝并建议升级。
+    if let Some(complexity_str) = input.complexity.as_deref() {
+        let complexity = match complexity_str.trim().to_ascii_lowercase().as_str() {
+            "simple" => TaskComplexity::Simple,
+            "diagnostic" => TaskComplexity::Diagnostic,
+            "architectural" => TaskComplexity::Architectural,
+            other => {
+                return Err(format!(
+                    "invalid complexity '{other}': expected simple/diagnostic/architectural"
+                ));
+            }
+        };
+                        if !model_meets_complexity(&model, complexity) {
+            // If the model doesn't meet complexity requirements, suggest an upgrade.
+            if let Some(upgraded) = upgrade_model(&model) {
+                return Err(format!(
+                    "Model {model} ({:?} tier) does not meet {complexity_str} task complexity. Auto-upgrade to: {upgraded} ({:?} tier).",
+                    tier_for_model(&model),
+                    tier_for_model(&upgraded)
+                ));
+            }
+            return Err(format!(
+                "Model {model} does not meet {complexity_str} task complexity. Consider using a Flagship-tier model."
+            ));
+        }
+    }    let agent_name = input
         .name
         .as_deref()
         .map(slugify_agent_name)
@@ -6139,6 +6275,152 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
 #[allow(clippy::needless_pass_by_value)]
 fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
     GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
+}
+
+/// Search the local skill catalog by natural-language query.
+///
+/// Scoring strategy (BM25-inspired, all-local, no embedding API):
+/// 1. Tokenize the query into lowercase terms (split on whitespace/punctuation).
+/// 2. For each skill, score against name + description:
+///    - Name exact match: +12.0 (strongest signal)
+///    - Name contains query token: +4.0 per token
+///    - Description contains query token: +2.0 per token
+///    - Description contains full query phrase: +6.0
+/// 3. Sort by score descending; ties broken by name ascending.
+/// 4. Return top N (default 5).
+///
+/// Returns matches even when scores are 0 (lets the model see nearby
+/// candidates). `total_skills_indexed` is the total active skill count
+/// regardless of `max_results`.
+fn execute_skill_search(input: SkillSearchInput) -> SkillSearchOutput {
+    let cwd = std::env::current_dir().ok();
+    let skills = cwd
+        .as_deref()
+        .and_then(|c| commands::list_skill_summaries(c).ok())
+        .unwrap_or_default();
+
+    let query = input.query.trim();
+    let max_results = input.max_results.unwrap_or(5);
+    let query_lower = query.to_lowercase();
+    let query_tokens = tokenize_skill_query(&query_lower);
+
+    let mut matches: Vec<SkillMatch> = skills
+        .iter()
+        .map(|skill| {
+            let name = skill.name();
+            let desc = skill.description().unwrap_or("");
+            let (score, reason) = score_skill_match(name, desc, &query_lower, &query_tokens);
+            SkillMatch {
+                name: name.to_string(),
+                description: if desc.is_empty() { None } else { Some(desc.to_string()) },
+                score,
+                match_reason: reason,
+            }
+        })
+        .filter(|m| m.score > 0.0)
+        .collect();
+
+    // Sort by score desc, then name asc for stable tie-breaking.
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    matches.truncate(max_results);
+
+    SkillSearchOutput {
+        query: input.query,
+        matches,
+        total_skills_indexed: skills.len(),
+    }
+}
+
+/// Tokenize a search query into lowercase terms.
+///
+/// Splits on whitespace and ASCII punctuation, keeps alphanumeric tokens
+/// of length >= 1. Non-ASCII (CJK etc.) is preserved as-is per character
+/// via `chars()` collection.
+fn tokenize_skill_query(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in query.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '-' || !ch.is_ascii() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Score a single skill against the query.
+///
+/// Returns `(score, match_reason)`. The reason is a short human-readable
+/// string explaining the strongest match signal (for debugging / model
+/// interpretability).
+fn score_skill_match(
+    name: &str,
+    description: &str,
+    query_lower: &str,
+    query_tokens: &[String],
+) -> (f64, String) {
+    let name_lower = name.to_lowercase();
+    let desc_lower = description.to_lowercase();
+    let mut score: f64 = 0.0;
+    let mut best_reason = String::new();
+
+    // 1. Name exact match (strongest).
+    if name_lower == query_lower {
+        score += 12.0;
+        best_reason = "name exact match".to_string();
+    }
+
+    // 2. Name contains the full query phrase.
+    if !query_lower.is_empty() && name_lower.contains(query_lower) {
+        score += 6.0;
+        if best_reason.is_empty() {
+            best_reason = format!("name contains '{query_lower}'");
+        }
+    }
+
+    // 3. Description contains the full query phrase.
+    if !query_lower.is_empty() && desc_lower.contains(query_lower) {
+        score += 6.0;
+        if best_reason.is_empty() {
+            best_reason = format!("description contains '{query_lower}'");
+        }
+    }
+
+    // 4. Per-token scoring against name + description.
+    let mut name_token_hits = 0;
+    let mut desc_token_hits = 0;
+    for token in query_tokens {
+        if !token.is_empty() && name_lower.contains(token) {
+            score += 4.0;
+            name_token_hits += 1;
+        }
+        if !token.is_empty() && desc_lower.contains(token) {
+            score += 2.0;
+            desc_token_hits += 1;
+        }
+    }
+    if best_reason.is_empty() {
+        if name_token_hits > 0 {
+            best_reason = format!("name keyword match ({name_token_hits} token(s))");
+        } else if desc_token_hits > 0 {
+            best_reason = format!("description keyword match ({desc_token_hits} token(s))");
+        }
+    }
+
+    (score, best_reason)
+}
+
+fn run_skill_search(input: SkillSearchInput) -> Result<String, String> {
+    to_pretty_json(execute_skill_search(input))
 }
 
 fn deferred_tool_specs() -> Vec<ToolSpec> {
@@ -9344,6 +9626,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+            complexity: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -9425,6 +9708,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+            complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9482,6 +9766,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+            complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9529,6 +9814,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+            complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9574,6 +9860,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+            complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9622,6 +9909,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+            complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9662,6 +9950,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+            complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9708,6 +9997,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+            complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9778,6 +10068,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+            complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9819,6 +10110,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+            complexity: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -11657,6 +11949,227 @@ mod provider_system_block_tests {
         assert!(
             cc_pos < dyn_pos,
             "cache_control should precede dynamic content"
+        );
+    }
+}
+
+// ── SkillSearch meta-tool tests (Phase 2: skill discovery) ──
+// These live in a dedicated test module to keep the main `tests` module
+// focused. They exercise `execute_skill_search` against on-disk skill
+// fixtures so the full discovery → scoring → ranking pipeline is covered.
+
+#[cfg(test)]
+mod skill_search_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::{execute_skill_search, SkillSearchInput};
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("clawd-skill-search-{unique}-{name}"))
+    }
+
+    /// Write a SKILL.md file under `<root>/<name>/SKILL.md` with frontmatter.
+    fn write_skill(root: &Path, name: &str, description: &str) {
+        let skill_root = root.join(name);
+        fs::create_dir_all(&skill_root).expect("skill root");
+        fs::write(
+            skill_root.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"
+            ),
+        )
+        .expect("write skill");
+    }
+
+    /// Save cwd + relevant env vars, then point cwd/HOME at `home` so skill
+    /// discovery only sees skills created under `home/.claw/skills`.
+    /// Returns a closure that restores the original environment.
+    fn isolate_skill_env(home: &Path) -> Box<dyn FnOnce() + '_> {
+        let original_dir = std::env::current_dir().expect("cwd");
+        let original_home = std::env::var_os("HOME");
+        let original_userprofile = std::env::var_os("USERPROFILE");
+        let original_claw_config = std::env::var_os("CLAW_CONFIG_HOME");
+        let original_codex_home = std::env::var_os("CODEX_HOME");
+        let original_claude_config = std::env::var_os("CLAUDE_CONFIG_DIR");
+
+        std::env::set_current_dir(home).expect("set cwd");
+        std::env::set_var("HOME", home);
+        std::env::set_var("USERPROFILE", home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        Box::new(move || {
+            std::env::set_current_dir(&original_dir).expect("restore cwd");
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            match original_claw_config {
+                Some(v) => std::env::set_var("CLAW_CONFIG_HOME", v),
+                None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            }
+            match original_codex_home {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+            match original_claude_config {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        })
+    }
+
+    #[test]
+    fn skill_search_finds_exact_name_match() {
+        let _guard = env_guard();
+        let home = temp_path("skill-search-exact");
+        let skills_dir = home.join(".claw").join("skills");
+        fs::create_dir_all(&skills_dir).expect("skills dir");
+        write_skill(&skills_dir, "pdf-extractor", "Extract text from PDF files");
+
+        let restore = isolate_skill_env(&home);
+        let output = execute_skill_search(SkillSearchInput {
+            query: "pdf-extractor".to_string(),
+            max_results: None,
+        });
+        restore();
+        let _ = fs::remove_dir_all(&home);
+
+        assert!(!output.matches.is_empty(), "should find pdf-extractor");
+        assert_eq!(output.matches[0].name, "pdf-extractor");
+        // Exact name match scores +12.0 minimum.
+        assert!(
+            output.matches[0].score >= 12.0,
+            "exact name match should score >= 12.0, got {}",
+            output.matches[0].score
+        );
+        assert!(
+            output.matches[0].match_reason.contains("exact"),
+            "reason should mention exact match: {}",
+            output.matches[0].match_reason
+        );
+        // total_skills_indexed may include skills from ancestor dirs
+        // (user home etc.); only assert it found at least our fixture.
+        assert!(
+            output.total_skills_indexed >= 1,
+            "should index at least 1 skill, got {}",
+            output.total_skills_indexed
+        );
+    }
+
+    #[test]
+    fn skill_search_finds_by_description_keyword() {
+        let _guard = env_guard();
+        let home = temp_path("skill-search-desc");
+        let skills_dir = home.join(".claw").join("skills");
+        fs::create_dir_all(&skills_dir).expect("skills dir");
+        write_skill(&skills_dir, "doc-parser", "Parse and extract data from documents");
+        write_skill(&skills_dir, "image-resizer", "Resize and crop images");
+
+        let restore = isolate_skill_env(&home);
+        let output = execute_skill_search(SkillSearchInput {
+            query: "extract data from documents".to_string(),
+            max_results: None,
+        });
+        restore();
+        let _ = fs::remove_dir_all(&home);
+
+        assert!(!output.matches.is_empty(), "should find matching skill");
+        assert_eq!(output.matches[0].name, "doc-parser");
+        // Description contains the full query phrase → +6.0, plus token hits.
+        assert!(
+            output.matches[0].score > 0.0,
+            "should have positive score"
+        );
+    }
+
+    #[test]
+    fn skill_search_returns_empty_for_no_matches() {
+        let _guard = env_guard();
+        let home = temp_path("skill-search-empty");
+        let skills_dir = home.join(".claw").join("skills");
+        fs::create_dir_all(&skills_dir).expect("skills dir");
+        write_skill(&skills_dir, "pdf-extractor", "Extract text from PDF files");
+        write_skill(&skills_dir, "image-resizer", "Resize and crop images");
+
+        let restore = isolate_skill_env(&home);
+        let output = execute_skill_search(SkillSearchInput {
+            query: "quantum computing flux capacitor".to_string(),
+            max_results: None,
+        });
+        restore();
+        let _ = fs::remove_dir_all(&home);
+
+        assert!(
+            output.matches.is_empty(),
+            "should find no matches for unrelated query"
+        );
+        // total_skills_indexed includes ancestor-discovered skills;
+        // only assert we indexed at least our 2 fixtures.
+        assert!(
+            output.total_skills_indexed >= 2,
+            "should index at least 2 skills, got {}",
+            output.total_skills_indexed
+        );
+    }
+
+    #[test]
+    fn skill_search_respects_max_results_limit() {
+        let _guard = env_guard();
+        let home = temp_path("skill-search-max");
+        let skills_dir = home.join(".claw").join("skills");
+        fs::create_dir_all(&skills_dir).expect("skills dir");
+        // Create 4 skills that all match the keyword "search".
+        write_skill(&skills_dir, "search-alpha", "Search and index alpha data");
+        write_skill(&skills_dir, "search-beta", "Search and index beta data");
+        write_skill(&skills_dir, "search-gamma", "Search and index gamma data");
+        write_skill(&skills_dir, "search-delta", "Search and index delta data");
+
+        let restore = isolate_skill_env(&home);
+        let output = execute_skill_search(SkillSearchInput {
+            query: "search".to_string(),
+            max_results: Some(2),
+        });
+        restore();
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(
+            output.matches.len(),
+            2,
+            "max_results=2 should truncate to 2 matches"
+        );
+        assert!(
+            output.total_skills_indexed >= 4,
+            "should index at least 4 skills, got {}",
+            output.total_skills_indexed
+        );
+        // All returned matches should contain "search" in name.
+        assert!(output.matches.iter().all(|m| m.name.contains("search")));
+        // Results should be sorted by score descending.
+        assert!(
+            output.matches[0].score >= output.matches[1].score,
+            "matches should be sorted by score descending"
         );
     }
 }

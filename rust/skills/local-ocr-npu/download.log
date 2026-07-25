@@ -1,0 +1,19 @@
+10:30:41 Download started.
+[10:30:41] Downloading ppocr.exe + DLLs...
+[10:30:41]   Downloading from ModelScope: https://modelscope.cn/models/FionaGu1019/PaddleOCR-OpenVINO/resolve/master/bin/ppocr-windows-x64.zip
+[10:35:51] ppocr.exe + DLLs: OK
+[10:35:51] Downloading model: PP-OCRv5_server_det_ov
+[10:38:48]   OK: inference.xml
+[10:38:48]   OK: inference.bin
+[10:38:48]   OK: inference.yml
+[10:38:48]   OK: inference_960.xml
+[10:38:48] Downloading model: PP-OCRv5_server_rec_ov
+[10:40:45]   OK: inference.xml
+[10:40:45]   OK: inference.bin
+[10:40:45]   OK: inference.yml
+[10:40:45]   OK: inference_320.xml
+[10:40:45]   OK: inference_480.xml
+[10:40:45]   OK: inference_640.xml
+[10:40:45]   OK: inference_800.xml
+[10:40:45]   OK: inference_1280.xml
+[10:40:45] ALL DONE -- skill ready. Re-run to start OCR.

@@ -2591,16 +2591,64 @@ pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
         }
     };
     let t_map = t0.elapsed();
+
+    // Skill catalog: load all active skills (project + user + builtin) and
+    // render a compact one-line-per-skill summary. Injected into the dynamic
+    // region of the system prompt so the model can discover skills without
+    // loading each SKILL.md.
+    //
+    // Best-effort: on filesystem errors we silently fall back to no catalog
+    // rather than blocking startup. The catalog is session-stable — captured
+    // once at startup, not refreshed per-turn.
+    let skill_catalog = load_skill_catalog(cwd);
+    let t_catalog = t0.elapsed();
+
     eprintln!(
-        "[timing] load_prompt_extras: memory={:?} repomap={:?} broad_cwd={} (cwd={})",
+        "[timing] load_prompt_extras: memory={:?} repomap={:?} catalog={:?} broad_cwd={} (cwd={})",
         t_mem,
         t_map,
+        t_catalog,
         is_broad_cwd,
         cwd.display()
     );
     SystemPromptExtras {
         persistent_memory,
         repomap,
+        skill_catalog,
+    }
+}
+
+/// Load active skill summaries from all roots (project + user + builtin
+/// shipped) and render them as a compact catalog string.
+///
+/// Returns `None` when:
+/// - The skills catalog feature is disabled via settings (`skillsCatalogEnabled: false`)
+/// - No skills are found (empty catalog would only waste tokens)
+/// - A filesystem error occurs during discovery (best-effort fallback)
+fn load_skill_catalog(cwd: &Path) -> Option<String> {
+    // Respect the settings toggle. We need to load config first to check.
+    // ConfigLoader::default_for is the same loader used by the main prompt
+    // builder, so the toggle semantics match exactly.
+    let config = runtime::ConfigLoader::default_for(cwd).load().ok()?;
+    if !config
+        .feature_config()
+        .skills_catalog_enabled_or_default()
+    {
+        return None;
+    }
+
+    // Load all active skills (shadowed ones are filtered out by
+    // `list_skill_summaries`).
+    let skills = commands::list_skill_summaries(cwd).ok()?;
+    if skills.is_empty() {
+        return None;
+    }
+
+    let catalog = commands::render_skill_catalog(&skills);
+    if catalog.trim().is_empty() {
+        None
+    } else {
+        Some(catalog)
     }
 }
 

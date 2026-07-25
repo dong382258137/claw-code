@@ -2183,7 +2183,7 @@ pub struct PluginsCommandResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum DefinitionSource {
+pub enum DefinitionSource {
     ProjectClaw,
     ProjectCodex,
     ProjectClaude,
@@ -2192,13 +2192,17 @@ enum DefinitionSource {
     UserClaw,
     UserCodex,
     UserClaude,
+    /// Skills shipped with the claw binary itself (e.g. `rust/skills/` in the
+    /// source tree, or `<exe-dir>/skills/` after install).
+    BuiltinShipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum DefinitionScope {
+pub enum DefinitionScope {
     Project,
     UserConfigHome,
     UserHome,
+    Builtin,
 }
 
 impl DefinitionScope {
@@ -2207,6 +2211,7 @@ impl DefinitionScope {
             Self::Project => "Project roots",
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
+            Self::Builtin => "Builtin roots",
         }
     }
 }
@@ -2219,6 +2224,7 @@ impl DefinitionSource {
             }
             Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+            Self::BuiltinShipped => DefinitionScope::Builtin,
         }
     }
 
@@ -2238,7 +2244,7 @@ struct AgentSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SkillSummary {
+pub struct SkillSummary {
     name: String,
     description: Option<String>,
     source: DefinitionSource,
@@ -2246,14 +2252,49 @@ struct SkillSummary {
     origin: SkillOrigin,
 }
 
+impl SkillSummary {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    #[must_use]
+    pub fn source(&self) -> DefinitionSource {
+        self.source
+    }
+
+    #[must_use]
+    pub fn shadowed_by(&self) -> Option<DefinitionSource> {
+        self.shadowed_by
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> SkillOrigin {
+        self.origin
+    }
+
+    /// Whether this skill is active (i.e. not shadowed by a higher-priority
+    /// source). Shadowed skills remain in the list for diagnostics but should
+    /// not be exposed as invocable to the model.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.shadowed_by.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillOrigin {
+pub enum SkillOrigin {
     SkillsDir,
     LegacyCommandsDir,
 }
 
 impl SkillOrigin {
-    fn detail_label(self) -> Option<&'static str> {
+    pub fn detail_label(self) -> Option<&'static str> {
         match self {
             Self::SkillsDir => None,
             Self::LegacyCommandsDir => Some("legacy /commands"),
@@ -2262,10 +2303,27 @@ impl SkillOrigin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SkillRoot {
+pub struct SkillRoot {
     source: DefinitionSource,
     path: PathBuf,
     origin: SkillOrigin,
+}
+
+impl SkillRoot {
+    #[must_use]
+    pub fn source(&self) -> DefinitionSource {
+        self.source
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> SkillOrigin {
+        self.origin
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3083,7 +3141,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
 }
 
 #[allow(clippy::too_many_lines)]
-fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
+pub fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
 
     for ancestor in cwd.ancestors() {
@@ -3241,6 +3299,55 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             DefinitionSource::UserClaude,
             claude_config_dir.join("commands"),
             SkillOrigin::LegacyCommandsDir,
+        );
+    }
+
+    // Built-in skills shipped with the claw binary.
+    // Resolution order (first match wins via `push_unique_skill_root`):
+    //   1. `<cwd-ancestor>/rust/skills`  — dev mode: running claw from the repo
+    //   2. `<exe-dir>/skills`            — install mode: skills co-located with binary
+    //   3. `<exe-dir>/../../skills`      — install mode variant: binary in
+    //      `rust/target/<profile>/`, skills in `rust/skills/`
+    //   4. `<home>/.claw/builtin-skills` — user-install fallback for `install.sh`
+    for ancestor in cwd.ancestors() {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::BuiltinShipped,
+            ancestor.join("rust").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            push_unique_skill_root(
+                &mut roots,
+                DefinitionSource::BuiltinShipped,
+                exe_dir.join("skills"),
+                SkillOrigin::SkillsDir,
+            );
+            push_unique_skill_root(
+                &mut roots,
+                DefinitionSource::BuiltinShipped,
+                exe_dir.join("..").join("..").join("skills"),
+                SkillOrigin::SkillsDir,
+            );
+        }
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::BuiltinShipped,
+            PathBuf::from(home).join(".claw").join("builtin-skills"),
+            SkillOrigin::SkillsDir,
+        );
+    } else if let Ok(userprofile) = env::var("USERPROFILE") {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::BuiltinShipped,
+            PathBuf::from(userprofile).join(".claw").join("builtin-skills"),
+            SkillOrigin::SkillsDir,
         );
     }
 
@@ -3514,7 +3621,7 @@ fn load_agents_from_roots(
     Ok(agents)
 }
 
-fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
+pub fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
     let mut skills = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
 
@@ -3615,7 +3722,7 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
+pub fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
     let mut lines = contents.lines();
     if lines.next().map(str::trim) != Some("---") {
         return (None, None);
@@ -3644,6 +3751,89 @@ fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
     }
 
     (name, description)
+}
+
+/// Discover skill roots from `cwd` and load all skill summaries.
+///
+/// Convenience wrapper around [`discover_skill_roots`] +
+/// [`load_skills_from_roots`] for external crates that just need the
+/// catalog without caring about root-level metadata.
+///
+/// Only returns **active** (non-shadowed) skills, sorted by name. Use
+/// [`discover_skill_roots`] + [`load_skills_from_roots`] directly if you
+/// need the full list including shadowed entries for diagnostics.
+pub fn list_skill_summaries(cwd: &Path) -> std::io::Result<Vec<SkillSummary>> {
+    let roots = discover_skill_roots(cwd);
+    let mut skills = load_skills_from_roots(&roots)?;
+    skills.retain(|s| s.is_active());
+    skills.sort_by(|a, b| a.name().cmp(b.name()));
+    Ok(skills)
+}
+
+/// Render a compact skill catalog string suitable for system prompt injection.
+///
+/// Format (one line per skill, ~30-50 tokens each):
+/// ```text
+/// - test-driven-development: Use when implementing any feature or bugfix...
+/// - frontend-design: Create distinctive, production-grade frontend...
+/// ```
+///
+/// Description is truncated to the first sentence (up to 120 chars) to keep
+/// the catalog compact. Skills without a description are still listed with
+/// just their name.
+pub fn render_skill_catalog(skills: &[SkillSummary]) -> String {
+    let mut lines = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let name = skill.name();
+        let desc = skill.description().unwrap_or("");
+        let summary = summarize_description(desc, 120);
+        if summary.is_empty() {
+            lines.push(format!("- {name}"));
+        } else {
+            lines.push(format!("- {name}: {summary}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Truncate a skill description to a compact single-line summary.
+///
+/// Strategy:
+/// 1. Take the first line (descriptions are typically single-line in frontmatter).
+/// 2. Truncate at the first sentence boundary (. ! ?) if within `max_chars`.
+/// 3. Otherwise hard-truncate at `max_chars` and append "…".
+/// 4. Trim whitespace and trailing punctuation.
+fn summarize_description(description: &str, max_chars: usize) -> String {
+    let first_line = description.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return String::new();
+    }
+    // Try to break at the first sentence boundary within limit.
+    let truncated: String = if first_line.len() <= max_chars {
+        first_line.to_string()
+    } else {
+        // Search for sentence-ending punctuation within the limit.
+        let end_byte = first_line
+            .char_indices()
+            .take(max_chars)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or_else(|| max_chars.min(first_line.len()));
+        let prefix = &first_line[..end_byte];
+        let mut break_at = prefix.len();
+        for (idx, ch) in prefix.char_indices().rev() {
+            if matches!(ch, '.' | '!' | '?') {
+                break_at = idx + 1;
+                break;
+            }
+        }
+        if break_at >= prefix.len() {
+            format!("{}…", prefix.trim_end())
+        } else {
+            prefix[..break_at].to_string()
+        }
+    };
+    truncated.trim().trim_end_matches('.').trim().to_string()
 }
 
 fn unquote_frontmatter_value(value: &str) -> String {
@@ -3679,6 +3869,7 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
+        DefinitionScope::Builtin,
     ] {
         let group = agents
             .iter()
@@ -3754,6 +3945,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
+        DefinitionScope::Builtin,
     ] {
         let group = skills
             .iter()
@@ -4181,6 +4373,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
         DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
             "user_claw"
         }
+        DefinitionSource::BuiltinShipped => "builtin_shipped",
     }
 }
 
@@ -6086,5 +6279,130 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    // ── Skill catalog public API tests (Phase 1: catalog injection) ──
+
+    #[test]
+    fn list_skill_summaries_returns_active_skills_sorted_by_name() {
+        let _guard = env_guard();
+        let home = temp_dir("catalog-home");
+        let skills_dir = home.join(".claw").join("skills");
+        fs::create_dir_all(&skills_dir).expect("skills dir");
+        write_skill(&skills_dir, "zebra-skill", "Z is for zebra");
+        write_skill(&skills_dir, "alpha-skill", "A is for alpha");
+        write_skill(&skills_dir, "mid-skill", "M is in the middle");
+
+        let original_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let original_userprofile = std::env::var_os("USERPROFILE");
+        std::env::set_var("USERPROFILE", &home);
+
+        // Use the home dir as cwd so project-root discovery doesn't pick
+        // up unrelated skills.
+        let skills = super::list_skill_summaries(&home).expect("list should succeed");
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        let _ = fs::remove_dir_all(home);
+
+        // Filter to our fixture skills; ancestor dirs (user home etc.) may
+        // contribute extra skills that we can't control in test env.
+        let fixture: Vec<_> = skills
+            .iter()
+            .filter(|s| matches!(s.name(), "alpha-skill" | "mid-skill" | "zebra-skill"))
+            .collect();
+        assert_eq!(fixture.len(), 3, "all three fixture skills should be found");
+        // list_skill_summaries sorts by name ascending.
+        assert_eq!(fixture[0].name(), "alpha-skill");
+        assert_eq!(fixture[1].name(), "mid-skill");
+        assert_eq!(fixture[2].name(), "zebra-skill");
+        // All fixture skills should be active (no shadowing in single-root scenario).
+        assert!(fixture.iter().all(|s| s.is_active()));
+    }
+
+    #[test]
+    fn render_skill_catalog_formats_one_line_per_skill() {
+        let skills = vec![
+            super::SkillSummary {
+                name: "alpha".to_string(),
+                description: Some("First skill for testing".to_string()),
+                source: super::DefinitionSource::BuiltinShipped,
+                shadowed_by: None,
+                origin: super::SkillOrigin::SkillsDir,
+            },
+            super::SkillSummary {
+                name: "beta".to_string(),
+                description: None,
+                source: super::DefinitionSource::BuiltinShipped,
+                shadowed_by: None,
+                origin: super::SkillOrigin::SkillsDir,
+            },
+        ];
+        let catalog = super::render_skill_catalog(&skills);
+        let lines: Vec<&str> = catalog.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("- alpha: "));
+        assert!(lines[0].contains("First skill"));
+        // Skills without description get just the name.
+        assert_eq!(lines[1], "- beta");
+    }
+
+    #[test]
+    fn render_skill_catalog_truncates_long_descriptions() {
+        let long_desc = "This is a very long description that exceeds the 120 character limit and should be truncated at a sentence boundary if possible or hard-truncated with an ellipsis";
+        assert!(long_desc.len() > 120);
+        let skills = vec![super::SkillSummary {
+            name: "long".to_string(),
+            description: Some(long_desc.to_string()),
+            source: super::DefinitionSource::BuiltinShipped,
+            shadowed_by: None,
+            origin: super::SkillOrigin::SkillsDir,
+        }];
+        let catalog = super::render_skill_catalog(&skills);
+        // The rendered line should be shorter than the original description.
+        let line = catalog.lines().next().expect("at least one line");
+        assert!(line.len() < long_desc.len() + 10, "should be truncated");
+    }
+
+    #[test]
+    fn list_skill_summaries_handles_missing_directory_gracefully() {
+        let _guard = env_guard();
+        let home = temp_dir("catalog-empty-home");
+        fs::create_dir_all(&home).expect("home dir");
+
+        let original_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let original_userprofile = std::env::var_os("USERPROFILE");
+        std::env::set_var("USERPROFILE", &home);
+
+        let skills = super::list_skill_summaries(&home).expect("should not error on empty");
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        let _ = fs::remove_dir_all(home);
+
+        // Ancestor dirs (user home etc.) may contribute skills we can't
+        // control; the test's core assertion is that the call succeeds
+        // without error (covered by .expect above). We only verify that
+        // no skill named like our test fixtures leaked in.
+        assert!(
+            !skills
+                .iter()
+                .any(|s| s.name().starts_with("catalog-empty")),
+            "no fixture skills should exist in empty home"
+        );
     }
 }

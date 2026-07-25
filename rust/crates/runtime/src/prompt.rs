@@ -302,6 +302,10 @@ pub struct SystemPromptBuilder {
     // `PartialEq`/`Eq` derive issues with `RepoMap`'s internal
     // `HashMap`/`SystemTime` fields. Callers pre-render via `RepoMap::render()`.
     repomap_rendered: Option<String>,
+    /// Pre-rendered skill catalog (one line per skill). Injected as a
+    /// dynamic section so it doesn't perturb the prompt-cache prefix.
+    /// See `commands::render_skill_catalog`.
+    skill_catalog: Option<String>,
 }
 
 impl SystemPromptBuilder {
@@ -382,6 +386,25 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Attach a pre-rendered skill catalog string to be injected as a
+    /// dynamic section at the end of the system prompt.
+    ///
+    /// The catalog should be pre-rendered by the caller (typically via
+    /// `commands::render_skill_catalog`) so the builder stays decoupled
+    /// from the commands crate. Each line is expected to follow the format
+    /// `- <name>: <short description>`.
+    ///
+    /// Injected in the **dynamic** region (after the cache boundary) so it
+    /// doesn't perturb the static prompt-cache prefix. The catalog is
+    /// session-stable: it's captured at startup and not refreshed per-turn,
+    /// so its bytes stay constant within a session (only the surrounding
+    /// dynamic sections like NOTEBOOK/Plan vary).
+    #[must_use]
+    pub fn with_skill_catalog(mut self, catalog: impl Into<String>) -> Self {
+        self.skill_catalog = Some(catalog.into());
+        self
+    }
+
     #[must_use]
     pub fn append_section(mut self, section: impl Into<String>) -> Self {
         self.append_sections.push(section.into());
@@ -455,6 +478,16 @@ impl SystemPromptBuilder {
         // commits），虽 build() 时一次性捕获，但将来可能支持 turn 间刷新。
         if let Some(project_context) = &self.project_context {
             sections.push(render_project_context(project_context));
+        }
+        // Skill catalog: pre-rendered one-line-per-skill summary letting the
+        // model discover available skills without loading each SKILL.md.
+        // Injected in dynamic region so it doesn't perturb the static cache
+        // prefix. Bytes are session-stable (captured at startup).
+        if let Some(catalog) = &self.skill_catalog {
+            let section = render_skill_catalog_section(catalog);
+            if !section.is_empty() {
+                sections.push(section);
+            }
         }
         sections.extend(self.append_sections.iter().cloned());
         sections
@@ -819,6 +852,13 @@ pub struct SystemPromptExtras {
     pub persistent_memory: Option<PersistentMemory>,
     /// Pre-rendered repository map string injected as a static section.
     pub repomap: Option<String>,
+    /// Pre-rendered skill catalog string (one line per skill, name + short
+    /// description) injected as a dynamic section at the end of the system
+    /// prompt. Lets the model discover available skills without loading
+    /// each SKILL.md. `None` disables catalog injection.
+    ///
+    /// See `commands::render_skill_catalog` for the standard renderer.
+    pub skill_catalog: Option<String>,
 }
 
 /// Loads config and project context, then renders the system prompt text.
@@ -870,6 +910,9 @@ pub fn load_system_prompt_with_extras(
     }
     if let Some(map) = extras.repomap {
         builder = builder.with_repomap(map);
+    }
+    if let Some(catalog) = extras.skill_catalog {
+        builder = builder.with_skill_catalog(catalog);
     }
     // Cache Aligner (Phase 1):走 build_split() 路径而非 build()，
     // 让 DynamicValueExtractor 对 static sections 提取动态值并用占位符替换，
@@ -1202,6 +1245,32 @@ fn render_repomap_section(rendered_map: &str) -> String {
         return String::new();
     }
     format!("## Repository Map\n{rendered_map}")
+}
+
+/// Render the skill catalog as a system prompt section.
+///
+/// The `catalog` is a pre-rendered string (one line per skill, expected
+/// format `- <name>: <short description>`). This wrapper adds a header
+/// explaining to the model how to use the catalog: invoke the `Skill`
+/// tool with the skill name to load full instructions, or use `SkillSearch`
+/// to discover skills by semantic query.
+///
+/// Placed in `dynamic_sections` (after the boundary marker) so it doesn't
+/// perturb the static prompt-cache prefix. Bytes are session-stable.
+fn render_skill_catalog_section(catalog: &str) -> String {
+    let trimmed = catalog.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "## Available Skills\n\
+         The following skills are available. To load a skill's full instructions,\n\
+         call the `Skill` tool with the skill name. To discover skills by semantic\n\
+         query (e.g. when you don't know the exact name), call `SkillSearch` with\n\
+         a capability description.\n\
+         \n\
+         {trimmed}"
+    )
 }
 
 #[cfg(test)]
@@ -2091,5 +2160,84 @@ mod tests {
         let result = truncate_diff_to_budget(&long, 50);
         assert!(result.chars().count() < 200);
         assert!(result.contains("truncated"));
+    }
+
+    // ── Skill catalog injection tests (Phase 1) ──
+
+    #[test]
+    fn skill_catalog_section_is_injected_into_dynamic_region() {
+        let catalog = "- alpha-skill: First skill\n- beta-skill: Second skill";
+        let sections = SystemPromptBuilder::new()
+            .with_skill_catalog(catalog)
+            .build();
+        // Catalog section should appear after the boundary marker.
+        let boundary_idx = sections
+            .iter()
+            .position(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("boundary should exist");
+        let catalog_section_idx = sections
+            .iter()
+            .position(|s| s.contains("## Available Skills"))
+            .expect("catalog section should be present");
+        assert!(
+            catalog_section_idx > boundary_idx,
+            "catalog must be in dynamic region (after boundary)"
+        );
+        // Catalog should contain both skills.
+        let catalog_section = &sections[catalog_section_idx];
+        assert!(catalog_section.contains("alpha-skill"));
+        assert!(catalog_section.contains("beta-skill"));
+        // Should mention how to use it (Skill tool / SkillSearch).
+        assert!(catalog_section.contains("`Skill`"));
+        assert!(catalog_section.contains("`SkillSearch`"));
+    }
+
+    #[test]
+    fn skill_catalog_not_injected_when_not_set() {
+        let sections = SystemPromptBuilder::new().build();
+        let has_catalog = sections
+            .iter()
+            .any(|s| s.contains("## Available Skills"));
+        assert!(!has_catalog, "no catalog section when skill_catalog is None");
+    }
+
+    #[test]
+    fn skill_catalog_not_injected_when_empty() {
+        let sections = SystemPromptBuilder::new()
+            .with_skill_catalog("   \n  \n")
+            .build();
+        let has_catalog = sections
+            .iter()
+            .any(|s| s.contains("## Available Skills"));
+        assert!(!has_catalog, "empty/whitespace catalog should be skipped");
+    }
+
+    #[test]
+    fn skill_catalog_does_not_perturb_static_region() {
+        // The catalog must be in dynamic region so the static cache prefix
+        // stays byte-stable regardless of catalog content.
+        let sections_without_catalog = SystemPromptBuilder::new().build();
+        let sections_with_catalog = SystemPromptBuilder::new()
+            .with_skill_catalog("- some-skill: description")
+            .build();
+        let boundary_idx_without = sections_without_catalog
+            .iter()
+            .position(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("boundary");
+        let boundary_idx_with = sections_with_catalog
+            .iter()
+            .position(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("boundary");
+        assert_eq!(
+            boundary_idx_without, boundary_idx_with,
+            "boundary index must not shift when catalog is added"
+        );
+        // Static sections (before boundary) must be identical.
+        let static_without = &sections_without_catalog[..boundary_idx_without];
+        let static_with = &sections_with_catalog[..boundary_idx_with];
+        assert_eq!(
+            static_without, static_with,
+            "static region must be unaffected by catalog injection"
+        );
     }
 }

@@ -76,6 +76,17 @@ pub struct RuntimeFeatureConfig {
     plan_mode: Option<bool>,
     slop_scan: Option<bool>,
     completion_verify: Option<bool>,
+    /// Skill catalog injection into system prompt. `Some(true)` (default)
+    /// injects a one-line-per-skill summary into the dynamic region of the
+    /// system prompt so the model can discover available skills. Set to
+    /// `Some(false)` to disable (e.g. for token-budget-constrained sessions).
+    /// `None` is treated as enabled.
+    skills_catalog_enabled: Option<bool>,
+    /// Skill search meta-tool (`SkillSearch`). `Some(true)` (default) exposes
+    /// a dedicated `SkillSearch` tool that lets the model discover skills by
+    /// semantic query without enumerating the full catalog. Set to `Some(false)`
+    /// to hide the tool. `None` is treated as enabled.
+    skills_tool_search_enabled: Option<bool>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -456,6 +467,8 @@ impl ConfigLoader {
             plan_mode: parse_optional_plan_mode(&merged_value),
             slop_scan: None,
             completion_verify: None,
+            skills_catalog_enabled: parse_optional_bool(&merged_value, "skillsCatalogEnabled"),
+            skills_tool_search_enabled: parse_optional_bool(&merged_value, "skillsToolSearchEnabled"),
         };
 
         Ok(RuntimeConfig {
@@ -669,6 +682,34 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn completion_verify(&self) -> Option<bool> {
         self.completion_verify
+    }
+
+    /// Skill catalog injection into system prompt. `None` or `Some(true)`
+    /// means enabled (default); `Some(false)` means disabled.
+    #[must_use]
+    pub fn skills_catalog_enabled(&self) -> Option<bool> {
+        self.skills_catalog_enabled
+    }
+
+    /// Convenience: returns `true` when catalog injection is enabled (i.e.
+    /// `None` or `Some(true)`).
+    #[must_use]
+    pub fn skills_catalog_enabled_or_default(&self) -> bool {
+        self.skills_catalog_enabled.unwrap_or(true)
+    }
+
+    /// Skill search meta-tool (`SkillSearch`) visibility. `None` or
+    /// `Some(true)` means the tool is exposed (default); `Some(false)`
+    /// means hidden.
+    #[must_use]
+    pub fn skills_tool_search_enabled(&self) -> Option<bool> {
+        self.skills_tool_search_enabled
+    }
+
+    /// Convenience: returns `true` when the SkillSearch tool is enabled.
+    #[must_use]
+    pub fn skills_tool_search_enabled_or_default(&self) -> bool {
+        self.skills_tool_search_enabled.unwrap_or(true)
     }
 }
 
@@ -1218,6 +1259,14 @@ fn parse_optional_poor_mode(root: &JsonValue) -> Option<bool> {
 fn parse_optional_plan_mode(root: &JsonValue) -> Option<bool> {
     root.as_object()
         .and_then(|object| object.get("planMode"))
+        .and_then(JsonValue::as_bool)
+}
+
+/// 通用布尔配置项解析器。读取 `settings.<key>` 字段，未配置或类型不匹配时
+/// 返回 `None`。用于新增的 skills 等配置项，避免重复实现。
+fn parse_optional_bool(root: &JsonValue, key: &str) -> Option<bool> {
+    root.as_object()
+        .and_then(|object| object.get(key))
         .and_then(JsonValue::as_bool)
 }
 
