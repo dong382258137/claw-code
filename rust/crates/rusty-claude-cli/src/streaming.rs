@@ -375,10 +375,12 @@ impl ApiClient for AnthropicRuntimeClient {
         // 自动降低 reasoning_effort 到 "low"。模型读完工具结果后的续写通常不需要
         // 深度推理,降低 effort 可节省 output token 和延迟。
         // 新问题或用户显式设置 high 时保持全力。
-        let effective_effort = if is_post_tool && self.reasoning_effort.as_deref() != Some("high") {
-            Some("low".to_string())
-        } else {
-            self.reasoning_effort.clone()
+        // 注意:仅在用户已开启 reasoning(self.reasoning_effort = Some)时才生效;
+        // 若为 None 则保持 None,避免为非 reasoning 模型意外注入 reasoning_effort
+        // 参数(会触发 DeepSeek thinking 模式并要求回传 reasoning_content)。
+        let effective_effort = match (is_post_tool, &self.reasoning_effort) {
+            (true, Some(effort)) if effort != "high" => Some("low".to_string()),
+            _ => self.reasoning_effort.clone(),
         };
 
         let message_request = MessageRequest {
@@ -1146,10 +1148,10 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) ->
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
-                ContentBlock::Thinking { .. } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     if keep_thinking {
                         Some(InputContentBlock::Thinking {
-                            thinking: String::new(),
+                            thinking: thinking.clone(),
                             signature: None,
                         })
                     } else {
