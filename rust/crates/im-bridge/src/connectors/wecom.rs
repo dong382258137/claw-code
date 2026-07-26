@@ -199,14 +199,14 @@ impl WeComClient {
     /// Push a text message to a WeCom chat via webhook URL.
     ///
     /// Uses the smart bot webhook (passive response channel) or
-    /// the generic message-send API with access token.
-    pub async fn push_text_message(&self, _chat_id: &str, text: &str) -> Result<(), String> {
+    /// the `appchat/send` API with access token.
+    pub async fn push_text_message(&self, chat_id: &str, text: &str) -> Result<(), String> {
         // Prefer webhook if configured (simpler, no token needed)
         if let Some(ref webhook_url) = self.config.webhook_url {
             self.push_via_webhook(webhook_url, text).await
         } else {
-            // Fall back to API-based send
-            self.push_via_api(text).await
+            // Fall back to API-based send (targeted at the specific chat)
+            self.push_via_api(chat_id, text).await
         }
     }
 
@@ -259,15 +259,16 @@ impl WeComClient {
         Ok(())
     }
 
-    /// Push via WeCom API (requires access token).
-    async fn push_via_api(&self, text: &str) -> Result<(), String> {
+    /// Push via WeCom `appchat/send` API (requires access token).
+    ///
+    /// Targets a specific chat via `chatid` instead of broadcasting to `@all`.
+    async fn push_via_api(&self, chat_id: &str, text: &str) -> Result<(), String> {
         let token = self.get_access_token().await?;
 
         #[derive(Serialize)]
         struct ApiBody<'a> {
-            touser: &'a str,
+            chatid: &'a str,
             msgtype: &'a str,
-            agentid: i64,
             text: ApiText<'a>,
         }
 
@@ -277,13 +278,12 @@ impl WeComClient {
         }
 
         let body = ApiBody {
-            touser: "@all",
+            chatid: chat_id,
             msgtype: "text",
-            agentid: self.config.agent_id.unwrap_or(0),
             text: ApiText { content: text },
         };
 
-        let url = format!("https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}");
+        let url = format!("https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token={token}");
 
         #[derive(Deserialize)]
         struct ApiResponse {
@@ -310,7 +310,7 @@ impl WeComClient {
             ));
         }
 
-        tracing::info!("wecom api message sent");
+        tracing::info!("wecom api message sent to chat {chat_id}");
         Ok(())
     }
 }

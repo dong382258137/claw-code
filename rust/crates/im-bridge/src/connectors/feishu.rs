@@ -173,26 +173,37 @@ impl FeishuClient {
         }
     }
 
-    /// Verify the Feishu webhook signature (if verification_token is configured).
+    /// Whether signature verification is required (encrypt_key is configured).
     ///
-    /// Feishu signature format: SHA256(timestamp + nonce + verification_token)
-    pub fn verify_signature(
+    /// When `true`, the webhook handler MUST verify the `X-Lark-Signature`
+    /// header before processing the event.
+    pub fn requires_signature(&self) -> bool {
+        self.config.encrypt_key.is_some()
+    }
+
+    /// Verify the Feishu event signature (if encrypt_key is configured).
+    ///
+    /// Feishu signature format: SHA256(timestamp + nonce + encrypt_key + body)
+    /// where `body` is the raw request body string.
+    ///
+    /// If `encrypt_key` is None, verification is skipped (dev mode).
+    pub fn verify_event_signature(
         &self,
         timestamp: &str,
         nonce: &str,
         body: &str,
         signature: &str,
     ) -> bool {
-        match &self.config.verification_token {
-            Some(token) => {
-                let data = format!("{timestamp}{nonce}{token}{body}");
+        match &self.config.encrypt_key {
+            Some(key) => {
+                let data = format!("{timestamp}{nonce}{key}{body}");
                 let mut hasher = Sha256::new();
                 hasher.update(data.as_bytes());
                 let computed = hex::encode(hasher.finalize());
                 // Constant-time-ish comparison
                 computed == signature
             }
-            None => true, // No verification token → skip verification (dev mode)
+            None => true, // No encrypt key → skip verification (dev mode)
         }
     }
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, Json},
     routing::{get, post},
     Router,
@@ -101,7 +101,9 @@ pub async fn run_server(
         .map_err(|e| format!("failed to bind to {addr}: {e}"))?;
 
     let server_task = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("HTTP server error: {e}");
+        }
     });
 
     Ok(ServerHandle {
@@ -122,11 +124,42 @@ async fn health_handler() -> &'static str {
 
 async fn feishu_webhook(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: String,
 ) -> Result<Json<Value>, StatusCode> {
     // Guard: ensure feishu client is configured
-    if state.feishu_client.is_none() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    let feishu = state
+        .feishu_client
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    // P1-3: Verify event signature when encrypt_key is configured.
+    // Feishu sends three headers: X-Lark-Signature, X-Lark-Request-Timestamp,
+    // X-Lark-Request-Nonce. If encrypt_key is set but headers are missing or
+    // the signature doesn't match, reject the request as unauthorized.
+    if feishu.requires_signature() {
+        let sig = headers
+            .get("x-lark-signature")
+            .and_then(|v| v.to_str().ok());
+        let ts = headers
+            .get("x-lark-request-timestamp")
+            .and_then(|v| v.to_str().ok());
+        let nonce = headers
+            .get("x-lark-request-nonce")
+            .and_then(|v| v.to_str().ok());
+
+        match (sig, ts, nonce) {
+            (Some(s), Some(t), Some(n)) => {
+                if !feishu.verify_event_signature(t, n, &body, s) {
+                    tracing::warn!("feishu signature verification failed");
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            _ => {
+                tracing::warn!("feishu signature headers missing (encrypt_key configured)");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
     }
 
     let webhook: FeishuWebhookBody = serde_json::from_str(&body).map_err(|e| {

@@ -1149,7 +1149,10 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) ->
             .filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
                 ContentBlock::Thinking { thinking, .. } => {
-                    if keep_thinking {
+                    // 仅在 keep_thinking 且 thinking 内容非空时才回传。
+                    // 空的 thinking 内容会被 DeepSeek 的 thinking 模式拒绝
+                    // (400: reasoning_content must be passed back)。
+                    if keep_thinking && !thinking.is_empty() {
                         Some(InputContentBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: None,

@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::ProviderClient;
-use claw_shell::ClawAgentBuilder;
 use im_bridge::api_adapter::BridgeApiClient;
 use im_bridge::config::ImBridgeConfig;
 use im_bridge::response::SessionRouter;
@@ -14,6 +13,7 @@ use im_bridge::server::run_server;
 use im_bridge::session::SessionManager;
 use runtime::{PermissionMode, PermissionPolicy};
 use tokio_util::sync::CancellationToken;
+use tools::GlobalToolRegistry;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -54,7 +54,12 @@ async fn run_bridge(config: &ImBridgeConfig) -> Result<(), String> {
     let provider = ProviderClient::from_model(&model)
         .map_err(|e| format!("failed to create API client: {e}"))?;
 
-    let bridge_client = BridgeApiClient::new(provider, model.clone(), true);
+    let bridge_client = BridgeApiClient::new(
+        provider,
+        model.clone(),
+        true,
+        GlobalToolRegistry::builtin(),
+    );
 
     let system_prompt = vec![
         format!(
@@ -67,11 +72,14 @@ async fn run_bridge(config: &ImBridgeConfig) -> Result<(), String> {
     ];
 
     let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite);
-    let builder = ClawAgentBuilder::new(bridge_client, policy, system_prompt);
-
     let cancel = CancellationToken::new();
-    let spawn_result =
-        SessionManager::spawn_with_restore(builder, cancel, config.session_timeout_secs);
+    let spawn_result = SessionManager::spawn(
+        bridge_client,
+        system_prompt,
+        policy,
+        cancel,
+        config.session_timeout_secs,
+    );
 
     let session_router: SessionRouter = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 

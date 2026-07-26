@@ -9,6 +9,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod model_tier;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -283,6 +284,19 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
+    // DeepSeek models (deepseek-v4-pro, deepseek-v4-flash, deepseek-chat,
+    // deepseek-reasoner, etc.) via OpenAI-compatible protocol.
+    // Uses DEEPSEEK_API_KEY as primary auth, with fallback to OPENAI_API_KEY
+    // at credential-check time for users who route through OpenRouter or
+    // a unified proxy.
+    if canonical.starts_with("deepseek") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
         });
     }
     None

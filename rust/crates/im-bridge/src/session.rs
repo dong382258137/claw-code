@@ -1,24 +1,44 @@
-//! Session manager: maps IM chats to ACP agent sessions.
+//! Session manager: maps IM chats to per-chat ACP agent sessions.
 //!
 //! Services:
 //! - Session routing: one agent session per IM chat
 //! - Command handling: chat commands intercepted before agent
 //! - Session lifecycle: create, reuse, destroy, persist
+//!
+//! ## Architecture (multi-agent, fixes 隐患-12)
+//!
+//! Each `ChatKey` gets its own `spawn_claw_shell` agent thread, so concurrent
+//! users on different chats don't block each other. All agents' notification
+//! streams are merged into one channel for `ResponseCollector`.
+//!
+//! ## P0-2 fix: lock-free ACP handshake
+//!
+//! `get_or_create_session` does NOT hold the sessions Mutex across `await`
+//! points. It locks briefly to check, drops the lock for the ACP handshake,
+//! then re-locks to insert — handling the race with double-checked insertion.
+//!
+//! ## P2-7: idle timeout cleanup
+//!
+//! A background task periodically scans for sessions idle longer than
+//! `idle_timeout` and cancels their agent threads.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol as acp;
-use claw_acp::acp_send;
+use claw_acp::{acp_send, AcpClientMessage};
 use claw_shell::{spawn_claw_shell, ClawAgentBuilder};
+use runtime::PermissionPolicy;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::api_adapter::BridgeApiClient;
 use crate::commands::{parse_command, ChatCommand, CommandParseResult};
 use crate::persistence::{PersistedSession, PersistenceManager};
 use crate::response::PromptCompleted;
+use crate::tools::register_default_tools;
 
 /// Identifies a specific IM chat across platforms.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -54,103 +74,108 @@ pub struct ImRequest {
     pub text: String,
 }
 
-struct AgentSession {
+/// Per-chat agent entry. Each chat gets its own agent thread + ACP channels.
+struct AgentEntry {
+    /// Sender for ACP requests (Prompt, Cancel, etc.) → agent thread.
+    agent_tx: mpsc::UnboundedSender<claw_acp::AcpAgentMessage>,
     session_id: acp::SessionId,
     cwd: std::path::PathBuf,
     last_active: Instant,
     user_id: String,
+    /// Cancel token for this agent's thread. Firing it causes the agent to exit.
+    cancel: CancellationToken,
 }
 
 /// Manages agent lifecycle and session routing.
+///
+/// Multi-agent design (隐患-12 fix): each `ChatKey` has its own agent thread,
+/// so concurrent chats are processed in parallel rather than serialized through
+/// a single agent.
 pub struct SessionManager {
-    sessions: Arc<Mutex<HashMap<ChatKey, AgentSession>>>,
-    agent_tx: mpsc::UnboundedSender<claw_acp::AcpAgentMessage>,
+    sessions: Arc<Mutex<HashMap<ChatKey, AgentEntry>>>,
+    /// Template client — cloned for each new agent.
+    api_client: BridgeApiClient,
+    system_prompt: Vec<String>,
+    permission_policy: PermissionPolicy,
+    parent_cancel: CancellationToken,
+    /// Merged notification channel: all agents forward their `AcpClientMessage`s here.
+    notification_tx: mpsc::UnboundedSender<AcpClientMessage>,
     completion_tx: mpsc::UnboundedSender<PromptCompleted>,
-    #[allow(dead_code)]
     idle_timeout: Duration,
-    /// Persistence manager for save/restore.
     persistence: PersistenceManager,
 }
 
 /// Result of spawning a session manager.
 pub struct SpawnResult {
     pub manager: Arc<SessionManager>,
-    pub notification_rx: mpsc::UnboundedReceiver<claw_acp::AcpClientMessage>,
+    pub notification_rx: mpsc::UnboundedReceiver<AcpClientMessage>,
     pub completion_rx: mpsc::UnboundedReceiver<PromptCompleted>,
     pub keep_alive: SpawnKeepAlive,
 }
 
-/// Holds the spawned agent thread handle to prevent early drop.
+/// Holds background task handles to prevent early drop.
 pub struct SpawnKeepAlive {
-    _thread: std::thread::JoinHandle<()>,
+    /// Idle-cleanup task handle.
+    _idle_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SessionManager {
-    /// Spawn the agent in a background thread and create the manager.
-    pub fn spawn<C>(
-        builder: ClawAgentBuilder<C>,
-        cancel: CancellationToken,
+    /// Spawn the session manager with multi-agent support.
+    ///
+    /// Each new chat session will spawn its own `ClawAgentBuilder` (with a cloned
+    /// `BridgeApiClient`) and run in a dedicated thread, so concurrent users
+    /// don't block each other.
+    ///
+    /// Persisted sessions from a previous run are loaded for awareness; new
+    /// agent sessions are created on first message to each chat (ACP sessions
+    /// don't survive process restart).
+    pub fn spawn(
+        api_client: BridgeApiClient,
+        system_prompt: Vec<String>,
+        permission_policy: PermissionPolicy,
+        parent_cancel: CancellationToken,
         idle_timeout_secs: u64,
-    ) -> SpawnResult
-    where
-        C: runtime::ApiClient + Send + 'static,
-    {
-        let spawned =
-            spawn_claw_shell(builder, &cancel).expect("failed to spawn claw agent for IM bridge");
-
-        let claw_acp::AcpClientChannel {
-            rx: notification_rx,
-            tx: agent_tx,
-        } = spawned.channel;
-
+    ) -> SpawnResult {
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
+        let manager = Arc::new(SessionManager {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            api_client,
+            system_prompt,
+            permission_policy,
+            parent_cancel: parent_cancel.clone(),
+            notification_tx,
+            completion_tx,
+            idle_timeout: Duration::from_secs(idle_timeout_secs),
+            persistence: PersistenceManager::new(),
+        });
+
+        // P2-7: Spawn idle-cleanup background task
+        let cleanup_mgr = manager.clone();
+        let idle_task = tokio::spawn(async move {
+            cleanup_mgr.run_idle_cleanup().await;
+        });
+
+        // 隐患-11: Load persisted sessions for awareness only.
+        // ACP sessions don't survive restart, so we can't truly "restore" them.
+        // New agent sessions are created on first message to each chat.
+        let persisted = manager.persistence.load();
+        if !persisted.sessions.is_empty() {
+            tracing::info!(
+                "loaded {} persisted session record(s); new agents will be created on first message",
+                persisted.sessions.len()
+            );
+        }
+
         SpawnResult {
-            manager: Arc::new(SessionManager {
-                sessions: Arc::new(Mutex::new(HashMap::new())),
-                agent_tx,
-                completion_tx,
-                idle_timeout: Duration::from_secs(idle_timeout_secs),
-                persistence: PersistenceManager::new(),
-            }),
+            manager,
             notification_rx,
             completion_rx,
             keep_alive: SpawnKeepAlive {
-                _thread: spawned._thread_handle,
+                _idle_task: Some(idle_task),
             },
         }
-    }
-
-    /// Spawn and restore previously persisted sessions.
-    ///
-    /// Restored sessions are re-established as "stale" — the agent process is new,
-    /// but the session routing is restored. Old agent conversations are lost
-    /// (ACP sessions don't survive process restart), but we preserve the chat→session
-    /// mapping for future messages.
-    pub fn spawn_with_restore<C>(
-        builder: ClawAgentBuilder<C>,
-        cancel: CancellationToken,
-        idle_timeout_secs: u64,
-    ) -> SpawnResult
-    where
-        C: runtime::ApiClient + Send + 'static,
-    {
-        let result = Self::spawn(builder, cancel, idle_timeout_secs);
-
-        let persisted = result.manager.persistence.load();
-        let restored_count = persisted.sessions.len();
-
-        if restored_count > 0 {
-            tracing::info!(
-                "restoring {} previously persisted session(s); note: agent conversations are fresh",
-                restored_count
-            );
-            // We don't actually re-create ACP sessions (they don't survive restart).
-            // The persisted data serves as a record; new sessions will be created
-            // on first message to each chat.
-        }
-
-        result
     }
 
     /// Get the persistence manager reference (for periodic saves).
@@ -205,7 +230,23 @@ impl SessionManager {
             .get_or_create_session(&req.chat_key, &req.user_id)
             .await?;
 
-        let tx = self.agent_tx.clone();
+        // Get the agent_tx for this chat (clone the sender, don't hold the lock)
+        let agent_tx = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(&req.chat_key)
+                .map(|e| e.agent_tx.clone())
+                .ok_or_else(|| "session disappeared during process_request".to_string())?
+        };
+
+        // Update last_active
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(entry) = sessions.get_mut(&req.chat_key) {
+                entry.last_active = Instant::now();
+            }
+        }
+
         let completion_tx = self.completion_tx.clone();
         let sid = session_id.clone();
         let text = req.text;
@@ -217,7 +258,7 @@ impl SessionManager {
                 vec![acp::ContentBlock::Text(acp::TextContent::new(&text))],
             );
 
-            let success = match acp_send(prompt_req, &tx).await {
+            let success = match acp_send(prompt_req, &agent_tx).await {
                 Ok(_) => {
                     tracing::info!("prompt sent for session {}", sid);
                     true
@@ -249,13 +290,13 @@ impl SessionManager {
         let sessions = self.sessions.lock().await;
         sessions
             .iter()
-            .map(|(key, session)| PersistedSession {
+            .map(|(key, entry)| PersistedSession {
                 platform: key.platform.clone(),
                 chat_id: key.chat_id.clone(),
-                session_id: session.session_id.to_string(),
-                cwd: session.cwd.display().to_string(),
-                last_active_secs: session.last_active.elapsed().as_secs(),
-                user_id: Some(session.user_id.clone()),
+                session_id: entry.session_id.to_string(),
+                cwd: entry.cwd.display().to_string(),
+                last_active_secs: entry.last_active.elapsed().as_secs(),
+                user_id: Some(entry.user_id.clone()),
             })
             .collect()
     }
@@ -274,43 +315,79 @@ impl SessionManager {
 
     // ── private helpers ───────────────────────────────────────
 
+    /// Get an existing session for the chat, or create a new one.
+    ///
+    /// P0-2 fix: the Mutex is NOT held across `await` points. The flow is:
+    /// 1. Lock briefly to check for an existing session → drop lock
+    /// 2. Perform ACP handshake (initialize/authenticate/new_session) without lock
+    /// 3. Re-lock to insert — handle race condition (if another thread won, reuse theirs)
     async fn get_or_create_session(
         &self,
         key: &ChatKey,
         user_id: &str,
     ) -> Result<acp::SessionId, String> {
-        let mut sessions = self.sessions.lock().await;
-
-        // Check for existing session
-        if let Some(session) = sessions.get(key) {
-            let sid = session.session_id.clone();
-            // Update last_active
-            if let Some(s) = sessions.get_mut(key) {
-                s.last_active = Instant::now();
+        // Fast path: check for existing session (brief lock, no await)
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(entry) = sessions.get(key) {
+                tracing::debug!(
+                    "reusing existing session {} for chat {:?}",
+                    entry.session_id,
+                    key
+                );
+                return Ok(entry.session_id.clone());
             }
-            tracing::debug!("reusing existing session {} for chat {:?}", sid, key);
-            return Ok(sid);
         }
 
-        // Create new session via ACP
+        // Slow path: create a new agent + ACP handshake (NO lock held)
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
+        let builder = ClawAgentBuilder::new(
+            self.api_client.clone(),
+            self.permission_policy.clone(),
+            self.system_prompt.clone(),
+        )
+        .with_tool_setup(|executor| {
+            register_default_tools(executor);
+        });
+
+        let child_cancel = self.parent_cancel.child_token();
+        let spawned =
+            spawn_claw_shell(builder, &child_cancel).map_err(|e| format!("spawn agent: {e}"))?;
+
+        let claw_acp::AcpClientChannel {
+            rx: notification_rx,
+            tx: agent_tx,
+        } = spawned.channel;
+
+        // Forward this agent's notifications into the merged channel
+        let merged_tx = self.notification_tx.clone();
+        tokio::spawn(async move {
+            let mut rx = notification_rx;
+            while let Some(msg) = rx.recv().await {
+                if merged_tx.send(msg).is_err() {
+                    break; // merged channel closed — stop forwarding
+                }
+            }
+        });
+
+        // ACP handshake (no sessions lock held)
         acp_send(
             acp::InitializeRequest::new(acp::ProtocolVersion::LATEST),
-            &self.agent_tx,
+            &agent_tx,
         )
         .await
         .map_err(|e| format!("initialize failed: {e}"))?;
 
         acp_send(
             acp::AuthenticateRequest::new(acp::AuthMethodId::new("api_key")),
-            &self.agent_tx,
+            &agent_tx,
         )
         .await
         .map_err(|e| format!("authenticate failed: {e}"))?;
 
         let session_req = acp::NewSessionRequest::new(cwd.clone());
-        let session_resp = acp_send(session_req, &self.agent_tx)
+        let session_resp = acp_send(session_req, &agent_tx)
             .await
             .map_err(|e| format!("new_session failed: {e}"))?;
 
@@ -322,32 +399,90 @@ impl SessionManager {
             user_id
         );
 
-        sessions.insert(
-            key.clone(),
-            AgentSession {
-                session_id: session_id.clone(),
-                cwd,
-                last_active: Instant::now(),
-                user_id: user_id.to_string(),
-            },
-        );
+        // Re-lock to insert — handle race: another thread may have inserted first
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(existing) = sessions.get(key) {
+                // Race: another concurrent request created a session for this chat.
+                // Cancel our agent and reuse the existing one.
+                let existing_sid = existing.session_id.clone();
+                tracing::debug!(
+                    "race detected for chat {:?}: reusing session {}",
+                    key,
+                    existing_sid
+                );
+                drop(sessions);
+                child_cancel.cancel();
+                return Ok(existing_sid);
+            }
+            sessions.insert(
+                key.clone(),
+                AgentEntry {
+                    agent_tx,
+                    session_id: session_id.clone(),
+                    cwd,
+                    last_active: Instant::now(),
+                    user_id: user_id.to_string(),
+                    cancel: child_cancel,
+                },
+            );
+        }
 
         Ok(session_id)
     }
 
     /// Force creation of a new session, replacing any existing one.
+    ///
+    /// Cancels the old agent thread and removes the entry before creating a new one.
     async fn force_new_session(
         &self,
         key: &ChatKey,
         user_id: &str,
     ) -> Result<acp::SessionId, String> {
-        // Remove old session
+        // Cancel and remove old agent if any
         {
             let mut sessions = self.sessions.lock().await;
-            sessions.remove(key);
+            if let Some(entry) = sessions.remove(key) {
+                entry.cancel.cancel();
+                tracing::info!("cancelled old agent for chat {:?}", key);
+            }
         }
 
         // Create new one
         self.get_or_create_session(key, user_id).await
+    }
+
+    /// P2-7: Background task that periodically removes idle sessions.
+    ///
+    /// Runs every 60 seconds. Sessions whose `last_active` exceeds `idle_timeout`
+    /// are cancelled (agent thread exits) and removed from the map.
+    async fn run_idle_cleanup(self: Arc<Self>) {
+        let check_interval = Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(check_interval).await;
+
+            let now = Instant::now();
+            let expired: Vec<ChatKey> = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .iter()
+                    .filter(|(_, e)| now.duration_since(e.last_active) > self.idle_timeout)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            };
+
+            if expired.is_empty() {
+                continue;
+            }
+
+            tracing::info!("idle cleanup: removing {} expired session(s)", expired.len());
+            let mut sessions = self.sessions.lock().await;
+            for key in &expired {
+                if let Some(entry) = sessions.remove(key) {
+                    entry.cancel.cancel();
+                    tracing::debug!("idle cleanup: cancelled agent for chat {:?}", key);
+                }
+            }
+        }
     }
 }

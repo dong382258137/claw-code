@@ -33,6 +33,10 @@ pub use providers::{
     provider_diagnostics_for_model, resolve_model_alias, ModelTokenLimit, ProviderDiagnostics,
     ProviderKind,
 };
+pub use providers::model_tier::{
+    model_meets_complexity, tier_for_model, upgrade_cost_multiplier, upgrade_model, ModelTier,
+    TaskComplexity,
+};
 pub use sse::{parse_frame, SseParser};
 pub use types::{
     CacheControl, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,

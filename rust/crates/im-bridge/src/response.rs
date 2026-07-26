@@ -83,8 +83,8 @@ impl ResponseCollector {
                 // Prompt completed signal
                 msg = self.completion_rx.recv() => {
                     match msg {
-                        Some(PromptCompleted { session_id, .. }) => {
-                            self.dispatch_if_complete(&session_id).await;
+                        Some(PromptCompleted { session_id, success }) => {
+                            self.dispatch_if_complete(&session_id, success).await;
                         }
                         None => break,
                     }
@@ -94,13 +94,49 @@ impl ResponseCollector {
         tracing::info!("response collector: exiting");
     }
 
-    async fn dispatch_if_complete(&mut self, session_id: &acp::SessionId) {
-        if let Some(text) = self.partials.remove(session_id) {
-            let text = text.trim().to_string();
-            if text.is_empty() {
-                return;
-            }
+    async fn dispatch_if_complete(&mut self, session_id: &acp::SessionId, success: bool) {
+        let partial = self.partials.remove(session_id);
+        let text = partial
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
 
+        // If the prompt failed and we have no partial text, send an error message.
+        if !success && text.is_none() {
+            let error_msg = "❌ Request failed. Please try again.";
+            let router = self.router.lock().await;
+            if let Some(target) = router.get(session_id) {
+                match target {
+                    RouteTarget::Feishu { client, chat_id } => {
+                        if let Err(e) = client.send_text_message(chat_id, error_msg).await {
+                            tracing::error!(
+                                "failed to send feishu error for session {}: {}",
+                                session_id,
+                                e
+                            );
+                        }
+                    }
+                    RouteTarget::WeCom { client, chat_id } => {
+                        if let Err(e) = client.push_text_message(chat_id, error_msg).await {
+                            tracing::error!(
+                                "failed to send wecom error for session {}: {}",
+                                session_id,
+                                e
+                            );
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "no route target for failed session {}, error dropped",
+                    session_id
+                );
+            }
+            return;
+        }
+
+        // Either the prompt succeeded, or it failed but we have partial text
+        // (better than nothing) — send whatever text we have.
+        if let Some(text) = text {
             let router = self.router.lock().await;
             if let Some(target) = router.get(session_id) {
                 match target {

@@ -58,6 +58,11 @@ where
 {
     let (acp_client, acp_agent) = acp_channels();
     let agent_cancel = parent_cancel.child_token();
+    // Clone the cancel token so the caller can actually cancel the agent thread.
+    // The original `agent_cancel` moves into the thread; `return_cancel` is
+    // returned to the caller. `CancellationToken::clone` shares the same
+    // underlying cancellation state, so firing either one cancels both.
+    let return_cancel = agent_cancel.clone();
 
     // 在 move 到线程前,先从 acp_agent.tx clone 一份用于 agent 回推 notification。
     // acp_agent.tx 发送 AcpClientMessage(SessionNotification 等),正好匹配
@@ -94,7 +99,7 @@ where
 
     Ok(SpawnedAgent {
         channel: acp_client,
-        cancel: parent_cancel.child_token(),
+        cancel: return_cancel,
         _thread_handle: handle,
     })
 }

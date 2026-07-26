@@ -63,6 +63,9 @@ where
 {
     api_client: C,
     config: ClawAgentConfig,
+    /// Optional tool handler setup, called inside `build()` (LocalSet context)
+    /// to register handlers on the `StaticToolExecutor` before it's consumed.
+    tool_setup: Option<Box<dyn FnOnce(&mut StaticToolExecutor) + Send>>,
 }
 
 impl<C> ClawAgentBuilder<C>
@@ -86,7 +89,23 @@ where
                 system_prompt,
                 permission_policy,
             },
+            tool_setup: None,
         }
+    }
+
+    /// Register a setup closure that populates the `StaticToolExecutor` with
+    /// tool handlers. Called inside `build()` (within the LocalSet), so the
+    /// `!Send` `FnMut` handlers are created in the correct thread context.
+    ///
+    /// The closure itself must be `Send` (it's stored in the builder before
+    /// the thread spawn), but the handlers it creates may be `!Send`.
+    #[must_use]
+    pub fn with_tool_setup<F>(mut self, setup: F) -> Self
+    where
+        F: FnOnce(&mut StaticToolExecutor) + Send + 'static,
+    {
+        self.tool_setup = Some(Box::new(setup));
+        self
     }
 
     /// 在 LocalSet 内构造 `ClawAgent`。
@@ -94,11 +113,15 @@ where
     /// `client_gateway` 由 `spawn_claw_shell` 从 ACP gateway 中取出注入。
     /// `StaticToolExecutor` 在此创建(非 Send,必须在线程内)。
     pub(crate) fn build(self, client_gateway: AcpGatewaySender<acp::AgentSide>) -> ClawAgent<C> {
+        let mut tool_executor = StaticToolExecutor::new();
+        if let Some(setup) = self.tool_setup {
+            setup(&mut tool_executor);
+        }
         ClawAgent {
             runtime: RefCell::new(None),
             config: self.config,
             api_client: RefCell::new(Some(self.api_client)),
-            tool_executor: RefCell::new(Some(StaticToolExecutor::new())),
+            tool_executor: RefCell::new(Some(tool_executor)),
             client_gateway,
         }
     }
