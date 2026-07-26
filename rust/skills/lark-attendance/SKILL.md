@@ -1,7 +1,7 @@
 ---
 name: lark-attendance
 version: 1.0.0
-description: "飞书考勤打卡：查询自己的考勤打卡记录"
+description: "飞书考勤打卡：查询自己的考勤打卡记录。当用户需要查看上下班打卡情况、考勤统计数据、补卡记录时使用。不负责发起补卡审批（走 lark-approval）。"
 metadata:
   requires:
     bins: ["lark-cli"]
@@ -11,6 +11,14 @@ metadata:
 # attendance (v1)
 
 **CRITICAL — 开始前 MUST 先用 Read 工具读取 [`../lark-shared/SKILL.md`](../lark-shared/SKILL.md)，其中包含认证、权限处理**
+
+## 典型场景
+
+| 用户意图 | 命令 |
+|---------|------|
+| "查我本周的打卡记录" | `lark-cli attendance user_tasks query --params '{"start_date":"2026-07-20","end_date":"2026-07-26"}' --json` |
+| "看看我上个月考勤" | `lark-cli attendance user_tasks query --params '{"start_date":"2026-06-01","end_date":"2026-06-30"}' --json` |
+| "查今天的打卡" | `lark-cli attendance user_tasks query --params '{"start_date":"2026-07-26","end_date":"2026-07-26"}' --json` |
 
 ## 默认参数自动填充规则
 

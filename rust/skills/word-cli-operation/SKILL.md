@@ -2,10 +2,7 @@
 name: word-cli-operation
 description: "Word文档CLI自动化操作工具。触发词：生成Word文档、创建联系函docx、施工日记docx、报账单docx、Word文档编辑、docx操作、word-cli。替代MCP word-wrapper，支持--json结构化输出，Trae IDE和Hermes均可调用。"
 version: 1.0.0
-适用智能体: 全部（资料员/预算员/技术总工/项目经理均需使用）
 最后更新: 2026-05-31
-项目: 牙南村委会产业配套设施完善项目
-合同金额: 833万元
 ---
 
 # Word CLI - 智能体Word文档自动化操作
@@ -688,3 +685,85 @@ def format_all(doc):
 - `project-core.md` — 牙南印象项目核心规则（命名规范、编号规则）
 - `document-rules.md` — 文档撰写规范（联系函模板、施工日记模板、措辞规范）
 - `预算员造价计算规范.md` — 造价计算规范（单价选取优先级）
+
+---
+
+# 附录：MCP word-wrapper 补充能力
+
+> 合并自原 `word-document-operation` 技能。word-cli 已覆盖 90% 文档生成场景，以下能力依赖 word-wrapper MCP（底层 word-mcp-live，80+ 工具合并为 6 个），仅在需要时启用。
+
+## 工具架构
+
+```
+word-wrapper（6个合并工具，调用 word-mcp-live 80+ 细粒度工具）
+├── word_create    → 文档创建/复制/读取/查询
+├── word_edit      → 内容编辑（段落/标题/表格/图片）
+├── word_format    → 格式化（文字/表格/样式）
+├── word_layout    → 页面布局（页眉页脚/页码/分节符）
+├── word_annotate  → 批注/脚注/超链接/修订追踪
+└── word_live      → 实时编辑（需 Word 正在运行，COM 接口）
+```
+
+前 5 个工具直接操作 .docx 文件，**不需要 Word 运行**；`word_live` 需要先打开 Word 文档。
+
+## word-cli 不支持、需调用 word-wrapper 的场景
+
+### 1. 修订追踪（word_annotate）
+
+```js
+// 进入修订模式
+word_annotate({ action: "track_replace", filename: "文档.docx", old_text: "原文字", new_text: "新文字" })
+word_annotate({ action: "track_insert", filename: "文档.docx", insert_text: "插入内容" })
+word_annotate({ action: "track_delete", filename: "文档.docx", old_text: "要删除的文字" })
+
+// 接受/拒绝修订
+word_annotate({ action: "accept_changes", filename: "文档.docx" })
+word_annotate({ action: "reject_changes", filename: "文档.docx" })
+word_annotate({ action: "get_tracked_changes", filename: "文档.docx" })
+```
+
+### 2. 实时编辑（word_live，需 Word 运行）
+
+```js
+word_live({ action: "list_open" })                                    // 列出 Word 中打开的所有文档
+word_live({ action: "save", filename: "文档.docx" })                  // 保存或另存为
+word_live({ action: "save", filename: "文档.docx", save_as: "备份.docx" })
+word_live({ action: "undo", filename: "文档.docx", times: 3 })        // 撤销 N 次
+word_live({ action: "screenshot", filename: "文档.docx" })            // 截图确认效果
+word_live({ action: "insert_text", filename: "文档.docx", text: "新增内容" })
+word_live({ action: "replace_text", filename: "文档.docx", find_text: "旧文字", replace_text: "新文字" })
+```
+
+### 3. 复杂排版（word_format / word_layout）
+
+```js
+// 单元格底色
+word_format({ action: "table_cell_shading", filename: "文档.docx", table_index: 0, row_index: 0, col_index: 0, color: "4472C4" })
+
+// 列宽 / 单元格对齐
+word_format({ action: "column_width", filename: "文档.docx", table_index: 0, col_index: 0 })
+word_format({ action: "cell_alignment", filename: "文档.docx", table_index: 0, row_index: 0, col_index: 0 })
+
+// 自定义样式
+word_format({ action: "create_style", filename: "文档.docx", style_name: "我的样式", bold: true, font_name: "宋体", font_size: 12 })
+
+// 分节符 / 水印 / 书签
+word_layout({ action: "section_break", filename: "文档.docx", break_type: "new_page" })  // new_page/continuous/even_page/odd_page
+word_layout({ action: "watermark", filename: "文档.docx", text: "草稿" })
+word_layout({ action: "bookmark", filename: "文档.docx" })
+
+// 目录
+word_edit({ action: "add_toc", filename: "文档.docx", text: "目 录" })
+```
+
+## 工具选择决策表
+
+| 场景 | 推荐工具 | 原因 |
+|------|---------|------|
+| 从零创建文档 | **word-cli** | 稳定可靠，可脚本化 |
+| 批量生成文档 | **word-cli** | 27 个命令 + --json |
+| 编辑已有文档（简单替换） | **word-cli** | replace / insert / replace-block 足够 |
+| 修订追踪（保留修改痕迹） | **word-wrapper** `word_annotate` | python-docx 不支持 track changes |
+| 实时编辑运行中的 Word | **word-wrapper** `word_live` | 需 COM 接口 |
+| 复杂排版（水印/分节/自定义样式） | **word-wrapper** `word_format`/`word_layout` | python-docx 限制 |
+| 表格精细控制（单元格底色/列宽） | **word-wrapper** `word_format` | python-docx 限制 |

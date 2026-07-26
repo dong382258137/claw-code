@@ -7,6 +7,18 @@ description: "MANDATORY tool for creating digital avatar skills that run as auto
 
 This skill creates digital avatar skills. Each avatar is a SubAgent that autonomously handles user requests within its defined expertise.
 
+## 与 skill-creator 的边界
+
+| 能力 | 归属 | 适用场景 |
+|------|------|---------|
+| 创建 SubAgent 化身技能（`mode: agent`，可独立运行） | **digital-avatar-creator（本技能）** | 用户要创建数字分身、虚拟角色、专业化 AI 助手 |
+| 创建普通技能（无 `mode: agent`，作为知识库被加载） | **skill-creator** | 用户要创建知识型技能、工具说明型技能 |
+
+**关键区别**：
+- digital-avatar-creator 创建的技能**必须包含 `mode: agent`**，运行时通过 Task tool 调度，具有独立上下文
+- skill-creator 创建的技能**不包含 `mode: agent`**，运行时通过 Skill tool 加载到当前上下文
+- 两者产物结构不同：avatar 必须有 Agent 身份 + Workflow，普通 skill 是 Markdown 知识文档
+
 ## When to Use
 
 **CRITICAL: Invoke this skill IMMEDIATELY as your FIRST action when:**

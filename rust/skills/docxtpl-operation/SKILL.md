@@ -1,11 +1,16 @@
 ---
 name: "docxtpl-operation"
-description: "文档模板生成操作。使用docxtpl-mcp（12个工具）进行Jinja2模板渲染、文档生成、解析等。Invoke when user needs to generate documents from templates, validate templates, parse DOCX/PDF/Excel documents."
+description: "文档模板生成操作。使用docxtpl-mcp进行Jinja2模板渲染、PDF/PPT解析。当需要从模板批量生成文档、解析PDF或PPT时使用。DOCX解析用word-cli，Excel解析用excel-operation。"
 ---
 
 # 文档模板生成助手
 
-通过 docxtpl-mcp 实现基于 Jinja2 模板的文档生成、文档解析和提取操作。
+通过 docxtpl-mcp 实现基于 Jinja2 模板的文档生成、PDF/PPT 解析操作。
+
+> **职责边界**：
+> - **本技能负责**：Jinja2 模板渲染、模板管理、PDF 解析、PPT 解析
+> - **word-cli 负责**：DOCX 创建/编辑/解析（`get-text`/`get-tables`/`info`）
+> - **excel-operation 负责**：Excel 读取查询
 
 ## 工具列表
 
@@ -21,19 +26,17 @@ description: "文档模板生成操作。使用docxtpl-mcp（12个工具）进�
 ### 文档生成类
 | 工具 | 功能 |
 |------|------|
-| `generate_document` | 从模板生成Word文档 |
+| `generate_document` | 从模板生成Word文档（Jinja2 渲染） |
 | `list_documents` | 列出所有已生成的文档 |
 | `delete_document` | 删除已生成的文档 |
 
-### 文档解析类
+### 文档解析类（本技能独有）
 | 工具 | 功能 |
 |------|------|
-| `parse_docx_document` | 解析DOCX文档（含表格结构） |
 | `parse_pdf_document` | 解析PDF文档 |
-| `extract_text_from_document` | 快速提取文本（DOCX/PDF/Excel） |
-| `get_document_metadata` | 获取文档元数据 |
-| `parse_excel_document` | 解析Excel文档 |
 | `parse_ppt_document` | 解析PowerPoint文档 |
+| `extract_text_from_document` | 快速提取文本（跨格式：DOCX/PDF/Excel） |
+| `get_document_metadata` | 获取文档元数据 |
 
 ---
 
@@ -117,16 +120,6 @@ delete_document({ document_id: "doc_xxx" })
 
 ### 文档解析
 
-#### parse_docx_document — 解析DOCX
-
-```
-# 解析DOCX文档，包含段落、表格和元数据
-parse_docx_document({ file_path: "D:\\牙南项目\\05-联系函\\联系函.docx" })
-
-# 不提取表格
-parse_docx_document({ file_path: "D:\\牙南项目\\05-联系函\\联系函.docx", include_tables: false })
-```
-
 #### parse_pdf_document — 解析PDF
 
 ```
@@ -151,20 +144,6 @@ get_document_metadata({ file_path: "D:\\牙南项目\\05-联系函\\联系函.do
 ```
 
 返回：作者、创建时间、修改时间、页数等元数据。
-
-#### parse_excel_document — 解析Excel
-
-```
-# 解析所有工作表
-parse_excel_document({ file_path: "D:\\牙南项目\\02-设计图纸\\图纸会审\\图纸会审记录.xlsx" })
-
-# 解析指定工作表，包含公式
-parse_excel_document({
-  file_path: "D:\\牙南项目\\06-报账资料\\报账单.xlsx",
-  sheet_name: "Sheet1",
-  include_formulas: true
-})
-```
 
 #### parse_ppt_document — 解析PowerPoint
 

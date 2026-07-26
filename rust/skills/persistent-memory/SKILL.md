@@ -29,6 +29,23 @@ description: "持久记忆技能。自动保存重要对话、智能提取用户
 > **注意**：不要同时使用 `evolution_cli.py save-conversation`。对话保存统一走 MCP `conversation save`。
 > 任务轨迹记录（可选增强）走 `evolution_cli.py record-task`，详见 `evolution-autosave` 技能。
 
+## 与 evolution-autosave 的边界
+
+| 能力 | 归属 | 调用方式 | 触发时机 |
+|------|------|---------|---------|
+| 对话保存 | **persistent-memory（本技能）** | MCP `conversation save` | 每轮对话（user_rules 强制） |
+| 用户画像管理 | **persistent-memory（本技能）** | MCP `profile get/update` | 每轮对话开始 |
+| 偏好设置 | **persistent-memory（本技能）** | MCP `profile set_pref/get_pref` | 检测到偏好关键词 |
+| 记忆检索 | **persistent-memory（本技能）** | MCP `memory recall/search/semantic_search` | 用户询问或上下文需要 |
+| 任务轨迹记录 | **evolution-autosave** | CLI `evolution_cli.py record-task` | 可选，≥5 次工具调用且具有复用价值 |
+| 自动审计 | **evolution-autosave** | `save_auditor.py`（heartbeat-mcp 触发） | 每 10 分钟自动运行 |
+| 技能质量复盘 | **evolution-autosave** | `hermes_evolution.py` RetrospectiveAnalyzer | 每小时自动运行 |
+
+**关键原则**：
+- 用户相关的**信息保存与检索** → 使用 persistent-memory
+- 进化引擎的**任务轨迹与质量审计** → 使用 evolution-autosave
+- 不要混淆：对话保存永远走 persistent-memory 的 MCP 入口，不要用 CLI save-conversation
+
 ---
 
 ## 核心功能
@@ -206,8 +223,8 @@ profile(action="get")
 
 ## 与其他技能的协同
 
-### 与 desktop-vision 协同
-用户: "记住这个图表的形态" → desktop-vision 截图分析 → persistent-memory 保存分析结果
+### 与 computer-use 协同
+用户: "记住这个图表的形态" → computer-use 截图分析 → persistent-memory 保存分析结果
 
 ### 与 tradingview-analyzer 协同
 用户: "记住我对ETH的分析偏好" → tradingview-analyzer 获取设置 → persistent-memory 保存偏好

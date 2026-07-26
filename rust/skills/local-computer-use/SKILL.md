@@ -14,6 +14,18 @@ description: |
 
 # Local-Computer-Use Skill Guide
 
+## 与 computer-use 的边界
+
+| 能力 | 归属 | 调用方式 | 适用场景 |
+|------|------|---------|---------|
+| Windows 系统配置管理（CPU/蓝牙/音量/主题/广告等） | **local-computer-use（本技能）** | CLI `scripts\run.ps1 "<指令>"` | 用自然语言管理 Windows 系统设置 |
+| 应用 UI 自动化（点击、输入、滚动、拖拽、按键） | **computer-use** | MCP `ide_mcp.config.ext.computer-use` | 操作应用界面元素，无专用 API 时 |
+
+**关键原则**：
+- 本技能**只负责 Windows 系统配置管理**（系统设置、设备、显示、应用等）
+- 应用 UI 自动化（如操作非系统设置应用的界面）使用 computer-use
+- 本技能支持自然语言指令，无需手动指定 UI 元素
+
 ## Usage
 
 ### Run a user instruction

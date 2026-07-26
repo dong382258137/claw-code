@@ -2,10 +2,7 @@
 name: cad-cli-operation
 description: "CAD图纸CLI自动化操作。触发词：CAD图纸分析、提取图纸文字、提取尺寸标注、DWG操作、DXF操作、cad-cli、坐标数据绘制。基于ezdxf+pyautocad双引擎，支持--json结构化输出，支持从坐标文件生成DXF。"
 version: 1.1.0
-适用智能体: 全部（技术总工/预算员/测量员最常用）
 最后更新: 2026-07-09
-项目: 牙南村委会产业配套设施完善项目、食品厂宿舍项目
-合同金额: 833万元
 ---
 
 # CAD CLI - 智能体CAD图纸自动化操作
@@ -376,6 +373,6 @@ cad-cli dwg-save --json
 # 参考
 
 - `word-cli` — Word文档CLI自动化
-- `edge-cli` — Edge浏览器CLI自动化
+- `webapp-testing`（含 edge-cli 附录） — 浏览器自动化
 - `drawing-review` — 图纸审查
 - `cost-estimation` — 造价评估

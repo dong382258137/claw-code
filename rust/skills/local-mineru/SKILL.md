@@ -97,3 +97,68 @@ Markdown output file as a `yyb-product` card using the exact path from the foote
 - Does NOT generate or create new documents
 - Does NOT support handwritten text recognition (accuracy may vary)
 - Does NOT fall back to cloud-based services on non-AIPC hardware
+
+---
+
+# 附录：快速图片 OCR（PP-OCRv5 NPU 模式）
+
+> 本附录整合自原 `local-ocr-npu` 技能。当需要**快速纯文本提取**（无需版面分析、表格、公式）时，使用本附录的 PP-OCRv5 工具更高效。
+
+## 工具选择决策表
+
+| 场景 | 推荐工具 | 原因 |
+|------|---------|------|
+| PDF 文档解析（含表格、公式、版面） | **local-mineru 主流程**（`scripts\run.ps1`） | MinerU2.5-Pro 模型，输出 Markdown |
+| 图片转 Markdown（含版面、表格） | **local-mineru 主流程** | 同上 |
+| 纯图片快速 OCR（仅需文本） | **PP-OCRv5**（`ocr_npu\scripts\run.ps1`） | NPU 加速，0.32s/image |
+| 批量图片 OCR（无需版面） | **PP-OCRv5** | 支持目录批量处理 |
+
+## PP-OCRv5 使用方法
+
+### 单图 OCR
+```
+ocr_npu\scripts\run.ps1 "<image_path>"
+```
+
+### 批量 OCR（目录）
+```
+ocr_npu\scripts\run.ps1 "<image_directory>"
+```
+
+### 指定设备（默认 npu）
+```
+ocr_npu\scripts\run.ps1 "<image_path>" -Device cpu
+```
+
+### 示例
+
+| 意图 | 命令 |
+| --- | --- |
+| 提取截图文字 | `ocr_npu\scripts\run.ps1 "C:\Users\user\Desktop\screenshot.png"` |
+| OCR 整个文件夹 | `ocr_npu\scripts\run.ps1 "C:\invoice_images"` |
+| 强制 CPU 模式 | `ocr_npu\scripts\run.ps1 "image.jpg" -Device cpu` |
+
+## 输出格式
+
+逐行输出识别文字（含置信度分数）：
+```
+[0.997] 增值税专用发票
+[0.985] 发票代码：1100183130
+[0.991] 开票日期：2024年03月15日
+...
+OCR completed: 1 image(s) | NPU | avg 0.32 s/image
+```
+
+## 注意事项
+
+- `ocr_npu\scripts\run.ps1` 是**唯一支持入口**，不要直接调用其他脚本
+- 首次 NPU 调用编译模型到 NPU ISA（~27s），后续调用使用磁盘缓存（~0.3s 启动）
+- 若返回 `This skill requires an Intel AIPC platform`（退出码 1），硬件不支持 NPU，使用 `-Device cpu`
+- 输入支持：jpg / jpeg / png / bmp / tiff
+
+## 性能参考（Intel PTL 12XE, PP-OCRv5-server）
+
+| Device | 1st init | 2nd init | Avg inference |
+|---|---|---|---|
+| NPU | ~27 s | ~0.32 s | **0.32 s/img** |
+| CPU | ~0.40 s | ~0.35 s | 1.50 s/img |

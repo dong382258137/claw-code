@@ -1,7 +1,11 @@
 ---
 name: lark-shared
 version: 1.0.0
-description: "Use for lark-cli setup/auth tasks: auth login/status/logout, user vs bot identity, business-domain permissions (--domain, including all/docs/drive), missing scopes, revoking authorization, or handling _notice JSON."
+description: "lark-cli 共享规则：认证登录/登出、user/bot 身份切换、业务域权限（--domain）、scope 缺失处理、_notice JSON 处理。所有 lark-* 技能的前置基础。"
+metadata:
+  requires:
+    bins: ["lark-cli"]
+  cliHelp: "lark-cli --help"
 ---
 
 # lark-cli 共享规则

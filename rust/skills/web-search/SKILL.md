@@ -38,7 +38,7 @@ AI 在以下场景自动触发搜索：
 }
 ```
 
-已在 `C:\Users\38225\.trae-cn\mcp.json` 中配置。
+已在用户级 MCP 配置文件中配置（路径因 Trae 版本而异：中文版 `%USERPROFILE%\.trae-cn\mcp.json`，国际版 `%USERPROFILE%\.trae\mcp.json`）。
 
 ## 最佳实践
 

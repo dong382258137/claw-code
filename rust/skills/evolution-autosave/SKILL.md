@@ -5,6 +5,25 @@ description: "进化引擎自动保存：对话保存由 MCP conversation save �
 
 # Evolution Autosave - 进化引擎自动保存
 
+## 与 persistent-memory 的边界
+
+| 能力 | 归属 | 调用方式 | 触发时机 |
+|------|------|---------|---------|
+| 对话保存 | **persistent-memory** | MCP `conversation save` | 每轮对话（user_rules 强制） |
+| 用户画像管理 | **persistent-memory** | MCP `profile get/update` | 每轮对话开始 |
+| 偏好设置 | **persistent-memory** | MCP `profile set_pref/get_pref` | 检测到偏好关键词 |
+| 记忆检索 | **persistent-memory** | MCP `memory recall/search/semantic_search` | 用户询问或上下文需要 |
+| 任务轨迹记录 | **evolution-autosave（本技能）** | CLI `evolution_cli.py record-task` | 可选，≥5 次工具调用且具有复用价值 |
+| 自动审计 | **evolution-autosave（本技能）** | `save_auditor.py`（heartbeat-mcp 触发） | 每 10 分钟自动运行 |
+| 技能质量复盘 | **evolution-autosave（本技能）** | `hermes_evolution.py` RetrospectiveAnalyzer | 每小时自动运行 |
+
+**关键原则**：
+- 本技能**不负责对话保存**（那是 persistent-memory 的职责）
+- 本技能**只负责进化引擎相关**：任务轨迹记录 + 自动审计 + 技能质量复盘
+- 不要使用 CLI `save-conversation`，对话保存统一走 persistent-memory 的 MCP 入口
+
+---
+
 ## 保存架构（统一入口）
 
 ```
@@ -46,9 +65,11 @@ description: "进化引擎自动保存：对话保存由 MCP conversation save �
 
 ```bash
 # 1. 先写轨迹 JSON 到临时文件
-# 2. 然后调用:
-python "d:\BCAD\AutoCAD 2014\.trae\messaging\evolution_cli.py" record-task "任务描述" "@trace.json" true "AI回复摘要" false
+# 2. 然后调用（EVOLUTION_CLI_PATH 为当前项目 .trae/messaging/evolution_cli.py 的绝对路径）:
+python "$EVOLUTION_CLI_PATH" record-task "任务描述" "@trace.json" true "AI回复摘要" false
 ```
+
+**路径定位**：`evolution_cli.py` 位于当前项目根目录的 `.trae/messaging/` 子目录下。首次使用时通过 `Get-ChildItem -Path . -Recurse -Filter evolution_cli.py -ErrorAction SilentlyContinue` 定位。
 
 **注意**：此调用是可选的。进化引擎的核心价值在于 `hermes_evolution.py` 的周期性复盘和质量评分，而非每次任务都触发。
 
@@ -66,10 +87,11 @@ python "d:\BCAD\AutoCAD 2014\.trae\messaging\evolution_cli.py" record-task "任�
 
 ```bash
 # record-task（记录任务轨迹+触发进化引擎）
-python "d:\BCAD\AutoCAD 2014\.trae\messaging\evolution_cli.py" record-task "任务描述" "@trace.json" true "AI回复摘要" false
+# EVOLUTION_CLI_PATH 请按上文"路径定位"方法获取
+python "$EVOLUTION_CLI_PATH" record-task "任务描述" "@trace.json" true "AI回复摘要" false
 
 # skill-stats（查看进化引擎技能库统计）
-python "d:\BCAD\AutoCAD 2014\.trae\messaging\evolution_cli.py" skill-stats
+python "$EVOLUTION_CLI_PATH" skill-stats
 ```
 
 ---
