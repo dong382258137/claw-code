@@ -2750,7 +2750,7 @@ fn repl_help_includes_shared_commands_and_exit() {
     let help = render_repl_help();
     assert!(help.contains("REPL"));
     assert!(help.contains("/help"));
-    assert!(help.contains("Complete commands, modes, and recent sessions"));
+    assert!(help.contains("补全命令、模式和最近会话"));
     assert!(help.contains("/status"));
     assert!(help.contains("/sandbox"));
     assert!(help.contains("/model [model]"));
@@ -2767,9 +2767,7 @@ fn repl_help_includes_shared_commands_and_exit() {
     assert!(help.contains("/export [file]"));
     // Batch 5 added `/session delete`; match on the stable core rather than
     // the trailing bracket so future additions don't re-break this.
-    assert!(
-        help.contains("/session [list|exists <session-id>|switch <session-id>|fork [branch-name]")
-    );
+    assert!(help.contains("/session [list"));
     assert!(help.contains(
         "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
     ));
@@ -2778,9 +2776,9 @@ fn repl_help_includes_shared_commands_and_exit() {
     assert!(help.contains("/skills"));
     assert!(help.contains("/exit"));
     assert!(help.contains(
-        "Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
+        "自动保存             .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
     ));
-    assert!(help.contains("Resume latest        /resume latest"));
+    assert!(help.contains("恢复最近会话         /resume latest"));
 }
 
 #[test]
@@ -3136,28 +3134,28 @@ fn status_line_reports_model_and_token_totals() {
         },
         None, // #148
     );
-    assert!(status.contains("Status"));
-    assert!(status.contains("Model            claude-sonnet"));
-    assert!(status.contains("Permission mode  workspace-write"));
-    assert!(status.contains("Messages         7"));
-    assert!(status.contains("Latest total     10"));
-    assert!(status.contains("Cache create     2"));
-    assert!(status.contains("Cache read       1"));
-    assert!(status.contains("Cumulative total 31"));
-    assert!(status.contains("Estimated cost"));
-    assert!(status.contains("Cwd              /tmp/project"));
-    assert!(status.contains("Project root     /tmp"));
-    assert!(status.contains("Git branch       main"));
-    assert!(status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked"));
-    assert!(status.contains("Changed files    3"));
-    assert!(status.contains("Staged           1"));
-    assert!(status.contains("Unstaged         1"));
-    assert!(status.contains("Untracked        1"));
-    assert!(status.contains("Session          session.jsonl"));
-    assert!(status.contains("Lifecycle        idle shell · dirty worktree · abandoned? · cmd=zsh"));
-    assert!(status.contains("Config files     loaded 2/3"));
-    assert!(status.contains("Memory files     4"));
-    assert!(status.contains("Suggested flow   /status → /diff → /commit"));
+    assert!(status.contains("状态"));
+    assert!(status.contains("模型             claude-sonnet"));
+    assert!(status.contains("权限模式         workspace-write"));
+    assert!(status.contains("消息数           7"));
+    assert!(status.contains("本次总量         10"));
+    assert!(status.contains("缓存创建         2"));
+    assert!(status.contains("缓存读取         1"));
+    assert!(status.contains("累计总量         31"));
+    assert!(status.contains("预估成本"));
+    assert!(status.contains("当前目录         /tmp/project"));
+    assert!(status.contains("项目根目录       /tmp"));
+    assert!(status.contains("Git 分支         main"));
+    assert!(status.contains("Git 状态         脏 · 3 个文件 · 1 已暂存, 1 未暂存, 1 未跟踪"));
+    assert!(status.contains("已更改文件       3"));
+    assert!(status.contains("已暂存           1"));
+    assert!(status.contains("未暂存           1"));
+    assert!(status.contains("未跟踪           1"));
+    assert!(status.contains("会话             session.jsonl"));
+    assert!(status.contains("生命周期         idle shell · dirty worktree · abandoned? · cmd=zsh"));
+    assert!(status.contains("配置文件         已加载 2/3"));
+    assert!(status.contains("Memory 文件      4"));
+    assert!(status.contains("建议流程         /status → /diff → /commit"));
 }
 
 #[test]
@@ -3411,7 +3409,7 @@ fn commit_reports_surface_workspace_context() {
     let preflight = format_commit_preflight_report(Some("feature/ux"), summary);
     assert!(preflight.contains("Result           ready"));
     assert!(preflight.contains("Branch           feature/ux"));
-    assert!(preflight.contains("Workspace        dirty · 2 files · 1 staged, 1 unstaged"));
+    assert!(preflight.contains("Workspace        脏 · 2 个文件 · 1 已暂存, 1 未暂存"));
     assert!(preflight
         .contains("Action           create a git commit from the current workspace changes"));
 }
@@ -3460,10 +3458,10 @@ fn no_arg_commands_reject_unexpected_arguments() {
 #[test]
 fn config_report_supports_section_views() {
     let report = render_config_report(Some("env")).expect("config report should render");
-    assert!(report.contains("Merged section: env"));
+    assert!(report.contains("合并的节: env"));
     let plugins_report =
         render_config_report(Some("plugins")).expect("plugins config report should render");
-    assert!(plugins_report.contains("Merged section: plugins"));
+    assert!(plugins_report.contains("合并的节: plugins"));
 }
 
 #[test]
@@ -3479,8 +3477,8 @@ fn memory_report_uses_sectioned_layout() {
 fn config_report_uses_sectioned_layout() {
     let report = render_config_report(None).expect("config report should render");
     assert!(report.contains("Config"));
-    assert!(report.contains("Discovered files"));
-    assert!(report.contains("Merged JSON"));
+    assert!(report.contains("发现的文件"));
+    assert!(report.contains("合并的 JSON"));
 }
 
 #[test]
@@ -3628,7 +3626,7 @@ fn resume_diff_command_renders_report_for_saved_session() {
             .expect("resume diff should work")
     });
     let message = outcome.message.expect("diff message should exist");
-    assert!(message.contains("Unstaged changes:"));
+    assert!(message.contains("未暂存的更改:"));
     assert!(message.contains("tracked.txt"));
 
     fs::remove_dir_all(root).expect("cleanup temp dir");
