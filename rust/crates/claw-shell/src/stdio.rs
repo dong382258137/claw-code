@@ -725,4 +725,217 @@ mod tests {
             })
             .await;
     }
+
+    /// A6.4:单元测试 — `ClawAgent::cancel` 是 stub,直接调用应返回 `Ok(())`
+    ///
+    /// Phase A 中 `cancel`(agent.rs:345-350)不做任何事,仅记录 warn 日志后返回 Ok。
+    /// 此测试固化该行为。未来 cancel 被实现后,需更新断言以验证实际的取消语义。
+    #[tokio::test]
+    async fn claw_agent_cancel_returns_ok_as_stub() {
+        use agent_client_protocol as acp;
+        use acp::Agent;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // 构造 agent(需要 gateway sender,但 cancel 不使用它)
+                let builder = test_builder();
+                let (gw_tx, _gw_rx) = mpsc::unbounded_channel();
+                let client_gateway = AcpGatewaySender::<acp::AgentSide>::new(gw_tx);
+                let agent = builder.build(client_gateway);
+
+                // cancel 是 stub:无论 session 是否存在,都返回 Ok(())
+                let notif = acp::CancelNotification::new("fake-session-id");
+                let result = agent.cancel(notif).await;
+
+                assert!(result.is_ok(), "cancel stub should return Ok: {:?}", result);
+            })
+            .await;
+    }
+
+    /// A6.4:集成测试 — cancel during prompt turn(当前 stub 行为)
+    ///
+    /// 验证场景:在 agent 处理 `session/prompt` 期间(或紧随其后)发送
+    /// `session/cancel` 通知,验证当前行为:
+    ///
+    /// - **当前(Phase A)**:cancel 是 stub,不中断正在进行的 turn;
+    ///   prompt 正常完成并返回 `StopReason::EndTurn`
+    /// - **未来**:cancel 应中断 turn,prompt 应返回 `StopReason::Cancelled`
+    ///
+    /// 架构说明:`run_turn` 是同步阻塞 API,会阻塞 LocalSet 线程。
+    /// 因此 `session/cancel` 通知实际上会在 turn 完成后才被处理
+    /// (cancel handler 是 no-op,无副作用)。此测试固化该时序行为。
+    ///
+    /// 未来 `run_turn` 改为 async + CancellationToken 后,取消语义将改变,
+    /// 需将 `end_turn` 断言改为 `cancelled`。
+    #[tokio::test]
+    async fn run_agent_on_io_cancel_during_prompt_does_not_interrupt_turn() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // 1. 两个 duplex:client→agent(incoming)和 agent→client(outgoing)
+                let (mut client_tx, agent_rx) = tokio::io::duplex(8192);
+                let (agent_tx, mut client_rx) = tokio::io::duplex(8192);
+
+                // 2. 构造 builder + cancel
+                let builder = test_builder();
+                let cancel = CancellationToken::new();
+                let agent_cancel = cancel.clone();
+
+                // 3. 启动 agent
+                let agent_task = tokio::task::spawn_local(async move {
+                    let incoming = agent_rx.compat();
+                    let outgoing = agent_tx.compat_write();
+                    run_agent_on_io(builder, agent_cancel, incoming, outgoing).await
+                });
+
+                let mut reader = tokio::io::BufReader::new(&mut client_rx);
+                let mut line = String::new();
+
+                // 4. initialize 请求
+                let init_req = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "params": { "protocolVersion": 1 },
+                    "id": 1
+                });
+                let req_line = format!("{}\n", serde_json::to_string(&init_req).unwrap());
+                client_tx.write_all(req_line.as_bytes()).await.unwrap();
+                client_tx.flush().await.unwrap();
+
+                line.clear();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    reader.read_line(&mut line),
+                )
+                .await
+                .expect("should receive initialize response within 5s");
+                let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                assert_eq!(resp["id"], 1, "initialize response id: {resp}");
+                assert_eq!(resp["result"]["protocolVersion"], 1, "protocolVersion: {resp}");
+
+                // 5. authenticate 请求
+                let auth_req = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "authenticate",
+                    "params": { "methodId": "api_key" },
+                    "id": 2
+                });
+                let req_line = format!("{}\n", serde_json::to_string(&auth_req).unwrap());
+                client_tx.write_all(req_line.as_bytes()).await.unwrap();
+                client_tx.flush().await.unwrap();
+
+                line.clear();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    reader.read_line(&mut line),
+                )
+                .await
+                .expect("should receive authenticate response within 5s");
+                let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                assert_eq!(resp["id"], 2, "authenticate response id: {resp}");
+
+                // 6. session/new 请求
+                let new_session_req = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/new",
+                    "params": {
+                        "cwd": ".",
+                        "mcpServers": []
+                    },
+                    "id": 3
+                });
+                let req_line = format!("{}\n", serde_json::to_string(&new_session_req).unwrap());
+                client_tx.write_all(req_line.as_bytes()).await.unwrap();
+                client_tx.flush().await.unwrap();
+
+                line.clear();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    reader.read_line(&mut line),
+                )
+                .await
+                .expect("should receive session/new response within 5s");
+                let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                assert_eq!(resp["id"], 3, "session/new response id: {resp}");
+                let session_id = resp["result"]["sessionId"]
+                    .as_str()
+                    .expect("sessionId should be in response")
+                    .to_string();
+
+                // 7. 发送 session/prompt 请求(立即紧跟 session/cancel 通知)
+                //    cancel 是 JSON-RPC notification(无 id 字段),agent 不返回响应。
+                //    由于 run_turn 同步阻塞 LocalSet,cancel 实际在 turn 完成后才被处理。
+                let prompt_req = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": session_id,
+                        "prompt": [{ "type": "text", "text": "hello" }]
+                    },
+                    "id": 4
+                });
+                let prompt_line = format!("{}\n", serde_json::to_string(&prompt_req).unwrap());
+                client_tx.write_all(prompt_line.as_bytes()).await.unwrap();
+
+                // 立即发送 cancel notification(无 id = notification)
+                let cancel_req = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": { "sessionId": session_id }
+                });
+                let cancel_line = format!("{}\n", serde_json::to_string(&cancel_req).unwrap());
+                client_tx.write_all(cancel_line.as_bytes()).await.unwrap();
+                client_tx.flush().await.unwrap();
+
+                // 8. 读取 agent 发送的消息:
+                //    预期先收到 session/update notification(AgentMessageChunk),
+                //    然后收到 session/prompt response(id=4, stopReason=end_turn)。
+                //    cancel notification 是 silent 的(无响应)。
+                let mut found_prompt_response = false;
+                for _ in 0..5 {
+                    line.clear();
+                    let read_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        reader.read_line(&mut line),
+                    )
+                    .await;
+                    assert!(
+                        read_result.is_ok(),
+                        "should receive message within 10s after prompt+cancel"
+                    );
+
+                    let msg: serde_json::Value = serde_json::from_str(line.trim())
+                        .unwrap_or_else(|e| panic!("invalid JSON: {e}, got: {line}"));
+
+                    // 检查是否是 prompt response(id=4)
+                    if msg.get("id") == Some(&serde_json::Value::from(4)) {
+                        found_prompt_response = true;
+                        let stop_reason = msg["result"]["stopReason"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("stopReason missing: {msg}"));
+                        // 当前 stub 行为:cancel 不中断 turn,prompt 正常完成
+                        // 未来实现 cancel 后,此断言应改为 "cancelled"
+                        assert_eq!(
+                            stop_reason, "end_turn",
+                            "cancel stub should not interrupt turn; expected end_turn, got {stop_reason}"
+                        );
+                        break;
+                    }
+                    // 否则是 notification(session/update 等),跳过
+                }
+
+                assert!(
+                    found_prompt_response,
+                    "should receive prompt response with id=4"
+                );
+
+                // 9. 清理
+                cancel.cancel();
+                let _ = agent_task.await;
+            })
+            .await;
+    }
 }

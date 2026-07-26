@@ -1162,6 +1162,272 @@ mod tests {
         assert_eq!(outcome.unwrap(), PermissionOutcome::AlwaysAllow);
     }
 
+    // ---- 反向请求的成功路径测试 ----
+    //
+    // 以下 3 个测试用 `acp::Channel::duplex()` 构造 in-process transport,
+    // 让 mock IDE(Client 角色)响应 agent 的反向请求,覆盖完整的
+    // 请求-响应循环。与错误路径测试互补,验证真实连接下的行为。
+    //
+    // 架构:
+    // - Client(mock IDE):`acp::Client.builder().on_receive_request(...).connect_to(client_channel)`
+    //   注册类型化 handler,返回 canned response。`spawn_local` 驱动。
+    // - Agent:`acp::Agent.builder().connect_with(agent_channel, main_fn)`
+    //   `main_fn` 接收 `ConnectionTo<Client>`,写入 slot 后等待测试完成信号。
+    //   `spawn_local` 驱动,使 background actors 持续轮询。
+    // - 主流程:等 slot 填充 → 调用 agent 反向请求方法 → 断言 → 通知退出。
+    //
+    // `ClawAgentV13` 持有 `RefCell`(!Send),但 `connect_with` 的 `main_fn`
+    // 不要求 `Send`(只捕获 Send 的 slot + oneshot),且 `LocalSet` +
+    // `current_thread` runtime 接受 !Send future,故 agent 可留在主流程中。
+
+    /// 验证 `read_editor_buffer` 在真实 IDE 连接下返回文件内容。
+    ///
+    /// mock IDE 收到 `fs/read_text_file` 请求后返回固定内容,验证 agent
+    /// 的 `read_editor_buffer` 能完整走通 send_request → block_task →
+    /// 解析 response.content 的成功路径。
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_editor_buffer_returns_content_from_ide() {
+        use tokio::task::LocalSet;
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (client_channel, agent_channel) = acp::Channel::duplex();
+
+                // Client(mock IDE):处理 fs/read_text_file,返回固定内容
+                let client_connection = acp::Client
+                    .builder()
+                    .on_receive_request(
+                        async |_req: schema::ReadTextFileRequest,
+                               responder: acp::Responder<schema::ReadTextFileResponse>,
+                               _cx: acp::ConnectionTo<acp::Agent>| {
+                            responder.respond(schema::ReadTextFileResponse::new(
+                                "hello from IDE buffer",
+                            ))
+                        },
+                        acp::on_receive_request!(),
+                    )
+                    .connect_to(client_channel);
+                tokio::task::spawn_local(async move {
+                    let _ = client_connection.await;
+                });
+
+                // Agent:connect_with 获取 ConnectionTo<Client> 并注入 slot
+                let agent = ClawAgentV13::<NullApiClient>::new();
+                agent.set_active_session(schema::SessionId::new("test-session"));
+                let slot = agent.connection_slot();
+                let (slot_ready_tx, slot_ready_rx) = tokio::sync::oneshot::channel();
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+                let agent_connection = acp::Agent
+                    .builder()
+                    .name("test-read-agent")
+                    .connect_with(
+                        agent_channel,
+                        async move |cx: acp::ConnectionTo<acp::Client>| {
+                            slot.set_connection(cx.clone()).await;
+                            let _ = slot_ready_tx.send(());
+                            // 保持连接存活,直到测试完成
+                            let _ = done_rx.await;
+                            Ok(())
+                        },
+                    );
+                tokio::task::spawn_local(async move {
+                    let _ = agent_connection.await;
+                });
+
+                // 等待 slot 填充(connect_with main_fn 已注入 ConnectionTo)
+                let _ = slot_ready_rx.await;
+
+                // 调用反向请求,验证成功路径
+                let result = agent.read_editor_buffer("/test/file.rs").await;
+                assert!(
+                    result.is_ok(),
+                    "read_editor_buffer should succeed with live connection: {result:?}"
+                );
+                assert_eq!(
+                    result.unwrap(),
+                    "hello from IDE buffer",
+                    "should return content from IDE"
+                );
+
+                // 通知 agent 连接可以退出
+                let _ = done_tx.send(());
+            })
+            .await;
+    }
+
+    /// 验证 `write_editor_buffer` 在 IDE ACK 后完成。
+    ///
+    /// mock IDE 收到 `fs/write_text_file` 请求后返回空 ACK
+    /// (`WriteTextFileResponse` 无业务数据),验证 agent 的
+    /// `write_editor_buffer` 能完整走通 send_request → block_task → Ok(())
+    /// 的成功路径。
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_editor_buffer_completes_when_ide_acknowledges() {
+        use tokio::task::LocalSet;
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (client_channel, agent_channel) = acp::Channel::duplex();
+
+                // Client(mock IDE):处理 fs/write_text_file,返回空 ACK
+                let client_connection = acp::Client
+                    .builder()
+                    .on_receive_request(
+                        async |_req: schema::WriteTextFileRequest,
+                               responder: acp::Responder<schema::WriteTextFileResponse>,
+                               _cx: acp::ConnectionTo<acp::Agent>| {
+                            responder.respond(schema::WriteTextFileResponse::new())
+                        },
+                        acp::on_receive_request!(),
+                    )
+                    .connect_to(client_channel);
+                tokio::task::spawn_local(async move {
+                    let _ = client_connection.await;
+                });
+
+                // Agent:connect_with 获取 ConnectionTo<Client> 并注入 slot
+                let agent = ClawAgentV13::<NullApiClient>::new();
+                agent.set_active_session(schema::SessionId::new("test-session"));
+                let slot = agent.connection_slot();
+                let (slot_ready_tx, slot_ready_rx) = tokio::sync::oneshot::channel();
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+                let agent_connection = acp::Agent
+                    .builder()
+                    .name("test-write-agent")
+                    .connect_with(
+                        agent_channel,
+                        async move |cx: acp::ConnectionTo<acp::Client>| {
+                            slot.set_connection(cx.clone()).await;
+                            let _ = slot_ready_tx.send(());
+                            let _ = done_rx.await;
+                            Ok(())
+                        },
+                    );
+                tokio::task::spawn_local(async move {
+                    let _ = agent_connection.await;
+                });
+
+                let _ = slot_ready_rx.await;
+
+                // 调用反向请求,验证成功路径(WriteTextFileResponse 无业务数据,
+                // 只要不报错即表示 IDE 已 ACK)
+                let result = agent
+                    .write_editor_buffer("/test/output.rs", "fn main() {}")
+                    .await;
+                assert!(
+                    result.is_ok(),
+                    "write_editor_buffer should succeed when IDE acknowledges: {result:?}"
+                );
+
+                let _ = done_tx.send(());
+            })
+            .await;
+    }
+
+    /// 验证 `request_permission` 返回 IDE 的授权决策。
+    ///
+    /// mock IDE 对第一次请求返回 "allow",对第二次返回 "deny"
+    /// (用 counter 区分)。验证 agent 分别收到 `PermissionOutcome::Allow`
+    /// 和 `PermissionOutcome::Deny`,且 AlwaysAllow 缓存未被触发
+    /// (allow ≠ allow_always)。
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_permission_returns_decision_from_ide() {
+        use tokio::task::LocalSet;
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (client_channel, agent_channel) = acp::Channel::duplex();
+
+                // Client(mock IDE):用 counter 区分两次请求,第一次 allow,第二次 deny
+                let counter = std::sync::Arc::new(tokio::sync::Mutex::new(0u32));
+                let counter_clone = counter.clone();
+                let client_connection = acp::Client
+                    .builder()
+                    .on_receive_request(
+                        async move |_req: schema::RequestPermissionRequest,
+                               responder: acp::Responder<schema::RequestPermissionResponse>,
+                               _cx: acp::ConnectionTo<acp::Agent>| {
+                            let mut c = counter_clone.lock().await;
+                            *c += 1;
+                            let option_id = if *c == 1 { "allow" } else { "deny" };
+                            let outcome = schema::RequestPermissionOutcome::Selected(
+                                schema::SelectedPermissionOutcome::new(option_id),
+                            );
+                            responder.respond(schema::RequestPermissionResponse::new(outcome))
+                        },
+                        acp::on_receive_request!(),
+                    )
+                    .connect_to(client_channel);
+                tokio::task::spawn_local(async move {
+                    let _ = client_connection.await;
+                });
+
+                // Agent:connect_with 获取 ConnectionTo<Client> 并注入 slot
+                let agent = ClawAgentV13::<NullApiClient>::new();
+                agent.set_active_session(schema::SessionId::new("test-session"));
+                let slot = agent.connection_slot();
+                let (slot_ready_tx, slot_ready_rx) = tokio::sync::oneshot::channel();
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+                let agent_connection = acp::Agent
+                    .builder()
+                    .name("test-perm-agent")
+                    .connect_with(
+                        agent_channel,
+                        async move |cx: acp::ConnectionTo<acp::Client>| {
+                            slot.set_connection(cx.clone()).await;
+                            let _ = slot_ready_tx.send(());
+                            let _ = done_rx.await;
+                            Ok(())
+                        },
+                    );
+                tokio::task::spawn_local(async move {
+                    let _ = agent_connection.await;
+                });
+
+                let _ = slot_ready_rx.await;
+
+                // 第一次请求:operation/target A → IDE 返回 allow
+                let request_a = PermissionRequest {
+                    operation: "shell_exec".to_string(),
+                    target: "ls -la".to_string(),
+                    impact: "read-only listing".to_string(),
+                };
+                let outcome_a = agent.request_permission(request_a).await;
+                assert!(
+                    outcome_a.is_ok(),
+                    "first request_permission should succeed: {outcome_a:?}"
+                );
+                assert_eq!(
+                    outcome_a.unwrap(),
+                    PermissionOutcome::Allow,
+                    "first request should be Allow"
+                );
+
+                // 第二次请求:operation/target B(不同 cache key)→ IDE 返回 deny
+                let request_b = PermissionRequest {
+                    operation: "file_write".to_string(),
+                    target: "/etc/passwd".to_string(),
+                    impact: "system file".to_string(),
+                };
+                let outcome_b = agent.request_permission(request_b).await;
+                assert!(
+                    outcome_b.is_ok(),
+                    "second request_permission should succeed: {outcome_b:?}"
+                );
+                assert_eq!(
+                    outcome_b.unwrap(),
+                    PermissionOutcome::Deny,
+                    "second request should be Deny"
+                );
+
+                let _ = done_tx.send(());
+            })
+            .await;
+    }
+
     // ---- flush_lane_events 测试 ----
 
     /// 全局 LaneEvent sink 序列化锁(与 0.10.4 lane_bridge 测试一致)。

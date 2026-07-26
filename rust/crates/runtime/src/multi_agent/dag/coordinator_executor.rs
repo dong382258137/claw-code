@@ -211,6 +211,11 @@ mod tests {
     use super::*;
     use crate::multi_agent::CoordinationMode;
     use crate::multi_agent::dag::types::RetryPolicy;
+    use crate::multi_agent::dag::{DagError, DagGraph, DagScheduler};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     fn sample_node() -> DagNode {
         DagNode {
@@ -341,5 +346,268 @@ mod tests {
         let executor = CoordinatorExecutor::new(coordinator.clone());
         // Just verify the accessor compiles and returns the right type.
         let _inner: &MultiAgentCoordinator = executor.coordinator();
+    }
+
+    // ========================================================================
+    // Production-path tests: inject a more realistic SubagentRunner (mirroring
+    // SubagentDispatcher behaviour) and verify end-to-end execution via
+    // DagScheduler.
+    // ========================================================================
+
+    /// Helper: build a DagNode with the given id and dependencies.
+    fn dag_node(id: &str, deps: &[&str]) -> DagNode {
+        DagNode {
+            id: id.to_string(),
+            label: id.to_string(),
+            task: format!("task-{id}"),
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            acceptance_criteria: "ok".to_string(),
+            verify_command: None,
+            max_retries: 0,
+            mode: CoordinationMode::Fork,
+            retry_policy: RetryPolicy::default(),
+        }
+    }
+
+    /// Test (a): realistic runner with simulated LLM latency returns
+    /// result_ref paths for every node in a small linear DAG.
+    ///
+    /// Verifies that CoordinatorExecutor + DagScheduler end-to-end execution
+    /// works when the runner mirrors a real LLM dispatch (sleep + result_ref
+    /// path), and that the runner's return value flows through to NodeResult.
+    #[tokio::test]
+    async fn coordinator_executor_with_realistic_runner_executes_dag_node() {
+        // Linear DAG: n1 -> n2 -> n3
+        let mut graph = DagGraph::new("realistic");
+        graph.add_node(dag_node("n1", &[]));
+        graph.add_node(dag_node("n2", &["n1"]));
+        graph.add_node(dag_node("n3", &["n2"]));
+        graph.add_edge(&"n1".to_string(), &"n2".to_string()).unwrap();
+        graph.add_edge(&"n2".to_string(), &"n3".to_string()).unwrap();
+
+        // Track dispatched (subagent_id, task) pairs to verify the runner was
+        // actually invoked and that summaries match the dispatched ids.
+        let dispatched: Arc<Mutex<Vec<(String, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = dispatched.clone();
+
+        // Realistic runner: simulates LLM latency, then returns the result_ref
+        // path (mirroring SubagentDispatcher::dispatch's return format).
+        let runner: SubagentRunner = Arc::new(move |id: String, task: String| {
+            let dispatched = dispatched_clone.clone();
+            Box::pin(async move {
+                // Simulate LLM call latency.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                dispatched
+                    .lock()
+                    .expect("dispatched poisoned")
+                    .push((id.clone(), task));
+                Ok(format!(".claw/subagents/{id}.md"))
+            })
+        });
+
+        let coordinator = Arc::new(MultiAgentCoordinator::new());
+        let executor = CoordinatorExecutor::new(coordinator).with_runner(runner);
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(executor);
+
+        let scheduler = DagScheduler::new(graph, executor);
+        let results = scheduler
+            .run()
+            .await
+            .expect("realistic DAG should complete");
+
+        assert_eq!(results.len(), 3, "all 3 nodes should succeed");
+
+        // Build the set of expected result_ref paths from dispatched ids.
+        let dispatched = dispatched.lock().expect("dispatched poisoned");
+        assert_eq!(
+            dispatched.len(),
+            3,
+            "runner should have been called 3 times, got {}",
+            dispatched.len()
+        );
+        let expected_paths: Vec<String> = dispatched
+            .iter()
+            .map(|(id, _)| format!(".claw/subagents/{id}.md"))
+            .collect();
+
+        // Every result summary should be one of the expected result_ref paths.
+        for result in &results {
+            assert!(
+                expected_paths.contains(&result.summary),
+                "summary {} should be one of {:?}",
+                result.summary,
+                expected_paths
+            );
+        }
+
+        // All 3 subagent_ids should be distinct (distinct paths).
+        let unique_paths: std::collections::HashSet<&str> =
+            results.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(unique_paths.len(), 3, "all result_ref paths should be distinct");
+    }
+
+    /// Test (b): a runner that fails for a specific subagent_id propagates the
+    /// failure through DagScheduler as DagError::NodeFailed.
+    ///
+    /// Verifies that when the runner returns Err, CoordinatorExecutor maps it
+    /// to NodeError::ExecutionFailed, the scheduler applies FailFast (with
+    /// max_retries=0), and the coordinator's subagent state reflects the
+    /// failure.
+    #[tokio::test]
+    async fn coordinator_executor_with_failing_runner_reports_node_failure() {
+        // Linear DAG: n1 -> n2. n1 will fail (subagent-1), so n2 never runs.
+        let mut graph = DagGraph::new("failing");
+        graph.add_node(dag_node("n1", &[]));
+        graph.add_node(dag_node("n2", &["n1"]));
+        graph.add_edge(&"n1".to_string(), &"n2".to_string()).unwrap();
+
+        // Runner that fails for the first spawned subagent ("subagent-1").
+        // Since n1 is the only root, it will be spawned first.
+        let runner: SubagentRunner = Arc::new(|id: String, _task: String| {
+            Box::pin(async move {
+                if id == "subagent-1" {
+                    return Err(format!("simulated LLM failure for {id}"));
+                }
+                Ok(format!(".claw/subagents/{id}.md"))
+            })
+        });
+
+        let coordinator = Arc::new(MultiAgentCoordinator::new());
+        let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(executor);
+
+        let scheduler = DagScheduler::new(graph, executor);
+        let err = scheduler.run().await.expect_err("DAG should fail");
+        match err {
+            DagError::NodeFailed(node_id) => {
+                assert_eq!(
+                    node_id, "n1",
+                    "expected n1 to be the failing node, got {node_id}"
+                );
+            }
+            other => panic!("expected DagError::NodeFailed, got {other:?}"),
+        }
+
+        // The coordinator's subagent state should reflect the failure.
+        let agents = coordinator.list();
+        assert!(
+            agents
+                .iter()
+                .any(|a| a.status == crate::multi_agent::SubagentStatus::Failed),
+            "expected at least one Failed subagent, got {:?}",
+            agents.iter().map(|a| a.status).collect::<Vec<_>>()
+        );
+    }
+
+    /// Test (c): a runner that mirrors SubagentDispatcher's file-writing
+    /// behaviour creates the result file on disk and returns a matching path.
+    ///
+    /// Verifies that the SubagentDispatcher pattern (write file to
+    /// {workspace_root}/.claw/subagents/{id}.md, return relative path) works
+    /// end-to-end through CoordinatorExecutor::execute, and that the returned
+    /// summary matches the actual file location.
+    #[tokio::test]
+    async fn coordinator_executor_with_subagent_dispatcher_pattern() {
+        // Use a temp dir as the workspace_root, mirroring SubagentDispatcher.
+        let tmp = TempDir::new().expect("temp dir creation failed");
+        let workspace_root: PathBuf = tmp.path().to_path_buf();
+
+        // Track dispatched subagent_ids for later verification.
+        let dispatched_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = dispatched_ids.clone();
+        let workspace_for_runner = workspace_root.clone();
+
+        // Runner that mirrors SubagentDispatcher::dispatch_impl:
+        // 1. Creates {workspace_root}/.claw/subagents/ dir
+        // 2. Writes {workspace_root}/.claw/subagents/{id}.md (via tmp + rename)
+        // 3. Returns the relative result_ref path ".claw/subagents/{id}.md"
+        let runner: SubagentRunner = Arc::new(move |id: String, task: String| {
+            let workspace = workspace_for_runner.clone();
+            let dispatched = dispatched_clone.clone();
+            Box::pin(async move {
+                dispatched
+                    .lock()
+                    .expect("dispatched poisoned")
+                    .push(id.clone());
+
+                let subagents_dir = workspace.join(".claw").join("subagents");
+                std::fs::create_dir_all(&subagents_dir)
+                    .map_err(|e| format!("failed to create subagents dir: {e}"))?;
+                let result_path = subagents_dir.join(format!("{id}.md"));
+                let tmp_path = subagents_dir.join(format!("{id}.md.tmp"));
+
+                let file_content = format!(
+                    "# Subagent Result: {id}\n\n\
+                     **Task:** {task}\n\n\
+                     Result content."
+                );
+
+                std::fs::write(&tmp_path, &file_content)
+                    .map_err(|e| format!("failed to write tmp file: {e}"))?;
+                std::fs::rename(&tmp_path, &result_path)
+                    .map_err(|e| format!("failed to rename tmp file: {e}"))?;
+
+                Ok(format!(".claw/subagents/{id}.md"))
+            })
+        });
+
+        let coordinator = Arc::new(MultiAgentCoordinator::new());
+        let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
+        let node = sample_node();
+        let result = executor
+            .execute(&node)
+            .await
+            .expect("dispatcher-style runner should succeed");
+
+        assert_eq!(result.node_id, "n1");
+
+        // Inspect which subagent_id was actually dispatched.
+        let dispatched = dispatched_ids.lock().expect("dispatched poisoned");
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "exactly one subagent should have been dispatched"
+        );
+        let dispatched_id = dispatched[0].clone();
+        drop(dispatched);
+
+        // The returned summary should match the SubagentDispatcher's format.
+        let expected_summary = format!(".claw/subagents/{dispatched_id}.md");
+        assert_eq!(
+            result.summary, expected_summary,
+            "returned summary should match the dispatched subagent's result_ref path"
+        );
+
+        // The file should actually exist on disk at the workspace_root.
+        let file_path = workspace_root
+            .join(".claw")
+            .join("subagents")
+            .join(format!("{dispatched_id}.md"));
+        assert!(
+            file_path.exists(),
+            "expected result file to exist at {}",
+            file_path.display()
+        );
+
+        // Verify file contents to ensure the runner wrote meaningful data.
+        let content = std::fs::read_to_string(&file_path)
+            .expect("should be able to read the result file");
+        assert!(
+            content.contains(&dispatched_id),
+            "file content should mention the subagent id"
+        );
+        assert!(
+            content.contains("echo hello"),
+            "file content should mention the task"
+        );
+
+        // The coordinator should have transitioned the subagent to Completed.
+        let agents = coordinator.list();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(
+            agents[0].status,
+            crate::multi_agent::SubagentStatus::Completed
+        );
     }
 }
