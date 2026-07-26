@@ -11,10 +11,13 @@
 //!   for `dag_status` tool compat).
 //! - [`executor_trait`]: v0.2 [`SubagentExecutor`] trait abstracting how a
 //!   single node's subagent is dispatched.
+//! - [`coordinator_executor`]: v0.2 [`CoordinatorExecutor`] bridging
+//!   [`MultiAgentCoordinator`] to the [`SubagentExecutor`] trait.
 //! - [`scheduler`]: v0.2 async concurrent scheduler (JoinSet +
-//!   CancellationToken, FailFast).
+//!   CancellationToken, FailFast, retry-with-backoff, DagRun bridging).
 //! - [`status`]: Human-readable status rendering.
 
+pub mod coordinator_executor;
 pub mod executor;
 pub mod executor_trait;
 pub mod scheduler;
@@ -22,14 +25,15 @@ pub mod status;
 pub mod types;
 
 // v0.2 re-exports: petgraph-backed graph + async scheduler primitives.
+pub use coordinator_executor::{CoordinatorExecutor, SubagentRunner};
 pub use executor_trait::{NodeError, SubagentExecutor};
-pub use scheduler::DagScheduler;
+pub use scheduler::{DagScheduler, ProgressEvent};
 pub use types::{DagError, DagGraph, DagId, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use types::{Dag, DagRun};
+use types::{Dag, DagNodeStatus, DagRun, DagStatus};
 
 /// A thread-safe store for DAG definitions and their runs (G8.11).
 #[derive(Debug, Clone, Default)]
@@ -110,6 +114,59 @@ impl DagStore {
         let run = runs.get(run_id)?;
         let dags = self.dags.lock().unwrap_or_else(|e| e.into_inner());
         dags.get(&run.dag_id).cloned()
+    }
+
+    /// Update a node's status within a run (v0.2 bridge).
+    ///
+    /// Called by the async [`DagScheduler`](super::scheduler::DagScheduler)
+    /// to propagate per-node progress into the persistent [`DagRun`] so that
+    /// `dag_status` tool queries reflect async execution.
+    ///
+    /// # Errors
+    /// - `run not found: {run_id}` — the run was never started or was evicted.
+    pub fn update_node_status(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        status: DagNodeStatus,
+    ) -> Result<(), String> {
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        let run = runs
+            .get_mut(run_id)
+            .ok_or_else(|| format!("run not found: {run_id}"))?;
+        run.set_node_status(node_id, status);
+        Ok(())
+    }
+
+    /// Update the overall run status (v0.2 bridge).
+    ///
+    /// Side effects:
+    /// - Transitioning to [`DagStatus::Running`] stamps `started_at` if unset.
+    /// - Transitioning to a terminal status (`Completed` / `Failed` /
+    ///   `Cancelled`) stamps `completed_at`.
+    ///
+    /// # Errors
+    /// - `run not found: {run_id}` — the run was never started or was evicted.
+    pub fn update_run_status(
+        &self,
+        run_id: &str,
+        status: DagStatus,
+    ) -> Result<(), String> {
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        let run = runs
+            .get_mut(run_id)
+            .ok_or_else(|| format!("run not found: {run_id}"))?;
+        run.status = status;
+        if status == DagStatus::Running && run.started_at.is_none() {
+            run.started_at = Some(types::now_secs());
+        }
+        if matches!(
+            status,
+            DagStatus::Completed | DagStatus::Failed | DagStatus::Cancelled
+        ) {
+            run.completed_at = Some(types::now_secs());
+        }
+        Ok(())
     }
 }
 

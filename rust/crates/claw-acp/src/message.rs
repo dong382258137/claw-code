@@ -434,6 +434,17 @@ mod agent {
         acp::SetSessionModelResponse,
         acp::AGENT_METHOD_NAMES.session_set_model,
     );
+    // 1.3 replacement: `session/set_config_option` replaces `session/set_model`.
+    // Model switching is done by sending a SetSessionConfigOptionRequest with
+    // `config_id = "model"` and the model id as the value. The agent's
+    // `configOptions[category=model]` (returned in session/new or
+    // InitializeResponse) lists the accepted model ids.
+    #[cfg(feature = "acp-1_5")]
+    acp_define_request_response!(
+        acp::SetSessionConfigOptionRequest,
+        acp::SetSessionConfigOptionResponse,
+        acp::AGENT_METHOD_NAMES.session_set_config_option,
+    );
 
     /// ACP messages meant *for* the agent.
     #[derive(Debug, From)]
@@ -449,6 +460,10 @@ mod agent {
         ExtNotification(AcpArgsGeneric<acp::ExtNotification, S>),
         #[cfg(feature = "acp-0_10")]
         SetSessionModel(AcpArgsGeneric<acp::SetSessionModelRequest, S>),
+        /// 1.3 replacement for `SetSessionModel`. Send with `config_id = "model"`
+        /// and the model id as the value to switch models mid-session.
+        #[cfg(feature = "acp-1_5")]
+        SetSessionConfigOption(AcpArgsGeneric<acp::SetSessionConfigOptionRequest, S>),
     }
 
     #[allow(type_alias_bounds)]
@@ -470,6 +485,8 @@ mod agent {
                 Self::ExtNotification(a) => a.method_name(),
                 #[cfg(feature = "acp-0_10")]
                 Self::SetSessionModel(a) => a.method_name(),
+                #[cfg(feature = "acp-1_5")]
+                Self::SetSessionConfigOption(a) => a.method_name(),
             }
         }
     }
@@ -505,6 +522,10 @@ mod agent {
                 }
                 #[cfg(feature = "acp-0_10")]
                 Self::SetSessionModel(args) => {
+                    state.serialize_field("request", args.request.borrow())?
+                }
+                #[cfg(feature = "acp-1_5")]
+                Self::SetSessionConfigOption(args) => {
                     state.serialize_field("request", args.request.borrow())?
                 }
             }
@@ -563,6 +584,13 @@ mod agent {
                         return parse!(SetSessionModel);
                     }
                 }
+                // 1.3: `session/set_config_option` replaces `session/set_model`.
+                #[cfg(feature = "acp-1_5")]
+                {
+                    if method == acp::AGENT_METHOD_NAMES.session_set_config_option {
+                        return parse!(SetSessionConfigOption);
+                    }
+                }
                 Err(serde::de::Error::custom(format!(
                     "Unknown method name: {method}"
                 )))
@@ -584,6 +612,10 @@ mod agent {
                 Self::ExtNotification(args) => AcpAgentMessageBox::ExtNotification(args.boxed()),
                 #[cfg(feature = "acp-0_10")]
                 Self::SetSessionModel(args) => AcpAgentMessageBox::SetSessionModel(args.boxed()),
+                #[cfg(feature = "acp-1_5")]
+                Self::SetSessionConfigOption(args) => {
+                    AcpAgentMessageBox::SetSessionConfigOption(args.boxed())
+                }
             }
         }
 
@@ -683,5 +715,187 @@ mod agent {
                 ),
             }
         }
+    }
+}
+
+// ============================================================================
+// Cross-version compat: model switching (SetSessionModel → SetSessionConfigOption)
+// ============================================================================
+//
+// In ACP 0.10.4, model switching is done via the `session/set_model` method
+// (`SetSessionModelRequest`).
+//
+// In ACP 1.3, `session/set_model` was REMOVED. The replacement is
+// `session/set_config_option` (`SetSessionConfigOptionRequest`) with
+// `config_id = "model"`. The agent advertises available models via
+// `configOptions[category=model]` in the `session/new` response (or
+// `InitializeResponse.configOptions`). The client sends the desired model id
+// as the option value.
+//
+// The compat layer below lets upper layers (claw-shell) switch models without
+// caring about the ACP version:
+//   - 0.10.4: build a `SetSessionModelRequest` and send it as the
+//     `SetSessionModel` message variant.
+//   - 1.3: build a `SetSessionConfigOptionRequest` with `config_id = "model"`
+//     and send it as the `SetSessionConfigOption` message variant.
+
+/// Error returned when a model switch cannot be performed.
+#[derive(Debug, thiserror::Error)]
+pub enum ModelSwitchError {
+    /// The legacy `SetSessionModel` method is not available under ACP 1.3+.
+    /// Use `SetSessionConfigOption` with `config_id = "model"` instead.
+    #[error("SetSessionModel not supported in ACP 1.3; use SetSessionConfigOption with config_id=\"model\"")]
+    NotSupportedInV1_3,
+    /// The agent rejected the model switch (e.g. unknown model id).
+    #[error("model switch failed: {0}")]
+    Failed(String),
+}
+
+/// Config-id used by ACP 1.3 to address the model selector option.
+#[cfg(feature = "acp-1_5")]
+const MODEL_CONFIG_ID: &str = "model";
+
+/// Build a 1.3 `SetSessionConfigOptionRequest` that switches the session's
+/// model. Under 1.3, this is the replacement for 0.10.4's
+/// `SetSessionModelRequest`.
+///
+/// The `model` argument should be one of the model ids advertised by the
+/// agent in `configOptions[category=model]`. The `provider` argument is
+/// ignored under 1.3 — provider/model negotiation happens at session creation
+/// (`session/new`) or via agent-side configuration, not via this method.
+#[cfg(feature = "acp-1_5")]
+pub fn build_set_model_request_v1_3(
+    session_id: &acp::SessionId,
+    model: &str,
+) -> acp::SetSessionConfigOptionRequest {
+    acp::SetSessionConfigOptionRequest::new(
+        session_id.clone(),
+        acp::SessionConfigId::new(MODEL_CONFIG_ID),
+        acp::SessionConfigOptionValue::value_id(model.to_string()),
+    )
+}
+
+/// Unified, version-agnostic model-switch entry point.
+///
+/// Returns `Ok(())` if model switching is supported under the current ACP
+/// feature flag, or an error explaining why it isn't. This is a capability
+/// check — it does NOT send the request itself. The caller is expected to
+/// build and dispatch the appropriate message variant:
+///
+/// - Under `acp-0_10`: build a `SetSessionModelRequest` and send it as the
+///   `AcpAgentMessage::SetSessionModel` variant.
+/// - Under `acp-1_5`: call [`build_set_model_request_v1_3`] and send the
+///   result as the `AcpAgentMessage::SetSessionConfigOption` variant.
+///
+/// The `provider` parameter is retained for future use (1.3 provider/model
+/// negotiation at session creation) but is not currently wired.
+pub fn set_session_model_compat(
+    _session_id: &acp::SessionId,
+    _model: &str,
+    _provider: Option<&str>,
+) -> Result<(), ModelSwitchError> {
+    #[cfg(feature = "acp-0_10")]
+    {
+        // 0.10.4: SetSessionModel variant is available; caller builds and
+        // sends the request via AcpAgentMessage::SetSessionModel.
+        Ok(())
+    }
+    #[cfg(feature = "acp-1_5")]
+    {
+        // 1.3: SetSessionConfigOption variant is available; caller uses
+        // build_set_model_request_v1_3 and sends via
+        // AcpAgentMessage::SetSessionConfigOption.
+        Ok(())
+    }
+    #[cfg(not(any(feature = "acp-0_10", feature = "acp-1_5")))]
+    {
+        Err(ModelSwitchError::Failed(
+            "no ACP feature flag enabled".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    #[test]
+    fn set_session_model_compat_returns_ok_under_default_feature() {
+        // Under whichever feature flag is active, the compat check should
+        // succeed (both 0.10.4 and 1.3 have a working message variant).
+        #[cfg(feature = "acp-0_10")]
+        {
+            let session_id = acp::SessionId::new("test-session");
+            assert!(set_session_model_compat(&session_id, "claude-sonnet-4", None).is_ok());
+        }
+        #[cfg(feature = "acp-1_5")]
+        {
+            let session_id = acp::SessionId::new("test-session");
+            assert!(set_session_model_compat(&session_id, "claude-sonnet-4", None).is_ok());
+        }
+    }
+
+    #[cfg(feature = "acp-1_5")]
+    #[test]
+    fn build_set_model_request_v1_3_uses_model_config_id() {
+        let session_id = acp::SessionId::new("sess_123");
+        let request = build_set_model_request_v1_3(&session_id, "claude-sonnet-4");
+        // SessionConfigId / SessionId / SessionConfigValueId are Arc<str>
+        // newtypes deriving Display — compare via to_string().
+        assert_eq!(request.config_id.to_string(), "model");
+        assert_eq!(request.session_id.to_string(), "sess_123");
+        // The value should be a SessionConfigValueId holding the model name.
+        assert_eq!(
+            request.value.as_value_id().map(|v| v.to_string()),
+            Some("claude-sonnet-4".to_string())
+        );
+    }
+
+    #[cfg(feature = "acp-1_5")]
+    #[test]
+    fn set_config_option_message_variant_round_trips() {
+        // Build a SetSessionConfigOptionRequest, wrap it in the message enum,
+        // serialize, and deserialize back to verify the variant is wired
+        // correctly through method_name / Serialize / Deserialize.
+        let session_id = acp::SessionId::new("sess_round_trip");
+        let request = build_set_model_request_v1_3(&session_id, "gpt-5");
+        let (response_tx, _response_rx) = oneshot::channel();
+        let message = AcpAgentMessage::SetSessionConfigOption(AcpArgs {
+            request,
+            response_tx,
+        });
+
+        // method_name should match the 1.3 method constant.
+        assert_eq!(
+            message.method_name(),
+            acp::AGENT_METHOD_NAMES.session_set_config_option
+        );
+
+        // Serialize → deserialize round trip.
+        let json = serde_json::to_string(&message).expect("serialize failed");
+        let parsed: AcpAgentMessage =
+            serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(parsed.method_name(), message.method_name());
+    }
+
+    #[cfg(feature = "acp-0_10")]
+    #[test]
+    fn set_session_model_message_variant_still_exists_in_0_10() {
+        // Sanity: the 0.10.4 SetSessionModel variant is still present and
+        // routes to the correct method name. `SetSessionModelRequest::new`
+        // is available because claw-acp enables the `unstable` feature which
+        // turns on `unstable_session_model`.
+        let session_id = acp::SessionId::new("sess_0_10");
+        let request =
+            acp::SetSessionModelRequest::new(session_id, "claude-sonnet-4");
+        let (response_tx, _response_rx) = oneshot::channel();
+        let message = AcpAgentMessage::SetSessionModel(AcpArgs {
+            request,
+            response_tx,
+        });
+        assert_eq!(
+            message.method_name(),
+            acp::AGENT_METHOD_NAMES.session_set_model
+        );
     }
 }

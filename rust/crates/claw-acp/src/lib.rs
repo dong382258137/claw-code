@@ -28,9 +28,17 @@ pub use self::{
     message::{
         AcpAgentMessage, AcpAgentMessageBox, AcpAgentMessageGeneric, AcpArgs, AcpArgsBox,
         AcpClientMessage, AcpClientMessageBox, AcpClientMessageGeneric, AcpMethod, AcpRequest,
-        AcpSide, Boxed, StorageMarker, Unboxed,
+        AcpSide, Boxed, ModelSwitchError, StorageMarker, Unboxed,
     },
 };
 
 #[doc(hidden)]
 pub use self::common::compact_json;
+
+/// Build a 1.3 `SetSessionConfigOptionRequest` for model switching.
+/// Only available under the `acp-1_5` feature flag.
+#[cfg(feature = "acp-1_5")]
+pub use self::message::build_set_model_request_v1_3;
+
+/// Unified, version-agnostic model-switch capability check.
+pub use self::message::set_session_model_compat;

@@ -6,10 +6,33 @@ license.workspace = true
 publish.workspace = true
 description = "ACP shell layer: spawns the claw agent runtime and exposes it via ACP channels"
 
+[features]
+# 默认使用 ACP 0.10.4(与 claw-acp 默认 feature 对齐)。
+# 启用本地 acp-0_10 feature,它会:
+# 1. 透传 claw-acp/acp-0_10(让 claw-acp 用 0.10.4 schema)
+# 2. 启用本地 agent-client-protocol 0.10.4 依赖(供 agent.rs / lane_bridge.rs 等使用)
+default = ["acp-0_10"]
+acp-0_10 = ["claw-acp/acp-0_10", "dep:agent-client-protocol"]
+# 启用 ACP 1.3 路径(实际指向 agent-client-protocol 1.3.0)。
+# 透传 claw-acp 的 acp-1_5 feature,并启用本地 agent-client-protocol-v1
+# 可选依赖,供 `agent_v1_3.rs` 直接引用 1.3 schema 类型。
+# 注意:同时启用 acp-0_10 和 acp-1_5 会导致 claw-acp 同时激活两个互斥 feature
+# (common.rs 中的 `use ... as acp;` 会冲突),因此使用 1.3 时应:
+#   cargo check -p claw-shell --no-default-features --features acp-1_5
+acp-1_5 = ["claw-acp/acp-1_5", "dep:agent-client-protocol-v1", "dep:thiserror"]
+
 [dependencies]
-claw-acp = { path = "../claw-acp" }
+claw-acp = { path = "../claw-acp", default-features = false }
 runtime = { path = "../runtime" }
-agent-client-protocol = { version = "0.10.4", features = ["unstable"] }
+# 0.10.4 schema:仅在 acp-0_10 feature 启用时引入。
+# 必须设为 optional,否则 --no-default-features --features acp-1_5 时
+# 依赖图中会同时存在 0.10.4 和 1.3 两个版本,导致 trait bound 冲突。
+agent-client-protocol = { version = "0.10.4", features = ["unstable"], optional = true }
+# 1.3 schema:package 名仍是 agent-client-protocol,但通过 rename 区分。
+# 仅在 acp-1_5 feature 启用时引入,供 agent_v1_3.rs 使用。
+agent-client-protocol-v1 = { package = "agent-client-protocol", version = "1.3", optional = true }
+# thiserror 仅用于 agent_v1_3.rs 的错误类型定义,1.3 路径才需要。
+thiserror = { workspace = true, optional = true }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

@@ -17,8 +17,8 @@
 
 pub mod dag;
 pub use dag::{
-    DagError, DagGraph, DagId, DagScheduler, NodeError, NodeResult, RetryPolicy, SubagentExecutor,
-    DEFAULT_MAX_PARALLELISM,
+    CoordinatorExecutor, DagError, DagGraph, DagId, DagScheduler, NodeError, NodeResult,
+    ProgressEvent, RetryPolicy, SubagentExecutor, SubagentRunner, DEFAULT_MAX_PARALLELISM,
 };
 pub use dag::DagStore;
 

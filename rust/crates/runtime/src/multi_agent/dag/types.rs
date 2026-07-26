@@ -64,9 +64,15 @@ fn default_coordination_mode() -> CoordinationMode {
 /// Retry policy for a DAG node (v0.2).
 ///
 /// Encodes how the scheduler should retry a failed node before marking it as
-/// permanently failed. Currently informational — the async scheduler
-/// honours `max_retries` on [`DagNode`] directly; richer backoff strategies
-/// will consume these fields in a follow-up.
+/// permanently failed. As of v0.2, the async [`DagScheduler`](super::scheduler::DagScheduler)
+/// consumes these fields directly: on a node failure, if
+/// [`DagNode::max_retries`] has not been reached, the scheduler sleeps for
+/// the computed backoff and re-spawns the node.
+///
+/// # Backoff formula
+/// `delay_ms = base_delay_ms * backoff_factor^attempt`, capped at
+/// `max_delay_ms`. With the default policy (base=500ms, factor=2.0,
+/// max=30s): attempt 0 → 500ms, attempt 1 → 1s, attempt 2 → 2s, etc.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RetryPolicy {
     /// Base delay in milliseconds between retries (exponential backoff seed).

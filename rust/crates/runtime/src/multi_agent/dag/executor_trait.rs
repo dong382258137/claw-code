@@ -6,12 +6,22 @@
 //! mock, remote ACP, …).
 //!
 //! The scheduler calls [`SubagentExecutor::execute`] for each ready node
-//! and treats [`NodeError`] variants as FailFast / retry / cancel signals.
+//! and treats [`NodeError`] variants as FailFast / cancel signals.
 //!
-//! Future implementations:
-//! - `MultiAgentCoordinatorExecutor` — bridges to the existing
+//! # Retry ownership (v0.2 contract change)
+//! As of v0.2, the **scheduler** owns retry / backoff logic — it consults
+//! [`DagNode::max_retries`](super::types::DagNode::max_retries) and
+//! [`RetryPolicy`](super::types::RetryPolicy) and re-invokes `execute` on
+//! each attempt. Implementations should therefore execute the node **once**
+//! per `execute` call and return immediately on failure; they must NOT
+//! retry internally. Centralising retry in the scheduler keeps backoff
+//! timing, attempt counting, and DagRun status updates consistent.
+//!
+//! Implementations:
+//! - [`CoordinatorExecutor`](super::coordinator_executor::CoordinatorExecutor) —
+//!   bridges to the existing
 //!   [`MultiAgentCoordinator`](crate::multi_agent::MultiAgentCoordinator)
-//!   via `dispatch(...)` + `join_all()`.
+//!   via `spawn` + `execute_async` + an injectable `SubagentRunner` callback.
 //! - `AcpSubagentExecutor` — Phase 4: dispatches over ACP channels.
 //! - `MockSubagentExecutor` — unit tests (see scheduler tests).
 
@@ -27,17 +37,28 @@ use super::types::{DagNode, NodeResult};
 /// 3. Returning a [`NodeResult`] on success or a [`NodeError`] variant on
 ///    failure / timeout / cancellation.
 ///
-/// The scheduler does NOT retry failed nodes itself — that is the executor's
-/// responsibility (it has access to `node.max_retries` and `node.retry_policy`).
-/// Once the executor returns `Err(NodeError::ExecutionFailed(_))`, the
-/// scheduler treats the node as permanently failed and applies FailFast.
+/// # Retry contract (v0.2)
+/// The scheduler owns retry logic — it re-invokes `execute` up to
+/// `node.max_retries` times with backoff derived from `node.retry_policy`.
+/// Implementations must execute the node **once** per call and return
+/// immediately on failure; they must NOT retry internally. Once the executor
+/// returns `Err(NodeError::ExecutionFailed(_))`, the scheduler decides
+/// whether to retry or apply FailFast.
 #[async_trait]
 pub trait SubagentExecutor: Send + Sync {
-    /// Execute a single DAG node, returning its result on success.
+    /// Execute a single DAG node attempt, returning its result on success.
     ///
-    /// Implementations should respect `node.max_retries` /
-    /// `node.retry_policy` before giving up with
-    /// [`NodeError::ExecutionFailed`].
+    /// Implementations should NOT retry — the scheduler handles retries
+    /// via [`DagNode::max_retries`](super::types::DagNode::max_retries) +
+    /// [`RetryPolicy`](super::types::RetryPolicy).
+    ///
+    /// # Errors
+    /// - [`NodeError::ExecutionFailed`] — the subagent finished but failed
+    ///   its task. The scheduler may retry per `max_retries`.
+    /// - [`NodeError::Timeout`] — the subagent did not complete within the
+    ///   per-node timeout. Retriable.
+    /// - [`NodeError::Cancelled`] — the subagent was cancelled. Not retriable;
+    ///   the scheduler propagates this as [`DagError::Cancelled`].
     async fn execute(&self, node: &DagNode) -> Result<NodeResult, NodeError>;
 
     /// Request cancellation of an in-flight node (best-effort).
