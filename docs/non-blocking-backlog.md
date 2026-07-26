@@ -16,9 +16,9 @@
 | P1 | 1.2 claw-shell clippy 3 个 warning | ~15min | 待办 |
 | P1 | 2.2 Notification 事件触发 | ~30min | 待办 |
 | P1 | 2.3 dag_run 工具接入 async scheduler | 2-3h | 待办(原描述失实,实际更严重) |
-| P2 | 3.1 ClawAgent::cancel stub | 3-5 天 | 待办(主循环重构) |
-| P2 | 3.2 ACP 0.10.4 silent drop | 切换 1.3 即可 | 待办 |
-| P2 | 4.1 tui_mode gating | 1-2 天 | 待办 |
+| P2 | 3.1 ClawAgent::cancel stub | 已落地(同步边界) | ✅ 已修复 |
+| P2 | 3.2 ACP 0.10.4 silent drop | 已修复 | ✅ 已修复 |
+| P2 | 4.1 tui_mode gating | 已修复 | ✅ 已修复 |
 | P2 | 4.2 cancel during permission prompt 测试 | ~4h | 待办 |
 | P2 | 5.1 反向请求端到端测试 | ~1 天 | 待办 |
 | P2 | 5.2 CoordinatorExecutor 生产路径测试 | ~1 天 | 待办(依赖 3.3) |
@@ -232,10 +232,10 @@ async fn cancel(&self, _arguments: acp::CancelNotification) -> Result<(), acp::E
 | 2.1 LaneEvent 桥接接入 | P0 | ✅ 已修复 | 1d78b863 |
 | 2.2 Notification 事件触发 | P1 | ✅ 已修复 | 1d78b863 |
 | 2.3 dag_run 接入 async scheduler | P1 | ✅ 已修复 | 1d78b863 |
-| 3.1 ClawAgent::cancel stub | P2 | ⏭️ 跳过(需 3-5 天主循环重构) | - |
-| 3.2 ACP silent drop | P2 | ⏭️ 跳过(需 fork 外部库或 wrapper) | - |
+| 3.1 ClawAgent::cancel stub | P2 | ✅ 已修复 | (本批次) |
+| 3.2 ACP silent drop | P2 | ✅ 已修复 | (本批次) |
 | 3.3 CoordinatorExecutor 注入 | P0 | ✅ 已修复 | 1d78b863 |
-| 4.1 tui_mode gating | P2 | ⏭️ 跳过(需 1-2 天评估所有使用点) | - |
+| 4.1 tui_mode gating | P2 | ✅ 已修复 | (本批次) |
 | 4.2 cancel during prompt 测试 | P2 | ✅ 已修复 | 81a52dd3 |
 | 5.1 反向请求端到端测试 | P2 | ✅ 已修复 | 81a52dd3 |
 | 5.2 CoordinatorExecutor 生产测试 | P2 | ✅ 已修复 | 81a52dd3 |
@@ -262,10 +262,29 @@ async fn cancel(&self, _arguments: acp::CancelNotification) -> Result<(), acp::E
 
 **4.2 cancel during permission prompt 测试**: 新增 2 个测试:`claw_agent_cancel_returns_ok_as_stub`(单元测试,固化 stub 返回 Ok 的契约)、`run_agent_on_io_cancel_during_prompt_does_not_interrupt_turn`(集成测试,完整 ACP 协议交互,验证 cancel 不中断 turn)。
 
-### 跳过项说明(3 项)
+### 修复详情(2026-07-27 P2 剩余3项)
 
-| 项 | 跳过原因 |
+**3.1 ClawAgent::cancel stub**: agent.rs 新增 `turn_abort_signal: RefCell<Option<runtime::HookAbortSignal>>` 字段,new_session 时创建并注入 runtime,prompt 入口调 reset() 清除 sticky 状态。cancel() 调 `signal.abort()`,run_turn 主循环在下一迭代顶部或工具调用边界检测到后返回 RuntimeError,prompt 据此返回 StopReason::Cancelled。hooks.rs 为 HookAbortSignal 添加 reset() 方法。限制:正在进行的 LLM stream 调用是同步阻塞,无法立即中断,需等流完成或失败后才进入下一检查点(与 TUI 路径 Ctrl+C 行为一致)。
+
+**3.2 ACP silent drop**: 通过 fork agent-client-protocol 0.10.4 patch 修复(方案 D)。将上游库复制到 `rust/forks/agent-client-protocol/`,修改 `rpc.rs` 三处 silent drop 位置:
+- parse 失败(行 270-289):返回 `id=null` 的 `-32700 parse_error` response
+- 无 id 无 method(行 252-269):返回 `id=null` 的 `-32600 invalid_request` response
+- 未知 request id 的 response(行 237):保持 `log::error!`(JSON-RPC 规范不要求响应,对端不会再等)
+
+workspace `Cargo.toml` 添加 `[patch.crates-io] agent-client-protocol = { path = "forks/agent-client-protocol" }` 重定向。stdio.rs 原 `run_agent_on_io_silently_drops_invalid_json` 测试改名为 `run_agent_on_io_returns_parse_error_on_invalid_json`,断言新行为(验证 `-32700` 响应)。`run_agent_on_io_silently_drops_missing_method_field` 保留(有 id 无 method 路径仍 silent drop,符合 JSON-RPC 规范)。
+
+**4.1 tui_mode gating**: 通过方法分离修复(方案 B)。app.rs 重构:
+- `run_turn` 回归纯 REPL 路径:删除所有 `tui_mode` 分支和 `#[cfg(feature = "full-tui")]` gating,`emit_output=true`,使用 `CliPermissionPrompter`,直接 spinner/println/print_status_bar 输出
+- 新增 `run_turn_tui`(cfg-gated):`emit_output=false`,使用 `TuiSilentPermissionPrompter`,保存 `current_abort_signal`,抑制所有 stdout/stderr 写入
+- 移除 `tui_mode: bool` 字段(行 516)和 `set_tui_mode` 方法(行 2482)
+- tui/app.rs 调用点改为 `cli.run_turn_tui(line)`,移除 `set_tui_mode(true)/(false)`
+
+验证: `cargo check --workspace` 0 warning 0 error;`cargo clippy --workspace --no-deps` 无新 warning(5 个 rusty-claude-cli 预先存在 warning 与本修改无关);`cargo test -p claw-shell --lib` 41/41 通过;`cargo test -p claw-acp` 11/11 通过。rusty-claude-cli 16 个预先存在的测试失败(help/report/diff 渲染相关)已通过 git stash 验证与本修改无关。
+
+### 待办项说明(0 项,全部已修复)
+
+| 项 | 状态说明 |
 |---|---|
-| 3.1 ClawAgent::cancel stub | 需将 run_turn 改造为 async + CancellationToken,涉及 conversation 主循环重构,估计 3-5 天 |
-| 3.2 ACP silent drop | silent drop 是外部库 agent_client_protocol 的 rpc.rs 设计,claw-shell 无法直接修改;切换 1.3 会导致 route_to_agent/route_to_client stub 退化 |
-| 4.1 tui_mode gating | 需评估 14 处 tui_mode 使用点(app.rs + tui/app.rs),涉及 permission_prompter 分支、stdout gating 等,估计 1-2 天 |
+| 3.1 ClawAgent::cancel stub | 已通过 HookAbortSignal 落地真实取消信号;同 LLM stream 阻塞期间无法立即中断(需等下一检查点),与 TUI 路径 Ctrl+C 行为一致。详见 [agent.rs:369-384](../../rust/crates/claw-shell/src/agent.rs)。|
+| 3.2 ACP silent drop | 已通过 fork agent-client-protocol 0.10.4 patch 修复:rpc.rs 在 parse 失败时返回 -32700 parse_error、无 id 无 method 时返回 -32600 invalid_request(均 id=null)。workspace Cargo.toml 添加 [patch.crates-io] 重定向到 rust/forks/agent-client-protocol。测试 `run_agent_on_io_returns_parse_error_on_invalid_json` 固化新行为。|
+| 4.1 tui_mode gating | 已通过方法分离修复:新增 `run_turn_tui` 承载原 tui_mode=true 分支(emit_output=false、TuiSilentPermissionPrompter、current_abort_signal),`run_turn` 回归纯 REPL 路径。移除 `tui_mode` 字段和 `set_tui_mode` 方法,tui/app.rs 改调 `run_turn_tui`。|

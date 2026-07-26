@@ -1777,7 +1777,7 @@ fn state_error_surfaces_actionable_worker_commands_139() {
 
     // Keep the original locator so scripts grepping for it still work.
     assert!(
-        message.contains("no worker state file found at"),
+        message.contains("未找到 worker 状态文件:"),
         "error should keep the canonical prefix: {message}"
     );
     // New actionable hints — this is what #139 is fixing.
@@ -2709,8 +2709,8 @@ fn permission_policy_uses_plugin_tool_permissions() {
 #[test]
 fn shared_help_uses_resume_annotation_copy() {
     let help = commands::render_slash_command_help();
-    assert!(help.contains("Slash commands"));
-    assert!(help.contains("works with --resume SESSION.jsonl"));
+    assert!(help.contains("斜杠命令"));
+    assert!(help.contains("也支持 --resume SESSION.jsonl"));
 }
 
 #[test]
@@ -2987,13 +2987,13 @@ fn cost_report_uses_sectioned_layout() {
         cache_creation_input_tokens: 3,
         cache_read_input_tokens: 1,
     });
-    assert!(report.contains("Cost"));
-    assert!(report.contains("Input tokens     20"));
-    assert!(report.contains("Output tokens    8"));
-    assert!(report.contains("Cache create     3"));
-    assert!(report.contains("Cache read       1"));
-    assert!(report.contains("Total tokens     32"));
-    assert!(report.contains("Estimated cost"));
+    assert!(report.contains("成本"));
+    assert!(report.contains("输入 tokens      20"));
+    assert!(report.contains("输出 tokens      8"));
+    assert!(report.contains("缓存创建         3"));
+    assert!(report.contains("缓存读取         1"));
+    assert!(report.contains("总 tokens        32"));
+    assert!(report.contains("预估成本"));
 }
 
 #[test]
@@ -3032,7 +3032,7 @@ fn init_help_mentions_direct_subcommand() {
     assert!(help.contains("claw mcp"));
     assert!(help.contains("claw skills"));
     assert!(help.contains("claw /skills"));
-    assert!(help.contains("ultraworkers/claw-code"));
+    assert!(help.contains("dong382258137/claw-code"));
     assert!(help.contains("cargo install claw-code"));
     assert!(!help.contains("claw login"));
     assert!(!help.contains("claw logout"));
@@ -3470,9 +3470,9 @@ fn config_report_supports_section_views() {
 fn memory_report_uses_sectioned_layout() {
     let report = render_memory_report().expect("memory report should render");
     assert!(report.contains("Memory"));
-    assert!(report.contains("Working directory"));
-    assert!(report.contains("Instruction files"));
-    assert!(report.contains("Discovered files"));
+    assert!(report.contains("工作目录"));
+    assert!(report.contains("指令文件数"));
+    assert!(report.contains("发现的文件"));
 }
 
 #[test]
@@ -3534,7 +3534,7 @@ UU conflicted.rs",
     );
     assert_eq!(
         summary.headline(),
-        "dirty · 4 files · 2 staged, 2 unstaged, 1 untracked, 1 conflicted"
+        "脏 · 4 个文件 · 2 已暂存, 2 未暂存, 1 未跟踪, 1 有冲突"
     );
 }
 
@@ -3551,7 +3551,7 @@ fn render_diff_report_shows_clean_tree_for_committed_repo() {
     git(&["commit", "-m", "init", "--quiet"], &root);
 
     let report = render_diff_report_for(&root).expect("diff report should render");
-    assert!(report.contains("clean working tree"));
+    assert!(report.contains("干净的工作树"));
 
     fs::remove_dir_all(root).expect("cleanup temp dir");
 }
@@ -3573,8 +3573,8 @@ fn render_diff_report_includes_staged_and_unstaged_sections() {
     fs::write(root.join("tracked.txt"), "hello\nstaged\nunstaged\n").expect("update file twice");
 
     let report = render_diff_report_for(&root).expect("diff report should render");
-    assert!(report.contains("Staged changes:"));
-    assert!(report.contains("Unstaged changes:"));
+    assert!(report.contains("已暂存的更改:"));
+    assert!(report.contains("未暂存的更改:"));
     assert!(report.contains("tracked.txt"));
 
     fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -4084,12 +4084,12 @@ fn compact_tool_output_preserves_edit_file_error() {
 #[test]
 fn repl_help_mentions_history_completion_and_multiline() {
     let help = render_repl_help();
-    assert!(help.contains("Up/Down"));
+    assert!(help.contains("↑/↓"));
     assert!(help.contains("Tab"));
     assert!(help.contains("Shift+Enter/Ctrl+J"));
     assert!(help.contains("Ctrl-R"));
-    assert!(help.contains("Reverse-search prompt history"));
-    assert!(help.contains("/history [count]"));
+    assert!(help.contains("反向搜索历史输入"));
+    assert!(help.contains("/history [数量]"));
 }
 
 #[test]
@@ -4423,6 +4423,7 @@ fn push_output_block_renders_markdown_text() {
     let mut events = Vec::new();
     let mut pending_tool = None;
     let mut block_has_thinking_summary = false;
+    let mut pending_thinking = None;
 
     push_output_block(
         OutputContentBlock::Text {
@@ -4433,6 +4434,7 @@ fn push_output_block_renders_markdown_text() {
         &mut pending_tool,
         false,
         &mut block_has_thinking_summary,
+        &mut pending_thinking,
     )
     .expect("text block should render");
 
@@ -4447,6 +4449,7 @@ fn push_output_block_skips_empty_object_prefix_for_tool_streams() {
     let mut events = Vec::new();
     let mut pending_tool = None;
     let mut block_has_thinking_summary = false;
+    let mut pending_thinking = None;
 
     push_output_block(
         OutputContentBlock::ToolUse {
@@ -4459,6 +4462,7 @@ fn push_output_block_skips_empty_object_prefix_for_tool_streams() {
         &mut pending_tool,
         true,
         &mut block_has_thinking_summary,
+        &mut pending_thinking,
     )
     .expect("tool block should accumulate");
 
@@ -4467,6 +4471,80 @@ fn push_output_block_skips_empty_object_prefix_for_tool_streams() {
         pending_tool,
         Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
     );
+}
+
+/// P0 修复回归测试：流式路径的 Thinking 块必须暂存到 pending_thinking，
+/// 而不是直接 push 到 events。这是 DeepSeek thinking 模式不报 400 的关键 —
+/// ContentBlockStop 时才会统一 emit AssistantEvent::Thinking，让 history
+/// 里包含 reasoning_content 供下一轮请求回传。
+#[test]
+fn push_output_block_streaming_thinking_defers_to_pending() {
+    let mut out = Vec::new();
+    let mut events = Vec::new();
+    let mut pending_tool = None;
+    let mut block_has_thinking_summary = false;
+    let mut pending_thinking = None;
+
+    push_output_block(
+        OutputContentBlock::Thinking {
+            thinking: "initial".to_string(),
+            signature: Some("sig_abc".to_string()),
+        },
+        &mut out,
+        &mut events,
+        &mut pending_tool,
+        true, // streaming_tool_input=true：流式路径
+        &mut block_has_thinking_summary,
+        &mut pending_thinking,
+    )
+    .expect("thinking block should accumulate");
+
+    // 流式路径下 events 必须为空（待 ContentBlockStop 时 emit）
+    assert!(events.is_empty(), "streaming thinking must defer emit");
+    // pending_thinking 必须暂存 thinking 内容与 signature
+    assert_eq!(
+        pending_thinking,
+        Some(("initial".to_string(), Some("sig_abc".to_string())))
+    );
+    // 渲染摘要必须正常输出
+    let rendered = String::from_utf8(out).expect("utf8");
+    assert!(rendered.contains("▶ Thinking"));
+}
+
+/// P0 修复回归测试：非流式路径的 Thinking 块必须直接 emit 到 events。
+/// 这条路径是 fallback（流式未收到 stop 时回退到 send_message），
+/// 必须保持原有行为不变。
+#[test]
+fn push_output_block_nonstreaming_thinking_emits_directly() {
+    let mut out = Vec::new();
+    let mut events = Vec::new();
+    let mut pending_tool = None;
+    let mut block_has_thinking_summary = false;
+    let mut pending_thinking = None;
+
+    push_output_block(
+        OutputContentBlock::Thinking {
+            thinking: "step 1".to_string(),
+            signature: Some("sig_xyz".to_string()),
+        },
+        &mut out,
+        &mut events,
+        &mut pending_tool,
+        false, // streaming_tool_input=false：非流式回退路径
+        &mut block_has_thinking_summary,
+        &mut pending_thinking,
+    )
+    .expect("non-streaming thinking should emit directly");
+
+    // 非流式路径必须直接 push 事件
+    assert_eq!(events.len(), 1, "non-streaming thinking must emit directly");
+    assert!(matches!(
+        &events[0],
+        AssistantEvent::Thinking { thinking, signature }
+            if thinking == "step 1" && signature.as_deref() == Some("sig_xyz")
+    ));
+    // pending_thinking 必须保持空
+    assert!(pending_thinking.is_none(), "non-streaming must not populate pending");
 }
 
 #[test]
@@ -5039,9 +5117,9 @@ mod sandbox_report_tests {
     fn sandbox_report_renders_expected_fields() {
         let report = format_sandbox_report(&runtime::SandboxStatus::default());
         assert!(report.contains("Sandbox"));
-        assert!(report.contains("Enabled"));
-        assert!(report.contains("Filesystem mode"));
-        assert!(report.contains("Fallback reason"));
+        assert!(report.contains("已启用"));
+        assert!(report.contains("文件系统模式"));
+        assert!(report.contains("降级原因"));
     }
 
     #[test]

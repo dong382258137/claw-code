@@ -25,6 +25,13 @@ pub mod ultraplan;
 #[cfg(feature = "full-tui")]
 pub mod tui;
 
+// 从 grok-build (Apache-2.0) 移植的 TUI 子模块。与原生 tui/ 隔离,
+// 便于跟踪上游变更。详见 tui-ports/PORTING.md。
+// 目录用连字符(用户要求),模块名用下划线(Rust 标识符要求),通过 #[path] 桥接。
+#[cfg(feature = "full-tui")]
+#[path = "tui-ports/mod.rs"]
+pub mod tui_ports;
+
 #[cfg(test)]
 mod tests;
 
@@ -1187,4 +1194,93 @@ pub struct PluginsCommandPayload {
     pub config_load_error: Option<String>,
     pub plugins: Vec<Value>,
     pub load_failures: Vec<Value>,
+}
+
+/// `claw` / `claw-plus` binary 的统一入口。
+///
+/// 注册 panic hook（落盘到 ~/.claw/claw-crash.log），然后调用 `run()`。
+/// 错误时按 `--output-format` 决定 JSON 或文本输出，最后 `exit(1)`。
+/// `src/main.rs`（claw-plus bin）和 `src/bin/claw.rs`（claw bin）都调用此函数，
+/// 避免入口逻辑重复。
+pub fn main_entry() {
+    // 诊断：注册 panic hook，落盘到 ~/.claw/claw-crash.log
+    // 双击运行时 stderr 不可见，panic hook 是唯一能确认"是否 panic"的可靠信号。
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic>".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let claw_dir = home.join(".claw");
+        let _ = std::fs::create_dir_all(&claw_dir);
+        let crash_path = claw_dir.join("claw-crash.log");
+        let _ = std::fs::write(
+            &crash_path,
+            format!(
+                "PANIC at {location}\nMessage: {msg}\nTimestamp: {}\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ),
+        );
+        eprintln!("thread panicked at {location}: {msg}");
+        eprintln!("Crash log: {}", crash_path.display());
+    }));
+
+    if let Err(error) = run() {
+        let message = error.to_string();
+        // When --output-format json is active, emit errors as JSON so downstream
+        // tools can parse failures the same way they parse successes (ROADMAP #42).
+        let argv: Vec<String> = std::env::args().collect();
+        let json_output = argv
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "json")
+            || argv.iter().any(|a| a == "--output-format=json");
+        if json_output {
+            // #77: classify error by prefix so downstream claws can route without
+            // regex-scraping the prose. Split short-reason from hint-runbook.
+            let kind = classify_error_kind(&message);
+            let (short_reason, hint) = split_error_hint(&message);
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "type": "error",
+                    "error": short_reason,
+                    "kind": kind,
+                    "hint": hint,
+                    "exit_code": 1,
+                })
+            );
+        } else {
+            // #156: Add machine-readable error kind to text output so stderr observers
+            // don't need to regex-scrape the prose.
+            let kind = classify_error_kind(&message);
+            if message.contains("`claw --help`") {
+                eprintln!(
+                    "[error-kind: {kind}]
+error: {message}"
+                );
+            } else {
+                eprintln!(
+                    "[error-kind: {kind}]
+error: {message}
+
+Run `claw --help` for usage."
+                );
+            }
+        }
+        std::process::exit(1);
+    }
 }

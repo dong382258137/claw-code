@@ -51,6 +51,11 @@ where
     /// 推送到前端的 gateway sender。
     /// S = acp::AgentSide:agent 视角,OutMessage = AcpClientMessage。
     client_gateway: AcpGatewaySender<acp::AgentSide>,
+    /// 用于 cancel 当前 turn 的 abort signal。
+    /// 在 new_session 时创建并 clone 一份注入 runtime,
+    /// 保留一份供 cancel() 调用 abort()。
+    /// 在 prompt 入口调用 reset() 清除上一个 turn 的 sticky 状态。
+    turn_abort_signal: RefCell<Option<runtime::HookAbortSignal>>,
 }
 
 /// Builder:在 spawn 线程外构造,然后 `build()` 在 LocalSet 内完成。
@@ -124,6 +129,7 @@ where
             api_client: RefCell::new(Some(self.api_client)),
             tool_executor: RefCell::new(Some(tool_executor)),
             client_gateway,
+            turn_abort_signal: RefCell::new(None),
         }
     }
 }
@@ -249,6 +255,12 @@ where
         let tx = runtime::RefactorTransaction::new(arguments.cwd.clone());
         runtime = runtime.with_refactor_transaction(tx);
 
+        // 创建 abort signal:一份注入 runtime 供 run_turn 主循环检查,
+        // 一份保留在 self 供 cancel() 调用 abort()。
+        let abort_signal = runtime::HookAbortSignal::new();
+        runtime = runtime.with_hook_abort_signal(abort_signal.clone());
+        *self.turn_abort_signal.borrow_mut() = Some(abort_signal);
+
         *self.runtime.borrow_mut() = Some(runtime);
 
         Ok(acp::NewSessionResponse::new(session_id))
@@ -287,6 +299,12 @@ where
         let session_id = arguments.session_id.clone();
         let user_input = Self::extract_user_text(&arguments.prompt);
 
+        // 清除上一个 turn 可能残留的 sticky abort 状态,
+        // 否则 cancel signal 从 turn N 会立即 abort turn N+1。
+        if let Some(signal) = self.turn_abort_signal.borrow().as_ref() {
+            signal.reset();
+        }
+
         // run_turn 是同步阻塞 API。
         // current_thread + LocalSet 下直接同步调用:会阻塞 LocalSet 直到 turn 完成,
         // 但不会死锁(没有其他 task 需要并发,且 channel 发送是非阻塞的)。
@@ -299,9 +317,16 @@ where
             Err(e) => {
                 // 失败:runtime 放回,返回错误
                 *self.runtime.borrow_mut() = Some(runtime_rc);
+                let err_msg = e.to_string();
+                // 检测是否为用户取消(cancel 触发 HookAbortSignal,
+                // run_turn 在检查点返回 "turn interrupted by user")
+                if err_msg.contains("turn interrupted by user") {
+                    tracing::info!("claw-agent: turn cancelled by user");
+                    return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                }
                 return Err(acp::Error::new(
                     acp::ErrorCode::InternalError.into(),
-                    e.to_string(),
+                    err_msg,
                 ));
             }
         };
@@ -343,9 +368,19 @@ where
     }
 
     async fn cancel(&self, _arguments: acp::CancelNotification) -> Result<(), acp::Error> {
-        // 本期 run_turn 不支持中途取消(同步 API 无法中断)
-        // TODO: 改造 run_turn 为 async + CancellationToken 后实现
-        tracing::warn!("claw-agent: cancel not yet implemented (sync run_turn)");
+        // 调用 HookAbortSignal::abort(),run_turn 主循环在下一次迭代
+        // 顶部或工具调用边界检测到后返回 RuntimeError("turn interrupted by user"),
+        // prompt 方法据此返回 StopReason::Cancelled。
+        //
+        // 注意:正在进行的 LLM stream 调用(api_client.stream)是同步阻塞,
+        // 无法立即中断,需等流完成或失败后才进入下一检查点。
+        // 这与 TUI 路径(Ctrl+C)的行为一致。
+        if let Some(signal) = self.turn_abort_signal.borrow().as_ref() {
+            signal.abort();
+            tracing::info!("claw-agent: cancel signal fired for current turn");
+        } else {
+            tracing::debug!("claw-agent: cancel received but no active turn");
+        }
         Ok(())
     }
 

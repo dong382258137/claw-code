@@ -28,3 +28,10 @@ pedantic = { level = "allow", priority = -1 }
 module_name_repetitions = "allow"
 missing_panics_doc = "allow"
 missing_errors_doc = "allow"
+
+# 本地 fork 的 agent-client-protocol 0.10.4,修补 silent drop 行为:
+# - 解析失败时返回 -32700 parse_error(原 silent drop)
+# - 无 id 无 method 时返回 -32600 invalid_request(原 silent drop)
+# 详见 rust/forks/agent-client-protocol/src/rpc.rs
+[patch.crates-io]
+agent-client-protocol = { path = "forks/agent-client-protocol" }

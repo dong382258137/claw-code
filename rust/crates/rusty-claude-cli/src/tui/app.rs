@@ -2556,18 +2556,21 @@ fn execute_turn(
     });
 
     cli.set_status_emitter(emitter);
-    cli.set_tui_mode(true);
 
     // 细粒度诊断：注入 diag callback，在 run_turn 关键路径埋点写入 claw-diag.log。
     cli.set_diag_callback(Box::new(|msg| {
         crate::diag_log(&msg);
     }));
 
-    let result = cli.run_turn(line);
+    // TUI 路径走 run_turn_tui(分离自原 tui_mode gating):
+    // - emit_output=false,consume_stream 写入 io::sink
+    // - 抑制 spinner/println/print_status_bar/eprintln
+    // - 使用 TuiSilentPermissionPrompter 避免 stdin 冲突
+    // - 保存 current_abort_signal 供 Ctrl+C 中断
+    let result = cli.run_turn_tui(line);
 
     cli.clear_diag_callback();
     cli.clear_status_emitter();
-    cli.set_tui_mode(false);
     // Ensure streaming is marked as finished even on error
     if let Ok(mut guard) = status_state.lock() {
         if guard.streaming {

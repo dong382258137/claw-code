@@ -492,18 +492,14 @@ mod tests {
             .await;
     }
 
-    /// A6.4:错误路径 — 发送无效 JSON,验证 agent 不崩溃且通道保持可用
-    /// (后续合法请求仍可正常处理)。
+    /// A6.4:错误路径 — 发送无效 JSON,验证 agent 返回 `-32700 parse_error`
+    /// 错误响应且通道保持可用(后续合法请求仍可正常处理)。
     ///
-    /// **ACP 0.10.4 行为**:JSON parse 失败时,`rpc.rs` 仅 `log::error!`
-    /// 记录,**不发送 JSON-RPC error response**(silent drop)。这是上游
-    /// 库的设计,非 bug。此测试固化该行为:invalid JSON 后 agent 仍能
-    /// 处理合法的 `initialize` 请求。
-    ///
-    /// 未来若升级 ACP 版本(如 1.3.0 会返回 `-32700` parse_error),
-    /// 需同步更新此测试断言。
+    /// **行为变迁**:原 ACP 0.10.4 上游库对 parse 失败仅 `log::error!`
+    /// 并 silent drop。本项目通过 `rust/forks/agent-client-protocol` patch
+    /// 修复此行为,遵循 JSON-RPC 2.0 规范返回 `id=null` 的 parse_error 响应。
     #[tokio::test]
-    async fn run_agent_on_io_silently_drops_invalid_json() {
+    async fn run_agent_on_io_returns_parse_error_on_invalid_json() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let local = tokio::task::LocalSet::new();
@@ -529,23 +525,25 @@ mod tests {
                     .unwrap();
                 client_tx.flush().await.unwrap();
 
-                // 2. 等待一小段时间,确保 agent 处理了 invalid JSON
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-                // 3. 验证 agent 未发送任何响应(silent drop)
+                // 2. 验证 agent 返回 -32700 parse_error 响应(id=null)
                 let mut reader = tokio::io::BufReader::new(&mut client_rx);
                 let mut line = String::new();
                 let read_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
+                    std::time::Duration::from_secs(2),
                     reader.read_line(&mut line),
                 )
                 .await;
                 assert!(
-                    read_result.is_err(),
-                    "agent should NOT send response for invalid JSON (ACP 0.10.4 silent drop)"
+                    read_result.is_ok(),
+                    "agent should send parse_error response for invalid JSON"
                 );
+                let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                assert_eq!(resp["jsonrpc"], "2.0");
+                assert_eq!(resp["id"], serde_json::Value::Null);
+                assert_eq!(resp["error"]["code"], -32700);
+                assert_eq!(resp["error"]["message"], "Parse error");
 
-                // 4. 发送合法的 initialize 请求,验证 agent 仍可响应
+                // 3. 发送合法的 initialize 请求,验证 agent 仍可响应
                 let init_req = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "initialize",
@@ -564,7 +562,7 @@ mod tests {
                 .await;
                 assert!(
                     read_result.is_ok(),
-                    "agent should respond to valid initialize after invalid JSON"
+                    "agent should respond to valid initialize after parse error"
                 );
                 let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
                 assert_eq!(resp["jsonrpc"], "2.0");

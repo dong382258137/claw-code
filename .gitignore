@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 archive/
 .omx/
 # Claude Code local artifacts
@@ -36,3 +36,9 @@ target/
 # Sandbox tmp (transient)
 .sandbox-tmp/
 **/.sandbox-tmp/
+
+# Vendored reference sources (not a build dependency)
+.vendor/
+
+# Porting notes (deferred)
+rust/crates/rusty-claude-cli/tui-ports/PORTING.md

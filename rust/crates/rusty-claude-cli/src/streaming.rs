@@ -438,6 +438,10 @@ impl AnthropicRuntimeClient {
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
+        // P0 修复：thinking 内容累积器。
+        // ContentBlockStart 暂存 thinking 初值，ThinkingDelta 追加文本，
+        // SignatureDelta 追加签名，ContentBlockStop 时统一 emit。
+        let mut pending_thinking: Option<(String, Option<String>)> = None;
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
@@ -498,9 +502,21 @@ impl AnthropicRuntimeClient {
                             &mut pending_tool,
                             true,
                             &mut block_has_thinking_summary,
+                            &mut pending_thinking,
                         )?;
                         if block_has_thinking_summary {
                             had_thinking_summary = true;
+                        }
+                        // P0 修复：MessageStart 携带的 thinking 块没有对应
+                        // ContentBlockStop 事件（OpenAI-compat 提供商可能把完整
+                        // thinking 放在 MessageStart.content 里）。如果只暂存到
+                        // pending_thinking 等待 ContentBlockStop，会被后续
+                        // ContentBlockStart 覆盖丢失，且顺序错乱（thinking 应在
+                        // text 之前）。这里立即 emit 以保证顺序正确。
+                        if let Some((thinking, signature)) = pending_thinking.take() {
+                            if !thinking.is_empty() {
+                                events.push(AssistantEvent::Thinking { thinking, signature });
+                            }
                         }
                     }
                     if had_thinking_summary {
@@ -521,6 +537,7 @@ impl AnthropicRuntimeClient {
                         &mut pending_tool,
                         true,
                         &mut block_has_thinking_summary,
+                        &mut pending_thinking,
                     )?;
                     // P0 修复：OpenAI-compatible 提供商（DeepSeek 等）可能在
                     // ContentBlockStart 中携带完整文本块。push_output_block 只写入
@@ -562,7 +579,12 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
+                        // P0 修复：累积 thinking delta 文本到 pending_thinking。
+                        // 之前用 `ThinkingDelta { .. }` 直接丢弃 delta 文本，
+                        // 导致流式响应后 assistant 消息没有任何 thinking 内容，
+                        // 下一轮请求 DeepSeek API 报 400
+                        // (reasoning_content must be passed back)。
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
@@ -575,8 +597,23 @@ impl AnthropicRuntimeClient {
                                 redacted: false,
                             });
                         }
+                        match &mut pending_thinking {
+                            Some((pending, _)) => pending.push_str(&thinking),
+                            None => {
+                                pending_thinking = Some((thinking, None));
+                            }
+                        }
                     }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
+                    ContentBlockDelta::SignatureDelta { signature } => {
+                        // P0 修复：累积 signature delta，与 thinking 一起在
+                        // ContentBlockStop 时 emit。Anthropic extended thinking
+                        // 通过 signature 验证 thinking 块完整性。
+                        if let Some((_, pending_signature)) = &mut pending_thinking {
+                            pending_signature
+                                .get_or_insert_with(String::new)
+                                .push_str(&signature);
+                        }
+                    }
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
@@ -587,6 +624,16 @@ impl AnthropicRuntimeClient {
                                 // P0-1 修复 #6/9：ContentBlockStop markdown flush 失败。
                                 self.emit_stream_error(error.to_string(), false)
                             })?;
+                    }
+                    // P0 修复：thinking 块结束时统一 emit AssistantEvent::Thinking。
+                    // 这是 DeepSeek thinking 模式不报 400 的关键 — 下一轮请求时
+                    // convert_messages 会把这个 thinking 块转换成 reasoning_content
+                    // 回传给 API。空 thinking 不 emit，避免发送空 reasoning_content
+                    // (空内容会被 DeepSeek 拒绝)。
+                    if let Some((thinking, signature)) = pending_thinking.take() {
+                        if !thinking.is_empty() {
+                            events.push(AssistantEvent::Thinking { thinking, signature });
+                        }
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
@@ -886,6 +933,15 @@ pub(crate) fn push_output_block(
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
+    // P0 修复：流式响应必须累积 thinking 内容。
+    // DeepSeek V4 在 thinking 模式下要求历史中 assistant 消息回传 reasoning_content。
+    // 之前流式路径用 `ThinkingDelta { .. }` 直接丢弃 delta 文本，
+    // 且 push_output_block 在 streaming_tool_input=true 时不 emit Thinking 事件，
+    // 导致下一轮请求历史中完全没有 thinking 块，触发 API 400
+    // (reasoning_content must be passed back)。镜像 tools/src/lib.rs 的实现：
+    // ContentBlockStart 时把 thinking 暂存到 pending_thinking，
+    // 后续 ThinkingDelta/SignatureDelta 追加，ContentBlockStop 时 emit 事件。
+    pending_thinking: &mut Option<(String, Option<String>)>,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
@@ -911,17 +967,18 @@ pub(crate) fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
+        OutputContentBlock::Thinking { thinking, signature } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
-            // G10.5 fix: non-streaming fallback path must emit Thinking
-            // event so downstream consumers (planner, TUI status) receive
-            // the full event stream — mirrors tools/lib.rs push_output_block.
-            if !streaming_tool_input {
-                events.push(AssistantEvent::Thinking {
-                    thinking,
-                    signature: None,
-                });
+            if streaming_tool_input {
+                // 流式路径：暂存到 pending_thinking，等待后续 delta 追加，
+                // 由 ContentBlockStop 统一 emit AssistantEvent::Thinking。
+                *pending_thinking = Some((thinking, signature));
+            } else {
+                // G10.5 fix: non-streaming fallback path must emit Thinking
+                // event so downstream consumers (planner, TUI status) receive
+                // the full event stream — mirrors tools/lib.rs push_output_block.
+                events.push(AssistantEvent::Thinking { thinking, signature });
             }
         }
         OutputContentBlock::RedactedThinking { .. } => {
@@ -938,6 +995,10 @@ pub(crate) fn response_to_events(
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
+    // 非流式回退路径：streaming_tool_input=false 时 push_output_block 会
+    // 直接 push AssistantEvent::Thinking 到 events，无需 pending_thinking。
+    // 此变量仅为满足 push_output_block 新签名而存在，永远不会被写入。
+    let mut pending_thinking: Option<(String, Option<String>)> = None;
 
     for block in response.content {
         let mut block_has_thinking_summary = false;
@@ -948,9 +1009,17 @@ pub(crate) fn response_to_events(
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            &mut pending_thinking,
         )?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
+        }
+        // 安全网：流式累积漏 emit 时这里兜底（理论上不会触发，
+        // 因为 streaming_tool_input=false 时 push_output_block 已经 push 过）。
+        if let Some((thinking, signature)) = pending_thinking.take() {
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::Thinking { thinking, signature });
+            }
         }
     }
 

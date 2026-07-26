@@ -96,6 +96,15 @@ impl HookAbortSignal {
     pub fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
     }
+
+    /// Reset the abort flag to false.
+    ///
+    /// Used by `ClawAgent::prompt` to clear a sticky abort state from a
+    /// previous turn before starting a new turn. Without this, a cancel
+    /// signal from turn N would immediately abort turn N+1.
+    pub fn reset(&self) {
+        self.aborted.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

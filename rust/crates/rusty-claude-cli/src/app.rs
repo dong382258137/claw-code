@@ -509,11 +509,6 @@ pub(crate) struct LiveCli {
     // the TUI's StatusBarState + OutputView in real time.
     #[cfg(feature = "full-tui")]
     status_emitter: Option<crate::streaming::StatusEmitter>,
-    /// Phase 2: When true, run_turn suppresses emit_output (consume_stream
-    /// writes to io::sink instead of stdout). TUI captures content via the
-    /// status_emitter's TextDelta callback. Set by TuiApp via set_tui_mode.
-    #[cfg(feature = "full-tui")]
-    tui_mode: bool,
     /// TUI 本地命令输出捕获：当设置时，`tui_println` 会把内容追加到此
     /// buffer 而不是打印到 stdout（避免破坏 alternate screen）。
     /// 由 TuiApp 在执行斜杠命令前设置，执行后清除。
@@ -704,8 +699,6 @@ impl LiveCli {
             #[cfg(feature = "full-tui")]
             status_emitter: None,
             #[cfg(feature = "full-tui")]
-            tui_mode: false,
-            #[cfg(feature = "full-tui")]
             tui_output: None,
             #[cfg(feature = "full-tui")]
             current_abort_signal: None,
@@ -889,57 +882,20 @@ impl LiveCli {
     }
 
     pub(crate) fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // Phase 2: in TUI mode, suppress emit_output so consume_stream writes
-        // to io::sink instead of stdout — preventing duplicate output under
-        // the TUI's alternate screen. Streaming content is captured via the
-        // status_emitter's TextDelta callback.
-        //
-        // BUG 1 fix: in TUI mode we must also suppress *all* direct stdout/stderr
-        // writes from this function (spinner, println, print_status_bar, eprintln),
-        // because stdout/stderr are bound to the alternate-screen terminal and any
-        // stray write will corrupt the TUI render. State updates (accumulate_usage,
-        // goal_manager.record_tokens, persist_session, replace_runtime) still run.
-        let emit_output = {
-            #[cfg(feature = "full-tui")]
-            {
-                !self.tui_mode
-            }
-            #[cfg(not(feature = "full-tui"))]
-            {
-                true
-            }
-        };
-        #[cfg(feature = "full-tui")]
-        let tui_mode = self.tui_mode;
-        #[cfg(not(feature = "full-tui"))]
-        let tui_mode = false;
-        let (mut runtime, hook_abort_monitor, abort_signal) =
-            self.prepare_turn_runtime(emit_output)?;
-        // TUI 中断支持：保存 abort signal handle，让 TUI 层 Ctrl+C 能取消当前 turn。
-        #[cfg(feature = "full-tui")]
-        {
-            self.current_abort_signal = Some(abort_signal.clone());
-        }
+        // REPL 路径:emit_output=true,consume_stream 写入 stdout,
+        // spinner/println/print_status_bar 直接输出到终端。
+        // TUI 路径请用 run_turn_tui(分离自原 tui_mode gating)。
+        let (mut runtime, hook_abort_monitor, _abort_signal) =
+            self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        if !tui_mode {
-            spinner.tick(
-                "🦀 Thinking...",
-                TerminalRenderer::new().color_theme(),
-                &mut stdout,
-            )?;
-        }
-        // BUG 2 fix: in TUI mode the crossterm event loop owns stdin (raw mode),
-        // so a blocking `io::stdin().read_line()` inside CliPermissionPrompter
-        // would either hang forever or read garbage. Use a non-interactive
-        // prompter that auto-denies (with a clear reason) so the turn fails
-        // fast instead of wedging the TUI. The user can re-run the prompt in
-        // non-TUI mode to approve interactively.
-        let mut permission_prompter: Box<dyn runtime::PermissionPrompter> = if tui_mode {
-            Box::new(TuiSilentPermissionPrompter::new(self.permission_mode))
-        } else {
-            Box::new(CliPermissionPrompter::new(self.permission_mode))
-        };
+        spinner.tick(
+            "🦀 Thinking...",
+            TerminalRenderer::new().color_theme(),
+            &mut stdout,
+        )?;
+        let mut permission_prompter: Box<dyn runtime::PermissionPrompter> =
+            Box::new(CliPermissionPrompter::new(self.permission_mode));
         // Tier S #1 Goal 持续驱动：在调 runtime.run_turn 之前 prepend goal 前缀。
         // 前缀包含 goal 文本、状态（active/blocked）、blocked 计数、token 用量。
         // LLM 每轮都看到 goal 上下文，驱动持续工作。Paused 状态不注入。
@@ -953,72 +909,106 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                if !tui_mode {
-                    spinner.finish(
-                        "✨ Done",
-                        TerminalRenderer::new().color_theme(),
-                        &mut stdout,
-                    )?;
-                    let final_text = final_assistant_text(&summary);
-                    if !final_text.is_empty() {
-                        println!("{final_text}");
-                    }
-                    println!();
-                    if let Some(event) = summary.auto_compaction {
-                        println!(
-                            "{}",
-                            format_auto_compaction_notice(event.removed_message_count)
-                        );
-                    }
+                spinner.finish(
+                    "✨ Done",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                let final_text = final_assistant_text(&summary);
+                if !final_text.is_empty() {
+                    println!("{final_text}");
+                }
+                println!();
+                if let Some(event) = summary.auto_compaction {
+                    println!(
+                        "{}",
+                        format_auto_compaction_notice(event.removed_message_count)
+                    );
                 }
                 // P2 富状态栏：累加本次 usage 并打印状态行。
-                // run_turn 只在 REPL 交互模式被调用（非交互走 run_prompt_*），
-                // 所以无需额外门控 emit_output。
                 self.accumulate_usage(summary.usage);
                 // Tier S #1 Goal 持续驱动：累加本次回合的 token 用量到 goal_manager。
-                // 用于 budget 跟踪。失败不阻断主流程。
                 let turn_tokens = u64::from(summary.usage.total_tokens());
                 let _ = self.goal_manager.record_tokens(turn_tokens);
-                if !tui_mode {
-                    self.print_status_bar();
-                    println!();
-                }
+                self.print_status_bar();
+                println!();
                 self.persist_session()?;
-                // TUI 中断支持：turn 成功结束后清空 abort signal handle。
-                #[cfg(feature = "full-tui")]
-                {
-                    self.current_abort_signal = None;
-                }
                 Ok(())
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                if !tui_mode {
-                    spinner.fail(
-                        "❌ Request failed",
-                        TerminalRenderer::new().color_theme(),
-                        &mut stdout,
-                    )?;
-                }
+                spinner.fail(
+                    "❌ Request failed",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
                 // Tier S #1 Goal 持续驱动：检测网络错误关键词，自动 pause goal。
-                // 避免网络中断期间 goal 持续注入无效 prompt。
                 let error_str = error.to_string().to_ascii_lowercase();
                 let is_network_error = NETWORK_ERROR_KEYWORDS
                     .iter()
                     .any(|kw| error_str.contains(kw));
                 if is_network_error {
                     let _ = self.goal_manager.pause("network error");
-                    if !tui_mode {
-                        eprintln!(
-                            "\x1b[33m⚠ Goal auto-paused due to network error. Use /goal resume when network is restored.\x1b[0m"
-                        );
-                    }
+                    eprintln!(
+                        "\x1b[33m⚠ Goal auto-paused due to network error. Use /goal resume when network is restored.\x1b[0m"
+                    );
+                }
+                Err(Box::new(error))
+            }
+        }
+    }
+
+    /// TUI 模式专用 turn 入口(Phase A Step A5:从原 `tui_mode` gating 分离)。
+    ///
+    /// 与 `run_turn` 的差异:
+    /// - `emit_output=false`:consume_stream 写入 io::sink,流式内容通过
+    ///   status_emitter 的 TextDelta 回调驱动 TUI 渲染,避免 alternate screen
+    ///   下重复输出。
+    /// - 抑制所有 stdout/stderr 写入(spinner/println/print_status_bar/eprintln),
+    ///   因为它们绑定到 alternate-screen 终端,stray write 会破坏 TUI 渲染。
+    ///   状态更新(accumulate_usage/goal_manager.record_tokens/persist_session/
+    ///   replace_runtime)仍执行。
+    /// - 使用 `TuiSilentPermissionPrompter`:crossterm event loop 拥有 stdin
+    ///   (raw mode),CliPermissionPrompter 的阻塞 read_line 会挂起或读到垃圾,
+    ///   非交互 prompter 自动 deny(带清晰原因)让 turn 快速失败而非 wedging TUI。
+    /// - 保存 `current_abort_signal` handle,让 TUI 层 Ctrl+C 能取消当前 turn。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn run_turn_tui(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor, abort_signal) =
+            self.prepare_turn_runtime(false)?;
+        // TUI 中断支持：保存 abort signal handle，让 TUI 层 Ctrl+C 能取消当前 turn。
+        self.current_abort_signal = Some(abort_signal.clone());
+        let mut permission_prompter: Box<dyn runtime::PermissionPrompter> =
+            Box::new(TuiSilentPermissionPrompter::new(self.permission_mode));
+        let goal_prefix = self.goal_manager.render_prompt_prefix();
+        let full_input = match &goal_prefix {
+            Some(prefix) => format!("{prefix}{input}"),
+            None => input.to_string(),
+        };
+        let result = runtime.run_turn(&full_input, Some(&mut *permission_prompter));
+        hook_abort_monitor.stop();
+        match result {
+            Ok(summary) => {
+                self.replace_runtime(runtime)?;
+                self.accumulate_usage(summary.usage);
+                let turn_tokens = u64::from(summary.usage.total_tokens());
+                let _ = self.goal_manager.record_tokens(turn_tokens);
+                self.persist_session()?;
+                // TUI 中断支持：turn 成功结束后清空 abort signal handle。
+                self.current_abort_signal = None;
+                Ok(())
+            }
+            Err(error) => {
+                runtime.shutdown_plugins()?;
+                let error_str = error.to_string().to_ascii_lowercase();
+                let is_network_error = NETWORK_ERROR_KEYWORDS
+                    .iter()
+                    .any(|kw| error_str.contains(kw));
+                if is_network_error {
+                    let _ = self.goal_manager.pause("network error");
                 }
                 // TUI 中断支持：turn 结束（含错误/中断）后清空 abort signal handle。
-                #[cfg(feature = "full-tui")]
-                {
-                    self.current_abort_signal = None;
-                }
+                self.current_abort_signal = None;
                 Err(Box::new(error))
             }
         }
@@ -2472,15 +2462,6 @@ impl LiveCli {
     #[cfg(feature = "full-tui")]
     pub(crate) fn clear_diag_callback(&mut self) {
         self.diag_callback = None;
-    }
-
-    /// Phase 2: Toggle TUI mode. When on, run_turn calls prepare_turn_runtime
-    /// with emit_output=false so consume_stream's `out` goes to io::sink()
-    /// instead of stdout — preventing duplicate output in alternate screen.
-    /// Streaming content is captured via the status_emitter's TextDelta callback.
-    #[cfg(feature = "full-tui")]
-    pub(crate) fn set_tui_mode(&mut self, on: bool) {
-        self.tui_mode = on;
     }
 
     /// TUI 模式下设置本地命令输出捕获 buffer。设置后，`tui_println` 会把
