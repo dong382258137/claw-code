@@ -2,7 +2,7 @@ use std::{borrow::Borrow, fmt, ops::Deref};
 
 #[cfg(feature = "acp-0_10")]
 use agent_client_protocol as acp;
-#[cfg(feature = "acp-1_5")]
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 use agent_client_protocol_v1::schema::v1 as acp;
 use derive_more::From;
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
@@ -48,7 +48,7 @@ impl AcpSide for acp::ClientSide {
 // 1.3 stub marker types: acp::AgentSide / acp::ClientSide were removed in 1.x.
 // These stubs let the crate compile under `acp-1_5` but the gateway dispatch
 // path is non-functional until Phase 2 implements the 1.3 Component model.
-#[cfg(feature = "acp-1_5")]
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 mod side_markers {
     use super::{AcpAgentMessage, AcpClientMessage, AcpSide};
 
@@ -70,7 +70,7 @@ mod side_markers {
     }
 }
 
-#[cfg(feature = "acp-1_5")]
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 pub use side_markers::{AgentSide, ClientSide};
 
 /// Extends each request/response type pair with the side marker type and schema method name.
@@ -158,6 +158,7 @@ impl StorageMarker for Boxed {
 }
 
 mod client {
+    #[cfg(feature = "acp-0_10")]
     use futures::{future::LocalBoxFuture, FutureExt as _};
 
     use super::*;
@@ -386,6 +387,7 @@ mod client {
 }
 
 mod agent {
+    #[cfg(feature = "acp-0_10")]
     use futures::{future::LocalBoxFuture, FutureExt as _};
 
     use super::*;
@@ -439,7 +441,7 @@ mod agent {
     // `config_id = "model"` and the model id as the value. The agent's
     // `configOptions[category=model]` (returned in session/new or
     // InitializeResponse) lists the accepted model ids.
-    #[cfg(feature = "acp-1_5")]
+    #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
     acp_define_request_response!(
         acp::SetSessionConfigOptionRequest,
         acp::SetSessionConfigOptionResponse,
@@ -462,7 +464,7 @@ mod agent {
         SetSessionModel(AcpArgsGeneric<acp::SetSessionModelRequest, S>),
         /// 1.3 replacement for `SetSessionModel`. Send with `config_id = "model"`
         /// and the model id as the value to switch models mid-session.
-        #[cfg(feature = "acp-1_5")]
+        #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
         SetSessionConfigOption(AcpArgsGeneric<acp::SetSessionConfigOptionRequest, S>),
     }
 
@@ -485,7 +487,7 @@ mod agent {
                 Self::ExtNotification(a) => a.method_name(),
                 #[cfg(feature = "acp-0_10")]
                 Self::SetSessionModel(a) => a.method_name(),
-                #[cfg(feature = "acp-1_5")]
+                #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
                 Self::SetSessionConfigOption(a) => a.method_name(),
             }
         }
@@ -524,7 +526,7 @@ mod agent {
                 Self::SetSessionModel(args) => {
                     state.serialize_field("request", args.request.borrow())?
                 }
-                #[cfg(feature = "acp-1_5")]
+                #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
                 Self::SetSessionConfigOption(args) => {
                     state.serialize_field("request", args.request.borrow())?
                 }
@@ -585,7 +587,7 @@ mod agent {
                     }
                 }
                 // 1.3: `session/set_config_option` replaces `session/set_model`.
-                #[cfg(feature = "acp-1_5")]
+                #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
                 {
                     if method == acp::AGENT_METHOD_NAMES.session_set_config_option {
                         return parse!(SetSessionConfigOption);
@@ -612,7 +614,7 @@ mod agent {
                 Self::ExtNotification(args) => AcpAgentMessageBox::ExtNotification(args.boxed()),
                 #[cfg(feature = "acp-0_10")]
                 Self::SetSessionModel(args) => AcpAgentMessageBox::SetSessionModel(args.boxed()),
-                #[cfg(feature = "acp-1_5")]
+                #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
                 Self::SetSessionConfigOption(args) => {
                     AcpAgentMessageBox::SetSessionConfigOption(args.boxed())
                 }
@@ -752,7 +754,7 @@ pub enum ModelSwitchError {
 }
 
 /// Config-id used by ACP 1.3 to address the model selector option.
-#[cfg(feature = "acp-1_5")]
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 const MODEL_CONFIG_ID: &str = "model";
 
 /// Build a 1.3 `SetSessionConfigOptionRequest` that switches the session's
@@ -763,7 +765,7 @@ const MODEL_CONFIG_ID: &str = "model";
 /// agent in `configOptions[category=model]`. The `provider` argument is
 /// ignored under 1.3 — provider/model negotiation happens at session creation
 /// (`session/new`) or via agent-side configuration, not via this method.
-#[cfg(feature = "acp-1_5")]
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 pub fn build_set_model_request_v1_3(
     session_id: &acp::SessionId,
     model: &str,
@@ -800,7 +802,7 @@ pub fn set_session_model_compat(
         // sends the request via AcpAgentMessage::SetSessionModel.
         Ok(())
     }
-    #[cfg(feature = "acp-1_5")]
+    #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
     {
         // 1.3: SetSessionConfigOption variant is available; caller uses
         // build_set_model_request_v1_3 and sends via
@@ -828,14 +830,14 @@ mod compat_tests {
             let session_id = acp::SessionId::new("test-session");
             assert!(set_session_model_compat(&session_id, "claude-sonnet-4", None).is_ok());
         }
-        #[cfg(feature = "acp-1_5")]
+        #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
         {
             let session_id = acp::SessionId::new("test-session");
             assert!(set_session_model_compat(&session_id, "claude-sonnet-4", None).is_ok());
         }
     }
 
-    #[cfg(feature = "acp-1_5")]
+    #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
     #[test]
     fn build_set_model_request_v1_3_uses_model_config_id() {
         let session_id = acp::SessionId::new("sess_123");
@@ -851,7 +853,7 @@ mod compat_tests {
         );
     }
 
-    #[cfg(feature = "acp-1_5")]
+    #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
     #[test]
     fn set_config_option_message_variant_round_trips() {
         // Build a SetSessionConfigOptionRequest, wrap it in the message enum,

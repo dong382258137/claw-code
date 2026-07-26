@@ -65,6 +65,7 @@ where
     config: ClawAgentConfig,
     /// Optional tool handler setup, called inside `build()` (LocalSet context)
     /// to register handlers on the `StaticToolExecutor` before it's consumed.
+    #[allow(clippy::type_complexity)] // builder 模式常见,Fnonce 闭包类型无法简化
     tool_setup: Option<Box<dyn FnOnce(&mut StaticToolExecutor) + Send>>,
 }
 
@@ -304,6 +305,16 @@ where
                 ));
             }
         };
+
+        // 推送 LaneEvent → SessionNotification 桥接事件(工具调用进度、子 agent 状态等)
+        // 在 turn 完成后一次性 drain 并 forward 给 IDE 端,激活实时推送能力。
+        let flushed = crate::lane_bridge::flush_lane_events_to_acp(
+            &self.client_gateway,
+            &session_id,
+        );
+        if flushed > 0 {
+            tracing::debug!("claw-agent: flushed {flushed} lane events to ACP gateway");
+        }
 
         // 推流 assistant 文本(本期简化:turn 完成后一次性推送,非真实流式)
         let text = Self::extract_assistant_text(&runtime_rc);

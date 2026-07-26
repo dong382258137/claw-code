@@ -22,12 +22,14 @@ pub mod executor;
 pub mod executor_trait;
 pub mod scheduler;
 pub mod status;
+pub mod subagent_dispatcher;
 pub mod types;
 
 // v0.2 re-exports: petgraph-backed graph + async scheduler primitives.
 pub use coordinator_executor::{CoordinatorExecutor, SubagentRunner};
 pub use executor_trait::{NodeError, SubagentExecutor};
 pub use scheduler::{DagScheduler, ProgressEvent};
+pub use subagent_dispatcher::SubagentDispatcher;
 pub use types::{DagError, DagGraph, DagId, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
 
 use std::collections::HashMap;

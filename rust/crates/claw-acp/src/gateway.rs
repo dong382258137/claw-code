@@ -4,16 +4,24 @@ use std::rc::Rc;
 
 #[cfg(feature = "acp-0_10")]
 use agent_client_protocol as acp;
-#[cfg(feature = "acp-1_5")]
+// 同时启用 acp-0_10 和 acp-1_5 时,0.10.4 优先(向后兼容)。
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 use agent_client_protocol_v1::schema::v1 as acp;
+#[cfg(feature = "acp-0_10")]
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
+#[cfg(feature = "acp-0_10")]
 use tracing::Instrument;
 
+// acp_send 在 1.3 路径的 forward() 中也使用,所以不能 gating 到 0.10.4
 use crate::{
     acp_send,
     common::AcpResult,
-    message::{AcpAgentMessage, AcpArgs, AcpClientMessage, AcpRequest, AcpSide},
+    message::{AcpArgs, AcpRequest, AcpSide},
+};
+#[cfg(feature = "acp-0_10")]
+use crate::{
+    message::{AcpAgentMessage, AcpClientMessage},
     AcpMethod,
 };
 
@@ -23,6 +31,7 @@ type OnMetaFn = Rc<dyn Fn(&acp::Meta) -> tracing::Span>;
 
 /// Gateway receiver - allows sending messages to it via a channel and it will
 /// forward them to an underlying connection.
+#[allow(dead_code)] // rx/conn 在 1.3 stub 路径下未读(只有 0.10.4 的 run() 使用)
 pub struct AcpGatewayReceiver<S: AcpSide, C> {
     rx: mpsc::UnboundedReceiver<S::OutMessage>,
     conn: C,
@@ -121,15 +130,19 @@ pub type AcpClientGatewaySender = AcpGatewaySender<acp::ClientSide>;
 // Use the local stub marker types and a placeholder connection. The gateway
 // dispatch path is non-functional under `acp-1_5` until Phase 2 implements
 // the 1.3 Component/Connection model.
-#[cfg(feature = "acp-1_5")]
+//
+// 同时启用 acp-0_10 和 acp-1_5 时,0.10.4 的别名优先(上面已定义)。
+// 此处的 1.3 别名仅在 acp-0_10 未启用时生效,避免 E0428 重复定义。
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 pub type AcpAgentGatewayReceiver = AcpGatewayReceiver<crate::message::AgentSide, ()>;
-#[cfg(feature = "acp-1_5")]
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 pub type AcpAgentGatewaySender = AcpGatewaySender<crate::message::AgentSide>;
-#[cfg(feature = "acp-1_5")]
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 pub type AcpClientGatewayReceiver = AcpGatewayReceiver<crate::message::ClientSide, ()>;
-#[cfg(feature = "acp-1_5")]
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 pub type AcpClientGatewaySender = AcpGatewaySender<crate::message::ClientSide>;
 
+#[cfg(feature = "acp-0_10")]
 fn before_request<T: AcpRequest>(args: &AcpArgs<T>, tracing: bool) -> Option<String> {
     tracing.then(|| {
         let method = crate::common::compact_json(&args.method_name());
@@ -141,6 +154,7 @@ fn before_request<T: AcpRequest>(args: &AcpArgs<T>, tracing: bool) -> Option<Str
     })
 }
 
+#[cfg(feature = "acp-0_10")]
 fn after_request<T: Serialize>(
     response_tx: oneshot::Sender<AcpResult<T>>,
     response: AcpResult<T>,
@@ -163,6 +177,7 @@ fn after_request<T: Serialize>(
     response_tx.send(response).is_ok()
 }
 
+#[cfg(feature = "acp-0_10")]
 macro_rules! handle {
     ($args:expr, $tracing:expr, $conn:expr, $name:ident, $spawn:expr, $on_meta:expr $(,)?) => {{
         let span = ($on_meta)
@@ -562,7 +577,7 @@ mod tests {
 
     #[cfg(feature = "acp-0_10")]
     use agent_client_protocol as acp;
-    #[cfg(feature = "acp-1_5")]
+    #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
     use agent_client_protocol_v1::schema::v1 as acp;
 
     struct OrderTrackingClient {

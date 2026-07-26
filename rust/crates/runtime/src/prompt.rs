@@ -995,6 +995,7 @@ fn get_simple_doing_tasks_section() -> String {
         .join("\n")
 }
 
+#[allow(dead_code)] // 预先存在,保留供未来 actions section 使用
 fn get_actions_section() -> String {
     [
         "# Executing actions with care".to_string(),

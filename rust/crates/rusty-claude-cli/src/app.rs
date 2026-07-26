@@ -2783,6 +2783,10 @@ pub(crate) fn build_runtime_with_plugin_state(
     let shared_topology = env::current_dir()
         .ok()
         .map(|cwd| std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(cwd)));
+    // v0.2 生产接入:在 model 被 move 进 AnthropicRuntimeClient 之前先 clone 一份,
+    // 稍后用于构造独立的 subagent api_client(DAG dispatch 用)。
+    // AnthropicRuntimeClient 不是 Clone(内含 tokio::runtime::Runtime),只能重建。
+    let model_for_subagent = model.clone();
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -2849,9 +2853,46 @@ pub(crate) fn build_runtime_with_plugin_state(
     let coordinator = runtime::MultiAgentCoordinator::new();
     let task_registry = runtime::task_registry::TaskRegistry::new()
         .with_multi_agent_coordinator(coordinator.clone());
+    // v0.2 生产接入:保留一份 coordinator 的 Arc,用于构造 CoordinatorExecutor。
+    // coordinator 是 Clone(内部全 Arc<Mutex>),clone 后再 move 给 with_multi_agent_coordinator。
+    let coordinator_arc = std::sync::Arc::new(coordinator.clone());
     runtime = runtime
         .with_multi_agent_coordinator(coordinator)
         .with_task_registry(task_registry);
+
+    // v0.2 生产接入:构造 CoordinatorExecutor 并装入 runtime,让 DAG 调度能真正
+    // 执行子 agent turn(替代 v0.1 stub 路径)。
+    //
+    // 因 AnthropicRuntimeClient 不是 Clone(内含 tokio::runtime::Runtime),
+    // 这里用之前 clone 的 model_for_subagent 重建一份独立的 client 给 subagent
+    // dispatcher。subagent 走独立 LLM 请求 + 独立 prompt cache(§5.2 缓存保护),
+    // enable_tools=false(subagent system prompt 明确不需要工具),
+    // emit_output=false(避免子 agent 输出污染主 CLI),
+    // progress_reporter=None(subagent 不需要进度回调)。
+    if let Ok(workspace_root) = env::current_dir() {
+        let subagent_api_client = AnthropicRuntimeClient::new(
+            session_id,
+            model_for_subagent,
+            false, // enable_tools
+            false, // emit_output
+            None,  // allowed_tools
+            tool_registry.clone(),
+            None,  // progress_reporter
+        )?;
+        runtime = runtime.with_dag_coordinator(
+            coordinator_arc,
+            subagent_api_client,
+            workspace_root,
+        );
+    }
+
+    // v0.2 生产接入:把 CoordinatorExecutor 注入 tools 层全局 registry,
+    // 让 dag_run 工具的 "start" 分支能取出它构造 DagScheduler。
+    // Arc<CoordinatorExecutor> 通过 unsizing 自动转换为
+    // Arc<dyn SubagentExecutor + Send + Sync>。
+    if let Some(executor) = runtime.coordinator_executor() {
+        tools::set_coordinator_executor(executor.clone());
+    }
     // 根据模型 context window 动态设置 compaction 阈值。
     // 1M 模型(DeepSeek V4/GPT-5.4)阈值 650K,200K 模型(Claude)阈值 130K,
     // 避免 100K 一刀切对长上下文模型过度激进压缩。

@@ -1,6 +1,8 @@
 #[cfg(feature = "acp-0_10")]
 use agent_client_protocol as acp;
-#[cfg(feature = "acp-1_5")]
+// 同时启用 acp-0_10 和 acp-1_5 时,0.10.4 优先(向后兼容)。
+// 仅在 acp-0_10 未启用时,才引入 1.3 schema 作为 acp 别名。
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 use agent_client_protocol_v1::schema::v1 as acp;
 use tokio::sync::{mpsc, oneshot};
 

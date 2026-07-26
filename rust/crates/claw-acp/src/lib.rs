@@ -36,8 +36,9 @@ pub use self::{
 pub use self::common::compact_json;
 
 /// Build a 1.3 `SetSessionConfigOptionRequest` for model switching.
-/// Only available under the `acp-1_5` feature flag.
-#[cfg(feature = "acp-1_5")]
+/// Only available under the `acp-1_5` feature flag (and `acp-0_10` NOT set,
+/// since 0.10.4 takes priority when both are enabled).
+#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
 pub use self::message::build_set_model_request_v1_3;
 
 /// Unified, version-agnostic model-switch capability check.

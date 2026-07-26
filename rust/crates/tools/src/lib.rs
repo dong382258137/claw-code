@@ -362,6 +362,33 @@ fn global_dag_store() -> &'static dag::DagStore {
     STORE.get_or_init(dag::DagStore::new)
 }
 
+/// v0.2 生产接入:全局 CoordinatorExecutor registry。
+///
+/// 由 app.rs 在 runtime 构造后调用 [`set_coordinator_executor`] 注入。
+/// 当 set 后,dag_run 工具的 "start" 分支会用它构造 DagScheduler 进行
+/// 真实并发调度(替代 v0.1 stub 路径)。
+///
+/// 类型是 `Arc<dyn SubagentExecutor + Send + Sync>` 而非具体的
+/// `Arc<CoordinatorExecutor>`,让 tools 层不必依赖 CoordinatorExecutor
+/// 具体类型(只依赖 SubagentExecutor trait)。
+static COORDINATOR_EXECUTOR: std::sync::OnceLock<
+    Arc<dyn dag::SubagentExecutor + Send + Sync>,
+> = std::sync::OnceLock::new();
+
+/// 注入全局 CoordinatorExecutor。在 app startup 期间调用一次。
+///
+/// 接受 `Arc<dyn SubagentExecutor + Send + Sync>`,调用方通常通过
+/// `Arc<CoordinatorExecutor>` 的 unsizing 转换传入。多次调用静默忽略
+/// (OnceLock 语义),仅第一次生效。
+pub fn set_coordinator_executor(executor: Arc<dyn dag::SubagentExecutor + Send + Sync>) {
+    let _ = COORDINATOR_EXECUTOR.set(executor);
+}
+
+/// 读取全局 CoordinatorExecutor(若已注入)。
+fn global_coordinator_executor() -> Option<&'static Arc<dyn dag::SubagentExecutor + Send + Sync>> {
+    COORDINATOR_EXECUTOR.get()
+}
+
 fn global_task_registry() -> &'static TaskRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
@@ -3483,6 +3510,56 @@ fn run_dag_run(input: dag::DagRunInput) -> Result<String, String> {
         _ => {
             // Start a new run
             let run = store.start_run(&input.dag_id)?;
+
+            // v0.2 生产接入:尝试用全局 CoordinatorExecutor 进行真实并发调度。
+            // 若未注入(executor=None),回退到 v0.1 stub 行为(仅注册 Pending run)。
+            if let Some(executor) = global_coordinator_executor() {
+                if let Some(dag) = store.dag_for_run(&run.id) {
+                    let graph = dag::DagGraph::from_dag(&dag);
+                    let scheduler = dag::DagScheduler::new(graph, executor.clone())
+                        .with_dag_run(Arc::new(store.clone()), run.id.clone());
+
+                    // 后台 spawn 调度循环(不阻塞 tool 返回)。
+                    // 用 std::thread::spawn + 独立 tokio runtime,因为 tools
+                    // 是从同步 ConversationRuntime::run_turn 调用的,当前线程
+                    // 没有 tokio runtime 上下文。DagScheduler::run 是 async,
+                    // 需要runtime 来 drive;SubagentDispatcher::dispatch 内部的
+                    // spawn_blocking 也需要 runtime。
+                    let run_id = run.id.clone();
+                    std::thread::spawn(move || {
+                        let rt = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                eprintln!(
+                                    "DAG run {run_id}: failed to create tokio runtime: {e}"
+                                );
+                                return;
+                            }
+                        };
+                        rt.block_on(async move {
+                            match scheduler.run().await {
+                                Ok(results) => eprintln!(
+                                    "DAG run {run_id} completed: {} nodes",
+                                    results.len()
+                                ),
+                                Err(e) => eprintln!("DAG run {run_id} failed: {e}"),
+                            }
+                        });
+                    });
+
+                    return to_pretty_json(serde_json::json!({
+                        "dag_id": input.dag_id,
+                        "run_id": run.id,
+                        "status": "Running",
+                        "message": "DAG scheduling started in background"
+                    }));
+                }
+            }
+
+            // Fallback:无 executor 或取不到 dag,仅注册 Pending(原有行为)
             to_pretty_json(serde_json::json!({
                 "dag_id": input.dag_id,
                 "run_id": run.id,

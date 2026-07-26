@@ -263,7 +263,7 @@ pub fn lane_event_to_session_update(
             let subagent_id = extract_subagent_id(event);
             Some(tool_call_notification(
                 session_id,
-                &format!("subagent-{subagent_id}"),
+                format!("subagent-{subagent_id}"),
                 format!("Subagent handoff ({subagent_id}): {msg}"),
                 acp::ToolKind::Other,
                 acp::ToolCallStatus::InProgress,
@@ -284,7 +284,7 @@ pub fn lane_event_to_session_update(
             };
             Some(tool_call_notification(
                 session_id,
-                &format!("subagent-{subagent_id}"),
+                format!("subagent-{subagent_id}"),
                 format!("Subagent result ({subagent_id}): {msg}"),
                 acp::ToolKind::Other,
                 call_status,

@@ -35,6 +35,12 @@ use crate::planner::{
 // 主 agent 通过 dispatch_subagent tool 派发任务给子 agent。
 // 子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
 use crate::multi_agent::{CoordinationMode, MultiAgentCoordinator, SubagentStatus};
+// CoordinatorExecutor + SubagentDispatcher + SubagentRunner — 用于 DAG 真实调度
+// (v0.2 TODO 2 生产接入)。with_dag_coordinator 把 CoordinatorExecutor 装到 runtime,
+// 供 tools 层 dag_run 工具取出后构造 DagScheduler。
+use crate::multi_agent::dag::{
+    CoordinatorExecutor, SubagentDispatcher, SubagentRunner,
+};
 // Step 3.2-a:LaneEvent helpers for SubagentHandoff / SubagentResult.
 use crate::lane_events::{try_publish as publish_lane_event, LaneEvent};
 // Harness O(可观测性)层接入:LoopDetectionMiddleware 打断 Doom Loop。
@@ -403,6 +409,14 @@ pub struct ConversationRuntime<C, T> {
     /// 与 multi_agent_coordinator 配合使用:coordinator 管理子 agent 生命周期,
     /// registry 管理 task 级元数据。详见 plan.md §9.2 Epic 3。
     task_registry: Option<crate::task_registry::TaskRegistry>,
+    /// v0.2 生产接入:CoordinatorExecutor for DAG dispatch。
+    ///
+    /// `None` 时(默认)DAG 调度走 v0.1 stub 路径(仅注册 Pending run);
+    /// `Some` 时 dag_run 工具可取出此 executor 构造 DagScheduler,真正并发
+    /// 执行子 agent turn。注入路径:`with_dag_coordinator` 把传入的
+    /// api_client + workspace_root 包成 SubagentDispatcher,再装到
+    /// CoordinatorExecutor 的 SubagentRunner 回调。
+    coordinator_executor: Option<Arc<CoordinatorExecutor>>,
     /// P0-3:NOTEBOOK 刷新提醒 flag。
     ///
     /// 当 microcompact / auto_compaction / reactive compaction 压缩了
@@ -500,6 +514,7 @@ where
             turn_start: Cell::new(None),
             multi_agent_coordinator: None,
             task_registry: None,
+            coordinator_executor: None,
             notebook_refresh_pending: false,
             pending_remediation: None,
             decision_log: None,
@@ -721,6 +736,54 @@ where
     /// `&mut self` 版本的 `with_multi_agent_coordinator`。
     pub fn set_multi_agent_coordinator(&mut self, coordinator: MultiAgentCoordinator) {
         self.multi_agent_coordinator = Some(coordinator);
+    }
+
+    /// v0.2 生产接入:配置 DAG dispatch 用 CoordinatorExecutor。
+    ///
+    /// 把传入的 `coordinator` + `api_client` + `workspace_root` 组装成
+    /// CoordinatorExecutor(其 SubagentRunner 回调由 SubagentDispatcher 实现),
+    /// 装入 runtime。后续 tools 层 dag_run 工具通过 [`coordinator_executor`]
+    /// 取出此 executor,即可构造 DagScheduler 进行真实并发调度。
+    ///
+    /// `api_client` 是独立的一份(不与 runtime 内部主 agent 的 api_client 共享),
+    /// 因为 subagent 走独立 LLM 请求 + 独立 prompt cache(§5.2 缓存保护)。
+    /// 调用方需在构造 runtime 之前保留 / 重建一份 api_client 传入此处。
+    ///
+    /// # 类型约束
+    /// `C: ApiClient + Send + 'static` — api_client 会被 box 成
+    /// `Box<dyn ApiClient + Send>` 并存入 `Arc<Mutex<..>>`,必须满足 Send。
+    #[must_use]
+    pub fn with_dag_coordinator(
+        mut self,
+        coordinator: Arc<MultiAgentCoordinator>,
+        api_client: C,
+        workspace_root: PathBuf,
+    ) -> Self
+    where
+        C: ApiClient + Send + 'static,
+    {
+        let dispatcher = SubagentDispatcher::new(
+            Arc::new(Mutex::new(Box::new(api_client))),
+            workspace_root,
+        );
+        let runner: SubagentRunner = Arc::new(move |id, task| {
+            let d = dispatcher.clone();
+            Box::pin(async move { d.dispatch(id, task).await })
+        });
+        self.coordinator_executor = Some(Arc::new(
+            CoordinatorExecutor::new(coordinator).with_runner(runner),
+        ));
+        self
+    }
+
+    /// 取出已注入的 CoordinatorExecutor 引用(若已注入)。
+    ///
+    /// tools 层 dag_run 工具在 "start" 分支调用此方法,若返回 `Some`
+    /// 则构造 DagScheduler 进行真实调度;若 `None` 则回退到 v0.1 stub
+    /// 路径(仅注册 Pending run)。
+    #[must_use]
+    pub fn coordinator_executor(&self) -> Option<&Arc<CoordinatorExecutor>> {
+        self.coordinator_executor.as_ref()
     }
 
     /// Epic 3:注入 TaskRegistry,启用子 agent 任务追踪。
@@ -1684,12 +1747,18 @@ where
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
-                    PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
-                        tool_use_id,
-                        tool_name,
-                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
-                        true,
-                    ),
+                    PermissionOutcome::Deny { reason } => {
+                        // 触发 Notification hook:权限拒绝是用户通知的天然触发点
+                        let _ = self.hook_runner.run_notification(
+                            &format!("Tool `{tool_name}` was denied: {reason}"),
+                        );
+                        ConversationMessage::tool_result(
+                            tool_use_id,
+                            tool_name,
+                            merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                            true,
+                        )
+                    }
                 };
                 self.session
                     .push_message(result_message.clone())
@@ -3123,7 +3192,7 @@ fn parse_auto_compaction_threshold_opt(value: Option<&str>) -> Option<u32> {
         .filter(|threshold| *threshold > 0)
 }
 
-fn build_assistant_message(
+pub(crate) fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<
     (
