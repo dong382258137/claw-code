@@ -323,15 +323,15 @@ Build is done. Now let me start running the tests systematically. I’ll run all
 [38;5;245m│[0m     {
 [38;5;245m│[0m       “deprecated_install”: “cargo install claw-code”,
 [38;5;245m│[0m       “details”: [
-[38;5;245m│[0m         “官方仓库          https://github.com/ultraworkers/claw-code”,
+[38;5;245m│[0m         “官方仓库          https://github.com/dong382258137/claw-code”,
 [38;5;245m│[0m         “推荐路径          从本仓库构建或使用 README.md 中记录的上游二进制”,
 [38;5;245m│[0m         “已弃用的 crate    [38;5;10m`cargo install claw-code`[39m 安装的是已弃用的占位包,不提供 [38;5;10m`claw-plus`[39m 二进制”
 [38;5;245m│[0m       ],
 [38;5;245m│[0m       “name”: “install source”,
-[38;5;245m│[0m       “official_repo”: “https://github.com/ultraworkers/claw-code”,
+[38;5;245m│[0m       “official_repo”: “https://github.com/dong382258137/claw-code”,
 [38;5;245m│[0m       “recommended_install”: “build from source or follow the upstream binary instructions in README.md”,
 [38;5;245m│[0m       “status”: “ok”,
-[38;5;245m│[0m       “summary”: “官方来源是 ultraworkers/claw-code;避免使用 [38;5;10m`cargo install claw-code`[39m”
+[38;5;245m│[0m       “summary”: “官方来源是 dong382258137/claw-code;避免使用 [38;5;10m`cargo install claw-code`[39m”
 [38;5;245m│[0m     },
 [38;5;245m│[0m     {
 [38;5;245m│[0m       “changed_files”: 13,
@@ -445,7 +445,7 @@ G1.1 result: JSON output looks correct - has [38;5;10m`kind: "doctor"`[39m, [
 [38;5;245m│[0m       Diagnose local auth, config, workspace, and sandbox health
 [38;5;245m│[0m   claw acp [serve]
 [38;5;245m│[0m       [38;5;10m`claw acp serve`[39m starts a stdio ACP JSON-RPC server for editor integration; aliases: –acp, -acp
-[38;5;245m│[0m       Source of truth: ultraworkers/claw-code
+[38;5;245m│[0m       Source of truth: dong382258137/claw-code
 [38;5;245m│[0m       Warning: do not [38;5;10m`cargo install claw-code`[39m (deprecated stub)
 [38;5;245m│[0m   claw dump-manifests [–manifests-dir PATH]
 [38;5;245m│[0m   claw bootstrap-plan

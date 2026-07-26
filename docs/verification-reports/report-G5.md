@@ -474,7 +474,7 @@ Now let me run all the remaining grep checks in parallel:
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs:120:                “description”: “Coordination mode: ‘fork’ (shared workdir, parallel), ‘teammate’ (shared TaskRegistry), ‘worktree’ (isolated git worktree).”,
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs:386:    /// Epic 3:TaskRegistry — 子 agent 任务注册表。
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs:388:    /// [38;5;10m`Some`[39m 时子 agent 任务可通过 TaskRegistry 追踪状态/心跳/团队分配。
-[38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs:391:    task_registry: Option[38;5;12m[4m[crate::task_registry::TaskRegistry](crate::task_registry::TaskRegistry)[0m,
+[38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs:391:    task_registry: Option[38;5;12m[4m`crate::task_registry::TaskRegistry`[0m,
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs:484:            task_registry: None,
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs:708:    /// Epic 3:注入 TaskRegistry,启用子 agent 任务追踪。
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs:711:    /// TaskRegistry 追踪。与 multi_agent_coordinator 配合使用。
@@ -488,7 +488,7 @@ Now let me run all the remaining grep checks in parallel:
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\lib.rs:297:pub use task_registry::{
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\lib.rs:298:    LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat, Task, TaskRegistry, TaskStatus,
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\multi_agent\mod.rs:8://!   - [[38;5;10m`CoordinationMode::Teammate`[39m]:多个 agent 协作,通过共享 TaskRegistry 通信。
-[38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\multi_agent\mod.rs:11://! - 与 [38;5;12m[4m[[38;5;10m`TaskRegistry`[39m](crate::task_registry::TaskRegistry)[0m 对接。
+`crate::task_registry::TaskRegistry`[0m 对接。
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\multi_agent\mod.rs:31:    /// Teammate:多个 agent 协作,通过共享 TaskRegistry 通信。
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\multi_agent\mod.rs:102:    /// - [38;5;10m`Teammate`[39m → 创建子 agent,workdir=None(通过 TaskRegistry 通信)
 [38;5;245m│[0m \?\D:\claw-code-src\rust\crates\runtime\src\task_registry.rs:107:pub struct TaskRegistry {

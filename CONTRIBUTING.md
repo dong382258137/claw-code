@@ -1,7 +1,7 @@
 ﻿# Contributing to Claw Plus
 
 Thanks for helping improve Claw Plus. This repository is a fork of
-[ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) (MIT License),
+[dong382258137/claw-code](https://github.com/dong382258137/claw-code) (MIT License),
 maintained at [dong382258137/claw-code](https://github.com/dong382258137/claw-code).
 
 ## Ground rules

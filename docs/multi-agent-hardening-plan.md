@@ -33,7 +33,7 @@
 
 | v1 声称 | 实际 |
 |---|---|
-| "panic hook **未注册**(全仓 0 处命中)" | **错误**。[main.rs:13-45](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/main.rs#L13-L45) 已注册完整 panic hook,落盘到 `~/.claw/claw-crash.log` |
+| "panic hook **未注册**(全仓 0 处命中)" | **错误**。[main.rs:13-45](../rust/crates/rusty-claude-cli/src/main.rs#L13-L45) 已注册完整 panic hook,落盘到 `~/.claw/claw-crash.log` |
 
 **v1 后果**:方案 §4.1 要求"main.rs:10 第一行加 `install_panic_hook()`",但 `std::panic::set_hook` 是**替换**不是追加,会覆盖现有 hook。
 
@@ -41,7 +41,7 @@
 
 ### 0.2 headless.rs panic hook 缺失(v1 描述自相矛盾)
 
-[headless.rs:22-50](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs#L22-L50) 确实没有 panic hook。v1 §2.2 声称"全仓 0 处命中"与 §4.1 要求"headless.rs 补 hook"自相矛盾。
+[headless.rs:22-50](../rust/crates/rusty-claude-cli/src/bin/headless.rs#L22-L50) 确实没有 panic hook。v1 §2.2 声称"全仓 0 处命中"与 §4.1 要求"headless.rs 补 hook"自相矛盾。
 
 **v2 修正**:headless.rs 是真实缺口,需补 `install_panic_hook()` 调用。
 
@@ -49,9 +49,9 @@
 
 | v1 声称 | 实际 |
 |---|---|
-| `ProviderClient::from_model(m)` 是"伪 API",项目中不存在 | **错误**。[client.rs:17](file:///d:/claw-code-src/rust/crates/api/src/client.rs#L17) `pub fn from_model(model: &str) -> Result<Self, ApiError>` 真实存在 |
+| `ProviderClient::from_model(m)` 是"伪 API",项目中不存在 | **错误**。[client.rs:17](../rust/crates/api/src/client.rs#L17) `pub fn from_model(model: &str) -> Result<Self, ApiError>` 真实存在 |
 
-**真实构造路径**([client.rs:17-47](file:///d:/claw-code-src/rust/crates/api/src/client.rs#L17-L47)):
+**真实构造路径**([client.rs:17-47](../rust/crates/api/src/client.rs#L17-L47)):
 
 ```rust
 pub fn from_model(model: &str) -> Result<Self, ApiError> {
@@ -84,23 +84,23 @@ pub fn from_model_with_anthropic_auth(
 
 | v1 声称 | 实际 |
 |---|---|
-| `tools/src/lib.rs:5180-5214` `providerFallbacks` | 行号偏差;实际 [tools/lib.rs:5217-5224](file:///d:/claw-code-src/rust/crates/tools/src/lib.rs#L5217-L5224) `load_provider_fallback_config()` |
-| 配置 key `providerFallbacks` | 正确,但实际类型是 `ProviderFallbackConfig { primary: Option<String>, fallbacks: Vec<String> }`,定义在 [config.rs:582-602](file:///d:/claw-code-src/rust/crates/runtime/src/config.rs#L582-L602) |
+| `tools/src/lib.rs:5180-5214` `providerFallbacks` | 行号偏差;实际 [tools/lib.rs:5217-5224](../rust/crates/tools/src/lib.rs#L5217-L5224) `load_provider_fallback_config()` |
+| 配置 key `providerFallbacks` | 正确,但实际类型是 `ProviderFallbackConfig { primary: Option<String>, fallbacks: Vec<String> }`,定义在 [config.rs:582-602](../rust/crates/runtime/src/config.rs#L582-L602) |
 
 **fallback 链构造路径**:
-1. [config.rs:1042-1056](file:///d:/claw-code-src/rust/crates/runtime/src/config.rs#L1042-L1056) `parse_optional_provider_fallbacks` 从 `settings.json` 的 `providerFallbacks` 字段解析
-2. [tools/lib.rs:5208-5215](file:///d:/claw-code-src/rust/crates/tools/src/lib.rs#L5208-L5215) `build_provider_entry` 用 `ProviderClient::from_model` 构造每个 entry
+1. [config.rs:1042-1056](../rust/crates/runtime/src/config.rs#L1042-L1056) `parse_optional_provider_fallbacks` 从 `settings.json` 的 `providerFallbacks` 字段解析
+2. [tools/lib.rs:5208-5215](../rust/crates/tools/src/lib.rs#L5208-L5215) `build_provider_entry` 用 `ProviderClient::from_model` 构造每个 entry
 3. 仅对 retryable 错误触发,与本次 `upgrade_model`(validation 失败触发)**正交**,不会冲突
 
 ### 0.5 deepseek-v4-pro / flash 现状(为 MVP 路由核实)
 
 | 维度 | deepseek-v4-pro | deepseek-v4-flash | 源码依据 |
 |---|---|---|---|
-| ProviderKind | OpenAi | OpenAi | [mod.rs:257-263](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L257-L263) `openai/` 前缀路由 |
+| ProviderKind | OpenAi | OpenAi | [mod.rs:257-263](../rust/crates/api/src/providers/mod.rs#L257-L263) `openai/` 前缀路由 |
 | auth_env | OPENAI_API_KEY | OPENAI_API_KEY | 同上 |
 | base_url | OPENAI_BASE_URL(用户自定义 deepseek endpoint) | 同左 | 同上 |
-| context_window | 1M tokens | 1M tokens | [mod.rs:645-648](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L645-L648) |
-| reasoning_content_in_history | 需要 | 需要 | [openai_compat.rs:983](file:///d:/claw-code-src/rust/crates/api/src/providers/openai_compat.rs#L983) `starts_with("deepseek-v4")` |
+| context_window | 1M tokens | 1M tokens | [mod.rs:645-648](../rust/crates/api/src/providers/mod.rs#L645-L648) |
+| reasoning_content_in_history | 需要 | 需要 | [openai_compat.rs:983](../rust/crates/api/src/providers/openai_compat.rs#L983) `starts_with("deepseek-v4")` |
 | v1 `tier_for_model` 推断 | Standard(不含 opus/mini/haiku) | **Standard(错误,应为 Budget)** | v1 §4.2 前缀匹配 `mini/haiku/nano` 才归 Budget,但 `flash` 未覆盖 |
 
 **v1 漏洞**:`tier_for_model` 未识别 `flash` 后缀,导致 deepseek-v4-flash 被误判为 Standard。MVP 必须修正(见 §4.2 v2)。
@@ -109,24 +109,24 @@ pub fn from_model_with_anthropic_auth(
 
 | v1 引用 | 实际位置 | 偏差 |
 |---|---|---|
-| `execute_dispatch_subagent` @ conversation.rs:1663 | [conversation.rs:1700](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L1700) | +37 |
-| `run_subagent_turn` @ 1777-1876 | [conversation.rs:1814](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L1814) | +37 |
-| `providerFallbacks` @ tools/lib.rs:5180-5214 | [tools/lib.rs:5217-5224](file:///d:/claw-code-src/rust/crates/tools/src/lib.rs#L5217-L5224) | +37 |
+| `execute_dispatch_subagent` @ conversation.rs:1663 | [conversation.rs:1700](../rust/crates/runtime/src/conversation.rs#L1700) | +37 |
+| `run_subagent_turn` @ 1777-1876 | [conversation.rs:1814](../rust/crates/runtime/src/conversation.rs#L1814) | +37 |
+| `providerFallbacks` @ tools/lib.rs:5180-5214 | [tools/lib.rs:5217-5224](../rust/crates/tools/src/lib.rs#L5217-L5224) | +37 |
 | `MODEL_REGISTRY` @ mod.rs:121 | 实际位置正确 | 0 |
-| `metadata_for_model` @ mod.rs:234-289 | [mod.rs:235-289](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L235-L289) | +1 |
-| `provider_capabilities_for_model` @ mod.rs:384-450 | [mod.rs:385-450](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L385-L450) | +1 |
+| `metadata_for_model` @ mod.rs:234-289 | [mod.rs:235-289](../rust/crates/api/src/providers/mod.rs#L235-L289) | +1 |
+| `provider_capabilities_for_model` @ mod.rs:384-450 | [mod.rs:385-450](../rust/crates/api/src/providers/mod.rs#L385-L450) | +1 |
 
 ### 0.7 spawn 签名破坏面(v1 低估)
 
 v1 把 `spawn() -> String` 改为 `spawn() -> Result<String, String>`,会破坏:
-- [conversation.rs:1737](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L1737) 唯一运行时调用方(易改)
-- [mod.rs:307-463](file:///d:/claw-code-src/rust/crates/runtime/src/multi_agent/mod.rs#L307-L463) **12 处单元测试**(全部需改)
+- [conversation.rs:1737](../rust/crates/runtime/src/conversation.rs#L1737) 唯一运行时调用方(易改)
+- [mod.rs:307-463](../rust/crates/runtime/src/multi_agent/mod.rs#L307-L463) **12 处单元测试**(全部需改)
 
 **v2 修正方向**:保留 `spawn` 原签名 `-> String`(能力校验失败时返回 id 并把 warning 写入 Subagent.notes 字段),新增 `spawn_with_model` 扩展方法返回 `Result`。原 12 处测试零改动。
 
 ### 0.8 ProviderDiagnostics 字段数(v1 描述不准)
 
-v1 §2.3 称"ProviderDiagnostics 8 布尔位",实际 [mod.rs:104-119](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L104-L119) 是 **8 bool + 6 非 bool 字段**(`requested_model`/`resolved_model`/`provider`/`auth_env`/`base_url_env`/`default_base_url`)。
+v1 §2.3 称"ProviderDiagnostics 8 布尔位",实际 [mod.rs:104-119](../rust/crates/api/src/providers/mod.rs#L104-L119) 是 **8 bool + 6 非 bool 字段**(`requested_model`/`resolved_model`/`provider`/`auth_env`/`base_url_env`/`default_base_url`)。
 
 ---
 
@@ -182,12 +182,12 @@ v1 §2.3 称"ProviderDiagnostics 8 布尔位",实际 [mod.rs:104-119](file:///d:
 | 维度 | 现状 | 源码依据 |
 |---|---|---|
 | 统一日志模块 | **不存在**。主 CLI crate 不依赖任何日志 crate | — |
-| panic hook(主 binary) | **已注册**。[main.rs:13-45](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/main.rs#L13-L45) 内联闭包,落盘 `~/.claw/claw-crash.log` | v1 错误声称"全仓 0 处命中" |
-| panic hook(headless) | **未注册**。[headless.rs:22-50](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs#L22-L50) 无 hook | 真实缺口 |
-| 文件诊断日志 | 仅 `paste.rs` 的 `paste_diag_log`,覆盖 paste 子系统 | [paste.rs:40-69](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/paste.rs#L40-L69) |
+| panic hook(主 binary) | **已注册**。[main.rs:13-45](../rust/crates/rusty-claude-cli/src/main.rs#L13-L45) 内联闭包,落盘 `~/.claw/claw-crash.log` | v1 错误声称"全仓 0 处命中" |
+| panic hook(headless) | **未注册**。[headless.rs:22-50](../rust/crates/rusty-claude-cli/src/bin/headless.rs#L22-L50) 无 hook | 真实缺口 |
+| 文件诊断日志 | 仅 `paste.rs` 的 `paste_diag_log`,覆盖 paste 子系统 | [paste.rs:40-69](../rust/crates/rusty-claude-cli/src/paste.rs#L40-L69) |
 | crash log 落盘 | **已存在**于主 binary,但代码内联不可复用 | main.rs:33-42 |
 | `diag!` / `tdiag!` 宏 | **不存在** | — |
-| TUI 静默 | `paste.rs:18` 的 `TUI_SILENT` AtomicBool + `set_tui_silent`,已就绪可复用 | [paste.rs:16-23](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/paste.rs#L16-L23) |
+| TUI 静默 | `paste.rs:18` 的 `TUI_SILENT` AtomicBool + `set_tui_silent`,已就绪可复用 | [paste.rs:16-23](../rust/crates/rusty-claude-cli/src/paste.rs#L16-L23) |
 | tracing | `claw-acp` / `claw-shell` 引入但**未初始化 subscriber**,全部 no-op | — |
 
 **关键缺口(v2 修正)**:不是"panic hook 不存在",而是"main.rs 内联 hook 不可复用 + headless 完全缺失"。`paste_diag_log` 是项目里唯一可参考的"flush-to-disk"实现模板(路径策略、门控、时间戳、append 模式都正确),可推广为通用 `diag!` 宏。
@@ -422,10 +422,10 @@ macro_rules! diag {
 
 **修改点(v2 修正)**：
 
-- **[main.rs:13-45](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/main.rs#L13-L45)**:**删除**内联 panic hook 闭包,改为第一行调用 `runtime::diag::install_panic_hook();`(v1 错误声称"新增",实际是提取替换)
-- **[bin/headless.rs:22](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs#L22)**:`fn main()` 第一行加 `runtime::diag::install_panic_hook();`(真实缺口,补齐)
-- **[paste.rs:18](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/paste.rs#L18)** `TUI_SILENT`:改为委托调用 `runtime::diag::set_tui_silent()`,paste.rs 保留 `set_tui_silent` 包装函数但内部转发,消除两个独立 AtomicBool 不同步风险
-- **[paste.rs:40-69](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/paste.rs#L40-L69)** `paste_diag_log`:改为调用 `runtime::diag::log`,保留 `paste_log!` 宏语义不变
+- **[main.rs:13-45](../rust/crates/rusty-claude-cli/src/main.rs#L13-L45)**:**删除**内联 panic hook 闭包,改为第一行调用 `runtime::diag::install_panic_hook();`(v1 错误声称"新增",实际是提取替换)
+- **[bin/headless.rs:22](../rust/crates/rusty-claude-cli/src/bin/headless.rs#L22)**:`fn main()` 第一行加 `runtime::diag::install_panic_hook();`(真实缺口,补齐)
+- **[paste.rs:18](../rust/crates/rusty-claude-cli/src/paste.rs#L18)** `TUI_SILENT`:改为委托调用 `runtime::diag::set_tui_silent()`,paste.rs 保留 `set_tui_silent` 包装函数但内部转发,消除两个独立 AtomicBool 不同步风险
+- **[paste.rs:40-69](../rust/crates/rusty-claude-cli/src/paste.rs#L40-L69)** `paste_diag_log`:改为调用 `runtime::diag::log`,保留 `paste_log!` 宏语义不变
 
 **设计要点(v2 修正)**：
 - ~~`OnceLock<bool>` 缓存开关检查~~ → 改用 `AtomicBool + OnceLock<()>` 初始化门控,支持 `enable()` 运行时强制开启(修复 v1 竞态)
@@ -1487,7 +1487,7 @@ for attempt in 1..=max_attempts {
 
 #### 4.5.3 `run_subagent_turn_with_model` 新增方法(v2 修正)
 
-**v2 修正**:`ProviderClient::from_model` 真实存在([client.rs:17](file:///d:/claw-code-src/rust/crates/api/src/client.rs#L17)),v1 误以为不存在。spike 报告见 §9。
+**v2 修正**:`ProviderClient::from_model` 真实存在([client.rs:17](../rust/crates/api/src/client.rs#L17)),v1 误以为不存在。spike 报告见 §9。
 
 ```rust
 /// 带模型选择的 subagent turn 执行。
@@ -1785,7 +1785,7 @@ pub fn persist_decisions_to_notebook(
 
 **修改文件**：`rust/crates/runtime/src/conversation.rs` 的 auto_compaction 路径
 
-> **关键插入点**:在 [conversation.rs:2201-2227](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L2201-L2227) 的 auto_compaction 调用 `compact_session` **之前**,插入决策提取步骤。
+> **关键插入点**:在 [conversation.rs:2201-2227](../rust/crates/runtime/src/conversation.rs#L2201-L2227) 的 auto_compaction 调用 `compact_session` **之前**,插入决策提取步骤。
 
 ```rust
 // conversation.rs auto_compaction 路径(约 2201 行附近)
@@ -2036,38 +2036,38 @@ pub struct CostGuard {
 
 | 关注点 | 文件 | 行号 | 备注 |
 |---|---|---|---|
-| MultiAgentCoordinator 定义 | [mod.rs](file:///d:/claw-code-src/rust/crates/runtime/src/multi_agent/mod.rs) | 78 | 准确 |
-| Coordinator.start() | [mod.rs:138-151](file:///d:/claw-code-src/rust/crates/runtime/src/multi_agent/mod.rs#L138-L151) | 138-151 | 准确 |
-| Coordinator.spawn() 原签名 | [mod.rs:104-135](file:///d:/claw-code-src/rust/crates/runtime/src/multi_agent/mod.rs#L104-L135) | 104-135 | v2 保持不变 |
-| Coordinator.complete() | [mod.rs:154-169](file:///d:/claw-code-src/rust/crates/runtime/src/multi_agent/mod.rs#L154-L169) | 154-169 | v2 retry loop 关键约束 |
-| 任务分发 execute_dispatch_subagent | [conversation.rs:1700](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L1700) | 1700 | v1 错称 1663 |
-| subagent turn 执行 run_subagent_turn | [conversation.rs:1814](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L1814) | 1814 | v1 错称 1777 |
-| 现有 panic hook(主 binary) | [main.rs:13-45](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/main.rs#L13-L45) | 13-45 | v2 提取目标 |
-| 现有 paste_diag_log 模板 | [paste.rs:40-69](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/paste.rs#L40-L69) | 40-69 | 准确 |
-| TUI_SILENT 静默机制 | [paste.rs:16-23](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/paste.rs#L16-L23) | 16-23 | 准确 |
-| ProviderClient::from_model | [client.rs:17-47](file:///d:/claw-code-src/rust/crates/api/src/client.rs#L17-L47) | 17-47 | v2 新增,v1 误以为不存在 |
-| ProviderKind 枚举 | [mod.rs:32-37](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L32-L37) | 32-37 | 准确 |
-| ProviderDiagnostics(8 bool + 6 非 bool) | [mod.rs:104-119](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L104-L119) | 104-119 | v1 错称"8 布尔位" |
-| 能力矩阵 provider_capabilities_for_model | [mod.rs:385-450](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L385-L450) | 385-450 | v1 错称 384 |
-| 模型路由 metadata_for_model | [mod.rs:235-289](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L235-L289) | 235-289 | v1 错称 234 |
-| detect_provider_kind | [mod.rs:341-362](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L341-L362) | 341-362 | v2 新增,deepseek 路由关键 |
-| deepseek-v4 token limit | [mod.rs:645-648](file:///d:/claw-code-src/rust/crates/api/src/providers/mod.rs#L645-L648) | 645-648 | v2 新增,MVP 路由关键 |
-| Fallback 链构造 build_provider_entry | [tools/lib.rs:5208-5215](file:///d:/claw-code-src/rust/crates/tools/src/lib.rs#L5208-L5215) | 5208-5215 | v1 错称 5180-5214 |
-| Fallback 配置加载 load_provider_fallback_config | [tools/lib.rs:5217-5224](file:///d:/claw-code-src/rust/crates/tools/src/lib.rs#L5217-L5224) | 5217-5224 | v2 新增 |
-| ProviderFallbackConfig 定义 | [config.rs:582-602](file:///d:/claw-code-src/rust/crates/runtime/src/config.rs#L582-L602) | 582-602 | v2 新增 |
-| parse_optional_provider_fallbacks | [config.rs:1042-1056](file:///d:/claw-code-src/rust/crates/runtime/src/config.rs#L1042-L1056) | 1042-1056 | v2 新增 |
-| 主进程入口 | [main.rs:10](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/main.rs#L10) | 10 | 准确 |
-| headless 入口(缺 panic hook) | [headless.rs:22](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs#L22) | 22 | v2 补 hook |
-| compaction 摘要生成 summarize_messages | [compact.rs:546-631](file:///d:/claw-code-src/rust/crates/runtime/src/compact.rs#L546-L631) | 546-631 | v3 §4.7 决策提取前置点 |
-| 摘要体积压缩 compress_summary_text | [summary_compression.rs](file:///d:/claw-code-src/rust/crates/runtime/src/summary_compression.rs) | 全文件 | v3 §4.7 决策丢失根因 |
-| auto_compaction 触发点 | [conversation.rs:2201-2227](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L2201-L2227) | 2201-2227 | v3 §4.7.3 决策提取插入点 |
-| NOTEBOOK.md 数据模型 | [notebook.rs](file:///d:/claw-code-src/rust/crates/runtime/src/notebook.rs) | 73-94 | v3 §4.7.2 新增 decisions 段 |
-| NOTEBOOK 注入 system_prompt | [conversation.rs:954-975](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L954-L975) | 954-975 | v3 §4.7 复用 |
-| notebook_refresh_pending 机制 | [conversation.rs:383-397](file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs#L383-L397) | 383-397 | v3 §4.7 复用 |
-| FTS5 索引构建 index_message | [session.rs:704-726](file:///d:/claw-code-src/rust/crates/runtime/src/session.rs#L704-L726) | 704-726 | v3 §4.7.3 新增 decision role |
-| FTS5 搜索 history_search | [history_search.rs](file:///d:/claw-code-src/rust/crates/runtime/src/history_search.rs) | 47-54 | v3 §4.7.4 decision 加权 |
-| tool_result_archive 三层架构注释 | [tool_result_archive.rs:20-30](file:///d:/claw-code-src/rust/crates/runtime/src/tool_result_archive.rs#L20-L30) | 20-30 | v3 §4.7.5 四层架构引用 |
-| DAG ↔ NOTEBOOK 协同(设计文档) | [dag-orchestration-detail.md:2038-2069](file:///d:/claw-code-src/docs/modules/dag-orchestration-detail.md#L2038-L2069) | 2038-2069 | v3 §4.7.6 对齐建议 |
+| MultiAgentCoordinator 定义 | [mod.rs](../rust/crates/runtime/src/multi_agent/mod.rs) | 78 | 准确 |
+| Coordinator.start() | [mod.rs:138-151](../rust/crates/runtime/src/multi_agent/mod.rs#L138-L151) | 138-151 | 准确 |
+| Coordinator.spawn() 原签名 | [mod.rs:104-135](../rust/crates/runtime/src/multi_agent/mod.rs#L104-L135) | 104-135 | v2 保持不变 |
+| Coordinator.complete() | [mod.rs:154-169](../rust/crates/runtime/src/multi_agent/mod.rs#L154-L169) | 154-169 | v2 retry loop 关键约束 |
+| 任务分发 execute_dispatch_subagent | [conversation.rs:1700](../rust/crates/runtime/src/conversation.rs#L1700) | 1700 | v1 错称 1663 |
+| subagent turn 执行 run_subagent_turn | [conversation.rs:1814](../rust/crates/runtime/src/conversation.rs#L1814) | 1814 | v1 错称 1777 |
+| 现有 panic hook(主 binary) | [main.rs:13-45](../rust/crates/rusty-claude-cli/src/main.rs#L13-L45) | 13-45 | v2 提取目标 |
+| 现有 paste_diag_log 模板 | [paste.rs:40-69](../rust/crates/rusty-claude-cli/src/paste.rs#L40-L69) | 40-69 | 准确 |
+| TUI_SILENT 静默机制 | [paste.rs:16-23](../rust/crates/rusty-claude-cli/src/paste.rs#L16-L23) | 16-23 | 准确 |
+| ProviderClient::from_model | [client.rs:17-47](../rust/crates/api/src/client.rs#L17-L47) | 17-47 | v2 新增,v1 误以为不存在 |
+| ProviderKind 枚举 | [mod.rs:32-37](../rust/crates/api/src/providers/mod.rs#L32-L37) | 32-37 | 准确 |
+| ProviderDiagnostics(8 bool + 6 非 bool) | [mod.rs:104-119](../rust/crates/api/src/providers/mod.rs#L104-L119) | 104-119 | v1 错称"8 布尔位" |
+| 能力矩阵 provider_capabilities_for_model | [mod.rs:385-450](../rust/crates/api/src/providers/mod.rs#L385-L450) | 385-450 | v1 错称 384 |
+| 模型路由 metadata_for_model | [mod.rs:235-289](../rust/crates/api/src/providers/mod.rs#L235-L289) | 235-289 | v1 错称 234 |
+| detect_provider_kind | [mod.rs:341-362](../rust/crates/api/src/providers/mod.rs#L341-L362) | 341-362 | v2 新增,deepseek 路由关键 |
+| deepseek-v4 token limit | [mod.rs:645-648](../rust/crates/api/src/providers/mod.rs#L645-L648) | 645-648 | v2 新增,MVP 路由关键 |
+| Fallback 链构造 build_provider_entry | [tools/lib.rs:5208-5215](../rust/crates/tools/src/lib.rs#L5208-L5215) | 5208-5215 | v1 错称 5180-5214 |
+| Fallback 配置加载 load_provider_fallback_config | [tools/lib.rs:5217-5224](../rust/crates/tools/src/lib.rs#L5217-L5224) | 5217-5224 | v2 新增 |
+| ProviderFallbackConfig 定义 | [config.rs:582-602](../rust/crates/runtime/src/config.rs#L582-L602) | 582-602 | v2 新增 |
+| parse_optional_provider_fallbacks | [config.rs:1042-1056](../rust/crates/runtime/src/config.rs#L1042-L1056) | 1042-1056 | v2 新增 |
+| 主进程入口 | [main.rs:10](../rust/crates/rusty-claude-cli/src/main.rs#L10) | 10 | 准确 |
+| headless 入口(缺 panic hook) | [headless.rs:22](../rust/crates/rusty-claude-cli/src/bin/headless.rs#L22) | 22 | v2 补 hook |
+| compaction 摘要生成 summarize_messages | [compact.rs:546-631](../rust/crates/runtime/src/compact.rs#L546-L631) | 546-631 | v3 §4.7 决策提取前置点 |
+| 摘要体积压缩 compress_summary_text | [summary_compression.rs](../rust/crates/runtime/src/summary_compression.rs) | 全文件 | v3 §4.7 决策丢失根因 |
+| auto_compaction 触发点 | [conversation.rs:2201-2227](../rust/crates/runtime/src/conversation.rs#L2201-L2227) | 2201-2227 | v3 §4.7.3 决策提取插入点 |
+| NOTEBOOK.md 数据模型 | [notebook.rs](../rust/crates/runtime/src/notebook.rs) | 73-94 | v3 §4.7.2 新增 decisions 段 |
+| NOTEBOOK 注入 system_prompt | [conversation.rs:954-975](../rust/crates/runtime/src/conversation.rs#L954-L975) | 954-975 | v3 §4.7 复用 |
+| notebook_refresh_pending 机制 | [conversation.rs:383-397](../rust/crates/runtime/src/conversation.rs#L383-L397) | 383-397 | v3 §4.7 复用 |
+| FTS5 索引构建 index_message | [session.rs:704-726](../rust/crates/runtime/src/session.rs#L704-L726) | 704-726 | v3 §4.7.3 新增 decision role |
+| FTS5 搜索 history_search | [history_search.rs](../rust/crates/runtime/src/history_search.rs) | 47-54 | v3 §4.7.4 decision 加权 |
+| tool_result_archive 三层架构注释 | [tool_result_archive.rs:20-30](../rust/crates/runtime/src/tool_result_archive.rs#L20-L30) | 20-30 | v3 §4.7.5 四层架构引用 |
+| DAG ↔ NOTEBOOK 协同(设计文档) | [dag-orchestration-detail.md:2038-2069](../docs/modules/dag-orchestration-detail.md) | 2038-2069 | v3 §4.7.6 对齐建议 |
 
 ---
 
@@ -2152,7 +2152,7 @@ $env:OPENAI_BASE_URL = "https://api.deepseek.com/v1"
 
 1. **base_url 共享**:pro/flash 共享同一 `OPENAI_BASE_URL`,若用户同时用 OpenAI 和 deepseek,需用 `openai/deepseek-v4-pro` 前缀路由(走 `metadata_for_model` 的 `openai/` 分支)。MVP 首期假设用户只用 deepseek,不处理多 provider 共存。
 
-2. **reasoning_content 序列化**:`deepseek-v4-*` 需要 `reasoning_content_in_history`([openai_compat.rs:983](file:///d:/claw-code-src/rust/crates/api/src/providers/openai_compat.rs#L983) `starts_with("deepseek-v4")`),`ProviderClient::from_model` 构造的 client 会自动处理,无需 subagent 额外配置。
+2. **reasoning_content 序列化**:`deepseek-v4-*` 需要 `reasoning_content_in_history`([openai_compat.rs:983](../rust/crates/api/src/providers/openai_compat.rs#L983) `starts_with("deepseek-v4")`),`ProviderClient::from_model` 构造的 client 会自动处理,无需 subagent 额外配置。
 
 3. **fallback 链与 upgrade_map 协调**:现有 `providerFallbacks`(retryable 错误触发)与 `upgrade_map`(validation 失败触发)正交,不冲突。但 MVP 首期应**禁用** `providerFallbacks`,只用 `upgrade_map`,避免双层重试混淆。验证流程稳定后再考虑组合。
 

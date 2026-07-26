@@ -28,7 +28,7 @@
 
 ```
 Anthropic Claude Code（概念来源 / 架构参考）
-  └─ ultraworkers/claw-code（MIT License 开源实现）
+  └─ dong382258137/claw-code（MIT License 开源实现）
        └─ dong382258137/claw-code → Claw Plus（本仓库）
             ├─ IM 桥接集成 (IM Bridge)
             └─ 其他功能增强与定制
@@ -37,11 +37,11 @@ Anthropic Claude Code（概念来源 / 架构参考）
 | 层级 | 项目 | 角色 |
 |------|------|------|
 | 概念层 | [Anthropic Claude Code](https://claude.ai/code) | Anthropic 公司的闭源产品，CLI AI 编程助手的原始概念和架构参考 |
-| 实现层 | [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) | MIT License 开源实现，本项目直接 fork 的基座仓库 |
+| 实现层 | [dong382258137/claw-code](https://github.com/dong382258137/claw-code) | MIT License 开源实现，本项目直接 fork 的基座仓库 |
 | 扩展层 | **Claw Plus**（本仓库） | 在上游基础上增加 IM 桥接等功能的二次开发 |
 
 > [!IMPORTANT]
-> **本仓库是 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) 的 fork（MIT License）。**
+> **本仓库是 [dong382258137/claw-code](https://github.com/dong382258137/claw-code) 的 fork（MIT License）。**
 > - 上游版权 © 2026 UltraWorkers and Claw Plus contributors
 > - 下游修改版权 © 2026 dong382258137（IM 桥接及下游改动）
 > - "Claude" 和 "Claude Code" 是 Anthropic 的商标，本项目与 Anthropic 无关联，亦非其官方产品
@@ -69,7 +69,7 @@ Anthropic Claude Code（概念来源 / 架构参考）
 - **插件与扩展生态** — 插件管理器、Skills 系统、MCP 服务器生命周期、Hooks
 - **其他功能增强与定制**
 
-> 完整特性清单见下方 [✨ 核心特性 / Key Features](#-核心特性--key-features) 章节。
+> 完整特性清单见下方 [✨ 核心特性 / Key Features](#核心特性-key-features) 章节。
 
 ---
 
@@ -228,7 +228,7 @@ First-class support for containerized and automated pipelines.
 
 Claw Plus is a Rust implementation of the `claw-plus` CLI agent harness.
 The canonical implementation lives in [`rust/`](./rust). This fork builds on
-the upstream [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)
+the upstream [dong382258137/claw-code](https://github.com/dong382258137/claw-code)
 project with additional features and modifications.
 
 > [!IMPORTANT]
@@ -416,7 +416,7 @@ cargo test --workspace
 ## Ecosystem
 
 This fork is part of a broader ecosystem of projects. The upstream base is
-[ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) (MIT License).
+[dong382258137/claw-code](https://github.com/dong382258137/claw-code) (MIT License).
 Related projects in the ecosystem (independently maintained by their respective authors):
 
 - [clawhip](https://github.com/Yeachan-Heo/clawhip) — event and notification routing (by [Yeachan-Heo](https://github.com/Yeachan-Heo))
@@ -426,9 +426,9 @@ Related projects in the ecosystem (independently maintained by their respective 
 
 ## Ownership / affiliation disclaimer
 
-- 本项目基于 MIT License 的 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) 进行二次开发，尊重并保留上游版权声明。
+- 本项目基于 MIT License 的 [dong382258137/claw-code](https://github.com/dong382258137/claw-code) 进行二次开发，尊重并保留上游版权声明。
 - This repository does **not** claim ownership of the original Claude Code source material.
 - This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
 - "Claude" and "Claude Code" are trademarks of Anthropic.
-- This is an independent fork of the MIT-licensed [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) project.
+- This is an independent fork of the MIT-licensed [dong382258137/claw-code](https://github.com/dong382258137/claw-code) project.
 - 参考项目（clawhip、oh-my-openagent 等）均为独立开源项目，各有自己的作者和许可证，本仓库引用它们不代表对其拥有所有权。

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust + rusqlite + serde + tokio(超时保护)+ 现有 TraceAnalyzer/DecisionLog/api_client 基础设施
 
-**设计文档:** [docs/2026-07-24-p3-self-evolving-harness-design.md](file:///d:/claw-code-src/docs/2026-07-24-p3-self-evolving-harness-design.md)
+**设计文档:** [docs/2026-07-24-p3-self-evolving-harness-design.md](../docs/2026-07-24-p3-self-evolving-harness-design.md)
 
 ---
 

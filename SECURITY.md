@@ -24,6 +24,6 @@ Include:
 
 ## Upstream
 
-This repository is a fork of [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) (MIT License).
+This repository is a fork of [dong382258137/claw-code](https://github.com/dong382258137/claw-code) (MIT License).
 Security issues that also affect the upstream project should be reported to
 both repositories.

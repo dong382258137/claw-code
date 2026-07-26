@@ -432,8 +432,7 @@ Good. Now G8.4 (subagent journal) — already confirmed in [38;5;10m`run_subage
 [38;5;245m│[0m //!   - [[38;5;10m`CoordinationMode::Teammate`[39m]:多个 agent 协作,通过共享 TaskRegistry 通信。
 [38;5;245m│[0m //!   - [[38;5;10m`CoordinationMode::Worktree`[39m]:每个 agent 独立 git worktree,避免文件冲突。
 [38;5;245m│[0m //! - [[38;5;10m`MultiAgentCoordinator`[39m]:统一入口,管理 agent 生命周期 + 任务分派。
-[38;5;245m│[0m //! - 与 [38;5;12m[4m[[38;5;10m`TaskRegistry`[39m](crate::task_registry::TaskRegistry)[0m 对接。
-[38;5;245m│[0m //! - 与 [38;5;12m[4m[[38;5;10m`VerifierAgent`[39m](crate::verifier::VerifierAgent)[0m 对接:子 agent 完成后校验。
+`crate::task_registry::TaskRegistry``crate::verifier::VerifierAgent`[0m 对接:子 agent 完成后校验。
 [38;5;245m│[0m //!
 [38;5;245m│[0m //! [38;5;11m[1m缓存保护[0m(详见 §5.2):
 [38;5;245m│[0m //! 每个子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存。

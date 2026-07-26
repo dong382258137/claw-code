@@ -236,7 +236,7 @@ Let me start by reading the plan files and then systematically verify each G10 i
 [38;5;245m│[0m
 [38;5;245m│[0m ### 🟡 P1：Thinking 事件覆盖缺口
 [38;5;245m│[0m
-[38;5;245m│[0m [38;5;11m[1m核实属实[0m：[38;5;12m[4m[streaming.rs:786-793](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/streaming.rs#L786-L793)[0m 的 [38;5;10m`push_output_block`[39m 处理 [38;5;10m`Thinking/RedactedThinking`[39m 块时：
+[38;5;245m│[0m [38;5;11m[1m核实属实[0m：[38;5;12m[4m[streaming.rs:786-793](../../rust/crates/rusty-claude-cli/src/streaming.rs#L786-L793)[0m 的 [38;5;10m`push_output_block`[39m 处理 [38;5;10m`Thinking/RedactedThinking`[39m 块时：
 [38;5;245m│[0m - 只调用 [38;5;10m`render_thinking_block_summary(out, ...)`[39m 写到 [38;5;10m`out`[39m
 [38;5;245m│[0m - TUI 模式下 [38;5;10m`out = io::sink()`[39m，输出被丢弃
 [38;5;245m│[0m - 未调用 [38;5;10m`self.emit_status(StatusEvent::Thinking {...})`[39m
@@ -244,7 +244,7 @@ Let me start by reading the plan files and then systematically verify each G10 i
 [38;5;245m│[0m [38;5;11m[1m影响场景[0m：
 [38;5;245m│[0m - [38;5;10m`MessageStart`[39m 事件携带的 thinking 块（非流式响应或首批 content）
 [38;5;245m│[0m - [38;5;10m`ContentBlockStart`[39m 携带的完整 thinking 块
-[38;5;245m│[0m - 流式 [38;5;10m`ThinkingDelta`[39m 路径已覆盖（[38;5;12m[4m[L461](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/streaming.rs#L461)[0m）
+[38;5;245m│[0m - 流式 [38;5;10m`ThinkingDelta`[39m 路径已覆盖（[38;5;12m[4m[L461](../../rust/crates/rusty-claude-cli/src/streaming.rs#L461)[0m）
 [38;5;245m│[0m
 [38;5;245m│[0m [38;5;11m[1m❌ 修正：修复方案[0m
 [38;5;245m│[0m

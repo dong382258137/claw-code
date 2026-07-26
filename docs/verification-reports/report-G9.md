@@ -769,7 +769,7 @@ Let me start by reading the key source files mentioned in the instructions.
 [38;5;245m│[0m
 [38;5;245m│[0m [1;32m✓[0m [38;5;245mgrep_search[0m 0 matches across 27 files
 [38;5;245m│[0m D:\claw-code-src\rust\crates\claw-acp\src\gateway.rs:180:                AcpAgentMessage::Initialize(args) => {
-[38;5;245m│[0m D:\claw-code-src\rust\crates\claw-acp\src\gateway.rs:476:    async fn initialize(&self, args: acp::InitializeRequest) -> AcpResult[38;5;12m[4m[acp::InitializeResponse](acp::InitializeResponse)[0m {
+[38;5;245m│[0m D:\claw-code-src\rust\crates\claw-acp\src\gateway.rs:476:    async fn initialize(&self, args: acp::InitializeRequest) -> AcpResult[38;5;12m[4m`acp::InitializeResponse`[0m {
 [38;5;245m│[0m D:\claw-code-src\rust\crates\claw-acp\src\message.rs:358:        acp::InitializeRequest,
 [38;5;245m│[0m D:\claw-code-src\rust\crates\claw-acp\src\message.rs:359:        acp::InitializeResponse,
 [38;5;245m│[0m D:\claw-code-src\rust\crates\claw-acp\src\message.rs:401:        Initialize(AcpArgsGeneric<acp::InitializeRequest, S>),

@@ -8,14 +8,14 @@
 - v0.2 焦点: SAGA 补偿端到端示例 + Replan 机制 + 资源背压 + CancellationToken 层级 + 与 MultiAgentCoordinator 完整适配层 + 性能基准
 - 适用范围: `rust/crates/runtime/src/dag/` 新模块及其与 `multi_agent` / `planner` / `conversation` / `lane_events` 的集成
 - 关联代码:
-  - `file:///d:/claw-code-src/rust/crates/runtime/src/multi_agent/mod.rs`
-  - `file:///d:/claw-code-src/rust/crates/runtime/src/planner/mod.rs`
-  - `file:///d:/claw-code-src/rust/crates/runtime/src/planner/artifact.rs`
-  - `file:///d:/claw-code-src/rust/crates/runtime/src/planner/reviewer.rs`
-  - `file:///d:/claw-code-src/rust/crates/runtime/src/task_registry.rs`
-  - `file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs`
-  - `file:///d:/claw-code-src/rust/crates/runtime/src/recovery_orchestrator.rs`
-  - `file:///d:/claw-code-src/rust/crates/runtime/src/conversation.rs`
+  - `../../rust/crates/runtime/src/multi_agent/mod.rs`
+  - `../../rust/crates/runtime/src/planner/mod.rs`
+  - `../../rust/crates/runtime/src/planner/artifact.rs`
+  - `../../rust/crates/runtime/src/planner/reviewer.rs`
+  - `../../rust/crates/runtime/src/task_registry.rs`
+  - `../../rust/crates/runtime/src/lane_events.rs`
+  - `../../rust/crates/runtime/src/recovery_orchestrator.rs`
+  - `../../rust/crates/runtime/src/conversation.rs`
 
 ---
 

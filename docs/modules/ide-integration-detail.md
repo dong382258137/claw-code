@@ -35,11 +35,11 @@
 
 1. [现状审计](#一现状审计)
 2. [ACP 1.5 升级路径](#二acp-15-升级路径)
-3. [ACP 1.5 升级 PoC 验证方案](#二5-acp-15-升级-poc-验证方案)
-4. [双版本兼容策略](#二6-双版本兼容策略)
+3. [ACP 1.5 升级 PoC 验证方案](#二5acp-15-升级-poc-验证方案)
+4. [双版本兼容策略](#二6双版本兼容策略)
 5. [协议方法补齐](#三协议方法补齐)
 6. [ClawAgent 扩展](#四clawagent-扩展)
-7. [LaneEvent → SessionNotification 桥接](#五laneevent--sessionnotification-桥接)
+7. [LaneEvent → SessionNotification 桥接](#五laneevent-sessionnotification-桥接)
 8. [VS Code 扩展骨架](#六vs-code-扩展骨架)
 9. [Zed 集成验证](#七zed-集成验证)
 10. [实施步骤分解](#八实施步骤分解)
@@ -59,16 +59,16 @@ Claw Plus 在 Phase A(`commit 8af738a`)已完成 ACP 0.10.4 接入层,核心代�
 
 | 模块 | 路径 | 职责 |
 |------|------|------|
-| `claw-acp` crate | [rust/crates/claw-acp/](file:///d:/claw-code-src/rust/crates/claw-acp/) | 协议层:mpsc channel + gateway 转发 + stdio 传输 |
-| `claw-shell::agent` | [agent.rs](file:///d:/claw-code-src/rust/crates/claw-shell/src/agent.rs) | `ClawAgent<C>` 实现 `acp::Agent` trait |
-| `claw-shell::spawn` | [spawn.rs](file:///d:/claw-code-src/rust/crates/claw-shell/src/spawn.rs) | 独立线程 + `LocalSet` 启动模式 |
-| `claw-shell::stdio` | [stdio.rs](file:///d:/claw-code-src/rust/crates/claw-shell/src/stdio.rs) | `run_stdio_agent` / `run_agent_on_io`(可测试核心) |
-| `claw-plus-headless` binary | [headless.rs](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs) | 极简 stdio ACP 服务器入口,供 Zed 等 spawn |
-| `runtime::lane_events` | [lane_events.rs](file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs) | 23 种 `LaneEventName` + 全局 sink(`Mutex<Vec<LaneEvent>>`) |
+| `claw-acp` crate | [rust/crates/claw-acp/](../../rust/crates/claw-acp/) | 协议层:mpsc channel + gateway 转发 + stdio 传输 |
+| `claw-shell::agent` | [agent.rs](../../rust/crates/claw-shell/src/agent.rs) | `ClawAgent<C>` 实现 `acp::Agent` trait |
+| `claw-shell::spawn` | [spawn.rs](../../rust/crates/claw-shell/src/spawn.rs) | 独立线程 + `LocalSet` 启动模式 |
+| `claw-shell::stdio` | [stdio.rs](../../rust/crates/claw-shell/src/stdio.rs) | `run_stdio_agent` / `run_agent_on_io`(可测试核心) |
+| `claw-plus-headless` binary | [headless.rs](../../rust/crates/rusty-claude-cli/src/bin/headless.rs) | 极简 stdio ACP 服务器入口,供 Zed 等 spawn |
+| `runtime::lane_events` | [lane_events.rs](../../rust/crates/runtime/src/lane_events.rs) | 23 种 `LaneEventName` + 全局 sink(`Mutex<Vec<LaneEvent>>`) |
 
 ### 1.2 已实现的 ACP 方法清单(0.10.4)
 
-`ClawAgent<C>` 当前实现 [`acp::Agent`](file:///d:/claw-code-src/rust/crates/claw-shell/src/agent.rs) trait 的方法状态:
+`ClawAgent<C>` 当前实现 [`acp::Agent`](../../rust/crates/claw-shell/src/agent.rs) trait 的方法状态:
 
 | 方法 | 实现状态 | 关键行为 |
 |------|---------|---------|
@@ -112,7 +112,7 @@ Claw Plus 在 Phase A(`commit 8af738a`)已完成 ACP 0.10.4 接入层,核心代�
 
 ### 1.5 LaneEvent 消费者现状
 
-[lane_events.rs](file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs) 中的全局 sink 当前状态:
+[lane_events.rs](../../rust/crates/runtime/src/lane_events.rs) 中的全局 sink 当前状态:
 
 ```rust
 // rust/crates/runtime/src/lane_events.rs(行 1027-1104)
@@ -155,7 +155,7 @@ Claw Plus 在 Phase A(`commit 8af738a`)已完成 ACP 0.10.4 接入层,核心代�
 3. **`SessionConfig` 强类型化**:从 `serde_json::Value` 改为 typed struct,`NewSessionRequest.session_configuration` 字段需要新结构
 4. **`PermissionOption` 枚举化**:`request_permission` 的 `options` 字段从 `Vec<serde_json::Value>` 改为 `Vec<PermissionOption>`,需更新反向请求逻辑
 5. **`Diff` 类型新增 `location`**:文件 diff 需要带位置信息,影响 `fs/write_text_file` 响应构造
-6. **`Terminal` API 新增**:`acp::Client` trait 新增 5 个 terminal 方法(create/release/wait/output/kill),`AcpGatewaySender<acp::AgentSide>` 需实现转发(已存在,见 [gateway.rs:412-441](file:///d:/claw-code-src/rust/crates/claw-acp/src/gateway.rs))
+6. **`Terminal` API 新增**:`acp::Client` trait 新增 5 个 terminal 方法(create/release/wait/output/kill),`AcpGatewaySender<acp::AgentSide>` 需实现转发(已存在,见 [gateway.rs:412-441](../../rust/crates/claw-acp/src/gateway.rs))
 
 ### 2.3 兼容策略
 
@@ -1309,7 +1309,7 @@ where
 
 #### 与现有 Read tool 的关系(v0.2 新增)
 
-Claw Plus 现有 `Read` tool(在 [rust/crates/runtime/src/tools/](file:///d:/claw-code-src/rust/crates/runtime/src/tools/) 下)是 **agent 主动调用**的工具,直接通过 `tokio::fs::read_to_string` 读磁盘。
+Claw Plus 现有 `Read` tool(在 [rust/crates/tools/src/](../../rust/crates/tools/src/) 下)是 **agent 主动调用**的工具,直接通过 `tokio::fs::read_to_string` 读磁盘。
 
 **两条读路径的对比**:
 
@@ -1800,7 +1800,7 @@ pub async fn request_permission(
 
 ### 4.1 现有结构分析
 
-当前 `ClawAgent<C>` 定义见 [agent.rs:40-56](file:///d:/claw-code-src/rust/crates/claw-shell/src/agent.rs):
+当前 `ClawAgent<C>` 定义见 [agent.rs:40-56](../../rust/crates/claw-shell/src/agent.rs):
 
 ```rust
 pub struct ClawAgent<C>
@@ -1986,7 +1986,7 @@ where
 
 ### 5.1 LaneEvent 完整清单
 
-[runtime/src/lane_events.rs:5-57](file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs) 定义了 23 种 `LaneEventName`(注:任务描述称 19 种,实际源码为 23 种):
+[runtime/src/lane_events.rs:5-57](../../rust/crates/runtime/src/lane_events.rs) 定义了 23 种 `LaneEventName`(注:任务描述称 19 种,实际源码为 23 种):
 
 | # | LaneEventName | wire value | 类别 |
 |---|---------------|-----------|------|
@@ -2468,7 +2468,7 @@ for tool_call in pending_tool_calls {
 
 **位置**:子 agent(handoff → result)完成后,父 agent 接收结果时。
 
-**当前现状**:[lane_events.rs:1027-1104](file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs) 中 `SubagentHandoff` / `SubagentResult` 已经发布到全局 sink,但无消费者。本调用点正是消费这些事件。
+**当前现状**:[lane_events.rs:1027-1104](../../rust/crates/runtime/src/lane_events.rs) 中 `SubagentHandoff` / `SubagentResult` 已经发布到全局 sink,但无消费者。本调用点正是消费这些事件。
 
 **实施**:在 `ConversationRuntime::handle_subagent_result` 内调用 `flush_lane_events_to_acp`。
 
@@ -4093,7 +4093,7 @@ async fn acp_zed_integration_e2e() {
 - 不能在 `tokio::spawn` 中调用(Send 要求)
 - 必须在 `tokio::task::spawn_local` 或 `LocalSet::block_on` 中调用
 
-**现状**:已通过 `spawn_claw_shell`([spawn.rs:69-93](file:///d:/claw-code-src/rust/crates/claw-shell/src/spawn.rs))和 `run_stdio_agent`([stdio.rs:106-129](file:///d:/claw-code-src/rust/crates/claw-shell/src/stdio.rs))正确隔离。
+**现状**:已通过 `spawn_claw_shell`([spawn.rs:69-93](../../rust/crates/claw-shell/src/spawn.rs))和 `run_stdio_agent`([stdio.rs:106-129](../../rust/crates/claw-shell/src/stdio.rs))正确隔离。
 
 **缓解**:
 
@@ -4116,7 +4116,7 @@ where
 
 **问题**:`StaticToolExecutor` 内部 `Box<dyn FnMut>` 非 Send,无法跨线程移动。
 
-**现状**:`ClawAgentBuilder<C>` 要求 `C: ApiClient + Send + 'static`(api_client 必须可跨线程移动),`StaticToolExecutor` 在 `build()` 内创建([agent.rs:98-110](file:///d:/claw-code-src/rust/crates/claw-shell/src/agent.rs)),确保不跨线程。
+**现状**:`ClawAgentBuilder<C>` 要求 `C: ApiClient + Send + 'static`(api_client 必须可跨线程移动),`StaticToolExecutor` 在 `build()` 内创建([agent.rs:98-110](../../rust/crates/claw-shell/src/agent.rs)),确保不跨线程。
 
 **风险点**:
 
@@ -4131,7 +4131,7 @@ where
 
 ### 10.4 LaneEvent sink 容量保护
 
-**问题**:[lane_events.rs:1047](file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs) 全局 sink 容量 512,超容量丢弃最旧一半。
+**问题**:[lane_events.rs:1047](../../rust/crates/runtime/src/lane_events.rs) 全局 sink 容量 512,超容量丢弃最旧一半。
 
 **风险**:ACP 桥接启用后,若 IDE 端响应慢,`flush_lane_events_to_acp` 调用间隔变长,sink 可能溢出。
 
@@ -4435,14 +4435,14 @@ copy target\release\claw-plus-headless.exe C:\Users\38225\.cargo\bin\
 
 ### 11.3 Claw Plus 内部参考
 
-- [主文档:IDE 集成方案](file:///d:/claw-code-src/docs/ide-hooks-dag-implementation-plan.md) — 父文档
-- [agent.rs:ClawAgent 实现](file:///d:/claw-code-src/rust/crates/claw-shell/src/agent.rs) — 当前 ACP Agent trait 实现
-- [spawn.rs:spawn_claw_shell](file:///d:/claw-code-src/rust/crates/claw-shell/src/spawn.rs) — 独立线程 + LocalSet 启动模式
-- [stdio.rs:run_agent_on_io](file:///d:/claw-code-src/rust/crates/claw-shell/src/stdio.rs) — stdio ACP 服务器核心
-- [gateway.rs:AcpGatewaySender](file:///d:/claw-code-src/rust/crates/claw-acp/src/gateway.rs) — Gateway 转发层
-- [lane_events.rs:LaneEvent](file:///d:/claw-code-src/rust/crates/runtime/src/lane_events.rs) — 23 种内部事件定义
-- [headless.rs:claw-plus-headless](file:///d:/claw-code-src/rust/crates/rusty-claude-cli/src/bin/headless.rs) — stdio 服务器入口 binary
-- [claw-acp Cargo.toml](file:///d:/claw-code-src/rust/crates/claw-acp/Cargo.toml) — 0.10.4 版本锁定位置
+- [主文档:IDE 集成方案](../../docs/ide-hooks-dag-implementation-plan.md) — 父文档
+- [agent.rs:ClawAgent 实现](../../rust/crates/claw-shell/src/agent.rs) — 当前 ACP Agent trait 实现
+- [spawn.rs:spawn_claw_shell](../../rust/crates/claw-shell/src/spawn.rs) — 独立线程 + LocalSet 启动模式
+- [stdio.rs:run_agent_on_io](../../rust/crates/claw-shell/src/stdio.rs) — stdio ACP 服务器核心
+- [gateway.rs:AcpGatewaySender](../../rust/crates/claw-acp/src/gateway.rs) — Gateway 转发层
+- [lane_events.rs:LaneEvent](../../rust/crates/runtime/src/lane_events.rs) — 23 种内部事件定义
+- [headless.rs:claw-plus-headless](../../rust/crates/rusty-claude-cli/src/bin/headless.rs) — stdio 服务器入口 binary
+- [claw-acp Cargo.toml](../../rust/crates/claw-acp/Cargo.toml) — 0.10.4 版本锁定位置
 
 ### 11.4 相关 RFC 与设计文档
 

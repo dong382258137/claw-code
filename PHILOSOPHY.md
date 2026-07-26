@@ -1,7 +1,7 @@
 # Claw Plus Philosophy
 
 > [!NOTE]
-> **本文档继承自上游项目 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（MIT License），经本仓库适配修改。**
+> **本文档继承自上游项目 [dong382258137/claw-code](https://github.com/dong382258137/claw-code)（MIT License），经本仓库适配修改。**
 >
 > 文档中提及的 [clawhip](https://github.com/Yeachan-Heo/clawhip)、[oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)、[oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) 为各自作者独立维护的开源项目，本仓库引用它们仅为说明多智能体协作生态的完整图景，并非声称对其拥有所有权。
 

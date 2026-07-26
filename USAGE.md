@@ -1,6 +1,6 @@
 # Claw Plus Usage
 
-> 本项目是 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（MIT License）的 fork，本使用指南经适配修改。
+> 本项目是 [dong382258137/claw-code](https://github.com/dong382258137/claw-code)（MIT License）的 fork，本使用指南经适配修改。
 
 This guide covers the current Rust workspace under `rust/` and the `claw-plus` CLI binary. If you are brand new, make the doctor health check your first run: start `claw-plus`, then run `/doctor`.
 

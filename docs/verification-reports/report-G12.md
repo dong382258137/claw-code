@@ -265,7 +265,7 @@ G12.1 PASS and G12.10 confirmed. Now let me run the binary checks.
 [38;5;245m│[0m       Diagnose local auth, config, workspace, and sandbox health
 [38;5;245m│[0m   claw acp [serve]
 [38;5;245m│[0m       [38;5;10m`claw acp serve`[39m starts a stdio ACP JSON-RPC server for editor integration; aliases: –acp, -acp
-[38;5;245m│[0m       Source of truth: ultraworkers/claw-code
+[38;5;245m│[0m       Source of truth: dong382258137/claw-code
 [38;5;245m│[0m       Warning: do not [38;5;10m`cargo install claw-code`[39m (deprecated stub)
 [38;5;245m│[0m   claw dump-manifests [–manifests-dir PATH]
 [38;5;245m│[0m   claw bootstrap-plan
@@ -428,9 +428,9 @@ G12.2 binary is 21.3 MB (slightly above the ~16-20 MB target). G12.3 help output
 [38;5;245m│[0m
 [38;5;245m│[0m Install source
 [38;5;245m│[0m   状态             正常
-[38;5;245m│[0m   摘要             官方来源是 ultraworkers/claw-code;避免使用 [38;5;10m`cargo install claw-code`[39m
+[38;5;245m│[0m   摘要             官方来源是 dong382258137/claw-code;避免使用 [38;5;10m`cargo install claw-code`[39m
 [38;5;245m│[0m   详情
-[38;5;245m│[0m     - 官方仓库          https://github.com/ultraworkers/claw-code
+[38;5;245m│[0m     - 官方仓库          https://github.com/dong382258137/claw-code
 [38;5;245m│[0m     - 推荐路径          从本仓库构建或使用 README.md 中记录的上游二进制
 [38;5;245m│[0m     - 已弃用的 crate    [38;5;10m`cargo install claw-code`[39m 安装的是已弃用的占位包,不提供 [38;5;10m`claw-plus`[39m 二进制
 [38;5;245m│[0m
@@ -563,7 +563,7 @@ All 4 subcommands exit 0. Now let me finalize the summary.
 • exit 0[38;5;12mG12.6 [39m[38;5;10m`check_release_readiness.py`[39m
 
 • [38;5;11m[1mFAIL[0m
-• 证据: [38;5;10m`release-readiness check failed`[39m，包含 ~120 个错误，涉及：• 3 个 [38;5;10m`.md`[39m 文件中存在 [38;5;11m[1m~[0m[38;5;11m[1m60 个缺失的锚点[0m，全部为中文标题（[38;5;10m`ide-hooks-dag-implementation-plan.md`[39m, [38;5;10m`hooks-system-detail.md`[39m, [38;5;10m`ide-integration-detail.md`[39m）• 3 个 [38;5;10m`.md`[39m 文件中存在 [38;5;11m[1m~[0m[38;5;11m[1m60 个链接逃逸仓库根路径[0m，使用了 [38;5;10m`file:///d:/claw-code-src/...`[39m 而非相对路径（[38;5;10m`multi-agent-hardening-plan.md`[39m, [38;5;10m`ide-integration-detail.md`[39m, [38;5;10m`report-G10.md`[39m）• [38;5;11m[1m根本原因[0m: 脚本 [38;5;10m`check_release_readiness.py`[39m 无法处理中文锚点（编码不匹配），[38;5;10m`docs/modules/`[39m 下的文档文件使用了绝对 [38;5;10m`file://`[39m 链接及供应商特定的 [38;5;10m`crate::`[39m 引用
+• 证据: [38;5;10m`release-readiness check failed`[39m，包含 ~120 个错误，涉及：• 3 个 [38;5;10m`.md`[39m 文件中存在 [38;5;11m[1m~[0m[38;5;11m[1m60 个缺失的锚点[0m，全部为中文标题（[38;5;10m`ide-hooks-dag-implementation-plan.md`[39m, [38;5;10m`hooks-system-detail.md`[39m, [38;5;10m`ide-integration-detail.md`[39m）• 3 个 [38;5;10m`.md`[39m 文件中存在 [38;5;11m[1m~[0m[38;5;11m[1m60 个链接逃逸仓库根路径[0m，使用了 [38;5;10m`../../...`[39m 而非相对路径（[38;5;10m`multi-agent-hardening-plan.md`[39m, [38;5;10m`ide-integration-detail.md`[39m, [38;5;10m`report-G10.md`[39m）• [38;5;11m[1m根本原因[0m: 脚本 [38;5;10m`check_release_readiness.py`[39m 无法处理中文锚点（编码不匹配），[38;5;10m`docs/modules/`[39m 下的文档文件使用了绝对 [38;5;10m`file://`[39m 链接及供应商特定的 [38;5;10m`crate::`[39m 引用
 • 推荐: 锚点失败为误报（中文编码问题）；链接逃逸及 [38;5;10m`crate::`[39m 引用是合法的文档质量问题，应修复。[38;5;12mG12.7 [39m[38;5;10m`workspace.package.license = "MIT"`[39m
 
 • [38;5;11m[1mPASS[0m
@@ -598,7 +598,7 @@ All 4 subcommands exit 0. Now let me finalize the summary.
 [38;5;6m│[39m G12.10 [38;5;6m│[39m CI workflows                        [38;5;6m│[39m ✅ PASS [38;5;6m│[39m [38;5;10m`rust-ci.yml`[39m + [38;5;10m`release.yml`[39m both present, rust-ci has test/fmt/clippy [38;5;6m│[39m---[38;5;15m[1m🟡 Triage[0m[38;5;12mG12.6 FAIL: [39m[38;5;10m`check_release_readiness.py`[39m[38;5;11m[1mWhy it failed:[0m
 
 1. [38;5;11m[1mChinese anchors (误报)[0m: [38;5;10m`ide-hooks-dag-implementation-plan.md`[39m, [38;5;10m`hooks-system-detail.md`[39m, [38;5;10m`ide-integration-detail.md`[39m use Chinese [38;5;10m`<a name="...">`[39m or heading anchors — the script’s MD parsing cannot match the UTF-8 encoded anchor names, producing ~60 “missing anchor” errors.
-2. [38;5;11m[1mAbsolute file:// links[0m: [38;5;10m`multi-agent-hardening-plan.md`[39m and [38;5;10m`ide-integration-detail.md`[39m use [38;5;10m`file:///d:/claw-code-src/rust/...`[39m absolute paths instead of relative links.
+2. [38;5;11m[1mAbsolute file:// links[0m: [38;5;10m`multi-agent-hardening-plan.md`[39m and [38;5;10m`ide-integration-detail.md`[39m use [38;5;10m`../../rust/...`[39m absolute paths instead of relative links.
 3. [38;5;11m[1mCrate-style links[0m: [38;5;10m`final-report.md`[39m, [38;5;10m`report-G5.md`[39m, [38;5;10m`report-G8.md`[39m, [38;5;10m`report-G9.md`[39m use [38;5;10m`crate::task_registry::TaskRegistry`[39m and [38;5;10m`acp::InitializeResponse`[39m (Rust-doc style) which don’t resolve in raw Markdown.[38;5;11m[1mRoot cause[0m: The release-readiness script enforces repo-relative links and ASCII-anchor matching. Chinese-language planning docs and verification reports use conventions that the tool doesn’t support.[38;5;11m[1mRecommendation[0m: DEFER — this is documentation portability debt, not a build/release blocker. Fix the [38;5;10m`file://`[39m links to relative paths in a docs cleanup pass. Accept Chinese anchor failures as false positives.---[38;5;15m[1mFinal Summary[0m[38;5;8m[1m╭─ code[0m
 [48;5;236m[38;2;192;197;206mPASS:   9[0m
 [48;5;236m[38;2;192;197;206mFAIL:   1[0m
@@ -644,7 +644,7 @@ All 4 subcommands exit 0. Now let me finalize the summary.
 - **FAIL**
 - 证据: `release-readiness check failed`，包含 ~120 个错误，涉及：
   - 3 个 `.md` 文件中存在 **~60 个缺失的锚点**，全部为中文标题（`ide-hooks-dag-implementation-plan.md`, `hooks-system-detail.md`, `ide-integration-detail.md`）
-  - 3 个 `.md` 文件中存在 **~60 个链接逃逸仓库根路径**，使用了 `file:///d:/claw-code-src/...` 而非相对路径（`multi-agent-hardening-plan.md`, `ide-integration-detail.md`, `report-G10.md`）
+  - 3 个 `.md` 文件中存在 **~60 个链接逃逸仓库根路径**，使用了 `../../...` 而非相对路径（`multi-agent-hardening-plan.md`, `ide-integration-detail.md`, `report-G10.md`）
   - **根本原因**: 脚本 `check_release_readiness.py` 无法处理中文锚点（编码不匹配），`docs/modules/` 下的文档文件使用了绝对 `file://` 链接及供应商特定的 `crate::` 引用
 - 推荐: 锚点失败为误报（中文编码问题）；链接逃逸及 `crate::` 引用是合法的文档质量问题，应修复。
 
@@ -707,7 +707,7 @@ All 4 subcommands exit 0. Now let me finalize the summary.
 
 **Why it failed:**
 1. **Chinese anchors (误报)**: `ide-hooks-dag-implementation-plan.md`, `hooks-system-detail.md`, `ide-integration-detail.md` use Chinese `<a name="...">` or heading anchors — the script's MD parsing cannot match the UTF-8 encoded anchor names, producing ~60 "missing anchor" errors.
-2. **Absolute file:// links**: `multi-agent-hardening-plan.md` and `ide-integration-detail.md` use `file:///d:/claw-code-src/rust/...` absolute paths instead of relative links.
+2. **Absolute file:// links**: `multi-agent-hardening-plan.md` and `ide-integration-detail.md` use `../../rust/...` absolute paths instead of relative links.
 3. **Crate-style links**: `final-report.md`, `report-G5.md`, `report-G8.md`, `report-G9.md` use `crate::task_registry::TaskRegistry` and `acp::InitializeResponse` (Rust-doc style) which don't resolve in raw Markdown.
 
 **Root cause**: The release-readiness script enforces repo-relative links and ASCII-anchor matching. Chinese-language planning docs and verification reports use conventions that the tool doesn't support.

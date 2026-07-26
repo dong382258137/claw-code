@@ -63,7 +63,7 @@ def github_anchor(heading: str) -> str:
     anchor = heading.strip().lower()
     anchor = re.sub(r"<[^>]+>", "", anchor)
     anchor = re.sub(r"`([^`]*)`", r"\1", anchor)
-    anchor = re.sub(r"[^a-z0-9 _-]", "", anchor)
+    anchor = re.sub(r"[^\w _-]", "", anchor)
     anchor = anchor.replace(" ", "-")
     anchor = re.sub(r"-+", "-", anchor)
     return anchor.strip("-")

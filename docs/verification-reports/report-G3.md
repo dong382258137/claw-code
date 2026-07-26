@@ -90,7 +90,7 @@ Let me first read the key documentation and understand the CLI structure.
 [38;5;245m│[0m [1;32m✓[0m [2m📄 Read \?\D:\claw-code-src\rust\USAGE.md (lines 1-11 of 11)[0m
 [38;5;245m│[0m # Rust usage guide
 [38;5;245m│[0m
-[38;5;245m│[0m The canonical task-oriented usage guide lives at [38;5;12m[4m[[38;5;10m`../USAGE.md`[39m](../USAGE.md)[0m.
+[38;5;245m│[0m The canonical task-oriented usage guide lives at [38;5;12m[4m[[38;5;10m`../USAGE.md`[39m](../../USAGE.md)[0m.
 [38;5;245m│[0m
 [38;5;245m│[0m Use that guide for:
 [38;5;245m│[0m
@@ -106,7 +106,7 @@ Let me first read the key documentation and understand the CLI structure.
 [38;5;245m│[0m
 [38;5;245m│[0m A high-performance Rust rewrite of the Claw Plus CLI agent harness. Built for speed, safety, and native tool execution.
 [38;5;245m│[0m
-[38;5;245m│[0m For a task-oriented guide with copy/paste examples, see [38;5;12m[4m[[38;5;10m`../USAGE.md`[39m](../USAGE.md)[0m.
+[38;5;245m│[0m For a task-oriented guide with copy/paste examples, see [38;5;12m[4m[[38;5;10m`../USAGE.md`[39m](../../USAGE.md)[0m.
 [38;5;245m│[0m
 [38;5;245m│[0m ## Quick Start
 [38;5;245m│[0m
@@ -230,7 +230,7 @@ Let me first read the key documentation and understand the CLI structure.
 [38;5;245m│[0m - [38;5;10m`/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]`[39m
 [38;5;245m│[0m - [38;5;10m`/subagent [list|steer <target> <msg>|kill <id>]`[39m
 [38;5;245m│[0m
-[38;5;245m│[0m See [38;5;12m[4m[[38;5;10m`../USAGE.md`[39m](../USAGE.md)[0m for usage examples and run [38;5;10m`cargo run -p rusty-claude-cli -- --help`[39m for the live canonical command list.
+[38;5;245m│[0m See [38;5;12m[4m[[38;5;10m`../USAGE.md`[39m](../../USAGE.md)[0m for usage examples and run [38;5;10m`cargo run -p rusty-claude-cli -- --help`[39m for the live canonical command list.
 [38;5;245m│[0m
 [38;5;245m│[0m ## Workspace Layout
 [38;5;245m│[0m
@@ -272,7 +272,7 @@ Build failed because claw.exe is locked (in use). Let me check for an existing b
 [38;5;245m│[0m       Diagnose local auth, config, workspace, and sandbox health
 [38;5;245m│[0m   claw acp [serve]
 [38;5;245m│[0m       [38;5;10m`claw acp serve`[39m starts a stdio ACP JSON-RPC server for editor integration; aliases: –acp, -acp
-[38;5;245m│[0m       Source of truth: ultraworkers/claw-code
+[38;5;245m│[0m       Source of truth: dong382258137/claw-code
 [38;5;245m│[0m       Warning: do not [38;5;10m`cargo install claw-code`[39m (deprecated stub)
 [38;5;245m│[0m   claw dump-manifests [–manifests-dir PATH]
 [38;5;245m│[0m   claw bootstrap-plan
@@ -337,7 +337,7 @@ Build failed because claw.exe is locked (in use). Let me check for an existing b
 [38;5;245m│[0m       Diagnose local auth, config, workspace, and sandbox health
 [38;5;245m│[0m   claw acp [serve]
 [38;5;245m│[0m       [38;5;10m`claw acp serve`[39m starts a stdio ACP JSON-RPC server for editor integration; aliases: –acp, -acp
-[38;5;245m│[0m       Source of truth: ultraworkers/claw-code
+[38;5;245m│[0m       Source of truth: dong382258137/claw-code
 [38;5;245m│[0m       Warning: do not [38;5;10m`cargo install claw-code`[39m (deprecated stub)
 [38;5;245m│[0m   claw dump-manifests [–manifests-dir PATH]
 [38;5;245m│[0m   claw bootstrap-plan
@@ -414,7 +414,7 @@ Good, the binary exists. Let me get the full [38;5;10m`--help`[39m output and 
 [38;5;245m│[0m       Diagnose local auth, config, workspace, and sandbox health
 [38;5;245m│[0m   claw acp [serve]
 [38;5;245m│[0m       [38;5;10m`claw acp serve`[39m starts a stdio ACP JSON-RPC server for editor integration; aliases: –acp, -acp
-[38;5;245m│[0m       Source of truth: ultraworkers/claw-code
+[38;5;245m│[0m       Source of truth: dong382258137/claw-code
 [38;5;245m│[0m       Warning: do not [38;5;10m`cargo install claw-code`[39m (deprecated stub)
 [38;5;245m│[0m   claw dump-manifests [–manifests-dir PATH]
 [38;5;245m│[0m   claw bootstrap-plan
@@ -1375,7 +1375,7 @@ The issue was git-bash mangling [38;5;10m`/`[39m prefixes. Using PowerShell wo
 [38;5;245m│[0m   “sandboxStatus”: null,
 [38;5;245m│[0m   “shellType”: “powershell”,
 [38;5;245m│[0m   “stderr”: “”,
-[38;5;245m│[0m   “stdout”: “{\n  "checks": [\n    {\n      "api_key_present": true,\n      "auth_token_present": false,\n      "details": [\n        "环境变量          api_key=已配置 auth_token=缺失"\n      ],\n      "legacy_refresh_token_present": false,\n      "legacy_saved_oauth_expires_at": null,\n      "legacy_saved_oauth_present": false,\n      "legacy_scopes": [],\n      "name": "auth",\n      "status": "ok",\n      "summary": "支持的认证环境变量已配置"\n    },\n    {\n      "details": [\n        "配置文件          已加载 1/1",\n        "MCP 服务器        0",\n        "发现的文件        D:\\claw-code-src\\.claw.json"\n      ],\n      "discovered_files": [\n        "D:\\claw-code-src\\.claw.json"\n      ],\n      "discovered_files_count": 1,\n      "loaded_config_files": 1,\n      "mcp_servers": 0,\n      "name": "config",\n      "resolved_model": null,\n      "status": "ok",\n      "summary": "运行时配置加载成功"\n    },\n    {\n      "deprecated_install": "cargo install claw-code",\n      "details": [\n        "官方仓库          https://github.com/ultraworkers/claw-code",\n        "推荐路径          从本仓库构建或使用 README.md 中记录的上游二进制",\n        "已弃用的 crate    [38;5;10m`cargo install claw-code`[39m 安装的是已弃用的占位包,不提供 [38;5;10m`claw-plus`[39m 二进制"\n      ],\n      "name": "install source",\n      "official_repo": "https://github.com/ultraworkers/claw-code",\n      "recommended_install": "build from source or follow the upstream binary instructions in README.md",\n      "status": "ok",\n      "summary": "官方来源是 ultraworkers/claw-code;避免使用 [38;5;10m`cargo install claw-code`[39m"\n    },\n    {\n      "changed_files": 17,\n      "cwd": "D:\\claw-code-src",\n      "details": [\n        "当前目录          D:\\claw-code-src",\n        "项目根目录        D:/claw-code-src",\n        "Git 分支          main",\n        "Git 状态          脏 · 17 个文件 · 3 未暂存, 14 未跟踪",\n        "已更改文件        17",\n        "Memory 文件       1 · 配置文件已加载 1/5",\n        "Stale base        正常"\n      ],\n      "discovered_config_files": 5,\n      "git_branch": "main",\n      "git_state": "脏 · 17 个文件 · 3 未暂存, 14 未跟踪",\n      "in_git_repo": true,\n      "loaded_config_files": 1,\n      "memory_file_count": 1,\n      "name": "workspace",\n      "project_root": "D:/claw-code-src",\n      "stale_base": {\n        "fresh": null,\n        "status": "no_expected_base"\n      },\n      "status": "ok",\n      "summary": "在分支 main 上检测到项目根目录"\n    },\n    {\n      "boot_preflight": {\n        "branch_freshness": {\n          "ahead": 144,\n          "behind": 1684,\n          "fresh": false,\n          "upstream": "upstream/main"\n        },\n        "control_sockets": [\n          {\n            "configured": false,\n            "exists": false,\n            "name": "tmux",\n            "path": null\n          }\n        ],\n        "last_failed_boot_reason": null,\n        "mcp_startup": {\n          "eligible": true,\n          "servers_configured": 0\n        },\n        "plugin_startup": {\n          "eligible": true,\n          "plugins_configured": 0\n        },\n        "repo": {\n          "exists": true,\n          "git_dir_exists": true,\n          "worktree_exists": true\n        },\n        "required_binaries": [\n          {\n            "available": true,\n            "name": "claw"\n          },\n          {\n            "available": true,\n            "name": "git"\n          },\n          {\n            "available": false,\n            "name": "tmux"\n
+[38;5;245m│[0m   “stdout”: “{\n  "checks": [\n    {\n      "api_key_present": true,\n      "auth_token_present": false,\n      "details": [\n        "环境变量          api_key=已配置 auth_token=缺失"\n      ],\n      "legacy_refresh_token_present": false,\n      "legacy_saved_oauth_expires_at": null,\n      "legacy_saved_oauth_present": false,\n      "legacy_scopes": [],\n      "name": "auth",\n      "status": "ok",\n      "summary": "支持的认证环境变量已配置"\n    },\n    {\n      "details": [\n        "配置文件          已加载 1/1",\n        "MCP 服务器        0",\n        "发现的文件        D:\\claw-code-src\\.claw.json"\n      ],\n      "discovered_files": [\n        "D:\\claw-code-src\\.claw.json"\n      ],\n      "discovered_files_count": 1,\n      "loaded_config_files": 1,\n      "mcp_servers": 0,\n      "name": "config",\n      "resolved_model": null,\n      "status": "ok",\n      "summary": "运行时配置加载成功"\n    },\n    {\n      "deprecated_install": "cargo install claw-code",\n      "details": [\n        "官方仓库          https://github.com/dong382258137/claw-code",\n        "推荐路径          从本仓库构建或使用 README.md 中记录的上游二进制",\n        "已弃用的 crate    [38;5;10m`cargo install claw-code`[39m 安装的是已弃用的占位包,不提供 [38;5;10m`claw-plus`[39m 二进制"\n      ],\n      "name": "install source",\n      "official_repo": "https://github.com/dong382258137/claw-code",\n      "recommended_install": "build from source or follow the upstream binary instructions in README.md",\n      "status": "ok",\n      "summary": "官方来源是 dong382258137/claw-code;避免使用 [38;5;10m`cargo install claw-code`[39m"\n    },\n    {\n      "changed_files": 17,\n      "cwd": "D:\\claw-code-src",\n      "details": [\n        "当前目录          D:\\claw-code-src",\n        "项目根目录        D:/claw-code-src",\n        "Git 分支          main",\n        "Git 状态          脏 · 17 个文件 · 3 未暂存, 14 未跟踪",\n        "已更改文件        17",\n        "Memory 文件       1 · 配置文件已加载 1/5",\n        "Stale base        正常"\n      ],\n      "discovered_config_files": 5,\n      "git_branch": "main",\n      "git_state": "脏 · 17 个文件 · 3 未暂存, 14 未跟踪",\n      "in_git_repo": true,\n      "loaded_config_files": 1,\n      "memory_file_count": 1,\n      "name": "workspace",\n      "project_root": "D:/claw-code-src",\n      "stale_base": {\n        "fresh": null,\n        "status": "no_expected_base"\n      },\n      "status": "ok",\n      "summary": "在分支 main 上检测到项目根目录"\n    },\n    {\n      "boot_preflight": {\n        "branch_freshness": {\n          "ahead": 144,\n          "behind": 1684,\n          "fresh": false,\n          "upstream": "upstream/main"\n        },\n        "control_sockets": [\n          {\n            "configured": false,\n            "exists": false,\n            "name": "tmux",\n            "path": null\n          }\n        ],\n        "last_failed_boot_reason": null,\n        "mcp_startup": {\n          "eligible": true,\n          "servers_configured": 0\n        },\n        "plugin_startup": {\n          "eligible": true,\n          "plugins_configured": 0\n        },\n        "repo": {\n          "exists": true,\n          "git_dir_exists": true,\n          "worktree_exists": true\n        },\n        "required_binaries": [\n          {\n            "available": true,\n            "name": "claw"\n          },\n          {\n            "available": true,\n            "name": "git"\n          },\n          {\n            "available": false,\n            "name": "tmux"\n
 [38;5;245m│[0m [2m… output truncated for display; full result preserved in session.[0m
 [38;5;245m╰──────────────────╯[0m
 [38;5;245m│[0m

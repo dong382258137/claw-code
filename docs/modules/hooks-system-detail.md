@@ -40,7 +40,7 @@ v0.2 在 v0.1 设计骨架基础上补全:集成点行号验证、3 个端到端
 2. [HookEvent 完整设计](#2-hookevent-完整设计)
 3. [HookHandler 4 类型详解](#3-hookhandler-4-类型详解)
 4. [HookContext 数据结构](#4-hookcontext-数据结构)
-5. [Hook trait + HookRegistry](#5-hook-trait--hookregistry)
+5. [Hook trait + HookRegistry](#5-hook-trait-hookregistry)
 6. [HookRunner 异步引擎](#6-hookrunner-异步引擎)
 7. [run_turn 7 集成点](#7-run_turn-7-集成点)
 8. [配置文件格式](#8-配置文件格式)
