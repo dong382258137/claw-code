@@ -37,11 +37,15 @@ mod spawn;
 mod stdio;
 
 // ---- 1.3 路径(可选) ----
-// ACP 1.3 版本的 ClawAgent 骨架(仅在 acp-1_5 feature 启用时编译)。
+// ACP 1.3 版本的 ClawAgent(仅在 acp-1_5 feature 启用时编译)。
 // 提供 fs/read_text_file、fs/write_text_file、session/request_permission 三个
-// 反向请求方法的占位实现。完整接入是阶段 2 后续工作。
+// 反向请求方法的实现,以及 stdio / spawn 入口。
 #[cfg(feature = "acp-1_5")]
 mod agent_v1_3;
+#[cfg(feature = "acp-1_5")]
+mod spawn_v1_3;
+#[cfg(feature = "acp-1_5")]
+mod stdio_v1_3;
 
 // ---- 公开 re-export ----
 // 根据启用的 feature 导出对应类型。两个 feature 同时启用时(不推荐),
@@ -57,8 +61,13 @@ pub use self::stdio::{run_agent_on_io, run_stdio_agent};
 #[cfg(feature = "acp-0_10")]
 pub use self::lane_bridge::{flush_lane_events_to_acp, lane_event_to_session_update};
 
-// 导出 1.3 骨架的公开类型(仅在 acp-1_5 feature 启用时可见)。
+// 导出 1.3 的公开类型(仅在 acp-1_5 feature 启用时可见)。
 #[cfg(feature = "acp-1_5")]
 pub use self::agent_v1_3::{
-    ClawAgentV13, PermissionError, PermissionOutcome, PermissionRequest, ReadError, WriteError,
+    ClawAgentV13, ClawAgentV13ConnectionSlot, PermissionError, PermissionOutcome,
+    PermissionRequest, ReadError, WriteError,
 };
+#[cfg(feature = "acp-1_5")]
+pub use self::spawn_v1_3::{spawn_claw_shell_v1_3, SpawnedAgentV13};
+#[cfg(feature = "acp-1_5")]
+pub use self::stdio_v1_3::{run_agent_on_io_v1_3, run_stdio_agent_v1_3};
