@@ -4,15 +4,27 @@
 //! Nodes are dispatched as sub-agents via [`SubagentCoordinator`].
 //!
 //! Module structure:
-//! - [`types`]: Data model (Dag, DagNode, DagRun, status enums)
-//! - [`executor`]: Sequential execution in topological order
-//! - [`scheduler`]: Concurrent execution with parallelism control
-//! - [`status`]: Human-readable status rendering
+//! - [`types`]: Data model (Dag, DagNode, DagRun, status enums) + v0.2
+//!   petgraph-backed [`DagGraph`] with SCC cycle detection and ready-node
+//!   computation.
+//! - [`executor`]: Sequential execution in topological order (v0.1, retained
+//!   for `dag_status` tool compat).
+//! - [`executor_trait`]: v0.2 [`SubagentExecutor`] trait abstracting how a
+//!   single node's subagent is dispatched.
+//! - [`scheduler`]: v0.2 async concurrent scheduler (JoinSet +
+//!   CancellationToken, FailFast).
+//! - [`status`]: Human-readable status rendering.
 
 pub mod executor;
+pub mod executor_trait;
 pub mod scheduler;
 pub mod status;
 pub mod types;
+
+// v0.2 re-exports: petgraph-backed graph + async scheduler primitives.
+pub use executor_trait::{NodeError, SubagentExecutor};
+pub use scheduler::DagScheduler;
+pub use types::{DagError, DagGraph, DagId, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

@@ -15,8 +15,14 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 telemetry = { path = "../telemetry" }
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time", "sync"] }
 walkdir = "2"
+# DAG 多 agent 编排基础设施 (v0.2):见 workspace Cargo.toml 注释。
+petgraph.workspace = true
+tokio-util.workspace = true
+serde_yaml.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
 # Step 4.2: LSP 官方类型定义,用于类型安全的 documentSymbol/Diagnostic 解析。
 # 替代部分手搓 serde_json,提高协议层可靠性。
 lsp-types = "0.95"

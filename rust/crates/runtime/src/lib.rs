@@ -324,6 +324,11 @@ pub use loop_detection::{
 pub use multi_agent::{
     CoordinationMode, JoinStats, MultiAgentCoordinator, Subagent, SubagentStatus,
 };
+// v0.2 DAG 多 agent 编排基础设施:petgraph 图封装 + async scheduler + executor trait。
+pub use multi_agent::{
+    DagError, DagGraph, DagId, DagScheduler, NodeError, NodeResult, RetryPolicy, SubagentExecutor,
+    DEFAULT_MAX_PARALLELISM,
+};
 pub use trace_analyzer::{
     FailureCluster, TraceAnalyzer, TraceRecord, TraceStats, CSV_HEADER as TRACE_CSV_HEADER,
     MAX_SAMPLE_ERRORS_PER_CLUSTER,

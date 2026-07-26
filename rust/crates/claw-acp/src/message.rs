@@ -1,6 +1,9 @@
 use std::{borrow::Borrow, fmt, ops::Deref};
 
+#[cfg(feature = "acp-0_10")]
 use agent_client_protocol as acp;
+#[cfg(feature = "acp-1_5")]
+use agent_client_protocol_v1::schema::v1 as acp;
 use derive_more::From;
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -25,6 +28,7 @@ pub trait AcpSide {
 }
 
 /// Marker type representing the agent's view of the ACP connection (as one side of that connection).
+#[cfg(feature = "acp-0_10")]
 impl AcpSide for acp::AgentSide {
     type InMessage = AcpAgentMessage; // inbound messages = messages meant *for* the agent
     type OutMessage = AcpClientMessage; // outbound messages = messages meant *for* the client
@@ -33,12 +37,41 @@ impl AcpSide for acp::AgentSide {
 }
 
 /// Marker type representing the agent's view of the ACP connection (as one side of that connection).
+#[cfg(feature = "acp-0_10")]
 impl AcpSide for acp::ClientSide {
     type InMessage = AcpClientMessage; // inbound messages = messages meant *for* the client
     type OutMessage = AcpAgentMessage; // outbound messages = messages meant *for* the agent
     type OtherSide = acp::AgentSide;
     const NAME: &'static str = "client";
 }
+
+// 1.3 stub marker types: acp::AgentSide / acp::ClientSide were removed in 1.x.
+// These stubs let the crate compile under `acp-1_5` but the gateway dispatch
+// path is non-functional until Phase 2 implements the 1.3 Component model.
+#[cfg(feature = "acp-1_5")]
+mod side_markers {
+    use super::{AcpAgentMessage, AcpClientMessage, AcpSide};
+
+    pub struct AgentSide;
+    pub struct ClientSide;
+
+    impl AcpSide for AgentSide {
+        type InMessage = AcpAgentMessage;
+        type OutMessage = AcpClientMessage;
+        type OtherSide = ClientSide;
+        const NAME: &'static str = "agent";
+    }
+
+    impl AcpSide for ClientSide {
+        type InMessage = AcpClientMessage;
+        type OutMessage = AcpAgentMessage;
+        type OtherSide = AgentSide;
+        const NAME: &'static str = "client";
+    }
+}
+
+#[cfg(feature = "acp-1_5")]
+pub use side_markers::{AgentSide, ClientSide};
 
 /// Extends each request/response type pair with the side marker type and schema method name.
 pub trait AcpMethod {
@@ -239,6 +272,9 @@ mod client {
             }
         }
 
+        // TODO(1.3): `acp::Client` is a struct in 1.3, not a trait. Routing
+        // needs to be rewritten using the 1.3 Component/Connection model.
+        #[cfg(feature = "acp-0_10")]
         pub fn route_to_client(
             self,
             client: impl acp::Client + 'static, // note: acp::Client is auto-implemented for Rc/Arc
@@ -389,6 +425,10 @@ mod agent {
         (),
         acp::AGENT_METHOD_NAMES.session_cancel,
     );
+    // TODO(1.3): SetSessionModel was removed in ACP 1.x. The 1.3 equivalent
+    // is handled via provider/model negotiation in the new Component model.
+    // This variant is gated to `acp-0_10` only.
+    #[cfg(feature = "acp-0_10")]
     acp_define_request_response!(
         acp::SetSessionModelRequest,
         acp::SetSessionModelResponse,
@@ -407,6 +447,7 @@ mod agent {
         Cancel(AcpArgsGeneric<acp::CancelNotification, S>),
         ExtMethod(AcpArgsGeneric<acp::ExtRequest, S>),
         ExtNotification(AcpArgsGeneric<acp::ExtNotification, S>),
+        #[cfg(feature = "acp-0_10")]
         SetSessionModel(AcpArgsGeneric<acp::SetSessionModelRequest, S>),
     }
 
@@ -427,6 +468,7 @@ mod agent {
                 Self::Cancel(a) => a.method_name(),
                 Self::ExtMethod(a) => a.method_name(),
                 Self::ExtNotification(a) => a.method_name(),
+                #[cfg(feature = "acp-0_10")]
                 Self::SetSessionModel(a) => a.method_name(),
             }
         }
@@ -461,6 +503,7 @@ mod agent {
                 Self::ExtNotification(args) => {
                     state.serialize_field("request", args.request.borrow())?
                 }
+                #[cfg(feature = "acp-0_10")]
                 Self::SetSessionModel(args) => {
                     state.serialize_field("request", args.request.borrow())?
                 }
@@ -508,13 +551,18 @@ mod agent {
                 parse!(Prompt)
             } else if method == acp::AGENT_METHOD_NAMES.session_cancel {
                 parse!(Cancel)
-            } else if method == acp::AGENT_METHOD_NAMES.session_set_model {
-                parse!(SetSessionModel)
             } else if method == "ext_method" {
                 parse!(ExtMethod)
             } else if method == "ext_notification" {
                 parse!(ExtNotification)
             } else {
+                // TODO(1.3): SetSessionModel was removed in ACP 1.x.
+                #[cfg(feature = "acp-0_10")]
+                {
+                    if method == acp::AGENT_METHOD_NAMES.session_set_model {
+                        return parse!(SetSessionModel);
+                    }
+                }
                 Err(serde::de::Error::custom(format!(
                     "Unknown method name: {method}"
                 )))
@@ -534,10 +582,14 @@ mod agent {
                 Self::Cancel(args) => AcpAgentMessageBox::Cancel(args.boxed()),
                 Self::ExtMethod(args) => AcpAgentMessageBox::ExtMethod(args.boxed()),
                 Self::ExtNotification(args) => AcpAgentMessageBox::ExtNotification(args.boxed()),
+                #[cfg(feature = "acp-0_10")]
                 Self::SetSessionModel(args) => AcpAgentMessageBox::SetSessionModel(args.boxed()),
             }
         }
 
+        // TODO(1.3): `acp::Agent` is a struct in 1.3, not a trait. Routing
+        // needs to be rewritten using the 1.3 Component/Connection model.
+        #[cfg(feature = "acp-0_10")]
         pub fn route_to_agent(
             self,
             agent: impl acp::Agent + 'static, // note: acp::Agent is auto-implemented for Rc/Arc
@@ -619,6 +671,7 @@ mod agent {
                     }
                     .boxed_local(),
                 ),
+                #[cfg(feature = "acp-0_10")]
                 AcpAgentMessage::SetSessionModel(args) => spawn(
                     async move {
                         _ = args

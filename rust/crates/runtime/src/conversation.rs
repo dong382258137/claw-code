@@ -967,6 +967,11 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
+        // G9.1: SessionStart lifecycle hook — 在 turn 主循环开始前触发,
+        // 让外部观察者(session 审计、UI 状态指示器等)感知会话启动。
+        // 返回值不影响主流程,故意丢弃(messages 已在 HookRunner 内部处理)。
+        let _ = self.hook_runner.run_session_start(&self.session.session_id);
+
         // P2-7 修复:在每个 turn 开始时重置 loop_detector,避免跨 turn 累积。
         // 否则同一文件被多次编辑会触发 InjectContext/Abort,即使这些编辑分布在
         // 不同 turn 中(误判 doom loop)。
@@ -995,6 +1000,11 @@ where
         self.session
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+
+        // G9.1: UserPromptSubmit lifecycle hook — 用户输入已入 session 后触发,
+        // 让外部观察者(敏感词过滤、prompt 审计、telemetry 等)看到原始 prompt。
+        // 返回值不影响主流程,故意丢弃。
+        let _ = self.hook_runner.run_user_prompt_submit(&user_input);
 
         // BUG-6 修复:Harness C(Memory)层接入 — 语义召回。
         // 当 persistent_memory 存在时,调用 semantic_recall 获取 top-3 相关记忆,
@@ -1964,6 +1974,18 @@ where
             }
         }
 
+        // G9.1: Stop lifecycle hook — turn 主循环正常结束前触发,
+        // 让外部观察者(完成通知、telemetry、UI 状态指示器等)感知会话停止。
+        // reason 描述结束原因(此处为正常完成);异常路径由各自分支的
+        // record_turn_failed 处理,不在此触发 Stop(避免与失败信号竞争)。
+        // 返回值不影响主流程,故意丢弃。
+        let _ = self.hook_runner.run_stop("turn_completed");
+
+        // G9.1: SessionEnd lifecycle hook — turn 完全结束(含 nudge 等清理)后触发,
+        // 让外部观察者(session 审计、状态持久化、清理逻辑等)感知会话结束。
+        // 返回值不影响主流程,故意丢弃。
+        let _ = self.hook_runner.run_session_end(&self.session.session_id);
+
         Ok(summary)
     }
 
@@ -2151,6 +2173,11 @@ where
                 let _ = coordinator.fail(&subagent_id, error.as_str());
             }
         }
+
+        // G9.1: SubagentStop lifecycle hook — 子 agent 进入终态(completed/failed)
+        // 时触发,让外部观察者(子 agent 审计、telemetry、清理逻辑等)感知停止。
+        // 返回值不影响主流程,故意丢弃。
+        let _ = self.hook_runner.run_subagent_stop(&subagent_id);
 
         // 发布终态 SubagentResult lane event
         let terminal_status = if subagent_result.is_ok() {
@@ -2815,6 +2842,17 @@ where
         if self.usage_tracker.cumulative_usage().context_tokens() < threshold {
             return None;
         }
+
+        // G9.1: PreCompact lifecycle hook — 在 compact_session 实际执行前触发,
+        // 让外部观察者(上下文快照、telemetry、审计等)在压缩发生前捕获 pre 状态。
+        // context 包含当前 token 用量与阈值,便于 hook 决策是否记录。
+        // 返回值不影响主流程,故意丢弃。
+        let pre_compact_context = format!(
+            "auto_compaction: context_tokens={} threshold={}",
+            self.usage_tracker.cumulative_usage().context_tokens(),
+            threshold
+        );
+        let _ = self.hook_runner.run_pre_compact(&pre_compact_context);
 
         // Use the default CompactionConfig (max_estimated_tokens: 10_000) so that
         // small sessions are not pointlessly compacted. The auto-compact trigger

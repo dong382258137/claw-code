@@ -6,8 +6,17 @@ license.workspace = true
 publish.workspace = true
 description = "ACP (Agent Communication Protocol) channel/gateway layer for claw-code"
 
+[features]
+default = ["acp-0_10"]
+acp-0_10 = ["dep:agent-client-protocol"]
+acp-1_5 = ["dep:agent-client-protocol-v1"]
+
 [dependencies]
-agent-client-protocol = { version = "0.10.4", features = ["unstable"] }
+# 保留 0.10.4 作为默认(原配置)
+agent-client-protocol = { version = "0.10.4", features = ["unstable"], optional = true }
+# 新增 1.3.0 作为可选(1.5.0 不存在于 crates.io,1.3.0 为最新 1.x)
+# 命名规范上沿用任务里的 `acp-1_5` feature 名,但实际指向 1.3.0
+agent-client-protocol-v1 = { package = "agent-client-protocol", version = "1.3", optional = true }
 async-trait = "0.1"
 derive_more = "0.99"
 futures = "0.3"

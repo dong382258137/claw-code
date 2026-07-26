@@ -2,7 +2,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
+#[cfg(feature = "acp-0_10")]
 use agent_client_protocol as acp;
+#[cfg(feature = "acp-1_5")]
+use agent_client_protocol_v1::schema::v1 as acp;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
@@ -104,10 +107,28 @@ pub fn acp_gateway<S: AcpSide, C>(conn: C) -> (AcpGatewaySender<S>, AcpGatewayRe
     (sender, receiver)
 }
 
+// 0.10.4: use acp crate's AgentSide/ClientSide and connection types.
+#[cfg(feature = "acp-0_10")]
 pub type AcpAgentGatewayReceiver = AcpGatewayReceiver<acp::AgentSide, acp::AgentSideConnection>;
+#[cfg(feature = "acp-0_10")]
 pub type AcpAgentGatewaySender = AcpGatewaySender<acp::AgentSide>;
+#[cfg(feature = "acp-0_10")]
 pub type AcpClientGatewayReceiver = AcpGatewayReceiver<acp::ClientSide, acp::ClientSideConnection>;
+#[cfg(feature = "acp-0_10")]
 pub type AcpClientGatewaySender = AcpGatewaySender<acp::ClientSide>;
+
+// 1.3: AgentSide/ClientSide/AgentSideConnection/ClientSideConnection were removed.
+// Use the local stub marker types and a placeholder connection. The gateway
+// dispatch path is non-functional under `acp-1_5` until Phase 2 implements
+// the 1.3 Component/Connection model.
+#[cfg(feature = "acp-1_5")]
+pub type AcpAgentGatewayReceiver = AcpGatewayReceiver<crate::message::AgentSide, ()>;
+#[cfg(feature = "acp-1_5")]
+pub type AcpAgentGatewaySender = AcpGatewaySender<crate::message::AgentSide>;
+#[cfg(feature = "acp-1_5")]
+pub type AcpClientGatewayReceiver = AcpGatewayReceiver<crate::message::ClientSide, ()>;
+#[cfg(feature = "acp-1_5")]
+pub type AcpClientGatewaySender = AcpGatewaySender<crate::message::ClientSide>;
 
 fn before_request<T: AcpRequest>(args: &AcpArgs<T>, tracing: bool) -> Option<String> {
     tracing.then(|| {
@@ -169,6 +190,9 @@ macro_rules! handle {
     };
 }
 
+// TODO(1.3): `acp::Agent` is a struct in 1.3, not a trait. The gateway
+// dispatch model needs to be rewritten using the 1.3 Component/Connection API.
+#[cfg(feature = "acp-0_10")]
 impl<C: acp::Agent + 'static> AcpGatewayReceiver<acp::ClientSide, C> {
     pub async fn run(mut self) {
         let conn = Rc::new(self.conn);
@@ -231,6 +255,8 @@ impl<C: acp::Agent + 'static> AcpGatewayReceiver<acp::ClientSide, C> {
     }
 }
 
+// TODO(1.3): `acp::Client` is a struct in 1.3, not a trait. See note above.
+#[cfg(feature = "acp-0_10")]
 impl<C: acp::Client + 'static> AcpGatewayReceiver<acp::AgentSide, C> {
     pub async fn run(mut self) {
         let conn = Rc::new(self.conn);
@@ -387,6 +413,8 @@ impl<S: AcpSide> AcpGatewaySender<S> {
     }
 }
 
+// TODO(1.3): Client trait impl - needs rewrite for 1.3 Component model.
+#[cfg(feature = "acp-0_10")]
 #[async_trait::async_trait(?Send)]
 impl acp::Client for AcpGatewaySender<acp::AgentSide> {
     async fn request_permission(
@@ -471,6 +499,8 @@ impl acp::Client for AcpGatewaySender<acp::AgentSide> {
     }
 }
 
+// TODO(1.3): Agent trait impl - needs rewrite for 1.3 Component model.
+#[cfg(feature = "acp-0_10")]
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for AcpGatewaySender<acp::ClientSide> {
     async fn initialize(&self, args: acp::InitializeRequest) -> AcpResult<acp::InitializeResponse> {
@@ -522,13 +552,18 @@ impl acp::Agent for AcpGatewaySender<acp::ClientSide> {
     }
 }
 
-#[cfg(test)]
+// Tests use the 0.10.4 trait-based dispatch model (acp::Client, acp::AgentSide).
+// TODO(1.3): Add 1.3-specific tests using the Component/Connection model.
+#[cfg(all(test, feature = "acp-0_10"))]
 mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    #[cfg(feature = "acp-0_10")]
     use agent_client_protocol as acp;
+    #[cfg(feature = "acp-1_5")]
+    use agent_client_protocol_v1::schema::v1 as acp;
 
     struct OrderTrackingClient {
         log: Rc<RefCell<Vec<String>>>,

@@ -10,6 +10,14 @@ publish = false
 
 [workspace.dependencies]
 serde_json = "1"
+# DAG 多 agent 编排基础设施 (v0.2):petgraph 提供图算法(SCC 环检测、toposort),
+# tokio-util 提供 CancellationToken 用于 FailFast 取消,serde_yaml 用于 DAG 定义文件解析,
+# async-trait 用于 SubagentExecutor trait 的 async fn, thiserror 用于 NodeError/DagError。
+petgraph = "0.6"
+tokio-util = { version = "0.7", features = ["rt"] }
+serde_yaml = "0.9"
+async-trait = "0.1"
+thiserror = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

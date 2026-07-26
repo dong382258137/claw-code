@@ -148,7 +148,8 @@ impl DagExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi_agent::dag::types::DagNode;
+    use crate::multi_agent::dag::types::{DagNode, RetryPolicy};
+    use crate::multi_agent::CoordinationMode;
 
     fn sample_dag() -> Dag {
         Dag {
@@ -163,6 +164,8 @@ mod tests {
                     acceptance_criteria: "Step 1 done".to_string(),
                     verify_command: None,
                     max_retries: 1,
+                    mode: CoordinationMode::Fork,
+                    retry_policy: RetryPolicy::default(),
                 },
                 DagNode {
                     id: "n2".to_string(),
@@ -172,6 +175,8 @@ mod tests {
                     acceptance_criteria: "Step 2 done".to_string(),
                     verify_command: None,
                     max_retries: 1,
+                    mode: CoordinationMode::Fork,
+                    retry_policy: RetryPolicy::default(),
                 },
             ],
         }

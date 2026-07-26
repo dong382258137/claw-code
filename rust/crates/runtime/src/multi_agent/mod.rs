@@ -16,6 +16,10 @@
 //! "Subagent as Tool" 模式 — 主 agent 通过 tool call 接口调用子 agent。
 
 pub mod dag;
+pub use dag::{
+    DagError, DagGraph, DagId, DagScheduler, NodeError, NodeResult, RetryPolicy, SubagentExecutor,
+    DEFAULT_MAX_PARALLELISM,
+};
 pub use dag::DagStore;
 
 use std::collections::HashMap;
