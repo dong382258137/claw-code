@@ -227,18 +227,18 @@ async fn cancel(&self, _arguments: acp::CancelNotification) -> Result<(), acp::E
 
 | 项 | 优先级 | 状态 | commit |
 |---|---|---|---|
-| 1.1 claw-acp 10 warning | P1 | ✅ 已修复 | - |
-| 1.2 claw-shell 3 warning | P1 | ✅ 已修复 | - |
-| 2.1 LaneEvent 桥接接入 | P0 | ✅ 已修复 | - |
-| 2.2 Notification 事件触发 | P1 | ✅ 已修复 | - |
-| 2.3 dag_run 接入 async scheduler | P1 | ✅ 已修复 | - |
-| 3.1 ClawAgent::cancel stub | P2 | 待办 | - |
-| 3.2 ACP silent drop | P2 | 待办 | - |
-| 3.3 CoordinatorExecutor 注入 | P0 | ✅ 已修复 | - |
-| 4.1 tui_mode gating | P2 | 待办 | - |
-| 4.2 cancel during prompt 测试 | P2 | 待办 | - |
-| 5.1 反向请求端到端测试 | P2 | 待办 | - |
-| 5.2 CoordinatorExecutor 生产测试 | P2 | 待办 | - |
+| 1.1 claw-acp 10 warning | P1 | ✅ 已修复 | 1d78b863 |
+| 1.2 claw-shell 3 warning | P1 | ✅ 已修复 | 1d78b863 |
+| 2.1 LaneEvent 桥接接入 | P0 | ✅ 已修复 | 1d78b863 |
+| 2.2 Notification 事件触发 | P1 | ✅ 已修复 | 1d78b863 |
+| 2.3 dag_run 接入 async scheduler | P1 | ✅ 已修复 | 1d78b863 |
+| 3.1 ClawAgent::cancel stub | P2 | ⏭️ 跳过(需 3-5 天主循环重构) | - |
+| 3.2 ACP silent drop | P2 | ⏭️ 跳过(需 fork 外部库或 wrapper) | - |
+| 3.3 CoordinatorExecutor 注入 | P0 | ✅ 已修复 | 1d78b863 |
+| 4.1 tui_mode gating | P2 | ⏭️ 跳过(需 1-2 天评估所有使用点) | - |
+| 4.2 cancel during prompt 测试 | P2 | ✅ 已修复 | 81a52dd3 |
+| 5.1 反向请求端到端测试 | P2 | ✅ 已修复 | 81a52dd3 |
+| 5.2 CoordinatorExecutor 生产测试 | P2 | ✅ 已修复 | 81a52dd3 |
 
 ### 修复详情(2026-07-27)
 
@@ -253,3 +253,19 @@ async fn cancel(&self, _arguments: acp::CancelNotification) -> Result<(), acp::E
 **3.3 CoordinatorExecutor 注入**: 新增 `SubagentDispatcher`(subagent_dispatcher.rs)提取 `run_subagent_turn` 逻辑为异步 Send+Sync;ConversationRuntime 新增 `coordinator_executor` 字段 + `with_dag_coordinator` builder;app.rs 构造第二个 AnthropicRuntimeClient 给 dispatcher 并注入 tools 全局 registry。
 
 **2.3 dag_run 接入 async scheduler**: tools/lib.rs 新增 `COORDINATOR_EXECUTOR: OnceLock` + `set_coordinator_executor` setter;`run_dag_run` 在 executor 已注入时构造 `DagGraph::from_dag` + `DagScheduler::with_dag_run`,在独立 OS 线程 + tokio runtime 中后台 spawn 调度循环,立即返回 Running 状态。
+
+### 修复详情(2026-07-27 P2 测试覆盖)
+
+**5.1 反向请求端到端测试**: 用 `acp::Channel::duplex()` 构造 in-process mock gateway,通过 `Client.builder().on_receive_request(...)` 注册类型化 handler。新增 3 个成功路径测试:`read_editor_buffer_returns_content_from_ide`、`write_editor_buffer_completes_when_ide_acknowledges`、`request_permission_returns_decision_from_ide`。
+
+**5.2 CoordinatorExecutor 生产路径测试**: 新增 3 个测试覆盖真实 runner 注入:`coordinator_executor_with_realistic_runner_executes_dag_node`(模拟 LLM 延迟 + 线性 DAG + DagScheduler 端到端)、`coordinator_executor_with_failing_runner_reports_node_failure`(失败传播 + FailFast)、`coordinator_executor_with_subagent_dispatcher_pattern`(完整 SubagentDispatcher 写文件模式)。
+
+**4.2 cancel during permission prompt 测试**: 新增 2 个测试:`claw_agent_cancel_returns_ok_as_stub`(单元测试,固化 stub 返回 Ok 的契约)、`run_agent_on_io_cancel_during_prompt_does_not_interrupt_turn`(集成测试,完整 ACP 协议交互,验证 cancel 不中断 turn)。
+
+### 跳过项说明(3 项)
+
+| 项 | 跳过原因 |
+|---|---|
+| 3.1 ClawAgent::cancel stub | 需将 run_turn 改造为 async + CancellationToken,涉及 conversation 主循环重构,估计 3-5 天 |
+| 3.2 ACP silent drop | silent drop 是外部库 agent_client_protocol 的 rpc.rs 设计,claw-shell 无法直接修改;切换 1.3 会导致 route_to_agent/route_to_client stub 退化 |
+| 4.1 tui_mode gating | 需评估 14 处 tui_mode 使用点(app.rs + tui/app.rs),涉及 permission_prompter 分支、stdout gating 等,估计 1-2 天 |
