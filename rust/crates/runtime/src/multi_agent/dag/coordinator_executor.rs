@@ -109,6 +109,8 @@ impl CoordinatorExecutor {
     ///
     /// # Example
     /// ```no_run
+    /// use std::future::Future;
+    /// use std::pin::Pin;
     /// use std::sync::Arc;
     /// use runtime::multi_agent::MultiAgentCoordinator;
     /// use runtime::multi_agent::dag::coordinator_executor::CoordinatorExecutor;

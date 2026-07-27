@@ -16,6 +16,12 @@
 //! "Subagent as Tool" 模式 — 主 agent 通过 tool call 接口调用子 agent。
 
 pub mod dag;
+// Multi-Agent Hardening §4.4:验证门禁(ValidationGate trait + CommandValidationGate + LlmJudgeGate 预留)。
+pub mod validation;
+pub use validation::{
+    detect_changed_files, rust_compile_gate, CommandValidationGate, LlmJudgeGate, ValidationContext,
+    ValidationError, ValidationGate,
+};
 pub use dag::{
     CoordinatorExecutor, DagError, DagGraph, DagId, DagScheduler, NodeError, NodeResult,
     ProgressEvent, RetryPolicy, SubagentDispatcher, SubagentExecutor, SubagentRunner,
@@ -30,6 +36,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
+
+// ValidationGate 等已通过 `pub use validation::{...}` 导出,无需重复 use。
+
+/// 任务复杂度需求 — Multi-Agent Hardening §4.2。
+///
+/// 由调用方声明,coordinator 据此匹配模型能力层级。
+/// 与 `api::providers::model_tier::TaskComplexity` 保持兼容(避免循环依赖,本地定义)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskComplexity {
+    /// 简单任务:单文件编辑、已知模式 — Budget 模型可胜任。
+    Simple,
+    /// 诊断任务:根因定位、复杂调试 — 需要强推理能力,Flagship 模型。
+    Diagnostic,
+    /// 架构决策:多方案评估、trade-off 分析 — Flagship 模型。
+    Architectural,
+}
 
 /// 多 agent 编排模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +83,8 @@ pub enum SubagentStatus {
 }
 
 /// 子 agent 描述符。
+///
+/// Multi-Agent Hardening v3:扩展字段支持模型路由、重试、成本门禁、checkpoint。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subagent {
     /// 全局唯一 ID。
@@ -80,15 +105,102 @@ pub struct Subagent {
     pub completed_at: Option<u64>,
     /// 结果(完成后填充)。
     pub result: Option<String>,
+
+    // === Multi-Agent Hardening v3 扩展字段 ===
+
+    /// 使用的模型名(None 表示使用默认模型)。
+    /// §4.2:模型能力分级 + 任务路由依据。
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// 任务复杂度分类,用于模型能力匹配。
+    /// §4.2:Diagnostic/Architectural 任务拒绝 Budget 模型。
+    #[serde(default = "default_complexity")]
+    pub complexity: TaskComplexity,
+
+    /// 最大尝试次数(默认 1 = 只尝试 1 次不重试;2 = 1 次原始 + 1 次重试)。
+    /// §4.5 retry loop 上限,防止无限重试。
+    /// 注意:`retry loop` 用 `for attempt in 1..=max_attempts` 作为循环上限,
+    /// 即 max_attempts 表示"最大尝试次数"而非"重试次数"。
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+
+    /// 当前已重置次数(0 = 未重置,1 = 已重置 1 次准备第 2 次尝试,以此类推)。
+    /// §4.5:`reset_for_retry` 时 +1,达 `max_attempts - 1` 后拒绝重置
+    /// (因为 max_attempts=2 意味着最多 2 次尝试,只能在第 1 次失败后重置 1 次)。
+    #[serde(default)]
+    pub attempts: u32,
+
+    /// 是否已通过验证门禁。
+    /// §4.4:`validate()` 成功后置 true,失败置 false 并触发 retry。
+    #[serde(default)]
+    pub validated: bool,
+
+    /// 诊断备注(如能力校验警告、retry 原因等)。
+    /// §0.7 v2:`spawn` 能力校验失败时不返回 Err,而是把警告写入 notes。
+    #[serde(default)]
+    pub notes: Vec<String>,
+
+    /// Checkpoint 文件路径(P1 预留)。
+    /// §v3 P1:`save_checkpoint` 落盘路径,用于 durable execution。
+    /// MVP 仅实现 save,restore 留待 v2。
+    #[serde(default)]
+    pub checkpoint_path: Option<PathBuf>,
+
+    /// 成本上限(USD)。None 表示无限制。
+    /// §v3 P0 成本门禁:retry loop 升级前调用 `check_cost_limit` 校验。
+    #[serde(default)]
+    pub cost_limit: Option<f64>,
+
+    /// 累计成本(USD)。每次 LLM 调用后累加。
+    /// §v3 P0:与 `cost_limit` 配合,达上限后中止 retry。
+    #[serde(default)]
+    pub cost_accumulated: f64,
+}
+
+fn default_complexity() -> TaskComplexity {
+    TaskComplexity::Simple
+}
+
+fn default_max_attempts() -> u32 {
+    1
 }
 
 /// 多 agent 协调器 — 管理 agent 生命周期 + 任务分派。
-#[derive(Debug, Clone, Default)]
+///
+/// Multi-Agent Hardening v3:扩展验证门禁链 + workspace_root 注入。
+//
+// 注:`Debug` 手动实现,因 `Box<dyn ValidationGate>` 不实现 `Debug`。
+// 调试输出仅展示 subagent 数量和 gate 数量,不展开内部状态。
+#[derive(Clone, Default)]
 pub struct MultiAgentCoordinator {
     /// 已注册的子 agent(按 ID 索引)。
     subagents: Arc<Mutex<HashMap<String, Subagent>>>,
     /// ID 计数器。
     id_counter: Arc<Mutex<u64>>,
+    /// 验证门禁链(§4.4:subagent 完成后依次调用)。
+    validation_gates: Arc<Mutex<Vec<Box<dyn ValidationGate>>>>,
+    /// workspace 根目录(§4.4:用于 detect_changed_files + CommandValidationGate)。
+    workspace_root: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl std::fmt::Debug for MultiAgentCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let subagent_count = self
+            .subagents
+            .lock()
+            .map_or(0, |s| s.len())
+            .max(0);
+        let gate_count = self
+            .validation_gates
+            .lock()
+            .map_or(0, |g| g.len())
+            .max(0);
+        f.debug_struct("MultiAgentCoordinator")
+            .field("subagents_count", &subagent_count)
+            .field("validation_gates_count", &gate_count)
+            .finish_non_exhaustive()
+    }
 }
 
 fn now_secs() -> u64 {
@@ -157,11 +269,355 @@ impl MultiAgentCoordinator {
             created_at: now_secs(),
             completed_at: None,
             result: None,
+            // v3 扩展字段默认值
+            model: None,
+            complexity: TaskComplexity::Simple,
+            max_attempts: 1,
+            attempts: 0,
+            validated: false,
+            notes: Vec::new(),
+            checkpoint_path: None,
+            cost_limit: None,
+            cost_accumulated: 0.0,
         };
 
         let mut agents = self.subagents.lock().expect("subagents lock poisoned");
         agents.insert(id.clone(), subagent);
         id
+    }
+
+    /// 派生子 agent(带模型 + 复杂度) — Multi-Agent Hardening §4.2/§0.7 v2。
+    ///
+    /// 与 [`spawn`](Self::spawn) 不同,此方法:
+    /// - 显式指定模型名和任务复杂度
+    /// - 返回 `Result<String, String>`,能力校验失败时返回 Err
+    /// - §0.7 v2:保留 `spawn` 原签名 `-> String`(避免破坏 12 处单测),
+    ///   新增本方法作为扩展入口
+    ///
+    /// # 参数
+    /// - `name`: 子 agent 名称
+    /// - `task`: 任务描述
+    /// - `mode`: 编排模式
+    /// - `model`: 模型名(如 "deepseek-v4-flash")
+    /// - `complexity`: 任务复杂度(Simple/Diagnostic/Architectural)
+    ///
+    /// # 返回
+    /// - `Ok(id)`: 子 agent 创建成功
+    /// - `Err(msg)`: 能力校验失败(如 Budget 模型执行 Diagnostic 任务)
+    pub fn spawn_with_model(
+        &self,
+        name: impl Into<String>,
+        task: impl Into<String>,
+        mode: CoordinationMode,
+        model: impl Into<String>,
+        complexity: TaskComplexity,
+    ) -> Result<String, String> {
+        let model = model.into();
+        let name = name.into();
+        let task = task.into();
+
+        // §4.2:能力校验 — Diagnostic/Architectural 任务拒绝 Budget 模型
+        // 注意:这里只做粗粒度前缀检查,不依赖 api crate(避免循环依赖)。
+        // 完整的 tier_for_model 校验在 conversation.rs 调用方执行(那里能访问 api)。
+        let lower = model.to_ascii_lowercase();
+        let is_budget = lower.contains("haiku")
+            || lower.contains("mini")
+            || lower.contains("nano")
+            || lower.contains("flash");
+        if is_budget && matches!(complexity, TaskComplexity::Diagnostic | TaskComplexity::Architectural)
+        {
+            return Err(format!(
+                "model '{model}' (Budget tier) cannot handle {complexity:?} task — use Flagship model"
+            ));
+        }
+
+        // 复用 spawn 创建基础 subagent,然后填充 v3 扩展字段
+        let id = self.spawn(name, task, mode);
+        let mut agents = self.subagents.lock().expect("subagents lock poisoned");
+        if let Some(agent) = agents.get_mut(&id) {
+            agent.model = Some(model);
+            agent.complexity = complexity;
+            // Diagnostic/Architectural 任务默认允许 1 次重试(升级到 Flagship)
+            // max_attempts=2 意味着"最多 2 次尝试"(1 次原始 + 1 次升级重试)
+            if matches!(complexity, TaskComplexity::Diagnostic | TaskComplexity::Architectural) {
+                agent.max_attempts = 2;
+            }
+        }
+        Ok(id)
+    }
+
+    /// 重置子 agent 以进行重试 — Multi-Agent Hardening §4.5。
+    ///
+    /// 在 retry loop 中调用,将子 agent 状态从 `Failed` 或 `Completed`
+    /// (验证失败后)重置为 `Created`,允许重新执行。同时:
+    /// - `attempts` +1
+    /// - `validated` 重置为 false
+    /// - `status` 重置为 Created
+    /// - `completed_at` 清空
+    /// - `result` 清空
+    /// - 可选:更新 `model`(升级模型重试)
+    ///
+    /// # 状态转换图(§4.5.1)
+    /// - `Failed --retryable--> reset_for_retry() --> Created --> start() --> Running`
+    /// - `Completed --validate retryable fail--> reset_for_retry() --> Created --> start() --> Running`
+    ///
+    /// v2 修正:同时接受 `Failed` 和 `Completed` 状态 — 修复 v1 中
+    /// `Completed` 状态不可重置的漏洞(验证失败后无法 retry)。
+    ///
+    /// # 返回
+    /// - `Ok(())`: 重置成功
+    /// - `Err(msg)`: 子 agent 不存在 / 已达 max_attempts / 状态不允许重试
+    pub fn reset_for_retry(
+        &self,
+        subagent_id: &str,
+        upgraded_model: Option<String>,
+    ) -> Result<(), String> {
+        let mut agents = self.subagents.lock().expect("subagents lock poisoned");
+        let agent = agents
+            .get_mut(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+
+        // §4.5 状态转换图:Failed 和 Completed 都可重置
+        // - Failed:run_subagent_turn 返回 Err 后调用 fail() 进入 Failed
+        // - Completed:run_subagent_turn 成功后 complete(),但 validate() 失败
+        if agent.status != SubagentStatus::Failed && agent.status != SubagentStatus::Completed {
+            return Err(format!(
+                "subagent {subagent_id} cannot reset_for_retry from status {:?} (only Failed/Completed allowed)",
+                agent.status
+            ));
+        }
+
+        // §4.5:达 reset 次数上限后停止重试
+        // max_attempts 语义 = "最大尝试次数"(retry loop 用 `for attempt in 1..=max_attempts`)
+        // reset 次数上限 = max_attempts - 1(因为 max_attempts=2 意味着 2 次尝试,只能 reset 1 次)
+        // saturating_sub 防止 max_attempts=0 时下溢(0-1=0,即不允许任何 reset)
+        let max_resets = agent.max_attempts.saturating_sub(1);
+        if agent.attempts >= max_resets {
+            return Err(format!(
+                "subagent {subagent_id} reached max_attempts {} (resets used: {}, max resets: {})",
+                agent.max_attempts, agent.attempts, max_resets
+            ));
+        }
+
+        agent.attempts += 1;
+        agent.validated = false;
+        agent.status = SubagentStatus::Created;
+        agent.completed_at = None;
+        agent.result = None;
+        if let Some(model) = upgraded_model {
+            agent.notes.push(format!(
+                "retry attempt {}: upgraded model to '{}'",
+                agent.attempts, model
+            ));
+            agent.model = Some(model);
+        } else {
+            agent.notes.push(format!("retry attempt {}", agent.attempts));
+        }
+        Ok(())
+    }
+
+    /// 保存 checkpoint — Multi-Agent Hardening v3 P1。
+    ///
+    /// MVP 仅实现 save(落盘到 `checkpoint_path`),restore 留待 v2。
+    /// 借鉴 LangGraph/Temporal durable execution + Anthropic "resume from where the agent was"。
+    ///
+    /// # 行为
+    /// 1. 序列化 Subagent 为 JSON
+    /// 2. 落盘到 `{workspace_root}/.claw/checkpoints/{id}.json`
+    /// 3. 更新 `checkpoint_path` 字段
+    ///
+    /// # 返回
+    /// - `Ok(path)`: checkpoint 保存路径
+    /// - `Err(msg)`: 子 agent 不存在 / 序列化失败 / 落盘失败
+    pub fn save_checkpoint(&self, subagent_id: &str) -> Result<PathBuf, String> {
+        let agent = self
+            .get(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+
+        let workspace_root = self
+            .workspace_root
+            .lock()
+            .expect("workspace_root lock")
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let checkpoint_dir = workspace_root.join(".claw").join("checkpoints");
+        std::fs::create_dir_all(&checkpoint_dir)
+            .map_err(|e| format!("create checkpoint dir failed: {e}"))?;
+
+        let path = checkpoint_dir.join(format!("{subagent_id}.json"));
+        let json = serde_json::to_string_pretty(&agent)
+            .map_err(|e| format!("serialize subagent failed: {e}"))?;
+        std::fs::write(&path, json)
+            .map_err(|e| format!("write checkpoint failed: {e}"))?;
+
+        // 更新 checkpoint_path 字段
+        let mut agents = self.subagents.lock().expect("subagents lock poisoned");
+        if let Some(a) = agents.get_mut(subagent_id) {
+            a.checkpoint_path = Some(path.clone());
+        }
+
+        crate::diag::global().append(
+            crate::diag::DiagEntry::new(
+                crate::diag::DiagLevel::Info,
+                "checkpoint",
+                format!("checkpoint saved for subagent {subagent_id}"),
+            )
+            .with_field(
+                "path",
+                serde_json::Value::String(path.to_string_lossy().into_owned()),
+            ),
+        );
+
+        Ok(path)
+    }
+
+    /// 注册验证门禁 — Multi-Agent Hardening §4.4。
+    pub fn add_validation_gate(&self, gate: Box<dyn ValidationGate>) {
+        self.validation_gates
+            .lock()
+            .expect("gates lock")
+            .push(gate);
+    }
+
+    /// 设置 workspace_root — Multi-Agent Hardening §4.4。
+    ///
+    /// 从 ConversationRuntime 注入,用于 `detect_changed_files` + `CommandValidationGate`。
+    pub fn set_workspace_root(&self, root: PathBuf) {
+        *self.workspace_root.lock().expect("workspace_root lock") = Some(root);
+    }
+
+    /// 验证 subagent 结果 — Multi-Agent Hardening §4.4。
+    ///
+    /// 调用所有注册的 gate,首个失败即返回。
+    /// 成功后标记 `validated = true`。
+    pub fn validate(&self, subagent_id: &str) -> Result<(), validation::ValidationError> {
+        let agents = self.subagents.lock().expect("subagents lock");
+        let agent = agents.get(subagent_id).ok_or_else(|| validation::ValidationError {
+            message: format!("subagent not found: {subagent_id}"),
+            retryable: false,
+        })?;
+        if agent.status != SubagentStatus::Completed {
+            return Err(validation::ValidationError {
+                message: format!(
+                    "subagent {subagent_id} cannot validate from status {:?} (only Completed allowed)",
+                    agent.status
+                ),
+                retryable: false,
+            });
+        }
+        let task = agent.task.clone();
+        let result = agent.result.clone().unwrap_or_default();
+        let model = agent.model.clone().unwrap_or_default();
+        drop(agents); // 释放锁
+
+        let result_path = PathBuf::from(&result);
+        let workspace_root = self
+            .workspace_root
+            .lock()
+            .expect("workspace_root lock")
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let changed_files = validation::detect_changed_files(&workspace_root);
+
+        let ctx = validation::ValidationContext {
+            subagent_id,
+            task: &task,
+            result_path: &result_path,
+            workspace_root: &workspace_root,
+            changed_files: &changed_files,
+            model: &model,
+        };
+
+        let gates = self.validation_gates.lock().expect("gates lock");
+        for gate in gates.iter() {
+            gate.validate(&ctx)?;
+        }
+        drop(gates);
+
+        // 标记 validated = true
+        let mut agents = self.subagents.lock().expect("subagents lock");
+        if let Some(a) = agents.get_mut(subagent_id) {
+            a.validated = true;
+        }
+
+        Ok(())
+    }
+
+    /// 检查成本上限 — Multi-Agent Hardening v3 P0。
+    ///
+    /// 在 retry loop 升级模型前调用。达上限返回 false,中止 retry。
+    ///
+    /// # 返回
+    /// - `true`: 可继续 retry(未达 cost_limit 或无 cost_limit)
+    /// - `false`: 已达 cost_limit,应中止 retry
+    pub fn check_cost_limit(&self, subagent_id: &str) -> bool {
+        let agents = self.subagents.lock().expect("subagents lock");
+        if let Some(agent) = agents.get(subagent_id) {
+            if let Some(limit) = agent.cost_limit {
+                return agent.cost_accumulated < limit;
+            }
+        }
+        true // 无 cost_limit 表示无限制
+    }
+
+    /// 累加成本 — Multi-Agent Hardening v3 P0。
+    ///
+    /// 每次 LLM 调用后调用,更新 `cost_accumulated`。
+    pub fn add_cost(&self, subagent_id: &str, cost_usd: f64) -> Result<(), String> {
+        let mut agents = self.subagents.lock().expect("subagents lock");
+        let agent = agents
+            .get_mut(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+        agent.cost_accumulated += cost_usd;
+        Ok(())
+    }
+
+    /// 设置子 agent 的成本上限 — Multi-Agent Hardening v3 P0。
+    ///
+    /// 由 `execute_dispatch_subagent` 在 spawn 后调用,根据 JSON 输入的
+    /// `cost_limit` 字段注入。`None` 表示无限制。
+    pub fn set_cost_limit(&self, subagent_id: &str, limit: Option<f64>) -> Result<(), String> {
+        let mut agents = self.subagents.lock().expect("subagents lock");
+        let agent = agents
+            .get_mut(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+        agent.cost_limit = limit;
+        Ok(())
+    }
+
+    /// 设置子 agent 的最大尝试次数 — Multi-Agent Hardening §4.5。
+    ///
+    /// 由 `execute_dispatch_subagent` 在 spawn 后调用,根据 JSON 输入的
+    /// 可选 `max_attempts` 字段注入,覆盖 spawn_with_model 的默认值。
+    /// 这允许调用方显式控制重试次数(如测试场景或高级用户配置)。
+    pub fn set_max_attempts(&self, subagent_id: &str, max_attempts: u32) -> Result<(), String> {
+        let mut agents = self.subagents.lock().expect("subagents lock");
+        let agent = agents
+            .get_mut(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+        agent.max_attempts = max_attempts;
+        Ok(())
+    }
+
+    /// 读取子 agent 的成本上限 — 用于 retry loop 失败消息中显示。
+    #[must_use]
+    pub fn get_cost_limit(&self, subagent_id: &str) -> Option<f64> {
+        self.subagents
+            .lock()
+            .expect("subagents lock")
+            .get(subagent_id)
+            .and_then(|a| a.cost_limit)
+    }
+
+    /// 读取子 agent 的累计成本 — 用于诊断与失败消息。
+    #[must_use]
+    pub fn get_cost_accumulated(&self, subagent_id: &str) -> f64 {
+        self.subagents
+            .lock()
+            .expect("subagents lock")
+            .get(subagent_id)
+            .map_or(0.0, |a| a.cost_accumulated)
     }
 
     /// 启动子 agent(标记为 Running)。
@@ -265,14 +721,21 @@ impl MultiAgentCoordinator {
     }
 
     /// 标记子 agent 失败。
+    ///
+    /// 接受两种起始状态:
+    /// - `Running`:turn 执行失败(LLM 错误、panic 等)
+    /// - `Completed`:turn 成功但 validation 失败(§4.4 验证门禁失败后转 Failed)
+    ///
+    /// §4.5 retry loop 路径:`Running --turn Ok--> Completed --validate fail--> Failed`
+    /// 这是合法转换,因 validate() 在 complete() 之后调用,验证失败需回退终态。
     pub fn fail(&self, subagent_id: &str, error: impl Into<String>) -> Result<(), String> {
         let mut agents = self.subagents.lock().expect("subagents lock poisoned");
         let agent = agents
             .get_mut(subagent_id)
             .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
-        if agent.status != SubagentStatus::Running {
+        if agent.status != SubagentStatus::Running && agent.status != SubagentStatus::Completed {
             return Err(format!(
-                "subagent {subagent_id} cannot fail from status {:?}",
+                "subagent {subagent_id} cannot fail from status {:?} (only Running/Completed allowed)",
                 agent.status
             ));
         }
@@ -382,7 +845,7 @@ impl MultiAgentCoordinator {
 /// - Fork/Teammate 模式:共享工作目录,主 agent 收集结果
 /// - Worktree 模式:独立 git worktree,避免文件冲突
 /// - 批量 spawn + dispatch + join 工作流
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SubagentCoordinator {
     inner: MultiAgentCoordinator,
 }
@@ -481,6 +944,65 @@ impl JoinStats {
     pub fn all_done(&self) -> bool {
         self.running == 0 && self.completed + self.failed + self.cancelled == self.total
     }
+}
+
+/// 模型升级目标 — Multi-Agent Hardening §4.2/§4.5。
+///
+/// 与 `api::providers::model_tier::UpgradeEntry` 对应,但因 `runtime`
+/// 不能依赖 `api` crate(循环依赖),本地定义。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelUpgrade {
+    /// 升级目标模型名(如 "deepseek-v4-pro")
+    pub target_model: String,
+    /// 成本倍数:升级后单次调用成本 ≈ 原成本 × cost_multiplier。
+    /// deepseek-v4-pro 相对 flash 约 10 倍(输入)+ 30 倍(输出),MVP 取 10.0。
+    pub cost_multiplier: f64,
+}
+
+/// 模型升级路径查询 — Multi-Agent Hardening §4.5 retry loop 调用。
+///
+/// MVP 范围(§10):仅覆盖 `deepseek-v4-flash → deepseek-v4-pro` 单跳升级。
+/// 完整的 `upgrade_map` 配置化在 `api::providers::model_tier`(运行时可访问),
+/// 本函数仅作为 runtime 内部的最小可用回退,避免循环依赖。
+///
+/// # 返回
+/// - `Some(ModelUpgrade)`:存在升级路径
+/// - `None`:模型已是最高层级 / 无升级路径
+///
+/// # 升级表
+/// | 当前模型 | 目标模型 | cost_multiplier |
+/// |---|---|---|
+/// | deepseek-v4-flash | deepseek-v4-pro | 10.0 |
+/// | 其他含 `flash` 后缀 | 同前缀 `-pro` 版本 | 10.0 |
+/// | deepseek-v4-pro | (无,已是旗舰) | — |
+#[must_use]
+pub fn upgrade_model_for_subagent(current_model: &str) -> Option<ModelUpgrade> {
+    let lower = current_model.to_ascii_lowercase();
+
+    // 已是旗舰:deepseek-v4-pro 不再升级
+    if lower.ends_with("-pro") || lower == "deepseek-v4-pro" {
+        return None;
+    }
+
+    // flash → pro 单跳升级(MVP 唯一覆盖路径)
+    if lower.contains("flash") {
+        // 特殊处理 deepseek-v4-flash → deepseek-v4-pro
+        if lower.contains("deepseek") {
+            return Some(ModelUpgrade {
+                target_model: "deepseek-v4-pro".to_string(),
+                cost_multiplier: 10.0,
+            });
+        }
+        // 通用 flash → pro 升级(替换 flash 为 pro)
+        let target = lower.replace("flash", "pro");
+        return Some(ModelUpgrade {
+            target_model: target,
+            cost_multiplier: 10.0,
+        });
+    }
+
+    // 其他模型:MVP 不覆盖,留待 v2 从 api crate 注入完整 upgrade_map
+    None
 }
 
 #[cfg(test)]
@@ -658,5 +1180,397 @@ mod tests {
     fn start_returns_error_for_unknown_id() {
         let coord = MultiAgentCoordinator::new();
         assert!(coord.start("nonexistent").is_err());
+    }
+
+    // ===== Multi-Agent Hardening P0 步骤 9 端到端 MVP 验证 =====
+    // 依据 docs/multi-agent-hardening-plan.md §10.4 验收标准
+
+    /// §10.4 spawn_with_model:Budget 模型拒绝 Diagnostic 任务
+    #[test]
+    fn spawn_with_model_rejects_budget_for_diagnostic() {
+        let coord = MultiAgentCoordinator::new();
+        let err = coord
+            .spawn_with_model(
+                "diag-agent",
+                "root cause analysis",
+                CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                TaskComplexity::Diagnostic,
+            )
+            .expect_err("flash should reject Diagnostic");
+        assert!(
+            err.contains("Budget tier") && err.contains("Diagnostic"),
+            "expected Budget rejection msg, got: {err}"
+        );
+    }
+
+    /// §10.4 spawn_with_model:Budget 模型拒绝 Architectural 任务
+    #[test]
+    fn spawn_with_model_rejects_budget_for_architectural() {
+        let coord = MultiAgentCoordinator::new();
+        let err = coord
+            .spawn_with_model(
+                "arch-agent",
+                "design review",
+                CoordinationMode::Fork,
+                "claude-haiku-4-5",
+                TaskComplexity::Architectural,
+            )
+            .expect_err("haiku should reject Architectural");
+        assert!(err.contains("Budget tier"));
+    }
+
+    /// §10.4 spawn_with_model:Flagship 模型接受 Diagnostic 任务,且 max_attempts 默认 2(1 次原始 + 1 次重试)
+    #[test]
+    fn spawn_with_model_accepts_flagship_for_diagnostic() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord
+            .spawn_with_model(
+                "diag-agent",
+                "root cause analysis",
+                CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                TaskComplexity::Diagnostic,
+            )
+            .expect("pro should accept Diagnostic");
+        let agent = coord.get(&id).expect("agent should exist");
+        assert_eq!(agent.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(agent.complexity, TaskComplexity::Diagnostic);
+        assert_eq!(agent.max_attempts, 2, "Diagnostic 默认 2 次尝试(1 次原始 + 1 次重试)");
+        assert_eq!(agent.attempts, 0);
+        assert!(!agent.validated);
+    }
+
+    /// §10.4 spawn_with_model:Simple 任务 + Budget 模型,max_attempts 保持默认 1
+    #[test]
+    fn spawn_with_model_simple_task_keeps_default_max_attempts() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord
+            .spawn_with_model(
+                "simple-agent",
+                "format code",
+                CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                TaskComplexity::Simple,
+            )
+            .expect("flash should accept Simple");
+        let agent = coord.get(&id).expect("agent should exist");
+        assert_eq!(agent.complexity, TaskComplexity::Simple);
+        assert_eq!(agent.max_attempts, 1);
+    }
+
+    /// §10.4 reset_for_retry:从 Failed 状态重置,attempts+1,model 升级
+    #[test]
+    fn reset_for_retry_from_failed_upgrades_model() {
+        let coord = MultiAgentCoordinator::new();
+        // 用 pro + Diagnostic 获得 max_attempts=2(允许 1 次 reset)
+        let id = coord.spawn_with_model(
+            "diag",
+            "task",
+            CoordinationMode::Fork,
+            "deepseek-v4-pro",
+            TaskComplexity::Diagnostic,
+        ).expect("spawn ok");
+        coord.start(&id).unwrap();
+        coord.fail(&id, "turn error").unwrap();
+
+        coord
+            .reset_for_retry(&id, Some("deepseek-v4-pro".to_string()))
+            .expect("reset should succeed");
+
+        let agent = coord.get(&id).expect("agent exists");
+        assert_eq!(agent.status, SubagentStatus::Created);
+        assert_eq!(agent.attempts, 1);
+        assert!(!agent.validated);
+        assert_eq!(agent.model.as_deref(), Some("deepseek-v4-pro"));
+        assert!(agent.result.is_none());
+        assert!(agent.completed_at.is_none());
+        assert!(agent.notes.iter().any(|n| n.contains("upgraded model")));
+    }
+
+    /// §10.4 reset_for_retry:从 Completed 状态(验证失败)重置
+    #[test]
+    fn reset_for_retry_from_completed_after_validation_fail() {
+        let coord = MultiAgentCoordinator::new();
+        // 用 pro + Diagnostic 获得 max_attempts=2(允许 1 次 reset)
+        let id = coord.spawn_with_model(
+            "agent",
+            "task",
+            CoordinationMode::Fork,
+            "deepseek-v4-pro",
+            TaskComplexity::Diagnostic,
+        ).expect("spawn ok");
+        coord.start(&id).unwrap();
+        coord.complete(&id, "result").unwrap();
+
+        coord
+            .reset_for_retry(&id, None)
+            .expect("reset from Completed should succeed");
+
+        let agent = coord.get(&id).expect("agent exists");
+        assert_eq!(agent.status, SubagentStatus::Created);
+        assert_eq!(agent.attempts, 1);
+        assert!(agent.result.is_none());
+    }
+
+    /// §10.4 reset_for_retry:从 Running 状态不可重置
+    #[test]
+    fn reset_for_retry_rejects_running_state() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        coord.start(&id).unwrap();
+        let err = coord
+            .reset_for_retry(&id, None)
+            .expect_err("Running should reject");
+        assert!(err.contains("cannot reset_for_retry"));
+    }
+
+    /// §10.4 reset_for_retry:达 reset 次数上限(max_attempts - 1)后不可重置
+    #[test]
+    fn reset_for_retry_rejects_when_max_attempts_reached() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn_with_model(
+            "diag",
+            "task",
+            CoordinationMode::Fork,
+            "deepseek-v4-pro",
+            TaskComplexity::Diagnostic,
+        ).expect("spawn ok");
+        // Diagnostic 默认 max_attempts=2(2 次尝试),reset 上限 = 2-1 = 1
+        coord.start(&id).unwrap();
+        coord.fail(&id, "err").unwrap();
+        // 第一次 reset:attempts 0→1,允许(1 <= max_resets=1)
+        coord.reset_for_retry(&id, None).expect("first reset ok");
+        // 第二次 reset:attempts=1 已达 max_resets=1,拒绝
+        coord.start(&id).unwrap();
+        coord.fail(&id, "err2").unwrap();
+        let err = coord
+            .reset_for_retry(&id, None)
+            .expect_err("should reject at max_attempts");
+        assert!(err.contains("max_attempts"));
+    }
+
+    /// §10.4 reset_for_retry:max_attempts=1(Simple 任务)时不允许任何 reset
+    #[test]
+    fn reset_for_retry_rejects_when_max_attempts_is_one() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("simple", "task", CoordinationMode::Fork);
+        // 默认 max_attempts=1,max_resets=0,不允许任何 reset
+        coord.start(&id).unwrap();
+        coord.fail(&id, "err").unwrap();
+        let err = coord
+            .reset_for_retry(&id, None)
+            .expect_err("max_attempts=1 should reject all resets");
+        assert!(err.contains("max_attempts"));
+        assert!(err.contains("max resets: 0"));
+    }
+
+    /// §10.4 成本门禁:check_cost_limit 无 limit 时返回 true
+    #[test]
+    fn check_cost_limit_returns_true_when_no_limit() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        assert!(coord.check_cost_limit(&id));
+    }
+
+    /// §10.4 成本门禁:check_cost_limit 在 accumulated < limit 时返回 true
+    #[test]
+    fn check_cost_limit_returns_true_when_under_limit() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        coord.set_cost_limit(&id, Some(0.50)).unwrap();
+        coord.add_cost(&id, 0.10).unwrap();
+        assert!(coord.check_cost_limit(&id), "0.10 < 0.50 应允许");
+    }
+
+    /// §10.4 场景 5:check_cost_limit 在 accumulated >= limit 时返回 false
+    #[test]
+    fn check_cost_limit_returns_false_when_limit_exceeded() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        // 场景 5:cost_limit=0.30,flash 调用 $0.001 后 accumulated=0.001,
+        // 但升级 pro 预估 $0.42,0.001+0.42 > 0.30 应拒绝
+        coord.set_cost_limit(&id, Some(0.30)).unwrap();
+        coord.add_cost(&id, 0.001).unwrap();
+        // check_cost_limit 仅检查 accumulated < limit
+        // 0.001 < 0.30 → true(实际场景 5 需升级前预估,见 conversation 端到端测试)
+        assert!(coord.check_cost_limit(&id), "0.001 < 0.30 仍允许");
+        // 累加到超限
+        coord.add_cost(&id, 0.50).unwrap();
+        assert!(!coord.check_cost_limit(&id), "0.501 > 0.30 应拒绝");
+    }
+
+    /// §10.4 成本门禁:add_cost 正确累加
+    #[test]
+    fn add_cost_accumulates_correctly() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        assert_eq!(coord.get_cost_accumulated(&id), 0.0);
+        coord.add_cost(&id, 0.001).unwrap();
+        assert_eq!(coord.get_cost_accumulated(&id), 0.001);
+        coord.add_cost(&id, 0.01).unwrap();
+        assert!((coord.get_cost_accumulated(&id) - 0.011).abs() < 1e-9);
+    }
+
+    /// §10.4 成本门禁:add_cost 对未知 id 返回 Err
+    #[test]
+    fn add_cost_errors_for_unknown_id() {
+        let coord = MultiAgentCoordinator::new();
+        assert!(coord.add_cost("nonexistent", 0.1).is_err());
+    }
+
+    /// §10.4 成本门禁:set_cost_limit + get_cost_limit 往返
+    #[test]
+    fn set_and_get_cost_limit_roundtrip() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        assert_eq!(coord.get_cost_limit(&id), None);
+        coord.set_cost_limit(&id, Some(0.42)).unwrap();
+        assert_eq!(coord.get_cost_limit(&id), Some(0.42));
+        coord.set_cost_limit(&id, None).unwrap();
+        assert_eq!(coord.get_cost_limit(&id), None);
+    }
+
+    /// §10.4 checkpoint:save_checkpoint 落盘到 {workspace_root}/.claw/checkpoints/{id}.json
+    #[test]
+    fn save_checkpoint_writes_json_file_with_required_fields() {
+        let coord = MultiAgentCoordinator::new();
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        coord.set_workspace_root(tempdir.path().to_path_buf());
+
+        let id = coord.spawn_with_model(
+            "diag-agent",
+            "root cause analysis",
+            CoordinationMode::Fork,
+            "deepseek-v4-pro",
+            TaskComplexity::Diagnostic,
+        ).expect("spawn ok");
+        coord.start(&id).unwrap();
+        coord.add_cost(&id, 0.022).unwrap();
+
+        let path = coord.save_checkpoint(&id).expect("save should succeed");
+        assert!(path.exists(), "checkpoint file should exist at {path:?}");
+        // 跨平台路径检查:Windows 用 `\`,Unix 用 `/`
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.contains("checkpoints") && path_str.contains(".claw"),
+            "checkpoint path should contain .claw/checkpoints/: {path_str}"
+        );
+
+        // 验证文件包含 §10.4 要求的字段:id/task/model/attempts/cost_accumulated
+        let content = std::fs::read_to_string(&path).expect("read checkpoint");
+        let json: serde_json::Value = serde_json::from_str(&content).expect("parse json");
+        assert_eq!(json["id"], id);
+        assert_eq!(json["task"], "root cause analysis");
+        assert_eq!(json["model"], "deepseek-v4-pro");
+        assert_eq!(json["attempts"], 0);
+        assert!((json["cost_accumulated"].as_f64().unwrap() - 0.022).abs() < 1e-9);
+
+        // checkpoint_path 字段应更新
+        let agent = coord.get(&id).expect("agent exists");
+        assert_eq!(agent.checkpoint_path.as_ref(), Some(&path));
+    }
+
+    /// §10.4 checkpoint:save_checkpoint 对未知 id 返回 Err
+    #[test]
+    fn save_checkpoint_errors_for_unknown_id() {
+        let coord = MultiAgentCoordinator::new();
+        assert!(coord.save_checkpoint("nonexistent").is_err());
+    }
+
+    /// §10.4 checkpoint:save_checkpoint 失败不影响主流程(由调用方 `let _ =` 容错)
+    #[test]
+    fn save_checkpoint_failure_is_non_fatal() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        // 故意不设置 workspace_root,使用默认 "."(可能无写权限或不存在 .claw/checkpoints)
+        // 实际场景中调用方用 `let _ = coordinator.save_checkpoint(&id)` 容错
+        let _ = coord.save_checkpoint(&id);
+        // 不 panic 即视为通过
+    }
+
+    /// §10.4 validate:无 gate 注册时,Completed 状态始终通过
+    #[test]
+    fn validate_passes_when_no_gates_registered() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        coord.start(&id).unwrap();
+        coord.complete(&id, "result").unwrap();
+        coord.validate(&id).expect("no gates = always Ok");
+        let agent = coord.get(&id).expect("agent exists");
+        assert!(agent.validated, "validated flag should be set");
+    }
+
+    /// §10.4 validate:非 Completed 状态不可验证
+    #[test]
+    fn validate_rejects_non_completed_state() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        coord.start(&id).unwrap();
+        let err = coord.validate(&id).expect_err("Running should reject");
+        assert!(!err.retryable, "状态错误不可重试");
+        assert!(err.message.contains("only Completed allowed"));
+    }
+
+    /// §10.4 validate:注册自定义 gate,验证 gate 失败时返回 retryable 错误
+    #[test]
+    fn validate_runs_registered_gate_and_returns_retryable_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailGate {
+            call_count: AtomicUsize,
+        }
+        impl ValidationGate for FailGate {
+            fn validate(&self, _ctx: &validation::ValidationContext) -> Result<(), validation::ValidationError> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(validation::ValidationError {
+                        message: "cargo build failed".into(),
+                        retryable: true,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            fn name(&self) -> &'static str {
+                "fail-gate"
+            }
+        }
+
+        let coord = MultiAgentCoordinator::new();
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        coord.set_workspace_root(tempdir.path().to_path_buf());
+        coord.add_validation_gate(Box::new(FailGate { call_count: AtomicUsize::new(0) }));
+
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        coord.start(&id).unwrap();
+        coord.complete(&id, "result").unwrap();
+        // 第一次验证:gate 返回 retryable Err
+        let err = coord.validate(&id).expect_err("first validate should fail");
+        assert!(err.retryable);
+        assert_eq!(err.message, "cargo build failed");
+        // validated 不应被标记
+        let agent = coord.get(&id).expect("agent exists");
+        assert!(!agent.validated);
+    }
+
+    /// §10.4 upgrade_model_for_subagent:flash → pro 单跳
+    #[test]
+    fn upgrade_model_for_subagent_flash_to_pro() {
+        let upgrade = upgrade_model_for_subagent("deepseek-v4-flash").expect("flash should upgrade");
+        assert_eq!(upgrade.target_model, "deepseek-v4-pro");
+        assert_eq!(upgrade.cost_multiplier, 10.0);
+    }
+
+    /// §10.4 upgrade_model_for_subagent:pro 已顶级,返回 None
+    #[test]
+    fn upgrade_model_for_subagent_pro_returns_none() {
+        assert!(upgrade_model_for_subagent("deepseek-v4-pro").is_none());
+    }
+
+    /// §10.4 upgrade_model_for_subagent:未知模型返回 None
+    #[test]
+    fn upgrade_model_for_subagent_unknown_returns_none() {
+        assert!(upgrade_model_for_subagent("unknown-model").is_none());
     }
 }

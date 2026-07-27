@@ -407,6 +407,32 @@ impl ApiClient for AnthropicRuntimeClient {
             self.consume_stream(&message_request, is_post_tool).await
         })
     }
+
+    /// Multi-Agent Hardening §4.5.3:构造一个绑定到指定模型的子 agent client。
+    ///
+    /// 用于 `execute_dispatch_subagent` retry loop 中的模型升级路径:
+    /// - `deepseek-v4-flash` 失败 → `with_model("deepseek-v4-pro")` → 重试
+    ///
+    /// 子 agent client 配置:
+    /// - `enable_tools = false`:子 agent 走单轮 LLM 请求,不调用工具
+    /// - `emit_output = false`:静默执行,不污染主 agent 的 stdout
+    /// - `allowed_tools = None`:无工具白名单
+    /// - `progress_reporter = None`:不订阅进度事件
+    /// - `status_emitter = None`:不订阅状态事件
+    /// - 复用主 agent 的 `session_id`(用于 prompt cache 隔离桶)和 `tool_registry`(共享工具定义)
+    fn with_model(&self, model: &str) -> Result<Box<dyn ApiClient>, String> {
+        let client = AnthropicRuntimeClient::new(
+            &self.session_id,
+            model.to_string(),
+            false, // enable_tools:子 agent 不调用工具
+            false, // emit_output:静默
+            None,  // allowed_tools
+            self.tool_registry.clone(),
+            None,  // progress_reporter
+        )
+        .map_err(|e| format!("failed to construct subagent client for {model}: {e}"))?;
+        Ok(Box::new(client))
+    }
 }
 
 impl AnthropicRuntimeClient {

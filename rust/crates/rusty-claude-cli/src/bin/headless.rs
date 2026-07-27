@@ -20,6 +20,10 @@ use rusty_claude_cli::{
 };
 
 fn main() {
+    // Multi-Agent Hardening §0.2 修复:headless binary 补 panic hook,
+    // 与 main_entry 共享同一实现,落盘到 ~/.claw/claw-crash.log + 同步到 diag.log。
+    runtime::diag::install_panic_hook();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut model = DEFAULT_MODEL.to_string();
     let mut permission_mode = default_permission_mode();

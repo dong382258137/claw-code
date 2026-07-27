@@ -17,6 +17,9 @@ pub mod config_validate;
 pub mod content_classifier;
 pub mod content_compression;
 mod conversation;
+// Multi-Agent Hardening §4.1:统一诊断基础设施(panic hook + DiagLog)。
+// 提取自 rusty-claude-cli/src/lib.rs main_entry 内联闭包,供 main/headless/测试入口复用。
+pub mod diag;
 pub mod decision_log;
 mod file_ops;
 pub mod g004_conformance;

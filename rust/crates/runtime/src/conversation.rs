@@ -34,7 +34,10 @@ use crate::planner::{
 // Harness M(多 agent)层接入:MultiAgentCoordinator — Step 3.2-c。
 // 主 agent 通过 dispatch_subagent tool 派发任务给子 agent。
 // 子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
-use crate::multi_agent::{CoordinationMode, MultiAgentCoordinator, SubagentStatus};
+use crate::multi_agent::{
+    upgrade_model_for_subagent, CoordinationMode, MultiAgentCoordinator, SubagentStatus,
+    TaskComplexity,
+};
 // CoordinatorExecutor + SubagentDispatcher + SubagentRunner — 用于 DAG 真实调度
 // (v0.2 TODO 2 生产接入)。with_dag_coordinator 把 CoordinatorExecutor 装到 runtime,
 // 供 tools 层 dag_run 工具取出后构造 DagScheduler。
@@ -190,6 +193,22 @@ pub struct PromptCacheEvent {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+
+    /// Construct a fresh client bound to a specific model — used by the
+    /// subagent retry loop with model upgrading (Multi-Agent Hardening §4.5).
+    ///
+    /// Default implementation returns `Err` (model swap unsupported); in that
+    /// case the retry loop falls back to reusing `self.api_client` and only
+    /// the validation/cost-limit gates take effect.
+    ///
+    /// Production implementations should construct a fresh client via
+    /// `ProviderClient::from_model(model)` and return it as a
+    /// `Box<dyn ApiClient>` so the runtime can use it polymorphically.
+    ///
+    /// Returns `Ok(boxed_client)` if the model swap succeeded.
+    fn with_model(&self, _model: &str) -> Result<Box<dyn ApiClient>, String> {
+        Err("model swap not supported by this ApiClient implementation".to_string())
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -2159,24 +2178,34 @@ where
     /// Step 3.2-c:Execute the `dispatch_subagent` tool — subagent-as-tool 路由。
     ///
     /// 主 agent 通过 tool call 派发子 agent。流程:
-    /// 1. 解析 JSON 输入(`name`/`task`/`mode`)
+    /// 1. 解析 JSON 输入(`name`/`task`/`mode`/`model`?/`complexity`?/`cost_limit`?)
     /// 2. 检查 `multi_agent_coordinator` 是否注入
-    /// 3. 调用 `coordinator.spawn()` + `coordinator.start()`
+    /// 3. 调用 `coordinator.spawn()`(或 `spawn_with_model`) + `coordinator.start()`
     /// 4. 发布 `SubagentHandoff` lane event(可观测性)
-    /// 5. 返回 subagent_id(主 agent 后续用 `check_subagent` 轮询)
+    /// 5. **Multi-Agent Hardening §4.5 retry loop**:执行 → 验证 → 失败时
+    ///    升级模型重试,达 `max_attempts` 或 `cost_limit` 中止
+    /// 6. 返回结果给主 agent
     ///
     /// **缓存保护**(§5.2):子 agent 走独立 LLM 请求 + 独立 prompt cache,
-    /// 不污染主 agent 缓存。本方法只做派发登记,不阻塞等待子 agent 完成。
+    /// 不污染主 agent 缓存。
+    ///
+    /// **JSON 输入字段**:
+    /// - `name`(必填):子 agent 名称
+    /// - `task`(必填):任务描述
+    /// - `mode`(可选,默认 `fork`):编排模式 fork/teammate/worktree
+    /// - `model`(可选):指定模型名(如 `deepseek-v4-flash`),省略则用主 agent client
+    /// - `complexity`(可选,默认 `simple`):任务复杂度 simple/diagnostic/architectural
+    /// - `cost_limit`(可选,USD):成本上限,达上限中止 retry
     fn execute_dispatch_subagent(
         &mut self,
         input: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(coordinator) = &self.multi_agent_coordinator else {
+        if self.multi_agent_coordinator.is_none() {
             return Ok(
                 "dispatch_subagent is not available: no multi-agent coordinator configured."
                     .to_string(),
             );
-        };
+        }
 
         let parsed: serde_json::Value =
             serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
@@ -2204,10 +2233,39 @@ where
             }
         };
 
-        let subagent_id = coordinator.spawn(name, task, mode);
-        coordinator
-            .start(&subagent_id)
-            .map_err(|e| format!("failed to start subagent: {e}"))?;
+        // Multi-Agent Hardening §4.2/§4.5:可选 model + complexity + cost_limit + max_attempts 字段
+        let model_str = parsed.get("model").and_then(|v| v.as_str());
+        let complexity = parse_complexity(parsed.get("complexity"));
+        let cost_limit = parsed.get("cost_limit").and_then(|v| v.as_f64());
+        let max_attempts_override = parsed
+            .get("max_attempts")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+
+        // spawn:有 model 走 spawn_with_model(能力校验),否则走原 spawn(向后兼容)
+        // 借用:此处 coordinator 是 &MultiAgentCoordinator(不可变借用 self.multi_agent_coordinator)
+        let subagent_id = {
+            let coordinator = self.multi_agent_coordinator.as_ref().expect("checked above");
+            let id = if let Some(m) = model_str {
+                coordinator
+                    .spawn_with_model(name, task, mode, m, complexity)
+                    .map_err(|e| format!("spawn_with_model failed: {e}"))?
+            } else {
+                coordinator.spawn(name, task, mode)
+            };
+            // 注入 cost_limit(如有)
+            if let Some(limit) = cost_limit {
+                let _ = coordinator.set_cost_limit(&id, Some(limit));
+            }
+            // 注入 max_attempts 覆盖(如有)— 允许调用方显式控制重试次数
+            if let Some(ma) = max_attempts_override {
+                let _ = coordinator.set_max_attempts(&id, ma);
+            }
+            coordinator
+                .start(&id)
+                .map_err(|e| format!("failed to start subagent: {e}"))?;
+            id
+        }; // coordinator 借用在此结束,后续可重新获取
 
         // 发布 SubagentHandoff lane event — 主 agent → 子 agent 任务派发记录。
         let emitted_at = std::time::SystemTime::now()
@@ -2217,60 +2275,248 @@ where
         let event = LaneEvent::subagent_handoff(emitted_at.clone(), &subagent_id, mode_str, task);
         publish_lane_event(event);
 
-        // P0-2:子智能体真实化 — 同步阻塞执行独立 LLM 请求。
-        //
-        // 论文依据:Anthropic Multi-Agent Research System
-        // - "spawn fresh subagents with clean contexts" — 完全隔离(独立 Session)
-        // - "maintaining continuity through careful handoffs" — task 作为 user message
-        // - "Subagent output to a filesystem" — 写到 .claw/subagents/{id}.md
-        // - "pass lightweight references back" — 主 agent 只收到 result_ref 路径
-        //
-        // 子智能体走单轮 LLM 请求(不循环 tool calls),结果写到文件。
-        // 主 agent 同步等待,完成后收到 result_ref,可后续读取文件内容。
-        let subagent_result = self.run_subagent_turn(&subagent_id, name, task);
-
-        // 根据执行结果标记 coordinator 状态
-        let coordinator = self
+        // 读取 max_attempts(用于 retry loop 上限)
+        let max_attempts = self
             .multi_agent_coordinator
             .as_ref()
-            .expect("coordinator checked above");
-        match &subagent_result {
-            Ok(result_ref) => {
-                let _ = coordinator.complete(&subagent_id, result_ref.as_str());
-            }
-            Err(error) => {
-                let _ = coordinator.fail(&subagent_id, error.as_str());
+            .and_then(|c| c.get(&subagent_id))
+            .map(|a| a.max_attempts)
+            .unwrap_or(1)
+            .max(1);
+        let mut current_model = model_str.map(String::from);
+        let mut final_status = "failed";
+        let mut final_result_msg = String::new();
+
+        // P0-4:Multi-Agent Hardening §4.5 retry loop
+        // 论文依据:Anthropic Multi-Agent Research System + Router-R1 + FrugalGPT
+        // - 失败时升级模型重试,达 max_attempts / cost_limit 中止
+        // - validate() 通过方为终态成功
+        // - reset_for_retry() 修复 v1 状态不可达漏洞
+        //
+        // 借用策略:循环内每次 `self.run_subagent_turn_with_model` (mut self) 后,
+        // 重新通过 `self.multi_agent_coordinator.as_ref()` 获取 coordinator 引用,
+        // 避免 mut self 与不可变 coordinator 借用冲突。
+        for attempt in 1..=max_attempts {
+            // 记录诊断:attempt + model
+            crate::diag::global().append(
+                crate::diag::DiagEntry::new(
+                    crate::diag::DiagLevel::Info,
+                    "subagent_attempt",
+                    format!(
+                        "subagent {subagent_id} attempt {attempt}/{max_attempts} with model {:?}",
+                        current_model
+                    ),
+                )
+                .with_field("subagent_id", serde_json::Value::String(subagent_id.clone()))
+                .with_field(
+                    "attempt",
+                    serde_json::Value::Number(serde_json::Number::from(attempt)),
+                )
+                .with_field(
+                    "max_attempts",
+                    serde_json::Value::Number(serde_json::Number::from(max_attempts)),
+                )
+                .with_field(
+                    "model",
+                    serde_json::Value::String(
+                        current_model.clone().unwrap_or_else(|| "<default>".to_string()),
+                    ),
+                ),
+            );
+
+            // 执行子智能体 LLM 请求(单轮,完全隔离)— mut self 借用,调用后释放
+            let subagent_result = self.run_subagent_turn_with_model(
+                &subagent_id,
+                name,
+                task,
+                current_model.as_deref(),
+            );
+
+            // 重新获取 coordinator 引用(multi_agent_coordinator 不可变借用)
+            let coordinator = self
+                .multi_agent_coordinator
+                .as_ref()
+                .expect("coordinator checked above");
+
+            // MVP 成本累计:名义值 $0.001/次,旗舰模型(pro)×10
+            // 完整成本计算需 token 用量,v2 由 run_subagent_turn_with_model 回传
+            let nominal_cost = if current_model
+                .as_deref()
+                .map(|m| m.contains("pro"))
+                .unwrap_or(false)
+            {
+                0.01
+            } else {
+                0.001
+            };
+            let _ = coordinator.add_cost(&subagent_id, nominal_cost);
+
+            // v3 P1 checkpoint:每轮 turn 后保存(借鉴 LangGraph durable execution)
+            let _ = coordinator.save_checkpoint(&subagent_id);
+
+            match subagent_result {
+                Ok(result_ref) => {
+                    // turn 成功 → complete() → validate()
+                    let _ = coordinator.complete(&subagent_id, &result_ref);
+
+                    match coordinator.validate(&subagent_id) {
+                        Ok(()) => {
+                            // 验证通过 → 终态成功
+                            final_status = "completed";
+                            final_result_msg = format!(
+                                "Subagent `{subagent_id}` completed (attempt {attempt}/{max_attempts}). \
+                                 Result written to: {result_ref}\n\
+                                 Use Read tool to inspect the result. \
+                                 The subagent ran with an isolated context — it did not pollute your context window."
+                            );
+                            break;
+                        }
+                        Err(ve) if ve.retryable && attempt < max_attempts => {
+                            // 验证失败(可重试)— 升级模型 + reset_for_retry
+                            crate::diag::global().append(
+                                crate::diag::DiagEntry::new(
+                                    crate::diag::DiagLevel::Warn,
+                                    "subagent_validation_failed",
+                                    format!(
+                                        "subagent {subagent_id} validation failed (attempt {attempt}): {}",
+                                        ve.message
+                                    ),
+                                )
+                                .with_field("subagent_id", serde_json::Value::String(subagent_id.clone()))
+                                .with_field("retryable", serde_json::Value::Bool(true)),
+                            );
+
+                            // 成本门禁:升级前检查
+                            if !coordinator.check_cost_limit(&subagent_id) {
+                                let cost_acc = coordinator.get_cost_accumulated(&subagent_id);
+                                let cost_lim = coordinator.get_cost_limit(&subagent_id).unwrap_or(0.0);
+                                let msg = format!(
+                                    "Subagent `{subagent_id}` failed: cost limit ${cost_lim:.4} exceeded (accumulated ${cost_acc:.4}); validation error: {}",
+                                    ve.message
+                                );
+                                let _ = coordinator.fail(&subagent_id, &msg);
+                                final_status = "failed";
+                                final_result_msg = msg;
+                                break;
+                            }
+
+                            // 升级模型
+                            let upgraded = current_model
+                                .as_deref()
+                                .and_then(upgrade_model_for_subagent);
+                            match upgraded {
+                                Some(upgrade) => {
+                                    let _ = coordinator.reset_for_retry(
+                                        &subagent_id,
+                                        Some(upgrade.target_model.clone()),
+                                    );
+                                    let _ = coordinator.start(&subagent_id);
+                                    current_model = Some(upgrade.target_model);
+                                    // continue 下一轮 retry
+                                }
+                                None => {
+                                    // 已是旗舰,无法升级 — 立即失败
+                                    let msg = format!(
+                                        "Subagent `{subagent_id}` failed: model at flagship but validation still fails (attempt {attempt}): {}",
+                                        ve.message
+                                    );
+                                    let _ = coordinator.fail(&subagent_id, &msg);
+                                    final_status = "failed";
+                                    final_result_msg = msg;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(ve) => {
+                            // 不可重试 或 达 max_attempts
+                            let msg = format!(
+                                "Subagent `{subagent_id}` failed validation after {attempt} attempts: {}",
+                                ve.message
+                            );
+                            let _ = coordinator.fail(&subagent_id, &msg);
+                            final_status = "failed";
+                            final_result_msg = msg;
+                            break;
+                        }
+                    }
+                }
+                Err(e) if attempt < max_attempts => {
+                    // turn 失败(可重试)— 升级模型 + reset_for_retry
+                    let _ = coordinator.fail(&subagent_id, &e);
+
+                    crate::diag::global().append(
+                        crate::diag::DiagEntry::new(
+                            crate::diag::DiagLevel::Warn,
+                            "subagent_turn_failed",
+                            format!(
+                                "subagent {subagent_id} turn failed (attempt {attempt}): {e}, retrying with upgraded model"
+                            ),
+                        )
+                        .with_field("subagent_id", serde_json::Value::String(subagent_id.clone())),
+                    );
+
+                    // 成本门禁
+                    if !coordinator.check_cost_limit(&subagent_id) {
+                        let cost_acc = coordinator.get_cost_accumulated(&subagent_id);
+                        let cost_lim = coordinator.get_cost_limit(&subagent_id).unwrap_or(0.0);
+                        let msg = format!(
+                            "Subagent `{subagent_id}` failed: cost limit ${cost_lim:.4} exceeded (accumulated ${cost_acc:.4}); turn error: {e}"
+                        );
+                        final_status = "failed";
+                        final_result_msg = msg;
+                        break;
+                    }
+
+                    let upgraded = current_model
+                        .as_deref()
+                        .and_then(upgrade_model_for_subagent);
+                    match upgraded {
+                        Some(upgrade) => {
+                            let _ = coordinator.reset_for_retry(
+                                &subagent_id,
+                                Some(upgrade.target_model.clone()),
+                            );
+                            let _ = coordinator.start(&subagent_id);
+                            current_model = Some(upgrade.target_model);
+                            // continue 下一轮 retry
+                        }
+                        None => {
+                            // 无升级路径 — 立即失败
+                            let msg = format!(
+                                "Subagent `{subagent_id}` failed after {attempt} attempts (no model upgrade path): {e}"
+                            );
+                            final_status = "failed";
+                            final_result_msg = msg;
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // 达 max_attempts — 终态失败
+                    let _ = coordinator.fail(&subagent_id, &e);
+                    final_status = "failed";
+                    final_result_msg = format!(
+                        "Subagent `{subagent_id}` failed after {max_attempts} attempts: {e}\n\
+                         You may retry with a different task description or approach the task directly."
+                    );
+                    break;
+                }
             }
         }
 
-        // G9.1: SubagentStop lifecycle hook — 子 agent 进入终态(completed/failed)
-        // 时触发,让外部观察者(子 agent 审计、telemetry、清理逻辑等)感知停止。
-        // 返回值不影响主流程,故意丢弃。
+        // G9.1: SubagentStop lifecycle hook — 子 agent 进入终态时触发
         let _ = self.hook_runner.run_subagent_stop(&subagent_id);
 
         // 发布终态 SubagentResult lane event
-        let terminal_status = if subagent_result.is_ok() {
-            "completed"
-        } else {
-            "failed"
-        };
-        let terminal_result = subagent_result.as_deref().unwrap_or_else(|e| e.as_str());
-        let event =
-            LaneEvent::subagent_result(emitted_at, &subagent_id, terminal_status, terminal_result);
+        let event = LaneEvent::subagent_result(
+            emitted_at,
+            &subagent_id,
+            final_status,
+            &final_result_msg,
+        );
         publish_lane_event(event);
 
-        // 返回给主 agent:成功返回 result_ref 路径,失败返回错误
-        match subagent_result {
-            Ok(result_ref) => Ok(format!(
-                "Subagent `{subagent_id}` completed. Result written to: {result_ref}\n\
-                 Use Read tool to inspect the result. \
-                 The subagent ran with an isolated context — it did not pollute your context window."
-            )),
-            Err(error) => Ok(format!(
-                "Subagent `{subagent_id}` failed: {error}\n\
-                 You may retry with a different task description or approach the task directly."
-            )),
-        }
+        Ok(final_result_msg)
     }
 
     /// P0-2:执行子智能体的独立 LLM 请求(单轮,完全隔离)。
@@ -2280,22 +2526,98 @@ where
     /// - 独立 system_prompt(子智能体专用,不包含主 agent 的上下文)
     /// - 独立 prompt cache(不污染主 agent 缓存)
     ///
-    /// 执行流程:
-    /// 1. 构造子智能体 system_prompt + task 作为 user message
-    /// 2. 调用 api_client.stream(复用主 agent 的 client,但请求隔离)
-    /// 3. 解析 assistant response,提取 text 内容
-    /// 4. 写到 `.claw/subagents/{id}.md`
-    /// 5. 返回 result_ref 路径
+    /// **注意**:本方法是 [`run_subagent_turn_with_model`] 的便利包装,
+    /// 等价于 `run_subagent_turn_with_model(id, name, task, None)`。
+    /// 新代码应直接调用 `run_subagent_turn_with_model`。
+    /// 保留本方法以兼容现有文档引用和未来外部调用。
     fn run_subagent_turn(
         &mut self,
         subagent_id: &str,
         name: &str,
         task: &str,
     ) -> Result<String, String> {
+        self.run_subagent_turn_with_model(subagent_id, name, task, None)
+    }
+
+    /// Multi-Agent Hardening §4.5.3:带模型选择的 subagent turn 执行。
+    ///
+    /// - `model = None`:复用主 agent client(同 [`run_subagent_turn`])
+    /// - `model = Some(m)`:通过 [`ApiClient::with_model`] 构造独立 client
+    ///
+    /// 若 `with_model` 返回 `Err`(默认实现或生产实现构造失败),
+    /// 记录诊断日志并回退到主 agent client — 保证 retry loop 不因
+    /// client 构造失败而中止,降级为"同模型重试"。
+    fn run_subagent_turn_with_model(
+        &mut self,
+        subagent_id: &str,
+        name: &str,
+        task: &str,
+        model: Option<&str>,
+    ) -> Result<String, String> {
         let workspace_root = self.workspace_root.as_ref().ok_or_else(|| {
             "workspace_root not configured — subagent requires filesystem access for result persistence".to_string()
         })?;
 
+        // model 为 None:走原 run_subagent_turn 路径(复用主 agent client)
+        let model = match model {
+            None | Some("") => {
+                return Self::execute_subagent_llm(
+                    workspace_root,
+                    &mut self.api_client,
+                    subagent_id,
+                    name,
+                    task,
+                );
+            }
+            Some(m) => m,
+        };
+
+        // 构造独立 client — Multi-Agent Hardening §4.5.3
+        match self.api_client.with_model(model) {
+            Ok(mut sub_client) => Self::execute_subagent_llm(
+                workspace_root,
+                &mut *sub_client,
+                subagent_id,
+                name,
+                task,
+            ),
+            Err(e) => {
+                // 降级:client 构造失败时回退到主 agent client(同模型重试)
+                // 记录诊断日志,便于排查环境配置问题
+                crate::diag::global().append(
+                    crate::diag::DiagEntry::new(
+                        crate::diag::DiagLevel::Warn,
+                        "subagent_model_swap",
+                        format!(
+                            "model swap failed for {model}: {e}; falling back to main client (same-model retry)"
+                        ),
+                    )
+                    .with_field("subagent_id", serde_json::Value::String(subagent_id.into()))
+                    .with_field("target_model", serde_json::Value::String(model.into())),
+                );
+                Self::execute_subagent_llm(
+                    workspace_root,
+                    &mut self.api_client,
+                    subagent_id,
+                    name,
+                    task,
+                )
+            }
+        }
+    }
+
+    /// 子智能体 LLM 调用的核心逻辑(无 `self` 借用,避免与 `api_client` 冲突)。
+    ///
+    /// 抽出为自由函数,以便 [`run_subagent_turn`] 和
+    /// [`run_subagent_turn_with_model`] 复用 — 前者传入 `&mut self.api_client`,
+    /// 后者传入 `&mut *boxed_client`(由 `with_model` 构造的独立 client)。
+    fn execute_subagent_llm(
+        workspace_root: &std::path::Path,
+        client: &mut dyn ApiClient,
+        subagent_id: &str,
+        name: &str,
+        task: &str,
+    ) -> Result<String, String> {
         // 构造子智能体 system_prompt — 完全隔离,不包含主 agent 上下文
         let subagent_system_prompt = SystemPromptSplit::from_sections(vec![format!(
             "# Subagent: {name} ({subagent_id})\n\
@@ -2333,9 +2655,8 @@ where
             messages: vec![user_message],
         };
 
-        // 同步阻塞调用 LLM — 复用主 agent 的 api_client(无状态,请求隔离)
-        let events = self
-            .api_client
+        // 同步阻塞调用 LLM — client 由调用方决定(主 client 或 with_model 构造的独立 client)
+        let events = client
             .stream(request)
             .map_err(|e| format!("subagent LLM request failed: {e}"))?;
 
@@ -3190,6 +3511,23 @@ fn parse_auto_compaction_threshold_opt(value: Option<&str>) -> Option<u32> {
     value
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
+}
+
+/// Multi-Agent Hardening §4.2:从 JSON 值解析任务复杂度。
+///
+/// 接受字符串("simple"/"diagnostic"/"architectural",大小写不敏感)。
+/// 缺失或无法识别时返回 `Simple`(向后兼容,与 Subagent 默认值一致)。
+fn parse_complexity(value: Option<&serde_json::Value>) -> TaskComplexity {
+    let s = value
+        .and_then(|v| v.as_str())
+        .unwrap_or("simple")
+        .to_ascii_lowercase();
+    match s.as_str() {
+        "diagnostic" => TaskComplexity::Diagnostic,
+        "architectural" | "architecture" => TaskComplexity::Architectural,
+        // simple / unknown / 缺失 — 均回退到 Simple
+        _ => TaskComplexity::Simple,
+    }
 }
 
 pub(crate) fn build_assistant_message(
@@ -6130,5 +6468,453 @@ mod tests {
             output.contains("call_old_1"),
             "recall_full should include tool_use_id: {output}"
         );
+    }
+
+    // ===== Multi-Agent Hardening P0 步骤 9:端到端 MVP 验证 =====
+    // 依据 docs/multi-agent-hardening-plan.md §10.4 验收标准
+    // 场景 1-5 全覆盖:
+    //   场景 1:简单任务 → flash → 一次成功
+    //   场景 2:诊断任务 → pro → 一次成功
+    //   场景 3:flash 失败 → 升级 pro → 重试成功
+    //   场景 4:flash 失败 → 升级 pro → 仍失败 → 达 max_attempts fail
+    //   场景 5:成本超限 → 拒绝升级 → fail(不浪费 pro 调用)
+
+    /// 可控的 mock ValidationGate — 通过 AtomicUsize 控制第 N 次返回 Ok/Err。
+    /// 用于场景 3-5 端到端 retry loop 测试。
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    struct ScriptedGate {
+        call_count: AtomicUsize,
+        /// 每次调用的返回结果序列:Some(true)=Ok, Some(false)=retryable Err, None=fatal Err
+        script: Vec<Option<bool>>,
+    }
+
+    impl ScriptedGate {
+        fn new(script: Vec<Option<bool>>) -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                script,
+            }
+        }
+    }
+
+    impl crate::multi_agent::ValidationGate for ScriptedGate {
+        fn validate(
+            &self,
+            _ctx: &crate::multi_agent::validation::ValidationContext,
+        ) -> Result<(), crate::multi_agent::validation::ValidationError> {
+            let n = self.call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            match self.script.get(n) {
+                Some(Some(true)) => Ok(()),
+                Some(Some(false)) => Err(crate::multi_agent::validation::ValidationError {
+                    message: format!("scripted retryable failure at call #{n}"),
+                    retryable: true,
+                }),
+                Some(None) => Err(crate::multi_agent::validation::ValidationError {
+                    message: format!("scripted fatal failure at call #{n}"),
+                    retryable: false,
+                }),
+                None => Ok(()), // 脚本耗尽,默认 Ok
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "scripted-gate"
+        }
+    }
+
+    /// 场景 1:简单任务路由到 flash,一次成功(§10.4 端到端流程 P0)
+    /// 验收:简单任务 → flash → run → validate 通过 → completed
+    #[test]
+    fn dispatch_subagent_scenario1_simple_task_flash_succeeds() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+        let unique_task = "scenario1-simple-flash-uuid-p0-9-s1";
+
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        // 无 validation gate → validate 默认通过(coordinator.validate 在无 gate 时返回 Ok)
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        let input = serde_json::json!({
+            "name": "fmt-agent",
+            "task": unique_task,
+            "mode": "fork",
+            "model": "deepseek-v4-flash",
+            "complexity": "simple",
+            "max_attempts": 1
+        })
+        .to_string();
+
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("scenario 1 should succeed");
+
+        assert!(
+            output.contains("Subagent `") && output.contains("completed"),
+            "scenario 1 should complete on first attempt: {output}"
+        );
+
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let agent = coordinator.get(subagent_id).expect("agent exists");
+        // 关键不变量:模型未升级(仍是 flash),attempts=0(无重试)
+        assert_eq!(
+            agent.model.as_deref(),
+            Some("deepseek-v4-flash"),
+            "scenario 1: model should remain flash (no upgrade needed)"
+        );
+        assert_eq!(agent.attempts, 0, "scenario 1: no retry should happen");
+        assert!(agent.validated, "scenario 1: should be validated");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Completed,
+            "scenario 1: should be Completed"
+        );
+    }
+
+    /// 场景 2:诊断任务路由到 pro,一次成功(§10.4 端到端流程 P0)
+    /// 验收:诊断任务 → pro → run → validate 通过 → completed
+    #[test]
+    fn dispatch_subagent_scenario2_diagnostic_task_pro_succeeds() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+        let unique_task = "scenario2-diagnostic-pro-uuid-p0-9-s2";
+
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        let input = serde_json::json!({
+            "name": "diag-agent",
+            "task": unique_task,
+            "mode": "fork",
+            "model": "deepseek-v4-pro",
+            "complexity": "diagnostic",
+            "max_attempts": 2
+        })
+        .to_string();
+
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("scenario 2 should succeed");
+
+        assert!(
+            output.contains("Subagent `") && output.contains("completed"),
+            "scenario 2 should complete on first attempt: {output}"
+        );
+
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let agent = coordinator.get(subagent_id).expect("agent exists");
+        // 关键不变量:模型保持 pro(旗舰,无需升级),attempts=0(一次成功)
+        assert_eq!(
+            agent.model.as_deref(),
+            Some("deepseek-v4-pro"),
+            "scenario 2: model should remain pro (flagship, no upgrade)"
+        );
+        assert_eq!(agent.attempts, 0, "scenario 2: no retry should happen");
+        assert!(agent.validated, "scenario 2: should be validated");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Completed,
+            "scenario 2: should be Completed"
+        );
+        // 诊断任务默认 max_attempts=2(spawn_with_model 中设置),但本测试一次通过
+        assert_eq!(
+            agent.max_attempts, 2,
+            "scenario 2: diagnostic task should default to max_attempts=2"
+        );
+    }
+
+    /// 场景 3:flash + Simple + max_attempts=2,validate 第一次失败 → 升级 pro → 第二次成功
+    #[test]
+    fn dispatch_subagent_scenario3_upgrade_retry_succeeds() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+        let unique_task = "scenario3-upgrade-retry-uuid-p0-9-s3";
+
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        // gate 脚本:第一次 Err(retryable),第二次 Ok
+        coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
+            Some(false), // attempt 1 validate: retryable Err
+            Some(true),  // attempt 2 validate: Ok
+        ])));
+
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        let input = serde_json::json!({
+            "name": "diag-agent",
+            "task": unique_task,
+            "mode": "fork",
+            "model": "deepseek-v4-flash",
+            "complexity": "simple",
+            "max_attempts": 2
+        })
+        .to_string();
+
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("dispatch should succeed");
+
+        // 场景 3:升级后第二次 validate 通过 → completed
+        assert!(
+            output.contains("Subagent `") && output.contains("completed"),
+            "scenario 3 should complete after upgrade: {output}"
+        );
+
+        // 验证 subagent 最终模型升级为 pro
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let agent = coordinator.get(subagent_id).expect("agent exists");
+        assert_eq!(
+            agent.model.as_deref(),
+            Some("deepseek-v4-pro"),
+            "model should be upgraded to pro after retry"
+        );
+        assert_eq!(agent.attempts, 1, "should have 1 reset (attempt 2)");
+        assert!(agent.validated, "should be validated");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Completed
+        );
+    }
+
+    /// 场景 4:flash + Simple + max_attempts=2,validate 两次都失败 → 达上限 fail
+    #[test]
+    fn dispatch_subagent_scenario4_upgrade_still_fails() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+        let unique_task = "scenario4-still-fails-uuid-p0-9-s4";
+
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        // gate 脚本:总是 retryable Err
+        coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
+            Some(false), // attempt 1: retryable Err
+            Some(false), // attempt 2: retryable Err
+        ])));
+
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        let input = serde_json::json!({
+            "name": "diag-agent",
+            "task": unique_task,
+            "mode": "fork",
+            "model": "deepseek-v4-flash",
+            "complexity": "simple",
+            "max_attempts": 2
+        })
+        .to_string();
+
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("dispatch should not propagate as hard error");
+
+        // 场景 4:达 max_attempts 后 fail
+        assert!(
+            output.contains("Subagent `") && output.contains("failed"),
+            "scenario 4 should fail after max_attempts: {output}"
+        );
+
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let agent = coordinator.get(subagent_id).expect("agent exists");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Failed,
+            "should be Failed after exhausting attempts"
+        );
+        assert!(!agent.validated, "should not be validated");
+        // 模型应已升级到 pro(attempt 1 失败后升级)
+        assert_eq!(
+            agent.model.as_deref(),
+            Some("deepseek-v4-pro"),
+            "model should be upgraded to pro"
+        );
+    }
+
+    /// 场景 5:flash + Simple + max_attempts=2 + cost_limit=0.0005,
+    /// attempt 1 后 accumulated($0.001) > cost_limit($0.0005) → 成本门禁拒绝升级 → fail
+    #[test]
+    fn dispatch_subagent_scenario5_cost_limit_blocks_upgrade() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+        let unique_task = "scenario5-cost-limit-uuid-p0-9-s5";
+
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        // gate 脚本:第一次 retryable Err(触发升级检查)
+        coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
+            Some(false), // attempt 1: retryable Err → 触发升级 + 成本门禁
+        ])));
+
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        // cost_limit=0.0005:flash 调用 $0.001 后 accumulated=0.001 > 0.0005 → 拒绝升级
+        let input = serde_json::json!({
+            "name": "diag-agent",
+            "task": unique_task,
+            "mode": "fork",
+            "model": "deepseek-v4-flash",
+            "complexity": "simple",
+            "max_attempts": 2,
+            "cost_limit": 0.0005
+        })
+        .to_string();
+
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("dispatch should not propagate as hard error");
+
+        // 场景 5:成本超限 → fail(不浪费 pro 调用)
+        assert!(
+            output.contains("Subagent `") && output.contains("failed"),
+            "scenario 5 should fail due to cost limit: {output}"
+        );
+        assert!(
+            output.contains("cost limit"),
+            "should mention cost limit in failure msg: {output}"
+        );
+
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let agent = coordinator.get(subagent_id).expect("agent exists");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Failed,
+            "should be Failed due to cost limit"
+        );
+        // 关键不变量:模型未升级(仍是 flash),因为没有调用 pro
+        assert_eq!(
+            agent.model.as_deref(),
+            Some("deepseek-v4-flash"),
+            "model should NOT be upgraded — cost gate blocked pro call"
+        );
+        // 累计成本应只有 flash 的 $0.001(名义值)
+        assert!(
+            (agent.cost_accumulated - 0.001).abs() < 1e-9,
+            "cost_accumulated should be 0.001 (flash only), got: {}",
+            agent.cost_accumulated
+        );
+    }
+
+    /// 场景 5 补充:cost_limit 足够大时,升级不被阻止(对比测试)
+    #[test]
+    fn dispatch_subagent_scenario5_high_cost_limit_allows_upgrade() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+        let unique_task = "scenario5-high-limit-uuid-p0-9-s5b";
+
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
+            Some(false), // attempt 1: retryable Err → 触发升级
+            Some(true),  // attempt 2: Ok
+        ])));
+
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        // cost_limit=10.0:足够大,不阻止升级
+        let input = serde_json::json!({
+            "name": "diag-agent",
+            "task": unique_task,
+            "mode": "fork",
+            "model": "deepseek-v4-flash",
+            "complexity": "simple",
+            "max_attempts": 2,
+            "cost_limit": 10.0
+        })
+        .to_string();
+
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("dispatch should succeed");
+
+        // 高成本上限:升级成功 → completed
+        assert!(
+            output.contains("completed"),
+            "high cost_limit should allow upgrade and complete: {output}"
+        );
+
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let agent = coordinator.get(subagent_id).expect("agent exists");
+        assert_eq!(
+            agent.model.as_deref(),
+            Some("deepseek-v4-pro"),
+            "model should be upgraded to pro with high cost_limit"
+        );
+    }
+
+    /// §10.4 端到端:max_attempts=1 时不重试,第一次 validate 失败直接 fail
+    #[test]
+    fn dispatch_subagent_no_retry_when_max_attempts_is_one() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+        let unique_task = "no-retry-max-1-uuid-p0-9";
+
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
+            Some(false), // attempt 1: retryable Err
+        ])));
+
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        let input = serde_json::json!({
+            "name": "agent",
+            "task": unique_task,
+            "mode": "fork",
+            "model": "deepseek-v4-flash",
+            "complexity": "simple",
+            "max_attempts": 1
+        })
+        .to_string();
+
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("dispatch should not propagate as hard error");
+
+        // max_attempts=1:不重试,直接 fail
+        assert!(
+            output.contains("failed"),
+            "max_attempts=1 should fail without retry: {output}"
+        );
+
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let agent = coordinator.get(subagent_id).expect("agent exists");
+        assert_eq!(agent.model.as_deref(), Some("deepseek-v4-flash"), "model should not change");
+        assert_eq!(agent.attempts, 0, "no reset should happen");
     }
 }

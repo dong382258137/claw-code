@@ -1203,41 +1203,11 @@ pub struct PluginsCommandPayload {
 /// `src/main.rs`（claw-plus bin）和 `src/bin/claw.rs`（claw bin）都调用此函数，
 /// 避免入口逻辑重复。
 pub fn main_entry() {
-    // 诊断：注册 panic hook，落盘到 ~/.claw/claw-crash.log
-    // 双击运行时 stderr 不可见，panic hook 是唯一能确认"是否 panic"的可靠信号。
-    std::panic::set_hook(Box::new(|info| {
-        let payload = info.payload();
-        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<non-string panic>".to_string()
-        };
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let claw_dir = home.join(".claw");
-        let _ = std::fs::create_dir_all(&claw_dir);
-        let crash_path = claw_dir.join("claw-crash.log");
-        let _ = std::fs::write(
-            &crash_path,
-            format!(
-                "PANIC at {location}\nMessage: {msg}\nTimestamp: {}\n",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0)
-            ),
-        );
-        eprintln!("thread panicked at {location}: {msg}");
-        eprintln!("Crash log: {}", crash_path.display());
-    }));
+    // 诊断：注册 panic hook,落盘到 ~/.claw/claw-crash.log
+    // 双击运行时 stderr 不可见,panic hook 是唯一能确认"是否 panic"的可靠信号。
+    // Multi-Agent Hardening §0.1 v2 修正:提取内联闭包到 runtime::diag 模块,
+    // 供 main_entry/headless/测试入口复用,避免 hook 注册逻辑重复。
+    runtime::diag::install_panic_hook();
 
     if let Err(error) = run() {
         let message = error.to_string();
