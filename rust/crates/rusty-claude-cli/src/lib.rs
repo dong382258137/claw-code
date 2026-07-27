@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod format;
 pub mod init;
 pub mod input;
+pub mod llm_clients;
 pub mod locale;
 pub mod paste;
 pub mod plugin_state;

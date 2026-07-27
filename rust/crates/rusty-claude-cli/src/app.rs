@@ -2833,6 +2833,36 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 详见 plan.md §9.2 Epic 3。
     let coordinator = runtime::MultiAgentCoordinator::new();
 
+    // v2 Phase 2 Epic 4:启动恢复 — 扫描 .claw/checkpoints/*.json,
+    // 把崩溃前未完成的 subagent 状态恢复到 registry,让 retry loop 接管。
+    //
+    // 语义边界:只恢复 subagent 注册表 + 元状态,不恢复 LLM 对话历史
+    // (与 LangGraph/Temporal durable execution 一致)。
+    // Running 状态会自动降级为 Created,允许重新 start() 调度。
+    //
+    // 失败处理:单个 checkpoint 恢复失败只 log,不中止整个启动
+    // (避免一个损坏文件阻塞整个 CLI)。
+    if let Ok(cwd) = env::current_dir() {
+        let ckpt_dir = cwd.join(".claw").join("checkpoints");
+        if let Ok(entries) = std::fs::read_dir(&ckpt_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    match coordinator.restore_from_checkpoint(&path) {
+                        Ok(id) => eprintln!(
+                            "[restore] subagent {id} restored from {}",
+                            path.display()
+                        ),
+                        Err(e) => eprintln!(
+                            "[restore] failed to restore {}: {e}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     // v2 §10.5 多 ValidationGate:注册 rust/npm/pytest gate。
     // 设计要点:
     // - gate 用 file_filter 正则隔离,Rust 子 agent 改 .rs 只触发 cargo-build,
@@ -2856,6 +2886,34 @@ pub(crate) fn build_runtime_with_plugin_state(
                 runtime::multi_agent::validation::pytest_gate(workspace_root.clone()),
             ));
         }
+
+        // v2 Phase 2 Epic 5:注册 LlmJudgeGate(诊断/架构任务的 LLM-as-judge 评分)。
+        //
+        // 设计要点:
+        // - judge 模型用 subagent 同款模型(避免引入新配置项;用户可通过 --model 切换)
+        // - max_tokens=1024(judge 只输出 0.0-1.0 分数 + 简短说明,1024 足够)
+        // - 构造失败(无 API key / 模型名无效)时跳过注册,不阻断启动
+        //   (降级为 MVP 行为:只有命令 gate,无 LLM judge)
+        // - 注入后,LlmJudgeGate::validate 会在命令 gate 之后执行,
+        //   对诊断/架构任务做四维评分(根因定位/方案可行性/完整性/副作用)
+        match crate::llm_clients::AnthropicJudgeClient::new(&model_for_subagent, Some(1024)) {
+            Ok(judge_client) => {
+                let judge: std::sync::Arc<dyn runtime::multi_agent::validation::JudgeClient> =
+                    std::sync::Arc::new(judge_client);
+                coordinator.add_validation_gate(Box::new(
+                    runtime::multi_agent::validation::LlmJudgeGate::diagnostic_default(
+                        &model_for_subagent,
+                        workspace_root.clone(),
+                    )
+                    .with_client(judge),
+                ));
+            }
+            Err(e) => {
+                eprintln!(
+                    "[startup] LlmJudgeGate skipped (judge client construction failed): {e}"
+                );
+            }
+        }
     }
 
     let task_registry = runtime::task_registry::TaskRegistry::new()
@@ -2866,6 +2924,36 @@ pub(crate) fn build_runtime_with_plugin_state(
     runtime = runtime
         .with_multi_agent_coordinator(coordinator)
         .with_task_registry(task_registry);
+
+    // v2 Phase 2 Epic 6:注入全局 DecisionExtractorClient。
+    //
+    // 注入后,context compaction 触发时 `extract_decisions_before_compaction` 的
+    // `LlmExtract` 分支会真正调用 LLM 提取结构化决策点
+    // (context/decision/rationale/alternatives),而非降级为 Heuristic。
+    //
+    // 设计要点:
+    // - 用 subagent 同款模型(避免引入新配置项)
+    // - max_tokens=2048(决策提取需输出 JSON 数组,2048 容纳多决策点)
+    // - OnceLock 进程级单例,只能注册一次(重复调用静默忽略)
+    // - 构造失败(无 API key / 模型名无效)时跳过,不阻断启动
+    //   (降级为 Heuristic,保证不丢决策)
+    // - 用 budget 模型降低成本(提取任务对推理能力要求低于 judge)
+    match crate::llm_clients::AnthropicDecisionExtractorClient::new(
+        &model_for_subagent,
+        Some(2048),
+    ) {
+        Ok(extractor) => {
+            let extractor_client: std::sync::Arc<
+                dyn runtime::decision_log::DecisionExtractorClient,
+            > = std::sync::Arc::new(extractor);
+            runtime::decision_log::set_global_decision_extractor_client(extractor_client);
+        }
+        Err(e) => {
+            eprintln!(
+                "[startup] DecisionExtractorClient skipped (construction failed): {e}"
+            );
+        }
+    }
 
     // v0.2 生产接入:构造 CoordinatorExecutor 并装入 runtime,让 DAG 调度能真正
     // 执行子 agent turn(替代 v0.1 stub 路径)。

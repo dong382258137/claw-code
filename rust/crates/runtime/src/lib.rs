@@ -152,7 +152,8 @@ pub use context_assembler::{
     AssembledPrompt, CacheStrategy, ContextAssembler, ContextBlock, ContextSource, TokenBudget,
 };
 pub use decision_log::{
-    compute_simhash, hamming_distance, DecisionLog, DecisionLogError, DecisionVerification,
+    compute_simhash, hamming_distance, DecisionExtractorClient, DecisionLog, DecisionLogError,
+    DecisionVerification, set_global_decision_extractor_client,
 };
 pub use vcs_snapshot::{RefactorTransaction, TransactionStatus, VcsError};
 

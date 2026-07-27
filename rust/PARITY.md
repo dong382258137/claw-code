@@ -229,6 +229,13 @@ Harness note: current coverage now includes write-file denial, bash escalation a
 - [x] **v2 Phase 2 Epic 4:checkpoint restore**(2026-07-27)— 实现 `restore_from_checkpoint`,读取 JSON → 反序列化 Subagent → Running 降级为 Created → 插入 registry。5 个测试(roundtrip/Running 降级/文件不存在/损坏 JSON/id 冲突)全通过
 - [x] **v2 Phase 2 Epic 5:LlmJudgeGate 实现**(2026-07-27)— 引入 `JudgeClient` trait 依赖倒置(runtime 不依赖 api crate),实现 `parse_score`(正则提取 0.0-1.0 浮点数/整数回退)+ `build_judge_prompt` + `validate`(client 调用/分数解析/阈值比较)。无 client 时降级为 stub。9 个新测试全通过
 - [x] **v2 Phase 2 Epic 6:决策持久化 LlmExtract**(2026-07-27)— 引入 `DecisionExtractorClient` trait + 全局 OnceLock 注册。实现 `extract_decisions_with_llm` + `build_llm_extract_prompt` + `parse_llm_decision_json`(剥离 markdown 代码块 + JSON 数组解析 + 字段缺失容错 + 截断)。三重降级策略(API 失败/JSON 解析失败/空数组 → Heuristic)。15 个新测试全通过
+- [x] **v2 Phase 2 生产接入**(2026-07-27)— 三项缺口全部接入 rusty-claude-cli 主入口 `app.rs::build_runtime`:
+  - 缺口 1(restore_from_checkpoint):`app.rs` 启动时扫描 `.claw/checkpoints/*.json`,逐个调用 `coordinator.restore_from_checkpoint(&path)` 恢复崩溃前未完成的 subagent。失败只 log 不 abort。
+  - 缺口 2(LlmJudgeGate::with_client):新建 `rusty-claude-cli/src/llm_clients.rs` 模块,定义 `LlmBridge`(独立 tokio Runtime + `ProviderClient::from_model` + `block_on` async-to-sync 桥接,与 `AnthropicRuntimeClient::stream` 同模式)+ `AnthropicJudgeClient` impl `JudgeClient`。`app.rs` 构造后注入 `LlmJudgeGate::diagnostic_default(...).with_client(...)` → `add_validation_gate`。
+  - 缺口 3(set_global_decision_extractor_client):`llm_clients.rs` 定义 `AnthropicDecisionExtractorClient` impl `DecisionExtractorClient`。`app.rs` 构造后调用 `runtime::decision_log::set_global_decision_extractor_client(Arc::new(extractor))` 注入全局 OnceLock。
+  - runtime crate 顶层导出补全:`pub use decision_log::{DecisionExtractorClient, set_global_decision_extractor_client}` + `pub use validation::JudgeClient`
+  - 降级策略:JudgeClient/DecisionExtractorClient 构造失败(无 API key / 模型名无效)时跳过注册,不阻断启动,降级为 MVP 行为(无 LLM judge / Heuristic 决策提取)
+  - 验收:`cargo test -p runtime --lib` 1367 passed / 0 failed / 2 ignored;`cargo test -p rusty-claude-cli --lib` 373 passed / 0 failed(新增 5 个 llm_clients 测试);零警告
 - [ ] 多 provider 升级链（Anthropic/OpenAI/xAI，v3 阶段）
 
 ### API 与文档差异说明

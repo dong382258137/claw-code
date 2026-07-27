@@ -19,8 +19,8 @@ pub mod dag;
 // Multi-Agent Hardening §4.4:验证门禁(ValidationGate trait + CommandValidationGate + LlmJudgeGate 预留)。
 pub mod validation;
 pub use validation::{
-    detect_changed_files, rust_compile_gate, CommandValidationGate, LlmJudgeGate, ValidationContext,
-    ValidationError, ValidationGate,
+    detect_changed_files, rust_compile_gate, CommandValidationGate, JudgeClient, LlmJudgeGate,
+    ValidationContext, ValidationError, ValidationGate,
 };
 pub use dag::{
     CoordinatorExecutor, DagError, DagGraph, DagId, DagScheduler, NodeError, NodeResult,

@@ -496,11 +496,46 @@ P0 + P1 全部完成,后续进入 v2/v3 阶段:
 - **cargo test -p runtime --lib**: ✅ 1367 passed / 0 failed / 2 ignored(新增 29 个测试:5 checkpoint restore + 9 LlmJudgeGate + 15 LlmExtract)
 - **零警告**(仅 `private_interfaces` MVP 阶段可接受警告)
 
+### v2 Phase 2 生产接入(2026-07-27 完成)
+
+**接入审计**:P0/P1/v2 Phase 1 全部已接入生产路径;v2 Phase 2 三项缺口(Epic 4/5/6)在初次实现时停留在 runtime crate 单元测试层,本次补齐生产接入。
+
+**新增文件**:`rust/crates/rusty-claude-cli/src/llm_clients.rs`
+
+**核心设计 — `LlmBridge` async-to-sync 桥接**:
+- 持有独立 `tokio::runtime::Runtime`(与主 agent runtime 隔离)
+- 持有独立 `ProviderClient::from_model`(独立 prompt cache,符合 §5.2 缓存保护)
+- `call(prompt)` 方法:构造 `MessageRequest`(单条 user message,stream=false)→ `runtime.block_on(client.send_message(&request))` → 提取 `OutputContentBlock::Text` 拼接
+- 桥接模式与 `AnthropicRuntimeClient::stream`(streaming.rs:402)一致;`ConversationRuntime::run_turn` 是同步函数,当前线程不在 tokio runtime 上下文,无嵌套 panic 风险
+
+**接入点**:`rust/crates/rusty-claude-cli/src/app.rs::build_runtime`
+
+| 缺口 | 接入位置 | 代码 |
+|------|---------|------|
+| 缺口 1 `restore_from_checkpoint` | `app.rs` line ~2845(在 `MultiAgentCoordinator::new()` 之后,`add_validation_gate` 之前) | 扫描 `.claw/checkpoints/*.json` → `coordinator.restore_from_checkpoint(&path)`,失败只 log |
+| 缺口 2 `LlmJudgeGate::with_client` | `app.rs` line ~2899(在三道命令 gate 之后) | `AnthropicJudgeClient::new(model, 1024)` → `Arc<dyn JudgeClient>` → `LlmJudgeGate::diagnostic_default(...).with_client(judge)` → `add_validation_gate` |
+| 缺口 3 `set_global_decision_extractor_client` | `app.rs` line ~2941(在 `with_multi_agent_coordinator` 之后) | `AnthropicDecisionExtractorClient::new(model, 2048)` → `Arc<dyn DecisionExtractorClient>` → `set_global_decision_extractor_client(extractor_client)` |
+
+**runtime crate 顶层导出补全**:
+- `runtime/src/lib.rs`:`pub use decision_log::{DecisionExtractorClient, set_global_decision_extractor_client}`
+- `runtime/src/multi_agent/mod.rs`:`pub use validation::JudgeClient`
+
+**降级策略**(关键设计):
+- `AnthropicJudgeClient::new` / `AnthropicDecisionExtractorClient::new` 构造失败(无 API key / 模型名无效)时,`app.rs` 只打印 stderr 警告,跳过注册,不阻断启动
+- 缺口 2 跳过 → 降级为 MVP 行为(只有命令 gate,无 LLM judge)
+- 缺口 3 跳过 → 降级为 Heuristic 决策提取(零 LLM 成本)
+- 这保证 CI 无 API key 环境下 CLI 仍可启动,所有现有测试不受影响
+
+### v2 Phase 2 生产接入验收(2026-07-27)
+
+- **cargo build -p rusty-claude-cli --lib**: ✅ PASS(零警告)
+- **cargo test -p runtime --lib**: ✅ 1367 passed / 0 failed / 2 ignored(无回归)
+- **cargo test -p rusty-claude-cli --lib**: ✅ 373 passed / 0 failed / 0 ignored(新增 5 个 llm_clients 测试:trait 约束 + Arc<dyn> 转换 + 无 auth 错误传播)
+
 ### v2 Phase 3 待办(后续推进)
 
 1. **多 provider 升级链**:Anthropic/OpenAI/xAI 接入 `model_tier` 跨 provider 升级(v3 阶段)
 2. **`spawn_parallel` 真并行接入**:在 `execute_dispatch_subagent` 中调用 `DagScheduler::run` 实现 tokio JoinSet 并发调度
-3. **生产环境 JudgeClient/DecisionExtractorClient 注入**:在 `rusty-claude-cli` 启动时构造 `Arc<dyn JudgeClient>` + `Arc<dyn DecisionExtractorClient>` 注入 runtime
 
 ---
 
