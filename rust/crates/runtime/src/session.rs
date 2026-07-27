@@ -1265,7 +1265,7 @@ fn message_record(message: &ConversationMessage) -> JsonValue {
 /// name + output) blocks are all concatenated so that both natural
 /// language and tool I/O remain recallable. Blocks are joined with
 /// newlines.
-fn extract_indexable_text(message: &ConversationMessage) -> String {
+pub(crate) fn extract_indexable_text(message: &ConversationMessage) -> String {
     let mut parts: Vec<String> = Vec::new();
     for block in &message.blocks {
         match block {

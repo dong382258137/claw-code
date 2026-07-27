@@ -1,13 +1,22 @@
-//! DecisionLog — SQLite + FTS5-backed decision/repair experience index.
+//! DecisionLog — SQLite + FTS5-backed decision/repair experience index +
+//! §4.7 设计决策自动提取(DecisionPoint)。
 //!
 //! # Design
 //!
-//! DecisionLog 是 MemoryBank 的核心组件,记录 LLM 的每一次修复决策(问题签名、
-//! 根因假设、应用方案、验证结果),并提供语义检索与 simhash 去重。
+//! 本模块包含两类"决策"概念,正交共存:
+//!
+//! 1. **`DecisionLog`(§4.4 修复经验库)**:MemoryBank 核心组件,记录 LLM 每一次
+//!    修复决策(问题签名、根因假设、应用方案、验证结果),提供语义检索与 simhash
+//!    去重。由 LLM 主动调用 `log_decision` 工具记录。
+//! 2. **`DecisionPoint`(§4.7 设计决策)**:在 context compaction 触发前自动
+//!    启发式提取"设计决策点"(为什么选 A 不选 B、权衡了什么),持久化到
+//!    NOTEBOOK.md `<decisions>` 段 + FTS5 history_index(role="decision")。
+//!    与 `diag!` 互补:diag! 记录"发生了什么",DecisionPoint 记录"决定了什么"。
 //!
 //! ## 与 NOTEBOOK.md 分工
 //!
 //! - **DecisionLog** = 修复经验库(SQLite + simhash),持久化、可搜索、可去重
+//! - **DecisionPoint** = 设计决策点(启发式提取 + NOTEBOOK 持久化)
 //! - **NOTEBOOK.md** = 当前任务的工作记忆(跨压缩持久化的笔记)
 //!
 //! ## Schema
@@ -25,6 +34,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 
 /// FNV-1a 64-bit 哈希常量。
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -783,6 +793,245 @@ fn migrate_schema(conn: &Connection) -> Result<(), DecisionLogError> {
         conn.execute("PRAGMA user_version = 2", [])?;
     }
 
+    Ok(())
+}
+
+// ===========================================================================
+// §4.7 设计决策自动提取(DecisionPoint)— compaction 前持久化设计决策
+//
+// 与 §4.4 的 `DecisionLog`(修复经验库)正交:
+// - `DecisionLog` = LLM 主动调用的 SQLite 修复经验库
+// - `DecisionPoint` = compaction 前自动启发式提取的设计决策,持久化到 NOTEBOOK.md
+//
+// 与 §4.1 的 `diag!` 互补:
+// - `diag!` 记录"发生了什么"(运行时信号:panic/error/状态变更)
+// - `DecisionPoint` 记录"决定了什么、为什么"(设计决策信号)
+// ===========================================================================
+
+/// 决策点 — 一个关键设计决策的完整记录(§4.7)。
+///
+/// 在 context compaction 触发前,从待压缩消息中启发式提取,
+/// 持久化到 NOTEBOOK.md `<decisions>` 段 + FTS5 history_index(role="decision")。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionPoint {
+    /// 决策 ID(时间戳 + 消息序号哈希)。
+    pub id: String,
+    /// 决策上下文(什么场景下做的决策,通常是前一条消息)。
+    pub context: String,
+    /// 决策内容(做了什么决定)。
+    pub decision: String,
+    /// 决策理由(为什么这样做)。
+    pub rationale: String,
+    /// 被否决的替代方案(为什么没选其他选项)。
+    /// MVP 启发式不提取,留空;v2 LLM 提取时填充。
+    pub alternatives: Vec<String>,
+    /// 时间戳(ms since UNIX_EPOCH)。
+    pub timestamp_ms: u64,
+    /// 来源 session_id。
+    pub session_id: String,
+}
+
+/// 决策检测策略(§4.7)。
+#[derive(Debug, Clone)]
+pub enum DetectionStrategy {
+    /// MVP:启发式关键词检测。零 LLM 调用,零成本。
+    /// 检测包含决策信号的消息:decided/chose/trade-off/权衡/否决/放弃/之所以/因为。
+    Heuristic,
+    /// v2:LLM 提取。用轻量模型(flash)从待压缩消息中提取结构化决策。
+    /// 成本低(flash),但需要 LLM 调用。MVP 阶段返回空 Vec。
+    LlmExtract { model: String },
+}
+
+/// 启发式决策检测关键词(中英文,§4.7)。
+/// MVP 策略:零成本,零 LLM 调用。
+///
+/// 注意:避免加入过于宽泛的词(如 "over "),否则会误匹配普通文本。
+const DECISION_KEYWORDS: &[&str] = &[
+    // 英文决策信号
+    "decided",
+    "chose",
+    "chosen",
+    "trade-off",
+    "tradeoff",
+    "alternative",
+    "rejected",
+    "ruled out",
+    "instead of",
+    "rather than",
+    // 中文决策信号
+    "决定",
+    "选择",
+    "权衡",
+    "否决",
+    "放弃",
+    "之所以",
+    "因为",
+    "而非",
+    "而不是",
+    "替代方案",
+    "备选",
+];
+
+/// 检测单条消息是否包含决策信号(§4.7)。
+///
+/// MVP:关键词匹配(大小写不敏感)。v2:LLM 提取。
+pub fn detect_decision_signal(message_text: &str) -> bool {
+    let lower = message_text.to_ascii_lowercase();
+    DECISION_KEYWORDS
+        .iter()
+        .any(|kw| lower.contains(&kw.to_ascii_lowercase()))
+}
+
+/// 从待压缩的消息列表中提取决策点(§4.7)。
+///
+/// 在 `compact_session` 执行前调用,确保设计决策不随原始消息消失。
+///
+/// # MVP 策略(`DetectionStrategy::Heuristic`)
+///
+/// 1. 遍历待压缩消息,检测决策关键词
+/// 2. 命中关键词的消息,提取该消息 + 前一条消息作为上下文
+/// 3. 用模板构造 `DecisionPoint`(context/decision/rationale 由 LLM 后续填充或人工确认)
+///
+/// # v2 策略(`DetectionStrategy::LlmExtract`)
+///
+/// 1. 用 flash 模型从待压缩消息中提取结构化决策
+/// 2. 自动填充 context/decision/rationale/alternatives
+/// 3. MVP 阶段直接返回空 Vec(`TODO(v2)` 标记)
+///
+/// # 参数
+///
+/// - `messages`:待压缩的消息文本列表(已转换为纯文本)
+/// - `strategy`:检测策略(MVP 用 `Heuristic`,v2 用 `LlmExtract`)
+/// - `session_id`:当前 session ID,用于追溯决策来源
+///
+/// # 返回
+///
+/// 提取到的决策点列表(可能为空)。每个决策点 ID 唯一,格式 `d{timestamp_ms}-{index}`。
+pub fn extract_decisions_before_compaction(
+    messages: &[&str],
+    strategy: &DetectionStrategy,
+    session_id: &str,
+) -> Vec<DecisionPoint> {
+    match strategy {
+        DetectionStrategy::Heuristic => {
+            let mut decisions = Vec::new();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            for (i, msg) in messages.iter().enumerate() {
+                if detect_decision_signal(msg) {
+                    // 提取上下文:前一条消息(如果有)
+                    let context = if i > 0 { messages[i - 1] } else { "" };
+                    // MVP:整条消息作为 decision + rationale 的候选
+                    // v2 会用 LLM 精确提取
+                    let id = format!("d{now_ms}-{i}");
+                    decisions.push(DecisionPoint {
+                        id,
+                        context: truncate_for_decision(context, 200),
+                        decision: truncate_for_decision(msg, 300),
+                        rationale: truncate_for_decision(msg, 500),
+                        alternatives: Vec::new(), // MVP 不提取,留待 v2 LLM 填充
+                        timestamp_ms: now_ms,
+                        session_id: session_id.to_string(),
+                    });
+                }
+            }
+            decisions
+        }
+        DetectionStrategy::LlmExtract { model: _ } => {
+            // v2 实现:调用 flash 模型提取结构化决策
+            // TODO(v2):构造 prompt,调用 ProviderClient::from_model(model)
+            Vec::new()
+        }
+    }
+}
+
+/// UTF-8 安全的字符串截断(§4.7 内部辅助)。
+///
+/// 与现有 `truncate_str` 类似,但使用省略号 `…`(单字符)而非 `...`(三字符),
+/// 与计划文档保持一致。若 `max` 落在多字节字符中间,回退到上一个字符边界。
+fn truncate_for_decision(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        return "…".to_string();
+    }
+    format!("{}…", &s[..end])
+}
+
+/// 将决策点渲染为 NOTEBOOK.md `<decisions>` 段的格式(§4.7)。
+///
+/// 输出格式与现有 NOTEBOOK 段一致(纯文本列表,每行一条决策)。
+/// 最多渲染 20 条决策(NOTEBOOK 16K 上限的自我约束)。
+#[must_use]
+pub fn render_decision_for_notebook(decisions: &[DecisionPoint]) -> String {
+    if decisions.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    for d in decisions.iter().take(20) {
+        // ID 取前 8 字符(与计划一致),避免过长
+        let id_short: String = d.id.chars().take(8).collect();
+        lines.push(format!("- [{}] {} — {}", id_short, d.decision, d.rationale));
+        if !d.alternatives.is_empty() {
+            lines.push(format!("  alternatives: {}", d.alternatives.join("; ")));
+        }
+    }
+    lines.join("\n")
+}
+
+/// 将决策点追加到 NOTEBOOK.md 的 `<decisions>` 段(§4.7)。
+///
+/// 复用 `Notebook::save` 的原子写机制(`.tmp` + `rename`),遵守 16K 上限。
+/// 超限时保留最近 100 行(约 10-20 条决策),丢弃旧决策。
+///
+/// # 参数
+///
+/// - `workspace_root`:工作区根目录(NOTEBOOK.md 位于 `.claw/NOTEBOOK.md`)
+/// - `decisions`:待持久化的决策点列表
+///
+/// # 返回
+///
+/// `Ok(())` 表示成功持久化;`Err(msg)` 表示加载/保存失败。
+pub fn persist_decisions_to_notebook(
+    workspace_root: &std::path::Path,
+    decisions: &[DecisionPoint],
+) -> Result<(), String> {
+    if decisions.is_empty() {
+        return Ok(());
+    }
+    let mut notebook = crate::notebook::Notebook::load(workspace_root)
+        .map_err(|e| format!("load notebook failed: {e}"))?;
+    let rendered = render_decision_for_notebook(decisions);
+    if rendered.is_empty() {
+        return Ok(());
+    }
+    // 追加到 decisions 段(不覆盖,累积记录)
+    let existing = notebook.get_section("decisions").unwrap_or_default();
+    let combined = if existing.is_empty() {
+        rendered
+    } else {
+        format!("{existing}\n{rendered}")
+    };
+    // 检查上限:NOTEBOOK_MAX_CHARS = 16_000,decisions 段预留 14_000 字符
+    // 超限时保留最近 100 行(从末尾截取),丢弃旧决策
+    if combined.len() > 14_000 {
+        let lines: Vec<&str> = combined.lines().collect();
+        let start = lines.len().saturating_sub(100);
+        let trimmed = lines[start..].join("\n");
+        notebook.set_section("decisions", &trimmed);
+    } else {
+        notebook.set_section("decisions", &combined);
+    }
+    notebook
+        .save(workspace_root)
+        .map_err(|e| format!("save notebook failed: {e}"))?;
     Ok(())
 }
 
@@ -1545,5 +1794,353 @@ mod tests {
             (rate - 1.0).abs() < 1e-9,
             "rate should be exactly 1.0 after 50 Confirmed, got {rate}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §4.7 DecisionPoint / extract_decisions_before_compaction 测试
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn detect_decision_signal_matches_english_keywords() {
+        assert!(detect_decision_signal("we decided to use tokio for async runtime"));
+        assert!(detect_decision_signal("I chose the flash model for budget tasks"));
+        assert!(detect_decision_signal("trade-off between latency and throughput"));
+        assert!(detect_decision_signal("rejected the alternative approach"));
+        assert!(detect_decision_signal("ruled out option C"));
+        assert!(detect_decision_signal("used A instead of B"));
+        assert!(detect_decision_signal("picked A rather than B"));
+    }
+
+    #[test]
+    fn detect_decision_signal_matches_chinese_keywords() {
+        assert!(detect_decision_signal("我们决定使用 tokio"));
+        assert!(detect_decision_signal("选择 flash 模型"));
+        assert!(detect_decision_signal("权衡延迟与吞吐"));
+        assert!(detect_decision_signal("否决了备选方案"));
+        assert!(detect_decision_signal("放弃原计划"));
+        assert!(detect_decision_signal("之所以这样设计,是因为向后兼容"));
+        assert!(detect_decision_signal("用 A 而非 B"));
+        assert!(detect_decision_signal("用 A 而不是 B"));
+    }
+
+    #[test]
+    fn detect_decision_signal_no_match_for_plain_text() {
+        assert!(!detect_decision_signal("hello world"));
+        assert!(!detect_decision_signal("the quick brown fox jumps over the lazy dog"));
+        assert!(!detect_decision_signal("这是一段普通文本,没有决策关键词"));
+        assert!(!detect_decision_signal(""));
+    }
+
+    #[test]
+    fn detect_decision_signal_case_insensitive() {
+        assert!(detect_decision_signal("We DECIDED to..."));
+        assert!(detect_decision_signal("TRADE-OFF considered"));
+        assert!(detect_decision_signal("Chose this option"));
+    }
+
+    #[test]
+    fn extract_decisions_heuristic_finds_decision_messages() {
+        let messages = vec![
+            "let's discuss the architecture",
+            "we decided to use SQLite for persistence",  // 命中 "decided"
+            "the implementation plan is...",
+            "chose flash model for budget tier",          // 命中 "chose"
+            "no decision here, just facts",
+        ];
+        let decisions = extract_decisions_before_compaction(
+            &messages,
+            &DetectionStrategy::Heuristic,
+            "test-session",
+        );
+        assert_eq!(decisions.len(), 2, "should find 2 decision messages");
+        // 验证 ID 格式
+        assert!(decisions[0].id.starts_with("d"));
+        assert!(decisions[1].id.starts_with("d"));
+        // 验证 session_id 透传
+        assert_eq!(decisions[0].session_id, "test-session");
+        assert_eq!(decisions[1].session_id, "test-session");
+        // 验证上下文提取(前一条消息)
+        assert_eq!(decisions[0].context, "let's discuss the architecture");
+        assert_eq!(
+            decisions[1].context,
+            "the implementation plan is..."
+        );
+        // 验证 decision/rationale 字段填充
+        assert!(decisions[0].decision.contains("SQLite"));
+        assert!(decisions[0].rationale.contains("SQLite"));
+        // MVP 不提取 alternatives
+        assert!(decisions[0].alternatives.is_empty());
+    }
+
+    #[test]
+    fn extract_decisions_heuristic_first_message_has_empty_context() {
+        // 第一条消息命中关键词时,context 应为空字符串
+        let messages = vec!["decided to use Rust for the CLI"];
+        let decisions = extract_decisions_before_compaction(
+            &messages,
+            &DetectionStrategy::Heuristic,
+            "sess",
+        );
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].context, "");
+    }
+
+    #[test]
+    fn extract_decisions_heuristic_empty_input() {
+        let messages: Vec<&str> = vec![];
+        let decisions = extract_decisions_before_compaction(
+            &messages,
+            &DetectionStrategy::Heuristic,
+            "sess",
+        );
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn extract_decisions_heuristic_no_keywords_no_decisions() {
+        let messages = vec![
+            "hello world",
+            "the quick brown fox",
+            "just some plain text",
+        ];
+        let decisions = extract_decisions_before_compaction(
+            &messages,
+            &DetectionStrategy::Heuristic,
+            "sess",
+        );
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn extract_decisions_llm_extract_returns_empty_in_mvp() {
+        // v2 占位:MVP 阶段 LlmExtract 直接返回空 Vec
+        let messages = vec!["we decided to use Rust"];
+        let decisions = extract_decisions_before_compaction(
+            &messages,
+            &DetectionStrategy::LlmExtract {
+                model: "deepseek-v4-flash".to_string(),
+            },
+            "sess",
+        );
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn extract_decisions_truncates_long_messages() {
+        // 构造超长消息,验证截断逻辑
+        let long_msg = "decided: ".to_string() + &"x".repeat(1000);
+        let messages = vec![long_msg.as_str()];
+        let decisions = extract_decisions_before_compaction(
+            &messages,
+            &DetectionStrategy::Heuristic,
+            "sess",
+        );
+        assert_eq!(decisions.len(), 1);
+        // decision 字段截断到 300 字节 + "…"(3 字节 UTF-8)= 303 字节
+        assert!(
+            decisions[0].decision.len() <= 303,
+            "decision len {} should be <= 303",
+            decisions[0].decision.len()
+        );
+        // rationale 字段截断到 500 字节 + "…"(3 字节 UTF-8)= 503 字节
+        assert!(
+            decisions[0].rationale.len() <= 503,
+            "rationale len {} should be <= 503",
+            decisions[0].rationale.len()
+        );
+    }
+
+    #[test]
+    fn truncate_for_decision_handles_multibyte_utf8() {
+        // ASCII:正常截断
+        let r = truncate_for_decision("hello world", 5);
+        assert_eq!(r, "hello…");
+        // 不需要截断
+        assert_eq!(truncate_for_decision("short", 200), "short");
+        // 中文:3 字节字符,max 落在字符中间不应 panic
+        let chinese = "你好世界测试字符串";
+        let r = truncate_for_decision(chinese, 7); // 7 落在第二个中文字符(字节 3-5)的中间
+        assert!(r.ends_with('…'));
+        assert!(!r.is_empty());
+        // 结果应该是 "你好…"(截到字节 6,即第二个完整中文字符之后)
+        assert_eq!(r, "你好…");
+        // max = 0 的极端情况
+        assert_eq!(truncate_for_decision("hello", 0), "…");
+    }
+
+    #[test]
+    fn render_decision_for_notebook_empty_returns_empty() {
+        let decisions: Vec<DecisionPoint> = vec![];
+        assert_eq!(render_decision_for_notebook(&decisions), "");
+    }
+
+    #[test]
+    fn render_decision_for_notebook_renders_decision_lines() {
+        let decisions = vec![DecisionPoint {
+            id: "d1234567890-0".to_string(),
+            context: "ctx".to_string(),
+            decision: "use SQLite".to_string(),
+            rationale: "simpler than Postgres".to_string(),
+            alternatives: vec![],
+            timestamp_ms: 1234567890,
+            session_id: "sess".to_string(),
+        }];
+        let rendered = render_decision_for_notebook(&decisions);
+        assert!(rendered.contains("[d1234567]"));
+        assert!(rendered.contains("use SQLite"));
+        assert!(rendered.contains("simpler than Postgres"));
+    }
+
+    #[test]
+    fn render_decision_for_notebook_includes_alternatives() {
+        let decisions = vec![DecisionPoint {
+            id: "d1-0".to_string(),
+            context: "ctx".to_string(),
+            decision: "use Rust".to_string(),
+            rationale: "performance".to_string(),
+            alternatives: vec!["Go".to_string(), "C++".to_string()],
+            timestamp_ms: 1,
+            session_id: "sess".to_string(),
+        }];
+        let rendered = render_decision_for_notebook(&decisions);
+        assert!(rendered.contains("alternatives: Go; C++"));
+    }
+
+    #[test]
+    fn render_decision_for_notebook_caps_at_20_decisions() {
+        let decisions: Vec<DecisionPoint> = (0..50)
+            .map(|i| DecisionPoint {
+                id: format!("d-{i}"),
+                context: "ctx".to_string(),
+                decision: format!("decision {i}"),
+                rationale: "why".to_string(),
+                alternatives: vec![],
+                timestamp_ms: i as u64,
+                session_id: "sess".to_string(),
+            })
+            .collect();
+        let rendered = render_decision_for_notebook(&decisions);
+        // 应该只渲染前 20 条
+        let line_count = rendered.lines().count();
+        assert_eq!(line_count, 20, "should cap at 20 decisions");
+        assert!(rendered.contains("decision 0"));
+        assert!(rendered.contains("decision 19"));
+        assert!(!rendered.contains("decision 20"));
+    }
+
+    #[test]
+    fn persist_decisions_to_notebook_empty_decisions_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let decisions: Vec<DecisionPoint> = vec![];
+        let result = persist_decisions_to_notebook(dir.path(), &decisions);
+        assert!(result.is_ok());
+        // NOTEBOOK.md 不应被创建(空输入直接返回)
+        let notebook_path = dir.path().join(".claw/NOTEBOOK.md");
+        assert!(!notebook_path.exists());
+    }
+
+    #[test]
+    fn persist_decisions_to_notebook_creates_decisions_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let decisions = vec![DecisionPoint {
+            id: "d123-0".to_string(),
+            context: "discussing async runtime".to_string(),
+            decision: "use tokio".to_string(),
+            rationale: "industry standard".to_string(),
+            alternatives: vec![],
+            timestamp_ms: 123,
+            session_id: "sess".to_string(),
+        }];
+        let result = persist_decisions_to_notebook(dir.path(), &decisions);
+        assert!(result.is_ok(), "persist failed: {:?}", result.err());
+        // 加载 NOTEBOOK 验证 decisions 段
+        let notebook = crate::notebook::Notebook::load(dir.path()).unwrap();
+        let decisions_section = notebook.get_section("decisions");
+        assert!(decisions_section.is_some(), "decisions section should exist");
+        let content = decisions_section.unwrap();
+        assert!(content.contains("use tokio"));
+        assert!(content.contains("industry standard"));
+    }
+
+    #[test]
+    fn persist_decisions_to_notebook_appends_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        // 第一次写入
+        let decisions1 = vec![DecisionPoint {
+            id: "d1-0".to_string(),
+            context: "ctx1".to_string(),
+            decision: "first decision".to_string(),
+            rationale: "why1".to_string(),
+            alternatives: vec![],
+            timestamp_ms: 1,
+            session_id: "sess".to_string(),
+        }];
+        persist_decisions_to_notebook(dir.path(), &decisions1).unwrap();
+        // 第二次写入
+        let decisions2 = vec![DecisionPoint {
+            id: "d2-0".to_string(),
+            context: "ctx2".to_string(),
+            decision: "second decision".to_string(),
+            rationale: "why2".to_string(),
+            alternatives: vec![],
+            timestamp_ms: 2,
+            session_id: "sess".to_string(),
+        }];
+        persist_decisions_to_notebook(dir.path(), &decisions2).unwrap();
+        // 验证累积(两条决策都在)
+        let notebook = crate::notebook::Notebook::load(dir.path()).unwrap();
+        let content = notebook.get_section("decisions").unwrap();
+        assert!(content.contains("first decision"), "first decision missing");
+        assert!(content.contains("second decision"), "second decision missing");
+    }
+
+    #[test]
+    fn persist_decisions_to_notebook_trims_when_exceeding_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // 构造 200 条决策,每条较长,确保超过 14_000 字符上限
+        let decisions: Vec<DecisionPoint> = (0..200)
+            .map(|i| DecisionPoint {
+                id: format!("d-{i}"),
+                context: format!("context for decision {i}"),
+                decision: format!("decision {i}: use approach {}", i % 5),
+                rationale: format!("rationale {i}: {}", "x".repeat(50)),
+                alternatives: vec![],
+                timestamp_ms: i as u64,
+                session_id: "sess".to_string(),
+            })
+            .collect();
+        let result = persist_decisions_to_notebook(dir.path(), &decisions);
+        assert!(result.is_ok(), "trim path failed: {:?}", result.err());
+        // 验证 NOTEBOOK 仍可加载且 decisions 段被截断到 100 行以内
+        let notebook = crate::notebook::Notebook::load(dir.path()).unwrap();
+        let content = notebook.get_section("decisions").unwrap();
+        let line_count = content.lines().count();
+        assert!(
+            line_count <= 100,
+            "decisions section should be trimmed to <= 100 lines, got {line_count}"
+        );
+    }
+
+    #[test]
+    fn decision_point_serializes_to_json() {
+        // 验证 serde 序列化/反序列化 round-trip
+        let dp = DecisionPoint {
+            id: "d123-0".to_string(),
+            context: "ctx".to_string(),
+            decision: "decide".to_string(),
+            rationale: "why".to_string(),
+            alternatives: vec!["alt1".to_string()],
+            timestamp_ms: 123,
+            session_id: "sess".to_string(),
+        };
+        let json = serde_json::to_string(&dp).unwrap();
+        let parsed: DecisionPoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, dp.id);
+        assert_eq!(parsed.context, dp.context);
+        assert_eq!(parsed.decision, dp.decision);
+        assert_eq!(parsed.rationale, dp.rationale);
+        assert_eq!(parsed.alternatives, dp.alternatives);
+        assert_eq!(parsed.timestamp_ms, dp.timestamp_ms);
+        assert_eq!(parsed.session_id, dp.session_id);
     }
 }

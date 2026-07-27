@@ -3295,6 +3295,61 @@ where
         );
         let _ = self.hook_runner.run_pre_compact(&pre_compact_context);
 
+        // §4.7 v3:compaction 前提取决策点,避免设计决策随原始消息消失。
+        // MVP 用 Heuristic 策略(零 LLM 成本),v2 升级为 LlmExtract。
+        // 与 §4.1 的 diag! 互补:diag! 记录"发生了什么",decision_log 记录"决定了什么"。
+        let preserve_recent = CompactionConfig::default().preserve_recent_messages;
+        let messages_to_compact: Vec<String> = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .skip(preserve_recent)
+            .map(crate::session::extract_indexable_text)
+            .collect();
+        let messages_refs: Vec<&str> =
+            messages_to_compact.iter().map(String::as_str).collect();
+        let strategy = crate::decision_log::DetectionStrategy::Heuristic;
+        let decisions = crate::decision_log::extract_decisions_before_compaction(
+            &messages_refs,
+            &strategy,
+            &self.session.session_id,
+        );
+        if !decisions.is_empty() {
+            eprintln!(
+                "[decision_log] extracted {} decision point(s) before compaction",
+                decisions.len()
+            );
+            // 持久化到 NOTEBOOK.md decisions 段(§4.7.2)
+            if let Some(ws) = &self.workspace_root {
+                if let Err(e) =
+                    crate::decision_log::persist_decisions_to_notebook(ws, &decisions)
+                {
+                    eprintln!("[decision_log] failed to persist decisions to notebook: {e}");
+                }
+            }
+            // 同步写入 FTS5 索引(role="decision"),提升可检索性(§4.7.4)
+            if let Some(history_index) = self.session.history_index.as_ref() {
+                for d in &decisions {
+                    let content = format!(
+                        "[DECISION {}] context: {}\ndecision: {}\nrationale: {}\nalternatives: {}",
+                        d.id,
+                        d.context,
+                        d.decision,
+                        d.rationale,
+                        d.alternatives.join("; "),
+                    );
+                    let _ = history_index.index_message(
+                        &content,
+                        &d.session_id,
+                        "decision", // §4.7 v3 新增 role 类型
+                        0,          // message_index=0 表示决策点
+                        d.timestamp_ms,
+                    );
+                }
+            }
+        }
+
         // Use the default CompactionConfig (max_estimated_tokens: 10_000) so that
         // small sessions are not pointlessly compacted. The auto-compact trigger
         // above (input_tokens >= threshold) already decided compaction is needed;

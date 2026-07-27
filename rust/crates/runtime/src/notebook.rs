@@ -78,7 +78,19 @@ pub const NOTEBOOK_MAX_CHARS: usize = 16_000;
 /// NOTEBOOK.md 的段标识(Anthropic 推荐的 XML 标签分段)。
 ///
 /// 顺序固定,便于 LLM 解析和人类阅读。
-pub const SECTION_TAGS: &[&str] = &["plan", "subagents", "attempted", "preferences", "key_files"];
+///
+/// §4.7 v3 新增 `decisions` 段:由 `decision_log::persist_decisions_to_notebook`
+/// 在 compaction 前自动写入,记录设计决策(为什么选 A 不选 B、权衡了什么)。
+/// 与 `attempted` 段(已尝试的方案及结论)正交:attempted 记录"做了什么",
+/// decisions 记录"为什么决定这样做"。
+pub const SECTION_TAGS: &[&str] = &[
+    "plan",
+    "subagents",
+    "attempted",
+    "preferences",
+    "key_files",
+    "decisions", // §4.7 v3 新增:设计决策持久化段(compaction 前自动提取)
+];
 
 /// NOTEBOOK.md 的渲染头部,解释文档用途,引导 LLM 正确维护。
 pub const NOTEBOOK_HEADER: &str = "# NOTEBOOK — Structured Working Memory\n\
@@ -91,7 +103,8 @@ pub const NOTEBOOK_HEADER: &str = "# NOTEBOOK — Structured Working Memory\n\
     - `<subagents>`:已 dispatch 的子智能体注册表(name | status | result_ref)\n\
     - `<attempted>`:已尝试的方案及结论(成功/失败 + 原因)\n\
     - `<preferences>`:用户明确表达的偏好/约束\n\
-    - `<key_files>`:关键文件引用 + 一句话摘要\n";
+    - `<key_files>`:关键文件引用 + 一句话摘要\n\
+    - `<decisions>`:设计决策持久化(§4.7,compaction 前自动提取,LLM 一般不直接写)\n";
 
 /// NOTEBOOK 数据模型 — 按 XML 段组织的内容。
 ///
@@ -365,7 +378,7 @@ pub struct NotebookUpdateInput {
 /// 注册到 LLM 的 tool list,让 LLM 知道可以维护 NOTEBOOK。
 pub const NOTEBOOK_UPDATE_TOOL_SPEC: &str = r#"{
     "name": "notebook_update",
-    "description": "Update the persistent working memory (NOTEBOOK.md). This memory survives context compaction — use it to record key decisions, subagent registry, attempted approaches, user preferences, and key file references. CRITICAL: always record subagent dispatches here so you do not re-dispatch the same task later. Modes: 'set' (overwrite section) or 'append' (add a line). Sections: plan, subagents, attempted, preferences, key_files.",
+    "description": "Update the persistent working memory (NOTEBOOK.md). This memory survives context compaction — use it to record key decisions, subagent registry, attempted approaches, user preferences, and key file references. CRITICAL: always record subagent dispatches here so you do not re-dispatch the same task later. Modes: 'set' (overwrite section) or 'append' (add a line). Sections: plan, subagents, attempted, preferences, key_files, decisions. Note: 'decisions' section is auto-populated by compaction-time heuristic extraction; LLMs typically do not need to write it directly.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -376,7 +389,7 @@ pub const NOTEBOOK_UPDATE_TOOL_SPEC: &str = r#"{
             },
             "section": {
                 "type": "string",
-                "enum": ["plan", "subagents", "attempted", "preferences", "key_files"],
+                "enum": ["plan", "subagents", "attempted", "preferences", "key_files", "decisions"],
                 "description": "Target section name."
             },
             "content": {

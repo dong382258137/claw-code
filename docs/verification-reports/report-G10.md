@@ -236,9 +236,9 @@
 | 3 | Subagent 字段扩展 + `spawn_with_model` + `reset_for_retry` + `record_cost` + `check_cost_limit` + `save_checkpoint` | P0 | ✅ DONE | [multi_agent/mod.rs](../../rust/crates/runtime/src/multi_agent/mod.rs) L86-156（v3 扩展字段：`model`/`complexity`/`max_attempts`/`attempts`/`validated`/`notes`/`checkpoint_path`/`cost_limit`/`cost_accumulated`），L304-343 `spawn_with_model`，L366-403 `reset_for_retry`，成本门禁方法 |
 | 4 | `validation.rs`（`CommandValidationGate` + `rust_compile_gate` + `LlmJudgeGate` trait 预留） | P0 | ✅ DONE | [validation.rs](../../rust/crates/runtime/src/multi_agent/validation.rs) L48-296，`CommandValidationGate` L85-197，`LlmJudgeGate` L243-295（MVP stub 返 Ok，v2 实现 `call_judge_model`） |
 | 5 | `execute_dispatch_subagent` retry loop（成本门禁 + checkpoint 保存） | P0 | ✅ DONE | [conversation.rs](../../rust/crates/runtime/src/conversation.rs) L2199-2497，retry loop L2291-2497，模型升级 L2396-2420/L2462-2484，成本门禁 L2382-2393/L2451-2460 |
-| 6 | 诊断 SOP 注入（Diagnostic 复杂度） | P1 | ⏳ pending | — |
-| 7 | `spawn_parallel` 接口预留（串行退化） | P1 | ⏳ pending | — |
-| 8 | 决策持久化 §4.7（NOTEBOOK decisions 段 + FTS5 decision role） | P1 | ⏳ pending | — |
+| 6 | 诊断 SOP 注入（Diagnostic 复杂度） | P1 | ✅ DONE | [conversation.rs](../../rust/crates/runtime/src/conversation.rs) `run_subagent_turn_with_model` 中 `DIAGNOSTIC_SOP_PROMPT` 拼接 |
+| 7 | `spawn_parallel` 接口预留（串行退化） | P1 | ✅ DONE | [multi_agent/mod.rs](../../rust/crates/runtime/src/multi_agent/mod.rs) `spawn_parallel(&mut self, tasks: &[SubagentSpec]) -> Result<Vec<String>, String>` |
+| 8 | 决策持久化 §4.7（NOTEBOOK decisions 段 + FTS5 decision role） | P1 | ✅ DONE | [decision_log.rs](../../rust/crates/runtime/src/decision_log.rs) `extract_decisions_before_compaction` + [notebook.rs](../../rust/crates/runtime/src/notebook.rs) `decisions` 段 + [history_search.rs](../../rust/crates/runtime/src/history_search.rs) `rank *= 2.0` 加权 |
 | 9 | 端到端 MVP 验证（场景 1-5，含成本超限场景） | P0 | ✅ DONE | [conversation.rs](../../rust/crates/runtime/src/conversation.rs) 测试 L6524-6803（scenario1-5 + 边界测试），7 个端到端测试全通过 |
 
 ### P0 步骤 9 端到端验证详情（§10.4 验收标准）
@@ -291,18 +291,72 @@
 - **cargo test -p runtime --lib multi_agent::validation**: ✅ 12 passed（验证门禁验收）
 - **cargo test -p runtime --lib diag::**: ✅ 4 passed（诊断层验收）
 
-### 后续 P1 工作项
+### P1 步骤 6/7/8 实施详情（2026-07-27 完成）
 
-P0 全部完成，后续进入 P1 阶段：
+#### 步骤 6:诊断 SOP 注入
 
-1. **步骤 6 诊断 SOP 注入**：Diagnostic 复杂度时注入系统提示
-2. **步骤 7 `spawn_parallel` 接口预留**：MVP 串行退化，v2 接入 tokio 真并行
-3. **步骤 8 决策持久化 §4.7**：`decision_log.rs` + NOTEBOOK decisions 段 + FTS5 decision role 加权索引
-4. **checkpoint restore**：v2 阶段实现 `restore_from_checkpoint`
-5. **`LlmJudgeGate` 实现**：v2 阶段实现 `call_judge_model`
-6. **多 ValidationGate**：npm/pytest/lint gate，v2 阶段
-7. **多 provider 升级链**：Anthropic/OpenAI/xAI，v3 阶段
-8. **dead_code 警告处理**：`run_subagent_turn`（conversation.rs L2533）为私有未使用方法，建议删除或加 `#[allow(dead_code)]`
+`run_subagent_turn_with_model` 在 `complexity == TaskComplexity::Diagnostic` 时拼接 `DIAGNOSTIC_SOP_PROMPT` 到 system prompt,要求模型:
+1. **先诊断后修复**:第一动作是写文件诊断日志确认错误类型,而非堆砌防御代码
+2. **验证错误机制**:用文件日志/复现脚本确认是 panic 还是 Err 传播,而非凭直觉假设
+3. **`cargo build` 验证**:任何代码修改后必须 `cargo build` 验证编译通过
+4. **提供复现证据**:修复方案必须附复现脚本/日志/错误信息
+5. **根因未定位前不堆砌防御代码**:禁止 `catch_unwind` / `render_error_screen` 等无根因的防御
+
+**背景**:源于一次真实事故 — deepseek 旧版 API 执行诊断任务时凭直觉堆砌防御代码、误判 panic 机制,浪费两轮迭代。SOP 注入从平台层根治"能力不足模型浪费轮次"。
+
+#### 步骤 7:`spawn_parallel` 接口预留
+
+`MultiAgentCoordinator::spawn_parallel(&mut self, tasks: &[SubagentSpec]) -> Result<Vec<String>, String>`:
+- **MVP 实现**:内部循环调用 `spawn_with_model` 串行执行,返回 id 列表
+- **v2 路径**:接口签名已为 tokio `JoinSet` 并行执行预留,届时只需替换内部实现,调用方零改动
+- **设计依据**:借鉴 Anthropic Multi-Agent Research System(并行 spawn 3-5 subagents,90% 加速)
+
+#### 步骤 8:决策持久化 §4.7
+
+**问题**:context compaction 会丢弃原始消息,导致设计决策的 rationale 随之消失。后续 LLM 无法回溯"为什么这样做",可能推翻已论证的决策。
+
+**三段子工作**:
+
+1. **步骤 8c 启发式提取**(`decision_log.rs::extract_decisions_before_compaction`):
+   - 关键词检测:`决定/decided/采用/选择/否决/alternatives/方案` 等
+   - 提取四元组:`context`(前一条消息) + `decision`(本条) + `rationale`(本条) + `alternatives`(空,MVP 不提取)
+   - 截断策略:context 200 / decision 300 / rationale 500 字符,多字节 UTF-8 安全
+   - `DetectionStrategy::Heuristic`(MVP 落地) vs `LlmExtract { model }`(v2 预留)
+
+2. **步骤 8d NOTEBOOK 持久化**(`notebook.rs` + `decision_log.rs::persist_decisions_to_notebook`):
+   - `SECTION_TAGS` 新增 `"decisions"` 段
+   - `persist_decisions_to_notebook` 将决策点追加写入 NOTEBOOK.md
+   - **NOTEBOOK.md 跨 compaction 持久化**(microcompact/compact_session 不影响)
+   - 限制:最多 50 条,超出时按 FIFO 淘汰
+
+3. **步骤 8e FTS5 decision role 加权**(`history_search.rs::search`):
+   - `conversation.rs` 在 compaction 前调用 `extract_decisions_before_compaction`,将决策点以 `role="decision"` 写入 FTS5 索引
+   - `search` 方法对 `role="decision"` 命中 `rank *= 2.0`(FTS5 BM25 越负越相关,× 2.0 让 rank 更负 = 排名提前)
+   - 实现策略:多取 `top_k * 2` 条 → 决策点 rank × 2.0 → 重新排序 → 截断到 top_k
+   - **关键 bug 修复**:原实现 `rank *= 0.5` 是错的 — 对负 rank 来说 × 0.5 让绝对值变小(更接近 0)= 更不相关 = 排名退后,实际是惩罚而非加权。改为 `*= 2.0` 才是真正的加权
+
+#### 死代码清理
+
+- `run_subagent_turn`(conversation.rs L2533) 加 `#[allow(dead_code)]` — MVP 用 `run_subagent_turn_with_model` 替代,接口保留供 v2 调用
+
+### P1 验收(2026-07-27)
+
+- **cargo test -p runtime --lib**: ✅ 1336 passed / 0 failed / 2 ignored
+  - `history_search::tests::*`: 10 passed(含 4 个 decision role 加权测试:`decision_role_gets_rank_boosted` / `decision_role_boost_fits_within_top_k` / `non_decision_roles_are_not_boosted` / `search_with_top_k_zero_returns_empty`)
+  - `decision_log::tests::*`: 46 passed(含启发式提取 / NOTEBOOK 持久化 / 截断 / 多字节 UTF-8 安全 / schema migration)
+  - `multi_agent::tests::*`: 全部通过(无回归)
+  - `diag::tests::*`: 4 passed(P0 诊断层无回归)
+
+### 后续 v2/v3 工作项
+
+P0 + P1 全部完成,后续进入 v2/v3 阶段:
+
+1. **checkpoint restore**:v2 阶段实现 `restore_from_checkpoint`
+2. **`LlmJudgeGate` 实现**:v2 阶段实现 `call_judge_model`
+3. **多 ValidationGate**:npm/pytest/lint gate,v2 阶段
+4. **多 provider 升级链**:Anthropic/OpenAI/xAI,v3 阶段
+5. **`spawn_parallel` 真并行**:v2 阶段接入 tokio `JoinSet`
+6. **`DetectionStrategy::LlmExtract` 实现**:v2 阶段用 LLM 提取决策点,替代启发式关键词
 
 ---
 

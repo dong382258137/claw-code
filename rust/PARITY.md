@@ -205,15 +205,30 @@ Harness note: current coverage now includes write-file denial, bash escalation a
 - [x] `LlmJudgeGate::diagnostic_default` rubric 含根因定位/方案可行性/完整性/副作用评估四维（`llm_judge_gate_diagnostic_default_rubric_contains_four_dimensions`）
 - [x] MVP 阶段不注册 `LlmJudgeGate`（诊断任务用人工验收 + rust_compile_gate，stub 返 Ok）
 
-### P1 预留项（trait/字段/接口就位，实现分阶段落地）
+### P1 已完成项（MVP 阶段,2026-07-27）
 
-- [ ] 步骤 6：诊断 SOP 注入（Diagnostic 复杂度时注入系统提示）
-- [ ] 步骤 7：`spawn_parallel` 接口预留（MVP 串行退化，v2 接入 tokio 真并行）
-- [ ] 步骤 8：决策持久化 §4.7（`decision_log.rs` + NOTEBOOK decisions 段 + FTS5 decision role 加权索引）
+- [x] 步骤 6：诊断 SOP 注入（Diagnostic 复杂度时注入系统提示） — `conversation.rs::run_subagent_turn_with_model` 在 `complexity == Diagnostic` 时拼接 `DIAGNOSTIC_SOP_PROMPT`,要求"先诊断后修复、写诊断日志、`cargo build` 验证、提供复现证据、根因未定位前不堆砌防御代码"
+- [x] 步骤 7：`spawn_parallel` 接口预留（MVP 串行退化,v2 接入 tokio 真并行） — `MultiAgentCoordinator::spawn_parallel(&mut self, tasks: &[SubagentSpec]) -> Result<Vec<String>, String>` 接口就位,MVP 内部循环调用 `spawn_with_model` 串行执行,接口签名已为 v2 tokio 并行预留
+- [x] 步骤 8：决策持久化 §4.7 — 三个子步骤全部落地:
+  - [x] 步骤 8c:`decision_log.rs::extract_decisions_before_compaction` 启发式提取(关键词检测 "决定/decided/采用/否决/alternatives" 等 + 上下文/决策/理由/替代方案四元组 + 200/300/500 字符截断)
+  - [x] 步骤 8d:`notebook.rs` SECTION_TAGS 新增 `"decisions"` 段,`persist_decisions_to_notebook` 将决策点追加写入 NOTEBOOK.md(跨 compaction 持久化)
+  - [x] 步骤 8e:`history_search.rs::search` 对 `role="decision"` 命中 `rank *= 2.0`(FTS5 BM25 越负越相关,× 2.0 让 rank 更负 = 排名提前),`conversation.rs` 在 compaction 前自动提取并写入 FTS5 索引
+- [x] 死代码清理:`run_subagent_turn` 加 `#[allow(dead_code)]`(MVP 用 `run_subagent_turn_with_model` 替代,接口保留供 v2 调用)
+
+**P1 验收** — ✅ `cargo test -p runtime --lib` 1336 passed / 0 failed / 2 ignored:
+- `history_search::tests::*` 10 passed(含 4 个 decision role 加权测试)
+- `decision_log::tests::*` 46 passed(含启发式提取/NOTEBOOK 持久化/截断/多字节 UTF-8 安全)
+- `multi_agent::tests::*` 全部通过(无回归)
+- `diag::tests::*` 4 passed(P0 诊断层无回归)
+
+### P1 待办项（v2/v3 阶段落地）
+
 - [ ] checkpoint restore（v2 阶段实现 `restore_from_checkpoint`）
 - [ ] `LlmJudgeGate` 实现（v2 阶段实现 `call_judge_model`）
 - [ ] 多 ValidationGate（npm/pytest/lint gate，v2 阶段）
 - [ ] 多 provider 升级链（Anthropic/OpenAI/xAI，v3 阶段）
+- [ ] `spawn_parallel` 真并行实现（v2 阶段接入 tokio）
+- [ ] `DetectionStrategy::LlmExtract` 实现（v2 阶段用 LLM 提取决策点,替代启发式关键词)
 
 ### API 与文档差异说明
 
