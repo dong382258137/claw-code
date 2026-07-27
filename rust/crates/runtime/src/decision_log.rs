@@ -838,8 +838,51 @@ pub enum DetectionStrategy {
     /// 检测包含决策信号的消息:decided/chose/trade-off/权衡/否决/放弃/之所以/因为。
     Heuristic,
     /// v2:LLM 提取。用轻量模型(flash)从待压缩消息中提取结构化决策。
-    /// 成本低(flash),但需要 LLM 调用。MVP 阶段返回空 Vec。
+    /// 成本低(flash),但需要 LLM 调用。
+    ///
+    /// **使用方式**:`extract_decisions_before_compaction` 中 LlmExtract 分支
+    /// 需要通过 [`set_global_decision_extractor_client`] 注册全局 client 才能工作。
+    /// 未注册时降级为 Heuristic(零成本回退,保证不阻塞 compaction)。
     LlmExtract { model: String },
+}
+
+/// 决策提取 client trait — v2 §10.5 Epic 6 依赖倒置。
+///
+/// runtime crate 不直接依赖 api crate(避免循环依赖),通过此 trait 注入 LLM 调用。
+/// 生产实现由上层 crate 构造(封装 `ProviderClient::from_model` + async-to-sync 桥接)。
+///
+/// # 接口约定
+/// - 输入:提取 prompt(含待压缩消息列表 + JSON schema 说明)
+/// - 输出:LLM 原始文本响应(应为 JSON 数组,由 `parse_llm_decision_json` 解析)
+/// - 错误:网络/API/超时等返回 `Err(String)`,调用方降级为 Heuristic
+pub trait DecisionExtractorClient: Send + Sync {
+    /// 调用 LLM 提取决策,返回原始文本响应。
+    fn extract(&self, prompt: &str) -> Result<String, String>;
+}
+
+/// 全局决策提取 client(OnceLock,进程级单例)。
+///
+/// v2 设计:通过 `set_global_decision_extractor_client` 在进程启动时注入,
+/// `extract_decisions_before_compaction` 的 LlmExtract 分支通过
+/// `global_decision_extractor_client()` 获取并调用。
+///
+/// 未注入时 LlmExtract 降级为 Heuristic(零成本回退)。
+static GLOBAL_DECISION_EXTRACTOR: std::sync::OnceLock<Option<std::sync::Arc<dyn DecisionExtractorClient>>> =
+    std::sync::OnceLock::new();
+
+/// 注册全局决策提取 client(v2 §10.5 Epic 6)。
+///
+/// 由上层 crate(rusty-claude-cli)在启动时调用,注入 `Arc<dyn DecisionExtractorClient>`。
+/// 注入后 `DetectionStrategy::LlmExtract` 才能真正调用 LLM。
+pub fn set_global_decision_extractor_client(client: std::sync::Arc<dyn DecisionExtractorClient>) {
+    let _ = GLOBAL_DECISION_EXTRACTOR.set(Some(client));
+}
+
+/// 获取全局决策提取 client(若已注册)。
+fn global_decision_extractor_client() -> Option<&'static std::sync::Arc<dyn DecisionExtractorClient>> {
+    GLOBAL_DECISION_EXTRACTOR
+        .get()
+        .and_then(|opt| opt.as_ref())
 }
 
 /// 启发式决策检测关键词(中英文,§4.7)。
@@ -939,10 +982,22 @@ pub fn extract_decisions_before_compaction(
             }
             decisions
         }
-        DetectionStrategy::LlmExtract { model: _ } => {
-            // v2 实现:调用 flash 模型提取结构化决策
-            // TODO(v2):构造 prompt,调用 ProviderClient::from_model(model)
-            Vec::new()
+        DetectionStrategy::LlmExtract { model } => {
+            // v2 §10.5 Epic 6 实现:调用全局 DecisionExtractorClient 提取决策
+            //
+            // 降级策略:若未注册全局 client,回退到 Heuristic(零成本,不阻塞 compaction)
+            match global_decision_extractor_client() {
+                Some(client) => extract_decisions_with_llm(messages, model, client.as_ref(), session_id),
+                None => {
+                    eprintln!(
+                        "[decision_log] LlmExtract strategy requested but no global client registered — \
+                         falling back to Heuristic"
+                    );
+                    // 降级:用 Heuristic 逻辑提取(避免完全丢失决策)
+                    let heuristic_strategy = DetectionStrategy::Heuristic;
+                    extract_decisions_before_compaction(messages, &heuristic_strategy, session_id)
+                }
+            }
         }
     }
 }
@@ -963,6 +1018,210 @@ fn truncate_for_decision(s: &str, max: usize) -> String {
         return "…".to_string();
     }
     format!("{}…", &s[..end])
+}
+
+/// v2 §10.5 Epic 6:用 LLM 从待压缩消息中提取结构化决策点。
+///
+/// # 流程
+/// 1. 构造提取 prompt(消息列表 + JSON schema 说明 + few-shot 示例)
+/// 2. 调用 `DecisionExtractorClient::extract`
+/// 3. 解析 JSON 数组(容错:剥离 markdown 代码块、字段缺失跳过)
+/// 4. 截断字段(context 200 / decision 300 / rationale 500 / alternatives 100)
+///
+/// # 降级策略
+/// - LLM 调用失败 → 回退到 Heuristic(保证不丢决策)
+/// - JSON 解析失败 → 回退到 Heuristic
+/// - 部分条目解析失败 → 跳过该条,保留成功解析的条目
+///
+/// # 参数
+/// - `messages`:待压缩的消息文本列表
+/// - `model`:LLM 模型名(仅用于诊断日志,实际调用由 client 封装)
+/// - `client`:决策提取 client(依赖倒置)
+/// - `session_id`:当前 session ID
+fn extract_decisions_with_llm(
+    messages: &[&str],
+    model: &str,
+    client: &dyn DecisionExtractorClient,
+    session_id: &str,
+) -> Vec<DecisionPoint> {
+    // 1. 构造 prompt
+    let prompt = build_llm_extract_prompt(messages);
+
+    // 2. 调用 LLM
+    let response = match client.extract(&prompt) {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!(
+                "[decision_log] LLM extract failed (model={model}): {e} — falling back to Heuristic"
+            );
+            let heuristic_strategy = DetectionStrategy::Heuristic;
+            return extract_decisions_before_compaction(messages, &heuristic_strategy, session_id);
+        }
+    };
+
+    // 3. 解析 JSON
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    match parse_llm_decision_json(&response, now_ms, session_id) {
+        Ok(decisions) if !decisions.is_empty() => {
+            eprintln!(
+                "[decision_log] LLM extracted {} decision point(s) (model={model})",
+                decisions.len()
+            );
+            decisions
+        }
+        Ok(_) => {
+            // LLM 返回空数组,回退到 Heuristic(可能 LLM 漏掉了决策)
+            eprintln!(
+                "[decision_log] LLM returned 0 decisions (model={model}) — falling back to Heuristic"
+            );
+            let heuristic_strategy = DetectionStrategy::Heuristic;
+            extract_decisions_before_compaction(messages, &heuristic_strategy, session_id)
+        }
+        Err(e) => {
+            eprintln!(
+                "[decision_log] LLM JSON parse failed (model={model}): {e} — falling back to Heuristic"
+            );
+            let heuristic_strategy = DetectionStrategy::Heuristic;
+            extract_decisions_before_compaction(messages, &heuristic_strategy, session_id)
+        }
+    }
+}
+
+/// 构造 LLM 提取 prompt(v2 §10.5 Epic 6)。
+fn build_llm_extract_prompt(messages: &[&str]) -> String {
+    let messages_block = messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| format!("[{i}] {msg}"))
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+
+    let mut prompt = String::new();
+    prompt.push_str("你是一个决策提取助手。请从以下对话消息中提取\"设计决策点\"。\n\n");
+    prompt.push_str("## 设计决策点的判定标准\n");
+    prompt.push_str("- 明确选择了某个方案(而非仅陈述事实)\n");
+    prompt.push_str("- 包含 trade-off 权衡或否决其他方案的理由\n");
+    prompt.push_str("- 涉及架构、技术选型、向后兼容、迁移策略等关键决策\n");
+    prompt.push_str("- **不提取**:纯事实陈述、问题报告、代码片段、操作步骤\n\n");
+    prompt.push_str("## 输出格式\n");
+    prompt.push_str("输出 JSON 数组,每个元素包含:\n");
+    prompt.push_str("```json\n");
+    prompt.push_str("[\n");
+    prompt.push_str("  {\n");
+    prompt.push_str("    \"context\": \"决策前的上下文(≤200字符)\",\n");
+    prompt.push_str("    \"decision\": \"做了什么决定(≤300字符)\",\n");
+    prompt.push_str("    \"rationale\": \"为什么这样做(≤500字符)\",\n");
+    prompt.push_str("    \"alternatives\": [\"被否决的方案1\", \"被否决的方案2\"]\n");
+    prompt.push_str("  }\n");
+    prompt.push_str("]\n");
+    prompt.push_str("```\n\n");
+    prompt.push_str("## few-shot 示例\n");
+    prompt.push_str("输入: [0] 我们考虑了 Rust 和 Go,最终决定用 Rust,因为性能更好且内存安全\n");
+    prompt.push_str("输出: [{\"context\": \"语言选型\", \"decision\": \"选择 Rust\", \"rationale\": \"性能更好且内存安全\", \"alternatives\": [\"Go\"]}]\n\n");
+    prompt.push_str("若无决策点,返回空数组 `[]`。\n\n");
+    prompt.push_str("## 待分析的消息\n");
+    prompt.push_str(&messages_block);
+    prompt
+}
+
+/// 解析 LLM 返回的决策 JSON(v2 §10.5 Epic 6)。
+///
+/// # 容错策略
+/// 1. 剥离 markdown 代码块包裹(```json ... ``` 或 ``` ... ```)
+/// 2. 提取首个 JSON 数组(从 `[` 到匹配的 `]`)
+/// 3. 用 `serde_json::from_str` 解析为 `Vec<RawDecision>`
+/// 4. 逐条转换,跳过字段缺失/类型错误的条目
+/// 5. 截断字段到上限
+fn parse_llm_decision_json(
+    response: &str,
+    now_ms: u64,
+    session_id: &str,
+) -> Result<Vec<DecisionPoint>, String> {
+    // 1. 剥离 markdown 代码块
+    let json_str = strip_markdown_code_block(response);
+
+    // 2. 提取首个 JSON 数组
+    let json_array = extract_json_array(json_str)?;
+
+    // 3. 解析为 Vec<RawDecision>
+    let raw_decisions: Vec<RawDecision> = serde_json::from_str(json_array)
+        .map_err(|e| format!("JSON 解析失败: {e}"))?;
+
+    // 4. 逐条转换 + 截断
+    let mut decisions = Vec::new();
+    for (i, raw) in raw_decisions.into_iter().enumerate() {
+        // 跳过 decision 为空的条目(无决策内容)
+        if raw.decision.trim().is_empty() {
+            continue;
+        }
+        let id = format!("d{now_ms}-llm-{i}");
+        let alternatives: Vec<String> = raw
+            .alternatives
+            .into_iter()
+            .map(|a| truncate_for_decision(&a, 100))
+            .collect();
+        decisions.push(DecisionPoint {
+            id,
+            context: truncate_for_decision(&raw.context, 200),
+            decision: truncate_for_decision(&raw.decision, 300),
+            rationale: truncate_for_decision(&raw.rationale, 500),
+            alternatives,
+            timestamp_ms: now_ms,
+            session_id: session_id.to_string(),
+        });
+    }
+
+    Ok(decisions)
+}
+
+/// 剥离 markdown 代码块包裹(```json ... ``` 或 ``` ... ```)。
+fn strip_markdown_code_block(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.starts_with("```") {
+        let after_first_line = trimmed.strip_prefix("```").unwrap_or(trimmed);
+        // 跳过语言标识(如 json)
+        let after_lang = if after_first_line.starts_with("json") {
+            &after_first_line[4..]
+        } else {
+            after_first_line
+        };
+        // 去掉末尾的 ```
+        if let Some(stripped) = after_lang.strip_suffix("```") {
+            return stripped.trim();
+        }
+        // 末尾无 ``` 也接受(容错)
+        return after_lang.trim();
+    }
+    trimmed
+}
+
+/// 从文本中提取首个 JSON 数组(从 `[` 到匹配的 `]`)。
+fn extract_json_array(s: &str) -> Result<&str, String> {
+    let start = s.find('[').ok_or_else(|| "无 JSON 数组起始 `[`".to_string())?;
+    // 简化策略:从最后一个 `]` 截断(容忍中间嵌套)
+    if let Some(end) = s.rfind(']') {
+        if end > start {
+            return Ok(&s[start..=end]);
+        }
+    }
+    Err("无 JSON 数组结束 `]`".to_string())
+}
+
+/// LLM 返回的原始决策(用于 serde 反序列化)。
+#[derive(Debug, serde::Deserialize)]
+struct RawDecision {
+    #[serde(default)]
+    context: String,
+    #[serde(default)]
+    decision: String,
+    #[serde(default)]
+    rationale: String,
+    #[serde(default)]
+    alternatives: Vec<String>,
 }
 
 /// 将决策点渲染为 NOTEBOOK.md `<decisions>` 段的格式(§4.7)。
@@ -1912,8 +2171,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_decisions_llm_extract_returns_empty_in_mvp() {
-        // v2 占位:MVP 阶段 LlmExtract 直接返回空 Vec
+    fn extract_decisions_llm_extract_falls_back_to_heuristic_without_client() {
+        // v2 §10.5 Epic 6:无全局 client 时,LlmExtract 降级为 Heuristic
+        // "decided" 是启发式关键词,应被检测到
         let messages = vec!["we decided to use Rust"];
         let decisions = extract_decisions_before_compaction(
             &messages,
@@ -1922,7 +2182,13 @@ mod tests {
             },
             "sess",
         );
-        assert!(decisions.is_empty());
+        // 降级为 Heuristic 后应检测到 "decided" 关键词
+        assert_eq!(
+            decisions.len(),
+            1,
+            "LlmExtract 无 client 时应降级为 Heuristic 并检测到 'decided'"
+        );
+        assert!(decisions[0].decision.contains("Rust"));
     }
 
     #[test]
@@ -2142,5 +2408,227 @@ mod tests {
         assert_eq!(parsed.alternatives, dp.alternatives);
         assert_eq!(parsed.timestamp_ms, dp.timestamp_ms);
         assert_eq!(parsed.session_id, dp.session_id);
+    }
+
+    // ===== v2 §10.5 Epic 6:LlmExtract 决策提取测试 =====
+
+    /// mock 决策提取 client — 仅用于测试。
+    struct MockDecisionExtractorClient {
+        response: String,
+        force_error: bool,
+    }
+
+    impl DecisionExtractorClient for MockDecisionExtractorClient {
+        fn extract(&self, _prompt: &str) -> Result<String, String> {
+            if self.force_error {
+                return Err("mock API failure".to_string());
+            }
+            Ok(self.response.clone())
+        }
+    }
+
+    /// §10.5 Epic 6:parse_llm_decision_json 解析标准 JSON 数组
+    #[test]
+    fn parse_llm_decision_json_parses_standard_array() {
+        let response = r#"```json
+[
+  {
+    "context": "语言选型",
+    "decision": "选择 Rust",
+    "rationale": "性能更好且内存安全",
+    "alternatives": ["Go", "Python"]
+  }
+]
+```"#;
+        let decisions = parse_llm_decision_json(response, 1000, "sess").unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].context, "语言选型");
+        assert_eq!(decisions[0].decision, "选择 Rust");
+        assert_eq!(decisions[0].rationale, "性能更好且内存安全");
+        assert_eq!(decisions[0].alternatives, vec!["Go", "Python"]);
+        assert_eq!(decisions[0].session_id, "sess");
+        assert_eq!(decisions[0].timestamp_ms, 1000);
+        assert!(decisions[0].id.starts_with("d1000-llm-"));
+    }
+
+    /// §10.5 Epic 6:parse_llm_decision_json 解析无 markdown 包裹的 JSON
+    #[test]
+    fn parse_llm_decision_json_parses_plain_json() {
+        let response = r#"[{"context":"ctx","decision":"decide","rationale":"why","alternatives":[]}]"#;
+        let decisions = parse_llm_decision_json(response, 2000, "sess").unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "decide");
+    }
+
+    /// §10.5 Epic 6:parse_llm_decision_json 解析多条决策
+    #[test]
+    fn parse_llm_decision_json_parses_multiple_decisions() {
+        let response = r#"[
+          {"context":"c1","decision":"d1","rationale":"r1","alternatives":[]},
+          {"context":"c2","decision":"d2","rationale":"r2","alternatives":["a"]}
+        ]"#;
+        let decisions = parse_llm_decision_json(response, 3000, "sess").unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].decision, "d1");
+        assert_eq!(decisions[1].decision, "d2");
+        assert_eq!(decisions[1].alternatives, vec!["a"]);
+    }
+
+    /// §10.5 Epic 6:parse_llm_decision_json 跳过 decision 为空的条目
+    #[test]
+    fn parse_llm_decision_json_skips_empty_decision() {
+        let response = r#"[
+          {"context":"c1","decision":"","rationale":"r1","alternatives":[]},
+          {"context":"c2","decision":"d2","rationale":"r2","alternatives":[]}
+        ]"#;
+        let decisions = parse_llm_decision_json(response, 4000, "sess").unwrap();
+        assert_eq!(decisions.len(), 1, "空 decision 条目应被跳过");
+        assert_eq!(decisions[0].decision, "d2");
+    }
+
+    /// §10.5 Epic 6:parse_llm_decision_json 对非法 JSON 返回 Err
+    #[test]
+    fn parse_llm_decision_json_errors_for_invalid_json() {
+        let response = "not json at all";
+        let result = parse_llm_decision_json(response, 5000, "sess");
+        assert!(result.is_err(), "无 JSON 数组应返回 Err");
+    }
+
+    /// §10.5 Epic 6:parse_llm_decision_json 容错 — 字段缺失时用默认空字符串
+    #[test]
+    fn parse_llm_decision_json_tolerates_missing_fields() {
+        // 仅 decision 字段,其余缺失
+        let response = r#"[{"decision":"only decision"}]"#;
+        let decisions = parse_llm_decision_json(response, 6000, "sess").unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "only decision");
+        assert_eq!(decisions[0].context, "", "缺失字段应为空字符串");
+        assert_eq!(decisions[0].rationale, "");
+        assert!(decisions[0].alternatives.is_empty());
+    }
+
+    /// §10.5 Epic 6:parse_llm_decision_json 截断超长字段
+    #[test]
+    fn parse_llm_decision_json_truncates_long_fields() {
+        let long_context = "x".repeat(300);
+        let long_decision = "d".repeat(400);
+        let response = format!(
+            r#"[{{"context":"{long_context}","decision":"{long_decision}","rationale":"r","alternatives":[]}}]"#
+        );
+        let decisions = parse_llm_decision_json(&response, 7000, "sess").unwrap();
+        assert_eq!(decisions.len(), 1);
+        // context 截断到 200 字符 + 省略号(UTF-8 中 … 是 3 字节)
+        // 原文 300 字符,截断后应明显变短(≤ 203 字节 = 200 字符 + 3 字节省略号)
+        assert!(
+            decisions[0].context.chars().count() <= 201,
+            "context 应被截断到 ≤201 字符, got {} chars",
+            decisions[0].context.chars().count()
+        );
+        assert!(decisions[0].context.ends_with('…'));
+        // decision 截断到 300 字符 + 省略号
+        assert!(
+            decisions[0].decision.chars().count() <= 301,
+            "decision 应被截断到 ≤301 字符, got {} chars",
+            decisions[0].decision.chars().count()
+        );
+        assert!(decisions[0].decision.ends_with('…'));
+    }
+
+    /// §10.5 Epic 6:extract_decisions_with_llm 成功提取决策
+    #[test]
+    fn extract_decisions_with_llm_extracts_from_mock_client() {
+        let messages = vec!["we discussed the architecture"];
+        let json_response = serde_json::json!([{
+            "context": "架构讨论",
+            "decision": "采用微服务",
+            "rationale": "可扩展性",
+            "alternatives": ["单体"]
+        }]).to_string();
+        let mock = MockDecisionExtractorClient {
+            response: json_response,
+            force_error: false,
+        };
+        let decisions = extract_decisions_with_llm(&messages, "flash", &mock, "sess");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "采用微服务");
+        assert_eq!(decisions[0].alternatives, vec!["单体"]);
+        assert!(decisions[0].id.contains("llm"), "LLM 提取的 id 应含 'llm' 标记");
+    }
+
+    /// §10.5 Epic 6:extract_decisions_with_llm 在 API 失败时降级为 Heuristic
+    #[test]
+    fn extract_decisions_with_llm_falls_back_on_api_failure() {
+        // "decided" 是启发式关键词,降级后应被检测到
+        let messages = vec!["we decided to use Rust"];
+        let mock = MockDecisionExtractorClient {
+            response: String::new(),
+            force_error: true,
+        };
+        let decisions = extract_decisions_with_llm(&messages, "flash", &mock, "sess");
+        assert_eq!(decisions.len(), 1, "API 失败应降级为 Heuristic 并检测到 'decided'");
+        assert!(decisions[0].decision.contains("Rust"));
+        // Heuristic 的 id 不含 'llm' 标记
+        assert!(!decisions[0].id.contains("llm"));
+    }
+
+    /// §10.5 Epic 6:extract_decisions_with_llm 在 JSON 解析失败时降级为 Heuristic
+    #[test]
+    fn extract_decisions_with_llm_falls_back_on_json_parse_failure() {
+        let messages = vec!["we decided to use Rust"];
+        let mock = MockDecisionExtractorClient {
+            response: "invalid response not json".to_string(),
+            force_error: false,
+        };
+        let decisions = extract_decisions_with_llm(&messages, "flash", &mock, "sess");
+        assert_eq!(decisions.len(), 1, "JSON 解析失败应降级为 Heuristic");
+    }
+
+    /// §10.5 Epic 6:extract_decisions_with_llm 在 LLM 返回空数组时降级为 Heuristic
+    #[test]
+    fn extract_decisions_with_llm_falls_back_on_empty_response() {
+        let messages = vec!["we decided to use Rust"];
+        let mock = MockDecisionExtractorClient {
+            response: "[]".to_string(),
+            force_error: false,
+        };
+        let decisions = extract_decisions_with_llm(&messages, "flash", &mock, "sess");
+        assert_eq!(decisions.len(), 1, "LLM 返回空数组应降级为 Heuristic");
+    }
+
+    /// §10.5 Epic 6:build_llm_extract_prompt 包含消息列表和 JSON schema
+    #[test]
+    fn build_llm_extract_prompt_contains_required_sections() {
+        let messages = vec!["msg1", "msg2"];
+        let prompt = build_llm_extract_prompt(&messages);
+        assert!(prompt.contains("[0] msg1"), "prompt 应含消息 [0]");
+        assert!(prompt.contains("[1] msg2"), "prompt 应含消息 [1]");
+        assert!(prompt.contains("设计决策点"), "prompt 应含判定标准");
+        assert!(prompt.contains("JSON"), "prompt 应含 JSON schema");
+        assert!(prompt.contains("alternatives"), "prompt 应含 alternatives 字段说明");
+        assert!(prompt.contains("few-shot"), "prompt 应含 few-shot 示例");
+    }
+
+    /// §10.5 Epic 6:strip_markdown_code_block 剥离 ```json ... ``` 包裹
+    #[test]
+    fn strip_markdown_code_block_handles_json_block() {
+        let input = "```json\n[{\"a\":1}]\n```";
+        let stripped = strip_markdown_code_block(input);
+        assert_eq!(stripped, "[{\"a\":1}]");
+    }
+
+    /// §10.5 Epic 6:strip_markdown_code_block 剥离无语言标识的 ``` ... ``` 包裹
+    #[test]
+    fn strip_markdown_code_block_handles_plain_block() {
+        let input = "```\n[{\"a\":1}]\n```";
+        let stripped = strip_markdown_code_block(input);
+        assert_eq!(stripped, "[{\"a\":1}]");
+    }
+
+    /// §10.5 Epic 6:strip_markdown_code_block 对无包裹的文本原样返回
+    #[test]
+    fn strip_markdown_code_block_passes_through_plain_text() {
+        let input = "[{\"a\":1}]";
+        let stripped = strip_markdown_code_block(input);
+        assert_eq!(stripped, "[{\"a\":1}]");
     }
 }

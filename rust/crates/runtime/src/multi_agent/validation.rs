@@ -268,10 +268,14 @@ pub fn detect_changed_files(workspace_root: &Path) -> Vec<PathBuf> {
 /// - rubric 包含:准确性/完整性/根因定位/方案可行性
 /// - end-state evaluation:只评判最终状态,不评判中间步骤
 ///
-/// # MVP 边界
-/// **trait 设计在 MVP 就位,实现留待 v2**。
-/// 诊断任务 MVP 阶段用人工验收 + `rust_compile_gate` 双重确认。
-#[derive(Debug, Clone)]
+/// # v2 实现要点(§10.5 Epic 5)
+/// - **依赖倒置**:runtime crate 不直接依赖 api crate,通过 [`JudgeClient`] trait 注入。
+///   生产环境由上层(rusty-claude-cli)构造 `Arc<dyn JudgeClient>` 注入;
+///   测试环境用 [`MockJudgeClient`] 注入预设分数。
+/// - **无 client 时降级为 stub**:返回 `Ok(())` + Warn 诊断日志,
+///   保证未接入 judge 的项目不阻塞 validation 链。
+/// - **分数解析容错**:LLM 输出可能含解释文本,用正则提取首个 0.0-1.0 浮点数;
+///   解析失败按 `ValidationError` (retryable=false) 处理,避免无限重试。
 pub struct LlmJudgeGate {
     /// 评判模型(建议用旗舰,如 deepseek-v4-pro,保证判断质量)。
     pub judge_model: String,
@@ -281,10 +285,74 @@ pub struct LlmJudgeGate {
     pub pass_threshold: f64,
     /// workspace_root(用于读取 changed_files 内容供 judge 参考)。
     pub workspace_root: PathBuf,
+    /// judge client(v2 依赖倒置)。None 时降级为 stub。
+    client: Option<std::sync::Arc<dyn JudgeClient>>,
+}
+
+impl std::fmt::Debug for LlmJudgeGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmJudgeGate")
+            .field("judge_model", &self.judge_model)
+            .field("pass_threshold", &self.pass_threshold)
+            .field("workspace_root", &self.workspace_root)
+            .field("has_client", &self.client.is_some())
+            .finish()
+    }
+}
+
+impl Clone for LlmJudgeGate {
+    fn clone(&self) -> Self {
+        Self {
+            judge_model: self.judge_model.clone(),
+            rubric: self.rubric.clone(),
+            pass_threshold: self.pass_threshold,
+            workspace_root: self.workspace_root.clone(),
+            client: self.client.clone(),
+        }
+    }
+}
+
+/// judge client trait — v2 §10.5 Epic 5 依赖倒置。
+///
+/// runtime crate 不直接依赖 api crate(避免循环依赖),通过此 trait 注入 LLM 调用。
+/// 生产实现由上层 crate 构造(封装 `ProviderClient::from_model` + async-to-sync 桥接)。
+///
+/// # 接口约定
+/// - 输入:judge prompt(含 task/model/result/rubric)
+/// - 输出:LLM 原始文本响应(由 `LlmJudgeGate::parse_score` 解析分数)
+/// - 错误:网络/API/超时等返回 `Err(String)`,`LlmJudgeGate::validate` 负责降级处理
+///
+/// # 测试
+/// 使用 [`MockJudgeClient`] 注入预设响应,验证分数解析 + 阈值比较逻辑。
+pub trait JudgeClient: Send + Sync {
+    /// 调用 judge 模型,返回原始文本响应。
+    fn judge(&self, prompt: &str) -> Result<String, String>;
+}
+
+/// mock judge client — 仅用于测试。
+#[cfg(test)]
+pub struct MockJudgeClient {
+    /// 预设响应文本。
+    pub response: String,
+    /// 是否强制返回 Err(模拟 API 故障)。
+    pub force_error: bool,
+}
+
+#[cfg(test)]
+impl JudgeClient for MockJudgeClient {
+    fn judge(&self, _prompt: &str) -> Result<String, String> {
+        if self.force_error {
+            return Err("mock API failure".to_string());
+        }
+        Ok(self.response.clone())
+    }
 }
 
 impl LlmJudgeGate {
     /// 诊断任务默认 rubric(借鉴 Anthropic rubric 设计)。
+    ///
+    /// **注意**:此构造器不注入 client,validate 时降级为 stub(返回 Ok + Warn)。
+    /// 生产使用请用 [`LlmJudgeGate::with_client`] 注入 client。
     pub fn diagnostic_default(judge_model: impl Into<String>, workspace_root: PathBuf) -> Self {
         Self {
             judge_model: judge_model.into(),
@@ -297,26 +365,149 @@ impl LlmJudgeGate {
                 .to_string(),
             pass_threshold: 0.7, // 默认 0.7 通过
             workspace_root,
+            client: None,
         }
+    }
+
+    /// 注入 judge client — v2 生产入口。
+    ///
+    /// 在 `diagnostic_default` 基础上注入 `Arc<dyn JudgeClient>`,
+    /// 使 `validate` 执行真实的 LLM judge 调用。
+    pub fn with_client(mut self, client: std::sync::Arc<dyn JudgeClient>) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// 构造 judge prompt(v2 §10.5 Epic 5)。
+    ///
+    /// prompt 结构:
+    /// ```text
+    /// 你是一个代码评审 judge,请评估 subagent 完成的任务质量。
+    ///
+    /// ## 任务
+    /// {task}
+    ///
+    /// ## subagent 使用的模型
+    /// {model}
+    ///
+    /// ## 修改的文件
+    /// {changed_files}
+    ///
+    /// ## subagent 结果
+    /// {result_content}
+    ///
+    /// {rubric}
+    /// ```
+    fn build_judge_prompt(&self, ctx: &ValidationContext) -> String {
+        let changed_files_str = if ctx.changed_files.is_empty() {
+            "(无文件修改)".to_string()
+        } else {
+            ctx.changed_files
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let result_content = std::fs::read_to_string(ctx.result_path)
+            .unwrap_or_else(|e| format!("(读取结果文件失败: {e})"));
+
+        format!(
+            "你是一个代码评审 judge,请评估 subagent 完成的任务质量。\n\n\
+             ## 任务\n{task}\n\n\
+             ## subagent 使用的模型\n{model}\n\n\
+             ## 修改的文件\n{changed_files}\n\n\
+             ## subagent 结果\n{result}\n\n\
+             {rubric}",
+            task = ctx.task,
+            model = ctx.model,
+            changed_files = changed_files_str,
+            result = result_content,
+            rubric = self.rubric,
+        )
+    }
+
+    /// 从 LLM 响应文本解析 0.0-1.0 分数。
+    ///
+    /// 容错策略:
+    /// 1. 尝试提取首个 `0.0`-`1.0` 范围的浮点数(正则 `\d+\.\d+`)
+    /// 2. 若无匹配,尝试纯整数(如 "1" 视为 1.0,"0" 视为 0.0)
+    /// 3. 解析失败返回 Err
+    fn parse_score(text: &str) -> Result<f64, String> {
+        // 优先匹配浮点数
+        let re = regex::Regex::new(r"(\d+\.\d+)").map_err(|e| e.to_string())?;
+        if let Some(cap) = re.captures(text) {
+            if let Ok(score) = cap[1].parse::<f64>() {
+                if (0.0..=1.0).contains(&score) {
+                    return Ok(score);
+                }
+            }
+        }
+        // 回退:纯整数
+        let int_re = regex::Regex::new(r"\b(\d+)\b").map_err(|e| e.to_string())?;
+        if let Some(cap) = int_re.captures(text) {
+            if let Ok(n) = cap[1].parse::<i64>() {
+                let score = n as f64;
+                if (0.0..=1.0).contains(&score) {
+                    return Ok(score);
+                }
+            }
+        }
+        Err(format!("无法从 judge 响应解析分数: {text}"))
     }
 }
 
 impl ValidationGate for LlmJudgeGate {
     fn validate(&self, ctx: &ValidationContext) -> Result<(), ValidationError> {
-        // MVP 边界:trait 已就位,实现留待 v2。
-        // 当前返回 Ok,假设通过(诊断任务 MVP 阶段用人工验收 + rust_compile_gate 双重确认)。
-        // v2 实现时,此处应:
-        // 1. 读取 ctx.result_path 内容
-        // 2. 构造 judge prompt(任务 + 模型 + changed_files + 结果 + rubric)
-        // 3. 调用 ProviderClient::from_model(&self.judge_model)
-        // 4. 解析 0.0-1.0 分数
-        // 5. 与 self.pass_threshold 比较
-        let _ = ctx;
-        crate::diag::global().append(crate::diag::DiagEntry::new(
-            crate::diag::DiagLevel::Warn,
-            "validation",
-            "LlmJudgeGate MVP stub: skipping LLM judge (v2 implementation pending)",
-        ));
+        // 无 client 时降级为 stub(向后兼容 P0 行为)
+        let client = match &self.client {
+            None => {
+                crate::diag::global().append(crate::diag::DiagEntry::new(
+                    crate::diag::DiagLevel::Warn,
+                    "validation",
+                    "LlmJudgeGate no client injected: skipping LLM judge (stub mode)",
+                ));
+                return Ok(());
+            }
+            Some(c) => c.clone(),
+        };
+
+        // 1. 构造 judge prompt
+        let prompt = self.build_judge_prompt(ctx);
+
+        // 2. 调用 judge client
+        let response = client.judge(&prompt).map_err(|e| ValidationError {
+            message: format!("LLM judge 调用失败: {e}"),
+            retryable: false, // API 故障不重试(避免无限重试 + 成本失控)
+        })?;
+
+        // 3. 解析分数
+        let score = Self::parse_score(&response).map_err(|e| ValidationError {
+            message: format!("{e}"),
+            retryable: false, // 解析失败不重试(LLM 输出格式问题,重试也不一定改善)
+        })?;
+
+        crate::diag::global().append(
+            crate::diag::DiagEntry::new(
+                crate::diag::DiagLevel::Info,
+                "validation",
+                format!("LlmJudgeGate score: {score:.3} (threshold: {:.3})", self.pass_threshold),
+            )
+            .with_field("score", serde_json::Value::from(score))
+            .with_field("threshold", serde_json::Value::from(self.pass_threshold)),
+        );
+
+        // 4. 阈值比较
+        if score < self.pass_threshold {
+            return Err(ValidationError {
+                message: format!(
+                    "LLM judge 评分 {score:.3} 低于阈值 {:.3}",
+                    self.pass_threshold
+                ),
+                retryable: true, // 评分低可重试(换模型或重做任务)
+            });
+        }
+
         Ok(())
     }
 
@@ -546,5 +737,214 @@ mod tests {
         let gate = rust_compile_gate(PathBuf::from("/tmp"));
         assert_eq!(gate.gate_name(), "cargo-build");
         assert_eq!(gate.name(), "command");
+    }
+
+    // ===== v2 §10.5 Epic 5:LlmJudgeGate 完整实现测试 =====
+
+    /// §10.5 Epic 5:with_client 注入 client 后,高分(0.85 > 0.7)验证通过
+    #[test]
+    fn llm_judge_gate_with_client_passes_when_score_above_threshold() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let result_path = tempdir.path().join("result.md");
+        std::fs::write(&result_path, "修复了根因,验证通过").unwrap();
+
+        let mock = MockJudgeClient {
+            response: "0.85".to_string(),
+            force_error: false,
+        };
+        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+            .with_client(std::sync::Arc::new(mock));
+
+        let changed_files = vec![PathBuf::from("src/main.rs")];
+        let ctx = make_ctx(
+            "sub-1",
+            "诊断任务",
+            &result_path,
+            tempdir.path(),
+            &changed_files,
+            "deepseek-v4-flash",
+        );
+
+        assert!(gate.validate(&ctx).is_ok(), "score 0.85 > 0.7 应通过");
+    }
+
+    /// §10.5 Epic 5:with_client 注入 client 后,低分(0.40 < 0.7)验证失败(retryable)
+    #[test]
+    fn llm_judge_gate_with_client_fails_when_score_below_threshold() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let result_path = tempdir.path().join("result.md");
+        std::fs::write(&result_path, "修复不完整").unwrap();
+
+        let mock = MockJudgeClient {
+            response: "0.40".to_string(),
+            force_error: false,
+        };
+        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+            .with_client(std::sync::Arc::new(mock));
+
+        let changed_files = vec![];
+        let ctx = make_ctx(
+            "sub-1",
+            "诊断任务",
+            &result_path,
+            tempdir.path(),
+            &changed_files,
+            "deepseek-v4-flash",
+        );
+
+        let err = gate.validate(&ctx).expect_err("0.40 < 0.7 应失败");
+        assert!(err.retryable, "评分低应可重试");
+        assert!(err.message.contains("0.40"), "错误消息应含分数: {}", err.message);
+        assert!(err.message.contains("0.7"), "错误消息应含阈值: {}", err.message);
+    }
+
+    /// §10.5 Epic 5:client 调用失败(API 故障)时返回 fatal 错误(retryable=false)
+    #[test]
+    fn llm_judge_gate_with_client_returns_fatal_error_on_api_failure() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let result_path = tempdir.path().join("result.md");
+        std::fs::write(&result_path, "any content").unwrap();
+
+        let mock = MockJudgeClient {
+            response: String::new(),
+            force_error: true,
+        };
+        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+            .with_client(std::sync::Arc::new(mock));
+
+        let changed_files = vec![];
+        let ctx = make_ctx(
+            "sub-1",
+            "诊断任务",
+            &result_path,
+            tempdir.path(),
+            &changed_files,
+            "deepseek-v4-flash",
+        );
+
+        let err = gate.validate(&ctx).expect_err("API 故障应失败");
+        assert!(!err.retryable, "API 故障不可重试(避免无限重试 + 成本失控)");
+        assert!(err.message.contains("LLM judge 调用失败"), "unexpected: {}", err.message);
+    }
+
+    /// §10.5 Epic 5:LLM 响应含解释文本时仍能解析分数
+    #[test]
+    fn llm_judge_gate_parse_score_extracts_score_from_explanatory_text() {
+        // LLM 常输出"评分: 0.82\n理由: ..."格式
+        let score = LlmJudgeGate::parse_score("根据 rubric,评分: 0.82\n理由: 根因定位准确...").unwrap();
+        assert!((score - 0.82).abs() < 1e-9, "应提取 0.82, got {score}");
+    }
+
+    /// §10.5 Epic 5:parse_score 解析纯整数("1" → 1.0, "0" → 0.0)
+    #[test]
+    fn llm_judge_gate_parse_score_handles_integer_responses() {
+        assert!((LlmJudgeGate::parse_score("1").unwrap() - 1.0).abs() < 1e-9);
+        assert!((LlmJudgeGate::parse_score("0").unwrap() - 0.0).abs() < 1e-9);
+    }
+
+    /// §10.5 Epic 5:parse_score 对无数字或越界数字返回 Err
+    #[test]
+    fn llm_judge_gate_parse_score_errors_for_invalid_input() {
+        assert!(LlmJudgeGate::parse_score("无分数").is_err());
+        assert!(LlmJudgeGate::parse_score("2.5").is_err(), "2.5 越界应失败");
+        assert!(LlmJudgeGate::parse_score("5").is_err(), "5 越界应失败");
+    }
+
+    /// §10.5 Epic 5:parse_score 解析失败时 validate 返回 fatal 错误
+    #[test]
+    fn llm_judge_gate_returns_fatal_error_when_score_unparseable() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let result_path = tempdir.path().join("result.md");
+        std::fs::write(&result_path, "content").unwrap();
+
+        let mock = MockJudgeClient {
+            response: "我无法评分".to_string(),
+            force_error: false,
+        };
+        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+            .with_client(std::sync::Arc::new(mock));
+
+        let ctx = make_ctx(
+            "sub-1",
+            "诊断任务",
+            &result_path,
+            tempdir.path(),
+            &[],
+            "deepseek-v4-flash",
+        );
+
+        let err = gate.validate(&ctx).expect_err("解析失败应报错");
+        assert!(!err.retryable, "解析失败不可重试");
+    }
+
+    /// §10.5 Epic 5:build_judge_prompt 包含 task/model/rubric 三要素
+    #[test]
+    fn llm_judge_gate_build_prompt_contains_required_sections() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let result_path = tempdir.path().join("result.md");
+        std::fs::write(&result_path, "修复内容").unwrap();
+
+        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf());
+        let changed_files = vec![PathBuf::from("src/main.rs")];
+        let ctx = make_ctx(
+            "sub-1",
+            "诊断崩溃任务",
+            &result_path,
+            tempdir.path(),
+            &changed_files,
+            "deepseek-v4-flash",
+        );
+
+        let prompt = gate.build_judge_prompt(&ctx);
+        assert!(prompt.contains("诊断崩溃任务"), "prompt 应含 task");
+        assert!(prompt.contains("deepseek-v4-flash"), "prompt 应含 subagent model");
+        assert!(prompt.contains("src/main.rs"), "prompt 应含 changed_files");
+        assert!(prompt.contains("修复内容"), "prompt 应含 result_content");
+        assert!(prompt.contains("根因定位"), "prompt 应含 rubric");
+    }
+
+    /// §10.5 Epic 5:无 client 时降级为 stub(向后兼容 P0 行为)
+    #[test]
+    fn llm_judge_gate_without_client_degrades_to_stub() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let result_path = tempdir.path().join("result.md");
+        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf());
+        // 不调用 with_client,client 为 None
+        let ctx = make_ctx(
+            "sub-1",
+            "诊断任务",
+            &result_path,
+            tempdir.path(),
+            &[],
+            "deepseek-v4-flash",
+        );
+        // stub 模式应返回 Ok
+        assert!(gate.validate(&ctx).is_ok(), "无 client 时应降级为 stub 返回 Ok");
+    }
+
+    /// §10.5 Epic 5:阈值边界 — 分数恰好等于阈值应通过
+    #[test]
+    fn llm_judge_gate_passes_when_score_equals_threshold() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let result_path = tempdir.path().join("result.md");
+        std::fs::write(&result_path, "content").unwrap();
+
+        let mock = MockJudgeClient {
+            response: "0.7".to_string(), // 恰好等于默认阈值
+            force_error: false,
+        };
+        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+            .with_client(std::sync::Arc::new(mock));
+
+        let ctx = make_ctx(
+            "sub-1",
+            "诊断任务",
+            &result_path,
+            tempdir.path(),
+            &[],
+            "deepseek-v4-flash",
+        );
+
+        assert!(gate.validate(&ctx).is_ok(), "分数 0.7 == 阈值 0.7 应通过");
     }
 }

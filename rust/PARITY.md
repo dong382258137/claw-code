@@ -226,9 +226,9 @@ Harness note: current coverage now includes write-file denial, bash escalation a
 - [x] **v2 Phase 1 Epic 1:Architectural SOP 注入**(2026-07-27)— `build_subagent_system_prompt` 新增 Architectural 复杂度的架构决策 SOP(六条规则:候选方案/trade-off/rationale/向后兼容/NOTEBOOK 持久化/禁止凭直觉拍板)
 - [x] **v2 Phase 1 Epic 2:多 ValidationGate 注册**(2026-07-27)— `validation.rs` 新增 `npm_build_gate`/`pytest_gate` helper,`app.rs` 用 `command_exists` 探测 PATH 后注册 rust/npm/pytest gate,`file_filter` 正则隔离互不干扰
 - [x] **v2 Phase 1 Epic 3:spawn_parallel 真并行路径文档化**(2026-07-27)— `spawn_parallel` 文档指向 DAG 模块(`DagScheduler`+`CoordinatorExecutor`+`SubagentDispatcher`)真并行路径,新增串行退化语义测试
-- [ ] **v2 Phase 2 Epic 4:checkpoint restore**(实现 `restore_from_checkpoint`)
-- [ ] **v2 Phase 2 Epic 5:`LlmJudgeGate` 实现**(引入 `JudgeClient` trait 依赖倒置 + `call_judge_model`)
-- [ ] **v2 Phase 2 Epic 6:`DetectionStrategy::LlmExtract` 实现**(用 LLM 提取决策点,替代启发式关键词)
+- [x] **v2 Phase 2 Epic 4:checkpoint restore**(2026-07-27)— 实现 `restore_from_checkpoint`,读取 JSON → 反序列化 Subagent → Running 降级为 Created → 插入 registry。5 个测试(roundtrip/Running 降级/文件不存在/损坏 JSON/id 冲突)全通过
+- [x] **v2 Phase 2 Epic 5:LlmJudgeGate 实现**(2026-07-27)— 引入 `JudgeClient` trait 依赖倒置(runtime 不依赖 api crate),实现 `parse_score`(正则提取 0.0-1.0 浮点数/整数回退)+ `build_judge_prompt` + `validate`(client 调用/分数解析/阈值比较)。无 client 时降级为 stub。9 个新测试全通过
+- [x] **v2 Phase 2 Epic 6:决策持久化 LlmExtract**(2026-07-27)— 引入 `DecisionExtractorClient` trait + 全局 OnceLock 注册。实现 `extract_decisions_with_llm` + `build_llm_extract_prompt` + `parse_llm_decision_json`(剥离 markdown 代码块 + JSON 数组解析 + 字段缺失容错 + 截断)。三重降级策略(API 失败/JSON 解析失败/空数组 → Heuristic)。15 个新测试全通过
 - [ ] 多 provider 升级链（Anthropic/OpenAI/xAI，v3 阶段）
 
 ### API 与文档差异说明

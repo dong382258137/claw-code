@@ -30,7 +30,7 @@ pub use dag::{
 pub use dag::DagStore;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -567,6 +567,80 @@ impl MultiAgentCoordinator {
         );
 
         Ok(path)
+    }
+
+    /// 从 checkpoint 恢复 subagent — Multi-Agent Hardening v2 §10.5 Epic 4。
+    ///
+    /// `save_checkpoint` 的逆操作:读取 JSON 文件 → 反序列化为 `Subagent` →
+    /// 插入 registry,返回恢复的 subagent_id。
+    ///
+    /// # 语义边界(v2 设计决策)
+    /// **恢复 = 恢复 subagent 注册表 + 元状态,不恢复 LLM 对话历史。**
+    /// - 恢复后 subagent 可被 retry loop 重新调度(`get`/`reset_for_retry`/`start`)
+    /// - 恢复后 subagent 可被 `validate`(若状态为 Completed)
+    /// - **不恢复** LLM 上下文:下一次 turn 会用全新 system prompt + task 重新构造请求
+    ///
+    /// 这与 LangGraph/Temporal 的 durable execution 语义一致:"resume from where
+    /// the agent was" 指恢复到最近的 checkpoint 状态,而非完整的执行历史。
+    ///
+    /// # 状态机一致性
+    /// 持久化时若状态为 `Running`(崩溃前正在执行),恢复后降级为 `Created`:
+    /// - `Running` 意味着有活跃的 tokio task,但崩溃后该 task 已不存在
+    /// - 降级为 `Created` 允许 retry loop 重新 `start()` 调度
+    /// - 其他状态(`Created`/`Completed`/`Failed`/`Cancelled`)原样保留
+    ///
+    /// # 返回
+    /// - `Ok(subagent_id)`: 恢复成功,返回 subagent id(可用于后续 `start`/`get`)
+    /// - `Err(msg)`: 文件不存在 / 反序列化失败 / registry 已有同 id subagent
+    ///
+    /// # 使用场景
+    /// 1. **崩溃恢复**:进程重启后扫描 `.claw/checkpoints/` 目录,对每个 checkpoint
+    ///    调用 restore,让 retry loop 接管未完成的 subagent
+    /// 2. **跨进程恢复**:主 CLI 崩溃后,headless 模式或新 CLI 进程可恢复 subagent
+    /// 3. **调试**:从 checkpoint 文件恢复特定 subagent 状态用于复现
+    pub fn restore_from_checkpoint(&self, path: &Path) -> Result<String, String> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| format!("read checkpoint failed: {e}"))?;
+        let mut agent: Subagent = serde_json::from_str(&json)
+            .map_err(|e| format!("deserialize subagent failed: {e}"))?;
+
+        // 状态机一致性:Running 降级为 Created
+        // 崩溃前 Running 的 subagent 没有活跃的 tokio task,需重新 start()
+        if agent.status == SubagentStatus::Running {
+            agent.status = SubagentStatus::Created;
+        }
+
+        let id = agent.id.clone();
+
+        // 检查 id 冲突:registry 已有同 id subagent 时拒绝覆盖
+        {
+            let agents = self.subagents.lock().expect("subagents lock poisoned");
+            if agents.contains_key(&id) {
+                return Err(format!(
+                    "subagent {id} already exists in registry — restore would overwrite"
+                ));
+            }
+        }
+
+        // 插入 registry
+        {
+            let mut agents = self.subagents.lock().expect("subagents lock poisoned");
+            agents.insert(id.clone(), agent);
+        }
+
+        crate::diag::global().append(
+            crate::diag::DiagEntry::new(
+                crate::diag::DiagLevel::Info,
+                "checkpoint",
+                format!("checkpoint restored for subagent {id}"),
+            )
+            .with_field(
+                "path",
+                serde_json::Value::String(path.to_string_lossy().into_owned()),
+            ),
+        );
+
+        Ok(id)
     }
 
     /// 注册验证门禁 — Multi-Agent Hardening §4.4。
@@ -1740,6 +1814,109 @@ mod tests {
         // 实际场景中调用方用 `let _ = coordinator.save_checkpoint(&id)` 容错
         let _ = coord.save_checkpoint(&id);
         // 不 panic 即视为通过
+    }
+
+    /// §10.5 v2 Epic 4:restore_from_checkpoint roundtrip 恢复 subagent 元状态
+    #[test]
+    fn restore_from_checkpoint_rebuilds_subagent_state() {
+        let coord = MultiAgentCoordinator::new();
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        coord.set_workspace_root(tempdir.path().to_path_buf());
+
+        // 创建 subagent 并推进到 Completed 状态
+        let id = coord.spawn_with_model(
+            "diag-agent",
+            "root cause analysis",
+            CoordinationMode::Fork,
+            "deepseek-v4-pro",
+            TaskComplexity::Diagnostic,
+        ).expect("spawn ok");
+        coord.start(&id).unwrap();
+        coord.add_cost(&id, 0.022).unwrap();
+        coord.complete(&id, "fixed").unwrap();
+
+        // 保存 checkpoint
+        let path = coord.save_checkpoint(&id).expect("save should succeed");
+
+        // 用新的 coordinator 模拟"进程重启"
+        let coord2 = MultiAgentCoordinator::new();
+        coord2.set_workspace_root(tempdir.path().to_path_buf());
+
+        // 恢复
+        let restored_id = coord2.restore_from_checkpoint(&path).expect("restore should succeed");
+        assert_eq!(restored_id, id, "restored id should match original");
+
+        // 验证元状态字段完整恢复
+        let agent = coord2.get(&restored_id).expect("restored agent should exist");
+        assert_eq!(agent.id, id);
+        assert_eq!(agent.name, "diag-agent");
+        assert_eq!(agent.task, "root cause analysis");
+        assert_eq!(agent.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(agent.complexity, TaskComplexity::Diagnostic);
+        assert_eq!(agent.status, SubagentStatus::Completed, "Completed 状态应原样保留");
+        assert!((agent.cost_accumulated - 0.022).abs() < 1e-9, "cost_accumulated 应恢复");
+        assert_eq!(agent.result.as_deref(), Some("fixed"));
+    }
+
+    /// §10.5 v2 Epic 4:restore_from_checkpoint 将 Running 状态降级为 Created
+    /// (崩溃前 Running 的 subagent 没有活跃 tokio task,需重新 start)
+    #[test]
+    fn restore_from_checkpoint_demotes_running_to_created() {
+        let coord = MultiAgentCoordinator::new();
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        coord.set_workspace_root(tempdir.path().to_path_buf());
+
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        coord.start(&id).unwrap(); // 进入 Running
+        assert_eq!(coord.get(&id).unwrap().status, SubagentStatus::Running);
+
+        let path = coord.save_checkpoint(&id).expect("save");
+
+        // 新 coordinator 恢复
+        let coord2 = MultiAgentCoordinator::new();
+        let restored_id = coord2.restore_from_checkpoint(&path).expect("restore");
+        let agent = coord2.get(&restored_id).expect("exists");
+        assert_eq!(
+            agent.status,
+            SubagentStatus::Created,
+            "Running 应降级为 Created(无活跃 tokio task)"
+        );
+    }
+
+    /// §10.5 v2 Epic 4:restore_from_checkpoint 对不存在文件返回 Err
+    #[test]
+    fn restore_from_checkpoint_errors_for_missing_file() {
+        let coord = MultiAgentCoordinator::new();
+        let path = std::path::Path::new("/nonexistent/checkpoint.json");
+        let err = coord.restore_from_checkpoint(path).expect_err("should fail");
+        assert!(err.contains("read checkpoint failed"), "unexpected error: {err}");
+    }
+
+    /// §10.5 v2 Epic 4:restore_from_checkpoint 对损坏 JSON 返回 Err
+    #[test]
+    fn restore_from_checkpoint_errors_for_corrupt_json() {
+        let coord = MultiAgentCoordinator::new();
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let corrupt_path = tempdir.path().join("corrupt.json");
+        std::fs::write(&corrupt_path, "not valid json {").unwrap();
+
+        let err = coord.restore_from_checkpoint(&corrupt_path).expect_err("should fail");
+        assert!(err.contains("deserialize"), "unexpected error: {err}");
+    }
+
+    /// §10.5 v2 Epic 4:restore_from_checkpoint 拒绝覆盖已有同 id subagent
+    #[test]
+    fn restore_from_checkpoint_rejects_id_collision() {
+        let coord = MultiAgentCoordinator::new();
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        coord.set_workspace_root(tempdir.path().to_path_buf());
+
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        let path = coord.save_checkpoint(&id).expect("save");
+
+        // 同一 coordinator 再 restore 应失败(id 已存在)
+        let err = coord.restore_from_checkpoint(&path).expect_err("should reject");
+        assert!(err.contains("already exists"), "unexpected error: {err}");
     }
 
     /// §10.4 validate:无 gate 注册时,Completed 状态始终通过

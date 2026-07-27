@@ -403,11 +403,104 @@ P0 + P1 全部完成,后续进入 v2/v3 阶段:
 - **cargo test -p rusty-claude-cli --lib**: ✅ 368 passed / 0 failed / 0 ignored
 - **cargo test -p runtime --lib build_subagent_system_prompt**: ✅ 3 passed(含新增 Architectural SOP 测试)
 
-### v2 Phase 2 待办(后续推进)
+### v2 Phase 2 实施详情(2026-07-27 完成)
 
-1. **Epic 4:checkpoint restore** — 实现 `restore_from_checkpoint`,需先明确语义边界(元状态恢复 vs 对话历史恢复)
-2. **Epic 5:LlmJudgeGate 实现** — 引入 `JudgeClient` trait 依赖倒置,实现 `call_judge_model`
-3. **Epic 6:决策持久化 LlmExtract** — 复用 Epic 5 的 LLM 调用模式,实现 `DetectionStrategy::LlmExtract`
+#### Epic 4:checkpoint restore
+
+**核心文件**:[multi_agent/mod.rs](../../rust/crates/runtime/src/multi_agent/mod.rs) `restore_from_checkpoint`
+
+**语义边界**(v2 设计决策):
+- 恢复 = 恢复 subagent 注册表 + 元状态,**不恢复 LLM 对话历史**
+- 恢复后 subagent 可被 retry loop 重新调度(`get`/`reset_for_retry`/`start`)
+- 下一次 turn 用全新 system prompt + task 重新构造请求(与 LangGraph/Temporal durable execution 语义一致)
+
+**状态机一致性**:
+- 持久化时若状态为 `Running`(崩溃前正在执行),恢复后降级为 `Created`
+- 崩溃前的 tokio task 已不存在,降级为 `Created` 允许 retry loop 重新 `start()` 调度
+- 其他状态(`Created`/`Completed`/`Failed`/`Cancelled`)原样保留
+
+**冲突保护**:registry 已有同 id subagent 时拒绝覆盖(返回 `Err`),避免意外覆盖内存中的活跃 subagent
+
+**测试覆盖**(5 个):
+- `restore_from_checkpoint_roundtrip` — save → restore 完整闭环
+- `restore_from_checkpoint_demotes_running_to_created` — 状态机降级
+- `restore_from_checkpoint_returns_error_for_missing_file` — 文件不存在
+- `restore_from_checkpoint_returns_error_for_corrupt_json` — 损坏 JSON
+- `restore_from_checkpoint_returns_error_for_duplicate_id` — id 冲突保护
+
+#### Epic 5:LlmJudgeGate 实现
+
+**核心文件**:[multi_agent/validation.rs](../../rust/crates/runtime/src/multi_agent/validation.rs) `LlmJudgeGate` + `JudgeClient`
+
+**依赖倒置设计**:
+- runtime crate 不直接依赖 api crate(避免循环依赖)
+- 通过 `JudgeClient` trait 注入 LLM 调用:`fn judge(&self, prompt: &str) -> Result<String, String>`
+- 生产实现由上层 crate 构造(封装 `ProviderClient::from_model` + async-to-sync 桥接)
+- 测试用 `MockJudgeClient` 注入预设响应
+
+**核心实现**:
+- `build_judge_prompt` — 构造含 task/model/changed_files/result_content/rubric 的 prompt
+- `parse_score` — 正则提取 0.0-1.0 浮点数;支持整数回退(`1` → `1.0`)
+- `validate` — 无 client 时降级 stub(Ok + Warn 诊断);有 client 时调用 → 解析 → 阈值比较
+- 阈值比较:score < pass_threshold 返回 `ValidationError { retryable: true }`(可重试换模型/重做)
+
+**错误处理**:
+- API 故障(`client.judge` Err)→ `retryable: false`(避免无限重试 + 成本失控)
+- 解析失败 → `retryable: false`(LLM 输出格式问题,重试不一定改善)
+- 评分低 → `retryable: true`(可换模型或重做任务)
+
+**测试覆盖**(9 个):
+- `llm_judge_gate_with_client_high_score_passes` — 高分通过
+- `llm_judge_gate_with_client_low_score_fails_with_retryable_error` — 低分失败,标记 retryable
+- `llm_judge_gate_with_client_parse_failure_returns_non_retryable_error` — 解析失败,non-retryable
+- `llm_judge_gate_with_client_api_failure_returns_non_retryable_error` — API 故障,non-retryable
+- `llm_judge_gate_no_client_degrades_to_stub` — 无 client 降级 stub
+- `llm_judge_gate_parse_score_extracts_decimal` — 浮点数解析
+- `llm_judge_gate_parse_score_extracts_integer` — 整数回退
+- `llm_judge_gate_parse_score_returns_none_for_no_number` — 无数字返 None
+- `llm_judge_gate_build_judge_prompt_includes_all_fields` — prompt 完整性
+
+#### Epic 6:决策持久化 LlmExtract
+
+**核心文件**:[decision_log.rs](../../rust/crates/runtime/src/decision_log.rs) `extract_decisions_with_llm` + `DecisionExtractorClient`
+
+**依赖倒置设计**:
+- `DecisionExtractorClient` trait:`fn extract(&self, prompt: &str) -> Result<String, String>`
+- 全局 OnceLock 注册:`set_global_decision_extractor_client` 在进程启动时注入
+- 未注入时 `DetectionStrategy::LlmExtract` 降级为 Heuristic(零成本回退)
+
+**核心实现**:
+- `build_llm_extract_prompt` — 构造含消息列表 + JSON schema 说明 + few-shot 示例的 prompt
+- `parse_llm_decision_json` — 剥离 markdown 代码块(```json ... ```)→ JSON 数组解析 → 字段缺失容错 → 截断(context 200 / decision 300 / rationale 500 / alternatives 100)
+- `extract_decisions_with_llm` — 调用 client → 解析 → 返回 DecisionPoint 列表
+
+**三重降级策略**:
+1. LLM 调用失败(`client.extract` Err)→ 回退 Heuristic(保证不丢决策)
+2. JSON 解析失败 → 回退 Heuristic
+3. LLM 返回空数组 → 回退 Heuristic(可能 LLM 漏掉了决策)
+
+**部分条目解析失败**:跳过该条,保留成功解析的条目(避免一条错误拖垮全部)
+
+**测试覆盖**(15 个):
+- JSON 解析:`parse_llm_decision_json_strips_markdown_code_block` / `parse_llm_decision_json_handles_plain_json` / `parse_llm_decision_json_returns_error_for_invalid_json` / `parse_llm_decision_json_skips_entries_with_missing_required_fields` / `parse_llm_decision_json_truncates_long_fields`
+- prompt 构造:`build_llm_extract_prompt_includes_messages_and_schema` / `build_llm_extract_prompt_includes_few_shot_example`
+- 降级路径:`extract_decisions_with_llm_falls_back_to_heuristic_on_api_failure` / `extract_decisions_with_llm_falls_back_to_heuristic_on_parse_failure` / `extract_decisions_with_llm_falls_back_to_heuristic_on_empty_array`
+- 成功路径:`extract_decisions_with_llm_returns_decisions_on_success`
+- 全局注册:`set_global_decision_extractor_client_registers_client` / `global_decision_extractor_client_returns_none_when_uninitialized`
+- 截断(字符而非字节):`parse_llm_decision_json_truncates_by_char_count_not_byte_count`
+- LLM 调用次数:`extract_decisions_with_llm_calls_client_exactly_once`
+
+### v2 Phase 2 验收(2026-07-27)
+
+- **cargo build -p runtime**: ✅ PASS
+- **cargo test -p runtime --lib**: ✅ 1367 passed / 0 failed / 2 ignored(新增 29 个测试:5 checkpoint restore + 9 LlmJudgeGate + 15 LlmExtract)
+- **零警告**(仅 `private_interfaces` MVP 阶段可接受警告)
+
+### v2 Phase 3 待办(后续推进)
+
+1. **多 provider 升级链**:Anthropic/OpenAI/xAI 接入 `model_tier` 跨 provider 升级(v3 阶段)
+2. **`spawn_parallel` 真并行接入**:在 `execute_dispatch_subagent` 中调用 `DagScheduler::run` 实现 tokio JoinSet 并发调度
+3. **生产环境 JudgeClient/DecisionExtractorClient 注入**:在 `rusty-claude-cli` 启动时构造 `Arc<dyn JudgeClient>` + `Arc<dyn DecisionExtractorClient>` 注入 runtime
 
 ---
 
