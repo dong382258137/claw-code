@@ -166,6 +166,58 @@ fn default_max_attempts() -> u32 {
     1
 }
 
+/// v3 新增(P1):`spawn_parallel` 的请求参数。
+///
+/// 每个 `SpawnRequest` 对应一次 `spawn_with_model` 调用,
+/// `spawn_parallel` 按顺序返回每个请求的结果。
+///
+/// # 示例
+/// ```
+/// use runtime::multi_agent::{SpawnRequest, CoordinationMode, TaskComplexity};
+///
+/// let req = SpawnRequest::new(
+///     "diag-agent",
+///     "定位 wizard 闪退",
+///     CoordinationMode::Fork,
+///     "deepseek-v4-pro",
+///     TaskComplexity::Diagnostic,
+/// );
+/// assert_eq!(req.name, "diag-agent");
+/// ```
+#[derive(Debug, Clone)]
+pub struct SpawnRequest {
+    /// 子 agent 名称。
+    pub name: String,
+    /// 任务描述。
+    pub task: String,
+    /// 编排模式。
+    pub mode: CoordinationMode,
+    /// 模型名。
+    pub model: String,
+    /// 任务复杂度。
+    pub complexity: TaskComplexity,
+}
+
+impl SpawnRequest {
+    /// 创建一个新的 `SpawnRequest`。
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        task: impl Into<String>,
+        mode: CoordinationMode,
+        model: impl Into<String>,
+        complexity: TaskComplexity,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            task: task.into(),
+            mode,
+            model: model.into(),
+            complexity,
+        }
+    }
+}
+
 /// 多 agent 协调器 — 管理 agent 生命周期 + 任务分派。
 ///
 /// Multi-Agent Hardening v3:扩展验证门禁链 + workspace_root 注入。
@@ -344,6 +396,42 @@ impl MultiAgentCoordinator {
             }
         }
         Ok(id)
+    }
+
+    /// v3 新增(P1):并行 spawn 多个 subagent(预留接口)。
+    ///
+    /// 借鉴 Anthropic Multi-Agent Research System:lead agent 并行 spawn 3-5 subagents,
+    /// 复杂查询研究时间减少 90%。
+    ///
+    /// **MVP 阶段退化为串行调用 `spawn_with_model`**,v2 接入 tokio 实现真并行。
+    /// 串行退化保证接口就位,调用方可直接使用,v2 升级时只需替换实现。
+    ///
+    /// # 参数
+    /// - `tasks`:spawn 请求列表,每个请求包含 name/task/mode/model/complexity
+    ///
+    /// # 返回
+    /// - `Vec<Result<String, String>>`:每个请求对应一个结果(Ok=id, Err=原因)
+    /// - 顺序与输入 `tasks` 一致
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let coordinator = MultiAgentCoordinator::new();
+    /// let tasks = vec![
+    ///     SpawnRequest::new("agent-a", "task A", CoordinationMode::Fork, "deepseek-v4-flash", TaskComplexity::Simple),
+    ///     SpawnRequest::new("agent-b", "task B", CoordinationMode::Fork, "deepseek-v4-pro", TaskComplexity::Diagnostic),
+    /// ];
+    /// let results = coordinator.spawn_parallel(tasks);
+    /// assert_eq!(results.len(), 2);
+    /// ```
+    pub fn spawn_parallel(&self, tasks: Vec<SpawnRequest>) -> Vec<Result<String, String>> {
+        // MVP:串行执行,v2 改为 tokio::join_all 并行
+        // 注:串行退化不改变接口语义,调用方无需感知差异
+        tasks
+            .into_iter()
+            .map(|t| {
+                self.spawn_with_model(t.name, t.task, t.mode, t.model, t.complexity)
+            })
+            .collect()
     }
 
     /// 重置子 agent 以进行重试 — Multi-Agent Hardening §4.5。
@@ -1257,6 +1345,117 @@ mod tests {
         let agent = coord.get(&id).expect("agent should exist");
         assert_eq!(agent.complexity, TaskComplexity::Simple);
         assert_eq!(agent.max_attempts, 1);
+    }
+
+    /// §10.3 P1 步骤 7:spawn_parallel 接口预留 — 多任务串行 spawn
+    #[test]
+    fn spawn_parallel_spawns_multiple_subagents_serially() {
+        let coord = MultiAgentCoordinator::new();
+        let tasks = vec![
+            SpawnRequest::new(
+                "agent-a",
+                "task A",
+                CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                TaskComplexity::Simple,
+            ),
+            SpawnRequest::new(
+                "agent-b",
+                "task B",
+                CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                TaskComplexity::Diagnostic,
+            ),
+            SpawnRequest::new(
+                "agent-c",
+                "task C",
+                CoordinationMode::Teammate,
+                "deepseek-v4-flash",
+                TaskComplexity::Simple,
+            ),
+        ];
+
+        let results = coord.spawn_parallel(tasks);
+        assert_eq!(results.len(), 3, "should return 3 results");
+        assert!(results.iter().all(|r| r.is_ok()), "all spawns should succeed");
+
+        // 验证三个 subagent 都已注册且字段正确
+        let id_a = results[0].as_ref().unwrap();
+        let id_b = results[1].as_ref().unwrap();
+        let id_c = results[2].as_ref().unwrap();
+        assert_ne!(id_a, id_b, "ids should be unique");
+        assert_ne!(id_b, id_c, "ids should be unique");
+
+        let agent_a = coord.get(id_a).expect("agent-a exists");
+        assert_eq!(agent_a.name, "agent-a");
+        assert_eq!(agent_a.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(agent_a.complexity, TaskComplexity::Simple);
+
+        let agent_b = coord.get(id_b).expect("agent-b exists");
+        assert_eq!(agent_b.name, "agent-b");
+        assert_eq!(agent_b.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(agent_b.complexity, TaskComplexity::Diagnostic);
+        assert_eq!(agent_b.max_attempts, 2, "Diagnostic should default to max_attempts=2");
+
+        let agent_c = coord.get(id_c).expect("agent-c exists");
+        assert_eq!(agent_c.mode, CoordinationMode::Teammate);
+    }
+
+    /// §10.3 P1 步骤 7:spawn_parallel 空列表返回空结果
+    #[test]
+    fn spawn_parallel_empty_list_returns_empty() {
+        let coord = MultiAgentCoordinator::new();
+        let results = coord.spawn_parallel(vec![]);
+        assert!(results.is_empty(), "empty input should return empty");
+    }
+
+    /// §10.3 P1 步骤 7:spawn_parallel 能力校验失败时返回对应 Err
+    #[test]
+    fn spawn_parallel_propagates_capability_errors() {
+        let coord = MultiAgentCoordinator::new();
+        // flash + Diagnostic 应失败(Budget 模型不能处理 Diagnostic 任务)
+        let tasks = vec![
+            SpawnRequest::new(
+                "ok-agent",
+                "simple task",
+                CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                TaskComplexity::Simple,
+            ),
+            SpawnRequest::new(
+                "bad-agent",
+                "diagnostic task",
+                CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                TaskComplexity::Diagnostic,
+            ),
+        ];
+
+        let results = coord.spawn_parallel(tasks);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok(), "first task should succeed");
+        assert!(results[1].is_err(), "second task should fail (Budget + Diagnostic)");
+
+        // 验证错误消息含能力校验信息
+        let err = results[1].as_ref().unwrap_err();
+        assert!(err.contains("Budget"), "error should mention Budget tier: {err}");
+    }
+
+    /// §10.3 P1 步骤 7:SpawnRequest::new 构造正确字段
+    #[test]
+    fn spawn_request_new_constructs_correctly() {
+        let req = SpawnRequest::new(
+            "test-agent",
+            "test task",
+            CoordinationMode::Worktree,
+            "deepseek-v4-pro",
+            TaskComplexity::Architectural,
+        );
+        assert_eq!(req.name, "test-agent");
+        assert_eq!(req.task, "test task");
+        assert_eq!(req.mode, CoordinationMode::Worktree);
+        assert_eq!(req.model, "deepseek-v4-pro");
+        assert_eq!(req.complexity, TaskComplexity::Architectural);
     }
 
     /// §10.4 reset_for_retry:从 Failed 状态重置,attempts+1,model 升级

@@ -2275,14 +2275,15 @@ where
         let event = LaneEvent::subagent_handoff(emitted_at.clone(), &subagent_id, mode_str, task);
         publish_lane_event(event);
 
-        // 读取 max_attempts(用于 retry loop 上限)
-        let max_attempts = self
+        // 读取 max_attempts(用于 retry loop 上限)和 complexity(用于 §4.6 诊断 SOP 注入)
+        // 注:complexity 在 retry 过程中不变(只升级 model,不改变 complexity),故循环外读取一次即可
+        let (max_attempts, subagent_complexity) = self
             .multi_agent_coordinator
             .as_ref()
             .and_then(|c| c.get(&subagent_id))
-            .map(|a| a.max_attempts)
-            .unwrap_or(1)
-            .max(1);
+            .map(|a| (a.max_attempts, a.complexity))
+            .unwrap_or((1, crate::multi_agent::TaskComplexity::Simple));
+        let max_attempts = max_attempts.max(1);
         let mut current_model = model_str.map(String::from);
         let mut final_status = "failed";
         let mut final_result_msg = String::new();
@@ -2325,11 +2326,13 @@ where
             );
 
             // 执行子智能体 LLM 请求(单轮,完全隔离)— mut self 借用,调用后释放
+            // §4.6 诊断 SOP 注入:传入 complexity,Diagnostic 时追加 SOP 到 system_prompt
             let subagent_result = self.run_subagent_turn_with_model(
                 &subagent_id,
                 name,
                 task,
                 current_model.as_deref(),
+                subagent_complexity,
             );
 
             // 重新获取 coordinator 引用(multi_agent_coordinator 不可变借用)
@@ -2527,22 +2530,27 @@ where
     /// - 独立 prompt cache(不污染主 agent 缓存)
     ///
     /// **注意**:本方法是 [`run_subagent_turn_with_model`] 的便利包装,
-    /// 等价于 `run_subagent_turn_with_model(id, name, task, None)`。
+    /// 等价于 `run_subagent_turn_with_model(id, name, task, None, complexity)`。
     /// 新代码应直接调用 `run_subagent_turn_with_model`。
     /// 保留本方法以兼容现有文档引用和未来外部调用。
+    #[allow(dead_code)]
     fn run_subagent_turn(
         &mut self,
         subagent_id: &str,
         name: &str,
         task: &str,
+        complexity: crate::multi_agent::TaskComplexity,
     ) -> Result<String, String> {
-        self.run_subagent_turn_with_model(subagent_id, name, task, None)
+        self.run_subagent_turn_with_model(subagent_id, name, task, None, complexity)
     }
 
     /// Multi-Agent Hardening §4.5.3:带模型选择的 subagent turn 执行。
     ///
     /// - `model = None`:复用主 agent client(同 [`run_subagent_turn`])
     /// - `model = Some(m)`:通过 [`ApiClient::with_model`] 构造独立 client
+    ///
+    /// §4.6 诊断 SOP 注入:`complexity` 参数传递给 [`execute_subagent_llm`],
+    /// 当为 `Diagnostic` 时向 system_prompt 追加诊断 SOP。
     ///
     /// 若 `with_model` 返回 `Err`(默认实现或生产实现构造失败),
     /// 记录诊断日志并回退到主 agent client — 保证 retry loop 不因
@@ -2553,6 +2561,7 @@ where
         name: &str,
         task: &str,
         model: Option<&str>,
+        complexity: crate::multi_agent::TaskComplexity,
     ) -> Result<String, String> {
         let workspace_root = self.workspace_root.as_ref().ok_or_else(|| {
             "workspace_root not configured — subagent requires filesystem access for result persistence".to_string()
@@ -2567,6 +2576,7 @@ where
                     subagent_id,
                     name,
                     task,
+                    complexity,
                 );
             }
             Some(m) => m,
@@ -2580,6 +2590,7 @@ where
                 subagent_id,
                 name,
                 task,
+                complexity,
             ),
             Err(e) => {
                 // 降级:client 构造失败时回退到主 agent client(同模型重试)
@@ -2601,8 +2612,62 @@ where
                     subagent_id,
                     name,
                     task,
+                    complexity,
                 )
             }
+        }
+    }
+
+    /// 构造子智能体 system_prompt — §4.6 诊断 SOP 注入。
+    ///
+    /// 抽出为独立函数以便单元测试验证 SOP 注入逻辑。
+    ///
+    /// - `complexity == Diagnostic`:追加诊断任务执行规范
+    /// - 其他复杂度:仅基础 prompt,不污染简单任务
+    fn build_subagent_system_prompt(
+        subagent_id: &str,
+        name: &str,
+        task: &str,
+        complexity: crate::multi_agent::TaskComplexity,
+    ) -> String {
+        let base_prompt = format!(
+            "# Subagent: {name} ({subagent_id})\n\
+             \n\
+             你是一个子智能体,由主智能体派发执行独立任务。\n\
+             \n\
+             ## 任务\n\
+             {task}\n\
+             \n\
+             ## 约束\n\
+             - 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
+             - 你的响应将被写入文件,主智能体会后续读取\n\
+             - 请提供完整、自包含的分析结果\n\
+             - 不需要调用工具,直接给出你的分析和结论\n\
+             \n\
+             ## 输出格式\n\
+             请直接输出你的分析结果,使用 Markdown 格式。包含:\n\
+             1. 任务理解(简要复述)\n\
+             2. 分析过程\n\
+             3. 关键发现\n\
+             4. 结论和建议"
+        );
+
+        // §4.6 诊断 SOP 注入:仅 Diagnostic 复杂度追加 SOP
+        // 设计要点:SOP 仅注入 Diagnostic,避免污染简单任务;规则固化到系统提示,
+        // 能力不足模型也无法绕过;与验证门禁形成"提示层 + 强制层"双重防护。
+        if matches!(complexity, crate::multi_agent::TaskComplexity::Diagnostic) {
+            format!(
+                "{base_prompt}\n\n\
+                 ## 诊断任务执行规范\n\
+                 1. 遇到崩溃/闪退类问题,第一动作是写文件诊断日志(CLAW_DIAG=1 或调用 diag! 宏),\
+                 而非凭直觉堆砌防御代码\n\
+                 2. 先用可靠信号确认错误类型(panic vs Err vs 配置错误),再决定修复方向\n\
+                 3. 修改后必须运行 `cargo build` 验证编译通过\n\
+                 4. 声称修复后必须提供复现验证证据(重新运行原场景确认不崩溃)\n\
+                 5. 禁止在未验证根因的情况下堆砌 catch_unwind / panic hook 等防御性代码"
+            )
+        } else {
+            base_prompt
         }
     }
 
@@ -2611,35 +2676,21 @@ where
     /// 抽出为自由函数,以便 [`run_subagent_turn`] 和
     /// [`run_subagent_turn_with_model`] 复用 — 前者传入 `&mut self.api_client`,
     /// 后者传入 `&mut *boxed_client`(由 `with_model` 构造的独立 client)。
+    ///
+    /// §4.6 诊断 SOP 注入:当 `complexity == Diagnostic` 时,向 system_prompt 追加
+    /// 诊断任务执行规范,强制子智能体遵循"先诊断后修复"流程,避免堆砌防御代码。
     fn execute_subagent_llm(
         workspace_root: &std::path::Path,
         client: &mut dyn ApiClient,
         subagent_id: &str,
         name: &str,
         task: &str,
+        complexity: crate::multi_agent::TaskComplexity,
     ) -> Result<String, String> {
-        // 构造子智能体 system_prompt — 完全隔离,不包含主 agent 上下文
-        let subagent_system_prompt = SystemPromptSplit::from_sections(vec![format!(
-            "# Subagent: {name} ({subagent_id})\n\
-                 \n\
-                 你是一个子智能体,由主智能体派发执行独立任务。\n\
-                 \n\
-                 ## 任务\n\
-                 {task}\n\
-                 \n\
-                 ## 约束\n\
-                 - 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
-                 - 你的响应将被写入文件,主智能体会后续读取\n\
-                 - 请提供完整、自包含的分析结果\n\
-                 - 不需要调用工具,直接给出你的分析和结论\n\
-                 \n\
-                 ## 输出格式\n\
-                 请直接输出你的分析结果,使用 Markdown 格式。包含:\n\
-                 1. 任务理解(简要复述)\n\
-                 2. 分析过程\n\
-                 3. 关键发现\n\
-                 4. 结论和建议"
-        )]);
+        // 构造子智能体 system_prompt — §4.6 诊断 SOP 注入
+        let system_prompt = Self::build_subagent_system_prompt(subagent_id, name, task, complexity);
+
+        let subagent_system_prompt = SystemPromptSplit::from_sections(vec![system_prompt]);
 
         // 构造子智能体的 user message — task 作为唯一输入
         let user_message = ConversationMessage {
@@ -6478,6 +6529,58 @@ mod tests {
     //   场景 3:flash 失败 → 升级 pro → 重试成功
     //   场景 4:flash 失败 → 升级 pro → 仍失败 → 达 max_attempts fail
     //   场景 5:成本超限 → 拒绝升级 → fail(不浪费 pro 调用)
+
+    // ===== P1 步骤 6:诊断 SOP 注入单元测试 =====
+
+    /// §4.6 验收:Diagnostic 复杂度时 system_prompt 含诊断 SOP
+    #[test]
+    fn build_subagent_system_prompt_injects_diagnostic_sop() {
+        let prompt = ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
+            "subagent-test",
+            "diag-agent",
+            "定位 wizard 闪退",
+            crate::multi_agent::TaskComplexity::Diagnostic,
+        );
+        // 基础 prompt 内容
+        assert!(prompt.contains("# Subagent: diag-agent"), "should contain base header");
+        assert!(prompt.contains("定位 wizard 闪退"), "should contain task");
+        // 诊断 SOP 五条规则
+        assert!(prompt.contains("## 诊断任务执行规范"), "missing SOP header");
+        assert!(prompt.contains("CLAW_DIAG=1"), "missing rule 1: diag log first");
+        assert!(prompt.contains("panic vs Err vs 配置错误"), "missing rule 2: confirm error type");
+        assert!(prompt.contains("cargo build"), "missing rule 3: verify compilation");
+        assert!(prompt.contains("复现验证证据"), "missing rule 4: reproduce evidence");
+        assert!(prompt.contains("catch_unwind / panic hook"), "missing rule 5: no defensive code");
+    }
+
+    /// §4.6 验收:Simple 复杂度时 system_prompt 不含诊断 SOP(避免污染简单任务)
+    #[test]
+    fn build_subagent_system_prompt_skips_sop_for_simple_task() {
+        let prompt = ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
+            "subagent-test",
+            "fmt-agent",
+            "格式化 mod.rs",
+            crate::multi_agent::TaskComplexity::Simple,
+        );
+        // 基础 prompt 内容
+        assert!(prompt.contains("# Subagent: fmt-agent"), "should contain base header");
+        // 不应含诊断 SOP
+        assert!(!prompt.contains("## 诊断任务执行规范"), "Simple task should NOT have SOP");
+        assert!(!prompt.contains("CLAW_DIAG=1"), "Simple task should NOT contain diag rule");
+    }
+
+    /// §4.6 验收:Architectural 复杂度也不注入 SOP(仅 Diagnostic 注入)
+    #[test]
+    fn build_subagent_system_prompt_skips_sop_for_architectural_task() {
+        let prompt = ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
+            "subagent-test",
+            "arch-agent",
+            "评估微服务拆分方案",
+            crate::multi_agent::TaskComplexity::Architectural,
+        );
+        assert!(prompt.contains("# Subagent: arch-agent"), "should contain base header");
+        assert!(!prompt.contains("## 诊断任务执行规范"), "Architectural should NOT have SOP");
+    }
 
     /// 可控的 mock ValidationGate — 通过 AtomicUsize 控制第 N 次返回 Ok/Err。
     /// 用于场景 3-5 端到端 retry loop 测试。
