@@ -236,7 +236,21 @@ Harness note: current coverage now includes write-file denial, bash escalation a
   - runtime crate 顶层导出补全:`pub use decision_log::{DecisionExtractorClient, set_global_decision_extractor_client}` + `pub use validation::JudgeClient`
   - 降级策略:JudgeClient/DecisionExtractorClient 构造失败(无 API key / 模型名无效)时跳过注册,不阻断启动,降级为 MVP 行为(无 LLM judge / Heuristic 决策提取)
   - 验收:`cargo test -p runtime --lib` 1367 passed / 0 failed / 2 ignored;`cargo test -p rusty-claude-cli --lib` 373 passed / 0 failed(新增 5 个 llm_clients 测试);零警告
-- [ ] 多 provider 升级链（Anthropic/OpenAI/xAI，v3 阶段）
+- [x] **v2 Phase 3 Epic 7:多 provider 升级链**(2026-07-27)— `runtime/multi_agent/mod.rs` 新增 `is_flagship_model`(镜像 `api::model_tier::tier_for_model` 旗舰判断)+ `upgrade_lookup`(按 provider 分支匹配)。`upgrade_model_for_subagent` 扩展支持:
+  - DeepSeek 链:`deepseek-v4-flash` → `deepseek-v4-pro`(10.0x)
+  - Anthropic 两跳链:`haiku` → `claude-sonnet-4-6`(5.0x)→ `claude-opus-4-6`(15.0x)
+  - OpenAI 单跳链:`gpt-4.1-mini` → `gpt-4.1`(5.0x)
+  - xAI 单跳链:`grok-3-mini`/`grok-mini` → `grok-3`(8.0x)
+  - 通用 `flash` → `pro` 兜底升级
+  - 14 个新测试覆盖:单跳升级/alias 与 canonical 名/两跳链终止/旗舰回归(o3/o4/gpt-4.1/grok-3/opus 不再升级)
+- [x] **v2 Phase 3 Epic 8:api crate 升级表同步**(2026-07-27)— `api/providers/model_tier.rs::default_upgrades()` 扩展与 runtime 一致的多 provider 升级链(alias + canonical 双键覆盖)。9 个新测试:haiku→sonnet / sonnet→opus / opus 哨兵 / 两跳链 / gpt-4.1-mini→gpt-4.1 / grok-3-mini→grok-3 / 旗舰回归
+- [x] **v2 Phase 3 Epic 9:spawn_parallel_via_dag 真并行**(2026-07-27)— `ConversationRuntime::spawn_parallel_via_dag(&self, tasks: Vec<SpawnRequest>) -> Vec<Result<String, String>>` 新方法:
+  - 预检能力校验(Budget+Diagnostic/Architectural 直接 Err,与 `spawn_with_model` 一致)
+  - 构建 `DagGraph`(所有节点无依赖,并行根)→ `DagScheduler::new(graph, executor)`
+  - async-to-sync 桥接:`tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(scheduler.run())`(与 `tools/lib.rs::run_dag_run` 同模式,但同步等待结果而非 fire-and-forget)
+  - FailFast 语义:`max_retries=0`,任一 subagent 失败即整体失败,未完成 node 标记为 "cancelled due to sibling failure"
+  - 4 个集成测试:无 executor 拒绝 / 空 task / 能力校验拒绝 / 端到端真并行成功(验证 result_ref 文件写入)
+  - `dag::DagNode` 加入 `pub use` re-export链(`dag/mod.rs` + `multi_agent/mod.rs`)
 
 ### API 与文档差异说明
 

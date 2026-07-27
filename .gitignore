@@ -24,6 +24,8 @@ archive/
 **/.claw/sessions/
 **/.claw/decision_log.db*
 **/.claw/tool_results_archive.jsonl
+**/.claw/checkpoints/
+**/.claw/subagents/
 **/.clawd-todos.json
 **/.clawd-agents/
 status-help.txt

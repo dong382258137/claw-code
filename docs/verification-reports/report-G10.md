@@ -532,10 +532,76 @@ P0 + P1 全部完成,后续进入 v2/v3 阶段:
 - **cargo test -p runtime --lib**: ✅ 1367 passed / 0 failed / 2 ignored(无回归)
 - **cargo test -p rusty-claude-cli --lib**: ✅ 373 passed / 0 failed / 0 ignored(新增 5 个 llm_clients 测试:trait 约束 + Arc<dyn> 转换 + 无 auth 错误传播)
 
-### v2 Phase 3 待办(后续推进)
+### v2 Phase 3 实施详情(2026-07-27 完成)
 
-1. **多 provider 升级链**:Anthropic/OpenAI/xAI 接入 `model_tier` 跨 provider 升级(v3 阶段)
-2. **`spawn_parallel` 真并行接入**:在 `execute_dispatch_subagent` 中调用 `DagScheduler::run` 实现 tokio JoinSet 并发调度
+#### Epic 7:多 provider 升级链(runtime crate)
+
+**问题**:原 `upgrade_model_for_subagent` 仅支持 DeepSeek `flash → pro` 单链,且旗舰判断只检查 `-pro` 后缀,会误判 `opus`/`gpt-4.1`/`grok-3`/`o3`/`o4` 为非旗舰导致无限升级。
+
+**实现**(`runtime/multi_agent/mod.rs`):
+- 新增 `is_flagship_model(lower: &str) -> bool`:镜像 `api::model_tier::tier_for_model` 旗舰判断逻辑(因 runtime 不能依赖 api crate,本地复制)。覆盖 `opus` / `gpt-4.1`(非 mini)/ `grok-3`(严格相等)/ `o3`/`o4`(非 mini/nano)/ `*-pro` 后缀
+- 新增 `upgrade_lookup(lower: &str) -> Option<ModelUpgrade>`:按 provider 分支匹配升级路径
+- `upgrade_model_for_subagent` 重构:先 `is_flagship_model` 拦截,再 `upgrade_lookup` 查表
+
+**升级表**:
+
+| Provider | 当前模型 | 目标模型 | cost_multiplier | 链 |
+|---|---|---|---|---|
+| DeepSeek | deepseek-v4-flash | deepseek-v4-pro | 10.0 | 单跳 |
+| Anthropic | haiku / claude-haiku-* | claude-sonnet-4-6 | 5.0 | 第1跳 |
+| Anthropic | sonnet / claude-sonnet-* | claude-opus-4-6 | 15.0 | 第2跳 |
+| OpenAI | gpt-4.1-mini | gpt-4.1 | 5.0 | 单跳 |
+| xAI | grok-3-mini / grok-mini | grok-3 | 8.0 | 单跳 |
+
+**测试**:14 个新测试覆盖单跳升级、alias 与 canonical 名、两跳链终止、旗舰回归(o3/o4/gpt-4.1/grok-3/opus 不再升级)
+
+#### Epic 8:api crate 升级表同步
+
+**问题**:`api/providers/model_tier.rs::default_upgrades()` 仅含 DeepSeek 双模型条目,与 runtime 扩展后的升级表不一致。
+
+**实现**(`api/providers/model_tier.rs`):
+- `default_upgrades()` 扩展:DeepSeek/Anthropic/OpenAI/xAI 全链路覆盖
+- 每个升级路径同时注册 alias(如 `haiku`)和 canonical 名(如 `claude-haiku-4-5-20251213`),兼容 `upgrade_model()` 的精确匹配逻辑
+- 旗舰模型(opus/gpt-4.1/grok-3)注册为哨兵值(`target_model == self`,`cost_multiplier == 1.0`),`upgrade_model()` 返回 `None`
+
+**测试**:9 个新测试 — haiku→sonnet / sonnet→opus / opus 哨兵 / 两跳链 / gpt-4.1-mini→gpt-4.1 / grok-3-mini→grok-3 / 旗舰回归
+
+#### Epic 9:spawn_parallel_via_dag 真并行
+
+**问题**:`MultiAgentCoordinator::spawn_parallel` 是 MVP 串行退化(循环调用 `spawn_with_model`),v2 需接入 `DagScheduler::run` 实现真并行。
+
+**实现**(`runtime/conversation.rs`):
+- 新增 `ConversationRuntime::spawn_parallel_via_dag(&self, tasks: Vec<SpawnRequest>) -> Vec<Result<String, String>>`
+- 流程:
+  1. 取出已注入的 `coordinator_executor`(若 `None` 全部返回 Err)
+  2. 预检能力校验(Budget+Diagnostic/Architectural 直接 Err,与 `spawn_with_model` 一致)
+  3. 每个 `SpawnRequest` 转为 `DagNode`(无依赖,并行根节点,`max_retries=0`)
+  4. 构建 `DagGraph` → `DagScheduler::new(graph, executor)`
+  5. async-to-sync 桥接:`tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(scheduler.run())`
+  6. 映射 `Vec<NodeResult>` 回 `Vec<Result<String, String>>`(Ok=result_ref 路径)
+- FailFast 语义:任一 node 失败,整个 DAG 取消;失败 node 标记 "subagent failed",其余标记 "cancelled due to sibling failure"
+- `dag::DagNode` 加入 `pub use` re-export 链
+
+**桥接模式对比**:
+- `tools/lib.rs::run_dag_run`:fire-and-forget(`std::thread::spawn` + 后台 runtime,tool 立即返回)
+- `spawn_parallel_via_dag`:同步等待(当前线程 `new_current_thread().enable_all().build()?.block_on(...)`,阻塞至 DAG 完成)
+
+**测试**:4 个集成测试 — 无 executor 拒绝 / 空 task / 能力校验拒绝 / 端到端真并行成功(验证 `.claw/subagents/{id}.md` 文件写入)
+
+### v2 Phase 3 验收(2026-07-27)
+
+- **cargo build -p runtime --lib**: ✅ PASS
+- **cargo build -p api --lib**: ✅ PASS
+- **cargo build -p rusty-claude-cli**: ✅ PASS
+- **cargo test -p runtime --lib**: ✅ 1384 passed / 0 failed / 2 ignored(较 Phase 2 的 1367 新增 17 个:14 升级测试 + 4 spawn_parallel_via_dag 测试,减去 1 个已被替代的旧测试)
+- **cargo test -p api --lib**: ✅ 183 passed / 0 failed / 0 ignored(新增 9 个 v3 升级测试)
+
+### v3 后续待办(下一阶段)
+
+1. **生产接入 `spawn_parallel_via_dag`**:在 `rusty-claude-cli` 主入口暴露并行 spawn 能力(如新 tool 或 CLI 子命令)
+2. **`DetectionStrategy::LlmExtract` 端到端**:决策持久化 LLM 提取接入生产 `app.rs::build_runtime`
+3. **`spawn_parallel` 真正 tokio JoinSet**:当前 `spawn_parallel_via_dag` 通过 `block_on` 同步等待,未来可改为异步接口供 async 调用方使用
+4. **DAG 部分失败容错**:当前 FailFast,未来可配置 `FailFast::Off` 收集部分结果
 
 ---
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -35,14 +35,17 @@ use crate::planner::{
 // 主 agent 通过 dispatch_subagent tool 派发任务给子 agent。
 // 子 agent 走独立 LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
 use crate::multi_agent::{
-    upgrade_model_for_subagent, CoordinationMode, MultiAgentCoordinator, SubagentStatus,
-    TaskComplexity,
+    upgrade_model_for_subagent, CoordinationMode, MultiAgentCoordinator, SpawnRequest,
+    SubagentStatus, TaskComplexity,
 };
 // CoordinatorExecutor + SubagentDispatcher + SubagentRunner — 用于 DAG 真实调度
 // (v0.2 TODO 2 生产接入)。with_dag_coordinator 把 CoordinatorExecutor 装到 runtime,
 // 供 tools 层 dag_run 工具取出后构造 DagScheduler。
+// v3:新增 DagGraph / DagScheduler / DagNode / DagError / NodeResult / RetryPolicy,
+// 用于 spawn_parallel_via_dag 真并行 spawn。
 use crate::multi_agent::dag::{
-    CoordinatorExecutor, SubagentDispatcher, SubagentRunner,
+    DagError, DagGraph, DagNode, DagScheduler, NodeResult, CoordinatorExecutor,
+    RetryPolicy, SubagentDispatcher, SubagentRunner,
 };
 // Step 3.2-a:LaneEvent helpers for SubagentHandoff / SubagentResult.
 use crate::lane_events::{try_publish as publish_lane_event, LaneEvent};
@@ -803,6 +806,191 @@ where
     #[must_use]
     pub fn coordinator_executor(&self) -> Option<&Arc<CoordinatorExecutor>> {
         self.coordinator_executor.as_ref()
+    }
+
+    /// v3 真并行 spawn:基于 `DagScheduler::run` 实现多 subagent 并发执行。
+    ///
+    /// 与 [`MultiAgentCoordinator::spawn_parallel`](crate::multi_agent::MultiAgentCoordinator::spawn_parallel)
+    /// (串行退化)不同,本方法:
+    /// 1. 将每个 `SpawnRequest` 转为 `DagNode`(无依赖,并行根节点)
+    /// 2. 通过 `CoordinatorExecutor` + `DagScheduler::run` 真并发调度
+    /// 3. async-to-sync 桥接:`tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(scheduler.run())`
+    ///
+    /// # 调用前提
+    /// runtime 必须已通过 [`with_dag_coordinator`](Self::with_dag_coordinator)
+    /// 注入 `CoordinatorExecutor`。否则所有 task 返回 `Err`。
+    ///
+    /// # 能力校验
+    /// 与 `spawn_with_model` 一致:Budget 模型(haiku/mini/nano/flash)执行
+    /// Diagnostic/Architectural 任务直接返回 `Err`,不进入 DAG 调度。
+    ///
+    /// # 参数
+    /// - `tasks`:spawn 请求列表,每个请求包含 name/task/mode/model/complexity
+    ///
+    /// # 返回
+    /// - `Vec<Result<String, String>>`:每个 task 对应一个结果(顺序与输入一致)
+    ///   - `Ok(result_ref)`:subagent 完成后的产物路径(如 `.claw/subagents/{id}.md`)
+    ///   - `Err(msg)`:能力校验未通过 / DAG 调度失败 / runtime 未注入
+    ///
+    /// # FailFast 语义
+    /// `DagScheduler::run` 采用 FailFast:任一 node 失败(且耗尽 retry)后,
+    /// 整个 DAG 取消,未完成的 node 一并标记为 `Err`。
+    /// 本方法设置 `max_retries = 0`(无重试),任一 subagent 失败即整体失败。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// use runtime::multi_agent::{SpawnRequest, CoordinationMode, TaskComplexity};
+    /// # use runtime::ConversationRuntime;
+    /// # let runtime: ConversationRuntime<_, _> = unimplemented!();
+    /// let tasks = vec![
+    ///     SpawnRequest::new("agent-a", "task A", CoordinationMode::Fork, "deepseek-v4-flash", TaskComplexity::Simple),
+    ///     SpawnRequest::new("agent-b", "task B", CoordinationMode::Fork, "deepseek-v4-pro", TaskComplexity::Diagnostic),
+    /// ];
+    /// let results = runtime.spawn_parallel_via_dag(tasks);
+    /// assert_eq!(results.len(), 2);
+    /// ```
+    pub fn spawn_parallel_via_dag(
+        &self,
+        tasks: Vec<SpawnRequest>,
+    ) -> Vec<Result<String, String>> {
+        let n = tasks.len();
+        let mut results: Vec<Result<String, String>> = Vec::with_capacity(n);
+
+        // 1. 取出已注入的 CoordinatorExecutor
+        let executor = match &self.coordinator_executor {
+            Some(e) => e.clone(),
+            None => {
+                return (0..n)
+                    .map(|_| {
+                        Err(
+                            "coordinator_executor not injected — call with_dag_coordinator first"
+                                .to_string(),
+                        )
+                    })
+                    .collect();
+            }
+        };
+
+        if n == 0 {
+            return results;
+        }
+
+        // 2. 预检能力校验 + 构建 DagNode(并行根节点,无依赖)
+        // 能力校验与 spawn_with_model 保持一致:
+        // Budget 模型(haiku/mini/nano/flash)执行 Diagnostic/Architectural 任务拒绝
+        let mut nodes: Vec<(usize, DagNode)> = Vec::with_capacity(n);
+        for (idx, task) in tasks.into_iter().enumerate() {
+            let lower = task.model.to_ascii_lowercase();
+            let is_budget = lower.contains("haiku")
+                || lower.contains("mini")
+                || lower.contains("nano")
+                || lower.contains("flash");
+            if is_budget
+                && matches!(
+                    task.complexity,
+                    TaskComplexity::Diagnostic | TaskComplexity::Architectural
+                )
+            {
+                results.push(Err(format!(
+                    "model '{}' (Budget tier) cannot handle {:?} task — use Flagship model",
+                    task.model, task.complexity
+                )));
+                continue;
+            }
+
+            let node = DagNode {
+                id: format!("spawn-{idx}"),
+                label: task.name,
+                task: task.task,
+                depends_on: Vec::new(),
+                acceptance_criteria: String::new(),
+                verify_command: None,
+                // v3 MVP:无重试,任一 subagent 失败即整体失败(FailFast)
+                max_retries: 0,
+                mode: task.mode,
+                retry_policy: RetryPolicy::default(),
+            };
+            nodes.push((idx, node));
+            results.push(Ok(String::new())); // 占位,后续填充
+        }
+
+        // 3. 若所有 task 都未通过能力校验,提前返回
+        if nodes.is_empty() {
+            return results;
+        }
+
+        // 4. 构建 DagGraph(所有节点为并行根,无 edge)
+        let max_parallel = nodes.len();
+        let mut graph =
+            DagGraph::new("spawn_parallel_via_dag").with_max_parallelism(max_parallel);
+        for (_, node) in &nodes {
+            graph.add_node(node.clone());
+        }
+
+        // 5. 构造 DagScheduler 并 async-to-sync 桥接
+        // 注:本方法从同步上下文(run_turn)调用,当前线程无 tokio runtime。
+        // 使用 new_current_thread + enable_all + block_on 桥接(与 tools 层
+        // dag_run 工具的桥接模式一致,但本方法同步等待结果而非 fire-and-forget)。
+        let scheduler = DagScheduler::new(graph, executor);
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let msg = format!("failed to create tokio runtime: {e}");
+                for (idx, _) in &nodes {
+                    results[*idx] = Err(msg.clone());
+                }
+                return results;
+            }
+        };
+
+        let run_result = rt.block_on(async move { scheduler.run().await });
+
+        // 6. 映射结果回 Vec<Result<String, String>>
+        match run_result {
+            Ok(node_results) => {
+                // 全部成功:按 node_id 索引填充
+                let mut result_map: HashMap<String, NodeResult> = HashMap::new();
+                for nr in node_results {
+                    result_map.insert(nr.node_id.clone(), nr);
+                }
+                for (idx, node) in nodes {
+                    match result_map.remove(&node.id) {
+                        Some(nr) => results[idx] = Ok(nr.summary),
+                        None => {
+                            results[idx] =
+                                Err(format!("node {} result missing after DAG run", node.id));
+                        }
+                    }
+                }
+            }
+            Err(dag_err) => {
+                // FailFast:任一 node 失败导致整体失败
+                // 失败的 node_id 提取自 DagError::NodeFailed(id)
+                let failed_node_id = match &dag_err {
+                    DagError::NodeFailed(id) => Some(id.clone()),
+                    _ => None,
+                };
+                let msg = dag_err.to_string();
+                for (idx, node) in nodes {
+                    if let Some(ref failed_id) = failed_node_id {
+                        if node.id == *failed_id {
+                            results[idx] = Err(format!("subagent failed: {msg}"));
+                        } else {
+                            results[idx] = Err(format!(
+                                "cancelled due to sibling failure: {msg}"
+                            ));
+                        }
+                    } else {
+                        results[idx] = Err(msg.clone());
+                    }
+                }
+            }
+        }
+
+        results
     }
 
     /// Epic 3:注入 TaskRegistry,启用子 agent 任务追踪。
@@ -7105,5 +7293,173 @@ mod tests {
         let agent = coordinator.get(subagent_id).expect("agent exists");
         assert_eq!(agent.model.as_deref(), Some("deepseek-v4-flash"), "model should not change");
         assert_eq!(agent.attempts, 0, "no reset should happen");
+    }
+
+    // ===== v3 Phase 3:spawn_parallel_via_dag 真并行集成测试 =====
+    // 依据 docs/multi-agent-hardening-plan.md v3 阶段验收标准
+
+    /// v3:未注入 coordinator_executor 时,所有 task 返回 Err
+    #[test]
+    fn spawn_parallel_via_dag_no_executor_returns_err() {
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        // 未调用 with_dag_coordinator → coordinator_executor = None
+
+        let tasks = vec![
+            crate::multi_agent::SpawnRequest::new(
+                "agent-a",
+                "task A",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+            crate::multi_agent::SpawnRequest::new(
+                "agent-b",
+                "task B",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                crate::multi_agent::TaskComplexity::Diagnostic,
+            ),
+        ];
+
+        let results = runtime.spawn_parallel_via_dag(tasks);
+        assert_eq!(results.len(), 2, "should return one result per task");
+        for (i, r) in results.iter().enumerate() {
+            match r {
+                Err(msg) => assert!(
+                    msg.contains("coordinator_executor not injected"),
+                    "task {i} should report missing executor, got: {msg}"
+                ),
+                Ok(_) => panic!("task {i} should fail, but got Ok"),
+            }
+        }
+    }
+
+    /// v3:空 task 列表返回空 vec(不触发 DAG 调度)
+    #[test]
+    fn spawn_parallel_via_dag_empty_tasks_returns_empty() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let results = runtime.spawn_parallel_via_dag(vec![]);
+        assert!(results.is_empty(), "empty tasks should return empty vec");
+    }
+
+    /// v3:能力校验 — Budget 模型 + Diagnostic/Architectural 任务直接拒绝,不进入 DAG
+    #[test]
+    fn spawn_parallel_via_dag_capability_check_rejects_budget_diagnostic() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        // 两个 task 都应被能力校验拒绝:flash+Diagnostic / haiku+Architectural
+        let tasks = vec![
+            crate::multi_agent::SpawnRequest::new(
+                "diag-agent",
+                "诊断闪退",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Diagnostic,
+            ),
+            crate::multi_agent::SpawnRequest::new(
+                "arch-agent",
+                "架构评估",
+                crate::multi_agent::CoordinationMode::Fork,
+                "claude-haiku-4-5",
+                crate::multi_agent::TaskComplexity::Architectural,
+            ),
+        ];
+
+        let results = runtime.spawn_parallel_via_dag(tasks);
+        assert_eq!(results.len(), 2);
+        for (i, r) in results.iter().enumerate() {
+            match r {
+                Err(msg) => assert!(
+                    msg.contains("Budget tier"),
+                    "task {i} should be rejected for Budget tier, got: {msg}"
+                ),
+                Ok(_) => panic!("task {i} should be rejected, but got Ok"),
+            }
+        }
+    }
+
+    /// v3:端到端真并行 — 两个 Simple task 通过 DagScheduler 并发执行,返回 result_ref 路径
+    #[test]
+    fn spawn_parallel_via_dag_parallel_execution_succeeds() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let tasks = vec![
+            crate::multi_agent::SpawnRequest::new(
+                "agent-a",
+                "task A",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+            crate::multi_agent::SpawnRequest::new(
+                "agent-b",
+                "task B",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+        ];
+
+        let results = runtime.spawn_parallel_via_dag(tasks);
+        assert_eq!(results.len(), 2, "should return 2 results");
+
+        // 两个 task 都应成功,返回 result_ref 路径
+        for (i, r) in results.iter().enumerate() {
+            match r {
+                Ok(path) => {
+                    assert!(
+                        path.contains(".claw/subagents/"),
+                        "task {i} result should be a subagent path, got: {path}"
+                    );
+                    // 验证文件实际写入
+                    let full_path = tempdir.path().join(path);
+                    assert!(
+                        full_path.exists(),
+                        "task {i} result file should exist at {full_path:?}"
+                    );
+                }
+                Err(e) => panic!("task {i} should succeed, got err: {e}"),
+            }
+        }
     }
 }

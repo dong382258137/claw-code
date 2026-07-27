@@ -30,7 +30,7 @@ pub use coordinator_executor::{CoordinatorExecutor, SubagentRunner};
 pub use executor_trait::{NodeError, SubagentExecutor};
 pub use scheduler::{DagScheduler, ProgressEvent};
 pub use subagent_dispatcher::SubagentDispatcher;
-pub use types::{DagError, DagGraph, DagId, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
+pub use types::{DagError, DagGraph, DagId, DagNode, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
