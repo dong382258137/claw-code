@@ -2652,11 +2652,16 @@ where
              4. 结论和建议"
         );
 
-        // §4.6 诊断 SOP 注入:仅 Diagnostic 复杂度追加 SOP
-        // 设计要点:SOP 仅注入 Diagnostic,避免污染简单任务;规则固化到系统提示,
+        // §4.6 SOP 注入:Diagnostic 和 Architectural 复杂度追加各自 SOP
+        // 设计要点:SOP 仅注入高复杂度任务,避免污染简单任务;规则固化到系统提示,
         // 能力不足模型也无法绕过;与验证门禁形成"提示层 + 强制层"双重防护。
-        if matches!(complexity, crate::multi_agent::TaskComplexity::Diagnostic) {
-            format!(
+        //
+        // v2 新增:Architectural 复杂度的架构决策 SOP(§10.5 v2 扩展路径)
+        // - 与 Diagnostic SOP 互补:Diagnostic 解决"凭直觉堆砌防御代码",
+        //   Architectural 解决"凭直觉拍板方案、缺乏 trade-off 论证"
+        // - 借鉴 Anthropic Multi-Agent Research System 的 rubric 评分维度
+        match complexity {
+            crate::multi_agent::TaskComplexity::Diagnostic => format!(
                 "{base_prompt}\n\n\
                  ## 诊断任务执行规范\n\
                  1. 遇到崩溃/闪退类问题,第一动作是写文件诊断日志(CLAW_DIAG=1 或调用 diag! 宏),\
@@ -2665,9 +2670,22 @@ where
                  3. 修改后必须运行 `cargo build` 验证编译通过\n\
                  4. 声称修复后必须提供复现验证证据(重新运行原场景确认不崩溃)\n\
                  5. 禁止在未验证根因的情况下堆砌 catch_unwind / panic hook 等防御性代码"
-            )
-        } else {
-            base_prompt
+            ),
+            crate::multi_agent::TaskComplexity::Architectural => format!(
+                "{base_prompt}\n\n\
+                 ## 架构决策执行规范\n\
+                 1. 提出方案前必须列出至少 2 个候选方案(alternatives),\
+                 禁止只给出单一方案就拍板\n\
+                 2. 每个候选方案需评估 trade-off:优势 / 劣势 / 适用场景 / 风险\n\
+                 3. 推荐方案必须给出否决其他方案的理由(rationale),\
+                 而非仅陈述推荐方案的优势\n\
+                 4. 涉及向后兼容/迁移成本的决策,必须评估现有用户/代码的影响范围\n\
+                 5. 架构决策写入 NOTEBOOK.md `<decisions>` 段(context/decision/rationale/alternatives),\
+                 供后续 compaction 后回溯\n\
+                 6. 禁止凭直觉或习惯拍板:任何架构决策必须有可复现的论证依据\
+                 (benchmark / 代码引用 / 论文 / 既有项目实践)"
+            ),
+            crate::multi_agent::TaskComplexity::Simple => base_prompt,
         }
     }
 
@@ -6624,17 +6642,30 @@ mod tests {
         assert!(!prompt.contains("CLAW_DIAG=1"), "Simple task should NOT contain diag rule");
     }
 
-    /// §4.6 验收:Architectural 复杂度也不注入 SOP(仅 Diagnostic 注入)
+    /// §4.6 v2 验收:Architectural 复杂度注入架构决策 SOP(非诊断 SOP)
     #[test]
-    fn build_subagent_system_prompt_skips_sop_for_architectural_task() {
+    fn build_subagent_system_prompt_injects_architectural_sop() {
         let prompt = ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
             "subagent-test",
             "arch-agent",
             "评估微服务拆分方案",
             crate::multi_agent::TaskComplexity::Architectural,
         );
+        // 基础 prompt 内容
         assert!(prompt.contains("# Subagent: arch-agent"), "should contain base header");
-        assert!(!prompt.contains("## 诊断任务执行规范"), "Architectural should NOT have SOP");
+        // 架构决策 SOP 六条规则
+        assert!(prompt.contains("## 架构决策执行规范"), "missing architectural SOP header");
+        assert!(prompt.contains("候选方案"), "missing rule 1: alternatives required");
+        assert!(prompt.contains("trade-off"), "missing rule 2: trade-off evaluation");
+        assert!(prompt.contains("rationale"), "missing rule 3: rationale for rejecting alternatives");
+        assert!(prompt.contains("向后兼容"), "missing rule 4: backward compatibility impact");
+        assert!(prompt.contains("NOTEBOOK.md"), "missing rule 5: decisions persistence");
+        assert!(prompt.contains("禁止凭直觉"), "missing rule 6: no intuition-based decisions");
+        // 不应含诊断 SOP(两个 SOP 互斥)
+        assert!(
+            !prompt.contains("## 诊断任务执行规范"),
+            "Architectural should NOT have diagnostic SOP"
+        );
     }
 
     /// 可控的 mock ValidationGate — 通过 AtomicUsize 控制第 N 次返回 Ok/Err。

@@ -2832,6 +2832,32 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 为 LaneBoard 监控和后续 Epic 4 lane_events 提供数据源。
     // 详见 plan.md §9.2 Epic 3。
     let coordinator = runtime::MultiAgentCoordinator::new();
+
+    // v2 §10.5 多 ValidationGate:注册 rust/npm/pytest gate。
+    // 设计要点:
+    // - gate 用 file_filter 正则隔离,Rust 子 agent 改 .rs 只触发 cargo-build,
+    //   Node 子 agent 改 .ts/.tsx 只触发 npm-build,Python 同理 — 互不干扰
+    // - 命令不存在时跳过注册(避免 retryable=false 中止 validation 链),
+    //   借鉴 PATH 探测模式:有 cargo/npm/python 才注册对应 gate
+    // - 无 workspace_root 时全部跳过(CommandValidationGate 需要 cwd)
+    if let Ok(workspace_root) = env::current_dir() {
+        if crate::command_exists("cargo") {
+            coordinator.add_validation_gate(Box::new(
+                runtime::multi_agent::validation::rust_compile_gate(workspace_root.clone()),
+            ));
+        }
+        if crate::command_exists("npm") {
+            coordinator.add_validation_gate(Box::new(
+                runtime::multi_agent::validation::npm_build_gate(workspace_root.clone()),
+            ));
+        }
+        if crate::command_exists("python") {
+            coordinator.add_validation_gate(Box::new(
+                runtime::multi_agent::validation::pytest_gate(workspace_root.clone()),
+            ));
+        }
+    }
+
     let task_registry = runtime::task_registry::TaskRegistry::new()
         .with_multi_agent_coordinator(coordinator.clone());
     // v0.2 生产接入:保留一份 coordinator 的 Arc,用于构造 CoordinatorExecutor。

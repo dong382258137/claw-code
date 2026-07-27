@@ -358,6 +358,57 @@ P0 + P1 全部完成,后续进入 v2/v3 阶段:
 5. **`spawn_parallel` 真并行**:v2 阶段接入 tokio `JoinSet`
 6. **`DetectionStrategy::LlmExtract` 实现**:v2 阶段用 LLM 提取决策点,替代启发式关键词
 
+### v2 Phase 1 实施详情(2026-07-27 完成)
+
+#### Epic 1:Architectural SOP 注入
+
+`build_subagent_system_prompt`(`conversation.rs`)在 `complexity == Architectural` 时注入架构决策 SOP,六条规则:
+1. 提出方案前必须列出至少 2 个候选方案(alternatives),禁止只给出单一方案就拍板
+2. 每个候选方案需评估 trade-off:优势 / 劣势 / 适用场景 / 风险
+3. 推荐方案必须给出否决其他方案的理由(rationale)
+4. 涉及向后兼容/迁移成本的决策,必须评估现有用户/代码的影响范围
+5. 架构决策写入 NOTEBOOK.md `<decisions>` 段,供后续 compaction 后回溯
+6. 禁止凭直觉或习惯拍板:任何架构决策必须有可复现的论证依据
+
+**测试翻转**:`build_subagent_system_prompt_skips_sop_for_architectural_task` → `build_subagent_system_prompt_injects_architectural_sop`,断言六条规则均存在,且不含诊断 SOP(两个 SOP 互斥)。
+
+#### Epic 2:多 ValidationGate 注册
+
+- `validation.rs` 新增 `npm_build_gate(workspace_root)` 和 `pytest_gate(workspace_root)` helper,与 `rust_compile_gate` 对称
+- `app.rs` 在 `MultiAgentCoordinator::new()` 后用 `crate::command_exists` 探测 PATH:
+  - 有 `cargo` → 注册 `rust_compile_gate`(`\.rs$`)
+  - 有 `npm` → 注册 `npm_build_gate`(`\.(ts|tsx|js|jsx)$`)
+  - 有 `python` → 注册 `pytest_gate`(`\.py$`)
+- `file_filter` 正则隔离:Rust 子 agent 改 `.rs` 只触发 cargo-build,Node 子 agent 改 `.ts` 只触发 npm-build,互不干扰
+- 命令不存在时跳过注册(避免 `retryable=false` 中止 validation 链)
+
+#### Epic 3:spawn_parallel 真并行路径文档化
+
+**关键发现**:DAG 模块(`multi_agent::dag::`)已有完整真并行基础设施:
+- `DagScheduler`(`scheduler.rs`)— DAG 并行调度器,基于 tokio
+- `CoordinatorExecutor`(`coordinator_executor.rs`)— 实现 `SubagentExecutor` trait
+- `SubagentDispatcher`(`subagent_dispatcher.rs`)— async + Send + Sync 的 LLM 调度器,用 `spawn_blocking` 包装同步 stream
+- `execute_async`(`mod.rs:745`)— 已用 `tokio::spawn` + `JoinHandle` 实现真异步执行
+
+**改动**:
+- `spawn_parallel` 文档注释指向 DAG 模块作为真并行入口,标注 MVP 串行版本"仅用于注册,不执行 turn"
+- 新增 `spawn_parallel_serial_degradation_registers_without_executing` 测试,验证串行退化语义:返回的 id 都能在 coordinator 中查到,但 status 仍是 `Created`(未执行 turn)
+- 真并行执行路径:用 `DagScheduler::new(graph, Arc::new(executor)).run().await`,现成集成测试参考 `dag::coordinator_executor::tests`
+
+### v2 Phase 1 验收(2026-07-27)
+
+- **cargo build -p runtime**: ✅ PASS
+- **cargo build -p rusty-claude-cli**: ✅ PASS
+- **cargo test -p runtime --lib**: ✅ 1337 passed / 0 failed / 2 ignored(新增 1 个 spawn_parallel 测试)
+- **cargo test -p rusty-claude-cli --lib**: ✅ 368 passed / 0 failed / 0 ignored
+- **cargo test -p runtime --lib build_subagent_system_prompt**: ✅ 3 passed(含新增 Architectural SOP 测试)
+
+### v2 Phase 2 待办(后续推进)
+
+1. **Epic 4:checkpoint restore** — 实现 `restore_from_checkpoint`,需先明确语义边界(元状态恢复 vs 对话历史恢复)
+2. **Epic 5:LlmJudgeGate 实现** — 引入 `JudgeClient` trait 依赖倒置,实现 `call_judge_model`
+3. **Epic 6:决策持久化 LlmExtract** — 复用 Epic 5 的 LLM 调用模式,实现 `DetectionStrategy::LlmExtract`
+
 ---
 
 ## 历史 BUG 修复说明（保留供追溯）

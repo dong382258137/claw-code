@@ -223,12 +223,13 @@ Harness note: current coverage now includes write-file denial, bash escalation a
 
 ### P1 待办项（v2/v3 阶段落地）
 
-- [ ] checkpoint restore（v2 阶段实现 `restore_from_checkpoint`）
-- [ ] `LlmJudgeGate` 实现（v2 阶段实现 `call_judge_model`）
-- [ ] 多 ValidationGate（npm/pytest/lint gate，v2 阶段）
+- [x] **v2 Phase 1 Epic 1:Architectural SOP 注入**(2026-07-27)— `build_subagent_system_prompt` 新增 Architectural 复杂度的架构决策 SOP(六条规则:候选方案/trade-off/rationale/向后兼容/NOTEBOOK 持久化/禁止凭直觉拍板)
+- [x] **v2 Phase 1 Epic 2:多 ValidationGate 注册**(2026-07-27)— `validation.rs` 新增 `npm_build_gate`/`pytest_gate` helper,`app.rs` 用 `command_exists` 探测 PATH 后注册 rust/npm/pytest gate,`file_filter` 正则隔离互不干扰
+- [x] **v2 Phase 1 Epic 3:spawn_parallel 真并行路径文档化**(2026-07-27)— `spawn_parallel` 文档指向 DAG 模块(`DagScheduler`+`CoordinatorExecutor`+`SubagentDispatcher`)真并行路径,新增串行退化语义测试
+- [ ] **v2 Phase 2 Epic 4:checkpoint restore**(实现 `restore_from_checkpoint`)
+- [ ] **v2 Phase 2 Epic 5:`LlmJudgeGate` 实现**(引入 `JudgeClient` trait 依赖倒置 + `call_judge_model`)
+- [ ] **v2 Phase 2 Epic 6:`DetectionStrategy::LlmExtract` 实现**(用 LLM 提取决策点,替代启发式关键词)
 - [ ] 多 provider 升级链（Anthropic/OpenAI/xAI，v3 阶段）
-- [ ] `spawn_parallel` 真并行实现（v2 阶段接入 tokio）
-- [ ] `DetectionStrategy::LlmExtract` 实现（v2 阶段用 LLM 提取决策点,替代启发式关键词)
 
 ### API 与文档差异说明
 

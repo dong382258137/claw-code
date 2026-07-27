@@ -426,6 +426,15 @@ impl MultiAgentCoordinator {
     pub fn spawn_parallel(&self, tasks: Vec<SpawnRequest>) -> Vec<Result<String, String>> {
         // MVP:串行执行,v2 改为 tokio::join_all 并行
         // 注:串行退化不改变接口语义,调用方无需感知差异
+        //
+        // v2 真并行路径(§10.5):本方法仅"注册 subagent 到 registry",不执行 turn。
+        // 真并行执行请使用 DAG 模块:
+        //   1. 构造 DagGraph 描述依赖关系
+        //   2. 用 CoordinatorExecutor 包装 MultiAgentCoordinator + SubagentRunner
+        //   3. DagScheduler::new(graph, Arc::new(executor)).run().await 并行调度
+        // 详见 `multi_agent::dag::scheduler::DagScheduler` 和
+        //      `multi_agent::dag::coordinator_executor::CoordinatorExecutor`。
+        // 现成集成测试参考 `dag::coordinator_executor::tests`。
         tasks
             .into_iter()
             .map(|t| {
@@ -1456,6 +1465,51 @@ mod tests {
         assert_eq!(req.mode, CoordinationMode::Worktree);
         assert_eq!(req.model, "deepseek-v4-pro");
         assert_eq!(req.complexity, TaskComplexity::Architectural);
+    }
+
+    /// §10.5 v2:spawn_parallel 串行退化仅注册 subagent,不执行 turn。
+    /// 真并行执行应使用 DAG 模块(DagScheduler + CoordinatorExecutor)。
+    /// 本测试验证串行退化的语义正确性:返回的 id 都能在 coordinator 中查到,
+    /// 但 status 仍是 Created(未执行 turn)。
+    #[test]
+    fn spawn_parallel_serial_degradation_registers_without_executing() {
+        let coord = MultiAgentCoordinator::new();
+        let tasks = vec![
+            SpawnRequest::new(
+                "agent-a",
+                "task A",
+                CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                TaskComplexity::Simple,
+            ),
+            SpawnRequest::new(
+                "agent-b",
+                "task B",
+                CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                TaskComplexity::Simple,
+            ),
+        ];
+        let results = coord.spawn_parallel(tasks);
+        assert_eq!(results.len(), 2, "should return 2 results");
+        // 两个 id 都应成功注册
+        let id_a = results[0].as_ref().expect("agent-a spawn should succeed");
+        let id_b = results[1].as_ref().expect("agent-b spawn should succeed");
+        // 注册后 status 应为 Created(串行退化不执行 turn)
+        let agent_a = coord.get(id_a).expect("agent-a should be in registry");
+        assert_eq!(
+            agent_a.status,
+            SubagentStatus::Created,
+            "serial degradation should NOT execute turn — status must remain Created"
+        );
+        let agent_b = coord.get(id_b).expect("agent-b should be in registry");
+        assert_eq!(
+            agent_b.status,
+            SubagentStatus::Created,
+            "serial degradation should NOT execute turn — status must remain Created"
+        );
+        // 真并行执行路径:用 DagScheduler + CoordinatorExecutor,
+        // 详见 dag::coordinator_executor::tests 和 dag::scheduler::tests
     }
 
     /// §10.4 reset_for_retry:从 Failed 状态重置,attempts+1,model 升级

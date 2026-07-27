@@ -208,6 +208,37 @@ pub fn rust_compile_gate(workspace_root: PathBuf) -> CommandValidationGate {
     )
 }
 
+/// Node.js / TypeScript 专用门禁(v2 新增,§10.5 多 ValidationGate)。
+///
+/// 等价于 `CommandValidationGate::new("npm-build", ["npm","run","build"], workspace_root, r"\.(ts|tsx|js|jsx)$")`。
+///
+/// 仅在 `changed_files` 含 `.ts/.tsx/.js/.jsx` 时触发;无相关文件修改时静默跳过。
+/// 若项目无 `package.json` 或 `build` script,gate 会以 retryable=false 失败中止
+/// validation 链(环境错误,非代码错误)。
+pub fn npm_build_gate(workspace_root: PathBuf) -> CommandValidationGate {
+    CommandValidationGate::new(
+        "npm-build",
+        ["npm", "run", "build"],
+        workspace_root,
+        r"\.(ts|tsx|js|jsx)$",
+    )
+}
+
+/// Python 专用门禁(v2 新增,§10.5 多 ValidationGate)。
+///
+/// 等价于 `CommandValidationGate::new("pytest", ["python","-m","pytest"], workspace_root, r"\.py$")`。
+///
+/// 仅在 `changed_files` 含 `.py` 时触发;无相关文件修改时静默跳过。
+/// 若项目无 `pytest` 或 `pyproject.toml`,gate 会以 retryable=false 失败。
+pub fn pytest_gate(workspace_root: PathBuf) -> CommandValidationGate {
+    CommandValidationGate::new(
+        "pytest",
+        ["python", "-m", "pytest"],
+        workspace_root,
+        r"\.py$",
+    )
+}
+
 /// 从 `git diff --name-only` 检测 subagent 修改的文件。
 ///
 /// 在 [`MultiAgentCoordinator::validate`] 调用前执行,结果填入 [`ValidationContext`]。
