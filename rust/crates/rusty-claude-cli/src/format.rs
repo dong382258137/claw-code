@@ -14,9 +14,9 @@ use api::detect_provider_kind;
 use commands::{render_slash_command_help_filtered, resume_supported_slash_commands};
 use runtime::{
     canonicalize_report, format_usd, pricing_for_model, resolve_sandbox_status, CanonicalReportV1,
-    ClaimKind, ConfigLoader, ConfigSource, ContentBlock, MessageRole, PermissionMode,
-    ProjectContext, ReportClaim, ReportConfidence, ReportIdentity, RuntimeConfig, SensitivityClass,
-    Session, TokenUsage, REPORT_SCHEMA_V1,
+    ClaimKind, ConfigLoader, ConfigSource, ContentBlock, DetectionStrategy, MessageRole,
+    PermissionMode, ProjectContext, ReportClaim, ReportConfidence, ReportIdentity, RuntimeConfig,
+    SensitivityClass, Session, TokenUsage, REPORT_SCHEMA_V1,
 };
 
 use crate::commands_handler::{
@@ -127,6 +127,81 @@ pub(crate) fn format_permissions_switch_report(previous: &str, next: &str) -> St
   Applies to       subsequent tool calls
   Usage            /permissions to inspect current mode"
     )
+}
+
+/// v3 §4.7:解析 `/detection-strategy` 参数为 `DetectionStrategy`。
+///
+/// 支持格式:
+/// - `heuristic` → `DetectionStrategy::Heuristic`
+/// - `llm` → `DetectionStrategy::LlmExtract { model: "deepseek-v4-flash" }`(默认 flash)
+/// - `llm:<model>` → `DetectionStrategy::LlmExtract { model }`
+pub(crate) fn parse_detection_strategy(arg: &str) -> Option<DetectionStrategy> {
+    let trimmed = arg.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "heuristic" {
+        return Some(DetectionStrategy::Heuristic);
+    }
+    if let Some(model) = lower.strip_prefix("llm:") {
+        let model = model.trim();
+        if model.is_empty() {
+            return None;
+        }
+        return Some(DetectionStrategy::LlmExtract {
+            model: model.to_string(),
+        });
+    }
+    if lower == "llm" {
+        return Some(DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-flash".to_string(),
+        });
+    }
+    None
+}
+
+/// v3 §4.7:格式化当前 detection strategy 报告(无参数 `/detection-strategy` 时调用)。
+pub(crate) fn format_detection_strategy_report(strategy: &DetectionStrategy) -> String {
+    let strategies = [
+        ("heuristic", "Heuristic keyword detection (zero cost)", matches!(strategy, DetectionStrategy::Heuristic)),
+        ("llm", "LLM extraction (flash model, low cost)", matches!(strategy, DetectionStrategy::LlmExtract { .. })),
+    ]
+    .into_iter()
+    .map(|(name, description, is_current)| {
+        let marker = if is_current { "● current" } else { "○ available" };
+        format!("  {name:<12} {marker:<11} {description}")
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    let detail = match strategy {
+        DetectionStrategy::Heuristic => String::new(),
+        DetectionStrategy::LlmExtract { model } => format!("\n  Active model     {model}"),
+    };
+
+    format!("Decision detection strategy\n{strategies}{detail}\n  Usage            /detection-strategy [heuristic|llm[:<model>]]")
+}
+
+/// v3 §4.7:格式化 detection strategy 切换报告。
+pub(crate) fn format_detection_strategy_switch_report(
+    previous: &DetectionStrategy,
+    next: &DetectionStrategy,
+) -> String {
+    let previous_label = detection_strategy_label(previous);
+    let next_label = detection_strategy_label(next);
+    format!(
+        "Detection strategy updated
+  Result           strategy switched
+  Previous         {previous_label}
+  Active           {next_label}
+  Applies to       next compaction cycle
+  Usage            /detection-strategy to inspect current strategy"
+    )
+}
+
+fn detection_strategy_label(strategy: &DetectionStrategy) -> String {
+    match strategy {
+        DetectionStrategy::Heuristic => "heuristic".to_string(),
+        DetectionStrategy::LlmExtract { model } => format!("llm:{model}"),
+    }
 }
 
 pub(crate) fn format_cost_report(usage: TokenUsage) -> String {
@@ -2008,4 +2083,96 @@ pub(crate) fn json_error_envelope(message: &str) -> String {
         },
     })
     .unwrap_or_else(|_| serde_json::json!({"type":"error","error":message}).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_detection_strategy_heuristic() {
+        let result = parse_detection_strategy("heuristic");
+        assert_eq!(result, Some(DetectionStrategy::Heuristic));
+    }
+
+    #[test]
+    fn parse_detection_strategy_heuristic_case_insensitive() {
+        let result = parse_detection_strategy("HEURISTIC");
+        assert_eq!(result, Some(DetectionStrategy::Heuristic));
+    }
+
+    #[test]
+    fn parse_detection_strategy_llm_default_model() {
+        let result = parse_detection_strategy("llm");
+        assert_eq!(
+            result,
+            Some(DetectionStrategy::LlmExtract {
+                model: "deepseek-v4-flash".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_detection_strategy_llm_with_model() {
+        let result = parse_detection_strategy("llm:deepseek-v4-pro");
+        assert_eq!(
+            result,
+            Some(DetectionStrategy::LlmExtract {
+                model: "deepseek-v4-pro".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_detection_strategy_llm_with_model_case_insensitive() {
+        let result = parse_detection_strategy("LLM:DeepSeek-V4-Pro");
+        assert_eq!(
+            result,
+            Some(DetectionStrategy::LlmExtract {
+                model: "deepseek-v4-pro".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_detection_strategy_llm_empty_model_returns_none() {
+        let result = parse_detection_strategy("llm:");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn parse_detection_strategy_invalid_returns_none() {
+        assert_eq!(parse_detection_strategy("invalid"), None);
+        assert_eq!(parse_detection_strategy(""), None);
+    }
+
+    #[test]
+    fn format_detection_strategy_report_heuristic() {
+        let report = format_detection_strategy_report(&DetectionStrategy::Heuristic);
+        assert!(report.contains("heuristic"));
+        assert!(report.contains("● current"));
+    }
+
+    #[test]
+    fn format_detection_strategy_report_llm_shows_model() {
+        let strategy = DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-pro".to_string(),
+        };
+        let report = format_detection_strategy_report(&strategy);
+        assert!(report.contains("llm"));
+        assert!(report.contains("● current"));
+        assert!(report.contains("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn format_detection_strategy_switch_report_includes_labels() {
+        let previous = DetectionStrategy::Heuristic;
+        let next = DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-flash".to_string(),
+        };
+        let report = format_detection_strategy_switch_report(&previous, &next);
+        assert!(report.contains("heuristic"));
+        assert!(report.contains("llm:deepseek-v4-flash"));
+        assert!(report.contains("strategy switched"));
+    }
 }

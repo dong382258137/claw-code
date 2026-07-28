@@ -30,12 +30,12 @@ pub use coordinator_executor::{CoordinatorExecutor, SubagentRunner};
 pub use executor_trait::{NodeError, SubagentExecutor};
 pub use scheduler::{DagScheduler, ProgressEvent};
 pub use subagent_dispatcher::SubagentDispatcher;
-pub use types::{DagError, DagGraph, DagId, DagNode, FailFast, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
+pub use types::{DagError, DagGraph, DagId, DagNode, DagRunResult, DagStatus, FailFast, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use types::{Dag, DagNodeStatus, DagRun, DagStatus};
+use types::{Dag, DagNodeStatus, DagRun};
 
 /// A thread-safe store for DAG definitions and their runs (G8.11).
 #[derive(Debug, Clone, Default)]

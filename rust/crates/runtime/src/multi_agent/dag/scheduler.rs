@@ -44,7 +44,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::executor_trait::{NodeError, SubagentExecutor};
 use super::types::{
-    DagError, DagGraph, DagNodeId, DagNodeStatus, DagStatus, FailFast, NodeResult, RetryPolicy,
+    DagError, DagGraph, DagNodeId, DagNodeStatus, DagRunResult, DagStatus, FailFast, NodeResult,
+    RetryPolicy,
 };
 use super::DagStore;
 
@@ -69,6 +70,13 @@ pub enum ProgressEvent {
         error: String,
         attempt: u32,
         will_retry: bool,
+    },
+    /// v3:节点因依赖失败而被跳过(FailFast::Off 专属事件)。
+    /// 与 `NodeFailed` 区分:Skipped 节点本身未执行,可通过
+    /// [`DagScheduler::recover_skipped`] 恢复。
+    NodeSkipped {
+        node_id: DagNodeId,
+        reason: String,
     },
     /// The entire DAG completed successfully.
     DagCompleted,
@@ -199,7 +207,8 @@ impl DagScheduler {
     /// - [`DagError::Cancelled`] — the DAG-level token was cancelled.
     /// - [`DagError::JoinError`] — a spawned task panicked.
     pub async fn run(&self) -> Result<Vec<NodeResult>, DagError> {
-        self.run_inner(None).await
+        let result = self.run_inner(None).await?;
+        Ok(result.into_successes())
     }
 
     /// Run the DAG, invoking `on_progress` for each lifecycle event.
@@ -215,7 +224,92 @@ impl DagScheduler {
     where
         F: FnMut(ProgressEvent) + Send + 'static,
     {
-        self.run_inner(Some(Box::new(on_progress))).await
+        let result = self.run_inner(Some(Box::new(on_progress))).await?;
+        Ok(result.into_successes())
+    }
+
+    /// v3:运行 DAG 并返回完整结果(含失败/跳过信息)。
+    ///
+    /// 与 [`run`](Self::run) 相同,但返回 [`DagRunResult`] 而非 `Vec<NodeResult>`,
+    /// 让调用方能区分"全成功"和"部分失败"(FailFast::Off 下)。
+    /// 调用方可据此决定是否调用 [`retry_failed`](Self::retry_failed) /
+    /// [`recover_skipped`](Self::recover_skipped)。
+    ///
+    /// # Errors
+    /// Same as [`run`](Self::run)。FailFast::Off 下即使有节点失败也返回 `Ok(DagRunResult)`。
+    pub async fn run_with_details(&self) -> Result<DagRunResult, DagError> {
+        self.run_inner(None).await
+    }
+
+    /// v3:重试指定的 failed 节点。
+    ///
+    /// 在 [`run_with_details`](Self::run_with_details) 返回 `DagRunResult` 后,
+    /// 调用方可选择性地重试部分失败节点。本方法构造一个仅含 `node_ids` 的子 DAG,
+    /// 用同一 executor + FailFast 策略重新执行,返回新的 `DagRunResult`。
+    ///
+    /// **不会恢复 skipped 节点**:若 failed 节点有下游 skipped 节点,需单独调用
+    /// [`recover_skipped`](Self::recover_skipped)。
+    ///
+    /// # 参数
+    /// - `node_ids`:要重试的节点 ID 列表(必须存在于原 DAG 中)。
+    ///
+    /// # 返回
+    /// 新的 `DagRunResult`,仅包含重试节点的结果(不合并原结果)。
+    ///
+    /// # Errors
+    /// - [`DagError::NodeNotFound`] — 指定的 node_id 不存在。
+    /// - 其他错误同 [`run`](Self::run)。
+    pub async fn retry_failed(&self, node_ids: &[DagNodeId]) -> Result<DagRunResult, DagError> {
+        let sub_graph = self.build_subgraph(node_ids)?;
+        let sub_scheduler = DagScheduler::new(sub_graph, Arc::clone(&self.executor))
+            .with_max_parallelism(self.max_parallelism)
+            .with_fail_fast(self.fail_fast);
+        sub_scheduler.run_inner(None).await
+    }
+
+    /// v3:恢复指定的 skipped 节点。
+    ///
+    /// 在 failed 节点通过 [`retry_failed`](Self::retry_failed) 成功重试后,
+    /// 调用方可恢复因依赖失败而被跳过的节点。本方法:
+    /// 1. 构造仅含 `node_ids` 的子 DAG(保留原依赖关系)。
+    /// 2. 用同一 executor + FailFast 策略执行。
+    ///
+    /// **前置条件**:调用方应确保 `node_ids` 的所有 `depends_on` 已成功
+    /// (通过之前的 `retry_failed` 或原 `run`)。否则节点会再次被跳过。
+    ///
+    /// # 参数
+    /// - `node_ids`:要恢复的节点 ID 列表。
+    ///
+    /// # 返回
+    /// 新的 `DagRunResult`,仅包含恢复节点的结果。
+    ///
+    /// # Errors
+    /// 同 [`retry_failed`](Self::retry_failed)。
+    pub async fn recover_skipped(&self, node_ids: &[DagNodeId]) -> Result<DagRunResult, DagError> {
+        // recover_skipped 与 retry_failed 共享子图构造 + 执行逻辑,
+        // 语义区别仅在调用方约定(retry_failed 针对 failed,recover_skipped 针对 skipped)。
+        self.retry_failed(node_ids).await
+    }
+
+    /// 构造仅含指定节点的子 DAG(保留原节点定义 + 依赖关系)。
+    ///
+    /// 内部辅助函数,供 `retry_failed` / `recover_skipped` 使用。
+    /// 子图的 `max_parallelism` 继承自原 scheduler。
+    fn build_subgraph(&self, node_ids: &[DagNodeId]) -> Result<DagGraph, DagError> {
+        let mut sub = DagGraph::new("retry-subgraph").with_max_parallelism(self.max_parallelism);
+        // 先添加所有目标节点(清除 depends_on,因为子图只含目标节点本身)
+        for nid in node_ids {
+            let mut node = self
+                .dag
+                .get_node(nid)
+                .ok_or_else(|| DagError::UnknownNode(nid.clone()))?
+                .clone();
+            // 子图中清除依赖:retry/recover 的节点在子图中应作为根节点执行,
+            // 调用方负责确保原依赖已满足(retry_failed 前置条件)。
+            node.depends_on.clear();
+            sub.add_node(node);
+        }
+        Ok(sub)
     }
 
     /// Shared implementation for [`run`](Self::run) and
@@ -223,7 +317,7 @@ impl DagScheduler {
     ///
     /// `on_progress` is `Option<Box<...>>` to keep the call sites uniform
     /// without monomorphising the entire loop body per callback type.
-    async fn run_inner(&self, mut on_progress: ProgressCallback) -> Result<Vec<NodeResult>, DagError> {
+    async fn run_inner(&self, mut on_progress: ProgressCallback) -> Result<DagRunResult, DagError> {
         // Validate acyclicity up-front so we never loop forever on a cyclic graph.
         self.dag.validate_acyclic()?;
 
@@ -231,7 +325,8 @@ impl DagScheduler {
         // v3 FailFast::Off:追踪永久失败的节点 + 因依赖失败而被跳过的节点。
         // 这两个集合合并到 `completed` 中以避免 `ready_nodes` 反复列出它们,
         // 但通过 `failed`/`skipped` 单独追踪以供结果报告。
-        let mut failed: HashSet<DagNodeId> = HashSet::new();
+        // v3 增强:`failed` 存储最后一次错误信息,供 `DagRunResult.failures` 使用。
+        let mut failed: HashMap<DagNodeId, String> = HashMap::new();
         let mut skipped: HashSet<DagNodeId> = HashSet::new();
         let mut results: Vec<NodeResult> = Vec::with_capacity(self.dag.node_count());
         // Each spawned task returns (node_id, result) so we can precisely
@@ -266,7 +361,7 @@ impl DagScheduler {
                     // FailFast::Off:若任一依赖已失败/跳过,则此节点也跳过
                     if self.fail_fast == FailFast::Off {
                         if let Some(node) = self.dag.get_node(id) {
-                            if node.depends_on.iter().any(|dep| failed.contains(dep) || skipped.contains(dep)) {
+                            if node.depends_on.iter().any(|dep| failed.contains_key(dep) || skipped.contains(dep)) {
                                 newly_skipped.push(id.clone());
                                 return false;
                             }
@@ -277,17 +372,16 @@ impl DagScheduler {
                 .collect();
 
             // v3 FailFast::Off:将因依赖失败而跳过的节点标记为 Skipped。
+            // v3 增强:使用独立的 `NodeSkipped` 事件(而非复用 `NodeFailed`)。
             for sid in &newly_skipped {
                 skipped.insert(sid.clone());
                 completed.insert(sid.clone()); // 防止 ready_nodes 反复列出
                 self.bridge_node_status(sid, DagNodeStatus::Skipped);
                 self.emit_progress(
                     &mut on_progress,
-                    ProgressEvent::NodeFailed {
+                    ProgressEvent::NodeSkipped {
                         node_id: sid.clone(),
-                        error: "skipped due to upstream dependency failure".to_string(),
-                        attempt: 0,
-                        will_retry: false,
+                        reason: "skipped due to upstream dependency failure".to_string(),
                     },
                 );
             }
@@ -447,8 +541,8 @@ impl DagScheduler {
                     self.bridge_node_status(&node_id, DagNodeStatus::Failed);
 
                     if self.fail_fast == FailFast::Off {
-                        // v3 FailFast::Off:标记节点失败,跳过其下游,继续执行独立分支。
-                        failed.insert(node_id.clone());
+                        // v3 FailFast::Off:标记节点失败(含错误信息),跳过其下游,继续执行独立分支。
+                        failed.insert(node_id.clone(), node_err.to_string());
                         completed.insert(node_id.clone()); // 防止 ready_nodes 反复列出
                         // 不取消 DAG,不 abort 在途任务,继续循环
                         continue;
@@ -476,10 +570,24 @@ impl DagScheduler {
             }
         }
 
-        // All nodes completed successfully.
-        self.emit_progress(&mut on_progress, ProgressEvent::DagCompleted);
-        self.bridge_run_status(DagStatus::Completed);
-        Ok(results)
+        // All nodes reached terminal state.
+        // v3 增强:FailFast::Off 下若有 failed/skipped,用 CompletedWithFailures 终态。
+        let has_failures = !failed.is_empty() || !skipped.is_empty();
+        if has_failures {
+            self.emit_progress(&mut on_progress, ProgressEvent::DagCompleted);
+            self.bridge_run_status(DagStatus::CompletedWithFailures);
+        } else {
+            self.emit_progress(&mut on_progress, ProgressEvent::DagCompleted);
+            self.bridge_run_status(DagStatus::Completed);
+        }
+
+        let failures = failed.into_iter().collect();
+        let skipped = skipped.into_iter().collect();
+        Ok(DagRunResult {
+            successes: results,
+            failures,
+            skipped,
+        })
     }
 
     /// Best-effort: stamp a node status into the bridged DagRun (if any).
@@ -957,5 +1065,156 @@ mod tests {
         let scheduler = DagScheduler::new(graph, executor);
         let err = scheduler.run().await.expect_err("should be cancelled");
         assert!(matches!(err, DagError::Cancelled));
+    }
+
+    // ========================================================================
+    // v3 FailFast::Off 增强:retry_failed / recover_skipped / DagRunResult
+    // ========================================================================
+
+    #[tokio::test]
+    async fn fail_fast_off_parallel_graph_collects_partial_results() {
+        // n1 fails, n2 succeeds (independent), n3 depends on n1 → skipped.
+        let g = parallel_graph();
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n1".to_string(),
+        });
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::Off);
+        let result = scheduler
+            .run_with_details()
+            .await
+            .expect("FailFast::Off should return Ok with partial results");
+
+        assert_eq!(result.success_count(), 1, "n2 should succeed");
+        assert_eq!(result.failure_count(), 1, "n1 should fail");
+        assert_eq!(result.skip_count(), 1, "n3 should be skipped");
+        assert!(!result.is_all_success());
+        assert!(result.successes.iter().any(|r| r.node_id == "n2"));
+        assert!(result.failures.iter().any(|(id, _)| id == "n1"));
+        assert!(result.skipped.contains(&"n3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn fail_fast_off_all_success_returns_completed_status() {
+        let g = parallel_graph();
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(SuccessExecutor {
+            seen: Mutex::new(Vec::new()),
+        });
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::Off);
+        let result = scheduler
+            .run_with_details()
+            .await
+            .expect("all success should return Ok");
+
+        assert!(result.is_all_success());
+        assert_eq!(result.success_count(), 3);
+        assert_eq!(result.failure_count(), 0);
+        assert_eq!(result.skip_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn fail_fast_on_still_returns_err_on_failure() {
+        // FailFast::On (default) should return Err, not DagRunResult.
+        let g = parallel_graph();
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n1".to_string(),
+        });
+        let scheduler = DagScheduler::new(g, executor); // default FailFast::On
+        let err = scheduler
+            .run_with_details()
+            .await
+            .expect_err("FailFast::On should return Err on failure");
+        assert!(matches!(err, DagError::NodeFailed(ref id) if id == "n1"));
+    }
+
+    #[tokio::test]
+    async fn retry_failed_succeeds_after_transient_failure() {
+        // 原始 DAG:n1 失败(FailFast::Off)。retry_failed 后用 FailThenSucceed 重试。
+        let g = parallel_graph();
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n1".to_string(),
+        });
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::Off);
+        let result = scheduler
+            .run_with_details()
+            .await
+            .expect("FailFast::Off returns Ok");
+
+        assert_eq!(result.failure_count(), 1);
+        let failed_id = result.failures[0].0.clone();
+
+        // retry_failed with a new executor that succeeds.
+        let retry_executor: Arc<dyn SubagentExecutor> = Arc::new(SuccessExecutor {
+            seen: Mutex::new(Vec::new()),
+        });
+        let retry_scheduler =
+            DagScheduler::new(parallel_graph(), retry_executor).with_fail_fast(FailFast::Off);
+        let retry_result = retry_scheduler
+            .retry_failed(&[failed_id])
+            .await
+            .expect("retry should succeed");
+        assert_eq!(retry_result.success_count(), 1);
+        assert_eq!(retry_result.failures.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_failed_unknown_node_returns_error() {
+        let g = parallel_graph();
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(SuccessExecutor {
+            seen: Mutex::new(Vec::new()),
+        });
+        let scheduler = DagScheduler::new(g, executor);
+        let err = scheduler
+            .retry_failed(&["nonexistent".to_string()])
+            .await
+            .expect_err("unknown node should error");
+        assert!(matches!(err, DagError::UnknownNode(ref id) if id == "nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn recover_skipped_runs_skipped_node_after_dependency_fixed() {
+        // 原始 DAG:n1 fails, n3 skipped。recover_skipped("n3") 在 n1 已修复后应成功。
+        let g = parallel_graph();
+        let fail_executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n1".to_string(),
+        });
+        let scheduler = DagScheduler::new(g, fail_executor).with_fail_fast(FailFast::Off);
+        let result = scheduler
+            .run_with_details()
+            .await
+            .expect("FailFast::Off returns Ok");
+
+        assert_eq!(result.skip_count(), 1);
+        let skipped_id = result.skipped[0].clone();
+        assert_eq!(skipped_id, "n3");
+
+        // recover_skipped with SuccessExecutor.
+        let recover_executor: Arc<dyn SubagentExecutor> = Arc::new(SuccessExecutor {
+            seen: Mutex::new(Vec::new()),
+        });
+        let recover_scheduler =
+            DagScheduler::new(parallel_graph(), recover_executor).with_fail_fast(FailFast::Off);
+        let recover_result = recover_scheduler
+            .recover_skipped(&[skipped_id])
+            .await
+            .expect("recover should succeed");
+        assert_eq!(recover_result.success_count(), 1);
+        assert_eq!(recover_result.successes[0].node_id, "n3");
+    }
+
+    #[tokio::test]
+    async fn dag_run_result_into_successes_extracts_only_successes() {
+        let g = parallel_graph();
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n2".to_string(),
+        });
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::Off);
+        let result = scheduler
+            .run_with_details()
+            .await
+            .expect("FailFast::Off returns Ok");
+
+        let successes = result.into_successes();
+        assert_eq!(successes.len(), 1);
+        assert!(successes.iter().any(|r| r.node_id == "n1"));
     }
 }

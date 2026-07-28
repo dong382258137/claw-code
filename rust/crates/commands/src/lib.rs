@@ -93,6 +93,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "detection-strategy",
+        aliases: &[],
+        summary: "Show or switch the decision detection strategy (heuristic|llm[:model])",
+        argument_hint: Some("[heuristic|llm[:<model>]]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "permissions",
         aliases: &[],
         summary: "Show or switch the active permission mode",
@@ -1111,6 +1118,9 @@ pub enum SlashCommand {
     Model {
         model: Option<String>,
     },
+    DetectionStrategy {
+        strategy: Option<String>,
+    },
     Permissions {
         mode: Option<String>,
     },
@@ -1307,6 +1317,7 @@ impl SlashCommand {
             Self::DebugToolCall { .. } => "/debug-tool-call",
             Self::Resume { .. } => "/resume",
             Self::Model { .. } => "/model",
+            Self::DetectionStrategy { .. } => "/detection-strategy",
             Self::Permissions { .. } => "/permissions",
             Self::Session { .. } => "/session",
             Self::Plugins { .. } => "/plugins",
@@ -1415,6 +1426,9 @@ pub fn validate_slash_command_input(
         }
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
+        },
+        "detection-strategy" => SlashCommand::DetectionStrategy {
+            strategy: optional_single_arg(command, &args, "[heuristic|llm[:<model>]]")?,
         },
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
@@ -4543,6 +4557,7 @@ pub fn handle_slash_command(
         | SlashCommand::DebugToolCall
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
+        | SlashCommand::DetectionStrategy { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
@@ -4829,6 +4844,22 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/model"),
             Ok(Some(SlashCommand::Model { model: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/detection-strategy"),
+            Ok(Some(SlashCommand::DetectionStrategy { strategy: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/detection-strategy heuristic"),
+            Ok(Some(SlashCommand::DetectionStrategy {
+                strategy: Some("heuristic".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/detection-strategy llm:deepseek-v4-pro"),
+            Ok(Some(SlashCommand::DetectionStrategy {
+                strategy: Some("llm:deepseek-v4-pro".to_string())
+            }))
         );
         assert_eq!(
             SlashCommand::parse("/permissions read-only"),
@@ -5212,7 +5243,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 146);
+        assert_eq!(slash_command_specs().len(), 147);
         assert!(resume_supported_slash_commands().len() >= 42);
     }
 

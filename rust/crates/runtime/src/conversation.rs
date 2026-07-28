@@ -773,6 +773,21 @@ where
         &self.detection_strategy
     }
 
+    /// v3 §4.7:运行时切换决策检测策略(供 `/detection-strategy` 命令使用)。
+    ///
+    /// 与 `with_detection_strategy`(builder 模式,消耗 self)不同,本方法
+    /// 接受 `&mut self`,可在已构造的 runtime 上原地切换策略,无需重建。
+    ///
+    /// **降级行为**:切换到 `LlmExtract` 但未通过 `set_global_decision_extractor_client`
+    /// 注册 client 时,`extract_decisions_before_compaction` 会自动 3 路降级为 Heuristic,
+    /// 不会阻塞 compaction。
+    pub fn set_detection_strategy(
+        &mut self,
+        strategy: crate::decision_log::DetectionStrategy,
+    ) {
+        self.detection_strategy = strategy;
+    }
+
     pub fn with_project_topology(
         mut self,
         topo: std::sync::Arc<crate::project_topology::ProjectTopology>,
@@ -3219,6 +3234,88 @@ where
         &mut self,
         input: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // 共享解析逻辑(与 async 变体复用)
+        let (tasks, fail_fast, fail_fast_str) = Self::parse_spawn_parallel_input(input)?;
+
+        // 发布 lane event(可观测性):批量并行派发开始
+        let emitted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let summary = format!(
+            "spawn_parallel_subagents: {} tasks, fail_fast={}",
+            tasks.len(),
+            fail_fast_str
+        );
+        publish_lane_event(LaneEvent::subagent_handoff(
+            emitted_at,
+            "parallel-batch",
+            "fork",
+            &summary,
+        ));
+
+        // 调用 spawn_parallel_via_dag_with_fail_fast(同步桥接 DagScheduler::run)
+        let results = self.spawn_parallel_via_dag_with_fail_fast(tasks, fail_fast);
+
+        // 格式化结果(与 async 版本共享逻辑)
+        Ok(Self::format_spawn_parallel_results(
+            &results,
+            &fail_fast_str,
+        ))
+    }
+
+    /// v3:async 变体 — 供 async 调用方使用,避免 `block_on`。
+    ///
+    /// 与 [`execute_spawn_parallel_subagents`](Self::execute_spawn_parallel_subagents)
+    /// 功能完全相同,但内部调用 [`spawn_parallel_via_dag_async`](Self::spawn_parallel_via_dag_async)
+    /// 而非同步桥接版本,适用于已在 tokio runtime 中的调用方(如未来的 `run_turn_async`)。
+    ///
+    /// **当前状态**:接口就绪,但 `run_turn` 仍是同步函数,本方法暂未被生产路径调用。
+    /// 待 `run_turn_async` 改造完成后,可在 async 上下文中直接 `.await` 本方法。
+    ///
+    /// # Errors
+    /// 同 [`execute_spawn_parallel_subagents`](Self::execute_spawn_parallel_subagents)。
+    pub async fn execute_spawn_parallel_subagents_async(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // 共享解析逻辑
+        let (tasks, fail_fast, fail_fast_str) = Self::parse_spawn_parallel_input(input)?;
+
+        // 发布 lane event(可观测性)
+        let emitted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let summary = format!(
+            "spawn_parallel_subagents: {} tasks, fail_fast={}",
+            tasks.len(),
+            fail_fast_str
+        );
+        publish_lane_event(LaneEvent::subagent_handoff(
+            emitted_at,
+            "parallel-batch",
+            "fork",
+            &summary,
+        ));
+
+        // 调用 async 变体(无 block_on,直接 .await)
+        let results = self.spawn_parallel_via_dag_async(tasks, fail_fast).await;
+
+        // 格式化结果(与同步版本共享逻辑)
+        Ok(Self::format_spawn_parallel_results(
+            &results,
+            &fail_fast_str,
+        ))
+    }
+
+    /// v3:解析 `spawn_parallel_subagents` 工具的 JSON 输入(共享逻辑)。
+    ///
+    /// 返回 `(tasks, fail_fast, fail_fast_str)`,供同步/async 变体复用。
+    fn parse_spawn_parallel_input(
+        input: &str,
+    ) -> Result<(Vec<SpawnRequest>, FailFast, String), Box<dyn std::error::Error + Send + Sync>>
+    {
         let parsed: serde_json::Value =
             serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
 
@@ -3230,7 +3327,6 @@ where
             return Err("'tasks' array must not be empty".into());
         }
 
-        // 解析 fail_fast(默认 on)
         let fail_fast_str = parsed
             .get("fail_fast")
             .and_then(|v| v.as_str())
@@ -3247,7 +3343,6 @@ where
             }
         };
 
-        // 解析 tasks 数组为 SpawnRequest 列表
         let mut tasks: Vec<SpawnRequest> = Vec::with_capacity(tasks_arr.len());
         for (idx, item) in tasks_arr.iter().enumerate() {
             let name = item
@@ -3283,27 +3378,14 @@ where
             tasks.push(SpawnRequest::new(name, task, mode, model, complexity));
         }
 
-        // 发布 lane event(可观测性):批量并行派发开始
-        let emitted_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_else(|_| "0".to_string());
-        let summary = format!(
-            "spawn_parallel_subagents: {} tasks, fail_fast={}",
-            tasks.len(),
-            fail_fast_str
-        );
-        publish_lane_event(LaneEvent::subagent_handoff(
-            emitted_at,
-            "parallel-batch",
-            "fork",
-            &summary,
-        ));
+        Ok((tasks, fail_fast, fail_fast_str))
+    }
 
-        // 调用 spawn_parallel_via_dag_with_fail_fast(同步桥接 DagScheduler::run)
-        let results = self.spawn_parallel_via_dag_with_fail_fast(tasks, fail_fast);
-
-        // 格式化结果为可读字符串
+    /// v3:格式化 `spawn_parallel_subagents` 结果为可读字符串(共享逻辑)。
+    fn format_spawn_parallel_results(
+        results: &[Result<String, String>],
+        fail_fast_str: &str,
+    ) -> String {
         let mut output = String::new();
         let success_count = results.iter().filter(|r| r.is_ok()).count();
         let fail_count = results.len() - success_count;
@@ -3323,7 +3405,7 @@ where
                 }
             }
         }
-        Ok(output)
+        output
     }
 
     /// Step 3.2-c:Execute the `check_subagent` tool — 查询子 agent 状态/结果。
@@ -8176,6 +8258,130 @@ mod tests {
         assert!(output.contains("0 succeeded"), "got: {output}");
         assert!(output.contains("1 failed"), "got: {output}");
         assert!(output.contains("Budget tier"), "got: {output}");
+    }
+
+    // ===== v3:async 变体测试 =====
+
+    /// v3:`execute_spawn_parallel_subagents_async` — 无效 JSON 返回错误
+    #[tokio::test]
+    async fn execute_spawn_parallel_subagents_async_invalid_json_errors() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let err = runtime
+            .execute_spawn_parallel_subagents_async("not json")
+            .await
+            .expect_err("invalid JSON should error");
+        assert!(err.to_string().contains("invalid input JSON"));
+    }
+
+    /// v3:`execute_spawn_parallel_subagents_async` — 空 tasks 数组返回错误
+    #[tokio::test]
+    async fn execute_spawn_parallel_subagents_async_empty_tasks_errors() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let err = runtime
+            .execute_spawn_parallel_subagents_async(r#"{"tasks":[]}"#)
+            .await
+            .expect_err("empty tasks should error");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    /// v3:`execute_spawn_parallel_subagents_async` — 端到端成功:2 个 Simple task 并行执行
+    #[tokio::test]
+    async fn execute_spawn_parallel_subagents_async_succeeds() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let input = r#"{
+            "tasks": [
+                {"name":"task-a","task":"do A","model":"deepseek-v4-pro"},
+                {"name":"task-b","task":"do B","model":"claude-haiku"}
+            ],
+            "fail_fast":"off"
+        }"#;
+        let output = runtime
+            .execute_spawn_parallel_subagents_async(input)
+            .await
+            .expect("should return formatted output");
+        assert!(output.contains("spawn_parallel_subagents:"), "got: {output}");
+        assert!(output.contains("fail_fast=off"), "got: {output}");
+    }
+
+    /// v3:`parse_spawn_parallel_input` — 共享解析逻辑的单元测试
+    #[test]
+    fn parse_spawn_parallel_input_valid_input() {
+        let input = r#"{
+            "tasks": [
+                {"name":"a","task":"do A","model":"deepseek-v4-pro"},
+                {"name":"b","task":"do B","model":"claude-haiku","mode":"fork","complexity":"simple"}
+            ],
+            "fail_fast":"off"
+        }"#;
+        let (tasks, fail_fast, fail_fast_str) =
+            ConversationRuntime::<NoopApi, StaticToolExecutor>::parse_spawn_parallel_input(input)
+                .expect("valid input should parse");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].name, "a");
+        assert_eq!(tasks[0].model, "deepseek-v4-pro");
+        assert_eq!(tasks[1].name, "b");
+        assert_eq!(fail_fast, FailFast::Off);
+        assert_eq!(fail_fast_str, "off");
+    }
+
+    /// v3:`format_spawn_parallel_results` — 共享格式化逻辑的单元测试
+    #[test]
+    fn format_spawn_parallel_results_mixed_success_failure() {
+        let results = vec![
+            Ok("/path/to/artifact-1".to_string()),
+            Err("capability check failed".to_string()),
+            Ok("/path/to/artifact-2".to_string()),
+        ];
+        let output =
+            ConversationRuntime::<NoopApi, StaticToolExecutor>::format_spawn_parallel_results(
+                &results,
+                "on",
+            );
+        assert!(output.contains("2 succeeded"), "got: {output}");
+        assert!(output.contains("1 failed"), "got: {output}");
+        assert!(output.contains("fail_fast=on"), "got: {output}");
+        assert!(output.contains("[0] OK:"), "got: {output}");
+        assert!(output.contains("[1] FAIL:"), "got: {output}");
+        assert!(output.contains("[2] OK:"), "got: {output}");
     }
 
     // ===== v3 §4.7:DetectionStrategy 端到端接入测试 =====

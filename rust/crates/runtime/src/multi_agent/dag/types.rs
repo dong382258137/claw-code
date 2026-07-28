@@ -161,6 +161,57 @@ pub enum DagStatus {
     Failed,
     /// Execution was cancelled.
     Cancelled,
+    /// v3:FailFast::Off 下 DAG 完成,但有节点失败或跳过。
+    /// 区别于 `Completed`(全成功)和 `Failed`(FailFast::On 不可继续)。
+    CompletedWithFailures,
+}
+
+/// v3:DAG 运行的完整结果(含失败/跳过信息)。
+///
+/// 由 [`super::scheduler::DagScheduler::run_with_details`] 返回,
+/// 供调用方分析部分失败情况并决定是否调用
+/// [`retry_failed`](super::scheduler::DagScheduler::retry_failed) /
+/// [`recover_skipped`](super::scheduler::DagScheduler::recover_skipped)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DagRunResult {
+    /// 成功完成的节点结果(按完成顺序)。
+    pub successes: Vec<NodeResult>,
+    /// 永久失败的节点(耗尽 retry):`(node_id, 最后一次错误)`。
+    pub failures: Vec<(DagNodeId, String)>,
+    /// 因依赖失败而被跳过的节点 ID。
+    pub skipped: Vec<DagNodeId>,
+}
+
+impl DagRunResult {
+    /// 返回成功节点数量。
+    #[must_use]
+    pub fn success_count(&self) -> usize {
+        self.successes.len()
+    }
+
+    /// 返回失败节点数量。
+    #[must_use]
+    pub fn failure_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    /// 返回跳过节点数量。
+    #[must_use]
+    pub fn skip_count(&self) -> usize {
+        self.skipped.len()
+    }
+
+    /// 是否全部成功(无失败、无跳过)。
+    #[must_use]
+    pub fn is_all_success(&self) -> bool {
+        self.failures.is_empty() && self.skipped.is_empty()
+    }
+
+    /// 提取成功节点列表(向后兼容 `run` 方法的 `Vec<NodeResult>` 返回值)。
+    #[must_use]
+    pub fn into_successes(self) -> Vec<NodeResult> {
+        self.successes
+    }
 }
 
 /// A DAG definition — the graph structure and node metadata.

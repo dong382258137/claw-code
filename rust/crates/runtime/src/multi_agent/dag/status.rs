@@ -15,6 +15,7 @@ pub fn render_dag_status(dag: &Dag, run: &DagRun) -> String {
         DagStatus::Completed => "✓",
         DagStatus::Failed => "✗",
         DagStatus::Cancelled => "⊘",
+        DagStatus::CompletedWithFailures => "⚠",
     };
 
     out.push_str(&format!(

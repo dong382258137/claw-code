@@ -2398,13 +2398,71 @@ MVP 验收通过后,按以下顺序扩展(每步独立可回滚):
 
 ### 12.4 后续工作
 
-- spawn_parallel_via_dag_async 生产集成:目前 async 变体已就绪,但 `execute_spawn_parallel_subagents` 仍走同步路径(因 `run_turn` 是同步上下文)。未来若 TUI event loop 改为 async,可切换到 async 变体。
-- DAG partial failure tolerance 进一步增强:目前 FailFast::Off 仅跳过直接下游,未实现"重试 failed 节点"或"手动恢复 skipped 节点"。
-- DetectionStrategy 运行时切换:目前策略在启动时固定,未来可加 `/detection-strategy` slash command 支持运行时切换。
+- ~~spawn_parallel_via_dag_async 生产集成~~:**已完成**(v3 Phase 4,见 §13)。
+- ~~DAG partial failure tolerance 进一步增强~~:**已完成**(v3 Phase 4,见 §13)。
+- ~~DetectionStrategy 运行时切换~~:**已完成**(v3 Phase 4,见 §13)。
 
 ---
 
-## 13. 总结
+## 13. v3 Phase 4 实施完成记录(2026-07-28)
+
+### 13.1 已完成工作项
+
+| # | 工作项 | 文件 | 测试 |
+|:-:|------|------|------|
+| 1 | **DetectionStrategy 运行时切换** | `runtime/src/decision_log.rs` + `runtime/src/conversation.rs` + `commands/src/lib.rs` + `rusty-claude-cli/src/app.rs` + `rusty-claude-cli/src/format.rs` + `rusty-claude-cli/src/session_mgr.rs` + `runtime/src/lib.rs` | format 11 + commands 3 |
+| 2 | **FailFast::Off 增强** | `runtime/src/multi_agent/dag/types.rs` + `scheduler.rs` + `mod.rs` + `status.rs` | 7 回归测试 |
+| 3 | **async 变体生产集成** | `runtime/src/conversation.rs` | 5 新测试(3 async + 2 共享逻辑) |
+
+### 13.2 关键设计决策
+
+#### DetectionStrategy 运行时切换(`/detection-strategy` 命令)
+
+- **方案 A(直接 setter)**:`ConversationRuntime::set_detection_strategy(&mut self, strategy)` 原地切换,不重建 runtime(因 `detection_strategy` 是简单字段)。
+- **命令格式**:`/detection-strategy [heuristic|llm[:<model>]]`
+  - 无参数:打印当前策略报告(含 ●/○ 标记)
+  - `heuristic`:切换为启发式(零成本)
+  - `llm`:切换为 LLM 提取(默认 `deepseek-v4-flash`)
+  - `llm:<model>`:切换为 LLM 提取并指定模型
+- **降级行为**:切换到 `LlmExtract` 但未注册 client 时,自动 3 路降级为 Heuristic,不阻塞 compaction。
+- **DetectionStrategy 新增 `PartialEq`**:支持"已是该策略则不切换"短路。
+- **SlashCommand 新增 `DetectionStrategy` 变体**:4 处注册点(spec / enum / canonical_name / parse) + 2 处 match 补全(session_mgr / is_runtime_state_change)。
+
+#### FailFast::Off 增强(retry_failed / recover_skipped)
+
+- **新增 `DagRunResult` 结构体**:含 `successes: Vec<NodeResult>` + `failures: Vec<(DagNodeId, String)>` + `skipped: Vec<DagNodeId>`,提供 `is_all_success()` / `into_successes()` 等方法。
+- **新增 `DagStatus::CompletedWithFailures`**:FailFast::Off 下若有 failed/skipped,终态为 `CompletedWithFailures`(区别于 `Completed` 全成功)。
+- **新增 `ProgressEvent::NodeSkipped`**:独立事件(不再复用 `NodeFailed`),含 `node_id` + `reason`。
+- **新增 `DagScheduler::run_with_details()`**:返回 `DagRunResult` 而非 `Vec<NodeResult>`(向后兼容:`run()` 仍返回 `Vec<NodeResult>`)。
+- **新增 `DagScheduler::retry_failed(&self, node_ids)`**:构造子 DAG(清除 depends_on,调用方负责确保依赖已满足),用同一 executor + FailFast 策略重新执行。
+- **新增 `DagScheduler::recover_skipped(&self, node_ids)`**:与 `retry_failed` 共享子图构造逻辑,语义区别在调用方约定(针对 skipped 节点)。
+- **`failed` 集合升级为 `HashMap<DagNodeId, String>`**:存储最后一次错误信息,供 `DagRunResult.failures` 使用。
+- **`run_inner` 返回值改为 `DagRunResult`**:`run()` / `run_with_progress()` 通过 `into_successes()` 提取保持向后兼容。
+
+#### async 变体生产集成
+
+- **新增 `execute_spawn_parallel_subagents_async`**:async 镜像,内部调用 `spawn_parallel_via_dag_async`(直接 `.await`,无 `block_on`)。
+- **共享逻辑提取**:`parse_spawn_parallel_input`(解析 JSON)+ `format_spawn_parallel_results`(格式化输出),同步/async 变体复用。
+- **当前状态**:接口就绪,但 `run_turn` 仍是同步函数,async 变体暂未被生产路径调用。待 `run_turn_async` 改造完成后可直接接入。
+- **适用场景**:claw-shell ACP 路径(已在 tokio runtime 中),未来 `run_turn_async` 改造后可消除"嵌套 runtime + block_on"开销。
+
+### 13.3 测试验证
+
+- runtime crate:**1410 passed**, 0 failed, 2 ignored(新增 12 个:7 dag + 5 async)
+- rusty-claude-cli crate:**383 passed**, 0 failed(新增 11 个 format 测试)
+- commands crate:**46 passed**, 0 failed(新增 3 个解析测试 + 更新命令计数)
+- api crate:**183 passed**, 0 failed
+- **新增测试总计:26 个**
+
+### 13.4 后续工作
+
+- `run_turn_async` 改造:目前 `run_turn` 是同步函数,TUI/REPL/JSON 路径均无 tokio runtime。改造为 async 后,`execute_spawn_parallel_subagents_async` 可直接接入,消除 `spawn_parallel_via_dag_with_fail_fast` 的临时 runtime 构造开销。
+- FailFast::Off 进一步增强:目前 `retry_failed` / `recover_skipped` 构造全新子 DAG,未保留原 scheduler 的 DagStore 桥接。未来可支持"在原 DagRun 上追加 retry 记录"。
+- `/detection-strategy` 增强:目前切换后立即生效,未来可加 `--dry-run` 预览或 `--verify` 校验 client 是否已注册。
+
+---
+
+## 14. 总结
 
 本方案从平台层根治"能力不足模型浪费轮次"问题，**五重防护**(v3 从四重升级):
 

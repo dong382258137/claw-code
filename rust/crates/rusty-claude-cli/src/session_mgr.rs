@@ -756,6 +756,7 @@ pub(crate) fn run_resume_command(
         | SlashCommand::DebugToolCall { .. }
         | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
+        | SlashCommand::DetectionStrategy { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Login
         | SlashCommand::Logout

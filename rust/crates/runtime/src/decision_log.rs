@@ -832,7 +832,7 @@ pub struct DecisionPoint {
 }
 
 /// 决策检测策略(§4.7)。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DetectionStrategy {
     /// MVP:启发式关键词检测。零 LLM 调用,零成本。
     /// 检测包含决策信号的消息:decided/chose/trade-off/权衡/否决/放弃/之所以/因为。

@@ -1160,6 +1160,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::DetectionStrategy { strategy } => self.set_detection_strategy(strategy)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -1622,6 +1623,56 @@ impl LiveCli {
             "{}",
             format_permissions_switch_report(&previous, normalized)
         );
+        Ok(true)
+    }
+
+    /// v3 §4.7:`/detection-strategy` 命令处理 — 运行时切换决策检测策略。
+    ///
+    /// - 无参数:打印当前策略
+    /// - `heuristic`:切换为启发式(零成本)
+    /// - `llm`:切换为 LLM 提取(使用默认 flash 模型)
+    /// - `llm:<model>`:切换为 LLM 提取并指定模型
+    ///
+    /// 采用方案 A(直接 setter),不重建 runtime,因 `detection_strategy` 是简单字段。
+    /// 切换到 `LlmExtract` 但未注册 client 时,提取逻辑会自动 3 路降级为 Heuristic。
+    fn set_detection_strategy(
+        &mut self,
+        strategy: Option<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(rt) = self.runtime.runtime.as_mut() else {
+            return Err("runtime not initialized".into());
+        };
+
+        let Some(strategy_arg) = strategy else {
+            // 无参数:打印当前策略
+            let current = rt.detection_strategy();
+            let report = format_detection_strategy_report(current);
+            if !self.tui_println(&report) {
+                println!("{report}");
+            }
+            return Ok(false);
+        };
+
+        let new_strategy = parse_detection_strategy(&strategy_arg).ok_or_else(|| {
+            format!(
+                "unsupported detection strategy '{strategy_arg}'. Use heuristic, llm, or llm:<model>."
+            )
+        })?;
+
+        let previous = rt.detection_strategy().clone();
+        if new_strategy == previous {
+            let report = format_detection_strategy_report(&new_strategy);
+            if !self.tui_println(&report) {
+                println!("{report}");
+            }
+            return Ok(false);
+        }
+
+        rt.set_detection_strategy(new_strategy.clone());
+        let switch_report = format_detection_strategy_switch_report(&previous, &new_strategy);
+        if !self.tui_println(&switch_report) {
+            println!("{switch_report}");
+        }
         Ok(true)
     }
 
