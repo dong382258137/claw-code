@@ -106,6 +106,25 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
+    // 检测是否已在 tokio runtime 上下文中(如 TUI 的 run_turn_async 调用栈)。
+    // 若是,直接创建新 runtime + block_on 会触发
+    // "Cannot start a runtime from within a runtime" panic。
+    // 修复:用 std::thread::spawn 创建独立 OS 线程,完全不继承 runtime context,
+    // 通过 oneshot channel 传回结果。与 subagent_dispatcher.rs 的隔离模式一致。
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let (tx, rx) = std::sync::mpsc::channel::<io::Result<BashCommandOutput>>();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = Builder::new_current_thread().enable_all().build()?;
+                runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+            })();
+            let _ = tx.send(result);
+        });
+        return rx
+            .recv()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bash worker thread died: {e}")))?;
+    }
+
     let runtime = Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
 }
