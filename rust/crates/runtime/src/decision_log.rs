@@ -878,6 +878,17 @@ pub fn set_global_decision_extractor_client(client: std::sync::Arc<dyn DecisionE
     let _ = GLOBAL_DECISION_EXTRACTOR.set(Some(client));
 }
 
+/// v3:检查全局 DecisionExtractorClient 是否已注册。
+///
+/// 供 `/detection-strategy --verify` 命令在切换前预检 client 可用性。
+/// 返回 `false` 时,`LlmExtract` 策略会自动降级为 `Heuristic`。
+#[must_use]
+pub fn is_decision_extractor_client_registered() -> bool {
+    GLOBAL_DECISION_EXTRACTOR
+        .get()
+        .map_or(false, |opt| opt.is_some())
+}
+
 /// 获取全局决策提取 client(若已注册)。
 fn global_decision_extractor_client() -> Option<&'static std::sync::Arc<dyn DecisionExtractorClient>> {
     GLOBAL_DECISION_EXTRACTOR

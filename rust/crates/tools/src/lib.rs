@@ -6041,6 +6041,79 @@ impl ApiClient for ProviderRuntimeClient {
             |error| error.to_string(),
         )))
     }
+
+    /// v3:async 变体 — 直接 `.await` [`stream_with_provider`],消除
+    /// [`stream`](Self::stream) 内部 `runtime.block_on()` 创建的嵌套 runtime。
+    ///
+    /// 调用方必须已在 tokio runtime 中(如 [`ConversationRuntime::run_turn_async`]
+    /// 或 `spawn_parallel_via_dag_async`)。在非 async 上下文调用请使用同步
+    /// [`stream`](Self::stream)。
+    ///
+    /// 与同步版本语义完全一致:
+    /// - 遍历 `chain` 中的 provider,首个成功者返回
+    /// - retryable 错误触发 fallback 到下一个 provider
+    /// - 不可重试错误或链耗尽返回 `Err`
+    ///
+    /// # Send 性
+    /// 返回的 `Future` 为 `Send`,因为 `ProviderRuntimeClient` 本身是 `Send`
+    /// (默认 `stream_async` 实现已要求 `Self: Send`),且 `stream_with_provider`
+    /// 仅持有 `&entry.client`(`&self.chain` 的共享借用)跨 await 点。
+    fn stream_async<'a>(
+        &'a mut self,
+        request: ApiRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
+                .into_iter()
+                .map(|spec| ToolDefinition {
+                    name: spec.name.to_string(),
+                    description: Some(spec.description.to_string()),
+                    input_schema: spec.input_schema,
+                    cache_control: None,
+                })
+                .collect::<Vec<_>>();
+            let messages = convert_messages(&request.messages);
+            let system = build_provider_system_blocks(&request.system_prompt);
+            let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
+
+            let mut last_error: Option<ApiError> = None;
+            for (index, entry) in self.chain.iter().enumerate() {
+                let message_request = MessageRequest {
+                    model: entry.model.clone(),
+                    max_tokens: max_tokens_for_model(&entry.model),
+                    messages: messages.clone(),
+                    system: system.clone(),
+                    tools: (!tools.is_empty()).then(|| tools.clone()),
+                    tool_choice: tool_choice.clone(),
+                    stream: true,
+                    ..Default::default()
+                };
+
+                match stream_with_provider(&entry.client, &message_request).await {
+                    Ok(events) => return Ok(events),
+                    Err(error) if error.is_retryable() && index + 1 < self.chain.len() => {
+                        eprintln!(
+                            "provider {} failed with retryable error, falling back: {error}",
+                            entry.model
+                        );
+                        last_error = Some(error);
+                    }
+                    Err(error) => return Err(RuntimeError::new(error.to_string())),
+                }
+            }
+
+            Err(RuntimeError::new(last_error.map_or_else(
+                || String::from("provider chain exhausted with no attempts"),
+                |error| error.to_string(),
+            )))
+        })
+    }
 }
 
 #[allow(clippy::too_many_lines)]

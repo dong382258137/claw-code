@@ -177,7 +177,7 @@ pub(crate) fn format_detection_strategy_report(strategy: &DetectionStrategy) -> 
         DetectionStrategy::LlmExtract { model } => format!("\n  Active model     {model}"),
     };
 
-    format!("Decision detection strategy\n{strategies}{detail}\n  Usage            /detection-strategy [heuristic|llm[:<model>]]")
+    format!("Decision detection strategy\n{strategies}{detail}\n  Usage            /detection-strategy [heuristic|llm[:<model>]] [--dry-run] [--verify]")
 }
 
 /// v3 §4.7:格式化 detection strategy 切换报告。
@@ -194,6 +194,81 @@ pub(crate) fn format_detection_strategy_switch_report(
   Active           {next_label}
   Applies to       next compaction cycle
   Usage            /detection-strategy to inspect current strategy"
+    )
+}
+
+/// v3:格式化 dry-run 预览报告(不实际切换)。
+///
+/// 展示"如果应用此切换会发生什么":
+/// - Previous → Next 的变化
+/// - 是否会触发降级(client 未注册时 LlmExtract → Heuristic)
+/// - 不实际修改 runtime 状态
+pub(crate) fn format_detection_strategy_dry_run_report(
+    current: &DetectionStrategy,
+    proposed: &DetectionStrategy,
+    client_registered: bool,
+) -> String {
+    let current_label = detection_strategy_label(current);
+    let proposed_label = detection_strategy_label(proposed);
+
+    // 判断是否会触发降级
+    let downgrade_note = match (current, proposed, client_registered) {
+        // 切换到 LlmExtract 但 client 未注册 → 会降级
+        (_, DetectionStrategy::LlmExtract { .. }, false) => {
+            "\n  Warning          LlmExtract selected but no DecisionExtractorClient registered
+                   extraction will silently downgrade to Heuristic at runtime"
+        }
+        // 切换到 Heuristic → 无降级风险
+        (_, DetectionStrategy::Heuristic, _) => "",
+        // 切换到 LlmExtract 且 client 已注册 → 无降级
+        (_, DetectionStrategy::LlmExtract { .. }, true) => "",
+    };
+
+    format!(
+        "Detection strategy dry-run
+  Result           preview only (no changes applied)
+  Current          {current_label}
+  Proposed         {proposed_label}
+  Client status    {client_status}{downgrade_note}
+  Usage            re-run without --dry-run to apply; add --verify to check client",
+        client_status = if client_registered {
+            "registered"
+        } else {
+            "not registered"
+        }
+    )
+}
+
+/// v3:格式化 verify 报告(校验 DecisionExtractorClient 注册状态)。
+///
+/// 报告内容:
+/// - client 注册状态(registered / not registered)
+/// - 当前策略与 client 状态的匹配度(是否需要降级)
+/// - 建议(若不匹配,给出修复指引)
+pub(crate) fn format_detection_strategy_verify_report(
+    current: &DetectionStrategy,
+    client_registered: bool,
+) -> String {
+    let status_line = if client_registered {
+        "  Client           registered (LlmExtract will be used as configured)"
+    } else {
+        "  Client           not registered (LlmExtract will downgrade to Heuristic)"
+    };
+
+    let advice = match (current, client_registered) {
+        (DetectionStrategy::LlmExtract { .. }, false) => {
+            "\n  Advice           call /register-decision-extractor <model> first,
+                   or switch to /detection-strategy heuristic"
+        }
+        (DetectionStrategy::LlmExtract { .. }, true) => "",
+        (DetectionStrategy::Heuristic, _) => "",
+    };
+
+    let current_label = detection_strategy_label(current);
+    format!(
+        "Detection strategy verify
+  Current          {current_label}{status_line}{advice}
+  Usage            /detection-strategy <strategy> to switch"
     )
 }
 
@@ -2174,5 +2249,80 @@ mod tests {
         assert!(report.contains("heuristic"));
         assert!(report.contains("llm:deepseek-v4-flash"));
         assert!(report.contains("strategy switched"));
+    }
+
+    #[test]
+    fn dry_run_report_shows_preview_only() {
+        let current = DetectionStrategy::Heuristic;
+        let proposed = DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-flash".to_string(),
+        };
+        let report =
+            format_detection_strategy_dry_run_report(&current, &proposed, true);
+        assert!(report.contains("dry-run"));
+        assert!(report.contains("preview only"));
+        assert!(report.contains("heuristic"));
+        assert!(report.contains("llm:deepseek-v4-flash"));
+        assert!(report.contains("registered"));
+        // 不应出现降级 warning
+        assert!(!report.contains("downgrade"));
+    }
+
+    #[test]
+    fn dry_run_report_warns_on_unregistered_client() {
+        let current = DetectionStrategy::Heuristic;
+        let proposed = DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-flash".to_string(),
+        };
+        let report =
+            format_detection_strategy_dry_run_report(&current, &proposed, false);
+        assert!(report.contains("Warning"));
+        assert!(report.contains("downgrade"));
+        assert!(report.contains("not registered"));
+    }
+
+    #[test]
+    fn dry_run_report_no_warning_for_heuristic() {
+        let current = DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-flash".to_string(),
+        };
+        let proposed = DetectionStrategy::Heuristic;
+        // 即使 client 未注册,切到 Heuristic 也不应有 warning
+        let report =
+            format_detection_strategy_dry_run_report(&current, &proposed, false);
+        assert!(!report.contains("Warning"));
+        assert!(!report.contains("downgrade"));
+    }
+
+    #[test]
+    fn verify_report_registered_client() {
+        let current = DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-flash".to_string(),
+        };
+        let report = format_detection_strategy_verify_report(&current, true);
+        assert!(report.contains("verify"));
+        assert!(report.contains("registered"));
+        assert!(report.contains("llm:deepseek-v4-flash"));
+        // client 已注册时不应出现 advice
+        assert!(!report.contains("Advice"));
+    }
+
+    #[test]
+    fn verify_report_unregistered_client_offers_advice() {
+        let current = DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-flash".to_string(),
+        };
+        let report = format_detection_strategy_verify_report(&current, false);
+        assert!(report.contains("not registered"));
+        assert!(report.contains("Advice"));
+        assert!(report.contains("downgrade"));
+    }
+
+    #[test]
+    fn verify_report_heuristic_no_advice_even_unregistered() {
+        let current = DetectionStrategy::Heuristic;
+        let report = format_detection_strategy_verify_report(&current, false);
+        // Heuristic 不依赖 client,无 advice
+        assert!(!report.contains("Advice"));
     }
 }

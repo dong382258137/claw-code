@@ -408,6 +408,75 @@ impl ApiClient for AnthropicRuntimeClient {
         })
     }
 
+    /// v3:async 变体 — 直接 `.await` [`consume_stream`](Self::consume_stream),
+    /// 消除 [`stream`](Self::stream) 内部 `runtime.block_on()` 创建的嵌套 runtime。
+    ///
+    /// 调用方必须已在 tokio runtime 中(如 [`ConversationRuntime::run_turn_async`]
+    /// 或 `spawn_parallel_via_dag_async`)。在非 async 上下文调用请使用同步
+    /// [`stream`](Self::stream)。
+    ///
+    /// 与同步版本语义完全一致:
+    /// - 触发 `progress_reporter.mark_model_phase()`
+    /// - 计算 `is_post_tool` / `effective_effort` 路由
+    /// - 单次 `consume_stream` 调用(stall 仍由内部 `tokio::time::timeout` 保护)
+    ///
+    /// # Send 性
+    /// 返回的 `Future` 为 `Send`,因为 `AnthropicRuntimeClient` 是 `Send`
+    /// (所有字段均为 `Send + Sync`:Runtime / ApiProviderClient /
+    /// GlobalToolRegistry / InternalPromptProgressReporter / StatusEmitter 等)。
+    fn stream_async<'a>(
+        &'a mut self,
+        request: ApiRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if let Some(progress_reporter) = &self.progress_reporter {
+                progress_reporter.mark_model_phase();
+            }
+            let is_post_tool = request_ends_with_tool_result(&request);
+
+            // 与同步 `stream` 一致:抽离 system 角色消息走 system 字段(prompt cache)
+            let (system_text, filtered_messages) = extract_system_messages(&request.messages);
+            let mut split = request.system_prompt;
+            if !system_text.is_empty() {
+                split.dynamic_sections.push(system_text);
+            }
+
+            // Effort 路由(与同步版本完全一致):
+            // post-tool 续写且非 high 时降到 "low",节省 output token / 延迟。
+            // 仅在用户已开启 reasoning 时生效,避免为非 reasoning 模型注入参数。
+            let effective_effort = match (is_post_tool, &self.reasoning_effort) {
+                (true, Some(effort)) if effort != "high" => Some("low".to_string()),
+                _ => self.reasoning_effort.clone(),
+            };
+
+            let message_request = MessageRequest {
+                model: self.model.clone(),
+                max_tokens: max_tokens_for_model(&self.model),
+                messages: convert_messages(&filtered_messages, &self.model),
+                system: build_system_blocks(&split),
+                tools: self.enable_tools.then(|| {
+                    let mut tools =
+                        filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+                    mark_last_tool_with_cache_control(&mut tools);
+                    tools
+                }),
+                tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+                stream: true,
+                reasoning_effort: effective_effort,
+                ..Default::default()
+            };
+
+            // 直接 await,无 runtime.block_on
+            self.consume_stream(&message_request, is_post_tool).await
+        })
+    }
+
     /// Multi-Agent Hardening §4.5.3:构造一个绑定到指定模型的子 agent client。
     ///
     /// 用于 `execute_dispatch_subagent` retry loop 中的模型升级路径:
@@ -455,7 +524,10 @@ impl AnthropicRuntimeClient {
             })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
-        let out: &mut dyn Write = if self.emit_output {
+        // v3:使用 `dyn Write + Send` 让 `consume_stream` 返回的 Future 为 `Send`,
+        // 从而可在 `stream_async` 中直接 `.await`(消除嵌套 runtime)。
+        // `io::Stdout` 与 `io::Sink` 均为 `Send + Sync`,满足此 bound。
+        let out: &mut (dyn Write + Send) = if self.emit_output {
             &mut stdout
         } else {
             &mut sink

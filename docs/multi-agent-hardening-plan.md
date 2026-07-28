@@ -2456,9 +2456,64 @@ MVP 验收通过后,按以下顺序扩展(每步独立可回滚):
 
 ### 13.4 后续工作
 
-- `run_turn_async` 改造:目前 `run_turn` 是同步函数,TUI/REPL/JSON 路径均无 tokio runtime。改造为 async 后,`execute_spawn_parallel_subagents_async` 可直接接入,消除 `spawn_parallel_via_dag_with_fail_fast` 的临时 runtime 构造开销。
-- FailFast::Off 进一步增强:目前 `retry_failed` / `recover_skipped` 构造全新子 DAG,未保留原 scheduler 的 DagStore 桥接。未来可支持"在原 DagRun 上追加 retry 记录"。
-- `/detection-strategy` 增强:目前切换后立即生效,未来可加 `--dry-run` 预览或 `--verify` 校验 client 是否已注册。
+- ~~`run_turn_async` 改造~~:**已完成**(v3 Phase 4 后续,见 §13.5)。
+- ~~FailFast::Off 进一步增强~~:**已完成**(v3 Phase 4 后续,见 §13.5)。
+- ~~`/detection-strategy` 增强~~:**已完成**(v3 Phase 4 后续,见 §13.5)。
+
+### 13.5 v3 Phase 4 后续工作完成记录(2026-07-28)
+
+#### 已完成工作项
+
+| # | 工作项 | 关键文件 | 说明 |
+|:-:|------|---------|------|
+| 1 | **run_turn_async 改造** | `runtime/src/conversation.rs` + `tools/src/lib.rs` + `rusty-claude-cli/src/streaming.rs` + `claw-shell/src/agent.rs` | 让 async 变体真正生效,消除嵌套 runtime 开销 |
+| 2 | **FailFast::Off 增强** | `runtime/src/multi_agent/dag/types.rs` + `scheduler.rs` | 在原 DagRun 上追加 retry 记录 |
+| 3 | **/detection-strategy 增强** | `commands/src/lib.rs` + `rusty-claude-cli/src/app.rs` + `rusty-claude-cli/src/format.rs` + `runtime/src/decision_log.rs` | `--dry-run` 预览 + `--verify` 校验 client |
+
+#### 关键设计决策
+
+**run_turn_async 改造**
+
+- **`ApiClient: Send` supertrait**:所有 `ApiClient` 实现必须 `Send`。这让 `dyn ApiClient` 自动满足 `stream_async` 的 `Self: Send` 约束,统一支持 `ConversationRuntime<C>::run_turn_async`、`execute_subagent_llm(&mut dyn ApiClient)` 和 `spawn_parallel_via_dag_async`(JoinSet)三条调用路径。
+- **`stream_async` trait 方法**:返回 `Pin<Box<dyn Future + Send + 'a>>`,默认实现委托给同步 `stream`。Production 实现(`ProviderRuntimeClient` / `AnthropicRuntimeClient`)重写为原生 async 调用,消除 `runtime.block_on()` 嵌套 runtime 开销。
+- **`run_turn_async`**:async 主循环,直接 `.await` `stream_async`。所有 subagent 链路(`execute_dispatch_subagent_async` / `run_subagent_turn_with_model` / `execute_subagent_llm` / `execute_spawn_parallel_subagents_async`)均已转为 async。
+- **同步 `run_turn` 包装**:保留向后兼容,内部 `current_thread` runtime + `block_on`。新增嵌套 runtime 检测:若调用方已在 tokio context 中,返回 `Err` 提示改用 `run_turn_async`,避免 `block_on` panic。
+- **claw-shell 接入**:`agent.rs::prompt` 方法从 `runtime_rc.run_turn(...)` 改为 `runtime_rc.run_turn_async(...).await`,直接在 LocalSet 的 async 上下文执行。原 `block_in_place` 同步阻塞模式被替换,await 期间 LocalSet 上的其他 task(如 cancel 信号处理、channel forwarder)有机会调度。
+- **`AnthropicRuntimeClient::stream_async` Send 修复**:将 `&mut dyn Write` 改为 `&mut (dyn Write + Send)` 以满足 future 的 Send 约束。
+
+**FailFast::Off 增强(retry_history 追加)**
+
+- **新增 `NodeAttempt` 结构体**:含 `node_id` + `attempt`(0 保留给原始 run)+ `status` + `error` + `started_at` + `completed_at`,记录每次 retry 尝试。
+- **`DagRun::retry_history: Vec<NodeAttempt>`**:追加式历史记录,不覆盖原始 run 的 `node_statuses`。
+- **`DagRun::record_retry_attempt()`**:追加一条 attempt 记录。
+- **`DagRun::retry_count_for()` / `last_attempt_for()`**:查询辅助方法。
+- **`DagScheduler::append_retry_attempts()`**:私有方法,供 `retry_failed` / `recover_skipped` 共享。在子 DAG 执行完成后,根据 `result.successes` / `result.failures` 追加 `NodeAttempt` 到原始 DagRun。retry 成功的节点在 `node_statuses` 中也会从 `Failed` 提升为 `Succeeded`。
+- **attempt 序号计算**:基于 `retry_history` 中已有该节点的 retry 次数 + 1,保证多次 retry 的 attempt 序号连续递增。
+
+**/detection-strategy 增强**
+
+- **`SlashCommand::DetectionStrategy` 扩展**:新增 `dry_run: bool` + `verify: bool` 字段,可与策略参数组合。
+- **`parse_detection_strategy_args()`**:解析 `--dry-run` / `--verify` flags,支持任意顺序,可与策略参数组合(如 `/detection-strategy llm --dry-run --verify`)。
+- **`--dry-run` 预览**:不切换策略,仅打印预览报告(含目标策略 + client 注册状态 + 预期影响)。
+- **`--verify` 校验**:检查 LLM client 是否已注册(LlmExtract 策略前置检查)。未注册时返回提示,不切换策略。
+- **`is_decision_extractor_client_registered()`**:新增 public 方法供 app 层调用,避免暴露内部 `Arc<RwLock>`。
+- **`format_detection_strategy_dry_run_report()` / `format_detection_strategy_verify_report()`**:新增格式化函数,生成用户友好的报告。
+
+#### 测试验证
+
+- runtime crate:**1413 passed**, 0 failed, 2 ignored(新增 3 个 retry_history 测试)
+- claw-shell crate:**41 passed**, 0 failed
+- commands crate:**46 passed**, 0 failed(新增 5 个 dry_run/verify 解析测试)
+- rusty-claude-cli crate:**389 passed**, 0 failed(新增 dry_run/verify 格式化 + app 集成测试)
+- api crate:**183 passed**, 0 failed
+- **新增测试总计:8+ 个**
+
+#### 后续工作
+
+所有原 §13.4 后续工作项已完成。剩余非阻塞优化:
+- TUI event loop 集成 `run_turn_async`(目前 TUI 路径仍用同步 `run_turn`,需评估是否改造)
+- FailFast::Off 增强:retry 失败时的 `On` → `Off` 运行时切换(目前只能构造时设置)
+- `/detection-strategy` 增强:`--persist` 持久化到配置文件(目前仅运行时切换)
 
 ---
 

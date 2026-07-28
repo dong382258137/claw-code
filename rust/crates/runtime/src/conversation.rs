@@ -261,8 +261,39 @@ pub struct PromptCacheEvent {
 }
 
 /// Minimal streaming API contract required by [`ConversationRuntime`].
-pub trait ApiClient {
+///
+/// v3:`ApiClient: Send` supertrait — 所有实现必须 `Send`。这让 `dyn ApiClient`
+/// 自动满足 `stream_async` 的 `Self: Send` 约束,从而支持:
+/// - `ConversationRuntime<C>` 在 `run_turn_async` 中调用 `C::stream_async`
+/// - `execute_subagent_llm` 在 `&mut dyn ApiClient` 上调用 `stream_async`
+/// - `spawn_parallel_via_dag_async` 在 JoinSet 中跨线程 spawn 调用链
+pub trait ApiClient: Send {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+
+    /// v3:async 变体 — 供已在 tokio runtime 中的调用方使用,避免嵌套 runtime 开销。
+    ///
+    /// 默认实现委托给同步 [`stream`](Self::stream),仍会触发 production impl
+    /// 内部的 `block_on`。Production 实现(`ProviderRuntimeClient` /
+    /// `AnthropicRuntimeClient`)重写本方法以直接 `.await` 异步 provider 调用,
+    /// 消除 `runtime.block_on()` 创建嵌套 runtime 的开销。
+    ///
+    /// # 调用方
+    /// - [`ConversationRuntime::run_turn_async`]:在 async 上下文中调用本方法
+    /// - `spawn_parallel_via_dag_async`:并行 subagent 调度
+    /// - 任何持有 `&mut dyn ApiClient` 且已在 tokio runtime 中的代码路径
+    ///
+    /// # 返回
+    /// `Pin<Box<dyn Future + Send>>`,与 `async-trait` crate 的展开形式一致,
+    /// 但不引入额外依赖。由于 `ApiClient: Send`,所有实现已满足 `Self: Send`,
+    /// 故无需在方法上额外加 `where Self: Send` 约束。
+    fn stream_async<'a>(
+        &'a mut self,
+        request: ApiRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.stream(request) })
+    }
 
     /// Construct a fresh client bound to a specific model — used by the
     /// subagent retry loop with model upgrading (Multi-Agent Hardening §4.5).
@@ -1469,7 +1500,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn run_turn(
+    pub async fn run_turn_async(
         &mut self,
         user_input: impl Into<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
@@ -1712,7 +1743,7 @@ where
                 }
             };
             self.emit_diag("[diag] api_stream_start".to_string());
-            let events = match self.api_client.stream(request) {
+            let events = match self.api_client.stream_async(request).await {
                 Ok(events) => {
                     self.emit_diag("[diag] api_stream_done".to_string());
                     events
@@ -2031,7 +2062,8 @@ where
                             // Step 3.2-c:subagent-as-tool 路由。
                             // 主 agent 通过 tool call 派发子 agent,走独立 LLM 请求,
                             // 不污染主 agent 的 prompt cache(§5.2 缓存保护)。
-                            match self.execute_dispatch_subagent(&effective_input) {
+                            // v3:使用 async 变体避免 nested block_on panic。
+                            match self.execute_dispatch_subagent_async(&effective_input).await {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
@@ -2047,7 +2079,11 @@ where
                             // 与 dispatch_subagent(单个 + retry loop)互补:
                             // - 适用于独立的可并行任务(多文件分析、多模块测试)
                             // - 不带 retry,支持 fail_fast 配置
-                            match self.execute_spawn_parallel_subagents(&effective_input) {
+                            // v3:使用 async 变体避免 nested block_on panic。
+                            match self
+                                .execute_spawn_parallel_subagents_async(&effective_input)
+                                .await
+                            {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
@@ -2513,6 +2549,36 @@ where
         Ok(summary)
     }
 
+    /// 同步入口 — 为不在 tokio runtime 中的调用方提供向后兼容。
+    ///
+    /// 内部创建 `current_thread` runtime 并 `block_on`
+    /// [`run_turn_async`](Self::run_turn_async)。
+    ///
+    /// **若调用方已在 tokio runtime 中(如 claw-shell 的 LocalSet),请直接使用
+    /// [`run_turn_async`](Self::run_turn_async)**,以避免嵌套 runtime 开销和
+    /// `block_on` panic。
+    ///
+    /// # 嵌套 runtime 检测
+    /// 若检测到调用方已在 tokio runtime 上下文中,返回 `Err` 而非 panic,
+    /// 提示调用方改用 [`run_turn_async`](Self::run_turn_async)。
+    pub fn run_turn(
+        &mut self,
+        user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(RuntimeError::new(
+                "run_turn (sync) called from within a tokio runtime — \
+                 use run_turn_async instead to avoid nested runtime overhead",
+            ));
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| RuntimeError::new(format!("failed to create tokio runtime: {e}")))?;
+        rt.block_on(self.run_turn_async(user_input, prompter))
+    }
+
     /// Execute the `session_search` tool: query the FTS5 history index.
     ///
     /// Parses a JSON input of the form `{"query": "...", "top_k": 10}`,
@@ -2632,7 +2698,7 @@ where
     /// - `model`(可选):指定模型名(如 `deepseek-v4-flash`),省略则用主 agent client
     /// - `complexity`(可选,默认 `simple`):任务复杂度 simple/diagnostic/architectural
     /// - `cost_limit`(可选,USD):成本上限,达上限中止 retry
-    fn execute_dispatch_subagent(
+    async fn execute_dispatch_subagent_async(
         &mut self,
         input: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -2763,13 +2829,15 @@ where
 
             // 执行子智能体 LLM 请求(单轮,完全隔离)— mut self 借用,调用后释放
             // §4.6 诊断 SOP 注入:传入 complexity,Diagnostic 时追加 SOP 到 system_prompt
-            let subagent_result = self.run_subagent_turn_with_model(
-                &subagent_id,
-                name,
-                task,
-                current_model.as_deref(),
-                subagent_complexity,
-            );
+            let subagent_result = self
+                .run_subagent_turn_with_model(
+                    &subagent_id,
+                    name,
+                    task,
+                    current_model.as_deref(),
+                    subagent_complexity,
+                )
+                .await;
 
             // 重新获取 coordinator 引用(multi_agent_coordinator 不可变借用)
             let coordinator = self
@@ -2958,6 +3026,27 @@ where
         Ok(final_result_msg)
     }
 
+    /// 同步入口 — 为不在 tokio runtime 中的调用方(主要是单元测试)提供向后兼容。
+    ///
+    /// 内部创建 `current_thread` runtime 并 `block_on`
+    /// [`execute_dispatch_subagent_async`](Self::execute_dispatch_subagent_async)。
+    ///
+    /// **生产代码(已在 tokio runtime 中)应直接调用
+    /// [`execute_dispatch_subagent_async`](Self::execute_dispatch_subagent_async)**,
+    /// 以避免嵌套 runtime 开销和 `block_on` panic。
+    fn execute_dispatch_subagent(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to create tokio runtime: {e}").into()
+            })?;
+        rt.block_on(self.execute_dispatch_subagent_async(input))
+    }
+
     /// P0-2:执行子智能体的独立 LLM 请求(单轮,完全隔离)。
     ///
     /// 子智能体拥有:
@@ -2970,7 +3059,7 @@ where
     /// 新代码应直接调用 `run_subagent_turn_with_model`。
     /// 保留本方法以兼容现有文档引用和未来外部调用。
     #[allow(dead_code)]
-    fn run_subagent_turn(
+    async fn run_subagent_turn(
         &mut self,
         subagent_id: &str,
         name: &str,
@@ -2978,6 +3067,7 @@ where
         complexity: crate::multi_agent::TaskComplexity,
     ) -> Result<String, String> {
         self.run_subagent_turn_with_model(subagent_id, name, task, None, complexity)
+            .await
     }
 
     /// Multi-Agent Hardening §4.5.3:带模型选择的 subagent turn 执行。
@@ -2991,7 +3081,7 @@ where
     /// 若 `with_model` 返回 `Err`(默认实现或生产实现构造失败),
     /// 记录诊断日志并回退到主 agent client — 保证 retry loop 不因
     /// client 构造失败而中止,降级为"同模型重试"。
-    fn run_subagent_turn_with_model(
+    async fn run_subagent_turn_with_model(
         &mut self,
         subagent_id: &str,
         name: &str,
@@ -3013,7 +3103,8 @@ where
                     name,
                     task,
                     complexity,
-                );
+                )
+                .await;
             }
             Some(m) => m,
         };
@@ -3027,7 +3118,8 @@ where
                 name,
                 task,
                 complexity,
-            ),
+            )
+            .await,
             Err(e) => {
                 // 降级:client 构造失败时回退到主 agent client(同模型重试)
                 // 记录诊断日志,便于排查环境配置问题
@@ -3050,6 +3142,7 @@ where
                     task,
                     complexity,
                 )
+                .await
             }
         }
     }
@@ -3133,7 +3226,7 @@ where
     ///
     /// §4.6 诊断 SOP 注入:当 `complexity == Diagnostic` 时,向 system_prompt 追加
     /// 诊断任务执行规范,强制子智能体遵循"先诊断后修复"流程,避免堆砌防御代码。
-    fn execute_subagent_llm(
+    async fn execute_subagent_llm(
         workspace_root: &std::path::Path,
         client: &mut dyn ApiClient,
         subagent_id: &str,
@@ -3160,9 +3253,11 @@ where
             messages: vec![user_message],
         };
 
-        // 同步阻塞调用 LLM — client 由调用方决定(主 client 或 with_model 构造的独立 client)
+        // v3:async 调用 LLM — 通过 stream_async 避免 nested block_on panic。
+        // 调用方(`run_subagent_turn_with_model`)必须在 async 上下文中。
         let events = client
-            .stream(request)
+            .stream_async(request)
+            .await
             .map_err(|e| format!("subagent LLM request failed: {e}"))?;
 
         // 解析 assistant response

@@ -95,8 +95,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "detection-strategy",
         aliases: &[],
-        summary: "Show or switch the decision detection strategy (heuristic|llm[:model])",
-        argument_hint: Some("[heuristic|llm[:<model>]]"),
+        summary: "Show or switch the decision detection strategy (heuristic|llm[:model], --dry-run, --verify)",
+        argument_hint: Some("[heuristic|llm[:<model>]] [--dry-run] [--verify]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1120,6 +1120,10 @@ pub enum SlashCommand {
     },
     DetectionStrategy {
         strategy: Option<String>,
+        /// v3:--dry-run 预览切换结果而不实际应用
+        dry_run: bool,
+        /// v3:--verify 校验 LLM client 是否已注册(LlmExtract 策略前置检查)
+        verify: bool,
     },
     Permissions {
         mode: Option<String>,
@@ -1427,9 +1431,14 @@ pub fn validate_slash_command_input(
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
         },
-        "detection-strategy" => SlashCommand::DetectionStrategy {
-            strategy: optional_single_arg(command, &args, "[heuristic|llm[:<model>]]")?,
-        },
+        "detection-strategy" => {
+            let (strategy, dry_run, verify) = parse_detection_strategy_args(&args)?;
+            SlashCommand::DetectionStrategy {
+                strategy,
+                dry_run,
+                verify,
+            }
+        }
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
@@ -1664,6 +1673,52 @@ fn parse_clear_args(args: &[&str]) -> Result<bool, SlashCommandParseError> {
         )),
         _ => Err(usage_error("clear", "[--confirm]")),
     }
+}
+
+/// v3:解析 `/detection-strategy` 的参数,支持 `--dry-run` 与 `--verify` flags。
+///
+/// 支持形式:
+/// - `[]` → `(None, false, false)`(打印当前策略)
+/// - `[strategy]` → `(Some(strategy), false, false)`
+/// - `[strategy, --dry-run]` → `(Some(strategy), true, false)`
+/// - `[strategy, --verify]` → `(Some(strategy), false, true)`
+/// - `[--verify]` → `(None, false, true)`(只校验当前 client)
+/// - `[--dry-run, --verify]` → `(None, true, true)`(dry-run + verify 当前策略)
+///
+/// flags 可任意顺序;strategy 必须唯一。`--dry-run` 与 `--verify` 可同时出现。
+fn parse_detection_strategy_args(
+    args: &[&str],
+) -> Result<(Option<String>, bool, bool), SlashCommandParseError> {
+    let mut strategy: Option<String> = None;
+    let mut dry_run = false;
+    let mut verify = false;
+
+    for arg in args {
+        match *arg {
+            "--dry-run" => dry_run = true,
+            "--verify" => verify = true,
+            other => {
+                if other.starts_with("--") {
+                    return Err(command_error(
+                        &format!(
+                            "Unsupported /detection-strategy flag '{other}'. Use --dry-run or --verify."
+                        ),
+                        "detection-strategy",
+                        "/detection-strategy [heuristic|llm[:<model>]] [--dry-run] [--verify]",
+                    ));
+                }
+                if strategy.is_some() {
+                    return Err(usage_error(
+                        "detection-strategy",
+                        "[heuristic|llm[:<model>]] [--dry-run] [--verify]",
+                    ));
+                }
+                strategy = Some(other.to_string());
+            }
+        }
+    }
+
+    Ok((strategy, dry_run, verify))
 }
 
 fn parse_config_section(args: &[&str]) -> Result<Option<String>, SlashCommandParseError> {
@@ -4847,20 +4902,64 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::parse("/detection-strategy"),
-            Ok(Some(SlashCommand::DetectionStrategy { strategy: None }))
+            Ok(Some(SlashCommand::DetectionStrategy {
+                strategy: None,
+                dry_run: false,
+                verify: false
+            }))
         );
         assert_eq!(
             SlashCommand::parse("/detection-strategy heuristic"),
             Ok(Some(SlashCommand::DetectionStrategy {
-                strategy: Some("heuristic".to_string())
+                strategy: Some("heuristic".to_string()),
+                dry_run: false,
+                verify: false
             }))
         );
         assert_eq!(
             SlashCommand::parse("/detection-strategy llm:deepseek-v4-pro"),
             Ok(Some(SlashCommand::DetectionStrategy {
-                strategy: Some("llm:deepseek-v4-pro".to_string())
+                strategy: Some("llm:deepseek-v4-pro".to_string()),
+                dry_run: false,
+                verify: false
             }))
         );
+        assert_eq!(
+            SlashCommand::parse("/detection-strategy llm --dry-run"),
+            Ok(Some(SlashCommand::DetectionStrategy {
+                strategy: Some("llm".to_string()),
+                dry_run: true,
+                verify: false
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/detection-strategy llm --verify"),
+            Ok(Some(SlashCommand::DetectionStrategy {
+                strategy: Some("llm".to_string()),
+                dry_run: false,
+                verify: true
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/detection-strategy --verify"),
+            Ok(Some(SlashCommand::DetectionStrategy {
+                strategy: None,
+                dry_run: false,
+                verify: true
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/detection-strategy llm --dry-run --verify"),
+            Ok(Some(SlashCommand::DetectionStrategy {
+                strategy: Some("llm".to_string()),
+                dry_run: true,
+                verify: true
+            }))
+        );
+        // v3:不支持的双 strategy 应报错
+        assert!(SlashCommand::parse("/detection-strategy heuristic llm").is_err());
+        // v3:不支持的 flag 应报错
+        assert!(SlashCommand::parse("/detection-strategy --bogus").is_err());
         assert_eq!(
             SlashCommand::parse("/permissions read-only"),
             Ok(Some(SlashCommand::Permissions {

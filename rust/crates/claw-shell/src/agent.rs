@@ -3,8 +3,9 @@
 //! 架构参考:grok-build `xai-grok-shell/src/agent/mvp_agent/acp_agent.rs`。
 //!
 //! 关键差异:
-//! - 本地 `run_turn` 是同步阻塞 API,通过 `tokio::task::block_in_place` 包裹
-//! - 本地 `run_turn` 需要 `&mut self`,通过 `RefCell` 提供内部可变性
+//! - v3:本地 `run_turn_async` 是 async API,在 LocalSet 的 async 上下文中直接 `.await`
+//!   (原 `run_turn` 同步包装会在 tokio context 中返回 Err,不再适用)
+//! - 本地 `run_turn_async` 需要 `&mut self`,通过 `RefCell` 提供内部可变性
 //! - session 状态保存在 agent 内部,ACP `session_id` 与 `Session::id` 一一对应
 //! - 流式输出通过 `AcpGatewaySender<AgentSide>` 主动推送 `SessionNotification`
 //!
@@ -305,12 +306,12 @@ where
             signal.reset();
         }
 
-        // run_turn 是同步阻塞 API。
-        // current_thread + LocalSet 下直接同步调用:会阻塞 LocalSet 直到 turn 完成,
-        // 但不会死锁(没有其他 task 需要并发,且 channel 发送是非阻塞的)。
-        // 注意:不能用 block_in_place(它要求 multi-threaded runtime)。
-        // TODO: 未来将 run_turn 改为 async 后,改用 spawn_blocking 真正并行。
-        let turn_result = runtime_rc.run_turn(user_input, None);
+        // v3:run_turn_async — 直接在 LocalSet 的 async 上下文中 await,
+        // 避免嵌套 runtime 开销(原 run_turn 会因检测到 tokio context 返回 Err)。
+        // current_thread + LocalSet 下,await 期间可被 cancel() 触发的 HookAbortSignal
+        // 中断;由于 prompt 本身是 async fn,LocalSet 上的其他 task(如 channel forwarder)
+        // 在 await 点有机会调度执行。
+        let turn_result = runtime_rc.run_turn_async(user_input, None).await;
 
         let turn_summary = match turn_result {
             Ok(summary) => summary,
@@ -368,13 +369,14 @@ where
     }
 
     async fn cancel(&self, _arguments: acp::CancelNotification) -> Result<(), acp::Error> {
-        // 调用 HookAbortSignal::abort(),run_turn 主循环在下一次迭代
+        // 调用 HookAbortSignal::abort(),run_turn_async 主循环在下一次迭代
         // 顶部或工具调用边界检测到后返回 RuntimeError("turn interrupted by user"),
         // prompt 方法据此返回 StopReason::Cancelled。
         //
-        // 注意:正在进行的 LLM stream 调用(api_client.stream)是同步阻塞,
-        // 无法立即中断,需等流完成或失败后才进入下一检查点。
-        // 这与 TUI 路径(Ctrl+C)的行为一致。
+        // v3:由于 LLM stream 现使用 stream_async(原生 async),
+        // await 点会立即让出控制权,LocalSet 上的本 cancel 方法可在 stream 还在进行时
+        // 被调度执行,触发 abort signal 后下一次检查点会立刻中断。
+        // 这比原同步 stream 路径(必须等流完成)响应更及时。
         if let Some(signal) = self.turn_abort_signal.borrow().as_ref() {
             signal.abort();
             tracing::info!("claw-agent: cancel signal fired for current turn");

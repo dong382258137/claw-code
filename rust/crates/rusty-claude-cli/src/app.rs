@@ -1160,7 +1160,11 @@ impl LiveCli {
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
-            SlashCommand::DetectionStrategy { strategy } => self.set_detection_strategy(strategy)?,
+            SlashCommand::DetectionStrategy {
+                strategy,
+                dry_run,
+                verify,
+            } => self.set_detection_strategy(strategy, dry_run, verify)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -1632,23 +1636,52 @@ impl LiveCli {
     /// - `heuristic`:切换为启发式(零成本)
     /// - `llm`:切换为 LLM 提取(使用默认 flash 模型)
     /// - `llm:<model>`:切换为 LLM 提取并指定模型
+    /// - `--dry-run`:预览切换结果而不实际应用(可与 strategy 组合)
+    /// - `--verify`:校验 DecisionExtractorClient 注册状态
     ///
+    /// flag 组合行为见 `parse_detection_strategy_args` 文档。
     /// 采用方案 A(直接 setter),不重建 runtime,因 `detection_strategy` 是简单字段。
     /// 切换到 `LlmExtract` 但未注册 client 时,提取逻辑会自动 3 路降级为 Heuristic。
     fn set_detection_strategy(
         &mut self,
         strategy: Option<String>,
+        dry_run: bool,
+        verify: bool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(rt) = self.runtime.runtime.as_mut() else {
             return Err("runtime not initialized".into());
         };
 
-        let Some(strategy_arg) = strategy else {
-            // 无参数:打印当前策略
-            let current = rt.detection_strategy();
-            let report = format_detection_strategy_report(current);
+        let current = rt.detection_strategy().clone();
+        let client_registered = runtime::is_decision_extractor_client_registered();
+
+        // --verify 单独或组合使用:打印 client 注册校验报告
+        // 若同时指定了 strategy,verify 在 dry-run/实际切换前先报告
+        if verify && strategy.is_none() && !dry_run {
+            // 仅 --verify:只校验当前 client
+            let report = format_detection_strategy_verify_report(&current, client_registered);
             if !self.tui_println(&report) {
                 println!("{report}");
+            }
+            return Ok(false);
+        }
+
+        let Some(strategy_arg) = strategy else {
+            // 无 strategy 且无 verify:打印当前策略
+            if !verify {
+                let report = format_detection_strategy_report(&current);
+                if !self.tui_println(&report) {
+                    println!("{report}");
+                }
+                return Ok(false);
+            }
+            // --verify + --dry-run 但无 strategy:打印当前策略 + verify
+            let report = format_detection_strategy_report(&current);
+            let verify_report =
+                format_detection_strategy_verify_report(&current, client_registered);
+            let combined = format!("{report}\n\n{verify_report}");
+            if !self.tui_println(&combined) {
+                println!("{combined}");
             }
             return Ok(false);
         };
@@ -1659,8 +1692,29 @@ impl LiveCli {
             )
         })?;
 
-        let previous = rt.detection_strategy().clone();
-        if new_strategy == previous {
+        // --dry-run:仅预览,不应用
+        if dry_run {
+            let report = format_detection_strategy_dry_run_report(
+                &current,
+                &new_strategy,
+                client_registered,
+            );
+            // 若同时 --verify,追加 verify 报告
+            let final_report = if verify {
+                let verify_report =
+                    format_detection_strategy_verify_report(&new_strategy, client_registered);
+                format!("{report}\n\n{verify_report}")
+            } else {
+                report
+            };
+            if !self.tui_println(&final_report) {
+                println!("{final_report}");
+            }
+            return Ok(false);
+        }
+
+        // 实际切换
+        if new_strategy == current {
             let report = format_detection_strategy_report(&new_strategy);
             if !self.tui_println(&report) {
                 println!("{report}");
@@ -1669,7 +1723,7 @@ impl LiveCli {
         }
 
         rt.set_detection_strategy(new_strategy.clone());
-        let switch_report = format_detection_strategy_switch_report(&previous, &new_strategy);
+        let switch_report = format_detection_strategy_switch_report(&current, &new_strategy);
         if !self.tui_println(&switch_report) {
             println!("{switch_report}");
         }

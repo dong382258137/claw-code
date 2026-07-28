@@ -250,6 +250,11 @@ impl DagScheduler {
     /// **不会恢复 skipped 节点**:若 failed 节点有下游 skipped 节点,需单独调用
     /// [`recover_skipped`](Self::recover_skipped)。
     ///
+    /// **v3 DagRun 追加**:若本 scheduler 通过 [`with_dag_run`](Self::with_dag_run)
+    /// 桥接了 DagStore,则每次重试的节点结果会以 [`NodeAttempt`] 形式追加到原始
+    /// DagRun 的 `retry_history`,从而保留完整的 retry 轨迹。retry 成功的节点
+    /// 在 `node_statuses` 中也会从 `Failed` 提升为 `Succeeded`。
+    ///
     /// # 参数
     /// - `node_ids`:要重试的节点 ID 列表(必须存在于原 DAG 中)。
     ///
@@ -264,7 +269,23 @@ impl DagScheduler {
         let sub_scheduler = DagScheduler::new(sub_graph, Arc::clone(&self.executor))
             .with_max_parallelism(self.max_parallelism)
             .with_fail_fast(self.fail_fast);
-        sub_scheduler.run_inner(None).await
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let result = sub_scheduler.run_inner(None).await?;
+        let completed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // v3:若有 DagRun 桥接,把本次 retry 结果追加到原始 DagRun
+        if let (Some(store), Some(run_id)) = (&self.dag_store, &self.dag_run_id) {
+            self.append_retry_attempts(store, run_id, &result, started, completed)
+                .await;
+        }
+
+        Ok(result)
     }
 
     /// v3:恢复指定的 skipped 节点。
@@ -276,6 +297,9 @@ impl DagScheduler {
     ///
     /// **前置条件**:调用方应确保 `node_ids` 的所有 `depends_on` 已成功
     /// (通过之前的 `retry_failed` 或原 `run`)。否则节点会再次被跳过。
+    ///
+    /// **v3 DagRun 追加**:与 [`retry_failed`](Self::retry_failed) 相同,
+    /// 恢复结果会以 [`NodeAttempt`] 形式追加到原始 DagRun。
     ///
     /// # 参数
     /// - `node_ids`:要恢复的节点 ID 列表。
@@ -289,6 +313,76 @@ impl DagScheduler {
         // recover_skipped 与 retry_failed 共享子图构造 + 执行逻辑,
         // 语义区别仅在调用方约定(retry_failed 针对 failed,recover_skipped 针对 skipped)。
         self.retry_failed(node_ids).await
+    }
+
+    /// v3:把 retry/recover 的结果追加到原始 DagRun 的 `retry_history`。
+    ///
+    /// 内部辅助函数,供 [`retry_failed`](Self::retry_failed) 与
+    /// [`recover_skipped`](Self::recover_skipped) 共享。
+    ///
+    /// 对每个成功/失败的节点追加一条 [`NodeAttempt`];skipped 节点不追加
+    /// (它们在子图中本就不会执行,sub-scheduler 不会返回 skipped)。
+    async fn append_retry_attempts(
+        &self,
+        store: &Arc<DagStore>,
+        run_id: &str,
+        result: &DagRunResult,
+        started_at: u64,
+        completed_at: u64,
+    ) {
+        // 先查询当前每个节点的 retry 次数,以确定本次 attempt 序号
+        let existing_counts: HashMap<DagNodeId, u32> = if let Some(run) = store.get_run(run_id) {
+            result
+                .successes
+                .iter()
+                .map(|s| (s.node_id.clone(), run.retry_count_for(&s.node_id)))
+                .chain(
+                    result
+                        .failures
+                        .iter()
+                        .map(|(nid, _)| (nid.clone(), run.retry_count_for(nid))),
+                )
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // 追加成功的 retry
+        for success in &result.successes {
+            let attempt_num = existing_counts
+                .get(&success.node_id)
+                .copied()
+                .unwrap_or(0)
+                + 1;
+            let attempt = super::types::NodeAttempt {
+                node_id: success.node_id.clone(),
+                attempt: attempt_num,
+                status: super::types::DagNodeStatus::Succeeded,
+                error: None,
+                started_at,
+                completed_at,
+            };
+            // 忽略写入错误:retry 已成功,DagRun 同步失败不应影响 retry 结果
+            let _ = store.record_retry_attempt(run_id, attempt);
+        }
+
+        // 追加失败的 retry
+        for (node_id, error) in &result.failures {
+            let attempt_num = existing_counts
+                .get(node_id)
+                .copied()
+                .unwrap_or(0)
+                + 1;
+            let attempt = super::types::NodeAttempt {
+                node_id: node_id.clone(),
+                attempt: attempt_num,
+                status: super::types::DagNodeStatus::Failed,
+                error: Some(error.clone()),
+                started_at,
+                completed_at,
+            };
+            let _ = store.record_retry_attempt(run_id, attempt);
+        }
     }
 
     /// 构造仅含指定节点的子 DAG(保留原节点定义 + 依赖关系)。
@@ -1154,6 +1248,216 @@ mod tests {
             .expect("retry should succeed");
         assert_eq!(retry_result.success_count(), 1);
         assert_eq!(retry_result.failures.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_failed_appends_attempt_to_original_dag_run() {
+        // v3:retry_failed 在有 DagRun 桥接时,应把 retry 结果追加到原始 DagRun.retry_history
+        let dag = Dag {
+            id: "parallel".to_string(),
+            name: "Parallel".to_string(),
+            nodes: vec![
+                node("n1", &[]),
+                node("n2", &[]),
+                node("n3", &["n1", "n2"]),
+            ],
+        };
+        let graph = DagGraph::from_dag(&dag);
+        let store = Arc::new(DagStore::new());
+        store.create_dag(dag.clone()).unwrap();
+        let run = store.start_run(&dag.id).unwrap();
+        let run_id = run.id.clone();
+
+        // 原始 run:n1 失败 (FailFast::Off)
+        let fail_executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n1".to_string(),
+        });
+        let scheduler =
+            DagScheduler::new(graph, fail_executor)
+                .with_fail_fast(FailFast::Off)
+                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let result = scheduler
+            .run_with_details()
+            .await
+            .expect("FailFast::Off returns Ok");
+        assert_eq!(result.failure_count(), 1);
+        let failed_id = result.failures[0].0.clone();
+        assert_eq!(failed_id, "n1");
+
+        // 验证原始 DagRun 中 n1 为 Failed,且 retry_history 为空
+        let mid_run = store.get_run(&run_id).expect("run should exist");
+        assert_eq!(mid_run.node_status("n1"), Some(DagNodeStatus::Failed));
+        assert!(mid_run.retry_history.is_empty(), "no retries yet");
+
+        // retry_failed with SuccessExecutor (same scheduler instance to preserve dag_run bridge)
+        let retry_executor: Arc<dyn SubagentExecutor> = Arc::new(SuccessExecutor {
+            seen: Mutex::new(Vec::new()),
+        });
+        // 用新 scheduler 但桥接同一个 DagRun
+        let retry_graph = DagGraph::from_dag(&dag);
+        let retry_scheduler =
+            DagScheduler::new(retry_graph, retry_executor)
+                .with_fail_fast(FailFast::Off)
+                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let retry_result = retry_scheduler
+            .retry_failed(&[failed_id.clone()])
+            .await
+            .expect("retry should succeed");
+        assert_eq!(retry_result.success_count(), 1);
+
+        // 验证 retry_history 已追加一条 Succeeded 记录
+        let final_run = store.get_run(&run_id).expect("run should exist");
+        assert_eq!(
+            final_run.retry_history.len(),
+            1,
+            "retry_history should have 1 attempt"
+        );
+        let attempt = &final_run.retry_history[0];
+        assert_eq!(attempt.node_id, "n1");
+        assert_eq!(attempt.attempt, 1, "first retry → attempt 1");
+        assert_eq!(attempt.status, DagNodeStatus::Succeeded);
+        assert!(attempt.error.is_none());
+
+        // 验证 node_statuses 中 n1 从 Failed 提升为 Succeeded
+        assert_eq!(
+            final_run.node_status("n1"),
+            Some(DagNodeStatus::Succeeded),
+            "n1 should be upgraded to Succeeded after successful retry"
+        );
+
+        // 验证 retry_count_for 与 last_attempt_for 辅助方法
+        assert_eq!(final_run.retry_count_for("n1"), 1);
+        assert_eq!(final_run.retry_count_for("n2"), 0, "n2 never retried");
+        let last = final_run.last_attempt_for("n1").expect("should exist");
+        assert_eq!(last.status, DagNodeStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn retry_failed_multiple_attempts_increment_counter() {
+        // v3:多次 retry 同一节点,attempt 序号应递增
+        let dag = Dag {
+            id: "single".to_string(),
+            name: "Single".to_string(),
+            nodes: vec![node("n1", &[])],
+        };
+        let graph = DagGraph::from_dag(&dag);
+        let store = Arc::new(DagStore::new());
+        store.create_dag(dag.clone()).unwrap();
+        let run = store.start_run(&dag.id).unwrap();
+        let run_id = run.id.clone();
+
+        // 原始 run:n1 失败
+        let fail_executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n1".to_string(),
+        });
+        let scheduler =
+            DagScheduler::new(graph, fail_executor)
+                .with_fail_fast(FailFast::Off)
+                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let _ = scheduler.run_with_details().await.expect("FailFast::Off");
+
+        // 第一次 retry:仍然失败
+        let fail_again: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n1".to_string(),
+        });
+        let s1 = DagScheduler::new(DagGraph::from_dag(&dag), fail_again)
+            .with_fail_fast(FailFast::Off)
+            .with_dag_run(Arc::clone(&store), run_id.clone());
+        let r1 = s1.retry_failed(&["n1".to_string()]).await.expect("retry 1");
+        assert_eq!(r1.failure_count(), 1);
+
+        // 第二次 retry:成功
+        let success_exec: Arc<dyn SubagentExecutor> = Arc::new(SuccessExecutor {
+            seen: Mutex::new(Vec::new()),
+        });
+        let s2 = DagScheduler::new(DagGraph::from_dag(&dag), success_exec)
+            .with_fail_fast(FailFast::Off)
+            .with_dag_run(Arc::clone(&store), run_id.clone());
+        let r2 = s2.retry_failed(&["n1".to_string()]).await.expect("retry 2");
+        assert_eq!(r2.success_count(), 1);
+
+        // 验证 retry_history 有两条记录,attempt 序号分别为 1 和 2
+        let final_run = store.get_run(&run_id).expect("run should exist");
+        assert_eq!(final_run.retry_history.len(), 2);
+        assert_eq!(final_run.retry_history[0].attempt, 1);
+        assert_eq!(final_run.retry_history[0].status, DagNodeStatus::Failed);
+        assert!(final_run.retry_history[0].error.is_some());
+        assert_eq!(final_run.retry_history[1].attempt, 2);
+        assert_eq!(final_run.retry_history[1].status, DagNodeStatus::Succeeded);
+        assert!(final_run.retry_history[1].error.is_none());
+
+        // 最终 n1 应为 Succeeded(最后一次 retry 成功)
+        assert_eq!(
+            final_run.node_status("n1"),
+            Some(DagNodeStatus::Succeeded)
+        );
+        assert_eq!(final_run.retry_count_for("n1"), 2);
+    }
+
+    #[tokio::test]
+    async fn recover_skipped_appends_attempt_to_original_dag_run() {
+        // v3:recover_skipped 同样应追加到原 DagRun
+        // 使用 parallel 结构:n1 失败 → n3 skipped(因依赖 n1),n2 独立成功
+        let dag = Dag {
+            id: "parallel".to_string(),
+            name: "Parallel".to_string(),
+            nodes: vec![
+                node("n1", &[]),
+                node("n2", &[]),
+                node("n3", &["n1", "n2"]),
+            ],
+        };
+        let graph = DagGraph::from_dag(&dag);
+        let store = Arc::new(DagStore::new());
+        store.create_dag(dag.clone()).unwrap();
+        let run = store.start_run(&dag.id).unwrap();
+        let run_id = run.id.clone();
+
+        // 原始 run:n1 失败 → n3 skipped (FailFast::Off)
+        let fail_executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
+            fail_id: "n1".to_string(),
+        });
+        let scheduler =
+            DagScheduler::new(graph, fail_executor)
+                .with_fail_fast(FailFast::Off)
+                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let result = scheduler
+            .run_with_details()
+            .await
+            .expect("FailFast::Off returns Ok");
+        assert_eq!(result.skip_count(), 1);
+        assert_eq!(result.skipped[0], "n3");
+
+        // recover_skipped("n3") 应成功(假设 n1/n2 依赖已满足,只恢复 n3)
+        let success_exec: Arc<dyn SubagentExecutor> = Arc::new(SuccessExecutor {
+            seen: Mutex::new(Vec::new()),
+        });
+        let recover_scheduler =
+            DagScheduler::new(DagGraph::from_dag(&dag), success_exec)
+                .with_fail_fast(FailFast::Off)
+                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let recover_result = recover_scheduler
+            .recover_skipped(&["n3".to_string()])
+            .await
+            .expect("recover should succeed");
+        assert_eq!(recover_result.success_count(), 1);
+
+        // 验证 retry_history 追加了 n3 的 Succeeded 记录
+        let final_run = store.get_run(&run_id).expect("run should exist");
+        let n3_attempts: Vec<_> = final_run
+            .retry_history
+            .iter()
+            .filter(|a| a.node_id == "n3")
+            .collect();
+        assert_eq!(n3_attempts.len(), 1);
+        assert_eq!(n3_attempts[0].status, DagNodeStatus::Succeeded);
+        assert_eq!(n3_attempts[0].attempt, 1);
+
+        // n3 node_status 应为 Succeeded
+        assert_eq!(
+            final_run.node_status("n3"),
+            Some(DagNodeStatus::Succeeded)
+        );
     }
 
     #[tokio::test]

@@ -240,6 +240,37 @@ pub struct DagRun {
     pub started_at: Option<u64>,
     /// Unix epoch second when the run completed.
     pub completed_at: Option<u64>,
+    /// v3:retry 尝试历史(按时间顺序追加)。
+    ///
+    /// 每次 [`DagScheduler::retry_failed`](super::scheduler::DagScheduler::retry_failed)
+    /// 或 [`recover_skipped`](super::scheduler::DagScheduler::recover_skipped)
+    /// 调用都会把本次重试的每个节点结果追加到此列表,从而保留完整的尝试轨迹。
+    /// 原始 `run` 的首次尝试不写入此字段(其结果直接反映在 `node_statuses` 中),
+    /// 仅显式 retry/recover 调用才追加,以便区分"原始执行"与"重试执行"。
+    #[serde(default)]
+    pub retry_history: Vec<NodeAttempt>,
+}
+
+/// v3:单次 retry/recover 尝试的节点结果记录。
+///
+/// 由 [`DagScheduler::retry_failed`](super::scheduler::DagScheduler::retry_failed)
+/// 与 [`recover_skipped`](super::scheduler::DagScheduler::recover_skipped) 在
+/// 每次重试完成后追加到 [`DagRun::retry_history`]。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeAttempt {
+    /// 被重试的节点 ID。
+    pub node_id: DagNodeId,
+    /// 重试序号:1 = 第一次 retry,2 = 第二次 retry,以此类推。
+    /// 0 保留给原始 run(不写入 `retry_history`)。
+    pub attempt: u32,
+    /// 本次尝试的结果状态(通常为 `Succeeded` 或 `Failed`)。
+    pub status: DagNodeStatus,
+    /// 失败时的错误信息;成功时为 `None`。
+    pub error: Option<String>,
+    /// 本次尝试开始的 Unix epoch second。
+    pub started_at: u64,
+    /// 本次尝试完成的 Unix epoch second。
+    pub completed_at: u64,
 }
 
 impl Dag {
@@ -308,6 +339,7 @@ impl DagRun {
             node_statuses,
             started_at: None,
             completed_at: None,
+            retry_history: Vec::new(),
         }
     }
 
@@ -325,6 +357,40 @@ impl DagRun {
         if let Some((_, existing)) = self.node_statuses.iter_mut().find(|(id, _)| id == node_id) {
             *existing = status;
         }
+    }
+
+    /// v3:追加一条 retry 尝试记录到 `retry_history`。
+    ///
+    /// 同时根据本次尝试结果更新 `node_statuses`:
+    /// - `Succeeded` → 节点状态更新为 `Succeeded`
+    /// - `Failed` → 节点状态保持 `Failed`(不降级)
+    /// - 其他状态 → 仅追加 history,不修改 `node_statuses`
+    pub fn record_retry_attempt(&mut self, attempt: NodeAttempt) {
+        // 同步 node_statuses:retry 成功时把节点从 Failed 提升为 Succeeded
+        if attempt.status == DagNodeStatus::Succeeded {
+            self.set_node_status(&attempt.node_id, DagNodeStatus::Succeeded);
+        }
+        self.retry_history.push(attempt);
+    }
+
+    /// v3:查询指定节点的 retry 次数(基于 `retry_history`)。
+    ///
+    /// 返回 0 表示该节点从未被显式 retry(仅有原始 run 的首次尝试)。
+    #[must_use]
+    pub fn retry_count_for(&self, node_id: &str) -> u32 {
+        self.retry_history
+            .iter()
+            .filter(|a| a.node_id == node_id)
+            .count() as u32
+    }
+
+    /// v3:查询指定节点的最后一次 retry 尝试。
+    #[must_use]
+    pub fn last_attempt_for(&self, node_id: &str) -> Option<&NodeAttempt> {
+        self.retry_history
+            .iter()
+            .rev()
+            .find(|a| a.node_id == node_id)
     }
 
     /// Check if all nodes are in a terminal state.

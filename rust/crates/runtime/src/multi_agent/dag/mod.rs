@@ -30,7 +30,7 @@ pub use coordinator_executor::{CoordinatorExecutor, SubagentRunner};
 pub use executor_trait::{NodeError, SubagentExecutor};
 pub use scheduler::{DagScheduler, ProgressEvent};
 pub use subagent_dispatcher::SubagentDispatcher;
-pub use types::{DagError, DagGraph, DagId, DagNode, DagRunResult, DagStatus, FailFast, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
+pub use types::{DagError, DagGraph, DagId, DagNode, DagRunResult, DagStatus, FailFast, NodeAttempt, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -168,6 +168,33 @@ impl DagStore {
         ) {
             run.completed_at = Some(types::now_secs());
         }
+        Ok(())
+    }
+
+    /// v3:向指定 DagRun 追加一条 retry 尝试记录。
+    ///
+    /// 由 [`DagScheduler::retry_failed`](super::scheduler::DagScheduler::retry_failed)
+    /// 与 [`recover_skipped`](super::scheduler::DagScheduler::recover_skipped)
+    /// 在每次重试完成后调用,把尝试结果写回原始 DagRun,从而保留完整的
+    /// retry 历史轨迹。
+    ///
+    /// # Errors
+    /// - `run not found: {run_id}` — 目标 DagRun 不存在。
+    ///
+    /// # Side effects
+    /// - 若 `attempt.status == Succeeded`,对应节点的 `node_statuses` 会被
+    ///   提升为 `Succeeded`(覆盖原始 `Failed` 状态)。
+    /// - `retry_history` 追加新条目。
+    pub fn record_retry_attempt(
+        &self,
+        run_id: &str,
+        attempt: types::NodeAttempt,
+    ) -> Result<(), String> {
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        let run = runs
+            .get_mut(run_id)
+            .ok_or_else(|| format!("run not found: {run_id}"))?;
+        run.record_retry_attempt(attempt);
         Ok(())
     }
 }
