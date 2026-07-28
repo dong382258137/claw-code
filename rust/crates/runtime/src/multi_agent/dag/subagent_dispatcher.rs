@@ -98,19 +98,32 @@ impl SubagentDispatcher {
             messages: vec![user_message],
         };
 
-        // 同步 stream 调用放在 spawn_blocking 中,避免阻塞 async runtime。
-        // ApiClient::stream 是 &mut self 同步方法,需要先 lock 再调。
+        // ⚠ 不能用 `tokio::task::spawn_blocking`:它仍然在当前 tokio runtime
+        // context 中执行闭包,而 `client.stream()` 内部会调用
+        // `self.runtime.block_on(...)`(AnthropicRuntimeClient 自带的 runtime),
+        // 触发 "Cannot start a runtime from within a runtime" panic。
+        //
+        // 正确做法:用 `std::thread::spawn` 创建独立 OS 线程,完全不继承 tokio
+        // runtime context,让 `client.stream()` 内部的 `block_on` 安全执行。
+        // 通过 `tokio::sync::oneshot` 把结果传回 async 调用方。
+        // 这与 `tools/src/lib.rs` 中 DAG 执行器的隔离模式一致。
         let api_client = api_client.clone();
-        let events = tokio::task::spawn_blocking(move || {
-            let mut client = api_client
-                .lock()
-                .map_err(|e| format!("api_client lock poisoned: {e}"))?;
-            client
-                .stream(request)
-                .map_err(|e| format!("subagent LLM request failed: {e}"))
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking join failed: {e}"))??;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mut client = api_client
+                    .lock()
+                    .map_err(|e| format!("api_client lock poisoned: {e}"))?;
+                client
+                    .stream(request)
+                    .map_err(|e| format!("subagent LLM request failed: {e}"))
+            })();
+            // tx 收到 Err 仅表示调用方提前 drop(如取消),无需处理
+            let _ = tx.send(result);
+        });
+        let events = rx
+            .await
+            .map_err(|e| format!("subagent dispatch channel closed: {e}"))??;
 
         // 解析 assistant response(与 run_subagent_turn 一致)
         let (assistant_message, _usage, _cache_events) =
