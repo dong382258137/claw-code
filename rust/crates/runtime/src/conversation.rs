@@ -3034,10 +3034,27 @@ where
     /// **生产代码(已在 tokio runtime 中)应直接调用
     /// [`execute_dispatch_subagent_async`](Self::execute_dispatch_subagent_async)**,
     /// 以避免嵌套 runtime 开销和 `block_on` panic。
+    ///
+    /// # 嵌套 runtime 检测
+    /// 若检测到调用方已在 tokio runtime 上下文中(如 `run_turn_async` 调用栈),
+    /// 返回 `Err` 而非 panic,提示调用方改用
+    /// [`execute_dispatch_subagent_async`](Self::execute_dispatch_subagent_async)。
+    /// 与 [`run_turn`](Self::run_turn) 的检测保持一致。
     fn execute_dispatch_subagent(
         &mut self,
         input: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // v3 修复(c051bac0 后):run_turn 已改为 run_turn_async,主 turn loop
+        // 在 LocalSet async 上下文中执行。若本同步包装器被 async 路径误调用,
+        // 直接 block_on 会触发 "Cannot start a runtime from within a runtime" panic。
+        // 与 run_turn 一致,返回 Err 而非 panic。
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(
+                "execute_dispatch_subagent (sync) called from within a tokio runtime — \
+                 use execute_dispatch_subagent_async instead to avoid nested runtime panic"
+                    .into(),
+            );
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

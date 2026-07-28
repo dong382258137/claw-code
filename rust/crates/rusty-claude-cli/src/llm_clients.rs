@@ -15,12 +15,19 @@
 //!
 //! # 调用栈安全性
 //!
-//! `LlmJudgeGate::validate` 在 `execute_dispatch_subagent` retry loop 内触发,
-//! `extract_decisions_before_compaction` 在 `compact_session` 之前触发。两者都在
-//! `ConversationRuntime::run_turn`(同步函数,非 async)的调用栈内,当前线程**不在**
-//! tokio runtime 上下文,因此直接 `runtime.block_on(async { ... })` 不会触发
-//! "Cannot start a runtime from within a runtime" panic。这与 `AnthropicRuntimeClient::stream`
-//! 的生产模式一致。
+//! `LlmJudgeGate::validate` 在 `execute_dispatch_subagent_async` retry loop 内触发,
+//! `extract_decisions_before_compaction` 在 `compact_session` 之前触发。c051bac0 后
+//! 两者都在 `ConversationRuntime::run_turn_async` 的 async 调用栈内,当前线程**已在**
+//! tokio runtime 上下文(LocalSet 驱动)。
+//!
+//! 因此 `LlmBridge::call` 不能直接 `runtime.block_on(...)`,否则触发
+//! "Cannot start a runtime from within a runtime" panic。`call` 内部通过
+//! `Handle::try_current()` 检测:若已在 runtime 中,在独立 OS 线程上执行
+//! `Handle::block_on`(该线程不在任何 tokio runtime 上下文,可安全驱动 future);
+//! 否则(如同步单元测试)直接 `self.runtime.block_on(...)`。
+//!
+//! `block_in_place` 不可用:claw-shell 使用 `current_thread` + `LocalSet`,
+//! `block_in_place` 在 `current_thread` runtime 上会 panic。
 //!
 //! # 错误降级
 //!
@@ -89,10 +96,29 @@ impl LlmBridge {
             stream: false,
             ..Default::default()
         };
-        let response = self
-            .runtime
-            .block_on(async { self.client.send_message(&request).await })
-            .map_err(|e| format!("LLM send_message failed: {e}"))?;
+
+        // v3 修复(c051bac0 后):调用方可能在 tokio runtime 上下文中
+        // (run_turn_async 调用栈内,如 JudgeGate::validate 或
+        // extract_decisions_before_compaction)。直接 self.runtime.block_on
+        // 会触发 "Cannot start a runtime from within a runtime" panic。
+        // 检测到当前线程已在 runtime 中时,在独立 OS 线程上执行 block_on,
+        // 该线程不在任何 tokio runtime 上下文,可安全驱动 future。
+        // block_in_place 不可用:claw-shell 使用 current_thread + LocalSet,
+        // block_in_place 在 current_thread runtime 上会 panic。
+        let response = if tokio::runtime::Handle::try_current().is_ok() {
+            let handle = self.runtime.handle().clone();
+            let client = self.client.clone();
+            std::thread::spawn(move || {
+                handle.block_on(async move { client.send_message(&request).await })
+            })
+            .join()
+            .map_err(|e| format!("LLM bridge worker thread panicked: {e:?}"))?
+        } else {
+            // 调用方不在 tokio runtime 上下文(如同步单元测试),直接 block_on 安全。
+            self.runtime
+                .block_on(async { self.client.send_message(&request).await })
+        }
+        .map_err(|e| format!("LLM send_message failed: {e}"))?;
 
         // 提取所有 Text 块拼接(过滤 ToolUse / Thinking / RedactedThinking)
         let text: String = response
