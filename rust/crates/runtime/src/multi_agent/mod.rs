@@ -23,8 +23,8 @@ pub use validation::{
     ValidationContext, ValidationError, ValidationGate,
 };
 pub use dag::{
-    CoordinatorExecutor, DagError, DagGraph, DagId, DagNode, DagScheduler, NodeError, NodeResult,
-    ProgressEvent, RetryPolicy, SubagentDispatcher, SubagentExecutor, SubagentRunner,
+    CoordinatorExecutor, DagError, DagGraph, DagId, DagNode, DagScheduler, FailFast, NodeError,
+    NodeResult, ProgressEvent, RetryPolicy, SubagentDispatcher, SubagentExecutor, SubagentRunner,
     DEFAULT_MAX_PARALLELISM,
 };
 pub use dag::DagStore;

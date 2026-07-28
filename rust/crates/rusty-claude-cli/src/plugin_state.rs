@@ -722,6 +722,71 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["orchestration".to_string(), "subagent".to_string()],
     });
+    // v3:注册 spawn_parallel_subagents 工具 — 批量并行派发(走 DagScheduler 真并行)。
+    // 与 dispatch_subagent(单个 + retry loop)互补:适用于独立的可并行任务。
+    // 执行由 ConversationRuntime::run_turn 拦截,路由到 execute_spawn_parallel_subagents,
+    // 内部调用 spawn_parallel_via_dag_with_fail_fast(tasks, fail_fast)。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "spawn_parallel_subagents".to_string(),
+        description: Some(
+            "Dispatch multiple sub-agents in parallel using a DAG scheduler. \
+             All tasks run concurrently in independent tokio tasks (true parallelism, \
+             not sequential). Each sub-agent has its own LLM request and prompt cache. \
+             Use this for independent parallelizable work (e.g. analyzing multiple \
+             files, running multiple test suites). For dependent tasks, use dag_run \
+             instead. Returns one result per task."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "List of sub-agent tasks to dispatch in parallel.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Human-readable name for the sub-agent (e.g. 'analyze-auth', 'test-runner')."
+                            },
+                            "task": {
+                                "type": "string",
+                                "description": "The task description / prompt to send to the sub-agent."
+                            },
+                            "model": {
+                                "type": "string",
+                                "description": "Model name for the sub-agent (e.g. 'deepseek-v4-flash', 'deepseek-v4-pro'). Required — capability check uses this to gate Budget vs Flagship tasks."
+                            },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["fork", "teammate", "worktree"],
+                                "description": "Coordination mode: 'fork' (shared workdir, parallel), 'teammate' (shared TaskRegistry), 'worktree' (isolated git worktree).",
+                                "default": "fork"
+                            },
+                            "complexity": {
+                                "type": "string",
+                                "enum": ["simple", "diagnostic", "architectural"],
+                                "description": "Task complexity. Budget-tier models (haiku/mini/nano/flash) cannot handle 'diagnostic' or 'architectural'.",
+                                "default": "simple"
+                            }
+                        },
+                        "required": ["name", "task", "model"]
+                    },
+                    "minItems": 1
+                },
+                "fail_fast": {
+                    "type": "string",
+                    "enum": ["on", "off"],
+                    "description": "Failure propagation: 'on' (default) cancels all siblings on any failure; 'off' tolerates failures and returns partial results.",
+                    "default": "on"
+                }
+            },
+            "required": ["tasks"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["orchestration".to_string(), "subagent".to_string(), "parallel".to_string()],
+    });
     // Phase 4-A:DecisionLog — register log_decision and search_past_decisions tools.
     // Logs repair decisions (problem signature, root cause hypothesis, applied solution,
     // verification result) into a SQLite + FTS5-backed decision log. The runtime intercepts

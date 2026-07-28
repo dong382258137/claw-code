@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::executor_trait::{NodeError, SubagentExecutor};
 use super::types::{
-    DagError, DagGraph, DagNodeId, DagNodeStatus, DagStatus, NodeResult, RetryPolicy,
+    DagError, DagGraph, DagNodeId, DagNodeStatus, DagStatus, FailFast, NodeResult, RetryPolicy,
 };
 use super::DagStore;
 
@@ -113,6 +113,8 @@ pub struct DagScheduler {
     dag_store: Option<Arc<DagStore>>,
     /// ID of the DagRun to update when `dag_store` is `Some`.
     dag_run_id: Option<String>,
+    /// v3:失败传播策略。默认 `FailFast::On`(向后兼容)。
+    fail_fast: FailFast,
 }
 
 impl DagScheduler {
@@ -128,6 +130,7 @@ impl DagScheduler {
             max_parallelism,
             dag_store: None,
             dag_run_id: None,
+            fail_fast: FailFast::On,
         }
     }
 
@@ -135,6 +138,16 @@ impl DagScheduler {
     #[must_use]
     pub fn with_max_parallelism(mut self, limit: usize) -> Self {
         self.max_parallelism = limit.max(1);
+        self
+    }
+
+    /// v3:设置失败传播策略。
+    ///
+    /// - `FailFast::On`(默认):任一节点失败后立即取消整个 DAG。
+    /// - `FailFast::Off`:节点失败后标记为 Failed,跳过其下游,继续执行独立分支。
+    #[must_use]
+    pub fn with_fail_fast(mut self, mode: FailFast) -> Self {
+        self.fail_fast = mode;
         self
     }
 
@@ -215,6 +228,11 @@ impl DagScheduler {
         self.dag.validate_acyclic()?;
 
         let mut completed: HashSet<DagNodeId> = HashSet::new();
+        // v3 FailFast::Off:追踪永久失败的节点 + 因依赖失败而被跳过的节点。
+        // 这两个集合合并到 `completed` 中以避免 `ready_nodes` 反复列出它们,
+        // 但通过 `failed`/`skipped` 单独追踪以供结果报告。
+        let mut failed: HashSet<DagNodeId> = HashSet::new();
+        let mut skipped: HashSet<DagNodeId> = HashSet::new();
         let mut results: Vec<NodeResult> = Vec::with_capacity(self.dag.node_count());
         // Each spawned task returns (node_id, result) so we can precisely
         // identify which node failed (v0.2 TODO 4) without guessing from
@@ -237,12 +255,42 @@ impl DagScheduler {
             }
 
             // Spawn ready nodes up to the parallelism cap.
+            // v3 FailFast::Off:过滤掉依赖已失败的节点(标记为 Skipped)。
+            let mut newly_skipped: Vec<DagNodeId> = Vec::new();
             let ready: Vec<DagNodeId> = self
                 .dag
                 .ready_nodes(&completed)
                 .into_iter()
                 .filter(|id| !inflight.contains(id))
+                .filter(|id| {
+                    // FailFast::Off:若任一依赖已失败/跳过,则此节点也跳过
+                    if self.fail_fast == FailFast::Off {
+                        if let Some(node) = self.dag.get_node(id) {
+                            if node.depends_on.iter().any(|dep| failed.contains(dep) || skipped.contains(dep)) {
+                                newly_skipped.push(id.clone());
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
                 .collect();
+
+            // v3 FailFast::Off:将因依赖失败而跳过的节点标记为 Skipped。
+            for sid in &newly_skipped {
+                skipped.insert(sid.clone());
+                completed.insert(sid.clone()); // 防止 ready_nodes 反复列出
+                self.bridge_node_status(sid, DagNodeStatus::Skipped);
+                self.emit_progress(
+                    &mut on_progress,
+                    ProgressEvent::NodeFailed {
+                        node_id: sid.clone(),
+                        error: "skipped due to upstream dependency failure".to_string(),
+                        attempt: 0,
+                        will_retry: false,
+                    },
+                );
+            }
             let available_slots = self.max_parallelism.saturating_sub(inflight.len());
             for node_id in ready.iter().take(available_slots) {
                 let Some(node) = self.dag.get_node(node_id) else {
@@ -395,10 +443,20 @@ impl DagScheduler {
                         continue;
                     }
 
-                    // Retries exhausted → FailFast.
+                    // Retries exhausted.
+                    self.bridge_node_status(&node_id, DagNodeStatus::Failed);
+
+                    if self.fail_fast == FailFast::Off {
+                        // v3 FailFast::Off:标记节点失败,跳过其下游,继续执行独立分支。
+                        failed.insert(node_id.clone());
+                        completed.insert(node_id.clone()); // 防止 ready_nodes 反复列出
+                        // 不取消 DAG,不 abort 在途任务,继续循环
+                        continue;
+                    }
+
+                    // FailFast::On(默认):立即取消整个 DAG。
                     self.cancel_token.cancel();
                     joinset.abort_all();
-                    self.bridge_node_status(&node_id, DagNodeStatus::Failed);
                     self.emit_progress(
                         &mut on_progress,
                         ProgressEvent::DagFailed {

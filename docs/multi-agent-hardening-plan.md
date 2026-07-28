@@ -1,4 +1,4 @@
-﻿# CLAW 多 Agent 编排硬化方案
+# CLAW 多 Agent 编排硬化方案
 
 > **状态**：设计草案(v3 — 含现状核实 / 状态机 / spike / 泛化抽象 / MVP 范围 / 成本门禁 / LlmJudgeGate / checkpoint)
 > **日期**：2026-07-22
@@ -2349,7 +2349,62 @@ MVP 验收通过后,按以下顺序扩展(每步独立可回滚):
 
 ---
 
-## 11. 总结
+## 12. v3 Phase 3 实施完成记录(2026-07-28)
+
+### 12.1 已完成工作项
+
+| # | 工作项 | 文件 | 测试 |
+|:-:|------|------|------|
+| 1 | **多 provider 升级链**(Anthropic/OpenAI/xAI) | `runtime/src/multi_agent/upgrade.rs` + `api/src/upgrade.rs` | runtime 14 + api 9 |
+| 2 | **spawn_parallel_via_dag 真并行** | `runtime/src/conversation.rs` | 4 集成测试 |
+| 3 | **DAG 部分失败容错(FailFast::Off)** | `runtime/src/multi_agent/dag/types.rs` + `scheduler.rs` | 含在 spawn_parallel 测试 |
+| 4 | **异步接口变体(避免 block_on)** | `runtime/src/conversation.rs` | 4 async + 1 sync 测试 |
+| 5 | **CLI tool 接入(spawn_parallel_subagents)** | `runtime/src/conversation.rs` + `rusty-claude-cli/src/plugin_state.rs` | 7 测试 |
+| 6 | **DetectionStrategy::LlmExtract 端到端** | `runtime/src/conversation.rs` + `rusty-claude-cli/src/app.rs` | 2 测试 |
+
+### 12.2 关键设计决策
+
+#### FailFast 枚举(`types.rs`)
+- `FailFast::On`(默认):任一 node 失败(耗尽 retry)后立即取消整个 DAG,返回 `Err(DagError::NodeFailed)`。向后兼容。
+- `FailFast::Off`:标记失败节点,跳过其下游依赖,继续执行独立分支。DAG 正常结束(返回 `Ok`),结果仅含成功节点。
+- 依赖失败传播:FailFast::Off 时,若 node 的任一 `depends_on` 在 `failed` 或 `skipped` 集合中,该 node 标记为 `Skipped` 并加入 `completed`(防止 `ready_nodes` 反复列出)。
+
+#### spawn_parallel_via_dag 三变体(`conversation.rs`)
+1. `spawn_parallel_via_dag(tasks)` — 同步,默认 FailFast::On(向后兼容)
+2. `spawn_parallel_via_dag_with_fail_fast(tasks, fail_fast)` — 同步,可配置 FailFast
+3. `spawn_parallel_via_dag_async(tasks, fail_fast)` — 异步,供 async 调用方使用(避免 block_on)
+
+共享逻辑提取到三个私有辅助:`prepare_dag_for_spawn_parallel`、`build_spawn_parallel_graph`、`map_dag_run_result`。
+
+#### spawn_parallel_subagents 工具
+- 注册为 `RuntimeToolDefinition`(与 `dispatch_subagent` 同级)
+- 执行由 `ConversationRuntime::run_turn` 拦截,路由到 `execute_spawn_parallel_subagents`
+- JSON 输入:`tasks` 数组(每项含 name/task/model 必填,mode/complexity 可选)+ `fail_fast`(可选,默认 on)
+- 输出:可读多行字符串,标明每个任务的成功/失败
+
+#### DetectionStrategy 端到端接入
+- `ConversationRuntime` 新增 `detection_strategy: DetectionStrategy` 字段(默认 `Heuristic`)
+- 新增 `with_detection_strategy(strategy)` builder + `detection_strategy()` getter
+- `maybe_auto_compact` 从 `self.detection_strategy.clone()` 读取策略(替代硬编码 `Heuristic`)
+- `app.rs::build_runtime` 在 `DecisionExtractorClient` 注册成功后调用 `with_detection_strategy(LlmExtract { model })`
+- 3 路降级保证:client 未注册 / LLM 调用失败 / JSON 解析失败 → 自动回退 Heuristic
+
+### 12.3 测试验证
+
+- runtime crate:**1398 passed**, 0 failed, 2 ignored
+- rusty-claude-cli crate:**373 passed**, 0 failed
+- api crate:**183 passed**, 0 failed
+- 新增测试:**20 个**(spawn_parallel 系列 9 + execute_spawn_parallel_subagents 7 + detection_strategy 2 + dag FailFast 2)
+
+### 12.4 后续工作
+
+- spawn_parallel_via_dag_async 生产集成:目前 async 变体已就绪,但 `execute_spawn_parallel_subagents` 仍走同步路径(因 `run_turn` 是同步上下文)。未来若 TUI event loop 改为 async,可切换到 async 变体。
+- DAG partial failure tolerance 进一步增强:目前 FailFast::Off 仅跳过直接下游,未实现"重试 failed 节点"或"手动恢复 skipped 节点"。
+- DetectionStrategy 运行时切换:目前策略在启动时固定,未来可加 `/detection-strategy` slash command 支持运行时切换。
+
+---
+
+## 13. 总结
 
 本方案从平台层根治"能力不足模型浪费轮次"问题，**五重防护**(v3 从四重升级):
 

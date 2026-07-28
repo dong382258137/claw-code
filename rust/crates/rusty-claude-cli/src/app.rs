@@ -2947,6 +2947,19 @@ pub(crate) fn build_runtime_with_plugin_state(
                 dyn runtime::decision_log::DecisionExtractorClient,
             > = std::sync::Arc::new(extractor);
             runtime::decision_log::set_global_decision_extractor_client(extractor_client);
+            // v3 §4.7 端到端接入:client 注册成功后,把 runtime 的检测策略
+            // 从默认的 Heuristic 升级为 LlmExtract。这样 maybe_auto_compact
+            // 触发时会调用 LLM 提取结构化决策点(context/decision/rationale/
+            // alternatives),而非仅做关键词匹配。
+            //
+            // 失败时(client 未注册 / LLM 调用失败 / JSON 解析失败)自动 3 路降级
+            // 为 Heuristic,保证不阻塞 compaction(详见
+            // decision_log::extract_decisions_with_llm)。
+            runtime = runtime.with_detection_strategy(
+                runtime::decision_log::DetectionStrategy::LlmExtract {
+                    model: model_for_subagent.clone(),
+                },
+            );
         }
         Err(e) => {
             eprintln!(

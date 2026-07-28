@@ -98,6 +98,23 @@ const fn default_retry_max_delay_ms() -> u64 {
     30_000
 }
 
+/// DAG 失败传播策略(v3)。
+///
+/// 控制 [`super::scheduler::DagScheduler`] 在某节点耗尽 retry 后的行为:
+/// - `On`(默认):立即取消所有在途节点,返回 `Err(DagError::NodeFailed)`。
+///   适用于"任一失败即整体失败"的严格语义。
+/// - `Off`:标记失败节点,跳过其下游依赖,继续执行其他独立分支。
+///   适用于"收集部分结果"的容错语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FailFast {
+    /// FailFast 开启:任一节点失败(耗尽 retry)后立即取消整个 DAG。
+    #[default]
+    On,
+    /// FailFast 关闭:节点失败后标记为 Failed,跳过其下游,继续执行独立分支。
+    /// DAG 正常结束(返回 `Ok`),结果 `Vec<NodeResult>` 仅含成功节点。
+    Off,
+}
+
 /// Result of executing a single DAG node (v0.2).
 ///
 /// Produced by [`SubagentExecutor`](super::executor_trait::SubagentExecutor::execute)

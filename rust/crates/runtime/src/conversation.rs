@@ -44,7 +44,7 @@ use crate::multi_agent::{
 // v3:新增 DagGraph / DagScheduler / DagNode / DagError / NodeResult / RetryPolicy,
 // 用于 spawn_parallel_via_dag 真并行 spawn。
 use crate::multi_agent::dag::{
-    DagError, DagGraph, DagNode, DagScheduler, NodeResult, CoordinatorExecutor,
+    DagError, DagGraph, DagNode, DagScheduler, FailFast, NodeResult, CoordinatorExecutor,
     RetryPolicy, SubagentDispatcher, SubagentRunner,
 };
 // Step 3.2-a:LaneEvent helpers for SubagentHandoff / SubagentResult.
@@ -155,6 +155,73 @@ pub const CHECK_SUBAGENT_TOOL_SPEC: &str = r#"{
             }
         },
         "required": ["subagent_id"]
+    }
+}"#;
+
+/// v3:Tool specification for the `spawn_parallel_subagents` tool.
+///
+/// 主 agent 通过此 tool **批量并行**派发多个子 agent,内部走
+/// [`ConversationRuntime::spawn_parallel_via_dag_with_fail_fast`],
+/// 由 `DagScheduler` 在独立的 tokio task 中真并发执行(而非顺序循环)。
+///
+/// 与 `dispatch_subagent`(单个派发 + retry loop)的区别:
+/// - 一次调用派发 N 个子 agent,共享一个 DAG 调度回合
+/// - 真并行:所有 task 在独立的 tokio task 中同时执行
+/// - 不带 retry loop(单次执行,`max_retries = 0`)
+/// - 支持 `fail_fast` 配置:`on`(默认,任一失败即取消全部)/ `off`(容错,收集部分结果)
+///
+/// 适用于:独立的可并行任务(如多文件分析、多模块测试、多方案探索)。
+/// 不适用于:有依赖关系的任务(应使用 `dag_run` + DAG 定义)。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const SPAWN_PARALLEL_SUBAGENTS_TOOL_SPEC: &str = r#"{
+    "name": "spawn_parallel_subagents",
+    "description": "Dispatch multiple sub-agents in parallel using a DAG scheduler. All tasks run concurrently in independent tokio tasks (true parallelism, not sequential). Each sub-agent has its own LLM request and prompt cache. Use this for independent parallelizable work (e.g. analyzing multiple files, running multiple test suites). For dependent tasks, use dag_run instead. Returns one result per task.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "description": "List of sub-agent tasks to dispatch in parallel.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Human-readable name for the sub-agent (e.g. 'analyze-auth', 'test-runner')."
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "The task description / prompt to send to the sub-agent."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Model name for the sub-agent (e.g. 'deepseek-v4-flash', 'deepseek-v4-pro'). Required — capability check uses this to gate Budget vs Flagship tasks."
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["fork", "teammate", "worktree"],
+                            "description": "Coordination mode: 'fork' (shared workdir, parallel), 'teammate' (shared TaskRegistry), 'worktree' (isolated git worktree).",
+                            "default": "fork"
+                        },
+                        "complexity": {
+                            "type": "string",
+                            "enum": ["simple", "diagnostic", "architectural"],
+                            "description": "Task complexity. Budget-tier models (haiku/mini/nano/flash) cannot handle 'diagnostic' or 'architectural'.",
+                            "default": "simple"
+                        }
+                    },
+                    "required": ["name", "task", "model"]
+                },
+                "minItems": 1
+            },
+            "fail_fast": {
+                "type": "string",
+                "enum": ["on", "off"],
+                "description": "Failure propagation: 'on' (default) cancels all siblings on any failure; 'off' tolerates failures and returns partial results.",
+                "default": "on"
+            }
+        },
+        "required": ["tasks"]
     }
 }"#;
 
@@ -464,6 +531,10 @@ pub struct ConversationRuntime<C, T> {
     /// 上一次 verify 为什么失败,只能盲目重试 → 必然陷入 doom loop。
     pending_remediation: Option<String>,
     decision_log: Option<crate::decision_log::DecisionLog>,
+    /// v3 §4.7:决策检测策略。控制 `maybe_auto_compact` 在压缩前用何种方式
+    /// 提取决策点。默认 `Heuristic`(零成本),可通过
+    /// [`with_detection_strategy`](Self::with_detection_strategy) 升级为 `LlmExtract`。
+    detection_strategy: crate::decision_log::DetectionStrategy,
     project_topology: Option<std::sync::Arc<crate::project_topology::ProjectTopology>>,
     refactor_tx: Option<crate::vcs_snapshot::RefactorTransaction>,
 }
@@ -540,6 +611,7 @@ where
             notebook_refresh_pending: false,
             pending_remediation: None,
             decision_log: None,
+            detection_strategy: crate::decision_log::DetectionStrategy::Heuristic,
             project_topology: None,
             refactor_tx: None,
         }
@@ -669,6 +741,36 @@ where
     pub fn with_decision_log(mut self, decision_log: crate::decision_log::DecisionLog) -> Self {
         self.decision_log = Some(decision_log);
         self
+    }
+
+    /// v3 §4.7:设置决策检测策略。
+    ///
+    /// 控制 [`Self::maybe_auto_compact`] 在压缩前用何种方式提取决策点:
+    /// - [`DetectionStrategy::Heuristic`](crate::decision_log::DetectionStrategy::Heuristic)
+    ///   (默认):零 LLM 调用,纯关键词匹配。`alternatives` 字段永远为空。
+    /// - [`DetectionStrategy::LlmExtract`](crate::decision_log::DetectionStrategy::LlmExtract)
+    ///   { model }:调用轻量模型(flash)提取结构化决策
+    ///   (context/decision/rationale/alternatives)。需先通过
+    ///   [`set_global_decision_extractor_client`](crate::decision_log::set_global_decision_extractor_client)
+    ///   注册全局 client,否则自动降级为 Heuristic。
+    ///
+    /// **推荐用法**:`build_runtime` 中注入 `DecisionExtractorClient` 后,
+    /// 调用 `runtime.with_detection_strategy(DetectionStrategy::LlmExtract { model })`
+    /// 启用 LLM 提取。若 client 未注册 / 调用失败 / JSON 解析失败,自动 3 路降级
+    /// 保证不阻塞 compaction。
+    #[must_use]
+    pub fn with_detection_strategy(
+        mut self,
+        strategy: crate::decision_log::DetectionStrategy,
+    ) -> Self {
+        self.detection_strategy = strategy;
+        self
+    }
+
+    /// v3 §4.7:获取当前配置的决策检测策略(用于诊断 / 测试)。
+    #[must_use]
+    pub fn detection_strategy(&self) -> &crate::decision_log::DetectionStrategy {
+        &self.detection_strategy
     }
 
     pub fn with_project_topology(
@@ -833,9 +935,11 @@ where
     ///   - `Err(msg)`:能力校验未通过 / DAG 调度失败 / runtime 未注入
     ///
     /// # FailFast 语义
-    /// `DagScheduler::run` 采用 FailFast:任一 node 失败(且耗尽 retry)后,
+    /// 本方法使用 `FailFast::On`(向后兼容):任一 node 失败(且耗尽 retry)后,
     /// 整个 DAG 取消,未完成的 node 一并标记为 `Err`。
     /// 本方法设置 `max_retries = 0`(无重试),任一 subagent 失败即整体失败。
+    /// 如需容错模式,请使用 [`spawn_parallel_via_dag_with_fail_fast`](Self::spawn_parallel_via_dag_with_fail_fast)
+    /// 或异步版本 [`spawn_parallel_via_dag_async`](Self::spawn_parallel_via_dag_async)。
     ///
     /// # 示例
     /// ```ignore
@@ -853,32 +957,156 @@ where
         &self,
         tasks: Vec<SpawnRequest>,
     ) -> Vec<Result<String, String>> {
-        let n = tasks.len();
-        let mut results: Vec<Result<String, String>> = Vec::with_capacity(n);
+        // 默认 FailFast::On(向后兼容)
+        self.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On)
+    }
 
-        // 1. 取出已注入的 CoordinatorExecutor
+    /// v3:同步版本的 `spawn_parallel_via_dag`,支持配置 [`FailFast`] 策略。
+    ///
+    /// 与 [`spawn_parallel_via_dag`](Self::spawn_parallel_via_dag) 行为一致,
+    /// 但允许调用方选择失败传播策略:
+    /// - `FailFast::On`:任一 node 失败即取消整个 DAG(严格语义,默认)
+    /// - `FailFast::Off`:node 失败后标记为 Failed,继续执行其他独立分支(容错语义)
+    ///
+    /// 内部通过 `tokio::runtime::Builder::new_current_thread` + `block_on` 桥接
+    /// [`spawn_parallel_via_dag_async`](Self::spawn_parallel_via_dag_async)。
+    /// 供同步上下文(如 `run_turn`)调用。若调用方已在 async 上下文中,应直接使用
+    /// async 版本以避免 `block_on` 开销。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// use runtime::multi_agent::{SpawnRequest, CoordinationMode, TaskComplexity};
+    /// use runtime::multi_agent::dag::FailFast;
+    /// # use runtime::ConversationRuntime;
+    /// # let runtime: ConversationRuntime<_, _> = unimplemented!();
+    /// let tasks = vec![
+    ///     SpawnRequest::new("agent-a", "task A", CoordinationMode::Fork, "deepseek-v4-flash", TaskComplexity::Simple),
+    /// ];
+    /// // 容错模式:失败的 task 返回 Err,成功的 task 仍返回 Ok
+    /// let results = runtime.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::Off);
+    /// ```
+    pub fn spawn_parallel_via_dag_with_fail_fast(
+        &self,
+        tasks: Vec<SpawnRequest>,
+        fail_fast: FailFast,
+    ) -> Vec<Result<String, String>> {
+        let (executor, nodes, results) = match self.prepare_dag_for_spawn_parallel(tasks) {
+            Ok(v) => v,
+            Err(early) => return early,
+        };
+
+        let graph = Self::build_spawn_parallel_graph(&nodes);
+        let scheduler = DagScheduler::new(graph, executor).with_fail_fast(fail_fast);
+
+        // 同步桥接:本方法从同步上下文(run_turn)调用,当前线程无 tokio runtime。
+        // 使用 new_current_thread + enable_all + block_on(与 tools 层 dag_run 工具一致)。
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let msg = format!("failed to create tokio runtime: {e}");
+                let mut results = results;
+                for (idx, _) in &nodes {
+                    results[*idx] = Err(msg.clone());
+                }
+                return results;
+            }
+        };
+
+        let run_result = rt.block_on(async move { scheduler.run().await });
+        Self::map_dag_run_result(run_result, nodes, results)
+    }
+
+    /// v3:异步版本的 `spawn_parallel_via_dag`,供 async 调用方使用(避免 `block_on`)。
+    ///
+    /// 与 [`spawn_parallel_via_dag_with_fail_fast`](Self::spawn_parallel_via_dag_with_fail_fast)
+    /// 行为一致,但直接 `.await` `DagScheduler::run()`,无需桥接 tokio runtime。
+    /// 适合在 async 上下文(如 TUI event loop、HTTP handler)中调用。
+    ///
+    /// # 参数
+    /// - `tasks`:spawn 请求列表
+    /// - `fail_fast`:失败传播策略
+    ///
+    /// # 返回
+    /// 同 [`spawn_parallel_via_dag`](Self::spawn_parallel_via_dag)。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// use runtime::multi_agent::{SpawnRequest, CoordinationMode, TaskComplexity};
+    /// use runtime::multi_agent::dag::FailFast;
+    /// # use runtime::ConversationRuntime;
+    /// # let runtime: ConversationRuntime<_, _> = unimplemented!();
+    /// let tasks = vec![
+    ///     SpawnRequest::new("agent-a", "task A", CoordinationMode::Fork, "deepseek-v4-flash", TaskComplexity::Simple),
+    /// ];
+    /// // 在 async 上下文中直接 await
+    /// let results = runtime.spawn_parallel_via_dag_async(tasks, FailFast::On).await;
+    /// ```
+    pub async fn spawn_parallel_via_dag_async(
+        &self,
+        tasks: Vec<SpawnRequest>,
+        fail_fast: FailFast,
+    ) -> Vec<Result<String, String>> {
+        let (executor, nodes, results) = match self.prepare_dag_for_spawn_parallel(tasks) {
+            Ok(v) => v,
+            Err(early) => return early,
+        };
+
+        let graph = Self::build_spawn_parallel_graph(&nodes);
+        let scheduler = DagScheduler::new(graph, executor).with_fail_fast(fail_fast);
+
+        let run_result = scheduler.run().await;
+        Self::map_dag_run_result(run_result, nodes, results)
+    }
+
+    /// 私有辅助:为 `spawn_parallel_via_dag*` 系列方法准备 DAG 调度所需的
+    /// executor、节点列表和结果占位向量。
+    ///
+    /// 提取 sync / async 变体共享的逻辑:
+    /// 1. 取出已注入的 `CoordinatorExecutor`(若未注入,返回 `Err` 早退结果)
+    /// 2. 能力校验 + 构建 `DagNode`(并行根节点,无依赖,`max_retries = 0`)
+    /// 3. 初始化结果占位向量(通过校验的位置为 `Ok(String::new())`)
+    ///
+    /// # 返回
+    /// - `Ok((executor, nodes, results_skeleton))`:可继续构造 DagScheduler
+    /// - `Err(results)`:早退 — 未注入 executor / 空 tasks / 全部 task 未通过能力校验
+    fn prepare_dag_for_spawn_parallel(
+        &self,
+        tasks: Vec<SpawnRequest>,
+    ) -> Result<
+        (
+            Arc<CoordinatorExecutor>,
+            Vec<(usize, DagNode)>,
+            Vec<Result<String, String>>,
+        ),
+        Vec<Result<String, String>>,
+    > {
+        let n = tasks.len();
         let executor = match &self.coordinator_executor {
             Some(e) => e.clone(),
             None => {
-                return (0..n)
+                return Err((0..n)
                     .map(|_| {
                         Err(
                             "coordinator_executor not injected — call with_dag_coordinator first"
                                 .to_string(),
                         )
                     })
-                    .collect();
+                    .collect());
             }
         };
 
         if n == 0 {
-            return results;
+            return Err(Vec::new());
         }
 
-        // 2. 预检能力校验 + 构建 DagNode(并行根节点,无依赖)
-        // 能力校验与 spawn_with_model 保持一致:
+        // 能力校验 + 构建 DagNode(并行根节点,无依赖)
+        // 与 spawn_with_model 保持一致:
         // Budget 模型(haiku/mini/nano/flash)执行 Diagnostic/Architectural 任务拒绝
         let mut nodes: Vec<(usize, DagNode)> = Vec::with_capacity(n);
+        let mut results: Vec<Result<String, String>> = Vec::with_capacity(n);
         for (idx, task) in tasks.into_iter().enumerate() {
             let lower = task.model.to_ascii_lowercase();
             let is_budget = lower.contains("haiku")
@@ -914,41 +1142,38 @@ where
             results.push(Ok(String::new())); // 占位,后续填充
         }
 
-        // 3. 若所有 task 都未通过能力校验,提前返回
+        // 若所有 task 都未通过能力校验,提前返回
         if nodes.is_empty() {
-            return results;
+            return Err(results);
         }
 
-        // 4. 构建 DagGraph(所有节点为并行根,无 edge)
+        Ok((executor, nodes, results))
+    }
+
+    /// 私有辅助:从已校验的节点列表构造并行 DAG 图。
+    ///
+    /// 所有节点作为并行根节点(无 edge),`max_parallelism = nodes.len()`
+    /// 即一次性全部 spawn。
+    fn build_spawn_parallel_graph(nodes: &[(usize, DagNode)]) -> DagGraph {
         let max_parallel = nodes.len();
         let mut graph =
             DagGraph::new("spawn_parallel_via_dag").with_max_parallelism(max_parallel);
-        for (_, node) in &nodes {
+        for (_, node) in nodes {
             graph.add_node(node.clone());
         }
+        graph
+    }
 
-        // 5. 构造 DagScheduler 并 async-to-sync 桥接
-        // 注:本方法从同步上下文(run_turn)调用,当前线程无 tokio runtime。
-        // 使用 new_current_thread + enable_all + block_on 桥接(与 tools 层
-        // dag_run 工具的桥接模式一致,但本方法同步等待结果而非 fire-and-forget)。
-        let scheduler = DagScheduler::new(graph, executor);
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let msg = format!("failed to create tokio runtime: {e}");
-                for (idx, _) in &nodes {
-                    results[*idx] = Err(msg.clone());
-                }
-                return results;
-            }
-        };
-
-        let run_result = rt.block_on(async move { scheduler.run().await });
-
-        // 6. 映射结果回 Vec<Result<String, String>>
+    /// 私有辅助:将 `DagScheduler::run` 的结果映射回 `Vec<Result<String, String>>`。
+    ///
+    /// - `Ok(node_results)`:按 node_id 索引填充成功结果;缺失的 node 标记为 `Err`
+    /// - `Err(dag_err)`:FailFast 场景,失败的 node 标记为 `subagent failed`,
+    ///   其他 node 标记为 `cancelled due to sibling failure`
+    fn map_dag_run_result(
+        run_result: Result<Vec<NodeResult>, DagError>,
+        nodes: Vec<(usize, DagNode)>,
+        mut results: Vec<Result<String, String>>,
+    ) -> Vec<Result<String, String>> {
         match run_result {
             Ok(node_results) => {
                 // 全部成功:按 node_id 索引填充
@@ -989,7 +1214,6 @@ where
                 }
             }
         }
-
         results
     }
 
@@ -1800,6 +2024,15 @@ where
                             // Step 3.2-c:查询子 agent 状态/结果。
                             // 终态会发布 SubagentResult lane event。
                             match self.execute_check_subagent(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "spawn_parallel_subagents" {
+                            // v3:批量并行派发多个子 agent(走 DagScheduler 真并行)。
+                            // 与 dispatch_subagent(单个 + retry loop)互补:
+                            // - 适用于独立的可并行任务(多文件分析、多模块测试)
+                            // - 不带 retry,支持 fail_fast 配置
+                            match self.execute_spawn_parallel_subagents(&effective_input) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
@@ -2965,6 +3198,134 @@ where
         Ok(result_ref)
     }
 
+    /// v3:Execute the `spawn_parallel_subagents` tool — 批量并行派发多个子 agent。
+    ///
+    /// 主 agent 通过此 tool 一次调用派发 N 个子 agent,内部走
+    /// [`Self::spawn_parallel_via_dag_with_fail_fast`],由 `DagScheduler`
+    /// 在独立的 tokio task 中真并发执行。
+    ///
+    /// 流程:
+    /// 1. 解析 JSON 输入(`tasks` 数组 + 可选 `fail_fast`)
+    /// 2. 每个任务项解析为 `SpawnRequest`(name/task/model 必填,mode/complexity 可选)
+    /// 3. 调用 `spawn_parallel_via_dag_with_fail_fast(tasks, fail_fast)`
+    /// 4. 格式化结果为可读字符串,每个任务一行
+    ///
+    /// **JSON 输入字段**:
+    /// - `tasks`(必填):数组,每项含 `name`/`task`/`model`/`mode`?/`complexity`?
+    /// - `fail_fast`(可选,默认 `on`):`on`/`off`
+    ///
+    /// **返回**:可读的多行字符串,每个任务一行,标明成功(产物路径)或失败(错误信息)。
+    fn execute_spawn_parallel_subagents(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+
+        let tasks_arr = parsed
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .ok_or("missing or invalid 'tasks' field (expected array)")?;
+        if tasks_arr.is_empty() {
+            return Err("'tasks' array must not be empty".into());
+        }
+
+        // 解析 fail_fast(默认 on)
+        let fail_fast_str = parsed
+            .get("fail_fast")
+            .and_then(|v| v.as_str())
+            .unwrap_or("on")
+            .to_ascii_lowercase();
+        let fail_fast = match fail_fast_str.as_str() {
+            "on" => FailFast::On,
+            "off" => FailFast::Off,
+            other => {
+                return Err(format!(
+                    "invalid fail_fast '{other}': expected 'on' or 'off'"
+                )
+                .into());
+            }
+        };
+
+        // 解析 tasks 数组为 SpawnRequest 列表
+        let mut tasks: Vec<SpawnRequest> = Vec::with_capacity(tasks_arr.len());
+        for (idx, item) in tasks_arr.iter().enumerate() {
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("tasks[{idx}]: missing 'name' field"))?;
+            let task = item
+                .get("task")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("tasks[{idx}]: missing 'task' field"))?;
+            let model = item
+                .get("model")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("tasks[{idx}]: missing 'model' field"))?;
+
+            let mode_str = item
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("fork");
+            let mode = match mode_str {
+                "fork" => CoordinationMode::Fork,
+                "teammate" => CoordinationMode::Teammate,
+                "worktree" => CoordinationMode::Worktree,
+                other => {
+                    return Err(format!(
+                        "tasks[{idx}]: invalid mode '{other}' (expected fork/teammate/worktree)"
+                    )
+                    .into());
+                }
+            };
+
+            let complexity = parse_complexity(item.get("complexity"));
+            tasks.push(SpawnRequest::new(name, task, mode, model, complexity));
+        }
+
+        // 发布 lane event(可观测性):批量并行派发开始
+        let emitted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let summary = format!(
+            "spawn_parallel_subagents: {} tasks, fail_fast={}",
+            tasks.len(),
+            fail_fast_str
+        );
+        publish_lane_event(LaneEvent::subagent_handoff(
+            emitted_at,
+            "parallel-batch",
+            "fork",
+            &summary,
+        ));
+
+        // 调用 spawn_parallel_via_dag_with_fail_fast(同步桥接 DagScheduler::run)
+        let results = self.spawn_parallel_via_dag_with_fail_fast(tasks, fail_fast);
+
+        // 格式化结果为可读字符串
+        let mut output = String::new();
+        let success_count = results.iter().filter(|r| r.is_ok()).count();
+        let fail_count = results.len() - success_count;
+        output.push_str(&format!(
+            "spawn_parallel_subagents: {} succeeded, {} failed (fail_fast={})\n",
+            success_count,
+            fail_count,
+            fail_fast_str
+        ));
+        for (i, r) in results.iter().enumerate() {
+            match r {
+                Ok(path) => {
+                    output.push_str(&format!("  [{i}] OK: {path}\n"));
+                }
+                Err(msg) => {
+                    output.push_str(&format!("  [{i}] FAIL: {msg}\n"));
+                }
+            }
+        }
+        Ok(output)
+    }
+
     /// Step 3.2-c:Execute the `check_subagent` tool — 查询子 agent 状态/结果。
     ///
     /// 主 agent 通过 tool call 查询子 agent 状态:
@@ -3515,7 +3876,10 @@ where
             .collect();
         let messages_refs: Vec<&str> =
             messages_to_compact.iter().map(String::as_str).collect();
-        let strategy = crate::decision_log::DetectionStrategy::Heuristic;
+        // v3 §4.7:从 runtime 字段读取策略(默认 Heuristic,可通过 with_detection_strategy 升级)。
+        // LlmExtract 分支会调用全局 DecisionExtractorClient(由 build_runtime 注入),
+        // 失败时 3 路降级保证不阻塞 compaction。
+        let strategy = self.detection_strategy.clone();
         let decisions = crate::decision_log::extract_decisions_before_compaction(
             &messages_refs,
             &strategy,
@@ -4006,6 +4370,7 @@ mod tests {
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::memory::PersistentMemory;
+    use crate::multi_agent::dag::FailFast;
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -7460,6 +7825,397 @@ mod tests {
                 }
                 Err(e) => panic!("task {i} should succeed, got err: {e}"),
             }
+        }
+    }
+
+    // ===== v3 Phase 3:异步接口变体 + FailFast 容错测试 =====
+
+    /// v3:异步变体 — 未注入 executor 时所有 task 返回 Err
+    #[tokio::test]
+    async fn spawn_parallel_via_dag_async_no_executor_returns_err() {
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let tasks = vec![
+            crate::multi_agent::SpawnRequest::new(
+                "agent-a",
+                "task A",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+        ];
+
+        let results = runtime
+            .spawn_parallel_via_dag_async(tasks, FailFast::On)
+            .await;
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Err(msg) => assert!(
+                msg.contains("coordinator_executor not injected"),
+                "got: {msg}"
+            ),
+            Ok(_) => panic!("should fail"),
+        }
+    }
+
+    /// v3:异步变体 — 空 tasks 返回空 vec
+    #[tokio::test]
+    async fn spawn_parallel_via_dag_async_empty_tasks_returns_empty() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let results = runtime
+            .spawn_parallel_via_dag_async(vec![], FailFast::On)
+            .await;
+        assert!(results.is_empty());
+    }
+
+    /// v3:异步变体 — 能力校验拒绝 Budget tier + Diagnostic
+    #[tokio::test]
+    async fn spawn_parallel_via_dag_async_capability_check_rejects() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let tasks = vec![
+            crate::multi_agent::SpawnRequest::new(
+                "diag-agent",
+                "诊断",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Diagnostic,
+            ),
+        ];
+
+        let results = runtime
+            .spawn_parallel_via_dag_async(tasks, FailFast::On)
+            .await;
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Err(msg) => assert!(msg.contains("Budget tier"), "got: {msg}"),
+            Ok(_) => panic!("should reject"),
+        }
+    }
+
+    /// v3:异步变体 — 端到端真并行执行成功
+    #[tokio::test]
+    async fn spawn_parallel_via_dag_async_parallel_execution_succeeds() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let tasks = vec![
+            crate::multi_agent::SpawnRequest::new(
+                "agent-a",
+                "task A",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+            crate::multi_agent::SpawnRequest::new(
+                "agent-b",
+                "task B",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+        ];
+
+        let results = runtime
+            .spawn_parallel_via_dag_async(tasks, FailFast::On)
+            .await;
+        assert_eq!(results.len(), 2);
+        for (i, r) in results.iter().enumerate() {
+            match r {
+                Ok(path) => {
+                    assert!(
+                        path.contains(".claw/subagents/"),
+                        "task {i} got: {path}"
+                    );
+                    assert!(
+                        tempdir.path().join(path).exists(),
+                        "task {i} file should exist"
+                    );
+                }
+                Err(e) => panic!("task {i} should succeed, got: {e}"),
+            }
+        }
+    }
+
+    /// v3:同步 FailFast 变体 — 与默认方法行为一致(FailFast::On)
+    #[test]
+    fn spawn_parallel_via_dag_with_fail_fast_on_matches_default() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let tasks = vec![
+            crate::multi_agent::SpawnRequest::new(
+                "agent-x",
+                "task X",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+        ];
+
+        let results = runtime.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "should succeed: {:?}", results[0]);
+    }
+
+    // ===== v3 Phase 3:execute_spawn_parallel_subagents(CLI tool 接入)测试 =====
+
+    /// v3:`spawn_parallel_subagents` tool — 无效 JSON 返回错误
+    #[test]
+    fn execute_spawn_parallel_subagents_invalid_json_errors() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let err = runtime
+            .execute_spawn_parallel_subagents("not json")
+            .expect_err("invalid JSON should error");
+        assert!(err.to_string().contains("invalid input JSON"));
+    }
+
+    /// v3:`spawn_parallel_subagents` tool — 缺少 tasks 数组返回错误
+    #[test]
+    fn execute_spawn_parallel_subagents_missing_tasks_errors() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let err = runtime
+            .execute_spawn_parallel_subagents(r#"{"fail_fast":"on"}"#)
+            .expect_err("missing tasks should error");
+        assert!(err.to_string().contains("missing or invalid 'tasks'"));
+    }
+
+    /// v3:`spawn_parallel_subagents` tool — 空 tasks 数组返回错误
+    #[test]
+    fn execute_spawn_parallel_subagents_empty_tasks_errors() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let err = runtime
+            .execute_spawn_parallel_subagents(r#"{"tasks":[]}"#)
+            .expect_err("empty tasks should error");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    /// v3:`spawn_parallel_subagents` tool — 无效 fail_fast 值返回错误
+    #[test]
+    fn execute_spawn_parallel_subagents_invalid_fail_fast_errors() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let input = r#"{"tasks":[{"name":"a","task":"b","model":"deepseek-v4-flash"}],"fail_fast":"bogus"}"#;
+        let err = runtime
+            .execute_spawn_parallel_subagents(input)
+            .expect_err("invalid fail_fast should error");
+        assert!(err.to_string().contains("invalid fail_fast 'bogus'"));
+    }
+
+    /// v3:`spawn_parallel_subagents` tool — 任务项缺少 model 字段返回错误
+    #[test]
+    fn execute_spawn_parallel_subagents_task_missing_model_errors() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let input = r#"{"tasks":[{"name":"a","task":"b"}]}"#;
+        let err = runtime
+            .execute_spawn_parallel_subagents(input)
+            .expect_err("missing model should error");
+        assert!(err.to_string().contains("missing 'model'"));
+    }
+
+    /// v3:`spawn_parallel_subagents` tool — 端到端成功:2 个 Simple task 并行执行
+    #[test]
+    fn execute_spawn_parallel_subagents_succeeds() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let input = r#"{
+            "tasks": [
+                {"name":"agent-a","task":"task A","model":"deepseek-v4-flash"},
+                {"name":"agent-b","task":"task B","model":"deepseek-v4-flash","mode":"fork","complexity":"simple"}
+            ],
+            "fail_fast": "on"
+        }"#;
+        let output = runtime
+            .execute_spawn_parallel_subagents(input)
+            .expect("should succeed");
+        assert!(output.contains("2 succeeded"), "got: {output}");
+        assert!(output.contains("0 failed"), "got: {output}");
+        assert!(output.contains("[0] OK:"), "got: {output}");
+        assert!(output.contains("[1] OK:"), "got: {output}");
+        assert!(output.contains(".claw/subagents/"), "got: {output}");
+    }
+
+    /// v3:`spawn_parallel_subagents` tool — 能力校验失败:Budget + Diagnostic
+    #[test]
+    fn execute_spawn_parallel_subagents_capability_reject() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        let input = r#"{
+            "tasks": [
+                {"name":"diag","task":"诊断","model":"deepseek-v4-flash","complexity":"diagnostic"}
+            ]
+        }"#;
+        let output = runtime
+            .execute_spawn_parallel_subagents(input)
+            .expect("should return formatted output");
+        // 能力校验失败标记为 FAIL,但 tool 调用本身成功(返回 formatted 输出)
+        assert!(output.contains("0 succeeded"), "got: {output}");
+        assert!(output.contains("1 failed"), "got: {output}");
+        assert!(output.contains("Budget tier"), "got: {output}");
+    }
+
+    // ===== v3 §4.7:DetectionStrategy 端到端接入测试 =====
+
+    /// v3:默认策略为 Heuristic
+    #[test]
+    fn detection_strategy_defaults_to_heuristic() {
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        assert!(matches!(
+            runtime.detection_strategy(),
+            crate::decision_log::DetectionStrategy::Heuristic
+        ));
+    }
+
+    /// v3:`with_detection_strategy` 正确设置 LlmExtract
+    #[test]
+    fn with_detection_strategy_sets_llm_extract() {
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_detection_strategy(
+            crate::decision_log::DetectionStrategy::LlmExtract {
+                model: "deepseek-v4-flash".to_string(),
+            },
+        );
+        match runtime.detection_strategy() {
+            crate::decision_log::DetectionStrategy::LlmExtract { model } => {
+                assert_eq!(model, "deepseek-v4-flash");
+            }
+            other => panic!("expected LlmExtract, got {other:?}"),
         }
     }
 }
