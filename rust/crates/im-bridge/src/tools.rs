@@ -285,6 +285,7 @@ fn handle_grep_search(input: &str) -> Result<String, ToolError> {
     let mut results = Vec::new();
     let mut count = 0u64;
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_and_grep(
         dir: &std::path::Path,
         pattern: &str,

@@ -1118,6 +1118,7 @@ where
     /// # 返回
     /// - `Ok((executor, nodes, results_skeleton))`:可继续构造 DagScheduler
     /// - `Err(results)`:早退 — 未注入 executor / 空 tasks / 全部 task 未通过能力校验
+    #[allow(clippy::type_complexity)]
     fn prepare_dag_for_spawn_parallel(
         &self,
         tasks: Vec<SpawnRequest>,

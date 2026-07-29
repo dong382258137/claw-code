@@ -1190,6 +1190,7 @@ fn parse_llm_decision_json(
 }
 
 /// 剥离 markdown 代码块包裹(```json ... ``` 或 ``` ... ```)。
+#[allow(clippy::manual_strip)]
 fn strip_markdown_code_block(s: &str) -> &str {
     let trimmed = s.trim();
     if trimmed.starts_with("```") {

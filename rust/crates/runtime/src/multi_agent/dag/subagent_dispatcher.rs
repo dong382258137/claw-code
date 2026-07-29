@@ -57,7 +57,7 @@ impl SubagentDispatcher {
 
     async fn dispatch_impl(
         api_client: &Arc<Mutex<Box<dyn ApiClient + Send>>>,
-        workspace_root: &PathBuf,
+        workspace_root: &std::path::Path,
         subagent_id: &str,
         name: &str,
         task: &str,

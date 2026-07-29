@@ -88,6 +88,7 @@ impl LlmBridge {
     ///
     /// # 错误
     /// 网络/API/超时等返回 `Err(String)`,由上层降级处理。
+    #[allow(clippy::result_large_err)]
     fn call(&self, prompt: &str) -> Result<String, String> {
         let request = MessageRequest {
             model: self.model.clone(),
