@@ -6,6 +6,7 @@
 #![cfg(unix)]
 #![allow(clippy::while_let_on_iterator)]
 
+mod common;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};

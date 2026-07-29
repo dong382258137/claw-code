@@ -5,6 +5,7 @@
 // Windows is a symptom of the `python3` lookup failing in a degraded env.
 #![cfg(unix)]
 
+mod common;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;

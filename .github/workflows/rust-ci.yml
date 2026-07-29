@@ -151,3 +151,20 @@ jobs:
           } finally {
             Pop-Location
           }
+
+  compat-harness:
+    name: compat-harness (upstream parity check)
+    runs-on: ubuntu-latest
+    needs: [test-workspace]
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Run upstream compatibility comparison
+        run: bash scripts/check-upstream-compat.sh

@@ -1,5 +1,4 @@
 mod hooks;
-#[cfg(test)]
 pub mod test_isolation;
 
 use std::collections::{BTreeMap, BTreeSet};
