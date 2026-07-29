@@ -241,13 +241,11 @@ impl std::fmt::Debug for MultiAgentCoordinator {
         let subagent_count = self
             .subagents
             .lock()
-            .map_or(0, |s| s.len())
-            .max(0);
+            .map_or(0, |s| s.len());
         let gate_count = self
             .validation_gates
             .lock()
-            .map_or(0, |g| g.len())
-            .max(0);
+            .map_or(0, |g| g.len());
         f.debug_struct("MultiAgentCoordinator")
             .field("subagents_count", &subagent_count)
             .field("validation_gates_count", &gate_count)

@@ -483,7 +483,7 @@ impl ValidationGate for LlmJudgeGate {
 
         // 3. 解析分数
         let score = Self::parse_score(&response).map_err(|e| ValidationError {
-            message: format!("{e}"),
+            message: e.to_string(),
             retryable: false, // 解析失败不重试(LLM 输出格式问题,重试也不一定改善)
         })?;
 

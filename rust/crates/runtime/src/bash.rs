@@ -122,7 +122,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
         return rx
             .recv()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bash worker thread died: {e}")))?;
+            .map_err(|e| io::Error::other(format!("bash worker thread died: {e}")))?;
     }
 
     let runtime = Builder::new_current_thread().enable_all().build()?;

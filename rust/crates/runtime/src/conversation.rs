@@ -3040,6 +3040,7 @@ where
     /// 返回 `Err` 而非 panic,提示调用方改用
     /// [`execute_dispatch_subagent_async`](Self::execute_dispatch_subagent_async)。
     /// 与 [`run_turn`](Self::run_turn) 的检测保持一致。
+    #[allow(dead_code)]
     fn execute_dispatch_subagent(
         &mut self,
         input: &str,
@@ -3342,6 +3343,7 @@ where
     /// - `fail_fast`(可选,默认 `on`):`on`/`off`
     ///
     /// **返回**:可读的多行字符串,每个任务一行,标明成功(产物路径)或失败(错误信息)。
+    #[allow(dead_code)]
     fn execute_spawn_parallel_subagents(
         &mut self,
         input: &str,

@@ -886,7 +886,7 @@ pub fn set_global_decision_extractor_client(client: std::sync::Arc<dyn DecisionE
 pub fn is_decision_extractor_client_registered() -> bool {
     GLOBAL_DECISION_EXTRACTOR
         .get()
-        .map_or(false, |opt| opt.is_some())
+        .is_some_and(|opt| opt.is_some())
 }
 
 /// 获取全局决策提取 client(若已注册)。
