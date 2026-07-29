@@ -127,32 +127,22 @@ impl OutputEntry {
                     return format!("\n{ts_prefix}┌─ 🔧 {name} {summary} ⏳\n");
                 }
                 let output = result.as_ref().unwrap();
-                if *collapsed {
-                    // 折叠状态：只显示 header + 结果摘要
-                    let icon = if *is_error { "❌" } else { "✅" };
-                    let line_count = output.lines().count();
-                    if line_count == 0 {
-                        format!("\n{ts_prefix}┌─ 🔧 {name} {summary}\n{ts_prefix}├─ {icon} {name} (空)\n{ts_prefix}└─\n")
-                    } else {
-                        format!(
-                            "\n{ts_prefix}┌─ 🔧 {name} {summary}\n{ts_prefix}├─ {icon} {name} ({line_count} 行，已折叠)\n{ts_prefix}└─\n"
-                        )
-                    }
+                // P1 修复：统一委托给 render_tool_result_public，由它根据
+                // `collapsed` 参数决定折叠预览（前3行+展开提示）或完整展开。
+                // 之前 collapsed==true 走独立分支只显示一行摘要，导致
+                // render_tool_result 的折叠预览优化永远不生效。
+                let rendered = crate::tui::tool_card::render_tool_result_public(
+                    name,
+                    output,
+                    *is_error,
+                    Some(input),
+                    *collapsed,
+                );
+                // render_tool_result_public 输出以 \n 开头，把时间戳插入到首行
+                if let Some(stripped) = rendered.strip_prefix('\n') {
+                    format!("\n{ts_prefix}{stripped}")
                 } else {
-                    // 展开状态：显示完整卡片（含 diff 和结果）
-                    // 时间戳前缀加在 header 行前
-                    let rendered = crate::tui::tool_card::render_tool_result_public(
-                        name,
-                        output,
-                        *is_error,
-                        Some(input),
-                    );
-                    // render_tool_result_public 输出以 \n 开头，把时间戳插入到首行
-                    if let Some(stripped) = rendered.strip_prefix('\n') {
-                        format!("\n{ts_prefix}{stripped}")
-                    } else {
-                        format!("{ts_prefix}{rendered}")
-                    }
+                    format!("{ts_prefix}{rendered}")
                 }
             }
         }
@@ -762,6 +752,94 @@ mod tests {
         let snap = view.snapshot();
         assert!(snap.contains("bash"));
         assert!(snap.contains("2 行"));
+    }
+
+    /// 回归测试：complete_tool_card 后长输出应显示折叠预览（前3行 + 展开 hint）。
+    ///
+    /// 这是用户报告的核心问题：之前 complete_tool_card 把 collapsed 设为 true，
+    /// 但 render() 在 collapsed==true 分支只显示一行摘要 "(N 行，已折叠)"，
+    /// 完全跳过了 render_tool_result 中的折叠预览逻辑（前3行 + [+] 展开）。
+    /// 修复后 render() 统一委托给 render_tool_result(..., collapsed)，
+    /// collapsed==true + 长输出 → 前3行预览 + [+] 展开提示。
+    #[test]
+    fn complete_tool_card_long_output_shows_collapse_preview() {
+        let view = OutputView::new();
+        {
+            let mut guard = view.inner.lock().unwrap();
+            guard.push_entry(OutputEntry::tool_card_start(
+                "t1".to_string(),
+                "bash".to_string(),
+                r#"{"command":"ls"}"#.to_string(),
+            ));
+        }
+        // 20 行输出，超过 COLLAPSE_THRESHOLD(5)
+        let long_output = (1..=20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        {
+            let mut guard = view.inner.lock().unwrap();
+            assert!(guard.complete_tool_card("t1", long_output, false));
+        }
+        let snap = view.snapshot();
+        // 应显示折叠预览，而不是只显示一行摘要
+        assert!(
+            snap.contains("[+] 展开"),
+            "折叠预览应包含 [+] 展开 提示: {snap}"
+        );
+        assert!(
+            snap.contains("17 行"),
+            "应显示隐藏行数: {snap}"
+        );
+        // 应包含前3行预览
+        assert!(snap.contains("line1"));
+        assert!(snap.contains("line3"));
+        // 不应包含第4行（已被折叠）
+        assert!(
+            !snap.contains("│ line4"),
+            "第4行不应出现在折叠预览中: {snap}"
+        );
+        // 不应显示旧的"已折叠"摘要文案
+        assert!(
+            !snap.contains("已折叠）\n"),
+            "不应显示旧的纯摘要分支输出: {snap}"
+        );
+    }
+
+    /// 回归测试：toggle 展开 ToolCard 后长输出应显示完整内容。
+    #[test]
+    fn toggle_expand_long_tool_card_shows_full_output() {
+        let view = OutputView::new();
+        let long_output = (1..=20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        {
+            let mut guard = view.inner.lock().unwrap();
+            guard.push_entry(OutputEntry::ToolCard {
+                tool_id: "t1".to_string(),
+                name: "bash".to_string(),
+                input: r#"{"command":"ls"}"#.to_string(),
+                result: Some(long_output),
+                is_error: false,
+                collapsed: true,
+                timestamp: String::new(),
+            });
+        }
+        // 切换为展开
+        {
+            let mut guard = view.inner.lock().unwrap();
+            assert!(guard.toggle_latest_tool_card());
+        }
+        let snap = view.snapshot();
+        // 展开后不应有折叠提示
+        assert!(
+            !snap.contains("[+] 展开"),
+            "展开状态不应有折叠提示: {snap}"
+        );
+        // 应包含所有行
+        assert!(snap.contains("line1"));
+        assert!(snap.contains("line20"));
     }
 
     #[test]

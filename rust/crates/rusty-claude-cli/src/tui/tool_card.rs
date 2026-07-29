@@ -68,16 +68,25 @@ fn render_edit_diff(input: &str) -> Option<String> {
 }
 
 /// Render a tool result card (collapsible).
-/// If `output` has more than `COLLAPSE_THRESHOLD` lines, only the first
-/// `COLLAPSED_PREVIEW_LINES` lines are shown followed by an expand hint.
-/// Tool results are syntax-highlighted when the tool name implies code output.
-/// P1 修复：对 edit_file 工具，在 result 卡片中显示 diff（原 start 卡片
-/// 中的 diff 已移除）。
+///
+/// 折叠语义（P1 修复）：
+/// - `collapsed == true` 且 `line_count > COLLAPSE_THRESHOLD`：
+///   折叠预览视图，显示前 `COLLAPSED_PREVIEW_LINES` 行 + `[+] 展开` 提示。
+/// - `collapsed == false` 或 `line_count <= COLLAPSE_THRESHOLD`：
+///   完整视图，显示全部输出。
+///
+/// 之前的问题：`complete_tool_card` 把 `collapsed` 设为 `true` 后，
+/// `OutputEntry::render()` 走了独立的"只显示摘要"分支，本函数的折叠预览
+/// 逻辑（前3行+展开提示）永远不会被执行。现在由 `render()` 统一委托给
+/// 本函数，根据 `collapsed` 参数决定折叠/展开。
+///
+/// 对 edit_file 工具，在 result 卡片中显示 diff（原 start 卡片中的 diff 已移除）。
 pub(crate) fn render_tool_result(
     name: &str,
     output: &str,
     is_error: bool,
     input: Option<&str>,
+    collapsed: bool,
 ) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let line_count = lines.len();
@@ -104,8 +113,8 @@ pub(crate) fn render_tool_result(
         }
     };
 
-    if line_count > COLLAPSE_THRESHOLD {
-        // Collapsed view: show preview + expand hint
+    if collapsed && line_count > COLLAPSE_THRESHOLD {
+        // 折叠预览视图：显示前几行 + 展开提示
         let preview: String = highlighted_body(&lines[..COLLAPSED_PREVIEW_LINES.min(line_count)]);
         let hidden = line_count - COLLAPSED_PREVIEW_LINES;
         format!(
@@ -114,7 +123,7 @@ pub(crate) fn render_tool_result(
     } else if line_count == 0 {
         format!("{diff_prefix}├─ {icon} {name} (空)\n└─\n")
     } else {
-        // Full view
+        // 完整视图
         let body = highlighted_body(&lines);
         format!("{diff_prefix}├─ {icon} {name} ({line_count} 行)\n{body}└─\n")
     }
@@ -189,14 +198,16 @@ pub(crate) fn summarize_tool_input_public(name: &str, input: &str) -> String {
 }
 
 /// Render a tool result card (collapsible).
-/// P1 重构：公开接口供 OutputView::render() 调用（展开状态渲染）。
+/// P1 重构：公开接口供 OutputView::render() 调用。
+/// `collapsed` 参数控制折叠预览/完整展开两种视图。
 pub(crate) fn render_tool_result_public(
     name: &str,
     output: &str,
     is_error: bool,
     input: Option<&str>,
+    collapsed: bool,
 ) -> String {
-    render_tool_result(name, output, is_error, input)
+    render_tool_result(name, output, is_error, input, collapsed)
 }
 
 /// Summarize tool input to a short one-liner for the card header.
@@ -304,7 +315,8 @@ mod tests {
     #[test]
     fn render_tool_result_short_output_full_view() {
         let output = "line1\nline2\nline3";
-        let card = render_tool_result("bash", output, false, None);
+        // 短输出：无论 collapsed 参数都显示完整内容
+        let card = render_tool_result("bash", output, false, None, false);
         assert!(card.contains("✅ bash"));
         assert!(card.contains("3 行"));
         assert!(!card.contains("[+] 展开"));
@@ -312,12 +324,12 @@ mod tests {
 
     #[test]
     fn render_tool_result_long_output_collapsed() {
-        // P1 修复：阈值从 15 降到 5，20 行输出会被折叠，只显示前 3 行
+        // P1 修复：阈值从 15 降到 5，20 行输出 + collapsed=true 时折叠，只显示前 3 行
         let output = (1..=20)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let card = render_tool_result("bash", &output, false, None);
+        let card = render_tool_result("bash", &output, false, None, true);
         assert!(card.contains("20 行"));
         assert!(card.contains("[+] 展开"));
         assert!(card.contains("17 行"));
@@ -329,14 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn render_tool_result_long_output_expanded() {
+        // P1 修复：长输出 + collapsed=false 时应显示完整内容，不折叠
+        let output = (1..=20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let card = render_tool_result("bash", &output, false, None, false);
+        assert!(card.contains("✅ bash"));
+        assert!(card.contains("20 行"));
+        // 展开状态不应有折叠提示
+        assert!(!card.contains("[+] 展开"));
+        // 应包含所有行
+        assert!(card.contains("line1"));
+        assert!(card.contains("line20"));
+    }
+
+    #[test]
     fn render_tool_result_error_shows_x_icon() {
-        let card = render_tool_result("bash", "command not found", true, None);
+        let card = render_tool_result("bash", "command not found", true, None, false);
         assert!(card.contains("❌ bash"));
     }
 
     #[test]
     fn render_tool_result_empty_output() {
-        let card = render_tool_result("bash", "", false, None);
+        let card = render_tool_result("bash", "", false, None, false);
         assert!(card.contains("空"));
     }
 
@@ -373,7 +402,7 @@ mod tests {
         // P1 修复：diff 已从 start 卡片移到 result 卡片
         let input =
             r#"{"file_path":"src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#;
-        let card = render_tool_result("edit_file", "ok", false, Some(input));
+        let card = render_tool_result("edit_file", "ok", false, Some(input), false);
         // Should contain red (removed) and green (added) ANSI codes
         assert!(
             card.contains("\x1b[31m"),
@@ -390,7 +419,7 @@ mod tests {
     #[test]
     fn render_edit_diff_identical_strings_no_diff() {
         let input = r#"{"file_path":"src/main.rs","old_string":"same","new_string":"same"}"#;
-        let card = render_tool_result("edit_file", "ok", false, Some(input));
+        let card = render_tool_result("edit_file", "ok", false, Some(input), false);
         // No diff lines should be rendered
         assert!(!card.contains("\x1b[31m"));
         assert!(!card.contains("\x1b[32m"));
@@ -399,7 +428,7 @@ mod tests {
     #[test]
     fn render_edit_diff_multi_line() {
         let input = r#"{"file_path":"test.rs","old_string":"line1\nline2\nline3","new_string":"line1\nmodified\nline3"}"#;
-        let card = render_tool_result("edit_file", "ok", false, Some(input));
+        let card = render_tool_result("edit_file", "ok", false, Some(input), false);
         // line1 and line3 are context, line2 is removed, modified is added
         assert!(card.contains("line2"));
         assert!(card.contains("modified"));
