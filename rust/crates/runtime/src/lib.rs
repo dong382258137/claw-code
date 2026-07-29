@@ -353,6 +353,46 @@ pub use worker_boot::{
     WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
 };
 
+// ── Embedding runtime factory ──
+// Step 4.x: 将 embedding provider 的创建集中在一个工厂函数中,供 PersistentMemory、
+// TraceAnalyzer 等消费者注入。feature `embedding` 开启时优先使用 FastembedProvider
+// (BGE-small-en-v1.5,384 维),创建失败则自动降级到 HashEmbeddingProvider。
+
+/// 根据编译 feature 创建 embedding provider。
+///
+/// - `feature = "embedding"` 开启且 FastembedProvider 初始化成功:返回 BGE-small 384 维。
+/// - `feature = "embedding"` 开启但初始化失败(如模型下载失败):自动降级为 HashEmbeddingProvider。
+/// - `feature = "embedding"` 未开启:返回 None(调用方应使用 keyword fallback)。
+///
+/// 返回 `None` 不表示错误,调用方应检测并退化为关键词匹配。
+#[must_use]
+pub fn build_embedding_provider() -> Option<Box<dyn EmbeddingProvider + Send + Sync>> {
+    #[cfg(feature = "embedding")]
+    {
+        match memory_semantic::fastembed_provider::FastembedProvider::try_new() {
+            Ok(provider) => {
+                eprintln!(
+                    "embedding provider: fastembed ({}-dim BGE-small-en-v1.5)",
+                    provider.dim()
+                );
+                return Some(Box::new(provider));
+            }
+            Err(e) => {
+                eprintln!(
+                    "fastembed init failed ({}), falling back to hash embedding",
+                    e
+                );
+                return Some(Box::new(HashEmbeddingProvider::default_dim()));
+            }
+        }
+    }
+    #[cfg(not(feature = "embedding"))]
+    {
+        // 未编译 embedding feature:不提供 provider,调用方走 keyword fallback。
+        None
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

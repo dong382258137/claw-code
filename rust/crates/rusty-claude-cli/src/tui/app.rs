@@ -2125,7 +2125,36 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
     let logical = match key.code {
         KeyCode::Char(c) => return input.handle_key(Some(c), ""),
         KeyCode::Enter => "Enter",
-        KeyCode::Esc => "Esc",
+        KeyCode::Esc => {
+            // ── ESC peek-ahead：区分真正的 Esc 键和 ANSI 转义序列的 ESC ──
+            //
+            // 根本原因：crossterm 0.28.1 on Windows 把粘贴内容中的 ESC (0x1B)
+            // 字符转换为 KeyCode::Esc 事件，而非 KeyCode::Char('\x1b')。
+            // 这绕过了 InputLine 的 CSI 状态机（只在 Some(ch) 路径运行），
+            // 导致后续 ANSI 参数字符（[, 2, ;, 1, H 等）作为普通字符泄漏到
+            // input buffer，造成输入栏被污染。
+            //
+            // 修复策略：peek-ahead。当收到 KeyCode::Esc 时，用 1ms 超时
+            // 探测下一个事件是否立即可用：
+            // - conhost 粘贴：字符在同一个输入批次中投递（µs 级间隔），
+            //   poll(1ms) 返回 true → 将 \x1b 送入 CSI 状态机，后续字符
+            //   由状态机消费（ConsumingCsi/ConsumingOsc），不会泄漏到 buffer。
+            // - 真正的 Esc 键：人击键间隔 ≥50ms，poll(1ms) 返回 false →
+            //   走正常的 "Esc" 逻辑（reset buffer 或 exit）。
+            //
+            // 例外情况：
+            // - CSI 状态机已激活时（如 OSC 的 ST 终止符 \x1b\\）：直接送入状态机，
+            //   无需 peek-ahead
+            // - 菜单打开时：Esc 应关闭菜单，走 "Esc" 逻辑
+            if input.is_consuming_ansi() {
+                return input.handle_key(Some('\x1b'), "");
+            }
+            if !input.menu_open() && event::poll(Duration::from_millis(1)).unwrap_or(false) {
+                paste_diag_log("ESC peek-ahead: next event available, feeding \\x1b to CSI state machine");
+                return input.handle_key(Some('\x1b'), "");
+            }
+            "Esc"
+        }
         KeyCode::BackTab => "Tab",
         KeyCode::Backspace => "Backspace",
         KeyCode::Left => "Left",

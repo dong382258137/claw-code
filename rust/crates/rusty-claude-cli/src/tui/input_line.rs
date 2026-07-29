@@ -124,6 +124,17 @@ impl InputLine {
         self.menu_open
     }
 
+    /// True if the CSI state machine is actively consuming an ANSI escape
+    /// sequence (i.e., `csi_state != Normal`).
+    ///
+    /// Used by `route_key` to decide whether to feed `\x1b` from a
+    /// `KeyCode::Esc` event directly into the state machine (when already
+    /// consuming) or to do a peek-ahead to distinguish genuine Esc keypress
+    /// from ANSI ESC.
+    pub(crate) fn is_consuming_ansi(&self) -> bool {
+        !matches!(self.csi_state, CsiState::Normal)
+    }
+
     /// Reset to empty state.
     pub(crate) fn reset(&mut self) {
         self.buffer.clear();
@@ -1005,14 +1016,14 @@ mod tests {
     #[test]
     fn handle_key_simulated_ansi_paste_from_terminal() {
         // 真实场景模拟：从终端窗口复制含 CUP 光标定位序列 + SGR 颜色码的文本
-        // "\x1b[2;3HWorkspace 版\x1b[2;15H本为 `2026.7.0`"
+        // "\x1b[2;3HWorkspace 版\x1b[2;15H本为 `2026.8.0`"
         let mut line = InputLine::new();
-        let dirty = "\x1b[2;3HWorkspace 版\x1b[2;15H本为 `2026.7.0`";
+        let dirty = "\x1b[2;3HWorkspace 版\x1b[2;15H本为 `2026.8.0`";
         for ch in dirty.chars() {
             line.handle_key(Some(ch), "");
         }
         // CSI 序列的全部字符（\x1b, [, 数字, ;, H）被过滤，只剩可见文本
-        assert_eq!(line.buffer(), "Workspace 版本为 `2026.7.0`");
+        assert_eq!(line.buffer(), "Workspace 版本为 `2026.8.0`");
     }
 
     #[test]
@@ -1031,5 +1042,170 @@ mod tests {
         line.handle_key(Some('d'), "");
         assert_eq!(line.buffer(), "ad");
         assert_eq!(line.cursor(), 2);
+    }
+
+    // ── ESC peek-ahead 场景测试 ──
+    // 模拟 conhost 粘贴含 ANSI 转义序列的内容。
+    // route_key 中 KeyCode::Esc 被转换为 handle_key(Some('\x1b'), "")，
+    // 而非 handle_key(None, "Esc")，确保 CSI 状态机正确消费整个序列。
+
+    #[test]
+    fn esc_char_feeds_into_csi_state_machine_not_key_handler() {
+        // 核心场景：ESC 字符通过 Some('\x1b') 路径进入状态机，
+        // 而非通过 None, "Esc" 路径触发 buffer reset。
+        // 模拟 route_key 的 KeyCode::Esc → handle_key(Some('\x1b'), "") 调用。
+        let mut line = InputLine::new();
+        // 先插入一些内容
+        for ch in "hello".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        assert_eq!(line.buffer(), "hello");
+        // ESC 字符进入状态机（而非 reset buffer）
+        line.handle_key(Some('\x1b'), "");
+        // buffer 不应被清空（ESC 进入 ExpectingCsi 状态）
+        assert_eq!(line.buffer(), "hello");
+        assert!(line.is_consuming_ansi());
+    }
+
+    #[test]
+    fn ansi_csi_sequence_via_esc_char_fully_consumed() {
+        // 模拟 conhost 粘贴 "\x1b[2;1Hhello" 的完整流程：
+        // route_key 把 KeyCode::Esc 映射为 handle_key(Some('\x1b'), "")
+        // 后续 [, 2, ;, 1, H 作为 KeyCode::Char 走 handle_key(Some(c), "")
+        let mut line = InputLine::new();
+        // ESC → ExpectingCsi
+        line.handle_key(Some('\x1b'), "");
+        // [ → ConsumingCsi
+        line.handle_key(Some('['), "");
+        // 参数字符被消费
+        line.handle_key(Some('2'), "");
+        line.handle_key(Some(';'), "");
+        line.handle_key(Some('1'), "");
+        // H 是终止符 → Normal
+        line.handle_key(Some('H'), "");
+        // 后续正常字符应被插入
+        for ch in "hello".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        assert_eq!(line.buffer(), "hello");
+        assert!(!line.is_consuming_ansi());
+    }
+
+    #[test]
+    fn multiple_ansi_sequences_via_esc_char_all_consumed() {
+        // 模拟用户报告的场景：多个 ANSI 序列混合可见文本
+        // "\x1b[2;1H\x1b[38;5;1;49m│ - pub fn\x1b[3;1H\x1b[39;49m├─ ✅"
+        let mut line = InputLine::new();
+        let dirty = "\x1b[2;1H\x1b[38;5;1;49m│ - pub fn\x1b[3;1H\x1b[39;49m├─ ✅";
+        // 模拟 route_key：ESC → handle_key(Some('\x1b'), "")，其他字符 → handle_key(Some(c), "")
+        let mut chars = dirty.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                line.handle_key(Some('\x1b'), "");
+            } else {
+                line.handle_key(Some(ch), "");
+            }
+        }
+        // ANSI 序列全部被过滤，只剩可见文本
+        assert_eq!(line.buffer(), "│ - pub fn├─ ✅");
+    }
+
+    #[test]
+    fn ansi_sgr_color_sequence_via_esc_char_consumed() {
+        // SGR 颜色序列：\x1b[38;5;240m文本\x1b[0m
+        let mut line = InputLine::new();
+        let dirty = "\x1b[38;5;240m[10:26:08]\x1b[0m hello";
+        let mut chars = dirty.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                line.handle_key(Some('\x1b'), "");
+            } else {
+                line.handle_key(Some(ch), "");
+            }
+        }
+        assert_eq!(line.buffer(), "[10:26:08] hello");
+    }
+
+    #[test]
+    fn ansi_cup_sequence_via_esc_char_consumed() {
+        // 光标定位序列 (CUP)：\x1b[2;1H + \x1b[3;7H 混合文本
+        let mut line = InputLine::new();
+        let dirty = "\x1b[2;1HWorkspace \x1b[2;15H版本为 `2026.8.0`";
+        let mut chars = dirty.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                line.handle_key(Some('\x1b'), "");
+            } else {
+                line.handle_key(Some(ch), "");
+            }
+        }
+        assert_eq!(line.buffer(), "Workspace 版本为 `2026.8.0`");
+    }
+
+    #[test]
+    fn genuine_esc_key_still_resets_buffer() {
+        // 真正的 Esc 键通过 handle_key(None, "Esc") 调用，
+        // 应该 reset buffer（原有行为不变）。
+        let mut line = InputLine::new();
+        for ch in "hello".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        assert_eq!(line.buffer(), "hello");
+        // Esc 键 → reset
+        let action = line.handle_key(None, "Esc");
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(line.buffer(), "");
+    }
+
+    #[test]
+    fn genuine_esc_key_exits_when_buffer_empty() {
+        let mut line = InputLine::new();
+        assert_eq!(line.handle_key(None, "Esc"), InputAction::Exit);
+    }
+
+    #[test]
+    fn is_consuming_ansi_reflects_csi_state() {
+        let mut line = InputLine::new();
+        assert!(!line.is_consuming_ansi()); // Normal
+        line.handle_key(Some('\x1b'), "");
+        assert!(line.is_consuming_ansi()); // ExpectingCsi
+        line.handle_key(Some('['), "");
+        assert!(line.is_consuming_ansi()); // ConsumingCsi
+        line.handle_key(Some('H'), ""); // 终止符
+        assert!(!line.is_consuming_ansi()); // Normal
+    }
+
+    #[test]
+    fn osc_sequence_via_esc_char_consumed() {
+        // OSC 序列：\x1b]0;title\x07
+        let mut line = InputLine::new();
+        let dirty = "\x1b]0;title\x07hello";
+        let mut chars = dirty.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                line.handle_key(Some('\x1b'), "");
+            } else {
+                line.handle_key(Some(ch), "");
+            }
+        }
+        assert_eq!(line.buffer(), "hello");
+    }
+
+    #[test]
+    fn osc_sequence_with_st_terminator_via_esc_char() {
+        // OSC 序列用 ST (\x1b\\) 终止：\x1b]0;title\x1b\\hello
+        // 第二个 \x1b 在 ConsumingOsc 状态下应正确进入 ExpectingCsi，
+        // 然后 \\ 被消费（非 [ / ]），回到 Normal。
+        let mut line = InputLine::new();
+        let dirty = "\x1b]0;title\x1b\\hello";
+        let mut chars = dirty.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                line.handle_key(Some('\x1b'), "");
+            } else {
+                line.handle_key(Some(ch), "");
+            }
+        }
+        assert_eq!(line.buffer(), "hello");
     }
 }

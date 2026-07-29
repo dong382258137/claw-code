@@ -14,6 +14,7 @@
 //!   stable across turns within a single session.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -332,6 +333,12 @@ impl PersistentMemory {
             }
         }
         memory.semantic = recaller;
+        // Step 4.x:注入全局 embedding provider(若可用),使 semantic_recall
+        // 自动使用向量搜索而非退化为 keyword。
+        if let Some(provider) = crate::build_embedding_provider() {
+            memory.semantic = std::mem::take(&mut memory.semantic)
+                .with_embedding_provider(Arc::from(provider));
+        }
         memory.frozen_snapshot = Some(memory.render_current());
         memory
     }

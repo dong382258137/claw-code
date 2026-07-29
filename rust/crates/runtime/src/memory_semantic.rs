@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +77,27 @@ pub enum RecallStrategy {
 ///
 /// **Eq 不再 derive**:`Vec<f32>` 不 impl Eq(floating point NaN 问题)。
 /// `PartialEq` 仍 derive,测试用 `assert_eq!` 比较 entry 不受影响。
+///
+/// `EmbeddingProviderRef` 包装 `Arc<dyn EmbeddingProvider>` 并提供
+/// Debug/PartialEq 占位实现,使 `SemanticRecaller` 仍可 #[derive(Debug, PartialEq)]。
+/// Default 始终为 None(无 provider)。
+#[derive(Clone, Default)]
+struct EmbeddingProviderRef(Option<Arc<dyn EmbeddingProvider + Send + Sync>>);
+
+impl std::fmt::Debug for EmbeddingProviderRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("EmbeddingProviderRef")
+            .field(&self.0.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
+impl PartialEq for EmbeddingProviderRef {
+    fn eq(&self, _other: &Self) -> bool {
+        true // provider 身份不影响语义相等性
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SemanticRecaller {
     /// L1 索引(常驻内存)。
@@ -91,6 +113,12 @@ pub struct SemanticRecaller {
     /// 持久化时只存 L1 索引,加载后通过 `index_embeddings` 重建。
     #[serde(skip)]
     vectors: HashMap<String, Vec<f32>>,
+    /// 运行时 embedding provider(注入后用于向量召回)。
+    /// `#[serde(skip)]` — provider 是运行时资源,不持久化。
+    /// 通过 newtype 包装以旁路 Debug/PartialEq derive。
+    #[serde(skip)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    embedding_provider: EmbeddingProviderRef,
 }
 
 /// L1 索引条目摘要的字符上限。
@@ -153,16 +181,28 @@ impl SemanticRecaller {
 
     /// 语义召回 — 查找与 `query` 最相似的 k 条记忆。
     ///
-    /// **不带 embedding provider**:若 strategy=Embedding 但 vectors 已填充,
-    /// 仍退化到 keyword(因为无法 embed query)。需要向量搜索时使用
-    /// [`SemanticRecaller::semantic_recall_with_provider`]。
+    /// **自动 provider 选择**:若已通过 `with_embedding_provider()` 注入 provider,
+    /// 且 strategy=Embedding 且 vectors 已填充,则使用向量搜索;否则退化到 keyword。
     ///
     /// **缓存保护**:召回结果应末尾追加到 prompt 变动区,不污染稳定区。
     #[must_use]
     pub fn semantic_recall(&self, query: &str, k: usize) -> Vec<MemoryHit> {
         let k = k.max(1);
-        // 无 provider 时统一走 keyword fallback。
+        // Step 4.x:若已注入 provider,走向量路径;否则 keyword fallback。
+        if let Some(ref provider) = self.embedding_provider.0 {
+            return self.semantic_recall_with_provider(query, k, provider.as_ref());
+        }
         self.keyword_recall(query, k)
+    }
+
+    /// 注入 embedding provider(用于向量语义召回)。
+    ///
+    /// 调用方应在构建 `PersistentMemory` 时通过此方法注入全局 provider。
+    pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider + Send + Sync>) -> Self {
+        self.strategy = RecallStrategy::Embedding;
+        self.embedding_available = true;
+        self.embedding_provider = EmbeddingProviderRef(Some(provider));
+        self
     }
 
     /// 带 embedding provider 的语义召回。
