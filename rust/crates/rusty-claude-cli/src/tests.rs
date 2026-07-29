@@ -1856,36 +1856,30 @@ fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         !err_other.contains("--output-format json"),
         "unrelated args should not trigger --json hint: {err_other}"
     );
-    // #154: model syntax error should hint at provider prefix when applicable
-    let err_gpt = parse_args(&[
+    // #154: GPT-4 / qwen-plus models now pass validation because
+    // metadata_for_model recognizes their prefix (gpt- → OpenAI,
+    // qwen- → DashScope). They no longer need the provider/ prefix.
+    let action_gpt = parse_args(&[
         "prompt".to_string(),
         "test".to_string(),
         "--model".to_string(),
         "gpt-4".to_string(),
     ])
-    .expect_err("`--model gpt-4` should fail with OpenAI hint");
+    .expect("`--model gpt-4` should succeed: metadata_for_model routes gpt- → OpenAI");
     assert!(
-        err_gpt.contains("Did you mean `openai/gpt-4`?"),
-        "GPT model error should hint openai/ prefix: {err_gpt}"
+        matches!(action_gpt, CliAction::Prompt { ref model, .. } if model == "gpt-4"),
+        "gpt-4 should be accepted as a bare model name: {action_gpt:?}"
     );
-    assert!(
-        err_gpt.contains("OPENAI_API_KEY"),
-        "GPT model error should mention env var: {err_gpt}"
-    );
-    let err_qwen = parse_args(&[
+    let action_qwen = parse_args(&[
         "prompt".to_string(),
         "test".to_string(),
         "--model".to_string(),
         "qwen-plus".to_string(),
     ])
-    .expect_err("`--model qwen-plus` should fail with DashScope hint");
+    .expect("`--model qwen-plus` should succeed: metadata_for_model routes qwen- → DashScope");
     assert!(
-        err_qwen.contains("Did you mean `qwen/qwen-plus`?"),
-        "Qwen model error should hint qwen/ prefix: {err_qwen}"
-    );
-    assert!(
-        err_qwen.contains("DASHSCOPE_API_KEY"),
-        "Qwen model error should mention env var: {err_qwen}"
+        matches!(action_qwen, CliAction::Prompt { ref model, .. } if model == "qwen-plus"),
+        "qwen-plus should be accepted as a bare model name: {action_qwen:?}"
     );
     // Unrelated invalid model should NOT get a hint
     let err_garbage = parse_args(&[
@@ -2898,6 +2892,152 @@ fn resolve_repl_model_falls_back_to_anthropic_model_env_when_default() {
     assert_eq!(resolved, "claude-sonnet-4-6");
 
     std::env::remove_var("ANTHROPIC_MODEL");
+    std::env::remove_var("CLAW_CONFIG_HOME");
+    fs::remove_dir_all(root).expect("cleanup temp dir");
+}
+
+// ── Auto-detect model tests ────────────────────────────────────────────────
+
+#[test]
+fn resolve_repl_model_auto_detects_deepseek_when_key_present() {
+    let _guard = env_lock();
+    let root = temp_dir();
+    fs::create_dir_all(&root).expect("root dir");
+    let config_home = root.join("config");
+    fs::create_dir_all(&config_home).expect("config home dir");
+    std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+    std::env::remove_var("ANTHROPIC_MODEL");
+
+    // Clear Anthropic auth so DeepSeek is picked (priority 2)
+    let orig_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
+    let orig_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+    let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
+    let orig_openai = std::env::var("OPENAI_API_KEY").ok();
+    std::env::remove_var("ANTHROPIC_API_KEY");
+    std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+    std::env::remove_var("OPENAI_API_KEY");
+    std::env::set_var("DEEPSEEK_API_KEY", "sk-test-deepseek-key");
+
+    let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+
+    assert_eq!(resolved, "deepseek-v4-pro");
+
+    // Restore
+    std::env::remove_var("DEEPSEEK_API_KEY");
+    if let Some(v) = orig_anthropic { std::env::set_var("ANTHROPIC_API_KEY", v); }
+    if let Some(v) = orig_auth_token { std::env::set_var("ANTHROPIC_AUTH_TOKEN", v); }
+    if let Some(v) = orig_openai { std::env::set_var("OPENAI_API_KEY", v); }
+    if let Some(v) = orig_deepseek { std::env::set_var("DEEPSEEK_API_KEY", v); }
+    std::env::remove_var("CLAW_CONFIG_HOME");
+    fs::remove_dir_all(root).expect("cleanup temp dir");
+}
+
+#[test]
+fn resolve_repl_model_auto_detects_openai_when_only_openai_key_present() {
+    let _guard = env_lock();
+    let root = temp_dir();
+    fs::create_dir_all(&root).expect("root dir");
+    let config_home = root.join("config");
+    fs::create_dir_all(&config_home).expect("config home dir");
+    std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+    std::env::remove_var("ANTHROPIC_MODEL");
+
+    let orig_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
+    let orig_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+    let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
+    let orig_openai = std::env::var("OPENAI_API_KEY").ok();
+    std::env::remove_var("ANTHROPIC_API_KEY");
+    std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+    std::env::remove_var("DEEPSEEK_API_KEY");
+    std::env::set_var("OPENAI_API_KEY", "sk-test-openai-key");
+
+    let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+
+    assert_eq!(resolved, "openai/gpt-4.1-mini");
+
+    // Restore
+    std::env::remove_var("OPENAI_API_KEY");
+    if let Some(v) = orig_anthropic { std::env::set_var("ANTHROPIC_API_KEY", v); }
+    if let Some(v) = orig_auth_token { std::env::set_var("ANTHROPIC_AUTH_TOKEN", v); }
+    if let Some(v) = orig_openai { std::env::set_var("OPENAI_API_KEY", v); }
+    if let Some(v) = orig_deepseek { std::env::set_var("DEEPSEEK_API_KEY", v); }
+    std::env::remove_var("CLAW_CONFIG_HOME");
+    fs::remove_dir_all(root).expect("cleanup temp dir");
+}
+
+#[test]
+fn model_provenance_reports_auto_detect_when_no_config() {
+    let _guard = env_lock();
+    let root = temp_dir();
+    fs::create_dir_all(&root).expect("root dir");
+    let config_home = root.join("config");
+    fs::create_dir_all(&config_home).expect("config home dir");
+    std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+    std::env::remove_var("ANTHROPIC_MODEL");
+
+    // Set DEEPSEEK_API_KEY only, clear Anthropic
+    let orig_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
+    let orig_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+    let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
+    let orig_openai = std::env::var("OPENAI_API_KEY").ok();
+    std::env::remove_var("ANTHROPIC_API_KEY");
+    std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+    std::env::remove_var("OPENAI_API_KEY");
+    std::env::set_var("DEEPSEEK_API_KEY", "sk-test-deepseek");
+
+    let provenance =
+        with_current_dir(&root, || ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL));
+
+    assert_eq!(provenance.source, ModelSource::AutoDetect);
+    assert_eq!(provenance.resolved, "deepseek-v4-pro");
+
+    // Restore
+    std::env::remove_var("DEEPSEEK_API_KEY");
+    if let Some(v) = orig_anthropic { std::env::set_var("ANTHROPIC_API_KEY", v); }
+    if let Some(v) = orig_auth_token { std::env::set_var("ANTHROPIC_AUTH_TOKEN", v); }
+    if let Some(v) = orig_openai { std::env::set_var("OPENAI_API_KEY", v); }
+    if let Some(v) = orig_deepseek { std::env::set_var("DEEPSEEK_API_KEY", v); }
+    std::env::remove_var("CLAW_CONFIG_HOME");
+    fs::remove_dir_all(root).expect("cleanup temp dir");
+}
+
+#[test]
+fn model_provenance_reports_default_when_no_keys_at_all() {
+    let _guard = env_lock();
+    let root = temp_dir();
+    fs::create_dir_all(&root).expect("root dir");
+    let config_home = root.join("config");
+    fs::create_dir_all(&config_home).expect("config home dir");
+    std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+    std::env::remove_var("ANTHROPIC_MODEL");
+
+    // Clear ALL API keys
+    let orig_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
+    let orig_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+    let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
+    let orig_openai = std::env::var("OPENAI_API_KEY").ok();
+    let orig_xai = std::env::var("XAI_API_KEY").ok();
+    let orig_dashscope = std::env::var("DASHSCOPE_API_KEY").ok();
+    std::env::remove_var("ANTHROPIC_API_KEY");
+    std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+    std::env::remove_var("DEEPSEEK_API_KEY");
+    std::env::remove_var("OPENAI_API_KEY");
+    std::env::remove_var("XAI_API_KEY");
+    std::env::remove_var("DASHSCOPE_API_KEY");
+
+    let provenance =
+        with_current_dir(&root, || ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL));
+
+    assert_eq!(provenance.source, ModelSource::Default);
+    assert_eq!(provenance.resolved, DEFAULT_MODEL);
+
+    // Restore
+    if let Some(v) = orig_anthropic { std::env::set_var("ANTHROPIC_API_KEY", v); }
+    if let Some(v) = orig_auth_token { std::env::set_var("ANTHROPIC_AUTH_TOKEN", v); }
+    if let Some(v) = orig_openai { std::env::set_var("OPENAI_API_KEY", v); }
+    if let Some(v) = orig_deepseek { std::env::set_var("DEEPSEEK_API_KEY", v); }
+    if let Some(v) = orig_xai { std::env::set_var("XAI_API_KEY", v); }
+    if let Some(v) = orig_dashscope { std::env::set_var("DASHSCOPE_API_KEY", v); }
     std::env::remove_var("CLAW_CONFIG_HOME");
     fs::remove_dir_all(root).expect("cleanup temp dir");
 }

@@ -168,7 +168,9 @@ pub enum ModelSource {
     /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
     /// flag nor env set it).
     Config,
-    /// Compiled-in DEFAULT_MODEL fallback.
+    /// Auto-detected from available API keys (zero-config fallback).
+    AutoDetect,
+    /// Compiled-in DEFAULT_MODEL fallback (no keys found at all).
     Default,
 }
 
@@ -178,6 +180,7 @@ impl ModelSource {
             ModelSource::Flag => "flag",
             ModelSource::Env => "env",
             ModelSource::Config => "config",
+            ModelSource::AutoDetect => "auto-detect",
             ModelSource::Default => "default",
         }
     }
@@ -212,8 +215,8 @@ impl ModelProvenance {
 
     pub fn from_env_or_config_or_default(cli_model: &str) -> Self {
         // Only called when no --model flag was passed. Probe env first,
-        // then config, else fall back to default. Mirrors the logic in
-        // resolve_repl_model() but captures the source.
+        // then config, else auto-detect from available API keys.
+        // Mirrors the logic in resolve_repl_model() but captures the source.
         if cli_model != DEFAULT_MODEL {
             // Already resolved from some prior path; treat as flag.
             return Self {
@@ -238,6 +241,15 @@ impl ModelProvenance {
                 resolved: resolve_model_alias_with_config(&config_model),
                 raw: Some(config_model),
                 source: ModelSource::Config,
+            };
+        }
+        // Zero-config auto-detection: pick the best model for available API keys.
+        let auto_model = detect_best_available_model();
+        if auto_model != DEFAULT_MODEL {
+            return Self {
+                resolved: resolve_model_alias_with_config(&auto_model),
+                raw: None,
+                source: ModelSource::AutoDetect,
             };
         }
         Self::default_fallback()
@@ -460,6 +472,12 @@ pub fn run_tui_repl_entry(
             diag_log("found saved wizard settings, injecting env vars");
             inject_wizard_env_vars(&saved);
             let _ = runtime::mark_bootstrapped();
+        } else if any_api_key_available() {
+            // Auto-bootstrap: the user already has API keys configured via
+            // environment variables or .env file. Skip the wizard and create
+            // the sentinel silently — zero-config experience.
+            diag_log("API key(s) detected in env, auto-bootstrapping");
+            let _ = runtime::mark_bootstrapped();
         } else {
             diag_log("no saved settings, running first-run wizard");
             tui::wizard::run_first_run_wizard()?;
@@ -503,6 +521,9 @@ fn inject_wizard_env_vars(settings: &runtime::WizardSettings) {
         }
         "dashscope" => {
             std::env::set_var("DASHSCOPE_API_KEY", &settings.api_key);
+        }
+        "deepseek" => {
+            std::env::set_var("DEEPSEEK_API_KEY", &settings.api_key);
         }
         _ => {}
     }
@@ -824,6 +845,14 @@ pub fn validate_model_syntax(model: &str) -> Result<(), String> {
     // Check provider/model format: provider_id/model_id
     let parts: Vec<&str> = trimmed.split('/').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        // Bare model names that metadata_for_model can route to a provider
+        // are valid without the `provider/` prefix. This includes:
+        //   deepseek-v4-pro, deepseek-v4-flash, deepseek-chat, deepseek-reasoner
+        //   gpt-5.4, gpt-4.1-mini, qwen-plus, qwen-max, kimi-k2.5, grok-3, etc.
+        if api::metadata_for_model(trimmed).is_some() {
+            return Ok(());
+        }
+        // #154: hint if the model looks like it belongs to a different provider
         // #154: hint if the model looks like it belongs to a different provider
         let mut err_msg = format!(
             "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)",
@@ -948,7 +977,51 @@ pub fn resolve_repl_model(cli_model: String) -> String {
     if let Some(config_model) = config_model_for_current_dir() {
         return resolve_model_alias_with_config(&config_model);
     }
-    cli_model
+    // Zero-config auto-detection: pick the best available model based on
+    // which API keys are present in the environment or .env file.
+    detect_best_available_model()
+}
+
+/// Auto-detect the best available model based on which API keys are present
+/// in the environment or `.env` file.
+///
+/// Checks providers in priority order:
+/// 1. Anthropic (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`)
+/// 2. DeepSeek (`DEEPSEEK_API_KEY`, falls back to `OPENAI_API_KEY`)
+/// 3. OpenAI (`OPENAI_API_KEY`)
+/// 4. xAI / Grok (`XAI_API_KEY`)
+/// 5. DashScope / Kimi-Qwen (`DASHSCOPE_API_KEY`)
+///
+/// Falls back to [`DEFAULT_MODEL`] when no API keys are found (connection
+/// will fail with a clear auth error at that point).
+fn detect_best_available_model() -> String {
+    if api::has_auth_from_env_or_saved().unwrap_or(false) {
+        return "claude-opus-4-6".to_string();
+    }
+    if api::has_api_key("DEEPSEEK_API_KEY") {
+        return "deepseek-v4-pro".to_string();
+    }
+    if api::has_api_key("OPENAI_API_KEY") {
+        return "openai/gpt-4.1-mini".to_string();
+    }
+    if api::has_api_key("XAI_API_KEY") {
+        return "grok-3".to_string();
+    }
+    if api::has_api_key("DASHSCOPE_API_KEY") {
+        return "kimi-k2.5".to_string();
+    }
+    DEFAULT_MODEL.to_string()
+}
+
+/// Returns `true` if at least one provider API key is available in the
+/// environment or `.env` file. Used to skip the first-run wizard when the
+/// user has pre-configured keys (zero-config auto-bootstrap).
+fn any_api_key_available() -> bool {
+    api::has_auth_from_env_or_saved().unwrap_or(false)
+        || api::has_api_key("DEEPSEEK_API_KEY")
+        || api::has_api_key("OPENAI_API_KEY")
+        || api::has_api_key("XAI_API_KEY")
+        || api::has_api_key("DASHSCOPE_API_KEY")
 }
 
 pub fn provider_label(kind: ProviderKind) -> &'static str {

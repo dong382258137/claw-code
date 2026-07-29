@@ -75,6 +75,14 @@ const KNOWN_PROVIDERS: &[ProviderInfo] = &[
         base_url_env: "DASHSCOPE_BASE_URL",
         description: "Kimi K2.5, Qwen models via Alibaba Cloud",
     },
+    ProviderInfo {
+        label: "DeepSeek",
+        env_key: "DEEPSEEK_API_KEY",
+        slug: "deepseek",
+        default_model: "deepseek-v4-pro",
+        base_url_env: "DEEPSEEK_BASE_URL",
+        description: "DeepSeek V4 Pro, V4 Flash, Chat, Reasoner",
+    },
 ];
 
 /// Result of scanning environment variables for pre-existing keys.
