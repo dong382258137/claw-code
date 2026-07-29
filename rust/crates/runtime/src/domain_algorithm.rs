@@ -438,8 +438,8 @@ fn compute_stats(times: &[u64]) -> Stats {
     Stats {
         avg_ms: avg,
         median_ms: median,
-        min_ms: *sorted.first().unwrap(),
-        max_ms: *sorted.last().unwrap(),
+        min_ms: *sorted.first().expect("times non-empty after is_empty check"),
+        max_ms: *sorted.last().expect("times non-empty after is_empty check"),
         stddev_ms: variance.sqrt(),
         valid_count: count,
     }

@@ -858,7 +858,10 @@ fn find_callers_fast(
             let Some(whole_match) = caps.get(0) else {
                 continue;
             };
-            let Ok(line_num) = caps.get(1).unwrap().as_str().parse::<u32>() else {
+            let Some(cap1) = caps.get(1) else {
+                continue;
+            };
+            let Ok(line_num) = cap1.as_str().parse::<u32>() else {
                 continue;
             };
             let file_path = &line[..whole_match.start()];

@@ -504,7 +504,7 @@ pub fn format_log_summary(tool_name: &str, tool_use_id: &str, output: &str) -> S
             if current_count > 0 {
                 if let Some(ref p) = current_pattern {
                     pattern_counts.entry(p.clone()).or_insert(0);
-                    *pattern_counts.get_mut(p).unwrap() += current_count;
+                    *pattern_counts.get_mut(p).expect("key just inserted above") += current_count;
                 }
                 let keep = current_count.min(MAX_REPEATED_PATTERN_KEEP);
                 for i in 0..keep {

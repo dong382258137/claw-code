@@ -428,43 +428,43 @@ fn init_definition_regexes() -> DefRegexVec {
     vec![
         (
             DefinitionKind::Function,
-            Regex::new(r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap(),
+            Regex::new(r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").expect("valid regex literal"),
         ),
         (
             DefinitionKind::Struct,
-            Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap(),
+            Regex::new(r"(?:pub\s+)?struct\s+(\w+)").expect("valid regex literal"),
         ),
         (
             DefinitionKind::Enum,
-            Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap(),
+            Regex::new(r"(?:pub\s+)?enum\s+(\w+)").expect("valid regex literal"),
         ),
         (
             DefinitionKind::Trait,
-            Regex::new(r"(?:pub\s+)?trait\s+(\w+)").unwrap(),
+            Regex::new(r"(?:pub\s+)?trait\s+(\w+)").expect("valid regex literal"),
         ),
         (
             DefinitionKind::Impl,
-            Regex::new(r"impl(?:<[^>]+>)?\s+(\w+)").unwrap(),
+            Regex::new(r"impl(?:<[^>]+>)?\s+(\w+)").expect("valid regex literal"),
         ),
         (
             DefinitionKind::Module,
-            Regex::new(r"(?:pub\s+)?mod\s+(\w+)").unwrap(),
+            Regex::new(r"(?:pub\s+)?mod\s+(\w+)").expect("valid regex literal"),
         ),
         (
             DefinitionKind::Const,
-            Regex::new(r"(?:pub\s+)?const\s+(\w+)").unwrap(),
+            Regex::new(r"(?:pub\s+)?const\s+(\w+)").expect("valid regex literal"),
         ),
         (
             DefinitionKind::Type,
-            Regex::new(r"(?:pub\s+)?type\s+(\w+)").unwrap(),
+            Regex::new(r"(?:pub\s+)?type\s+(\w+)").expect("valid regex literal"),
         ),
     ]
 }
 
 fn init_reference_regexes() -> RefRegexVec {
     vec![
-        Regex::new(r"use\s+([\w:]+)").unwrap(),
-        Regex::new(r"mod\s+(\w+)\s*;").unwrap(),
+        Regex::new(r"use\s+([\w:]+)").expect("valid regex literal"),
+        Regex::new(r"mod\s+(\w+)\s*;").expect("valid regex literal"),
     ]
 }
 
