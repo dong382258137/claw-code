@@ -80,7 +80,10 @@ impl WeComCrypto {
                 .map_err(|e| format!("base64 decode failed: {e}"))?;
 
         // IV = first 16 bytes of AES key
-        let iv: [u8; 16] = self.aes_key[..16].try_into().unwrap();
+        // IV = first 16 bytes of AES key (key is 32 bytes for AES-256-CBC)
+        let iv: [u8; 16] = self.aes_key[..16]
+            .try_into()
+            .map_err(|_| "AES key too short for IV".to_string())?;
 
         let plaintext = Aes256CbcDec::new(self.aes_key.as_slice().into(), &iv.into())
             .decrypt_padded_vec_mut::<Pkcs7>(&ciphertext)
@@ -151,7 +154,10 @@ impl WeComCrypto {
         data.extend_from_slice(corp_id_bytes);
 
         // IV = first 16 bytes of AES key
-        let iv: [u8; 16] = self.aes_key[..16].try_into().unwrap();
+        // IV = first 16 bytes of AES key (key is 32 bytes for AES-256-CBC)
+        let iv: [u8; 16] = self.aes_key[..16]
+            .try_into()
+            .map_err(|_| "AES key too short for IV".to_string())?;
 
         let ciphertext = Aes256CbcEnc::new(self.aes_key.as_slice().into(), &iv.into())
             .encrypt_padded_vec_mut::<Pkcs7>(&data);

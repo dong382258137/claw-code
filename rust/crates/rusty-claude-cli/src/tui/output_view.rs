@@ -126,7 +126,7 @@ impl OutputEntry {
                     // 执行中：只显示 header
                     return format!("\n{ts_prefix}┌─ 🔧 {name} {summary} ⏳\n");
                 }
-                let output = result.as_ref().unwrap();
+                let output = result.as_ref().expect("result must be Some after executing check");
                 // P1 修复：统一委托给 render_tool_result_public，由它根据
                 // `collapsed` 参数决定折叠预览（前3行+展开提示）或完整展开。
                 // 之前 collapsed==true 走独立分支只显示一行摘要，导致
@@ -194,7 +194,7 @@ impl OutputBuffer {
             let lines = ansi_to_lines(&self.cached_snapshot);
             self.cached_lines = Some(Arc::new(lines));
         }
-        Arc::clone(self.cached_lines.as_ref().unwrap())
+        Arc::clone(self.cached_lines.as_ref().expect("cached_lines must be Some after is_none check"))
     }
 }
 

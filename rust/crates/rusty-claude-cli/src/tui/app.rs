@@ -1517,7 +1517,7 @@ fn run_event_loop(
                                                 pending_at_path = Some(composed.clone());
                                                 conhost_suppress_input = true;
                                                 pending_paste_last_line = Some(
-                                                    pending_paste_lines.last().unwrap().clone(),
+                                                    pending_paste_lines.last().expect("non-empty check above").clone(),
                                                 );
                                                 conhost_paste_intercepted = true;
                                                 (composed, String::new())
@@ -1606,8 +1606,7 @@ fn run_event_loop(
                             let status_handle = Arc::clone(&status_state);
                             let tool_history_handle = Arc::clone(&tool_history_shared);
                             let skill_history_handle = Arc::clone(&skill_history_shared);
-
-                            let mut cli = cli_holder.take().unwrap();
+                            let mut cli = cli_holder.take().expect("CLI holder must be initialized before message processing");
 
                             // TUI 原生选择列表拦截：/session pick 在 TUI 下不走 worker 线程，
                             // 而是打开 SessionPicker overlay，用上下键选中会话后 Enter 确认。

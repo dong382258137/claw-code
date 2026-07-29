@@ -723,7 +723,7 @@ fn normalize_nested_fences(markdown: &str) -> String {
                 .last()
                 .is_some_and(|top| top.fence.char == fl.char && fl.len >= top.fence.len);
             if closes_top {
-                let opener = stack.pop().unwrap();
+                let opener = stack.pop().expect("stack non-empty after last().is_some_and check");
                 // Find max fence length of any fence line strictly between
                 // opener and closer (these are the nested fences).
                 let inner_max = fence_info[opener.line_idx + 1..i]
@@ -752,7 +752,7 @@ fn normalize_nested_fences(markdown: &str) -> String {
     let mut rewrites: std::collections::HashMap<usize, Rewrite> = std::collections::HashMap::new();
 
     for (opener_idx, closer_idx, inner_max) in &pairs {
-        let opener_fl = fence_info[*opener_idx].as_ref().unwrap();
+        let opener_fl = fence_info[*opener_idx].as_ref().expect("opener fence must be in fence_info");
         if opener_fl.len <= *inner_max {
             let new_len = inner_max + 1;
             let info_part = {
@@ -770,7 +770,7 @@ fn normalize_nested_fences(markdown: &str) -> String {
                     indent: opener_fl.indent,
                 },
             );
-            let closer_fl = fence_info[*closer_idx].as_ref().unwrap();
+            let closer_fl = fence_info[*closer_idx].as_ref().expect("closer fence must be in fence_info");
             rewrites.insert(
                 *closer_idx,
                 Rewrite {
@@ -799,7 +799,7 @@ fn normalize_nested_fences(markdown: &str) -> String {
             let indent_str: String = std::iter::repeat(' ').take(rw.indent).collect();
             // Recover the original info string (if any) and trailing newline.
             let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-            let fi = fence_info[i].as_ref().unwrap();
+            let fi = fence_info[i].as_ref().expect("rewrite entry must have fence_info");
             let info = &trimmed[fi.indent + fi.len..];
             let trailing = &line[trimmed.len()..];
             out.push_str(&indent_str);

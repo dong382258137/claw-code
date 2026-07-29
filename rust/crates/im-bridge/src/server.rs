@@ -181,7 +181,10 @@ async fn feishu_webhook(
                 &msg.user_id,
                 &msg.text,
                 move |state, chat_key, req| async move {
-                    let feishu = state.feishu_client.as_ref().unwrap();
+                    let Some(feishu) = state.feishu_client.as_ref() else {
+                        tracing::error!("feishu_client not initialized in callback");
+                        return;
+                    };
                     match state.session_manager.process_request(req).await {
                         Ok(session_id) => {
                             let mut router = state.session_router.lock().await;
@@ -284,7 +287,10 @@ async fn wecom_message_callback(
         &user_id,
         &text,
         move |state, chat_key, req| async move {
-            let wecom = state.wecom_client.as_ref().unwrap();
+            let Some(wecom) = state.wecom_client.as_ref() else {
+                tracing::error!("wecom_client not initialized in callback");
+                return;
+            };
             match state.session_manager.process_request(req).await {
                 Ok(session_id) => {
                     let mut router = state.session_router.lock().await;

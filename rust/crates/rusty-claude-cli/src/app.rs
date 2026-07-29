@@ -1352,7 +1352,7 @@ impl LiveCli {
                     }
                     Some("low") | Some("medium") | Some("high") => {
                         self.set_reasoning_effort(level.clone());
-                        format!("思考强度已设置为: {}", level.as_ref().unwrap())
+                        format!("思考强度已设置为: {}", level.as_ref().expect("match arm guarantees Some"))
                     }
                     Some(other) => {
                         format!(
