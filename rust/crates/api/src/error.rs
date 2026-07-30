@@ -40,7 +40,6 @@ pub enum ApiError {
         estimated_total_tokens: u32,
         context_window_tokens: u32,
     },
-    ExpiredOAuthToken,
     Auth(String),
     InvalidApiKeyEnv(VarError),
     Http(reqwest::Error),
@@ -153,7 +152,6 @@ impl ApiError {
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
-            | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Io(_)
@@ -171,7 +169,6 @@ impl ApiError {
             Self::RetriesExhausted { last_error, .. } => last_error.request_id(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
-            | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
@@ -191,7 +188,7 @@ impl ApiError {
                 "provider_retry_exhausted"
             }
             Self::RetriesExhausted { last_error, .. } => last_error.safe_failure_class(),
-            Self::MissingCredentials { .. } | Self::ExpiredOAuthToken | Self::Auth(_) => {
+            Self::MissingCredentials { .. } | Self::Auth(_) => {
                 "provider_auth"
             }
             Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
@@ -220,7 +217,6 @@ impl ApiError {
             Self::RetriesExhausted { last_error, .. } => last_error.is_generic_fatal_wrapper(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
-            | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
@@ -250,7 +246,6 @@ impl ApiError {
             }
             Self::RetriesExhausted { last_error, .. } => last_error.is_context_window_failure(),
             Self::MissingCredentials { .. }
-            | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
@@ -305,12 +300,6 @@ impl Display for ApiError {
                 f,
                 "context_window_blocked for {model}: estimated input {estimated_input_tokens} + requested output {requested_output_tokens} = {estimated_total_tokens} tokens exceeds the {context_window_tokens}-token context window; compact the session or reduce request size before retrying"
             ),
-            Self::ExpiredOAuthToken => {
-                write!(
-                    f,
-                    "saved OAuth token is expired and no refresh token is available"
-                )
-            }
             Self::Auth(message) => write!(f, "auth error: {message}"),
             Self::InvalidApiKeyEnv(error) => {
                 write!(f, "failed to read credential environment variable: {error}")
@@ -445,7 +434,7 @@ impl TypedErrorEnvelope {
         let request_id = error.request_id().map(ToOwned::to_owned);
 
         let (code, hint) = match error {
-            ApiError::MissingCredentials { .. } | ApiError::ExpiredOAuthToken => {
+            ApiError::MissingCredentials { .. } => {
                 (Some("AUTH_MISSING".to_string()), None)
             }
             ApiError::Auth(_) => (Some("AUTH_REJECTED".to_string()), None),

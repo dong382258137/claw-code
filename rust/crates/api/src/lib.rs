@@ -2,7 +2,6 @@
 mod client;
 mod error;
 mod http_client;
-mod prompt_cache;
 mod providers;
 mod sse;
 mod types;
@@ -12,10 +11,6 @@ pub use error::{ApiError, TypedErrorEnvelope, TypedErrorPayload};
 pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with,
     build_http_client_with_opts, ProxyConfig, TimeoutConfig,
-};
-pub use prompt_cache::{
-    CacheBreakEvent, CacheBreakReasons, PromptCache, PromptCacheConfig, PromptCachePaths,
-    PromptCacheRecord, PromptCacheStats,
 };
 pub use providers::openai_compat::has_api_key;
 pub use providers::openai_compat::{

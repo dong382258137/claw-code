@@ -1,33 +1,12 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(dead_code)]
-use std::future::Future;
-use std::pin::Pin;
-
 use serde::Serialize;
 
 use crate::error::ApiError;
-use crate::types::{MessageRequest, MessageResponse};
+use crate::types::MessageRequest;
 
 pub mod model_tier;
 pub mod openai_compat;
-
-#[allow(dead_code)]
-pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
-
-#[allow(dead_code)]
-pub trait Provider {
-    type Stream;
-
-    fn send_message<'a>(
-        &'a self,
-        request: &'a MessageRequest,
-    ) -> ProviderFuture<'a, MessageResponse>;
-
-    fn stream_message<'a>(
-        &'a self,
-        request: &'a MessageRequest,
-    ) -> ProviderFuture<'a, Self::Stream>;
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ProviderKind {

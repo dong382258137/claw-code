@@ -429,6 +429,7 @@ impl SystemPromptBuilder {
         sections.push(get_memory_verification_section());
         sections.push(get_context_recovery_section());
         sections.push(get_decision_log_section());
+        sections.push(get_cross_session_recall_section());
         // ── P0+P1: 多 Agent 编排工具教程区（类 Decision Experience 模式）──
         // P0: 编排四件套 + 三种模式 + DAG 工作流
         sections.push(get_multi_agent_orchestration_section());
@@ -1121,6 +1122,41 @@ fn get_decision_log_section() -> String {
      - AFTER applying a fix AND verifying it works (tests pass / user confirms / command succeeds), call `log_decision` with: `problem_signature`, `root_cause_hypothesis`, `applied_solution`, `affected_files`, and `verification_result`. This records the experience for future sessions.\n\
      - Even if a fix FAILED, still call `log_decision` with `verification_result=\"Refuted\"` — negative experience is equally valuable for avoiding repeated mistakes.\n\
      - Skip `log_decision` for trivial changes (typo fixes, formatting, rename) — it is meant for non-obvious repairs that took diagnosis."
+        .to_string()
+}
+
+/// 跨会话回忆引导段（Phase：跨会话记忆缺口修复）。
+///
+/// 与 `get_context_recovery_section` / `get_decision_log_section` 同模式：
+/// 静态注入到 system prompt，让 LLM 知道**何时**应该用 `session_search`
+/// 检索跨会话历史。修复"用户问上次任务 → AI 凭空猜测/误用代码搜索"的问题：
+/// 之前 session_search 只在 Context Recovery 段被提及，且场景限定为
+/// "压缩后找回"，对"跨会话回忆"场景无引导，导致能力被埋没。
+///
+/// 放在 Decision Experience 段之后，与 Context Recovery / Decision Experience
+/// 共同构成"工具使用教程区"，且 session 内字节稳定，不影响 prompt cache。
+fn get_cross_session_recall_section() -> String {
+    "## Cross-Session Recall (跨会话回忆)\n\
+     You have access to `session_search`, which searches `.claw/history.db` — \
+     an FTS5 index that covers **ALL past sessions** (not just the current one). \
+     Every conversation turn is automatically mirrored there.\n\
+     \n\
+     When the user asks about PAST sessions, do NOT guess from current context \
+     or infer from retrieved documents. Instead:\n\
+     \n\
+     1. **\"上次做了什么\" / \"上次的任务\" / \"what did I do last time\" / \"continue from before\"** — \
+     call `session_search` with a query like `\"task\"`, `\"user\"`, or the specific topic. \
+     Read the top results to summarize what was done.\n\
+     2. **\"上次关于 X 的讨论\"** — call `session_search` with query `\"X\"`. \
+     FTS5 ranks by relevance; pick the top hits with the highest `rank` field.\n\
+     3. **\"上上次 / 上周\"** — call `session_search` with `top_k: 20` to widen the net.\n\
+     \n\
+     Also check the NOTEBOOK `<plan>` section (injected at the top of every turn): \
+     if the previous session refreshed it, it contains the last task's decisions, \
+     constraints, and progress — your fastest path to \"what was I doing\".\n\
+     \n\
+     Only if both NOTEBOOK `<plan>` is empty AND `session_search` returns no hits, \
+     tell the user you have no record of that session."
         .to_string()
 }
 

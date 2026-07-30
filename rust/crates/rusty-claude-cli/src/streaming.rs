@@ -22,7 +22,7 @@ use std::time::Duration;
 use api::{
     model_requires_reasoning_content_in_history, CacheControl, ContentBlockDelta,
     InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent, SystemBlock,
+    ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent, SystemBlock,
     SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
@@ -727,8 +727,6 @@ impl AnthropicRuntimeClient {
             }
         }
 
-        push_prompt_cache_record(&self.client, &mut events);
-
         if !saw_stop
             && events.iter().any(|event| {
                 matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
@@ -758,8 +756,7 @@ impl AnthropicRuntimeClient {
                 let msg = format_user_visible_api_error(&self.session_id, &error);
                 self.emit_stream_error(msg, false)
             })?;
-        let mut events = response_to_events(response, out)?;
-        push_prompt_cache_record(&self.client, &mut events);
+        let events = response_to_events(response, out)?;
         Ok(events)
     }
 }
@@ -1079,35 +1076,6 @@ pub(crate) fn response_to_events(
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
     events.push(AssistantEvent::MessageStop);
     Ok(events)
-}
-
-pub(crate) fn push_prompt_cache_record(
-    client: &ApiProviderClient,
-    events: &mut Vec<AssistantEvent>,
-) {
-    // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
-    // to the Anthropic variant and returns `None` for OpenAI-compat /
-    // xAI variants, which do not have a prompt cache. So this helper
-    // remains a no-op on non-Anthropic providers without any extra
-    // branching here.
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
-        }
-    }
-}
-
-pub(crate) fn prompt_cache_record_to_runtime_event(
-    record: api::PromptCacheRecord,
-) -> Option<PromptCacheEvent> {
-    let cache_break = record.cache_break?;
-    Some(PromptCacheEvent {
-        unexpected: cache_break.unexpected,
-        reason: cache_break.reason,
-        previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
-        current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
-        token_drop: cache_break.token_drop,
-    })
 }
 
 pub(crate) fn permission_policy(

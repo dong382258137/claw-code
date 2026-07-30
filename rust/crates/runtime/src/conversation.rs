@@ -1683,6 +1683,25 @@ where
                                 .to_string(),
                         );
                     }
+
+                    // 方案 C:跨会话 plan stale 检测。
+                    // 上一会话结束时通过 mark_plan_stale 写入标记文件,本会话
+                    // 首 turn 检测到则注入提醒,引导 LLM 调用 notebook_update
+                    // 把上一会话的任务摘要写入 <plan>,让本会话后续 turn 能看到。
+                    // 清除时机:LLM 成功调用 notebook_update 后由
+                    // execute_notebook_update 触发 clear_plan_stale。
+                    if crate::notebook::is_plan_stale(workspace_root) {
+                        system_split.dynamic_sections.push(
+                            "# 📝 New Session — NOTEBOOK <plan> Refresh Recommended\n\
+                             这是新会话的首个 turn,上一会话结束时标记了 <plan> 为 stale。\n\
+                             **请在处理完当前用户请求后,调用 `notebook_update` 工具**,\n\
+                             把上一会话的任务摘要写入 `<plan>` 段(若当前任务已变化):\n\
+                             - 本次会话的目标 / 关键决策 / 约束 / 进度\n\
+                             这样后续 turn 和下一会话能零延迟知道任务状态。\n\
+                             若当前任务与上一会话无关,可忽略此提醒。"
+                                .to_string(),
+                        );
+                    }
                 }
                 if let Some(assembler) = &self.context_assembler {
                     // 统一注入路径:把所有动态内容通过 assembler 收集。
@@ -2541,6 +2560,14 @@ where
         // record_turn_failed 处理,不在此触发 Stop(避免与失败信号竞争)。
         // 返回值不影响主流程,故意丢弃。
         let _ = self.hook_runner.run_stop("turn_completed");
+
+        // 方案 C:会话结束时标记 NOTEBOOK <plan> 为 stale。
+        // 下一会话首 turn 检测到此标记会注入"刷新 <plan>"提醒,引导 LLM
+        // 调用 notebook_update 把本次会话的任务摘要写入 <plan> 段,让下一会话
+        // 零延迟知道上次任务状态。失败静默忽略(非关键路径)。
+        if let Some(workspace_root) = &self.workspace_root {
+            crate::notebook::mark_plan_stale(workspace_root);
+        }
 
         // G9.1: SessionEnd lifecycle hook — turn 完全结束(含 nudge 等清理)后触发,
         // 让外部观察者(session 审计、状态持久化、清理逻辑等)感知会话结束。
@@ -3620,6 +3647,9 @@ where
         // 刷新提醒,清除 flag 避免重复提醒。失败时 LLM 会从返回消息看到错误
         // 并自行决定下一步,不需要继续提醒。
         self.notebook_refresh_pending = false;
+        // 方案 C:LLM 已响应 NOTEBOOK 刷新,清除跨会话 stale marker。
+        // 避免下一 turn / 下一会话重复提醒。
+        crate::notebook::clear_plan_stale(workspace_root);
         match result {
             Ok(message) => Ok(message),
             Err(error) => Ok(format!("notebook_update failed: {error}")),

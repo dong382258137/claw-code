@@ -309,213 +309,25 @@ pub(crate) fn run_doctor(
     Ok(())
 }
 
-/// `claw doctor --cache-stats`:扫描 `~/.claude/cache/prompt-cache/*/stats.json`,
-/// 跨 session 汇总 Cache Aligner 监控指标并输出。
+/// `claw doctor --cache-stats`:已废弃。
 ///
-/// 暴露两类指标:
-/// 1. `break_reasons` — 按原因分类的 cache break 计数(model/system_prompt/
-///    tool_definitions/message_payload/ttl_expiry/unknown)。`system_prompt_changed`
-///    和 `tool_definitions_changed` 占比高说明 static 区仍有动态值泄漏。
-/// 2. completion 缓存命中统计(hits/misses/writes)。
-///
-/// 若没有任何 session stats 文件,输出提示而非报错,以便首次运行时不打扰用户。
+/// 客户端 prompt cache(prompt_cache.rs)已移除。DeepSeek 服务端前缀缓存
+/// 的命中信息通过 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+/// 字段在每次 API 响应中返回,并由 TUI 状态栏实时显示,无需跨 session 汇总。
 fn run_doctor_cache_stats(
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use api::{CacheBreakReasons, PromptCacheStats};
-
-    // 与 prompt_cache.rs::base_cache_root() 保持一致,避免引入新 pub API。
-    let root = if let Some(config_home) = std::env::var_os("CLAUDE_CONFIG_HOME") {
-        PathBuf::from(config_home)
-            .join("cache")
-            .join("prompt-cache")
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home)
-            .join(".claude")
-            .join("cache")
-            .join("prompt-cache")
-    } else {
-        std::env::temp_dir().join("claude-prompt-cache")
-    };
-
-    let mut aggregated_breaks = CacheBreakReasons::default();
-    let mut aggregated_hits: u64 = 0;
-    let mut aggregated_misses: u64 = 0;
-    let mut aggregated_writes: u64 = 0;
-    let mut aggregated_creation_tokens: u64 = 0;
-    let mut aggregated_read_tokens: u64 = 0;
-    let mut aggregated_tracked_requests: u64 = 0;
-    let mut aggregated_unexpected_breaks: u64 = 0;
-    let mut aggregated_expected_invalidations: u64 = 0;
-    let mut session_count: u32 = 0;
-    let mut last_break_reason: Option<String> = None;
-
-    if root.exists() {
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            let stats_path = entry.path().join("stats.json");
-            if !stats_path.exists() {
-                continue;
-            }
-            let raw = match fs::read(&stats_path) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
-            let stats: PromptCacheStats = match serde_json::from_slice(&raw) {
-                Ok(s) => s,
-                Err(_) => continue, // 跳过损坏文件,不阻断汇总
-            };
-            session_count += 1;
-            aggregated_breaks.model_changed += stats.break_reasons.model_changed;
-            aggregated_breaks.system_prompt_changed += stats.break_reasons.system_prompt_changed;
-            aggregated_breaks.tool_definitions_changed +=
-                stats.break_reasons.tool_definitions_changed;
-            aggregated_breaks.message_payload_changed +=
-                stats.break_reasons.message_payload_changed;
-            aggregated_breaks.ttl_expiry += stats.break_reasons.ttl_expiry;
-            aggregated_breaks.unknown += stats.break_reasons.unknown;
-            aggregated_hits += stats.completion_cache_hits;
-            aggregated_misses += stats.completion_cache_misses;
-            aggregated_writes += stats.completion_cache_writes;
-            aggregated_creation_tokens += stats.total_cache_creation_input_tokens;
-            aggregated_read_tokens += stats.total_cache_read_input_tokens;
-            aggregated_tracked_requests += stats.tracked_requests;
-            aggregated_unexpected_breaks += stats.unexpected_cache_breaks;
-            aggregated_expected_invalidations += stats.expected_invalidations;
-            if let Some(reason) = stats.last_break_reason {
-                last_break_reason = Some(reason);
-            }
-        }
-    }
-
     match output_format {
         CliOutputFormat::Text => {
-            if session_count == 0 {
-                println!("Cache Aligner 监控:暂无 session stats 文件。");
-                println!("  提示:运行一次 `claw` 对话后,stats 会在退出时持久化到:");
-                println!("  {}", root.display());
-                return Ok(());
-            }
-            println!(
-                "Cache Aligner 监控(汇总 {} 个 session,根目录 {})",
-                session_count,
-                root.display()
-            );
-            println!();
-            println!("== Cache Break 原因分布 ==");
-            let total_breaks = aggregated_breaks.total();
-            println!("  总 break 事件:{}", total_breaks);
-            if total_breaks > 0 {
-                let pct = |n: u64| (n as f64 * 100.0 / total_breaks as f64).round() as u64;
-                println!(
-                    "    model_changed           : {:>5} ({:>3}%)",
-                    aggregated_breaks.model_changed,
-                    pct(aggregated_breaks.model_changed)
-                );
-                println!(
-                    "    system_prompt_changed   : {:>5} ({:>3}%)  ← Cache Aligner 关注项",
-                    aggregated_breaks.system_prompt_changed,
-                    pct(aggregated_breaks.system_prompt_changed)
-                );
-                println!(
-                    "    tool_definitions_changed: {:>5} ({:>3}%)  ← Cache Aligner 关注项",
-                    aggregated_breaks.tool_definitions_changed,
-                    pct(aggregated_breaks.tool_definitions_changed)
-                );
-                println!(
-                    "    message_payload_changed : {:>5} ({:>3}%)  (正常,每 turn 都变)",
-                    aggregated_breaks.message_payload_changed,
-                    pct(aggregated_breaks.message_payload_changed)
-                );
-                println!(
-                    "    ttl_expiry              : {:>5} ({:>3}%)  (provider 侧 TTL)",
-                    aggregated_breaks.ttl_expiry,
-                    pct(aggregated_breaks.ttl_expiry)
-                );
-                println!(
-                    "    unknown                 : {:>5} ({:>3}%)",
-                    aggregated_breaks.unknown,
-                    pct(aggregated_breaks.unknown)
-                );
-            }
-            println!();
-            println!("== Completion 缓存 ==");
-            println!("  hits   : {}", aggregated_hits);
-            println!("  misses : {}", aggregated_misses);
-            println!("  writes : {}", aggregated_writes);
-            let completion_total = aggregated_hits + aggregated_misses;
-            if completion_total > 0 {
-                let hit_rate =
-                    (aggregated_hits as f64 * 100.0 / completion_total as f64).round() as u64;
-                println!("  命中率 : {}%", hit_rate);
-            }
-            println!();
-            println!("== Token 流量 ==");
-            println!(
-                "  cache_creation_input_tokens : {}",
-                aggregated_creation_tokens
-            );
-            println!("  cache_read_input_tokens     : {}", aggregated_read_tokens);
-            println!(
-                "  tracked_requests            : {}",
-                aggregated_tracked_requests
-            );
-            println!(
-                "  unexpected_cache_breaks     : {}",
-                aggregated_unexpected_breaks
-            );
-            println!(
-                "  expected_invalidations       : {}",
-                aggregated_expected_invalidations
-            );
-            if let Some(reason) = last_break_reason {
-                println!("  last_break_reason           : {}", reason);
-            }
-            println!();
-            // 验收标准提示:system_prompt_changed + tool_definitions_changed 占比应 < 5%
-            let aligner_target = aggregated_breaks.system_prompt_changed
-                + aggregated_breaks.tool_definitions_changed;
-            if total_breaks > 0 && aligner_target * 20 > total_breaks {
-                // > 5% 时提示
-                println!(
-                    "⚠ Cache Aligner 关注项占比 {:.1}% > 5%,static 区可能仍有动态值泄漏",
-                    aligner_target as f64 * 100.0 / total_breaks as f64
-                );
-            } else if total_breaks > 0 {
-                println!(
-                    "✓ Cache Aligner 关注项占比 {:.1}% ≤ 5%,static 区缓存稳定",
-                    aligner_target as f64 * 100.0 / total_breaks as f64
-                );
-            }
+            println!("`--cache-stats` 已废弃:客户端 prompt cache 已移除。");
+            println!("  DeepSeek 服务端前缀缓存命中信息在每次 API 响应中返回,");
+            println!("  并由 TUI 状态栏实时显示(cache_read/cache_creation tokens)。");
         }
         CliOutputFormat::Json => {
-            let report = json!({
-                "session_count": session_count,
-                "cache_root": root.to_string_lossy(),
-                "break_reasons": {
-                    "total": aggregated_breaks.total(),
-                    "model_changed": aggregated_breaks.model_changed,
-                    "system_prompt_changed": aggregated_breaks.system_prompt_changed,
-                    "tool_definitions_changed": aggregated_breaks.tool_definitions_changed,
-                    "message_payload_changed": aggregated_breaks.message_payload_changed,
-                    "ttl_expiry": aggregated_breaks.ttl_expiry,
-                    "unknown": aggregated_breaks.unknown,
-                },
-                "completion_cache": {
-                    "hits": aggregated_hits,
-                    "misses": aggregated_misses,
-                    "writes": aggregated_writes,
-                },
-                "tokens": {
-                    "cache_creation_input_tokens": aggregated_creation_tokens,
-                    "cache_read_input_tokens": aggregated_read_tokens,
-                },
-                "tracked_requests": aggregated_tracked_requests,
-                "unexpected_cache_breaks": aggregated_unexpected_breaks,
-                "expected_invalidations": aggregated_expected_invalidations,
-                "last_break_reason": last_break_reason,
-            });
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "deprecated": true,
+                "reason": "client-side prompt cache removed; DeepSeek server-side prefix caching stats are shown per-response in TUI",
+            }))?);
         }
     }
     Ok(())

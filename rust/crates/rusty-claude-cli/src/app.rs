@@ -65,8 +65,8 @@ use crate::streaming::{
     build_system_blocks, collect_prompt_cache_events, collect_tool_results, collect_tool_uses,
     compact_tool_output_for_model, convert_messages, extract_system_messages, final_assistant_text,
     format_context_window_blocked_error, format_user_visible_api_error,
-    mark_last_tool_with_cache_control, permission_policy, prompt_cache_record_to_runtime_event,
-    push_output_block, push_prompt_cache_record, render_thinking_block_summary,
+    mark_last_tool_with_cache_control, permission_policy,
+    push_output_block, render_thinking_block_summary,
     request_ends_with_tool_result, response_to_events, AnthropicRuntimeClient, HookAbortMonitor,
     NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
 };
@@ -96,7 +96,7 @@ use crate::ultraplan::{
 use api::{
     detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
     model_token_limit, CacheControl, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    MessageRequest, MessageResponse, OutputContentBlock,
     ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock,
     SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };

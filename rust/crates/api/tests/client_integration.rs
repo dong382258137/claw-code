@@ -155,28 +155,6 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
 }
 
 #[tokio::test]
-#[ignore = "telemetry session tracer / anthropic-beta / with_extra_body_param surface was removed in the DeepSeek-only migration; the OpenAiCompatClient does not carry a SessionTracer or per-request beta list. Re-enable only if a DeepSeek-equivalent telemetry hook is reintroduced."]
-async fn send_message_applies_request_profile_and_records_telemetry() {
-    // Kept for migration audit trail. The original test asserted:
-    //   * anthropic-beta header accumulation (no longer applies — DeepSeek uses
-    //     an OpenAI-compatible wire shape with no beta headers).
-    //   * user-agent derived from ClientIdentity (OpenAiCompatClient does not
-    //     expose a with_client_identity builder).
-    //   * extra_body params merged onto the request body (still possible via
-    //     MessageRequest.extra_body, but the assertions below were tied to the
-    //     Anthropic client surface).
-    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-}
-
-#[tokio::test]
-#[ignore = "prompt cache token accounting (cache_creation_input_tokens / cache_read_input_tokens from Anthropic-style usage objects) was removed with the Anthropic client. DeepSeek cache semantics (prompt_cache_hit_tokens / prompt_cache_miss_tokens) are covered by openai_compat_integration.rs::openai_compat_reads_deepseek_native_cache_fields_*."]
-async fn send_message_parses_prompt_cache_token_usage_from_response() {
-    // Migration note: see openai_compat_integration.rs for the DeepSeek-equivalent
-    // cache-field parsing tests (non-streaming + streaming).
-    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-}
-
-#[tokio::test]
 async fn given_empty_usage_object_when_send_message_parses_response_then_usage_defaults_to_zero() {
     // given
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
@@ -499,18 +477,6 @@ async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter
         elapsed < Duration::from_secs(5),
         "retries should complete promptly, took {elapsed:?}"
     );
-}
-
-#[tokio::test]
-#[ignore = "local prompt cache (with_prompt_cache / prompt_cache_stats) was removed in the DeepSeek-only migration. DeepSeek exposes implicit prefix caching on the server side, so the client no longer maintains a completion cache."]
-async fn send_message_reuses_recent_completion_cache_entries() {
-    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-}
-
-#[tokio::test]
-#[ignore = "prompt cache break detection (with_prompt_cache(PromptCacheConfig{...})) was removed in the DeepSeek-only migration. See send_message_reuses_recent_completion_cache_entries ignore note."]
-async fn send_message_tracks_unexpected_prompt_cache_breaks() {
-    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
 }
 
 #[tokio::test]

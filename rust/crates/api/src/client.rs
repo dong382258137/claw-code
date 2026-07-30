@@ -1,5 +1,4 @@
 use crate::error::ApiError;
-use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
@@ -28,22 +27,6 @@ impl ProviderClient {
     #[must_use]
     pub const fn provider_kind(&self) -> ProviderKind {
         ProviderKind::DeepSeek
-    }
-
-    #[must_use]
-    pub fn with_prompt_cache(self, _prompt_cache: PromptCache) -> Self {
-        // DeepSeek OpenAI-compat client does not maintain a local prompt cache.
-        self
-    }
-
-    #[must_use]
-    pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
-        None
-    }
-
-    #[must_use]
-    pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
-        None
     }
 
     pub async fn send_message(

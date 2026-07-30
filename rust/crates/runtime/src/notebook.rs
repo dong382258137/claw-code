@@ -330,6 +330,46 @@ impl Notebook {
     }
 }
 
+/// 跨会话"plan 需刷新"标记文件名(相对于 workspace_root)。
+///
+/// 方案 C:会话结束时写入,下一会话首 turn 检测到则注入"刷新 `<plan>`"提醒,
+/// LLM 调用 `notebook_update` 后清除。修复"上一会话 `<plan>` 过时/为空导致
+/// 下一会话 AI 不知道上次任务"的问题。
+///
+/// 与 `notebook_refresh_pending`(turn 内 flag)的区别:此 marker 持久化到磁盘,
+/// 跨会话存活,专门用于会话边界信号传递。
+pub const PLAN_STALE_MARKER: &str = ".claw/.notebook_plan_stale";
+
+/// 标记 NOTEBOOK `<plan>` 段为 stale(会话结束时调用)。
+///
+/// 写入一个空标记文件 `.claw/.notebook_plan_stale`,下一会话首 turn 通过
+/// [`is_plan_stale`] 检测。失败静默忽略(非关键路径,最坏情况是下一会话
+/// 不提醒刷新,与现有行为一致)。
+pub fn mark_plan_stale(workspace_root: &Path) {
+    let path = workspace_root.join(PLAN_STALE_MARKER);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"");
+}
+
+/// 检测 NOTEBOOK `<plan>` 段是否被标记为 stale。
+///
+/// 返回 `true` 表示上一会话结束时标记了 stale,当前会话首 turn 应注入
+/// 刷新提醒。检测后**不自动删除** —— 删除时机由 `execute_notebook_update`
+/// 成功后触发(确认 LLM 已响应提醒)。
+pub fn is_plan_stale(workspace_root: &Path) -> bool {
+    workspace_root.join(PLAN_STALE_MARKER).exists()
+}
+
+/// 清除 plan stale 标记。
+///
+/// 在 LLM 成功调用 `notebook_update` 后调用,避免重复提醒。
+/// 失败静默忽略(最坏情况是下一 turn 多提醒一次)。
+pub fn clear_plan_stale(workspace_root: &Path) {
+    let _ = std::fs::remove_file(workspace_root.join(PLAN_STALE_MARKER));
+}
+
 /// NOTEBOOK 操作错误。
 #[derive(Debug)]
 pub enum NotebookError {

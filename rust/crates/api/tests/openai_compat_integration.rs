@@ -672,18 +672,6 @@ async fn openai_compatible_client_honors_http_proxy_for_requests() {
     );
 }
 
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
-#[ignore = "ProviderClient::Xai(_), XAI_API_KEY, XAI_BASE_URL, and OpenAiCompatConfig::xai() were removed in the DeepSeek-only migration. xAI provider dispatch is no longer reachable. DeepSeek provider dispatch is covered by client_integration.rs::provider_client_dispatches_deepseek_requests."]
-async fn provider_client_dispatches_xai_requests_from_env() {
-    // Migration audit stub. The original test verified that
-    // `ProviderClient::from_model("grok")` resolved to `ProviderClient::Xai(_)`
-    // and dispatched requests with `XAI_API_KEY` / `XAI_BASE_URL`. Both the
-    // enum variant and the xAI-specific env vars have been deleted; all models
-    // now route through the DeepSeek-only OpenAiCompatClient.
-    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedRequest {
     path: String,

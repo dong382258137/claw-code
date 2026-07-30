@@ -63,7 +63,7 @@ fn create_sample_request(message_count: usize) -> MessageRequest {
     }
 
     MessageRequest {
-        model: "gpt-4o".to_string(),
+        model: "deepseek-v4-pro".to_string(),
         max_tokens: 1024,
         messages,
         stream: false,
@@ -90,7 +90,7 @@ fn bench_translate_message(c: &mut Criterion) {
         BenchmarkId::new("text_only", "single"),
         &text_message,
         |b, msg| {
-            b.iter(|| translate_message(black_box(msg), black_box("gpt-4o")));
+            b.iter(|| translate_message(black_box(msg), black_box("deepseek-v4-pro")));
         },
     );
 
@@ -117,7 +117,7 @@ fn bench_translate_message(c: &mut Criterion) {
         BenchmarkId::new("assistant_with_tools", "2_tools"),
         &assistant_message,
         |b, msg| {
-            b.iter(|| translate_message(black_box(msg), black_box("gpt-4o")));
+            b.iter(|| translate_message(black_box(msg), black_box("deepseek-v4-pro")));
         },
     );
 
@@ -136,16 +136,16 @@ fn bench_translate_message(c: &mut Criterion) {
         BenchmarkId::new("tool_result", "single"),
         &tool_result_message,
         |b, msg| {
-            b.iter(|| translate_message(black_box(msg), black_box("gpt-4o")));
+            b.iter(|| translate_message(black_box(msg), black_box("deepseek-v4-pro")));
         },
     );
 
-    // Tool result for kimi model (is_error excluded)
+    // Tool result for deepseek flash model
     group.bench_with_input(
-        BenchmarkId::new("tool_result_kimi", "kimi-k2.5"),
+        BenchmarkId::new("tool_result_flash", "deepseek-v4-flash"),
         &tool_result_message,
         |b, msg| {
-            b.iter(|| translate_message(black_box(msg), black_box("kimi-k2.5")));
+            b.iter(|| translate_message(black_box(msg), black_box("deepseek-v4-flash")));
         },
     );
 
@@ -156,7 +156,7 @@ fn bench_translate_message(c: &mut Criterion) {
         BenchmarkId::new("large_text", "10kb"),
         &large_message,
         |b, msg| {
-            b.iter(|| translate_message(black_box(msg), black_box("gpt-4o")));
+            b.iter(|| translate_message(black_box(msg), black_box("deepseek-v4-pro")));
         },
     );
 
@@ -166,7 +166,7 @@ fn bench_translate_message(c: &mut Criterion) {
 /// Benchmark build_chat_completion_request with various message counts
 fn bench_build_request(c: &mut Criterion) {
     let mut group = c.benchmark_group("build_chat_completion_request");
-    let config = OpenAiCompatConfig::openai();
+    let config = OpenAiCompatConfig::deepseek();
 
     for message_count in [10, 50, 100].iter() {
         let request = create_sample_request(*message_count);
@@ -181,21 +181,21 @@ fn bench_build_request(c: &mut Criterion) {
 
     // Benchmark with reasoning model (tuning params stripped)
     let mut reasoning_request = create_sample_request(50);
-    reasoning_request.model = "o1-mini".to_string();
+    reasoning_request.model = "deepseek-r1".to_string();
     group.bench_with_input(
-        BenchmarkId::new("reasoning_model", "o1-mini"),
+        BenchmarkId::new("reasoning_model", "deepseek-r1"),
         &reasoning_request,
         |b, req| {
             b.iter(|| build_chat_completion_request(black_box(req), config.clone()));
         },
     );
 
-    // Benchmark with gpt-5 (max_completion_tokens)
-    let mut gpt5_request = create_sample_request(50);
-    gpt5_request.model = "gpt-5".to_string();
+    // Benchmark with deepseek-v4-pro
+    let mut pro_request = create_sample_request(50);
+    pro_request.model = "deepseek-v4-pro".to_string();
     group.bench_with_input(
-        BenchmarkId::new("gpt5", "gpt-5"),
-        &gpt5_request,
+        BenchmarkId::new("deepseek_pro", "deepseek-v4-pro"),
+        &pro_request,
         |b, req| {
             b.iter(|| build_chat_completion_request(black_box(req), config.clone()));
         },
@@ -298,13 +298,9 @@ fn bench_is_reasoning_model(c: &mut Criterion) {
     let mut group = c.benchmark_group("is_reasoning_model");
 
     let models = vec![
-        ("gpt-4o", false),
-        ("o1-mini", true),
-        ("o3", true),
-        ("grok-3", false),
-        ("grok-3-mini", true),
-        ("qwen/qwen-qwq-32b", true),
-        ("qwen/qwen-plus", false),
+        ("deepseek-v4-pro", false),
+        ("deepseek-v4-flash", false),
+        ("deepseek-r1", true),
     ];
 
     for (model, expected) in models {

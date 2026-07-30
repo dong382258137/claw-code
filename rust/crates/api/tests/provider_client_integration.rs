@@ -69,26 +69,6 @@ fn read_base_url_prefers_deepseek_env_override() {
     );
 }
 
-#[test]
-#[ignore = "from_model_with_anthropic_auth + AuthSource::ApiKey + ProviderKind::Anthropic were removed in the DeepSeek-only migration. DeepSeek auth is resolved internally via DEEPSEEK_API_KEY / OpenAiCompatClient::from_env, so there is no separate AuthSource surface to test."]
-fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
-    // Migration audit stub. The original test verified that
-    // `ProviderClient::from_model_with_anthropic_auth("claude-sonnet-4-6",
-    // Some(AuthSource::ApiKey("anthropic-test-key")))` would skip env lookup
-    // and return a `ProviderKind::Anthropic` client. Both the constructor and
-    // the enum variant no longer exist.
-}
-
-#[test]
-#[ignore = "ProviderKind::Xai and OpenAiCompatConfig::xai() were removed in the DeepSeek-only migration. xAI provider dispatch (XAI_API_KEY, read_xai_base_url, ProviderClient::Xai(_)) is no longer reachable."]
-fn provider_client_routes_grok_aliases_through_xai() {
-    // Migration audit stub. The original test verified that
-    // `ProviderClient::from_model("grok-mini")` resolved to
-    // `ProviderClient::Xai(_)` with `ProviderKind::Xai`. With the migration
-    // `detect_provider_kind` always returns `ProviderKind::DeepSeek` and the
-    // xAI-specific code paths have been deleted.
-}
-
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

@@ -45,9 +45,9 @@ fn main() {
 }
 
 async fn run_bridge(config: &ImBridgeConfig) -> Result<(), String> {
-    let model = std::env::var("ANTHROPIC_MODEL")
-        .or_else(|_| std::env::var("CLAUDEMODEL"))
-        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+    let model = std::env::var("DEEPSEEK_MODEL")
+        .or_else(|_| std::env::var("CLAW_MODEL"))
+        .unwrap_or_else(|_| "deepseek-v4-pro".to_string());
 
     tracing::info!("starting IM bridge with model: {model}");
 
