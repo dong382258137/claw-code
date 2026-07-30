@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1186,7 +1186,66 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      **Default rule**: prefer `worktree` for any multi-agent write task unless \
      you are certain the files do not overlap. A file conflict between two \
-     fork-mode agents can cause data loss."
+     fork-mode agents can cause data loss.\n\
+     \n\
+     ### Model Selection Guide (模型选择指南)\n\
+     \n\
+     When using `spawn_parallel_subagents` or `dispatch_subagent`, you MUST \
+     choose the appropriate model tier for each task based on its complexity. \
+     Each task can have a different model — pick the cheapest model that can \
+     reliably complete the task.\n\
+     \n\
+     | complexity | Task Type | Model Tier | Examples |\n\
+     |-----------|-----------|------------|----------|\n\
+     | `simple` | Read-only, search, format, single-file edit | **Budget** (flash/haiku/mini) | grep for symbols, read a file, run a test suite, format code |\n\
+     | `diagnostic` | Debugging, root-cause analysis, multi-file reasoning | **Flagship** (pro/opus/sonnet) | trace a bug across modules, analyze error chains, review a PR |\n\
+     | `architectural` | System design, refactor planning, cross-cutting changes | **Flagship** (pro/opus/sonnet) | design a new module, refactor error handling, plan migration |\n\
+     \n\
+     **Budget-tier models** (names containing `flash`, `haiku`, `mini`, `nano`) \
+     CANNOT handle `diagnostic` or `architectural` tasks — the capability check \
+     will reject them. Use them only for `simple` tasks.\n\
+     \n\
+     **Flagship-tier models** (names containing `pro`, `opus`, `sonnet`, `gpt-4.1`, \
+     `grok-3`, `o3`, `o4`) can handle any complexity, but cost 5-10x more. Do \
+     NOT use them for `simple` tasks — it wastes budget.\n\
+     \n\
+     ### Autonomous Task Decomposition Pattern\n\
+     \n\
+     When the user gives a high-level request, AUTOMATICALLY decompose it into \
+     sub-tasks with per-task model selection. Do NOT ask the user which model \
+     to use — decide yourself based on the task.\n\
+     \n\
+     **Example** — User: \"分析这三个模块的测试覆盖率并给出改进建议\"\n\
+     \n\
+     ```
+     spawn_parallel_subagents({\n\
+       \"tasks\": [\n\
+         {\"name\": \"analyze-A\", \"task\": \"分析模块 A 的测试覆盖率\", \"model\": \"deepseek-v4-flash\", \"complexity\": \"simple\"},\n\
+         {\"name\": \"analyze-B\", \"task\": \"分析模块 B 的测试覆盖率\", \"model\": \"deepseek-v4-flash\", \"complexity\": \"simple\"},\n\
+         {\"name\": \"analyze-C\", \"task\": \"分析模块 C 的测试覆盖率\", \"model\": \"deepseek-v4-flash\", \"complexity\": \"simple\"},\n\
+         {\"name\": \"synthesize\", \"task\": \"综合三份分析,给出架构级改进建议\", \"model\": \"deepseek-v4-pro\", \"complexity\": \"architectural\"}\n\
+       ],\n\
+       \"fail_fast\": \"off\"\n\
+     })\n\
+     ```\n\
+     \n\
+     **Key principle**: parallelizable simple tasks use Budget models; the \
+     final synthesis/judgment step uses a Flagship model. This cuts cost by \
+     5-10x while keeping quality.\n\
+     \n\
+     ### Model Selection Decision Tree\n\
+     \n\
+     ```\n\
+     Does the task need deep reasoning (debug/design/multi-file analysis)?\n\
+     ├─ No  → Budget model  (flash/haiku/mini)  + complexity=\"simple\"\n\
+     └─ Yes → Flagship model (pro/opus/sonnet)\n\
+              ├─ Root-cause / debugging?        → complexity=\"diagnostic\"\n\
+              └─ Design / refactor / planning?  → complexity=\"architectural\"\n\
+     ```\n\
+     \n\
+     **Default when unsure**: use the user's current main model (it is always \
+     Flagship-tier) rather than guessing. But prefer Budget for any task that \
+     is clearly read-only or single-file."
         .to_string()
 }
 
