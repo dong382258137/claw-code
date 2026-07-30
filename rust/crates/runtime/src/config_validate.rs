@@ -789,7 +789,7 @@ mod tests {
         // given — `_wizard` is written by the first-run wizard and must not
         // be rejected by the validator (source-control fix: tolerate `_`-prefixed
         // internal keys instead of stripping them after the wizard completes).
-        let source = r#"{"_wizard": {"provider": "anthropic"}, "model": "sonnet"}"#;
+        let source = r#"{"_wizard": {"provider": "deepseek"}, "model": "deepseek-v4-pro"}"#;
         let parsed = JsonValue::parse(source).expect("valid json");
         let object = parsed.as_object().expect("object");
 

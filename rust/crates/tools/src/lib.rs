@@ -4836,7 +4836,7 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_AGENT_MODEL: &str = "deepseek-v4-pro";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -9857,7 +9857,7 @@ mod tests {
                 prompt: "Do the work".to_string(),
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
-                model: Some("claude-sonnet-4-6".to_string()),
+                model: Some("deepseek-v4-pro".to_string()),
             complexity: None,
             },
             |job| {
@@ -11657,13 +11657,13 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        let original_deepseek = std::env::var_os("DEEPSEEK_API_KEY");
+        std::env::set_var("DEEPSEEK_API_KEY", "deepseek-test-key");
         let fallback_config = ProviderFallbackConfig::default();
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
+            "deepseek-v4-pro".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -11671,11 +11671,11 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 1);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[0].model, "deepseek-v4-pro");
 
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        match original_deepseek {
+            Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
+            None => std::env::remove_var("DEEPSEEK_API_KEY"),
         }
     }
 
@@ -11685,18 +11685,16 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::set_var("XAI_API_KEY", "xai-test-key");
+        let original_deepseek = std::env::var_os("DEEPSEEK_API_KEY");
+        std::env::set_var("DEEPSEEK_API_KEY", "deepseek-test-key");
         let fallback_config = ProviderFallbackConfig::new(
             None,
-            vec!["grok-3".to_string(), "grok-3-mini".to_string()],
+            vec!["deepseek-v4-flash".to_string(), "deepseek-chat".to_string()],
         );
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
+            "deepseek-v4-pro".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -11704,17 +11702,13 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 3);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-        assert_eq!(client.chain[1].model, "grok-3");
-        assert_eq!(client.chain[2].model, "grok-3-mini");
+        assert_eq!(client.chain[0].model, "deepseek-v4-pro");
+        assert_eq!(client.chain[1].model, "deepseek-v4-flash");
+        assert_eq!(client.chain[2].model, "deepseek-chat");
 
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        match original_xai {
-            Some(value) => std::env::set_var("XAI_API_KEY", value),
-            None => std::env::remove_var("XAI_API_KEY"),
+        match original_deepseek {
+            Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
+            None => std::env::remove_var("DEEPSEEK_API_KEY"),
         }
     }
 
@@ -11724,18 +11718,16 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::set_var("XAI_API_KEY", "xai-test-key");
+        let original_deepseek = std::env::var_os("DEEPSEEK_API_KEY");
+        std::env::set_var("DEEPSEEK_API_KEY", "deepseek-test-key");
         let fallback_config = ProviderFallbackConfig::new(
-            Some("grok-3".to_string()),
-            vec!["claude-sonnet-4-6".to_string()],
+            Some("deepseek-v4-pro".to_string()),
+            vec!["deepseek-v4-flash".to_string()],
         );
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-haiku-4-5-20251213".to_string(),
+            "deepseek-chat".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -11743,56 +11735,42 @@ printf 'pwsh:%s' "$1"
 
         // then
         assert_eq!(client.chain.len(), 2);
-        assert_eq!(client.chain[0].model, "grok-3");
-        assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[0].model, "deepseek-v4-pro");
+        assert_eq!(client.chain[1].model, "deepseek-v4-flash");
 
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        match original_xai {
-            Some(value) => std::env::set_var("XAI_API_KEY", value),
-            None => std::env::remove_var("XAI_API_KEY"),
+        match original_deepseek {
+            Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
+            None => std::env::remove_var("DEEPSEEK_API_KEY"),
         }
     }
 
     #[test]
     fn provider_runtime_client_chain_skips_fallbacks_missing_credentials() {
+        // DeepSeek 单 provider 下所有模型共用 DEEPSEEK_API_KEY：凭证缺失时主链即构建失败。
         // given
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::remove_var("XAI_API_KEY");
+        let original_deepseek = std::env::var_os("DEEPSEEK_API_KEY");
+        std::env::remove_var("DEEPSEEK_API_KEY");
         let fallback_config = ProviderFallbackConfig::new(
             None,
-            vec![
-                "grok-3".to_string(),
-                "claude-haiku-4-5-20251213".to_string(),
-            ],
+            vec!["deepseek-v4-flash".to_string(), "deepseek-chat".to_string()],
         );
 
         // when
-        let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
+        let result = ProviderRuntimeClient::new_with_fallback_config(
+            "deepseek-v4-pro".to_string(),
             BTreeSet::new(),
             &fallback_config,
-        )
-        .expect("chain construction should not fail when only some fallbacks are unavailable");
+        );
 
         // then
-        assert_eq!(client.chain.len(), 2);
-        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
+        assert!(result.is_err(), "chain construction should fail when DEEPSEEK_API_KEY is missing");
 
-        match original_anthropic {
-            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        if let Some(value) = original_xai {
-            std::env::set_var("XAI_API_KEY", value);
+        match original_deepseek {
+            Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
+            None => std::env::remove_var("DEEPSEEK_API_KEY"),
         }
     }
 

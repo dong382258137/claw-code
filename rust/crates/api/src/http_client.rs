@@ -171,7 +171,22 @@ pub fn build_http_client_with_opts(
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(timeout.connect_timeout)
-        .timeout(timeout.request_timeout);
+        .timeout(timeout.request_timeout)
+        // ── 连接池保活：防止长时间空闲后复用陈旧连接 ──
+        //
+        // 根因：reqwest 默认 pool_idle_timeout=90s 且不开 TCP keepalive。
+        // 长时间空闲后，连接池中的连接可能已被中间设备（NAT/防火墙/LB）
+        // 静默关闭，但客户端不知情。复用这种"看似存活但已被对端关闭"
+        // 的连接会导致 SSE 流式响应静默挂起，触发 60s INTER_EVENT_TIMEOUT，
+        // 最终 turn 以 error 结束。
+        //
+        // 修复：
+        // - pool_idle_timeout=60s：缩短空闲超时，主动清理闲置连接，
+        //   使下次请求强制建立新连接而非复用可能已失效的旧连接。
+        // - tcp_keepalive=30s：开启 TCP 层 keepalive 探测，主动检测
+        //   连接存活状态，让操作系统及时回收半开连接。
+        .pool_idle_timeout(Some(Duration::from_secs(60)))
+        .tcp_keepalive(Some(Duration::from_secs(30)));
 
     let no_proxy = config
         .no_proxy
@@ -469,5 +484,28 @@ mod tests {
             config.request_timeout > Duration::ZERO,
             "request_timeout must be non-zero"
         );
+    }
+
+    // ── 连接池保活配置测试 ──
+    // 防止"长时间空闲后复用陈旧连接导致 SSE 流挂起"的回归。
+
+    #[test]
+    fn build_http_client_succeeds_with_keepalive_config() {
+        // 验证添加 pool_idle_timeout 和 tcp_keepalive 后，
+        // client 仍能正常构建。
+        let config = ProxyConfig::default();
+        let result = build_http_client_with_opts(&config, &TimeoutConfig::default());
+        assert!(result.is_ok(), "build should succeed with keepalive config");
+    }
+
+    #[test]
+    fn build_http_client_with_keepalive_and_proxy() {
+        // 验证 keepalive 配置与代理配置兼容。
+        let config = ProxyConfig {
+            proxy_url: Some("http://proxy.internal:3128".to_string()),
+            ..ProxyConfig::default()
+        };
+        let result = build_http_client_with_opts(&config, &TimeoutConfig::default());
+        assert!(result.is_ok(), "build should succeed with keepalive + proxy");
     }
 }

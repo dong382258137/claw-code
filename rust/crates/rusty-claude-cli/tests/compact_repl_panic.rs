@@ -67,7 +67,7 @@ fn run_claw_repl(
     let mut child = command
         .current_dir(cwd)
         .env_clear()
-        .env("ANTHROPIC_API_KEY", "test-compact-repl-key")
+        .env("DEEPSEEK_API_KEY", "test-compact-repl-key")
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")

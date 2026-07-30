@@ -20,7 +20,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
         .current_dir(&temp_dir)
         .args([
             "--model",
-            "sonnet",
+            "pro",
             "--permission-mode",
             "read-only",
             "status",
@@ -32,7 +32,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Model            claude-sonnet-4-6"));
+    assert!(stdout.contains("Model            deepseek-v4-pro"));
     assert!(stdout.contains("Permission mode  read-only"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
@@ -196,9 +196,8 @@ fn doctor_command_runs_as_a_local_shell_entrypoint() {
     // when
     let output = command_in(&temp_dir)
         .env("CLAW_CONFIG_HOME", &config_home)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:9")
         .arg("doctor")
         .output()
         .expect("claw doctor should launch");
@@ -245,7 +244,7 @@ fn local_smoke_commands_do_not_require_live_credentials() {
             "unexpected stdout for {args:?}: {stdout}"
         );
         assert!(
-            !stderr.contains("missing Anthropic credentials")
+            !stderr.contains("missing DeepSeek credentials")
                 && !stderr.contains("auth_unavailable"),
             "local smoke command {args:?} should not require live credentials: {stderr}"
         );
@@ -266,17 +265,15 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
 
     let doctor_help = command_in(&temp_dir)
         .env("CLAW_CONFIG_HOME", &config_home)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:9")
         .args(["doctor", "--help"])
         .output()
         .expect("doctor help should launch");
     let status_help = command_in(&temp_dir)
         .env("CLAW_CONFIG_HOME", &config_home)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:9")
         .args(["status", "--help"])
         .output()
         .expect("status help should launch");
@@ -305,12 +302,11 @@ fn offline_command_in(cwd: &Path, config_home: &Path) -> Command {
     let mut command = command_in(cwd);
     command
         .env("CLAW_CONFIG_HOME", config_home)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("DEEPSEEK_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("XAI_API_KEY")
         .env_remove("DASHSCOPE_API_KEY")
-        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9");
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:9");
     command
 }
 

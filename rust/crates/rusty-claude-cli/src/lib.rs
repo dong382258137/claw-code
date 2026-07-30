@@ -51,10 +51,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
-    resolve_startup_auth_source, AnthropicClient, AuthSource, CacheControl, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
-    SystemBlock, SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    CacheControl, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use app::*;
@@ -88,8 +88,8 @@ use plugin_state::{
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, OutputVerbosity, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
+    check_base_commit, format_stale_base_warning, format_usd, load_system_prompt,
+    load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
     CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
     ConversationRuntime, HistoryIndex, McpServer, McpServerManager, McpServerSpec, McpTool,
@@ -122,9 +122,8 @@ use streaming::{
     format_context_window_blocked_error, format_user_visible_api_error,
     mark_last_tool_with_cache_control, permission_policy, prompt_cache_record_to_runtime_event,
     push_output_block, push_prompt_cache_record, render_thinking_block_summary,
-    request_ends_with_tool_result, resolve_cli_auth_source, resolve_cli_auth_source_for_cwd,
-    response_to_events, AnthropicRuntimeClient, HookAbortMonitor, NETWORK_ERROR_KEYWORDS,
-    POST_TOOL_STALL_TIMEOUT,
+    request_ends_with_tool_result, response_to_events, AnthropicRuntimeClient, HookAbortMonitor,
+    NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
 };
 use suggestion::{
     common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
@@ -153,7 +152,7 @@ use ultraplan::{
     InternalPromptProgressState, INTERNAL_PROGRESS_HEARTBEAT_INTERVAL,
 };
 
-pub const DEFAULT_MODEL: &str = "claude-opus-4-6";
+pub const DEFAULT_MODEL: &str = "deepseek-v4-pro";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
@@ -163,7 +162,7 @@ pub const DEFAULT_MODEL: &str = "claude-opus-4-6";
 pub enum ModelSource {
     /// Explicit `--model` / `--model=` CLI flag.
     Flag,
-    /// ANTHROPIC_MODEL environment variable (when no flag was passed).
+    /// CLAW_MODEL environment variable (when no flag was passed).
     Env,
     /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
     /// flag nor env set it).
@@ -225,7 +224,7 @@ impl ModelProvenance {
                 source: ModelSource::Flag,
             };
         }
-        if let Some(env_model) = env::var("ANTHROPIC_MODEL")
+        if let Some(env_model) = env::var("CLAW_MODEL")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -282,7 +281,7 @@ pub type AllowedToolSet = BTreeSet<String>;
 /// matching against the error messages produced throughout the CLI surface.
 pub fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
-    if message.contains("missing Anthropic credentials") {
+    if message.contains("missing DeepSeek credentials") {
         "missing_credentials"
     } else if message.contains("Manifest source files are missing") {
         "missing_manifests"
@@ -510,18 +509,6 @@ pub fn run_tui_repl_entry(
 #[cfg(feature = "full-tui")]
 fn inject_wizard_env_vars(settings: &runtime::WizardSettings) {
     match settings.provider.as_str() {
-        "anthropic" => {
-            std::env::set_var("ANTHROPIC_API_KEY", &settings.api_key);
-        }
-        "openai" => {
-            std::env::set_var("OPENAI_API_KEY", &settings.api_key);
-        }
-        "xai" => {
-            std::env::set_var("XAI_API_KEY", &settings.api_key);
-        }
-        "dashscope" => {
-            std::env::set_var("DASHSCOPE_API_KEY", &settings.api_key);
-        }
         "deepseek" => {
             std::env::set_var("DEEPSEEK_API_KEY", &settings.api_key);
         }
@@ -803,12 +790,10 @@ impl CliOutputFormat {
 }
 
 pub fn resolve_model_alias(model: &str) -> &str {
-    match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
-        _ => model,
-    }
+    // DeepSeek-only build: built-in aliases are resolved by the api crate's
+    // `api::resolve_model_alias` (e.g. "pro" -> "deepseek-v4-pro"). The CLI
+    // layer no longer maintains its own alias table.
+    model
 }
 
 /// Resolve a model name through user-defined config aliases first, then fall
@@ -823,22 +808,17 @@ pub fn resolve_model_alias_with_config(model: &str) -> String {
 }
 
 /// Validate model syntax at parse time.
-/// Accepts: known aliases (opus, sonnet, haiku) or provider/model pattern.
+/// Accepts: bare DeepSeek model names or provider/model pattern.
 /// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
 pub fn validate_model_syntax(model: &str) -> Result<(), String> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return Err("model string cannot be empty".to_string());
     }
-    // Known aliases are always valid
-    match trimmed {
-        "opus" | "sonnet" | "haiku" => return Ok(()),
-        _ => {}
-    }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
         return Err(format!(
-            "invalid model syntax: '{}' contains spaces. Use provider/model format or known alias",
+            "invalid model syntax: '{}' contains spaces. Use provider/model format or a known DeepSeek model name",
             trimmed
         ));
     }
@@ -848,29 +828,13 @@ pub fn validate_model_syntax(model: &str) -> Result<(), String> {
         // Bare model names that metadata_for_model can route to a provider
         // are valid without the `provider/` prefix. This includes:
         //   deepseek-v4-pro, deepseek-v4-flash, deepseek-chat, deepseek-reasoner
-        //   gpt-5.4, gpt-4.1-mini, qwen-plus, qwen-max, kimi-k2.5, grok-3, etc.
         if api::metadata_for_model(trimmed).is_some() {
             return Ok(());
         }
-        // #154: hint if the model looks like it belongs to a different provider
-        // #154: hint if the model looks like it belongs to a different provider
-        let mut err_msg = format!(
-            "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)",
+        let err_msg = format!(
+            "invalid model syntax: '{}'. Expected provider/model (e.g., deepseek/deepseek-v4-pro) or a known DeepSeek model name",
             trimmed
         );
-        if trimmed.starts_with("gpt-") || trimmed.starts_with("gpt_") {
-            err_msg.push_str("\nDid you mean `openai/");
-            err_msg.push_str(trimmed);
-            err_msg.push_str("`? (Requires OPENAI_API_KEY env var)");
-        } else if trimmed.starts_with("qwen") {
-            err_msg.push_str("\nDid you mean `qwen/");
-            err_msg.push_str(trimmed);
-            err_msg.push_str("`? (Requires DASHSCOPE_API_KEY env var)");
-        } else if trimmed.starts_with("grok") {
-            err_msg.push_str("\nDid you mean `xai/");
-            err_msg.push_str(trimmed);
-            err_msg.push_str("`? (Requires XAI_API_KEY env var)");
-        }
         return Err(err_msg);
     }
     Ok(())
@@ -967,7 +931,7 @@ pub fn resolve_repl_model(cli_model: String) -> String {
     if cli_model != DEFAULT_MODEL {
         return cli_model;
     }
-    if let Some(env_model) = env::var("ANTHROPIC_MODEL")
+    if let Some(env_model) = env::var("CLAW_MODEL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -985,30 +949,12 @@ pub fn resolve_repl_model(cli_model: String) -> String {
 /// Auto-detect the best available model based on which API keys are present
 /// in the environment or `.env` file.
 ///
-/// Checks providers in priority order:
-/// 1. Anthropic (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`)
-/// 2. DeepSeek (`DEEPSEEK_API_KEY`, falls back to `OPENAI_API_KEY`)
-/// 3. OpenAI (`OPENAI_API_KEY`)
-/// 4. xAI / Grok (`XAI_API_KEY`)
-/// 5. DashScope / Kimi-Qwen (`DASHSCOPE_API_KEY`)
-///
-/// Falls back to [`DEFAULT_MODEL`] when no API keys are found (connection
-/// will fail with a clear auth error at that point).
+/// DeepSeek-only build: checks `DEEPSEEK_API_KEY`. Falls back to
+/// [`DEFAULT_MODEL`] when no API key is found (connection will fail with a
+/// clear auth error at that point).
 fn detect_best_available_model() -> String {
-    if api::has_auth_from_env_or_saved().unwrap_or(false) {
-        return "claude-opus-4-6".to_string();
-    }
     if api::has_api_key("DEEPSEEK_API_KEY") {
         return "deepseek-v4-pro".to_string();
-    }
-    if api::has_api_key("OPENAI_API_KEY") {
-        return "openai/gpt-4.1-mini".to_string();
-    }
-    if api::has_api_key("XAI_API_KEY") {
-        return "grok-3".to_string();
-    }
-    if api::has_api_key("DASHSCOPE_API_KEY") {
-        return "kimi-k2.5".to_string();
     }
     DEFAULT_MODEL.to_string()
 }
@@ -1017,18 +963,12 @@ fn detect_best_available_model() -> String {
 /// environment or `.env` file. Used to skip the first-run wizard when the
 /// user has pre-configured keys (zero-config auto-bootstrap).
 fn any_api_key_available() -> bool {
-    api::has_auth_from_env_or_saved().unwrap_or(false)
-        || api::has_api_key("DEEPSEEK_API_KEY")
-        || api::has_api_key("OPENAI_API_KEY")
-        || api::has_api_key("XAI_API_KEY")
-        || api::has_api_key("DASHSCOPE_API_KEY")
+    api::has_api_key("DEEPSEEK_API_KEY")
 }
 
 pub fn provider_label(kind: ProviderKind) -> &'static str {
     match kind {
-        ProviderKind::Anthropic => "anthropic",
-        ProviderKind::Xai => "xai",
-        ProviderKind::OpenAi => "openai",
+        ProviderKind::DeepSeek => "deepseek",
     }
 }
 

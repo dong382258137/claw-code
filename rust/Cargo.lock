@@ -2524,10 +2524,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "mock-anthropic-service"
+name = "mock-deepseek-service"
 version = "2026.8.0"
 dependencies = [
- "api",
  "serde_json",
  "tokio",
 ]
@@ -3711,7 +3710,7 @@ dependencies = [
  "commands",
  "compat-harness",
  "crossterm",
- "mock-anthropic-service",
+ "mock-deepseek-service",
  "plugins",
  "pulldown-cmark",
  "ratatui",

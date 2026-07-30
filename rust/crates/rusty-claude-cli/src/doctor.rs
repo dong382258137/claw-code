@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use runtime::{
-    format_stale_base_warning, load_oauth_credentials, resolve_sandbox_status, BaseCommitState,
-    ConfigLoader, McpServer, McpServerSpec, McpTool, ProjectContext, TokenUsage,
+    format_stale_base_warning, resolve_sandbox_status, BaseCommitState, ConfigLoader, McpServer,
+    McpServerSpec, McpTool, ProjectContext, TokenUsage,
 };
 // Epic 3:policy_engine + green_contract 接入 doctor 作为 smoke test。
 // - PolicyEngine/LaneContext/PolicyAction 等通过 runtime 顶层 re-export 拿到
@@ -598,115 +598,38 @@ pub(crate) fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn check_auth_health() -> DiagnosticCheck {
-    let api_key_present = env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
-    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
+    let api_key_present = env::var("DEEPSEEK_API_KEY")
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
     let env_details = format!(
-        "环境变量          api_key={} auth_token={}",
+        "环境变量          DEEPSEEK_API_KEY={}",
         if api_key_present {
-            "已配置"
-        } else {
-            "缺失"
-        },
-        if auth_token_present {
             "已配置"
         } else {
             "缺失"
         }
     );
 
-    match load_oauth_credentials() {
-        Ok(Some(token_set)) => DiagnosticCheck::new(
-            "Auth",
-            if api_key_present || auth_token_present {
-                DiagnosticLevel::Ok
-            } else {
-                DiagnosticLevel::Warn
-            },
-            if api_key_present || auth_token_present {
-                "支持的认证环境变量已配置;旧的已保存 OAuth 凭证将被忽略"
-            } else {
-                "存在旧的已保存 OAuth 凭证,但不再支持"
-            },
-        )
-        .with_details(vec![
-            env_details,
-            format!(
-                "旧版 OAuth        expires_at={} refresh_token={} scopes={}",
-                token_set
-                    .expires_at
-                    .map_or_else(|| "<无>".to_string(), |value| value.to_string()),
-                if token_set.refresh_token.is_some() {
-                    "已配置"
-                } else {
-                    "缺失"
-                },
-                if token_set.scopes.is_empty() {
-                    "<无>".to_string()
-                } else {
-                    token_set.scopes.join(",")
-                }
-            ),
-            "建议操作          设置 ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN;`claw login` 已移除"
-                .to_string(),
-        ])
-        .with_data(Map::from_iter([
-            ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), json!(true)),
-            (
-                "legacy_saved_oauth_expires_at".to_string(),
-                json!(token_set.expires_at),
-            ),
-            (
-                "legacy_refresh_token_present".to_string(),
-                json!(token_set.refresh_token.is_some()),
-            ),
-            ("legacy_scopes".to_string(), json!(token_set.scopes)),
-        ])),
-        Ok(None) => DiagnosticCheck::new(
-            "Auth",
-            if api_key_present || auth_token_present {
-                DiagnosticLevel::Ok
-            } else {
-                DiagnosticLevel::Warn
-            },
-            if api_key_present || auth_token_present {
-                "支持的认证环境变量已配置"
-            } else {
-                "未找到支持的认证环境变量"
-            },
-        )
-        .with_details(vec![env_details])
-        .with_data(Map::from_iter([
-            ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), json!(false)),
-            ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
-            ("legacy_refresh_token_present".to_string(), json!(false)),
-            ("legacy_scopes".to_string(), json!(Vec::<String>::new())),
-        ])),
-        Err(error) => DiagnosticCheck::new(
-            "Auth",
-            DiagnosticLevel::Fail,
-            format!("检查旧版已保存凭证失败: {error}"),
-        )
-        .with_data(Map::from_iter([
-            ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
-            ("legacy_saved_oauth_present".to_string(), Value::Null),
-            ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
-            ("legacy_refresh_token_present".to_string(), Value::Null),
-            ("legacy_scopes".to_string(), Value::Null),
-            (
-                "legacy_saved_oauth_error".to_string(),
-                json!(error.to_string()),
-            ),
-        ])),
-    }
+    DiagnosticCheck::new(
+        "Auth",
+        if api_key_present {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warn
+        },
+        if api_key_present {
+            "DEEPSEEK_API_KEY 已配置"
+        } else {
+            "未找到 DEEPSEEK_API_KEY 环境变量"
+        },
+    )
+    .with_details(vec![
+        env_details,
+        "建议操作          设置 DEEPSEEK_API_KEY 环境变量".to_string(),
+    ])
+    .with_data(Map::from_iter([
+        ("api_key_present".to_string(), json!(api_key_present)),
+    ]))
 }
 
 pub(crate) fn check_config_health(

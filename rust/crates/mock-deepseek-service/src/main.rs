@@ -1,6 +1,6 @@
 use std::env;
 
-use mock_anthropic_service::MockAnthropicService;
+use mock_deepseek_service::MockDeepSeekService;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bind_addr = flag[7..].to_string();
             }
             "--help" | "-h" => {
-                println!("Usage: mock-anthropic-service [--bind HOST:PORT]");
+                println!("Usage: mock-deepseek-service [--bind HOST:PORT]");
                 return Ok(());
             }
             other => {
@@ -26,8 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let server = MockAnthropicService::spawn_on(&bind_addr).await?;
-    println!("MOCK_ANTHROPIC_BASE_URL={}", server.base_url());
+    let server = MockDeepSeekService::spawn_on(&bind_addr).await?;
+    println!("MOCK_DEEPSEEK_BASE_URL={}", server.base_url());
     tokio::signal::ctrl_c().await?;
     drop(server);
     Ok(())

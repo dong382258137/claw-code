@@ -1,4 +1,4 @@
-﻿use std::collections::BTreeMap;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -582,7 +582,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "api-key",
         aliases: &[],
-        summary: "Show or set the Anthropic API key",
+        summary: "Show or set the DeepSeek API key",
         argument_hint: Some("[key]"),
         resume_supported: false,
     },
@@ -1496,7 +1496,7 @@ pub fn validate_slash_command_input(
         }
         "login" | "logout" => {
             return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
+                "This auth flow was removed. Set DEEPSEEK_API_KEY instead.",
                 command,
                 "",
             ));
@@ -4891,9 +4891,9 @@ mod tests {
             Ok(Some(SlashCommand::DebugToolCall))
         );
         assert_eq!(
-            SlashCommand::parse("/model claude-opus"),
+            SlashCommand::parse("/model deepseek-v4-pro"),
             Ok(Some(SlashCommand::Model {
-                model: Some("claude-opus".to_string()),
+                model: Some("deepseek-v4-pro".to_string()),
             }))
         );
         assert_eq!(
@@ -5294,9 +5294,8 @@ mod tests {
     #[test]
     fn removed_login_and_logout_commands_report_env_auth_guidance() {
         let login_error = parse_error_message("/login");
-        assert!(login_error.contains("ANTHROPIC_API_KEY"));
-        let logout_error = parse_error_message("/logout");
-        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(login_error.contains("DEEPSEEK_API_KEY"));
+        // login 与 logout 共用同一引导文案，logout 不再单独断言 ANTHROPIC_AUTH_TOKEN。
     }
 
     #[test]

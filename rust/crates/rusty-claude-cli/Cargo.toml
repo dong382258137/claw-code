@@ -57,7 +57,7 @@ missing_panics_doc = "allow"
 missing_errors_doc = "allow"
 
 [dev-dependencies]
-mock-anthropic-service = { path = "../mock-anthropic-service" }
+mock-deepseek-service = { path = "../mock-deepseek-service" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 [features]

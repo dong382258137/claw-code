@@ -9,8 +9,8 @@
 //! 本模块:
 //! - [`LlmBridge`] 共享桥接:同步 trait → async LLM 调用,与 `AnthropicRuntimeClient::stream`
 //!   (streaming.rs) 同样的 `runtime.block_on(async { ... })` 模式
-//! - [`AnthropicJudgeClient`] impl `JudgeClient`,用于 `LlmJudgeGate::with_client`
-//! - [`AnthropicDecisionExtractorClient`] impl `DecisionExtractorClient`,用于
+//! - [`DeepSeekJudgeClient`] impl `JudgeClient`,用于 `LlmJudgeGate::with_client`
+//! - [`DeepSeekDecisionExtractorClient`] impl `DecisionExtractorClient`,用于
 //!   `set_global_decision_extractor_client`
 //!
 //! # 调用栈安全性
@@ -64,7 +64,7 @@ impl LlmBridge {
     /// 构造桥接。
     ///
     /// # 参数
-    /// - `model`:LLM 模型名(如 "deepseek-v4-pro" / "claude-sonnet-4-6")
+    /// - `model`:LLM 模型名(如 "deepseek-v4-pro" / "deepseek-v4-flash")
     /// - `max_tokens`:单次响应上限。`None` 时用 `api::max_tokens_for_model` 默认值
     ///
     /// # 错误
@@ -146,19 +146,19 @@ impl LlmBridge {
 ///
 /// # 构造
 /// ```ignore
-/// use rusty_claude_cli::llm_clients::AnthropicJudgeClient;
+/// use rusty_claude_cli::llm_clients::DeepSeekJudgeClient;
 /// use std::sync::Arc;
 /// use runtime::multi_agent::validation::{JudgeClient, LlmJudgeGate};
 ///
-/// let judge: Arc<dyn JudgeClient> = Arc::new(AnthropicJudgeClient::new("claude-sonnet-4-6", None)?);
-/// let gate = LlmJudgeGate::diagnostic_default("claude-sonnet-4-6", workspace_root)
+/// let judge: Arc<dyn JudgeClient> = Arc::new(DeepSeekJudgeClient::new("deepseek-v4-pro", None)?);
+/// let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", workspace_root)
 ///     .with_client(judge);
 /// ```
-pub struct AnthropicJudgeClient {
+pub struct DeepSeekJudgeClient {
     bridge: LlmBridge,
 }
 
-impl AnthropicJudgeClient {
+impl DeepSeekJudgeClient {
     /// 构造 judge client。
     ///
     /// # 参数
@@ -171,7 +171,7 @@ impl AnthropicJudgeClient {
     }
 }
 
-impl JudgeClient for AnthropicJudgeClient {
+impl JudgeClient for DeepSeekJudgeClient {
     fn judge(&self, prompt: &str) -> Result<String, String> {
         self.bridge.call(prompt)
     }
@@ -186,19 +186,19 @@ impl JudgeClient for AnthropicJudgeClient {
 ///
 /// # 构造
 /// ```ignore
-/// use rusty_claude_cli::llm_clients::AnthropicDecisionExtractorClient;
+/// use rusty_claude_cli::llm_clients::DeepSeekDecisionExtractorClient;
 /// use std::sync::Arc;
 /// use runtime::decision_log::{DecisionExtractorClient, set_global_decision_extractor_client};
 ///
 /// let extractor: Arc<dyn DecisionExtractorClient> =
-///     Arc::new(AnthropicDecisionExtractorClient::new("deepseek-v4-flash", None)?);
+///     Arc::new(DeepSeekDecisionExtractorClient::new("deepseek-v4-flash", None)?);
 /// set_global_decision_extractor_client(extractor);
 /// ```
-pub struct AnthropicDecisionExtractorClient {
+pub struct DeepSeekDecisionExtractorClient {
     bridge: LlmBridge,
 }
 
-impl AnthropicDecisionExtractorClient {
+impl DeepSeekDecisionExtractorClient {
     /// 构造决策提取 client。
     ///
     /// # 参数
@@ -211,7 +211,7 @@ impl AnthropicDecisionExtractorClient {
     }
 }
 
-impl DecisionExtractorClient for AnthropicDecisionExtractorClient {
+impl DecisionExtractorClient for DeepSeekDecisionExtractorClient {
     fn extract(&self, prompt: &str) -> Result<String, String> {
         self.bridge.call(prompt)
     }
@@ -228,15 +228,8 @@ mod tests {
     /// 此时 `call` 会尝试真实网络调用,我们不测 `call` 以避免 flaky。
     #[test]
     fn llm_bridge_new_returns_err_on_missing_auth() {
-        // 临时移除所有 LLM auth 环境变量,模拟无 auth 场景
-        let keys = [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "OPENAI_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "DASHSCOPE_API_KEY",
-            "XAI_API_KEY",
-        ];
+        // 临时移除 DeepSeek auth 环境变量,模拟无 auth 场景
+        let keys = ["DEEPSEEK_API_KEY"];
         let saved: Vec<(String, Option<String>)> = keys
             .iter()
             .map(|k| (k.to_string(), std::env::var(k).ok()))
@@ -245,8 +238,8 @@ mod tests {
             std::env::remove_var(k);
         }
 
-        // 用一个明确不存在的模型名,强制走 Anthropic provider(读 ANTHROPIC_API_KEY)
-        let result = LlmBridge::new("claude-sonnet-4-6", None);
+        // DeepSeek-only build: ProviderClient::from_model 读 DEEPSEEK_API_KEY
+        let result = LlmBridge::new("deepseek-v4-pro", None);
 
         // 恢复环境变量
         for (k, v) in &saved {
@@ -270,33 +263,33 @@ mod tests {
         assert!(result.is_err(), "expected Err when no auth available");
     }
 
-    /// 验证 `AnthropicJudgeClient` 可构造并实现 `JudgeClient` trait。
+    /// 验证 `DeepSeekJudgeClient` 可构造并实现 `JudgeClient` trait。
     #[test]
-    fn anthropic_judge_client_implements_judge_client() {
+    fn deepseek_judge_client_implements_judge_client() {
         // 只验证类型trait 约束,不实际构造(避免依赖 API key)
         fn assert_judge_client<T: JudgeClient>() {}
-        assert_judge_client::<AnthropicJudgeClient>();
+        assert_judge_client::<DeepSeekJudgeClient>();
     }
 
-    /// 验证 `AnthropicDecisionExtractorClient` 可构造并实现 `DecisionExtractorClient` trait。
+    /// 验证 `DeepSeekDecisionExtractorClient` 可构造并实现 `DecisionExtractorClient` trait。
     #[test]
-    fn anthropic_decision_extractor_client_implements_trait() {
+    fn deepseek_decision_extractor_client_implements_trait() {
         fn assert_extractor<T: DecisionExtractorClient>() {}
-        assert_extractor::<AnthropicDecisionExtractorClient>();
+        assert_extractor::<DeepSeekDecisionExtractorClient>();
     }
 
-    /// 验证 `Arc<dyn JudgeClient>` 可从 `AnthropicJudgeClient` 构造
+    /// 验证 `Arc<dyn JudgeClient>` 可从 `DeepSeekJudgeClient` 构造
     /// (验证 v-table + Send + Sync 约束满足)。
     #[test]
-    fn anthropic_judge_client_can_be_arc_dyn() {
+    fn deepseek_judge_client_can_be_arc_dyn() {
         // 不实际构造(避免依赖 API key),只验证类型转换
         fn assert_arc_dyn(_x: std::sync::Arc<dyn JudgeClient>) {}
         // 若编译通过,说明类型约束满足
     }
 
-    /// 验证 `Arc<dyn DecisionExtractorClient>` 可从 `AnthropicDecisionExtractorClient` 构造。
+    /// 验证 `Arc<dyn DecisionExtractorClient>` 可从 `DeepSeekDecisionExtractorClient` 构造。
     #[test]
-    fn anthropic_decision_extractor_client_can_be_arc_dyn() {
+    fn deepseek_decision_extractor_client_can_be_arc_dyn() {
         fn assert_arc_dyn(_x: std::sync::Arc<dyn DecisionExtractorClient>) {}
     }
 }

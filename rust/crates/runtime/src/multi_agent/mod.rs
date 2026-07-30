@@ -1130,11 +1130,7 @@ pub struct ModelUpgrade {
 
 /// 模型升级路径查询 — Multi-Agent Hardening §4.5 retry loop 调用。
 ///
-/// v2 Phase 3(2026-07-27):扩展为多 provider 升级链,覆盖:
-/// - DeepSeek 链:`deepseek-v4-flash → deepseek-v4-pro`
-/// - Anthropic 链:`haiku → sonnet → opus`(两跳)
-/// - OpenAI 链:`gpt-4.1-mini → gpt-4.1`(gpt-4.1 已是 Flagship,不再升到 o3)
-/// - xAI 链:`grok-3-mini → grok-3`
+/// DeepSeek 升级链:`deepseek-v4-flash → deepseek-v4-pro`
 ///
 /// 完整的 `upgrade_map` 配置化在 `api::providers::model_tier`(运行时可访问),
 /// 本函数仅作为 runtime 内部的最小可用回退,避免循环依赖。
@@ -1148,10 +1144,6 @@ pub struct ModelUpgrade {
 /// | 当前模型 | 目标模型 | cost_multiplier | 链 |
 /// |---|---|---|---|
 /// | deepseek-v4-flash | deepseek-v4-pro | 10.0 | DeepSeek |
-/// | haiku / claude-haiku-* | claude-sonnet-4-6 | 5.0 | Anthropic 第1跳 |
-/// | sonnet / claude-sonnet-* | claude-opus-4-6 | 15.0 | Anthropic 第2跳 |
-/// | gpt-4.1-mini | gpt-4.1 | 5.0 | OpenAI 单跳 |
-/// | grok-3-mini / grok-mini | grok-3 | 8.0 | xAI 单跳 |
 #[must_use]
 pub fn upgrade_model_for_subagent(current_model: &str) -> Option<ModelUpgrade> {
     let lower = current_model.to_ascii_lowercase();
@@ -1159,15 +1151,11 @@ pub fn upgrade_model_for_subagent(current_model: &str) -> Option<ModelUpgrade> {
     // 已是旗舰:不再升级
     // 覆盖所有 Flagship 模式(与 api::model_tier::tier_for_model 保持一致):
     // - `*-pro` 后缀(deepseek-v4-pro 等)
-    // - `opus`(claude-opus-4-6 / opus)
-    // - `gpt-4.1` 开头且不含 mini
-    // - `grok-3` 严格相等(不含 mini/flash)
-    // - `o3` / `o4` 开头且不含 mini/nano
     if is_flagship_model(&lower) {
         return None;
     }
 
-    // 多 provider 升级链(按 provider 分支)
+    // DeepSeek 升级链
     upgrade_lookup(&lower)
 }
 
@@ -1176,17 +1164,11 @@ pub fn upgrade_model_for_subagent(current_model: &str) -> Option<ModelUpgrade> {
 /// runtime crate 不能依赖 api crate,因此本地复制判断逻辑。
 /// 若 api crate 的 `tier_for_model` 修改,本函数需同步更新。
 fn is_flagship_model(lower: &str) -> bool {
-    // 旗舰:opus / gpt-4.1(非 mini) / grok-3(严格相等) / o3 / o4(非 mini/nano) / *-pro
-    lower.contains("opus")
-        || (lower.starts_with("gpt-4.1") && !lower.contains("mini"))
-        || lower == "grok-3"
-        || ((lower.starts_with("o3") || lower.starts_with("o4"))
-            && !lower.contains("mini")
-            && !lower.contains("nano"))
-        || lower.ends_with("-pro")
+    // 旗舰:*-pro 后缀(DeepSeek 系列旗舰)
+    lower.ends_with("-pro")
 }
 
-/// 升级表查询 — 按 provider 分支匹配。
+/// 升级表查询 — DeepSeek 系列升级路径。
 ///
 /// 返回 `Some(ModelUpgrade)` 若命中升级路径,`None` 若无升级路径或已是旗舰。
 fn upgrade_lookup(lower: &str) -> Option<ModelUpgrade> {
@@ -1195,42 +1177,6 @@ fn upgrade_lookup(lower: &str) -> Option<ModelUpgrade> {
         return Some(ModelUpgrade {
             target_model: "deepseek-v4-pro".to_string(),
             cost_multiplier: 10.0,
-        });
-    }
-
-    // Anthropic 链:haiku → sonnet → opus
-    // 第1跳:haiku → sonnet
-    if lower.contains("haiku") {
-        return Some(ModelUpgrade {
-            target_model: "claude-sonnet-4-6".to_string(),
-            cost_multiplier: 5.0,
-        });
-    }
-    // 第2跳:sonnet → opus(注意:必须排除 haiku,避免 haiku 误匹配 sonnet 链)
-    if lower.contains("sonnet") && !lower.contains("haiku") {
-        return Some(ModelUpgrade {
-            target_model: "claude-opus-4-6".to_string(),
-            cost_multiplier: 15.0,
-        });
-    }
-
-    // OpenAI 链:gpt-4.1-mini → gpt-4.1 → o3
-    // 第1跳:gpt-4.1-mini → gpt-4.1
-    if lower.contains("gpt-4.1-mini") || lower == "gpt-4.1-mini" {
-        return Some(ModelUpgrade {
-            target_model: "gpt-4.1".to_string(),
-            cost_multiplier: 5.0,
-        });
-    }
-    // 第2跳:gpt-4.1(非 mini)→ o3
-    // 注意:is_flagship_model 已把 gpt-4.1 识别为旗舰,这里不会命中
-    // 但为了显式文档化,保留注释:gpt-4.1 → o3 的升级路径在 is_flagship_model 中被拦截
-
-    // xAI 链:grok-3-mini → grok-3
-    if lower.contains("grok-3-mini") || lower.contains("grok-mini") {
-        return Some(ModelUpgrade {
-            target_model: "grok-3".to_string(),
-            cost_multiplier: 8.0,
         });
     }
 
@@ -2074,119 +2020,5 @@ mod tests {
     #[test]
     fn upgrade_model_for_subagent_unknown_returns_none() {
         assert!(upgrade_model_for_subagent("unknown-model").is_none());
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — Anthropic haiku → sonnet
-    #[test]
-    fn upgrade_anthropic_haiku_to_sonnet() {
-        let upgrade = upgrade_model_for_subagent("claude-haiku-4-5-20251213")
-            .expect("haiku should upgrade to sonnet");
-        assert_eq!(upgrade.target_model, "claude-sonnet-4-6");
-        assert_eq!(upgrade.cost_multiplier, 5.0);
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — Anthropic 短别名 haiku → sonnet
-    #[test]
-    fn upgrade_anthropic_haiku_alias_to_sonnet() {
-        let upgrade =
-            upgrade_model_for_subagent("haiku").expect("haiku alias should upgrade to sonnet");
-        assert_eq!(upgrade.target_model, "claude-sonnet-4-6");
-        assert_eq!(upgrade.cost_multiplier, 5.0);
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — Anthropic sonnet → opus(第2跳)
-    #[test]
-    fn upgrade_anthropic_sonnet_to_opus() {
-        let upgrade = upgrade_model_for_subagent("claude-sonnet-4-6")
-            .expect("sonnet should upgrade to opus");
-        assert_eq!(upgrade.target_model, "claude-opus-4-6");
-        assert_eq!(upgrade.cost_multiplier, 15.0);
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — Anthropic 短别名 sonnet → opus
-    #[test]
-    fn upgrade_anthropic_sonnet_alias_to_opus() {
-        let upgrade =
-            upgrade_model_for_subagent("sonnet").expect("sonnet alias should upgrade to opus");
-        assert_eq!(upgrade.target_model, "claude-opus-4-6");
-        assert_eq!(upgrade.cost_multiplier, 15.0);
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — Anthropic opus 已旗舰,不升级
-    #[test]
-    fn upgrade_anthropic_opus_returns_none() {
-        assert!(upgrade_model_for_subagent("claude-opus-4-6").is_none());
-        assert!(upgrade_model_for_subagent("opus").is_none());
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — OpenAI gpt-4.1-mini → gpt-4.1
-    #[test]
-    fn upgrade_openai_mini_to_gpt41() {
-        let upgrade = upgrade_model_for_subagent("gpt-4.1-mini")
-            .expect("gpt-4.1-mini should upgrade to gpt-4.1");
-        assert_eq!(upgrade.target_model, "gpt-4.1");
-        assert_eq!(upgrade.cost_multiplier, 5.0);
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — OpenAI gpt-4.1 已旗舰,不升级到 o3
-    #[test]
-    fn upgrade_openai_gpt41_returns_none() {
-        assert!(upgrade_model_for_subagent("gpt-4.1").is_none());
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — xAI grok-3-mini → grok-3
-    #[test]
-    fn upgrade_xai_grok_mini_to_grok3() {
-        let upgrade = upgrade_model_for_subagent("grok-3-mini")
-            .expect("grok-3-mini should upgrade to grok-3");
-        assert_eq!(upgrade.target_model, "grok-3");
-        assert_eq!(upgrade.cost_multiplier, 8.0);
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — xAI grok-3 已旗舰,不升级
-    #[test]
-    fn upgrade_xai_grok3_returns_none() {
-        assert!(upgrade_model_for_subagent("grok-3").is_none());
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — o3 / o4 已旗舰,不升级
-    #[test]
-    fn upgrade_o_series_returns_none() {
-        assert!(upgrade_model_for_subagent("o3").is_none());
-        assert!(upgrade_model_for_subagent("o4").is_none());
-    }
-
-    /// v2 Phase 3 多 provider 升级链 — o4-mini 不是旗舰(Budget),但目前无升级路径
-    #[test]
-    fn upgrade_o4_mini_returns_none_no_path() {
-        // o4-mini 是 Budget 层级,但当前升级表没有定义 o4-mini → ? 的路径
-        // 返回 None 表示"无升级路径"(而非"已是旗舰")
-        assert!(upgrade_model_for_subagent("o4-mini").is_none());
-    }
-
-    /// v2 Phase 3 bug 回归:opus 不含 -pro 后缀,旧逻辑会误判为非旗舰无限升级
-    #[test]
-    fn regression_opus_not_misjudged_as_non_flagship() {
-        // 旧逻辑只检查 -pro 后缀,opus / gpt-4.1 / grok-3 / o3 都不含 -pro
-        // 新逻辑通过 is_flagship_model 正确识别这些 Flagship 模型
-        assert!(upgrade_model_for_subagent("claude-opus-4-6").is_none());
-        assert!(upgrade_model_for_subagent("gpt-4.1").is_none());
-        assert!(upgrade_model_for_subagent("grok-3").is_none());
-        assert!(upgrade_model_for_subagent("o3").is_none());
-        assert!(upgrade_model_for_subagent("deepseek-v4-pro").is_none());
-    }
-
-    /// v2 Phase 3 Anthropic 两跳链:end-to-end haiku → sonnet → opus
-    #[test]
-    fn anthropic_two_hop_chain_haiku_to_opus() {
-        // 第1跳:haiku → sonnet
-        let hop1 = upgrade_model_for_subagent("claude-haiku-4-5-20251213").expect("haiku → sonnet");
-        assert_eq!(hop1.target_model, "claude-sonnet-4-6");
-        // 第2跳:sonnet → opus
-        let hop2 =
-            upgrade_model_for_subagent(&hop1.target_model).expect("sonnet → opus");
-        assert_eq!(hop2.target_model, "claude-opus-4-6");
-        // 第3跳:opus 已旗舰,返回 None(链终止)
-        assert!(upgrade_model_for_subagent(&hop2.target_model).is_none());
     }
 }

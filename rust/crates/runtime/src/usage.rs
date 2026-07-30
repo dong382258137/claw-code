@@ -415,10 +415,10 @@ mod tests {
         let cost = usage.estimate_cost_usd();
         assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
         assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
-        let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-20250514"));
-        assert!(lines[0].contains("estimated_cost=$54.6750"));
-        assert!(lines[0].contains("model=claude-sonnet-4-20250514"));
-        assert!(lines[1].contains("cache_read=$0.3000"));
+        let lines = usage.summary_lines_for_model("usage", Some("deepseek-v4-pro"));
+        assert!(lines[0].contains("estimated_cost=$0.8759"));
+        assert!(lines[0].contains("model=deepseek-v4-pro"));
+        assert!(lines[1].contains("cache_read=$0.0007"));
     }
 
     #[test]
@@ -430,50 +430,24 @@ mod tests {
             cache_read_input_tokens: 0,
         };
 
-        let haiku = pricing_for_model("claude-haiku-4-5-20251001").expect("haiku pricing");
-        let opus = pricing_for_model("claude-opus-4-6").expect("opus pricing");
-        let haiku_cost = usage.estimate_cost_usd_with_pricing(haiku);
-        let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
-        assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
-        assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
+        let flash = pricing_for_model("deepseek-v4-flash").expect("flash pricing");
+        let pro = pricing_for_model("deepseek-v4-pro").expect("pro pricing");
+        let flash_cost = usage.estimate_cost_usd_with_pricing(flash);
+        let pro_cost = usage.estimate_cost_usd_with_pricing(pro);
+        // flash: $0.139/M input + $0.278/M output = $0.139 + $0.139 = $0.278
+        assert_eq!(format_usd(flash_cost.total_cost_usd()), "$0.2780");
+        // pro: $0.417/M input + $0.833/M output = $0.417 + $0.4165 = $0.8335
+        assert_eq!(format_usd(pro_cost.total_cost_usd()), "$0.8335");
     }
 
     #[test]
-    fn supports_non_anthropic_model_pricing() {
-        // P2-6 扩展：验证非 Anthropic 系列模型定价能正确返回。
-        let gpt5 = pricing_for_model("gpt-5-2025-08-07").expect("gpt-5 pricing");
-        let gpt4o = pricing_for_model("gpt-4o-2024-08-06").expect("gpt-4o pricing");
-        let gpt4o_mini = pricing_for_model("gpt-4o-mini").expect("gpt-4o-mini pricing");
-        let grok3 = pricing_for_model("grok-3-latest").expect("grok-3 pricing");
-        let grok2 = pricing_for_model("grok-2-latest").expect("grok-2 pricing");
-        let qwen_max = pricing_for_model("qwen-max-2024-09-10").expect("qwen-max pricing");
-        let qwen_plus = pricing_for_model("qwen-plus").expect("qwen-plus pricing");
-        let qwen_turbo = pricing_for_model("qwen-turbo").expect("qwen-turbo pricing");
+    fn supports_deepseek_model_pricing() {
         // DeepSeek v4-flash（原 deepseek-chat）和 v4-pro（原 deepseek-reasoner）
         let ds_flash = pricing_for_model("deepseek-chat").expect("deepseek-chat pricing");
         let ds_pro = pricing_for_model("deepseek-reasoner").expect("deepseek-reasoner pricing");
         let ds_v4_flash =
             pricing_for_model("deepseek-v4-flash").expect("deepseek-v4-flash pricing");
         let ds_v4_pro = pricing_for_model("deepseek-v4-pro").expect("deepseek-v4-pro pricing");
-
-        // 非 Anthropic 系列 cache 价格应为 0
-        assert_eq!(gpt5.cache_creation_cost_per_million, 0.0);
-        assert_eq!(gpt5.cache_read_cost_per_million, 0.0);
-        assert_eq!(grok3.cache_creation_cost_per_million, 0.0);
-        assert_eq!(qwen_max.cache_read_cost_per_million, 0.0);
-
-        // 验证输入/输出价格与设定一致
-        assert_eq!(gpt5.input_cost_per_million, 5.0);
-        assert_eq!(gpt5.output_cost_per_million, 15.0);
-        assert_eq!(gpt4o.input_cost_per_million, 2.5);
-        assert_eq!(gpt4o.output_cost_per_million, 10.0);
-        assert_eq!(gpt4o_mini.input_cost_per_million, 0.15);
-        assert_eq!(gpt4o_mini.output_cost_per_million, 0.6);
-        assert_eq!(grok3.input_cost_per_million, 5.0);
-        assert_eq!(grok2.input_cost_per_million, 2.0);
-        assert_eq!(qwen_max.input_cost_per_million, 2.5);
-        assert_eq!(qwen_plus.input_cost_per_million, 0.4);
-        assert_eq!(qwen_turbo.input_cost_per_million, 0.05);
 
         // DeepSeek 2026-07 官方价目（按汇率 7.2 换算）
         // v4-flash: ¥1/M input, ¥2/M output, ¥0.02/M cache hit

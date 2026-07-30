@@ -20,10 +20,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use api::{
-    detect_provider_kind, model_requires_reasoning_content_in_history, resolve_startup_auth_source,
-    AnthropicClient, AuthSource, CacheControl, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock,
+    model_requires_reasoning_content_in_history, CacheControl, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    PromptCache, ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent, SystemBlock,
     SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
@@ -194,48 +193,13 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Dispatch to the correct provider at construction time.
-        // `ApiProviderClient` (exposed by the api crate as
-        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
-        // variants, where xAI and OpenAI both use the OpenAI-compat
-        // wire format under the hood. We consult
-        // `detect_provider_kind(&resolved_model)` so model-name prefix
-        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
-        // env-var presence.
-        //
-        // For Anthropic we build the client directly instead of going
-        // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `api::read_base_url()` — that
-        // reads `ANTHROPIC_BASE_URL` and is required for the local
-        // mock-server test harness
-        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // claw at its fake Anthropic endpoint. We also attach a
-        // session-scoped prompt cache on the Anthropic path; the
-        // prompt cache is Anthropic-only so non-Anthropic variants
-        // skip it.
+        // DeepSeek-only build: the api crate's `ProviderClient::from_model`
+        // reads `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` from the environment
+        // and builds an `OpenAiCompatClient` with the DeepSeek config. Auth is
+        // resolved internally via `from_env`, so no external auth source is
+        // needed here.
         let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-            }
-        };
+        let client = ApiProviderClient::from_model(&resolved_model)?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -296,15 +260,6 @@ impl AnthropicRuntimeClient {
         });
         RuntimeError::new(msg)
     }
-}
-
-pub(crate) fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_cli_auth_source_for_cwd()?)
-}
-
-#[allow(clippy::result_large_err)]
-pub(crate) fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
-    resolve_startup_auth_source(|| Ok(None))
 }
 
 /// Convert a [`SystemPromptSplit`] into an Anthropic-compatible

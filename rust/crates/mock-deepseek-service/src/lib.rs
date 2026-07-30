@@ -1,9 +1,18 @@
+//! Mock DeepSeek service that speaks the OpenAI-compatible chat completions
+//! protocol (`POST /v1/chat/completions`). Used by the integration test suite
+//! as a deterministic stand-in for a real DeepSeek deployment.
+//!
+//! The mock preserves the same scenario-driven design as the previous
+//! Anthropic-flavoured mock: tests inject a `PARITY_SCENARIO:<name>` token
+//! into a user message, and the mock dispatches a canned response based on
+//! the scenario. Both streaming (SSE) and non-streaming (JSON) modes are
+//! supported.
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use api::{InputContentBlock, MessageRequest, MessageResponse, OutputContentBlock, Usage};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -11,7 +20,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+pub const DEFAULT_MODEL: &str = "deepseek-v4-pro";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {
@@ -23,14 +32,14 @@ pub struct CapturedRequest {
     pub raw_body: String,
 }
 
-pub struct MockAnthropicService {
+pub struct MockDeepSeekService {
     base_url: String,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     shutdown: Option<oneshot::Sender<()>>,
     join_handle: JoinHandle<()>,
 }
 
-impl MockAnthropicService {
+impl MockDeepSeekService {
     pub async fn spawn() -> io::Result<Self> {
         Self::spawn_on("127.0.0.1:0").await
     }
@@ -77,7 +86,7 @@ impl MockAnthropicService {
     }
 }
 
-impl Drop for MockAnthropicService {
+impl Drop for MockDeepSeekService {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -144,17 +153,21 @@ async fn handle_connection(
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
 ) -> io::Result<()> {
     let (method, path, headers, raw_body) = read_http_request(&mut socket).await?;
-    let request: MessageRequest = serde_json::from_str(&raw_body)
+    let request: Value = serde_json::from_str(&raw_body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     let scenario = detect_scenario(&request)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parity scenario"))?;
+    let stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     requests.lock().await.push(CapturedRequest {
         method,
         path,
         headers,
         scenario: scenario.name().to_string(),
-        stream: request.stream,
+        stream,
         raw_body,
     });
 
@@ -241,75 +254,111 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
-    request.messages.iter().rev().find_map(|message| {
-        message.content.iter().rev().find_map(|block| match block {
-            InputContentBlock::Text { text } => text
-                .split_whitespace()
-                .find_map(|token| token.strip_prefix(SCENARIO_PREFIX))
-                .and_then(Scenario::parse),
-            _ => None,
-        })
+fn detect_scenario(request: &Value) -> Option<Scenario> {
+    let messages = request.get("messages").and_then(Value::as_array)?;
+    messages.iter().rev().find_map(|message| {
+        let content = message_text(message)?;
+        content
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(SCENARIO_PREFIX).and_then(Scenario::parse))
     })
 }
 
-fn latest_tool_result(request: &MessageRequest) -> Option<(String, bool)> {
-    request.messages.iter().rev().find_map(|message| {
-        message.content.iter().rev().find_map(|block| match block {
-            InputContentBlock::ToolResult {
-                content, is_error, ..
-            } => Some((flatten_tool_result_content(content), *is_error)),
-            _ => None,
-        })
+fn message_text(message: &Value) -> Option<String> {
+    match message.get("content") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(Value::as_str) {
+                    text.push_str(t);
+                }
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn latest_tool_result(request: &Value) -> Option<(String, bool)> {
+    let messages = request.get("messages").and_then(Value::as_array)?;
+    messages.iter().rev().find_map(|message| {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            return None;
+        }
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let is_error = message
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Some((content, is_error))
     })
 }
 
-fn tool_results_by_name(request: &MessageRequest) -> HashMap<String, (String, bool)> {
-    let mut tool_names_by_id = HashMap::new();
-    for message in &request.messages {
-        for block in &message.content {
-            if let InputContentBlock::ToolUse { id, name, .. } = block {
-                tool_names_by_id.insert(id.clone(), name.clone());
+fn tool_results_by_name(request: &Value) -> HashMap<String, (String, bool)> {
+    let messages = match request.get("messages").and_then(Value::as_array) {
+        Some(arr) => arr,
+        None => return HashMap::new(),
+    };
+
+    let mut names_by_id = HashMap::new();
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in tool_calls {
+                let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = call
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                names_by_id.insert(id.to_string(), name.to_string());
             }
         }
     }
 
     let mut results = HashMap::new();
-    for message in request.messages.iter().rev() {
-        for block in message.content.iter().rev() {
-            if let InputContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } = block
-            {
-                let tool_name = tool_names_by_id
-                    .get(tool_use_id)
-                    .cloned()
-                    .unwrap_or_else(|| tool_use_id.clone());
-                results
-                    .entry(tool_name)
-                    .or_insert_with(|| (flatten_tool_result_content(content), *is_error));
-            }
+    for message in messages.iter().rev() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
         }
+        let tool_call_id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let is_error = message
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let tool_name = names_by_id
+            .get(tool_call_id)
+            .cloned()
+            .unwrap_or_else(|| tool_call_id.to_string());
+        results
+            .entry(tool_name)
+            .or_insert_with(|| (content, is_error));
     }
     results
 }
 
-fn flatten_tool_result_content(content: &[api::ToolResultContentBlock]) -> String {
-    content
-        .iter()
-        .map(|block| match block {
-            api::ToolResultContentBlock::Text { text } => text.clone(),
-            api::ToolResultContentBlock::Json { value } => value.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[allow(clippy::too_many_lines)]
-fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
-    let response = if request.stream {
+fn build_http_response(request: &Value, scenario: Scenario) -> String {
+    let stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if stream {
         let body = build_stream_body(request, scenario);
         return http_response(
             "200 OK",
@@ -317,20 +366,18 @@ fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
             &body,
             &[("x-request-id", request_id_for(scenario))],
         );
-    } else {
-        build_message_response(request, scenario)
-    };
-
+    }
+    let response = build_message_response(request, scenario);
     http_response(
         "200 OK",
         "application/json",
-        &serde_json::to_string(&response).expect("message response should serialize"),
-        &[("request-id", request_id_for(scenario))],
+        &serde_json::to_string(&response).expect("chat completion response should serialize"),
+        &[("x-request-id", request_id_for(scenario))],
     )
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
+fn build_stream_body(request: &Value, scenario: Scenario) -> String {
     match scenario {
         Scenario::StreamingText => streaming_text_sse(),
         Scenario::ReadFileRoundtrip => match latest_tool_result(request) {
@@ -339,7 +386,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 extract_read_content(&tool_output)
             )),
             None => tool_use_sse(
-                "toolu_read_fixture",
+                "call_read_fixture",
                 "read_file",
                 &[r#"{"path":"fixture.txt"}"#],
             ),
@@ -350,7 +397,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 extract_num_matches(&tool_output)
             )),
             None => tool_use_sse(
-                "toolu_grep_fixture",
+                "call_grep_fixture",
                 "grep_search",
                 &[
                     "{\"pattern\":\"par",
@@ -365,7 +412,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 extract_file_path(&tool_output)
             )),
             None => tool_use_sse(
-                "toolu_write_allowed",
+                "call_write_allowed",
                 "write_file",
                 &[r#"{"path":"generated/output.txt","content":"created by mock service\n"}"#],
             ),
@@ -375,7 +422,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 final_text_sse(&format!("write_file denied as expected: {tool_output}"))
             }
             None => tool_use_sse(
-                "toolu_write_denied",
+                "call_write_denied",
                 "write_file",
                 &[r#"{"path":"generated/denied.txt","content":"should not exist\n"}"#],
             ),
@@ -393,12 +440,12 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 )),
                 _ => tool_uses_sse(&[
                     ToolUseSse {
-                        tool_id: "toolu_multi_read",
+                        tool_id: "call_multi_read",
                         tool_name: "read_file",
                         partial_json_chunks: &[r#"{"path":"fixture.txt"}"#],
                     },
                     ToolUseSse {
-                        tool_id: "toolu_multi_grep",
+                        tool_id: "call_multi_grep",
                         tool_name: "grep_search",
                         partial_json_chunks: &[
                             "{\"pattern\":\"par",
@@ -415,7 +462,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 extract_bash_stdout(&tool_output)
             )),
             None => tool_use_sse(
-                "toolu_bash_stdout",
+                "call_bash_stdout",
                 "bash",
                 &[r#"{"command":"printf 'alpha from bash'","timeout":1000}"#],
             ),
@@ -432,7 +479,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 }
             }
             None => tool_use_sse(
-                "toolu_bash_prompt_allow",
+                "call_bash_prompt_allow",
                 "bash",
                 &[r#"{"command":"printf 'approved via prompt'","timeout":1000}"#],
             ),
@@ -442,7 +489,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 final_text_sse(&format!("bash denied as expected: {tool_output}"))
             }
             None => tool_use_sse(
-                "toolu_bash_prompt_deny",
+                "call_bash_prompt_deny",
                 "bash",
                 &[r#"{"command":"printf 'should not run'","timeout":1000}"#],
             ),
@@ -453,7 +500,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 extract_plugin_message(&tool_output)
             )),
             None => tool_use_sse(
-                "toolu_plugin_echo",
+                "call_plugin_echo",
                 "plugin_echo",
                 &[r#"{"message":"hello from plugin parity"}"#],
             ),
@@ -468,62 +515,62 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_message_response(request: &MessageRequest, scenario: Scenario) -> MessageResponse {
+fn build_message_response(request: &Value, scenario: Scenario) -> Value {
     match scenario {
-        Scenario::StreamingText => text_message_response(
-            "msg_streaming_text",
+        Scenario::StreamingText => text_completion_response(
+            "chatcmpl_streaming_text",
             "Mock streaming says hello from the parity harness.",
         ),
         Scenario::ReadFileRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_read_file_final",
+            Some((tool_output, _)) => text_completion_response(
+                "chatcmpl_read_file_final",
                 &format!(
                     "read_file roundtrip complete: {}",
                     extract_read_content(&tool_output)
                 ),
             ),
-            None => tool_message_response(
-                "msg_read_file_tool",
-                "toolu_read_fixture",
+            None => tool_completion_response(
+                "chatcmpl_read_file_tool",
+                "call_read_fixture",
                 "read_file",
                 json!({"path": "fixture.txt"}),
             ),
         },
         Scenario::GrepChunkAssembly => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_grep_final",
+            Some((tool_output, _)) => text_completion_response(
+                "chatcmpl_grep_final",
                 &format!(
                     "grep_search matched {} occurrences",
                     extract_num_matches(&tool_output)
                 ),
             ),
-            None => tool_message_response(
-                "msg_grep_tool",
-                "toolu_grep_fixture",
+            None => tool_completion_response(
+                "chatcmpl_grep_tool",
+                "call_grep_fixture",
                 "grep_search",
                 json!({"pattern": "parity", "path": "fixture.txt", "output_mode": "count"}),
             ),
         },
         Scenario::WriteFileAllowed => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_write_allowed_final",
+            Some((tool_output, _)) => text_completion_response(
+                "chatcmpl_write_allowed_final",
                 &format!("write_file succeeded: {}", extract_file_path(&tool_output)),
             ),
-            None => tool_message_response(
-                "msg_write_allowed_tool",
-                "toolu_write_allowed",
+            None => tool_completion_response(
+                "chatcmpl_write_allowed_tool",
+                "call_write_allowed",
                 "write_file",
                 json!({"path": "generated/output.txt", "content": "created by mock service\n"}),
             ),
         },
         Scenario::WriteFileDenied => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_write_denied_final",
+            Some((tool_output, _)) => text_completion_response(
+                "chatcmpl_write_denied_final",
                 &format!("write_file denied as expected: {tool_output}"),
             ),
-            None => tool_message_response(
-                "msg_write_denied_tool",
-                "toolu_write_denied",
+            None => tool_completion_response(
+                "chatcmpl_write_denied_tool",
+                "call_write_denied",
                 "write_file",
                 json!({"path": "generated/denied.txt", "content": "should not exist\n"}),
             ),
@@ -534,24 +581,24 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 tool_results.get("read_file"),
                 tool_results.get("grep_search"),
             ) {
-                (Some((read_output, _)), Some((grep_output, _))) => text_message_response(
-                    "msg_multi_tool_final",
+                (Some((read_output, _)), Some((grep_output, _))) => text_completion_response(
+                    "chatcmpl_multi_tool_final",
                     &format!(
                         "multi-tool roundtrip complete: {} / {} occurrences",
                         extract_read_content(read_output),
                         extract_num_matches(grep_output)
                     ),
                 ),
-                _ => tool_message_response_many(
-                    "msg_multi_tool_start",
+                _ => tool_completion_response_many(
+                    "chatcmpl_multi_tool_start",
                     &[
                         ToolUseMessage {
-                            tool_id: "toolu_multi_read",
+                            tool_id: "call_multi_read",
                             tool_name: "read_file",
                             input: json!({"path": "fixture.txt"}),
                         },
                         ToolUseMessage {
-                            tool_id: "toolu_multi_grep",
+                            tool_id: "call_multi_grep",
                             tool_name: "grep_search",
                             input: json!({"pattern": "parity", "path": "fixture.txt", "output_mode": "count"}),
                         },
@@ -560,13 +607,13 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             }
         }
         Scenario::BashStdoutRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_bash_stdout_final",
+            Some((tool_output, _)) => text_completion_response(
+                "chatcmpl_bash_stdout_final",
                 &format!("bash completed: {}", extract_bash_stdout(&tool_output)),
             ),
-            None => tool_message_response(
-                "msg_bash_stdout_tool",
-                "toolu_bash_stdout",
+            None => tool_completion_response(
+                "chatcmpl_bash_stdout_tool",
+                "call_bash_stdout",
                 "bash",
                 json!({"command": "printf 'alpha from bash'", "timeout": 1000}),
             ),
@@ -574,13 +621,13 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
         Scenario::BashPermissionPromptApproved => match latest_tool_result(request) {
             Some((tool_output, is_error)) => {
                 if is_error {
-                    text_message_response(
-                        "msg_bash_prompt_allow_error",
+                    text_completion_response(
+                        "chatcmpl_bash_prompt_allow_error",
                         &format!("bash approval unexpectedly failed: {tool_output}"),
                     )
                 } else {
-                    text_message_response(
-                        "msg_bash_prompt_allow_final",
+                    text_completion_response(
+                        "chatcmpl_bash_prompt_allow_final",
                         &format!(
                             "bash approved and executed: {}",
                             extract_bash_stdout(&tool_output)
@@ -588,48 +635,48 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                     )
                 }
             }
-            None => tool_message_response(
-                "msg_bash_prompt_allow_tool",
-                "toolu_bash_prompt_allow",
+            None => tool_completion_response(
+                "chatcmpl_bash_prompt_allow_tool",
+                "call_bash_prompt_allow",
                 "bash",
                 json!({"command": "printf 'approved via prompt'", "timeout": 1000}),
             ),
         },
         Scenario::BashPermissionPromptDenied => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_bash_prompt_deny_final",
+            Some((tool_output, _)) => text_completion_response(
+                "chatcmpl_bash_prompt_deny_final",
                 &format!("bash denied as expected: {tool_output}"),
             ),
-            None => tool_message_response(
-                "msg_bash_prompt_deny_tool",
-                "toolu_bash_prompt_deny",
+            None => tool_completion_response(
+                "chatcmpl_bash_prompt_deny_tool",
+                "call_bash_prompt_deny",
                 "bash",
                 json!({"command": "printf 'should not run'", "timeout": 1000}),
             ),
         },
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_plugin_tool_final",
+            Some((tool_output, _)) => text_completion_response(
+                "chatcmpl_plugin_tool_final",
                 &format!(
                     "plugin tool completed: {}",
                     extract_plugin_message(&tool_output)
                 ),
             ),
-            None => tool_message_response(
-                "msg_plugin_tool_start",
-                "toolu_plugin_echo",
+            None => tool_completion_response(
+                "chatcmpl_plugin_tool_start",
+                "call_plugin_echo",
                 "plugin_echo",
                 json!({"message": "hello from plugin parity"}),
             ),
         },
-        Scenario::AutoCompactTriggered => text_message_response_with_usage(
-            "msg_auto_compact_triggered",
+        Scenario::AutoCompactTriggered => text_completion_response_with_usage(
+            "chatcmpl_auto_compact_triggered",
             "auto compact parity complete.",
             50_000,
             200,
         ),
-        Scenario::TokenCostReporting => text_message_response_with_usage(
-            "msg_token_cost_reporting",
+        Scenario::TokenCostReporting => text_completion_response_with_usage(
+            "chatcmpl_token_cost_reporting",
             "token cost reporting parity complete.",
             1_000,
             500,
@@ -666,60 +713,32 @@ fn http_response(status: &str, content_type: &str, body: &str, headers: &[(&str,
     )
 }
 
-fn text_message_response(id: &str, text: &str) -> MessageResponse {
-    MessageResponse {
-        id: id.to_string(),
-        kind: "message".to_string(),
-        role: "assistant".to_string(),
-        content: vec![OutputContentBlock::Text {
-            text: text.to_string(),
-        }],
-        model: DEFAULT_MODEL.to_string(),
-        stop_reason: Some("end_turn".to_string()),
-        stop_sequence: None,
-        usage: Usage {
-            input_tokens: 10,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: 6,
-        },
-        request_id: None,
-    }
+fn text_completion_response(id: &str, text: &str) -> Value {
+    completion_response(id, text, false, None, usage_json(10, 6))
 }
 
-fn text_message_response_with_usage(
+fn text_completion_response_with_usage(
     id: &str,
     text: &str,
-    input_tokens: u32,
-    output_tokens: u32,
-) -> MessageResponse {
-    MessageResponse {
-        id: id.to_string(),
-        kind: "message".to_string(),
-        role: "assistant".to_string(),
-        content: vec![OutputContentBlock::Text {
-            text: text.to_string(),
-        }],
-        model: DEFAULT_MODEL.to_string(),
-        stop_reason: Some("end_turn".to_string()),
-        stop_sequence: None,
-        usage: Usage {
-            input_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens,
-        },
-        request_id: None,
-    }
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) -> Value {
+    completion_response(
+        id,
+        text,
+        false,
+        None,
+        usage_json(prompt_tokens, completion_tokens),
+    )
 }
 
-fn tool_message_response(
+fn tool_completion_response(
     id: &str,
     tool_id: &str,
     tool_name: &str,
     input: Value,
-) -> MessageResponse {
-    tool_message_response_many(
+) -> Value {
+    tool_completion_response_many(
         id,
         &[ToolUseMessage {
             tool_id,
@@ -735,96 +754,81 @@ struct ToolUseMessage<'a> {
     input: Value,
 }
 
-fn tool_message_response_many(id: &str, tool_uses: &[ToolUseMessage<'_>]) -> MessageResponse {
-    MessageResponse {
-        id: id.to_string(),
-        kind: "message".to_string(),
-        role: "assistant".to_string(),
-        content: tool_uses
-            .iter()
-            .map(|tool_use| OutputContentBlock::ToolUse {
-                id: tool_use.tool_id.to_string(),
-                name: tool_use.tool_name.to_string(),
-                input: tool_use.input.clone(),
+fn tool_completion_response_many(id: &str, tool_uses: &[ToolUseMessage<'_>]) -> Value {
+    let tool_calls: Vec<Value> = tool_uses
+        .iter()
+        .map(|tool_use| {
+            let arguments = serde_json::to_string(&tool_use.input)
+                .unwrap_or_else(|_| "{}".to_string());
+            json!({
+                "id": tool_use.tool_id,
+                "type": "function",
+                "function": {
+                    "name": tool_use.tool_name,
+                    "arguments": arguments,
+                }
             })
-            .collect(),
-        model: DEFAULT_MODEL.to_string(),
-        stop_reason: Some("tool_use".to_string()),
-        stop_sequence: None,
-        usage: Usage {
-            input_tokens: 10,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: 3,
-        },
-        request_id: None,
+        })
+        .collect();
+    completion_response(id, "", true, Some(tool_calls), usage_json(10, 3))
+}
+
+fn completion_response(
+    id: &str,
+    text: &str,
+    is_tool: bool,
+    tool_calls: Option<Vec<Value>>,
+    usage: Value,
+) -> Value {
+    let mut message = json!({
+        "role": "assistant",
+        "content": if is_tool { Value::Null } else { json!(text) },
+    });
+    if let Some(calls) = tool_calls {
+        message["tool_calls"] = Value::Array(calls);
     }
+    let finish_reason = if is_tool { "tool_calls" } else { "stop" };
+    json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": now_unix(),
+        "model": DEFAULT_MODEL,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": usage,
+    })
 }
 
 fn streaming_text_sse() -> String {
     let mut body = String::new();
+    let id = unique_chat_id();
+    let created = now_unix();
     append_sse(
         &mut body,
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": "msg_streaming_text",
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": DEFAULT_MODEL,
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": usage_json(11, 0)
-            }
-        }),
+        chunk(&id, created, json!({"role": "assistant", "content": ""}), None, None),
     );
     append_sse(
         &mut body,
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        }),
+        chunk(&id, created, json!({"content": "Mock streaming "}), None, None),
     );
     append_sse(
         &mut body,
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "Mock streaming "}
-        }),
+        chunk(
+            &id,
+            created,
+            json!({"content": "says hello from the parity harness."}),
+            None,
+            None,
+        ),
     );
     append_sse(
         &mut body,
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "says hello from the parity harness."}
-        }),
+        chunk(&id, created, json!({}), Some("stop"), Some(usage_json(11, 8))),
     );
-    append_sse(
-        &mut body,
-        "content_block_stop",
-        json!({
-            "type": "content_block_stop",
-            "index": 0
-        }),
-    );
-    append_sse(
-        &mut body,
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-            "usage": usage_json(11, 8)
-        }),
-    );
-    append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
+    body.push_str("data: [DONE]\n\n");
     body
 }
 
@@ -844,224 +848,178 @@ struct ToolUseSse<'a> {
 
 fn tool_uses_sse(tool_uses: &[ToolUseSse<'_>]) -> String {
     let mut body = String::new();
-    let message_id = tool_uses.first().map_or_else(
-        || "msg_tool_use".to_string(),
-        |tool_use| format!("msg_{}", tool_use.tool_id),
-    );
+    let id = unique_chat_id();
+    let created = now_unix();
     append_sse(
         &mut body,
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": DEFAULT_MODEL,
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": usage_json(12, 0)
-            }
-        }),
+        chunk(
+            &id,
+            created,
+            json!({"role": "assistant", "content": Value::Null}),
+            None,
+            None,
+        ),
     );
     for (index, tool_use) in tool_uses.iter().enumerate() {
         append_sse(
             &mut body,
-            "content_block_start",
-            json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_use.tool_id,
-                    "name": tool_use.tool_name,
-                    "input": {}
-                }
-            }),
+            chunk_with_tool_calls(
+                &id,
+                created,
+                index,
+                tool_use.tool_id,
+                tool_use.tool_name,
+                "",
+            ),
         );
-        for chunk in tool_use.partial_json_chunks {
+        for piece in tool_use.partial_json_chunks {
             append_sse(
                 &mut body,
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "input_json_delta", "partial_json": chunk}
-                }),
+                chunk_with_tool_call_delta(&id, created, index, piece),
             );
         }
-        append_sse(
-            &mut body,
-            "content_block_stop",
-            json!({
-                "type": "content_block_stop",
-                "index": index
-            }),
-        );
     }
     append_sse(
         &mut body,
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
-            "usage": usage_json(12, 4)
-        }),
+        chunk(&id, created, json!({}), Some("tool_calls"), Some(usage_json(12, 4))),
     );
-    append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
+    body.push_str("data: [DONE]\n\n");
     body
 }
 
 fn final_text_sse(text: &str) -> String {
+    final_text_sse_with_usage(text, 14, 7)
+}
+
+fn final_text_sse_with_usage(text: &str, prompt_tokens: u32, completion_tokens: u32) -> String {
     let mut body = String::new();
+    let id = unique_chat_id();
+    let created = now_unix();
     append_sse(
         &mut body,
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": unique_message_id(),
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": DEFAULT_MODEL,
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": usage_json(14, 0)
-            }
-        }),
+        chunk(&id, created, json!({"role": "assistant", "content": ""}), None, None),
     );
     append_sse(
         &mut body,
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        }),
+        chunk(&id, created, json!({"content": text}), None, None),
     );
     append_sse(
         &mut body,
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": text}
-        }),
+        chunk(
+            &id,
+            created,
+            json!({}),
+            Some("stop"),
+            Some(usage_json(prompt_tokens, completion_tokens)),
+        ),
     );
-    append_sse(
-        &mut body,
-        "content_block_stop",
-        json!({
-            "type": "content_block_stop",
-            "index": 0
-        }),
-    );
-    append_sse(
-        &mut body,
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-            "usage": usage_json(14, 7)
-        }),
-    );
-    append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
+    body.push_str("data: [DONE]\n\n");
     body
 }
 
-fn final_text_sse_with_usage(text: &str, input_tokens: u32, output_tokens: u32) -> String {
-    let mut body = String::new();
-    append_sse(
-        &mut body,
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": unique_message_id(),
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": DEFAULT_MODEL,
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "output_tokens": 0
-                }
-            }
-        }),
-    );
-    append_sse(
-        &mut body,
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
+fn chunk(id: &str, created: u64, delta: Value, finish_reason: Option<&str>, usage: Option<Value>) -> Value {
+    let mut payload = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": DEFAULT_MODEL,
+        "choices": [{
             "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        }),
-    );
-    append_sse(
-        &mut body,
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    });
+    if let Some(u) = usage {
+        payload["usage"] = u;
+    }
+    payload
+}
+
+fn chunk_with_tool_calls(
+    id: &str,
+    created: u64,
+    index: usize,
+    tool_id: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> Value {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": DEFAULT_MODEL,
+        "choices": [{
             "index": 0,
-            "delta": {"type": "text_delta", "text": text}
-        }),
-    );
-    append_sse(
-        &mut body,
-        "content_block_stop",
-        json!({
-            "type": "content_block_stop",
-            "index": 0
-        }),
-    );
-    append_sse(
-        &mut body,
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-            "usage": {
-                "input_tokens": input_tokens,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": output_tokens
-            }
-        }),
-    );
-    append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
-    body
+            "delta": {
+                "tool_calls": [{
+                    "index": index,
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": arguments,
+                    }
+                }]
+            },
+            "finish_reason": Value::Null,
+        }],
+    })
+}
+
+fn chunk_with_tool_call_delta(
+    id: &str,
+    created: u64,
+    index: usize,
+    arguments: &str,
+) -> Value {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": DEFAULT_MODEL,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": index,
+                    "function": {
+                        "arguments": arguments,
+                    }
+                }]
+            },
+            "finish_reason": Value::Null,
+        }],
+    })
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn append_sse(buffer: &mut String, event: &str, payload: Value) {
+fn append_sse(buffer: &mut String, payload: Value) {
     use std::fmt::Write as _;
-    writeln!(buffer, "event: {event}").expect("event write should succeed");
     writeln!(buffer, "data: {payload}").expect("payload write should succeed");
     buffer.push('\n');
 }
 
-fn usage_json(input_tokens: u32, output_tokens: u32) -> Value {
+fn usage_json(prompt_tokens: u32, completion_tokens: u32) -> Value {
     json!({
-        "input_tokens": input_tokens,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "output_tokens": output_tokens
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens
     })
 }
 
-fn unique_message_id() -> String {
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_secs()
+}
+
+fn unique_chat_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
         .as_nanos();
-    format!("msg_{nanos}")
+    format!("chatcmpl_{nanos}")
 }
 
 fn extract_read_content(tool_output: &str) -> String {

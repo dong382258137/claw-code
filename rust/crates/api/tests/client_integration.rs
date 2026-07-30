@@ -1,16 +1,29 @@
+//! Integration tests for the DeepSeek-only `OpenAiCompatClient` /
+//! `ProviderClient` surface.
+//!
+//! These tests were originally written against the Anthropic-flavoured
+//! `ApiClient` / `AnthropicClient` / `AuthSource` API. After the DeepSeek-only
+//! migration they now exercise the OpenAI-compatible chat completions path
+//! (`POST /chat/completions`) via `OpenAiCompatClient::new(...,
+//! OpenAiCompatConfig::deepseek())` and `ProviderClient::from_model`.
+//!
+//! Tests that depended on Anthropic-only features (anthropic-beta headers,
+//! local prompt cache, `with_auth_token`, telemetry session tracer) are
+//! preserved but marked `#[ignore]` with a documented reason so the test count
+//! stays honest and the migration history remains auditable.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use api::{
-    AnthropicClient, ApiClient, ApiError, AuthSource, ContentBlockDelta, ContentBlockDeltaEvent,
-    ContentBlockStartEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient, StreamEvent, SystemContent,
-    ToolChoice, ToolDefinition,
+    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
+    InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest, OpenAiCompatClient,
+    OpenAiCompatConfig, OutputContentBlock, ProviderClient, ProviderKind, StreamEvent,
+    SystemContent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
-use telemetry::{ClientIdentity, MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -27,15 +40,13 @@ async fn send_message_posts_json_and_parses_response() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let body = concat!(
         "{",
-        "\"id\":\"msg_test\",",
-        "\"type\":\"message\",",
-        "\"role\":\"assistant\",",
-        "\"content\":[{\"type\":\"text\",\"text\":\"Hello from Claude\"}],",
-        "\"model\":\"claude-3-7-sonnet-latest\",",
-        "\"stop_reason\":\"end_turn\",",
-        "\"stop_sequence\":null,",
-        "\"usage\":{\"input_tokens\":12,\"output_tokens\":4},",
-        "\"request_id\":\"req_body_123\"",
+        "\"id\":\"chatcmpl_test\",",
+        "\"model\":\"deepseek-v4-pro\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Hello from DeepSeek\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4}",
         "}"
     );
     let server = spawn_server(
@@ -44,62 +55,61 @@ async fn send_message_posts_json_and_parses_response() {
     )
     .await;
 
-    let client = ApiClient::new("test-key")
-        .with_auth_token(Some("proxy-token".to_string()))
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let response = client
         .send_message(&sample_request(false))
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.id, "msg_test");
+    assert_eq!(response.id, "chatcmpl_test");
     assert_eq!(response.total_tokens(), 16);
-    assert_eq!(response.request_id.as_deref(), Some("req_body_123"));
-    assert_eq!(response.usage.cache_creation_input_tokens, 0);
-    assert_eq!(response.usage.cache_read_input_tokens, 0);
     assert_eq!(
         response.content,
         vec![OutputContentBlock::Text {
-            text: "Hello from Claude".to_string(),
+            text: "Hello from DeepSeek".to_string(),
         }]
     );
 
     let captured = state.lock().await;
     let request = captured.first().expect("server should capture request");
     assert_eq!(request.method, "POST");
-    assert_eq!(request.path, "/v1/messages");
-    assert_eq!(
-        request.headers.get("x-api-key").map(String::as_str),
-        Some("test-key")
-    );
+    assert_eq!(request.path, "/chat/completions");
     assert_eq!(
         request.headers.get("authorization").map(String::as_str),
-        Some("Bearer proxy-token")
+        Some("Bearer test-key")
     );
-    assert_eq!(
-        request.headers.get("anthropic-version").map(String::as_str),
-        Some("2023-06-01")
+    assert!(
+        request.headers.get("x-api-key").is_none(),
+        "DeepSeek OpenAI-compat path must not send an x-api-key header"
     );
-    assert_eq!(
-        request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/2026.8.0")
+    assert!(
+        request.headers.get("anthropic-version").is_none(),
+        "anthropic-version header must not be sent on the DeepSeek path"
     );
-    assert_eq!(
-        request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05")
+    assert!(
+        request.headers.get("anthropic-beta").is_none(),
+        "anthropic-beta header must not be sent on the DeepSeek path"
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
     assert_eq!(
         body.get("model").and_then(serde_json::Value::as_str),
-        Some("claude-3-7-sonnet-latest")
+        Some("deepseek-v4-pro")
     );
-    assert!(body.get("stream").is_none());
-    assert_eq!(body["tools"][0]["name"], json!("get_weather"));
-    assert_eq!(body["tool_choice"]["type"], json!("auto"));
+    // The OpenAI-compat path always serializes the `stream` boolean (unlike the
+    // legacy Anthropic client, which omitted it for non-streaming requests).
+    assert_eq!(
+        body.get("stream").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "non-streaming DeepSeek request should serialize stream=false"
+    );
+    assert_eq!(body["tools"][0]["type"], json!("function"));
+    assert_eq!(body["tools"][0]["function"]["name"], json!("get_weather"));
+    assert_eq!(body["tool_choice"], json!("auto"));
     assert!(
         body.get("betas").is_none(),
-        "betas must travel via the anthropic-beta header, not the request body"
+        "betas are an Anthropic-only concept and must not appear in the DeepSeek request body"
     );
 }
 
@@ -112,15 +122,20 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
     )
     .await;
 
-    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::deepseek())
+        .with_base_url(server.base_url());
     let error = client
         .send_message(&MessageRequest {
-            model: "claude-sonnet-4-6".to_string(),
+            model: "deepseek-v4-pro".to_string(),
             max_tokens: 64_000,
             messages: vec![InputMessage {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
-                    text: "x".repeat(600_000),
+                    // DeepSeek-v4-pro has a 1M-token context window. The
+                    // preflight estimator uses ~bytes/4, so ~5M chars yields
+                    // ~1.25M estimated input tokens — comfortably above the
+                    // 1M ceiling once max_tokens is added.
+                    text: "x".repeat(5_000_000),
                 }],
             }],
             system: Some(SystemContent::from_text("Keep the answer short.")),
@@ -140,137 +155,25 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
 }
 
 #[tokio::test]
+#[ignore = "telemetry session tracer / anthropic-beta / with_extra_body_param surface was removed in the DeepSeek-only migration; the OpenAiCompatClient does not carry a SessionTracer or per-request beta list. Re-enable only if a DeepSeek-equivalent telemetry hook is reintroduced."]
 async fn send_message_applies_request_profile_and_records_telemetry() {
-    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
-        state.clone(),
-        vec![http_response_with_headers(
-            "200 OK",
-            "application/json",
-            concat!(
-                "{",
-                "\"id\":\"msg_profile\",",
-                "\"type\":\"message\",",
-                "\"role\":\"assistant\",",
-                "\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],",
-                "\"model\":\"claude-3-7-sonnet-latest\",",
-                "\"stop_reason\":\"end_turn\",",
-                "\"stop_sequence\":null,",
-                "\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3,\"output_tokens\":1}",
-                "}"
-            ),
-            &[("request-id", "req_profile_123")],
-        )],
-    )
-    .await;
-    let sink = Arc::new(MemoryTelemetrySink::default());
-
-    let client = AnthropicClient::new("test-key")
-        .with_base_url(server.base_url())
-        .with_client_identity(ClientIdentity::new("claude-code", "9.9.9").with_runtime("rust-cli"))
-        .with_beta("tools-2026-04-01")
-        .with_extra_body_param("metadata", json!({"source": "clawd-code"}))
-        .with_session_tracer(SessionTracer::new("session-telemetry", sink.clone()));
-
-    let response = client
-        .send_message(&sample_request(false))
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(response.request_id.as_deref(), Some("req_profile_123"));
-
-    let captured = state.lock().await;
-    let request = captured.first().expect("server should capture request");
-    assert_eq!(
-        request.headers.get("anthropic-beta").map(String::as_str),
-        Some("claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01")
-    );
-    assert_eq!(
-        request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/9.9.9")
-    );
-    let body: serde_json::Value =
-        serde_json::from_str(&request.body).expect("request body should be json");
-    assert_eq!(body["metadata"]["source"], json!("clawd-code"));
-    assert!(
-        body.get("betas").is_none(),
-        "betas must travel via the anthropic-beta header, not the request body"
-    );
-
-    let events = sink.events();
-    assert_eq!(events.len(), 6);
-    assert!(matches!(
-        &events[0],
-        TelemetryEvent::HttpRequestStarted {
-            session_id,
-            attempt: 1,
-            method,
-            path,
-            ..
-        } if session_id == "session-telemetry" && method == "POST" && path == "/v1/messages"
-    ));
-    assert!(matches!(
-        &events[1],
-        TelemetryEvent::SessionTrace(trace) if trace.name == "http_request_started"
-    ));
-    assert!(matches!(
-        &events[2],
-        TelemetryEvent::HttpRequestSucceeded {
-            request_id,
-            status: 200,
-            ..
-        } if request_id.as_deref() == Some("req_profile_123")
-    ));
-    assert!(matches!(
-        &events[3],
-        TelemetryEvent::SessionTrace(trace) if trace.name == "http_request_succeeded"
-    ));
-    assert!(matches!(
-        &events[4],
-        TelemetryEvent::Analytics(event)
-            if event.namespace == "api"
-                && event.action == "message_usage"
-                && event.properties.get("request_id") == Some(&json!("req_profile_123"))
-                && event.properties.get("total_tokens") == Some(&json!(7))
-                && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0001"))
-    ));
-    assert!(matches!(
-        &events[5],
-        TelemetryEvent::SessionTrace(trace) if trace.name == "analytics"
-    ));
+    // Kept for migration audit trail. The original test asserted:
+    //   * anthropic-beta header accumulation (no longer applies — DeepSeek uses
+    //     an OpenAI-compatible wire shape with no beta headers).
+    //   * user-agent derived from ClientIdentity (OpenAiCompatClient does not
+    //     expose a with_client_identity builder).
+    //   * extra_body params merged onto the request body (still possible via
+    //     MessageRequest.extra_body, but the assertions below were tied to the
+    //     Anthropic client surface).
+    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
 }
 
 #[tokio::test]
+#[ignore = "prompt cache token accounting (cache_creation_input_tokens / cache_read_input_tokens from Anthropic-style usage objects) was removed with the Anthropic client. DeepSeek cache semantics (prompt_cache_hit_tokens / prompt_cache_miss_tokens) are covered by openai_compat_integration.rs::openai_compat_reads_deepseek_native_cache_fields_*."]
 async fn send_message_parses_prompt_cache_token_usage_from_response() {
-    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let body = concat!(
-        "{",
-        "\"id\":\"msg_cache_tokens\",",
-        "\"type\":\"message\",",
-        "\"role\":\"assistant\",",
-        "\"content\":[{\"type\":\"text\",\"text\":\"Cache tokens\"}],",
-        "\"model\":\"claude-3-7-sonnet-latest\",",
-        "\"stop_reason\":\"end_turn\",",
-        "\"stop_sequence\":null,",
-        "\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":321,\"cache_read_input_tokens\":654,\"output_tokens\":4}",
-        "}"
-    );
-    let server = spawn_server(
-        state,
-        vec![http_response("200 OK", "application/json", body)],
-    )
-    .await;
-
-    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
-    let response = client
-        .send_message(&sample_request(false))
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(response.usage.input_tokens, 12);
-    assert_eq!(response.usage.cache_creation_input_tokens, 321);
-    assert_eq!(response.usage.cache_read_input_tokens, 654);
-    assert_eq!(response.usage.output_tokens, 4);
+    // Migration note: see openai_compat_integration.rs for the DeepSeek-equivalent
+    // cache-field parsing tests (non-streaming + streaming).
+    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
 }
 
 #[tokio::test]
@@ -279,13 +182,12 @@ async fn given_empty_usage_object_when_send_message_parses_response_then_usage_d
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let body = concat!(
         "{",
-        "\"id\":\"msg_empty_usage\",",
-        "\"type\":\"message\",",
-        "\"role\":\"assistant\",",
-        "\"content\":[{\"type\":\"text\",\"text\":\"Hello from Claude\"}],",
-        "\"model\":\"claude-3-7-sonnet-latest\",",
-        "\"stop_reason\":\"end_turn\",",
-        "\"stop_sequence\":null,",
+        "\"id\":\"chatcmpl_empty_usage\",",
+        "\"model\":\"deepseek-v4-pro\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Hello from DeepSeek\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
         "\"usage\":{}",
         "}"
     );
@@ -294,7 +196,8 @@ async fn given_empty_usage_object_when_send_message_parses_response_then_usage_d
         vec![http_response("200 OK", "application/json", body)],
     )
     .await;
-    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::deepseek())
+        .with_base_url(server.base_url());
 
     // when
     let response = client
@@ -303,7 +206,7 @@ async fn given_empty_usage_object_when_send_message_parses_response_then_usage_d
         .expect("response with empty usage object should still parse");
 
     // then
-    assert_eq!(response.id, "msg_empty_usage");
+    assert_eq!(response.id, "chatcmpl_empty_usage");
     assert_eq!(response.total_tokens(), 0);
     assert_eq!(response.usage.input_tokens, 0);
     assert_eq!(response.usage.cache_creation_input_tokens, 0);
@@ -315,29 +218,12 @@ async fn given_empty_usage_object_when_send_message_parses_response_then_usage_d
 #[allow(clippy::await_holding_lock)]
 async fn stream_message_parses_sse_events_with_tool_use() {
     let _guard = env_lock();
-    let temp_root = std::env::temp_dir().join(format!(
-        "api-stream-cache-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(
-        "event: message_start\n",
-        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":8,\"cache_creation_input_tokens\":13,\"cache_read_input_tokens\":21,\"output_tokens\":0}}}\n\n",
-        "event: content_block_start\n",
-        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"get_weather\",\"input\":{}}}\n\n",
-        "event: content_block_delta\n",
-        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n\n",
-        "event: content_block_stop\n",
-        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-        "event: message_delta\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":8,\"cache_creation_input_tokens\":34,\"cache_read_input_tokens\":55,\"output_tokens\":1}}\n\n",
-        "event: message_stop\n",
-        "data: {\"type\":\"message_stop\"}\n\n",
+        "data: {\"id\":\"chatcmpl_stream\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl_stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1}}\n\n",
         "data: [DONE]\n\n"
     );
     let server = spawn_server(
@@ -346,17 +232,15 @@ async fn stream_message_parses_sse_events_with_tool_use() {
             "200 OK",
             "text/event-stream",
             sse,
-            &[("request-id", "req_stream_456")],
+            &[("x-request-id", "req_stream_456")],
         )],
     )
     .await;
 
-    let client = ApiClient::new("test-key")
-        .with_auth_token(Some("proxy-token".to_string()))
-        .with_base_url(server.base_url())
-        .with_prompt_cache(PromptCache::new("stream-session"));
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::deepseek())
+        .with_base_url(server.base_url());
     let mut stream = client
-        .stream_message(&sample_request(false))
+        .stream_message(&sample_request(true))
         .await
         .expect("stream should start");
 
@@ -371,57 +255,53 @@ async fn stream_message_parses_sse_events_with_tool_use() {
         events.push(event);
     }
 
-    assert_eq!(events.len(), 6);
-    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
-    assert!(matches!(
-        events[1],
-        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-            content_block: OutputContentBlock::ToolUse { .. },
-            ..
-        })
-    ));
-    assert!(matches!(
-        events[2],
-        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-            delta: ContentBlockDelta::InputJsonDelta { .. },
-            ..
-        })
-    ));
-    assert!(matches!(events[3], StreamEvent::ContentBlockStop(_)));
-    assert!(matches!(
-        events[4],
-        StreamEvent::MessageDelta(MessageDeltaEvent { .. })
-    ));
-    assert!(matches!(events[5], StreamEvent::MessageStop(_)));
-
-    match &events[1] {
-        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-            content_block: OutputContentBlock::ToolUse { name, input, .. },
-            ..
-        }) => {
-            assert_eq!(name, "get_weather");
-            assert_eq!(input, &json!({}));
-        }
-        other => panic!("expected tool_use block, got {other:?}"),
-    }
+    // The OpenAI-compat parser emits a MessageStart, then content/tool blocks,
+    // then a MessageDelta carrying the trailing usage, then MessageStop.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageStart(_))),
+        "expected a MessageStart event"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                content_block: OutputContentBlock::ToolUse { name, .. },
+                ..
+            }) if name == "get_weather")),
+        "expected a tool_use content block for get_weather"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::InputJsonDelta { .. },
+                ..
+            }))),
+        "expected an input_json_delta for the tool call"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageDelta(MessageDeltaEvent { .. }))),
+        "expected a MessageDelta event"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageStop(_))),
+        "expected a MessageStop event"
+    );
 
     let captured = state.lock().await;
     let request = captured.first().expect("server should capture request");
+    assert_eq!(request.path, "/chat/completions");
     assert!(request.body.contains("\"stream\":true"));
-
-    let cache_stats = client
-        .prompt_cache_stats()
-        .expect("prompt cache stats should exist");
-    assert_eq!(cache_stats.tracked_requests, 1);
-    assert_eq!(cache_stats.last_cache_creation_input_tokens, Some(34));
-    assert_eq!(cache_stats.last_cache_read_input_tokens, Some(55));
-    assert_eq!(
-        cache_stats.last_cache_source.as_deref(),
-        Some("api-response")
+    assert!(
+        request.body.contains("\"stream_options\""),
+        "stream requests should opt into usage chunks via stream_options.include_usage"
     );
-
-    std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
-    std::env::remove_var("CLAUDE_CONFIG_HOME");
 }
 
 #[tokio::test]
@@ -433,18 +313,18 @@ async fn retries_retryable_failures_before_succeeding() {
             http_response(
                 "429 Too Many Requests",
                 "application/json",
-                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+                "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
             ),
             http_response(
                 "200 OK",
                 "application/json",
-                "{\"id\":\"msg_retry\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Recovered\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+                "{\"id\":\"chatcmpl_retry\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Recovered\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}",
             ),
         ],
     )
     .await;
 
-    let client = ApiClient::new("test-key")
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url())
         .with_retry_policy(2, Duration::from_millis(1), Duration::from_millis(2));
 
@@ -458,29 +338,32 @@ async fn retries_retryable_failures_before_succeeding() {
 }
 
 #[tokio::test]
-async fn provider_client_dispatches_anthropic_requests() {
+async fn provider_client_dispatches_deepseek_requests() {
+    let _guard = env_lock();
+    std::env::set_var("DEEPSEEK_API_KEY", "test-key");
+    std::env::set_var("DEEPSEEK_BASE_URL", ""); // ensure from_env reads env api key
+
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
         state.clone(),
         vec![http_response(
             "200 OK",
             "application/json",
-            "{\"id\":\"msg_provider\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Dispatched\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+            "{\"id\":\"chatcmpl_provider\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Dispatched\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}",
         )],
     )
     .await;
 
-    let client = ProviderClient::from_model_with_anthropic_auth(
-        "claude-sonnet-4-6",
-        Some(AuthSource::ApiKey("test-key".to_string())),
-    )
-    .expect("anthropic provider client should be constructed");
-    let client = match client {
-        ProviderClient::Anthropic(client) => {
-            ProviderClient::Anthropic(client.with_base_url(server.base_url()))
-        }
-        other => panic!("expected anthropic provider, got {other:?}"),
-    };
+    let client = ProviderClient::from_model("deepseek-v4-pro")
+        .expect("deepseek provider client should be constructed");
+    assert_eq!(client.provider_kind(), ProviderKind::DeepSeek);
+
+    // ProviderClient wraps an OpenAiCompatClient configured from env. To point
+    // it at the mock server we set DEEPSEEK_BASE_URL before construction; the
+    // client reads the env var via read_base_url at construction time.
+    std::env::set_var("DEEPSEEK_BASE_URL", server.base_url());
+    let client = ProviderClient::from_model("deepseek-v4-pro")
+        .expect("deepseek provider client should rebuild against mock base url");
 
     let response = client
         .send_message(&sample_request(false))
@@ -491,11 +374,18 @@ async fn provider_client_dispatches_anthropic_requests() {
 
     let captured = state.lock().await;
     let request = captured.first().expect("server should capture request");
-    assert_eq!(request.path, "/v1/messages");
+    assert_eq!(request.path, "/chat/completions");
     assert_eq!(
-        request.headers.get("x-api-key").map(String::as_str),
-        Some("test-key")
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer test-key")
     );
+    assert!(
+        request.headers.get("x-api-key").is_none(),
+        "DeepSeek path must not send x-api-key"
+    );
+
+    std::env::remove_var("DEEPSEEK_API_KEY");
+    std::env::remove_var("DEEPSEEK_BASE_URL");
 }
 
 #[tokio::test]
@@ -507,18 +397,18 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
             http_response(
                 "503 Service Unavailable",
                 "application/json",
-                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}",
+                "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}",
             ),
             http_response(
                 "503 Service Unavailable",
                 "application/json",
-                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"still busy\"}}",
+                "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"still busy\"}}",
             ),
         ],
     )
     .await;
 
-    let client = ApiClient::new("test-key")
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url())
         .with_retry_policy(1, Duration::from_millis(1), Duration::from_millis(2));
 
@@ -555,38 +445,38 @@ async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter
             http_response(
                 "429 Too Many Requests",
                 "application/json",
-                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+                "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
             ),
             http_response(
                 "500 Internal Server Error",
                 "application/json",
-                "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}",
+                "{\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}",
             ),
             http_response(
                 "503 Service Unavailable",
                 "application/json",
-                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}",
+                "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}",
             ),
             http_response(
                 "429 Too Many Requests",
                 "application/json",
-                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down again\"}}",
+                "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down again\"}}",
             ),
             http_response(
                 "503 Service Unavailable",
                 "application/json",
-                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"still busy\"}}",
+                "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"still busy\"}}",
             ),
             http_response(
                 "200 OK",
                 "application/json",
-                "{\"id\":\"msg_exp_retry\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Recovered after 5\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+                "{\"id\":\"chatcmpl_exp_retry\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Recovered after 5\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}",
             ),
         ],
     )
     .await;
 
-    let client = ApiClient::new("test-key")
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url())
         .with_retry_policy(8, Duration::from_millis(1), Duration::from_millis(4));
     let started_at = std::time::Instant::now();
@@ -612,128 +502,26 @@ async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
+#[ignore = "local prompt cache (with_prompt_cache / prompt_cache_stats) was removed in the DeepSeek-only migration. DeepSeek exposes implicit prefix caching on the server side, so the client no longer maintains a completion cache."]
 async fn send_message_reuses_recent_completion_cache_entries() {
-    let _guard = env_lock();
-    let temp_root = std::env::temp_dir().join(format!(
-        "api-prompt-cache-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
-
-    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
-        state.clone(),
-        vec![http_response(
-            "200 OK",
-            "application/json",
-            "{\"id\":\"msg_cached\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Cached once\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":4000,\"output_tokens\":2}}",
-        )],
-    )
-    .await;
-
-    let client = AnthropicClient::new("test-key")
-        .with_base_url(server.base_url())
-        .with_prompt_cache(PromptCache::new("integration-session"));
-
-    let first = client
-        .send_message(&sample_request(false))
-        .await
-        .expect("first request should succeed");
-    let second = client
-        .send_message(&sample_request(false))
-        .await
-        .expect("second request should reuse cache");
-
-    assert_eq!(first.content, second.content);
-    assert_eq!(state.lock().await.len(), 1);
-
-    let cache_stats = client
-        .prompt_cache_stats()
-        .expect("prompt cache stats should exist");
-    assert_eq!(cache_stats.completion_cache_hits, 1);
-    assert_eq!(cache_stats.completion_cache_misses, 1);
-    assert_eq!(cache_stats.completion_cache_writes, 1);
-
-    std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
-    std::env::remove_var("CLAUDE_CONFIG_HOME");
+    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
+#[ignore = "prompt cache break detection (with_prompt_cache(PromptCacheConfig{...})) was removed in the DeepSeek-only migration. See send_message_reuses_recent_completion_cache_entries ignore note."]
 async fn send_message_tracks_unexpected_prompt_cache_breaks() {
-    let _guard = env_lock();
-    let temp_root = std::env::temp_dir().join(format!(
-        "api-prompt-break-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
-
-    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
-        state,
-        vec![
-            http_response(
-                "200 OK",
-                "application/json",
-                "{\"id\":\"msg_one\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"One\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":6000,\"output_tokens\":2}}",
-            ),
-            http_response(
-                "200 OK",
-                "application/json",
-                "{\"id\":\"msg_two\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Two\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":1000,\"output_tokens\":2}}",
-            ),
-        ],
-    )
-    .await;
-
-    let request = sample_request(false);
-    let client = AnthropicClient::new("test-key")
-        .with_base_url(server.base_url())
-        .with_prompt_cache(PromptCache::with_config(PromptCacheConfig {
-            session_id: "break-session".to_string(),
-            completion_ttl: Duration::from_secs(0),
-            ..PromptCacheConfig::default()
-        }));
-
-    client
-        .send_message(&request)
-        .await
-        .expect("first response should succeed");
-    client
-        .send_message(&request)
-        .await
-        .expect("second response should succeed");
-
-    let cache_stats = client
-        .prompt_cache_stats()
-        .expect("prompt cache stats should exist");
-    assert_eq!(cache_stats.unexpected_cache_breaks, 1);
-    assert_eq!(
-        cache_stats.last_break_reason.as_deref(),
-        Some("cache read tokens dropped while prompt fingerprint remained stable")
-    );
-
-    std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
-    std::env::remove_var("CLAUDE_CONFIG_HOME");
+    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
 }
 
 #[tokio::test]
-#[ignore = "requires ANTHROPIC_API_KEY and network access"]
+#[ignore = "requires DEEPSEEK_API_KEY and network access to api.deepseek.com"]
 async fn live_stream_smoke_test() {
-    let client = ApiClient::from_env().expect("ANTHROPIC_API_KEY must be set");
+    let client =
+        OpenAiCompatClient::from_env(OpenAiCompatConfig::deepseek()).expect("DEEPSEEK_API_KEY must be set");
     let mut stream = client
         .stream_message(&MessageRequest {
-            model: std::env::var("ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-3-7-sonnet-latest".to_string()),
+            model: std::env::var("DEEPSEEK_MODEL")
+                .unwrap_or_else(|_| "deepseek-v4-pro".to_string()),
             max_tokens: 32,
             messages: vec![InputMessage::user_text(
                 "Reply with exactly: hello from rust",
@@ -894,7 +682,7 @@ fn http_response_with_headers(
 
 fn sample_request(stream: bool) -> MessageRequest {
     MessageRequest {
-        model: "claude-3-7-sonnet-latest".to_string(),
+        model: "deepseek-v4-pro".to_string(),
         max_tokens: 64,
         messages: vec![InputMessage {
             role: "user".to_string(),

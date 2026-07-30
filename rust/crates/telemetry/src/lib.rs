@@ -9,11 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const DEFAULT_APP_NAME: &str = "claude-code";
 pub const DEFAULT_RUNTIME: &str = "rust";
-pub const DEFAULT_AGENTIC_BETA: &str = "claude-code-20250219";
-pub const DEFAULT_PROMPT_CACHING_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientIdentity {
@@ -47,87 +44,6 @@ impl ClientIdentity {
 impl Default for ClientIdentity {
     fn default() -> Self {
         Self::new(DEFAULT_APP_NAME, env!("CARGO_PKG_VERSION"))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnthropicRequestProfile {
-    pub anthropic_version: String,
-    pub client_identity: ClientIdentity,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub betas: Vec<String>,
-    #[serde(default, skip_serializing_if = "Map::is_empty")]
-    pub extra_body: Map<String, Value>,
-}
-
-impl AnthropicRequestProfile {
-    #[must_use]
-    pub fn new(client_identity: ClientIdentity) -> Self {
-        Self {
-            anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
-            client_identity,
-            betas: vec![
-                DEFAULT_AGENTIC_BETA.to_string(),
-                DEFAULT_PROMPT_CACHING_SCOPE_BETA.to_string(),
-            ],
-            extra_body: Map::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
-        let beta = beta.into();
-        if !self.betas.contains(&beta) {
-            self.betas.push(beta);
-        }
-        self
-    }
-
-    #[must_use]
-    pub fn with_extra_body(mut self, key: impl Into<String>, value: Value) -> Self {
-        self.extra_body.insert(key.into(), value);
-        self
-    }
-
-    #[must_use]
-    pub fn header_pairs(&self) -> Vec<(String, String)> {
-        let mut headers = vec![
-            (
-                "anthropic-version".to_string(),
-                self.anthropic_version.clone(),
-            ),
-            ("user-agent".to_string(), self.client_identity.user_agent()),
-        ];
-        if !self.betas.is_empty() {
-            headers.push(("anthropic-beta".to_string(), self.betas.join(",")));
-        }
-        headers
-    }
-
-    pub fn render_json_body<T: Serialize>(&self, request: &T) -> Result<Value, serde_json::Error> {
-        let mut body = serde_json::to_value(request)?;
-        let object = body.as_object_mut().ok_or_else(|| {
-            serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request body must serialize to a JSON object",
-            ))
-        })?;
-        for (key, value) in &self.extra_body {
-            object.insert(key.clone(), value.clone());
-        }
-        if !self.betas.is_empty() {
-            object.insert(
-                "betas".to_string(),
-                Value::Array(self.betas.iter().cloned().map(Value::String).collect()),
-            );
-        }
-        Ok(body)
-    }
-}
-
-impl Default for AnthropicRequestProfile {
-    fn default() -> Self {
-        Self::new(ClientIdentity::default())
     }
 }
 
@@ -432,47 +348,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_profile_emits_headers_and_merges_body() {
-        let profile = AnthropicRequestProfile::new(
-            ClientIdentity::new("claude-code", "1.2.3").with_runtime("rust-cli"),
-        )
-        .with_beta("tools-2026-04-01")
-        .with_extra_body("metadata", serde_json::json!({"source": "test"}));
-
-        assert_eq!(
-            profile.header_pairs(),
-            vec![
-                (
-                    "anthropic-version".to_string(),
-                    DEFAULT_ANTHROPIC_VERSION.to_string()
-                ),
-                ("user-agent".to_string(), "claude-code/1.2.3".to_string()),
-                (
-                    "anthropic-beta".to_string(),
-                    "claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01"
-                        .to_string(),
-                ),
-            ]
-        );
-
-        let body = profile
-            .render_json_body(&serde_json::json!({"model": "claude-sonnet"}))
-            .expect("body should serialize");
-        assert_eq!(
-            body["metadata"]["source"],
-            Value::String("test".to_string())
-        );
-        assert_eq!(
-            body["betas"],
-            serde_json::json!([
-                "claude-code-20250219",
-                "prompt-caching-scope-2026-01-05",
-                "tools-2026-04-01"
-            ])
-        );
-    }
-
-    #[test]
     fn session_tracer_records_structured_events_and_trace_sequence() {
         let sink = Arc::new(MemoryTelemetrySink::default());
         let tracer = SessionTracer::new("session-123", sink.clone());
@@ -480,7 +355,7 @@ mod tests {
         tracer.record_http_request_started(1, "POST", "/v1/messages", Map::new());
         tracer.record_analytics(
             AnalyticsEvent::new("cli", "prompt_sent")
-                .with_property("model", Value::String("claude-opus".to_string())),
+                .with_property("model", Value::String("deepseek-v4-pro".to_string())),
         );
 
         let events = sink.events();

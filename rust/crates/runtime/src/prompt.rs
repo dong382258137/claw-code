@@ -189,7 +189,7 @@ impl SystemPromptSplit {
 }
 
 /// Human-readable default frontier model name embedded into generated prompts.
-pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
+pub const FRONTIER_MODEL_NAME: &str = "DeepSeek V4 Pro";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
@@ -197,7 +197,7 @@ const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ModelFamilyIdentity {
     #[default]
-    Claude,
+    DeepSeek,
     Generic,
 }
 
@@ -205,7 +205,7 @@ impl ModelFamilyIdentity {
     #[must_use]
     pub const fn family_label(self) -> &'static str {
         match self {
-            Self::Claude => FRONTIER_MODEL_NAME,
+            Self::DeepSeek => FRONTIER_MODEL_NAME,
             Self::Generic => "an AI assistant",
         }
     }
@@ -1197,16 +1197,16 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      | complexity | Task Type | Model Tier | Examples |\n\
      |-----------|-----------|------------|----------|\n\
-     | `simple` | Read-only, search, format, single-file edit | **Budget** (flash/haiku/mini) | grep for symbols, read a file, run a test suite, format code |\n\
-     | `diagnostic` | Debugging, root-cause analysis, multi-file reasoning | **Flagship** (pro/opus/sonnet) | trace a bug across modules, analyze error chains, review a PR |\n\
-     | `architectural` | System design, refactor planning, cross-cutting changes | **Flagship** (pro/opus/sonnet) | design a new module, refactor error handling, plan migration |\n\
+     | `simple` | Read-only, search, format, single-file edit | **Budget** (flash) | grep for symbols, read a file, run a test suite, format code |\n\
+     | `diagnostic` | Debugging, root-cause analysis, multi-file reasoning | **Flagship** (pro) | trace a bug across modules, analyze error chains, review a PR |\n\
+     | `architectural` | System design, refactor planning, cross-cutting changes | **Flagship** (pro) | design a new module, refactor error handling, plan migration |\n\
      \n\
-     **Budget-tier models** (names containing `flash`, `haiku`, `mini`, `nano`) \
+     **Budget-tier models** (names containing `flash`) \
      CANNOT handle `diagnostic` or `architectural` tasks — the capability check \
      will reject them. Use them only for `simple` tasks.\n\
      \n\
-     **Flagship-tier models** (names containing `pro`, `opus`, `sonnet`, `gpt-4.1`, \
-     `grok-3`, `o3`, `o4`) can handle any complexity, but cost 5-10x more. Do \
+     **Flagship-tier models** (names containing `pro`) can handle any complexity, \
+     but cost 5-10x more. Do \
      NOT use them for `simple` tasks — it wastes budget.\n\
      \n\
      ### Autonomous Task Decomposition Pattern\n\
@@ -1237,8 +1237,8 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      ```\n\
      Does the task need deep reasoning (debug/design/multi-file analysis)?\n\
-     ├─ No  → Budget model  (flash/haiku/mini)  + complexity=\"simple\"\n\
-     └─ Yes → Flagship model (pro/opus/sonnet)\n\
+     ├─ No  → Budget model  (flash)  + complexity=\"simple\"\n\
+     └─ Yes → Flagship model (pro)\n\
               ├─ Root-cause / debugging?        → complexity=\"diagnostic\"\n\
               └─ Design / refactor / planning?  → complexity=\"architectural\"\n\
      ```\n\
@@ -1631,7 +1631,7 @@ mod tests {
             "2026-03-31",
             "linux",
             "6.8",
-            ModelFamilyIdentity::Claude,
+            ModelFamilyIdentity::DeepSeek,
         )
         .expect("system prompt should load")
         .join(
@@ -1671,8 +1671,8 @@ mod tests {
             .with_project_context(project_context)
             .render();
 
-        // then: the Claude model family label is preserved by default
-        assert!(prompt.contains("Model family: Claude Opus 4.6"));
+        // then: the DeepSeek model family label is preserved by default
+        assert!(prompt.contains("Model family: DeepSeek V4 Pro"));
     }
 
     #[test]
@@ -1695,9 +1695,9 @@ mod tests {
             .find(|line| line.contains("Model family:"))
             .expect("model family line should render");
 
-        // then: the model family line is neutral and excludes Claude Opus 4.6
+        // then: the model family line is neutral and excludes DeepSeek V4 Pro
         assert_eq!(model_family_line, " - Model family: an AI assistant");
-        assert!(!model_family_line.contains("Claude Opus 4.6"));
+        assert!(!model_family_line.contains("DeepSeek V4 Pro"));
     }
 
     #[test]

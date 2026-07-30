@@ -436,8 +436,8 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)]
     fn make_state() -> StatusBarState {
         let mut s = StatusBarState::default();
-        s.model = "claude-sonnet-4-6".to_string();
-        s.provider = "Anthropic".to_string();
+        s.model = "deepseek-v4-pro".to_string();
+        s.provider = "deepseek".to_string();
         s.git_branch = "main".to_string();
         s.session_id = "abc-123".to_string();
         s.permission_mode = "workspace-write".to_string();

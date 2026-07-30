@@ -37,7 +37,7 @@ fn system_content_text_emits_single_string_system_message() {
     // SystemContent::Text 应该作为单个 system message，content 是 string。
     let payload = build_chat_completion_request(
         &sample_request(Some(SystemContent::from_text("be helpful"))),
-        OpenAiCompatConfig::openai(),
+        OpenAiCompatConfig::deepseek(),
     );
     assert_eq!(payload["messages"][0]["role"], json!("system"));
     assert_eq!(payload["messages"][0]["content"], json!("be helpful"));
@@ -55,7 +55,7 @@ fn system_content_blocks_without_cache_control_emits_single_joined_message() {
             SystemBlock::new("section B"),
             SystemBlock::new("section C"),
         ]))),
-        OpenAiCompatConfig::openai(),
+        OpenAiCompatConfig::deepseek(),
     );
     assert_eq!(payload["messages"][0]["role"], json!("system"));
     assert_eq!(
@@ -78,7 +78,7 @@ fn system_content_blocks_with_cache_control_splits_into_static_and_dynamic() {
             SystemBlock::new("dynamic: env_info"),
             SystemBlock::new("dynamic: mcp_instructions"),
         ]))),
-        OpenAiCompatConfig::openai(),
+        OpenAiCompatConfig::deepseek(),
     );
     // 第一个 system message = 静态段
     assert_eq!(payload["messages"][0]["role"], json!("system"));
@@ -107,7 +107,7 @@ fn system_content_blocks_with_cache_control_on_last_block_emits_only_static() {
             SystemBlock::new("section A"),
             SystemBlock::new("section B").with_cache_control(CacheControl::ephemeral()),
         ]))),
-        OpenAiCompatConfig::openai(),
+        OpenAiCompatConfig::deepseek(),
     );
     assert_eq!(payload["messages"][0]["role"], json!("system"));
     assert_eq!(
@@ -119,7 +119,7 @@ fn system_content_blocks_with_cache_control_on_last_block_emits_only_static() {
 
 #[test]
 fn system_content_blocks_with_multiple_cache_control_uses_last_as_boundary() {
-    // 多个 cache_control 标记时，用最后一个作为边界（与 Anthropic 路径
+    // 多个 cache_control 标记时，用最后一个作为边界（与 DeepSeek 路径
     // build_system_blocks 的语义一致 —— 它只在最后一个 static block 上标标记）。
     let payload = build_chat_completion_request(
         &sample_request(Some(SystemContent::Blocks(vec![
@@ -127,7 +127,7 @@ fn system_content_blocks_with_multiple_cache_control_uses_last_as_boundary() {
             SystemBlock::new("B").with_cache_control(CacheControl::ephemeral()),
             SystemBlock::new("C"),
         ]))),
-        OpenAiCompatConfig::openai(),
+        OpenAiCompatConfig::deepseek(),
     );
     // 静态段 = A + B（最后一个 cache_control 在 B 上）
     assert_eq!(payload["messages"][0]["content"], json!("A\n\nB"));
@@ -140,18 +140,18 @@ fn empty_system_content_emits_no_system_message() {
     // 空 SystemContent 不应该产生 system message。
     let payload = build_chat_completion_request(
         &sample_request(Some(SystemContent::Text(String::new()))),
-        OpenAiCompatConfig::openai(),
+        OpenAiCompatConfig::deepseek(),
     );
     assert_eq!(payload["messages"][0]["role"], json!("user"));
 
     let payload = build_chat_completion_request(
         &sample_request(Some(SystemContent::Blocks(vec![]))),
-        OpenAiCompatConfig::openai(),
+        OpenAiCompatConfig::deepseek(),
     );
     assert_eq!(payload["messages"][0]["role"], json!("user"));
 
     let payload =
-        build_chat_completion_request(&sample_request(None), OpenAiCompatConfig::openai());
+        build_chat_completion_request(&sample_request(None), OpenAiCompatConfig::deepseek());
     assert_eq!(payload["messages"][0]["role"], json!("user"));
 }
 
@@ -164,7 +164,7 @@ fn cache_control_marker_does_not_leak_into_openai_payload() {
             SystemBlock::new("static").with_cache_control(CacheControl::ephemeral()),
             SystemBlock::new("dynamic"),
         ]))),
-        OpenAiCompatConfig::openai(),
+        OpenAiCompatConfig::deepseek(),
     );
     let system_msg = &payload["messages"][0];
     // content 必须是纯字符串，不能是带 cache_control 字段的对象数组

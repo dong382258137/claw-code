@@ -914,7 +914,7 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
 
 pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
-        "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`claw {command_name}` has been removed. Set DEEPSEEK_API_KEY instead."
     )
 }
 
@@ -2119,7 +2119,7 @@ fn render_im_start_command() -> (String, serde_json::Value) {
         "",
         "  Prerequisites:",
         "    1. Create \x1b[2m~/.claw/im-bridge.toml\x1b[0m with platform config",
-        "    2. Set \x1b[2mANTHROPIC_API_KEY\x1b[0m (or equivalent) in env",
+        "    2. Set \x1b[2mDEEPSEEK_API_KEY\x1b[0m (or equivalent) in env",
         "    3. Configure bot webhook URL in WeCom/Feishu admin panel",
         "",
         "  The bridge will start an HTTP server at \x1b[2m127.0.0.1:3456\x1b[0m (configurable).",

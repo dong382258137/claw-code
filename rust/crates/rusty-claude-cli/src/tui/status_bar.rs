@@ -485,8 +485,6 @@ mod tests {
     fn context_window_returns_correct_size() {
         assert_eq!(context_window_for_model("claude-sonnet-4"), 200_000);
         assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
-        // GPT-5.4 has 1M context window
-        assert_eq!(context_window_for_model("gpt-5.4"), 1_000_000);
         // DeepSeek V3 (deepseek-chat) has 64K context window
         assert_eq!(context_window_for_model("deepseek-chat"), 64_000);
         // DeepSeek V4 has 1M context window

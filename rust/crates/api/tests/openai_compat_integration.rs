@@ -8,7 +8,7 @@ use api::{
     build_http_client_with, ApiError, ContentBlockDelta, ContentBlockDeltaEvent,
     ContentBlockStartEvent, ContentBlockStopEvent, InputContentBlock, InputMessage,
     MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
-    ProviderClient, ProxyConfig, StreamEvent, SystemContent, ToolChoice, ToolDefinition,
+    ProxyConfig, StreamEvent, SystemContent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,9 +21,9 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
     let body = concat!(
         "{",
         "\"id\":\"chatcmpl_test\",",
-        "\"model\":\"grok-3\",",
+        "\"model\":\"deepseek-v4-pro\",",
         "\"choices\":[{",
-        "\"message\":{\"role\":\"assistant\",\"content\":\"Hello from Grok\",\"tool_calls\":[]},",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Hello from DeepSeek\",\"tool_calls\":[]},",
         "\"finish_reason\":\"stop\"",
         "}],",
         "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":3}}",
@@ -35,22 +35,25 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let response = client
         .send_message(&sample_request(false))
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.model, "grok-3");
-    assert_eq!(response.usage.input_tokens, 8);
+    assert_eq!(response.model, "deepseek-v4-pro");
+    // DeepSeek semantics: input_tokens=0 (all prompt tokens are cache hit or
+    // miss), cache_creation=prompt_tokens-cached_tokens, cache_read=cached_tokens.
+    assert_eq!(response.usage.input_tokens, 0);
+    assert_eq!(response.usage.cache_creation_input_tokens, 8);
     assert_eq!(response.usage.cache_read_input_tokens, 3);
     assert_eq!(response.usage.output_tokens, 5);
     assert_eq!(response.total_tokens(), 16);
     assert_eq!(
         response.content,
         vec![OutputContentBlock::Text {
-            text: "Hello from Grok".to_string(),
+            text: "Hello from DeepSeek".to_string(),
         }]
     );
 
@@ -59,10 +62,10 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
     assert_eq!(request.path, "/chat/completions");
     assert_eq!(
         request.headers.get("authorization").map(String::as_str),
-        Some("Bearer xai-test-key")
+        Some("Bearer deepseek-test-key")
     );
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
-    assert_eq!(body["model"], json!("grok-3"));
+    assert_eq!(body["model"], json!("deepseek-v4-pro"));
     assert_eq!(body["messages"][0]["role"], json!("system"));
     assert_eq!(body["tools"][0]["type"], json!("function"));
 }
@@ -97,7 +100,7 @@ async fn openai_compat_reads_deepseek_native_cache_fields_non_streaming() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let response = client
         .send_message(&sample_request(false))
@@ -138,7 +141,7 @@ async fn openai_compat_reads_deepseek_native_cache_fields_streaming() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let request = MessageRequest {
         model: "deepseek-chat".to_string(),
@@ -189,7 +192,7 @@ async fn send_message_passes_optional_openai_compatible_parameters_on_wire() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let response = client
         .send_message(&MessageRequest {
@@ -239,7 +242,7 @@ async fn send_message_preserves_deepseek_reasoning_content_before_text() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let response = client
         .send_message(&MessageRequest {
@@ -291,7 +294,7 @@ async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params()
     extra_body.insert("parallel_tool_calls".to_string(), json!(false));
     extra_body.insert("model".to_string(), json!("malicious-override"));
 
-    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let response = client
         .send_message(&MessageRequest {
@@ -317,7 +320,7 @@ async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params()
 }
 
 #[tokio::test]
-async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
+async fn send_message_blocks_oversized_deepseek_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
         state.clone(),
@@ -325,16 +328,20 @@ async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let error = client
         .send_message(&MessageRequest {
-            model: "grok-3".to_string(),
+            model: "deepseek-v4-pro".to_string(),
             max_tokens: 64_000,
             messages: vec![InputMessage {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
-                    text: "x".repeat(300_000),
+                    // DeepSeek-v4-pro has a 1M-token context window. The
+                    // preflight estimator uses ~bytes/4, so ~5M chars yields
+                    // ~1.25M estimated input tokens — comfortably above the
+                    // 1M ceiling once max_tokens is added.
+                    text: "x".repeat(5_000_000),
                 }],
             }],
             system: Some(SystemContent::from_text("Keep the answer short.")),
@@ -359,7 +366,7 @@ async fn send_message_accepts_full_chat_completions_endpoint_override() {
     let body = concat!(
         "{",
         "\"id\":\"chatcmpl_full_endpoint\",",
-        "\"model\":\"grok-3\",",
+        "\"model\":\"deepseek-v4-pro\",",
         "\"choices\":[{",
         "\"message\":{\"role\":\"assistant\",\"content\":\"Endpoint override works\",\"tool_calls\":[]},",
         "\"finish_reason\":\"stop\"",
@@ -374,7 +381,7 @@ async fn send_message_accepts_full_chat_completions_endpoint_override() {
     .await;
 
     let endpoint_url = format!("{}/chat/completions", server.base_url());
-    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(endpoint_url);
     let response = client
         .send_message(&sample_request(false))
@@ -392,7 +399,7 @@ async fn send_message_accepts_full_chat_completions_endpoint_override() {
 async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(
-        "data: {\"id\":\"chatcmpl_stream\",\"model\":\"grok-3\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_stream\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
         "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}},{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"clock\",\"arguments\":\"{\\\"zone\\\":\\\"UTC\\\"}\"}}]}}]}\n\n",
         "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n"
@@ -403,19 +410,19 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
             "200 OK",
             "text/event-stream",
             sse,
-            &[("x-request-id", "req_grok_stream")],
+            &[("x-request-id", "req_ds_stream")],
         )],
     )
     .await;
 
-    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+    let client = OpenAiCompatClient::new("deepseek-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let mut stream = client
         .stream_message(&sample_request(false))
         .await
         .expect("stream should start");
 
-    assert_eq!(stream.request_id(), Some("req_grok_stream"));
+    assert_eq!(stream.request_id(), Some("req_ds_stream"));
 
     let mut events = Vec::new();
     while let Some(event) = stream.next_event().await.expect("event should parse") {
@@ -513,7 +520,7 @@ async fn stream_message_retries_retryable_sse_handshake_failures() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url())
         .with_retry_policy(1, Duration::ZERO, Duration::ZERO);
     let mut stream = client
@@ -566,7 +573,7 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let mut stream = client
         .stream_message(&sample_request(false))
@@ -607,7 +614,11 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
 
     match &events[4] {
         StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => {
-            assert_eq!(usage.input_tokens, 7);
+            // DeepSeek semantics: input_tokens=0, cache_creation=prompt-cached,
+            // cache_read=cached. The StreamState model is deepseek-v4-pro
+            // (from sample_request), so is_deepseek=true.
+            assert_eq!(usage.input_tokens, 0);
+            assert_eq!(usage.cache_creation_input_tokens, 7);
             assert_eq!(usage.cache_read_input_tokens, 2);
             assert_eq!(usage.output_tokens, 4);
             assert_eq!(usage.total_tokens(), 13);
@@ -640,7 +651,7 @@ async fn openai_compatible_client_honors_http_proxy_for_requests() {
     let proxied_http = build_http_client_with(&ProxyConfig::from_proxy_url(proxy.base_url()))
         .expect("proxy client should build");
 
-    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::deepseek())
         .with_http_client(proxied_http)
         .with_base_url("http://origin.invalid/v1");
     let response = client
@@ -663,40 +674,14 @@ async fn openai_compatible_client_honors_http_proxy_for_requests() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+#[ignore = "ProviderClient::Xai(_), XAI_API_KEY, XAI_BASE_URL, and OpenAiCompatConfig::xai() were removed in the DeepSeek-only migration. xAI provider dispatch is no longer reachable. DeepSeek provider dispatch is covered by client_integration.rs::provider_client_dispatches_deepseek_requests."]
 async fn provider_client_dispatches_xai_requests_from_env() {
-    let _lock = env_lock();
-    let _api_key = ScopedEnvVar::set("XAI_API_KEY", "xai-test-key");
-
-    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
-        state.clone(),
-        vec![http_response(
-            "200 OK",
-            "application/json",
-            "{\"id\":\"chatcmpl_provider\",\"model\":\"grok-3\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Through provider client\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}",
-        )],
-    )
-    .await;
-    let _base_url = ScopedEnvVar::set("XAI_BASE_URL", server.base_url());
-
-    let client =
-        ProviderClient::from_model("grok").expect("xAI provider client should be constructed");
-    assert!(matches!(client, ProviderClient::Xai(_)));
-
-    let response = client
-        .send_message(&sample_request(false))
-        .await
-        .expect("provider-dispatched request should succeed");
-
-    assert_eq!(response.total_tokens(), 13);
-
-    let captured = state.lock().await;
-    let request = captured.first().expect("captured request");
-    assert_eq!(request.path, "/chat/completions");
-    assert_eq!(
-        request.headers.get("authorization").map(String::as_str),
-        Some("Bearer xai-test-key")
-    );
+    // Migration audit stub. The original test verified that
+    // `ProviderClient::from_model("grok")` resolved to `ProviderClient::Xai(_)`
+    // and dispatched requests with `XAI_API_KEY` / `XAI_BASE_URL`. Both the
+    // enum variant and the xAI-specific env vars have been deleted; all models
+    // now route through the DeepSeek-only OpenAiCompatClient.
+    let _state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -829,7 +814,7 @@ fn http_response_with_headers(
 
 fn sample_request(stream: bool) -> MessageRequest {
     MessageRequest {
-        model: "grok-3".to_string(),
+        model: "deepseek-v4-pro".to_string(),
         max_tokens: 64,
         messages: vec![InputMessage {
             role: "user".to_string(),
@@ -887,7 +872,7 @@ async fn deepseek_v4_openai_format_cached_tokens_applies_deepseek_semantics() {
     )
     .await;
 
-    let client = OpenAiCompatClient::new("ds-v4-key", OpenAiCompatConfig::openai())
+    let client = OpenAiCompatClient::new("ds-v4-key", OpenAiCompatConfig::deepseek())
         .with_base_url(server.base_url());
     let response = client
         .send_message(&sample_request(false))
@@ -913,12 +898,14 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[allow(dead_code)]
 struct ScopedEnvVar {
     key: &'static str,
     previous: Option<OsString>,
 }
 
 impl ScopedEnvVar {
+    #[allow(dead_code)]
     fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);

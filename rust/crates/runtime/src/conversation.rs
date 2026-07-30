@@ -7936,7 +7936,7 @@ mod tests {
         )
         .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
 
-        // 两个 task 都应被能力校验拒绝:flash+Diagnostic / haiku+Architectural
+        // 两个 task 都应被能力校验拒绝:flash+Diagnostic / flash+Architectural
         let tasks = vec![
             crate::multi_agent::SpawnRequest::new(
                 "diag-agent",
@@ -7949,7 +7949,7 @@ mod tests {
                 "arch-agent",
                 "架构评估",
                 crate::multi_agent::CoordinationMode::Fork,
-                "claude-haiku-4-5",
+                "deepseek-v4-flash",
                 crate::multi_agent::TaskComplexity::Architectural,
             ),
         ];
@@ -8463,7 +8463,7 @@ mod tests {
         let input = r#"{
             "tasks": [
                 {"name":"a","task":"do A","model":"deepseek-v4-pro"},
-                {"name":"b","task":"do B","model":"claude-haiku","mode":"fork","complexity":"simple"}
+                {"name":"b","task":"do B","model":"deepseek-v4-flash","mode":"fork","complexity":"simple"}
             ],
             "fail_fast":"off"
         }"#;

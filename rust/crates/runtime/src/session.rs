@@ -1401,15 +1401,11 @@ fn truncate_jsonl_field(value: &str) -> String {
 fn redact_jsonl_secrets(value: &str) -> String {
     let mut redacted = value.to_string();
     for marker in [
-        "ANTHROPIC_API_KEY=",
-        "ANTHROPIC_AUTH_TOKEN=",
+        "DEEPSEEK_API_KEY=",
         "OPENAI_API_KEY=",
-        "DASHSCOPE_API_KEY=",
-        "XAI_API_KEY=",
         "Authorization: Bearer ",
         "authorization: Bearer ",
         "Bearer sk-",
-        "sk-ant-",
     ] {
         redacted = redact_after_marker(&redacted, marker);
     }

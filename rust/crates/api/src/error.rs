@@ -29,8 +29,8 @@ pub enum ApiError {
         env_vars: &'static [&'static str],
         /// Optional, runtime-computed hint appended to the error Display
         /// output. Populated when the provider resolver can infer what the
-        /// user probably intended (e.g. an `OpenAI` key is set but Anthropic
-        /// was selected because no Anthropic credentials exist).
+        /// user probably intended (e.g. `DEEPSEEK_API_KEY` is missing but
+        /// another credential is set in the environment).
         hint: Option<String>,
     },
     ContextWindowExceeded {
@@ -539,11 +539,11 @@ mod tests {
         let source = serde_json::from_str::<serde_json::Value>("{not json")
             .expect_err("invalid json should fail to parse");
 
-        let error = ApiError::json_deserialize("Anthropic", "claude-opus-4-6", &raw_body, source);
+        let error = ApiError::json_deserialize("DeepSeek", "deepseek-v4-pro", &raw_body, source);
         let rendered = error.to_string();
 
         assert!(
-            rendered.starts_with("failed to parse Anthropic response for model claude-opus-4-6: "),
+            rendered.starts_with("failed to parse DeepSeek response for model deepseek-v4-pro: "),
             "rendered error should lead with provider and model: {rendered}"
         );
         assert!(
@@ -684,10 +684,7 @@ mod tests {
     #[test]
     fn missing_credentials_without_hint_renders_the_canonical_message() {
         // given
-        let error = ApiError::missing_credentials(
-            "Anthropic",
-            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
-        );
+        let error = ApiError::missing_credentials("DeepSeek", &["DEEPSEEK_API_KEY"]);
 
         // when
         let rendered = error.to_string();
@@ -695,7 +692,7 @@ mod tests {
         // then
         assert!(
             rendered.starts_with(
-                "missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API"
+                "missing DeepSeek credentials; export DEEPSEEK_API_KEY before calling the DeepSeek API"
             ),
             "rendered error should lead with the canonical missing-credential message: {rendered}"
         );
@@ -709,9 +706,9 @@ mod tests {
     fn missing_credentials_with_hint_appends_the_hint_after_base_message() {
         // given
         let error = ApiError::missing_credentials_with_hint(
-            "Anthropic",
-            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
-            "I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.",
+            "DeepSeek",
+            &["DEEPSEEK_API_KEY"],
+            "DEEPSEEK_API_KEY is not set — export it before starting the session.",
         );
 
         // when
@@ -719,10 +716,10 @@ mod tests {
 
         // then
         assert!(
-            rendered.starts_with("missing Anthropic credentials;"),
+            rendered.starts_with("missing DeepSeek credentials;"),
             "hint should be appended, not replace the base message: {rendered}"
         );
-        let hint_marker = " — hint: I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.";
+        let hint_marker = " — hint: DEEPSEEK_API_KEY is not set — export it before starting the session.";
         assert!(
             rendered.ends_with(hint_marker),
             "rendered error should end with the hint: {rendered}"

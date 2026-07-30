@@ -1871,8 +1871,8 @@ mod tests {
             home.join("settings.json"),
             r#"{
               "providerFallbacks": {
-                "primary": "claude-opus-4-6",
-                "fallbacks": ["grok-3", "grok-3-mini"]
+                "primary": "deepseek-v4-pro",
+                "fallbacks": ["deepseek-v4-flash", "deepseek-v4-flash"]
               }
             }"#,
         )
@@ -1885,10 +1885,10 @@ mod tests {
 
         // then
         let chain = loaded.provider_fallbacks();
-        assert_eq!(chain.primary(), Some("claude-opus-4-6"));
+        assert_eq!(chain.primary(), Some("deepseek-v4-pro"));
         assert_eq!(
             chain.fallbacks(),
-            &["grok-3".to_string(), "grok-3-mini".to_string()]
+            &["deepseek-v4-flash".to_string(), "deepseek-v4-flash".to_string()]
         );
         assert!(!chain.is_empty());
 
@@ -2271,12 +2271,12 @@ mod tests {
 
         fs::write(
             home.join("settings.json"),
-            r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"claude-opus-4-6"}}"#,
+            r#"{"aliases":{"fast":"deepseek-v4-flash","smart":"deepseek-v4-pro"}}"#,
         )
         .expect("write user settings");
         fs::write(
             cwd.join(".claw").join("settings.local.json"),
-            r#"{"aliases":{"smart":"claude-sonnet-4-6","cheap":"grok-3-mini"}}"#,
+            r#"{"aliases":{"smart":"deepseek-v4-pro","cheap":"deepseek-v4-flash"}}"#,
         )
         .expect("write local settings");
 
@@ -2289,15 +2289,15 @@ mod tests {
         let aliases = loaded.aliases();
         assert_eq!(
             aliases.get("fast").map(String::as_str),
-            Some("claude-haiku-4-5-20251213")
+            Some("deepseek-v4-flash")
         );
         assert_eq!(
             aliases.get("smart").map(String::as_str),
-            Some("claude-sonnet-4-6")
+            Some("deepseek-v4-pro")
         );
         assert_eq!(
             aliases.get("cheap").map(String::as_str),
-            Some("grok-3-mini")
+            Some("deepseek-v4-flash")
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");

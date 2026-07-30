@@ -1,4 +1,4 @@
-﻿//! First-run configuration wizard for the Claw Plus TUI.
+//! First-run configuration wizard for the Claw Plus TUI.
 //!
 //! When the bootstrapped sentinel file is missing, this module presents a
 //! two-step ratatui screen that lets the user select a provider and enter an
@@ -43,38 +43,6 @@ struct ProviderInfo {
 }
 
 const KNOWN_PROVIDERS: &[ProviderInfo] = &[
-    ProviderInfo {
-        label: "Anthropic",
-        env_key: "ANTHROPIC_API_KEY",
-        slug: "anthropic",
-        default_model: "sonnet",
-        base_url_env: "ANTHROPIC_BASE_URL",
-        description: "Claude models (Sonnet, Opus, Haiku)",
-    },
-    ProviderInfo {
-        label: "OpenAI",
-        env_key: "OPENAI_API_KEY",
-        slug: "openai",
-        default_model: "openai/gpt-4.1-mini",
-        base_url_env: "OPENAI_BASE_URL",
-        description: "GPT-4.1, GPT-4o, o3, o4-mini",
-    },
-    ProviderInfo {
-        label: "xAI (Grok)",
-        env_key: "XAI_API_KEY",
-        slug: "xai",
-        default_model: "grok",
-        base_url_env: "XAI_BASE_URL",
-        description: "Grok-3, Grok-3-mini",
-    },
-    ProviderInfo {
-        label: "DashScope (Kimi / Qwen)",
-        env_key: "DASHSCOPE_API_KEY",
-        slug: "dashscope",
-        default_model: "kimi",
-        base_url_env: "DASHSCOPE_BASE_URL",
-        description: "Kimi K2.5, Qwen models via Alibaba Cloud",
-    },
     ProviderInfo {
         label: "DeepSeek",
         env_key: "DEEPSEEK_API_KEY",
@@ -206,17 +174,8 @@ pub(crate) fn run_first_run_wizard() -> Result<(), Box<dyn std::error::Error>> {
 
 fn inject_api_key(provider_slug: &str, api_key: &str) {
     match provider_slug {
-        "anthropic" => {
-            std::env::set_var("ANTHROPIC_API_KEY", api_key);
-        }
-        "openai" => {
-            std::env::set_var("OPENAI_API_KEY", api_key);
-        }
-        "xai" => {
-            std::env::set_var("XAI_API_KEY", api_key);
-        }
-        "dashscope" => {
-            std::env::set_var("DASHSCOPE_API_KEY", api_key);
+        "deepseek" => {
+            std::env::set_var("DEEPSEEK_API_KEY", api_key);
         }
         _ => {}
     }

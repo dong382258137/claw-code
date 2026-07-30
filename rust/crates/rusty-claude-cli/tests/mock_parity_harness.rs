@@ -10,14 +10,14 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
+use mock_deepseek_service::{MockDeepSeekService, SCENARIO_PREFIX};
 use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios() {
+fn clean_env_cli_reaches_mock_deepseek_service_across_scripted_parity_scenarios() {
     let manifest_entries = load_scenario_manifest();
     let manifest = manifest_entries
         .iter()
@@ -26,7 +26,7 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
         .collect::<BTreeMap<_, _>>();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
     let server = runtime
-        .block_on(MockAnthropicService::spawn())
+        .block_on(MockDeepSeekService::spawn())
         .expect("mock service should start");
     let base_url = server.base_url();
 
@@ -186,19 +186,19 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
     }
 
     let captured = runtime.block_on(server.captured_requests());
-    // After `be561bf` added count_tokens preflight, each turn sends an
-    // extra POST to `/v1/messages/count_tokens` before the messages POST.
-    // The original count (21) assumed messages-only requests.  We now
-    // filter to `/v1/messages` and verify that subset matches the original
-    // scenario expectation.
+    // DeepSeek uses the OpenAI-compatible chat completions endpoint
+    // (`POST /chat/completions`) for both streaming and non-streaming
+    // requests. Unlike the old Anthropic client, the DeepSeek client
+    // performs only a local context-window preflight (no extra HTTP call),
+    // so every captured request is a chat completions request.
     let messages_only: Vec<_> = captured
         .iter()
-        .filter(|r| r.path == "/v1/messages")
+        .filter(|r| r.path == "/chat/completions")
         .collect();
     assert_eq!(
         messages_only.len(),
         21,
-        "twelve scenarios should produce twenty-one /v1/messages requests (total captured: {}, includes count_tokens)",
+        "twelve scenarios should produce twenty-one /chat/completions requests (total captured: {})",
         captured.len()
     );
     assert!(messages_only.iter().all(|request| request.stream));
@@ -315,15 +315,15 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     command
         .current_dir(&workspace.root)
         .env_clear()
-        .env("ANTHROPIC_API_KEY", "test-parity-key")
-        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("DEEPSEEK_API_KEY", "test-parity-key")
+        .env("DEEPSEEK_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", &workspace.config_home)
         .env("HOME", &workspace.home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args([
             "--model",
-            "sonnet",
+            "pro",
             "--permission-mode",
             case.permission_mode,
             "--output-format=json",

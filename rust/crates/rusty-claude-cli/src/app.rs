@@ -67,9 +67,8 @@ use crate::streaming::{
     format_context_window_blocked_error, format_user_visible_api_error,
     mark_last_tool_with_cache_control, permission_policy, prompt_cache_record_to_runtime_event,
     push_output_block, push_prompt_cache_record, render_thinking_block_summary,
-    request_ends_with_tool_result, resolve_cli_auth_source, resolve_cli_auth_source_for_cwd,
-    response_to_events, AnthropicRuntimeClient, HookAbortMonitor, NETWORK_ERROR_KEYWORDS,
-    POST_TOOL_STALL_TIMEOUT,
+    request_ends_with_tool_result, response_to_events, AnthropicRuntimeClient, HookAbortMonitor,
+    NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
 };
 use crate::suggestion::{
     common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
@@ -96,11 +95,10 @@ use crate::ultraplan::{
 };
 use api::{
     detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
-    model_token_limit, resolve_startup_auth_source, AnthropicClient, AuthSource, CacheControl,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    model_token_limit, CacheControl, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock,
+    SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -113,8 +111,8 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
+    check_base_commit, format_stale_base_warning, format_usd, load_system_prompt,
+    load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
     CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ContextAssembler,
     ConversationMessage, ConversationRuntime, HistoryIndex, McpServer, McpServerManager,
@@ -3001,7 +2999,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         //   (降级为 MVP 行为:只有命令 gate,无 LLM judge)
         // - 注入后,LlmJudgeGate::validate 会在命令 gate 之后执行,
         //   对诊断/架构任务做四维评分(根因定位/方案可行性/完整性/副作用)
-        match crate::llm_clients::AnthropicJudgeClient::new(&model_for_subagent, Some(1024)) {
+        match crate::llm_clients::DeepSeekJudgeClient::new(&model_for_subagent, Some(1024)) {
             Ok(judge_client) => {
                 let judge: std::sync::Arc<dyn runtime::multi_agent::validation::JudgeClient> =
                     std::sync::Arc::new(judge_client);
@@ -3043,7 +3041,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     // - 构造失败(无 API key / 模型名无效)时跳过,不阻断启动
     //   (降级为 Heuristic,保证不丢决策)
     // - 用 budget 模型降低成本(提取任务对推理能力要求低于 judge)
-    match crate::llm_clients::AnthropicDecisionExtractorClient::new(
+    match crate::llm_clients::DeepSeekDecisionExtractorClient::new(
         &model_for_subagent,
         Some(2048),
     ) {

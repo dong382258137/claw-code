@@ -1,58 +1,92 @@
+//! Integration tests for `ProviderClient` provider routing in the DeepSeek-only
+//! build.
+//!
+//! Originally these tests asserted that the legacy enum-based `ProviderClient`
+//! dispatched `grok` / `claude` models to xAI / Anthropic variants and that
+//! `read_xai_base_url` honoured `XAI_BASE_URL`. After the DeepSeek-only
+//! migration the only supported provider is DeepSeek, so the tests now verify
+//! that:
+//!   * `ProviderClient::from_model` resolves DeepSeek aliases.
+//!   * `ProviderClient::from_model` surfaces `MissingCredentials` when
+//!     `DEEPSEEK_API_KEY` is absent.
+//!   * `read_base_url` honours `DEEPSEEK_BASE_URL`.
+//!
+//! Tests that exercised Anthropic / xAI-only surfaces (`from_model_with_anthropic_auth`,
+//! `AuthSource::ApiKey`, `ProviderKind::Anthropic` / `ProviderKind::Xai`) are
+//! preserved below as `#[ignore]`d migration audit stubs.
+
 use std::ffi::OsString;
 use std::sync::{Mutex, OnceLock};
 
-use api::{read_xai_base_url, ApiError, AuthSource, ProviderClient, ProviderKind};
+use api::{read_base_url, ApiError, ProviderClient, ProviderKind};
 
 #[test]
-fn provider_client_routes_grok_aliases_through_xai() {
+fn provider_client_routes_deepseek_aliases_to_deepseek_kind() {
     let _lock = env_lock();
-    let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
+    let _api_key = EnvVarGuard::set("DEEPSEEK_API_KEY", Some("deepseek-test-key"));
 
-    let client = ProviderClient::from_model("grok-mini").expect("grok alias should resolve");
+    let client = ProviderClient::from_model("pro").expect("pro alias should resolve to DeepSeek");
 
-    assert_eq!(client.provider_kind(), ProviderKind::Xai);
+    assert_eq!(client.provider_kind(), ProviderKind::DeepSeek);
 }
 
 #[test]
-fn provider_client_reports_missing_xai_credentials_for_grok_models() {
+fn provider_client_reports_missing_deepseek_credentials_when_env_unset() {
     let _lock = env_lock();
-    let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", None);
+    let _api_key = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
+    // Defensive: ensure no .env leak from the working directory influences the
+    // lookup. The `from_env` path consults `dotenv_value("DEEPSEEK_API_KEY")`
+    // as a fallback, so unsetting the env var alone is not always sufficient.
+    let _previous_cwd = EnvVarGuard::set_cwd_for_dotenv_isolation();
 
-    let error = ProviderClient::from_model("grok-3")
-        .expect_err("grok requests without XAI_API_KEY should fail fast");
+    let error = ProviderClient::from_model("deepseek-v4-pro")
+        .expect_err("deepseek requests without DEEPSEEK_API_KEY should fail fast");
 
     match error {
         ApiError::MissingCredentials {
-            provider, env_vars, ..
+            provider,
+            env_vars,
+            ..
         } => {
-            assert_eq!(provider, "xAI");
-            assert_eq!(env_vars, &["XAI_API_KEY"]);
+            assert_eq!(provider, "DeepSeek");
+            assert_eq!(env_vars, &["DEEPSEEK_API_KEY"]);
         }
-        other => panic!("expected missing xAI credentials, got {other:?}"),
+        other => panic!("expected missing DeepSeek credentials, got {other:?}"),
     }
 }
 
 #[test]
-fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
+fn read_base_url_prefers_deepseek_env_override() {
     let _lock = env_lock();
-    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
-    let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+    let _base_url = EnvVarGuard::set(
+        "DEEPSEEK_BASE_URL",
+        Some("https://example.deepseek.test/v1"),
+    );
 
-    let client = ProviderClient::from_model_with_anthropic_auth(
-        "claude-sonnet-4-6",
-        Some(AuthSource::ApiKey("anthropic-test-key".to_string())),
-    )
-    .expect("explicit anthropic auth should avoid env lookup");
-
-    assert_eq!(client.provider_kind(), ProviderKind::Anthropic);
+    assert_eq!(
+        read_base_url(),
+        "https://example.deepseek.test/v1"
+    );
 }
 
 #[test]
-fn read_xai_base_url_prefers_env_override() {
-    let _lock = env_lock();
-    let _xai_base_url = EnvVarGuard::set("XAI_BASE_URL", Some("https://example.xai.test/v1"));
+#[ignore = "from_model_with_anthropic_auth + AuthSource::ApiKey + ProviderKind::Anthropic were removed in the DeepSeek-only migration. DeepSeek auth is resolved internally via DEEPSEEK_API_KEY / OpenAiCompatClient::from_env, so there is no separate AuthSource surface to test."]
+fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
+    // Migration audit stub. The original test verified that
+    // `ProviderClient::from_model_with_anthropic_auth("claude-sonnet-4-6",
+    // Some(AuthSource::ApiKey("anthropic-test-key")))` would skip env lookup
+    // and return a `ProviderKind::Anthropic` client. Both the constructor and
+    // the enum variant no longer exist.
+}
 
-    assert_eq!(read_xai_base_url(), "https://example.xai.test/v1");
+#[test]
+#[ignore = "ProviderKind::Xai and OpenAiCompatConfig::xai() were removed in the DeepSeek-only migration. xAI provider dispatch (XAI_API_KEY, read_xai_base_url, ProviderClient::Xai(_)) is no longer reachable."]
+fn provider_client_routes_grok_aliases_through_xai() {
+    // Migration audit stub. The original test verified that
+    // `ProviderClient::from_model("grok-mini")` resolved to
+    // `ProviderClient::Xai(_)` with `ProviderKind::Xai`. With the migration
+    // `detect_provider_kind` always returns `ProviderKind::DeepSeek` and the
+    // xAI-specific code paths have been deleted.
 }
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -76,6 +110,23 @@ impl EnvVarGuard {
         }
         Self { key, original }
     }
+
+    /// Move the process cwd into a fresh temp directory so `dotenv_value`
+    /// (which reads `./.env`) cannot accidentally supply `DEEPSEEK_API_KEY`.
+    /// Returns a guard that restores the previous cwd on drop.
+    fn set_cwd_for_dotenv_isolation() -> CwdGuard {
+        let previous = std::env::current_dir().ok();
+        let temp = std::env::temp_dir().join(format!(
+            "api-provider-client-isolation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = std::fs::create_dir_all(&temp);
+        let _ = std::env::set_current_dir(&temp);
+        CwdGuard { previous, temp }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -84,5 +135,19 @@ impl Drop for EnvVarGuard {
             Some(value) => std::env::set_var(self.key, value),
             None => std::env::remove_var(self.key),
         }
+    }
+}
+
+struct CwdGuard {
+    previous: Option<std::path::PathBuf>,
+    temp: std::path::PathBuf,
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            let _ = std::env::set_current_dir(previous);
+        }
+        let _ = std::fs::remove_dir_all(&self.temp);
     }
 }

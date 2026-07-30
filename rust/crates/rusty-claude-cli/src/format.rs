@@ -1,4 +1,4 @@
-﻿//! Output formatting: reports, JSON, status bar, help text, diff rendering.
+//! Output formatting: reports, JSON, status bar, help text, diff rendering.
 
 use std::env;
 use std::io::{self, Write};
@@ -2071,7 +2071,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  claw --model claude-opus \"summarize this repo\"")?;
+    writeln!(out, "  claw --model deepseek-v4-pro \"summarize this repo\"")?;
     writeln!(
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""

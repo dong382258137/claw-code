@@ -19,9 +19,6 @@ use crate::types::{
 
 use super::{preflight_message_request, Provider, ProviderFuture};
 
-pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
-pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
@@ -35,66 +32,19 @@ pub struct OpenAiCompatConfig {
     pub api_key_env: &'static str,
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
-    /// Maximum request body size in bytes. Provider-specific limits:
-    /// - `DashScope`: 6MB (`6_291_456` bytes) - observed in dogfood testing
-    /// - `OpenAI`: 100MB (`104_857_600` bytes)
-    /// - `xAI`: 50MB (`52_428_800` bytes)
+    /// Maximum request body size in bytes.
     pub max_request_body_bytes: usize,
 }
 
-const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
-const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
-const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
-const DEEPSEEK_ENV_VARS: &[&str] = &["DEEPSEEK_API_KEY", "OPENAI_API_KEY"];
+const DEEPSEEK_ENV_VARS: &[&str] = &["DEEPSEEK_API_KEY"];
 
-// Provider-specific request body size limits in bytes
-const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
-const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
-const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
-// DeepSeek has no documented body size limit; use 100MB same as OpenAI (safe default)
+// DeepSeek has no documented body size limit; use 100MB as a safe default.
 const DEEPSEEK_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 
 impl OpenAiCompatConfig {
-    #[must_use]
-    pub const fn xai() -> Self {
-        Self {
-            provider_name: "xAI",
-            api_key_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: DEFAULT_XAI_BASE_URL,
-            max_request_body_bytes: XAI_MAX_REQUEST_BODY_BYTES,
-        }
-    }
-
-    #[must_use]
-    pub const fn openai() -> Self {
-        Self {
-            provider_name: "OpenAI",
-            api_key_env: "OPENAI_API_KEY",
-            base_url_env: "OPENAI_BASE_URL",
-            default_base_url: DEFAULT_OPENAI_BASE_URL,
-            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
-        }
-    }
-
-    /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
-    /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
-    /// Requested via Discord #clawcode-get-help: native Alibaba API for
-    /// higher rate limits than going through `OpenRouter`.
-    #[must_use]
-    pub const fn dashscope() -> Self {
-        Self {
-            provider_name: "DashScope",
-            api_key_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
-            max_request_body_bytes: DASHSCOPE_MAX_REQUEST_BODY_BYTES,
-        }
-    }
-
     /// DeepSeek API (deepseek-v4-pro, deepseek-v4-flash, etc.)
     /// Uses the OpenAI-compatible REST shape at api.deepseek.com/v1.
-    /// Primary auth via DEEPSEEK_API_KEY, with fallback to OPENAI_API_KEY.
+    /// Auth via DEEPSEEK_API_KEY.
     #[must_use]
     pub const fn deepseek() -> Self {
         Self {
@@ -108,13 +58,7 @@ impl OpenAiCompatConfig {
 
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
-        match self.provider_name {
-            "xAI" => XAI_ENV_VARS,
-            "OpenAI" => OPENAI_ENV_VARS,
-            "DashScope" => DASHSCOPE_ENV_VARS,
-            "DeepSeek" => DEEPSEEK_ENV_VARS,
-            _ => &[],
-        }
+        DEEPSEEK_ENV_VARS
     }
 }
 
@@ -152,27 +96,9 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let api_key = match read_env_non_empty(config.api_key_env)? {
-            Some(key) => key,
-            None if config.api_key_env == "DEEPSEEK_API_KEY" => {
-                // DeepSeek key fallback: try OPENAI_API_KEY as alternative auth.
-                // This supports users who share one API key across providers
-                // (e.g. via OpenRouter or a unified proxy that needs both
-                // Anthropic and DeepSeek access).
-                read_env_non_empty("OPENAI_API_KEY")?.ok_or_else(|| {
-                    ApiError::missing_credentials(
-                        "DeepSeek",
-                        &["DEEPSEEK_API_KEY", "OPENAI_API_KEY"],
-                    )
-                })?
-            }
-            None => {
-                return Err(ApiError::missing_credentials(
-                    config.provider_name,
-                    config.credential_env_vars(),
-                ));
-            }
-        };
+        let api_key = read_env_non_empty(config.api_key_env)?.ok_or_else(|| {
+            ApiError::missing_credentials(config.provider_name, config.credential_env_vars())
+        })?;
         Ok(Self::new(api_key, config))
     }
 
@@ -987,25 +913,12 @@ struct ErrorBody {
 /// Returns true for models known to reject tuning parameters like temperature,
 /// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
-/// Returns true for models known to reject tuning parameters like temperature,
-/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
-/// reasoning/chain-of-thought models with fixed sampling.
+/// DeepSeek-reasoner is handled via `model_requires_reasoning_content_in_history`
+/// and does not rely on this function.
 /// Public for benchmarking and testing purposes.
 #[must_use]
-pub fn is_reasoning_model(model: &str) -> bool {
-    let lowered = model.to_ascii_lowercase();
-    // Strip any provider/ prefix for the check (e.g. qwen/qwen-qwq -> qwen-qwq)
-    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    // OpenAI reasoning models
-    canonical.starts_with("o1")
-        || canonical.starts_with("o3")
-        || canonical.starts_with("o4")
-        // xAI reasoning: grok-3-mini always uses reasoning mode
-        || canonical == "grok-3-mini"
-        // Alibaba DashScope reasoning variants (QwQ + Qwen3-Thinking family)
-        || canonical.starts_with("qwen-qwq")
-        || canonical.starts_with("qwq")
-        || canonical.contains("thinking")
+pub fn is_reasoning_model(_model: &str) -> bool {
+    false
 }
 
 /// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
@@ -1017,54 +930,32 @@ pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
     canonical.starts_with("deepseek-v4")
 }
 
-/// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
-/// The prefix is used only to select transport; the backend expects the
-/// bare model id.
+/// Strip routing prefix (e.g., "deepseek/deepseek-v4-pro" → "deepseek-v4-pro")
+/// for the wire. The prefix is used only to select transport; the backend
+/// expects the bare model id.
 #[allow(dead_code)]
 fn strip_routing_prefix(model: &str) -> &str {
     if let Some(pos) = model.find('/') {
         let prefix = &model[..pos];
-        // Only strip if the prefix before "/" is a known routing prefix,
-        // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
-            &model[pos + 1..]
-        } else {
-            model
+        if prefix.eq_ignore_ascii_case("deepseek") {
+            return &model[pos + 1..];
         }
-    } else {
-        model
     }
+    model
 }
 
 fn wire_model_for_base_url<'a>(
     model: &'a str,
-    config: OpenAiCompatConfig,
-    base_url: &str,
+    _config: OpenAiCompatConfig,
+    _base_url: &str,
 ) -> Cow<'a, str> {
     let Some(pos) = model.find('/') else {
         return Cow::Borrowed(model);
     };
     let prefix = &model[..pos];
-    let lowered_prefix = prefix.to_ascii_lowercase();
-
-    if lowered_prefix == "openai" {
-        let trimmed_base_url = base_url.trim_end_matches('/');
-        let default_openai = DEFAULT_OPENAI_BASE_URL.trim_end_matches('/');
-        if config.provider_name == "OpenAI" && trimmed_base_url != default_openai {
-            // OpenAI-compatible gateways such as OpenRouter commonly use
-            // slash-containing model slugs (for example `openai/gpt-4.1-mini`).
-            // Preserve the slug when the user configured a non-default OpenAI
-            // base URL; the prefix still routed to the OpenAI-compatible client,
-            // but the gateway owns the final model namespace.
-            return Cow::Borrowed(model);
-        }
+    if prefix.eq_ignore_ascii_case("deepseek") {
         return Cow::Borrowed(&model[pos + 1..]);
     }
-
-    if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
-        return Cow::Borrowed(&model[pos + 1..]);
-    }
-
     Cow::Borrowed(model)
 }
 
@@ -1218,23 +1109,14 @@ fn build_chat_completion_request_for_base_url(
     // still proceed with the remaining history intact.
     messages = sanitize_tool_message_pairing(messages);
 
-    // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
-    // We send the correct field based on the wire model name so gpt-5.x requests
-    // don't fail with "unknown field max_tokens".
-    let max_tokens_key = if wire_model.starts_with("gpt-5") {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    };
-
     let mut payload = json!({
         "model": wire_model,
-        max_tokens_key: request.max_tokens,
+        "max_tokens": request.max_tokens,
         "messages": messages,
         "stream": request.stream,
     });
 
-    if request.stream && should_request_stream_usage(config) {
+    if request.stream {
         payload["stream_options"] = json!({ "include_usage": true });
     }
 
@@ -1247,8 +1129,6 @@ fn build_chat_completion_request_for_base_url(
     }
 
     // OpenAI-compatible tuning parameters — only included when explicitly set.
-    // Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
-    // silently strip them to avoid cryptic provider errors.
     if !is_reasoning_model(&request.model) {
         if let Some(temperature) = request.temperature {
             payload["temperature"] = json!(temperature);
@@ -1269,7 +1149,7 @@ fn build_chat_completion_request_for_base_url(
             payload["stop"] = json!(stop);
         }
     }
-    // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
+    // reasoning_effort for DeepSeek reasoning models (deepseek-reasoner, etc.)
     if let Some(effort) = &request.reasoning_effort {
         payload["reasoning_effort"] = json!(effort);
     }
@@ -1287,35 +1167,14 @@ fn build_chat_completion_request_for_base_url(
 fn is_protected_extra_body_key(key: &str) -> bool {
     matches!(
         key,
-        "model"
-            | "messages"
-            | "stream"
-            | "tools"
-            | "tool_choice"
-            | "max_tokens"
-            | "max_completion_tokens"
+        "model" | "messages" | "stream" | "tools" | "tool_choice" | "max_tokens"
     )
-}
-
-/// Returns true for models that do NOT support the `is_error` field in tool results.
-/// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
-/// Returns true for models that do NOT support the `is_error` field in tool results.
-/// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
-/// Public for benchmarking and testing purposes.
-#[must_use]
-pub fn model_rejects_is_error_field(model: &str) -> bool {
-    let lowered = model.to_ascii_lowercase();
-    // Strip any provider/ prefix for the check
-    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    // kimi models (kimi-k2.5, kimi-k1.5, kimi-moonshot, etc.)
-    canonical.starts_with("kimi")
 }
 
 /// Translates an `InputMessage` into OpenAI-compatible message format.
 /// Public for benchmarking purposes.
 #[must_use]
 pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
-    let supports_is_error = !model_rejects_is_error_field(model);
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
@@ -1371,17 +1230,12 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     content,
                     is_error,
                 } => {
-                    let mut msg = json!({
+                    Some(json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
                         "content": flatten_tool_result_content(content),
-                    });
-                    // Only include is_error for models that support it.
-                    // kimi models reject this field with 400 Bad Request.
-                    if supports_is_error {
-                        msg["is_error"] = json!(is_error);
-                    }
-                    Some(msg)
+                        "is_error": is_error,
+                    }))
                 }
                 InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
             })
@@ -1544,10 +1398,6 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
             "function": { "name": name },
         }),
     }
-}
-
-fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
-    matches!(config.provider_name, "OpenAI")
 }
 
 fn normalize_response(
@@ -1861,7 +1711,7 @@ mod tests {
     fn request_translation_uses_openai_compatible_shape() {
         let payload = build_chat_completion_request(
             &MessageRequest {
-                model: "grok-3".to_string(),
+                model: "deepseek-v4-pro".to_string(),
                 max_tokens: 64,
                 messages: vec![InputMessage {
                     role: "user".to_string(),
@@ -1889,7 +1739,7 @@ mod tests {
                 stream: false,
                 ..Default::default()
             },
-            OpenAiCompatConfig::xai(),
+            OpenAiCompatConfig::deepseek(),
         );
 
         assert_eq!(payload["messages"][0]["role"], json!("system"));
@@ -1905,14 +1755,13 @@ mod tests {
         let positive = [
             "deepseek-v4-flash",
             "deepseek-v4-pro",
-            "openai/deepseek-v4-pro",
+            "deepseek/deepseek-v4-pro",
             "deepseek/deepseek-v4-flash",
         ];
         let negative = [
             "deepseek-reasoner",
             "deepseek-chat",
-            "gpt-4o",
-            "claude-sonnet-4-6",
+            "unknown-model",
         ];
 
         // When checking whether history reasoning_content is required.
@@ -1931,7 +1780,7 @@ mod tests {
         let request = assistant_history_with_thinking_request("deepseek-reasoner");
 
         // When serializing for legacy deepseek-reasoner.
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
 
         // Then reasoning_content is omitted.
         let assistant = &payload["messages"][0];
@@ -1945,7 +1794,7 @@ mod tests {
         let request = assistant_history_with_thinking_request("openai/deepseek-v4-pro");
 
         // When serializing for DeepSeek V4 Pro.
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
 
         // Then reasoning_content is included on the assistant message.
         let assistant = &payload["messages"][0];
@@ -1959,7 +1808,7 @@ mod tests {
         let request = assistant_history_with_thinking_request("deepseek-v4-flash");
 
         // When serializing for DeepSeek V4 Flash.
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
 
         // Then reasoning_content is included on the assistant message.
         let assistant = &payload["messages"][0];
@@ -2129,13 +1978,13 @@ mod tests {
     fn reasoning_effort_is_included_when_set() {
         let payload = build_chat_completion_request(
             &MessageRequest {
-                model: "o4-mini".to_string(),
+                model: "deepseek-v4-pro".to_string(),
                 max_tokens: 1024,
                 messages: vec![InputMessage::user_text("think hard")],
                 reasoning_effort: Some("high".to_string()),
                 ..Default::default()
             },
-            OpenAiCompatConfig::openai(),
+            OpenAiCompatConfig::deepseek(),
         );
         assert_eq!(payload["reasoning_effort"], json!("high"));
     }
@@ -2144,12 +1993,12 @@ mod tests {
     fn reasoning_effort_omitted_when_not_set() {
         let payload = build_chat_completion_request(
             &MessageRequest {
-                model: "gpt-4o".to_string(),
+                model: "deepseek-v4-flash".to_string(),
                 max_tokens: 64,
                 messages: vec![InputMessage::user_text("hello")],
                 ..Default::default()
             },
-            OpenAiCompatConfig::openai(),
+            OpenAiCompatConfig::deepseek(),
         );
         assert!(payload.get("reasoning_effort").is_none());
     }
@@ -2158,7 +2007,7 @@ mod tests {
     fn openai_streaming_requests_include_usage_opt_in() {
         let payload = build_chat_completion_request(
             &MessageRequest {
-                model: "gpt-5".to_string(),
+                model: "deepseek-v4-pro".to_string(),
                 max_tokens: 64,
                 messages: vec![InputMessage::user_text("hello")],
                 system: None,
@@ -2167,29 +2016,10 @@ mod tests {
                 stream: true,
                 ..Default::default()
             },
-            OpenAiCompatConfig::openai(),
+            OpenAiCompatConfig::deepseek(),
         );
 
         assert_eq!(payload["stream_options"], json!({"include_usage": true}));
-    }
-
-    #[test]
-    fn xai_streaming_requests_skip_openai_specific_usage_opt_in() {
-        let payload = build_chat_completion_request(
-            &MessageRequest {
-                model: "grok-3".to_string(),
-                max_tokens: 64,
-                messages: vec![InputMessage::user_text("hello")],
-                system: None,
-                tools: None,
-                tool_choice: None,
-                stream: true,
-                ..Default::default()
-            },
-            OpenAiCompatConfig::xai(),
-        );
-
-        assert!(payload.get("stream_options").is_none());
     }
 
     #[test]
@@ -2213,15 +2043,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_xai_api_key_is_provider_specific() {
+    fn missing_deepseek_api_key_is_detected() {
         let _lock = env_lock();
-        std::env::remove_var("XAI_API_KEY");
-        let error = OpenAiCompatClient::from_env(OpenAiCompatConfig::xai())
+        std::env::remove_var("DEEPSEEK_API_KEY");
+        let error = OpenAiCompatClient::from_env(OpenAiCompatConfig::deepseek())
             .expect_err("missing key should error");
         assert!(matches!(
             error,
             ApiError::MissingCredentials {
-                provider: "xAI",
+                provider: "DeepSeek",
                 ..
             }
         ));
@@ -2230,16 +2060,16 @@ mod tests {
     #[test]
     fn endpoint_builder_accepts_base_urls_and_full_endpoints() {
         assert_eq!(
-            chat_completions_endpoint("https://api.x.ai/v1"),
-            "https://api.x.ai/v1/chat/completions"
+            chat_completions_endpoint("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/chat/completions"
         );
         assert_eq!(
-            chat_completions_endpoint("https://api.x.ai/v1/"),
-            "https://api.x.ai/v1/chat/completions"
+            chat_completions_endpoint("https://api.deepseek.com/v1/"),
+            "https://api.deepseek.com/v1/chat/completions"
         );
         assert_eq!(
-            chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
-            "https://api.x.ai/v1/chat/completions"
+            chat_completions_endpoint("https://api.deepseek.com/v1/chat/completions"),
+            "https://api.deepseek.com/v1/chat/completions"
         );
     }
 
@@ -2280,7 +2110,7 @@ mod tests {
     #[test]
     fn tuning_params_included_in_payload_when_set() {
         let request = MessageRequest {
-            model: "gpt-4o".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             max_tokens: 1024,
             messages: vec![],
             system: None,
@@ -2295,7 +2125,7 @@ mod tests {
             reasoning_effort: None,
             extra_body: BTreeMap::new(),
         };
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
         assert_eq!(payload["temperature"], 0.7);
         assert_eq!(payload["top_p"], 0.9);
         assert_eq!(payload["frequency_penalty"], 0.5);
@@ -2317,16 +2147,16 @@ mod tests {
 
         let payload = build_chat_completion_request(
             &MessageRequest {
-                model: "gpt-4o".to_string(),
+                model: "deepseek-v4-flash".to_string(),
                 max_tokens: 1024,
                 messages: vec![InputMessage::user_text("hello")],
                 extra_body,
                 ..Default::default()
             },
-            OpenAiCompatConfig::openai(),
+            OpenAiCompatConfig::deepseek(),
         );
 
-        assert_eq!(payload["model"], json!("gpt-4o"));
+        assert_eq!(payload["model"], json!("deepseek-v4-flash"));
         assert_eq!(payload["max_tokens"], json!(1024));
         assert_eq!(payload["messages"].as_array().map(Vec::len), Some(1));
         assert_eq!(
@@ -2337,71 +2167,26 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_model_strips_tuning_params() {
-        let request = MessageRequest {
-            model: "o1-mini".to_string(),
-            max_tokens: 1024,
-            messages: vec![],
-            stream: false,
-            temperature: Some(0.7),
-            top_p: Some(0.9),
-            frequency_penalty: Some(0.5),
-            presence_penalty: Some(0.3),
-            stop: Some(vec!["\n".to_string()]),
-            ..Default::default()
-        };
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
-        assert!(
-            payload.get("temperature").is_none(),
-            "reasoning model should strip temperature"
-        );
-        assert!(
-            payload.get("top_p").is_none(),
-            "reasoning model should strip top_p"
-        );
-        assert!(payload.get("frequency_penalty").is_none());
-        assert!(payload.get("presence_penalty").is_none());
-        // stop is safe for all providers
-        assert_eq!(payload["stop"], json!(["\n"]));
-    }
-
-    #[test]
-    fn grok_3_mini_is_reasoning_model() {
-        assert!(is_reasoning_model("grok-3-mini"));
-        assert!(is_reasoning_model("o1"));
-        assert!(is_reasoning_model("o1-mini"));
-        assert!(is_reasoning_model("o3-mini"));
-        assert!(!is_reasoning_model("gpt-4o"));
-        assert!(!is_reasoning_model("grok-3"));
-        assert!(!is_reasoning_model("claude-sonnet-4-6"));
-    }
-
-    #[test]
-    fn qwen_reasoning_variants_are_detected() {
-        // QwQ reasoning model
-        assert!(is_reasoning_model("qwen-qwq-32b"));
-        assert!(is_reasoning_model("qwen/qwen-qwq-32b"));
-        // Qwen3 thinking family
-        assert!(is_reasoning_model("qwen3-30b-a3b-thinking"));
-        assert!(is_reasoning_model("qwen/qwen3-30b-a3b-thinking"));
-        // Bare qwq
-        assert!(is_reasoning_model("qwq-plus"));
-        // Regular Qwen models must NOT be classified as reasoning
-        assert!(!is_reasoning_model("qwen-max"));
-        assert!(!is_reasoning_model("qwen/qwen-plus"));
-        assert!(!is_reasoning_model("qwen-turbo"));
+    fn is_reasoning_model_always_returns_false_for_deepseek() {
+        // DeepSeek does not use fixed-sampling reasoning models; reasoning is
+        // controlled via reasoning_effort and reasoning_content, not by
+        // stripping tuning parameters.
+        assert!(!is_reasoning_model("deepseek-v4-pro"));
+        assert!(!is_reasoning_model("deepseek-v4-flash"));
+        assert!(!is_reasoning_model("deepseek-chat"));
+        assert!(!is_reasoning_model("deepseek-reasoner"));
     }
 
     #[test]
     fn tuning_params_omitted_from_payload_when_none() {
         let request = MessageRequest {
-            model: "gpt-4o".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
             ..Default::default()
         };
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
         assert!(
             payload.get("temperature").is_none(),
             "temperature should be absent"
@@ -2410,29 +2195,6 @@ mod tests {
         assert!(payload.get("frequency_penalty").is_none());
         assert!(payload.get("presence_penalty").is_none());
         assert!(payload.get("stop").is_none());
-    }
-
-    #[test]
-    fn gpt5_uses_max_completion_tokens_not_max_tokens() {
-        // gpt-5* models require `max_completion_tokens`; legacy `max_tokens` causes
-        // a request-validation failure. Verify the correct key is emitted.
-        let request = MessageRequest {
-            model: "gpt-5.2".to_string(),
-            max_tokens: 512,
-            messages: vec![],
-            stream: false,
-            ..Default::default()
-        };
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
-        assert_eq!(
-            payload["max_completion_tokens"],
-            json!(512),
-            "gpt-5.2 should emit max_completion_tokens"
-        );
-        assert!(
-            payload.get("max_tokens").is_none(),
-            "gpt-5.2 must not emit max_tokens"
-        );
     }
 
     /// Regression test: some OpenAI-compatible providers emit `"tool_calls": null`
@@ -2475,7 +2237,7 @@ mod tests {
         use crate::types::{InputContentBlock, InputMessage};
 
         let request = MessageRequest {
-            model: "gpt-4o".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             max_tokens: 100,
             messages: vec![InputMessage {
                 role: "assistant".to_string(),
@@ -2486,7 +2248,7 @@ mod tests {
             stream: false,
             ..Default::default()
         };
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
         let messages = payload["messages"].as_array().unwrap();
         let assistant_msg = messages
             .iter()
@@ -2505,7 +2267,7 @@ mod tests {
         use crate::types::{InputContentBlock, InputMessage};
 
         let request = MessageRequest {
-            model: "gpt-4o".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             max_tokens: 100,
             messages: vec![InputMessage {
                 role: "assistant".to_string(),
@@ -2518,7 +2280,7 @@ mod tests {
             stream: false,
             ..Default::default()
         };
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
         let messages = payload["messages"].as_array().unwrap();
         let assistant_msg = messages
             .iter()
@@ -2577,203 +2339,21 @@ mod tests {
     }
 
     #[test]
-    fn non_gpt5_uses_max_tokens() {
-        // Older OpenAI models expect `max_tokens`; verify gpt-4o is unaffected.
+    fn deepseek_uses_max_tokens() {
+        // DeepSeek models use `max_tokens`.
         let request = MessageRequest {
-            model: "gpt-4o".to_string(),
+            model: "deepseek-v4-pro".to_string(),
             max_tokens: 512,
             messages: vec![],
             stream: false,
             ..Default::default()
         };
-        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
         assert_eq!(payload["max_tokens"], json!(512));
         assert!(
             payload.get("max_completion_tokens").is_none(),
-            "gpt-4o must not emit max_completion_tokens"
+            "deepseek-v4-pro must not emit max_completion_tokens"
         );
-    }
-
-    // ============================================================================
-    // US-009: kimi model compatibility tests
-    // ============================================================================
-
-    #[test]
-    fn model_rejects_is_error_field_detects_kimi_models() {
-        // kimi models (various formats) should be detected
-        assert!(super::model_rejects_is_error_field("kimi-k2.5"));
-        assert!(super::model_rejects_is_error_field("kimi-k1.5"));
-        assert!(super::model_rejects_is_error_field("kimi-moonshot"));
-        assert!(super::model_rejects_is_error_field("KIMI-K2.5")); // case insensitive
-        assert!(super::model_rejects_is_error_field("dashscope/kimi-k2.5")); // with prefix
-        assert!(super::model_rejects_is_error_field("moonshot/kimi-k2.5")); // different prefix
-
-        // Non-kimi models should NOT be detected
-        assert!(!super::model_rejects_is_error_field("gpt-4o"));
-        assert!(!super::model_rejects_is_error_field("gpt-4"));
-        assert!(!super::model_rejects_is_error_field("claude-sonnet-4-6"));
-        assert!(!super::model_rejects_is_error_field("grok-3"));
-        assert!(!super::model_rejects_is_error_field("grok-3-mini"));
-        assert!(!super::model_rejects_is_error_field("xai/grok-3"));
-        assert!(!super::model_rejects_is_error_field("qwen/qwen-plus"));
-        assert!(!super::model_rejects_is_error_field("o1-mini"));
-    }
-
-    #[test]
-    fn translate_message_includes_is_error_for_non_kimi_models() {
-        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
-
-        // Test with gpt-4o (should include is_error)
-        let message = InputMessage {
-            role: "user".to_string(),
-            content: vec![InputContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
-                content: vec![ToolResultContentBlock::Text {
-                    text: "Error occurred".to_string(),
-                }],
-                is_error: true,
-            }],
-        };
-
-        let translated = super::translate_message(&message, "gpt-4o");
-        assert_eq!(translated.len(), 1);
-        let tool_msg = &translated[0];
-        assert_eq!(tool_msg["role"], json!("tool"));
-        assert_eq!(tool_msg["tool_call_id"], json!("call_1"));
-        assert_eq!(tool_msg["content"], json!("Error occurred"));
-        assert!(
-            tool_msg.get("is_error").is_some(),
-            "gpt-4o should include is_error field"
-        );
-        assert_eq!(tool_msg["is_error"], json!(true));
-
-        // Test with grok-3 (should include is_error)
-        let message2 = InputMessage {
-            role: "user".to_string(),
-            content: vec![InputContentBlock::ToolResult {
-                tool_use_id: "call_2".to_string(),
-                content: vec![ToolResultContentBlock::Text {
-                    text: "Success".to_string(),
-                }],
-                is_error: false,
-            }],
-        };
-
-        let translated2 = super::translate_message(&message2, "grok-3");
-        assert!(
-            translated2[0].get("is_error").is_some(),
-            "grok-3 should include is_error field"
-        );
-        assert_eq!(translated2[0]["is_error"], json!(false));
-
-        // Test with claude model (should include is_error)
-        let translated3 = super::translate_message(&message, "claude-sonnet-4-6");
-        assert!(
-            translated3[0].get("is_error").is_some(),
-            "claude should include is_error field"
-        );
-    }
-
-    #[test]
-    fn translate_message_excludes_is_error_for_kimi_models() {
-        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
-
-        // Test with kimi-k2.5 (should EXCLUDE is_error)
-        let message = InputMessage {
-            role: "user".to_string(),
-            content: vec![InputContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
-                content: vec![ToolResultContentBlock::Text {
-                    text: "Error occurred".to_string(),
-                }],
-                is_error: true,
-            }],
-        };
-
-        let translated = super::translate_message(&message, "kimi-k2.5");
-        assert_eq!(translated.len(), 1);
-        let tool_msg = &translated[0];
-        assert_eq!(tool_msg["role"], json!("tool"));
-        assert_eq!(tool_msg["tool_call_id"], json!("call_1"));
-        assert_eq!(tool_msg["content"], json!("Error occurred"));
-        assert!(
-            tool_msg.get("is_error").is_none(),
-            "kimi-k2.5 must NOT include is_error field (would cause 400 Bad Request)"
-        );
-
-        // Test with kimi-k1.5
-        let translated2 = super::translate_message(&message, "kimi-k1.5");
-        assert!(
-            translated2[0].get("is_error").is_none(),
-            "kimi-k1.5 must NOT include is_error field"
-        );
-
-        // Test with dashscope/kimi-k2.5 (with provider prefix)
-        let translated3 = super::translate_message(&message, "dashscope/kimi-k2.5");
-        assert!(
-            translated3[0].get("is_error").is_none(),
-            "dashscope/kimi-k2.5 must NOT include is_error field"
-        );
-    }
-
-    #[test]
-    fn build_chat_completion_request_kimi_vs_non_kimi_tool_results() {
-        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
-
-        // Helper to create a request with a tool result
-        let make_request = |model: &str| MessageRequest {
-            model: model.to_string(),
-            max_tokens: 100,
-            messages: vec![
-                InputMessage {
-                    role: "assistant".to_string(),
-                    content: vec![InputContentBlock::ToolUse {
-                        id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        input: serde_json::json!({"path": "/tmp/test"}),
-                    }],
-                },
-                InputMessage {
-                    role: "user".to_string(),
-                    content: vec![InputContentBlock::ToolResult {
-                        tool_use_id: "call_1".to_string(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: "file contents".to_string(),
-                        }],
-                        is_error: false,
-                    }],
-                },
-            ],
-            stream: false,
-            ..Default::default()
-        };
-
-        // Non-kimi model: should have is_error field
-        let request_gpt = make_request("gpt-4o");
-        let payload_gpt = build_chat_completion_request(&request_gpt, OpenAiCompatConfig::openai());
-        let messages_gpt = payload_gpt["messages"].as_array().unwrap();
-        let tool_msg_gpt = messages_gpt.iter().find(|m| m["role"] == "tool").unwrap();
-        assert!(
-            tool_msg_gpt.get("is_error").is_some(),
-            "gpt-4o request should include is_error in tool result"
-        );
-
-        // kimi model: should NOT have is_error field
-        let request_kimi = make_request("kimi-k2.5");
-        let payload_kimi =
-            build_chat_completion_request(&request_kimi, OpenAiCompatConfig::dashscope());
-        let messages_kimi = payload_kimi["messages"].as_array().unwrap();
-        let tool_msg_kimi = messages_kimi.iter().find(|m| m["role"] == "tool").unwrap();
-        assert!(
-            tool_msg_kimi.get("is_error").is_none(),
-            "kimi-k2.5 request must NOT include is_error in tool result (would cause 400)"
-        );
-
-        // Verify both have the essential fields
-        assert_eq!(tool_msg_gpt["tool_call_id"], json!("call_1"));
-        assert_eq!(tool_msg_kimi["tool_call_id"], json!("call_1"));
-        assert_eq!(tool_msg_gpt["content"], json!("file contents"));
-        assert_eq!(tool_msg_kimi["content"], json!("file contents"));
     }
 
     // ============================================================================
@@ -2783,14 +2363,14 @@ mod tests {
     #[test]
     fn estimate_request_body_size_returns_reasonable_estimate() {
         let request = MessageRequest {
-            model: "gpt-4o".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             max_tokens: 100,
             messages: vec![InputMessage::user_text("Hello world".to_string())],
             stream: false,
             ..Default::default()
         };
 
-        let size = super::estimate_request_body_size(&request, OpenAiCompatConfig::openai());
+        let size = super::estimate_request_body_size(&request, OpenAiCompatConfig::deepseek());
         // Should be non-zero and reasonable for a small request
         assert!(size > 0, "estimated size should be positive");
         assert!(size < 10_000, "small request should be under 10KB");
@@ -2799,93 +2379,34 @@ mod tests {
     #[test]
     fn check_request_body_size_passes_for_small_requests() {
         let request = MessageRequest {
-            model: "gpt-4o".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             max_tokens: 100,
             messages: vec![InputMessage::user_text("Hello".to_string())],
             stream: false,
             ..Default::default()
         };
 
-        // Should pass for all providers with a small request
-        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::openai()).is_ok());
-        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::xai()).is_ok());
-        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::dashscope()).is_ok());
+        // Should pass for DeepSeek with a small request
+        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::deepseek()).is_ok());
     }
 
     #[test]
-    fn check_request_body_size_fails_for_dashscope_when_exceeds_6mb() {
-        // Create a request that exceeds DashScope's 6MB limit
-        let large_content = "x".repeat(7_000_000); // 7MB of content
-        let request = MessageRequest {
-            model: "qwen-plus".to_string(),
-            max_tokens: 100,
-            messages: vec![InputMessage::user_text(large_content)],
-            stream: false,
-            ..Default::default()
-        };
-
-        let result = super::check_request_body_size(&request, OpenAiCompatConfig::dashscope());
-        assert!(result.is_err(), "should fail for 7MB request to DashScope");
-
-        let err = result.unwrap_err();
-        match err {
-            crate::error::ApiError::RequestBodySizeExceeded {
-                estimated_bytes,
-                max_bytes,
-                provider,
-            } => {
-                assert_eq!(provider, "DashScope");
-                assert_eq!(max_bytes, 6_291_456); // 6MB limit
-                assert!(estimated_bytes > max_bytes);
-            }
-            _ => panic!("expected RequestBodySizeExceeded error, got {err:?}"),
-        }
-    }
-
-    #[test]
-    fn check_request_body_size_allows_large_requests_for_openai() {
-        // Create a request that exceeds DashScope's limit but is under OpenAI's 100MB limit
-        let large_content = "x".repeat(10_000_000); // 10MB of content
-        let request = MessageRequest {
-            model: "gpt-4o".to_string(),
-            max_tokens: 100,
-            messages: vec![InputMessage::user_text(large_content)],
-            stream: false,
-            ..Default::default()
-        };
-
-        // Should pass for OpenAI (100MB limit)
-        assert!(
-            super::check_request_body_size(&request, OpenAiCompatConfig::openai()).is_ok(),
-            "10MB request should pass for OpenAI's 100MB limit"
-        );
-
-        // Should fail for DashScope (6MB limit)
-        assert!(
-            super::check_request_body_size(&request, OpenAiCompatConfig::dashscope()).is_err(),
-            "10MB request should fail for DashScope's 6MB limit"
-        );
-    }
-
-    #[test]
-    fn provider_specific_size_limits_are_correct() {
+    fn deepseek_size_limit_is_100mb() {
         assert_eq!(
-            OpenAiCompatConfig::dashscope().max_request_body_bytes,
-            6_291_456
-        ); // 6MB
-        assert_eq!(
-            OpenAiCompatConfig::openai().max_request_body_bytes,
+            OpenAiCompatConfig::deepseek().max_request_body_bytes,
             104_857_600
         ); // 100MB
-        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800);
-        // 50MB
     }
 
     #[test]
-    fn strip_routing_prefix_strips_kimi_provider_prefix() {
-        // US-023: kimi prefix should be stripped for wire format
-        assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
-        assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
-        assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    fn strip_routing_prefix_strips_deepseek_provider_prefix() {
+        assert_eq!(
+            super::strip_routing_prefix("deepseek/deepseek-v4-pro"),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            super::strip_routing_prefix("deepseek-v4-pro"),
+            "deepseek-v4-pro"
+        ); // no prefix, unchanged
     }
 }
