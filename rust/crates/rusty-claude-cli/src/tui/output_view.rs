@@ -156,8 +156,60 @@ fn ansi_to_lines(ansi: &str) -> Vec<Line<'static>> {
     }
     match ansi.into_text() {
         Ok(text) => text.lines,
-        Err(_) => ansi.lines().map(|l| Line::raw(l.to_string())).collect(),
+        Err(_) => ansi
+            .lines()
+            .map(|l| Line::raw(strip_ansi_for_raw_line(l).to_string()))
+            .collect(),
     }
+}
+
+/// Strip ALL ANSI escape sequences from a string.
+///
+/// Safety net for `ansi_to_lines` fallback: when `ansi_to_tui` fails to parse
+/// the input, we must NOT pass raw `\x1b[...` sequences to `Line::raw()`.
+/// Ratatui's `Print()` writes span content as raw bytes to stdout; the terminal
+/// interprets `\x1b[2;1H` (Cursor Position) as a cursor movement command,
+/// corrupting the TUI display — text appears at wrong positions (especially
+/// the input line), making it look like the input buffer was "auto-filled".
+///
+/// Handles: CSI (\x1b[...letter), OSC (\x1b]...BEL/ST), standalone ESC,
+/// and other ESC+char sequences.
+fn strip_ansi_for_raw_line(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c.is_ascii_alphabetic() || c == '~' {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 #[derive(Debug)]

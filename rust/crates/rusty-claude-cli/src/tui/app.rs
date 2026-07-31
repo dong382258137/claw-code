@@ -2134,22 +2134,45 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
             // 导致后续 ANSI 参数字符（[, 2, ;, 1, H 等）作为普通字符泄漏到
             // input buffer，造成输入栏被污染。
             //
-            // 修复策略：peek-ahead。当收到 KeyCode::Esc 时，用 1ms 超时
+            // 修复策略：peek-ahead。当收到 KeyCode::Esc 时，用 5ms 超时
             // 探测下一个事件是否立即可用：
             // - conhost 粘贴：字符在同一个输入批次中投递（µs 级间隔），
-            //   poll(1ms) 返回 true → 将 \x1b 送入 CSI 状态机，后续字符
+            //   poll(5ms) 返回 true → 将 \x1b 送入 CSI 状态机，后续字符
             //   由状态机消费（ConsumingCsi/ConsumingOsc），不会泄漏到 buffer。
-            // - 真正的 Esc 键：人击键间隔 ≥50ms，poll(1ms) 返回 false →
+            // - 真正的 Esc 键：人击键间隔 ≥50ms，poll(5ms) 返回 false →
             //   走正常的 "Esc" 逻辑（reset buffer 或 exit）。
+            //
+            // timeout 从 1ms 提升到 5ms：系统繁忙时（如 cargo test 运行中），
+            // 1ms 超时太短会导致 false negative，使 ANSI 序列的 ESC 被误判为
+            // Esc 键，后续字符以普通文本泄漏到输入缓冲区。
             //
             // 例外情况：
             // - CSI 状态机已激活时（如 OSC 的 ST 终止符 \x1b\\）：直接送入状态机，
             //   无需 peek-ahead
-            // - 菜单打开时：Esc 应关闭菜单，走 "Esc" 逻辑
+            // - busy 时（turn 运行中）：总是送入状态机，不做 peek-ahead（见下文）
+            // - 菜单打开时（非 busy）：Esc 应关闭菜单，走 "Esc" 逻辑
             if input.is_consuming_ansi() {
                 return input.handle_key(Some('\x1b'), "");
             }
-            if !input.menu_open() && event::poll(Duration::from_millis(1)).unwrap_or(false) {
+            // busy 时：总是把 \x1b 送入 CSI 状态机，不做 peek-ahead。
+            //
+            // 根因：cargo test 等长任务运行时系统繁忙，reflected escape
+            // sequence 的后续字符（[, 2, ;, 1, H）可能延迟超过 5ms 到达，
+            // poll(5ms) 返回 false（false negative）。如果丢弃 ESC（return
+            // Continue），后续字符会作为普通 KeyCode::Char 事件插入 input
+            // buffer，造成输入栏被 \x1b[2;1H\x1b[38;...m 等 ANSI 序列污染。
+            //
+            // 修复：busy 时无论 poll 结果如何，都把 \x1b 送入状态机。
+            // busy 时 Esc 本就是 no-op（不退出/不清空），送入状态机不影响功能：
+            // - reflected escape sequence：状态机消费后续字符（ExpectingCsi
+            //   → ConsumingCsi → Normal），不泄漏到 buffer
+            // - 真正的 Esc 键：状态机进入 ExpectingCsi，下一个非 [/] 字符
+            //   被吞掉（busy 时用户通常不按键，Ctrl+C 仍可中断）
+            if busy {
+                paste_diag_log("ESC during busy: feeding \\x1b to CSI state machine (skipping peek-ahead)");
+                return input.handle_key(Some('\x1b'), "");
+            }
+            if !input.menu_open() && event::poll(Duration::from_millis(5)).unwrap_or(false) {
                 paste_diag_log("ESC peek-ahead: next event available, feeding \\x1b to CSI state machine");
                 return input.handle_key(Some('\x1b'), "");
             }

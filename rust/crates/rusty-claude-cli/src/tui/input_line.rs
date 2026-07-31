@@ -1208,4 +1208,41 @@ mod tests {
         }
         assert_eq!(line.buffer(), "hello");
     }
+
+    #[test]
+    fn ansi_sequence_during_busy_does_not_leak() {
+        // 模拟 cargo test 运行中（busy=true）时 reflected escape sequence 的处理。
+        //
+        // 根因：route_key 在 busy=true 且 peek-ahead poll(5ms) 超时时，
+        // 旧代码丢弃 ESC（return Continue），后续 [, 2, ;, 1, H 作为普通
+        // KeyCode::Char 插入 input buffer，造成输入栏被 ANSI 序列污染。
+        //
+        // 修复后：busy=true 时 route_key 总是把 \x1b 送入 CSI 状态机，
+        // 后续字符由状态机消费。此测试验证状态机层面的行为。
+        //
+        // 场景来自用户截图：
+        // \x1b[2;1H\x1b[38;2;163;190;140;48;5;236mt::tests::...ok
+        let mut line = InputLine::new();
+        // 模拟 route_key(busy=true)：ESC → handle_key(Some('\x1b'), "")
+        line.handle_key(Some('\x1b'), "");
+        // 后续字符作为 KeyCode::Char 到达，状态机应消费
+        for ch in "[2;1H".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        // 第二个 ANSI 序列（SGR 颜色码）
+        line.handle_key(Some('\x1b'), "");
+        for ch in "[38;2;163;190;140;48;5;236m".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        // 可见文本应被正常插入
+        for ch in "t::tests::upgrade_model_for_subagent_pro_returns_none ... ok".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        // buffer 只包含可见文本，无 ANSI 序列
+        assert_eq!(
+            line.buffer(),
+            "t::tests::upgrade_model_for_subagent_pro_returns_none ... ok"
+        );
+        assert!(!line.is_consuming_ansi());
+    }
 }

@@ -669,12 +669,13 @@ impl LiveCli {
                 if let Some(poor) = config.feature_config().poor_mode() {
                     runtime::poor_mode::set_active(poor);
                 }
-                // P3-1:从 settings.json `planMode` 启用 Plan/Execute/Review。
-                // CLI flag `--enable-plan-mode` 会在 run_repl 中覆盖(优先级更高)。
-                // workspace_root 对所有工具路径都需要,不应仅绑定在 plan_mode 内。
+                // P3-1:从 settings.json `planMode` 控制 Plan/Execute/Review。
+                // 默认启用(true),CLI flag `--enable-plan-mode` 在 run_repl 中覆盖。
                 runtime.set_workspace_root(cwd.clone());
-                if config.feature_config().plan_mode() == Some(true) {
-                    runtime.set_plan_mode_enabled(true);
+                match config.feature_config().plan_mode() {
+                    Some(true) => runtime.set_plan_mode_enabled(true),
+                    Some(false) => runtime.set_plan_mode_enabled(false),
+                    None => {} // 保持默认(true)
                 }
                 // SP4.2-B3:从配置初始化 LSP servers(best-effort,失败不阻断启动)
                 let _ = init_lsp_from_config(&config, &cwd);
