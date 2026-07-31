@@ -373,12 +373,49 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("plugins-hook-runner-{label}-{nanos}"))
+    /// RAII guard:测试 panic 时自动清理临时目录(同 lib.rs 的 TempDirGuard)。
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(label: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should be after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("plugins-hook-runner-{label}-{nanos}"));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl std::ops::Deref for TempDirGuard {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for TempDirGuard {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for TempDirGuard {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.path.as_os_str()
+        }
+    }
+
+    fn temp_dir(label: &str) -> TempDirGuard {
+        TempDirGuard::new(label)
     }
 
     fn make_executable(path: &Path) {

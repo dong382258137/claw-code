@@ -2312,12 +2312,51 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("plugins-{label}-{nanos}"))
+    fn temp_dir(label: &str) -> TempDirGuard {
+        TempDirGuard::new(label)
+    }
+
+    /// RAII guard:测试 panic 时自动清理临时目录,防止残留文件被
+    /// TRAE CN 文件监视器检测到并自动打开,从而避免 TRAE CN 打开文件
+    /// 时的控制序列泄漏到 claw TUI 共享终端污染 InputLine。
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(label: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("plugins-{label}-{nanos}"));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl std::ops::Deref for TempDirGuard {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for TempDirGuard {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for TempDirGuard {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.path.as_os_str()
+        }
     }
 
     #[test]
@@ -2893,7 +2932,8 @@ mod tests {
     #[test]
     fn discovers_builtin_and_bundled_plugins() {
         let _guard = env_guard();
-        let manager = PluginManager::new(PluginManagerConfig::new(temp_dir("discover")));
+        let home = temp_dir("discover");
+        let manager = PluginManager::new(PluginManagerConfig::new(&home));
         let plugins = manager.list_plugins().expect("plugins should list");
         assert!(plugins
             .iter()
@@ -2948,8 +2988,8 @@ mod tests {
             .iter()
             .any(|plugin| plugin.metadata.id == "demo@external"));
 
-        let _ = fs::remove_dir_all(config_home);
-        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(&config_home);
+        let _ = fs::remove_dir_all(&source_root);
     }
 
     #[test]
@@ -2960,7 +3000,7 @@ mod tests {
         write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", false);
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         let manager = PluginManager::new(config);
 
         let installed = manager
@@ -3023,7 +3063,7 @@ mod tests {
         );
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         config.install_root = Some(config_home.join("plugins").join("installed"));
         let manager = PluginManager::new(config);
 
@@ -3084,7 +3124,7 @@ mod tests {
         );
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         config.install_root = Some(install_root.clone());
         let manager = PluginManager::new(config);
 
@@ -3097,9 +3137,9 @@ mod tests {
                 name: "registry-fallback".to_string(),
                 version: "1.0.0".to_string(),
                 description: "Registry fallback plugin".to_string(),
-                install_path: external_install_path.clone(),
+                install_path: external_install_path.to_path_buf(),
                 source: PluginInstallSource::LocalPath {
-                    path: external_install_path.clone(),
+                    path: external_install_path.to_path_buf(),
                 },
                 installed_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -3131,7 +3171,7 @@ mod tests {
         let missing_install_path = temp_dir("registry-prune-missing");
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         config.install_root = Some(install_root);
         let manager = PluginManager::new(config);
 
@@ -3144,9 +3184,9 @@ mod tests {
                 name: "stale-external".to_string(),
                 version: "1.0.0".to_string(),
                 description: "stale external plugin".to_string(),
-                install_path: missing_install_path.clone(),
+                install_path: missing_install_path.to_path_buf(),
                 source: PluginInstallSource::LocalPath {
-                    path: missing_install_path.clone(),
+                    path: missing_install_path.to_path_buf(),
                 },
                 installed_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -3176,7 +3216,7 @@ mod tests {
         write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", false);
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         let mut manager = PluginManager::new(config.clone());
 
         manager
@@ -3188,7 +3228,7 @@ mod tests {
         );
 
         let mut reloaded_config = PluginManagerConfig::new(&config_home);
-        reloaded_config.bundled_root = Some(bundled_root.clone());
+        reloaded_config.bundled_root = Some(bundled_root.to_path_buf());
         reloaded_config.enabled_plugins = load_enabled_plugins(&manager.settings_path());
         let reloaded_manager = PluginManager::new(reloaded_config);
         let reloaded = reloaded_manager
@@ -3210,7 +3250,7 @@ mod tests {
         write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", true);
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         let mut manager = PluginManager::new(config);
 
         manager
@@ -3222,7 +3262,7 @@ mod tests {
         );
 
         let mut reloaded_config = PluginManagerConfig::new(&config_home);
-        reloaded_config.bundled_root = Some(bundled_root.clone());
+        reloaded_config.bundled_root = Some(bundled_root.to_path_buf());
         reloaded_config.enabled_plugins = load_enabled_plugins(&manager.settings_path());
         let reloaded_manager = PluginManager::new(reloaded_config);
         let reloaded = reloaded_manager
@@ -3289,7 +3329,7 @@ mod tests {
         write_broken_plugin(&external_root.join("broken"), "broken-report");
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.external_dirs = vec![external_root.clone()];
+        config.external_dirs = vec![external_root.to_path_buf()];
         let manager = PluginManager::new(config);
 
         // when
@@ -3335,7 +3375,7 @@ mod tests {
         write_broken_plugin(&install_root.join("broken"), "installed-broken");
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         config.install_root = Some(install_root);
         let manager = PluginManager::new(config);
 
@@ -3489,7 +3529,7 @@ mod tests {
         );
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         config.install_root = Some(install_root);
         let manager = PluginManager::new(config);
 
@@ -3521,7 +3561,7 @@ mod tests {
         );
 
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         config.install_root = Some(install_root);
         let manager = PluginManager::new(config);
 
@@ -3563,7 +3603,7 @@ mod tests {
 
         // Create PluginManager with isolated bundled_root - it should use the temp config_home, not host ~/.claw/
         let mut config = PluginManagerConfig::new(&config_home);
-        config.bundled_root = Some(bundled_root.clone());
+        config.bundled_root = Some(bundled_root.to_path_buf());
         let manager = PluginManager::new(config);
 
         // List installed plugins - should only see the test fixture, not host plugins
@@ -3606,7 +3646,7 @@ mod tests {
         // Spawn multiple threads to install plugins simultaneously
         let mut handles = Vec::new();
         for thread_id in 0..5 {
-            let base_dir = base_dir.clone();
+            let base_dir = base_dir.to_path_buf();
             let success_count = Arc::clone(&success_count);
             let error_count = Arc::clone(&error_count);
 
