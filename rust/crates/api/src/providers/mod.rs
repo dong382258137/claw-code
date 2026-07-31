@@ -130,7 +130,7 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
 #[must_use]
 pub fn provider_diagnostics_for_model(model: &str) -> ProviderDiagnostics {
     let resolved_model = resolve_model_alias(model);
-    let metadata = metadata_for_model(&resolved_model).unwrap_or_else(|| ProviderMetadata {
+    let metadata = metadata_for_model(&resolved_model).unwrap_or(ProviderMetadata {
         provider: ProviderKind::DeepSeek,
         auth_env: "DEEPSEEK_API_KEY",
         base_url_env: "DEEPSEEK_BASE_URL",
@@ -148,7 +148,8 @@ pub fn provider_diagnostics_for_model(model: &str) -> ProviderDiagnostics {
         default_base_url: metadata.default_base_url,
         openai_compatible,
         reasoning_model,
-        preserves_reasoning_content_in_history: openai_compat::model_requires_reasoning_content_in_history(&resolved_model),
+        preserves_reasoning_content_in_history:
+            openai_compat::model_requires_reasoning_content_in_history(&resolved_model),
         strips_tuning_params: reasoning_model,
         supports_stream_usage: true,
         honors_proxy_env: true,
@@ -174,7 +175,7 @@ pub fn model_family_identity_for(model: &str) -> runtime::ModelFamilyIdentity {
 
 #[must_use]
 pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
-    let metadata = metadata_for_model(model).unwrap_or_else(|| ProviderMetadata {
+    let metadata = metadata_for_model(model).unwrap_or(ProviderMetadata {
         provider: ProviderKind::DeepSeek,
         auth_env: "DEEPSEEK_API_KEY",
         base_url_env: "DEEPSEEK_BASE_URL",
@@ -193,7 +194,9 @@ pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport 
         prompt_cache: ProviderFeatureSupport::Unsupported,
         custom_parameters: ProviderFeatureSupport::Supported,
         reasoning_effort: ProviderFeatureSupport::Supported,
-        reasoning_content_history: if openai_compat::model_requires_reasoning_content_in_history(model) {
+        reasoning_content_history: if openai_compat::model_requires_reasoning_content_in_history(
+            model,
+        ) {
             ProviderFeatureSupport::Supported
         } else {
             ProviderFeatureSupport::Unsupported
@@ -274,7 +277,11 @@ fn web_passthrough_diagnostic(
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
     let canonical = resolve_model_alias(model);
-    let heuristic = if canonical.contains("pro") { 32_000 } else { 64_000 };
+    let heuristic = if canonical.contains("pro") {
+        32_000
+    } else {
+        64_000
+    };
 
     model_token_limit(model).map_or(heuristic, |limit| heuristic.min(limit.max_output_tokens))
 }
@@ -406,15 +413,15 @@ mod tests {
     use serde_json::json;
 
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, SystemContent, ToolChoice,
-        ToolDefinition,
+        InputContentBlock, InputMessage, MessageRequest, SystemContent, ToolChoice, ToolDefinition,
     };
 
     use super::{
         detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
         model_family_identity_for, model_family_identity_for_kind, model_token_limit, parse_dotenv,
-        preflight_message_request, provider_capabilities_for_model, provider_diagnostics_for_request,
-        resolve_model_alias, ProviderFeatureSupport, ProviderKind, ProviderWireProtocol,
+        preflight_message_request, provider_capabilities_for_model,
+        provider_diagnostics_for_request, resolve_model_alias, ProviderFeatureSupport,
+        ProviderKind, ProviderWireProtocol,
     };
 
     #[test]
@@ -502,7 +509,10 @@ mod tests {
 
     #[test]
     fn detects_provider_kind_always_returns_deepseek() {
-        assert_eq!(detect_provider_kind("deepseek-v4-pro"), ProviderKind::DeepSeek);
+        assert_eq!(
+            detect_provider_kind("deepseek-v4-pro"),
+            ProviderKind::DeepSeek
+        );
         assert_eq!(detect_provider_kind("anything"), ProviderKind::DeepSeek);
     }
 
@@ -531,8 +541,14 @@ mod tests {
         assert_eq!(deepseek.auth_env, "DEEPSEEK_API_KEY");
         assert_eq!(deepseek.streaming_usage, ProviderFeatureSupport::Supported);
         assert_eq!(deepseek.reasoning_effort, ProviderFeatureSupport::Supported);
-        assert_eq!(deepseek.web_search, ProviderFeatureSupport::PassthroughAsTool);
-        assert_eq!(deepseek.web_fetch, ProviderFeatureSupport::PassthroughAsTool);
+        assert_eq!(
+            deepseek.web_search,
+            ProviderFeatureSupport::PassthroughAsTool
+        );
+        assert_eq!(
+            deepseek.web_fetch,
+            ProviderFeatureSupport::PassthroughAsTool
+        );
     }
 
     #[test]

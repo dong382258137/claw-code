@@ -11,7 +11,7 @@ pub mod bg;
 mod bootstrap;
 pub mod branch_lock;
 pub mod cache_alignment;
-mod compact;
+pub mod compact;
 mod config;
 pub mod config_validate;
 pub mod content_classifier;
@@ -19,8 +19,8 @@ pub mod content_compression;
 mod conversation;
 // Multi-Agent Hardening §4.1:统一诊断基础设施(panic hook + DiagLog)。
 // 提取自 rusty-claude-cli/src/lib.rs main_entry 内联闭包,供 main/headless/测试入口复用。
-pub mod diag;
 pub mod decision_log;
+pub mod diag;
 mod file_ops;
 pub mod g004_conformance;
 mod git_context;
@@ -152,9 +152,9 @@ pub use context_assembler::{
     AssembledPrompt, CacheStrategy, ContextAssembler, ContextBlock, ContextSource, TokenBudget,
 };
 pub use decision_log::{
-    compute_simhash, hamming_distance, DecisionExtractorClient, DecisionLog, DecisionLogError,
-    DecisionVerification, DetectionStrategy, is_decision_extractor_client_registered,
-    set_global_decision_extractor_client,
+    compute_simhash, hamming_distance, is_decision_extractor_client_registered,
+    set_global_decision_extractor_client, DecisionExtractorClient, DecisionLog, DecisionLogError,
+    DecisionVerification, DetectionStrategy,
 };
 pub use vcs_snapshot::{RefactorTransaction, TransactionStatus, VcsError};
 
@@ -375,14 +375,14 @@ pub fn build_embedding_provider() -> Option<Box<dyn EmbeddingProvider + Send + S
                     "embedding provider: fastembed ({}-dim BGE-small-en-v1.5)",
                     provider.dim()
                 );
-                return Some(Box::new(provider));
+                Some(Box::new(provider))
             }
             Err(e) => {
                 eprintln!(
                     "fastembed init failed ({}), falling back to hash embedding",
                     e
                 );
-                return Some(Box::new(HashEmbeddingProvider::default_dim()));
+                Some(Box::new(HashEmbeddingProvider::default_dim()))
             }
         }
     }

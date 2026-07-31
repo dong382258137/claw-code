@@ -576,7 +576,7 @@ impl TerminalRenderer {
         let code = strip_ansi(code);
         let syntax = self
             .syntax_set
-            .find_syntax_by_token(&language)
+            .find_syntax_by_token(language)
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
         let mut syntax_highlighter = HighlightLines::new(syntax, &self.syntax_theme);
         let mut colored_output = String::new();

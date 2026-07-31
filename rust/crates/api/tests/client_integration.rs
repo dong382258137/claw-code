@@ -18,10 +18,10 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use api::{
-    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
-    InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest, OpenAiCompatClient,
-    OpenAiCompatConfig, OutputContentBlock, ProviderClient, ProviderKind, StreamEvent,
-    SystemContent, ToolChoice, ToolDefinition,
+    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, InputContentBlock,
+    InputMessage, MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig,
+    OutputContentBlock, ProviderClient, ProviderKind, StreamEvent, SystemContent, ToolChoice,
+    ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -80,15 +80,15 @@ async fn send_message_posts_json_and_parses_response() {
         Some("Bearer test-key")
     );
     assert!(
-        request.headers.get("x-api-key").is_none(),
+        !request.headers.contains_key("x-api-key"),
         "DeepSeek OpenAI-compat path must not send an x-api-key header"
     );
     assert!(
-        request.headers.get("anthropic-version").is_none(),
+        !request.headers.contains_key("anthropic-version"),
         "anthropic-version header must not be sent on the DeepSeek path"
     );
     assert!(
-        request.headers.get("anthropic-beta").is_none(),
+        !request.headers.contains_key("anthropic-beta"),
         "anthropic-beta header must not be sent on the DeepSeek path"
     );
     let body: serde_json::Value =
@@ -242,21 +242,22 @@ async fn stream_message_parses_sse_events_with_tool_use() {
         "expected a MessageStart event"
     );
     assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+        events.iter().any(
+            |event| matches!(event, StreamEvent::ContentBlockStart(ContentBlockStartEvent {
                 content_block: OutputContentBlock::ToolUse { name, .. },
                 ..
-            }) if name == "get_weather")),
+            }) if name == "get_weather")
+        ),
         "expected a tool_use content block for get_weather"
     );
     assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                 delta: ContentBlockDelta::InputJsonDelta { .. },
                 ..
-            }))),
+            })
+        )),
         "expected an input_json_delta for the tool call"
     );
     assert!(
@@ -316,6 +317,7 @@ async fn retries_retryable_failures_before_succeeding() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // env 互斥锁:防止并行测试相互覆盖环境变量,有意持有跨 await
 async fn provider_client_dispatches_deepseek_requests() {
     let _guard = env_lock();
     std::env::set_var("DEEPSEEK_API_KEY", "test-key");
@@ -358,7 +360,7 @@ async fn provider_client_dispatches_deepseek_requests() {
         Some("Bearer test-key")
     );
     assert!(
-        request.headers.get("x-api-key").is_none(),
+        !request.headers.contains_key("x-api-key"),
         "DeepSeek path must not send x-api-key"
     );
 
@@ -482,8 +484,8 @@ async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter
 #[tokio::test]
 #[ignore = "requires DEEPSEEK_API_KEY and network access to api.deepseek.com"]
 async fn live_stream_smoke_test() {
-    let client =
-        OpenAiCompatClient::from_env(OpenAiCompatConfig::deepseek()).expect("DEEPSEEK_API_KEY must be set");
+    let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::deepseek())
+        .expect("DEEPSEEK_API_KEY must be set");
     let mut stream = client
         .stream_message(&MessageRequest {
             model: std::env::var("DEEPSEEK_MODEL")

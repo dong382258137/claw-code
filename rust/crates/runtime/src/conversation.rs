@@ -44,7 +44,7 @@ use crate::multi_agent::{
 // v3:新增 DagGraph / DagScheduler / DagNode / DagError / NodeResult / RetryPolicy,
 // 用于 spawn_parallel_via_dag 真并行 spawn。
 use crate::multi_agent::dag::{
-    DagError, DagGraph, DagNode, DagScheduler, FailFast, NodeResult, CoordinatorExecutor,
+    CoordinatorExecutor, DagError, DagGraph, DagNode, DagScheduler, FailFast, NodeResult,
     RetryPolicy, SubagentDispatcher, SubagentRunner,
 };
 // Step 3.2-a:LaneEvent helpers for SubagentHandoff / SubagentResult.
@@ -290,7 +290,9 @@ pub trait ApiClient: Send {
         &'a mut self,
         request: ApiRequest,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a,
+        >,
     > {
         Box::pin(async move { self.stream(request) })
     }
@@ -812,10 +814,7 @@ where
     /// **降级行为**:切换到 `LlmExtract` 但未通过 `set_global_decision_extractor_client`
     /// 注册 client 时,`extract_decisions_before_compaction` 会自动 3 路降级为 Heuristic,
     /// 不会阻塞 compaction。
-    pub fn set_detection_strategy(
-        &mut self,
-        strategy: crate::decision_log::DetectionStrategy,
-    ) {
+    pub fn set_detection_strategy(&mut self, strategy: crate::decision_log::DetectionStrategy) {
         self.detection_strategy = strategy;
     }
 
@@ -932,10 +931,8 @@ where
     where
         C: ApiClient + Send + 'static,
     {
-        let dispatcher = SubagentDispatcher::new(
-            Arc::new(Mutex::new(Box::new(api_client))),
-            workspace_root,
-        );
+        let dispatcher =
+            SubagentDispatcher::new(Arc::new(Mutex::new(Box::new(api_client))), workspace_root);
         let runner: SubagentRunner = Arc::new(move |id, task| {
             let d = dispatcher.clone();
             Box::pin(async move { d.dispatch(id, task).await })
@@ -999,10 +996,7 @@ where
     /// let results = runtime.spawn_parallel_via_dag(tasks);
     /// assert_eq!(results.len(), 2);
     /// ```
-    pub fn spawn_parallel_via_dag(
-        &self,
-        tasks: Vec<SpawnRequest>,
-    ) -> Vec<Result<String, String>> {
+    pub fn spawn_parallel_via_dag(&self, tasks: Vec<SpawnRequest>) -> Vec<Result<String, String>> {
         // 默认 FailFast::On(向后兼容)
         self.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On)
     }
@@ -1203,8 +1197,7 @@ where
     /// 即一次性全部 spawn。
     fn build_spawn_parallel_graph(nodes: &[(usize, DagNode)]) -> DagGraph {
         let max_parallel = nodes.len();
-        let mut graph =
-            DagGraph::new("spawn_parallel_via_dag").with_max_parallelism(max_parallel);
+        let mut graph = DagGraph::new("spawn_parallel_via_dag").with_max_parallelism(max_parallel);
         for (_, node) in nodes {
             graph.add_node(node.clone());
         }
@@ -1251,9 +1244,7 @@ where
                         if node.id == *failed_id {
                             results[idx] = Err(format!("subagent failed: {msg}"));
                         } else {
-                            results[idx] = Err(format!(
-                                "cancelled due to sibling failure: {msg}"
-                            ));
+                            results[idx] = Err(format!("cancelled due to sibling failure: {msg}"));
                         }
                     } else {
                         results[idx] = Err(msg.clone());
@@ -1582,9 +1573,12 @@ where
         if self.plan_mode_enabled && self.active_plan.is_none() {
             match assess_complexity(&user_input) {
                 ComplexityAssessment::Complex { reason: _ } => {
-                    // G10.7 fix: heuristic task decomposition fills steps
-                    // (full LLM decomposition deferred to Group D1)
-                    let steps = decompose_task(&user_input);
+                    // D1.0:LLM-driven planning — 已注册 PlanGeneratorClient 时
+                    // 由模型生成步骤(JSON),失败/未注册回退启发式 decompose_task。
+                    // 模型输出经 parse_llm_plan_steps 容错解析,任何异常都不阻断
+                    // plan 创建(回退启发式,保证至少 1 个 step)。
+                    let steps = crate::planner::generate_steps_with_llm(&user_input)
+                        .unwrap_or_else(|| decompose_task(&user_input));
                     let mut artifact = PlanArtifact::new(user_input.clone(), steps);
                     // 尝试持久化(workspace_root 为 None 时跳过,不阻断主流程)。
                     if let Some(root) = &self.workspace_root {
@@ -2260,9 +2254,9 @@ where
                     }
                     PermissionOutcome::Deny { reason } => {
                         // 触发 Notification hook:权限拒绝是用户通知的天然触发点
-                        let _ = self.hook_runner.run_notification(
-                            &format!("Tool `{tool_name}` was denied: {reason}"),
-                        );
+                        let _ = self
+                            .hook_runner
+                            .run_notification(&format!("Tool `{tool_name}` was denied: {reason}"));
                         ConversationMessage::tool_result(
                             tool_use_id,
                             tool_name,
@@ -2775,7 +2769,10 @@ where
         // spawn:有 model 走 spawn_with_model(能力校验),否则走原 spawn(向后兼容)
         // 借用:此处 coordinator 是 &MultiAgentCoordinator(不可变借用 self.multi_agent_coordinator)
         let subagent_id = {
-            let coordinator = self.multi_agent_coordinator.as_ref().expect("checked above");
+            let coordinator = self
+                .multi_agent_coordinator
+                .as_ref()
+                .expect("checked above");
             let id = if let Some(m) = model_str {
                 coordinator
                     .spawn_with_model(name, task, mode, m, complexity)
@@ -2838,7 +2835,10 @@ where
                         current_model
                     ),
                 )
-                .with_field("subagent_id", serde_json::Value::String(subagent_id.clone()))
+                .with_field(
+                    "subagent_id",
+                    serde_json::Value::String(subagent_id.clone()),
+                )
                 .with_field(
                     "attempt",
                     serde_json::Value::Number(serde_json::Number::from(attempt)),
@@ -2850,7 +2850,9 @@ where
                 .with_field(
                     "model",
                     serde_json::Value::String(
-                        current_model.clone().unwrap_or_else(|| "<default>".to_string()),
+                        current_model
+                            .clone()
+                            .unwrap_or_else(|| "<default>".to_string()),
                     ),
                 ),
             );
@@ -2924,7 +2926,8 @@ where
                             // 成本门禁:升级前检查
                             if !coordinator.check_cost_limit(&subagent_id) {
                                 let cost_acc = coordinator.get_cost_accumulated(&subagent_id);
-                                let cost_lim = coordinator.get_cost_limit(&subagent_id).unwrap_or(0.0);
+                                let cost_lim =
+                                    coordinator.get_cost_limit(&subagent_id).unwrap_or(0.0);
                                 let msg = format!(
                                     "Subagent `{subagent_id}` failed: cost limit ${cost_lim:.4} exceeded (accumulated ${cost_acc:.4}); validation error: {}",
                                     ve.message
@@ -3007,10 +3010,8 @@ where
                         .and_then(upgrade_model_for_subagent);
                     match upgraded {
                         Some(upgrade) => {
-                            let _ = coordinator.reset_for_retry(
-                                &subagent_id,
-                                Some(upgrade.target_model.clone()),
-                            );
+                            let _ = coordinator
+                                .reset_for_retry(&subagent_id, Some(upgrade.target_model.clone()));
                             let _ = coordinator.start(&subagent_id);
                             current_model = Some(upgrade.target_model);
                             // continue 下一轮 retry
@@ -3043,12 +3044,8 @@ where
         let _ = self.hook_runner.run_subagent_stop(&subagent_id);
 
         // 发布终态 SubagentResult lane event
-        let event = LaneEvent::subagent_result(
-            emitted_at,
-            &subagent_id,
-            final_status,
-            &final_result_msg,
-        );
+        let event =
+            LaneEvent::subagent_result(emitted_at, &subagent_id, final_status, &final_result_msg);
         publish_lane_event(event);
 
         Ok(final_result_msg)
@@ -3157,15 +3154,17 @@ where
 
         // 构造独立 client — Multi-Agent Hardening §4.5.3
         match self.api_client.with_model(model) {
-            Ok(mut sub_client) => Self::execute_subagent_llm(
-                workspace_root,
-                &mut *sub_client,
-                subagent_id,
-                name,
-                task,
-                complexity,
-            )
-            .await,
+            Ok(mut sub_client) => {
+                Self::execute_subagent_llm(
+                    workspace_root,
+                    &mut *sub_client,
+                    subagent_id,
+                    name,
+                    task,
+                    complexity,
+                )
+                .await
+            }
             Err(e) => {
                 // 降级:client 构造失败时回退到主 agent client(同模型重试)
                 // 记录诊断日志,便于排查环境配置问题
@@ -3478,10 +3477,7 @@ where
             "on" => FailFast::On,
             "off" => FailFast::Off,
             other => {
-                return Err(format!(
-                    "invalid fail_fast '{other}': expected 'on' or 'off'"
-                )
-                .into());
+                return Err(format!("invalid fail_fast '{other}': expected 'on' or 'off'").into());
             }
         };
 
@@ -3500,10 +3496,7 @@ where
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("tasks[{idx}]: missing 'model' field"))?;
 
-            let mode_str = item
-                .get("mode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("fork");
+            let mode_str = item.get("mode").and_then(|v| v.as_str()).unwrap_or("fork");
             let mode = match mode_str {
                 "fork" => CoordinationMode::Fork,
                 "teammate" => CoordinationMode::Teammate,
@@ -3533,9 +3526,7 @@ where
         let fail_count = results.len() - success_count;
         output.push_str(&format!(
             "spawn_parallel_subagents: {} succeeded, {} failed (fail_fast={})\n",
-            success_count,
-            fail_count,
-            fail_fast_str
+            success_count, fail_count, fail_fast_str
         ));
         for (i, r) in results.iter().enumerate() {
             match r {
@@ -4101,8 +4092,7 @@ where
             .skip(preserve_recent)
             .map(crate::session::extract_indexable_text)
             .collect();
-        let messages_refs: Vec<&str> =
-            messages_to_compact.iter().map(String::as_str).collect();
+        let messages_refs: Vec<&str> = messages_to_compact.iter().map(String::as_str).collect();
         // v3 §4.7:从 runtime 字段读取策略(默认 Heuristic,可通过 with_detection_strategy 升级)。
         // LlmExtract 分支会调用全局 DecisionExtractorClient(由 build_runtime 注入),
         // 失败时 3 路降级保证不阻塞 compaction。
@@ -4119,9 +4109,7 @@ where
             );
             // 持久化到 NOTEBOOK.md decisions 段(§4.7.2)
             if let Some(ws) = &self.workspace_root {
-                if let Err(e) =
-                    crate::decision_log::persist_decisions_to_notebook(ws, &decisions)
-                {
+                if let Err(e) = crate::decision_log::persist_decisions_to_notebook(ws, &decisions) {
                     eprintln!("[decision_log] failed to persist decisions to notebook: {e}");
                 }
             }
@@ -7388,59 +7376,113 @@ mod tests {
     /// §4.6 验收:Diagnostic 复杂度时 system_prompt 含诊断 SOP
     #[test]
     fn build_subagent_system_prompt_injects_diagnostic_sop() {
-        let prompt = ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
-            "subagent-test",
-            "diag-agent",
-            "定位 wizard 闪退",
-            crate::multi_agent::TaskComplexity::Diagnostic,
-        );
+        let prompt =
+            ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
+                "subagent-test",
+                "diag-agent",
+                "定位 wizard 闪退",
+                crate::multi_agent::TaskComplexity::Diagnostic,
+            );
         // 基础 prompt 内容
-        assert!(prompt.contains("# Subagent: diag-agent"), "should contain base header");
+        assert!(
+            prompt.contains("# Subagent: diag-agent"),
+            "should contain base header"
+        );
         assert!(prompt.contains("定位 wizard 闪退"), "should contain task");
         // 诊断 SOP 五条规则
         assert!(prompt.contains("## 诊断任务执行规范"), "missing SOP header");
-        assert!(prompt.contains("CLAW_DIAG=1"), "missing rule 1: diag log first");
-        assert!(prompt.contains("panic vs Err vs 配置错误"), "missing rule 2: confirm error type");
-        assert!(prompt.contains("cargo build"), "missing rule 3: verify compilation");
-        assert!(prompt.contains("复现验证证据"), "missing rule 4: reproduce evidence");
-        assert!(prompt.contains("catch_unwind / panic hook"), "missing rule 5: no defensive code");
+        assert!(
+            prompt.contains("CLAW_DIAG=1"),
+            "missing rule 1: diag log first"
+        );
+        assert!(
+            prompt.contains("panic vs Err vs 配置错误"),
+            "missing rule 2: confirm error type"
+        );
+        assert!(
+            prompt.contains("cargo build"),
+            "missing rule 3: verify compilation"
+        );
+        assert!(
+            prompt.contains("复现验证证据"),
+            "missing rule 4: reproduce evidence"
+        );
+        assert!(
+            prompt.contains("catch_unwind / panic hook"),
+            "missing rule 5: no defensive code"
+        );
     }
 
     /// §4.6 验收:Simple 复杂度时 system_prompt 不含诊断 SOP(避免污染简单任务)
     #[test]
     fn build_subagent_system_prompt_skips_sop_for_simple_task() {
-        let prompt = ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
-            "subagent-test",
-            "fmt-agent",
-            "格式化 mod.rs",
-            crate::multi_agent::TaskComplexity::Simple,
-        );
+        let prompt =
+            ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
+                "subagent-test",
+                "fmt-agent",
+                "格式化 mod.rs",
+                crate::multi_agent::TaskComplexity::Simple,
+            );
         // 基础 prompt 内容
-        assert!(prompt.contains("# Subagent: fmt-agent"), "should contain base header");
+        assert!(
+            prompt.contains("# Subagent: fmt-agent"),
+            "should contain base header"
+        );
         // 不应含诊断 SOP
-        assert!(!prompt.contains("## 诊断任务执行规范"), "Simple task should NOT have SOP");
-        assert!(!prompt.contains("CLAW_DIAG=1"), "Simple task should NOT contain diag rule");
+        assert!(
+            !prompt.contains("## 诊断任务执行规范"),
+            "Simple task should NOT have SOP"
+        );
+        assert!(
+            !prompt.contains("CLAW_DIAG=1"),
+            "Simple task should NOT contain diag rule"
+        );
     }
 
     /// §4.6 v2 验收:Architectural 复杂度注入架构决策 SOP(非诊断 SOP)
     #[test]
     fn build_subagent_system_prompt_injects_architectural_sop() {
-        let prompt = ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
-            "subagent-test",
-            "arch-agent",
-            "评估微服务拆分方案",
-            crate::multi_agent::TaskComplexity::Architectural,
-        );
+        let prompt =
+            ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
+                "subagent-test",
+                "arch-agent",
+                "评估微服务拆分方案",
+                crate::multi_agent::TaskComplexity::Architectural,
+            );
         // 基础 prompt 内容
-        assert!(prompt.contains("# Subagent: arch-agent"), "should contain base header");
+        assert!(
+            prompt.contains("# Subagent: arch-agent"),
+            "should contain base header"
+        );
         // 架构决策 SOP 六条规则
-        assert!(prompt.contains("## 架构决策执行规范"), "missing architectural SOP header");
-        assert!(prompt.contains("候选方案"), "missing rule 1: alternatives required");
-        assert!(prompt.contains("trade-off"), "missing rule 2: trade-off evaluation");
-        assert!(prompt.contains("rationale"), "missing rule 3: rationale for rejecting alternatives");
-        assert!(prompt.contains("向后兼容"), "missing rule 4: backward compatibility impact");
-        assert!(prompt.contains("NOTEBOOK.md"), "missing rule 5: decisions persistence");
-        assert!(prompt.contains("禁止凭直觉"), "missing rule 6: no intuition-based decisions");
+        assert!(
+            prompt.contains("## 架构决策执行规范"),
+            "missing architectural SOP header"
+        );
+        assert!(
+            prompt.contains("候选方案"),
+            "missing rule 1: alternatives required"
+        );
+        assert!(
+            prompt.contains("trade-off"),
+            "missing rule 2: trade-off evaluation"
+        );
+        assert!(
+            prompt.contains("rationale"),
+            "missing rule 3: rationale for rejecting alternatives"
+        );
+        assert!(
+            prompt.contains("向后兼容"),
+            "missing rule 4: backward compatibility impact"
+        );
+        assert!(
+            prompt.contains("NOTEBOOK.md"),
+            "missing rule 5: decisions persistence"
+        );
+        assert!(
+            prompt.contains("禁止凭直觉"),
+            "missing rule 6: no intuition-based decisions"
+        );
         // 不应含诊断 SOP(两个 SOP 互斥)
         assert!(
             !prompt.contains("## 诊断任务执行规范"),
@@ -7659,10 +7701,7 @@ mod tests {
             "model should NOT be upgraded (auto-upgrade disabled)"
         );
         assert!(!agent.validated, "should not be validated");
-        assert_eq!(
-            agent.status,
-            crate::multi_agent::SubagentStatus::Failed
-        );
+        assert_eq!(agent.status, crate::multi_agent::SubagentStatus::Failed);
     }
 
     /// 场景 4:flash + Simple + max_attempts=2,validate 失败 → 无升级路径 → fail
@@ -7893,7 +7932,11 @@ mod tests {
             .and_then(|s| s.split('`').next())
             .expect("extract subagent_id");
         let agent = coordinator.get(subagent_id).expect("agent exists");
-        assert_eq!(agent.model.as_deref(), Some("deepseek-v4-flash"), "model should not change");
+        assert_eq!(
+            agent.model.as_deref(),
+            Some("deepseek-v4-flash"),
+            "model should not change"
+        );
         assert_eq!(agent.attempts, 0, "no reset should happen");
     }
 
@@ -8078,15 +8121,13 @@ mod tests {
             vec!["system".to_string()],
         );
 
-        let tasks = vec![
-            crate::multi_agent::SpawnRequest::new(
-                "agent-a",
-                "task A",
-                crate::multi_agent::CoordinationMode::Fork,
-                "deepseek-v4-flash",
-                crate::multi_agent::TaskComplexity::Simple,
-            ),
-        ];
+        let tasks = vec![crate::multi_agent::SpawnRequest::new(
+            "agent-a",
+            "task A",
+            crate::multi_agent::CoordinationMode::Fork,
+            "deepseek-v4-flash",
+            crate::multi_agent::TaskComplexity::Simple,
+        )];
 
         let results = runtime
             .spawn_parallel_via_dag_async(tasks, FailFast::On)
@@ -8137,15 +8178,13 @@ mod tests {
         )
         .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
 
-        let tasks = vec![
-            crate::multi_agent::SpawnRequest::new(
-                "diag-agent",
-                "诊断",
-                crate::multi_agent::CoordinationMode::Fork,
-                "deepseek-v4-flash",
-                crate::multi_agent::TaskComplexity::Diagnostic,
-            ),
-        ];
+        let tasks = vec![crate::multi_agent::SpawnRequest::new(
+            "diag-agent",
+            "诊断",
+            crate::multi_agent::CoordinationMode::Fork,
+            "deepseek-v4-flash",
+            crate::multi_agent::TaskComplexity::Diagnostic,
+        )];
 
         let results = runtime
             .spawn_parallel_via_dag_async(tasks, FailFast::On)
@@ -8159,6 +8198,7 @@ mod tests {
 
     /// v3:异步变体 — 端到端真并行执行成功
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试互斥锁:有意持有跨 await,串行化共享 lane-events 状态
     async fn spawn_parallel_via_dag_async_parallel_execution_succeeds() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
@@ -8199,10 +8239,7 @@ mod tests {
         for (i, r) in results.iter().enumerate() {
             match r {
                 Ok(path) => {
-                    assert!(
-                        path.contains(".claw/subagents/"),
-                        "task {i} got: {path}"
-                    );
+                    assert!(path.contains(".claw/subagents/"), "task {i} got: {path}");
                     assert!(
                         tempdir.path().join(path).exists(),
                         "task {i} file should exist"
@@ -8231,15 +8268,13 @@ mod tests {
         )
         .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
 
-        let tasks = vec![
-            crate::multi_agent::SpawnRequest::new(
-                "agent-x",
-                "task X",
-                crate::multi_agent::CoordinationMode::Fork,
-                "deepseek-v4-flash",
-                crate::multi_agent::TaskComplexity::Simple,
-            ),
-        ];
+        let tasks = vec![crate::multi_agent::SpawnRequest::new(
+            "agent-x",
+            "task X",
+            crate::multi_agent::CoordinationMode::Fork,
+            "deepseek-v4-flash",
+            crate::multi_agent::TaskComplexity::Simple,
+        )];
 
         let results = runtime.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On);
         assert_eq!(results.len(), 1);
@@ -8419,6 +8454,7 @@ mod tests {
 
     /// v3:`execute_spawn_parallel_subagents_async` — 无效 JSON 返回错误
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试互斥锁:有意持有跨 await,串行化共享 lane-events 状态
     async fn execute_spawn_parallel_subagents_async_invalid_json_errors() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
@@ -8443,6 +8479,7 @@ mod tests {
 
     /// v3:`execute_spawn_parallel_subagents_async` — 空 tasks 数组返回错误
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试互斥锁:有意持有跨 await,串行化共享 lane-events 状态
     async fn execute_spawn_parallel_subagents_async_empty_tasks_errors() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
@@ -8467,6 +8504,7 @@ mod tests {
 
     /// v3:`execute_spawn_parallel_subagents_async` — 端到端成功:2 个 Simple task 并行执行
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试互斥锁:有意持有跨 await,串行化共享 lane-events 状态
     async fn execute_spawn_parallel_subagents_async_succeeds() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
@@ -8493,7 +8531,10 @@ mod tests {
             .execute_spawn_parallel_subagents_async(input)
             .await
             .expect("should return formatted output");
-        assert!(output.contains("spawn_parallel_subagents:"), "got: {output}");
+        assert!(
+            output.contains("spawn_parallel_subagents:"),
+            "got: {output}"
+        );
         assert!(output.contains("fail_fast=off"), "got: {output}");
     }
 
@@ -8528,8 +8569,7 @@ mod tests {
         ];
         let output =
             ConversationRuntime::<NoopApi, StaticToolExecutor>::format_spawn_parallel_results(
-                &results,
-                "on",
+                &results, "on",
             );
         assert!(output.contains("2 succeeded"), "got: {output}");
         assert!(output.contains("1 failed"), "got: {output}");
@@ -8567,11 +8607,9 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_detection_strategy(
-            crate::decision_log::DetectionStrategy::LlmExtract {
-                model: "deepseek-v4-flash".to_string(),
-            },
-        );
+        .with_detection_strategy(crate::decision_log::DetectionStrategy::LlmExtract {
+            model: "deepseek-v4-flash".to_string(),
+        });
         match runtime.detection_strategy() {
             crate::decision_log::DetectionStrategy::LlmExtract { model } => {
                 assert_eq!(model, "deepseek-v4-flash");

@@ -42,16 +42,14 @@ struct ProviderInfo {
     description: &'static str,
 }
 
-const KNOWN_PROVIDERS: &[ProviderInfo] = &[
-    ProviderInfo {
-        label: "DeepSeek",
-        env_key: "DEEPSEEK_API_KEY",
-        slug: "deepseek",
-        default_model: "deepseek-v4-pro",
-        base_url_env: "DEEPSEEK_BASE_URL",
-        description: "DeepSeek V4 Pro, V4 Flash, Chat, Reasoner",
-    },
-];
+const KNOWN_PROVIDERS: &[ProviderInfo] = &[ProviderInfo {
+    label: "DeepSeek",
+    env_key: "DEEPSEEK_API_KEY",
+    slug: "deepseek",
+    default_model: "deepseek-v4-pro",
+    base_url_env: "DEEPSEEK_BASE_URL",
+    description: "DeepSeek V4 Pro, V4 Flash, Chat, Reasoner",
+}];
 
 /// Result of scanning environment variables for pre-existing keys.
 struct DetectedKey {
@@ -173,11 +171,8 @@ pub(crate) fn run_first_run_wizard() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn inject_api_key(provider_slug: &str, api_key: &str) {
-    match provider_slug {
-        "deepseek" => {
-            std::env::set_var("DEEPSEEK_API_KEY", api_key);
-        }
-        _ => {}
+    if provider_slug == "deepseek" {
+        std::env::set_var("DEEPSEEK_API_KEY", api_key);
     }
 }
 

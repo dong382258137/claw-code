@@ -52,9 +52,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
     CacheControl, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, ProviderClient as ApiProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use app::*;
@@ -120,10 +120,9 @@ use streaming::{
     build_system_blocks, collect_prompt_cache_events, collect_tool_results, collect_tool_uses,
     compact_tool_output_for_model, convert_messages, extract_system_messages, final_assistant_text,
     format_context_window_blocked_error, format_user_visible_api_error,
-    mark_last_tool_with_cache_control, permission_policy,
-    push_output_block, render_thinking_block_summary,
-    request_ends_with_tool_result, response_to_events, AnthropicRuntimeClient, HookAbortMonitor,
-    NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
+    mark_last_tool_with_cache_control, permission_policy, push_output_block,
+    render_thinking_block_summary, request_ends_with_tool_result, response_to_events,
+    AnthropicRuntimeClient, HookAbortMonitor, NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
 };
 use suggestion::{
     common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
@@ -510,11 +509,8 @@ pub fn run_tui_repl_entry(
 /// process so that downstream auth resolution picks them up transparently.
 #[cfg(feature = "full-tui")]
 fn inject_wizard_env_vars(settings: &runtime::WizardSettings) {
-    match settings.provider.as_str() {
-        "deepseek" => {
-            std::env::set_var("DEEPSEEK_API_KEY", &settings.api_key);
-        }
-        _ => {}
+    if settings.provider.as_str() == "deepseek" {
+        std::env::set_var("DEEPSEEK_API_KEY", &settings.api_key);
     }
 }
 

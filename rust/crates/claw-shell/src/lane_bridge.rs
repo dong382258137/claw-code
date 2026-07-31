@@ -354,9 +354,7 @@ pub fn flush_lane_events_to_acp(
 mod tests {
     use super::*;
     // 从 runtime 根命名空间导入(lane_events 模块本身是私有的)。
-    use runtime::{
-        EventProvenance, LaneEventBuilder, LaneEventStatus, LaneFailureClass,
-    };
+    use runtime::{EventProvenance, LaneEventBuilder, LaneEventStatus, LaneFailureClass};
 
     // `LaneEventStatus` 在非测试代码中未使用,但在测试中频繁使用。
 
@@ -366,13 +364,21 @@ mod tests {
     fn sink_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// 构造一个带最小 metadata 的测试 LaneEvent。
     fn make_event(name: LaneEventName, status: LaneEventStatus, seq: u64) -> LaneEvent {
-        LaneEventBuilder::new(name, status, "2026-07-26T00:00:00Z", seq, EventProvenance::Test)
-            .build()
+        LaneEventBuilder::new(
+            name,
+            status,
+            "2026-07-26T00:00:00Z",
+            seq,
+            EventProvenance::Test,
+        )
+        .build()
     }
 
     fn session_id() -> acp::SessionId {
@@ -395,8 +401,12 @@ mod tests {
 
     #[test]
     fn prompt_misdelivery_maps_to_agent_message_chunk() {
-        let event = make_event(LaneEventName::PromptMisdelivery, LaneEventStatus::Blocked, 2)
-            .with_detail("wrong agent");
+        let event = make_event(
+            LaneEventName::PromptMisdelivery,
+            LaneEventStatus::Blocked,
+            2,
+        )
+        .with_detail("wrong agent");
         let notif = lane_event_to_session_update(&event, &session_id())
             .expect("PromptMisdelivery should map");
         assert!(matches!(
@@ -409,8 +419,8 @@ mod tests {
     fn blocked_maps_to_plan_in_progress() {
         let event = make_event(LaneEventName::Blocked, LaneEventStatus::Blocked, 3)
             .with_detail("blocked on test");
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Blocked should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("Blocked should map");
         match notif.update {
             acp::SessionUpdate::Plan(plan) => {
                 assert_eq!(plan.entries.len(), 1);
@@ -423,16 +433,14 @@ mod tests {
     #[test]
     fn red_maps_to_plan_in_progress() {
         let event = make_event(LaneEventName::Red, LaneEventStatus::Red, 4);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Red should map");
+        let notif = lane_event_to_session_update(&event, &session_id()).expect("Red should map");
         assert!(matches!(notif.update, acp::SessionUpdate::Plan(_)));
     }
 
     #[test]
     fn green_maps_to_agent_message_chunk() {
         let event = make_event(LaneEventName::Green, LaneEventStatus::Green, 5);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Green should map");
+        let notif = lane_event_to_session_update(&event, &session_id()).expect("Green should map");
         assert!(matches!(
             notif.update,
             acp::SessionUpdate::AgentMessageChunk(_)
@@ -442,8 +450,8 @@ mod tests {
     #[test]
     fn finished_maps_to_agent_message_chunk() {
         let event = make_event(LaneEventName::Finished, LaneEventStatus::Completed, 6);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Finished should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("Finished should map");
         assert!(matches!(
             notif.update,
             acp::SessionUpdate::AgentMessageChunk(_)
@@ -453,8 +461,8 @@ mod tests {
     #[test]
     fn commit_created_maps_to_tool_call_completed() {
         let event = make_event(LaneEventName::CommitCreated, LaneEventStatus::Completed, 7);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("CommitCreated should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("CommitCreated should map");
         match notif.update {
             acp::SessionUpdate::ToolCall(call) => {
                 assert_eq!(call.status, acp::ToolCallStatus::Completed);
@@ -467,22 +475,28 @@ mod tests {
     #[test]
     fn pr_opened_maps_to_tool_call_completed() {
         let event = make_event(LaneEventName::PrOpened, LaneEventStatus::Ready, 8);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("PrOpened should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("PrOpened should map");
         assert!(matches!(
             notif.update,
-            acp::SessionUpdate::ToolCall(acp::ToolCall { status: acp::ToolCallStatus::Completed, .. })
+            acp::SessionUpdate::ToolCall(acp::ToolCall {
+                status: acp::ToolCallStatus::Completed,
+                ..
+            })
         ));
     }
 
     #[test]
     fn merge_ready_maps_to_tool_call_completed() {
         let event = make_event(LaneEventName::MergeReady, LaneEventStatus::Ready, 9);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("MergeReady should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("MergeReady should map");
         assert!(matches!(
             notif.update,
-            acp::SessionUpdate::ToolCall(acp::ToolCall { status: acp::ToolCallStatus::Completed, .. })
+            acp::SessionUpdate::ToolCall(acp::ToolCall {
+                status: acp::ToolCallStatus::Completed,
+                ..
+            })
         ));
     }
 
@@ -490,8 +504,7 @@ mod tests {
     fn failed_maps_to_agent_message_chunk() {
         let event = make_event(LaneEventName::Failed, LaneEventStatus::Failed, 10)
             .with_failure_class(LaneFailureClass::Test);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Failed should map");
+        let notif = lane_event_to_session_update(&event, &session_id()).expect("Failed should map");
         assert!(matches!(
             notif.update,
             acp::SessionUpdate::AgentMessageChunk(_)
@@ -501,38 +514,40 @@ mod tests {
     #[test]
     fn reconciled_maps_to_tool_call() {
         let event = make_event(LaneEventName::Reconciled, LaneEventStatus::Reconciled, 11);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Reconciled should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("Reconciled should map");
         assert!(matches!(notif.update, acp::SessionUpdate::ToolCall(_)));
     }
 
     #[test]
     fn merged_maps_to_tool_call() {
         let event = make_event(LaneEventName::Merged, LaneEventStatus::Merged, 12);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Merged should map");
+        let notif = lane_event_to_session_update(&event, &session_id()).expect("Merged should map");
         assert!(matches!(notif.update, acp::SessionUpdate::ToolCall(_)));
     }
 
     #[test]
     fn superseded_maps_to_tool_call() {
         let event = make_event(LaneEventName::Superseded, LaneEventStatus::Superseded, 13);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Superseded should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("Superseded should map");
         assert!(matches!(notif.update, acp::SessionUpdate::ToolCall(_)));
     }
 
     #[test]
     fn closed_maps_to_tool_call() {
         let event = make_event(LaneEventName::Closed, LaneEventStatus::Closed, 14);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("Closed should map");
+        let notif = lane_event_to_session_update(&event, &session_id()).expect("Closed should map");
         assert!(matches!(notif.update, acp::SessionUpdate::ToolCall(_)));
     }
 
     #[test]
     fn branch_stale_maps_to_agent_message_chunk() {
-        let event = make_event(LaneEventName::BranchStaleAgainstMain, LaneEventStatus::Blocked, 15);
+        let event = make_event(
+            LaneEventName::BranchStaleAgainstMain,
+            LaneEventStatus::Blocked,
+            15,
+        );
         let notif = lane_event_to_session_update(&event, &session_id())
             .expect("BranchStaleAgainstMain should map");
         assert!(matches!(
@@ -543,8 +558,11 @@ mod tests {
 
     #[test]
     fn branch_mismatch_maps_to_agent_message_chunk() {
-        let event =
-            make_event(LaneEventName::BranchWorkspaceMismatch, LaneEventStatus::Blocked, 16);
+        let event = make_event(
+            LaneEventName::BranchWorkspaceMismatch,
+            LaneEventStatus::Blocked,
+            16,
+        );
         let notif = lane_event_to_session_update(&event, &session_id())
             .expect("BranchWorkspaceMismatch should map");
         assert!(matches!(
@@ -556,14 +574,18 @@ mod tests {
     #[test]
     fn ship_prepared_maps_to_tool_call() {
         let event = make_event(LaneEventName::ShipPrepared, LaneEventStatus::Ready, 17);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("ShipPrepared should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("ShipPrepared should map");
         assert!(matches!(notif.update, acp::SessionUpdate::ToolCall(_)));
     }
 
     #[test]
     fn ship_commits_selected_maps_to_tool_call() {
-        let event = make_event(LaneEventName::ShipCommitsSelected, LaneEventStatus::Ready, 18);
+        let event = make_event(
+            LaneEventName::ShipCommitsSelected,
+            LaneEventStatus::Ready,
+            18,
+        );
         let notif = lane_event_to_session_update(&event, &session_id())
             .expect("ShipCommitsSelected should map");
         assert!(matches!(notif.update, acp::SessionUpdate::ToolCall(_)));
@@ -572,16 +594,20 @@ mod tests {
     #[test]
     fn ship_merged_maps_to_tool_call() {
         let event = make_event(LaneEventName::ShipMerged, LaneEventStatus::Completed, 19);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("ShipMerged should map");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("ShipMerged should map");
         assert!(matches!(notif.update, acp::SessionUpdate::ToolCall(_)));
     }
 
     #[test]
     fn ship_pushed_main_maps_to_tool_call() {
-        let event = make_event(LaneEventName::ShipPushedMain, LaneEventStatus::Completed, 20);
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("ShipPushedMain should map");
+        let event = make_event(
+            LaneEventName::ShipPushedMain,
+            LaneEventStatus::Completed,
+            20,
+        );
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("ShipPushedMain should map");
         assert!(matches!(notif.update, acp::SessionUpdate::ToolCall(_)));
     }
 
@@ -609,14 +635,10 @@ mod tests {
 
     #[test]
     fn subagent_result_completed_maps_to_tool_call_completed() {
-        let event = LaneEvent::subagent_result(
-            "2026-07-26T00:00:00Z",
-            "sub-456",
-            "completed",
-            "done",
-        );
-        let notif = lane_event_to_session_update(&event, &session_id())
-            .expect("SubagentResult should map");
+        let event =
+            LaneEvent::subagent_result("2026-07-26T00:00:00Z", "sub-456", "completed", "done");
+        let notif =
+            lane_event_to_session_update(&event, &session_id()).expect("SubagentResult should map");
         match notif.update {
             acp::SessionUpdate::ToolCall(call) => {
                 assert_eq!(call.status, acp::ToolCallStatus::Completed);
@@ -628,12 +650,7 @@ mod tests {
 
     #[test]
     fn subagent_result_failed_maps_to_tool_call_failed() {
-        let event = LaneEvent::subagent_result(
-            "2026-07-26T00:00:00Z",
-            "sub-789",
-            "failed",
-            "boom",
-        );
+        let event = LaneEvent::subagent_result("2026-07-26T00:00:00Z", "sub-789", "failed", "boom");
         let notif = lane_event_to_session_update(&event, &session_id())
             .expect("SubagentResult failed should map");
         match notif.update {
@@ -646,6 +663,7 @@ mod tests {
 
     /// 验证 `flush_lane_events_to_acp` 在空 sink 时不 panic 且返回 0。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试互斥锁:有意持有跨 await,串行化共享全局 sink
     async fn flush_empty_sink_returns_zero() {
         // 获取序列化锁:防止与其他使用全局 sink 的测试并行执行。
         let _guard = sink_lock();
@@ -666,6 +684,7 @@ mod tests {
 
     /// 验证 `flush_lane_events_to_acp` 将事件推入 gateway channel。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试互斥锁:有意持有跨 await,串行化共享全局 sink
     async fn flush_pushes_events_to_gateway_channel() {
         // 获取序列化锁:防止与其他使用全局 sink 的测试并行执行。
         let _guard = sink_lock();

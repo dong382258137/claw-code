@@ -18,7 +18,9 @@ use plugins::test_isolation::EnvLock;
 /// 获取环境隔离锁，将 HOME / XDG 重定向到临时目录。
 ///
 /// 返回的 `EnvLock` 必须保持在测试期间存活（Drop 时自动清理临时目录）。
+// 共享测试工具:并非每个 target 都调用,仅声明 mod common 的 target 会告警。
 #[must_use]
+#[allow(dead_code)]
 pub fn isolate() -> EnvLock {
     EnvLock::lock()
 }

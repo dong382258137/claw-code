@@ -56,13 +56,9 @@ use super::DagStore;
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
     /// A node was spawned (entered Running state).
-    NodeStarted {
-        node_id: DagNodeId,
-    },
+    NodeStarted { node_id: DagNodeId },
     /// A node completed successfully.
-    NodeSucceeded {
-        node_id: DagNodeId,
-    },
+    NodeSucceeded { node_id: DagNodeId },
     /// A node failed. `attempt` is 0-indexed (0 = first try).
     /// `will_retry` is `true` if the scheduler will re-spawn the node.
     NodeFailed {
@@ -74,16 +70,11 @@ pub enum ProgressEvent {
     /// v3:节点因依赖失败而被跳过(FailFast::Off 专属事件)。
     /// 与 `NodeFailed` 区分:Skipped 节点本身未执行,可通过
     /// [`DagScheduler::recover_skipped`] 恢复。
-    NodeSkipped {
-        node_id: DagNodeId,
-        reason: String,
-    },
+    NodeSkipped { node_id: DagNodeId, reason: String },
     /// The entire DAG completed successfully.
     DagCompleted,
     /// The DAG failed (a node exhausted retries and FailFast propagated).
-    DagFailed {
-        node_id: DagNodeId,
-    },
+    DagFailed { node_id: DagNodeId },
     /// The DAG was cancelled via [`DagScheduler::cancel`] or a token fire.
     DagCancelled,
 }
@@ -349,11 +340,7 @@ impl DagScheduler {
 
         // 追加成功的 retry
         for success in &result.successes {
-            let attempt_num = existing_counts
-                .get(&success.node_id)
-                .copied()
-                .unwrap_or(0)
-                + 1;
+            let attempt_num = existing_counts.get(&success.node_id).copied().unwrap_or(0) + 1;
             let attempt = super::types::NodeAttempt {
                 node_id: success.node_id.clone(),
                 attempt: attempt_num,
@@ -368,11 +355,7 @@ impl DagScheduler {
 
         // 追加失败的 retry
         for (node_id, error) in &result.failures {
-            let attempt_num = existing_counts
-                .get(node_id)
-                .copied()
-                .unwrap_or(0)
-                + 1;
+            let attempt_num = existing_counts.get(node_id).copied().unwrap_or(0) + 1;
             let attempt = super::types::NodeAttempt {
                 node_id: node_id.clone(),
                 attempt: attempt_num,
@@ -455,7 +438,11 @@ impl DagScheduler {
                     // FailFast::Off:若任一依赖已失败/跳过,则此节点也跳过
                     if self.fail_fast == FailFast::Off {
                         if let Some(node) = self.dag.get_node(id) {
-                            if node.depends_on.iter().any(|dep| failed.contains_key(dep) || skipped.contains(dep)) {
+                            if node
+                                .depends_on
+                                .iter()
+                                .any(|dep| failed.contains_key(dep) || skipped.contains(dep))
+                            {
                                 newly_skipped.push(id.clone());
                                 return false;
                             }
@@ -537,10 +524,7 @@ impl DagScheduler {
                     completed.insert(node_id.clone());
                     results.push(result);
                     self.bridge_node_status(&node_id, DagNodeStatus::Succeeded);
-                    self.emit_progress(
-                        &mut on_progress,
-                        ProgressEvent::NodeSucceeded { node_id },
-                    );
+                    self.emit_progress(&mut on_progress, ProgressEvent::NodeSucceeded { node_id });
                 }
                 Ok((node_id, Err(node_err))) => {
                     // Precise failure attribution (v0.2 TODO 4): we know
@@ -638,7 +622,7 @@ impl DagScheduler {
                         // v3 FailFast::Off:标记节点失败(含错误信息),跳过其下游,继续执行独立分支。
                         failed.insert(node_id.clone(), node_err.to_string());
                         completed.insert(node_id.clone()); // 防止 ready_nodes 反复列出
-                        // 不取消 DAG,不 abort 在途任务,继续循环
+                                                           // 不取消 DAG,不 abort 在途任务,继续循环
                         continue;
                     }
 
@@ -802,7 +786,10 @@ mod tests {
     #[async_trait]
     impl SubagentExecutor for SuccessExecutor {
         async fn execute(&self, node: &DagNode) -> Result<NodeResult, NodeError> {
-            self.seen.lock().expect("seen poisoned").push(node.id.clone());
+            self.seen
+                .lock()
+                .expect("seen poisoned")
+                .push(node.id.clone());
             Ok(NodeResult {
                 node_id: node.id.clone(),
                 summary: node.task.clone(),
@@ -854,8 +841,7 @@ mod tests {
                 if *attempts <= self.fail_n_times {
                     return Err(NodeError::ExecutionFailed(format!(
                         "transient failure {} on {}",
-                        *attempts,
-                        node.id
+                        *attempts, node.id
                     )));
                 }
             }
@@ -933,7 +919,10 @@ mod tests {
         });
         let scheduler = DagScheduler::new(graph, executor);
         scheduler.cancel();
-        let err = scheduler.run().await.expect_err("cancelled run should error");
+        let err = scheduler
+            .run()
+            .await
+            .expect_err("cancelled run should error");
         assert!(matches!(err, DagError::Cancelled));
     }
 
@@ -947,11 +936,7 @@ mod tests {
         let dag = Dag {
             id: "linear".to_string(),
             name: "Linear".to_string(),
-            nodes: vec![
-                node("n1", &[]),
-                node("n2", &["n1"]),
-                node("n3", &["n2"]),
-            ],
+            nodes: vec![node("n1", &[]), node("n2", &["n1"]), node("n3", &["n2"])],
         };
         let graph = DagGraph::from_dag(&dag);
         let store = Arc::new(DagStore::new());
@@ -971,7 +956,11 @@ mod tests {
         assert_eq!(final_run.status, DagStatus::Completed);
         assert!(final_run.completed_at.is_some());
         for (_, status) in &final_run.node_statuses {
-            assert_eq!(*status, DagNodeStatus::Succeeded, "all nodes should be Succeeded");
+            assert_eq!(
+                *status,
+                DagNodeStatus::Succeeded,
+                "all nodes should be Succeeded"
+            );
         }
     }
 
@@ -980,11 +969,7 @@ mod tests {
         let dag = Dag {
             id: "parallel".to_string(),
             name: "Parallel".to_string(),
-            nodes: vec![
-                node("n1", &[]),
-                node("n2", &[]),
-                node("n3", &["n1", "n2"]),
-            ],
+            nodes: vec![node("n1", &[]), node("n2", &[]), node("n3", &["n1", "n2"])],
         };
         let graph = DagGraph::from_dag(&dag);
         let store = Arc::new(DagStore::new());
@@ -1028,10 +1013,9 @@ mod tests {
         let events = events.lock().unwrap();
         // 3 NodeStarted + 3 NodeSucceeded + 1 DagCompleted = 7 events.
         assert_eq!(events.len(), 7);
-        assert!(events.iter().any(|e| matches!(
-            e,
-            ProgressEvent::DagCompleted
-        )));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::DagCompleted)));
         assert_eq!(
             events
                 .iter()
@@ -1079,7 +1063,10 @@ mod tests {
             attempts: Mutex::new(0),
         });
         let scheduler = DagScheduler::new(g, executor);
-        let err = scheduler.run().await.expect_err("should fail after retries");
+        let err = scheduler
+            .run()
+            .await
+            .expect_err("should fail after retries");
         assert!(
             matches!(err, DagError::NodeFailed(ref id) if id == "n1"),
             "expected NodeFailed(n1) after retry exhaustion, got {err:?}"
@@ -1094,7 +1081,10 @@ mod tests {
             fail_id: "n1".to_string(),
         });
         let scheduler = DagScheduler::new(g, executor);
-        let err = scheduler.run().await.expect_err("should fail without retry");
+        let err = scheduler
+            .run()
+            .await
+            .expect_err("should fail without retry");
         assert!(matches!(err, DagError::NodeFailed(_)));
     }
 
@@ -1256,11 +1246,7 @@ mod tests {
         let dag = Dag {
             id: "parallel".to_string(),
             name: "Parallel".to_string(),
-            nodes: vec![
-                node("n1", &[]),
-                node("n2", &[]),
-                node("n3", &["n1", "n2"]),
-            ],
+            nodes: vec![node("n1", &[]), node("n2", &[]), node("n3", &["n1", "n2"])],
         };
         let graph = DagGraph::from_dag(&dag);
         let store = Arc::new(DagStore::new());
@@ -1272,10 +1258,9 @@ mod tests {
         let fail_executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
             fail_id: "n1".to_string(),
         });
-        let scheduler =
-            DagScheduler::new(graph, fail_executor)
-                .with_fail_fast(FailFast::Off)
-                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let scheduler = DagScheduler::new(graph, fail_executor)
+            .with_fail_fast(FailFast::Off)
+            .with_dag_run(Arc::clone(&store), run_id.clone());
         let result = scheduler
             .run_with_details()
             .await
@@ -1295,12 +1280,11 @@ mod tests {
         });
         // 用新 scheduler 但桥接同一个 DagRun
         let retry_graph = DagGraph::from_dag(&dag);
-        let retry_scheduler =
-            DagScheduler::new(retry_graph, retry_executor)
-                .with_fail_fast(FailFast::Off)
-                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let retry_scheduler = DagScheduler::new(retry_graph, retry_executor)
+            .with_fail_fast(FailFast::Off)
+            .with_dag_run(Arc::clone(&store), run_id.clone());
         let retry_result = retry_scheduler
-            .retry_failed(&[failed_id.clone()])
+            .retry_failed(std::slice::from_ref(&failed_id))
             .await
             .expect("retry should succeed");
         assert_eq!(retry_result.success_count(), 1);
@@ -1350,10 +1334,9 @@ mod tests {
         let fail_executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
             fail_id: "n1".to_string(),
         });
-        let scheduler =
-            DagScheduler::new(graph, fail_executor)
-                .with_fail_fast(FailFast::Off)
-                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let scheduler = DagScheduler::new(graph, fail_executor)
+            .with_fail_fast(FailFast::Off)
+            .with_dag_run(Arc::clone(&store), run_id.clone());
         let _ = scheduler.run_with_details().await.expect("FailFast::Off");
 
         // 第一次 retry:仍然失败
@@ -1387,10 +1370,7 @@ mod tests {
         assert!(final_run.retry_history[1].error.is_none());
 
         // 最终 n1 应为 Succeeded(最后一次 retry 成功)
-        assert_eq!(
-            final_run.node_status("n1"),
-            Some(DagNodeStatus::Succeeded)
-        );
+        assert_eq!(final_run.node_status("n1"), Some(DagNodeStatus::Succeeded));
         assert_eq!(final_run.retry_count_for("n1"), 2);
     }
 
@@ -1401,11 +1381,7 @@ mod tests {
         let dag = Dag {
             id: "parallel".to_string(),
             name: "Parallel".to_string(),
-            nodes: vec![
-                node("n1", &[]),
-                node("n2", &[]),
-                node("n3", &["n1", "n2"]),
-            ],
+            nodes: vec![node("n1", &[]), node("n2", &[]), node("n3", &["n1", "n2"])],
         };
         let graph = DagGraph::from_dag(&dag);
         let store = Arc::new(DagStore::new());
@@ -1417,10 +1393,9 @@ mod tests {
         let fail_executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
             fail_id: "n1".to_string(),
         });
-        let scheduler =
-            DagScheduler::new(graph, fail_executor)
-                .with_fail_fast(FailFast::Off)
-                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let scheduler = DagScheduler::new(graph, fail_executor)
+            .with_fail_fast(FailFast::Off)
+            .with_dag_run(Arc::clone(&store), run_id.clone());
         let result = scheduler
             .run_with_details()
             .await
@@ -1432,10 +1407,9 @@ mod tests {
         let success_exec: Arc<dyn SubagentExecutor> = Arc::new(SuccessExecutor {
             seen: Mutex::new(Vec::new()),
         });
-        let recover_scheduler =
-            DagScheduler::new(DagGraph::from_dag(&dag), success_exec)
-                .with_fail_fast(FailFast::Off)
-                .with_dag_run(Arc::clone(&store), run_id.clone());
+        let recover_scheduler = DagScheduler::new(DagGraph::from_dag(&dag), success_exec)
+            .with_fail_fast(FailFast::Off)
+            .with_dag_run(Arc::clone(&store), run_id.clone());
         let recover_result = recover_scheduler
             .recover_skipped(&["n3".to_string()])
             .await
@@ -1454,10 +1428,7 @@ mod tests {
         assert_eq!(n3_attempts[0].attempt, 1);
 
         // n3 node_status 应为 Succeeded
-        assert_eq!(
-            final_run.node_status("n3"),
-            Some(DagNodeStatus::Succeeded)
-        );
+        assert_eq!(final_run.node_status("n3"), Some(DagNodeStatus::Succeeded));
     }
 
     #[tokio::test]

@@ -1098,8 +1098,7 @@ mod tests {
         let mut line = InputLine::new();
         let dirty = "\x1b[2;1H\x1b[38;5;1;49m│ - pub fn\x1b[3;1H\x1b[39;49m├─ ✅";
         // 模拟 route_key：ESC → handle_key(Some('\x1b'), "")，其他字符 → handle_key(Some(c), "")
-        let mut chars = dirty.chars().peekable();
-        while let Some(ch) = chars.next() {
+        for ch in dirty.chars() {
             if ch == '\x1b' {
                 line.handle_key(Some('\x1b'), "");
             } else {
@@ -1115,8 +1114,7 @@ mod tests {
         // SGR 颜色序列：\x1b[38;5;240m文本\x1b[0m
         let mut line = InputLine::new();
         let dirty = "\x1b[38;5;240m[10:26:08]\x1b[0m hello";
-        let mut chars = dirty.chars().peekable();
-        while let Some(ch) = chars.next() {
+        for ch in dirty.chars() {
             if ch == '\x1b' {
                 line.handle_key(Some('\x1b'), "");
             } else {
@@ -1131,8 +1129,7 @@ mod tests {
         // 光标定位序列 (CUP)：\x1b[2;1H + \x1b[3;7H 混合文本
         let mut line = InputLine::new();
         let dirty = "\x1b[2;1HWorkspace \x1b[2;15H版本为 `2026.8.0`";
-        let mut chars = dirty.chars().peekable();
-        while let Some(ch) = chars.next() {
+        for ch in dirty.chars() {
             if ch == '\x1b' {
                 line.handle_key(Some('\x1b'), "");
             } else {
@@ -1180,8 +1177,7 @@ mod tests {
         // OSC 序列：\x1b]0;title\x07
         let mut line = InputLine::new();
         let dirty = "\x1b]0;title\x07hello";
-        let mut chars = dirty.chars().peekable();
-        while let Some(ch) = chars.next() {
+        for ch in dirty.chars() {
             if ch == '\x1b' {
                 line.handle_key(Some('\x1b'), "");
             } else {
@@ -1198,8 +1194,7 @@ mod tests {
         // 然后 \\ 被消费（非 [ / ]），回到 Normal。
         let mut line = InputLine::new();
         let dirty = "\x1b]0;title\x1b\\hello";
-        let mut chars = dirty.chars().peekable();
-        while let Some(ch) = chars.next() {
+        for ch in dirty.chars() {
             if ch == '\x1b' {
                 line.handle_key(Some('\x1b'), "");
             } else {

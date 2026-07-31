@@ -126,7 +126,9 @@ impl OutputEntry {
                     // 执行中：只显示 header
                     return format!("\n{ts_prefix}┌─ 🔧 {name} {summary} ⏳\n");
                 }
-                let output = result.as_ref().expect("result must be Some after executing check");
+                let output = result
+                    .as_ref()
+                    .expect("result must be Some after executing check");
                 // P1 修复：统一委托给 render_tool_result_public，由它根据
                 // `collapsed` 参数决定折叠预览（前3行+展开提示）或完整展开。
                 // 之前 collapsed==true 走独立分支只显示一行摘要，导致
@@ -182,7 +184,7 @@ fn strip_ansi_for_raw_line(s: &str) -> String {
             match chars.peek() {
                 Some('[') => {
                     chars.next();
-                    while let Some(c) = chars.next() {
+                    for c in chars.by_ref() {
                         if c.is_ascii_alphabetic() || c == '~' {
                             break;
                         }
@@ -246,7 +248,11 @@ impl OutputBuffer {
             let lines = ansi_to_lines(&self.cached_snapshot);
             self.cached_lines = Some(Arc::new(lines));
         }
-        Arc::clone(self.cached_lines.as_ref().expect("cached_lines must be Some after is_none check"))
+        Arc::clone(
+            self.cached_lines
+                .as_ref()
+                .expect("cached_lines must be Some after is_none check"),
+        )
     }
 }
 
@@ -839,10 +845,7 @@ mod tests {
             snap.contains("[+] 展开"),
             "折叠预览应包含 [+] 展开 提示: {snap}"
         );
-        assert!(
-            snap.contains("17 行"),
-            "应显示隐藏行数: {snap}"
-        );
+        assert!(snap.contains("17 行"), "应显示隐藏行数: {snap}");
         // 应包含前3行预览
         assert!(snap.contains("line1"));
         assert!(snap.contains("line3"));
@@ -885,10 +888,7 @@ mod tests {
         }
         let snap = view.snapshot();
         // 展开后不应有折叠提示
-        assert!(
-            !snap.contains("[+] 展开"),
-            "展开状态不应有折叠提示: {snap}"
-        );
+        assert!(!snap.contains("[+] 展开"), "展开状态不应有折叠提示: {snap}");
         // 应包含所有行
         assert!(snap.contains("line1"));
         assert!(snap.contains("line20"));
