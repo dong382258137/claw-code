@@ -12,6 +12,12 @@
 const COLLAPSE_THRESHOLD: usize = 5;
 /// Number of lines to show when collapsed.
 const COLLAPSED_PREVIEW_LINES: usize = 3;
+/// P1 修复:语法高亮降级阈值。超过此行数的输出不进行语法高亮,
+/// 直接显示纯文本。根因:syntect 对 JSON/Rust 等语言高亮会为每个
+/// token 生成 ANSI 颜色序列,长输出(如 `cargo test --workspace` 的
+/// JSON 结果)会产生数千个 ANSI 序列,经 crossterm 反射为键盘事件
+/// 会污染 InputLine。降级为纯文本可从根本上消除密集 ANSI 序列。
+const SYNTAX_HIGHLIGHT_MAX_LINES: usize = 50;
 
 /// Render a tool call start card (header only, result pending).
 /// P1 修复：start 卡片只显示一行 header，不显示 diff 和 running 状态。
@@ -101,7 +107,13 @@ pub(crate) fn render_tool_result(
 
     // Determine if this tool's output should be syntax-highlighted
     let language = detect_language_for_tool(name, output);
+    // P1 修复:超长输出降级为纯文本,避免密集 ANSI 序列反射污染 InputLine。
+    let highlight_enabled = line_count <= SYNTAX_HIGHLIGHT_MAX_LINES;
     let highlighted_body = |slice: &[&str]| -> String {
+        if !highlight_enabled {
+            // 降级:纯文本,不做语法高亮
+            return slice.iter().map(|l| format!("│ {l}\n")).collect();
+        }
         let text = slice.join("\n");
         if let Some(lang) = language {
             let renderer = crate::render::TerminalRenderer::new();

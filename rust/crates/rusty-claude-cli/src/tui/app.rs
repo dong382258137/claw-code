@@ -466,6 +466,12 @@ fn run_event_loop(
     let mut last_drawn_version: u64 = u64::MAX; // 初始 MAX 确保首帧必绘
     let mut last_drawn_elapsed_s: u64 = 0;
     let mut last_drawn_streaming: bool = false;
+    // P1 修复:记录最近一次渲染时刻,用于 ESC peek-ahead 判断"渲染高峰窗口"。
+    // ToolCard 渲染含密集 ANSI 序列(尤其 JSON 语法高亮),crossterm 反射为键盘事件。
+    // bash 工具完成后(turn 结束)busy=false,但渲染高峰产生的反射事件仍在排队,
+    // 此时 5ms peek-ahead 超时太短会造成 false negative,使 ANSI 字符泄漏到 buffer。
+    // 在渲染后 200ms 内视为"渲染高峰窗口",ESC 直接送入 CSI 状态机不做 peek-ahead。
+    let mut last_draw_instant: Option<Instant> = None;
 
     // 折行缓存：避免每帧对全部 output lines 做 O(N) wrap 和 Arc 分配。
     // output_view.snapshot_lines() 在内容未变时返回同一个 Arc，所以用
@@ -691,6 +697,15 @@ fn run_event_loop(
                 needs_redraw = false;
                 last_drawn_version = current_version;
                 last_drawn_elapsed_s = current_elapsed_s;
+                // P0 修复:防止外部进程(如 Trae CN 扩展宿主的 Node.js deprecation
+                // warning / Lifecycle#kill 输出)退出 alternate screen 后界面框线消失。
+                // EnterAlternateScreen 是幂等指令:已在 alternate screen 内时无副作用;
+                // 若被外部退出则恢复。在 draw 前执行可保证渲染目标始终是 alternate screen。
+                // 副作用是会清屏,但紧接着 terminal.draw 会完整重绘,用户无感知。
+                {
+                    let mut stdout = io::stdout();
+                    let _ = execute!(stdout, EnterAlternateScreen);
+                }
                 last_drawn_streaming = current_streaming;
                 terminal.draw(|f| {
             // Top-level vertical layout: main row (output+input) + status bar.
@@ -917,6 +932,8 @@ fn run_event_loop(
             last_main_area = main_area;
             last_scroll_y = scroll_y as u16;
         })?;
+            // P1 修复:记录渲染完成时刻,供 ESC peek-ahead 判断"渲染高峰窗口"。
+            last_draw_instant = Some(Instant::now());
             }
         }
 
@@ -1070,7 +1087,12 @@ fn run_event_loop(
                 }
 
                 let busy = turn_rx.is_some();
-                let action = route_key(&mut input, key, help_visible, busy);
+                // P1 修复:渲染高峰窗口内的 ESC 也走 CSI 状态机(不做 peek-ahead)。
+                // 阈值 200ms:覆盖一次 draw 周期 + crossterm 事件反射延迟。
+                let recently_rendered = last_draw_instant
+                    .map(|t| t.elapsed() < Duration::from_millis(200))
+                    .unwrap_or(false);
+                let action = route_key(&mut input, key, help_visible, busy || recently_rendered);
 
                 // 方案 C drain phase 修复：
                 // conhost_suppress_input 抑制字符输入后 buffer 始终为空，
@@ -1517,7 +1539,10 @@ fn run_event_loop(
                                                 pending_at_path = Some(composed.clone());
                                                 conhost_suppress_input = true;
                                                 pending_paste_last_line = Some(
-                                                    pending_paste_lines.last().expect("non-empty check above").clone(),
+                                                    pending_paste_lines
+                                                        .last()
+                                                        .expect("non-empty check above")
+                                                        .clone(),
                                                 );
                                                 conhost_paste_intercepted = true;
                                                 (composed, String::new())
@@ -1606,7 +1631,9 @@ fn run_event_loop(
                             let status_handle = Arc::clone(&status_state);
                             let tool_history_handle = Arc::clone(&tool_history_shared);
                             let skill_history_handle = Arc::clone(&skill_history_shared);
-                            let mut cli = cli_holder.take().expect("CLI holder must be initialized before message processing");
+                            let mut cli = cli_holder
+                                .take()
+                                .expect("CLI holder must be initialized before message processing");
 
                             // TUI 原生选择列表拦截：/session pick 在 TUI 下不走 worker 线程，
                             // 而是打开 SessionPicker overlay，用上下键选中会话后 Enter 确认。
@@ -2134,17 +2161,19 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
             // 导致后续 ANSI 参数字符（[, 2, ;, 1, H 等）作为普通字符泄漏到
             // input buffer，造成输入栏被污染。
             //
-            // 修复策略：peek-ahead。当收到 KeyCode::Esc 时，用 5ms 超时
-            // 探测下一个事件是否立即可用：
-            // - conhost 粘贴：字符在同一个输入批次中投递（µs 级间隔），
-            //   poll(5ms) 返回 true → 将 \x1b 送入 CSI 状态机，后续字符
-            //   由状态机消费（ConsumingCsi/ConsumingOsc），不会泄漏到 buffer。
-            // - 真正的 Esc 键：人击键间隔 ≥50ms，poll(5ms) 返回 false →
-            //   走正常的 "Esc" 逻辑（reset buffer 或 exit）。
+            // 修复策略:peek-ahead。当收到 KeyCode::Esc 时,用 50ms 超时
+            // 探测下一个事件是否立即可用:
+            // - conhost 粘贴:字符在同一个输入批次中投递(µs 级间隔),
+            //   poll(50ms) 返回 true → 将 \x1b 送入 CSI 状态机,后续字符
+            //   由状态机消费(ConsumingCsi/ConsumingOsc),不会泄漏到 buffer。
+            // - 真正的 Esc 键:人击键间隔 ≥100ms,poll(50ms) 返回 false →
+            //   走正常的 "Esc" 逻辑(reset buffer 或 exit)。
             //
-            // timeout 从 1ms 提升到 5ms：系统繁忙时（如 cargo test 运行中），
-            // 1ms 超时太短会导致 false negative，使 ANSI 序列的 ESC 被误判为
-            // Esc 键，后续字符以普通文本泄漏到输入缓冲区。
+            // timeout 从 1ms 提升到 50ms:系统繁忙时(如 cargo test 运行中),
+            // 1ms 超时太短会导致 false negative,使 ANSI 序列的 ESC 被误判为
+            // Esc 键,后续字符以普通文本泄漏到输入缓冲区。
+            // 进一步在"渲染高峰窗口"(最近一次 draw 后 200ms 内)禁用 peek-ahead,
+            // 直接走 CSI 状态机,避免 ToolCard 密集 ANSI 反射造成泄漏。
             //
             // 例外情况：
             // - CSI 状态机已激活时（如 OSC 的 ST 终止符 \x1b\\）：直接送入状态机，
@@ -2169,11 +2198,19 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
             // - 真正的 Esc 键：状态机进入 ExpectingCsi，下一个非 [/] 字符
             //   被吞掉（busy 时用户通常不按键，Ctrl+C 仍可中断）
             if busy {
-                paste_diag_log("ESC during busy: feeding \\x1b to CSI state machine (skipping peek-ahead)");
+                paste_diag_log(
+                    "ESC during busy: feeding \\x1b to CSI state machine (skipping peek-ahead)",
+                );
                 return input.handle_key(Some('\x1b'), "");
             }
-            if !input.menu_open() && event::poll(Duration::from_millis(5)).unwrap_or(false) {
-                paste_diag_log("ESC peek-ahead: next event available, feeding \\x1b to CSI state machine");
+            // P1 修复:peek-ahead 超时从 5ms 提升到 50ms。
+            // 系统繁忙时(如 cargo test 运行后的事件排队)5ms 太短,
+            // 反射 ESC 序列的后续字符可能延迟到达,造成 false negative。
+            // 50ms 仍远小于人击键间隔(≥100ms),不会误判真正的 Esc 键。
+            if !input.menu_open() && event::poll(Duration::from_millis(50)).unwrap_or(false) {
+                paste_diag_log(
+                    "ESC peek-ahead: next event available, feeding \\x1b to CSI state machine",
+                );
                 return input.handle_key(Some('\x1b'), "");
             }
             "Esc"

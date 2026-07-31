@@ -567,14 +567,21 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn highlight_code(&self, code: &str, language: &str) -> String {
+        // P0 修复:bash 输出(如 `cargo test --workspace` 带 --color=always)可能
+        // 包含原始 ANSI 颜色序列。syntect 的 highlight_line 不会识别这些序列,
+        // 会把它们当作字面量重新高亮,导致输出的 ANSI 序列密度翻倍。
+        // 这些密集序列经 crossterm 反射为键盘事件(ESC + 参数字符)会污染 InputLine,
+        // 在系统繁忙时 peek-ahead 超时还会把它们当作普通字符插入 buffer。
+        // 先剥离输入中的所有 ANSI 序列,再交给 syntect 重新高亮。
+        let code = strip_ansi(code);
         let syntax = self
             .syntax_set
-            .find_syntax_by_token(language)
+            .find_syntax_by_token(&language)
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
         let mut syntax_highlighter = HighlightLines::new(syntax, &self.syntax_theme);
         let mut colored_output = String::new();
 
-        for line in LinesWithEndings::from(code) {
+        for line in LinesWithEndings::from(&code) {
             match syntax_highlighter.highlight_line(line, &self.syntax_set) {
                 Ok(ranges) => {
                     let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
@@ -723,7 +730,9 @@ fn normalize_nested_fences(markdown: &str) -> String {
                 .last()
                 .is_some_and(|top| top.fence.char == fl.char && fl.len >= top.fence.len);
             if closes_top {
-                let opener = stack.pop().expect("stack non-empty after last().is_some_and check");
+                let opener = stack
+                    .pop()
+                    .expect("stack non-empty after last().is_some_and check");
                 // Find max fence length of any fence line strictly between
                 // opener and closer (these are the nested fences).
                 let inner_max = fence_info[opener.line_idx + 1..i]
@@ -752,7 +761,9 @@ fn normalize_nested_fences(markdown: &str) -> String {
     let mut rewrites: std::collections::HashMap<usize, Rewrite> = std::collections::HashMap::new();
 
     for (opener_idx, closer_idx, inner_max) in &pairs {
-        let opener_fl = fence_info[*opener_idx].as_ref().expect("opener fence must be in fence_info");
+        let opener_fl = fence_info[*opener_idx]
+            .as_ref()
+            .expect("opener fence must be in fence_info");
         if opener_fl.len <= *inner_max {
             let new_len = inner_max + 1;
             let info_part = {
@@ -770,7 +781,9 @@ fn normalize_nested_fences(markdown: &str) -> String {
                     indent: opener_fl.indent,
                 },
             );
-            let closer_fl = fence_info[*closer_idx].as_ref().expect("closer fence must be in fence_info");
+            let closer_fl = fence_info[*closer_idx]
+                .as_ref()
+                .expect("closer fence must be in fence_info");
             rewrites.insert(
                 *closer_idx,
                 Rewrite {
@@ -799,7 +812,9 @@ fn normalize_nested_fences(markdown: &str) -> String {
             let indent_str: String = std::iter::repeat(' ').take(rw.indent).collect();
             // Recover the original info string (if any) and trailing newline.
             let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-            let fi = fence_info[i].as_ref().expect("rewrite entry must have fence_info");
+            let fi = fence_info[i]
+                .as_ref()
+                .expect("rewrite entry must have fence_info");
             let info = &trimmed[fi.indent + fi.len..];
             let trailing = &line[trimmed.len()..];
             out.push_str(&indent_str);
