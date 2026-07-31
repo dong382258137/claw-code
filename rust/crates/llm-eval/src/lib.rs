@@ -33,9 +33,12 @@ pub struct TaskCase {
     pub name: String,
     /// 发给模型的 prompt。
     pub prompt: String,
-    /// 金标准关键词 — 输出全部包含即视为通过(大小写不敏感子串匹配)。
+    /// 金标准关键词 — 大小写不敏感子串匹配。
     #[serde(default)]
     pub golden: Vec<String>,
+    /// 匹配模式:false(默认)= 全部 golden 关键词必须命中;true = 命中任一即得分 1.0。
+    #[serde(default)]
+    pub match_any: bool,
     /// 自由文本评分标准(可选,供人工复核 / 未来 LLM-as-judge 使用)。
     #[serde(default)]
     pub rubric: Option<String>,
@@ -215,18 +218,29 @@ fn score_case(case: &TaskCase, output: &str, threshold: f64) -> (usize, f64, boo
         return (0, if passed { 1.0 } else { 0.0 }, passed, detail);
     }
     let output_lower = trimmed.to_lowercase();
-    let hits = case
+    let matched: Vec<bool> = case
         .golden
         .iter()
-        .filter(|kw| output_lower.contains(&kw.to_lowercase()))
-        .count();
-    let score = hits as f64 / case.golden.len() as f64;
+        .map(|kw| output_lower.contains(&kw.to_lowercase()))
+        .collect();
+    let hits = matched.iter().filter(|m| **m).count();
     let missing: Vec<&str> = case
         .golden
         .iter()
-        .filter(|kw| !output_lower.contains(&kw.to_lowercase()))
-        .map(String::as_str)
+        .zip(&matched)
+        .filter(|(_, m)| !**m)
+        .map(|(kw, _)| kw.as_str())
         .collect();
+    // any 模式:命中任一关键词即满分;all 模式:按命中比例计分。
+    let score = if case.match_any {
+        if hits > 0 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        hits as f64 / case.golden.len() as f64
+    };
     let passed = score >= threshold;
     let detail = if passed {
         format!("all {hits} golden keyword(s) matched")
@@ -302,8 +316,16 @@ mod tests {
             name: "test".into(),
             prompt: "do it".into(),
             golden: golden.iter().map(|s| s.to_string()).collect(),
+            match_any: false,
             rubric: None,
             min_output_chars: 0,
+        }
+    }
+
+    fn case_any(golden: &[&str]) -> TaskCase {
+        TaskCase {
+            match_any: true,
+            ..case(golden)
         }
     }
 
@@ -348,6 +370,25 @@ mod tests {
         let (_, _, passed, detail) = score_case(&c, "   ", 1.0);
         assert!(!passed);
         assert!(detail.contains("missing") || detail.contains("empty"));
+    }
+
+    #[test]
+    fn scoring_any_mode_passes_on_single_hit() {
+        let c = case_any(&["yes", "no"]);
+        let (hits, score, passed, _) = score_case(&c, "yes", 1.0);
+        assert_eq!(hits, 1);
+        assert_eq!(score, 1.0);
+        assert!(passed);
+    }
+
+    #[test]
+    fn scoring_any_mode_fails_on_zero_hits() {
+        let c = case_any(&["yes", "no"]);
+        let (hits, score, passed, detail) = score_case(&c, "maybe", 1.0);
+        assert_eq!(hits, 0);
+        assert_eq!(score, 0.0);
+        assert!(!passed);
+        assert!(detail.contains("yes, no"));
     }
 
     #[test]
