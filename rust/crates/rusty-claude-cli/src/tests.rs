@@ -2850,14 +2850,13 @@ fn resolve_repl_model_auto_detects_deepseek_when_key_present() {
     fs::create_dir_all(&config_home).expect("config home dir");
     std::env::set_var("CLAW_CONFIG_HOME", &config_home);
     std::env::remove_var("CLAW_MODEL");
-
-    // Set DEEPSEEK_API_KEY so auto-detect picks deepseek-v4-pro
+    // Set DEEPSEEK_API_KEY so auto-detect picks the default model
     let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
     std::env::set_var("DEEPSEEK_API_KEY", "sk-test-deepseek-key");
 
     let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
-    assert_eq!(resolved, "deepseek-v4-pro");
+    assert_eq!(resolved, DEFAULT_MODEL);
 
     // Restore
     std::env::remove_var("DEEPSEEK_API_KEY");
@@ -2886,7 +2885,7 @@ fn model_provenance_reports_default_when_deepseek_key_present() {
     // DeepSeek's auto-detected model equals DEFAULT_MODEL, so source is Default
     // (not AutoDetect, which only applies when the detected model differs from default).
     assert_eq!(provenance.source, ModelSource::Default);
-    assert_eq!(provenance.resolved, "deepseek-v4-pro");
+    assert_eq!(provenance.resolved, DEFAULT_MODEL);
 
     // Restore
     std::env::remove_var("DEEPSEEK_API_KEY");

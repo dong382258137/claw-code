@@ -956,7 +956,7 @@ pub fn resolve_repl_model(cli_model: String) -> String {
 /// clear auth error at that point).
 fn detect_best_available_model() -> String {
     if api::has_api_key("DEEPSEEK_API_KEY") {
-        return "deepseek-v4-pro".to_string();
+        return DEFAULT_MODEL.to_string();
     }
     DEFAULT_MODEL.to_string()
 }
