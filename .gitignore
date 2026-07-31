@@ -48,3 +48,6 @@ target/
 
 # Porting notes (deferred)
 rust/crates/rusty-claude-cli/tui-ports/PORTING.md
+
+# fastembed model cache (downloaded ONNX models)
+.fastembed_cache/

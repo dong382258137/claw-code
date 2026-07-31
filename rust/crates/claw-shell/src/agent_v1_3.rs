@@ -40,8 +40,8 @@ use std::cell::RefCell;
 // (位于 `acp::role::acp::`,通过 `acp::Client` / `acp::Agent` re-export)。
 // `acp::ConnectionTo<R>` 是连接上下文,Clone + Send,通过 `acp::ConnectTo<R>`
 // trait 的 `connect_to` 方法建立连接。
-use agent_client_protocol_v1 as acp;
 use acp::schema::v1 as schema;
+use agent_client_protocol_v1 as acp;
 
 use runtime::{ApiClient, ConversationRuntime, StaticToolExecutor};
 
@@ -201,9 +201,7 @@ where
     /// 若 slot 为 None(尚未建立连接),返回 `ConnectionClosed` 错误。
     ///
     /// 注意:故意不在锁内发送请求,避免长时间持锁。lock-and-clone 后立即释放。
-    async fn acquire_connection(
-        &self,
-    ) -> Result<acp::ConnectionTo<acp::Client>, ConnectionClosed> {
+    async fn acquire_connection(&self) -> Result<acp::ConnectionTo<acp::Client>, ConnectionClosed> {
         let guard = self.client_connection.lock().await;
         guard.clone().ok_or(ConnectionClosed)
     }
@@ -254,21 +252,14 @@ where
     /// # 1.3 API 实现要点
     /// 通过 `ConnectionTo<Client>::send_request(WriteTextFileRequest)` 发送。
     /// 1.3 的 `WriteTextFileResponse` 为空 struct(仅 ACK),无业务数据。
-    pub async fn write_editor_buffer(
-        &self,
-        path: &str,
-        content: &str,
-    ) -> Result<(), WriteError> {
+    pub async fn write_editor_buffer(&self, path: &str, content: &str) -> Result<(), WriteError> {
         let conn = self.acquire_connection().await?;
         let session_id = self
             .active_session_id()
             .ok_or(WriteError::Ide("no active session".into()))?;
 
-        let req = schema::WriteTextFileRequest::new(
-            session_id,
-            path.to_string(),
-            content.to_string(),
-        );
+        let req =
+            schema::WriteTextFileRequest::new(session_id, path.to_string(), content.to_string());
 
         tokio::time::timeout(DEFAULT_REVERSE_REQUEST_TIMEOUT, async {
             conn.send_request(req).block_task().await
@@ -324,11 +315,7 @@ where
         fields.title = Some(format!("{}: {}", request.operation, request.target));
         fields.kind = Some(schema::ToolKind::Other);
         fields.status = Some(schema::ToolCallStatus::Pending);
-        let tool_call_id = format!(
-            "perm-{}-{}",
-            request.operation,
-            short_hash(&request.target)
-        );
+        let tool_call_id = format!("perm-{}-{}", request.operation, short_hash(&request.target));
         let tool_call = schema::ToolCallUpdate::new(tool_call_id, fields);
 
         // 三个标准选项:Allow / AlwaysAllow / Deny
@@ -343,15 +330,10 @@ where
                 "Always Allow",
                 schema::PermissionOptionKind::AllowAlways,
             ),
-            schema::PermissionOption::new(
-                "deny",
-                "Deny",
-                schema::PermissionOptionKind::RejectOnce,
-            ),
+            schema::PermissionOption::new("deny", "Deny", schema::PermissionOptionKind::RejectOnce),
         ];
 
-        let req =
-            schema::RequestPermissionRequest::new(session_id, tool_call, options);
+        let req = schema::RequestPermissionRequest::new(session_id, tool_call, options);
 
         let response = tokio::time::timeout(DEFAULT_REVERSE_REQUEST_TIMEOUT, async {
             conn.send_request(req).block_task().await
@@ -436,10 +418,7 @@ where
                 // fire-and-forget:与 0.10.4 策略一致
                 // (1.3 中 send_notification 不返回 future 需 await)
                 if let Err(e) = conn.send_notification(notification) {
-                    tracing::debug!(
-                        "flush_lane_events: send_notification failed: {}",
-                        e
-                    );
+                    tracing::debug!("flush_lane_events: send_notification failed: {}", e);
                 }
             }
         }
@@ -463,8 +442,7 @@ where
 /// 后写入 `client_connection`,使 agent 的反向请求方法可读。
 pub struct ClawAgentV13ConnectionSlot {
     /// 反向请求句柄的共享 slot。
-    pub client_connection:
-        Arc<tokio::sync::Mutex<Option<acp::ConnectionTo<acp::Client>>>>,
+    pub client_connection: Arc<tokio::sync::Mutex<Option<acp::ConnectionTo<acp::Client>>>>,
     /// AlwaysAllow 缓存的共享 slot(供 Builder 闭包查询/写入)。
     pub permission_cache: Arc<tokio::sync::Mutex<HashSet<(String, String)>>>,
 }
@@ -975,8 +953,8 @@ mod tests {
             "2026-07-26T00:00:00Z",
         );
         let session_id = schema::SessionId::new("test");
-        let notif = lane_event_to_session_update_v1_3(&event, &session_id)
-            .expect("Blocked should map");
+        let notif =
+            lane_event_to_session_update_v1_3(&event, &session_id).expect("Blocked should map");
         match notif.update {
             schema::SessionUpdate::Plan(plan) => {
                 assert_eq!(plan.entries.len(), 1);
@@ -1200,9 +1178,8 @@ mod tests {
                         async |_req: schema::ReadTextFileRequest,
                                responder: acp::Responder<schema::ReadTextFileResponse>,
                                _cx: acp::ConnectionTo<acp::Agent>| {
-                            responder.respond(schema::ReadTextFileResponse::new(
-                                "hello from IDE buffer",
-                            ))
+                            responder
+                                .respond(schema::ReadTextFileResponse::new("hello from IDE buffer"))
                         },
                         acp::on_receive_request!(),
                     )
@@ -1218,19 +1195,16 @@ mod tests {
                 let (slot_ready_tx, slot_ready_rx) = tokio::sync::oneshot::channel();
                 let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-                let agent_connection = acp::Agent
-                    .builder()
-                    .name("test-read-agent")
-                    .connect_with(
-                        agent_channel,
-                        async move |cx: acp::ConnectionTo<acp::Client>| {
-                            slot.set_connection(cx.clone()).await;
-                            let _ = slot_ready_tx.send(());
-                            // 保持连接存活,直到测试完成
-                            let _ = done_rx.await;
-                            Ok(())
-                        },
-                    );
+                let agent_connection = acp::Agent.builder().name("test-read-agent").connect_with(
+                    agent_channel,
+                    async move |cx: acp::ConnectionTo<acp::Client>| {
+                        slot.set_connection(cx.clone()).await;
+                        let _ = slot_ready_tx.send(());
+                        // 保持连接存活,直到测试完成
+                        let _ = done_rx.await;
+                        Ok(())
+                    },
+                );
                 tokio::task::spawn_local(async move {
                     let _ = agent_connection.await;
                 });
@@ -1293,18 +1267,15 @@ mod tests {
                 let (slot_ready_tx, slot_ready_rx) = tokio::sync::oneshot::channel();
                 let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-                let agent_connection = acp::Agent
-                    .builder()
-                    .name("test-write-agent")
-                    .connect_with(
-                        agent_channel,
-                        async move |cx: acp::ConnectionTo<acp::Client>| {
-                            slot.set_connection(cx.clone()).await;
-                            let _ = slot_ready_tx.send(());
-                            let _ = done_rx.await;
-                            Ok(())
-                        },
-                    );
+                let agent_connection = acp::Agent.builder().name("test-write-agent").connect_with(
+                    agent_channel,
+                    async move |cx: acp::ConnectionTo<acp::Client>| {
+                        slot.set_connection(cx.clone()).await;
+                        let _ = slot_ready_tx.send(());
+                        let _ = done_rx.await;
+                        Ok(())
+                    },
+                );
                 tokio::task::spawn_local(async move {
                     let _ = agent_connection.await;
                 });
@@ -1347,8 +1318,10 @@ mod tests {
                     .builder()
                     .on_receive_request(
                         async move |_req: schema::RequestPermissionRequest,
-                               responder: acp::Responder<schema::RequestPermissionResponse>,
-                               _cx: acp::ConnectionTo<acp::Agent>| {
+                                    responder: acp::Responder<
+                            schema::RequestPermissionResponse,
+                        >,
+                                    _cx: acp::ConnectionTo<acp::Agent>| {
                             let mut c = counter_clone.lock().await;
                             *c += 1;
                             let option_id = if *c == 1 { "allow" } else { "deny" };
@@ -1371,18 +1344,15 @@ mod tests {
                 let (slot_ready_tx, slot_ready_rx) = tokio::sync::oneshot::channel();
                 let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-                let agent_connection = acp::Agent
-                    .builder()
-                    .name("test-perm-agent")
-                    .connect_with(
-                        agent_channel,
-                        async move |cx: acp::ConnectionTo<acp::Client>| {
-                            slot.set_connection(cx.clone()).await;
-                            let _ = slot_ready_tx.send(());
-                            let _ = done_rx.await;
-                            Ok(())
-                        },
-                    );
+                let agent_connection = acp::Agent.builder().name("test-perm-agent").connect_with(
+                    agent_channel,
+                    async move |cx: acp::ConnectionTo<acp::Client>| {
+                        slot.set_connection(cx.clone()).await;
+                        let _ = slot_ready_tx.send(());
+                        let _ = done_rx.await;
+                        Ok(())
+                    },
+                );
                 tokio::task::spawn_local(async move {
                     let _ = agent_connection.await;
                 });
@@ -1510,8 +1480,8 @@ mod tests {
             "2026-07-26T00:00:00Z",
         );
         let session_id = schema::SessionId::new("test");
-        let notif = lane_event_to_session_update_v1_3(&event, &session_id)
-            .expect("Green should map");
+        let notif =
+            lane_event_to_session_update_v1_3(&event, &session_id).expect("Green should map");
         assert!(
             matches!(notif.update, schema::SessionUpdate::AgentMessageChunk(_)),
             "expected AgentMessageChunk, got {:?}",
@@ -1529,8 +1499,8 @@ mod tests {
             "2026-07-26T00:00:00Z",
         );
         let session_id = schema::SessionId::new("test");
-        let notif = lane_event_to_session_update_v1_3(&event, &session_id)
-            .expect("Failed should map");
+        let notif =
+            lane_event_to_session_update_v1_3(&event, &session_id).expect("Failed should map");
         assert!(
             matches!(notif.update, schema::SessionUpdate::AgentMessageChunk(_)),
             "expected AgentMessageChunk, got {:?}",
@@ -1548,8 +1518,7 @@ mod tests {
             "2026-07-26T00:00:00Z",
         );
         let session_id = schema::SessionId::new("test");
-        let notif = lane_event_to_session_update_v1_3(&event, &session_id)
-            .expect("Red should map");
+        let notif = lane_event_to_session_update_v1_3(&event, &session_id).expect("Red should map");
         match notif.update {
             schema::SessionUpdate::Plan(plan) => {
                 assert_eq!(plan.entries.len(), 1);
@@ -1563,12 +1532,8 @@ mod tests {
     /// 映射为 ToolCall(Completed)。
     #[test]
     fn subagent_result_completed_maps_to_tool_call_completed_v1_3() {
-        let event = LaneEvent::subagent_result(
-            "2026-07-26T00:00:00Z",
-            "sub-456",
-            "completed",
-            "done",
-        );
+        let event =
+            LaneEvent::subagent_result("2026-07-26T00:00:00Z", "sub-456", "completed", "done");
         let session_id = schema::SessionId::new("test");
         let notif = lane_event_to_session_update_v1_3(&event, &session_id)
             .expect("SubagentResult should map");
@@ -1585,12 +1550,7 @@ mod tests {
     /// 映射为 ToolCall(Failed)。
     #[test]
     fn subagent_result_failed_maps_to_tool_call_failed_v1_3() {
-        let event = LaneEvent::subagent_result(
-            "2026-07-26T00:00:00Z",
-            "sub-789",
-            "failed",
-            "boom",
-        );
+        let event = LaneEvent::subagent_result("2026-07-26T00:00:00Z", "sub-789", "failed", "boom");
         let session_id = schema::SessionId::new("test");
         let notif = lane_event_to_session_update_v1_3(&event, &session_id)
             .expect("SubagentResult failed should map");

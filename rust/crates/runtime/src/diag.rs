@@ -65,7 +65,11 @@ impl DiagEntry {
     }
 
     /// 追加一个 KV 字段。
-    pub fn with_field(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+    pub fn with_field(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
         if let Some(obj) = self.fields.as_object_mut() {
             obj.insert(key.into(), value.into());
         }

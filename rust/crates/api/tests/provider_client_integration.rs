@@ -44,9 +44,7 @@ fn provider_client_reports_missing_deepseek_credentials_when_env_unset() {
 
     match error {
         ApiError::MissingCredentials {
-            provider,
-            env_vars,
-            ..
+            provider, env_vars, ..
         } => {
             assert_eq!(provider, "DeepSeek");
             assert_eq!(env_vars, &["DEEPSEEK_API_KEY"]);
@@ -63,10 +61,7 @@ fn read_base_url_prefers_deepseek_env_override() {
         Some("https://example.deepseek.test/v1"),
     );
 
-    assert_eq!(
-        read_base_url(),
-        "https://example.deepseek.test/v1"
-    );
+    assert_eq!(read_base_url(), "https://example.deepseek.test/v1");
 }
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {

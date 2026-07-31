@@ -3279,8 +3279,18 @@ where
         task: &str,
         complexity: crate::multi_agent::TaskComplexity,
     ) -> Result<String, String> {
+        // 知识新鲜度门控(Phase 1):Novel 任务注入调研摘要到 task 文本。
+        // 缓存命中(execute/dispatch_impl 已调过)零成本;未命中降级为原 task。
+        let gated = crate::knowledge_freshness::gate_task(task, 0).await;
+        let enhanced_task = gated.enhance_task(task);
+
         // 构造子智能体 system_prompt — §4.6 诊断 SOP 注入
-        let system_prompt = Self::build_subagent_system_prompt(subagent_id, name, task, complexity);
+        let system_prompt = Self::build_subagent_system_prompt(
+            subagent_id,
+            name,
+            &enhanced_task,
+            complexity,
+        );
 
         let subagent_system_prompt = SystemPromptSplit::from_sections(vec![system_prompt]);
 
@@ -3288,7 +3298,7 @@ where
         let user_message = ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text {
-                text: format!("请执行以下任务:\n\n{task}"),
+                text: format!("请执行以下任务:\n\n{enhanced_task}"),
             }],
             usage: None,
         };
@@ -3764,8 +3774,29 @@ where
                     .to_string(),
             );
         };
+
+        // P1-4:自动注入 knowledge_source(无需 LLM 传参)。
+        // 若 input JSON 不含 knowledge_source 字段,从全局 last-gated 读取
+        // (gate_task 调用时更新)。缺失时默认 "parametric"(纯参数记忆)。
+        let effective_input = match serde_json::from_str::<serde_json::Value>(input) {
+            Ok(mut parsed) => {
+                if parsed.get("knowledge_source").is_none() {
+                    let source = crate::knowledge_freshness::last_gated_knowledge_source()
+                        .unwrap_or("parametric");
+                    if let Some(obj) = parsed.as_object_mut() {
+                        obj.insert(
+                            "knowledge_source".to_string(),
+                            serde_json::Value::String(source.to_string()),
+                        );
+                    }
+                }
+                serde_json::to_string(&parsed).unwrap_or_else(|_| input.to_string())
+            }
+            Err(_) => input.to_string(), // JSON 解析失败,原样传入让 log_decision 报错
+        };
+
         decision_log
-            .log_decision(input)
+            .log_decision(&effective_input)
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
     }
 

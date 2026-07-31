@@ -24,10 +24,7 @@ pub struct SubagentDispatcher {
 }
 
 impl SubagentDispatcher {
-    pub fn new(
-        api_client: Arc<Mutex<Box<dyn ApiClient + Send>>>,
-        workspace_root: PathBuf,
-    ) -> Self {
+    pub fn new(api_client: Arc<Mutex<Box<dyn ApiClient + Send>>>, workspace_root: PathBuf) -> Self {
         Self {
             api_client,
             workspace_root,
@@ -62,6 +59,11 @@ impl SubagentDispatcher {
         name: &str,
         task: &str,
     ) -> Result<String, String> {
+        // 知识新鲜度门控(Phase 1):Novel 任务注入调研摘要到 task 文本。
+        // 缓存命中(execute 已调过)零成本;未命中(client 未注入)降级为原 task。
+        let gated = crate::knowledge_freshness::gate_task(task, 0).await;
+        let enhanced_task = gated.enhance_task(task);
+
         // 构造请求(与 run_subagent_turn 完全一致)
         let subagent_system_prompt = SystemPromptSplit::from_sections(vec![format!(
             "# Subagent: {name} ({subagent_id})\n\
@@ -69,7 +71,7 @@ impl SubagentDispatcher {
              你是一个子智能体,由主智能体派发执行独立任务。\n\
              \n\
              ## 任务\n\
-             {task}\n\
+             {enhanced_task}\n\
              \n\
              ## 约束\n\
              - 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
@@ -88,7 +90,7 @@ impl SubagentDispatcher {
         let user_message = ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text {
-                text: format!("请执行以下任务:\n\n{task}"),
+                text: format!("请执行以下任务:\n\n{enhanced_task}"),
             }],
             usage: None,
         };

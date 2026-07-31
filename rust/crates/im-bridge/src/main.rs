@@ -54,12 +54,8 @@ async fn run_bridge(config: &ImBridgeConfig) -> Result<(), String> {
     let provider = ProviderClient::from_model(&model)
         .map_err(|e| format!("failed to create API client: {e}"))?;
 
-    let bridge_client = BridgeApiClient::new(
-        provider,
-        model.clone(),
-        true,
-        GlobalToolRegistry::builtin(),
-    );
+    let bridge_client =
+        BridgeApiClient::new(provider, model.clone(), true, GlobalToolRegistry::builtin());
 
     let system_prompt = vec![
         format!(

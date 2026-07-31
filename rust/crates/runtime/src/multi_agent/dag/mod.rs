@@ -30,7 +30,10 @@ pub use coordinator_executor::{CoordinatorExecutor, SubagentRunner};
 pub use executor_trait::{NodeError, SubagentExecutor};
 pub use scheduler::{DagScheduler, ProgressEvent};
 pub use subagent_dispatcher::SubagentDispatcher;
-pub use types::{DagError, DagGraph, DagId, DagNode, DagRunResult, DagStatus, FailFast, NodeAttempt, NodeResult, RetryPolicy, DEFAULT_MAX_PARALLELISM};
+pub use types::{
+    DagError, DagGraph, DagId, DagNode, DagRunResult, DagStatus, FailFast, NodeAttempt, NodeResult,
+    RetryPolicy, DEFAULT_MAX_PARALLELISM,
+};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -149,11 +152,7 @@ impl DagStore {
     ///
     /// # Errors
     /// - `run not found: {run_id}` — the run was never started or was evicted.
-    pub fn update_run_status(
-        &self,
-        run_id: &str,
-        status: DagStatus,
-    ) -> Result<(), String> {
+    pub fn update_run_status(&self, run_id: &str, status: DagStatus) -> Result<(), String> {
         let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
         let run = runs
             .get_mut(run_id)

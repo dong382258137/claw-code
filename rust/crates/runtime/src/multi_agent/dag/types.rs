@@ -127,6 +127,11 @@ pub struct NodeResult {
     pub summary: String,
     /// Optional artifact path (e.g. written file, git commit) for verification.
     pub artifact_path: Option<String>,
+    /// 知识新鲜度门控结果(Phase 0:由 coordinator_executor::execute 填充)。
+    /// None 表示未经过门控(如 mock executor / 测试桩),决策日志按
+    /// "unknown" 处理。Phase 1 由 DecisionRecord.knowledge_source 消费。
+    #[serde(default)]
+    pub gated: Option<crate::knowledge_freshness::GatedTask>,
 }
 
 /// Execution status of a single DAG node.
@@ -600,10 +605,7 @@ impl DagGraph {
                 continue;
             }
             // Multi-node SCC = cycle.
-            let cycle: Vec<DagNodeId> = scc
-                .iter()
-                .map(|&idx| self.graph[idx].id.clone())
-                .collect();
+            let cycle: Vec<DagNodeId> = scc.iter().map(|&idx| self.graph[idx].id.clone()).collect();
             return Err(DagError::CycleDetected(cycle));
         }
         Ok(())
@@ -646,7 +648,10 @@ impl DagGraph {
     /// (e.g. the sync [`DagExecutor`](super::executor::DagExecutor)).
     pub fn topological_order(&self) -> Result<Vec<DagNodeId>, DagError> {
         match petgraph::algo::toposort(&self.graph, None) {
-            Ok(order) => Ok(order.into_iter().map(|idx| self.graph[idx].id.clone()).collect()),
+            Ok(order) => Ok(order
+                .into_iter()
+                .map(|idx| self.graph[idx].id.clone())
+                .collect()),
             Err(_) => {
                 // Cycle: surface via the same SCC-based reporting for consistency.
                 self.validate_acyclic()?;
@@ -663,9 +668,7 @@ impl PartialEq for DagGraph {
         if self.id != other.id || self.name != other.name {
             return false;
         }
-        if self.node_count() != other.node_count()
-            || self.edge_count() != other.edge_count()
-        {
+        if self.node_count() != other.node_count() || self.edge_count() != other.edge_count() {
             return false;
         }
         // Compare nodes by id (order-independent).
@@ -800,10 +803,9 @@ mod graph_tests {
     #[test]
     fn ready_nodes_empty_when_all_completed() {
         let g = linear_graph();
-        let completed: HashSet<DagNodeId> =
-            ["n1".to_string(), "n2".to_string(), "n3".to_string()]
-                .into_iter()
-                .collect();
+        let completed: HashSet<DagNodeId> = ["n1".to_string(), "n2".to_string(), "n3".to_string()]
+            .into_iter()
+            .collect();
         assert!(g.ready_nodes(&completed).is_empty());
     }
 
@@ -811,7 +813,9 @@ mod graph_tests {
     fn add_edge_unknown_node_returns_error() {
         let mut g = DagGraph::new("g");
         g.add_node(node("a", &[]));
-        let err = g.add_edge(&"a".to_string(), &"ghost".to_string()).unwrap_err();
+        let err = g
+            .add_edge(&"a".to_string(), &"ghost".to_string())
+            .unwrap_err();
         assert!(matches!(err, DagError::UnknownNode(_)));
     }
 
@@ -819,7 +823,10 @@ mod graph_tests {
     fn topological_order_matches_dependencies() {
         let g = linear_graph();
         let order = g.topological_order().unwrap();
-        assert_eq!(order, vec!["n1".to_string(), "n2".to_string(), "n3".to_string()]);
+        assert_eq!(
+            order,
+            vec!["n1".to_string(), "n2".to_string(), "n3".to_string()]
+        );
     }
 
     #[test]

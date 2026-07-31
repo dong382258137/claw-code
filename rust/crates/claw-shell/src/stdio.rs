@@ -730,8 +730,8 @@ mod tests {
     /// 此测试固化该行为。未来 cancel 被实现后,需更新断言以验证实际的取消语义。
     #[tokio::test]
     async fn claw_agent_cancel_returns_ok_as_stub() {
-        use agent_client_protocol as acp;
         use acp::Agent;
+        use agent_client_protocol as acp;
 
         let local = tokio::task::LocalSet::new();
         local

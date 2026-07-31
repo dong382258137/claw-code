@@ -18,13 +18,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
     // when
     let output = Command::new(env!("CARGO_BIN_EXE_claw-plus"))
         .current_dir(&temp_dir)
-        .args([
-            "--model",
-            "pro",
-            "--permission-mode",
-            "read-only",
-            "status",
-        ])
+        .args(["--model", "pro", "--permission-mode", "read-only", "status"])
         .output()
         .expect("claw should launch");
 

@@ -324,10 +324,13 @@ fn run_doctor_cache_stats(
             println!("  并由 TUI 状态栏实时显示(cache_read/cache_creation tokens)。");
         }
         CliOutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "deprecated": true,
-                "reason": "client-side prompt cache removed; DeepSeek server-side prefix caching stats are shown per-response in TUI",
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "deprecated": true,
+                    "reason": "client-side prompt cache removed; DeepSeek server-side prefix caching stats are shown per-response in TUI",
+                }))?
+            );
         }
     }
     Ok(())
@@ -439,9 +442,10 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
         env_details,
         "建议操作          设置 DEEPSEEK_API_KEY 环境变量".to_string(),
     ])
-    .with_data(Map::from_iter([
-        ("api_key_present".to_string(), json!(api_key_present)),
-    ]))
+    .with_data(Map::from_iter([(
+        "api_key_present".to_string(),
+        json!(api_key_present),
+    )]))
 }
 
 pub(crate) fn check_config_health(

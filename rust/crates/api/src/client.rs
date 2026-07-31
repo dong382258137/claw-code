@@ -84,7 +84,10 @@ mod tests {
 
     #[test]
     fn provider_detection_always_returns_deepseek() {
-        assert_eq!(detect_provider_kind("deepseek-v4-pro"), ProviderKind::DeepSeek);
+        assert_eq!(
+            detect_provider_kind("deepseek-v4-pro"),
+            ProviderKind::DeepSeek
+        );
         assert_eq!(detect_provider_kind("anything"), ProviderKind::DeepSeek);
     }
 }

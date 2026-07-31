@@ -614,7 +614,9 @@ impl ContextAssembler {
                 break;
             }
 
-            let last = blocks.last_mut().expect("blocks non-empty per while condition");
+            let last = blocks
+                .last_mut()
+                .expect("blocks non-empty per while condition");
 
             // Calculate how much we need to save
             let excess = current_total - budget;

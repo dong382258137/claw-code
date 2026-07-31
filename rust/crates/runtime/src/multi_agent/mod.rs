@@ -18,16 +18,16 @@
 pub mod dag;
 // Multi-Agent Hardening §4.4:验证门禁(ValidationGate trait + CommandValidationGate + LlmJudgeGate 预留)。
 pub mod validation;
-pub use validation::{
-    detect_changed_files, rust_compile_gate, CommandValidationGate, JudgeClient, LlmJudgeGate,
-    ValidationContext, ValidationError, ValidationGate,
-};
+pub use dag::DagStore;
 pub use dag::{
     CoordinatorExecutor, DagError, DagGraph, DagId, DagNode, DagRunResult, DagScheduler, FailFast,
     NodeError, NodeResult, ProgressEvent, RetryPolicy, SubagentDispatcher, SubagentExecutor,
     SubagentRunner, DEFAULT_MAX_PARALLELISM,
 };
-pub use dag::DagStore;
+pub use validation::{
+    detect_changed_files, rust_compile_gate, CommandValidationGate, JudgeClient, LlmJudgeGate,
+    ValidationContext, ValidationError, ValidationGate,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -107,7 +107,6 @@ pub struct Subagent {
     pub result: Option<String>,
 
     // === Multi-Agent Hardening v3 扩展字段 ===
-
     /// 使用的模型名(None 表示使用默认模型)。
     /// §4.2:模型能力分级 + 任务路由依据。
     #[serde(default)]
@@ -238,14 +237,8 @@ pub struct MultiAgentCoordinator {
 
 impl std::fmt::Debug for MultiAgentCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let subagent_count = self
-            .subagents
-            .lock()
-            .map_or(0, |s| s.len());
-        let gate_count = self
-            .validation_gates
-            .lock()
-            .map_or(0, |g| g.len());
+        let subagent_count = self.subagents.lock().map_or(0, |s| s.len());
+        let gate_count = self.validation_gates.lock().map_or(0, |g| g.len());
         f.debug_struct("MultiAgentCoordinator")
             .field("subagents_count", &subagent_count)
             .field("validation_gates_count", &gate_count)
@@ -374,7 +367,11 @@ impl MultiAgentCoordinator {
             || lower.contains("mini")
             || lower.contains("nano")
             || lower.contains("flash");
-        if is_budget && matches!(complexity, TaskComplexity::Diagnostic | TaskComplexity::Architectural)
+        if is_budget
+            && matches!(
+                complexity,
+                TaskComplexity::Diagnostic | TaskComplexity::Architectural
+            )
         {
             return Err(format!(
                 "model '{model}' (Budget tier) cannot handle {complexity:?} task — use Flagship model"
@@ -389,7 +386,10 @@ impl MultiAgentCoordinator {
             agent.complexity = complexity;
             // Diagnostic/Architectural 任务默认允许 1 次重试(升级到 Flagship)
             // max_attempts=2 意味着"最多 2 次尝试"(1 次原始 + 1 次升级重试)
-            if matches!(complexity, TaskComplexity::Diagnostic | TaskComplexity::Architectural) {
+            if matches!(
+                complexity,
+                TaskComplexity::Diagnostic | TaskComplexity::Architectural
+            ) {
                 agent.max_attempts = 2;
             }
         }
@@ -528,7 +528,9 @@ impl MultiAgentCoordinator {
             ));
             agent.model = Some(model);
         } else {
-            agent.notes.push(format!("retry attempt {}", agent.attempts));
+            agent
+                .notes
+                .push(format!("retry attempt {}", agent.attempts));
         }
         Ok(())
     }
@@ -565,8 +567,7 @@ impl MultiAgentCoordinator {
         let path = checkpoint_dir.join(format!("{subagent_id}.json"));
         let json = serde_json::to_string_pretty(&agent)
             .map_err(|e| format!("serialize subagent failed: {e}"))?;
-        std::fs::write(&path, json)
-            .map_err(|e| format!("write checkpoint failed: {e}"))?;
+        std::fs::write(&path, json).map_err(|e| format!("write checkpoint failed: {e}"))?;
 
         // 更新 checkpoint_path 字段
         let mut agents = self.subagents.lock().expect("subagents lock poisoned");
@@ -619,10 +620,10 @@ impl MultiAgentCoordinator {
     /// 2. **跨进程恢复**:主 CLI 崩溃后,headless 模式或新 CLI 进程可恢复 subagent
     /// 3. **调试**:从 checkpoint 文件恢复特定 subagent 状态用于复现
     pub fn restore_from_checkpoint(&self, path: &Path) -> Result<String, String> {
-        let json = std::fs::read_to_string(path)
-            .map_err(|e| format!("read checkpoint failed: {e}"))?;
-        let mut agent: Subagent = serde_json::from_str(&json)
-            .map_err(|e| format!("deserialize subagent failed: {e}"))?;
+        let json =
+            std::fs::read_to_string(path).map_err(|e| format!("read checkpoint failed: {e}"))?;
+        let mut agent: Subagent =
+            serde_json::from_str(&json).map_err(|e| format!("deserialize subagent failed: {e}"))?;
 
         // 状态机一致性:Running 降级为 Created
         // 崩溃前 Running 的 subagent 没有活跃的 tokio task,需重新 start()
@@ -665,10 +666,7 @@ impl MultiAgentCoordinator {
 
     /// 注册验证门禁 — Multi-Agent Hardening §4.4。
     pub fn add_validation_gate(&self, gate: Box<dyn ValidationGate>) {
-        self.validation_gates
-            .lock()
-            .expect("gates lock")
-            .push(gate);
+        self.validation_gates.lock().expect("gates lock").push(gate);
     }
 
     /// 设置 workspace_root — Multi-Agent Hardening §4.4。
@@ -684,10 +682,12 @@ impl MultiAgentCoordinator {
     /// 成功后标记 `validated = true`。
     pub fn validate(&self, subagent_id: &str) -> Result<(), validation::ValidationError> {
         let agents = self.subagents.lock().expect("subagents lock");
-        let agent = agents.get(subagent_id).ok_or_else(|| validation::ValidationError {
-            message: format!("subagent not found: {subagent_id}"),
-            retryable: false,
-        })?;
+        let agent = agents
+            .get(subagent_id)
+            .ok_or_else(|| validation::ValidationError {
+                message: format!("subagent not found: {subagent_id}"),
+                retryable: false,
+            })?;
         if agent.status != SubagentStatus::Completed {
             return Err(validation::ValidationError {
                 message: format!(
@@ -1218,7 +1218,6 @@ fn upgrade_lookup(_lower: &str) -> Option<ModelUpgrade> {
     None
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1450,7 +1449,10 @@ mod tests {
         let agent = coord.get(&id).expect("agent should exist");
         assert_eq!(agent.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(agent.complexity, TaskComplexity::Diagnostic);
-        assert_eq!(agent.max_attempts, 2, "Diagnostic 默认 2 次尝试(1 次原始 + 1 次重试)");
+        assert_eq!(
+            agent.max_attempts, 2,
+            "Diagnostic 默认 2 次尝试(1 次原始 + 1 次重试)"
+        );
         assert_eq!(agent.attempts, 0);
         assert!(!agent.validated);
     }
@@ -1503,7 +1505,10 @@ mod tests {
 
         let results = coord.spawn_parallel(tasks);
         assert_eq!(results.len(), 3, "should return 3 results");
-        assert!(results.iter().all(|r| r.is_ok()), "all spawns should succeed");
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "all spawns should succeed"
+        );
 
         // 验证三个 subagent 都已注册且字段正确
         let id_a = results[0].as_ref().unwrap();
@@ -1521,7 +1526,10 @@ mod tests {
         assert_eq!(agent_b.name, "agent-b");
         assert_eq!(agent_b.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(agent_b.complexity, TaskComplexity::Diagnostic);
-        assert_eq!(agent_b.max_attempts, 2, "Diagnostic should default to max_attempts=2");
+        assert_eq!(
+            agent_b.max_attempts, 2,
+            "Diagnostic should default to max_attempts=2"
+        );
 
         let agent_c = coord.get(id_c).expect("agent-c exists");
         assert_eq!(agent_c.mode, CoordinationMode::Teammate);
@@ -1560,11 +1568,17 @@ mod tests {
         let results = coord.spawn_parallel(tasks);
         assert_eq!(results.len(), 2);
         assert!(results[0].is_ok(), "first task should succeed");
-        assert!(results[1].is_err(), "second task should fail (Budget + Diagnostic)");
+        assert!(
+            results[1].is_err(),
+            "second task should fail (Budget + Diagnostic)"
+        );
 
         // 验证错误消息含能力校验信息
         let err = results[1].as_ref().unwrap_err();
-        assert!(err.contains("Budget"), "error should mention Budget tier: {err}");
+        assert!(
+            err.contains("Budget"),
+            "error should mention Budget tier: {err}"
+        );
     }
 
     /// §10.3 P1 步骤 7:SpawnRequest::new 构造正确字段
@@ -1634,13 +1648,15 @@ mod tests {
     fn reset_for_retry_from_failed_upgrades_model() {
         let coord = MultiAgentCoordinator::new();
         // 用 pro + Diagnostic 获得 max_attempts=2(允许 1 次 reset)
-        let id = coord.spawn_with_model(
-            "diag",
-            "task",
-            CoordinationMode::Fork,
-            "deepseek-v4-pro",
-            TaskComplexity::Diagnostic,
-        ).expect("spawn ok");
+        let id = coord
+            .spawn_with_model(
+                "diag",
+                "task",
+                CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                TaskComplexity::Diagnostic,
+            )
+            .expect("spawn ok");
         coord.start(&id).unwrap();
         coord.fail(&id, "turn error").unwrap();
 
@@ -1663,13 +1679,15 @@ mod tests {
     fn reset_for_retry_from_completed_after_validation_fail() {
         let coord = MultiAgentCoordinator::new();
         // 用 pro + Diagnostic 获得 max_attempts=2(允许 1 次 reset)
-        let id = coord.spawn_with_model(
-            "agent",
-            "task",
-            CoordinationMode::Fork,
-            "deepseek-v4-pro",
-            TaskComplexity::Diagnostic,
-        ).expect("spawn ok");
+        let id = coord
+            .spawn_with_model(
+                "agent",
+                "task",
+                CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                TaskComplexity::Diagnostic,
+            )
+            .expect("spawn ok");
         coord.start(&id).unwrap();
         coord.complete(&id, "result").unwrap();
 
@@ -1699,13 +1717,15 @@ mod tests {
     #[test]
     fn reset_for_retry_rejects_when_max_attempts_reached() {
         let coord = MultiAgentCoordinator::new();
-        let id = coord.spawn_with_model(
-            "diag",
-            "task",
-            CoordinationMode::Fork,
-            "deepseek-v4-pro",
-            TaskComplexity::Diagnostic,
-        ).expect("spawn ok");
+        let id = coord
+            .spawn_with_model(
+                "diag",
+                "task",
+                CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                TaskComplexity::Diagnostic,
+            )
+            .expect("spawn ok");
         // Diagnostic 默认 max_attempts=2(2 次尝试),reset 上限 = 2-1 = 1
         coord.start(&id).unwrap();
         coord.fail(&id, "err").unwrap();
@@ -1808,13 +1828,15 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("create temp dir");
         coord.set_workspace_root(tempdir.path().to_path_buf());
 
-        let id = coord.spawn_with_model(
-            "diag-agent",
-            "root cause analysis",
-            CoordinationMode::Fork,
-            "deepseek-v4-pro",
-            TaskComplexity::Diagnostic,
-        ).expect("spawn ok");
+        let id = coord
+            .spawn_with_model(
+                "diag-agent",
+                "root cause analysis",
+                CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                TaskComplexity::Diagnostic,
+            )
+            .expect("spawn ok");
         coord.start(&id).unwrap();
         coord.add_cost(&id, 0.022).unwrap();
 
@@ -1867,13 +1889,15 @@ mod tests {
         coord.set_workspace_root(tempdir.path().to_path_buf());
 
         // 创建 subagent 并推进到 Completed 状态
-        let id = coord.spawn_with_model(
-            "diag-agent",
-            "root cause analysis",
-            CoordinationMode::Fork,
-            "deepseek-v4-pro",
-            TaskComplexity::Diagnostic,
-        ).expect("spawn ok");
+        let id = coord
+            .spawn_with_model(
+                "diag-agent",
+                "root cause analysis",
+                CoordinationMode::Fork,
+                "deepseek-v4-pro",
+                TaskComplexity::Diagnostic,
+            )
+            .expect("spawn ok");
         coord.start(&id).unwrap();
         coord.add_cost(&id, 0.022).unwrap();
         coord.complete(&id, "fixed").unwrap();
@@ -1886,18 +1910,29 @@ mod tests {
         coord2.set_workspace_root(tempdir.path().to_path_buf());
 
         // 恢复
-        let restored_id = coord2.restore_from_checkpoint(&path).expect("restore should succeed");
+        let restored_id = coord2
+            .restore_from_checkpoint(&path)
+            .expect("restore should succeed");
         assert_eq!(restored_id, id, "restored id should match original");
 
         // 验证元状态字段完整恢复
-        let agent = coord2.get(&restored_id).expect("restored agent should exist");
+        let agent = coord2
+            .get(&restored_id)
+            .expect("restored agent should exist");
         assert_eq!(agent.id, id);
         assert_eq!(agent.name, "diag-agent");
         assert_eq!(agent.task, "root cause analysis");
         assert_eq!(agent.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(agent.complexity, TaskComplexity::Diagnostic);
-        assert_eq!(agent.status, SubagentStatus::Completed, "Completed 状态应原样保留");
-        assert!((agent.cost_accumulated - 0.022).abs() < 1e-9, "cost_accumulated 应恢复");
+        assert_eq!(
+            agent.status,
+            SubagentStatus::Completed,
+            "Completed 状态应原样保留"
+        );
+        assert!(
+            (agent.cost_accumulated - 0.022).abs() < 1e-9,
+            "cost_accumulated 应恢复"
+        );
         assert_eq!(agent.result.as_deref(), Some("fixed"));
     }
 
@@ -1931,8 +1966,13 @@ mod tests {
     fn restore_from_checkpoint_errors_for_missing_file() {
         let coord = MultiAgentCoordinator::new();
         let path = std::path::Path::new("/nonexistent/checkpoint.json");
-        let err = coord.restore_from_checkpoint(path).expect_err("should fail");
-        assert!(err.contains("read checkpoint failed"), "unexpected error: {err}");
+        let err = coord
+            .restore_from_checkpoint(path)
+            .expect_err("should fail");
+        assert!(
+            err.contains("read checkpoint failed"),
+            "unexpected error: {err}"
+        );
     }
 
     /// §10.5 v2 Epic 4:restore_from_checkpoint 对损坏 JSON 返回 Err
@@ -1943,7 +1983,9 @@ mod tests {
         let corrupt_path = tempdir.path().join("corrupt.json");
         std::fs::write(&corrupt_path, "not valid json {").unwrap();
 
-        let err = coord.restore_from_checkpoint(&corrupt_path).expect_err("should fail");
+        let err = coord
+            .restore_from_checkpoint(&corrupt_path)
+            .expect_err("should fail");
         assert!(err.contains("deserialize"), "unexpected error: {err}");
     }
 
@@ -1958,7 +2000,9 @@ mod tests {
         let path = coord.save_checkpoint(&id).expect("save");
 
         // 同一 coordinator 再 restore 应失败(id 已存在)
-        let err = coord.restore_from_checkpoint(&path).expect_err("should reject");
+        let err = coord
+            .restore_from_checkpoint(&path)
+            .expect_err("should reject");
         assert!(err.contains("already exists"), "unexpected error: {err}");
     }
 
@@ -1994,7 +2038,10 @@ mod tests {
             call_count: AtomicUsize,
         }
         impl ValidationGate for FailGate {
-            fn validate(&self, _ctx: &validation::ValidationContext) -> Result<(), validation::ValidationError> {
+            fn validate(
+                &self,
+                _ctx: &validation::ValidationContext,
+            ) -> Result<(), validation::ValidationError> {
                 let n = self.call_count.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     Err(validation::ValidationError {
@@ -2013,7 +2060,9 @@ mod tests {
         let coord = MultiAgentCoordinator::new();
         let tempdir = tempfile::tempdir().expect("temp dir");
         coord.set_workspace_root(tempdir.path().to_path_buf());
-        coord.add_validation_gate(Box::new(FailGate { call_count: AtomicUsize::new(0) }));
+        coord.add_validation_gate(Box::new(FailGate {
+            call_count: AtomicUsize::new(0),
+        }));
 
         let id = coord.spawn("a", "t", CoordinationMode::Fork);
         coord.start(&id).unwrap();

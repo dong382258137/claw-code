@@ -48,6 +48,11 @@ use super::types::{DagNode, NodeResult};
 pub trait SubagentExecutor: Send + Sync {
     /// Execute a single DAG node attempt, returning its result on success.
     ///
+    /// `attempt` is 0-indexed (0 = first try, 1 = first retry, …).
+    /// Implementations may use it to adjust behaviour on retries — e.g. the
+    /// knowledge-freshness gate treats `attempt > 0` as "urgent" and skips
+    /// research (`crate::knowledge_freshness::gate_task`).
+    ///
     /// Implementations should NOT retry — the scheduler handles retries
     /// via [`DagNode::max_retries`](super::types::DagNode::max_retries) +
     /// [`RetryPolicy`](super::types::RetryPolicy).
@@ -59,7 +64,7 @@ pub trait SubagentExecutor: Send + Sync {
     ///   per-node timeout. Retriable.
     /// - [`NodeError::Cancelled`] — the subagent was cancelled. Not retriable;
     ///   the scheduler propagates this as [`DagError::Cancelled`].
-    async fn execute(&self, node: &DagNode) -> Result<NodeResult, NodeError>;
+    async fn execute(&self, node: &DagNode, attempt: u32) -> Result<NodeResult, NodeError>;
 
     /// Request cancellation of an in-flight node (best-effort).
     ///
@@ -92,19 +97,20 @@ pub enum NodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi_agent::CoordinationMode;
     use crate::multi_agent::dag::types::RetryPolicy;
+    use crate::multi_agent::CoordinationMode;
 
     /// A minimal in-process executor used to exercise the trait contract.
     struct EchoExecutor;
 
     #[async_trait]
     impl SubagentExecutor for EchoExecutor {
-        async fn execute(&self, node: &DagNode) -> Result<NodeResult, NodeError> {
+        async fn execute(&self, node: &DagNode, _attempt: u32) -> Result<NodeResult, NodeError> {
             Ok(NodeResult {
                 node_id: node.id.clone(),
                 summary: node.task.clone(),
                 artifact_path: None,
+                gated: None,
             })
         }
 
@@ -129,7 +135,7 @@ mod tests {
     async fn echo_executor_returns_node_result() {
         let executor = EchoExecutor;
         let node = sample_node();
-        let result = executor.execute(&node).await.expect("echo should succeed");
+        let result = executor.execute(&node, 0).await.expect("echo should succeed");
         assert_eq!(result.node_id, "n1");
         assert_eq!(result.summary, "echo hello");
     }

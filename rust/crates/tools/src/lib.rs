@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError, CacheControl,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
-    model_meets_complexity, tier_for_model, upgrade_model, TaskComplexity,
+    max_tokens_for_model, model_family_identity_for, model_meets_complexity, resolve_model_alias,
+    tier_for_model, upgrade_model, ApiError, CacheControl, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, TaskComplexity, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -31,8 +31,8 @@ use runtime::{
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, McpServerManager,
-    MessageRole, PermissionMode, PermissionPolicy, ProviderFallbackConfig,
-    RuntimeError, Session, SystemPromptSplit, TaskPacket, ToolError, ToolExecutor,
+    MessageRole, PermissionMode, PermissionPolicy, ProviderFallbackConfig, RuntimeError, Session,
+    SystemPromptSplit, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -371,9 +371,8 @@ fn global_dag_store() -> &'static dag::DagStore {
 /// 类型是 `Arc<dyn SubagentExecutor + Send + Sync>` 而非具体的
 /// `Arc<CoordinatorExecutor>`,让 tools 层不必依赖 CoordinatorExecutor
 /// 具体类型(只依赖 SubagentExecutor trait)。
-static COORDINATOR_EXECUTOR: std::sync::OnceLock<
-    Arc<dyn dag::SubagentExecutor + Send + Sync>,
-> = std::sync::OnceLock::new();
+static COORDINATOR_EXECUTOR: std::sync::OnceLock<Arc<dyn dag::SubagentExecutor + Send + Sync>> =
+    std::sync::OnceLock::new();
 
 /// 注入全局 CoordinatorExecutor。在 app startup 期间调用一次。
 ///
@@ -3533,18 +3532,15 @@ fn run_dag_run(input: dag::DagRunInput) -> Result<String, String> {
                         {
                             Ok(rt) => rt,
                             Err(e) => {
-                                eprintln!(
-                                    "DAG run {run_id}: failed to create tokio runtime: {e}"
-                                );
+                                eprintln!("DAG run {run_id}: failed to create tokio runtime: {e}");
                                 return;
                             }
                         };
                         rt.block_on(async move {
                             match scheduler.run().await {
-                                Ok(results) => eprintln!(
-                                    "DAG run {run_id} completed: {} nodes",
-                                    results.len()
-                                ),
+                                Ok(results) => {
+                                    eprintln!("DAG run {run_id} completed: {} nodes", results.len())
+                                }
                                 Err(e) => eprintln!("DAG run {run_id} failed: {e}"),
                             }
                         });
@@ -4320,6 +4316,91 @@ fn preview_text(input: &str, max_chars: usize) -> String {
     let shortened = input.chars().take(max_chars).collect::<String>();
     format!("{}…", shortened.trim_end())
 }
+
+// ---------------------------------------------------------------------------
+// research_topic:知识新鲜度门控(Phase 1)的搜索+抓取封装
+// ---------------------------------------------------------------------------
+
+/// 单条调研结果(标题 + URL + 内容片段)。
+///
+/// 由 [`research_topic`] 返回,供上层(rusty-claude-cli 的 WebResearchClient)
+/// 拼接成 LLM 摘要 prompt。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResearchHit {
+    /// 搜索结果标题。
+    pub title: String,
+    /// 页面 URL。
+    pub url: String,
+    /// 抓取并清洗后的文本内容(已 HTML→text、collapse whitespace、截断)。
+    pub content: String,
+}
+
+/// 调研指定查询:执行 WebSearch → 对 top N 结果 WebFetch 抓取 → 返回内容片段。
+///
+/// 供 `runtime::knowledge_freshness::ResearchClient` 的生产实现调用。
+/// 本函数是同步阻塞的(内部用 reqwest blocking client),调用方需在
+/// 独立线程上执行(参考 `LlmBridge` 的 `std::thread::spawn` 模式)。
+///
+/// # 参数
+/// - `query`:搜索查询(建议已由 `build_research_query` 提取关键词)
+/// - `max_results`:抓取的页面数(建议 2-3,平衡成本与覆盖)
+///
+/// # 错误
+/// 搜索或抓取失败返回 Err。调用方应降级为 None(不阻塞任务)。
+///
+/// # 设计
+/// 复用已有的 `execute_web_search` + `execute_web_fetch` + `normalize_fetched_content`,
+/// 不引入新 HTTP 依赖。与 tools 内部 `run_web_search`/`run_web_fetch` 的区别:
+/// 本函数返回结构化 `ResearchHit`(供 LLM 摘要),而非 JSON 序列化的完整输出。
+pub fn research_topic(query: &str, max_results: usize) -> Result<Vec<ResearchHit>, String> {
+    // 1. 搜索
+    let search_input = WebSearchInput {
+        query: query.to_string(),
+        allowed_domains: None,
+        blocked_domains: None,
+    };
+    let search_output = execute_web_search(&search_input)?;
+
+    // 2. 提取 top N 结果的 URL + 标题
+    let candidates: Vec<(String, String)> = search_output
+        .results
+        .into_iter()
+        .filter_map(|item| match item {
+            WebSearchResultItem::SearchResult { content, .. } => {
+                content.into_iter().next().map(|hit| (hit.title, hit.url))
+            }
+            WebSearchResultItem::Commentary(_) => None,
+        })
+        .take(max_results)
+        .collect();
+
+    // 3. 逐个抓取(失败的结果跳过,不阻塞整体)
+    let mut hits = Vec::with_capacity(candidates.len());
+    for (title, url) in candidates {
+        let fetch_input = WebFetchInput {
+            url: url.clone(),
+            prompt: format!("Extract key technical facts about: {query}"),
+        };
+        match execute_web_fetch(&fetch_input) {
+            Ok(output) => {
+                // 截断到 2000 字符,避免 LLM 摘要 prompt 过长
+                let content = preview_text(&output.result, 2000);
+                hits.push(ResearchHit {
+                    title,
+                    url,
+                    content,
+                });
+            }
+            Err(_) => {
+                // 单个页面抓取失败,跳过(不阻塞整体调研)
+                continue;
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
 fn extract_search_hits(html: &str) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     let mut remaining = html;
@@ -4633,7 +4714,9 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
         push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
         push_skill_lookup_root(
             &mut roots,
-            std::path::Path::new(&home).join(".claw").join("builtin-skills"),
+            std::path::Path::new(&home)
+                .join(".claw")
+                .join("builtin-skills"),
             SkillLookupOrigin::SkillsDir,
         );
     }
@@ -4876,7 +4959,7 @@ where
                 ));
             }
         };
-                        if !model_meets_complexity(&model, complexity) {
+        if !model_meets_complexity(&model, complexity) {
             // If the model doesn't meet complexity requirements, suggest an upgrade.
             if let Some(upgraded) = upgrade_model(&model) {
                 return Err(format!(
@@ -4889,7 +4972,8 @@ where
                 "Model {model} does not meet {complexity_str} task complexity. Consider using a Flagship-tier model."
             ));
         }
-    }    let agent_name = input
+    }
+    let agent_name = input
         .name
         .as_deref()
         .map(slugify_agent_name)
@@ -6063,9 +6147,7 @@ impl ApiClient for ProviderRuntimeClient {
         request: ApiRequest,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>>
-                + Send
-                + 'a,
+            dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a,
         >,
     > {
         Box::pin(async move {
@@ -6438,7 +6520,11 @@ fn execute_skill_search(input: SkillSearchInput) -> SkillSearchOutput {
             let (score, reason) = score_skill_match(name, desc, &query_lower, &query_tokens);
             SkillMatch {
                 name: name.to_string(),
-                description: if desc.is_empty() { None } else { Some(desc.to_string()) },
+                description: if desc.is_empty() {
+                    None
+                } else {
+                    Some(desc.to_string())
+                },
                 score,
                 match_reason: reason,
             }
@@ -9752,7 +9838,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
-            complexity: None,
+                complexity: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -9834,7 +9920,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("deepseek-v4-pro".to_string()),
-            complexity: None,
+                complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9892,7 +9978,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
-            complexity: None,
+                complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9940,7 +10026,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
-            complexity: None,
+                complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10035,7 +10121,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
-            complexity: None,
+                complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10194,7 +10280,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
-            complexity: None,
+                complexity: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10236,7 +10322,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
-            complexity: None,
+                complexity: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -11742,7 +11828,10 @@ printf 'pwsh:%s' "$1"
         );
 
         // then
-        assert!(result.is_err(), "chain construction should fail when DEEPSEEK_API_KEY is missing");
+        assert!(
+            result.is_err(),
+            "chain construction should fail when DEEPSEEK_API_KEY is missing"
+        );
 
         match original_deepseek {
             Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
@@ -12094,9 +12183,7 @@ mod skill_search_tests {
         fs::create_dir_all(&skill_root).expect("skill root");
         fs::write(
             skill_root.join("SKILL.md"),
-            format!(
-                "---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"
-            ),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
         )
         .expect("write skill");
     }
@@ -12188,7 +12275,11 @@ mod skill_search_tests {
         let home = temp_path("skill-search-desc");
         let skills_dir = home.join(".claw").join("skills");
         fs::create_dir_all(&skills_dir).expect("skills dir");
-        write_skill(&skills_dir, "doc-parser", "Parse and extract data from documents");
+        write_skill(
+            &skills_dir,
+            "doc-parser",
+            "Parse and extract data from documents",
+        );
         write_skill(&skills_dir, "image-resizer", "Resize and crop images");
 
         let restore = isolate_skill_env(&home);
@@ -12202,10 +12293,7 @@ mod skill_search_tests {
         assert!(!output.matches.is_empty(), "should find matching skill");
         assert_eq!(output.matches[0].name, "doc-parser");
         // Description contains the full query phrase → +6.0, plus token hits.
-        assert!(
-            output.matches[0].score > 0.0,
-            "should have positive score"
-        );
+        assert!(output.matches[0].score > 0.0, "should have positive score");
     }
 
     #[test]

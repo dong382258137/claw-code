@@ -258,9 +258,11 @@ fn detect_scenario(request: &Value) -> Option<Scenario> {
     let messages = request.get("messages").and_then(Value::as_array)?;
     messages.iter().rev().find_map(|message| {
         let content = message_text(message)?;
-        content
-            .split_whitespace()
-            .find_map(|token| token.strip_prefix(SCENARIO_PREFIX).and_then(Scenario::parse))
+        content.split_whitespace().find_map(|token| {
+            token
+                .strip_prefix(SCENARIO_PREFIX)
+                .and_then(Scenario::parse)
+        })
     })
 }
 
@@ -732,12 +734,7 @@ fn text_completion_response_with_usage(
     )
 }
 
-fn tool_completion_response(
-    id: &str,
-    tool_id: &str,
-    tool_name: &str,
-    input: Value,
-) -> Value {
+fn tool_completion_response(id: &str, tool_id: &str, tool_name: &str, input: Value) -> Value {
     tool_completion_response_many(
         id,
         &[ToolUseMessage {
@@ -758,8 +755,8 @@ fn tool_completion_response_many(id: &str, tool_uses: &[ToolUseMessage<'_>]) -> 
     let tool_calls: Vec<Value> = tool_uses
         .iter()
         .map(|tool_use| {
-            let arguments = serde_json::to_string(&tool_use.input)
-                .unwrap_or_else(|_| "{}".to_string());
+            let arguments =
+                serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
             json!({
                 "id": tool_use.tool_id,
                 "type": "function",
@@ -808,11 +805,23 @@ fn streaming_text_sse() -> String {
     let created = now_unix();
     append_sse(
         &mut body,
-        chunk(&id, created, json!({"role": "assistant", "content": ""}), None, None),
+        chunk(
+            &id,
+            created,
+            json!({"role": "assistant", "content": ""}),
+            None,
+            None,
+        ),
     );
     append_sse(
         &mut body,
-        chunk(&id, created, json!({"content": "Mock streaming "}), None, None),
+        chunk(
+            &id,
+            created,
+            json!({"content": "Mock streaming "}),
+            None,
+            None,
+        ),
     );
     append_sse(
         &mut body,
@@ -826,7 +835,13 @@ fn streaming_text_sse() -> String {
     );
     append_sse(
         &mut body,
-        chunk(&id, created, json!({}), Some("stop"), Some(usage_json(11, 8))),
+        chunk(
+            &id,
+            created,
+            json!({}),
+            Some("stop"),
+            Some(usage_json(11, 8)),
+        ),
     );
     body.push_str("data: [DONE]\n\n");
     body
@@ -881,7 +896,13 @@ fn tool_uses_sse(tool_uses: &[ToolUseSse<'_>]) -> String {
     }
     append_sse(
         &mut body,
-        chunk(&id, created, json!({}), Some("tool_calls"), Some(usage_json(12, 4))),
+        chunk(
+            &id,
+            created,
+            json!({}),
+            Some("tool_calls"),
+            Some(usage_json(12, 4)),
+        ),
     );
     body.push_str("data: [DONE]\n\n");
     body
@@ -897,7 +918,13 @@ fn final_text_sse_with_usage(text: &str, prompt_tokens: u32, completion_tokens: 
     let created = now_unix();
     append_sse(
         &mut body,
-        chunk(&id, created, json!({"role": "assistant", "content": ""}), None, None),
+        chunk(
+            &id,
+            created,
+            json!({"role": "assistant", "content": ""}),
+            None,
+            None,
+        ),
     );
     append_sse(
         &mut body,
@@ -917,7 +944,13 @@ fn final_text_sse_with_usage(text: &str, prompt_tokens: u32, completion_tokens: 
     body
 }
 
-fn chunk(id: &str, created: u64, delta: Value, finish_reason: Option<&str>, usage: Option<Value>) -> Value {
+fn chunk(
+    id: &str,
+    created: u64,
+    delta: Value,
+    finish_reason: Option<&str>,
+    usage: Option<Value>,
+) -> Value {
     let mut payload = json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -966,12 +999,7 @@ fn chunk_with_tool_calls(
     })
 }
 
-fn chunk_with_tool_call_delta(
-    id: &str,
-    created: u64,
-    index: usize,
-    arguments: &str,
-) -> Value {
+fn chunk_with_tool_call_delta(id: &str, created: u64, index: usize, arguments: &str) -> Value {
     json!({
         "id": id,
         "object": "chat.completion.chunk",

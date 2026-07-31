@@ -198,7 +198,10 @@ impl SemanticRecaller {
     /// 注入 embedding provider(用于向量语义召回)。
     ///
     /// 调用方应在构建 `PersistentMemory` 时通过此方法注入全局 provider。
-    pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider + Send + Sync>) -> Self {
+    pub fn with_embedding_provider(
+        mut self,
+        provider: Arc<dyn EmbeddingProvider + Send + Sync>,
+    ) -> Self {
         self.strategy = RecallStrategy::Embedding;
         self.embedding_available = true;
         self.embedding_provider = EmbeddingProviderRef(Some(provider));
@@ -303,6 +306,35 @@ impl SemanticRecaller {
         hits
     }
 
+    /// 增量计算单个 L1 entry 的向量并写入 vectors 索引。
+    ///
+    /// 供运行时 `add_entry` / `replace_entry` 在写入 L1 索引后调用,
+    /// 使新记忆立即进入向量召回范围(否则 vectors 为空,向量路径恒不触发,
+    /// 语义召回永远退化为 keyword)。
+    ///
+    /// 幂等:已存在向量的 entry 跳过。embed 失败(provider 初始化异常 /
+    /// 返回空向量)静默跳过 — 该 entry 仍可由 keyword 召回兜底。
+    pub fn embed_entry(&mut self, id: &str) {
+        if self.embedding_provider.0.is_none() || self.vectors.contains_key(id) {
+            return;
+        }
+        let Some(summary) = self
+            .l1_index
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.summary.clone())
+        else {
+            return;
+        };
+        if let Some(provider) = &self.embedding_provider.0 {
+            if let Ok(vector) = provider.embed(&summary) {
+                if !vector.is_empty() {
+                    self.vectors.insert(id.to_string(), vector);
+                }
+            }
+        }
+    }
+
     /// 预计算所有 L1 entry 的 embedding 并存入 vectors 索引。
     ///
     /// 幂等:已存在向量的 entry 不会被重新计算。
@@ -357,6 +389,12 @@ impl SemanticRecaller {
     #[must_use]
     pub fn l1_count(&self) -> usize {
         self.l1_index.len()
+    }
+
+    /// 获取已计算向量的条目数量(向量召回可用性的代理指标)。
+    #[must_use]
+    pub fn vectors_count(&self) -> usize {
+        self.vectors.len()
     }
 
     /// 获取已索引的向量数量。

@@ -226,9 +226,7 @@ mod tests {
         // - 外层 `.expect(...)` 解 thread::Result → 拿到闭包返回值
         //   (`Result<(), io::Error>`)
         // - 不再 `.expect()` 内层:保留 `Result` 以便 `.is_ok()` 断言
-        let result: Result<(), io::Error> = handle
-            .join()
-            .expect("test thread should not panic");
+        let result: Result<(), io::Error> = handle.join().expect("test thread should not panic");
 
         assert!(
             result.is_ok(),

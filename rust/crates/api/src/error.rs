@@ -188,9 +188,7 @@ impl ApiError {
                 "provider_retry_exhausted"
             }
             Self::RetriesExhausted { last_error, .. } => last_error.safe_failure_class(),
-            Self::MissingCredentials { .. } | Self::Auth(_) => {
-                "provider_auth"
-            }
+            Self::MissingCredentials { .. } | Self::Auth(_) => "provider_auth",
             Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
             Self::ContextWindowExceeded { .. } => "context_window",
             Self::Api { .. } if self.is_context_window_failure() => "context_window",
@@ -434,9 +432,7 @@ impl TypedErrorEnvelope {
         let request_id = error.request_id().map(ToOwned::to_owned);
 
         let (code, hint) = match error {
-            ApiError::MissingCredentials { .. } => {
-                (Some("AUTH_MISSING".to_string()), None)
-            }
+            ApiError::MissingCredentials { .. } => (Some("AUTH_MISSING".to_string()), None),
             ApiError::Auth(_) => (Some("AUTH_REJECTED".to_string()), None),
             ApiError::InvalidApiKeyEnv(_) => (Some("AUTH_BAD_ENV".to_string()), None),
             ApiError::ContextWindowExceeded { .. } => (Some("CONTEXT_WINDOW".to_string()), None),
@@ -708,7 +704,8 @@ mod tests {
             rendered.starts_with("missing DeepSeek credentials;"),
             "hint should be appended, not replace the base message: {rendered}"
         );
-        let hint_marker = " — hint: DEEPSEEK_API_KEY is not set — export it before starting the session.";
+        let hint_marker =
+            " — hint: DEEPSEEK_API_KEY is not set — export it before starting the session.";
         assert!(
             rendered.ends_with(hint_marker),
             "rendered error should end with the hint: {rendered}"

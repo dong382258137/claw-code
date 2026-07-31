@@ -875,8 +875,7 @@ mod compat_tests {
 
         // Serialize → deserialize round trip.
         let json = serde_json::to_string(&message).expect("serialize failed");
-        let parsed: AcpAgentMessage =
-            serde_json::from_str(&json).expect("deserialize failed");
+        let parsed: AcpAgentMessage = serde_json::from_str(&json).expect("deserialize failed");
         assert_eq!(parsed.method_name(), message.method_name());
     }
 
@@ -888,8 +887,7 @@ mod compat_tests {
         // is available because claw-acp enables the `unstable` feature which
         // turns on `unstable_session_model`.
         let session_id = acp::SessionId::new("sess_0_10");
-        let request =
-            acp::SetSessionModelRequest::new(session_id, "claude-sonnet-4");
+        let request = acp::SetSessionModelRequest::new(session_id, "claude-sonnet-4");
         let (response_tx, _response_rx) = oneshot::channel();
         let message = AcpAgentMessage::SetSessionModel(AcpArgs {
             request,

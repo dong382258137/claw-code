@@ -81,7 +81,9 @@ pub(crate) fn render_sidebar(
     //  Stats+Usage: remaining → 2 stat lines + usage details
 
     let session_h = total_h.min(6);
-    if let Some(a) = take_section(&mut y, inner, session_h) { render_session_section(a, buf, state) }
+    if let Some(a) = take_section(&mut y, inner, session_h) {
+        render_session_section(a, buf, state)
+    }
 
     // Skills section: show only when there are skill invocations
     if !skill_history.is_empty() {
@@ -90,7 +92,9 @@ pub(crate) fn render_sidebar(
         if remaining >= 4 {
             // Need at least 4 rows (1 header + 1 item + 2 borders)
             let skills_h = skills_visible.min(remaining);
-            if let Some(a) = take_section(&mut y, inner, skills_h) { render_skills_section(a, buf, skill_history) }
+            if let Some(a) = take_section(&mut y, inner, skills_h) {
+                render_skills_section(a, buf, skill_history)
+            }
         }
     }
 
@@ -99,13 +103,17 @@ pub(crate) fn render_sidebar(
     let reserve_for_bottom = 12u16; // 10 usage lines + 1 top border + 1 margin
     let tools_h = remaining.saturating_sub(reserve_for_bottom);
     if tools_h > 0 {
-        if let Some(a) = take_section(&mut y, inner, tools_h) { render_tools_section(a, buf, tool_history, tools_scroll) }
+        if let Some(a) = take_section(&mut y, inner, tools_h) {
+            render_tools_section(a, buf, tool_history, tools_scroll)
+        }
     }
 
     // Stats + Usage section: remaining space
     let remaining = inner.height.saturating_sub(y.saturating_sub(inner.y));
     if remaining > 0 {
-        if let Some(a) = take_section(&mut y, inner, remaining) { render_usage_section(a, buf, state) }
+        if let Some(a) = take_section(&mut y, inner, remaining) {
+            render_usage_section(a, buf, state)
+        }
     }
 }
 

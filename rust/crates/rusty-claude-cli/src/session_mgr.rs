@@ -13,7 +13,7 @@ use commands::{
 };
 use runtime::{
     format_usd, resolve_sandbox_status, CompactionConfig, ConfigLoader, ContentBlock, HistoryIndex,
-    MessageRole, Session, SessionStore, UsageTracker,
+    MessageRole, Session, SessionStore, TokenUsage, UsageTracker,
 };
 use serde_json::{json, Value};
 
@@ -692,6 +692,46 @@ pub(crate) fn run_resume_command(
                 })),
             })
         }
+        SlashCommand::Summary => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_session_summary_text(session)),
+            json: Some(serde_json::json!({
+                "kind": "summary",
+                "messages": session.messages.len(),
+            })),
+        }),
+        SlashCommand::Context { .. } => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_context_report(session)),
+            json: Some(serde_json::json!({
+                "kind": "context",
+                "messages": session.messages.len(),
+                "estimated_tokens": runtime::compact::estimate_session_tokens(session),
+            })),
+        }),
+        SlashCommand::Usage { .. } => {
+            let tracker = UsageTracker::from_session(session);
+            let cum = tracker.cumulative_usage();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(render_usage_report(
+                    None,
+                    cum,
+                    tracker.current_turn_usage(),
+                    tracker.turns(),
+                )),
+                json: Some(serde_json::json!({
+                    "kind": "usage",
+                    "turns": tracker.turns(),
+                    "cumulative": {
+                        "input_tokens": cum.input_tokens,
+                        "output_tokens": cum.output_tokens,
+                        "cache_creation_input_tokens": cum.cache_creation_input_tokens,
+                        "cache_read_input_tokens": cum.cache_read_input_tokens,
+                    },
+                })),
+            })
+        }
         SlashCommand::Poor { action } => {
             // Tier S #3 穷鬼模式：在 resume 模式下也可查询/切换。切换仅影响
             // 运行时全局 AtomicBool，不写回 settings.json。
@@ -767,7 +807,6 @@ pub(crate) fn run_resume_command(
         | SlashCommand::Files
         | SlashCommand::Fast
         | SlashCommand::Exit
-        | SlashCommand::Summary
         | SlashCommand::Desktop
         | SlashCommand::Brief
         | SlashCommand::Advisor
@@ -783,11 +822,9 @@ pub(crate) fn run_resume_command(
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
-        | SlashCommand::Usage { .. }
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
-        | SlashCommand::Context { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
         | SlashCommand::Branch { .. }
@@ -850,6 +887,96 @@ fn build_search_preview(role_label: &str, text: &str) -> String {
         ""
     };
     format!("[{role_label}] {truncated}{suffix}")
+}
+
+/// 会话摘要渲染 — 供 `/summary` 命令使用。
+///
+/// 复用 runtime compaction 的 LLM 优先摘要(已注册 `CompactionSummarizerClient`
+/// 时由模型生成,否则启发式规则摘要)。不压缩、不删除任何消息。
+#[must_use]
+pub(crate) fn render_session_summary_text(session: &Session) -> String {
+    let summary = runtime::compact::render_session_summary(session);
+    format!(
+        "Summary\n  Messages         {}\n  Source           {}\n\n{}",
+        session.messages.len(),
+        llm_or_heuristic_label(),
+        summary
+    )
+}
+
+fn llm_or_heuristic_label() -> &'static str {
+    if runtime::compact::is_compaction_summarizer_registered() {
+        "LLM summary"
+    } else {
+        "heuristic summary"
+    }
+}
+
+/// 上下文占用报告 — 供 `/context` 命令使用。
+///
+/// 统计会话规模(消息数、按角色分布、估算 token)与压缩状态,
+/// 帮助用户判断是否需要 /compact 或清理。
+#[must_use]
+pub(crate) fn render_context_report(session: &Session) -> String {
+    let total = session.messages.len();
+    let count_by_role =
+        |role: MessageRole| session.messages.iter().filter(|m| m.role == role).count();
+    let user = count_by_role(MessageRole::User);
+    let assistant = count_by_role(MessageRole::Assistant);
+    let tool = count_by_role(MessageRole::Tool);
+    let system = count_by_role(MessageRole::System);
+    let estimated = runtime::compact::estimate_session_tokens(session);
+    // 压缩边界检测:boundary 之后的活跃消息数。
+    let active = runtime::compact::get_messages_after_compact_boundary(&session.messages).len();
+    let compacted = if active < total {
+        format!("yes ({} summarized below boundary)", total - active)
+    } else {
+        "no".to_string()
+    };
+    let summarizer = if runtime::compact::is_compaction_summarizer_registered() {
+        "LLM"
+    } else {
+        "heuristic"
+    };
+    // 展示配置的 provider fallback 链(settings.json `providerFallbacks`)。
+    // ProviderRuntimeClient 在 retryable 错误时按序切换链上模型重试。
+    let fallbacks = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        .map(|config| config.provider_fallbacks().clone())
+        .unwrap_or_default();
+    let mut fallback_line = String::from("none");
+    if !fallbacks.fallbacks().is_empty() {
+        let chain: Vec<String> = std::iter::once(
+            fallbacks
+                .primary()
+                .map_or_else(|| "primary".to_string(), str::to_string),
+        )
+        .chain(fallbacks.fallbacks().iter().cloned())
+        .collect();
+        fallback_line = chain.join(" → ");
+    }
+    format!(
+        "Context\n  Messages         {total}\n    user           {user}\n    assistant      {assistant}\n    tool           {tool}\n    system         {system}\n  Estimated tokens {estimated}\n  Active after boundary {active}\n  Compacted       {compacted}\n  Summarizer      {summarizer}\n  Provider fallback {fallback_line}"
+    )
+}
+
+/// 用量报告 — 供 `/usage` 命令使用(与 /stats 互补,展示最新/累计/轮次/成本)。
+#[must_use]
+pub(crate) fn render_usage_report(
+    model: Option<&str>,
+    cumulative: TokenUsage,
+    latest: TokenUsage,
+    turns: u32,
+) -> String {
+    let model_line = model.unwrap_or("(unknown)");
+    let mut out = format!(
+        "Usage\n  Model           {model_line}\n  Turns           {turns}\n\nLatest turn\n{}",
+        crate::format::format_cost_report(latest)
+    );
+    out.push_str("\n\nCumulative\n");
+    out.push_str(&crate::format::format_cost_report(cumulative));
+    out
 }
 
 /// Undo the most recent file-editing tool call in the session.
@@ -1814,6 +1941,59 @@ mod tests {
             usage: None,
         });
         session
+    }
+
+    #[test]
+    fn render_session_summary_text_works_without_llm() {
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("implement the auth module"));
+        session
+            .messages
+            .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "I will add auth.rs".to_string(),
+            }]));
+        let text = render_session_summary_text(&session);
+        assert!(text.contains("Summary"));
+        assert!(text.contains("Messages"));
+        // 未注册 LLM client 时走启发式,包含 Scope 统计。
+        assert!(text.contains("Scope:"));
+    }
+
+    #[test]
+    fn render_context_report_lists_roles_and_estimated_tokens() {
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("hello"));
+        session
+            .messages
+            .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }]));
+        let text = render_context_report(&session);
+        assert!(text.contains("Context"));
+        assert!(text.contains("Messages         2"));
+        assert!(text.contains("user"));
+        assert!(text.contains("assistant"));
+        assert!(text.contains("Estimated tokens"));
+    }
+
+    #[test]
+    fn render_usage_report_shows_latest_and_cumulative() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_creation_input_tokens: 2,
+            cache_read_input_tokens: 1,
+        };
+        let text = render_usage_report(Some("deepseek-v4-flash"), usage, usage, 3);
+        assert!(text.contains("deepseek-v4-flash"));
+        assert!(text.contains("Turns"));
+        assert!(text.contains("3"));
+        assert!(text.contains("Latest turn"));
+        assert!(text.contains("Cumulative"));
     }
 
     fn text_block(text: &str) -> ContentBlock {

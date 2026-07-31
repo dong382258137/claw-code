@@ -22,8 +22,8 @@ use std::time::Duration;
 use api::{
     model_requires_reasoning_content_in_history, CacheControl, ContentBlockDelta,
     InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent, SystemBlock,
-    SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent,
+    ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
@@ -384,9 +384,7 @@ impl ApiClient for AnthropicRuntimeClient {
         request: ApiRequest,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>>
-                + Send
-                + 'a,
+            dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a,
         >,
     > {
         Box::pin(async move {
@@ -452,7 +450,7 @@ impl ApiClient for AnthropicRuntimeClient {
             false, // emit_output:静默
             None,  // allowed_tools
             self.tool_registry.clone(),
-            None,  // progress_reporter
+            None, // progress_reporter
         )
         .map_err(|e| format!("failed to construct subagent client for {model}: {e}"))?;
         Ok(Box::new(client))
@@ -568,7 +566,10 @@ impl AnthropicRuntimeClient {
                         // text 之前）。这里立即 emit 以保证顺序正确。
                         if let Some((thinking, signature)) = pending_thinking.take() {
                             if !thinking.is_empty() {
-                                events.push(AssistantEvent::Thinking { thinking, signature });
+                                events.push(AssistantEvent::Thinking {
+                                    thinking,
+                                    signature,
+                                });
                             }
                         }
                     }
@@ -685,7 +686,10 @@ impl AnthropicRuntimeClient {
                     // (空内容会被 DeepSeek 拒绝)。
                     if let Some((thinking, signature)) = pending_thinking.take() {
                         if !thinking.is_empty() {
-                            events.push(AssistantEvent::Thinking { thinking, signature });
+                            events.push(AssistantEvent::Thinking {
+                                thinking,
+                                signature,
+                            });
                         }
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
@@ -1017,7 +1021,10 @@ pub(crate) fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, signature } => {
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
             if streaming_tool_input {
@@ -1028,7 +1035,10 @@ pub(crate) fn push_output_block(
                 // G10.5 fix: non-streaming fallback path must emit Thinking
                 // event so downstream consumers (planner, TUI status) receive
                 // the full event stream — mirrors tools/lib.rs push_output_block.
-                events.push(AssistantEvent::Thinking { thinking, signature });
+                events.push(AssistantEvent::Thinking {
+                    thinking,
+                    signature,
+                });
             }
         }
         OutputContentBlock::RedactedThinking { .. } => {
@@ -1068,7 +1078,10 @@ pub(crate) fn response_to_events(
         // 因为 streaming_tool_input=false 时 push_output_block 已经 push 过）。
         if let Some((thinking, signature)) = pending_thinking.take() {
             if !thinking.is_empty() {
-                events.push(AssistantEvent::Thinking { thinking, signature });
+                events.push(AssistantEvent::Thinking {
+                    thinking,
+                    signature,
+                });
             }
         }
     }

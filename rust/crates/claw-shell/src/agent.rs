@@ -334,10 +334,8 @@ where
 
         // 推送 LaneEvent → SessionNotification 桥接事件(工具调用进度、子 agent 状态等)
         // 在 turn 完成后一次性 drain 并 forward 给 IDE 端,激活实时推送能力。
-        let flushed = crate::lane_bridge::flush_lane_events_to_acp(
-            &self.client_gateway,
-            &session_id,
-        );
+        let flushed =
+            crate::lane_bridge::flush_lane_events_to_acp(&self.client_gateway, &session_id);
         if flushed > 0 {
             tracing::debug!("claw-agent: flushed {flushed} lane events to ACP gateway");
         }

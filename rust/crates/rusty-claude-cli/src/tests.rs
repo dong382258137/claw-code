@@ -745,7 +745,10 @@ fn resolves_known_model_aliases() {
     // DeepSeek-only build: the CLI's `resolve_model_alias` is an identity
     // mapping — built-in aliases (pro/flash) are resolved by the api crate.
     assert_eq!(resolve_model_alias("deepseek-v4-pro"), "deepseek-v4-pro");
-    assert_eq!(resolve_model_alias("deepseek-v4-flash"), "deepseek-v4-flash");
+    assert_eq!(
+        resolve_model_alias("deepseek-v4-flash"),
+        "deepseek-v4-flash"
+    );
     assert_eq!(resolve_model_alias("pro"), "pro");
 }
 
@@ -2860,7 +2863,9 @@ fn resolve_repl_model_auto_detects_deepseek_when_key_present() {
 
     // Restore
     std::env::remove_var("DEEPSEEK_API_KEY");
-    if let Some(v) = orig_deepseek { std::env::set_var("DEEPSEEK_API_KEY", v); }
+    if let Some(v) = orig_deepseek {
+        std::env::set_var("DEEPSEEK_API_KEY", v);
+    }
     std::env::remove_var("CLAW_CONFIG_HOME");
     fs::remove_dir_all(root).expect("cleanup temp dir");
 }
@@ -2879,8 +2884,9 @@ fn model_provenance_reports_default_when_deepseek_key_present() {
     let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
     std::env::set_var("DEEPSEEK_API_KEY", "sk-test-deepseek");
 
-    let provenance =
-        with_current_dir(&root, || ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL));
+    let provenance = with_current_dir(&root, || {
+        ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL)
+    });
 
     // DeepSeek's auto-detected model equals DEFAULT_MODEL, so source is Default
     // (not AutoDetect, which only applies when the detected model differs from default).
@@ -2889,7 +2895,9 @@ fn model_provenance_reports_default_when_deepseek_key_present() {
 
     // Restore
     std::env::remove_var("DEEPSEEK_API_KEY");
-    if let Some(v) = orig_deepseek { std::env::set_var("DEEPSEEK_API_KEY", v); }
+    if let Some(v) = orig_deepseek {
+        std::env::set_var("DEEPSEEK_API_KEY", v);
+    }
     std::env::remove_var("CLAW_CONFIG_HOME");
     fs::remove_dir_all(root).expect("cleanup temp dir");
 }
@@ -2908,14 +2916,17 @@ fn model_provenance_reports_default_when_no_keys_at_all() {
     let orig_deepseek = std::env::var("DEEPSEEK_API_KEY").ok();
     std::env::remove_var("DEEPSEEK_API_KEY");
 
-    let provenance =
-        with_current_dir(&root, || ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL));
+    let provenance = with_current_dir(&root, || {
+        ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL)
+    });
 
     assert_eq!(provenance.source, ModelSource::Default);
     assert_eq!(provenance.resolved, DEFAULT_MODEL);
 
     // Restore
-    if let Some(v) = orig_deepseek { std::env::set_var("DEEPSEEK_API_KEY", v); }
+    if let Some(v) = orig_deepseek {
+        std::env::set_var("DEEPSEEK_API_KEY", v);
+    }
     std::env::remove_var("CLAW_CONFIG_HOME");
     fs::remove_dir_all(root).expect("cleanup temp dir");
 }
@@ -4560,7 +4571,10 @@ fn push_output_block_nonstreaming_thinking_emits_directly() {
             if thinking == "step 1" && signature.as_deref() == Some("sig_xyz")
     ));
     // pending_thinking 必须保持空
-    assert!(pending_thinking.is_none(), "non-streaming must not populate pending");
+    assert!(
+        pending_thinking.is_none(),
+        "non-streaming must not populate pending"
+    );
 }
 
 #[test]

@@ -923,8 +923,8 @@ fn run_event_loop(
             last_main_area = main_area;
             last_scroll_y = scroll_y as u16;
         })?;
-            // P1 修复:记录渲染完成时刻,供 ESC peek-ahead 判断"渲染高峰窗口"。
-            last_draw_instant = Some(Instant::now());
+                // P1 修复:记录渲染完成时刻,供 ESC peek-ahead 判断"渲染高峰窗口"。
+                last_draw_instant = Some(Instant::now());
             }
         }
 

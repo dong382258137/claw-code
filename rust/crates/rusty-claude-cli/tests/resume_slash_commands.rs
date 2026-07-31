@@ -90,13 +90,7 @@ fn status_command_applies_cli_flags_end_to_end() {
     // when
     let output = run_claw(
         &temp_dir,
-        &[
-            "--model",
-            "pro",
-            "--permission-mode",
-            "read-only",
-            "status",
-        ],
+        &["--model", "pro", "--permission-mode", "read-only", "status"],
     );
 
     // then

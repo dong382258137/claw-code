@@ -475,7 +475,10 @@ impl SessionManager {
                 continue;
             }
 
-            tracing::info!("idle cleanup: removing {} expired session(s)", expired.len());
+            tracing::info!(
+                "idle cleanup: removing {} expired session(s)",
+                expired.len()
+            );
             let mut sessions = self.sessions.lock().await;
             for key in &expired {
                 if let Some(entry) = sessions.remove(key) {

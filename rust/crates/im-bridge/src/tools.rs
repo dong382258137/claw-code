@@ -54,9 +54,13 @@ fn handle_bash(input: &str) -> Result<String, ToolError> {
     let command = get_str(&v, "command")?;
 
     #[cfg(windows)]
-    let result = std::process::Command::new("cmd").args(["/C", command]).output();
+    let result = std::process::Command::new("cmd")
+        .args(["/C", command])
+        .output();
     #[cfg(not(windows))]
-    let result = std::process::Command::new("sh").args(["-c", command]).output();
+    let result = std::process::Command::new("sh")
+        .args(["-c", command])
+        .output();
 
     let output = result.map_err(|e| ToolError::new(format!("failed to execute command: {e}")))?;
 
@@ -145,11 +149,7 @@ fn handle_edit_file(input: &str) -> Result<String, ToolError> {
                 result.push_str(&content[idx + old_string.len()..]);
                 result
             }
-            None => {
-                return Err(ToolError::new(format!(
-                    "old_string not found in '{path}'"
-                )))
-            }
+            None => return Err(ToolError::new(format!("old_string not found in '{path}'"))),
         }
     };
 
@@ -186,7 +186,9 @@ fn handle_replace_lines(input: &str) -> Result<String, ToolError> {
     std::fs::write(path, &result)
         .map_err(|e| ToolError::new(format!("failed to write '{path}': {e}")))?;
 
-    Ok(format!("Successfully replaced lines {start_line}-{end_line} in {path}"))
+    Ok(format!(
+        "Successfully replaced lines {start_line}-{end_line} in {path}"
+    ))
 }
 
 fn handle_glob_search(input: &str) -> Result<String, ToolError> {

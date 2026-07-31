@@ -12,6 +12,10 @@ pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with,
     build_http_client_with_opts, ProxyConfig, TimeoutConfig,
 };
+pub use providers::model_tier::{
+    model_meets_complexity, tier_for_model, upgrade_cost_multiplier, upgrade_model, ModelTier,
+    TaskComplexity,
+};
 pub use providers::openai_compat::has_api_key;
 pub use providers::openai_compat::{
     build_chat_completion_request, check_request_body_size, estimate_request_body_size,
@@ -23,10 +27,6 @@ pub use providers::{
     metadata_for_model, model_family_identity_for, model_family_identity_for_kind,
     model_token_limit, provider_diagnostics_for_model, resolve_model_alias, ModelTokenLimit,
     ProviderDiagnostics, ProviderKind,
-};
-pub use providers::model_tier::{
-    model_meets_complexity, tier_for_model, upgrade_cost_multiplier, upgrade_model, ModelTier,
-    TaskComplexity,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

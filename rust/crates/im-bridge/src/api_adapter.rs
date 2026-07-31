@@ -113,9 +113,7 @@ impl RuntimeApiClient for BridgeApiClient {
                         return;
                     }
                 };
-                let result = rt.block_on(async move {
-                    client.send_message(&msg_request).await
-                });
+                let result = rt.block_on(async move { client.send_message(&msg_request).await });
                 let _ = tx.send(result.map_err(|e| e.to_string()));
             })
             .map_err(|e| RuntimeError::new(format!("failed to spawn API thread: {e}")))?;
@@ -124,8 +122,7 @@ impl RuntimeApiClient for BridgeApiClient {
             .recv()
             .map_err(|e| RuntimeError::new(format!("API thread channel error: {e}")))?;
 
-        let response = result
-            .map_err(|e| RuntimeError::new(format!("API error: {e}")))?;
+        let response = result.map_err(|e| RuntimeError::new(format!("API error: {e}")))?;
 
         Ok(Self::convert_response(&response))
     }

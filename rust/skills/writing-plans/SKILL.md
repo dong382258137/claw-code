@@ -15,7 +15,7 @@ Assume they are a skilled developer, but know almost nothing about our toolset o
 
 **Context:** This should be run in a dedicated worktree (created by brainstorming skill).
 
-**Save plans to:** `docs/superpowers/plans/YYYY-MM-DD-<feature-name>.md`
+**Save plans to:** `docs/plans/YYYY-MM-DD-<feature-name>.md`
 - (User preferences for plan location override this default)
 
 ## Scope Check
@@ -48,8 +48,6 @@ This structure informs the task decomposition. Each task should produce self-con
 
 ```markdown
 # [Feature Name] Implementation Plan
-
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** [One sentence describing what this builds]
 
@@ -123,30 +121,46 @@ Every step must contain the actual content an engineer needs. These are **plan f
 
 After writing the complete plan, look at the spec with fresh eyes and check the plan against it. This is a checklist you run yourself — not a subagent dispatch.
 
+### 文档正确性检查
+
 **1. Spec coverage:** Skim each section/requirement in the spec. Can you point to a task that implements it? List any gaps.
 
 **2. Placeholder scan:** Search your plan for red flags — any of the patterns from the "No Placeholders" section above. Fix them.
 
 **3. Type consistency:** Do the types, method signatures, and property names you used in later tasks match what you defined in earlier tasks? A function called `clearLayers()` in Task 3 but `clearFullLayers()` in Task 7 is a bug.
 
+### 代码事实核查(必做)
+
+方案中所有引用代码的声明**必须实际验证**,不允许凭参数记忆断言:
+
+**4. 现状分析表**:方案开头必须含"现状分析"表,每行一个组件,列含:位置(文件:行号)/ 现状 / 验证标记。未验证标 ⚠️,已验证标 ✅
+
+**5. 签名/可见性/依赖验证**:函数签名(async/sync、&self/&mut self)、常量可见性(pub/private)、crate 依赖关系 —— 必须通过 Read/Grep 核查,不能假设
+
+**6. 行号附注**:引用代码位置必须附行号或文件路径,不允许只说"在 xxx 模块中"
+
+### 实现可行性推演(必做,逐项回答)
+
+以下 9 项必须逐项推演,结果记入方案的"实现可行性评审"章节:
+
+**7. 签名兼容性**:新调用的函数签名与调用点上下文兼容吗?(async/sync、&self/&mut self、生命周期)
+
+**8. 参数来源**:每个函数参数从哪来?调用方签名里有吗?
+
+**9. 数据传递链**:数据从产生点到消费点,中间每个层级都传递了吗?会丢失吗?
+
+**10. 判定优先级**:多个判定条件共存时,顺序对吗?漏判成本 vs 误判成本谁高?
+
+**11. retry/重入**:被重复调用时成本可控吗?有缓存/幂等吗?
+
+**12. 冲突处理**:外部输入与内部状态冲突时,谁优先?优先规则安全吗?
+
+**13. 与现有系统重叠**:新机制与现有机制职责重叠吗?
+
+**14. 失败路径**:每个外部依赖失败时,系统行为是什么?降级还是阻塞?
+
+**15. 构造点破坏扫描**:加字段是否破坏 `..Default::default()` 构造点?列出所有受影响的构造点(含测试 `node()`/`sample_node()` 等),并在文件改动清单中标注"需同步更新"。
+
+**16. 成本估算**:行数估算含 prompt 工程/错误处理/边界 case 吗?
+
 If you find issues, fix them inline. No need to re-review — just fix and move on. If you find a spec requirement with no task, add the task.
-
-## Execution Handoff
-
-After saving the plan, offer execution choice:
-
-**"Plan complete and saved to `docs/superpowers/plans/<filename>.md`. Two execution options:**
-
-**1. Subagent-Driven (recommended)** - I dispatch a fresh subagent per task, review between tasks, fast iteration
-
-**2. Inline Execution** - Execute tasks in this session using executing-plans, batch execution with checkpoints
-
-**Which approach?"**
-
-**If Subagent-Driven chosen:**
-- **REQUIRED SUB-SKILL:** Use superpowers:subagent-driven-development
-- Fresh subagent per task + two-stage review
-
-**If Inline Execution chosen:**
-- **REQUIRED SUB-SKILL:** Use superpowers:executing-plans
-- Batch execution with checkpoints for review

@@ -3715,6 +3715,7 @@ version = "2026.8.0"
 dependencies = [
  "ansi-to-tui",
  "api",
+ "async-trait",
  "chrono",
  "claw-shell",
  "commands",

@@ -27,6 +27,7 @@ mod git_context;
 pub mod goal;
 pub mod green_contract;
 pub mod history_search;
+pub mod knowledge_freshness;
 mod hooks;
 mod json;
 mod lane_events;

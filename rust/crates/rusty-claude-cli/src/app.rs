@@ -65,10 +65,9 @@ use crate::streaming::{
     build_system_blocks, collect_prompt_cache_events, collect_tool_results, collect_tool_uses,
     compact_tool_output_for_model, convert_messages, extract_system_messages, final_assistant_text,
     format_context_window_blocked_error, format_user_visible_api_error,
-    mark_last_tool_with_cache_control, permission_policy,
-    push_output_block, render_thinking_block_summary,
-    request_ends_with_tool_result, response_to_events, AnthropicRuntimeClient, HookAbortMonitor,
-    NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
+    mark_last_tool_with_cache_control, permission_policy, push_output_block,
+    render_thinking_block_summary, request_ends_with_tool_result, response_to_events,
+    AnthropicRuntimeClient, HookAbortMonitor, NETWORK_ERROR_KEYWORDS, POST_TOOL_STALL_TIMEOUT,
 };
 use crate::suggestion::{
     common_prefix_len, levenshtein_distance, looks_like_subcommand_typo, ranked_suggestions,
@@ -96,9 +95,9 @@ use crate::ultraplan::{
 use api::{
     detect_provider_kind, model_family_identity_for, model_requires_reasoning_content_in_history,
     model_token_limit, CacheControl, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock,
-    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock,
-    SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -664,6 +663,10 @@ impl LiveCli {
         // Tier S #1 Goal 持续驱动：从 `<cwd>/.claw/goal.json` 加载已持久化的 goal，
         // 恢复上次会话的 goal 状态。文件不存在或解析失败时为空管理器。
         let goal_manager = if let Ok(cwd) = env::current_dir() {
+            // workspace_root 对所有工具路径都需要(notebook_update/recall_full/
+            // subagent 等),且与 config 解析正交——config 解析失败时不应导致
+            // workspace_root 缺失。因此无条件设置,不嵌套在 loader.load() 分支内。
+            runtime.set_workspace_root(cwd.clone());
             let loader = ConfigLoader::default_for(&cwd);
             if let Ok(config) = loader.load() {
                 if let Some(poor) = config.feature_config().poor_mode() {
@@ -671,7 +674,6 @@ impl LiveCli {
                 }
                 // P3-1:从 settings.json `planMode` 控制 Plan/Execute/Review。
                 // 默认启用(true),CLI flag `--enable-plan-mode` 在 run_repl 中覆盖。
-                runtime.set_workspace_root(cwd.clone());
                 match config.feature_config().plan_mode() {
                     Some(true) => runtime.set_plan_mode_enabled(true),
                     Some(false) => runtime.set_plan_mode_enabled(false),
@@ -884,8 +886,7 @@ impl LiveCli {
         // REPL 路径:emit_output=true,consume_stream 写入 stdout,
         // spinner/println/print_status_bar 直接输出到终端。
         // TUI 路径请用 run_turn_tui(分离自原 tui_mode gating)。
-        let (mut runtime, hook_abort_monitor, _abort_signal) =
-            self.prepare_turn_runtime(true)?;
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -973,8 +974,7 @@ impl LiveCli {
     /// - 保存 `current_abort_signal` handle,让 TUI 层 Ctrl+C 能取消当前 turn。
     #[cfg(feature = "full-tui")]
     pub(crate) fn run_turn_tui(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor, abort_signal) =
-            self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, abort_signal) = self.prepare_turn_runtime(false)?;
         // TUI 中断支持：保存 abort signal handle，让 TUI 层 Ctrl+C 能取消当前 turn。
         self.current_abort_signal = Some(abort_signal.clone());
         let mut permission_prompter: Box<dyn runtime::PermissionPrompter> =
@@ -1294,6 +1294,47 @@ impl LiveCli {
                 }
                 false
             }
+            SlashCommand::Summary => {
+                let report =
+                    crate::session_mgr::render_session_summary_text(self.runtime.session());
+                if !self.tui_println(&report) {
+                    println!("{report}");
+                }
+                false
+            }
+            SlashCommand::Context { action } => {
+                // /context [clear]:仅支持查看;clear 提示使用 /clear。
+                if let Some(action) = action.as_deref() {
+                    let msg = if action == "clear" {
+                        "Context\n  Hint             use /clear to reset the session transcript"
+                            .to_string()
+                    } else {
+                        format!("Context\n  Unsupported action {action}")
+                    };
+                    if !self.tui_println(&msg) {
+                        println!("{msg}");
+                    }
+                    return Ok(false);
+                }
+                let report = crate::session_mgr::render_context_report(self.runtime.session());
+                if !self.tui_println(&report) {
+                    println!("{report}");
+                }
+                false
+            }
+            SlashCommand::Usage { .. } => {
+                let usage = self.runtime.usage();
+                let report = crate::session_mgr::render_usage_report(
+                    Some(&self.model),
+                    usage.cumulative_usage(),
+                    usage.current_turn_usage(),
+                    usage.turns(),
+                );
+                if !self.tui_println(&report) {
+                    println!("{report}");
+                }
+                false
+            }
             SlashCommand::Poor { action } => {
                 let (_, message) = handle_poor_mode_action(action.as_deref());
                 if !self.tui_println(&message) {
@@ -1351,7 +1392,10 @@ impl LiveCli {
                     }
                     Some("low") | Some("medium") | Some("high") => {
                         self.set_reasoning_effort(level.clone());
-                        format!("思考强度已设置为: {}", level.as_ref().expect("match arm guarantees Some"))
+                        format!(
+                            "思考强度已设置为: {}",
+                            level.as_ref().expect("match arm guarantees Some")
+                        )
                     }
                     Some(other) => {
                         format!(
@@ -1373,7 +1417,6 @@ impl LiveCli {
             | SlashCommand::Files
             | SlashCommand::Fast
             | SlashCommand::Exit
-            | SlashCommand::Summary
             | SlashCommand::Desktop
             | SlashCommand::Brief
             | SlashCommand::Advisor
@@ -1389,11 +1432,9 @@ impl LiveCli {
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
-            | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Branch { .. }
             | SlashCommand::Rewind { .. }
@@ -2715,10 +2756,7 @@ fn load_skill_catalog(cwd: &Path) -> Option<String> {
     // ConfigLoader::default_for is the same loader used by the main prompt
     // builder, so the toggle semantics match exactly.
     let config = runtime::ConfigLoader::default_for(cwd).load().ok()?;
-    if !config
-        .feature_config()
-        .skills_catalog_enabled_or_default()
-    {
+    if !config.feature_config().skills_catalog_enabled_or_default() {
         return None;
     }
 
@@ -2953,14 +2991,10 @@ pub(crate) fn build_runtime_with_plugin_state(
                 let path = entry.path();
                 if path.extension().and_then(|s| s.to_str()) == Some("json") {
                     match coordinator.restore_from_checkpoint(&path) {
-                        Ok(id) => eprintln!(
-                            "[restore] subagent {id} restored from {}",
-                            path.display()
-                        ),
-                        Err(e) => eprintln!(
-                            "[restore] failed to restore {}: {e}",
-                            path.display()
-                        ),
+                        Ok(id) => {
+                            eprintln!("[restore] subagent {id} restored from {}", path.display())
+                        }
+                        Err(e) => eprintln!("[restore] failed to restore {}: {e}", path.display()),
                     }
                 }
             }
@@ -3013,9 +3047,7 @@ pub(crate) fn build_runtime_with_plugin_state(
                 ));
             }
             Err(e) => {
-                eprintln!(
-                    "[startup] LlmJudgeGate skipped (judge client construction failed): {e}"
-                );
+                eprintln!("[startup] LlmJudgeGate skipped (judge client construction failed): {e}");
             }
         }
     }
@@ -3042,10 +3074,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     // - 构造失败(无 API key / 模型名无效)时跳过,不阻断启动
     //   (降级为 Heuristic,保证不丢决策)
     // - 用 budget 模型降低成本(提取任务对推理能力要求低于 judge)
-    match crate::llm_clients::DeepSeekDecisionExtractorClient::new(
-        &model_for_subagent,
-        Some(2048),
-    ) {
+    match crate::llm_clients::DeepSeekDecisionExtractorClient::new(&model_for_subagent, Some(2048))
+    {
         Ok(extractor) => {
             let extractor_client: std::sync::Arc<
                 dyn runtime::decision_log::DecisionExtractorClient,
@@ -3066,9 +3096,127 @@ pub(crate) fn build_runtime_with_plugin_state(
             );
         }
         Err(e) => {
+            eprintln!("[startup] DecisionExtractorClient skipped (construction failed): {e}");
+        }
+    }
+
+    // 知识新鲜度门控(Phase 1):注入全局 ResearchClient。
+    //
+    // 注入后,DAG 任务的 Novel 类(新版本/新论文)在派发前会触发联网调研
+    // (WebSearch + WebFetch + LLM 摘要),摘要注入 system prompt,避免
+    // 模型用过时参数知识自信地错答。Stable/Evolving 类不调研,零成本。
+    //
+    // 设计要点(镜像 DecisionExtractorClient 注入模式):
+    // - 用 budget 模型(摘要任务对推理能力要求低,降成本)
+    // - max_tokens=2048(摘要输出上限)
+    // - OnceLock 进程级单例,重复注册静默忽略
+    // - 构造失败(无 API key)时跳过,降级为不调研(不阻塞任务)
+    // - 网络失败/超时由 gate_task 降级为 None(不阻塞任务)
+    match crate::llm_clients::WebResearchClient::new(&model_for_subagent, Some(2048)) {
+        Ok(researcher) => {
+            let research_client: std::sync::Arc<
+                dyn runtime::knowledge_freshness::ResearchClient,
+            > = std::sync::Arc::new(researcher);
+            runtime::knowledge_freshness::set_global_research_client(research_client);
+        }
+        Err(e) => {
+            eprintln!("[startup] ResearchClient skipped (construction failed): {e}");
+        }
+    }
+
+    // 知识新鲜度门控(Phase 2.1):注入全局 FreshnessAssessor。
+    //
+    // 注入后,关键词评估为 Evolving(不确定)的任务会调 flash 模型做语义细化,
+    // 区分"看似 Evolving 实则 Novel"(如冷门库新版本)和"确实 Stable"(如通用重构)。
+    // Novel/Stable(强信号)不调 LLM,零额外成本。
+    //
+    // 设计要点:
+    // - 用 budget 模型(评估任务对推理能力要求低,降成本)
+    // - max_tokens=256(只返回 JSON,不需要长输出)
+    // - OnceLock 进程级单例,重复注册静默忽略
+    // - 构造失败(无 API key)时跳过,降级为纯关键词评估(不阻塞任务)
+    match crate::llm_clients::DeepSeekFreshnessAssessor::new(&model_for_subagent, Some(256)) {
+        Ok(assessor) => {
+            let assessor_client: std::sync::Arc<
+                dyn runtime::knowledge_freshness::FreshnessAssessor,
+            > = std::sync::Arc::new(assessor);
+            runtime::knowledge_freshness::set_global_freshness_assessor(assessor_client);
+        }
+        Err(e) => {
+            eprintln!("[startup] FreshnessAssessor skipped (construction failed): {e}");
+        }
+    }
+
+    // 知识新鲜度门控(Phase 2.3):注入全局 QueryBuilderClient。
+    //
+    // 注入后,Novel 任务(需调研)的搜索查询由 LLM 从任务文本提取关键实体构建,
+    // 而非启发式截取前 200 字符。提升搜索命中率,调研摘要质量更高。
+    // LLM 提取失败时降级回启发式 build_research_query。
+    //
+    // 设计要点:
+    // - 用 budget 模型(提取任务对推理能力要求低,降成本)
+    // - max_tokens=128(只返回关键词,不需要长输出)
+    // - OnceLock 进程级单例,重复注册静默忽略
+    // - 构造失败(无 API key)时跳过,降级为启发式查询(不阻塞任务)
+    match crate::llm_clients::DeepSeekQueryBuilderClient::new(&model_for_subagent, Some(128)) {
+        Ok(builder) => {
+            let builder_client: std::sync::Arc<
+                dyn runtime::knowledge_freshness::QueryBuilderClient,
+            > = std::sync::Arc::new(builder);
+            runtime::knowledge_freshness::set_global_query_builder(builder_client);
+        }
+        Err(e) => {
+            eprintln!("[startup] QueryBuilderClient skipped (construction failed): {e}");
+        }
+    }
+
+    // v1.0 LLM context editing:注入全局 CompactionSummarizerClient。
+    //
+    // 注入后,context compaction(`compact_session_with_trigger` →
+    // `summarize_messages_with_llm`)会调用 LLM 生成模型摘要(语义压缩),
+    // 而非纯启发式规则摘要;失败/未注入自动降级回启发式,不阻塞压缩。
+    //
+    // 设计要点:
+    // - 用 budget 模型(与 decision extractor 同款),控制压缩成本
+    // - max_tokens=2048(摘要输出通常足够)
+    // - OnceLock 进程级单例,重复注册静默忽略
+    // - 构造失败(无 API key)时跳过,启动不失败
+    match crate::llm_clients::DeepSeekCompactionSummarizerClient::new(
+        &model_for_subagent,
+        Some(2048),
+    ) {
+        Ok(summarizer) => {
+            let summarizer_client: std::sync::Arc<
+                dyn runtime::compact::CompactionSummarizerClient,
+            > = std::sync::Arc::new(summarizer);
+            runtime::compact::set_global_compaction_summarizer_client(summarizer_client);
             eprintln!(
-                "[startup] DecisionExtractorClient skipped (construction failed): {e}"
+                "[startup] LLM compaction summarizer registered (model: {model_for_subagent})"
             );
+        }
+        Err(e) => {
+            eprintln!("[startup] CompactionSummarizerClient skipped (construction failed): {e}");
+        }
+    }
+
+    // D1.0 LLM-driven planning:注入全局 PlanGeneratorClient。
+    //
+    // 注入后,复杂任务(plan_mode + assess_complexity==Complex)由模型生成
+    // 计划步骤(JSON),失败/未注入自动回退启发式 decompose_task。
+    //
+    // 设计要点:
+    // - 复用主模型(与 decision extractor 同款策略,避免引入新配置项)
+    // - max_tokens=2048(计划 JSON 通常足够)
+    // - OnceLock 进程级单例,构造失败跳过,不阻断启动
+    match crate::llm_clients::DeepSeekPlanGeneratorClient::new(&model_for_subagent, Some(2048)) {
+        Ok(planner_client) => {
+            let planner_client: std::sync::Arc<dyn runtime::planner::PlanGeneratorClient> =
+                std::sync::Arc::new(planner_client);
+            runtime::planner::set_global_plan_generator_client(planner_client);
+            eprintln!("[startup] LLM plan generator registered (model: {model_for_subagent})");
+        }
+        Err(e) => {
+            eprintln!("[startup] PlanGeneratorClient skipped (construction failed): {e}");
         }
     }
 
@@ -3089,13 +3237,10 @@ pub(crate) fn build_runtime_with_plugin_state(
             false, // emit_output
             None,  // allowed_tools
             tool_registry.clone(),
-            None,  // progress_reporter
+            None, // progress_reporter
         )?;
-        runtime = runtime.with_dag_coordinator(
-            coordinator_arc,
-            subagent_api_client,
-            workspace_root,
-        );
+        runtime =
+            runtime.with_dag_coordinator(coordinator_arc, subagent_api_client, workspace_root);
     }
 
     // v0.2 生产接入:把 CoordinatorExecutor 注入 tools 层全局 registry,

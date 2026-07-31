@@ -506,6 +506,9 @@ mod tests {
             ..ProxyConfig::default()
         };
         let result = build_http_client_with_opts(&config, &TimeoutConfig::default());
-        assert!(result.is_ok(), "build should succeed with keepalive + proxy");
+        assert!(
+            result.is_ok(),
+            "build should succeed with keepalive + proxy"
+        );
     }
 }

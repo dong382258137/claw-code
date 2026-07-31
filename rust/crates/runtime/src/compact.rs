@@ -1,6 +1,7 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
@@ -10,6 +11,155 @@ const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from 
 
 const COMPACT_BOUNDARY_MARKER_PREFIX: &str = "<!-- compact_boundary: ";
 const COMPACT_BOUNDARY_MARKER_SUFFIX: &str = " -->";
+
+/// LLM 摘要 client — 由上层 CLI 注入,使 context compaction 生成
+/// **模型摘要**而非纯启发式规则摘要(context editing 的核心能力)。
+///
+/// 同步 trait(与 `decision_log::DecisionExtractorClient` 同构),生产实现
+/// (`rusty-claude-cli::llm_clients::DeepSeekCompactionSummarizerClient`)
+/// 内部用独立 tokio runtime + ProviderClient 桥接异步 API。
+///
+/// 未注册或调用失败时,[`summarize_messages_with_llm`] 自动降级为启发式,
+/// 保证压缩永不因 LLM 故障阻塞。
+pub trait CompactionSummarizerClient: Send + Sync {
+    /// 输入压缩 prompt,返回模型生成的摘要文本(自由格式文本,建议项目符号)。
+    fn summarize(&self, prompt: &str) -> Result<String, String>;
+}
+
+/// 全局压缩摘要 client(OnceLock,进程级单例)。
+///
+/// 设计镜像 `decision_log::GLOBAL_DECISION_EXTRACTOR`:
+/// - 通过 [`set_global_compaction_summarizer_client`] 在进程启动时注入
+/// - 未注册时 `summarize_messages_with_llm` 走纯启发式(零 LLM 成本)
+static GLOBAL_COMPACTION_SUMMARIZER: OnceLock<Option<Arc<dyn CompactionSummarizerClient>>> =
+    OnceLock::new();
+
+/// 注册全局压缩摘要 client(进程级单例,重复注册静默忽略)。
+pub fn set_global_compaction_summarizer_client(client: Arc<dyn CompactionSummarizerClient>) {
+    let _ = GLOBAL_COMPACTION_SUMMARIZER.set(Some(client));
+}
+
+/// 是否已注册压缩摘要 client(供诊断/命令展示使用)。
+#[must_use]
+pub fn is_compaction_summarizer_registered() -> bool {
+    GLOBAL_COMPACTION_SUMMARIZER
+        .get()
+        .is_some_and(|slot| slot.is_some())
+}
+
+fn global_compaction_summarizer() -> Option<Arc<dyn CompactionSummarizerClient>> {
+    GLOBAL_COMPACTION_SUMMARIZER
+        .get()
+        .and_then(|slot| slot.clone())
+}
+
+/// 构建 LLM 压缩 prompt — 把待压缩消息渲染成精简转录 + 摘要指令。
+///
+/// 转录复用 [`summarize_block`] 的逐块摘要(每条消息一行),控制 prompt 体积;
+/// 指令要求输出项目符号形式的要点,保证 [`merge_compact_summaries`]
+/// 能通过 [`extract_summary_highlights`] 提取到内容。
+fn build_llm_summarize_prompt(messages: &[ConversationMessage]) -> String {
+    let mut transcript = Vec::new();
+    for (idx, message) in messages.iter().enumerate() {
+        let role = match message.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        let content = message
+            .blocks
+            .iter()
+            .map(summarize_block)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        transcript.push(format!("{idx}. {role}: {content}"));
+    }
+    format!(
+        "You are a session-compaction summarizer. The following lines are a condensed transcript \
+         of an earlier portion of a coding-assistant conversation (roles: user / assistant / tool).\n\
+         \n\
+         {}\n\
+         \n\
+         Write a concise but information-dense summary that lets the assistant continue the task \
+         without the original transcript. Requirements:\n\
+         - Cover: the user's goals and recent requests, what was implemented/decided, key file \
+         paths touched, tool calls that matter, and any pending work.\n\
+         - Output plain bullet lines, one per point, each starting with \"- \".\n\
+         - Do NOT wrap in <summary> tags, do NOT add a \"- Key timeline:\" header, do not include \
+         per-message trivia. Keep it under 60 lines.\n\
+         - Preserve Chinese/English content verbatim where it matters (identifiers, file paths).",
+        transcript.join("\n")
+    )
+}
+
+/// 把模型自由格式输出规范化为 `<summary>` 块,保证下游
+/// [`merge_compact_summaries`] / [`compress_summary_text`] 能正确解析。
+fn sanitize_llm_summary(text: &str) -> String {
+    let body = text
+        .trim()
+        .trim_start_matches("<summary>")
+        .trim_end_matches("</summary>")
+        .trim();
+    let mut lines = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // 确保每行是 bullet,否则 extract_summary_highlights 提取不到。
+        if line.starts_with("- ") {
+            lines.push(line.to_string());
+        } else {
+            lines.push(format!("- {line}"));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("- (LLM summary returned empty content)".to_string());
+    }
+    format!(
+        "<summary>\nConversation summary:\n{}\n</summary>",
+        lines.join("\n")
+    )
+}
+
+/// 生成待压缩消息的摘要 — **LLM 优先,启发式兜底**。
+///
+/// 从全局注册表取 client;未注册 / 调用失败 / 返回空 → 回退
+/// [`summarize_messages`] 启发式规则摘要。
+fn summarize_messages_with_llm(messages: &[ConversationMessage]) -> String {
+    summarize_messages_with_client(messages, global_compaction_summarizer().as_deref())
+}
+
+/// 带显式 client 的摘要生成(测试可注入 fake client,生产走全局注册表)。
+fn summarize_messages_with_client(
+    messages: &[ConversationMessage],
+    client: Option<&dyn CompactionSummarizerClient>,
+) -> String {
+    if let Some(client) = client {
+        let prompt = build_llm_summarize_prompt(messages);
+        match client.summarize(&prompt) {
+            Ok(text) if !text.trim().is_empty() => return sanitize_llm_summary(&text),
+            Ok(_) => {
+                eprintln!(
+                    "[compact] LLM summarizer returned empty output; falling back to heuristic"
+                );
+            }
+            Err(e) => {
+                eprintln!("[compact] LLM summarizer failed ({e}); falling back to heuristic");
+            }
+        }
+    }
+    summarize_messages(messages)
+}
+
+/// 为整段会话生成摘要(不压缩,不删除消息)— 供 `/summary` 命令等展示用途。
+///
+/// 同样走 LLM 优先、启发式兜底,输出为 `<summary>` 块文本。
+#[must_use]
+pub fn render_session_summary(session: &Session) -> String {
+    summarize_messages_with_llm(&session.messages)
+}
 
 /// Identifies what triggered a compaction pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,8 +381,10 @@ pub fn compact_session_with_trigger(
     };
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
-    let merged_summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    // LLM 优先摘要(context editing):已注册 CompactionSummarizerClient 时
+    // 走模型摘要(语义压缩),未注册/失败回退启发式 summarize_messages。
+    let new_summary = summarize_messages_with_llm(removed);
+    let merged_summary = merge_compact_summaries(existing_summary.as_deref(), &new_summary);
     // Compress the merged summary to bound its size (max 1200 chars / 24 lines by
     // default). Without this, repeated compactions accumulate highlights and the
     // summary grows unbounded, wasting tokens every subsequent turn.
@@ -918,7 +1070,7 @@ mod tests {
         extract_compact_boundary, format_compact_summary, format_tool_result_summary,
         get_compact_continuation_message, get_messages_after_compact_boundary, infer_pending_work,
         is_already_summarized, merge_compact_summaries, microcompact, should_compact,
-        CompactBoundary, CompactTrigger, CompactionConfig,
+        CompactBoundary, CompactTrigger, CompactionConfig, CompactionSummarizerClient,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -938,6 +1090,107 @@ mod tests {
         assert_eq!(result.compacted_session, session);
         assert!(result.summary.is_empty());
         assert!(result.formatted_summary.is_empty());
+    }
+
+    /// 假 client — 返回固定摘要;可配置 Err 模拟故障。
+    struct FakeSummarizer {
+        result: Result<String, String>,
+    }
+    impl CompactionSummarizerClient for FakeSummarizer {
+        fn summarize(&self, _prompt: &str) -> Result<String, String> {
+            self.result.clone()
+        }
+    }
+
+    #[test]
+    fn llm_summarizer_used_when_client_present() {
+        // 注入 fake client 后,摘要应来自 LLM(含 fake 文本),
+        // 而非启发式(不含 "Scope:" 统计行)。
+        let messages = vec![
+            ConversationMessage::user_text("please refactor the auth module"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "I will split it into two files".to_string(),
+            }]),
+        ];
+        let client = FakeSummarizer {
+            result: Ok("- implemented auth split
+- pending: run tests"
+                .to_string()),
+        };
+        let summary = super::summarize_messages_with_client(&messages, Some(&client));
+        let rendered = super::format_compact_summary(&summary);
+        assert!(
+            rendered.contains("implemented auth split"),
+            "LLM summary should be used: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Scope:"),
+            "heuristic summary should NOT be used: {rendered}"
+        );
+        // 规范化为 bullet,merge 阶段能提取。
+        let highlights = super::extract_summary_highlights(&summary);
+        assert!(highlights.iter().any(|h| h.contains("pending: run tests")));
+    }
+
+    #[test]
+    fn llm_summarizer_falls_back_to_heuristic_on_error() {
+        let messages = vec![
+            ConversationMessage::user_text("please refactor the auth module"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "I will split it into two files".to_string(),
+            }]),
+        ];
+        let client = FakeSummarizer {
+            result: Err("api down".to_string()),
+        };
+        let summary = super::summarize_messages_with_client(&messages, Some(&client));
+        // 失败回退启发式 — 含 "Scope:" 统计行。
+        assert!(
+            summary.contains("Scope:"),
+            "should fall back to heuristic: {summary}"
+        );
+    }
+
+    #[test]
+    fn llm_summarizer_falls_back_to_heuristic_on_empty_output() {
+        let messages = vec![ConversationMessage::user_text("hi")];
+        let client = FakeSummarizer {
+            result: Ok("   
+  "
+            .to_string()),
+        };
+        let summary = super::summarize_messages_with_client(&messages, Some(&client));
+        assert!(
+            summary.contains("Scope:"),
+            "empty LLM output should fall back: {summary}"
+        );
+    }
+
+    #[test]
+    fn sanitize_llm_summary_normalizes_freeform_text_to_bullets() {
+        let out = super::sanitize_llm_summary(
+            "plain line one
+- already bullet
+
+second para",
+        );
+        let highlights = super::extract_summary_highlights(&out);
+        assert_eq!(highlights.len(), 3);
+        assert!(highlights[0].contains("plain line one"));
+        assert!(highlights[1].contains("already bullet"));
+        assert!(highlights[2].contains("second para"));
+    }
+
+    #[test]
+    fn llm_summarize_prompt_contains_transcript_and_instructions() {
+        let messages = vec![ConversationMessage::user_text("fix the bug in parser.rs")];
+        let prompt = super::build_llm_summarize_prompt(&messages);
+        assert!(
+            prompt.contains("parser.rs"),
+            "transcript should be in prompt"
+        );
+        assert!(prompt.contains("session-compaction summarizer"));
+        assert!(prompt.contains("- "), "instructions should mention bullets");
     }
 
     #[test]

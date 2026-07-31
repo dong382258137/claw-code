@@ -490,6 +490,22 @@ impl SystemPromptBuilder {
                 sections.push(section);
             }
         }
+        // Plan mode constraint: when plan_mode is enabled (default), inject a
+        // hard constraint forcing the model to invoke `brainstorming` and
+        // `writing-plans` skills before producing any design/plan for complex
+        // tasks. Simple tasks (assess_complexity != Complex) never trigger
+        // PlanArtifact creation, so the constraint is inert for them — zero
+        // cost for small tasks, enforced for complex ones.
+        //
+        // The constraint text intentionally contains NO detailed checklist —
+        // the 9-item implementation-feasibility review lives in the skills'
+        // Self-Review sections (A). This keeps the prompt minimal (C's job is
+        // to force-trigger the skills, not duplicate their content).
+        if let Some(config) = &self.config {
+            if config.feature_config().plan_mode().unwrap_or(true) {
+                sections.push(render_plan_mode_constraint_section());
+            }
+        }
         sections.extend(self.append_sections.iter().cloned());
         sections
     }
@@ -1367,6 +1383,22 @@ fn render_skill_catalog_section(catalog: &str) -> String {
          \n\
          {trimmed}"
     )
+}
+
+/// Render the Plan Mode constraint section injected into the dynamic region
+/// when `plan_mode` is enabled.
+///
+/// This is the "C" component of the C+A combo: a minimal hard constraint that
+/// forces the model to invoke `brainstorming` and `writing-plans` skills before
+/// producing any design or plan for complex tasks. The detailed 9-item
+/// implementation-feasibility review lives in the skills' Self-Review sections
+/// (component A), not here — keeping the prompt minimal and avoiding
+/// duplication.
+fn render_plan_mode_constraint_section() -> String {
+    "## Plan Mode Constraints (active)\n\
+     当前处于 Plan 模式。生成方案/计划前**必须**先调用 `brainstorming` skill,\n\
+     生成后**必须**调用 `writing-plans` skill 的 Self-Review 流程(含代码事实核查\n\
+     与实现可行性推演)。未调用 skill 的方案不得进入 Execute 阶段。".to_string()
 }
 
 #[cfg(test)]
@@ -2291,10 +2323,11 @@ mod tests {
     #[test]
     fn skill_catalog_not_injected_when_not_set() {
         let sections = SystemPromptBuilder::new().build();
-        let has_catalog = sections
-            .iter()
-            .any(|s| s.contains("## Available Skills"));
-        assert!(!has_catalog, "no catalog section when skill_catalog is None");
+        let has_catalog = sections.iter().any(|s| s.contains("## Available Skills"));
+        assert!(
+            !has_catalog,
+            "no catalog section when skill_catalog is None"
+        );
     }
 
     #[test]
@@ -2302,9 +2335,7 @@ mod tests {
         let sections = SystemPromptBuilder::new()
             .with_skill_catalog("   \n  \n")
             .build();
-        let has_catalog = sections
-            .iter()
-            .any(|s| s.contains("## Available Skills"));
+        let has_catalog = sections.iter().any(|s| s.contains("## Available Skills"));
         assert!(!has_catalog, "empty/whitespace catalog should be skipped");
     }
 
@@ -2335,5 +2366,82 @@ mod tests {
             static_without, static_with,
             "static region must be unaffected by catalog injection"
         );
+    }
+
+    // ── Plan mode constraint injection tests (C component) ──
+
+    #[test]
+    fn plan_mode_constraint_injected_when_config_present_and_default() {
+        // RuntimeConfig::empty() has plan_mode = None, which unwrap_or(true)
+        // treats as enabled → constraint should be injected.
+        let config = crate::config::RuntimeConfig::empty();
+        let sections = SystemPromptBuilder::new()
+            .with_runtime_config(config)
+            .build();
+        let has_constraint = sections
+            .iter()
+            .any(|s| s.contains("## Plan Mode Constraints (active)"));
+        assert!(
+            has_constraint,
+            "plan mode constraint should be injected when config is present and plan_mode is default (None→true)"
+        );
+        // Constraint must be in dynamic region (after boundary).
+        let boundary_idx = sections
+            .iter()
+            .position(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("boundary should exist");
+        let constraint_idx = sections
+            .iter()
+            .position(|s| s.contains("## Plan Mode Constraints (active)"))
+            .expect("constraint section should be present");
+        assert!(
+            constraint_idx > boundary_idx,
+            "plan mode constraint must be in dynamic region (after boundary)"
+        );
+    }
+
+    #[test]
+    fn plan_mode_constraint_not_injected_when_no_config() {
+        // No config set → no plan_mode check → no constraint.
+        let sections = SystemPromptBuilder::new().build();
+        let has_constraint = sections
+            .iter()
+            .any(|s| s.contains("## Plan Mode Constraints (active)"));
+        assert!(
+            !has_constraint,
+            "plan mode constraint should NOT be injected when no config is set"
+        );
+    }
+
+    #[test]
+    fn plan_mode_constraint_does_not_perturb_static_region() {
+        // Both builders have the same config (so same static region);
+        // the only difference is plan_mode constraint injection in dynamic.
+        // We can't easily construct a Some(false) config (private field),
+        // so instead verify the constraint appears AFTER the boundary,
+        // and that the static region (before boundary) is unaffected by
+        // the presence of the constraint section (it's purely dynamic).
+        let sections = SystemPromptBuilder::new()
+            .with_runtime_config(crate::config::RuntimeConfig::empty())
+            .build();
+        let boundary_idx = sections
+            .iter()
+            .position(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("boundary");
+        let constraint_idx = sections
+            .iter()
+            .position(|s| s.contains("## Plan Mode Constraints (active)"))
+            .expect("constraint section should be present");
+        assert!(
+            constraint_idx > boundary_idx,
+            "constraint must be after boundary (dynamic region), got boundary={boundary_idx} constraint={constraint_idx}"
+        );
+        // Static region should not contain the constraint text.
+        for (i, section) in sections[..boundary_idx].iter().enumerate() {
+            assert!(
+                !section.contains("Plan Mode Constraints"),
+                "static section {i} should not contain plan mode constraint text"
+            );
+        }
     }
 }

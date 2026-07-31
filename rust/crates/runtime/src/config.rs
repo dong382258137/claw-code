@@ -468,7 +468,10 @@ impl ConfigLoader {
             slop_scan: None,
             completion_verify: None,
             skills_catalog_enabled: parse_optional_bool(&merged_value, "skillsCatalogEnabled"),
-            skills_tool_search_enabled: parse_optional_bool(&merged_value, "skillsToolSearchEnabled"),
+            skills_tool_search_enabled: parse_optional_bool(
+                &merged_value,
+                "skillsToolSearchEnabled",
+            ),
         };
 
         Ok(RuntimeConfig {
@@ -1888,7 +1891,10 @@ mod tests {
         assert_eq!(chain.primary(), Some("deepseek-v4-pro"));
         assert_eq!(
             chain.fallbacks(),
-            &["deepseek-v4-flash".to_string(), "deepseek-v4-flash".to_string()]
+            &[
+                "deepseek-v4-flash".to_string(),
+                "deepseek-v4-flash".to_string()
+            ]
         );
         assert!(!chain.is_empty());
 

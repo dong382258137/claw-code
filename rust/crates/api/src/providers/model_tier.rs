@@ -4,8 +4,8 @@
 //! 范围：deepseek-v4-pro/flash 双模型路由。
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// 模型能力层级（粗粒度，用于任务路由）。
 /// Ord: Budget < Standard < Flagship（声明顺序映射到 Ord 值）。
@@ -212,7 +212,10 @@ mod tests {
         assert_eq!(tier_for_model("deepseek-v4-pro"), ModelTier::Flagship);
         assert_eq!(tier_for_model("deepseek-v4-flash"), ModelTier::Budget);
         // Prefixed forms
-        assert_eq!(tier_for_model("deepseek/deepseek-v4-pro"), ModelTier::Flagship);
+        assert_eq!(
+            tier_for_model("deepseek/deepseek-v4-pro"),
+            ModelTier::Flagship
+        );
         assert_eq!(
             tier_for_model("deepseek/deepseek-v4-flash"),
             ModelTier::Budget
@@ -225,10 +228,7 @@ mod tests {
     #[test]
     fn task_complexity_min_tiers() {
         assert_eq!(TaskComplexity::Simple.min_tier(), ModelTier::Budget);
-        assert_eq!(
-            TaskComplexity::Diagnostic.min_tier(),
-            ModelTier::Flagship
-        );
+        assert_eq!(TaskComplexity::Diagnostic.min_tier(), ModelTier::Flagship);
         assert_eq!(
             TaskComplexity::Architectural.min_tier(),
             ModelTier::Flagship

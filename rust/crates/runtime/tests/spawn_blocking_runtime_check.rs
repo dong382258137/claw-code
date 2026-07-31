@@ -11,11 +11,9 @@ async fn spawn_blocking_try_current_returns_ok() {
     assert!(Handle::try_current().is_ok());
 
     // spawn_blocking 闭包内是否仍能检测到 runtime?
-    let in_runtime = tokio::task::spawn_blocking(|| {
-        Handle::try_current().is_ok()
-    })
-    .await
-    .expect("spawn_blocking should not panic");
+    let in_runtime = tokio::task::spawn_blocking(|| Handle::try_current().is_ok())
+        .await
+        .expect("spawn_blocking should not panic");
 
     // 关键断言:如果 spawn_blocking 保留 runtime 上下文,这里为 true
     // 这就是 client.stream() 内部 runtime.block_on 触发 panic 的根因

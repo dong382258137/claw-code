@@ -1211,14 +1211,12 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
-                } => {
-                    Some(json!({
-                        "role": "tool",
-                        "tool_call_id": tool_use_id,
-                        "content": flatten_tool_result_content(content),
-                        "is_error": is_error,
-                    }))
-                }
+                } => Some(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_use_id,
+                    "content": flatten_tool_result_content(content),
+                    "is_error": is_error,
+                })),
                 InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
@@ -1740,11 +1738,7 @@ mod tests {
             "deepseek/deepseek-v4-pro",
             "deepseek/deepseek-v4-flash",
         ];
-        let negative = [
-            "deepseek-reasoner",
-            "deepseek-chat",
-            "unknown-model",
-        ];
+        let negative = ["deepseek-reasoner", "deepseek-chat", "unknown-model"];
 
         // When checking whether history reasoning_content is required.
         // Then only DeepSeek V4 variants require it.

@@ -276,6 +276,12 @@ pub struct DecisionRecord {
     pub tags: Vec<String>,
     pub verification_result: String,
     pub verification_evidence: Option<String>,
+    /// 知识来源标签(Phase 1 知识新鲜度门控)。
+    ///
+    /// 值:"parametric"(参数记忆)/ "web_research"(联网调研)/ "unknown"(未门控)。
+    /// 由 `NodeResult.gated.knowledge_source()` 映射,反映该决策基于何种知识。
+    /// 缺失时(旧 JSON / 未门控路径)默认 "unknown"。
+    pub knowledge_source: String,
 }
 
 impl DecisionRecord {
@@ -340,6 +346,12 @@ impl DecisionRecord {
             .and_then(|v| v.as_str())
             .map(ToString::to_string);
 
+        let knowledge_source = parsed
+            .get("knowledge_source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
         Ok(Self {
             session_id,
             problem_signature,
@@ -349,6 +361,7 @@ impl DecisionRecord {
             tags,
             verification_result,
             verification_evidence,
+            knowledge_source,
         })
     }
 }
@@ -428,8 +441,9 @@ impl DecisionLog {
             "INSERT INTO decisions (
                 session_id, timestamp_ms, problem_signature, root_cause_hypothesis,
                 applied_solution, affected_files, verification_result,
-                verification_evidence, context_hash, similarity_hash, tags
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                verification_evidence, context_hash, similarity_hash, tags,
+                knowledge_source
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 record.session_id,
                 timestamp_ms,
@@ -442,6 +456,7 @@ impl DecisionLog {
                 context_hash,
                 similarity_hash,
                 tags_str,
+                record.knowledge_source,
             ],
         )?;
 
@@ -470,7 +485,7 @@ impl DecisionLog {
                     d.root_cause_hypothesis, d.applied_solution,
                     d.affected_files, d.verification_result, d.verified_at_ms,
                     d.verify_count, d.success_rate, d.use_count,
-                    d.tags, d.similarity_hash,
+                    d.tags, d.similarity_hash, d.knowledge_source,
                     rank
              FROM decisions d
              JOIN decisions_fts fts ON d.id = fts.rowid
@@ -497,7 +512,8 @@ impl DecisionLog {
                     use_count: row.get(11)?,
                     tags: row.get(12)?,
                     similarity_hash: row.get::<_, i64>(13)? as u64,
-                    rank: row.get(14)?,
+                    knowledge_source: row.get(14)?,
+                    rank: row.get(15)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -547,6 +563,8 @@ impl DecisionLog {
                     output.push_str(&format!("   tags: {}\n", tags));
                 }
             }
+            // Phase 2.2:显示知识来源,让 LLM 知道该决策基于参数记忆还是联网调研
+            output.push_str(&format!("   source: {}\n", hit.knowledge_source));
             output.push_str(&format!(
                 "   files: {}\n\n",
                 truncate_str(&hit.affected_files, 200)
@@ -554,6 +572,57 @@ impl DecisionLog {
         }
 
         output.push_str("Use log_decision to record new decisions after verification.");
+        Ok(output)
+    }
+
+    /// Phase 2.2:按知识来源(knowledge_source)分组统计决策成功率。
+    ///
+    /// 用于闭环校准:对比 "web_research"(查来的方子)与 "parametric"(背出来的方子)
+    /// 的平均 success_rate,反向评估知识新鲜度门控的有效性。
+    /// 若 web_research 的成功率显著高于 parametric,说明门控有效;
+    /// 若无差异或更低,说明调研质量不佳,需调整 build_research_query 或 assessor 阈值。
+    ///
+    /// # 输出格式
+    /// ```text
+    /// Knowledge source statistics:
+    ///   parametric:      12 decisions, avg success_rate=62.5%
+    ///   web_research:     5 decisions, avg success_rate=85.0%
+    ///   deferred_research: 2 decisions, avg success_rate=40.0%
+    ///   unknown:          1 decisions, avg success_rate=50.0%
+    /// ```
+    pub fn stats_by_knowledge_source(&self) -> Result<String, DecisionLogError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut stmt = conn.prepare(
+            "SELECT knowledge_source,
+                    COUNT(*) as count,
+                    AVG(success_rate) as avg_rate
+             FROM decisions
+             GROUP BY knowledge_source
+             ORDER BY count DESC",
+        )?;
+
+        let rows: Vec<(String, i64, f64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if rows.is_empty() {
+            return Ok("No decisions logged yet.".to_string());
+        }
+
+        let mut output = String::from("Knowledge source statistics:\n");
+        for (source, count, avg_rate) in &rows {
+            output.push_str(&format!(
+                "  {source:<20} {count} decisions, avg success_rate={avg_rate:.1}%\n"
+            ));
+        }
         Ok(output)
     }
 
@@ -767,6 +836,8 @@ struct SearchHit {
     use_count: i64,
     tags: Option<String>,
     similarity_hash: u64,
+    /// Phase 2.2:知识来源(parametric/web_research/deferred_research/unknown)。
+    knowledge_source: String,
     #[allow(dead_code)]
     rank: f64,
 }
@@ -791,6 +862,16 @@ fn migrate_schema(conn: &Connection) -> Result<(), DecisionLogError> {
         conn.execute_batch(CREATE_FTS_V2)?;
         conn.execute_batch(CREATE_TRIGGERS_V2)?;
         conn.execute("PRAGMA user_version = 2", [])?;
+    }
+
+    if version < 3 {
+        // Phase 1 知识新鲜度门控:加 knowledge_source 列。
+        // ALTER TABLE ADD COLUMN 带默认值,旧数据自动填 "unknown"。
+        // 新列不参与 FTS5 索引(非搜索字段),无需重建触发器。
+        conn.execute_batch(
+            "ALTER TABLE decisions ADD COLUMN knowledge_source TEXT NOT NULL DEFAULT 'unknown';",
+        )?;
+        conn.execute("PRAGMA user_version = 3", [])?;
     }
 
     Ok(())
@@ -867,8 +948,9 @@ pub trait DecisionExtractorClient: Send + Sync {
 /// `global_decision_extractor_client()` 获取并调用。
 ///
 /// 未注入时 LlmExtract 降级为 Heuristic(零成本回退)。
-static GLOBAL_DECISION_EXTRACTOR: std::sync::OnceLock<Option<std::sync::Arc<dyn DecisionExtractorClient>>> =
-    std::sync::OnceLock::new();
+static GLOBAL_DECISION_EXTRACTOR: std::sync::OnceLock<
+    Option<std::sync::Arc<dyn DecisionExtractorClient>>,
+> = std::sync::OnceLock::new();
 
 /// 注册全局决策提取 client(v2 §10.5 Epic 6)。
 ///
@@ -890,10 +972,9 @@ pub fn is_decision_extractor_client_registered() -> bool {
 }
 
 /// 获取全局决策提取 client(若已注册)。
-fn global_decision_extractor_client() -> Option<&'static std::sync::Arc<dyn DecisionExtractorClient>> {
-    GLOBAL_DECISION_EXTRACTOR
-        .get()
-        .and_then(|opt| opt.as_ref())
+fn global_decision_extractor_client() -> Option<&'static std::sync::Arc<dyn DecisionExtractorClient>>
+{
+    GLOBAL_DECISION_EXTRACTOR.get().and_then(|opt| opt.as_ref())
 }
 
 /// 启发式决策检测关键词(中英文,§4.7)。
@@ -998,7 +1079,9 @@ pub fn extract_decisions_before_compaction(
             //
             // 降级策略:若未注册全局 client,回退到 Heuristic(零成本,不阻塞 compaction)
             match global_decision_extractor_client() {
-                Some(client) => extract_decisions_with_llm(messages, model, client.as_ref(), session_id),
+                Some(client) => {
+                    extract_decisions_with_llm(messages, model, client.as_ref(), session_id)
+                }
                 None => {
                     eprintln!(
                         "[decision_log] LlmExtract strategy requested but no global client registered — \
@@ -1159,8 +1242,8 @@ fn parse_llm_decision_json(
     let json_array = extract_json_array(json_str)?;
 
     // 3. 解析为 Vec<RawDecision>
-    let raw_decisions: Vec<RawDecision> = serde_json::from_str(json_array)
-        .map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let raw_decisions: Vec<RawDecision> =
+        serde_json::from_str(json_array).map_err(|e| format!("JSON 解析失败: {e}"))?;
 
     // 4. 逐条转换 + 截断
     let mut decisions = Vec::new();
@@ -1213,7 +1296,9 @@ fn strip_markdown_code_block(s: &str) -> &str {
 
 /// 从文本中提取首个 JSON 数组(从 `[` 到匹配的 `]`)。
 fn extract_json_array(s: &str) -> Result<&str, String> {
-    let start = s.find('[').ok_or_else(|| "无 JSON 数组起始 `[`".to_string())?;
+    let start = s
+        .find('[')
+        .ok_or_else(|| "无 JSON 数组起始 `[`".to_string())?;
     // 简化策略:从最后一个 `]` 截断(容忍中间嵌套)
     if let Some(end) = s.rfind(']') {
         if end > start {
@@ -2073,9 +2158,15 @@ mod tests {
 
     #[test]
     fn detect_decision_signal_matches_english_keywords() {
-        assert!(detect_decision_signal("we decided to use tokio for async runtime"));
-        assert!(detect_decision_signal("I chose the flash model for budget tasks"));
-        assert!(detect_decision_signal("trade-off between latency and throughput"));
+        assert!(detect_decision_signal(
+            "we decided to use tokio for async runtime"
+        ));
+        assert!(detect_decision_signal(
+            "I chose the flash model for budget tasks"
+        ));
+        assert!(detect_decision_signal(
+            "trade-off between latency and throughput"
+        ));
         assert!(detect_decision_signal("rejected the alternative approach"));
         assert!(detect_decision_signal("ruled out option C"));
         assert!(detect_decision_signal("used A instead of B"));
@@ -2097,7 +2188,9 @@ mod tests {
     #[test]
     fn detect_decision_signal_no_match_for_plain_text() {
         assert!(!detect_decision_signal("hello world"));
-        assert!(!detect_decision_signal("the quick brown fox jumps over the lazy dog"));
+        assert!(!detect_decision_signal(
+            "the quick brown fox jumps over the lazy dog"
+        ));
         assert!(!detect_decision_signal("这是一段普通文本,没有决策关键词"));
         assert!(!detect_decision_signal(""));
     }
@@ -2113,9 +2206,9 @@ mod tests {
     fn extract_decisions_heuristic_finds_decision_messages() {
         let messages = vec![
             "let's discuss the architecture",
-            "we decided to use SQLite for persistence",  // 命中 "decided"
+            "we decided to use SQLite for persistence", // 命中 "decided"
             "the implementation plan is...",
-            "chose flash model for budget tier",          // 命中 "chose"
+            "chose flash model for budget tier", // 命中 "chose"
             "no decision here, just facts",
         ];
         let decisions = extract_decisions_before_compaction(
@@ -2132,10 +2225,7 @@ mod tests {
         assert_eq!(decisions[1].session_id, "test-session");
         // 验证上下文提取(前一条消息)
         assert_eq!(decisions[0].context, "let's discuss the architecture");
-        assert_eq!(
-            decisions[1].context,
-            "the implementation plan is..."
-        );
+        assert_eq!(decisions[1].context, "the implementation plan is...");
         // 验证 decision/rationale 字段填充
         assert!(decisions[0].decision.contains("SQLite"));
         assert!(decisions[0].rationale.contains("SQLite"));
@@ -2147,11 +2237,8 @@ mod tests {
     fn extract_decisions_heuristic_first_message_has_empty_context() {
         // 第一条消息命中关键词时,context 应为空字符串
         let messages = vec!["decided to use Rust for the CLI"];
-        let decisions = extract_decisions_before_compaction(
-            &messages,
-            &DetectionStrategy::Heuristic,
-            "sess",
-        );
+        let decisions =
+            extract_decisions_before_compaction(&messages, &DetectionStrategy::Heuristic, "sess");
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].context, "");
     }
@@ -2159,26 +2246,16 @@ mod tests {
     #[test]
     fn extract_decisions_heuristic_empty_input() {
         let messages: Vec<&str> = vec![];
-        let decisions = extract_decisions_before_compaction(
-            &messages,
-            &DetectionStrategy::Heuristic,
-            "sess",
-        );
+        let decisions =
+            extract_decisions_before_compaction(&messages, &DetectionStrategy::Heuristic, "sess");
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn extract_decisions_heuristic_no_keywords_no_decisions() {
-        let messages = vec![
-            "hello world",
-            "the quick brown fox",
-            "just some plain text",
-        ];
-        let decisions = extract_decisions_before_compaction(
-            &messages,
-            &DetectionStrategy::Heuristic,
-            "sess",
-        );
+        let messages = vec!["hello world", "the quick brown fox", "just some plain text"];
+        let decisions =
+            extract_decisions_before_compaction(&messages, &DetectionStrategy::Heuristic, "sess");
         assert!(decisions.is_empty());
     }
 
@@ -2208,11 +2285,8 @@ mod tests {
         // 构造超长消息,验证截断逻辑
         let long_msg = "decided: ".to_string() + &"x".repeat(1000);
         let messages = vec![long_msg.as_str()];
-        let decisions = extract_decisions_before_compaction(
-            &messages,
-            &DetectionStrategy::Heuristic,
-            "sess",
-        );
+        let decisions =
+            extract_decisions_before_compaction(&messages, &DetectionStrategy::Heuristic, "sess");
         assert_eq!(decisions.len(), 1);
         // decision 字段截断到 300 字节 + "…"(3 字节 UTF-8)= 303 字节
         assert!(
@@ -2334,7 +2408,10 @@ mod tests {
         // 加载 NOTEBOOK 验证 decisions 段
         let notebook = crate::notebook::Notebook::load(dir.path()).unwrap();
         let decisions_section = notebook.get_section("decisions");
-        assert!(decisions_section.is_some(), "decisions section should exist");
+        assert!(
+            decisions_section.is_some(),
+            "decisions section should exist"
+        );
         let content = decisions_section.unwrap();
         assert!(content.contains("use tokio"));
         assert!(content.contains("industry standard"));
@@ -2369,7 +2446,10 @@ mod tests {
         let notebook = crate::notebook::Notebook::load(dir.path()).unwrap();
         let content = notebook.get_section("decisions").unwrap();
         assert!(content.contains("first decision"), "first decision missing");
-        assert!(content.contains("second decision"), "second decision missing");
+        assert!(
+            content.contains("second decision"),
+            "second decision missing"
+        );
     }
 
     #[test]
@@ -2466,7 +2546,8 @@ mod tests {
     /// §10.5 Epic 6:parse_llm_decision_json 解析无 markdown 包裹的 JSON
     #[test]
     fn parse_llm_decision_json_parses_plain_json() {
-        let response = r#"[{"context":"ctx","decision":"decide","rationale":"why","alternatives":[]}]"#;
+        let response =
+            r#"[{"context":"ctx","decision":"decide","rationale":"why","alternatives":[]}]"#;
         let decisions = parse_llm_decision_json(response, 2000, "sess").unwrap();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].decision, "decide");
@@ -2555,7 +2636,8 @@ mod tests {
             "decision": "采用微服务",
             "rationale": "可扩展性",
             "alternatives": ["单体"]
-        }]).to_string();
+        }])
+        .to_string();
         let mock = MockDecisionExtractorClient {
             response: json_response,
             force_error: false,
@@ -2564,7 +2646,10 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].decision, "采用微服务");
         assert_eq!(decisions[0].alternatives, vec!["单体"]);
-        assert!(decisions[0].id.contains("llm"), "LLM 提取的 id 应含 'llm' 标记");
+        assert!(
+            decisions[0].id.contains("llm"),
+            "LLM 提取的 id 应含 'llm' 标记"
+        );
     }
 
     /// §10.5 Epic 6:extract_decisions_with_llm 在 API 失败时降级为 Heuristic
@@ -2577,7 +2662,11 @@ mod tests {
             force_error: true,
         };
         let decisions = extract_decisions_with_llm(&messages, "flash", &mock, "sess");
-        assert_eq!(decisions.len(), 1, "API 失败应降级为 Heuristic 并检测到 'decided'");
+        assert_eq!(
+            decisions.len(),
+            1,
+            "API 失败应降级为 Heuristic 并检测到 'decided'"
+        );
         assert!(decisions[0].decision.contains("Rust"));
         // Heuristic 的 id 不含 'llm' 标记
         assert!(!decisions[0].id.contains("llm"));
@@ -2616,7 +2705,10 @@ mod tests {
         assert!(prompt.contains("[1] msg2"), "prompt 应含消息 [1]");
         assert!(prompt.contains("设计决策点"), "prompt 应含判定标准");
         assert!(prompt.contains("JSON"), "prompt 应含 JSON schema");
-        assert!(prompt.contains("alternatives"), "prompt 应含 alternatives 字段说明");
+        assert!(
+            prompt.contains("alternatives"),
+            "prompt 应含 alternatives 字段说明"
+        );
         assert!(prompt.contains("few-shot"), "prompt 应含 few-shot 示例");
     }
 

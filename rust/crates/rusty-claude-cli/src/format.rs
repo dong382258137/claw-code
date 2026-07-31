@@ -161,12 +161,24 @@ pub(crate) fn parse_detection_strategy(arg: &str) -> Option<DetectionStrategy> {
 /// v3 §4.7:格式化当前 detection strategy 报告(无参数 `/detection-strategy` 时调用)。
 pub(crate) fn format_detection_strategy_report(strategy: &DetectionStrategy) -> String {
     let strategies = [
-        ("heuristic", "Heuristic keyword detection (zero cost)", matches!(strategy, DetectionStrategy::Heuristic)),
-        ("llm", "LLM extraction (flash model, low cost)", matches!(strategy, DetectionStrategy::LlmExtract { .. })),
+        (
+            "heuristic",
+            "Heuristic keyword detection (zero cost)",
+            matches!(strategy, DetectionStrategy::Heuristic),
+        ),
+        (
+            "llm",
+            "LLM extraction (flash model, low cost)",
+            matches!(strategy, DetectionStrategy::LlmExtract { .. }),
+        ),
     ]
     .into_iter()
     .map(|(name, description, is_current)| {
-        let marker = if is_current { "● current" } else { "○ available" };
+        let marker = if is_current {
+            "● current"
+        } else {
+            "○ available"
+        };
         format!("  {name:<12} {marker:<11} {description}")
     })
     .collect::<Vec<_>>()
@@ -2071,7 +2083,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  claw --model deepseek-v4-pro \"summarize this repo\"")?;
+    writeln!(
+        out,
+        "  claw --model deepseek-v4-pro \"summarize this repo\""
+    )?;
     writeln!(
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""
@@ -2257,8 +2272,7 @@ mod tests {
         let proposed = DetectionStrategy::LlmExtract {
             model: "deepseek-v4-flash".to_string(),
         };
-        let report =
-            format_detection_strategy_dry_run_report(&current, &proposed, true);
+        let report = format_detection_strategy_dry_run_report(&current, &proposed, true);
         assert!(report.contains("dry-run"));
         assert!(report.contains("preview only"));
         assert!(report.contains("heuristic"));
@@ -2274,8 +2288,7 @@ mod tests {
         let proposed = DetectionStrategy::LlmExtract {
             model: "deepseek-v4-flash".to_string(),
         };
-        let report =
-            format_detection_strategy_dry_run_report(&current, &proposed, false);
+        let report = format_detection_strategy_dry_run_report(&current, &proposed, false);
         assert!(report.contains("Warning"));
         assert!(report.contains("downgrade"));
         assert!(report.contains("not registered"));
@@ -2288,8 +2301,7 @@ mod tests {
         };
         let proposed = DetectionStrategy::Heuristic;
         // 即使 client 未注册,切到 Heuristic 也不应有 warning
-        let report =
-            format_detection_strategy_dry_run_report(&current, &proposed, false);
+        let report = format_detection_strategy_dry_run_report(&current, &proposed, false);
         assert!(!report.contains("Warning"));
         assert!(!report.contains("downgrade"));
     }

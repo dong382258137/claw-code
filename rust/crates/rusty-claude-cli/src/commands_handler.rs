@@ -913,9 +913,7 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
 }
 
 pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
-    format!(
-        "`claw {command_name}` has been removed. Set DEEPSEEK_API_KEY instead."
-    )
+    format!("`claw {command_name}` has been removed. Set DEEPSEEK_API_KEY instead.")
 }
 
 pub(crate) fn parse_acp_args(
@@ -1254,7 +1252,6 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "files",
     "fast",
     "exit",
-    "summary",
     "desktop",
     "brief",
     "advisor",
@@ -1270,11 +1267,9 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "tasks",
     "theme",
     "voice",
-    "usage",
     "rename",
     "copy",
     "hooks",
-    "context",
     "color",
     "branch",
     "rewind",

@@ -3415,7 +3415,9 @@ pub fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::BuiltinShipped,
-            PathBuf::from(userprofile).join(".claw").join("builtin-skills"),
+            PathBuf::from(userprofile)
+                .join(".claw")
+                .join("builtin-skills"),
             SkillOrigin::SkillsDir,
         );
     }
@@ -6528,9 +6530,7 @@ mod tests {
         // without error (covered by .expect above). We only verify that
         // no skill named like our test fixtures leaked in.
         assert!(
-            !skills
-                .iter()
-                .any(|s| s.name().starts_with("catalog-empty")),
+            !skills.iter().any(|s| s.name().starts_with("catalog-empty")),
             "no fixture skills should exist in empty home"
         );
     }

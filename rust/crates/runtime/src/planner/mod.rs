@@ -28,6 +28,7 @@ pub use reviewer::{
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 /// 触发 plan 子调用的用户输入字符数阈值(粗略估算多文件预期)。
 pub const COMPLEX_TASK_INPUT_CHARS_THRESHOLD: usize = 200;
@@ -53,7 +54,7 @@ pub const COMPLEX_TASK_KEYWORDS: &[&str] = &[
 /// - 安全/凭证:security, auth, password, token, secret, credential
 /// - 不可逆:migrate, irreversible
 /// - 权限:permission, privilege, chmod, chown
-const HIGH_RISK_KEYWORDS: &[&str] = &[
+pub const HIGH_RISK_KEYWORDS: &[&str] = &[
     "delete",
     "drop",
     "remove",
@@ -247,6 +248,131 @@ pub fn decompose_task(user_input: &str) -> Vec<PlanStep> {
     steps
 }
 
+/// LLM 计划生成 client — 由上层 CLI 注入,使复杂任务由模型生成
+/// 计划步骤(LLM-driven planning),而非纯启发式 [`decompose_task`]。
+///
+/// 同步 trait(与 `compact::CompactionSummarizerClient` 同构),生产实现
+/// (`rusty-claude-cli::llm_clients::DeepSeekPlanGeneratorClient`)内部用
+/// 独立 tokio runtime + ProviderClient 桥接异步 API。
+///
+/// 未注册或返回无法解析的 JSON 时,[`generate_steps_with_llm`] 返回 `None`,
+/// 调用方回退到 [`decompose_task`] 启发式分解。
+pub trait PlanGeneratorClient: Send + Sync {
+    /// 输入计划生成 prompt,返回模型原始文本(应为 JSON 数组)。
+    fn generate_plan(&self, prompt: &str) -> Result<String, String>;
+}
+
+/// 全局计划生成 client(OnceLock,进程级单例)。
+static GLOBAL_PLAN_GENERATOR: OnceLock<Option<Arc<dyn PlanGeneratorClient>>> = OnceLock::new();
+
+/// 注册全局计划生成 client(进程级单例,重复注册静默忽略)。
+pub fn set_global_plan_generator_client(client: Arc<dyn PlanGeneratorClient>) {
+    let _ = GLOBAL_PLAN_GENERATOR.set(Some(client));
+}
+
+/// 是否已注册计划生成 client(供诊断/命令展示使用)。
+#[must_use]
+pub fn is_plan_generator_registered() -> bool {
+    GLOBAL_PLAN_GENERATOR
+        .get()
+        .is_some_and(|slot| slot.is_some())
+}
+
+/// LLM 生成 PlanStep 列表 — 成功返回 `Some(steps)`,否则 `None`(调用方回退启发式)。
+///
+/// # 流程
+/// 1. 构造生成 prompt(要求输出 JSON 数组)
+/// 2. 调用 [`PlanGeneratorClient::generate_plan`]
+/// 3. 容错解析 JSON(剥离 ```json 围栏、提取数组片段)
+/// 4. 解析失败 / 空数组 / LLM 调用失败 → `None`
+#[must_use]
+pub fn generate_steps_with_llm(user_input: &str) -> Option<Vec<PlanStep>> {
+    let client = GLOBAL_PLAN_GENERATOR.get()?.as_ref()?;
+    let prompt = build_plan_generation_prompt(user_input);
+    let raw = client.generate_plan(&prompt).ok()?;
+    let steps = parse_llm_plan_steps(&raw)?;
+    if steps.is_empty() {
+        return None;
+    }
+    Some(steps)
+}
+
+/// 构建计划生成 prompt — 要求模型输出 JSON 数组,每个元素含
+/// description / acceptance_criteria / verify_command(可选)。
+fn build_plan_generation_prompt(user_input: &str) -> String {
+    format!(
+        "You are a task planner for a coding assistant. Decompose the following user request \
+         into an ordered, executable plan.\n\
+         \n\
+         USER REQUEST:\n{user_input}\n\
+         \n\
+         Output ONLY a JSON array (no markdown fence, no prose). Each element: \
+         {{\"description\": string, \"acceptance_criteria\": string, \"verify_command\": string | null}}.\n\
+         Requirements:\n\
+         - 3-10 steps; each step = one cohesive unit of work (e.g. one file change or one subsystem).\n\
+         - description: what to do (Chinese or English, match the request language).\n\
+         - acceptance_criteria: how to verify the step succeeded.\n\
+         - verify_command: a concrete shell command that checks the step (e.g. \"cargo test --no-fail-fast\"), \
+         or null if not applicable.\n\
+         - Do not include escaping backslashes or code fences."
+    )
+}
+
+/// 内部 JSON 结构 — 只取 LLM 提供的字段,其余字段由 [`PlanStep`] 默认值填充。
+#[derive(serde::Deserialize)]
+struct LlmPlanStep {
+    description: String,
+    #[serde(default)]
+    acceptance_criteria: String,
+    #[serde(default)]
+    verify_command: Option<String>,
+}
+
+/// 容错解析 LLM 输出为 PlanStep 列表。
+///
+/// 容忍:```json 围栏、首尾多余文本、空数组。
+/// 任一元素缺 description 或整体不是数组 → `None`(回退启发式)。
+fn parse_llm_plan_steps(raw: &str) -> Option<Vec<PlanStep>> {
+    let trimmed = raw.trim();
+    // 剥离 markdown json 围栏(```json ... ``` 或 ``` ... ```)。
+    let body = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|s| s.strip_suffix("```").map_or_else(|| s.trim(), str::trim))
+        .unwrap_or(trimmed);
+    // 提取第一个 '[' 到最后一个 ']' 之间的片段,容忍前后 prose。
+    let start = body.find('[')?;
+    let end = body.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    let array_text = &body[start..=end];
+    let parsed: Vec<LlmPlanStep> = serde_json::from_str(array_text).ok()?;
+    if parsed.is_empty() {
+        return None;
+    }
+    Some(
+        parsed
+            .into_iter()
+            .enumerate()
+            .map(|(idx, step)| {
+                let mut s = PlanStep::new(
+                    format!("step_{}", idx + 1),
+                    step.description,
+                    if step.acceptance_criteria.is_empty() {
+                        format!("Verify step {} completes successfully", idx + 1)
+                    } else {
+                        step.acceptance_criteria
+                    },
+                );
+                s.verify_command = step.verify_command.filter(|c| !c.trim().is_empty());
+                s.risk_level = assess_step_risk(&s.description);
+                s
+            })
+            .collect(),
+    )
+}
+
 /// Update an existing [`PlanArtifact`] with new or modified steps (G8.9).
 ///
 /// Parses a structured or natural-language update description and applies
@@ -375,6 +501,66 @@ fn split_into_sentences(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_llm_plan_json_array_with_verify_commands() {
+        let raw = r#"[
+            {"description": "Add auth module", "acceptance_criteria": "auth compiles", "verify_command": "cargo check -p auth"},
+            {"description": "Add tests", "acceptance_criteria": "tests pass", "verify_command": "cargo test"}
+        ]"#;
+        let steps = parse_llm_plan_steps(raw).expect("valid JSON should parse");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].id, "step_1");
+        assert_eq!(steps[0].description, "Add auth module");
+        assert_eq!(
+            steps[0].verify_command.as_deref(),
+            Some("cargo check -p auth")
+        );
+        assert_eq!(steps[1].id, "step_2");
+        assert_eq!(steps[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn parses_llm_plan_with_markdown_fence() {
+        let raw = "```json\n[{\"description\": \"refactor parser\", \"acceptance_criteria\": \"clippy clean\"}]\n```";
+        let steps = parse_llm_plan_steps(raw).expect("fenced JSON should parse");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].description, "refactor parser");
+    }
+
+    #[test]
+    fn parses_llm_plan_tolerates_surrounding_prose() {
+        let raw = "Here is the plan:\n[{\"description\": \"step A\", \"acceptance_criteria\": \"done\"}]\nHope this helps!";
+        let steps = parse_llm_plan_steps(raw).expect("prose-wrapped JSON should parse");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].description, "step A");
+    }
+
+    #[test]
+    fn llm_plan_parse_returns_none_for_invalid_json() {
+        assert!(parse_llm_plan_steps("not json at all").is_none());
+        assert!(
+            parse_llm_plan_steps("[]").is_none(),
+            "empty array should be rejected"
+        );
+        assert!(parse_llm_plan_steps(r#"{"description": "not an array"}"#).is_none());
+    }
+
+    #[test]
+    fn llm_plan_parse_defaults_missing_fields() {
+        let raw = r#"[{"description": "only description"}]"#;
+        let steps = parse_llm_plan_steps(raw).expect("minimal entry should parse");
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].verify_command.is_none());
+        // acceptance_criteria 缺失时生成兜底文案。
+        assert!(steps[0].acceptance_criteria.contains("Verify step 1"));
+    }
+
+    #[test]
+    fn generate_steps_with_llm_returns_none_without_registered_client() {
+        // 未注册全局 client 时,gfenerate_steps_with_llm 返回 None(走启发式)。
+        assert!(generate_steps_with_llm("refactor the auth module").is_none());
+    }
 
     #[test]
     fn assess_complexity_returns_simple_for_short_input() {

@@ -142,11 +142,15 @@ impl CoordinatorExecutor {
 
 #[async_trait]
 impl SubagentExecutor for CoordinatorExecutor {
-    async fn execute(&self, node: &DagNode) -> Result<NodeResult, NodeError> {
+    async fn execute(&self, node: &DagNode, attempt: u32) -> Result<NodeResult, NodeError> {
+        // 知识新鲜度门控(事前评估):
+        // - attempt=0(首次):正常评估 freshness,Novel 任务触发调研
+        // - attempt>0(重试):急则治标旁路,跳过调研直接重试
+        //   (gate_task 内部 derive_urgent_from_attempt 处理)
+        let gated = crate::knowledge_freshness::gate_task(&node.task, attempt).await;
+
         // 1. Register the subagent in the coordinator's state machine.
-        let subagent_id = self
-            .coordinator
-            .spawn(&node.label, &node.task, node.mode);
+        let subagent_id = self.coordinator.spawn(&node.label, &node.task, node.mode);
 
         // 2. Acquire the runner. If none is configured, cancel the freshly
         //    spawned subagent (to keep coordinator state consistent) and
@@ -191,6 +195,7 @@ impl SubagentExecutor for CoordinatorExecutor {
                 node_id: node.id.clone(),
                 summary,
                 artifact_path: None,
+                gated: Some(gated),
             }),
             Err(e) => Err(NodeError::ExecutionFailed(e)),
         }
@@ -211,9 +216,9 @@ impl SubagentExecutor for CoordinatorExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi_agent::CoordinationMode;
     use crate::multi_agent::dag::types::RetryPolicy;
     use crate::multi_agent::dag::{DagError, DagGraph, DagScheduler};
+    use crate::multi_agent::CoordinationMode;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -239,7 +244,7 @@ mod tests {
         let executor = CoordinatorExecutor::new(coordinator.clone());
         let node = sample_node();
         let err = executor
-            .execute(&node)
+            .execute(&node, 0)
             .await
             .expect_err("should fail without runner");
         assert!(matches!(err, NodeError::ExecutionFailed(_)));
@@ -254,7 +259,7 @@ mod tests {
         let coordinator = Arc::new(MultiAgentCoordinator::new());
         let executor = CoordinatorExecutor::new(coordinator.clone());
         let node = sample_node();
-        let _ = executor.execute(&node).await;
+        let _ = executor.execute(&node, 0).await;
         // The subagent should have been spawned and then cancelled.
         let agents = coordinator.list();
         assert_eq!(agents.len(), 1, "subagent should be registered");
@@ -272,13 +277,12 @@ mod tests {
     async fn execute_with_runner_returns_node_result() {
         let coordinator = Arc::new(MultiAgentCoordinator::new());
         // Simple runner: returns a fake result_ref path.
-        let runner: SubagentRunner = Arc::new(|_id, _task| {
-            Box::pin(async { Ok(".claw/subagents/fake.md".to_string()) })
-        });
+        let runner: SubagentRunner =
+            Arc::new(|_id, _task| Box::pin(async { Ok(".claw/subagents/fake.md".to_string()) }));
         let executor = CoordinatorExecutor::new(coordinator).with_runner(runner);
         let node = sample_node();
         let result = executor
-            .execute(&node)
+            .execute(&node, 0)
             .await
             .expect("runner should succeed");
         assert_eq!(result.node_id, "n1");
@@ -293,7 +297,7 @@ mod tests {
         let executor = CoordinatorExecutor::new(coordinator).with_runner(runner);
         let node = sample_node();
         let err = executor
-            .execute(&node)
+            .execute(&node, 0)
             .await
             .expect_err("runner should fail");
         assert!(matches!(err, NodeError::ExecutionFailed(_)));
@@ -304,12 +308,11 @@ mod tests {
     #[tokio::test]
     async fn execute_with_runner_transitions_coordinator_to_completed() {
         let coordinator = Arc::new(MultiAgentCoordinator::new());
-        let runner: SubagentRunner = Arc::new(|_id, _task| {
-            Box::pin(async { Ok("result".to_string()) })
-        });
+        let runner: SubagentRunner =
+            Arc::new(|_id, _task| Box::pin(async { Ok("result".to_string()) }));
         let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
         let node = sample_node();
-        executor.execute(&node).await.expect("should succeed");
+        executor.execute(&node, 0).await.expect("should succeed");
         let agents = coordinator.list();
         assert_eq!(agents.len(), 1);
         assert_eq!(
@@ -325,13 +328,10 @@ mod tests {
             Arc::new(|_id, _task| Box::pin(async { Err("boom".to_string()) }));
         let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
         let node = sample_node();
-        let _ = executor.execute(&node).await;
+        let _ = executor.execute(&node, 0).await;
         let agents = coordinator.list();
         assert_eq!(agents.len(), 1);
-        assert_eq!(
-            agents[0].status,
-            crate::multi_agent::SubagentStatus::Failed
-        );
+        assert_eq!(agents[0].status, crate::multi_agent::SubagentStatus::Failed);
     }
 
     #[tokio::test]
@@ -384,13 +384,16 @@ mod tests {
         graph.add_node(dag_node("n1", &[]));
         graph.add_node(dag_node("n2", &["n1"]));
         graph.add_node(dag_node("n3", &["n2"]));
-        graph.add_edge(&"n1".to_string(), &"n2".to_string()).unwrap();
-        graph.add_edge(&"n2".to_string(), &"n3".to_string()).unwrap();
+        graph
+            .add_edge(&"n1".to_string(), &"n2".to_string())
+            .unwrap();
+        graph
+            .add_edge(&"n2".to_string(), &"n3".to_string())
+            .unwrap();
 
         // Track dispatched (subagent_id, task) pairs to verify the runner was
         // actually invoked and that summaries match the dispatched ids.
-        let dispatched: Arc<Mutex<Vec<(String, String)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let dispatched: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let dispatched_clone = dispatched.clone();
 
         // Realistic runner: simulates LLM latency, then returns the result_ref
@@ -446,7 +449,11 @@ mod tests {
         // All 3 subagent_ids should be distinct (distinct paths).
         let unique_paths: std::collections::HashSet<&str> =
             results.iter().map(|r| r.summary.as_str()).collect();
-        assert_eq!(unique_paths.len(), 3, "all result_ref paths should be distinct");
+        assert_eq!(
+            unique_paths.len(),
+            3,
+            "all result_ref paths should be distinct"
+        );
     }
 
     /// Test (b): a runner that fails for a specific subagent_id propagates the
@@ -462,7 +469,9 @@ mod tests {
         let mut graph = DagGraph::new("failing");
         graph.add_node(dag_node("n1", &[]));
         graph.add_node(dag_node("n2", &["n1"]));
-        graph.add_edge(&"n1".to_string(), &"n2".to_string()).unwrap();
+        graph
+            .add_edge(&"n1".to_string(), &"n2".to_string())
+            .unwrap();
 
         // Runner that fails for the first spawned subagent ("subagent-1").
         // Since n1 is the only root, it will be spawned first.
@@ -558,7 +567,7 @@ mod tests {
         let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
         let node = sample_node();
         let result = executor
-            .execute(&node)
+            .execute(&node, 0)
             .await
             .expect("dispatcher-style runner should succeed");
 
@@ -593,8 +602,8 @@ mod tests {
         );
 
         // Verify file contents to ensure the runner wrote meaningful data.
-        let content = std::fs::read_to_string(&file_path)
-            .expect("should be able to read the result file");
+        let content =
+            std::fs::read_to_string(&file_path).expect("should be able to read the result file");
         assert!(
             content.contains(&dispatched_id),
             "file content should mention the subagent id"

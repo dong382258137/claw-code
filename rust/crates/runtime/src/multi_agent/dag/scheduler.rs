@@ -490,9 +490,12 @@ impl DagScheduler {
                     },
                 );
 
+                // P1-6:首次执行 attempt=0(attempts 尚未记录该节点)。
+                // 重试时 attempts 已 insert,此处读取到 >0 的值。
+                let attempt = attempts.get(node_id).copied().unwrap_or(0);
                 joinset.spawn(async move {
                     // Cooperatively cancel if the parent token fires mid-execution.
-                    let exec_fut = executor.execute(&node);
+                    let exec_fut = executor.execute(&node, attempt);
                     let res = tokio::select! {
                         biased;
                         _ = child_token.cancelled() => Err(NodeError::Cancelled),
@@ -603,8 +606,11 @@ impl DagScheduler {
                         let child_token = self.cancel_token.child_token();
                         let node_id_for_status = node.id.clone();
                         inflight.insert(node_id);
+                        // P1-6:重试 attempt = current_attempt + 1(0-indexed)。
+                        // 566 行已 insert current_attempt+1 到 attempts,此处直接用。
+                        let retry_attempt = current_attempt + 1;
                         joinset.spawn(async move {
-                            let exec_fut = executor.execute(&node);
+                            let exec_fut = executor.execute(&node, retry_attempt);
                             let res = tokio::select! {
                                 biased;
                                 _ = child_token.cancelled() => Err(NodeError::Cancelled),
@@ -785,7 +791,7 @@ mod tests {
 
     #[async_trait]
     impl SubagentExecutor for SuccessExecutor {
-        async fn execute(&self, node: &DagNode) -> Result<NodeResult, NodeError> {
+        async fn execute(&self, node: &DagNode, _attempt: u32) -> Result<NodeResult, NodeError> {
             self.seen
                 .lock()
                 .expect("seen poisoned")
@@ -794,6 +800,7 @@ mod tests {
                 node_id: node.id.clone(),
                 summary: node.task.clone(),
                 artifact_path: None,
+                gated: None,
             })
         }
 
@@ -807,7 +814,7 @@ mod tests {
 
     #[async_trait]
     impl SubagentExecutor for FailOnExecutor {
-        async fn execute(&self, node: &DagNode) -> Result<NodeResult, NodeError> {
+        async fn execute(&self, node: &DagNode, _attempt: u32) -> Result<NodeResult, NodeError> {
             if node.id == self.fail_id {
                 return Err(NodeError::ExecutionFailed(format!(
                     "forced failure on {}",
@@ -818,6 +825,7 @@ mod tests {
                 node_id: node.id.clone(),
                 summary: node.task.clone(),
                 artifact_path: None,
+                gated: None,
             })
         }
 
@@ -834,7 +842,7 @@ mod tests {
 
     #[async_trait]
     impl SubagentExecutor for FailThenSucceedExecutor {
-        async fn execute(&self, node: &DagNode) -> Result<NodeResult, NodeError> {
+        async fn execute(&self, node: &DagNode, _attempt: u32) -> Result<NodeResult, NodeError> {
             if node.id == self.fail_id {
                 let mut attempts = self.attempts.lock().expect("attempts poisoned");
                 *attempts += 1;
@@ -849,6 +857,7 @@ mod tests {
                 node_id: node.id.clone(),
                 summary: node.task.clone(),
                 artifact_path: None,
+                gated: None,
             })
         }
 
@@ -1138,7 +1147,7 @@ mod tests {
         struct CancelExecutor;
         #[async_trait]
         impl SubagentExecutor for CancelExecutor {
-            async fn execute(&self, _node: &DagNode) -> Result<NodeResult, NodeError> {
+            async fn execute(&self, _node: &DagNode, _attempt: u32) -> Result<NodeResult, NodeError> {
                 Err(NodeError::Cancelled)
             }
             async fn cancel(&self, _node_id: &str) {}

@@ -336,8 +336,24 @@ impl PersistentMemory {
         // Step 4.x:注入全局 embedding provider(若可用),使 semantic_recall
         // 自动使用向量搜索而非退化为 keyword。
         if let Some(provider) = crate::build_embedding_provider() {
-            memory.semantic = std::mem::take(&mut memory.semantic)
-                .with_embedding_provider(Arc::from(provider));
+            let provider: Arc<dyn crate::memory_semantic::EmbeddingProvider + Send + Sync> =
+                Arc::from(provider);
+            let mut recaller =
+                std::mem::take(&mut memory.semantic).with_embedding_provider(provider.clone());
+            // 语义记忆接线:load 时批量预计算全部 entry 的向量。
+            // 没有这一步 vectors 索引恒为空,向量召回永远不触发,
+            // `semantic_recall` 实际退化为 keyword 子串匹配。
+            // index_embeddings 幂等且失败时保留已计算部分,不阻塞加载。
+            match recaller.index_embeddings(provider.as_ref()) {
+                Ok(count) if count > 0 => {
+                    eprintln!("[memory] indexed {count} memory entr(ies) for semantic recall");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[memory] embedding index failed ({e}); semantic recall falls back to keyword");
+                }
+            }
+            memory.semantic = recaller;
         }
         memory.frozen_snapshot = Some(memory.render_current());
         memory
@@ -447,8 +463,11 @@ impl PersistentMemory {
             source.to_string(),
             now,
         ));
-        self.semantic
-            .add_l1_entry(&entry_id(content), content, source);
+        let entry_id = entry_id(content);
+        self.semantic.add_l1_entry(&entry_id, content, source);
+        // 语义记忆接线:新增 entry 增量计算向量,使其立即可被向量召回命中。
+        // (load 时已有向量用批量 index_embeddings;运行时新增走增量 embed_entry。)
+        self.semantic.embed_entry(&entry_id);
         self.persist_or_warn("add_entry");
     }
 
@@ -472,8 +491,10 @@ impl PersistentMemory {
             source.to_string(),
             now,
         ));
-        self.semantic
-            .add_l1_entry(&entry_id(new_content), new_content, source);
+        let entry_id = entry_id(new_content);
+        self.semantic.add_l1_entry(&entry_id, new_content, source);
+        // 语义记忆接线:replace 同样增量计算新 entry 向量。
+        self.semantic.embed_entry(&entry_id);
         self.persist_or_warn("replace_entry");
     }
 
@@ -1306,6 +1327,33 @@ mod tests {
         let hits = mem.semantic_recall("rust systems programming", 5);
         assert_eq!(hits.len(), 1);
         assert!(hits[0].entry.summary.contains("rust"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn add_entry_incrementally_embeds_vector_when_provider_injected() {
+        // 语义记忆接线回归:注入 HashEmbeddingProvider 后,add_entry 必须
+        // 立即计算向量(vectors 非空),使 semantic_recall 走向量路径而非
+        // keyword 退化。此前 add_entry 只写 L1 索引不写 vectors,
+        // 向量索引恒空,向量召回永不触发。
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        let provider: std::sync::Arc<dyn crate::memory_semantic::EmbeddingProvider + Send + Sync> =
+            std::sync::Arc::new(HashEmbeddingProvider::default_dim());
+        mem.semantic = std::mem::take(&mut mem.semantic).with_embedding_provider(provider.clone());
+        mem.add_entry("user prefers rust for systems programming", "test");
+        // add_entry 后 vectors 应立即包含该 entry 的向量,向量召回路径可用。
+        assert_eq!(
+            mem.semantic().vectors_count(),
+            1,
+            "add_entry should embed incrementally"
+        );
+        // 注入 provider 后 semantic_recall 走向量路径(HashEmbeddingProvider
+        // 余弦相似度低于 EMBEDDING_MIN_SCORE=0.85 会被过滤,因此不要求命中;
+        // 这里只验证向量路径已接线且不 panic)。
+        let hits = mem.semantic_recall("rust systems programming", 5);
+        let _ = hits;
         let _ = std::fs::remove_file(&path);
     }
 

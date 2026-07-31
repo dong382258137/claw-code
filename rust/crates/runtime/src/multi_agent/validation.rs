@@ -136,13 +136,13 @@ impl ValidationGate for CommandValidationGate {
             crate::diag::DiagEntry::new(
                 crate::diag::DiagLevel::Info,
                 "validation",
-                format!("gate '{}' triggered for subagent {}", self.gate_name, ctx.subagent_id),
+                format!(
+                    "gate '{}' triggered for subagent {}",
+                    self.gate_name, ctx.subagent_id
+                ),
             )
             .with_field("gate", serde_json::Value::String(self.gate_name.clone()))
-            .with_field(
-                "command",
-                serde_json::Value::String(self.command.join(" ")),
-            ),
+            .with_field("command", serde_json::Value::String(self.command.join(" "))),
         );
 
         let output = std::process::Command::new(&self.command[0])
@@ -161,12 +161,8 @@ impl ValidationGate for CommandValidationGate {
                     String::from_utf8_lossy(&o.stderr),
                 );
                 crate::diag::global().append(
-                    crate::diag::DiagEntry::new(
-                        crate::diag::DiagLevel::Error,
-                        "validation",
-                        &msg,
-                    )
-                    .with_field("retryable", serde_json::Value::Bool(true)),
+                    crate::diag::DiagEntry::new(crate::diag::DiagLevel::Error, "validation", &msg)
+                        .with_field("retryable", serde_json::Value::Bool(true)),
                 );
                 Err(ValidationError {
                     message: msg,
@@ -176,12 +172,8 @@ impl ValidationGate for CommandValidationGate {
             Err(e) => {
                 let msg = format!("failed to run {}: {e}", self.gate_name);
                 crate::diag::global().append(
-                    crate::diag::DiagEntry::new(
-                        crate::diag::DiagLevel::Error,
-                        "validation",
-                        &msg,
-                    )
-                    .with_field("retryable", serde_json::Value::Bool(false)),
+                    crate::diag::DiagEntry::new(crate::diag::DiagLevel::Error, "validation", &msg)
+                        .with_field("retryable", serde_json::Value::Bool(false)),
                 );
                 Err(ValidationError {
                     message: msg,
@@ -200,12 +192,7 @@ impl ValidationGate for CommandValidationGate {
 ///
 /// 等价于 `CommandValidationGate::new("cargo-build", ["cargo", "build"], workspace_root, r"\.rs$")`。
 pub fn rust_compile_gate(workspace_root: PathBuf) -> CommandValidationGate {
-    CommandValidationGate::new(
-        "cargo-build",
-        ["cargo", "build"],
-        workspace_root,
-        r"\.rs$",
-    )
+    CommandValidationGate::new("cargo-build", ["cargo", "build"], workspace_root, r"\.rs$")
 }
 
 /// Node.js / TypeScript 专用门禁(v2 新增,§10.5 多 ValidationGate)。
@@ -491,7 +478,10 @@ impl ValidationGate for LlmJudgeGate {
             crate::diag::DiagEntry::new(
                 crate::diag::DiagLevel::Info,
                 "validation",
-                format!("LlmJudgeGate score: {score:.3} (threshold: {:.3})", self.pass_threshold),
+                format!(
+                    "LlmJudgeGate score: {score:.3} (threshold: {:.3})",
+                    self.pass_threshold
+                ),
             )
             .with_field("score", serde_json::Value::from(score))
             .with_field("threshold", serde_json::Value::from(self.pass_threshold)),
@@ -563,17 +553,17 @@ mod tests {
     fn command_gate_runs_when_matching_files() {
         // 用一个总是成功的命令 `cmd /c exit 0`(Windows)/ `true`(Unix)
         #[cfg(windows)]
-        let cmd = vec!["cmd".to_string(), "/c".to_string(), "exit".to_string(), "0".to_string()];
+        let cmd = vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "exit".to_string(),
+            "0".to_string(),
+        ];
         #[cfg(not(windows))]
         let cmd = vec!["true".to_string()];
 
         let tmp = std::env::temp_dir();
-        let gate = CommandValidationGate::new(
-            "test-gate",
-            cmd,
-            tmp.clone(),
-            r"\.rs$",
-        );
+        let gate = CommandValidationGate::new("test-gate", cmd, tmp.clone(), r"\.rs$");
         let changed_files: Vec<PathBuf> = vec![PathBuf::from("src/main.rs")];
         let ctx = make_ctx(
             "sub-1",
@@ -590,17 +580,17 @@ mod tests {
     #[test]
     fn command_gate_returns_retryable_on_failure() {
         #[cfg(windows)]
-        let cmd = vec!["cmd".to_string(), "/c".to_string(), "exit".to_string(), "1".to_string()];
+        let cmd = vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "exit".to_string(),
+            "1".to_string(),
+        ];
         #[cfg(not(windows))]
         let cmd = vec!["false".to_string()];
 
         let tmp = std::env::temp_dir();
-        let gate = CommandValidationGate::new(
-            "failing-gate",
-            cmd,
-            tmp.clone(),
-            r"\.rs$",
-        );
+        let gate = CommandValidationGate::new("failing-gate", cmd, tmp.clone(), r"\.rs$");
         let changed_files: Vec<PathBuf> = vec![PathBuf::from("src/main.rs")];
         let ctx = make_ctx(
             "sub-1",
@@ -639,10 +629,7 @@ mod tests {
     #[test]
     fn llm_judge_gate_mvp_returns_ok() {
         let tmp = std::env::temp_dir();
-        let gate = LlmJudgeGate::diagnostic_default(
-            "deepseek-v4-pro",
-            tmp.clone(),
-        );
+        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tmp.clone());
         let changed_files: Vec<PathBuf> = vec![];
         let ctx = make_ctx(
             "sub-1",
@@ -697,10 +684,19 @@ mod tests {
     fn llm_judge_gate_diagnostic_default_rubric_contains_four_dimensions() {
         let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", std::env::temp_dir());
         let rubric = &gate.rubric;
-        assert!(rubric.contains("根因定位"), "rubric 缺少根因定位维度: {rubric}");
-        assert!(rubric.contains("方案可行性"), "rubric 缺少方案可行性维度: {rubric}");
+        assert!(
+            rubric.contains("根因定位"),
+            "rubric 缺少根因定位维度: {rubric}"
+        );
+        assert!(
+            rubric.contains("方案可行性"),
+            "rubric 缺少方案可行性维度: {rubric}"
+        );
         assert!(rubric.contains("完整性"), "rubric 缺少完整性维度: {rubric}");
-        assert!(rubric.contains("副作用评估"), "rubric 缺少副作用评估维度: {rubric}");
+        assert!(
+            rubric.contains("副作用评估"),
+            "rubric 缺少副作用评估维度: {rubric}"
+        );
         // 权重总和应为 1.0(0.3 + 0.3 + 0.2 + 0.2)
         assert!(rubric.contains("0.3") && rubric.contains("0.2"));
     }
@@ -752,8 +748,9 @@ mod tests {
             response: "0.85".to_string(),
             force_error: false,
         };
-        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
-            .with_client(std::sync::Arc::new(mock));
+        let gate =
+            LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+                .with_client(std::sync::Arc::new(mock));
 
         let changed_files = vec![PathBuf::from("src/main.rs")];
         let ctx = make_ctx(
@@ -779,8 +776,9 @@ mod tests {
             response: "0.40".to_string(),
             force_error: false,
         };
-        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
-            .with_client(std::sync::Arc::new(mock));
+        let gate =
+            LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+                .with_client(std::sync::Arc::new(mock));
 
         let changed_files = vec![];
         let ctx = make_ctx(
@@ -794,8 +792,16 @@ mod tests {
 
         let err = gate.validate(&ctx).expect_err("0.40 < 0.7 应失败");
         assert!(err.retryable, "评分低应可重试");
-        assert!(err.message.contains("0.40"), "错误消息应含分数: {}", err.message);
-        assert!(err.message.contains("0.7"), "错误消息应含阈值: {}", err.message);
+        assert!(
+            err.message.contains("0.40"),
+            "错误消息应含分数: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("0.7"),
+            "错误消息应含阈值: {}",
+            err.message
+        );
     }
 
     /// §10.5 Epic 5:client 调用失败(API 故障)时返回 fatal 错误(retryable=false)
@@ -809,8 +815,9 @@ mod tests {
             response: String::new(),
             force_error: true,
         };
-        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
-            .with_client(std::sync::Arc::new(mock));
+        let gate =
+            LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+                .with_client(std::sync::Arc::new(mock));
 
         let changed_files = vec![];
         let ctx = make_ctx(
@@ -824,14 +831,19 @@ mod tests {
 
         let err = gate.validate(&ctx).expect_err("API 故障应失败");
         assert!(!err.retryable, "API 故障不可重试(避免无限重试 + 成本失控)");
-        assert!(err.message.contains("LLM judge 调用失败"), "unexpected: {}", err.message);
+        assert!(
+            err.message.contains("LLM judge 调用失败"),
+            "unexpected: {}",
+            err.message
+        );
     }
 
     /// §10.5 Epic 5:LLM 响应含解释文本时仍能解析分数
     #[test]
     fn llm_judge_gate_parse_score_extracts_score_from_explanatory_text() {
         // LLM 常输出"评分: 0.82\n理由: ..."格式
-        let score = LlmJudgeGate::parse_score("根据 rubric,评分: 0.82\n理由: 根因定位准确...").unwrap();
+        let score =
+            LlmJudgeGate::parse_score("根据 rubric,评分: 0.82\n理由: 根因定位准确...").unwrap();
         assert!((score - 0.82).abs() < 1e-9, "应提取 0.82, got {score}");
     }
 
@@ -861,8 +873,9 @@ mod tests {
             response: "我无法评分".to_string(),
             force_error: false,
         };
-        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
-            .with_client(std::sync::Arc::new(mock));
+        let gate =
+            LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+                .with_client(std::sync::Arc::new(mock));
 
         let ctx = make_ctx(
             "sub-1",
@@ -884,7 +897,8 @@ mod tests {
         let result_path = tempdir.path().join("result.md");
         std::fs::write(&result_path, "修复内容").unwrap();
 
-        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf());
+        let gate =
+            LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf());
         let changed_files = vec![PathBuf::from("src/main.rs")];
         let ctx = make_ctx(
             "sub-1",
@@ -897,7 +911,10 @@ mod tests {
 
         let prompt = gate.build_judge_prompt(&ctx);
         assert!(prompt.contains("诊断崩溃任务"), "prompt 应含 task");
-        assert!(prompt.contains("deepseek-v4-flash"), "prompt 应含 subagent model");
+        assert!(
+            prompt.contains("deepseek-v4-flash"),
+            "prompt 应含 subagent model"
+        );
         assert!(prompt.contains("src/main.rs"), "prompt 应含 changed_files");
         assert!(prompt.contains("修复内容"), "prompt 应含 result_content");
         assert!(prompt.contains("根因定位"), "prompt 应含 rubric");
@@ -908,7 +925,8 @@ mod tests {
     fn llm_judge_gate_without_client_degrades_to_stub() {
         let tempdir = tempfile::tempdir().expect("create temp dir");
         let result_path = tempdir.path().join("result.md");
-        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf());
+        let gate =
+            LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf());
         // 不调用 with_client,client 为 None
         let ctx = make_ctx(
             "sub-1",
@@ -919,7 +937,10 @@ mod tests {
             "deepseek-v4-flash",
         );
         // stub 模式应返回 Ok
-        assert!(gate.validate(&ctx).is_ok(), "无 client 时应降级为 stub 返回 Ok");
+        assert!(
+            gate.validate(&ctx).is_ok(),
+            "无 client 时应降级为 stub 返回 Ok"
+        );
     }
 
     /// §10.5 Epic 5:阈值边界 — 分数恰好等于阈值应通过
@@ -933,8 +954,9 @@ mod tests {
             response: "0.7".to_string(), // 恰好等于默认阈值
             force_error: false,
         };
-        let gate = LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
-            .with_client(std::sync::Arc::new(mock));
+        let gate =
+            LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+                .with_client(std::sync::Arc::new(mock));
 
         let ctx = make_ctx(
             "sub-1",
