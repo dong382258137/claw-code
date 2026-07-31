@@ -697,15 +697,6 @@ fn run_event_loop(
                 needs_redraw = false;
                 last_drawn_version = current_version;
                 last_drawn_elapsed_s = current_elapsed_s;
-                // P0 修复:防止外部进程(如 Trae CN 扩展宿主的 Node.js deprecation
-                // warning / Lifecycle#kill 输出)退出 alternate screen 后界面框线消失。
-                // EnterAlternateScreen 是幂等指令:已在 alternate screen 内时无副作用;
-                // 若被外部退出则恢复。在 draw 前执行可保证渲染目标始终是 alternate screen。
-                // 副作用是会清屏,但紧接着 terminal.draw 会完整重绘,用户无感知。
-                {
-                    let mut stdout = io::stdout();
-                    let _ = execute!(stdout, EnterAlternateScreen);
-                }
                 last_drawn_streaming = current_streaming;
                 terminal.draw(|f| {
             // Top-level vertical layout: main row (output+input) + status bar.
