@@ -374,6 +374,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// RAII guard:测试 panic 时自动清理临时目录(同 lib.rs 的 TempDirGuard)。
+    ///
+    /// 使用 CARGO_TARGET_TMPDIR(target/tmp/)而非 std::env::temp_dir()
+    /// (%TEMP%),避免 .sh 文件被 TRAE CN 文件监视器检测并自动打开,
+    /// 导致控制序列泄漏到 claw TUI 终端污染 InputLine。
     struct TempDirGuard {
         path: PathBuf,
     }
@@ -384,14 +388,34 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("time should be after epoch")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("plugins-hook-runner-{label}-{nanos}"));
+            // 使用 target/tmp/ 而非 %TEMP%,避免 .sh 文件被 TRAE CN
+            // 文件监视器检测并自动打开(同 lib.rs 的 TempDirGuard)。
+            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let target_tmp = manifest_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|root| root.join("target").join("tmp"))
+                .unwrap_or_else(std::env::temp_dir);
+            let path = target_tmp.join(format!("plugins-hook-runner-{label}-{nanos}"));
+            fs::create_dir_all(&path).expect("create target/tmp");
             Self { path }
         }
     }
 
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            // Windows 上文件句柄释放有延迟,重试几次。
+            let mut delay_ms = 10;
+            for attempt in 0..5u32 {
+                match fs::remove_dir_all(&self.path) {
+                    Ok(()) => return,
+                    Err(_) if attempt < 4 => {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        delay_ms *= 2;
+                    }
+                    Err(_) => return,
+                }
+            }
         }
     }
 

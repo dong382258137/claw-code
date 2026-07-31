@@ -2319,6 +2319,11 @@ mod tests {
     /// RAII guard:测试 panic 时自动清理临时目录,防止残留文件被
     /// TRAE CN 文件监视器检测到并自动打开,从而避免 TRAE CN 打开文件
     /// 时的控制序列泄漏到 claw TUI 共享终端污染 InputLine。
+    ///
+    /// 使用 CARGO_TARGET_TMPDIR(target/tmp/)而非 std::env::temp_dir()
+    /// (%TEMP%),因为 TRAE CN 文件监视器会扫描 %TEMP% 中的 .sh 文件并
+    /// 自动打开,导致控制序列泄漏。target/ 目录在 .gitignore 中,TRAE CN
+    /// 不会监视。
     struct TempDirGuard {
         path: PathBuf,
     }
@@ -2329,14 +2334,39 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time should be after epoch")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("plugins-{label}-{nanos}"));
+            // 使用 target/tmp/ 而非 %TEMP%:CARGO_TARGET_TMPDIR 仅对 [[test]]
+            // 目标可用,对 lib 内 #[cfg(test)] 不可用,因此用
+            // env!("CARGO_MANIFEST_DIR")(编译时注入)回溯到 workspace target/。
+            // target/ 在 .gitignore 中,TRAE CN 不会监视,避免 .sh 文件
+            // 被自动打开后控制序列泄漏到 TUI 终端。
+            let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let target_tmp = manifest_dir
+                .parent()  // crates/plugins → crates
+                .and_then(|p| p.parent())  // crates → workspace root
+                .map(|root| root.join("target").join("tmp"))
+                .unwrap_or_else(std::env::temp_dir);
+            let path = target_tmp.join(format!("plugins-{label}-{nanos}"));
+            std::fs::create_dir_all(&path).expect("create target/tmp");
             Self { path }
         }
     }
 
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            // Windows 上文件句柄释放有延迟(子进程退出、AV 扫描、
+            // TRAE CN 文件读取等),remove_dir_all 可能因 "file in use"
+            // 失败。重试几次,每次间隔递增。
+            let mut delay_ms = 10;
+            for attempt in 0..5u32 {
+                match fs::remove_dir_all(&self.path) {
+                    Ok(()) => return,
+                    Err(_) if attempt < 4 => {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        delay_ms *= 2;
+                    }
+                    Err(_) => return,
+                }
+            }
         }
     }
 

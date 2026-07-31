@@ -20,7 +20,15 @@ impl EnvLock {
     pub fn lock() -> Self {
         let guard = ENV_LOCK.lock().unwrap();
         let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let temp_home = std::env::temp_dir().join(format!("plugin-test-{count}"));
+        // Use target/tmp/ instead of %TEMP% to avoid TRAE CN file watcher
+        // detecting and auto-opening .sh files (same as TempDirGuard in lib.rs).
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let target_tmp = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join("target").join("tmp"))
+            .unwrap_or_else(std::env::temp_dir);
+        let temp_home = target_tmp.join(format!("plugin-test-{count}"));
 
         // Set up isolated environment
         std::fs::create_dir_all(&temp_home).ok();
@@ -47,8 +55,18 @@ impl EnvLock {
 
 impl Drop for EnvLock {
     fn drop(&mut self) {
-        // Cleanup temp directory
-        std::fs::remove_dir_all(&self.temp_home).ok();
+        // Retry cleanup: Windows file handles may still be held briefly.
+        let mut delay_ms = 10;
+        for attempt in 0..5u32 {
+            match std::fs::remove_dir_all(&self.temp_home) {
+                Ok(()) => return,
+                Err(_) if attempt < 4 => {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    delay_ms *= 2;
+                }
+                Err(_) => return,
+            }
+        }
     }
 }
 
