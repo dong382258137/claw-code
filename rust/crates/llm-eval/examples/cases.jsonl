@@ -1,0 +1,12 @@
+# llm-eval 示例任务集 — 覆盖代码理解/提取/调试/规划四类基础能力。
+# 用法: cargo run -p llm-eval -- --cases crates/llm-eval/examples/cases.jsonl --model deepseek-v4-flash
+
+{"id":"extract-01","name":"extract bearer token from URL","prompt":"Extract the bearer token from this URL query string: https://api.example.com/data?access_token=sk-abc123def456&scope=read. Answer with only the token value.","golden":["sk-abc123def456"],"min_output_chars":6}
+
+{"id":"explain-01","name":"explain what the function does","prompt":"Explain in one sentence what this Rust function does:\nfn id(x: u32) -> u32 { x }\n\nAnswer must contain the phrase 'identity'.","golden":["identity"],"min_output_chars":8}
+
+{"id":"debug-01","name":"spot the off-by-one bug","prompt":"This loop is supposed to print 0..9 but skips 9. What is the bug? for i in 0..10 { if i == 10 { break } println!(\"{i}\") }  Answer with the one-word cause.","golden":["range","exclusive"],"min_output_chars":4}
+
+{"id":"plan-01","name":"decompose a multi-file refactor","prompt":"List 3 ordered steps to refactor a Rust project's auth module into two files. Number the steps 1), 2), 3).","golden":["1)","2)","3)","auth"],"min_output_chars":40}
+
+{"id":"style-01","name":"CLI output style — be concise","prompt":"The user asked a simple yes/no question. Reply with exactly one word: yes or no.","golden":["yes","no"],"min_output_chars":2}
