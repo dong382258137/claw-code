@@ -442,18 +442,6 @@ mod tests {
         TempDirGuard::new(label)
     }
 
-    fn make_executable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(path, perms)
-                .unwrap_or_else(|e| panic!("chmod +x {}: {e}", path.display()));
-        }
-        #[cfg(not(unix))]
-        let _ = path;
-    }
-
     fn write_hook_plugin(
         root: &Path,
         name: &str,
@@ -462,36 +450,36 @@ mod tests {
         failure_message: &str,
     ) {
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
-        fs::create_dir_all(root.join("hooks")).expect("hooks dir");
 
-        let pre_path = root.join("hooks").join("pre.sh");
-        fs::write(
-            &pre_path,
-            format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
-        )
-        .expect("write pre hook");
-        make_executable(&pre_path);
+        // 跨平台 inline 命令:不创建 .sh 文件,避免文件被 TRAE CN 文件
+        // 监视器检测并自动打开后控制序列泄漏到 TUI 终端。
+        let (pre_cmd, post_cmd, failure_cmd) = if cfg!(windows) {
+            (
+                format!("echo {pre_message}"),
+                format!("echo {post_message}"),
+                format!("echo {failure_message}"),
+            )
+        } else {
+            (
+                format!("printf '%s\\n' '{pre_message}'"),
+                format!("printf '%s\\n' '{post_message}'"),
+                format!("printf '%s\\n' '{failure_message}'"),
+            )
+        };
 
-        let post_path = root.join("hooks").join("post.sh");
-        fs::write(
-            &post_path,
-            format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
-        )
-        .expect("write post hook");
-        make_executable(&post_path);
-
-        let failure_path = root.join("hooks").join("failure.sh");
-        fs::write(
-            &failure_path,
-            format!("#!/bin/sh\nprintf '%s\\n' '{failure_message}'\n"),
-        )
-        .expect("write failure hook");
-        make_executable(&failure_path);
+        let manifest = serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "description": "hook plugin",
+            "hooks": {
+                "PreToolUse": [pre_cmd],
+                "PostToolUse": [post_cmd],
+                "PostToolUseFailure": [failure_cmd]
+            }
+        });
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
-            format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"],\n    \"PostToolUseFailure\": [\"./hooks/failure.sh\"]\n  }}\n}}"
-            ),
+            manifest.to_string(),
         )
         .expect("write plugin manifest");
     }
@@ -560,8 +548,14 @@ mod tests {
     #[test]
     fn pre_tool_use_denies_when_plugin_hook_exits_two() {
         // given
+        let deny_command = if cfg!(windows) {
+            // cmd /C "echo blocked by plugin& exit /b 2"
+            "echo blocked by plugin& exit /b 2"
+        } else {
+            "printf 'blocked by plugin'; exit 2"
+        };
         let runner = HookRunner::new(crate::PluginHooks {
-            pre_tool_use: vec!["printf 'blocked by plugin'; exit 2".to_string()],
+            pre_tool_use: vec![deny_command.to_string()],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
         });
@@ -577,11 +571,19 @@ mod tests {
     #[test]
     fn propagates_plugin_hook_failures() {
         // given
-        let runner = HookRunner::new(crate::PluginHooks {
-            pre_tool_use: vec![
+        let (broken_cmd, later_cmd) = if cfg!(windows) {
+            (
+                "echo broken plugin hook& exit /b 1".to_string(),
+                "echo later plugin hook".to_string(),
+            )
+        } else {
+            (
                 "printf 'broken plugin hook'; exit 1".to_string(),
                 "printf 'later plugin hook'".to_string(),
-            ],
+            )
+        };
+        let runner = HookRunner::new(crate::PluginHooks {
+            pre_tool_use: vec![broken_cmd, later_cmd],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
         });
@@ -599,28 +601,5 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message == "later plugin hook"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn generated_hook_scripts_are_executable() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // given
-        let root = temp_dir("exec-guard");
-        write_hook_plugin(&root, "exec-check", "pre", "post", "fail");
-
-        // then
-        for script in ["pre.sh", "post.sh", "failure.sh"] {
-            let path = root.join("hooks").join(script);
-            let mode = fs::metadata(&path)
-                .unwrap_or_else(|e| panic!("{script} metadata: {e}"))
-                .permissions()
-                .mode();
-            assert!(
-                mode & 0o111 != 0,
-                "{script} must have at least one execute bit set, got mode {mode:#o}"
-            );
-        }
     }
 }
