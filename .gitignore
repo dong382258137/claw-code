@@ -1,6 +1,10 @@
 __pycache__/
 archive/
 .omx/
+# Environment files (contain API keys / secrets — never commit)
+.env
+.env.*
+!.env.example
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
