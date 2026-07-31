@@ -23,7 +23,7 @@ use crate::prompt::SystemPromptSplit;
 use crate::recovery_orchestrator::RecoveryOrchestrator;
 use crate::recovery_recipes::RecoveryResult;
 // Harness O(编排)层 + V(验证)层接入:Plan/Execute/Review 三段循环。
-// 默认不启用(plan_mode=false),需通过 CLI `--enable-plan-mode` 开启。
+// 默认启用(plan_mode=true)。可通过 settings.json `planMode: false` 关闭。
 // 缓存保护:PlanArtifact 末尾追加到 prompt 变动区(dynamic_sections),
 // 不污染 system_prompt + tools_schema 的"绝对稳定区"。详见
 // docs/harness-engineering-optimization-plan.md Step 2.1 与 §5.2。
@@ -622,7 +622,7 @@ where
             persistent_memory: None,
             turns_since_last_nudge: 0,
             recovery_orchestrator: RecoveryOrchestrator::default(),
-            plan_mode_enabled: false,
+            plan_mode_enabled: true,
             active_plan: None,
             plan_reviewer: PreCompletionChecklistMiddleware::default(),
             workspace_root: None,
@@ -7604,76 +7604,22 @@ mod tests {
         );
     }
 
-    /// 场景 3:flash + Simple + max_attempts=2,validate 第一次失败 → 升级 pro → 第二次成功
+    /// 场景 3:flash + Simple + max_attempts=2,validate 失败 → 无升级路径 → 立即 fail
+    ///
+    /// V4-Flash 正式版(2026-07-31)上线后自动升级链已关闭,
+    /// retryable 失败时无升级路径,直接 fail 而非升级重试。
     #[test]
-    fn dispatch_subagent_scenario3_upgrade_retry_succeeds() {
+    fn dispatch_subagent_scenario3_no_upgrade_fails_immediately() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario3-upgrade-retry-uuid-p0-9-s3";
+        let unique_task = "scenario3-no-upgrade-uuid-p0-9-s3";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        // gate 脚本:第一次 Err(retryable),第二次 Ok
+        // gate 脚本:第一次 Err(retryable)
+        // 自动升级已关闭,第一次失败即终止,不会到达第二次
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
             Some(false), // attempt 1 validate: retryable Err
-            Some(true),  // attempt 2 validate: Ok
-        ])));
-
-        let mut runtime = runtime_with_coordinator(coordinator.clone());
-        let tempdir = tempfile::tempdir().expect("temp workspace");
-        runtime.set_workspace_root(tempdir.path().to_path_buf());
-
-        let input = serde_json::json!({
-            "name": "diag-agent",
-            "task": unique_task,
-            "mode": "fork",
-            "model": "deepseek-v4-flash",
-            "complexity": "simple",
-            "max_attempts": 2
-        })
-        .to_string();
-
-        let output = runtime
-            .execute_dispatch_subagent(&input)
-            .expect("dispatch should succeed");
-
-        // 场景 3:升级后第二次 validate 通过 → completed
-        assert!(
-            output.contains("Subagent `") && output.contains("completed"),
-            "scenario 3 should complete after upgrade: {output}"
-        );
-
-        // 验证 subagent 最终模型升级为 pro
-        let subagent_id = output
-            .split("Subagent `")
-            .nth(1)
-            .and_then(|s| s.split('`').next())
-            .expect("extract subagent_id");
-        let agent = coordinator.get(subagent_id).expect("agent exists");
-        assert_eq!(
-            agent.model.as_deref(),
-            Some("deepseek-v4-pro"),
-            "model should be upgraded to pro after retry"
-        );
-        assert_eq!(agent.attempts, 1, "should have 1 reset (attempt 2)");
-        assert!(agent.validated, "should be validated");
-        assert_eq!(
-            agent.status,
-            crate::multi_agent::SubagentStatus::Completed
-        );
-    }
-
-    /// 场景 4:flash + Simple + max_attempts=2,validate 两次都失败 → 达上限 fail
-    #[test]
-    fn dispatch_subagent_scenario4_upgrade_still_fails() {
-        let _guard = acquire_lane_event_lock();
-        let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario4-still-fails-uuid-p0-9-s4";
-
-        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        // gate 脚本:总是 retryable Err
-        coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
-            Some(false), // attempt 1: retryable Err
-            Some(false), // attempt 2: retryable Err
+            Some(true),  // 不会被消费
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
@@ -7694,10 +7640,70 @@ mod tests {
             .execute_dispatch_subagent(&input)
             .expect("dispatch should not propagate as hard error");
 
-        // 场景 4:达 max_attempts 后 fail
+        // 自动升级已关闭:失败即终止
         assert!(
             output.contains("Subagent `") && output.contains("failed"),
-            "scenario 4 should fail after max_attempts: {output}"
+            "scenario 3 should fail without upgrade: {output}"
+        );
+
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let agent = coordinator.get(subagent_id).expect("agent exists");
+        // 模型不应升级,保持 flash
+        assert_eq!(
+            agent.model.as_deref(),
+            Some("deepseek-v4-flash"),
+            "model should NOT be upgraded (auto-upgrade disabled)"
+        );
+        assert!(!agent.validated, "should not be validated");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Failed
+        );
+    }
+
+    /// 场景 4:flash + Simple + max_attempts=2,validate 失败 → 无升级路径 → fail
+    ///
+    /// 自动升级已关闭,第一次失败即终止,模型保持 flash。
+    #[test]
+    fn dispatch_subagent_scenario4_no_upgrade_fails() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+        let unique_task = "scenario4-no-upgrade-uuid-p0-9-s4";
+
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        // gate 脚本:总是 retryable Err
+        // 自动升级已关闭,第一次失败即终止,第二次不会被消费
+        coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
+            Some(false), // attempt 1: retryable Err
+            Some(false), // 不会被消费
+        ])));
+
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        let input = serde_json::json!({
+            "name": "diag-agent",
+            "task": unique_task,
+            "mode": "fork",
+            "model": "deepseek-v4-flash",
+            "complexity": "simple",
+            "max_attempts": 2
+        })
+        .to_string();
+
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("dispatch should not propagate as hard error");
+
+        // 自动升级已关闭:第一次失败即 fail
+        assert!(
+            output.contains("Subagent `") && output.contains("failed"),
+            "scenario 4 should fail without upgrade: {output}"
         );
 
         let subagent_id = output
@@ -7709,14 +7715,14 @@ mod tests {
         assert_eq!(
             agent.status,
             crate::multi_agent::SubagentStatus::Failed,
-            "should be Failed after exhausting attempts"
+            "should be Failed"
         );
         assert!(!agent.validated, "should not be validated");
-        // 模型应已升级到 pro(attempt 1 失败后升级)
+        // 模型不应升级,保持 flash
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-pro"),
-            "model should be upgraded to pro"
+            Some("deepseek-v4-flash"),
+            "model should NOT be upgraded (auto-upgrade disabled)"
         );
     }
 
@@ -7789,24 +7795,27 @@ mod tests {
         );
     }
 
-    /// 场景 5 补充:cost_limit 足够大时,升级不被阻止(对比测试)
+    /// 场景 5 补充:cost_limit 足够大,但自动升级已关闭 → 仍 fail
+    ///
+    /// V4-Flash 正式版上线后自动升级链已关闭,
+    /// 即使成本上限足够,也不会升级到 pro,直接 fail。
     #[test]
-    fn dispatch_subagent_scenario5_high_cost_limit_allows_upgrade() {
+    fn dispatch_subagent_scenario5_high_cost_limit_no_upgrade_disabled() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario5-high-limit-uuid-p0-9-s5b";
+        let unique_task = "scenario5-high-limit-no-upgrade-uuid-p0-9-s5b";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
-            Some(false), // attempt 1: retryable Err → 触发升级
-            Some(true),  // attempt 2: Ok
+            Some(false), // attempt 1: retryable Err
+            Some(true),  // 不会被消费(自动升级已关闭)
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
         let tempdir = tempfile::tempdir().expect("temp workspace");
         runtime.set_workspace_root(tempdir.path().to_path_buf());
 
-        // cost_limit=10.0:足够大,不阻止升级
+        // cost_limit=10.0:足够大,但自动升级已关闭
         let input = serde_json::json!({
             "name": "diag-agent",
             "task": unique_task,
@@ -7820,12 +7829,12 @@ mod tests {
 
         let output = runtime
             .execute_dispatch_subagent(&input)
-            .expect("dispatch should succeed");
+            .expect("dispatch should not propagate as hard error");
 
-        // 高成本上限:升级成功 → completed
+        // 自动升级已关闭:即使成本上限足够,也直接 fail
         assert!(
-            output.contains("completed"),
-            "high cost_limit should allow upgrade and complete: {output}"
+            output.contains("failed"),
+            "should fail without upgrade even with high cost_limit: {output}"
         );
 
         let subagent_id = output
@@ -7834,10 +7843,11 @@ mod tests {
             .and_then(|s| s.split('`').next())
             .expect("extract subagent_id");
         let agent = coordinator.get(subagent_id).expect("agent exists");
+        // 模型不应升级,保持 flash
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-pro"),
-            "model should be upgraded to pro with high cost_limit"
+            Some("deepseek-v4-flash"),
+            "model should NOT be upgraded (auto-upgrade disabled)"
         );
     }
 

@@ -96,23 +96,26 @@ impl UpgradeEntry {
 
 /// 内置升级表（配置文件不存在时使用）。
 ///
-/// | 当前模型 | 目标模型 | cost_multiplier | 链 |
-/// |---|---|---|---|
-/// | DeepSeek | deepseek-v4-flash | deepseek-v4-pro | 10.0 | 单跳 |
+/// 历史升级链(V4-Flash 正式版发布前):
+///   deepseek-v4-flash → deepseek-v4-pro (cost_multiplier=10.0)
+///
+/// 2026-07-31 V4-Flash 正式版上线后,Agent 能力全面超越 Pro 预览版且价格更低,
+/// 自动升级链已关闭。Pro 正式版发布后再评估是否重新启用。
+///
+/// 配置文件 `~/.claw/model-upgrades.json` 仍可由用户自行覆盖。
 fn default_upgrades() -> HashMap<String, UpgradeEntry> {
-    let mut map = HashMap::new();
+    let map = HashMap::new();
 
-    // === DeepSeek 链:flash → pro ===
-    // flash (Budget) → pro (Flagship)，成本约 10 倍
-    map.insert(
-        "deepseek-v4-flash".to_string(),
-        UpgradeEntry::new("deepseek-v4-pro", 10.0),
-    );
+    // 自动升级已关闭 — 如需恢复,取消下方注释:
+    // map.insert(
+    //     "deepseek-v4-flash".to_string(),
+    //     UpgradeEntry::new("deepseek-v4-pro", 10.0),
+    // );
     // pro 本身是旗舰，返回自身作为哨兵值
-    map.insert(
-        "deepseek-v4-pro".to_string(),
-        UpgradeEntry::new("deepseek-v4-pro", 1.0),
-    );
+    // map.insert(
+    //     "deepseek-v4-pro".to_string(),
+    //     UpgradeEntry::new("deepseek-v4-pro", 1.0),
+    // );
 
     map
 }
@@ -256,9 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_deepseek_flash_to_pro() {
+    fn upgrade_deepseek_flash_returns_none_when_disabled() {
+        // V4-Flash 正式版(2026-07-31)上线后自动升级链已关闭
         let upgraded = upgrade_model("deepseek-v4-flash");
-        assert_eq!(upgraded.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(upgraded, None);
     }
 
     #[test]
@@ -275,11 +279,9 @@ mod tests {
 
     #[test]
     fn upgrade_cost_multiplier_deepseek() {
-        // flash → pro: 10x
-        assert_eq!(upgrade_cost_multiplier("deepseek-v4-flash"), 10.0);
-        // pro: no upgrade, 1.0
+        // 自动升级已关闭,所有模型 cost_multiplier 均为 1.0
+        assert_eq!(upgrade_cost_multiplier("deepseek-v4-flash"), 1.0);
         assert_eq!(upgrade_cost_multiplier("deepseek-v4-pro"), 1.0);
-        // unknown: 1.0
         assert_eq!(upgrade_cost_multiplier("unknown-model"), 1.0);
     }
 

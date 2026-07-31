@@ -152,7 +152,9 @@ use ultraplan::{
     InternalPromptProgressState, INTERNAL_PROGRESS_HEARTBEAT_INTERVAL,
 };
 
-pub const DEFAULT_MODEL: &str = "deepseek-v4-pro";
+// V4-Flash 正式版(2026-07-31)Agent 能力全面超越 Pro 预览版,且价格更低,
+// 作为默认模型。Pro 正式版发布后再评估是否切换。
+pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
