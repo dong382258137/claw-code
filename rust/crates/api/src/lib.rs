@@ -1,4 +1,5 @@
 #![allow(clippy::result_large_err)]
+mod cache_break_detection;
 mod client;
 mod error;
 mod http_client;
@@ -6,6 +7,10 @@ mod providers;
 mod sse;
 mod types;
 
+pub use cache_break_detection::{
+    cache_break_root, CacheBreakConfig, CacheBreakDetector, CacheBreakEvent, CacheBreakPaths,
+    CacheBreakRecord, CacheBreakReasons, CacheBreakStats,
+};
 pub use client::{read_base_url, MessageStream, ProviderClient};
 pub use error::{ApiError, TypedErrorEnvelope, TypedErrorPayload};
 pub use http_client::{

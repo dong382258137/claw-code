@@ -309,26 +309,194 @@ pub(crate) fn run_doctor(
     Ok(())
 }
 
-/// `claw doctor --cache-stats`:已废弃。
+/// `claw doctor --cache-stats`:服务端 prefix cache 命中率下降检测。
 ///
-/// 客户端 prompt cache(prompt_cache.rs)已移除。DeepSeek 服务端前缀缓存
-/// 的命中信息通过 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
-/// 字段在每次 API 响应中返回,并由 TUI 状态栏实时显示,无需跨 session 汇总。
+/// 汇总所有 session 的 cache break 统计,按根因分类显示。
+/// 数据来源:`streaming.rs::record_cache_break` 每次请求后写入的
+/// `~/.claude/cache/prompt-cache/<session>/stats.json`。
 fn run_doctor_cache_stats(
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use api::{cache_break_root, CacheBreakReasons, CacheBreakStats};
+
+    let root = cache_break_root();
+
+    let mut aggregated_breaks = CacheBreakReasons::default();
+    let mut aggregated_creation_tokens: u64 = 0;
+    let mut aggregated_read_tokens: u64 = 0;
+    let mut aggregated_tracked_requests: u64 = 0;
+    let mut aggregated_unexpected_breaks: u64 = 0;
+    let mut aggregated_expected_invalidations: u64 = 0;
+    let mut session_count: u32 = 0;
+    let mut last_break_reason: Option<String> = None;
+    let mut last_read_tokens: Option<u32> = None;
+    let mut last_creation_tokens: Option<u32> = None;
+
+    if root.exists() {
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let stats_path = entry.path().join("stats.json");
+            if !stats_path.exists() {
+                continue;
+            }
+            let raw = match fs::read(&stats_path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let stats: CacheBreakStats = match serde_json::from_slice(&raw) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            session_count += 1;
+            aggregated_breaks.model_changed += stats.break_reasons.model_changed;
+            aggregated_breaks.system_prompt_changed += stats.break_reasons.system_prompt_changed;
+            aggregated_breaks.tool_definitions_changed +=
+                stats.break_reasons.tool_definitions_changed;
+            aggregated_breaks.message_payload_changed += stats.break_reasons.message_payload_changed;
+            aggregated_breaks.ttl_expiry += stats.break_reasons.ttl_expiry;
+            aggregated_breaks.unknown += stats.break_reasons.unknown;
+            aggregated_creation_tokens += stats.total_cache_creation_input_tokens;
+            aggregated_read_tokens += stats.total_cache_read_input_tokens;
+            aggregated_tracked_requests += stats.tracked_requests;
+            aggregated_unexpected_breaks += stats.unexpected_cache_breaks;
+            aggregated_expected_invalidations += stats.expected_invalidations;
+            if let Some(reason) = stats.last_break_reason {
+                last_break_reason = Some(reason);
+            }
+            if let Some(v) = stats.last_cache_read_input_tokens {
+                last_read_tokens = Some(v);
+            }
+            if let Some(v) = stats.last_cache_creation_input_tokens {
+                last_creation_tokens = Some(v);
+            }
+        }
+    }
+
     match output_format {
         CliOutputFormat::Text => {
-            println!("`--cache-stats` 已废弃:客户端 prompt cache 已移除。");
-            println!("  DeepSeek 服务端前缀缓存命中信息在每次 API 响应中返回,");
-            println!("  并由 TUI 状态栏实时显示(cache_read/cache_creation tokens)。");
+            if session_count == 0 {
+                println!("Cache Break 监控:暂无 session stats 文件。");
+                println!("  提示:运行一次 `claw` 对话后,stats 会在每次请求后持久化到:");
+                println!("  {}", root.display());
+                return Ok(());
+            }
+            println!(
+                "Cache Break 监控(汇总 {} 个 session,根目录 {})",
+                session_count,
+                root.display()
+            );
+            println!();
+            println!("== Cache Break 原因分布 ==");
+            let total_breaks = aggregated_breaks.total();
+            println!("  总 break 事件:{}", total_breaks);
+            if total_breaks > 0 {
+                let pct = |n: u64| (n as f64 * 100.0 / total_breaks as f64).round() as u64;
+                println!(
+                    "    model_changed           : {:>5} ({:>3}%)",
+                    aggregated_breaks.model_changed,
+                    pct(aggregated_breaks.model_changed)
+                );
+                println!(
+                    "    system_prompt_changed   : {:>5} ({:>3}%)  ← 动态值泄漏到静态区",
+                    aggregated_breaks.system_prompt_changed,
+                    pct(aggregated_breaks.system_prompt_changed)
+                );
+                println!(
+                    "    tool_definitions_changed: {:>5} ({:>3}%)  ← 动态值泄漏到静态区",
+                    aggregated_breaks.tool_definitions_changed,
+                    pct(aggregated_breaks.tool_definitions_changed)
+                );
+                println!(
+                    "    message_payload_changed : {:>5} ({:>3}%)  (正常,每 turn 都变)",
+                    aggregated_breaks.message_payload_changed,
+                    pct(aggregated_breaks.message_payload_changed)
+                );
+                println!(
+                    "    ttl_expiry              : {:>5} ({:>3}%)  (provider 侧 TTL)",
+                    aggregated_breaks.ttl_expiry,
+                    pct(aggregated_breaks.ttl_expiry)
+                );
+                println!(
+                    "    unknown                 : {:>5} ({:>3}%)  ← 指纹未变但命中率下降",
+                    aggregated_breaks.unknown,
+                    pct(aggregated_breaks.unknown)
+                );
+            }
+            println!();
+            println!("== Token 累计 ==");
+            println!(
+                "  tracked_requests          : {}",
+                aggregated_tracked_requests
+            );
+            println!(
+                "  total_cache_read_tokens   : {} (命中)",
+                aggregated_read_tokens
+            );
+            println!(
+                "  total_cache_creation_tokens: {} (未命中写入)",
+                aggregated_creation_tokens
+            );
+            let hit_rate = if aggregated_read_tokens + aggregated_creation_tokens > 0 {
+                (aggregated_read_tokens as f64 * 100.0
+                    / (aggregated_read_tokens + aggregated_creation_tokens) as f64)
+                    .round() as u64
+            } else {
+                0
+            };
+            println!("  累计命中率:{}%", hit_rate);
+            println!();
+            println!("== 异常检测 ==");
+            println!(
+                "  unexpected_cache_breaks   : {} (指纹未变但命中率突降)",
+                aggregated_unexpected_breaks
+            );
+            println!(
+                "  expected_invalidations    : {} (指纹变化导致的预期失效)",
+                aggregated_expected_invalidations
+            );
+            if let Some(reason) = &last_break_reason {
+                println!("  last_break_reason         : {}", reason);
+            }
+            if let (Some(read), Some(creation)) = (last_read_tokens, last_creation_tokens) {
+                let last_total = read + creation;
+                let last_hit_rate = if last_total > 0 {
+                    (read as f64 * 100.0 / last_total as f64).round() as u64
+                } else {
+                    0
+                };
+                println!(
+                    "  last_response             : read={} creation={} hit_rate={}%",
+                    read, creation, last_hit_rate
+                );
+            }
         }
         CliOutputFormat::Json => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "deprecated": true,
-                    "reason": "client-side prompt cache removed; DeepSeek server-side prefix caching stats are shown per-response in TUI",
+                    "session_count": session_count,
+                    "break_reasons": {
+                        "total": aggregated_breaks.total(),
+                        "model_changed": aggregated_breaks.model_changed,
+                        "system_prompt_changed": aggregated_breaks.system_prompt_changed,
+                        "tool_definitions_changed": aggregated_breaks.tool_definitions_changed,
+                        "message_payload_changed": aggregated_breaks.message_payload_changed,
+                        "ttl_expiry": aggregated_breaks.ttl_expiry,
+                        "unknown": aggregated_breaks.unknown,
+                    },
+                    "tokens": {
+                        "tracked_requests": aggregated_tracked_requests,
+                        "total_cache_read_input_tokens": aggregated_read_tokens,
+                        "total_cache_creation_input_tokens": aggregated_creation_tokens,
+                        "cumulative_hit_rate_pct": if aggregated_read_tokens + aggregated_creation_tokens > 0 {
+                            (aggregated_read_tokens as f64 * 100.0 / (aggregated_read_tokens + aggregated_creation_tokens) as f64).round() as u64
+                        } else { 0 },
+                    },
+                    "anomalies": {
+                        "unexpected_cache_breaks": aggregated_unexpected_breaks,
+                        "expected_invalidations": aggregated_expected_invalidations,
+                        "last_break_reason": last_break_reason,
+                    },
                 }))?
             );
         }

@@ -27,7 +27,7 @@ use api::{
 };
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
-    PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeError, SystemPromptSplit,
+    PermissionMode, PermissionPolicy, RuntimeError, SystemPromptSplit,
     TokenUsage,
 };
 use serde_json::json;
@@ -181,6 +181,12 @@ pub(crate) struct AnthropicRuntimeClient {
     /// Optional callback for emitting streaming events to a status observer
     /// (e.g., the TUI's persistent status bar). None in non-TUI mode.
     status_emitter: Option<StatusEmitter>,
+    /// 服务端 prefix cache 命中率下降检测器。
+    ///
+    /// 每次请求记录 prompt 指纹,与上次对比,命中率下降超过阈值时触发 break event。
+    /// 持久化到 `~/.claude/cache/prompt-cache/<session>/stats.json`,供
+    /// `claw doctor --cache-stats` 诊断。不缓存响应(只做检测)。
+    cache_break_detector: api::CacheBreakDetector,
 }
 
 impl AnthropicRuntimeClient {
@@ -212,6 +218,7 @@ impl AnthropicRuntimeClient {
             progress_reporter,
             reasoning_effort: None,
             status_emitter: None,
+            cache_break_detector: api::CacheBreakDetector::new(session_id),
         })
     }
 
@@ -259,6 +266,23 @@ impl AnthropicRuntimeClient {
             recoverable,
         });
         RuntimeError::new(msg)
+    }
+
+    /// 记录 cache break 检测数据。
+    ///
+    /// 从 TokenUsage 还原 api::Usage,调用 detector 记录本次请求的 prompt 指纹
+    /// 和 cache 命中情况。usage 为 None 时(流式未收到任何 usage 事件)跳过。
+    fn record_cache_break(&self, request: &MessageRequest, usage: Option<TokenUsage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let api_usage = api::Usage {
+            input_tokens: usage.input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            output_tokens: usage.output_tokens,
+        };
+        let _ = self.cache_break_detector.record_usage(request, &api_usage);
     }
 }
 
@@ -496,6 +520,10 @@ impl AnthropicRuntimeClient {
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
+        // 追踪流式路径的最终 usage,供 cache_break_detector 在 return 前记录。
+        // MessageStart 携带初始 usage(通常 cache 字段已填充),MessageDelta
+        // 携带累积 usage;后者覆盖前者(更完整)。
+        let mut final_usage: Option<TokenUsage> = None;
 
         loop {
             // P3:事件间超时保护 — 统一用 tokio::time::timeout 包装 next_event。
@@ -581,6 +609,7 @@ impl AnthropicRuntimeClient {
                     }
                     events.push(AssistantEvent::Usage(start.message.usage.token_usage()));
                     self.emit_status(StatusEvent::Usage(start.message.usage.token_usage()));
+                    final_usage = Some(start.message.usage.token_usage());
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
                     let pre_len = events.len();
@@ -714,6 +743,7 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::MessageDelta(delta) => {
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
                     self.emit_status(StatusEvent::Usage(delta.usage.token_usage()));
+                    final_usage = Some(delta.usage.token_usage());
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -745,6 +775,7 @@ impl AnthropicRuntimeClient {
             .iter()
             .any(|event| matches!(event, AssistantEvent::MessageStop))
         {
+            self.record_cache_break(message_request, final_usage);
             return Ok(events);
         }
 
@@ -760,7 +791,10 @@ impl AnthropicRuntimeClient {
                 let msg = format_user_visible_api_error(&self.session_id, &error);
                 self.emit_stream_error(msg, false)
             })?;
+        // 非流式回退路径:从 response.usage 记录 cache break。
+        let fallback_usage = response.usage.token_usage();
         let events = response_to_events(response, out)?;
+        self.record_cache_break(message_request, Some(fallback_usage));
         Ok(events)
     }
 }

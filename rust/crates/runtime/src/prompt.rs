@@ -490,23 +490,16 @@ impl SystemPromptBuilder {
                 sections.push(section);
             }
         }
-        // Plan mode constraint: when plan_mode is enabled (default), inject a
-        // hard constraint forcing the model to invoke `brainstorming` and
-        // `writing-plans` skills before producing any design/plan for complex
-        // tasks. Simple tasks (assess_complexity != Complex) never trigger
-        // PlanArtifact creation, so the constraint is inert for them — zero
-        // cost for small tasks, enforced for complex ones.
-        //
-        // The constraint text intentionally contains NO detailed checklist —
-        // the 9-item implementation-feasibility review lives in the skills'
-        // Self-Review sections (A). This keeps the prompt minimal (C's job is
-        // to force-trigger the skills, not duplicate their content).
+        sections.extend(self.append_sections.iter().cloned());
+        // Plan mode constraint: 放在 dynamic region 最末端,最大化与旧版
+        // prompt 的公共前缀长度(append_sections 及之前的部分可命中服务端
+        // prefix cache),减少缓存失效范围。constraint 文本本身 session 内
+        // 稳定,放末端不影响 cache 命中,且 LLM 对末尾约束更敏感。
         if let Some(config) = &self.config {
             if config.feature_config().plan_mode().unwrap_or(true) {
                 sections.push(render_plan_mode_constraint_section());
             }
         }
-        sections.extend(self.append_sections.iter().cloned());
         sections
     }
 
