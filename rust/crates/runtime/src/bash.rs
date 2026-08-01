@@ -1,13 +1,14 @@
 use std::env;
 use std::io;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
-use tokio::time::timeout;
 
 use crate::lane_events::{LaneEvent, ShipMergeMethod, ShipProvenance};
 use crate::sandbox::{
@@ -15,6 +16,33 @@ use crate::sandbox::{
     SandboxConfig, SandboxStatus,
 };
 use crate::ConfigLoader;
+
+/// 全局 bash 中止标志。
+///
+/// TUI 在 Ctrl+C 时调用 `set_bash_abort()`,`execute_bash_async` 的 select! loop
+/// 每 100ms 轮询此标志,命中后 kill 子进程并返回 interrupted 输出。
+///
+/// 设计理由:不改 `ToolExecutor::execute` 同步 trait 签名(避免 breaking change),
+/// 用全局 AtomicBool 让 TUI 层的 Ctrl+C 信号穿透到 bash.rs 的子进程 kill。
+/// 一个 turn 内多次 bash 调用串行执行,每次开始前 clear,语义清晰。
+/// subagent 场景:用户 Ctrl+C 中断整个 turn,所有子任务的 bash 都应停止,
+/// 全局标志正好满足此语义。
+static BASH_ABORT_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// 设置全局 bash 中止标志(TUI Ctrl+C 时调用)。
+pub fn set_bash_abort() {
+    BASH_ABORT_FLAG.store(true, Ordering::SeqCst);
+}
+
+/// 清除全局 bash 中止标志(每次 execute_bash 开始前调用)。
+pub fn clear_bash_abort() {
+    BASH_ABORT_FLAG.store(false, Ordering::SeqCst);
+}
+
+/// 检查 bash 是否被中止。
+pub fn is_bash_aborted() -> bool {
+    BASH_ABORT_FLAG.load(Ordering::SeqCst)
+}
 
 /// Input schema for the built-in bash execution tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +105,10 @@ pub struct BashCommandOutput {
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
+
+    // 每次执行前清除中止标志,避免上一轮的 abort 残留影响本次。
+    // TUI 在 Ctrl+C 时 set,这里 clear 确保 turn 内后续 bash 命令正常执行。
+    clear_bash_abort();
 
     if input.run_in_background.unwrap_or(false) {
         let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
@@ -209,32 +241,143 @@ async fn execute_bash_async(
     // Detect and emit ship provenance for git push operations
     detect_and_emit_ship_prepared(&input.command);
 
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
-
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            (result?, false)
-        } else {
-            return Ok(timeout_output(&input, timeout_ms, sandbox_status));
-        }
-    } else {
+    let timeout_ms = input.timeout.unwrap_or_else(|| {
         // 默认超时保护：防止未限范围的命令（如全仓库 grep 无 glob）
         // 执行数十分钟导致 TUI 卡死。120 秒足够覆盖绝大多数合法操作。
         const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-        if let Ok(result) =
-            timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS), command.output()).await
-        {
-            (result?, false)
-        } else {
-            return Ok(timeout_output(&input, DEFAULT_TIMEOUT_MS, sandbox_status));
-        }
-    };
+        DEFAULT_TIMEOUT_MS
+    });
 
-    let (output, interrupted) = output_result;
-    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+    // 用 spawn + select! 替代 command.output()，支持：
+    // 1. 超时 kill 子进程（原 timeout 只放弃 await，子进程可能残留）
+    // 2. Ctrl+C 中断 kill 子进程（原实现完全无法中断）
+    // 3. 并发读 stdout/stderr 避免管道死锁（child 输出超过 64KB pipe buffer 会阻塞）
+    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.stdin(Stdio::null());
+
+    let mut child = command.spawn()?;
+
+    // take stdout/stderr 用于并发读取，避免管道死锁
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+
+    // 独立 buffer 避免 select! 分支间数据竞争
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    let mut tmp_out = [0u8; 8192];
+    let mut tmp_err = [0u8; 8192];
+
+    let start = Instant::now();
+    let timeout_dur = Duration::from_millis(timeout_ms);
+    let poll_interval = Duration::from_millis(100);
+
+    let mut exit_status: Option<i32> = None;
+    let mut child_exited = false;
+    let mut aborted = false;
+    let mut timed_out = false;
+
+    // select! loop：
+    // - child 未退出时：并发等待 child.wait() / 超时 / abort / 读 stdout / 读 stderr
+    // - child 退出后：继续读 stdout/stderr 直到 EOF（pipe 中可能有残留数据）
+    // - stdout/stderr 都 EOF 且 child 已退出时：break
+    loop {
+        if child_exited && child_stdout.is_none() && child_stderr.is_none() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+
+            // 分支 1：子进程退出（仅在未退出时等待）
+            status = child.wait(), if !child_exited => {
+                match status {
+                    Ok(s) => { exit_status = s.code(); }
+                    Err(_) => { exit_status = None; }
+                }
+                child_exited = true;
+            }
+
+            // 分支 2：轮询超时和 abort（仅在 child 未退出时检查）
+            _ = tokio::time::sleep(poll_interval), if !child_exited => {
+                if is_bash_aborted() {
+                    aborted = true;
+                    let _ = child.kill().await;
+                    // 不 wait（会阻塞），让 loop 继续，child_exited 会在下轮设为 true
+                    child_exited = true;
+                } else if start.elapsed() >= timeout_dur {
+                    timed_out = true;
+                    let _ = child.kill().await;
+                    child_exited = true;
+                }
+            }
+
+            // 分支 3：读 stdout
+            n = async {
+                if let Some(ref mut stdout) = child_stdout {
+                    stdout.read(&mut tmp_out).await
+                } else {
+                    std::future::pending::<io::Result<usize>>().await
+                }
+            }, if child_stdout.is_some() => {
+                match n {
+                    Ok(0) => { child_stdout = None; }
+                    Ok(n) => { stdout_buf.extend_from_slice(&tmp_out[..n]); }
+                    Err(_) => { child_stdout = None; }
+                }
+            }
+
+            // 分支 4：读 stderr
+            n = async {
+                if let Some(ref mut stderr) = child_stderr {
+                    stderr.read(&mut tmp_err).await
+                } else {
+                    std::future::pending::<io::Result<usize>>().await
+                }
+            }, if child_stderr.is_some() => {
+                match n {
+                    Ok(0) => { child_stderr = None; }
+                    Ok(n) => { stderr_buf.extend_from_slice(&tmp_err[..n]); }
+                    Err(_) => { child_stderr = None; }
+                }
+            }
+        }
+    }
+
+    // abort：用户 Ctrl+C 中断
+    if aborted {
+        let stdout = truncate_output(&String::from_utf8_lossy(&stdout_buf));
+        let stderr = truncate_output(&String::from_utf8_lossy(&stderr_buf));
+        return Ok(BashCommandOutput {
+            stdout,
+            stderr: format!("[interrupt] Command interrupted by user (Ctrl+C)\n{stderr}"),
+            raw_output_path: None,
+            interrupted: true,
+            is_image: None,
+            background_task_id: None,
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
+            dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+            return_code_interpretation: Some("interrupted".to_string()),
+            no_output_expected: Some(false),
+            structured_content: None,
+            persisted_output_path: None,
+            persisted_output_size: None,
+            sandbox_status: Some(sandbox_status),
+            shell_type: Some(detect_shell_type().as_str().to_string()),
+        });
+    }
+
+    // 超时
+    if timed_out {
+        return Ok(timeout_output(&input, timeout_ms, sandbox_status));
+    }
+
+    // 正常完成
+    let stdout = truncate_output(&String::from_utf8_lossy(&stdout_buf));
+    let stderr = truncate_output(&String::from_utf8_lossy(&stderr_buf));
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
-    let return_code_interpretation = output.status.code().and_then(|code| {
+    let return_code_interpretation = exit_status.and_then(|code| {
         if code == 0 {
             None
         } else {
@@ -246,7 +389,7 @@ async fn execute_bash_async(
         stdout,
         stderr,
         raw_output_path: None,
-        interrupted,
+        interrupted: false,
         is_image: None,
         background_task_id: None,
         backgrounded_by_user: None,

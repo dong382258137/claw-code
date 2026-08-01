@@ -1331,6 +1331,10 @@ fn run_event_loop(
                         // 正在进行的 API 流式请求无法中断（阻塞 IO），但可以阻止
                         // 下一轮迭代（不再发起新请求、不再执行新工具）。
                         crate::diag_log("[turn-abort] Ctrl+C interrupt signal sent");
+                        // 设置全局 bash 中止标志：execute_bash_async 的 select! loop
+                        // 会在 ≤100ms 内检测到并 kill 子进程，让长时间运行的
+                        // bash 命令（如 sleep 90）能被即时中断。
+                        runtime::bash::set_bash_abort();
                         if let Some(ref signal) = current_abort_signal {
                             signal.abort();
                             if let Ok(mut buf) = output_view.shared_handle().lock() {

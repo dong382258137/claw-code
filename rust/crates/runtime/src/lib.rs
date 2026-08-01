@@ -5,7 +5,7 @@
 //! that drives interactive and one-shot turns.
 
 mod approval_tokens;
-mod bash;
+pub mod bash;
 pub mod bash_validation;
 pub mod bg;
 mod bootstrap;
