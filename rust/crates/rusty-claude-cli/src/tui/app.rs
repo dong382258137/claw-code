@@ -121,34 +121,47 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
     // 参考 CLI 路径 input.rs 的 `.bracketed_paste(true)`，TUI 路径此前
     // 完全没有启用此模式，导致多行粘贴体验糟糕。
     //
-    // 根因修复：启用 Kitty keyboard protocol 的 DISAMBIGUATE_ESCAPE_CODES
-    // 增强标志。支持该协议的终端（Windows Terminal ≥1.25、WezTerm、
-    // Alacritty、kitty、iTerm2、foot 等）会把 Esc 键编码为 CSI 57344 u、
-    // 方向键编码为 CSI 57374 u 等，**彻底消除** "ESC + [ + A/B" 被拆解
-    // 为三个独立事件导致输入框出现 [A[B 残留的根因问题。
+    // 根因修复：尝试启用 Kitty keyboard protocol 的 DISAMBIGUATE_ESCAPE_CODES
+    // 增强标志。支持该协议的终端（WezTerm、Alacritty、kitty、iTerm2、foot 等）
+    // 会把 Esc 键编码为 CSI 57344 u、方向键编码为 CSI 57374 u 等，**彻底消除**
+    // "ESC + [ + A/B" 被拆解为三个独立事件导致输入框出现 [A[B 残留的根因问题。
     //
-    // 不支持 Kitty 协议的终端（老 conhost、SSH 远端老服务器）：
-    //   crossterm 的 PushKeyboardEnhancementFlags 只是向 stdout 写入
-    //   CSI > 1 u 序列，不支持时该序列被忽略或丢弃，行为与未启用时
-    //   一致，不会更糟。现有 route_key 中的 ESC peek-ahead + InputLine
-    //   的 CSI 状态机 + strip_ansi_and_control 三层兜底仍然保留，覆盖
-    //   不支持 Kitty 的终端场景。
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste,
-        crossterm::event::PushKeyboardEnhancementFlags(
-            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        )
-    )?;
+    // **兼容性**：crossterm 0.28 在 Windows 上的 supports_keyboard_enhancement()
+    // 永远返回 Ok(false)，PushKeyboardEnhancementFlags::execute_winapi() 返回
+    // Err("Keyboard progressive enhancement not implemented for the legacy Windows
+    // API.")。因此必须在调用 Push 前预检，否则 execute! 宏会传播 Err 导致 TUI
+    // 启动失败。不支持 Kitty 的终端走原有 peek-ahead + CSI 状态机 + strip_ansi
+    // 三层兜底。
+    let kitty_enabled = match crossterm::terminal::supports_keyboard_enhancement() {
+        Ok(true) => {
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                crossterm::event::EnableMouseCapture,
+                crossterm::event::EnableBracketedPaste,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )?;
+            true
+        }
+        _ => {
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                crossterm::event::EnableMouseCapture,
+                crossterm::event::EnableBracketedPaste,
+            )?;
+            false
+        }
+    };
 
     // Bug L10 修复：用 TerminalGuard Drop 确保终端状态恢复。
     // 旧实现用 closure + `?` 传播 Err，但 panic 会直接展开栈跳过 closure
     // 和 `result.is_err()` 块，导致 raw mode / alternate screen / mouse
     // capture / bracketed paste 残留，shell 不可用。
     // Drop guard 在任何退出路径（正常返回、Err、panic）都会执行。
-    struct TerminalGuard;
+    struct TerminalGuard { kitty_enabled: bool }
     impl Drop for TerminalGuard {
         fn drop(&mut self) {
             let _ = disable_raw_mode();
@@ -159,17 +172,27 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
             // 不残留 Kitty 增强模式（否则后续 shell 命令的键盘输入会异常）。
             // 顺序与 init 时 push 对应，PopKeyboardEnhancementFlags 发送
             // CSI < u 恢复传统键盘编码。
-            let _ = execute!(
-                stdout,
-                crossterm::event::PopKeyboardEnhancementFlags,
-                LeaveAlternateScreen,
-                crossterm::event::DisableMouseCapture,
-                crossterm::event::DisableBracketedPaste,
-                crossterm::cursor::Show
-            );
+            if self.kitty_enabled {
+                let _ = execute!(
+                    stdout,
+                    crossterm::event::PopKeyboardEnhancementFlags,
+                    LeaveAlternateScreen,
+                    crossterm::event::DisableMouseCapture,
+                    crossterm::event::DisableBracketedPaste,
+                    crossterm::cursor::Show
+                );
+            } else {
+                let _ = execute!(
+                    stdout,
+                    LeaveAlternateScreen,
+                    crossterm::event::DisableMouseCapture,
+                    crossterm::event::DisableBracketedPaste,
+                    crossterm::cursor::Show
+                );
+            }
         }
     }
-    let _terminal_guard = TerminalGuard;
+    let _terminal_guard = TerminalGuard { kitty_enabled };
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;

@@ -321,6 +321,14 @@ impl InputLine {
                         self.csi_state = CsiState::ConsumingCsi;
                     } else if ch == ']' {
                         self.csi_state = CsiState::ConsumingOsc;
+                    } else if ch == '\x1b' {
+                        // 连续 ESC：第二个 \\x1b 在等待 [ 时到达。
+                        // 保持 ExpectingCsi，重新等待 [。
+                        // 修复 crossterm 把 \\x1b[A\\x1b[A 拆解为事件流时
+                        // 第二个 \\x1b 在 ExpectingCsi 状态到达导致退回 Normal、
+                        // 后续 [ 和 A/B 作为普通字符插入 buffer（输入框出现
+                        // [A[B 残留）的根因 3 bug。
+                        self.csi_state = CsiState::ExpectingCsi;
                     } else {
                         // 孤立的 \\x1b（如误触 Esc 键），回到 Normal
                         self.csi_state = CsiState::Normal;
