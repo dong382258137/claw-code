@@ -7,3 +7,4 @@
 
 pub(crate) mod diff_view;
 pub(crate) mod project_picker;
+pub(crate) mod sticky_view;
