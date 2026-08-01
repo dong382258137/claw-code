@@ -566,34 +566,45 @@ impl OutputBuffer {
         // P0-2 修复：增量维护 cached_lines，而非全量 invalidate。
         // 原实现每次 recompute 都 invalidate_lines_cache()，导致下帧 snapshot_lines
         // 全量 ansi_to_lines 解析 ≤256KB 的 cached_snapshot（10-50ms/帧，streaming 时
-        // 每个 TextDelta 都触发），且产生新 Arc 指针使 app.rs 的 wrap 缓存永远 miss。
+        // 每个 TextDelta 都触发）。
         //
-        // 新方案：用 Arc::get_mut 在 strong_count==1 时原地修改 cached_lines，
-        // Arc 指针不变 → app.rs 的 wrap 缓存命中（pointer identity 比较）。
+        // 增量方案：用 Arc::try_unwrap 在 strong_count==1 时取出 Vec，只解析尾部 entry，
+        // 然后创建**新 Arc**。新 Arc 指针变化 → app.rs 的 wrap 缓存正确失效重算。
+        //
+        // 注意：不能用 Arc::get_mut（原地修改不改变指针），否则 wrap 缓存的
+        // pointer identity 比较会命中旧缓存，导致显示旧内容（内容已更新但屏幕不刷新）。
+        // 必须用 try_unwrap 取出 Vec 再创建新 Arc。
         // 主线程 draw 结束后会释放 snapshot_lines 返回的 Arc clone，worker 线程
-        // 获取锁时 cached_lines 通常是唯一引用，get_mut 成功。
+        // 获取锁时 cached_lines 通常是唯一引用，try_unwrap 成功。
         // 若 strong_count>1（主线程仍持有 Arc clone），放弃增量，invalidate 退化全量。
-        if let Some(lines_arc) = self.cached_lines.as_mut() {
-            if let Some(lines) = Arc::get_mut(lines_arc) {
-                // 增量更新成功路径：原地修改，Arc 指针不变
-                // 1. truncate cached_lines_breaks 到 from_idx + 1（保留 [0..=from_idx]）
-                self.cached_lines_breaks.truncate(from_idx + 1);
-                // 2. truncate cached_lines 到 from_idx 对应的起始行
-                let line_start = self
-                    .cached_lines_breaks
-                    .get(from_idx)
-                    .copied()
-                    .expect("breaks[from_idx] must exist after truncate to from_idx+1");
-                lines.truncate(line_start);
-                // 3. 重新解析 from_idx 之后的 entry，追加到 cached_lines
-                for i in from_idx..self.entries.len() {
-                    let rendered = self.entries[i].render();
-                    let entry_lines = ansi_to_lines(&rendered);
-                    lines.extend(entry_lines);
-                    self.cached_lines_breaks.push(lines.len());
+        if let Some(lines_arc) = self.cached_lines.take() {
+            match Arc::try_unwrap(lines_arc) {
+                Ok(mut lines) => {
+                    // 增量更新成功路径：修改 Vec 后创建新 Arc
+                    // 1. truncate cached_lines_breaks 到 from_idx + 1（保留 [0..=from_idx]）
+                    self.cached_lines_breaks.truncate(from_idx + 1);
+                    // 2. truncate cached_lines 到 from_idx 对应的起始行
+                    let line_start = self
+                        .cached_lines_breaks
+                        .get(from_idx)
+                        .copied()
+                        .expect("breaks[from_idx] must exist after truncate to from_idx+1");
+                    lines.truncate(line_start);
+                    // 3. 重新解析 from_idx 之后的 entry，追加到 cached_lines
+                    for i in from_idx..self.entries.len() {
+                        let rendered = self.entries[i].render();
+                        let entry_lines = ansi_to_lines(&rendered);
+                        lines.extend(entry_lines);
+                        self.cached_lines_breaks.push(lines.len());
+                    }
+                    // 创建新 Arc → 指针变化 → app.rs wrap 缓存正确失效
+                    self.cached_lines = Some(Arc::new(lines));
+                    return;
                 }
-                // cached_lines 的 Arc 指针未变，app.rs wrap 缓存命中
-                return;
+                Err(arc) => {
+                    // strong_count > 1（主线程仍持引用）：放回原 Arc，走 invalidate 退化
+                    self.cached_lines = Some(arc);
+                }
             }
         }
         // 退化路径：cached_lines 是 None（首次/被 clear）或 strong_count>1（主线程仍持引用）
