@@ -6,3 +6,4 @@
 //! See `tui-ports/PORTING.md` for the per-module porting ledger.
 
 pub(crate) mod diff_view;
+pub(crate) mod project_picker;
