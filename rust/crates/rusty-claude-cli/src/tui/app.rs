@@ -120,11 +120,27 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
     // 避免多行粘贴时 \n 被当作 Enter 立即提交）。
     // 参考 CLI 路径 input.rs 的 `.bracketed_paste(true)`，TUI 路径此前
     // 完全没有启用此模式，导致多行粘贴体验糟糕。
+    //
+    // 根因修复：启用 Kitty keyboard protocol 的 DISAMBIGUATE_ESCAPE_CODES
+    // 增强标志。支持该协议的终端（Windows Terminal ≥1.25、WezTerm、
+    // Alacritty、kitty、iTerm2、foot 等）会把 Esc 键编码为 CSI 57344 u、
+    // 方向键编码为 CSI 57374 u 等，**彻底消除** "ESC + [ + A/B" 被拆解
+    // 为三个独立事件导致输入框出现 [A[B 残留的根因问题。
+    //
+    // 不支持 Kitty 协议的终端（老 conhost、SSH 远端老服务器）：
+    //   crossterm 的 PushKeyboardEnhancementFlags 只是向 stdout 写入
+    //   CSI > 1 u 序列，不支持时该序列被忽略或丢弃，行为与未启用时
+    //   一致，不会更糟。现有 route_key 中的 ESC peek-ahead + InputLine
+    //   的 CSI 状态机 + strip_ansi_and_control 三层兜底仍然保留，覆盖
+    //   不支持 Kitty 的终端场景。
     execute!(
         stdout,
         EnterAlternateScreen,
         crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
     )?;
 
     // Bug L10 修复：用 TerminalGuard Drop 确保终端状态恢复。
@@ -137,8 +153,15 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
         fn drop(&mut self) {
             let _ = disable_raw_mode();
             let mut stdout = io::stdout();
+            // PopKeyboardEnhancementFlags 必须在 LeaveAlternateScreen 之前
+            // 执行：某些终端的备用屏幕退出会重置所有 DEC 私有模式，但
+            // Kitty 协议状态在主屏幕层面持久，显式 pop 确保主屏幕 shell
+            // 不残留 Kitty 增强模式（否则后续 shell 命令的键盘输入会异常）。
+            // 顺序与 init 时 push 对应，PopKeyboardEnhancementFlags 发送
+            // CSI < u 恢复传统键盘编码。
             let _ = execute!(
                 stdout,
+                crossterm::event::PopKeyboardEnhancementFlags,
                 LeaveAlternateScreen,
                 crossterm::event::DisableMouseCapture,
                 crossterm::event::DisableBracketedPaste,
@@ -1491,82 +1514,76 @@ fn run_event_loop(
                                 // "@路径第二行内容"。而是把 @路径保存到 pending_at_path，
                                 // 等 pending_paste_lines 为空（conhost 注入完毕）后再
                                 // insert_paste 到 buffer。
+                                //
+                                // P0-1 优化：原实现触发后再次调用 read_clipboard_text()
+                                // 读取完整剪贴板内容（第二次 PowerShell 调用，100-500ms）。
+                                // 现在 try_auto_expand_clipboard 返回原始剪贴板内容，
+                                // 直接复用，消除第二次 PowerShell 调用。
                                 if result.is_some() && !pending_paste_lines.is_empty() {
-                                    // 读取完整剪贴板内容（再读一次，因为 try_auto_expand 没返回）
-                                    match crate::paste::read_clipboard_text() {
-                                        Ok(clipboard_content) => {
-                                            // 写入临时文件，返回 @<路径>
-                                            if let Some(at_path) = write_clipboard_to_temp_file(
-                                                &clipboard_content,
-                                                &session_id,
-                                            ) {
-                                                // 提取用户前缀文字：
-                                                // Submit 内容 = "前缀" + 剪贴板首行
-                                                // drain phase 填充 buffer 时需要保留前缀，
-                                                // 否则用户输入的引导文字会丢失。
-                                                let clip_first = clipboard_content
-                                                    .lines()
-                                                    .next()
-                                                    .unwrap_or("")
-                                                    .trim();
-                                                let prefix = if !clip_first.is_empty()
-                                                    && trimmed.ends_with(clip_first)
-                                                {
-                                                    trimmed[..trimmed.len() - clip_first.len()]
-                                                        .trim()
-                                                        .to_string()
-                                                } else {
-                                                    String::new()
-                                                };
-                                                let composed = if prefix.is_empty() {
-                                                    at_path
-                                                } else {
-                                                    format!("{prefix} {at_path}")
-                                                };
-                                                paste_diag_log(&format!(
-                                                    "  conhost 方案 C: 写文件成功，@路径暂存 prefix={:?} composed={:?}",
-                                                    prefix, composed
-                                                ));
-                                                pending_at_path = Some(composed.clone());
-                                                conhost_suppress_input = true;
-                                                pending_paste_last_line = Some(
-                                                    pending_paste_lines
-                                                        .last()
-                                                        .expect("non-empty check above")
-                                                        .clone(),
-                                                );
-                                                conhost_paste_intercepted = true;
-                                                (composed, String::new())
-                                            } else {
-                                                paste_diag_log("  写文件失败，回退到原行为");
-                                                result.unwrap_or_else(|| {
-                                                    fold_pasted_input(
-                                                        &line,
-                                                        &session_id,
-                                                        &mut paste_id_gen,
-                                                    )
-                                                })
-                                            }
-                                        }
-                                        Err(e) => {
-                                            paste_diag_log(&format!(
-                                                "  读取剪贴板失败: {e}，回退到原行为"
-                                            ));
-                                            result.unwrap_or_else(|| {
-                                                fold_pasted_input(
-                                                    &line,
-                                                    &session_id,
-                                                    &mut paste_id_gen,
-                                                )
-                                            })
-                                        }
+                                    // 复用 try_auto_expand_clipboard 返回的原始剪贴板内容，
+                                    // 不再重复调用 read_clipboard_text()。
+                                    let (display_inner, expanded_inner, clipboard_content) =
+                                        result.expect("checked is_some above");
+                                    // 写入临时文件，返回 @<路径>
+                                    if let Some(at_path) = write_clipboard_to_temp_file(
+                                        &clipboard_content,
+                                        &session_id,
+                                    ) {
+                                        // 提取用户前缀文字：
+                                        // Submit 内容 = "前缀" + 剪贴板首行
+                                        // drain phase 填充 buffer 时需要保留前缀，
+                                        // 否则用户输入的引导文字会丢失。
+                                        let clip_first = clipboard_content
+                                            .lines()
+                                            .next()
+                                            .unwrap_or("")
+                                            .trim();
+                                        let prefix = if !clip_first.is_empty()
+                                            && trimmed.ends_with(clip_first)
+                                        {
+                                            trimmed[..trimmed.len() - clip_first.len()]
+                                                .trim()
+                                                .to_string()
+                                        } else {
+                                            String::new()
+                                        };
+                                        let composed = if prefix.is_empty() {
+                                            at_path
+                                        } else {
+                                            format!("{prefix} {at_path}")
+                                        };
+                                        paste_diag_log(&format!(
+                                            "  conhost 方案 C: 写文件成功，@路径暂存 prefix={:?} composed={:?}",
+                                            prefix, composed
+                                        ));
+                                        pending_at_path = Some(composed.clone());
+                                        conhost_suppress_input = true;
+                                        pending_paste_last_line = Some(
+                                            pending_paste_lines
+                                                .last()
+                                                .expect("non-empty check above")
+                                                .clone(),
+                                        );
+                                        conhost_paste_intercepted = true;
+                                        (composed, String::new())
+                                    } else {
+                                        paste_diag_log("  写文件失败，回退到原行为");
+                                        (display_inner, expanded_inner)
                                     }
                                 } else {
                                     // 未触发或触发但 pending 为空，走原逻辑
-                                    result.unwrap_or_else(|| {
-                                        paste_diag_log("  fallback 到 fold_pasted_input (单行)");
-                                        fold_pasted_input(&line, &session_id, &mut paste_id_gen)
-                                    })
+                                    result
+                                        .map(|(display, expanded, _clipboard)| (display, expanded))
+                                        .unwrap_or_else(|| {
+                                            paste_diag_log(
+                                                "  fallback 到 fold_pasted_input (单行)",
+                                            );
+                                            fold_pasted_input(
+                                                &line,
+                                                &session_id,
+                                                &mut paste_id_gen,
+                                            )
+                                        })
                                 }
                             } else {
                                 // 多行输入（bracketed paste 已触发）：直接 fold
