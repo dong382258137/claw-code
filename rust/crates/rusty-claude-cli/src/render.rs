@@ -1,5 +1,6 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
+use std::sync::OnceLock;
 
 use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
@@ -233,6 +234,26 @@ impl Default for TerminalRenderer {
             syntax_theme,
             color_theme: ColorTheme::default(),
         }
+    }
+}
+
+/// 进程级共享 `TerminalRenderer` 单例。
+///
+/// `SyntaxSet::load_defaults_newlines()` + `ThemeSet::load_defaults()` 加载
+/// 全套语法与主题表，单次构造可达数十毫秒。原 TUI 的 `tool_card.rs`
+/// 在每次 ToolCard 渲染时都 `TerminalRenderer::new()`，导致 cargo test 等
+/// 含大量工具调用的场景每个 card 都重复加载语法集，显著拖慢渲染。
+///
+/// 改为进程级 `OnceLock` 复用单一实例：首次访问时构造，此后零开销。
+/// `TerminalRenderer` 的所有方法都是 `&self`，并发只读访问安全。
+static SHARED_RENDERER: OnceLock<TerminalRenderer> = OnceLock::new();
+
+impl TerminalRenderer {
+    /// 获取进程级共享实例（首次调用时构造，此后零开销返回引用）。
+    /// 用于 TUI ToolCard 渲染等高频路径，避免每次重新加载语法集。
+    #[must_use]
+    pub fn shared() -> &'static Self {
+        SHARED_RENDERER.get_or_init(TerminalRenderer::default)
     }
 }
 

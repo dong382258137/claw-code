@@ -17,8 +17,6 @@ use std::sync::{Arc, Mutex};
 use ansi_to_tui::IntoText;
 use ratatui::text::Line;
 
-use crate::render::TerminalRenderer;
-
 /// 最大保留字节数（Text 条目的总文本长度上限）。
 /// 调大到 256KB 以支持长会话（100+ 工具调用）。
 const MAX_BUFFER_BYTES: usize = 256 * 1024;
@@ -235,18 +233,33 @@ pub(crate) struct OutputBuffer {
     /// snapshot() 直接 clone 此字段，持锁时间 O(n) 纯 memcpy 无业务逻辑。
     cached_snapshot: String,
     cached_lines: Option<Arc<Vec<Line<'static>>>>,
-    renderer: TerminalRenderer,
+    /// 每个 entry 在 cached_lines 中的起始行号。
+    /// 长度 = entries.len() + 1，breaks[0]=0，breaks[i+1] = 前 i+1 个 entry 的总行数。
+    /// 由 recompute_snapshot_tail 增量维护，用于增量更新 cached_lines 时定位截断点。
+    cached_lines_breaks: Vec<usize>,
 }
 
 impl OutputBuffer {
     fn invalidate_lines_cache(&mut self) {
         self.cached_lines = None;
+        self.cached_lines_breaks.clear();
     }
 
     fn snapshot_lines(&mut self) -> Arc<Vec<Line<'static>>> {
         if self.cached_lines.is_none() {
-            let lines = ansi_to_lines(&self.cached_snapshot);
+            // 全量重建：逐 entry 解析（而非 ansi_to_lines 整个 cached_snapshot），
+            // 同时建立 cached_lines_breaks 索引，供后续 recompute 增量更新。
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            let mut breaks: Vec<usize> = Vec::with_capacity(self.entries.len() + 1);
+            breaks.push(0);
+            for entry in &self.entries {
+                let rendered = entry.render();
+                let entry_lines = ansi_to_lines(&rendered);
+                lines.extend(entry_lines);
+                breaks.push(lines.len());
+            }
             self.cached_lines = Some(Arc::new(lines));
+            self.cached_lines_breaks = breaks;
         }
         Arc::clone(
             self.cached_lines
@@ -543,13 +556,48 @@ impl OutputBuffer {
         self.cached_snapshot.truncate(start_byte);
         // 截断 rendered_lengths 到 from_idx
         self.rendered_lengths.truncate(from_idx);
-        // 重新渲染 from_idx 之后的条目
+        // 重新渲染 from_idx 之后的条目，同时更新 cached_snapshot
         for i in from_idx..self.entries.len() {
             let rendered = self.entries[i].render();
             let len = rendered.len();
             self.cached_snapshot.push_str(&rendered);
             self.rendered_lengths.push(len);
         }
+        // P0-2 修复：增量维护 cached_lines，而非全量 invalidate。
+        // 原实现每次 recompute 都 invalidate_lines_cache()，导致下帧 snapshot_lines
+        // 全量 ansi_to_lines 解析 ≤256KB 的 cached_snapshot（10-50ms/帧，streaming 时
+        // 每个 TextDelta 都触发），且产生新 Arc 指针使 app.rs 的 wrap 缓存永远 miss。
+        //
+        // 新方案：用 Arc::get_mut 在 strong_count==1 时原地修改 cached_lines，
+        // Arc 指针不变 → app.rs 的 wrap 缓存命中（pointer identity 比较）。
+        // 主线程 draw 结束后会释放 snapshot_lines 返回的 Arc clone，worker 线程
+        // 获取锁时 cached_lines 通常是唯一引用，get_mut 成功。
+        // 若 strong_count>1（主线程仍持有 Arc clone），放弃增量，invalidate 退化全量。
+        if let Some(lines_arc) = self.cached_lines.as_mut() {
+            if let Some(lines) = Arc::get_mut(lines_arc) {
+                // 增量更新成功路径：原地修改，Arc 指针不变
+                // 1. truncate cached_lines_breaks 到 from_idx + 1（保留 [0..=from_idx]）
+                self.cached_lines_breaks.truncate(from_idx + 1);
+                // 2. truncate cached_lines 到 from_idx 对应的起始行
+                let line_start = self
+                    .cached_lines_breaks
+                    .get(from_idx)
+                    .copied()
+                    .expect("breaks[from_idx] must exist after truncate to from_idx+1");
+                lines.truncate(line_start);
+                // 3. 重新解析 from_idx 之后的 entry，追加到 cached_lines
+                for i in from_idx..self.entries.len() {
+                    let rendered = self.entries[i].render();
+                    let entry_lines = ansi_to_lines(&rendered);
+                    lines.extend(entry_lines);
+                    self.cached_lines_breaks.push(lines.len());
+                }
+                // cached_lines 的 Arc 指针未变，app.rs wrap 缓存命中
+                return;
+            }
+        }
+        // 退化路径：cached_lines 是 None（首次/被 clear）或 strong_count>1（主线程仍持引用）
+        // 全量重建交给下次 snapshot_lines() 调用，这里只 invalidate。
         self.invalidate_lines_cache();
     }
 
@@ -681,6 +729,7 @@ impl OutputView {
         guard.rendered_lengths.clear();
         guard.cached_snapshot.clear();
         guard.cached_lines = None;
+        guard.cached_lines_breaks.clear();
     }
 
     /// 总写入字节数。

@@ -94,8 +94,10 @@ pub(crate) fn render_tool_result(
     input: Option<&str>,
     collapsed: bool,
 ) -> String {
-    let lines: Vec<&str> = output.lines().collect();
-    let line_count = lines.len();
+    // P1-4 修复:折叠分支只显示前几行,无需全量 collect。
+    // 原实现 `output.lines().collect::<Vec<&str>>()` 即便折叠到 3 行预览
+    // 也遍历全部 N 行(如 cargo test 3000 行输出 = 3000 次分配)。
+    // 现在按需计算:折叠时只取预览行数 + 1 用作计数判断;完整视图才 collect 全量。
     let icon = if is_error { "❌" } else { "✅" };
 
     // For edit_file, prepend a diff preview before the result body
@@ -104,6 +106,10 @@ pub(crate) fn render_tool_result(
     } else {
         String::new()
     };
+
+    // 计算总行数:用 lines().count() 是 O(N) 但无 Vec 分配,比 collect 更轻。
+    // 折叠分支只需知道是否 > COLLAPSE_THRESHOLD + 预览行内容,无需全量 Vec。
+    let line_count = output.lines().count();
 
     // Determine if this tool's output should be syntax-highlighted
     let language = detect_language_for_tool(name, output);
@@ -116,7 +122,10 @@ pub(crate) fn render_tool_result(
         }
         let text = slice.join("\n");
         if let Some(lang) = language {
-            let renderer = crate::render::TerminalRenderer::new();
+            // P0-4 修复:用进程级单例,不再每次 ToolCard 渲染都加载语法集。
+            // 原 `TerminalRenderer::new()` 每次都触发 SyntaxSet::load_defaults_newlines()
+            // + ThemeSet::load_defaults(),数十 ms/次,是 ToolCard 渲染的核心瓶颈。
+            let renderer = crate::render::TerminalRenderer::shared();
             let highlighted = renderer.highlight_code(&text, &lang);
             // Add card prefix to each line
             highlighted.lines().map(|l| format!("│ {l}\n")).collect()
@@ -126,8 +135,12 @@ pub(crate) fn render_tool_result(
     };
 
     if collapsed && line_count > COLLAPSE_THRESHOLD {
-        // 折叠预览视图：显示前几行 + 展开提示
-        let preview: String = highlighted_body(&lines[..COLLAPSED_PREVIEW_LINES.min(line_count)]);
+        // 折叠预览视图：只取前几行,不全量 collect
+        let preview_lines: Vec<&str> = output
+            .lines()
+            .take(COLLAPSED_PREVIEW_LINES.min(line_count))
+            .collect();
+        let preview: String = highlighted_body(&preview_lines);
         let hidden = line_count - COLLAPSED_PREVIEW_LINES;
         format!(
             "{diff_prefix}├─ {icon} {name} ({line_count} 行，+{hidden} 行已折叠)\n{preview}├─ [+] 展开（还有 {hidden} 行）\n└─\n"
@@ -135,7 +148,8 @@ pub(crate) fn render_tool_result(
     } else if line_count == 0 {
         format!("{diff_prefix}├─ {icon} {name} (空)\n└─\n")
     } else {
-        // 完整视图
+        // 完整视图:此处必须 collect 全量行用于渲染
+        let lines: Vec<&str> = output.lines().collect();
         let body = highlighted_body(&lines);
         format!("{diff_prefix}├─ {icon} {name} ({line_count} 行)\n{body}└─\n")
     }

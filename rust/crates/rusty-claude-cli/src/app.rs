@@ -444,12 +444,16 @@ pub(crate) fn run_repl(
                     && !trimmed.starts_with('/')
                     && pending_paste_lines.is_empty()
                 {
+                    // P0-1 适配：try_auto_expand_clipboard 现在返回三元组
+                    // (display, expanded, raw_clipboard)。CLI 路径不需要 raw_clipboard，
+                    // 用 _ 丢弃（TUI 路径会复用以避免第二次 PowerShell 调用）。
                     try_auto_expand_clipboard(
                         &trimmed,
                         &cli.session.id,
                         &mut paste_id_gen,
                         &mut pending_paste_lines,
                     )
+                    .map(|(display, expanded, _clipboard)| (display, expanded))
                     .unwrap_or_else(|| {
                         fold_pasted_input(&trimmed, &cli.session.id, &mut paste_id_gen)
                     })

@@ -327,7 +327,10 @@ pub(crate) fn read_clipboard_text() -> Result<String, Box<dyn std::error::Error>
 /// 如果匹配，用剪贴板完整内容替换用户输入，并填充 pending_paste_lines
 /// 以便主循环丢弃后续被 conhost 逐行发送的行。
 ///
-/// 返回 `Some((display, expanded))` 如果触发了剪贴板替换；`None` 表示未触发。
+/// 返回 `Some((display, expanded, raw_clipboard))` 如果触发了剪贴板替换；
+/// `None` 表示未触发。第三个元素是原始剪贴板内容，供调用方复用，避免
+/// 重复调用 `read_clipboard_text`（P0-1 优化：原 TUI 路径触发后还会再读一次
+/// 剪贴板用于写临时文件，两次 PowerShell 调用 = 200-1000ms 主线程冻结）。
 ///
 /// 触发条件（全部满足）：
 /// 1. 剪贴板内容是多行（行数 > 1）
@@ -342,7 +345,7 @@ pub(crate) fn try_auto_expand_clipboard(
     session_id: &str,
     paste_id_gen: &mut u32,
     pending_paste_lines: &mut Vec<String>,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
     paste_log!("[paste-dbg] user_input={:?}", user_input);
     let clipboard = match read_clipboard_text() {
         Ok(c) => c,
@@ -399,7 +402,7 @@ pub(crate) fn try_auto_expand_clipboard(
         "[paste-dbg] triggered! pending={} lines",
         pending_paste_lines.len()
     );
-    Some((display, expanded))
+    Some((display, expanded, clipboard))
 }
 
 /// conhost TUI 路径专用：把剪贴板完整内容写到临时文件，返回 `@<文件路径>` 字符串。
