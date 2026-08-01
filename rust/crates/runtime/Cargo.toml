@@ -31,6 +31,16 @@ lsp-types = "0.95"
 # SemanticRecaller 在 feature 关闭时退化到 keyword fallback。
 fastembed = { version = "5", optional = true }
 
+# bash 智能超时检测器：Windows 上用 GetProcessTimes + CreateToolhelp32Snapshot
+# 查询子进程树 CPU 时间，区分"长计算无输出"和"死锁挂起"。
+# 仅作 Windows target 依赖（其他平台用 /proc），不影响非 Windows 编译。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 

@@ -241,11 +241,18 @@ async fn execute_bash_async(
     // Detect and emit ship provenance for git push operations
     detect_and_emit_ship_prepared(&input.command);
 
+    // 决定超时模式：
+    // - Some(timeout) → 固定墙钟超时（模型显式指定，保持向后兼容）
+    // - None → 智能活跃度检测（idle 5min / hard 1h，详见 activity_monitor 模块）
+    //          智能模式基于子进程树 CPU 时间 + stdout/stderr 流量判断是否真死锁，
+    //          不再因"墙钟时间到"就误杀合法长任务（如回测、训练、编译）。
+    let smart_mode = input.timeout.is_none();
     let timeout_ms = input.timeout.unwrap_or_else(|| {
-        // 默认超时保护：防止未限范围的命令（如全仓库 grep 无 glob）
-        // 执行数十分钟导致 TUI 卡死。120 秒足够覆盖绝大多数合法操作。
-        const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-        DEFAULT_TIMEOUT_MS
+        // 智能模式下的兜底硬上限：1 小时。
+        // 真死锁会在 5min idle_timeout 时被提前 kill；
+        // 1h 是绝对上限，防止活跃但失控的任务永久占用资源。
+        const SMART_HARD_LIMIT_MS: u64 = 60 * 60 * 1000;
+        SMART_HARD_LIMIT_MS
     });
 
     // 用 spawn + select! 替代 command.output()，支持：
@@ -272,10 +279,20 @@ async fn execute_bash_async(
     let timeout_dur = Duration::from_millis(timeout_ms);
     let poll_interval = Duration::from_millis(100);
 
+    // 智能模式：初始化 ActivityMonitor，跟踪子进程树活跃度
+    let mut monitor: Option<activity_monitor::ActivityMonitor> = if smart_mode {
+        let pid = child.id().unwrap_or(0);
+        Some(activity_monitor::ActivityMonitor::new(pid))
+    } else {
+        None
+    };
+
     let mut exit_status: Option<i32> = None;
     let mut child_exited = false;
     let mut aborted = false;
     let mut timed_out = false;
+    // 智能模式触发原因（idle vs hard），用于 stderr 消息和 provenance 区分
+    let mut smart_idle = false;
 
     // select! loop：
     // - child 未退出时：并发等待 child.wait() / 超时 / abort / 读 stdout / 读 stderr
@@ -305,7 +322,24 @@ async fn execute_bash_async(
                     let _ = child.kill().await;
                     // 不 wait（会阻塞），让 loop 继续，child_exited 会在下轮设为 true
                     child_exited = true;
+                } else if let Some(ref mut m) = monitor {
+                    // 智能模式：基于子进程树活跃度决策
+                    match m.poll() {
+                        activity_monitor::ActivityDecision::Continue => {}
+                        activity_monitor::ActivityDecision::IdleTimeout => {
+                            timed_out = true;
+                            smart_idle = true;
+                            let _ = child.kill().await;
+                            child_exited = true;
+                        }
+                        activity_monitor::ActivityDecision::HardTimeout => {
+                            timed_out = true;
+                            let _ = child.kill().await;
+                            child_exited = true;
+                        }
+                    }
                 } else if start.elapsed() >= timeout_dur {
+                    // 固定超时模式（input.timeout 显式指定时）
                     timed_out = true;
                     let _ = child.kill().await;
                     child_exited = true;
@@ -322,7 +356,12 @@ async fn execute_bash_async(
             }, if child_stdout.is_some() => {
                 match n {
                     Ok(0) => { child_stdout = None; }
-                    Ok(n) => { stdout_buf.extend_from_slice(&tmp_out[..n]); }
+                    Ok(n) => {
+                        stdout_buf.extend_from_slice(&tmp_out[..n]);
+                        if let Some(ref mut m) = monitor {
+                            m.note_output();
+                        }
+                    }
                     Err(_) => { child_stdout = None; }
                 }
             }
@@ -337,7 +376,12 @@ async fn execute_bash_async(
             }, if child_stderr.is_some() => {
                 match n {
                     Ok(0) => { child_stderr = None; }
-                    Ok(n) => { stderr_buf.extend_from_slice(&tmp_err[..n]); }
+                    Ok(n) => {
+                        stderr_buf.extend_from_slice(&tmp_err[..n]);
+                        if let Some(ref mut m) = monitor {
+                            m.note_output();
+                        }
+                    }
                     Err(_) => { child_stderr = None; }
                 }
             }
@@ -370,6 +414,10 @@ async fn execute_bash_async(
 
     // 超时
     if timed_out {
+        // 智能模式 idle 触发：给出不同消息引导模型重试
+        if smart_idle {
+            return Ok(idle_timeout_output(&input, sandbox_status));
+        }
         return Ok(timeout_output(&input, timeout_ms, sandbox_status));
     }
 
@@ -403,6 +451,53 @@ async fn execute_bash_async(
         sandbox_status: Some(sandbox_status),
         shell_type: Some(detect_shell_type().as_str().to_string()),
     })
+}
+
+/// 智能模式 idle 触发时的输出构造。
+///
+/// 与固定 timeout_output 区分：
+/// - stderr 文案明确指出"5min 无活动"（不是"超过 X ms"）
+/// - return_code_interpretation = "idle.timeout"
+/// - structured_content.provenance = "bash.smart_timeout"
+/// - 引导模型重试时主动设置 timeout 或保证 stdout 流式输出
+fn idle_timeout_output(
+    input: &BashCommandInput,
+    sandbox_status: SandboxStatus,
+) -> BashCommandOutput {
+    let guidance = "\n\n[Smart timeout] Command killed after 5 min of inactivity (no stdout, no stderr, no CPU usage).\n\
+         Likely causes: deadlock, network hang, waiting on unavailable resource, or pure-I/O block.\n\
+         Suggestions:\n\
+         - If this is a long-running task that does not produce output, set `timeout` explicitly\n\
+         - Pipe progress to stdout (e.g. `--progress` flag, periodic `echo` checkpoints)\n\
+         - For network operations, add explicit timeouts (curl --max-time, wget --timeout)\n\
+         - For deadlocks, check thread/lock state in your code";
+    BashCommandOutput {
+        stdout: String::new(),
+        stderr: format!("Command killed after 5 min of inactivity{guidance}"),
+        raw_output_path: None,
+        interrupted: true,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        return_code_interpretation: Some("idle.timeout".to_string()),
+        no_output_expected: Some(true),
+        structured_content: Some(vec![json!({
+            "event": "command.idle_timeout",
+            "failureClass": "idle_timeout",
+            "data": {
+                "command": input.command,
+                "idleSeconds": 300,
+                "provenance": "bash.smart_timeout",
+                "classification": "idle.timeout"
+            }
+        })]),
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: Some(sandbox_status),
+        shell_type: Some(detect_shell_type().as_str().to_string()),
+    }
 }
 
 fn timeout_output(
@@ -883,6 +978,54 @@ mod tests {
         assert_eq!(structured[0]["event"], "test.hung");
         assert_eq!(structured[0]["data"]["provenance"], "bash.timeout");
     }
+
+    /// 智能模式（timeout=None）下短命令应正常完成，不被误杀。
+    /// 验证：未设 timeout 时启用 ActivityMonitor，活跃度检测不会因
+    /// 固定 120s 默认超时触发（短任务本就不会触发），命令在毫秒级完成。
+    #[test]
+    fn smart_mode_completes_short_command_without_timeout() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("printf 'smart_done'"),
+            timeout: None, // 触发智能模式（idle=5min, hard=1h）
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("smart mode should execute short command");
+
+        assert_eq!(output.stdout, "smart_done");
+        assert!(!output.interrupted);
+    }
+
+    /// 智能模式不应因短时间 sleep（无 stdout 输出）被误判为 idle。
+    /// sleep 1s 期间无 stdout，但子进程 CPU 时间在增长（sleep 系统调用
+    /// 占用极小 CPU），且 1s 远小于 5min idle_timeout。
+    #[test]
+    fn smart_mode_does_not_kill_short_sleep_with_echo() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("sleep 1 && echo done"),
+            timeout: None, // 智能模式
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("smart mode should complete short sleep+echo");
+
+        assert!(
+            !output.interrupted,
+            "smart mode should not interrupt short sleep+echo: {:?}",
+            output.stderr
+        );
+        assert!(output.stdout.contains("done"));
+    }
 }
 
 /// Maximum output bytes before truncation (64 KiB).
@@ -939,5 +1082,429 @@ mod truncation_tests {
         let s = "a".repeat(MAX_OUTPUT_BYTES + 1);
         let result = truncate_output(&s);
         assert!(result.contains("[output truncated"));
+    }
+}
+
+/// 智能超时检测器
+///
+/// 替代固定 120s 墙钟超时，基于子进程活跃信号自适应判断：
+/// - stdout/stderr 有新字节 → 流式输出中（永不超时，如 cargo build、回测日志）
+/// - 子进程树 CPU 时间增长 → 长计算中（仅 max_hard_timeout 兜底，如 Python 训练）
+/// - 持续 idle_timeout 无任何活动 → 疑似死锁/挂起，kill
+///
+/// 仅当 BashCommandInput.timeout 为 None 时启用。模型显式指定 timeout 时
+/// 仍走固定墙钟超时（保持向后兼容与可预期性）。
+mod activity_monitor {
+    use std::time::{Duration, Instant};
+
+    /// 默认空闲超时：5 分钟无任何活动（无输出 + 无 CPU 增长）后判定为挂起。
+    /// 足够覆盖网络请求、DB 查询、短暂 IO 阻塞的合法等待。
+    const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+    /// 默认绝对硬上限：1 小时。
+    /// 即使持续有活动，超过此值也强制 kill，防止资源永久占用。
+    const DEFAULT_MAX_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+    /// CPU 采样间隔：避免每 100ms 都全量枚举进程树（Windows ~5ms，Linux ~1ms）。
+    /// 500ms 足够检测到短任务和长任务的 CPU 变化（采样定理）。
+    const CPU_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+
+    /// 活跃度检测决策。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ActivityDecision {
+        /// 继续等待子进程。
+        Continue,
+        /// 空闲超时：长时间无输出也无 CPU 活动，疑似死锁。
+        IdleTimeout,
+        /// 硬上限：超过绝对执行时间上限。
+        HardTimeout,
+    }
+
+    /// 进程活跃度监视器。
+    ///
+    /// 在 execute_bash_async 的 select! loop 中每 100ms 调用 `poll()`。
+    /// stdout/stderr 读到字节时调用 `note_output()` 重置空闲计时器。
+    pub(crate) struct ActivityMonitor {
+        /// 子进程 root PID（bash shell 进程）。
+        root_pid: u32,
+        /// 最后一次观察到 stdout/stderr 字节的时间。
+        last_output_at: Instant,
+        /// 上次采样的子进程树 CPU 时间总和（kernel + user）。
+        last_cpu_time: Duration,
+        /// 上次执行 CPU 采样的时间（限流）。
+        last_refresh_at: Instant,
+        /// 启动时间，用于判断 max_hard_timeout。
+        started_at: Instant,
+        /// 空闲超时阈值。
+        idle_timeout: Duration,
+        /// 绝对硬上限。
+        max_hard_timeout: Duration,
+    }
+
+    impl ActivityMonitor {
+        pub(crate) fn new(root_pid: u32) -> Self {
+            let now = Instant::now();
+            Self {
+                root_pid,
+                last_output_at: now,
+                last_cpu_time: Duration::ZERO,
+                last_refresh_at: now,
+                started_at: now,
+                idle_timeout: DEFAULT_IDLE_TIMEOUT,
+                max_hard_timeout: DEFAULT_MAX_HARD_TIMEOUT,
+            }
+        }
+
+        /// 自定义阈值的构造函数（测试用）。
+        #[cfg(test)]
+        pub(crate) fn with_thresholds(
+            root_pid: u32,
+            idle_timeout: Duration,
+            max_hard_timeout: Duration,
+        ) -> Self {
+            let mut m = Self::new(root_pid);
+            m.idle_timeout = idle_timeout;
+            m.max_hard_timeout = max_hard_timeout;
+            m
+        }
+
+        /// 收到 stdout/stderr 字节时调用，重置空闲计时器。
+        pub(crate) fn note_output(&mut self) {
+            self.last_output_at = Instant::now();
+        }
+
+        /// 每 100ms 轮询一次，返回决策结果。
+        pub(crate) fn poll(&mut self) -> ActivityDecision {
+            let now = Instant::now();
+
+            // 1. 绝对硬上限（优先级最高，无视活跃状态）
+            if now.duration_since(self.started_at) >= self.max_hard_timeout {
+                return ActivityDecision::HardTimeout;
+            }
+
+            // 2. 限流刷新 CPU 采样（避免高频枚举进程树的开销）
+            if now.duration_since(self.last_refresh_at) >= CPU_REFRESH_INTERVAL {
+                let current_cpu =
+                    collect_process_tree_cpu(self.root_pid).unwrap_or(self.last_cpu_time);
+                let cpu_advanced = current_cpu > self.last_cpu_time;
+                self.last_cpu_time = current_cpu;
+                self.last_refresh_at = now;
+
+                // CPU 时间增长 → 子进程树仍在计算，重置空闲计时器
+                if cpu_advanced {
+                    self.last_output_at = now;
+                }
+            }
+
+            // 3. 检查空闲时长
+            if now.duration_since(self.last_output_at) >= self.idle_timeout {
+                return ActivityDecision::IdleTimeout;
+            }
+
+            ActivityDecision::Continue
+        }
+    }
+
+    // ===== 平台实现：Windows =====
+
+    #[cfg(windows)]
+    fn collect_process_tree_cpu(root_pid: u32) -> Option<Duration> {
+        let pids = enum_process_tree_windows(root_pid);
+        if pids.is_empty() {
+            return None;
+        }
+        let mut total = Duration::ZERO;
+        for pid in &pids {
+            if let Some(cpu) = get_process_cpu_time_windows(*pid) {
+                total += cpu;
+            }
+        }
+        Some(total)
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn enum_process_tree_windows(root_pid: u32) -> Vec<u32> {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return vec![root_pid];
+        }
+
+        let mut known: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        known.insert(root_pid);
+
+        // 多轮扫描直到无新发现（进程树深度无上限）
+        // 每轮遍历一次 snapshot，把 parent 在已知集合中的 child 加入。
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut entry: PROCESSENTRY32W = unsafe { MaybeUninit::zeroed().assume_init() };
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+            if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+                break;
+            }
+            loop {
+                let parent = entry.th32ParentProcessID;
+                if known.contains(&parent) && !known.contains(&entry.th32ProcessID) {
+                    known.insert(entry.th32ProcessID);
+                    changed = true;
+                }
+                if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+
+        unsafe { CloseHandle(snapshot) };
+        known.into_iter().collect()
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn get_process_cpu_time_windows(pid: u32) -> Option<Duration> {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut creation: FILETIME = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut exit: FILETIME = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut kernel: FILETIME = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut user: FILETIME = unsafe { MaybeUninit::zeroed().assume_init() };
+
+        let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        unsafe { CloseHandle(handle) };
+
+        if ok == 0 {
+            return None;
+        }
+
+        // FILETIME 是 100ns 单位
+        let kernel_100ns = ((kernel.dwHighDateTime as u64) << 32) | (kernel.dwLowDateTime as u64);
+        let user_100ns = ((user.dwHighDateTime as u64) << 32) | (user.dwLowDateTime as u64);
+        let total_100ns = kernel_100ns + user_100ns;
+        Some(Duration::from_nanos(total_100ns * 100))
+    }
+
+    // ===== 平台实现：Linux =====
+
+    #[cfg(target_os = "linux")]
+    fn collect_process_tree_cpu(root_pid: u32) -> Option<Duration> {
+        let pids = enum_process_tree_linux(root_pid);
+        if pids.is_empty() {
+            return None;
+        }
+        let mut total_ticks: u64 = 0;
+        for pid in &pids {
+            if let Some(ticks) = read_proc_cpu_time(*pid) {
+                total_ticks = total_ticks.saturating_add(ticks);
+            }
+        }
+        // sysconf(_SC_CLK_TCK) 在 Linux 通常为 100
+        let hz = 100u64;
+        let total_ns = total_ticks.checked_mul(1_000_000_000)?.checked_div(hz)?;
+        Some(Duration::from_nanos(total_ns))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn enum_process_tree_linux(root_pid: u32) -> Vec<u32> {
+        let mut known: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        known.insert(root_pid);
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let entries = match std::fs::read_dir("/proc") {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else { continue };
+                let Ok(pid) = name_str.parse::<u32>() else { continue };
+                if known.contains(&pid) {
+                    continue;
+                }
+                if let Some(ppid) = read_proc_ppid(pid) {
+                    if known.contains(&ppid) {
+                        known.insert(pid);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        known.into_iter().collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_proc_stat_field(pid: u32, field_idx: usize) -> Option<u64> {
+        let path = format!("/proc/{pid}/stat");
+        let content = std::fs::read_to_string(&path).ok()?;
+        // stat 字段以空格分隔，但 comm 字段可能包含空格（用括号包围）
+        let start = content.find('(')?;
+        let end = content.rfind(')')?;
+        let rest = &content[end + 1..];
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // comm 占字段 2，其后的字段在 rest 中从 0 开始索引
+        // 原字段索引 - 3 = rest 索引（因为 comm 后从字段 3 开始）
+        let adjusted_idx = field_idx.saturating_sub(3);
+        fields.get(adjusted_idx).and_then(|s| s.parse().ok())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_proc_ppid(pid: u32) -> Option<u32> {
+        read_proc_stat_field(pid, 3).map(|v| v as u32)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_proc_cpu_time(pid: u32) -> Option<u64> {
+        let utime = read_proc_stat_field(pid, 14).unwrap_or(0);
+        let stime = read_proc_stat_field(pid, 15).unwrap_or(0);
+        Some(utime + stime)
+    }
+
+    // ===== 平台实现：其他（macOS 等）=====
+    //
+    // 降级到只用 stdout/stderr 流量信号 + max_hard_timeout。
+    // collect_process_tree_cpu 返回 None 时，ActivityMonitor.poll() 中
+    // last_cpu_time 始终为 ZERO，永不因 CPU 信号重置空闲计时器。
+    // 流式输出任务（如 cargo build）仍能正常工作，纯计算无输出任务
+    // 会被 idle_timeout 触发（macOS 上无 /proc，实现成本高）。
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn collect_process_tree_cpu(_root_pid: u32) -> Option<Duration> {
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::thread;
+
+        #[test]
+        fn monitor_initial_decision_is_continue() {
+            let mut m = ActivityMonitor::with_thresholds(
+                std::process::id(),
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+            );
+            assert_eq!(m.poll(), ActivityDecision::Continue);
+        }
+
+        #[test]
+        fn monitor_idle_timeout_triggers_after_threshold() {
+            let mut m = ActivityMonitor::with_thresholds(
+                std::process::id(),
+                Duration::from_millis(50),
+                Duration::from_secs(60),
+            );
+            // 让 CPU 采样至少跑一次（首次采样 last_cpu_time = 0）
+            thread::sleep(Duration::from_millis(20));
+            let _ = m.poll();
+            // 等待 idle_timeout 触发
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(m.poll(), ActivityDecision::IdleTimeout);
+        }
+
+        #[test]
+        fn monitor_hard_timeout_overrides_idle() {
+            let mut m = ActivityMonitor::with_thresholds(
+                std::process::id(),
+                Duration::from_secs(60),
+                Duration::from_millis(50),
+            );
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(m.poll(), ActivityDecision::HardTimeout);
+        }
+
+        #[test]
+        fn monitor_note_output_resets_idle() {
+            let mut m = ActivityMonitor::with_thresholds(
+                std::process::id(),
+                Duration::from_millis(150),
+                Duration::from_secs(60),
+            );
+            thread::sleep(Duration::from_millis(50));
+            m.note_output();
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(m.poll(), ActivityDecision::Continue);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_collect_cpu_time_for_self() {
+            let first = get_process_cpu_time_windows(std::process::id())
+                .expect("should query own process CPU time");
+            // 消耗足够 CPU 时间（>16ms）以超过 GetProcessTimes 精度阈值。
+            // 100M 次 wrapping_add 约占 200-500ms CPU，远超 15.625ms 精度。
+            let mut sum: u64 = 0;
+            for i in 0u64..100_000_000 {
+                sum = sum.wrapping_add(i);
+            }
+            std::hint::black_box(sum);
+            let second = get_process_cpu_time_windows(std::process::id())
+                .expect("should query own process CPU time again");
+            assert!(
+                second > first,
+                "CPU time should increase after work: first={first:?}, second={second:?}"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_enum_process_tree_includes_self() {
+            let pids = enum_process_tree_windows(std::process::id());
+            assert!(
+                pids.contains(&std::process::id()),
+                "self pid should be in process tree"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_collect_tree_cpu_returns_nonzero_for_self() {
+            // 触发一些 CPU 工作
+            let mut sum: u64 = 0;
+            for i in 0u64..500_000 {
+                sum = sum.wrapping_add(i);
+            }
+            std::hint::black_box(sum);
+            let cpu = collect_process_tree_cpu(std::process::id());
+            assert!(cpu.is_some(), "should collect CPU time for self");
+            assert!(
+                cpu.unwrap() > Duration::ZERO,
+                "CPU time should be > 0 after work"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_collect_cpu_time_for_self() {
+            // 触发一些 CPU 工作
+            let mut sum: u64 = 0;
+            for i in 0u64..500_000 {
+                sum = sum.wrapping_add(i);
+            }
+            std::hint::black_box(sum);
+            let cpu = collect_process_tree_cpu(std::process::id());
+            assert!(cpu.is_some(), "should collect CPU time for self on Linux");
+            assert!(
+                cpu.unwrap() > Duration::ZERO,
+                "CPU time should be > 0 after work"
+            );
+        }
     }
 }
