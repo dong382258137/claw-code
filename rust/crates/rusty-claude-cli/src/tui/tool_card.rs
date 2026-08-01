@@ -32,6 +32,10 @@ pub(crate) fn render_tool_call_start(name: &str, input: &str) -> String {
 
 /// Render a colored unified diff for an edit_file tool call.
 /// Reads `old_string` and `new_string` from the input JSON.
+///
+/// P1 升级:从逐行比较改为 Myers 算法(经 `tui_ports::diff_view`)。
+/// 原逐行比较无法识别位置偏移的相同行,会把"行顺序变了"误判为全删+全增;
+/// Myers 能正确识别上下文行(Equal),diff 更短更易读。
 fn render_edit_diff(input: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(input).ok()?;
     let old = parsed
@@ -47,30 +51,13 @@ fn render_edit_diff(input: &str) -> Option<String> {
         return None;
     }
 
-    let mut diff = String::from("\n");
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    // Simple line-by-line diff (not Myers, but good enough for preview)
-    let max_lines = old_lines.len().max(new_lines.len());
-    for i in 0..max_lines {
-        let old_line = old_lines.get(i).copied().unwrap_or("");
-        let new_line = new_lines.get(i).copied().unwrap_or("");
-        if old_line == new_line {
-            // Context line (unchanged)
-            diff.push_str(&format!("│   {old_line}\n"));
-        } else {
-            if !old_line.is_empty() || i < old_lines.len() {
-                // Removed line (red)
-                diff.push_str(&format!("\x1b[31m│ - {old_line}\x1b[0m\n"));
-            }
-            if !new_line.is_empty() || i < new_lines.len() {
-                // Added line (green)
-                diff.push_str(&format!("\x1b[32m│ + {new_line}\x1b[0m\n"));
-            }
-        }
+    // Myers diff via tui_ports::diff_view(从 grok-build 移植)。
+    // start_line=1:tool_card 不显示行号,起始行号无意义,传 1 即可。
+    let hunks = crate::tui_ports::diff_view::diff_hunks_from_strings(old, new, 1);
+    if hunks.is_empty() {
+        return None;
     }
-    Some(diff)
+    Some(crate::tui_ports::diff_view::render_hunks_ansi(&hunks))
 }
 
 /// Render a tool result card (collapsible).

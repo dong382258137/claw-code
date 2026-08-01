@@ -348,6 +348,37 @@ pub fn diff_hunks_to_patch(path: &str, hunks: &[DiffHunk]) -> String {
     out
 }
 
+/// 把 hunks 渲染为带 ANSI 颜色的卡片字符串(与 claw `tool_card.rs` 原格式兼容)。
+///
+/// 格式约定(必须与原 `render_edit_diff` 测试用例兼容):
+/// - Delete 行: `\x1b[31m│ - {text}\x1b[0m\n`(红)
+/// - Insert 行: `\x1b[32m│ + {text}\x1b[0m\n`(绿)
+/// - Equal  行: `│   {text}\n`(无颜色,3 空格)
+/// - 输出整体以 `\n` 开头,与原 `render_edit_diff` 一致
+///
+/// 相比原逐行比较,本函数走 Myers 算法,能正确识别上下文行(Equal),
+/// 即便它们在 old/new 中位置不同也能匹配为 context,而非误判为删+增。
+pub fn render_hunks_ansi(hunks: &[DiffHunk]) -> String {
+    let mut out = String::from("\n");
+    for hunk in hunks {
+        for line in hunk {
+            let text = line.text.trim_end_matches(['\r', '\n']);
+            match line.tag {
+                ChangeTag::Delete => {
+                    out.push_str(&format!("\x1b[31m│ - {text}\x1b[0m\n"));
+                }
+                ChangeTag::Insert => {
+                    out.push_str(&format!("\x1b[32m│ + {text}\x1b[0m\n"));
+                }
+                ChangeTag::Equal => {
+                    out.push_str(&format!("│   {text}\n"));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +475,48 @@ mod tests {
                 .remove(0)
         };
         assert_eq!(stitch_overlapping_hunks(vec![far(5), far(40)]).len(), 2);
+    }
+
+    #[test]
+    fn render_hunks_ansi_produces_red_green_context_lines() {
+        // 三行 old → 三行 new,中间行改变;Myers 应识别 line1/line3 为 Equal(context)。
+        let hunks = diff_hunks_from_strings("line1\nline2\nline3", "line1\nmodified\nline3", 1);
+        let rendered = render_hunks_ansi(&hunks);
+
+        // Delete 行含红色 ANSI
+        assert!(rendered.contains("\x1b[31m"), "missing red: {rendered}");
+        assert!(rendered.contains("line2"), "missing deleted line2: {rendered}");
+
+        // Insert 行含绿色 ANSI
+        assert!(rendered.contains("\x1b[32m"), "missing green: {rendered}");
+        assert!(rendered.contains("modified"), "missing inserted modified: {rendered}");
+
+        // Context 行无颜色,格式 `│   line1`
+        assert!(
+            rendered.contains("│   line1"),
+            "missing context line1: {rendered}"
+        );
+        assert!(
+            rendered.contains("│   line3"),
+            "missing context line3: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_hunks_ansi_starts_with_newline() {
+        let hunks = diff_hunks_from_strings("a", "b", 1);
+        let rendered = render_hunks_ansi(&hunks);
+        assert!(
+            rendered.starts_with('\n'),
+            "must start with \\n to match tool_card format: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_hunks_ansi_empty_when_no_hunks() {
+        // 相同字符串无 diff → 无 hunks → 渲染只剩开头的 \n
+        let hunks = diff_hunks_from_strings("same", "same", 1);
+        let rendered = render_hunks_ansi(&hunks);
+        assert_eq!(rendered, "\n");
     }
 }
