@@ -378,15 +378,82 @@ fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Wrap pre-rendered Lines to display width.
+/// Wrap pre-rendered Lines to display width, 同时记录每个 entry wrap 后的 display 起始行。
 /// Pure function: no markdown parsing, just character-width line splitting.
-fn wrap_lines_for_width(lines: &[Line<'static>], width: usize) -> Arc<Vec<Line<'static>>> {
-    Arc::new(
-        lines
+///
+/// `raw_breaks` 是未 wrap 的原始行 breaks(长度 = entries.len()+1),用于按 entry 分组 wrap。
+/// 返回 display breaks:每个 entry wrap 后在结果 Vec 中的起始行号,供 sticky_view 定位 entry 边界。
+fn wrap_lines_with_breaks(
+    lines: &[Line<'static>],
+    raw_breaks: &[usize],
+    width: usize,
+) -> (Arc<Vec<Line<'static>>>, Vec<usize>) {
+    if raw_breaks.len() <= 1 {
+        // 无 entry 或仅 1 个 break 点:整体 wrap,display_breaks = [0, len]
+        let wrapped: Vec<Line<'static>> = lines
             .iter()
             .flat_map(|line| wrap_line_to_display_lines(line, width))
-            .collect(),
-    )
+            .collect();
+        let display_breaks = vec![0, wrapped.len()];
+        return (Arc::new(wrapped), display_breaks);
+    }
+    // 按 entry 分组 wrap,记录每个 entry wrap 后的 display 起始行
+    let mut wrapped: Vec<Line<'static>> = Vec::new();
+    let mut display_breaks: Vec<usize> = Vec::with_capacity(raw_breaks.len());
+    display_breaks.push(0);
+    for i in 0..raw_breaks.len() - 1 {
+        let start = raw_breaks[i];
+        let end = raw_breaks[i + 1];
+        if start < end && end <= lines.len() {
+            for line in &lines[start..end] {
+                wrapped.extend(wrap_line_to_display_lines(line, width));
+            }
+        }
+        display_breaks.push(wrapped.len());
+    }
+    (Arc::new(wrapped), display_breaks)
+}
+
+/// 从 sticky layout 收集 header 区域要显示的行(pushed + gap + pinned)。
+/// 不含 gap_after(留背景色,由 header_area 高度 = header_screen_rows 覆盖)。
+///
+/// header 行从 wrapped_lines 取,以 display_breaks 定位每个 entry 的起始 display 行,
+/// 再按 clip_top 裁剪顶部(push 效果),取 visible_height 行。
+fn collect_sticky_header_lines(
+    layout: &crate::tui_ports::sticky_view::StickyHeaderLayout,
+    wrapped_lines: &[Line<'static>],
+    display_breaks: &[usize],
+) -> Vec<Line<'static>> {
+    use crate::tui_ports::sticky_view::RenderedPrompt;
+
+    let mut header_lines: Vec<Line<'static>> = Vec::new();
+
+    let push_line = |rp: RenderedPrompt, out: &mut Vec<Line<'static>>| {
+        let entry_start = display_breaks.get(rp.entry_idx).copied().unwrap_or(0);
+        let visible = rp.visible_height() as usize;
+        let clip = rp.clip_top as usize;
+        for i in 0..visible {
+            let line_idx = entry_start.saturating_add(clip).saturating_add(i);
+            if let Some(line) = wrapped_lines.get(line_idx) {
+                out.push(line.clone());
+            }
+        }
+    };
+
+    if let Some(pushed) = layout.pushed {
+        push_line(pushed, &mut header_lines);
+    }
+
+    // pushed 和 pinned 之间的 gap 行
+    if layout.pushed.is_some() && layout.pinned.is_some() {
+        header_lines.push(Line::raw(""));
+    }
+
+    if let Some(pinned) = layout.pinned {
+        push_line(pinned, &mut header_lines);
+    }
+
+    header_lines
 }
 
 /// Result of a turn executed in a background thread.
@@ -522,10 +589,13 @@ fn run_event_loop(
     // 折行缓存：避免每帧对全部 output lines 做 O(N) wrap 和 Arc 分配。
     // output_view.snapshot_lines() 在内容未变时返回同一个 Arc，所以用
     // Arc::as_ptr 做身份比较 (pointer identity)。仅在内容指针或宽度变化时
-    // 重新计算 wrap_lines_for_width。
+    // 重新计算 wrap_lines_with_breaks。
     let mut cached_wrap_ptr: *const Vec<Line<'static>> = std::ptr::null();
     let mut cached_wrap_width: usize = 0;
     let mut cached_wrapped: Arc<Vec<Line<'static>>> = Arc::new(Vec::new());
+    // sticky 集成:缓存 wrap 后的 display breaks(每个 entry 的起始 display 行)。
+    // 与 cached_wrapped 同生命周期,缓存命中时直接复用。
+    let mut cached_display_breaks: Vec<usize> = Vec::new();
 
     'main_loop: loop {
         // 处理 AskUserQuestion 请求：worker 线程通过 ask handler 投递的待回答问题。
@@ -821,18 +891,20 @@ fn run_event_loop(
 
             // Output area — write-time rendered lines (zero display render cost)
             let output_lines = output_view.snapshot_lines();
+            let raw_breaks = output_view.snapshot_breaks();
             let visible_height = main_area.height.saturating_sub(1) as usize; // Borders::TOP = 1 line
             let content_width = main_area.width as usize;
             let output_ptr = Arc::as_ptr(&output_lines);
-            let wrapped_lines_arc = if output_ptr == cached_wrap_ptr && content_width == cached_wrap_width {
+            let (wrapped_lines_arc, display_breaks) = if output_ptr == cached_wrap_ptr && content_width == cached_wrap_width {
                 // 折行缓存命中：内容指针 + 宽度均未变，零开销复用
-                Arc::clone(&cached_wrapped)
+                (Arc::clone(&cached_wrapped), cached_display_breaks.clone())
             } else {
-                let wrapped = wrap_lines_for_width(&output_lines, content_width);
+                let (wrapped, breaks) = wrap_lines_with_breaks(&output_lines, &raw_breaks, content_width);
                 cached_wrap_ptr = output_ptr;
                 cached_wrap_width = content_width;
                 cached_wrapped = Arc::clone(&wrapped);
-                wrapped
+                cached_display_breaks = breaks.clone();
+                (wrapped, breaks)
             };
 
             let total_display_lines = wrapped_lines_arc.len();
@@ -845,22 +917,74 @@ fn run_event_loop(
                 None => String::new(),
                 Some(offset) => format!(" [scroll -{offset}]"),
             };
-            let start = scroll_y.min(total_display_lines);
-            let end = (start + visible_height).min(total_display_lines);
+
+            // sticky 集成:仅在用户主动翻历史(scroll_offset = Some)时启用粘性头部。
+            // 跟随底部(None)时不启用,避免默认状态压缩输入区空间。
+            // sticky 算法的 scroll_offset 语义是"距顶部",与 claw 的 scroll_y 一致。
+            let sticky_layout = if scroll_offset.is_some() && !display_breaks.is_empty() {
+                crate::tui_ports::sticky_view::compute_claw_sticky_layout(
+                    scroll_offset,
+                    max_scroll,
+                    &display_breaks,
+                    visible_height as u16,
+                )
+            } else {
+                crate::tui_ports::sticky_view::StickyHeaderLayout::default()
+            };
+            let header_rows = sticky_layout.header_screen_rows() as usize;
+
+            // 内容区裁剪:保持底部连续性。
+            // sticky 语义:header 占 header_rows 行,内容区从 scroll_y + header_rows 开始
+            // (scroll_for_content = scroll_offset + header_screen_rows)。
+            // bottom_line = (scroll_y + header_rows) + (visible_height - header_rows) - 1
+            //             = scroll_y + visible_height - 1(与无 sticky 时一致)
+            let content_height = visible_height.saturating_sub(header_rows);
+            let content_scroll = scroll_y.saturating_add(header_rows);
+            let start = content_scroll.min(total_display_lines);
+            let end = (start + content_height).min(total_display_lines);
             let visible_lines: Vec<Line<'static>> = if start < end {
                 wrapped_lines_arc[start..end].to_vec()
             } else {
                 Vec::new()
             };
-            // scroll_y 可能等于 total_display_lines（空 buffer），此时 start == end，渲染空。
-            let output_paragraph = Paragraph::new(Text::from(visible_lines))
-                .block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .title(format!("输出{scroll_label}")),
+
+            // 渲染:border + sticky header + content 三段。
+            // 先用 Block 画 main_area 的顶部 border + title + 背景,
+            // 再用 Paragraph 覆盖 header 和 content 区域。
+            let border_block = Block::default()
+                .borders(Borders::TOP)
+                .title(format!("输出{scroll_label}"));
+            f.render_widget(border_block, main_area);
+
+            // sticky header(翻历史时显示当前 turn 的 prompt 摘要作为上下文锚点)
+            if header_rows > 0 {
+                let header_area = Rect {
+                    y: main_area.y + 1,
+                    x: main_area.x,
+                    width: main_area.width,
+                    height: header_rows as u16,
+                };
+                let header_lines = collect_sticky_header_lines(
+                    &sticky_layout,
+                    &wrapped_lines_arc,
+                    &display_breaks,
                 );
+                // 给 header 加淡色背景,与内容区视觉区分
+                let header_paragraph = Paragraph::new(Text::from(header_lines))
+                    .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+                f.render_widget(header_paragraph, header_area);
+            }
+
+            // content
+            let content_area = Rect {
+                y: main_area.y + 1 + header_rows as u16,
+                x: main_area.x,
+                width: main_area.width,
+                height: (main_area.height.saturating_sub(1 + header_rows as u16)),
+            };
+            let output_paragraph = Paragraph::new(Text::from(visible_lines));
             // 不用 .scroll() 和 .wrap()：已自己 wrap + 裁剪。
-            f.render_widget(output_paragraph, main_area);
+            f.render_widget(output_paragraph, content_area);
 
             // Input area
             // Bug fix（输入换行后光标位置不正确）：
@@ -3054,6 +3178,86 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// 验证 wrap_lines_with_breaks 按 entry 分组 wrap 并正确记录 display breaks。
+    /// 这是 sticky 集成的基础:display_breaks 用于定位每个 entry 在 wrap 后的边界。
+    #[test]
+    fn wrap_lines_with_breaks_multiple_entries() {
+        // 构造 3 个 entry,每个 1 行(短文本不触发 wrap)
+        // entry0: "AAA" (1 行)
+        // entry1: "BBB" (1 行)
+        // entry2: "CCC" (1 行)
+        let lines = vec![
+            Line::raw("AAA"),
+            Line::raw("BBB"),
+            Line::raw("CCC"),
+        ];
+        // raw_breaks: [0, 1, 2, 3](每个 entry 1 行)
+        let raw_breaks = vec![0, 1, 2, 3];
+        let (wrapped, display_breaks) = wrap_lines_with_breaks(&lines, &raw_breaks, 80);
+        assert_eq!(wrapped.len(), 3, "3 行不 wrap,总 3 display 行");
+        assert_eq!(display_breaks, vec![0, 1, 2, 3], "每个 entry 1 display 行");
+    }
+
+    /// 验证 wrap 触发时 display_breaks 反映 wrap 后的行数(而非原始行数)。
+    #[test]
+    fn wrap_lines_with_breaks_wrap_expands_display_breaks() {
+        // 1 个 entry,1 行长文本,宽度 5 触发 wrap 成 3 行
+        let long_text = "ABCDEFGHIJKL"; // 12 字符
+        let lines = vec![Line::raw(long_text)];
+        let raw_breaks = vec![0, 1]; // 1 个 entry,1 原始行
+        let (wrapped, display_breaks) = wrap_lines_with_breaks(&lines, &raw_breaks, 5);
+        // 12 字符 / 5 宽度 = 3 display 行
+        assert_eq!(wrapped.len(), 3, "12 字符宽度 5 应 wrap 成 3 行");
+        assert_eq!(display_breaks, vec![0, 3], "entry 0 占 3 display 行");
+    }
+
+    /// 验证空 lines 的边界情况。
+    #[test]
+    fn wrap_lines_with_breaks_empty() {
+        let lines: Vec<Line<'static>> = Vec::new();
+        let raw_breaks = vec![0];
+        let (wrapped, display_breaks) = wrap_lines_with_breaks(&lines, &raw_breaks, 80);
+        assert!(wrapped.is_empty());
+        assert_eq!(display_breaks, vec![0, 0]);
+    }
+
+    /// 验证 sticky 集成端到端:单 entry 场景下 compute_claw_sticky_layout
+    /// 能正确定位 pinned entry(无 next prompt,不触发 push)。
+    #[test]
+    fn sticky_integration_pinned_entry_correct() {
+        use crate::tui_ports::sticky_view::compute_claw_sticky_layout;
+        // 单 entry,20 display 行,viewport=10
+        // display_breaks: [0, 20]
+        let display_breaks = vec![0, 20];
+        let max_scroll = 20usize.saturating_sub(10); // viewport=10, max_scroll=10
+        // scroll_offset = Some(5):距底部 5 行,upstream_scroll = 10-5 = 5
+        // entry0 y_virtual=0 < 5 → pin entry0
+        // 无 next prompt → 不触发 push → pinned=Some
+        let layout = compute_claw_sticky_layout(Some(5), max_scroll, &display_breaks, 10);
+        assert!(layout.pinned.is_some(), "单 entry 无 push,pin entry0");
+        assert_eq!(
+            layout.pinned.unwrap().entry_idx,
+            0,
+            "upstream_scroll=5 > entry0.y_virtual=0,pin entry0"
+        );
+    }
+
+    /// 验证跟随底部(scroll_offset=None)时不启用 sticky 的语义前提:
+    /// compute_claw_sticky_layout(None, ...) 仍会 pin(单 entry 无 push),
+    /// 所以 app.rs 渲染层必须用 scroll_offset.is_some() 守卫。
+    #[test]
+    fn sticky_follow_bottom_pins_last_entry() {
+        use crate::tui_ports::sticky_view::compute_claw_sticky_layout;
+        // 单 entry,20 display 行,viewport=10
+        let display_breaks = vec![0, 20];
+        let max_scroll = 10;
+        // None → upstream_scroll = max_scroll = 10
+        // entry0 y_virtual=0 < 10 → pin entry0(无 next,不 push)
+        let layout = compute_claw_sticky_layout(None, max_scroll, &display_breaks, 10);
+        assert!(layout.pinned.is_some(), "None 时算法仍会 pin(故 app.rs 需守卫)");
+        assert_eq!(layout.pinned.unwrap().entry_idx, 0);
     }
 
     #[test]

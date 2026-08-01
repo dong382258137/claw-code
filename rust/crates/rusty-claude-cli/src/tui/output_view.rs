@@ -731,6 +731,16 @@ impl OutputView {
         guard.snapshot_lines()
     }
 
+    /// 快照每个 entry 在 cached_lines 中的起始行号(原始行,未 wrap)。
+    /// 长度 = entries.len() + 1,breaks[0]=0,breaks[i+1] = 前 i+1 个 entry 的总行数。
+    /// 供 sticky_view 计算粘性头部时定位 entry 边界(调用方需在 wrap 后映射到 display 行)。
+    pub(crate) fn snapshot_breaks(&self) -> Vec<usize> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // 确保 cached_lines_breaks 已建立(同 snapshot_lines 的惰性初始化)
+        guard.snapshot_lines();
+        guard.cached_lines_breaks.clone()
+    }
+
     /// 清空所有条目。
     pub(crate) fn clear(&mut self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
