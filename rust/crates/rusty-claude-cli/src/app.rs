@@ -201,6 +201,55 @@ pub(crate) fn correct_cwd_from_target_dir() -> Option<PathBuf> {
     None
 }
 
+/// 从 session 历史收集最近的项目目录(用于 project_picker)。
+///
+/// 遍历 managed sessions,加载每个 session 文件提取 `workspace_root`,
+/// 去重后按 `updated_at_ms` 倒序排列,只保留通过 `is_project_dir` 检测的目录。
+///
+/// 返回 `(路径, 最后更新时间)` 列表,最多 5 条。
+fn collect_recent_project_dirs() -> Vec<(PathBuf, chrono::DateTime<chrono::Utc>)> {
+    let summaries = match list_managed_sessions() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[project_picker] failed to list sessions: {e}");
+            return vec![];
+        }
+    };
+
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut projects: Vec<(PathBuf, chrono::DateTime<chrono::Utc>)> = Vec::new();
+
+    for summary in summaries {
+        // 加载 session 文件读 workspace_root
+        let session = match Session::load_from_path(&summary.path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let Some(root) = session.workspace_root else {
+            continue;
+        };
+        if !root.is_dir() {
+            continue;
+        }
+        if !crate::tui_ports::project_picker::is_project_dir(&root) {
+            continue;
+        }
+        if !seen.insert(root.clone()) {
+            continue; // 去重
+        }
+        let ts = chrono::DateTime::from_timestamp_millis(summary.updated_at_ms as i64)
+            .unwrap_or_else(chrono::Utc::now);
+        projects.push((root, ts));
+        if projects.len() >= 5 {
+            break;
+        }
+    }
+
+    // 按时间倒序
+    projects.sort_by(|a, b| b.1.cmp(&a.1));
+    projects
+}
+
 /// Enforce the broad-CWD policy: when running from home or root, either
 /// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
 /// or exit with an error (non-interactive).
@@ -218,25 +267,61 @@ pub(crate) fn enforce_broad_cwd_policy(
     let is_interactive = io::stdin().is_terminal();
 
     if is_interactive {
-        // Interactive mode: print warning and ask for confirmation.
-        // 用 print!/stdout 而非 eprint!/stderr：Windows Terminal 在某些配置下
-        // 对 stderr 的行缓冲策略不同，可能导致提示符不显示，用户看到"卡住"。
-        // stdout + 显式 flush 是最可靠的方式。
-        println!(
-            "Warning: claw is running from a very broad directory ({}).\n\
-             The agent can read and search everything under this path.\n\
-             Consider running from inside your project: cd /path/to/project && claw",
-            cwd.display()
-        );
-        print!("Continue anyway? [y/N]: ");
+        // Interactive mode: 用 project_picker 让用户选择项目目录(如果有 recent)
+        // 或确认继续(无 recent 时回退到原 y/N 确认)。
+        let recent_dirs = collect_recent_project_dirs();
+
+        if recent_dirs.is_empty() {
+            // 无最近项目目录,回退到原 y/N 确认流程
+            println!(
+                "Warning: claw is running from a very broad directory ({}).\n\
+                 The agent can read and search everything under this path.\n\
+                 Consider running from inside your project: cd /path/to/project && claw",
+                cwd.display()
+            );
+            print!("Continue anyway? [y/N]: ");
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim().to_lowercase();
+            if trimmed != "y" && trimmed != "yes" {
+                println!("Aborted.");
+                std::process::exit(0);
+            }
+            return Ok(());
+        }
+
+        // 有最近项目目录:显示 project_picker 菜单
+        use crate::tui_ports::project_picker;
+        let pq = project_picker::build_project_question(&recent_dirs, &cwd);
+        print!("{}", project_picker::render_question_stdout(&pq));
         io::stdout().flush()?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim().to_lowercase();
-        if trimmed != "y" && trimmed != "yes" {
-            println!("Aborted.");
-            std::process::exit(0);
+        loop {
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            match project_picker::parse_choice(&pq, &input) {
+                Some(Some(chosen_path)) => {
+                    // 用户选择了一个项目目录,切换过去
+                    if let Err(e) = env::set_current_dir(chosen_path) {
+                        eprintln!("Failed to switch to {}: {e}", chosen_path.display());
+                        std::process::exit(1);
+                    }
+                    println!("Switched to: {}", chosen_path.display());
+                    break;
+                }
+                Some(None) => {
+                    // "Don't ask me again" —— 继续在当前目录
+                    // (TODO: 持久化偏好到 config.toml,后续启动跳过检测)
+                    break;
+                }
+                None => {
+                    // 无效输入,重新提示
+                    print!("Invalid choice. Select [1-N]: ");
+                    io::stdout().flush()?;
+                }
+            }
         }
         Ok(())
     } else {

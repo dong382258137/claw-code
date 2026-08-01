@@ -198,6 +198,59 @@ pub fn build_project_question(
     }
 }
 
+// ── stdout 渲染 + 输入解析(用于 TUI 启动前的交互式菜单) ─────────────
+
+/// 把 `ProjectQuestion` 渲染为 stdout 菜单文本。
+///
+/// 格式:
+/// ```text
+/// Run claw in a project directory?
+///
+/// This gives claw full context of your codebase for better results.
+///
+///   1) claw (current)           d:/claw-code-src
+///   2) alpha                     ~/projects/alpha  (3m ago)
+///   ...
+///   N) Don't ask me again
+///
+/// Select [1-N]: 
+/// ```
+pub fn render_question_stdout(q: &ProjectQuestion) -> String {
+    let mut out = String::new();
+    out.push_str(&q.question.question);
+    out.push_str("\n\n");
+    for (i, opt) in q.question.options.iter().enumerate() {
+        let idx = i + 1;
+        if opt.description.is_empty() {
+            out.push_str(&format!("  {idx}) {}\n", opt.label));
+        } else {
+            out.push_str(&format!("  {idx}) {:<26}  {}\n", opt.label, opt.description));
+        }
+    }
+    out.push_str("\nSelect [1-N]: ");
+    out
+}
+
+/// 解析用户输入,返回选择的路径(如果有)。
+///
+/// 返回值:
+/// - `Some(Some(path))`:用户选择了一个项目目录,切换到该路径
+/// - `Some(None)`:用户选择了 "Don't ask me again",保持当前目录且不再询问
+/// - `None`:输入无效,调用方应重新提示
+pub fn parse_choice<'a>(q: &'a ProjectQuestion, input: &str) -> Option<Option<&'a Path>> {
+    let trimmed = input.trim();
+    let n: usize = trimmed.parse().ok()?;
+    if n == 0 || n > q.question.options.len() {
+        return None;
+    }
+    let idx = n - 1;
+    if idx == q.dont_ask_index {
+        Some(None) // Don't ask me again
+    } else {
+        q.resolved_paths.get(idx).map(|p| Some(p.as_path()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +373,45 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp);
         assert!(!is_project_dir(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn render_question_stdout_includes_question_and_options() {
+        let now = Utc::now();
+        let recent = vec![(PathBuf::from("/projects/alpha"), now)];
+        let pq = build_project_question(&recent, Path::new("/home/user"));
+        let rendered = render_question_stdout(&pq);
+        assert!(rendered.contains("Run claw in a project directory?"));
+        assert!(rendered.contains("1)"));
+        assert!(rendered.contains("alpha"));
+        assert!(rendered.contains("Don't ask me again"));
+        assert!(rendered.contains("Select [1-N]:"));
+    }
+
+    #[test]
+    fn parse_choice_valid_path_selection() {
+        let now = Utc::now();
+        let recent = vec![(PathBuf::from("/projects/alpha"), now)];
+        let pq = build_project_question(&recent, Path::new("/home/user"));
+        // 选 1 = cwd
+        assert_eq!(parse_choice(&pq, "1"), Some(Some(Path::new("/home/user"))));
+        // 选 2 = alpha
+        assert_eq!(parse_choice(&pq, "2"), Some(Some(Path::new("/projects/alpha"))));
+    }
+
+    #[test]
+    fn parse_choice_dont_ask_returns_none_inner() {
+        let pq = build_project_question(&[], Path::new("/home/user"));
+        // 最后一个选项是 "Don't ask me again"
+        let last = pq.question.options.len();
+        assert_eq!(parse_choice(&pq, &last.to_string()), Some(None));
+    }
+
+    #[test]
+    fn parse_choice_invalid_returns_none() {
+        let pq = build_project_question(&[], Path::new("/home/user"));
+        assert_eq!(parse_choice(&pq, "0"), None); // 0 无效
+        assert_eq!(parse_choice(&pq, "99"), None); // 超出范围
+        assert_eq!(parse_choice(&pq, "abc"), None); // 非数字
     }
 }
