@@ -885,7 +885,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "namespaceRestrictions": { "type": "boolean" },
                     "isolateNetwork": { "type": "boolean" },
                     "filesystemMode": { "type": "string", "enum": ["off", "workspace-only", "allow-list"] },
-                    "allowedMounts": { "type": "array", "items": { "type": "string" } }
+                    "allowedMounts": { "type": "array", "items": { "type": "string" } },
+                    "emphasis": { "type": "string", "enum": ["high", "normal", "low"], "description": "TUI 显示强调提示。'high': 永不折叠+高亮(错误/关键发现)；'normal': 默认折叠行为；'low': 单行摘要(成功确认/取消)。不填则走启发式 fallback(按 returnCodeInterpretation 判定)。" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -900,7 +901,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "path": { "type": "string" },
                     "offset": { "type": "integer", "minimum": 0, "description": "Line number to start reading from. Use together with 'limit' for large files." },
-                    "limit": { "type": "integer", "minimum": 1, "description": "Maximum lines to read. Recommended for files >500 lines to avoid response bloat." }
+                    "limit": { "type": "integer", "minimum": 1, "description": "Maximum lines to read. Recommended for files >500 lines to avoid response bloat." },
+                    "emphasis": { "type": "string", "enum": ["high", "normal", "low"], "description": "TUI 显示强调提示。'high': 永不折叠+高亮；'normal': 默认折叠；'low': 单行摘要。不填走启发式。" }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -914,7 +916,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "content": { "type": "string" }
+                    "content": { "type": "string" },
+                    "emphasis": { "type": "string", "enum": ["high", "normal", "low"], "description": "TUI 显示强调提示。'high': 永不折叠+高亮；'normal': 默认折叠；'low': 单行摘要。不填走启发式。" }
                 },
                 "required": ["path", "content"],
                 "additionalProperties": false
@@ -930,7 +933,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "path": { "type": "string" },
                     "old_string": { "type": "string" },
                     "new_string": { "type": "string" },
-                    "replace_all": { "type": "boolean" }
+                    "replace_all": { "type": "boolean" },
+                    "emphasis": { "type": "string", "enum": ["high", "normal", "low"], "description": "TUI 显示强调提示。'high': 永不折叠+高亮；'normal': 默认折叠；'low': 单行摘要。不填走启发式。" }
                 },
                 "required": ["path", "old_string", "new_string"],
                 "additionalProperties": false
@@ -960,7 +964,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
-                    "path": { "type": "string" }
+                    "path": { "type": "string" },
+                    "emphasis": { "type": "string", "enum": ["high", "normal", "low"], "description": "TUI 显示强调提示。'high': 永不折叠+高亮；'normal': 默认折叠；'low': 单行摘要。不填走启发式。" }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -987,7 +992,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "type": { "type": "string" },
                     "head_limit": { "type": "integer", "minimum": 1, "description": "Maximum result count across all files. Use to cap output on broad searches." },
                     "offset": { "type": "integer", "minimum": 0 },
-                    "multiline": { "type": "boolean" }
+                    "multiline": { "type": "boolean" },
+                    "emphasis": { "type": "string", "enum": ["high", "normal", "low"], "description": "TUI 显示强调提示。'high': 永不折叠+高亮；'normal': 默认折叠；'low': 单行摘要。不填走启发式。" }
                 },
                 "required": ["pattern", "glob"],
                 "additionalProperties": false
