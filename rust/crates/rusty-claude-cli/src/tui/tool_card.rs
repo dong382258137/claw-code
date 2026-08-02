@@ -60,18 +60,13 @@ fn render_edit_diff(input: &str) -> Option<String> {
     Some(crate::tui_ports::diff_view::render_hunks_ansi(&hunks))
 }
 
-/// Render a tool result card (collapsible).
+/// Render a tool result card (collapsible, priority-aware).
 ///
-/// 折叠语义（P1 修复）：
-/// - `collapsed == true` 且 `line_count > COLLAPSE_THRESHOLD`：
-///   折叠预览视图，显示前 `COLLAPSED_PREVIEW_LINES` 行 + `[+] 展开` 提示。
-/// - `collapsed == false` 或 `line_count <= COLLAPSE_THRESHOLD`：
-///   完整视图，显示全部输出。
-///
-/// 之前的问题：`complete_tool_card` 把 `collapsed` 设为 `true` 后，
-/// `OutputEntry::render()` 走了独立的"只显示摘要"分支，本函数的折叠预览
-/// 逻辑（前3行+展开提示）永远不会被执行。现在由 `render()` 统一委托给
-/// 本函数，根据 `collapsed` 参数决定折叠/展开。
+/// 折叠语义（按 priority 分档，详见 docs/tui-output-intelligence-plan.md §3.2）：
+/// - `Priority::P0`：永不折叠，即使 collapsed=true 也强制完整展开（error/关键发现）。
+/// - `Priority::P3`：L1 单行摘要，不显示预览（成功确认/interrupted）。
+/// - `Priority::P1/P2` + `collapsed && line_count > THRESHOLD`：折叠预览（前3行+展开提示）。
+/// - `Priority::P1/P2` + `!collapsed || line_count <= THRESHOLD`：完整视图。
 ///
 /// 对 edit_file 工具，在 result 卡片中显示 diff（原 start 卡片中的 diff 已移除）。
 pub(crate) fn render_tool_result(
@@ -80,11 +75,10 @@ pub(crate) fn render_tool_result(
     is_error: bool,
     input: Option<&str>,
     collapsed: bool,
+    priority: crate::tui::output_view::Priority,
 ) -> String {
-    // P1-4 修复:折叠分支只显示前几行,无需全量 collect。
-    // 原实现 `output.lines().collect::<Vec<&str>>()` 即便折叠到 3 行预览
-    // 也遍历全部 N 行(如 cargo test 3000 行输出 = 3000 次分配)。
-    // 现在按需计算:折叠时只取预览行数 + 1 用作计数判断;完整视图才 collect 全量。
+    use crate::tui::output_view::Priority;
+
     let icon = if is_error { "❌" } else { "✅" };
 
     // For edit_file, prepend a diff preview before the result body
@@ -94,9 +88,20 @@ pub(crate) fn render_tool_result(
         String::new()
     };
 
-    // 计算总行数:用 lines().count() 是 O(N) 但无 Vec 分配,比 collect 更轻。
-    // 折叠分支只需知道是否 > COLLAPSE_THRESHOLD + 预览行内容,无需全量 Vec。
     let line_count = output.lines().count();
+
+    // P3：L1 单行摘要（不显示预览，只显示语义摘要）
+    if priority == Priority::P3 && collapsed {
+        let summary = if let Some(inp) = input {
+            summarize_tool_result(name, inp, output, is_error)
+        } else {
+            format!("📦 {name} · {line_count}行")
+        };
+        return format!("{diff_prefix}├─ {icon} {name} · {summary}\n└─\n");
+    }
+
+    // P0：永不折叠（即使 collapsed=true 也强制完整展开）
+    let effective_collapsed = collapsed && priority != Priority::P0;
 
     // Determine if this tool's output should be syntax-highlighted
     let language = detect_language_for_tool(name, output);
@@ -121,7 +126,7 @@ pub(crate) fn render_tool_result(
         }
     };
 
-    if collapsed && line_count > COLLAPSE_THRESHOLD {
+    if effective_collapsed && line_count > COLLAPSE_THRESHOLD {
         // 折叠预览视图：只取前几行,不全量 collect
         let preview_lines: Vec<&str> = output
             .lines()
@@ -213,14 +218,16 @@ pub(crate) fn summarize_tool_input_public(name: &str, input: &str) -> String {
 /// Render a tool result card (collapsible).
 /// P1 重构：公开接口供 OutputView::render() 调用。
 /// `collapsed` 参数控制折叠预览/完整展开两种视图。
+/// `priority` 参数决定 P0 永不折叠 / P3 单行摘要（详见方案 §3.2）。
 pub(crate) fn render_tool_result_public(
     name: &str,
     output: &str,
     is_error: bool,
     input: Option<&str>,
     collapsed: bool,
+    priority: crate::tui::output_view::Priority,
 ) -> String {
-    render_tool_result(name, output, is_error, input, collapsed)
+    render_tool_result(name, output, is_error, input, collapsed, priority)
 }
 
 /// Summarize tool input to a short one-liner for the card header.
@@ -308,9 +315,120 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+/// 生成工具结果的 L1 摘要（单行，用于 P3 折叠视图）。
+///
+/// 按工具类型提取关键信息：
+/// - bash: 解析 returnCodeInterpretation + stdout 末行（结论在末尾）
+/// - edit/write: 路径 + 修改处数
+/// - read_file: 路径 + 行数
+/// - grep/glob: pattern + 匹配数
+///
+/// 详见 docs/tui-output-intelligence-plan.md §3.3
+pub(crate) fn summarize_tool_result(
+    name: &str,
+    input: &str,
+    result: &str,
+    is_error: bool,
+) -> String {
+    let parsed_input: serde_json::Value =
+        serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+    let parsed_result: serde_json::Value =
+        serde_json::from_str(result).unwrap_or(serde_json::Value::Null);
+
+    match name {
+        "bash" | "Bash" => {
+            let rc = parsed_result
+                .get("returnCodeInterpretation")
+                .and_then(|v| v.as_str());
+            let stdout = parsed_result
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let line_count = stdout.lines().count();
+            let last_line = stdout.lines().last().unwrap_or("");
+            match rc {
+                Some("interrupted") => "⏹ · 已取消".to_string(),
+                Some(r) if r.starts_with("exit_code:") && r != "exit_code:0" => {
+                    format!("❌ · {r} · {}行 · {}", line_count, truncate_str(last_line, 60))
+                }
+                Some("idle.timeout") | Some("timeout") | Some("test.hung") => {
+                    format!("⏱ · {rc:?} · {}行", line_count)
+                }
+                _ if is_error => format!("❌ · {line_count}行"),
+                _ => format!("✅ · {line_count}行 · {}", truncate_str(last_line, 60)),
+            }
+        }
+        "edit_file" | "Edit" | "write_file" | "Write" => {
+            let path = parsed_input
+                .get("file_path")
+                .or_else(|| parsed_input.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let hunks = parsed_result
+                .get("structured_patch")
+                .and_then(|v| v.as_array())
+                .map(Vec::len)
+                .unwrap_or(0);
+            if hunks > 0 {
+                format!("✏️ {path} · {hunks}处修改")
+            } else {
+                format!("✏️ {path}")
+            }
+        }
+        "read_file" | "Read" => {
+            let path = parsed_input
+                .get("file_path")
+                .or_else(|| parsed_input.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let num_lines = parsed_result
+                .get("file")
+                .and_then(|f| f.get("numLines"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("📄 {path} · {num_lines}行")
+        }
+        "grep" | "Grep" | "grep_search" => {
+            let pattern = parsed_input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let num_matches = parsed_result
+                .get("num_matches")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let num_files = parsed_result
+                .get("num_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("🔎 `{pattern}` · {num_matches}处 / {num_files}文件")
+        }
+        "glob" | "Glob" | "glob_search" => {
+            let pattern = parsed_input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let num_files = parsed_result
+                .get("num_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("🌐 `{pattern}` · {num_files}文件")
+        }
+        "WebFetch" | "WebSearch" => {
+            let line_count = result.lines().count();
+            format!("🌐 · {line_count}行")
+        }
+        _ => {
+            let line_count = result.lines().count();
+            format!("📦 {name} · {line_count}行")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::output_view::Priority;
 
     #[test]
     fn render_tool_call_start_has_tool_name() {
@@ -329,7 +447,7 @@ mod tests {
     fn render_tool_result_short_output_full_view() {
         let output = "line1\nline2\nline3";
         // 短输出：无论 collapsed 参数都显示完整内容
-        let card = render_tool_result("bash", output, false, None, false);
+        let card = render_tool_result("bash", output, false, None, false, Priority::P1);
         assert!(card.contains("✅ bash"));
         assert!(card.contains("3 行"));
         assert!(!card.contains("[+] 展开"));
@@ -342,7 +460,7 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let card = render_tool_result("bash", &output, false, None, true);
+        let card = render_tool_result("bash", &output, false, None, true, Priority::P2);
         assert!(card.contains("20 行"));
         assert!(card.contains("[+] 展开"));
         assert!(card.contains("17 行"));
@@ -360,7 +478,7 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let card = render_tool_result("bash", &output, false, None, false);
+        let card = render_tool_result("bash", &output, false, None, false, Priority::P1);
         assert!(card.contains("✅ bash"));
         assert!(card.contains("20 行"));
         // 展开状态不应有折叠提示
@@ -372,14 +490,59 @@ mod tests {
 
     #[test]
     fn render_tool_result_error_shows_x_icon() {
-        let card = render_tool_result("bash", "command not found", true, None, false);
+        let card = render_tool_result("bash", "command not found", true, None, false, Priority::P0);
         assert!(card.contains("❌ bash"));
     }
 
     #[test]
     fn render_tool_result_empty_output() {
-        let card = render_tool_result("bash", "", false, None, false);
+        let card = render_tool_result("bash", "", false, None, false, Priority::P1);
         assert!(card.contains("空"));
+    }
+
+    /// P3 折叠时显示 L1 单行摘要（不显示预览行）
+    #[test]
+    fn render_tool_result_p3_shows_l1_summary() {
+        let input = r#"{"command":"ls"}"#;
+        let result = r#"{"stdout":"file1\nfile2\nfile3","returnCodeInterpretation":"exit_code:0"}"#;
+        // P3 + collapsed → L1 摘要，不显示预览行
+        let card = render_tool_result("bash", result, false, Some(input), true, Priority::P3);
+        assert!(card.contains("✅"), "P3 应显示 ✅ 图标: {card}");
+        assert!(!card.contains("[+] 展开"), "P3 不应显示展开提示: {card}");
+        assert!(!card.contains("│ file1"), "P3 不应显示预览行: {card}");
+    }
+
+    /// P0 即使 collapsed=true 也强制完整展开
+    #[test]
+    fn render_tool_result_p0_never_collapsed() {
+        let output = (1..=50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // P0 + collapsed=true → 仍完整展开
+        let card = render_tool_result("bash", &output, true, None, true, Priority::P0);
+        assert!(card.contains("❌"), "P0 错误应显示 ❌: {card}");
+        assert!(!card.contains("[+] 展开"), "P0 不应折叠: {card}");
+        assert!(card.contains("line50"), "P0 应显示最后一行: {card}");
+    }
+
+    /// summarize_tool_result: bash interrupted → ⏹ 已取消
+    #[test]
+    fn summarize_tool_result_bash_interrupted() {
+        let input = r#"{"command":"sleep 100"}"#;
+        let result = r#"{"returnCodeInterpretation":"interrupted"}"#;
+        let s = summarize_tool_result("bash", input, result, false);
+        assert!(s.contains("已取消"), "interrupted 应显示已取消: {s}");
+    }
+
+    /// summarize_tool_result: bash ok → ✅ 末行
+    #[test]
+    fn summarize_tool_result_bash_ok_last_line() {
+        let input = r#"{"command":"ls"}"#;
+        let result = r#"{"stdout":"file1\nfile2\nfinal.txt","returnCodeInterpretation":"exit_code:0"}"#;
+        let s = summarize_tool_result("bash", input, result, false);
+        assert!(s.contains("✅"), "应显示 ✅: {s}");
+        assert!(s.contains("final.txt"), "应显示末行: {s}");
     }
 
     #[test]
@@ -415,7 +578,7 @@ mod tests {
         // P1 修复：diff 已从 start 卡片移到 result 卡片
         let input =
             r#"{"file_path":"src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#;
-        let card = render_tool_result("edit_file", "ok", false, Some(input), false);
+        let card = render_tool_result("edit_file", "ok", false, Some(input), false, Priority::P1);
         // Should contain red (removed) and green (added) ANSI codes
         assert!(
             card.contains("\x1b[31m"),
@@ -432,7 +595,7 @@ mod tests {
     #[test]
     fn render_edit_diff_identical_strings_no_diff() {
         let input = r#"{"file_path":"src/main.rs","old_string":"same","new_string":"same"}"#;
-        let card = render_tool_result("edit_file", "ok", false, Some(input), false);
+        let card = render_tool_result("edit_file", "ok", false, Some(input), false, Priority::P1);
         // No diff lines should be rendered
         assert!(!card.contains("\x1b[31m"));
         assert!(!card.contains("\x1b[32m"));
@@ -441,7 +604,7 @@ mod tests {
     #[test]
     fn render_edit_diff_multi_line() {
         let input = r#"{"file_path":"test.rs","old_string":"line1\nline2\nline3","new_string":"line1\nmodified\nline3"}"#;
-        let card = render_tool_result("edit_file", "ok", false, Some(input), false);
+        let card = render_tool_result("edit_file", "ok", false, Some(input), false, Priority::P1);
         // line1 and line3 are context, line2 is removed, modified is added
         assert!(card.contains("line2"));
         assert!(card.contains("modified"));

@@ -191,6 +191,7 @@ impl OutputEntry {
                 input,
                 result,
                 is_error,
+                priority,
                 collapsed,
                 timestamp,
                 ..
@@ -214,6 +215,7 @@ impl OutputEntry {
                     *is_error,
                     Some(input),
                     *collapsed,
+                    *priority,
                 );
                 // render_tool_result_public 输出以 \n 开头，把时间戳插入到首行
                 if let Some(stripped) = rendered.strip_prefix('\n') {
