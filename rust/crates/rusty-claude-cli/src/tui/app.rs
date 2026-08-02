@@ -31,7 +31,7 @@ use ratatui::style::Styled;
 // Phase 3.2: TerminalRenderer is used to convert markdown → ANSI; ansi_to_tui
 // then converts ANSI → ratatui Text<'static> so Paragraph can render styled
 // spans (headings, code blocks, bold/italic, etc.) instead of raw text.
-use crate::render::TerminalRenderer;
+use crate::render::{MarkdownStreamState, TerminalRenderer};
 use ansi_to_tui::IntoText;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -2685,12 +2685,25 @@ fn execute_turn(
     let tool_input_cache: Arc<Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
     let tool_input_cache_for_closure = Arc::clone(&tool_input_cache);
+    // MD 渲染状态：流式增量渲染 markdown → ANSI（方案 §3.6）。
+    // push() 在安全边界（空行/闭合 fence）返回已渲染片段，flush() 在 turn 结束时
+    // 渲染剩余 pending 内容。Arc<Mutex> 因 emitter 是 Fn 闭包，需跨调用可变访问。
+    let markdown_state: Arc<Mutex<MarkdownStreamState>> =
+        Arc::new(Mutex::new(MarkdownStreamState::default()));
+    let markdown_state_for_closure = Arc::clone(&markdown_state);
 
     let emitter: StatusEmitter = Arc::new(move |event: StatusEvent| {
         match event {
             StatusEvent::TextDelta(text) => {
-                if let Ok(mut buf) = output_handle.lock() {
-                    buf.append(&text);
+                // MD 渲染接线（方案 §3.6）：用 MarkdownStreamState 增量渲染，
+                // 在安全边界处输出已渲染的 ANSI 片段，避免半个 fence 渲染错乱。
+                let renderer = TerminalRenderer::shared();
+                if let Ok(mut ms) = markdown_state_for_closure.lock() {
+                    if let Some(rendered) = ms.push(renderer, &text) {
+                        if let Ok(mut buf) = output_handle.lock() {
+                            buf.append(&rendered);
+                        }
+                    }
                 }
             }
             StatusEvent::ToolUse { id, name, input } => {
@@ -2813,6 +2826,10 @@ fn execute_turn(
                 if let Ok(mut history) = tool_history.lock() {
                     history.clear();
                 }
+                // 重置 MD 渲染状态，防止上一个 turn 的 pending 残留混入新回复。
+                if let Ok(mut ms) = markdown_state_for_closure.lock() {
+                    *ms = MarkdownStreamState::default();
+                }
                 // P1 修复：不再在 StreamStart 清空 sidebar 历史。
                 // 原因：StreamStart 在每个 turn 开始时触发，清空 sidebar 历史
                 // 导致用户看不到工具调用记录。sidebar 历史应在 Submit 新 turn
@@ -2820,6 +2837,16 @@ fn execute_turn(
                 // 和结束后都能看到本次 turn 的工具调用记录。
             }
             StatusEvent::MessageStop => {
+                // MD 渲染 flush：渲染 pending 中剩余的 markdown（方案 §3.6）。
+                // 必须在 "\n\n" 分隔符之前执行，保证 AI 回复尾段不丢失。
+                let renderer = TerminalRenderer::shared();
+                if let Ok(mut ms) = markdown_state_for_closure.lock() {
+                    if let Some(rendered) = ms.flush(renderer) {
+                        if let Ok(mut buf) = output_for_closure.lock() {
+                            buf.append(&rendered);
+                        }
+                    }
+                }
                 // P1 修复：AI 回复末尾追加换行分隔符，避免下次 Submit echo
                 // 的 `> {line}` 紧贴 AI 回复末尾。原 TextDelta 流式 append
                 // 没有 `\n` 结尾，导致从第二次发送开始用户消息与 AI 回复
@@ -2873,6 +2900,15 @@ fn execute_turn(
                 // 永久保留，UI 假死。现在收到此事件立即：
                 // 1. 向 OutputView 追加错误提示（区分可重试/致命）
                 // 2. 调用 finish_turn() 退出 streaming 状态
+                // MD 渲染 flush：错误前先渲染 pending markdown，避免丢失尾段。
+                let renderer = TerminalRenderer::shared();
+                if let Ok(mut ms) = markdown_state_for_closure.lock() {
+                    if let Some(rendered) = ms.flush(renderer) {
+                        if let Ok(mut buf) = output_for_closure.lock() {
+                            buf.append(&rendered);
+                        }
+                    }
+                }
                 let banner = if recoverable {
                     format!("\n[error] 流式错误（可重试）：{message}\n")
                 } else {
