@@ -528,6 +528,17 @@ fn run_event_loop(
     // Any ScrollDown that brings n back to 0 re-enters follow mode.
     let mut scroll_offset: Option<usize> = None;
 
+    // 智能 auto-follow：manual 态时新输出累加此计数器，follow 态清零。
+    // 显示为边框标题区的 "[↓ N 行新输出]" 提示条（详见方案 §3.5）。
+    let mut new_output_lines: usize = 0;
+    // 上次渲染时的总行数，用于检测新输出（比较差值累加到 new_output_lines）。
+    let mut last_total_display_lines: usize = 0;
+
+    // Error 索引：记录所有 P0 error entry 的索引，供 E 键跳转（详见方案 §3.4）。
+    let mut error_entries: Vec<usize> = Vec::new();
+    // E 键跳转的当前位置（在 error_entries 中的索引）。
+    let mut error_nav_idx: usize = 0;
+
     // `?` toggles a centered keybindings overlay. While visible, most other
     // keybindings are intercepted so the overlay behaves like a modal.
     let mut help_visible: bool = false;
@@ -596,6 +607,9 @@ fn run_event_loop(
     // sticky 集成:缓存 wrap 后的 display breaks(每个 entry 的起始 display 行)。
     // 与 cached_wrapped 同生命周期,缓存命中时直接复用。
     let mut cached_display_breaks: Vec<usize> = Vec::new();
+    // E 键跳转用：draw 闭包更新，供 JumpToNextError 精确映射 entry→scroll_offset。
+    // scroll_offset 语义 = 距底部的行数，scroll_y = max_scroll - scroll_offset。
+    let mut last_max_scroll: usize = 0;
 
     'main_loop: loop {
         // 处理 AskUserQuestion 请求：worker 线程通过 ask handler 投递的待回答问题。
@@ -909,13 +923,36 @@ fn run_event_loop(
 
             let total_display_lines = wrapped_lines_arc.len();
             let max_scroll = total_display_lines.saturating_sub(visible_height);
+            // 供 E 键跳转使用（draw 外部无法直接获取 max_scroll）
+            last_max_scroll = max_scroll;
+
+            // 智能 auto-follow：检测新输出并更新计数器（方案 §3.5）
+            if total_display_lines > last_total_display_lines {
+                let diff = total_display_lines - last_total_display_lines;
+                if scroll_offset.is_some() {
+                    // manual 态：累加新输出行数
+                    new_output_lines = new_output_lines.saturating_add(diff);
+                }
+            }
+            // follow 态清零
+            if scroll_offset.is_none() {
+                new_output_lines = 0;
+            }
+            last_total_display_lines = total_display_lines;
+
             let scroll_y = match scroll_offset {
                 None => max_scroll,
                 Some(offset) => max_scroll.saturating_sub(offset),
             };
             let scroll_label = match scroll_offset {
                 None => String::new(),
-                Some(offset) => format!(" [scroll -{offset}]"),
+                Some(offset) => {
+                    if new_output_lines > 0 {
+                        format!(" [scroll -{offset}] [↓ {new_output_lines} 行新输出]")
+                    } else {
+                        format!(" [scroll -{offset}]")
+                    }
+                }
             };
 
             // sticky 集成:仅在用户主动翻历史(scroll_offset = Some)时启用粘性头部。
@@ -1431,6 +1468,41 @@ fn run_event_loop(
                             }
                         }
                     }
+                    InputAction::JumpToBottom => {
+                        // End 键：跳回底部 + 清零新输出计数（方案 §3.5）
+                        scroll_offset = None;
+                        new_output_lines = 0;
+                    }
+                    InputAction::JumpToNextError => {
+                        // E 键：跳转下一个 error entry（方案 §3.4）
+                        if let Ok(guard) = output_view.shared_handle().lock() {
+                            let errors = guard.error_entry_indices();
+                            if !errors.is_empty() {
+                                // 循环跳转：error_nav_idx 前进，越界回 0
+                                if errors.len() == 1 {
+                                    error_nav_idx = 0;
+                                } else if error_entries != errors {
+                                    // error 列表变化（新错误），从第一个开始
+                                    error_nav_idx = 0;
+                                } else {
+                                    error_nav_idx = (error_nav_idx + 1) % errors.len();
+                                }
+                                let target_entry = errors[error_nav_idx];
+                                error_entries = errors;
+                                // 用 cached_display_breaks 映射 entry → 起始 display 行。
+                                // breaks 长度 = entries.len() + 1，breaks[i] = entry i 的起始行。
+                                // 目标：让 error entry 出现在视口顶部 → scroll_y = breaks[i]。
+                                if target_entry < cached_display_breaks.len() {
+                                    let target_line = cached_display_breaks[target_entry];
+                                    let scroll_y = target_line.min(last_max_scroll);
+                                    scroll_offset = Some(last_max_scroll - scroll_y);
+                                } else {
+                                    // breaks 滞后（新 entry 未渲染），回退到距底部少量偏移
+                                    scroll_offset = Some(0);
+                                }
+                            }
+                        }
+                    }
                     InputAction::Submit(line) => {
                         // 重置 conhost_paste_intercepted 标志（每次 Submit 入口）
                         // 注意：如果上次设置了 conhost_paste_intercepted，后续的
@@ -1596,8 +1668,10 @@ fn run_event_loop(
                             let _ = ask.resp_tx.send(answer);
                             // pending_ask 已被 take() 清空，下一次 Submit 走正常对话流程。
                         } else if cli_holder.is_some() && turn_rx.is_none() {
-                            // Re-enter follow mode so the user sees new output.
-                            scroll_offset = None;
+                            // 智能 auto-follow（方案 §3.5）：不再强制重置 scroll_offset。
+                            // - follow 态（None）：保持 None，新输出自动贴底。
+                            // - manual 态（Some）：保持冻结，用户翻历史时不被打断，
+                            //   新输出累加到 new_output_lines，提示条引导用户按 End 跳转。
                             turn_start = Some(Instant::now());
 
                             // P2-4 修复：Submit 后立即调用 reset_turn（内部会设
@@ -2271,6 +2345,20 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
     }
     if matches!(key.code, KeyCode::PageDown) {
         return InputAction::ScrollDown;
+    }
+
+    // End → 跳回底部（follow 模式）+ 清零新输出计数（方案 §3.5）。
+    // 功能键，不需空闲守卫，用户正在打字时也能用。
+    if matches!(key.code, KeyCode::End) {
+        return InputAction::JumpToBottom;
+    }
+
+    // E（大写）+ 空闲守卫 → 跳转下一个 error entry（方案 §3.4）。
+    // 与 `?` 范式一致：buffer 非空时作为普通字符插入。
+    if let KeyCode::Char('E') = key.code {
+        if input.buffer().is_empty() {
+            return InputAction::JumpToNextError;
+        }
     }
 
     // Alt+Up / Alt+Down → 滚动侧栏工具历史。

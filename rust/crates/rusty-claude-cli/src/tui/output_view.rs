@@ -560,6 +560,23 @@ impl OutputBuffer {
             .count()
     }
 
+    /// 返回所有 error entry 的索引（is_error 或 priority=P0）。
+    /// 供 E 键跳转使用（详见方案 §3.4）。
+    pub(crate) fn error_entry_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, e)| match e {
+                OutputEntry::ToolCard {
+                    is_error,
+                    priority,
+                    ..
+                } if *is_error || *priority == Priority::P0 => Some(idx),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// 返回每个 ToolCard 在 `render_all()` 输出中的**显示行**区间 `[start, end)`。
     ///
     /// 鼠标点击场景：把点击的 row + scroll_y 映射到显示行号，

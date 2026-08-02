@@ -44,6 +44,10 @@ pub(crate) enum InputAction {
     SidebarScrollUp,
     /// User pressed Alt+Down to scroll the sidebar tool history down (newer).
     SidebarScrollDown,
+    /// User pressed End to jump back to bottom (follow mode) + clear new output counter.
+    JumpToBottom,
+    /// User pressed E (with empty buffer) to jump to the next error entry.
+    JumpToNextError,
     /// No-op (key not handled).
     Ignore,
 }
