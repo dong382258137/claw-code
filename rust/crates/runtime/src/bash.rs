@@ -278,6 +278,12 @@ async fn execute_bash_async(
     let start = Instant::now();
     let timeout_dur = Duration::from_millis(timeout_ms);
     let poll_interval = Duration::from_millis(100);
+    /// child 退出后 pipe 排空宽限期。
+    ///
+    /// 背景：bash `&` 启动的后台进程会继承 pipe 写端，导致 child 退出后
+    /// pipe 永不 EOF。给 2s 宽限期读取 child 退出前写入的残留数据，
+    /// 超时强制关闭 pipe，防止 select! loop 永久阻塞。
+    const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
     // 智能模式：初始化 ActivityMonitor，跟踪子进程树活跃度
     let mut monitor: Option<activity_monitor::ActivityMonitor> = if smart_mode {
@@ -293,10 +299,14 @@ async fn execute_bash_async(
     let mut timed_out = false;
     // 智能模式触发原因（idle vs hard），用于 stderr 消息和 provenance 区分
     let mut smart_idle = false;
+    // child 退出时间，用于 pipe 排空宽限期判断
+    let mut child_exit_time: Option<Instant> = None;
 
     // select! loop：
     // - child 未退出时：并发等待 child.wait() / 超时 / abort / 读 stdout / 读 stderr
     // - child 退出后：继续读 stdout/stderr 直到 EOF（pipe 中可能有残留数据）
+    // - child 退出后若 pipe 长时间未 EOF（后台 `&` 进程继承 pipe 写端），
+    //   超过 PIPE_DRAIN_GRACE 后强制关闭 pipe，防止死锁
     // - stdout/stderr 都 EOF 且 child 已退出时：break
     loop {
         if child_exited && child_stdout.is_none() && child_stderr.is_none() {
@@ -313,36 +323,54 @@ async fn execute_bash_async(
                     Err(_) => { exit_status = None; }
                 }
                 child_exited = true;
+                child_exit_time = Some(Instant::now());
             }
 
-            // 分支 2：轮询超时和 abort（仅在 child 未退出时检查）
-            _ = tokio::time::sleep(poll_interval), if !child_exited => {
+            // 分支 2：轮询超时、abort 和 pipe 排空宽限期
+            //   不带 `if !child_exited` guard：child 退出后仍需检查 pipe 宽限期。
+            //   原实现带此 guard 导致死锁：bash `&` 启动的后台进程继承 pipe 写端，
+            //   child 退出后 pipe 永不 EOF，timeout 检查被 guard 禁用，loop 永久阻塞。
+            _ = tokio::time::sleep(poll_interval) => {
                 if is_bash_aborted() {
                     aborted = true;
-                    let _ = child.kill().await;
-                    // 不 wait（会阻塞），让 loop 继续，child_exited 会在下轮设为 true
-                    child_exited = true;
-                } else if let Some(ref mut m) = monitor {
-                    // 智能模式：基于子进程树活跃度决策
-                    match m.poll() {
-                        activity_monitor::ActivityDecision::Continue => {}
-                        activity_monitor::ActivityDecision::IdleTimeout => {
-                            timed_out = true;
-                            smart_idle = true;
-                            let _ = child.kill().await;
-                            child_exited = true;
-                        }
-                        activity_monitor::ActivityDecision::HardTimeout => {
-                            timed_out = true;
-                            let _ = child.kill().await;
-                            child_exited = true;
-                        }
+                    if !child_exited {
+                        let _ = child.kill().await;
+                        child_exited = true;
                     }
-                } else if start.elapsed() >= timeout_dur {
-                    // 固定超时模式（input.timeout 显式指定时）
-                    timed_out = true;
-                    let _ = child.kill().await;
-                    child_exited = true;
+                    // abort 时立即关闭 pipe，快速退出（不等残留数据）
+                    child_stdout = None;
+                    child_stderr = None;
+                } else if !child_exited {
+                    if let Some(ref mut m) = monitor {
+                        // 智能模式：基于子进程树活跃度决策
+                        match m.poll() {
+                            activity_monitor::ActivityDecision::Continue => {}
+                            activity_monitor::ActivityDecision::IdleTimeout => {
+                                timed_out = true;
+                                smart_idle = true;
+                                let _ = child.kill().await;
+                                child_exited = true;
+                            }
+                            activity_monitor::ActivityDecision::HardTimeout => {
+                                timed_out = true;
+                                let _ = child.kill().await;
+                                child_exited = true;
+                            }
+                        }
+                    } else if start.elapsed() >= timeout_dur {
+                        // 固定超时模式（input.timeout 显式指定时）
+                        timed_out = true;
+                        let _ = child.kill().await;
+                        child_exited = true;
+                    }
+                } else if let Some(exit_time) = child_exit_time {
+                    // child 已退出但 pipe 未 EOF：后台进程（如 `&` 启动的服务）
+                    // 继承了 pipe 写端。给 PIPE_DRAIN_GRACE 宽限期读取残留数据，
+                    // 超时强制关闭 pipe，防止永久阻塞。
+                    if exit_time.elapsed() >= PIPE_DRAIN_GRACE {
+                        child_stdout = None;
+                        child_stderr = None;
+                    }
                 }
             }
 
