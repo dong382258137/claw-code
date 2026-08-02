@@ -790,9 +790,11 @@ impl OutputBuffer {
             }
             // Bug L8 修复：无 Text 可淘汰时，裁剪最早的 ToolCard 的 result。
             // 卡死修复：跳过已是占位符的 entry，避免无限裁剪同一 entry。
+            // 方案 §3.4：error/P0 entry 不被 trim 淘汰（用户需看到错误）。
             let first_card_idx = self.entries.iter().position(|e| {
-                matches!(e, OutputEntry::ToolCard { result: Some(r), .. }
-                    if !r.is_empty() && !r.starts_with("[trimmed:"))
+                matches!(e, OutputEntry::ToolCard { result: Some(r), is_error, priority, .. }
+                    if !r.is_empty() && !r.starts_with("[trimmed:")
+                    && !*is_error && *priority != Priority::P0)
             });
             if let Some(idx) = first_card_idx {
                 if let OutputEntry::ToolCard { result, .. } = &mut self.entries[idx] {
@@ -1245,5 +1247,43 @@ mod tests {
         let input = r#"{"command":"ls","emphasis":"normal"}"#;
         let result = r#"{"stdout":"ok"}"#;
         assert_eq!(compute_priority("bash", input, result, false), Priority::P1);
+    }
+
+    /// trim 保护 error entry：error/P0 ToolCard 的 result 不被 trim 淘汰（方案 §3.4）。
+    #[test]
+    fn trim_protects_error_entries() {
+        let mut buf = OutputBuffer::default();
+        // 1 个 error ToolCard（大 result）+ 1 个普通 ToolCard（大 result）
+        // + 超大 Text 触发 trim。验证 error entry 的 result 保持完整。
+        buf.push_entry(OutputEntry::ToolCard {
+            tool_id: "err1".to_string(),
+            name: "bash".to_string(),
+            input: "{}".to_string(),
+            result: Some("E".repeat(100 * 1024)),
+            is_error: true,
+            priority: Priority::P0,
+            collapsed: false,
+            timestamp: String::new(),
+        });
+        buf.push_entry(OutputEntry::ToolCard {
+            tool_id: "ok1".to_string(),
+            name: "bash".to_string(),
+            input: "{}".to_string(),
+            result: Some("O".repeat(100 * 1024)),
+            is_error: false,
+            priority: Priority::P2,
+            collapsed: true,
+            timestamp: String::new(),
+        });
+        // 追加 200KB Text → text_total_bytes 远超 256KB → 触发 trim
+        buf.append(&"T".repeat(200 * 1024));
+        // 验证 error entry 的 result 未被裁剪
+        if let OutputEntry::ToolCard { result, .. } = &buf.entries[0] {
+            let r = result.as_ref().expect("error result should exist");
+            assert!(!r.starts_with("[trimmed:"), "error entry must not be trimmed");
+            assert_eq!(r.len(), 100 * 1024, "error entry result must be intact");
+        } else {
+            panic!("entries[0] should be the error ToolCard");
+        }
     }
 }
