@@ -309,6 +309,16 @@ async fn execute_bash_async(
     //   超过 PIPE_DRAIN_GRACE 后强制关闭 pipe，防止死锁
     // - stdout/stderr 都 EOF 且 child 已退出时：break
     loop {
+        // PIPE_DRAIN_GRACE 检查（必须在 select! 之前，不依赖 sleep 分支）：
+        // biased select! 下，若后台进程持续输出数据，stdout read 分支总是
+        // 立即 ready，sleep 分支永远不到期 → PIPE_DRAIN_GRACE 检查被饿死。
+        // 在循环顶部检查确保即使 stdout 持续有数据，2s 后仍强制关闭 pipe。
+        if let Some(exit_time) = child_exit_time {
+            if exit_time.elapsed() >= PIPE_DRAIN_GRACE {
+                child_stdout = None;
+                child_stderr = None;
+            }
+        }
         if child_exited && child_stdout.is_none() && child_stderr.is_none() {
             break;
         }
