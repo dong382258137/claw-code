@@ -30,6 +30,80 @@ fn now_timestamp() -> String {
     Local::now().format("%H:%M:%S").to_string()
 }
 
+/// 工具结果的展现优先级（信息重要性 > 内容长度）。
+///
+/// 决定默认折叠行为与视觉突出程度：
+/// - `P0` 永不折叠 + 高亮（AI 文本 / error / emphasis=high / 命令失败）
+/// - `P1` 默认展开（短输出 ≤8 行 / normal / diff）
+/// - `P2` 默认折叠 + 预览（长输出 >40 行 / 长 JSON）
+/// - `P3` 折叠 + 单行摘要（emphasis=low / interrupted / 成功确认）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Priority {
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+impl Priority {
+    /// 该优先级默认是否折叠。
+    pub(crate) fn default_collapsed(self) -> bool {
+        matches!(self, Priority::P2 | Priority::P3)
+    }
+}
+
+/// 根据工具名、输入、结果、is_error 计算展现优先级。
+///
+/// 优先级链：模型 emphasis > is_error > bash returnCodeInterpretation > 行数启发式。
+/// 详见 docs/tui-output-intelligence-plan.md §3.1。
+pub(crate) fn compute_priority(
+    tool_name: &str,
+    input: &str,
+    result: &str,
+    is_error: bool,
+) -> Priority {
+    // 1. 模型 emphasis（最高优先级，模型明确表达意图）
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(emp) = v.get("emphasis").and_then(|e| e.as_str()) {
+            return match emp {
+                "high" => Priority::P0,
+                "low" => Priority::P3,
+                _ => Priority::P1, // "normal"
+            };
+        }
+    }
+
+    // 2. is_error（对非 bash 工具有效；bash 成功执行时 is_error 永远 false）
+    if is_error {
+        return Priority::P0;
+    }
+
+    // 3. bash returnCodeInterpretation 启发式（解析输出 JSON 中的字段）
+    if tool_name == "bash" {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(result) {
+            if let Some(rc) = v.get("returnCodeInterpretation").and_then(|e| e.as_str()) {
+                if rc == "interrupted" {
+                    return Priority::P3; // 用户 Ctrl+C 取消
+                }
+                if matches!(rc, "idle.timeout" | "timeout" | "test.hung") {
+                    return Priority::P0; // 超时/挂起，需关注
+                }
+                if rc.starts_with("exit_code:") && rc != "exit_code:0" {
+                    return Priority::P0; // 命令失败
+                }
+            }
+        }
+    }
+
+    // 4. 行数启发式兜底
+    let line_count = result.lines().count();
+    if line_count > 40 {
+        Priority::P2 // 长输出折叠
+    } else {
+        Priority::P1 // 短/中等输出默认展开
+    }
+}
+
 /// 结构化输出条目。
 #[derive(Debug, Clone)]
 pub(crate) enum OutputEntry {
@@ -47,6 +121,8 @@ pub(crate) enum OutputEntry {
         result: Option<String>,
         /// 是否为错误结果。
         is_error: bool,
+        /// 展现优先级（决定默认折叠行为与视觉突出）。
+        priority: Priority,
         /// 当前是否折叠（true=折叠只显示 header，false=展开显示完整结果）。
         collapsed: bool,
         /// 条目创建时的本地时间戳（HH:MM:SS）。
@@ -75,6 +151,7 @@ impl OutputEntry {
             input,
             result: None,
             is_error: false,
+            priority: Priority::P1, // 执行中默认 P1，complete 时重算
             collapsed: false,
             timestamp: now_timestamp(),
         }
@@ -323,7 +400,7 @@ impl OutputBuffer {
         self.trim_if_needed();
     }
 
-    /// 更新指定 tool_id 的 ToolCard：设置 result 并切换为折叠状态。
+    /// 更新指定 tool_id 的 ToolCard：设置 result 并按优先级决定折叠状态。
     pub(crate) fn complete_tool_card(
         &mut self,
         tool_id: &str,
@@ -338,16 +415,25 @@ impl OutputBuffer {
             // 工具结果可能很大（read 大文件、bash 大量输出），
             // 不计入会导致内存无限制增长。
             self.text_total_bytes += result.len();
+            // 先读取 name 和 input 用于计算优先级（借用冲突需先 clone）。
+            let (name, input) = match &self.entries[idx] {
+                OutputEntry::ToolCard { name, input, .. } => (name.clone(), input.clone()),
+                _ => unreachable!("idx 已确认是 ToolCard"),
+            };
+            let priority = compute_priority(&name, &input, &result, is_error);
+            let collapsed = priority.default_collapsed();
             if let OutputEntry::ToolCard {
                 result: r,
                 is_error: e,
-                collapsed,
+                priority: p,
+                collapsed: c,
                 ..
             } = &mut self.entries[idx]
             {
                 *r = Some(result);
                 *e = is_error;
-                *collapsed = true;
+                *p = priority;
+                *c = collapsed;
             }
             // 增量更新 cached_snapshot：从 idx 开始重渲染。
             self.recompute_snapshot_tail(idx);
@@ -379,16 +465,24 @@ impl OutputBuffer {
             });
         if let Some(idx) = found_idx {
             self.text_total_bytes += result.len();
+            let input = match &self.entries[idx] {
+                OutputEntry::ToolCard { input, .. } => input.clone(),
+                _ => unreachable!("idx 已确认是 ToolCard"),
+            };
+            let priority = compute_priority(tool_name, &input, &result, is_error);
+            let collapsed = priority.default_collapsed();
             if let OutputEntry::ToolCard {
                 result: r,
                 is_error: e,
-                collapsed,
+                priority: p,
+                collapsed: c,
                 ..
             } = &mut self.entries[idx]
             {
                 *r = Some(result);
                 *e = is_error;
-                *collapsed = true;
+                *p = priority;
+                *c = collapsed;
             }
             self.recompute_snapshot_tail(idx);
             self.trim_if_needed();
@@ -900,8 +994,8 @@ mod tests {
                 r#"{"command":"ls"}"#.to_string(),
             ));
         }
-        // 20 行输出，超过 COLLAPSE_THRESHOLD(5)
-        let long_output = (1..=20)
+        // 50 行输出，超过 P2 阈值(40) → 默认折叠
+        let long_output = (1..=50)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -915,7 +1009,7 @@ mod tests {
             snap.contains("[+] 展开"),
             "折叠预览应包含 [+] 展开 提示: {snap}"
         );
-        assert!(snap.contains("17 行"), "应显示隐藏行数: {snap}");
+        assert!(snap.contains("47 行"), "应显示隐藏行数: {snap}");
         // 应包含前3行预览
         assert!(snap.contains("line1"));
         assert!(snap.contains("line3"));
@@ -947,6 +1041,7 @@ mod tests {
                 input: r#"{"command":"ls"}"#.to_string(),
                 result: Some(long_output),
                 is_error: false,
+                priority: Priority::P2,
                 collapsed: true,
                 timestamp: String::new(),
             });
@@ -975,6 +1070,7 @@ mod tests {
                 input: "{}".to_string(),
                 result: Some("output".to_string()),
                 is_error: false,
+                priority: Priority::P2,
                 collapsed: true,
                 timestamp: String::new(),
             });
@@ -1000,6 +1096,7 @@ mod tests {
                 input: "{}".to_string(),
                 result: Some("out".to_string()),
                 is_error: false,
+                priority: Priority::P2,
                 collapsed: true,
                 timestamp: String::new(),
             });
@@ -1009,6 +1106,7 @@ mod tests {
                 input: "{}".to_string(),
                 result: None,
                 is_error: false,
+                priority: Priority::P1,
                 collapsed: false,
                 timestamp: String::new(),
             });
@@ -1046,6 +1144,7 @@ mod tests {
                 input: "{}".to_string(),
                 result: Some("x".repeat(1024)),
                 is_error: false,
+                priority: Priority::P2,
                 collapsed: true,
                 timestamp: String::new(),
             });
@@ -1056,5 +1155,76 @@ mod tests {
         let snap = buf.render_all();
         // 应该有被裁剪的占位符
         assert!(snap.contains("[trimmed:") || buf.truncated);
+    }
+
+    /// compute_priority：模型 emphasis=high → P0
+    #[test]
+    fn compute_priority_emphasis_high() {
+        let input = r#"{"command":"ls","emphasis":"high"}"#;
+        let result = r#"{"stdout":"ok"}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P0);
+    }
+
+    /// compute_priority：模型 emphasis=low → P3
+    #[test]
+    fn compute_priority_emphasis_low() {
+        let input = r#"{"command":"ls","emphasis":"low"}"#;
+        let result = r#"{"stdout":"ok"}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P3);
+    }
+
+    /// compute_priority：is_error=true → P0（非 bash 工具）
+    #[test]
+    fn compute_priority_is_error() {
+        let input = r#"{"path":"foo.rs"}"#;
+        assert_eq!(compute_priority("read_file", input, "err", true), Priority::P0);
+    }
+
+    /// compute_priority：bash interrupted → P3（用户取消）
+    #[test]
+    fn compute_priority_bash_interrupted() {
+        let input = r#"{"command":"sleep 100"}"#;
+        let result = r#"{"returnCodeInterpretation":"interrupted"}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P3);
+    }
+
+    /// compute_priority：bash exit_code:1 → P0（命令失败）
+    #[test]
+    fn compute_priority_bash_exit_nonzero() {
+        let input = r#"{"command":"false"}"#;
+        let result = r#"{"returnCodeInterpretation":"exit_code:1"}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P0);
+    }
+
+    /// compute_priority：bash idle.timeout → P0（挂起需关注）
+    #[test]
+    fn compute_priority_bash_idle_timeout() {
+        let input = r#"{"command":"hang"}"#;
+        let result = r#"{"returnCodeInterpretation":"idle.timeout"}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P0);
+    }
+
+    /// compute_priority：bash exit_code:0 + 短输出 → P1（默认展开）
+    #[test]
+    fn compute_priority_bash_ok_short() {
+        let input = r#"{"command":"ls"}"#;
+        let result = r#"{"returnCodeInterpretation":"exit_code:0","stdout":"file1\nfile2"}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P1);
+    }
+
+    /// compute_priority：长输出 >40 行 → P2（折叠预览）
+    #[test]
+    fn compute_priority_long_output() {
+        let input = r#"{"command":"cat big.txt"}"#;
+        let result = "line\n".repeat(50);
+        assert_eq!(compute_priority("bash", input, &result, false), Priority::P2);
+    }
+
+    /// compute_priority：normal emphasis → P1
+    #[test]
+    fn compute_priority_emphasis_normal() {
+        let input = r#"{"command":"ls","emphasis":"normal"}"#;
+        let result = r#"{"stdout":"ok"}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P1);
     }
 }
