@@ -1,7 +1,7 @@
 # TUI 输出智能化与人性化交互方案
 
 **版本**: v1.0 (2026-08-02)
-**状态**: 待实现
+**状态**: 已实现 (2026-08-03)
 **范围**: TUI 输出渲染层 + 工具结果 schema + system prompt
 
 ## 1. 背景与问题
@@ -152,20 +152,21 @@ AI 文本是 P0 永不折叠 — 若不接 MD 渲染，P0 文本仍是一堆 `#`
 
 8 个 commit，依赖顺序：
 
-| # | 改动 | 文件 | 依赖 |
-|---|------|------|------|
-| 1 | tool schema 加 emphasis 字段 | `runtime/src/bash.rs` `BashCommandOutput` 等 | 无 |
-| 2 | prompt 教模型用 emphasis | `runtime/src/prompt.rs` | #1 |
-| 3 | OutputEntry 加 priority + 启发式 | `tui/output_view.rs` | #1 |
-| 4 | 折叠按 priority 分档 + L1 摘要 | `tui/tool_card.rs` | #3 |
-| 5 | error 索引 + E/End 跳转 | `tui/output_view.rs`, `tui/app.rs` | #3 |
-| 6 | auto-follow 冻结 + 新输出提示 | `tui/app.rs` | 无 |
-| 7 | MD 渲染接线（StreamingMarkdownRenderer） | `tui/app.rs`, `tui/output_view.rs` | 无 |
-| 8 | trim 保护 error entry | `tui/output_view.rs` | #5 |
+| # | 改动 | 文件 | 依赖 | commit |
+|---|------|------|------|--------|
+| 1 | tool schema 加 emphasis 字段 | `runtime/src/bash.rs` `BashCommandOutput` 等 | 无 | `a80013de` |
+| 2 | prompt 教模型用 emphasis | `runtime/src/prompt.rs` | #1 | `b0d4bd49` |
+| 3 | OutputEntry 加 priority + 启发式 | `tui/output_view.rs` | #1 | `1b713e02` |
+| 4 | 折叠按 priority 分档 + L1 摘要 | `tui/tool_card.rs` | #3 | `16af4c68` |
+| 5 | error 索引 + E/End 跳转 | `tui/output_view.rs`, `tui/app.rs` | #3 | `d25a3b31` |
+| 6 | auto-follow 冻结 + 新输出提示 | `tui/app.rs` | 无 | `d25a3b31` |
+| 7 | MD 渲染接线（MarkdownStreamState） | `tui/app.rs` | 无 | `dc9269d0` |
+| 8 | trim 保护 error entry | `tui/output_view.rs` | #5 | `2fd1dd59` |
 
 - #1-2 是 runtime+prompt 层
 - #3-8 是 TUI 层
-- #7 可与 #3-6 并行
+- #5+#6 合并为一个 commit（共享 app.rs 改动）
+- 全部 485 测试通过，无回归
 
 ## 5. 验证计划
 
