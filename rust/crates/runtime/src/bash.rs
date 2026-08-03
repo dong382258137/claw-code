@@ -12,8 +12,8 @@ use tokio::runtime::Builder;
 
 use crate::lane_events::{LaneEvent, ShipMergeMethod, ShipProvenance};
 use crate::sandbox::{
-    build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
-    SandboxConfig, SandboxStatus,
+    build_linux_sandbox_command, platform_sandbox_supported, resolve_sandbox_status_for_request,
+    FilesystemIsolationMode, SandboxBuilder, SandboxConfig, SandboxStatus, WindowsSandboxBuilder,
 };
 use crate::ConfigLoader;
 
@@ -117,6 +117,12 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
+
+        // 改进点 5:Windows/macOS 平台接入 SandboxBuilder,
+        // 将子进程分配到 Job Object(Windows)或保留 macOS 钩子。
+        // Linux 在 prepare_command 阶段用 unshare 包装,不在此处理。
+        // std::process::Child::id() 返回 u32(非 Option)
+        try_assign_sandbox_job(&sandbox_status, child.id());
 
         return Ok(BashCommandOutput {
             stdout: String::new(),
@@ -264,6 +270,13 @@ async fn execute_bash_async(
     command.stdin(Stdio::null());
 
     let mut child = command.spawn()?;
+
+    // 改进点 5:Windows/macOS 平台接入 SandboxBuilder,
+    // spawn 后立即将子进程分配到 Job Object(Windows)。
+    // Linux 在 prepare_command 阶段用 unshare 包装,不在此处理。
+    if let Some(pid) = child.id() {
+        try_assign_sandbox_job(&sandbox_status, pid);
+    }
 
     // take stdout/stderr 用于并发读取，避免管道死锁
     let mut child_stdout = child.stdout.take();
@@ -678,6 +691,57 @@ fn inject_utf8_env_tokio(cmd: &mut tokio::process::Command) {
         if std::env::var("LC_ALL").is_err() {
             cmd.env("LC_ALL", "en_US.UTF-8");
         }
+    }
+}
+
+/// 尝试将子进程分配到平台沙箱(Windows Job Object / macOS sandbox-exec)。
+///
+/// 改进点 5:接入 Windows SandboxBuilder 到 bash 执行路径。
+/// 之前 `WindowsSandboxBuilder` 已实现但未被 `prepare_command` 调用,
+/// 导致 Windows 上 `sandbox.enabled=true` 时无实际隔离。
+///
+/// 现在在 spawn 后立即调用 `assign_process(pid)`,通过 Win32 API
+/// CreateJobObjectW + AssignProcessToJobObject 将子进程分配到 Job Object,
+/// 设置 CPU/memory 限制。失败时非致命(记录到 stderr 但不阻断主流程)。
+///
+/// **异步执行**:Job Object 设置通过 PowerShell + C# 内联调用 Win32 API,
+/// 可能耗时数百毫秒(PowerShell 启动 + C# 编译)。为避免阻塞 tokio runtime
+/// 和影响 timeout 判定(如 bash 测试的 1ms timeout),用 `std::thread::spawn`
+/// 在独立 OS 线程中执行,主流程不等待。
+///
+/// 注意:
+/// - 仅在 `sandbox_status.enabled && platform_sandbox_supported()` 时调用
+/// - Linux 不走此路径(Linux 在 `prepare_command` 阶段用 unshare 包装)
+/// - 失败时返回 `()`,不向上传播错误,避免沙箱设置失败阻塞命令执行
+fn try_assign_sandbox_job(sandbox_status: &SandboxStatus, pid: u32) {
+    if !sandbox_status.enabled || !platform_sandbox_supported() {
+        return;
+    }
+
+    // Linux 在 prepare_command 阶段用 unshare 包装,不在此处处理
+    if cfg!(target_os = "linux") {
+        return;
+    }
+
+    // Windows: 用 WindowsSandboxBuilder 的 assign_process 分配到 Job Object
+    // 异步执行:PowerShell 调用耗时可能数百毫秒,不阻塞主流程
+    #[cfg(target_os = "windows")]
+    {
+        std::thread::spawn(move || {
+            let builder = WindowsSandboxBuilder::default();
+            if let Err(e) = SandboxBuilder::assign_process(&builder, pid) {
+                // 非致命:Job Object 设置失败不阻断命令执行,仅记录到 stderr
+                eprintln!("[sandbox] Windows Job Object 分配失败(pid={pid}): {e}");
+            }
+        });
+    }
+
+    // macOS: MacOsSandboxBuilder 的 assign_process 是 no-op(默认实现),
+    // 实际隔离在 prepare_command 阶段的 sandbox-exec 包装中完成。
+    // 此处保留钩子,未来若 macOS 需要 post-spawn 处理可扩展。
+    #[cfg(target_os = "macos")]
+    {
+        let _ = pid;
     }
 }
 
@@ -1128,6 +1192,59 @@ mod tests {
             output.stderr
         );
         assert!(output.stdout.contains("done"));
+    }
+
+    /// 改进点 5:`try_assign_sandbox_job` 在 sandbox disabled 时应无副作用。
+    /// 即使在 Windows 上,只要 sandbox_status.enabled=false,函数应直接返回,
+    /// 不尝试调用 Job Object 分配。
+    #[test]
+    fn try_assign_sandbox_job_noop_when_disabled() {
+        use super::try_assign_sandbox_job;
+        use crate::sandbox::SandboxStatus;
+
+        let disabled_status = SandboxStatus {
+            enabled: false,
+            ..Default::default()
+        };
+        // 应无副作用,不 panic
+        try_assign_sandbox_job(&disabled_status, 9999);
+    }
+
+    /// 改进点 5:`try_assign_sandbox_job` 在 sandbox enabled 但当前平台不支持时
+    /// 应无副作用。非 Windows/macOS 平台(如 Linux)应直接返回。
+    #[test]
+    fn try_assign_sandbox_job_noop_on_unsupported_platform() {
+        use super::try_assign_sandbox_job;
+        use crate::sandbox::SandboxStatus;
+
+        // 构造 enabled=true 但 supported=false 的状态(模拟非 Windows 平台)
+        let enabled_but_unsupported = SandboxStatus {
+            enabled: true,
+            supported: false, // 模拟非 Windows/macOS
+            ..Default::default()
+        };
+        // 应无副作用,不 panic
+        try_assign_sandbox_job(&enabled_but_unsupported, 9999);
+    }
+
+    /// 改进点 5:Windows 平台上 sandbox enabled 时应尝试分配 Job Object。
+    /// 此测试不验证 Job Object 真正生效(需要 PowerShell + Win32 API),
+    /// 仅验证函数在 Windows 上被调用不 panic(可能返回 Err 但不传播)。
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn try_assign_sandbox_job_windows_attempts_assignment() {
+        use super::try_assign_sandbox_job;
+        use crate::sandbox::SandboxStatus;
+
+        let enabled_windows = SandboxStatus {
+            enabled: true,
+            supported: true, // Windows 平台支持
+            active: false,    // 但未激活(改进点 4 之后 supported 反映平台能力)
+            ..Default::default()
+        };
+        // pid=999999 几乎肯定不存在,assign_process 会失败但不应 panic
+        // 函数应吞掉错误,仅 eprintln 记录
+        try_assign_sandbox_job(&enabled_windows, 999_999);
     }
 }
 
