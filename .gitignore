@@ -51,3 +51,10 @@ rust/crates/rusty-claude-cli/tui-ports/PORTING.md
 
 # fastembed model cache (downloaded ONNX models)
 .fastembed_cache/
+
+# TUI debug screenshots and scripts (transient)
+_claw_tui_*.png
+_screenshot.ps1
+
+# Temporary example/test scratch files
+rust/crates/rusty-claude-cli/examples/
