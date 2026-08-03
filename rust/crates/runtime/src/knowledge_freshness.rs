@@ -8,13 +8,13 @@
 //! 架构:
 //! - `ResearchClient` trait(async):依赖倒置,runtime 不依赖 tools/api
 //! - `GLOBAL_RESEARCH_CLIENT`(OnceLock):全局注入点,未注入时降级(不调研)
-//! - `GATE_CACHE`(Mutex<HashMap>):task_hash → GatedTask 缓存,避免 retry 重复调研
+//! - `GATE_CACHE`(RwLock<HashMap>):task_hash → GatedTask 缓存,避免 retry 重复调研
 //! - `gate_task`(async):MVP 入口,在 coordinator_executor::execute 内部调用
 //!
 //! 详见 `docs/plans/knowledge-freshness-gate-plan.md` v3。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use async_trait::async_trait;
 
@@ -334,24 +334,26 @@ impl GatedTask {
 // 缓存(避免 retry 重复调研)
 // ──────────────────────────────────────────────────────────────────────────
 
-static GATE_CACHE: OnceLock<Mutex<HashMap<u64, GatedTask>>> = OnceLock::new();
+// P3:改用 RwLock 替代 Mutex — 并行子任务密集查询时,多个相同 task_hash 的
+// 读操作不会互相阻塞(读多写少场景)。写操作仍独占,保证一致性。
+static GATE_CACHE: OnceLock<RwLock<HashMap<u64, GatedTask>>> = OnceLock::new();
 
-fn gate_cache() -> &'static Mutex<HashMap<u64, GatedTask>> {
-    GATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn gate_cache() -> &'static RwLock<HashMap<u64, GatedTask>> {
+    GATE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// 读取缓存(命中返回 clone)。
 ///
-/// Mutex 中毒时降级为 None(不阻塞任务),符合 L2 规范
+/// RwLock 读锁中毒时降级为 None(不阻塞任务),符合 L2 规范
 /// "用 unwrap_or_else(|e| e.into_inner()) 不用 expect"。
 fn cache_get(task_hash: u64) -> Option<GatedTask> {
-    let guard = gate_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let guard = gate_cache().read().unwrap_or_else(|e| e.into_inner());
     guard.get(&task_hash).cloned()
 }
 
 /// 写入缓存。
 fn cache_put(task_hash: u64, gated: GatedTask) {
-    let mut guard = gate_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = gate_cache().write().unwrap_or_else(|e| e.into_inner());
     guard.insert(task_hash, gated);
 }
 

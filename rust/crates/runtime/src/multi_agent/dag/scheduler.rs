@@ -129,7 +129,9 @@ impl DagScheduler {
             max_parallelism,
             dag_store: None,
             dag_run_id: None,
-            fail_fast: FailFast::On,
+            // P0:默认 FailFast::Off — 单节点失败不应取消整个 DAG,
+            // 让独立分支继续执行。调用方如需严格语义,显式 `.with_fail_fast(FailFast::On)`。
+            fail_fast: FailFast::Off,
         }
     }
 
@@ -897,7 +899,8 @@ mod tests {
         let executor = Arc::new(FailOnExecutor {
             fail_id: "n1".to_string(),
         });
-        let scheduler = DagScheduler::new(graph, executor);
+        // 默认已改为 FailFast::Off,本测试验证 On 行为,需显式指定。
+        let scheduler = DagScheduler::new(graph, executor).with_fail_fast(FailFast::On);
         let err = scheduler.run().await.expect_err("should fail fast");
         assert!(
             matches!(err, DagError::NodeFailed(ref id) if id == "n1"),
@@ -989,7 +992,9 @@ mod tests {
         let executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
             fail_id: "n1".to_string(),
         });
-        let scheduler = DagScheduler::new(graph, executor).with_dag_run(store.clone(), run_id);
+        let scheduler = DagScheduler::new(graph, executor)
+            .with_dag_run(store.clone(), run_id)
+            .with_fail_fast(FailFast::On);
 
         let _ = scheduler.run().await;
 
@@ -1071,7 +1076,9 @@ mod tests {
             fail_n_times: 10,
             attempts: Mutex::new(0),
         });
-        let scheduler = DagScheduler::new(g, executor);
+        // 默认 FailFast::Off 下单节点 DAG 失败仍返回 Ok(DagRunResult),
+        // 本测试验证 Err 语义,需显式 On。
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::On);
         let err = scheduler
             .run()
             .await
@@ -1089,7 +1096,9 @@ mod tests {
         let executor = Arc::new(FailOnExecutor {
             fail_id: "n1".to_string(),
         });
-        let scheduler = DagScheduler::new(g, executor);
+        // 默认 FailFast::Off 下单节点 DAG 失败返回 Ok(DagRunResult),
+        // 本测试验证 Err 语义,需显式 On。
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::On);
         let err = scheduler
             .run()
             .await
@@ -1131,7 +1140,8 @@ mod tests {
         let executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
             fail_id: "n2".to_string(),
         });
-        let scheduler = DagScheduler::new(g, executor);
+        // 默认 FailFast::Off 下失败返回 Ok(DagRunResult),本测试验证 Err 语义,需显式 On。
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::On);
         let err = scheduler.run().await.expect_err("should fail");
         // The error must point at n2, not n1.
         assert!(
@@ -1206,12 +1216,13 @@ mod tests {
 
     #[tokio::test]
     async fn fail_fast_on_still_returns_err_on_failure() {
-        // FailFast::On (default) should return Err, not DagRunResult.
+        // FailFast::On should return Err, not DagRunResult.
+        // (默认已改为 Off,本测试验证 On 行为,需显式指定。)
         let g = parallel_graph();
         let executor: Arc<dyn SubagentExecutor> = Arc::new(FailOnExecutor {
             fail_id: "n1".to_string(),
         });
-        let scheduler = DagScheduler::new(g, executor); // default FailFast::On
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::On);
         let err = scheduler
             .run_with_details()
             .await

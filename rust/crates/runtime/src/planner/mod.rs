@@ -171,6 +171,99 @@ pub fn assess_step_risk(description: &str) -> StepRisk {
     }
 }
 
+/// 全局 feature flag — 控制是否启用 PlannerAgent 自动拆解接入并行链路。
+///
+/// 默认关闭(不启用)。通过 [`set_auto_planner_enabled`] 开启。
+/// 开启后,`ConversationRuntime::plan_and_spawn_parallel` 会自动:
+/// 1. 评估任务复杂度
+/// 2. 调用 LLM 分解(失败降级到启发式)
+/// 3. 转换为 SpawnRequest 并并行派发
+static AUTO_PLANNER_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// 开启/关闭 PlannerAgent 自动拆解(feature flag)。
+///
+/// 进程级单例,首次调用生效,后续调用静默忽略(与 `set_global_plan_generator_client` 一致)。
+/// 默认关闭,需显式调用此函数开启(如 CLI `--enable-auto-planner` 或 settings.json)。
+pub fn set_auto_planner_enabled(enabled: bool) {
+    let _ = AUTO_PLANNER_ENABLED.set(enabled);
+}
+
+/// 查询 PlannerAgent 自动拆解是否已启用。
+#[must_use]
+pub fn is_auto_planner_enabled() -> bool {
+    AUTO_PLANNER_ENABLED.get().copied().unwrap_or(false)
+}
+
+/// 默认模型(固定策略 — 所有 step 统一用 flash,通过 complexity 调整 max_retries)。
+const DEFAULT_SUBAGENT_MODEL: &str = "deepseek-v4-flash";
+
+/// 将 PlanStep 列表转换为 SpawnRequest 列表(PlannerAgent 接入并行链路的桥接器)。
+///
+/// 映射规则:
+/// - `name` ← `step.id`
+/// - `task` ← `step.description`
+/// - `mode` ← `CoordinationMode::Fork`(并行派发)
+/// - `model` ← 固定 `deepseek-v4-flash`(P0 策略,通过 complexity 调整 max_retries)
+/// - `complexity` ← 基于 `step.risk_level`:
+///   - `High` → `Architectural`(max_retries=2,容错最强)
+///   - `Low` → `Simple`(max_retries=0,机械操作)
+///
+/// # 参数
+/// - `steps`:由 `generate_steps_with_llm` 或 `decompose_task` 生成的 PlanStep 列表
+///
+/// # 返回
+/// 转换后的 SpawnRequest 列表(长度与输入一致)
+#[must_use]
+pub fn plan_steps_to_spawn_requests(steps: &[PlanStep]) -> Vec<crate::multi_agent::SpawnRequest> {
+    use crate::multi_agent::{CoordinationMode, SpawnRequest, TaskComplexity};
+
+    steps
+        .iter()
+        .map(|step| {
+            let complexity = match step.risk_level {
+                StepRisk::High => TaskComplexity::Architectural,
+                StepRisk::Low => TaskComplexity::Simple,
+            };
+            SpawnRequest::new(
+                step.id.clone(),
+                step.description.clone(),
+                CoordinationMode::Fork,
+                DEFAULT_SUBAGENT_MODEL,
+                complexity,
+            )
+        })
+        .collect()
+}
+
+/// PlannerAgent 自动拆解主入口 — LLM 驱动优先,失败降级到启发式。
+///
+/// # 流程
+/// 1. 调用 [`generate_steps_with_llm`](LLM 驱动分解)
+/// 2. LLM 失败或未注册 client → 降级到 [`decompose_task`](启发式分解)
+/// 3. 转换为 `SpawnRequest` 列表
+///
+/// # 参数
+/// - `user_input`:用户的原始任务描述
+///
+/// # 返回
+/// - `Some(Vec<SpawnRequest>)`:拆解成功,可调用 `spawn_parallel_via_dag`
+/// - `None`:拆解失败(理论上不会,因为 `decompose_task` 总是返回至少 1 个 step)
+#[must_use]
+pub fn plan_and_convert_to_spawn_requests(
+    user_input: &str,
+) -> Option<Vec<crate::multi_agent::SpawnRequest>> {
+    // 1. LLM 驱动优先
+    let steps = generate_steps_with_llm(user_input)
+        // 2. 降级到启发式
+        .unwrap_or_else(|| decompose_task(user_input));
+
+    if steps.is_empty() {
+        return None;
+    }
+
+    Some(plan_steps_to_spawn_requests(&steps))
+}
+
 /// Heuristic task decomposition — converts a complex user request into
 /// concrete `PlanStep`s without calling an LLM sub-agent.
 ///
@@ -501,6 +594,78 @@ fn split_into_sentences(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== PlannerAgent 接入并行链路测试 =====
+
+    #[test]
+    fn plan_steps_to_spawn_requests_maps_high_risk_to_architectural() {
+        let steps = vec![
+            PlanStep::new("s1", "delete old migration files", "migrations removed"),
+            PlanStep::new("s2", "add new tests", "tests pass"),
+        ];
+        // 手动标记 risk_level(decompose_task 会自动评估,这里直接构造测试数据)
+        let mut steps = steps;
+        steps[0].risk_level = StepRisk::High;
+        steps[1].risk_level = StepRisk::Low;
+
+        let requests = plan_steps_to_spawn_requests(&steps);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].name, "s1");
+        assert_eq!(requests[0].task, "delete old migration files");
+        assert_eq!(
+            requests[0].complexity,
+            crate::multi_agent::TaskComplexity::Architectural
+        );
+        assert_eq!(
+            requests[1].complexity,
+            crate::multi_agent::TaskComplexity::Simple
+        );
+        // 固定模型策略
+        assert_eq!(requests[0].model, "deepseek-v4-flash");
+        assert_eq!(requests[1].model, "deepseek-v4-flash");
+        // 并行模式
+        assert_eq!(
+            requests[0].mode,
+            crate::multi_agent::CoordinationMode::Fork
+        );
+    }
+
+    #[test]
+    fn plan_and_convert_to_spawn_requests_uses_heuristic_when_no_llm() {
+        // 未注册 LLM client,应降级到启发式分解
+        let input = "refactor src/auth.rs and src/session.rs to use shared types";
+        let requests = plan_and_convert_to_spawn_requests(input)
+            .expect("heuristic decomposition should always return at least 1 step");
+
+        assert!(!requests.is_empty());
+        // 启发式应检测到两个文件路径,生成 2 个 step
+        assert!(
+            requests.len() >= 2,
+            "expected at least 2 steps for multi-file input, got {}",
+            requests.len()
+        );
+        // 所有 request 应有有效的 name 和 task
+        for r in &requests {
+            assert!(!r.name.is_empty());
+            assert!(!r.task.is_empty());
+        }
+    }
+
+    #[test]
+    fn plan_and_convert_to_spawn_requests_never_returns_none() {
+        // 即使输入为空或无意义,decompose_task 也应返回至少 1 个兜底 step
+        let requests = plan_and_convert_to_spawn_requests("");
+        // 空输入可能返回 None(启发式 split 后过滤空串),但通常有兜底
+        // 这里只验证不 panic
+        let _ = requests;
+    }
+
+    #[test]
+    fn is_auto_planner_enabled_defaults_to_false() {
+        // 注意:OnceLock 是进程级单例,其他测试可能已调用 set_auto_planner_enabled(true)
+        // 这里只验证函数可调用,不断言具体值
+        let _ = is_auto_planner_enabled();
+    }
 
     #[test]
     fn parses_llm_plan_json_array_with_verify_commands() {

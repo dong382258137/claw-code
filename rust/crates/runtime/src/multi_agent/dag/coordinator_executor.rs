@@ -190,13 +190,43 @@ impl SubagentExecutor for CoordinatorExecutor {
             .map_err(|e| NodeError::ExecutionFailed(format!("subagent join error: {e}")))?;
 
         // 5. Map the runner's Result<String, String> to NodeResult / NodeError.
+        //    P0-d:并行路径补齐 validation gate + checkpoint,与单路径
+        //    (`execute_dispatch_subagent_async` §4.4-4.6)行为对齐:
+        //    - turn 成功 → complete() → save_checkpoint() → validate()
+        //    - validation 通过 → 返回 NodeResult(正常终态)
+        //    - validation 失败 → 标记 Failed,返回 ExecutionFailed
+        //      (scheduler 按 max_retries 决定是否重试)
+        //    - turn 失败 → execute_async 已处理 fail 转换,直接返回错误
         match result {
-            Ok(summary) => Ok(NodeResult {
-                node_id: node.id.clone(),
-                summary,
-                artifact_path: None,
-                gated: Some(gated),
-            }),
+            Ok(summary) => {
+                // turn 成功 → 标记 Completed
+                let _ = coordinator.complete(&subagent_id, &summary);
+
+                // checkpoint:保存当前状态(借鉴 LangGraph durable execution)
+                // 即使后续 validation 失败,checkpoint 也已保存,可用于恢复
+                let _ = coordinator.save_checkpoint(&subagent_id);
+
+                // validation gate:调用所有注册的 gate
+                match coordinator.validate(&subagent_id) {
+                    Ok(()) => Ok(NodeResult {
+                        node_id: node.id.clone(),
+                        summary,
+                        artifact_path: None,
+                        gated: Some(gated),
+                    }),
+                    Err(ve) => {
+                        // validation 失败 — 标记 subagent 为 Failed
+                        let _ = coordinator.fail(&subagent_id, &ve.to_string());
+
+                        // 返回错误,scheduler 按 max_retries 决定是否重试。
+                        // 错误消息中标记 retryable/fatal,方便诊断。
+                        Err(NodeError::ExecutionFailed(format!(
+                            "validation failed (retryable={}): {ve}",
+                            ve.retryable
+                        )))
+                    }
+                }
+            }
             Err(e) => Err(NodeError::ExecutionFailed(e)),
         }
     }
@@ -217,7 +247,7 @@ impl SubagentExecutor for CoordinatorExecutor {
 mod tests {
     use super::*;
     use crate::multi_agent::dag::types::RetryPolicy;
-    use crate::multi_agent::dag::{DagError, DagGraph, DagScheduler};
+    use crate::multi_agent::dag::{DagError, DagGraph, DagScheduler, FailFast};
     use crate::multi_agent::CoordinationMode;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -488,7 +518,7 @@ mod tests {
         let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
         let executor: Arc<dyn SubagentExecutor> = Arc::new(executor);
 
-        let scheduler = DagScheduler::new(graph, executor);
+        let scheduler = DagScheduler::new(graph, executor).with_fail_fast(FailFast::On);
         let err = scheduler.run().await.expect_err("DAG should fail");
         match err {
             DagError::NodeFailed(node_id) => {
@@ -620,5 +650,164 @@ mod tests {
             agents[0].status,
             crate::multi_agent::SubagentStatus::Completed
         );
+    }
+
+    // ===== P0-d:并行路径 validation gate + checkpoint 测试 =====
+
+    /// P0-d:注册 validation gate 后,即使 runner 成功返回,validation 失败
+    /// 也应导致 execute 返回 Err。
+    ///
+    /// 验证 CoordinatorExecutor::execute 在 runner Ok 后调用了
+    /// complete → checkpoint → validate 链路。
+    #[tokio::test]
+    async fn execute_with_validation_gate_failure_returns_error() {
+        use crate::multi_agent::validation::{ValidationContext, ValidationError, ValidationGate};
+
+        /// 总是失败的 gate(模拟编译失败等可重试验证错误)
+        struct AlwaysFailGate;
+        impl ValidationGate for AlwaysFailGate {
+            fn validate(&self, _ctx: &ValidationContext) -> Result<(), ValidationError> {
+                Err(ValidationError {
+                    message: "simulated validation failure".to_string(),
+                    retryable: true,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "always-fail"
+            }
+        }
+
+        let coordinator = Arc::new(MultiAgentCoordinator::new());
+        coordinator.add_validation_gate(Box::new(AlwaysFailGate));
+
+        // runner 成功返回(模拟 LLM turn 成功)
+        let runner: SubagentRunner = Arc::new(|id: String, _task: String| {
+            Box::pin(async move { Ok(format!(".claw/subagents/{id}.md")) })
+        });
+
+        let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(executor);
+
+        // 单节点 DAG
+        let mut g = DagGraph::new("validation-test");
+        g.add_node(dag_node("n1", &[]));
+
+        // FailFast::On + max_retries=0:第一次 validation 失败即整体失败
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::On);
+        let err = scheduler.run().await.expect_err("validation should fail");
+        assert!(
+            matches!(err, DagError::NodeFailed(ref id) if id == "n1"),
+            "expected NodeFailed(n1) from validation failure, got {err:?}"
+        );
+
+        // coordinator 中应有 Failed 状态的 subagent
+        let agents = coordinator.list();
+        assert!(
+            agents
+                .iter()
+                .any(|a| a.status == crate::multi_agent::SubagentStatus::Failed),
+            "expected Failed subagent after validation failure, got {:?}",
+            agents.iter().map(|a| a.status).collect::<Vec<_>>()
+        );
+    }
+
+    /// P0-d:无 validation gate 时,行为与之前一致(runner Ok → Completed)。
+    ///
+    /// 确保新增的 complete → validate 链路在无 gate 时不引入回归。
+    #[tokio::test]
+    async fn execute_without_validation_gate_succeeds() {
+        let coordinator = Arc::new(MultiAgentCoordinator::new());
+        // 不注册任何 gate
+
+        let runner: SubagentRunner = Arc::new(|id: String, _task: String| {
+            Box::pin(async move { Ok(format!(".claw/subagents/{id}.md")) })
+        });
+
+        let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(executor);
+
+        let mut g = DagGraph::new("no-validation");
+        g.add_node(dag_node("n1", &[]));
+
+        let scheduler = DagScheduler::new(g, executor);
+        let results = scheduler.run().await.expect("should succeed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].node_id, "n1");
+
+        // subagent 应为 Completed 且 validated=true
+        let agents = coordinator.list();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, crate::multi_agent::SubagentStatus::Completed);
+        assert!(
+            agents[0].validated,
+            "subagent should be validated when no gates fail"
+        );
+    }
+
+    /// P0-d:validation 失败后 scheduler 按 max_retries 重试,重试成功后
+    /// 整体应返回 Ok(验证 retry 机制与 validation gate 协同工作)。
+    #[tokio::test]
+    async fn validation_failure_triggers_retry_and_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use crate::multi_agent::validation::{ValidationContext, ValidationError, ValidationGate};
+
+        /// 前 N 次失败,之后成功的 gate(模拟修复后编译通过)
+        struct FailNTimesGate {
+            fail_n: u32,
+            count: AtomicU32,
+        }
+        impl ValidationGate for FailNTimesGate {
+            fn validate(&self, _ctx: &ValidationContext) -> Result<(), ValidationError> {
+                let n = self.count.fetch_add(1, Ordering::SeqCst);
+                if n < self.fail_n {
+                    return Err(ValidationError {
+                        message: format!("validation fail #{}", n + 1),
+                        retryable: true,
+                    });
+                }
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "fail-n-times"
+            }
+        }
+
+        let coordinator = Arc::new(MultiAgentCoordinator::new());
+        // gate 第 1 次失败,第 2 次成功(配合 max_retries=1)
+        coordinator.add_validation_gate(Box::new(FailNTimesGate {
+            fail_n: 1,
+            count: AtomicU32::new(0),
+        }));
+
+        let runner: SubagentRunner = Arc::new(|id: String, _task: String| {
+            Box::pin(async move { Ok(format!(".claw/subagents/{id}.md")) })
+        });
+
+        let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
+        let executor: Arc<dyn SubagentExecutor> = Arc::new(executor);
+
+        // max_retries=1:允许 1 次重试
+        let mut g = DagGraph::new("retry-validation");
+        g.add_node(crate::multi_agent::dag::types::DagNode {
+            id: "n1".to_string(),
+            label: "Retry".to_string(),
+            task: "task with validation".to_string(),
+            depends_on: vec![],
+            acceptance_criteria: String::new(),
+            verify_command: None,
+            max_retries: 1,
+            mode: crate::multi_agent::CoordinationMode::Fork,
+            retry_policy: RetryPolicy::default(),
+        });
+
+        // FailFast::Off:即使重试后仍失败,也返回 Ok(DagRunResult)
+        // 但这里第 2 次 validation 会成功,所以 run() 返回 Ok(Vec<NodeResult>)
+        let scheduler = DagScheduler::new(g, executor).with_fail_fast(FailFast::Off);
+        let results = scheduler.run().await.expect("retry should succeed");
+
+        assert_eq!(results.len(), 1, "n1 should succeed after retry");
+        assert_eq!(results[0].node_id, "n1");
     }
 }

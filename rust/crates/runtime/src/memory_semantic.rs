@@ -587,6 +587,7 @@ pub mod fastembed_provider {
     use super::{EmbeddingError, EmbeddingProvider};
 
     use fastembed::{InitOptions, TextEmbedding};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     /// Fastembed provider — 持有 ONNX Runtime + 模型。
@@ -609,13 +610,42 @@ pub mod fastembed_provider {
         }
     }
 
+    /// 解析一个跨 cwd 稳定的 fastembed 模型缓存目录。
+    ///
+    /// fastembed 5.17.3 默认 `get_cache_dir()` 返回相对路径 `.fastembed_cache`,
+    /// 导致模型被下载到当前工作目录(cwd)。每次 cwd 变化或目录被清理就会
+    /// 重复下载 ~50MB 的 ONNX 模型。这里显式指定绝对路径解决该问题。
+    ///
+    /// 优先级:
+    /// 1. `FASTEMBED_CACHE_DIR` 环境变量(用户显式覆盖)
+    /// 2. `$HOME/.cache/fastembed` 或 `%USERPROFILE%\.cache\fastembed`(稳定)
+    /// 3. 相对路径 `.fastembed_cache`(最后兜底,保持原行为)
+    ///
+    /// 注意:若设置了 `HF_HOME`,fastembed 内部 `pull_from_hf` 会优先使用
+    /// `HF_HOME` 而忽略此处传入的 cache_dir —— 这是上游行为,此处不干预。
+    fn stable_cache_dir() -> PathBuf {
+        if let Some(dir) = std::env::var_os("FASTEMBED_CACHE_DIR") {
+            return PathBuf::from(dir);
+        }
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        match home {
+            Some(h) => h.join(".cache").join("fastembed"),
+            None => PathBuf::from(".fastembed_cache"),
+        }
+    }
+
     impl FastembedProvider {
         /// 创建并加载 BGE-small-en-v1.5 模型。
         ///
-        /// 首次调用会下载模型文件到 `~/.cache/huggingface`(`HF_HOME` 可覆盖)。
-        /// 后续调用从缓存加载,~100ms。
+        /// 首次调用会下载模型文件到稳定缓存目录(默认 `~/.cache/fastembed`,
+        /// 可被 `FASTEMBED_CACHE_DIR` 或 `HF_HOME` 覆盖)。后续调用从缓存
+        /// 加载,~100ms。使用绝对路径避免因 cwd 变化导致的重复下载。
         pub fn try_new() -> Result<Self, EmbeddingError> {
-            let model = TextEmbedding::try_new(InitOptions::default())
+            let cache_dir = stable_cache_dir();
+            let options = InitOptions::default().with_cache_dir(cache_dir);
+            let model = TextEmbedding::try_new(options)
                 .map_err(|err| EmbeddingError::ModelLoad(err.to_string()))?;
             Ok(Self {
                 model: Arc::new(Mutex::new(model)),
