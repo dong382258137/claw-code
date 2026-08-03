@@ -888,6 +888,7 @@ pub(crate) fn check_boot_preflight_health(context: &StatusContext) -> Diagnostic
 }
 
 pub(crate) fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
+    let platform_supported = runtime::platform_sandbox_supported();
     let degraded = status.enabled && !status.active;
     let mut details = vec![
         format!("已启用            {}", status.enabled),
@@ -899,21 +900,23 @@ pub(crate) fn check_sandbox_health(status: &runtime::SandboxStatus) -> Diagnosti
     if let Some(reason) = &status.fallback_reason {
         details.push(format!("降级原因          {reason}"));
     }
-    DiagnosticCheck::new(
-        "Sandbox",
-        if degraded {
-            DiagnosticLevel::Warn
-        } else {
-            DiagnosticLevel::Ok
-        },
-        if degraded {
-            "已请求沙箱,但当前未激活"
-        } else if status.active {
-            "沙箱保护已激活"
-        } else {
-            "当前会话未激活沙箱"
-        },
-    )
+
+    // 级别判定:平台无任何沙箱机制时升级为 Fail;平台支持但隔离未激活保持 Warn
+    let (level, message) = if status.enabled && status.active {
+        (DiagnosticLevel::Ok, "沙箱保护已激活")
+    } else if status.enabled && !platform_supported {
+        (
+            DiagnosticLevel::Fail,
+            "已请求沙箱但当前平台无任何沙箱机制，命令将无隔离执行",
+        )
+    } else if status.enabled {
+        // status.enabled && !status.active && platform_supported
+        (DiagnosticLevel::Warn, "平台支持沙箱但请求的隔离类型未激活")
+    } else {
+        (DiagnosticLevel::Ok, "当前会话未激活沙箱")
+    };
+
+    DiagnosticCheck::new("Sandbox", level, message)
     .with_details(details)
     .with_data(Map::from_iter([
         ("enabled".to_string(), json!(status.enabled)),

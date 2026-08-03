@@ -75,6 +75,10 @@ pub const NOTEBOOK_FILENAME: &str = ".claw/NOTEBOOK.md";
 /// NOTEBOOK.md 内容的最大字符数(防止 LLM 写入失控)。
 pub const NOTEBOOK_MAX_CHARS: usize = 16_000;
 
+/// 改进点 12:`<evidence>` 段最大字符数。
+/// 超出时从头部裁剪(保留最新的证据),避免证据段挤占其他段的容量。
+pub const EVIDENCE_MAX_CHARS: usize = 4_096;
+
 /// NOTEBOOK.md 的段标识(Anthropic 推荐的 XML 标签分段)。
 ///
 /// 顺序固定,便于 LLM 解析和人类阅读。
@@ -90,6 +94,7 @@ pub const SECTION_TAGS: &[&str] = &[
     "preferences",
     "key_files",
     "decisions", // §4.7 v3 新增:设计决策持久化段(compaction 前自动提取)
+    "evidence",  // 改进点 12 新增:实验证据持久化段(compaction 前自动提取)
 ];
 
 /// NOTEBOOK.md 的渲染头部,解释文档用途,引导 LLM 正确维护。
@@ -104,7 +109,8 @@ pub const NOTEBOOK_HEADER: &str = "# NOTEBOOK — Structured Working Memory\n\
     - `<attempted>`:已尝试的方案及结论(成功/失败 + 原因)\n\
     - `<preferences>`:用户明确表达的偏好/约束\n\
     - `<key_files>`:关键文件引用 + 一句话摘要\n\
-    - `<decisions>`:设计决策持久化(§4.7,compaction 前自动提取,LLM 一般不直接写)\n";
+    - `<decisions>`:设计决策持久化(§4.7,compaction 前自动提取,LLM 一般不直接写)\n\
+    - `<evidence>`:实验证据持久化(改进点 12,compaction 前自动提取,含数值对比/基准数据)\n";
 
 /// NOTEBOOK 数据模型 — 按 XML 段组织的内容。
 ///
@@ -323,6 +329,35 @@ impl Notebook {
         entry.push_str(trimmed);
     }
 
+    /// 改进点 12:追加一条实验证据到 `<evidence>` 段。
+    ///
+    /// 与普通 `append_to_section` 的区别:有容量限制(`EVIDENCE_MAX_CHARS` = 4K),
+    /// 超出时从**头部**裁剪(保留最新的证据),避免证据段挤占 NOTEBOOK 其他段
+    /// 的 16K 总容量。裁剪时对齐到行首,不会截断半行。
+    pub fn append_evidence(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let entry = self.sections.entry("evidence".to_string()).or_default();
+        if !entry.is_empty() {
+            entry.push('\n');
+        }
+        entry.push_str(trimmed);
+        // 容量限制:超出 4K 时从头部裁剪,保留最新的(尾部)
+        if entry.chars().count() > EVIDENCE_MAX_CHARS {
+            let overflow = entry.chars().count() - EVIDENCE_MAX_CHARS;
+            let skipped: String = entry.chars().skip(overflow).collect();
+            // 对齐到行首:跳过第一个不完整的行(如果有的话)
+            let trimmed_content = if let Some(nl) = skipped.find('\n') {
+                skipped[nl + 1..].to_string()
+            } else {
+                skipped
+            };
+            *entry = trimmed_content;
+        }
+    }
+
     /// NOTEBOOK 是否完全为空(所有段都缺失或空)。
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -418,7 +453,7 @@ pub struct NotebookUpdateInput {
 /// 注册到 LLM 的 tool list,让 LLM 知道可以维护 NOTEBOOK。
 pub const NOTEBOOK_UPDATE_TOOL_SPEC: &str = r#"{
     "name": "notebook_update",
-    "description": "Update the persistent working memory (NOTEBOOK.md). This memory survives context compaction — use it to record key decisions, subagent registry, attempted approaches, user preferences, and key file references. CRITICAL: always record subagent dispatches here so you do not re-dispatch the same task later. Modes: 'set' (overwrite section) or 'append' (add a line). Sections: plan, subagents, attempted, preferences, key_files, decisions. Note: 'decisions' section is auto-populated by compaction-time heuristic extraction; LLMs typically do not need to write it directly.",
+    "description": "Update the persistent working memory (NOTEBOOK.md). This memory survives context compaction — use it to record key decisions, subagent registry, attempted approaches, user preferences, and key file references. CRITICAL: always record subagent dispatches here so you do not re-dispatch the same task later. Modes: 'set' (overwrite section) or 'append' (add a line). Sections: plan, subagents, attempted, preferences, key_files, decisions, evidence. Note: 'decisions' and 'evidence' sections are auto-populated by compaction-time heuristic extraction; LLMs typically do not need to write them directly.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -429,7 +464,7 @@ pub const NOTEBOOK_UPDATE_TOOL_SPEC: &str = r#"{
             },
             "section": {
                 "type": "string",
-                "enum": ["plan", "subagents", "attempted", "preferences", "key_files", "decisions"],
+                "enum": ["plan", "subagents", "attempted", "preferences", "key_files", "decisions", "evidence"],
                 "description": "Target section name."
             },
             "content": {
@@ -839,5 +874,69 @@ mod tests {
                 "section order should match SECTION_TAGS"
             );
         }
+    }
+
+    // ---- 改进点 12: <evidence> 段 ----
+
+    #[test]
+    fn evidence_section_is_in_section_tags() {
+        assert!(
+            SECTION_TAGS.contains(&"evidence"),
+            "SECTION_TAGS must include 'evidence'"
+        );
+    }
+
+    #[test]
+    fn append_evidence_creates_section() {
+        let mut nb = Notebook::new();
+        nb.append_evidence("[Bash] 基准结果: 100 req/s");
+        let content = nb.get_section("evidence").expect("evidence section should exist");
+        assert!(content.contains("基准结果"));
+        assert!(content.contains("100 req/s"));
+    }
+
+    #[test]
+    fn append_evidence_accumulates_multiple_items() {
+        let mut nb = Notebook::new();
+        nb.append_evidence("[Bash] 第一次基准: 100 req/s");
+        nb.append_evidence("[Bash] 第二次基准: 120 req/s");
+        let content = nb.get_section("evidence").expect("evidence section should exist");
+        assert!(content.contains("第一次基准"));
+        assert!(content.contains("第二次基准"));
+        assert_eq!(content.matches('\n').count(), 1); // 两行,一个换行
+    }
+
+    #[test]
+    fn append_evidence_trims_to_4k_cap_keeping_newest() {
+        let mut nb = Notebook::new();
+        // 每条 ~100 字符,添加 50 条 → 5000 字符,超过 4K
+        for i in 0..50 {
+            nb.append_evidence(&format!("[Bash] 基准测试 #{i:03}: {}", "x".repeat(80)));
+        }
+        let content = nb.get_section("evidence").expect("evidence section should exist");
+        assert!(
+            content.chars().count() <= super::EVIDENCE_MAX_CHARS,
+            "evidence section should be <= 4K, got {} chars",
+            content.chars().count()
+        );
+        // 最新的(编号大的)应保留,最旧的应被裁剪
+        assert!(
+            content.contains("基准测试 #049"),
+            "newest evidence should be retained: missing #049"
+        );
+        assert!(
+            !content.contains("基准测试 #000"),
+            "oldest evidence should be trimmed: found #000"
+        );
+    }
+
+    #[test]
+    fn evidence_section_included_in_render() {
+        let mut nb = Notebook::new();
+        nb.append_evidence("[Bash] 对比矩阵: A=100 B=200");
+        let rendered = nb.render();
+        assert!(rendered.contains("<evidence>"));
+        assert!(rendered.contains("对比矩阵"));
+        assert!(rendered.contains("</evidence>"));
     }
 }

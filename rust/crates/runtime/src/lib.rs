@@ -277,6 +277,7 @@ pub use sandbox::{
     detect_container_environment,
     detect_container_environment_from,
     platform_sandbox_builder,
+    platform_sandbox_supported,
     resolve_sandbox_status,
     resolve_sandbox_status_for_request,
     ContainerEnvironment,

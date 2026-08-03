@@ -205,6 +205,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "poorMode",
         expected: FieldType::Bool,
     },
+    FieldSpec {
+        name: "completionVerifyCommands",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[

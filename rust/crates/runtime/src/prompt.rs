@@ -623,6 +623,7 @@ fn discover_instruction_files(
     for dir in directories {
         for candidate in [
             dir.join("CLAUDE.md"),
+            dir.join("AGENTS.md"),
             dir.join("CLAUDE.local.md"),
             dir.join(".claw").join("CLAUDE.md"),
             dir.join(".claw").join("instructions.md"),

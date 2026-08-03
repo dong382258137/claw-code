@@ -25,9 +25,11 @@ use std::env;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -219,6 +221,120 @@ pub fn read_log_tail(workspace: &Path, pid: u32, lines: usize) -> Result<String,
     } else {
         let start = all_lines.len().saturating_sub(lines);
         Ok(all_lines[start..].join("\n"))
+    }
+}
+
+/// 持续读取后台会话日志的新增行（改进点 14）。
+///
+/// 轮询方式（不引入 notify 依赖），通过 seek 记忆上次读取位置。
+/// 当进程退出且日志无新增时返回，或当 `stop()` 返回 true 时返回。
+///
+/// # 行为
+/// - 初始 seek 到文件末尾（不回读历史行，仅跟随新输出）
+/// - 每 200ms 轮询一次文件新增内容
+/// - 对每行调用 `on_new_line`（不包含换行符）
+/// - 处理文件截断/轮转：文件大小变小则重置 seek 到 0
+/// - 进程退出后再读一轮确保获取最后输出，然后返回
+/// - 日志文件不存在时：若进程存活则等待重试，若进程已退出则立即返回
+///
+/// # 参数
+/// - `workspace`: 工作目录（日志文件位于 `<workspace>/.claw/bg/<pid>.log`）
+/// - `pid`: 后台会话 PID
+/// - `on_new_line`: 每读到一行新内容时调用（不含换行符）
+/// - `stop`: 返回 true 时停止跟随（用于 Ctrl+C 中断）
+pub fn follow_log_tail(
+    workspace: &Path,
+    pid: u32,
+    mut on_new_line: impl FnMut(&str),
+    stop: impl Fn() -> bool,
+) -> Result<(), BgError> {
+    let path = log_path(workspace, pid);
+    let mut pos: u64 = 0; // 上次读取到的位置
+    let mut initialized = false; // 是否已定位到文件末尾
+    let mut pending = String::new(); // 缓冲不完整的行（末尾无换行符）
+    let mut was_alive = false; // 上一轮的进程存活状态（初始化时设置）
+
+    loop {
+        // 检查停止信号（Ctrl+C）
+        if stop() {
+            if !pending.is_empty() {
+                on_new_line(&pending);
+            }
+            return Ok(());
+        }
+
+        // 读取文件当前大小（文件可能尚未创建）
+        let current_size = match fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => {
+                // 文件不存在（进程刚启动，日志未创建）
+                if !is_pid_alive(pid) {
+                    // 进程已退出且文件不存在，直接返回
+                    return Ok(());
+                }
+                // 进程仍存活，等待日志文件创建
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
+
+        // 首次打开文件：定位到末尾（不回读历史行，仅跟随新输出）
+        if !initialized {
+            pos = current_size;
+            initialized = true;
+            was_alive = is_pid_alive(pid);
+            if !was_alive {
+                // 进程已退出，无需跟随
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+
+        // 处理文件截断/轮转：大小变小则重置 seek 到 0
+        if current_size < pos {
+            pos = 0;
+            pending.clear();
+        }
+
+        // 读取新增内容（从上次位置到当前末尾）
+        if current_size > pos {
+            let mut file = fs::File::open(&path).map_err(|e| BgError::Io(e.to_string()))?;
+            file.seek(SeekFrom::Start(pos))
+                .map_err(|e| BgError::Io(e.to_string()))?;
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)
+                .map_err(|e| BgError::Io(e.to_string()))?;
+            pos = current_size;
+
+            // 将新增字节追加到 pending 缓冲，按行分割
+            let new_text = String::from_utf8_lossy(&buf);
+            pending.push_str(&new_text);
+            // split('\n') 的最后一个元素是不完整的行（或空串若以 \n 结尾）
+            let mut last: Option<&str> = None;
+            for line in pending.split('\n') {
+                if let Some(prev) = last {
+                    // 处理 Windows \r\n 换行：去除末尾 \r
+                    let trimmed = prev.strip_suffix('\r').unwrap_or(prev);
+                    on_new_line(trimmed);
+                }
+                last = Some(line);
+            }
+            pending = last.unwrap_or("").to_string();
+        }
+
+        // 检查进程存活状态
+        let now_alive = is_pid_alive(pid);
+        if !now_alive && !was_alive {
+            // 连续两轮检测到进程已退出，且本轮已无新内容，刷新缓冲后返回
+            if !pending.is_empty() {
+                on_new_line(&pending);
+            }
+            return Ok(());
+        }
+        was_alive = now_alive;
+
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -743,5 +859,185 @@ mod tests {
         // 组合值必须与旧硬编码 0x0800_0208 一致(向后兼容)
         let combined = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
         assert_eq!(combined, 0x0800_0208);
+    }
+
+    // ===== follow_log_tail 单元测试（改进点 14）=====
+
+    /// 进程已退出且日志文件不存在时，应立即返回 Ok。
+    #[test]
+    fn follow_log_tail_returns_immediately_for_dead_process_no_file() {
+        let ws = temp_workspace();
+        // PID 99999999 不存活，日志文件不存在
+        let result = follow_log_tail(
+            &ws,
+            99999999,
+            |_| panic!("不应调用 on_new_line"),
+            || false,
+        );
+        assert!(result.is_ok());
+    }
+
+    /// 进程已退出但日志文件存在时，应立即返回 Ok 且不回读历史行。
+    #[test]
+    fn follow_log_tail_returns_for_dead_process_with_existing_file() {
+        let ws = temp_workspace();
+        fs::create_dir_all(bg_dir(&ws)).unwrap();
+        // PID 99999999 不存活，但文件存在（含历史内容）
+        let log = log_path(&ws, 99999999);
+        fs::write(&log, "old line 1\nold line 2\n").unwrap();
+
+        let result = follow_log_tail(
+            &ws,
+            99999999,
+            |_| panic!("不应回读历史行"),
+            || false,
+        );
+        assert!(result.is_ok());
+    }
+
+    /// stop() 立即返回 true 时，应立即停止。
+    #[test]
+    fn follow_log_tail_stops_on_stop_callback() {
+        let ws = temp_workspace();
+        fs::create_dir_all(bg_dir(&ws)).unwrap();
+        let alive_pid = std::process::id();
+        let log = log_path(&ws, alive_pid);
+        fs::write(&log, "initial\n").unwrap();
+
+        // stop 立即返回 true
+        let result = follow_log_tail(&ws, alive_pid, |_| panic!("不应有新行"), || true);
+        assert!(result.is_ok());
+    }
+
+    /// 跟随日志新增行：初始内容被跳过，仅读取 follow 启动后追加的新行。
+    #[test]
+    fn follow_log_tail_reads_new_lines() {
+        let ws = temp_workspace();
+        fs::create_dir_all(bg_dir(&ws)).unwrap();
+        // 用自身 PID（存活），日志文件路径为 <self_pid>.log
+        let alive_pid = std::process::id();
+        let log = log_path(&ws, alive_pid);
+        // 初始内容（follow 从末尾开始，不会读到这些）
+        fs::write(&log, "old line\n").unwrap();
+
+        // 在另一个线程中追加新行
+        let log_clone = log.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_clone)
+                .unwrap();
+            writeln!(f, "new line 1").unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            writeln!(f, "new line 2").unwrap();
+        });
+
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = count.clone();
+
+        follow_log_tail(
+            &ws,
+            alive_pid,
+            |line| {
+                collected_clone.lock().unwrap().push(line.to_string());
+                count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            || count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        )
+        .unwrap();
+
+        writer.join().unwrap();
+        let lines = collected.lock().unwrap();
+        assert_eq!(lines.len(), 2, "应读到 2 行新内容，实际: {lines:?}");
+        assert_eq!(lines[0], "new line 1");
+        assert_eq!(lines[1], "new line 2");
+    }
+
+    /// 文件截断/轮转：文件大小变小时重置 seek，读取截断后的新内容。
+    #[test]
+    fn follow_log_tail_handles_file_truncation() {
+        let ws = temp_workspace();
+        fs::create_dir_all(bg_dir(&ws)).unwrap();
+        let alive_pid = std::process::id();
+        let log = log_path(&ws, alive_pid);
+        // 初始大文件
+        fs::write(&log, "old content line 1\nold content line 2\n").unwrap();
+
+        let log_clone = log.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            // 截断并写入新内容
+            fs::write(&log_clone, "truncated line\n").unwrap();
+        });
+
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = count.clone();
+
+        follow_log_tail(
+            &ws,
+            alive_pid,
+            |line| {
+                collected_clone.lock().unwrap().push(line.to_string());
+                count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            || count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        )
+        .unwrap();
+
+        writer.join().unwrap();
+        let lines = collected.lock().unwrap();
+        assert!(
+            lines.contains(&"truncated line".to_string()),
+            "应读到截断后的新行，实际: {lines:?}"
+        );
+    }
+
+    /// 处理 Windows \r\n 换行：回调收到的行不应包含末尾 \r。
+    #[test]
+    fn follow_log_tail_handles_crlf_line_endings() {
+        let ws = temp_workspace();
+        fs::create_dir_all(bg_dir(&ws)).unwrap();
+        let alive_pid = std::process::id();
+        let log = log_path(&ws, alive_pid);
+        fs::write(&log, "initial\n").unwrap();
+
+        let log_clone = log.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            // 写入 \r\n 换行的内容
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_clone)
+                .unwrap();
+            write!(f, "crlf line\r\n").unwrap();
+        });
+
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = count.clone();
+
+        follow_log_tail(
+            &ws,
+            alive_pid,
+            |line| {
+                collected_clone.lock().unwrap().push(line.to_string());
+                count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            || count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        )
+        .unwrap();
+
+        writer.join().unwrap();
+        let lines = collected.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "crlf line", "行不应包含末尾 \\r");
     }
 }

@@ -154,41 +154,45 @@ impl CompletionVerifier {
         None
     }
 
-    /// 自动探测项目验证命令 — 根据 workspace 根目录的项目文件。
+    /// 自动探测项目验证命令 — 根据 workspace 根目录的项目文件 + CLAUDE.md。
     ///
-    /// 优先级:Cargo.toml > package.json > go.mod > pyproject.toml
-    /// 探测到任一即返回对应命令,未探测到返回空 Vec(跳过验证)。
+    /// 改进点 8/9/10:
+    /// - 多语言项目收集所有匹配语言的命令(不再命中即 return)
+    /// - Node 项目读取 package.json scripts,按 test > lint > build 优先级选择
+    /// - 优先合并 CLAUDE.md 中声明的验证命令
+    /// 未探测到返回空 Vec(跳过验证)。
     #[must_use]
     pub fn detect_project_commands(workspace_root: &Path) -> Vec<String> {
         let mut commands = Vec::new();
 
+        // 改进点 8:优先解析 CLAUDE.md 中的验证命令(与文件检测合并,去重)
+        let claude_commands = parse_claude_md_verify_commands(workspace_root);
+        commands.extend(claude_commands);
+
         // Rust: cargo check(快速编译检查,不跑测试)
         if workspace_root.join("Cargo.toml").exists() {
             commands.push("cargo check".to_owned());
-            return commands;
         }
 
-        // Node.js: npm run build(如果 package.json 有 build 脚本)
-        // 简化处理:直接用 npm run build,若无 build 脚本 npm 会报错 → 视为验证失败
+        // Node.js: 读取 package.json scripts,按优先级选择(改进点 9)
         if workspace_root.join("package.json").exists() {
-            commands.push("npm run build".to_owned());
-            return commands;
+            commands.extend(detect_node_commands(workspace_root));
         }
 
         // Go: go build ./...
         if workspace_root.join("go.mod").exists() {
             commands.push("go build ./...".to_owned());
-            return commands;
         }
 
-        // Python: python -m pytest(如果 pyproject.toml 存在)
+        // Python: python -m pytest(如果 pyproject.toml/setup.py 存在)
         if workspace_root.join("pyproject.toml").exists()
             || workspace_root.join("setup.py").exists()
         {
             commands.push("python -m pytest --tb=short -q".to_owned());
-            return commands;
         }
 
+        // 改进点 10:多语言/CLAUDE.md 合并后去重,保留首次出现
+        dedupe_commands(&mut commands);
         commands
     }
 
@@ -304,6 +308,118 @@ fn extract_evidence(text: &str, pattern: &str) -> String {
     }
 }
 
+/// 读取 package.json 的 scripts,按 test > lint > build 优先级选择验证命令(改进点 9)。
+///
+/// 解析失败、无 scripts、或三者都没有时,回退到 `npm run build`(原行为)。
+fn detect_node_commands(workspace_root: &Path) -> Vec<String> {
+    let package_json_path = workspace_root.join("package.json");
+    let content = match std::fs::read_to_string(&package_json_path) {
+        Ok(c) => c,
+        Err(_) => return vec!["npm run build".to_owned()],
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return vec!["npm run build".to_owned()],
+    };
+    let scripts = match parsed.get("scripts").and_then(|s| s.as_object()) {
+        Some(s) => s,
+        None => return vec!["npm run build".to_owned()],
+    };
+    // 优先级:test > lint > build
+    if scripts.contains_key("test") {
+        return vec!["npm test".to_owned()];
+    }
+    if scripts.contains_key("lint") {
+        return vec!["npm run lint".to_owned()];
+    }
+    if scripts.contains_key("build") {
+        return vec!["npm run build".to_owned()];
+    }
+    // 三者都没有:回退到默认行为
+    vec!["npm run build".to_owned()]
+}
+
+/// 从 CLAUDE.md(含 .claw/CLAUDE.md)中提取验证命令(改进点 8)。
+///
+/// 扫描所有 ```bash / ```sh 代码块,提取包含验证关键词(cargo test、
+/// npm test、pytest 等)的命令行,去重后返回。文件不存在或无匹配返回空 Vec。
+fn parse_claude_md_verify_commands(workspace_root: &Path) -> Vec<String> {
+    let candidates = [
+        workspace_root.join("CLAUDE.md"),
+        workspace_root.join(".claw").join("CLAUDE.md"),
+    ];
+    let mut commands = Vec::new();
+    for path in candidates {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            extract_verify_commands_from_markdown(&content, &mut commands);
+        }
+    }
+    dedupe_commands(&mut commands);
+    commands
+}
+
+/// 验证命令关键词 — 用于在 CLAUDE.md 代码块中识别验证命令行。
+const VERIFY_KEYWORDS: &[&str] = &[
+    "cargo test",
+    "cargo clippy",
+    "cargo check",
+    "npm test",
+    "npm run lint",
+    "npm run build",
+    "pytest",
+    "ruff",
+    "mypy",
+    "make test",
+    "make check",
+    "make lint",
+    "go test",
+    "go vet",
+    "pyright",
+    "flake8",
+];
+
+/// 从 Markdown 文本中提取 ```bash / ```sh 代码块内的验证命令。
+fn extract_verify_commands_from_markdown(content: &str, out: &mut Vec<String>) {
+    let mut in_code_block = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // 检测代码块围栏
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                // 关闭围栏
+                in_code_block = false;
+            } else {
+                // 开启围栏:仅 bash / sh 语言块
+                let lang = trimmed.trim_start_matches("```").trim();
+                if lang == "bash" || lang == "sh" {
+                    in_code_block = true;
+                }
+            }
+            continue;
+        }
+        if in_code_block {
+            // 跳过空行和注释行
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // 去掉常见的 shell prompt 前缀 $
+            let cmd = trimmed.trim_start_matches('$').trim();
+            for kw in VERIFY_KEYWORDS {
+                if cmd.contains(kw) {
+                    out.push(cmd.to_owned());
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// 去重:保留首次出现,移除后续重复命令(保持顺序)。
+fn dedupe_commands(commands: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    commands.retain(|c| seen.insert(c.clone()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +513,178 @@ mod tests {
         assert!(commands.is_empty());
 
         let _ = std::fs::remove_dir_all(&empty_dir);
+    }
+
+    #[test]
+    fn detect_multi_language_project() {
+        // 改进点 10:Rust + Python 混合项目应返回两条命令(不再命中即 return)
+        let temp = std::env::temp_dir();
+        let mixed_dir = temp.join("test_completion_mixed");
+        let _ = std::fs::remove_dir_all(&mixed_dir);
+        let _ = std::fs::create_dir_all(&mixed_dir);
+        let _ = std::fs::write(
+            mixed_dir.join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1\"\n",
+        );
+        let _ = std::fs::write(
+            mixed_dir.join("pyproject.toml"),
+            "[project]\nname = \"test\"\n",
+        );
+
+        let commands = CompletionVerifier::detect_project_commands(&mixed_dir);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], "cargo check");
+        assert_eq!(commands[1], "python -m pytest --tb=short -q");
+
+        let _ = std::fs::remove_dir_all(&mixed_dir);
+    }
+
+    #[test]
+    fn detect_node_project_with_test_script() {
+        // 改进点 9:有 test 脚本时优先用 npm test
+        let temp = std::env::temp_dir();
+        let node_dir = temp.join("test_completion_node_test");
+        let _ = std::fs::remove_dir_all(&node_dir);
+        let _ = std::fs::create_dir_all(&node_dir);
+        let _ = std::fs::write(
+            node_dir.join("package.json"),
+            r#"{"scripts": {"test": "jest", "lint": "eslint .", "build": "tsc"}}"#,
+        );
+
+        let commands = CompletionVerifier::detect_project_commands(&node_dir);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "npm test");
+
+        let _ = std::fs::remove_dir_all(&node_dir);
+    }
+
+    #[test]
+    fn detect_node_project_with_lint_script() {
+        // 改进点 9:无 test、有 lint → npm run lint
+        let temp = std::env::temp_dir();
+        let node_dir = temp.join("test_completion_node_lint");
+        let _ = std::fs::remove_dir_all(&node_dir);
+        let _ = std::fs::create_dir_all(&node_dir);
+        let _ = std::fs::write(
+            node_dir.join("package.json"),
+            r#"{"scripts": {"lint": "eslint .", "build": "tsc"}}"#,
+        );
+
+        let commands = CompletionVerifier::detect_project_commands(&node_dir);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "npm run lint");
+
+        let _ = std::fs::remove_dir_all(&node_dir);
+    }
+
+    #[test]
+    fn detect_node_project_with_only_build_script() {
+        // 改进点 9:只有 build → npm run build
+        let temp = std::env::temp_dir();
+        let node_dir = temp.join("test_completion_node_build");
+        let _ = std::fs::remove_dir_all(&node_dir);
+        let _ = std::fs::create_dir_all(&node_dir);
+        let _ = std::fs::write(node_dir.join("package.json"), r#"{"scripts": {"build": "tsc"}}"#);
+
+        let commands = CompletionVerifier::detect_project_commands(&node_dir);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "npm run build");
+
+        let _ = std::fs::remove_dir_all(&node_dir);
+    }
+
+    #[test]
+    fn detect_node_project_invalid_json_falls_back() {
+        // 改进点 9:JSON 解析失败 → 回退到 npm run build
+        let temp = std::env::temp_dir();
+        let node_dir = temp.join("test_completion_node_invalid");
+        let _ = std::fs::remove_dir_all(&node_dir);
+        let _ = std::fs::create_dir_all(&node_dir);
+        let _ = std::fs::write(node_dir.join("package.json"), "{ not valid json");
+
+        let commands = CompletionVerifier::detect_project_commands(&node_dir);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "npm run build");
+
+        let _ = std::fs::remove_dir_all(&node_dir);
+    }
+
+    #[test]
+    fn parse_claude_md_verify_commands_extracts_bash_and_sh() {
+        // 改进点 8:从 ```bash / ```sh 块提取验证命令,忽略其他语言块
+        let temp = std::env::temp_dir();
+        let dir = temp.join("test_completion_claude_md");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("CLAUDE.md"),
+            "# Project\n\n## Verify\n\n```bash\ncargo test\ncargo clippy\n```\n\n```sh\nnpm run lint\n```\n\n```python\nprint('hi')\n```\n",
+        );
+
+        let commands = parse_claude_md_verify_commands(&dir);
+        assert!(commands.contains(&"cargo test".to_owned()));
+        assert!(commands.contains(&"cargo clippy".to_owned()));
+        assert!(commands.contains(&"npm run lint".to_owned()));
+        // python 代码块不应被解析
+        assert!(!commands.contains(&"print('hi')".to_owned()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_claude_md_verify_commands_no_file_returns_empty() {
+        let temp = std::env::temp_dir();
+        let dir = temp.join("test_completion_no_claude_md");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let commands = parse_claude_md_verify_commands(&dir);
+        assert!(commands.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_project_commands_merges_claude_md_and_file_detection() {
+        // 改进点 8:CLAUDE.md 命令与文件检测命令合并去重
+        let temp = std::env::temp_dir();
+        let dir = temp.join("test_completion_merge");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1\"\n",
+        );
+        let _ = std::fs::write(dir.join("CLAUDE.md"), "```bash\ncargo test\n```\n");
+
+        let commands = CompletionVerifier::detect_project_commands(&dir);
+        // CLAUDE.md 的 cargo test + 文件检测的 cargo check
+        assert!(commands.contains(&"cargo test".to_owned()));
+        assert!(commands.contains(&"cargo check".to_owned()));
+        // 去重:不应有重复条目
+        let check_count = commands.iter().filter(|c| *c == "cargo check").count();
+        assert_eq!(check_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_claude_md_strips_dollar_prompt() {
+        // 验证 $ prompt 前缀被去除
+        let temp = std::env::temp_dir();
+        let dir = temp.join("test_completion_dollar");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("CLAUDE.md"),
+            "```bash\n$ cargo test\n$ make check\n```\n",
+        );
+
+        let commands = parse_claude_md_verify_commands(&dir);
+        assert!(commands.contains(&"cargo test".to_owned()));
+        assert!(commands.contains(&"make check".to_owned()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── render_remediation ──

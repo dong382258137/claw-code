@@ -165,8 +165,23 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     let network_supported = namespace_supported;
     let filesystem_active =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
+    let platform_supported = platform_sandbox_supported();
+    // active 仍基于 namespace/network 隔离能力,不依赖 platform_supported
+    let active = request.enabled
+        && (!request.namespace_restrictions || namespace_supported)
+        && (!request.network_isolation || network_supported);
+
     let mut fallback_reasons = Vec::new();
 
+    // 当前平台无任何沙箱机制可用(非 Linux/Windows/macOS,或 Linux unshare 不可用)
+    if request.enabled && !platform_supported {
+        fallback_reasons.push("当前平台无任何沙箱机制可用，命令将无隔离执行".to_string());
+    }
+    // 平台支持沙箱但请求的隔离类型未激活(如 namespace 不可用)
+    if request.enabled && platform_supported && !active {
+        fallback_reasons
+            .push("平台支持沙箱但请求的隔离类型未激活（如 namespace 不可用）".to_string());
+    }
     if request.enabled && request.namespace_restrictions && !namespace_supported {
         fallback_reasons
             .push("namespace isolation unavailable (requires Linux with `unshare`)".to_string());
@@ -183,16 +198,12 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
             .push("filesystem allow-list requested without configured mounts".to_string());
     }
 
-    let active = request.enabled
-        && (!request.namespace_restrictions || namespace_supported)
-        && (!request.network_isolation || network_supported);
-
     let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
 
     SandboxStatus {
         enabled: request.enabled,
         requested: request.clone(),
-        supported: namespace_supported,
+        supported: platform_supported,
         active,
         namespace_supported,
         namespace_active: request.enabled && request.namespace_restrictions && namespace_supported,
@@ -300,6 +311,20 @@ fn unshare_user_namespace_works() -> bool {
             .status()
             .is_ok_and(|status| status.success())
     })
+}
+
+/// 检测当前平台是否有任何可用的沙箱机制。
+/// 不只反映 Linux namespace，还反映 Windows Job Object 和 macOS sandbox-exec。
+pub fn platform_sandbox_supported() -> bool {
+    if cfg!(target_os = "linux") {
+        unshare_user_namespace_works()
+    } else if cfg!(target_os = "windows") {
+        WindowsSandboxBuilder::default().is_supported()
+    } else if cfg!(target_os = "macos") {
+        MacOsSandboxBuilder.is_supported()
+    } else {
+        false
+    }
 }
 
 // ============================================================================

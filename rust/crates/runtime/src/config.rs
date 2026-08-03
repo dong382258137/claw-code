@@ -76,6 +76,10 @@ pub struct RuntimeFeatureConfig {
     plan_mode: Option<bool>,
     slop_scan: Option<bool>,
     completion_verify: Option<bool>,
+    /// 改进点 7:`settings.completionVerifyCommands` 配置覆盖。
+    /// 非空时优先于 `detect_project_commands` 的自动探测,
+    /// 兑现 `completion_verifier.rs` 注释中承诺的配置覆盖能力。
+    completion_verify_commands: Option<Vec<String>>,
     /// Skill catalog injection into system prompt. `Some(true)` (default)
     /// injects a one-line-per-skill summary into the dynamic region of the
     /// system prompt so the model can discover available skills. Set to
@@ -467,6 +471,7 @@ impl ConfigLoader {
             plan_mode: parse_optional_plan_mode(&merged_value),
             slop_scan: None,
             completion_verify: None,
+            completion_verify_commands: parse_optional_completion_verify_commands(&merged_value)?,
             skills_catalog_enabled: parse_optional_bool(&merged_value, "skillsCatalogEnabled"),
             skills_tool_search_enabled: parse_optional_bool(
                 &merged_value,
@@ -685,6 +690,13 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn completion_verify(&self) -> Option<bool> {
         self.completion_verify
+    }
+
+    /// 改进点 7:返回 `settings.completionVerifyCommands` 配置的命令列表。
+    /// `None` 表示未配置,调用方应回退到 `detect_project_commands` 自动探测。
+    #[must_use]
+    pub fn completion_verify_commands(&self) -> Option<&[String]> {
+        self.completion_verify_commands.as_deref()
     }
 
     /// Skill catalog injection into system prompt. `None` or `Some(true)`
@@ -1263,6 +1275,21 @@ fn parse_optional_plan_mode(root: &JsonValue) -> Option<bool> {
     root.as_object()
         .and_then(|object| object.get("planMode"))
         .and_then(JsonValue::as_bool)
+}
+
+/// 改进点 7:解析 `settings.completionVerifyCommands` 字符串数组配置项。
+/// 未配置时返回 `None`,调用方回退到 `detect_project_commands` 自动探测。
+fn parse_optional_completion_verify_commands(
+    root: &JsonValue,
+) -> Result<Option<Vec<String>>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(None);
+    };
+    optional_string_array(
+        object,
+        "completionVerifyCommands",
+        "merged settings.completionVerifyCommands",
+    )
 }
 
 /// 通用布尔配置项解析器。读取 `settings.<key>` 字段，未配置或类型不匹配时
@@ -2675,5 +2702,92 @@ mod tests {
             root_path: None,
         };
         assert!(cfg.args.is_empty());
+    }
+
+    // ---- 改进点 7: completionVerifyCommands 配置覆盖 ----
+
+    #[test]
+    fn parses_completion_verify_commands_from_settings() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"completionVerifyCommands": ["cargo test", "cargo clippy"]}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let commands = loaded
+            .feature_config()
+            .completion_verify_commands()
+            .expect("completion_verify_commands should be set");
+        assert_eq!(
+            commands,
+            &["cargo test".to_string(), "cargo clippy".to_string()]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn completion_verify_commands_default_none_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        assert!(loaded
+            .feature_config()
+            .completion_verify_commands()
+            .is_none());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_non_array_completion_verify_commands() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"completionVerifyCommands": "cargo test"}"#,
+        )
+        .expect("write bad settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then — 类型不匹配应在 validation 或 parse 阶段被拒绝
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("completionVerifyCommands"),
+            "error should name the offending field, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

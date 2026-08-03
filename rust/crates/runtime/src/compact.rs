@@ -670,6 +670,112 @@ fn compacted_summary_prefix_len(session: &Session) -> usize {
     )
 }
 
+// ---- 改进点 12: 压缩前提取实验证据 ----
+
+/// 实验证据识别关键词(中英文)。命中任一即视为实验证据。
+const EVIDENCE_KEYWORDS: &[&str] = &[
+    // 中文关键词
+    "对比",
+    "基准",
+    "矩阵",
+    "结果",
+    "成功率",
+    "失败率",
+    "UA",
+    "协议",
+    // 英文关键词
+    "benchmark",
+    "comparison",
+    "matrix",
+    "result",
+    "success rate",
+    "failure rate",
+];
+
+/// 每条证据摘要的最大字符数(含截断标记)。
+const EVIDENCE_SUMMARY_MAX_CHARS: usize = 500;
+
+/// 改进点 12:从待压缩的消息中提取实验证据(Heuristic,零 LLM 成本)。
+///
+/// 识别策略(任一命中即视为实验证据):
+/// - **表格数据**:包含 `|` 分隔的多列,且至少 2 行
+/// - **数值列表**:连续 ≥ 3 行纯数字(含小数/逗号/正负号)
+/// - **关键词**:包含"对比/基准/矩阵/结果/成功率/失败率/UA/协议"等
+///
+/// 提取摘要:保留前 10 行内容,截断到 500 字符。每条格式为
+/// `[tool_name] content`。非 ToolResult 块(如 user/assistant 文本)被跳过。
+///
+/// 与 `extract_decisions_before_compaction` 互补:decisions 记录"决定了什么",
+/// evidence 记录"实验数据是什么"。两者都持久化到 NOTEBOOK.md,跨压缩不丢失。
+#[must_use]
+pub fn extract_evidence_before_compaction(messages: &[ConversationMessage]) -> Vec<String> {
+    let mut evidence = Vec::new();
+    for message in messages {
+        for block in &message.blocks {
+            let ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } = block
+            else {
+                continue; // 只从 ToolResult 提取,跳过 Text/Thinking/ToolUse
+            };
+            // 错误结果不含实验证据
+            if *is_error {
+                continue;
+            }
+            if let Some(summary) = extract_evidence_from_output(tool_name, output) {
+                evidence.push(summary);
+            }
+        }
+    }
+    evidence
+}
+
+/// 检查 tool result 输出是否包含实验证据,若有则返回摘要。
+fn extract_evidence_from_output(tool_name: &str, output: &str) -> Option<String> {
+    let has_table = output
+        .lines()
+        .filter(|line| line.split('|').count() >= 3)
+        .count()
+        >= 2;
+    let has_numeric_list = output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ".,".contains(c) || c == ' ' || c == '-')
+        })
+        .count()
+        >= 3;
+    let has_keyword = EVIDENCE_KEYWORDS
+        .iter()
+        .any(|keyword| output.to_lowercase().contains(&keyword.to_lowercase()));
+
+    if !has_table && !has_numeric_list && !has_keyword {
+        return None;
+    }
+
+    // 提取摘要:前 10 行,截断到 EVIDENCE_SUMMARY_MAX_CHARS(含前缀和截断标记)
+    let summary: String = output.lines().take(10).collect::<Vec<_>>().join("\n");
+    // 完整输出格式为 `[tool_name] {content}…`,总长度(按字符计)不得超过
+    // EVIDENCE_SUMMARY_MAX_CHARS。需预留前缀 `[tool_name] ` 和截断标记 `…`
+    // 的空间,避免前缀导致最终长度超限(修复测试 extract_evidence_truncates_to_500_chars)。
+    let prefix = format!("[{tool_name}] ");
+    let prefix_chars = prefix.chars().count();
+    let max_content_chars = EVIDENCE_SUMMARY_MAX_CHARS.saturating_sub(prefix_chars + 1);
+    let result = if summary.chars().count() > max_content_chars {
+        let truncated: String = summary.chars().take(max_content_chars).collect();
+        format!("{prefix}{truncated}…")
+    } else {
+        format!("{prefix}{summary}")
+    };
+    Some(result)
+}
+
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
     let user_messages = messages
         .iter()
@@ -2214,5 +2320,123 @@ second para",
             !summary.contains("lines total"),
             "P1: short output (≤3 lines) should not include 'lines total' hint: {summary}"
         );
+    }
+
+    // ---- 改进点 12: extract_evidence_before_compaction ----
+
+    #[test]
+    fn extract_evidence_detects_table_data() {
+        let messages = vec![ConversationMessage::tool_result(
+            "call_1",
+            "Bash",
+            "| 方案 | 成功率 | 延迟 |\n|------|--------|------|\n| A    | 95%    | 10ms |\n| B    | 88%    | 20ms |",
+            false,
+        )];
+        let evidence = super::extract_evidence_before_compaction(&messages);
+        assert_eq!(evidence.len(), 1, "should detect table evidence");
+        assert!(evidence[0].contains("Bash"), "should include tool name");
+        assert!(evidence[0].contains("成功率"), "should include table content");
+    }
+
+    #[test]
+    fn extract_evidence_detects_numeric_list() {
+        let messages = vec![ConversationMessage::tool_result(
+            "call_2",
+            "Bash",
+            "100\n120\n95\n88\n110",
+            false,
+        )];
+        let evidence = super::extract_evidence_before_compaction(&messages);
+        assert_eq!(evidence.len(), 1, "should detect numeric list evidence");
+    }
+
+    #[test]
+    fn extract_evidence_detects_keywords() {
+        let messages = vec![ConversationMessage::tool_result(
+            "call_3",
+            "Bash",
+            "基准测试结果: UA=0.85, 协议=HTTP/2",
+            false,
+        )];
+        let evidence = super::extract_evidence_before_compaction(&messages);
+        assert_eq!(evidence.len(), 1, "should detect keyword evidence");
+        assert!(evidence[0].contains("基准"));
+    }
+
+    #[test]
+    fn extract_evidence_ignores_plain_text() {
+        let messages = vec![ConversationMessage::tool_result(
+            "call_4",
+            "Read",
+            "this is a regular file\nwith some text\nnothing special here",
+            false,
+        )];
+        let evidence = super::extract_evidence_before_compaction(&messages);
+        assert!(evidence.is_empty(), "should not detect evidence in plain text");
+    }
+
+    #[test]
+    fn extract_evidence_truncates_to_500_chars() {
+        let long_table = format!(
+            "| col1 | col2 |\n|------|------|\n{}",
+            "| val | data |".repeat(100)
+        );
+        let messages = vec![ConversationMessage::tool_result(
+            "call_5",
+            "Bash",
+            &long_table,
+            false,
+        )];
+        let evidence = super::extract_evidence_before_compaction(&messages);
+        assert_eq!(evidence.len(), 1);
+        // 每条不超过 EVIDENCE_SUMMARY_MAX_CHARS(500)字符(含前缀和截断标记)
+        assert!(
+            evidence[0].chars().count() <= super::EVIDENCE_SUMMARY_MAX_CHARS,
+            "evidence should be truncated to <= {} chars, got {}",
+            super::EVIDENCE_SUMMARY_MAX_CHARS,
+            evidence[0].chars().count()
+        );
+        assert!(evidence[0].ends_with('…'), "truncated evidence should end with …");
+    }
+
+    #[test]
+    fn extract_evidence_skips_non_tool_blocks() {
+        let messages = vec![
+            ConversationMessage::user_text("| 方案 | 成功率 |\n|------|--------|\n| A    | 95%    |"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "对比矩阵: A=100 B=200".to_string(),
+            }]),
+        ];
+        let evidence = super::extract_evidence_before_compaction(&messages);
+        assert!(
+            evidence.is_empty(),
+            "should only extract from ToolResult blocks, not user/assistant text"
+        );
+    }
+
+    #[test]
+    fn extract_evidence_handles_multiple_tool_results() {
+        let messages = vec![
+            ConversationMessage::tool_result(
+                "call_1",
+                "Bash",
+                "基准: 100 req/s",
+                false,
+            ),
+            ConversationMessage::tool_result(
+                "call_2",
+                "Read",
+                "plain file content",
+                false,
+            ),
+            ConversationMessage::tool_result(
+                "call_3",
+                "Bash",
+                "| 对比 | A | B |\n|------|---|---|\n| 结果 | 1 | 2 |",
+                false,
+            ),
+        ];
+        let evidence = super::extract_evidence_before_compaction(&messages);
+        assert_eq!(evidence.len(), 2, "should detect evidence in call_1 and call_3");
     }
 }

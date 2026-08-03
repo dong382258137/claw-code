@@ -326,26 +326,35 @@ async fn execute_bash_async(
         tokio::select! {
             biased;
 
-            // 分支 1：子进程退出（仅在未退出时等待）
-            status = child.wait(), if !child_exited => {
-                match status {
-                    Ok(s) => { exit_status = s.code(); }
-                    Err(_) => { exit_status = None; }
-                }
-                child_exited = true;
-                child_exit_time = Some(Instant::now());
-            }
-
-            // 分支 2：轮询超时、abort 和 pipe 排空宽限期
-            //   不带 `if !child_exited` guard：child 退出后仍需检查 pipe 宽限期。
-            //   原实现带此 guard 导致死锁：bash `&` 启动的后台进程继承 pipe 写端，
-            //   child 退出后 pipe 永不 EOF，timeout 检查被 guard 禁用，loop 永久阻塞。
+            // 分支 1：轮询超时、abort、try_wait 和 pipe 排空宽限期
+            //   用 try_wait() 轮询代替 child.wait() future：
+            //   tokio 在 Windows 上的 child.wait() 依赖后台线程 + IOCP 通知
+            //   （RegisterWaitForSingleObject），存在 race condition — child 在
+            //   注册之前退出会导致通知丢失，wait() future 永远不 ready。
+            //   try_wait() 直接调用 GetExitCodeProcess（同步、非阻塞），
+            //   不依赖 IOCP 通知，更可靠。每 100ms 轮询一次，检测延迟可接受。
             _ = tokio::time::sleep(poll_interval) => {
+                // try_wait() 轮询子进程退出状态
+                if !child_exited {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            exit_status = status.code();
+                            child_exited = true;
+                            child_exit_time = Some(Instant::now());
+                        }
+                        Ok(None) => { /* child 仍在运行 */ }
+                        Err(_) => {
+                            child_exited = true;
+                            child_exit_time = Some(Instant::now());
+                        }
+                    }
+                }
                 if is_bash_aborted() {
                     aborted = true;
                     if !child_exited {
                         let _ = child.kill().await;
                         child_exited = true;
+                        child_exit_time = Some(Instant::now());
                     }
                     // abort 时立即关闭 pipe，快速退出（不等残留数据）
                     child_stdout = None;
@@ -360,11 +369,13 @@ async fn execute_bash_async(
                                 smart_idle = true;
                                 let _ = child.kill().await;
                                 child_exited = true;
+                                child_exit_time = Some(Instant::now());
                             }
                             activity_monitor::ActivityDecision::HardTimeout => {
                                 timed_out = true;
                                 let _ = child.kill().await;
                                 child_exited = true;
+                                child_exit_time = Some(Instant::now());
                             }
                         }
                     } else if start.elapsed() >= timeout_dur {
@@ -372,19 +383,13 @@ async fn execute_bash_async(
                         timed_out = true;
                         let _ = child.kill().await;
                         child_exited = true;
-                    }
-                } else if let Some(exit_time) = child_exit_time {
-                    // child 已退出但 pipe 未 EOF：后台进程（如 `&` 启动的服务）
-                    // 继承了 pipe 写端。给 PIPE_DRAIN_GRACE 宽限期读取残留数据，
-                    // 超时强制关闭 pipe，防止永久阻塞。
-                    if exit_time.elapsed() >= PIPE_DRAIN_GRACE {
-                        child_stdout = None;
-                        child_stderr = None;
+                        child_exit_time = Some(Instant::now());
                     }
                 }
+                // PIPE_DRAIN_GRACE 检查已在循环顶部执行，此处不再重复
             }
 
-            // 分支 3：读 stdout
+            // 分支 2：读 stdout（child.wait() 已移到分支 1 的 try_wait 轮询）
             n = async {
                 if let Some(ref mut stdout) = child_stdout {
                     stdout.read(&mut tmp_out).await
@@ -404,7 +409,7 @@ async fn execute_bash_async(
                 }
             }
 
-            // 分支 4：读 stderr
+            // 分支 3：读 stderr
             n = async {
                 if let Some(ref mut stderr) = child_stderr {
                     stderr.read(&mut tmp_err).await
@@ -638,6 +643,44 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
     resolve_sandbox_status_for_request(&request, cwd)
 }
 
+/// 为子进程注入 UTF-8 编码环境变量，解决 Windows 中文系统乱码问题。
+/// 符合「源头控制」原则：在上游设置编码，不依赖下游过滤。
+///
+/// - `PYTHONUTF8=1`：Python 3.7+ UTF-8 模式，强制 stdin/stdout/stderr 与默认编码为 UTF-8
+/// - `PYTHONIOENCODING=utf-8`：兼容旧 Python，显式指定 IO 编码
+/// - Unix 下补 `LANG`/`LC_ALL`（仅当未设置时），确保 locale 不回退到 ASCII
+///
+/// 对非 Python 进程无副作用（环境变量只是被忽略），因此无条件注入是安全的。
+fn inject_utf8_env(cmd: &mut std::process::Command) {
+    cmd.env("PYTHONUTF8", "1");
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    #[cfg(unix)]
+    {
+        if std::env::var("LANG").is_err() {
+            cmd.env("LANG", "en_US.UTF-8");
+        }
+        if std::env::var("LC_ALL").is_err() {
+            cmd.env("LC_ALL", "en_US.UTF-8");
+        }
+    }
+}
+
+/// tokio 版本的 UTF-8 编码注入，逻辑同 `inject_utf8_env`。
+/// runtime crate 将 tokio 作为硬依赖（非 feature flag），故此函数始终可用。
+fn inject_utf8_env_tokio(cmd: &mut tokio::process::Command) {
+    cmd.env("PYTHONUTF8", "1");
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    #[cfg(unix)]
+    {
+        if std::env::var("LANG").is_err() {
+            cmd.env("LANG", "en_US.UTF-8");
+        }
+        if std::env::var("LC_ALL").is_err() {
+            cmd.env("LC_ALL", "en_US.UTF-8");
+        }
+    }
+}
+
 fn prepare_command(
     command: &str,
     cwd: &std::path::Path,
@@ -653,16 +696,28 @@ fn prepare_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
+        // Linux sandbox 路径同样需要 UTF-8 编码注入（sandbox 内子进程仍是 Python/sh）
+        inject_utf8_env(&mut prepared);
         return prepared;
     }
 
     let kind = shell_kind();
     let mut prepared = Command::new(&kind.program);
-    prepared.arg(kind.flag).arg(command).current_dir(cwd);
+    // cmd.exe 路径加 `chcp 65001` 前缀切换代码页到 UTF-8，
+    // 避免 cmd 默认 GBK 代码页导致中文输出乱码。
+    // 仅影响 cmd /C 路径，bash -c / sh -lc 路径不受影响。
+    let final_command = if kind.kind == ShellType::Cmd {
+        format!("chcp 65001 >nul && {}", command)
+    } else {
+        command.to_string()
+    };
+    prepared.arg(kind.flag).arg(&final_command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
+    // fallback 路径注入 UTF-8 编码环境变量
+    inject_utf8_env(&mut prepared);
     prepared
 }
 
@@ -681,16 +736,26 @@ fn prepare_tokio_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
+        // Linux sandbox 路径同样需要 UTF-8 编码注入
+        inject_utf8_env_tokio(&mut prepared);
         return prepared;
     }
 
     let kind = shell_kind();
     let mut prepared = TokioCommand::new(&kind.program);
-    prepared.arg(kind.flag).arg(command).current_dir(cwd);
+    // cmd.exe 路径加 `chcp 65001` 前缀切换代码页到 UTF-8
+    let final_command = if kind.kind == ShellType::Cmd {
+        format!("chcp 65001 >nul && {}", command)
+    } else {
+        command.to_string()
+    };
+    prepared.arg(kind.flag).arg(&final_command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
+    // fallback 路径注入 UTF-8 编码环境变量
+    inject_utf8_env_tokio(&mut prepared);
     prepared
 }
 

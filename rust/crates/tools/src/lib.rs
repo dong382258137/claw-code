@@ -7330,7 +7330,9 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
         "python" | "py" => Ok(ReplRuntime {
             program: detect_first_command(&["python3", "python"])
                 .ok_or_else(|| String::from("python runtime not found"))?,
-            args: &["-c"],
+            // 加 `-X utf8` 启用 Python UTF-8 模式，从源头避免 Windows 中文系统
+            // 默认 GBK 编码导致的中文输出乱码（符合「源头控制」原则）。
+            args: &["-X", "utf8", "-c"],
         }),
         "javascript" | "js" | "node" => Ok(ReplRuntime {
             program: detect_first_command(&["node"])

@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 static CLI_MAX_TURNS: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn take_max_turns() -> Option<u32> {
@@ -182,6 +183,11 @@ pub(crate) enum CliAction {
         /// (CloseoutLane/CleanupSession 等),发布到 lane_events。
         /// 默认关闭,向后兼容。
         enable_policy_engine: bool,
+        /// 启用 PlannerAgent 自动拆解(接入并行派发链路)。
+        /// 启用后,复杂用户输入会自动拆解为多个子任务并并行派发
+        /// (LLM 驱动优先,失败降级到启发式)。默认关闭。
+        /// 依赖 P0/P1 容错加固:retry + FailFast::Off + 限流 + validation gate。
+        enable_auto_planner: bool,
     },
     HelpTopic {
         topic: LocalHelpTopic,
@@ -239,6 +245,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // P1-1:`--enable-policy-engine` — 启用 PolicyEngine 策略引擎。
     // 默认关闭。启用后 lane 完成时调用 PolicyEngine::evaluate。
     let mut enable_policy_engine = false;
+    // `--enable-auto-planner` — 启用 PlannerAgent 自动拆解(接入并行派发链路)。
+    // 默认开启(true)。复杂输入自动拆解为子任务并并行派发。
+    // 用 `--no-auto-planner` 显式关闭。
+    let mut enable_auto_planner = true;
     // `--cache-stats`:仅对 `claw doctor` 生效,切换到 Cache Aligner 监控视图。
     let mut cache_stats = false;
     let mut rest: Vec<String> = Vec::new();
@@ -370,6 +380,14 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--enable-policy-engine" => {
                 enable_policy_engine = true;
+                index += 1;
+            }
+            "--enable-auto-planner" => {
+                enable_auto_planner = true;
+                index += 1;
+            }
+            "--no-auto-planner" => {
+                enable_auto_planner = false;
                 index += 1;
             }
             "--quiet" => {
@@ -527,6 +545,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             tui,
             enable_plan_mode,
             enable_policy_engine,
+            enable_auto_planner,
         });
     }
     if rest.first().map(String::as_str) == Some("--fork-session") {
@@ -1662,12 +1681,14 @@ pub(crate) fn handle_poor_mode_action(action: Option<&str>) -> (bool, String) {
 /// 支持的 args：
 /// - `None` / `"ps"` / `"list"`：列出所有后台会话（含存活状态刷新）
 /// - `"logs <pid> [N]"`：读取 pid 的最后 N 行日志（默认 50）
+/// - `"follow <pid>"`：实时跟随 pid 的日志新增行（Ctrl+C 停止，仅 CLI 模式）
 /// - `"kill <pid>"`：终止 pid 对应的后台进程
 /// - `"purge <pid>"`：删除已退出/被 kill 的 pid 的状态文件和 log
 /// - `"spawn <prompt>"`：启动新后台 claw 会话（`claw -p "<prompt>"`）
 /// - 其他：返回 usage 提示
 ///
 /// 返回 `(用户可见消息, JSON 结构化输出)`。JSON 用于 resume 模式编程式访问。
+/// `follow` 子命令是阻塞操作，行直接 println 到 stdout，返回值为结束摘要。
 pub(crate) fn handle_bg_command(args: Option<&str>, cwd: &Path) -> (String, serde_json::Value) {
     let trimmed = args.unwrap_or("").trim();
     let (subcommand, rest) = split_first_word(trimmed);
@@ -1775,6 +1796,99 @@ pub(crate) fn handle_bg_command(args: Option<&str>, cwd: &Path) -> (String, serd
                 ),
             }
         }
+        "follow" => {
+            let pid_str = rest.trim();
+            let pid = match pid_str.parse::<u32>() {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        "Usage: /bg follow <pid>\n\x1b[2mExample: /bg follow 1234\x1b[0m"
+                            .to_string(),
+                        serde_json::json!({"kind": "bg", "action": "follow", "error": "invalid_pid"}),
+                    );
+                }
+            };
+
+            // Ctrl+C 信号处理：spawn 线程监听信号，设置 stop flag。
+            // 使用 tokio::sync::oneshot 在 follow 结束时通知信号线程退出，
+            // 确保 ctrl_c handler 被正确清理（不残留全局 handler 影响 REPL）。
+            // 不需要 tokio macros feature：用 mpsc channel + spawn 实现 "二选一" 等待。
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_signal = stop.clone();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return,
+                };
+                rt.block_on(async {
+                    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+                    // Task 1: 监听 Ctrl+C → 设置 stop flag
+                    let done_tx1 = done_tx.clone();
+                    let stop_clone = stop_for_signal.clone();
+                    tokio::spawn(async move {
+                        let _ = tokio::signal::ctrl_c().await;
+                        stop_clone.store(true, Ordering::SeqCst);
+                        let _ = done_tx1.send(()).await;
+                    });
+
+                    // Task 2: 监听 shutdown 信号（follow 结束时触发）
+                    let done_tx2 = done_tx;
+                    tokio::spawn(async move {
+                        let _ = shutdown_rx.await;
+                        let _ = done_tx2.send(()).await;
+                    });
+
+                    // 等待任一 task 完成。block_on 返回后 runtime drop，
+                    // 所有 spawned task 被 abort，ctrl_c handler 被清理。
+                    let _ = done_rx.recv().await;
+                });
+            });
+
+            // CLI 模式下直接 println 每行（TUI 模式可能需要 OutputView，暂不支持）
+            println!(
+                "📄 Following log for PID {pid} \x1b[2m(Ctrl+C to stop)\x1b[0m..."
+            );
+
+            let mut line_count: usize = 0;
+            let result = runtime::bg::follow_log_tail(
+                cwd,
+                pid,
+                |line| {
+                    println!("{line}");
+                    line_count += 1;
+                },
+                || stop.load(Ordering::SeqCst),
+            );
+
+            // 通知信号线程退出（清理 ctrl_c handler）
+            let _ = shutdown_tx.send(());
+
+            match result {
+                Ok(()) => {
+                    if stop.load(Ordering::SeqCst) {
+                        (
+                            format!("⏹ Stopped following PID {pid} ({line_count} line(s) shown)."),
+                            serde_json::json!({"kind": "bg", "action": "follow", "pid": pid, "stopped": true, "lines": line_count}),
+                        )
+                    } else {
+                        (
+                            format!("📄 PID {pid} exited. Follow ended ({line_count} line(s) shown)."),
+                            serde_json::json!({"kind": "bg", "action": "follow", "pid": pid, "exited": true, "lines": line_count}),
+                        )
+                    }
+                }
+                Err(e) => (
+                    format!("❌ Failed to follow log for PID {pid}: {e}"),
+                    serde_json::json!({"kind": "bg", "action": "follow", "pid": pid, "error": e.to_string()}),
+                ),
+            }
+        }
         "kill" => {
             let pid_str = rest.trim();
             let pid = match pid_str.parse::<u32>() {
@@ -1857,7 +1971,7 @@ pub(crate) fn handle_bg_command(args: Option<&str>, cwd: &Path) -> (String, serd
         }
         other => (
             format!(
-                "Unknown bg subcommand: '{other}'.\n\x1b[2mUsage: /bg [ps|logs <pid>|kill <pid>|purge <pid>|spawn <prompt>]\x1b[0m"
+                "Unknown bg subcommand: '{other}'.\n\x1b[2mUsage: /bg [ps|logs <pid> [N]|follow <pid>|kill <pid>|purge <pid>|spawn <prompt>]\x1b[0m"
             ),
             serde_json::json!({"kind": "bg", "error": format!("unknown subcommand: {other}")}),
         ),

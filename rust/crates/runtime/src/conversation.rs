@@ -28,7 +28,8 @@ use crate::recovery_recipes::RecoveryResult;
 // 不污染 system_prompt + tools_schema 的"绝对稳定区"。详见
 // docs/harness-engineering-optimization-plan.md Step 2.1 与 §5.2。
 use crate::planner::{
-    assess_complexity, decompose_task, persist_plan_artifact, ComplexityAssessment, PlanArtifact,
+    assess_complexity, decompose_task, is_auto_planner_enabled, persist_plan_artifact,
+    plan_and_convert_to_spawn_requests, ComplexityAssessment, PlanArtifact,
     PreCompletionChecklistMiddleware, ReviewResult,
 };
 // Harness M(多 agent)层接入:MultiAgentCoordinator — Step 3.2-c。
@@ -75,6 +76,12 @@ const MICROCOMPACT_PRESERVE_RECENT: usize = 4;
 /// More aggressive preserve window used when recovering from a prompt-too-long
 /// error. Only the two most recent tool results are kept verbatim.
 const REACTIVE_MICROCOMPACT_PRESERVE_RECENT: usize = 2;
+
+/// P1:并行子任务最大并发数上限。
+///
+/// 参考 Anthropic 多智能体研究系统(lead agent 并行 spawn 3-5 subagents)。
+/// 超过此值的任务将排队等待,避免瞬间冲击 API 触发速率限制。
+const MAX_PARALLEL_SUBAGENTS: usize = 5;
 
 /// Tool specification for the `session_search` tool.
 ///
@@ -484,6 +491,9 @@ pub struct ConversationRuntime<C, T> {
     completion_verifier: crate::completion_verifier::CompletionVerifier,
     /// P3:完成声明校验开关。`true` 启用,`false` opt-out。
     completion_verify_enabled: bool,
+    /// 改进点 7:`settings.completionVerifyCommands` 配置覆盖。
+    /// 非空时优先于 `detect_project_commands` 的自动探测。
+    completion_verify_commands: Vec<String>,
     /// Harness C(Context Management)层:统一 prompt 注入器。
     /// `None` 时走原 SystemPromptSplit + 手动 push 逻辑;
     /// `Some` 时 PlanArtifact render 通过 assembler 收集到 Goal source,
@@ -554,6 +564,13 @@ pub struct ConversationRuntime<C, T> {
     /// CompactionRL (arXiv:2607.05378) — summary 必须保留 original goal /
     /// completed actions / unresolved errors / current state。
     notebook_refresh_pending: bool,
+    /// 改进点 13:压缩后注入归档 recall 提示的 flag。
+    ///
+    /// `maybe_auto_compact` 压缩成功后置 true,下一 turn 的 system_prompt
+    /// 构造时读取 `list_archived_summary` 列出可 recall 的归档 tool result,
+    /// 引导 LLM 在需要原始数据时调用 `recall_full` 工具检索。注入后清除
+    /// (一次性提示,避免每 turn 重复注入归档列表)。
+    archive_recall_hint_pending: bool,
     /// v2.0 VerifierAgent remediation 注入 — 上一轮 verify 失败的修正建议。
     ///
     /// Review 阶段若 VerifierAgent 检测到失败,把 `FailedVerification` 列表
@@ -633,6 +650,10 @@ where
             slop_scan_enabled: feature_config.slop_scan().unwrap_or(true),
             completion_verifier: crate::completion_verifier::CompletionVerifier::new(),
             completion_verify_enabled: feature_config.completion_verify().unwrap_or(true),
+            completion_verify_commands: feature_config
+                .completion_verify_commands()
+                .map(|cmds| cmds.to_vec())
+                .unwrap_or_default(),
             context_assembler: None,
             pending_semantic_context: None,
             verifier_agent: None,
@@ -642,6 +663,7 @@ where
             task_registry: None,
             coordinator_executor: None,
             notebook_refresh_pending: false,
+            archive_recall_hint_pending: false,
             pending_remediation: None,
             decision_log: None,
             detection_strategy: crate::decision_log::DetectionStrategy::Heuristic,
@@ -997,16 +1019,85 @@ where
     /// assert_eq!(results.len(), 2);
     /// ```
     pub fn spawn_parallel_via_dag(&self, tasks: Vec<SpawnRequest>) -> Vec<Result<String, String>> {
-        // 默认 FailFast::On(向后兼容)
-        self.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On)
+        // P0:默认 FailFast::Off — 单个子任务失败不应影响兄弟节点并发执行,
+        // 避免"一颗老鼠屎坏了一锅粥"。调用方如需严格语义可显式调用
+        // spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On)。
+        self.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::Off)
+    }
+
+    /// PlannerAgent 自动拆解 + 并行派发入口。
+    ///
+    /// 当 `auto_planner` feature flag 开启时(通过 `planner::set_auto_planner_enabled(true)`),
+    /// 自动将用户输入拆解为多个子任务并并行派发。流程:
+    ///
+    /// 1. **复杂度评估**:用 `assess_complexity` 判断是否为复杂任务
+    ///    - `Simple` → 直接返回(不拆解,由主 agent 处理)
+    ///    - `Complex` → 继续拆解
+    /// 2. **LLM 驱动拆解**(优先):调用 `plan_and_convert_to_spawn_requests`
+    ///    - LLM 失败或未注册 client → 自动降级到启发式 `decompose_task`
+    /// 3. **并行派发**:调用 `spawn_parallel_via_dag`(FailFast::Off + retry + validation)
+    ///
+    /// # 返回
+    /// - `Ok(Some(results))`:已拆解并派发,results 为每个子任务的结果
+    /// - `Ok(None)`:未拆解(feature flag 关闭 / 任务太简单)
+    /// - `Err(e)`:拆解失败(理论上不会,因为启发式总是返回至少 1 个 step)
+    ///
+    /// # Feature flag
+    /// 默认关闭。开启方式:
+    /// ```ignore
+    /// runtime::planner::set_auto_planner_enabled(true);
+    /// ```
+    ///
+    /// # 安全保障
+    /// - 并行路径已补齐 retry(P0-a)+ FailFast::Off(P0-b)+ 限流(P1)+ validation gate(P0-d)
+    /// - High risk step → `TaskComplexity::Architectural`(max_retries=2)
+    /// - Low risk step → `TaskComplexity::Simple`(max_retries=0)
+    pub fn plan_and_spawn_parallel(
+        &mut self,
+        user_input: &str,
+    ) -> Result<Option<Vec<Result<String, String>>>, String> {
+        // 1. Feature flag 检查
+        if !is_auto_planner_enabled() {
+            return Ok(None);
+        }
+
+        // 2. 复杂度评估 — Simple 任务不拆解
+        match assess_complexity(user_input) {
+            ComplexityAssessment::Simple => Ok(None),
+            ComplexityAssessment::Complex { reason } => {
+                // 3. LLM 驱动拆解(优先)+ 降级到启发式
+                let spawn_requests = plan_and_convert_to_spawn_requests(user_input)
+                    .ok_or_else(|| "planner returned no spawn requests".to_string())?;
+
+                crate::diag::global().append(
+                    crate::diag::DiagEntry::new(
+                        crate::diag::DiagLevel::Info,
+                        "auto_planner",
+                        format!(
+                            "auto-planner triggered: {} steps, reason: {}",
+                            spawn_requests.len(),
+                            reason
+                        ),
+                    )
+                    .with_field(
+                        "step_count",
+                        serde_json::Value::Number(serde_json::Number::from(spawn_requests.len())),
+                    ),
+                );
+
+                // 4. 并行派发(FailFast::Off + retry + validation 已内置)
+                let results = self.spawn_parallel_via_dag(spawn_requests);
+                Ok(Some(results))
+            }
+        }
     }
 
     /// v3:同步版本的 `spawn_parallel_via_dag`,支持配置 [`FailFast`] 策略。
     ///
     /// 与 [`spawn_parallel_via_dag`](Self::spawn_parallel_via_dag) 行为一致,
     /// 但允许调用方选择失败传播策略:
-    /// - `FailFast::On`:任一 node 失败即取消整个 DAG(严格语义,默认)
-    /// - `FailFast::Off`:node 失败后标记为 Failed,继续执行其他独立分支(容错语义)
+    /// - `FailFast::On`:任一 node 失败即取消整个 DAG(严格语义)
+    /// - `FailFast::Off`:node 失败后标记为 Failed,继续执行其他独立分支(容错语义,默认)
     ///
     /// 内部通过 `tokio::runtime::Builder::new_current_thread` + `block_on` 桥接
     /// [`spawn_parallel_via_dag_async`](Self::spawn_parallel_via_dag_async)。
@@ -1167,6 +1258,19 @@ where
                 continue;
             }
 
+            // P0:按 complexity 动态设置 max_retries — 挽救瞬时失败(30%~50% 并行路径失败)。
+            // 与单路径 spawn_with_model 的 max_attempts 语义对齐:
+            // - Simple:0(无重试,机械操作)
+            // - Diagnostic:1(1 次重试,诊断任务容错)
+            // - Architectural:2(2 次重试,架构决策容错)
+            // 注意:scheduler 的 max_retries 表示"重试次数"(不含首次),
+            //       与 coordinator 的 max_attempts(含首次)语义不同。
+            let max_retries = match task.complexity {
+                TaskComplexity::Simple => 0,
+                TaskComplexity::Diagnostic => 1,
+                TaskComplexity::Architectural => 2,
+            };
+
             let node = DagNode {
                 id: format!("spawn-{idx}"),
                 label: task.name,
@@ -1174,8 +1278,7 @@ where
                 depends_on: Vec::new(),
                 acceptance_criteria: String::new(),
                 verify_command: None,
-                // v3 MVP:无重试,任一 subagent 失败即整体失败(FailFast)
-                max_retries: 0,
+                max_retries,
                 mode: task.mode,
                 retry_policy: RetryPolicy::default(),
             };
@@ -1193,10 +1296,11 @@ where
 
     /// 私有辅助:从已校验的节点列表构造并行 DAG 图。
     ///
-    /// 所有节点作为并行根节点(无 edge),`max_parallelism = nodes.len()`
-    /// 即一次性全部 spawn。
+    /// 所有节点作为并行根节点(无 edge)。`max_parallelism` 取
+    /// `min(nodes.len(), MAX_PARALLEL_SUBAGENTS)` 以防瞬间大量子任务
+    /// 冲击 API 触发速率限制(P1 限流,参考 Anthropic 多智能体研究系统 3-5 并发)。
     fn build_spawn_parallel_graph(nodes: &[(usize, DagNode)]) -> DagGraph {
-        let max_parallel = nodes.len();
+        let max_parallel = nodes.len().min(MAX_PARALLEL_SUBAGENTS);
         let mut graph = DagGraph::new("spawn_parallel_via_dag").with_max_parallelism(max_parallel);
         for (_, node) in nodes {
             graph.add_node(node.clone());
@@ -1678,6 +1782,44 @@ where
                         );
                     }
 
+                    // 改进点 13:压缩后主动列出可 recall 的归档 tool result。
+                    // auto_compaction 删除了旧消息,但原始 tool result 已通过
+                    // microcompact 的 archiver 归档到 .claw/tool_results_archive.jsonl。
+                    // 这里列出最近的归档摘要,引导 LLM 在需要原始数据(如实验数值、
+                    // 完整文件内容)时调用 `recall_full` 工具按 tool_use_id 检索。
+                    // 一次性注入:注入后立即清除 flag,避免每 turn 重复注入。
+                    if self.archive_recall_hint_pending {
+                        self.archive_recall_hint_pending = false;
+                        if let Ok(summaries) =
+                            crate::tool_result_archive::list_archived_summary(workspace_root)
+                        {
+                            if !summaries.is_empty() {
+                                // 取最近 10 条归档(文件中靠后的更新),避免列表过长
+                                let recent: Vec<&(String, String, String, u64)> =
+                                    summaries.iter().rev().take(10).collect();
+                                let mut hint = String::with_capacity(512);
+                                hint.push_str(
+                                    "# 📦 Archived Tool Results Available for Recall\n\
+                                     上下文压缩已发生,部分旧 tool result 的原始内容已归档。\n\
+                                     若需要原始数据(完整文件内容、实验数值、命令输出等),\n\
+                                     可调用 `recall_full` 工具按 tool_use_id 检索。\n\
+                                     最近归档(最多 10 条):\n",
+                                );
+                                for (id, name, preview, _ts) in recent {
+                                    let p: String = preview.chars().take(60).collect();
+                                    hint.push_str(&format!(
+                                        "- id={id} tool={name} preview={p}\n"
+                                    ));
+                                }
+                                hint.push_str(
+                                    "调用示例:recall_full({\"tool_use_id\": \"<id>\"})\n\
+                                     或 recall_full({\"list_only\": true}) 查看全部归档。",
+                                );
+                                system_split.dynamic_sections.push(hint);
+                            }
+                        }
+                    }
+
                     // 方案 C:跨会话 plan stale 检测。
                     // 上一会话结束时通过 mark_plan_stale 写入标记文件,本会话
                     // 首 turn 检测到则注入提醒,引导 LLM 调用 notebook_update
@@ -1963,7 +2105,13 @@ where
                         )
                     {
                         if let Some(workspace_root) = &self.workspace_root {
-                            let commands = crate::completion_verifier::CompletionVerifier::detect_project_commands(workspace_root);
+                            // 改进点 7:优先读取 settings.completionVerifyCommands 配置覆盖,
+                            // 兑现 completion_verifier.rs:24 行注释承诺。未配置时回退自动探测。
+                            let commands = if !self.completion_verify_commands.is_empty() {
+                                self.completion_verify_commands.clone()
+                            } else {
+                                crate::completion_verifier::CompletionVerifier::detect_project_commands(workspace_root)
+                            };
                             if !commands.is_empty() {
                                 self.emit_diag(format!(
                                     "[diag] P3 completion_verify: signal={:?} commands={:?}",
@@ -3377,7 +3525,7 @@ where
     ///
     /// **JSON 输入字段**:
     /// - `tasks`(必填):数组,每项含 `name`/`task`/`model`/`mode`?/`complexity`?
-    /// - `fail_fast`(可选,默认 `on`):`on`/`off`
+    /// - `fail_fast`(可选,默认 `off`):`on`/`off`
     ///
     /// **返回**:可读的多行字符串,每个任务一行,标明成功(产物路径)或失败(错误信息)。
     #[allow(dead_code)]
@@ -3481,7 +3629,7 @@ where
         let fail_fast_str = parsed
             .get("fail_fast")
             .and_then(|v| v.as_str())
-            .unwrap_or("on")
+            .unwrap_or("off")
             .to_ascii_lowercase();
         let fail_fast = match fail_fast_str.as_str() {
             "on" => FailFast::On,
@@ -4166,6 +4314,36 @@ where
             }
         }
 
+        // 改进点 12:compaction 前提取实验证据(对比矩阵/基准数值等),
+        // 避免实验数据随原始消息消失。与 decisions 互补:decisions 记录
+        // "决定了什么",evidence 记录"实验数据是什么"。Heuristic 策略,
+        // 零 LLM 成本,从待压缩的 ToolResult 块中识别表格/数值列表/关键词。
+        let compact_end = self.session.messages.len().saturating_sub(preserve_recent);
+        let messages_to_compact = &self.session.messages[..compact_end];
+        let evidence = crate::compact::extract_evidence_before_compaction(messages_to_compact);
+        if !evidence.is_empty() {
+            eprintln!(
+                "[compact] extracted {} evidence item(s) before compaction",
+                evidence.len()
+            );
+            // 持久化到 NOTEBOOK.md <evidence> 段(改进点 12)
+            if let Some(ws) = &self.workspace_root {
+                match crate::notebook::Notebook::load(ws) {
+                    Ok(mut nb) => {
+                        for item in &evidence {
+                            nb.append_evidence(item);
+                        }
+                        if let Err(e) = nb.save(ws) {
+                            eprintln!("[compact] failed to persist evidence to notebook: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[compact] failed to load notebook for evidence: {e}");
+                    }
+                }
+            }
+        }
+
         // Use the default CompactionConfig (max_estimated_tokens: 10_000) so that
         // small sessions are not pointlessly compacted. The auto-compact trigger
         // above (input_tokens >= threshold) already decided compaction is needed;
@@ -4183,6 +4361,9 @@ where
         // auto_compaction 比 microcompact 更激进,会删除整条消息而非替换,
         // 关键信息丢失风险更高,因此必须刷新 NOTEBOOK。
         self.notebook_refresh_pending = true;
+        // 改进点 13:压缩后下个 turn 注入归档 recall 提示,主动列出可 recall
+        // 的归档 tool result,引导 LLM 在需要时调用 recall_full 检索原始内容。
+        self.archive_recall_hint_pending = true;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
@@ -8281,9 +8462,10 @@ mod tests {
         }
     }
 
-    /// v3:同步 FailFast 变体 — 与默认方法行为一致(FailFast::On)
+    /// v3:同步 FailFast 变体 — 显式 FailFast::On 路径应正常执行
+    /// (默认已改为 FailFast::Off,本测试验证显式 On 路径)
     #[test]
-    fn spawn_parallel_via_dag_with_fail_fast_on_matches_default() {
+    fn spawn_parallel_via_dag_with_fail_fast_on_executes_successfully() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
 
@@ -8310,6 +8492,57 @@ mod tests {
         let results = runtime.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok(), "should succeed: {:?}", results[0]);
+    }
+
+    // ===== PlannerAgent 自动拆解接入并行链路测试 =====
+
+    /// `plan_and_spawn_parallel` — feature flag 关闭时返回 Ok(None)
+    ///
+    /// 注意:library 层默认 false(unwrap_or(false)),CLI 层默认 true。
+    /// 此测试在 runtime crate 中运行,OnceLock 未被设置,默认 false。
+    #[test]
+    fn plan_and_spawn_parallel_disabled_returns_none() {
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        // library 层默认 false,应返回 Ok(None)
+        let result = runtime
+            .plan_and_spawn_parallel("refactor multiple files across modules")
+            .expect("should not error when disabled");
+        assert!(result.is_none(), "should return None when feature flag off");
+    }
+
+    /// `plan_and_spawn_parallel` — Simple 任务不拆解(即使 feature flag 开启)
+    #[test]
+    fn plan_and_spawn_parallel_simple_task_returns_none() {
+        // 注意:OnceLock 是进程级单例,可能已被其他测试开启
+        // 这里用 Simple 任务测试,无论 flag 状态都应返回 None
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+
+        // "hello" 是 Simple 任务,不应触发拆解
+        let result = runtime
+            .plan_and_spawn_parallel("hello")
+            .expect("should not error for simple task");
+        assert!(result.is_none(), "simple task should not trigger planner");
     }
 
     // ===== v3 Phase 3:execute_spawn_parallel_subagents(CLI tool 接入)测试 =====
