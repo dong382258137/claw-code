@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, StyledGrapheme, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Terminal;
 // Styled trait 提供 `line.styled_graphemes(style)` 方法，用于按 grapheme
 // 迭代 Line 并保留样式信息（自己 wrap 时需要）。
@@ -112,6 +112,15 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
     }
     let _ask_handler_guard = AskHandlerGuard;
 
+    // Windows: 设置控制台代码页为 UTF-8（CP 65001）。
+    // 根因：cmd.exe (conhost) 默认代码页为 936 (GBK) 或 437 (OEM)，
+    // 不支持 Unicode 边框字符（─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼ ╭ ╰）和
+    // MD 渲染的 Unicode 字符（• │ ╭ ╰ ┼）。TUI 的 ratatui Block 边框、
+    // MD 代码块边框、表格边框全部依赖这些字符。
+    // 设置 UTF-8 代码页后，cmd.exe 也能正确显示 Unicode 边框。
+    // 退出时由 ConsoleCpGuard 恢复原始代码页。
+    let _console_cp_guard = ConsoleCpGuard::new();
+
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     // 启用鼠标捕获（左键点击切换工具卡片折叠状态）和 bracketed paste
@@ -155,6 +164,57 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
             false
         }
     };
+
+    // Windows 控制台代码页 guard：TUI 启动时设置 UTF-8，退出时恢复。
+    // 放在 enable_raw_mode 之前执行，确保 ratatui 渲染的 Unicode 边框
+    // 字符在 cmd.exe (conhost) 中正确显示。
+    #[cfg(windows)]
+    struct ConsoleCpGuard {
+        saved_output_cp: u32,
+        saved_input_cp: u32,
+    }
+    #[cfg(windows)]
+    impl ConsoleCpGuard {
+        fn new() -> Self {
+            extern "system" {
+                fn GetConsoleOutputCP() -> u32;
+                fn SetConsoleOutputCP(code_page: u32) -> i32;
+                fn GetConsoleCP() -> u32;
+                fn SetConsoleCP(code_page: u32) -> i32;
+            }
+            let saved_output_cp = unsafe { GetConsoleOutputCP() };
+            let saved_input_cp = unsafe { GetConsoleCP() };
+            unsafe {
+                SetConsoleOutputCP(65001); // UTF-8
+                SetConsoleCP(65001);
+            }
+            Self {
+                saved_output_cp,
+                saved_input_cp,
+            }
+        }
+    }
+    #[cfg(windows)]
+    impl Drop for ConsoleCpGuard {
+        fn drop(&mut self) {
+            extern "system" {
+                fn SetConsoleOutputCP(code_page: u32) -> i32;
+                fn SetConsoleCP(code_page: u32) -> i32;
+            }
+            unsafe {
+                SetConsoleOutputCP(self.saved_output_cp);
+                SetConsoleCP(self.saved_input_cp);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    struct ConsoleCpGuard;
+    #[cfg(not(windows))]
+    impl ConsoleCpGuard {
+        fn new() -> Self {
+            Self
+        }
+    }
 
     // Bug L10 修复：用 TerminalGuard Drop 确保终端状态恢复。
     // 旧实现用 closure + `?` 传播 Err，但 panic 会直接展开栈跳过 closure
@@ -577,6 +637,14 @@ fn run_event_loop(
     let mut last_scroll_y: u16 = 0;
     let mut needs_redraw: bool = true;
 
+    // 调试 overlay(F12):显示 FPS / sticky 状态 / scroll 等渲染层元信息。
+    // 用于 sticky 集成验证:滚动时实时观察 pinned/pushed entry 切换、header_rows 渐变。
+    let mut debug_overlay: bool = false;
+    // FPS 跟踪(EMA 平滑):记录上一帧时间,帧间隔 = now - prev。
+    // alpha=0.1 → 新样本权重 10%,约 10 帧收敛,避免数字跳动。
+    let mut debug_fps_ema: f64 = 0.0;
+    let mut debug_last_frame: Option<std::time::Instant> = None;
+
     // 闪烁优化：跟踪上次 draw 时的内容版本号 + 状态栏关键状态，
     // streaming 时只在内容或秒级计时器变化时才重绘。
     //
@@ -829,6 +897,20 @@ fn run_event_loop(
                 last_drawn_elapsed_s = current_elapsed_s;
                 last_drawn_streaming = current_streaming;
                 terminal.draw(|f| {
+            // 调试 overlay FPS 更新(EMA):必须在 draw 闭包内,每帧更新。
+            // debug_overlay 关闭时也更新(开启时能立即显示稳定值)。
+            {
+                let now = std::time::Instant::now();
+                if let Some(prev) = debug_last_frame {
+                    let dt = now.duration_since(prev).as_secs_f64();
+                    if dt > 0.0 {
+                        let fps = 1.0 / dt;
+                        // EMA: alpha=0.1,新样本权重 10%
+                        debug_fps_ema = debug_fps_ema * 0.9 + fps * 0.1;
+                    }
+                }
+                debug_last_frame = Some(now);
+            }
             // Top-level vertical layout: main row (output+input) + status bar.
             // 动态输入区高度：根据当前 buffer 的显示行数调整。
             // - 最少 3 行（1 border + 至少 2 内容行）
@@ -988,8 +1070,11 @@ fn run_event_loop(
             // 渲染:border + sticky header + content 三段。
             // 先用 Block 画 main_area 的顶部 border + title + 背景,
             // 再用 Paragraph 覆盖 header 和 content 区域。
+            // 显式设置 border_style：Color::Reset 在某些终端上太暗不可见，
+            // 用 DarkGray 确保边框在任何终端主题下都可见。
             let border_block = Block::default()
                 .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray))
                 .title(format!("输出{scroll_label}"));
             f.render_widget(border_block, main_area);
 
@@ -1023,6 +1108,50 @@ fn run_event_loop(
             // 不用 .scroll() 和 .wrap()：已自己 wrap + 裁剪。
             f.render_widget(output_paragraph, content_area);
 
+            // 调试 overlay(F12):右上角小框,显示渲染层元信息。
+            // 用 Clear widget 清空背景区域再画文字,避免与 output 内容叠加。
+            if debug_overlay {
+                // sticky layout 详情(算法验证核心)
+                let pinned_str = match &sticky_layout.pinned {
+                    Some(p) => format!("idx={} h={} clip={}", p.entry_idx, p.render_height, p.clip_top),
+                    None => "None".to_string(),
+                };
+                let pushed_str = match &sticky_layout.pushed {
+                    Some(p) => format!("idx={} h={} clip={}", p.entry_idx, p.render_height, p.clip_top),
+                    None => "None".to_string(),
+                };
+                let lines_text = vec![
+                    Line::raw(format!(" fps: {:.1}", debug_fps_ema)),
+                    Line::raw(format!(" entries: {}", display_breaks.len().saturating_sub(1))),
+                    Line::raw(format!(" disp_lines: {}", total_display_lines)),
+                    Line::raw(format!(" scroll_offset: {:?}", scroll_offset)),
+                    Line::raw(format!(" max_scroll: {}", max_scroll)),
+                    Line::raw(format!(" scroll_y: {}", scroll_y)),
+                    Line::raw(format!(" header_rows: {}", header_rows)),
+                    Line::raw(format!(" sticky.pin: {}", pinned_str)),
+                    Line::raw(format!(" sticky.push: {}", pushed_str)),
+                    Line::raw(format!(" visible: [{}, {})", start, end)),
+                    Line::raw(format!(" wrap_width: {}", content_width)),
+                ];
+                let overlay_height = lines_text.len() as u16 + 2; // +2 border
+                let overlay_width = 32;
+                let overlay_area = Rect {
+                    x: main_area.x + main_area.width.saturating_sub(overlay_width),
+                    y: main_area.y + 1, // 跳过 main_area 的 top border
+                    width: overlay_width,
+                    height: overlay_height,
+                };
+                f.render_widget(Clear, overlay_area);
+                let overlay_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title("debug");
+                f.render_widget(
+                    Paragraph::new(Text::from(lines_text)).block(overlay_block),
+                    overlay_area,
+                );
+            }
+
             // Input area
             // Bug fix（输入换行后光标位置不正确）：
             // 旧实现用 Paragraph::new(input_line).wrap(Wrap{...}) 让 ratatui
@@ -1044,7 +1173,12 @@ fn run_event_loop(
                 .map(|s| Line::raw(s.clone()))
                 .collect();
             let input_paragraph = Paragraph::new(Text::from(visible_input_lines))
-                .block(Block::default().borders(Borders::TOP).title("输入"));
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title("输入"),
+                );
             f.render_widget(input_paragraph, outer[1]);
 
             // Cursor positioning：基于预折行结果计算，与渲染 100% 一致。
@@ -1502,6 +1636,11 @@ fn run_event_loop(
                                 }
                             }
                         }
+                    }
+                    InputAction::ToggleDebugOverlay => {
+                        // F12:切换调试 overlay 显示
+                        debug_overlay = !debug_overlay;
+                        needs_redraw = true;
                     }
                     InputAction::Submit(line) => {
                         // 重置 conhost_paste_intercepted 标志（每次 Submit 入口）
@@ -2336,6 +2475,11 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
     // F2 → toggle sidebar (also)
     if let KeyCode::F(2) = key.code {
         return InputAction::ToggleSidebar;
+    }
+
+    // F12 → toggle debug overlay (FPS / sticky state / scroll)
+    if let KeyCode::F(12) = key.code {
+        return InputAction::ToggleDebugOverlay;
     }
 
     // PgUp / PgDn → scroll output view (when slash menu is closed so we
