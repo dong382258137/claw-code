@@ -62,12 +62,15 @@ pub(crate) fn render_sidebar(
     skill_history: &SkillHistory,
     tools_scroll: Option<usize>,
 ) {
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " 侧栏 ",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " 侧栏 ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -168,12 +171,15 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
 
 fn render_skills_section(area: Rect, buf: &mut Buffer, skill_history: &SkillHistory) {
     let total = skill_history.len();
-    let block = Block::default().borders(Borders::TOP).title(Span::styled(
-        format!(" 技能 ({total}) "),
-        Style::default()
-            .fg(Color::LightBlue)
-            .add_modifier(Modifier::BOLD),
-    ));
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            format!(" 技能 ({total}) "),
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -223,12 +229,15 @@ fn render_tools_section(
     } else {
         format!(" 工具 ({total}) ")
     };
-    let block = Block::default().borders(Borders::TOP).title(Span::styled(
-        title,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    ));
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -400,7 +409,9 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
             ),
         ]),
     ];
-    let block = Block::default().borders(Borders::TOP);
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     block.render(area, buf);
     let p = Paragraph::new(lines);
