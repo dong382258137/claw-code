@@ -177,10 +177,23 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     if request.enabled && !platform_supported {
         fallback_reasons.push("当前平台无任何沙箱机制可用，命令将无隔离执行".to_string());
     }
-    // 平台支持沙箱但请求的隔离类型未激活(如 namespace 不可用)
+    // 平台支持沙箱但 namespace 隔离未激活:Windows/macOS 上 namespace 不可用,
+    // 已降级为平台原生沙箱(Windows Job Object / macOS sandbox-exec)的资源限制模式。
+    // 注意:平台原生沙箱仅限制 CPU/内存等资源,不提供 PID/文件系统/网络隔离。
     if request.enabled && platform_supported && !active {
-        fallback_reasons
-            .push("平台支持沙箱但请求的隔离类型未激活（如 namespace 不可用）".to_string());
+        if cfg!(target_os = "windows") {
+            fallback_reasons.push(
+                "namespace 隔离不可用（需 Linux），已降级为 Job Object 资源限制（不隔离 PID/文件系统/网络）".to_string()
+            );
+        } else if cfg!(target_os = "macos") {
+            fallback_reasons.push(
+                "namespace 隔离不可用（需 Linux），已降级为 sandbox-exec 资源限制".to_string()
+            );
+        } else {
+            fallback_reasons.push(
+                "平台支持沙箱但请求的隔离类型未激活（如 namespace 不可用）".to_string()
+            );
+        }
     }
     if request.enabled && request.namespace_restrictions && !namespace_supported {
         fallback_reasons
