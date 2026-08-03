@@ -1642,6 +1642,40 @@ fn run_event_loop(
                         debug_overlay = !debug_overlay;
                         needs_redraw = true;
                     }
+                    InputAction::JumpToPrevReply | InputAction::JumpToNextReply => {
+                        // J/K 键:跳转到前/后一个 AI 回复锚点(P0 改进)。
+                        // 锚点 = Text entry 的 display 起始行(原始行)。
+                        // 跳转时设 scroll_y = target_line,转换为 claw 的 scroll_offset。
+                        let reply_starts = output_view.text_entry_display_starts();
+                        if !reply_starts.is_empty() && last_max_scroll > 0 {
+                            // 当前 scroll_y(距顶部)
+                            let current_scroll_y = match scroll_offset {
+                                None => last_max_scroll, // 跟随底部 = 最底
+                                Some(off) => last_max_scroll.saturating_sub(off),
+                            };
+                            // 找到目标锚点
+                            let target = match action {
+                                InputAction::JumpToPrevReply => {
+                                    // 上一个:找第一个 < current_scroll_y 的锚点(反向)
+                                    reply_starts.iter().rev()
+                                        .find(|&&line| line < current_scroll_y)
+                                        .copied()
+                                }
+                                InputAction::JumpToNextReply => {
+                                    // 下一个:找第一个 > current_scroll_y 的锚点(正向)
+                                    reply_starts.iter()
+                                        .find(|&&line| line > current_scroll_y)
+                                        .copied()
+                                }
+                                _ => None,
+                            };
+                            if let Some(target_line) = target {
+                                let scroll_y = target_line.min(last_max_scroll);
+                                scroll_offset = Some(last_max_scroll - scroll_y);
+                                needs_redraw = true;
+                            }
+                        }
+                    }
                     InputAction::Submit(line) => {
                         // 重置 conhost_paste_intercepted 标志（每次 Submit 入口）
                         // 注意：如果上次设置了 conhost_paste_intercepted，后续的
@@ -2502,6 +2536,20 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
     if let KeyCode::Char('E') = key.code {
         if input.buffer().is_empty() {
             return InputAction::JumpToNextError;
+        }
+    }
+
+    // J/K（大写）+ 空闲守卫 → 跳转 AI 回复锚点(P0 改进,参考 grok-build J/K 设计)。
+    // J = 上一个回复,K = 下一个回复(vim 风格:j 下 k 上,这里 J/K 跳回复)。
+    // 与 E 范式一致:buffer 非空时作为普通字符插入。
+    if let KeyCode::Char('J') = key.code {
+        if input.buffer().is_empty() {
+            return InputAction::JumpToPrevReply;
+        }
+    }
+    if let KeyCode::Char('K') = key.code {
+        if input.buffer().is_empty() {
+            return InputAction::JumpToNextReply;
         }
     }
 

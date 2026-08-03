@@ -48,6 +48,10 @@ pub(crate) enum InputAction {
     JumpToBottom,
     /// User pressed E (with empty buffer) to jump to the next error entry.
     JumpToNextError,
+    /// User pressed J (uppercase, empty buffer) to jump to previous AI reply anchor.
+    JumpToPrevReply,
+    /// User pressed K (uppercase, empty buffer) to jump to next AI reply anchor.
+    JumpToNextReply,
     /// User pressed F12 to toggle the debug overlay (FPS / sticky state / scroll).
     ToggleDebugOverlay,
     /// No-op (key not handled).

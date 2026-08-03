@@ -65,8 +65,9 @@ fn render_edit_diff(input: &str) -> Option<String> {
 /// 折叠语义（按 priority 分档，详见 docs/tui-output-intelligence-plan.md §3.2）：
 /// - `Priority::P0`：永不折叠，即使 collapsed=true 也强制完整展开（error/关键发现）。
 /// - `Priority::P3`：L1 单行摘要，不显示预览（成功确认/interrupted）。
-/// - `Priority::P1/P2` + `collapsed && line_count > THRESHOLD`：折叠预览（前3行+展开提示）。
-/// - `Priority::P1/P2` + `!collapsed || line_count <= THRESHOLD`：完整视图。
+/// - `Priority::P1/P2` + `collapsed`：**单行标题折叠**(P0 改进,原为前3行预览)。
+///   工具输出是"噪音",折叠时只占 1 行,把 viewport 空间留给 AI 回复这个"信号"。
+/// - `Priority::P1/P2` + `!collapsed`：完整视图。
 ///
 /// 对 edit_file 工具，在 result 卡片中显示 diff（原 start 卡片中的 diff 已移除）。
 pub(crate) fn render_tool_result(
@@ -102,6 +103,17 @@ pub(crate) fn render_tool_result(
 
     // P0：永不折叠（即使 collapsed=true 也强制完整展开）
     let effective_collapsed = collapsed && priority != Priority::P0;
+
+    // P0 改进(2026-08-01):折叠时只显示单行标题,不再显示 3 行预览。
+    // 原折叠预览占 5-6 行(标题+3预览+展开提示+尾行),工具链一长就占满 viewport,
+    // 把 AI 回复挤出可见区。改为单行标题(├─ ✅ name (N 行,折叠)) + 尾行,
+    // 只占 2 行,用户 Tab 展开看详情。
+    // 参考 grok-build 设计:工具输出默认 Collapsed(1 行标题),AgentMessage 永不折叠。
+    if effective_collapsed && line_count > COLLAPSE_THRESHOLD {
+        return format!(
+            "{diff_prefix}├─ {icon} {name} ({line_count} 行，折叠)\n└─\n"
+        );
+    }
 
     // Determine if this tool's output should be syntax-highlighted
     let language = detect_language_for_tool(name, output);
@@ -455,20 +467,20 @@ mod tests {
 
     #[test]
     fn render_tool_result_long_output_collapsed() {
-        // P1 修复：阈值从 15 降到 5，20 行输出 + collapsed=true 时折叠，只显示前 3 行
+        // P0 改进(2026-08-01):折叠时只显示单行标题,不再显示 3 行预览。
+        // 原行为:标题 + 3 行预览 + 展开提示 + 尾行 = 6 行
+        // 新行为:标题(含行数+折叠标记) + 尾行 = 2 行,把 viewport 空间留给 AI 回复
         let output = (1..=20)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
         let card = render_tool_result("bash", &output, false, None, true, Priority::P2);
-        assert!(card.contains("20 行"));
-        assert!(card.contains("[+] 展开"));
-        assert!(card.contains("17 行"));
-        // Preview should contain first 3 lines (COLLAPSED_PREVIEW_LINES = 3)
-        assert!(card.contains("line1"));
-        assert!(card.contains("line3"));
-        // Should not contain line 4 in preview
-        assert!(!card.contains("│ line4"));
+        assert!(card.contains("20 行"), "应显示总行数: {card}");
+        assert!(card.contains("折叠"), "应显示折叠标记: {card}");
+        // 不应显示预览内容或展开提示(单行折叠)
+        assert!(!card.contains("[+] 展开"), "不应显示展开提示: {card}");
+        assert!(!card.contains("│ line1"), "不应显示预览行: {card}");
+        assert!(!card.contains("│ line3"), "不应显示预览行: {card}");
     }
 
     #[test]

@@ -351,9 +351,21 @@ impl OutputBuffer {
 impl OutputBuffer {
     /// 追加文本到当前条目。如果最后一个条目是 Text，则合并；
     /// 否则新建一个 Text 条目。
+    ///
+    /// P0 改进(2026-08-01):段落感知分段。当 text 包含段落分隔(双换行 `\n\n`)时,
+    /// 按段落分割为独立 Text entry。这样每段 AI 回复都是独立可寻址的条目,
+    /// 配合 J/K 键可快速跳转。最后一段不闭合(可能后续还有流式数据继续追加)。
     pub(crate) fn append(&mut self, text: &str) {
         self.total_written += text.len() as u64;
-        // 尝试合并到上一个 Text 条目
+
+        // 段落感知分段:检测 text 中的双换行分隔符
+        // 只对流式 AI 回复有意义(非工具输出)。工具结果走 push_entry,不会经过 append。
+        if text.contains("\n\n") {
+            self.append_segmented(text);
+            return;
+        }
+
+        // 无段落分隔:走原合并逻辑
         let from_idx = if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
             content.push_str(text);
             self.text_total_bytes += text.len();
@@ -363,7 +375,42 @@ impl OutputBuffer {
             self.entries.push(OutputEntry::text(text.to_string()));
             self.entries.len() - 1
         };
-        // 增量更新 cached_snapshot：只重渲染受影响的最后一个条目。
+        self.recompute_snapshot_tail(from_idx);
+        self.trim_if_needed();
+    }
+
+    /// 段落感知追加:按双换行分割 text,每段为独立 Text entry。
+    /// 最后一段合并到已存在的 trailing Text entry(或新建),支持后续流式追加。
+    fn append_segmented(&mut self, text: &str) {
+        // 按 "\n\n" 分割,保留非空段。最后一段单独处理(可能未结束)。
+        let segments: Vec<&str> = text.split("\n\n").collect();
+        let seg_count = segments.len();
+        let mut from_idx = self.entries.len();
+
+        for (i, seg) in segments.iter().enumerate() {
+            if seg.is_empty() {
+                continue;
+            }
+            if i + 1 == seg_count {
+                // 最后一段:合并到 trailing Text entry 或新建
+                from_idx = if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut()
+                {
+                    content.push_str(seg);
+                    self.text_total_bytes += seg.len();
+                    self.entries.len() - 1
+                } else {
+                    self.text_total_bytes += seg.len();
+                    self.entries.push(OutputEntry::text(seg.to_string()));
+                    self.entries.len() - 1
+                };
+            } else {
+                // 中间段:闭合为独立 entry(加回 \n\n 保持渲染换行)
+                let seg_text = format!("{seg}\n\n");
+                self.text_total_bytes += seg_text.len();
+                self.entries.push(OutputEntry::text(seg_text));
+                from_idx = self.entries.len() - 1;
+            }
+        }
         self.recompute_snapshot_tail(from_idx);
         self.trim_if_needed();
     }
@@ -856,6 +903,25 @@ impl OutputView {
         guard.cached_lines_breaks.clone()
     }
 
+    /// 返回所有 Text 类型 entry 的 display 起始行号(原始行,未 wrap)。
+    /// 供 J/K 键跳转 AI 回复锚点使用(P0 改进)。
+    /// 仅返回 Text entry,跳过 ToolCard/Thinking/Timeline(它们不是 AI 回复)。
+    pub(crate) fn text_entry_display_starts(&self) -> Vec<usize> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.snapshot_lines(); // 确保 cached_lines_breaks 已建立
+        let breaks = &guard.cached_lines_breaks;
+        let entries = &guard.entries;
+        let mut result = Vec::new();
+        for (i, entry) in entries.iter().enumerate() {
+            if matches!(entry, OutputEntry::Text { .. }) {
+                if let Some(&start) = breaks.get(i) {
+                    result.push(start);
+                }
+            }
+        }
+        result
+    }
+
     /// 清空所有条目。
     pub(crate) fn clear(&mut self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1025,25 +1091,13 @@ mod tests {
             assert!(guard.complete_tool_card("t1", long_output, false));
         }
         let snap = view.snapshot();
-        // 应显示折叠预览，而不是只显示一行摘要
-        assert!(
-            snap.contains("[+] 展开"),
-            "折叠预览应包含 [+] 展开 提示: {snap}"
-        );
-        assert!(snap.contains("47 行"), "应显示隐藏行数: {snap}");
-        // 应包含前3行预览
-        assert!(snap.contains("line1"));
-        assert!(snap.contains("line3"));
-        // 不应包含第4行（已被折叠）
-        assert!(
-            !snap.contains("│ line4"),
-            "第4行不应出现在折叠预览中: {snap}"
-        );
-        // 不应显示旧的"已折叠"摘要文案
-        assert!(
-            !snap.contains("已折叠）\n"),
-            "不应显示旧的纯摘要分支输出: {snap}"
-        );
+        // P0 改进(2026-08-01):折叠时只显示单行标题,不再显示 3 行预览。
+        // 新行为:标题(含行数+折叠标记) + 尾行,不显示 [+] 展开提示和预览行。
+        assert!(snap.contains("50 行"), "应显示总行数: {snap}");
+        assert!(snap.contains("折叠"), "应显示折叠标记: {snap}");
+        assert!(!snap.contains("[+] 展开"), "不应显示展开提示: {snap}");
+        assert!(!snap.contains("│ line1"), "不应显示预览行: {snap}");
+        assert!(!snap.contains("│ line3"), "不应显示预览行: {snap}");
     }
 
     /// 回归测试：toggle 展开 ToolCard 后长输出应显示完整内容。
