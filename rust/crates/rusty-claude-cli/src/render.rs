@@ -160,6 +160,8 @@ struct RenderState {
     list_stack: Vec<ListKind>,
     link_stack: Vec<LinkState>,
     table: Option<TableState>,
+    /// 表格渲染目标最大宽度（None 时按终端宽度/默认值解析）。
+    table_max_width: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,9 +272,14 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
+        self.render_markdown_with_width(markdown, None)
+    }
+
+    fn render_markdown_with_width(&self, markdown: &str, max_width: Option<usize>) -> String {
         let normalized = normalize_nested_fences(markdown);
         let mut output = String::new();
         let mut state = RenderState::default();
+        state.table_max_width = max_width;
         let mut code_language = String::new();
         let mut code_buffer = String::new();
         let mut in_code_block = false;
@@ -293,7 +300,14 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn markdown_to_ansi(&self, markdown: &str) -> String {
-        self.render_markdown(markdown)
+        self.render_markdown_with_width(markdown, None)
+    }
+
+    /// 带目标宽度的 markdown → ANSI 渲染。`max_width` 为 Some(>0) 时作为
+    /// 表格宽度上限；None 或 0 时按终端宽度（查询失败兜底 100）。
+    #[must_use]
+    pub fn markdown_to_ansi_with_width(&self, markdown: &str, max_width: Option<usize>) -> String {
+        self.render_markdown_with_width(markdown, max_width)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -407,7 +421,7 @@ impl TerminalRenderer {
             Event::Start(Tag::Table(..)) => state.table = Some(TableState::default()),
             Event::End(TagEnd::Table) => {
                 if let Some(table) = state.table.take() {
-                    output.push_str(&self.render_table(&table));
+                    output.push_str(&self.render_table(&table, state.table_max_width));
                     output.push_str("\n\n");
                 }
             }
@@ -515,7 +529,69 @@ impl TerminalRenderer {
         }
     }
 
-    fn render_table(&self, table: &TableState) -> String {
+    /// 按目标总宽收缩列宽（比例收缩，下限 MIN_TABLE_COLUMN_WIDTH）。
+    /// 返回每列最终显示宽度。
+    fn fit_column_widths(natural: &[usize], target_width: usize) -> Vec<usize> {
+        let n = natural.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        // 表格总宽 = Σ(w_i) + 3n + 1：每列内容 + 左右 padding 2、列间 ┼ 1、两端 │ 2
+        let base = 3 * n + 1;
+        let total: usize = natural.iter().sum::<usize>() + base;
+        if total <= target_width {
+            return natural.to_vec();
+        }
+        let available = target_width.saturating_sub(base);
+        let sum_natural: usize = natural.iter().sum::<usize>().max(1);
+        let mut widths: Vec<usize> = natural
+            .iter()
+            .map(|w| (w.saturating_mul(available) / sum_natural).max(MIN_TABLE_COLUMN_WIDTH))
+            .collect();
+        // 迭代收缩直到总和 ≤ available（每列下限 MIN_TABLE_COLUMN_WIDTH）
+        loop {
+            let current_total: usize = widths.iter().sum();
+            if current_total <= available {
+                break;
+            }
+            let excess = current_total - available;
+            let capacity_sum: usize = widths
+                .iter()
+                .map(|w| w.saturating_sub(MIN_TABLE_COLUMN_WIDTH))
+                .sum();
+            if capacity_sum == 0 {
+                break; // 全部已到下限，接受溢出（TUI 裁剪兜底）
+            }
+            let mut remaining = excess.min(capacity_sum);
+            let mut changed = false;
+            for w in widths.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                let capacity = w.saturating_sub(MIN_TABLE_COLUMN_WIDTH);
+                if capacity > 0 {
+                    let take = capacity.min(remaining);
+                    *w -= take;
+                    remaining -= take;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        widths
+    }
+
+    /// 单元格按 `\n` 分段后各段的可见宽度最大值（列宽计算用）。
+    fn max_visible_line_width(cell: &str) -> usize {
+        cell.split('\n')
+            .map(visible_width)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn render_table(&self, table: &TableState, max_width: Option<usize>) -> String {
         let mut rows = Vec::new();
         if !table.headers.is_empty() {
             rows.push(table.headers.clone());
@@ -527,15 +603,18 @@ impl TerminalRenderer {
         }
 
         let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let widths = (0..column_count)
+        let target_width = resolve_table_max_width(max_width);
+
+        let natural_widths: Vec<usize> = (0..column_count)
             .map(|column| {
                 rows.iter()
                     .filter_map(|row| row.get(column))
-                    .map(|cell| visible_width(cell))
+                    .map(|cell| Self::max_visible_line_width(cell))
                     .max()
                     .unwrap_or(0)
             })
-            .collect::<Vec<_>>();
+            .collect();
+        let widths = Self::fit_column_widths(&natural_widths, target_width);
 
         let border = format!("{}", "│".with(self.color_theme.table_border));
         let separator = widths
@@ -565,27 +644,45 @@ impl TerminalRenderer {
         output
     }
 
+    /// 渲染一行（支持单元格按列宽折行成多物理行，所有物理行边框对齐）。
     fn render_table_row(&self, row: &[String], widths: &[usize], is_header: bool) -> String {
         let border = format!("{}", "│".with(self.color_theme.table_border));
-        let mut line = String::new();
-        line.push_str(&border);
+        // 每列折行（含 `\n` 分段与 ANSI 样式保留）
+        let cell_lines: Vec<Vec<String>> = widths
+            .iter()
+            .enumerate()
+            .map(|(index, width)| {
+                let cell = row.get(index).map_or("", String::as_str);
+                wrap_cell_lines(cell, *width)
+            })
+            .collect();
+        let height = cell_lines.iter().map(Vec::len).max().unwrap_or(1).max(1);
 
-        for (index, width) in widths.iter().enumerate() {
-            let cell = row.get(index).map_or("", String::as_str);
-            line.push(' ');
-            if is_header {
-                let _ = write!(line, "{}", cell.bold().with(self.color_theme.heading));
-            } else {
-                line.push_str(cell);
+        let mut output = String::new();
+        for line_index in 0..height {
+            let mut line = border.clone();
+            for (index, width) in widths.iter().enumerate() {
+                let cell_line = cell_lines
+                    .get(index)
+                    .and_then(|lines| lines.get(line_index))
+                    .map_or("", String::as_str);
+                line.push(' ');
+                if is_header {
+                    let _ = write!(line, "{}", cell_line.bold().with(self.color_theme.heading));
+                } else {
+                    line.push_str(cell_line);
+                }
+                let padding = width.saturating_sub(visible_width(cell_line));
+                line.push_str(&" ".repeat(padding + 1));
+                line.push_str(&border);
             }
-            let padding = width.saturating_sub(visible_width(cell));
-            line.push_str(&" ".repeat(padding + 1));
-            line.push_str(&border);
+            output.push_str(&line);
+            if line_index + 1 < height {
+                output.push('\n');
+            }
         }
-
-        line
+        output
     }
-
     #[must_use]
     pub fn highlight_code(&self, code: &str, language: &str) -> String {
         // P0 修复:bash 输出(如 `cargo test --workspace` 带 --color=always)可能
@@ -1464,4 +1561,54 @@ mod tests {
         assert!(lines.len() >= 2, "8 列宽应容纳不下整句");
         let joined: String = lines.iter().map(|l| strip_ansi(l)).collect();
         assert_eq!(joined, "这是很长的一段中文文本", "折行不应丢字符");
+    }
+
+    #[test]
+    fn renders_tables_wrap_long_cells_and_stay_aligned() {
+        let terminal_renderer = TerminalRenderer::new();
+        let md = "\
+| 工具 | 说明 |
+| ---- | ---- |
+| read_file | 读取 https://raw.githubusercontent.com/example/very/long/path/to/a/documentation/file.md |
+| write_file | 写入文件 |
+";
+        // 目标宽度 40:列收缩 + 单元格折行
+        let markdown_output = terminal_renderer.markdown_to_ansi_with_width(md, Some(40));
+        let plain_text = strip_ansi(&markdown_output);
+        let lines = plain_text.lines().collect::<Vec<_>>();
+        assert!(lines.len() >= 4, "长表格应折成多行: {}", lines.len());
+        let widths: std::collections::BTreeSet<usize> =
+            lines.iter().map(|l| visible_width(l)).collect();
+        assert_eq!(widths.len(), 1, "所有表格行宽度应一致(对齐): {widths:?}");
+        for line in &lines {
+            assert!(line.starts_with('│'), "应以边框开头: {line:?}");
+            assert!(line.ends_with('│'), "应以边框结尾: {line:?}");
+            assert!(visible_width(line) <= 40, "不应超过目标宽度: {line:?}");
+        }
+    }
+
+    #[test]
+    fn renders_tables_shrink_columns_proportionally() {
+        let terminal_renderer = TerminalRenderer::new();
+        let long = "x".repeat(50);
+        let md = format!("| a | b |\n| - | - |\n| {long} | 1 |");
+        let markdown_output = terminal_renderer.markdown_to_ansi_with_width(&md, Some(40));
+        let plain_text = strip_ansi(&markdown_output);
+        for line in plain_text.lines() {
+            assert!(visible_width(line) <= 40, "收缩后仍超宽: {line:?}");
+            assert!(line.starts_with('│') && line.ends_with('│'));
+        }
+    }
+
+    #[test]
+    fn renders_tables_cjk_cells_stay_aligned() {
+        let terminal_renderer = TerminalRenderer::new();
+        let md = "| 名称 | 数量 |\n| ---- | ---- |\n| 苹果 | 10 |\n| 香蕉香蕉香蕉 | 3 |";
+        let markdown_output = terminal_renderer.markdown_to_ansi_with_width(md, Some(24));
+        let plain_text = strip_ansi(&markdown_output);
+        let widths: std::collections::BTreeSet<usize> = plain_text
+            .lines()
+            .map(|l| visible_width(l))
+            .collect();
+        assert_eq!(widths.len(), 1, "CJK 表格行应对齐: {widths:?}");
     }
