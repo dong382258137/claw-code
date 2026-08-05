@@ -419,10 +419,13 @@ impl TaskRegistry {
 
     pub fn output(&self, task_id: &str) -> Result<String, String> {
         let inner = self.inner.lock().expect("registry lock poisoned");
-        let task = inner
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let task = inner.tasks.get(task_id).ok_or_else(|| {
+            format!(
+                "task not found: {task_id}\n\
+                     Hint: task_id must come from TaskCreate (format: task_xxxxxxxx_y). \
+                     bash `backgroundPid` is a process PID, not a task_id."
+            )
+        })?;
         Ok(task.output.clone())
     }
 
