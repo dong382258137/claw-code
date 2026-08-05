@@ -51,6 +51,20 @@ impl Priority {
         matches!(self, Priority::P2 | Priority::P3)
     }
 }
+/// bash/编辑结果中的错误标记，命中即 P0 展开（内容信号覆盖行数）。
+/// 大小写分别收录："error:"(Rust/cargo/shell) 与 "Error:"(Node/Python)。
+/// FAILED 用大写：cargo test 失败输出大写 `FAILED`，ls 的小写文件名
+/// "failed.txt" 不误伤。
+const BASH_ERROR_MARKERS: &[&str] = &[
+    "error[E",
+    "error:",
+    "Error:",
+    "panic!",
+    "fatal:",
+    "FAILED",
+    "command not found",
+    "Traceback",
+];
 
 /// 根据工具名、输入、结果、is_error 计算展现优先级。
 ///
@@ -95,12 +109,66 @@ pub(crate) fn compute_priority(
         }
     }
 
-    // 4. 行数启发式兜底
-    let line_count = result.lines().count();
-    if line_count > 40 {
-        Priority::P2 // 长输出折叠
-    } else {
-        Priority::P1 // 短/中等输出默认展开
+    // 4. 内容语义分类器兜底（P0 修复 2026-08-04）
+    // 根因：旧实现统计 pretty JSON 信封行数（3 行 stdout → 38 行 JSON 恒 P2
+    // 折叠），且与内容语义无关。现在先提取真实内容，再按工具语义决定默认
+    // 展开层级：内容是答案（read_file/grep/测试/错误）→ 展开；
+    // 过程噪音（write/edit/glob）→ 折叠单行。
+    let body = crate::tui::tool_card::extract_tool_output_body_public(tool_name, result);
+    let lines = body.lines().count();
+    match tool_name {
+        "bash" | "Bash" => {
+            if BASH_ERROR_MARKERS.iter().any(|m| body.contains(m)) {
+                Priority::P0 // 命令失败/编译错误：内容信号覆盖行数
+            } else if body.contains("test result:") {
+                Priority::P1 // 测试总结（cargo test 末行）——长输出也展开
+            } else if lines > 8 {
+                Priority::P2 // 长输出折叠（ls -la 等过程输出）
+            } else {
+                Priority::P1
+            }
+        }
+        "read_file" | "Read" => {
+            // 内容是答案，门槛放宽到 40 行
+            if lines > 40 {
+                Priority::P2
+            } else {
+                Priority::P1
+            }
+        }
+        "grep_search" | "Grep" => {
+            // 命中即证据，门槛放宽到 50 行
+            if lines > 50 {
+                Priority::P2
+            } else {
+                Priority::P1
+            }
+        }
+        "edit_file" | "Edit" | "write_file" | "Write" => {
+            if BASH_ERROR_MARKERS.iter().any(|m| body.contains(m)) {
+                Priority::P0 // cargo check 编译错误 → 展开显示错误
+            } else {
+                Priority::P3 // 纯确认 → 单行摘要
+            }
+        }
+        "glob_search" | "Glob" | "Skill" | "TodoWrite" | "ToolSearch"
+        | "benchmark_compare" => {
+            Priority::P3 // 过程噪音/确认：单行摘要
+        }
+        "WebFetch" => {
+            if lines > 8 {
+                Priority::P2
+            } else {
+                Priority::P1
+            }
+        }
+        _ => {
+            if lines > 8 {
+                Priority::P2
+            } else {
+                Priority::P1
+            }
+        }
     }
 }
 
@@ -724,51 +792,65 @@ impl OutputBuffer {
             self.rendered_lengths.push(len);
         }
         // P0-2 修复：增量维护 cached_lines，而非全量 invalidate。
-        // 原实现每次 recompute 都 invalidate_lines_cache()，导致下帧 snapshot_lines
-        // 全量 ansi_to_lines 解析 ≤256KB 的 cached_snapshot（10-50ms/帧，streaming 时
-        // 每个 TextDelta 都触发）。
         //
-        // 增量方案：用 Arc::try_unwrap 在 strong_count==1 时取出 Vec，只解析尾部 entry，
-        // 然后创建**新 Arc**。新 Arc 指针变化 → app.rs 的 wrap 缓存正确失效重算。
+        // 增量方案优先用 Arc::try_unwrap（strong_count==1 时零拷贝取出 Vec），
+        // 失败时（主线程 draw 闭包仍持有 snapshot_lines 返回的 Arc clone）改为
+        // clone 现有 Vec 后增量修改 —— 比 invalidate + 全量 ansi_to_lines 重建快 10-50 倍。
         //
-        // 注意：不能用 Arc::get_mut（原地修改不改变指针），否则 wrap 缓存的
-        // pointer identity 比较会命中旧缓存，导致显示旧内容（内容已更新但屏幕不刷新）。
-        // 必须用 try_unwrap 取出 Vec 再创建新 Arc。
-        // 主线程 draw 结束后会释放 snapshot_lines 返回的 Arc clone，worker 线程
-        // 获取锁时 cached_lines 通常是唯一引用，try_unwrap 成功。
-        // 若 strong_count>1（主线程仍持有 Arc clone），放弃增量，invalidate 退化全量。
+        // 根因（渲染卡住恶性循环）：
+        //   1. 主线程 draw 闭包持 Arc clone → strong_count=2
+        //   2. worker 线程 append → try_unwrap 失败 → invalidate
+        //   3. 下次 draw → snapshot_lines 全量重建（5-10ms 持锁）
+        //   4. 全量重建期间 worker append 阻塞 → total_written 不更新 → content_changed=false
+        //   5. 只有 elapsed_changed（每秒一次）触发 draw → "卡住"现象
+        //
+        // clone 开销分析：256KB buffer ≈ 3000 行 ≈ 9000 个 Span → ~0.3ms
+        // 全量重建开销：ansi_to_lines 解析 256KB → 5-10ms
+        // clone 方案在 streaming 高频 append 下总开销 ~10ms/s，可接受。
         if let Some(lines_arc) = self.cached_lines.take() {
             match Arc::try_unwrap(lines_arc) {
                 Ok(mut lines) => {
-                    // 增量更新成功路径：修改 Vec 后创建新 Arc
-                    // 1. truncate cached_lines_breaks 到 from_idx + 1（保留 [0..=from_idx]）
+                    // 快速路径：strong_count==1，零拷贝取出 Vec
                     self.cached_lines_breaks.truncate(from_idx + 1);
-                    // 2. truncate cached_lines 到 from_idx 对应的起始行
                     let line_start = self
                         .cached_lines_breaks
                         .get(from_idx)
                         .copied()
                         .expect("breaks[from_idx] must exist after truncate to from_idx+1");
                     lines.truncate(line_start);
-                    // 3. 重新解析 from_idx 之后的 entry，追加到 cached_lines
                     for i in from_idx..self.entries.len() {
                         let rendered = self.entries[i].render();
                         let entry_lines = ansi_to_lines(&rendered);
                         lines.extend(entry_lines);
                         self.cached_lines_breaks.push(lines.len());
                     }
-                    // 创建新 Arc → 指针变化 → app.rs wrap 缓存正确失效
                     self.cached_lines = Some(Arc::new(lines));
                     return;
                 }
                 Err(arc) => {
-                    // strong_count > 1（主线程仍持引用）：放回原 Arc，走 invalidate 退化
-                    self.cached_lines = Some(arc);
+                    // strong_count > 1（主线程仍持 Arc clone）：
+                    // clone 现有 Vec，增量修改后创建新 Arc。
+                    // 避免 invalidate → 全量 ansi_to_lines 重建（5-10ms 持锁）。
+                    let mut lines: Vec<Line<'static>> = (*arc).clone();
+                    self.cached_lines_breaks.truncate(from_idx + 1);
+                    let line_start = self
+                        .cached_lines_breaks
+                        .get(from_idx)
+                        .copied()
+                        .expect("breaks[from_idx] must exist after truncate to from_idx+1");
+                    lines.truncate(line_start);
+                    for i in from_idx..self.entries.len() {
+                        let rendered = self.entries[i].render();
+                        let entry_lines = ansi_to_lines(&rendered);
+                        lines.extend(entry_lines);
+                        self.cached_lines_breaks.push(lines.len());
+                    }
+                    self.cached_lines = Some(Arc::new(lines));
+                    return;
                 }
             }
         }
-        // 退化路径：cached_lines 是 None（首次/被 clear）或 strong_count>1（主线程仍持引用）
-        // 全量重建交给下次 snapshot_lines() 调用，这里只 invalidate。
+        // 首次或被 clear：全量重建交给下次 snapshot_lines() 调用。
         self.invalidate_lines_cache();
     }
 
@@ -1287,12 +1369,28 @@ mod tests {
         assert_eq!(compute_priority("bash", input, result, false), Priority::P1);
     }
 
-    /// compute_priority：长输出 >40 行 → P2（折叠预览）
+    /// compute_priority：长输出 >8 行 → P2（折叠为单行标题）
     #[test]
     fn compute_priority_long_output() {
         let input = r#"{"command":"cat big.txt"}"#;
         let result = "line\n".repeat(50);
         assert_eq!(compute_priority("bash", input, &result, false), Priority::P2);
+    }
+
+    /// compute_priority：9 行输出 → P2（门槛边界,>8 即折叠）
+    #[test]
+    fn compute_priority_9_lines_collapses() {
+        let input = r#"{"command":"ls"}"#;
+        let result = "line\n".repeat(9);
+        assert_eq!(compute_priority("bash", input, &result, false), Priority::P2);
+    }
+
+    /// compute_priority：8 行输出 → P1（门槛边界,≤8 保持展开）
+    #[test]
+    fn compute_priority_8_lines_expands() {
+        let input = r#"{"command":"ls"}"#;
+        let result = "line\n".repeat(8);
+        assert_eq!(compute_priority("bash", input, &result, false), Priority::P1);
     }
 
     /// compute_priority：normal emphasis → P1
@@ -1301,6 +1399,110 @@ mod tests {
         let input = r#"{"command":"ls","emphasis":"normal"}"#;
         let result = r#"{"stdout":"ok"}"#;
         assert_eq!(compute_priority("bash", input, result, false), Priority::P1);
+    }
+
+    // ---------- 语义分类器测试（P0 修复 2026-08-04） ----------
+
+    /// 核心回归：bash 3 行 stdout 的 pretty JSON 信封（18 行）应展开（P1）。
+    /// 旧实现统计信封行数 → 恒 P2 折叠；新实现提取 stdout（3 行 ≤ 8）→ P1。
+    #[test]
+    fn compute_priority_pretty_json_short_stdout_expands() {
+        let input = r#"{"command":"echo hi"}"#;
+        let result = r#"{
+  "stdout": "line1\nline2\nline3",
+  "stderr": "",
+  "interrupted": false,
+  "isImage": false,
+  "backgroundTaskId": null,
+  "backgroundedByUser": false,
+  "assistantAutoBackgrounded": false,
+  "dangerouslyDisableSandbox": false,
+  "returnCodeInterpretation": "exit_code:0",
+  "noOutputExpected": false,
+  "structuredContent": null,
+  "persistedOutputPath": null,
+  "persistedOutputSize": null,
+  "sandboxStatus": {
+    "enabled": true,
+    "supported": true,
+    "active": false
+  }
+}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P1);
+    }
+
+    /// bash stdout 含错误标记（rc 为 0 时也能命中）→ P0，内容信号覆盖行数
+    #[test]
+    fn compute_priority_bash_error_marker_is_p0() {
+        let input = r#"{"command":"cargo build"}"#;
+        let result = r#"{
+  "stdout": "error: could not compile `demo`",
+  "returnCodeInterpretation": "exit_code:0"
+}"#;
+        assert_eq!(compute_priority("bash", input, result, false), Priority::P0);
+    }
+
+    /// bash 长输出含 test result:（41 行全过测试）→ P1 展开（测试总结是信号）
+    #[test]
+    fn compute_priority_bash_test_result_long_output_expands() {
+        let input = r#"{"command":"cargo test"}"#;
+        let mut stdout = String::new();
+        for i in 0..40 {
+            stdout.push_str(&format!("test tests::case{i} ... ok\n"));
+        }
+        stdout.push_str("test result: ok. 40 passed");
+        let result = format!(
+            "{{\n  \"stdout\": \"{}\",\n  \"returnCodeInterpretation\": \"exit_code:0\"\n}}",
+            stdout.replace('\n', "\\n")
+        );
+        assert_eq!(compute_priority("bash", input, &result, false), Priority::P1);
+    }
+
+    /// read_file 20 行内容（信封 10 行）→ P1 展开（内容是答案，门槛放宽到 40）
+    #[test]
+    fn compute_priority_read_file_20_lines_expands() {
+        let input = r#"{"path":"src/main.rs"}"#;
+        let content = (1..=20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let result = format!(
+            "{{\n  \"type\": \"file\",\n  \"file\": {{\n    \"filePath\": \"src/main.rs\",\n    \"content\": \"{content}\",\n    \"numLines\": 20,\n    \"startLine\": 1,\n    \"totalLines\": 20\n  }}\n}}"
+        );
+        assert_eq!(compute_priority("read_file", input, &result, false), Priority::P1);
+    }
+
+    /// write_file 纯确认 → P3 单行摘要（过程噪音折叠）
+    #[test]
+    fn compute_priority_write_file_confirms_p3() {
+        let input = r#"{"path":"a.txt","content":"hi"}"#;
+        let result = r#"{
+  "type": "write",
+  "filePath": "a.txt",
+  "content": "hi",
+  "structuredPatch": [],
+  "originalFile": null,
+  "gitDiff": null
+}"#;
+        assert_eq!(compute_priority("write_file", input, result, false), Priority::P3);
+    }
+
+    /// write_file 带 cargo check 编译错误 → P0（错误是信号）
+    #[test]
+    fn compute_priority_write_file_cargo_check_error_p0() {
+        let input = r#"{"path":"src/main.rs","content":"fn main() {}"}"#;
+        let result = format!(
+            "{}\n\n--- cargo check ---\nerror[E0308]: mismatched types\n --> src/main.rs:2:23",
+            r#"{
+  "type": "write",
+  "filePath": "src/main.rs",
+  "content": "fn main() {}",
+  "structuredPatch": [],
+  "originalFile": null,
+  "gitDiff": null
+}"#
+        );
+        assert_eq!(compute_priority("write_file", input, &result, false), Priority::P0);
     }
 
     /// trim 保护 error entry：error/P0 ToolCard 的 result 不被 trim 淘汰（方案 §3.4）。
