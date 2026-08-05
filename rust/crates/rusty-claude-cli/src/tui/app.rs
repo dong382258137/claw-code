@@ -925,11 +925,14 @@ fn run_event_loop(
             }
             // Top-level vertical layout: main row (output+input) + status bar.
             // 动态输入区高度：根据当前 buffer 的显示行数调整。
-            // - 最少 3 行（1 border + 至少 2 内容行）
+            // - 最少 2 行（1 border + 至少 1 内容行）
             // - 最多 8 行（避免输入区挤占输出区过多空间）
             // - 内容行数 = buffer 中所有行的显示行数（考虑 wrap）总和
             //   每行显示行数 = max(1, ceil(line_width / area_width))
             // 这样长输入或多行粘贴时输入区会自动扩展，不会出现"看不全"的问题。
+            // 高度按实际需要校准：= 1 border + 内容行数，不再额外留 safety margin。
+            // 原实现 (+2 / clamp 下限 3) 在单行输入时输入框多占 1-2 行，
+            // 把输出区底部内容挤出可视区（视觉上"被输入框遮挡"）。
             let input_area_width = f.area().width as usize;
             let input_content_lines: usize = {
                 let buf_str = input.buffer();
@@ -950,8 +953,9 @@ fn run_event_loop(
                     })
                     .sum()
             };
-            // +1 for top border, +1 for safety margin（避免光标在最后一行被裁）
-            let input_height = (input_content_lines + 2).clamp(3, 8) as u16;
+            // +1 for top border（输入框只有顶部边框）。光标行号在渲染端
+            // 已 clamp 到可见区，不需要额外安全行；渲染裁剪 take() 也保证不越界。
+            let input_height = (input_content_lines + 1).clamp(2, 8) as u16;
 
             let outer = Layout::default()
                 .direction(Direction::Vertical)
@@ -969,7 +973,7 @@ fn run_event_loop(
                     .direction(Direction::Horizontal)
                     .constraints([
                         Constraint::Min(50),    // output (增加以补偿侧栏变窄)
-                        Constraint::Length(24),  // sidebar (从36缩小1/3→24)
+                        Constraint::Length(28),  // sidebar (24→28: 原 24 太窄, 内容右侧 2-3 字符被截断)
                     ])
                     .split(outer[0]);
                 // Render sidebar using the latest state + tool history.
