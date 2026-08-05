@@ -3028,6 +3028,14 @@ where
             id
         }; // coordinator 借用在此结束,后续可重新获取
 
+        // 桥接:在 global TaskRegistry 注册子 agent 任务,让 AI 能通过 TaskOutput 查询进度。
+        let bridge_task_id = {
+            let registry = crate::task_registry::global();
+            let t = registry.create(task, Some(name));
+            let _ = registry.set_status(&t.task_id, crate::task_registry::TaskStatus::Running);
+            t.task_id
+        };
+
         // 发布 SubagentHandoff lane event — 主 agent → 子 agent 任务派发记录。
         let emitted_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3281,6 +3289,22 @@ where
         let event =
             LaneEvent::subagent_result(emitted_at, &subagent_id, final_status, &final_result_msg);
         publish_lane_event(event);
+
+        // 桥接:更新 global TaskRegistry 中子 agent 任务的终态,让 AI 能通过 TaskOutput 查到结果。
+        {
+            let registry = crate::task_registry::global();
+            let status = if final_status == "completed" {
+                crate::task_registry::TaskStatus::Completed
+            } else {
+                crate::task_registry::TaskStatus::Failed
+            };
+            let _ = registry.set_status(&bridge_task_id, status);
+            let _ = registry.append_output(&bridge_task_id, &final_result_msg);
+            // 把 task_id 暴露给 AI,让它知道可以用 TaskOutput(task_id) 查询此子 agent 的结果。
+            final_result_msg.push_str(&format!(
+                "\n\n(task_id: {bridge_task_id} — 可用 TaskOutput 工具查询此子 agent 的状态和输出)"
+            ));
+        }
 
         Ok(final_result_msg)
     }

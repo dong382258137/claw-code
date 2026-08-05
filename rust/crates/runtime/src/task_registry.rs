@@ -128,6 +128,22 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// 进程级全局 TaskRegistry 单例。
+///
+/// runtime 和 tools crate 共享此实例:
+/// - tools 的 TaskCreate/TaskOutput 工具通过自身 `global_task_registry()` 访问
+///   (内部委托到此函数)
+/// - runtime 的 `execute_dispatch_subagent_async` 通过此 `global()` 注册
+///   子 agent 任务状态,让 AI 能通过 TaskOutput 查询 coordinator 派发的子 agent 进度
+///
+/// 两者指向同一个实例,确保 AI 调 TaskOutput 查到的子 agent 状态与 coordinator
+/// 写入的一致。
+pub fn global() -> &'static TaskRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(TaskRegistry::new)
+}
+
 impl TaskRegistry {
     #[must_use]
     pub fn new() -> Self {

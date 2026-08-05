@@ -389,9 +389,8 @@ fn global_coordinator_executor() -> Option<&'static Arc<dyn dag::SubagentExecuto
 }
 
 fn global_task_registry() -> &'static TaskRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TaskRegistry::new)
+    // 委托到 runtime::task_registry::global(),与 runtime 的 spawn_subagent 桥接共享同一实例。
+    runtime::task_registry::global()
 }
 
 fn global_worker_registry() -> &'static WorkerRegistry {
