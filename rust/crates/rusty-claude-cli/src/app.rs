@@ -3152,14 +3152,10 @@ pub(crate) fn build_runtime_with_plugin_state(
         }
     }
 
-    let task_registry = runtime::task_registry::TaskRegistry::new()
-        .with_multi_agent_coordinator(coordinator.clone());
     // v0.2 生产接入:保留一份 coordinator 的 Arc,用于构造 CoordinatorExecutor。
     // coordinator 是 Clone(内部全 Arc<Mutex>),clone 后再 move 给 with_multi_agent_coordinator。
     let coordinator_arc = std::sync::Arc::new(coordinator.clone());
-    runtime = runtime
-        .with_multi_agent_coordinator(coordinator)
-        .with_task_registry(task_registry);
+    runtime = runtime.with_multi_agent_coordinator(coordinator);
 
     // v2 Phase 2 Epic 6:注入全局 DecisionExtractorClient。
     //

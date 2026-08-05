@@ -633,12 +633,6 @@ pub struct ConversationRuntime<C, T> {
     /// LLM 请求 + 独立 prompt cache,不污染主 agent 缓存(§5.2)。
     /// 详见 docs/harness-engineering-optimization-plan.md Step 3.2。
     multi_agent_coordinator: Option<MultiAgentCoordinator>,
-    /// Epic 3:TaskRegistry — 子 agent 任务注册表。
-    ///
-    /// `Some` 时子 agent 任务可通过 TaskRegistry 追踪状态/心跳/团队分配。
-    /// 与 multi_agent_coordinator 配合使用:coordinator 管理子 agent 生命周期,
-    /// registry 管理 task 级元数据。详见 plan.md §9.2 Epic 3。
-    task_registry: Option<crate::task_registry::TaskRegistry>,
     /// v0.2 生产接入:CoordinatorExecutor for DAG dispatch。
     ///
     /// `None` 时(默认)DAG 调度走 v0.1 stub 路径(仅注册 Pending run);
@@ -758,7 +752,6 @@ where
             trace_analyzer: None,
             turn_start: Cell::new(None),
             multi_agent_coordinator: None,
-            task_registry: None,
             coordinator_executor: None,
             notebook_refresh_pending: false,
             archive_recall_hint_pending: false,
@@ -1455,23 +1448,6 @@ where
             }
         }
         results
-    }
-
-    /// Epic 3:注入 TaskRegistry,启用子 agent 任务追踪。
-    ///
-    /// 注入后,子 agent 的 task 级元数据(状态/心跳/团队分配)可通过
-    /// TaskRegistry 追踪。与 multi_agent_coordinator 配合使用。
-    /// 详见 plan.md §9.2 Epic 3。
-    #[must_use]
-    pub fn with_task_registry(mut self, registry: crate::task_registry::TaskRegistry) -> Self {
-        self.task_registry = Some(registry);
-        self
-    }
-
-    /// 获取已注入的 TaskRegistry 引用(若已注入)。
-    #[must_use]
-    pub fn task_registry(&self) -> Option<&crate::task_registry::TaskRegistry> {
-        self.task_registry.as_ref()
     }
 
     /// Step 3.2-c:获取 `MultiAgentCoordinator` 引用(若已注入)。
