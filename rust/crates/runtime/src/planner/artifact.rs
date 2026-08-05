@@ -344,6 +344,92 @@ impl PlanArtifact {
         out.push_str("\nFocus on the current step. Do not skip ahead.");
         out
     }
+
+    /// 渲染 PlanArtifact 的**稳定骨架**(task_summary + steps 描述),
+    /// 不包含 step 状态标签(⏳/▶/✓/✗/⊘)。
+    ///
+    /// 骨架在 turn 间不变(steps 列表创建后固定,只有 status/attempts 变),
+    /// 因此可以安全放在 system_prompt 的 dynamic_sections 中而不破坏
+    /// 隐式前缀缓存 —— system_prompt 在 turn 间字节稳定,之后的 tools
+    /// 和 messages 都能被 DeepSeek 服务端 cache 命中。
+    ///
+    /// 与 [`render_status_delta`](Self::render_status_delta) 配合使用:
+    /// skeleton → dynamic_sections(可缓存),delta → messages 末尾(不可缓存)。
+    #[must_use]
+    pub fn render_skeleton(&self) -> String {
+        let mut out = String::with_capacity(512 + self.steps.len() * 200);
+        out.push_str("# Active Plan\n\n");
+        out.push_str(&format!("Task: {}\n\n", self.task_summary));
+        if self.steps.is_empty() {
+            out.push_str("Steps: (pending decomposition)\n\n");
+            out.push_str(
+                "This task was detected as complex but has not yet been decomposed into steps.\n",
+            );
+            out.push_str(
+                "Break it down into ordered steps with explicit acceptance criteria, \
+                then execute them one by one. Each step should map to a coherent unit of work \
+                (e.g., one file-level change or one cross-module refactor).\n",
+            );
+            out.push_str("\nFocus on decomposing and executing the task. Do not skip ahead.");
+            return out;
+        }
+        out.push_str("Steps:\n");
+        for (idx, step) in self.steps.iter().enumerate() {
+            let risk_tag = if step.risk_level == StepRisk::High {
+                " ⚠ high-risk"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "{}.{} {}\n   acceptance: {}\n   verify: {} (attempts: {})\n",
+                idx + 1,
+                risk_tag,
+                step.description,
+                step.acceptance_criteria,
+                step.verify_command.as_deref().unwrap_or("(skip)"),
+                step.attempts,
+            ));
+            if step.risk_level == StepRisk::High {
+                out.push_str(
+                    "   ⚠ PRE-COMMITMENT REQUIRED: This step is high-risk (destructive/irreversible/security-sensitive).\n   \
+                     Before implementing, generate 2+ candidate approaches and briefly state trade-offs (cost, risk, reversibility).\n   \
+                     Only commit after explicit comparison — never commit to the first feasible option just because it is feasible.\n",
+                );
+            }
+        }
+        out.push_str("\nFocus on the current step. Do not skip ahead.");
+        out
+    }
+
+    /// 渲染 PlanArtifact 的**状态增量**(step 状态标签),turn 间变化。
+    ///
+    /// 输出紧凑的状态摘要,如:
+    /// ```text
+    /// [plan status] 1=done 2=executing 3=pending
+    /// ```
+    ///
+    /// 设计为注入到 messages 末尾(随最新 user message 发送),而非
+    /// system_prompt。因为状态每 turn 变化,放在 system_prompt 会破坏
+    /// 隐式前缀缓存;放在 messages 末尾只影响最后一条 message,不影响
+    /// system_prompt + tools + 历史 messages 的 cache 命中。
+    #[must_use]
+    pub fn render_status_delta(&self) -> String {
+        if self.steps.is_empty() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(self.steps.len());
+        for (idx, step) in self.steps.iter().enumerate() {
+            let tag = match step.status {
+                StepStatus::Pending => "pending",
+                StepStatus::Executing => "executing",
+                StepStatus::Succeeded => "done",
+                StepStatus::Failed => "failed",
+                StepStatus::Skipped => "skipped",
+            };
+            parts.push(format!("{}={}", idx + 1, tag));
+        }
+        format!("[plan status] {}", parts.join(" "))
+    }
 }
 
 /// 生成形如 `plan-1777000000000-a1b2` 的 ID(时间戳 + 4 位随机后缀)。

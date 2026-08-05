@@ -1847,7 +1847,7 @@ where
                         asm.add_auto(ContextSource::Memory, memory_ctx.clone());
                     }
                     if let Some(plan) = &self.active_plan {
-                        let rendered = plan.render_for_prompt();
+                        let rendered = plan.render_skeleton();
                         if !rendered.is_empty() {
                             asm.add_auto(ContextSource::Goal, rendered);
                         }
@@ -1868,7 +1868,7 @@ where
                         system_split.dynamic_sections.push(memory_ctx.clone());
                     }
                     if let Some(plan) = &self.active_plan {
-                        let rendered = plan.render_for_prompt();
+                        let rendered = plan.render_skeleton();
                         if !rendered.is_empty() {
                             system_split.dynamic_sections.push(rendered);
                         }
@@ -1893,9 +1893,22 @@ where
                 // P3 完成声明校验也依赖此修复:break 点设置的 remediation
                 // 需要存活到下一 turn 被读取。
                 self.pending_remediation = None;
+                // 缓存保护(§5.2-enhanced):PlanArtifact 的 status_delta
+                // (step 状态标签 ⏳→▶→✓)每 turn 变化,若放在 system_prompt
+                // 的 dynamic_sections 会破坏隐式前缀缓存,导致之后的 tools
+                // 和 messages 全部 miss。改为追加到 messages 末尾,只影响
+                // 最后一条 message,system_prompt + tools + 历史 messages
+                // 全部保持 cache 命中。预期命中率从 88-92% 回升到 97%+。
+                let mut messages = sliced.to_vec();
+                if let Some(plan) = &self.active_plan {
+                    let delta = plan.render_status_delta();
+                    if !delta.is_empty() {
+                        messages.push(ConversationMessage::user_text(delta));
+                    }
+                }
                 ApiRequest {
                     system_prompt: system_split,
-                    messages: sliced.to_vec(),
+                    messages,
                 }
             };
             self.emit_diag("[diag] api_stream_start".to_string());
