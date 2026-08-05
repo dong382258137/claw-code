@@ -80,14 +80,13 @@ fn main() {
 /// fingerprint 时(git commit 不改变源码 mtime)build.rs 不会重跑,GIT_SHA
 /// 停留在首次构建时的值(曾导致部署的二进制标注旧 SHA)。改为显式声明输入:
 ///
-///   - <gitdir>/HEAD         :detached HEAD 时内容即 SHA,commit 更新其 mtime;
-///   - <commondir>/refs/     :loose ref(如 refs/heads/main)每次 commit 更新
-///                             mtime,Cargo 对目录递归跟踪;不硬编码分支名,
-///                             以免分支切换/改名导致集合失效;
-///   - <commondir>/packed-refs :分支被打包(gc/浅克隆)时 commit 更新该文件;
-///                             文件不存在时按 Cargo 语义视为"始终变化"→ 每次
-///                             重跑,是安全的兜底(代价仅几十毫秒);
-///   - <skills>/             :源 skill 变化时重新部署到 target/<profile>/skills。
+/// - <gitdir>/HEAD: detached HEAD 时内容即 SHA,commit 更新其 mtime;
+/// - <commondir>/refs/: loose ref(如 refs/heads/main)每次 commit 更新
+///   mtime,Cargo 对目录递归跟踪;不硬编码分支名,以免分支切换/改名导致集合失效;
+/// - <commondir>/packed-refs: 分支被打包(gc/浅克隆)时 commit 更新该文件;
+///   文件不存在时按 Cargo 语义视为"始终变化"→ 每次重跑,是安全的兜底
+///   (代价仅几十毫秒);
+/// - <skills>/: 源 skill 变化时重新部署到 target/<profile>/skills。
 ///
 /// 找不到 git 目录(crates.io 打包源码)时不输出 git 相关指令,Cargo 回退到
 /// 每次重跑,行为等同修复前,安全。

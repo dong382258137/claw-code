@@ -246,7 +246,7 @@ fn collect_recent_project_dirs() -> Vec<(PathBuf, chrono::DateTime<chrono::Utc>)
     }
 
     // 按时间倒序
-    projects.sort_by(|a, b| b.1.cmp(&a.1));
+    projects.sort_by_key(|a| std::cmp::Reverse(a.1));
     projects
 }
 
@@ -3214,9 +3214,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     // - 网络失败/超时由 gate_task 降级为 None(不阻塞任务)
     match crate::llm_clients::WebResearchClient::new(&model_for_subagent, Some(2048)) {
         Ok(researcher) => {
-            let research_client: std::sync::Arc<
-                dyn runtime::knowledge_freshness::ResearchClient,
-            > = std::sync::Arc::new(researcher);
+            let research_client: std::sync::Arc<dyn runtime::knowledge_freshness::ResearchClient> =
+                std::sync::Arc::new(researcher);
             runtime::knowledge_freshness::set_global_research_client(research_client);
         }
         Err(e) => {

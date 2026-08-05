@@ -278,8 +278,10 @@ impl TerminalRenderer {
     fn render_markdown_with_width(&self, markdown: &str, max_width: Option<usize>) -> String {
         let normalized = normalize_nested_fences(markdown);
         let mut output = String::new();
-        let mut state = RenderState::default();
-        state.table_max_width = max_width;
+        let mut state = RenderState {
+            table_max_width: max_width,
+            ..RenderState::default()
+        };
         let mut code_language = String::new();
         let mut code_buffer = String::new();
         let mut in_code_block = false;
@@ -585,10 +587,7 @@ impl TerminalRenderer {
 
     /// 单元格按 `\n` 分段后各段的可见宽度最大值（列宽计算用）。
     fn max_visible_line_width(cell: &str) -> usize {
-        cell.split('\n')
-            .map(visible_width)
-            .max()
-            .unwrap_or(0)
+        cell.split('\n').map(visible_width).max().unwrap_or(0)
     }
 
     fn render_table(&self, table: &TableState, max_width: Option<usize>) -> String {
@@ -1097,6 +1096,7 @@ struct AnsiUnit {
 /// - 带样式字符：`\x1b[0m` + 当前激活的全部 SGR 序列（自愈式重建）；
 /// - 紧跟在带样式字符后的无样式字符：`\x1b[0m`（清除泄漏的样式）；
 /// - 其余：空字符串。
+///
 /// 非 SGR 转义（OSC 等）作为零宽透传，追加到后续字符前缀。
 fn parse_ansi_units(input: &str) -> Vec<AnsiUnit> {
     let mut units: Vec<AnsiUnit> = Vec::new();
@@ -1262,11 +1262,7 @@ fn wrap_segment_lines(segment: &[AnsiUnit], width: usize, out: &mut Vec<String>)
             pending_ws.extend(token.units.iter().copied());
             continue;
         }
-        let word_width: usize = token
-            .units
-            .iter()
-            .map(|u| char_display_width(u.ch))
-            .sum();
+        let word_width: usize = token.units.iter().map(|u| char_display_width(u.ch)).sum();
         let ws_width: usize = pending_ws.iter().map(|u| char_display_width(u.ch)).sum();
         if current_width + ws_width + word_width <= width {
             emit_ansi_units(
@@ -1283,12 +1279,7 @@ fn wrap_segment_lines(segment: &[AnsiUnit], width: usize, out: &mut Vec<String>)
                 &mut last_styled,
             );
         } else if word_width <= width {
-            flush_ansi_line(
-                &mut current,
-                &mut current_width,
-                &mut last_styled,
-                out,
-            );
+            flush_ansi_line(&mut current, &mut current_width, &mut last_styled, out);
             pending_ws.clear();
             emit_ansi_units(
                 &token.units,
@@ -1378,7 +1369,9 @@ impl OutputVerbosity {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, visible_width, wrap_cell_lines, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{
+        strip_ansi, visible_width, wrap_cell_lines, MarkdownStreamState, Spinner, TerminalRenderer,
+    };
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
@@ -1535,113 +1528,108 @@ mod tests {
     }
 }
 
-    #[test]
-    fn wraps_cell_with_ansi_styles_at_word_boundaries() {
-        // 带 \x1b[1m 粗体样式的单元格,宽度 6 词边界折行
-        let styled = "\u{1b}[1mhello world\u{1b}[0m";
-        let lines = wrap_cell_lines(styled, 6);
-        assert_eq!(lines.len(), 2, "应折成 2 行");
-        assert_eq!(strip_ansi(&lines[0]), "hello");
-        assert_eq!(strip_ansi(&lines[1]), "world");
-        // 样式保留:每行都应包含粗体序列
-        assert!(lines[0].contains("\u{1b}[1m"));
-        assert!(lines[1].contains("\u{1b}[1m"));
-        // 每行可见宽度 ≤ 6
-        for line in &lines {
-            assert!(visible_width(line) <= 6, "行超宽: {line:?}");
-        }
+#[test]
+fn wraps_cell_with_ansi_styles_at_word_boundaries() {
+    // 带 \x1b[1m 粗体样式的单元格,宽度 6 词边界折行
+    let styled = "\u{1b}[1mhello world\u{1b}[0m";
+    let lines = wrap_cell_lines(styled, 6);
+    assert_eq!(lines.len(), 2, "应折成 2 行");
+    assert_eq!(strip_ansi(&lines[0]), "hello");
+    assert_eq!(strip_ansi(&lines[1]), "world");
+    // 样式保留:每行都应包含粗体序列
+    assert!(lines[0].contains("\u{1b}[1m"));
+    assert!(lines[1].contains("\u{1b}[1m"));
+    // 每行可见宽度 ≤ 6
+    for line in &lines {
+        assert!(visible_width(line) <= 6, "行超宽: {line:?}");
     }
+}
 
-    #[test]
-    fn wraps_cell_splits_overwide_single_token() {
-        // 无空格超宽 token:硬拆为 5/5/2
-        let lines = wrap_cell_lines("ABCDEFGHIJKL", 5);
-        let plain: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
-        assert_eq!(plain, vec!["ABCDE", "FGHIJ", "KL"]);
+#[test]
+fn wraps_cell_splits_overwide_single_token() {
+    // 无空格超宽 token:硬拆为 5/5/2
+    let lines = wrap_cell_lines("ABCDEFGHIJKL", 5);
+    let plain: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
+    assert_eq!(plain, vec!["ABCDE", "FGHIJ", "KL"]);
+}
+
+#[test]
+fn wraps_cell_breaks_on_newlines() {
+    // 换行强制分段
+    let lines = wrap_cell_lines("aaa\nbbb ccc", 6);
+    let plain: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
+    assert_eq!(plain, vec!["aaa", "bbb", "ccc"]);
+}
+
+#[test]
+fn wraps_cell_handles_plain_text_and_cjk() {
+    let lines = wrap_cell_lines("这是很长的一段中文文本", 8);
+    for line in &lines {
+        assert!(visible_width(line) <= 8, "CJK 行超宽: {line:?}");
     }
+    assert!(lines.len() >= 2, "8 列宽应容纳不下整句");
+    let joined: String = lines.iter().map(|l| strip_ansi(l)).collect();
+    assert_eq!(joined, "这是很长的一段中文文本", "折行不应丢字符");
+}
 
-    #[test]
-    fn wraps_cell_breaks_on_newlines() {
-        // 换行强制分段
-        let lines = wrap_cell_lines("aaa\nbbb ccc", 6);
-        let plain: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
-        assert_eq!(plain, vec!["aaa", "bbb", "ccc"]);
-    }
-
-    #[test]
-    fn wraps_cell_handles_plain_text_and_cjk() {
-        let lines = wrap_cell_lines("这是很长的一段中文文本", 8);
-        for line in &lines {
-            assert!(visible_width(line) <= 8, "CJK 行超宽: {line:?}");
-        }
-        assert!(lines.len() >= 2, "8 列宽应容纳不下整句");
-        let joined: String = lines.iter().map(|l| strip_ansi(l)).collect();
-        assert_eq!(joined, "这是很长的一段中文文本", "折行不应丢字符");
-    }
-
-    #[test]
-    fn renders_tables_wrap_long_cells_and_stay_aligned() {
-        let terminal_renderer = TerminalRenderer::new();
-        let md = "\
+#[test]
+fn renders_tables_wrap_long_cells_and_stay_aligned() {
+    let terminal_renderer = TerminalRenderer::new();
+    let md = "\
 | 工具 | 说明 |
 | ---- | ---- |
 | read_file | 读取 https://raw.githubusercontent.com/example/very/long/path/to/a/documentation/file.md |
 | write_file | 写入文件 |
 ";
-        // 目标宽度 40:列收缩 + 单元格折行
-        let markdown_output = terminal_renderer.markdown_to_ansi_with_width(md, Some(40));
-        let plain_text = strip_ansi(&markdown_output);
-        let lines = plain_text.lines().collect::<Vec<_>>();
-        assert!(lines.len() >= 4, "长表格应折成多行: {}", lines.len());
-        let widths: std::collections::BTreeSet<usize> =
-            lines.iter().map(|l| visible_width(l)).collect();
-        assert_eq!(widths.len(), 1, "所有表格行宽度应一致(对齐): {widths:?}");
-        for line in &lines {
-            assert!(line.starts_with('│'), "应以边框开头: {line:?}");
-            assert!(line.ends_with('│'), "应以边框结尾: {line:?}");
-            assert!(visible_width(line) <= 40, "不应超过目标宽度: {line:?}");
-        }
+    // 目标宽度 40:列收缩 + 单元格折行
+    let markdown_output = terminal_renderer.markdown_to_ansi_with_width(md, Some(40));
+    let plain_text = strip_ansi(&markdown_output);
+    let lines = plain_text.lines().collect::<Vec<_>>();
+    assert!(lines.len() >= 4, "长表格应折成多行: {}", lines.len());
+    let widths: std::collections::BTreeSet<usize> =
+        lines.iter().map(|l| visible_width(l)).collect();
+    assert_eq!(widths.len(), 1, "所有表格行宽度应一致(对齐): {widths:?}");
+    for line in &lines {
+        assert!(line.starts_with('│'), "应以边框开头: {line:?}");
+        assert!(line.ends_with('│'), "应以边框结尾: {line:?}");
+        assert!(visible_width(line) <= 40, "不应超过目标宽度: {line:?}");
     }
+}
 
-    #[test]
-    fn renders_tables_shrink_columns_proportionally() {
-        let terminal_renderer = TerminalRenderer::new();
-        let long = "x".repeat(50);
-        let md = format!("| a | b |\n| - | - |\n| {long} | 1 |");
-        let markdown_output = terminal_renderer.markdown_to_ansi_with_width(&md, Some(40));
-        let plain_text = strip_ansi(&markdown_output);
-        for line in plain_text.lines() {
-            assert!(visible_width(line) <= 40, "收缩后仍超宽: {line:?}");
-            assert!(line.starts_with('│') && line.ends_with('│'));
-        }
+#[test]
+fn renders_tables_shrink_columns_proportionally() {
+    let terminal_renderer = TerminalRenderer::new();
+    let long = "x".repeat(50);
+    let md = format!("| a | b |\n| - | - |\n| {long} | 1 |");
+    let markdown_output = terminal_renderer.markdown_to_ansi_with_width(&md, Some(40));
+    let plain_text = strip_ansi(&markdown_output);
+    for line in plain_text.lines() {
+        assert!(visible_width(line) <= 40, "收缩后仍超宽: {line:?}");
+        assert!(line.starts_with('│') && line.ends_with('│'));
     }
+}
 
-    #[test]
-    fn renders_tables_cjk_cells_stay_aligned() {
-        let terminal_renderer = TerminalRenderer::new();
-        let md = "| 名称 | 数量 |\n| ---- | ---- |\n| 苹果 | 10 |\n| 香蕉香蕉香蕉 | 3 |";
-        let markdown_output = terminal_renderer.markdown_to_ansi_with_width(md, Some(24));
-        let plain_text = strip_ansi(&markdown_output);
-        let widths: std::collections::BTreeSet<usize> = plain_text
-            .lines()
-            .map(|l| visible_width(l))
-            .collect();
-        assert_eq!(widths.len(), 1, "CJK 表格行应对齐: {widths:?}");
-    }
+#[test]
+fn renders_tables_cjk_cells_stay_aligned() {
+    let terminal_renderer = TerminalRenderer::new();
+    let md = "| 名称 | 数量 |\n| ---- | ---- |\n| 苹果 | 10 |\n| 香蕉香蕉香蕉 | 3 |";
+    let markdown_output = terminal_renderer.markdown_to_ansi_with_width(md, Some(24));
+    let plain_text = strip_ansi(&markdown_output);
+    let widths: std::collections::BTreeSet<usize> = plain_text.lines().map(visible_width).collect();
+    assert_eq!(widths.len(), 1, "CJK 表格行应对齐: {widths:?}");
+}
 
-    #[test]
-    fn streaming_state_applies_max_width_to_tables() {
-        let renderer = TerminalRenderer::new();
-        let long = "x".repeat(50);
-        let md = format!("| a | b |\n| - | - |\n| {long} | 1 |\n\n");
-        let mut state = MarkdownStreamState::with_max_width(Some(40));
-        let flushed = state
-            .push(&renderer, &md)
-            .expect("blank line flushes");
-        for line in strip_ansi(&flushed).lines() {
-            assert!(visible_width(line) <= 40, "流式渲染未应用宽度: {line:?}");
-        }
-        // 无宽度（默认）时按终端宽度/100 解析，不应 panic
-        let mut default_state = MarkdownStreamState::default();
-        assert!(default_state.push(&renderer, &md).is_some());
+#[test]
+fn streaming_state_applies_max_width_to_tables() {
+    let renderer = TerminalRenderer::new();
+    let long = "x".repeat(50);
+    let md = format!("| a | b |\n| - | - |\n| {long} | 1 |\n\n");
+    let mut state = MarkdownStreamState::with_max_width(Some(40));
+    let flushed = state.push(&renderer, &md).expect("blank line flushes");
+    for line in strip_ansi(&flushed).lines() {
+        assert!(visible_width(line) <= 40, "流式渲染未应用宽度: {line:?}");
     }
+    // 无宽度（默认）时按终端宽度/100 解析，不应 panic
+    let mut default_state = MarkdownStreamState::default();
+    assert!(default_state.push(&renderer, &md).is_some());
+}

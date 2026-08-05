@@ -14,9 +14,9 @@
 )]
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -222,7 +222,9 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
     // 和 `result.is_err()` 块，导致 raw mode / alternate screen / mouse
     // capture / bracketed paste 残留，shell 不可用。
     // Drop guard 在任何退出路径（正常返回、Err、panic）都会执行。
-    struct TerminalGuard { kitty_enabled: bool }
+    struct TerminalGuard {
+        kitty_enabled: bool,
+    }
     impl Drop for TerminalGuard {
         fn drop(&mut self) {
             let _ = disable_raw_mode();
@@ -390,11 +392,7 @@ fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Li
     }
     let mut tokens: Vec<WToken> = Vec::new();
     for g in &graphemes {
-        let is_ws = g
-            .symbol
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace);
+        let is_ws = g.symbol.chars().next().is_some_and(char::is_whitespace);
         if let Some(last) = tokens.last_mut() {
             if last.is_ws == is_ws {
                 last.graphemes.push(g);
@@ -1749,13 +1747,16 @@ fn run_event_loop(
                             let target = match action {
                                 InputAction::JumpToPrevReply => {
                                     // 上一个:找第一个 < current_scroll_y 的锚点(反向)
-                                    reply_starts.iter().rev()
+                                    reply_starts
+                                        .iter()
+                                        .rev()
                                         .find(|&&line| line < current_scroll_y)
                                         .copied()
                                 }
                                 InputAction::JumpToNextReply => {
                                     // 下一个:找第一个 > current_scroll_y 的锚点(正向)
-                                    reply_starts.iter()
+                                    reply_starts
+                                        .iter()
                                         .find(|&&line| line > current_scroll_y)
                                         .copied()
                                 }
@@ -2009,7 +2010,10 @@ fn run_event_loop(
                                 // 读取完整剪贴板内容（第二次 PowerShell 调用，100-500ms）。
                                 // 现在 try_auto_expand_clipboard 返回原始剪贴板内容，
                                 // 直接复用，消除第二次 PowerShell 调用。
-                                if result.is_some() && !pending_paste_lines.is_empty() {
+                                if result
+                                    .as_ref()
+                                    .is_some_and(|_| !pending_paste_lines.is_empty())
+                                {
                                     // 复用 try_auto_expand_clipboard 返回的原始剪贴板内容，
                                     // 不再重复调用 read_clipboard_text()。
                                     let (display_inner, expanded_inner, clipboard_content) =
@@ -2023,11 +2027,8 @@ fn run_event_loop(
                                         // Submit 内容 = "前缀" + 剪贴板首行
                                         // drain phase 填充 buffer 时需要保留前缀，
                                         // 否则用户输入的引导文字会丢失。
-                                        let clip_first = clipboard_content
-                                            .lines()
-                                            .next()
-                                            .unwrap_or("")
-                                            .trim();
+                                        let clip_first =
+                                            clipboard_content.lines().next().unwrap_or("").trim();
                                         let prefix = if !clip_first.is_empty()
                                             && trimmed.ends_with(clip_first)
                                         {
@@ -2068,11 +2069,7 @@ fn run_event_loop(
                                             paste_diag_log(
                                                 "  fallback 到 fold_pasted_input (单行)",
                                             );
-                                            fold_pasted_input(
-                                                &line,
-                                                &session_id,
-                                                &mut paste_id_gen,
-                                            )
+                                            fold_pasted_input(&line, &session_id, &mut paste_id_gen)
                                         })
                                 }
                             } else {
@@ -2976,7 +2973,7 @@ fn execute_turn(
                 // 在安全边界处输出已渲染的 ANSI 片段，避免半个 fence 渲染错乱。
                 let renderer = TerminalRenderer::shared();
                 if let Ok(mut ms) = markdown_state_for_closure.lock() {
-                ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
+                    ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
                     if let Some(rendered) = ms.push(renderer, &text) {
                         if let Ok(mut buf) = output_handle.lock() {
                             buf.append(&rendered);
@@ -3119,7 +3116,7 @@ fn execute_turn(
                 // 必须在 "\n\n" 分隔符之前执行，保证 AI 回复尾段不丢失。
                 let renderer = TerminalRenderer::shared();
                 if let Ok(mut ms) = markdown_state_for_closure.lock() {
-                ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
+                    ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
                     if let Some(rendered) = ms.flush(renderer) {
                         if let Ok(mut buf) = output_for_closure.lock() {
                             buf.append(&rendered);
@@ -3182,7 +3179,7 @@ fn execute_turn(
                 // MD 渲染 flush：错误前先渲染 pending markdown，避免丢失尾段。
                 let renderer = TerminalRenderer::shared();
                 if let Ok(mut ms) = markdown_state_for_closure.lock() {
-                ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
+                    ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
                     if let Some(rendered) = ms.flush(renderer) {
                         if let Ok(mut buf) = output_for_closure.lock() {
                             buf.append(&rendered);
@@ -3596,11 +3593,7 @@ mod tests {
         // entry0: "AAA" (1 行)
         // entry1: "BBB" (1 行)
         // entry2: "CCC" (1 行)
-        let lines = vec![
-            Line::raw("AAA"),
-            Line::raw("BBB"),
-            Line::raw("CCC"),
-        ];
+        let lines = vec![Line::raw("AAA"), Line::raw("BBB"), Line::raw("CCC")];
         // raw_breaks: [0, 1, 2, 3](每个 entry 1 行)
         let raw_breaks = vec![0, 1, 2, 3];
         let (wrapped, display_breaks) = wrap_lines_with_breaks(&lines, &raw_breaks, 80);
@@ -3640,9 +3633,9 @@ mod tests {
         // display_breaks: [0, 20]
         let display_breaks = vec![0, 20];
         let max_scroll = 20usize.saturating_sub(10); // viewport=10, max_scroll=10
-        // scroll_offset = Some(5):距底部 5 行,upstream_scroll = 10-5 = 5
-        // entry0 y_virtual=0 < 5 → pin entry0
-        // 无 next prompt → 不触发 push → pinned=Some
+                                                     // scroll_offset = Some(5):距底部 5 行,upstream_scroll = 10-5 = 5
+                                                     // entry0 y_virtual=0 < 5 → pin entry0
+                                                     // 无 next prompt → 不触发 push → pinned=Some
         let layout = compute_claw_sticky_layout(Some(5), max_scroll, &display_breaks, 10);
         assert!(layout.pinned.is_some(), "单 entry 无 push,pin entry0");
         assert_eq!(
@@ -3664,7 +3657,10 @@ mod tests {
         // None → upstream_scroll = max_scroll = 10
         // entry0 y_virtual=0 < 10 → pin entry0(无 next,不 push)
         let layout = compute_claw_sticky_layout(None, max_scroll, &display_breaks, 10);
-        assert!(layout.pinned.is_some(), "None 时算法仍会 pin(故 app.rs 需守卫)");
+        assert!(
+            layout.pinned.is_some(),
+            "None 时算法仍会 pin(故 app.rs 需守卫)"
+        );
         assert_eq!(layout.pinned.unwrap().entry_idx, 0);
     }
 
@@ -3885,53 +3881,63 @@ mod tests {
         let emitter = build_test_emitter(handle, Arc::clone(&status));
         emitter(StatusEvent::TextDelta("Hello table".to_string()));
         let snapshot = output_view.snapshot();
-        assert!(snapshot.contains("Hello table"), "TextDelta 应被追加到输出缓冲");
+        assert!(
+            snapshot.contains("Hello table"),
+            "TextDelta 应被追加到输出缓冲"
+        );
     }
 }
 
-    #[test]
-    fn wrap_words_not_broken_midword() {
-        let line = Line::raw("foo bar baz qux");
-        let wrapped = wrap_line_to_display_lines(&line, 7);
-        let texts: Vec<String> = wrapped.iter().map(|l| l.to_string()).collect();
-        assert_eq!(texts, vec!["foo bar", "baz qux"], "单词不应被拆断");
-    }
+#[test]
+fn wrap_words_not_broken_midword() {
+    let line = Line::raw("foo bar baz qux");
+    let wrapped = wrap_line_to_display_lines(&line, 7);
+    let texts: Vec<String> = wrapped.iter().map(|l| l.to_string()).collect();
+    assert_eq!(texts, vec!["foo bar", "baz qux"], "单词不应被拆断");
+}
 
-    #[test]
-    fn wrap_splits_overwide_words() {
-        let line = Line::raw("ABCDEFGHIJKL");
-        let wrapped = wrap_line_to_display_lines(&line, 5);
-        let texts: Vec<String> = wrapped.iter().map(|l| l.to_string()).collect();
-        assert_eq!(texts, vec!["ABCDE", "FGHIJ", "KL"], "超宽无空格 token 应硬拆");
-    }
+#[test]
+fn wrap_splits_overwide_words() {
+    let line = Line::raw("ABCDEFGHIJKL");
+    let wrapped = wrap_line_to_display_lines(&line, 5);
+    let texts: Vec<String> = wrapped.iter().map(|l| l.to_string()).collect();
+    assert_eq!(
+        texts,
+        vec!["ABCDE", "FGHIJ", "KL"],
+        "超宽无空格 token 应硬拆"
+    );
+}
 
-    #[test]
-    fn wrap_leaves_table_rows_unwrapped() {
-        let row = "│ aaa │ bbbbbbbbbbbbbbbbbbbb │";
-        let line = Line::raw(row);
-        let wrapped = wrap_line_to_display_lines(&line, 10);
-        assert_eq!(wrapped.len(), 1, "表格行不应折行");
-        assert_eq!(wrapped[0].to_string(), row, "表格行应原样保留");
-    }
+#[test]
+fn wrap_leaves_table_rows_unwrapped() {
+    let row = "│ aaa │ bbbbbbbbbbbbbbbbbbbb │";
+    let line = Line::raw(row);
+    let wrapped = wrap_line_to_display_lines(&line, 10);
+    assert_eq!(wrapped.len(), 1, "表格行不应折行");
+    assert_eq!(wrapped[0].to_string(), row, "表格行应原样保留");
+}
 
-    #[test]
-    fn wrap_preserves_span_styles_across_lines() {
-        let line = Line::from(vec![
-            Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(" text", Style::default()),
-            Span::styled("here", Style::default().fg(Color::Red)),
-        ]);
-        let wrapped = wrap_line_to_display_lines(&line, 9);
-        assert_eq!(wrapped.len(), 2, "bold + texthere 应在 9 列下折成 2 行");
-        assert!(
-            wrapped[0]
-                .spans
-                .iter()
-                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
-            "第一行应保留 bold 样式"
-        );
-        assert!(
-            wrapped[1].spans.iter().any(|s| s.style.fg == Some(Color::Red)),
-            "第二行应保留红色样式"
-        );
-    }
+#[test]
+fn wrap_preserves_span_styles_across_lines() {
+    let line = Line::from(vec![
+        Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(" text", Style::default()),
+        Span::styled("here", Style::default().fg(Color::Red)),
+    ]);
+    let wrapped = wrap_line_to_display_lines(&line, 9);
+    assert_eq!(wrapped.len(), 2, "bold + texthere 应在 9 列下折成 2 行");
+    assert!(
+        wrapped[0]
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+        "第一行应保留 bold 样式"
+    );
+    assert!(
+        wrapped[1]
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(Color::Red)),
+        "第二行应保留红色样式"
+    );
+}

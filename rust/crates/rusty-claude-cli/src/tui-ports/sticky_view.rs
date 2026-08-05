@@ -522,7 +522,7 @@ pub fn compute_claw_sticky_layout(
             // saturating_cast 到 u16(sticky 算法只支持 u16 高度)
             let full_height = (w[1] - w[0]).min(u16::MAX as usize) as u16;
             // min_height = min(MIN_PINNED_HEIGHT, full_height),且至少 1 行
-            let min_height = full_height.min(MIN_PINNED_HEIGHT).max(1);
+            let min_height = full_height.clamp(1, MIN_PINNED_HEIGHT);
             PromptDescriptor {
                 entry_idx: i,
                 y_virtual,
@@ -589,7 +589,7 @@ mod tests {
 
         let pinned = layout.pinned.unwrap();
         assert_eq!(pinned.render_height, 7); // 8 - 1
-        // header_screen_rows = render_height + gap = 7 + 1 = 8
+                                             // header_screen_rows = render_height + gap = 7 + 1 = 8
         assert_eq!(layout.header_screen_rows(), 8);
     }
 
@@ -601,7 +601,7 @@ mod tests {
 
         let pinned = layout.pinned.unwrap();
         assert_eq!(pinned.render_height, 5); // 8 - 3
-        // header_screen_rows = 5 + 1 = 6
+                                             // header_screen_rows = 5 + 1 = 6
         assert_eq!(layout.header_screen_rows(), 6);
     }
 
@@ -613,7 +613,7 @@ mod tests {
 
         let pinned = layout.pinned.unwrap();
         assert_eq!(pinned.render_height, 4); // clamped to min
-        // header_screen_rows = 4 + 1 = 5
+                                             // header_screen_rows = 4 + 1 = 5
         assert_eq!(layout.header_screen_rows(), 5);
     }
 
@@ -625,7 +625,7 @@ mod tests {
 
         let pinned = layout.pinned.unwrap();
         assert_eq!(pinned.render_height, 4); // stays at min
-        // header_screen_rows = 4 + 1 = 5
+                                             // header_screen_rows = 4 + 1 = 5
         assert_eq!(layout.header_screen_rows(), 5);
     }
 
@@ -826,7 +826,7 @@ mod tests {
         assert!(layout.has_header());
         assert_eq!(layout.pinned_entry_idx(), Some(0));
         assert_eq!(layout.pinned_screen_row(), Some(0)); // No pushed, so pinned starts at 0
-        // min render_height=4, gap is at row 4
+                                                         // min render_height=4, gap is at row 4
         assert_eq!(layout.gap_row(), Some(4));
         assert_eq!(layout.content_height(24), 24 - 5); // viewport - header_screen_rows (4+1gap=5)
     }
@@ -1412,10 +1412,7 @@ mod tests {
         // Need to find scroll where both pushed and pinned exist
         for scroll in 0..20 {
             let layout = compute_sticky_layout(scroll, 20, &prompts);
-            if layout.pushed.is_some() && layout.pinned.is_some() {
-                let pushed = layout.pushed.unwrap();
-                let pinned = layout.pinned.unwrap();
-
+            if let (Some(pushed), Some(pinned)) = (layout.pushed.as_ref(), layout.pinned.as_ref()) {
                 // Pushed rows → entry 0
                 for row in 0..pushed.visible_height() {
                     assert_eq!(layout.entry_at_header_row(row), Some(0));
