@@ -230,15 +230,25 @@ pub const SPAWN_PARALLEL_SUBAGENTS_TOOL_SPEC: &str = r#"{
         },
         "required": ["tasks"]
     }
-}"#;
+}
+"#;
+
+/// 请求来源分类 — 用于缓存统计隔离。
+/// 子智能体请求经 cli 侧路由到独立的 `subagent-{session}` 统计,
+/// 不再污染主 agent 的缓存 break 检测(见设计文档 §4.2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    Main,
+    Subagent,
+}
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
     pub system_prompt: SystemPromptSplit,
     pub messages: Vec<ConversationMessage>,
+    pub request_kind: RequestKind,
 }
-
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
@@ -1909,6 +1919,7 @@ where
                 ApiRequest {
                     system_prompt: system_split,
                     messages,
+                    request_kind: RequestKind::Main,
                 }
             };
             self.emit_diag("[diag] api_stream_start".to_string());
@@ -3463,10 +3474,10 @@ where
             }],
             usage: None,
         };
-
         let request = ApiRequest {
             system_prompt: subagent_system_prompt,
             messages: vec![user_message],
+            request_kind: RequestKind::Subagent,
         };
 
         // v3:async 调用 LLM — 通过 stream_async 避免 nested block_on panic。
@@ -4804,7 +4815,7 @@ mod tests {
         build_assistant_message, compaction_threshold_for_context_window,
         parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, ApiClient,
         ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
-        RuntimeError, StaticToolExecutor, ToolExecutor,
+        RequestKind, RuntimeError, StaticToolExecutor, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, SESSION_SEARCH_TOOL_SPEC,
     };
     use crate::compact::CompactionConfig;
@@ -5883,9 +5894,20 @@ mod tests {
         let request = ApiRequest {
             system_prompt: split,
             messages: Vec::new(),
+            request_kind: RequestKind::Main,
         };
         assert_eq!(request.system_prompt.static_sections, vec!["static"]);
         assert_eq!(request.system_prompt.dynamic_sections, vec!["dynamic"]);
+    }
+
+    #[test]
+    fn api_request_carries_request_kind() {
+        let request = ApiRequest {
+            system_prompt: SystemPromptSplit::from_sections(vec!["static".to_string()]),
+            messages: Vec::new(),
+            request_kind: RequestKind::Main,
+        };
+        assert_eq!(request.request_kind, RequestKind::Main);
     }
 
     #[test]

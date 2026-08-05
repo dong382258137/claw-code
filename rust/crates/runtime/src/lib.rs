@@ -162,7 +162,7 @@ pub use vcs_snapshot::{RefactorTransaction, TransactionStatus, VcsError};
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_from_env_opt, ApiClient,
     ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
-    RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
+    RequestKind, RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_roots, glob_search,

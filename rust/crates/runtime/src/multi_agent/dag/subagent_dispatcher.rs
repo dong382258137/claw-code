@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::conversation::{ApiClient, ApiRequest};
+use crate::conversation::{ApiClient, ApiRequest, RequestKind};
 use crate::prompt::SystemPromptSplit;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole};
 
@@ -98,6 +98,7 @@ impl SubagentDispatcher {
         let request = ApiRequest {
             system_prompt: subagent_system_prompt,
             messages: vec![user_message],
+            request_kind: RequestKind::Subagent,
         };
 
         // ⚠ 不能用 `tokio::task::spawn_blocking`:它仍然在当前 tokio runtime
