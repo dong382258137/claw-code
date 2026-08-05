@@ -725,16 +725,32 @@ impl TerminalRenderer {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MarkdownStreamState {
     pending: String,
+    /// 表格渲染目标宽度（None → 终端宽度/默认值）。
+    max_width: Option<usize>,
 }
 
 impl MarkdownStreamState {
+    /// 携带初始目标宽度的构造器。
+    #[must_use]
+    pub fn with_max_width(max_width: Option<usize>) -> Self {
+        Self {
+            pending: String::new(),
+            max_width,
+        }
+    }
+
+    /// 更新目标宽度（TUI draw 循环每帧刷新内容区宽度后由 emitter 调用）。
+    pub fn set_max_width(&mut self, max_width: Option<usize>) {
+        self.max_width = max_width;
+    }
+
     #[must_use]
     pub fn push(&mut self, renderer: &TerminalRenderer, delta: &str) -> Option<String> {
         self.pending.push_str(delta);
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        Some(renderer.markdown_to_ansi_with_width(&ready, self.max_width))
     }
 
     #[must_use]
@@ -744,7 +760,7 @@ impl MarkdownStreamState {
             None
         } else {
             let pending = std::mem::take(&mut self.pending);
-            Some(renderer.markdown_to_ansi(&pending))
+            Some(renderer.markdown_to_ansi_with_width(&pending, self.max_width))
         }
     }
 }
@@ -1611,4 +1627,21 @@ mod tests {
             .map(|l| visible_width(l))
             .collect();
         assert_eq!(widths.len(), 1, "CJK 表格行应对齐: {widths:?}");
+    }
+
+    #[test]
+    fn streaming_state_applies_max_width_to_tables() {
+        let renderer = TerminalRenderer::new();
+        let long = "x".repeat(50);
+        let md = format!("| a | b |\n| - | - |\n| {long} | 1 |\n\n");
+        let mut state = MarkdownStreamState::with_max_width(Some(40));
+        let flushed = state
+            .push(&renderer, &md)
+            .expect("blank line flushes");
+        for line in strip_ansi(&flushed).lines() {
+            assert!(visible_width(line) <= 40, "流式渲染未应用宽度: {line:?}");
+        }
+        // 无宽度（默认）时按终端宽度/100 解析，不应 panic
+        let mut default_state = MarkdownStreamState::default();
+        assert!(default_state.push(&renderer, &md).is_some());
     }
