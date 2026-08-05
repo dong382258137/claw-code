@@ -1,7 +1,14 @@
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // 声明 build script 输入(rerun-if-changed)。必须在其它指令之前输出且
+    // 集合保持稳定:Cargo 一旦收到 rerun-if-changed 就认为 build script 的
+    // 输入只有这些路径,集合遗漏任何影响输出的输入都会导致对应输出停留在
+    // 旧构建(见 emit_rerun_if_changed 的修复背景)。
+    emit_rerun_if_changed();
+
     // Get git SHA (short hash)
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -51,16 +58,6 @@ fn main() {
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
-    // 修复:原本使用 `cargo:rerun-if-changed=.git/HEAD` 和 `.git/refs`,
-    // 但这两个路径相对于包目录(`crates/rusty-claude-cli`),而 git 仓库根
-    // 在更上层目录(`d:\claw-code-src\.git`),包目录下根本不存在 `.git/`,
-    // Cargo 认为"这些文件从未变化" → 永远复用缓存的 build script output
-    // → GIT_SHA 一直是首次构建时的值。
-    //
-    // 修复方案:不输出 rerun-if-changed,让 Cargo 在每次构建时都重新运行
-    // build.rs(默认行为)。代价是每次构建多花几十毫秒执行 `git rev-parse`,
-    // 但确保 GIT_SHA 始终与当前 HEAD 一致。
-
     // 部署 builtin skills 到 target/<profile>/skills/
     //
     // 背景:claw 二进制通过 `discover_skill_roots` 搜索 skill,其中一条路径
@@ -75,43 +72,141 @@ fn main() {
     deploy_builtin_skills();
 }
 
+/// 声明 build script 的输入路径,使 git HEAD/分支变化与 skills 源变化都能
+/// 触发 build.rs 重跑,从而 GIT_SHA 与 skills 部署始终与最新状态一致。
+///
+/// 修复背景:此前不输出 rerun-if-changed,依赖 Cargo"无指令则每次重跑"的
+/// 默认行为——该假设仅对 clean build 成立;增量构建 / `cargo install` 复用
+/// fingerprint 时(git commit 不改变源码 mtime)build.rs 不会重跑,GIT_SHA
+/// 停留在首次构建时的值(曾导致部署的二进制标注旧 SHA)。改为显式声明输入:
+///
+///   - <gitdir>/HEAD         :detached HEAD 时内容即 SHA,commit 更新其 mtime;
+///   - <commondir>/refs/     :loose ref(如 refs/heads/main)每次 commit 更新
+///                             mtime,Cargo 对目录递归跟踪;不硬编码分支名,
+///                             以免分支切换/改名导致集合失效;
+///   - <commondir>/packed-refs :分支被打包(gc/浅克隆)时 commit 更新该文件;
+///                             文件不存在时按 Cargo 语义视为"始终变化"→ 每次
+///                             重跑,是安全的兜底(代价仅几十毫秒);
+///   - <skills>/             :源 skill 变化时重新部署到 target/<profile>/skills。
+///
+/// 找不到 git 目录(crates.io 打包源码)时不输出 git 相关指令,Cargo 回退到
+/// 每次重跑,行为等同修复前,安全。
+fn emit_rerun_if_changed() {
+    if let Some(git_dir) = find_git_dir() {
+        let common_dir = find_common_dir(&git_dir);
+        println!("cargo::rerun-if-changed={}", git_dir.join("HEAD").display());
+        println!(
+            "cargo::rerun-if-changed={}",
+            common_dir.join("refs").display()
+        );
+        println!(
+            "cargo::rerun-if-changed={}",
+            common_dir.join("packed-refs").display()
+        );
+    }
+    let skills_dir = skills_source_dir();
+    if skills_dir.exists() {
+        println!("cargo::rerun-if-changed={}", skills_dir.display());
+    }
+}
+
+/// 从 CARGO_MANIFEST_DIR 向上定位 git 仓库根的 .git 条目。
+/// 普通仓库是目录;worktree/submodule 是文件,内容为 `gitdir: <path>`。
+/// 只接受含 HEAD 文件的有效 gitdir:残留的空 `.git` 目录(误操作 git init
+/// 遗留,如 crates/rusty-claude-cli/.git)会被跳过,继续向上找真正的仓库根。
+fn find_git_dir() -> Option<PathBuf> {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
+    let mut dir = PathBuf::from(manifest_dir);
+    loop {
+        let git_entry = dir.join(".git");
+        if let Some(gitdir) = resolve_git_entry(&git_entry, &dir) {
+            return Some(gitdir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// 解析单个 .git 条目为有效 gitdir(含 HEAD 文件):
+/// - 目录形态:须含 HEAD(空残留 .git 目录视为无效,返回 None);
+/// - 文件形态(worktree/submodule):内容 `gitdir: <path>`,目标须含 HEAD。
+fn resolve_git_entry(git_entry: &Path, parent: &Path) -> Option<PathBuf> {
+    if git_entry.is_dir() {
+        return git_entry
+            .join("HEAD")
+            .is_file()
+            .then_some(git_entry.to_path_buf());
+    }
+    if git_entry.is_file() {
+        let content = std::fs::read_to_string(git_entry).ok()?;
+        let line = content
+            .lines()
+            .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))?;
+        let p = PathBuf::from(line);
+        let gitdir = if p.is_absolute() { p } else { parent.join(p) };
+        return gitdir.join("HEAD").is_file().then_some(gitdir);
+    }
+    None
+}
+
+/// worktree 场景:gitdir 下 commondir 文件指向公共 gitdir(refs/ 的权威位置);
+/// 普通仓库无 commondir,gitdir 即公共 gitdir。
+fn find_common_dir(git_dir: &Path) -> PathBuf {
+    let commondir = git_dir.join("commondir");
+    if let Ok(content) = std::fs::read_to_string(&commondir) {
+        let line = content.trim();
+        if !line.is_empty() {
+            let p = PathBuf::from(line);
+            return if p.is_absolute() { p } else { git_dir.join(p) };
+        }
+    }
+    git_dir.to_path_buf()
+}
+
+/// rust/skills/ 源目录(与 deploy_builtin_skills 的部署源一致)。
+fn skills_source_dir() -> PathBuf {
+    let manifest_dir =
+        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set by Cargo");
+    PathBuf::from(manifest_dir)
+        .join("..")
+        .join("..")
+        .join("skills")
+}
+
 fn deploy_builtin_skills() {
-    // 源:CARGO_MANIFEST_DIR/../../skills = rust/skills/
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR is always set by Cargo");
-    let src_skills = std::path::Path::new(&manifest_dir)
-        .join("..")
-        .join("..")
-        .join("skills");
+    let src_skills = skills_source_dir();
 
     if !src_skills.exists() {
-        println!("cargo:warning=builtin skills source not found: {}, skipping deploy", src_skills.display());
+        println!(
+            "cargo:warning=builtin skills source not found: {}, skipping deploy",
+            src_skills.display()
+        );
         return;
     }
 
     // 目标:从 OUT_DIR 推算 target/<profile>/
     // OUT_DIR = target/<profile>/build/<pkg-hash>/out
     // 向上 4 层 = target/<profile>/
-    let out_dir = env::var("OUT_DIR")
-        .expect("OUT_DIR is always set by Cargo during build script execution");
+    let out_dir =
+        env::var("OUT_DIR").expect("OUT_DIR is always set by Cargo during build script execution");
     let target_profile_dir = std::path::Path::new(&out_dir)
         .ancestors()
         .nth(3)
         .expect("OUT_DIR should have at least 4 ancestors (target/<profile>/build/<pkg-hash>/out)");
     let dst_skills = target_profile_dir.join("skills");
-    // 注意:这里**不能**输出 rerun-if-changed。
-    // 一旦输出任何 rerun-if-changed,Cargo 就认为 build.rs 的输入只有这些
-    // 路径,只要它们不变就复用缓存的 build script 输出 → 上面注入的
-    // GIT_SHA(rustc-env)停留在首次构建时的值,新提交构建出的二进制
-    // 会显示旧 SHA(曾导致部署的二进制标注 be4b6789 而非实际 HEAD)。
-    // 不输出 rerun-if-changed = 每次构建都重跑 build.rs(默认行为),
-    // 与上方 GIT_SHA 修复的意图一致:代价是每次构建多花几十毫秒。
+    // skills 源目录的变化已通过 emit_rerun_if_changed() 中的
+    // `rerun-if-changed=<skills>/` 声明触发 build.rs 重跑,这里不再重复输出。
 
     // 删除旧目标(可能是旧版本 skill),然后重新复制。
     // 用 std::fs::remove_dir_all + create_dir_all 而非 cp -r,跨平台。
     if dst_skills.exists() {
         if let Err(e) = std::fs::remove_dir_all(&dst_skills) {
-            println!("cargo:warning=failed to remove old skills dir {}: {}", dst_skills.display(), e);
+            println!(
+                "cargo:warning=failed to remove old skills dir {}: {}",
+                dst_skills.display(),
+                e
+            );
             return;
         }
     }
@@ -120,7 +215,10 @@ fn deploy_builtin_skills() {
         return;
     }
 
-    println!("cargo:warning=deployed builtin skills to {}", dst_skills.display());
+    println!(
+        "cargo:warning=deployed builtin skills to {}",
+        dst_skills.display()
+    );
 }
 
 /// 递归复制目录(跨平台,等价于 cp -r)。
