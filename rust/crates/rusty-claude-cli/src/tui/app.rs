@@ -880,6 +880,18 @@ fn run_event_loop(
         // 消除"空帧重绘"导致的闪烁。
         {
             let streaming = turn_rx.is_some();
+            // 关键修复：bash 工具执行期间 API stream 已结束（guard.streaming=false），
+            // 但 turn 仍在运行（turn_rx.is_some()=true）。原实现依赖 guard.streaming
+            // 更新 turn_elapsed_ms，导致 bash 执行期间 elapsed 不变 → should_draw=false
+            // → TUI "卡住"（不渲染）。
+            // 修复：用 turn_rx.is_some()（而非 guard.streaming）作为更新条件，
+            // 确保整个 turn 期间计时器持续更新，每秒触发一次 draw。
+            if streaming {
+                if let Some(start) = turn_start {
+                    let mut guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.turn_elapsed_ms = start.elapsed().as_millis() as u64;
+                }
+            }
             let current_version = output_view.total_written();
             let (current_elapsed_s, current_streaming) = {
                 let guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2375,16 +2387,9 @@ fn run_event_loop(
             }
         }
 
-        // Refresh status: update turn_elapsed_ms if streaming
-        {
-            // Bug L9 修复：mutex 毒化时容错访问。
-            let mut guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.streaming {
-                if let Some(start) = turn_start {
-                    guard.turn_elapsed_ms = start.elapsed().as_millis() as u64;
-                }
-            }
-        }
+        // turn_elapsed_ms 已在 should_draw 判断前更新（用 turn_rx.is_some() 条件），
+        // 此处不再重复更新。原实现依赖 guard.streaming（API stream 状态），
+        // bash 执行期间 streaming=false 导致计时器停更 → TUI 卡住。
     }
 
     Ok(())
