@@ -1422,7 +1422,7 @@ mod tests {
   "stderr": "",
   "interrupted": false,
   "isImage": false,
-  "backgroundTaskId": null,
+  "backgroundPid": null,
   "backgroundedByUser": false,
   "assistantAutoBackgrounded": false,
   "dangerouslyDisableSandbox": false,

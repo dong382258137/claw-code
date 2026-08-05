@@ -627,11 +627,8 @@ pub(crate) fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> Stri
     use std::fmt::Write as _;
 
     let mut lines = vec![format!("{icon} \x1b[38;5;245mbash\x1b[0m")];
-    if let Some(task_id) = parsed
-        .get("backgroundTaskId")
-        .and_then(|value| value.as_str())
-    {
-        write!(&mut lines[0], " backgrounded ({task_id})").expect("write to string");
+    if let Some(task_id) = parsed.get("backgroundPid").and_then(|value| value.as_str()) {
+        write!(&mut lines[0], " backgrounded pid={task_id}").expect("write to string");
     } else if let Some(status) = parsed
         .get("returnCodeInterpretation")
         .and_then(|value| value.as_str())

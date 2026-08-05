@@ -10791,7 +10791,7 @@ mod tests {
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
+        assert!(background_output["backgroundPid"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
     }
 
@@ -11522,7 +11522,7 @@ printf 'pwsh:%s' "$1"
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
+        assert!(background_output["backgroundPid"].as_str().is_some());
         assert_eq!(background_output["backgroundedByUser"], true);
         assert_eq!(background_output["assistantAutoBackgrounded"], false);
     }

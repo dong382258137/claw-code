@@ -74,7 +74,9 @@ pub struct BashCommandOutput {
     pub interrupted: bool,
     #[serde(rename = "isImage")]
     pub is_image: Option<bool>,
-    #[serde(rename = "backgroundTaskId")]
+    // 字段名为 backgroundPid(非 backgroundTaskId),明确语义是子进程 PID,
+    // 防止 AI 把 PID 误当 TaskRegistry 的 task_id 传给 TaskOutput 工具。
+    #[serde(rename = "backgroundPid")]
     pub background_task_id: Option<String>,
     #[serde(rename = "backgroundedByUser")]
     pub backgrounded_by_user: Option<bool>,
