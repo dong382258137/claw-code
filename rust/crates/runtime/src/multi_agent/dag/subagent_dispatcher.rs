@@ -8,10 +8,9 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use crate::conversation::ApiClient;
+use crate::session::ContentBlock;
 
-use crate::conversation::{ApiClient, ApiRequest, RequestKind};
-use crate::prompt::SystemPromptSplit;
-use crate::session::{ContentBlock, ConversationMessage, MessageRole};
 
 /// 共享状态的子 agent 调度器。
 ///
@@ -64,42 +63,14 @@ impl SubagentDispatcher {
         let gated = crate::knowledge_freshness::gate_task(task, 0).await;
         let enhanced_task = gated.enhance_task(task);
 
-        // 构造请求(与 run_subagent_turn 完全一致)
-        let subagent_system_prompt = SystemPromptSplit::from_sections(vec![format!(
-            "# Subagent: {name} ({subagent_id})\n\
-             \n\
-             你是一个子智能体,由主智能体派发执行独立任务。\n\
-             \n\
-             ## 任务\n\
-             {enhanced_task}\n\
-             \n\
-             ## 约束\n\
-             - 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
-             - 你的响应将被写入文件,主智能体会后续读取\n\
-             - 请提供完整、自包含的分析结果\n\
-             - 不需要调用工具,直接给出你的分析和结论\n\
-             \n\
-             ## 输出格式\n\
-             请直接输出你的分析结果,使用 Markdown 格式。包含:\n\
-             1. 任务理解(简要复述)\n\
-             2. 分析过程\n\
-             3. 关键发现\n\
-             4. 结论和建议"
-        )]);
-
-        let user_message = ConversationMessage {
-            role: MessageRole::User,
-            blocks: vec![ContentBlock::Text {
-                text: format!("请执行以下任务:\n\n{enhanced_task}"),
-            }],
-            usage: None,
-        };
-
-        let request = ApiRequest {
-            system_prompt: subagent_system_prompt,
-            messages: vec![user_message],
-            request_kind: RequestKind::Subagent,
-        };
+        // 3a:与 execute_subagent_llm 共享同一公共构造(DRY)。
+        // DAG 路径无 complexity 概念,与现状一致走 Simple(无 SOP)。
+        let request = crate::conversation::build_subagent_request(
+            subagent_id,
+            name,
+            &enhanced_task,
+            crate::multi_agent::TaskComplexity::Simple,
+        );
 
         // ⚠ 不能用 `tokio::task::spawn_blocking`:它仍然在当前 tokio runtime
         // context 中执行闭包,而 `client.stream()` 内部会调用
