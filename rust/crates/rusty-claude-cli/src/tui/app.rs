@@ -321,6 +321,14 @@ fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Li
     if total_width <= area_width {
         return vec![line.clone()];
     }
+    // 表格行保护：render.rs 渲染的表格行以 │ 开头，宽度已按内容区收缩；
+    // 若因 resize 宽度不匹配而超宽，直接原样返回（Paragraph 右缘裁剪），
+    // 避免在单元格中间折行造成边框错位。
+    if let Some(first) = graphemes.first() {
+        if first.symbol == "│" {
+            return vec![line.clone()];
+        }
+    }
 
     let mut result: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
@@ -356,35 +364,97 @@ fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Li
             current_width = 0;
         };
     }
-
-    for g in &graphemes {
-        let gw = unicode_width::UnicodeWidthStr::width(g.symbol);
-        if gw == 0 {
-            // 零宽字符：追加到当前 span（不触发换行）
-            if has_span && current_span_style == g.style {
-                current_span_str.push_str(g.symbol);
+    // 追加一个 grapheme 到当前 span（style 相同合并，不同则新建）
+    macro_rules! append_grapheme {
+        ($g:expr) => {
+            if has_span && current_span_style == $g.style {
+                current_span_str.push_str($g.symbol);
             } else {
                 flush_span!();
-                current_span_str = g.symbol.to_string();
-                current_span_style = g.style;
+                current_span_str = $g.symbol.to_string();
+                current_span_style = $g.style;
                 has_span = true;
             }
+        };
+    }
+
+    // 词边界 token 化：word(非空白) / ws(空白) 交替
+    struct WToken<'a> {
+        graphemes: Vec<&'a StyledGrapheme<'a>>,
+        is_ws: bool,
+    }
+    let mut tokens: Vec<WToken> = Vec::new();
+    for g in &graphemes {
+        let is_ws = g
+            .symbol
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace);
+        if let Some(last) = tokens.last_mut() {
+            if last.is_ws == is_ws {
+                last.graphemes.push(g);
+                continue;
+            }
+        }
+        tokens.push(WToken {
+            graphemes: vec![g],
+            is_ws,
+        });
+    }
+
+    let mut pending_ws: Vec<&StyledGrapheme> = Vec::new();
+
+    for token in &tokens {
+        if token.is_ws {
+            pending_ws.extend(token.graphemes.iter().copied());
             continue;
         }
-        // 超过 area_width 且当前行非空：换行
-        if current_width + gw > area_width && current_width > 0 {
+        let word_width: usize = token
+            .graphemes
+            .iter()
+            .map(|g| unicode_width::UnicodeWidthStr::width(g.symbol))
+            .sum();
+        let ws_width: usize = pending_ws
+            .iter()
+            .map(|g| unicode_width::UnicodeWidthStr::width(g.symbol))
+            .sum();
+        if current_width + ws_width + word_width <= area_width {
+            // 整词放得下：先输出暂存空白，再输出词
+            for g in &pending_ws {
+                append_grapheme!(g);
+                current_width += unicode_width::UnicodeWidthStr::width(g.symbol);
+            }
+            pending_ws.clear();
+            for g in &token.graphemes {
+                append_grapheme!(g);
+                current_width += unicode_width::UnicodeWidthStr::width(g.symbol);
+            }
+        } else if word_width <= area_width {
+            // 词单独放得下：换行后输出（丢弃行尾暂存空白）
             flush_line!();
-        }
-        // 追加 grapheme 到当前 span（style 相同则合并，不同则新建 span）
-        if has_span && current_span_style == g.style {
-            current_span_str.push_str(g.symbol);
+            pending_ws.clear();
+            for g in &token.graphemes {
+                append_grapheme!(g);
+                current_width += unicode_width::UnicodeWidthStr::width(g.symbol);
+            }
         } else {
-            flush_span!();
-            current_span_str = g.symbol.to_string();
-            current_span_style = g.style;
-            has_span = true;
+            // 词本身超宽：硬拆（不拆转义/样式，按 grapheme 边界）
+            flush_line!();
+            pending_ws.clear();
+            for g in &token.graphemes {
+                let gw = unicode_width::UnicodeWidthStr::width(g.symbol);
+                if gw == 0 {
+                    // 零宽字符：追加到当前 span（不触发换行）
+                    append_grapheme!(g);
+                    continue;
+                }
+                if current_width + gw > area_width && current_width > 0 {
+                    flush_line!();
+                }
+                append_grapheme!(g);
+                current_width += gw;
+            }
         }
-        current_width += gw;
     }
     // flush 最后一行
     flush_line!();
@@ -3789,3 +3859,50 @@ mod tests {
         );
     }
 }
+
+    #[test]
+    fn wrap_words_not_broken_midword() {
+        let line = Line::raw("foo bar baz qux");
+        let wrapped = wrap_line_to_display_lines(&line, 7);
+        let texts: Vec<String> = wrapped.iter().map(|l| l.to_string()).collect();
+        assert_eq!(texts, vec!["foo bar", "baz qux"], "单词不应被拆断");
+    }
+
+    #[test]
+    fn wrap_splits_overwide_words() {
+        let line = Line::raw("ABCDEFGHIJKL");
+        let wrapped = wrap_line_to_display_lines(&line, 5);
+        let texts: Vec<String> = wrapped.iter().map(|l| l.to_string()).collect();
+        assert_eq!(texts, vec!["ABCDE", "FGHIJ", "KL"], "超宽无空格 token 应硬拆");
+    }
+
+    #[test]
+    fn wrap_leaves_table_rows_unwrapped() {
+        let row = "│ aaa │ bbbbbbbbbbbbbbbbbbbb │";
+        let line = Line::raw(row);
+        let wrapped = wrap_line_to_display_lines(&line, 10);
+        assert_eq!(wrapped.len(), 1, "表格行不应折行");
+        assert_eq!(wrapped[0].to_string(), row, "表格行应原样保留");
+    }
+
+    #[test]
+    fn wrap_preserves_span_styles_across_lines() {
+        let line = Line::from(vec![
+            Span::styled("bold", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(" text", Style::default()),
+            Span::styled("here", Style::default().fg(Color::Red)),
+        ]);
+        let wrapped = wrap_line_to_display_lines(&line, 9);
+        assert_eq!(wrapped.len(), 2, "bold + texthere 应在 9 列下折成 2 行");
+        assert!(
+            wrapped[0]
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "第一行应保留 bold 样式"
+        );
+        assert!(
+            wrapped[1].spans.iter().any(|s| s.style.fg == Some(Color::Red)),
+            "第二行应保留红色样式"
+        );
+    }
