@@ -159,6 +159,94 @@ pub(crate) fn render_tool_result(
     }
 }
 
+/// 从工具结果 JSON 信封中提取面向用户的真实内容。
+///
+/// 背景（P0 修复 2026-08-04）：所有工具结果经 `serde_json::to_string_pretty`
+/// 序列化为 pretty JSON 信封（bash 17 字段 + sandboxStatus，3 行 stdout 会膨胀
+/// 成 38 行 JSON）。折叠判定与渲染此前直接统计/展示信封，导致"输出内容被当成
+/// 工具输出折叠"。本函数按工具结构提取真实内容；未知工具/非 JSON 回退原始输出。
+///
+/// 字段路径与 `src/tool_display.rs` 的 format_*_result 保持一致（同一份 schema）。
+fn extract_tool_output_body(name: &str, output: &str) -> String {
+    use serde_json::Value;
+    match name {
+        // bash：stdout 是主体；stderr 非空时追加（错误常在 stderr）
+        "bash" | "Bash" => match serde_json::from_str::<Value>(output) {
+            Ok(v) => {
+                let stdout = v.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
+                let stderr = v.get("stderr").and_then(|s| s.as_str()).unwrap_or("");
+                if stderr.is_empty() {
+                    stdout.to_string()
+                } else {
+                    format!("{stdout}\n[stderr]\n{stderr}")
+                }
+            }
+            Err(_) => output.to_string(),
+        },
+        // read_file：内容是答案
+        "read_file" | "Read" => match serde_json::from_str::<Value>(output) {
+            Ok(v) => v
+                .get("file")
+                .and_then(|f| f.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string(),
+            Err(_) => output.to_string(),
+        },
+        // grep_search：content 是预格式化匹配文本
+        "grep_search" | "Grep" => match serde_json::from_str::<Value>(output) {
+            Ok(v) => v
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string(),
+            Err(_) => output.to_string(),
+        },
+        // glob_search：文件名列表（分类器给 P3，这里提取以备不时之需）
+        "glob_search" | "Glob" => match serde_json::from_str::<Value>(output) {
+            Ok(v) => v
+                .get("filenames")
+                .and_then(|f| f.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+            Err(_) => output.to_string(),
+        },
+        // WebFetch：result 是正文
+        "WebFetch" => match serde_json::from_str::<Value>(output) {
+            Ok(v) => v
+                .get("result")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string(),
+            Err(_) => output.to_string(),
+        },
+        // write/edit：纯确认 JSON → 空；若尾部带 cargo check 输出（JSON 解析
+        // 失败），提取 cargo check 文本——编译错误是信号，不能折叠掉。
+        "write_file" | "Write" | "edit_file" | "Edit" => {
+            match serde_json::from_str::<Value>(output) {
+                Ok(_) => String::new(),
+                Err(_) => output
+                    .split_once("--- cargo check ---")
+                    .map(|(_, tail)| tail.trim_start().to_string())
+                    .unwrap_or_default(),
+            }
+        }
+        // WebSearch/未知工具：结构异构，回退原始输出
+        _ => output.to_string(),
+    }
+}
+
+/// 公开接口：供 `output_view.rs` 的 compute_priority 调用（沿用 P1 重构的
+pub(crate) fn extract_tool_output_body_public(name: &str, output: &str) -> String {
+    extract_tool_output_body(name, output)
+}
+
+/// Detect the syntax highlighting language for a tool's output.
 /// Detect the syntax highlighting language for a tool's output.
 /// Returns None if no highlighting should be applied.
 fn detect_language_for_tool(tool_name: &str, output: &str) -> Option<String> {
@@ -645,11 +733,87 @@ mod tests {
         assert!(timeline.contains("edit_file → ✗"));
         assert!(timeline.contains("3 个工具"));
     }
-
     #[test]
     fn render_timeline_empty_history() {
         let history: Vec<(String, bool)> = vec![];
         let timeline = render_tool_timeline(&history);
         assert!(timeline.is_empty());
+    }
+
+    // ---------- 提取层测试（P0 修复 2026-08-04） ----------
+
+    /// 提取：bash pretty JSON 信封 → stdout（stderr 为空时不追加）
+    #[test]
+    fn extract_tool_output_body_bash_extracts_stdout() {
+        let output = r#"{
+  "stdout": "hello\nworld",
+  "stderr": "",
+  "returnCodeInterpretation": "exit_code:0",
+  "sandboxStatus": {}
+}"#;
+        let body = extract_tool_output_body("bash", output);
+        assert_eq!(body, "hello\nworld");
+    }
+
+    /// 提取：bash stderr 非空时追加（错误常在 stderr，不能丢）
+    #[test]
+    fn extract_tool_output_body_bash_appends_stderr() {
+        let output = r#"{
+  "stdout": "partial output",
+  "stderr": "boom\nproblem",
+  "returnCodeInterpretation": "exit_code:1"
+}"#;
+        let body = extract_tool_output_body("bash", output);
+        assert_eq!(body, "partial output\n[stderr]\nboom\nproblem");
+    }
+
+    /// 提取：read_file → file.content
+    #[test]
+    fn extract_tool_output_body_read_file_extracts_content() {
+        let output = r#"{
+  "type": "file",
+  "file": {
+    "filePath": "src/main.rs",
+    "content": "fn main() {}\n",
+    "numLines": 1,
+    "startLine": 1,
+    "totalLines": 1
+  }
+}"#;
+        let body = extract_tool_output_body("read_file", output);
+        assert_eq!(body, "fn main() {}\n");
+    }
+
+    /// 提取：write_file 带 cargo check 尾部 → 提取 cargo check 错误，剔除确认 JSON
+    #[test]
+    fn extract_tool_output_body_write_file_with_cargo_check() {
+        let output = format!(
+            "{}\n\n--- cargo check ---\nerror[E0308]: mismatched types\n --> src/main.rs:2:23",
+            r#"{
+  "type": "write",
+  "filePath": "src/main.rs",
+  "content": "fn main() {}",
+  "structuredPatch": [],
+  "originalFile": null,
+  "gitDiff": null
+}"#
+        );
+        let body = extract_tool_output_body("write_file", &output);
+        assert!(body.contains("error[E0308]"), "应提取 cargo check 错误: {body}");
+        assert!(!body.contains("filePath"), "不应包含确认 JSON: {body}");
+    }
+
+    /// 提取：非 JSON 结果回退原始输出（不崩溃）
+    #[test]
+    fn extract_tool_output_body_non_json_falls_back() {
+        let body = extract_tool_output_body("bash", "plain text output");
+        assert_eq!(body, "plain text output");
+    }
+
+    /// 提取：未知工具回退原始输出
+    #[test]
+    fn extract_tool_output_body_unknown_tool_falls_back() {
+        let body = extract_tool_output_body("WebSearch", r#"{"query":"x"}"#);
+        assert_eq!(body, r#"{"query":"x"}"#);
     }
 }
