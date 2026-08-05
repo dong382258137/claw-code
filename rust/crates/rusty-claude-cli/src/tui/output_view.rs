@@ -151,8 +151,7 @@ pub(crate) fn compute_priority(
                 Priority::P3 // 纯确认 → 单行摘要
             }
         }
-        "glob_search" | "Glob" | "Skill" | "TodoWrite" | "ToolSearch"
-        | "benchmark_compare" => {
+        "glob_search" | "Glob" | "Skill" | "TodoWrite" | "ToolSearch" | "benchmark_compare" => {
             Priority::P3 // 过程噪音/确认：单行摘要
         }
         "WebFetch" => {
@@ -1455,7 +1454,10 @@ mod tests {
             "{{\n  \"stdout\": \"{}\",\n  \"returnCodeInterpretation\": \"exit_code:0\"\n}}",
             stdout.replace('\n', "\\n")
         );
-        assert_eq!(compute_priority("bash", input, &result, false), Priority::P1);
+        assert_eq!(
+            compute_priority("bash", input, &result, false),
+            Priority::P1
+        );
     }
 
     /// read_file 20 行内容（信封 10 行）→ P1 展开（内容是答案，门槛放宽到 40）
@@ -1469,7 +1471,10 @@ mod tests {
         let result = format!(
             "{{\n  \"type\": \"file\",\n  \"file\": {{\n    \"filePath\": \"src/main.rs\",\n    \"content\": \"{content}\",\n    \"numLines\": 20,\n    \"startLine\": 1,\n    \"totalLines\": 20\n  }}\n}}"
         );
-        assert_eq!(compute_priority("read_file", input, &result, false), Priority::P1);
+        assert_eq!(
+            compute_priority("read_file", input, &result, false),
+            Priority::P1
+        );
     }
 
     /// write_file 纯确认 → P3 单行摘要（过程噪音折叠）
@@ -1484,7 +1489,10 @@ mod tests {
   "originalFile": null,
   "gitDiff": null
 }"#;
-        assert_eq!(compute_priority("write_file", input, result, false), Priority::P3);
+        assert_eq!(
+            compute_priority("write_file", input, result, false),
+            Priority::P3
+        );
     }
 
     /// write_file 带 cargo check 编译错误 → P0（错误是信号）
@@ -1502,7 +1510,10 @@ mod tests {
   "gitDiff": null
 }"#
         );
-        assert_eq!(compute_priority("write_file", input, &result, false), Priority::P0);
+        assert_eq!(
+            compute_priority("write_file", input, &result, false),
+            Priority::P0
+        );
     }
 
     /// trim 保护 error entry：error/P0 ToolCard 的 result 不被 trim 淘汰（方案 §3.4）。

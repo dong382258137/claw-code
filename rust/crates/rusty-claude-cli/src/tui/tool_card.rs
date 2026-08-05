@@ -164,7 +164,10 @@ pub(crate) fn render_tool_result(
         let total = lines.len();
         if total > MAX_EXPANDED_LINES {
             let (shown, hidden) = if priority == Priority::P0 {
-                (&lines[total - MAX_EXPANDED_LINES..], total - MAX_EXPANDED_LINES)
+                (
+                    &lines[total - MAX_EXPANDED_LINES..],
+                    total - MAX_EXPANDED_LINES,
+                )
             } else {
                 (&lines[..MAX_EXPANDED_LINES], total - MAX_EXPANDED_LINES)
             };
@@ -819,7 +822,10 @@ mod tests {
 }"#
         );
         let body = extract_tool_output_body("write_file", &output);
-        assert!(body.contains("error[E0308]"), "应提取 cargo check 错误: {body}");
+        assert!(
+            body.contains("error[E0308]"),
+            "应提取 cargo check 错误: {body}"
+        );
         assert!(!body.contains("filePath"), "不应包含确认 JSON: {body}");
     }
 
@@ -849,7 +855,10 @@ mod tests {
 }"#;
         let card = render_tool_result("bash", output, false, None, false, Priority::P1);
         assert!(card.contains("hello"), "应渲染 stdout 内容: {card}");
-        assert!(!card.contains("sandboxStatus"), "不应渲染 JSON 信封: {card}");
+        assert!(
+            !card.contains("sandboxStatus"),
+            "不应渲染 JSON 信封: {card}"
+        );
         assert!(!card.contains("\"stdout\""), "不应渲染 JSON 键: {card}");
     }
 
