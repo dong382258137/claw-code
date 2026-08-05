@@ -682,9 +682,7 @@ impl OutputBuffer {
             .enumerate()
             .filter_map(|(idx, e)| match e {
                 OutputEntry::ToolCard {
-                    is_error,
-                    priority,
-                    ..
+                    is_error, priority, ..
                 } if *is_error || *priority == Priority::P0 => Some(idx),
                 _ => None,
             })
@@ -1333,7 +1331,10 @@ mod tests {
     #[test]
     fn compute_priority_is_error() {
         let input = r#"{"path":"foo.rs"}"#;
-        assert_eq!(compute_priority("read_file", input, "err", true), Priority::P0);
+        assert_eq!(
+            compute_priority("read_file", input, "err", true),
+            Priority::P0
+        );
     }
 
     /// compute_priority：bash interrupted → P3（用户取消）
@@ -1373,7 +1374,10 @@ mod tests {
     fn compute_priority_long_output() {
         let input = r#"{"command":"cat big.txt"}"#;
         let result = "line\n".repeat(50);
-        assert_eq!(compute_priority("bash", input, &result, false), Priority::P2);
+        assert_eq!(
+            compute_priority("bash", input, &result, false),
+            Priority::P2
+        );
     }
 
     /// compute_priority：9 行输出 → P2（门槛边界,>8 即折叠）
@@ -1381,7 +1385,10 @@ mod tests {
     fn compute_priority_9_lines_collapses() {
         let input = r#"{"command":"ls"}"#;
         let result = "line\n".repeat(9);
-        assert_eq!(compute_priority("bash", input, &result, false), Priority::P2);
+        assert_eq!(
+            compute_priority("bash", input, &result, false),
+            Priority::P2
+        );
     }
 
     /// compute_priority：8 行输出 → P1（门槛边界,≤8 保持展开）
@@ -1389,7 +1396,10 @@ mod tests {
     fn compute_priority_8_lines_expands() {
         let input = r#"{"command":"ls"}"#;
         let result = "line\n".repeat(8);
-        assert_eq!(compute_priority("bash", input, &result, false), Priority::P1);
+        assert_eq!(
+            compute_priority("bash", input, &result, false),
+            Priority::P1
+        );
     }
 
     /// compute_priority：normal emphasis → P1
@@ -1547,7 +1557,10 @@ mod tests {
         // 验证 error entry 的 result 未被裁剪
         if let OutputEntry::ToolCard { result, .. } = &buf.entries[0] {
             let r = result.as_ref().expect("error result should exist");
-            assert!(!r.starts_with("[trimmed:"), "error entry must not be trimmed");
+            assert!(
+                !r.starts_with("[trimmed:"),
+                "error entry must not be trimmed"
+            );
             assert_eq!(r.len(), 100 * 1024, "error entry result must be intact");
         } else {
             panic!("entries[0] should be the error ToolCard");

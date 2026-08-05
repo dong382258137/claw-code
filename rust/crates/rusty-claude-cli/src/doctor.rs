@@ -352,7 +352,8 @@ fn run_doctor_cache_stats(
             aggregated_breaks.system_prompt_changed += stats.break_reasons.system_prompt_changed;
             aggregated_breaks.tool_definitions_changed +=
                 stats.break_reasons.tool_definitions_changed;
-            aggregated_breaks.message_payload_changed += stats.break_reasons.message_payload_changed;
+            aggregated_breaks.message_payload_changed +=
+                stats.break_reasons.message_payload_changed;
             aggregated_breaks.ttl_expiry += stats.break_reasons.ttl_expiry;
             aggregated_breaks.unknown += stats.break_reasons.unknown;
             aggregated_creation_tokens += stats.total_cache_creation_input_tokens;
@@ -917,40 +918,40 @@ pub(crate) fn check_sandbox_health(status: &runtime::SandboxStatus) -> Diagnosti
     };
 
     DiagnosticCheck::new("Sandbox", level, message)
-    .with_details(details)
-    .with_data(Map::from_iter([
-        ("enabled".to_string(), json!(status.enabled)),
-        ("active".to_string(), json!(status.active)),
-        ("supported".to_string(), json!(status.supported)),
-        (
-            "namespace_supported".to_string(),
-            json!(status.namespace_supported),
-        ),
-        (
-            "namespace_active".to_string(),
-            json!(status.namespace_active),
-        ),
-        (
-            "network_supported".to_string(),
-            json!(status.network_supported),
-        ),
-        ("network_active".to_string(), json!(status.network_active)),
-        (
-            "filesystem_mode".to_string(),
-            json!(status.filesystem_mode.as_str()),
-        ),
-        (
-            "filesystem_active".to_string(),
-            json!(status.filesystem_active),
-        ),
-        ("allowed_mounts".to_string(), json!(status.allowed_mounts)),
-        ("in_container".to_string(), json!(status.in_container)),
-        (
-            "container_markers".to_string(),
-            json!(status.container_markers),
-        ),
-        ("fallback_reason".to_string(), json!(status.fallback_reason)),
-    ]))
+        .with_details(details)
+        .with_data(Map::from_iter([
+            ("enabled".to_string(), json!(status.enabled)),
+            ("active".to_string(), json!(status.active)),
+            ("supported".to_string(), json!(status.supported)),
+            (
+                "namespace_supported".to_string(),
+                json!(status.namespace_supported),
+            ),
+            (
+                "namespace_active".to_string(),
+                json!(status.namespace_active),
+            ),
+            (
+                "network_supported".to_string(),
+                json!(status.network_supported),
+            ),
+            ("network_active".to_string(), json!(status.network_active)),
+            (
+                "filesystem_mode".to_string(),
+                json!(status.filesystem_mode.as_str()),
+            ),
+            (
+                "filesystem_active".to_string(),
+                json!(status.filesystem_active),
+            ),
+            ("allowed_mounts".to_string(), json!(status.allowed_mounts)),
+            ("in_container".to_string(), json!(status.in_container)),
+            (
+                "container_markers".to_string(),
+                json!(status.container_markers),
+            ),
+            ("fallback_reason".to_string(), json!(status.fallback_reason)),
+        ]))
 }
 
 pub(crate) fn check_system_health(

@@ -404,11 +404,12 @@ impl runtime::knowledge_freshness::ResearchClient for WebResearchClient {
         // 解决方案:把搜索和摘要分两步,搜索在 spawn_blocking,摘要在当前
         // async 上下文用 LlmBridge::call(它内部自己处理 runtime 检测)。
         let query_for_search = query.clone();
-        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<tools::ResearchHit>, String> {
-            tools::research_topic(&query_for_search, max_results)
-        })
-        .await
-        .map_err(|e| format!("research spawn_blocking panicked: {e:?}"))??;
+        let hits =
+            tokio::task::spawn_blocking(move || -> Result<Vec<tools::ResearchHit>, String> {
+                tools::research_topic(&query_for_search, max_results)
+            })
+            .await
+            .map_err(|e| format!("research spawn_blocking panicked: {e:?}"))??;
 
         if hits.is_empty() {
             return Ok(format!("(搜索「{query}」无结果)"));
@@ -493,18 +494,23 @@ impl DeepSeekFreshnessAssessor {
     }
 
     /// 解析 LLM 返回的 JSON,提取 freshness 枚举。
-    fn parse_assess_response(response: &str) -> Result<(runtime::knowledge_freshness::KnowledgeFreshness, String), String> {
+    fn parse_assess_response(
+        response: &str,
+    ) -> Result<(runtime::knowledge_freshness::KnowledgeFreshness, String), String> {
         // LLM 可能返回带 ```json 包裹的 JSON,提取首个 { 到末尾
         let trimmed = response.trim();
         let json_str = if let Some(start) = trimmed.find('{') {
-            let end = trimmed.rfind('}').ok_or("missing closing } in assessor response")?;
+            let end = trimmed
+                .rfind('}')
+                .ok_or("missing closing } in assessor response")?;
             &trimmed[start..=end]
         } else {
             trimmed
         };
 
-        let parsed: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| format!("assessor response is not valid JSON: {e} (response: {response})"))?;
+        let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+            format!("assessor response is not valid JSON: {e} (response: {response})")
+        })?;
 
         let freshness_str = parsed
             .get("freshness")
@@ -530,7 +536,10 @@ impl DeepSeekFreshnessAssessor {
 
 #[async_trait::async_trait]
 impl runtime::knowledge_freshness::FreshnessAssessor for DeepSeekFreshnessAssessor {
-    async fn assess(&self, task: &str) -> Result<(runtime::knowledge_freshness::KnowledgeFreshness, String), String> {
+    async fn assess(
+        &self,
+        task: &str,
+    ) -> Result<(runtime::knowledge_freshness::KnowledgeFreshness, String), String> {
         let prompt = Self::build_assess_prompt(task);
         // LlmBridge::call 内部有 runtime 检测,在 async 上下文中安全
         let response = self.bridge.call(&prompt)?;

@@ -485,11 +485,17 @@ mod tests {
 
         // Delete 行含红色 ANSI
         assert!(rendered.contains("\x1b[31m"), "missing red: {rendered}");
-        assert!(rendered.contains("line2"), "missing deleted line2: {rendered}");
+        assert!(
+            rendered.contains("line2"),
+            "missing deleted line2: {rendered}"
+        );
 
         // Insert 行含绿色 ANSI
         assert!(rendered.contains("\x1b[32m"), "missing green: {rendered}");
-        assert!(rendered.contains("modified"), "missing inserted modified: {rendered}");
+        assert!(
+            rendered.contains("modified"),
+            "missing inserted modified: {rendered}"
+        );
 
         // Context 行无颜色,格式 `│   line1`
         assert!(

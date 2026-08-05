@@ -27,8 +27,7 @@ use api::{
 };
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
-    PermissionMode, PermissionPolicy, RequestKind, RuntimeError, SystemPromptSplit,
-    TokenUsage,
+    PermissionMode, PermissionPolicy, RequestKind, RuntimeError, SystemPromptSplit, TokenUsage,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
@@ -412,7 +411,8 @@ impl ApiClient for AnthropicRuntimeClient {
             // usage for no reliability gain (the stall is typically a transient
             // server/network issue that a retry of the identical request is
             // unlikely to fix). Let the caller handle the error.
-            self.consume_stream(request_kind, &message_request, is_post_tool).await
+            self.consume_stream(request_kind, &message_request, is_post_tool)
+                .await
         })
     }
 
@@ -480,7 +480,8 @@ impl ApiClient for AnthropicRuntimeClient {
             };
 
             // 直接 await,无 runtime.block_on
-            self.consume_stream(request_kind, &message_request, is_post_tool).await
+            self.consume_stream(request_kind, &message_request, is_post_tool)
+                .await
         })
     }
 

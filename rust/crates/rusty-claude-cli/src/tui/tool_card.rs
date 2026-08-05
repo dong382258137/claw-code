@@ -116,9 +116,7 @@ pub(crate) fn render_tool_result(
     // 只占 2 行,用户 Tab 展开看详情。
     // 参考 grok-build 设计:工具输出默认 Collapsed(1 行标题),AgentMessage 永不折叠。
     if effective_collapsed && line_count > COLLAPSE_THRESHOLD {
-        return format!(
-            "{diff_prefix}├─ {icon} {name} ({line_count} 行，折叠)\n└─\n"
-        );
+        return format!("{diff_prefix}├─ {icon} {name} ({line_count} 行，折叠)\n└─\n");
     }
 
     // Determine if this tool's output should be syntax-highlighted
@@ -472,7 +470,11 @@ pub(crate) fn summarize_tool_result(
             match rc {
                 Some("interrupted") => "⏹ · 已取消".to_string(),
                 Some(r) if r.starts_with("exit_code:") && r != "exit_code:0" => {
-                    format!("❌ · {r} · {}行 · {}", line_count, truncate_str(last_line, 60))
+                    format!(
+                        "❌ · {r} · {}行 · {}",
+                        line_count,
+                        truncate_str(last_line, 60)
+                    )
                 }
                 Some("idle.timeout") | Some("timeout") | Some("test.hung") => {
                     format!("⏱ · {rc:?} · {}行", line_count)
@@ -662,7 +664,8 @@ mod tests {
     #[test]
     fn summarize_tool_result_bash_ok_last_line() {
         let input = r#"{"command":"ls"}"#;
-        let result = r#"{"stdout":"file1\nfile2\nfinal.txt","returnCodeInterpretation":"exit_code:0"}"#;
+        let result =
+            r#"{"stdout":"file1\nfile2\nfinal.txt","returnCodeInterpretation":"exit_code:0"}"#;
         let s = summarize_tool_result("bash", input, result, false);
         assert!(s.contains("✅"), "应显示 ✅: {s}");
         assert!(s.contains("final.txt"), "应显示末行: {s}");

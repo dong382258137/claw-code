@@ -213,7 +213,7 @@ pub fn build_project_question(
 ///   ...
 ///   N) Don't ask me again
 ///
-/// Select [1-N]: 
+/// Select [1-N]:
 /// ```
 pub fn render_question_stdout(q: &ProjectQuestion) -> String {
     let mut out = String::new();
@@ -224,7 +224,10 @@ pub fn render_question_stdout(q: &ProjectQuestion) -> String {
         if opt.description.is_empty() {
             out.push_str(&format!("  {idx}) {}\n", opt.label));
         } else {
-            out.push_str(&format!("  {idx}) {:<26}  {}\n", opt.label, opt.description));
+            out.push_str(&format!(
+                "  {idx}) {:<26}  {}\n",
+                opt.label, opt.description
+            ));
         }
     }
     out.push_str("\nSelect [1-N]: ");
@@ -329,22 +332,34 @@ mod tests {
 
     #[test]
     fn format_relative_time_seconds() {
-        assert_eq!(format_relative_time(std::time::Duration::from_secs(30)), "30s ago");
+        assert_eq!(
+            format_relative_time(std::time::Duration::from_secs(30)),
+            "30s ago"
+        );
     }
 
     #[test]
     fn format_relative_time_minutes() {
-        assert_eq!(format_relative_time(std::time::Duration::from_secs(180)), "3m ago");
+        assert_eq!(
+            format_relative_time(std::time::Duration::from_secs(180)),
+            "3m ago"
+        );
     }
 
     #[test]
     fn format_relative_time_hours() {
-        assert_eq!(format_relative_time(std::time::Duration::from_secs(7200)), "2h ago");
+        assert_eq!(
+            format_relative_time(std::time::Duration::from_secs(7200)),
+            "2h ago"
+        );
     }
 
     #[test]
     fn format_relative_time_days() {
-        assert_eq!(format_relative_time(std::time::Duration::from_secs(86400 * 5)), "5d ago");
+        assert_eq!(
+            format_relative_time(std::time::Duration::from_secs(86400 * 5)),
+            "5d ago"
+        );
     }
 
     #[test]
@@ -396,7 +411,10 @@ mod tests {
         // 选 1 = cwd
         assert_eq!(parse_choice(&pq, "1"), Some(Some(Path::new("/home/user"))));
         // 选 2 = alpha
-        assert_eq!(parse_choice(&pq, "2"), Some(Some(Path::new("/projects/alpha"))));
+        assert_eq!(
+            parse_choice(&pq, "2"),
+            Some(Some(Path::new("/projects/alpha")))
+        );
     }
 
     #[test]
