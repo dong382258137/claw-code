@@ -19,6 +19,10 @@ const COLLAPSED_PREVIEW_LINES: usize = 3;
 /// 会污染 InputLine。降级为纯文本可从根本上消除密集 ANSI 序列。
 const SYNTAX_HIGHLIGHT_MAX_LINES: usize = 50;
 
+/// 展开视图最大行数（P0 修复 2026-08-04：展开+截断，兼顾可见性与空间）。
+/// P1 截头部；P0（错误）截尾部——错误摘要/失败列表常在输出末尾。
+const MAX_EXPANDED_LINES: usize = 60;
+
 /// Render a tool call start card (header only, result pending).
 /// P1 修复：start 卡片只显示一行 header，不显示 diff 和 running 状态。
 /// 原因：start 卡片中的 `├─ ⏳ running...\n` 会在 result 到来后仍留在
@@ -88,8 +92,10 @@ pub(crate) fn render_tool_result(
     } else {
         String::new()
     };
-
-    let line_count = output.lines().count();
+    // P0 修复(2026-08-04):行数与正文基于提取后的真实内容,而非 pretty JSON 信封。
+    // 信封行数会导致"3 行 stdout 显示 38 行 JSON、恒被折叠"。
+    let body = extract_tool_output_body(name, output);
+    let line_count = body.lines().count();
 
     // P3：L1 单行摘要（不显示预览，只显示语义摘要）
     if priority == Priority::P3 && collapsed {
@@ -116,7 +122,7 @@ pub(crate) fn render_tool_result(
     }
 
     // Determine if this tool's output should be syntax-highlighted
-    let language = detect_language_for_tool(name, output);
+    let language = detect_language_for_tool(name, &body);
     // P1 修复:超长输出降级为纯文本,避免密集 ANSI 序列反射污染 InputLine。
     let highlight_enabled = line_count <= SYNTAX_HIGHLIGHT_MAX_LINES;
     let highlighted_body = |slice: &[&str]| -> String {
@@ -152,10 +158,24 @@ pub(crate) fn render_tool_result(
     } else if line_count == 0 {
         format!("{diff_prefix}├─ {icon} {name} (空)\n└─\n")
     } else {
-        // 完整视图:此处必须 collect 全量行用于渲染
-        let lines: Vec<&str> = output.lines().collect();
-        let body = highlighted_body(&lines);
-        format!("{diff_prefix}├─ {icon} {name} ({line_count} 行)\n{body}└─\n")
+        // 完整视图：基于提取后的真实内容；超 60 行截断（展开+截断）。
+        // P0(错误)截尾部——失败摘要常在末尾；其余截头部。
+        let lines: Vec<&str> = body.lines().collect();
+        let total = lines.len();
+        if total > MAX_EXPANDED_LINES {
+            let (shown, hidden) = if priority == Priority::P0 {
+                (&lines[total - MAX_EXPANDED_LINES..], total - MAX_EXPANDED_LINES)
+            } else {
+                (&lines[..MAX_EXPANDED_LINES], total - MAX_EXPANDED_LINES)
+            };
+            let body_str = highlighted_body(shown);
+            format!(
+                "{diff_prefix}├─ {icon} {name} ({total} 行，截断)\n{body_str}│ …（其余 {hidden} 行省略）\n└─\n"
+            )
+        } else {
+            let body_str = highlighted_body(&lines);
+            format!("{diff_prefix}├─ {icon} {name} ({total} 行)\n{body_str}└─\n")
+        }
     }
 }
 
@@ -815,5 +835,50 @@ mod tests {
     fn extract_tool_output_body_unknown_tool_falls_back() {
         let body = extract_tool_output_body("WebSearch", r#"{"query":"x"}"#);
         assert_eq!(body, r#"{"query":"x"}"#);
+    }
+
+    // ---------- 渲染接线测试（P0 修复 2026-08-04） ----------
+
+    /// 核心回归：展开卡片渲染真实 stdout，而非 JSON 信封（无 sandboxStatus/键名）
+    #[test]
+    fn render_tool_result_renders_body_not_json_envelope() {
+        let output = r#"{
+  "stdout": "hello",
+  "stderr": "",
+  "sandboxStatus": { "enabled": true }
+}"#;
+        let card = render_tool_result("bash", output, false, None, false, Priority::P1);
+        assert!(card.contains("hello"), "应渲染 stdout 内容: {card}");
+        assert!(!card.contains("sandboxStatus"), "不应渲染 JSON 信封: {card}");
+        assert!(!card.contains("\"stdout\""), "不应渲染 JSON 键: {card}");
+    }
+
+    /// 展开 + 截断：100 行 body → 显示前 60 行 + 省略标记（P1 截头部）
+    #[test]
+    fn render_tool_result_expanded_truncates_head_at_60() {
+        let output = (1..=100)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let card = render_tool_result("bash", &output, false, None, false, Priority::P1);
+        assert!(card.contains("line1"), "应显示前 60 行: {card}");
+        assert!(card.contains("line60"), "应显示到第 60 行: {card}");
+        assert!(!card.contains("line61"), "不应显示第 61 行: {card}");
+        assert!(card.contains("其余 40 行省略"), "应显示省略标记: {card}");
+    }
+
+    /// 错误展开截尾部：P0 显示最后 60 行（失败摘要/错误列表常在输出末尾）
+    #[test]
+    fn render_tool_result_error_truncates_tail_at_60() {
+        let output = (1..=100)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let card = render_tool_result("bash", &output, true, None, true, Priority::P0);
+        assert!(card.contains("line100"), "P0 应显示最后一行: {card}");
+        assert!(card.contains("line41"), "P0 应显示尾部内容: {card}");
+        assert!(!card.contains("│ line1\n"), "P0 不应显示开头: {card}");
+        assert!(!card.contains("│ line2\n"), "P0 不应显示开头行: {card}");
+        assert!(card.contains("其余 40 行省略"), "应显示省略标记: {card}");
     }
 }
