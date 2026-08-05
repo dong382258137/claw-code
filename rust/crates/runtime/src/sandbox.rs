@@ -521,175 +521,161 @@ impl WindowsSandboxBuilder {
         )
     }
 
-    /// BUG-11:将当前进程分配到 Job Object 并设置限制。
+    /// BUG-11 修复(原生 Win32 API 版):将指定进程分配到持久 Job Object。
     ///
-    /// 通过 Win32 API(CreateJobObjectW + SetInformationJobObject +
-    /// AssignProcessToJobObject)实现。仅在 Windows 上生效。
+    /// **原实现缺陷**:通过 PowerShell + C# 内联调用 Win32 API,PowerShell
+    /// 脚本执行完毕退出后,Job Object 的唯一 handle 被关闭,Windows 内核
+    /// 随即销毁 Job Object,导致已分配到 Job 的子进程被强制终止(即使未
+    /// 设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)。用户观察到的"后台任务
+    /// 被沙箱的 Job Object 机制回收"根因即此。
     ///
-    /// 返回 `Ok(())` 表示 Job Object 已创建并设置限制。
-    /// 返回 `Err` 表示设置失败(非致命,不阻断主流程)。
+    /// **修复方案**:在 Rust 进程内直接调用 Win32 API,通过 `OnceLock` 持有
+    /// 全局 Job Object handle,生命周期与 claw 进程绑定。所有子进程都分配
+    /// 到同一个持久 Job Object,handle 直到 claw 进程退出才被 OS 回收,
+    /// 子进程不再因 handle 过早关闭而被清理。
+    ///
+    /// - CPU/内存限制通过 `SetInformationJobObject` 一次性设置
+    /// - `AssignProcessToJobObject` 把子进程加入持久 Job
+    /// - Windows 8+ 支持嵌套 Job,即使父进程已在另一个 Job 中也能分配
+    ///
+    /// 返回 `Ok(())` 表示分配成功;`Err` 表示失败(非致命,不阻断主流程)。
+    #[cfg_attr(target_os = "windows", allow(unsafe_code))]
     pub fn assign_process_to_job_object(&self, pid: u32) -> Result<(), String> {
         if !cfg!(target_os = "windows") {
             return Ok(());
         }
 
-        // 使用 PowerShell + C# 内联调用 Win32 API
-        let ps_script = self.build_job_object_powershell(pid);
+        #[cfg(target_os = "windows")]
+        {
+            use std::sync::OnceLock;
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+            use windows_sys::Win32::System::Threading::OpenProcess;
+            use windows_sys::Win32::System::Threading::{PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
-        let output = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", &ps_script])
-            .output();
+            /// 全局持久 Job Object handle — 生命周期与 claw 进程绑定。
+            /// 第一次调用时惰性创建并设置限制,之后所有子进程复用同一 Job。
+            /// handle 从不显式 CloseHandle,由 OS 在进程退出时回收,
+            /// 确保子进程不会因 handle 过早关闭而被强制终止。
+            ///
+            /// 用 `isize` 而非 `HANDLE` 存储,因为 `HANDLE = *mut c_void`
+            /// 不实现 `Send`/`Sync`,无法用于 `static OnceLock`。`isize` 能
+            /// 安全跨线程共享,使用时转回 `HANDLE`。
+            static PERSISTENT_JOB: OnceLock<isize> = OnceLock::new();
 
-        match output {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                Err(format!("job object setup failed: {stderr}"))
+            let job_raw = *PERSISTENT_JOB.get_or_init(|| {
+                let h = create_persistent_job(
+                    self.memory_limit_mb.unwrap_or(0),
+                    self.cpu_rate_limit.unwrap_or(0),
+                );
+                h as isize
+            });
+
+            if job_raw == 0 {
+                return Err("persistent job object not available".to_string());
             }
-            Err(e) => Err(format!("powershell error: {e}")),
+
+            let job = job_raw as HANDLE;
+
+            // OpenProcess 获取子进程 handle,分配到 Job,然后关闭子进程 handle。
+            // Job handle 保持持久打开,不在此处关闭。
+            let desired_access = PROCESS_SET_QUOTA | PROCESS_TERMINATE;
+            let h_proc = unsafe { OpenProcess(desired_access, 0, pid) };
+            if h_proc.is_null() {
+                return Err(format!("OpenProcess({pid}) failed"));
+            }
+
+            let result = unsafe { AssignProcessToJobObject(job, h_proc) };
+            unsafe { CloseHandle(h_proc) };
+
+            if result == 0 {
+                Err(format!("AssignProcessToJobObject failed for pid {pid}"))
+            } else {
+                Ok(())
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = pid;
+            Ok(())
         }
     }
 
-    /// 生成设置 Job Object 的 PowerShell + C# 内联脚本。
-    ///
-    /// SP4.1 修复(审查后):
-    /// - 改用 `JobObjectExtendedLimitInformation`(Class=9,144 bytes on x64)
-    ///   替代 `JobObjectBasicLimitInformation`(Class=2,64 bytes)
-    ///   前者才包含 `ProcessMemoryLimit` 字段,真正限制进程内存
-    /// - 修正 `JOB_OBJECT_LIMIT_PROCESS_MEMORY` flag:0x00000100(原代码误用 0x00000004,
-    ///   实际是 JOB_OBJECT_LIMIT_JOB_TIME,导致内存限制完全失效)
-    /// - 修正 CpuRateControl InfoClass:15(原代码误用 9,会污染 ExtendedLimitInformation)
-    /// - 加 try/finally 确保 AllocHGlobal 内存和句柄在异常时也释放
-    /// - 显式 CloseHandle($job)(原代码依赖 OS 隐式回收)
-    fn build_job_object_powershell(&self, pid: u32) -> String {
-        let mem_limit_bytes = self.memory_limit_mb.unwrap_or(0) * 1024 * 1024;
-        let cpu_rate = self.cpu_rate_limit.unwrap_or(0);
-
-        format!(
-            r#"
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class Win32JobObject {{
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr CreateJobObjectW(IntPtr lpJobAttributes, string lpName);
-
-    [DllImport("kernel32.dll")]
-    public static extern bool SetInformationJobObject(IntPtr hJob, int JobObjectInfoClass, IntPtr lpJobObjectInfo, int cbJobObjectInfoLength);
-
-    [DllImport("kernel32.dll")]
-    public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
-
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
-
-    [DllImport("kernel32.dll")]
-    public static extern bool CloseHandle(IntPtr hObject);
-}}
-"@
-
-$job = [Win32JobObject]::CreateJobObjectW([IntPtr]::Zero, "ClawSandboxJob")
-if ($job -eq [IntPtr]::Zero) {{ throw "CreateJobObjectW failed" }}
-
-try {{
-    # Extended Limits: JobObjectExtendedLimitInformation (Class=9)
-    # Layout on x64 (144 bytes total):
-    #   0-63:   BasicLimitInformation (64 bytes)
-    #     0-7:    PerProcessUserTimeLimit (LARGE_INTEGER)
-    #     8-15:   PerJobUserTimeLimit (LARGE_INTEGER)
-    #     16-19:  LimitFlags (DWORD)
-    #     20-23:  padding
-    #     24-31:  MinimumWorkingSetSize (SIZE_T)
-    #     32-39:  MaximumWorkingSetSize (SIZE_T)
-    #     40-43:  ActiveProcessLimit (DWORD)
-    #     44-47:  padding
-    #     48-55:  Affinity (ULONG_PTR)
-    #     56-59:  PriorityClass (DWORD)
-    #     60-63:  SchedulingClass (DWORD)
-    #   64-111:  IoInfo (IO_COUNTERS, 48 bytes, all zero)
-    #   112-119: ProcessMemoryLimit (SIZE_T) — requires JOB_OBJECT_LIMIT_PROCESS_MEMORY flag
-    #   120-127: JobMemoryLimit (SIZE_T)
-    #   128-135: PeakProcessMemoryUsed (SIZE_T)
-    #   136-143: PeakJobMemoryUsed (SIZE_T)
-    $extInfo = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(144)
-    try {{
-        # Zero the entire buffer first(确保 padding 和 IoInfo 为 0)
-        for ($i = 0; $i -lt 144; $i += 8) {{
-            [System.Runtime.InteropServices.Marshal]::WriteInt64($extInfo, $i, 0)
-        }}
-
-        # BasicLimitInformation.LimitFlags (offset 16, DWORD)
-        $limitFlags = 0
-        if ({mem_limit_bytes} -gt 0) {{
-            # JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100(原代码误用 0x00000004)
-            # JOB_OBJECT_LIMIT_WORKINGSET = 0x00000001(若设 MaxWorkingSet 需同时设此 flag)
-            $limitFlags = $limitFlags -bor 0x00000100 -bor 0x00000001
-        }}
-        [System.Runtime.InteropServices.Marshal]::WriteInt32($extInfo, 16, $limitFlags)
-
-        # BasicLimitInformation.MaximumWorkingSetSize (offset 32, SIZE_T)
-        if ({mem_limit_bytes} -gt 0) {{
-            [System.Runtime.InteropServices.Marshal]::WriteInt64($extInfo, 32, [long]{mem_limit_bytes})
-        }}
-
-        # ProcessMemoryLimit (offset 112, SIZE_T) — 真正限制进程提交的虚拟内存
-        if ({mem_limit_bytes} -gt 0) {{
-            [System.Runtime.InteropServices.Marshal]::WriteInt64($extInfo, 112, [long]{mem_limit_bytes})
-        }}
-
-        if (-not [Win32JobObject]::SetInformationJobObject($job, 9, $extInfo, 144)) {{
-            throw "SetInformationJobObject(Extended, Class=9) failed"
-        }}
-    }} finally {{
-        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($extInfo)
-    }}
-
-    # CPU Rate Control: JobObjectCpuRateControlInformation (Class=15) — Windows 8+
-    # 原代码误用 Class=9(ExtendedLimitInformation),会污染 BasicLimitInformation
-    if ({cpu_rate} -gt 0) {{
-        $cpuInfo = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(8)
-        try {{
-            # JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
-            # JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
-            $cpuFlags = 0x1 -bor 0x4
-            [System.Runtime.InteropServices.Marshal]::WriteInt32($cpuInfo, 0, $cpuFlags)
-            # CpuRate = rate * 100(hundredths of percent,如 80 表示 80%)
-            [System.Runtime.InteropServices.Marshal]::WriteInt32($cpuInfo, 4, {cpu_rate} * 100)
-            if (-not [Win32JobObject]::SetInformationJobObject($job, 15, $cpuInfo, 8)) {{
-                # CPU rate control may not be supported(Windows 7 或更早);忽略错误
-            }}
-        }} finally {{
-            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($cpuInfo)
-        }}
-    }}
-
-    # Assign process to job
-    $PROCESS_SET_QUOTA = 0x0100
-    $PROCESS_TERMINATE = 0x0001
-    $hProc = [Win32JobObject]::OpenProcess($PROCESS_SET_QUOTA -bor $PROCESS_TERMINATE, $false, {pid})
-    if ($hProc -eq [IntPtr]::Zero) {{ throw "OpenProcess({pid}) failed" }}
-    try {{
-        if (-not [Win32JobObject]::AssignProcessToJobObject($job, $hProc)) {{
-            throw "AssignProcessToJobObject failed"
-        }}
-    }} finally {{
-        [Win32JobObject]::CloseHandle($hProc)
-    }}
-}} finally {{
-    [Win32JobObject]::CloseHandle($job)
-}}
-"#,
-            mem_limit_bytes = mem_limit_bytes,
-            cpu_rate = cpu_rate,
-            pid = pid,
-        )
-    }
+    // 原 build_job_object_powershell 方法已移除 — 改用原生 Win32 API。
+    // 详见 assign_process_to_job_object() 和模块级 create_persistent_job() 函数。
 
     /// 获取 creation flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)。
     fn creation_flags(&self) -> u32 {
         CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     }
+}
+
+/// 创建持久 Job Object 并设置 CPU/内存限制(Windows 专用)。
+///
+/// 仅在 Windows 上有效,返回 Job Object handle(HANDLE = *mut c_void)。
+/// 失败时返回 null。调用方负责**不显式关闭**此 handle —— 它的生命周期与
+/// claw 进程绑定,由 OS 在进程退出时自动回收。这是修复"子进程被 Job Object
+/// 回收"的关键:handle 持久打开,Job Object 不会被销毁,子进程不会被强制终止。
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn create_persistent_job(
+    memory_limit_mb: u64,
+    cpu_rate_limit: u32,
+) -> windows_sys::Win32::Foundation::HANDLE {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+        JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOB_OBJECT_LIMIT_WORKINGSET,
+    };
+
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() || job == INVALID_HANDLE_VALUE {
+        return std::ptr::null_mut();
+    }
+
+    // 设置 Extended Limits(内存限制)
+    let mem_limit_bytes = memory_limit_mb.checked_mul(1024 * 1024).unwrap_or(0);
+    if mem_limit_bytes > 0 {
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_WORKINGSET;
+        info.BasicLimitInformation.MaximumWorkingSetSize = mem_limit_bytes as _;
+        info.ProcessMemoryLimit = mem_limit_bytes as _;
+
+        // 内存限制设置失败不致命,Job 仍可使用(只是无内存限制)
+        let _ = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+    }
+
+    // 设置 CPU Rate Control(CPU 占比上限,Windows 8+)
+    if cpu_rate_limit > 0 {
+        let mut cpu_info: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        cpu_info.ControlFlags =
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        cpu_info.Anonymous.CpuRate = cpu_rate_limit * 100; // 百分之几
+
+        // CPU 限制设置失败不致命,Job 仍可使用(只是无 CPU 限制)
+        let _ = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectCpuRateControlInformation,
+                &cpu_info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            )
+        };
+    }
+
+    job
 }
 
 impl SandboxBuilder for WindowsSandboxBuilder {
