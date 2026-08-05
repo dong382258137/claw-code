@@ -27,7 +27,7 @@ use api::{
 };
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
-    PermissionMode, PermissionPolicy, RuntimeError, SystemPromptSplit,
+    PermissionMode, PermissionPolicy, RequestKind, RuntimeError, SystemPromptSplit,
     TokenUsage,
 };
 use serde_json::json;
@@ -187,6 +187,13 @@ pub(crate) struct AnthropicRuntimeClient {
     /// 持久化到 `~/.claude/cache/prompt-cache/<session>/stats.json`,供
     /// `claw doctor --cache-stats` 诊断。不缓存响应(只做检测)。
     cache_break_detector: api::CacheBreakDetector,
+    /// 子智能体请求的独立缓存统计 session(`subagent-{session_id}`)。
+    ///
+    /// 3b:子智能体 system prompt 唯一内容多(历史上曾注入 id/name/task),
+    /// 若与主 agent 共用同一 detector,会踩脏主 session 的 `previous`
+    /// 指纹,导致主 agent 的 break_reasons 被 "system prompt changed"
+    /// 污染、本地命中率统计失真。独立 session 后两条曲线互不干扰。
+    subagent_cache_break_detector: api::CacheBreakDetector,
 }
 
 impl AnthropicRuntimeClient {
@@ -219,6 +226,9 @@ impl AnthropicRuntimeClient {
             reasoning_effort: None,
             status_emitter: None,
             cache_break_detector: api::CacheBreakDetector::new(session_id),
+            subagent_cache_break_detector: api::CacheBreakDetector::new(format!(
+                "subagent-{session_id}"
+            )),
         })
     }
 
@@ -272,7 +282,25 @@ impl AnthropicRuntimeClient {
     ///
     /// 从 TokenUsage 还原 api::Usage,调用 detector 记录本次请求的 prompt 指纹
     /// 和 cache 命中情况。usage 为 None 时(流式未收到任何 usage 事件)跳过。
-    fn record_cache_break(&self, request: &MessageRequest, usage: Option<TokenUsage>) {
+    /// 按请求来源选择缓存统计 detector:主 agent → 主 session;子智能体 → `subagent-{session}`。
+    fn detector_for(&self, kind: RequestKind) -> &api::CacheBreakDetector {
+        match kind {
+            RequestKind::Main => &self.cache_break_detector,
+            RequestKind::Subagent => &self.subagent_cache_break_detector,
+        }
+    }
+
+    /// 记录 cache break 检测数据。
+    ///
+    /// 从 TokenUsage 还原 api::Usage,调用 detector 记录本次请求的 prompt 指纹
+    /// 和 cache 命中情况。usage 为 None 时(流式未收到任何 usage 事件)跳过。
+    /// 3b:按 `kind` 路由到主/子独立 detector,互不污染。
+    fn record_cache_break(
+        &self,
+        kind: RequestKind,
+        request: &MessageRequest,
+        usage: Option<TokenUsage>,
+    ) {
         let Some(usage) = usage else {
             return;
         };
@@ -282,7 +310,7 @@ impl AnthropicRuntimeClient {
             cache_read_input_tokens: usage.cache_read_input_tokens,
             output_tokens: usage.output_tokens,
         };
-        let _ = self.cache_break_detector.record_usage(request, &api_usage);
+        let _ = self.detector_for(kind).record_usage(request, &api_usage);
     }
 }
 
@@ -344,6 +372,7 @@ impl ApiClient for AnthropicRuntimeClient {
         // Extract system-role messages so they route through MessageRequest.system
         // (eligible for prompt caching) instead of being flattened into messages.
         let (system_text, filtered_messages) = extract_system_messages(&request.messages);
+        let request_kind = request.request_kind;
         let mut split = request.system_prompt;
         if !system_text.is_empty() {
             split.dynamic_sections.push(system_text);
@@ -383,7 +412,7 @@ impl ApiClient for AnthropicRuntimeClient {
             // usage for no reliability gain (the stall is typically a transient
             // server/network issue that a retry of the identical request is
             // unlikely to fix). Let the caller handle the error.
-            self.consume_stream(&message_request, is_post_tool).await
+            self.consume_stream(request_kind, &message_request, is_post_tool).await
         })
     }
 
@@ -419,6 +448,7 @@ impl ApiClient for AnthropicRuntimeClient {
 
             // 与同步 `stream` 一致:抽离 system 角色消息走 system 字段(prompt cache)
             let (system_text, filtered_messages) = extract_system_messages(&request.messages);
+            let request_kind = request.request_kind;
             let mut split = request.system_prompt;
             if !system_text.is_empty() {
                 split.dynamic_sections.push(system_text);
@@ -450,7 +480,7 @@ impl ApiClient for AnthropicRuntimeClient {
             };
 
             // 直接 await,无 runtime.block_on
-            self.consume_stream(&message_request, is_post_tool).await
+            self.consume_stream(request_kind, &message_request, is_post_tool).await
         })
     }
 
@@ -465,7 +495,8 @@ impl ApiClient for AnthropicRuntimeClient {
     /// - `allowed_tools = None`:无工具白名单
     /// - `progress_reporter = None`:不订阅进度事件
     /// - `status_emitter = None`:不订阅状态事件
-    /// - 复用主 agent 的 `session_id`(用于 prompt cache 隔离桶)和 `tool_registry`(共享工具定义)
+    /// - 复用主 agent 的 `session_id` 前缀 + `tool_registry`(共享工具定义);
+    ///   子请求经 `request_kind = Subagent` 路由到独立 `subagent-{session}` 缓存统计(3b)
     fn with_model(&self, model: &str) -> Result<Box<dyn ApiClient>, String> {
         let client = AnthropicRuntimeClient::new(
             &self.session_id,
@@ -487,6 +518,7 @@ impl AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     async fn consume_stream(
         &self,
+        request_kind: RequestKind,
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -775,7 +807,7 @@ impl AnthropicRuntimeClient {
             .iter()
             .any(|event| matches!(event, AssistantEvent::MessageStop))
         {
-            self.record_cache_break(message_request, final_usage);
+            self.record_cache_break(request_kind, message_request, final_usage);
             return Ok(events);
         }
 
@@ -794,7 +826,7 @@ impl AnthropicRuntimeClient {
         // 非流式回退路径:从 response.usage 记录 cache break。
         let fallback_usage = response.usage.token_usage();
         let events = response_to_events(response, out)?;
-        self.record_cache_break(message_request, Some(fallback_usage));
+        self.record_cache_break(request_kind, message_request, Some(fallback_usage));
         Ok(events)
     }
 }
