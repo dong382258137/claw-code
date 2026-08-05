@@ -25,9 +25,9 @@ fn status_command_applies_model_and_permission_mode_flags() {
     // then
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
-    assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Model            deepseek-v4-pro"));
-    assert!(stdout.contains("Permission mode  read-only"));
+    assert!(stdout.contains("状态"));
+    assert!(stdout.contains("模型             pro"));
+    assert!(stdout.contains("权限模式         read-only"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
@@ -53,9 +53,9 @@ fn resume_flag_loads_a_saved_session_and_dispatches_status() {
     // then
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
-    assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Messages         1"));
-    assert!(stdout.contains("Session          "));
+    assert!(stdout.contains("状态"));
+    assert!(stdout.contains("消息数           1"));
+    assert!(stdout.contains("会话             "));
     assert!(stdout.contains(session_path.to_str().expect("utf8 path")));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
@@ -159,8 +159,8 @@ fn config_command_loads_defaults_from_standard_config_locations() {
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Config"));
-    assert!(stdout.contains("Loaded files      3"));
-    assert!(stdout.contains("Merged section: model"));
+    assert!(stdout.contains("已加载文件       3"));
+    assert!(stdout.contains("合并的节: model"));
     assert!(stdout.contains("opus"));
     assert!(stdout.contains(
         config_home

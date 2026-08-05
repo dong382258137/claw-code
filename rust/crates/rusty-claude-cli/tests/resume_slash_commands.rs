@@ -102,9 +102,9 @@ fn status_command_applies_cli_flags_end_to_end() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
-    assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Model            deepseek-v4-pro"));
-    assert!(stdout.contains("Permission mode  read-only"));
+    assert!(stdout.contains("状态"));
+    assert!(stdout.contains("模型             pro"));
+    assert!(stdout.contains("权限模式         read-only"));
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Config"));
-    assert!(stdout.contains("Loaded files      2"));
+    assert!(stdout.contains("已加载文件       2"));
     assert!(stdout.contains(
         config_home
             .join("settings.json")
@@ -166,7 +166,7 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
             .to_str()
             .expect("utf8 path")
     ));
-    assert!(stdout.contains("Merged section: model"));
+    assert!(stdout.contains("合并的节: model"));
     assert!(stdout.contains("opus"));
 }
 
@@ -212,8 +212,8 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
-    assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Messages         2"));
+    assert!(stdout.contains("状态"));
+    assert!(stdout.contains("消息数           2"));
     assert!(stdout.contains(newer_path.to_str().expect("utf8 path")));
 }
 
