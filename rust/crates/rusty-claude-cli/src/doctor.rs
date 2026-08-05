@@ -4,7 +4,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use api::{cache_break_root, CacheBreakReasons, CacheBreakStats};
 use runtime::{
     format_stale_base_warning, resolve_sandbox_status, BaseCommitState, ConfigLoader, McpServer,
     McpServerSpec, McpTool, ProjectContext, TokenUsage,
@@ -314,195 +316,453 @@ pub(crate) fn run_doctor(
 /// 汇总所有 session 的 cache break 统计,按根因分类显示。
 /// 数据来源:`streaming.rs::record_cache_break` 每次请求后写入的
 /// `~/.claude/cache/prompt-cache/<session>/stats.json`。
+///
+/// 主 agent 请求写入 `<session>/stats.json`,子智能体请求写入
+/// `subagent-<session>/stats.json`。本命令将两类 session **分开聚合**:
+/// 主汇总只统计非 `subagent-` 前缀的目录(不再被子智能体统计污染),
+/// 子智能体在独立一节汇总展示,每个 session(含 `subagent-{session}`)
+/// 在明细中独立成行,`last_response` 按 stats.json 修改时间取最新并标注
+/// 所属 session 名(不再受 read_dir 顺序影响)。
 fn run_doctor_cache_stats(
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use api::{cache_break_root, CacheBreakReasons, CacheBreakStats};
-
     let root = cache_break_root();
+    let sessions = collect_session_cache_stats(&root);
 
-    let mut aggregated_breaks = CacheBreakReasons::default();
-    let mut aggregated_creation_tokens: u64 = 0;
-    let mut aggregated_read_tokens: u64 = 0;
-    let mut aggregated_tracked_requests: u64 = 0;
-    let mut aggregated_unexpected_breaks: u64 = 0;
-    let mut aggregated_expected_invalidations: u64 = 0;
-    let mut session_count: u32 = 0;
-    let mut last_break_reason: Option<String> = None;
-    let mut last_read_tokens: Option<u32> = None;
-    let mut last_creation_tokens: Option<u32> = None;
-
-    if root.exists() {
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            let stats_path = entry.path().join("stats.json");
-            if !stats_path.exists() {
-                continue;
-            }
-            let raw = match fs::read(&stats_path) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
-            let stats: CacheBreakStats = match serde_json::from_slice(&raw) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            session_count += 1;
-            aggregated_breaks.model_changed += stats.break_reasons.model_changed;
-            aggregated_breaks.system_prompt_changed += stats.break_reasons.system_prompt_changed;
-            aggregated_breaks.tool_definitions_changed +=
-                stats.break_reasons.tool_definitions_changed;
-            aggregated_breaks.message_payload_changed +=
-                stats.break_reasons.message_payload_changed;
-            aggregated_breaks.ttl_expiry += stats.break_reasons.ttl_expiry;
-            aggregated_breaks.unknown += stats.break_reasons.unknown;
-            aggregated_creation_tokens += stats.total_cache_creation_input_tokens;
-            aggregated_read_tokens += stats.total_cache_read_input_tokens;
-            aggregated_tracked_requests += stats.tracked_requests;
-            aggregated_unexpected_breaks += stats.unexpected_cache_breaks;
-            aggregated_expected_invalidations += stats.expected_invalidations;
-            if let Some(reason) = stats.last_break_reason {
-                last_break_reason = Some(reason);
-            }
-            if let Some(v) = stats.last_cache_read_input_tokens {
-                last_read_tokens = Some(v);
-            }
-            if let Some(v) = stats.last_cache_creation_input_tokens {
-                last_creation_tokens = Some(v);
-            }
+    let mut main_sessions = Vec::new();
+    let mut subagent_sessions = Vec::new();
+    for session in sessions {
+        if session.is_subagent {
+            subagent_sessions.push(session);
+        } else {
+            main_sessions.push(session);
         }
+    }
+
+    let mut main_agg = CacheStatsAggregate::default();
+    for session in &main_sessions {
+        main_agg.push(&session.stats);
+    }
+    let mut subagent_agg = CacheStatsAggregate::default();
+    for session in &subagent_sessions {
+        subagent_agg.push(&session.stats);
     }
 
     match output_format {
         CliOutputFormat::Text => {
-            if session_count == 0 {
+            if main_agg.session_count + subagent_agg.session_count == 0 {
                 println!("Cache Break 监控:暂无 session stats 文件。");
                 println!("  提示:运行一次 `claw` 对话后,stats 会在每次请求后持久化到:");
                 println!("  {}", root.display());
                 return Ok(());
             }
             println!(
-                "Cache Break 监控(汇总 {} 个 session,根目录 {})",
-                session_count,
-                root.display()
+                "{}",
+                render_cache_stats_text(
+                    &root,
+                    &main_sessions,
+                    &subagent_sessions,
+                    &main_agg,
+                    &subagent_agg,
+                )
             );
-            println!();
-            println!("== Cache Break 原因分布 ==");
-            let total_breaks = aggregated_breaks.total();
-            println!("  总 break 事件:{}", total_breaks);
-            if total_breaks > 0 {
-                let pct = |n: u64| (n as f64 * 100.0 / total_breaks as f64).round() as u64;
-                println!(
-                    "    model_changed           : {:>5} ({:>3}%)",
-                    aggregated_breaks.model_changed,
-                    pct(aggregated_breaks.model_changed)
-                );
-                println!(
-                    "    system_prompt_changed   : {:>5} ({:>3}%)  ← 动态值泄漏到静态区",
-                    aggregated_breaks.system_prompt_changed,
-                    pct(aggregated_breaks.system_prompt_changed)
-                );
-                println!(
-                    "    tool_definitions_changed: {:>5} ({:>3}%)  ← 动态值泄漏到静态区",
-                    aggregated_breaks.tool_definitions_changed,
-                    pct(aggregated_breaks.tool_definitions_changed)
-                );
-                println!(
-                    "    message_payload_changed : {:>5} ({:>3}%)  (正常,每 turn 都变)",
-                    aggregated_breaks.message_payload_changed,
-                    pct(aggregated_breaks.message_payload_changed)
-                );
-                println!(
-                    "    ttl_expiry              : {:>5} ({:>3}%)  (provider 侧 TTL)",
-                    aggregated_breaks.ttl_expiry,
-                    pct(aggregated_breaks.ttl_expiry)
-                );
-                println!(
-                    "    unknown                 : {:>5} ({:>3}%)  ← 指纹未变但命中率下降",
-                    aggregated_breaks.unknown,
-                    pct(aggregated_breaks.unknown)
-                );
-            }
-            println!();
-            println!("== Token 累计 ==");
-            println!(
-                "  tracked_requests          : {}",
-                aggregated_tracked_requests
-            );
-            println!(
-                "  total_cache_read_tokens   : {} (命中)",
-                aggregated_read_tokens
-            );
-            println!(
-                "  total_cache_creation_tokens: {} (未命中写入)",
-                aggregated_creation_tokens
-            );
-            let hit_rate = if aggregated_read_tokens + aggregated_creation_tokens > 0 {
-                (aggregated_read_tokens as f64 * 100.0
-                    / (aggregated_read_tokens + aggregated_creation_tokens) as f64)
-                    .round() as u64
-            } else {
-                0
-            };
-            println!("  累计命中率:{}%", hit_rate);
-            println!();
-            println!("== 异常检测 ==");
-            println!(
-                "  unexpected_cache_breaks   : {} (指纹未变但命中率突降)",
-                aggregated_unexpected_breaks
-            );
-            println!(
-                "  expected_invalidations    : {} (指纹变化导致的预期失效)",
-                aggregated_expected_invalidations
-            );
-            if let Some(reason) = &last_break_reason {
-                println!("  last_break_reason         : {}", reason);
-            }
-            if let (Some(read), Some(creation)) = (last_read_tokens, last_creation_tokens) {
-                let last_total = read + creation;
-                let last_hit_rate = if last_total > 0 {
-                    (read as f64 * 100.0 / last_total as f64).round() as u64
-                } else {
-                    0
-                };
-                println!(
-                    "  last_response             : read={} creation={} hit_rate={}%",
-                    read, creation, last_hit_rate
-                );
-            }
         }
         CliOutputFormat::Json => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "session_count": session_count,
-                    "break_reasons": {
-                        "total": aggregated_breaks.total(),
-                        "model_changed": aggregated_breaks.model_changed,
-                        "system_prompt_changed": aggregated_breaks.system_prompt_changed,
-                        "tool_definitions_changed": aggregated_breaks.tool_definitions_changed,
-                        "message_payload_changed": aggregated_breaks.message_payload_changed,
-                        "ttl_expiry": aggregated_breaks.ttl_expiry,
-                        "unknown": aggregated_breaks.unknown,
-                    },
-                    "tokens": {
-                        "tracked_requests": aggregated_tracked_requests,
-                        "total_cache_read_input_tokens": aggregated_read_tokens,
-                        "total_cache_creation_input_tokens": aggregated_creation_tokens,
-                        "cumulative_hit_rate_pct": if aggregated_read_tokens + aggregated_creation_tokens > 0 {
-                            (aggregated_read_tokens as f64 * 100.0 / (aggregated_read_tokens + aggregated_creation_tokens) as f64).round() as u64
-                        } else { 0 },
-                    },
-                    "anomalies": {
-                        "unexpected_cache_breaks": aggregated_unexpected_breaks,
-                        "expected_invalidations": aggregated_expected_invalidations,
-                        "last_break_reason": last_break_reason,
-                    },
-                }))?
+                serde_json::to_string_pretty(&render_cache_stats_json(
+                    &main_sessions,
+                    &subagent_sessions,
+                    &main_agg,
+                    &subagent_agg,
+                ))?
             );
         }
     }
     Ok(())
+}
+
+/// 单个 session 的缓存统计快照(doctor 展示用)。
+#[derive(Debug, Clone)]
+struct SessionCacheStatsSnapshot {
+    name: String,
+    is_subagent: bool,
+    stats: CacheBreakStats,
+    modified_at: Option<SystemTime>,
+}
+
+/// 一组 session 的聚合结果(主 / subagent 分开聚合)。
+#[derive(Debug, Default)]
+struct CacheStatsAggregate {
+    session_count: u32,
+    tracked_requests: u64,
+    read_tokens: u64,
+    creation_tokens: u64,
+    unexpected_breaks: u64,
+    expected_invalidations: u64,
+    breaks: CacheBreakReasons,
+}
+
+impl CacheStatsAggregate {
+    fn push(&mut self, stats: &CacheBreakStats) {
+        self.session_count += 1;
+        self.tracked_requests += stats.tracked_requests;
+        self.read_tokens += stats.total_cache_read_input_tokens;
+        self.creation_tokens += stats.total_cache_creation_input_tokens;
+        self.unexpected_breaks += stats.unexpected_cache_breaks;
+        self.expected_invalidations += stats.expected_invalidations;
+        self.breaks.model_changed += stats.break_reasons.model_changed;
+        self.breaks.system_prompt_changed += stats.break_reasons.system_prompt_changed;
+        self.breaks.tool_definitions_changed += stats.break_reasons.tool_definitions_changed;
+        self.breaks.message_payload_changed += stats.break_reasons.message_payload_changed;
+        self.breaks.ttl_expiry += stats.break_reasons.ttl_expiry;
+        self.breaks.unknown += stats.break_reasons.unknown;
+    }
+
+    fn hit_rate_pct(&self) -> u64 {
+        hit_rate_pct(self.read_tokens, self.creation_tokens)
+    }
+}
+
+fn hit_rate_pct(read_tokens: u64, creation_tokens: u64) -> u64 {
+    let total = read_tokens + creation_tokens;
+    if total == 0 {
+        0
+    } else {
+        (read_tokens as f64 * 100.0 / total as f64).round() as u64
+    }
+}
+
+/// 扫描 cache stats 根目录,收集所有含 stats.json 的 session 快照。
+fn collect_session_cache_stats(root: &Path) -> Vec<SessionCacheStatsSnapshot> {
+    let mut sessions = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return sessions;
+    };
+    for entry in entries.flatten() {
+        let stats_path = entry.path().join("stats.json");
+        if !stats_path.exists() {
+            continue;
+        }
+        let Ok(raw) = fs::read(&stats_path) else {
+            continue;
+        };
+        let Ok(stats) = serde_json::from_slice::<CacheBreakStats>(&raw) else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_subagent = name.starts_with("subagent-");
+        let modified_at = fs::metadata(&stats_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        sessions.push(SessionCacheStatsSnapshot {
+            name,
+            is_subagent,
+            stats,
+            modified_at,
+        });
+    }
+    sessions
+}
+
+/// 取一组 session 中 stats.json 修改时间最新的一条(`last_response` 归属)。
+fn newest_session(sessions: &[SessionCacheStatsSnapshot]) -> Option<&SessionCacheStatsSnapshot> {
+    sessions.iter().max_by_key(|session| session.modified_at)
+}
+
+fn render_cache_stats_text(
+    root: &Path,
+    main_sessions: &[SessionCacheStatsSnapshot],
+    subagent_sessions: &[SessionCacheStatsSnapshot],
+    main_agg: &CacheStatsAggregate,
+    subagent_agg: &CacheStatsAggregate,
+) -> String {
+    let mut lines = vec![format!(
+        "Cache Break 监控(主 session {} 个,subagent session {} 个;根目录 {})",
+        main_agg.session_count,
+        subagent_agg.session_count,
+        root.display()
+    )];
+    lines.push(String::new());
+    lines.push("== Cache Break 原因分布(主 session,排除 subagent)==".to_string());
+    lines.extend(render_break_reasons_lines(&main_agg.breaks));
+    lines.push(String::new());
+    lines.push("== Token 累计(主 session,排除 subagent)==".to_string());
+    lines.extend(render_token_lines(main_agg));
+    lines.push(String::new());
+    lines.push("== 异常检测(主 session)==".to_string());
+    lines.extend(render_anomaly_lines(
+        main_agg,
+        newest_session(main_sessions),
+    ));
+    if subagent_agg.session_count > 0 {
+        lines.push(String::new());
+        lines.push("== Subagent 汇总(subagent-session-* 独立统计)==".to_string());
+        lines.extend(render_subagent_lines(
+            subagent_agg,
+            newest_session(subagent_sessions),
+        ));
+    }
+    lines.push(String::new());
+    lines.push("== Session 明细(按 stats.json 修改时间倒序;主/子独立成行)==".to_string());
+    let mut all_sessions = main_sessions
+        .iter()
+        .chain(subagent_sessions.iter())
+        .collect::<Vec<_>>();
+    all_sessions.sort_by_key(|b| std::cmp::Reverse(b.modified_at));
+    for session in all_sessions {
+        lines.push(render_session_line(session));
+    }
+    lines.join("\n")
+}
+
+fn render_break_reasons_lines(breaks: &CacheBreakReasons) -> Vec<String> {
+    let total = breaks.total();
+    let mut lines = vec![format!("  总 break 事件:{total}")];
+    if total > 0 {
+        let pct = |n: u64| (n as f64 * 100.0 / total as f64).round() as u64;
+        lines.push(format!(
+            "    model_changed           : {:>5} ({:>3}%)",
+            breaks.model_changed,
+            pct(breaks.model_changed)
+        ));
+        lines.push(format!(
+            "    system_prompt_changed   : {:>5} ({:>3}%)  ← 动态值泄漏到静态区",
+            breaks.system_prompt_changed,
+            pct(breaks.system_prompt_changed)
+        ));
+        lines.push(format!(
+            "    tool_definitions_changed: {:>5} ({:>3}%)  ← 动态值泄漏到静态区",
+            breaks.tool_definitions_changed,
+            pct(breaks.tool_definitions_changed)
+        ));
+        lines.push(format!(
+            "    message_payload_changed : {:>5} ({:>3}%)  (正常,每 turn 都变)",
+            breaks.message_payload_changed,
+            pct(breaks.message_payload_changed)
+        ));
+        lines.push(format!(
+            "    ttl_expiry              : {:>5} ({:>3}%)  (provider 侧 TTL)",
+            breaks.ttl_expiry,
+            pct(breaks.ttl_expiry)
+        ));
+        lines.push(format!(
+            "    unknown                 : {:>5} ({:>3}%)  ← 指纹未变但命中率下降",
+            breaks.unknown,
+            pct(breaks.unknown)
+        ));
+    }
+    lines
+}
+
+fn render_token_lines(agg: &CacheStatsAggregate) -> Vec<String> {
+    vec![
+        format!("  tracked_requests          : {}", agg.tracked_requests),
+        format!("  total_cache_read_tokens   : {} (命中)", agg.read_tokens),
+        format!(
+            "  total_cache_creation_tokens: {} (未命中写入)",
+            agg.creation_tokens
+        ),
+        format!("  累计命中率:{}%", agg.hit_rate_pct()),
+    ]
+}
+
+fn render_anomaly_lines(
+    agg: &CacheStatsAggregate,
+    newest: Option<&SessionCacheStatsSnapshot>,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "  unexpected_cache_breaks   : {} (指纹未变但命中率突降)",
+            agg.unexpected_breaks
+        ),
+        format!(
+            "  expected_invalidations    : {} (指纹变化导致的预期失效)",
+            agg.expected_invalidations
+        ),
+    ];
+    if let Some(session) = newest {
+        if let Some(reason) = &session.stats.last_break_reason {
+            lines.push(format!(
+                "  last_break_reason         : {reason} [{}]",
+                session.name
+            ));
+        }
+        if let (Some(read), Some(creation)) = (
+            session.stats.last_cache_read_input_tokens,
+            session.stats.last_cache_creation_input_tokens,
+        ) {
+            lines.push(format!(
+                "  last_response             : [{}] read={} creation={} hit_rate={}%",
+                session.name,
+                read,
+                creation,
+                hit_rate_pct(u64::from(read), u64::from(creation))
+            ));
+        }
+    }
+    lines
+}
+
+fn render_subagent_lines(
+    agg: &CacheStatsAggregate,
+    newest: Option<&SessionCacheStatsSnapshot>,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("  子 session 数            : {}", agg.session_count),
+        format!("  tracked_requests          : {}", agg.tracked_requests),
+        format!("  total_cache_read_tokens   : {} (命中)", agg.read_tokens),
+        format!(
+            "  total_cache_creation_tokens: {} (未命中写入)",
+            agg.creation_tokens
+        ),
+        format!("  累计命中率:{}%", agg.hit_rate_pct()),
+        format!("  总 break 事件             : {}", agg.breaks.total()),
+    ];
+    if let Some(session) = newest {
+        if let (Some(read), Some(creation)) = (
+            session.stats.last_cache_read_input_tokens,
+            session.stats.last_cache_creation_input_tokens,
+        ) {
+            lines.push(format!(
+                "  last_response             : [{}] read={} creation={} hit_rate={}%",
+                session.name,
+                read,
+                creation,
+                hit_rate_pct(u64::from(read), u64::from(creation))
+            ));
+        }
+    }
+    lines
+}
+
+fn render_session_line(session: &SessionCacheStatsSnapshot) -> String {
+    let kind = if session.is_subagent { "子" } else { "主" };
+    format!(
+        "  [{kind}] {:48} : tracked={} read={} creation={} hit={}% unexpected={} expected={} last_break={}",
+        session.name,
+        session.stats.tracked_requests,
+        session.stats.total_cache_read_input_tokens,
+        session.stats.total_cache_creation_input_tokens,
+        hit_rate_pct(
+            session.stats.total_cache_read_input_tokens,
+            session.stats.total_cache_creation_input_tokens,
+        ),
+        session.stats.unexpected_cache_breaks,
+        session.stats.expected_invalidations,
+        session.stats.last_break_reason.as_deref().unwrap_or("<无>"),
+    )
+}
+
+fn break_reasons_json(breaks: &CacheBreakReasons) -> Value {
+    json!({
+        "total": breaks.total(),
+        "model_changed": breaks.model_changed,
+        "system_prompt_changed": breaks.system_prompt_changed,
+        "tool_definitions_changed": breaks.tool_definitions_changed,
+        "message_payload_changed": breaks.message_payload_changed,
+        "ttl_expiry": breaks.ttl_expiry,
+        "unknown": breaks.unknown,
+    })
+}
+
+fn render_cache_stats_json(
+    main_sessions: &[SessionCacheStatsSnapshot],
+    subagent_sessions: &[SessionCacheStatsSnapshot],
+    main_agg: &CacheStatsAggregate,
+    subagent_agg: &CacheStatsAggregate,
+) -> Value {
+    let last_response_json = |newest: Option<&SessionCacheStatsSnapshot>| {
+        newest.map(|session| {
+            json!({
+                "session": session.name,
+                "is_subagent": session.is_subagent,
+                "read_input_tokens": session.stats.last_cache_read_input_tokens,
+                "creation_input_tokens": session.stats.last_cache_creation_input_tokens,
+                "hit_rate_pct": match (
+                    session.stats.last_cache_read_input_tokens,
+                    session.stats.last_cache_creation_input_tokens,
+                ) {
+                    (Some(read), Some(creation)) => {
+                        hit_rate_pct(u64::from(read), u64::from(creation))
+                    }
+                    _ => 0,
+                },
+            })
+        })
+    };
+    let group_json = |agg: &CacheStatsAggregate, newest: Option<&SessionCacheStatsSnapshot>| {
+        json!({
+            "session_count": agg.session_count,
+            "break_reasons": break_reasons_json(&agg.breaks),
+            "tokens": {
+                "tracked_requests": agg.tracked_requests,
+                "total_cache_read_input_tokens": agg.read_tokens,
+                "total_cache_creation_input_tokens": agg.creation_tokens,
+                "cumulative_hit_rate_pct": agg.hit_rate_pct(),
+            },
+            "anomalies": {
+                "unexpected_cache_breaks": agg.unexpected_breaks,
+                "expected_invalidations": agg.expected_invalidations,
+                "last_break_reason": newest.and_then(|s| s.stats.last_break_reason.clone()),
+                "last_response": last_response_json(newest),
+            },
+        })
+    };
+
+    let mut all_sessions = main_sessions
+        .iter()
+        .chain(subagent_sessions.iter())
+        .collect::<Vec<_>>();
+    all_sessions.sort_by_key(|b| std::cmp::Reverse(b.modified_at));
+    let sessions_json = all_sessions
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "is_subagent": s.is_subagent,
+                "modified_at_unix_secs": s
+                    .modified_at
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs()),
+                "tracked_requests": s.stats.tracked_requests,
+                "total_cache_read_input_tokens": s.stats.total_cache_read_input_tokens,
+                "total_cache_creation_input_tokens": s.stats.total_cache_creation_input_tokens,
+                "hit_rate_pct": hit_rate_pct(
+                    s.stats.total_cache_read_input_tokens,
+                    s.stats.total_cache_creation_input_tokens,
+                ),
+                "unexpected_cache_breaks": s.stats.unexpected_cache_breaks,
+                "expected_invalidations": s.stats.expected_invalidations,
+                "last_break_reason": s.stats.last_break_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        // 总 session 数(含 subagent),与旧版字段保持兼容;主/子拆分数见下文。
+        "session_count": main_agg.session_count + subagent_agg.session_count,
+        "main_session_count": main_agg.session_count,
+        "subagent_session_count": subagent_agg.session_count,
+        // 顶层 break_reasons/tokens/anomalies 只统计主 session(排除 subagent),
+        // 修复子智能体统计污染主 session 汇总的问题。
+        "break_reasons": break_reasons_json(&main_agg.breaks),
+        "tokens": {
+            "tracked_requests": main_agg.tracked_requests,
+            "total_cache_read_input_tokens": main_agg.read_tokens,
+            "total_cache_creation_input_tokens": main_agg.creation_tokens,
+            "cumulative_hit_rate_pct": main_agg.hit_rate_pct(),
+        },
+        "anomalies": {
+            "unexpected_cache_breaks": main_agg.unexpected_breaks,
+            "expected_invalidations": main_agg.expected_invalidations,
+            "last_break_reason": newest_session(main_sessions)
+                .and_then(|s| s.stats.last_break_reason.clone()),
+            "last_response": last_response_json(newest_session(main_sessions)),
+        },
+        "subagent": group_json(subagent_agg, newest_session(subagent_sessions)),
+        "sessions": sessions_json,
+    })
 }
 
 /// Starts a minimal Model Context Protocol server that exposes claw's
@@ -2220,4 +2480,208 @@ pub(crate) fn parse_git_status_metadata_for(
     let branch = resolve_git_branch_for(cwd).or_else(|| parse_git_status_branch(status));
     let project_root = find_git_root_in(cwd).ok();
     (project_root, branch)
+}
+
+#[cfg(test)]
+mod cache_stats_tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use serde_json::Value;
+
+    use super::{
+        collect_session_cache_stats, hit_rate_pct, newest_session, render_cache_stats_json,
+        render_cache_stats_text, CacheBreakStats, CacheStatsAggregate, SessionCacheStatsSnapshot,
+    };
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_stats(root: &Path, session: &str, tracked: u64, read: u64, creation: u64) {
+        let dir = root.join(session);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stats = CacheBreakStats {
+            tracked_requests: tracked,
+            total_cache_read_input_tokens: read,
+            total_cache_creation_input_tokens: creation,
+            ..Default::default()
+        };
+        std::fs::write(dir.join("stats.json"), serde_json::to_vec(&stats).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn collect_partitions_main_and_subagent_sessions() {
+        let root = temp_root("doctor-cache-collect");
+        write_stats(&root, "session-aaa", 10, 1_000, 100);
+        write_stats(&root, "subagent-session-aaa", 4, 0, 1_696);
+        // 无 stats.json 的目录应被跳过
+        std::fs::create_dir_all(root.join("session-empty")).unwrap();
+
+        let sessions = collect_session_cache_stats(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        let main = sessions.iter().find(|s| s.name == "session-aaa").unwrap();
+        assert!(!main.is_subagent);
+        assert!(main.modified_at.is_some());
+        let sub = sessions
+            .iter()
+            .find(|s| s.name == "subagent-session-aaa")
+            .unwrap();
+        assert!(sub.is_subagent);
+    }
+
+    #[test]
+    fn aggregate_keeps_main_and_subagent_separate() {
+        let root = temp_root("doctor-cache-agg");
+        write_stats(&root, "session-a", 10, 1_000, 100);
+        write_stats(&root, "subagent-session-a", 4, 0, 1_696);
+        let sessions = collect_session_cache_stats(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let mut main_agg = CacheStatsAggregate::default();
+        let mut sub_agg = CacheStatsAggregate::default();
+        for s in &sessions {
+            if s.is_subagent {
+                sub_agg.push(&s.stats);
+            } else {
+                main_agg.push(&s.stats);
+            }
+        }
+
+        assert_eq!(main_agg.session_count, 1);
+        assert_eq!(main_agg.tracked_requests, 10);
+        assert_eq!(main_agg.read_tokens, 1_000);
+        assert_eq!(sub_agg.session_count, 1);
+        assert_eq!(sub_agg.tracked_requests, 4);
+        assert_eq!(sub_agg.read_tokens, 0);
+        assert_eq!(sub_agg.creation_tokens, 1_696);
+        assert_eq!(sub_agg.hit_rate_pct(), 0);
+        assert_eq!(main_agg.hit_rate_pct(), 91);
+    }
+
+    #[test]
+    fn newest_session_uses_modified_at() {
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let sessions = vec![
+            SessionCacheStatsSnapshot {
+                name: "session-old".into(),
+                is_subagent: false,
+                stats: CacheBreakStats::default(),
+                modified_at: Some(older),
+            },
+            SessionCacheStatsSnapshot {
+                name: "subagent-session-new".into(),
+                is_subagent: true,
+                stats: CacheBreakStats::default(),
+                modified_at: Some(newer),
+            },
+        ];
+        let newest = newest_session(&sessions).expect("newest session");
+        assert_eq!(newest.name, "subagent-session-new");
+        assert!(newest.is_subagent);
+    }
+
+    #[test]
+    fn text_report_lists_each_subagent_session_as_own_line() {
+        let root = temp_root("doctor-cache-text");
+        write_stats(&root, "session-a", 25, 751_872, 0);
+        write_stats(&root, "subagent-session-a", 4, 0, 1_696);
+        let sessions = collect_session_cache_stats(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let (mut main_sessions, mut subagent_sessions) = (Vec::new(), Vec::new());
+        for s in sessions {
+            if s.is_subagent {
+                subagent_sessions.push(s);
+            } else {
+                main_sessions.push(s);
+            }
+        }
+        let mut main_agg = CacheStatsAggregate::default();
+        for s in &main_sessions {
+            main_agg.push(&s.stats);
+        }
+        let mut sub_agg = CacheStatsAggregate::default();
+        for s in &subagent_sessions {
+            sub_agg.push(&s.stats);
+        }
+
+        let text = render_cache_stats_text(
+            &root,
+            &main_sessions,
+            &subagent_sessions,
+            &main_agg,
+            &sub_agg,
+        );
+        assert!(text.contains("主 session 1 个,subagent session 1 个"));
+        assert!(text.contains("== Subagent 汇总(subagent-session-* 独立统计)=="));
+        assert!(text.contains("[子] subagent-session-a"));
+        assert!(text.contains("[主] session-a"));
+    }
+
+    #[test]
+    fn json_report_splits_main_and_subagent() {
+        let root = temp_root("doctor-cache-json");
+        write_stats(&root, "session-a", 25, 751_872, 0);
+        write_stats(&root, "subagent-session-a", 4, 0, 1_696);
+        let sessions = collect_session_cache_stats(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let (mut main_sessions, mut subagent_sessions) = (Vec::new(), Vec::new());
+        for s in sessions {
+            if s.is_subagent {
+                subagent_sessions.push(s);
+            } else {
+                main_sessions.push(s);
+            }
+        }
+        let mut main_agg = CacheStatsAggregate::default();
+        for s in &main_sessions {
+            main_agg.push(&s.stats);
+        }
+        let mut sub_agg = CacheStatsAggregate::default();
+        for s in &subagent_sessions {
+            sub_agg.push(&s.stats);
+        }
+
+        let value: Value =
+            render_cache_stats_json(&main_sessions, &subagent_sessions, &main_agg, &sub_agg);
+        assert_eq!(value["session_count"], 2);
+        assert_eq!(value["main_session_count"], 1);
+        assert_eq!(value["subagent_session_count"], 1);
+        // 顶层聚合只统计主 session,不被 subagent 污染
+        assert_eq!(value["tokens"]["total_cache_read_input_tokens"], 751_872);
+        assert_eq!(
+            value["subagent"]["tokens"]["total_cache_read_input_tokens"],
+            0
+        );
+        let sessions_json = value["sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions_json.len(), 2);
+        let names = sessions_json
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"session-a".to_string()));
+        assert!(names.contains(&"subagent-session-a".to_string()));
+    }
+
+    #[test]
+    fn hit_rate_pct_rounds_and_guards_zero() {
+        assert_eq!(hit_rate_pct(0, 0), 0);
+        assert_eq!(hit_rate_pct(1_000, 0), 100);
+        assert_eq!(hit_rate_pct(0, 1_696), 0);
+        assert_eq!(hit_rate_pct(9, 1), 90);
+    }
 }
