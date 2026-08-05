@@ -951,7 +951,266 @@ fn strip_ansi(input: &str) -> String {
     output
 }
 
-/// CLI 输出冗度级别。控制工具调用结果、错误、进度等信息的打印量。
+/// 表格渲染默认最大总宽度（终端尺寸查询失败时的兜底）。
+const DEFAULT_TABLE_MAX_WIDTH: usize = 100;
+/// 列宽收缩时单列最小显示宽度。
+const MIN_TABLE_COLUMN_WIDTH: usize = 8;
+
+/// 解析表格渲染目标宽度：显式指定 > 0 优先，否则查终端宽度，最后兜底默认值。
+fn resolve_table_max_width(requested: Option<usize>) -> usize {
+    if let Some(width) = requested {
+        if width > 0 {
+            return width;
+        }
+    }
+    crossterm::terminal::size()
+        .ok()
+        .and_then(|(width, _)| (width > 0).then_some(width as usize))
+        .unwrap_or(DEFAULT_TABLE_MAX_WIDTH)
+}
+
+/// ANSI 字符串解析单元：字符 + 从干净状态渲染它所需的前缀 + 该字符是否带样式。
+struct AnsiUnit {
+    /// 渲染该字符前必须输出的转义前缀（`\x1b[0m` + 激活的 SGR 序列）。
+    prefix: String,
+    ch: char,
+    /// 该字符是否处于非默认样式（用于行尾是否需要补 reset）。
+    styled: bool,
+}
+
+/// 解析 ANSI SGR 字符串为 (前缀, 字符) 单元序列。
+///
+/// 前缀规则（保证任意断点处新行从干净状态正确渲染）：
+/// - 带样式字符：`\x1b[0m` + 当前激活的全部 SGR 序列（自愈式重建）；
+/// - 紧跟在带样式字符后的无样式字符：`\x1b[0m`（清除泄漏的样式）；
+/// - 其余：空字符串。
+/// 非 SGR 转义（OSC 等）作为零宽透传，追加到后续字符前缀。
+fn parse_ansi_units(input: &str) -> Vec<AnsiUnit> {
+    let mut units: Vec<AnsiUnit> = Vec::new();
+    let mut active: Vec<String> = Vec::new();
+    let mut prev_styled = false;
+    let mut pending_escape = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            let mut seq = String::from("\u{1b}");
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                seq.push('[');
+                for next in chars.by_ref() {
+                    seq.push(next);
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                if seq.ends_with('m') {
+                    let params = &seq[2..seq.len() - 1];
+                    if params == "0" {
+                        active.clear();
+                    } else {
+                        active.push(seq.clone());
+                    }
+                } else {
+                    // 非 SGR（如 cursor 移动）:按零宽透传
+                    pending_escape.push_str(&seq);
+                    continue;
+                }
+            } else if chars.peek() == Some(&']') {
+                chars.next();
+                seq.push(']');
+                for next in chars.by_ref() {
+                    seq.push(next);
+                    if next == '\u{07}' {
+                        break;
+                    }
+                }
+                pending_escape.push_str(&seq);
+                continue;
+            } else if let Some(&next) = chars.peek() {
+                seq.push(next);
+                chars.next();
+                pending_escape.push_str(&seq);
+                continue;
+            }
+            // SGR 更新 active 后不产出字符单元
+            continue;
+        }
+        let styled = !active.is_empty();
+        let prefix = if styled {
+            format!("\u{1b}[0m{}", active.concat())
+        } else if prev_styled {
+            String::from("\u{1b}[0m")
+        } else {
+            String::new()
+        };
+        let prefix = std::mem::take(&mut pending_escape) + &prefix;
+        pending_escape.clear();
+        units.push(AnsiUnit { prefix, ch, styled });
+        prev_styled = styled;
+    }
+    units
+}
+
+/// 单元格文本（可能含 ANSI 样式与 `\n`）按指定显示宽度折行，返回样式保留的显示行。
+///
+/// - `\n` 强制分段；空格处优先断行；单个 token 超过列宽才硬拆；
+/// - CJK/emoji 按显示宽度计数；
+/// - `width == 0` 时仅按 `\n` 分段，不折行。
+fn wrap_cell_lines(cell: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return cell.split('\n').map(str::to_string).collect();
+    }
+    let units = parse_ansi_units(cell);
+    let mut segments: Vec<Vec<AnsiUnit>> = vec![Vec::new()];
+    for unit in units {
+        if unit.ch == '\n' {
+            segments.push(Vec::new());
+        } else if let Some(last) = segments.last_mut() {
+            last.push(unit);
+        }
+    }
+    let mut lines = Vec::new();
+    for segment in &segments {
+        wrap_segment_lines(segment, width, &mut lines);
+    }
+    lines
+}
+
+fn char_display_width(ch: char) -> usize {
+    unicode_width::UnicodeWidthStr::width(ch.to_string().as_str())
+}
+
+/// 把当前行 flush 到输出，行尾若残留样式则补 `\x1b[0m`（保证续行从干净状态开始）。
+fn flush_ansi_line(
+    current: &mut String,
+    current_width: &mut usize,
+    last_styled: &mut bool,
+    out: &mut Vec<String>,
+) {
+    if *last_styled {
+        current.push_str("\u{1b}[0m");
+    }
+    if !current.is_empty() {
+        out.push(std::mem::take(current));
+    }
+    *current_width = 0;
+    *last_styled = false;
+}
+
+fn emit_ansi_units(
+    units: &[&AnsiUnit],
+    target: &mut String,
+    width: &mut usize,
+    last_styled: &mut bool,
+) {
+    for unit in units {
+        if !unit.prefix.is_empty() {
+            target.push_str(&unit.prefix);
+        }
+        target.push(unit.ch);
+        *width += char_display_width(unit.ch);
+        *last_styled = unit.styled;
+    }
+}
+
+/// 词边界折行一个文本段（已按 `\n` 分段）。
+fn wrap_segment_lines(segment: &[AnsiUnit], width: usize, out: &mut Vec<String>) {
+    if segment.is_empty() {
+        out.push(String::new());
+        return;
+    }
+    // tokenize:word(非空白) / ws(空白) 交替
+    struct Token<'a> {
+        units: Vec<&'a AnsiUnit>,
+        is_ws: bool,
+    }
+    let mut tokens: Vec<Token> = Vec::new();
+    for unit in segment {
+        let is_ws = unit.ch.is_whitespace();
+        if let Some(last) = tokens.last_mut() {
+            if last.is_ws == is_ws {
+                last.units.push(unit);
+                continue;
+            }
+        }
+        tokens.push(Token {
+            units: vec![unit],
+            is_ws,
+        });
+    }
+
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let mut last_styled = false;
+    let mut pending_ws: Vec<&AnsiUnit> = Vec::new();
+
+    for token in &tokens {
+        if token.is_ws {
+            pending_ws.extend(token.units.iter().copied());
+            continue;
+        }
+        let word_width: usize = token
+            .units
+            .iter()
+            .map(|u| char_display_width(u.ch))
+            .sum();
+        let ws_width: usize = pending_ws.iter().map(|u| char_display_width(u.ch)).sum();
+        if current_width + ws_width + word_width <= width {
+            emit_ansi_units(
+                &pending_ws,
+                &mut current,
+                &mut current_width,
+                &mut last_styled,
+            );
+            pending_ws.clear();
+            emit_ansi_units(
+                &token.units,
+                &mut current,
+                &mut current_width,
+                &mut last_styled,
+            );
+        } else if word_width <= width {
+            flush_ansi_line(
+                &mut current,
+                &mut current_width,
+                &mut last_styled,
+                out,
+            );
+            pending_ws.clear();
+            emit_ansi_units(
+                &token.units,
+                &mut current,
+                &mut current_width,
+                &mut last_styled,
+            );
+        } else {
+            // 单词本身超宽:flush 当前行后硬拆
+            flush_ansi_line(&mut current, &mut current_width, &mut last_styled, out);
+            pending_ws.clear();
+            for unit in &token.units {
+                let w = char_display_width(unit.ch);
+                if w == 0 {
+                    if !unit.prefix.is_empty() {
+                        current.push_str(&unit.prefix);
+                    }
+                    current.push(unit.ch);
+                    last_styled = unit.styled;
+                    continue;
+                }
+                if current_width + w > width && current_width > 0 {
+                    flush_ansi_line(&mut current, &mut current_width, &mut last_styled, out);
+                }
+                if !unit.prefix.is_empty() {
+                    current.push_str(&unit.prefix);
+                }
+                current.push(unit.ch);
+                current_width += w;
+                last_styled = unit.styled;
+            }
+        }
+    }
+    flush_ansi_line(&mut current, &mut current_width, &mut last_styled, out);
+}
 ///
 /// 通过 `/output-style [style]` 斜杠命令切换，或由 `CliToolExecutor` 在
 /// `format_tool_result` / `show_tool_results` / `show_tool_errors` 路径上消费。
@@ -1006,7 +1265,7 @@ impl OutputVerbosity {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{strip_ansi, visible_width, wrap_cell_lines, MarkdownStreamState, Spinner, TerminalRenderer};
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
@@ -1162,3 +1421,47 @@ mod tests {
         assert!(output.contains("Working"));
     }
 }
+
+    #[test]
+    fn wraps_cell_with_ansi_styles_at_word_boundaries() {
+        // 带 \x1b[1m 粗体样式的单元格,宽度 6 词边界折行
+        let styled = "\u{1b}[1mhello world\u{1b}[0m";
+        let lines = wrap_cell_lines(styled, 6);
+        assert_eq!(lines.len(), 2, "应折成 2 行");
+        assert_eq!(strip_ansi(&lines[0]), "hello");
+        assert_eq!(strip_ansi(&lines[1]), "world");
+        // 样式保留:每行都应包含粗体序列
+        assert!(lines[0].contains("\u{1b}[1m"));
+        assert!(lines[1].contains("\u{1b}[1m"));
+        // 每行可见宽度 ≤ 6
+        for line in &lines {
+            assert!(visible_width(line) <= 6, "行超宽: {line:?}");
+        }
+    }
+
+    #[test]
+    fn wraps_cell_splits_overwide_single_token() {
+        // 无空格超宽 token:硬拆为 5/5/2
+        let lines = wrap_cell_lines("ABCDEFGHIJKL", 5);
+        let plain: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
+        assert_eq!(plain, vec!["ABCDE", "FGHIJ", "KL"]);
+    }
+
+    #[test]
+    fn wraps_cell_breaks_on_newlines() {
+        // 换行强制分段
+        let lines = wrap_cell_lines("aaa\nbbb ccc", 6);
+        let plain: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
+        assert_eq!(plain, vec!["aaa", "bbb", "ccc"]);
+    }
+
+    #[test]
+    fn wraps_cell_handles_plain_text_and_cjk() {
+        let lines = wrap_cell_lines("这是很长的一段中文文本", 8);
+        for line in &lines {
+            assert!(visible_width(line) <= 8, "CJK 行超宽: {line:?}");
+        }
+        assert!(lines.len() >= 2, "8 列宽应容纳不下整句");
+        let joined: String = lines.iter().map(|l| strip_ansi(l)).collect();
+        assert_eq!(joined, "这是很长的一段中文文本", "折行不应丢字符");
+    }
