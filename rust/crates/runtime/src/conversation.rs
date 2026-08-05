@@ -249,6 +249,94 @@ pub struct ApiRequest {
     pub messages: Vec<ConversationMessage>,
     pub request_kind: RequestKind,
 }
+/// 构造子智能体 system_prompt — §4.6 诊断 SOP 注入。
+///
+/// 3a 静态化:不再接收 id/name/task — 唯一内容移入 user message(见
+/// [`build_subagent_request`]),保证同一复杂度的所有子智能体请求共享
+/// 同一前缀,命中 DeepSeek prefix cache。
+///
+/// - `complexity == Diagnostic`:追加诊断任务执行规范
+/// - `complexity == Architectural`:追加架构决策执行规范
+/// - 其他复杂度:仅基础 prompt,不污染简单任务
+fn build_subagent_system_prompt(complexity: crate::multi_agent::TaskComplexity) -> String {
+    let base_prompt = "你是一个子智能体,由主智能体派发执行独立任务。\n\
+\n\
+## 约束\n\
+- 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
+- 你的响应将被写入文件,主智能体会后续读取\n\
+- 请提供完整、自包含的分析结果\n\
+- 不需要调用工具,直接给出你的分析和结论\n\
+\n\
+## 输出格式\n\
+请直接输出你的分析结果,使用 Markdown 格式。包含:\n\
+1. 任务理解(简要复述)\n\
+2. 分析过程\n\
+3. 关键发现\n\
+4. 结论和建议";
+
+    // §4.6 SOP 注入:Diagnostic 和 Architectural 复杂度追加各自 SOP
+    // 设计要点:SOP 仅注入高复杂度任务,避免污染简单任务;规则固化到系统提示,
+    // 能力不足模型也无法绕过;与验证门禁形成"提示层 + 强制层"双重防护。
+    // v2 新增:Architectural 复杂度的架构决策 SOP(§10.5 v2 扩展路径)
+    // - 与 Diagnostic SOP 互补:Diagnostic 解决"凭直觉堆砌防御代码",
+    //   Architectural 解决"凭直觉拍板方案、缺乏 trade-off 论证"
+    match complexity {
+        crate::multi_agent::TaskComplexity::Diagnostic => format!(
+            "{base_prompt}\n\n\
+             ## 诊断任务执行规范\n\
+             1. 遇到崩溃/闪退类问题,第一动作是写文件诊断日志(CLAW_DIAG=1 或调用 diag! 宏),\
+             而非凭直觉堆砌防御代码\n\
+             2. 先用可靠信号确认错误类型(panic vs Err vs 配置错误),再决定修复方向\n\
+             3. 修改后必须运行 `cargo build` 验证编译通过\n\
+             4. 声称修复后必须提供复现验证证据(重新运行原场景确认不崩溃)\n\
+             5. 禁止在未验证根因的情况下堆砌 catch_unwind / panic hook 等防御性代码"
+        ),
+        crate::multi_agent::TaskComplexity::Architectural => format!(
+            "{base_prompt}\n\n\
+             ## 架构决策执行规范\n\
+             1. 提出方案前必须列出至少 2 个候选方案(alternatives),\
+             禁止只给出单一方案就拍板\n\
+             2. 每个候选方案需评估 trade-off:优势 / 劣势 / 适用场景 / 风险\n\
+             3. 推荐方案必须给出否决其他方案的理由(rationale),\
+             而非仅陈述推荐方案的优势\n\
+             4. 涉及向后兼容/迁移成本的决策,必须评估现有用户/代码的影响范围\n\
+             5. 架构决策写入 NOTEBOOK.md `<decisions>` 段(context/decision/rationale/alternatives),\
+             供后续 compaction 后回溯\n\
+             6. 禁止凭直觉或习惯拍板:任何架构决策必须有可复现的论证依据\
+             (benchmark / 代码引用 / 论文 / 既有项目实践)"
+        ),
+        crate::multi_agent::TaskComplexity::Simple => base_prompt.to_string(),
+    }
+}
+
+/// 构造子智能体完整请求 — 3a/3b DRY 公共入口。
+///
+/// `execute_subagent_llm` 与 `SubagentDispatcher::dispatch_impl` 共用,
+/// 消除两份重复 prompt 构造:
+/// - system prompt 纯静态(见 [`build_subagent_system_prompt`])
+/// - id/name/task 移入 user message,单次出现
+/// - `request_kind = Subagent`,经 cli 侧路由到独立缓存统计 session
+pub(crate) fn build_subagent_request(
+    subagent_id: &str,
+    name: &str,
+    task: &str,
+    complexity: crate::multi_agent::TaskComplexity,
+) -> ApiRequest {
+    let system_prompt = build_subagent_system_prompt(complexity);
+    let user_message = ConversationMessage {
+        role: MessageRole::User,
+        blocks: vec![ContentBlock::Text {
+            text: format!("# Subagent: {name} ({subagent_id})\n\n请执行以下任务:\n\n{task}"),
+        }],
+        usage: None,
+    };
+    ApiRequest {
+        system_prompt: SystemPromptSplit::from_sections(vec![system_prompt]),
+        messages: vec![user_message],
+        request_kind: RequestKind::Subagent,
+    }
+}
+
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
@@ -1817,9 +1905,7 @@ where
                                 );
                                 for (id, name, preview, _ts) in recent {
                                     let p: String = preview.chars().take(60).collect();
-                                    hint.push_str(&format!(
-                                        "- id={id} tool={name} preview={p}\n"
-                                    ));
+                                    hint.push_str(&format!("- id={id} tool={name} preview={p}\n"));
                                 }
                                 hint.push_str(
                                     "调用示例:recall_full({\"tool_use_id\": \"<id>\"})\n\
@@ -3364,77 +3450,6 @@ where
         }
     }
 
-    /// 构造子智能体 system_prompt — §4.6 诊断 SOP 注入。
-    ///
-    /// 抽出为独立函数以便单元测试验证 SOP 注入逻辑。
-    ///
-    /// - `complexity == Diagnostic`:追加诊断任务执行规范
-    /// - 其他复杂度:仅基础 prompt,不污染简单任务
-    fn build_subagent_system_prompt(
-        subagent_id: &str,
-        name: &str,
-        task: &str,
-        complexity: crate::multi_agent::TaskComplexity,
-    ) -> String {
-        let base_prompt = format!(
-            "# Subagent: {name} ({subagent_id})\n\
-             \n\
-             你是一个子智能体,由主智能体派发执行独立任务。\n\
-             \n\
-             ## 任务\n\
-             {task}\n\
-             \n\
-             ## 约束\n\
-             - 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
-             - 你的响应将被写入文件,主智能体会后续读取\n\
-             - 请提供完整、自包含的分析结果\n\
-             - 不需要调用工具,直接给出你的分析和结论\n\
-             \n\
-             ## 输出格式\n\
-             请直接输出你的分析结果,使用 Markdown 格式。包含:\n\
-             1. 任务理解(简要复述)\n\
-             2. 分析过程\n\
-             3. 关键发现\n\
-             4. 结论和建议"
-        );
-
-        // §4.6 SOP 注入:Diagnostic 和 Architectural 复杂度追加各自 SOP
-        // 设计要点:SOP 仅注入高复杂度任务,避免污染简单任务;规则固化到系统提示,
-        // 能力不足模型也无法绕过;与验证门禁形成"提示层 + 强制层"双重防护。
-        //
-        // v2 新增:Architectural 复杂度的架构决策 SOP(§10.5 v2 扩展路径)
-        // - 与 Diagnostic SOP 互补:Diagnostic 解决"凭直觉堆砌防御代码",
-        //   Architectural 解决"凭直觉拍板方案、缺乏 trade-off 论证"
-        // - 借鉴 Anthropic Multi-Agent Research System 的 rubric 评分维度
-        match complexity {
-            crate::multi_agent::TaskComplexity::Diagnostic => format!(
-                "{base_prompt}\n\n\
-                 ## 诊断任务执行规范\n\
-                 1. 遇到崩溃/闪退类问题,第一动作是写文件诊断日志(CLAW_DIAG=1 或调用 diag! 宏),\
-                 而非凭直觉堆砌防御代码\n\
-                 2. 先用可靠信号确认错误类型(panic vs Err vs 配置错误),再决定修复方向\n\
-                 3. 修改后必须运行 `cargo build` 验证编译通过\n\
-                 4. 声称修复后必须提供复现验证证据(重新运行原场景确认不崩溃)\n\
-                 5. 禁止在未验证根因的情况下堆砌 catch_unwind / panic hook 等防御性代码"
-            ),
-            crate::multi_agent::TaskComplexity::Architectural => format!(
-                "{base_prompt}\n\n\
-                 ## 架构决策执行规范\n\
-                 1. 提出方案前必须列出至少 2 个候选方案(alternatives),\
-                 禁止只给出单一方案就拍板\n\
-                 2. 每个候选方案需评估 trade-off:优势 / 劣势 / 适用场景 / 风险\n\
-                 3. 推荐方案必须给出否决其他方案的理由(rationale),\
-                 而非仅陈述推荐方案的优势\n\
-                 4. 涉及向后兼容/迁移成本的决策,必须评估现有用户/代码的影响范围\n\
-                 5. 架构决策写入 NOTEBOOK.md `<decisions>` 段(context/decision/rationale/alternatives),\
-                 供后续 compaction 后回溯\n\
-                 6. 禁止凭直觉或习惯拍板:任何架构决策必须有可复现的论证依据\
-                 (benchmark / 代码引用 / 论文 / 既有项目实践)"
-            ),
-            crate::multi_agent::TaskComplexity::Simple => base_prompt,
-        }
-    }
-
     /// 子智能体 LLM 调用的核心逻辑(无 `self` 借用,避免与 `api_client` 冲突)。
     ///
     /// 抽出为自由函数,以便 [`run_subagent_turn`] 和
@@ -3456,29 +3471,8 @@ where
         let gated = crate::knowledge_freshness::gate_task(task, 0).await;
         let enhanced_task = gated.enhance_task(task);
 
-        // 构造子智能体 system_prompt — §4.6 诊断 SOP 注入
-        let system_prompt = Self::build_subagent_system_prompt(
-            subagent_id,
-            name,
-            &enhanced_task,
-            complexity,
-        );
-
-        let subagent_system_prompt = SystemPromptSplit::from_sections(vec![system_prompt]);
-
-        // 构造子智能体的 user message — task 作为唯一输入
-        let user_message = ConversationMessage {
-            role: MessageRole::User,
-            blocks: vec![ContentBlock::Text {
-                text: format!("请执行以下任务:\n\n{enhanced_task}"),
-            }],
-            usage: None,
-        };
-        let request = ApiRequest {
-            system_prompt: subagent_system_prompt,
-            messages: vec![user_message],
-            request_kind: RequestKind::Subagent,
-        };
+        // 3a:统一构造 — system 静态,id/name/task 进 user message(DRY)
+        let request = build_subagent_request(subagent_id, name, &enhanced_task, complexity);
 
         // v3:async 调用 LLM — 通过 stream_async 避免 nested block_on panic。
         // 调用方(`run_subagent_turn_with_model`)必须在 async 上下文中。
@@ -4812,11 +4806,12 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, compaction_threshold_for_context_window,
-        parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, ApiClient,
-        ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
-        RequestKind, RuntimeError, StaticToolExecutor, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, SESSION_SEARCH_TOOL_SPEC,
+        build_assistant_message, build_subagent_request, build_subagent_system_prompt,
+        compaction_threshold_for_context_window, parse_auto_compaction_threshold,
+        parse_auto_compaction_threshold_opt, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError,
+        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        SESSION_SEARCH_TOOL_SPEC,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -7618,24 +7613,21 @@ mod tests {
     //   场景 4:flash 失败 → 升级 pro → 仍失败 → 达 max_attempts fail
     //   场景 5:成本超限 → 拒绝升级 → fail(不浪费 pro 调用)
 
-    // ===== P1 步骤 6:诊断 SOP 注入单元测试 =====
+    // ===== P1 步骤 6:诊断 SOP 注入单元测试(3a 静态化重写) =====
 
-    /// §4.6 验收:Diagnostic 复杂度时 system_prompt 含诊断 SOP
+    /// §4.6 验收:Diagnostic 复杂度时 system_prompt 含诊断 SOP;且不含唯一内容(3a 静态化)
     #[test]
     fn build_subagent_system_prompt_injects_diagnostic_sop() {
-        let prompt =
-            ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
-                "subagent-test",
-                "diag-agent",
-                "定位 wizard 闪退",
-                crate::multi_agent::TaskComplexity::Diagnostic,
-            );
-        // 基础 prompt 内容
+        let prompt = build_subagent_system_prompt(crate::multi_agent::TaskComplexity::Diagnostic);
+        // 3a:静态化后不得包含 id/name/task 唯一内容
         assert!(
-            prompt.contains("# Subagent: diag-agent"),
-            "should contain base header"
+            !prompt.contains("# Subagent:"),
+            "unique header must move to user message"
         );
-        assert!(prompt.contains("定位 wizard 闪退"), "should contain task");
+        assert!(
+            !prompt.contains("定位 wizard 闪退"),
+            "task must move to user message"
+        );
         // 诊断 SOP 五条规则
         assert!(prompt.contains("## 诊断任务执行规范"), "missing SOP header");
         assert!(
@@ -7660,22 +7652,14 @@ mod tests {
         );
     }
 
-    /// §4.6 验收:Simple 复杂度时 system_prompt 不含诊断 SOP(避免污染简单任务)
+    /// §4.6 验收:Simple 复杂度时 system_prompt 不含诊断 SOP(避免污染简单任务);且为纯静态
     #[test]
     fn build_subagent_system_prompt_skips_sop_for_simple_task() {
-        let prompt =
-            ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
-                "subagent-test",
-                "fmt-agent",
-                "格式化 mod.rs",
-                crate::multi_agent::TaskComplexity::Simple,
-            );
-        // 基础 prompt 内容
+        let prompt = build_subagent_system_prompt(crate::multi_agent::TaskComplexity::Simple);
         assert!(
-            prompt.contains("# Subagent: fmt-agent"),
-            "should contain base header"
+            !prompt.contains("# Subagent:"),
+            "unique header must move to user message"
         );
-        // 不应含诊断 SOP
         assert!(
             !prompt.contains("## 诊断任务执行规范"),
             "Simple task should NOT have SOP"
@@ -7686,20 +7670,14 @@ mod tests {
         );
     }
 
-    /// §4.6 v2 验收:Architectural 复杂度注入架构决策 SOP(非诊断 SOP)
+    /// §4.6 v2 验收:Architectural 复杂度注入架构决策 SOP(非诊断 SOP);且为纯静态
     #[test]
     fn build_subagent_system_prompt_injects_architectural_sop() {
         let prompt =
-            ConversationRuntime::<NoopApi, StaticToolExecutor>::build_subagent_system_prompt(
-                "subagent-test",
-                "arch-agent",
-                "评估微服务拆分方案",
-                crate::multi_agent::TaskComplexity::Architectural,
-            );
-        // 基础 prompt 内容
+            build_subagent_system_prompt(crate::multi_agent::TaskComplexity::Architectural);
         assert!(
-            prompt.contains("# Subagent: arch-agent"),
-            "should contain base header"
+            !prompt.contains("# Subagent:"),
+            "unique header must move to user message"
         );
         // 架构决策 SOP 六条规则
         assert!(
@@ -7737,6 +7715,73 @@ mod tests {
         );
     }
 
+    /// 3a:子智能体请求 — system 纯静态,id/name/task 移入 user message 且只出现一次
+    #[test]
+    fn build_subagent_request_moves_unique_fields_to_user_message() {
+        let req = build_subagent_request(
+            "s-1",
+            "diag-agent",
+            "定位 wizard 闪退",
+            crate::multi_agent::TaskComplexity::Diagnostic,
+        );
+        let system = req.system_prompt.static_sections.join("\n");
+        assert!(
+            !system.contains("Subagent"),
+            "id/name must not be in system"
+        );
+        assert!(
+            !system.contains("定位 wizard 闪退"),
+            "task must not be in system"
+        );
+        assert_eq!(req.request_kind, RequestKind::Subagent);
+        assert_eq!(req.messages.len(), 1);
+        let user_text = match &req.messages[0].blocks[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("user message must be text"),
+        };
+        assert!(
+            user_text.contains("# Subagent: diag-agent (s-1)"),
+            "id/name header in user"
+        );
+        // task 只出现一次
+        assert_eq!(
+            user_text.matches("定位 wizard 闪退").count(),
+            1,
+            "task must appear exactly once"
+        );
+    }
+
+    /// 3a:同一复杂度的不同子智能体共享完全相同的 system prompt(前缀缓存可命中)
+    #[test]
+    fn build_subagent_request_shared_prefix_for_same_complexity() {
+        let a = build_subagent_request(
+            "s-1",
+            "agent-a",
+            "任务 A",
+            crate::multi_agent::TaskComplexity::Diagnostic,
+        );
+        let b = build_subagent_request(
+            "s-2",
+            "agent-b",
+            "任务 B",
+            crate::multi_agent::TaskComplexity::Diagnostic,
+        );
+        assert_eq!(
+            a.system_prompt.static_sections,
+            b.system_prompt.static_sections
+        );
+        // 三个复杂度变体互不相同(各自前缀)
+        let simple = build_subagent_request(
+            "s-3",
+            "agent-c",
+            "任务 C",
+            crate::multi_agent::TaskComplexity::Simple,
+        );
+        assert_ne!(
+            simple.system_prompt.static_sections,
+            a.system_prompt.static_sections
+        );
+    }
     /// 可控的 mock ValidationGate — 通过 AtomicUsize 控制第 N 次返回 Ok/Err。
     /// 用于场景 3-5 端到端 retry loop 测试。
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
