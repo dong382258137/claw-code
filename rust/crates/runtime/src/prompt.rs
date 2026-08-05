@@ -1393,7 +1393,8 @@ fn render_plan_mode_constraint_section() -> String {
     "## Plan Mode Constraints (active)\n\
      当前处于 Plan 模式。生成方案/计划前**必须**先调用 `brainstorming` skill,\n\
      生成后**必须**调用 `writing-plans` skill 的 Self-Review 流程(含代码事实核查\n\
-     与实现可行性推演)。未调用 skill 的方案不得进入 Execute 阶段。".to_string()
+     与实现可行性推演)。未调用 skill 的方案不得进入 Execute 阶段。"
+        .to_string()
 }
 
 #[cfg(test)]

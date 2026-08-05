@@ -9,7 +9,7 @@ mod types;
 
 pub use cache_break_detection::{
     cache_break_root, CacheBreakConfig, CacheBreakDetector, CacheBreakEvent, CacheBreakPaths,
-    CacheBreakRecord, CacheBreakReasons, CacheBreakStats,
+    CacheBreakReasons, CacheBreakRecord, CacheBreakStats,
 };
 pub use client::{read_base_url, MessageStream, ProviderClient};
 pub use error::{ApiError, TypedErrorEnvelope, TypedErrorPayload};

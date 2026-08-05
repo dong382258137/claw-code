@@ -2335,7 +2335,10 @@ second para",
         let evidence = super::extract_evidence_before_compaction(&messages);
         assert_eq!(evidence.len(), 1, "should detect table evidence");
         assert!(evidence[0].contains("Bash"), "should include tool name");
-        assert!(evidence[0].contains("成功率"), "should include table content");
+        assert!(
+            evidence[0].contains("成功率"),
+            "should include table content"
+        );
     }
 
     #[test]
@@ -2372,7 +2375,10 @@ second para",
             false,
         )];
         let evidence = super::extract_evidence_before_compaction(&messages);
-        assert!(evidence.is_empty(), "should not detect evidence in plain text");
+        assert!(
+            evidence.is_empty(),
+            "should not detect evidence in plain text"
+        );
     }
 
     #[test]
@@ -2396,13 +2402,18 @@ second para",
             super::EVIDENCE_SUMMARY_MAX_CHARS,
             evidence[0].chars().count()
         );
-        assert!(evidence[0].ends_with('…'), "truncated evidence should end with …");
+        assert!(
+            evidence[0].ends_with('…'),
+            "truncated evidence should end with …"
+        );
     }
 
     #[test]
     fn extract_evidence_skips_non_tool_blocks() {
         let messages = vec![
-            ConversationMessage::user_text("| 方案 | 成功率 |\n|------|--------|\n| A    | 95%    |"),
+            ConversationMessage::user_text(
+                "| 方案 | 成功率 |\n|------|--------|\n| A    | 95%    |",
+            ),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "对比矩阵: A=100 B=200".to_string(),
             }]),
@@ -2417,18 +2428,8 @@ second para",
     #[test]
     fn extract_evidence_handles_multiple_tool_results() {
         let messages = vec![
-            ConversationMessage::tool_result(
-                "call_1",
-                "Bash",
-                "基准: 100 req/s",
-                false,
-            ),
-            ConversationMessage::tool_result(
-                "call_2",
-                "Read",
-                "plain file content",
-                false,
-            ),
+            ConversationMessage::tool_result("call_1", "Bash", "基准: 100 req/s", false),
+            ConversationMessage::tool_result("call_2", "Read", "plain file content", false),
             ConversationMessage::tool_result(
                 "call_3",
                 "Bash",
@@ -2437,6 +2438,10 @@ second para",
             ),
         ];
         let evidence = super::extract_evidence_before_compaction(&messages);
-        assert_eq!(evidence.len(), 2, "should detect evidence in call_1 and call_3");
+        assert_eq!(
+            evidence.len(),
+            2,
+            "should detect evidence in call_1 and call_3"
+        );
     }
 }

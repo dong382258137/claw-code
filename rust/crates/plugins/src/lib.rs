@@ -2341,8 +2341,8 @@ mod tests {
             // 被自动打开后控制序列泄漏到 TUI 终端。
             let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
             let target_tmp = manifest_dir
-                .parent()  // crates/plugins → crates
-                .and_then(|p| p.parent())  // crates → workspace root
+                .parent() // crates/plugins → crates
+                .and_then(|p| p.parent()) // crates → workspace root
                 .map(|root| root.join("target").join("tmp"))
                 .unwrap_or_else(std::env::temp_dir);
             let path = target_tmp.join(format!("plugins-{label}-{nanos}"));
@@ -2513,7 +2513,10 @@ mod tests {
         let (init_cmd, shutdown_cmd) = if cfg!(windows) {
             ("echo init>>lifecycle.log", "echo shutdown>>lifecycle.log")
         } else {
-            ("printf 'init\\n' >> lifecycle.log", "printf 'shutdown\\n' >> lifecycle.log")
+            (
+                "printf 'init\\n' >> lifecycle.log",
+                "printf 'shutdown\\n' >> lifecycle.log",
+            )
         };
         let manifest = serde_json::json!({
             "name": name,
@@ -2543,7 +2546,14 @@ mod tests {
             // PowerShell:用单引号字符串拼接,避免 \" 转义问题
             // (PowerShell 中 \" 不是有效转义,需用 `" 或单引号拼接)
             let script = r#"$i=[Console]::In.ReadToEnd(); '{"plugin":"' + $env:CLAWD_PLUGIN_ID + '","tool":"' + $env:CLAWD_TOOL_NAME + '","input":' + $i + '}'"#;
-            ("powershell".to_string(), vec!["-NoProfile".to_string(), "-Command".to_string(), script.to_string()])
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    script.to_string(),
+                ],
+            )
         } else {
             let script = r#"INPUT=$(cat); printf '{"plugin":"%s","tool":"%s","input":%s}\n' "$CLAWD_PLUGIN_ID" "$CLAWD_TOOL_NAME" "$INPUT""#;
             ("sh".to_string(), vec!["-c".to_string(), script.to_string()])

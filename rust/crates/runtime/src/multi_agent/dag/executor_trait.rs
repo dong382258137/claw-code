@@ -135,7 +135,10 @@ mod tests {
     async fn echo_executor_returns_node_result() {
         let executor = EchoExecutor;
         let node = sample_node();
-        let result = executor.execute(&node, 0).await.expect("echo should succeed");
+        let result = executor
+            .execute(&node, 0)
+            .await
+            .expect("echo should succeed");
         assert_eq!(result.node_id, "n1");
         assert_eq!(result.summary, "echo hello");
     }

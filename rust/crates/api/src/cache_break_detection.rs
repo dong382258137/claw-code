@@ -363,11 +363,7 @@ fn classify_break_reason(reason: &str, reasons: &mut CacheBreakReasons) {
     }
 }
 
-fn apply_usage_to_stats(
-    stats: &mut CacheBreakStats,
-    usage: &Usage,
-    request_hash: &str,
-) {
+fn apply_usage_to_stats(stats: &mut CacheBreakStats, usage: &Usage, request_hash: &str) {
     stats.total_cache_creation_input_tokens += u64::from(usage.cache_creation_input_tokens);
     stats.total_cache_read_input_tokens += u64::from(usage.cache_read_input_tokens);
     stats.last_cache_creation_input_tokens = Some(usage.cache_creation_input_tokens);
@@ -478,15 +474,13 @@ fn stable_hash_bytes(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        detect_cache_break, read_json, request_hash_hex, sanitize_path_segment,
-        CacheBreakConfig, CacheBreakDetector, CacheBreakPaths, TrackedPromptState,
+        detect_cache_break, read_json, request_hash_hex, sanitize_path_segment, CacheBreakConfig,
+        CacheBreakDetector, CacheBreakPaths, TrackedPromptState,
     };
-    use crate::types::{
-        InputMessage, MessageRequest, SystemContent, Usage,
-    };
+    use crate::types::{InputMessage, MessageRequest, SystemContent, Usage};
 
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

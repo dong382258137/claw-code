@@ -624,10 +624,7 @@ mod tests {
         assert_eq!(requests[0].model, "deepseek-v4-flash");
         assert_eq!(requests[1].model, "deepseek-v4-flash");
         // 并行模式
-        assert_eq!(
-            requests[0].mode,
-            crate::multi_agent::CoordinationMode::Fork
-        );
+        assert_eq!(requests[0].mode, crate::multi_agent::CoordinationMode::Fork);
     }
 
     #[test]

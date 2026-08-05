@@ -160,6 +160,7 @@ impl CompletionVerifier {
     /// - 多语言项目收集所有匹配语言的命令(不再命中即 return)
     /// - Node 项目读取 package.json scripts,按 test > lint > build 优先级选择
     /// - 优先合并 CLAUDE.md 中声明的验证命令
+    ///
     /// 未探测到返回空 Vec(跳过验证)。
     #[must_use]
     pub fn detect_project_commands(workspace_root: &Path) -> Vec<String> {
@@ -584,7 +585,10 @@ mod tests {
         let node_dir = temp.join("test_completion_node_build");
         let _ = std::fs::remove_dir_all(&node_dir);
         let _ = std::fs::create_dir_all(&node_dir);
-        let _ = std::fs::write(node_dir.join("package.json"), r#"{"scripts": {"build": "tsc"}}"#);
+        let _ = std::fs::write(
+            node_dir.join("package.json"),
+            r#"{"scripts": {"build": "tsc"}}"#,
+        );
 
         let commands = CompletionVerifier::detect_project_commands(&node_dir);
         assert_eq!(commands.len(), 1);

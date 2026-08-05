@@ -1157,7 +1157,11 @@ mod tests {
         struct CancelExecutor;
         #[async_trait]
         impl SubagentExecutor for CancelExecutor {
-            async fn execute(&self, _node: &DagNode, _attempt: u32) -> Result<NodeResult, NodeError> {
+            async fn execute(
+                &self,
+                _node: &DagNode,
+                _attempt: u32,
+            ) -> Result<NodeResult, NodeError> {
                 Err(NodeError::Cancelled)
             }
             async fn cancel(&self, _node_id: &str) {}

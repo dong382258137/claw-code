@@ -216,7 +216,7 @@ impl SubagentExecutor for CoordinatorExecutor {
                     }),
                     Err(ve) => {
                         // validation 失败 — 标记 subagent 为 Failed
-                        let _ = coordinator.fail(&subagent_id, &ve.to_string());
+                        let _ = coordinator.fail(&subagent_id, ve.to_string());
 
                         // 返回错误,scheduler 按 max_retries 决定是否重试。
                         // 错误消息中标记 retryable/fatal,方便诊断。
@@ -738,7 +738,10 @@ mod tests {
         // subagent 应为 Completed 且 validated=true
         let agents = coordinator.list();
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].status, crate::multi_agent::SubagentStatus::Completed);
+        assert_eq!(
+            agents[0].status,
+            crate::multi_agent::SubagentStatus::Completed
+        );
         assert!(
             agents[0].validated,
             "subagent should be validated when no gates fail"

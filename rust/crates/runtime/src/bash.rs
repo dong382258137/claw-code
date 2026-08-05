@@ -1239,7 +1239,7 @@ mod tests {
         let enabled_windows = SandboxStatus {
             enabled: true,
             supported: true, // Windows 平台支持
-            active: false,    // 但未激活(改进点 4 之后 supported 反映平台能力)
+            active: false,   // 但未激活(改进点 4 之后 supported 反映平台能力)
             ..Default::default()
         };
         // pid=999999 几乎肯定不存在,assign_process 会失败但不应 panic
@@ -1506,7 +1506,8 @@ mod activity_monitor {
         let mut kernel: FILETIME = unsafe { MaybeUninit::zeroed().assume_init() };
         let mut user: FILETIME = unsafe { MaybeUninit::zeroed().assume_init() };
 
-        let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
         unsafe { CloseHandle(handle) };
 
         if ok == 0 {
@@ -1554,8 +1555,12 @@ mod activity_monitor {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                let Some(name_str) = name.to_str() else { continue };
-                let Ok(pid) = name_str.parse::<u32>() else { continue };
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                let Ok(pid) = name_str.parse::<u32>() else {
+                    continue;
+                };
                 if known.contains(&pid) {
                     continue;
                 }

@@ -205,7 +205,7 @@ pub fn set_global_research_client(client: Arc<dyn ResearchClient>) {
 pub fn get_global_research_client() -> Option<Arc<dyn ResearchClient>> {
     GLOBAL_RESEARCH_CLIENT
         .get()
-        .and_then(|opt| opt.as_ref().map(|c| Arc::clone(c)))
+        .and_then(|opt| opt.as_ref().map(Arc::clone))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -245,7 +245,7 @@ pub fn set_global_freshness_assessor(assessor: Arc<dyn FreshnessAssessor>) {
 pub fn get_global_freshness_assessor() -> Option<Arc<dyn FreshnessAssessor>> {
     GLOBAL_FRESHNESS_ASSESSOR
         .get()
-        .and_then(|opt| opt.as_ref().map(|a| Arc::clone(a)))
+        .and_then(|opt| opt.as_ref().map(Arc::clone))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -280,7 +280,7 @@ pub fn set_global_query_builder(builder: Arc<dyn QueryBuilderClient>) {
 pub fn get_global_query_builder() -> Option<Arc<dyn QueryBuilderClient>> {
     GLOBAL_QUERY_BUILDER
         .get()
-        .and_then(|opt| opt.as_ref().map(|b| Arc::clone(b)))
+        .and_then(|opt| opt.as_ref().map(Arc::clone))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -320,11 +320,9 @@ impl GatedTask {
     /// Phase 0 无摘要,原样返回 task。
     pub fn enhance_task<'a>(&self, task: &'a str) -> std::borrow::Cow<'a, str> {
         match &self.research_summary {
-            Some(summary) => {
-                std::borrow::Cow::Owned(format!(
-                    "{task}\n\n---\n## 调研材料(供参考,与任务冲突时需交叉验证)\n{summary}"
-                ))
-            }
+            Some(summary) => std::borrow::Cow::Owned(format!(
+                "{task}\n\n---\n## 调研材料(供参考,与任务冲突时需交叉验证)\n{summary}"
+            )),
             None => std::borrow::Cow::Borrowed(task),
         }
     }
@@ -372,6 +370,7 @@ fn cache_put(task_hash: u64, gated: GatedTask) {
 /// 1. plan §6.1 明确"若 GatedTask 丢失则写 None 不阻塞",本方案是 best-effort 增强
 /// 2. 并发子 agent 通常 freshness 相近(同批任务),knowledge_source 差异小
 /// 3. 精确传递需要改 ConversationRuntime 结构 + async task-local,复杂度过高
+///
 /// 因此采用此全局 last-gated 方案,在不改数据结构的前提下实现自动注入。
 static LAST_GATED_SOURCE: Mutex<Option<&'static str>> = Mutex::new(None);
 
@@ -492,10 +491,7 @@ pub async fn gate_task(task: &str, attempt: u32) -> GatedTask {
             } else {
                 build_research_query(task) // 默认:启发式
             };
-            match client.research(&query).await {
-                Ok(summary) => Some(summary),
-                Err(_) => None, // 降级:调研失败不阻塞任务
-            }
+            client.research(&query).await.ok() // 降级:调研失败不阻塞任务
         } else {
             None // 降级:client 未注入(Phase 0 默认)
         }

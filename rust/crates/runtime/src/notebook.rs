@@ -890,7 +890,9 @@ mod tests {
     fn append_evidence_creates_section() {
         let mut nb = Notebook::new();
         nb.append_evidence("[Bash] 基准结果: 100 req/s");
-        let content = nb.get_section("evidence").expect("evidence section should exist");
+        let content = nb
+            .get_section("evidence")
+            .expect("evidence section should exist");
         assert!(content.contains("基准结果"));
         assert!(content.contains("100 req/s"));
     }
@@ -900,7 +902,9 @@ mod tests {
         let mut nb = Notebook::new();
         nb.append_evidence("[Bash] 第一次基准: 100 req/s");
         nb.append_evidence("[Bash] 第二次基准: 120 req/s");
-        let content = nb.get_section("evidence").expect("evidence section should exist");
+        let content = nb
+            .get_section("evidence")
+            .expect("evidence section should exist");
         assert!(content.contains("第一次基准"));
         assert!(content.contains("第二次基准"));
         assert_eq!(content.matches('\n').count(), 1); // 两行,一个换行
@@ -913,7 +917,9 @@ mod tests {
         for i in 0..50 {
             nb.append_evidence(&format!("[Bash] 基准测试 #{i:03}: {}", "x".repeat(80)));
         }
-        let content = nb.get_section("evidence").expect("evidence section should exist");
+        let content = nb
+            .get_section("evidence")
+            .expect("evidence section should exist");
         assert!(
             content.chars().count() <= super::EVIDENCE_MAX_CHARS,
             "evidence section should be <= 4K, got {} chars",

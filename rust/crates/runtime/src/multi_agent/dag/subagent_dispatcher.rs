@@ -6,11 +6,10 @@
 //! LLM 调用逻辑提取为独立结构,持有 `Arc<Mutex<Box<dyn ApiClient + Send>>>`
 //! 共享状态,可在多线程异步上下文中安全调用。
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use crate::conversation::ApiClient;
 use crate::session::ContentBlock;
-
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// 共享状态的子 agent 调度器。
 ///

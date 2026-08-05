@@ -187,12 +187,11 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
             );
         } else if cfg!(target_os = "macos") {
             fallback_reasons.push(
-                "namespace 隔离不可用（需 Linux），已降级为 sandbox-exec 资源限制".to_string()
+                "namespace 隔离不可用（需 Linux），已降级为 sandbox-exec 资源限制".to_string(),
             );
         } else {
-            fallback_reasons.push(
-                "平台支持沙箱但请求的隔离类型未激活（如 namespace 不可用）".to_string()
-            );
+            fallback_reasons
+                .push("平台支持沙箱但请求的隔离类型未激活（如 namespace 不可用）".to_string());
         }
     }
     if request.enabled && request.namespace_restrictions && !namespace_supported {

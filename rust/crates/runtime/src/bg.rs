@@ -868,12 +868,7 @@ mod tests {
     fn follow_log_tail_returns_immediately_for_dead_process_no_file() {
         let ws = temp_workspace();
         // PID 99999999 不存活，日志文件不存在
-        let result = follow_log_tail(
-            &ws,
-            99999999,
-            |_| panic!("不应调用 on_new_line"),
-            || false,
-        );
+        let result = follow_log_tail(&ws, 99999999, |_| panic!("不应调用 on_new_line"), || false);
         assert!(result.is_ok());
     }
 
@@ -886,12 +881,7 @@ mod tests {
         let log = log_path(&ws, 99999999);
         fs::write(&log, "old line 1\nold line 2\n").unwrap();
 
-        let result = follow_log_tail(
-            &ws,
-            99999999,
-            |_| panic!("不应回读历史行"),
-            || false,
-        );
+        let result = follow_log_tail(&ws, 99999999, |_| panic!("不应回读历史行"), || false);
         assert!(result.is_ok());
     }
 
