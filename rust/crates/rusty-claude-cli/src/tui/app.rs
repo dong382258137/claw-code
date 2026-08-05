@@ -16,6 +16,7 @@
 use std::io::{self, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -307,6 +308,10 @@ fn has_instruction_files_in_cwd() -> bool {
     }
     false
 }
+/// 当前输出内容区宽度（显示列），由 draw 循环每帧更新；
+/// emitter 在渲染 markdown 表格前读取，保证表格宽度匹配内容区。
+static OUTPUT_CONTENT_WIDTH: AtomicUsize = AtomicUsize::new(0);
+
 fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Line<'static>> {
     if area_width == 0 {
         return vec![line.clone()];
@@ -1076,6 +1081,7 @@ fn run_event_loop(
             let raw_breaks = output_view.snapshot_breaks();
             let visible_height = main_area.height.saturating_sub(1) as usize; // Borders::TOP = 1 line
             let content_width = main_area.width as usize;
+            OUTPUT_CONTENT_WIDTH.store(content_width, Ordering::Relaxed);
             let output_ptr = Arc::as_ptr(&output_lines);
             let (wrapped_lines_arc, display_breaks) = if output_ptr == cached_wrap_ptr && content_width == cached_wrap_width {
                 // 折行缓存命中：内容指针 + 宽度均未变，零开销复用
@@ -2970,6 +2976,7 @@ fn execute_turn(
                 // 在安全边界处输出已渲染的 ANSI 片段，避免半个 fence 渲染错乱。
                 let renderer = TerminalRenderer::shared();
                 if let Ok(mut ms) = markdown_state_for_closure.lock() {
+                ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
                     if let Some(rendered) = ms.push(renderer, &text) {
                         if let Ok(mut buf) = output_handle.lock() {
                             buf.append(&rendered);
@@ -3112,6 +3119,7 @@ fn execute_turn(
                 // 必须在 "\n\n" 分隔符之前执行，保证 AI 回复尾段不丢失。
                 let renderer = TerminalRenderer::shared();
                 if let Ok(mut ms) = markdown_state_for_closure.lock() {
+                ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
                     if let Some(rendered) = ms.flush(renderer) {
                         if let Ok(mut buf) = output_for_closure.lock() {
                             buf.append(&rendered);
@@ -3174,6 +3182,7 @@ fn execute_turn(
                 // MD 渲染 flush：错误前先渲染 pending markdown，避免丢失尾段。
                 let renderer = TerminalRenderer::shared();
                 if let Ok(mut ms) = markdown_state_for_closure.lock() {
+                ms.set_max_width(Some(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed)));
                     if let Some(rendered) = ms.flush(renderer) {
                         if let Ok(mut buf) = output_for_closure.lock() {
                             buf.append(&rendered);
@@ -3857,6 +3866,26 @@ mod tests {
             text.lines.is_empty() || text.lines.iter().all(|l| l.spans.is_empty()),
             "empty markdown should yield empty text, got: {text:?}"
         );
+    }
+    #[test]
+    fn output_content_width_static_stores_and_loads() {
+        use std::sync::atomic::Ordering;
+        OUTPUT_CONTENT_WIDTH.store(40, Ordering::Relaxed);
+        assert_eq!(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed), 40);
+        OUTPUT_CONTENT_WIDTH.store(0, Ordering::Relaxed);
+        assert_eq!(OUTPUT_CONTENT_WIDTH.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn emitter_textdelta_still_appends_after_width_wiring() {
+        use crate::streaming::StatusEvent;
+        let output_view = OutputView::new();
+        let handle = output_view.shared_handle();
+        let status = StatusBarState::shared();
+        let emitter = build_test_emitter(handle, Arc::clone(&status));
+        emitter(StatusEvent::TextDelta("Hello table".to_string()));
+        let snapshot = output_view.snapshot();
+        assert!(snapshot.contains("Hello table"), "TextDelta 应被追加到输出缓冲");
     }
 }
 
