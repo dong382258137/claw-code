@@ -99,10 +99,13 @@ fn deploy_builtin_skills() {
         .nth(3)
         .expect("OUT_DIR should have at least 4 ancestors (target/<profile>/build/<pkg-hash>/out)");
     let dst_skills = target_profile_dir.join("skills");
-
-    // 增量复制:如果目标已存在且源未变,跳过。
-    // 用 rerun-if-changed 监听源目录,只有 skill 文件变化才重新运行 build.rs。
-    println!("cargo:rerun-if-changed={}", src_skills.display());
+    // 注意:这里**不能**输出 rerun-if-changed。
+    // 一旦输出任何 rerun-if-changed,Cargo 就认为 build.rs 的输入只有这些
+    // 路径,只要它们不变就复用缓存的 build script 输出 → 上面注入的
+    // GIT_SHA(rustc-env)停留在首次构建时的值,新提交构建出的二进制
+    // 会显示旧 SHA(曾导致部署的二进制标注 be4b6789 而非实际 HEAD)。
+    // 不输出 rerun-if-changed = 每次构建都重跑 build.rs(默认行为),
+    // 与上方 GIT_SHA 修复的意图一致:代价是每次构建多花几十毫秒。
 
     // 删除旧目标(可能是旧版本 skill),然后重新复制。
     // 用 std::fs::remove_dir_all + create_dir_all 而非 cp -r,跨平台。
