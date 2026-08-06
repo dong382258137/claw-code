@@ -809,11 +809,12 @@ impl OutputBuffer {
                 Ok(mut lines) => {
                     // 快速路径：strong_count==1，零拷贝取出 Vec
                     self.cached_lines_breaks.truncate(from_idx + 1);
-                    let line_start = self
-                        .cached_lines_breaks
-                        .get(from_idx)
-                        .copied()
-                        .expect("breaks[from_idx] must exist after truncate to from_idx+1");
+                    let Some(line_start) = self.cached_lines_breaks.get(from_idx).copied() else {
+                        // 索引越界保护：breaks 与 entries 数量不一致导致 from_idx 越界时，
+                        // 放弃增量更新，交给下次 snapshot_lines() 全量重建，避免渲染线程 panic。
+                        self.invalidate_lines_cache();
+                        return;
+                    };
                     lines.truncate(line_start);
                     for i in from_idx..self.entries.len() {
                         let rendered = self.entries[i].render();
@@ -830,11 +831,12 @@ impl OutputBuffer {
                     // 避免 invalidate → 全量 ansi_to_lines 重建（5-10ms 持锁）。
                     let mut lines: Vec<Line<'static>> = (*arc).clone();
                     self.cached_lines_breaks.truncate(from_idx + 1);
-                    let line_start = self
-                        .cached_lines_breaks
-                        .get(from_idx)
-                        .copied()
-                        .expect("breaks[from_idx] must exist after truncate to from_idx+1");
+                    let Some(line_start) = self.cached_lines_breaks.get(from_idx).copied() else {
+                        // 索引越界保护：breaks 与 entries 数量不一致导致 from_idx 越界时，
+                        // 放弃增量更新，交给下次 snapshot_lines() 全量重建，避免渲染线程 panic。
+                        self.invalidate_lines_cache();
+                        return;
+                    };
                     lines.truncate(line_start);
                     for i in from_idx..self.entries.len() {
                         let rendered = self.entries[i].render();

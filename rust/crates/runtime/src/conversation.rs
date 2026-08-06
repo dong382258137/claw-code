@@ -45,8 +45,8 @@ use crate::multi_agent::{
 // v3:新增 DagGraph / DagScheduler / DagNode / DagError / NodeResult / RetryPolicy,
 // 用于 spawn_parallel_via_dag 真并行 spawn。
 use crate::multi_agent::dag::{
-    CoordinatorExecutor, DagError, DagGraph, DagNode, DagScheduler, FailFast, NodeResult,
-    RetryPolicy, SubagentDispatcher, SubagentRunner,
+    CoordinatorExecutor, DagError, DagGraph, DagNode, DagRunResult, DagScheduler, FailFast,
+    NodeResult, RetryPolicy, SubagentDispatcher, SubagentRunner,
 };
 // Step 3.2-a:LaneEvent helpers for SubagentHandoff / SubagentResult.
 use crate::lane_events::{try_publish as publish_lane_event, LaneEvent};
@@ -1486,7 +1486,7 @@ where
             }
         };
 
-        let run_result = rt.block_on(async move { scheduler.run().await });
+        let run_result = rt.block_on(async move { scheduler.run_with_details().await });
         Self::map_dag_run_result(run_result, nodes, results)
     }
 
@@ -1528,7 +1528,7 @@ where
         let graph = Self::build_spawn_parallel_graph(&nodes);
         let scheduler = DagScheduler::new(graph, executor).with_fail_fast(fail_fast);
 
-        let run_result = scheduler.run().await;
+        let run_result = scheduler.run_with_details().await;
         Self::map_dag_run_result(run_result, nodes, results)
     }
 
@@ -1648,30 +1648,46 @@ where
         graph
     }
 
-    /// 私有辅助:将 `DagScheduler::run` 的结果映射回 `Vec<Result<String, String>>`。
+    /// 私有辅助:将 `DagScheduler::run_with_details` 的结果映射回 `Vec<Result<String, String>>`。
     ///
-    /// - `Ok(node_results)`:按 node_id 索引填充成功结果;缺失的 node 标记为 `Err`
+    /// - `Ok(DagRunResult)`:
+    ///   - `successes`:按 node_id 索引填充成功结果
+    ///   - `failures`:`(node_id, error)` 逐条标记为 `Err(subagent failed: ...)`
+    ///     携带真实失败原因(FailFast::Off 场景,节点失败但 DAG 继续执行)
+    ///   - `skipped`:标记为 `Err(skipped due to dependency failure)`。
+    ///     理论上的"结果缺失"(既不在成功也不在失败/跳过)仍标记 `Err(result missing)`,
+    ///     作为防御性兜底
     /// - `Err(dag_err)`:FailFast 场景,失败的 node 标记为 `subagent failed`,
     ///   其他 node 标记为 `cancelled due to sibling failure`
     fn map_dag_run_result(
-        run_result: Result<Vec<NodeResult>, DagError>,
+        run_result: Result<DagRunResult, DagError>,
         nodes: Vec<(usize, DagNode)>,
         mut results: Vec<Result<String, String>>,
     ) -> Vec<Result<String, String>> {
         match run_result {
-            Ok(node_results) => {
-                // 全部成功:按 node_id 索引填充
+            Ok(details) => {
+                // 成功节点:按 node_id 索引填充
                 let mut result_map: HashMap<String, NodeResult> = HashMap::new();
-                for nr in node_results {
+                for nr in details.successes {
                     result_map.insert(nr.node_id.clone(), nr);
                 }
+                // 失败节点:node_id → 真实失败原因
+                let failed_map: HashMap<String, String> = details.failures.into_iter().collect();
+                // 跳过节点
+                let skipped: Vec<String> = details.skipped;
                 for (idx, node) in nodes {
-                    match result_map.remove(&node.id) {
-                        Some(nr) => results[idx] = Ok(nr.summary),
-                        None => {
-                            results[idx] =
-                                Err(format!("node {} result missing after DAG run", node.id));
-                        }
+                    if let Some(nr) = result_map.remove(&node.id) {
+                        results[idx] = Ok(nr.summary);
+                    } else if let Some(err) = failed_map.get(&node.id) {
+                        results[idx] = Err(format!("subagent failed: {err}"));
+                    } else if skipped.contains(&node.id) {
+                        results[idx] = Err(format!(
+                            "skipped due to dependency failure: node {} not executed",
+                            node.id
+                        ));
+                    } else {
+                        results[idx] =
+                            Err(format!("node {} result missing after DAG run", node.id));
                     }
                 }
             }
@@ -1705,6 +1721,8 @@ where
     pub fn multi_agent_coordinator(&self) -> Option<&MultiAgentCoordinator> {
         self.multi_agent_coordinator.as_ref()
     }
+
+    /// 获取已注入的 TraceAnalyzer handle(克隆 `Arc`)。
 
     /// 获取已注入的 TraceAnalyzer handle(克隆 `Arc`)。
     ///
