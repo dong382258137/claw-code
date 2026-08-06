@@ -191,11 +191,42 @@ impl CacheBreakDetector {
     /// 不缓存响应,只更新指纹状态和统计。
     #[must_use]
     pub fn record_usage(&self, request: &MessageRequest, usage: &Usage) -> CacheBreakRecord {
+        self.record_usage_inner(request, usage, /* multi_turn = */ false)
+    }
+
+    /// 多轮 tool call 循环专用:仅比对 system/tools/model hash,忽略 messages_hash 变化。
+    ///
+    /// 用于子智能体多轮 tool call 循环(设计文档 §3.3.3):多轮中 system prompt 不变,
+    /// `messages` 数组增长是预期行为,不应触发 "message payload changed" break 误报。
+    /// 主 agent 的 `CacheBreakDetector` 仍用 [`record_usage`](Self::record_usage)
+    /// (主 agent 的 messages 增长确实是 break 信号)。
+    #[must_use]
+    pub fn record_usage_multi_turn(
+        &self,
+        request: &MessageRequest,
+        usage: &Usage,
+    ) -> CacheBreakRecord {
+        self.record_usage_inner(request, usage, /* multi_turn = */ true)
+    }
+
+    /// `record_usage` / `record_usage_multi_turn` 共用实现。
+    ///
+    /// `multi_turn=true` 时调用 [`detect_cache_break_multi_turn`],跳过 messages_hash 比对。
+    fn record_usage_inner(
+        &self,
+        request: &MessageRequest,
+        usage: &Usage,
+        multi_turn: bool,
+    ) -> CacheBreakRecord {
         let request_hash = request_hash_hex(request);
         let mut inner = self.lock();
         let previous = inner.previous.clone();
         let current = TrackedPromptState::from_usage(request, usage);
-        let cache_break = detect_cache_break(&inner.config, previous.as_ref(), &current);
+        let cache_break = if multi_turn {
+            detect_cache_break_multi_turn(&inner.config, previous.as_ref(), &current)
+        } else {
+            detect_cache_break(&inner.config, previous.as_ref(), &current)
+        };
 
         inner.stats.tracked_requests += 1;
         apply_usage_to_stats(&mut inner.stats, usage, &request_hash);
@@ -310,6 +341,80 @@ fn detect_cache_break(
     }
     if previous.messages_hash != current.messages_hash {
         reasons.push("message payload changed");
+    }
+
+    let elapsed = current
+        .observed_at_unix_secs
+        .saturating_sub(previous.observed_at_unix_secs);
+
+    let (unexpected, reason) = if reasons.is_empty() {
+        if elapsed > config.prompt_ttl.as_secs() {
+            (
+                false,
+                format!("possible prompt cache TTL expiry after {elapsed}s"),
+            )
+        } else {
+            (
+                true,
+                "cache read tokens dropped while prompt fingerprint remained stable".to_string(),
+            )
+        }
+    } else {
+        (false, reasons.join(", "))
+    };
+
+    Some(CacheBreakEvent {
+        unexpected,
+        reason,
+        previous_cache_read_input_tokens: previous.cache_read_input_tokens,
+        current_cache_read_input_tokens: current.cache_read_input_tokens,
+        token_drop,
+    })
+}
+
+/// 多轮 tool call 循环专用 cache break 检测(设计文档 §3.3.3)。
+///
+/// 与 [`detect_cache_break`] 的差异:**不检查 `messages_hash`**。
+/// 多轮循环中 system prompt 不变,`messages` 数组增长(追加 assistant + tool_result)
+/// 是预期行为,前缀缓存命中是正常的;只有 system/tools/model hash 变化
+/// (如 capability 切换)才视为真实 break。
+fn detect_cache_break_multi_turn(
+    config: &CacheBreakConfig,
+    previous: Option<&TrackedPromptState>,
+    current: &TrackedPromptState,
+) -> Option<CacheBreakEvent> {
+    let previous = previous?;
+    if previous.fingerprint_version != current.fingerprint_version {
+        return Some(CacheBreakEvent {
+            unexpected: false,
+            reason: format!(
+                "fingerprint version changed (v{} -> v{})",
+                previous.fingerprint_version, current.fingerprint_version
+            ),
+            previous_cache_read_input_tokens: previous.cache_read_input_tokens,
+            current_cache_read_input_tokens: current.cache_read_input_tokens,
+            token_drop: previous
+                .cache_read_input_tokens
+                .saturating_sub(current.cache_read_input_tokens),
+        });
+    }
+    let token_drop = previous
+        .cache_read_input_tokens
+        .saturating_sub(current.cache_read_input_tokens);
+    if token_drop < config.cache_break_min_drop {
+        return None;
+    }
+
+    // ⚠ 不检查 messages_hash — 多轮循环中 messages 增长是预期行为
+    let mut reasons = Vec::new();
+    if previous.model_hash != current.model_hash {
+        reasons.push("model changed");
+    }
+    if previous.system_hash != current.system_hash {
+        reasons.push("system prompt changed");
+    }
+    if previous.tools_hash != current.tools_hash {
+        reasons.push("tool definitions changed");
     }
 
     let elapsed = current
@@ -667,5 +772,130 @@ mod tests {
             system: Some(SystemContent::from_text(system)),
             ..Default::default()
         }
+    }
+
+    /// §3.3.3:多轮循环中 messages 增长但 system/tools/model 不变,且 token 下降。
+    /// 普通 `detect_cache_break` 会把下降归因于 "message payload changed"
+    /// (多轮中 messages 必然增长,该归因是噪声);`detect_cache_break_multi_turn`
+    /// 跳过 messages_hash 比对,**不产生 "message payload changed" 归因**。
+    #[test]
+    fn multi_turn_does_not_attribute_drop_to_messages_change() {
+        let prev_request = sample_request("turn 1");
+        // 同一 system("system")/tools/model,仅 messages 不同(模拟 tool_result 追加)
+        let curr_request = sample_request_with_system("turn 2", "system");
+        let previous = TrackedPromptState::from_usage(
+            &prev_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 6_000,
+                output_tokens: 0,
+            },
+        );
+        let current = TrackedPromptState::from_usage(
+            &curr_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1_000, // drop=5000 ≥ min_drop(2000)
+                output_tokens: 0,
+            },
+        );
+        // 普通 detect_cache_break:messages_hash 变化 → 归因 "message payload changed"
+        let normal = detect_cache_break(&CacheBreakConfig::default(), Some(&previous), &current)
+            .expect("normal detector flags the drop");
+        assert!(!normal.unexpected);
+        assert!(
+            normal.reason.contains("message payload changed"),
+            "normal detector attributes drop to messages change: {}",
+            normal.reason
+        );
+
+        // multi-turn:跳过 messages_hash → 不归因 "message payload changed"
+        let multi = super::detect_cache_break_multi_turn(
+            &CacheBreakConfig::default(),
+            Some(&previous),
+            &current,
+        )
+        .expect("multi-turn still surfaces the unexplained drop");
+        assert!(
+            !multi.reason.contains("message payload changed"),
+            "multi-turn must NOT attribute drop to messages change: {}",
+            multi.reason
+        );
+    }
+
+    /// §3.3.3:多轮循环中 system prompt 变化(如 capability 切换)→
+    /// `detect_cache_break_multi_turn` 应归因到 "system prompt changed"(真实失效),
+    /// 而非 "message payload changed"。
+    #[test]
+    fn multi_turn_flags_system_prompt_change() {
+        let prev_request = sample_request_with_system("turn 1", "system-A");
+        let curr_request = sample_request_with_system("turn 2", "system-B");
+        let previous = TrackedPromptState::from_usage(
+            &prev_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 6_000,
+                output_tokens: 0,
+            },
+        );
+        let current = TrackedPromptState::from_usage(
+            &curr_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1_000,
+                output_tokens: 0,
+            },
+        );
+        let event = super::detect_cache_break_multi_turn(
+            &CacheBreakConfig::default(),
+            Some(&previous),
+            &current,
+        )
+        .expect("system prompt change should be flagged even in multi-turn");
+        assert!(!event.unexpected);
+        assert!(event.reason.contains("system prompt changed"));
+        assert!(!event.reason.contains("message payload changed"));
+    }
+
+    /// §3.3.3:多轮循环中前缀缓存命中(token 无下降)→ multi-turn 不触发 break
+    /// (与普通检测器一致;此为多轮循环的常态)。
+    #[test]
+    fn multi_turn_no_break_when_cache_hits() {
+        let prev_request = sample_request("turn 1");
+        let curr_request = sample_request_with_system("turn 2", "system");
+        let previous = TrackedPromptState::from_usage(
+            &prev_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 45_000,
+                output_tokens: 0,
+            },
+        );
+        let current = TrackedPromptState::from_usage(
+            &curr_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 45_000, // drop=0 < min_drop → 无 break
+                output_tokens: 0,
+            },
+        );
+        assert!(
+            detect_cache_break(&CacheBreakConfig::default(), Some(&previous), &current).is_none()
+        );
+        assert!(
+            super::detect_cache_break_multi_turn(
+                &CacheBreakConfig::default(),
+                Some(&previous),
+                &current,
+            )
+            .is_none(),
+            "no drop → no break even in multi-turn"
+        );
     }
 }

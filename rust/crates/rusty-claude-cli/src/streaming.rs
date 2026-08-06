@@ -310,7 +310,17 @@ impl AnthropicRuntimeClient {
             cache_read_input_tokens: usage.cache_read_input_tokens,
             output_tokens: usage.output_tokens,
         };
-        let _ = self.detector_for(kind).record_usage(request, &api_usage);
+        // 子智能体经独立 `subagent-{session}` detector 统计(见 detector_for)。
+        // 多轮 tool call 循环中 messages 增长是预期行为(§3.3.3),用
+        // `record_usage_multi_turn` 忽略 messages_hash 变化,避免 "message
+        // payload changed" break 误报。主 agent 仍用 `record_usage`
+        // (messages 增长确实是 break 信号)。
+        let detector = self.detector_for(kind);
+        let _ = if kind == RequestKind::Subagent {
+            detector.record_usage_multi_turn(request, &api_usage)
+        } else {
+            detector.record_usage(request, &api_usage)
+        };
     }
 }
 
@@ -530,10 +540,7 @@ impl ApiClient for AnthropicRuntimeClient {
         let enable_tools = capability.enables_tools();
         let allowed_tools = if enable_tools {
             Some(AllowedToolSet::from_iter(
-                capability
-                    .allowed_tools()
-                    .iter()
-                    .map(|s| s.to_string()),
+                capability.allowed_tools().iter().map(|s| s.to_string()),
             ))
         } else {
             None

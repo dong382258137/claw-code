@@ -3400,12 +3400,36 @@ where
                         Ok(()) => {
                             // 验证通过 → 终态成功
                             final_status = "completed";
-                            final_result_msg = format!(
-                                "Subagent `{subagent_id}` completed (attempt {attempt}/{max_attempts}). \
-                                 Result written to: {result_ref}\n\
-                                 Use Read tool to inspect the result. \
-                                 The subagent ran with an isolated context — it did not pollute your context window."
-                            );
+                            // Epic 5 §8.4:解析 handoff frontmatter,`summary` + `changed_files`
+                            // 进主上下文(给主 agent 足够信息决策是否 Read details),
+                            // `details` 通过 result_ref 按需 Read(不进上下文,避免污染)。
+                            // 解析失败(旧格式/IO 错误)时降级到原文本路径,向后兼容。
+                            let handoff = self.workspace_root.as_deref().and_then(|root| {
+                                crate::multi_agent::read_handoff(&root.join(&result_ref)).ok()
+                            });
+                            final_result_msg = match handoff {
+                                Some(h) => {
+                                    let changed = if h.changed_files.is_empty() {
+                                        "none".to_string()
+                                    } else {
+                                        h.changed_files.join(", ")
+                                    };
+                                    format!(
+                                        "Subagent `{subagent_id}` completed (attempt {attempt}/{max_attempts}).\n\
+                                         Summary: {summary}\n\
+                                         Changed files: {changed}\n\
+                                         Full result: {result_ref} (use Read tool to inspect details).\n\
+                                         The subagent ran with an isolated context — it did not pollute your context window.",
+                                        summary = h.summary,
+                                    )
+                                }
+                                None => format!(
+                                    "Subagent `{subagent_id}` completed (attempt {attempt}/{max_attempts}). \
+                                     Result written to: {result_ref}\n\
+                                     Use Read tool to inspect the result. \
+                                     The subagent ran with an isolated context — it did not pollute your context window."
+                                ),
+                            };
                             break;
                         }
                         Err(ve) if ve.retryable && attempt < max_attempts => {
@@ -3971,6 +3995,7 @@ where
         Ok(Self::format_spawn_parallel_results(
             &results,
             &fail_fast_str,
+            self.workspace_root.as_deref(),
         ))
     }
 
@@ -4016,6 +4041,7 @@ where
         Ok(Self::format_spawn_parallel_results(
             &results,
             &fail_fast_str,
+            self.workspace_root.as_deref(),
         ))
     }
 
@@ -4092,6 +4118,7 @@ where
     fn format_spawn_parallel_results(
         results: &[Result<String, String>],
         fail_fast_str: &str,
+        workspace_root: Option<&std::path::Path>,
     ) -> String {
         let mut output = String::new();
         let success_count = results.iter().filter(|r| r.is_ok()).count();
@@ -4103,7 +4130,20 @@ where
         for (i, r) in results.iter().enumerate() {
             match r {
                 Ok(path) => {
-                    output.push_str(&format!("  [{i}] OK: {path}\n"));
+                    // Epic 5 §8.4:解析 handoff frontmatter,summary 进主上下文,
+                    // details 通过 path 按需 Read。解析失败时降级到仅显示路径。
+                    let summary_line = workspace_root
+                        .and_then(|root| crate::multi_agent::read_handoff(&root.join(path)).ok())
+                        .map(|h| {
+                            let changed = if h.changed_files.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" | changed: {}", h.changed_files.join(", "))
+                            };
+                            format!(" — {}{changed}", h.summary)
+                        })
+                        .unwrap_or_default();
+                    output.push_str(&format!("  [{i}] OK: {path}{summary_line}\n"));
                 }
                 Err(msg) => {
                     output.push_str(&format!("  [{i}] FAIL: {msg}\n"));
@@ -9609,7 +9649,7 @@ mod tests {
         ];
         let output =
             ConversationRuntime::<NoopApi, StaticToolExecutor>::format_spawn_parallel_results(
-                &results, "on",
+                &results, "on", None,
             );
         assert!(output.contains("2 succeeded"), "got: {output}");
         assert!(output.contains("1 failed"), "got: {output}");

@@ -806,14 +806,23 @@ impl MultiAgentCoordinator {
             .unwrap_or_else(|| PathBuf::from("."));
         let changed_files = validation::detect_changed_files(&workspace_root);
 
+        // Epic 5 §8.4:从 handoff frontmatter 提取子智能体声称的变更集。
+        // 与 git diff 全局列表交叉比对(双列表检查),解析失败时为空(向后兼容)。
+        let subagent_changed_files: Vec<PathBuf> =
+            validation::read_handoff_changed_files(&workspace_root.join(&result_path));
+
         let ctx = validation::ValidationContext {
             subagent_id,
             task: &task,
             result_path: &result_path,
             workspace_root: &workspace_root,
             changed_files: &changed_files,
+            subagent_changed_files: &subagent_changed_files,
             model: &model,
         };
+
+        // §8.4 双列表交叉检查:仅诊断(不触发 retry),surface 异常供主 agent 排查。
+        validation::diagnose_changed_files_mismatch(&ctx);
 
         let gates = self.validation_gates.lock().expect("gates lock");
         for gate in gates.iter() {

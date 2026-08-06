@@ -1677,9 +1677,14 @@ mod activity_monitor {
                 .expect("should query own process CPU time");
             // 消耗足够 CPU 时间（>16ms）以超过 GetProcessTimes 精度阈值。
             // 100M 次 wrapping_add 约占 200-500ms CPU，远超 15.625ms 精度。
+            //
+            // ⚠ 必须用 black_box 包裹循环变量 `i`：否则 LLVM SCEV 会把
+            // `sum += i` 识别为归纳变量并直接算出等差数列封闭形式，整个循环
+            // 被替换成常数，CPU 消耗≈0，时间戳不前进（实测 wall=3.5µs）。
+            // black_box 在循环体内破坏 SCEV，强制编译器真正执行迭代。
             let mut sum: u64 = 0;
             for i in 0u64..100_000_000 {
-                sum = sum.wrapping_add(i);
+                sum = sum.wrapping_add(std::hint::black_box(i));
             }
             std::hint::black_box(sum);
             let second = get_process_cpu_time_windows(std::process::id())

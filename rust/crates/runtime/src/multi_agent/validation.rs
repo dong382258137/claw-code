@@ -33,8 +33,13 @@ pub struct ValidationContext<'a> {
     pub result_path: &'a Path,
     /// workspace 根目录,用于执行验证命令。
     pub workspace_root: &'a Path,
-    /// `git diff --name-only` 检测到的修改文件列表。
+    /// `git diff --name-only` 检测到的修改文件列表(全局,含主 agent 并发修改)。
     pub changed_files: &'a [PathBuf],
+    /// subagent handoff 中**声称**修改的文件列表(§8.4 双列表检查)。
+    /// 与 `changed_files`(git diff 全局)交叉比对:
+    /// - 声称改了但 git diff 没有 → 子智能体声称与实际不符,需排查
+    /// - git diff 有但子智能体没声称 → 主 agent 并发修改,不归此子智能体 validation
+    pub subagent_changed_files: &'a [PathBuf],
     /// subagent 使用的模型名(用于诊断日志和 LlmJudgeGate)。
     pub model: &'a str,
 }
@@ -242,6 +247,80 @@ pub fn detect_changed_files(workspace_root: &Path) -> Vec<PathBuf> {
             .map(PathBuf::from)
             .collect(),
         _ => Vec::new(), // 非 git 仓库或 git 不可用,返回空(门禁可能跳过)
+    }
+}
+
+/// Epic 5 §8.4:从 handoff frontmatter 读取子智能体声称的变更文件列表。
+///
+/// 解析失败(旧格式纯文本、IO 错误、无 frontmatter)时返回空 `Vec`,向后兼容。
+/// 路径规范化由 handoff 落盘侧(`extract_changed_files`)保证,此处直接转 `PathBuf`。
+pub fn read_handoff_changed_files(handoff_path: &Path) -> Vec<PathBuf> {
+    match crate::multi_agent::read_handoff(handoff_path) {
+        Ok(h) => h.changed_files.into_iter().map(PathBuf::from).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Epic 5 §8.4:双列表交叉检查 — 子智能体声称的变更集 vs `git diff` 全局变更集。
+///
+/// 返回 `(unverified, concurrent)`:
+/// - `unverified`:子智能体声称改了但 git diff 没有(可能未落盘/被还原,需排查)
+/// - `concurrent`:git diff 有但子智能体没声称(主 agent 并发修改,不归此子智能体)
+///
+/// 归一化:按路径字符串比对(handoff 落盘侧已规范化路径)。
+pub fn compute_changed_files_mismatch(ctx: &ValidationContext<'_>) -> (Vec<String>, Vec<String>) {
+    if ctx.subagent_changed_files.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let git_set: std::collections::HashSet<&str> = ctx
+        .changed_files
+        .iter()
+        .filter_map(|p| p.to_str())
+        .collect();
+    let claimed_set: std::collections::HashSet<&str> = ctx
+        .subagent_changed_files
+        .iter()
+        .filter_map(|p| p.to_str())
+        .collect();
+
+    let unverified = claimed_set
+        .iter()
+        .filter(|n| !git_set.contains(*n))
+        .map(|s| s.to_string())
+        .collect();
+    let concurrent = git_set
+        .iter()
+        .filter(|n| !claimed_set.contains(*n))
+        .map(|s| s.to_string())
+        .collect();
+    (unverified, concurrent)
+}
+
+/// Epic 5 §8.4:双列表交叉检查 — 诊断版(写 `diag` 日志,不触发 validation 失败/retry)。
+///
+/// 不作为硬失败的原因:声称与实际不符也可能是子智能体 edit 后又还原(净零变更),
+/// 硬失败会触发 retry 风暴,与 FailFast::Off 理念冲突;诊断日志已足够 surface 异常。
+pub fn diagnose_changed_files_mismatch(ctx: &ValidationContext<'_>) {
+    let (unverified, concurrent) = compute_changed_files_mismatch(ctx);
+    if !unverified.is_empty() {
+        crate::diag::global().warn(
+            "subagent_changed_files_mismatch",
+            &format!(
+                "subagent {} claimed changes not in git diff: [{}] (可能未落盘/被还原,需排查)",
+                ctx.subagent_id,
+                unverified.join(", "),
+            ),
+        );
+    }
+    if !concurrent.is_empty() {
+        crate::diag::global().info(
+            "subagent_concurrent_changes",
+            &format!(
+                "subagent {} git diff has files not claimed by subagent: [{}] (主 agent 并发修改,不归此子智能体 validation)",
+                ctx.subagent_id,
+                concurrent.join(", "),
+            ),
+        );
     }
 }
 
@@ -518,12 +597,33 @@ mod tests {
         changed_files: &'a [PathBuf],
         model: &'a str,
     ) -> ValidationContext<'a> {
+        make_ctx_with_subagent_files(
+            subagent_id,
+            task,
+            result_path,
+            workspace_root,
+            changed_files,
+            &[],
+            model,
+        )
+    }
+
+    fn make_ctx_with_subagent_files<'a>(
+        subagent_id: &'a str,
+        task: &'a str,
+        result_path: &'a Path,
+        workspace_root: &'a Path,
+        changed_files: &'a [PathBuf],
+        subagent_changed_files: &'a [PathBuf],
+        model: &'a str,
+    ) -> ValidationContext<'a> {
         ValidationContext {
             subagent_id,
             task,
             result_path,
             workspace_root,
             changed_files,
+            subagent_changed_files,
             model,
         }
     }
@@ -968,5 +1068,91 @@ mod tests {
         );
 
         assert!(gate.validate(&ctx).is_ok(), "分数 0.7 == 阈值 0.7 应通过");
+    }
+
+    // ===== Epic 5 §8.4:双列表交叉检查 =====
+
+    /// §8.4:子智能体声称改了但 git diff 没有 → unverified 非空;
+    /// git diff 有但子智能体没声称 → concurrent 非空。
+    #[test]
+    fn compute_mismatch_detects_unverified_and_concurrent() {
+        let tmp = std::env::temp_dir();
+        // git diff 显示:a.rs, b.rs
+        let changed_files = vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")];
+        // 子智能体声称:a.rs(已落盘), c.rs(声称但 git diff 没有)
+        let subagent_changed_files = vec![PathBuf::from("src/a.rs"), PathBuf::from("src/c.rs")];
+        let ctx = make_ctx_with_subagent_files(
+            "sub-1",
+            "fix bug",
+            Path::new("/tmp/result.md"),
+            tmp.as_path(),
+            &changed_files,
+            &subagent_changed_files,
+            "deepseek-v4-pro",
+        );
+        let (unverified, concurrent) = compute_changed_files_mismatch(&ctx);
+        assert!(
+            unverified.iter().any(|f| f == "src/c.rs"),
+            "c.rs 声称但 git diff 没有,应在 unverified: {unverified:?}"
+        );
+        assert!(
+            concurrent.iter().any(|f| f == "src/b.rs"),
+            "b.rs 在 git diff 但子智能体没声称,应在 concurrent: {concurrent:?}"
+        );
+    }
+
+    /// §8.4:子智能体声称的变更与 git diff 完全一致 → 无 mismatch。
+    #[test]
+    fn compute_mismatch_empty_when_lists_agree() {
+        let tmp = std::env::temp_dir();
+        let changed_files = vec![PathBuf::from("src/a.rs")];
+        let subagent_changed_files = vec![PathBuf::from("src/a.rs")];
+        let ctx = make_ctx_with_subagent_files(
+            "sub-1",
+            "fix bug",
+            Path::new("/tmp/result.md"),
+            tmp.as_path(),
+            &changed_files,
+            &subagent_changed_files,
+            "deepseek-v4-pro",
+        );
+        let (unverified, concurrent) = compute_changed_files_mismatch(&ctx);
+        assert!(
+            unverified.is_empty(),
+            "一致时 unverified 应为空: {unverified:?}"
+        );
+        assert!(
+            concurrent.is_empty(),
+            "一致时 concurrent 应为空: {concurrent:?}"
+        );
+    }
+
+    /// §8.4:子智能体无声称变更(Analyze/ReadOnly/旧格式)→ 跳过,返回空。
+    #[test]
+    fn compute_mismatch_skips_when_subagent_claims_nothing() {
+        let tmp = std::env::temp_dir();
+        let changed_files = vec![PathBuf::from("src/a.rs")];
+        let ctx = make_ctx_with_subagent_files(
+            "sub-1",
+            "analyze task",
+            Path::new("/tmp/result.md"),
+            tmp.as_path(),
+            &changed_files,
+            &[], // 子智能体无声称变更
+            "deepseek-v4-flash",
+        );
+        let (unverified, concurrent) = compute_changed_files_mismatch(&ctx);
+        assert!(unverified.is_empty());
+        assert!(
+            concurrent.is_empty(),
+            "无声称变更时不报 concurrent(避免噪声)"
+        );
+    }
+
+    /// §8.4:`read_handoff_changed_files` 解析失败时返回空(向后兼容旧格式)。
+    #[test]
+    fn read_handoff_changed_files_returns_empty_on_missing_file() {
+        let files = read_handoff_changed_files(Path::new("/nonexistent/handoff-12345.md"));
+        assert!(files.is_empty(), "文件不存在时应返回空 Vec");
     }
 }
