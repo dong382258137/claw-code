@@ -16,6 +16,10 @@
 //! "Subagent as Tool" 模式 — 主 agent 通过 tool call 接口调用子 agent。
 
 pub mod dag;
+// Epic 5:结构化 handoff 协议(SubagentHandoff + write_handoff + parse_handoff)。
+pub mod handoff;
+// Epic 4:文件操作权限隔离(SubagentFileGuard + LockHandle)。
+pub mod file_guard;
 // Multi-Agent Hardening §4.4:验证门禁(ValidationGate trait + CommandValidationGate + LlmJudgeGate 预留)。
 pub mod validation;
 pub use dag::DagStore;
@@ -23,6 +27,11 @@ pub use dag::{
     CoordinatorExecutor, DagError, DagGraph, DagId, DagNode, DagRunResult, DagScheduler, FailFast,
     NodeError, NodeResult, ProgressEvent, RetryPolicy, SubagentDispatcher, SubagentExecutor,
     SubagentRunner, DEFAULT_MAX_PARALLELISM,
+};
+pub use file_guard::{LockHandle, SubagentFileGuard};
+pub use handoff::{
+    extract_changed_files, parse_handoff, read_handoff, serialize_handoff, write_handoff,
+    HandoffStatus, SubagentHandoff,
 };
 pub use validation::{
     detect_changed_files, rust_compile_gate, CommandValidationGate, JudgeClient, LlmJudgeGate,
@@ -52,6 +61,66 @@ pub enum TaskComplexity {
     Diagnostic,
     /// 架构决策:多方案评估、trade-off 分析 — Flagship 模型。
     Architectural,
+}
+
+/// 子智能体能力分级 — TRAE 架构对齐(见 docs/2026-08-06-subagent-trae-alignment-design.md §3.1)。
+///
+/// 三级能力枚举,按能力注入工具白名单与上下文前缀。默认 `Analyze`(向后兼容,
+/// 现有调用方零改动)。capability 决定:
+/// - `allowed_tools()`:该能力允许调用的工具名白名单
+/// - `enables_tools()`:是否启用工具(Analyze 不启用,纯 LLM 推理)
+/// - `max_iterations()`:多轮 tool call 循环上限(Epic 3)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentCapability {
+    /// L0 分析型:只读 + 推理,无副作用。用于调研、方案设计、代码审查。
+    #[default]
+    Analyze,
+    /// L1 只读型:可调用只读工具(read/grep/glob/repomap/lsp_diagnostics),禁止写入。
+    ReadOnly,
+    /// L2 执行型:可调用写入工具(edit/write/bash),受白名单约束。
+    Execute,
+}
+
+impl SubagentCapability {
+    /// 返回该能力允许的工具名白名单(按 tools::GlobalToolRegistry 注册名)。
+    ///
+    /// 注:`dispatch_subagent` / `spawn_parallel_subagents` 不放入白名单,
+    /// 递归派发禁止由 §3.3.1 guard 在 tool_use 提取阶段显式检查实现
+    /// (见 execute_subagent_llm 内 `if tu.name == "dispatch_subagent" ...` 分支)。
+    #[must_use]
+    pub fn allowed_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Analyze => &[],
+            Self::ReadOnly => &["read", "grep", "glob", "repomap", "lsp_diagnostics"],
+            Self::Execute => &[
+                "read",
+                "grep",
+                "glob",
+                "repomap",
+                "lsp_diagnostics",
+                "edit",
+                "write",
+                "bash",
+            ],
+        }
+    }
+
+    /// 是否启用工具(Analyze 不启用,纯 LLM 推理)。
+    #[must_use]
+    pub fn enables_tools(self) -> bool {
+        !matches!(self, Self::Analyze)
+    }
+
+    /// 多轮 tool call 循环上限(Epic 3)。
+    #[must_use]
+    pub fn max_iterations(self) -> usize {
+        match self {
+            Self::Analyze => 1,
+            Self::ReadOnly => 5,
+            Self::Execute => 10,
+        }
+    }
 }
 
 /// 多 agent 编排模式。
@@ -116,6 +185,11 @@ pub struct Subagent {
     /// §4.2:Diagnostic/Architectural 任务拒绝 Budget 模型。
     #[serde(default = "default_complexity")]
     pub complexity: TaskComplexity,
+
+    /// 子智能体能力分级 — TRAE 架构对齐(见 docs/2026-08-06-subagent-trae-alignment-design.md §3.1)。
+    /// 决定工具白名单、是否启用工具、多轮循环上限。默认 `Analyze`(向后兼容)。
+    #[serde(default)]
+    pub capability: SubagentCapability,
 
     /// 最大尝试次数(默认 1 = 只尝试 1 次不重试;2 = 1 次原始 + 1 次重试)。
     /// §4.5 retry loop 上限,防止无限重试。
@@ -195,10 +269,16 @@ pub struct SpawnRequest {
     pub model: String,
     /// 任务复杂度。
     pub complexity: TaskComplexity,
+    /// 子智能体能力分级 — TRAE 架构对齐(§3.1)。默认 `Analyze`(向后兼容,
+    /// `new()` 不接收此参数,调用方通过 `with_capability()` 设置)。
+    pub capability: SubagentCapability,
 }
 
 impl SpawnRequest {
     /// 创建一个新的 `SpawnRequest`。
+    ///
+    /// `capability` 默认为 `Analyze`(向后兼容,现有调用方零改动)。
+    /// 需要指定能力时链式调用 [`SpawnRequest::with_capability`]。
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -213,7 +293,15 @@ impl SpawnRequest {
             mode,
             model: model.into(),
             complexity,
+            capability: SubagentCapability::Analyze,
         }
+    }
+
+    /// Builder:设置子智能体能力分级(链式调用)。
+    #[must_use]
+    pub fn with_capability(mut self, capability: SubagentCapability) -> Self {
+        self.capability = capability;
+        self
     }
 }
 
@@ -315,6 +403,7 @@ impl MultiAgentCoordinator {
             // v3 扩展字段默认值
             model: None,
             complexity: TaskComplexity::Simple,
+            capability: SubagentCapability::Analyze,
             max_attempts: 1,
             attempts: 0,
             validated: false,
@@ -443,13 +532,19 @@ impl MultiAgentCoordinator {
                 let results = &results;
                 let coord = this.clone();
                 s.spawn(move || {
-                    let result = coord.spawn_with_model(
-                        task.name,
-                        task.task,
-                        task.mode,
-                        task.model,
-                        task.complexity,
-                    );
+                    let capability = task.capability;
+                    let result = coord
+                        .spawn_with_model(
+                            task.name,
+                            task.task,
+                            task.mode,
+                            task.model,
+                            task.complexity,
+                        )
+                        .and_then(|id| {
+                            // 传播 SpawnRequest.capability 到 Subagent(§3.1)
+                            coord.set_capability(&id, capability).map(|()| id)
+                        });
                     results.lock().expect("results lock poisoned")[i] = Some(result);
                 });
             }
@@ -788,6 +883,24 @@ impl MultiAgentCoordinator {
             .get_mut(subagent_id)
             .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
         agent.max_attempts = max_attempts;
+        Ok(())
+    }
+
+    /// 设置子 agent 的能力分级 — TRAE 架构对齐(§3.1)。
+    ///
+    /// 由 `execute_dispatch_subagent` / `spawn_parallel` 在 spawn 后调用,
+    /// 根据 JSON 输入或 `SpawnRequest.capability` 字段注入。决定工具白名单、
+    /// 是否启用工具、多轮循环上限。
+    pub fn set_capability(
+        &self,
+        subagent_id: &str,
+        capability: SubagentCapability,
+    ) -> Result<(), String> {
+        let mut agents = self.subagents.lock().expect("subagents lock");
+        let agent = agents
+            .get_mut(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+        agent.capability = capability;
         Ok(())
     }
 
@@ -1596,6 +1709,127 @@ mod tests {
         assert_eq!(req.mode, CoordinationMode::Worktree);
         assert_eq!(req.model, "deepseek-v4-pro");
         assert_eq!(req.complexity, TaskComplexity::Architectural);
+    }
+
+    /// Epic 0(§3.1):`SubagentCapability::allowed_tools()` 三个变体返回值正确。
+    #[test]
+    fn subagent_capability_allowed_tools_correct() {
+        assert!(SubagentCapability::Analyze.allowed_tools().is_empty());
+        let ro = SubagentCapability::ReadOnly.allowed_tools();
+        assert_eq!(ro, &["read", "grep", "glob", "repomap", "lsp_diagnostics"]);
+        let ex = SubagentCapability::Execute.allowed_tools();
+        assert!(ex.contains(&"edit"));
+        assert!(ex.contains(&"write"));
+        assert!(ex.contains(&"bash"));
+        // Execute 是 ReadOnly 的超集
+        for t in ro {
+            assert!(ex.contains(t), "Execute missing read-only tool {t}");
+        }
+        // 白名单不含递归派发工具
+        assert!(!ex.contains(&"dispatch_subagent"));
+        assert!(!ex.contains(&"spawn_parallel_subagents"));
+    }
+
+    /// Epic 0(§3.1):`enables_tools()` / `max_iterations()` 行为正确。
+    #[test]
+    fn subagent_capability_enables_tools_and_max_iterations() {
+        assert!(!SubagentCapability::Analyze.enables_tools());
+        assert!(SubagentCapability::ReadOnly.enables_tools());
+        assert!(SubagentCapability::Execute.enables_tools());
+
+        assert_eq!(SubagentCapability::Analyze.max_iterations(), 1);
+        assert_eq!(SubagentCapability::ReadOnly.max_iterations(), 5);
+        assert_eq!(SubagentCapability::Execute.max_iterations(), 10);
+    }
+
+    /// Epic 0:`SpawnRequest::new` 默认 capability = Analyze(向后兼容)。
+    /// `with_capability` builder 正确设置。
+    #[test]
+    fn spawn_request_default_capability_and_builder() {
+        let req = SpawnRequest::new(
+            "a",
+            "t",
+            CoordinationMode::Fork,
+            "m",
+            TaskComplexity::Simple,
+        );
+        assert_eq!(req.capability, SubagentCapability::Analyze);
+
+        let req = req.with_capability(SubagentCapability::Execute);
+        assert_eq!(req.capability, SubagentCapability::Execute);
+    }
+
+    /// Epic 0:`Subagent` 缺 `capability` 字段反序列化默认 Analyze(向后兼容)。
+    #[test]
+    fn subagent_deserialize_missing_capability_defaults_analyze() {
+        // 旧格式 JSON(无 capability 字段)应能正确反序列化,capability 默认 Analyze
+        let json = r#"{
+            "id": "test-id",
+            "name": "test",
+            "mode": "fork",
+            "task": "do something",
+            "status": "created",
+            "workdir": null,
+            "created_at": 0,
+            "completed_at": null,
+            "result": null,
+            "model": null,
+            "complexity": "simple",
+            "max_attempts": 1,
+            "attempts": 0,
+            "validated": false,
+            "notes": [],
+            "checkpoint_path": null,
+            "cost_limit": null,
+            "cost_accumulated": 0.0
+        }"#;
+        let agent: Subagent = serde_json::from_str(json).expect("deserialize old format");
+        assert_eq!(agent.capability, SubagentCapability::Analyze);
+    }
+
+    /// Epic 0:`Subagent` 含 `capability` 字段反序列化(kebab-case)。
+    #[test]
+    fn subagent_deserialize_with_capability() {
+        let json = r#"{
+            "id": "x",
+            "name": "x",
+            "mode": "fork",
+            "task": "x",
+            "status": "created",
+            "workdir": null,
+            "created_at": 0,
+            "completed_at": null,
+            "result": null,
+            "complexity": "simple",
+            "capability": "read-only",
+            "max_attempts": 1,
+            "attempts": 0,
+            "validated": false,
+            "notes": [],
+            "checkpoint_path": null,
+            "cost_limit": null,
+            "cost_accumulated": 0.0
+        }"#;
+        let agent: Subagent = serde_json::from_str(json).expect("deserialize with capability");
+        assert_eq!(agent.capability, SubagentCapability::ReadOnly);
+    }
+
+    /// Epic 0:`set_capability` 正确更新 subagent capability。
+    #[test]
+    fn set_capability_updates_subagent() {
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("a", "t", CoordinationMode::Fork);
+        assert_eq!(
+            coord.get(&id).unwrap().capability,
+            SubagentCapability::Analyze
+        );
+        coord
+            .set_capability(&id, SubagentCapability::Execute)
+            .unwrap();
+        assert_eq!(
+            coord.get(&id).unwrap().capability,
+            SubagentCapability::Execute
+        );
     }
 
     /// §10.5 v2:spawn_parallel 串行退化仅注册 subagent,不执行 turn。

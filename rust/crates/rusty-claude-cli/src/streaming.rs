@@ -26,8 +26,9 @@ use api::{
     ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
-    PermissionMode, PermissionPolicy, RequestKind, RuntimeError, SystemPromptSplit, TokenUsage,
+    multi_agent::SubagentCapability, ApiClient, ApiRequest, AssistantEvent, ContentBlock,
+    ConversationMessage, MessageRole, PermissionMode, PermissionPolicy, RequestKind, RuntimeError,
+    SystemPromptSplit, TokenUsage,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
@@ -505,6 +506,44 @@ impl ApiClient for AnthropicRuntimeClient {
             false, // enable_tools:子 agent 不调用工具
             false, // emit_output:静默
             None,  // allowed_tools
+            self.tool_registry.clone(),
+            None, // progress_reporter
+        )
+        .map_err(|e| format!("failed to construct subagent client for {model}: {e}"))?;
+        Ok(Box::new(client))
+    }
+
+    /// Epic 2(TRAE 架构对齐 §3.1):按 `SubagentCapability` 构造子 agent client。
+    ///
+    /// 与 [`with_model`](Self::with_model) 的差异:
+    /// - `Analyze`:`enable_tools=false`(纯 LLM 推理,等同原 `with_model` 行为)
+    /// - `ReadOnly`/`Execute`:`enable_tools=true`,按 `capability.allowed_tools()`
+    ///   设置 `AllowedToolSet` 白名单,仅暴露白名单内的工具定义
+    ///
+    /// 子 agent client 其余配置与 `with_model` 一致:静默执行、无进度/状态订阅、
+    /// 复用主 agent 的 `session_id` 前缀 + `tool_registry`。
+    fn with_model_and_capability(
+        &self,
+        model: &str,
+        capability: SubagentCapability,
+    ) -> Result<Box<dyn ApiClient>, String> {
+        let enable_tools = capability.enables_tools();
+        let allowed_tools = if enable_tools {
+            Some(AllowedToolSet::from_iter(
+                capability
+                    .allowed_tools()
+                    .iter()
+                    .map(|s| s.to_string()),
+            ))
+        } else {
+            None
+        };
+        let client = AnthropicRuntimeClient::new(
+            &self.session_id,
+            model.to_string(),
+            enable_tools,
+            false, // emit_output:静默
+            allowed_tools,
             self.tool_registry.clone(),
             None, // progress_reporter
         )

@@ -139,6 +139,12 @@ pub const DISPATCH_SUBAGENT_TOOL_SPEC: &str = r#"{
                 "enum": ["fork", "teammate", "worktree"],
                 "description": "Coordination mode: 'fork' (shared workdir, parallel), 'teammate' (shared TaskRegistry), 'worktree' (isolated git worktree).",
                 "default": "fork"
+            },
+            "capability": {
+                "type": "string",
+                "enum": ["analyze", "read-only", "execute"],
+                "description": "Subagent capability tier: 'analyze' (L0, read-only reasoning, no tools), 'read-only' (L1, read/grep/glob/repomap tools), 'execute' (L2, edit/write/bash tools). Determines tool whitelist and max tool-call iterations.",
+                "default": "analyze"
             }
         },
         "required": ["name", "task"]
@@ -215,6 +221,12 @@ pub const SPAWN_PARALLEL_SUBAGENTS_TOOL_SPEC: &str = r#"{
                             "enum": ["simple", "diagnostic", "architectural"],
                             "description": "Task complexity. Budget-tier models (haiku/mini/nano/flash) cannot handle 'diagnostic' or 'architectural'.",
                             "default": "simple"
+                        },
+                        "capability": {
+                            "type": "string",
+                            "enum": ["analyze", "read-only", "execute"],
+                            "description": "Subagent capability tier: 'analyze' (L0, read-only reasoning, no tools), 'read-only' (L1, read/grep/glob/repomap tools), 'execute' (L2, edit/write/bash tools). Determines tool whitelist and max tool-call iterations.",
+                            "default": "analyze"
                         }
                     },
                     "required": ["name", "task", "model"]
@@ -242,6 +254,31 @@ pub enum RequestKind {
     Subagent,
 }
 
+/// Epic 1(§3.2):子智能体上下文注入载体(owned 字段,避免跨 `.await` 生命周期约束)。
+///
+/// 持有 repo_map 摘要、ProjectContext、工具签名摘要,由调用方构造后传值给
+/// [`build_subagent_system_prompt`] / [`build_subagent_request`]。
+/// 所有字段可选/可空,默认值(全空)时行为与改造前一致(向后兼容)。
+#[derive(Debug, Clone, Default)]
+pub struct SubagentContext {
+    /// L1 静态环境:repo_map 摘要(限 1K token,已渲染为 owned String)。
+    /// `None` 时不注入 Repository Map section。
+    pub repo_map: Option<String>,
+    /// L1 静态环境:项目上下文(cwd/date/git_status)。
+    /// `None` 时不注入 Environment context section。
+    pub project_context: Option<crate::prompt::ProjectContext>,
+    /// L2 静态工具:capability 白名单对应的工具签名摘要(name+description)。
+    /// 空时不注入工具签名层(Analyze capability 无工具,自然为空)。
+    pub tool_summaries: Vec<ToolSummary>,
+}
+
+/// Epic 1(§3.2):工具签名摘要(不含完整 schema,减少 token 占用)。
+#[derive(Debug, Clone)]
+pub struct ToolSummary {
+    pub name: String,
+    pub description: String,
+}
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -249,17 +286,32 @@ pub struct ApiRequest {
     pub messages: Vec<ConversationMessage>,
     pub request_kind: RequestKind,
 }
-/// 构造子智能体 system_prompt — §4.6 诊断 SOP 注入。
+/// 构造子智能体 system_prompt — §4.6 诊断 SOP 注入 + Epic 1(§3.2)上下文注入。
 ///
 /// 3a 静态化:不再接收 id/name/task — 唯一内容移入 user message(见
 /// [`build_subagent_request`]),保证同一复杂度的所有子智能体请求共享
 /// 同一前缀,命中 DeepSeek prefix cache。
 ///
+/// Epic 1 分层注入(§3.2),所有 section 进 `static_sections`(task 在 user
+/// message,system prompt 全静态以最大化缓存命中):
+/// - **L0 指令**:角色约束 + 输出格式 + SOP(按 complexity)+ 能力声明(按 capability)
+/// - **L1 环境**:`## Repository Map`(§3.2 heading 对齐)+ `# Environment context`
+///   — heading 必须与 [`SystemPromptSplit::static_cache_breakpoints`] 一致,
+///   否则 breakpoint 失效、缓存分层退化
+/// - **L2 工具**:capability 白名单对应的工具签名摘要(仅 ReadOnly/Execute)
+///
 /// - `complexity == Diagnostic`:追加诊断任务执行规范
 /// - `complexity == Architectural`:追加架构决策执行规范
 /// - 其他复杂度:仅基础 prompt,不污染简单任务
-fn build_subagent_system_prompt(complexity: crate::multi_agent::TaskComplexity) -> String {
-    let base_prompt = "你是一个子智能体,由主智能体派发执行独立任务。\n\
+fn build_subagent_system_prompt(
+    complexity: crate::multi_agent::TaskComplexity,
+    capability: crate::multi_agent::SubagentCapability,
+    ctx: &SubagentContext,
+) -> SystemPromptSplit {
+    // L0 指令层:基础 prompt + 能力声明
+    let base_prompt = match capability {
+        crate::multi_agent::SubagentCapability::Analyze => {
+            "你是一个子智能体,由主智能体派发执行独立任务。\n\
 \n\
 ## 约束\n\
 - 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
@@ -272,15 +324,30 @@ fn build_subagent_system_prompt(complexity: crate::multi_agent::TaskComplexity) 
 1. 任务理解(简要复述)\n\
 2. 分析过程\n\
 3. 关键发现\n\
-4. 结论和建议";
+4. 结论和建议"
+        }
+        crate::multi_agent::SubagentCapability::ReadOnly
+        | crate::multi_agent::SubagentCapability::Execute => {
+            "你是一个子智能体,由主智能体派发执行独立任务。\n\
+\n\
+## 约束\n\
+- 你拥有独立的工作上下文,不共享主智能体的对话历史\n\
+- 你的响应将被写入文件,主智能体会后续读取\n\
+- 请提供完整、自包含的分析结果\n\
+- 你可以调用工具来完成任务(工具白名单见下文)\n\
+- 禁止递归派发子智能体(dispatch_subagent / spawn_parallel_subagents 不可用)\n\
+\n\
+## 输出格式\n\
+请直接输出你的分析结果,使用 Markdown 格式。包含:\n\
+1. 任务理解(简要复述)\n\
+2. 分析过程\n\
+3. 关键发现\n\
+4. 结论和建议"
+        }
+    };
 
     // §4.6 SOP 注入:Diagnostic 和 Architectural 复杂度追加各自 SOP
-    // 设计要点:SOP 仅注入高复杂度任务,避免污染简单任务;规则固化到系统提示,
-    // 能力不足模型也无法绕过;与验证门禁形成"提示层 + 强制层"双重防护。
-    // v2 新增:Architectural 复杂度的架构决策 SOP(§10.5 v2 扩展路径)
-    // - 与 Diagnostic SOP 互补:Diagnostic 解决"凭直觉堆砌防御代码",
-    //   Architectural 解决"凭直觉拍板方案、缺乏 trade-off 论证"
-    match complexity {
+    let l0_instruction = match complexity {
         crate::multi_agent::TaskComplexity::Diagnostic => format!(
             "{base_prompt}\n\n\
              ## 诊断任务执行规范\n\
@@ -306,7 +373,36 @@ fn build_subagent_system_prompt(complexity: crate::multi_agent::TaskComplexity) 
              (benchmark / 代码引用 / 论文 / 既有项目实践)"
         ),
         crate::multi_agent::TaskComplexity::Simple => base_prompt.to_string(),
+    };
+
+    let mut sections: Vec<String> = vec![l0_instruction];
+
+    // L1 环境层:repo_map(§3.2 heading 对齐 — 必须用 "## Repository Map")
+    if let Some(repo_map) = &ctx.repo_map {
+        sections.push(format!("## Repository Map\n{repo_map}"));
     }
+    // L1 环境层:ProjectContext(§3.2 heading 对齐 — 必须用 "# Environment context")
+    if let Some(pc) = &ctx.project_context {
+        let mut env = String::from("# Environment context");
+        env.push_str(&format!("\n- Working directory: {}", pc.cwd.display()));
+        env.push_str(&format!("\n- Date: {}", pc.current_date));
+        if let Some(gs) = &pc.git_status {
+            env.push_str(&format!("\n- Git status:\n```\n{gs}\n```"));
+        }
+        sections.push(env);
+    }
+
+    // L2 工具签名层(仅 ReadOnly/Execute,Analyze 无工具)
+    if !ctx.tool_summaries.is_empty() {
+        let mut tools = String::from("## Available Tools");
+        for ts in &ctx.tool_summaries {
+            tools.push_str(&format!("\n- **{}**: {}", ts.name, ts.description));
+        }
+        sections.push(tools);
+    }
+
+    // 全静态(task 在 user message,system prompt 无动态内容)
+    SystemPromptSplit::from_sections(sections)
 }
 
 /// 构造子智能体完整请求 — 3a/3b DRY 公共入口。
@@ -321,8 +417,10 @@ pub(crate) fn build_subagent_request(
     name: &str,
     task: &str,
     complexity: crate::multi_agent::TaskComplexity,
+    capability: crate::multi_agent::SubagentCapability,
+    ctx: &SubagentContext,
 ) -> ApiRequest {
-    let system_prompt = build_subagent_system_prompt(complexity);
+    let system_prompt = build_subagent_system_prompt(complexity, capability, ctx);
     let user_message = ConversationMessage {
         role: MessageRole::User,
         blocks: vec![ContentBlock::Text {
@@ -331,10 +429,124 @@ pub(crate) fn build_subagent_request(
         usage: None,
     };
     ApiRequest {
-        system_prompt: SystemPromptSplit::from_sections(vec![system_prompt]),
+        system_prompt,
         messages: vec![user_message],
         request_kind: RequestKind::Subagent,
     }
+}
+
+/// Epic 3a/3b(§3.3.1):工具调用处理公共函数 — 两条执行路径共用,消除重复。
+///
+/// 对每个 `ToolUse` block 执行:
+/// 1. **递归派发 guard**:`dispatch_subagent` / `spawn_parallel_subagents` → 立即 Err
+/// 2. **白名单 guard**:不在 `capability.allowed_tools()` → 立即 Err
+/// 3. **工具执行**:调用 `tool_executor.execute(name, input)`,失败时返回
+///    `is_error=true` 的 `ToolResult`(不中断循环,让 LLM 决定下一步)
+/// 4. **changed_files 提取**:`edit`/`write` 工具的 `file_path` 提取并规范化
+/// 5. **ToolResult 回填**:追加到 `messages`,供下一轮 LLM 调用使用
+///
+/// # 参数
+/// - `tool_uses`:已过滤的 `ToolUse` block 列表(owned,不含 Text/Thinking)
+/// - `tool_executor`:工具执行器(路径 A 传 `&mut dyn ToolExecutor`,
+///   路径 B 传 `&mut *Box<dyn ToolExecutor>`)
+///
+/// # 返回
+/// - `Ok(())`:所有工具调用已执行并回填
+/// - `Err(ToolError)`:guard 违规(递归/白名单),调用方应中止子智能体
+pub(crate) fn process_tool_uses(
+    capability: crate::multi_agent::SubagentCapability,
+    tool_uses: &[ContentBlock],
+    tool_executor: &mut dyn ToolExecutor,
+    workspace_root: &std::path::Path,
+    messages: &mut Vec<ConversationMessage>,
+    tools_used: &mut Vec<String>,
+    changed_files: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    for tu in tool_uses {
+        let (id, name, input) = match tu {
+            ContentBlock::ToolUse { id, name, input } => (id, name, input),
+            _ => continue,
+        };
+
+        // Guard 1:禁止递归派发(§3.3.1)
+        if name == "dispatch_subagent" || name == "spawn_parallel_subagents" {
+            return Err(ToolError::new(format!(
+                "subagent recursion forbidden: {name}"
+            )));
+        }
+        // Guard 2:白名单(§3.1)
+        if !capability.allowed_tools().contains(&name.as_str()) {
+            return Err(ToolError::new(format!(
+                "tool {name} not allowed for capability {capability:?}"
+            )));
+        }
+
+        tools_used.push(name.clone());
+
+        // Epic 4:edit/write 文件锁(SubagentFileGuard)
+        // Guard 2 已确保只有 Execute capability 能调 edit/write(Analyze/ReadOnly 被白名单拒绝)
+        // 此处获取 per-file 锁,防止并行 Execute 子智能体修改同一文件冲突(§4)
+        // try_acquire 是同步阻塞(Condvar wait_timeout,30s 超时),与 tool_executor.execute
+        // 同样为同步调用,在路径 A(async)和路径 B(sync thread)中均可接受
+        let _file_lock: Option<crate::multi_agent::LockHandle> =
+            if matches!(name.as_str(), "edit" | "write") {
+                let guard = crate::multi_agent::SubagentFileGuard::new(
+                    capability,
+                    workspace_root.to_path_buf(),
+                );
+                // 从 input JSON 提取 file_path(edit/write 工具标准字段)
+                let file_path = serde_json::from_str::<serde_json::Value>(input)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("file_path")
+                            .and_then(|fp| fp.as_str().map(std::path::PathBuf::from))
+                    });
+
+                match file_path {
+                    Some(path) => match guard.try_acquire(&path, true) {
+                        Ok(lock) => Some(lock),
+                        Err(e) => {
+                            // 锁获取失败(超时/拒绝)→ 工具未执行,回填 is_error=true
+                            // 不中止循环(与 execute 失败处理一致),让 LLM 决定下一步
+                            // 不提取 changed_files(文件实际未被修改)
+                            messages.push(ConversationMessage::tool_result(
+                                id.clone(),
+                                name.clone(),
+                                e,
+                                true,
+                            ));
+                            continue;
+                        }
+                    },
+                    None => None, // 无 file_path 字段,跳过锁(防御性降级)
+                }
+            } else {
+                None
+            };
+
+        // 工具执行 — 失败不中断,返回 is_error=true 让 LLM 决定下一步
+        // _file_lock 在此 block 作用域内持有,iteration 结束 drop 释放锁
+        let (output, is_error) = match tool_executor.execute(name, input) {
+            Ok(result) => (result, false),
+            Err(e) => (e.to_string(), true),
+        };
+
+        // changed_files 提取(edit/write 可能修改文件)
+        if matches!(name.as_str(), "edit" | "write") {
+            changed_files.extend(crate::multi_agent::extract_changed_files(
+                input,
+                workspace_root,
+            ));
+        }
+
+        messages.push(ConversationMessage::tool_result(
+            id.clone(),
+            name.clone(),
+            output,
+            is_error,
+        ));
+    }
+    Ok(())
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -417,10 +629,39 @@ pub trait ApiClient: Send {
     fn with_model(&self, _model: &str) -> Result<Box<dyn ApiClient>, String> {
         Err("model swap not supported by this ApiClient implementation".to_string())
     }
+
+    /// Epic 2(TRAE 架构对齐 §3.1):按 `SubagentCapability` 构造绑定到指定模型的
+    /// 子 agent client。与 [`with_model`](Self::with_model) 的差异:
+    /// - 按 `capability.enables_tools()` 决定是否启用工具(Analyze 不启用)
+    /// - 按 `capability.allowed_tools()` 设置工具白名单(ReadOnly/Execute 受限)
+    ///
+    /// 默认实现委托给 [`with_model`](Self::with_model),忽略 capability
+    /// (向后兼容,不支持的实现保持原 `enable_tools=false` 行为)。
+    /// Production 实现(`AnthropicRuntimeClient`)重写以按能力启用工具。
+    ///
+    /// # 参数
+    /// - `model`:目标模型名
+    /// - `capability`:子智能体能力分级,决定工具启用与白名单
+    ///
+    /// # 返回
+    /// `Ok(boxed_client)` 若构造成功。
+    fn with_model_and_capability(
+        &self,
+        model: &str,
+        _capability: crate::multi_agent::SubagentCapability,
+    ) -> Result<Box<dyn ApiClient>, String> {
+        self.with_model(model)
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
-pub trait ToolExecutor {
+///
+/// Epic 2.5(TRAE 架构对齐 §2.5.2):`Send` supertrait 使 `&mut dyn ToolExecutor`
+/// 可跨线程传递。路径 B(DAG 调度)用 `std::thread::spawn` 闭包需 `Send`,
+/// 路径 A(async)统一带 Send 与 3b 共用 trait。生产实现(`SubagentToolExecutor` /
+/// `CliToolExecutor`)字段均已满足 Send,零改动;仅测试用 `StaticToolExecutor`
+/// 的 handler 签名需加 `+ Send`。
+pub trait ToolExecutor: Send {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 }
 
@@ -1034,18 +1275,26 @@ where
     /// # 类型约束
     /// `C: ApiClient + Send + 'static` — api_client 会被 box 成
     /// `Box<dyn ApiClient + Send>` 并存入 `Arc<Mutex<..>>`,必须满足 Send。
+    ///
+    /// Epic 3b:新增 `tool_executor` 参数,启用多轮 tool call 循环。
+    /// `None` 时子智能体无法调用工具(单轮,向后兼容);
+    /// `Some(executor)` 时按 `SubagentDispatcher::with_tool_executor` 注入。
     #[must_use]
     pub fn with_dag_coordinator(
         mut self,
         coordinator: Arc<MultiAgentCoordinator>,
         api_client: C,
         workspace_root: PathBuf,
+        tool_executor: Option<Box<dyn ToolExecutor + Send>>,
     ) -> Self
     where
         C: ApiClient + Send + 'static,
     {
-        let dispatcher =
+        let mut dispatcher =
             SubagentDispatcher::new(Arc::new(Mutex::new(Box::new(api_client))), workspace_root);
+        if let Some(te) = tool_executor {
+            dispatcher = dispatcher.with_tool_executor(Arc::new(Mutex::new(te)));
+        }
         let runner: SubagentRunner = Arc::new(move |id, task| {
             let d = dispatcher.clone();
             Box::pin(async move { d.dispatch(id, task).await })
@@ -2994,6 +3243,7 @@ where
         // Multi-Agent Hardening §4.2/§4.5:可选 model + complexity + cost_limit + max_attempts 字段
         let model_str = parsed.get("model").and_then(|v| v.as_str());
         let complexity = parse_complexity(parsed.get("complexity"));
+        let capability = parse_capability(parsed.get("capability"));
         let cost_limit = parsed.get("cost_limit").and_then(|v| v.as_f64());
         let max_attempts_override = parsed
             .get("max_attempts")
@@ -3014,6 +3264,8 @@ where
             } else {
                 coordinator.spawn(name, task, mode)
             };
+            // 注入 capability — TRAE 架构对齐(§3.1)
+            let _ = coordinator.set_capability(&id, capability);
             // 注入 cost_limit(如有)
             if let Some(limit) = cost_limit {
                 let _ = coordinator.set_cost_limit(&id, Some(limit));
@@ -3045,13 +3297,18 @@ where
         publish_lane_event(event);
 
         // 读取 max_attempts(用于 retry loop 上限)和 complexity(用于 §4.6 诊断 SOP 注入)
-        // 注:complexity 在 retry 过程中不变(只升级 model,不改变 complexity),故循环外读取一次即可
-        let (max_attempts, subagent_complexity) = self
+        // 和 capability(用于 Epic 1 上下文注入 + Epic 3 工具白名单)
+        // 注:complexity/capability 在 retry 过程中不变(只升级 model,不改变任务属性),故循环外读取一次即可
+        let (max_attempts, subagent_complexity, subagent_capability) = self
             .multi_agent_coordinator
             .as_ref()
             .and_then(|c| c.get(&subagent_id))
-            .map(|a| (a.max_attempts, a.complexity))
-            .unwrap_or((1, crate::multi_agent::TaskComplexity::Simple));
+            .map(|a| (a.max_attempts, a.complexity, a.capability))
+            .unwrap_or((
+                1,
+                crate::multi_agent::TaskComplexity::Simple,
+                crate::multi_agent::SubagentCapability::Analyze,
+            ));
         let max_attempts = max_attempts.max(1);
         let mut current_model = model_str.map(String::from);
         let mut final_status = "failed";
@@ -3108,6 +3365,7 @@ where
                     task,
                     current_model.as_deref(),
                     subagent_complexity,
+                    subagent_capability,
                 )
                 .await;
 
@@ -3356,7 +3614,7 @@ where
     /// - 独立 prompt cache(不污染主 agent 缓存)
     ///
     /// **注意**:本方法是 [`run_subagent_turn_with_model`] 的便利包装,
-    /// 等价于 `run_subagent_turn_with_model(id, name, task, None, complexity)`。
+    /// 等价于 `run_subagent_turn_with_model(id, name, task, None, complexity, capability)`。
     /// 新代码应直接调用 `run_subagent_turn_with_model`。
     /// 保留本方法以兼容现有文档引用和未来外部调用。
     #[allow(dead_code)]
@@ -3366,8 +3624,9 @@ where
         name: &str,
         task: &str,
         complexity: crate::multi_agent::TaskComplexity,
+        capability: crate::multi_agent::SubagentCapability,
     ) -> Result<String, String> {
-        self.run_subagent_turn_with_model(subagent_id, name, task, None, complexity)
+        self.run_subagent_turn_with_model(subagent_id, name, task, None, complexity, capability)
             .await
     }
 
@@ -3379,6 +3638,10 @@ where
     /// §4.6 诊断 SOP 注入:`complexity` 参数传递给 [`execute_subagent_llm`],
     /// 当为 `Diagnostic` 时向 system_prompt 追加诊断 SOP。
     ///
+    /// Epic 1(§3.2):`capability` 参数用于上下文注入(工具白名单声明 +
+    /// 工具签名摘要)。`SubagentContext` 从主 agent 的 `system_prompt` sections
+    /// 中提取 repo_map 和 environment(复用已渲染内容,避免重复扫描)。
+    ///
     /// 若 `with_model` 返回 `Err`(默认实现或生产实现构造失败),
     /// 记录诊断日志并回退到主 agent client — 保证 retry loop 不因
     /// client 构造失败而中止,降级为"同模型重试"。
@@ -3389,10 +3652,15 @@ where
         task: &str,
         model: Option<&str>,
         complexity: crate::multi_agent::TaskComplexity,
+        capability: crate::multi_agent::SubagentCapability,
     ) -> Result<String, String> {
         let workspace_root = self.workspace_root.as_ref().ok_or_else(|| {
             "workspace_root not configured — subagent requires filesystem access for result persistence".to_string()
         })?;
+
+        // Epic 1(§3.2):从主 agent system_prompt sections 提取 repo_map 和 environment,
+        // 复用已渲染内容(避免重复扫描),heading 已对齐 static_cache_breakpoints。
+        let ctx = self.build_subagent_context(capability);
 
         // model 为 None:走原 run_subagent_turn 路径(复用主 agent client)
         let model = match model {
@@ -3400,26 +3668,33 @@ where
                 return Self::execute_subagent_llm(
                     workspace_root,
                     &mut self.api_client,
+                    &mut self.tool_executor,
                     subagent_id,
                     name,
                     task,
                     complexity,
+                    capability,
+                    &ctx,
                 )
                 .await;
             }
             Some(m) => m,
         };
 
-        // 构造独立 client — Multi-Agent Hardening §4.5.3
-        match self.api_client.with_model(model) {
+        // Epic 2:按 capability 构造独立 client — Multi-Agent Hardening §4.5.3
+        // Analyze 不启用工具;ReadOnly/Execute 按白名单启用
+        match self.api_client.with_model_and_capability(model, capability) {
             Ok(mut sub_client) => {
                 Self::execute_subagent_llm(
                     workspace_root,
                     &mut *sub_client,
+                    &mut self.tool_executor,
                     subagent_id,
                     name,
                     task,
                     complexity,
+                    capability,
+                    &ctx,
                 )
                 .await
             }
@@ -3440,14 +3715,55 @@ where
                 Self::execute_subagent_llm(
                     workspace_root,
                     &mut self.api_client,
+                    &mut self.tool_executor,
                     subagent_id,
                     name,
                     task,
                     complexity,
+                    capability,
+                    &ctx,
                 )
                 .await
             }
         }
+    }
+
+    /// Epic 1(§3.2):从主 agent `system_prompt` sections 提取 repo_map 和
+    /// environment,构造子智能体上下文。复用已渲染内容,避免重复扫描。
+    /// heading 已对齐 `static_cache_breakpoints`(§3.2 heading 对齐约束)。
+    fn build_subagent_context(
+        &self,
+        capability: crate::multi_agent::SubagentCapability,
+    ) -> SubagentContext {
+        let mut ctx = SubagentContext::default();
+        // 从主 agent system_prompt sections 提取 repo_map 和 environment
+        // (heading 对齐:## Repository Map / # Environment context)
+        for section in &self.system_prompt {
+            if section.starts_with("## Repository Map") {
+                // 去掉 heading 行,保留内容
+                ctx.repo_map = Some(
+                    section
+                        .strip_prefix("## Repository Map\n")
+                        .unwrap_or(section)
+                        .to_string(),
+                );
+            }
+            // ProjectContext:从 workspace_root 构造(简化版,完整版由 Epic 2 工具签名补充)
+            if section.starts_with("# Environment context") && self.workspace_root.is_some() {
+                ctx.project_context = Some(crate::prompt::ProjectContext {
+                    cwd: self.workspace_root.clone().unwrap_or_default(),
+                    current_date: "unknown".to_string(),
+                    git_status: None,
+                    git_diff: None,
+                    git_context: None,
+                    instruction_files: Vec::new(),
+                });
+            }
+        }
+        // L2 工具签名层:Epic 2 会填充真实工具签名,此处暂留空
+        // (Analyze 无工具,ReadOnly/Execute 的工具签名在 Epic 2 接入)
+        let _ = capability;
+        ctx
     }
 
     /// 子智能体 LLM 调用的核心逻辑(无 `self` 借用,避免与 `api_client` 冲突)。
@@ -3458,75 +3774,152 @@ where
     ///
     /// §4.6 诊断 SOP 注入:当 `complexity == Diagnostic` 时,向 system_prompt 追加
     /// 诊断任务执行规范,强制子智能体遵循"先诊断后修复"流程,避免堆砌防御代码。
+    ///
+    /// Epic 1(§3.2):`capability` + `ctx` 用于上下文注入(repo_map/environment/工具签名)。
+    ///
+    /// Epic 3a(§3.3.1):多轮 tool call 循环。`Analyze` 能力 `max_iterations=1`(单轮,
+    /// 行为与改造前一致);`ReadOnly=5` / `Execute=10` 支持多轮工具调用。每轮:
+    /// 1. 构造 `ApiRequest`(system_prompt 不变,messages 增长)
+    /// 2. `stream_async` → `build_assistant_message`
+    /// 3. 提取 `ToolUse` blocks → 若为空则正常终止
+    /// 4. `process_tool_uses`:guard(递归/白名单)+ 执行 + 回填 `ToolResult`
+    /// 5. 超过 `max_iterations` → 落盘 `Truncated` handoff + Err(§8.1)
     async fn execute_subagent_llm(
         workspace_root: &std::path::Path,
         client: &mut dyn ApiClient,
+        tool_executor: &mut dyn ToolExecutor,
         subagent_id: &str,
         name: &str,
         task: &str,
         complexity: crate::multi_agent::TaskComplexity,
+        capability: crate::multi_agent::SubagentCapability,
+        ctx: &SubagentContext,
     ) -> Result<String, String> {
+        use crate::multi_agent::{write_handoff, HandoffStatus, SubagentHandoff};
+
         // 知识新鲜度门控(Phase 1):Novel 任务注入调研摘要到 task 文本。
-        // 缓存命中(execute/dispatch_impl 已调过)零成本;未命中降级为原 task。
         let gated = crate::knowledge_freshness::gate_task(task, 0).await;
         let enhanced_task = gated.enhance_task(task);
 
-        // 3a:统一构造 — system 静态,id/name/task 进 user message(DRY)
-        let request = build_subagent_request(subagent_id, name, &enhanced_task, complexity);
+        // system_prompt 构建一次,多轮循环中不变(保 prefix cache 命中)
+        let system_prompt = build_subagent_system_prompt(complexity, capability, ctx);
+        let max_iter = capability.max_iterations();
+        let mut messages = vec![ConversationMessage::user_text(format!(
+            "# Subagent: {name} ({subagent_id})\n\n请执行以下任务:\n\n{enhanced_task}"
+        ))];
+        let mut iterations = 0;
+        let mut tools_used: Vec<String> = Vec::new();
+        let mut changed_files: Vec<String> = Vec::new();
+        let mut final_text = String::new();
 
-        // v3:async 调用 LLM — 通过 stream_async 避免 nested block_on panic。
-        // 调用方(`run_subagent_turn_with_model`)必须在 async 上下文中。
-        let events = client
-            .stream_async(request)
-            .await
-            .map_err(|e| format!("subagent LLM request failed: {e}"))?;
+        loop {
+            iterations += 1;
+            if iterations > max_iter {
+                // §8.1:截断 → 落盘 Truncated handoff + Err
+                let handoff = SubagentHandoff::new(
+                    subagent_id,
+                    name,
+                    capability,
+                    complexity,
+                    iterations,
+                    tools_used.clone(),
+                    changed_files.clone(),
+                    &final_text,
+                    &final_text,
+                )
+                .with_status(HandoffStatus::Truncated)
+                .with_task(task);
+                let _ = write_handoff(workspace_root, &handoff);
+                return Err(format!(
+                    "subagent exceeded max_iterations ({max_iter}); partial result at .claw/subagents/{subagent_id}.md"
+                ));
+            }
 
-        // 解析 assistant response
-        let (assistant_message, _usage, _cache_events) = build_assistant_message(events)
-            .map_err(|e| format!("subagent response parsing failed: {e}"))?;
+            let request = ApiRequest {
+                system_prompt: system_prompt.clone(),
+                messages: messages.clone(),
+                request_kind: RequestKind::Subagent,
+            };
 
-        // 提取 text 内容
-        let mut text_content = String::new();
-        for block in &assistant_message.blocks {
-            if let ContentBlock::Text { text } = block {
-                text_content.push_str(text);
-                text_content.push('\n');
+            // v3:async 调用 LLM — stream_async 避免 nested block_on panic
+            let events = client
+                .stream_async(request)
+                .await
+                .map_err(|e| format!("subagent LLM request failed: {e}"))?;
+
+            let (assistant_message, _usage, _cache_events) = build_assistant_message(events)
+                .map_err(|e| format!("subagent response parsing failed: {e}"))?;
+
+            // 提取 ToolUse blocks(cloned — assistant_message 随后 move 进 messages)
+            let tool_uses: Vec<ContentBlock> = assistant_message
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                .cloned()
+                .collect();
+
+            // 累积 text 内容(最终 summary/details 来源)
+            for block in &assistant_message.blocks {
+                if let ContentBlock::Text { text } = block {
+                    final_text.push_str(text);
+                    final_text.push('\n');
+                }
+            }
+
+            messages.push(assistant_message);
+
+            if tool_uses.is_empty() {
+                break; // 正常终止:无工具调用
+            }
+
+            // 工具调用处理(guard + 执行 + 回填)
+            if let Err(e) = process_tool_uses(
+                capability,
+                &tool_uses,
+                tool_executor,
+                workspace_root,
+                &mut messages,
+                &mut tools_used,
+                &mut changed_files,
+            ) {
+                // guard 违规(递归/白名单)→ 落盘 Failed handoff + Err
+                let handoff = SubagentHandoff::new(
+                    subagent_id,
+                    name,
+                    capability,
+                    complexity,
+                    iterations,
+                    tools_used.clone(),
+                    changed_files.clone(),
+                    e.to_string(),
+                    e.to_string(),
+                )
+                .with_status(HandoffStatus::Failed)
+                .with_task(task);
+                let _ = write_handoff(workspace_root, &handoff);
+                return Err(format!("subagent guard violation: {e}"));
             }
         }
-        if text_content.trim().is_empty() {
+
+        if final_text.trim().is_empty() {
             return Err("subagent produced no text content".to_string());
         }
 
-        // 写到 .claw/subagents/{id}.md(原子写)
-        let subagents_dir = workspace_root.join(".claw").join("subagents");
-        std::fs::create_dir_all(&subagents_dir)
-            .map_err(|e| format!("failed to create subagents dir: {e}"))?;
-        let result_path = subagents_dir.join(format!("{subagent_id}.md"));
-        let tmp_path = subagents_dir.join(format!("{subagent_id}.md.tmp"));
-
-        let file_content = format!(
-            "# Subagent Result: {name} ({subagent_id})\n\
-             \n\
-             **Task:** {task}\n\
-             **Timestamp:** {}\n\
-             \n\
-             ---\n\
-             \n\
-             {text_content}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| format!("{} (unix epoch)", d.as_secs()))
-                .unwrap_or_else(|_| "unknown".to_string())
-        );
-
-        std::fs::write(&tmp_path, &file_content)
-            .map_err(|e| format!("failed to write subagent result tmp file: {e}"))?;
-        std::fs::rename(&tmp_path, &result_path)
-            .map_err(|e| format!("failed to rename subagent result file: {e}"))?;
-
-        // 返回相对路径(便于主 agent 在 tool result 中阅读)
-        let result_ref = format!(".claw/subagents/{subagent_id}.md");
-        Ok(result_ref)
+        // 正常完成 → 落盘 Completed handoff(Epic 5 结构化协议)
+        let handoff = SubagentHandoff::new(
+            subagent_id,
+            name,
+            capability,
+            complexity,
+            iterations,
+            tools_used,
+            changed_files,
+            &final_text,
+            &final_text,
+        )
+        .with_task(task);
+        write_handoff(workspace_root, &handoff)
+            .map_err(|e| format!("failed to write subagent handoff: {e}"))
     }
 
     /// v3:Execute the `spawn_parallel_subagents` tool — 批量并行派发多个子 agent。
@@ -3686,7 +4079,10 @@ where
             };
 
             let complexity = parse_complexity(item.get("complexity"));
-            tasks.push(SpawnRequest::new(name, task, mode, model, complexity));
+            let capability = parse_capability(item.get("capability"));
+            tasks.push(
+                SpawnRequest::new(name, task, mode, model, complexity).with_capability(capability),
+            );
         }
 
         Ok((tasks, fail_fast, fail_fast_str))
@@ -4651,6 +5047,24 @@ fn parse_complexity(value: Option<&serde_json::Value>) -> TaskComplexity {
     }
 }
 
+/// TRAE 架构对齐(§3.1):从 JSON 值解析子智能体能力分级。
+///
+/// 接受字符串("analyze"/"read-only"/"execute",大小写不敏感,
+/// 与 `SubagentCapability` 的 `kebab-case` serde 表示一致)。
+/// 缺失或无法识别时返回 `Analyze`(向后兼容,与 Subagent 默认值一致)。
+fn parse_capability(value: Option<&serde_json::Value>) -> crate::multi_agent::SubagentCapability {
+    let s = value
+        .and_then(|v| v.as_str())
+        .unwrap_or("analyze")
+        .to_ascii_lowercase();
+    match s.as_str() {
+        "read-only" | "readonly" | "read_only" => crate::multi_agent::SubagentCapability::ReadOnly,
+        "execute" => crate::multi_agent::SubagentCapability::Execute,
+        // analyze / unknown / 缺失 — 均回退到 Analyze
+        _ => crate::multi_agent::SubagentCapability::Analyze,
+    }
+}
+
 pub(crate) fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<
@@ -4770,7 +5184,7 @@ fn extract_file_path_from_tool_input(tool_name: &str, tool_input: &str) -> Optio
     None
 }
 
-type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
+type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError> + Send>;
 
 /// Simple in-memory tool executor for tests and lightweight integrations.
 #[derive(Default)]
@@ -4788,7 +5202,7 @@ impl StaticToolExecutor {
     pub fn register(
         mut self,
         tool_name: impl Into<String>,
-        handler: impl FnMut(&str) -> Result<String, ToolError> + 'static,
+        handler: impl FnMut(&str) -> Result<String, ToolError> + Send + 'static,
     ) -> Self {
         self.handlers.insert(tool_name.into(), Box::new(handler));
         self
@@ -4808,10 +5222,10 @@ mod tests {
     use super::{
         build_assistant_message, build_subagent_request, build_subagent_system_prompt,
         compaction_threshold_for_context_window, parse_auto_compaction_threshold,
-        parse_auto_compaction_threshold_opt, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
-        SESSION_SEARCH_TOOL_SPEC,
+        parse_auto_compaction_threshold_opt, process_tool_uses, ApiClient, ApiRequest,
+        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind,
+        RuntimeError, StaticToolExecutor, SubagentContext, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, SESSION_SEARCH_TOOL_SPEC,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -7618,7 +8032,12 @@ mod tests {
     /// §4.6 验收:Diagnostic 复杂度时 system_prompt 含诊断 SOP;且不含唯一内容(3a 静态化)
     #[test]
     fn build_subagent_system_prompt_injects_diagnostic_sop() {
-        let prompt = build_subagent_system_prompt(crate::multi_agent::TaskComplexity::Diagnostic);
+        let prompt = build_subagent_system_prompt(
+            crate::multi_agent::TaskComplexity::Diagnostic,
+            crate::multi_agent::SubagentCapability::Analyze,
+            &SubagentContext::default(),
+        )
+        .render();
         // 3a:静态化后不得包含 id/name/task 唯一内容
         assert!(
             !prompt.contains("# Subagent:"),
@@ -7655,7 +8074,12 @@ mod tests {
     /// §4.6 验收:Simple 复杂度时 system_prompt 不含诊断 SOP(避免污染简单任务);且为纯静态
     #[test]
     fn build_subagent_system_prompt_skips_sop_for_simple_task() {
-        let prompt = build_subagent_system_prompt(crate::multi_agent::TaskComplexity::Simple);
+        let prompt = build_subagent_system_prompt(
+            crate::multi_agent::TaskComplexity::Simple,
+            crate::multi_agent::SubagentCapability::Analyze,
+            &SubagentContext::default(),
+        )
+        .render();
         assert!(
             !prompt.contains("# Subagent:"),
             "unique header must move to user message"
@@ -7673,8 +8097,12 @@ mod tests {
     /// §4.6 v2 验收:Architectural 复杂度注入架构决策 SOP(非诊断 SOP);且为纯静态
     #[test]
     fn build_subagent_system_prompt_injects_architectural_sop() {
-        let prompt =
-            build_subagent_system_prompt(crate::multi_agent::TaskComplexity::Architectural);
+        let prompt = build_subagent_system_prompt(
+            crate::multi_agent::TaskComplexity::Architectural,
+            crate::multi_agent::SubagentCapability::Analyze,
+            &SubagentContext::default(),
+        )
+        .render();
         assert!(
             !prompt.contains("# Subagent:"),
             "unique header must move to user message"
@@ -7723,6 +8151,8 @@ mod tests {
             "diag-agent",
             "定位 wizard 闪退",
             crate::multi_agent::TaskComplexity::Diagnostic,
+            crate::multi_agent::SubagentCapability::Analyze,
+            &SubagentContext::default(),
         );
         let system = req.system_prompt.static_sections.join("\n");
         assert!(
@@ -7759,12 +8189,16 @@ mod tests {
             "agent-a",
             "任务 A",
             crate::multi_agent::TaskComplexity::Diagnostic,
+            crate::multi_agent::SubagentCapability::Analyze,
+            &SubagentContext::default(),
         );
         let b = build_subagent_request(
             "s-2",
             "agent-b",
             "任务 B",
             crate::multi_agent::TaskComplexity::Diagnostic,
+            crate::multi_agent::SubagentCapability::Analyze,
+            &SubagentContext::default(),
         );
         assert_eq!(
             a.system_prompt.static_sections,
@@ -7776,13 +8210,244 @@ mod tests {
             "agent-c",
             "任务 C",
             crate::multi_agent::TaskComplexity::Simple,
+            crate::multi_agent::SubagentCapability::Analyze,
+            &SubagentContext::default(),
         );
         assert_ne!(
             simple.system_prompt.static_sections,
             a.system_prompt.static_sections
         );
     }
-    /// 可控的 mock ValidationGate — 通过 AtomicUsize 控制第 N 次返回 Ok/Err。
+
+    /// Epic 1(§3.2 heading 对齐):注入 repo_map 时 section heading 必须为
+    /// `## Repository Map`,ProjectContext 必须为 `# Environment context`,
+    /// 才能被 `static_cache_breakpoints` 正确识别为 breakpoint。
+    #[test]
+    fn build_subagent_system_prompt_breakpoint_heading_alignment() {
+        let ctx = SubagentContext {
+            repo_map: Some("src/main.rs (refs: 5)\n  fn main".to_string()),
+            project_context: Some(crate::prompt::ProjectContext {
+                cwd: std::path::PathBuf::from("/workspace"),
+                current_date: "2026-08-06".to_string(),
+                git_status: Some("M src/foo.rs".to_string()),
+                git_diff: None,
+                git_context: None,
+                instruction_files: Vec::new(),
+            }),
+            tool_summaries: Vec::new(),
+        };
+        let split = build_subagent_system_prompt(
+            crate::multi_agent::TaskComplexity::Simple,
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &ctx,
+        );
+        // heading 对齐:## Repository Map 和 # Environment context 必须存在
+        let has_repo_map = split
+            .static_sections
+            .iter()
+            .any(|s| s.starts_with("## Repository Map"));
+        assert!(has_repo_map, "missing ## Repository Map heading");
+        let has_env = split
+            .static_sections
+            .iter()
+            .any(|s| s.starts_with("# Environment context"));
+        assert!(has_env, "missing # Environment context heading");
+        // breakpoint 必须识别这两个 heading(回归测试,防止 heading 拼写错误导致缓存分层退化)
+        let breakpoints = split.static_cache_breakpoints();
+        assert!(
+            !breakpoints.is_empty(),
+            "breakpoints must be non-empty when repo_map + environment present"
+        );
+    }
+
+    /// Epic 1:Analyze capability(无工具)不注入工具签名层;
+    /// ReadOnly/Execute 注入 repo_map 后 system prompt 含 Repository Map。
+    #[test]
+    fn build_subagent_system_prompt_capability_and_context_injection() {
+        // Analyze + 空 ctx → 单 section(仅 L0 指令),无 repo_map/tools
+        let split_analyze = build_subagent_system_prompt(
+            crate::multi_agent::TaskComplexity::Simple,
+            crate::multi_agent::SubagentCapability::Analyze,
+            &SubagentContext::default(),
+        );
+        assert_eq!(
+            split_analyze.static_sections.len(),
+            1,
+            "Analyze + empty ctx should have single L0 section"
+        );
+        let rendered = split_analyze.render();
+        assert!(
+            rendered.contains("不需要调用工具"),
+            "Analyze should declare no tools"
+        );
+
+        // ReadOnly + repo_map → 含 Repository Map section
+        let ctx = SubagentContext {
+            repo_map: Some("src/lib.rs".to_string()),
+            project_context: None,
+            tool_summaries: vec![crate::conversation::ToolSummary {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+            }],
+        };
+        let split_ro = build_subagent_system_prompt(
+            crate::multi_agent::TaskComplexity::Simple,
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &ctx,
+        );
+        let ro_rendered = split_ro.render();
+        assert!(
+            ro_rendered.contains("## Repository Map"),
+            "ReadOnly + repo_map should inject Repository Map"
+        );
+        assert!(
+            ro_rendered.contains("## Available Tools"),
+            "ReadOnly + tool_summaries should inject Available Tools"
+        );
+        assert!(
+            ro_rendered.contains("你可以调用工具"),
+            "ReadOnly should declare tool capability"
+        );
+    }
+
+    // Epic 4 集成测试:process_tool_uses + SubagentFileGuard
+    // 验证 edit/write 工具执行前获取文件锁,capability 白名单二次防护
+
+    /// 构造 ToolUse block,input 为含 file_path 的 JSON。
+    fn make_edit_tool_use(id: &str, name: &str, file_path: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: format!(r#"{{"file_path":"{file_path}"}}"#),
+        }
+    }
+
+    #[test]
+    fn process_tool_uses_execute_edit_executes_with_file_lock() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let workspace = tmp.path().to_path_buf();
+
+        let tool_uses = vec![make_edit_tool_use("tu1", "edit", "src/foo.rs")];
+        let mut executor =
+            StaticToolExecutor::new().register("edit", |_input| Ok("edit applied".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &tool_uses,
+            &mut executor,
+            &workspace,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+        );
+
+        assert!(result.is_ok(), "Execute + edit should succeed");
+        assert_eq!(tools_used, vec!["edit"]);
+        assert_eq!(messages.len(), 1, "tool_result should be appended");
+        // changed_files 应包含 edit 的 file_path(规范化后)
+        assert!(
+            !changed_files.is_empty(),
+            "changed_files should be populated"
+        );
+    }
+
+    #[test]
+    fn process_tool_uses_analyze_edit_rejected_by_whitelist() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let workspace = tmp.path().to_path_buf();
+
+        let tool_uses = vec![make_edit_tool_use("tu1", "edit", "src/foo.rs")];
+        let mut executor =
+            StaticToolExecutor::new().register("edit", |_input| Ok("should not reach".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Analyze,
+            &tool_uses,
+            &mut executor,
+            &workspace,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+        );
+
+        // Analyze 白名单不含 edit -> Guard 2 拒绝,返回 Err
+        assert!(
+            result.is_err(),
+            "Analyze + edit should be rejected by whitelist"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("not allowed"),
+            "err should mention not allowed: {err}"
+        );
+        // 工具未执行
+        assert!(tools_used.is_empty(), "tools_used should be empty");
+        assert!(messages.is_empty(), "messages should be empty");
+    }
+
+    #[test]
+    fn process_tool_uses_readonly_write_rejected_by_whitelist() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let workspace = tmp.path().to_path_buf();
+
+        let tool_uses = vec![make_edit_tool_use("tu1", "write", "src/bar.rs")];
+        let mut executor = StaticToolExecutor::new()
+            .register("write", |_input| Ok("should not reach".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &tool_uses,
+            &mut executor,
+            &workspace,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+        );
+
+        assert!(
+            result.is_err(),
+            "ReadOnly + write should be rejected by whitelist"
+        );
+        assert!(tools_used.is_empty());
+    }
+
+    #[test]
+    fn process_tool_uses_execute_write_acquires_lock_and_executes() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let workspace = tmp.path().to_path_buf();
+
+        let tool_uses = vec![make_edit_tool_use("tu2", "write", "src/new.rs")];
+        let mut executor =
+            StaticToolExecutor::new().register("write", |_input| Ok("written".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &tool_uses,
+            &mut executor,
+            &workspace,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+        );
+
+        assert!(result.is_ok(), "Execute + write should succeed");
+        assert_eq!(tools_used, vec!["write"]);
+        assert_eq!(messages.len(), 1);
+    }
+
+    /// 可控的 mock ValidationGate -- 通过 AtomicUsize 控制第 N 次返回 Ok/Err。
     /// 用于场景 3-5 端到端 retry loop 测试。
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -8290,7 +8955,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let results = runtime.spawn_parallel_via_dag(vec![]);
         assert!(results.is_empty(), "empty tasks should return empty vec");
@@ -8309,7 +8974,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         // 两个 task 都应被能力校验拒绝:flash+Diagnostic / flash+Architectural
         let tasks = vec![
@@ -8358,7 +9023,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let tasks = vec![
             crate::multi_agent::SpawnRequest::new(
@@ -8447,7 +9112,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let results = runtime
             .spawn_parallel_via_dag_async(vec![], FailFast::On)
@@ -8468,7 +9133,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let tasks = vec![crate::multi_agent::SpawnRequest::new(
             "diag-agent",
@@ -8505,7 +9170,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let tasks = vec![
             crate::multi_agent::SpawnRequest::new(
@@ -8559,7 +9224,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let tasks = vec![crate::multi_agent::SpawnRequest::new(
             "agent-x",
@@ -8592,7 +9257,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         // library 层默认 false,应返回 Ok(None)
         let result = runtime
@@ -8616,7 +9281,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         // "hello" 是 Simple 任务,不应触发拆解
         let result = runtime
@@ -8639,7 +9304,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let err = runtime
             .execute_spawn_parallel_subagents("not json")
@@ -8659,7 +9324,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let err = runtime
             .execute_spawn_parallel_subagents(r#"{"fail_fast":"on"}"#)
@@ -8679,7 +9344,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let err = runtime
             .execute_spawn_parallel_subagents(r#"{"tasks":[]}"#)
@@ -8699,7 +9364,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let input = r#"{"tasks":[{"name":"a","task":"b","model":"deepseek-v4-flash"}],"fail_fast":"bogus"}"#;
         let err = runtime
@@ -8720,7 +9385,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let input = r#"{"tasks":[{"name":"a","task":"b"}]}"#;
         let err = runtime
@@ -8744,7 +9409,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let input = r#"{
             "tasks": [
@@ -8778,7 +9443,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let input = r#"{
             "tasks": [
@@ -8812,7 +9477,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let err = runtime
             .execute_spawn_parallel_subagents_async("not json")
@@ -8837,7 +9502,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let err = runtime
             .execute_spawn_parallel_subagents_async(r#"{"tasks":[]}"#)
@@ -8862,7 +9527,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf());
+        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
 
         let input = r#"{
             "tasks": [
@@ -8901,6 +9566,37 @@ mod tests {
         assert_eq!(tasks[1].name, "b");
         assert_eq!(fail_fast, FailFast::Off);
         assert_eq!(fail_fast_str, "off");
+    }
+
+    /// Epic 0(§3.1):`parse_spawn_parallel_input` 解析 capability 字段,
+    /// 缺失时默认 Analyze(向后兼容)。
+    #[test]
+    fn parse_spawn_parallel_input_capability_field() {
+        let input = r#"{
+            "tasks": [
+                {"name":"a","task":"do A","model":"deepseek-v4-pro"},
+                {"name":"b","task":"do B","model":"deepseek-v4-pro","capability":"read-only"},
+                {"name":"c","task":"do C","model":"deepseek-v4-pro","capability":"execute"}
+            ],
+            "fail_fast":"off"
+        }"#;
+        let (tasks, _, _) =
+            ConversationRuntime::<NoopApi, StaticToolExecutor>::parse_spawn_parallel_input(input)
+                .expect("valid input should parse");
+        assert_eq!(tasks.len(), 3);
+        // 缺失字段默认 Analyze
+        assert_eq!(
+            tasks[0].capability,
+            crate::multi_agent::SubagentCapability::Analyze
+        );
+        assert_eq!(
+            tasks[1].capability,
+            crate::multi_agent::SubagentCapability::ReadOnly
+        );
+        assert_eq!(
+            tasks[2].capability,
+            crate::multi_agent::SubagentCapability::Execute
+        );
     }
 
     /// v3:`format_spawn_parallel_results` — 共享格式化逻辑的单元测试

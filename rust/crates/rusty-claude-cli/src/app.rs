@@ -3334,8 +3334,12 @@ pub(crate) fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             None, // progress_reporter
         )?;
-        runtime =
-            runtime.with_dag_coordinator(coordinator_arc, subagent_api_client, workspace_root);
+        runtime = runtime.with_dag_coordinator(
+            coordinator_arc,
+            subagent_api_client,
+            workspace_root,
+            None, // tool_executor — None=单轮无工具(向后兼容);Some(executor) 启用多轮 tool call
+        );
     }
 
     // v0.2 生产接入:把 CoordinatorExecutor 注入 tools 层全局 registry,
