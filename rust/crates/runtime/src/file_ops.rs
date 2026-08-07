@@ -673,6 +673,27 @@ pub struct ReplaceLinesOutput {
     pub git_diff: Option<String>,
 }
 
+/// Runs `git diff -- <path>` against the working tree and returns the diff
+/// (relative to the repo root) as a string. Returns `None` when the file is
+/// not tracked by a git repo or git is unavailable.
+fn git_diff_for_path(absolute_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("diff")
+        .arg("--")
+        .arg(absolute_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let diff = String::from_utf8(output.stdout).ok()?;
+    if diff.trim().is_empty() {
+        None
+    } else {
+        Some(diff)
+    }
+}
+
 /// Performs a line-range replacement and returns metadata.
 ///
 /// Uses `edit_file_at_checked` pattern: rejects leaf symlinks (TOCTOU defense),
@@ -687,6 +708,15 @@ pub fn replace_lines(
     reject_leaf_symlink(&absolute_path)?;
 
     let original_file = fs::read_to_string(&absolute_path)?;
+    // Preserve the original file's line-ending style instead of forcing LF.
+    // On Windows, forcing LF while new_content carries CRLF produced mixed
+    // line endings and unreliable line-number counting (see
+    // docs/plans/2026-08-07-replace-lines-tool-pitfalls.md).
+    let newline = if original_file.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let original_lines: Vec<&str> = original_file.lines().collect();
 
     if start_line < 1 || start_line > original_lines.len() {
@@ -708,7 +738,7 @@ pub fn replace_lines(
         ));
     }
 
-    let replaced_slice = original_lines[(start_line - 1)..end_line].join("\n");
+    let replaced_slice = original_lines[(start_line - 1)..end_line].join(newline);
 
     // Build the updated content by splicing lines
     let mut out: Vec<&str> =
@@ -721,7 +751,7 @@ pub fn replace_lines(
     }
     out.extend_from_slice(&original_lines[end_line..]);
 
-    let mut updated = out.join("\n");
+    let mut updated = out.join(newline);
     // Preserve trailing newline: if original file ended with one, ensure updated does too
     if original_file.ends_with('\n') && !updated.ends_with('\n') {
         updated.push('\n');
@@ -747,7 +777,7 @@ pub fn replace_lines(
         replaced_end_line: end_line,
         new_content: new_content.to_owned(),
         original_lines: replaced_slice,
-        git_diff: None,
+        git_diff: git_diff_for_path(&absolute_path),
     })
 }
 
