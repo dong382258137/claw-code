@@ -35,6 +35,14 @@ impl HistoryIndex {
     ///
     /// Creates the `history` virtual table if it does not already exist.
     /// The file's parent directory is created if it does not exist.
+    ///
+    /// Schema versioning (stored in the `history_meta` table):
+    /// - v1: `history` table without `history_meta` (no CJK tokenization).
+    /// - v2: `history` with `history_meta`, `content` stores CJK-tokenized
+    ///   text, no `content_raw` column.
+    /// - v3: adds a `content_raw` column holding the original (pre-split)
+    ///   message body, so search hits can display raw text. Both v1 and v2
+    ///   indexes are transparently migrated to v3 on open.
     pub fn open(db_path: &Path) -> Result<Self, HistoryIndexError> {
         // Create parent directory (e.g. `.claw/`) if missing — prevents
         // silent failure where history_index stays None and session_search
@@ -42,15 +50,32 @@ impl HistoryIndex {
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = Connection::open(db_path)?;
+        let mut conn = Connection::open(db_path)?;
+        // 版本检测与迁移:
+        // - v1:有 history 表但无 history_meta(未切分 CJK)→ 重建为 v3(带 content_raw)
+        // - v2:有 history_meta 且 schema_version < 3(content 已切分但无 content_raw)→ 重建为 v3
+        let has_history_table = table_exists(&conn, "history");
+        let has_meta = table_exists(&conn, "history_meta");
+        if has_history_table && !has_meta {
+            migrate_from_v1(&mut conn)?;
+        } else if has_meta && current_schema_version(&conn)? < 3 {
+            migrate_to_v3(&mut conn)?;
+        }
         conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS history USING fts5(
-                content,
-                session_id UNINDEXED,
-                role UNINDEXED,
-                message_index UNINDEXED,
-                timestamp_ms UNINDEXED
-            );",
+            "CREATE TABLE IF NOT EXISTS history_meta (\
+                 key TEXT PRIMARY KEY,\
+                 value TEXT NOT NULL\
+             );\
+             INSERT OR REPLACE INTO history_meta (key, value)\
+                 VALUES ('schema_version', '3');\
+             CREATE VIRTUAL TABLE IF NOT EXISTS history USING fts5(\
+                 content,\
+                 content_raw UNINDEXED,\
+                 session_id UNINDEXED,\
+                 role UNINDEXED,\
+                 message_index UNINDEXED,\
+                 timestamp_ms UNINDEXED\
+             );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -73,10 +98,11 @@ impl HistoryIndex {
     ) -> Result<(), HistoryIndexError> {
         let conn = self.conn.lock().expect("history index mutex poisoned");
         conn.execute(
-            "INSERT INTO history (content, session_id, role, message_index, timestamp_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO history (content, content_raw, session_id, role, message_index, timestamp_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
-                content,
+                tokenize_content_for_index(content),
+                content, // content_raw: 原始文本,供检索结果显示
                 session_id,
                 role,
                 message_index as i64,
@@ -114,14 +140,17 @@ impl HistoryIndex {
         // §4.7.4:多取 top_k * 2 条,为加权后截断预留空间
         let fetch_limit = (top_k * 2) as i64;
         let mut stmt = conn.prepare(
-            "SELECT content, session_id, role, message_index, timestamp_ms, rank \
+            "SELECT COALESCE(content_raw, content), session_id, role, message_index, timestamp_ms, rank \
              FROM history \
              WHERE history MATCH ?1 \
              ORDER BY rank \
              LIMIT ?2",
         )?;
+        // CJK 查询拆字 AND 连接(如 `飞书` → `(飞 AND 书)`),使 2 字中文词可命中。
+        // 英文/短语/布尔运算符等非中文部分原样透传,不破坏 FTS5 语法。
+        let fts_query = tokenize_query_for_match(query);
         let mut hits = stmt
-            .query_map(rusqlite::params![query, fetch_limit], |row| {
+            .query_map(rusqlite::params![fts_query, fetch_limit], |row| {
                 Ok(HistoryHit {
                     content: row.get(0)?,
                     session_id: row.get(1)?,
@@ -167,6 +196,307 @@ impl HistoryIndex {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
         Ok(count as usize)
     }
+}
+
+// ---------------------------------------------------------------------------
+// CJK 分词与索引迁移辅助
+// ---------------------------------------------------------------------------
+
+/// SQLite FTS5 默认 `unicode61` tokenizer 对连续 CJK 文本不切词:整串 CJK 是
+/// 单个 token,`飞书` 这类 2 字查询永远无法命中。以下两个函数在索引端与查询端
+/// 对称地做**单字切分**,使中文检索可用且不破坏英文/数字/标点检索。
+///
+/// 索引端:连续汉字 → 每个汉字后加空格(`继续帮我配置飞书` → `继 续 帮 我 配 置 飞 书 `)。
+/// 查询端:连续汉字串(≥2 字) → `(字1 AND 字2 AND ...)`;短语查询(引号内) →
+/// `"字1 字2 ..."`(保持相邻语义)。ASCII 与 FTS5 运算符原样透传。
+
+/// 判断字符是否属于 CJK 统一表意文字(含扩展 A-F 与兼容区)。
+fn is_han(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2A700}'..='\u{2B73F}'
+            | '\u{2B740}'..='\u{2B81F}'
+            | '\u{2B820}'..='\u{2CEAF}'
+    )
+}
+
+/// 索引侧切分:连续汉字之间插入空格,使 FTS5 按单字建 token。
+/// 对已切分文本重复调用安全(token 集合不变,只是空白增多)。
+fn tokenize_content_for_index(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 2);
+    for ch in text.chars() {
+        if is_han(ch) {
+            out.push(ch);
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 查询侧切分:按空白把查询拆成词,词内连续汉字串拆成单字 AND 连接
+/// (短语 `"..."` 内保持空格相邻),FTS5 运算符/复杂表达式原样透传。
+///
+/// 注意 FTS5 语法限制:`(expr) 词`(括号表达式后直接跟 token)是语法错误,
+/// 必须显式写 `AND`。因此括号表达式后若跟普通词,连接符输出 ` AND `。
+fn tokenize_query_for_match(query: &str) -> String {
+    /// FTS5 布尔运算符(大小写不敏感)。
+    fn is_operator(part: &str) -> bool {
+        matches!(
+            part.to_ascii_uppercase().as_str(),
+            "AND" | "OR" | "NOT"
+        )
+    }
+
+    /// 把词中连续汉字拆为单字:phrase=true 用空格分隔(短语相邻语义),
+    /// 否则输出 `(字1 AND 字2 ...)`。
+    fn push_split(out: &mut String, word: &str, phrase: bool) {
+        fn flush_cjk(out: &mut String, buf: &mut String, phrase: bool) {
+            if buf.is_empty() {
+                return;
+            }
+            let chars: Vec<char> = buf.chars().collect();
+            match chars.len() {
+                1 => out.push(chars[0]),
+                _ if phrase => {
+                    for (i, c) in chars.iter().enumerate() {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        out.push(*c);
+                    }
+                }
+                _ => {
+                    out.push('(');
+                    for (i, c) in chars.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(" AND ");
+                        }
+                        out.push(*c);
+                    }
+                    out.push(')');
+                }
+            }
+            buf.clear();
+        }
+
+        let mut buf = String::new();
+        for ch in word.chars() {
+            if is_han(ch) {
+                buf.push(ch);
+            } else {
+                flush_cjk(out, &mut buf, phrase);
+                out.push(ch);
+            }
+        }
+        flush_cjk(out, &mut buf, phrase);
+    }
+
+    let mut out = String::with_capacity(query.len() + query.len() / 2);
+    let mut first = true;
+    let mut prev_paren = false;
+    for part in query.split_whitespace() {
+        if !first {
+            // 括号表达式后跟普通词需要显式 AND(FTS5 语法限制)。
+            if prev_paren && !is_operator(part) && !part.starts_with('(') {
+                out.push_str(" AND ");
+            } else {
+                out.push(' ');
+            }
+        }
+        first = false;
+        if is_operator(part) || part.contains(['(', ')']) {
+            out.push_str(part);
+            prev_paren = part.ends_with(')');
+            continue;
+        }
+        if part.starts_with('"') && part.ends_with('"') && part.len() > 2 {
+            // 短语查询:CJK 拆字空格,保持"相邻"语义
+            let inner = &part[1..part.len() - 1];
+            out.push('"');
+            push_split(&mut out, inner, true);
+            out.push('"');
+            prev_paren = false;
+            continue;
+        }
+        // 前缀 `*` / NOT `-` / 列 `:` 等复杂词原样透传
+        if part.contains(['*', '-', ':']) {
+            out.push_str(part);
+            prev_paren = false;
+            continue;
+        }
+        push_split(&mut out, part, false);
+        prev_paren = out.ends_with(')');
+    }
+    out
+}
+
+/// 逆变换 [`tokenize_content_for_index`]:去掉"汉字后插入的空格",还原原始文本。
+///
+/// v2 索引的 content 列存的是切分文本(如 `继 续 帮 我 配 置 飞 书 `),迁移到 v3
+/// 时用它还原显示文本。规则:
+/// - 汉字后紧跟一个空格:该空格是插入的,丢弃(汉字后紧跟汉字/标点/结尾时)。
+/// - 汉字后紧跟两个空格:第一个是插入的,第二个是原文的空格,保留一个。
+/// - 其余字符原样保留。
+fn detokenize_content(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if is_han(c) && i + 1 < chars.len() && chars[i + 1] == ' ' {
+            if i + 2 < chars.len() && chars[i + 2] == ' ' {
+                // 汉字 + 插入空格 + 原空格:保留一个空格
+                out.push(c);
+                out.push(' ');
+                i += 3;
+            } else {
+                // 汉字 + 插入空格:丢弃空格
+                out.push(c);
+                i += 2;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// 读取 history_meta 中的 schema_version(表/键缺失时返回 0,触发迁移)。
+fn current_schema_version(conn: &Connection) -> Result<i64, HistoryIndexError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM history_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0))
+}
+
+/// 判断 SQLite 主表是否存在指定表。
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// 迁移 v1 索引(未做 CJK 切分,无 history_meta 表)到 v3:读出全部行 → DROP →
+/// 重建(v3 schema,带 content_raw)→ 逐条切分重插。v1 的 content 存的是原始
+/// 文本,直接回填 content_raw。
+///
+/// FTS5 的 `content` 列存储原始文本(tokenizer 只影响索引、不影响存储),
+/// 因此旧数据可直接读出并切分后重插,历史消息一个不丢。全程事务执行。
+fn migrate_from_v1(conn: &mut Connection) -> Result<(), HistoryIndexError> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "SELECT content, session_id, role, message_index, timestamp_ms FROM history",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut legacy: Vec<(String, String, String, i64, i64)> = Vec::new();
+        for row in rows {
+            legacy.push(row?);
+        }
+        drop(stmt);
+        tx.execute_batch("DROP TABLE IF EXISTS history;")?;
+        tx.execute_batch(
+            "CREATE VIRTUAL TABLE history USING fts5(\
+                 content,\
+                 content_raw UNINDEXED,\
+                 session_id UNINDEXED,\
+                 role UNINDEXED,\
+                 message_index UNINDEXED,\
+                 timestamp_ms UNINDEXED\
+             );",
+        )?;
+        for (content, session_id, role, message_index, timestamp_ms) in &legacy {
+            tx.execute(
+                "INSERT INTO history (content, content_raw, session_id, role, message_index, timestamp_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    tokenize_content_for_index(content),
+                    content, // v1 存的是原始文本,直接回填
+                    session_id,
+                    role,
+                    message_index,
+                    timestamp_ms,
+                ],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// 迁移 v2 索引(schema_version=2,content 已切分、无 content_raw 列)到 v3:
+/// 重建表并回填 content_raw。v2 的 content 列存的是切分文本,无法直接还原原文,
+/// 用 [`detokenize_content`] 逆变换(去掉汉字后插入的空格)近似还原显示文本。
+fn migrate_to_v3(conn: &mut Connection) -> Result<(), HistoryIndexError> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "SELECT content, session_id, role, message_index, timestamp_ms FROM history",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut legacy: Vec<(String, String, String, i64, i64)> = Vec::new();
+        for row in rows {
+            legacy.push(row?);
+        }
+        drop(stmt);
+        tx.execute_batch("DROP TABLE IF EXISTS history;")?;
+        tx.execute_batch(
+            "CREATE VIRTUAL TABLE history USING fts5(\
+                 content,\
+                 content_raw UNINDEXED,\
+                 session_id UNINDEXED,\
+                 role UNINDEXED,\
+                 message_index UNINDEXED,\
+                 timestamp_ms UNINDEXED\
+             );",
+        )?;
+        for (content, session_id, role, message_index, timestamp_ms) in &legacy {
+            tx.execute(
+                "INSERT INTO history (content, content_raw, session_id, role, message_index, timestamp_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    content, // 已是切分文本,原样保留(索引 token 不变)
+                    detokenize_content(content),
+                    session_id,
+                    role,
+                    message_index,
+                    timestamp_ms,
+                ],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// A single full-text search hit.
@@ -217,7 +547,7 @@ impl From<rusqlite::Error> for HistoryIndexError {
 
 #[cfg(test)]
 mod tests {
-    use super::HistoryIndex;
+    use super::{detokenize_content, HistoryIndex};
     use tempfile::NamedTempFile;
 
     fn open_temp_index() -> (NamedTempFile, HistoryIndex) {
@@ -500,5 +830,180 @@ mod tests {
                 window[1].rank
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // CJK 中文检索(§修复:Bug-1 中文查询失效)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn search_chinese_query_finds_matches() {
+        let (_file, index) = open_temp_index();
+        index
+            .index_message("如何配置飞书机器人 Webhook", "sess-a", "user", 0, 1)
+            .expect("index msg");
+        index
+            .index_message("今天天气如何", "sess-b", "user", 0, 2)
+            .expect("index msg");
+
+        // 2 字中文词(unicode61 下完全无法命中)现在可搜
+        let hits = index.search("飞书", 10).expect("search 飞书");
+        assert_eq!(hits.len(), 1, "2-char CJK query should hit");
+        assert_eq!(hits[0].session_id, "sess-a");
+
+        // 多字词
+        let hits = index.search("机器人", 10).expect("search 机器人");
+        assert_eq!(hits.len(), 1);
+
+        // 混合中英文查询
+        let hits = index.search("飞书 Webhook", 10).expect("search mixed");
+        assert_eq!(hits.len(), 1);
+
+        // 中文短语查询(相邻语义)
+        let hits = index.search("\"配置飞书\"", 10).expect("search phrase");
+        assert_eq!(hits.len(), 1);
+
+        // 无关查询命中正确会话
+        let hits = index.search("天气", 10).expect("search 天气");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "sess-b");
+    }
+
+    #[test]
+    fn index_message_keeps_raw_content_for_cjk() {
+        // 索引 CJK 消息后,检索命中的 content 必须是原始文本(不含切分空格)
+        let (_file, index) = open_temp_index();
+        let raw = "如何配置飞书机器人 Webhook";
+        index
+            .index_message(raw, "sess-a", "user", 0, 1_000)
+            .expect("index msg");
+        let hits = index.search("飞书", 10).expect("search 飞书");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].content, raw,
+            "hit.content 必须是原始文本,而不是切分后的 '如 何 配 置 飞 书 ...'"
+        );
+    }
+
+    #[test]
+    fn tokenize_query_preserves_fts_syntax() {
+        // 非中文查询原样透传
+        assert_eq!(
+            super::tokenize_query_for_match("rust toolchain"),
+            "rust toolchain"
+        );
+        // 中英文混合:中文拆字 AND,括号表达式后跟词需显式 AND(FTS5 语法限制)
+        assert_eq!(
+            super::tokenize_query_for_match("飞书 Webhook"),
+            "(飞 AND 书) AND Webhook"
+        );
+        // 短语内中文拆字空格(保持相邻语义)
+        assert_eq!(
+            super::tokenize_query_for_match("\"配置飞书\""),
+            "\"配 置 飞 书\""
+        );
+        // 布尔运算符保留
+        assert_eq!(
+            super::tokenize_query_for_match("飞书 OR feishu"),
+            "(飞 AND 书) OR feishu"
+        );
+        // 索引切分:连续汉字间插空格,英文不受影响
+        assert_eq!(
+            super::tokenize_content_for_index("如何配置飞书 Feishu"),
+            "如 何 配 置 飞 书  Feishu"
+        );
+    }
+
+    #[test]
+    fn migration_reindexes_legacy_cjk_content() {
+        // 构造 v1 索引(未切分 content,无 history_meta 表)
+        let file = NamedTempFile::new().expect("create temp db file");
+        {
+            let conn = rusqlite::Connection::open(file.path()).expect("open conn");
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE history USING fts5(
+                    content,
+                    session_id UNINDEXED,
+                    role UNINDEXED,
+                    message_index UNINDEXED,
+                    timestamp_ms UNINDEXED
+                );
+                INSERT INTO history VALUES ('继续帮我配置飞书机器人', 'sess-legacy', 'user', 0, 1000);
+                INSERT INTO history VALUES ('the quick brown fox', 'sess-legacy', 'assistant', 1, 2000);",
+            )
+            .expect("create v1 table");
+        }
+
+        // 首次 open 触发迁移
+        let index = HistoryIndex::open(file.path()).expect("open migrates v1");
+        let hits = index.search("飞书", 10).expect("search 飞书 after migration");
+        assert_eq!(
+            hits.len(),
+            1,
+            "legacy CJK content should be searchable after migration"
+        );
+        assert_eq!(hits[0].session_id, "sess-legacy");
+        // v1 存的是原始文本,迁移后 content_raw 直接回填原文
+        assert_eq!(hits[0].content, "继续帮我配置飞书机器人");
+        // 英文旧数据同样可搜
+        let hits = index
+            .search("quick brown", 10)
+            .expect("search english after migration");
+        assert_eq!(hits.len(), 1);
+
+        // 二次 open 不重复迁移(幂等,count 不变)
+        let index2 = HistoryIndex::open(file.path()).expect("open again");
+        assert_eq!(index2.count().expect("count after second open"), 2);
+        let hits2 = index2.search("飞书", 10).expect("search 飞书 after second open");
+        assert_eq!(hits2.len(), 1);
+    }
+
+    #[test]
+    fn migration_v2_backfills_content_raw() {
+        // 构造 v2 索引:history_meta 存在且 schema_version=2,content 已切分,无 content_raw 列
+        let file = NamedTempFile::new().expect("create temp db file");
+        {
+            let conn = rusqlite::Connection::open(file.path()).expect("open conn");
+            conn.execute_batch(
+                "CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO history_meta VALUES ('schema_version', '2');
+                 CREATE VIRTUAL TABLE history USING fts5(
+                     content,
+                     session_id UNINDEXED,
+                     role UNINDEXED,
+                     message_index UNINDEXED,
+                     timestamp_ms UNINDEXED
+                 );
+                 INSERT INTO history VALUES ('继 续 帮 我 配 置 飞 书 ', 'sess-v2', 'user', 0, 1000);",
+            )
+            .expect("create v2 table");
+        }
+
+        let index = HistoryIndex::open(file.path()).expect("open migrates v2 to v3");
+        let hits = index.search("飞书", 10).expect("search 飞书 after v3 migration");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].content, "继续帮我配置飞书",
+            "content_raw 必须由切分文本逆变换还原"
+        );
+        // 二次 open 不重复迁移(幂等)
+        let index2 = HistoryIndex::open(file.path()).expect("open again");
+        assert_eq!(index2.count().expect("count after second open"), 1);
+    }
+
+    #[test]
+    fn detokenize_content_reconstructs_raw_text() {
+        // 纯汉字串
+        assert_eq!(detokenize_content("继 续 帮 我 配 置 飞 书 "), "继续帮我配置飞书");
+        // 汉字 + 原文空格
+        assert_eq!(detokenize_content("飞 书  配 置 "), "飞书 配置");
+        // 汉字 + 英文(无空格)
+        assert_eq!(detokenize_content("飞 书 Feishu"), "飞书Feishu");
+        // 汉字 + 原文空格 + 英文
+        assert_eq!(detokenize_content("飞 书  Feishu"), "飞书 Feishu");
+        // 无汉字:原样
+        assert_eq!(detokenize_content("the quick brown fox"), "the quick brown fox");
+        // 汉字 + 标点
+        assert_eq!(detokenize_content("配 置 完 成 。"), "配置完成。");
     }
 }
