@@ -1745,8 +1745,6 @@ where
     }
 
     /// 获取已注入的 TraceAnalyzer handle(克隆 `Arc`)。
-
-    /// 获取已注入的 TraceAnalyzer handle(克隆 `Arc`)。
     ///
     /// 调用方可通过 `handle.lock().stats()` 或 `handle.lock().export_csv(path)`
     /// 读取 trace 数据。`None` 表示未注入。
@@ -3939,6 +3937,7 @@ where
     /// 3. 提取 `ToolUse` blocks → 若为空则正常终止
     /// 4. `process_tool_uses`:guard(递归/白名单)+ 执行 + 回填 `ToolResult`
     /// 5. 超过 `max_iterations` → 落盘 `Truncated` handoff + Err(§8.1)
+    #[allow(clippy::too_many_arguments)]
     async fn execute_subagent_llm(
         workspace_root: &std::path::Path,
         client: &mut dyn ApiClient,

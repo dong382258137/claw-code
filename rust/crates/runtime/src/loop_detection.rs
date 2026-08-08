@@ -171,8 +171,9 @@ impl LoopDetector {
         let mut action = LoopAction::Continue;
         if entry.0 == TOOL_WARN_THRESHOLD {
             let warn_key = format!("call:{tool_name}:{}", call_key.1);
-            if !self.tool_warned.contains_key(&warn_key) {
-                self.tool_warned.insert(warn_key, now_ms);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.tool_warned.entry(warn_key)
+            {
+                e.insert(now_ms);
                 action = LoopAction::InjectContext(format!(
                     "consider reconsidering your approach — tool '{tool_name}' has been invoked \
                      {} times with identical input; the result has not changed",
@@ -195,8 +196,9 @@ impl LoopDetector {
         }
         if out_entry.0 == SAME_OUTPUT_WARN_THRESHOLD && matches!(action, LoopAction::Continue) {
             let warn_key = format!("out:{tool_name}:{}", out_key.1);
-            if !self.tool_warned.contains_key(&warn_key) {
-                self.tool_warned.insert(warn_key, now_ms);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.tool_warned.entry(warn_key)
+            {
+                e.insert(now_ms);
                 action = LoopAction::InjectContext(format!(
                     "consider reconsidering your approach — tool '{tool_name}' returned identical \
                      output {} times; the result has not changed, consider changing strategy \

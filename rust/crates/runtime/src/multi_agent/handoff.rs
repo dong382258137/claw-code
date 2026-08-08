@@ -70,6 +70,7 @@ pub struct SubagentHandoff {
 impl SubagentHandoff {
     /// 构造一个 `Completed` 状态的 handoff,自动截断 summary 到 [`SUMMARY_MAX_CHARS`]。
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         subagent_id: impl Into<String>,
         name: impl Into<String>,
@@ -193,7 +194,7 @@ pub fn parse_handoff(content: &str) -> Result<SubagentHandoff, String> {
     let lines: Vec<&str> = trimmed.lines().collect();
 
     // 检测 frontmatter:首行必须恰好是 "---"
-    if lines.first().map_or(true, |l| *l != FRONTMATTER_DELIMITER) {
+    if lines.first().is_none_or(|l| *l != FRONTMATTER_DELIMITER) {
         return Ok(legacy_handoff(content));
     }
 

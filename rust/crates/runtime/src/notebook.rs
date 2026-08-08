@@ -392,7 +392,7 @@ pub fn append_attempt(
     );
     let already = notebook
         .get_section("attempted")
-        .map_or(false, |s| s.lines().any(|l| l.trim() == line));
+        .is_some_and(|s| s.lines().any(|l| l.trim() == line));
     if already {
         return Ok(());
     }
