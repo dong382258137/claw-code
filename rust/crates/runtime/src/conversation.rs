@@ -760,6 +760,15 @@ pub enum ReactiveCompactState {
     /// made for this turn. Any further prompt-too-long error is returned as-is.
     FullCompactDone,
 }
+/// 主对话单 turn 的最大迭代次数(护栏)。
+///
+/// 原实现用 `usize::MAX`(无限),诊断/工具调用死循环只能靠用户 Ctrl+C 终止。
+/// 64 轮足以完成绝大多数合法任务(含复杂多文件重构);超限时
+/// [`ConversationRuntime::run_turn_async`] 返回明确错误,替代无限挂起。
+///
+/// 子代理(subagent)单独走 `DEFAULT_AGENT_MAX_ITERATIONS`(32)。
+pub const DEFAULT_MAX_ITERATIONS: usize = 64;
+
 /// 工具调用循环检测的跨 turn 保留窗口(15 分钟)。
 /// 窗口内相同工具调用跨 turn 累积计数;超过窗口未出现则衰减清零。
 pub const LOOP_DECAY_WINDOW_MS: u64 = 15 * 60 * 1000;
@@ -969,7 +978,12 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
-            max_iterations: usize::MAX,
+            // P2-8 修复:主对话单 turn 设置有限迭代护栏(默认 64)。
+            // 原值 usize::MAX 意味着诊断/工具调用死循环(如反复 netstat/tail
+            // 验证同一状态)只能靠用户 Ctrl+C 终止。64 轮足以完成绝大多数
+            // 合法任务(含复杂多文件重构),超限返回明确错误替代无限挂起。
+            // subagent 仍走 DEFAULT_AGENT_MAX_ITERATIONS(32)。
+            max_iterations: DEFAULT_MAX_ITERATIONS,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
@@ -2111,8 +2125,15 @@ where
             iterations += 1;
             self.emit_diag(format!("[diag] loop_start iter={iterations}"));
             if iterations > self.max_iterations {
+                // BUG-3 修复(升级):超限错误携带诊断上下文。
+                // 原实现裸错误,下一 turn 不知道上次为什么卡住 → 跨 turn 死循环
+                // 仍可能复发。现在错误明确指向 NOTEBOOK <attempted> 段
+                // (Task 2 已自动记录本 turn 所有失败尝试)。
                 let error = RuntimeError::new(
-                    "conversation loop exceeded the maximum number of iterations",
+                    "conversation loop exceeded the maximum number of iterations (64). \
+                     Turn aborted to prevent a runaway loop; failed attempts are \
+                     recorded in the NOTEBOOK <attempted> section. Change strategy \
+                     or ask the user before retrying.",
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);

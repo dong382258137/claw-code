@@ -5,8 +5,11 @@
 //! 架构:
 //! - [`LoopDetector`][]:跟踪每个文件的编辑次数,在阈值处触发注入上下文或中止。
 //! - [`LoopAction`]:中间件输出 — Continue / InjectContext / Abort。
-//! - 与 [`RecoveryOrchestrator`](crate::recovery_orchestrator) 对接:Abort
-//!   走 `WorkerFailureKind::Protocol` 恢复路径。
+//! - Abort 行为(经分析修订):**不**走 RecoveryOrchestrator —— 恢复编排器面向
+//!   worker-boot(trust prompt / MCP handshake / 编译修复),与主 agent 循环场景
+//!   不匹配,且默认模拟 executor 会把恢复误报为成功、多跑一轮 doomed 迭代。
+//!   实际由 conversation 工具循环检测到 `loop_abort_reason` 后**直接终止 turn**,
+//!   诊断信息写入 NOTEBOOK `<attempted>` 段供下一轮改变策略。
 //!
 //! 阈值:
 //! - 5 次同文件编辑 → `InjectContext("consider reconsidering your approach")`
