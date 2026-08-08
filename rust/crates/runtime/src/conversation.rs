@@ -760,6 +760,9 @@ pub enum ReactiveCompactState {
     /// made for this turn. Any further prompt-too-long error is returned as-is.
     FullCompactDone,
 }
+/// 工具调用循环检测的跨 turn 保留窗口(15 分钟)。
+/// 窗口内相同工具调用跨 turn 累积计数;超过窗口未出现则衰减清零。
+pub const LOOP_DECAY_WINDOW_MS: u64 = 15 * 60 * 1000;
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
@@ -1949,14 +1952,18 @@ where
         // 返回值不影响主流程,故意丢弃(messages 已在 HookRunner 内部处理)。
         let _ = self.hook_runner.run_session_start(&self.session.session_id);
 
-        // P2-7 修复:在每个 turn 开始时重置 loop_detector,避免跨 turn 累积。
-        // 否则同一文件被多次编辑会触发 InjectContext/Abort,即使这些编辑分布在
-        // 不同 turn 中(误判 doom loop)。
-        self.loop_detector.reset();
-
-        // Phase 4 P1-1：turn 级事务快照。
-        // 在 turn 开始时创建 git stash 快照，以便 turn 内的修改可以通过
-        // rollback_transaction 工具回滚。非 git 仓库自动进入 Disabled 状态。
+        // P2-7 修复(升级 v2):跨 turn 循环检测。
+        // 原实现每 turn 全量 reset(),跨 turn 的"换参数再诊断"循环不可见
+        // (turn 1 诊断失败 → turn 2 换参数再诊断 → ...)。现改为:
+        // - 文件编辑计数每 turn 清空(reset_edits):避免多 turn 合法编辑被误判;
+        // - 工具调用计数按时间窗口衰减(prune_decayed):窗口内跨 turn 累积,
+        //   超时自动清零,兼顾"跨 turn 循环检测"与"合法重复检查"。
+        self.loop_detector.reset_edits();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.loop_detector.prune_decayed(now_ms, LOOP_DECAY_WINDOW_MS);
         // 详见 docs/agent-cognitive-exoskeleton-plan.md 第三章。
         if let Some(tx) = &mut self.refactor_tx {
             let turn_id = format!(
