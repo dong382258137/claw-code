@@ -820,6 +820,10 @@ pub struct ConversationRuntime<C, T> {
     /// 同文件 5 次编辑触发 InjectContext,10 次触发 Abort。详见
     /// docs/harness-engineering-optimization-plan.md Step 2.2。
     loop_detector: LoopDetector,
+    /// LoopDetector Abort 触发时记录的原因;工具循环看到 Some 立即终止 turn。
+    /// 与 hook 的 cancelled 标志区分:普通 hook 取消只把工具结果标错,
+    /// loop abort 则真正中断 turn。
+    loop_abort_reason: Option<String>,
     /// Harness V(验证)层:幻觉/偷懒信号扫描器。
     /// 在 PostToolUse hook 中对 write_file/edit_file 产物扫描占位标记
     /// (unimplemented!/placeholder/TODO),命中时以 warning 追加到 hook
@@ -982,6 +986,7 @@ where
             plan_reviewer: PreCompletionChecklistMiddleware::default(),
             workspace_root: None,
             loop_detector: LoopDetector::new(),
+            loop_abort_reason: None,
             slop_scanner: SlopScanner::new(),
             slop_scan_enabled: feature_config.slop_scan().unwrap_or(true),
             completion_verifier: crate::completion_verifier::CompletionVerifier::new(),
@@ -1845,6 +1850,37 @@ where
         self.slop_scanner.render_warning(&signals)
     }
 
+    /// 运行 LoopDetector(文件编辑 + 工具调用双通道),合并动作并返回。
+    /// Abort 时同时写入 `loop_abort_reason`,供工具循环识别并终止 turn。
+    fn apply_loop_detection(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+    ) -> LoopAction {
+        let mut action = LoopAction::Continue;
+        if let Some(file_path) = extract_file_path_from_tool_input(tool_name, input) {
+            match self.loop_detector.record_edit(&file_path) {
+                LoopAction::Abort(reason) => return LoopAction::Abort(reason),
+                LoopAction::InjectContext(msg) => action = LoopAction::InjectContext(msg),
+                LoopAction::Continue => {}
+            }
+        }
+        match self.loop_detector.record_tool_call(tool_name, input, output) {
+            LoopAction::Abort(reason) => return LoopAction::Abort(reason),
+            LoopAction::InjectContext(msg) => {
+                action = match action {
+                    LoopAction::InjectContext(existing) => {
+                        LoopAction::InjectContext(format!("{existing}\n{msg}"))
+                    }
+                    _ => LoopAction::InjectContext(msg),
+                };
+            }
+            LoopAction::Continue => {}
+        }
+        action
+    }
+
     fn run_post_tool_use_hook(
         &mut self,
         tool_name: &str,
@@ -1852,47 +1888,38 @@ where
         output: &str,
         is_error: bool,
     ) -> HookRunResult {
-        // BUG-2 修复:在 PostToolUse hook 中接入 LoopDetector。
-        // 仅对会修改文件的工具有意义(Edit/Write/MultiEdit/NotebookEdit),
-        // 从 tool_input JSON 中提取 file_path 并记录到 loop_detector。
-        // 根据 LoopAction 决定:
+        // BUG-2 修复:在 PostToolUse hook 中接入 LoopDetector(两个检测维度见
+        // apply_loop_detection)。处理:
         // - Continue:正常流程,继续走原 hook_runner。
         // - InjectContext:把警告消息附加到 hook 结果的 messages 中,
         //   让主 agent 在下一轮看到"重新考虑方法"的提示。
-        // - Abort:返回 cancelled=true 的 HookRunResult,阻断当前 turn。
-        // 详见 docs/harness-engineering-optimization-plan.md Step 2.2。
-        if let Some(file_path) = extract_file_path_from_tool_input(tool_name, input) {
-            match self.loop_detector.record_edit(&file_path) {
-                LoopAction::Abort(reason) => {
-                    return HookRunResult::cancelled_with_message(reason);
-                }
-                LoopAction::InjectContext(msg) => {
-                    let mut base_result =
-                        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-                            self.hook_runner.run_post_tool_use_with_context(
-                                tool_name,
-                                input,
-                                output,
-                                is_error,
-                                Some(&self.hook_abort_signal),
-                                Some(reporter.as_mut()),
-                            )
-                        } else {
-                            self.hook_runner.run_post_tool_use_with_context(
-                                tool_name,
-                                input,
-                                output,
-                                is_error,
-                                Some(&self.hook_abort_signal),
-                                None,
-                            )
-                        };
-                    base_result.append_message(msg);
-                    return base_result;
-                }
-                LoopAction::Continue => {}
+        // - Abort:记录 loop_abort_reason 并返回 cancelled=true 的 HookRunResult,
+        //   工具循环检测到 loop_abort_reason 后**真正终止 turn**(而非仅标错)。
+        match self.apply_loop_detection(tool_name, input, output) {
+            LoopAction::Abort(reason) => {
+                self.loop_abort_reason = Some(reason.clone());
+                return HookRunResult::cancelled_with_message(reason);
             }
+            LoopAction::InjectContext(msg) => {
+                let mut base_result = self.run_post_tool_use_hook_base(
+                    tool_name, input, output, is_error,
+                );
+                base_result.append_message(msg);
+                return base_result;
+            }
+            LoopAction::Continue => {}
         }
+        self.run_post_tool_use_hook_base(tool_name, input, output, is_error)
+    }
+
+    /// 执行真正的 PostToolUse hook(不含 loop 检测前置)。
+    fn run_post_tool_use_hook_base(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+        is_error: bool,
+    ) -> HookRunResult {
         if let Some(reporter) = self.hook_progress_reporter.as_mut() {
             self.hook_runner.run_post_tool_use_with_context(
                 tool_name,
@@ -1915,6 +1942,33 @@ where
     }
 
     fn run_post_tool_use_failure_hook(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+    ) -> HookRunResult {
+        // BUG-2 修复(升级):失败的工具调用同样进入循环检测。
+        // 原实现失败路径完全绕过 LoopDetector,"命令报错 → 换参数再报错"的
+        // 循环(exit != 0)无法被捕获。现在与成功路径对称处理。
+        match self.apply_loop_detection(tool_name, input, output) {
+            LoopAction::Abort(reason) => {
+                self.loop_abort_reason = Some(reason.clone());
+                return HookRunResult::cancelled_with_message(reason);
+            }
+            LoopAction::InjectContext(msg) => {
+                let mut base_result = self.run_post_tool_use_failure_hook_base(
+                    tool_name, input, output,
+                );
+                base_result.append_message(msg);
+                return base_result;
+            }
+            LoopAction::Continue => {}
+        }
+        self.run_post_tool_use_failure_hook_base(tool_name, input, output)
+    }
+
+    /// 执行真正的 PostToolUseFailure hook(不含 loop 检测前置)。
+    fn run_post_tool_use_failure_hook_base(
         &mut self,
         tool_name: &str,
         input: &str,
@@ -2771,6 +2825,22 @@ where
                                     &output,
                                 );
                             }
+                        }
+
+                        // BUG-2 修复(升级):LoopDetector Abort 现在真正终止 turn。
+                        // 原实现只把工具结果标记为 error,LLM 看到错误消息后仍会
+                        // 继续循环,只有 64 次迭代上限兜底。现在 Abort 立即返回
+                        // 带诊断的错误;已尝试记录在 NOTEBOOK <attempted> 段
+                        // (Task 2 自动记账),供下一 turn 改变策略。
+                        if let Some(reason) = self.loop_abort_reason.take() {
+                            let error = RuntimeError::new(format!(
+                                "doom loop detected, turn aborted: {reason}. \
+                                 Failed attempts are recorded in the NOTEBOOK \
+                                 <attempted> section; change strategy or ask the \
+                                 user before retrying."
+                            ));
+                            self.record_turn_failed(iterations, &error);
+                            return Err(error);
                         }
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
@@ -6295,6 +6365,47 @@ mod tests {
             .contains("conversation loop exceeded the maximum number of iterations"));
     }
 
+    #[test]
+    fn run_turn_aborts_early_on_tool_loop() {
+        struct LoopingApi;
+
+        impl ApiClient for LoopingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "echo".to_string(),
+                        input: "payload".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // max_iterations=64 远高于中止阈值(6),证明是 loop detector 而非迭代上限兜底
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LoopingApi,
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(64);
+
+        // when
+        let error = runtime
+            .run_turn("loop", None)
+            .expect_err("identical tool calls should abort the turn");
+
+        // then
+        assert!(
+            error.to_string().contains("doom loop detected"),
+            "unexpected error: {error}"
+        );
+    }
     #[test]
     fn run_turn_propagates_api_errors() {
         struct FailingApi;
