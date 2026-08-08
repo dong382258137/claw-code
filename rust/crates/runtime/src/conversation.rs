@@ -2751,6 +2751,21 @@ where
                                 || post_hook_result.is_cancelled(),
                         );
 
+                        // P0:失败的工具调用自动记录到 NOTEBOOK <attempted> 段。
+                        // 循环中的 LLM 不会主动调用 notebook_update,此处由运行时记账,
+                        // 使下一轮/下一 turn 看到"已尝试且失败"的路径,从源头消除重复诊断。
+                        // 静默吞错:记录失败不阻断工具结果返回(与历史索引 hook 一致)。
+                        if is_error {
+                            if let Some(workspace_root) = &self.workspace_root {
+                                let _ = crate::notebook::append_attempt(
+                                    workspace_root,
+                                    &tool_name,
+                                    &effective_input,
+                                    &output,
+                                );
+                            }
+                        }
+
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
                     PermissionOutcome::Deny { reason } => {

@@ -365,6 +365,63 @@ impl Notebook {
     }
 }
 
+/// `<attempted>` 段自动记录的最大字符数。超出时从头部裁剪,保留最新的失败尝试。
+pub const ATTEMPTED_MAX_CHARS: usize = 2048;
+
+/// 运行时自动追加一条失败尝试到 `<attempted>` 段(不依赖 LLM 主动调用)。
+///
+/// 循环中的 LLM 不会停下来调用 `notebook_update` 记账,本函数由运行时在
+/// 工具调用失败路径自动调用,使下一轮/下一 turn 的 prompt 注入能看到
+/// "已尝试且失败"的路径,从源头消除重复诊断。
+///
+/// 特性:
+/// - 去重:完全相同的尝试行不重复追加(同一失败循环只记 1 条,不膨胀 prompt)
+/// - 容量:超出 [`ATTEMPTED_MAX_CHARS`] 时从头部裁剪(对齐行首,不截断半行)
+/// - 失败静默:NOTEBOOK 读写失败返回 Err,由调用方吞掉(不阻塞主流程)
+pub fn append_attempt(
+    workspace_root: &Path,
+    tool_name: &str,
+    tool_input: &str,
+    output: &str,
+) -> Result<(), NotebookError> {
+    let mut notebook = Notebook::load(workspace_root)?;
+    let line = format!(
+        "- [tool] {tool_name} | input={} | failed: {}",
+        truncate_for_attempt(tool_input, 80),
+        truncate_for_attempt(output, 120),
+    );
+    let already = notebook
+        .get_section("attempted")
+        .map_or(false, |s| s.lines().any(|l| l.trim() == line));
+    if already {
+        return Ok(());
+    }
+    notebook.append_to_section("attempted", &line);
+    if let Some(sec) = notebook.get_section("attempted") {
+        if sec.chars().count() > ATTEMPTED_MAX_CHARS {
+            let overflow = sec.chars().count() - ATTEMPTED_MAX_CHARS;
+            let skipped: String = sec.chars().skip(overflow).collect();
+            let trimmed = skipped
+                .find('\n')
+                .map(|nl| skipped[nl + 1..].to_string())
+                .unwrap_or(skipped);
+            notebook.set_section("attempted", &trimmed);
+        }
+    }
+    notebook.save(workspace_root)
+}
+
+/// 按字符数截断文本,超出时加省略号。
+fn truncate_for_attempt(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push('…');
+        out
+    }
+}
+
 /// 跨会话"plan 需刷新"标记文件名(相对于 workspace_root)。
 ///
 /// 方案 C:会话结束时写入,下一会话首 turn 检测到则注入"刷新 `<plan>`"提醒,
@@ -935,7 +992,6 @@ mod tests {
             "oldest evidence should be trimmed: found #000"
         );
     }
-
     #[test]
     fn evidence_section_included_in_render() {
         let mut nb = Notebook::new();
@@ -944,5 +1000,34 @@ mod tests {
         assert!(rendered.contains("<evidence>"));
         assert!(rendered.contains("对比矩阵"));
         assert!(rendered.contains("</evidence>"));
+    }
+
+    // ---- P0: <attempted> 段自动记录(防重复诊断循环) ----
+
+    #[test]
+    fn append_attempt_records_and_dedups() {
+        let dir = temp_workspace();
+        append_attempt(dir.path(), "Bash", "netstat -an", "no output").expect("append");
+        append_attempt(dir.path(), "Bash", "netstat -an", "no output").expect("append again");
+        let nb = Notebook::load(dir.path()).expect("load");
+        let sec = nb.get_section("attempted").expect("attempted section exists");
+        assert_eq!(sec.lines().count(), 1, "完全相同的尝试只记录一次");
+        assert!(sec.contains("netstat -an"));
+    }
+
+    #[test]
+    fn append_attempt_caps_section_size() {
+        let dir = temp_workspace();
+        for i in 0..100 {
+            append_attempt(dir.path(), "Bash", &format!("cmd {i}"), "failed").expect("append");
+        }
+        let nb = Notebook::load(dir.path()).expect("load");
+        let sec = nb.get_section("attempted").expect("attempted");
+        assert!(
+            sec.chars().count() <= ATTEMPTED_MAX_CHARS,
+            "attempted 段必须被裁剪到容量内"
+        );
+        assert!(sec.contains("cmd 99"), "保留最新的尝试");
+        assert!(!sec.contains("cmd 0"), "最旧的尝试被裁剪");
     }
 }
