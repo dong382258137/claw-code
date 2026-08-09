@@ -23,6 +23,7 @@ archive/
 # Agent dispatch cache (transient)
 .clawd-agents/
 # Per-workspace claw artifacts (subdirectory mirrors of root entries above)
+**/.claw/settings.local.json
 **/.claw/plugins/
 **/.claw/history.db
 **/.claw/sessions/
