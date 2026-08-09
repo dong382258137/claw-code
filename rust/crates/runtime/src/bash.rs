@@ -323,88 +323,94 @@ async fn execute_bash_async(
     // - child 退出后若 pipe 长时间未 EOF（后台 `&` 进程继承 pipe 写端），
     //   超过 PIPE_DRAIN_GRACE 后强制关闭 pipe，防止死锁
     // - stdout/stderr 都 EOF 且 child 已退出时：break
+    //
+    // 关键设计：所有周期检查（try_wait / abort / 智能或固定超时 / PIPE_DRAIN_GRACE）
+    // 都放在循环顶部，每轮必执行，绝不依赖 select! 的某个分支触发。
+    // 背景（BUG）：此前超时/try_wait 检查放在 select! 的 sleep 分支里，而 select!
+    // 用 biased 优先读 stdout。当 stdout 持续有数据时，read 分支总是立即 ready，
+    // sleep 分支被饿死 → 固定 timeout 永不触发（实测 timeout=30s 的命令跑了 578s），
+    // 会话表现为"执行工具后卡死"。把检查移到顶部后，即使 stdout 满速输出，
+    // 每轮循环仍会执行超时判定，保证 30s 准时 kill。
     loop {
-        // PIPE_DRAIN_GRACE 检查（必须在 select! 之前，不依赖 sleep 分支）：
-        // biased select! 下，若后台进程持续输出数据，stdout read 分支总是
-        // 立即 ready，sleep 分支永远不到期 → PIPE_DRAIN_GRACE 检查被饿死。
-        // 在循环顶部检查确保即使 stdout 持续有数据，2s 后仍强制关闭 pipe。
-        if let Some(exit_time) = child_exit_time {
-            if exit_time.elapsed() >= PIPE_DRAIN_GRACE {
-                child_stdout = None;
-                child_stderr = None;
+        // 1. try_wait() 轮询子进程退出状态 → 提前到循环顶部。
+        //    try_wait() 直接调用 GetExitCodeProcess（同步、非阻塞），
+        //    不依赖 IOCP 通知（tokio 的 child.wait() 在 Windows 有 race），
+        //    每轮执行一次，检测延迟 < 1 次迭代，可接受。
+        if !child_exited {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exit_status = status.code();
+                    child_exited = true;
+                    child_exit_time = Some(Instant::now());
+                }
+                Ok(None) => { /* child 仍在运行 */ }
+                Err(_) => {
+                    child_exited = true;
+                    child_exit_time = Some(Instant::now());
+                }
             }
         }
-        if child_exited && child_stdout.is_none() && child_stderr.is_none() {
-            break;
-        }
 
-        tokio::select! {
-            biased;
-
-            // 分支 1：轮询超时、abort、try_wait 和 pipe 排空宽限期
-            //   用 try_wait() 轮询代替 child.wait() future：
-            //   tokio 在 Windows 上的 child.wait() 依赖后台线程 + IOCP 通知
-            //   （RegisterWaitForSingleObject），存在 race condition — child 在
-            //   注册之前退出会导致通知丢失，wait() future 永远不 ready。
-            //   try_wait() 直接调用 GetExitCodeProcess（同步、非阻塞），
-            //   不依赖 IOCP 通知，更可靠。每 100ms 轮询一次，检测延迟可接受。
-            _ = tokio::time::sleep(poll_interval) => {
-                // try_wait() 轮询子进程退出状态
-                if !child_exited {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            exit_status = status.code();
-                            child_exited = true;
-                            child_exit_time = Some(Instant::now());
-                        }
-                        Ok(None) => { /* child 仍在运行 */ }
-                        Err(_) => {
-                            child_exited = true;
-                            child_exit_time = Some(Instant::now());
-                        }
-                    }
-                }
-                if is_bash_aborted() {
-                    aborted = true;
-                    if !child_exited {
+        // 2. abort / 智能或固定超时检查 → 提前到循环顶部。
+        if is_bash_aborted() {
+            aborted = true;
+            if !child_exited {
+                let _ = child.kill().await;
+                child_exited = true;
+                child_exit_time = Some(Instant::now());
+            }
+            // abort 时立即关闭 pipe，快速退出（不等残留数据）
+            child_stdout = None;
+            child_stderr = None;
+        } else if !child_exited {
+            if let Some(ref mut m) = monitor {
+                // 智能模式：基于子进程树活跃度决策
+                match m.poll() {
+                    activity_monitor::ActivityDecision::Continue => {}
+                    activity_monitor::ActivityDecision::IdleTimeout => {
+                        timed_out = true;
+                        smart_idle = true;
                         let _ = child.kill().await;
                         child_exited = true;
                         child_exit_time = Some(Instant::now());
                     }
-                    // abort 时立即关闭 pipe，快速退出（不等残留数据）
-                    child_stdout = None;
-                    child_stderr = None;
-                } else if !child_exited {
-                    if let Some(ref mut m) = monitor {
-                        // 智能模式：基于子进程树活跃度决策
-                        match m.poll() {
-                            activity_monitor::ActivityDecision::Continue => {}
-                            activity_monitor::ActivityDecision::IdleTimeout => {
-                                timed_out = true;
-                                smart_idle = true;
-                                let _ = child.kill().await;
-                                child_exited = true;
-                                child_exit_time = Some(Instant::now());
-                            }
-                            activity_monitor::ActivityDecision::HardTimeout => {
-                                timed_out = true;
-                                let _ = child.kill().await;
-                                child_exited = true;
-                                child_exit_time = Some(Instant::now());
-                            }
-                        }
-                    } else if start.elapsed() >= timeout_dur {
-                        // 固定超时模式（input.timeout 显式指定时）
+                    activity_monitor::ActivityDecision::HardTimeout => {
                         timed_out = true;
                         let _ = child.kill().await;
                         child_exited = true;
                         child_exit_time = Some(Instant::now());
                     }
                 }
-                // PIPE_DRAIN_GRACE 检查已在循环顶部执行，此处不再重复
+            } else if start.elapsed() >= timeout_dur {
+                // 固定超时模式（input.timeout 显式指定时）
+                timed_out = true;
+                let _ = child.kill().await;
+                child_exited = true;
+                child_exit_time = Some(Instant::now());
             }
+        }
 
-            // 分支 2：读 stdout（child.wait() 已移到分支 1 的 try_wait 轮询）
+        // 3. PIPE_DRAIN_GRACE：child 退出后排空 pipe 的宽限期。
+        //    后台 `&` 进程继承 pipe 写端导致 child 退出后 pipe 不 EOF，
+        //    超过宽限期后强制关闭 pipe，防止 select! 永久阻塞。
+        if let Some(exit_time) = child_exit_time {
+            if exit_time.elapsed() >= PIPE_DRAIN_GRACE {
+                child_stdout = None;
+                child_stderr = None;
+            }
+        }
+
+        // 4. 退出条件：child 已退出且 stdout/stderr 都 EOF（或已关闭）
+        if child_exited && child_stdout.is_none() && child_stderr.is_none() {
+            break;
+        }
+
+        // 事件循环：只负责读 stdout/stderr，外加 100ms 心跳保活。
+        // 周期检查全部在上方循环顶部完成，此处无需再放 sleep 分支的可判定逻辑。
+        tokio::select! {
+            biased;
+
+            // 分支 1：读 stdout
             n = async {
                 if let Some(ref mut stdout) = child_stdout {
                     stdout.read(&mut tmp_out).await
@@ -424,7 +430,7 @@ async fn execute_bash_async(
                 }
             }
 
-            // 分支 3：读 stderr
+            // 分支 2：读 stderr
             n = async {
                 if let Some(ref mut stderr) = child_stderr {
                     stderr.read(&mut tmp_err).await
@@ -443,6 +449,10 @@ async fn execute_bash_async(
                     Err(_) => { child_stderr = None; }
                 }
             }
+
+            // 分支 3：静默期心跳（两边 pipe 都无数据时，保证至少每 100ms 醒来一次，
+            // 让循环顶部的 try_wait/超时检查定期执行）
+            _ = tokio::time::sleep(poll_interval) => {}
         }
     }
 
@@ -1194,6 +1204,44 @@ mod tests {
             output.stderr
         );
         assert!(output.stdout.contains("done"));
+    }
+
+    /// 回归测试：固定超时在 stdout 持续输出时也必须准时触发。
+    ///
+    /// 背景 BUG：超时/try_wait 检查此前放在 select! 的 sleep 分支里，select! 用
+    /// biased 优先读 stdout。当命令持续向 stdout 写数据（如 `while true; do echo`）
+    /// 时，read 分支总是立即 ready，sleep 分支被饿死 → 固定 timeout 永不触发，
+    /// 命令永不返回（实测 timeout=30s 的命令跑了 578s，会话表现为卡死）。
+    ///
+    /// 修复后检查移到循环顶部，即使 stdout 满速输出，也应在一个较短的墙钟窗口内
+    /// kill 并返回 interrupted，绝不 hang。
+    #[test]
+    fn fixed_timeout_fires_even_with_continuous_stdout() {
+        let start = std::time::Instant::now();
+        let output = execute_bash(BashCommandInput {
+            // 持续向 stdout 写数据且永不退出的命令（git-bash 语法）
+            command: String::from("while true; do echo tick; done"),
+            timeout: Some(200), // 200ms 固定超时
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash command should return");
+
+        let elapsed_ms = start.elapsed().as_millis();
+        assert!(
+            output.interrupted,
+            "continuous-output command should be timeout-interrupted, stderr={}",
+            output.stderr
+        );
+        assert!(
+            elapsed_ms < 5_000,
+            "fixed timeout should fire promptly even with continuous stdout, took {elapsed_ms}ms"
+        );
     }
 
     /// 改进点 5:`try_assign_sandbox_job` 在 sandbox disabled 时应无副作用。

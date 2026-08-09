@@ -326,7 +326,9 @@ pub use tool_result_archive::{
 // 生产构建解锁:见 L59 模块注释。补齐 TrustAllowlistEntry/TrustResolution/
 // detect_trust_prompt,让 worker_boot 的 TrustGate 分支可在生产构建接入信任层。
 pub use loop_detection::{
-    LoopAction, LoopDetector, ABORT_THRESHOLD, MCP_TOOLS_MAX, SKILLS_MAX, WARN_THRESHOLD,
+    LoopAction, LoopDetector, ABORT_THRESHOLD, MCP_TOOLS_MAX, SAME_OUTPUT_ABORT_THRESHOLD,
+    SAME_OUTPUT_WARN_THRESHOLD, SKILLS_MAX, TOOL_ABORT_THRESHOLD, TOOL_WARN_THRESHOLD,
+    WARN_THRESHOLD,
 };
 pub use multi_agent::{
     CoordinationMode, JoinStats, MultiAgentCoordinator, Subagent, SubagentStatus,
