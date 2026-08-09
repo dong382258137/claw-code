@@ -44,21 +44,27 @@ pub enum SubagentCapability {
     /// L0 分析型：只读 + 推理，无副作用。用于调研、方案设计、代码审查。
     #[default]
     Analyze,
-    /// L1 只读型：可调用只读工具（read/grep/glob/repomap），禁止写入。
+    /// L1 只读型：可调用只读工具（read_file/grep_search/glob_search/repomap），禁止写入。
     ReadOnly,
-    /// L2 执行型：可调用写入工具（edit/write/bash），受白名单约束。
+    /// L2 执行型：可调用写入工具（edit_file/write_file/bash），受白名单约束。
     Execute,
 }
 
 impl SubagentCapability {
     /// 返回该能力允许的工具名白名单（按 tools::GlobalToolRegistry 注册名）。
+    ///
+    /// **使用规范名**（read_file/grep_search/... 与 `mvp_tool_specs` 注册名一致）：
+    /// API 层 `GlobalToolRegistry::definitions()` 按规范名过滤工具定义、
+    /// 执行层 `execute_tool` 仅匹配规范名，统一后 guard / API 工具暴露 /
+    /// 执行 / `## Available Tools` 层全链路一致，子 agent 不再"短名通过 guard
+    /// 却无法执行 / API 只见 bash"。
     pub fn allowed_tools(self) -> &'static [&'static str] {
         match self {
             Self::Analyze => &[],  // 纯 LLM 推理，不启用工具
-            Self::ReadOnly => &["read", "grep", "glob", "repomap", "lsp_diagnostics"],
+            Self::ReadOnly => &["read_file", "grep_search", "glob_search", "repomap", "lsp_diagnostics"],
             Self::Execute => &[
-                "read", "grep", "glob", "repomap", "lsp_diagnostics",
-                "edit", "write", "bash",
+                "read_file", "grep_search", "glob_search", "repomap", "lsp_diagnostics",
+                "edit_file", "write_file", "bash",
                 // 注:`dispatch_subagent` / `spawn_parallel_subagents` 不放入白名单,
                 // 递归派发禁止由 §3.3.1 guard 在 tool_use 提取阶段显式检查实现
                 // (见 execute_subagent_llm 内 `if tu.name == "dispatch_subagent" ...` 分支)。

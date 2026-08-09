@@ -279,42 +279,45 @@ pub struct ToolSummary {
     pub description: String,
 }
 
-/// design-gaps #5:默认子 agent 工具签名目录(短名 + 描述)。
+/// design-gaps #5:默认子 agent 工具签名目录(规范名 + 描述)。
 ///
 /// 与 [`SubagentCapability::allowed_tools()`](crate::multi_agent::SubagentCapability::allowed_tools)
-/// 白名单对齐的固定短名表。runtime crate 不依赖 tools crate,无法直接引用
-/// `mvp_tool_specs` 的实时描述,故维护静态表;生产调用方可经
+/// 白名单对齐的固定表,使用**规范名**(read_file/grep_search/... 与
+/// `mvp_tool_specs` 注册名一致)——API 层工具定义、执行层、guard 与
+/// `## Available Tools` 层全链路统一。runtime crate 不依赖 tools crate,
+/// 无法直接引用 `mvp_tool_specs` 的实时描述,故维护静态表;生产调用方可经
 /// [`ConversationRuntime::with_tool_catalog`] 从 `GlobalToolRegistry` 注入
 /// 实时目录,避免描述漂移。
 ///
 /// 仅收录**实际可执行**的工具:`repomap` / `lsp_diagnostics` 虽在能力白名单中,
 /// 但未在 `GlobalToolRegistry` 注册(前者是 prompt 层 repo_map 段,后者是
-/// edit/write 结果的附加诊断),广告它们只会诱导子 agent 试错被拒。
+/// edit_file/write_file 结果的附加诊断),广告它们只会诱导子 agent 试错被拒。
 ///
 /// `build_subagent_context` 按 capability 白名单过滤后再注入
-/// `## Available Tools` 层(ReadOnly=read/grep/glob,Execute 加 edit/write/bash)。
+/// `## Available Tools` 层(ReadOnly=read_file/grep_search/glob_search,
+/// Execute 加 edit_file/write_file/bash)。
 #[must_use]
 pub fn default_subagent_tool_catalog() -> Vec<ToolSummary> {
     vec![
         ToolSummary {
-            name: "read".into(),
-            description: "读取工作区文本文件(规范名 read_file)。支持 offset/limit 分页读取大文件。".into(),
+            name: "read_file".into(),
+            description: "读取工作区文本文件。支持 offset/limit 分页读取大文件。".into(),
         },
         ToolSummary {
-            name: "grep".into(),
-            description: "用正则搜索文件内容(规范名 grep_search)。必须指定 glob 文件扩展名(如 *.rs),避免搜索二进制/大文件。".into(),
+            name: "grep_search".into(),
+            description: "用正则搜索文件内容。必须指定 glob 文件扩展名(如 *.rs),避免搜索二进制/大文件。".into(),
         },
         ToolSummary {
-            name: "glob".into(),
-            description: "按 glob 模式查找文件(规范名 glob_search)。".into(),
+            name: "glob_search".into(),
+            description: "按 glob 模式查找文件。".into(),
         },
         ToolSummary {
-            name: "edit".into(),
-            description: "替换工作区文件中的文本(规范名 edit_file)。结果含 startLine/endLine/affectedLineCount,便于后续计算行偏移。".into(),
+            name: "edit_file".into(),
+            description: "替换工作区文件中的文本。结果含 startLine/endLine/affectedLineCount,便于后续计算行偏移。".into(),
         },
         ToolSummary {
-            name: "write".into(),
-            description: "在工作区写入文本文件(规范名 write_file)。".into(),
+            name: "write_file".into(),
+            description: "在工作区写入文本文件。".into(),
         },
         ToolSummary {
             name: "bash".into(),
@@ -486,7 +489,7 @@ pub(crate) fn build_subagent_request(
 /// 2. **白名单 guard**:不在 `capability.allowed_tools()` → 立即 Err
 /// 3. **工具执行**:调用 `tool_executor.execute(name, input)`,失败时返回
 ///    `is_error=true` 的 `ToolResult`(不中断循环,让 LLM 决定下一步)
-/// 4. **changed_files 提取**:`edit`/`write` 工具的 `file_path` 提取并规范化
+/// 4. **changed_files 提取**:`edit_file`/`write_file` 工具的 `file_path` 提取并规范化
 /// 5. **ToolResult 回填**:追加到 `messages`,供下一轮 LLM 调用使用
 ///
 /// # 参数
@@ -527,18 +530,18 @@ pub(crate) fn process_tool_uses(
 
         tools_used.push(name.clone());
 
-        // Epic 4:edit/write 文件锁(SubagentFileGuard)
-        // Guard 2 已确保只有 Execute capability 能调 edit/write(Analyze/ReadOnly 被白名单拒绝)
+        // Epic 4:edit_file/write_file 文件锁(SubagentFileGuard)
+        // Guard 2 已确保只有 Execute capability 能调 edit_file/write_file(Analyze/ReadOnly 被白名单拒绝)
         // 此处获取 per-file 锁,防止并行 Execute 子智能体修改同一文件冲突(§4)
         // try_acquire 是同步阻塞(Condvar wait_timeout,30s 超时),与 tool_executor.execute
         // 同样为同步调用,在路径 A(async)和路径 B(sync thread)中均可接受
         let _file_lock: Option<crate::multi_agent::LockHandle> =
-            if matches!(name.as_str(), "edit" | "write") {
+            if matches!(name.as_str(), "edit_file" | "write_file") {
                 let guard = crate::multi_agent::SubagentFileGuard::new(
                     capability,
                     workspace_root.to_path_buf(),
                 );
-                // 从 input JSON 提取 file_path(edit/write 工具标准字段)
+                // 从 input JSON 提取 file_path(edit_file/write_file 工具标准字段)
                 let file_path = serde_json::from_str::<serde_json::Value>(input)
                     .ok()
                     .and_then(|v| {
@@ -575,8 +578,8 @@ pub(crate) fn process_tool_uses(
             Err(e) => (e.to_string(), true),
         };
 
-        // changed_files 提取(edit/write 可能修改文件)
-        if matches!(name.as_str(), "edit" | "write") {
+        // changed_files 提取(edit_file/write_file 可能修改文件)
+        if matches!(name.as_str(), "edit_file" | "write_file") {
             changed_files.extend(crate::multi_agent::extract_changed_files(
                 input,
                 workspace_root,
@@ -8646,7 +8649,7 @@ mod tests {
             &RuntimeFeatureConfig::default(),
         );
 
-        // ReadOnly:仅只读子集(read/grep/glob),不含写入工具
+        // ReadOnly:仅只读子集(read_file/grep_search/glob_search),不含写入工具
         let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly);
         let ro_names: Vec<&str> = ro
             .tool_summaries
@@ -8655,11 +8658,11 @@ mod tests {
             .collect();
         assert_eq!(
             ro_names,
-            vec!["read", "grep", "glob"],
+            vec!["read_file", "grep_search", "glob_search"],
             "ReadOnly should only expose read-only subset"
         );
 
-        // Execute:全量可执行目录(read/grep/glob/edit/write/bash)
+        // Execute:全量可执行目录(read_file/grep_search/glob_search/edit_file/write_file/bash)
         let ex = runtime.build_subagent_context(SubagentCapability::Execute);
         let ex_names: Vec<&str> = ex
             .tool_summaries
@@ -8668,7 +8671,14 @@ mod tests {
             .collect();
         assert_eq!(
             ex_names,
-            vec!["read", "grep", "glob", "edit", "write", "bash"],
+            vec![
+                "read_file",
+                "grep_search",
+                "glob_search",
+                "edit_file",
+                "write_file",
+                "bash"
+            ],
             "Execute should expose the full executable catalog"
         );
         assert!(
@@ -8699,7 +8709,7 @@ mod tests {
         )
         .with_tool_catalog(vec![
             crate::conversation::ToolSummary {
-                name: "read".to_string(),
+                name: "read_file".to_string(),
                 description: "custom read".to_string(),
             },
             crate::conversation::ToolSummary {
@@ -8714,7 +8724,11 @@ mod tests {
             .iter()
             .map(|ts| ts.name.as_str())
             .collect();
-        assert_eq!(ro_names, vec!["read"], "override catalog filtered to ReadOnly");
+        assert_eq!(
+            ro_names,
+            vec!["read_file"],
+            "override catalog filtered to ReadOnly"
+        );
 
         let ex = runtime.build_subagent_context(SubagentCapability::Execute);
         let ex_names: Vec<&str> = ex
@@ -8722,17 +8736,28 @@ mod tests {
             .iter()
             .map(|ts| ts.name.as_str())
             .collect();
-        assert_eq!(ex_names, vec!["read", "bash"], "override catalog filtered to Execute");
+        assert_eq!(
+            ex_names,
+            vec!["read_file", "bash"],
+            "override catalog filtered to Execute"
+        );
     }
 
-    // design-gaps #5:default_subagent_tool_catalog 与白名单短名对齐,且不含未注册工具。
+    // design-gaps #5:default_subagent_tool_catalog 与白名单规范名对齐,且不含未注册工具。
     #[test]
     fn default_subagent_tool_catalog_aligned_with_whitelist() {
         let catalog = default_subagent_tool_catalog();
         let names: Vec<&str> = catalog.iter().map(|ts| ts.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["read", "grep", "glob", "edit", "write", "bash"]
+            vec![
+                "read_file",
+                "grep_search",
+                "glob_search",
+                "edit_file",
+                "write_file",
+                "bash"
+            ]
         );
         // 目录中每个条目都必须在 Execute 白名单内(过滤后不会被白名单丢弃)
         for tool in &names {
@@ -8763,9 +8788,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let workspace = tmp.path().to_path_buf();
 
-        let tool_uses = vec![make_edit_tool_use("tu1", "edit", "src/foo.rs")];
-        let mut executor =
-            StaticToolExecutor::new().register("edit", |_input| Ok("edit applied".to_string()));
+        let tool_uses = vec![make_edit_tool_use("tu1", "edit_file", "src/foo.rs")];
+        let mut executor = StaticToolExecutor::new()
+            .register("edit_file", |_input| Ok("edit applied".to_string()));
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -8780,10 +8805,10 @@ mod tests {
             &mut changed_files,
         );
 
-        assert!(result.is_ok(), "Execute + edit should succeed");
-        assert_eq!(tools_used, vec!["edit"]);
+        assert!(result.is_ok(), "Execute + edit_file should succeed");
+        assert_eq!(tools_used, vec!["edit_file"]);
         assert_eq!(messages.len(), 1, "tool_result should be appended");
-        // changed_files 应包含 edit 的 file_path(规范化后)
+        // changed_files 应包含 edit_file 的 file_path(规范化后)
         assert!(
             !changed_files.is_empty(),
             "changed_files should be populated"
@@ -8795,9 +8820,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let workspace = tmp.path().to_path_buf();
 
-        let tool_uses = vec![make_edit_tool_use("tu1", "edit", "src/foo.rs")];
-        let mut executor =
-            StaticToolExecutor::new().register("edit", |_input| Ok("should not reach".to_string()));
+        let tool_uses = vec![make_edit_tool_use("tu1", "edit_file", "src/foo.rs")];
+        let mut executor = StaticToolExecutor::new()
+            .register("edit_file", |_input| Ok("should not reach".to_string()));
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -8812,10 +8837,10 @@ mod tests {
             &mut changed_files,
         );
 
-        // Analyze 白名单不含 edit -> Guard 2 拒绝,返回 Err
+        // Analyze 白名单不含 edit_file -> Guard 2 拒绝,返回 Err
         assert!(
             result.is_err(),
-            "Analyze + edit should be rejected by whitelist"
+            "Analyze + edit_file should be rejected by whitelist"
         );
         let err = result.unwrap_err();
         assert!(
@@ -8832,9 +8857,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let workspace = tmp.path().to_path_buf();
 
-        let tool_uses = vec![make_edit_tool_use("tu1", "write", "src/bar.rs")];
+        let tool_uses = vec![make_edit_tool_use("tu1", "write_file", "src/bar.rs")];
         let mut executor = StaticToolExecutor::new()
-            .register("write", |_input| Ok("should not reach".to_string()));
+            .register("write_file", |_input| Ok("should not reach".to_string()));
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -8851,7 +8876,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "ReadOnly + write should be rejected by whitelist"
+            "ReadOnly + write_file should be rejected by whitelist"
         );
         assert!(tools_used.is_empty());
     }
@@ -8861,9 +8886,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let workspace = tmp.path().to_path_buf();
 
-        let tool_uses = vec![make_edit_tool_use("tu2", "write", "src/new.rs")];
-        let mut executor =
-            StaticToolExecutor::new().register("write", |_input| Ok("written".to_string()));
+        let tool_uses = vec![make_edit_tool_use("tu2", "write_file", "src/new.rs")];
+        let mut executor = StaticToolExecutor::new()
+            .register("write_file", |_input| Ok("written".to_string()));
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -8878,8 +8903,8 @@ mod tests {
             &mut changed_files,
         );
 
-        assert!(result.is_ok(), "Execute + write should succeed");
-        assert_eq!(tools_used, vec!["write"]);
+        assert!(result.is_ok(), "Execute + write_file should succeed");
+        assert_eq!(tools_used, vec!["write_file"]);
         assert_eq!(messages.len(), 1);
     }
 

@@ -2939,43 +2939,25 @@ pub(crate) fn is_broad_working_directory(cwd: &Path) -> bool {
 
 /// design-gaps #5:从 `GlobalToolRegistry` 生成子 agent 工具签名目录。
 ///
-/// 子 agent 能力白名单使用短名(read/grep/glob/edit/write),注册表使用规范名
-/// (read_file/grep_search/glob_search/edit_file/write_file)。此处按 alias 表
-/// 映射回短名,使 `## Available Tools` 层展示的可调用名与
-/// `SubagentCapability::allowed_tools()` guard 白名单一致;描述取自注册表
-/// (`mvp_tool_specs` 单源真值,避免静态表描述漂移)。
+/// 能力白名单使用**规范名**(read_file/grep_search/...,见
+/// `SubagentCapability::allowed_tools()`),与注册表一致,无需映射;
+/// `## Available Tools` 层展示的可调用名与 guard / API 工具定义全链路统一。
+/// 描述取自注册表(`mvp_tool_specs` 单源真值,避免静态表描述漂移)。
 ///
 /// `ConversationRuntime::build_subagent_context` 随后再按 capability 过滤
 /// (ReadOnly 取只读子集,Execute 取全量)。`repomap` / `lsp_diagnostics` 未
 /// 在注册表注册,自然不会出现在目录中。
 fn subagent_tool_catalog(registry: &GlobalToolRegistry) -> Vec<runtime::ToolSummary> {
-    // 短名 ↔ 规范名(与 tools::GlobalToolRegistry::normalize_allowed_tools 的 alias 表一致)
-    const ALIASES: &[(&str, &str)] = &[
-        ("read", "read_file"),
-        ("write", "write_file"),
-        ("edit", "edit_file"),
-        ("glob", "glob_search"),
-        ("grep", "grep_search"),
-    ];
-    let short_to_canonical: BTreeSet<String> = runtime::multi_agent::SubagentCapability::Execute
+    let allowed: BTreeSet<String> = runtime::multi_agent::SubagentCapability::Execute
         .allowed_tools()
         .iter()
-        .map(|short| {
-            ALIASES
-                .iter()
-                .find(|(s, _)| *s == *short)
-                .map_or(*short, |(_, canonical)| *canonical)
-                .to_string()
-        })
+        .map(|s| s.to_string())
         .collect();
     registry
-        .definitions(Some(&short_to_canonical))
+        .definitions(Some(&allowed))
         .into_iter()
         .map(|definition| runtime::ToolSummary {
-            name: ALIASES
-                .iter()
-                .find(|(_, canonical)| *canonical == definition.name.as_str())
-                .map_or(definition.name.clone(), |(short, _)| short.to_string()),
+            name: definition.name,
             description: definition.description.unwrap_or_default(),
         })
         .collect()

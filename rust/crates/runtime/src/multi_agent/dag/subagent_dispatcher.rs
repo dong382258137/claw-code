@@ -435,18 +435,18 @@ mod tests {
         let test_file = workspace.join("test.txt");
         std::fs::write(&test_file, "hello world").expect("write test file");
 
-        // 第 1 轮:LLM 请求 read 工具
+        // 第 1 轮:LLM 请求 read_file 工具
         // 第 2 轮:LLM 返回纯文本(无工具调用,终止循环)
         let client = MockApiClient::new(vec![
-            make_tool_use_event("tu-1", "read", r#"{"file_path":"test.txt"}"#),
+            make_tool_use_event("tu-1", "read_file", r#"{"file_path":"test.txt"}"#),
             make_text_event("Read result: hello world"),
         ]);
 
         let api_client: Arc<Mutex<Box<dyn ApiClient + Send>>> =
             Arc::new(Mutex::new(Box::new(client)));
 
-        // 创建一个能执行 read 的 tool_executor
-        let tool_exec = StaticToolExecutor::new().register("read", move |input| {
+        // 创建一个能执行 read_file 的 tool_executor
+        let tool_exec = StaticToolExecutor::new().register("read_file", move |input| {
             // 简单 mock:解析 file_path 并返回内容
             let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
             let path = parsed
@@ -474,7 +474,10 @@ mod tests {
         let handoff_path = tmp.path().join(".claw/subagents/subagent-ro-1.md");
         let content = std::fs::read_to_string(&handoff_path).expect("read handoff");
         assert!(content.contains("status: completed"));
-        assert!(content.contains("read"), "tools_used should contain read");
+        assert!(
+            content.contains("read_file"),
+            "tools_used should contain read_file"
+        );
         assert!(
             content.contains("iterations: 2"),
             "should have 2 iterations"
@@ -525,7 +528,7 @@ mod tests {
         // LLM 请求工具,但无 tool_executor
         let client = MockApiClient::new(vec![make_tool_use_event(
             "tu-1",
-            "read",
+            "read_file",
             r#"{"file_path":"test.txt"}"#,
         )]);
 
