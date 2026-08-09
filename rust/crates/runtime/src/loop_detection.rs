@@ -14,6 +14,12 @@
 //! 阈值:
 //! - 5 次同文件编辑 → `InjectContext("consider reconsidering your approach")`
 //! - 10 次同文件编辑 → `Abort("doom loop detected")`
+//! - 3 次相同 (tool_name, 规范化 input) 调用 → `InjectContext`
+//! - 6 次相同 (tool_name, 规范化 input) 调用 → `Abort`
+//! - 5 次相同 (tool_name, 规范化 output) 调用 → `InjectContext`
+//! - 10 次相同 (tool_name, 规范化 output) 调用 → `Abort`
+//! - 15 次连续无产出(非文件修改)工具调用 → `InjectContext`(探索循环)
+//! - 30 次连续无产出工具调用 → `Abort`
 //!
 //! 经验法则:
 //! - MCP Tools ≤ 80, Skills ≤ 15,注册时校验。
@@ -42,6 +48,19 @@ pub const SAME_OUTPUT_WARN_THRESHOLD: u32 = 5;
 
 /// 相同 (tool_name, output) 调用触发中止的阈值。
 pub const SAME_OUTPUT_ABORT_THRESHOLD: u32 = 10;
+
+/// 连续无产出(非文件修改)工具调用触发警告的阈值。
+///
+/// 针对"探索循环":每次调用不同命令/工具(相同-input 与相同-output 通道
+/// 均无法命中),但从不修改任何文件、任务无进展。达到该次数注入提示,
+/// 引导模型改变策略或询问用户。
+pub const NO_OUTPUT_WARN_THRESHOLD: u32 = 15;
+
+/// 连续无产出工具调用触发中止的阈值。
+///
+/// 高于警告阈值:给"边探索边思考"的复杂分析留足空间(文本输出/文件修改
+/// 都会清零 streak),同时保留硬终止兜底,防止模型无视警告后无限空转。
+pub const NO_OUTPUT_ABORT_THRESHOLD: u32 = 30;
 
 /// MCP Tools 注册数量上限(经验法则)。
 pub const MCP_TOOLS_MAX: usize = 80;
@@ -90,6 +109,13 @@ pub struct LoopDetector {
     /// 已发出过警告的调用 key → 警告时间戳 ms。衰减时一并清除,
     /// 允许窗口期过后对新一轮循环重新警告。
     tool_warned: HashMap<String, u64>,
+    /// 连续非文件修改工具调用计数(探索循环检测)。
+    /// 命中文件修改工具时清零;达到 [`NO_OUTPUT_WARN_THRESHOLD`] /
+    /// [`NO_OUTPUT_ABORT_THRESHOLD`] 时警告/中止。跨 turn 保留
+    /// (由 [`LoopDetector::reset_edits`] 之外的路径自然延续)。
+    no_output_run: u32,
+    /// 是否已对当前无产出 streak 发出过警告(避免重复注入)。
+    no_output_warned: bool,
 }
 
 impl LoopDetector {
@@ -109,6 +135,9 @@ impl LoopDetector {
         let count = self.edit_counts.entry(file_path.to_owned()).or_insert(0);
         *count += 1;
         self.total_edits += 1;
+        // 文件编辑是任务产出信号:清零无产出 streak。
+        self.no_output_run = 0;
+        self.no_output_warned = false;
 
         if *count >= ABORT_THRESHOLD {
             LoopAction::Abort(format!(
@@ -156,6 +185,16 @@ impl LoopDetector {
         output: &str,
         now_ms: u64,
     ) -> LoopAction {
+        // 无产出通道更新(探索循环检测):
+        // - 文件修改工具 → 产出信号,清零 streak;
+        // - 其他工具 → 累加。置前更新以便下文 Abort 优先级判断使用。
+        if crate::slop_scanner::is_file_modifying_tool(tool_name) {
+            self.no_output_run = 0;
+            self.no_output_warned = false;
+        } else {
+            self.no_output_run += 1;
+        }
+
         let normalized = normalize_tool_input(tool_input);
         let call_key = (tool_name.to_owned(), normalized);
         let entry = self.tool_call_counts.entry(call_key.clone()).or_insert((0, 0));
@@ -207,7 +246,47 @@ impl LoopDetector {
                 ));
             }
         }
+
+        // 无产出通道:连续非文件修改工具调用达到中止阈值 → 终止 turn。
+        // 置于相同-input / 相同-output Abort 之后,保证后者优先级更高。
+        if self.no_output_run >= NO_OUTPUT_ABORT_THRESHOLD {
+            return LoopAction::Abort(format!(
+                "no-output loop detected: {0} consecutive tool calls without any file \
+                 modification; the task is not progressing. Failed attempts are recorded \
+                 in the NOTEBOOK <attempted> section; change strategy or ask the user \
+                 before retrying",
+                self.no_output_run
+            ));
+        }
+        // 达到警告阈值且未警告过 → 注入"无产出,改变策略"提示。
+        if self.no_output_run == NO_OUTPUT_WARN_THRESHOLD && !self.no_output_warned {
+            self.no_output_warned = true;
+            let msg = format!(
+                "consider reconsidering your approach — {0} consecutive tool calls have \
+                 produced no file modification; the task is not progressing. Consider \
+                 changing strategy or asking the user for direction",
+                self.no_output_run
+            );
+            action = match action {
+                LoopAction::InjectContext(existing) => LoopAction::InjectContext(format!(
+                    "{existing}\n{msg}"
+                )),
+                _ => LoopAction::InjectContext(msg),
+            };
+        }
         action
+    }
+
+    /// 记录一次模型文本输出(弱产出信号)。
+    ///
+    /// 模型输出可见文本(说明分析进度/阶段性结论)时,视为仍在推进思考,
+    /// 重置无产出 streak。避免"边说明边探索"的合理诊断(如复杂根因分析)
+    /// 被"连续无产出"通道误判为探索循环。文件修改是强产出信号
+    /// ([`LoopDetector::record_edit`] 与 `record_tool_call` 中的
+    /// `is_file_modifying_tool` 分支),文本输出是弱信号,两者任一出现都清零。
+    pub fn record_text_output(&mut self) {
+        self.no_output_run = 0;
+        self.no_output_warned = false;
     }
 
     /// 重置文件编辑跟踪(每个 turn 开始调用;工具调用计数保留,支持跨 turn 检测)。
@@ -554,6 +633,122 @@ mod tests {
         assert_eq!(detector.edit_count("src/main.rs"), 0);
         let action = detector.record_edit("src/main.rs");
         assert!(matches!(action, LoopAction::Continue));
+    }
+
+    // -----------------------------------------------------------------
+    // 无产出通道(探索循环):连续非文件修改工具调用检测
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn no_output_streak_warns_then_aborts() {
+        // 每次调用不同只读工具(绕过相同-input / 相同-output 通道),
+        // 但从不产出 → 第 NO_OUTPUT_WARN_THRESHOLD 次警告,第
+        // NO_OUTPUT_ABORT_THRESHOLD 次中止。
+        let mut detector = LoopDetector::new();
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
+            let input = format!("probe step {i}");
+            let output = format!("output #{i}");
+            let action = detector.record_tool_call("Bash", &input, &output);
+            assert!(
+                matches!(action, LoopAction::Continue),
+                "第 {i} 次调用应仍为 Continue(低于警告阈值): {action:?}"
+            );
+        }
+        let action = detector.record_tool_call("Bash", "probe step warn", "output #warn");
+        assert!(
+            matches!(action, LoopAction::InjectContext(_)),
+            "第 {NO_OUTPUT_WARN_THRESHOLD} 次连续无产出调用应触发警告: {action:?}"
+        );
+        if let LoopAction::InjectContext(msg) = action {
+            assert!(msg.contains("no file modification"));
+        }
+        // 继续到中止阈值
+        for i in NO_OUTPUT_WARN_THRESHOLD..NO_OUTPUT_ABORT_THRESHOLD - 1 {
+            let input = format!("probe step {i}");
+            let output = format!("output #{i}");
+            let action = detector.record_tool_call("Bash", &input, &output);
+            assert!(
+                matches!(action, LoopAction::Continue),
+                "第 {i} 次调用应仍为 Continue(警告后不再重复注入): {action:?}"
+            );
+        }
+        let action = detector.record_tool_call("Bash", "probe step abort", "output #abort");
+        assert!(
+            matches!(action, LoopAction::Abort(_)),
+            "第 {NO_OUTPUT_ABORT_THRESHOLD} 次连续无产出调用应中止: {action:?}"
+        );
+        if let LoopAction::Abort(msg) = action {
+            assert!(msg.contains("no-output loop detected"));
+        }
+    }
+
+    #[test]
+    fn file_edit_resets_no_output_streak() {
+        // 无产出 streak 中插入一次文件编辑 → 计数清零,重新累计
+        let mut detector = LoopDetector::new();
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
+            let _ = detector.record_tool_call("Bash", &format!("probe {i}"), &format!("out {i}"));
+        }
+        // 文件编辑(record_edit)清零 streak
+        let _ = detector.record_edit("src/main.rs");
+        // 重新累计到警告阈值才会警告(而非依赖旧的 streak)
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
+            let action =
+                detector.record_tool_call("Read", &format!("file {i}"), &format!("content {i}"));
+            assert!(matches!(action, LoopAction::Continue));
+        }
+        let action = detector.record_tool_call("Read", "file warn", "content warn");
+        assert!(
+            matches!(action, LoopAction::InjectContext(_)),
+            "编辑后 streak 应重置,需重新达到警告阈值: {action:?}"
+        );
+    }
+
+    #[test]
+    fn file_modifying_tool_resets_no_output_streak() {
+        // 直接调用文件修改工具(走 record_tool_call)同样清零 streak
+        let mut detector = LoopDetector::new();
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD {
+            let _ = detector.record_tool_call("Bash", &format!("probe {i}"), &format!("out {i}"));
+        }
+        let action = detector.record_tool_call(
+            "edit_file",
+            r#"{"file_path":"src/main.rs","old_string":"a","new_string":"b"}"#,
+            "ok",
+        );
+        assert!(
+            matches!(action, LoopAction::Continue),
+            "文件修改工具应清零 streak 并返回 Continue: {action:?}"
+        );
+        // 之后重新累计:前几次不再立即警告
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
+            let action =
+                detector.record_tool_call("Read", &format!("file {i}"), &format!("content {i}"));
+            assert!(matches!(action, LoopAction::Continue));
+        }
+    }
+
+    #[test]
+    fn text_output_resets_no_output_streak() {
+        // 模型输出文本(弱产出信号)清零 streak —— 保护"边说明边探索"的复杂诊断
+        let mut detector = LoopDetector::new();
+        // 累计到接近警告阈值
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
+            let _ = detector.record_tool_call("Read", &format!("file {i}"), &format!("content {i}"));
+        }
+        // 模型输出文本 → streak 清零
+        detector.record_text_output();
+        // 重新累计到警告阈值才警告(而非依赖旧 streak)
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
+            let action =
+                detector.record_tool_call("Bash", &format!("probe {i}"), &format!("out {i}"));
+            assert!(matches!(action, LoopAction::Continue));
+        }
+        let action = detector.record_tool_call("Bash", "probe warn", "out warn");
+        assert!(
+            matches!(action, LoopAction::InjectContext(_)),
+            "文本输出后 streak 应重置,需重新达到警告阈值: {action:?}"
+        );
     }
 
     // -----------------------------------------------------------------

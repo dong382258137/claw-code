@@ -2495,6 +2495,17 @@ where
                     })
                     .sum::<usize>()
             ));
+            // 无产出循环检测:模型输出可见文本 → 弱产出信号,重置无产出 streak。
+            // 复杂诊断任务(如根因分析)会边说明进度边探索,若仅按"无文件修改"
+            // 判定会被误判为探索循环;文本输出证明模型在推进思考,应放宽。
+            // 注意:在 record_assistant_iteration 之前调用,不改变消息流。
+            if assistant_message
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if !text.is_empty()))
+            {
+                self.loop_detector.record_text_output();
+            }
             self.record_assistant_iteration(
                 iterations,
                 &assistant_message,
