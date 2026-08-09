@@ -366,7 +366,7 @@ mod tests {
             SubagentCapability::Execute,
             TaskComplexity::Architectural,
             3,
-            vec!["read".into(), "edit".into(), "bash".into()],
+            vec!["read_file".into(), "edit_file".into(), "bash".into()],
             vec!["src/foo.rs".into(), "src/bar.rs".into()],
             "修复了 edit 工具的路径问题",
             "完整分析过程\n多行内容\n含 --- 分隔符也不影响解析",

@@ -393,14 +393,14 @@ fn summarize_tool_input(name: &str, input: &str) -> String {
                 .unwrap_or("?");
             format!("✏️ {path}")
         }
-        "grep" | "Grep" => {
+        "grep" | "Grep" | "grep_search" => {
             let pattern = parsed
                 .get("pattern")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             format!("🔎 `{pattern}`")
         }
-        "glob" | "Glob" => {
+        "glob" | "Glob" | "glob_search" => {
             let pattern = parsed
                 .get("pattern")
                 .and_then(|v| v.as_str())
@@ -566,6 +566,16 @@ mod tests {
     fn render_tool_call_start_for_read_file() {
         let card = render_tool_call_start("read_file", r#"{"file_path":"/tmp/test.rs"}"#);
         assert!(card.contains("📄 /tmp/test.rs"));
+    }
+
+    #[test]
+    fn summarize_tool_input_matches_canonical_grep_glob_names() {
+        // 子 agent 用规范名调用(grep_search/glob_search),输入摘要需命中专用分支,
+        // 而不是 fallback 到 generic 键值对(防展示层短名/规范名双重失效回归)。
+        let grep = summarize_tool_input("grep_search", r#"{"pattern":"foo"}"#);
+        assert!(grep.contains("🔎 `foo`"), "grep_search 应命中输入摘要: {grep}");
+        let glob = summarize_tool_input("glob_search", r#"{"pattern":"*.rs"}"#);
+        assert!(glob.contains("🌐 `*.rs`"), "glob_search 应命中输入摘要: {glob}");
     }
 
     #[test]

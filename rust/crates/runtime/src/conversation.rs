@@ -8613,7 +8613,7 @@ mod tests {
             repo_map: Some("src/lib.rs".to_string()),
             project_context: None,
             tool_summaries: vec![crate::conversation::ToolSummary {
-                name: "read".to_string(),
+                name: "read_file".to_string(),
                 description: "Read a file".to_string(),
             }],
         };
