@@ -20,8 +20,8 @@
 //! 按需设置 capability。
 
 use crate::conversation::{
-    build_assistant_message, build_subagent_request, process_tool_uses, ApiClient, SubagentContext,
-    ToolExecutor,
+    build_assistant_message, build_subagent_request, default_subagent_tool_catalog,
+    process_tool_uses, ApiClient, SubagentContext, ToolExecutor,
 };
 use crate::multi_agent::{write_handoff, HandoffStatus, SubagentCapability, SubagentHandoff};
 use crate::session::ContentBlock;
@@ -132,7 +132,15 @@ impl SubagentDispatcher {
         // 3a/3b DRY:共享同一公共构造。
         // DAG 路径无 complexity 概念,与现状一致走 Simple(无 SOP)。
         let complexity = crate::multi_agent::TaskComplexity::Simple;
-        let ctx = SubagentContext::default();
+        // design-gaps #5:注入工具签名目录(按 capability 白名单过滤,与路径 A 一致)。
+        // 短名与 process_tool_uses 白名单 guard 一致;Analyze 过滤后为空(无工具层)。
+        let ctx = SubagentContext {
+            tool_summaries: default_subagent_tool_catalog()
+                .into_iter()
+                .filter(|ts| capability.allowed_tools().contains(&ts.name.as_str()))
+                .collect(),
+            ..SubagentContext::default()
+        };
         let initial_request = build_subagent_request(
             subagent_id,
             name,

@@ -5,7 +5,7 @@
 > 用途：作为后续实施排期与优先级决策的依据
 > 核查结论要点：docs 中大部分设计方案已实现并默认开启；以下为**未实现 / 部分实现 / 已偏离**项的收益清单。
 >
-> **实施进度（2026-08-09）**：#3 知识新鲜度（S4 负向排除 + 中文关键词，commit `ca22cc4c`）、#4 提示词引导（WebSearch 优先 / ToolSearch / TaskUpdate，commit `222f1b2f`）、#1 hooks（matcher + timeout，commit `4ffc45bc`；PostCustomToolCall 事件面，commit `17a9598e`）已完成；#3 剩余路径 A 传递链（`knowledge_source` 移除全局 last-gated，改 LLM 显式传参精确传递）、#4 的 capability/`--resume`（经核查代码不存在）未实现。各条目以 ✅ 标注。
+> **实施进度（2026-08-09）**：#3 知识新鲜度（S4 负向排除 + 中文关键词，commit `ca22cc4c`）、#4 提示词引导（WebSearch 优先 / ToolSearch / TaskUpdate，commit `222f1b2f`）、#1 hooks（matcher + timeout，commit `4ffc45bc`；PostCustomToolCall 事件面，commit `17a9598e`）已完成；#3 剩余路径 A 传递链（`knowledge_source` 移除全局 last-gated，改 LLM 显式传参精确传递）、#4 的 capability/`--resume`（经核查代码不存在）未实现；**#5 tool_summaries 注满已完成**（`default_subagent_tool_catalog` 短名表 + `build_subagent_context` 按 capability 过滤注入 + 路径 A/B 双接线 + cli 从 `GlobalToolRegistry` 注入实时目录）。各条目以 ✅ 标注。
 
 ---
 
@@ -33,7 +33,7 @@
 
 | # | 未实现内容 | 完善后的收益 |
 |---|---|---|
-| 5 | **TRAE 对齐 Epic 1 剩余**：`SubagentContext.tool_summaries` 生产路径留空（`runtime/src/conversation.rs:3916` 注释"暂留空"） | 子智能体 system prompt 的 `## Available Tools` 层当前**真空**，注满后：① 子 agent 清楚自己有哪些工具可用，不再试错调用被拒；② L2 工具层进静态前缀，复用缓存断点，不损命中率 |
+| 5 | ✅ **TRAE 对齐 Epic 1 剩余（已完成）**：~~`SubagentContext.tool_summaries` 生产路径留空（`runtime/src/conversation.rs:3916` 注释"暂留空"）~~。**已完成**：新增 `default_subagent_tool_catalog()` 短名表（仅收录实际可执行的 read/grep/glob/edit/write/bash，未注册的 repomap/lsp_diagnostics 不广告）；`build_subagent_context` 按 `capability.allowed_tools()` 白名单过滤注入（路径 A）；DAG 路径 B 同步接线；cli 从 `GlobalToolRegistry` 生成实时目录经 `with_tool_catalog` 注入（描述与 mvp_tool_specs 单源一致） | 子智能体 system prompt 的 `## Available Tools` 层**注满**：① 子 agent 清楚自己有哪些工具可用，不再试错调用被拒；② L2 工具层进静态前缀，复用缓存断点，不损命中率 |
 | 6 | **ACP/IDE 应用层 5 项**：`fs/read_text_file`、`fs/write_text_file`、`session/request_permission`、LaneEvent→SessionNotification 桥接、VS Code 扩展（`claw-shell/src/agent.rs` 这些方法为 stub） | ① **IDE 闭环**：claw 作为 ACP server 可读编辑器缓冲区、请求用户权限，VS Code 扩展让 AI 直接编辑当前打开文件；② 桥接后 IDE 端实时感知 lane 进度；③ 这是文档承诺的"IDE 原生体验"，补齐后 claw 不再是纯终端工具 |
 | 7 | ✅ **hooks 的 Stop/PostCustomToolCall 集成点**（~~hooks.rs 有方法但 conversation.rs 未接入~~）。**已完成**：核查确认 Stop（turn 完成）与 SubagentStop 早已接入；PostCustomToolCall 已接入（commit `17a9598e`），仅对经 ToolExecutor 执行的外部自定义工具触发，payload 携带真实 tool_name + output | 会话停止、自定义工具调用完成时 hook 静默失效。接入后：监控/审计类 hook 覆盖完整事件面，合规场景才可用 |
 | 8 | ✅ **local-openai-providers 文档漂移**：~~文档写 `OPENAI_BASE_URL`，代码已改为 `DEEPSEEK_*` 专有~~（`api/src/providers/mod.rs:162-164` 无条件 DeepSeek 路由）。**已完成**：文档对齐实现现状 —— 文首标注 provider 路由为 DeepSeek 专有、routing 示例改用 `DEEPSEEK_BASE_URL`、本地模型示例标注"待通用 `OPENAI_BASE_URL` 分支恢复" | ① 用户不再按过时文档配置导致失败；② 若需支持 Ollama/OpenRouter 等，可恢复通用 OPENAI_BASE_URL 分支，**解锁本地模型调试场景**（离线/低成本开发） |
@@ -95,7 +95,7 @@
 短期做（中等投入）：
   ④ ACP fs/permission + 桥接  →  解锁 IDE 闭环
   ⑤ self-evolving harness MVP  →  立项级，建议拆成 harness 记录 + CLI 两个里程碑
-  ⑥ tool_summaries 注满  →  子 agent 能力可见性
+  ⑥ ✅ tool_summaries 注满  →  子 agent 能力可见性（已完成，`default_subagent_tool_catalog` 短名表 + capability 过滤注入 + cli 从 GlobalToolRegistry 注入）
   ⑥' hooks 剩余：异步 HookRunner（P1 异步化，文档建议 P0 保留同步）+ 配置热重载
 
 按需做（有明确场景再投入）：

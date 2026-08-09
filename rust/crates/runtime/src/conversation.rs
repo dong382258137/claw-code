@@ -279,6 +279,50 @@ pub struct ToolSummary {
     pub description: String,
 }
 
+/// design-gaps #5:默认子 agent 工具签名目录(短名 + 描述)。
+///
+/// 与 [`SubagentCapability::allowed_tools()`](crate::multi_agent::SubagentCapability::allowed_tools)
+/// 白名单对齐的固定短名表。runtime crate 不依赖 tools crate,无法直接引用
+/// `mvp_tool_specs` 的实时描述,故维护静态表;生产调用方可经
+/// [`ConversationRuntime::with_tool_catalog`] 从 `GlobalToolRegistry` 注入
+/// 实时目录,避免描述漂移。
+///
+/// 仅收录**实际可执行**的工具:`repomap` / `lsp_diagnostics` 虽在能力白名单中,
+/// 但未在 `GlobalToolRegistry` 注册(前者是 prompt 层 repo_map 段,后者是
+/// edit/write 结果的附加诊断),广告它们只会诱导子 agent 试错被拒。
+///
+/// `build_subagent_context` 按 capability 白名单过滤后再注入
+/// `## Available Tools` 层(ReadOnly=read/grep/glob,Execute 加 edit/write/bash)。
+#[must_use]
+pub fn default_subagent_tool_catalog() -> Vec<ToolSummary> {
+    vec![
+        ToolSummary {
+            name: "read".into(),
+            description: "读取工作区文本文件(规范名 read_file)。支持 offset/limit 分页读取大文件。".into(),
+        },
+        ToolSummary {
+            name: "grep".into(),
+            description: "用正则搜索文件内容(规范名 grep_search)。必须指定 glob 文件扩展名(如 *.rs),避免搜索二进制/大文件。".into(),
+        },
+        ToolSummary {
+            name: "glob".into(),
+            description: "按 glob 模式查找文件(规范名 glob_search)。".into(),
+        },
+        ToolSummary {
+            name: "edit".into(),
+            description: "替换工作区文件中的文本(规范名 edit_file)。结果含 startLine/endLine/affectedLineCount,便于后续计算行偏移。".into(),
+        },
+        ToolSummary {
+            name: "write".into(),
+            description: "在工作区写入文本文件(规范名 write_file)。".into(),
+        },
+        ToolSummary {
+            name: "bash".into(),
+            description: "在当前工作区执行 shell 命令。".into(),
+        },
+    ]
+}
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -820,6 +864,14 @@ pub struct ConversationRuntime<C, T> {
     /// Review 阶段中间件,决定 AllPassed / Replan / Failed。
     /// 默认 `max_replans=3`,通过 `with_plan_reviewer` 可定制。
     plan_reviewer: PreCompletionChecklistMiddleware,
+    /// 子 agent 可用工具签名摘要(design-gaps #5)。
+    ///
+    /// 默认由 [`default_subagent_tool_catalog`] 填充(短名 + 描述,与
+    /// `SubagentCapability::allowed_tools()` 白名单对齐);调用方可经
+    /// [`Self::with_tool_catalog`] 覆盖(如从 `GlobalToolRegistry` 生成)。
+    /// `build_subagent_context` 按 capability 白名单过滤后注入子 agent
+    /// system prompt 的 `## Available Tools` 层(静态,进缓存前缀)。
+    tool_catalog: Vec<ToolSummary>,
     /// 用于 `persist_plan_artifact` 的工作区根目录。
     /// `None` 时跳过持久化(仅内存)。生产环境应通过
     /// `with_workspace_root` 注入 `cwd`。
@@ -998,6 +1050,7 @@ where
             plan_mode_enabled: true,
             active_plan: None,
             plan_reviewer: PreCompletionChecklistMiddleware::default(),
+            tool_catalog: default_subagent_tool_catalog(),
             workspace_root: None,
             loop_detector: LoopDetector::new(),
             loop_abort_reason: None,
@@ -1149,6 +1202,17 @@ where
     #[must_use]
     pub fn with_decision_log(mut self, decision_log: crate::decision_log::DecisionLog) -> Self {
         self.decision_log = Some(decision_log);
+        self
+    }
+
+    /// 覆盖子 agent 工具签名目录(design-gaps #5)。
+    ///
+    /// 默认使用 [`default_subagent_tool_catalog`](crate::conversation::default_subagent_tool_catalog)
+    /// (与 `SubagentCapability::allowed_tools()` 白名单对齐的固定短名表)。
+    /// 生产调用方可从 `GlobalToolRegistry` 生成更完整的目录注入。
+    #[must_use]
+    pub fn with_tool_catalog(mut self, catalog: Vec<ToolSummary>) -> Self {
+        self.tool_catalog = catalog;
         self
     }
 
@@ -3918,6 +3982,11 @@ where
     /// Epic 1(§3.2):从主 agent `system_prompt` sections 提取 repo_map 和
     /// environment,构造子智能体上下文。复用已渲染内容,避免重复扫描。
     /// heading 已对齐 `static_cache_breakpoints`(§3.2 heading 对齐约束)。
+    ///
+    /// design-gaps #5:L2 工具签名层按 `capability.allowed_tools()` 白名单
+    /// 从 `tool_catalog`(默认 [`default_subagent_tool_catalog`],或调用方经
+    /// [`Self::with_tool_catalog`] 注入的实时目录)过滤注入,名称与
+    /// capability guard 白名单短名一致。
     fn build_subagent_context(
         &self,
         capability: crate::multi_agent::SubagentCapability,
@@ -3947,9 +4016,17 @@ where
                 });
             }
         }
-        // L2 工具签名层:Epic 2 会填充真实工具签名,此处暂留空
-        // (Analyze 无工具,ReadOnly/Execute 的工具签名在 Epic 2 接入)
-        let _ = capability;
+        // L2 工具签名层(design-gaps #5):按 capability 白名单过滤注入。
+        // 名称与白名单短名一致(read/grep/glob/edit/write/bash),
+        // 使 `## Available Tools` 层展示的可调用名与 capability guard 一致。
+        // Analyze 白名单为空 → tool_summaries 为空(不注入工具层)。
+        let allowed = capability.allowed_tools();
+        ctx.tool_summaries = self
+            .tool_catalog
+            .iter()
+            .filter(|ts| allowed.contains(&ts.name.as_str()))
+            .cloned()
+            .collect();
         ctx
     }
 
@@ -5426,16 +5503,17 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, build_subagent_request, build_subagent_system_prompt,
-        compaction_threshold_for_context_window, parse_auto_compaction_threshold,
-        parse_auto_compaction_threshold_opt, process_tool_uses, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind,
-        RuntimeError, StaticToolExecutor, SubagentContext, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, SESSION_SEARCH_TOOL_SPEC,
+        compaction_threshold_for_context_window, default_subagent_tool_catalog,
+        parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, process_tool_uses,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor, SubagentContext,
+        ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, SESSION_SEARCH_TOOL_SPEC,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::memory::PersistentMemory;
     use crate::multi_agent::dag::FailFast;
+    use crate::multi_agent::SubagentCapability;
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -8554,6 +8632,118 @@ mod tests {
             ro_rendered.contains("你可以调用工具"),
             "ReadOnly should declare tool capability"
         );
+    }
+
+    // design-gaps #5:build_subagent_context 按 capability 白名单过滤 tool_catalog。
+    #[test]
+    fn build_subagent_context_filters_tool_catalog_by_capability() {
+        let runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["## Repository Map\nsrc/lib.rs".to_string()],
+            &RuntimeFeatureConfig::default(),
+        );
+
+        // ReadOnly:仅只读子集(read/grep/glob),不含写入工具
+        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly);
+        let ro_names: Vec<&str> = ro
+            .tool_summaries
+            .iter()
+            .map(|ts| ts.name.as_str())
+            .collect();
+        assert_eq!(
+            ro_names,
+            vec!["read", "grep", "glob"],
+            "ReadOnly should only expose read-only subset"
+        );
+
+        // Execute:全量可执行目录(read/grep/glob/edit/write/bash)
+        let ex = runtime.build_subagent_context(SubagentCapability::Execute);
+        let ex_names: Vec<&str> = ex
+            .tool_summaries
+            .iter()
+            .map(|ts| ts.name.as_str())
+            .collect();
+        assert_eq!(
+            ex_names,
+            vec!["read", "grep", "glob", "edit", "write", "bash"],
+            "Execute should expose the full executable catalog"
+        );
+        assert!(
+            ex.tool_summaries
+                .iter()
+                .all(|ts| !ts.description.is_empty()),
+            "descriptions should be non-empty"
+        );
+
+        // Analyze:白名单为空 → 不注入工具层
+        let an = runtime.build_subagent_context(SubagentCapability::Analyze);
+        assert!(
+            an.tool_summaries.is_empty(),
+            "Analyze should expose no tools"
+        );
+    }
+
+    // design-gaps #5:with_tool_catalog 覆盖默认目录,且过滤结果随之变化。
+    #[test]
+    fn build_subagent_context_uses_with_tool_catalog_override() {
+        let runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            Vec::new(),
+            &RuntimeFeatureConfig::default(),
+        )
+        .with_tool_catalog(vec![
+            crate::conversation::ToolSummary {
+                name: "read".to_string(),
+                description: "custom read".to_string(),
+            },
+            crate::conversation::ToolSummary {
+                name: "bash".to_string(),
+                description: "custom bash".to_string(),
+            },
+        ]);
+
+        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly);
+        let ro_names: Vec<&str> = ro
+            .tool_summaries
+            .iter()
+            .map(|ts| ts.name.as_str())
+            .collect();
+        assert_eq!(ro_names, vec!["read"], "override catalog filtered to ReadOnly");
+
+        let ex = runtime.build_subagent_context(SubagentCapability::Execute);
+        let ex_names: Vec<&str> = ex
+            .tool_summaries
+            .iter()
+            .map(|ts| ts.name.as_str())
+            .collect();
+        assert_eq!(ex_names, vec!["read", "bash"], "override catalog filtered to Execute");
+    }
+
+    // design-gaps #5:default_subagent_tool_catalog 与白名单短名对齐,且不含未注册工具。
+    #[test]
+    fn default_subagent_tool_catalog_aligned_with_whitelist() {
+        let catalog = default_subagent_tool_catalog();
+        let names: Vec<&str> = catalog.iter().map(|ts| ts.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["read", "grep", "glob", "edit", "write", "bash"]
+        );
+        // 目录中每个条目都必须在 Execute 白名单内(过滤后不会被白名单丢弃)
+        for tool in &names {
+            assert!(
+                SubagentCapability::Execute.allowed_tools().contains(tool),
+                "catalog entry `{tool}` not in whitelist"
+            );
+        }
+        // 不广告未注册的 repomap / lsp_diagnostics,避免诱导试错
+        assert!(!names.contains(&"repomap"));
+        assert!(!names.contains(&"lsp_diagnostics"));
     }
 
     // Epic 4 集成测试:process_tool_uses + SubagentFileGuard
