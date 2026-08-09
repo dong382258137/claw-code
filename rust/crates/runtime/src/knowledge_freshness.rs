@@ -14,7 +14,7 @@
 //! 详见 `docs/plans/knowledge-freshness-gate-plan.md` v3。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 
@@ -474,43 +474,6 @@ fn cache_put(task_hash: u64, gated: GatedTask) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// 最近 GatedTask(P1-4:log_decision 自动注入 knowledge_source)
-// ──────────────────────────────────────────────────────────────────────────
-
-/// 最近一次 gate_task 的 knowledge_source 标签。
-///
-/// P1-4 传递链:`gate_task` 调用时更新此值,`execute_log_decision` 读取此值
-/// 注入到 DecisionRecord.knowledge_source(无需 LLM 传参)。
-///
-/// **并发语义**(best-effort):多子 agent 并发时,后调用的 gate_task 会覆盖前者的值。
-/// 这意味着并发场景下 log_decision 可能读到其他任务的 knowledge_source。
-/// 考虑到:
-/// 1. plan §6.1 明确"若 GatedTask 丢失则写 None 不阻塞",本方案是 best-effort 增强
-/// 2. 并发子 agent 通常 freshness 相近(同批任务),knowledge_source 差异小
-/// 3. 精确传递需要改 ConversationRuntime 结构 + async task-local,复杂度过高
-///
-/// 因此采用此全局 last-gated 方案,在不改数据结构的前提下实现自动注入。
-static LAST_GATED_SOURCE: Mutex<Option<&'static str>> = Mutex::new(None);
-
-/// 读取最近一次 gate_task 的 knowledge_source(供 execute_log_decision 注入)。
-///
-/// 返回 None 时调用方应使用默认值("parametric")。
-pub fn last_gated_knowledge_source() -> Option<&'static str> {
-    // MutexGuard<Option<&'static str>> → as_ref → Option<&&'static str> → copied → Option<&'static str>
-    LAST_GATED_SOURCE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .copied()
-}
-
-/// 更新最近 GatedTask 的 knowledge_source(gate_task 内部调用)。
-fn update_last_gated_source(source: &'static str) {
-    let mut guard = LAST_GATED_SOURCE.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some(source);
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 // gate_task:门控入口
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -625,9 +588,6 @@ pub async fn gate_task(task: &str, attempt: u32) -> GatedTask {
 
     // 4. 写入缓存
     cache_put(task_hash, gated.clone());
-
-    // 5. P1-4:更新全局 last-gated source,供 execute_log_decision 自动注入。
-    update_last_gated_source(gated.knowledge_source());
 
     gated
 }

@@ -5,7 +5,7 @@
 > 用途：作为后续实施排期与优先级决策的依据
 > 核查结论要点：docs 中大部分设计方案已实现并默认开启；以下为**未实现 / 部分实现 / 已偏离**项的收益清单。
 >
-> **实施进度（2026-08-09）**：#3 知识新鲜度（S4 负向排除 + 中文关键词，commit `ca22cc4c`）、#4 提示词引导（WebSearch 优先 / ToolSearch / TaskUpdate，commit `222f1b2f`）已完成；#3 剩余路径 A 传递链、#4 的 capability/`--resume`（经核查代码不存在）未实现。各条目以 ✅ 标注。
+> **实施进度（2026-08-09）**：#3 知识新鲜度（S4 负向排除 + 中文关键词，commit `ca22cc4c`）、#4 提示词引导（WebSearch 优先 / ToolSearch / TaskUpdate，commit `222f1b2f`）、#1 hooks（matcher + timeout，commit `4ffc45bc`；PostCustomToolCall 事件面，commit `17a9598e`）已完成；#3 剩余路径 A 传递链（`knowledge_source` 移除全局 last-gated，改 LLM 显式传参精确传递）、#4 的 capability/`--resume`（经核查代码不存在）未实现。各条目以 ✅ 标注。
 
 ---
 
@@ -24,7 +24,7 @@
 |---|---|---|
 | 1 | **hooks 系统四件套缺失**：matcher 正则过滤、每 hook 独立 timeout、异步 HookRunner、配置热重载（`runtime/src/hooks.rs` 仅同步 Command/Script/Http/Mcp） | ① 命令/脚本 hook 卡死**不再阻塞整个对话循环**（当前同步执行是单点故障源）；② hook 可按工具名/事件精准触发，避免误拦截；③ 改 hooks.toml 无需重启会话，运维成本大降；④ 防止恶意/失控 hook 无限期挂起 |
 | 2 | **self-evolving harness 完全未开工**：`harness_evolution` 模块、`task_success` 字段、`claw harness` CLI（`docs/2026-07-24-p3-self-evolving-harness-design.md`） | ① 会话失败教训自动沉淀 → **跨会话自我进化**，同类错误不再重复犯；② TraceAnalyzer 聚类 + 自动修复建议形成闭环；③ 这是"从工具到自进化 Agent"的分水岭能力 |
-| 3 | ✅ **知识新鲜度门控三处偏差（部分实现）**：~~S4 负向排除未实现~~、~~关键词表无中文词~~、路径 A 传递链降级为全局 last-gated（`runtime/src/knowledge_freshness.rs`）。**已完成**：S4 负向排除 + 中文关键词（commit `ca22cc4c`）；**待办**：路径 A 传递链 | ① 消除**内部仓库任务误触发联网调研**的 token 浪费（当前"在这个仓库里改 X"可能被判 Novel）；② 中文任务（本项目主力场景）新鲜度评估准确率显著提升；③ `knowledge_source` 统计不再串任务，决策闭环可信 |
+| 3 | ✅ **知识新鲜度门控三处偏差（已全部完成）**：~~S4 负向排除~~、~~关键词表无中文词~~、~~路径 A 传递链降级为全局 last-gated~~（`runtime/src/knowledge_freshness.rs`）。**已完成**：S4 负向排除 + 中文关键词（commit `ca22cc4c`）；**已完成**：路径 A 传递链 —— `knowledge_source` 移除全局 last-gated（并发串任务根因），改由 LLM 基于自身任务上下文显式传参，主 agent 默认 `parametric` | ① 消除**内部仓库任务误触发联网调研**的 token 浪费（当前"在这个仓库里改 X"可能被判 Novel）；② 中文任务（本项目主力场景）新鲜度评估准确率显著提升；③ `knowledge_source` 统计不再串任务，决策闭环可信 |
 | 4 | ✅ **AI 提示词 4 处能力缺失（部分实现）**：~~WebSearch 优先~~、~~知识新鲜度~~、capability 参数、会话恢复协议。**已完成**：WebSearch 优先 + 知识新鲜度引导写入 `runtime/src/prompt.rs` Tool Usage Guidance（commit `222f1b2f`）；**不实现**：capability 参数（`AgentInput` 无该字段）与 `--resume`（claw-shell 无该参数）——代码核查确认不存在，避免引导幻影功能 | ① 子智能体能力分级（analyze/read-only/execute）**从"代码里有、AI 不会用"变为可引导调用**；② Novel 任务自动触发调研，减少过时知识自信错答；③ 明确"先搜索后回答"约束；④ AI 知道 `--resume` 会话恢复语义。**纯提示词改动、零架构成本，却是收益杠杆最高的项** |
 
 ---
@@ -88,12 +88,15 @@
 立即做（低投入高收益）：
   ① ✅ 提示词补全 4 能力（部分：WebSearch/知识新鲜度引导已提交 `222f1b2f`；capability/`--resume` 因代码不存在跳过）
   ② ✅ 知识新鲜度负向排除 + 中文词（已提交 `ca22cc4c`）
-  ③ hooks matcher + timeout  →  收敛当前同步 hook 的单点故障风险
+  ③ ✅ hooks matcher + timeout（已提交 `4ffc45bc`）→ 收敛当前同步 hook 的单点故障风险
+  ③' ✅ hooks PostCustomToolCall 事件面（已提交 `17a9598e`）
+  ③'' ✅ 知识新鲜度路径 A 传递链（移除全局 last-gated → LLM 显式传参，`knowledge_source` 不再串任务）
 
 短期做（中等投入）：
   ④ ACP fs/permission + 桥接  →  解锁 IDE 闭环
   ⑤ self-evolving harness MVP  →  立项级，建议拆成 harness 记录 + CLI 两个里程碑
   ⑥ tool_summaries 注满  →  子 agent 能力可见性
+  ⑥' hooks 剩余：异步 HookRunner（P1 异步化，文档建议 P0 保留同步）+ 配置热重载
 
 按需做（有明确场景再投入）：
   ⑦ DAG YAML/checkpoint/渲染

@@ -4530,18 +4530,19 @@ where
             );
         };
 
-        // P1-4:自动注入 knowledge_source(无需 LLM 传参)。
-        // 若 input JSON 不含 knowledge_source 字段,从全局 last-gated 读取
-        // (gate_task 调用时更新)。缺失时默认 "parametric"(纯参数记忆)。
+        // #3 路径 A 精确传递(design-gaps):knowledge_source 不再依赖全局
+        // last-gated(并发时会被其他子任务覆盖,导致统计串任务)。
+        // 改为 LLM 基于自身任务上下文显式传参 —— 子 agent 的 log_decision
+        // 由外部 executor 执行时,LLM 在自己的上下文中明确 knowledge_source;
+        // 主 agent 未做调研,无参时默认 "parametric"(纯参数记忆),不继承
+        // 任何子任务的调研来源。
         let effective_input = match serde_json::from_str::<serde_json::Value>(input) {
             Ok(mut parsed) => {
                 if parsed.get("knowledge_source").is_none() {
-                    let source = crate::knowledge_freshness::last_gated_knowledge_source()
-                        .unwrap_or("parametric");
                     if let Some(obj) = parsed.as_object_mut() {
                         obj.insert(
                             "knowledge_source".to_string(),
-                            serde_json::Value::String(source.to_string()),
+                            serde_json::Value::String("parametric".to_string()),
                         );
                     }
                 }
@@ -9890,5 +9891,65 @@ mod tests {
             }
             other => panic!("expected LlmExtract, got {other:?}"),
         }
+    }
+
+    // ===== #3 路径 A 精确传递:log_decision 的 knowledge_source =====
+
+    /// 无显式 knowledge_source → 默认 "parametric",不受任何子任务
+    /// last-gated 全局变量污染(design-gaps #3:统计不再串任务)。
+    #[test]
+    fn execute_log_decision_defaults_to_parametric_without_explicit_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log);
+
+        let input = r#"{"session_id":"s1","problem_signature":"p1","root_cause_hypothesis":"r1","applied_solution":"s1","affected_files":["x.rs"],"verification_result":"Confirmed"}"#;
+        runtime
+            .execute_log_decision(input)
+            .unwrap_or_else(|e| panic!("log_decision failed: {e:?}"));
+
+        let stats = runtime
+            .decision_log
+            .as_ref()
+            .unwrap()
+            .stats_by_knowledge_source()
+            .expect("stats");
+        assert!(stats.contains("parametric"), "stats: {stats}");
+        assert!(!stats.contains("web_research"), "stats: {stats}");
+    }
+
+    /// 显式传 knowledge_source → 原样保留(LLM 基于自身任务上下文精确标注)。
+    #[test]
+    fn execute_log_decision_preserves_explicit_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log);
+
+        let input = r#"{"session_id":"s2","problem_signature":"p2","root_cause_hypothesis":"r2","applied_solution":"s2","affected_files":["y.rs"],"verification_result":"Confirmed","knowledge_source":"web_research"}"#;
+        runtime
+            .execute_log_decision(input)
+            .expect("log_decision should succeed");
+
+        let stats = runtime
+            .decision_log
+            .as_ref()
+            .unwrap()
+            .stats_by_knowledge_source()
+            .expect("stats");
+        assert!(stats.contains("web_research"), "stats: {stats}");
     }
 }
