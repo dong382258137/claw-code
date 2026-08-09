@@ -314,7 +314,9 @@ fn has_instruction_files_in_cwd() -> bool {
 /// emitter 在渲染 markdown 表格前读取，保证表格宽度匹配内容区。
 static OUTPUT_CONTENT_WIDTH: AtomicUsize = AtomicUsize::new(0);
 
-fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Line<'static>> {
+/// 把单行文本按词边界折成多行显示行（样式保留，ANSI 已由 ratatui 解析）。
+/// 与输出区 draw 使用同一实现，供 output_view 的行号映射复用（鼠标点击命中）。
+pub(crate) fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Line<'static>> {
     if area_width == 0 {
         return vec![line.clone()];
     }
@@ -708,6 +710,10 @@ fn run_event_loop(
     // draw 闭包每次渲染后更新这两个值。
     let mut last_main_area: Rect = Rect::default();
     let mut last_scroll_y: u16 = 0;
+    // P0-3 修复：sticky 头部占用的行数也要缓存。draw 中内容区从
+    // main_area.y + 1 + header_rows 开始，鼠标点击映射若不减去 header_rows，
+    // 翻历史时有 sticky 头部时点击会命中上一行的卡片。
+    let mut last_header_rows: usize = 0;
     let mut needs_redraw: bool = true;
 
     // 调试 overlay(F12):显示 FPS / sticky 状态 / scroll 等渲染层元信息。
@@ -1353,6 +1359,7 @@ fn run_event_loop(
             // 缓存 main_area 和 scroll_y 到 loop 外变量，供 Event::Mouse 分支使用。
             last_main_area = main_area;
             last_scroll_y = scroll_y as u16;
+            last_header_rows = header_rows;
         })?;
                 // P1 修复:记录渲染完成时刻,供 ESC peek-ahead 判断"渲染高峰窗口"。
                 last_draw_instant = Some(Instant::now());
@@ -2398,25 +2405,31 @@ fn run_event_loop(
                 //   ScrollDownLine 的语义，每次滚动 3 行（典型鼠标滚轮手感）
                 //
                 // 坐标映射（仅左键点击需要）：mouse.row 是终端绝对行号，需减去
-                // main_area.y + 1（+1 为顶部 border）得到相对行号，再加 scroll_y
-                // 得到显示行号。
+                // 内容区顶部（main_area.y + 1 顶部 border + header_rows sticky 头）
+                // 得到内容区内相对行号，再加 scroll_y 得到显示行号。
                 //
                 // **P1-2 修复**：之前注释写"逻辑行号"，但 last_scroll_y 是显示行单位
                 // （Paragraph::scroll 按 Wrap 后的显示行计算），两者不一致导致长行
                 // 场景下点击坐标偏移。现在 toggle_tool_card_at_line 接收 area_width
                 // 参数，内部按显示行计算 [start, end) 区间，与 scroll 单位一致。
+                //
+                // **P0-3 修复**：
+                // 1. 内容区顶部补上 last_header_rows（sticky 头部占用的行）——
+                //    旧实现漏减，翻历史时点击会命中上一行的卡片。
+                // 2. area_width 直接用 main_area.width——旧实现误减 2（左右 border
+                //    早已移除，仅保留顶部 border），导致折行宽度算窄、行数高估。
                 use crossterm::event::{MouseButton, MouseEventKind};
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left)
                         if !help_visible && last_main_area.height > 0 =>
                     {
-                        let content_top = last_main_area.y + 1; // +1 for top border
+                        let content_top = last_main_area.y + 1 + last_header_rows as u16;
                         let content_bottom = last_main_area.y + last_main_area.height;
                         if mouse.row >= content_top && mouse.row < content_bottom {
                             let relative_row = (mouse.row - content_top) as usize;
                             let logical_row = relative_row + last_scroll_y as usize;
-                            // 输出区可见宽度 = area.width - 2（左右 border 各 1）
-                            let area_width = last_main_area.width.saturating_sub(2) as usize;
+                            // 输出区可见宽度 = main_area.width（仅顶部 border）
+                            let area_width = last_main_area.width as usize;
                             let handle = output_view.shared_handle();
                             if let Ok(mut buf) = handle.lock() {
                                 buf.toggle_tool_card_at_line(logical_row, area_width);
