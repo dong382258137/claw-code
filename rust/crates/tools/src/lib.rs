@@ -877,7 +877,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": { "type": "integer", "minimum": 1, "description": "Command wall-clock timeout in MILLISECONDS (default: smart idle detection). A value under 1000ms is almost certainly a seconds/milliseconds unit mistake." },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
@@ -925,7 +925,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace text in a workspace file. The result includes startLine/endLine/affectedLineCount/newTotalLines telling where the replacement landed and the file's new total line count, so you can compute line offsets for subsequent edits without re-reading the file. Line endings are normalized to the file's own style (CRLF/LF) before matching.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -942,7 +942,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "replace_lines",
-            description: "Replace a range of lines in a workspace file by 1-based line numbers.",
+            description: "Replace a range of lines in a workspace file by 1-based line numbers. The result includes replacedLineCount/newTotalLines to track how the file changed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

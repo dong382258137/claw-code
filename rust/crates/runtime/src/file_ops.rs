@@ -337,6 +337,19 @@ pub struct EditFileOutput {
     pub replace_all: bool,
     #[serde(rename = "gitDiff")]
     pub git_diff: Option<serde_json::Value>,
+    /// 替换发生处的行号区间（1-based 闭区间）。`replace_all` 时报告首次
+    /// 匹配位置。新增字段为 additive，`#[serde(default)]` 保证旧 JSON
+    /// 反序列化兼容（对应 PRD P0-2）。
+    #[serde(rename = "startLine", default)]
+    pub start_line: usize,
+    #[serde(rename = "endLine", default)]
+    pub end_line: usize,
+    #[serde(rename = "affectedLineCount", default)]
+    pub affected_line_count: usize,
+    /// 替换后文件的总行数。行数增减时 AI 可据此校准后续编辑的偏移，
+    /// 无需重新 read_file（与 replace_lines 的 newTotalLines 语义一致）。
+    #[serde(rename = "newTotalLines", default)]
+    pub new_total_lines: usize,
 }
 
 /// Result of a glob-based filename search.
@@ -494,6 +507,89 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     })
 }
 
+/// 检测文本的换行风格：含 `\r\n` 时返回 `"\r\n"`，否则 `"\n"`。
+fn detect_line_ending(content: &str) -> &'static str {
+    if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// 将文本统一归一化为 LF 行尾（用于跨 CRLF/LF 的匹配）。
+fn to_lf(content: &str) -> String {
+    if content.contains("\r\n") {
+        content.replace("\r\n", "\n")
+    } else {
+        content.to_owned()
+    }
+}
+
+/// 将 LF 归一化文本还原为指定的行尾风格。
+fn from_lf(content: &str, line_ending: &str) -> String {
+    if line_ending == "\r\n" {
+        content.replace('\n', "\r\n")
+    } else {
+        content.to_owned()
+    }
+}
+
+/// 计算 `needle`（LF 归一化）在 `haystack_lf`（LF 归一化）中首次出现处的
+/// 行号范围。返回 `(start_line, end_line, affected_line_count)`，1-based 闭区间。
+fn locate_match(haystack_lf: &str, needle_lf: &str) -> Option<(usize, usize, usize)> {
+    let idx = haystack_lf.find(needle_lf)?;
+    let before = &haystack_lf[..idx];
+    let start_line = before.matches('\n').count() + 1;
+    let affected = needle_lf.matches('\n').count() + 1;
+    Some((start_line, start_line + affected - 1, affected))
+}
+
+/// CRLF 感知的字符串替换核心。
+///
+/// 文件内容与 `old_string` 均先归一化为 LF 进行匹配，消除 Windows 下
+/// CRLF 文件与 LF old_string 不匹配导致的批量失败（对应 PRD P0-1）；
+/// 写入前将结果还原为文件原有行尾风格，避免混合行尾。同时返回替换
+/// 发生的行号区间（P0-2），供 LLM 在连续编辑时校准行号。
+fn apply_string_edit(
+    original_file: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> io::Result<(String, usize, usize, usize)> {
+    if old_string == new_string {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string and new_string must differ",
+        ));
+    }
+    let line_ending = detect_line_ending(original_file);
+    let haystack = to_lf(original_file);
+    let needle = to_lf(old_string);
+    let (start_line, end_line, affected) = locate_match(&haystack, &needle).ok_or_else(|| {
+        // P1-3: 匹配失败时附带行尾诊断，避免 LLM 用相同参数盲目重试。
+        let mut msg = format!(
+            "old_string not found in file ({} lines, {} line endings)",
+            original_file.lines().count(),
+            if line_ending == "\r\n" { "CRLF" } else { "LF" }
+        );
+        if line_ending == "\r\n" && old_string.contains('\n') && !old_string.contains("\r\n") {
+            msg.push_str(
+                " — the file uses CRLF line endings but old_string uses LF; \
+                 use replace_lines or include \\r\\n in old_string",
+            );
+        }
+        io::Error::new(io::ErrorKind::NotFound, msg)
+    })?;
+    let replacement = to_lf(new_string);
+    let lf_updated = if replace_all {
+        haystack.replace(&needle, &replacement)
+    } else {
+        haystack.replacen(&needle, &replacement, 1)
+    };
+    let updated = from_lf(&lf_updated, line_ending);
+    Ok((updated, start_line, end_line, affected))
+}
+
 /// Performs an in-file string replacement and returns patch metadata.
 pub fn edit_file(
     path: &str,
@@ -503,24 +599,8 @@ pub fn edit_file(
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
-    if old_string == new_string {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "old_string and new_string must differ",
-        ));
-    }
-    if !original_file.contains(old_string) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "old_string not found in file",
-        ));
-    }
-
-    let updated = if replace_all {
-        original_file.replace(old_string, new_string)
-    } else {
-        original_file.replacen(old_string, new_string, 1)
-    };
+    let (updated, start_line, end_line, affected_line_count) =
+        apply_string_edit(&original_file, old_string, new_string, replace_all)?;
     fs::write(&absolute_path, &updated)?;
 
     Ok(EditFileOutput {
@@ -532,6 +612,10 @@ pub fn edit_file(
         user_modified: false,
         replace_all,
         git_diff: None,
+        start_line,
+        end_line,
+        affected_line_count,
+        new_total_lines: updated.lines().count(),
     })
 }
 
@@ -620,24 +704,8 @@ fn edit_file_at_checked(
     reject_leaf_symlink(absolute_path)?;
 
     let original_file = fs::read_to_string(absolute_path)?;
-    if old_string == new_string {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "old_string and new_string must differ",
-        ));
-    }
-    if !original_file.contains(old_string) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "old_string not found in file",
-        ));
-    }
-
-    let updated = if replace_all {
-        original_file.replace(old_string, new_string)
-    } else {
-        original_file.replacen(old_string, new_string, 1)
-    };
+    let (updated, start_line, end_line, affected_line_count) =
+        apply_string_edit(&original_file, old_string, new_string, replace_all)?;
     fs::write(absolute_path, &updated)?;
 
     Ok(EditFileOutput {
@@ -649,6 +717,10 @@ fn edit_file_at_checked(
         user_modified: false,
         replace_all,
         git_diff: None,
+        start_line,
+        end_line,
+        affected_line_count,
+        new_total_lines: updated.lines().count(),
     })
 }
 
@@ -669,6 +741,10 @@ pub struct ReplaceLinesOutput {
     pub new_content: String,
     #[serde(rename = "originalLines")]
     pub original_lines: String,
+    #[serde(rename = "replacedLineCount")]
+    pub replaced_line_count: usize,
+    #[serde(rename = "newTotalLines")]
+    pub new_total_lines: usize,
     #[serde(rename = "gitDiff")]
     pub git_diff: Option<String>,
 }
@@ -777,6 +853,8 @@ pub fn replace_lines(
         replaced_end_line: end_line,
         new_content: new_content.to_owned(),
         original_lines: replaced_slice,
+        replaced_line_count: end_line - start_line + 1,
+        new_total_lines: out.len(),
         git_diff: git_diff_for_path(&absolute_path),
     })
 }
@@ -1471,8 +1549,8 @@ mod tests {
 
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        GrepSearchInput, MAX_WRITE_SIZE,
+        grep_search, is_symlink_escape, read_file, read_file_in_workspace, replace_lines,
+        write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1503,6 +1581,123 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    /// PRD P0-1：CRLF 文件 + LF old_string 应匹配成功，写入后保持 CRLF。
+    #[test]
+    fn edit_file_normalizes_crlf_matching() {
+        let path = temp_path("edit-crlf.txt");
+        std::fs::write(&path, "line1\r\nline2\r\nline3").expect("seed crlf file");
+        let output = edit_file(path.to_string_lossy().as_ref(), "line2", "LINE2", false)
+            .expect("edit should succeed on CRLF file with LF old_string");
+        assert_eq!(output.start_line, 2);
+        assert_eq!(output.end_line, 2);
+        assert_eq!(output.affected_line_count, 1);
+        assert_eq!(output.new_total_lines, 3);
+        let content = std::fs::read_to_string(&path).expect("read back");
+        assert!(content.contains("LINE2"));
+        assert!(content.contains("\r\n"), "file must keep CRLF line endings");
+    }
+
+    /// PRD P0-1：跨行 old_string（LF）在 CRLF 文件上也能匹配。
+    #[test]
+    fn edit_file_matches_multiline_old_string_on_crlf_file() {
+        let path = temp_path("edit-crlf-multi.txt");
+        std::fs::write(&path, "a\r\nb\r\nc").expect("seed crlf file");
+        let output =
+            edit_file(path.to_string_lossy().as_ref(), "a\nb", "A\nB", false).expect("edit ok");
+        assert_eq!(output.start_line, 1);
+        assert_eq!(output.end_line, 2);
+        assert_eq!(output.affected_line_count, 2);
+        assert_eq!(output.new_total_lines, 3);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("A\r\nB"));
+    }
+
+    /// PRD P0-1：混合行尾文件（LF 为主 + 零星 CRLF）被统一为检测到的行尾
+    /// 风格（含任意 \r\n 即判定 CRLF），编辑后全文件 CRLF、不残留混合行尾。
+    #[test]
+    fn edit_file_unifies_mixed_line_endings_to_detected_style() {
+        let path = temp_path("edit-mixed-eol.txt");
+        std::fs::write(&path, "line1\nline2\r\nline3\nline4").expect("seed mixed-eol file");
+        let output = edit_file(path.to_string_lossy().as_ref(), "line3", "LINE3", false)
+            .expect("edit should succeed on mixed line-ending file");
+        assert_eq!(output.start_line, 3);
+        assert_eq!(output.end_line, 3);
+        assert_eq!(output.new_total_lines, 4);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "line1\r\nline2\r\nLINE3\r\nline4");
+    }
+
+    /// PRD P0-2：LF 文件编辑后报告替换位置，且文件保持 LF。
+    #[test]
+    fn edit_file_lf_file_reports_location() {
+        let path = temp_path("edit-lf-loc.txt");
+        write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree").expect("write");
+        let output =
+            edit_file(path.to_string_lossy().as_ref(), "two", "TWO", false).expect("edit");
+        assert_eq!(output.start_line, 2);
+        assert_eq!(output.end_line, 2);
+        assert_eq!(output.affected_line_count, 1);
+        assert_eq!(output.new_total_lines, 3);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains('\r'), "LF file must stay LF");
+    }
+
+    /// PRD P0-2：edit_file 报告替换后文件总行数；行数增减时后续偏移可校准。
+    #[test]
+    fn edit_file_reports_new_total_lines() {
+        // 增长：1 行替换为 3 行 → 总行数 3 → 5
+        let path = temp_path("edit-total-growth.txt");
+        write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree").expect("write");
+        let out = edit_file(
+            path.to_string_lossy().as_ref(),
+            "two",
+            "TWO\nTWO_B\nTWO_C",
+            false,
+        )
+        .expect("grow edit");
+        assert_eq!(out.start_line, 2);
+        assert_eq!(out.end_line, 2);
+        assert_eq!(out.affected_line_count, 1);
+        assert_eq!(out.new_total_lines, 5);
+
+        // 收缩：3 行替换为 1 行 → 总行数 5 → 3
+        let out2 = edit_file(
+            path.to_string_lossy().as_ref(),
+            "TWO\nTWO_B\nTWO_C",
+            "2",
+            false,
+        )
+        .expect("shrink edit");
+        assert_eq!(out2.start_line, 2);
+        assert_eq!(out2.end_line, 4);
+        assert_eq!(out2.affected_line_count, 3);
+        assert_eq!(out2.new_total_lines, 3);
+    }
+
+    /// PRD P1-3：匹配失败时错误信息附带 CRLF 行尾诊断。
+    #[test]
+    fn edit_file_mismatch_reports_crlf_diagnostic() {
+        let path = temp_path("edit-crlf-diag.txt");
+        std::fs::write(&path, "line1\r\nline2").expect("seed crlf file");
+        let result = edit_file(path.to_string_lossy().as_ref(), "missing\ncontent", "x", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("old_string not found"));
+        assert!(err.contains("CRLF"));
+    }
+
+    /// PRD P0-2：replace_lines 报告替换行数与替换后总行数。
+    #[test]
+    fn replace_lines_reports_line_counts() {
+        let path = temp_path("repl-lines.txt");
+        write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree\nfour").expect("write");
+        let output = replace_lines(path.to_string_lossy().as_ref(), 2, 3, "X\nY").expect("replace");
+        assert_eq!(output.replaced_line_count, 2);
+        assert_eq!(output.new_total_lines, 4);
+        assert_eq!(output.replaced_start_line, 2);
+        assert_eq!(output.replaced_end_line, 3);
     }
 
     #[test]

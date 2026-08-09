@@ -490,14 +490,24 @@ async fn execute_bash_async(
     }
 
     // 正常完成
-    let stdout = truncate_output(&String::from_utf8_lossy(&stdout_buf));
+    let mut stdout = truncate_output(&String::from_utf8_lossy(&stdout_buf));
     let stderr = truncate_output(&String::from_utf8_lossy(&stderr_buf));
+    // P1-4: timeout 单位兜底提示。提示写入 stdout（LLM 直接可见），
+    // 不写 stderr，避免污染 TUI alternate screen。必须在计算
+    // no_output_expected 之前追加，否则提示被判定为"无输出"而隐藏。
+    stdout.push_str(&timeout_unit_note(input.timeout));
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
     let return_code_interpretation = exit_status.and_then(|code| {
         if code == 0 {
             None
         } else {
-            Some(format!("exit_code:{code}"))
+            let mut interp = format!("exit_code:{code}");
+            if has_shell_syntax_error(&stderr) {
+                interp.push_str(
+                    " — command has a shell syntax error (unmatched quotes/escaping)",
+                );
+            }
+            Some(interp)
         }
     });
 
@@ -568,6 +578,21 @@ fn idle_timeout_output(
     }
 }
 
+/// P1-4: timeout 单位兜底提示。`timeout` 单位为毫秒；<1s 的极小值
+/// 极可能是秒/毫秒单位误用。返回提示文本（无问题时为空串）。
+///
+/// 正常完成与固定超时两条路径共用，确保单位歧义在两种结局下
+/// （命令跑完 / 命令被 300ms 误杀）都能被 LLM 看到。
+fn timeout_unit_note(timeout: Option<u64>) -> String {
+    match timeout {
+        Some(t) if t < 1000 => format!(
+            "\n[claw] note: `timeout` is in milliseconds; the given {t}ms (< 1s) \
+             may be a seconds/milliseconds unit mistake."
+        ),
+        _ => String::new(),
+    }
+}
+
 fn timeout_output(
     input: &BashCommandInput,
     timeout_ms: u64,
@@ -599,7 +624,7 @@ fn timeout_output(
          - Checking if a simpler approach can achieve the same goal"
     };
     BashCommandOutput {
-        stdout: String::new(),
+        stdout: timeout_unit_note(input.timeout),
         stderr: format!("Command exceeded timeout of {timeout_ms} ms{guidance}"),
         raw_output_path: None,
         interrupted: true,
@@ -609,7 +634,9 @@ fn timeout_output(
         assistant_auto_backgrounded: None,
         dangerously_disable_sandbox: input.dangerously_disable_sandbox,
         return_code_interpretation: Some(String::from(return_code_interpretation)),
-        no_output_expected: Some(true),
+        // 仅当 stdout 带单位提示时视为"有输出"（提示需展示给 LLM），
+        // 否则超时消息属于合成文案，不占用 no_output_expected。
+        no_output_expected: Some(timeout_unit_note(input.timeout).is_empty()),
         structured_content: Some(vec![test_timeout_provenance(
             &input.command,
             timeout_ms,
@@ -1092,8 +1119,29 @@ mod unix_shell_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use super::{execute_bash, has_shell_syntax_error, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+
+    /// PRD P2-5：shell 语法错误特征识别（bash/sh/cmd 通用）。
+    #[test]
+    fn detects_shell_syntax_errors() {
+        assert!(has_shell_syntax_error(
+            "/usr/bin/bash: -c: line 1: unexpected EOF while looking for matching `\"'"
+        ));
+        assert!(has_shell_syntax_error(
+            "bash: syntax error near unexpected token `;'"
+        ));
+        assert!(has_shell_syntax_error("sh: 1: Syntax error: \"(\" unexpected"));
+        // cmd.exe 特征
+        assert!(has_shell_syntax_error("The syntax of the command is incorrect."));
+        assert!(has_shell_syntax_error("'&&' was unexpected at this time."));
+        // 正常编译错误 / "命令不存在" 不应误报
+        assert!(!has_shell_syntax_error("error[E0308]: mismatched types"));
+        assert!(!has_shell_syntax_error("cargo: the 'dev' profile"));
+        assert!(!has_shell_syntax_error(
+            "'foo' is not recognized as an internal or external command"
+        ));
+    }
 
     #[test]
     fn executes_simple_command() {
@@ -1113,6 +1161,32 @@ mod tests {
         assert_eq!(output.stdout, "hello");
         assert!(!output.interrupted);
         assert!(output.sandbox_status.is_some());
+    }
+
+    /// PRD P1-4：timeout < 1000ms 时 stdout 附带秒/毫秒单位误用提示。
+    #[test]
+    fn timeout_below_one_second_emits_unit_hint() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("printf 'ok'"),
+            timeout: Some(300),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("bash should execute");
+
+        assert!(output.stdout.contains("ok"));
+        assert!(
+            output
+                .stdout
+                .contains("[claw] note: `timeout` is in milliseconds"),
+            "unit hint missing: {}",
+            output.stdout
+        );
     }
 
     #[test]
@@ -1156,6 +1230,43 @@ mod tests {
         let structured = output.structured_content.expect("structured content");
         assert_eq!(structured[0]["event"], "test.hung");
         assert_eq!(structured[0]["data"]["provenance"], "bash.timeout");
+    }
+
+    /// PRD P1-4 边界：timeout < 1000ms 且命令真实超时（被 300ms 误杀）时，
+    /// 单位提示也必须出现在 stdout —— 精确复现会话中 clippy 因 300ms 超时
+    /// 被中断的场景，避免"命令跑完才有提示、真超时反而无提示"的盲区。
+    #[test]
+    fn timeout_below_one_second_emits_unit_hint_even_on_timeout() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("sleep 2"),
+            timeout: Some(300),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("bash should return structured timeout");
+
+        assert!(output.interrupted);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        assert_eq!(
+            output.no_output_expected,
+            Some(false),
+            "unit hint on stdout must be flagged as output"
+        );
+        assert!(
+            output
+                .stdout
+                .contains("[claw] note: `timeout` is in milliseconds"),
+            "unit hint missing on timeout path: {}",
+            output.stdout
+        );
     }
 
     /// 智能模式（timeout=None）下短命令应正常完成，不被误杀。
@@ -1304,6 +1415,25 @@ mod tests {
 /// output before microcompact could archive it. 64 KiB provides enough headroom
 /// for typical compiler/test output while still bounding context usage.
 const MAX_OUTPUT_BYTES: usize = 65_536;
+
+/// 检测 stderr 中是否包含 shell 语法错误特征（bash/sh/cmd 通用）。
+///
+/// 命中时 `return_code_interpretation` 会附加「命令存在 shell 语法错误
+/// （引号/转义不匹配）」诊断，避免 LLM 自行解读原始错误（对应 PRD P2-5）。
+fn has_shell_syntax_error(stderr: &str) -> bool {
+    let low = stderr.to_ascii_lowercase();
+    [
+        "unexpected eof",
+        "syntax error near",
+        "syntax error",
+        "unexpected token",
+        "missing terminating",
+        "was unexpected at this time",
+        "the syntax of the command is incorrect",
+    ]
+    .iter()
+    .any(|needle| low.contains(needle))
+}
 
 /// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
 fn truncate_output(s: &str) -> String {
