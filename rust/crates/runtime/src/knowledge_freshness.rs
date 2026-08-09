@@ -56,6 +56,7 @@ impl KnowledgeFreshness {
 ///
 /// 这些词几乎只在"需要最新信息"的语境出现,误报率低。
 const NOVEL_STRONG: &[&str] = &[
+    // 英文
     "latest",
     "newest",
     "recent",
@@ -67,6 +68,19 @@ const NOVEL_STRONG: &[&str] = &[
     "rfc",
     "breaking change",
     "deprecat", // 涵盖 deprecate/deprecated/deprecation
+    // 中文(本项目主力场景)
+    "最新",
+    "新版",
+    "新版本",
+    "最新版",
+    "发布说明",
+    "更新日志",
+    "变更日志",
+    "论文",
+    "规范",
+    "废弃",
+    "弃用",
+    "破坏性变更",
 ];
 
 /// 动作型 Novel 信号:需与版本号共现才判为 Novel。
@@ -74,16 +88,27 @@ const NOVEL_STRONG: &[&str] = &[
 /// 单独出现 "upgrade to" 可能是抽象描述,但 "upgrade to 3.2" 是明确的新版本迁移。
 /// 这避免了 "bump version"(Stable)被 "version" 误判为 Novel 的问题。
 const NOVEL_ACTION: &[&str] = &[
+    // 英文
     "upgrade to",
     "migrate to",
     "update to",
     "port to",
     "pin to",
     "bump to",
+    // 中文
+    "升级到",
+    "升级至",
+    "迁移到",
+    "迁移至",
+    "更新到",
+    "更新至",
+    "移植到",
+    "移植至",
 ];
 
 /// Evolving 信号:涉及代码演进,框架 API 可能变化。
 const EVOLVING_KEYWORDS: &[&str] = &[
+    // 英文
     "refactor",
     "optimize",
     "performance",
@@ -92,10 +117,20 @@ const EVOLVING_KEYWORDS: &[&str] = &[
     "error",
     "crash",
     "regression",
+    // 中文
+    "重构",
+    "优化",
+    "性能",
+    "缺陷",
+    "错误",
+    "崩溃",
+    "回归",
+    "修复",
 ];
 
 /// Stable 信号:机械操作,知识高度稳定。
 const STABLE_KEYWORDS: &[&str] = &[
+    // 英文
     "typo",
     "format",
     "rename",
@@ -105,7 +140,82 @@ const STABLE_KEYWORDS: &[&str] = &[
     "sort",
     "reorder",
     "capitaliz", // 涵盖 capitalize/capitalization
+    // 中文
+    "错别字",
+    "格式",
+    "重命名",
+    "空格",
+    "导入",
+    "排序",
 ];
+
+/// 本地/内部操作信号(S4 负向排除)。
+///
+/// 设计文档 §3.2/S4:关键词命中是**候选信号**而非最终裁决。任务明显是
+/// 本地/内部操作(如"在这个仓库里…"、"项目内…"、引用具体文件路径)时,
+/// 即使含 "api"/"sdk"/"latest" 等关键词也回退 Stable——避免对内部 API
+/// 误触发联网调研(白搜)。
+const LOCAL_INTERNAL_SIGNALS: &[&str] = &[
+    // 中文
+    "仓库里",
+    "仓库内",
+    "本仓库",
+    "当前仓库",
+    "项目内",
+    "项目里",
+    "本项目中",
+    "这个项目",
+    "代码库",
+    "源码里",
+    "源码中",
+    "本目录",
+    "工作区",
+    "这个文件",
+    "该文件",
+    "当前文件",
+    // 英文
+    "in this repo",
+    "in this repository",
+    "in the repo",
+    "in this codebase",
+    "in the codebase",
+    "in this project",
+    "in the workspace",
+    "internal api",
+    "internal function",
+    "internal module",
+    "our codebase",
+];
+
+/// 判断任务是否为本地/内部操作(S4 负向排除的判定主体)。
+///
+/// 命中条件:短语信号(仓库/项目/代码库语境)或具体文件路径特征
+/// (含 `src/`、`crates/` 等路径前缀或 `.rs`/`.py` 等扩展名)。
+fn is_local_internal_task(lower: &str) -> bool {
+    for kw in LOCAL_INTERNAL_SIGNALS {
+        if lower.contains(kw) {
+            return true;
+        }
+    }
+    // 具体文件路径特征:路径前缀或常见源码/配置文件扩展名。
+    // 例如 "修改 src/main.rs 的接口"、"在 crates/runtime 里…"。
+    for path_marker in [
+        "src/", "crates/", "tests/", "docs/", "lib/", "app/", "core/", "config/",
+    ] {
+        if lower.contains(path_marker) {
+            return true;
+        }
+    }
+    for ext in [
+        ".rs", ".py", ".ts", ".js", ".go", ".java", ".cpp", ".c", ".h", ".md", ".toml",
+        ".json", ".yaml", ".yml",
+    ] {
+        if lower.contains(ext) {
+            return true;
+        }
+    }
+    false
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // 评估函数
@@ -115,8 +225,16 @@ const STABLE_KEYWORDS: &[&str] = &[
 ///
 /// 判定顺序(风险优先):Novel > Evolving > Stable > 默认 Evolving。
 /// Novel 信号最优先(漏判 = 用过时知识自信地错答,成本最高)。
+///
+/// S4 负向排除优先级最高:本地/内部操作任务(仓库内/项目内/文件路径)直接
+/// 判 Stable,短路后续关键词评估——避免"在这个仓库里改 API"误触发联网调研。
 pub fn assess_knowledge_freshness(task: &str) -> KnowledgeFreshness {
     let lower = task.to_lowercase();
+
+    // 0. S4 负向排除:本地/内部操作任务直接 Stable(最高优先级,短路)。
+    if is_local_internal_task(&lower) {
+        return KnowledgeFreshness::Stable;
+    }
 
     // 1. Novel:强信号单独命中
     for kw in NOVEL_STRONG {
@@ -645,6 +763,117 @@ mod tests {
         assert_eq!(
             assess_knowledge_freshness("build the feature"),
             KnowledgeFreshness::Evolving
+        );
+    }
+
+    // ── 中文关键词测试 ──
+
+    #[test]
+    fn assess_chinese_novel_strong_signal() {
+        assert_eq!(
+            assess_knowledge_freshness("升级到最新版 SDK"),
+            KnowledgeFreshness::Novel
+        );
+        assert_eq!(
+            assess_knowledge_freshness("查看发布说明"),
+            KnowledgeFreshness::Novel
+        );
+        assert_eq!(
+            assess_knowledge_freshness("实现论文里的算法"),
+            KnowledgeFreshness::Novel
+        );
+        assert_eq!(
+            assess_knowledge_freshness("该接口已被废弃"),
+            KnowledgeFreshness::Novel
+        );
+    }
+
+    #[test]
+    fn assess_chinese_novel_action_with_version() {
+        assert_eq!(
+            assess_knowledge_freshness("升级到 3.2"),
+            KnowledgeFreshness::Novel
+        );
+        assert_eq!(
+            assess_knowledge_freshness("迁移到 react 18.2"),
+            KnowledgeFreshness::Novel
+        );
+    }
+
+    #[test]
+    fn assess_chinese_evolving_signals() {
+        assert_eq!(
+            assess_knowledge_freshness("重构这个模块"),
+            KnowledgeFreshness::Evolving
+        );
+        assert_eq!(
+            assess_knowledge_freshness("修复性能问题"),
+            KnowledgeFreshness::Evolving // "修复"(Evolving)先于 "性能"(Evolving)
+        );
+    }
+
+    #[test]
+    fn assess_chinese_stable_signals() {
+        assert_eq!(
+            assess_knowledge_freshness("格式化代码"),
+            KnowledgeFreshness::Stable // "格式" 命中 Stable
+        );
+        assert_eq!(
+            assess_knowledge_freshness("把变量重命名"),
+            KnowledgeFreshness::Stable
+        );
+    }
+
+    // ── S4 负向排除测试 ──
+
+    #[test]
+    fn assess_local_internal_task_overrides_novel() {
+        // 本地仓库语境 + Novel 信号 → 负向排除,回退 Stable
+        assert_eq!(
+            assess_knowledge_freshness("在这个仓库里升级 API 到 2.0"),
+            KnowledgeFreshness::Stable
+        );
+        assert_eq!(
+            assess_knowledge_freshness("本仓库中修复废弃接口"),
+            KnowledgeFreshness::Stable
+        );
+    }
+
+    #[test]
+    fn assess_local_internal_task_with_file_path() {
+        // 引用具体文件路径 → 本地任务
+        assert_eq!(
+            assess_knowledge_freshness("修改 src/main.rs 的接口"),
+            KnowledgeFreshness::Stable
+        );
+        assert_eq!(
+            assess_knowledge_freshness("在 crates/runtime 里修复 bug"),
+            KnowledgeFreshness::Stable
+        );
+    }
+
+    #[test]
+    fn assess_local_internal_task_english() {
+        assert_eq!(
+            assess_knowledge_freshness("in this repo, fix the api"),
+            KnowledgeFreshness::Stable
+        );
+        assert_eq!(
+            assess_knowledge_freshness("our codebase uses the latest sdk"),
+            KnowledgeFreshness::Stable
+        );
+    }
+
+    #[test]
+    fn assess_local_signal_does_not_leak_to_external_tasks() {
+        // 无本地信号的外部任务不受负向排除影响
+        assert_eq!(
+            assess_knowledge_freshness("upgrade to latest sdk"),
+            KnowledgeFreshness::Novel
+        );
+        assert_eq!(
+            assess_knowledge_freshness("upgrade to react 18.2"),
+            KnowledgeFreshness::Novel
         );
     }
 
