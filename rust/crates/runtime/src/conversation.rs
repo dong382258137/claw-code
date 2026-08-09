@@ -2648,6 +2648,10 @@ where
                         // `Arc<HistoryIndex>` without going through a foreign
                         // dispatcher. All other tool names fall through to the
                         // standard executor.
+                        // 工具是否经外部 ToolExecutor 执行(自定义工具路径)。
+                        // runtime 内建拦截工具(session_search/dispatch_subagent 等)
+                        // 不触发 PostCustomToolCall,与"自定义工具"语义对齐。
+                        let mut executed_via_external_executor = false;
                         let (mut output, mut is_error) = if tool_name == "session_search" {
                             match self.execute_session_search(&effective_input) {
                                 Ok(output) => (output, false),
@@ -2766,6 +2770,9 @@ where
                                 Err(error) => (error.to_string(), true),
                             }
                         } else {
+                            // 外部自定义工具路径:经 ToolExecutor 注册的工具(含 MCP)。
+                            // 成功执行后触发 PostCustomToolCall 事件(见下方接入点)。
+                            executed_via_external_executor = true;
                             match self.tool_executor.execute(&tool_name, &effective_input) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
@@ -2830,6 +2837,22 @@ where
                                 || post_hook_result.is_failed()
                                 || post_hook_result.is_cancelled(),
                         );
+
+                        // PostCustomToolCall(design-gaps #7):外部自定义工具调用
+                        // 成功后的监控/审计事件。仅对经 ToolExecutor 执行的外部工具
+                        // 触发,失败路径已由 PostToolUseFailure 覆盖,此处不重复。
+                        // 返回消息追加到 tool result(不改变状态,监控语义)。
+                        if !is_error && executed_via_external_executor {
+                            let custom_hook_result =
+                                self.hook_runner.run_post_custom_tool_call(&tool_name, &output);
+                            if !custom_hook_result.messages().is_empty() {
+                                output = merge_hook_feedback(
+                                    custom_hook_result.messages(),
+                                    output,
+                                    false,
+                                );
+                            }
+                        }
 
                         // P0:失败的工具调用自动记录到 NOTEBOOK <attempted> 段。
                         // 循环中的 LLM 不会主动调用 notebook_update,此处由运行时记账,

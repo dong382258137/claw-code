@@ -407,10 +407,28 @@ impl HookRunner {
         self.run_lifecycle_event(HookEvent::PreCompact, context)
     }
     #[must_use]
-    pub fn run_post_custom_tool_call(&self, tool_name: &str, result: &str) -> HookRunResult {
-        self.run_lifecycle_event(
+    pub fn run_post_custom_tool_call(&self, tool_name: &str, tool_output: &str) -> HookRunResult {
+        // PostCustomToolCall:自定义工具(经 ToolExecutor 注册的外部工具)调用
+        // 完成后的监控/审计事件。payload 携带真实 tool_name 与 tool_output,
+        // 语义与 PostToolUse 区分开(后者覆盖全部工具)。
+        let definitions = self
+            .config
+            .lifecycle()
+            .get(HookEvent::PostCustomToolCall.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if definitions.is_empty() {
+            return HookRunResult::allow(Vec::new());
+        }
+        Self::run_definitions(
             HookEvent::PostCustomToolCall,
-            &format!("{tool_name}: {result}"),
+            definitions,
+            tool_name,
+            "{}",
+            Some(tool_output),
+            false,
+            None,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -1465,6 +1483,23 @@ mod tests {
         );
         assert!(result.is_failed());
         assert!(result.messages().iter().any(|m| m.contains("timed out")));
+    }
+
+    #[test]
+    fn post_custom_tool_call_carries_real_tool_name_and_output() {
+        // PostCustomToolCall payload 应携带真实 tool_name 与 tool_output,
+        // 而非旧实现的 `"{tool_name}: {result}"` 拼接(会污染 tool_name 字段)。
+        let mut config = RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new());
+        config.add_lifecycle(
+            "PostCustomToolCall",
+            HookDefinition::command(
+                "printf '%s|%s' \"$HOOK_TOOL_NAME\" \"$HOOK_TOOL_OUTPUT\"",
+            ),
+        );
+        let runner = HookRunner::new(config);
+        let result = runner.run_post_custom_tool_call("edit_file", "patched OK");
+        assert!(!result.is_failed());
+        assert!(result.messages().iter().any(|m| m.contains("edit_file|patched OK")));
     }
 
     #[test]
