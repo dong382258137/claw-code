@@ -2119,7 +2119,7 @@ fn render_im_status(
             lines.push(String::new());
             lines.push("  Commands:".to_string());
             lines.push("    \x1b[2m/im config\x1b[0m    \u{2014} view full config".to_string());
-            lines.push("    \x1b[2m/im start\x1b[0m     \u{2014} show startup instructions".to_string());
+            lines.push("    \x1b[2m/im start\x1b[0m     \u{2014} start the bridge".to_string());
             lines.push("    \x1b[2mclaw-im-bridge\x1b[0m \u{2014} start directly".to_string());
 
             (
@@ -2215,35 +2215,229 @@ fn render_im_config(
 }
 
 fn render_im_start_command() -> (String, serde_json::Value) {
-    let message = [
-        "\u{1f916} Starting IM Bridge",
-        "",
-        "  The IM Bridge runs as a standalone process:",
-        "",
-        "    \x1b[1mclaw-im-bridge\x1b[0m",
-        "",
-        "  Or with cargo:",
-        "",
-        "    \x1b[1mcargo run --bin claw-im-bridge\x1b[0m",
-        "",
-        "  Prerequisites:",
-        "    1. Create \x1b[2m~/.claw/im-bridge.toml\x1b[0m with platform config",
-        "    2. Set \x1b[2mDEEPSEEK_API_KEY\x1b[0m (or equivalent) in env",
-        "    3. Configure bot webhook URL in WeCom/Feishu admin panel",
-        "",
-        "  The bridge will start an HTTP server at \x1b[2m127.0.0.1:3456\x1b[0m (configurable).",
-        "  Press Ctrl+C to stop.",
-        "",
-        "  \x1b[2mUse /im status to check your configuration first.\x1b[0m",
-    ]
-    .join("\n");
+    let config_path = im_bridge_config_path();
 
-    (
-        message,
-        serde_json::json!({
-            "kind": "im",
-            "action": "start",
-            "command": "claw-im-bridge",
-        }),
-    )
+    // 1) 配置自检：文件必须存在
+    if !config_path.exists() {
+        let msg = vec![
+            "\u{1f916} IM Bridge 未配置".to_string(),
+            String::new(),
+            format!("  \x1b[2mConfig path\x1b[0m: {}", config_path.display()),
+            "  \x1b[33m\u{26a0} 找不到配置文件\x1b[0m".to_string(),
+            String::new(),
+            "  请先运行交互式配置向导生成配置：".to_string(),
+            "    \x1b[1mclaw-im-bridge --setup\x1b[0m".to_string(),
+        ]
+        .join("\n");
+        return (
+            msg,
+            serde_json::json!({
+                "kind": "im",
+                "action": "start",
+                "ok": false,
+                "error": "config file not found",
+            }),
+        );
+    }
+
+    // 2) 解析并校验必填字段
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                format!(
+                    "\u{1f916} IM Bridge 启动失败\n  \x1b[31m读取配置失败\x1b[0m: {e}",
+                ),
+                serde_json::json!({
+                    "kind": "im",
+                    "action": "start",
+                    "ok": false,
+                    "error": format!("read config failed: {e}"),
+                }),
+            );
+        }
+    };
+    let issues = validate_im_config(&content);
+    if !issues.is_empty() {
+        let mut lines = vec!["\u{1f916} IM Bridge 配置不完整，无法启动".to_string()];
+        for i in &issues {
+            lines.push(format!("  \x1b[31m\u{2717}\x1b[0m {i}"));
+        }
+        lines.push(String::new());
+        lines.push("  \x1b[2m请运行 \x1b[1mclaw-im-bridge --setup\x1b[0m\x1b[2m 重新配置，或手动编辑配置文件。\x1b[0m".to_string());
+        return (
+            lines.join("\n"),
+            serde_json::json!({
+                "kind": "im",
+                "action": "start",
+                "ok": false,
+                "issues": issues,
+            }),
+        );
+    }
+
+    // 3) 定位 claw-im-bridge 可执行文件
+    let bin = match resolve_im_bridge_binary() {
+        Some(p) => p,
+        None => {
+            return (
+                "\u{1f916} IM Bridge 启动失败\n  \x1b[31m找不到 claw-im-bridge 可执行文件\x1b[0m\n\n  \x1b[2m请先构建：\x1b[0m cargo build --release -p im-bridge\n  \x1b[2m或安装到 PATH：\x1b[0m cargo install --path rust/crates/im-bridge"
+                    .to_string(),
+                serde_json::json!({
+                    "kind": "im",
+                    "action": "start",
+                    "ok": false,
+                    "error": "claw-im-bridge binary not found",
+                }),
+            );
+        }
+    };
+
+    // 4) 启动进程，日志重定向到 ~/.claw/im-bridge.log
+    let log_path = config_path.with_file_name("im-bridge.log");
+    let log = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                format!("\u{1f916} IM Bridge 启动失败\n  \x1b[31m打开日志文件失败\x1b[0m: {e}"),
+                serde_json::json!({
+                    "kind": "im",
+                    "action": "start",
+                    "ok": false,
+                    "error": format!("open log failed: {e}"),
+                }),
+            );
+        }
+    };
+
+    let log_err = match log.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                format!("\u{1f916} IM Bridge 启动失败\n  \x1b[31m复制日志句柄失败\x1b[0m: {e}"),
+                serde_json::json!({
+                    "kind": "im",
+                    "action": "start",
+                    "ok": false,
+                    "error": format!("clone log handle failed: {e}"),
+                }),
+            );
+        }
+    };
+
+    match std::process::Command::new(&bin)
+        .stdout(std::process::Stdio::from(log_err))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+    {
+        Ok(child) => {
+            let pid = child.id();
+            let msg = format!(
+                "\u{1f916} IM Bridge 已启动\n\n  \x1b[2mPID\x1b[0m:        {pid}\n  \x1b[2mBinary\x1b[0m:   {}\n  \x1b[2mConfig\x1b[0m:    {}\n  \x1b[2mLog\x1b[0m:        {}\n\n  \x1b[2m监听地址\x1b[0m见配置文件，健康检查：\x1b[0m\x1b[32mGET /health\x1b[0m",
+                bin.display(),
+                config_path.display(),
+                log_path.display()
+            );
+            (
+                msg,
+                serde_json::json!({
+                    "kind": "im",
+                    "action": "start",
+                    "ok": true,
+                    "pid": pid,
+                    "binary": bin.display().to_string(),
+                    "log": log_path.display().to_string(),
+                }),
+            )
+        }
+        Err(e) => (
+            format!(
+                "\u{1f916} IM Bridge 启动失败\n  \x1b[31m无法启动进程\x1b[0m: {e}\n\n  \x1b[2m可尝试手动运行 \x1b[0m\x1b[1m{}\x1b[0m 查看详细日志。",
+                bin.display()
+            ),
+            serde_json::json!({
+                "kind": "im",
+                "action": "start",
+                "ok": false,
+                "error": format!("spawn failed: {e}"),
+            }),
+        ),
+    }
+}
+
+/// 校验配置文件中的必填字段，返回缺失项列表。
+fn validate_im_config(content: &str) -> Vec<String> {
+    let has_feishu = content.contains("[feishu]");
+    let has_wecom = content.contains("[wecom]");
+    if !has_feishu && !has_wecom {
+        return vec!["未检测到 [feishu] 或 [wecom] 平台段".to_string()];
+    }
+
+    let field_present = |key: &str| -> bool {
+        content
+            .lines()
+            .any(|l| l.trim().starts_with(key) && l.contains('=') && !l.split('=').nth(1).unwrap_or("").trim().is_empty())
+    };
+
+    let mut issues = Vec::new();
+    if has_feishu {
+        for key in ["app_id", "app_secret"] {
+            if !field_present(key) {
+                issues.push(format!("[feishu] 缺少必填字段: {key}"));
+            }
+        }
+    }
+    if has_wecom {
+        for key in ["corp_id", "secret", "token", "encoding_aes_key"] {
+            if !field_present(key) {
+                issues.push(format!("[wecom] 缺少必填字段: {key}"));
+            }
+        }
+    }
+    issues
+}
+
+/// 定位 claw-im-bridge 可执行文件。
+/// 优先查找与当前 claw 可执行文件同目录的二进制，再回退到 PATH。
+fn resolve_im_bridge_binary() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let exe_names = ["claw-im-bridge.exe", "claw-im-bridge"];
+    #[cfg(not(windows))]
+    let exe_names = ["claw-im-bridge"];
+
+    // 1) 与当前 claw 可执行文件同目录
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in exe_names {
+                let p = dir.join(name);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    // 2) PATH 中查找
+    let name = exe_names[0];
+    if let Ok(output) = std::process::Command::new("where")
+        .arg(name)
+        .output()
+    {
+        if output.status.success() {
+            let first = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .map(|s| s.trim().to_string());
+            if let Some(p) = first {
+                if !p.is_empty() {
+                    return Some(std::path::PathBuf::from(p));
+                }
+            }
+        }
+    }
+    // 3) 直接尝试命令名（让系统解析 PATH）
+    Some(std::path::PathBuf::from(name))
 }

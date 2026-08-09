@@ -22,4 +22,5 @@ pub mod persistence;
 pub mod response;
 pub mod server;
 pub mod session;
+pub mod setup;
 pub mod tools;

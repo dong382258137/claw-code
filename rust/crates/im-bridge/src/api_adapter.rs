@@ -67,7 +67,11 @@ impl RuntimeApiClient for BridgeApiClient {
         let system = Self::build_system(&request.system_prompt);
         let messages = Self::convert_messages(&request.messages);
         let tools = if self.enable_tools {
-            Some(self.tool_registry.definitions(None))
+            let mut defs = self.tool_registry.definitions(None);
+            // 保持"广告 = 可执行":剔除 IM 环境不适用的工具(如 AskUserQuestion
+            // 需要交互式 stdin,在 IM 服务里会永久阻塞 agent 线程)。
+            defs.retain(|def| !crate::tools::IM_BRIDGE_EXCLUDED_TOOLS.contains(&def.name.as_str()));
+            Some(defs)
         } else {
             None
         };

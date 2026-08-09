@@ -20,6 +20,7 @@ cbc = { version = "0.1", features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 claw-acp = { path = "../claw-acp" }
 claw-shell = { path = "../claw-shell" }
+futures-util = "0.3"
 hex = "0.4"
 quick-xml = { version = "0.37", features = ["serialize"] }
 rand = "0.8"
@@ -33,6 +34,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.8"
 tools = { path = "../tools" }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

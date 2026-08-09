@@ -1198,6 +1198,46 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
+            name: "ImBridgeSetup",
+            description:
+                "Query or configure the IM Bridge (\u{98de}\u{4e66}/Feishu or \u{4f01}\u{4e1a}\u{5fae}\u{4fe1}/WeCom) by writing ~/.claw/im-bridge.toml. Use action='status' (default) to check current config. Use action='setup' to write a platform config; required fields for feishu are app_id+app_secret, for wecom are corp_id+secret+token+encoding_aes_key. If required credentials are missing, the tool reports them and you should ask the user.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["status", "setup"], "description": "'status'=query current config (default); 'setup'=write/update a platform config." },
+                    "platform": { "type": "string", "enum": ["feishu", "wecom"] },
+                    "listen_addr": { "type": "string", "description": "HTTP listen address, default 127.0.0.1:3456." },
+                    "app_id": { "type": "string", "description": "Feishu App ID (cli_xxx). Required for feishu." },
+                    "app_secret": { "type": "string", "description": "Feishu App Secret. Required for feishu." },
+                    "mode": { "type": "string", "enum": ["ws", "http"], "description": "Feishu event subscription mode: 'ws'=long connection (recommended, no public URL), 'http'=webhook callback (needs public URL). Default 'ws'." },
+                    "verification_token": { "type": "string" },
+                    "encrypt_key": { "type": "string" },
+                    "corp_id": { "type": "string", "description": "WeCom Corp ID. Required for wecom." },
+                    "secret": { "type": "string", "description": "WeCom secret. Required for wecom." },
+                    "token": { "type": "string", "description": "WeCom token. Required for wecom." },
+                    "encoding_aes_key": { "type": "string", "description": "WeCom EncodingAESKey (43 chars). Required for wecom." },
+                    "webhook_url": { "type": "string" },
+                    "agent_id": { "type": "integer" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "ImBridgeService",
+            description:
+                "Manage the IM Bridge runtime service (the process that listens for Feishu/WeCom webhooks and sends messages). Use action='status' (default) to check if the service is running; 'start' to launch it (requires a valid ~/.claw/im-bridge.toml, see ImBridgeSetup); 'stop' to stop it. After the service is started, Feishu/WeCom can send/receive messages through the bridge.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["status", "start", "stop"], "description": "'status'=check running state (default); 'start'=start the service; 'stop'=stop the service." },
+                    "listen_addr": { "type": "string", "description": "HTTP listen address override (default read from config, 127.0.0.1:3456)." }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "EnterPlanMode",
             description: "Enable a worktree-local planning mode override and remember the previous local setting for ExitPlanMode.",
             input_schema: json!({
@@ -1881,6 +1921,12 @@ fn execute_tool_with_enforcer(
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
+        "ImBridgeSetup" => {
+            from_value::<ImBridgeSetupInput>(input).and_then(run_im_bridge_setup)
+        }
+        "ImBridgeService" => {
+            from_value::<ImBridgeServiceInput>(input).and_then(run_im_bridge_service)
+        }
         "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
         "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
         "StructuredOutput" => {
@@ -3079,6 +3125,14 @@ fn run_config(input: ConfigInput) -> Result<String, String> {
     to_pretty_json(execute_config(input)?)
 }
 
+fn run_im_bridge_setup(input: ImBridgeSetupInput) -> Result<String, String> {
+    to_pretty_json(execute_im_bridge_setup(input)?)
+}
+
+fn run_im_bridge_service(input: ImBridgeServiceInput) -> Result<String, String> {
+    to_pretty_json(execute_im_bridge_service(input)?)
+}
+
 fn run_enter_plan_mode(input: EnterPlanModeInput) -> Result<String, String> {
     to_pretty_json(execute_enter_plan_mode(input)?)
 }
@@ -3485,6 +3539,109 @@ enum BriefStatus {
 struct ConfigInput {
     setting: String,
     value: Option<ConfigValue>,
+}
+
+/// `ImBridgeSetup` 工具输入：查询或配置 IM Bridge（飞书/企业微信）。
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+struct ImBridgeSetupInput {
+    /// "status"(默认) 查询当前配置；"setup" 写入/更新某个平台的配置。
+    action: Option<String>,
+    /// 平台："feishu" 或 "wecom"。
+    platform: Option<String>,
+    /// HTTP 监听地址（默认 127.0.0.1:3456）。
+    listen_addr: Option<String>,
+    // 飞书字段
+    app_id: Option<String>,
+    app_secret: Option<String>,
+    /// 飞书事件订阅模式："ws"(长连接,推荐,无需公网地址) 或 "http"(webhook,需公网地址)。默认 "ws"。
+    mode: Option<String>,
+    verification_token: Option<String>,
+    encrypt_key: Option<String>,
+    // 企业微信字段
+    corp_id: Option<String>,
+    secret: Option<String>,
+    token: Option<String>,
+    encoding_aes_key: Option<String>,
+    webhook_url: Option<String>,
+    agent_id: Option<i64>,
+}
+
+
+/// `ImBridgeSetup` 工具输出。
+#[derive(Debug, serde::Serialize)]
+struct ImBridgeSetupOutput {
+    success: bool,
+    config_path: String,
+    configured: bool,
+    platforms: Vec<String>,
+    /// 配置时缺失的必填字段（供 AI 向用户询问）。
+    missing_required: Vec<String>,
+    message: Option<String>,
+}
+
+impl ImBridgeSetupOutput {
+    fn ok(config_path: String, configured: bool, platforms: Vec<String>, message: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            config_path,
+            configured,
+            platforms,
+            missing_required: Vec::new(),
+            message: Some(message.into()),
+        }
+    }
+
+    fn incomplete(config_path: String, message: Vec<String>, missing: Vec<String>) -> Self {
+        Self {
+            success: false,
+            config_path,
+            configured: false,
+            platforms: Vec::new(),
+            missing_required: missing,
+            message: Some(message.join("\n")),
+        }
+    }
+}
+
+/// `ImBridgeService` 工具输入：启动/停止/查看 IM Bridge 服务。
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+struct ImBridgeServiceInput {
+    /// "status"(默认) 查看服务是否在运行；"start" 启动服务；"stop" 停止服务。
+    action: Option<String>,
+    /// 配置文件的 listen_addr（不传则从 ~/.claw/im-bridge.toml 读取）。
+    listen_addr: Option<String>,
+}
+
+
+/// `ImBridgeService` 工具输出。
+#[derive(Debug, serde::Serialize)]
+struct ImBridgeServiceOutput {
+    success: bool,
+    action: String,
+    running: bool,
+    pid: Option<u32>,
+    config_path: String,
+    /// 启动时配置缺失的必填字段（供 AI 告知用户）。
+    issues: Vec<String>,
+    message: Option<String>,
+}
+
+impl ImBridgeServiceOutput {
+    fn ok(action: &str, running: bool, config_path: String, message: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            action: action.to_string(),
+            running,
+            pid: None,
+            config_path,
+            issues: Vec::new(),
+            message: Some(message.into()),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -7109,6 +7266,503 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
             error: None,
         })
     }
+}
+
+/// 生成指定平台的 TOML 段，并校验必填字段。
+/// 返回（段文本，缺失必填字段列表）。缺失时段文本为空。
+fn render_im_bridge_section(input: &ImBridgeSetupInput) -> (String, Vec<String>) {
+    let platform = input.platform.as_deref().unwrap_or("");
+    let mut missing = Vec::new();
+    let mut section = String::new();
+
+    let mut take = |v: &Option<String>, key: &str| -> String {
+        match v.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => {
+                missing.push(key.to_string());
+                String::new()
+            }
+        }
+    };
+
+    match platform {
+        "feishu" => {
+            let app_id = take(&input.app_id, "app_id");
+            let app_secret = take(&input.app_secret, "app_secret");
+            if missing.is_empty() {
+                let mode = input
+                    .mode
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("ws");
+                section.push_str("\n[feishu]\n");
+                section.push_str(&format!("mode = \"{mode}\"\n"));
+                section.push_str(&format!("app_id = \"{app_id}\"\n"));
+                section.push_str(&format!("app_secret = \"{app_secret}\"\n"));
+                if let Some(v) = input.verification_token.as_deref().filter(|s| !s.is_empty()) {
+                    section.push_str(&format!("verification_token = \"{v}\"\n"));
+                }
+                if let Some(k) = input.encrypt_key.as_deref().filter(|s| !s.is_empty()) {
+                    section.push_str(&format!("encrypt_key = \"{k}\"\n"));
+                }
+            }
+        }
+        "wecom" => {
+            let corp_id = take(&input.corp_id, "corp_id");
+            let secret = take(&input.secret, "secret");
+            let token = take(&input.token, "token");
+            let aes = take(&input.encoding_aes_key, "encoding_aes_key");
+            if missing.is_empty() {
+                section.push_str("\n[wecom]\n");
+                section.push_str(&format!("corp_id = \"{corp_id}\"\n"));
+                section.push_str(&format!("secret = \"{secret}\"\n"));
+                section.push_str(&format!("token = \"{token}\"\n"));
+                section.push_str(&format!("encoding_aes_key = \"{aes}\"\n"));
+                if let Some(u) = input.webhook_url.as_deref().filter(|s| !s.is_empty()) {
+                    section.push_str(&format!("webhook_url = \"{u}\"\n"));
+                }
+                if let Some(a) = input.agent_id {
+                    section.push_str(&format!("agent_id = {a}\n"));
+                }
+            }
+        }
+        other => {
+            if other.is_empty() {
+                missing.push("platform".to_string());
+            } else {
+                missing.push(format!("无效 platform: {other}（应为 feishu 或 wecom）"));
+            }
+        }
+    }
+
+    (section, missing)
+}
+
+/// 从 TOML 文本中提取顶层键的字符串值（剥离引号）。
+fn extract_toml_value(content: &str, key: &str) -> Option<String> {
+    content.lines().find_map(|l| {
+        let t = l.trim();
+        t.strip_prefix(key).and_then(|rest| {
+            let v = rest.trim_start_matches('=').trim();
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.trim_matches('"').trim_matches('\'').to_string())
+            }
+        })
+    })
+}
+
+/// 将新生成的顶层 + 本次平台段合并进已有配置，保留其他平台段。
+fn merge_im_bridge_config(
+    existing: Option<&str>,
+    top: &str,
+    platform: &str,
+    new_section: &str,
+) -> String {
+    let target = format!("[{platform}]");
+    let mut others = Vec::new();
+
+    if let Some(content) = existing {
+        let mut current: Option<String> = None;
+        let mut current_body = String::new();
+        for line in content.lines() {
+            let t = line.trim();
+            if t.starts_with('[') && t.ends_with(']') {
+                if let Some(h) = current.take() {
+                    if h != target {
+                        others.push(format!("{h}\n{current_body}"));
+                    }
+                }
+                current = Some(line.to_string());
+                current_body.clear();
+            } else if current.is_some() {
+                current_body.push_str(line);
+                current_body.push('\n');
+            }
+        }
+        if let Some(h) = current.take() {
+            if h != target {
+                others.push(format!("{h}\n{current_body}"));
+            }
+        }
+    }
+
+    let mut out = top.to_string();
+    for o in &others {
+        out.push('\n');
+        out.push_str(o.trim_end());
+        out.push('\n');
+    }
+    if !new_section.trim().is_empty() {
+        out.push('\n');
+        out.push_str(new_section.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn im_bridge_tool_config_path() -> std::path::PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".claw").join("im-bridge.toml")
+}
+
+fn execute_im_bridge_setup(input: ImBridgeSetupInput) -> Result<ImBridgeSetupOutput, String> {
+    let config_path = im_bridge_tool_config_path();
+    let existing = std::fs::read_to_string(&config_path).ok();
+
+    let action = input.action.as_deref().unwrap_or("status");
+
+    // 查询模式
+    if action == "status" {
+        let mut platforms = Vec::new();
+        if let Some(c) = &existing {
+            if c.contains("[feishu]") {
+                platforms.push("feishu".to_string());
+            }
+            if c.contains("[wecom]") {
+                platforms.push("wecom".to_string());
+            }
+        }
+        let configured = !platforms.is_empty();
+        let msg = if configured {
+            format!("已配置平台: {}", platforms.join(", "))
+        } else {
+            "未配置。如需配置飞书，调用本工具并传入 action='setup'、platform='feishu'、app_id、app_secret；若未知凭据，请向用户询问。"
+                .to_string()
+        };
+        return Ok(ImBridgeSetupOutput::ok(
+            config_path.display().to_string(),
+            configured,
+            platforms,
+            msg,
+        ));
+    }
+
+    if action != "setup" {
+        return Err(format!("未知 action: '{action}'（可选 'status' / 'setup'）"));
+    }
+
+    // 生成平台段并校验必填
+    let (section, missing) = render_im_bridge_section(&input);
+    if !missing.is_empty() {
+        return Ok(ImBridgeSetupOutput::incomplete(
+            config_path.display().to_string(),
+            vec![
+                "配置不完整，缺少以下必填字段：".to_string(),
+                format!("  {}", missing.join(", ")),
+                "请向用户询问这些信息后再调用本工具完成配置。".to_string(),
+            ],
+            missing,
+        ));
+    }
+
+    // 组装顶层：继承已有 listen_addr / session_timeout，可用入参覆盖
+    let default_listen = existing
+        .as_deref()
+        .and_then(|c| extract_toml_value(c, "listen_addr"))
+        .unwrap_or_else(|| "127.0.0.1:3456".to_string());
+    let default_timeout = existing
+        .as_deref()
+        .and_then(|c| extract_toml_value(c, "session_timeout_secs"))
+        .unwrap_or_else(|| "1800".to_string());
+    let listen_addr = input.listen_addr.clone().unwrap_or(default_listen);
+
+    let mut top = format!("listen_addr = \"{listen_addr}\"\n");
+    top.push_str(&format!("session_timeout_secs = {default_timeout}\n"));
+
+    let platform = input.platform.as_deref().unwrap_or("");
+    let merged = merge_im_bridge_config(existing.as_deref(), &top, platform, &section);
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    std::fs::write(&config_path, merged).map_err(|e| format!("写入配置失败: {e}"))?;
+
+    Ok(ImBridgeSetupOutput::ok(
+        config_path.display().to_string(),
+        true,
+        vec![platform.to_string()],
+        format!("已写入 {platform} 配置到 {}", config_path.display()),
+    ))
+}
+
+fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServiceOutput, String> {
+    let config_path = im_bridge_tool_config_path();
+    let action = input.action.as_deref().unwrap_or("status");
+
+    match action {
+        "status" => {
+            let (running, running_pid) = im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
+            let pid_label = running_pid
+                .map(|p| format!(" (PID {p})"))
+                .unwrap_or_default();
+            let msg = if running {
+                format!("IM Bridge 服务正在运行{pid_label}")
+            } else {
+                "IM Bridge 服务未运行。如需启动，调用本工具并传入 action='start'。".to_string()
+            };
+            Ok(ImBridgeServiceOutput::ok(
+                "status",
+                running,
+                config_path.display().to_string(),
+                msg,
+            )
+            .with_pid(running_pid))
+        }
+        "start" => {
+            // 已运行则直接返回成功
+            let (running, running_pid) = im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
+            if running {
+                let pid_label = running_pid
+                    .map(|p| format!(" (PID {p})"))
+                    .unwrap_or_default();
+                return Ok(ImBridgeServiceOutput::ok(
+                    "start",
+                    true,
+                    config_path.display().to_string(),
+                    format!("IM Bridge 服务已在运行{pid_label}，无需重复启动"),
+                )
+                .with_pid(running_pid));
+            }
+
+            // 配置自检
+            if !config_path.exists() {
+                return Err(format!(
+                    "IM Bridge 尚未配置（{} 不存在）。请先用 ImBridgeSetup 工具配置飞书/企业微信，或运行 `claw-im-bridge --setup` 交互式向导。",
+                    config_path.display()
+                ));
+            }
+            let content = std::fs::read_to_string(&config_path)
+                .map_err(|e| format!("读取配置失败: {e}"))?;
+            let issues = im_bridge_validate_config(&content);
+            if !issues.is_empty() {
+                return Ok(ImBridgeServiceOutput {
+                    success: false,
+                    action: "start".to_string(),
+                    running: false,
+                    pid: None,
+                    config_path: config_path.display().to_string(),
+                    issues,
+                    message: Some("配置不完整，无法启动。请用 ImBridgeSetup 工具补齐缺失字段。".to_string()),
+                });
+            }
+
+            // 定位可执行文件
+            let bin = resolve_im_bridge_binary()
+                .ok_or_else(|| "找不到 claw-im-bridge 可执行文件。请先构建: cargo build --release -p im-bridge".to_string())?;
+
+            // 启动进程，日志重定向到 ~/.claw/im-bridge.log
+            let log_path = config_path.with_file_name("im-bridge.log");
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|e| format!("打开日志文件失败: {e}"))?;
+            let log_err = log
+                .try_clone()
+                .map_err(|e| format!("复制日志句柄失败: {e}"))?;
+
+            let child = std::process::Command::new(&bin)
+                .stdout(std::process::Stdio::from(log_err))
+                .stderr(std::process::Stdio::from(log))
+                .spawn()
+                .map_err(|e| format!("启动进程失败: {e}"))?;
+            let pid = child.id();
+            Ok(ImBridgeServiceOutput::ok(
+                "start",
+                true,
+                config_path.display().to_string(),
+                format!("IM Bridge 服务已启动 (PID {pid})。日志: {}", log_path.display()),
+            )
+            .with_pid(Some(pid)))
+        }
+        "stop" => {
+            let (running, pid) = im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
+            if !running {
+                return Ok(ImBridgeServiceOutput::ok(
+                    "stop",
+                    false,
+                    config_path.display().to_string(),
+                    "IM Bridge 服务未在运行，无需停止。".to_string(),
+                ));
+            }
+            let pid = pid.ok_or_else(|| "服务在运行但无法获取 PID，请手动停止进程".to_string())?;
+            kill_im_bridge_process(pid)
+                .map_err(|e| format!("停止服务失败: {e}"))?;
+            Ok(ImBridgeServiceOutput::ok(
+                "stop",
+                false,
+                config_path.display().to_string(),
+                format!("IM Bridge 服务已停止 (PID {pid})。"),
+            ))
+        }
+        other => Err(format!("未知 action: '{other}'（可选 'status' / 'start' / 'stop'）")),
+    }
+}
+
+impl ImBridgeServiceOutput {
+    fn with_pid(mut self, pid: Option<u32>) -> Self {
+        self.pid = pid;
+        self
+    }
+}
+
+/// 探测 IM Bridge 服务是否正在运行，返回 (running, pid)。
+fn im_bridge_probe_running(
+    config_path: &std::path::Path,
+    listen_addr_override: Option<&str>,
+) -> (bool, Option<u32>) {
+    // 首选：通过监听地址做 TCP 探测（最可靠的服务存活信号）
+    let listen = listen_addr_override.map(str::to_string).or_else(|| {
+        std::fs::read_to_string(config_path)
+            .ok()
+            .and_then(|c| extract_toml_value(&c, "listen_addr"))
+    });
+    if let Some(addr) = listen {
+        if let Ok(addr) = addr.parse::<std::net::SocketAddr>() {
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300))
+                .is_ok()
+            {
+                return (true, im_bridge_find_pid());
+            }
+        }
+    }
+
+    // 回退：按进程名查找
+    let pid = im_bridge_find_pid();
+    (pid.is_some(), pid)
+}
+
+/// 通过系统命令查找 claw-im-bridge 进程，返回 PID（可能失败返回 None）。
+fn im_bridge_find_pid() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Process claw-im-bridge -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Id",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        s.parse::<u32>().ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg("claw-im-bridge")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse::<u32>().ok())
+    }
+}
+
+/// 按 PID 终止 IM Bridge 进程。
+fn kill_im_bridge_process(pid: u32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status()
+            .map_err(|e| format!("调用 taskkill 失败: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("taskkill 未能终止进程（可能已退出）".to_string())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .map_err(|e| format!("调用 kill 失败: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("kill 未能终止进程（可能已退出）".to_string())
+        }
+    }
+}
+
+/// 校验配置文件中的必填字段，返回缺失项列表。
+fn im_bridge_validate_config(content: &str) -> Vec<String> {
+    let has_feishu = content.contains("[feishu]");
+    let has_wecom = content.contains("[wecom]");
+    if !has_feishu && !has_wecom {
+        return vec!["未检测到 [feishu] 或 [wecom] 平台段".to_string()];
+    }
+    let field_present = |key: &str| -> bool {
+        content
+            .lines()
+            .any(|l| l.trim().starts_with(key) && l.contains('='))
+    };
+    let mut issues = Vec::new();
+    if has_feishu {
+        for key in ["app_id", "app_secret"] {
+            if !field_present(key) {
+                issues.push(format!("[feishu] 缺少必填字段: {key}"));
+            }
+        }
+    }
+    if has_wecom {
+        for key in ["corp_id", "secret", "token", "encoding_aes_key"] {
+            if !field_present(key) {
+                issues.push(format!("[wecom] 缺少必填字段: {key}"));
+            }
+        }
+    }
+    issues
+}
+
+/// 定位 claw-im-bridge 可执行文件：优先与当前可执行文件同目录，再回退 PATH。
+fn resolve_im_bridge_binary() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let exe_names = ["claw-im-bridge.exe", "claw-im-bridge"];
+    #[cfg(not(windows))]
+    let exe_names = ["claw-im-bridge"];
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in exe_names {
+                let p = dir.join(name);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    let name = exe_names[0];
+    if let Ok(output) = std::process::Command::new("where").arg(name).output() {
+        if output.status.success() {
+            let first = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .map(|s| s.trim().to_string());
+            if let Some(p) = first {
+                if !p.is_empty() {
+                    return Some(std::path::PathBuf::from(p));
+                }
+            }
+        }
+    }
+    Some(std::path::PathBuf::from(name))
 }
 
 const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];

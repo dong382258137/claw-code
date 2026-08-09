@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
 
 use crate::config::ImBridgeConfig;
-use crate::connectors::feishu::{FeishuClient, FeishuWebhookBody};
+use crate::connectors::feishu::{FeishuClient, FeishuUserMessage, FeishuWebhookBody};
+use crate::connectors::feishu_ws::FeishuWsClient;
 use crate::connectors::wecom::WeComClient;
 use crate::response::{ResponseCollector, RouteTarget, SessionRouter};
 use crate::session::{ChatKey, ImRequest, SessionManager, SpawnKeepAlive, SpawnResult};
@@ -39,6 +40,8 @@ pub struct ServerHandle {
     pub server_task: tokio::task::JoinHandle<()>,
     pub collector_task: tokio::task::JoinHandle<()>,
     pub persist_task: tokio::task::JoinHandle<()>,
+    /// Feishu long-connection (WebSocket) client task, when enabled.
+    pub feishu_ws_task: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
     pub keep_alive: SpawnKeepAlive,
 }
@@ -55,6 +58,11 @@ pub async fn run_server(
         .map_err(|e| format!("invalid listen address '{}': {e}", config.listen_addr))?;
 
     let feishu_client = config.feishu.clone().map(FeishuClient::new);
+    let use_feishu_ws = config
+        .feishu
+        .as_ref()
+        .map(|c| c.mode == "ws")
+        .unwrap_or(false);
 
     let wecom_client = match &config.wecom {
         Some(cfg) => Some(WeComClient::new(cfg.clone())?),
@@ -86,6 +94,35 @@ pub async fn run_server(
         }
     });
 
+    // Feishu long-connection (WebSocket) mode: subscribe events via a
+    // full-duplex channel instead of the HTTP webhook. Requires no public URL.
+    let feishu_ws_task = if use_feishu_ws {
+        let feishu_cfg = config
+            .feishu
+            .clone()
+            .ok_or("feishu ws mode requires a [feishu] config section")?;
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<FeishuUserMessage>();
+        let ws_client = FeishuWsClient::new(feishu_cfg, ws_tx);
+        let ws_task = tokio::spawn(async move {
+            if let Err(e) = ws_client.run().await {
+                tracing::error!("feishu long connection client stopped: {e}");
+            }
+        });
+        let consumer_state = state.clone();
+        let consumer_task = tokio::spawn(async move {
+            while let Some(msg) = ws_rx.recv().await {
+                process_feishu_message(&consumer_state, msg).await;
+            }
+        });
+        tracing::info!("feishu long connection (ws) mode enabled");
+        Some(tokio::spawn(async move {
+            let _ = ws_task.await;
+            let _ = consumer_task.await;
+        }))
+    } else {
+        None
+    };
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/feishu/webhook", post(feishu_webhook))
@@ -110,6 +147,7 @@ pub async fn run_server(
         server_task,
         collector_task,
         persist_task,
+        feishu_ws_task,
         keep_alive: spawn_result.keep_alive,
     })
 }
@@ -174,39 +212,63 @@ async fn feishu_webhook(
         }
         FeishuWebhookBody::EventCallback(callback) => {
             let msg = FeishuClient::extract_message(&callback).ok_or(StatusCode::OK)?;
-            handle_im_message(
-                &state,
-                "feishu",
-                &msg.chat_id,
-                &msg.user_id,
-                &msg.text,
-                move |state, chat_key, req| async move {
-                    let Some(feishu) = state.feishu_client.as_ref() else {
-                        tracing::error!("feishu_client not initialized in callback");
-                        return;
-                    };
-                    match state.session_manager.process_request(req).await {
-                        Ok(session_id) => {
-                            let mut router = state.session_router.lock().await;
-                            router.insert(
-                                session_id,
-                                RouteTarget::Feishu {
-                                    client: feishu.clone(),
-                                    chat_id: chat_key.chat_id.clone(),
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!("failed to process feishu message: {e}");
-                            let _ = feishu
-                                .send_text_message(&chat_key.chat_id, &format!("Error: {e}"))
-                                .await;
-                        }
-                    }
-                },
-            )
-            .await;
+            process_feishu_message(&state, msg).await;
             Ok(Json(json!({})))
+        }
+    }
+}
+
+/// Process a Feishu user message: run commands directly, otherwise submit to
+/// the agent and register the route for the response.
+async fn process_feishu_message(state: &AppState, msg: FeishuUserMessage) {
+    let chat_key = ChatKey::new("feishu", &msg.chat_id);
+    let req = ImRequest {
+        chat_key: chat_key.clone(),
+        user_id: msg.user_id,
+        text: msg.text,
+    };
+
+    match state.session_manager.handle_command(&req).await {
+        Ok(Some(cmd_response)) => {
+            tracing::info!(
+                "command handled for feishu chat {}",
+                msg.chat_id
+            );
+            if let Some(client) = &state.feishu_client {
+                if let Err(e) = client
+                    .send_text_message(&msg.chat_id, &cmd_response)
+                    .await
+                {
+                    tracing::error!("failed to send feishu command response: {e}");
+                }
+            }
+        }
+        Ok(None) => {
+            let Some(feishu) = state.feishu_client.clone() else {
+                tracing::error!("feishu_client not initialized");
+                return;
+            };
+            match state.session_manager.process_request(req).await {
+                Ok(session_id) => {
+                    let mut router = state.session_router.lock().await;
+                    router.insert(
+                        session_id,
+                        RouteTarget::Feishu {
+                            client: feishu,
+                            chat_id: msg.chat_id,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("failed to process feishu message: {e}");
+                    let _ = feishu
+                        .send_text_message(&msg.chat_id, &format!("Error: {e}"))
+                        .await;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("command handling error for feishu: {e}");
         }
     }
 }
