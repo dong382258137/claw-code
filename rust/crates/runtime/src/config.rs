@@ -108,6 +108,14 @@ pub struct HookDefinition {
     pub handler_type: HookHandlerType,
     pub value: String,
     pub failure_policy: FailurePolicy,
+    /// 可选工具名正则匹配器：任一正则命中 `tool_name` 才执行该 hook。
+    /// `None` 或空列表 = 匹配所有工具（向后兼容，与旧行为一致）。
+    /// 对应 design-gaps #1「matcher 正则过滤」。
+    pub matchers: Option<Vec<String>>,
+    /// 可选单 hook 执行超时（毫秒）。`None` = 无超时（仅受 abort 控制，
+    /// 保持旧行为）；显式设置后超时即 kill 子进程，避免 hook 卡死阻塞
+    /// 对话循环（单点故障）。对应 design-gaps #1「每 hook 独立 timeout」。
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +139,8 @@ impl HookDefinition {
             handler_type: HookHandlerType::Command,
             value: cmd.into(),
             failure_policy: FailurePolicy::FailClose,
+            matchers: None,
+            timeout_ms: None,
         }
     }
     #[must_use]
@@ -139,6 +149,8 @@ impl HookDefinition {
             handler_type: HookHandlerType::Script,
             value: content.into(),
             failure_policy: FailurePolicy::FailClose,
+            matchers: None,
+            timeout_ms: None,
         }
     }
     #[must_use]
@@ -147,6 +159,8 @@ impl HookDefinition {
             handler_type: HookHandlerType::Http,
             value: url.into(),
             failure_policy: FailurePolicy::FailClose,
+            matchers: None,
+            timeout_ms: None,
         }
     }
     #[must_use]
@@ -155,11 +169,25 @@ impl HookDefinition {
             handler_type: HookHandlerType::Mcp,
             value: tool_name.into(),
             failure_policy: FailurePolicy::FailClose,
+            matchers: None,
+            timeout_ms: None,
         }
     }
     #[must_use]
     pub fn with_failure_policy(mut self, policy: FailurePolicy) -> Self {
         self.failure_policy = policy;
+        self
+    }
+    /// 设置工具名正则匹配器。任一正则命中工具名才执行该 hook。
+    #[must_use]
+    pub fn with_matchers(mut self, matchers: Vec<String>) -> Self {
+        self.matchers = Some(matchers);
+        self
+    }
+    /// 设置单 hook 执行超时（毫秒）。
+    #[must_use]
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
         self
     }
 }
@@ -1099,23 +1127,52 @@ fn parse_optional_hooks_config_object(
     };
     let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?
-            .unwrap_or_default()
-            .into_iter()
-            .map(HookDefinition::from)
-            .collect(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?
-            .unwrap_or_default()
-            .into_iter()
-            .map(HookDefinition::from)
-            .collect(),
-        post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
-            .unwrap_or_default()
-            .into_iter()
-            .map(HookDefinition::from)
-            .collect(),
+        pre_tool_use: optional_hook_array(hooks, "PreToolUse", context)?
+            .unwrap_or_default(),
+        post_tool_use: optional_hook_array(hooks, "PostToolUse", context)?
+            .unwrap_or_default(),
+        post_tool_use_failure: optional_hook_array(hooks, "PostToolUseFailure", context)?
+            .unwrap_or_default(),
         lifecycle: std::collections::HashMap::new(),
     })
+}
+
+/// 解析 hooks 条目数组。每条目支持两种形式（向后兼容）：
+/// - 字符串：`"printf hi"` → [`HookDefinition::command`]（旧格式）
+/// - 对象：`{"command": "...", "matcher": ["bash"], "timeoutMs": 5000}`（新格式，
+///   对应 design-gaps #1「matcher 正则过滤 + 每 hook 独立 timeout」）
+fn optional_hook_array(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<Vec<HookDefinition>>, ConfigError> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let Some(array) = value.as_array() else {
+        return Err(ConfigError::Parse(format!(
+            "{context}: field {key} must be an array"
+        )));
+    };
+    let defs = array
+        .iter()
+        .map(|item| {
+            if let Some(command) = item.as_str() {
+                return Ok(HookDefinition::command(command));
+            }
+            let entry = expect_object(item, &format!("{context}: field {key}"))?;
+            let command = expect_string(entry, "command", &format!("{context}: field {key}"))?;
+            let mut def = HookDefinition::command(command);
+            if let Some(matchers) = optional_string_array(entry, "matcher", context)? {
+                def = def.with_matchers(matchers);
+            }
+            if let Some(timeout_ms) = optional_u64(entry, "timeoutMs", context)? {
+                def = def.with_timeout_ms(timeout_ms);
+            }
+            Ok(def)
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+    Ok(Some(defs))
 }
 
 fn validate_optional_hooks_config(
@@ -1847,6 +1904,42 @@ mod tests {
         assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_hook_objects_with_matchers_and_timeout() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        // 混合数组：旧格式字符串 + 新格式对象（matcher 正则 + timeoutMs）
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"hooks":{"PreToolUse":["printf base",{"command":"printf gated","matcher":["bash|edit_file"],"timeoutMs":5000}]}}"#,
+        )
+        .expect("write project settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        let hooks = loaded.hooks().pre_tool_use();
+        assert_eq!(hooks.len(), 2);
+        // 旧格式字符串兼容
+        assert_eq!(hooks[0], HookDefinition::command("printf base"));
+        assert_eq!(hooks[0].matchers, None);
+        assert_eq!(hooks[0].timeout_ms, None);
+        // 新格式对象
+        assert_eq!(hooks[1].value, "printf gated");
+        assert_eq!(
+            hooks[1].matchers,
+            Some(vec!["bash|edit_file".to_string()])
+        );
+        assert_eq!(hooks[1].timeout_ms, Some(5000));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -7,7 +7,7 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -447,6 +447,12 @@ impl HookRunner {
         let mut result = HookRunResult::allow(Vec::new());
 
         for def in definitions {
+            // matcher 正则过滤：任一正则命中 tool_name 才执行该 hook；
+            // None 或空列表 = 匹配全部工具（向后兼容，与旧行为一致）。
+            if !hook_matches(def, tool_name) {
+                continue;
+            }
+
             let label = match def.handler_type {
                 HookHandlerType::Command => def.value.clone(),
                 HookHandlerType::Script => "<script>".to_string(),
@@ -472,6 +478,7 @@ impl HookRunner {
                     is_error,
                     &payload,
                     abort_signal,
+                    def.timeout_ms,
                 ),
                 HookHandlerType::Script => Self::run_script_handler(
                     &def.value,
@@ -480,9 +487,17 @@ impl HookRunner {
                     tool_input,
                     &payload,
                     abort_signal,
+                    def.timeout_ms,
                 ),
                 HookHandlerType::Http => {
-                    Self::run_http_handler(&def.value, event, tool_name, &payload, abort_signal)
+                    Self::run_http_handler(
+                        &def.value,
+                        event,
+                        tool_name,
+                        &payload,
+                        abort_signal,
+                        def.timeout_ms,
+                    )
                 }
                 HookHandlerType::Mcp => {
                     Self::run_mcp_handler(&def.value, event, tool_name, &payload)
@@ -561,6 +576,7 @@ impl HookRunner {
         is_error: bool,
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
+        timeout_ms: Option<u64>,
     ) -> HookCommandOutcome {
         let mut child = shell_command(command);
         child.stdin(Stdio::piped());
@@ -574,7 +590,11 @@ impl HookRunner {
             child.env("HOOK_TOOL_OUTPUT", tool_output);
         }
 
-        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+        match child.output_with_stdin(
+            payload.as_bytes(),
+            abort_signal,
+            timeout_ms.map(Duration::from_millis),
+        ) {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -617,6 +637,16 @@ impl HookRunner {
                     event.as_str()
                 ),
             },
+            Ok(CommandExecution::TimedOut) => HookCommandOutcome::Failed {
+                parsed: ParsedHookOutput {
+                    messages: vec![format!(
+                        "{} hook `{command}` timed out after {}ms while handling `{tool_name}`",
+                        event.as_str(),
+                        timeout_ms.unwrap_or_default()
+                    )],
+                    ..ParsedHookOutput::default()
+                },
+            },
             Err(error) => HookCommandOutcome::Failed {
                 parsed: ParsedHookOutput {
                     messages: vec![format!(
@@ -640,6 +670,7 @@ impl HookRunner {
         tool_input: &str,
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
+        timeout_ms: Option<u64>,
     ) -> HookCommandOutcome {
         let (program, flag) = crate::bash::shell_launcher();
         let mut child = CommandWithStdin::new(Command::new(&program));
@@ -653,7 +684,11 @@ impl HookRunner {
         child.env("HOOK_PAYLOAD", payload);
         let stdin_content = format!("{}\n# --- hook payload (JSON) ---\n{}", script, payload);
         let label = bounded_hook_preview(script).unwrap_or_else(|| "<script>".to_string());
-        match child.output_with_stdin(stdin_content.as_bytes(), abort_signal) {
+        match child.output_with_stdin(
+            stdin_content.as_bytes(),
+            abort_signal,
+            timeout_ms.map(Duration::from_millis),
+        ) {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -694,6 +729,16 @@ impl HookRunner {
                     event.as_str()
                 ),
             },
+            Ok(CommandExecution::TimedOut) => HookCommandOutcome::Failed {
+                parsed: ParsedHookOutput {
+                    messages: vec![format!(
+                        "{} hook script timed out after {}ms while handling `{tool_name}`",
+                        event.as_str(),
+                        timeout_ms.unwrap_or_default()
+                    )],
+                    ..ParsedHookOutput::default()
+                },
+            },
             Err(error) => HookCommandOutcome::Failed {
                 parsed: ParsedHookOutput {
                     messages: vec![format!(
@@ -714,6 +759,7 @@ impl HookRunner {
         tool_name: &str,
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
+        timeout_ms: Option<u64>,
     ) -> HookCommandOutcome {
         if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
             return HookCommandOutcome::Cancelled {
@@ -731,7 +777,11 @@ impl HookRunner {
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
         child.stderr(Stdio::piped());
-        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+        match child.output_with_stdin(
+            payload.as_bytes(),
+            abort_signal,
+            timeout_ms.map(Duration::from_millis),
+        ) {
             Ok(CommandExecution::Finished(output)) => {
                 let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr_out = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -768,6 +818,16 @@ impl HookRunner {
             }
             Ok(CommandExecution::Cancelled) => HookCommandOutcome::Cancelled {
                 message: format!("{} hook http `{label}` cancelled", event.as_str()),
+            },
+            Ok(CommandExecution::TimedOut) => HookCommandOutcome::Failed {
+                parsed: ParsedHookOutput {
+                    messages: vec![format!(
+                        "{} hook http `{label}` timed out after {}ms",
+                        event.as_str(),
+                        timeout_ms.unwrap_or_default()
+                    )],
+                    ..ParsedHookOutput::default()
+                },
             },
             Err(error) => HookCommandOutcome::Failed {
                 parsed: ParsedHookOutput {
@@ -1091,17 +1151,43 @@ impl CommandWithStdin {
         &mut self,
         stdin: &[u8],
         abort_signal: Option<&HookAbortSignal>,
+        timeout: Option<Duration>,
     ) -> std::io::Result<CommandExecution> {
         let mut child = self.command.spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
             child_stdin.write_all(stdin)?;
         }
 
+        let start = Instant::now();
         loop {
             if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
                 let _ = child.kill();
                 let _ = child.wait_with_output();
                 return Ok(CommandExecution::Cancelled);
+            }
+
+            // 每 hook 独立超时：超时即 kill 子进程并返回 TimedOut，
+            // 避免 hook 卡死永久阻塞对话循环（单点故障）。
+            if let Some(timeout) = timeout {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    // kill 仅终止 bash 自身；sleep 等孙进程可能仍持有
+                    // stdout 管道，wait_with_output() 会阻塞到孙进程退出
+                    // （Windows 上 kill 不递归进程树）→ 放弃读取输出，
+                    // 短暂轮询回收 bash 后立即返回 TimedOut。
+                    let deadline = Instant::now() + Duration::from_millis(200);
+                    loop {
+                        match child.try_wait()? {
+                            Some(_) => break,
+                            None if Instant::now() >= deadline => {
+                                let _ = child.wait();
+                                break;
+                            }
+                            None => thread::sleep(Duration::from_millis(10)),
+                        }
+                    }
+                    return Ok(CommandExecution::TimedOut);
+                }
             }
 
             match child.try_wait()? {
@@ -1115,6 +1201,26 @@ impl CommandWithStdin {
 enum CommandExecution {
     Finished(std::process::Output),
     Cancelled,
+    TimedOut,
+}
+
+/// 判断 hook 是否应针对给定工具执行（matcher 正则过滤）。
+///
+/// 无 matcher 或空列表 → 匹配全部工具（向后兼容，与旧行为一致）。
+/// 有 matcher 时任一正则命中 `tool_name` 才执行。正则编译失败视为
+/// 不匹配（安全降级：非法正则不会导致 hook 意外执行）。
+fn hook_matches(def: &HookDefinition, tool_name: &str) -> bool {
+    let Some(matchers) = def.matchers.as_deref() else {
+        return true;
+    };
+    if matchers.is_empty() {
+        return true;
+    }
+    matchers.iter().any(|pattern| {
+        regex::Regex::new(pattern)
+            .map(|re| re.is_match(tool_name))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -1123,8 +1229,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
-        HookRunner,
+        HookAbortSignal, HookDefinition, HookEvent, HookProgressEvent, HookProgressReporter,
+        HookRunResult, HookRunner,
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
@@ -1253,6 +1359,112 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message == "later failure hook"));
+    }
+
+    // ── matcher 正则过滤 + 每 hook 独立 timeout（design-gaps #1）──
+
+    #[test]
+    fn matcher_filters_hooks_by_tool_name() {
+        let defs = vec![HookDefinition::command("printf 'ran'").with_matchers(vec!["bash".into()])];
+        let on_bash = HookRunner::run_definitions(
+            HookEvent::PreToolUse,
+            &defs,
+            "bash",
+            "{}",
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(on_bash.messages().iter().any(|m| m == "ran"));
+        let on_other = HookRunner::run_definitions(
+            HookEvent::PreToolUse,
+            &defs,
+            "read_file",
+            "{}",
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(
+            !on_other.messages().iter().any(|m| m == "ran"),
+            "matcher 未命中 read_file 时不应执行 hook"
+        );
+    }
+
+    #[test]
+    fn matcher_supports_regex() {
+        let defs =
+            vec![HookDefinition::command("printf 'edit'").with_matchers(vec!["^edit_".into()])];
+        let on_edit = HookRunner::run_definitions(
+            HookEvent::PreToolUse,
+            &defs,
+            "edit_file",
+            "{}",
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(on_edit.messages().iter().any(|m| m == "edit"));
+        let on_bash = HookRunner::run_definitions(
+            HookEvent::PreToolUse,
+            &defs,
+            "bash",
+            "{}",
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(!on_bash.messages().iter().any(|m| m == "edit"));
+    }
+
+    #[test]
+    fn no_matcher_matches_all_tools() {
+        // 向后兼容：无 matcher 时所有工具都触发。
+        let defs = vec![HookDefinition::command("printf 'all'")];
+        for tool in ["bash", "read_file", "edit_file"] {
+            let result = HookRunner::run_definitions(
+                HookEvent::PreToolUse,
+                &defs,
+                tool,
+                "{}",
+                None,
+                false,
+                None,
+                None,
+            );
+            assert!(
+                result.messages().iter().any(|m| m == "all"),
+                "tool {tool} 应触发无 matcher 的 hook"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_timeout_kills_hanging_command() {
+        // 挂起的 hook（sleep 5s）应被 500ms 超时 kill，不再阻塞调用方。
+        let defs = vec![HookDefinition::command("sleep 5").with_timeout_ms(500)];
+        let start = std::time::Instant::now();
+        let result = HookRunner::run_definitions(
+            HookEvent::PreToolUse,
+            &defs,
+            "bash",
+            "{}",
+            None,
+            false,
+            None,
+            None,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "hook 应在超时后快速返回，实际耗时 {elapsed:?}"
+        );
+        assert!(result.is_failed());
+        assert!(result.messages().iter().any(|m| m.contains("timed out")));
     }
 
     #[test]

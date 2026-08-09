@@ -93,6 +93,9 @@ enum FieldType {
     Object,
     StringArray,
     Number,
+    /// hooks 数组：元素可为字符串（旧格式）或对象（新格式，含
+    /// command/matcher/timeoutMs）。对应 design-gaps #1。
+    HookArray,
 }
 
 impl FieldType {
@@ -103,6 +106,7 @@ impl FieldType {
             Self::Object => "an object",
             Self::StringArray => "an array of strings",
             Self::Number => "a number",
+            Self::HookArray => "an array of strings or objects",
         }
     }
 
@@ -115,6 +119,10 @@ impl FieldType {
                 .as_array()
                 .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some())),
             Self::Number => value.as_i64().is_some(),
+            Self::HookArray => value.as_array().is_some_and(|arr| {
+                arr.iter()
+                    .all(|v| v.as_str().is_some() || v.as_object().is_some())
+            }),
         }
     }
 }
@@ -214,15 +222,15 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
 const HOOKS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "PreToolUse",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookArray,
     },
     FieldSpec {
         name: "PostToolUse",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookArray,
     },
     FieldSpec {
         name: "PostToolUseFailure",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookArray,
     },
 ];
 

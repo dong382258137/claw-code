@@ -4,6 +4,8 @@
 > 来源：对 `D:\claw-code-src\docs` 全部设计方案与源码实现状态的对比核查
 > 用途：作为后续实施排期与优先级决策的依据
 > 核查结论要点：docs 中大部分设计方案已实现并默认开启；以下为**未实现 / 部分实现 / 已偏离**项的收益清单。
+>
+> **实施进度（2026-08-09）**：#3 知识新鲜度（S4 负向排除 + 中文关键词，commit `ca22cc4c`）、#4 提示词引导（WebSearch 优先 / ToolSearch / TaskUpdate，commit `222f1b2f`）已完成；#3 剩余路径 A 传递链、#4 的 capability/`--resume`（经核查代码不存在）未实现。各条目以 ✅ 标注。
 
 ---
 
@@ -22,8 +24,8 @@
 |---|---|---|
 | 1 | **hooks 系统四件套缺失**：matcher 正则过滤、每 hook 独立 timeout、异步 HookRunner、配置热重载（`runtime/src/hooks.rs` 仅同步 Command/Script/Http/Mcp） | ① 命令/脚本 hook 卡死**不再阻塞整个对话循环**（当前同步执行是单点故障源）；② hook 可按工具名/事件精准触发，避免误拦截；③ 改 hooks.toml 无需重启会话，运维成本大降；④ 防止恶意/失控 hook 无限期挂起 |
 | 2 | **self-evolving harness 完全未开工**：`harness_evolution` 模块、`task_success` 字段、`claw harness` CLI（`docs/2026-07-24-p3-self-evolving-harness-design.md`） | ① 会话失败教训自动沉淀 → **跨会话自我进化**，同类错误不再重复犯；② TraceAnalyzer 聚类 + 自动修复建议形成闭环；③ 这是"从工具到自进化 Agent"的分水岭能力 |
-| 3 | **知识新鲜度门控三处偏差**：S4 负向排除未实现（本地任务误判 Novel 会白搜）、关键词表无中文词、路径 A 传递链降级为全局 last-gated（`runtime/src/knowledge_freshness.rs`） | ① 消除**内部仓库任务误触发联网调研**的 token 浪费（当前"在这个仓库里改 X"可能被判 Novel）；② 中文任务（本项目主力场景）新鲜度评估准确率显著提升；③ `knowledge_source` 统计不再串任务，决策闭环可信 |
-| 4 | **AI 提示词 4 处能力缺失**：capability 参数、知识新鲜度、WebSearch 优先、会话恢复协议均未写入 `runtime/src/prompt.rs` | ① 子智能体能力分级（analyze/read-only/execute）**从"代码里有、AI 不会用"变为可引导调用**；② Novel 任务自动触发调研，减少过时知识自信错答；③ 明确"先搜索后回答"约束；④ AI 知道 `--resume` 会话恢复语义。**纯提示词改动、零架构成本，却是收益杠杆最高的项** |
+| 3 | ✅ **知识新鲜度门控三处偏差（部分实现）**：~~S4 负向排除未实现~~、~~关键词表无中文词~~、路径 A 传递链降级为全局 last-gated（`runtime/src/knowledge_freshness.rs`）。**已完成**：S4 负向排除 + 中文关键词（commit `ca22cc4c`）；**待办**：路径 A 传递链 | ① 消除**内部仓库任务误触发联网调研**的 token 浪费（当前"在这个仓库里改 X"可能被判 Novel）；② 中文任务（本项目主力场景）新鲜度评估准确率显著提升；③ `knowledge_source` 统计不再串任务，决策闭环可信 |
+| 4 | ✅ **AI 提示词 4 处能力缺失（部分实现）**：~~WebSearch 优先~~、~~知识新鲜度~~、capability 参数、会话恢复协议。**已完成**：WebSearch 优先 + 知识新鲜度引导写入 `runtime/src/prompt.rs` Tool Usage Guidance（commit `222f1b2f`）；**不实现**：capability 参数（`AgentInput` 无该字段）与 `--resume`（claw-shell 无该参数）——代码核查确认不存在，避免引导幻影功能 | ① 子智能体能力分级（analyze/read-only/execute）**从"代码里有、AI 不会用"变为可引导调用**；② Novel 任务自动触发调研，减少过时知识自信错答；③ 明确"先搜索后回答"约束；④ AI 知道 `--resume` 会话恢复语义。**纯提示词改动、零架构成本，却是收益杠杆最高的项** |
 
 ---
 
@@ -57,15 +59,15 @@
 
 | # | 未调用工具 | 未释放的收益 |
 |---|---|---|
-| 11 | **WebSearch / WebFetch**（0 次） | 排查外部错误、查 API 文档/版本变更时「先搜索后回答」，替代"盲猜 + 反复编译"的试错循环；当前工作流全程未联网检索 |
-| 12 | **Agent**（0 次） | 子智能体委派 + 持久化 handoff 元数据；当前仅用内部 `dispatch_subagent`/`spawn_parallel_subagents`（各 1 次），跨 turn 保留子任务产物的能力闲置 |
-| 13 | **ToolSearch / SkillSearch**（0 次） | 工具发现门卫：56+ 工具 AI 未必全知道，主动搜索可避免"不知道有工具而用 bash/grep 绕道" |
+| 11 | ✅ **WebSearch / WebFetch**（0 次 → **已引导**，commit `222f1b2f`） | 排查外部错误、查 API 文档/版本变更时「先搜索后回答」，替代"盲猜 + 反复编译"的试错循环；当前工作流全程未联网检索 |
+| 12 | **Agent**（0 次，**部分**：既有 `Agent Subagent Types` 段已覆盖 subagent_type 选择，未新增"替代 dispatch_subagent"引导） | 子智能体委派 + 持久化 handoff 元数据；当前仅用内部 `dispatch_subagent`/`spawn_parallel_subagents`（各 1 次），跨 turn 保留子任务产物的能力闲置 |
+| 13 | ✅ **ToolSearch / SkillSearch**（0 次 → **已引导**，commit `222f1b2f`） | 工具发现门卫：56+ 工具 AI 未必全知道，主动搜索可避免"不知道有工具而用 bash/grep 绕道" |
 
 ### 🟡 P1 级 — 补齐闭环（任务进度与编排）
 
 | # | 未调用工具 | 未释放的收益 |
 |---|---|---|
-| 14 | **TaskUpdate**（0 次） | TaskCreate 3 次 / TaskOutput 5 次但任务状态从不更新，进度闭环不完整 |
+| 14 | ✅ **TaskUpdate**（0 次 → **已引导**，commit `222f1b2f`） | TaskCreate 3 次 / TaskOutput 5 次但任务状态从不更新，进度闭环不完整 |
 | 15 | **CronCreate / CronDelete / CronList**（0 次） | 定时任务（周期回归、每日报告），调度基础设施已就绪 |
 | 16 | **dag_run / dag_status**（0 次） | DAG 编排生产路径已实现（`tools/src/lib.rs:3652`），批处理/流水线场景完全闲置 |
 | 17 | **Worker 系列**（Create/Get/Observe/SendPrompt/Restart/Terminate 等 9 个，0 次） | 长驻编码 worker + trust gate，适合大型多轮改造 |
@@ -84,8 +86,8 @@
 
 ```
 立即做（低投入高收益）：
-  ① 提示词补全 4 能力  →  纯 prompt 改动，半天内可完成，AI 行为立刻改变
-  ② 知识新鲜度负向排除 + 中文词  →  ~50 行，省 token + 提准确率
+  ① ✅ 提示词补全 4 能力（部分：WebSearch/知识新鲜度引导已提交 `222f1b2f`；capability/`--resume` 因代码不存在跳过）
+  ② ✅ 知识新鲜度负向排除 + 中文词（已提交 `ca22cc4c`）
   ③ hooks matcher + timeout  →  收敛当前同步 hook 的单点故障风险
 
 短期做（中等投入）：
@@ -103,13 +105,13 @@
 
 ```
 立即做（零成本、与提示词补全同批）：
-  ⑩ WebSearch/WebFetch 写入「先搜索后回答」提示词约束  →  工具已实现，引导即生效
-  ⑪ Agent 工具替代内部 dispatch_subagent 的引导        →  子任务产物可跨 turn 保留
-  ⑫ ToolSearch 作为工具发现门卫                        →  减少「不知道有工具」的绕道成本
+  ⑩ ✅ WebSearch/WebFetch 写入「先搜索后回答」提示词约束（已提交 `222f1b2f`）
+  ⑪ Agent 工具替代内部 dispatch_subagent 的引导（待办，`Agent Subagent Types` 段已部分覆盖）
+  ⑫ ✅ ToolSearch 作为工具发现门卫（已提交 `222f1b2f`）
 
 短期做（补齐闭环）：
-  ⑬ TaskUpdate 补任务状态更新                          →  任务生命周期可追踪
-  ⑭ Cron 定时任务用于周期回归/每日报告                  →  调度设施已就绪，直接启用
+  ⑬ ✅ TaskUpdate 补任务状态更新（已提交 `222f1b2f`）
+  ⑭ Cron 定时任务用于周期回归/每日报告  →  调度设施已就绪，直接启用
 
 按需做（有明确场景再投入）：
   ⑮ dag_run / Worker* 用于批处理与长驻编码 worker
