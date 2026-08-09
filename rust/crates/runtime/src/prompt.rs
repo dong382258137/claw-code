@@ -1372,7 +1372,28 @@ fn get_tool_usage_guidance_section() -> String {
      ### 任务生命周期\n\
      After creating a task with `TaskCreate`, call `TaskUpdate` to keep its \
      status in sync as work progresses (e.g. running → completed/cancelled), \
-     so task progress stays trackable."
+     so task progress stays trackable.\n\
+     \n\
+     ### 文件搜索优先\n\
+     Search file contents with `grep_search` and find files by name with \
+     `glob_search` — NOT with bash `grep`/`find`. The dedicated tools return \
+     structured results (match counts, file paths, line numbers), respect \
+     permission tiers, and cost fewer output tokens. Reserve bash for commands \
+     with side effects (running tests, git, starting servers) or pipelines.\n\
+     \n\
+     ### 编辑前先精确读取\n\
+     Before calling `edit_file` or `replace_lines`, first `read_file` the \
+     exact target lines to confirm the precise bytes (indentation, quotes, \
+     line endings). Never construct old_string from memory — it causes \
+     `old_string not found` retries. If a match fails, read the error's line \
+     count/line-ending hint and correct the old_string once instead of \
+     retrying identical parameters.\n\
+     \n\
+     ### 任务 ID 来源\n\
+     The `task_id` for `TaskOutput`/`TaskGet`/`TaskStop`/`TaskUpdate` must \
+     come from the return value of `TaskCreate` or `RunTaskPacket`. A bash \
+     background PID (`backgroundPid` in bash output) is an OS process number, \
+     NOT a task_id — passing it to task tools fails with `task not found`."
         .to_string()
 }
 /// session even as new entries are written to disk.

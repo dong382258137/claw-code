@@ -1412,7 +1412,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskOutput",
-            description: "Retrieve the output produced by a background task.",
+            description: "Retrieve the output produced by a background task. The task_id must be the ID returned by TaskCreate or RunTaskPacket — NOT the bash backgroundPid (that is an OS process number, not a task_id; passing it fails with 'task not found').",
             input_schema: json!({
                 "type": "object",
                 "properties": {
