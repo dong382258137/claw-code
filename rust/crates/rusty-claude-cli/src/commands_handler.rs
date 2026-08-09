@@ -2245,9 +2245,7 @@ fn render_im_start_command() -> (String, serde_json::Value) {
         Ok(c) => c,
         Err(e) => {
             return (
-                format!(
-                    "\u{1f916} IM Bridge 启动失败\n  \x1b[31m读取配置失败\x1b[0m: {e}",
-                ),
+                format!("\u{1f916} IM Bridge 启动失败\n  \x1b[31m读取配置失败\x1b[0m: {e}",),
                 serde_json::json!({
                     "kind": "im",
                     "action": "start",
@@ -2378,9 +2376,11 @@ fn validate_im_config(content: &str) -> Vec<String> {
     }
 
     let field_present = |key: &str| -> bool {
-        content
-            .lines()
-            .any(|l| l.trim().starts_with(key) && l.contains('=') && !l.split('=').nth(1).unwrap_or("").trim().is_empty())
+        content.lines().any(|l| {
+            l.trim().starts_with(key)
+                && l.contains('=')
+                && !l.split('=').nth(1).unwrap_or("").trim().is_empty()
+        })
     };
 
     let mut issues = Vec::new();
@@ -2422,10 +2422,7 @@ fn resolve_im_bridge_binary() -> Option<std::path::PathBuf> {
     }
     // 2) PATH 中查找
     let name = exe_names[0];
-    if let Ok(output) = std::process::Command::new("where")
-        .arg(name)
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("where").arg(name).output() {
         if output.status.success() {
             let first = String::from_utf8_lossy(&output.stdout)
                 .lines()

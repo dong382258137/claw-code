@@ -314,9 +314,17 @@ fn has_instruction_files_in_cwd() -> bool {
 /// emitter 在渲染 markdown 表格前读取，保证表格宽度匹配内容区。
 static OUTPUT_CONTENT_WIDTH: AtomicUsize = AtomicUsize::new(0);
 
+/// 输出区底部预留的空白行数。
+/// 让最后一行输出内容与输入框保持间隔，避免"最底下一行被输入框遮挡"的
+/// 视觉问题（输出内容填满输出框时，末行紧贴输入框顶部边框）。
+const OUTPUT_BOTTOM_PADDING: u16 = 3;
+
 /// 把单行文本按词边界折成多行显示行（样式保留，ANSI 已由 ratatui 解析）。
 /// 与输出区 draw 使用同一实现，供 output_view 的行号映射复用（鼠标点击命中）。
-pub(crate) fn wrap_line_to_display_lines(line: &Line<'static>, area_width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_line_to_display_lines(
+    line: &Line<'static>,
+    area_width: usize,
+) -> Vec<Line<'static>> {
     if area_width == 0 {
         return vec![line.clone()];
     }
@@ -1083,7 +1091,13 @@ fn run_event_loop(
             // Output area — write-time rendered lines (zero display render cost)
             let output_lines = output_view.snapshot_lines();
             let raw_breaks = output_view.snapshot_breaks();
-            let visible_height = main_area.height.saturating_sub(1) as usize; // Borders::TOP = 1 line
+            // 底部预留 OUTPUT_BOTTOM_PADDING 行空白（防止末行贴输入框被"遮挡"）。
+            // 小终端（高度不足）时退回 .max(1)，保证至少能看到 1 行内容。
+            let visible_height = main_area
+                .height
+                .saturating_sub(1)                    // Borders::TOP = 1 line
+                .saturating_sub(OUTPUT_BOTTOM_PADDING) // 底部空白
+                .max(1) as usize;
             let content_width = main_area.width as usize;
             OUTPUT_CONTENT_WIDTH.store(content_width, Ordering::Relaxed);
             let output_ptr = Arc::as_ptr(&output_lines);
@@ -1198,7 +1212,11 @@ fn run_event_loop(
                 y: main_area.y + 1 + header_rows as u16,
                 x: main_area.x,
                 width: main_area.width,
-                height: (main_area.height.saturating_sub(1 + header_rows as u16)),
+                // 底部预留空白与 visible_height 一致，段落渲染高度 = content_height。
+                height: main_area
+                    .height
+                    .saturating_sub(1 + header_rows as u16 + OUTPUT_BOTTOM_PADDING)
+                    .max(1),
             };
             let output_paragraph = Paragraph::new(Text::from(visible_lines));
             // 不用 .scroll() 和 .wrap()：已自己 wrap + 裁剪。

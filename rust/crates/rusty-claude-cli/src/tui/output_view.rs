@@ -467,8 +467,7 @@ impl OutputBuffer {
             let touched: usize;
             if i + 1 == seg_count {
                 // 最后一段:合并到 trailing Text entry 或新建
-                touched = if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut()
-                {
+                touched = if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
                     content.push_str(seg);
                     self.text_total_bytes += seg.len();
                     self.entries.len() - 1
@@ -1645,9 +1644,18 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("Hello world."), "lines 应含第一段: {joined}");
-        assert!(joined.contains("Second paragraph"), "lines 应含第二段: {joined}");
-        assert!(joined.contains("Final sentence"), "lines 应含 flush 段: {joined}");
+        assert!(
+            joined.contains("Hello world."),
+            "lines 应含第一段: {joined}"
+        );
+        assert!(
+            joined.contains("Second paragraph"),
+            "lines 应含第二段: {joined}"
+        );
+        assert!(
+            joined.contains("Final sentence"),
+            "lines 应含 flush 段: {joined}"
+        );
     }
 
     /// 回归测试：AI 回复流式到达时，若尾部是 ToolCard（正在执行），
@@ -1697,10 +1705,7 @@ mod tests {
         // ToolCard result 应被裁剪为占位符
         if let OutputEntry::ToolCard { result, .. } = &buf.entries[1] {
             let r = result.as_ref().expect("result should exist");
-            assert!(
-                r.starts_with("[trimmed:"),
-                "ToolCard result 应被裁剪: {r}"
-            );
+            assert!(r.starts_with("[trimmed:"), "ToolCard result 应被裁剪: {r}");
         } else {
             panic!("entries[1] 应为 ToolCard");
         }
@@ -1725,7 +1730,12 @@ mod tests {
             tool_id: "t1".to_string(),
             name: "bash".to_string(),
             input: r#"{"command":"ls"}"#.to_string(),
-            result: Some((1..=30).map(|i| format!("line{i:02}").repeat(2)).collect::<Vec<_>>().join("\n")),
+            result: Some(
+                (1..=30)
+                    .map(|i| format!("line{i:02}").repeat(2))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             is_error: false,
             priority: Priority::P2,
             collapsed: true,
@@ -1771,7 +1781,13 @@ mod tests {
             "点击区间1起点应命中卡片1"
         );
         assert!(
-            matches!(&buf.entries[1], OutputEntry::ToolCard { collapsed: false, .. }),
+            matches!(
+                &buf.entries[1],
+                OutputEntry::ToolCard {
+                    collapsed: false,
+                    ..
+                }
+            ),
             "卡片1 应被展开"
         );
         let ranges2 = buf.tool_card_line_ranges(width);
@@ -1780,7 +1796,13 @@ mod tests {
             "点击区间2起点应命中卡片2"
         );
         assert!(
-            matches!(&buf.entries[2], OutputEntry::ToolCard { collapsed: true, .. }),
+            matches!(
+                &buf.entries[2],
+                OutputEntry::ToolCard {
+                    collapsed: true,
+                    ..
+                }
+            ),
             "卡片2 应被折叠"
         );
         // 点击区间外（如前置 Text entry 所在行）不应命中任何卡片
