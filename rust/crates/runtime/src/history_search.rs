@@ -254,13 +254,40 @@ fn tokenize_query_for_match(query: &str) -> String {
     }
 
     /// 把词中连续汉字拆为单字:phrase=true 用空格分隔(短语相邻语义),
-    /// 否则输出 `(字1 AND 字2 ...)`。
+    /// 否则输出 `(字1 AND 字2 ...)`。CJK 片段与 ASCII 片段之间用空格
+    /// (括号表达式后跟词时显式 `AND`)连接,避免 `(规 AND 则)4` 这类
+    /// 括号与裸字符粘连导致的 FTS5 语法错误(`fts5: syntax error near`).
     fn push_split(out: &mut String, word: &str, phrase: bool) {
-        fn flush_cjk(out: &mut String, buf: &mut String, phrase: bool) {
-            if buf.is_empty() {
-                return;
+        if word.is_empty() {
+            return;
+        }
+        // 切成片段:连续汉字为一个 CJK 片段,连续非汉字为一个 ASCII 片段。
+        let mut segments: Vec<String> = Vec::new();
+        let mut buf = String::new();
+        let mut buf_is_cjk = false;
+        for ch in word.chars() {
+            let is_cjk = is_han(ch);
+            if !buf.is_empty() && is_cjk != buf_is_cjk {
+                segments.push(std::mem::take(&mut buf));
             }
-            let chars: Vec<char> = buf.chars().collect();
+            buf_is_cjk = is_cjk;
+            buf.push(ch);
+        }
+        if !buf.is_empty() {
+            segments.push(buf);
+        }
+        let mut first = true;
+        for seg in segments {
+            if !first {
+                // FTS5 语法限制:括号表达式后直接跟 token 必须显式写 AND。
+                out.push_str(if out.ends_with(')') { " AND " } else { " " });
+            }
+            first = false;
+            let chars: Vec<char> = seg.chars().collect();
+            if !is_han(chars[0]) {
+                out.push_str(&seg);
+                continue;
+            }
             match chars.len() {
                 1 => out.push(chars[0]),
                 _ if phrase => {
@@ -282,37 +309,29 @@ fn tokenize_query_for_match(query: &str) -> String {
                     out.push(')');
                 }
             }
-            buf.clear();
         }
-
-        let mut buf = String::new();
-        for ch in word.chars() {
-            if is_han(ch) {
-                buf.push(ch);
-            } else {
-                flush_cjk(out, &mut buf, phrase);
-                out.push(ch);
-            }
-        }
-        flush_cjk(out, &mut buf, phrase);
     }
 
     let mut out = String::with_capacity(query.len() + query.len() / 2);
     let mut first = true;
-    let mut prev_paren = false;
+    let mut prev_was_operator = false;
     for part in query.split_whitespace() {
+        let part_is_operator = is_operator(part);
         if !first {
-            // 括号表达式后跟普通词需要显式 AND(FTS5 语法限制)。
-            if prev_paren && !is_operator(part) && !part.starts_with('(') {
+            // 非运算符 part 之间统一显式 AND:词/短语/括号表达式任意两两
+            // 组合都是合法 FTS5 语法,避免短语后跟括号(如
+            // `"EPIC-017" (背 AND 驰)`)这类隐式连接触发 `syntax error near AND`。
+            // 运算符(AND/OR/NOT)前后保持空格分隔。
+            if !part_is_operator && !prev_was_operator {
                 out.push_str(" AND ");
             } else {
                 out.push(' ');
             }
         }
         first = false;
-        if is_operator(part) || part.contains(['(', ')']) {
+        if part_is_operator || part.contains(['(', ')']) {
             out.push_str(part);
-            prev_paren = part.ends_with(')');
+            prev_was_operator = part_is_operator;
             continue;
         }
         if part.starts_with('"') && part.ends_with('"') && part.len() > 2 {
@@ -321,17 +340,31 @@ fn tokenize_query_for_match(query: &str) -> String {
             out.push('"');
             push_split(&mut out, inner, true);
             out.push('"');
-            prev_paren = false;
             continue;
         }
-        // 前缀 `*` / NOT `-` / 列 `:` 等复杂词原样透传
-        if part.contains(['*', '-', ':']) {
+        // 用户显式 FTS5 语法(前缀 `*` / 列 `:`)原样透传
+        if part.contains('*') || part.contains(':') {
             out.push_str(part);
-            prev_paren = false;
+            continue;
+        }
+        // 纯数字 token(如 `1786293120900`)会被 FTS5 解析为列名引用,
+        // 报 `no such column`。转字面短语,按普通词匹配。
+        if part.chars().all(|c| c.is_ascii_digit()) {
+            out.push('"');
+            out.push_str(part);
+            out.push('"');
+            continue;
+        }
+        // 含 `-` 的词(如 `EPIC-017` / `n-4` / `BTC-1m`)会被 FTS5 当作
+        // NOT 运算符,`-` 后的数字/词被解析成列名(`no such column: 017`)。
+        // 转字面短语,`-` 作为普通字符参与匹配。
+        if part.contains('-') {
+            out.push('"');
+            push_split(&mut out, part, true);
+            out.push('"');
             continue;
         }
         push_split(&mut out, part, false);
-        prev_paren = out.ends_with(')');
     }
     out
 }
@@ -887,12 +920,12 @@ mod tests {
 
     #[test]
     fn tokenize_query_preserves_fts_syntax() {
-        // 非中文查询原样透传
+        // 非中文查询:part 间统一显式 AND(词/短语任意组合均合法)
         assert_eq!(
             super::tokenize_query_for_match("rust toolchain"),
-            "rust toolchain"
+            "rust AND toolchain"
         );
-        // 中英文混合:中文拆字 AND,括号表达式后跟词需显式 AND(FTS5 语法限制)
+        // 中英文混合:中文拆字 AND,词之间显式 AND
         assert_eq!(
             super::tokenize_query_for_match("飞书 Webhook"),
             "(飞 AND 书) AND Webhook"
@@ -902,11 +935,25 @@ mod tests {
             super::tokenize_query_for_match("\"配置飞书\""),
             "\"配 置 飞 书\""
         );
-        // 布尔运算符保留
+        // 布尔运算符保留(operator 之间仍为空格)
         assert_eq!(
             super::tokenize_query_for_match("飞书 OR feishu"),
             "(飞 AND 书) OR feishu"
         );
+        // 含 `-` 的词(EPIC-017 / n-4)转字面短语,避免被 FTS5 解析为
+        // NOT 运算符导致 `no such column: 017`(会话实测失败场景)
+        assert_eq!(
+            super::tokenize_query_for_match("EPIC-017 背驰 恢复"),
+            "\"EPIC-017\" AND (背 AND 驰) AND (恢 AND 复)"
+        );
+        assert_eq!(super::tokenize_query_for_match("n-4"), "\"n-4\"");
+        // 纯数字 token 转字面短语,避免 `no such column` 列名解析
+        assert_eq!(
+            super::tokenize_query_for_match("1786293120900"),
+            "\"1786293120900\""
+        );
+        // CJK 与 ASCII 混合 token:片段间显式 AND,避免 `(规 AND 则)4` 粘连语法错误
+        assert_eq!(super::tokenize_query_for_match("规则4"), "(规 AND 则) AND 4");
         // 索引切分:连续汉字间插空格,英文不受影响
         assert_eq!(
             super::tokenize_content_for_index("如何配置飞书 Feishu"),
