@@ -18,7 +18,7 @@ use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace_with_roots,
     execute_bash, glob_search_in_workspace_with_roots, grep_search_in_workspace_with_roots,
     load_system_prompt,
-    lsp_client::LspRegistry,
+    lsp_client::{LspDiagnostic, LspRegistry},
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_in_workspace_with_roots, replace_lines_in_workspace_with_roots,
@@ -1668,7 +1668,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "LSP",
-            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics, definition, hover, format, completion).",
+            description: "Query Language Server Protocol for code intelligence. USE THIS PROACTIVELY: after editing or reading source code (.rs/.ts/.tsx/.js/.jsx/.py/.go/.java/.c/.h/.cpp/.rb/.lua), call action='diagnostics' for that file to catch compile errors and static issues early. If the result reports the LSP server is 'not in PATH', it includes the exact install command — run it via bash (ask the user first if unsure) and retry, instead of skipping. Also supports hover, definition, references, completion, symbols, format.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2991,6 +2991,134 @@ fn run_read_file(input: ReadFileInput, extra_roots: Option<&[PathBuf]>) -> Resul
     )
 }
 
+/// 文件扩展名 → LSP 语言标识（与 `LspRegistry::dispatch` 的语言映射保持一致）。
+fn lsp_language_for_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "rs" => Some("rust"),
+        "ts" | "tsx" => Some("typescript"),
+        "js" | "jsx" => Some("javascript"),
+        "py" => Some("python"),
+        "go" => Some("go"),
+        "java" => Some("java"),
+        "c" | "h" => Some("c"),
+        "cpp" | "hpp" | "cc" => Some("cpp"),
+        "rb" => Some("ruby"),
+        "lua" => Some("lua"),
+        _ => None,
+    }
+}
+
+/// 编辑文件后自动拉取 LSP 诊断兜底（非侵入式）。
+///
+/// 只读取 registry 中已缓存的 publishDiagnostics —— 不 spawn server、
+/// 不阻塞、不提示安装。当前会话已通过 LSP 工具分析过该文件时，
+/// 把缓存诊断附在编辑结果后；否则静默跳过（对应目标：AI 主动调用
+/// LSP 工具负责启用/安装 server，此处仅作第二道防线）。
+fn run_lsp_diagnostics_for_file(file_path: &Path) -> Option<String> {
+    let ext = file_path.extension()?.to_str()?.to_ascii_lowercase();
+    // 非代码文件直接跳过，避免无谓的 registry 加锁。
+    lsp_language_for_extension(&ext)?;
+    let registry = global_lsp_registry();
+    let path = file_path.to_string_lossy();
+    let diags = registry.get_diagnostics(&path);
+    if diags.is_empty() {
+        return None;
+    }
+    Some(format_lsp_diagnostics(file_path, &diags))
+}
+
+/// 将 LSP 诊断格式化为 AI 可读的文本块（1-based 行号）。
+fn format_lsp_diagnostics(file_path: &Path, diags: &[LspDiagnostic]) -> String {
+    let mut lines = vec![format!(
+        "[lsp] {} issue(s) in {} (cached):",
+        diags.len(),
+        file_path.display()
+    )];
+    for d in diags.iter().take(20) {
+        lines.push(format!(
+            "  {}:{} [{}] {}",
+            d.line + 1,
+            d.character,
+            d.severity,
+            d.message
+        ));
+    }
+    if diags.len() > 20 {
+        lines.push(format!("  ... and {} more", diags.len() - 20));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod lsp_auto_diagnostics_tests {
+    use super::{format_lsp_diagnostics, lsp_language_for_extension, run_lsp_diagnostics_for_file};
+    use runtime::lsp_client::LspDiagnostic;
+    use std::path::Path;
+
+    #[test]
+    fn maps_code_extensions_to_languages() {
+        assert_eq!(lsp_language_for_extension("rs"), Some("rust"));
+        assert_eq!(lsp_language_for_extension("tsx"), Some("typescript"));
+        assert_eq!(lsp_language_for_extension("py"), Some("python"));
+        assert_eq!(lsp_language_for_extension("md"), None);
+        assert_eq!(lsp_language_for_extension("json"), None);
+        assert_eq!(lsp_language_for_extension(""), None);
+    }
+
+    #[test]
+    fn formats_diagnostics_with_1based_lines() {
+        let diags = vec![
+            LspDiagnostic {
+                path: "src/main.rs".into(),
+                line: 4,
+                character: 9,
+                severity: "error".into(),
+                message: "mismatched types".into(),
+                source: Some("rust-analyzer".into()),
+            },
+            LspDiagnostic {
+                path: "src/main.rs".into(),
+                line: 12,
+                character: 1,
+                severity: "warning".into(),
+                message: "unused variable".into(),
+                source: None,
+            },
+        ];
+        let out = format_lsp_diagnostics(Path::new("src/main.rs"), &diags);
+        assert!(out.contains("2 issue(s) in src/main.rs"));
+        assert!(out.contains("  5:9 [error] mismatched types"));
+        assert!(out.contains("  13:1 [warning] unused variable"));
+    }
+
+    #[test]
+    fn truncates_long_diagnostics_lists() {
+        let diags: Vec<LspDiagnostic> = (0..25)
+            .map(|i| LspDiagnostic {
+                path: "a.rs".into(),
+                line: i,
+                character: 0,
+                severity: "error".into(),
+                message: format!("issue {i}"),
+                source: None,
+            })
+            .collect();
+        let out = format_lsp_diagnostics(Path::new("a.rs"), &diags);
+        assert!(out.contains("25 issue(s)"));
+        assert!(out.contains("... and 5 more"));
+    }
+
+    #[test]
+    fn skips_silently_for_unsupported_or_unanalyzed_files() {
+        // 非代码文件：直接跳过，不触碰 registry。
+        assert!(run_lsp_diagnostics_for_file(Path::new("README.md")).is_none());
+        // 代码文件但 registry 无该路径的缓存诊断：静默跳过（不 spawn、不提示安装）。
+        assert!(
+            run_lsp_diagnostics_for_file(Path::new("unique_unanalyzed_file.rs")).is_none()
+        );
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(
     input: WriteFileInput,
@@ -3004,6 +3132,10 @@ fn run_write_file(
     if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
         output.push_str("\n\n--- cargo check ---\n");
         output.push_str(&check_output);
+    }
+    if let Some(lsp_output) = run_lsp_diagnostics_for_file(Path::new(&result.file_path)) {
+        output.push_str("\n\n--- LSP diagnostics ---\n");
+        output.push_str(&lsp_output);
     }
     Ok(output)
 }
@@ -3025,6 +3157,10 @@ fn run_edit_file(input: EditFileInput, extra_roots: Option<&[PathBuf]>) -> Resul
     if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
         output.push_str("\n\n--- cargo check ---\n");
         output.push_str(&check_output);
+    }
+    if let Some(lsp_output) = run_lsp_diagnostics_for_file(Path::new(&result.file_path)) {
+        output.push_str("\n\n--- LSP diagnostics ---\n");
+        output.push_str(&lsp_output);
     }
     Ok(output)
 }
@@ -3049,6 +3185,10 @@ fn run_replace_lines(
     if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
         output.push_str("\n\n--- cargo check ---\n");
         output.push_str(&check_output);
+    }
+    if let Some(lsp_output) = run_lsp_diagnostics_for_file(Path::new(&result.file_path)) {
+        output.push_str("\n\n--- LSP diagnostics ---\n");
+        output.push_str(&lsp_output);
     }
     Ok(output)
 }
