@@ -1,4 +1,13 @@
-﻿# Local OpenAI-compatible providers and skills setup
+# Local OpenAI-compatible providers and skills setup
+
+> **实现现状（2026-08-09，design-gaps #8 对齐）**：当前 `rust/crates/api/src/providers/mod.rs`
+> 的 provider 路由为 **DeepSeek 专有** —— `metadata_for_model` 仅识别 `deepseek*` 模型，
+> `detect_provider_kind` 无条件返回 `ProviderKind::DeepSeek`，认证环境变量为
+> `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL`。**`OPENAI_BASE_URL` 尚未被代码读取**，
+> 文档中所有针对 Ollama / llama.cpp / vLLM 的示例目前会失败。
+>
+> 若需恢复本地 OpenAI-compatible 模型调试，需先实现通用 `OPENAI_BASE_URL` 分支
+> （`ProviderKind::OpenAiCompat` 变体 + 模型前缀路由），属待办项。
 
 This guide covers two common offline/local workflows:
 
@@ -11,15 +20,18 @@ Claw Plus is a Claude-Code-shaped workflow/runtime, not a Claude-only product. I
 
 If you need the most polished daily-driver experience for a specific non-Claude model today, compare that provider’s native tools. If you need runtime/provider hackability, Claw’s OpenAI-compatible route is the intended extension path.
 
-## OpenAI-compatible routing basics
+## OpenAI-compatible routing basics (DeepSeek 当前实现)
 
-Set `OPENAI_BASE_URL` to the server’s `/v1` endpoint and set `OPENAI_API_KEY` to either the required token or a harmless placeholder for local servers that expect an Authorization header. The model name must match what the server exposes.
+Set `DEEPSEEK_BASE_URL` to the server’s `/v1` endpoint and set `DEEPSEEK_API_KEY` to either the required token or a harmless placeholder for local servers that expect an Authorization header. The model name must match what the server exposes.
 
 ```bash
-export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
-export OPENAI_API_KEY="local-dev-token"
-claw --model "qwen3:latest" prompt "Reply exactly HELLO_WORLD_123"
+export DEEPSEEK_BASE_URL="https://api.deepseek.com/v1"
+export DEEPSEEK_API_KEY="your-key"
+claw --model "deepseek-v4-flash" prompt "Reply exactly HELLO_WORLD_123"
 ```
+
+> 本地 OpenAI-compatible 服务（Ollama / llama.cpp / vLLM）需等待通用 `OPENAI_BASE_URL`
+> 分支恢复后才可使用（见文首现状说明）。以下各本地示例保留供恢复后参考。
 
 Routing notes:
 

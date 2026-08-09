@@ -35,8 +35,8 @@
 |---|---|---|
 | 5 | **TRAE 对齐 Epic 1 剩余**：`SubagentContext.tool_summaries` 生产路径留空（`runtime/src/conversation.rs:3916` 注释"暂留空"） | 子智能体 system prompt 的 `## Available Tools` 层当前**真空**，注满后：① 子 agent 清楚自己有哪些工具可用，不再试错调用被拒；② L2 工具层进静态前缀，复用缓存断点，不损命中率 |
 | 6 | **ACP/IDE 应用层 5 项**：`fs/read_text_file`、`fs/write_text_file`、`session/request_permission`、LaneEvent→SessionNotification 桥接、VS Code 扩展（`claw-shell/src/agent.rs` 这些方法为 stub） | ① **IDE 闭环**：claw 作为 ACP server 可读编辑器缓冲区、请求用户权限，VS Code 扩展让 AI 直接编辑当前打开文件；② 桥接后 IDE 端实时感知 lane 进度；③ 这是文档承诺的"IDE 原生体验"，补齐后 claw 不再是纯终端工具 |
-| 7 | **hooks 的 Stop/PostCustomToolCall 集成点缺失**（hooks.rs 有方法但 conversation.rs 未接入） | 会话停止、自定义工具调用完成时 hook 静默失效。接入后：监控/审计类 hook 覆盖完整事件面，合规场景才可用 |
-| 8 | **local-openai-providers 文档漂移**：文档写 `OPENAI_BASE_URL`，代码已改为 `DEEPSEEK_*` 专有（`api/src/providers/mod.rs:162-164` 无条件 DeepSeek 路由） | 文档-代码对齐后：① 用户不再按过时文档配置导致失败；② 若需支持 Ollama/OpenRouter 等，可恢复通用 OPENAI_BASE_URL 分支，**解锁本地模型调试场景**（离线/低成本开发） |
+| 7 | ✅ **hooks 的 Stop/PostCustomToolCall 集成点**（~~hooks.rs 有方法但 conversation.rs 未接入~~）。**已完成**：核查确认 Stop（turn 完成）与 SubagentStop 早已接入；PostCustomToolCall 已接入（commit `17a9598e`），仅对经 ToolExecutor 执行的外部自定义工具触发，payload 携带真实 tool_name + output | 会话停止、自定义工具调用完成时 hook 静默失效。接入后：监控/审计类 hook 覆盖完整事件面，合规场景才可用 |
+| 8 | ✅ **local-openai-providers 文档漂移**：~~文档写 `OPENAI_BASE_URL`，代码已改为 `DEEPSEEK_*` 专有~~（`api/src/providers/mod.rs:162-164` 无条件 DeepSeek 路由）。**已完成**：文档对齐实现现状 —— 文首标注 provider 路由为 DeepSeek 专有、routing 示例改用 `DEEPSEEK_BASE_URL`、本地模型示例标注"待通用 `OPENAI_BASE_URL` 分支恢复" | ① 用户不再按过时文档配置导致失败；② 若需支持 Ollama/OpenRouter 等，可恢复通用 OPENAI_BASE_URL 分支，**解锁本地模型调试场景**（离线/低成本开发） |
 
 ---
 
