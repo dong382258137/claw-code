@@ -1114,7 +1114,18 @@ fn get_context_recovery_section() -> String {
      Summarized tool results show a `recall_full` hint with the `tool_use_id` — \
      call that tool to retrieve the full original output. Use `session_search` to \
      search across all conversation history (including compacted messages) for past \
-     discussions or decisions that may have been summarized away."
+     discussions or decisions that may have been summarized away.\n\
+     \n\
+     ### 何时使用历史检索(决策边界)\n\
+     - DO search history when the task depends on past decisions, earlier \
+     conventions, or prior work in this repo (e.g. \"之前怎么修的\", \"上次的结论\").\n\
+     - SKIP history for self-contained requests that need no prior context: \
+     trivial formatting, simple translation, one-line commands, current \
+     date/time questions.\n\
+     - Keep the lookup light: at most a couple of targeted `session_search` \
+     /`search_past_decisions` calls. If the first query finds nothing relevant, \
+     stop and proceed — do not keep re-querying with variants.\n\
+     - When a memory conflicts with actual file contents, trust the files."
         .to_string()
 }
 
@@ -1351,6 +1362,16 @@ fn get_worker_lifecycle_section() -> String {
 fn get_tool_usage_guidance_section() -> String {
     "## Tool Usage Guidance (工具使用引导)\n\
      \n\
+     ### 用途 → 工具映射(Use the dedicated tool, never the bash workaround)\n\
+     | Purpose | Use | Never use |\n\
+     | --- | --- | --- |\n\
+     | Read a file | `read_file` | bash `cat`/`head`/`tail`/`sed -n` |\n\
+     | Find files by name | `glob_search` | bash `find`/`dir` |\n\
+     | Search file contents | `grep_search` | bash `grep`/`rg`/`findstr` |\n\
+     | Edit a file | `edit_file`/`replace_lines`/`write_file` | bash `sed -i`/`python -c` |\n\
+     | External info / API docs | `WebSearch`/`WebFetch` | guessing from memory |\n\
+     | Find a suitable tool | `ToolSearch` | bash workarounds |\n\
+     \n\
      ### Web 搜索优先\n\
      When the task involves external dependencies, API docs, version changes, \
      unknown error codes, or unfamiliar technologies, call `WebSearch` FIRST \
@@ -1373,13 +1394,6 @@ fn get_tool_usage_guidance_section() -> String {
      After creating a task with `TaskCreate`, call `TaskUpdate` to keep its \
      status in sync as work progresses (e.g. running → completed/cancelled), \
      so task progress stays trackable.\n\
-     \n\
-     ### 文件搜索优先\n\
-     Search file contents with `grep_search` and find files by name with \
-     `glob_search` — NOT with bash `grep`/`find`. The dedicated tools return \
-     structured results (match counts, file paths, line numbers), respect \
-     permission tiers, and cost fewer output tokens. Reserve bash for commands \
-     with side effects (running tests, git, starting servers) or pipelines.\n\
      \n\
      ### 编辑前先精确读取\n\
      Before calling `edit_file` or `replace_lines`, first `read_file` the \

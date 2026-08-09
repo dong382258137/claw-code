@@ -894,7 +894,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace. Use 'offset' and 'limit' (especially handy for long files), but it's recommended to read the whole file by not providing these parameters.",
+            description: "Read a text file from the workspace. ALWAYS use this tool to read files — NEVER use bash `cat`/`head`/`tail`/`sed -n` for file reading. Use 'offset' and 'limit' (especially handy for long files), but it's recommended to read the whole file by not providing these parameters.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -958,7 +958,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
-            description: "Find files by glob pattern.",
+            description: "Find files by glob pattern. ALWAYS use this tool to locate files by name — NEVER use bash `find`/`dir` for filename search.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -974,7 +974,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "grep_search",
             description:
-                "Search file contents with a regex pattern. IMPORTANT: 'glob' is REQUIRED to avoid searching large binary files. Always specify a file extension pattern like '*.rs', '*.ts', '*.py'. For broad searches, use `output_mode: \"files_with_matches\"` first to gauge scope, then narrow with `head_limit` and line-number output (`\"-n\": true`). Avoid `-C` (or `context`) with high values on broad searches; prefer targeted `-A`/`-B` or re-read the matched file directly.",
+                "Search file contents with a regex pattern. ALWAYS use this tool for content search — NEVER invoke bash `grep`/`findstr`/`rg`. IMPORTANT: 'glob' is REQUIRED to avoid searching large binary files. Always specify a file extension pattern like '*.rs', '*.ts', '*.py'. For broad searches, use `output_mode: \"files_with_matches\"` first to gauge scope, then narrow with `head_limit` and line-number output (`\"-n\": true`). Avoid `-C` (or `context`) with high values on broad searches; prefer targeted `-A`/`-B` or re-read the matched file directly.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1299,7 +1299,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "AskUserQuestion",
-            description: "Ask the user a question and wait for their response.",
+            description: "Ask the user a question and wait for their response. Use when you need clarification, want to validate assumptions, or must choose a direction the user should decide. When the user explicitly invites discussion (\"discuss\", \"decide together\", \"你觉得呢\") and the request has not converged, use this tool to structure the discussion into clear options. The user can always pick \"Other\" — options are suggestions, not a closed set. Put your recommended option first with \"(Recommended)\".",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1603,7 +1603,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "CronCreate",
-            description: "Create a scheduled recurring task.",
+            description: "Create a scheduled recurring task. Use ONLY when the user explicitly asks for a recurring or scheduled execution (\"every morning\", \"daily\", \"weekly\"). Do NOT proactively convert one-off requests into scheduled tasks — execute one-off tasks in the current session.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -5408,6 +5408,24 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
     prompt.push(format!(
         "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
+    if subagent_type == "Explore" {
+        // 借鉴 Trae search 子智能体策略:搜索 agent 是快速 agent,追求吞吐与低 token 浪费。
+        prompt.push(
+            "You are a fast file-search agent. Optimize for speed and low output cost.\n\
+             - DEFAULT TO PARALLEL: before making tool calls, think about what information you need to \
+             fully answer the question, then issue ALL of those searches together instead of waiting for \
+             each result before planning the next. Sequential calls ONLY when one result genuinely \
+             determines the next call. Parallel execution is 3-5x faster.\n\
+             - Use absolute file paths only (your working directory is reset between tool calls).\n\
+             - Use read_file/glob_search/grep_search for codebase work — never bash grep/find/cat.\n\
+             - In your final report, share absolute paths of relevant files. Include code snippets ONLY \
+             when the exact text is load-bearing (a bug, a function signature); do not recap code you \
+             merely read.\n\
+             - Begin your report by stating the search was comprehensive, so the caller avoids \
+             redundant follow-up searches."
+            .to_string(),
+        );
+    }
     Ok(prompt)
 }
 
