@@ -437,6 +437,8 @@ impl SystemPromptBuilder {
         sections.push(get_agent_subagent_types_section());
         // P1: Worker 生命周期（9 步状态机）
         sections.push(get_worker_lifecycle_section());
+        // 工具使用引导（WebSearch 优先 / 知识新鲜度 / ToolSearch / TaskUpdate）
+        sections.push(get_tool_usage_guidance_section());
         if let Some(memory) = &self.persistent_memory {
             sections.push(render_persistent_memory_section(memory));
         }
@@ -1335,6 +1337,44 @@ fn get_worker_lifecycle_section() -> String {
      (async with polling) instead."
         .to_string()
 }
+
+/// 工具使用引导段（Tool Usage Guidance）。
+///
+/// 解决"工具已实现但 AI 从不调用"的缺口（docs/2026-08-09-design-gaps-benefit-list.md
+/// §工具使用缺口）：WebSearch/WebFetch 0 调用、ToolSearch 0 调用、
+/// TaskUpdate 0 调用。与 Decision Experience 段同模式：静态注入 system prompt，
+/// 让 LLM 知道**何时**应该调用这些工具，而非只在 tool description 里被动看到。
+///
+/// 放在 boundary 之前（静态段），session 内字节稳定，不影响 prompt cache。
+/// 注：能力核查确认 `Agent` 输入无 `capability` 参数、CLI 无 `--resume`，
+/// 因此不引导这两处（避免幻影功能）。
+fn get_tool_usage_guidance_section() -> String {
+    "## Tool Usage Guidance (工具使用引导)\n\
+     \n\
+     ### Web 搜索优先\n\
+     When the task involves external dependencies, API docs, version changes, \
+     unknown error codes, or unfamiliar technologies, call `WebSearch` FIRST \
+     before deciding on an approach; use `WebFetch` to read specific pages. \
+     Do not guess external API behavior from memory — that leads to a \
+     \"blind-try + recompile\" loop. For tasks entirely inside this repository \
+     (\"change X in this repo\"), do NOT trigger web research — search the \
+     codebase (grep_search / session_search) instead.\n\
+     \n\
+     ### 知识新鲜度\n\
+     For tasks relying on features or APIs you may not know about, search for \
+     the latest information before answering, to avoid confidently answering \
+     with stale knowledge.\n\
+     \n\
+     ### 工具发现\n\
+     If unsure whether a more suitable tool exists, call `ToolSearch` with a \
+     keyword description before falling back to bash/grep workarounds.\n\
+     \n\
+     ### 任务生命周期\n\
+     After creating a task with `TaskCreate`, call `TaskUpdate` to keep its \
+     status in sync as work progresses (e.g. running → completed/cancelled), \
+     so task progress stays trackable."
+        .to_string()
+}
 /// session even as new entries are written to disk.
 fn render_persistent_memory_section(memory: &PersistentMemory) -> String {
     memory.frozen_render()
@@ -1878,14 +1918,58 @@ mod tests {
         let built = builder.build();
         let split = builder.build_split();
 
-        let built_without_boundary: Vec<String> = built
-            .into_iter()
-            .filter(|s| s != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-            .collect();
+        assert_eq!(
+            split.render().trim(),
+            built
+                .iter()
+                .filter(|s| s.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n\n")
+                .trim()
+        );
+    }
 
-        let mut rejoined = split.static_sections.clone();
-        rejoined.extend(split.dynamic_sections.iter().cloned());
-        assert_eq!(rejoined, built_without_boundary);
+    /// Tool Usage Guidance 段位于静态区（boundary 前），session 内稳定。
+    #[test]
+    fn build_includes_tool_usage_guidance_in_static() {
+        let builder = SystemPromptBuilder::new();
+        let split = builder.build_split();
+        let guidance = split
+            .static_sections
+            .iter()
+            .find(|s| s.contains("## Tool Usage Guidance"))
+            .expect("Tool Usage Guidance section must exist in static region");
+        // 关键引导内容存在：WebSearch 优先
+        assert!(guidance.contains("`WebSearch` FIRST"));
+        // 不引导幻影功能（Agent 输入无 capability 参数）
+        assert!(!guidance.contains("capability"));
+    }
+
+    /// 缓存安全验证：Tool Usage Guidance 段为纯静态文本，
+    /// DynamicValueExtractor 处理后字节不变（无日期/UUID/路径等动态值），
+    /// 不会扰动静态 prompt 缓存前缀。
+    #[test]
+    fn tool_usage_guidance_is_cache_stable() {
+        let builder = SystemPromptBuilder::new();
+        let split = builder.build_split();
+        let guidance = split
+            .static_sections
+            .iter()
+            .find(|s| s.contains("## Tool Usage Guidance"))
+            .expect("section must exist in static region");
+        let mut extractor = crate::cache_alignment::DynamicValueExtractor::new();
+        let processed = extractor.extract_replace(guidance);
+        // 纯静态文本不应被修改（Cow::Borrowed 表示未改动）
+        assert!(
+            matches!(processed, std::borrow::Cow::Borrowed(_)),
+            "guidance section must not contain dynamic values"
+        );
+        assert_eq!(processed.as_ref(), guidance.as_str());
+        assert!(
+            extractor.collect_section().is_empty(),
+            "no dynamic values should be extracted from guidance"
+        );
     }
 
     #[test]
