@@ -1374,10 +1374,12 @@ fn get_tool_usage_guidance_section() -> String {
      | Find a suitable tool | `ToolSearch` | bash workarounds |\n\
      \n\
      ### 代码编辑后 LSP 诊断\n\
-     After editing or reading code files (.py/.rs/.ts/.tsx/.js/.jsx/.go/.java/.c/.h/.cpp/.rb/.lua), call `LSP` with \
+     After EDITING a code file (.py/.rs/.ts/.tsx/.js/.jsx/.go/.java/.c/.h/.cpp/.rb/.lua), always call `LSP` with \
      action='diagnostics' for that file to catch compile errors and static issues early — do NOT rely on running \
      tests to discover syntax errors. If it reports the server is 'not in PATH', install it via the command it \
-     provides (run it with bash) and retry, instead of skipping.\n\
+     provides (run it with bash) and retry, instead of skipping. Reading a file purely to understand its logic does \
+     NOT require diagnostics; only run it when you are about to modify that file, or when that file is a dependency \
+     of the code you are about to edit.\n\
      \n\
      ### Web 搜索优先\n\
      When the task involves external dependencies, API docs, version changes, \
