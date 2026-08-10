@@ -1,11 +1,11 @@
 //! Right-hand sidebar widget for the TUI split layout.
 //!
 //! Displays contextual information alongside the main output area:
-//! - Session metadata (branch, session id, permissions, goal, git status)
+//! - Session metadata (session id, permissions, goal)
 //! - Current-turn skill invocations
 //! - Current-turn tool call history (name + success/error marker)
 //! - Session statistics (message count, success rate, duration)
-//! - Live token usage breakdown (input/output/cache hit/cache miss/cache hit rate)
+//! - Live token usage breakdown (input/output/cache hit/cache miss; 命中率已移到底栏)
 //! - Streaming timer
 //!
 //! All data is read from a shared `StatusBarState` snapshot plus
@@ -78,7 +78,7 @@ pub(crate) fn render_sidebar(
     let mut y = inner.y;
 
     // Section layout (top→bottom):
-    //  Session: 5-6 lines (branch, session, permissions, goal?, git)
+    //  Session: 2-4 lines (session, permissions, goal?)  ← 分支/Git 已移到底栏
     //  Skills:  dynamic (if any skill invocations)
     //  Tools:   dynamic
     //  Stats+Usage: remaining → 2 stat lines + usage details
@@ -103,7 +103,7 @@ pub(crate) fn render_sidebar(
 
     // Tools section: carve remaining space, leaving at least 9 rows for stats+usage
     let remaining = inner.height.saturating_sub(y.saturating_sub(inner.y));
-    let reserve_for_bottom = 12u16; // 10 usage lines + 1 top border + 1 margin
+    let reserve_for_bottom = 11u16; // 9 usage lines (命中率已移底栏) + 1 top border + 1 margin
     let tools_h = remaining.saturating_sub(reserve_for_bottom);
     if tools_h > 0 {
         if let Some(a) = take_section(&mut y, inner, tools_h) {
@@ -123,16 +123,8 @@ pub(crate) fn render_sidebar(
 // ---- session section ----
 
 fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
-    // 思考强度、经济模式、轮次 已移到底栏，此处不再显示。
+    // 分支/Git 工作区状态 已移到底栏，此处不再显示。
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("分支 ", Style::default().fg(Color::DarkGray)),
-            Span::raw(if state.git_branch.is_empty() {
-                "（无）"
-            } else {
-                &state.git_branch
-            }),
-        ]),
         Line::from(vec![
             Span::styled("会话 ", Style::default().fg(Color::DarkGray)),
             Span::raw(&state.session_id),
@@ -148,21 +140,6 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
             Span::raw(&state.goal_badge),
         ]));
     }
-    // Git 工作区状态
-    let (git_label, git_color) = if state.git_status.is_empty() {
-        ("…".to_string(), Color::DarkGray)
-    } else if state.git_status == "clean" {
-        ("clean".to_string(), Color::Green)
-    } else {
-        (state.git_status.clone(), Color::Yellow)
-    };
-    lines.push(Line::from(vec![
-        Span::styled("Git  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            git_label,
-            Style::default().fg(git_color).add_modifier(Modifier::BOLD),
-        ),
-    ]));
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
     paragraph.render(area, buf);
 }
@@ -285,25 +262,10 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
     let turn = &state.turn_usage;
     let cum = &state.cumulative_usage;
 
-    // 缓存统计 (命中= cache_read, 未命中= cache_creation)
+    // 缓存统计 (命中= cache_read, 未命中= cache_creation；命中率已移到底栏)
     let hit_total = (cum.cache_read_input_tokens as u64) + (turn.cache_read_input_tokens as u64);
     let miss_total =
         (cum.cache_creation_input_tokens as u64) + (turn.cache_creation_input_tokens as u64);
-    let cache_sum = hit_total + miss_total;
-    let hit_rate = if cache_sum > 0 {
-        format!("{:.1}%", (hit_total as f64 / cache_sum as f64) * 100.0)
-    } else {
-        "—".to_string()
-    };
-    let hit_rate_color = if cache_sum == 0 {
-        Color::DarkGray
-    } else if hit_total as f64 / cache_sum as f64 >= 0.85 {
-        Color::Green
-    } else if hit_total as f64 / cache_sum as f64 >= 0.60 {
-        Color::Yellow
-    } else {
-        Color::Red
-    };
 
     let timer = if state.streaming {
         format_elapsed_ms(state.turn_elapsed_ms)
@@ -398,15 +360,6 @@ fn render_usage_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) {
         Line::from(vec![
             Span::styled("未命中  ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{} tokens", miss_total)),
-        ]),
-        Line::from(vec![
-            Span::styled("命中率  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                &hit_rate,
-                Style::default()
-                    .fg(hit_rate_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
         ]),
     ];
     let block = Block::default()
@@ -657,6 +610,10 @@ mod tests {
         assert!(
             content.contains("83%"),
             "should show success rate: {content}"
+        );
+        assert!(
+            !content.contains("命中率"),
+            "cache hit rate moved to bottom bar: {content}"
         );
     }
 }
