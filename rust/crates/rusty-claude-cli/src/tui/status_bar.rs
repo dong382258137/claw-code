@@ -77,6 +77,22 @@ impl StatusBarState {
         cumulative + turn
     }
 
+    /// 缓存命中率（0.0~1.0），口径与侧栏原算法一致：
+    /// 命中 = cache_read，未命中 = cache_creation，均为累计 + 当前轮 delta。
+    /// 无缓存数据（命中 + 未命中 = 0）时返回 None，调用方不渲染该段。
+    pub(crate) fn cache_hit_rate(&self) -> Option<f64> {
+        let hit = (self.cumulative_usage.cache_read_input_tokens as u64)
+            + (self.turn_usage.cache_read_input_tokens as u64);
+        let miss = (self.cumulative_usage.cache_creation_input_tokens as u64)
+            + (self.turn_usage.cache_creation_input_tokens as u64);
+        let sum = hit + miss;
+        if sum == 0 {
+            None
+        } else {
+            Some(hit as f64 / sum as f64)
+        }
+    }
+
     /// 上下文窗口实际消耗的 Token 数（不含 output tokens）。
     ///
     /// 与进度条分母 `context_window_tokens` 口径一致：
@@ -209,6 +225,36 @@ impl<'a> Widget for StatusBar<'a> {
             Span::styled(cwd_short, style_dim),
         ]);
 
+        // P2.5: Git 分支 + 工作区状态（从侧栏移到底栏；非 git 仓库时不显示）
+        if !self.state.git_branch.is_empty() {
+            let (git_style, dirty_suffix) = match self.state.git_status.as_str() {
+                // 工作区干净：分支绿色
+                "clean" => (
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                    String::new(),
+                ),
+                // git_status 为空（非 git 目录 / 未获取）：分支灰色
+                "" => (Style::default().fg(Color::DarkGray), String::new()),
+                // 有改动：分支黄色，追加摘要（如 ±3）
+                summary => (
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    format!(" {summary}"),
+                ),
+            };
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled("⎇ ", style_dim),
+                Span::styled(
+                    format!("{}{}", self.state.git_branch, dirty_suffix),
+                    git_style,
+                ),
+            ]);
+        }
+
         // P3: Cost (从侧栏移到底栏)
         // 成本计算与进度条保持一致：累计 + 当前轮 delta。
         // 使用 total_tokens() 确保 streaming 期间也能看到实时成本变化。
@@ -279,6 +325,28 @@ impl<'a> Widget for StatusBar<'a> {
             Span::raw(" "),
             Span::raw(bar),
         ]);
+
+        // P4.5: 缓存命中率（从侧栏移到底栏；无缓存数据时不显示）
+        if let Some(rate) = self.state.cache_hit_rate() {
+            let cache_style = if rate >= 0.85 {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if rate >= 0.60 {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD)
+            };
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled("缓存 ", style_dim),
+                Span::styled(format!("{:.0}%", rate * 100.0), cache_style),
+            ]);
+        }
 
         // P5: Streaming timer
         if self.state.streaming {
@@ -553,5 +621,94 @@ mod tests {
 
         let content: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(content.contains("5s"), "should show elapsed: {content}");
+    }
+
+    #[test]
+    fn status_bar_shows_git_and_cache_sections() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let state = StatusBarState {
+            model: "deepseek-v4-pro".to_string(),
+            cwd: "~/claw".to_string(),
+            git_branch: "main".to_string(),
+            git_status: "±3".to_string(),
+            turn_count: 3,
+            cumulative_usage: TokenUsage {
+                input_tokens: 1_000,
+                output_tokens: 500,
+                cache_creation_input_tokens: 1_000, // miss
+                cache_read_input_tokens: 9_000,     // hit → 90%
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let widget = StatusBar { state: &state };
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let content: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("main"), "branch: {content}");
+        assert!(content.contains("±3"), "git dirty summary: {content}");
+        assert!(content.contains("90%"), "cache rate: {content}");
+    }
+
+    #[test]
+    fn status_bar_hides_git_when_not_in_repo() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let state = StatusBarState {
+            model: "test-model".to_string(),
+            cwd: "~".to_string(),
+            ..Default::default() // git_branch 为空
+        };
+        let widget = StatusBar { state: &state };
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let content: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(!content.contains('⎇'), "no git section: {content}");
+        assert!(!content.contains("main"), "no branch: {content}");
+    }
+
+    #[test]
+    fn status_bar_hides_cache_when_no_cache_usage() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let state = StatusBarState {
+            model: "test-model".to_string(),
+            cwd: "~".to_string(),
+            cumulative_usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let widget = StatusBar { state: &state };
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let content: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(!content.contains("缓存"), "no cache section: {content}");
+    }
+
+    #[test]
+    fn cache_hit_rate_returns_none_without_cache_data() {
+        let state = StatusBarState::default();
+        assert_eq!(state.cache_hit_rate(), None);
+    }
+
+    #[test]
+    fn cache_hit_rate_sums_cumulative_and_turn() {
+        let mut state = StatusBarState::default();
+        state.cumulative_usage.cache_read_input_tokens = 80;
+        state.cumulative_usage.cache_creation_input_tokens = 10;
+        state.turn_usage.cache_read_input_tokens = 10;
+        state.turn_usage.cache_creation_input_tokens = 0;
+        // hit = 90, miss = 10 → 0.90
+        assert!((state.cache_hit_rate().unwrap() - 0.90).abs() < 1e-9);
     }
 }
