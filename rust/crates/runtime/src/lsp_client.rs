@@ -1846,16 +1846,29 @@ fn language_for_extension(ext: &str) -> Option<&'static str> {
 /// 将文件路径规范化为"绝对路径 + 正斜杠",与 [`uri_to_path`] 的输出格式一致。
 ///
 /// 为什么必须统一:LSP 推送(`publishDiagnostics`)的 path 是 file:// URI 反解出的
-/// `D:/...` 格式(正斜杠),而本地查询路径通常是 `D:\...`(反斜杠)或相对路径。
-/// 所有按 path 匹配缓存的入口(诊断过滤 / 推送序号)必须走同一规范化,否则失配。
+/// `D:/...` 格式(正斜杠),而本地查询路径可能是 `D:\...`(反斜杠)、相对路径,
+/// 或编辑工具返回的 Windows verbatim 路径 `\\?\D:\...`。所有按 path 匹配缓存的
+/// 入口(诊断过滤 / 推送序号)必须走同一规范化,否则失配。
+/// - 剥离 Windows verbatim 前缀 `\\?\`(以及 `\\?\UNC\server\share` → `//server/share`);
 /// - 相对路径 → 基于当前工作目录解析为绝对路径;
 /// - 反斜杠 → 正斜杠(与 Windows 下 uri_to_path 输出一致);
 /// - 当前目录不可用时返回 None(调用方静默跳过)。
 fn normalize_lsp_path(path: &str) -> Option<String> {
-    let abs = if std::path::Path::new(path).is_absolute() {
-        path.to_owned()
+    // 剥离 Windows verbatim 扩展长度前缀(`\\?\D:\...` → `D:\...`)。
+    let cleaned = if let Some(rest) = path.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            // `\\?\UNC\server\share` → `//server/share`(UNC 路径,正斜杠)。
+            format!("//{}", unc.replace('\\', "/"))
+        } else {
+            rest.to_owned()
+        }
     } else {
-        std::env::current_dir().ok()?.join(path).display().to_string()
+        path.to_owned()
+    };
+    let abs = if std::path::Path::new(&cleaned).is_absolute() {
+        cleaned
+    } else {
+        std::env::current_dir().ok()?.join(cleaned).display().to_string()
     };
     Some(abs.replace('\\', "/"))
 }
@@ -2586,6 +2599,12 @@ mod tests {
         // 绝对路径的反斜杠 → 正斜杠(与 uri_to_path 输出一致;仅 Windows)。
         #[cfg(windows)]
         assert_eq!(normalize_lsp_path("D:\\a\\b.rs").as_deref(), Some("D:/a/b.rs"));
+        // Windows verbatim 前缀 `\\?\` 剥离(编辑工具返回的 filePath 格式;仅 Windows)。
+        #[cfg(windows)]
+        assert_eq!(
+            normalize_lsp_path(r"\\?\D:\a\b.rs").as_deref(),
+            Some("D:/a/b.rs")
+        );
     }
 
     #[test]
