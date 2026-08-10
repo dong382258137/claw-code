@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Global task registry shared across tool invocations within a session.
-fn global_lsp_registry() -> &'static LspRegistry {
+///
+/// 公开暴露供 CLI 侧(如 repomap 的 LSP 增强)查询 server 状态。
+pub fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
     REGISTRY.get_or_init(LspRegistry::new)
@@ -974,7 +976,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "grep_search",
             description:
-                "Search file contents with a regex pattern. ALWAYS use this tool for content search — NEVER invoke bash `grep`/`findstr`/`rg`. IMPORTANT: 'glob' is REQUIRED to avoid searching large binary files. Always specify a file extension pattern like '*.rs', '*.ts', '*.py'. For broad searches, use `output_mode: \"files_with_matches\"` first to gauge scope, then narrow with `head_limit` and line-number output (`\"-n\": true`). Avoid `-C` (or `context`) with high values on broad searches; prefer targeted `-A`/`-B` or re-read the matched file directly.",
+                "Search file contents with a regex pattern. ALWAYS use this tool for content search — NEVER invoke bash `grep`/`findstr`/`rg`. A single call replaces bash pipelines like `grep -n 'A|B' file | head -30`: combine multiple patterns into one regex (`A|B`) and use `-n`, `-A`/`-B`/`context`, `head_limit`, `offset` in the same call. IMPORTANT: 'glob' is REQUIRED to avoid searching large binary files. Always specify a file extension pattern like '*.rs', '*.ts', '*.py'. For broad searches, use `output_mode: \"files_with_matches\"` first to gauge scope, then narrow with `head_limit` and line-number output (`\"-n\": true`). Avoid `-C` (or `context`) with high values on broad searches; prefer targeted `-A`/`-B` or re-read the matched file directly.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

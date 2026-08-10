@@ -1368,9 +1368,16 @@ fn get_tool_usage_guidance_section() -> String {
      | Read a file | `read_file` | bash `cat`/`head`/`tail`/`sed -n` |\n\
      | Find files by name | `glob_search` | bash `find`/`dir` |\n\
      | Search file contents | `grep_search` | bash `grep`/`rg`/`findstr` |\n\
+     | grep + 截断/上下文 | `grep_search` (`-n`/`-A`/`-B`/`head_limit`) | bash `grep | head` 管道 |\n\
      | Edit a file | `edit_file`/`replace_lines`/`write_file` | bash `sed -i`/`python -c` |\n\
      | External info / API docs | `WebSearch`/`WebFetch` | guessing from memory |\n\
      | Find a suitable tool | `ToolSearch` | bash workarounds |\n\
+     \n\
+     ### 代码编辑后 LSP 诊断\n\
+     After editing or reading code files (.py/.rs/.ts/.tsx/.js/.jsx/.go/.java/.c/.h/.cpp/.rb/.lua), call `LSP` with \
+     action='diagnostics' for that file to catch compile errors and static issues early — do NOT rely on running \
+     tests to discover syntax errors. If it reports the server is 'not in PATH', install it via the command it \
+     provides (run it with bash) and retry, instead of skipping.\n\
      \n\
      ### Web 搜索优先\n\
      When the task involves external dependencies, API docs, version changes, \
