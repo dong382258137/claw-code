@@ -543,6 +543,10 @@ impl LspRegistry {
     }
 
     /// Add diagnostics to a server.
+    ///
+    /// 每条 diagnostic 的 path 经 [`normalize_lsp_path`] 统一为规范化格式
+    /// (绝对路径 + 正斜杠),与 `get_diagnostics` 的查询规范化保持一致,
+    /// 避免缓存 path 与查询 path 因反斜杠/相对路径失配。
     pub fn add_diagnostics(
         &self,
         language: &str,
@@ -553,18 +557,34 @@ impl LspRegistry {
             .servers
             .get_mut(language)
             .ok_or_else(|| format!("LSP server not found for language: {language}"))?;
-        server.diagnostics.extend(diagnostics);
+        let normalized: Vec<LspDiagnostic> = diagnostics
+            .into_iter()
+            .map(|mut d| {
+                if let Some(path) = normalize_lsp_path(&d.path) {
+                    d.path = path;
+                }
+                d
+            })
+            .collect();
+        server.diagnostics.extend(normalized);
         Ok(())
     }
 
     /// Get diagnostics for a specific file path.
+    ///
+    /// 查询 path 会先经 [`normalize_lsp_path`] 规范化(绝对路径 + 正斜杠),
+    /// 与 `publishDiagnostics` 推送缓存中的 path(`uri_to_path` 输出的 `D:/...`
+    /// 格式)保持一致,避免反斜杠/正斜杠导致的失配。
     pub fn get_diagnostics(&self, path: &str) -> Vec<LspDiagnostic> {
+        let Some(normalized) = normalize_lsp_path(path) else {
+            return Vec::new();
+        };
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
         inner
             .servers
             .values()
             .flat_map(|s| &s.diagnostics)
-            .filter(|d| d.path == path)
+            .filter(|d| d.path == normalized)
             .cloned()
             .collect()
     }
@@ -626,16 +646,8 @@ impl LspRegistry {
         // 路径规范化:绝对路径 + 正斜杠,与 `uri_to_path` 的输出格式一致
         // (publishDiagnostics 推送的 path 是 file:// URI 反解出的 `D:/...` 格式;
         //  不统一则 last_push_version / get_diagnostics 全部查不到,链路永远超时)。
-        let normalized_path = {
-            let abs = if std::path::Path::new(path).is_absolute() {
-                path.to_owned()
-            } else {
-                let Ok(cwd) = std::env::current_dir() else {
-                    return LspAutoDiagOutcome::Skip;
-                };
-                cwd.join(path).display().to_string()
-            };
-            abs.replace('\\', "/")
+        let Some(normalized_path) = normalize_lsp_path(path) else {
+            return LspAutoDiagOutcome::Skip;
         };
 
         // 确保 server 已注册并 spawn(未就绪则 auto-start,含安装提示)。
@@ -692,12 +704,18 @@ impl LspRegistry {
     }
 
     /// 该文件最近一次 publishDiagnostics 推送对应的全局序号(0 = 从未推送)。
+    ///
+    /// path 经 [`normalize_lsp_path`] 规范化,与 reader 线程 `record_push`
+    /// 记录的 key(uri_to_path 正斜杠格式)保持一致。
     fn last_push_version(&self, path: &str) -> u64 {
+        let Some(normalized) = normalize_lsp_path(path) else {
+            return 0;
+        };
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
         inner
             .last_push_versions
             .lock()
-            .map(|v| v.get(path).copied().unwrap_or(0))
+            .map(|v| v.get(&normalized).copied().unwrap_or(0))
             .unwrap_or(0)
     }
 
@@ -1802,6 +1820,23 @@ fn language_for_extension(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// 将文件路径规范化为"绝对路径 + 正斜杠",与 [`uri_to_path`] 的输出格式一致。
+///
+/// 为什么必须统一:LSP 推送(`publishDiagnostics`)的 path 是 file:// URI 反解出的
+/// `D:/...` 格式(正斜杠),而本地查询路径通常是 `D:\...`(反斜杠)或相对路径。
+/// 所有按 path 匹配缓存的入口(诊断过滤 / 推送序号)必须走同一规范化,否则失配。
+/// - 相对路径 → 基于当前工作目录解析为绝对路径;
+/// - 反斜杠 → 正斜杠(与 Windows 下 uri_to_path 输出一致);
+/// - 当前目录不可用时返回 None(调用方静默跳过)。
+fn normalize_lsp_path(path: &str) -> Option<String> {
+    let abs = if std::path::Path::new(path).is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir().ok()?.join(path).display().to_string()
+    };
+    Some(abs.replace('\\', "/"))
+}
+
 /// severity 映射:1=error, 2=warning, 3=info, 4=hint
 fn parse_publish_diagnostics(msg: &serde_json::Value) -> Vec<LspDiagnostic> {
     let uri = msg
@@ -2480,16 +2515,20 @@ mod tests {
     #[test]
     fn record_push_tracks_per_file_versions() {
         let registry = LspRegistry::new();
+        let base = if cfg!(windows) { "D:/proj" } else { "/proj" };
+        let a = format!("{base}/a.rs");
+        let b = format!("{base}/b.py");
+        let c = format!("{base}/c.go");
         {
             let mut inner = registry.inner.lock().expect("lock");
-            record_push(&mut inner, "a.rs".to_string());
-            record_push(&mut inner, "b.py".to_string());
-            record_push(&mut inner, "a.rs".to_string());
+            record_push(&mut inner, a.clone());
+            record_push(&mut inner, b.clone());
+            record_push(&mut inner, a.clone());
         }
         // 全局序号递增,每文件记录最近一次序号。
-        assert_eq!(registry.last_push_version("a.rs"), 3);
-        assert_eq!(registry.last_push_version("b.py"), 2);
-        assert_eq!(registry.last_push_version("c.go"), 0, "从未推送的文件序号为 0");
+        assert_eq!(registry.last_push_version(&a), 3);
+        assert_eq!(registry.last_push_version(&b), 2);
+        assert_eq!(registry.last_push_version(&c), 0, "从未推送的文件序号为 0");
     }
 
     #[test]
@@ -2513,6 +2552,65 @@ mod tests {
         assert_eq!(language_for_extension("py"), Some("python"));
         assert_eq!(language_for_extension("md"), None);
         assert_eq!(language_for_extension(""), None);
+    }
+
+    #[test]
+    fn normalize_lsp_path_unifies_separators_and_resolves_relative() {
+        // 相对路径 → 基于 cwd 解析为绝对路径,且不再含反斜杠。
+        let rel = normalize_lsp_path("src/x.py").expect("resolvable");
+        assert!(rel.ends_with("src/x.py"));
+        assert!(!rel.contains('\\'), "规范化后不应有反斜杠: {rel}");
+        // 绝对路径的反斜杠 → 正斜杠(与 uri_to_path 输出一致;仅 Windows)。
+        #[cfg(windows)]
+        assert_eq!(normalize_lsp_path("D:\\a\\b.rs").as_deref(), Some("D:/a/b.rs"));
+    }
+
+    #[test]
+    fn get_diagnostics_matches_cached_path_regardless_of_separator() {
+        let registry = LspRegistry::new();
+        registry.register("python", LspServerStatus::Connected, None, vec![]);
+        // 跨平台绝对路径(Windows: D:/..., Unix: /...)。
+        let key = if cfg!(windows) {
+            "D:/proj/src/mod.py"
+        } else {
+            "/proj/src/mod.py"
+        };
+        // 缓存 path 是 uri_to_path 输出格式(正斜杠)。
+        registry
+            .add_diagnostics(
+                "python",
+                vec![LspDiagnostic {
+                    path: key.to_string(),
+                    line: 0,
+                    character: 0,
+                    severity: "error".to_string(),
+                    message: "syntax".to_string(),
+                    source: None,
+                }],
+            )
+            .expect("add");
+        // 正斜杠查询命中。
+        assert_eq!(registry.get_diagnostics(key).len(), 1);
+        // 反斜杠查询同样命中(同类 bug 修复点;仅 Windows)。
+        #[cfg(windows)]
+        assert_eq!(registry.get_diagnostics("D:\\proj\\src\\mod.py").len(), 1);
+        // 无关路径不命中。
+        let other = if cfg!(windows) { "D:/other.py" } else { "/other.py" };
+        assert!(registry.get_diagnostics(other).is_empty());
+    }
+
+    #[test]
+    fn record_push_version_matches_backslash_query() {
+        let registry = LspRegistry::new();
+        let key = if cfg!(windows) { "D:/proj/a.py" } else { "/proj/a.py" };
+        {
+            let mut inner = registry.inner.lock().expect("lock");
+            record_push(&mut inner, key.to_string());
+        }
+        // last_push_version 同样规范化,反斜杠查询可命中(仅 Windows)。
+        #[cfg(windows)]
+        assert_eq!(registry.last_push_version("D:\\proj\\a.py"), 1);
+        assert_eq!(registry.last_push_version(key), 1);
     }
 
     #[test]
