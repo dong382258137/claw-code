@@ -18,7 +18,7 @@ use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace_with_roots,
     execute_bash, glob_search_in_workspace_with_roots, grep_search_in_workspace_with_roots,
     load_system_prompt,
-    lsp_client::{LspDiagnostic, LspRegistry},
+    lsp_client::{LspAutoDiagOutcome, LspDiagnostic, LspRegistry},
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_in_workspace_with_roots, replace_lines_in_workspace_with_roots,
@@ -3010,23 +3010,32 @@ fn lsp_language_for_extension(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// 编辑文件后自动拉取 LSP 诊断兜底（非侵入式）。
+/// 编辑文件后自动拉取 LSP 诊断(主动刷新,非只读缓存)。
 ///
-/// 只读取 registry 中已缓存的 publishDiagnostics —— 不 spawn server、
-/// 不阻塞、不提示安装。当前会话已通过 LSP 工具分析过该文件时，
-/// 把缓存诊断附在编辑结果后；否则静默跳过（对应目标：AI 主动调用
-/// LSP 工具负责启用/安装 server，此处仅作第二道防线）。
+/// 由 `refresh_diagnostics_for_path` 确保 server 就绪 → didOpen/didChange →
+/// 等待 publishDiagnostics 推送。设计见 docs/2026-08-10-auto-lsp-diagnostics-design.md:
+/// - 非代码文件 / 冷却期 / 等待推送超时 → 静默跳过(不阻塞编辑结果);
+/// - auto-start 首次失败 → 附安装提示引导安装;
+/// - 刷新成功但 0 问题 → 不附加(已确认刷新过,避免噪音)。
+/// - `.rs` 维持 cargo check 兜底,不叠加 LSP(避免双重同步等待)。
 fn run_lsp_diagnostics_for_file(file_path: &Path) -> Option<String> {
     let ext = file_path.extension()?.to_str()?.to_ascii_lowercase();
-    // 非代码文件直接跳过，避免无谓的 registry 加锁。
+    // 非代码文件直接跳过,避免无谓的 registry 加锁。
     lsp_language_for_extension(&ext)?;
-    let registry = global_lsp_registry();
-    let path = file_path.to_string_lossy();
-    let diags = registry.get_diagnostics(&path);
-    if diags.is_empty() {
+    // .rs 由 run_cargo_check_for_file 兜底(cargo check),不叠加 LSP 自动刷新。
+    if ext == "rs" {
         return None;
     }
-    Some(format_lsp_diagnostics(file_path, &diags))
+    let registry = global_lsp_registry();
+    let path = file_path.to_string_lossy();
+    match registry.refresh_diagnostics_for_path(&path) {
+        LspAutoDiagOutcome::Refresh(diags) if !diags.is_empty() => {
+            Some(format_lsp_diagnostics(file_path, &diags))
+        }
+        LspAutoDiagOutcome::Refresh(_) => None, // 0 问题:不附加(已确认刷新过)
+        LspAutoDiagOutcome::InstallHint(hint) => Some(hint),
+        LspAutoDiagOutcome::Skip => None,
+    }
 }
 
 /// 将 LSP 诊断格式化为 AI 可读的文本块（1-based 行号）。
@@ -3111,13 +3120,38 @@ mod lsp_auto_diagnostics_tests {
     }
 
     #[test]
-    fn skips_silently_for_unsupported_or_unanalyzed_files() {
-        // 非代码文件：直接跳过，不触碰 registry。
+    fn skips_silently_for_unsupported_or_rust_files() {
+        // 非代码文件:直接跳过,不触碰 registry。
         assert!(run_lsp_diagnostics_for_file(Path::new("README.md")).is_none());
-        // 代码文件但 registry 无该路径的缓存诊断：静默跳过（不 spawn、不提示安装）。
+        // .rs 维持 cargo check 兜底(run_cargo_check_for_file),不叠加 LSP 自动刷新。
+        assert!(run_lsp_diagnostics_for_file(Path::new("src/main.rs")).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires pylsp in PATH; run with --ignored for e2e verification"]
+    fn e2e_auto_diagnostics_attaches_for_syntax_error_py() {
+        // 真实链路验证:含语法错误的 .py 编辑后,自动诊断应返回诊断块。
+        // 依赖本机 pylsp 在 PATH(自动 auto-start)。在 target/tmp 下创建,
+        // 避免 %TEMP% 被外部监听。
+        let dir = std::env::current_dir()
+            .expect("cwd")
+            .join("target/tmp/lsp-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let py = dir.join("bug.py");
+        // 语法错误:冒号后缺参数体(缩进错误不会让 pyflakes 报语法错,用括号不匹配)。
+        std::fs::write(&py, "def f(:\n    return 1\n").expect("write");
+        let out = run_lsp_diagnostics_for_file(&py);
         assert!(
-            run_lsp_diagnostics_for_file(Path::new("unique_unanalyzed_file.rs")).is_none()
+            out.is_some(),
+            "编辑含语法错误的 .py 应返回诊断块(auto-start pylsp 并等待推送)"
         );
+        let text = out.unwrap();
+        assert!(
+            text.contains("issue(s)"),
+            "诊断块应包含问题数,got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

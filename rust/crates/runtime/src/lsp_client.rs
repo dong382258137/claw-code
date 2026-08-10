@@ -4,13 +4,11 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
-use std::time::Duration;
-// SP4.2 修复:HashSet 用于 opened_files
-use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +40,7 @@ impl LspAction {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LspDiagnostic {
     pub path: String,
     pub line: u32,
@@ -133,6 +131,16 @@ struct RegistryInner {
     /// 默认工作区根路径,供 auto-start 时使用。
     /// 由 init_lsp_from_config 在启动时设置(即使 lspServers 为空也会设置)。
     default_root_path: Option<String>,
+    /// publishDiagnostics 推送序号(全局递增)。reader 线程每处理一次推送递增。
+    /// 配合 [`last_push_versions`],用于"编辑后自动诊断"检测某文件的新推送是否已到达。
+    push_counter: Arc<AtomicU64>,
+    /// path → 该文件最近一次 publishDiagnostics 推送对应的 `push_counter` 序号。
+    /// 解决空诊断歧义:publishDiagnostics 为空数组时缓存被清空,无法从缓存内容
+    /// 区分"已推送 0 错误"与"尚未推送",序号越过基线才是可靠信号。
+    last_push_versions: Mutex<HashMap<String, u64>>,
+    /// 语言级 auto-start 冷却:auto-start 失败后,该语言在冷却期内不再尝试。
+    /// 避免 server 缺失时每次编辑都重复 spawn + 弹安装提示(刷屏)。
+    auto_start_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl std::fmt::Debug for RegistryInner {
@@ -146,6 +154,26 @@ impl std::fmt::Debug for RegistryInner {
             .finish()
     }
 }
+
+/// "编辑后自动诊断"的刷新结果。
+///
+/// 由 [`LspRegistry::refresh_diagnostics_for_path`] 返回,调用方(tools crate
+/// 编辑工具)按结果决定是否把诊断附加到工具结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LspAutoDiagOutcome {
+    /// 刷新成功,返回该文件最新诊断(空 Vec = 0 问题,表示已确认刷新过)。
+    Refresh(Vec<LspDiagnostic>),
+    /// auto-start 首次失败,携带安装提示(应附到工具结果,引导安装 server)。
+    InstallHint(String),
+    /// 静默跳过:语言不支持 / 冷却期 / 服务器不可用 / 等待推送超时。
+    Skip,
+}
+
+/// 编辑后自动诊断等待 server 推送 `publishDiagnostics` 的超时上限。
+const LSP_AUTO_DIAG_TIMEOUT_MS: u64 = 2500;
+
+/// 语言级 auto-start 失败后的冷却时长。
+const LSP_AUTO_START_COOLDOWN_MS: u64 = 60_000;
 
 impl LspRegistry {
     #[must_use]
@@ -456,6 +484,29 @@ impl LspRegistry {
         Ok(parse_document_symbols_typed(&response, path))
     }
 
+    /// 获取符号在跨文件中的引用位置(精确语义解析,Step 4.3)。
+    ///
+    /// 通过 `textDocument/references` 请求 LSP server,
+    /// 并用 [`parse_references`] 解析响应为 `Vec<LspLocation>`。
+    ///
+    /// # 与 repomap 协同
+    /// 返回值用于 [`crate::repomap::RepoMap::refresh_lsp_references`]:
+    /// 统计"定义符号被其他文件引用"的次数,替代 regex 子串匹配的跨模块定位。
+    ///
+    /// # 参数
+    /// - `path`:定义符号所在文件路径
+    /// - `line`:定义符号的行号(0-based,来自 LspSymbol.line)
+    /// - `character`:定义符号的列号(0-based,来自 LspSymbol.character)
+    pub fn get_references(
+        &self,
+        path: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspLocation>, String> {
+        let response = self.dispatch("references", Some(path), Some(line), Some(character), None)?;
+        Ok(parse_references(&response))
+    }
+
     pub fn get(&self, language: &str) -> Option<LspServerState> {
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
         inner.servers.get(language).cloned()
@@ -544,6 +595,133 @@ impl LspRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// 编辑后自动诊断:确保 server 就绪 → didOpen/didChange → 等待推送。
+    ///
+    /// 设计见 `docs/2026-08-10-auto-lsp-diagnostics-design.md`。核心策略:
+    /// - 语言不支持 / 冷却期 / 等待推送超时 → [`LspAutoDiagOutcome::Skip`](静默,
+    ///   不阻塞编辑结果);
+    /// - auto-start 首次失败 → [`LspAutoDiagOutcome::InstallHint`](引导安装),
+    ///   随后进入语言级冷却,冷却期内不再尝试;
+    /// - 刷新成功(推送序号越过基线) → [`LspAutoDiagOutcome::Refresh`](诊断,
+    ///   空 Vec = 0 问题,表示已确认刷新过)。
+    pub fn refresh_diagnostics_for_path(&self, path: &str) -> LspAutoDiagOutcome {
+        let Some(ext) = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+        else {
+            return LspAutoDiagOutcome::Skip;
+        };
+        let Some(language) = language_for_extension(&ext) else {
+            return LspAutoDiagOutcome::Skip;
+        };
+
+        // 冷却检查:auto-start 失败后 60s 内不再尝试(避免 server 缺失时刷屏)。
+        if self.is_auto_start_cooldown(language) {
+            return LspAutoDiagOutcome::Skip;
+        }
+
+        // 路径规范化:绝对路径 + 正斜杠,与 `uri_to_path` 的输出格式一致
+        // (publishDiagnostics 推送的 path 是 file:// URI 反解出的 `D:/...` 格式;
+        //  不统一则 last_push_version / get_diagnostics 全部查不到,链路永远超时)。
+        let normalized_path = {
+            let abs = if std::path::Path::new(path).is_absolute() {
+                path.to_owned()
+            } else {
+                let Ok(cwd) = std::env::current_dir() else {
+                    return LspAutoDiagOutcome::Skip;
+                };
+                cwd.join(path).display().to_string()
+            };
+            abs.replace('\\', "/")
+        };
+
+        // 确保 server 已注册并 spawn(未就绪则 auto-start,含安装提示)。
+        let server_ready = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner.servers.contains_key(language)
+                && inner.process_transports.contains_key(language)
+        };
+        if !server_ready {
+            if let Err(err) = self.try_auto_start(language) {
+                // 首次失败:记录冷却;若属 server 缺失类错误,附安装提示引导安装。
+                self.set_auto_start_cooldown(language);
+                if err.contains("not in PATH") || err.contains("failed to spawn") {
+                    return LspAutoDiagOutcome::InstallHint(err);
+                }
+                return LspAutoDiagOutcome::Skip;
+            }
+        }
+
+        // 获取 transport 并触发重新诊断(didOpen 首开 + didChange 增量)。
+        let transport = {
+            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            inner.process_transports.get(language).cloned()
+        };
+        let Some(transport) = transport else {
+            return LspAutoDiagOutcome::Skip;
+        };
+
+        // 基线:该文件当前已知的最新推送序号。
+        let baseline = self.last_push_version(&normalized_path);
+
+        {
+            let t = transport.lock().unwrap_or_else(|e| e.into_inner());
+            if t.ensure_did_open(&normalized_path, language).is_err() {
+                return LspAutoDiagOutcome::Skip;
+            }
+            if t.notify_did_change(&normalized_path).is_err() {
+                return LspAutoDiagOutcome::Skip;
+            }
+        }
+
+        // 等待该文件的推送序号越过基线(带超时)。
+        let deadline = Instant::now() + Duration::from_millis(LSP_AUTO_DIAG_TIMEOUT_MS);
+        loop {
+            if self.last_push_version(&normalized_path) > baseline {
+                let diags = self.get_diagnostics(&normalized_path);
+                return LspAutoDiagOutcome::Refresh(diags);
+            }
+            if Instant::now() >= deadline {
+                return LspAutoDiagOutcome::Skip;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 该文件最近一次 publishDiagnostics 推送对应的全局序号(0 = 从未推送)。
+    fn last_push_version(&self, path: &str) -> u64 {
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner
+            .last_push_versions
+            .lock()
+            .map(|v| v.get(path).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// 语言是否处于 auto-start 失败冷却期。
+    fn is_auto_start_cooldown(&self, language: &str) -> bool {
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        inner
+            .auto_start_cooldowns
+            .lock()
+            .map(|c| c.get(language).is_some_and(|until| *until > Instant::now()))
+            .unwrap_or(false)
+    }
+
+    /// 记录语言的 auto-start 失败冷却截止时间。
+    fn set_auto_start_cooldown(&self, language: &str) {
+        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let mut cooldowns = inner
+            .auto_start_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cooldowns.insert(
+            language.to_owned(),
+            Instant::now() + Duration::from_millis(LSP_AUTO_START_COOLDOWN_MS),
+        );
     }
 
     /// Dispatch an LSP action and return a structured result.
@@ -1000,8 +1178,9 @@ pub struct ProcessLspTransport {
     /// 只锁 write,不再锁 read(reader 线程独占 stdout 读取)。
     /// 替代旧 send_lock,使并发请求不再因读等待而串行化。
     write_lock: Mutex<()>,
-    /// SP4.2 修复:已发送 didOpen 的文件路径集合,避免重复 open。
-    opened_files: Mutex<HashSet<String>>,
+    /// 已 didOpen 的文件 path → 当前版本号(didOpen 记录 v1,didChange 递增)。
+    /// 同时避免重复发送 didOpen。
+    opened_files: Mutex<HashMap<String, u64>>,
     /// 后台 reader 线程停止信号。
     /// Drop/shutdown 时置 true;reader 线程在下次循环检查时退出
     /// (若阻塞在 read_exact,则由 child kill 导致 EOF 退出)。
@@ -1060,7 +1239,7 @@ impl ProcessLspTransport {
             child_stdout: None,
             next_id: Arc::new(Mutex::new(1)),
             write_lock: Mutex::new(()),
-            opened_files: Mutex::new(std::collections::HashSet::new()),
+            opened_files: Mutex::new(HashMap::new()),
             reader_stop: Arc::new(AtomicBool::new(false)),
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
             registry_inner: None,
@@ -1194,6 +1373,9 @@ impl ProcessLspTransport {
                                                 {
                                                     server.diagnostics.retain(|d| d.path != path);
                                                     server.diagnostics.extend(diags);
+                                                    // 记录该文件的推送序号(全局递增),
+                                                    // 供"编辑后自动诊断"检测新推送已到达。
+                                                    record_push(&mut inner, path);
                                                 }
                                             }
                                         }
@@ -1215,6 +1397,7 @@ impl ProcessLspTransport {
                                                         server
                                                             .diagnostics
                                                             .retain(|d| d.path != path);
+                                                        record_push(&mut inner, path);
                                                     }
                                                 }
                                             }
@@ -1247,7 +1430,8 @@ impl ProcessLspTransport {
     /// SP4.2 修复:发送 textDocument/didOpen 通知。
     ///
     /// LSP 协议要求 client 在发任何 textDocument 请求前先发 didOpen,
-    /// server 才能解析文件内容。此方法跟踪已 open 的文件,避免重复发送。
+    /// server 才能解析文件内容。此方法跟踪已 open 的文件(path → 版本号),
+    /// 避免重复发送。
     pub fn ensure_did_open(&self, path: &str, language_id: &str) -> Result<(), String> {
         let abs_path = if std::path::Path::new(path).is_absolute() {
             path.to_owned()
@@ -1263,7 +1447,7 @@ impl ProcessLspTransport {
             .opened_files
             .lock()
             .map_err(|_| "opened_files lock poisoned".to_string())?;
-        if opened.contains(&abs_path) {
+        if opened.contains_key(&abs_path) {
             return Ok(());
         }
 
@@ -1282,8 +1466,48 @@ impl ProcessLspTransport {
         });
 
         self.send_notification("textDocument/didOpen", params)?;
-        opened.insert(abs_path);
+        opened.insert(abs_path, 1);
         Ok(())
+    }
+
+    /// 编辑后发送 textDocument/didChange 通知,触发服务器重新诊断。
+    ///
+    /// 为何必要:didOpen 有去重,同一文件二次编辑时不会重发 didOpen,
+    /// 服务器不会感知文件变化。因此每次编辑后必须发 didChange。
+    /// - contentChanges 使用全量替换(编辑工具改动的完整内容);
+    /// - 版本号由 `opened_files` 内部递增(didOpen 为 v1);
+    /// - didChange 无需 languageId(与 didOpen 不同)。
+    pub fn notify_did_change(&self, path: &str) -> Result<(), String> {
+        let abs_path = if std::path::Path::new(path).is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(path)
+                .display()
+                .to_string()
+        };
+
+        let version = {
+            let mut opened = self
+                .opened_files
+                .lock()
+                .map_err(|_| "opened_files lock poisoned".to_string())?;
+            let v = opened.get(&abs_path).copied().unwrap_or(0) + 1;
+            opened.insert(abs_path.clone(), v);
+            v
+        };
+
+        let content = std::fs::read_to_string(&abs_path)
+            .map_err(|e| format!("failed to read file for didChange '{abs_path}': {e}"))?;
+
+        let uri = path_to_file_uri(&abs_path);
+        let params = serde_json::json!({
+            "textDocument": { "uri": uri, "version": version },
+            "contentChanges": [{ "text": content }],
+        });
+
+        self.send_notification("textDocument/didChange", params)
     }
 
     /// 构造 initialize 请求的 params。
@@ -1305,6 +1529,12 @@ impl ProcessLspTransport {
                 "textDocument": {
                     "completion": { "completionItem": { "snippetSupport": true } },
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
+                    // Step 4.3:声明 hierarchicalDocumentSymbolSupport。
+                    // 不声明时 rust-analyzer 回退 flat SymbolInformation(location.range.start
+                    // 是声明块起点,含 doc 注释),导致 references 查询位置落在注释行上,
+                    // 跨模块引用永远解析不到。声明后返回 DocumentSymbol[] 的 selectionRange
+                    // (标识符精确位置),get_references 才能命中符号。
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                     "synchronization": { "didOpen": true, "didChange": true, "didClose": true }
                 }
             }
@@ -1546,6 +1776,32 @@ fn read_one_message(stdout: &Mutex<ChildStdout>) -> Result<serde_json::Value, St
 /// }
 /// ```
 ///
+/// reader 线程处理 publishDiagnostics 后调用:递增全局推送序号,
+/// 并记录该文件最近一次推送的序号(供"编辑后自动诊断"检测新推送到达)。
+fn record_push(inner: &mut RegistryInner, path: String) {
+    let seq = inner.push_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut versions) = inner.last_push_versions.lock() {
+        versions.insert(path, seq);
+    }
+}
+
+/// 文件扩展名 → LSP 语言标识(与 `LspRegistry::dispatch` 的语言映射保持一致)。
+fn language_for_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "rs" => Some("rust"),
+        "ts" | "tsx" => Some("typescript"),
+        "js" | "jsx" => Some("javascript"),
+        "py" => Some("python"),
+        "go" => Some("go"),
+        "java" => Some("java"),
+        "c" | "h" => Some("c"),
+        "cpp" | "hpp" | "cc" => Some("cpp"),
+        "rb" => Some("ruby"),
+        "lua" => Some("lua"),
+        _ => None,
+    }
+}
+
 /// severity 映射:1=error, 2=warning, 3=info, 4=hint
 fn parse_publish_diagnostics(msg: &serde_json::Value) -> Vec<LspDiagnostic> {
     let uri = msg
@@ -1797,6 +2053,87 @@ impl From<lsp_types::SymbolInformation> for LspSymbol {
     }
 }
 
+/// 从 dispatch 包装响应中提取真正的 LSP JSON-RPC `result`。
+///
+/// `LspRegistry::dispatch` 返回 `{ action, path, ..., rpc_response, ... }`,
+/// 真正的 LSP 结果位于 `rpc_response.result`。此函数同时兼容
+/// 直接传入原始 JSON-RPC 响应(`result` 在顶层)的调用方式。
+fn unwrap_lsp_result(response: &serde_json::Value) -> Option<&serde_json::Value> {
+    if let Some(rpc) = response.get("rpc_response") {
+        if let Some(result) = rpc.get("result") {
+            return Some(result);
+        }
+    }
+    response.get("result")
+}
+
+/// 解析 `textDocument/references` 响应为 `Vec<LspLocation>`。
+///
+/// LSP server 可能返回两种格式(参考 LSP spec §3.11.4):
+/// 1. `Location[]` — 平铺结构,每项含 `uri` + `range`
+/// 2. `LocationLink[]` — 链接结构,每项含 `targetUri` + `targetRange`(+`targetSelectionRange`)
+///
+/// 两种格式都会统一转换为 [`LspLocation`](LspLocation)(本地路径 + 位置)。
+/// result 为 `null`(无引用)或解析失败时返回空 Vec。
+///
+/// # 与 repomap 协同
+/// 返回的引用位置用于 [`crate::repomap::RepoMap::refresh_lsp_references`]
+/// 统计跨模块引用计数(替代 regex 子串匹配)。
+#[must_use]
+pub fn parse_references(response: &serde_json::Value) -> Vec<LspLocation> {
+    let result = match unwrap_lsp_result(response) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let arr = match result.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+
+    let mut locations = Vec::new();
+    for item in arr {
+        // LocationLink 优先(targetUri),否则 Location(uri)
+        let uri = item
+            .get("targetUri")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("uri").and_then(|v| v.as_str()));
+        // LocationLink 用 targetRange,Location 用 range
+        let range = item.get("targetRange").or_else(|| item.get("range"));
+
+        let (Some(uri), Some(range)) = (uri, range) else {
+            continue;
+        };
+
+        let path = uri_to_path(uri);
+        let line = range
+            .get("start")
+            .and_then(|s| s.get("line").and_then(|l| l.as_u64()))
+            .unwrap_or(0) as u32;
+        let character = range
+            .get("start")
+            .and_then(|s| s.get("character").and_then(|c| c.as_u64()))
+            .unwrap_or(0) as u32;
+        let end_line = range
+            .get("end")
+            .and_then(|e| e.get("line").and_then(|l| l.as_u64()))
+            .map(|n| n as u32);
+        let end_character = range
+            .get("end")
+            .and_then(|e| e.get("character").and_then(|c| c.as_u64()))
+            .map(|n| n as u32);
+
+        locations.push(LspLocation {
+            path,
+            line,
+            character,
+            end_line,
+            end_character,
+            preview: None,
+        });
+    }
+    locations
+}
+
 /// Step 4.2-c:使用 `lsp_types` 官方类型解析 documentSymbol 响应。
 ///
 /// 与 [`parse_document_symbols`](fn@parse_document_symbols) 功能相同,
@@ -1813,7 +2150,10 @@ impl From<lsp_types::SymbolInformation> for LspSymbol {
 /// - `path`:文件路径(用于 DocumentSymbol 格式,SymbolInformation 自带 uri)
 #[must_use]
 pub fn parse_document_symbols_typed(response: &serde_json::Value, path: &str) -> Vec<LspSymbol> {
-    let result = response.get("result").unwrap_or(response);
+    // SP4.3 修复:process transport 下响应被包装在 `rpc_response.result`,
+    // 用 unwrap_lsp_result 统一解包(兼容原始 JSON-RPC 与 dispatch 包装两种形态),
+    // 否则真实 rust-analyzer 的 documentSymbol 永远解析为空。
+    let result = unwrap_lsp_result(response).unwrap_or(response);
 
     // 尝试 1:DocumentSymbol[] 反序列化
     if let Ok(doc_symbols) =
@@ -2073,7 +2413,11 @@ impl LspJsonRpcClient {
                 "capabilities": {
                     "textDocument": {
                         "completion": { "completionItem": { "snippetSupport": true } },
-                        "hover": { "contentFormat": ["markdown", "plaintext"] }
+                        "hover": { "contentFormat": ["markdown", "plaintext"] },
+                        // Step 4.3:声明 hierarchicalDocumentSymbolSupport,
+                        // 与 ProcessLspTransport::initialize_params 保持一致,
+                        // 确保 rust-analyzer 返回带 selectionRange 的 DocumentSymbol[]。
+                        "documentSymbol": { "hierarchicalDocumentSymbolSupport": true }
                     }
                 }
             })
@@ -2118,6 +2462,58 @@ impl LspJsonRpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 编辑后自动诊断(refresh_diagnostics_for_path)──
+
+    #[test]
+    fn refresh_skips_non_code_extensions_without_touching_registry() {
+        let registry = LspRegistry::new();
+        for path in ["README.md", "config.json", "noext", "notes.txt"] {
+            assert_eq!(
+                registry.refresh_diagnostics_for_path(path),
+                LspAutoDiagOutcome::Skip,
+                "非代码文件 {path} 应静默跳过"
+            );
+        }
+    }
+
+    #[test]
+    fn record_push_tracks_per_file_versions() {
+        let registry = LspRegistry::new();
+        {
+            let mut inner = registry.inner.lock().expect("lock");
+            record_push(&mut inner, "a.rs".to_string());
+            record_push(&mut inner, "b.py".to_string());
+            record_push(&mut inner, "a.rs".to_string());
+        }
+        // 全局序号递增,每文件记录最近一次序号。
+        assert_eq!(registry.last_push_version("a.rs"), 3);
+        assert_eq!(registry.last_push_version("b.py"), 2);
+        assert_eq!(registry.last_push_version("c.go"), 0, "从未推送的文件序号为 0");
+    }
+
+    #[test]
+    fn refresh_respects_auto_start_cooldown_for_supported_language() {
+        let registry = LspRegistry::new();
+        // 设置 python 冷却后,刷新 .py 直接 Skip(不 spawn server)。
+        registry.set_auto_start_cooldown("python");
+        assert!(registry.is_auto_start_cooldown("python"));
+        assert_eq!(
+            registry.refresh_diagnostics_for_path("src/mod.py"),
+            LspAutoDiagOutcome::Skip
+        );
+        // 未冷却的其他语言不受影响。
+        assert!(!registry.is_auto_start_cooldown("typescript"));
+    }
+
+    #[test]
+    fn language_for_extension_maps_known_code_files() {
+        assert_eq!(language_for_extension("rs"), Some("rust"));
+        assert_eq!(language_for_extension("tsx"), Some("typescript"));
+        assert_eq!(language_for_extension("py"), Some("python"));
+        assert_eq!(language_for_extension("md"), None);
+        assert_eq!(language_for_extension(""), None);
+    }
 
     #[test]
     fn registers_and_retrieves_server() {
@@ -2894,6 +3290,15 @@ mod tests {
                 ["snippetSupport"],
             true
         );
+        // Step 4.3:必须声明 hierarchicalDocumentSymbolSupport,
+        // 否则 rust-analyzer 返回 flat SymbolInformation(位置含 doc 注释),
+        // get_references 无法命中标识符。
+        assert_eq!(
+            params["capabilities"]["textDocument"]["documentSymbol"]
+                ["hierarchicalDocumentSymbolSupport"],
+            true,
+            "initialize must declare hierarchicalDocumentSymbolSupport"
+        );
     }
 
     #[test]
@@ -3362,6 +3767,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_document_symbols_typed_uses_selection_range_for_position() {
+        // Step 4.3 回归:typed 路径必须用 DocumentSymbol 的 selectionRange
+        // (标识符精确位置),而不是 range(声明块起点,含 doc 注释)。
+        // 用 dispatch 包装响应(与真实 process transport 返回一致)构造,
+        // 验证 unwrap_lsp_result 解包 + DocumentSymbol 反序列化双路径。
+        let response = serde_json::json!({
+            "action": "symbols",
+            "path": "src/lib.rs",
+            "language": "rust",
+            "method": "textDocument/documentSymbol",
+            "rpc_response": {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [
+                    {
+                        "name": "OrderItem",
+                        "kind": 23,
+                        "range": { "start": {"line": 9, "character": 0}, "end": {"line": 13, "character": 1} },
+                        "selectionRange": { "start": {"line": 10, "character": 11}, "end": {"line": 10, "character": 20} },
+                        "children": []
+                    }
+                ]
+            },
+            "status": "dispatched"
+        });
+
+        let symbols = parse_document_symbols_typed(&response, "src/lib.rs");
+        assert_eq!(symbols.len(), 1, "typed path should parse one symbol");
+        assert_eq!(symbols[0].name, "OrderItem");
+        // selectionRange.start = (10, 11) 是标识符位置;若误用 range.start 会得到 (9, 0)。
+        assert_eq!(
+            (symbols[0].line, symbols[0].character),
+            (10, 11),
+            "position must come from selectionRange (identifier), not range (declaration block start)"
+        );
+    }
+
+    #[test]
     fn get_symbols_returns_empty_for_memory_transport() {
         // MemoryLspTransport 返回 placeholder 响应,parse 应返回空 Vec
         let registry = LspRegistry::new();
@@ -3378,6 +3821,153 @@ mod tests {
         registry.register("rust", LspServerStatus::Disconnected, None, vec![]);
 
         let result = registry.get_symbols("src/main.rs");
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Step 4.3 — parse_references / get_references 测试
+    // ========================================================================
+
+    #[test]
+    fn parse_references_handles_location_array() {
+        // Location[] 格式:每项含 uri + range
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "uri": "file:///workspace/src/lib.rs",
+                    "range": { "start": {"line": 10, "character": 4}, "end": {"line": 10, "character": 12} }
+                },
+                {
+                    "uri": "file:///workspace/src/main.rs",
+                    "range": { "start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 5} }
+                }
+            ]
+        });
+
+        let refs = parse_references(&response);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].path, "/workspace/src/lib.rs");
+        assert_eq!(refs[0].line, 10);
+        assert_eq!(refs[0].character, 4);
+        assert_eq!(refs[0].end_line, Some(10));
+        assert_eq!(refs[0].end_character, Some(12));
+        assert_eq!(refs[1].path, "/workspace/src/main.rs");
+        assert_eq!(refs[1].line, 3);
+    }
+
+    #[test]
+    fn parse_references_handles_location_link_array() {
+        // LocationLink[] 格式:每项含 targetUri + targetRange
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {
+                    "originSelectionRange": { "start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 8} },
+                    "targetUri": "file:///workspace/src/types.rs",
+                    "targetRange": { "start": {"line": 20, "character": 0}, "end": {"line": 20, "character": 30} },
+                    "targetSelectionRange": { "start": {"line": 20, "character": 4}, "end": {"line": 20, "character": 10} }
+                }
+            ]
+        });
+
+        let refs = parse_references(&response);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "/workspace/src/types.rs");
+        assert_eq!(refs[0].line, 20);
+        assert_eq!(refs[0].character, 0);
+        assert_eq!(refs[0].end_line, Some(20));
+        assert_eq!(refs[0].end_character, Some(30));
+    }
+
+    #[test]
+    fn parse_references_handles_dispatch_wrapped_response() {
+        // dispatch 包装响应(rpc_response.result 内层)
+        let response = serde_json::json!({
+            "action": "references",
+            "path": "src/main.rs",
+            "line": 10,
+            "character": 4,
+            "language": "rust",
+            "method": "textDocument/references",
+            "rpc_response": {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [
+                    {
+                        "uri": "file:///workspace/src/lib.rs",
+                        "range": { "start": {"line": 2, "character": 1}, "end": {"line": 2, "character": 9} }
+                    }
+                ]
+            },
+            "status": "dispatched"
+        });
+
+        let refs = parse_references(&response);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "/workspace/src/lib.rs");
+        assert_eq!(refs[0].line, 2);
+        assert_eq!(refs[0].character, 1);
+    }
+
+    #[test]
+    fn parse_references_handles_null_and_empty_result() {
+        // result 为 null(无引用)
+        let null_resp = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null });
+        assert!(parse_references(&null_resp).is_empty());
+
+        // result 为空数组
+        let empty_resp = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": [] });
+        assert!(parse_references(&empty_resp).is_empty());
+
+        // 错误响应(无 result)
+        let err_resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32601, "message": "method not found" }
+        });
+        assert!(parse_references(&err_resp).is_empty());
+    }
+
+    #[test]
+    fn parse_references_skips_malformed_entries() {
+        // 缺 uri/range 的畸形条目应被跳过,不影响其他有效条目
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                { "uri": "file:///workspace/src/lib.rs", "range": { "start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4} } },
+                { "uri": "file:///workspace/src/no_range.rs" },
+                { "range": { "start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 1} } }
+            ]
+        });
+
+        let refs = parse_references(&response);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "/workspace/src/lib.rs");
+    }
+
+    #[test]
+    fn get_references_uses_memory_transport_fallback() {
+        // 未 spawn 时 dispatch fallback 到 MemoryLspTransport,
+        // get_references 返回空 Vec(不报错)。
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Connected, None, vec![]);
+
+        let refs = registry
+            .get_references("src/main.rs", 10, 4)
+            .expect("memory fallback should not error");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn get_references_errors_for_disconnected_server() {
+        let registry = LspRegistry::new();
+        registry.register("rust", LspServerStatus::Disconnected, None, vec![]);
+
+        let result = registry.get_references("src/main.rs", 10, 4);
         assert!(result.is_err());
     }
 
