@@ -15,12 +15,20 @@ use regex::Regex;
 const DEFAULT_MAX_TOKENS: usize = 1024;
 const CACHE_TTL_SECS: u64 = 60;
 
+/// Step 4.3:单文件一次引用解析最多查询的 symbol 数量。
+/// 防止 monorepo 中文件 symbol 过多导致 LSP 调用爆炸。
+const MAX_REF_SYMBOLS_PER_FILE: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct RepoMap {
     root: PathBuf,
     max_tokens: usize,
     cache: HashMap<PathBuf, CachedFileMap>,
     cache_time: Option<SystemTime>,
+    /// Step 4.3:LSP references 解析出的跨模块引用计数。
+    /// key 是"定义所在文件"(绝对路径),value 是该文件符号被其他文件引用的次数。
+    /// 仅在 LSP 可用时填充,优先级高于 regex 子串匹配的 importance。
+    lsp_importance: HashMap<PathBuf, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +40,9 @@ struct CachedFileMap {
     /// 若存在,render 时优先使用 LSP symbols(语义准确),
     /// 否则 fallback 到 regex 提取的 definitions。
     lsp_symbols: Vec<crate::lsp_client::LspSymbol>,
+    /// Step 4.3:该文件是否已尝试过 LSP references 解析。
+    /// 用于区分"LSP 不可用(fallback regex)"与"LSP 可用但符号无跨文件引用"。
+    lsp_refs_resolved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +71,7 @@ impl RepoMap {
             max_tokens: DEFAULT_MAX_TOKENS,
             cache: HashMap::new(),
             cache_time: None,
+            lsp_importance: HashMap::new(),
         }
     }
 
@@ -87,6 +99,9 @@ impl RepoMap {
     pub fn render_with_lsp(&mut self, registry: &crate::lsp_client::LspRegistry) -> String {
         self.refresh_cache_if_stale();
         self.refresh_lsp_symbols(registry);
+        // Step 4.3:LSP references 跨模块引用解析(语义重要性,优先于 regex 子串匹配)。
+        // best-effort:无可用 LSP server 时内部自动 fallback,不影响 render。
+        self.refresh_lsp_references(registry);
         let importance = self.calculate_importance();
         let mut ranked: Vec<(PathBuf, usize)> = importance.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -171,6 +186,7 @@ impl RepoMap {
                 references: Vec::new(),
                 mtime,
                 lsp_symbols: symbols,
+                lsp_refs_resolved: false,
             });
     }
 
@@ -191,6 +207,16 @@ impl RepoMap {
     #[must_use]
     pub fn calculate_importance(&self) -> HashMap<PathBuf, usize> {
         let mut importance: HashMap<PathBuf, usize> = HashMap::new();
+
+        // Step 4.3:若 LSP references 已解析,优先使用语义引用计数。
+        // LSP 能精确区分跨模块引用(regex 的 substring contains 会误匹配
+        // Foo 与 FooBar、注释/字符串中的同名标识符)。
+        // lsp_importance 在 refresh_lsp_references 中为全部文件初始化了 0,
+        // 因此非空即表示 LSP 解析可用。
+        if !self.lsp_importance.is_empty() {
+            return self.lsp_importance.clone();
+        }
+
         for (path, cached) in &self.cache {
             let mut count = 0usize;
             for def in &cached.definitions {
@@ -349,6 +375,12 @@ impl RepoMap {
                 .map(|c| c.lsp_symbols.clone())
                 .unwrap_or_default();
 
+            let existing_lsp_refs_resolved = self
+                .cache
+                .get(path)
+                .map(|c| c.lsp_refs_resolved)
+                .unwrap_or(false);
+
             self.cache.insert(
                 path.to_path_buf(),
                 CachedFileMap {
@@ -356,6 +388,7 @@ impl RepoMap {
                     references,
                     mtime,
                     lsp_symbols: existing_lsp_symbols,
+                    lsp_refs_resolved: existing_lsp_refs_resolved,
                 },
             );
         }
@@ -412,10 +445,148 @@ impl RepoMap {
 
         refreshed
     }
+
+    /// Step 4.3:通过 LSP `textDocument/references` 解析跨模块引用计数。
+    ///
+    /// 对每个已 spawn server 的文件:
+    /// 1. 用 [`crate::lsp_client::LspRegistry::get_references`] 查询每个 symbol
+    ///    的引用位置(跨文件语义引用,替代 regex 子串匹配)。
+    /// 2. 统计"引用位置所在文件 ≠ 定义所在文件"的条目,计入该文件的重要性。
+    /// 3. 结果写入 `self.lsp_importance`,`calculate_importance` 优先使用它。
+    ///
+    /// # 说明
+    /// - 单文件最多查询 [`MAX_REF_SYMBOLS_PER_FILE`] 个 symbol,防止 LSP 调用爆炸。
+    /// - 这是 best-effort 操作:单文件失败不阻断其他文件。
+    /// - 所有 cache 文件先初始化为 0,保证排名列表完整
+    ///   (否则零引用文件会从 map 中消失)。
+    ///
+    /// # 前置条件
+    /// 应优先在 [`refresh_lsp_symbols`](Self::refresh_lsp_symbols) 之后调用,
+    /// 复用已注入的 lsp_symbols,避免重复 documentSymbol 请求。
+    ///
+    /// # 返回
+    /// 成功完成引用解析的文件数量
+    pub fn refresh_lsp_references(&mut self, registry: &crate::lsp_client::LspRegistry) -> usize {
+        // 先确认是否有文件对应**已 spawn** 的 LSP server。
+        // 仅 registered 而未 spawn 的 server 不视为可用 —— 避免 prompt 组装时
+        // 意外触发 lazy auto-start(首次 rust-analyzer 索引可能耗时 30-60s)。
+        // 若完全没有,保持 lsp_importance 为空,calculate_importance 继续走 regex 路径。
+        let paths: Vec<PathBuf> = self.cache.keys().cloned().collect();
+        let mut candidate_paths: Vec<PathBuf> = Vec::new();
+        for path in &paths {
+            if let Some(s) = path.to_str() {
+                if let Some(server) = registry.find_server_for_path(s) {
+                    if registry.is_server_spawned(&server.language) {
+                        candidate_paths.push(path.clone());
+                    }
+                }
+            }
+        }
+        if candidate_paths.is_empty() {
+            self.lsp_importance.clear();
+            return 0;
+        }
+
+        // 为所有文件初始化 0,保证排名列表完整性。
+        self.lsp_importance = paths
+            .iter()
+            .map(|p| (p.clone(), 0usize))
+            .collect();
+
+        let mut refreshed = 0usize;
+        for path in candidate_paths {
+            let path_str = match path.to_str() {
+                Some(s) => s.to_owned(),
+                None => continue,
+            };
+
+            // 复用 refresh_lsp_symbols 注入的 symbols;若为空则现场获取一次。
+            let symbols = {
+                let cached = self.cache.get(&path);
+                match cached.and_then(|c| {
+                    if c.lsp_symbols.is_empty() {
+                        None
+                    } else {
+                        Some(c.lsp_symbols.clone())
+                    }
+                }) {
+                    Some(syms) => syms,
+                    None => match registry.get_symbols(&path_str) {
+                        Ok(syms) => syms,
+                        Err(_) => continue,
+                    },
+                }
+            };
+
+            if symbols.is_empty() {
+                continue;
+            }
+
+            let mut cross_file_count = 0usize;
+            for symbol in symbols.iter().take(MAX_REF_SYMBOLS_PER_FILE) {
+                match registry.get_references(&path_str, symbol.line, symbol.character) {
+                    Ok(locations) => {
+                        for loc in locations {
+                            // 跨模块:引用位置所在文件 ≠ 定义所在文件
+                            // Windows 上大小写不敏感(LSP 返回的 URI 大小写可能
+                            // 与本地 walkdir 路径不同)。
+                            let loc_norm = normalize_ref_path(&loc.path);
+                            let def_norm = normalize_ref_path(&path_str);
+                            #[cfg(windows)]
+                            let is_cross = !loc_norm.eq_ignore_ascii_case(&def_norm);
+                            #[cfg(not(windows))]
+                            let is_cross = loc_norm != def_norm;
+                            if is_cross {
+                                cross_file_count += 1;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // 单 symbol 失败不阻断该文件整体(部分 symbol 可能可用)
+                    }
+                }
+            }
+
+            if let Some(cached) = self.cache.get_mut(&path) {
+                cached.lsp_refs_resolved = true;
+            }
+            self.lsp_importance.insert(path.clone(), cross_file_count);
+            refreshed += 1;
+        }
+
+        // 若一个文件都没解析成功(如 server 在索引/全部报错),
+        // 清空 lsp_importance 让 calculate_importance 回退 regex,避免全零重要性。
+        if refreshed == 0 {
+            self.lsp_importance.clear();
+        }
+
+        refreshed
+    }
 }
 
 fn estimate_tokens(s: &str) -> usize {
     s.chars().count() / 2 + 1
+}
+
+/// 规范化路径用于引用位置与定义文件的比较。
+///
+/// LSP 返回的 path 可能是 `file:///C:/workspace/a.rs`、`C:/workspace/a.rs`
+/// 或 `/workspace/a.rs`,与本地 walkdir 产出的绝对路径格式不一致。
+/// 统一去掉 `file://` 前缀并转换 `/` 与 `\`,仅用于比较,不用于展示。
+fn normalize_ref_path(p: &str) -> String {
+    let stripped = p.strip_prefix("file://").unwrap_or(p);
+    let normalized = stripped.replace('\\', "/");
+    // Windows 盘符场景:`file:///C:/workspace/a.rs` → `/C:/workspace/a.rs`,
+    // 去掉前导 `/` 与 `C:/workspace/a.rs` 对齐。
+    let bytes = normalized.as_bytes();
+    if normalized.starts_with('/')
+        && normalized.len() >= 3
+        && bytes[2] == b':'
+    {
+        normalized[1..].to_string()
+    } else {
+        normalized
+    }
 }
 
 type DefRegexVec = Vec<(DefinitionKind, Regex)>;
@@ -734,5 +905,120 @@ mod tests {
         let temp = tempdir().unwrap();
         let map = RepoMap::new(temp.path());
         assert!(!map.has_lsp_symbols(Path::new("nonexistent.rs")));
+    }
+
+    // ========================================================================
+    // Step 4.3 — LSP references 跨模块引用测试
+    // ========================================================================
+
+    #[test]
+    fn normalize_ref_path_unifies_uri_and_separators() {
+        // file:// URI、正斜杠与反斜杠应归一为同一条路径
+        assert_eq!(
+            normalize_ref_path("file:///C:/workspace/a.rs"),
+            normalize_ref_path(r"C:\workspace\a.rs")
+        );
+        assert_eq!(
+            normalize_ref_path("file:///workspace/a.rs"),
+            normalize_ref_path("/workspace/a.rs")
+        );
+    }
+
+    #[test]
+    fn refresh_lsp_references_no_spawned_server_falls_back() {
+        // 无已 spawn 的 LSP server 时,lsp_importance 应为空,
+        // calculate_importance 走 regex 路径(不出现全零重要性)。
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("b.rs"), "pub fn func_b() {}").unwrap();
+        std::fs::write(
+            temp.path().join("a.rs"),
+            "use crate::func_b;\npub fn func_a() {}",
+        )
+        .unwrap();
+
+        let mut map = RepoMap::new(temp.path());
+        map.refresh_cache_if_stale();
+
+        // 空 registry:没有任何 server,refresh 返回 0
+        let registry = crate::lsp_client::LspRegistry::new();
+        let refreshed = map.refresh_lsp_references(&registry);
+        assert_eq!(refreshed, 0);
+        assert!(map.lsp_importance.is_empty());
+
+        // calculate_importance 应仍走 regex 路径:b.rs 被 a.rs 引用 > 0
+        let importance = map.calculate_importance();
+        let b = temp.path().join("b.rs");
+        assert!(
+            importance.get(&b).copied().unwrap_or(0) > 0,
+            "no LSP server → regex importance should apply"
+        );
+    }
+
+    #[test]
+    fn refresh_lsp_references_registered_but_not_spawned_falls_back() {
+        // server 已注册但未 spawn:refresh 不应触发 auto-start,
+        // lsp_importance 保持为空(避免 prompt 组装阶段慢启动)。
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}").unwrap();
+
+        let mut map = RepoMap::new(temp.path());
+        map.refresh_cache_if_stale();
+
+        let registry = crate::lsp_client::LspRegistry::new();
+        registry.register_with_command(
+            "rust",
+            crate::lsp_client::LspServerStatus::Disconnected,
+            Some(temp.path().to_str().unwrap()),
+            vec![],
+            "rust-analyzer",
+        );
+
+        let refreshed = map.refresh_lsp_references(&registry);
+        assert_eq!(refreshed, 0);
+        assert!(map.lsp_importance.is_empty());
+    }
+
+    #[test]
+    fn refresh_lsp_references_connected_but_not_spawned_falls_back() {
+        // server 状态标记为 Connected 但 process_transports 中无真实 transport
+        // (如 spawn 失败后状态残留):refresh 应依据 is_server_spawned 跳过,
+        // lsp_importance 保持为空,calculate_importance 走 regex。
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}").unwrap();
+        std::fs::write(temp.path().join("b.rs"), "pub fn func_b() {}").unwrap();
+
+        let mut map = RepoMap::new(temp.path());
+        map.refresh_cache_if_stale();
+
+        // 注入 LSP symbols 模拟 refresh_lsp_symbols 的结果
+        map.augment_with_lsp_symbols(
+            Path::new("a.rs"),
+            vec![crate::lsp_client::LspSymbol {
+                name: "func_a".to_string(),
+                kind: "function".to_string(),
+                path: "a.rs".to_string(),
+                line: 0,
+                character: 7,
+            }],
+        );
+
+        // 注册 server 但从未 spawn(模拟 spawn 失败后 status 残留 Connected)
+        let registry = crate::lsp_client::LspRegistry::new();
+        registry.register_with_command(
+            "rust",
+            crate::lsp_client::LspServerStatus::Connected,
+            Some(temp.path().to_str().unwrap()),
+            vec![],
+            "rust-analyzer",
+        );
+        assert!(!registry.is_server_spawned("rust"));
+
+        let refreshed = map.refresh_lsp_references(&registry);
+        assert_eq!(refreshed, 0);
+        assert!(map.lsp_importance.is_empty());
+
+        // 未 spawn → calculate_importance 走 regex,不会全零
+        let importance = map.calculate_importance();
+        assert!(!importance.is_empty());
     }
 }

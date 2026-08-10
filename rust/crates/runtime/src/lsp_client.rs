@@ -575,6 +575,8 @@ impl LspRegistry {
     /// 查询 path 会先经 [`normalize_lsp_path`] 规范化(绝对路径 + 正斜杠),
     /// 与 `publishDiagnostics` 推送缓存中的 path(`uri_to_path` 输出的 `D:/...`
     /// 格式)保持一致,避免反斜杠/正斜杠导致的失配。
+    /// Windows 上比较大小写不敏感(文件系统不区分大小写,但 LSP 返回的
+    /// URI 大小写可能与查询路径不同)。
     pub fn get_diagnostics(&self, path: &str) -> Vec<LspDiagnostic> {
         let Some(normalized) = normalize_lsp_path(path) else {
             return Vec::new();
@@ -584,7 +586,16 @@ impl LspRegistry {
             .servers
             .values()
             .flat_map(|s| &s.diagnostics)
-            .filter(|d| d.path == normalized)
+            .filter(|d| {
+                #[cfg(windows)]
+                {
+                    d.path.eq_ignore_ascii_case(&normalized)
+                }
+                #[cfg(not(windows))]
+                {
+                    d.path == normalized
+                }
+            })
             .cloned()
             .collect()
     }
@@ -707,16 +718,28 @@ impl LspRegistry {
     ///
     /// path 经 [`normalize_lsp_path`] 规范化,与 reader 线程 `record_push`
     /// 记录的 key(uri_to_path 正斜杠格式)保持一致。
+    /// Windows 上查找大小写不敏感(与 `get_diagnostics` 语义一致)。
     fn last_push_version(&self, path: &str) -> u64 {
         let Some(normalized) = normalize_lsp_path(path) else {
             return 0;
         };
         let inner = self.inner.lock().expect("lsp registry lock poisoned");
-        inner
+        let versions = inner
             .last_push_versions
             .lock()
-            .map(|v| v.get(&normalized).copied().unwrap_or(0))
-            .unwrap_or(0)
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(windows)]
+        {
+            versions
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&normalized))
+                .map(|(_, version)| *version)
+                .unwrap_or(0)
+        }
+        #[cfg(not(windows))]
+        {
+            versions.get(&normalized).copied().unwrap_or(0)
+        }
     }
 
     /// 语言是否处于 auto-start 失败冷却期。
@@ -2594,6 +2617,9 @@ mod tests {
         // 反斜杠查询同样命中(同类 bug 修复点;仅 Windows)。
         #[cfg(windows)]
         assert_eq!(registry.get_diagnostics("D:\\proj\\src\\mod.py").len(), 1);
+        // 大小写不同同样命中(Windows 文件系统不区分大小写;仅 Windows)。
+        #[cfg(windows)]
+        assert_eq!(registry.get_diagnostics("d:/PROJ/src/MOD.py").len(), 1);
         // 无关路径不命中。
         let other = if cfg!(windows) { "D:/other.py" } else { "/other.py" };
         assert!(registry.get_diagnostics(other).is_empty());
@@ -2610,6 +2636,8 @@ mod tests {
         // last_push_version 同样规范化,反斜杠查询可命中(仅 Windows)。
         #[cfg(windows)]
         assert_eq!(registry.last_push_version("D:\\proj\\a.py"), 1);
+        #[cfg(windows)]
+        assert_eq!(registry.last_push_version("d:/PROJ/A.PY"), 1, "大小写不敏感命中");
         assert_eq!(registry.last_push_version(key), 1);
     }
 
