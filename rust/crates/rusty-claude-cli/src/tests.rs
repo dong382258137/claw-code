@@ -1296,6 +1296,119 @@ fn removed_login_and_logout_subcommands_error_helpfully() {
 }
 
 #[test]
+fn harness_subcommand_parses_list_stats_rollback_evolve() {
+    use crate::commands_handler::HarnessCommand;
+    use runtime::harness_evolution::EditStatus;
+
+    assert_eq!(
+        parse_args(&["harness".to_string(), "list".to_string()])
+            .expect("harness list should parse"),
+        CliAction::Harness {
+            subcommand: HarnessCommand::List(None),
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    assert_eq!(
+        parse_args(&[
+            "harness".to_string(),
+            "list".to_string(),
+            "--status".to_string(),
+            "Active".to_string(),
+        ])
+        .expect("harness list --status Active should parse"),
+        CliAction::Harness {
+            subcommand: HarnessCommand::List(Some(EditStatus::Active)),
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    assert_eq!(
+        parse_args(&[
+            "harness".to_string(),
+            "list".to_string(),
+            "--status=Retired".to_string(),
+        ])
+        .expect("harness list --status=Retired should parse"),
+        CliAction::Harness {
+            subcommand: HarnessCommand::List(Some(EditStatus::Retired)),
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    let invalid = parse_args(&[
+        "harness".to_string(),
+        "list".to_string(),
+        "--status".to_string(),
+        "Bogus".to_string(),
+    ])
+    .expect_err("invalid --status should be rejected");
+    assert!(
+        invalid.contains("Candidate, Active, or Retired"),
+        "got: {invalid}"
+    );
+    assert_eq!(
+        parse_args(&[
+            "harness".to_string(),
+            "stats".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+        ])
+        .expect("harness stats --output-format json should parse"),
+        CliAction::Harness {
+            subcommand: HarnessCommand::Stats,
+            output_format: CliOutputFormat::Json,
+        }
+    );
+    assert_eq!(
+        parse_args(&["harness".to_string(), "rollback".to_string(), "--all".to_string()])
+            .expect("harness rollback --all should parse"),
+        CliAction::Harness {
+            subcommand: HarnessCommand::RollbackAll,
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    assert_eq!(
+        parse_args(&[
+            "harness".to_string(),
+            "rollback".to_string(),
+            "--id".to_string(),
+            "edit-1-abc".to_string(),
+        ])
+        .expect("harness rollback --id should parse"),
+        CliAction::Harness {
+            subcommand: HarnessCommand::RollbackId("edit-1-abc".to_string()),
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    let no_target = parse_args(&["harness".to_string(), "rollback".to_string()])
+        .expect_err("rollback without --all/--id should be rejected");
+    assert!(no_target.contains("--all or --id"), "got: {no_target}");
+    assert_eq!(
+        parse_args(&[
+            "harness".to_string(),
+            "evolve".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .expect("harness evolve --dry-run should parse"),
+        CliAction::Harness {
+            subcommand: HarnessCommand::EvolveDryRun,
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    let no_dry_run =
+        parse_args(&["harness".to_string(), "evolve".to_string()])
+            .expect_err("evolve without --dry-run should be rejected");
+    assert!(no_dry_run.contains("--dry-run"), "got: {no_dry_run}");
+    let unknown = parse_args(&["harness".to_string(), "wat".to_string()])
+        .expect_err("unknown harness subcommand should be rejected");
+    assert!(unknown.contains("unknown harness subcommand"), "got: {unknown}");
+    let missing = parse_args(&["harness".to_string()])
+        .expect_err("bare harness should require a subcommand");
+    assert!(
+        missing.contains("requires a subcommand"),
+        "got: {missing}"
+    );
+}
+
+#[test]
 fn dump_manifests_subcommand_accepts_explicit_manifest_dir() {
     assert_eq!(
         parse_args(&[

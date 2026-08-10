@@ -23,6 +23,31 @@ pub struct ImBridgeConfig {
     /// Session idle timeout in seconds (default: 1800 = 30 min).
     #[serde(default = "default_session_timeout_secs")]
     pub session_timeout_secs: u64,
+
+    /// Agent 工作区配置（默认：启动目录，即沙盒边界）。
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// Agent 工作区配置。
+///
+/// 默认情况下 agent 的沙盒边界 = im-bridge 进程启动目录：bash 在启动目录下
+/// 执行，文件工具（read/write/edit/grep/glob）拒绝访问边界之外的路径。
+/// 本配置用于扩展工作区根；**未配置时程序自动枚举本机所有盘符根作为白名单**，
+/// 即默认获得跨盘"最大权限"，无需手动配置。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AgentConfig {
+    /// 主工作区根目录。设置后 im-bridge 进程以它为当前目录：bash 默认工作
+    /// 目录、文件工具主边界都跟随它。设为盘符根（如 `"C:\\"`）即可访问该盘
+    /// 任意路径。未设置时保持启动目录为 bash 默认目录。
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
+
+    /// 额外允许的工作区根（可包含多个盘符/目录）。文件工具边界 = 主根 +
+    /// 这些额外根。**为空时自动探测本机所有盘符根**（最大权限）；显式设置
+    /// 时可借此收窄/指定访问范围。
+    #[serde(default)]
+    pub workspace_roots: Vec<PathBuf>,
 }
 
 fn default_listen_addr() -> String {
@@ -144,5 +169,54 @@ fn warn_legacy_mode(path: &std::path::Path, content: &str) {
              To pin it explicitly, add `mode = \"ws\"` under [feishu].",
             path.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [agent] 段可解析：workspace_root + workspace_roots。
+    #[test]
+    fn parses_agent_workspace_config() {
+        let toml_str = r#"
+            listen_addr = "127.0.0.1:3456"
+            session_timeout_secs = 1800
+
+            [feishu]
+            mode = "ws"
+            app_id = "cli_test"
+            app_secret = "secret"
+
+            [agent]
+            workspace_root = "C:\\"
+            workspace_roots = ["D:\\", "E:\\"]
+        "#;
+        let config: ImBridgeConfig = toml::from_str(toml_str).expect("should parse");
+        let agent = config.agent;
+        assert_eq!(
+            agent.workspace_root.as_deref(),
+            Some(std::path::Path::new("C:\\"))
+        );
+        let roots: Vec<String> = agent
+            .workspace_roots
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(roots, vec!["D:\\", "E:\\"]);
+    }
+
+    /// 无 [agent] 段时默认：不限制主根、无额外根。
+    #[test]
+    fn agent_defaults_when_section_missing() {
+        let toml_str = r#"
+            [feishu]
+            mode = "ws"
+            app_id = "cli_test"
+            app_secret = "secret"
+        "#;
+        let config: ImBridgeConfig = toml::from_str(toml_str).expect("should parse");
+        assert!(config.agent.workspace_root.is_none());
+        assert!(config.agent.workspace_roots.is_empty());
     }
 }

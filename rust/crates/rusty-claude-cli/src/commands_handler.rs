@@ -121,6 +121,11 @@ pub(crate) enum CliAction {
         /// 并跨 session 汇总。
         cache_stats: bool,
     },
+    /// `claw harness <list|stats|rollback>`(design-gaps #2 self-evolving harness)。
+    Harness {
+        subcommand: HarnessCommand,
+        output_format: CliOutputFormat,
+    },
     Acp {
         output_format: CliOutputFormat,
     },
@@ -197,6 +202,28 @@ pub(crate) enum CliAction {
     Help {
         output_format: CliOutputFormat,
     },
+}
+
+/// `claw harness` 子命令(design-gaps #2)。
+///
+/// 支持:list / stats / rollback / evolve。操作当前目录的 `.claw/decision_log.db`
+/// 中 `harness_edits` 表。
+/// - `list [--status <Candidate|Active|Retired>]`
+/// - `stats`
+/// - `rollback --all` 或 `rollback --id <edit_id>`
+/// - `evolve --dry-run`(仅预览,不写入)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HarnessCommand {
+    /// 列出 edits,可选按状态过滤。
+    List(Option<runtime::harness_evolution::EditStatus>),
+    /// 统计概览。
+    Stats,
+    /// 一键回滚所有 Active edits。
+    RollbackAll,
+    /// 回滚单个 Active edit。
+    RollbackId(String),
+    /// 手动触发一轮 evolution(仅预览,不写入 archive)。
+    EvolveDryRun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,7 +896,7 @@ pub(crate) fn parse_single_word_command_alias(
         }
     }
 
-    if rest.len() != 1 {
+    if rest.len() != 1 && rest.first().map(String::as_str) != Some("harness") {
         return None;
     }
 
@@ -889,6 +916,8 @@ pub(crate) fn parse_single_word_command_alias(
             cache_stats,
         })),
         "state" => Some(Ok(CliAction::State { output_format })),
+        // design-gaps #2:`claw harness <list|stats|rollback>`。
+        "harness" => parse_harness_args(&rest[1..], output_format),
         // #146: let `config` and `diff` fall through to parse_subcommand
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
@@ -896,6 +925,117 @@ pub(crate) fn parse_single_word_command_alias(
         "config" | "diff" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
+}
+
+/// 解析 `claw harness <subcommand>` 的子命令参数。
+pub(crate) fn parse_harness_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Option<Result<CliAction, String>> {
+    let mut args = args.to_vec();
+    if args.is_empty() {
+        return Some(Err(
+            "claw harness requires a subcommand: list | stats | rollback | evolve".to_string(),
+        ));
+    }
+    // 归一化 `--status=X` → `--status`, `X`(与主循环其它 flag 一致)。
+    let mut status_filter: Option<runtime::harness_evolution::EditStatus> = None;
+    let mut rollback_all = false;
+    let mut rollback_id: Option<String> = None;
+    let mut dry_run = false;
+
+    let subcommand = args.remove(0);
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--all" => {
+                rollback_all = true;
+                idx += 1;
+            }
+            "--id" => {
+                let Some(value) = args.get(idx + 1) else {
+                    return Some(Err("missing value for --id".to_string()));
+                };
+                rollback_id = Some(value.clone());
+                idx += 2;
+            }
+            flag if flag.starts_with("--id=") => {
+                rollback_id = Some(flag[5..].to_string());
+                idx += 1;
+            }
+            "--status" => {
+                let Some(value) = args.get(idx + 1) else {
+                    return Some(Err("missing value for --status".to_string()));
+                };
+                status_filter = runtime::harness_evolution::EditStatus::from_db_str(value);
+                if status_filter.is_none() {
+                    return Some(Err(format!(
+                        "invalid --status `{value}`; expected Candidate, Active, or Retired"
+                    )));
+                }
+                idx += 2;
+            }
+            flag if flag.starts_with("--status=") => {
+                let value = &flag[9..];
+                status_filter = runtime::harness_evolution::EditStatus::from_db_str(value);
+                if status_filter.is_none() {
+                    return Some(Err(format!(
+                        "invalid --status `{value}`; expected Candidate, Active, or Retired"
+                    )));
+                }
+                idx += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                idx += 1;
+            }
+            other => return Some(Err(format!("unrecognized harness argument `{other}`"))),
+        }
+    }
+
+    let subcommand = match subcommand.as_str() {
+        "list" => HarnessCommand::List(status_filter),
+        "stats" => {
+            if status_filter.is_some() || rollback_all || rollback_id.is_some() {
+                return Some(Err("`claw harness stats` takes no filters".to_string()));
+            }
+            HarnessCommand::Stats
+        }
+        "rollback" => {
+            if rollback_all && rollback_id.is_some() {
+                return Some(Err(
+                    "use either `rollback --all` or `rollback --id <id>`, not both".to_string(),
+                ));
+            }
+            if rollback_all {
+                HarnessCommand::RollbackAll
+            } else if let Some(id) = rollback_id {
+                HarnessCommand::RollbackId(id)
+            } else {
+                return Some(Err(
+                    "`claw harness rollback` requires --all or --id <edit_id>".to_string(),
+                ));
+            }
+        }
+        "evolve" => {
+            if !dry_run {
+                return Some(Err(
+                    "`claw harness evolve` is read-only; use --dry-run to preview".to_string(),
+                ));
+            }
+            HarnessCommand::EvolveDryRun
+        }
+        other => {
+            return Some(Err(format!(
+                "unknown harness subcommand `{other}`; expected list, stats, rollback, or evolve"
+            )));
+        }
+    };
+
+    Some(Ok(CliAction::Harness {
+        subcommand,
+        output_format,
+    }))
 }
 
 pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
@@ -2219,7 +2359,7 @@ fn render_im_start_command() -> (String, serde_json::Value) {
 
     // 1) 配置自检：文件必须存在
     if !config_path.exists() {
-        let msg = vec![
+        let msg = [
             "\u{1f916} IM Bridge 未配置".to_string(),
             String::new(),
             format!("  \x1b[2mConfig path\x1b[0m: {}", config_path.display()),

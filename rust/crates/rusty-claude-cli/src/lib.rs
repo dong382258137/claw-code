@@ -762,6 +762,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 enable_auto_planner,
             )?
         }
+        CliAction::Harness {
+            subcommand,
+            output_format,
+        } => run_harness_command(subcommand, output_format)?,
         CliAction::HelpTopic {
             topic,
             output_format,
@@ -769,6 +773,195 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Help { output_format } => print_help(output_format)?,
     }
     Ok(())
+}
+
+/// `claw harness <list|stats|rollback|evolve>` 分派(design-gaps #2)。
+///
+/// 操作当前目录 `.claw/decision_log.db` 中的 `harness_edits` 表。
+/// `--output-format json` 输出结构化数据(text 输出供人工阅读)。
+fn run_harness_command(
+    subcommand: HarnessCommand,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let archive = runtime::harness_evolution::HarnessArchive::open(&cwd)
+        .map_err(|e| format!("cannot open harness archive: {e}"))?;
+
+    match subcommand {
+        HarnessCommand::List(status_filter) => {
+            let edits = archive
+                .list_edits(status_filter)
+                .map_err(|e| format!("cannot list harness edits: {e}"))?;
+            match output_format {
+                CliOutputFormat::Text => print_harness_edits_text(&edits),
+                CliOutputFormat::Json => {
+                    let payload = serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "count": edits.len(),
+                        "edits": edits,
+                    }))?;
+                    println!("{payload}");
+                }
+            }
+        }
+        HarnessCommand::Stats => {
+            let stats = archive
+                .stats()
+                .map_err(|e| format!("cannot read harness stats: {e}"))?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!(
+                        "harness_edits: total={} active={} candidate={} retired={} rule={} llm={}",
+                        stats.total,
+                        stats.active,
+                        stats.candidate,
+                        stats.retired,
+                        stats.rule_sourced,
+                        stats.llm_sourced,
+                    );
+                    println!(
+                        "active success_rate avg: {:.2}",
+                        stats.avg_active_success_rate
+                    );
+                }
+                CliOutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&stats)?);
+                }
+            }
+        }
+        HarnessCommand::RollbackAll => {
+            let n = archive
+                .rollback_all()
+                .map_err(|e| format!("rollback failed: {e}"))?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("rolled back {n} active harness edit(s)");
+                }
+                CliOutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "rolled_back": n,
+                        }))?
+                    );
+                }
+            }
+        }
+        HarnessCommand::RollbackId(id) => match archive.get_edit(&id) {
+            Ok(Some(_)) => {
+                archive
+                    .rollback(&id)
+                    .map_err(|e| format!("rollback failed: {e}"))?;
+                match output_format {
+                    CliOutputFormat::Text => println!("rolled back harness edit `{id}`"),
+                    CliOutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "ok": true,
+                                "edit_id": id,
+                            }))?
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                eprintln!("harness edit `{id}` not found");
+                std::process::exit(1);
+            }
+            Err(e) => return Err(format!("cannot read harness edit `{id}`: {e}").into()),
+        },
+        HarnessCommand::EvolveDryRun => {
+            // 从 `.claw/traces.csv` 加载历史 trace 预览一轮 evolution,
+            // 不写入 archive(MVP:规则式 Proposer 零 LLM 调用)。
+            let trace_csv = cwd.join(".claw").join("traces.csv");
+            let analyzer = if trace_csv.exists() {
+                match runtime::trace_analyzer::TraceAnalyzer::load_csv(&trace_csv) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("failed to load trace csv: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!(
+                    "no trace data found at {}; run a session first, then export traces",
+                    trace_csv.display()
+                );
+                std::process::exit(1);
+            };
+            let config = runtime::harness_evolution::EvolutionConfig::default();
+            match runtime::harness_evolution::evolve(&analyzer, &archive, &config) {
+                Ok(report) => match output_format {
+                    CliOutputFormat::Text => {
+                        println!(
+                            "dry-run (no writes): {} weaknesses, {} proposals, {} promoted, {} retired, {} skipped",
+                            report.weaknesses_count,
+                            report.proposals_count,
+                            report.promoted_count,
+                            report.retired_count,
+                            report.skipped_count
+                        );
+                    }
+                    CliOutputFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("evolution dry-run failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// text 模式渲染 harness edits 列表。
+fn print_harness_edits_text(edits: &[runtime::harness_evolution::HarnessEdit]) {
+    if edits.is_empty() {
+        println!("no harness edits");
+        return;
+    }
+    for edit in edits {
+        let created = format_ms_timestamp(edit.created_at);
+        println!(
+            "[{}] {}  status={}  source={}  verify={} success={} rate={:.2}  created={}",
+            edit.status.as_db_str(),
+            edit.id,
+            edit.pathology,
+            edit.source.as_db_str(),
+            edit.verify_count,
+            edit.success_count,
+            edit.success_rate(),
+            created,
+        );
+        if let Some(reason) = &edit.retire_reason {
+            println!("    retired: {reason}");
+        }
+        println!("    content: {}", truncate_inline(&edit.content, 120));
+    }
+}
+
+/// ms 时间戳 → 本地 `YYYY-MM-DD HH:MM:SS`。
+fn format_ms_timestamp(ms: i64) -> String {
+    use chrono::{DateTime, Local, Utc};
+    let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) else {
+        return String::new();
+    };
+    dt.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// 单行截断(供 CLI 文本展示,保留可读性)。
+fn truncate_inline(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = chars[..max].iter().collect();
+        format!("{truncated}…")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

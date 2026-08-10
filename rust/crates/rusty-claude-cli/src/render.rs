@@ -276,6 +276,17 @@ impl TerminalRenderer {
     }
 
     fn render_markdown_with_width(&self, markdown: &str, max_width: Option<usize>) -> String {
+        self.render_markdown_with_width_trim(markdown, max_width, true)
+    }
+
+    /// 内部渲染实现。`trim_trailing` 为 true 时剥掉尾部空白（一次性整块渲染）；
+    /// false 时保留（流式增量渲染，保证段落/表格与后续内容的换行边界不被吞掉）。
+    fn render_markdown_with_width_trim(
+        &self,
+        markdown: &str,
+        max_width: Option<usize>,
+        trim_trailing: bool,
+    ) -> String {
         let normalized = normalize_nested_fences(markdown);
         let mut output = String::new();
         let mut state = RenderState {
@@ -297,7 +308,11 @@ impl TerminalRenderer {
             );
         }
 
-        output.trim_end().to_string()
+        if trim_trailing {
+            output.trim_end().to_string()
+        } else {
+            output
+        }
     }
 
     #[must_use]
@@ -749,7 +764,12 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi_with_width(&ready, self.max_width))
+        // 保留尾部换行：ready 以空行结尾，段落/表格与后续内容的换行边界
+        // 必须原样保留，否则跨 flush 的内容（如下一个表格）会粘连错位。
+        Some(
+            renderer
+                .render_markdown_with_width_trim(&ready, self.max_width, false),
+        )
     }
 
     #[must_use]
@@ -1617,6 +1637,58 @@ fn renders_tables_cjk_cells_stay_aligned() {
     let plain_text = strip_ansi(&markdown_output);
     let widths: std::collections::BTreeSet<usize> = plain_text.lines().map(visible_width).collect();
     assert_eq!(widths.len(), 1, "CJK 表格行应对齐: {widths:?}");
+}
+
+#[test]
+fn table_after_paragraph_across_flush_keeps_header_aligned() {
+    let renderer = TerminalRenderer::new();
+    // 用户报告的真实场景：段落（含 →、inline code）后空行、表格紧随其后，
+    // 流式分块使段落与表格分别在不同 push 中 flush。
+    let para = "02:34，而源码修复在 8/9 23:29。`web/static/dist/` 被 gitignore，git 部署不会更新产物 → 浏览器永远加载旧代码。已执行的修复：";
+    let mut state = MarkdownStreamState::with_max_width(Some(60));
+    let mut chunks = Vec::new();
+    for delta in [
+        // 段落 + 空行：单独 flush，输出必须以换行结尾，不能与后续表格粘连
+        format!("{para}\n\n"),
+        "| 步骤 | 结果 |\n".to_string(),
+        "| --- | --- |\n".to_string(),
+        "| 01 | 已执行 |\n".to_string(),
+        "| 02 | 已执行 |\n".to_string(),
+        "| 03 | 已执行 |\n\n".to_string(), // 表格结束空行触发整表 flush
+        "后续文本".to_string(),
+    ] {
+        if let Some(rendered) = state.push(&renderer, &delta) {
+            chunks.push(rendered);
+        }
+    }
+    if let Some(rendered) = state.flush(&renderer) {
+        chunks.push(rendered);
+    }
+    let plain = strip_ansi(&chunks.concat());
+    println!("=== stream output ===\n{plain}");
+    let lines: Vec<&str> = plain.lines().collect();
+    assert!(!lines.is_empty(), "应有渲染输出");
+    // 1) 表格表头行必须以 │ 开头且独占一行（不与段落文本粘连）
+    let header_idx = lines.iter().position(|l| l.trim_start().starts_with('│'));
+    assert!(header_idx.is_some(), "应渲染出表格表头行");
+    // 2) 表头行之前的段落行不得混入表格边框
+    for l in &lines[..header_idx.unwrap()] {
+        if !l.trim().is_empty() {
+            assert!(!l.contains('│'), "段落行不应混入表格边框: {l:?}");
+        }
+    }
+    // 3) 表格所有物理行宽度一致（对齐）
+    let table_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with('│'))
+        .copied()
+        .collect();
+    let widths: std::collections::BTreeSet<usize> =
+        table_lines.iter().map(|l| visible_width(l)).collect();
+    assert_eq!(widths.len(), 1, "表格行应对齐: {widths:?}");
+    // 4) 表格与后续文本不粘连
+    let last_table = table_lines.last().expect("有表格行");
+    assert!(plain.contains(&format!("{last_table}\n")), "表格后应有换行");
 }
 
 #[test]

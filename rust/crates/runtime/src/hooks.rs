@@ -3,8 +3,8 @@ use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, RwLock,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +17,26 @@ use crate::config::{
 use crate::permissions::PermissionOverride;
 
 const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
+
+/// 无 timeout 配置的 hook 的总执行预算(毫秒)。
+///
+/// design-gaps #1「异步 HookRunner」：决策性事件(PreToolUse/PostToolUse 等)
+/// 需要同步结果,但失控/卡死的 hook 不能无限期阻塞对话循环。即使某个 hook
+/// 未配置独立 timeout,整体等待也不超过该预算,超时部分按 Failed 处理。
+const DEFAULT_HOOK_ASYNC_BUDGET_MS: u64 = 60_000;
+
+/// 测试专用:覆盖全局预算,避免在单测里真的等 60s。
+/// `0` = 使用 [`DEFAULT_HOOK_ASYNC_BUDGET_MS`]。
+static HOOK_BUDGET_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn hook_budget_ms() -> u64 {
+    let override_ms = HOOK_BUDGET_OVERRIDE_MS.load(Ordering::Relaxed);
+    if override_ms > 0 {
+        override_ms
+    } else {
+        DEFAULT_HOOK_ASYNC_BUDGET_MS
+    }
+}
 
 pub type HookPermissionDecision = PermissionOverride;
 
@@ -203,20 +223,77 @@ impl HookRunResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct HookRunner {
-    config: RuntimeHookConfig,
+    /// 配置经 `Arc<RwLock>` 共享可变：支持配置热重载（`reload` 原子替换），
+    /// 运行时所有 run_* 方法从读锁获取最新配置。
+    config: Arc<RwLock<RuntimeHookConfig>>,
 }
 
 impl HookRunner {
     #[must_use]
     pub fn new(config: RuntimeHookConfig) -> Self {
-        Self { config }
+        Self {
+            config: Arc::new(RwLock::new(config)),
+        }
     }
 
     #[must_use]
     pub fn from_feature_config(feature_config: &RuntimeFeatureConfig) -> Self {
         Self::new(feature_config.hooks().clone())
+    }
+
+    /// 热重载：原子替换 hooks 配置，后续 hook 调用立即使用新配置。
+    /// design-gaps #1「配置热重载」：修改 hooks 配置（settings.json）无需
+    /// 重启会话。
+    pub fn reload(&self, config: RuntimeHookConfig) {
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
+    /// 从 feature config 热重载 hooks 配置。
+    pub fn reload_from_feature_config(&self, feature_config: &RuntimeFeatureConfig) {
+        self.reload(feature_config.hooks().clone());
+    }
+
+    /// 返回当前 hooks 配置快照（读锁 clone）。
+    #[must_use]
+    pub fn current_config(&self) -> RuntimeHookConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// fire-and-forget：生命周期事件（Stop/SessionStart/Notification 等）在
+    /// 后台线程异步执行，立即返回，**不阻塞对话循环**。即使 hook 卡死/失控，
+    /// 也只影响后台线程。调用方不关心返回值（conversation.rs 均为 `let _ =`）。
+    pub fn spawn_lifecycle_event(&self, event: HookEvent, context: String) {
+        let definitions = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .lifecycle()
+            .get(event.as_str())
+            .cloned()
+            .unwrap_or_default();
+        if definitions.is_empty() {
+            return;
+        }
+        thread::spawn(move || {
+            let _ = Self::run_definitions(
+                event,
+                &definitions,
+                &context,
+                "{}",
+                None,
+                false,
+                None,
+                None,
+            );
+        });
     }
 
     #[must_use]
@@ -234,7 +311,10 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_definitions(
             HookEvent::PreToolUse,
-            self.config.pre_tool_use(),
+            self.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .pre_tool_use(),
             tool_name,
             tool_input,
             None,
@@ -284,7 +364,10 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_definitions(
             HookEvent::PostToolUse,
-            self.config.post_tool_use(),
+            self.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .post_tool_use(),
             tool_name,
             tool_input,
             Some(tool_output),
@@ -334,7 +417,10 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_definitions(
             HookEvent::PostToolUseFailure,
-            self.config.post_tool_use_failure(),
+            self.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .post_tool_use_failure(),
             tool_name,
             tool_input,
             Some(tool_error),
@@ -368,14 +454,16 @@ impl HookRunner {
         let event_name = event.as_str();
         let definitions = self
             .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .lifecycle()
             .get(event_name)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .cloned()
+            .unwrap_or_default();
         if definitions.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
-        Self::run_definitions(event, definitions, context, "{}", None, false, None, None)
+        Self::run_definitions(event, &definitions, context, "{}", None, false, None, None)
     }
 
     #[must_use]
@@ -413,16 +501,18 @@ impl HookRunner {
         // 语义与 PostToolUse 区分开(后者覆盖全部工具)。
         let definitions = self
             .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .lifecycle()
             .get(HookEvent::PostCustomToolCall.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .cloned()
+            .unwrap_or_default();
         if definitions.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
         Self::run_definitions(
             HookEvent::PostCustomToolCall,
-            definitions,
+            &definitions,
             tool_name,
             "{}",
             Some(tool_output),
@@ -464,6 +554,13 @@ impl HookRunner {
         let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
         let mut result = HookRunResult::allow(Vec::new());
 
+        // design-gaps #1「异步 HookRunner」:决策性事件(PreToolUse/PostToolUse
+        // 等)保留同步语义,但未配置独立 timeout 的 hook 也不能无限期阻塞对话
+        // 循环。从本轮第一次执行起算共享预算,多个 hook 累计占用;预算耗尽后
+        // 剩余 hook 按 1ms 超时立即 Failed(调用方按 failure_policy 处理)。
+        let budget_deadline =
+            Instant::now() + Duration::from_millis(hook_budget_ms());
+
         for def in definitions {
             // matcher 正则过滤：任一正则命中 tool_name 才执行该 hook；
             // None 或空列表 = 匹配全部工具（向后兼容，与旧行为一致）。
@@ -486,6 +583,14 @@ impl HookRunner {
                 });
             }
 
+            // 独立 timeout 优先;未配置时用全局预算的剩余时间兜底。
+            let effective_timeout_ms = def.timeout_ms.or_else(|| {
+                let remaining = budget_deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                Some(remaining.max(1))
+            });
+
             let outcome = match def.handler_type {
                 HookHandlerType::Command => Self::run_command(
                     &def.value,
@@ -496,7 +601,7 @@ impl HookRunner {
                     is_error,
                     &payload,
                     abort_signal,
-                    def.timeout_ms,
+                    effective_timeout_ms,
                 ),
                 HookHandlerType::Script => Self::run_script_handler(
                     &def.value,
@@ -505,7 +610,7 @@ impl HookRunner {
                     tool_input,
                     &payload,
                     abort_signal,
-                    def.timeout_ms,
+                    effective_timeout_ms,
                 ),
                 HookHandlerType::Http => {
                     Self::run_http_handler(
@@ -514,7 +619,7 @@ impl HookRunner {
                         tool_name,
                         &payload,
                         abort_signal,
-                        def.timeout_ms,
+                        effective_timeout_ms,
                     )
                 }
                 HookHandlerType::Mcp => {
@@ -1243,12 +1348,13 @@ fn hook_matches(def: &HookDefinition, tool_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         HookAbortSignal, HookDefinition, HookEvent, HookProgressEvent, HookProgressReporter,
-        HookRunResult, HookRunner,
+        HookRunResult, HookRunner, HOOK_BUDGET_OVERRIDE_MS,
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
@@ -1650,6 +1756,113 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn hot_reload_switches_config_atomically() {
+        // design-gaps #1「配置热重载」:reload 后下一次 hook 调用立即使用新配置,
+        // 无需重建 HookRunner(等价于无需重启会话)。
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet("printf 'old-hook'")],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let before = runner.run_pre_tool_use("Read", r#"{"path":"a.txt"}"#);
+        assert!(before.messages().iter().any(|m| m == "old-hook"));
+
+        let new_config = RuntimeHookConfig::new(
+            vec![shell_snippet("printf 'new-hook'")],
+            Vec::new(),
+            Vec::new(),
+        );
+        runner.reload(new_config.clone());
+        assert_eq!(runner.current_config(), new_config);
+
+        let after = runner.run_pre_tool_use("Read", r#"{"path":"a.txt"}"#);
+        assert!(after.messages().iter().any(|m| m == "new-hook"));
+        assert!(!after.messages().iter().any(|m| m == "old-hook"));
+    }
+
+    #[test]
+    fn reload_from_feature_config_applies_new_hooks() {
+        // 与 CLI 接线一致:reload_from_feature_config 用于从重新加载的
+        // RuntimeConfig 原子替换 hooks。
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet("printf 'v1'")],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let new_feature = RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
+            vec![shell_snippet("printf 'v2'")],
+            Vec::new(),
+            Vec::new(),
+        ));
+        runner.reload_from_feature_config(&new_feature);
+
+        let result = runner.run_pre_tool_use("Read", r#"{"path":"a.txt"}"#);
+        assert!(result.messages().iter().any(|m| m == "v2"));
+    }
+
+    #[test]
+    fn spawn_lifecycle_event_returns_immediately_and_runs_in_background() {
+        // design-gaps #1「异步 HookRunner」:生命周期事件 fire-and-forget,
+        // spawn 立即返回(不阻塞对话循环),hook 在后台线程执行。
+        let marker = std::env::temp_dir().join(format!(
+            "claw-hook-spawn-{}.marker",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let marker_bash = marker.display().to_string().replace('\\', "/");
+        let mut config = RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new());
+        config.add_lifecycle(
+            "Stop",
+            HookDefinition::command(format!("sleep 1; echo done > {marker_bash}")),
+        );
+        let runner = HookRunner::new(config);
+
+        let start = Instant::now();
+        runner.spawn_lifecycle_event(HookEvent::Stop, "turn_completed".to_string());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "spawn 应立即返回，实际耗时 {elapsed:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "后台 hook 应在 ~1s 后写入 marker 文件");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn unconfigured_timeout_respects_global_budget() {
+        // design-gaps #1:即使 hook 未配置独立 timeout,整体执行也不超过全局
+        // 预算(这里用测试 override 缩短到 400ms),避免失控 hook 无限期阻塞。
+        HOOK_BUDGET_OVERRIDE_MS.store(400, Ordering::Relaxed);
+        let defs = vec![HookDefinition::command("sleep 5")];
+        let start = Instant::now();
+        let result = HookRunner::run_definitions(
+            HookEvent::PreToolUse,
+            &defs,
+            "bash",
+            "{}",
+            None,
+            false,
+            None,
+            None,
+        );
+        HOOK_BUDGET_OVERRIDE_MS.store(0, Ordering::Relaxed);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "预算应限制总执行时间，实际耗时 {elapsed:?}"
+        );
+        assert!(result.is_failed());
+        assert!(result.messages().iter().any(|m| m.contains("timed out")));
     }
 
     #[cfg(windows)]

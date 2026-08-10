@@ -116,8 +116,17 @@ impl PersistenceManager {
         let content =
             serde_json::to_string_pretty(data).map_err(|e| format!("serialize failed: {e}"))?;
 
-        // Atomic write: write to temp file, then rename
-        let tmp_path = self.path.with_extension("tmp");
+        // Atomic write: write to unique temp file, then rename.
+        // 固定 tmp 名在多实例并发写同一路径时会被对方持有句柄 → os error 5。
+        // 用 pid + 纳秒后缀保证唯一,消除实例间冲突。
+        let tmp_path = self.path.with_file_name(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or_default()
+        ));
         std::fs::write(&tmp_path, content).map_err(|e| format!("write failed: {e}"))?;
         std::fs::rename(&tmp_path, &self.path).map_err(|e| format!("rename failed: {e}"))?;
 
@@ -162,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_persistence_roundtrip() {
-        let tmp = std::env::temp_dir().join("im-bridge-test-sessions.json");
+        let tmp = std::env::temp_dir().join("im-bridge-test-roundtrip.json");
         let _ = std::fs::remove_file(&tmp);
 
         let mgr = PersistenceManager::with_path(tmp.clone());
@@ -194,5 +203,30 @@ mod tests {
         let mgr = PersistenceManager::with_path(PathBuf::from("/nonexistent/path/test.json"));
         let data = mgr.load();
         assert!(data.sessions.is_empty());
+    }
+
+    /// save 成功后临时文件必须被 rename 清理,目录中不得残留 *.tmp。
+    #[test]
+    fn test_persistence_no_tmp_leftover() {
+        let tmp = std::env::temp_dir().join("im-bridge-test-no-tmp-leftover.json");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mgr = PersistenceManager::with_path(tmp.clone());
+        let data = PersistenceData::default();
+        mgr.save(&data).unwrap();
+
+        let dir = tmp.parent().unwrap();
+        let stem = tmp.file_stem().unwrap().to_string_lossy().to_string();
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name == format!("{stem}.tmp") || name.starts_with(&format!(".{stem}."))
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected tmp leftovers: {leftovers:?}");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

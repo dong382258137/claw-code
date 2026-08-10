@@ -135,11 +135,34 @@ export interface SessionUpdateParams {
     update: SessionUpdate;
 }
 
-/** ACP 0.10.4 SessionUpdate 枚举子集 */
+/**
+ * ACP 0.10.4 SessionUpdate（内部 tag 为 `sessionUpdate`，variant 为 snake_case）
+ *
+ * wire 示例:
+ * { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "..." } }
+ */
 export type SessionUpdate =
-    | { type: 'AgentMessageChunk'; content: { type: 'text'; text: string } }
-    | { type: 'ToolCall'; toolCallId: string; toolName: string; status: 'pending' | 'completed' | 'failed'; input?: unknown }
-    | { type: 'ToolCallStatus'; toolCallId: string; status: 'pending' | 'completed' | 'failed' };
+    | {
+          sessionUpdate: 'agent_message_chunk';
+          content: { type: 'text'; text: string };
+      }
+    | {
+          sessionUpdate: 'user_message_chunk';
+          content: { type: 'text'; text: string };
+      }
+    | {
+          sessionUpdate: 'tool_call';
+          id: string;
+          toolName: string;
+          status: 'pending' | 'completed' | 'failed';
+          input?: unknown;
+      }
+    | {
+          sessionUpdate: 'tool_call_update';
+          id: string;
+          status: 'pending' | 'completed' | 'failed';
+          title?: string;
+      };
 
 /** 扩展配置（对应 package.json configuration） */
 export interface ClawConfig {
@@ -148,4 +171,9 @@ export interface ClawConfig {
     permissionMode: 'read-only' | 'workspace-write' | 'danger-full-access';
     autoStart: boolean;
     logLevel: 'error' | 'warn' | 'info' | 'debug';
+    /**
+     * API Key 配置状态（存 SecretStorage，不在 settings.json 明文保存）。
+     * `configured=true` 表示用户已在向导中填过 key。
+     */
+    apiKeyConfigured?: boolean;
 }

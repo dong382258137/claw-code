@@ -64,8 +64,9 @@ pub use self::lane_bridge::{flush_lane_events_to_acp, lane_event_to_session_upda
 // 导出 1.3 的公开类型(仅在 acp-1_5 feature 启用时可见)。
 #[cfg(feature = "acp-1_5")]
 pub use self::agent_v1_3::{
-    ClawAgentV13, ClawAgentV13ConnectionSlot, PermissionError, PermissionOutcome,
-    PermissionRequest, ReadError, WriteError,
+    AgentCommand, ClawAgentV13, ClawAgentV13Builder, ClawAgentV13Config,
+    ClawAgentV13ConnectionSlot, PermissionError, PermissionOutcome, PermissionRequest,
+    ReadError, WriteError,
 };
 #[cfg(feature = "acp-1_5")]
 pub use self::spawn_v1_3::{spawn_claw_shell_v1_3, SpawnedAgentV13};

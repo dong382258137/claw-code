@@ -128,7 +128,12 @@ use tools::{
 };
 
 // ACP stdio server:把 ClawAgent 通过 stdin/stdout JSON-RPC 暴露给外部编辑器
+// 协议版本由 feature 决定:默认 acp-0_10(0.10.4),acp-1_5(1.3) 需
+// --no-default-features --features acp-1_5 编译。
+#[cfg(all(feature = "acp-0_10", not(feature = "acp-1_5")))]
 use claw_shell::{run_stdio_agent, ClawAgentBuilder};
+#[cfg(feature = "acp-1_5")]
+use claw_shell::{run_stdio_agent_v1_3, ClawAgentV13Builder};
 use tokio_util::sync::CancellationToken;
 
 // 从 crate root 引入共享符号（CliOutputFormat、ModelProvenance、共享 helper 等）
@@ -626,6 +631,12 @@ pub(crate) struct LiveCli {
     /// 细粒度诊断回调：在 run_turn 关键路径埋点，写入 claw-diag.log。
     #[cfg(feature = "full-tui")]
     diag_callback: Option<Box<dyn Fn(String) + Send>>,
+    /// 工具完成回调（P-fix）：runtime 内置工具（log_decision 等）不经
+    /// CliToolExecutor，不 emit ToolResult 事件，导致 TUI ToolCard 永久 ⏳。
+    /// 此回调在 prepare_turn_runtime 注入 runtime 的 tool_result_callback，
+    /// 转发为 StatusEvent::ToolResult 让 TUI 闭合卡片。
+    #[cfg(feature = "full-tui")]
+    tool_result_callback: Option<runtime::ToolResultCallback>,
 }
 
 pub(crate) struct BuiltRuntime {
@@ -807,6 +818,8 @@ impl LiveCli {
             external_abort_signal: None,
             #[cfg(feature = "full-tui")]
             diag_callback: None,
+            #[cfg(feature = "full-tui")]
+            tool_result_callback: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -969,6 +982,17 @@ impl LiveCli {
         if let Some(cb) = self.diag_callback.take() {
             if let Some(rt) = runtime.runtime.take() {
                 runtime.runtime = Some(rt.with_diag_callback(cb));
+            }
+        }
+        // P-fix:将 TUI 层的 tool_result_callback 注入 runtime,让内置工具
+        // (log_decision 等)完成后补发 ToolResult 事件闭合 ToolCard。
+        // 仅在有 status_emitter(TUI 模式)时注入,CLI/headless 无 UI 消费。
+        #[cfg(feature = "full-tui")]
+        if self.status_emitter.is_some() {
+            if let Some(cb) = self.tool_result_callback.take() {
+                if let Some(rt) = runtime.runtime.take() {
+                    runtime.runtime = Some(rt.with_tool_result_callback(cb));
+                }
             }
         }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal.clone());
@@ -2709,6 +2733,20 @@ impl LiveCli {
         self.diag_callback = None;
     }
 
+    /// 工具完成回调支持：设置 tool_result_callback，供 TUI 闭合
+    /// runtime 内置工具（log_decision 等）的 ToolCard。参数
+    /// (tool_use_id, tool_name, output, is_error)。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn set_tool_result_callback(&mut self, cb: runtime::ToolResultCallback) {
+        self.tool_result_callback = Some(cb);
+    }
+
+    /// 工具完成回调支持：清空 tool_result_callback（turn 结束后调用）。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn clear_tool_result_callback(&mut self) {
+        self.tool_result_callback = None;
+    }
+
     /// TUI 模式下设置本地命令输出捕获 buffer。设置后，`tui_println` 会把
     /// 内容追加到此 buffer 而非 stdout，避免破坏 alternate screen。
     /// 由 TuiApp 在执行斜杠命令前调用。
@@ -2757,6 +2795,19 @@ pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn st
     let cwd = env::current_dir()?;
     #[cfg(feature = "full-tui")]
     crate::diag_log(&format!("[build_system_prompt] cwd={}", cwd.display()));
+
+    // Step 4.3:在 repomap 渲染前初始化 LSP server。
+    // build_system_prompt 先于 build_runtime 执行,若不在此提前 spawn,
+    // load_prompt_extras 里的 is_server_spawned("rust") 恒为 false,
+    // render_with_lsp(跨模块语义重要性)永远不会生效。
+    // best-effort:未配置 lspServers 或 spawn 失败时不阻断启动。
+    // 注:build_runtime 阶段会再次调用 init_lsp_from_config,
+    // 对已 spawn 的语言返回 "already spawned" 错误,被忽略,无害。
+    let loader = ConfigLoader::default_for(&cwd);
+    if let Ok(config) = loader.load() {
+        let _ = init_lsp_from_config(&config, &cwd);
+    }
+
     let extras = load_prompt_extras(&cwd);
     #[cfg(feature = "full-tui")]
     crate::diag_log(
@@ -2809,7 +2860,15 @@ pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
         None
     } else {
         let mut map = RepoMap::new(cwd).with_max_tokens(1024);
-        let rendered = map.render();
+        // Step 4.3:若 rust-analyzer 已 spawn,用 render_with_lsp 获得 LSP
+        // references 语义重要性(regex 子串匹配在 monorepo 跨模块定位不准)。
+        // 仅在已 spawn 时启用,避免 prompt 组装阶段意外触发 slow auto-start。
+        let registry = tools::global_lsp_registry();
+        let rendered = if registry.is_server_spawned("rust") {
+            map.render_with_lsp(registry)
+        } else {
+            map.render()
+        };
         if rendered.trim().is_empty() {
             None
         } else {
@@ -3065,6 +3124,12 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 从 GlobalToolRegistry 生成(描述与 mvp_tool_specs 单源一致),
     // build_subagent_context 按 capability 白名单过滤后注入 Available Tools 层。
     runtime = runtime.with_tool_catalog(subagent_tool_catalog(&tool_registry));
+    // design-gaps #1:启用 hooks 配置热重载 — 每 turn 检查配置源
+    // (settings.json / .claw.json 等)的 mtime,变化则原子替换 hooks 配置,
+    // 无需重启会话。加载失败(如 cwd 不可用)时静默保持默认行为。
+    if let Ok(cwd) = env::current_dir() {
+        runtime = runtime.with_hooks_hot_reload(ConfigLoader::default_for(cwd));
+    }
     // Harness C(Context Management)层接入:ContextAssembler 统一 prompt 注入。
     // 收集 Memory/Goal/Plan/remediation 等动态内容到 assembler,
     // 由 assemble() 按 7 级优先级栈排序,TokenBudget 控制各源上限。
@@ -3093,6 +3158,13 @@ pub(crate) fn build_runtime_with_plugin_state(
     runtime = runtime
         .with_verifier_agent(runtime::VerifierAgent::new())
         .with_trace_analyzer(runtime::TraceAnalyzer::new());
+    // design-gaps #2:注入 self-evolving harness archive。
+    // 让会话运行时每 evolution_interval turn 自动执行 weakness mining +
+    // 规则式 Proposer + 两重门控验证,失败教训跨会话沉淀。
+    // 打开失败只静默跳过(archive 是可选增强,不应阻塞启动)。
+    if let Ok(cwd) = env::current_dir() {
+        runtime = runtime.with_harness_evolution(cwd);
+    }
     // Epic 2:注入 MultiAgentCoordinator,启用 subagent-as-tool 路由。
     // 注入后,主 agent 可通过 dispatch_subagent tool 派发子 agent,
     // 通过 check_subagent tool 查询状态/结果。子 agent 走独立 LLM 请求 +
@@ -3611,13 +3683,25 @@ pub fn run_acp_serve(
     // 5. 构造 system_prompt
     let system_prompt = build_system_prompt(&model)?;
 
-    // 6. 组装 ClawAgentBuilder
-    let builder = ClawAgentBuilder::new(api_client, policy, system_prompt);
-
-    // 7. 启动 stdio ACP 服务器(阻塞直到 stdin EOF 或 cancel)
-    //    MVP 阶段不接 Ctrl+C,靠 stdin EOF 退出
+    // 6. 按 feature 组装 builder 并启动 stdio ACP 服务器(阻塞直到 stdin EOF 或 cancel)
+    //    默认 acp-0_10(0.10.4);acp-1_5(1.3) 需 --no-default-features --features acp-1_5 编译。
+    //    MVP 阶段不接 Ctrl+C,靠 stdin EOF 退出。
     let cancel = CancellationToken::new();
-    run_stdio_agent(builder, cancel)?;
+
+    #[cfg(all(feature = "acp-0_10", not(feature = "acp-1_5")))]
+    {
+        let builder = ClawAgentBuilder::new(api_client, policy, system_prompt);
+        run_stdio_agent(builder, cancel)?;
+    }
+
+    #[cfg(feature = "acp-1_5")]
+    {
+        // 1.3 路径:ClawAgentV13Builder 注入 api_client,turn 在命令循环中
+        // 真实驱动 ConversationRuntime(Stage 3 接线)。
+        let builder = ClawAgentV13Builder::new(api_client, policy, system_prompt);
+        let agent = builder.build();
+        run_stdio_agent_v1_3(agent, cancel)?;
+    }
 
     Ok(())
 }

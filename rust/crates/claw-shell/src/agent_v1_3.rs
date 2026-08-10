@@ -30,6 +30,7 @@
 
 use std::collections::HashSet;
 use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,23 +79,16 @@ where
     C: ApiClient + 'static,
 {
     /// 当前活跃的 runtime。initialize 阶段为 None,new_session 后创建。
-    ///
-    /// Stage 2 占位:本字段在 stage 3 引入 ClawAgentV13Builder 后才填充。
-    /// 保留字段是为了 stage 3 添加 builder 时不需要破坏性改 struct。
-    #[allow(dead_code)]
     runtime: RefCell<Option<ConversationRuntime<C, StaticToolExecutor>>>,
 
     /// API client(在 new_session 时移入 runtime,故用 Option)。
-    ///
-    /// Stage 2 占位:同上,stage 3 才填充。
-    #[allow(dead_code)]
     api_client: RefCell<Option<C>>,
 
     /// Tool executor(在 new_session 时移入 runtime,故用 Option)。
-    ///
-    /// Stage 2 占位:同上,stage 3 才填充。
-    #[allow(dead_code)]
     tool_executor: RefCell<Option<StaticToolExecutor>>,
+
+    /// Agent 配置(在 create_session 时注入 runtime)。
+    config: ClawAgentV13Config,
 
     /// 活跃 session 的 ID 集合。
     /// 1.3 中 session 通过 `SessionId` 标识,session 状态由 `Component` 管理。
@@ -119,8 +113,81 @@ where
     /// 与 `client_connection` 一样用 `Arc<Mutex<...>>` 以满足 Send。
     permission_cache: Arc<tokio::sync::Mutex<HashSet<(String, String)>>>,
 
+    /// 用于 cancel 当前 turn 的 abort signal。
+    /// 在 create_session 时创建并 clone 一份注入 runtime,
+    /// 保留一份供 cancel() 调用 abort()。
+    turn_abort_signal: RefCell<Option<runtime::HookAbortSignal>>,
+
     /// 占位字段,确保 `C` 类型参数被使用。
     _marker: PhantomData<C>,
+}
+
+/// Agent 构造配置(Stage 3,供 `ClawAgentV13Builder` 使用)。
+#[derive(Debug, Clone)]
+pub struct ClawAgentV13Config {
+    pub system_prompt: Vec<String>,
+    pub permission_policy: runtime::PermissionPolicy,
+}
+
+impl Default for ClawAgentV13Config {
+    fn default() -> Self {
+        Self {
+            system_prompt: Vec::new(),
+            permission_policy: runtime::PermissionPolicy::new(runtime::PermissionMode::WorkspaceWrite),
+        }
+    }
+}
+
+/// Builder:在线程外构造(持有 Send 数据),然后在 LocalSet 内 `build()`。
+///
+/// 与 0.10.4 的 `ClawAgentBuilder` 对应:`StaticToolExecutor` 在 `build()`
+/// 内创建(因其内部 `Box<dyn FnMut>` 非 Send),确保不跨线程 move。
+pub struct ClawAgentV13Builder<C>
+where
+    C: ApiClient + Send + 'static,
+{
+    api_client: C,
+    config: ClawAgentV13Config,
+}
+
+impl<C> ClawAgentV13Builder<C>
+where
+    C: ApiClient + Send + 'static,
+{
+    /// 创建 builder。
+    ///
+    /// # 参数
+    /// - `api_client`:上游 API 客户端(必须 `Send`)
+    /// - `permission_policy`:权限策略
+    /// - `system_prompt`:系统提示词
+    #[must_use]
+    pub fn new(
+        api_client: C,
+        permission_policy: runtime::PermissionPolicy,
+        system_prompt: Vec<String>,
+    ) -> Self {
+        Self {
+            api_client,
+            config: ClawAgentV13Config {
+                system_prompt,
+                permission_policy,
+            },
+        }
+    }
+
+    /// 在 LocalSet 内构造 `ClawAgentV13`。
+    ///
+    /// `StaticToolExecutor` 在此创建(非 Send,必须在线程内)。
+    #[must_use]
+    pub fn build(self) -> ClawAgentV13<C> {
+        let mut tool_executor = StaticToolExecutor::new();
+        let _ = &mut tool_executor; // 预留工具 handler 注册点
+        let mut agent = ClawAgentV13::<C>::new();
+        agent.config = self.config;
+        *agent.api_client.borrow_mut() = Some(self.api_client);
+        *agent.tool_executor.borrow_mut() = Some(tool_executor);
+        agent
+    }
 }
 
 impl<C> ClawAgentV13<C>
@@ -162,10 +229,12 @@ where
             runtime: RefCell::new(None),
             api_client: RefCell::new(None),
             tool_executor: RefCell::new(None),
+            config: ClawAgentV13Config::default(),
             sessions: RefCell::new(HashSet::new()),
             active_session: RefCell::new(None),
             client_connection: Arc::new(tokio::sync::Mutex::new(None)),
             permission_cache: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            turn_abort_signal: RefCell::new(None),
             _marker: PhantomData,
         }
     }
@@ -424,6 +493,122 @@ where
         }
         count
     }
+
+    // ===== Stage 3:会话生命周期方法 =====
+    //
+    // 由 `run_agent_on_io_v1_3` 的命令循环调用。由于 dispatch handler
+    // 闭包要求 `Send` 而 agent 非 `Send`,这些方法只能从持有 agent 的
+    // 命令循环侧调用(通过 mpsc channel 转发请求)。
+
+    /// 创建新会话:从 `Option` 取出 api_client + tool_executor,构造
+    /// `ConversationRuntime` 并注入认知外骨骼组件(对齐 0.10.4 路径)。
+    ///
+    /// 返回分配的 `SessionId`,并设为当前活跃 session。
+    pub fn create_session(&self, cwd: PathBuf) -> Result<schema::SessionId, acp::Error> {
+        let api_client = self.api_client.borrow_mut().take().ok_or_else(|| {
+            acp::util::internal_error("api_client already consumed by a previous session")
+        })?;
+        let tool_executor = self.tool_executor.borrow_mut().take().ok_or_else(|| {
+            acp::util::internal_error("tool_executor already consumed by a previous session")
+        })?;
+
+        let session = runtime::Session::new().with_workspace_root(cwd.clone());
+        let session_id = schema::SessionId::new(session.session_id.clone());
+        let mut runtime = ConversationRuntime::new(
+            session,
+            api_client,
+            tool_executor,
+            self.config.permission_policy.clone(),
+            self.config.system_prompt.clone(),
+        );
+
+        // 认知外骨骼注入(与 0.10.4 `ClawAgent::new_session` 对齐):
+        // DecisionLog / ProjectTopology / RefactorTransaction。
+        if let Ok(decision_log) = runtime::DecisionLog::open(&cwd) {
+            runtime = runtime.with_decision_log(decision_log);
+        }
+        let topology = std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(
+            cwd.clone(),
+        ));
+        runtime = runtime.with_project_topology(topology);
+        let tx = runtime::RefactorTransaction::new(cwd.clone());
+        runtime = runtime.with_refactor_transaction(tx);
+
+        // cancel 支持:创建 abort signal 注入 runtime。
+        let abort_signal = runtime::HookAbortSignal::new();
+        runtime = runtime.with_hook_abort_signal(abort_signal.clone());
+        *self.turn_abort_signal.borrow_mut() = Some(abort_signal);
+
+        *self.runtime.borrow_mut() = Some(runtime);
+        self.set_active_session(session_id.clone());
+        Ok(session_id)
+    }
+
+    /// 运行一轮 prompt:同步阻塞直到 turn 完成(与 0.10.4 一致,非真实流式)。
+    ///
+    /// turn 完成后:
+    /// 1. 提取 assistant 文本并推送 `AgentMessageChunk` notification;
+    /// 2. drain LaneEvent 并推送为 `SessionNotification`(IDE 实时感知进度)。
+    pub async fn run_prompt(
+        &self,
+        session_id: &schema::SessionId,
+        text: String,
+    ) -> Result<schema::StopReason, acp::Error> {
+        let runtime_opt = self.runtime.borrow_mut().take();
+        let mut runtime = runtime_opt.ok_or_else(|| {
+            acp::util::internal_error("no active session: call session/new first")
+        })?;
+
+        // 清除上一 turn 残留的 sticky abort 状态。
+        if let Some(signal) = self.turn_abort_signal.borrow().as_ref() {
+            signal.reset();
+        }
+
+        let turn_result = runtime.run_turn_async(text, None).await;
+        match turn_result {
+            Ok(_summary) => {}
+            Err(e) => {
+                *self.runtime.borrow_mut() = Some(runtime);
+                let err_msg = e.to_string();
+                if err_msg.contains("turn interrupted by user") {
+                    tracing::info!("claw-agent-v1-3: turn cancelled by user");
+                    return Ok(schema::StopReason::Cancelled);
+                }
+                return Err(acp::util::internal_error(err_msg));
+            }
+        }
+
+        // 推送 assistant 文本(turn 完成后一次性,非流式)。
+        let assistant_text = extract_assistant_text_v1_3(&runtime);
+        if !assistant_text.is_empty() {
+            if let Ok(conn) = self.acquire_connection().await {
+                let notif = schema::SessionNotification::new(
+                    session_id.clone(),
+                    schema::SessionUpdate::AgentMessageChunk(schema::ContentChunk::new(
+                        schema::ContentBlock::Text(schema::TextContent::new(assistant_text)),
+                    )),
+                );
+                if let Err(e) = conn.send_notification(notif) {
+                    tracing::debug!("run_prompt: send_notification failed: {e}");
+                }
+            }
+        }
+
+        // drain LaneEvent → SessionNotification 桥接。
+        self.flush_lane_events(session_id).await;
+
+        *self.runtime.borrow_mut() = Some(runtime);
+        Ok(schema::StopReason::EndTurn)
+    }
+
+    /// 取消当前 turn(cancel notification 处理)。通过 abort signal
+    /// 中断 run_turn 主循环,下一次检查点返回 `Cancelled`。
+    pub fn cancel(&self, _session_id: &schema::SessionId) {
+        if let Some(signal) = self.turn_abort_signal.borrow().as_ref() {
+            signal.abort();
+            tracing::info!("claw-agent-v1-3: cancellation triggered");
+        }
+    }
 }
 
 impl<C> Default for ClawAgentV13<C>
@@ -433,6 +618,56 @@ where
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 命令循环与 dispatch handler 之间的通道命令(Stage 3)。
+///
+/// dispatch handler 闭包要求 `Send`,而 `ClawAgentV13` 持有 `RefCell`
+/// 非 `Send`。因此 handler 不直接调用 agent 方法,而是通过
+/// `UnboundedSender<AgentCommand>` 把请求发给持有 agent 的命令循环,
+/// 并用 `oneshot::Sender` 回传结果。
+pub enum AgentCommand {
+    /// 创建新会话。
+    NewSession {
+        cwd: PathBuf,
+        tx: tokio::sync::oneshot::Sender<Result<schema::SessionId, String>>,
+    },
+    /// 运行一轮 prompt(已提取文本)。
+    Prompt {
+        session_id: schema::SessionId,
+        prompt: String,
+        tx: tokio::sync::oneshot::Sender<Result<schema::StopReason, String>>,
+    },
+    /// 取消当前 turn。
+    Cancel {
+        session_id: schema::SessionId,
+    },
+}
+
+/// 从 `ConversationRuntime` 提取最后一条 assistant 消息的文本(对齐 0.10.4)。
+fn extract_assistant_text_v1_3<C>(
+    runtime: &ConversationRuntime<C, StaticToolExecutor>,
+) -> String
+where
+    C: ApiClient + 'static,
+{
+    runtime
+        .session()
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == runtime::MessageRole::Assistant)
+        .map(|m| {
+            m.blocks
+                .iter()
+                .filter_map(|b| match b {
+                    runtime::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 /// 由 Builder handler 闭包持有的连接 slot,共享给 ClawAgentV13。

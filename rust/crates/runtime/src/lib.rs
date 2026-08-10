@@ -108,6 +108,7 @@ pub mod sandbox;
 mod session;
 pub mod session_control;
 pub mod trace_analyzer;
+pub mod harness_evolution;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
@@ -163,7 +164,7 @@ pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_from_env_opt, ApiClient,
     ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
     default_subagent_tool_catalog, PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor,
-    ToolError, ToolExecutor, ToolSummary, TurnSummary,
+    ToolError, ToolExecutor, ToolResultCallback, ToolSummary, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_roots, glob_search,

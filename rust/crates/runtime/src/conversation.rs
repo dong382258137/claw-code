@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+﻿use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -9,8 +9,10 @@ use telemetry::SessionTracer;
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
-use crate::config::RuntimeFeatureConfig;
-use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::hooks::{
+    HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
+};
 use crate::memory::{
     extract_nudge_actions, should_nudge, NudgeAction, NudgeConfig, PersistentMemory,
 };
@@ -807,18 +809,89 @@ pub enum ReactiveCompactState {
     /// made for this turn. Any further prompt-too-long error is returned as-is.
     FullCompactDone,
 }
-/// 主对话单 turn 的最大迭代次数(护栏)。
+/// 主对话单 turn 的软迭代阈值:达到该轮次时注入收敛警告,不中止。
+///
+/// 软硬双层护栏的"软"层(硬上限见 [`DEFAULT_MAX_ITERATIONS`])。背景:
+/// 合法的大型只读根因分析(如 WebSocket 断连排查)可能超过 64 次迭代
+/// 仍在推进,若在此直接中止会误杀仍在产出的 turn(2026-08-10 实测误杀:
+/// 64 次调用全为只读侦察、模型输出 44 段实质分析文本、已发现关键线索
+/// 仍被 64 硬上限终止)。改为 64 轮处先向 session 注入收敛警告,引导模型
+/// 总结已有发现或询问用户方向;仅在恰好的轮次触发一次(不重复注入)。
+pub const SOFT_MAX_ITERATIONS: usize = 64;
+
+/// 主对话单 turn 的最大迭代次数(硬上限护栏)。
 ///
 /// 原实现用 `usize::MAX`(无限),诊断/工具调用死循环只能靠用户 Ctrl+C 终止。
-/// 64 轮足以完成绝大多数合法任务(含复杂多文件重构);超限时
-/// [`ConversationRuntime::run_turn_async`] 返回明确错误,替代无限挂起。
+/// 超限时 [`ConversationRuntime::run_turn_async`] 返回明确错误,替代无限挂起。
+/// 现为软硬双层:64 轮处先由 [`SOFT_MAX_ITERATIONS`] 注入收敛警告,模型有
+/// 收敛机会;192 轮处才真正中止,保留成本护栏的同时消除对长程分析任务的
+/// 误杀。
 ///
 /// 子代理(subagent)单独走 `DEFAULT_AGENT_MAX_ITERATIONS`(32)。
-pub const DEFAULT_MAX_ITERATIONS: usize = 64;
+pub const DEFAULT_MAX_ITERATIONS: usize = 192;
 
 /// 工具调用循环检测的跨 turn 保留窗口(15 分钟)。
 /// 窗口内相同工具调用跨 turn 累积计数;超过窗口未出现则衰减清零。
 pub const LOOP_DECAY_WINDOW_MS: u64 = 15 * 60 * 1000;
+
+/// hooks 配置热重载状态(design-gaps #1「配置热重载」)。
+///
+/// 记录配置源的修改时间,`maybe_reload` 在每轮 turn 开始时检查:
+/// 任一配置源(settings.json / .claw.json 等)变化则重新
+/// `ConfigLoader::load()` 并通过 [`HookRunner::reload`] 原子替换 hooks
+/// 配置——**会话无需重启**,下一轮 hook 调用立即使用新配置。
+struct HookReloadWatch {
+    loader: ConfigLoader,
+    last_mtimes: Vec<(PathBuf, Option<SystemTime>)>,
+    last_hooks: RuntimeHookConfig,
+}
+
+impl HookReloadWatch {
+    fn new(loader: ConfigLoader, initial_hooks: RuntimeHookConfig) -> Self {
+        let last_mtimes = Self::snapshot_mtimes(&loader);
+        Self {
+            loader,
+            last_mtimes,
+            last_hooks: initial_hooks,
+        }
+    }
+
+    fn snapshot_mtimes(loader: &ConfigLoader) -> Vec<(PathBuf, Option<SystemTime>)> {
+        loader
+            .discover()
+            .into_iter()
+            .map(|entry| {
+                let mtime =
+                    std::fs::metadata(&entry.path).and_then(|m| m.modified()).ok();
+                (entry.path, mtime)
+            })
+            .collect()
+    }
+
+    /// 检查配置源是否变化;变化则重载 hooks 配置。返回 true 表示发生了重载。
+    fn maybe_reload(&mut self, hook_runner: &HookRunner) -> bool {
+        let now_mtimes = Self::snapshot_mtimes(&self.loader);
+        if now_mtimes == self.last_mtimes {
+            return false;
+        }
+        self.last_mtimes = now_mtimes;
+        let Ok(config) = self.loader.load() else {
+            return false;
+        };
+        let hooks = config.hooks().clone();
+        if hooks == self.last_hooks {
+            return false;
+        }
+        self.last_hooks = hooks.clone();
+        hook_runner.reload(hooks);
+        true
+    }
+}
+
+/// 工具完成回调类型（P-fix）：runtime 内置工具（log_decision 等）执行完成后
+/// 触发，参数 (tool_use_id, tool_name, output, is_error)。
+/// 上层（TUI）注入后转发为 `StatusEvent::ToolResult` 闭合 ToolCard。
+pub type ToolResultCallback = Box<dyn Fn(&str, &str, &str, bool) + Send>;
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
@@ -830,6 +903,10 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
+    /// hooks 配置热重载(design-gaps #1)。`Some` 时每 turn 开始检查配置源
+    /// mtime,变化则原子重载 hooks 配置。`None` = 不启用热重载(默认关闭,
+    /// 保持旧行为)。
+    hooks_reload: Option<HookReloadWatch>,
     auto_compaction_input_tokens_threshold: u32,
     /// 模型 context window 大小,用于动态计算 compaction 阈值。
     /// 设置后 `maybe_auto_compact` 会根据 context window
@@ -841,6 +918,12 @@ pub struct ConversationRuntime<C, T> {
     /// 细粒度诊断回调：在 `run_turn` 关键路径埋点，帮助定位"会话卡死"问题。
     /// 每个事件自动带时间戳，回调签名 `Fn(String) + Send`。
     diag_callback: Option<Box<dyn Fn(String) + Send>>,
+    /// 工具完成回调（P-fix）：runtime 内置工具（log_decision 等）不经
+    /// `CliToolExecutor`，不 emit `StatusEvent::ToolResult`，导致 TUI
+    /// ToolCard 永久显示 ⏳。此回调在内置工具执行完成后触发，
+    /// 参数 (tool_use_id, tool_name, output, is_error)，供上层（TUI）
+    /// 转发为 ToolResult 事件以闭合卡片。
+    tool_result_callback: Option<ToolResultCallback>,
     session_tracer: Option<SessionTracer>,
     /// Optional persistent memory surface. When present, the runtime runs a
     /// rule-based nudge pass every `NudgeConfig::interval_turns` turns to keep
@@ -849,6 +932,12 @@ pub struct ConversationRuntime<C, T> {
     /// Turns elapsed since the last nudge fired. Reset to 0 whenever a nudge
     /// runs.
     turns_since_last_nudge: usize,
+    /// Phase 3(self-evolving harness):自进化 turn 计数器,每 `evolution_interval`
+    /// turn 触发一次 evolve()。见 docs/2026-07-24-p3-self-evolving-harness-design.md。
+    turns_since_last_evolution: usize,
+    /// Phase 3:HarnessArchive(Option,可禁用)。`Some` 时每 `evolution_interval`
+    /// turn 自动沉淀失败教训为 HarnessEdit,并把 Active edits 注入 dynamic_sections。
+    harness_archive: Option<crate::harness_evolution::HarnessArchive>,
     /// Recovery orchestrator invoked on the `run_turn` failure path. Wraps
     /// `recovery_recipes` so callers can request recovery by
     /// [`WorkerFailureKind`] without coupling to recipe lookup. Each scenario
@@ -1041,14 +1130,18 @@ where
             max_iterations: DEFAULT_MAX_ITERATIONS,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
+            hooks_reload: None,
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
             context_window: None,
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             diag_callback: None,
+            tool_result_callback: None,
             session_tracer: None,
             persistent_memory: None,
             turns_since_last_nudge: 0,
+            turns_since_last_evolution: 0,
+            harness_archive: None,
             recovery_orchestrator: RecoveryOrchestrator::default(),
             plan_mode_enabled: true,
             active_plan: None,
@@ -1133,6 +1226,15 @@ where
         self
     }
 
+    /// 注入工具完成回调（P-fix）：runtime 内置工具执行完成后触发，
+    /// 供上层（TUI）转发为 `StatusEvent::ToolResult` 以闭合 ToolCard。
+    /// 参数 (tool_use_id, tool_name, output, is_error)。
+    #[must_use]
+    pub fn with_tool_result_callback(mut self, tool_result_callback: ToolResultCallback) -> Self {
+        self.tool_result_callback = Some(tool_result_callback);
+        self
+    }
+
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
@@ -1195,6 +1297,37 @@ where
     #[must_use]
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = Some(root);
+        self
+    }
+
+    /// 启用 hooks 配置热重载(design-gaps #1「配置热重载」)。
+    ///
+    /// 每轮 turn 开始时检查配置源(settings.json / .claw.json 等)的修改
+    /// 时间;任一变化则重新加载并原子替换 hooks 配置,**会话无需重启**,
+    /// 下一轮 hook 调用立即使用新配置。未调用时保持旧行为(启动时加载一次)。
+    #[must_use]
+    pub fn with_hooks_hot_reload(mut self, loader: ConfigLoader) -> Self {
+        let initial_hooks = self.hook_runner.current_config();
+        self.hooks_reload = Some(HookReloadWatch::new(loader, initial_hooks));
+        self
+    }
+
+    /// 启用 self-evolving harness(design-gaps #2)。
+    ///
+    /// 以 `root` 打开 HarnessArchive(共用 `.claw/decision_log.db`,独立
+    /// `harness_edits` 表)。每 `evolution_interval`(默认 10)turn 自动:
+    /// 1. Weakness Mining(复用 TraceAnalyzer 失败聚类);
+    /// 2. 规则式 Proposer 生成 Candidate edits;
+    /// 3. 两重门控验证(Candidate → Active/Retired);
+    ///
+    /// 并把 Active edits 注入 `dynamic_sections`(≤10 条,全量注入 < 1.5K tokens)。
+    ///
+    /// 打开失败(如工作区不可写)时静默禁用,不阻塞会话。
+    #[must_use]
+    pub fn with_harness_evolution(mut self, root: PathBuf) -> Self {
+        if let Ok(archive) = crate::harness_evolution::HarnessArchive::open(&root) {
+            self.harness_archive = Some(archive);
+        }
         self
     }
     /// Phase 4-A:注入 DecisionLog,启用修复经验记录和检索。
@@ -2080,10 +2213,20 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
+        // design-gaps #1:配置热重载 — 每 turn 检查 hooks 配置源是否有变化,
+        // 变化则通过 HookRunner 原子替换,下一轮 hook 调用立即生效,无需重启会话。
+        if let Some(watch) = &mut self.hooks_reload {
+            if watch.maybe_reload(&self.hook_runner) {
+                self.emit_diag("hooks config hot-reloaded at turn start".to_string());
+            }
+        }
+
         // G9.1: SessionStart lifecycle hook — 在 turn 主循环开始前触发,
         // 让外部观察者(session 审计、UI 状态指示器等)感知会话启动。
-        // 返回值不影响主流程,故意丢弃(messages 已在 HookRunner 内部处理)。
-        let _ = self.hook_runner.run_session_start(&self.session.session_id);
+        // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程
+        // (messages 已在 HookRunner 内部处理)。
+        self.hook_runner
+            .spawn_lifecycle_event(HookEvent::SessionStart, self.session.session_id.clone());
 
         // P2-7 修复(升级 v2):跨 turn 循环检测。
         // 原实现每 turn 全量 reset(),跨 turn 的"换参数再诊断"循环不可见
@@ -2120,8 +2263,9 @@ where
 
         // G9.1: UserPromptSubmit lifecycle hook — 用户输入已入 session 后触发,
         // 让外部观察者(敏感词过滤、prompt 审计、telemetry 等)看到原始 prompt。
-        // 返回值不影响主流程,故意丢弃。
-        let _ = self.hook_runner.run_user_prompt_submit(&user_input);
+        // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
+        self.hook_runner
+            .spawn_lifecycle_event(HookEvent::UserPromptSubmit, user_input.clone());
 
         // BUG-6 修复:Harness C(Memory)层接入 — 语义召回。
         // 当 persistent_memory 存在时,调用 semantic_recall 获取 top-3 相关记忆,
@@ -2189,17 +2333,34 @@ where
         loop {
             iterations += 1;
             self.emit_diag(format!("[diag] loop_start iter={iterations}"));
+            // 软阈值(SOFT_MAX_ITERATIONS):达到时注入收敛警告,不中止。
+            // 模型在下一轮迭代即可看到该消息,被引导总结已有发现或询问用户,
+            // 避免"合法的长程分析仍在推进却被硬上限误杀"。仅在恰好的轮次
+            // 触发一次,注入失败静默吞错(不阻断主流程)。
+            if iterations == SOFT_MAX_ITERATIONS {
+                let warning = format!(
+                    "[runtime] 已运行 {} 次迭代仍未收敛。若已接近结论,请总结 \
+                     已有发现并输出最终答案;否则请改变策略或询问用户方向。",
+                    SOFT_MAX_ITERATIONS
+                );
+                let _ = self
+                    .session
+                    .push_message(ConversationMessage::user_text(warning));
+            }
+
+            // 硬上限(max_iterations):真正中止。
             if iterations > self.max_iterations {
                 // BUG-3 修复(升级):超限错误携带诊断上下文。
                 // 原实现裸错误,下一 turn 不知道上次为什么卡住 → 跨 turn 死循环
                 // 仍可能复发。现在错误明确指向 NOTEBOOK <attempted> 段
                 // (Task 2 已自动记录本 turn 所有失败尝试)。
-                let error = RuntimeError::new(
-                    "conversation loop exceeded the maximum number of iterations (64). \
+                let error = RuntimeError::new(format!(
+                    "conversation loop exceeded the maximum number of iterations ({}). \
                      Turn aborted to prevent a runaway loop; failed attempts are \
                      recorded in the NOTEBOOK <attempted> section. Change strategy \
                      or ask the user before retrying.",
-                );
+                    self.max_iterations
+                ));
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
@@ -2268,6 +2429,20 @@ where
                              这是防止长程任务中关键信息丢失的关键步骤。"
                                 .to_string(),
                         );
+                    }
+
+                    // Phase 3(self-evolving harness):注入生效中的 harness edits
+                    // (全量注入,≤10 条)。每条内容为一段"失败教训 → 应对策略"
+                    // 指令,引导 LLM 在本 turn 避免重复犯同类错误。读取失败
+                    // (如 db 损坏)时静默跳过,不阻塞 turn。
+                    if let Some(archive) = &self.harness_archive {
+                        if let Ok(edit_sections) =
+                            crate::harness_evolution::render_for_injection(archive)
+                        {
+                            for section in edit_sections {
+                                system_split.dynamic_sections.push(section);
+                            }
+                        }
                     }
 
                     // 改进点 13:压缩后主动列出可 recall 的归档 tool result。
@@ -2963,6 +3138,16 @@ where
                             return Err(error);
                         }
 
+                        // P-fix:runtime 内置工具(log_decision 等)不经 CliToolExecutor,
+                        // 不 emit StatusEvent::ToolResult,导致 TUI ToolCard 永久 ⏳。
+                        // 在此补发回调,由上层(TUI)转发为 ToolResult 事件闭合卡片。
+                        // 外部工具(executed_via_external_executor=true)已由
+                        // CliToolExecutor 内部 emit,不重复触发。
+                        if !executed_via_external_executor {
+                            if let Some(cb) = &self.tool_result_callback {
+                                cb(&tool_use_id, &tool_name, &output, is_error);
+                            }
+                        }
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
                     PermissionOutcome::Deny { reason } => {
@@ -2970,6 +3155,11 @@ where
                         let _ = self
                             .hook_runner
                             .run_notification(&format!("Tool `{tool_name}` was denied: {reason}"));
+                        // P-fix:权限拒绝同样闭合 ToolCard(显示为 error),
+                        // 避免 TUI 卡片永久 ⏳。
+                        if let Some(cb) = &self.tool_result_callback {
+                            cb(&tool_use_id, &tool_name, &reason, true);
+                        }
                         ConversationMessage::tool_result(
                             tool_use_id,
                             tool_name,
@@ -3261,12 +3451,44 @@ where
             }
         }
 
+        // Phase 3(self-evolving harness):自进化触发(同步限频)。
+        // 规则式路径零 LLM 调用;只在 trace_analyzer + harness_archive 同时
+        // 存在时生效。evolve 失败只打 diag 并清零计数(避免 db 抖动导致
+        // 每 turn 反复重试),不阻塞 turn 结束。
+        if let Some(archive) = &self.harness_archive {
+            if let Some(handle) = &self.trace_analyzer {
+                self.turns_since_last_evolution += 1;
+                let config = crate::harness_evolution::EvolutionConfig::default();
+                if self.turns_since_last_evolution >= config.evolution_interval {
+                    if let Ok(trace) = handle.lock() {
+                        match crate::harness_evolution::evolve(&trace, archive, &config) {
+                            Ok(report) => {
+                                self.emit_diag(format!(
+                                    "harness evolution: {} weaknesses, {} proposals, {} promoted, {} retired, {} skipped",
+                                    report.weaknesses_count,
+                                    report.proposals_count,
+                                    report.promoted_count,
+                                    report.retired_count,
+                                    report.skipped_count
+                                ));
+                            }
+                            Err(e) => {
+                                self.emit_diag(format!("harness evolution error: {e}"));
+                            }
+                        }
+                    }
+                    self.turns_since_last_evolution = 0;
+                }
+            }
+        }
+
         // G9.1: Stop lifecycle hook — turn 主循环正常结束前触发,
         // 让外部观察者(完成通知、telemetry、UI 状态指示器等)感知会话停止。
         // reason 描述结束原因(此处为正常完成);异常路径由各自分支的
         // record_turn_failed 处理,不在此触发 Stop(避免与失败信号竞争)。
-        // 返回值不影响主流程,故意丢弃。
-        let _ = self.hook_runner.run_stop("turn_completed");
+        // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
+        self.hook_runner
+            .spawn_lifecycle_event(HookEvent::Stop, "turn_completed".to_string());
 
         // 方案 C:会话结束时标记 NOTEBOOK <plan> 为 stale。
         // 下一会话首 turn 检测到此标记会注入"刷新 <plan>"提醒,引导 LLM
@@ -3278,8 +3500,11 @@ where
 
         // G9.1: SessionEnd lifecycle hook — turn 完全结束(含 nudge 等清理)后触发,
         // 让外部观察者(session 审计、状态持久化、清理逻辑等)感知会话结束。
-        // 返回值不影响主流程,故意丢弃。
-        let _ = self.hook_runner.run_session_end(&self.session.session_id);
+        // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
+        self.hook_runner.spawn_lifecycle_event(
+            HookEvent::SessionEnd,
+            self.session.session_id.clone(),
+        );
 
         Ok(summary)
     }
@@ -3794,8 +4019,10 @@ where
             }
         }
 
-        // G9.1: SubagentStop lifecycle hook — 子 agent 进入终态时触发
-        let _ = self.hook_runner.run_subagent_stop(&subagent_id);
+        // G9.1: SubagentStop lifecycle hook — 子 agent 进入终态时触发。
+        // 异步 fire-and-forget:不阻塞对话循环。
+        self.hook_runner
+            .spawn_lifecycle_event(HookEvent::SubagentStop, subagent_id.clone());
 
         // 发布终态 SubagentResult lane event
         let event =
@@ -4950,13 +5177,14 @@ where
         // G9.1: PreCompact lifecycle hook — 在 compact_session 实际执行前触发,
         // 让外部观察者(上下文快照、telemetry、审计等)在压缩发生前捕获 pre 状态。
         // context 包含当前 token 用量与阈值,便于 hook 决策是否记录。
-        // 返回值不影响主流程,故意丢弃。
+        // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
         let pre_compact_context = format!(
             "auto_compaction: context_tokens={} threshold={}",
             self.usage_tracker.cumulative_usage().context_tokens(),
             threshold
         );
-        let _ = self.hook_runner.run_pre_compact(&pre_compact_context);
+        self.hook_runner
+            .spawn_lifecycle_event(HookEvent::PreCompact, pre_compact_context);
 
         // §4.7 v3:compaction 前提取决策点,避免设计决策随原始消息消失。
         // MVP 用 Heuristic 策略(零 LLM 成本),v2 升级为 LlmExtract。
@@ -5510,10 +5738,12 @@ mod tests {
         parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, process_tool_uses,
         ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
         PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor, SubagentContext,
-        ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, SESSION_SEARCH_TOOL_SPEC,
+        ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        DEFAULT_MAX_ITERATIONS, SESSION_SEARCH_TOOL_SPEC, SOFT_MAX_ITERATIONS,
     };
     use crate::compact::CompactionConfig;
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::hooks::HookRunner;
     use crate::memory::PersistentMemory;
     use crate::multi_agent::dag::FailFast;
     use crate::multi_agent::SubagentCapability;
@@ -6461,6 +6691,63 @@ mod tests {
     }
 
     #[test]
+    fn hook_reload_watch_detects_config_source_change() {
+        // design-gaps #1「配置热重载」:配置源(settings.json)修改后,
+        // HookReloadWatch 在下轮 turn 检查时检测到变化并原子重载 hooks 配置。
+        let workspace = std::env::temp_dir().join(format!(
+            "claw-hook-watch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        let config_home = workspace.join(".claw");
+        fs::create_dir_all(&config_home).expect("create config home");
+        let settings = config_home.join("settings.json");
+        fs::write(
+            &settings,
+            r#"{"hooks":{"PreToolUse":[{"command":"printf 'v1'"}]}}"#,
+        )
+        .expect("write settings v1");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let config = loader.load().expect("load config");
+        let hooks = config.hooks().clone();
+        let runner = HookRunner::new(hooks.clone());
+        let mut watch = super::HookReloadWatch::new(loader, hooks);
+
+        // 配置未变化:不触发重载。
+        assert!(
+            !watch.maybe_reload(&runner),
+            "未变化的配置不应触发重载"
+        );
+
+        // 修改配置源:检测到变化并重载,下一次 hook 调用使用新配置。
+        // 稍等确保 mtime 变化可观测(低精度文件系统兜底)。
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        fs::write(
+            &settings,
+            r#"{"hooks":{"PreToolUse":[{"command":"printf 'v2'"}]}}"#,
+        )
+        .expect("write settings v2");
+        assert!(watch.maybe_reload(&runner), "配置变化应触发重载");
+        let result = runner.run_pre_tool_use("Read", r#"{"path":"a.txt"}"#);
+        assert!(
+            result.messages().iter().any(|m| m == "v2"),
+            "重载后应使用新 hook 配置"
+        );
+
+        // 再次检查:已记录新 mtime,不重复重载。
+        assert!(
+            !watch.maybe_reload(&runner),
+            "相同配置不应重复重载"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
     fn run_turn_errors_when_max_iterations_is_exceeded() {
         struct LoopingApi;
 
@@ -6540,6 +6827,76 @@ mod tests {
         assert!(
             error.to_string().contains("doom loop detected"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn soft_threshold_injects_convergence_warning_before_hard_limit() {
+        // mock:每轮输出不同文本 + 不同 tool input/output,绕过 LoopDetector
+        // 全部通道(相同input / 相同output / 无产出均不触发),只有硬上限能中止。
+        // 从而验证软硬双层护栏:第 SOFT_MAX_ITERATIONS 轮注入收敛警告,超过
+        // max_iterations 才真正中止(消除"仍在推进的长程分析被硬上限误杀")。
+        struct LongLoopApi {
+            counter: usize,
+        }
+
+        impl ApiClient for LongLoopApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let n = self.counter;
+                self.counter += 1;
+                Ok(vec![
+                    AssistantEvent::TextDelta(format!("analyzing step {n}")),
+                    AssistantEvent::ToolUse {
+                        id: format!("tool-{n}"),
+                        name: "echo".to_string(),
+                        input: format!("payload-{n}"),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LongLoopApi { counter: 0 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(DEFAULT_MAX_ITERATIONS)
+        // 测试跑满 192 轮,禁用 auto-compact 避免压缩掉注入的警告消息。
+        .with_auto_compaction_input_tokens_threshold(u32::MAX);
+
+        // when
+        let error = runtime
+            .run_turn("loop", None)
+            .expect_err("should hit the hard iteration limit");
+
+        // then:硬上限中止,错误消息保留原前缀
+        assert!(
+            error.to_string().contains("conversation loop exceeded the maximum number of iterations"),
+            "unexpected error: {error}"
+        );
+        // 软阈值警告恰好注入一次(第 SOFT_MAX_ITERATIONS 轮的 user 消息,含"收敛")
+        let warning_count = runtime
+            .session
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(m.role, MessageRole::User)
+                    && m.blocks.iter().any(|b| matches!(
+                        b,
+                        ContentBlock::Text { text } if text.contains("收敛")
+                    ))
+            })
+            .count();
+        assert_eq!(
+            warning_count,
+            1,
+            "第 {SOFT_MAX_ITERATIONS} 轮应恰好注入一次收敛警告,实际 {warning_count} 次"
         );
     }
     #[test]
@@ -10177,5 +10534,183 @@ mod tests {
             .stats_by_knowledge_source()
             .expect("stats");
         assert!(stats.contains("web_research"), "stats: {stats}");
+    }
+
+    // ===== P-fix:内置工具完成后触发 tool_result_callback =====
+
+    /// 允许一切工具的测试 prompter(本地定义,避免与其他测试共享状态)。
+    struct PromptAllowAll;
+    impl PermissionPrompter for PromptAllowAll {
+        fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+            PermissionPromptDecision::Allow
+        }
+    }
+
+    /// 第一次调用返回 bash 工具调用的 API(用于权限拒绝测试)。
+    struct DeniedToolApi;
+    impl ApiClient for DeniedToolApi {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool)
+            {
+                return Ok(vec![
+                    AssistantEvent::TextDelta("tool denied".to_string()),
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+            Ok(vec![
+                AssistantEvent::ToolUse {
+                    id: "tool-bash-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "ls".to_string(),
+                },
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    /// 捕获 tool_result_callback 参数的测试辅助容器。
+    type ToolResultCalls = Arc<std::sync::Mutex<Vec<(String, String, String, bool)>>>;
+
+    /// 内置工具(log_decision 等)不经 CliToolExecutor,不 emit ToolResult 事件。
+    /// 验证 with_tool_result_callback 在内置工具执行完成后被触发,
+    /// 上层(TUI)可据此转发为 StatusEvent::ToolResult 闭合 ToolCard。
+    #[test]
+    fn tool_result_callback_fires_for_builtin_tool_log_decision() {
+        struct LogDecisionApi;
+        impl ApiClient for LogDecisionApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                // 第一次调用:模型请求执行 log_decision 内置工具。
+                let has_tool_result = request
+                    .messages
+                    .iter()
+                    .any(|m| m.blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. })));
+                if !has_tool_result {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-decision-1".to_string(),
+                            name: "log_decision".to_string(),
+                            input: r#"{"problem_signature":"p","root_cause_hypothesis":"h","applied_solution":"s"}"#
+                                .to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                // 第二次调用:工具结果已回传,模型给出最终答复。
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let captured: ToolResultCalls =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_cb = Arc::clone(&captured);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LogDecisionApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_tool_result_callback(Box::new(move |id, name, output, is_error| {
+            captured_for_cb
+                .lock()
+                .unwrap()
+                .push((id.to_string(), name.to_string(), output.to_string(), is_error));
+        }));
+
+        let summary = runtime
+            .run_turn("please log a decision", Some(&mut PromptAllowAll))
+            .expect("turn should succeed");
+
+        // 内置工具 log_decision 已完成 → callback 必须被触发一次。
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 1, "内置工具应触发 tool_result_callback");
+        assert_eq!(calls[0].0, "tool-decision-1", "tool_use_id 应透传");
+        assert_eq!(calls[0].1, "log_decision", "tool_name 应透传");
+        assert!(!calls[0].3, "log_decision 成功不应标记为 error");
+        assert_eq!(summary.iterations, 2);
+    }
+
+    /// 权限拒绝时也应触发 tool_result_callback(is_error=true),闭合 ToolCard。
+    #[test]
+    fn tool_result_callback_fires_for_denied_tool() {
+        struct DenyAll;
+        impl PermissionPrompter for DenyAll {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                PermissionPromptDecision::Deny {
+                    reason: "test deny".to_string(),
+                }
+            }
+        }
+
+        let captured: ToolResultCalls =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_cb = Arc::clone(&captured);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DeniedToolApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_tool_result_callback(Box::new(move |id, name, output, is_error| {
+            captured_for_cb
+                .lock()
+                .unwrap()
+                .push((id.to_string(), name.to_string(), output.to_string(), is_error));
+        }));
+
+        runtime
+            .run_turn("run the tool", Some(&mut DenyAll))
+            .expect("turn should succeed");
+
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 1, "deny 应触发 tool_result_callback");
+        assert_eq!(calls[0].1, "bash", "deny 的工具名应透传");
+        assert!(calls[0].3, "deny 应标记为 error");
+        assert!(calls[0].2.contains("test deny"), "output 应包含拒绝原因");
+    }
+
+    /// 外部工具(经 CliToolExecutor)不应重复触发 callback ——
+    /// 它们由 executor 内部 emit ToolResult 事件,重复会双份渲染。
+    #[test]
+    fn tool_result_callback_not_fired_for_external_tool() {
+        let captured: ToolResultCalls =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_cb = Arc::clone(&captured);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("add", |input| {
+                let total = input
+                    .split(',')
+                    .map(|part| part.parse::<i32>().expect("valid integer"))
+                    .sum::<i32>();
+                Ok(total.to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_tool_result_callback(Box::new(move |id, name, output, is_error| {
+            captured_for_cb
+                .lock()
+                .unwrap()
+                .push((id.to_string(), name.to_string(), output.to_string(), is_error));
+        }));
+
+        runtime
+            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .expect("turn should succeed");
+
+        let calls = captured.lock().unwrap();
+        assert!(calls.is_empty(), "外部工具不应触发 callback: {calls:?}");
     }
 }

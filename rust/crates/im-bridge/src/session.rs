@@ -103,6 +103,9 @@ pub struct SessionManager {
     completion_tx: mpsc::UnboundedSender<PromptCompleted>,
     idle_timeout: Duration,
     persistence: PersistenceManager,
+    /// 上次进程遗留的持久化元数据(load 自磁盘)。persist 时与当前活跃 session
+    /// 合并,防止进程重启后第一轮 persist 用空内存 map 覆盖历史记录。
+    persisted_metadata: std::sync::Mutex<Vec<PersistedSession>>,
 }
 
 /// Result of spawning a session manager.
@@ -149,6 +152,7 @@ impl SessionManager {
             completion_tx,
             idle_timeout: Duration::from_secs(idle_timeout_secs),
             persistence: PersistenceManager::new(),
+            persisted_metadata: std::sync::Mutex::new(Vec::new()),
         });
 
         // P2-7: Spawn idle-cleanup background task
@@ -160,11 +164,17 @@ impl SessionManager {
         // 隐患-11: Load persisted sessions for awareness only.
         // ACP sessions don't survive restart, so we can't truly "restore" them.
         // New agent sessions are created on first message to each chat.
+        // 同时把元数据回灌 persisted_metadata,persist 时合并,避免覆盖清空历史。
         let persisted = manager.persistence.load();
-        if !persisted.sessions.is_empty() {
+        let persisted_count = persisted.sessions.len();
+        if persisted_count > 0 {
+            *manager
+                .persisted_metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = persisted.sessions;
             tracing::info!(
                 "loaded {} persisted session record(s); new agents will be created on first message",
-                persisted.sessions.len()
+                persisted_count
             );
         }
 
@@ -304,13 +314,44 @@ impl SessionManager {
     /// Save current sessions to disk.
     pub async fn persist_sessions(&self) {
         let sessions = self.collect_persistable_sessions().await;
+        let merged = self.merge_with_history(sessions);
         let data = crate::persistence::PersistenceData {
-            sessions,
+            sessions: merged,
             schema_version: 1,
         };
         if let Err(e) = self.persistence.save(&data) {
             tracing::error!("failed to persist sessions: {e}");
         }
+    }
+
+    /// 合并历史元数据与当前活跃 session,按 (platform, chat_id) 去重,活跃优先。
+    /// 防止进程重启后第一轮 persist 用空内存 map 覆盖磁盘上的历史记录。
+    fn merge_with_history(&self, active: Vec<PersistedSession>) -> Vec<PersistedSession> {
+        let merged = {
+            let history = self.persisted_metadata.lock().unwrap_or_else(|e| e.into_inner());
+            Self::merge_sessions(&history, &active)
+        };
+        // 更新历史缓存,下一轮 persist 以本轮为准(避免过期历史反复合入)。
+        *self
+            .persisted_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = merged.clone();
+        merged
+    }
+
+    /// 纯函数:按 (platform, chat_id) 合并历史与活跃记录,活跃覆盖历史。
+    fn merge_sessions(
+        history: &[PersistedSession],
+        active: &[PersistedSession],
+    ) -> Vec<PersistedSession> {
+        let mut merged: HashMap<(String, String), PersistedSession> = HashMap::new();
+        for s in history {
+            merged.insert((s.platform.clone(), s.chat_id.clone()), s.clone());
+        }
+        for s in active {
+            merged.insert((s.platform.clone(), s.chat_id.clone()), s.clone());
+        }
+        merged.into_values().collect()
     }
 
     // ── private helpers ───────────────────────────────────────
@@ -487,5 +528,50 @@ impl SessionManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn persisted_session(platform: &str, chat_id: &str, session_id: &str) -> PersistedSession {
+        PersistedSession {
+            platform: platform.to_string(),
+            chat_id: chat_id.to_string(),
+            session_id: session_id.to_string(),
+            cwd: "D:\\".to_string(),
+            last_active_secs: 60,
+            user_id: Some("ou_user".to_string()),
+        }
+    }
+
+    /// 核心回归:进程重启后活跃列表为空时,merge 必须保留历史记录,
+    /// 防止 persist 用空 map 覆盖磁盘上的历史 session。
+    #[test]
+    fn merge_preserves_history_when_active_empty() {
+        let history = vec![persisted_session("feishu", "chat_a", "sess_old")];
+        let merged = SessionManager::merge_sessions(&history, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].session_id, "sess_old");
+    }
+
+    /// 活跃记录按 (platform, chat_id) 覆盖历史记录。
+    #[test]
+    fn merge_active_overrides_history_same_key() {
+        let history = vec![persisted_session("feishu", "chat_a", "sess_old")];
+        let active = vec![persisted_session("feishu", "chat_a", "sess_new")];
+        let merged = SessionManager::merge_sessions(&history, &active);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].session_id, "sess_new");
+    }
+
+    /// 活跃新增的 key 与历史 key 共存,不去重误删。
+    #[test]
+    fn merge_combines_distinct_keys() {
+        let history = vec![persisted_session("feishu", "chat_a", "sess_old")];
+        let active = vec![persisted_session("wecom", "chat_b", "sess_b")];
+        let merged = SessionManager::merge_sessions(&history, &active);
+        assert_eq!(merged.len(), 2);
     }
 }

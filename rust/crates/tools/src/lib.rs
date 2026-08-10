@@ -3599,13 +3599,13 @@ struct GlobSearchInputValue {
     path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct WebFetchInput {
     url: String,
     prompt: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct WebSearchInput {
     query: String,
     allowed_domains: Option<Vec<String>>,
@@ -4369,91 +4369,135 @@ struct SearchHit {
     url: String,
 }
 
+/// 在 tokio runtime 上下文中安全执行阻塞的 web 工具(WebSearch / WebFetch)。
+///
+/// # 背景
+/// `reqwest::blocking` 在 debug 构建下会做运行时自检(reqwest 0.12
+/// `blocking/wait.rs::enter`):创建并 drop 一个临时 current_thread runtime。
+/// 若在已 Entered 的 tokio 上下文内 drop(如 `run_turn_async` 的工具执行路径,
+/// `conversation.rs:3029` 直接同步调用 tool_executor),会触发 tokio 1.50 的
+/// "Cannot drop a runtime in a context where blocking is not allowed" panic
+/// (runtime/blocking/shutdown.rs:44)。
+///
+/// # 方案
+/// 与 `runtime::bash::execute_bash` 的隔离模式一致:检测到当前线程已在 tokio
+/// runtime 上下文中时,把阻塞工作放到独立 OS 线程执行(`std::thread::spawn` +
+/// `std::sync::mpsc`)。该线程的 `Context.runtime` 为 `NotEntered`,可安全
+/// 创建/drop reqwest 内部的 runtime;结果经 channel 传回调用线程。调用方不在
+/// runtime 上下文时(纯同步路径/单元测试)直接执行,零额外开销。
+fn run_web_sync_guarded<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv()
+            .map_err(|_| "web tool worker thread died".to_string())?
+    } else {
+        f()
+    }
+}
+
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
-    let started = Instant::now();
-    let client = build_http_client()?;
-    let request_url = normalize_fetch_url(&input.url)?;
-    let response = client
-        .get(request_url.clone())
-        .send()
-        .map_err(|error| error.to_string())?;
+    // 阻塞的 HTTP 请求需在 runtime 上下文之外执行(debug 构建下 reqwest
+    // blocking 自检会 drop 临时 runtime,见 run_web_sync_guarded)。
+    // input 需 clone 才能 move 进 'static 线程闭包。
+    let input = input.clone();
+    run_web_sync_guarded(move || {
+        let started = Instant::now();
+        let client = build_http_client()?;
+        let request_url = normalize_fetch_url(&input.url)?;
+        let response = client
+            .get(request_url.clone())
+            .send()
+            .map_err(|error| error.to_string())?;
 
-    let status = response.status();
-    let final_url = response.url().to_string();
-    let code = status.as_u16();
-    let code_text = status.canonical_reason().unwrap_or("Unknown").to_string();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let body = response.text().map_err(|error| error.to_string())?;
-    let bytes = body.len();
-    let normalized = normalize_fetched_content(&body, &content_type);
-    let result = summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
+        let status = response.status();
+        let final_url = response.url().to_string();
+        let code = status.as_u16();
+        let code_text = status.canonical_reason().unwrap_or("Unknown").to_string();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = response.text().map_err(|error| error.to_string())?;
+        let bytes = body.len();
+        let normalized = normalize_fetched_content(&body, &content_type);
+        let result =
+            summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
 
-    Ok(WebFetchOutput {
-        bytes,
-        code,
-        code_text,
-        result,
-        duration_ms: started.elapsed().as_millis(),
-        url: final_url,
+        Ok(WebFetchOutput {
+            bytes,
+            code,
+            code_text,
+            result,
+            duration_ms: started.elapsed().as_millis(),
+            url: final_url,
+        })
     })
 }
 
 fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
-    let started = Instant::now();
-    let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
-    let response = client
-        .get(search_url)
-        .send()
-        .map_err(|error| error.to_string())?;
+    // 阻塞的 HTTP 请求需在 runtime 上下文之外执行(debug 构建下 reqwest
+    // blocking 自检会 drop 临时 runtime,见 run_web_sync_guarded)。
+    // input 需 clone 才能 move 进 'static 线程闭包。
+    let input = input.clone();
+    run_web_sync_guarded(move || {
+        let started = Instant::now();
+        let client = build_http_client()?;
+        let search_url = build_search_url(&input.query)?;
+        let response = client
+            .get(search_url)
+            .send()
+            .map_err(|error| error.to_string())?;
 
-    let final_url = response.url().clone();
-    let html = response.text().map_err(|error| error.to_string())?;
-    let mut hits = extract_search_hits(&html);
+        let final_url = response.url().clone();
+        let html = response.text().map_err(|error| error.to_string())?;
+        let mut hits = extract_search_hits(&html);
 
-    if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
-    }
+        if hits.is_empty() && final_url.host_str().is_some() {
+            hits = extract_search_hits_from_generic_links(&html);
+        }
 
-    if let Some(allowed) = input.allowed_domains.as_ref() {
-        hits.retain(|hit| host_matches_list(&hit.url, allowed));
-    }
-    if let Some(blocked) = input.blocked_domains.as_ref() {
-        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
-    }
+        if let Some(allowed) = input.allowed_domains.as_ref() {
+            hits.retain(|hit| host_matches_list(&hit.url, allowed));
+        }
+        if let Some(blocked) = input.blocked_domains.as_ref() {
+            hits.retain(|hit| !host_matches_list(&hit.url, blocked));
+        }
 
-    dedupe_hits(&mut hits);
-    hits.truncate(8);
+        dedupe_hits(&mut hits);
+        hits.truncate(8);
 
-    let summary = if hits.is_empty() {
-        format!("No web search results matched the query {:?}.", input.query)
-    } else {
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Search results for {:?}. Include a Sources section in the final answer.\n{}",
-            input.query, rendered_hits
-        )
-    };
+        let summary = if hits.is_empty() {
+            format!("No web search results matched the query {:?}.", input.query)
+        } else {
+            let rendered_hits = hits
+                .iter()
+                .map(|hit| format!("- [{}]({})", hit.title, hit.url))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Search results for {:?}. Include a Sources section in the final answer.\n{}",
+                input.query, rendered_hits
+            )
+        };
 
-    Ok(WebSearchOutput {
-        query: input.query.clone(),
-        results: vec![
-            WebSearchResultItem::Commentary(summary),
-            WebSearchResultItem::SearchResult {
-                tool_use_id: String::from("web_search_1"),
-                content: hits,
-            },
-        ],
-        duration_seconds: started.elapsed().as_secs_f64(),
+        Ok(WebSearchOutput {
+            query: input.query.clone(),
+            results: vec![
+                WebSearchResultItem::Commentary(summary),
+                WebSearchResultItem::SearchResult {
+                    tool_use_id: String::from("web_search_1"),
+                    content: hits,
+                },
+            ],
+            duration_seconds: started.elapsed().as_secs_f64(),
+        })
     })
 }
 
@@ -8808,12 +8852,12 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
+        build_http_client, classify_lane_failure, derive_agent_state, execute_agent_with_spawn,
+        execute_tool, extract_recovery_outcome, final_assistant_text, global_cron_registry,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        persist_agent_terminal_state, push_output_block, run_task_packet, run_web_sync_guarded,
+        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -9989,6 +10033,26 @@ mod tests {
             .expect_err("invalid base URL should fail");
         std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
+    }
+
+    #[test]
+    fn web_blocking_client_safe_inside_runtime_context() {
+        // 回归(debug 构建):直接在 Entered 上下文构建并 drop reqwest blocking
+        // client,会触发 reqwest 的 debug 自检(blocking/wait.rs::enter)drop 临时
+        // runtime → tokio 1.50 "Cannot drop a runtime in a context where blocking
+        // is not allowed" panic(runtime/blocking/shutdown.rs:44)。
+        // run_web_sync_guarded 把阻塞工作隔离到独立 OS 线程后,此处不再 panic。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create current_thread runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async { run_web_sync_guarded(build_http_client) })
+        }));
+        assert!(
+            result.is_ok(),
+            "reqwest blocking client build inside runtime context must not panic \
+             (worker thread isolation failed)"
+        );
     }
 
     #[test]

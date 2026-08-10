@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "claw-code-plus-plus",
   "displayName": "Claw Plus",
   "description": "ACP-compatible AI coding agent for VS Code",
@@ -15,11 +15,17 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
+    "onCommand:claw.setupWizard",
     "onCommand:claw.startServer",
     "onCommand:claw.openChat"
   ],
   "contributes": {
     "commands": [
+      {
+        "command": "claw.setupWizard",
+        "title": "Claw: Run Setup Wizard",
+        "category": "Claw"
+      },
       {
         "command": "claw.startServer",
         "title": "Claw: Start Server",
@@ -51,12 +57,12 @@
       "properties": {
         "claw.binaryPath": {
           "type": "string",
-          "default": "claw-headless",
-          "description": "Path to claw-headless binary"
+          "default": "claw-plus-headless",
+          "description": "Path to claw-plus-headless binary"
         },
         "claw.model": {
           "type": "string",
-          "default": "claude-sonnet-4-5",
+          "default": "deepseek-v4-flash",
           "description": "Model to use"
         },
         "claw.permissionMode": {

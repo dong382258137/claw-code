@@ -69,11 +69,48 @@ async fn run_bridge(config: &ImBridgeConfig) -> Result<(), String> {
     // 使 `MCP`/`ListMcpResources`/`ReadMcpResource` 等工具真正可用。
     init_mcp_tools();
 
+    // Agent 工作区根配置：切换到配置的主工作区根，使 bash 与文件工具的
+    // 沙盒边界（默认 = 进程 cwd）跟随配置，实现跨目录/跨盘访问。
+    if let Some(root) = &config.agent.workspace_root {
+        match std::env::set_current_dir(root) {
+            Ok(()) => tracing::info!(
+                "agent workspace_root set to {} (bash cwd + file-tool boundary)",
+                root.display()
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    "failed to set workspace_root to {}: {e}; falling back to startup directory",
+                    root.display()
+                );
+            }
+        }
+    }
+
     let provider = ProviderClient::from_model(&model)
         .map_err(|e| format!("failed to create API client: {e}"))?;
 
-    let bridge_client =
-        BridgeApiClient::new(provider, model.clone(), true, GlobalToolRegistry::builtin());
+    let mut registry = GlobalToolRegistry::builtin();
+    // 未显式配置 workspace_roots 时,自动探测本机所有盘符根作为白名单,
+    // 实现"最大权限"(跨盘任意文件访问),编译后零配置即生效。
+    // 显式配置时以显式值为准(可借此收窄权限)。
+    let extra_roots = if config.agent.workspace_roots.is_empty() {
+        detect_drive_roots()
+    } else {
+        config.agent.workspace_roots.clone()
+    };
+    if !extra_roots.is_empty() {
+        registry = registry.with_workspace_roots(extra_roots.clone());
+        tracing::info!(
+            "agent workspace_roots: {}",
+            extra_roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let bridge_client = BridgeApiClient::new(provider, model.clone(), true, registry);
 
     let system_prompt = vec![
         format!(
@@ -179,4 +216,46 @@ fn init_mcp_tools() {
         discovery.failed_servers.len(),
         discovery.unsupported_servers.len()
     );
+}
+
+/// 枚举本机所有存在的盘符根（Windows，如 `C:\`、`D:\`）作为默认工作区
+/// 白名单，实现"最大权限"：文件工具可跨盘访问任意路径。盘符机器相关，
+/// 运行时探测比硬编码通用；显式配置 `workspace_roots` 时以其为准。
+#[must_use]
+fn detect_drive_roots() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        (b'A'..=b'Z')
+            .map(|letter| std::path::PathBuf::from(format!("{}:\\", letter as char)))
+            .filter(|root| std::fs::metadata(root).is_ok_and(|m| m.is_dir()))
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![std::path::PathBuf::from("/")]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_drive_roots_includes_current_dir_drive() {
+        let roots = detect_drive_roots();
+        assert!(!roots.is_empty(), "至少探测到一个盘符根: {roots:?}");
+        // 当前工作目录所在盘必须存在
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd = cwd.to_string_lossy().to_uppercase();
+            let drive = cwd
+                .chars()
+                .next()
+                .map(|c| format!("{}:\\", c))
+                .unwrap_or_default();
+            assert!(
+                roots.iter().any(|r| r.to_string_lossy().eq_ignore_ascii_case(&drive)),
+                "应包含当前盘 {drive}: {roots:?}"
+            );
+        }
+    }
 }

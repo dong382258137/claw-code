@@ -3234,6 +3234,19 @@ fn execute_turn(
         }
     });
 
+    // P-fix:注入 tool_result_callback,将 runtime 内置工具(log_decision 等)
+    // 的完成事件转发为 StatusEvent::ToolResult,闭合 TUI ToolCard。
+    // 根因:内置工具不经 CliToolExecutor,不 emit ToolResult,卡片永久 ⏳。
+    let tool_result_emitter = Arc::clone(&emitter);
+    cli.set_tool_result_callback(Box::new(move |id, name, output, is_error| {
+        tool_result_emitter(crate::streaming::StatusEvent::ToolResult {
+            id: id.to_string(),
+            name: name.to_string(),
+            output: output.to_string(),
+            is_error,
+        });
+    }));
+
     cli.set_status_emitter(emitter);
 
     // 细粒度诊断：注入 diag callback，在 run_turn 关键路径埋点写入 claw-diag.log。
@@ -3249,6 +3262,7 @@ fn execute_turn(
     let result = cli.run_turn_tui(line);
 
     cli.clear_diag_callback();
+    cli.clear_tool_result_callback();
     cli.clear_status_emitter();
     // Ensure streaming is marked as finished even on error
     if let Ok(mut guard) = status_state.lock() {

@@ -245,7 +245,14 @@ impl OutputEntry {
     pub(crate) fn render(&self) -> String {
         match self {
             OutputEntry::Text { content, timestamp } => {
-                format!("\x1b[38;5;240m[{timestamp}]\x1b[0m {content}")
+                // 表格行（render.rs 渲染的表格首行以 │ 开头，可能带 ANSI 样式
+                // 前缀）不加时间戳前缀：否则表头行被整体右移、与数据行错位
+                // （用户报告的"表格第一行错位"bug）。
+                if starts_with_table_border(content) {
+                    content.clone()
+                } else {
+                    format!("\x1b[38;5;240m[{timestamp}]\x1b[0m {content}")
+                }
             }
             OutputEntry::Thinking { summary, timestamp } => {
                 format!("\x1b[38;5;240m[{timestamp}]\x1b[0m{summary}")
@@ -293,6 +300,29 @@ impl OutputEntry {
             }
         }
     }
+}
+
+/// 判断文本是否以表格边框行开头（render.rs 渲染的表格首行以 │ 开头，
+/// 且可能带 ANSI 样式前缀）。用于 Text entry 渲染时决定是否跳过时间戳前缀，
+/// 保持表格列对齐。
+fn starts_with_table_border(text: &str) -> bool {
+    let first_line = text.split('\n').next().unwrap_or_default();
+    // 跳过前导 ANSI SGR 序列（如边框样式 \x1b[38;5;6m）
+    let mut chars = first_line.chars().peekable();
+    while chars.peek() == Some(&'\u{1b}') {
+        chars.next();
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    chars.peek() == Some(&'│')
 }
 
 /// 线程安全的结构化输出缓冲区。
@@ -464,10 +494,9 @@ impl OutputBuffer {
             if seg.is_empty() {
                 continue;
             }
-            let touched: usize;
-            if i + 1 == seg_count {
+            let touched = if i + 1 == seg_count {
                 // 最后一段:合并到 trailing Text entry 或新建
-                touched = if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
+                if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
                     content.push_str(seg);
                     self.text_total_bytes += seg.len();
                     self.entries.len() - 1
@@ -475,14 +504,14 @@ impl OutputBuffer {
                     self.text_total_bytes += seg.len();
                     self.entries.push(OutputEntry::text(seg.to_string()));
                     self.entries.len() - 1
-                };
+                }
             } else {
                 // 中间段:闭合为独立 entry(加回 \n\n 保持渲染换行)
                 let seg_text = format!("{seg}\n\n");
                 self.text_total_bytes += seg_text.len();
                 self.entries.push(OutputEntry::text(seg_text));
-                touched = self.entries.len() - 1;
-            }
+                self.entries.len() - 1
+            };
             from_idx = from_idx.min(touched);
         }
         self.recompute_snapshot_tail(from_idx);
@@ -714,8 +743,9 @@ impl OutputBuffer {
     ///    → 折行数高估 → 区间向右下方错位 → 点击命中"上方的卡片"。
     /// 2. `div_ceil` 假设可在任意字符处折行，但显示端 `wrap_line_to_display_lines`
     ///    按词边界折行（超长单词不折）→ 长词行计数不一致 → 偶发点击无反应。
+    ///
     /// 修复：直接复用 draw 使用的同一份数据（`cached_lines` + `cached_lines_breaks`
-    /// + `wrap_line_to_display_lines`），保证区间与屏幕显示完全一致。
+    ///   + `wrap_line_to_display_lines`），保证区间与屏幕显示完全一致。
     pub(crate) fn tool_card_line_ranges(
         &mut self,
         area_width: usize,
@@ -1084,6 +1114,41 @@ mod tests {
         // Text 渲染会带时间戳前缀 [HH:MM:SS]
         let snap = view.snapshot();
         assert!(snap.contains("hello world"));
+    }
+
+    /// 回归测试：表格 ANSI 首行以 │ 开头，render() 不得加时间戳前缀，
+    /// 否则表头行会被整体右移、与数据行错位（用户报告的"表格第一行错位"）。
+    #[test]
+    fn table_text_entry_skips_timestamp_prefix_on_first_line() {
+        use crate::render::TerminalRenderer;
+        let renderer = TerminalRenderer::new();
+        let md = "| Name | Description |\n| ---- | ---- |\n| read_file | Reads a file |";
+        let ansi = renderer.markdown_to_ansi_with_width(md, Some(40));
+        let entry = OutputEntry::text(ansi);
+        let rendered = entry.render();
+        // 时间戳前缀固定为灰色 \x1b[38;5;240m[...]；表格首行不得出现此前缀，
+        // 否则表头行整体右移、与数据行（无前缀）错位。
+        assert!(
+            !rendered.starts_with("\u{1b}[38;5;240m"),
+            "表格首行不应带时间戳前缀(否则与数据行错位): {rendered:?}"
+        );
+        // 首行去 ANSI 后应以表格边框 │ 开头
+        let first_line = rendered.split('\n').next().unwrap_or_default();
+        let mut chars = first_line.chars().peekable();
+        while chars.peek() == Some(&'\u{1b}') {
+            chars.next();
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        assert_eq!(chars.next(), Some('│'), "首行应以 │ 开头: {first_line:?}");
     }
 
     #[test]
@@ -1718,6 +1783,7 @@ mod tests {
     /// 而显示端按词边界折行且 ANSI 已剥离 → 区间被高估/错位：
     /// - 区间相互重叠 → 点击"下面的卡片"命中"上面的卡片"
     /// - 长词行计数不一致 → 偶发点击无反应
+    ///
     /// 新实现复用 `cached_lines` + `cached_lines_breaks` + `wrap_line_to_display_lines`
     /// （与 draw 同一份数据），区间与屏幕显示一致。
     #[test]

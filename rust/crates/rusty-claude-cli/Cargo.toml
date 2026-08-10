@@ -21,7 +21,9 @@ api = { path = "../api" }
 ansi-to-tui = { version = "7", optional = true }
 async-trait.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-claw-shell = { path = "../claw-shell" }
+# claw-shell 默认 feature 是 acp-0_10;这里 default-features = false 让
+# rusty-claude-cli 显式控制 ACP 版本。默认启用 acp-0_10(见 [features])。
+claw-shell = { path = "../claw-shell", default-features = false }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
 crossterm = "0.28"
@@ -62,6 +64,15 @@ mock-deepseek-service = { path = "../mock-deepseek-service" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 [features]
-default = ["full-tui", "embedding"]
+# 默认启用 full-tui + embedding + ACP 0.10.4(claw-shell 的 acp-0_10)。
+default = ["full-tui", "embedding", "acp-0_10"]
 full-tui = ["dep:ratatui", "dep:ansi-to-tui"]
 embedding = ["runtime/embedding"]
+# ACP 协议版本选择:默认 acp-0_10(0.10.4),可选 acp-1_5(1.3)。
+# 两者互斥(claw-acp 内部 use 别名冲突),启用 acp-1_5 时必须:
+#   cargo build --no-default-features --features acp-1_5
+# acp-1_5 隐式携带 full-tui + embedding:因为 rusty-claude-cli 的 lib
+# 在无 full-tui 时编译失败(tui_ports 引用未全部 cfg-gate),而 headless
+# binary 依赖 lib 整体。这样单条命令即可产出完整 1.3 二进制。
+acp-0_10 = ["claw-shell/acp-0_10"]
+acp-1_5 = ["claw-shell/acp-1_5", "full-tui", "embedding"]

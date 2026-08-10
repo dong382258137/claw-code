@@ -1,4 +1,4 @@
-﻿// Webview 对话面板：每个 panel 对应一个 ACP session。
+// Webview 对话面板：每个 panel 对应一个 ACP session。
 //
 // 职责：
 // 1. 创建 Webview，注入基础 HTML
@@ -42,7 +42,12 @@ export class ChatPanelManager {
         panel.webview.html = this.getChatHtml();
 
         // 创建 ACP session
-        const result = (await this.transport.request('session/new', { cwd })) as {
+        // mcpServers 是 NewSessionRequest 的必填字段（schema 无 default），
+        // 缺省时 agent 返回 -32602 Invalid params。
+        const result = (await this.transport.request('session/new', {
+            cwd,
+            mcpServers: [],
+        })) as {
             sessionId: string;
         };
         const sessionId = result.sessionId;
@@ -241,13 +246,14 @@ export class ChatPanelManager {
   });
 
   function handleUpdate(update) {
-    if (update.type === 'AgentMessageChunk' && update.content && update.content.text) {
+    // ACP 0.10.4:SessionUpdate 内部 tag 为 sessionUpdate, variant 为 snake_case
+    if (update.sessionUpdate === 'agent_message_chunk' && update.content && update.content.text) {
       appendMsg('agent', update.content.text);
-    } else if (update.type === 'ToolCall') {
+    } else if (update.sessionUpdate === 'tool_call') {
       const status = update.status || 'pending';
       appendMsg('tool', '[tool] ' + (update.toolName || 'unknown') + ' (' + status + ')');
-    } else if (update.type === 'ToolCallStatus') {
-      appendMsg('tool', '[tool] ' + update.toolCallId + ' -> ' + update.status);
+    } else if (update.sessionUpdate === 'tool_call_update') {
+      appendMsg('tool', '[tool] ' + (update.id || 'unknown') + ' -> ' + update.status);
     } else {
       // 未识别的 update 类型，原样显示
       appendMsg('agent', JSON.stringify(update));

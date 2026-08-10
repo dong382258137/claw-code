@@ -29,8 +29,10 @@ use serde::{Deserialize, Serialize};
 use crate::memory_semantic::{cosine_similarity, EmbeddingProvider};
 
 /// CSV 表头,固定顺序与 [`TraceRecord`] 字段一一对应。
+/// 第 7 列 `task_success` 为 Phase 3 self-evolving harness 新增;
+/// 旧 6 列 CSV 仍可加载(缺失列按 `failure_kind` 推断,向后兼容)。
 pub const CSV_HEADER: &str =
-    "turn_id,latency_ms,tool_calls,compact_triggered,failure_kind,error_message";
+    "turn_id,latency_ms,tool_calls,compact_triggered,failure_kind,error_message,task_success";
 
 /// 每个聚类最多保留的样本错误消息条数,避免聚类膨胀。
 pub const MAX_SAMPLE_ERRORS_PER_CLUSTER: usize = 5;
@@ -48,7 +50,7 @@ pub const KMEANS_MAX_ITERATIONS: usize = 10;
 /// 简化的本地 trace 记录类型 — 一行 CSV 对应一条记录。
 ///
 /// 字段对应 CSV 列(见 [`CSV_HEADER`]):
-/// `turn_id,latency_ms,tool_calls,compact_triggered,failure_kind,error_message`
+/// `turn_id,latency_ms,tool_calls,compact_triggered,failure_kind,error_message,task_success`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceRecord {
     /// Turn 唯一标识。
@@ -63,10 +65,13 @@ pub struct TraceRecord {
     pub failure_kind: Option<String>,
     /// 错误消息;`None` 表示该 turn 未失败或无错误消息。
     pub error_message: Option<String>,
+    /// Phase 3:任务是否成功(单一外部信号 TaskSuccessRate)。
+    /// 成功 turn = 编译通过 + 测试通过 + 工具调用成功。
+    pub task_success: bool,
 }
 
 impl TraceRecord {
-    /// 构造一条未失败、未触发 compact 的基础记录。
+    /// 构造一条未失败、未触发 compact 的基础记录(默认成功)。
     #[must_use]
     pub fn new(turn_id: impl Into<String>, latency_ms: u64, tool_calls: u32) -> Self {
         Self {
@@ -76,6 +81,7 @@ impl TraceRecord {
             compact_triggered: false,
             failure_kind: None,
             error_message: None,
+            task_success: true,
         }
     }
 
@@ -86,11 +92,12 @@ impl TraceRecord {
         self
     }
 
-    /// 链式设置失败类别与错误消息。
+    /// 链式设置失败类别与错误消息(同时标记任务失败)。
     #[must_use]
     pub fn with_failure(mut self, kind: impl Into<String>, message: impl Into<String>) -> Self {
         self.failure_kind = Some(kind.into());
         self.error_message = Some(message.into());
+        self.task_success = false;
         self
     }
 }
@@ -520,11 +527,15 @@ fn format_csv_row(record: &TraceRecord) -> String {
         record.compact_triggered.to_string(),
         escape_csv_field(record.failure_kind.as_deref().unwrap_or("")),
         escape_csv_field(record.error_message.as_deref().unwrap_or("")),
+        record.task_success.to_string(),
     ]
     .join(",")
 }
 
 /// 判断一行是否为 CSV 表头。
+///
+/// 兼容新旧两种表头:前 6 列匹配即视为表头(第 7 列 `task_success` 是
+/// Phase 3 新增,旧 CSV 可能没有)。
 fn is_header_row(fields: &[String]) -> bool {
     let expected = [
         "turn_id",
@@ -534,15 +545,19 @@ fn is_header_row(fields: &[String]) -> bool {
         "failure_kind",
         "error_message",
     ];
-    fields.len() == expected.len() && fields.iter().zip(expected.iter()).all(|(f, e)| f == e)
+    fields.len() >= expected.len() && fields.iter().zip(expected.iter()).all(|(f, e)| f == e)
 }
 
 /// 将一行 CSV 字段解析为 [`TraceRecord`]。
+///
+/// 接受 6 列(旧格式)或 7 列(含 `task_success`)。旧格式缺失
+/// `task_success` 时按 `failure_kind` 推断(`None` = 成功,有值 = 失败),
+/// 保持向后兼容。
 fn parse_record_fields(fields: &[String]) -> Result<TraceRecord, std::io::Error> {
-    if fields.len() != 6 {
+    if fields.len() < 6 || fields.len() > 7 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("expected 6 CSV fields, got {}", fields.len()),
+            format!("expected 6 or 7 CSV fields, got {}", fields.len()),
         ));
     }
     let turn_id = fields[0].clone();
@@ -578,6 +593,21 @@ fn parse_record_fields(fields: &[String]) -> Result<TraceRecord, std::io::Error>
     } else {
         Some(fields[5].clone())
     };
+    let task_success = if let Some(raw) = fields.get(6) {
+        match raw.as_str() {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid task_success `{other}`"),
+                ));
+            }
+        }
+    } else {
+        // 旧 6 列格式:失败记录视为任务失败,其余视为成功。
+        failure_kind.is_none()
+    };
     Ok(TraceRecord {
         turn_id,
         latency_ms,
@@ -585,6 +615,7 @@ fn parse_record_fields(fields: &[String]) -> Result<TraceRecord, std::io::Error>
         compact_triggered,
         failure_kind,
         error_message,
+        task_success,
     })
 }
 
@@ -797,11 +828,11 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 3, "expected header + 2 rows, got: {content}");
         assert_eq!(lines[0], CSV_HEADER);
-        assert_eq!(lines[1], "t1,100,3,false,\"\",\"\"");
-        // error_message contains comma → quoted
+        assert_eq!(lines[1], "t1,100,3,false,\"\",\"\",true");
+        // error_message contains comma → quoted; failure → task_success=false
         assert_eq!(
             lines[2],
-            "t2,250,5,true,timeout,\"req timed out, retry exhausted\""
+            "t2,250,5,true,timeout,\"req timed out, retry exhausted\",false"
         );
 
         let _ = std::fs::remove_file(path);
@@ -904,6 +935,39 @@ mod tests {
         assert_eq!(loaded.records.len(), 1);
         assert_eq!(loaded.records[0].turn_id, "t1");
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_legacy_six_column_csv_backfills_task_success() {
+        // Phase 3 向后兼容:旧 6 列 CSV(无 task_success)仍可加载,
+        // 并按 failure_kind 推断 task_success(有失败 → false,无失败 → true)。
+        let path = fixture_path("legacy-6col");
+        let csv = "turn_id,latency_ms,tool_calls,compact_triggered,failure_kind,error_message\n\
+                   t1,100,3,false,\"\",\"\"\n\
+                   t2,200,5,true,auth,\"missing token\"\n";
+        std::fs::write(&path, csv).expect("write should succeed");
+
+        let loaded = TraceAnalyzer::load_csv(&path).expect("load should succeed");
+        assert_eq!(loaded.records.len(), 2);
+        assert!(loaded.records[0].task_success, "无失败记录应推断为成功");
+        assert!(!loaded.records[1].task_success, "失败记录应推断为失败");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn export_csv_writes_task_success_column() {
+        let mut analyzer = TraceAnalyzer::new();
+        analyzer.add_record(TraceRecord::new("t1", 100, 1));
+        analyzer.add_record(TraceRecord::new("t2", 200, 2).with_failure("auth", "nope"));
+        let path = fixture_path("task-success-col");
+        analyzer.export_csv(&path).expect("export should succeed");
+        let content = std::fs::read_to_string(&path).expect("read should succeed");
+        assert!(content.contains("task_success"), "表头应包含 task_success");
+        let rows: Vec<&str> = content.lines().skip(1).collect();
+        assert!(rows[0].ends_with(",true"));
+        assert!(rows[1].ends_with(",false"));
         let _ = std::fs::remove_file(path);
     }
 

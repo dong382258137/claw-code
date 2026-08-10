@@ -1,4 +1,4 @@
-﻿// 扩展入口：activate/deactivate + 命令注册 + 生命周期管理
+// 扩展入口：activate/deactivate + 命令注册 + 生命周期管理
 //
 // 职责：
 // 1. 注册 5 个命令：startServer / stopServer / openChat / cancelPrompt / showStatus
@@ -12,6 +12,11 @@ import { ErrorRecovery, createErrorRecovery } from './error-recovery';
 import { createHandlers } from './handlers';
 import { StatusBarManager } from './status-bar';
 import { ChatPanelManager } from './chat-panel';
+import {
+    API_KEY_SECRET_KEY,
+    createSetupWizard,
+    runSetupWizard,
+} from './setup-wizard';
 import type { ClawConfig } from './types';
 
 let outputChannel: vscode.OutputChannel;
@@ -19,8 +24,11 @@ let transport: AcpTransport | null = null;
 let errorRecovery: ErrorRecovery;
 let statusBar: StatusBarManager;
 let chatManager: ChatPanelManager | null = null;
+/** 扩展 context（保存 SecretStorage 引用，供 startClawServer 读取 API key） */
+let extensionContext: vscode.ExtensionContext;
 
 export function activate(context: vscode.ExtensionContext): void {
+    extensionContext = context;
     outputChannel = vscode.window.createOutputChannel('Claw Plus');
     errorRecovery = createErrorRecovery(outputChannel, vscode);
     statusBar = new StatusBarManager(vscode);
@@ -31,6 +39,8 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand('claw.openChat', openChat),
         vscode.commands.registerCommand('claw.cancelPrompt', cancelActivePrompt),
         vscode.commands.registerCommand('claw.showStatus', showStatusBarMenu),
+        // 首次运行配置向导：手动触发 + 首次自动检查
+        vscode.commands.registerCommand('claw.setupWizard', () => setupWizard(context, true)),
         statusBar,
         outputChannel,
     );
@@ -48,10 +58,12 @@ export function activate(context: vscode.ExtensionContext): void {
         }),
     );
 
-    // 自动启动
+    // 首次运行：自动弹向导（已完成过则内部静默跳过）；autoStart 时启动服务
     const config = getConfig();
     if (config.autoStart) {
         void startClawServer();
+    } else {
+        void setupWizard(context, false);
     }
 }
 
@@ -60,6 +72,19 @@ export function deactivate(): void {
         void transport.stop();
     }
     chatManager?.dispose();
+}
+
+/** 首次运行配置向导：检查 binary + API key，缺什么引导补什么 */
+async function setupWizard(context: vscode.ExtensionContext, force: boolean): Promise<void> {
+    const deps = createSetupWizard(context, vscode);
+    const result = await runSetupWizard(deps, getConfig(), force);
+    outputChannel.appendLine(
+        `[info] Setup wizard done: binaryReady=${result.binaryReady} apiKeyReady=${result.apiKeyReady}`,
+    );
+    // 就绪则自动启动
+    if (result.binaryReady && result.apiKeyReady && !transport?.isRunning()) {
+        await startClawServer();
+    }
 }
 
 // ===== 命令实现 =====
@@ -73,10 +98,18 @@ async function startClawServer(): Promise<void> {
     const config = getConfig();
     statusBar.setStatus('starting');
 
+    // 从 SecretStorage 读取 API key 注入子进程环境（优先于环境变量）
+    const apiKey = await contextSecretsApiKey();
+    const env: Record<string, string> = {};
+    if (apiKey) {
+        env.DEEPSEEK_API_KEY = apiKey;
+    }
+
     transport = new AcpTransport({
         binaryPath: config.binaryPath,
         args: ['--model', config.model, '--permission-mode', config.permissionMode],
         cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+        env,
     });
 
     transport.on('stderr', (line) => {
@@ -188,10 +221,19 @@ async function showStatusBarMenu(): Promise<void> {
 function getConfig(): ClawConfig {
     const cfg = vscode.workspace.getConfiguration('claw');
     return {
-        binaryPath: cfg.get('binaryPath', 'claw-headless'),
-        model: cfg.get('model', 'claude-sonnet-4-5'),
+        binaryPath: cfg.get('binaryPath', 'claw-plus-headless'),
+        model: cfg.get('model', 'deepseek-v4-flash'),
         permissionMode: cfg.get('permissionMode', 'workspace-write'),
         autoStart: cfg.get('autoStart', false),
         logLevel: cfg.get('logLevel', 'info'),
     };
+}
+
+/** 从 SecretStorage 读取 API key（无则 undefined） */
+async function contextSecretsApiKey(): Promise<string | undefined> {
+    try {
+        return await extensionContext.secrets.get(API_KEY_SECRET_KEY);
+    } catch {
+        return undefined;
+    }
 }

@@ -34,7 +34,7 @@
 | # | 未实现内容 | 完善后的收益 |
 |---|---|---|
 | 5 | ✅ **TRAE 对齐 Epic 1 剩余（已完成）**：~~`SubagentContext.tool_summaries` 生产路径留空（`runtime/src/conversation.rs:3916` 注释"暂留空"）~~。**已完成**：新增 `default_subagent_tool_catalog()` 短名表（仅收录实际可执行的 read/grep/glob/edit/write/bash，未注册的 repomap/lsp_diagnostics 不广告）；`build_subagent_context` 按 `capability.allowed_tools()` 白名单过滤注入（路径 A）；DAG 路径 B 同步接线；cli 从 `GlobalToolRegistry` 生成实时目录经 `with_tool_catalog` 注入（描述与 mvp_tool_specs 单源一致） | 子智能体 system prompt 的 `## Available Tools` 层**注满**：① 子 agent 清楚自己有哪些工具可用，不再试错调用被拒；② L2 工具层进静态前缀，复用缓存断点，不损命中率 |
-| 6 | **ACP/IDE 应用层 5 项**：`fs/read_text_file`、`fs/write_text_file`、`session/request_permission`、LaneEvent→SessionNotification 桥接、VS Code 扩展（`claw-shell/src/agent.rs` 这些方法为 stub） | ① **IDE 闭环**：claw 作为 ACP server 可读编辑器缓冲区、请求用户权限，VS Code 扩展让 AI 直接编辑当前打开文件；② 桥接后 IDE 端实时感知 lane 进度；③ 这是文档承诺的"IDE 原生体验"，补齐后 claw 不再是纯终端工具 |
+| 6 | ✅ **ACP/IDE 应用层 5 项（已完成，0.10.4 + 1.3 双路径）**：反向请求发送逻辑（`fs/read_text_file`/`fs/write_text_file`/`session/request_permission`）已在 `claw-shell/src/agent_v1_3.rs` 完整实现（含 AlwaysAllow 缓存 + 30s 超时）；LaneEvent→SessionNotification 桥接已在 `lane_bridge.rs` 实现并经 `ClawAgent::prompt` 接入（turn 结束 drain 推送）；VS Code 扩展（`vscode-extension/`）已修复并端到端验证 —— binary 名 `claw-headless`→`claw-plus-headless`、默认 model 对齐 `deepseek-v4-flash`、`session/new` 补必填 `mcpServers`、`SessionUpdate` wire 格式修正（内部 tag `sessionUpdate` + snake_case variant）、新增 `scripts/acp-smoke-test.mjs` 全链路 smoke test（initialize + session/new + prompt + assistant 文本推送验证通过）。**1.3 路径 Stage 3 已完成**：`stdio_v1_3.rs` dispatch handler 从 stub 升级为真实 handler（initialize/auth/session-new/session-prompt/session-cancel 5 个类型化 handler + catch-all dispatch + mpsc 命令通道桥接非 Send agent + select! 并发），`agent_v1_3.rs` 新增 `ClawAgentV13Builder`/`AgentCommand` 及 `create_session`/`run_prompt`/`cancel` 会话生命周期（含认知外骨骼注入 + HookAbortSignal）；新增 e2e 握手集成测试 `e2e_handshake_initialize_session_new_prompt` 用 `acp::Channel::duplex()` 走完整 initialize→session/new→prompt 链路验证通过（31 个测试全过）。**`claw acp serve` 已接线 1.3**：`rusty-claude-cli` 新增 `acp-1_5` feature（透传 `claw-shell/acp-1_5`，隐式携带 full-tui + embedding），`app.rs::run_acp_serve` 按 feature 分支 —— 默认编译走 0.10.4，`--no-default-features --features acp-1_5` 编译走 1.3（`ClawAgentV13Builder` → `run_stdio_agent_v1_3`）；修复 `ClawAgentV13` 在 async 上下文 drop 内部 tokio Runtime 的 panic（`run_stdio_agent_v1_3` 用 Rc 双层持有，agent 在 block_on 返回后的主线程释放）；真实二进制 NDJSON smoke test 验证 initialize/session-new/prompt 全链路通过（退出码 0） | ① **IDE 闭环**：claw 作为 ACP server 可读编辑器缓冲区、请求用户权限，VS Code 扩展让 AI 直接编辑当前打开文件；② 桥接后 IDE 端实时感知 lane 进度；③ 这是文档承诺的"IDE 原生体验"，补齐后 claw 不再是纯终端工具 |
 | 7 | ✅ **hooks 的 Stop/PostCustomToolCall 集成点**（~~hooks.rs 有方法但 conversation.rs 未接入~~）。**已完成**：核查确认 Stop（turn 完成）与 SubagentStop 早已接入；PostCustomToolCall 已接入（commit `17a9598e`），仅对经 ToolExecutor 执行的外部自定义工具触发，payload 携带真实 tool_name + output | 会话停止、自定义工具调用完成时 hook 静默失效。接入后：监控/审计类 hook 覆盖完整事件面，合规场景才可用 |
 | 8 | ✅ **local-openai-providers 文档漂移**：~~文档写 `OPENAI_BASE_URL`，代码已改为 `DEEPSEEK_*` 专有~~（`api/src/providers/mod.rs:162-164` 无条件 DeepSeek 路由）。**已完成**：文档对齐实现现状 —— 文首标注 provider 路由为 DeepSeek 专有、routing 示例改用 `DEEPSEEK_BASE_URL`、本地模型示例标注"待通用 `OPENAI_BASE_URL` 分支恢复" | ① 用户不再按过时文档配置导致失败；② 若需支持 Ollama/OpenRouter 等，可恢复通用 OPENAI_BASE_URL 分支，**解锁本地模型调试场景**（离线/低成本开发） |
 
@@ -94,9 +94,9 @@
 
 短期做（中等投入）：
   ④ ACP fs/permission + 桥接  →  解锁 IDE 闭环
-  ⑤ self-evolving harness MVP  →  立项级，建议拆成 harness 记录 + CLI 两个里程碑
+  ⑤ ✅ self-evolving harness MVP  →  已完成（`harness_evolution` 模块：Weakness Mining + 规则式 Proposer 零 LLM + 两重门控验证 + SQLite 持久化 + conversation 每 10 turn 自动触发 + `claw harness list/stats/rollback/evolve --dry-run` CLI + `with_harness_evolution` 注入）
   ⑥ ✅ tool_summaries 注满  →  子 agent 能力可见性（已完成，`default_subagent_tool_catalog` 短名表 + capability 过滤注入 + cli 从 GlobalToolRegistry 注入）
-  ⑥' hooks 剩余：异步 HookRunner（P1 异步化，文档建议 P0 保留同步）+ 配置热重载
+  ⑥' ✅ hooks 剩余：异步 HookRunner（生命周期事件 fire-and-forget 后台执行，决策事件保留同步 + 60s 全局预算兜底）+ 配置热重载（`Arc<RwLock>` 原子替换 + 每 turn mtime 检查）
 
 按需做（有明确场景再投入）：
   ⑦ DAG YAML/checkpoint/渲染

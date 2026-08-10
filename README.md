@@ -66,7 +66,9 @@ Anthropic Claude Code（概念来源 / 架构参考）
 - **IM 桥接集成 (IM Bridge)** — 位于 `rust/crates/im-bridge/`
 - **多智能体 DAG 并行编排** — 依赖图调度、worktree 隔离、异步子智能体分发
 - **现代 TUI 终端界面** — 侧边栏、状态栏、上下文窗口进度条、工具卡片渲染
-- **插件与扩展生态** — 插件管理器、Skills 系统、MCP 服务器生命周期、Hooks
+- **自进化 Harness (Self-Evolving Harness)** — LLM 驱动、两重门控防 misevolution 的失败模式学习与动态注入
+- **插件与扩展生态** — 插件管理器、Skills 系统、MCP 服务器生命周期、Hooks（支持配置热重载）
+- **ACP/IDE 应用层闭环** — ACP server（0.10.4 + 1.3 双路径）、VS Code 扩展首次运行配置向导
 - **其他功能增强与定制**
 
 > 完整特性清单见下方 [✨ 核心特性 / Key Features](#核心特性-key-features) 章节。
@@ -142,6 +144,21 @@ A declarative dependency graph scheduler that decomposes complex tasks into para
 - **SAGA 补偿模式 / SAGA compensation pattern** — 节点失败时自动执行补偿操作，保证分布式一致性
 - **TeamCreate 团队编排 / TeamCreate orchestration** — 将多个任务组合为命名团队，统一监控
 
+### 🧬 自进化 Harness / Self-Evolving Harness
+
+LLM 驱动的失败模式学习系统：从历史失败的轨迹中挖掘 weakness、自动提议修复规则，并在两重门控验证通过后注入 system prompt 动态段，实现"越用越强"的自改进闭环。
+
+An LLM-driven failure-mode learning system: mines weaknesses from past failures, proposes fix rules, and injects them into the dynamic prompt sections after passing dual-gate validation.
+
+- **Weakness Mining（Stage 1）** — 复用 `TraceAnalyzer::cluster_failures` 聚类失败记录，过滤低频噪声（`occurrence_count < min_occurrences`）
+- **规则式 Proposer（Stage 2）** — 7+ 种预定义错误模式（`old_string not found`、`unresolved import`、`connection refused` 等）直接映射为 HarnessEdit，MVP 零 LLM 调用；simhash 去重防重复提案
+- **两重门控验证 / Dual-gate validation** — Validity（基础设施噪声过滤 + pathology 出现确认）+ Significance（z-test, alpha=0.05），仅统计显著且有据可依的 edit 晋升为 Active
+- **全量动态注入 / Dynamic injection** — Active edits（≤10 条）注入 `SystemPromptSplit::dynamic_sections`，约束总 token
+- **CLI 管理 / `claw harness`** — `list [--status]` / `stats` / `rollback --all | --id` / `evolve --dry-run`，支持 `--output-format json`
+- **SQLite 持久化 / SQLite persistence** — edits 存于 `.claw/decision_log.db` 的 `harness_edits` 表，进程重启后保留状态
+
+> 设计文档：`docs/2026-07-24-p3-self-evolving-harness-design.md`；实现位于 `rust/crates/runtime/src/harness_evolution/`
+
 ### 🔌 插件与扩展生态 / Plugin & Extension Ecosystem
 
 完整的插件生命周期管理 + Skills 系统 + MCP 协议支持 + Hooks 系统 + 自定义 Agent。
@@ -180,8 +197,9 @@ Remote control of Claw Plus via instant messaging platforms like Discord, enabli
 - **通知路由 / Notification routing** — 将 Agent 状态变更（任务完成/阻塞/失败）推送至 IM 频道
 - **频道级协调 / Channel-level coordination** — 多人通过 Discord 频道协作驱动多智能体并行工作
 - **异步工作流 / Async workflow** — 发送指令后可离线，Claw Plus 完成后通知结果
+- **Agent 工作区配置 / Agent workspace config** — `[agent]` 段自定义 `workspace_root` / `workspace_roots`（沙盒边界）；未配置时自动枚举本机所有盘符根作为白名单，默认零配置跨盘访问
 
-> 位于 `rust/crates/im-bridge/`
+> 位于 `rust/crates/im-bridge/`；配置向导：`claw-im-bridge --setup`
 
 ### 🔧 卓越的开发体验 / Superior Developer Experience
 
@@ -232,9 +250,9 @@ the upstream [dong382258137/claw-code](https://github.com/dong382258137/claw-cod
 project with additional features and modifications.
 
 > [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md) or run the one-click installer [`install.ps1`](./install.ps1). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
 >
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon or JSON-RPC entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, returns status with exit code 0, and real ACP support remains tracked separately in `ROADMAP.md`. For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
+> **ACP / IDE status:** `claw acp serve` is a real ACP server supporting dual paths — ACP 0.10.4 by default and ACP 1.3 (initialize/auth/session-new/session-prompt/session-cancel) via the `acp-1_5` feature. The bundled VS Code extension (`vscode-extension/`) uses it for IDE integration and ships a first-run setup wizard plus a full-chain smoke test (`vscode-extension/scripts/acp-smoke-test.mjs`). For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
 
 ## Current repository shape
 
@@ -275,7 +293,16 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 ### Windows setup
 
-**PowerShell is a supported Windows path.** Use whichever shell works for you. The common onboarding issues on Windows are:
+**PowerShell is a supported Windows path.** Use whichever shell works for you. The fastest onboarding path is the one-click installer:
+
+```powershell
+# From the repo root (debug build; add -Release for an optimized build)
+./install.ps1
+```
+
+It detects the environment, checks the Rust toolchain, builds `claw` + `claw-plus-headless`, deploys them to `~/.cargo/bin` (already on PATH), verifies the install, and guides API key setup.
+
+The common manual onboarding issues on Windows are:
 
 1. **Install Rust first** — download from <https://rustup.rs/> and run the installer. Close and reopen your terminal when it finishes.
 2. **Verify Rust is on PATH:**
@@ -404,6 +431,8 @@ cargo test --workspace
 - [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — terminal navigation, scrollback, `@path` file context, attachments, and secret-safety guidance
 - [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM setup, Claw multi-provider positioning, and local skills install checks
 - [`docs/windows-install-release.md`](./docs/windows-install-release.md) — PowerShell-first install, release artifact, provider switching, and Windows/WSL notification smoke paths
+- [`install.ps1`](./install.ps1) — Windows one-click installer (mirrors `install.sh`)
+- [`CHANGELOG.md`](./CHANGELOG.md) — version history and notable changes
 - [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
 - [`PARITY.md`](./PARITY.md) — parity status for the Rust port
 - [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details

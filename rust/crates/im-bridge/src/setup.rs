@@ -73,6 +73,7 @@ fn render_feishu_toml(
     if let Some(k) = encrypt_key.filter(|s| !s.is_empty()) {
         out.push_str(&format!("encrypt_key = \"{k}\"\n"));
     }
+    push_agent_section(&mut out);
     out
 }
 
@@ -101,7 +102,17 @@ fn render_wecom_toml(
     if let Some(a) = agent_id {
         out.push_str(&format!("agent_id = {a}\n"));
     }
+    push_agent_section(&mut out);
     out
+}
+
+/// 追加 [agent] 工作区配置示例（注释形式，默认自动全盘）。
+fn push_agent_section(out: &mut String) {
+    out.push_str("\n# [agent]\n");
+    out.push_str("# Agent 工作区配置(默认:自动枚举本机所有盘符根 = 最大权限,无需配置)。\n");
+    out.push_str("# 需要收窄权限时取消注释:\n");
+    out.push_str("# workspace_root = \"D:\\\\\"\n");
+    out.push_str("# workspace_roots = [\"C:\\\\\"]\n");
 }
 
 /// 运行交互式配置向导。

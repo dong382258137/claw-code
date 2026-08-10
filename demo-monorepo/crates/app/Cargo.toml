@@ -1,0 +1,8 @@
+[package]
+name = "demo-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+demo-core = { path = "../core" }
+demo-utils = { path = "../utils" }

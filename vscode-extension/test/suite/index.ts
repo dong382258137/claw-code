@@ -14,7 +14,7 @@ export function activate(): Promise<void> {
     });
 
     // 手动列举测试文件（编译后从 out/test/suite/ 运行）
-    const tests = ['./acp-transport.test', './handlers.test'];
+    const tests = ['./acp-transport.test', './handlers.test', './setup-wizard.test'];
     for (const t of tests) {
         mocha.addFile(path.resolve(__dirname, `${t}.js`));
     }
