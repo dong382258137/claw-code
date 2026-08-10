@@ -649,10 +649,10 @@ fn run_event_loop(
     // 一旦置 true，后续 Submit 不再静默丢弃输入，而是向 OutputView 反馈。
     let mut fatal_error: bool = false;
 
-    // Sidebar: visible by default on wide terminals (>=100 cols), toggleable
-    // via F2 / Ctrl+B. Holds a shared tool-history mirror so the sidebar
+    // Sidebar: hidden by default for a clean interface, toggleable via
+    // F2 / Ctrl+B. Holds a shared tool-history mirror so the sidebar
     // can show live tool-call progress during a streaming turn.
-    let mut sidebar_visible: bool = terminal.size().map(|s| s.width >= 88).unwrap_or(false);
+    let mut sidebar_visible: bool = false;
     let tool_history_shared: Arc<Mutex<ToolHistory>> = Arc::new(Mutex::new(Vec::new()));
     let skill_history_shared: Arc<Mutex<SkillHistory>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -2909,7 +2909,7 @@ fn render_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         ("Up / Down", "滚动输出（菜单开启时用于导航菜单）"),
         ("PgUp / PgDn", "滚动输出视图 上 / 下 一屏"),
         ("/", "打开斜杠命令菜单（模糊过滤）"),
-        ("F2 / Ctrl+B", "切换右侧侧栏"),
+        ("F2 / Ctrl+B", "打开/关闭右侧侧栏（默认隐藏，查看工具状态）"),
         ("Alt+Up / Alt+Down", "滚动侧栏工具历史（看更早 / 回最新）"),
         ("Ctrl+T", "折叠 / 展开最近一个工具卡片"),
         ("鼠标左键", "点击工具卡片切换折叠 / 展开"),

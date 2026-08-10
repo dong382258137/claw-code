@@ -4,7 +4,8 @@
 //! launches an alternate-screen ratatui interface with:
 //! - A scrollable output area capturing streamed responses
 //! - A bottom input line with slash-command popup menu (fuzzy filter)
-//! - A persistent status bar showing model, cwd, branch, tokens, cost
+//! - A persistent status bar showing model, cwd, git, cost, ctx progress,
+//!   cache hit rate, streaming timer, version
 //!
 //! All modules here are `#[cfg(feature = "full-tui")]`. When the feature
 //! is off, this entire module compiles to nothing.
