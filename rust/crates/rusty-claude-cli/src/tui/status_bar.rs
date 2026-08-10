@@ -639,7 +639,6 @@ mod tests {
                 output_tokens: 500,
                 cache_creation_input_tokens: 1_000, // miss
                 cache_read_input_tokens: 9_000,     // hit → 90%
-                ..Default::default()
             },
             ..Default::default()
         };
