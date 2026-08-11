@@ -15,6 +15,8 @@
   ·
   <a href="./SECURITY.md">Security</a>
   ·
+  <a href="./SERVICES.md">💼 商业服务 / Services</a>
+  ·
   <a href="https://github.com/dong382258137/claw-code">GitHub</a>
 </p>
 
