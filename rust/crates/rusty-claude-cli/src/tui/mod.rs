@@ -16,6 +16,7 @@
 pub(crate) mod app;
 pub(crate) mod input_line;
 pub(crate) mod output_view;
+pub(crate) mod session_replay;
 pub(crate) mod sidebar;
 pub(crate) mod slash_menu;
 pub(crate) mod status_bar;

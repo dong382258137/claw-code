@@ -1609,6 +1609,12 @@ impl LiveCli {
         Ok(())
     }
 
+    /// 当前会话的持久化文件路径（session JSONL）。
+    /// 供 TUI 历史回看从文件流式重放。
+    pub(crate) fn session_file_path(&self) -> std::path::PathBuf {
+        self.session.path.clone()
+    }
+
     fn print_status(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();

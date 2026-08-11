@@ -1,28 +1,31 @@
 #![cfg(feature = "full-tui")]
 
-//! 结构化输出视图 — 支持交互式折叠/展开的工具卡片。
+//! 结构化输出视图 — 窗口化渲染（瘦前端）。
 //!
-//! P1 重构：从纯文本 ring buffer 改为结构化条目存储。
+//! 设计（docs/2026-08-11-tui-windowed-renderer-design.md）：
+//! TUI 是瘦渲染器，数据权威在后端 session JSONL。本模块只保留"窗口"大小的
+//! 结构化条目（供 ToolCard 更新 / 折叠 / 点击命中 / J-K-E 跳转），窗口滑出即
+//! 丢弃 —— 无内存预算、无淘汰策略、无跨窗口缓存一致性，从根上消灭
+//! "内容被吞 / 渲染卡住" 这类 bug。
+//!
 //! - `OutputEntry::Text` — 普通文本流（AI 回复、用户 echo）
 //! - `OutputEntry::ToolCard` — 工具调用卡片，可折叠/展开
 //! - `OutputEntry::Thinking` — Thinking 块摘要
 //! - `OutputEntry::Timeline` — 工具时间线
 //!
-//! 渲染时根据每个 entry 的 `collapsed` 状态动态生成可见行。
-//! `Tab` 键切换最近一个 ToolCard 的折叠状态。
+//! 历史回看 = 从 session JSONL 流式重放（见 session_replay.rs）。
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use ansi_to_tui::IntoText;
 use ratatui::text::Line;
 
-/// 最大保留字节数（Text 条目的总文本长度上限）。
-/// 调大到 256KB 以支持长会话（100+ 工具调用）。
-const MAX_BUFFER_BYTES: usize = 256 * 1024;
-
-/// trim_if_needed 的最大迭代次数，防止意外死循环。
-const MAX_TRIM_ITERS: usize = 1000;
+/// 窗口最大条目数（结构化存储上限）。
+/// 超出后从头部弹出（滚出窗口即丢弃）——数据权威在后端 session JSONL，
+/// TUI 不承担无限历史存储。
+const MAX_WINDOW_ENTRIES: usize = 400;
 
 /// 生成当前本地时间戳字符串（HH:MM:SS 格式）。
 fn now_timestamp() -> String {
@@ -76,26 +79,24 @@ pub(crate) fn compute_priority(
     result: &str,
     is_error: bool,
 ) -> Priority {
-    // 1. 模型 emphasis（最高优先级，模型明确表达意图）
+    // 1. 模型显式 emphasis：最高优先级
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
-        if let Some(emp) = v.get("emphasis").and_then(|e| e.as_str()) {
-            return match emp {
-                "high" => Priority::P0,
-                "low" => Priority::P3,
-                _ => Priority::P1, // "normal"
-            };
+        if let Some(emphasis) = v.get("emphasis").and_then(|e| e.as_str()) {
+            match emphasis {
+                "high" => return Priority::P0, // 模型明确要求强调
+                "low" => return Priority::P3,  // 模型明确要求低调
+                _ => {}
+            }
         }
     }
-
-    // 2. is_error（对非 bash 工具有效；bash 成功执行时 is_error 永远 false）
+    // 2. 错误标记：P0 永不折叠
     if is_error {
         return Priority::P0;
     }
-
-    // 3. bash returnCodeInterpretation 启发式（解析输出 JSON 中的字段）
-    if tool_name == "bash" {
+    // 3. bash 专用：returnCodeInterpretation 覆盖行数启发式
+    if tool_name == "bash" || tool_name == "Bash" {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(result) {
-            if let Some(rc) = v.get("returnCodeInterpretation").and_then(|e| e.as_str()) {
+            if let Some(rc) = v.get("returnCodeInterpretation").and_then(|v| v.as_str()) {
                 if rc == "interrupted" {
                     return Priority::P3; // 用户 Ctrl+C 取消
                 }
@@ -281,8 +282,6 @@ impl OutputEntry {
                     .expect("result must be Some after executing check");
                 // P1 修复：统一委托给 render_tool_result_public，由它根据
                 // `collapsed` 参数决定折叠预览（前3行+展开提示）或完整展开。
-                // 之前 collapsed==true 走独立分支只显示一行摘要，导致
-                // render_tool_result 的折叠预览优化永远不生效。
                 let rendered = crate::tui::tool_card::render_tool_result_public(
                     name,
                     output,
@@ -325,7 +324,7 @@ fn starts_with_table_border(text: &str) -> bool {
     chars.peek() == Some(&'│')
 }
 
-/// 线程安全的结构化输出缓冲区。
+/// 线程安全的结构化输出缓冲区（窗口化）。
 fn ansi_to_lines(ansi: &str) -> Vec<Line<'static>> {
     if ansi.is_empty() {
         return Vec::new();
@@ -392,164 +391,85 @@ fn strip_ansi_for_raw_line(s: &str) -> String {
 pub(crate) struct OutputView {
     inner: Arc<Mutex<OutputBuffer>>,
 }
+
+/// 窗口化输出缓冲区。
+///
+/// 只保留最近 `MAX_WINDOW_ENTRIES` 条结构化条目；窗口滑出即丢弃。
+/// 无内存预算、无淘汰策略 —— 数据权威在后端 session JSONL。
 #[derive(Debug, Default)]
 pub(crate) struct OutputBuffer {
-    /// 结构化条目列表（按追加顺序）。
-    entries: Vec<OutputEntry>,
-    /// Text 条目的总字节数（用于 MAX_BUFFER_BYTES 限制）。
-    text_total_bytes: usize,
-    /// 总写入字节数（含已淘汰的，用于诊断）。
-    total_written: u64,
-    /// 是否发生过淘汰。
-    truncated: bool,
-    /// 每个条目在 cached_snapshot 中对应的文本长度。与 entries 等长，
-    /// 用于 recompute_snapshot_tail 增量更新时定位截断点。
-    rendered_lengths: Vec<usize>,
-    /// 渲染后的完整文本缓存。由 recompute_snapshot_tail 增量维护，
-    /// snapshot() 直接 clone 此字段，持锁时间 O(n) 纯 memcpy 无业务逻辑。
-    cached_snapshot: String,
-    cached_lines: Option<Arc<Vec<Line<'static>>>>,
-    /// 每个 entry 在 cached_lines 中的起始行号。
-    /// 长度 = entries.len() + 1，breaks[0]=0，breaks[i+1] = 前 i+1 个 entry 的总行数。
-    /// 由 recompute_snapshot_tail 增量维护，用于增量更新 cached_lines 时定位截断点。
-    cached_lines_breaks: Vec<usize>,
+    /// 窗口内条目（结构化，供 ToolCard 更新/折叠/点击/跳转）。
+    entries: VecDeque<OutputEntry>,
+    /// 单调版本号：每次内容变化递增，供主循环 draw 触发检测。
+    version: u64,
+    /// 极简渲染缓存：`(version, lines, breaks)`。
+    /// draw 间无变化直接复用，避免全量重建；version 不匹配即整体重建
+    /// （窗口小 → 毫秒级）。无增量一致性复杂度。
+    cached_lines: Option<(u64, Arc<Vec<Line<'static>>>, Vec<usize>)>,
 }
 
 impl OutputBuffer {
-    fn invalidate_lines_cache(&mut self) {
+    /// 内容变化：版本号递增 + 渲染缓存失效。
+    fn bump(&mut self) {
+        self.version = self.version.wrapping_add(1);
         self.cached_lines = None;
-        self.cached_lines_breaks.clear();
     }
 
-    fn snapshot_lines(&mut self) -> Arc<Vec<Line<'static>>> {
-        if self.cached_lines.is_none() {
-            // 全量重建：逐 entry 解析（而非 ansi_to_lines 整个 cached_snapshot），
-            // 同时建立 cached_lines_breaks 索引，供后续 recompute 增量更新。
-            let mut lines: Vec<Line<'static>> = Vec::new();
-            let mut breaks: Vec<usize> = Vec::with_capacity(self.entries.len() + 1);
-            breaks.push(0);
-            for entry in &self.entries {
-                let rendered = entry.render();
-                let entry_lines = ansi_to_lines(&rendered);
-                lines.extend(entry_lines);
-                breaks.push(lines.len());
-            }
-            self.cached_lines = Some(Arc::new(lines));
-            self.cached_lines_breaks = breaks;
+    /// 入窗口（尾部追加），超容量从头部弹出（滚出窗口即丢弃）。
+    fn push_window(&mut self, entry: OutputEntry) {
+        self.entries.push_back(entry);
+        while self.entries.len() > MAX_WINDOW_ENTRIES {
+            self.entries.pop_front();
         }
-        Arc::clone(
-            self.cached_lines
-                .as_ref()
-                .expect("cached_lines must be Some after is_none check"),
-        )
     }
-}
 
-impl OutputBuffer {
     /// 追加文本到当前条目。如果最后一个条目是 Text，则合并；
     /// 否则新建一个 Text 条目。
     ///
-    /// P0 改进(2026-08-01):段落感知分段。当 text 包含段落分隔(双换行 `\n\n`)时,
-    /// 按段落分割为独立 Text entry。这样每段 AI 回复都是独立可寻址的条目,
-    /// 配合 J/K 键可快速跳转。最后一段不闭合(可能后续还有流式数据继续追加)。
+    /// 段落感知分段：text 含段落分隔（双换行 `\n\n`）时按段落分割为独立
+    /// Text entry（配合 J/K 键快速跳转）。最后一段不闭合（可能后续流式追加）。
     pub(crate) fn append(&mut self, text: &str) {
-        self.total_written += text.len() as u64;
-
-        // 段落感知分段:检测 text 中的双换行分隔符
-        // 只对流式 AI 回复有意义(非工具输出)。工具结果走 push_entry,不会经过 append。
         if text.contains("\n\n") {
             self.append_segmented(text);
             return;
         }
-
-        // 无段落分隔:走原合并逻辑
-        let from_idx = if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
+        // 无段落分隔：走原合并逻辑
+        if let Some(OutputEntry::Text { content, .. }) = self.entries.back_mut() {
             content.push_str(text);
-            self.text_total_bytes += text.len();
-            self.entries.len() - 1
         } else {
-            self.text_total_bytes += text.len();
-            self.entries.push(OutputEntry::text(text.to_string()));
-            self.entries.len() - 1
-        };
-        self.recompute_snapshot_tail(from_idx);
-        self.trim_if_needed();
+            self.push_window(OutputEntry::text(text.to_string()));
+        }
+        self.bump();
     }
 
-    /// 段落感知追加:按双换行分割 text,每段为独立 Text entry。
-    /// 最后一段合并到已存在的 trailing Text entry(或新建),支持后续流式追加。
+    /// 段落感知追加：按双换行分割 text，每段为独立 Text entry。
+    /// 最后一段合并到已存在的 trailing Text entry（或新建），支持后续流式追加。
     fn append_segmented(&mut self, text: &str) {
-        // 按 "\n\n" 分割,保留非空段。最后一段单独处理(可能未结束)。
         let segments: Vec<&str> = text.split("\n\n").collect();
         let seg_count = segments.len();
-        // P0 修复：from_idx 必须取本次调用**最早**被修改的 entry 索引。
-        // 旧实现只记录最后一个 push/merge 的索引——当一次 append 含 3+ 个
-        // 段落时（markdown 渲染器在安全边界一次性输出多个段落），中间段
-        // 创建的独立 entry 被跳过重渲染，cached_snapshot 永久丢失这些段
-        // （"AI 回复被吞掉"）。用 min 聚合所有被触碰的索引，recompute 从
-        // 最早修改点重渲染，保证 cached_snapshot 与 entries 一致。
-        let mut from_idx = self.entries.len();
-
         for (i, seg) in segments.iter().enumerate() {
             if seg.is_empty() {
                 continue;
             }
-            let touched = if i + 1 == seg_count {
-                // 最后一段:合并到 trailing Text entry 或新建
-                if let Some(OutputEntry::Text { content, .. }) = self.entries.last_mut() {
+            if i + 1 == seg_count {
+                // 最后一段：合并到 trailing Text entry 或新建
+                if let Some(OutputEntry::Text { content, .. }) = self.entries.back_mut() {
                     content.push_str(seg);
-                    self.text_total_bytes += seg.len();
-                    self.entries.len() - 1
                 } else {
-                    self.text_total_bytes += seg.len();
-                    self.entries.push(OutputEntry::text(seg.to_string()));
-                    self.entries.len() - 1
+                    self.push_window(OutputEntry::text(seg.to_string()));
                 }
             } else {
-                // 中间段:闭合为独立 entry(加回 \n\n 保持渲染换行)
-                let seg_text = format!("{seg}\n\n");
-                self.text_total_bytes += seg_text.len();
-                self.entries.push(OutputEntry::text(seg_text));
-                self.entries.len() - 1
-            };
-            from_idx = from_idx.min(touched);
+                // 中间段：闭合为独立 entry（加回 \n\n 保持渲染换行）
+                self.push_window(OutputEntry::text(format!("{seg}\n\n")));
+            }
         }
-        self.recompute_snapshot_tail(from_idx);
-        self.trim_if_needed();
+        self.bump();
     }
 
     /// 追加一个结构化条目。
     pub(crate) fn push_entry(&mut self, entry: OutputEntry) {
-        // Bug L8 修复：ToolCard 的 input 字节数也计入 text_total_bytes，
-        // 防止大量工具调用 input（如长 bash 命令、大文件 write 内容）无限积累。
-        // result 到达时由 complete_tool_card 单独计入。
-        // timestamp 字段长度不计入（恒为 8 字节，可忽略）。
-        if let OutputEntry::Text { content, .. } = &entry {
-            self.text_total_bytes += content.len();
-        } else if let OutputEntry::ToolCard {
-            input,
-            result: Some(r),
-            ..
-        } = &entry
-        {
-            self.text_total_bytes += input.len() + r.len();
-        } else if let OutputEntry::ToolCard {
-            input,
-            result: None,
-            ..
-        } = &entry
-        {
-            self.text_total_bytes += input.len();
-        } else if let OutputEntry::Thinking { summary, .. } = &entry {
-            self.text_total_bytes += summary.len();
-        } else if let OutputEntry::Timeline { summary, .. } = &entry {
-            self.text_total_bytes += summary.len();
-        }
-        self.entries.push(entry);
-        // 增量更新 cached_snapshot：只重渲染新增的最后一个条目。
-        let from_idx = self.entries.len() - 1;
-        self.recompute_snapshot_tail(from_idx);
-        self.trim_if_needed();
+        self.push_window(entry);
+        self.bump();
     }
 
     /// 更新指定 tool_id 的 ToolCard：设置 result 并按优先级决定折叠状态。
@@ -559,14 +479,11 @@ impl OutputBuffer {
         result: String,
         is_error: bool,
     ) -> bool {
-        // 先查找目标索引，避免在 iter_mut 期间调用 recompute_snapshot_tail 的借用冲突。
+        // 先查找目标索引，避免在 iter_mut 期间借用冲突。
         let found_idx = self.entries.iter().position(|e| {
             matches!(e, OutputEntry::ToolCard { tool_id: id, result: r, .. } if id == tool_id && r.is_none())
         });
         if let Some(idx) = found_idx {
-            // 工具结果可能很大（read 大文件、bash 大量输出），
-            // 不计入会导致内存无限制增长。
-            self.text_total_bytes += result.len();
             // 先读取 name 和 input 用于计算优先级（借用冲突需先 clone）。
             let (name, input) = match &self.entries[idx] {
                 OutputEntry::ToolCard { name, input, .. } => (name.clone(), input.clone()),
@@ -587,9 +504,7 @@ impl OutputBuffer {
                 *p = priority;
                 *c = collapsed;
             }
-            // 增量更新 cached_snapshot：从 idx 开始重渲染。
-            self.recompute_snapshot_tail(idx);
-            self.trim_if_needed();
+            self.bump();
             return true;
         }
         false
@@ -616,7 +531,6 @@ impl OutputBuffer {
                 _ => None,
             });
         if let Some(idx) = found_idx {
-            self.text_total_bytes += result.len();
             let input = match &self.entries[idx] {
                 OutputEntry::ToolCard { input, .. } => input.clone(),
                 _ => unreachable!("idx 已确认是 ToolCard"),
@@ -636,8 +550,7 @@ impl OutputBuffer {
                 *p = priority;
                 *c = collapsed;
             }
-            self.recompute_snapshot_tail(idx);
-            self.trim_if_needed();
+            self.bump();
             return true;
         }
         false
@@ -660,7 +573,7 @@ impl OutputBuffer {
             if let OutputEntry::ToolCard { collapsed, .. } = &mut self.entries[idx] {
                 *collapsed = !*collapsed;
             }
-            self.recompute_snapshot_tail(idx);
+            self.bump();
             return true;
         }
         false
@@ -688,7 +601,7 @@ impl OutputBuffer {
             if let OutputEntry::ToolCard { collapsed, .. } = &mut self.entries[idx] {
                 *collapsed = !*collapsed;
             }
-            self.recompute_snapshot_tail(idx);
+            self.bump();
             return true;
         }
         false
@@ -730,22 +643,9 @@ impl OutputBuffer {
     /// 鼠标点击场景：把点击的 row + scroll_y 映射到显示行号，
     /// 然后查这个表找出命中的 ToolCard entry。
     ///
-    /// **行号计算规则**（与 `Paragraph::scroll` 单位一致，考虑 `Wrap`）：
-    /// - 对每个 entry 的 `render()` 输出，按 `area_width` 计算显示行数
-    ///   （每个逻辑行若超过 area_width 会折成多行显示行）
-    /// - 累计得到 entry 在显示行空间的 `[start, end)` 区间
-    /// - 区间命中条件：`start <= line < end`
-    ///
-    /// **P0-3 修复（鼠标点击错位）**：旧实现直接用含 ANSI 转义的原始渲染串
-    /// 做 `UnicodeWidthStr::width` + `div_ceil` 估算折行数，两处与真实显示
-    /// 不一致：
-    /// 1. ANSI 转义序列（`\x1b[...m`）被当成可见字符计入宽度 → 每行宽度高估
-    ///    → 折行数高估 → 区间向右下方错位 → 点击命中"上方的卡片"。
-    /// 2. `div_ceil` 假设可在任意字符处折行，但显示端 `wrap_line_to_display_lines`
-    ///    按词边界折行（超长单词不折）→ 长词行计数不一致 → 偶发点击无反应。
-    ///
-    /// 修复：直接复用 draw 使用的同一份数据（`cached_lines` + `cached_lines_breaks`
-    ///   + `wrap_line_to_display_lines`），保证区间与屏幕显示完全一致。
+    /// 与 draw 同源：用 `snapshot_lines()` + `snapshot_breaks()` 计算，
+    /// 保证区间与屏幕显示完全一致（P0-3 修复：不再用含 ANSI 的原始串估算
+    /// 宽度，避免高估折行数导致点击命中错位）。
     pub(crate) fn tool_card_line_ranges(
         &mut self,
         area_width: usize,
@@ -755,10 +655,8 @@ impl OutputBuffer {
         usize, /*end*/
     )> {
         let width = area_width.max(1);
-        // 与 draw 同源：snapshot_lines 确保 cached_lines 已构建，breaks 标记
-        // 每个 entry 的原始行区间（ANSI 已解析为样式化行）。
         let lines = self.snapshot_lines();
-        let breaks = self.cached_lines_breaks.clone();
+        let breaks = self.snapshot_breaks();
         let mut ranges = Vec::new();
         let mut current_display: usize = 0;
         for i in 0..breaks.len().saturating_sub(1) {
@@ -802,8 +700,7 @@ impl OutputBuffer {
                 }) = self.entries.get_mut(entry_idx)
                 {
                     *collapsed = !*collapsed;
-                    // 增量更新 cached_snapshot：从 entry_idx 开始重渲染。
-                    self.recompute_snapshot_tail(entry_idx);
+                    self.bump();
                     return true;
                 }
             }
@@ -811,94 +708,9 @@ impl OutputBuffer {
         false
     }
 
-    /// 从 from_idx 开始重新渲染条目，增量更新 cached_snapshot 和 rendered_lengths。
-    /// 用于 entries 被修改后的增量更新：只重渲染受影响的尾部，避免全量遍历。
-    ///
-    /// 复杂度：O(entries.len() - from_idx) 的 render 调用 + O(cached_snapshot.len())
-    /// 的 truncate。对于高频的 append 合并（from_idx = len-1），只重渲染 1 个条目。
-    fn recompute_snapshot_tail(&mut self, from_idx: usize) {
-        // 计算 from_idx 之前所有条目的 render 长度之和（cached_snapshot 中的起始字节位置）
-        let start_byte: usize = self.rendered_lengths.iter().take(from_idx).sum();
-        // 截断 cached_snapshot 到 start_byte
-        self.cached_snapshot.truncate(start_byte);
-        // 截断 rendered_lengths 到 from_idx
-        self.rendered_lengths.truncate(from_idx);
-        // 重新渲染 from_idx 之后的条目，同时更新 cached_snapshot
-        for i in from_idx..self.entries.len() {
-            let rendered = self.entries[i].render();
-            let len = rendered.len();
-            self.cached_snapshot.push_str(&rendered);
-            self.rendered_lengths.push(len);
-        }
-        // P0-2 修复：增量维护 cached_lines，而非全量 invalidate。
-        //
-        // 增量方案优先用 Arc::try_unwrap（strong_count==1 时零拷贝取出 Vec），
-        // 失败时（主线程 draw 闭包仍持有 snapshot_lines 返回的 Arc clone）改为
-        // clone 现有 Vec 后增量修改 —— 比 invalidate + 全量 ansi_to_lines 重建快 10-50 倍。
-        //
-        // 根因（渲染卡住恶性循环）：
-        //   1. 主线程 draw 闭包持 Arc clone → strong_count=2
-        //   2. worker 线程 append → try_unwrap 失败 → invalidate
-        //   3. 下次 draw → snapshot_lines 全量重建（5-10ms 持锁）
-        //   4. 全量重建期间 worker append 阻塞 → total_written 不更新 → content_changed=false
-        //   5. 只有 elapsed_changed（每秒一次）触发 draw → "卡住"现象
-        //
-        // clone 开销分析：256KB buffer ≈ 3000 行 ≈ 9000 个 Span → ~0.3ms
-        // 全量重建开销：ansi_to_lines 解析 256KB → 5-10ms
-        // clone 方案在 streaming 高频 append 下总开销 ~10ms/s，可接受。
-        if let Some(lines_arc) = self.cached_lines.take() {
-            match Arc::try_unwrap(lines_arc) {
-                Ok(mut lines) => {
-                    // 快速路径：strong_count==1，零拷贝取出 Vec
-                    self.cached_lines_breaks.truncate(from_idx + 1);
-                    let Some(line_start) = self.cached_lines_breaks.get(from_idx).copied() else {
-                        // 索引越界保护：breaks 与 entries 数量不一致导致 from_idx 越界时，
-                        // 放弃增量更新，交给下次 snapshot_lines() 全量重建，避免渲染线程 panic。
-                        self.invalidate_lines_cache();
-                        return;
-                    };
-                    lines.truncate(line_start);
-                    for i in from_idx..self.entries.len() {
-                        let rendered = self.entries[i].render();
-                        let entry_lines = ansi_to_lines(&rendered);
-                        lines.extend(entry_lines);
-                        self.cached_lines_breaks.push(lines.len());
-                    }
-                    self.cached_lines = Some(Arc::new(lines));
-                    return;
-                }
-                Err(arc) => {
-                    // strong_count > 1（主线程仍持 Arc clone）：
-                    // clone 现有 Vec，增量修改后创建新 Arc。
-                    // 避免 invalidate → 全量 ansi_to_lines 重建（5-10ms 持锁）。
-                    let mut lines: Vec<Line<'static>> = (*arc).clone();
-                    self.cached_lines_breaks.truncate(from_idx + 1);
-                    let Some(line_start) = self.cached_lines_breaks.get(from_idx).copied() else {
-                        // 索引越界保护：breaks 与 entries 数量不一致导致 from_idx 越界时，
-                        // 放弃增量更新，交给下次 snapshot_lines() 全量重建，避免渲染线程 panic。
-                        self.invalidate_lines_cache();
-                        return;
-                    };
-                    lines.truncate(line_start);
-                    for i in from_idx..self.entries.len() {
-                        let rendered = self.entries[i].render();
-                        let entry_lines = ansi_to_lines(&rendered);
-                        lines.extend(entry_lines);
-                        self.cached_lines_breaks.push(lines.len());
-                    }
-                    self.cached_lines = Some(Arc::new(lines));
-                    return;
-                }
-            }
-        }
-        // 首次或被 clear：全量重建交给下次 snapshot_lines() 调用。
-        self.invalidate_lines_cache();
-    }
-
-    /// 返回 cached_snapshot 的 clone。
-    /// 增量维护模式下 cached_snapshot 始终最新，无需全量遍历。
+    /// 返回窗口内全部条目的渲染文本（含 ANSI 转义）。
     pub(crate) fn render_all(&self) -> String {
-        self.cached_snapshot.clone()
+        self.entries.iter().map(|e| e.render()).collect()
     }
 
     /// 保留向后兼容：返回渲染后的文本（等价于 render_all）。
@@ -906,102 +718,102 @@ impl OutputBuffer {
         self.render_all()
     }
 
-    /// 只读访问总写入字节数。
-    pub(crate) fn total_written(&self) -> u64 {
-        self.total_written
+    /// 只读访问版本号（内容变化即递增，供 draw 触发检测）。
+    pub(crate) fn version(&self) -> u64 {
+        self.version
     }
 
-    /// 只读访问 truncated 标志。
-    pub(crate) fn truncated(&self) -> bool {
-        self.truncated
+    /// 重建窗口内渲染行 + 每条目的起始行索引。
+    fn rebuild(&mut self) {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut breaks: Vec<usize> = Vec::with_capacity(self.entries.len() + 1);
+        breaks.push(0);
+        for entry in &self.entries {
+            let rendered = entry.render();
+            let entry_lines = ansi_to_lines(&rendered);
+            lines.extend(entry_lines);
+            breaks.push(lines.len());
+        }
+        self.cached_lines = Some((self.version, Arc::new(lines), breaks));
     }
 
-    /// 当 Text 总字节数超限时，淘汰最早的 Text 条目；
-    /// 若无 Text 条目可淘汰，则裁剪最早的 ToolCard 的 result。
-    ///
-    /// **Bug L8 修复**：原实现只淘汰 Text，ToolCard 的 result（可能几 MB）
-    /// 完全不计入限制，导致内存爆炸。现在：
-    /// - push_entry / complete_tool_card 把 ToolCard 的 input + result 字节数
-    ///   都计入 `text_total_bytes`。
-    /// - trim 时若仍超限且无 Text 可淘汰，把最早的 ToolCard 的 result 替换为
-    ///   `[trimmed: N bytes]` 占位符（保留 header 和 input 以维持工具调用历史，
-    ///   仅裁剪可能极大的 result 文本），并相应减少 text_total_bytes。
-    ///
-    /// **卡死修复**：原 trim 在 ToolCard result 被替换为占位符后，下一轮迭代
-    /// 仍命中同一 entry（占位符非空），导致无限循环并持锁死锁主渲染线程。
-    /// 修复策略：
-    /// 1. 跳过已是 `[trimmed:` 开头的占位符，遍历到下一个未裁剪过的 ToolCard
-    /// 2. 增加 MAX_TRIM_ITERS 兜底，防止未来类似问题
-    /// 3. 把占位符字节数从 text_total_bytes 中扣除（占位符属于元信息，不计入预算）
-    fn trim_if_needed(&mut self) {
-        let mut iter_count = 0;
-        while self.text_total_bytes > MAX_BUFFER_BYTES {
-            iter_count += 1;
-            if iter_count > MAX_TRIM_ITERS {
-                // 防御性兜底：超出迭代上限仍未收敛，记录 truncated 并退出。
-                // 比死锁主线程好得多。
-                self.truncated = true;
-                break;
-            }
-            // P0 修复：优先裁剪 ToolCard 的 result（体积大、已折叠显示、非信号），
-            // 最后才淘汰 Text（AI 回复/用户 echo）。
-            // 旧实现反序（先删 Text 再裁 ToolCard），长会话里一旦工具输出撑满
-            // 256KB 预算，最早的 AI 回复会被静默删除 →"AI 回复被吞掉"。
-            // 现在优先裁掉最大的 ToolCard result（保留 header/input 历史），
-            // Text 仅在 ToolCard 全部裁完且仍超预算时才淘汰。
-            // error/P0 entry 永不裁剪（用户需看到错误）。
-            let largest_card_idx = self.entries.iter().enumerate().filter_map(|(idx, e)| {
-                if let OutputEntry::ToolCard {
-                    result: Some(r),
-                    is_error,
-                    priority,
-                    ..
-                } = e
-                {
-                    if !r.is_empty()
-                        && !r.starts_with("[trimmed:")
-                        && !*is_error
-                        && *priority != Priority::P0
-                    {
-                        return Some((idx, r.len()));
-                    }
+    /// 返回窗口内全部渲染行（Arc 共享，draw 直接使用）。
+    pub(crate) fn snapshot_lines(&mut self) -> Arc<Vec<Line<'static>>> {
+        if self.cached_lines.as_ref().map(|(v, _, _)| *v) != Some(self.version) {
+            self.rebuild();
+        }
+        Arc::clone(
+            &self
+                .cached_lines
+                .as_ref()
+                .expect("cached_lines must be set after rebuild")
+                .1,
+        )
+    }
+
+    /// 快照每个 entry 在渲染行中的起始行号（原始行，未 wrap）。
+    /// 长度 = entries.len() + 1，breaks[0]=0，breaks[i+1] = 前 i+1 个 entry 的总行数。
+    pub(crate) fn snapshot_breaks(&mut self) -> Vec<usize> {
+        if self.cached_lines.as_ref().map(|(v, _, _)| *v) != Some(self.version) {
+            self.rebuild();
+        }
+        self.cached_lines
+            .as_ref()
+            .expect("cached_lines must be set after rebuild")
+            .2
+            .clone()
+    }
+
+    /// 返回所有 Text 类型 entry 的 display 起始行号（原始行，未 wrap）。
+    /// 供 J/K 键跳转 AI 回复锚点使用。
+    /// 仅返回 Text entry，跳过 ToolCard/Thinking/Timeline（它们不是 AI 回复）。
+    pub(crate) fn text_entry_display_starts(&mut self) -> Vec<usize> {
+        self.snapshot_breaks(); // 确保 breaks 已建立
+        let breaks = self.snapshot_breaks();
+        let mut result = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if matches!(entry, OutputEntry::Text { .. }) {
+                if let Some(&start) = breaks.get(i) {
+                    result.push(start);
                 }
-                None
-            });
-            if let Some((idx, _)) = largest_card_idx.max_by_key(|(_, len)| *len) {
-                if let OutputEntry::ToolCard { result, .. } = &mut self.entries[idx] {
-                    if let Some(r) = result.take() {
-                        let trimmed_len = r.len();
-                        let placeholder = format!("[trimmed: {} bytes]", trimmed_len);
-                        // 占位符自身从 text_total_bytes 中扣除，避免占位符
-                        // 又被下一轮迭代命中（占位符不算业务文本）。
-                        self.text_total_bytes = self.text_total_bytes.saturating_sub(trimmed_len);
-                        *result = Some(placeholder);
-                        self.truncated = true;
-                    }
-                }
-                // result 被替换为占位符后增量更新 cached_snapshot。
-                self.recompute_snapshot_tail(idx);
-                continue;
-            }
-            // 无 ToolCard 可裁剪时，淘汰最早的 Text 条目。
-            let first_text_idx = self
-                .entries
-                .iter()
-                .position(|e| matches!(e, OutputEntry::Text { .. }));
-            if let Some(idx) = first_text_idx {
-                if let OutputEntry::Text { content, .. } = &self.entries[idx] {
-                    self.text_total_bytes = self.text_total_bytes.saturating_sub(content.len());
-                }
-                self.entries.remove(idx);
-                self.truncated = true;
-                // 删除条目后增量更新 cached_snapshot：从 idx 开始重渲染。
-                self.recompute_snapshot_tail(idx);
-            } else {
-                // 既无 ToolCard 也无 Text 可淘汰，停止以避免死循环。
-                break;
             }
         }
+        result
+    }
+
+    /// 清空窗口（本地 /clear 或 /new）。
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.bump();
+    }
+
+    /// 历史回看：把 session JSONL 重放得到的更早条目前置到窗口头部。
+    /// 超出窗口容量时从尾部弹出（尾部内容仍保存在后端 session 文件，
+    /// 滚动回底部时重新实时追加）。
+    pub(crate) fn prepend_history(&mut self, entries: Vec<OutputEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        for e in entries.into_iter().rev() {
+            self.entries.push_front(e);
+        }
+        while self.entries.len() > MAX_WINDOW_ENTRIES {
+            self.entries.pop_back();
+        }
+        self.bump();
+    }
+
+    /// 窗口内条目数（诊断用）。
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 取出窗口内全部条目（供 session_replay 收集历史段）。
+    /// 取空后窗口清空，版本递增。
+    pub(crate) fn drain_entries(&mut self) -> Vec<OutputEntry> {
+        let out: Vec<OutputEntry> = self.entries.drain(..).collect();
+        self.bump();
+        out
     }
 }
 
@@ -1018,14 +830,12 @@ impl OutputView {
         Arc::clone(&self.inner)
     }
 
-    /// 快照当前渲染后的文本内容（克隆）。
-    /// 增量维护模式下 cached_snapshot 始终最新，持锁期间只做 String clone。
+    /// 快照当前渲染后的文本内容（窗口内，克隆）。
     pub(crate) fn snapshot(&self) -> String {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .cached_snapshot
-            .clone()
+            .render_all()
     }
 
     pub(crate) fn snapshot_lines(&self) -> Arc<Vec<Line<'static>>> {
@@ -1033,53 +843,28 @@ impl OutputView {
         guard.snapshot_lines()
     }
 
-    /// 快照每个 entry 在 cached_lines 中的起始行号(原始行,未 wrap)。
-    /// 长度 = entries.len() + 1,breaks[0]=0,breaks[i+1] = 前 i+1 个 entry 的总行数。
-    /// 供 sticky_view 计算粘性头部时定位 entry 边界(调用方需在 wrap 后映射到 display 行)。
+    /// 快照每个 entry 在渲染行中的起始行号(原始行,未 wrap)。
+    /// 供 sticky_view 计算粘性头部时定位 entry 边界。
     pub(crate) fn snapshot_breaks(&self) -> Vec<usize> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // 确保 cached_lines_breaks 已建立(同 snapshot_lines 的惰性初始化)
-        guard.snapshot_lines();
-        guard.cached_lines_breaks.clone()
+        guard.snapshot_breaks()
     }
 
-    /// 返回所有 Text 类型 entry 的 display 起始行号(原始行,未 wrap)。
-    /// 供 J/K 键跳转 AI 回复锚点使用(P0 改进)。
-    /// 仅返回 Text entry,跳过 ToolCard/Thinking/Timeline(它们不是 AI 回复)。
-    pub(crate) fn text_entry_display_starts(&self) -> Vec<usize> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.snapshot_lines(); // 确保 cached_lines_breaks 已建立
-        let breaks = &guard.cached_lines_breaks;
-        let entries = &guard.entries;
-        let mut result = Vec::new();
-        for (i, entry) in entries.iter().enumerate() {
-            if matches!(entry, OutputEntry::Text { .. }) {
-                if let Some(&start) = breaks.get(i) {
-                    result.push(start);
-                }
-            }
-        }
-        result
-    }
-
-    /// 清空所有条目。
-    pub(crate) fn clear(&mut self) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.entries.clear();
-        guard.text_total_bytes = 0;
-        guard.truncated = false;
-        guard.rendered_lengths.clear();
-        guard.cached_snapshot.clear();
-        guard.cached_lines = None;
-        guard.cached_lines_breaks.clear();
-    }
-
-    /// 总写入字节数。
-    pub(crate) fn total_written(&self) -> u64 {
+    /// 只读访问版本号（内容变化即递增，供 draw 触发检测）。
+    pub(crate) fn version(&self) -> u64 {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .total_written
+            .version
+    }
+
+    /// 返回所有 Text 类型 entry 的 display 起始行号（原始行，未 wrap）。
+    /// 供 J/K 键跳转 AI 回复锚点使用。
+    pub(crate) fn text_entry_display_starts(&self) -> Vec<usize> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .text_entry_display_starts()
     }
 }
 
@@ -1106,6 +891,19 @@ impl Write for OutputView {
 mod tests {
     use super::*;
 
+    fn card(tool_id: &str, name: &str, input: &str) -> OutputEntry {
+        OutputEntry::ToolCard {
+            tool_id: tool_id.to_string(),
+            name: name.to_string(),
+            input: input.to_string(),
+            result: None,
+            is_error: false,
+            priority: Priority::P1,
+            collapsed: false,
+            timestamp: String::new(),
+        }
+    }
+
     #[test]
     fn write_appends_to_buffer() {
         let mut view = OutputView::new();
@@ -1122,41 +920,30 @@ mod tests {
     fn table_text_entry_skips_timestamp_prefix_on_first_line() {
         use crate::render::TerminalRenderer;
         let renderer = TerminalRenderer::new();
-        let md = "| Name | Description |\n| ---- | ---- |\n| read_file | Reads a file |";
-        let ansi = renderer.markdown_to_ansi_with_width(md, Some(40));
-        let entry = OutputEntry::text(ansi);
-        let rendered = entry.render();
-        // 时间戳前缀固定为灰色 \x1b[38;5;240m[...]；表格首行不得出现此前缀，
-        // 否则表头行整体右移、与数据行（无前缀）错位。
+        let rendered = renderer.markdown_to_ansi("| a | b |\n|---|---|\n| 1 | 2 |");
+        assert!(rendered.contains('│'), "表格应渲染出边框: {rendered}");
+        let entry = OutputEntry::text(rendered);
+        let out = entry.render();
+        let first_line = out.lines().next().unwrap_or_default();
+        // 首行不应带灰色时间戳前缀（否则表头被整体右移）
         assert!(
-            !rendered.starts_with("\u{1b}[38;5;240m"),
-            "表格首行不应带时间戳前缀(否则与数据行错位): {rendered:?}"
+            !first_line.starts_with("\u{1b}[38;5;240m["),
+            "表格首行不应加时间戳前缀: {first_line:?}"
         );
-        // 首行去 ANSI 后应以表格边框 │ 开头
-        let first_line = rendered.split('\n').next().unwrap_or_default();
-        let mut chars = first_line.chars().peekable();
-        while chars.peek() == Some(&'\u{1b}') {
-            chars.next();
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-        assert_eq!(chars.next(), Some('│'), "首行应以 │ 开头: {first_line:?}");
     }
 
     #[test]
-    fn total_written_counts_all_bytes() {
+    fn shared_handle_shares_state() {
+        let view = OutputView::new();
+        let handle = view.shared_handle();
+        handle.lock().unwrap().append("shared");
+        assert!(view.snapshot().contains("shared"));
+    }
+
+    #[test]
+    fn flush_is_noop() {
         let mut view = OutputView::new();
-        view.write_all(b"abc").unwrap();
-        view.write_all(b"de").unwrap();
-        assert_eq!(view.total_written(), 5);
+        assert!(view.flush().is_ok());
     }
 
     #[test]
@@ -1167,244 +954,293 @@ mod tests {
     }
 
     #[test]
-    fn buffer_trims_when_exceeding_max() {
-        let mut view = OutputView::new();
-        let big_chunk = "x".repeat(MAX_BUFFER_BYTES + 100);
-        view.write_all(big_chunk.as_bytes()).unwrap();
-        let snap = view.snapshot();
-        // 渲染后长度可能略大于 MAX_BUFFER_BYTES（因时间戳前缀），但应远小于写入总量
-        assert!(snap.len() < MAX_BUFFER_BYTES + 100);
-        assert!(view.total_written() as usize >= MAX_BUFFER_BYTES);
-    }
-
-    #[test]
-    fn clear_empties_buffer() {
-        let mut view = OutputView::new();
-        view.write_all(b"data").unwrap();
-        view.clear();
-        assert_eq!(view.snapshot(), "");
-    }
-
-    #[test]
-    fn shared_handle_shares_state() {
-        let mut view = OutputView::new();
-        let handle = view.shared_handle();
-        view.write_all(b"shared").unwrap();
-        let snap = handle.lock().unwrap().render_all();
-        // Text 渲染会带时间戳前缀
-        assert!(snap.contains("shared"));
-    }
-
-    #[test]
-    fn flush_is_noop() {
-        let mut view = OutputView::new();
-        assert!(view.flush().is_ok());
-    }
-
-    #[test]
     fn push_entry_creates_distinct_entry() {
-        let mut view = OutputView::new();
-        view.write_all(b"text1").unwrap();
-        {
-            let mut guard = view.inner.lock().unwrap();
-            guard.push_entry(OutputEntry::thinking("\n▶ Thinking hidden\n".to_string()));
-        }
-        view.write_all(b"text2").unwrap();
-        let snap = view.snapshot();
+        let mut buf = OutputBuffer::default();
+        buf.push_entry(OutputEntry::text("text1".to_string()));
+        buf.push_entry(card("t1", "bash", "{}"));
+        assert_eq!(buf.entry_count(), 2);
+        let snap = buf.render_all();
         assert!(snap.contains("text1"));
-        assert!(snap.contains("text2"));
-        assert!(snap.contains("Thinking hidden"));
+        assert!(snap.contains("bash"));
+    }
+
+    #[test]
+    fn text_entries_merge_consecutive_writes() {
+        let mut buf = OutputBuffer::default();
+        buf.append("text1 ");
+        buf.append("text2 ");
+        buf.append("text3");
+        assert_eq!(buf.entry_count(), 1, "连续 append 应合并为单个 Text entry");
+        assert!(buf.render_all().contains("text1 text2 text3"));
     }
 
     #[test]
     fn complete_tool_card_sets_result() {
-        let view = OutputView::new();
-        {
-            let mut guard = view.inner.lock().unwrap();
-            guard.push_entry(OutputEntry::tool_card_start(
-                "t1".to_string(),
-                "bash".to_string(),
-                r#"{"command":"ls"}"#.to_string(),
-            ));
-        }
-        // 完成工具调用
-        {
-            let mut guard = view.inner.lock().unwrap();
-            assert!(guard.complete_tool_card("t1", "file1\nfile2".to_string(), false));
-        }
-        // 渲染应包含结果
-        let snap = view.snapshot();
+        let mut buf = OutputBuffer::default();
+        buf.push_entry(OutputEntry::tool_card_start(
+            "t1".to_string(),
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+        ));
+        assert!(buf.complete_tool_card("t1", "file1\nfile2".to_string(), false));
+        assert_eq!(buf.completed_tool_card_count(), 1);
+        let snap = buf.render_all();
         assert!(snap.contains("bash"));
         assert!(snap.contains("2 行"));
     }
 
     /// 回归测试：complete_tool_card 后长输出应显示折叠预览（前3行 + 展开 hint）。
-    ///
-    /// 这是用户报告的核心问题：之前 complete_tool_card 把 collapsed 设为 true，
-    /// 但 render() 在 collapsed==true 分支只显示一行摘要 "(N 行，已折叠)"，
-    /// 完全跳过了 render_tool_result 中的折叠预览逻辑（前3行 + [+] 展开）。
-    /// 修复后 render() 统一委托给 render_tool_result(..., collapsed)，
-    /// collapsed==true + 长输出 → 前3行预览 + [+] 展开提示。
     #[test]
     fn complete_tool_card_long_output_shows_collapse_preview() {
-        let view = OutputView::new();
-        {
-            let mut guard = view.inner.lock().unwrap();
-            guard.push_entry(OutputEntry::tool_card_start(
-                "t1".to_string(),
-                "bash".to_string(),
-                r#"{"command":"ls"}"#.to_string(),
-            ));
-        }
-        // 50 行输出，超过 P2 阈值(40) → 默认折叠
-        let long_output = (1..=50)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        {
-            let mut guard = view.inner.lock().unwrap();
-            assert!(guard.complete_tool_card("t1", long_output, false));
-        }
-        let snap = view.snapshot();
-        // P0 改进(2026-08-01):折叠时只显示单行标题,不再显示 3 行预览。
-        // 新行为:标题(含行数+折叠标记) + 尾行,不显示 [+] 展开提示和预览行。
+        let mut buf = OutputBuffer::default();
+        buf.push_entry(OutputEntry::tool_card_start(
+            "t1".to_string(),
+            "bash".to_string(),
+            r#"{"command":"cat big.txt"}"#.to_string(),
+        ));
+        let long_output = (1..=50).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        assert!(buf.complete_tool_card("t1", long_output, false));
+        let snap = buf.render_all();
         assert!(snap.contains("50 行"), "应显示总行数: {snap}");
         assert!(snap.contains("折叠"), "应显示折叠标记: {snap}");
-        assert!(!snap.contains("[+] 展开"), "不应显示展开提示: {snap}");
-        assert!(!snap.contains("│ line1"), "不应显示预览行: {snap}");
-        assert!(!snap.contains("│ line3"), "不应显示预览行: {snap}");
-    }
-
-    /// 回归测试：toggle 展开 ToolCard 后长输出应显示完整内容。
-    #[test]
-    fn toggle_expand_long_tool_card_shows_full_output() {
-        let view = OutputView::new();
-        let long_output = (1..=20)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        {
-            let mut guard = view.inner.lock().unwrap();
-            guard.push_entry(OutputEntry::ToolCard {
-                tool_id: "t1".to_string(),
-                name: "bash".to_string(),
-                input: r#"{"command":"ls"}"#.to_string(),
-                result: Some(long_output),
-                is_error: false,
-                priority: Priority::P2,
-                collapsed: true,
-                timestamp: String::new(),
-            });
-        }
-        // 切换为展开
-        {
-            let mut guard = view.inner.lock().unwrap();
-            assert!(guard.toggle_latest_tool_card());
-        }
-        let snap = view.snapshot();
-        // 展开后不应有折叠提示
-        assert!(!snap.contains("[+] 展开"), "展开状态不应有折叠提示: {snap}");
-        // 应包含所有行
-        assert!(snap.contains("line1"));
-        assert!(snap.contains("line20"));
+        assert!(!snap.contains("[+] 展开"), "单行标题折叠不应有展开提示: {snap}");
     }
 
     #[test]
     fn toggle_latest_tool_card_switches_collapsed() {
-        let view = OutputView::new();
-        {
-            let mut guard = view.inner.lock().unwrap();
-            guard.push_entry(OutputEntry::ToolCard {
-                tool_id: "t1".to_string(),
-                name: "bash".to_string(),
-                input: "{}".to_string(),
-                result: Some("output".to_string()),
-                is_error: false,
-                priority: Priority::P2,
+        let mut buf = OutputBuffer::default();
+        buf.push_entry(OutputEntry::text("before".to_string()));
+        buf.push_entry(OutputEntry::tool_card_start(
+            "t1".to_string(),
+            "bash".to_string(),
+            "{}".to_string(),
+        ));
+        buf.complete_tool_card("t1", "ok".to_string(), false);
+        assert!(buf.toggle_latest_tool_card());
+        // 折叠后渲染只显示标题行
+        assert!(matches!(
+            buf.entries.back(),
+            Some(OutputEntry::ToolCard {
                 collapsed: true,
-                timestamp: String::new(),
-            });
-        }
-        // 切换折叠
-        {
-            let mut guard = view.inner.lock().unwrap();
-            assert!(guard.toggle_latest_tool_card());
-        }
-        // 渲染应显示完整内容（展开状态）
-        let snap = view.snapshot();
-        assert!(snap.contains("output"));
+                ..
+            })
+        ));
+    }
+
+    /// 展开长 ToolCard 应显示完整输出。
+    #[test]
+    fn toggle_expand_long_tool_card_shows_full_output() {
+        let mut buf = OutputBuffer::default();
+        let long_output = (1..=20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        buf.push_entry(OutputEntry::ToolCard {
+            tool_id: "t1".to_string(),
+            name: "bash".to_string(),
+            input: r#"{"command":"ls"}"#.to_string(),
+            result: Some(long_output),
+            is_error: false,
+            priority: Priority::P2,
+            collapsed: true,
+            timestamp: String::new(),
+        });
+        // 初始折叠：只显示标题
+        let collapsed0 = buf.render_all();
+        assert!(!collapsed0.contains("line1"), "P2 默认折叠应隐藏正文");
+        // 切换为展开
+        assert!(buf.toggle_latest_tool_card());
+        let expanded = buf.render_all();
+        assert!(expanded.contains("line1"));
+        assert!(expanded.contains("line20"));
+        // 再切换回折叠
+        assert!(buf.toggle_latest_tool_card());
+        let collapsed = buf.render_all();
+        assert!(!collapsed.contains("line1"));
     }
 
     #[test]
     fn completed_tool_card_count_excludes_pending() {
-        let view = OutputView::new();
-        {
-            let mut guard = view.inner.lock().unwrap();
-            guard.push_entry(OutputEntry::ToolCard {
-                tool_id: "t1".to_string(),
+        let mut buf = OutputBuffer::default();
+        buf.push_entry(OutputEntry::tool_card_start(
+            "t1".to_string(),
+            "bash".to_string(),
+            "{}".to_string(),
+        ));
+        assert_eq!(buf.completed_tool_card_count(), 0);
+        buf.complete_tool_card("t1", "ok".to_string(), false);
+        assert_eq!(buf.completed_tool_card_count(), 1);
+    }
+
+    #[test]
+    fn error_entry_indices_flags_error_cards() {
+        let mut buf = OutputBuffer::default();
+        buf.push_entry(OutputEntry::text("reply".to_string()));
+        buf.push_entry(OutputEntry::tool_card_start(
+            "t1".to_string(),
+            "bash".to_string(),
+            r#"{"command":"false"}"#.to_string(),
+        ));
+        buf.complete_tool_card("t1", "boom".to_string(), true);
+        let idx = buf.error_entry_indices();
+        assert_eq!(idx, vec![1]);
+    }
+
+    /// 窗口容量：超出 MAX_WINDOW_ENTRIES 时从头部弹出，内存恒定。
+    #[test]
+    fn window_drops_oldest_when_capacity_exceeded() {
+        let mut buf = OutputBuffer::default();
+        for i in 0..MAX_WINDOW_ENTRIES + 50 {
+            buf.push_entry(OutputEntry::text(format!("entry {i}")));
+        }
+        assert_eq!(
+            buf.entry_count(),
+            MAX_WINDOW_ENTRIES,
+            "窗口应保持容量上限"
+        );
+        // 最旧内容已弹出（数据权威在后端 session 文件，TUI 不保留）
+        assert!(!buf.render_all().contains("entry 0"));
+        assert!(buf.render_all().contains(&format!("entry {}", MAX_WINDOW_ENTRIES + 49)));
+    }
+
+    /// 版本号：每次内容变化递增，供 draw 触发检测。
+    #[test]
+    fn version_increments_on_change() {
+        let mut buf = OutputBuffer::default();
+        let v0 = buf.version();
+        buf.append("hello");
+        assert!(buf.version() > v0);
+        buf.push_entry(OutputEntry::text("x".to_string()));
+        assert!(buf.version() > v0 + 1);
+        let v1 = buf.version();
+        buf.complete_tool_card("missing", "x".to_string(), false);
+        assert_eq!(buf.version(), v1, "未命中的 complete 不应递增版本");
+    }
+
+    /// 渲染快照与 breaks 一致（draw 数据源）。
+    #[test]
+    fn snapshot_lines_and_breaks_consistent() {
+        let mut buf = OutputBuffer::default();
+        buf.push_entry(OutputEntry::text("AAA".to_string()));
+        buf.push_entry(card("t1", "bash", "{}"));
+        buf.complete_tool_card("t1", "ok".to_string(), false);
+        buf.append("回复文本\n\n第二段");
+        let lines = buf.snapshot_lines();
+        let breaks = buf.snapshot_breaks();
+        assert_eq!(breaks.len(), buf.entry_count() + 1);
+        for (i, &b) in breaks.iter().enumerate() {
+            assert!(b <= lines.len(), "break[{i}]={b} 越界");
+        }
+        assert_eq!(*breaks.last().unwrap(), lines.len());
+        let joined: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        assert!(joined.contains("回复文本"));
+    }
+
+    /// prepend_history：历史条目前置到窗口头部，最新内容保持尾部。
+    #[test]
+    fn prepend_history_puts_older_first() {
+        let mut buf = OutputBuffer::default();
+        buf.append("live-output");
+        let history: Vec<OutputEntry> = vec![
+            OutputEntry::text("historical-1".to_string()),
+            OutputEntry::text("historical-2".to_string()),
+        ];
+        buf.prepend_history(history);
+        assert_eq!(buf.entry_count(), 3);
+        let all = buf.render_all();
+        let i1 = all.find("historical-1").unwrap();
+        let i2 = all.find("historical-2").unwrap();
+        let il = all.find("live-output").unwrap();
+        assert!(i1 < i2 && i2 < il, "历史应在前、最新在后: {all}");
+    }
+
+    /// 段落感知：一次 append 含 3+ 段落时全部保留（P0 回归：AI 回复被吞）。
+    #[test]
+    fn append_multi_paragraph_single_delta_preserves_all_content() {
+        let mut buf = OutputBuffer::default();
+        buf.append("Para A\n\nPara B\n\nPara C");
+        let snap = buf.render_all();
+        assert!(snap.contains("Para A"), "Para A 应保留: {snap}");
+        assert!(snap.contains("Para B"), "Para B 应保留: {snap}");
+        assert!(snap.contains("Para C"), "Para C 应保留: {snap}");
+    }
+
+    /// 流式：多段文本分段追加后累计完整（尾段合并）。
+    #[test]
+    fn streaming_paragraph_boundary_preserves_accumulated_text() {
+        let mut buf = OutputBuffer::default();
+        buf.append("Hello world.\n\n");
+        buf.append("Second paragraph\n\n");
+        buf.append("Final sentence");
+        let snap = buf.render_all();
+        assert!(snap.contains("Hello world."), "应保留已累积段落: {snap}");
+        assert!(snap.contains("Second paragraph"), "第二段应保留: {snap}");
+        assert!(snap.contains("Final sentence"), "flush 段应保留: {snap}");
+    }
+
+    /// 事故回归：窗口满（大量 ToolCard）+ 最终回复流式 append → 内容完整。
+    /// 旧架构在 256KB 预算下 trim 吞掉 AI 回复；窗口化后无预算、无淘汰，
+    /// 最新内容天然保留。
+    #[test]
+    fn repro_session_tail_stream_final_reply_after_trim() {
+        use crate::render::{MarkdownStreamState, TerminalRenderer};
+        let renderer = TerminalRenderer::shared();
+        // 1) 窗口填满 ToolCard（接近上限）
+        let mut buf = OutputBuffer::default();
+        for i in 0..MAX_WINDOW_ENTRIES - 2 {
+            let input = format!(r#"{{"command":"git status --short step{i}"}}"#);
+            buf.push_entry(OutputEntry::ToolCard {
+                tool_id: format!("t{i}"),
                 name: "bash".to_string(),
-                input: "{}".to_string(),
-                result: Some("out".to_string()),
-                is_error: false,
-                priority: Priority::P2,
-                collapsed: true,
-                timestamp: String::new(),
-            });
-            guard.push_entry(OutputEntry::ToolCard {
-                tool_id: "t2".to_string(),
-                name: "read".to_string(),
-                input: "{}".to_string(),
-                result: None,
+                input,
+                result: Some(format!("{{\"stdout\":\"{}\"}}", "output line\n".repeat(60))),
                 is_error: false,
                 priority: Priority::P1,
                 collapsed: false,
                 timestamp: String::new(),
             });
         }
-        let count = view.inner.lock().unwrap().completed_tool_card_count();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn text_entries_merge_consecutive_writes() {
-        let mut view = OutputView::new();
-        view.write_all(b"hello ").unwrap();
-        view.write_all(b"world").unwrap();
-        let guard = view.inner.lock().unwrap();
-        // 应该只有 1 个 Text 条目（合并）
-        let text_count = guard
-            .entries
-            .iter()
-            .filter(|e| matches!(e, OutputEntry::Text { .. }))
-            .count();
-        assert_eq!(text_count, 1);
-    }
-
-    /// 卡死回归测试：模拟 100+ 工具调用导致 text_total_bytes 超 MAX_BUFFER_BYTES，
-    /// 验证 trim_if_needed 不会陷入无限循环。
-    #[test]
-    fn trim_if_needed_terminates_with_many_tool_cards() {
-        let mut buf = OutputBuffer::default();
-        // 制造 200 个 ToolCard，每个 result 1KB → 总 200KB < 256KB（不会触发 trim）
-        // 再追加一个 300KB 的 Text → 触发 trim
-        for i in 0..200 {
-            buf.push_entry(OutputEntry::ToolCard {
-                tool_id: format!("t{i}"),
-                name: "bash".to_string(),
-                input: "{}".to_string(),
-                result: Some("x".repeat(1024)),
-                is_error: false,
-                priority: Priority::P2,
-                collapsed: true,
-                timestamp: String::new(),
-            });
+        // 2) 最后一张 bash 卡片完成（result 即事故现场的 1843 字节）
+        buf.push_entry(OutputEntry::tool_card_start(
+            "last_bash".to_string(),
+            "bash".to_string(),
+            r#"{"command":"git add macd.py && git commit -m 'perf: test' && git log --oneline -3"}"#
+                .to_string(),
+        ));
+        buf.complete_tool_card("last_bash", "x".repeat(1843), false);
+        // 3) 分片流式 append 最终回复（模拟 TextDelta 事件序列 + MessageStop flush）
+        let final_reply = "✅ **已提交** `b396231`（分支 `yesterday-full`）\n\n```\nb396231 perf: 切换时间周期/品种数据链路加速 3.6x — MACD 面积扫描二分优化\n  2 files changed, 82 insertions(+), 57 deletions(-)\n```\n\n**提交内容**（纯本次优化，方便精确回滚）：\n- `macd.py`：`scan_macd_area` 二分优化 + 单循环合并（137 行）\n- `data_manager.py`：仅 `MAX_STORES 3→6` 这一个 hunk（用 `git add -p` 拆分出来的）\n\n**留在工作树未提交**：data_manager.py 里 08-10 早间 session 的**缺口检测基准修复**（`prev_confirmed_ts`、`_fill_gap from_ts` 等 9 个 hunk）——它不属于本次优化主题，回滚点更清晰。如需一并提交可以说一声。\n\n回滚命令：`git reset --hard b396231~1` 即可回到优化前（注意会同时丢弃工作树里早间的缺口修复，如需保留先 `git stash`）。\n\n现在可以继续优化了。继续之前的方向——下一步是**渐进式切换**（先拉最近 1000 根秒出图 + 后台补全剩余 4000 根），还是先做**网络层首片优先**？或者你有其他优先级想法？";
+        let mut ms = MarkdownStreamState::with_max_width(Some(120));
+        // 按字符边界切分，每片 ~80 字符（模拟流式 delta）
+        let chars: Vec<char> = final_reply.chars().collect();
+        let mut pos = 0;
+        let mut appended = 0usize;
+        while pos < chars.len() {
+            let end = (pos + 80).min(chars.len());
+            let delta: String = chars[pos..end].iter().collect();
+            if let Some(rendered) = ms.push(&renderer, &delta) {
+                buf.append(&rendered);
+                appended += rendered.len();
+            }
+            pos = end;
         }
-        // 此时 text_total_bytes ≈ 200KB，再追加 100KB Text 触发 trim
-        buf.append(&"y".repeat(100 * 1024));
-        // 如果 trim_if_needed 死循环，这里永远不会返回（测试会超时）
+        if let Some(rendered) = ms.flush(&renderer) {
+            buf.append(&rendered);
+            appended += rendered.len();
+        }
         let snap = buf.render_all();
-        // 应该有被裁剪的占位符
-        assert!(snap.contains("[trimmed:") || buf.truncated);
+        assert!(
+            snap.contains("已提交"),
+            "最终回复应保留在窗口中（appended={appended}）:\n{snap}"
+        );
+        assert!(
+            snap.contains("MACD 面积扫描二分优化"),
+            "code block 内容应保留"
+        );
+        // draw 数据源一致性
+        let lines = buf.snapshot_lines();
+        let breaks = buf.snapshot_breaks();
+        assert_eq!(breaks.len(), buf.entry_count() + 1);
+        assert_eq!(*breaks.last().unwrap(), lines.len());
+        let joined: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        assert!(joined.contains("已提交"), "snapshot_lines 应含最终回复");
     }
 
     /// compute_priority：模型 emphasis=high → P0
@@ -1506,59 +1342,27 @@ mod tests {
         assert_eq!(compute_priority("bash", input, result, false), Priority::P1);
     }
 
-    // ---------- 语义分类器测试（P0 修复 2026-08-04） ----------
-
-    /// 核心回归：bash 3 行 stdout 的 pretty JSON 信封（18 行）应展开（P1）。
-    /// 旧实现统计信封行数 → 恒 P2 折叠；新实现提取 stdout（3 行 ≤ 8）→ P1。
-    #[test]
-    fn compute_priority_pretty_json_short_stdout_expands() {
-        let input = r#"{"command":"echo hi"}"#;
-        let result = r#"{
-  "stdout": "line1\nline2\nline3",
-  "stderr": "",
-  "interrupted": false,
-  "isImage": false,
-  "backgroundPid": null,
-  "backgroundedByUser": false,
-  "assistantAutoBackgrounded": false,
-  "dangerouslyDisableSandbox": false,
-  "returnCodeInterpretation": "exit_code:0",
-  "noOutputExpected": false,
-  "structuredContent": null,
-  "persistedOutputPath": null,
-  "persistedOutputSize": null,
-  "sandboxStatus": {
-    "enabled": true,
-    "supported": true,
-    "active": false
-  }
-}"#;
-        assert_eq!(compute_priority("bash", input, result, false), Priority::P1);
-    }
-
-    /// bash stdout 含错误标记（rc 为 0 时也能命中）→ P0，内容信号覆盖行数
+    /// compute_priority：bash 长输出含 error: → P0（错误信号覆盖行数）
     #[test]
     fn compute_priority_bash_error_marker_is_p0() {
         let input = r#"{"command":"cargo build"}"#;
-        let result = r#"{
-  "stdout": "error: could not compile `demo`",
-  "returnCodeInterpretation": "exit_code:0"
-}"#;
-        assert_eq!(compute_priority("bash", input, result, false), Priority::P0);
+        let result = format!(
+            "{{\"returnCodeInterpretation\":\"exit_code:101\",\"stdout\":\"{}\"}}",
+            "error[E0308]: mismatched types\n".repeat(30)
+        );
+        assert_eq!(
+            compute_priority("bash", input, &result, false),
+            Priority::P0
+        );
     }
 
-    /// bash 长输出含 test result:（41 行全过测试）→ P1 展开（测试总结是信号）
+    /// compute_priority：bash 长输出含 test result: → P1（测试总结是信号）
     #[test]
     fn compute_priority_bash_test_result_long_output_expands() {
         let input = r#"{"command":"cargo test"}"#;
-        let mut stdout = String::new();
-        for i in 0..40 {
-            stdout.push_str(&format!("test tests::case{i} ... ok\n"));
-        }
-        stdout.push_str("test result: ok. 40 passed");
         let result = format!(
-            "{{\n  \"stdout\": \"{}\",\n  \"returnCodeInterpretation\": \"exit_code:0\"\n}}",
-            stdout.replace('\n', "\\n")
+            "{{\"returnCodeInterpretation\":\"exit_code:0\",\"stdout\":\"{}\"}}",
+            "running 41 tests\ntest result: ok. 41 passed; 0 failed".to_string()
         );
         assert_eq!(
             compute_priority("bash", input, &result, false),
@@ -1566,55 +1370,42 @@ mod tests {
         );
     }
 
-    /// read_file 20 行内容（信封 10 行）→ P1 展开（内容是答案，门槛放宽到 40）
+    /// compute_priority：read_file 20 行 → P1（内容是答案，门槛 40 行）
     #[test]
     fn compute_priority_read_file_20_lines_expands() {
-        let input = r#"{"path":"src/main.rs"}"#;
-        let content = (1..=20)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\\n");
-        let result = format!(
-            "{{\n  \"type\": \"file\",\n  \"file\": {{\n    \"filePath\": \"src/main.rs\",\n    \"content\": \"{content}\",\n    \"numLines\": 20,\n    \"startLine\": 1,\n    \"totalLines\": 20\n  }}\n}}"
-        );
+        let input = r#"{"path":"foo.rs"}"#;
+        let result = (1..=20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
         assert_eq!(
             compute_priority("read_file", input, &result, false),
             Priority::P1
         );
     }
 
-    /// write_file 纯确认 → P3 单行摘要（过程噪音折叠）
+    /// compute_priority：write_file 纯确认 → P3
     #[test]
     fn compute_priority_write_file_confirms_p3() {
-        let input = r#"{"path":"a.txt","content":"hi"}"#;
-        let result = r#"{
-  "type": "write",
-  "filePath": "a.txt",
-  "content": "hi",
-  "structuredPatch": [],
-  "originalFile": null,
-  "gitDiff": null
-}"#;
+        let input = r#"{"path":"a.txt"}"#;
+        let result = r#"{"ok":true}"#;
         assert_eq!(
             compute_priority("write_file", input, result, false),
             Priority::P3
         );
     }
 
-    /// write_file 带 cargo check 编译错误 → P0（错误是信号）
+    /// compute_priority：write_file cargo check 错误 → P0
     #[test]
     fn compute_priority_write_file_cargo_check_error_p0() {
         let input = r#"{"path":"src/main.rs","content":"fn main() {}"}"#;
         let result = format!(
             "{}\n\n--- cargo check ---\nerror[E0308]: mismatched types\n --> src/main.rs:2:23",
             r#"{
-  "type": "write",
-  "filePath": "src/main.rs",
-  "content": "fn main() {}",
-  "structuredPatch": [],
-  "originalFile": null,
-  "gitDiff": null
-}"#
+    "type": "write",
+    "filePath": "src/main.rs",
+    "content": "fn main() {}",
+    "structuredPatch": [],
+    "originalFile": null,
+    "gitDiff": null
+  }"#
         );
         assert_eq!(
             compute_priority("write_file", input, &result, false),
@@ -1622,170 +1413,7 @@ mod tests {
         );
     }
 
-    /// trim 保护 error entry：error/P0 ToolCard 的 result 不被 trim 淘汰（方案 §3.4）。
-    #[test]
-    fn trim_protects_error_entries() {
-        let mut buf = OutputBuffer::default();
-        // 1 个 error ToolCard（大 result）+ 1 个普通 ToolCard（大 result）
-        // + 超大 Text 触发 trim。验证 error entry 的 result 保持完整。
-        buf.push_entry(OutputEntry::ToolCard {
-            tool_id: "err1".to_string(),
-            name: "bash".to_string(),
-            input: "{}".to_string(),
-            result: Some("E".repeat(100 * 1024)),
-            is_error: true,
-            priority: Priority::P0,
-            collapsed: false,
-            timestamp: String::new(),
-        });
-        buf.push_entry(OutputEntry::ToolCard {
-            tool_id: "ok1".to_string(),
-            name: "bash".to_string(),
-            input: "{}".to_string(),
-            result: Some("O".repeat(100 * 1024)),
-            is_error: false,
-            priority: Priority::P2,
-            collapsed: true,
-            timestamp: String::new(),
-        });
-        // 追加 200KB Text → text_total_bytes 远超 256KB → 触发 trim
-        buf.append(&"T".repeat(200 * 1024));
-        // 验证 error entry 的 result 未被裁剪
-        if let OutputEntry::ToolCard { result, .. } = &buf.entries[0] {
-            let r = result.as_ref().expect("error result should exist");
-            assert!(
-                !r.starts_with("[trimmed:"),
-                "error entry must not be trimmed"
-            );
-            assert_eq!(r.len(), 100 * 1024, "error entry result must be intact");
-        } else {
-            panic!("entries[0] should be the error ToolCard");
-        }
-    }
-
-    /// 回归测试：单次 append 含 3+ 个段落（markdown 渲染器在安全边界一次性
-    /// 输出多个段落），内容必须在 snapshot() 和 snapshot_lines() 中都完整保留。
-    ///
-    /// 根因：append_segmented 循环中 from_idx 只跟踪最后处理的 segment，
-    /// 中间段生成的独立 entry 未参与 recompute_snapshot_tail 的重渲染，
-    /// 导致 cached_snapshot 丢失中间段落（"AI 回复被吞掉"）。
-    #[test]
-    fn append_multi_paragraph_single_delta_preserves_all_content() {
-        let mut view = OutputView::new();
-        view.write_all(b"Para A\n\nPara B\n\nPara C").unwrap();
-        let snap = view.snapshot();
-        assert!(snap.contains("Para A"), "Para A 应保留: {snap}");
-        assert!(snap.contains("Para B"), "Para B 应保留: {snap}");
-        assert!(snap.contains("Para C"), "Para C 应保留: {snap}");
-        // snapshot_lines 路径也应完整（TUI draw 实际使用此路径）
-        let lines = view.snapshot_lines();
-        let joined = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("Para A"), "lines 应含 Para A: {joined}");
-        assert!(joined.contains("Para B"), "lines 应含 Para B: {joined}");
-        assert!(joined.contains("Para C"), "lines 应含 Para C: {joined}");
-    }
-
-    /// 回归测试：流式分段（markdown 渲染器在段落边界一次性输出完整段落，
-    /// 最终 flush 输出无尾部 \n\n 的残留段）不应丢失任何已累积的内容。
-    #[test]
-    fn streaming_paragraph_boundary_preserves_accumulated_text() {
-        let mut view = OutputView::new();
-        // 模拟 markdown 渲染器：段落边界处输出完整段落（含尾部 \n\n）
-        view.write_all(b"Hello world.\n\n").unwrap();
-        view.write_all(b"Second paragraph\n\n").unwrap();
-        // 模拟 MessageStop flush：无尾部 \n\n 的残留段合并进 trailing entry
-        view.write_all(b"Final sentence").unwrap();
-        let snap = view.snapshot();
-        assert!(snap.contains("Hello world."), "应保留已累积段落: {snap}");
-        assert!(snap.contains("Second paragraph"), "第二段应保留: {snap}");
-        assert!(snap.contains("Final sentence"), "flush 段应保留: {snap}");
-        let lines = view.snapshot_lines();
-        let joined = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            joined.contains("Hello world."),
-            "lines 应含第一段: {joined}"
-        );
-        assert!(
-            joined.contains("Second paragraph"),
-            "lines 应含第二段: {joined}"
-        );
-        assert!(
-            joined.contains("Final sentence"),
-            "lines 应含 flush 段: {joined}"
-        );
-    }
-
-    /// 回归测试：AI 回复流式到达时，若尾部是 ToolCard（正在执行），
-    /// 回复必须作为独立 Text entry 创建，不能并进 ToolCard。
-    #[test]
-    fn ai_reply_after_pending_toolcard_becomes_new_text_entry() {
-        let mut buf = OutputBuffer::default();
-        buf.push_entry(OutputEntry::tool_card_start(
-            "t1".to_string(),
-            "bash".to_string(),
-            r#"{"command":"ls"}"#.to_string(),
-        ));
-        buf.append("AI reply text");
-        // 应创建独立 Text entry，而不是修改 ToolCard
-        assert_eq!(buf.entries.len(), 2, "应有两个 entry");
-        assert!(
-            matches!(&buf.entries[1], OutputEntry::Text { content, .. } if content == "AI reply text"),
-            "entries[1] 应为独立 Text entry"
-        );
-    }
-
-    /// 回归测试：trim 优先裁剪大体积 ToolCard result，而不是删除 AI 回复
-    /// Text entry。旧实现先删 Text（AI 回复/echo）再裁 ToolCard → 长会话中
-    /// 早期 AI 回复被静默吞掉。
-    #[test]
-    fn trim_preserves_ai_replies_when_large_tool_results_exist() {
-        let mut buf = OutputBuffer::default();
-        // AI 回复（Text）+ 大体积 ToolCard result
-        buf.push_entry(OutputEntry::text("AI reply one".to_string()));
-        buf.push_entry(OutputEntry::ToolCard {
-            tool_id: "t1".to_string(),
-            name: "bash".to_string(),
-            input: "{}".to_string(),
-            result: Some("B".repeat(300 * 1024)), // 300KB 工具输出撑爆预算
-            is_error: false,
-            priority: Priority::P2,
-            collapsed: true,
-            timestamp: String::new(),
-        });
-        buf.trim_if_needed();
-        // AI 回复应保留
-        assert!(
-            matches!(&buf.entries[0], OutputEntry::Text { content, .. } if content == "AI reply one"),
-            "AI 回复应保留: {:?}",
-            buf.entries
-        );
-        // ToolCard result 应被裁剪为占位符
-        if let OutputEntry::ToolCard { result, .. } = &buf.entries[1] {
-            let r = result.as_ref().expect("result should exist");
-            assert!(r.starts_with("[trimmed:"), "ToolCard result 应被裁剪: {r}");
-        } else {
-            panic!("entries[1] 应为 ToolCard");
-        }
-    }
-
-    /// 回归测试：tool_card_line_ranges 的行区间必须与显示折行（wrap 后）完全一致。
-    ///
-    /// 旧实现直接统计含 ANSI 转义的原始渲染串宽度（`UnicodeWidthStr::width`
-    /// 会把 `\x1b[...m` 计为可见字符）+ `div_ceil`（假设任意字符可折行），
-    /// 而显示端按词边界折行且 ANSI 已剥离 → 区间被高估/错位：
-    /// - 区间相互重叠 → 点击"下面的卡片"命中"上面的卡片"
-    /// - 长词行计数不一致 → 偶发点击无反应
-    ///
-    /// 新实现复用 `cached_lines` + `cached_lines_breaks` + `wrap_line_to_display_lines`
-    /// （与 draw 同一份数据），区间与屏幕显示一致。
+    /// 鼠标点击行号区间与显示 wrap 一致。
     #[test]
     fn tool_card_line_ranges_match_display_wrap() {
         let mut buf = OutputBuffer::default();
@@ -1828,32 +1456,13 @@ mod tests {
         assert!(s1 < e1, "区间1 应有效 [start<end]: {ranges:?}");
         assert!(s2 < e2, "区间2 应有效 [start<end]: {ranges:?}");
         assert!(e1 <= s2, "区间不应重叠: {ranges:?}");
-        // 与显示管道交叉验证：每个 entry 的 wrap 行数之和 = 区间跨度
-        let lines = buf.snapshot_lines();
-        let breaks = buf.cached_lines_breaks.clone();
-        let display_span: Vec<usize> = (0..breaks.len() - 1)
-            .map(|i| {
-                lines[breaks[i]..breaks[i + 1]]
-                    .iter()
-                    .map(|l| crate::tui::app::wrap_line_to_display_lines(l, width).len())
-                    .sum()
-            })
-            .collect();
-        assert_eq!(e1 - s1 + 1, display_span[1], "区间1 跨度应等于显示行数");
-        assert_eq!(e2 - s2 + 1, display_span[2], "区间2 跨度应等于显示行数");
-        // 命中测试：点击区间起点行应切换对应的卡片（不是上面的卡片）
+        // 命中测试：点击区间起点行应切换对应的卡片
         assert!(
             buf.toggle_tool_card_at_line(s1, width),
             "点击区间1起点应命中卡片1"
         );
         assert!(
-            matches!(
-                &buf.entries[1],
-                OutputEntry::ToolCard {
-                    collapsed: false,
-                    ..
-                }
-            ),
+            matches!(&buf.entries[1], OutputEntry::ToolCard { collapsed: false, .. }),
             "卡片1 应被展开"
         );
         let ranges2 = buf.tool_card_line_ranges(width);
@@ -1862,18 +1471,12 @@ mod tests {
             "点击区间2起点应命中卡片2"
         );
         assert!(
-            matches!(
-                &buf.entries[2],
-                OutputEntry::ToolCard {
-                    collapsed: true,
-                    ..
-                }
-            ),
+            matches!(&buf.entries[2], OutputEntry::ToolCard { collapsed: true, .. }),
             "卡片2 应被折叠"
         );
-        // 点击区间外（如前置 Text entry 所在行）不应命中任何卡片
+        // 区间外（前置 Text entry 所在行）不应命中
         assert!(
-            !buf.toggle_tool_card_at_line(s1.saturating_sub(1), width),
+            !buf.toggle_tool_card_at_line(0, width),
             "Text entry 行不应命中 ToolCard"
         );
     }

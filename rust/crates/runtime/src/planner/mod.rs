@@ -296,11 +296,7 @@ pub fn decompose_task(user_input: &str) -> Vec<PlanStep> {
                 continue;
             }
             step_id += 1;
-            let short = if trimmed.len() > 80 {
-                format!("{}…", &trimmed[..80])
-            } else {
-                trimmed.to_string()
-            };
+            let short = truncate_utf8(trimmed, 80);
             steps.push(PlanStep::new(
                 format!("step_{step_id}"),
                 short,
@@ -313,11 +309,7 @@ pub fn decompose_task(user_input: &str) -> Vec<PlanStep> {
     // 4. Fallback: at minimum one step.
     if steps.is_empty() {
         step_id += 1;
-        let summary = if user_input.len() > 120 {
-            format!("{}…", &user_input[..120])
-        } else {
-            user_input.to_string()
-        };
+        let summary = truncate_utf8(user_input, 120);
         steps.push(PlanStep::new(
             format!("step_{step_id}"),
             format!("Execute: {summary}"),
@@ -543,11 +535,7 @@ pub fn update_plan(artifact: &mut PlanArtifact, update: &str) -> usize {
             continue;
         }
         let next_id = format!("step_{}", artifact.steps.len() + 1);
-        let short = if s.len() > 80 {
-            format!("{}…", &s[..80])
-        } else {
-            s.to_string()
-        };
+        let short = truncate_utf8(s, 80);
         artifact.steps.push(PlanStep::new(
             next_id,
             short,
@@ -589,6 +577,18 @@ fn split_into_sentences(text: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// UTF-8 安全截断:按字节上限截断,但回退到最近的字符边界,避免切到多字节字符中间 panic。
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]

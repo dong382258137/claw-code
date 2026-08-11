@@ -425,7 +425,11 @@ fn shorten_model_name(model: &str) -> String {
     } else {
         // 未知模型：截断到40字符
         if model.len() > 40 {
-            format!("{}…", &model[..39])
+            let mut end = 39;
+            while end > 0 && !model.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &model[..end])
         } else {
             model.to_string()
         }

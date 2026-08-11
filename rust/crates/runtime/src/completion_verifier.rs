@@ -255,7 +255,11 @@ impl CompletionVerifier {
             if let Some(rem) = &f.remediation {
                 // 截断 remediation 避免上下文膨胀(保留前 2KB)
                 let truncated = if rem.len() > 2048 {
-                    format!("{}...(truncated)", &rem[..2048])
+                    let mut end = 2048;
+                    while end > 0 && !rem.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...(truncated)", &rem[..end])
                 } else {
                     rem.clone()
                 };
@@ -301,7 +305,11 @@ fn extract_evidence(text: &str, pattern: &str) -> String {
     } else {
         // fallback: 截断 pattern 本身
         let truncated = if pattern.len() > 80 {
-            format!("{}...", &pattern[..80])
+            let mut end = 80;
+            while end > 0 && !pattern.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &pattern[..end])
         } else {
             pattern.to_owned()
         };

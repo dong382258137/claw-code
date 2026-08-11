@@ -631,6 +631,14 @@ fn run_event_loop(
     }
 
     let mut turn_start: Option<Instant> = None;
+    // 历史回看（瘦前端：数据权威在后端 session JSONL，TUI 只保留窗口）。
+    // 用户滚动到窗口内容顶部之外时，从 session 文件按需流式重放更早历史。
+    // 必须在 cli move 进 cli_holder 之前获取路径。
+    let session_path = cli.session_file_path();
+    let mut replay_cursor: usize = std::fs::read_to_string(&session_path)
+        .map(|c| c.lines().count())
+        .unwrap_or(0);
+    const HISTORY_BATCH: usize = 50; // 单次回看加载的 JSONL 行数
     // cli_holder: Some when idle, None when a turn is running in a thread
     let mut cli_holder: Option<LiveCli> = Some(cli);
     // Turn completion channel: Some when a turn is running
@@ -979,7 +987,7 @@ fn run_event_loop(
                     guard.turn_elapsed_ms = start.elapsed().as_millis() as u64;
                 }
             }
-            let current_version = output_view.total_written();
+            let current_version = output_view.version();
             let (current_elapsed_s, current_streaming) = {
                 let guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
                 (guard.turn_elapsed_ms / 1000, guard.streaming)
@@ -1117,6 +1125,35 @@ fn run_event_loop(
             let max_scroll = total_display_lines.saturating_sub(visible_height);
             // 供 E 键跳转使用（draw 外部无法直接获取 max_scroll）
             last_max_scroll = max_scroll;
+
+            // 历史回看：手动滚动到窗口内容顶部之外时，从 session 文件流式
+            // 重放更早历史（瘦前端——TUI 不保存全量数据，需要时从文件加载）。
+            if let Some(offset) = scroll_offset {
+                if replay_cursor > 0 && offset > max_scroll {
+                    let before_lines = output_lines.len();
+                    let entries = crate::tui::session_replay::load_history_entries(
+                        &session_path,
+                        replay_cursor.saturating_sub(HISTORY_BATCH),
+                        HISTORY_BATCH,
+                        Some(content_width),
+                    );
+                    if !entries.is_empty() {
+                        if let Ok(mut buf) = output_view.shared_handle().lock() {
+                            buf.prepend_history(entries);
+                        }
+                        let after_lines = output_view.snapshot_lines().len();
+                        let added = after_lines.saturating_sub(before_lines);
+                        replay_cursor = replay_cursor.saturating_sub(HISTORY_BATCH);
+                        // 窗口变长 added 行，保持"距底部"语义稳定，scroll_offset 同步增加。
+                        if let Some(off) = scroll_offset.as_mut() {
+                            *off = off.saturating_add(added);
+                        }
+                        needs_redraw = true;
+                    } else {
+                        replay_cursor = 0; // 历史已耗尽，停止尝试
+                    }
+                }
+            }
 
             // 智能 auto-follow：检测新输出并更新计数器（方案 §3.5）
             if total_display_lines > last_total_display_lines {

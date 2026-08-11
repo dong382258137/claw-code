@@ -2231,7 +2231,11 @@ fn render_im_status(
                             .trim_matches('"');
                         // Show truncated URL for privacy
                         let display = if val.len() > 60 {
-                            format!("{}...", &val[..60])
+                            let mut end = 60;
+                            while end > 0 && !val.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}...", &val[..end])
                         } else {
                             val.to_string()
                         };
