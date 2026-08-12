@@ -97,7 +97,7 @@ const MAX_PARALLEL_SUBAGENTS: usize = 5;
 #[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
 pub const SESSION_SEARCH_TOOL_SPEC: &str = r#"{
     "name": "session_search",
-    "description": "Search the conversation history using full-text search. Use this to recall specific past discussions, decisions, or file references that may not be in the current context window. Returns ranked matches with session ID, role, and content snippet.",
+    "description": "Search the conversation history using hybrid full-text + semantic search. Combines FTS5 keyword matching with dense vector recall (reciprocal rank fusion). Use this to recall specific past discussions, decisions, or file references that may not be in the current context window. Returns ranked matches with session ID, role, and content snippet. The query still supports FTS5 syntax: phrases, AND, OR, NOT, and prefix queries (term*).",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -3577,7 +3577,9 @@ where
 
         // Primary: search FTS5 history index
         if let Some(history_index) = self.session.history_index.as_ref() {
-            let hits = history_index.search(query, top_k)?;
+            // v4:混合检索(FTS5 词法 + 向量稠密,RRF 融合)。
+            // 未注入 embedder / 嵌入失败时内部自动回退纯词法,行为与旧 search 一致。
+            let hits = history_index.hybrid_search(query, top_k)?;
             if !hits.is_empty() {
                 let mut output = format!("Found {} matches for '{}':\n\n", hits.len(), query);
                 for (i, hit) in hits.iter().enumerate() {
@@ -7368,6 +7370,37 @@ mod tests {
         assert!(
             output.contains("rank:"),
             "rank missing from output: {output}"
+        );
+    }
+
+    #[test]
+    fn session_search_uses_hybrid_path_with_embedder() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_history_index();
+        let provider: Arc<dyn crate::memory_semantic::EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider.clone());
+        index
+            .index_message("rust toolchain setup", "sess-h", "user", 0, 1_000)
+            .expect("index msg");
+        let session = Session::new().with_history_index(Arc::new(index));
+        let runtime = ConversationRuntime::new(
+            session,
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let output = runtime
+            .execute_session_search(r#"{"query":"rust toolchain","top_k":5}"#)
+            .expect("search should succeed");
+        assert!(
+            output.contains("Found 1 matches"),
+            "expected hybrid match in output: {output}"
+        );
+        assert!(
+            output.contains("session: sess-h"),
+            "session id missing from output: {output}"
         );
     }
 
