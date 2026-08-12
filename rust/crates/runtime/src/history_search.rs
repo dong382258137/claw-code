@@ -294,7 +294,19 @@ impl HistoryIndex {
         if dense.is_empty() {
             return Ok(lexical);
         }
-        Ok(rrf_merge(lexical, dense, top_k))
+        let mut merged = rrf_merge(lexical, dense, top_k);
+        // Phase 2:salience 重加权(L3 salience reweighter)。
+        // final_rank = rrf_score × salience_weight(role, content)。
+        // 仅融合路径生效:无 embedder / dense 为空时直接返回词法结果,不应用。
+        for hit in &mut merged {
+            hit.rank *= salience_weight(&hit.role, &hit.content);
+        }
+        merged.sort_by(|a, b| {
+            b.rank
+                .partial_cmp(&a.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(merged)
     }
 
     /// Remove all entries for a session (used on session reset / compaction).
@@ -1593,5 +1605,79 @@ mod tests {
         let upper = salience_weight("tool", "PANIC: VERIFIED FAIL");
         let lower = salience_weight("tool", "panic: verified fail");
         assert_eq!(upper, lower, "signals should be case-insensitive");
+    }
+
+    #[test]
+    fn hybrid_search_applies_salience_boost_to_decision() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider.clone());
+        // user 消息词法(短文档 BM25 更高)+ 稠密(余弦 1.0)双路都领先;
+        // decision 词法靠 search() 内部 ×2.0 领先、稠密被 filler 挤出前二。
+        // 未集成时 user 融合分更高(确定性,非并列);salience 层 ×1.5 必须反超。
+        index
+            .index_message("rust toolchain", "s1", "user", 0, 1_000)
+            .expect("index user");
+        index
+            .index_message("rust toolchain build cargo rustup project", "s1", "decision", 1, 2_000)
+            .expect("index decision");
+        // 第三条消息仅稠密命中(词法缺 toolchain),把 decision 挤到 dense rank 2
+        index
+            .index_message("rust", "s1", "user", 2, 3_000)
+            .expect("index filler");
+        let hits = index.hybrid_search("rust toolchain", 2).expect("hybrid");
+        assert_eq!(hits.len(), 2, "top_k=2 should return two hits");
+        let decision_pos = hits
+            .iter()
+            .position(|h| h.role == "decision")
+            .expect("decision hit present");
+        let user_pos = hits.iter().position(|h| h.role == "user").expect("user hit present");
+        assert!(
+            decision_pos < user_pos,
+            "decision should rank above user after salience reweight: {decision_pos} vs {user_pos}"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_boosts_conclusion_heavy_assistant_message() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider);
+        // 两条 assistant 消息都命中词法查询,但一条含结论强标记
+        index
+            .index_message("rust toolchain setup complete", "s1", "assistant", 0, 1_000)
+            .expect("index plain");
+        index
+            .index_message("rust toolchain root cause verified, PASS", "s1", "assistant", 1, 2_000)
+            .expect("index conclusion");
+        let hits = index.hybrid_search("rust toolchain", 5).expect("hybrid");
+        assert_eq!(hits.len(), 2);
+        let conclusion_pos = hits
+            .iter()
+            .position(|h| h.message_index == 1)
+            .expect("conclusion hit");
+        let plain_pos = hits
+            .iter()
+            .position(|h| h.message_index == 0)
+            .expect("plain hit");
+        assert!(
+            conclusion_pos < plain_pos,
+            "conclusion-heavy message should rank above plain: {conclusion_pos} vs {plain_pos}"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_without_embedder_skips_salience() {
+        // 无 embedder:hybrid_search 直接返回词法结果,不应用 salience。
+        let (_file, index) = open_temp_index();
+        index
+            .index_message("rust toolchain decision", "s1", "decision", 0, 1_000)
+            .expect("index");
+        let hits = index.hybrid_search("rust", 5).expect("hybrid");
+        assert!(!hits.is_empty(), "lexical fallback should still work");
     }
 }
