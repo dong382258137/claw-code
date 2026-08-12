@@ -300,8 +300,16 @@ impl HistoryIndex {
     /// Remove all entries for a session (used on session reset / compaction).
     ///
     /// Returns the number of rows deleted.
+    ///
+    /// v4:同时删除该会话的稠密向量(先删向量,此时 history 行仍存在,
+    /// 子查询可解析 rowid;再删词法行,避免孤立向量)。
     pub fn clear_session(&self, session_id: &str) -> Result<usize, HistoryIndexError> {
         let conn = self.conn.lock().expect("history index mutex poisoned");
+        conn.execute(
+            "DELETE FROM history_vectors \
+             WHERE message_id IN (SELECT rowid FROM history WHERE session_id = ?1)",
+            rusqlite::params![session_id],
+        )?;
         let removed = conn.execute(
             "DELETE FROM history WHERE session_id = ?1",
             rusqlite::params![session_id],
@@ -619,7 +627,7 @@ fn migrate_from_v1(conn: &mut Connection) -> Result<(), HistoryIndexError> {
             legacy.push(row?);
         }
         drop(stmt);
-        tx.execute_batch("DROP TABLE IF EXISTS history;")?;
+        tx.execute_batch("DROP TABLE IF EXISTS history_vectors; DROP TABLE IF EXISTS history;")?;
         tx.execute_batch(
             "CREATE VIRTUAL TABLE history USING fts5(\
                  content,\
@@ -672,7 +680,7 @@ fn migrate_to_v3(conn: &mut Connection) -> Result<(), HistoryIndexError> {
             legacy.push(row?);
         }
         drop(stmt);
-        tx.execute_batch("DROP TABLE IF EXISTS history;")?;
+        tx.execute_batch("DROP TABLE IF EXISTS history_vectors; DROP TABLE IF EXISTS history;")?;
         tx.execute_batch(
             "CREATE VIRTUAL TABLE history USING fts5(\
                  content,\
@@ -1397,5 +1405,72 @@ mod tests {
         let hits = index.hybrid_search("rust", 5).expect("hybrid search");
         assert!(!hits.is_empty(), "embed failure must fall back to lexical");
         assert_eq!(hits[0].session_id, "s1");
+    }
+
+    #[test]
+    fn clear_session_removes_vectors() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider);
+        index
+            .index_message("msg a1", "sess-a", "user", 0, 1_000)
+            .expect("index a1");
+        index
+            .index_message("msg a2", "sess-a", "user", 1, 2_000)
+            .expect("index a2");
+        index
+            .index_message("msg b1", "sess-b", "user", 0, 3_000)
+            .expect("index b1");
+        assert_eq!(index.clear_session("sess-a").expect("clear"), 2);
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(count, 1, "only sess-b vector should remain");
+        // 残留向量必须属于 sess-b
+        let session: String = conn
+            .query_row(
+                "SELECT h.session_id FROM history_vectors v JOIN history h ON h.rowid = v.message_id",
+                [],
+                |row| row.get(0),
+            )
+            .expect("remaining vector session");
+        assert_eq!(session, "sess-b");
+    }
+
+    #[test]
+    fn open_migrates_v2_to_v4_keeps_searchable() {
+        let file = NamedTempFile::new().expect("create temp db file");
+        {
+            let conn = rusqlite::Connection::open(file.path()).expect("open conn");
+            conn.execute_batch(
+                "CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO history_meta VALUES ('schema_version', '2');
+                 CREATE VIRTUAL TABLE history USING fts5(
+                     content,
+                     session_id UNINDEXED,
+                     role UNINDEXED,
+                     message_index UNINDEXED,
+                     timestamp_ms UNINDEXED
+                 );
+                 INSERT INTO history VALUES ('继 续 帮 我 配 置 飞 书 ', 'sess-v2', 'user', 0, 1000);",
+            )
+            .expect("create v2 table");
+        }
+        let index = HistoryIndex::open(file.path()).expect("open migrates v2 to v4");
+        let hits = index.search("飞书", 10).expect("search 飞书");
+        assert_eq!(hits.len(), 1, "legacy data stays searchable");
+        // v4:history_vectors 表已创建
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let has_vec: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='history_vectors'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count history_vectors");
+        assert_eq!(has_vec, 1, "history_vectors should exist after migration");
     }
 }
