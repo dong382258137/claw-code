@@ -1,4 +1,4 @@
-﻿use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
@@ -10,9 +10,7 @@ use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
 use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
-use crate::hooks::{
-    HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
-};
+use crate::hooks::{HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner};
 use crate::memory::{
     extract_nudge_actions, should_nudge, NudgeAction, NudgeConfig, PersistentMemory,
 };
@@ -74,10 +72,24 @@ const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 /// Number of recent tool results kept verbatim by the microcompact pass that
 /// runs at the end of every turn, before auto-compaction is considered.
-const MICROCOMPACT_PRESERVE_RECENT: usize = 4;
+/// 对齐微软《Less Context, Better Agents》(arXiv:2606.10209)实证:
+/// "最近 5 轮工具交互 + 旧内容摘要" 是最优配置(91.6% vs 全上下文 71.0%)。
+/// 可通过 `CLAW_COMPACT_PRESERVE_RECENT` 环境变量覆盖(1-10),默认 5。
+const MICROCOMPACT_PRESERVE_RECENT: usize = 5;
 /// More aggressive preserve window used when recovering from a prompt-too-long
 /// error. Only the two most recent tool results are kept verbatim.
 const REACTIVE_MICROCOMPACT_PRESERVE_RECENT: usize = 2;
+
+/// 微压缩保留窗口(默认 5,微软实证最优)。`CLAW_COMPACT_PRESERVE_RECENT`
+/// 环境变量可覆盖(1-10),便于按会话/工作负载微调 —— 长链任务可调高,
+/// 追求更低 token 时可调低。
+fn microcompact_preserve_recent() -> usize {
+    std::env::var("CLAW_COMPACT_PRESERVE_RECENT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| (1..=10).contains(&n))
+        .unwrap_or(MICROCOMPACT_PRESERVE_RECENT)
+}
 
 /// P1:并行子任务最大并发数上限。
 ///
@@ -142,10 +154,14 @@ pub const DISPATCH_SUBAGENT_TOOL_SPEC: &str = r#"{
                 "description": "Coordination mode: 'fork' (shared workdir, parallel), 'teammate' (shared TaskRegistry), 'worktree' (isolated git worktree).",
                 "default": "fork"
             },
+            "workspace": {
+                "type": "string",
+                "description": "Optional sub-workspace directory (relative to the session workspace root, e.g. 'crates/api'). When set, the sub-agent is confined to that directory: read_file/write_file/edit_file/glob_search/grep_search are scope-checked against it, whole-repo scan tools (repomap/lsp_diagnostics) and bash are disabled, and the handoff is persisted under the sub-workspace."
+            },
             "capability": {
                 "type": "string",
                 "enum": ["analyze", "read-only", "execute"],
-                "description": "Subagent capability tier: 'analyze' (L0, read-only reasoning, no tools), 'read-only' (L1, read/grep/glob/repomap tools), 'execute' (L2, edit/write/bash tools). Determines tool whitelist and max tool-call iterations.",
+                "description": "Subagent capability tier: 'analyze' (L0, read-only reasoning, no tools), 'read-only' (L1, read/grep/glob/repomap tools), 'execute' (L2, edit_file/write_file/bash tools; note bash is unavailable when 'workspace' is bound). Determines tool whitelist and max tool-call iterations.",
                 "default": "analyze"
             }
         },
@@ -170,6 +186,147 @@ pub const CHECK_SUBAGENT_TOOL_SPEC: &str = r#"{
             }
         },
         "required": ["subagent_id"]
+    }
+}"#;
+
+/// Epic 2 A2.3c:Tool specification for the `steer_subagent` tool。
+///
+/// 主 agent 通过此 tool 向运行中的子代理注入控制指令(经 SessionBus Command
+/// 消息,`execute_subagent_llm` 每轮消费)。适用于调整子代理方向、追加约束等。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const STEER_SUBAGENT_TOOL_SPEC: &str = r#"{
+    "name": "steer_subagent",
+    "description": "Inject a steering instruction into a running sub-agent. The instruction is delivered via the session bus and consumed by the sub-agent on its next tool-call iteration (like a mid-flight correction). Requires the sub-agent to still be running (created/running).",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "subagent_id": {
+                "type": "string",
+                "description": "The subagent_id returned by dispatch_subagent."
+            },
+            "message": {
+                "type": "string",
+                "description": "The steering instruction to inject (e.g. 'ignore auth module, focus on tests only')."
+            }
+        },
+        "required": ["subagent_id", "message"]
+    }
+}"#;
+
+/// Epic 2 A2.3c:Tool specification for the `kill_subagent` tool。
+///
+/// 主 agent 通过此 tool 终止运行中的子代理(经 SessionBus Command 消息,
+/// 子代理在下一轮工具循环检测后中断,状态置 Cancelled)。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const KILL_SUBAGENT_TOOL_SPEC: &str = r#"{
+    "name": "kill_subagent",
+    "description": "Terminate a running sub-agent immediately. The sub-agent stops at its next tool-call iteration and is marked cancelled; any partial result is persisted as a cancelled handoff. No-op with an informative message if the sub-agent already reached a terminal state.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "subagent_id": {
+                "type": "string",
+                "description": "The subagent_id returned by dispatch_subagent."
+            }
+        },
+        "required": ["subagent_id"]
+    }
+}"#;
+
+/// Epic 4 延续:Tool specification for the `bus_list` tool。
+///
+/// 主 agent 通过此 tool 查看 Session Bus 上所有对等会话(peer)及其状态,
+/// 用于了解当前框架内正在运行哪些会话(主会话 / subagent / IDE / IM 频道),
+/// 为跨会话协作、消息路由决策提供依据。
+///
+/// 使用建议:
+/// - **建议在派发/协调多个子代理前后调用**,确认各 peer 的存在与状态。
+/// - 只读、无副作用,可随时调用。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const BUS_LIST_TOOL_SPEC: &str = r#"{
+    "name": "bus_list",
+    "description": "List all peer sessions currently visible on the Session Bus (main session, running sub-agents, IDE panels, IM channels) with their kind, status (idle/streaming/blocked/done) and unread count. Read-only. Call this before coordinating multiple sessions (e.g. after dispatching sub-agents) to know what is running and reachable.",
+    "input_schema": {
+        "type": "object",
+        "properties": {}
+    }
+}"#;
+
+/// Epic 4 延续:Tool specification for the `bus_send` tool。
+///
+/// 主 agent 通过此 tool 向指定 peer(如某 subagent / IDE 面板 / IM 频道)发送
+/// 消息。目标为 Subagent 时走 Command(steer) 语义(注入为该子代理下一轮的
+/// 控制指令);目标为其他 peer 时走 Message 语义。`*` 广播到全部可达 peer。
+///
+/// 使用约束:
+/// - `to` 必须是 `bus_list` 返回的有效 peer session_id,或 `*`。
+/// - `text` 不能为空。
+/// - 发送受 `session_bus.allow` 权限约束(默认仅 Main→*、Subagent→Main/Subagent)。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const BUS_SEND_TOOL_SPEC: &str = r#"{
+    "name": "bus_send",
+    "description": "Send a message to another session on the Session Bus. Target must be a peer session_id from bus_list (e.g. a subagent_id) or '*' to broadcast. If the target is a sub-agent, the message is delivered as a steering command (consumed on its next tool-call iteration). Otherwise it is delivered as a message into the target's unread queue. Permission is governed by session_bus.allow (deny by default). Returns the number of peers that received it.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "to": {
+                "type": "string",
+                "description": "Target peer session_id (from bus_list) or '*' for broadcast."
+            },
+            "text": {
+                "type": "string",
+                "description": "Message content to send."
+            }
+        },
+        "required": ["to", "text"]
+    }
+}"#;
+
+/// Epic 4 延续:Tool specification for the `bus_watch` tool。
+///
+/// 主 agent 通过此 tool 订阅某 peer 的消息流(watch 镜像进入本会话未读队列,
+/// 由框架 drain 到 OutputView/上下文)。用于持续跟踪某子代理/频道的输出。
+///
+/// 使用约束:
+/// - `target` 必须是 `bus_list` 返回的有效 peer session_id,不能是自身。
+/// - `unwatch` 为 true 时取消订阅(幂等)。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const BUS_WATCH_TOOL_SPEC: &str = r#"{
+    "name": "bus_watch",
+    "description": "Subscribe to another peer session's message stream: when that peer receives a message, a mirror is queued into this session's unread list (visible in the output view). Set unwatch=true to unsubscribe (idempotent). Useful to track a sub-agent's ongoing output. Target must be a peer session_id from bus_list and cannot be this session.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Peer session_id to watch/unwatch (from bus_list)."
+            },
+            "unwatch": {
+                "type": "boolean",
+                "description": "true = unsubscribe, false/absent = subscribe.",
+                "default": false
+            }
+        },
+        "required": ["target"]
+    }
+}"#;
+
+/// Epic 3(拓扑感知派发):Tool specification for the `suggest_workspace` tool。
+///
+/// 集成 `ModuleGraph`(cargo metadata):按 crate 边界自动推导 `dispatch_subagent`
+/// 建议的 `workspace` 相对路径,供 LLM 派发时参考(约束子代理到对应 crate)。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const SUGGEST_WORKSPACE_TOOL_SPEC: &str = r#"{
+    "name": "suggest_workspace",
+    "description": "Suggest which workspace (crate subdirectory) to dispatch a sub-agent to, based on the cargo crate graph. Returns recommended 'workspace' relative paths to use in dispatch_subagent, so the sub-agent is confined to that crate. Optional 'query' filters by crate name. If topology is building, do NOT retry immediately — use read/grep instead, or dispatch without the 'workspace' field.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Optional crate name (or fragment) to filter suggestions, e.g. 'api'."
+            }
+        }
     }
 }"#;
 
@@ -454,13 +611,14 @@ fn build_subagent_system_prompt(
     SystemPromptSplit::from_sections(sections)
 }
 
-/// 构造子智能体完整请求 — 3a/3b DRY 公共入口。
+/// 构造子智能体完整请求(仅测试用 — T7 执行链统一后生产路径由
+/// [`execute_subagent_llm`] 内部经 [`build_subagent_system_prompt`] 构造)。
 ///
-/// `execute_subagent_llm` 与 `SubagentDispatcher::dispatch_impl` 共用,
-/// 消除两份重复 prompt 构造:
+/// 保留以验证 prompt 构造的字段布局:
 /// - system prompt 纯静态(见 [`build_subagent_system_prompt`])
 /// - id/name/task 移入 user message,单次出现
 /// - `request_kind = Subagent`,经 cli 侧路由到独立缓存统计 session
+#[cfg(test)]
 pub(crate) fn build_subagent_request(
     subagent_id: &str,
     name: &str,
@@ -482,6 +640,83 @@ pub(crate) fn build_subagent_request(
         messages: vec![user_message],
         request_kind: RequestKind::Subagent,
     }
+}
+
+/// T4(方案 A 4-3):把 input JSON 中的 `file_path`/`path` 值改写为主 workspace_root 相对。
+///
+/// 当 Guard 3 判定子代理传的是相对 workspace(子目录)的路径(如 "src/x.rs",即
+/// `scope_root.join` 落在 scope 内)时,工具执行器以主 root 解析相对路径,若不改写
+/// 会写到错误位置(root/src/x.rs)。这里把 candidate(绝对路径)strip 掉 workspace_root
+/// 前缀改写为主 root 相对形式("crates/api/src/x.rs"),使执行落位与 Guard 3 判定一致。
+/// 改写失败(无路径字段/无法 strip)返回 None,调用方保持原 input。
+fn rewrite_path_to_workspace_relative(
+    input: &str,
+    candidate: &std::path::Path,
+    workspace_root: &std::path::Path,
+) -> Option<String> {
+    let rel = candidate.strip_prefix(workspace_root).ok()?;
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let mut value: serde_json::Value = serde_json::from_str(input).ok()?;
+    let obj = value.as_object_mut()?;
+    let replaced = if obj
+        .get("file_path")
+        .map_or(false, serde_json::Value::is_string)
+    {
+        obj.insert(
+            "file_path".to_string(),
+            serde_json::Value::String(rel_str.clone()),
+        );
+        true
+    } else if obj.get("path").map_or(false, serde_json::Value::is_string) {
+        obj.insert(
+            "path".to_string(),
+            serde_json::Value::String(rel_str.clone()),
+        );
+        true
+    } else {
+        false
+    };
+    if replaced {
+        serde_json::to_string(&value).ok()
+    } else {
+        None
+    }
+}
+
+/// 词法路径归一化:折叠 `.` 与 `..`(不访问文件系统)。
+///
+/// 用于子代理目录作用域校验(Guard 3),使 `../` 逃逸无法靠字符串前缀匹配绕过。
+/// Windows 上 `Path::components()` 可能输出 `\\?\` verbatim 前缀(尤其含点组件时),
+/// 这里统一剥离,保证归一化结果与 workspace_root 同构(否则 strip_prefix 失败)。
+fn normalize_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    strip_verbatim_prefix(out)
+}
+
+/// 去除 Windows `\\?\` 前缀(与 file_guard.rs / file_ops.rs 的策略一致)。
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(stripped)
+    } else {
+        path
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    path
 }
 
 /// Epic 3a/3b(§3.3.1):工具调用处理公共函数 — 两条执行路径共用,消除重复。
@@ -510,12 +745,19 @@ pub(crate) fn process_tool_uses(
     messages: &mut Vec<ConversationMessage>,
     tools_used: &mut Vec<String>,
     changed_files: &mut Vec<String>,
+    scope: Option<&crate::file_ops::WorkspacePathScope>,
 ) -> Result<(), ToolError> {
     for tu in tool_uses {
         let (id, name, input) = match tu {
             ContentBlock::ToolUse { id, name, input } => (id, name, input),
             _ => continue,
         };
+
+        // T4(方案 A 4-3):工具执行用的 input。Guard 3 若判定采用 scope 相对基准,
+        // 会把其中的 file_path/path 改写为主 root 相对(工具执行器以主 root 解析),
+        // 否则保持原样。file lock 也可复用 Guard 3 解析出的绝对路径(resolved_abs)。
+        let mut effective_input: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(input);
+        let mut resolved_abs: Option<std::path::PathBuf> = None;
 
         // Guard 1:禁止递归派发(§3.3.1)
         if name == "dispatch_subagent" || name == "spawn_parallel_subagents" {
@@ -528,6 +770,118 @@ pub(crate) fn process_tool_uses(
             return Err(ToolError::new(format!(
                 "tool {name} not allowed for capability {capability:?}"
             )));
+        }
+
+        // Guard 2.5(审查补充):绑定子目录 workspace 的子代理禁用全仓库扫描工具。
+        // repomap / lsp_diagnostics 没有 file_path/path 参数可做作用域校验,
+        // 会扫描子目录之外的仓库结构与符号,造成信息泄露。
+        // bash 亦禁止:其 cwd 是进程当前目录而非 workspace(runtime/bash.rs
+        // execute_bash 用 env::current_dir()),命令任意、无法静态校验目录,
+        // 可 `bash: echo x > ../../outside` 直接逃逸写任意路径;
+        // 写操作改由 write_file/edit_file 承担(已被 Guard 3 + file lock 保护)。
+        if scope.is_some() && matches!(name.as_str(), "repomap" | "lsp_diagnostics" | "bash") {
+            return Err(ToolError::new(format!(
+                "tool {name} not allowed for workspace-scoped subagent (whole-repo scan tool / unbounded shell)"
+            )));
+        }
+
+        // Guard 3:目录层级作用域校验(设计文档 2026-08-11-dir-hierarchy-control-design.md §2.2)。
+        // 当子代理绑定子目录 workspace 时,`scope` 为该子目录的 `WorkspacePathScope`;
+        // 路径类工具的目标若越出子目录 → 回填 is_error=true 且不执行工具。
+        if let Some(scope) = scope {
+            if matches!(
+                name.as_str(),
+                "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
+            ) {
+                let target = serde_json::from_str::<serde_json::Value>(input)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("file_path")
+                            .or_else(|| v.get("path"))
+                            .and_then(|p| p.as_str().map(std::path::PathBuf::from))
+                    });
+                if let Some(target) = target {
+                    let scope_root = scope.roots().first().cloned().unwrap_or_default();
+                    // T4(方案 A 4-2):双基准解析。cwd 视角切到子目录后,LLM 可能传
+                    // 相对 workspace 的路径(如 "src/x.rs")或相对主 root 的路径
+                    // (如 "crates/api/src/x.rs")。生成两个候选:
+                    // - workspace_root.join(主 root 相对,P0 修复的基准)
+                    // - scope_root.join(子目录相对,T4 新增)
+                    // 任一通过 validate_resolved(lexical + canonicalize 二次校验)即放行。
+                    // 安全:逃逸路径两个基准都归一化后逃不出 scope(canonicalize 兜底 symlink)。
+                    // 采用 scope 相对基准时(candidate_uses_scope_relative=true),
+                    // 需在 4-3 把 input 路径改写为主 root 相对,否则工具执行器
+                    // (以主 root 解析)会把文件写到错误位置。
+                    let mut candidates: Vec<(std::path::PathBuf, bool)> = Vec::new();
+                    if target.is_absolute() {
+                        candidates.push((normalize_lexical(&target), false));
+                    } else {
+                        candidates.push((normalize_lexical(&workspace_root.join(&target)), false));
+                        // T4 scope 相对候选的启用条件:target 第一组件不是主 root 顶层目录。
+                        // 否则 "crates/api/../core/x.rs" 这类主 root 相对越界路径经
+                        // scope 基准归一化(root/crates/api/crates/core/x.rs)会错误落在
+                        // scope 内被放行(P0 修复漏洞复发)。monorepo root 顶层是 crates/,
+                        // 故 "crates/..." 视为主 root 相对;scope 内独有的 "src/..." 才走 scope 基准。
+                        let first_component_under_root = target
+                            .components()
+                            .next()
+                            .map(|c| workspace_root.join(c.as_os_str()).is_dir())
+                            .unwrap_or(true);
+                        if !first_component_under_root {
+                            candidates.push((normalize_lexical(&scope_root.join(&target)), true));
+                        }
+                    }
+                    let mut chosen: Option<std::path::PathBuf> = None;
+                    let mut uses_scope_relative = false;
+                    let mut rejection = String::new();
+                    for (cand, scope_rel) in &candidates {
+                        // lexical 校验
+                        if let Err(e) = scope.validate_resolved(cand) {
+                            rejection = e.to_string();
+                            continue;
+                        }
+                        // 二次校验(防 symlink 逃逸):lexical 校验只认字符串前缀,
+                        // 若子目录内存在指向外部的 symlink,链接目标在 scope 外仍会放行。
+                        // canonicalize 解析真实路径后再校验一次,越界即拒绝。
+                        // 路径不存在时 canonicalize 失败 → 跳过(工具本身会失败,无泄露)。
+                        if let Ok(canonical) = cand.canonicalize() {
+                            if let Err(e) = scope.validate_resolved(&canonical) {
+                                rejection = format!(
+                                    "path {:?} rejected via canonical path {:?}: {e}",
+                                    target, canonical
+                                );
+                                continue;
+                            }
+                        }
+                        chosen = Some(cand.clone());
+                        uses_scope_relative = *scope_rel;
+                        break;
+                    }
+                    let Some(candidate) = chosen else {
+                        messages.push(ConversationMessage::tool_result(
+                            id.clone(),
+                            name.clone(),
+                            format!(
+                                "path {:?} rejected: {rejection} (subagent workspace scope: {})",
+                                target,
+                                scope_root.display()
+                            ),
+                            true,
+                        ));
+                        continue;
+                    };
+                    resolved_abs = Some(candidate.clone());
+                    // T4(方案 A 4-3):采用 scope 相对基准时,把 input 里的相对路径
+                    // 改写为主 root 相对,使工具执行落位与 Guard 3 判定一致。
+                    if uses_scope_relative {
+                        if let Some(rewritten) =
+                            rewrite_path_to_workspace_relative(input, &candidate, workspace_root)
+                        {
+                            effective_input = std::borrow::Cow::Owned(rewritten);
+                        }
+                    }
+                }
+            }
         }
 
         tools_used.push(name.clone());
@@ -543,13 +897,18 @@ pub(crate) fn process_tool_uses(
                     capability,
                     workspace_root.to_path_buf(),
                 );
-                // 从 input JSON 提取 file_path(edit_file/write_file 工具标准字段)
-                let file_path = serde_json::from_str::<serde_json::Value>(input)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("file_path")
-                            .and_then(|fp| fp.as_str().map(std::path::PathBuf::from))
-                    });
+                // T4(方案 A 4-4):优先用 Guard 3 解析出的绝对路径(resolved_abs,双基准
+                // 归一化),保证与主 agent 锁 key 一致(scope 相对与主 root 相对两种写法
+                // 都归一化到同一绝对路径,canonicalize 或 strip 前缀后一致);
+                // 无 Guard 3 解析(非路径工具等)时回退从 input 提取 file_path。
+                let file_path: Option<std::path::PathBuf> = resolved_abs.clone().or_else(|| {
+                    serde_json::from_str::<serde_json::Value>(&effective_input)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("file_path")
+                                .and_then(|fp| fp.as_str().map(std::path::PathBuf::from))
+                        })
+                });
 
                 match file_path {
                     Some(path) => match guard.try_acquire(&path, true) {
@@ -575,7 +934,8 @@ pub(crate) fn process_tool_uses(
 
         // 工具执行 — 失败不中断,返回 is_error=true 让 LLM 决定下一步
         // _file_lock 在此 block 作用域内持有,iteration 结束 drop 释放锁
-        let (output, is_error) = match tool_executor.execute(name, input) {
+        // T4(方案 A 4-3):用 effective_input(scope 相对路径已改写为主 root 相对)
+        let (output, is_error) = match tool_executor.execute(name, &effective_input) {
             Ok(result) => (result, false),
             Err(e) => (e.to_string(), true),
         };
@@ -583,7 +943,7 @@ pub(crate) fn process_tool_uses(
         // changed_files 提取(edit_file/write_file 可能修改文件)
         if matches!(name.as_str(), "edit_file" | "write_file") {
             changed_files.extend(crate::multi_agent::extract_changed_files(
-                input,
+                &effective_input,
                 workspace_root,
             ));
         }
@@ -861,8 +1221,9 @@ impl HookReloadWatch {
             .discover()
             .into_iter()
             .map(|entry| {
-                let mtime =
-                    std::fs::metadata(&entry.path).and_then(|m| m.modified()).ok();
+                let mtime = std::fs::metadata(&entry.path)
+                    .and_then(|m| m.modified())
+                    .ok();
                 (entry.path, mtime)
             })
             .collect()
@@ -929,6 +1290,12 @@ pub struct ConversationRuntime<C, T> {
     /// rule-based nudge pass every `NudgeConfig::interval_turns` turns to keep
     /// the memory layer fresh without an LLM call.
     persistent_memory: Option<PersistentMemory>,
+    /// 任务状态(task anchor,episodic memory)内存缓存。
+    ///
+    /// 每 turn 结束自动更新并持久化到 `.claw/task_state.json`;会话经历过
+    /// 压缩时注入 system 变动区,让 AI 在压缩后仍持有任务锚点,防止任务漂移
+    /// 与重复查询。None 表示尚未初始化(惰性加载)。
+    task_state: Option<crate::task_state::TaskState>,
     /// Turns elapsed since the last nudge fired. Reset to 0 whenever a nudge
     /// runs.
     turns_since_last_nudge: usize,
@@ -1082,6 +1449,257 @@ pub struct ConversationRuntime<C, T> {
     refactor_tx: Option<crate::vcs_snapshot::RefactorTransaction>,
 }
 
+/// 子智能体 LLM 调用的核心逻辑(无 `self` 借用,避免与 `api_client` 冲突)。
+///
+/// Epic 1 T7:统一执行链入口 — 路径 A([`run_subagent_turn_with_model`])与
+/// 路径 B([`SubagentDispatcher`](crate::multi_agent::dag::subagent_dispatcher::SubagentDispatcher))
+/// 均委托本函数,一处 guard / 循环 / prompt 构造,消除双执行循环漂移。
+///
+/// §4.6 诊断 SOP 注入:当 `complexity == Diagnostic` 时,向 system_prompt 追加
+/// 诊断任务执行规范,强制子智能体遵循"先诊断后修复"流程,避免堆砌防御代码。
+///
+/// Epic 1(§3.2):`capability` + `ctx` 用于上下文注入(repo_map/environment/工具签名)。
+///
+/// Epic 3a(§3.3.1):多轮 tool call 循环。`Analyze` 能力 `max_iterations=1`(单轮,
+/// 行为与改造前一致);`ReadOnly=5` / `Execute=10` 支持多轮工具调用。每轮:
+/// 1. 构造 `ApiRequest`(system_prompt 不变,messages 增长)
+/// 2. `stream_async` → `build_assistant_message`
+/// 3. 提取 `ToolUse` blocks → 若为空则正常终止
+/// 4. `process_tool_uses`:guard(递归/白名单)+ 执行 + 回填 `ToolResult`
+/// 5. 超过 `max_iterations` → 落盘 `Truncated` handoff + Err(§8.1)
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_subagent_llm(
+    workspace_root: &std::path::Path,
+    workspace_override: Option<&std::path::Path>,
+    client: &mut dyn ApiClient,
+    tool_executor: &mut dyn ToolExecutor,
+    subagent_id: &str,
+    name: &str,
+    task: &str,
+    complexity: crate::multi_agent::TaskComplexity,
+    capability: crate::multi_agent::SubagentCapability,
+    ctx: &SubagentContext,
+) -> Result<String, String> {
+    use crate::multi_agent::{write_handoff, HandoffStatus, SubagentHandoff};
+
+    // 目录层级控制(设计文档 §2.2):子代理绑定子目录 workspace 时,
+    // handoff 落盘到子目录 `.claw/subagents/`,工具作用域收窄到子目录。
+    let handoff_root = workspace_override.unwrap_or(workspace_root);
+    let subagent_scope = workspace_override
+        .map(|ws| crate::file_ops::WorkspacePathScope::from_roots(vec![ws.to_path_buf()]));
+
+    // Epic 1 T8:统一执行入口负责 bus 生命周期(路径 A/B 子代理自动可见于 /bus list)。
+    // 注册 Streaming → Drop guard 置 Done。MultiAgentCoordinator 与 SessionBus
+    // 互不直接依赖,经本执行入口协作(编排层正交化);编排层不再手动注册。
+    {
+        let bus = crate::session_bus::global();
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: subagent_id.to_string(),
+            label: format!("subagent:{name}"),
+            kind: crate::session_bus::PeerKind::Subagent,
+            status: crate::session_bus::PeerStatus::Streaming,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+    }
+    let _done_guard = BusPeerDoneGuard::new(subagent_id.to_string());
+
+    // 知识新鲜度门控(Phase 1):Novel 任务注入调研摘要到 task 文本。
+    let gated = crate::knowledge_freshness::gate_task(task, 0).await;
+    let enhanced_task = gated.enhance_task(task);
+
+    // system_prompt 构建一次,多轮循环中不变(保 prefix cache 命中)
+    let system_prompt = build_subagent_system_prompt(complexity, capability, ctx);
+    let max_iter = capability.max_iterations();
+    let mut messages = vec![ConversationMessage::user_text(format!(
+        "# Subagent: {name} ({subagent_id})\n\n请执行以下任务:\n\n{enhanced_task}"
+    ))];
+    let mut iterations = 0;
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut changed_files: Vec<String> = Vec::new();
+    let mut final_text = String::new();
+
+    loop {
+        iterations += 1;
+        if iterations > max_iter {
+            // §8.1:截断 → 落盘 Truncated handoff + Err
+            let handoff = SubagentHandoff::new(
+                subagent_id,
+                name,
+                capability,
+                complexity,
+                iterations,
+                tools_used.clone(),
+                changed_files.clone(),
+                &final_text,
+                &final_text,
+            )
+            .with_status(HandoffStatus::Truncated)
+            .with_task(task);
+            let _ = write_handoff(handoff_root, &handoff);
+            return Err(format!(
+                "subagent exceeded max_iterations ({max_iter}); partial result at .claw/subagents/{subagent_id}.md"
+            ));
+        }
+
+        // Epic 2 A2.3c/d:每轮消费主会话经 bus 注入的 Command(steer / kill)。
+        // steer → 追加为 user 指令(下一轮 LLM 调用前生效);
+        // kill → 落盘 Cancelled handoff + Err(子代理终止,不重试)。
+        // 审查补充(2026-08-12):改用 consume_commands 只消费 Command,保留同队列
+        // 的 Message(此前 mark_read 全清会静默丢弃混在队列里的普通消息)。
+        {
+            let bus = crate::session_bus::global();
+            let commands = bus.consume_commands(subagent_id);
+            if !commands.is_empty() {
+                for cmd in &commands {
+                    let action = cmd
+                        .payload
+                        .get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if action == "kill" {
+                        let handoff = SubagentHandoff::new(
+                            subagent_id,
+                            name,
+                            capability,
+                            complexity,
+                            iterations,
+                            tools_used.clone(),
+                            changed_files.clone(),
+                            &final_text,
+                            &final_text,
+                        )
+                        .with_status(HandoffStatus::Cancelled)
+                        .with_task(task);
+                        let _ = write_handoff(handoff_root, &handoff);
+                        return Err(format!(
+                            "subagent {subagent_id} killed by parent; partial result at .claw/subagents/{subagent_id}.md"
+                        ));
+                    }
+                    if action == "steer" {
+                        if let Some(msg) = cmd.payload.get("message").and_then(|v| v.as_str()) {
+                            messages.push(crate::ConversationMessage::user_text(format!(
+                                "[主会话指令] {msg}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        let request = ApiRequest {
+            system_prompt: system_prompt.clone(),
+            messages: messages.clone(),
+            request_kind: RequestKind::Subagent,
+        };
+
+        // v3:async 调用 LLM — stream_async 避免 nested block_on panic
+        let events = client
+            .stream_async(request)
+            .await
+            .map_err(|e| format!("subagent LLM request failed: {e}"))?;
+
+        let (assistant_message, _usage, _cache_events) = build_assistant_message(events)
+            .map_err(|e| format!("subagent response parsing failed: {e}"))?;
+
+        // 提取 ToolUse blocks(cloned — assistant_message 随后 move 进 messages)
+        let tool_uses: Vec<ContentBlock> = assistant_message
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .cloned()
+            .collect();
+
+        // 累积 text 内容(最终 summary/details 来源)
+        for block in &assistant_message.blocks {
+            if let ContentBlock::Text { text } = block {
+                final_text.push_str(text);
+                final_text.push('\n');
+            }
+        }
+
+        messages.push(assistant_message);
+
+        if tool_uses.is_empty() {
+            break; // 正常终止:无工具调用
+        }
+
+        // 工具调用处理(guard + 执行 + 回填)
+        if let Err(e) = process_tool_uses(
+            capability,
+            &tool_uses,
+            tool_executor,
+            workspace_root,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            subagent_scope.as_ref(),
+        ) {
+            // guard 违规(递归/白名单)→ 落盘 Failed handoff + Err
+            let handoff = SubagentHandoff::new(
+                subagent_id,
+                name,
+                capability,
+                complexity,
+                iterations,
+                tools_used.clone(),
+                changed_files.clone(),
+                e.to_string(),
+                e.to_string(),
+            )
+            .with_status(HandoffStatus::Failed)
+            .with_task(task);
+            let _ = write_handoff(handoff_root, &handoff);
+            return Err(format!("subagent guard violation: {e}"));
+        }
+    }
+
+    if final_text.trim().is_empty() {
+        return Err("subagent produced no text content".to_string());
+    }
+
+    // 正常完成 → 落盘 Completed handoff(Epic 5 结构化协议)
+    let handoff = SubagentHandoff::new(
+        subagent_id,
+        name,
+        capability,
+        complexity,
+        iterations,
+        tools_used,
+        changed_files,
+        &final_text,
+        &final_text,
+    )
+    .with_task(task);
+    write_handoff(handoff_root, &handoff)
+        .map_err(|e| format!("failed to write subagent handoff: {e}"))
+}
+
+/// Epic 1 T8:bus peer 生命周期 Drop guard — 任意返回路径把 peer 置为 `Done`。
+/// 注册(Streaming)与终态(Done)均由统一执行入口 [`execute_subagent_llm`] 负责,
+/// 编排层(MultiAgentCoordinator / dispatch_subagent)不再直接调用 SessionBus。
+/// 对未注册 id 调用 `update_status` 为 no-op,安全。
+struct BusPeerDoneGuard {
+    session_id: String,
+}
+
+impl BusPeerDoneGuard {
+    fn new(session_id: String) -> Self {
+        Self { session_id }
+    }
+}
+
+impl Drop for BusPeerDoneGuard {
+    fn drop(&mut self) {
+        let bus = crate::session_bus::global();
+        bus.update_status(&self.session_id, crate::session_bus::PeerStatus::Done);
+        // 审查补充(2026-08-12):Done 子代理达上限后淘汰最旧,防止 peers 表无界膨胀、
+        // bus_list 上下文浪费(完整记录仍在 coordinator / handoff 文件)。
+        bus.prune_done_peers(crate::session_bus::MAX_DONE_SUBAGENTS);
+    }
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1139,6 +1757,7 @@ where
             tool_result_callback: None,
             session_tracer: None,
             persistent_memory: None,
+            task_state: None,
             turns_since_last_nudge: 0,
             turns_since_last_evolution: 0,
             harness_archive: None,
@@ -1294,8 +1913,13 @@ where
 
     /// 注入工作区根目录,用于 `persist_plan_artifact` 写入
     /// `<workspace>/.claw/plans/<id>.json`。生产环境应注入 `cwd`。
+    ///
+    /// Epic 2 A2.3b:同步注入 coordinator 的 workspace_root(manifest 落盘依赖)。
     #[must_use]
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        if let Some(coordinator) = &self.multi_agent_coordinator {
+            coordinator.set_workspace_root(root.clone());
+        }
         self.workspace_root = Some(root);
         self
     }
@@ -1501,6 +2125,12 @@ where
     /// Epic 3b:新增 `tool_executor` 参数,启用多轮 tool call 循环。
     /// `None` 时子智能体无法调用工具(单轮,向后兼容);
     /// `Some(executor)` 时按 `SubagentDispatcher::with_tool_executor` 注入。
+    ///
+    /// Epic 1 T6:新增 `workspace_override` 参数(路径 B 目录隔离)。
+    /// `Some(subdir)` 时绑定子目录 workspace — 工具作用域收窄
+    /// (Guard 2.5 禁全仓扫描/bash + Guard 3 越界拒绝),handoff 落盘到
+    /// `{subdir}/.claw/subagents/`,与路径 A(dispatch_subagent 的 workspace
+    /// 字段)治理对齐。`None` 保持主 root 行为(向后兼容)。
     #[must_use]
     pub fn with_dag_coordinator(
         mut self,
@@ -1508,12 +2138,14 @@ where
         api_client: C,
         workspace_root: PathBuf,
         tool_executor: Option<Box<dyn ToolExecutor + Send>>,
+        workspace_override: Option<PathBuf>,
     ) -> Self
     where
         C: ApiClient + Send + 'static,
     {
         let mut dispatcher =
-            SubagentDispatcher::new(Arc::new(Mutex::new(Box::new(api_client))), workspace_root);
+            SubagentDispatcher::new(Arc::new(Mutex::new(Box::new(api_client))), workspace_root)
+                .with_workspace_override(workspace_override);
         if let Some(te) = tool_executor {
             dispatcher = dispatcher.with_tool_executor(Arc::new(Mutex::new(te)));
         }
@@ -1960,7 +2592,14 @@ where
     }
 
     /// `&mut self` 版本的 `with_workspace_root`,同上。
+    ///
+    /// Epic 2 A2.3b:同步注入到 `MultiAgentCoordinator` 的 workspace_root,
+    /// 使 manifest 生命周期/状态投影能定位 `.claw/subagents/manifest.json`
+    /// (coordinator 的 manifest 写入依赖该字段;不同步则生产路径永不落盘)。
     pub fn set_workspace_root(&mut self, root: PathBuf) {
+        if let Some(coordinator) = &self.multi_agent_coordinator {
+            coordinator.set_workspace_root(root.clone());
+        }
         self.workspace_root = Some(root);
     }
 
@@ -2064,12 +2703,7 @@ where
 
     /// 运行 LoopDetector(文件编辑 + 工具调用双通道),合并动作并返回。
     /// Abort 时同时写入 `loop_abort_reason`,供工具循环识别并终止 turn。
-    fn apply_loop_detection(
-        &mut self,
-        tool_name: &str,
-        input: &str,
-        output: &str,
-    ) -> LoopAction {
+    fn apply_loop_detection(&mut self, tool_name: &str, input: &str, output: &str) -> LoopAction {
         let mut action = LoopAction::Continue;
         if let Some(file_path) = extract_file_path_from_tool_input(tool_name, input) {
             match self.loop_detector.record_edit(&file_path) {
@@ -2078,7 +2712,10 @@ where
                 LoopAction::Continue => {}
             }
         }
-        match self.loop_detector.record_tool_call(tool_name, input, output) {
+        match self
+            .loop_detector
+            .record_tool_call(tool_name, input, output)
+        {
             LoopAction::Abort(reason) => return LoopAction::Abort(reason),
             LoopAction::InjectContext(msg) => {
                 action = match action {
@@ -2113,9 +2750,13 @@ where
                 return HookRunResult::cancelled_with_message(reason);
             }
             LoopAction::InjectContext(msg) => {
-                let mut base_result = self.run_post_tool_use_hook_base(
-                    tool_name, input, output, is_error,
-                );
+                let mut base_result =
+                    self.run_post_tool_use_hook_base(tool_name, input, output, is_error);
+                // 重复输出/重复调用警告：抑制原始输出，只返回提示。
+                // 模型看不到"结果未变"的旧输出，不再盲目重试同一命令。
+                if is_repetition_warning(&msg) {
+                    base_result.mark_suppress_output();
+                }
                 base_result.append_message(msg);
                 return base_result;
             }
@@ -2168,9 +2809,13 @@ where
                 return HookRunResult::cancelled_with_message(reason);
             }
             LoopAction::InjectContext(msg) => {
-                let mut base_result = self.run_post_tool_use_failure_hook_base(
-                    tool_name, input, output,
-                );
+                let mut base_result =
+                    self.run_post_tool_use_failure_hook_base(tool_name, input, output);
+                // 失败路径同样抑制重复警告的原始输出（命令报错 → 换参数再报错
+                // 的循环在相同报错输出下无法被模型察觉，必须切断）。
+                if is_repetition_warning(&msg) {
+                    base_result.mark_suppress_output();
+                }
                 base_result.append_message(msg);
                 return base_result;
             }
@@ -2239,7 +2884,8 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        self.loop_detector.prune_decayed(now_ms, LOOP_DECAY_WINDOW_MS);
+        self.loop_detector
+            .prune_decayed(now_ms, LOOP_DECAY_WINDOW_MS);
         // 详见 docs/agent-cognitive-exoskeleton-plan.md 第三章。
         if let Some(tx) = &mut self.refactor_tx {
             let turn_id = format!(
@@ -2540,6 +3186,30 @@ where
                         // 让最易变的内容放最后,最大化前缀缓存命中率。
                         system_split.dynamic_sections.push(remediation.clone());
                     }
+                    // Task State 注入:仅当会话经历过压缩时注入(平时会话历史
+                    // 已含任务上下文,注入冗余反而浪费 token)。压缩后 AI 靠
+                    // task_state 持有任务锚点,防止任务漂移与重复查询。
+                    if crate::compact::extract_compact_boundary(&self.session.messages).is_some() {
+                        if let Some(state) = &self.task_state {
+                            let rendered = state.render_for_prompt();
+                            if !rendered.is_empty() {
+                                system_split.dynamic_sections.push(rendered);
+                            }
+                        }
+                        // P2:历史操作教训注入 —— 压缩后读取 lessons.jsonl 最近
+                        // 教训,让 AI 下次执行同类操作时主动规避(覆盖成功 turn
+                        // 中工具级瑕疵的自进化盲区)。
+                        if let Some(root) = &self.workspace_root {
+                            let recent = crate::lessons::load_recent_lessons(
+                                root,
+                                crate::lessons::LESSONS_INJECT_MAX,
+                            );
+                            let rendered = crate::lessons::render_for_prompt(&recent);
+                            if !rendered.is_empty() {
+                                system_split.dynamic_sections.push(rendered);
+                            }
+                        }
+                    }
                     // Verbosity steering(Headroom Output Token Reduction 对标):
                     // 在 dynamic 区末尾追加简洁指令,引导模型减少 output token。
                     // 放 dynamic 区不影响 static 缓存前缀;内容常量,不破坏隐式前缀缓存。
@@ -2641,6 +3311,10 @@ where
                                 self.session = result.compacted_session;
                                 // P0-3:reactive full compact 删除了消息,置 flag。
                                 self.notebook_refresh_pending = true;
+                                // P1:压缩摘要字段化 —— reactive 路径同样从摘要
+                                // 更新任务状态(零额外 LLM 调用)。
+                                self.apply_task_state_from_compaction(&result.formatted_summary);
+                                self.apply_lessons_from_compaction(&result.formatted_summary);
                                 reactive_state = ReactiveCompactState::FullCompactDone;
                                 continue;
                             }
@@ -2707,6 +3381,35 @@ where
             // 用户在流式响应期间按 Ctrl+C 无法中断阻塞 IO，但可以在此处立即返回，
             // 避免继续处理 assistant message 和执行工具。
             if self.hook_abort_signal.is_aborted() {
+                // BUG:中断前必须保留本轮已生成的 assistant 回复,否则下一次
+                // turn 的请求只剩 user 消息,AI 丢失上下文(只能靠 history_search
+                // 找回,任务不连贯且浪费 token)。
+                // 若消息含 tool_use 声明,为每个 tool_use 补发中断的 tool_result
+                // (role=Tool 独立消息),保持 user→assistant→tool 消息对完整 ——
+                // 否则下一 turn 请求会带悬挂 tool_use(无对应 tool_result)被 API 拒绝。
+                let pending_tool_uses = assistant_message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolUse { id, name, input } => {
+                            Some((id.clone(), name.clone(), input.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                self.session
+                    .push_message(assistant_message.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                for (tool_use_id, tool_name, _input) in &pending_tool_uses {
+                    self.session
+                        .push_message(ConversationMessage::tool_result(
+                            tool_use_id.clone(),
+                            tool_name.clone(),
+                            "[interrupt] 工具未执行：任务已被用户取消。".to_string(),
+                            true,
+                        ))
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                }
                 self.record_turn_failed(iterations, &RuntimeError::new("turn interrupted by user"));
                 return Err(RuntimeError::new("turn interrupted by user"));
             }
@@ -2939,6 +3642,42 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
+                        } else if tool_name == "steer_subagent" {
+                            // Epic 2 A2.3c:向运行中的子代理注入控制指令(bus Command)。
+                            match self.execute_steer_subagent(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "kill_subagent" {
+                            // Epic 2 A2.3c:终止运行中的子代理(bus Command + cancel)。
+                            match self.execute_kill_subagent(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "bus_list" {
+                            // Epic 4 延续:列出 Session Bus 全部 peer(只读)。
+                            match self.execute_bus_list() {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "bus_send" {
+                            // Epic 4 延续:向目标 peer 发消息(Subagent→Command steer)。
+                            match self.execute_bus_send(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "bus_watch" {
+                            // Epic 4 延续:订阅/取消订阅某 peer 的消息流。
+                            match self.execute_bus_watch(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "suggest_workspace" {
+                            // Epic 3:按 crate 边界推导 dispatch_subagent 建议 workspace。
+                            match self.execute_suggest_workspace(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
                         } else if tool_name == "notebook_update" {
                             // P0-1:LLM 主动维护 NOTEBOOK.md(跨压缩持久化记忆)。
                             // Anthropic《Effective Context Engineering for AI Agents》
@@ -3025,10 +3764,53 @@ where
                         } else {
                             // 外部自定义工具路径:经 ToolExecutor 注册的工具(含 MCP)。
                             // 成功执行后触发 PostCustomToolCall 事件(见下方接入点)。
+                            //
+                            // Epic 1 T2(父子并发写保护):主 agent(父会话)写文件也过
+                            // SubagentFileGuard,与子代理共享同一进程级锁注册表,
+                            // 防止父子并发写同一文件(write_file/edit_file)。
+                            // 锁在本次工具执行后 Drop 自动释放;获取失败(超时/拒绝)
+                            // 则回填 is_error 且不执行工具,让 LLM 决定下一步。
+                            let mut lock_failure: Option<String> = None;
+                            let _parent_write_lock: Option<crate::multi_agent::LockHandle> =
+                                if matches!(tool_name.as_str(), "write_file" | "edit_file") {
+                                    self.workspace_root.clone().and_then(|root| {
+                                        let guard = crate::multi_agent::SubagentFileGuard::new(
+                                            crate::multi_agent::SubagentCapability::Execute,
+                                            root,
+                                        );
+                                        let file_path = serde_json::from_str::<serde_json::Value>(
+                                            &effective_input,
+                                        )
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("file_path").and_then(|fp| {
+                                                fp.as_str().map(std::path::PathBuf::from)
+                                            })
+                                        });
+                                        match file_path {
+                                            Some(path) => match guard.try_acquire(&path, true) {
+                                                Ok(lock) => Some(lock),
+                                                Err(e) => {
+                                                    lock_failure = Some(e);
+                                                    None
+                                                }
+                                            },
+                                            // 无 file_path 字段,跳过锁(防御性降级)
+                                            None => None,
+                                        }
+                                    })
+                                } else {
+                                    None
+                                };
                             executed_via_external_executor = true;
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
+                            match lock_failure {
+                                Some(e) => (e, true),
+                                None => {
+                                    match self.tool_executor.execute(&tool_name, &effective_input) {
+                                        Ok(output) => (output, false),
+                                        Err(error) => (error.to_string(), true),
+                                    }
+                                }
                             }
                         };
                         // SlopScanner:在 merge_hook_feedback 污染前扫描原始产物。
@@ -3083,21 +3865,35 @@ where
                         {
                             is_error = true;
                         }
-                        output = merge_hook_feedback(
-                            post_hook_result.messages(),
-                            output,
-                            post_hook_result.is_denied()
-                                || post_hook_result.is_failed()
-                                || post_hook_result.is_cancelled(),
-                        );
+                        // 重复输出抑制：丢弃原始 output，只返回循环警告提示。
+                        // 模型看不到"结果未变"的旧输出 → 不再基于它盲目重试。
+                        if post_hook_result.should_suppress_output() {
+                            output = if post_hook_result.messages().is_empty() {
+                                "Tool output suppressed: repetition detected".to_string()
+                            } else {
+                                format!(
+                                    "[tool output suppressed: repetition detected]\n\n{}",
+                                    post_hook_result.messages().join("\n")
+                                )
+                            };
+                        } else {
+                            output = merge_hook_feedback(
+                                post_hook_result.messages(),
+                                output,
+                                post_hook_result.is_denied()
+                                    || post_hook_result.is_failed()
+                                    || post_hook_result.is_cancelled(),
+                            );
+                        }
 
                         // PostCustomToolCall(design-gaps #7):外部自定义工具调用
                         // 成功后的监控/审计事件。仅对经 ToolExecutor 执行的外部工具
                         // 触发,失败路径已由 PostToolUseFailure 覆盖,此处不重复。
                         // 返回消息追加到 tool result(不改变状态,监控语义)。
                         if !is_error && executed_via_external_executor {
-                            let custom_hook_result =
-                                self.hook_runner.run_post_custom_tool_call(&tool_name, &output);
+                            let custom_hook_result = self
+                                .hook_runner
+                                .run_post_custom_tool_call(&tool_name, &output);
                             if !custom_hook_result.messages().is_empty() {
                                 output = merge_hook_feedback(
                                     custom_hook_result.messages(),
@@ -3338,7 +4134,7 @@ where
         let archive_root = self.workspace_root.clone();
         let microcompacted = crate::compact::microcompact_with_archiver(
             &self.session.messages,
-            MICROCOMPACT_PRESERVE_RECENT,
+            microcompact_preserve_recent(),
             |id, name, output| {
                 if let Some(root) = &archive_root {
                     let _ = crate::tool_result_archive::archive_tool_result(root, id, name, output);
@@ -3366,6 +4162,11 @@ where
             auto_compaction,
         };
         self.record_turn_completed(&summary);
+
+        // Task State 自动维护(episodic memory):turn 结束更新任务锚点并
+        // 持久化到 `.claw/task_state.json`。不依赖 AI 主动调用 notebook_update,
+        // 保证"当前任务是什么 / 已确认哪些关键发现"在压缩后仍有落点。
+        self.maybe_update_task_state(&user_input, &summary.assistant_messages);
 
         // BUG-6 修复:turn 结束时清空 pending_semantic_context,
         // 下一 turn 重新召回,避免陈旧记忆污染。
@@ -3501,10 +4302,8 @@ where
         // G9.1: SessionEnd lifecycle hook — turn 完全结束(含 nudge 等清理)后触发,
         // 让外部观察者(session 审计、状态持久化、清理逻辑等)感知会话结束。
         // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
-        self.hook_runner.spawn_lifecycle_event(
-            HookEvent::SessionEnd,
-            self.session.session_id.clone(),
-        );
+        self.hook_runner
+            .spawn_lifecycle_event(HookEvent::SessionEnd, self.session.session_id.clone());
 
         Ok(summary)
     }
@@ -3707,6 +4506,19 @@ where
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
 
+        // 目录层级控制(设计文档 2026-08-11-dir-hierarchy-control-design.md §2.2):
+        // 可选 `workspace` 字段 — 子代理绑定子目录,越界/非法路径直接拒绝。
+        let workspace_override: Option<std::path::PathBuf> =
+            match parsed.get("workspace").and_then(|v| v.as_str()) {
+                None => None,
+                Some(ws) => {
+                    let ws_root = self.workspace_root.as_ref().ok_or(
+                    "workspace field requires a configured workspace_root for the parent session",
+                )?;
+                    Some(crate::subworkspace::resolve_subworkspace(ws_root, ws)?)
+                }
+            };
+
         // spawn:有 model 走 spawn_with_model(能力校验),否则走原 spawn(向后兼容)
         // 借用:此处 coordinator 是 &MultiAgentCoordinator(不可变借用 self.multi_agent_coordinator)
         let subagent_id = {
@@ -3723,6 +4535,8 @@ where
             };
             // 注入 capability — TRAE 架构对齐(§3.1)
             let _ = coordinator.set_capability(&id, capability);
+            // 注入 workspace — Epic 2 A2.3a(目录层级控制派发,None = 主会话 cwd)
+            let _ = coordinator.set_workspace(&id, workspace_override.clone());
             // 注入 cost_limit(如有)
             if let Some(limit) = cost_limit {
                 let _ = coordinator.set_cost_limit(&id, Some(limit));
@@ -3736,6 +4550,10 @@ where
                 .map_err(|e| format!("failed to start subagent: {e}"))?;
             id
         }; // coordinator 借用在此结束,后续可重新获取
+
+        // Epic 1 T8:bus peer 注册/状态流转已移至统一执行入口 execute_subagent_llm
+        // (register Streaming + Drop guard Done)。编排层不再直接调用 SessionBus —
+        // 并行路径(B)子代理经同一入口自动注册,消除"单发可见、并行不可见"差异。
 
         // 桥接:在 global TaskRegistry 注册子 agent 任务,让 AI 能通过 TaskOutput 查询进度。
         let bridge_task_id = {
@@ -3820,6 +4638,7 @@ where
                     &subagent_id,
                     name,
                     task,
+                    workspace_override.as_deref(),
                     current_model.as_deref(),
                     subagent_complexity,
                     subagent_capability,
@@ -4047,6 +4866,25 @@ where
             ));
         }
 
+        // 会话互通(Session Bus,设计文档 §2.2/§2.3):更新子代理终态并广播
+        // Handoff 摘要到主会话/同侪,使 Sidebar peer 视图与未读计数可见。
+        {
+            let bus = crate::session_bus::global();
+            let _ = bus.update_status(&subagent_id, crate::session_bus::PeerStatus::Done);
+            let _ = bus.publish(crate::session_bus::BusMessage {
+                from: subagent_id.clone(),
+                to: "*".to_string(),
+                kind: crate::session_bus::BusMessageKind::Handoff,
+                payload: serde_json::json!({
+                    "status": final_status,
+                    "task": task,
+                    "summary": final_result_msg,
+                }),
+                hop: 0,
+                ts_ms: crate::session_bus::now_ms(),
+            });
+        }
+
         Ok(final_result_msg)
     }
 
@@ -4109,8 +4947,16 @@ where
         complexity: crate::multi_agent::TaskComplexity,
         capability: crate::multi_agent::SubagentCapability,
     ) -> Result<String, String> {
-        self.run_subagent_turn_with_model(subagent_id, name, task, None, complexity, capability)
-            .await
+        self.run_subagent_turn_with_model(
+            subagent_id,
+            name,
+            task,
+            None,
+            None,
+            complexity,
+            capability,
+        )
+        .await
     }
 
     /// Multi-Agent Hardening §4.5.3:带模型选择的 subagent turn 执行。
@@ -4133,6 +4979,7 @@ where
         subagent_id: &str,
         name: &str,
         task: &str,
+        workspace_override: Option<&std::path::Path>,
         model: Option<&str>,
         complexity: crate::multi_agent::TaskComplexity,
         capability: crate::multi_agent::SubagentCapability,
@@ -4141,15 +4988,44 @@ where
             "workspace_root not configured — subagent requires filesystem access for result persistence".to_string()
         })?;
 
+        // T5(TOCTOU 缓解):派发时 resolve_subworkspace 的校验快照在子代理实际
+        // 执行期间可能失效(目录被删除/替换为 symlink/项目标记消失)。turn 开始处
+        // 重新 canonicalize 复核,失败直接报错 → 子代理首轮即被拒;通过后以重新
+        // 解析的路径为 scope/handoff 基准,与 Guard 3 每次工具调用的 canonicalize
+        // 判定保持一致。行为预期"false-negative 安全方向可接受"(见设计文档 T5)。
+        let workspace_override = if let Some(ws) = workspace_override {
+            let re_resolved = crate::subworkspace::revalidate_subworkspace(workspace_root, ws)
+                .map_err(|e| {
+                    crate::diag::global().append(
+                        crate::diag::DiagEntry::new(
+                            crate::diag::DiagLevel::Warn,
+                            "subagent_workspace_revalidate",
+                            format!("workspace revalidation failed: {e}"),
+                        )
+                        .with_field(
+                            "subagent_id",
+                            serde_json::Value::String(subagent_id.to_string()),
+                        ),
+                    );
+                    e
+                })?;
+            Some(re_resolved)
+        } else {
+            None
+        };
+
         // Epic 1(§3.2):从主 agent system_prompt sections 提取 repo_map 和 environment,
         // 复用已渲染内容(避免重复扫描),heading 已对齐 static_cache_breakpoints。
-        let ctx = self.build_subagent_context(capability);
+        // T4(方案 A 4-1):workspace_override 存在时,project_context.cwd 切到子目录,
+        // 指令文件从子目录收集,使 LLM 路径视角与执行基准一致。
+        let ctx = self.build_subagent_context(capability, workspace_override.as_deref());
 
         // model 为 None:走原 run_subagent_turn 路径(复用主 agent client)
         let model = match model {
             None | Some("") => {
-                return Self::execute_subagent_llm(
+                return execute_subagent_llm(
                     workspace_root,
+                    workspace_override.as_deref(),
                     &mut self.api_client,
                     &mut self.tool_executor,
                     subagent_id,
@@ -4168,8 +5044,9 @@ where
         // Analyze 不启用工具;ReadOnly/Execute 按白名单启用
         match self.api_client.with_model_and_capability(model, capability) {
             Ok(mut sub_client) => {
-                Self::execute_subagent_llm(
+                execute_subagent_llm(
                     workspace_root,
+                    workspace_override.as_deref(),
                     &mut *sub_client,
                     &mut self.tool_executor,
                     subagent_id,
@@ -4195,8 +5072,9 @@ where
                     .with_field("subagent_id", serde_json::Value::String(subagent_id.into()))
                     .with_field("target_model", serde_json::Value::String(model.into())),
                 );
-                Self::execute_subagent_llm(
+                execute_subagent_llm(
                     workspace_root,
+                    workspace_override.as_deref(),
                     &mut self.api_client,
                     &mut self.tool_executor,
                     subagent_id,
@@ -4222,6 +5100,7 @@ where
     fn build_subagent_context(
         &self,
         capability: crate::multi_agent::SubagentCapability,
+        workspace_override: Option<&std::path::Path>,
     ) -> SubagentContext {
         let mut ctx = SubagentContext::default();
         // 从主 agent system_prompt sections 提取 repo_map 和 environment
@@ -4236,16 +5115,34 @@ where
                         .to_string(),
                 );
             }
-            // ProjectContext:从 workspace_root 构造(简化版,完整版由 Epic 2 工具签名补充)
-            if section.starts_with("# Environment context") && self.workspace_root.is_some() {
-                ctx.project_context = Some(crate::prompt::ProjectContext {
-                    cwd: self.workspace_root.clone().unwrap_or_default(),
-                    current_date: "unknown".to_string(),
-                    git_status: None,
-                    git_diff: None,
-                    git_context: None,
-                    instruction_files: Vec::new(),
-                });
+            // ProjectContext(简化版,完整版由 Epic 2 工具签名补充)。
+            // T4(方案 A 4-1):workspace_override 存在时,cwd 切到子目录且指令文件
+            // 从子目录向上收集(ProjectContext::discover),使 LLM 路径视角与工具
+            // 执行基准一致;未绑定时保持主 root(向后兼容)。
+            if section.starts_with("# Environment context")
+                && (self.workspace_root.is_some() || workspace_override.is_some())
+            {
+                let cwd = workspace_override
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| self.workspace_root.clone().unwrap_or_default());
+                ctx.project_context = match crate::prompt::ProjectContext::discover(&cwd, "unknown")
+                {
+                    Ok(mut pc) => {
+                        // 子代理上下文不注入 git 状态(diff 由 validation 阶段处理)
+                        pc.git_status = None;
+                        pc.git_diff = None;
+                        pc.git_context = None;
+                        Some(pc)
+                    }
+                    Err(_) => Some(crate::prompt::ProjectContext {
+                        cwd,
+                        current_date: "unknown".to_string(),
+                        git_status: None,
+                        git_diff: None,
+                        git_context: None,
+                        instruction_files: Vec::new(),
+                    }),
+                };
             }
         }
         // L2 工具签名层(design-gaps #5):按 capability 白名单过滤注入。
@@ -4260,163 +5157,6 @@ where
             .cloned()
             .collect();
         ctx
-    }
-
-    /// 子智能体 LLM 调用的核心逻辑(无 `self` 借用,避免与 `api_client` 冲突)。
-    ///
-    /// 抽出为自由函数,以便 [`run_subagent_turn`] 和
-    /// [`run_subagent_turn_with_model`] 复用 — 前者传入 `&mut self.api_client`,
-    /// 后者传入 `&mut *boxed_client`(由 `with_model` 构造的独立 client)。
-    ///
-    /// §4.6 诊断 SOP 注入:当 `complexity == Diagnostic` 时,向 system_prompt 追加
-    /// 诊断任务执行规范,强制子智能体遵循"先诊断后修复"流程,避免堆砌防御代码。
-    ///
-    /// Epic 1(§3.2):`capability` + `ctx` 用于上下文注入(repo_map/environment/工具签名)。
-    ///
-    /// Epic 3a(§3.3.1):多轮 tool call 循环。`Analyze` 能力 `max_iterations=1`(单轮,
-    /// 行为与改造前一致);`ReadOnly=5` / `Execute=10` 支持多轮工具调用。每轮:
-    /// 1. 构造 `ApiRequest`(system_prompt 不变,messages 增长)
-    /// 2. `stream_async` → `build_assistant_message`
-    /// 3. 提取 `ToolUse` blocks → 若为空则正常终止
-    /// 4. `process_tool_uses`:guard(递归/白名单)+ 执行 + 回填 `ToolResult`
-    /// 5. 超过 `max_iterations` → 落盘 `Truncated` handoff + Err(§8.1)
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_subagent_llm(
-        workspace_root: &std::path::Path,
-        client: &mut dyn ApiClient,
-        tool_executor: &mut dyn ToolExecutor,
-        subagent_id: &str,
-        name: &str,
-        task: &str,
-        complexity: crate::multi_agent::TaskComplexity,
-        capability: crate::multi_agent::SubagentCapability,
-        ctx: &SubagentContext,
-    ) -> Result<String, String> {
-        use crate::multi_agent::{write_handoff, HandoffStatus, SubagentHandoff};
-
-        // 知识新鲜度门控(Phase 1):Novel 任务注入调研摘要到 task 文本。
-        let gated = crate::knowledge_freshness::gate_task(task, 0).await;
-        let enhanced_task = gated.enhance_task(task);
-
-        // system_prompt 构建一次,多轮循环中不变(保 prefix cache 命中)
-        let system_prompt = build_subagent_system_prompt(complexity, capability, ctx);
-        let max_iter = capability.max_iterations();
-        let mut messages = vec![ConversationMessage::user_text(format!(
-            "# Subagent: {name} ({subagent_id})\n\n请执行以下任务:\n\n{enhanced_task}"
-        ))];
-        let mut iterations = 0;
-        let mut tools_used: Vec<String> = Vec::new();
-        let mut changed_files: Vec<String> = Vec::new();
-        let mut final_text = String::new();
-
-        loop {
-            iterations += 1;
-            if iterations > max_iter {
-                // §8.1:截断 → 落盘 Truncated handoff + Err
-                let handoff = SubagentHandoff::new(
-                    subagent_id,
-                    name,
-                    capability,
-                    complexity,
-                    iterations,
-                    tools_used.clone(),
-                    changed_files.clone(),
-                    &final_text,
-                    &final_text,
-                )
-                .with_status(HandoffStatus::Truncated)
-                .with_task(task);
-                let _ = write_handoff(workspace_root, &handoff);
-                return Err(format!(
-                    "subagent exceeded max_iterations ({max_iter}); partial result at .claw/subagents/{subagent_id}.md"
-                ));
-            }
-
-            let request = ApiRequest {
-                system_prompt: system_prompt.clone(),
-                messages: messages.clone(),
-                request_kind: RequestKind::Subagent,
-            };
-
-            // v3:async 调用 LLM — stream_async 避免 nested block_on panic
-            let events = client
-                .stream_async(request)
-                .await
-                .map_err(|e| format!("subagent LLM request failed: {e}"))?;
-
-            let (assistant_message, _usage, _cache_events) = build_assistant_message(events)
-                .map_err(|e| format!("subagent response parsing failed: {e}"))?;
-
-            // 提取 ToolUse blocks(cloned — assistant_message 随后 move 进 messages)
-            let tool_uses: Vec<ContentBlock> = assistant_message
-                .blocks
-                .iter()
-                .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
-                .cloned()
-                .collect();
-
-            // 累积 text 内容(最终 summary/details 来源)
-            for block in &assistant_message.blocks {
-                if let ContentBlock::Text { text } = block {
-                    final_text.push_str(text);
-                    final_text.push('\n');
-                }
-            }
-
-            messages.push(assistant_message);
-
-            if tool_uses.is_empty() {
-                break; // 正常终止:无工具调用
-            }
-
-            // 工具调用处理(guard + 执行 + 回填)
-            if let Err(e) = process_tool_uses(
-                capability,
-                &tool_uses,
-                tool_executor,
-                workspace_root,
-                &mut messages,
-                &mut tools_used,
-                &mut changed_files,
-            ) {
-                // guard 违规(递归/白名单)→ 落盘 Failed handoff + Err
-                let handoff = SubagentHandoff::new(
-                    subagent_id,
-                    name,
-                    capability,
-                    complexity,
-                    iterations,
-                    tools_used.clone(),
-                    changed_files.clone(),
-                    e.to_string(),
-                    e.to_string(),
-                )
-                .with_status(HandoffStatus::Failed)
-                .with_task(task);
-                let _ = write_handoff(workspace_root, &handoff);
-                return Err(format!("subagent guard violation: {e}"));
-            }
-        }
-
-        if final_text.trim().is_empty() {
-            return Err("subagent produced no text content".to_string());
-        }
-
-        // 正常完成 → 落盘 Completed handoff(Epic 5 结构化协议)
-        let handoff = SubagentHandoff::new(
-            subagent_id,
-            name,
-            capability,
-            complexity,
-            iterations,
-            tools_used,
-            changed_files,
-            &final_text,
-            &final_text,
-        )
-        .with_task(task);
-        write_handoff(workspace_root, &handoff)
-            .map_err(|e| format!("failed to write subagent handoff: {e}"))
     }
 
     /// v3:Execute the `spawn_parallel_subagents` tool — 批量并行派发多个子 agent。
@@ -4695,6 +5435,262 @@ where
             },
         });
         Ok(serde_json::to_string_pretty(&response)?)
+    }
+
+    /// Epic 2 A2.3c:校验子代理目标 — 存在性 + workspace 绑定仍有效(TOCTOU 一致性,
+    /// 与 T5 revalidate 同基准)。供 steer / kill 使用,防止对失效 workspace 子代理误操作。
+    fn validate_subagent_target(&self, subagent_id: &str) -> Result<(), String> {
+        let Some(coordinator) = &self.multi_agent_coordinator else {
+            return Err(
+                "subagent steering unavailable: no multi-agent coordinator configured".to_string(),
+            );
+        };
+        let agent = coordinator
+            .get(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+        if let (Some(root), Some(ws)) = (self.workspace_root.as_ref(), agent.workspace.as_ref()) {
+            crate::subworkspace::revalidate_subworkspace(root, ws)
+                .map_err(|e| format!("subagent workspace invalid: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Epic 2 A2.3c:执行 `steer_subagent` — 经 SessionBus Command 消息向运行中的
+    /// 子代理注入控制指令(`execute_subagent_llm` 每轮消费后追加为 user 指令)。
+    fn execute_steer_subagent(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let subagent_id = parsed
+            .get("subagent_id")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'subagent_id' field")?;
+        let message = parsed
+            .get("message")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'message' field")?;
+        if message.trim().is_empty() {
+            return Err("steer message must not be empty".into());
+        }
+        self.validate_subagent_target(subagent_id)?;
+
+        let bus = crate::session_bus::global();
+        let delivered = bus.publish(crate::session_bus::BusMessage {
+            from: self.session.session_id.clone(),
+            to: subagent_id.to_string(),
+            kind: crate::session_bus::BusMessageKind::Command,
+            payload: serde_json::json!({"action": "steer", "message": message}),
+            hop: 0,
+            ts_ms: crate::session_bus::now_ms(),
+        })?;
+        if delivered.is_empty() {
+            return Err(format!(
+                "subagent {subagent_id} is not reachable on the session bus (not registered?)"
+            )
+            .into());
+        }
+        Ok(format!("steering instruction queued for {subagent_id}"))
+    }
+
+    /// Epic 2 A2.3c:执行 `kill_subagent` — 经 SessionBus Command 消息终止运行中的
+    /// 子代理。子代理在下一轮工具循环检测 kill 后落盘 Cancelled handoff 并返回
+    /// Err;此处同时同步标记 coordinator 状态(Created/Running → Cancelled),
+    /// 使 manifest 与 `/subagent list` 即时反映。终态子代理为 no-op 提示。
+    fn execute_kill_subagent(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let subagent_id = parsed
+            .get("subagent_id")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'subagent_id' field")?;
+
+        let status = self
+            .multi_agent_coordinator
+            .as_ref()
+            .and_then(|c| c.get(subagent_id))
+            .map(|a| a.status);
+        let Some(status) = status else {
+            return Err(format!("subagent not found: {subagent_id}").into());
+        };
+        if matches!(
+            status,
+            SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Cancelled
+        ) {
+            return Ok(format!(
+                "subagent {subagent_id} already in terminal state {status:?}; nothing to kill"
+            ));
+        }
+        self.validate_subagent_target(subagent_id)?;
+
+        let bus = crate::session_bus::global();
+        bus.publish(crate::session_bus::BusMessage {
+            from: self.session.session_id.clone(),
+            to: subagent_id.to_string(),
+            kind: crate::session_bus::BusMessageKind::Command,
+            payload: serde_json::json!({"action": "kill"}),
+            hop: 0,
+            ts_ms: crate::session_bus::now_ms(),
+        })?;
+        // 同步标记 coordinator 状态(Running → Cancelled;子代理先消费 kill 后此处
+        // cancel 为 no-op Err,忽略)。
+        if let Some(coordinator) = &self.multi_agent_coordinator {
+            let _ = coordinator.cancel(subagent_id);
+        }
+        Ok(format!("kill command queued for {subagent_id}"))
+    }
+
+    /// Epic 4 延续:执行 `bus_list` — 列出 Session Bus 全部 peer 及状态。
+    ///
+    /// 只读;输出格式与 `/bus list` 一致(peer id · kind · status · unread)。
+    fn execute_bus_list(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let bus = crate::session_bus::global();
+        let mut peers = bus.peers_snapshot();
+        if let Some(root) = bus.bus_root() {
+            peers.extend(bus.remote_peers(&root, &self.session.session_id));
+        }
+        if peers.is_empty() {
+            return Ok("(no peers on the session bus)".to_string());
+        }
+        let lines: Vec<String> = peers
+            .iter()
+            .map(|p| {
+                format!(
+                    "- {} · {} · {} · unread {}",
+                    p.session_id,
+                    p.kind.as_str(),
+                    p.status.as_str(),
+                    p.unread
+                )
+            })
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    /// Epic 4 延续:执行 `bus_send` — 向目标 peer 发消息。
+    ///
+    /// 目标为 Subagent 时走 Command(steer) 语义(与 `/bus send` 一致);
+    /// 其他目标走 Message。`*` 广播。返回实际送达 peer 数。
+    fn execute_bus_send(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let to = parsed
+            .get("to")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'to' field")?
+            .trim();
+        let text = parsed
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'text' field")?
+            .trim();
+        if to.is_empty() {
+            return Err("'to' must not be empty (peer session_id or '*')".into());
+        }
+        if text.is_empty() {
+            return Err("'text' must not be empty".into());
+        }
+
+        let bus = crate::session_bus::global();
+        // 目标为 Subagent → Command(steer);其余 → Message(与 CLI /bus send 一致)。
+        let target_is_subagent = bus
+            .peers_snapshot()
+            .iter()
+            .any(|p| p.session_id == to && p.kind == crate::session_bus::PeerKind::Subagent);
+        let (kind, payload) = if target_is_subagent {
+            (
+                crate::session_bus::BusMessageKind::Command,
+                serde_json::json!({"action": "steer", "message": text}),
+            )
+        } else {
+            (
+                crate::session_bus::BusMessageKind::Message,
+                serde_json::json!({"text": text}),
+            )
+        };
+        let msg = crate::session_bus::BusMessage {
+            from: self.session.session_id.clone(),
+            to: to.to_string(),
+            kind,
+            payload,
+            hop: 0,
+            ts_ms: crate::session_bus::now_ms(),
+        };
+        let delivered = bus.publish(msg)?;
+        Ok(format!(
+            "sent to `{to}` (delivered to {} peer(s))",
+            delivered.len()
+        ))
+    }
+
+    /// Epic 4 延续:执行 `bus_watch` — 订阅/取消订阅某 peer 的消息流。
+    ///
+    /// watch 后该 peer 收到的消息会镜像到本会话未读队列(OutputView 可见)。
+    fn execute_bus_watch(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let target = parsed
+            .get("target")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'target' field")?
+            .trim();
+        if target.is_empty() {
+            return Err("'target' must not be empty".into());
+        }
+        let unwatch = parsed
+            .get("unwatch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let bus = crate::session_bus::global();
+        if unwatch {
+            bus.unwatch(&self.session.session_id, target);
+            Ok(format!("unwatched `{target}`"))
+        } else {
+            bus.watch(&self.session.session_id, target)
+                .map(|_| {
+                    format!("watching `{target}` — its messages will mirror into this session")
+                })
+                .map_err(|e| e.into())
+        }
+    }
+
+    /// Epic 3(拓扑感知派发):执行 `suggest_workspace` — 集成 `ModuleGraph` 按
+    /// crate 边界推导 `dispatch_subagent` 建议的 `workspace` 相对路径,供 LLM 参考。
+    /// 无 ProjectTopology 或拓扑未就绪时返回降级提示(不报错,LLM 可继续派发)。
+    fn execute_suggest_workspace(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let query = if input.trim().is_empty() {
+            None
+        } else {
+            let parsed: serde_json::Value =
+                serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+            parsed
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        let Some(topo) = &self.project_topology else {
+            return Ok(
+                "suggest_workspace is not available: no ProjectTopology configured. \
+                     Dispatch without the 'workspace' field, or query_project_graph if available."
+                    .to_string(),
+            );
+        };
+        Ok(topo.suggest_workspaces(query.as_deref())?)
     }
 
     /// P0-1:执行 `notebook_update` 工具调用,维护 NOTEBOOK.md。
@@ -5293,9 +6289,111 @@ where
         // 改进点 13:压缩后下个 turn 注入归档 recall 提示,主动列出可 recall
         // 的归档 tool result,引导 LLM 在需要时调用 recall_full 检索原始内容。
         self.archive_recall_hint_pending = true;
+        // P1:压缩摘要字段化 —— 从摘要解析 [active_task]/[closed_tasks] 段,
+        // 更新任务状态(零额外 LLM 调用,复用本次压缩摘要)。
+        self.apply_task_state_from_compaction(&result.formatted_summary);
+        // P2:压缩摘要字段化扩展 —— 从摘要 [lessons] 段提取失败教训,
+        // 持久化到 .claw/lessons.jsonl(覆盖成功 turn 中工具级瑕疵的盲区)。
+        self.apply_lessons_from_compaction(&result.formatted_summary);
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+
+    /// 任务状态自动更新:从本 turn 提取 goal + findings,持久化到
+    /// `.claw/task_state.json`,并更新内存缓存。失败静默(不阻断主流程)。
+    fn maybe_update_task_state(
+        &mut self,
+        user_input: &str,
+        assistant_messages: &[ConversationMessage],
+    ) {
+        let Some(root) = self.workspace_root.clone() else {
+            return;
+        };
+        let path = root.join(".claw").join(crate::task_state::TASK_STATE_FILE);
+        let mut state = self
+            .task_state
+            .clone()
+            .unwrap_or_else(|| crate::task_state::TaskState::load(&path).unwrap_or_default());
+        let texts: Vec<String> = assistant_messages
+            .iter()
+            .flat_map(|m| {
+                m.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        if texts.is_empty() && user_input.trim().is_empty() {
+            return;
+        }
+        state.update_from_turn(user_input, &texts);
+        if let Err(e) = state.save(&path) {
+            eprintln!("[task_state] failed to persist: {e}");
+        }
+        self.task_state = Some(state);
+    }
+
+    /// P1:压缩后从摘要解析任务状态(压缩摘要字段化)。
+    ///
+    /// 压缩时本来就要调一次 LLM 生成摘要(`CompactionSummarizerClient`),摘要
+    /// 按模板输出 `[active_task]` / `[closed_tasks]` 结构化段;此处从摘要文本
+    /// 解析出当前任务目标与已收尾任务,更新内存缓存并持久化 —— **零额外 LLM
+    /// 调用**(复用既有压缩调用,对齐 Claude Code 9 部分结构化摘要)。
+    /// 摘要无结构化段(启发式摘要)时跳过。
+    fn apply_task_state_from_compaction(&mut self, summary: &str) {
+        let extract = crate::task_state::parse_task_state_from_summary(summary);
+        if extract.active_goal.is_none() && extract.closed_tasks.is_empty() {
+            return;
+        }
+        let Some(root) = self.workspace_root.clone() else {
+            return;
+        };
+        let path = root.join(".claw").join(crate::task_state::TASK_STATE_FILE);
+        let mut state = self
+            .task_state
+            .clone()
+            .unwrap_or_else(|| crate::task_state::TaskState::load(&path).unwrap_or_default());
+        if let Some(goal) = &extract.active_goal {
+            state.goal = goal.clone();
+        }
+        for t in extract.closed_tasks {
+            if !state.closed_tasks.contains(&t) {
+                state.closed_tasks.push(t);
+            }
+            if state.closed_tasks.len() >= crate::task_state::TASK_FINDINGS_MAX {
+                break;
+            }
+        }
+        state.updated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        if let Err(e) = state.save(&path) {
+            eprintln!("[task_state] failed to persist after compaction: {e}");
+        }
+        self.task_state = Some(state);
+    }
+
+    /// P2:压缩后从摘要解析失败教训并持久化(压缩摘要字段化扩展)。
+    ///
+    /// 复用既有压缩 LLM 调用(与 [`apply_task_state_from_compaction`] 同构):
+    /// 摘要 `[lessons]` 段由摘要模型从**被压缩历史**中提取失败/低效工具操作
+    /// 教训(即使整体 turn 成功),追加到 `<workspace>/.claw/lessons.jsonl`,
+    /// 后续请求注入 system 变动区 → AI 下次执行时主动规避。
+    /// 覆盖自进化盲区:HarnessArchive 只学习 turn 级失败,成功 turn 中的
+    /// 工具级瑕疵(git stash 路径事故等)原本随压缩蒸发。
+    fn apply_lessons_from_compaction(&mut self, summary: &str) {
+        let lessons = crate::lessons::parse_lessons_from_summary(summary);
+        if lessons.is_empty() {
+            return;
+        }
+        let Some(root) = self.workspace_root.clone() else {
+            return;
+        };
+        if let Err(e) = crate::lessons::append_lessons(&root, &lessons) {
+            eprintln!("[lessons] failed to persist after compaction: {e}");
+        }
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -5655,6 +6753,14 @@ fn format_hook_message(result: &HookRunResult, fallback: &str) -> String {
     }
 }
 
+/// 判断 LoopDetector 的 InjectContext 消息是否为"重复调用/重复输出"警告。
+///
+/// 这类警告表明工具在循环中反复返回相同结果；调用方应抑制原始输出，
+/// 只返回提示文本，切断"看到相同输出 → 继续重试"的验证循环。
+fn is_repetition_warning(msg: &str) -> bool {
+    msg.contains("identical input") || msg.contains("identical output")
+}
+
 fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> String {
     if messages.is_empty() {
         return output;
@@ -5737,11 +6843,12 @@ mod tests {
     use super::{
         build_assistant_message, build_subagent_request, build_subagent_system_prompt,
         compaction_threshold_for_context_window, default_subagent_tool_catalog,
-        parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, process_tool_uses,
+        is_repetition_warning, microcompact_preserve_recent, parse_auto_compaction_threshold,
+        parse_auto_compaction_threshold_opt, process_tool_uses, rewrite_path_to_workspace_relative,
         ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
         PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor, SubagentContext,
-        ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
-        DEFAULT_MAX_ITERATIONS, SESSION_SEARCH_TOOL_SPEC, SOFT_MAX_ITERATIONS,
+        ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
+        MICROCOMPACT_PRESERVE_RECENT, SESSION_SEARCH_TOOL_SPEC, SOFT_MAX_ITERATIONS,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
@@ -6720,10 +7827,7 @@ mod tests {
         let mut watch = super::HookReloadWatch::new(loader, hooks);
 
         // 配置未变化:不触发重载。
-        assert!(
-            !watch.maybe_reload(&runner),
-            "未变化的配置不应触发重载"
-        );
+        assert!(!watch.maybe_reload(&runner), "未变化的配置不应触发重载");
 
         // 修改配置源:检测到变化并重载,下一次 hook 调用使用新配置。
         // 稍等确保 mtime 变化可观测(低精度文件系统兜底)。
@@ -6741,10 +7845,7 @@ mod tests {
         );
 
         // 再次检查:已记录新 mtime,不重复重载。
-        assert!(
-            !watch.maybe_reload(&runner),
-            "相同配置不应重复重载"
-        );
+        assert!(!watch.maybe_reload(&runner), "相同配置不应重复重载");
 
         let _ = fs::remove_dir_all(&workspace);
     }
@@ -6832,6 +7933,381 @@ mod tests {
         );
     }
 
+    /// 复现：工具执行中被 Ctrl+C 中断（场景 A）后，下一 turn 的请求上下文
+    /// 必须保留 turn 1 的 user + assistant(tool_use) + tool_result 完整链，
+    /// 否则 AI 会丢失"正在做什么"的上下文。
+    #[test]
+    fn interrupted_during_tool_execution_preserves_context() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering2};
+        use std::sync::Mutex;
+
+        let abort_signal = crate::hooks::HookAbortSignal::new();
+        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+
+        struct InterruptToolApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+        }
+        impl ApiClient for InterruptToolApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let n = self.calls.fetch_add(1, AtomicOrdering2::SeqCst);
+                self.captured.lock().expect("lock").push(request.messages);
+                if n == 0 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-interrupt".to_string(),
+                            name: "bash".to_string(),
+                            input: "sleep 60".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("second turn done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let abort_for_tool = abort_signal.clone();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            InterruptToolApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new().register("bash", move |_input| {
+                // 模拟用户在 bash 执行期间按 Ctrl+C（TUI 层 abort signal + bash kill）
+                abort_for_tool.abort();
+                Err(crate::ToolError::new("bash interrupted by user"))
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_hook_abort_signal(abort_signal.clone());
+
+        // turn 1：工具执行中被中断 → 必须返回 interrupted 错误
+        let err = runtime
+            .run_turn("first request", None)
+            .expect_err("tool-phase interrupt should abort the turn");
+        assert!(
+            err.to_string().contains("turn interrupted by user"),
+            "{err}"
+        );
+
+        // ClawAgent::prompt 会 reset sticky abort 状态
+        abort_signal.reset();
+
+        // turn 2：发新消息
+        runtime
+            .run_turn("continue please", None)
+            .expect("second turn should succeed");
+
+        // 断言：turn 2 的请求上下文包含 turn 1 的完整消息链
+        let requests = captured.lock().expect("lock");
+        let second_request = requests.last().expect("two requests captured");
+        let roles: Vec<&str> = second_request
+            .iter()
+            .map(|m| match m.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Tool => "tool",
+                MessageRole::System => "system",
+            })
+            .collect();
+        assert!(
+            second_request.iter().any(|m| m.role == MessageRole::User),
+            "turn2 request must contain user message, roles={roles:?}"
+        );
+        assert!(
+            second_request
+                .iter()
+                .any(|m| m.role == MessageRole::Assistant),
+            "turn2 request must contain turn-1 assistant (tool_use), roles={roles:?}"
+        );
+        assert!(
+            second_request.iter().any(|m| m.role == MessageRole::Tool),
+            "turn2 request must contain turn-1 tool result, roles={roles:?}"
+        );
+    }
+
+    /// 复现：API 流式响应完成后、assistant 消息入 session 前被中断
+    /// （conversation.rs 细粒度中断检查点）时，本轮 assistant 回复会丢失，
+    /// 下一 turn 只能看到 user 消息 → AI 丢失上下文。
+    #[test]
+    fn interrupted_after_stream_loses_assistant_message() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering3};
+        use std::sync::Mutex;
+
+        let abort_signal = crate::hooks::HookAbortSignal::new();
+        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+
+        struct InterruptAfterStreamApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+            abort_signal: crate::hooks::HookAbortSignal,
+        }
+        impl ApiClient for InterruptAfterStreamApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let n = self.calls.fetch_add(1, AtomicOrdering3::SeqCst);
+                self.captured.lock().expect("lock").push(request.messages);
+                if n == 0 {
+                    // 模拟用户在此刻按 Ctrl+C：流已返回，但 abort 标志已设置，
+                    // 命中 L3332 的"流式调用完成后立即检查"中断点。
+                    self.abort_signal.abort();
+                    Ok(vec![
+                        AssistantEvent::TextDelta("first turn partial reply".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("second turn done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            InterruptAfterStreamApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+                abort_signal: abort_signal.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_hook_abort_signal(abort_signal.clone());
+
+        let err = runtime
+            .run_turn("first request", None)
+            .expect_err("post-stream interrupt should abort the turn");
+        assert!(
+            err.to_string().contains("turn interrupted by user"),
+            "{err}"
+        );
+
+        abort_signal.reset();
+
+        runtime
+            .run_turn("continue please", None)
+            .expect("second turn should succeed");
+
+        let requests = captured.lock().expect("lock");
+        let second_request = requests.last().expect("two requests captured");
+        // 期望：turn 1 的 assistant 回复已在中断前入 session，turn 2 能看到
+        let assistant_msgs = second_request
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .count();
+        assert_eq!(
+            assistant_msgs,
+            1,
+            "turn2 request must retain turn-1 assistant reply; roles={:?}",
+            second_request
+                .iter()
+                .map(|m| m.role.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 流式后中断且 assistant 消息含 tool_use 声明时，修复必须为悬挂 tool_use
+    /// 补齐中断的 tool_result，保证下一 turn 请求消息对完整（否则 API 拒绝）。
+    #[test]
+    fn interrupted_after_stream_completes_pending_tool_use() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering4};
+        use std::sync::Mutex;
+
+        let abort_signal = crate::hooks::HookAbortSignal::new();
+        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+
+        struct InterruptToolUseApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+            abort_signal: crate::hooks::HookAbortSignal,
+        }
+        impl ApiClient for InterruptToolUseApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let n = self.calls.fetch_add(1, AtomicOrdering4::SeqCst);
+                self.captured.lock().expect("lock").push(request.messages);
+                if n == 0 {
+                    // 流式完成后用户按 Ctrl+C：assistant 已声明调用工具但未执行
+                    self.abort_signal.abort();
+                    Ok(vec![
+                        AssistantEvent::TextDelta("let me check".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "tool-pending".to_string(),
+                            name: "bash".to_string(),
+                            input: "echo hi".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("second turn done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            InterruptToolUseApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+                abort_signal: abort_signal.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_hook_abort_signal(abort_signal.clone());
+
+        let err = runtime
+            .run_turn("first request", None)
+            .expect_err("post-stream interrupt should abort the turn");
+        assert!(
+            err.to_string().contains("turn interrupted by user"),
+            "{err}"
+        );
+
+        abort_signal.reset();
+
+        runtime
+            .run_turn("continue please", None)
+            .expect("second turn should succeed");
+
+        let requests = captured.lock().expect("lock");
+        let second_request = requests.last().expect("two requests captured");
+        // 消息链必须为 [user, assistant(tool_use), tool(interrupted), user]
+        let roles: Vec<MessageRole> = second_request.iter().map(|m| m.role.clone()).collect();
+        let expected = vec![
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::Tool,
+            MessageRole::User,
+        ];
+        assert_eq!(
+            roles, expected,
+            "interrupted assistant(tool_use) must be paired with an interrupted tool_result; actual={roles:?}"
+        );
+        // tool_result 必须标记为错误(interrupted),内容提示用户取消
+        let tool_result = second_request
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool result present");
+        let output = tool_result
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    output, is_error, ..
+                } => Some((output.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("tool result block");
+        assert!(output.1, "interrupted tool_result must be is_error=true");
+        assert!(
+            output.0.contains("interrupt"),
+            "interrupted tool_result should mention cancellation: {}",
+            output.0
+        );
+    }
+
+    #[test]
+    fn is_repetition_warning_matches_identical_input_and_output() {
+        // identical input 警告 → 抑制
+        assert!(is_repetition_warning(
+            "consider reconsidering your approach — tool 'bash' has been invoked 3 times \
+             with identical input; the result has not changed"
+        ));
+        // identical output 警告 → 抑制
+        assert!(is_repetition_warning(
+            "consider reconsidering your approach — tool 'bash' returned identical output \
+             5 times; the result has not changed, consider changing strategy or asking the user"
+        ));
+        // 非重复警告(如文件编辑警告) → 不抑制,保留原始输出
+        assert!(!is_repetition_warning(
+            "consider reconsidering your approach — this file has been edited many times"
+        ));
+        // 无产出探索循环警告 → 不抑制(仍保留输出供模型判断)
+        assert!(!is_repetition_warning(
+            "consider reconsidering your approach — 15 consecutive tool calls have produced \
+             no file modification"
+        ));
+    }
+
+    /// 集成验证：bash 工具连续返回相同输出时，第 5 次（SAME_OUTPUT_WARN_THRESHOLD）
+    /// 起 tool result 被抑制为提示文本，模型不再看到重复的原始输出。
+    /// 输入每次不同 → 绕过 identical-input 通道，精确命中 identical-output 通道。
+    #[test]
+    fn repeated_bash_output_is_suppressed_not_passed_through() {
+        // mock API：每轮请求返回一个不同的 bash ToolUse（input 不同、执行器输出相同）。
+        struct RepeatApi {
+            counter: usize,
+        }
+
+        impl ApiClient for RepeatApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.counter += 1;
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: format!("call-{}", self.counter),
+                        name: "bash".to_string(),
+                        input: format!("echo iteration {}", self.counter),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // 执行器固定返回相同输出（验证循环的典型特征）。
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RepeatApi { counter: 0 },
+            StaticToolExecutor::new()
+                .register("bash", |_| Ok("identical output payload".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(20);
+
+        // when：跑到第 6 次触发 SAME_OUTPUT_ABORT_THRESHOLD(10) 前的若干轮；
+        // 用 abort 兜底（identical output 10 次）结束 turn。
+        let error = runtime
+            .run_turn("run", None)
+            .expect_err("identical output should eventually abort the turn");
+
+        // then：turn 因循环中止，而非正常完成。
+        assert!(
+            error.to_string().contains("doom loop detected"),
+            "unexpected error: {error}"
+        );
+
+        // 关键断言：至少一条 tool result 已被抑制（含提示、不含原始重复输出）。
+        let suppressed = runtime.session().messages.iter().any(|m| {
+            m.blocks.iter().any(|b| {
+                if let ContentBlock::ToolResult { output, .. } = b {
+                    output.contains("tool output suppressed: repetition detected")
+                        && !output.contains("identical output payload")
+                } else {
+                    false
+                }
+            })
+        });
+        assert!(
+            suppressed,
+            "identical output 应在警告阈值处被抑制为提示文本"
+        );
+    }
+
     #[test]
     fn soft_threshold_injects_convergence_warning_before_hard_limit() {
         // mock:每轮输出不同文本 + 不同 tool input/output,绕过 LoopDetector
@@ -6879,7 +8355,9 @@ mod tests {
 
         // then:硬上限中止,错误消息保留原前缀
         assert!(
-            error.to_string().contains("conversation loop exceeded the maximum number of iterations"),
+            error
+                .to_string()
+                .contains("conversation loop exceeded the maximum number of iterations"),
             "unexpected error: {error}"
         );
         // 软阈值警告恰好注入一次(第 SOFT_MAX_ITERATIONS 轮的 user 消息,含"收敛")
@@ -6889,15 +8367,16 @@ mod tests {
             .iter()
             .filter(|m| {
                 matches!(m.role, MessageRole::User)
-                    && m.blocks.iter().any(|b| matches!(
-                        b,
-                        ContentBlock::Text { text } if text.contains("收敛")
-                    ))
+                    && m.blocks.iter().any(|b| {
+                        matches!(
+                            b,
+                            ContentBlock::Text { text } if text.contains("收敛")
+                        )
+                    })
             })
             .count();
         assert_eq!(
-            warning_count,
-            1,
+            warning_count, 1,
             "第 {SOFT_MAX_ITERATIONS} 轮应恰好注入一次收敛警告,实际 {warning_count} 次"
         );
     }
@@ -7003,6 +8482,288 @@ mod tests {
             request_kind: RequestKind::Main,
         };
         assert_eq!(request.request_kind, RequestKind::Main);
+    }
+
+    /// 复现记忆丢失根因(方案 A):turn 结束后 task_state 自动提取并持久化;
+    /// 会话经历压缩后,后续请求必须注入 task_state,让 AI 在压缩后仍持有
+    /// 任务锚点(目标 + 已确认关键发现),防止任务漂移与重复查询。
+    #[test]
+    fn task_state_persisted_and_injected_after_compact_boundary() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering4};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct TaskStateApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for TaskStateApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured
+                    .lock()
+                    .expect("lock")
+                    .push(request.system_prompt.dynamic_sections.clone());
+                let n = self.calls.fetch_add(1, AtomicOrdering4::SeqCst);
+                if n == 0 {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("关键发现:根因是缓存失效。".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-task-state-e2e-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TaskStateApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        // turn 1:任务描述足够长 → 提取 goal + finding 并持久化
+        runtime
+            .run_turn("调查 BTC 30分钟笔绘制数量差异问题", None)
+            .expect("turn1 should succeed");
+
+        let state_file = tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE);
+        assert!(state_file.exists(), "task_state.json should be persisted");
+        let loaded = crate::task_state::TaskState::load(&state_file).expect("load task_state");
+        assert!(
+            loaded.goal.contains("BTC"),
+            "goal should be extracted, got: {}",
+            loaded.goal
+        );
+        assert!(
+            loaded.findings.iter().any(|f| f.contains("根因")),
+            "finding should be extracted, got: {:?}",
+            loaded.findings
+        );
+
+        // 注入压缩边界(模拟会话被压缩过)
+        let marker = "<!-- compact_boundary: {\"trigger\":\"Auto\",\"pre_tokens\":500,\
+                      \"messages_summarized\":3,\"timestamp_ms\":1} -->"
+            .to_string();
+        let _ = runtime.session.push_message(ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text { text: marker }],
+            usage: None,
+        });
+
+        // turn 2:压缩后请求必须注入 task state
+        runtime
+            .run_turn("继续", None)
+            .expect("turn2 should succeed");
+
+        let sections = captured.lock().expect("lock");
+        let last = sections.last().expect("two requests captured");
+        assert!(
+            last.iter().any(|s| s.contains("当前任务状态")),
+            "task state block should be injected, got: {last:?}"
+        );
+        assert!(
+            last.iter().any(|s| s.contains("BTC")),
+            "goal should be injected, got: {last:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// P2 回归:压缩摘要 `[lessons]` 段 → 持久化到 lessons.jsonl,且压缩后
+    /// 请求注入历史教训(覆盖成功 turn 中工具级瑕疵的自进化盲区)。
+    #[test]
+    fn compaction_summary_persists_and_injects_lessons() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering5};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct LessonApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for LessonApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured
+                    .lock()
+                    .expect("lock")
+                    .push(request.system_prompt.dynamic_sections.clone());
+                let n = self.calls.fetch_add(1, AtomicOrdering5::SeqCst);
+                if n == 0 {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done2".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-lessons-e2e-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LessonApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        // 模拟压缩摘要含 [lessons] 段(如 git stash 路径事故教训)
+        runtime.apply_lessons_from_compaction(
+            "- 修复了登录 401\n\n[lessons]\n- git stash push 需用相对 cwd 的路径\n- read_file 先确认仓库根路径",
+        );
+
+        // 落盘验证
+        let lessons_file = tmp.join(".claw").join(crate::lessons::LESSONS_FILE);
+        assert!(lessons_file.exists(), "lessons.jsonl should be persisted");
+        let lessons = crate::lessons::load_recent_lessons(&tmp, 10);
+        assert_eq!(lessons.len(), 2, "two lessons should persist: {lessons:?}");
+
+        // 注入压缩边界 → turn 请求应含历史教训
+        let marker = "<!-- compact_boundary: {\"trigger\":\"Auto\",\"pre_tokens\":500,\
+                      \"messages_summarized\":3,\"timestamp_ms\":1} -->"
+            .to_string();
+        let _ = runtime.session.push_message(ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text { text: marker }],
+            usage: None,
+        });
+        runtime
+            .run_turn("继续", None)
+            .expect("turn should succeed");
+
+        let sections = captured.lock().expect("lock");
+        let last = sections.last().expect("request captured");
+        assert!(
+            last.iter().any(|s| s.contains("历史操作教训")),
+            "lessons block should be injected, got: {last:?}"
+        );
+        assert!(
+            last.iter().any(|s| s.contains("git stash push 需用相对 cwd")),
+            "lesson content should be injected, got: {last:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+    /// P1 回归:压缩摘要字段化 —— 摘要含 `[active_task]`/`[closed_tasks]` 段时,
+    /// `apply_task_state_from_compaction` 解析并持久化 goal + closed_tasks。
+    #[test]
+    fn compaction_summary_updates_task_state() {
+        struct NoopApi;
+        impl ApiClient for NoopApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![AssistantEvent::MessageStop])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-task-state-compact-e2e-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime.apply_task_state_from_compaction(
+            "- 修复了登录 401\n- 关键文件: auth.rs\n\n[active_task]\n\
+             goal: 兼容旧 Session 格式\nnext_action: 补迁移测试\n\n\
+             [closed_tasks]\n- 登录 401 修复: 6/6 PASS\n- auth 重构: 已收尾",
+        );
+
+        let state_file = tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE);
+        assert!(state_file.exists(), "task_state.json should be persisted");
+        let loaded = crate::task_state::TaskState::load(&state_file).expect("load task_state");
+        assert_eq!(
+            loaded.goal, "兼容旧 Session 格式",
+            "goal should come from [active_task]"
+        );
+        assert!(
+            loaded.closed_tasks.iter().any(|t| t.contains("401")),
+            "closed_tasks should be parsed, got: {:?}",
+            loaded.closed_tasks
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// D 配置化回归:微压缩保留窗口默认 5,可通过 `CLAW_COMPACT_PRESERVE_RECENT`
+    /// 覆盖(1-10),越界/非法回退默认值。
+    #[test]
+    fn microcompact_preserve_recent_env_override() {
+        use std::env;
+        env::set_var("CLAW_COMPACT_PRESERVE_RECENT", "8");
+        assert_eq!(microcompact_preserve_recent(), 8);
+        env::set_var("CLAW_COMPACT_PRESERVE_RECENT", "99");
+        assert_eq!(
+            microcompact_preserve_recent(),
+            MICROCOMPACT_PRESERVE_RECENT,
+            "out-of-range falls back to default"
+        );
+        env::set_var("CLAW_COMPACT_PRESERVE_RECENT", "0");
+        assert_eq!(
+            microcompact_preserve_recent(),
+            MICROCOMPACT_PRESERVE_RECENT,
+            "0 falls back to default"
+        );
+        env::set_var("CLAW_COMPACT_PRESERVE_RECENT", "not-a-number");
+        assert_eq!(
+            microcompact_preserve_recent(),
+            MICROCOMPACT_PRESERVE_RECENT,
+            "invalid value falls back to default"
+        );
+        env::remove_var("CLAW_COMPACT_PRESERVE_RECENT");
+        assert_eq!(microcompact_preserve_recent(), MICROCOMPACT_PRESERVE_RECENT);
     }
 
     #[test]
@@ -7277,6 +9038,34 @@ mod tests {
                 AssistantEvent::TextDelta("noop".to_string()),
                 AssistantEvent::MessageStop,
             ])
+        }
+    }
+
+    /// Epic 1 T6:首轮返回指定 tool_use(触发工具 guard 验证),后续轮次返回纯文本。
+    struct ToolUseOnceApi {
+        tool_name: String,
+        tool_input: String,
+        call_count: usize,
+    }
+
+    impl ApiClient for ToolUseOnceApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.call_count += 1;
+            if self.call_count == 1 {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tu-1".to_string(),
+                        name: self.tool_name.clone(),
+                        input: self.tool_input.clone(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            } else {
+                Ok(vec![
+                    AssistantEvent::TextDelta("scoped done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
         }
     }
 
@@ -7749,6 +9538,462 @@ mod tests {
             result_event.is_some(),
             "SubagentResult terminal event should be published after P0-2 sync execution"
         );
+    }
+
+    // Epic 2 A2.3c:steer/kill 工具经 SessionBus Command 投递,并同步 coordinator 状态。
+    #[test]
+    fn steer_and_kill_subagent_tools_queue_bus_commands() {
+        let _guard = acquire_lane_event_lock();
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        // 注册主会话 peer(steer/kill 的 from 必须已注册)
+        let bus = crate::session_bus::global();
+        let main_id = runtime.session.session_id.clone();
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: main_id.clone(),
+            label: "主会话".to_string(),
+            kind: crate::session_bus::PeerKind::Main,
+            status: crate::session_bus::PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+
+        // 模拟运行中的子代理(绑定 workspace + 注册 bus peer)
+        let sub = tempdir.path().join("crates/api");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("Cargo.toml"), "[package]").unwrap();
+        let id = coordinator.spawn(
+            "ws-worker",
+            "task",
+            crate::multi_agent::CoordinationMode::Fork,
+        );
+        let ws = crate::subworkspace::resolve_subworkspace(tempdir.path(), "crates/api")
+            .expect("resolve workspace");
+        coordinator.set_workspace(&id, Some(ws)).unwrap();
+        coordinator.start(&id).unwrap();
+        // A2.3b 落盘验证:spawn/start 状态流转同步 manifest(set_workspace_root 同步后)。
+        let before = crate::multi_agent::manifest::read_manifest(tempdir.path());
+        assert_eq!(
+            before.len(),
+            1,
+            "manifest should reflect the spawned subagent; got {before:?}"
+        );
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: id.clone(),
+            label: "subagent:ws-worker".to_string(),
+            kind: crate::session_bus::PeerKind::Subagent,
+            status: crate::session_bus::PeerStatus::Streaming,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+
+        // steer 投递:Command {action: steer, message}
+        let out = runtime
+            .execute_steer_subagent(
+                &serde_json::json!({"subagent_id": id, "message": "focus on tests"}).to_string(),
+            )
+            .expect("steer should succeed");
+        assert!(out.contains("queued"), "got: {out}");
+        let cmds = bus.unread_messages(&id);
+        assert!(
+            cmds.iter()
+                .any(|m| m.kind == crate::session_bus::BusMessageKind::Command
+                    && m.payload.get("action").and_then(|v| v.as_str()) == Some("steer")
+                    && m.payload.get("message").and_then(|v| v.as_str()) == Some("focus on tests")),
+            "steer Command should be queued: {cmds:?}"
+        );
+
+        // kill 投递 + coordinator 状态同步(manifest 亦反映)
+        let out = runtime
+            .execute_kill_subagent(&serde_json::json!({"subagent_id": id}).to_string())
+            .expect("kill should succeed");
+        assert!(out.contains("queued"), "got: {out}");
+        let agent = coordinator.get(&id).expect("agent exists");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Cancelled,
+            "kill must mark coordinator state"
+        );
+        let entries = crate::multi_agent::manifest::read_manifest(tempdir.path());
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.id == id && e.status == "cancelled"),
+            "manifest should reflect cancelled: {entries:?}"
+        );
+    }
+
+    // Epic 2 A2.3c:kill 终态子代理为 no-op 提示,不重复投递。
+    #[test]
+    fn kill_subagent_on_terminal_state_is_noop() {
+        let _guard = acquire_lane_event_lock();
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        let id = coordinator.spawn("done", "task", crate::multi_agent::CoordinationMode::Fork);
+        coordinator.start(&id).unwrap();
+        coordinator.complete(&id, ".claw/subagents/x.md").unwrap();
+
+        let out = runtime
+            .execute_kill_subagent(&serde_json::json!({"subagent_id": id}).to_string())
+            .expect("kill on terminal should be no-op Ok");
+        assert!(
+            out.contains("terminal"),
+            "terminal kill should return informative message: got: {out}"
+        );
+        let agent = coordinator.get(&id).unwrap();
+        assert_eq!(agent.status, crate::multi_agent::SubagentStatus::Completed);
+    }
+
+    // Epic 2 A2.3c/d:子代理执行循环消费 kill Command → 落盘 Cancelled handoff + Err。
+    #[tokio::test]
+    async fn execute_subagent_llm_consumes_kill_command() {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let root = tempdir.path().canonicalize().expect("canonicalize root");
+        let subagent_id = "subagent-kill-consumer";
+        let bus = crate::session_bus::global();
+        // 主会话(from)与子代理(to)均注册
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: "main-test".to_string(),
+            label: "主会话".to_string(),
+            kind: crate::session_bus::PeerKind::Main,
+            status: crate::session_bus::PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: subagent_id.to_string(),
+            label: "subagent:kill-consumer".to_string(),
+            kind: crate::session_bus::PeerKind::Subagent,
+            status: crate::session_bus::PeerStatus::Streaming,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+
+        // 第二轮调用前注入 kill Command;每轮都返回 ToolUse 保持循环(直到消费 kill)。
+        struct KillInjectApi {
+            calls: usize,
+        }
+        impl ApiClient for KillInjectApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 2 {
+                    let bus = crate::session_bus::global();
+                    let _ = bus.publish(crate::session_bus::BusMessage {
+                        from: "main-test".to_string(),
+                        to: "subagent-kill-consumer".to_string(),
+                        kind: crate::session_bus::BusMessageKind::Command,
+                        payload: serde_json::json!({"action": "kill"}),
+                        hop: 0,
+                        ts_ms: crate::session_bus::now_ms(),
+                    });
+                }
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "t-read".to_string(),
+                        name: "read_file".to_string(),
+                        input: r#"{"file_path": "a.txt"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let result = super::execute_subagent_llm(
+            &root,
+            None,
+            &mut KillInjectApi { calls: 0 },
+            &mut StaticToolExecutor::new()
+                .register("read_file", |_input| Ok("content".to_string())),
+            subagent_id,
+            "kill-consumer",
+            "task",
+            crate::multi_agent::TaskComplexity::Simple,
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &SubagentContext::default(),
+        )
+        .await;
+
+        let err = result.expect_err("kill must terminate the sub-agent loop");
+        assert!(err.contains("killed by parent"), "got: {err}");
+
+        // handoff 落盘且状态为 Cancelled
+        let handoff = crate::multi_agent::read_handoff(
+            &root
+                .join(".claw")
+                .join("subagents")
+                .join(format!("{subagent_id}.md")),
+        )
+        .expect("cancelled handoff should be persisted");
+        assert_eq!(
+            handoff.status,
+            crate::multi_agent::HandoffStatus::Cancelled,
+            "kill handoff status must be Cancelled"
+        );
+    }
+
+    // Epic 2 A2.3c/d:steer Command 被消费为 user 指令,下一轮 LLM 请求可见。
+    #[tokio::test]
+    async fn execute_subagent_llm_consumes_steer_command() {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let root = tempdir.path().canonicalize().expect("canonicalize root");
+        let subagent_id = "subagent-steer-consumer";
+        let bus = crate::session_bus::global();
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: "main-test".to_string(),
+            label: "主会话".to_string(),
+            kind: crate::session_bus::PeerKind::Main,
+            status: crate::session_bus::PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: subagent_id.to_string(),
+            label: "subagent:steer-consumer".to_string(),
+            kind: crate::session_bus::PeerKind::Subagent,
+            status: crate::session_bus::PeerStatus::Streaming,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+
+        // 时序:轮1 返回 ToolUse → 注入 steer(在轮2 stream 内)→ 轮2 顶部消费追加指令
+        // → 轮3 断言指令已出现在请求中并返回 Text 结束。
+        struct SteerInjectApi {
+            calls: usize,
+            steer_seen: bool,
+        }
+        impl ApiClient for SteerInjectApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "t-read".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path": "a.txt"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        // 注入 steer,返回又一工具调用,让循环继续
+                        let bus = crate::session_bus::global();
+                        let _ = bus.publish(crate::session_bus::BusMessage {
+                            from: "main-test".to_string(),
+                            to: "subagent-steer-consumer".to_string(),
+                            kind: crate::session_bus::BusMessageKind::Command,
+                            payload: serde_json::json!({
+                                "action": "steer",
+                                "message": "ignore auth module"
+                            }),
+                            hop: 0,
+                            ts_ms: crate::session_bus::now_ms(),
+                        });
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "t-read-2".to_string(),
+                                name: "read_file".to_string(),
+                                input: r#"{"file_path": "b.txt"}"#.to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => {
+                        // 轮3:指令应已注入请求
+                        let has_steer = request.messages.iter().any(|m| {
+                            m.role == MessageRole::User
+                                && m.blocks.iter().any(|b| {
+                                    matches!(b, ContentBlock::Text { text }
+                                        if text.contains("[主会话指令]")
+                                            && text.contains("ignore auth module"))
+                                })
+                        });
+                        assert!(
+                            has_steer,
+                            "steer instruction must appear in request: {:?}",
+                            request.messages
+                        );
+                        self.steer_seen = true;
+                        Ok(vec![
+                            AssistantEvent::TextDelta("final".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                }
+            }
+        }
+
+        let result = super::execute_subagent_llm(
+            &root,
+            None,
+            &mut SteerInjectApi {
+                calls: 0,
+                steer_seen: false,
+            },
+            &mut StaticToolExecutor::new()
+                .register("read_file", |_input| Ok("content".to_string())),
+            subagent_id,
+            "steer-consumer",
+            "task",
+            crate::multi_agent::TaskComplexity::Simple,
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &SubagentContext::default(),
+        )
+        .await;
+        result.expect("steer should not terminate the sub-agent");
+    }
+
+    // Epic 3:无 ProjectTopology 时 suggest_workspace 降级提示(不报错)。
+    #[test]
+    fn suggest_workspace_without_topology_returns_hint() {
+        let runtime = runtime_without_coordinator();
+        let out = runtime
+            .execute_suggest_workspace(r#"{"query":"api"}"#)
+            .expect("should return a hint, not error");
+        assert!(out.contains("no ProjectTopology configured"), "got: {out}");
+        // 空输入(JSON 空对象/空串)同样降级,不 panic
+        let out2 = runtime
+            .execute_suggest_workspace("")
+            .expect("empty input should not error");
+        assert!(out2.contains("no ProjectTopology"), "got: {out2}");
+    }
+
+    // 目录层级控制(设计文档 §2.2):workspace 绑定子目录的派发与校验。
+    #[test]
+    fn dispatch_subagent_binds_workspace_subdirectory() {
+        let _guard = acquire_lane_event_lock();
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = runtime_with_coordinator(coordinator.clone());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+        // 构造一个子工作区 crates/api
+        let sub = tempdir.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        std::fs::write(sub.join("Cargo.toml"), "[package]").expect("write Cargo.toml");
+
+        // 会话互通:先注册主会话 peer(与生产 app.rs 初始化一致),使子代理完成时
+        // 广播的 Handoff 能送达主会话;子代理自身不再收到自己的广播(审查修正
+        // 2026-08-12:广播 `*` 排除发送者)。
+        let bus = crate::session_bus::global();
+        let main_id = runtime.session.session_id.clone();
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: main_id.clone(),
+            label: "test-main".to_string(),
+            kind: crate::session_bus::PeerKind::Main,
+            status: crate::session_bus::PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+
+        let input = serde_json::json!({
+            "name": "ws-worker",
+            "task": "analyze api crate [test-dispatch-ws-uuid-81d0]",
+            "mode": "fork",
+            "workspace": "crates/api",
+        })
+        .to_string();
+        let output = runtime
+            .execute_dispatch_subagent(&input)
+            .expect("workspace dispatch should succeed");
+        assert!(output.contains("completed"), "got: {output}");
+
+        let subagent_id = output
+            .split("Subagent `")
+            .nth(1)
+            .and_then(|s| s.split('`').next())
+            .expect("extract subagent_id");
+        let peer = bus
+            .peers_snapshot()
+            .into_iter()
+            .find(|p| p.session_id == subagent_id)
+            .expect("subagent should be registered on the bus");
+        assert_eq!(peer.kind, crate::session_bus::PeerKind::Subagent);
+        assert_eq!(peer.status, crate::session_bus::PeerStatus::Done);
+        // Handoff 广播送达主会话(Subagent→Main 默认放行)
+        let main_unread = bus.unread_messages(&main_id);
+        assert!(
+            main_unread
+                .iter()
+                .any(|m| m.kind == crate::session_bus::BusMessageKind::Handoff),
+            "main session should receive the subagent's Handoff broadcast"
+        );
+        // 子代理自身不再收到自己的 Handoff 广播
+        let self_unread = bus.unread_messages(subagent_id);
+        assert!(
+            !self_unread
+                .iter()
+                .any(|m| m.kind == crate::session_bus::BusMessageKind::Handoff),
+            "subagent must not receive its own Handoff broadcast"
+        );
+
+        // Epic 2 A2.3a:coordinator 记录子代理绑定的 workspace(供 manifest / steer / kill 使用)。
+        let recorded = coordinator
+            .get(subagent_id)
+            .expect("subagent should be registered in coordinator");
+        assert_eq!(
+            recorded.workspace.as_deref(),
+            Some(sub.canonicalize().expect("canonicalize sub").as_path()),
+            "subagent workspace binding must be recorded"
+        );
+    }
+
+    #[test]
+    fn dispatch_subagent_rejects_invalid_workspace() {
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = runtime_with_coordinator(coordinator);
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        runtime.set_workspace_root(tempdir.path().to_path_buf());
+
+        // `../` 逃逸
+        let escape = serde_json::json!({
+            "name": "esc",
+            "task": "x",
+            "workspace": "..",
+        })
+        .to_string();
+        let err = runtime
+            .execute_dispatch_subagent(&escape)
+            .expect_err("escape workspace must be rejected");
+        assert!(err.to_string().contains("invalid workspace"), "got: {err}");
+
+        // 绝对路径
+        let absolute = serde_json::json!({
+            "name": "abs",
+            "task": "x",
+            "workspace": tempdir.path().to_string_lossy(),
+        })
+        .to_string();
+        let err = runtime
+            .execute_dispatch_subagent(&absolute)
+            .expect_err("absolute workspace must be rejected");
+        assert!(err.to_string().contains("invalid workspace"), "got: {err}");
+
+        // 非项目目录
+        std::fs::create_dir_all(tempdir.path().join("plain")).expect("create plain dir");
+        let not_project = serde_json::json!({
+            "name": "np",
+            "task": "x",
+            "workspace": "plain",
+        })
+        .to_string();
+        let err = runtime
+            .execute_dispatch_subagent(&not_project)
+            .expect_err("non-project workspace must be rejected");
+        assert!(err.to_string().contains("no project markers"), "got: {err}");
     }
 
     #[test]
@@ -8594,8 +10839,9 @@ mod tests {
         let workspace_root = tempdir.path().to_path_buf();
 
         // 构造 3 个 Read tool result,只有最后 1 个会被保留(preserve_recent=1)
-        let original_output_1 = "file1 content line1\nfile1 content line2\nfile1 content line3";
-        let original_output_2 = "file2 content line1\nfile2 content line2\nfile2 content line3";
+        // 旧结果输出需超过 SMALL_OUTPUT_PRESERVE_CHARS,否则被小输出保护保留
+        let original_output_1 = "file1 content line1: function foo with a very long signature and body\nfile1 content line2: implementation detail that keeps going for many characters\nfile1 content line3: additional context and comments that extend the output well beyond the two hundred character threshold used by microcompact's small output preservation logic\nfile1 content line4: trailing padding to be safe";
+        let original_output_2 = "file2 content line1: class Bar with fields and methods declared\nfile2 content line2: detailed documentation comment block spanning several lines\nfile2 content line3: method implementations with verbose error handling branches\nfile2 content line4: more padding to comfortably exceed the two hundred character small output preservation threshold for the microcompact pass";
         let original_output_3 = "file3 content (recent, should be preserved verbatim)";
 
         let messages = vec![
@@ -9040,7 +11286,7 @@ mod tests {
         );
 
         // ReadOnly:仅只读子集(read_file/grep_search/glob_search),不含写入工具
-        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly);
+        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly, None);
         let ro_names: Vec<&str> = ro
             .tool_summaries
             .iter()
@@ -9053,7 +11299,7 @@ mod tests {
         );
 
         // Execute:全量可执行目录(read_file/grep_search/glob_search/edit_file/write_file/bash)
-        let ex = runtime.build_subagent_context(SubagentCapability::Execute);
+        let ex = runtime.build_subagent_context(SubagentCapability::Execute, None);
         let ex_names: Vec<&str> = ex
             .tool_summaries
             .iter()
@@ -9079,7 +11325,7 @@ mod tests {
         );
 
         // Analyze:白名单为空 → 不注入工具层
-        let an = runtime.build_subagent_context(SubagentCapability::Analyze);
+        let an = runtime.build_subagent_context(SubagentCapability::Analyze, None);
         assert!(
             an.tool_summaries.is_empty(),
             "Analyze should expose no tools"
@@ -9108,7 +11354,7 @@ mod tests {
             },
         ]);
 
-        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly);
+        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly, None);
         let ro_names: Vec<&str> = ro
             .tool_summaries
             .iter()
@@ -9120,7 +11366,7 @@ mod tests {
             "override catalog filtered to ReadOnly"
         );
 
-        let ex = runtime.build_subagent_context(SubagentCapability::Execute);
+        let ex = runtime.build_subagent_context(SubagentCapability::Execute, None);
         let ex_names: Vec<&str> = ex
             .tool_summaries
             .iter()
@@ -9193,6 +11439,7 @@ mod tests {
             &mut messages,
             &mut tools_used,
             &mut changed_files,
+            None,
         );
 
         assert!(result.is_ok(), "Execute + edit_file should succeed");
@@ -9225,6 +11472,7 @@ mod tests {
             &mut messages,
             &mut tools_used,
             &mut changed_files,
+            None,
         );
 
         // Analyze 白名单不含 edit_file -> Guard 2 拒绝,返回 Err
@@ -9262,6 +11510,7 @@ mod tests {
             &mut messages,
             &mut tools_used,
             &mut changed_files,
+            None,
         );
 
         assert!(
@@ -9277,8 +11526,8 @@ mod tests {
         let workspace = tmp.path().to_path_buf();
 
         let tool_uses = vec![make_edit_tool_use("tu2", "write_file", "src/new.rs")];
-        let mut executor = StaticToolExecutor::new()
-            .register("write_file", |_input| Ok("written".to_string()));
+        let mut executor =
+            StaticToolExecutor::new().register("write_file", |_input| Ok("written".to_string()));
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -9291,11 +11540,723 @@ mod tests {
             &mut messages,
             &mut tools_used,
             &mut changed_files,
+            None,
         );
 
         assert!(result.is_ok(), "Execute + write_file should succeed");
         assert_eq!(tools_used, vec!["write_file"]);
         assert_eq!(messages.len(), 1);
+    }
+
+    // 目录层级控制(设计文档 §2.2 Guard 3):子代理绑定子目录 workspace 后,
+    // 路径类工具的目标越出子目录 → 回填 is_error 且不执行工具。
+    #[test]
+    fn process_tool_uses_scope_rejects_out_of_subdirectory() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        std::fs::write(tmp.path().join("root.rs"), "outside").expect("write root file");
+
+        let scope = crate::file_ops::WorkspacePathScope::from_roots(vec![sub.clone()]);
+        let mut executor = StaticToolExecutor::new()
+            .register("read_file", |_input| Ok("should not reach".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        // 场景 1:绝对路径越界
+        let escape_absolute = ContentBlock::ToolUse {
+            id: "tu-abs".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({
+                "file_path": tmp.path().join("root.rs").to_string_lossy()
+            })
+            .to_string(),
+        };
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &[escape_absolute],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        assert!(
+            result.is_ok(),
+            "scope violation should be tool_result, not abort"
+        );
+        assert!(tools_used.is_empty(), "tool must not execute on escape");
+        let err_msg = error_tool_result_text(&messages);
+        assert!(
+            err_msg.contains("rejected"),
+            "expected rejection message, got: {err_msg}"
+        );
+
+        // 场景 2:相对路径 `../` 逃逸(词法归一化后必须被拒)
+        messages.clear();
+        tools_used.clear();
+        changed_files.clear();
+        let escape_relative = ContentBlock::ToolUse {
+            id: "tu-rel".to_string(),
+            name: "read_file".to_string(),
+            input: r#"{"file_path":"../root.rs"}"#.to_string(),
+        };
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &[escape_relative],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        assert!(result.is_ok());
+        assert!(tools_used.is_empty(), "tool must not execute on ../ escape");
+        let err_msg = error_tool_result_text(&messages);
+        assert!(
+            err_msg.contains("rejected"),
+            "expected rejection message, got: {err_msg}"
+        );
+
+        // 场景 3(审查 P0 回归):相对主 workspace_root 的子目录外路径必须被拒。
+        // 修复前 candidate 用 scope_root.join,`crates/api/../core/foo.rs` 归一化后
+        // 落在子目录字符串前缀内被放行,执行器却以主 root 解析 → 越界读取。
+        // 修复后 candidate 用 workspace_root.join,归一化得到 root/crates/core/foo.rs,
+        // 不在子目录 scope 内 → 拒绝。
+        std::fs::write(sub.join("lib.rs"), "inside").expect("write lib.rs");
+        std::fs::create_dir_all(tmp.path().join("crates/core")).expect("create core dir");
+        std::fs::write(tmp.path().join("crates/core/foo.rs"), "outside").expect("write core file");
+        messages.clear();
+        tools_used.clear();
+        changed_files.clear();
+        let main_relative_escape = ContentBlock::ToolUse {
+            id: "tu-rel-main".to_string(),
+            name: "read_file".to_string(),
+            input: r#"{"file_path":"crates/api/../core/foo.rs"}"#.to_string(),
+        };
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &[main_relative_escape],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        assert!(
+            result.is_ok(),
+            "scope violation should be tool_result, not abort"
+        );
+        assert!(
+            tools_used.is_empty(),
+            "tool must not execute on main-relative escape"
+        );
+        let err_msg = error_tool_result_text(&messages);
+        assert!(
+            err_msg.contains("rejected"),
+            "expected rejection message, got: {err_msg}"
+        );
+
+        // 场景 4:子目录内的合法相对路径必须放行(确保 P0 修复未过度拦截)。
+        messages.clear();
+        tools_used.clear();
+        changed_files.clear();
+        let legal = ContentBlock::ToolUse {
+            id: "tu-legal".to_string(),
+            name: "read_file".to_string(),
+            input: r#"{"file_path":"crates/api/lib.rs"}"#.to_string(),
+        };
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &[legal],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        assert!(result.is_ok(), "in-scope path must be allowed");
+        assert_eq!(tools_used, vec!["read_file"]);
+    }
+
+    // 审查补充(Guard 2.5):绑定 workspace 的子代理禁用全仓库扫描工具。
+    #[test]
+    fn process_tool_uses_scoped_rejects_whole_repo_scan_tools() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        let scope = crate::file_ops::WorkspacePathScope::from_roots(vec![sub.clone()]);
+
+        for tool_name in ["repomap", "lsp_diagnostics"] {
+            let scan_use = ContentBlock::ToolUse {
+                id: format!("tu-{tool_name}"),
+                name: tool_name.to_string(),
+                input: "{}".to_string(),
+            };
+            let mut executor = StaticToolExecutor::new();
+            let mut messages = Vec::new();
+            let mut tools_used = Vec::new();
+            let mut changed_files = Vec::new();
+            let result = process_tool_uses(
+                crate::multi_agent::SubagentCapability::ReadOnly,
+                &[scan_use],
+                &mut executor,
+                tmp.path(),
+                &mut messages,
+                &mut tools_used,
+                &mut changed_files,
+                Some(&scope),
+            );
+            assert!(
+                result.is_err(),
+                "{tool_name} should be rejected for scoped subagent"
+            );
+            assert!(
+                result.unwrap_err().to_string().contains("whole-repo scan"),
+                "err should mention whole-repo scan"
+            );
+        }
+    }
+
+    // Epic 1 T1(封 bash 逃逸):绑定 workspace 的 Execute 子代理禁用 bash。
+    // bash 的 cwd 是进程当前目录而非 workspace(execute_bash 用 env::current_dir()),
+    // 命令任意无法静态校验目录,可逃逸写任意路径;写操作只走 write_file/edit_file。
+    // 注意必须用 Execute capability(ReadOnly 会在 Guard 2 白名单先被拒)。
+    #[test]
+    fn process_tool_uses_scope_rejects_bash() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        let scope = crate::file_ops::WorkspacePathScope::from_roots(vec![sub.clone()]);
+
+        let bash_use = ContentBlock::ToolUse {
+            id: "tu-bash".to_string(),
+            name: "bash".to_string(),
+            input: r#"{"command":"echo x > ../../outside.txt"}"#.to_string(),
+        };
+        let mut executor = StaticToolExecutor::new()
+            // 若 bash 意外被执行,handler 会返回唯一标记出现在 tool_result 中。
+            .register("bash", |_| Ok("BASH_RAN".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &[bash_use],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        assert!(
+            result.is_err(),
+            "bash should be rejected for scoped subagent"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unbounded shell"),
+            "err should mention unbounded shell, got: {err}"
+        );
+        // 工具不得被执行:任何 tool_result 的 output 中出现 handler 标记即说明泄漏执行。
+        let executed = messages.iter().any(|m| {
+            m.blocks.iter().any(|b| match b {
+                crate::session::ContentBlock::ToolResult { output, .. } => {
+                    output.contains("BASH_RAN")
+                }
+                _ => false,
+            })
+        });
+        assert!(!executed, "bash must not execute for scoped subagent");
+    }
+
+    // Epic 1 T1(改动 3):workspace 绑定 + Execute 能力 — write_file 到 workspace 内成功。
+    // LLM 传相对主 workspace_root 的路径,Guard 3 以主 root 为基准归一化后落在子目录
+    // scope 内 → 放行执行;file lock 正常获取;changed_files 提取到 workspace 内路径。
+    #[test]
+    fn process_tool_uses_execute_write_within_workspace_succeeds() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        std::fs::create_dir_all(sub.join("src")).expect("create src dir");
+        let scope = crate::file_ops::WorkspacePathScope::from_roots(vec![sub.clone()]);
+
+        let write_use = make_edit_tool_use("tu-w-in", "write_file", "crates/api/src/new.rs");
+        let mut executor =
+            StaticToolExecutor::new().register("write_file", |_input| Ok("written:OK".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &[write_use],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        assert!(result.is_ok(), "in-scope write should succeed");
+        assert_eq!(tools_used, vec!["write_file"], "write_file must execute");
+        // handler 已执行:output 出现标记
+        let rendered = tool_results_text(&messages);
+        assert!(
+            rendered.contains("written:OK"),
+            "write handler should have run, got: {rendered}"
+        );
+        // changed_files 提取到 workspace 内路径
+        assert!(
+            changed_files
+                .iter()
+                .any(|c| c.contains("crates/api/src/new.rs")),
+            "changed_files should capture workspace path, got: {changed_files:?}"
+        );
+    }
+
+    // Epic 1 T1(改动 3):workspace 绑定 + Execute 能力 — write_file 越界被拒。
+    // 相对主 root 的 `crates/core/x.rs` 归一化后不在子目录 scope 内 → 回填 is_error,
+    // 工具不执行、changed_files 不提取(文件实际未被修改)。
+    #[test]
+    fn process_tool_uses_execute_write_outside_workspace_rejected() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        std::fs::create_dir_all(tmp.path().join("crates/core")).expect("create core dir");
+        let scope = crate::file_ops::WorkspacePathScope::from_roots(vec![sub.clone()]);
+
+        let write_use = make_edit_tool_use("tu-w-out", "write_file", "crates/core/x.rs");
+        let mut executor = StaticToolExecutor::new()
+            .register("write_file", |_input| Ok("WRITTEN-MARKER".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &[write_use],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        // 越界是回填 is_error,不中止循环(result ok)
+        assert!(
+            result.is_ok(),
+            "scope violation should be tool_result, not abort"
+        );
+        assert!(
+            tools_used.is_empty(),
+            "write_file must not execute on escape"
+        );
+        assert!(
+            changed_files.is_empty(),
+            "no changed_files on rejected write"
+        );
+        let rendered = tool_results_text(&messages);
+        assert!(
+            rendered.contains("rejected"),
+            "expected rejection message, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("WRITTEN-MARKER"),
+            "write handler must not run on escape, got: {rendered}"
+        );
+    }
+
+    // Epic 1 T4(方案 A 4-1):workspace 绑定派发时,子代理 project_context.cwd 切到子目录,
+    // 指令文件从子目录向上收集(ProjectContext::discover);未绑定时保持主 root(向后兼容)。
+    #[test]
+    fn build_subagent_context_switches_cwd_to_workspace_override() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        // 子目录指令文件
+        std::fs::write(sub.join("CLAUDE.md"), "api crate instructions").expect("write CLAUDE.md");
+
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["# Environment context\nplaceholder".to_string()],
+            &RuntimeFeatureConfig::default(),
+        );
+        runtime.set_workspace_root(tmp.path().to_path_buf());
+
+        // 未绑定:保持主 root
+        let ctx = runtime.build_subagent_context(SubagentCapability::ReadOnly, None);
+        let pc = ctx.project_context.expect("project_context should be set");
+        assert_eq!(
+            pc.cwd,
+            tmp.path(),
+            "no override should keep workspace root cwd"
+        );
+
+        // 绑定:切到子目录 + 子目录指令文件收集
+        let ctx2 = runtime.build_subagent_context(SubagentCapability::ReadOnly, Some(&sub));
+        let pc2 = ctx2.project_context.expect("project_context should be set");
+        assert_eq!(
+            pc2.cwd, sub,
+            "workspace override should switch cwd to subdir"
+        );
+        assert!(
+            pc2.instruction_files
+                .iter()
+                .any(|f| f.path.ends_with("CLAUDE.md")),
+            "instruction files should be collected from subdir, got: {:?}",
+            pc2.instruction_files
+                .iter()
+                .map(|f| &f.path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Epic 1 T5(TOCTOU 缓解):派发时 resolve_subworkspace 校验通过,派发后、
+    // turn 开始前子目录被删除 → turn 开始处 revalidate 失败,子代理首轮直接
+    // 报错(明确报错路径,不执行任何工具)。
+    #[tokio::test]
+    async fn run_subagent_turn_after_workspace_removal_rejects() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        std::fs::write(sub.join("Cargo.toml"), "[package]").expect("write Cargo.toml");
+
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["# Environment context\nplaceholder".to_string()],
+            &RuntimeFeatureConfig::default(),
+        );
+        runtime.set_workspace_root(tmp.path().to_path_buf());
+
+        // 派发时校验通过(模拟 dispatch_subagent 内 resolve_subworkspace)
+        let ws = crate::subworkspace::resolve_subworkspace(tmp.path(), "crates/api")
+            .expect("dispatch-time resolve should succeed");
+        // TOCTOU 窗口:派发后、turn 开始前目录被删除
+        std::fs::remove_dir_all(&sub).expect("subdir removed between dispatch and turn");
+
+        let err = runtime
+            .run_subagent_turn_with_model(
+                "sub-t5",
+                "worker",
+                "do work [test-t5-uuid-41c2]",
+                Some(&ws),
+                None,
+                crate::multi_agent::TaskComplexity::Simple,
+                crate::multi_agent::SubagentCapability::ReadOnly,
+            )
+            .await
+            .expect_err("turn must fail when workspace vanished");
+        assert!(err.contains("no longer exists"), "got: {err}");
+    }
+
+    // Epic 1 T4(方案 A 4-2/4-3):绑定 workspace 后,LLM 传相对 workspace 的路径
+    // ("src/new.rs",cwd 视角切到子目录的自然写法)被双基准放行,且执行前改写为
+    // 主 root 相对("crates/api/src/new.rs"),落位与 Guard 3 判定一致。
+    #[test]
+    fn process_tool_uses_scope_relative_write_rewritten_to_root_relative() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        std::fs::create_dir_all(sub.join("src")).expect("create src");
+        let scope = crate::file_ops::WorkspacePathScope::from_roots(vec![sub.clone()]);
+
+        // 双基准判定验证:主 root 相对候选(root/src/new.rs)越界拒绝;
+        // scope 相对候选(sub/src/new.rs)在 scope 内放行(无 . / .. 的路径 normalize 前后等价)。
+        let c1 = tmp.path().join("src/new.rs");
+        let c2 = sub.join("src/new.rs");
+        assert!(
+            scope.validate_resolved(&c1).is_err(),
+            "c1 ({}) should be rejected by scope",
+            c1.display()
+        );
+        assert!(
+            scope.validate_resolved(&c2).is_ok(),
+            "c2 ({}) should be accepted by scope",
+            c2.display()
+        );
+
+        let write_use = make_edit_tool_use("tu-rel", "write_file", "src/new.rs");
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        let mut executor = StaticToolExecutor::new().register("write_file", move |input| {
+            cap.lock().unwrap().push(input.to_string());
+            Ok("written".to_string())
+        });
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &[write_use],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        assert!(result.is_ok(), "scope-relative write should be accepted");
+        assert_eq!(tools_used, vec!["write_file"], "write_file must execute");
+        // 执行器收到的 input 应为改写后的主 root 相对路径
+        let handler_input = captured
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            handler_input.contains("crates/api/src/new.rs"),
+            "handler should receive rewritten root-relative path, got: {handler_input}"
+        );
+        // 落位改写:changed_files 提取到主 root 相对(crates/api/src/new.rs),而非 root/src/
+        assert!(
+            changed_files
+                .iter()
+                .any(|c| c.contains("crates/api/src/new.rs")),
+            "changed_files should reflect rewritten root-relative path: {changed_files:?}"
+        );
+        assert!(
+            !changed_files
+                .iter()
+                .any(|c| c.ends_with("/src/new.rs") && !c.contains("crates/api")),
+            "must not write to wrong root location: {changed_files:?}"
+        );
+    }
+
+    // Epic 1 T4:scope 相对逃逸("../core/x.rs")双基准都归一化逃出 scope → 拒绝。
+    #[test]
+    fn process_tool_uses_scope_relative_escape_rejected() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        let scope = crate::file_ops::WorkspacePathScope::from_roots(vec![sub.clone()]);
+
+        let write_use = make_edit_tool_use("tu-rel-esc", "write_file", "../core/x.rs");
+        let mut executor = StaticToolExecutor::new()
+            .register("write_file", |_input| Ok("WRITTEN-MARKER".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &[write_use],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        // 越界是回填 is_error,不中止循环
+        assert!(
+            result.is_ok(),
+            "scope violation should be tool_result, not abort"
+        );
+        assert!(
+            tools_used.is_empty(),
+            "write_file must not execute on scope-relative escape"
+        );
+        let rendered = tool_results_text(&messages);
+        assert!(
+            rendered.contains("rejected"),
+            "expected rejection message, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("WRITTEN-MARKER"),
+            "write handler must not run on escape, got: {rendered}"
+        );
+    }
+
+    // Epic 1 T4:rewrite helper 单测 — scope 相对路径改写成主 root 相对。
+    #[test]
+    fn t4_rewrite_path_helper_rewrites_scope_relative() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let root = tmp.path();
+        let candidate = root.join("crates/api/src/new.rs");
+        let rewritten =
+            rewrite_path_to_workspace_relative(r#"{"file_path":"src/new.rs"}"#, &candidate, root);
+        assert!(
+            rewritten.is_some(),
+            "rewrite should succeed, got: {rewritten:?}"
+        );
+        let s = rewritten.unwrap();
+        assert!(
+            s.contains("crates/api/src/new.rs"),
+            "rewritten should be root-relative, got: {s}"
+        );
+        assert!(
+            !s.contains("src/new.rs\"") || s.contains("crates/api/src/new.rs"),
+            "original scope-relative path must be replaced: {s}"
+        );
+    }
+
+    // Epic 1 T2(父子并发写保护):主 agent(父会话)持锁时,子代理写同一文件被锁挡。
+    // 与 file_guard.rs 并发测试不同,这里验证 process_tool_uses 写路径在锁冲突时
+    // 回填 is_error 且工具不执行(父写权威,子代理等待/超时)。
+    #[test]
+    fn process_tool_uses_write_conflicts_with_parent_lock() {
+        // 缩短锁超时,避免测试等待默认 30s。
+        std::env::set_var("CLAW_SUBAGENT_FILE_LOCK_TIMEOUT", "1");
+        let body = (|| {
+            let tmp = tempfile::tempdir().expect("temp workspace");
+            let workspace = tmp.path().to_path_buf();
+            std::fs::create_dir_all(workspace.join("src")).expect("create src");
+            std::fs::write(workspace.join("src/shared.rs"), "// test").expect("write file");
+
+            // 主 agent(父会话)持有写锁
+            let parent_guard = crate::multi_agent::SubagentFileGuard::new(
+                crate::multi_agent::SubagentCapability::Execute,
+                workspace.clone(),
+            );
+            let parent_lock = parent_guard
+                .try_acquire(std::path::Path::new("src/shared.rs"), true)
+                .expect("parent acquires lock");
+
+            // 子代理尝试写同一文件 → 锁冲突:1s 超时后回填 is_error,工具不执行
+            let write_use = make_edit_tool_use("tu-conflict", "write_file", "src/shared.rs");
+            let mut executor =
+                StaticToolExecutor::new().register("write_file", |_input| Ok("WROTE".to_string()));
+            let mut messages = Vec::new();
+            let mut tools_used = Vec::new();
+            let mut changed_files = Vec::new();
+            let process_result = process_tool_uses(
+                crate::multi_agent::SubagentCapability::Execute,
+                &[write_use],
+                &mut executor,
+                &workspace,
+                &mut messages,
+                &mut tools_used,
+                &mut changed_files,
+                None,
+            );
+            assert!(
+                process_result.is_ok(),
+                "lock conflict should be tool_result, not abort"
+            );
+            // tools_used 记录"尝试调用"(push 在锁之前),但工具 handler 不得真正执行
+            assert!(
+                changed_files.is_empty(),
+                "no changed_files on lock conflict"
+            );
+            let rendered = tool_results_text(&messages);
+            assert!(
+                rendered.contains("file lock timeout"),
+                "expected file lock timeout, got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("WROTE"),
+                "write handler must not run on lock conflict, got: {rendered}"
+            );
+            drop(parent_lock);
+            Ok::<(), String>(())
+        })();
+        std::env::remove_var("CLAW_SUBAGENT_FILE_LOCK_TIMEOUT");
+        body.expect("test body should succeed");
+    }
+
+    // 审查修复(方案 A):Guard 3 canonicalize 二次校验必须拦截 symlink 逃逸。
+    // 子目录内的 symlink 指向外部文件时,lexical 校验放行,但 canonicalize 解析
+    // 出真实路径后应被 scope 拒绝。平台不支持创建 symlink(如 Windows 未开开发者
+    // 模式/无权限)时跳过本测试。
+    #[test]
+    fn process_tool_uses_scope_rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let sub = tmp.path().join("crates/api");
+        let external = tmp.path().join("outside-secret.txt");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        std::fs::write(&external, "top secret").expect("write external file");
+
+        let link = sub.join("leak.txt");
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(&external, &link);
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_file(&external, &link);
+        if created.is_err() {
+            // 平台无法创建 symlink(权限/开发者模式)→ 本场景不可构造,跳过。
+            return;
+        }
+
+        let scope = crate::file_ops::WorkspacePathScope::from_roots(vec![sub.clone()]);
+        let escape = ContentBlock::ToolUse {
+            id: "tu-symlink".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({ "file_path": link.to_string_lossy() }).to_string(),
+        };
+        let mut executor = StaticToolExecutor::new()
+            .register("read_file", |_input| Ok("should not reach".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::ReadOnly,
+            &[escape],
+            &mut executor,
+            tmp.path(),
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            Some(&scope),
+        );
+        assert!(
+            result.is_ok(),
+            "scope violation should be tool_result, not abort"
+        );
+        assert!(
+            tools_used.is_empty(),
+            "tool must not execute on symlink escape"
+        );
+        let err_msg = error_tool_result_text(&messages);
+        assert!(
+            err_msg.contains("rejected"),
+            "expected rejection message, got: {err_msg}"
+        );
+    }
+
+    /// 提取 messages 中第一条 is_error 的 ToolResult 文本(Guard 3 断言辅助)。
+    fn error_tool_result_text(messages: &[ConversationMessage]) -> String {
+        messages
+            .iter()
+            .filter_map(|msg| {
+                msg.blocks.iter().find_map(|b| match b {
+                    ContentBlock::ToolResult {
+                        output,
+                        is_error: true,
+                        ..
+                    } => Some(output.clone()),
+                    _ => None,
+                })
+            })
+            .next()
+            .unwrap_or_else(|| "<no error tool_result>".to_string())
+    }
+
+    /// 拼接所有 ToolResult 的 output(无论 is_error)。用于验证 handler 是否真正执行
+    /// (handler 返回的标记应出现在 output 中)或检查拒绝消息。
+    fn tool_results_text(messages: &[ConversationMessage]) -> String {
+        messages
+            .iter()
+            .flat_map(|msg| {
+                msg.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// 可控的 mock ValidationGate -- 通过 AtomicUsize 控制第 N 次返回 Ok/Err。
@@ -9806,7 +12767,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let results = runtime.spawn_parallel_via_dag(vec![]);
         assert!(results.is_empty(), "empty tasks should return empty vec");
@@ -9825,7 +12792,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         // 两个 task 都应被能力校验拒绝:flash+Diagnostic / flash+Architectural
         let tasks = vec![
@@ -9874,7 +12847,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let tasks = vec![
             crate::multi_agent::SpawnRequest::new(
@@ -9913,6 +12892,167 @@ mod tests {
                 }
                 Err(e) => panic!("task {i} should succeed, got err: {e}"),
             }
+        }
+    }
+
+    /// Epic 1 T6:路径 B 接入目录隔离 — with_dag_coordinator 绑定 workspace_override,
+    /// 并行子代理越界读被 Guard 3 拒绝(工具不执行),handoff 落盘到子目录而非主 root。
+    #[test]
+    fn spawn_parallel_via_dag_workspace_scoped_rejects_escape() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let sub = tempdir.path().join("crates/api");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        std::fs::write(sub.join("Cargo.toml"), "[package]").expect("write Cargo.toml");
+
+        // 兄弟目录文件:canonicalize 通过但仍越出 scope(路径 B Guard 3 应拒绝)
+        std::fs::create_dir_all(tempdir.path().join("crates/core")).expect("create sibling");
+        std::fs::write(
+            tempdir.path().join("crates/core/other.txt"),
+            "sibling secret",
+        )
+        .expect("write sibling file");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolUseOnceApi {
+                tool_name: "read_file".to_string(),
+                tool_input: r#"{"file_path":"crates/core/other.txt"}"#.to_string(),
+                call_count: 0,
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(
+            coordinator,
+            ToolUseOnceApi {
+                tool_name: "read_file".to_string(),
+                tool_input: r#"{"file_path":"crates/core/other.txt"}"#.to_string(),
+                call_count: 0,
+            },
+            tempdir.path().to_path_buf(),
+            Some(Box::new(
+                StaticToolExecutor::new()
+                    .register("read_file", |_| Ok("UNEXPECTED-READ".to_string())),
+            )),
+            Some(sub.clone()),
+        );
+
+        let tasks = vec![crate::multi_agent::SpawnRequest::new(
+            "scoped-a",
+            "read sibling file",
+            crate::multi_agent::CoordinationMode::Fork,
+            "deepseek-v4-flash",
+            crate::multi_agent::TaskComplexity::Simple,
+        )];
+        let results = runtime.spawn_parallel_via_dag(tasks);
+        assert_eq!(results.len(), 1);
+        // 路径 B 绑定 workspace 后治理生效:工具请求被 guard 拒绝(dispatcher 默认
+        // Analyze,read_file 先被 Guard 2 白名单拦;Guard 3/2.5 精确越界拒绝见
+        // subagent_dispatcher 单元测试,那里以 ReadOnly/Execute 触发)。
+        let err = results[0]
+            .as_ref()
+            .expect_err("tool request must be rejected");
+        assert!(err.contains("guard violation"), "got: {err}");
+        assert!(err.contains("not allowed"), "got: {err}");
+
+        // Failed handoff 落盘到子目录(恰好一个文件),主 root 下无 handoff
+        let scoped_dir = sub.join(".claw/subagents");
+        let files: Vec<_> = std::fs::read_dir(&scoped_dir)
+            .expect("scoped handoff dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read dir");
+        assert_eq!(files.len(), 1, "one handoff under scoped workspace");
+        let content = std::fs::read_to_string(files[0].path()).expect("read scoped handoff");
+        assert!(
+            content.contains("status: failed"),
+            "guard-rejected dispatch should leave a failed handoff, got: {content}"
+        );
+        assert!(
+            !tempdir.path().join(".claw/subagents").exists(),
+            "no handoff dir under main root when scoped"
+        );
+    }
+
+    /// Epic 1 T8:并行子代理经统一执行入口(execute_subagent_llm)注册为 bus peer —
+    /// `/bus list` 可见(kind=Subagent)且终态 Done(编排层不再手动注册)。
+    #[test]
+    fn spawn_parallel_via_dag_registers_bus_peers() {
+        let _guard = acquire_lane_event_lock();
+        let _ = crate::lane_events::drain_lane_events();
+
+        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
+
+        let tasks = vec![
+            crate::multi_agent::SpawnRequest::new(
+                "bus-a",
+                "task bus A",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+            crate::multi_agent::SpawnRequest::new(
+                "bus-b",
+                "task bus B",
+                crate::multi_agent::CoordinationMode::Fork,
+                "deepseek-v4-flash",
+                crate::multi_agent::TaskComplexity::Simple,
+            ),
+        ];
+        let results = runtime.spawn_parallel_via_dag(tasks);
+        assert_eq!(results.len(), 2);
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "task {i} should succeed, got: {r:?}");
+        }
+
+        // 从结果路径提取 coordinator 生成的 subagent_id(".claw/subagents/{id}.md")
+        let ids: Vec<String> = results
+            .iter()
+            .map(|r| {
+                let path = r.as_ref().expect("ok");
+                path.rsplit('/')
+                    .next()
+                    .unwrap_or(path)
+                    .trim_end_matches(".md")
+                    .to_string()
+            })
+            .collect();
+
+        // 并行子代理已注册为 bus peer 且终态 Done
+        let bus = crate::session_bus::global();
+        for id in &ids {
+            let peer = bus
+                .peers_snapshot()
+                .into_iter()
+                .find(|p| p.session_id == *id)
+                .unwrap_or_else(|| panic!("subagent {id} should be registered on the bus"));
+            assert_eq!(peer.kind, crate::session_bus::PeerKind::Subagent);
+            assert_eq!(
+                peer.status,
+                crate::session_bus::PeerStatus::Done,
+                "subagent {id} should reach Done, got {:?}",
+                peer.status
+            );
         }
     }
 
@@ -9963,7 +13103,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let results = runtime
             .spawn_parallel_via_dag_async(vec![], FailFast::On)
@@ -9984,7 +13130,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let tasks = vec![crate::multi_agent::SpawnRequest::new(
             "diag-agent",
@@ -10021,7 +13173,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let tasks = vec![
             crate::multi_agent::SpawnRequest::new(
@@ -10075,7 +13233,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let tasks = vec![crate::multi_agent::SpawnRequest::new(
             "agent-x",
@@ -10108,7 +13272,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         // library 层默认 false,应返回 Ok(None)
         let result = runtime
@@ -10132,7 +13302,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         // "hello" 是 Simple 任务,不应触发拆解
         let result = runtime
@@ -10155,7 +13331,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let err = runtime
             .execute_spawn_parallel_subagents("not json")
@@ -10175,7 +13357,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let err = runtime
             .execute_spawn_parallel_subagents(r#"{"fail_fast":"on"}"#)
@@ -10195,7 +13383,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let err = runtime
             .execute_spawn_parallel_subagents(r#"{"tasks":[]}"#)
@@ -10215,7 +13409,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let input = r#"{"tasks":[{"name":"a","task":"b","model":"deepseek-v4-flash"}],"fail_fast":"bogus"}"#;
         let err = runtime
@@ -10236,7 +13436,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let input = r#"{"tasks":[{"name":"a","task":"b"}]}"#;
         let err = runtime
@@ -10260,7 +13466,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let input = r#"{
             "tasks": [
@@ -10294,7 +13506,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let input = r#"{
             "tasks": [
@@ -10328,7 +13546,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let err = runtime
             .execute_spawn_parallel_subagents_async("not json")
@@ -10353,7 +13577,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let err = runtime
             .execute_spawn_parallel_subagents_async(r#"{"tasks":[]}"#)
@@ -10378,7 +13608,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_dag_coordinator(coordinator, NoopApi, tempdir.path().to_path_buf(), None);
+        .with_dag_coordinator(
+            coordinator,
+            NoopApi,
+            tempdir.path().to_path_buf(),
+            None,
+            None,
+        );
 
         let input = r#"{
             "tasks": [
@@ -10614,15 +13850,13 @@ mod tests {
     fn tool_result_callback_fires_for_builtin_tool_log_decision() {
         struct LogDecisionApi;
         impl ApiClient for LogDecisionApi {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 // 第一次调用:模型请求执行 log_decision 内置工具。
-                let has_tool_result = request
-                    .messages
-                    .iter()
-                    .any(|m| m.blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. })));
+                let has_tool_result = request.messages.iter().any(|m| {
+                    m.blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                });
                 if !has_tool_result {
                     return Ok(vec![
                         AssistantEvent::ToolUse {
@@ -10642,8 +13876,7 @@ mod tests {
             }
         }
 
-        let captured: ToolResultCalls =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured: ToolResultCalls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_for_cb = Arc::clone(&captured);
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -10653,10 +13886,12 @@ mod tests {
             vec!["system".to_string()],
         )
         .with_tool_result_callback(Box::new(move |id, name, output, is_error| {
-            captured_for_cb
-                .lock()
-                .unwrap()
-                .push((id.to_string(), name.to_string(), output.to_string(), is_error));
+            captured_for_cb.lock().unwrap().push((
+                id.to_string(),
+                name.to_string(),
+                output.to_string(),
+                is_error,
+            ));
         }));
 
         let summary = runtime
@@ -10684,8 +13919,7 @@ mod tests {
             }
         }
 
-        let captured: ToolResultCalls =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured: ToolResultCalls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_for_cb = Arc::clone(&captured);
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -10695,10 +13929,12 @@ mod tests {
             vec!["system".to_string()],
         )
         .with_tool_result_callback(Box::new(move |id, name, output, is_error| {
-            captured_for_cb
-                .lock()
-                .unwrap()
-                .push((id.to_string(), name.to_string(), output.to_string(), is_error));
+            captured_for_cb.lock().unwrap().push((
+                id.to_string(),
+                name.to_string(),
+                output.to_string(),
+                is_error,
+            ));
         }));
 
         runtime
@@ -10716,8 +13952,7 @@ mod tests {
     /// 它们由 executor 内部 emit ToolResult 事件,重复会双份渲染。
     #[test]
     fn tool_result_callback_not_fired_for_external_tool() {
-        let captured: ToolResultCalls =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured: ToolResultCalls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_for_cb = Arc::clone(&captured);
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -10733,10 +13968,12 @@ mod tests {
             vec!["system".to_string()],
         )
         .with_tool_result_callback(Box::new(move |id, name, output, is_error| {
-            captured_for_cb
-                .lock()
-                .unwrap()
-                .push((id.to_string(), name.to_string(), output.to_string(), is_error));
+            captured_for_cb.lock().unwrap().push((
+                id.to_string(),
+                name.to_string(),
+                output.to_string(),
+                is_error,
+            ));
         }));
 
         runtime
@@ -10745,5 +13982,176 @@ mod tests {
 
         let calls = captured.lock().unwrap();
         assert!(calls.is_empty(), "外部工具不应触发 callback: {calls:?}");
+    }
+
+    // ---- Epic 4 延续:AI 自主调用 Session Bus 工具 (bus_list / bus_send / bus_watch) ----
+
+    /// Session Bus 全局实例是进程级单例:使用 bus 的测试必须串行执行,
+    /// 否则并行测试会互相干扰(注册/清理 peer、unread 计数)。
+    fn bus_tool_lock() -> std::sync::MutexGuard<'static, ()> {
+        static BUS_TOOL_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        BUS_TOOL_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 构造带 session_id 的 runtime（主会话已注册为 Main peer 的场景）。
+    fn bus_tool_runtime(session_id: &str) -> ConversationRuntime<NoopApi, StaticToolExecutor> {
+        let mut session = Session::new();
+        session.session_id = session_id.to_string();
+        ConversationRuntime::new(
+            session,
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+    }
+
+    /// 注册一个测试用 bus peer（幂等覆盖）。
+    fn bus_register_test_peer(
+        bus: &crate::session_bus::SessionBus,
+        id: &str,
+        kind: crate::session_bus::PeerKind,
+        status: crate::session_bus::PeerStatus,
+    ) {
+        let _ = bus.register(crate::session_bus::BusPeer {
+            session_id: id.to_string(),
+            label: format!("test:{id}"),
+            kind,
+            status,
+            unread: 0,
+            last_seen_ms: crate::session_bus::now_ms(),
+            config_path: None,
+        });
+    }
+
+    #[test]
+    fn bus_list_returns_peers() {
+        let _guard = bus_tool_lock();
+        let bus = crate::session_bus::global();
+        // 用唯一 id,避免与并行测试冲突
+        let main_id = format!("main-buslist-{}", std::process::id());
+        let sub_id = format!("sub-buslist-{}", std::process::id());
+        bus_register_test_peer(
+            bus,
+            &main_id,
+            crate::session_bus::PeerKind::Main,
+            crate::session_bus::PeerStatus::Streaming,
+        );
+        bus_register_test_peer(
+            bus,
+            &sub_id,
+            crate::session_bus::PeerKind::Subagent,
+            crate::session_bus::PeerStatus::Done,
+        );
+
+        let runtime = bus_tool_runtime(&main_id);
+        let out = runtime.execute_bus_list().expect("bus_list");
+        assert!(out.contains(&main_id), "must list main: {out}");
+        assert!(out.contains(&sub_id), "must list subagent: {out}");
+        assert!(out.contains("streaming"), "must show status");
+        assert!(out.contains("unread 0"), "must show unread count");
+
+        // 清理
+        bus.leave(&main_id);
+        bus.leave(&sub_id);
+    }
+
+    #[test]
+    fn bus_send_to_subagent_uses_steer_command() {
+        let _guard = bus_tool_lock();
+        let bus = crate::session_bus::global();
+        let main_id = format!("main-send-{}", std::process::id());
+        let sub_id = format!("sub-send-{}", std::process::id());
+        bus_register_test_peer(
+            bus,
+            &main_id,
+            crate::session_bus::PeerKind::Main,
+            crate::session_bus::PeerStatus::Idle,
+        );
+        bus_register_test_peer(
+            bus,
+            &sub_id,
+            crate::session_bus::PeerKind::Subagent,
+            crate::session_bus::PeerStatus::Streaming,
+        );
+
+        let runtime = bus_tool_runtime(&main_id);
+        let out = runtime
+            .execute_bus_send(&format!(
+                r#"{{"to": "{sub_id}", "text": "focus on tests"}}"#
+            ))
+            .expect("bus_send");
+        assert!(out.contains("delivered to 1"), "steer delivered: {out}");
+
+        // 目标 subagent 收到 Command(steer) 消息
+        let unread = bus.unread_messages(&sub_id);
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].kind, crate::session_bus::BusMessageKind::Command);
+        assert_eq!(
+            unread[0].payload.get("action").and_then(|v| v.as_str()),
+            Some("steer")
+        );
+
+        bus.leave(&main_id);
+        bus.leave(&sub_id);
+    }
+
+    #[test]
+    fn bus_send_rejects_missing_fields() {
+        let _guard = bus_tool_lock();
+        let runtime = bus_tool_runtime("main-test");
+        assert!(runtime.execute_bus_send(r#"{"to": ""}"#).is_err());
+        assert!(runtime
+            .execute_bus_send(r#"{"to": "x", "text": ""}"#)
+            .is_err());
+        assert!(runtime
+            .execute_bus_send(r#"{"text": "no target"}"#)
+            .is_err());
+    }
+
+    #[test]
+    fn bus_watch_and_unwatch_roundtrip() {
+        let _guard = bus_tool_lock();
+        let bus = crate::session_bus::global();
+        let main_id = format!("main-watch-{}", std::process::id());
+        let sub_id = format!("sub-watch-{}", std::process::id());
+        bus_register_test_peer(
+            bus,
+            &main_id,
+            crate::session_bus::PeerKind::Main,
+            crate::session_bus::PeerStatus::Idle,
+        );
+        bus_register_test_peer(
+            bus,
+            &sub_id,
+            crate::session_bus::PeerKind::Subagent,
+            crate::session_bus::PeerStatus::Idle,
+        );
+
+        let runtime = bus_tool_runtime(&main_id);
+        let out = runtime
+            .execute_bus_watch(&format!(r#"{{"target": "{sub_id}"}}"#))
+            .expect("watch");
+        assert!(out.contains("watching"), "watch output: {out}");
+        assert_eq!(bus.watched_peers(&main_id), vec![sub_id.clone()]);
+
+        // 观察自身被拒
+        assert!(runtime
+            .execute_bus_watch(&format!(r#"{{"target": "{main_id}"}}"#))
+            .is_err());
+
+        // unwatch 幂等
+        let out = runtime
+            .execute_bus_watch(&format!(r#"{{"target": "{sub_id}", "unwatch": true}}"#))
+            .expect("unwatch");
+        assert!(out.contains("unwatched"), "unwatch output: {out}");
+        assert!(bus.watched_peers(&main_id).is_empty());
+
+        bus.leave(&main_id);
+        bus.leave(&sub_id);
     }
 }

@@ -25,15 +25,70 @@ const MAX_ARRAY_KEEP: usize = 3;
 ///
 /// 被 `compact.rs::format_tool_result_summary` 调用,替代原来的
 /// "前 3 行 + 240 chars"单一逻辑。
+///
+/// `input` 是产生该输出的 tool_use 入参(JSON 字符串)。摘要会带上入参提示
+/// (如 `[grep_search("分型|脱离") Text summarized: ...]`),让模型在被压缩后
+/// 仍能看出"当时查了什么/做了什么"——否则模型连搜索词都看不到,只能重新
+/// 调用工具查询(实测会话中 AI 反复重读同一批文件即源于此)。
 #[must_use]
-pub fn format_summary(tool_name: &str, tool_use_id: &str, output: &str) -> String {
+pub fn format_summary(tool_name: &str, tool_use_id: &str, input: &str, output: &str) -> String {
     let content_type = classify(output);
-    match content_type {
+    let summary = match content_type {
         ContentType::Json => format_json_summary(tool_name, tool_use_id, output),
         ContentType::Code(lang) => format_code_summary(tool_name, tool_use_id, output, lang),
         ContentType::Log => format_log_summary(tool_name, tool_use_id, output),
         ContentType::Tabular => format_tabular_summary(tool_name, tool_use_id, output),
         ContentType::Text => format_text_summary(tool_name, tool_use_id, output),
+    };
+    let hint = extract_input_hint(input);
+    if hint.is_empty() {
+        summary
+    } else {
+        // 在 `[tool_name ` 之后插入 `(input_hint) `,子压缩器输出格式保持不变。
+        summary.replacen(
+            &format!("[{tool_name} "),
+            &format!("[{tool_name}({hint}) "),
+            1,
+        )
+    }
+}
+
+/// 从 tool_use 入参 JSON 中提取可读提示(截断到 48 字符)。
+///
+/// 优先取常见命令/查询字段的值(pattern/command/query/path/glob),
+/// 否则整体截断 JSON 原文。解析失败或为空时返回空串(不附加提示)。
+fn extract_input_hint(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+    let hint = if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(input) {
+        [
+            "file_path",
+            "pattern",
+            "command",
+            "query",
+            "glob",
+            "path",
+            "content",
+            "file",
+            "name",
+        ]
+        .iter()
+        .find_map(|k| map.get(*k).and_then(|v| v.as_str()).map(str::to_owned))
+        .unwrap_or_default()
+    } else {
+        input.to_string()
+    };
+    let hint = hint.trim();
+    if hint.is_empty() {
+        return String::new();
+    }
+    let hint: String = hint.chars().take(48).collect();
+    if hint.chars().count() >= 48 {
+        format!("{hint}…")
+    } else {
+        hint
     }
 }
 
@@ -840,7 +895,7 @@ mod tests {
     #[test]
     fn log_summary_routes_from_format_summary() {
         let input = "   Compiling proc-macro2 v1.0.81\n   Compiling libc v0.2.153\n    Finished dev [unoptimized] target(s)\n     Running `target/debug/test`\nerror[E0308]: mismatched types\n";
-        let result = format_summary("Bash", "call_log6", input);
+        let result = format_summary("Bash", "call_log6", "", input);
         assert!(
             result.contains("Log summarized"),
             "构建日志应路由到 Log 压缩器"
@@ -852,21 +907,21 @@ mod tests {
     #[test]
     fn format_summary_routes_json() {
         let input = r#"{"key":"value"}"#;
-        let result = format_summary("Bash", "call_d", input);
+        let result = format_summary("Bash", "call_d", "", input);
         assert!(result.contains("JSON summarized"));
     }
 
     #[test]
     fn format_summary_routes_code() {
         let input = "fn foo() {}\n";
-        let result = format_summary("Read", "call_e", input);
+        let result = format_summary("Read", "call_e", "", input);
         assert!(result.contains("Code summarized"));
     }
 
     #[test]
     fn format_summary_routes_text() {
         let input = "just plain text\nsecond line\n";
-        let result = format_summary("Read", "call_f", input);
+        let result = format_summary("Read", "call_f", "", input);
         assert!(result.contains("Text summarized"));
     }
 }

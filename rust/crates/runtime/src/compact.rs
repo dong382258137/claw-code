@@ -7,7 +7,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
 const COMPACT_RECENT_MESSAGES_NOTE: &str = "Recent messages are preserved verbatim.";
-const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.";
+// 中性续接指令 v2:压缩 summary 描述的是"压缩时刻之前"的工作,可能含多个
+// 不同状态的任务。原指令 "Continue the conversation from where it left off"
+// 会把 agent 拉回压缩前的旧任务 —— 当用户随后切换新任务或旧任务已收尾时,
+// 该残留指令成为任务漂移源(实测:用户说"继续",AI 却去继续压缩前已完成
+// 的任务)。v2 增加 active/closed 任务区分引导:已收尾任务(PASS/已修复/已
+// 完成/已交付)即使摘要中描述再详细,也禁止续接。
+const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation. \
+The summary above describes earlier work and may describe tasks in different states; \
+treat it as a structured record and distinguish ACTIVE tasks from CLOSED tasks. \
+CLOSED tasks are finished — marked by indicators like PASS, 已修复/已收尾/已完成, \
+delivered, or explicitly summarized as done — and MUST NOT be resumed, even if the \
+most recent user message is \"continue\". If the most recent user message starts a new \
+task or is unrelated, focus on it instead of any summarized work; if the summary is \
+stale relative to the current request, ignore it. Resume directly — do not acknowledge \
+the summary, do not recap what was happening, and do not preface with continuation text.";
 
 const COMPACT_BOUNDARY_MARKER_PREFIX: &str = "<!-- compact_boundary: ";
 const COMPACT_BOUNDARY_MARKER_SUFFIX: &str = " -->";
@@ -88,7 +102,27 @@ fn build_llm_summarize_prompt(messages: &[ConversationMessage]) -> String {
          - Output plain bullet lines, one per point, each starting with \"- \".\n\
          - Do NOT wrap in <summary> tags, do NOT add a \"- Key timeline:\" header, do not include \
          per-message trivia. Keep it under 60 lines.\n\
-         - Preserve Chinese/English content verbatim where it matters (identifiers, file paths).",
+         - Preserve Chinese/English content verbatim where it matters (identifiers, file paths).\n\
+         \n\
+         After the bullets, ALWAYS append three machine-parseable sections (P1: task-state fieldization + \
+         failure-lessons fieldization, mirrors Claude Code's structured compaction):\n\
+         \n\
+         [active_task]\n\
+         goal: <the single current task objective; if no task is in progress, write NONE>\n\
+         next_action: <the immediate next step; if the task is finished, write NONE>\n\
+         \n\
+         [closed_tasks]\n\
+         - <finished tasks, one bullet each, with a completion marker such as PASS/FAIL/已修复/已完成; \
+         if none, write NONE>\n\
+         \n\
+         [lessons]\n\
+         - <operational lessons worth persisting, one bullet each: failed or inefficient tool operations \
+         (e.g. wrong path, wrong git invocation, permission errors), their cause and how to avoid them; \
+         this includes mistakes that were later recovered even if the overall turn succeeded. \
+         Each lesson must be self-contained and actionable for a future session; if none, write NONE>\n\
+         \n\
+         The sections above are consumed by a parser — keep the headers exactly as shown, one field per \
+         line, and put them AFTER the summary bullets.",
         transcript.join("\n")
     )
 }
@@ -542,9 +576,18 @@ fn is_already_summarized(output: &str) -> bool {
 /// - Tabular 压缩器:保留表头 + 前 3 行代表性行
 /// - Text 压缩器:原"前 3 行 + 240 chars"逻辑(兜底)
 #[must_use]
-fn format_tool_result_summary(tool_name: &str, tool_use_id: &str, output: &str) -> String {
-    crate::content_compression::format_summary(tool_name, tool_use_id, output)
+fn format_tool_result_summary(
+    tool_name: &str,
+    tool_use_id: &str,
+    input: &str,
+    output: &str,
+) -> String {
+    crate::content_compression::format_summary(tool_name, tool_use_id, input, output)
 }
+
+/// 输出字符数低于此阈值的 tool result 不值得摘要:体积小、不占上下文,
+/// 摘要反而丢失精确内容,导致模型重复查询。直接保留原文。
+const SMALL_OUTPUT_PRESERVE_CHARS: usize = 200;
 
 /// Summarize old tool results to free context before full compaction.
 ///
@@ -620,8 +663,63 @@ where
     // Older ones become candidates for summarization.
     let preserve_count = preserve_recent.min(tool_result_indices.len());
     let cutoff = tool_result_indices.len().saturating_sub(preserve_count);
-    let summarize_candidates: HashSet<usize> =
+    let mut summarize_candidates: HashSet<usize> =
         tool_result_indices[..cutoff].iter().copied().collect();
+
+    // 依赖感知保护(Self-GC arXiv:2607.00692):按时间序产生的候选摘要集
+    // 对"未来依赖"盲目 —— 被后续 assistant 文本引用过的工具结果(如 AI 的
+    // "引擎复现是 6 笔"引用之前的 bash 输出)一旦被压成摘要,模型只能重新
+    // 调用工具查询,造成重复劳动与 token 浪费。故从候选集中剔除两类:
+    // 1) 被后续 assistant 文本提及工具名的结果(正在被讨论/引用的活跃证据)
+    // 2) 输出本身很小(< SMALL_OUTPUT_PRESERVE_CHARS)的结果(摘要无收益)
+    let mut protected: HashSet<usize> = HashSet::new();
+    for &idx in &tool_result_indices[..cutoff] {
+        let message = &messages[idx];
+        let tool_names: Vec<String> = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.clone()),
+                _ => None,
+            })
+            .collect();
+        let referenced = messages[idx + 1..].iter().any(|later| {
+            if later.role != MessageRole::Assistant {
+                return false;
+            }
+            later.blocks.iter().any(|block| {
+                if let ContentBlock::Text { text } = block {
+                    tool_names.iter().any(|name| text.contains(name.as_str()))
+                } else {
+                    false
+                }
+            })
+        });
+        let tiny = message.blocks.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { output, .. }
+                    if output.chars().count() < SMALL_OUTPUT_PRESERVE_CHARS
+            )
+        });
+        if referenced || tiny {
+            protected.insert(idx);
+        }
+    }
+    for idx in &protected {
+        summarize_candidates.remove(idx);
+    }
+
+    // tool_use_id → input 映射:摘要时带上入参提示,让模型在被压缩后仍能
+    // 看出"当时查了什么/做了什么"(如 `[grep_search("分型|脱离") ...]`)。
+    let mut input_by_id: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for message in messages {
+        for block in &message.blocks {
+            if let ContentBlock::ToolUse { id, input, .. } = block {
+                input_by_id.insert(id.as_str(), input.as_str());
+            }
+        }
+    }
 
     messages
         .iter()
@@ -653,7 +751,8 @@ where
                 }
                 // P0:归档原始 output 到 ToolResultArchive,再替换为摘要。
                 archiver(tool_use_id, tool_name, output);
-                *output = format_tool_result_summary(tool_name, tool_use_id, output);
+                let input = input_by_id.get(tool_use_id.as_str()).copied().unwrap_or("");
+                *output = format_tool_result_summary(tool_name, tool_use_id, input, output);
             }
             new_message
         })
@@ -1950,9 +2049,11 @@ second para",
 
     #[test]
     fn microcompact_preserves_recent_tool_results() {
+        // 旧结果输出需超过 SMALL_OUTPUT_PRESERVE_CHARS,否则被小输出保护保留
+        let long_output = "line1: file header content\nline2: import statements block\nline3: function start signature\nline4: function body implementation detail\nline5: function end marker\nline6: additional padding line that extends the output well beyond two hundred characters to satisfy the small output preservation threshold used by microcompact\nline7: more padding\nline8: final padding to be safe";
         let messages = vec![
             ConversationMessage::user_text("q1"),
-            ConversationMessage::tool_result("1", "Read", "line1\nline2", false),
+            ConversationMessage::tool_result("1", "Read", long_output, false),
             ConversationMessage::user_text("q2"),
             ConversationMessage::tool_result("2", "Read", "recent1\nrecent2", false),
             ConversationMessage::user_text("q3"),
@@ -1983,14 +2084,11 @@ second para",
 
     #[test]
     fn microcompact_summarizes_old_read_results() {
+        // 旧结果输出需超过 SMALL_OUTPUT_PRESERVE_CHARS,否则被小输出保护保留
+        let long_output = "file contents line 1: package declaration and module imports\nfile contents line 2: struct definition with several fields spanning long names\nfile contents line 3: function signature with generic bounds and lifetimes that make this line long enough\nfile contents line 4: function body with detailed implementation comments\nfile contents line 5: closing brace and module end marker with trailing newline padding that extends beyond the two hundred character threshold used by microcompact's small output preservation";
         let messages = vec![
             ConversationMessage::user_text("q1"),
-            ConversationMessage::tool_result(
-                "1",
-                "Read",
-                "file contents line 1\nfile contents line 2\nline 3",
-                false,
-            ),
+            ConversationMessage::tool_result("1", "Read", long_output, false),
             ConversationMessage::user_text("q2"),
             ConversationMessage::tool_result("2", "Read", "recent", false),
             ConversationMessage::user_text("q3"),
@@ -2023,6 +2121,67 @@ second para",
         assert!(
             output.contains("file contents line 1"),
             "summary should include first line, got: {output}"
+        );
+    }
+
+    #[test]
+    fn microcompact_preserves_referenced_tool_results() {
+        // 依赖感知保护(Self-GC arXiv:2607.00692):旧 tool result 被后续 assistant
+        // 文本提及工具名时,即使超出保留窗口也不得摘要 —— 它是当前讨论引用的
+        // 活跃证据,压掉后模型只能重新调用工具查询(重复劳动 + token 浪费)。
+        let long_output = "line1: analysis result detail\nline2: engine reproduction shows 6 items in total\nline3: breakdown per category with long names and annotations that push this output well beyond two hundred characters of length so that the small output preservation rule does not kick in and mask the reference protection logic under test\nline4: more detail rows\nline5: trailing padding line";
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::tool_result("1", "Bash", long_output, false),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "根据 Bash 输出,引擎复现是 6 笔".to_string(),
+            }]),
+            ConversationMessage::user_text("q3"),
+            ConversationMessage::tool_result("2", "Read", "recent", false),
+        ];
+
+        // preserve_recent=1:只有最后一个 Read 在保留窗口内;旧的 Bash 本应被
+        // 摘要,但因被后续 assistant 文本引用而必须保留原文。
+        let result = microcompact(&messages, 1);
+        let ContentBlock::ToolResult { output, .. } = &result[1].blocks[0] else {
+            panic!("expected tool result");
+        };
+        assert!(
+            output.contains("engine reproduction shows 6 items"),
+            "referenced tool result must keep full output, got: {output}"
+        );
+        // 窗口内结果照常保留(对照)。
+        let ContentBlock::ToolResult { output, .. } = &result[5].blocks[0] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(output, "recent");
+    }
+
+    #[test]
+    fn microcompact_summary_keeps_input_hint() {
+        // 摘要带 input 提示:被压缩后模型仍能看出"当时查了什么/做了什么",
+        // 避免因看不到搜索词/文件路径而重新调用工具查询。
+        let long_output = "line1: file header\nline2: module imports and package declarations that are quite verbose and push this output far beyond two hundred characters in order to avoid the small output preservation branch and exercise the input hint path in the summarizer\nline3: struct definitions\nline4: function implementations with comments\nline5: trailing content to guarantee sufficient length";
+        let messages = vec![
+            ConversationMessage::user_text("q1"),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "1".to_string(),
+                name: "Read".to_string(),
+                input: r#"{"file_path": "src/main.rs"}"#.to_string(),
+            }]),
+            ConversationMessage::tool_result("1", "Read", long_output, false),
+            ConversationMessage::user_text("q2"),
+            ConversationMessage::tool_result("2", "Read", "recent", false),
+        ];
+
+        let result = microcompact(&messages, 1);
+        let ContentBlock::ToolResult { output, .. } = &result[2].blocks[0] else {
+            panic!("expected tool result");
+        };
+        assert!(
+            output.contains("[Read(src/main.rs)"),
+            "summary should carry input hint, got: {output}"
         );
     }
 
@@ -2239,7 +2398,7 @@ second para",
     #[test]
     fn format_tool_result_summary_preserves_multiple_lines() {
         let multi_line_output = "line1: file header\nline2: import statement\nline3: function start\nline4: function body\nline5: function end";
-        let summary = format_tool_result_summary("Read", "call_test1", multi_line_output);
+        let summary = format_tool_result_summary("Read", "call_test1", "", multi_line_output);
 
         // 应包含前 3 行(不是只第一行)
         assert!(
@@ -2279,8 +2438,12 @@ second para",
     /// P1:验证 is_already_summarized 对新格式仍然有效(避免重复摘要)。
     #[test]
     fn is_already_summarized_recognizes_new_multi_line_format() {
-        let new_format =
-            format_tool_result_summary("Read", "call_test2", "line1\nline2\nline3\nline4\nline5");
+        let new_format = format_tool_result_summary(
+            "Read",
+            "call_test2",
+            "",
+            "line1\nline2\nline3\nline4\nline5",
+        );
         assert!(
             is_already_summarized(&new_format),
             "P1: is_already_summarized should recognize new multi-line format: {new_format}"
@@ -2311,7 +2474,7 @@ second para",
     #[test]
     fn format_tool_result_summary_omits_line_count_for_short_output() {
         let short_output = "only one line here";
-        let summary = format_tool_result_summary("Read", "call_test3", short_output);
+        let summary = format_tool_result_summary("Read", "call_test3", "", short_output);
         assert!(
             summary.contains("only one line here"),
             "summary should contain the single line: {summary}"
