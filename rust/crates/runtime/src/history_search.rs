@@ -495,6 +495,39 @@ fn detokenize_content(text: &str) -> String {
     out
 }
 
+/// RRF 融合两个按相关性排序的候选列表。
+///
+/// 同一逻辑消息(键 = session_id + message_index + role)出现在两列时
+/// 获得双重贡献,排名显著提前 —— 词法与语义双信号一致的可信度加成。
+/// 返回列表按融合分数降序,`rank` 字段写入融合分数(越高越相关)。
+fn rrf_merge(lexical: Vec<HistoryHit>, dense: Vec<HistoryHit>, top_k: usize) -> Vec<HistoryHit> {
+    let mut acc: std::collections::HashMap<(String, usize, String), (f64, HistoryHit)> =
+        std::collections::HashMap::new();
+    for (rank, hit) in lexical.into_iter().enumerate() {
+        let key = (hit.session_id.clone(), hit.message_index, hit.role.clone());
+        let entry = acc.entry(key).or_insert((0.0, hit));
+        entry.0 += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    for (rank, hit) in dense.into_iter().enumerate() {
+        let key = (hit.session_id.clone(), hit.message_index, hit.role.clone());
+        let entry = acc.entry(key).or_insert((0.0, hit));
+        entry.0 += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    let mut merged: Vec<(f64, HistoryHit)> = acc.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(top_k);
+    merged
+        .into_iter()
+        .map(|(score, mut hit)| {
+            hit.rank = score;
+            hit
+        })
+        .collect()
+}
+
 /// f32 向量 → little-endian 字节(SQLite BLOB 存储)。
 fn f32_vec_to_le_bytes(vec: &[f32]) -> Vec<u8> {
     vec.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -698,7 +731,7 @@ impl From<rusqlite::Error> for HistoryIndexError {
 
 #[cfg(test)]
 mod tests {
-    use super::{detokenize_content, HistoryIndex, MAX_EMBED_CHARS};
+    use super::{detokenize_content, HistoryHit, HistoryIndex, MAX_EMBED_CHARS, rrf_merge};
     use crate::memory_semantic::EmbeddingProvider;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
@@ -1272,6 +1305,34 @@ mod tests {
             (hits[0].rank - 1.0).abs() < 1e-5,
             "identical text should have cosine ~1.0, got {}",
             hits[0].rank
+        );
+    }
+
+    #[test]
+    fn rrf_merge_ranks_dual_hits_above_single_list_hits() {
+        fn hit(session_id: &str, message_index: usize, role: &str) -> HistoryHit {
+            HistoryHit {
+                content: format!("{session_id}#{message_index}"),
+                session_id: session_id.to_string(),
+                role: role.to_string(),
+                message_index,
+                timestamp_ms: 0,
+                rank: 0.0,
+            }
+        }
+        let lexical = vec![hit("s", 0, "user"), hit("s", 1, "user"), hit("s", 2, "user")];
+        let dense = vec![hit("s", 1, "user"), hit("s", 2, "user"), hit("s", 3, "user")];
+        let merged = rrf_merge(lexical, dense, 5);
+        assert_eq!(merged.len(), 4, "union of {{0,1,2}} and {{1,2,3}} = 4 distinct");
+        // 双列命中(1,2)分数更高,排在最前
+        assert_eq!(merged[0].message_index, 1);
+        assert_eq!(merged[1].message_index, 2);
+        // 单列命中(0,3)排后
+        assert!(
+            merged[0].rank > merged[3].rank,
+            "dual-list hit must outrank single-list hit: {} vs {}",
+            merged[0].rank,
+            merged[3].rank
         );
     }
 }
