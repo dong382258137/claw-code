@@ -121,12 +121,25 @@ impl HistoryIndex {
         message_index: usize,
         timestamp_ms: u64,
     ) -> Result<(), HistoryIndexError> {
-        let vector: Option<Vec<u8>> = self.embedder.provider().and_then(|embedder| {
-            if content.chars().count() > MAX_EMBED_CHARS {
-                return None;
+        // Phase 3:novelty 门控 —— 决定是否嵌入(词法索引不受影响)。
+        // 粗过滤(长度)+ 细过滤(gzip novelty)。仅 embedder 存在时启用。
+        let mut should_embed = content.chars().count() <= MAX_EMBED_CHARS;
+        if should_embed {
+            if let Some(_embedder) = self.embedder.provider() {
+                let memory = self.neighborhood_context(content, NOVELTY_NEIGHBOR_K);
+                if !memory.is_empty() {
+                    should_embed = gzip_novelty(&memory, content) >= NOVELTY_THRESHOLD;
+                }
             }
-            embedder.embed(content).ok().map(|v| f32_vec_to_le_bytes(&v))
-        });
+        }
+        // 向量在锁外计算,避免阻塞其他索引/检索操作;嵌入失败静默跳过(词法兜底)。
+        let vector: Option<Vec<u8>> = if should_embed {
+            self.embedder.provider().and_then(|embedder| {
+                embedder.embed(content).ok().map(|v| f32_vec_to_le_bytes(&v))
+            })
+        } else {
+            None
+        };
         let conn = self.conn.lock().expect("history index mutex poisoned");
         conn.execute(
             "INSERT INTO history (content, content_raw, session_id, role, message_index, timestamp_ms) \
@@ -148,6 +161,26 @@ impl HistoryIndex {
             )?;
         }
         Ok(())
+    }
+
+    /// stored neighborhood:用 FTS5 检索当前消息文本,取前 `k` 条已存消息的
+    /// 原始文本拼接为 gzip novelty 的 memory 上下文 M(插入前检索,不包含自身)。
+    /// 拼接总长受 [`NOVELTY_CTX_MAX_CHARS`] 限制,控制 gzip 计算成本。
+    ///
+    /// 检索失败**静默降级为空串**(调用方视为"应嵌入"):gate 只是成本优化,
+    /// 检索错误(如边缘输入的 FTS5 语法异常)绝不能传播为 `index_message` 的
+    /// Err 而阻断词法写入 —— 词法 verbatim 保留不受 gate 影响。
+    fn neighborhood_context(&self, content: &str, k: usize) -> String {
+        let hits = self.search(content, k).unwrap_or_default(); // 失败 → 空 → 应嵌入
+        let mut memory = String::new();
+        for hit in hits {
+            if memory.len() + hit.content.len() > NOVELTY_CTX_MAX_CHARS {
+                break;
+            }
+            memory.push_str(&hit.content);
+            memory.push('\n');
+        }
+        memory
     }
 
     /// Search history with FTS5 full-text search.
@@ -1760,5 +1793,110 @@ mod tests {
             n >= 0.0 && n < 0.8,
             "partial overlap should land in (0, 0.8): {n}"
         );
+    }
+
+    #[test]
+    fn index_message_skips_embedding_for_redundant_content() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider);
+        // 第一条:唯一内容 → 嵌入
+        index
+            .index_message("unique rust toolchain setup content", "s1", "user", 0, 1_000)
+            .expect("index first");
+        // 第二条:与第一条完全相同 → novelty≈0 → 跳过嵌入
+        index
+            .index_message("unique rust toolchain setup content", "s1", "user", 1, 2_000)
+            .expect("index duplicate");
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(
+            count, 1,
+            "redundant message should not create a second vector"
+        );
+    }
+
+    #[test]
+    fn index_message_embeds_novel_content() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider);
+        index
+            .index_message("first topic about rust toolchain", "s1", "user", 0, 1_000)
+            .expect("index first");
+        // 内容迥异 → novelty 高 → 嵌入
+        index
+            .index_message("completely different weather forecast discussion", "s1", "user", 1, 2_000)
+            .expect("index novel");
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(count, 2, "novel messages should both be embedded");
+    }
+
+    #[test]
+    fn index_message_without_embedder_skips_gate() {
+        // 无 embedder:gate 不启用,也不嵌入(与 Phase 1 行为一致)。
+        let (_file, index) = open_temp_index();
+        index
+            .index_message("any content", "s1", "user", 0, 1_000)
+            .expect("index msg");
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn index_message_skips_embedding_for_redundant_chinese_content() {
+        // CJK 回归:中文重复消息(单字拆词,neighborhood 命中自身)→ novelty≈0 → 不重复嵌入。
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider);
+        index
+            .index_message("用户偏好深色模式用于代码评审", "s1", "user", 0, 1_000)
+            .expect("index chinese first");
+        index
+            .index_message("用户偏好深色模式用于代码评审", "s1", "user", 1, 2_000)
+            .expect("index chinese duplicate");
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(
+            count, 1,
+            "redundant chinese message should not create a second vector"
+        );
+    }
+
+    #[test]
+    fn index_message_embeds_novel_chinese_content() {
+        // CJK 回归:中文迥异内容(neighborhood 无相关命中或 novelty 高)→ 应嵌入。
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider);
+        index
+            .index_message("配置飞书机器人 Webhook 事件订阅", "s1", "user", 0, 1_000)
+            .expect("index chinese first");
+        index
+            .index_message("股票 K 线背驰信号量化策略复盘", "s1", "user", 1, 2_000)
+            .expect("index chinese novel");
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(count, 2, "novel chinese messages should both be embedded");
     }
 }
