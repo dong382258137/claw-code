@@ -54,6 +54,7 @@ fn prompt(label: &str, hint: &str, default: Option<&str>, required: bool) -> Opt
 fn render_feishu_toml(
     listen_addr: &str,
     session_timeout: u64,
+    bus_root: Option<&str>,
     mode: &str,
     app_id: &str,
     app_secret: &str,
@@ -63,6 +64,9 @@ fn render_feishu_toml(
     let mut out = String::new();
     out.push_str(&format!("listen_addr = \"{listen_addr}\"\n"));
     out.push_str(&format!("session_timeout_secs = {session_timeout}\n"));
+    if let Some(r) = bus_root.filter(|s| !s.is_empty()) {
+        out.push_str(&format!("bus_root = \"{r}\"\n"));
+    }
     out.push_str("\n[feishu]\n");
     out.push_str(&format!("mode = \"{mode}\"\n"));
     out.push_str(&format!("app_id = \"{app_id}\"\n"));
@@ -81,6 +85,7 @@ fn render_feishu_toml(
 fn render_wecom_toml(
     listen_addr: &str,
     session_timeout: u64,
+    bus_root: Option<&str>,
     corp_id: &str,
     secret: &str,
     token: &str,
@@ -91,6 +96,9 @@ fn render_wecom_toml(
     let mut out = String::new();
     out.push_str(&format!("listen_addr = \"{listen_addr}\"\n"));
     out.push_str(&format!("session_timeout_secs = {session_timeout}\n"));
+    if let Some(r) = bus_root.filter(|s| !s.is_empty()) {
+        out.push_str(&format!("bus_root = \"{r}\"\n"));
+    }
     out.push_str("\n[wecom]\n");
     out.push_str(&format!("corp_id = \"{corp_id}\"\n"));
     out.push_str(&format!("secret = \"{secret}\"\n"));
@@ -146,6 +154,15 @@ pub fn run_setup() -> Result<(), String> {
     .parse::<u64>()
     .map_err(|_| "会话超时必须为数字".to_string())?;
 
+    // 审查补充(2026-08-12):跨进程互通目录(可选)——指向 TUI claw 进程的 .claw/bus,
+    // 使 TUI 主会话 ↔ IM 频道经文件事件队列互通。
+    println!("  \u{251c} 跨进程互通(可选):");
+    println!("  \u{2502}   填写 TUI claw 进程所在项目的 .claw/bus 目录(例如 C:/proj/.claw/bus)");
+    println!("  \u{2502}   启用后 TUI 主会话 ↔ IM 频道可经文件队列互发;留空则仅进程内互通");
+    let bus_root = prompt("bus_root (TUI 的 .claw/bus 目录, 可选)", "", None, false)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     // 生成配置，已存在则先备份
     if path.exists() {
         let backup = path.with_extension("toml.bak");
@@ -169,6 +186,7 @@ pub fn run_setup() -> Result<(), String> {
         render_wecom_toml(
             &listen_addr,
             session_timeout,
+            bus_root.as_deref(),
             &corp_id,
             &secret,
             &token,
@@ -193,6 +211,7 @@ pub fn run_setup() -> Result<(), String> {
         render_feishu_toml(
             &listen_addr,
             session_timeout,
+            bus_root.as_deref(),
             mode,
             &app_id,
             &app_secret,

@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
 
@@ -25,6 +26,7 @@ use crate::connectors::feishu_ws::FeishuWsClient;
 use crate::connectors::wecom::WeComClient;
 use crate::response::{ResponseCollector, RouteTarget, SessionRouter};
 use crate::session::{ChatKey, ImRequest, SessionManager, SpawnKeepAlive, SpawnResult};
+use runtime::{bus_now_ms, global_session_bus, BusMessageKind, PeerKind};
 
 /// Shared application state.
 #[derive(Clone)]
@@ -42,6 +44,8 @@ pub struct ServerHandle {
     pub persist_task: tokio::task::JoinHandle<()>,
     /// Feishu long-connection (WebSocket) client task, when enabled.
     pub feishu_ws_task: Option<tokio::task::JoinHandle<()>>,
+    /// Session Bus 跨进程邮箱轮询任务，配置 `bus_root` 时启用（审查补充 2026-08-12）。
+    pub bus_poll_task: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
     pub keep_alive: SpawnKeepAlive,
 }
@@ -75,6 +79,18 @@ pub async fn run_server(
         feishu_client,
         wecom_client,
     };
+
+    // Epic 3 Session Bus hub：进程内唯一总线，IM 频道注册为 `im:*` peer。
+    // 放行 hub 内互通：`im:im`（IM 频道互发）与 `ide:*`（外部进程 → IM 频道），
+    // 保持 deny-by-default 的其余规则（Main/Subagent 不受影响）。
+    // 审查补充(2026-08-12):追加 `im:ide` 放行——IM 频道可经文件事件队列投递到
+    // 远端邮箱(TUI 主会话 / IDE 面板),打通跨进程反向通道(否则 Im→Ide 默认拒绝,
+    // IM 用户 `/bus send main:xxx` 连文件都不写)。
+    let bus = global_session_bus();
+    bus.set_allow(PeerKind::Im, PeerKind::Im, true);
+    bus.set_allow(PeerKind::Im, PeerKind::Ide, true);
+    bus.set_allow(PeerKind::Ide, PeerKind::Im, true);
+    bus.set_allow(PeerKind::Ide, PeerKind::Ide, true);
 
     // Spawn response collector
     let collector = ResponseCollector::new(
@@ -123,11 +139,28 @@ pub async fn run_server(
         None
     };
 
+    // 审查补充(2026-08-12):配置 `bus_root` 时启用跨进程文件事件队列——
+    // TUI 主会话 ↔ IM 频道互通:本进程消费 IM 频道邮箱并直发真实 IM(广播/定向),
+    // IM 用户 `/bus send` 反向经文件投递到 TUI 主会话邮箱。
+    // 注意:须在 `.with_state(state)` 消费 state 之前启动(此处只 clone 字段)。
+    let bus_poll_task = if let Some(root) = config.bus_root.clone() {
+        let manager = state.session_manager.clone();
+        bus.set_bus_root(root.clone());
+        tracing::info!("Session Bus cross-process mailbox polling enabled at {}", root.display());
+        Some(manager.start_bus_mailbox_poller(root))
+    } else {
+        None
+    };
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/feishu/webhook", post(feishu_webhook))
         .route("/wecom/webhook", get(wecom_verify_url))
         .route("/wecom/webhook", post(wecom_message_callback))
+        // Epic 3 Session Bus hub API：跨进程/跨频道互通
+        .route("/api/bus/send", post(bus_send_handler))
+        .route("/api/bus/list", get(bus_list_handler))
+        .route("/api/bus/poll", get(bus_poll_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -148,6 +181,7 @@ pub async fn run_server(
         collector_task,
         persist_task,
         feishu_ws_task,
+        bus_poll_task,
         keep_alive: spawn_result.keep_alive,
     })
 }
@@ -156,6 +190,132 @@ pub async fn run_server(
 
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+// ── Epic 3 Session Bus hub API ─────────────────────────────
+
+/// `POST /api/bus/send` 请求体。
+#[derive(Deserialize)]
+struct BusSendRequest {
+    /// 发送方 peer id；缺省时 hub 自动注册为 `ext:<n>`（外部进程身份，kind=Ide）。
+    #[serde(default)]
+    from: Option<String>,
+    /// 目标 peer id（`im:{platform}:{chat_id}`）或 `*` 广播。
+    to: String,
+    /// 消息种类，缺省 `message`。
+    #[serde(default)]
+    kind: Option<String>,
+    /// 消息文本。
+    text: String,
+}
+
+/// `POST /api/bus/send` — 外部进程（IDE / 其他 CLAW 实例 / 脚本）经 hub 向总线发布消息。
+///
+/// 发送方若未注册会被自动注册为 `Ide` peer（外部进程身份）；发布受 `session_bus.allow`
+/// 权限约束（hub 默认放行 `im:im` / `ide:*`，见 `run_server` 初始化）。
+/// 目标为本 hub 已注册的 IM 频道时，同时向该频道直发真实 IM 消息。
+async fn bus_send_handler(
+    State(state): State<AppState>,
+    body: String,
+) -> Result<Json<Value>, StatusCode> {
+    let req: BusSendRequest = serde_json::from_str(&body).map_err(|e| {
+        tracing::warn!("bus send: invalid body: {e}");
+        StatusCode::BAD_REQUEST
+    })?;
+
+    // 外部进程身份：注册为 Ide peer（幂等，统一路由层入口）
+    let from = match req.from {
+        Some(f) if !f.trim().is_empty() => f,
+        _ => format!("ext:{}", bus_now_ms()),
+    };
+    let bus = global_session_bus();
+    if !bus.ensure_external_peer(&from) {
+        return Ok(Json(json!({ "ok": false, "error": "invalid sender id" })));
+    }
+
+    // 统一外部入口：kind 解析 + 文本消息构造 + 发布（含权限校验 + 限流）
+    let kind = BusMessageKind::from_str(req.kind.as_deref().unwrap_or("message"));
+    let delivered = match bus.publish_text(&from, &req.to, kind, &req.text) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("bus send rejected: {e}");
+            return Ok(Json(json!({ "ok": false, "error": e })));
+        }
+    };
+
+    // 目标为本 hub 已注册的 IM 频道 → 直发真实 IM 消息。
+    // 注意：publish 已在上方完成，此处仅做直发（bus_send_and_push 的 publish 幂等——
+    // 同消息再发布只会让 unread 重复，故直接复用其直发逻辑会重复投递。这里改为
+    // 仅当目标是本地 IM 频道时执行直发，不重复 publish）。
+    let mut pushed_im = false;
+    if req.to.starts_with("im:") {
+        let route = state
+            .session_manager
+            .bus_route_for(&req.to);
+        if route {
+            pushed_im = state
+                .session_manager
+                .push_im_route(&req.to, &req.text, &from)
+                .await;
+        }
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "delivered": delivered,
+        "pushed_im": pushed_im,
+    })))
+}
+
+/// `GET /api/bus/list` — 列出全部 peer（供外部进程发现会话）。
+async fn bus_list_handler(State(_state): State<AppState>) -> Json<Value> {
+    let bus = global_session_bus();
+    let peers: Vec<Value> = bus
+        .peers_snapshot()
+        .into_iter()
+        .map(|p| {
+            json!({
+                "session_id": p.session_id,
+                "label": p.label,
+                "kind": p.kind.as_str(),
+                "status": p.status.as_str(),
+                "unread": p.unread,
+            })
+        })
+        .collect();
+    Json(json!({ "peers": peers }))
+}
+
+/// `GET /api/bus/poll?session_id=X` — 轮询某 peer 的未读消息（外部订阅方拉取）。
+///
+/// 返回该 peer 未读的 `BusMessage` 列表（时间升序）并标记已读（消费确认）。
+async fn bus_poll_handler(
+    State(_state): State<AppState>,
+    Query(params): Query<BusPollParams>,
+) -> Json<Value> {
+    let bus = global_session_bus();
+    let msgs: Vec<Value> = bus
+        .unread_messages(&params.session_id)
+        .into_iter()
+        .map(|m| {
+            json!({
+                "from": m.from,
+                "to": m.to,
+                "kind": m.kind.as_str(),
+                "payload": m.payload,
+                "hop": m.hop,
+                "ts_ms": m.ts_ms,
+            })
+        })
+        .collect();
+    bus.mark_read(&params.session_id);
+    Json(json!({ "messages": msgs }))
+}
+
+/// `GET /api/bus/poll` 查询参数。
+#[derive(Deserialize)]
+struct BusPollParams {
+    session_id: String,
 }
 
 // ── Feishu webhook ─────────────────────────────────────────
@@ -250,14 +410,18 @@ async fn process_feishu_message(state: &AppState, msg: FeishuUserMessage) {
             };
             match state.session_manager.process_request(req).await {
                 Ok(session_id) => {
+                    let target = RouteTarget::Feishu {
+                        client: feishu,
+                        chat_id: msg.chat_id.clone(),
+                    };
                     let mut router = state.session_router.lock().await;
-                    router.insert(
-                        session_id,
-                        RouteTarget::Feishu {
-                            client: feishu,
-                            chat_id: msg.chat_id,
-                        },
-                    );
+                    router.insert(session_id, target.clone());
+                    drop(router);
+                    // Epic 3：同步注册 bus 直发路由（跨频道 `/bus send` 直达本频道）
+                    state
+                        .session_manager
+                        .register_bus_route(&chat_key, target)
+                        .await;
                 }
                 Err(e) => {
                     tracing::error!("failed to process feishu message: {e}");
@@ -355,14 +519,18 @@ async fn wecom_message_callback(
             };
             match state.session_manager.process_request(req).await {
                 Ok(session_id) => {
+                    let target = RouteTarget::WeCom {
+                        client: wecom.clone(),
+                        chat_id: chat_key.chat_id.clone(),
+                    };
                     let mut router = state.session_router.lock().await;
-                    router.insert(
-                        session_id,
-                        RouteTarget::WeCom {
-                            client: wecom.clone(),
-                            chat_id: chat_key.chat_id.clone(),
-                        },
-                    );
+                    router.insert(session_id, target.clone());
+                    drop(router);
+                    // Epic 3：同步注册 bus 直发路由（跨频道 `/bus send` 直达本频道）
+                    state
+                        .session_manager
+                        .register_bus_route(&chat_key, target)
+                        .await;
                 }
                 Err(e) => {
                     tracing::error!("failed to process wecom message: {e}");
@@ -434,5 +602,146 @@ async fn handle_im_message<F, Fut>(
         Err(e) => {
             tracing::error!("command handling error for {platform}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime::SessionBus;
+
+    fn im_peer(id: &str) -> BusPeer {
+        BusPeer {
+            session_id: id.to_string(),
+            label: format!("IM {id}"),
+            kind: PeerKind::Im,
+            status: PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: bus_now_ms(),
+            config_path: None,
+        }
+    }
+
+    /// Epic 3 hub 权限模型：模拟 `run_server` 中 `set_allow(im:im)` 后，
+    /// 两个 IM 频道可以互发；缺省 deny-by-default 下不可。
+    #[test]
+    fn hub_allow_im_to_im_enables_cross_channel() {
+        let bus = SessionBus::new();
+        bus.register(im_peer("im:feishu:oc_a")).unwrap();
+        bus.register(im_peer("im:wecom:chat_b")).unwrap();
+
+        // 缺省：Im → Im 被拒（deny by default）
+        let msg = BusMessage {
+            from: "im:feishu:oc_a".into(),
+            to: "im:wecom:chat_b".into(),
+            kind: BusMessageKind::Message,
+            payload: json!({ "text": "hi" }),
+            hop: 0,
+            ts_ms: bus_now_ms(),
+        };
+        assert!(bus.publish(msg.clone()).unwrap().is_empty());
+
+        // 放行 im:im（run_server 初始化）后互通
+        bus.set_allow(PeerKind::Im, PeerKind::Im, true);
+        let delivered = bus.publish(msg).unwrap();
+        assert_eq!(delivered, vec!["im:wecom:chat_b".to_string()]);
+    }
+
+    /// Epic 3：外部进程（Ide）经 hub 向 IM 频道投递需放行 ide:im。
+    #[test]
+    fn hub_allow_ide_to_im_enables_external_send() {
+        let bus = SessionBus::new();
+        bus.register(im_peer("im:feishu:oc_a")).unwrap();
+        bus.register(BusPeer {
+            session_id: "ext:panel-1".into(),
+            label: "external:panel-1".into(),
+            kind: PeerKind::Ide,
+            status: PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: bus_now_ms(),
+            config_path: None,
+        })
+        .unwrap();
+
+        let msg = BusMessage {
+            from: "ext:panel-1".into(),
+            to: "im:feishu:oc_a".into(),
+            kind: BusMessageKind::Message,
+            payload: json!({ "text": "from ide" }),
+            hop: 0,
+            ts_ms: bus_now_ms(),
+        };
+        // 缺省拒绝
+        assert!(bus.publish(msg.clone()).unwrap().is_empty());
+        // hub 放行 ide:im 后可达
+        bus.set_allow(PeerKind::Ide, PeerKind::Im, true);
+        let delivered = bus.publish(msg).unwrap();
+        assert_eq!(delivered, vec!["im:feishu:oc_a".to_string()]);
+    }
+
+    /// Epic 3：外部进程未注册时，`/api/bus/send` 自动注册为 Ide peer。
+    #[test]
+    fn bus_send_auto_registers_external_sender() {
+        let bus = SessionBus::new();
+        bus.set_allow(PeerKind::Ide, PeerKind::Im, true);
+        bus.register(im_peer("im:feishu:oc_a")).unwrap();
+
+        // 模拟 bus_send_handler 的自动注册逻辑
+        let from = "ext:auto-1";
+        bus.register(BusPeer {
+            session_id: from.into(),
+            label: format!("external:{from}"),
+            kind: PeerKind::Ide,
+            status: PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: bus_now_ms(),
+            config_path: None,
+        })
+        .unwrap();
+
+        let msg = BusMessage {
+            from: from.into(),
+            to: "im:feishu:oc_a".into(),
+            kind: BusMessageKind::Message,
+            payload: json!({ "text": "hello" }),
+            hop: 0,
+            ts_ms: bus_now_ms(),
+        };
+        let delivered = bus.publish(msg).unwrap();
+        assert_eq!(delivered, vec!["im:feishu:oc_a".to_string()]);
+        assert_eq!(bus.unread_messages("im:feishu:oc_a").len(), 1);
+    }
+
+    /// 审查补充(2026-08-12):IM → 远端跨进程反向通道。IM 频道 `/bus send` 到
+    /// TUI 主会话邮箱需放行 im:ide(文件路由目标 kind=Ide);run_server 已配置。
+    #[test]
+    fn hub_allow_im_to_ide_enables_reverse_file_route() {
+        let bus = SessionBus::new();
+        bus.register(im_peer("im:feishu:oc_a")).unwrap();
+        // TUI 主会话邮箱(远端,本进程未注册其 peer)
+        let root = std::env::temp_dir().join(format!("bus-im-test-{}", bus_now_ms()));
+        SessionBus::ensure_mailbox(&root, "main-abc").expect("ensure mailbox");
+        bus.set_bus_root(root.clone());
+
+        let msg = BusMessage {
+            from: "im:feishu:oc_a".into(),
+            to: "main-abc".into(),
+            kind: BusMessageKind::Message,
+            payload: json!({ "text": "from im" }),
+            hop: 0,
+            ts_ms: bus_now_ms(),
+        };
+        // 缺省:Im → Ide 拒绝 → 进程内与文件路由都不投递
+        assert!(bus.publish(msg.clone()).unwrap().is_empty());
+        let mailbox = SessionBus::mailbox_dir(&root, "main-abc");
+        let count = |p: &std::path::Path| -> usize {
+            std::fs::read_dir(p).map(|rd| rd.flatten().count()).unwrap_or(0)
+        };
+        assert_eq!(count(&mailbox), 0, "denied: no file written");
+        // 放行 im:ide(run_server 初始化)后文件路由生效
+        bus.set_allow(PeerKind::Im, PeerKind::Ide, true);
+        assert!(bus.publish(msg).unwrap().is_empty(), "进程内仍不投递(未注册)");
+        assert_eq!(count(&mailbox), 1, "file routed to main mailbox");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

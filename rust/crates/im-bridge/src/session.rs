@@ -29,7 +29,10 @@ use std::time::{Duration, Instant};
 use agent_client_protocol as acp;
 use claw_acp::{acp_send, AcpClientMessage};
 use claw_shell::{spawn_claw_shell, ClawAgentBuilder};
-use runtime::PermissionPolicy;
+use runtime::{
+    bus_now_ms, global_session_bus, BusMessage, BusMessageKind, BusPeer, PeerKind, PeerStatus,
+    PermissionPolicy,
+};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -37,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api_adapter::BridgeApiClient;
 use crate::commands::{parse_command, ChatCommand, CommandParseResult};
 use crate::persistence::{PersistedSession, PersistenceManager};
-use crate::response::PromptCompleted;
+use crate::response::{PromptCompleted, RouteTarget};
 use crate::tools::register_default_tools;
 
 /// Identifies a specific IM chat across platforms.
@@ -63,6 +66,13 @@ impl ChatKey {
             platform: platform.to_string(),
             chat_id: chat_id.to_string(),
         })
+    }
+
+    /// 本频道在 SessionBus 中的 peer id：`im:{platform}:{chat_id}`。
+    ///
+    /// 跨频道目标也以此格式书写（如 `/bus send im:feishu:oc_123 你好`）。
+    pub fn bus_peer_id(&self) -> String {
+        format!("im:{}:{}", self.platform, self.chat_id)
     }
 }
 
@@ -106,6 +116,9 @@ pub struct SessionManager {
     /// 上次进程遗留的持久化元数据(load 自磁盘)。persist 时与当前活跃 session
     /// 合并,防止进程重启后第一轮 persist 用空内存 map 覆盖历史记录。
     persisted_metadata: std::sync::Mutex<Vec<PersistedSession>>,
+    /// Session Bus（Epic 3 IM hub）：跨频道互通路由表 `im:{platform}:{chat_id}` → 回复目标。
+    /// 供 `/bus send` 向本地 IM 频道直发（unread 之外的真实 IM 消息）。
+    bus_router: std::sync::Mutex<HashMap<String, RouteTarget>>,
 }
 
 /// Result of spawning a session manager.
@@ -153,6 +166,7 @@ impl SessionManager {
             idle_timeout: Duration::from_secs(idle_timeout_secs),
             persistence: PersistenceManager::new(),
             persisted_metadata: std::sync::Mutex::new(Vec::new()),
+            bus_router: std::sync::Mutex::new(HashMap::new()),
         });
 
         // P2-7: Spawn idle-cleanup background task
@@ -208,6 +222,7 @@ impl SessionManager {
         match parse_command(&req.text) {
             CommandParseResult::Command(cmd) => {
                 let response = match &cmd {
+                    ChatCommand::Bus { args } => self.handle_bus_command(&req.chat_key, args).await,
                     ChatCommand::NewSession => {
                         // Force a new session creation
                         self.force_new_session(&req.chat_key, &req.user_id).await?;
@@ -232,6 +247,238 @@ impl SessionManager {
         }
     }
 
+    /// 注册 IM 频道的 bus 直发路由：`im:{platform}:{chat_id}` → RouteTarget。
+    ///
+    /// server.rs 在建立 session_id → RouteTarget 映射的同时调用本方法，使
+    /// `/bus send` 能向本地已注册的 IM 频道直发真实 IM 消息（跨频道协作）。
+    pub async fn register_bus_route(&self, chat_key: &ChatKey, target: RouteTarget) {
+        self.bus_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chat_key.bus_peer_id(), target);
+    }
+
+    /// 执行 `/bus` 子命令：list / send / watch / unwatch（Epic 3 IM hub）。
+    ///
+    /// - `list`：列出全部 peer（含跨进程 remote peer）。
+    /// - `send <target> <text>`：publish 到总线；若目标是本 hub 已注册的 IM 频道，
+    ///   同时通过 RouteTarget 直发真实 IM 消息。
+    /// - `watch/unwatch <target>`：订阅/取消订阅目标 peer 的消息流。
+    async fn handle_bus_command(&self, chat_key: &ChatKey, args: &str) -> String {
+        let bus = global_session_bus();
+        let own_id = chat_key.bus_peer_id();
+        let mut parts = args.split_whitespace();
+        match parts.next() {
+            None | Some("") => crate::commands::handle_command(
+                &ChatCommand::Bus { args: String::new() },
+                &acp::SessionId::new("bus"),
+                0,
+            )
+            .await,
+            Some("list") => {
+                let mut lines = vec![format!("**Session Bus Peers**（本频道 `{own_id}`）")];
+                let mut peers = bus.peers_snapshot();
+                // 追加跨进程邮箱发现的远端 peer（.claw/bus/ 文件事件队列）
+                if let Some(root) = bus.bus_root() {
+                    peers.extend(bus.remote_peers(&root, &own_id));
+                }
+                if peers.is_empty() {
+                    lines.push("(no peers yet — 任一频道首次发消息后出现)".to_string());
+                }
+                for p in &peers {
+                    lines.push(format!(
+                        "- `{}` · {} · {} · unread {}",
+                        p.session_id,
+                        p.kind.as_str(),
+                        p.status.as_str(),
+                        p.unread
+                    ));
+                }
+                lines.join("\n")
+            }
+            Some("send") => {
+                let target = match parts.next() {
+                    Some(t) => t.to_string(),
+                    None => {
+                        return "Usage: `/bus send <target> <text>`".to_string();
+                    }
+                };
+                let text = parts.collect::<Vec<_>>().join(" ");
+                if text.is_empty() {
+                    return "Usage: `/bus send <target> <text>`".to_string();
+                }
+                self.format_bus_send_result(&own_id, &target, &text).await
+            }
+            Some("watch") => {
+                let Some(target) = parts.next() else {
+                    return "Usage: `/bus watch <target>`".to_string();
+                };
+                match bus.watch(&own_id, target) {
+                    Ok(()) => format!("👁 已订阅 `{target}` 的消息流"),
+                    Err(e) => format!("❌ {e}"),
+                }
+            }
+            Some("unwatch") => {
+                let Some(target) = parts.next() else {
+                    return "Usage: `/bus unwatch <target>`".to_string();
+                };
+                bus.unwatch(&own_id, target);
+                format!("已取消订阅 `{target}`")
+            }
+            Some(other) => format!("Unknown /bus subcommand: `{other}`\n\n{}", 
+                crate::commands::handle_command(
+                    &ChatCommand::Bus { args: String::new() },
+                    &acp::SessionId::new("bus"),
+                    0,
+                )
+                .await),
+        }
+    }
+
+    /// 总线发送 + IM 直发（Epic 3 hub 核心，供 `/bus send` 与 `POST /api/bus/send` 复用）。
+    ///
+    /// 1. 构造 `Message` 消息并 `publish` 到全局总线（`to` 未注册时仅写入 unread/文件队列）。
+    /// 2. 若目标是本 hub 已注册的 IM 频道（`bus_router` 命中），通过 RouteTarget
+    ///    向目标聊天直发真实 IM 消息（跨频道协作的用户可见效果）。
+    ///
+    /// 返回 `(delivered, pushed_im)`——送达 peer 列表 + 是否已推送真实 IM 消息。
+    pub async fn bus_send_and_push(
+        &self,
+        from: &str,
+        to: &str,
+        text: &str,
+    ) -> Result<(Vec<String>, bool), String> {
+        let bus = global_session_bus();
+        let msg = BusMessage {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: BusMessageKind::Message,
+            payload: serde_json::json!({ "text": text }),
+            hop: 0,
+            ts_ms: bus_now_ms(),
+        };
+        let delivered = bus.publish(msg)?;
+        // 目标为本 hub 已注册的 IM 频道 → 直发真实 IM 消息
+        let pushed_im = if to.starts_with("im:") {
+            self.push_im_route(to, text, from).await
+        } else {
+            false
+        };
+        Ok((delivered, pushed_im))
+    }
+
+    /// 查询 `im:{platform}:{chat_id}` 是否已注册本 hub 直发路由。
+    pub fn bus_route_for(&self, peer_id: &str) -> bool {
+        self.bus_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(peer_id)
+    }
+
+    /// 向已注册的 IM 频道直发真实 IM 消息（跨频道协作的用户可见效果）。
+    /// 返回是否成功推送。无路由或发送失败返回 `false`。
+    pub async fn push_im_route(&self, peer_id: &str, text: &str, from: &str) -> bool {
+        let route = self
+            .bus_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer_id)
+            .cloned();
+        let Some(rt) = route else {
+            return false;
+        };
+        let display = format!("📨 来自 `{from}`:\n{text}");
+        match rt {
+            RouteTarget::Feishu { client, chat_id } => {
+                client.send_text_message(&chat_id, &display).await.is_ok()
+            }
+            RouteTarget::WeCom { client, chat_id } => {
+                client.push_text_message(&chat_id, &display).await.is_ok()
+            }
+        }
+    }
+
+    /// 当前已注册的所有 IM 频道 key（供 bus 邮箱轮询遍历，审查补充 2026-08-12）。
+    pub async fn registered_chats(&self) -> Vec<ChatKey> {
+        self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    /// 启动 Session Bus 邮箱轮询（审查补充 2026-08-12）。
+    ///
+    /// 周期性消费各已注册 IM 频道在 `bus_root` 下的邮箱：把远端进程（TUI 主会话 /
+    /// IDE 面板）经文件事件队列投递的消息注入本地总线；若目标是本 hub 的 IM 频道，
+    /// 同时直发真实 IM 消息（跨进程广播 `*` / 定向投递的用户可见效果）。
+    pub fn start_bus_mailbox_poller(
+        self: &Arc<Self>,
+        bus_root: std::path::PathBuf,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let chats = manager.registered_chats().await;
+                if chats.is_empty() {
+                    continue;
+                }
+                let bus = global_session_bus();
+                for key in chats {
+                    let peer_id = key.bus_peer_id();
+                    let msgs = runtime::SessionBus::consume_mailbox(&bus_root, &peer_id);
+                    if msgs.is_empty() {
+                        continue;
+                    }
+                    for msg in msgs {
+                        let is_local = bus
+                            .peers_snapshot()
+                            .iter()
+                            .any(|p| p.session_id == msg.from);
+                        if is_local {
+                            continue; // 本进程消息，已在进程内投递
+                        }
+                        let _ = bus.register(BusPeer {
+                            session_id: msg.from.clone(),
+                            label: format!("remote:{}", msg.from),
+                            kind: PeerKind::Ide,
+                            status: PeerStatus::Idle,
+                            unread: 0,
+                            last_seen_ms: bus_now_ms(),
+                            config_path: Some(runtime::SessionBus::mailbox_dir(
+                                &bus_root, &msg.from,
+                            )),
+                        });
+                        // 注入（跳过接收端权限重检：发送端已校验）
+                        let _ = bus.inject(msg.clone());
+                        // 目标是本 hub IM 频道 → 直发真实 IM 消息
+                        if msg.to.starts_with("im:") {
+                            let _ = manager
+                                .push_im_route(&msg.to, msg.text_payload(), &msg.from)
+                                .await;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// `/bus send` 的用户可读结果（内部格式化 `bus_send_and_push` 返回值）。
+    async fn format_bus_send_result(&self, from: &str, to: &str, text: &str) -> String {
+        match self.bus_send_and_push(from, to, text).await {
+            Ok((delivered, pushed_im)) => {
+                let mut msg_txt = format!("✅ 已发送到 `{to}`（总线投递 {}）", delivered.len());
+                if pushed_im {
+                    msg_txt.push_str("，并已推送到目标 IM 频道");
+                } else if delivered.is_empty() {
+                    // 审查补充(2026-08-12):delivered 空 = 目标未注册/权限拒绝/文件
+                    // 路由落盘,不再用"目标未注册,仅写入总线"误导(可能实际被权限拒绝)。
+                    msg_txt.push_str("。目标不可达（未注册或权限拒绝），已尝试写入总线");
+                }
+                msg_txt
+            }
+            Err(e) => format!("❌ {e}"),
+        }
+    }
+
     /// Process an incoming IM request asynchronously.
     ///
     /// Returns immediately; the response will be dispatched via the completion channel.
@@ -239,7 +486,6 @@ impl SessionManager {
         let session_id = self
             .get_or_create_session(&req.chat_key, &req.user_id)
             .await?;
-
         // Get the agent_tx for this chat (clone the sender, don't hold the lock)
         let agent_tx = {
             let sessions = self.sessions.lock().await;
@@ -469,7 +715,41 @@ impl SessionManager {
             );
         }
 
+        // Epic 3：注册本频道为 Session Bus 的 `im:{platform}:{chat_id}` peer，
+        // 使其他频道/外部进程可通过 `/bus send` 或 `/api/bus/send` 发现并投递。
+        self.register_im_peer(key);
+
         Ok(session_id)
+    }
+
+    /// 注册本频道为 Session Bus 的 `Im` peer（幂等：同 id 重复注册覆盖更新）。
+    fn register_im_peer(&self, key: &ChatKey) {
+        let bus = global_session_bus();
+        let peer_id = key.bus_peer_id();
+        // 审查补充(2026-08-12):配置了 bus_root 时创建频道邮箱目录,使 TUI 主会话
+        // 能经文件事件队列投递到本频道(bus 广播/定向的落点),poller 消费后直发真实 IM。
+        if let Some(root) = bus.bus_root() {
+            let _ = runtime::SessionBus::ensure_mailbox(&root, &peer_id);
+        }
+        let _ = bus.register(BusPeer {
+            session_id: peer_id.clone(),
+            label: format!("IM {}:{}", key.platform, key.chat_id),
+            kind: PeerKind::Im,
+            status: PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: bus_now_ms(),
+            config_path: None,
+        });
+        tracing::debug!("registered IM bus peer {peer_id}");
+    }
+
+    /// 注销本频道 bus peer（会话被清理时调用，避免僵尸 peer）。
+    fn leave_im_peer(&self, key: &ChatKey) {
+        global_session_bus().leave(&key.bus_peer_id());
+        self.bus_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key.bus_peer_id());
     }
 
     /// Force creation of a new session, replacing any existing one.
@@ -486,6 +766,7 @@ impl SessionManager {
             if let Some(entry) = sessions.remove(key) {
                 entry.cancel.cancel();
                 tracing::info!("cancelled old agent for chat {:?}", key);
+                self.leave_im_peer(key);
             }
         }
 
@@ -525,6 +806,7 @@ impl SessionManager {
                 if let Some(entry) = sessions.remove(key) {
                     entry.cancel.cancel();
                     tracing::debug!("idle cleanup: cancelled agent for chat {:?}", key);
+                    self.leave_im_peer(key);
                 }
             }
         }
@@ -573,5 +855,14 @@ mod tests {
         let active = vec![persisted_session("wecom", "chat_b", "sess_b")];
         let merged = SessionManager::merge_sessions(&history, &active);
         assert_eq!(merged.len(), 2);
+    }
+
+    /// Epic 3：ChatKey 的 bus peer id 格式为 `im:{platform}:{chat_id}`。
+    #[test]
+    fn chat_key_bus_peer_id_format() {
+        let key = ChatKey::new("feishu", "oc_123456");
+        assert_eq!(key.bus_peer_id(), "im:feishu:oc_123456");
+        let key = ChatKey::new("wecom", "chat-abc");
+        assert_eq!(key.bus_peer_id(), "im:wecom:chat-abc");
     }
 }

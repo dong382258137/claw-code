@@ -12,6 +12,15 @@ pub struct ImBridgeConfig {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
 
+    /// Session Bus 跨进程文件事件队列根目录（可选，审查补充 2026-08-12）。
+    ///
+    /// 指向 TUI 主进程的 `.claw/bus/`（通常为项目目录下 `.claw/bus`）。配置后
+    /// im-bridge 启用邮箱轮询：TUI 主会话 ↔ IM 频道可经文件队列跨进程互通——
+    /// TUI 广播/定向投递落到 IM 频道邮箱后由本进程消费并直发真实 IM 消息，
+    /// IM 用户 `/bus send` 反向投递到 TUI 主会话邮箱。未配置则仅进程内互通。
+    #[serde(default)]
+    pub bus_root: Option<PathBuf>,
+
     /// Feishu (Lark) configuration.
     #[serde(default)]
     pub feishu: Option<FeishuConfig>,
