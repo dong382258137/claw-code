@@ -599,6 +599,31 @@ fn salience_weight(role: &str, content: &str) -> f64 {
     base + bonus.min(SALIENCE_CONTENT_BONUS_CAP)
 }
 
+/// gzip level 6 压缩后的字节长度(flate2 GzEncoder)。
+fn gzip_len(text: &str) -> usize {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
+    encoder
+        .write_all(text.as_bytes())
+        .expect("gzip write to vec cannot fail");
+    encoder.finish().expect("gzip finish cannot fail").len()
+}
+
+/// gzip novelty 分数(True Memory encoding gate,论文公式)。
+///
+/// `n = (|gz(memory ∥ event)| - |gz(memory)|) / |gz(event)|`
+/// - memory 与 event 完全相同 → n≈0(冗余)
+/// - memory 与 event 完全不同 → n≈1(新颖)
+#[must_use]
+fn gzip_novelty(memory: &str, event: &str) -> f64 {
+    let m_len = gzip_len(memory);
+    let combined_len = gzip_len(&format!("{memory}{event}"));
+    let e_len = gzip_len(event).max(1);
+    (combined_len - m_len) as f64 / e_len as f64
+}
+
 /// f32 向量 → little-endian 字节(SQLite BLOB 存储)。
 fn f32_vec_to_le_bytes(vec: &[f32]) -> Vec<u8> {
     vec.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -791,6 +816,22 @@ pub const SALIENCE_SIGNAL_WEIGHT_ERROR: f64 = 0.25;
 pub const SALIENCE_SIGNAL_WEIGHT_DECISION: f64 = 0.2;
 /// 内容信号总加成上限(防止单一消息无限膨胀)。
 pub const SALIENCE_CONTENT_BONUS_CAP: f64 = 1.0;
+
+// ── Phase 3:gzip novelty 门控 ──
+// 对应 True Memory encoding gate 的 novelty 信号:
+// n_t = (|gz(M ∥ e_t)| - |gz(M)|) / |gz(e_t)|,gz = gzip level 6。
+// n_t 低于阈值视为与已存历史高度冗余,跳过向量嵌入(词法索引不受影响)。
+
+/// novelty 阈值:n_t < 该值视为冗余消息,跳过嵌入。
+///
+/// 设计假设(未经实证标定):0.3 位于"完全相同(n≈0)~ 完全不同(n≈1)"量级的中点偏保守,
+/// 偏向"多嵌"(省成本为主,不牺牲召回)。中间地带(0.2–0.4)存在同主题后续消息时嵌时跳
+/// 的抖动风险;若线上观察 embedding 成本收益不理想,优先在此调参(单点常量)。
+pub const NOVELTY_THRESHOLD: f64 = 0.3;
+/// stored neighborhood 的消息条数(search 取前 K 条已存消息拼接为 M)。
+pub const NOVELTY_NEIGHBOR_K: usize = 3;
+/// stored neighborhood 拼接总长上限(字符),控制 gzip 计算成本。
+pub const NOVELTY_CTX_MAX_CHARS: usize = 2000;
 
 /// 结论强标记词 —— 命中即视为"已确认结论",salience 最高档。
 const SALIENCE_STRONG_MARKERS: &[&str] = &[
@@ -1679,5 +1720,45 @@ mod tests {
             .expect("index");
         let hits = index.hybrid_search("rust", 5).expect("hybrid");
         assert!(!hits.is_empty(), "lexical fallback should still work");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3:gzip novelty 门控
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn gzip_novelty_identical_text_is_near_zero() {
+        // 与 memory 完全相同的消息:n≈0(高度冗余)
+        let m = "user prefers dark mode for code review";
+        let e = "user prefers dark mode for code review";
+        let n = super::gzip_novelty(m, e);
+        assert!(
+            n < super::NOVELTY_THRESHOLD,
+            "identical text should be below threshold: {n}"
+        );
+    }
+
+    #[test]
+    fn gzip_novelty_disparate_text_is_high() {
+        // 注意:短文本下 gzip 头尾固定开销(≈18B)抬高分母,迥异但过短的文本
+        // n 只能到 ~0.36;因此用较长的迥异文本验证"高 novelty"语义。
+        let m = "user prefers dark mode for code review sessions because it reduces eye strain during long working hours";
+        let e = "rust async runtime tokio worker pool sizing strategy for high concurrency web services with graceful shutdown";
+        let n = super::gzip_novelty(m, e);
+        assert!(
+            n > 0.5,
+            "disparate text should score high novelty: {n}"
+        );
+    }
+
+    #[test]
+    fn gzip_novelty_partial_overlap_is_mid_range() {
+        let m = "rust toolchain setup with rustup on windows";
+        let e = "rust toolchain configuration via rustup";
+        let n = super::gzip_novelty(m, e);
+        assert!(
+            n >= 0.0 && n < 0.8,
+            "partial overlap should land in (0, 0.8): {n}"
+        );
     }
 }
