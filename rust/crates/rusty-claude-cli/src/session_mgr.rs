@@ -12,8 +12,8 @@ use commands::{
     handle_skills_slash_command_json, slash_command_specs, SkillSlashDispatch, SlashCommand,
 };
 use runtime::{
-    format_usd, resolve_sandbox_status, CompactionConfig, ConfigLoader, ContentBlock, HistoryIndex,
-    MessageRole, Session, SessionStore, TokenUsage, UsageTracker,
+    build_embedding_provider, format_usd, resolve_sandbox_status, CompactionConfig, ConfigLoader,
+    ContentBlock, HistoryIndex, MessageRole, Session, SessionStore, TokenUsage, UsageTracker,
 };
 use serde_json::{json, Value};
 
@@ -1108,7 +1108,12 @@ pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     // recall past messages. Best-effort: if the DB cannot be opened (e.g.
     // permission denied), the session still works — only search is disabled.
     let db_path = cwd.join(".claw").join("history.db");
-    if let Ok(index) = HistoryIndex::open(&db_path) {
+    if let Ok(mut index) = HistoryIndex::open(&db_path) {
+        // v4:注入进程级共享 embedding provider(BGE-small 单例)启用稠密检索;
+        // 未编译 embedding feature 时返回 None,索引保持纯 FTS5 行为。
+        if let Some(provider) = runtime::build_embedding_provider() {
+            index = index.with_embedder(provider);
+        }
         session = session.with_history_index(std::sync::Arc::new(index));
     }
     Ok(session)
@@ -1128,7 +1133,12 @@ pub(crate) fn new_cli_session_with_roots(
     // recall past messages. Best-effort: if the DB cannot be opened (e.g.
     // permission denied), the session still works — only search is disabled.
     let db_path = cwd.join(".claw").join("history.db");
-    if let Ok(index) = HistoryIndex::open(&db_path) {
+    if let Ok(mut index) = HistoryIndex::open(&db_path) {
+        // v4:注入进程级共享 embedding provider(BGE-small 单例)启用稠密检索;
+        // 未编译 embedding feature 时返回 None,索引保持纯 FTS5 行为。
+        if let Some(provider) = runtime::build_embedding_provider() {
+            index = index.with_embedder(provider);
+        }
         session = session.with_history_index(std::sync::Arc::new(index));
     }
     Ok(session)
