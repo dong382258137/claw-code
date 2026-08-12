@@ -397,7 +397,63 @@ pub(crate) fn build_live_cli_for_repl(
         output_verbosity,
     )?;
     cli.set_reasoning_effort(reasoning_effort);
+    // 会话互通(Session Bus,设计文档 2026-08-11-session-bus-design.md §2.2):
+    // 主会话注册为 Main peer(REPL 与 TUI 共用此构造路径);子代理在
+    // conversation.rs 派发时自动注册 Subagent peer。
+    {
+        let bus = runtime::global_session_bus();
+        let _ = bus.register(runtime::BusPeer {
+            session_id: cli.session.id.clone(),
+            label: "主会话".to_string(),
+            kind: runtime::PeerKind::Main,
+            status: runtime::PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: runtime::bus_now_ms(),
+            config_path: None,
+        });
+        // Epic 1:应用 `session_bus.allow` 配置(设计文档 §2.5,deny by default)。
+        // 未配置时仅默认 Main→*、Subagent→Main/Subagent 放行。
+        let loader = runtime::ConfigLoader::default_for(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
+        if let Ok(cfg) = loader.load() {
+            bus.apply_allow_rules(cfg.feature_config().session_bus_allow());
+        }
+        // Epic 2:跨进程文件事件队列(设计文档 §2.4)。
+        // 启用 `.claw/bus/` 邮箱:远端会话可经文件投递消息到本会话,本会话
+        // 轮询线程消费邮箱并注入本地总线(子代理 Handoff/watch 照常走进程内)。
+        if let Ok(cwd) = std::env::current_dir() {
+            let bus_root = cwd.join(".claw").join("bus");
+            let own_id = cli.session.id.clone();
+            if runtime::SessionBus::ensure_mailbox(&bus_root, &own_id).is_ok() {
+                bus.set_bus_root(bus_root.clone());
+                runtime::SessionBus::start_mailbox_poller(bus_root, own_id);
+            }
+        }
+    }
     Ok(cli)
+}
+
+/// 会话互通(Session Bus)：drain 主会话未读 bus 消息并打印为 PeerMessage 行。
+/// REPL 模式在主循环顶部调用；TUI 模式由 tui/app.rs 的事件循环处理。
+fn drain_bus_unread_repl(session_id: &str, cli: &LiveCli) {
+    let bus = runtime::global_session_bus();
+    let msgs = bus.unread_messages(session_id);
+    if msgs.is_empty() {
+        return;
+    }
+    bus.mark_read(session_id);
+    for m in msgs {
+        let line = format!(
+            "\x1b[36m[来自 {} · {}]\x1b[0m {}",
+            m.from,
+            m.kind.as_str(),
+            render_bus_message_line(&m)
+        );
+        if !cli.tui_println(&line) {
+            println!("{line}");
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -476,6 +532,9 @@ pub(crate) fn run_repl(
     );
 
     loop {
+        // 会话互通(Session Bus):drain 主会话未读 bus 消息(子代理 Handoff /
+        // watch 镜像)到 stdout,使 REPL 也能看到对等会话消息。
+        drain_bus_unread_repl(&cli.session.id, &cli);
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
@@ -1486,6 +1545,14 @@ impl LiveCli {
             SlashCommand::Im { args } => {
                 // IM Bridge: show status, config, or startup instructions.
                 let (message, _json) = handle_im_command(args.as_deref());
+                if !self.tui_println(&message) {
+                    println!("{message}");
+                }
+                false
+            }
+            SlashCommand::Bus { args } => {
+                // 会话互通：列出 Session Bus 对等会话与状态 / 发送 / 订阅。
+                let message = handle_bus_command(args.as_deref(), &self.session.id);
                 if !self.tui_println(&message) {
                     println!("{message}");
                 }
@@ -3447,6 +3514,7 @@ pub(crate) fn build_runtime_with_plugin_state(
             subagent_api_client,
             workspace_root,
             None, // tool_executor — None=单轮无工具(向后兼容);Some(executor) 启用多轮 tool call
+            None, // workspace_override — 路径 B 未绑定子目录(主 root,向后兼容);Some 时收窄工具作用域
         );
     }
 

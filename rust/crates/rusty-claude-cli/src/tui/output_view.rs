@@ -196,10 +196,30 @@ pub(crate) enum OutputEntry {
         /// 条目创建时的本地时间戳（HH:MM:SS）。
         timestamp: String,
     },
-    /// Thinking 块摘要。
-    Thinking { summary: String, timestamp: String },
+    /// Thinking 块卡片：流式实时显示全文，结束后自动折叠为摘要。
+    Thinking {
+        /// 完整思考文本（流式增量累积）。
+        full_text: String,
+        /// 折叠时显示的摘要（如 "\n▶ Thinking (N chars hidden)\n"）。
+        summary: String,
+        /// 当前是否折叠（true=只显示摘要，false=展开显示全文）。
+        collapsed: bool,
+        /// 条目创建时的本地时间戳（HH:MM:SS）。
+        timestamp: String,
+    },
     /// 工具时间线。
     Timeline { summary: String, timestamp: String },
+    /// 对等会话消息（Session Bus，设计文档 2026-08-11-session-bus-design.md §2.3）。
+    PeerMessage {
+        /// 来源会话标签，如 "subagent:api-worker"。
+        from: String,
+        /// 消息种类，如 "handoff" / "message"。
+        kind: String,
+        /// 摘要（单行，控制台友好）。
+        summary: String,
+        /// 条目创建时的本地时间戳（HH:MM:SS）。
+        timestamp: String,
+    },
 }
 
 impl OutputEntry {
@@ -226,9 +246,25 @@ impl OutputEntry {
     }
 
     /// 工厂方法：创建 Thinking 条目，自动填充当前时间戳。
+    ///
+    /// 默认折叠为摘要（session_replay 等一次性渲染路径使用）；流式路径
+    /// 用 [`OutputBuffer::start_thinking`] / [`append_thinking_delta`] 创建展开态。
     pub(crate) fn thinking(summary: String) -> Self {
         Self::Thinking {
+            full_text: String::new(),
             summary,
+            collapsed: true,
+            timestamp: now_timestamp(),
+        }
+    }
+
+    /// 工厂方法：创建展开态的 Thinking 条目（流式思考开始），
+    /// 之后通过 [`OutputBuffer::append_thinking_delta`] 追加全文。
+    pub(crate) fn thinking_started() -> Self {
+        Self::Thinking {
+            full_text: String::new(),
+            summary: String::new(),
+            collapsed: false,
             timestamp: now_timestamp(),
         }
     }
@@ -236,6 +272,18 @@ impl OutputEntry {
     /// 工厂方法：创建 Timeline 条目，自动填充当前时间戳。
     pub(crate) fn timeline(summary: String) -> Self {
         Self::Timeline {
+            summary,
+            timestamp: now_timestamp(),
+        }
+    }
+
+    /// 工厂方法：创建对等会话消息条目（Session Bus），自动填充当前时间戳。
+    ///
+    /// 渲染为 `[来自 <from> · <kind>] <summary>`，优先级 P1（折叠档，不抢占焦点）。
+    pub(crate) fn peer_message(from: String, kind: String, summary: String) -> Self {
+        Self::PeerMessage {
+            from,
+            kind,
             summary,
             timestamp: now_timestamp(),
         }
@@ -255,11 +303,33 @@ impl OutputEntry {
                     format!("\x1b[38;5;240m[{timestamp}]\x1b[0m {content}")
                 }
             }
-            OutputEntry::Thinking { summary, timestamp } => {
-                format!("\x1b[38;5;240m[{timestamp}]\x1b[0m{summary}")
+            OutputEntry::Thinking {
+                full_text,
+                summary,
+                collapsed,
+                timestamp,
+            } => {
+                if *collapsed {
+                    format!("\x1b[38;5;240m[{timestamp}]\x1b[0m{summary}")
+                } else {
+                    // 展开态：显示完整思考文本。
+                    format!(
+                        "\x1b[38;5;240m[{timestamp}]\x1b[0m\n▶ Thinking\n{full_text}"
+                    )
+                }
             }
             OutputEntry::Timeline { summary, timestamp } => {
                 format!("\x1b[38;5;240m[{timestamp}]\x1b[0m{summary}")
+            }
+            OutputEntry::PeerMessage {
+                from,
+                kind,
+                summary,
+                timestamp,
+            } => {
+                format!(
+                    "\x1b[38;5;240m[{timestamp}]\x1b[0m \x1b[36m[来自 {from} · {kind}]\x1b[0m {summary}"
+                )
             }
             OutputEntry::ToolCard {
                 name,
@@ -442,6 +512,12 @@ impl OutputBuffer {
         self.bump();
     }
 
+    /// 追加对等会话消息条目（Session Bus）。独立成条，不与 Text 合并。
+    pub(crate) fn push_peer_message(&mut self, from: String, kind: String, summary: String) {
+        self.push_window(OutputEntry::peer_message(from, kind, summary));
+        self.bump();
+    }
+
     /// 段落感知追加：按双换行分割 text，每段为独立 Text entry。
     /// 最后一段合并到已存在的 trailing Text entry（或新建），支持后续流式追加。
     fn append_segmented(&mut self, text: &str) {
@@ -470,6 +546,118 @@ impl OutputBuffer {
     pub(crate) fn push_entry(&mut self, entry: OutputEntry) {
         self.push_window(entry);
         self.bump();
+    }
+
+    /// 流式思考开始：新建一个展开态的 Thinking 条目。
+    /// 若最后一个条目已是展开态 Thinking（上一块未结束），则复用。
+    pub(crate) fn start_thinking(&mut self) {
+        let reuse = matches!(
+            self.entries.back(),
+            Some(OutputEntry::Thinking {
+                collapsed: false,
+                ..
+            })
+        );
+        if !reuse {
+            self.push_window(OutputEntry::thinking_started());
+        }
+        self.bump();
+    }
+
+    /// 追加 thinking 增量文本到当前 Thinking 条目（实时显示）。
+    /// 若最后一个条目不是展开态 Thinking，先新建。
+    pub(crate) fn append_thinking_delta(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let reuse = matches!(
+            self.entries.back(),
+            Some(OutputEntry::Thinking {
+                collapsed: false,
+                ..
+            })
+        );
+        if !reuse {
+            self.push_window(OutputEntry::thinking_started());
+        }
+        if let Some(OutputEntry::Thinking { full_text, .. }) = self.entries.back_mut() {
+            full_text.push_str(text);
+        }
+        self.bump();
+    }
+
+    /// 思考块结束：把最近一个 Thinking 条目折叠为摘要。
+    /// 幂等 —— 已折叠或不存在时无操作。`char_count` 是思考总字符数
+    /// （None 表示 provider 隐藏），`redacted` 表示内容被 provider 抹除。
+    pub(crate) fn complete_thinking(
+        &mut self,
+        char_count: Option<usize>,
+        redacted: bool,
+    ) {
+        let summary = if redacted {
+            "\n▶ Thinking block hidden by provider\n".to_string()
+        } else if let Some(char_count) = char_count {
+            format!("\n▶ Thinking ({char_count} chars hidden)\n")
+        } else {
+            "\n▶ Thinking hidden\n".to_string()
+        };
+        // 从后往前找最近一个 Thinking 条目（完整块路径刚 append 后即折叠）。
+        // 若不存在（如直接收到 done 信号的 RedactedThinking），新建折叠态条目。
+        if let Some(idx) = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
+            matches!(e, OutputEntry::Thinking { .. }).then_some(idx)
+        }) {
+            if let OutputEntry::Thinking {
+                summary: s,
+                collapsed,
+                ..
+            } = &mut self.entries[idx]
+            {
+                *s = summary;
+                *collapsed = true;
+            }
+        } else {
+            self.push_window(OutputEntry::thinking(summary));
+        }
+        self.bump();
+    }
+
+    /// 切换最近一个可折叠条目的折叠/展开状态（Thinking 或已完成的 ToolCard）。
+    /// 优先 Thinking（流式思考卡片更常需要查看全文），否则 ToolCard。
+    /// 返回 true 表示成功切换。
+    pub(crate) fn toggle_latest_collapsible(&mut self) -> bool {
+        let found_idx = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
+            match e {
+                OutputEntry::Thinking { .. } => Some(idx),
+                OutputEntry::ToolCard { result: Some(_), .. } => Some(idx),
+                _ => None,
+            }
+        });
+        if let Some(idx) = found_idx {
+            match &mut self.entries[idx] {
+                OutputEntry::Thinking { collapsed, .. } => *collapsed = !*collapsed,
+                OutputEntry::ToolCard { collapsed, .. } => *collapsed = !*collapsed,
+                _ => unreachable!("idx 已确认是可折叠条目"),
+            }
+            self.bump();
+            return true;
+        }
+        false
+    }
+
+    /// 切换最近一个 Thinking 条目的折叠/展开状态。
+    /// 返回 true 表示成功切换。
+    pub(crate) fn toggle_latest_thinking(&mut self) -> bool {
+        let found_idx = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
+            matches!(e, OutputEntry::Thinking { .. }).then_some(idx)
+        });
+        if let Some(idx) = found_idx {
+            if let OutputEntry::Thinking { collapsed, .. } = &mut self.entries[idx] {
+                *collapsed = !*collapsed;
+            }
+            self.bump();
+            return true;
+        }
+        false
     }
 
     /// 更新指定 tool_id 的 ToolCard：设置 result 并按优先级决定折叠状态。
@@ -1022,6 +1210,115 @@ mod tests {
             buf.entries.back(),
             Some(OutputEntry::ToolCard {
                 collapsed: true,
+                ..
+            })
+        ));
+    }
+
+    /// 流式 thinking：增量 delta 实时追加全文，结束后自动折叠为摘要。
+    #[test]
+    fn thinking_streaming_append_delta_then_complete_collapses() {
+        let mut buf = OutputBuffer::default();
+        // 思考开始 + 增量文本
+        buf.start_thinking();
+        buf.append_thinking_delta("step1 ");
+        buf.append_thinking_delta("step2 ");
+        buf.append_thinking_delta("step3");
+        // 展开态应包含全部思考全文
+        assert!(matches!(
+            buf.entries.back(),
+            Some(OutputEntry::Thinking {
+                collapsed: false,
+                full_text,
+                ..
+            }) if full_text == "step1 step2 step3"
+        ));
+        let expanded = buf.render_all();
+        assert!(expanded.contains("step1 step2 step3"), "展开态应显示全文");
+        assert!(expanded.contains("▶ Thinking"), "展开态应有 Thinking 标题");
+
+        // 思考块结束 → 自动折叠为摘要
+        buf.complete_thinking(Some(16), false);
+        assert!(matches!(
+            buf.entries.back(),
+            Some(OutputEntry::Thinking {
+                collapsed: true,
+                ..
+            })
+        ));
+        let collapsed = buf.render_all();
+        assert!(collapsed.contains("▶ Thinking (16 chars hidden)"));
+        assert!(!collapsed.contains("step1 step2 step3"), "折叠后隐藏全文");
+    }
+
+    /// 完整块路径：done 信号带全文，先 append 再折叠。
+    #[test]
+    fn thinking_complete_with_text_appends_then_collapses() {
+        let mut buf = OutputBuffer::default();
+        buf.append_thinking_delta("full thinking text");
+        buf.complete_thinking(Some(17), false);
+        assert!(matches!(
+            buf.entries.back(),
+            Some(OutputEntry::Thinking {
+                collapsed: true,
+                ..
+            })
+        ));
+        let out = buf.render_all();
+        assert!(out.contains("▶ Thinking (17 chars hidden)"));
+    }
+
+    /// RedactedThinking：直接 done 信号，无文本，新建折叠态摘要。
+    #[test]
+    fn thinking_complete_redacted_without_existing_entry() {
+        let mut buf = OutputBuffer::default();
+        buf.complete_thinking(None, true);
+        assert!(matches!(
+            buf.entries.back(),
+            Some(OutputEntry::Thinking {
+                collapsed: true,
+                ..
+            })
+        ));
+        let out = buf.render_all();
+        assert!(out.contains("▶ Thinking block hidden by provider"));
+    }
+
+    /// toggle_latest_collapsible 优先切换 Thinking，否则 ToolCard。
+    #[test]
+    fn toggle_latest_collapsible_prefers_thinking_then_tool_card() {
+        let mut buf = OutputBuffer::default();
+        // 只有 ToolCard → 切换 ToolCard
+        buf.push_entry(OutputEntry::tool_card_start(
+            "t1".to_string(),
+            "bash".to_string(),
+            "{}".to_string(),
+        ));
+        buf.complete_tool_card("t1", "ok".to_string(), false);
+        assert!(buf.toggle_latest_collapsible());
+        assert!(matches!(
+            buf.entries.back(),
+            Some(OutputEntry::ToolCard {
+                collapsed: true,
+                ..
+            })
+        ));
+        // 追加 Thinking → 优先切换 Thinking
+        buf.append_thinking_delta("think");
+        assert!(buf.toggle_latest_collapsible());
+        assert!(matches!(
+            buf.entries.back(),
+            Some(OutputEntry::Thinking {
+                collapsed: true,
+                ..
+            })
+        ));
+        // 再切换展开
+        assert!(buf.toggle_latest_collapsible());
+        assert!(matches!(
+            buf.entries.back(),
+            Some(OutputEntry::Thinking {
+                collapsed: false,
                 ..
             })
         ));

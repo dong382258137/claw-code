@@ -287,6 +287,35 @@ impl ProjectTopology {
         }
     }
 
+    /// 拓扑感知派发(Epic 3):按 crate 边界自动推导建议的 `workspace` 参数。
+    ///
+    /// 集成 `ModuleGraph`:把每个 crate 的目录映射为 `dispatch_subagent` 的
+    /// `workspace` 相对路径候选(manifest_path.parent() 相对 workspace_root),
+    /// 供 LLM 派发时参考。`query` 可选,按 crate 名过滤(大小写不敏感)。
+    ///
+    /// # 返回
+    /// - `Ready`:候选列表(每个条目含 crate 名 / 建议 workspace 相对路径 / deps)。
+    /// - `Building`/`Failed`/`Uninitialized`:降级提示(与 [`query_project_graph`] 一致)。
+    pub fn suggest_workspaces(&self, query: Option<&str>) -> Result<String, String> {
+        let state = self.ensure_built();
+        match state {
+            TopologyState::Ready(data) => {
+                Ok(format_workspace_suggestions(&data.module_graph, query))
+            }
+            TopologyState::Building { .. } => Ok(
+                "ProjectTopology is still building (cargo metadata + crate graph). \
+                    This usually takes < 5 seconds. Do NOT retry immediately. \
+                    Use read/grep/search tools instead."
+                    .to_string(),
+            ),
+            TopologyState::Failed(e) => Ok(format!(
+                "ProjectTopology failed to build: {e}. \
+                     Workspace suggestions unavailable; dispatch without the 'workspace' field."
+            )),
+            TopologyState::Uninitialized => Ok("ProjectTopology is uninitialized.".to_string()),
+        }
+    }
+
     /// 查询 crate 依赖图。
     pub fn query_project_graph(&self) -> Result<String, String> {
         let state = self.ensure_built();
@@ -537,6 +566,83 @@ impl ProjectTopology {
 // ---------------------------------------------------------------------------
 // cargo metadata → ModuleGraph
 // ---------------------------------------------------------------------------
+
+/// Epic 3(拓扑感知派发):把 `ModuleGraph` 映射为 `dispatch_subagent` 的
+/// `workspace` 建议列表(纯函数,便于单测)。
+///
+/// 每个 crate 映射为建议 workspace 相对路径(manifest_path.parent() 相对
+/// workspace_root,正斜杠);crate 位于 workspace 根时返回 `"."`。按 crate 名
+/// 排序;`query` 提供时仅保留 crate 名包含 query(大小写不敏感)的条目。
+#[must_use]
+pub fn format_workspace_suggestions(g: &ModuleGraph, query: Option<&str>) -> String {
+    let query_lower = query.map(|q| q.to_lowercase());
+    let mut crates: Vec<&CrateInfo> = g
+        .crates
+        .iter()
+        .filter(|c| {
+            query_lower
+                .as_ref()
+                .map_or(true, |q| c.name.to_lowercase().contains(q))
+        })
+        .collect();
+    crates.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if crates.is_empty() {
+        return if let Some(q) = query {
+            format!("No crates found matching '{q}'. Use `query_project_graph` to see all crates.")
+        } else {
+            "No crates found in the workspace. Use `query_project_graph` for details.".to_string()
+        };
+    }
+
+    let mut out = String::from(
+        "## 建议 workspace(按 crate 边界)\n\
+         在 dispatch_subagent 的 \"workspace\" 字段中使用下列相对路径,将子代理约束到对应 crate。\n",
+    );
+    for c in &crates {
+        out.push_str(&format!(
+            "- crate `{}` v{} → workspace \"{}\"\n",
+            c.name,
+            c.version,
+            crate_workspace_relative(g, c)
+        ));
+        out.push_str(&format!(
+            "   manifest: {}\n",
+            crate_path_display(g, &c.manifest_path)
+        ));
+        if !c.dependencies.is_empty() {
+            out.push_str(&format!("   deps: [{}]\n", c.dependencies.join(", ")));
+        }
+    }
+    out
+}
+
+/// crate 的建议 workspace 值:manifest_path.parent() 相对 workspace_root(正斜杠)。
+/// crate 位于 workspace 根时返回 `"."`。
+fn crate_workspace_relative(g: &ModuleGraph, c: &CrateInfo) -> String {
+    match crate_manifest_relative(g, &c.manifest_path) {
+        Some(rel) if rel.parent().is_some_and(|p| !p.as_os_str().is_empty()) => rel
+            .parent()
+            .expect("parent checked above")
+            .to_string_lossy()
+            .replace('\\', "/"),
+        _ => ".".to_string(),
+    }
+}
+
+/// manifest_path 相对 workspace_root;不在 workspace_root 内时为 None。
+fn crate_manifest_relative(g: &ModuleGraph, path: &Path) -> Option<PathBuf> {
+    path.strip_prefix(&g.workspace_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+/// 路径展示:相对 workspace_root 用正斜杠,否则原样显示。
+fn crate_path_display(g: &ModuleGraph, path: &Path) -> String {
+    crate_manifest_relative(g, path)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| path.display().to_string())
+}
 
 /// P2-1:构建完整的 `TopologyData`(ModuleGraph + best-effort SymbolIndex)。
 ///
@@ -1152,6 +1258,96 @@ mod tests {
         let result = topo.query_project_graph().unwrap();
         // Should return a message rather than error
         assert!(!result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Epic 3: 拓扑感知派发 — workspace 建议推导
+    // -----------------------------------------------------------------------
+
+    fn sample_graph() -> ModuleGraph {
+        ModuleGraph {
+            workspace_root: PathBuf::from("/proj"),
+            crates: vec![
+                CrateInfo {
+                    name: "api".to_string(),
+                    version: "1.0.0".to_string(),
+                    manifest_path: PathBuf::from("/proj/crates/api/Cargo.toml"),
+                    dependencies: vec!["core".to_string()],
+                    source_paths: vec![PathBuf::from("/proj/crates/api/src")],
+                },
+                CrateInfo {
+                    name: "core".to_string(),
+                    version: "0.9.0".to_string(),
+                    manifest_path: PathBuf::from("/proj/crates/core/Cargo.toml"),
+                    dependencies: Vec::new(),
+                    source_paths: vec![PathBuf::from("/proj/crates/core/src")],
+                },
+                CrateInfo {
+                    name: "app".to_string(),
+                    version: "2.0.0".to_string(),
+                    manifest_path: PathBuf::from("/proj/Cargo.toml"),
+                    dependencies: vec!["api".to_string()],
+                    source_paths: vec![PathBuf::from("/proj/src")],
+                },
+            ],
+            reverse_deps: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn suggest_workspaces_maps_crates_to_relative_paths() {
+        let out = format_workspace_suggestions(&sample_graph(), None);
+        // 子 crate → 相对 workspace 路径
+        assert!(out.contains("crate `api`"), "got: {out}");
+        assert!(out.contains("workspace \"crates/api\""), "got: {out}");
+        assert!(out.contains("crate `core`"), "got: {out}");
+        assert!(out.contains("workspace \"crates/core\""), "got: {out}");
+        // workspace 根自身 crate → "."
+        assert!(out.contains("workspace \".\""), "got: {out}");
+        // 按 crate 名排序(api 在 app 前)
+        let api_pos = out.find("crate `api`").expect("api");
+        let app_pos = out.find("crate `app`").expect("app");
+        assert!(api_pos < app_pos, "crates should be sorted by name");
+    }
+
+    #[test]
+    fn suggest_workspaces_filters_by_query() {
+        let out = format_workspace_suggestions(&sample_graph(), Some("API"));
+        assert!(out.contains("crate `api`"), "got: {out}");
+        assert!(
+            !out.contains("crate `core`"),
+            "query filter should exclude core: {out}"
+        );
+        assert!(
+            !out.contains("crate `app`"),
+            "query filter should exclude app: {out}"
+        );
+    }
+
+    #[test]
+    fn suggest_workspaces_no_match_returns_hint() {
+        let out = format_workspace_suggestions(&sample_graph(), Some("nonexistent"));
+        assert!(out.contains("No crates found matching"), "got: {out}");
+    }
+
+    #[test]
+    fn suggest_workspaces_windows_paths_normalize_to_forward_slashes() {
+        let g = ModuleGraph {
+            workspace_root: PathBuf::from(r"C:\repo"),
+            crates: vec![CrateInfo {
+                name: "api".to_string(),
+                version: "1.0.0".to_string(),
+                manifest_path: PathBuf::from(r"C:\repo\crates\api\Cargo.toml"),
+                dependencies: Vec::new(),
+                source_paths: Vec::new(),
+            }],
+            reverse_deps: HashMap::new(),
+        };
+        let out = format_workspace_suggestions(&g, None);
+        assert!(
+            out.contains("workspace \"crates/api\""),
+            "Windows separators should be normalized: {out}"
+        );
     }
 
     // -----------------------------------------------------------------------

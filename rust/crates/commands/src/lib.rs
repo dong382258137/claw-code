@@ -272,6 +272,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "bus",
+        aliases: &[],
+        summary: "List Session Bus peers (other visible sessions and their status)",
+        argument_hint: Some("[list|help]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, or invoke available skills",
@@ -1165,6 +1172,10 @@ pub enum SlashCommand {
     Agents {
         args: Option<String>,
     },
+    /// 会话互通：查询 Session Bus 对等会话列表。
+    Bus {
+        args: Option<String>,
+    },
     Skills {
         args: Option<String>,
     },
@@ -1367,6 +1378,7 @@ impl SlashCommand {
             Self::Goal { .. } => "/goal",
             Self::Bg { .. } => "/bg",
             Self::Im { .. } => "/im",
+            Self::Bus { .. } => "/bus",
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -1485,6 +1497,9 @@ pub fn validate_slash_command_input(
         "session" => parse_session_command(&args)?,
         "plugin" | "plugins" | "marketplace" => parse_plugin_command(&args)?,
         "agents" => SlashCommand::Agents {
+            args: parse_list_or_help_args(command, remainder)?,
+        },
+        "bus" => SlashCommand::Bus {
             args: parse_list_or_help_args(command, remainder)?,
         },
         "skills" | "skill" => SlashCommand::Skills {
@@ -4630,6 +4645,7 @@ pub fn handle_slash_command(
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
+        | SlashCommand::Bus { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
         | SlashCommand::Login
@@ -5343,7 +5359,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 147);
+        assert_eq!(slash_command_specs().len(), 148);
         assert!(resume_supported_slash_commands().len() >= 42);
     }
 

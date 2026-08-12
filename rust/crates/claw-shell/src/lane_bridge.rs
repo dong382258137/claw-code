@@ -350,6 +350,69 @@ pub fn flush_lane_events_to_acp(
     count
 }
 
+// ---- Session Bus ↔ ACP 桥接(设计文档 2026-08-11-session-bus-design.md §2.4)----
+//
+// 前端面板(IDE 多面板)与总线互通,复用 ACP 官方扩展通道 `ExtNotification`,
+// 不改动外部 `agent-client-protocol` crate 的 `SessionUpdate` 枚举:
+// - 面板 → 总线:`session/broadcast`,params = {from, to, kind, text}
+// - 总线 → 面板:`session/peer_message`,params = BusMessage JSON
+
+/// 总线消息 → 前端面板通知(`session/peer_message` ExtNotification)。
+///
+/// 复用 `flush_lane_events_to_acp` 的 fire-and-forget 推送模式:面板通道关闭
+/// 不阻塞 agent。
+pub fn push_bus_message_to_acp(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    msg: &runtime::BusMessage,
+) {
+    let Ok(value) = serde_json::to_value(msg) else {
+        return;
+    };
+    let Ok(raw) = serde_json::value::to_raw_value(&value) else {
+        return;
+    };
+    let notif = acp::ExtNotification::new("session/peer_message", raw.into());
+    gateway.forward_fire_and_forget(notif);
+}
+
+/// 前端面板广播 → 总线(`session/broadcast` ExtNotification 处理)。
+///
+/// params 结构：`{"from": "<panel session id>", "to": "<target 或 *>",
+/// "kind": "message|command|handoff|state"(默认 message), "text": "..."}`。
+///
+/// 发送方首次出现时经 [`runtime::SessionBus::ensure_external_peer`] 注册为
+/// `PeerKind::Ide` 对等会话；随后经 [`runtime::SessionBus::publish_text`] 发布
+/// （含 `from_kind → to_kind` 权限校验 + Epic 4 限流，deny by default——
+/// `Ide → Main` 需 `session_bus.allow = ["ide:*"]` 显式放行）。
+///
+/// 返回实际送达的 peer 数(0 = 未送达/参数非法)。
+pub fn handle_broadcast_notification(params: &acp::RawValue) -> usize {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(params.get()) else {
+        return 0;
+    };
+    let Some(from) = json.get("from").and_then(|v| v.as_str()) else {
+        return 0;
+    };
+    if from.trim().is_empty() {
+        return 0;
+    }
+    let to = json.get("to").and_then(|v| v.as_str()).unwrap_or("*");
+    let kind = json.get("kind").and_then(|v| v.as_str()).unwrap_or("message");
+    // 审查补充(2026-08-12):空 text 拒绝发布,防止 IDE 面板误发空消息广播噪音。
+    let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.trim().is_empty() {
+        return 0;
+    }
+
+    let bus = runtime::global_session_bus();
+    // 注册面板为 Ide peer(幂等)；空 id 由 ensure_external_peer 拒绝
+    if !bus.ensure_external_peer(from) {
+        return 0;
+    }
+    let kind = runtime::BusMessageKind::from_str(kind);
+    bus.publish_text(from, to, kind, text).map(|d| d.len()).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +721,134 @@ mod tests {
                 assert_eq!(call.status, acp::ToolCallStatus::Failed);
             }
             other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    // ---- Session Bus ↔ ACP 桥接测试 ----
+
+    /// 全局总线是进程单例:唯一 id + 用完清理,避免与其他测试互相污染。
+    fn unique_id(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{}-{seq}", std::process::id())
+    }
+
+    #[test]
+    fn broadcast_from_ide_registers_peer_and_delivers() {
+        let bus = runtime::global_session_bus();
+        let main_id = unique_id("main-acp");
+        let ide_id = unique_id("ide-panel");
+        let _ = bus.register(runtime::BusPeer {
+            session_id: main_id.clone(),
+            label: "主会话".to_string(),
+            kind: runtime::PeerKind::Main,
+            status: runtime::PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: runtime::bus_now_ms(),
+            config_path: None,
+        });
+        // 显式放行 Ide → Main(deny by default 下默认拒绝)
+        bus.set_allow(runtime::PeerKind::Ide, runtime::PeerKind::Main, true);
+
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({
+            "from": ide_id,
+            "to": main_id,
+            "kind": "message",
+            "text": "hello from panel",
+        }))
+        .unwrap();
+        let delivered = handle_broadcast_notification(&raw);
+        assert_eq!(delivered, 1, "panel broadcast must reach main");
+
+        // 面板注册为 Ide peer
+        let registered = bus
+            .peers_snapshot()
+            .iter()
+            .any(|p| p.session_id == ide_id && p.kind == runtime::PeerKind::Ide);
+        assert!(registered, "panel must be registered as Ide peer");
+
+        // 消息进入 main 未读队列
+        let unread = bus.unread_messages(&main_id);
+        assert_eq!(unread.len(), 1);
+        assert_eq!(
+            unread[0].payload.get("text").and_then(|v| v.as_str()),
+            Some("hello from panel")
+        );
+
+        // 清理:peers + 权限回滚
+        bus.leave(&main_id);
+        bus.leave(&ide_id);
+        bus.set_allow(runtime::PeerKind::Ide, runtime::PeerKind::Main, false);
+    }
+
+    #[test]
+    fn broadcast_rejects_missing_from() {
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({ "to": "x" })).unwrap();
+        assert_eq!(handle_broadcast_notification(&raw), 0);
+        let raw = serde_json::value::to_raw_value(&serde_json::json!({ "from": "", "to": "x" }))
+            .unwrap();
+        assert_eq!(handle_broadcast_notification(&raw), 0);
+    }
+
+    // 审查补充(2026-08-12):空 text 拒绝发布,防止 IDE 面板误发空消息广播噪音。
+    #[test]
+    fn broadcast_rejects_empty_text() {
+        let bus = runtime::global_session_bus();
+        let main_id = unique_id("main-empty");
+        let ide_id = unique_id("ide-empty");
+        let _ = bus.register(runtime::BusPeer {
+            session_id: main_id.clone(),
+            label: "主会话".to_string(),
+            kind: runtime::PeerKind::Main,
+            status: runtime::PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: runtime::bus_now_ms(),
+            config_path: None,
+        });
+        bus.set_allow(runtime::PeerKind::Ide, runtime::PeerKind::Main, true);
+        // 缺 text / 空 text / 纯空白 text 均拒绝
+        let cases = vec![
+            serde_json::json!({ "from": ide_id, "to": main_id, "kind": "message" }),
+            serde_json::json!({ "from": ide_id, "to": main_id, "text": "" }),
+            serde_json::json!({ "from": ide_id, "to": main_id, "text": "   " }),
+        ];
+        for c in cases {
+            let raw = serde_json::value::to_raw_value(&c).unwrap();
+            assert_eq!(handle_broadcast_notification(&raw), 0, "empty text must be rejected");
+        }
+        assert!(bus.unread_messages(&main_id).is_empty());
+        bus.leave(&main_id);
+        bus.leave(&ide_id);
+        bus.set_allow(runtime::PeerKind::Ide, runtime::PeerKind::Main, false);
+    }
+
+    #[tokio::test]
+    async fn push_bus_message_to_acp_sends_peer_message_notification() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let gateway: AcpGatewaySender<acp::AgentSide> = AcpGatewaySender::new(tx);
+        let msg = runtime::BusMessage {
+            from: "main-1".to_string(),
+            to: "panel-1".to_string(),
+            kind: runtime::BusMessageKind::Message,
+            payload: serde_json::json!({ "text": "hi" }),
+            hop: 0,
+            ts_ms: 1,
+        };
+        push_bus_message_to_acp(&gateway, &msg);
+
+        let received = rx.recv().await.expect("should receive ExtNotification");
+        match received {
+            claw_acp::AcpClientMessage::ExtNotification(args) => {
+                assert_eq!(args.request.method.as_ref(), "session/peer_message");
+                let params: serde_json::Value =
+                    serde_json::from_str(args.request.params.get()).unwrap();
+                assert_eq!(params["from"], "main-1");
+                assert_eq!(params["to"], "panel-1");
+                assert_eq!(params["payload"]["text"], "hi");
+            }
+            other => panic!("expected ExtNotification, got {other:?}"),
         }
     }
 

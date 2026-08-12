@@ -127,10 +127,17 @@ impl CommandValidationGate {
 impl ValidationGate for CommandValidationGate {
     fn validate(&self, ctx: &ValidationContext) -> Result<(), ValidationError> {
         // v2 修正:用 changed_files + 正则判断是否触发,而非 v1 的 result_text 关键字匹配
+        // Epic 1 T3 增强:git diff 可能检测不到 untracked 新文件(detect_changed_files
+        // 已补 git ls-files),此处再补充子智能体声称的变更集(subagent_changed_files,
+        // 绝对路径,正则匹配路径尾部即可),声称改了相关文件也触发验证,互为兜底。
         let triggered = ctx
             .changed_files
             .iter()
-            .any(|f| self.file_filter.is_match(&f.to_string_lossy()));
+            .any(|f| self.file_filter.is_match(&f.to_string_lossy()))
+            || ctx
+                .subagent_changed_files
+                .iter()
+                .any(|f| self.file_filter.is_match(&f.to_string_lossy()));
         if !triggered {
             // 无相关文件修改,跳过验证(避免 README 修改触发 cargo build)
             return Ok(());
@@ -231,14 +238,33 @@ pub fn pytest_gate(workspace_root: PathBuf) -> CommandValidationGate {
     )
 }
 
-/// 从 `git diff --name-only` 检测 subagent 修改的文件。
+/// 从 git 工作区检测 subagent 修改的文件。
 ///
 /// 在 [`MultiAgentCoordinator::validate`] 调用前执行,结果填入 [`ValidationContext`]。
 ///
+/// 覆盖两类变更(Epic 1 T1 Execute 放开 write_file 后新建文件是常态):
+/// - tracked 修改:`git diff --name-only HEAD`(工作区 + index 相对 HEAD 的差异)
+/// - untracked 新文件:`git ls-files --others --exclude-standard`
+///   (git diff 检测不到 untracked 文件,若只靠它,新建文件会跳过验证链)
+///
 /// [`MultiAgentCoordinator::validate`]: super::MultiAgentCoordinator::validate
 pub fn detect_changed_files(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut files = run_git(&["diff", "--name-only", "HEAD"], workspace_root);
+    files.extend(run_git(
+        &["ls-files", "--others", "--exclude-standard"],
+        workspace_root,
+    ));
+    // 去重:同一文件可能同时出现在 tracked 修改与 untracked 列表
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|p| seen.insert(p.clone()));
+    files
+}
+
+/// 运行 git 子命令,成功时返回相对路径行(正斜杠);失败(非 git 仓库/git 不可用)
+/// 返回空 Vec(门禁可能跳过,向后兼容)。
+fn run_git(args: &[&str], workspace_root: &Path) -> Vec<PathBuf> {
     let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", "HEAD"])
+        .args(args)
         .current_dir(workspace_root)
         .output();
     match output {
@@ -246,7 +272,7 @@ pub fn detect_changed_files(workspace_root: &Path) -> Vec<PathBuf> {
             .lines()
             .map(PathBuf::from)
             .collect(),
-        _ => Vec::new(), // 非 git 仓库或 git 不可用,返回空(门禁可能跳过)
+        _ => Vec::new(),
     }
 }
 
@@ -267,7 +293,9 @@ pub fn read_handoff_changed_files(handoff_path: &Path) -> Vec<PathBuf> {
 /// - `unverified`:子智能体声称改了但 git diff 没有(可能未落盘/被还原,需排查)
 /// - `concurrent`:git diff 有但子智能体没声称(主 agent 并发修改,不归此子智能体)
 ///
-/// 归一化:按路径字符串比对(handoff 落盘侧已规范化路径)。
+/// 归一化:handoff 声称的是绝对路径(`extract_changed_files` 用 `workspace_root.join`),
+/// git diff 是相对路径。比对前把声称路径 strip 掉 workspace_root 前缀并统一正斜杠,
+/// 否则绝对/相对恒不匹配(§8.4 双列表检查失真)。
 pub fn compute_changed_files_mismatch(ctx: &ValidationContext<'_>) -> (Vec<String>, Vec<String>) {
     if ctx.subagent_changed_files.is_empty() {
         return (Vec::new(), Vec::new());
@@ -277,20 +305,26 @@ pub fn compute_changed_files_mismatch(ctx: &ValidationContext<'_>) -> (Vec<Strin
         .iter()
         .filter_map(|p| p.to_str())
         .collect();
-    let claimed_set: std::collections::HashSet<&str> = ctx
+    let root = ctx.workspace_root;
+    let claimed_set: std::collections::HashSet<String> = ctx
         .subagent_changed_files
         .iter()
-        .filter_map(|p| p.to_str())
+        .map(|p| {
+            p.strip_prefix(root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
         .collect();
 
     let unverified = claimed_set
         .iter()
-        .filter(|n| !git_set.contains(*n))
+        .filter(|n| !git_set.contains(n.as_str()))
         .map(|s| s.to_string())
         .collect();
     let concurrent = git_set
         .iter()
-        .filter(|n| !claimed_set.contains(*n))
+        .filter(|n| !claimed_set.contains(**n))
         .map(|s| s.to_string())
         .collect();
     (unverified, concurrent)
@@ -1154,5 +1188,161 @@ mod tests {
     fn read_handoff_changed_files_returns_empty_on_missing_file() {
         let files = read_handoff_changed_files(Path::new("/nonexistent/handoff-12345.md"));
         assert!(files.is_empty(), "文件不存在时应返回空 Vec");
+    }
+
+    // ===== Epic 1 T3:changed_files 喂 validation gate =====
+
+    /// T3:detect_changed_files 合并 untracked 新文件。
+    /// `git diff --name-only HEAD` 检测不到 untracked,须补 `git ls-files --others`,
+    /// 否则子代理 write_file 新建文件(Execute 能力)会跳过验证链。
+    #[test]
+    fn detect_changed_files_includes_untracked() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let root = tmp.path();
+        // git 不可用(如精简环境)→ 跳过本测试
+        let init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output();
+        if !init.ok().is_some_and(|o| o.status.success()) {
+            eprintln!("git unavailable, skipping detect_changed_files test");
+            return;
+        }
+        std::fs::write(root.join("tracked.txt"), "v1").expect("write tracked");
+
+        // 首次提交(tracked 基线)
+        let _ = std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(root)
+            .output();
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(root)
+            .output();
+        if !commit.ok().is_some_and(|o| o.status.success()) {
+            eprintln!("git commit unavailable, skipping detect_changed_files test");
+            return;
+        }
+
+        // 修改 tracked + 新建 untracked
+        std::fs::write(root.join("tracked.txt"), "v2").expect("modify tracked");
+        std::fs::write(root.join("untracked.txt"), "new").expect("write untracked");
+
+        let files = detect_changed_files(root);
+        assert!(
+            files.iter().any(|f| f.to_string_lossy() == "tracked.txt"),
+            "tracked modification should be detected: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.to_string_lossy() == "untracked.txt"),
+            "untracked new file should be detected: {files:?}"
+        );
+        // 去重后无重复
+        let mut uniq = files.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), files.len(), "no duplicates expected: {files:?}");
+    }
+
+    /// T3:双列表比对归一化 — 声称的绝对路径与 git diff 相对路径视为一致。
+    /// 修复前绝对/相对恒不匹配,unverified/concurrent 恒非空(诊断噪声)。
+    #[test]
+    fn compute_mismatch_normalizes_absolute_claimed_paths() {
+        let tmp = std::env::temp_dir();
+        // git diff 相对路径:src/a.rs;声称绝对路径:<root>/src/a.rs → 应一致(无 mismatch)
+        let changed_files = vec![PathBuf::from("src/a.rs")];
+        let subagent_changed_files = vec![tmp.join("src/a.rs")];
+        let ctx = make_ctx_with_subagent_files(
+            "sub-1",
+            "fix bug",
+            Path::new("/tmp/result.md"),
+            tmp.as_path(),
+            &changed_files,
+            &subagent_changed_files,
+            "deepseek-v4-pro",
+        );
+        let (unverified, concurrent) = compute_changed_files_mismatch(&ctx);
+        assert!(
+            unverified.is_empty(),
+            "absolute claimed path should match git diff relative: {unverified:?}"
+        );
+        assert!(
+            concurrent.is_empty(),
+            "no concurrent mismatch expected: {concurrent:?}"
+        );
+    }
+
+    /// T3:gate 触发补充声称变更 — git diff 无记录但子代理声称改了 .rs 文件 → 触发。
+    /// 用必然失败的命令验证"确实触发了"(skip 时返回 Ok,触发失败返回 Err)。
+    #[test]
+    fn command_gate_triggers_on_claimed_changes() {
+        #[cfg(windows)]
+        let cmd = vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "exit".to_string(),
+            "1".to_string(),
+        ];
+        #[cfg(not(windows))]
+        let cmd = vec!["false".to_string()];
+
+        let tmp = std::env::temp_dir();
+        let gate = CommandValidationGate::new("failing-gate", cmd, tmp.clone(), r"\.rs$");
+        // git diff 无记录(changed_files 空),但子代理声称改了 src/main.rs
+        let changed_files: Vec<PathBuf> = vec![];
+        let subagent_changed_files: Vec<PathBuf> = vec![PathBuf::from("src/main.rs")];
+        let ctx = make_ctx_with_subagent_files(
+            "sub-1",
+            "fix bug",
+            Path::new("/tmp/result.md"),
+            tmp.as_path(),
+            &changed_files,
+            &subagent_changed_files,
+            "deepseek-v4-flash",
+        );
+        let err = gate
+            .validate(&ctx)
+            .expect_err("claimed .rs change should trigger failing gate");
+        assert!(err.retryable, "触发后命令失败应可重试");
+    }
+
+    /// T3:gate 触发 — 声称的变更与 filter 不匹配(README.md)时仍跳过。
+    #[test]
+    fn command_gate_skips_when_claimed_changes_irrelevant() {
+        #[cfg(windows)]
+        let cmd = vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "exit".to_string(),
+            "1".to_string(),
+        ];
+        #[cfg(not(windows))]
+        let cmd = vec!["false".to_string()];
+
+        let tmp = std::env::temp_dir();
+        let gate = CommandValidationGate::new("failing-gate", cmd, tmp.clone(), r"\.rs$");
+        let changed_files: Vec<PathBuf> = vec![];
+        let subagent_changed_files: Vec<PathBuf> = vec![PathBuf::from("README.md")];
+        let ctx = make_ctx_with_subagent_files(
+            "sub-1",
+            "fix bug",
+            Path::new("/tmp/result.md"),
+            tmp.as_path(),
+            &changed_files,
+            &subagent_changed_files,
+            "deepseek-v4-flash",
+        );
+        assert!(
+            gate.validate(&ctx).is_ok(),
+            "claimed non-.rs change should skip gate"
+        );
     }
 }

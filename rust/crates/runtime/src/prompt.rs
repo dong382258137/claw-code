@@ -435,6 +435,8 @@ impl SystemPromptBuilder {
         sections.push(get_multi_agent_orchestration_section());
         // P0: Agent 子智能体类型指南（Explore / Plan / Verification）
         sections.push(get_agent_subagent_types_section());
+        // P0: Session Bus 会话总线工具教程区（bus_list / bus_send / bus_watch）
+        sections.push(get_session_bus_section());
         // P1: Worker 生命周期（9 步状态机）
         sections.push(get_worker_lifecycle_section());
         // 工具使用引导（WebSearch 优先 / 知识新鲜度 / ToolSearch / TaskUpdate）
@@ -1306,6 +1308,38 @@ fn get_multi_agent_orchestration_section() -> String {
      **Default when unsure**: use the user's current main model (it is always \
      Flagship-tier) rather than guessing. But prefer Budget for any task that \
      is clearly read-only or single-file."
+        .to_string()
+}
+
+/// Session Bus 工具教程 — 教会模型总线能力、用法与约束。
+///
+/// 补充在 Multi-Agent Orchestration 之后：sub-agent 派发/协作依赖 Session Bus
+/// 路由，主 agent 可用 `bus_list` / `bus_send` / `bus_watch` 主动查看/控制
+/// 所有对等会话（TUI 主会话、subagent、IDE 面板、IM 频道）。
+fn get_session_bus_section() -> String {
+    "## Session Bus (会话总线)\n\
+     \n\
+     The framework exposes a session bus that links every visible session \
+     (main session, running sub-agents, IDE panels, IM channels). Use these \
+     tools to coordinate across sessions:\n\
+     \n\
+     | Tool | When to Use |\n\
+     |------|-------------|\n\
+     | `bus_list` | **Call this first** before coordinating multiple sessions (e.g. after dispatching sub-agents). Read-only: shows each peer's kind (main/subagent/ide/im), status (idle/streaming/blocked/done) and unread count. |\n\
+     | `bus_send` | Send a message to another session. `to` MUST be a peer session_id from `bus_list` (or `*` to broadcast). Sending to a sub-agent is delivered as a steering command consumed on its next tool-call iteration. Permission follows `session_bus.allow` (deny by default). |\n\
+     | `bus_watch` | Subscribe to another peer's message stream so its messages mirror into this session's unread view (track a sub-agent's ongoing output). `target` MUST be a peer from `bus_list` and cannot be this session; set `unwatch: true` to unsubscribe. |\n\
+     \n\
+     ### Workflow\n\
+     \n\
+     1. After `dispatch_subagent` / `spawn_parallel_subagents`, call `bus_list` to confirm the sub-agents registered and see their status.\n\
+     2. To steer a running sub-agent, prefer `steer_subagent`; `bus_send` with a sub-agent target has the same effect.\n\
+     3. To follow a sub-agent's output, `bus_watch` it — mirrors appear in this session's unread view.\n\
+     \n\
+     ### Constraints\n\
+     \n\
+     - `bus_send` / `bus_watch` targets MUST come from `bus_list` output (or be a known session id); do not guess session ids.\n\
+     - Cross-session sends are gated by `session_bus.allow` (default: Main can reach everyone; Subagent only reaches Main/Subagent). If a send is rejected, respect the permission boundary — do not retry with `*`.\n\
+     - Never watch your own session (rejected by design)."
         .to_string()
 }
 

@@ -1202,13 +1202,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "ImBridgeSetup",
             description:
-                "Query or configure the IM Bridge (\u{98de}\u{4e66}/Feishu or \u{4f01}\u{4e1a}\u{5fae}\u{4fe1}/WeCom) by writing ~/.claw/im-bridge.toml. Use action='status' (default) to check current config. Use action='setup' to write a platform config; required fields for feishu are app_id+app_secret, for wecom are corp_id+secret+token+encoding_aes_key. If required credentials are missing, the tool reports them and you should ask the user.",
+                "Query or configure the IM Bridge (\u{98de}\u{4e66}/Feishu or \u{4f01}\u{4e1a}\u{5fae}\u{4fe1}/WeCom) by writing ~/.claw/im-bridge.toml. Use action='status' (default) to check current config (platforms + bus_root cross-process routing). Use action='setup' to write a platform config; required fields for feishu are app_id+app_secret, for wecom are corp_id+secret+token+encoding_aes_key. Optional 'bus_root' enables cross-process interop: point it at the TUI claw process's .claw/bus directory (e.g. C:/path/to/project/.claw/bus) so TUI <-> IM messages route via the file queue. If required credentials are missing, the tool reports them and you should ask the user.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["status", "setup"], "description": "'status'=query current config (default); 'setup'=write/update a platform config." },
                     "platform": { "type": "string", "enum": ["feishu", "wecom"] },
                     "listen_addr": { "type": "string", "description": "HTTP listen address, default 127.0.0.1:3456." },
+                    "bus_root": { "type": "string", "description": "Optional: TUI claw process's .claw/bus directory (cross-process Session Bus interop). Example 'C:/proj/.claw/bus'. Ask the user for the project directory where the TUI runs." },
                     "app_id": { "type": "string", "description": "Feishu App ID (cli_xxx). Required for feishu." },
                     "app_secret": { "type": "string", "description": "Feishu App Secret. Required for feishu." },
                     "mode": { "type": "string", "enum": ["ws", "http"], "description": "Feishu event subscription mode: 'ws'=long connection (recommended, no public URL), 'http'=webhook callback (needs public URL). Default 'ws'." },
@@ -3728,6 +3729,9 @@ struct ImBridgeSetupInput {
     platform: Option<String>,
     /// HTTP 监听地址（默认 127.0.0.1:3456）。
     listen_addr: Option<String>,
+    /// 跨进程互通：TUI claw 进程的 `.claw/bus` 目录（审查补充 2026-08-12）。
+    /// 配置后 im-bridge 启用邮箱轮询，TUI 主会话 ↔ IM 频道经文件队列互通。
+    bus_root: Option<String>,
     // 飞书字段
     app_id: Option<String>,
     app_secret: Option<String>,
@@ -7667,11 +7671,25 @@ fn execute_im_bridge_setup(input: ImBridgeSetupInput) -> Result<ImBridgeSetupOut
             }
         }
         let configured = !platforms.is_empty();
+        // 审查补充(2026-08-12):报告跨进程互通(bus_root)状态并给出引导提示。
+        let bus_root = existing
+            .as_deref()
+            .and_then(|c| extract_toml_value(c, "bus_root"));
+        let interop = match &bus_root {
+            Some(root) => format!("跨进程互通已启用：bus_root = \"{root}\"（TUI 主会话 ↔ IM 频道经文件队列互通）"),
+            None => "跨进程互通未启用：im-bridge 仅进程内互通，TUI 主会话无法与 IM 频道经文件队列互发。如需启用，用 action='setup' 并传入 bus_root（指向 TUI claw 进程所在项目的 .claw/bus 目录，例如项目根为 C:/proj 则填 C:/proj/.claw/bus）；若不知道项目目录请询问用户。".to_string(),
+        };
         let msg = if configured {
-            format!("已配置平台: {}", platforms.join(", "))
+            format!(
+                "已配置平台: {}。{}",
+                platforms.join(", "),
+                interop
+            )
         } else {
-            "未配置。如需配置飞书，调用本工具并传入 action='setup'、platform='feishu'、app_id、app_secret；若未知凭据，请向用户询问。"
-                .to_string()
+            format!(
+                "未配置平台。{} 如需配置飞书，调用本工具并传入 action='setup'、platform='feishu'、app_id、app_secret；若未知凭据，请向用户询问。",
+                interop
+            )
         };
         return Ok(ImBridgeSetupOutput::ok(
             config_path.display().to_string(),
@@ -7699,7 +7717,7 @@ fn execute_im_bridge_setup(input: ImBridgeSetupInput) -> Result<ImBridgeSetupOut
         ));
     }
 
-    // 组装顶层：继承已有 listen_addr / session_timeout，可用入参覆盖
+    // 组装顶层：继承已有 listen_addr / session_timeout / bus_root，可用入参覆盖
     let default_listen = existing
         .as_deref()
         .and_then(|c| extract_toml_value(c, "listen_addr"))
@@ -7709,9 +7727,20 @@ fn execute_im_bridge_setup(input: ImBridgeSetupInput) -> Result<ImBridgeSetupOut
         .and_then(|c| extract_toml_value(c, "session_timeout_secs"))
         .unwrap_or_else(|| "1800".to_string());
     let listen_addr = input.listen_addr.clone().unwrap_or(default_listen);
+    // 审查补充(2026-08-12):跨进程互通目录——入参覆盖、否则继承已有配置。
+    let default_bus_root = existing.as_deref().and_then(|c| extract_toml_value(c, "bus_root"));
+    let bus_root = input
+        .bus_root
+        .clone()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or(default_bus_root);
 
     let mut top = format!("listen_addr = \"{listen_addr}\"\n");
     top.push_str(&format!("session_timeout_secs = {default_timeout}\n"));
+    if let Some(root) = &bus_root {
+        top.push_str(&format!("bus_root = \"{root}\"\n"));
+    }
 
     let platform = input.platform.as_deref().unwrap_or("");
     let merged = merge_im_bridge_config(existing.as_deref(), &top, platform, &section);

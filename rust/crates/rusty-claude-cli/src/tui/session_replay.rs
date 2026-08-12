@@ -143,9 +143,16 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/tmp");
         std::fs::create_dir_all(&dir).unwrap();
+        // 文件名加纳秒时间戳：多个测试并行运行（cargo test 默认线程并行）
+        // 时避免共用同一 pid 文件互相覆盖/删除。
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let path = dir.join(format!(
-            "session_replay_test_{}.jsonl",
-            std::process::id()
+            "session_replay_test_{}_{}.jsonl",
+            std::process::id(),
+            ns
         ));
         let mut f = std::fs::File::create(&path).unwrap();
         for l in lines {

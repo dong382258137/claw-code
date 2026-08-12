@@ -274,6 +274,24 @@ struct AskRequest {
     resp_tx: mpsc::Sender<String>,
 }
 
+/// 会话互通(Session Bus)：drain 主会话未读 bus 消息 → OutputView PeerMessage 条目。
+/// 每轮事件循环(100-200ms)调用一次：子代理完成时 Handoff 广播、`/bus watch`
+/// 订阅的镜像消息在此实时可见。展示后 `mark_read` 清空，未读计数保持精确。
+fn drain_bus_messages_to_output(main_session_id: &str, output_view: &OutputView) {
+    let bus = runtime::global_session_bus();
+    let msgs = bus.unread_messages(main_session_id);
+    if msgs.is_empty() {
+        return;
+    }
+    bus.mark_read(main_session_id);
+    if let Ok(mut buf) = output_view.shared_handle().lock() {
+        for m in msgs {
+            let summary = crate::commands_handler::render_bus_message_line(&m);
+            buf.push_peer_message(m.from.clone(), m.kind.as_str().to_string(), summary);
+        }
+    }
+}
+
 /// 快速字符串 hash（无需新依赖，对 64KB 字符串 ~100ns）。
 fn fast_hash(s: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -635,6 +653,8 @@ fn run_event_loop(
     // 用户滚动到窗口内容顶部之外时，从 session 文件按需流式重放更早历史。
     // 必须在 cli move 进 cli_holder 之前获取路径。
     let session_path = cli.session_file_path();
+    // 会话互通(Session Bus)：主会话 id 供事件循环 drain 未读消息。
+    let main_session_id = cli.session_id_snapshot().to_string();
     let mut replay_cursor: usize = std::fs::read_to_string(&session_path)
         .map(|c| c.lines().count())
         .unwrap_or(0);
@@ -803,6 +823,10 @@ fn run_event_loop(
                 pending_ask = Some(req);
             }
         }
+
+        // 会话互通(Session Bus)：drain 主会话未读消息 → OutputView PeerMessage 条目。
+        // 每轮循环(100-200ms)执行一次，实现子代理 Handoff / watch 镜像的实时可见。
+        drain_bus_messages_to_output(&main_session_id, &output_view);
 
         // Check if a running turn has completed
         if let Some(ref rx) = turn_rx {
@@ -1700,12 +1724,12 @@ fn run_event_loop(
                         }
                     }
                     InputAction::ToggleToolCard => {
-                        // P1 重构：交互式折叠/展开最近一个工具卡片。
-                        // 配合结构化 OutputView，按 Ctrl+T 切换最新 ToolCard
-                        // 的 collapsed 字段，下次渲染时动态生成可见行。
+                        // P1 重构：交互式折叠/展开最近一个可折叠卡片
+                        // （Thinking 或 ToolCard）。配合结构化 OutputView，
+                        // 按 Ctrl+T 切换 collapsed 字段，下次渲染时动态生成可见行。
                         let handle = output_view.shared_handle();
                         if let Ok(mut buf) = handle.lock() {
-                            buf.toggle_latest_tool_card();
+                            buf.toggle_latest_collapsible();
                         };
                     }
                     InputAction::ScrollUp => {
@@ -3219,20 +3243,24 @@ fn execute_turn(
                 }
             }
             StatusEvent::Thinking {
+                text,
+                done,
                 char_count,
                 redacted,
             } => {
-                // Phase 3: render a short thinking-block summary into the
-                // output view, mirroring the stdout path in streaming.rs.
-                let summary = if redacted {
-                    "\n▶ Thinking block hidden by provider\n".to_string()
-                } else if let Some(char_count) = char_count {
-                    format!("\n▶ Thinking ({char_count} chars hidden)\n")
-                } else {
-                    "\n▶ Thinking hidden\n".to_string()
-                };
+                // 实时思考渲染：done=false 时把增量文本追加到展开态 Thinking
+                // 卡片（或新建）；done=true 时把卡片折叠为摘要。完整块路径
+                // （done=true 且 text 非空）先追加全文再折叠。
                 if let Ok(mut buf) = output_handle.lock() {
-                    buf.append(&summary);
+                    if !text.is_empty() {
+                        buf.append_thinking_delta(&text);
+                    } else if !done {
+                        // 思考块开始信号（Anthropic 流式先发空块再发 delta）。
+                        buf.start_thinking();
+                    }
+                    if done {
+                        buf.complete_thinking(char_count, redacted);
+                    }
                 }
             }
             StatusEvent::StreamError {
@@ -3630,18 +3658,20 @@ mod tests {
                 StatusEvent::ToolUse { .. } => {}
                 StatusEvent::ToolResult { .. } => {}
                 StatusEvent::Thinking {
+                    text,
+                    done,
                     char_count,
                     redacted,
                 } => {
-                    let summary = if redacted {
-                        "\n▶ Thinking block hidden by provider\n".to_string()
-                    } else if let Some(char_count) = char_count {
-                        format!("\n▶ Thinking ({char_count} chars hidden)\n")
-                    } else {
-                        "\n▶ Thinking hidden\n".to_string()
-                    };
                     if let Ok(mut buf) = output_handle.lock() {
-                        buf.append(&summary);
+                        if !text.is_empty() {
+                            buf.append_thinking_delta(&text);
+                        } else if !done {
+                            buf.start_thinking();
+                        }
+                        if done {
+                            buf.complete_thinking(char_count, redacted);
+                        }
                     }
                 }
                 StatusEvent::StreamError {
@@ -3841,6 +3871,8 @@ mod tests {
         let emitter = build_test_emitter(handle, status);
 
         emitter(StatusEvent::Thinking {
+            text: String::new(),
+            done: true,
             char_count: None,
             redacted: false,
         });
@@ -3865,6 +3897,8 @@ mod tests {
         let emitter = build_test_emitter(handle, status);
 
         emitter(StatusEvent::Thinking {
+            text: String::new(),
+            done: true,
             char_count: Some(42),
             redacted: false,
         });
@@ -3886,6 +3920,8 @@ mod tests {
         let emitter = build_test_emitter(handle, status);
 
         emitter(StatusEvent::Thinking {
+            text: String::new(),
+            done: true,
             char_count: None,
             redacted: true,
         });

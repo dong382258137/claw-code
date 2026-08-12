@@ -7,9 +7,7 @@
 use std::sync::Arc;
 
 use runtime::multi_agent::dag::FailFast;
-use runtime::multi_agent::{
-    CoordinationMode, MultiAgentCoordinator, SpawnRequest, TaskComplexity,
-};
+use runtime::multi_agent::{CoordinationMode, MultiAgentCoordinator, SpawnRequest, TaskComplexity};
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, PermissionMode, PermissionPolicy,
     RuntimeError, Session, StaticToolExecutor,
@@ -36,7 +34,13 @@ fn spawn_parallel_all_nodes_fail_reports_real_reason() {
         PermissionPolicy::new(PermissionMode::DangerFullAccess),
         vec!["system".to_string()],
     )
-    .with_dag_coordinator(coordinator.clone(), EmptyApi, tempdir.path().to_path_buf(), None);
+    .with_dag_coordinator(
+        coordinator.clone(),
+        EmptyApi,
+        tempdir.path().to_path_buf(),
+        None,
+        None,
+    );
 
     // 3 个并行子任务,全部会失败(LLM 返回空流)
     let tasks = vec![
@@ -91,7 +95,11 @@ fn spawn_parallel_all_nodes_fail_reports_real_reason() {
     assert_eq!(with_real_reason, 3, "3 个任务都应携带真实失败原因");
 
     // 4) coordinator 状态机应同样记录了真实失败原因(与返回结果一致)
-    assert_eq!(coordinator.list().len(), 3, "coordinator 应有 3 条 subagent 记录");
+    assert_eq!(
+        coordinator.list().len(),
+        3,
+        "coordinator 应有 3 条 subagent 记录"
+    );
     for a in coordinator.list() {
         eprintln!(
             ">>> coordinator 中 subagent {}: status={:?}, result={:?}",

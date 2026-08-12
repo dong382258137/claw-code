@@ -180,7 +180,24 @@ impl SessionStore {
     ) -> Result<LoadedManagedSession, SessionControlError> {
         let handle = self.resolve_reference(reference)?;
         let session = Session::load_from_path(&handle.path)?;
-        self.validate_loaded_session(&handle.path, &session)?;
+        // Epic 2(A2.2):显式路径引用 —— 指向 store 管理区(`<ws>/.claw/sessions/`,
+        // 含 legacy 根)之外的会话文件,如绑定 workspace 的子代理会话。这是用户
+        // 明确的跨 workspace 恢复意图:仅要求会话 workspace 位于本 store 工作区
+        // 树内(子目录),不强制完全匹配。管理区内的引用保持严格校验。
+        let managed_root = self.sessions_root.parent(); // <ws>/.claw/sessions
+        let is_managed = managed_root.is_some_and(|root| handle.path.starts_with(root));
+        if is_managed {
+            self.validate_loaded_session(&handle.path, &session)?;
+        } else if let Some(actual) = session.workspace_root() {
+            // 显式外部引用:绑定 workspace 的会话必须在本 store 工作区树内,
+            // 拒绝加载完全不相关的 workspace(防任意外部文件恢复)。
+            if !path_is_within_workspace(actual, &self.workspace_root) {
+                return Err(SessionControlError::WorkspaceMismatch {
+                    expected: self.workspace_root.clone(),
+                    actual: actual.to_path_buf(),
+                });
+            }
+        }
         Ok(LoadedManagedSession {
             handle: SessionHandle {
                 id: session.session_id.clone(),
@@ -857,6 +874,71 @@ mod tests {
             store_a.sessions_dir(),
             store_b.sessions_dir(),
             "session directories must differ across workspaces"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    // Epic 2(A2.2):父会话可通过显式路径引用恢复"绑定 workspace 的子代理会话"
+    // (子目录内 `.claw/sessions/` 按 workspace 分目录天然分域,父 store 列表
+    // 不可见),不相关 workspace 的会话即使显式传路径也被拒(防任意外部恢复)。
+    #[test]
+    fn parent_store_loads_child_workspace_session_via_explicit_path() {
+        // given
+        let base = temp_dir();
+        let parent = base.join("repo");
+        let child = base.join("repo").join("crates").join("api");
+        fs::create_dir_all(&child).expect("child workspace should exist");
+
+        let parent_store = SessionStore::from_cwd(&parent).expect("parent store");
+        let child_store = SessionStore::from_cwd(&child).expect("child store");
+        let child_session = persist_session(&child, "child agent work");
+        let child_path = child_store.create_handle(&child_session.session_id).path;
+
+        // when
+        let parent_list = parent_store.list_sessions().expect("parent list");
+        let loaded = parent_store
+            .load_session(child_path.to_str().expect("path str"))
+            .expect("explicit path reference should load child workspace session");
+
+        // then — 子会话不污染父 store 列表,但可经显式路径恢复
+        assert_eq!(
+            parent_list.len(),
+            0,
+            "child sessions must not pollute parent list"
+        );
+        assert_eq!(loaded.handle.id, child_session.session_id);
+        assert_eq!(
+            loaded.session.workspace_root(),
+            Some(child.as_path()),
+            "child session keeps its own workspace binding"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    // Epic 2(A2.2):完全不相关 workspace 的会话经显式路径引用仍被拒。
+    #[test]
+    fn parent_store_rejects_unrelated_workspace_session_via_explicit_path() {
+        // given
+        let base = temp_dir();
+        let parent = base.join("repo");
+        let other = base.join("other-repo");
+        fs::create_dir_all(&parent).expect("parent should exist");
+        fs::create_dir_all(&other).expect("other should exist");
+
+        let parent_store = SessionStore::from_cwd(&parent).expect("parent store");
+        let other_store = SessionStore::from_cwd(&other).expect("other store");
+        let other_session = persist_session(&other, "other work");
+        let other_path = other_store.create_handle(&other_session.session_id).path;
+
+        // when
+        let err = parent_store
+            .load_session(other_path.to_str().expect("path str"))
+            .expect_err("unrelated workspace session must be rejected");
+
+        // then
+        assert!(
+            matches!(err, SessionControlError::WorkspaceMismatch { .. }),
+            "got: {err:?}"
         );
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }

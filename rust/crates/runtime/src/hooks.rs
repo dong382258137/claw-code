@@ -136,6 +136,10 @@ pub struct HookRunResult {
     permission_override: Option<PermissionOverride>,
     permission_reason: Option<String>,
     updated_input: Option<String>,
+    /// 抑制工具原始输出：true 时调用方应丢弃 output，仅保留 messages
+    /// （LoopDetector 检测到重复输出/重复调用时置位，避免模型基于
+    /// 未变化的旧输出盲目重试）。
+    suppress_output: bool,
 }
 
 impl HookRunResult {
@@ -149,6 +153,7 @@ impl HookRunResult {
             permission_override: None,
             permission_reason: None,
             updated_input: None,
+            suppress_output: false,
         }
     }
 
@@ -165,6 +170,39 @@ impl HookRunResult {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    /// 是否应抑制工具原始输出（LoopDetector 重复检测触发）。
+    #[must_use]
+    pub fn should_suppress_output(&self) -> bool {
+        self.suppress_output
+    }
+
+    /// 构造一个抑制原始输出的 HookRunResult（allow 状态），携带提示消息。
+    ///
+    /// LoopDetector 检测到重复输出/重复调用时返回此结果：调用方丢弃
+    /// 工具 output，只把提示消息回灌给模型，切断"看到相同输出 → 继续重试"
+    /// 的验证循环。
+    #[must_use]
+    pub fn suppressed_with_messages(messages: Vec<String>) -> Self {
+        Self {
+            denied: false,
+            failed: false,
+            cancelled: false,
+            messages,
+            permission_override: None,
+            permission_reason: None,
+            updated_input: None,
+            suppress_output: true,
+        }
+    }
+
+    /// 标记抑制原始输出（保留 denied/failed/cancelled 等既有状态不变）。
+    ///
+    /// 用于 LoopDetector 重复警告注入路径：在已运行的 base hook 结果上
+    /// 追加抑制标记，不改变 hook 的决策状态。
+    pub fn mark_suppress_output(&mut self) {
+        self.suppress_output = true;
     }
 
     #[must_use]
@@ -211,6 +249,7 @@ impl HookRunResult {
             permission_override: None,
             permission_reason: None,
             updated_input: None,
+            suppress_output: false,
         }
     }
 
@@ -247,10 +286,7 @@ impl HookRunner {
     /// design-gaps #1「配置热重载」：修改 hooks 配置（settings.json）无需
     /// 重启会话。
     pub fn reload(&self, config: RuntimeHookConfig) {
-        *self
-            .config
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = config;
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
     }
 
     /// 从 feature config 热重载 hooks 配置。
@@ -283,16 +319,8 @@ impl HookRunner {
             return;
         }
         thread::spawn(move || {
-            let _ = Self::run_definitions(
-                event,
-                &definitions,
-                &context,
-                "{}",
-                None,
-                false,
-                None,
-                None,
-            );
+            let _ =
+                Self::run_definitions(event, &definitions, &context, "{}", None, false, None, None);
         });
     }
 
@@ -548,6 +576,7 @@ impl HookRunner {
                 permission_override: None,
                 permission_reason: None,
                 updated_input: None,
+                suppress_output: false,
             };
         }
 
@@ -558,8 +587,7 @@ impl HookRunner {
         // 等)保留同步语义,但未配置独立 timeout 的 hook 也不能无限期阻塞对话
         // 循环。从本轮第一次执行起算共享预算,多个 hook 累计占用;预算耗尽后
         // 剩余 hook 按 1ms 超时立即 Failed(调用方按 failure_policy 处理)。
-        let budget_deadline =
-            Instant::now() + Duration::from_millis(hook_budget_ms());
+        let budget_deadline = Instant::now() + Duration::from_millis(hook_budget_ms());
 
         for def in definitions {
             // matcher 正则过滤：任一正则命中 tool_name 才执行该 hook；
@@ -612,16 +640,14 @@ impl HookRunner {
                     abort_signal,
                     effective_timeout_ms,
                 ),
-                HookHandlerType::Http => {
-                    Self::run_http_handler(
-                        &def.value,
-                        event,
-                        tool_name,
-                        &payload,
-                        abort_signal,
-                        effective_timeout_ms,
-                    )
-                }
+                HookHandlerType::Http => Self::run_http_handler(
+                    &def.value,
+                    event,
+                    tool_name,
+                    &payload,
+                    abort_signal,
+                    effective_timeout_ms,
+                ),
                 HookHandlerType::Mcp => {
                     Self::run_mcp_handler(&def.value, event, tool_name, &payload)
                 }
@@ -1598,14 +1624,15 @@ mod tests {
         let mut config = RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new());
         config.add_lifecycle(
             "PostCustomToolCall",
-            HookDefinition::command(
-                "printf '%s|%s' \"$HOOK_TOOL_NAME\" \"$HOOK_TOOL_OUTPUT\"",
-            ),
+            HookDefinition::command("printf '%s|%s' \"$HOOK_TOOL_NAME\" \"$HOOK_TOOL_OUTPUT\""),
         );
         let runner = HookRunner::new(config);
         let result = runner.run_post_custom_tool_call("edit_file", "patched OK");
         assert!(!result.is_failed());
-        assert!(result.messages().iter().any(|m| m.contains("edit_file|patched OK")));
+        assert!(result
+            .messages()
+            .iter()
+            .any(|m| m.contains("edit_file|patched OK")));
     }
 
     #[test]
@@ -1809,10 +1836,8 @@ mod tests {
     fn spawn_lifecycle_event_returns_immediately_and_runs_in_background() {
         // design-gaps #1「异步 HookRunner」:生命周期事件 fire-and-forget,
         // spawn 立即返回(不阻塞对话循环),hook 在后台线程执行。
-        let marker = std::env::temp_dir().join(format!(
-            "claw-hook-spawn-{}.marker",
-            std::process::id()
-        ));
+        let marker =
+            std::env::temp_dir().join(format!("claw-hook-spawn-{}.marker", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let marker_bash = marker.display().to_string().replace('\\', "/");
         let mut config = RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new());
@@ -1877,5 +1902,38 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
+    }
+
+    // ---- suppress_output(LoopDetector 重复输出抑制)----
+
+    #[test]
+    fn allow_result_does_not_suppress_output_by_default() {
+        let result = HookRunResult::allow(vec!["ok".to_string()]);
+        assert!(!result.should_suppress_output());
+    }
+
+    #[test]
+    fn suppressed_with_messages_flags_suppress_output() {
+        let result = HookRunResult::suppressed_with_messages(vec![
+            "consider reconsidering your approach — tool 'bash' returned identical output 5 times"
+                .to_string(),
+        ]);
+        assert!(result.should_suppress_output());
+        assert_eq!(result.messages().len(), 1);
+        assert!(!result.is_denied());
+        assert!(!result.is_failed());
+        assert!(!result.is_cancelled());
+    }
+
+    #[test]
+    fn mark_suppress_output_preserves_decision_state() {
+        // 用 cancelled_with_message 模拟非 allow 状态，打抑制标记不应覆盖它
+        let mut result = HookRunResult::cancelled_with_message("blocked".to_string());
+        result.mark_suppress_output();
+        assert!(result.should_suppress_output());
+        assert!(result.is_cancelled());
+        // 再打一次仍为 true(幂等)
+        result.mark_suppress_output();
+        assert!(result.should_suppress_output());
     }
 }

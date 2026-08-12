@@ -904,6 +904,64 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["decision-log".to_string(), "memory".to_string()],
     });
+    // Epic 4 延续:bus_list / bus_send / bus_watch — Session Bus 统一路由层工具。
+    // 让 AI 自主调用多会话总线能力(查看 peer / 发消息 / 订阅消息流)。
+    // 执行由 ConversationRuntime::run_turn 拦截,路由到 execute_bus_list /
+    // execute_bus_send / execute_bus_watch(conversation.rs)。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "bus_list".to_string(),
+        description: Some(
+            "List all peer sessions currently visible on the Session Bus (main session, running sub-agents, IDE panels, IM channels) with their kind, status (idle/streaming/blocked/done) and unread count. Read-only. Call this before coordinating multiple sessions (e.g. after dispatching sub-agents) to know what is running and reachable.".to_string(),
+        ),
+        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["session-bus".to_string(), "orchestration".to_string()],
+    });
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "bus_send".to_string(),
+        description: Some(
+            "Send a message to another session on the Session Bus. Target must be a peer session_id from bus_list (e.g. a subagent_id) or '*' to broadcast. If the target is a sub-agent, the message is delivered as a steering command (consumed on its next tool-call iteration). Otherwise it is delivered as a message into the target's unread queue. Permission is governed by session_bus.allow (deny by default). Returns the number of peers that received it.".to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "Target peer session_id (from bus_list) or '*' for broadcast."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Message content to send."
+                }
+            },
+            "required": ["to", "text"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["session-bus".to_string(), "orchestration".to_string()],
+    });
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "bus_watch".to_string(),
+        description: Some(
+            "Subscribe to another peer session's message stream: when that peer receives a message, a mirror is queued into this session's unread list (visible in the output view). Set unwatch=true to unsubscribe (idempotent). Useful to track a sub-agent's ongoing output. Target must be a peer session_id from bus_list and cannot be this session.".to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Peer session_id to watch/unwatch (from bus_list)."
+                },
+                "unwatch": {
+                    "type": "boolean",
+                    "description": "true = unsubscribe, false/absent = subscribe.",
+                    "default": false
+                }
+            },
+            "required": ["target"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["session-bus".to_string(), "orchestration".to_string()],
+    });
     // Phase 4-B: ProjectTopology + DomainTools registration.
     runtime_tools.push(RuntimeToolDefinition {
         name: "query_project_graph".to_string(),

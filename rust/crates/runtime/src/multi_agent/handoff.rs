@@ -30,6 +30,8 @@ pub enum HandoffStatus {
     Failed,
     /// 超过 max_iterations 截断(§8.1:返回 Err + Truncated handoff)。
     Truncated,
+    /// Epic 2 A2.3c:被主会话 kill 命令终止(父侧显式取消,部分结果已落盘)。
+    Cancelled,
     /// 旧格式纯文本文件(无 frontmatter,降级解析)。
     Legacy,
 }

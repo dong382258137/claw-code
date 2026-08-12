@@ -2147,6 +2147,247 @@ pub(crate) fn handle_im_command(args: Option<&str>) -> (String, serde_json::Valu
     }
 }
 
+/// Session Bus 命令处理（设计文档 2026-08-11-session-bus-design.md §2.3/Epic 1）。
+///
+/// 子命令：
+/// - `list`（默认）— 列出对等会话与状态
+/// - `send <target> <text>` — 主会话向目标 peer 发消息（Subagent 目标经 steer 通道注入）
+/// - `watch [target]` — 订阅/列出订阅的 peer 消息流（进入 OutputView）
+/// - `unwatch <target>` — 取消订阅
+/// - `help` — 本帮助
+///
+/// `session_id` 为当前会话 id（REPL/TUI 主会话或 resume 模式的会话）。
+pub(crate) fn handle_bus_command(args: Option<&str>, session_id: &str) -> String {
+    let trimmed = args.unwrap_or("").trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let subcommand = parts.next().unwrap_or("").to_string();
+    let rest = parts.next().unwrap_or("").trim().to_string();
+
+    // 确保发送方已注册（REPL/TUI 已在启动时注册 Main；resume 模式按需注册）。
+    let bus = runtime::global_session_bus();
+    if !bus.peers_snapshot().iter().any(|p| p.session_id == session_id) {
+        let _ = bus.register(runtime::BusPeer {
+            session_id: session_id.to_string(),
+            label: "主会话".to_string(),
+            kind: runtime::PeerKind::Main,
+            status: runtime::PeerStatus::Idle,
+            unread: 0,
+            last_seen_ms: runtime::bus_now_ms(),
+            config_path: None,
+        });
+    }
+
+    match subcommand.as_str() {
+        "" | "list" => render_bus_list(&bus, session_id),
+        "help" => render_bus_help(),
+        "send" => run_bus_send(&bus, session_id, &rest),
+        "watch" => run_bus_watch(&bus, session_id, &rest),
+        "unwatch" => run_bus_unwatch(&bus, session_id, &rest),
+        other => format!(
+            "Unknown bus subcommand: '{other}'.\n\x1b[2m用法: /bus [list|send|watch|unwatch|help]\x1b[0m"
+        ),
+    }
+}
+
+fn render_bus_help() -> String {
+    "\u{1f514} Session Bus\n  /bus list — 列出对等会话与状态\n  /bus send <target> <text> — 向目标 peer 发消息（Subagent 目标经 steer 通道注入）\n  /bus watch <target> — 订阅目标 peer 的消息流（进入 OutputView）\n  /bus watch — 列出当前订阅\n  /bus unwatch <target> — 取消订阅\n  /bus help — 本帮助\n\n目标可为 session_id 或 peer 标签（如 subagent:xxx），'*' 表示广播。".to_string()
+}
+
+fn render_bus_list(bus: &runtime::SessionBus, session_id: &str) -> String {
+    let mut peers = bus.peers_snapshot();
+    // Epic 2:合并邮箱发现的远端会话(跨进程对等,kind=ide)。
+    if let Some(bus_root) = bus.bus_root() {
+        peers.extend(bus.remote_peers(&bus_root, session_id));
+    }
+    let mut lines = vec![format!("\u{1f514} Session Bus · {} peers", peers.len())];
+    if peers.is_empty() {
+        lines.push("  <no peers registered>".to_string());
+        lines.push("  提示: 派发 subagent 或启动会话后，此列表会填充。".to_string());
+        return lines.join("\n");
+    }
+    for peer in peers {
+        let unread = if peer.unread > 0 {
+            format!(" · \x1b[33m未读 {}\x1b[0m", peer.unread)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "  {} · {} · {}{}",
+            peer.label,
+            peer.kind.as_str(),
+            peer.status.as_str(),
+            unread
+        ));
+    }
+    lines.push("用法: /bus list 查看对等会话与状态".to_string());
+    lines.join("\n")
+}
+
+/// 解析目标：`*` 广播；否则按 session_id 精确匹配，再按 label 匹配。
+/// 返回 (目标 session_id, 目标 kind)。
+fn resolve_bus_target(bus: &runtime::SessionBus, target: &str) -> Option<(String, runtime::PeerKind)> {
+    if target == "*" {
+        return None;
+    }
+    for peer in bus.peers_snapshot() {
+        if peer.session_id == target || peer.label == target {
+            return Some((peer.session_id, peer.kind));
+        }
+    }
+    None
+}
+
+/// `/bus send <target> <text>`：向目标 peer 发消息。
+/// - 目标是 Subagent → Command(steer) 消息，经执行循环注入为 [主会话指令]（复用 steer 通道）。
+/// - 目标为 Main/Ide/Im 或广播 → Message 消息。
+fn run_bus_send(bus: &runtime::SessionBus, session_id: &str, rest: &str) -> String {
+    let Some((target, text)) = rest.split_once(char::is_whitespace) else {
+        return "\x1b[33m用法: /bus send <target> <text>\x1b[0m\n  示例: /bus send subagent:api-worker 继续执行第 2 步\n        /bus send * 同步状态到所有会话".to_string();
+    };
+    let target = target.trim();
+    let text = text.trim();
+    if text.is_empty() {
+        return "\x1b[33m消息内容不能为空: /bus send <target> <text>\x1b[0m".to_string();
+    }
+
+    let (kind, payload) = match resolve_bus_target(bus, target) {
+        // Subagent 目标：复用 steer 通道（设计文档 Epic 1）
+        Some((_, runtime::PeerKind::Subagent)) => (
+            runtime::BusMessageKind::Command,
+            serde_json::json!({ "action": "steer", "message": text }),
+        ),
+        _ => (
+            runtime::BusMessageKind::Message,
+            serde_json::json!({ "text": text }),
+        ),
+    };
+
+    let msg = runtime::BusMessage {
+        from: session_id.to_string(),
+        to: target.to_string(),
+        kind,
+        payload,
+        hop: 0,
+        ts_ms: runtime::bus_now_ms(),
+    };
+    match bus.publish(msg) {
+        Ok(delivered) if !delivered.is_empty() => {
+            let target_label = if target == "*" {
+                format!("{} 个会话", delivered.len())
+            } else {
+                resolve_bus_target(bus, target)
+                    .map(|(_, kind)| format!("{} ({})", target, kind.as_str()))
+                    .unwrap_or_else(|| target.to_string())
+            };
+            format!("\u{2705} 已发送 → {target_label}: {text}")
+        }
+        Ok(_) => {
+            format!("\x1b[33m消息未送达: 目标 '{target}' 不存在、已退出或权限被拒。\x1b[0m\n\x1b[2m用 /bus list 查看当前对等会话。\x1b[0m")
+        }
+        Err(e) => format!("\x1b[31m发送失败: {e}\x1b[0m"),
+    }
+}
+
+/// `/bus watch [target]`：订阅（有参）或列出订阅（无参）。
+fn run_bus_watch(bus: &runtime::SessionBus, session_id: &str, rest: &str) -> String {
+    let target = rest.trim();
+    if target.is_empty() {
+        let watched = bus.watched_peers(session_id);
+        if watched.is_empty() {
+            return "当前未订阅任何 peer。\n用法: /bus watch <target>".to_string();
+        }
+        let mut lines = vec![format!("\u{1f514} 当前订阅 {} 个 peer", watched.len())];
+        for id in watched {
+            if let Some((_, kind)) = resolve_bus_target(bus, &id) {
+                lines.push(format!("  {id} ({})", kind.as_str()));
+            } else {
+                lines.push(format!("  {id}"));
+            }
+        }
+        return lines.join("\n");
+    }
+    if target == "*" {
+        return "\x1b[33m不支持订阅 '*'，请指定具体 peer（/bus list 查看）。\x1b[0m".to_string();
+    }
+    let Some((id, kind)) = resolve_bus_target(bus, target) else {
+        return format!("\x1b[33m目标 '{target}' 不存在或已退出（/bus list 查看）。\x1b[0m");
+    };
+    match bus.watch(session_id, &id) {
+        Ok(()) => format!(
+            "\u{1f4c1} 已订阅 {id} ({}) 的消息流。后续该 peer 收到的消息将进入 OutputView。\n\x1b[2m取消: /bus unwatch {id}\x1b[0m",
+            kind.as_str()
+        ),
+        Err(e) => format!("\x1b[33m订阅失败: {e}\x1b[0m"),
+    }
+}
+
+/// `/bus unwatch <target>`：取消订阅。
+fn run_bus_unwatch(bus: &runtime::SessionBus, session_id: &str, rest: &str) -> String {
+    let target = rest.trim();
+    if target.is_empty() {
+        return "\x1b[33m用法: /bus unwatch <target>\x1b[0m".to_string();
+    }
+    if let Some((id, _)) = resolve_bus_target(bus, target) {
+        bus.unwatch(session_id, &id);
+        format!("\u{1f4c1} 已取消订阅 {id}。")
+    } else {
+        bus.unwatch(session_id, target);
+        format!("\u{1f4c1} 已取消订阅 {target}。")
+    }
+}
+
+/// 渲染一条 bus 消息为可读行（供 REPL 主会话 drain 使用）。
+/// 镜像（watch_relay）显示原始目标；Handoff 显示状态+摘要；Command 显示 action+内容。
+pub(crate) fn render_bus_message_line(m: &runtime::BusMessage) -> String {
+    let payload = &m.payload;
+    let summary = match m.kind {
+        runtime::BusMessageKind::Handoff => {
+            let status = payload
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("done");
+            let text = payload
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>();
+            format!("[{status}] {text}")
+        }
+        runtime::BusMessageKind::Command => {
+            let action = payload
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cmd");
+            let text = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("[指令:{action}] {text}")
+        }
+        runtime::BusMessageKind::State => {
+            let text = payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("状态变更");
+            text.to_string()
+        }
+        runtime::BusMessageKind::Message => payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    };
+    // watch 镜像：标注原始目标（"→ sub-1: 内容"）
+    if payload.get("watch_relay").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if let Some(original) = payload.get("original_to").and_then(|v| v.as_str()) {
+            return format!("→ {original}: {summary}");
+        }
+    }
+    summary
+}
+
 fn im_bridge_config_path() -> std::path::PathBuf {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -2581,4 +2822,58 @@ fn resolve_im_bridge_binary() -> Option<std::path::PathBuf> {
     }
     // 3) 直接尝试命令名（让系统解析 PATH）
     Some(std::path::PathBuf::from(name))
+}
+
+#[cfg(test)]
+mod bus_tests {
+    use super::*;
+
+    fn bus_message(kind: runtime::BusMessageKind, payload: serde_json::Value) -> runtime::BusMessage {
+        runtime::BusMessage {
+            from: "sub-1".to_string(),
+            to: "main-1".to_string(),
+            kind,
+            payload,
+            hop: 0,
+            ts_ms: 0,
+        }
+    }
+
+    #[test]
+    fn render_message_plain_text() {
+        let m = bus_message(
+            runtime::BusMessageKind::Message,
+            serde_json::json!({ "text": "hello 世界" }),
+        );
+        assert_eq!(render_bus_message_line(&m), "hello 世界");
+    }
+
+    #[test]
+    fn render_steer_command_shows_action() {
+        let m = bus_message(
+            runtime::BusMessageKind::Command,
+            serde_json::json!({ "action": "steer", "message": "继续第 2 步" }),
+        );
+        assert_eq!(render_bus_message_line(&m), "[指令:steer] 继续第 2 步");
+    }
+
+    #[test]
+    fn render_handoff_shows_status_and_summary() {
+        let m = bus_message(
+            runtime::BusMessageKind::Handoff,
+            serde_json::json!({ "status": "success", "summary": "已完成任务" }),
+        );
+        assert_eq!(render_bus_message_line(&m), "[success] 已完成任务");
+    }
+
+    #[test]
+    fn render_watch_relay_prepends_original_target() {
+        let mut m = bus_message(
+            runtime::BusMessageKind::Command,
+            serde_json::json!({ "action": "steer", "message": "继续" }),
+        );
+        m.payload["watch_relay"] = serde_json::json!(true);
+        m.payload["original_to"] = serde_json::json!("sub-1");
+        assert_eq!(render_bus_message_line(&m), "→ sub-1: [指令:steer] 继续");
+    }
 }

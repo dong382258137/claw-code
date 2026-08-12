@@ -91,6 +91,11 @@ pub struct RuntimeFeatureConfig {
     /// semantic query without enumerating the full catalog. Set to `Some(false)`
     /// to hide the tool. `None` is treated as enabled.
     skills_tool_search_enabled: Option<bool>,
+    /// Session Bus 互通白名单（`settings.sessionBus.allow`，设计文档
+    /// 2026-08-11-session-bus-design.md §2.5）。每条规则 `"<from>:<to>"`，
+    /// `*` 匹配任意 kind；省略冒号视为 `"<from>:*"`。启动时经
+    /// [`crate::session_bus::SessionBus::apply_allow_rules`] 应用到全局总线。
+    session_bus_allow: Vec<String>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -419,7 +424,7 @@ impl ConfigLoader {
             || PathBuf::from(".claw.json"),
             |parent| parent.join(".claw.json"),
         );
-        vec![
+        let mut entries = vec![
             ConfigEntry {
                 source: ConfigSource::User,
                 path: user_legacy_path,
@@ -428,19 +433,49 @@ impl ConfigLoader {
                 source: ConfigSource::User,
                 path: self.config_home.join("settings.json"),
             },
-            ConfigEntry {
+        ];
+        // Epic 2(A2.1):ancestor walk — 项目树内配置继承(父先子后,子覆盖父)。
+        // 从 cwd 向上收集各层 `.claw.json` + `.claw/settings.json`,到用户主目录
+        // (USERPROFILE / HOME,与 diag.rs 约定一致)即止——主目录级配置已由
+        // User source 收集,不进入项目继承链(避免把 `~/.claw.json` 误当
+        // Project 配置重复合并,也避免临时目录测试被真实用户配置污染)。
+        // `settings.local.json` 仅当前目录(本地例外,不随继承链传播)。
+        let home_dir = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        let mut dir = Some(self.cwd.clone());
+        while let Some(d) = dir {
+            ancestors.push(d.clone());
+            if home_dir.as_ref().is_some_and(|h| &d == h) {
+                break;
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+        // ancestors 当前为 [cwd, parent, ..., 主目录],反转成 [主目录, ..., parent, cwd](父先子后)
+        ancestors.reverse();
+        for d in &ancestors {
+            // 跳过主目录与 config_home 层级(其配置由 User source 收集,避免重复合并);
+            // cwd 自身永远收集(即使 cwd 恰为主目录)。
+            let is_skipped_layer = home_dir.as_ref().is_some_and(|h| d == h)
+                || d.as_path() == self.config_home.as_path();
+            if is_skipped_layer && d != &self.cwd {
+                continue;
+            }
+            entries.push(ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw.json"),
-            },
-            ConfigEntry {
+                path: d.join(".claw.json"),
+            });
+            entries.push(ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw").join("settings.json"),
-            },
-            ConfigEntry {
-                source: ConfigSource::Local,
-                path: self.cwd.join(".claw").join("settings.local.json"),
-            },
-        ]
+                path: d.join(".claw").join("settings.json"),
+            });
+        }
+        entries.push(ConfigEntry {
+            source: ConfigSource::Local,
+            path: self.cwd.join(".claw").join("settings.local.json"),
+        });
+        entries
     }
 
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
@@ -505,6 +540,7 @@ impl ConfigLoader {
                 &merged_value,
                 "skillsToolSearchEnabled",
             ),
+            session_bus_allow: parse_optional_session_bus_allow(&merged_value),
         };
 
         Ok(RuntimeConfig {
@@ -753,6 +789,12 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn skills_tool_search_enabled_or_default(&self) -> bool {
         self.skills_tool_search_enabled.unwrap_or(true)
+    }
+
+    /// Session Bus 互通白名单（`settings.sessionBus.allow`）。
+    #[must_use]
+    pub fn session_bus_allow(&self) -> &[String] {
+        &self.session_bus_allow
     }
 }
 
@@ -1127,10 +1169,8 @@ fn parse_optional_hooks_config_object(
     };
     let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_hook_array(hooks, "PreToolUse", context)?
-            .unwrap_or_default(),
-        post_tool_use: optional_hook_array(hooks, "PostToolUse", context)?
-            .unwrap_or_default(),
+        pre_tool_use: optional_hook_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
+        post_tool_use: optional_hook_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
         post_tool_use_failure: optional_hook_array(hooks, "PostToolUseFailure", context)?
             .unwrap_or_default(),
         lifecycle: std::collections::HashMap::new(),
@@ -1355,6 +1395,28 @@ fn parse_optional_bool(root: &JsonValue, key: &str) -> Option<bool> {
     root.as_object()
         .and_then(|object| object.get(key))
         .and_then(JsonValue::as_bool)
+}
+
+/// 解析 `settings.sessionBus.allow` 字符串数组（Session Bus 互通白名单）。
+/// 未配置或类型不匹配时返回空列表。形如：
+/// `{"sessionBus": {"allow": ["im:main", "ide:*"]}}`
+fn parse_optional_session_bus_allow(root: &JsonValue) -> Vec<String> {
+    let Some(object) = root.as_object() else {
+        return Vec::new();
+    };
+    let Some(session_bus) = object.get("sessionBus").and_then(JsonValue::as_object) else {
+        return Vec::new();
+    };
+    let Some(array) = session_bus.get("allow").and_then(JsonValue::as_array) else {
+        return Vec::new();
+    };
+    let mut rules = Vec::new();
+    for value in array {
+        if let Some(rule) = value.as_str() {
+            rules.push(rule.to_string());
+        }
+    }
+    rules
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
@@ -1935,10 +1997,7 @@ mod tests {
         assert_eq!(hooks[0].timeout_ms, None);
         // 新格式对象
         assert_eq!(hooks[1].value, "printf gated");
-        assert_eq!(
-            hooks[1].matchers,
-            Some(vec!["bash|edit_file".to_string()])
-        );
+        assert_eq!(hooks[1].matchers, Some(vec!["bash|edit_file".to_string()]));
         assert_eq!(hooks[1].timeout_ms, Some(5000));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2133,6 +2192,53 @@ mod tests {
 
         // then
         assert!(loaded.trusted_roots().is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn session_bus_allow_parses_configured_rules() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"sessionBus": {"allow": ["im:main", "ide:*"]}}"#,
+        )
+        .expect("write project settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        assert_eq!(
+            loaded.feature_config().session_bus_allow(),
+            ["im:main".to_string(), "ide:*".to_string()]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn session_bus_allow_defaults_empty() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.feature_config().session_bus_allow().is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -2427,6 +2533,108 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    // Epic 2(A2.1):ancestor walk — 子目录配置继承父级,同名键子级覆盖父级。
+    #[test]
+    fn ancestor_walk_merges_parent_config_with_child_override() {
+        let root = temp_dir();
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(home.join("settings.json"), r#"{"model":"user-model"}"#).unwrap();
+        // 父级 project 配置
+        fs::create_dir_all(root.join("repo/.claw")).unwrap();
+        fs::write(
+            root.join("repo/.claw/settings.json"),
+            r#"{"model":"parent-model","permissionMode":"read-only"}"#,
+        )
+        .unwrap();
+        // 子目录配置(同名键覆盖父级)
+        fs::create_dir_all(root.join("repo/crates/api/.claw")).unwrap();
+        fs::write(
+            root.join("repo/crates/api/.claw/settings.json"),
+            r#"{"model":"child-model"}"#,
+        )
+        .unwrap();
+
+        let loaded = ConfigLoader::new(root.join("repo/crates/api"), &home)
+            .load()
+            .expect("load");
+        // 子级覆盖父级(也覆盖 user 级)
+        assert_eq!(
+            loaded.get("model").and_then(|v| v.as_str()),
+            Some("child-model")
+        );
+        // 父级键继承(未被覆盖)
+        assert_eq!(
+            loaded.get("permissionMode").and_then(|v| v.as_str()),
+            Some("read-only")
+        );
+    }
+
+    // Epic 2(A2.1):`settings.local.json` 仅当前目录生效,不随继承链传播。
+    #[test]
+    fn ancestor_walk_does_not_inherit_settings_local() {
+        let root = temp_dir();
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).unwrap();
+        // 父级 local 配置(不应被子目录继承)
+        fs::create_dir_all(root.join("repo/.claw")).unwrap();
+        fs::write(
+            root.join("repo/.claw/settings.local.json"),
+            r#"{"permissionMode":"danger-full-access"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("repo/crates/api")).unwrap();
+
+        let loaded = ConfigLoader::new(root.join("repo/crates/api"), &home)
+            .load()
+            .expect("load");
+        assert_ne!(
+            loaded.get("permissionMode").and_then(|v| v.as_str()),
+            Some("danger-full-access"),
+            "parent settings.local.json must not be inherited by child directory"
+        );
+    }
+
+    // Epic 2(A2.1):优先级 user < parent < child < local。
+    #[test]
+    fn ancestor_walk_priority_user_parent_child_local() {
+        let root = temp_dir();
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("settings.json"), r#"{"model":"user-model"}"#).unwrap();
+        fs::create_dir_all(root.join("repo/.claw")).unwrap();
+        fs::write(
+            root.join("repo/.claw/settings.json"),
+            r#"{"model":"parent-model"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("repo/crates/api/.claw")).unwrap();
+        fs::write(
+            root.join("repo/crates/api/.claw/settings.json"),
+            r#"{"model":"child-model","permissionMode":"read-only"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("repo/crates/api/.claw/settings.local.json"),
+            r#"{"model":"local-model"}"#,
+        )
+        .unwrap();
+
+        let loaded = ConfigLoader::new(root.join("repo/crates/api"), &home)
+            .load()
+            .expect("load");
+        // local 最高优先级(覆盖 user/parent/child)
+        assert_eq!(
+            loaded.get("model").and_then(|v| v.as_str()),
+            Some("local-model")
+        );
+        // child settings.json 覆盖 user 级(permissionMode 仅 user/child 出现)
+        assert_eq!(
+            loaded.get("permissionMode").and_then(|v| v.as_str()),
+            Some("read-only")
+        );
     }
 
     #[test]

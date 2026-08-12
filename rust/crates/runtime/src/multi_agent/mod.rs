@@ -22,6 +22,8 @@ pub mod handoff;
 pub mod file_guard;
 // Multi-Agent Hardening §4.4:验证门禁(ValidationGate trait + CommandValidationGate + LlmJudgeGate 预留)。
 pub mod validation;
+// Epic 2 A2.3b:子代理生命周期清单(manifest.json,subagent_id → workspace 映射)。
+pub mod manifest;
 pub use dag::DagStore;
 pub use dag::{
     CoordinatorExecutor, DagError, DagGraph, DagId, DagNode, DagRunResult, DagScheduler, FailFast,
@@ -99,7 +101,13 @@ impl SubagentCapability {
     pub fn allowed_tools(self) -> &'static [&'static str] {
         match self {
             Self::Analyze => &[],
-            Self::ReadOnly => &["read_file", "grep_search", "glob_search", "repomap", "lsp_diagnostics"],
+            Self::ReadOnly => &[
+                "read_file",
+                "grep_search",
+                "glob_search",
+                "repomap",
+                "lsp_diagnostics",
+            ],
             Self::Execute => &[
                 "read_file",
                 "grep_search",
@@ -175,6 +183,10 @@ pub struct Subagent {
     pub status: SubagentStatus,
     /// 工作目录(Worktree 模式下为独立 git worktree 路径)。
     pub workdir: Option<PathBuf>,
+    /// 绑定的子工作区目录(Epic 2 A2.3a:目录层级控制派发时注入,None = 主会话 cwd)。
+    /// 供 `/subagent list`、manifest 生命周期、steer/kill 的 workspace 校验使用。
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
     /// 创建时间(unix epoch 秒)。
     pub created_at: u64,
     /// 完成时间(unix epoch 秒,None 表示未完成)。
@@ -279,6 +291,9 @@ pub struct SpawnRequest {
     /// 子智能体能力分级 — TRAE 架构对齐(§3.1)。默认 `Analyze`(向后兼容,
     /// `new()` 不接收此参数,调用方通过 `with_capability()` 设置)。
     pub capability: SubagentCapability,
+    /// 绑定的子工作区目录(Epic 2 A2.3a:None = 主会话 cwd)。
+    /// 默认 `None`(`new()` 不接收此参数,调用方通过 `with_workspace()` 设置)。
+    pub workspace: Option<PathBuf>,
 }
 
 impl SpawnRequest {
@@ -301,6 +316,7 @@ impl SpawnRequest {
             model: model.into(),
             complexity,
             capability: SubagentCapability::Analyze,
+            workspace: None,
         }
     }
 
@@ -308,6 +324,13 @@ impl SpawnRequest {
     #[must_use]
     pub fn with_capability(mut self, capability: SubagentCapability) -> Self {
         self.capability = capability;
+        self
+    }
+
+    /// Builder:绑定子工作区目录(Epic 2 A2.3a,链式调用)。
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: Option<PathBuf>) -> Self {
+        self.workspace = workspace;
         self
     }
 }
@@ -404,6 +427,7 @@ impl MultiAgentCoordinator {
             task,
             status: SubagentStatus::Created,
             workdir,
+            workspace: None,
             created_at: now_secs(),
             completed_at: None,
             result: None,
@@ -422,6 +446,8 @@ impl MultiAgentCoordinator {
 
         let mut agents = self.subagents.lock().expect("subagents lock poisoned");
         agents.insert(id.clone(), subagent);
+        drop(agents);
+        self.persist_manifest();
         id
     }
 
@@ -540,6 +566,7 @@ impl MultiAgentCoordinator {
                 let coord = this.clone();
                 s.spawn(move || {
                     let capability = task.capability;
+                    let workspace = task.workspace;
                     let result = coord
                         .spawn_with_model(
                             task.name,
@@ -551,6 +578,10 @@ impl MultiAgentCoordinator {
                         .and_then(|id| {
                             // 传播 SpawnRequest.capability 到 Subagent(§3.1)
                             coord.set_capability(&id, capability).map(|()| id)
+                        })
+                        .and_then(|id| {
+                            // 传播 SpawnRequest.workspace 到 Subagent(Epic 2 A2.3a)
+                            coord.set_workspace(&id, workspace).map(|()| id)
                         });
                     results.lock().expect("results lock poisoned")[i] = Some(result);
                 });
@@ -920,6 +951,58 @@ impl MultiAgentCoordinator {
         Ok(())
     }
 
+    /// 设置子 agent 绑定的子工作区目录 — Epic 2 A2.3a。
+    ///
+    /// 由 `execute_dispatch_subagent` / `spawn_parallel` 在 spawn 后调用,
+    /// 记录目录层级控制派发的 workspace(供 manifest 生命周期与 steer/kill
+    /// 的 workspace 校验使用)。`None` 表示子代理运行在主会话 cwd。
+    pub fn set_workspace(
+        &self,
+        subagent_id: &str,
+        workspace: Option<PathBuf>,
+    ) -> Result<(), String> {
+        let mut agents = self.subagents.lock().expect("subagents lock");
+        let agent = agents
+            .get_mut(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+        agent.workspace = workspace;
+        drop(agents);
+        self.persist_manifest();
+        Ok(())
+    }
+
+    /// 把当前全部子代理的状态投影到 `<workspace_root>/.claw/subagents/manifest.json`
+    /// — Epic 2 A2.3b。
+    ///
+    /// best-effort:workspace_root 未设置(如纯内存测试)或写盘失败均静默跳过,
+    /// 不阻塞子代理生命周期。状态转换点(spawn/start/complete/fail/cancel/
+    /// set_workspace)统一调用,保证跨会话可见性与磁盘恢复一致。
+    fn persist_manifest(&self) {
+        let Some(workspace_root) = self
+            .workspace_root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let agents = self.subagents.lock().unwrap_or_else(|e| e.into_inner());
+        let entries: Vec<manifest::SubagentManifestEntry> = agents
+            .values()
+            .map(|a| manifest::SubagentManifestEntry {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                status: format!("{:?}", a.status).to_ascii_lowercase(),
+                workspace: a.workspace.clone(),
+                created_at: a.created_at,
+                completed_at: a.completed_at,
+                result_ref: a.result.clone(),
+            })
+            .collect();
+        drop(agents);
+        let _ = manifest::sync_manifest(&workspace_root, &entries);
+    }
+
     /// 读取子 agent 的成本上限 — 用于 retry loop 失败消息中显示。
     #[must_use]
     pub fn get_cost_limit(&self, subagent_id: &str) -> Option<f64> {
@@ -953,6 +1036,8 @@ impl MultiAgentCoordinator {
             ));
         }
         agent.status = SubagentStatus::Running;
+        drop(agents);
+        self.persist_manifest();
         Ok(())
     }
 
@@ -1003,6 +1088,8 @@ impl MultiAgentCoordinator {
                             agent.result = Some(result.clone());
                         }
                     }
+                    drop(agents);
+                    coord.persist_manifest();
                     Ok(result)
                 }
                 Err(error) => {
@@ -1014,6 +1101,8 @@ impl MultiAgentCoordinator {
                             agent.result = Some(format!("error: {}", &error));
                         }
                     }
+                    drop(agents);
+                    coord.persist_manifest();
                     Err(error)
                 }
             }
@@ -1037,6 +1126,8 @@ impl MultiAgentCoordinator {
         agent.status = SubagentStatus::Completed;
         agent.completed_at = Some(now_secs());
         agent.result = Some(result.into());
+        drop(agents);
+        self.persist_manifest();
         Ok(())
     }
 
@@ -1062,6 +1153,8 @@ impl MultiAgentCoordinator {
         agent.status = SubagentStatus::Failed;
         agent.completed_at = Some(now_secs());
         agent.result = Some(format!("error: {}", error.into()));
+        drop(agents);
+        self.persist_manifest();
         Ok(())
     }
 
@@ -1082,6 +1175,8 @@ impl MultiAgentCoordinator {
         }
         agent.status = SubagentStatus::Cancelled;
         agent.completed_at = Some(now_secs());
+        drop(agents);
+        self.persist_manifest();
         Ok(())
     }
 
@@ -1734,7 +1829,13 @@ mod tests {
         let ro = SubagentCapability::ReadOnly.allowed_tools();
         assert_eq!(
             ro,
-            &["read_file", "grep_search", "glob_search", "repomap", "lsp_diagnostics"]
+            &[
+                "read_file",
+                "grep_search",
+                "glob_search",
+                "repomap",
+                "lsp_diagnostics"
+            ]
         );
         let ex = SubagentCapability::Execute.allowed_tools();
         assert!(ex.contains(&"edit_file"));
@@ -2269,6 +2370,55 @@ mod tests {
         coord.validate(&id).expect("no gates = always Ok");
         let agent = coord.get(&id).expect("agent exists");
         assert!(agent.validated, "validated flag should be set");
+    }
+
+    /// Epic 2 A2.3b:子代理状态流转(spawn → start → complete)同步写
+    /// `.claw/subagents/manifest.json`,含 workspace 绑定映射。
+    #[test]
+    fn lifecycle_syncs_manifest_with_workspace_binding() {
+        let coord = MultiAgentCoordinator::new();
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        coord.set_workspace_root(tempdir.path().to_path_buf());
+
+        let id = coord.spawn("ws-worker", "task", CoordinationMode::Fork);
+        let ws = tempdir.path().join("crates/api");
+        coord
+            .set_workspace(&id, Some(ws.clone()))
+            .expect("bind workspace");
+        coord.start(&id).expect("start");
+        coord
+            .complete(&id, ".claw/subagents/foo.md")
+            .expect("complete");
+
+        let entries = manifest::read_manifest(tempdir.path());
+        assert_eq!(
+            entries.len(),
+            1,
+            "manifest should contain exactly one entry"
+        );
+        let entry = &entries[0];
+        assert_eq!(entry.id, id);
+        assert_eq!(entry.name, "ws-worker");
+        assert_eq!(entry.status, "completed");
+        assert_eq!(entry.workspace.as_deref(), Some(ws.as_path()));
+        assert_eq!(entry.result_ref.as_deref(), Some(".claw/subagents/foo.md"));
+    }
+
+    /// Epic 2 A2.3b:cancel 状态同步到 manifest。
+    #[test]
+    fn lifecycle_syncs_manifest_on_cancel() {
+        let coord = MultiAgentCoordinator::new();
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        coord.set_workspace_root(tempdir.path().to_path_buf());
+
+        let id = coord.spawn("cancelled-worker", "task", CoordinationMode::Fork);
+        coord.start(&id).expect("start");
+        coord.cancel(&id).expect("cancel");
+
+        let entries = manifest::read_manifest(tempdir.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "cancelled");
+        assert!(entries[0].completed_at.is_some());
     }
 
     /// §10.4 validate:非 Completed 状态不可验证

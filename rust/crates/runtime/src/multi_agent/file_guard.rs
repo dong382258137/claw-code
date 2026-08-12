@@ -252,7 +252,11 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::thread;
+
+    /// 串行化所有读写进程级环境变量 `CLAW_SUBAGENT_FILE_LOCK_TIMEOUT` 的测试。
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_workspace() -> tempfile::TempDir {
         tempfile::tempdir().expect("temp dir")
@@ -409,6 +413,8 @@ mod tests {
 
     #[test]
     fn lock_timeout_env_var() {
+        // 两个 env 测试共享同一进程级环境变量,必须串行执行(防并发竞态)。
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 临时设置超时为 1 秒
         env::set_var(LOCK_TIMEOUT_ENV, "1");
         assert_eq!(lock_timeout(), Duration::from_secs(1));
@@ -423,6 +429,7 @@ mod tests {
 
     #[test]
     fn lock_timeout_invalid_env_falls_back_to_default() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         env::set_var(LOCK_TIMEOUT_ENV, "not-a-number");
         assert_eq!(
             lock_timeout(),

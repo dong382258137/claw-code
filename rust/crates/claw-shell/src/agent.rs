@@ -264,6 +264,21 @@ where
 
         *self.runtime.borrow_mut() = Some(runtime);
 
+        // Session Bus(设计文档 §2.4):面板会话注册为 Ide 对等会话,
+        // 使主会话可经 `/bus send ide:<id>` 向其发消息。
+        {
+            let bus = runtime::global_session_bus();
+            let _ = bus.register(runtime::BusPeer {
+                session_id: session_id.0.to_string(),
+                label: format!("ide:{}", session_id.0),
+                kind: runtime::PeerKind::Ide,
+                status: runtime::PeerStatus::Idle,
+                unread: 0,
+                last_seen_ms: runtime::bus_now_ms(),
+                config_path: None,
+            });
+        }
+
         Ok(acp::NewSessionResponse::new(session_id))
     }
 
@@ -340,6 +355,17 @@ where
             tracing::debug!("claw-agent: flushed {flushed} lane events to ACP gateway");
         }
 
+        // Session Bus(设计文档 §2.4):把发给本面板 session 的未读 bus 消息
+        // 作为 `session/peer_message` 通知推送(复用 lane_bridge 推送模式)。
+        let bus = runtime::global_session_bus();
+        let panel_unread = bus.unread_messages(session_id.0.as_ref());
+        if !panel_unread.is_empty() {
+            bus.mark_read(session_id.0.as_ref());
+            for m in panel_unread {
+                crate::lane_bridge::push_bus_message_to_acp(&self.client_gateway, &m);
+            }
+        }
+
         // 推流 assistant 文本(本期简化:turn 完成后一次性推送,非真实流式)
         let text = Self::extract_assistant_text(&runtime_rc);
         if !text.is_empty() {
@@ -391,7 +417,13 @@ where
         Err(acp::Error::method_not_found())
     }
 
-    async fn ext_notification(&self, _arguments: acp::ExtNotification) -> Result<(), acp::Error> {
+    async fn ext_notification(&self, arguments: acp::ExtNotification) -> Result<(), acp::Error> {
+        // Session Bus(设计文档 2026-08-11-session-bus-design.md §2.4):
+        // IDE 面板经 `session/broadcast` ExtNotification 向总线发布消息,
+        // 复用 lane_bridge 的广播处理(注册面板为 Ide peer + publish)。
+        if arguments.method.as_ref() == "session/broadcast" {
+            crate::lane_bridge::handle_broadcast_notification(&arguments.params);
+        }
         Ok(())
     }
 }

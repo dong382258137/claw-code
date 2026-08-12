@@ -64,12 +64,18 @@ pub(crate) enum StatusEvent {
         output: String,
         is_error: bool,
     },
-    /// A thinking block was observed during streaming. `char_count` is the
-    /// number of thinking chars hidden from the user (None when the provider
-    /// redacted the content entirely). `redacted` is true for
-    /// `RedactedThinking` blocks. The TUI renders a short summary like
-    /// "▶ Thinking (N chars hidden)" so users know reasoning happened.
+    /// A thinking block was observed during streaming.
+    ///
+    /// - `text`: 本次事件的 thinking 增量文本。流式路径每次携带一个 delta
+    ///   （`done=false`）；完整块路径携带整段 thinking（`done=true`）。
+    ///   结束信号（`done=true`）时 `text` 可为空，TUI 据此折叠卡片。
+    /// - `done`: 思考块是否已结束（ContentBlockStop / 完整块到达）。
+    ///   TUI 收到 `done=true` 时把 Thinking 卡片折叠为摘要。
+    /// - `char_count`: 思考块总字符数（`done=true` 时可知；流式期间为 None）。
+    /// - `redacted`: 是否 `RedactedThinking`（provider 隐藏了内容）。
     Thinking {
+        text: String,
+        done: bool,
         char_count: Option<usize>,
         redacted: bool,
     },
@@ -652,6 +658,7 @@ impl AnthropicRuntimeClient {
                     // 导致 [Thinking, Text, ToolUse] 序列会重复 emit 3 次 Thinking。
                     // 现在改为先处理所有块，循环结束后只 emit 一次。
                     let mut had_thinking_summary = false;
+                    let mut emitted_thinking = false;
                     for block in start.message.content {
                         push_output_block(
                             block,
@@ -673,15 +680,29 @@ impl AnthropicRuntimeClient {
                         // text 之前）。这里立即 emit 以保证顺序正确。
                         if let Some((thinking, signature)) = pending_thinking.take() {
                             if !thinking.is_empty() {
+                                let len = thinking.chars().count();
                                 events.push(AssistantEvent::Thinking {
-                                    thinking,
+                                    thinking: thinking.clone(),
                                     signature,
                                 });
+                                // 完整块路径：携带全文 + done=true，TUI 立即渲染并折叠。
+                                self.emit_status(StatusEvent::Thinking {
+                                    text: thinking,
+                                    done: true,
+                                    char_count: Some(len),
+                                    redacted: false,
+                                });
+                                emitted_thinking = true;
                             }
                         }
                     }
-                    if had_thinking_summary {
+                    // 兜底：RedactedThinking 等无文本 thinking 块（pending_thinking 为空）
+                    // 未在循环内 emit，此处补发 done 信号。有文本的已在上面 emit，
+                    // 跳过避免重复。
+                    if had_thinking_summary && !emitted_thinking {
                         self.emit_status(StatusEvent::Thinking {
+                            text: String::new(),
+                            done: true,
                             char_count: None,
                             redacted: false,
                         });
@@ -711,11 +732,40 @@ impl AnthropicRuntimeClient {
                     }
                     // P1 修复：同 MessageStart 分支，ContentBlockStart 携带完整
                     // thinking 块时也需 emit Thinking 事件给 TUI。
+                    // 注意：不 take pending_thinking —— 完整 thinking 块由
+                    // ContentBlockStop 统一 take 并 push AssistantEvent。
                     if block_has_thinking_summary {
-                        self.emit_status(StatusEvent::Thinking {
-                            char_count: None,
-                            redacted: false,
-                        });
+                        match pending_thinking.as_ref() {
+                            // 完整块（非空文本，OpenAI-compat 场景）：携带全文 + done=true。
+                            Some((thinking, _)) if !thinking.is_empty() => {
+                                let len = thinking.chars().count();
+                                self.emit_status(StatusEvent::Thinking {
+                                    text: thinking.clone(),
+                                    done: true,
+                                    char_count: Some(len),
+                                    redacted: false,
+                                });
+                            }
+                            // 空 thinking 块（Anthropic 流式开始）：发送开始信号
+                            // （done=false），后续 ThinkingDelta 追加，ContentBlockStop 折叠。
+                            Some(_) => {
+                                self.emit_status(StatusEvent::Thinking {
+                                    text: String::new(),
+                                    done: false,
+                                    char_count: None,
+                                    redacted: false,
+                                });
+                            }
+                            // RedactedThinking：无文本无 delta，立即折叠。
+                            None => {
+                                self.emit_status(StatusEvent::Thinking {
+                                    text: String::new(),
+                                    done: true,
+                                    char_count: None,
+                                    redacted: true,
+                                });
+                            }
+                        }
                     }
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -750,15 +800,15 @@ impl AnthropicRuntimeClient {
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
-                            // Phase 3: notify TUI that a thinking block is
-                            // happening. char_count is None because streaming
-                            // deltas don't give us the total (matches the
-                            // stdout summary which also says "hidden").
-                            self.emit_status(StatusEvent::Thinking {
-                                char_count: None,
-                                redacted: false,
-                            });
                         }
+                        // 实时渲染：每个 delta 都 emit 增量文本给 TUI 追加到
+                        // Thinking 卡片。char_count 流式期间未知（None）。
+                        self.emit_status(StatusEvent::Thinking {
+                            text: thinking.clone(),
+                            done: false,
+                            char_count: None,
+                            redacted: false,
+                        });
                         match &mut pending_thinking {
                             Some((pending, _)) => pending.push_str(&thinking),
                             None => {
@@ -794,9 +844,19 @@ impl AnthropicRuntimeClient {
                     // (空内容会被 DeepSeek 拒绝)。
                     if let Some((thinking, signature)) = pending_thinking.take() {
                         if !thinking.is_empty() {
+                            let len = thinking.chars().count();
                             events.push(AssistantEvent::Thinking {
-                                thinking,
+                                thinking: thinking.clone(),
                                 signature,
+                            });
+                            // 思考块结束信号：TUI 把 Thinking 卡片折叠为摘要。
+                            // 若 ContentBlockStart 已带全文（done=true）则此处重复
+                            // emit 也无害 —— TUI 折叠是幂等操作。
+                            self.emit_status(StatusEvent::Thinking {
+                                text: String::new(),
+                                done: true,
+                                char_count: Some(len),
+                                redacted: false,
                             });
                         }
                     }

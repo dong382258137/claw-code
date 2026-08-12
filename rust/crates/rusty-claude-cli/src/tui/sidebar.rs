@@ -140,6 +140,45 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
             Span::raw(&state.goal_badge),
         ]));
     }
+
+    // 会话互通：Session Bus 对等会话视图（设计文档 2026-08-11-session-bus-design.md §2.3）。
+    // 显示其他会话（子代理/IDE/IM）的状态与未读计数，超出 section 高度自动裁剪。
+    let peers = runtime::global_session_bus().peers_snapshot();
+    if !peers.is_empty() {
+        let budget = area
+            .height
+            .saturating_sub(lines.len() as u16)
+            .saturating_sub(1); // 1 行标题
+        if budget >= 1 {
+            lines.push(Line::from(Span::styled(
+                format!("总线 {}", peers.len()),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for peer in peers.into_iter().take(budget as usize) {
+                let status_color = match peer.status {
+                    runtime::PeerStatus::Streaming => Color::LightCyan,
+                    runtime::PeerStatus::Blocked => Color::Yellow,
+                    runtime::PeerStatus::Done | runtime::PeerStatus::Idle => Color::DarkGray,
+                };
+                let unread = if peer.unread > 0 {
+                    format!(" [{}]", peer.unread)
+                } else {
+                    String::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {} ", peer.label)),
+                    Span::styled(
+                        peer.status.as_str(),
+                        Style::default().fg(status_color),
+                    ),
+                    Span::raw(unread),
+                ]));
+            }
+        }
+    }
+
     let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
     paragraph.render(area, buf);
 }

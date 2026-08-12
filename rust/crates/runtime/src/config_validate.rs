@@ -214,6 +214,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Bool,
     },
     FieldSpec {
+        name: "sessionBus",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "completionVerifyCommands",
         expected: FieldType::StringArray,
     },
@@ -279,6 +283,11 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Number,
     },
 ];
+
+const SESSION_BUS_FIELDS: &[FieldSpec] = &[FieldSpec {
+    name: "allow",
+    expected: FieldType::StringArray,
+}];
 
 const SANDBOX_FIELDS: &[FieldSpec] = &[
     FieldSpec {
@@ -514,6 +523,15 @@ pub fn validate_config_file(
             sandbox,
             SANDBOX_FIELDS,
             "sandbox",
+            source,
+            &path_display,
+        ));
+    }
+    if let Some(session_bus) = object.get("sessionBus").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            session_bus,
+            SESSION_BUS_FIELDS,
+            "sessionBus",
             source,
             &path_display,
         ));
