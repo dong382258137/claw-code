@@ -272,6 +272,31 @@ impl HistoryIndex {
         Ok(hits)
     }
 
+    /// 混合检索:FTS5 词法 + 稠密向量双路,RRF 融合后返回 top-k。
+    ///
+    /// - 未注入 embedder:等价于纯词法 [`HistoryIndex::search`]。
+    /// - 已注入但向量为空或查询嵌入失败:自动回退纯词法。
+    /// - 返回的 `HistoryHit.rank` 为 RRF 融合分数(**越高越相关**),
+    ///   与 `search` 的 BM25 rank(**越低越相关**)语义不同,勿混用。
+    pub fn hybrid_search(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<HistoryHit>, HistoryIndexError> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let lexical = self.search(query, top_k.saturating_mul(2))?;
+        let Some(embedder) = self.embedder.provider() else {
+            return Ok(lexical);
+        };
+        let dense = self.dense_search(query, top_k.saturating_mul(2), embedder)?;
+        if dense.is_empty() {
+            return Ok(lexical);
+        }
+        Ok(rrf_merge(lexical, dense, top_k))
+    }
+
     /// Remove all entries for a session (used on session reset / compaction).
     ///
     /// Returns the number of rows deleted.
@@ -1334,5 +1359,43 @@ mod tests {
             merged[0].rank,
             merged[3].rank
         );
+    }
+
+    #[test]
+    fn hybrid_search_falls_back_to_lexical_without_embedder() {
+        let (_file, index) = open_temp_index();
+        index
+            .index_message("rust toolchain guide", "s1", "user", 0, 1_000)
+            .expect("index msg");
+        let hits = index.hybrid_search("rust", 5).expect("hybrid search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "s1");
+    }
+
+    #[test]
+    fn hybrid_search_falls_back_when_embed_fails() {
+        struct FailingProvider;
+        impl EmbeddingProvider for FailingProvider {
+            fn embed(&self, _t: &str) -> Result<Vec<f32>, crate::memory_semantic::EmbeddingError> {
+                Err(crate::memory_semantic::EmbeddingError::Inference(
+                    "boom".to_string(),
+                ))
+            }
+            fn dim(&self) -> usize {
+                0
+            }
+            fn name(&self) -> &str {
+                "failing"
+            }
+        }
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> = Arc::new(FailingProvider);
+        let index = index.with_embedder(provider);
+        index
+            .index_message("rust toolchain guide", "s1", "user", 0, 1_000)
+            .expect("index msg");
+        let hits = index.hybrid_search("rust", 5).expect("hybrid search");
+        assert!(!hits.is_empty(), "embed failure must fall back to lexical");
+        assert_eq!(hits[0].session_id, "s1");
     }
 }
