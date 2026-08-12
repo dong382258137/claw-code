@@ -216,6 +216,62 @@ impl HistoryIndex {
         Ok(hits)
     }
 
+    /// 稠密检索:对全部已存向量做 brute-force 余弦相似度,返回 top-k。
+    ///
+    /// 命中 `rank` = 余弦分数(0.0-1.0,**越高越相关**)。
+    /// 查询嵌入失败或向量表为空时返回空列表(由 `hybrid_search` 回退词法)。
+    fn dense_search(
+        &self,
+        query: &str,
+        top_k: usize,
+        embedder: &dyn EmbeddingProvider,
+    ) -> Result<Vec<HistoryHit>, HistoryIndexError> {
+        let query_vec = match embedder.embed(query) {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Ok(Vec::new()),
+        };
+        let conn = self.conn.lock().expect("history index mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT h.content_raw, h.session_id, h.role, h.message_index, h.timestamp_ms, v.vector \
+             FROM history_vectors v \
+             JOIN history h ON h.rowid = v.message_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
+        })?;
+        let mut hits: Vec<HistoryHit> = Vec::new();
+        for row in rows {
+            let (content, session_id, role, message_index, timestamp_ms, bytes) = row?;
+            let vec = f32_vec_from_le_bytes(&bytes);
+            let score = cosine_similarity(&query_vec, &vec);
+            if score <= 0.0 {
+                continue; // 无词袋重叠(零向量)直接跳过
+            }
+            hits.push(HistoryHit {
+                content,
+                session_id,
+                role,
+                message_index: message_index as usize,
+                timestamp_ms,
+                rank: score as f64,
+            });
+        }
+        hits.sort_by(|a, b| {
+            b.rank
+                .partial_cmp(&a.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
     /// Remove all entries for a session (used on session reset / compaction).
     ///
     /// Returns the number of rows deleted.
@@ -1192,5 +1248,30 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
             .expect("count vectors");
         assert_eq!(count, 0, "oversized content should not embed");
+    }
+
+    #[test]
+    fn dense_search_returns_cosine_ranked_hits() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider.clone());
+        index
+            .index_message("rust programming", "s1", "user", 0, 1_000)
+            .expect("index msg 0");
+        index
+            .index_message("weather report today", "s1", "user", 1, 2_000)
+            .expect("index msg 1");
+        let hits = index
+            .dense_search("rust programming", 5, &*provider)
+            .expect("dense search");
+        assert_eq!(hits.len(), 1, "only identical bag-of-words should pass cos>0");
+        assert_eq!(hits[0].message_index, 0);
+        assert!(
+            (hits[0].rank - 1.0).abs() < 1e-5,
+            "identical text should have cosine ~1.0, got {}",
+            hits[0].rank
+        );
     }
 }
