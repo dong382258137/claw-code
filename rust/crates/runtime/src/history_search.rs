@@ -20,14 +20,20 @@
 //!   is `!Sync` but the index is shared across threads via `Arc`.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
+
+use crate::memory_semantic::{cosine_similarity, EmbeddingProvider, EmbeddingProviderRef};
 
 /// FTS5-backed history search index.
 #[derive(Debug)]
 pub struct HistoryIndex {
     conn: Mutex<Connection>,
+    /// 可选的稠密检索 embedder。注入后 `index_message` 为每条消息增量
+    /// 计算向量存入 `history_vectors` 表,`hybrid_search` 走词法+稠密双路。
+    /// 未注入时行为与纯 FTS5 `search` 完全一致。
+    embedder: EmbeddingProviderRef,
 }
 
 impl HistoryIndex {
@@ -43,6 +49,8 @@ impl HistoryIndex {
     /// - v3: adds a `content_raw` column holding the original (pre-split)
     ///   message body, so search hits can display raw text. Both v1 and v2
     ///   indexes are transparently migrated to v3 on open.
+    /// - v4: adds the `history_vectors` table (message_id = history rowid)
+    ///   holding dense embeddings for hybrid (lexical + vector) search.
     pub fn open(db_path: &Path) -> Result<Self, HistoryIndexError> {
         // Create parent directory (e.g. `.claw/`) if missing — prevents
         // silent failure where history_index stays None and session_search
@@ -52,8 +60,8 @@ impl HistoryIndex {
         }
         let mut conn = Connection::open(db_path)?;
         // 版本检测与迁移:
-        // - v1:有 history 表但无 history_meta(未切分 CJK)→ 重建为 v3(带 content_raw)
-        // - v2:有 history_meta 且 schema_version < 3(content 已切分但无 content_raw)→ 重建为 v3
+        // - v1:有 history 表但无 history_meta(未切分 CJK)→ 重建为 v4(带 content_raw)
+        // - v2:有 history_meta 且 schema_version < 3(content 已切分但无 content_raw)→ 重建为 v4
         let has_history_table = table_exists(&conn, "history");
         let has_meta = table_exists(&conn, "history_meta");
         if has_history_table && !has_meta {
@@ -67,7 +75,7 @@ impl HistoryIndex {
                  value TEXT NOT NULL\
              );\
              INSERT OR REPLACE INTO history_meta (key, value)\
-                 VALUES ('schema_version', '3');\
+                 VALUES ('schema_version', '4');\
              CREATE VIRTUAL TABLE IF NOT EXISTS history USING fts5(\
                  content,\
                  content_raw UNINDEXED,\
@@ -75,10 +83,16 @@ impl HistoryIndex {
                  role UNINDEXED,\
                  message_index UNINDEXED,\
                  timestamp_ms UNINDEXED\
+             );\
+             -- v4:稠密向量表。message_id 关联 history 表的 rowid。\n\
+             CREATE TABLE IF NOT EXISTS history_vectors (\
+                 message_id INTEGER PRIMARY KEY,\
+                 vector BLOB NOT NULL\
              );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            embedder: EmbeddingProviderRef::default(),
         })
     }
 
@@ -402,14 +416,19 @@ fn detokenize_content(text: &str) -> String {
 }
 
 /// 读取 history_meta 中的 schema_version(表/键缺失时返回 0,触发迁移)。
+///
+/// 注意:history_meta.value 为 TEXT 列(SQLite 亲和性会强制把写入的数值转为
+/// 文本),而 rusqlite 0.31 的 `FromSql for i64` 只接受 INTEGER 存储值,因此
+/// 这里读 String 再解析,兼容 v2/v3 遗留库写入的 TEXT 版本号。
 fn current_schema_version(conn: &Connection) -> Result<i64, HistoryIndexError> {
-    Ok(conn
+    let raw: String = conn
         .query_row(
             "SELECT value FROM history_meta WHERE key = 'schema_version'",
             [],
-            |row| row.get::<_, i64>(0),
+            |row| row.get(0),
         )
-        .unwrap_or(0))
+        .unwrap_or_else(|_| "0".to_string());
+    Ok(raw.trim().parse::<i64>().unwrap_or(0))
 }
 
 /// 判断 SQLite 主表是否存在指定表。
@@ -549,6 +568,12 @@ pub struct HistoryHit {
     /// real (double) value; rusqlite deserializes it into `f64`.
     pub rank: f64,
 }
+
+/// RRF(Reciprocal Rank Fusion)融合常数,标准值 60(Cormack et al. 2009)。
+const RRF_K: f64 = 60.0;
+/// 超过此字符数的消息跳过稠密嵌入(巨型工具输出语义价值低且嵌入成本高);
+/// 词法 FTS5 路径不受影响。
+pub const MAX_EMBED_CHARS: usize = 4096;
 
 /// Errors raised by [`HistoryIndex`] operations.
 #[derive(Debug)]
@@ -1052,5 +1077,33 @@ mod tests {
         assert_eq!(detokenize_content("the quick brown fox"), "the quick brown fox");
         // 汉字 + 标点
         assert_eq!(detokenize_content("配 置 完 成 。"), "配置完成。");
+    }
+
+    // -----------------------------------------------------------------
+    // v4:history_vectors 表 + schema_version=4
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn open_creates_history_vectors_table_schema_v4() {
+        let (_file, index) = open_temp_index();
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // history_meta.value 是 TEXT 列,读 String 再解析(断言 schema_version 语义为 4)。
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM history_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema_version row");
+        let version: i64 = raw.parse().expect("schema_version numeric");
+        assert_eq!(version, 4, "schema_version should be 4");
+        let has_vec: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='history_vectors'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count history_vectors");
+        assert_eq!(has_vec, 1, "history_vectors table should exist");
     }
 }
