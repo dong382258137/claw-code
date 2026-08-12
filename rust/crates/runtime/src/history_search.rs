@@ -561,6 +561,32 @@ fn rrf_merge(lexical: Vec<HistoryHit>, dense: Vec<HistoryHit>, top_k: usize) -> 
         .collect()
 }
 
+/// 规则式 salience 打分 —— 返回乘子(≥1.0),作用于 RRF 融合分数。
+///
+/// `final_rank = rrf_score × salience_weight(role, content)`。
+/// 由角色基值 + 内容信号词加成组成;内容加成封顶 [`SALIENCE_CONTENT_BONUS_CAP`]。
+/// 信号词匹配大小写不敏感。
+#[must_use]
+fn salience_weight(role: &str, content: &str) -> f64 {
+    let base = match role {
+        "decision" => SALIENCE_ROLE_DECISION,
+        "assistant" => SALIENCE_ROLE_ASSISTANT,
+        _ => SALIENCE_ROLE_BASELINE,
+    };
+    let lower = content.to_ascii_lowercase();
+    let count_marker = |markers: &[&str], weight: f64| -> f64 {
+        markers
+            .iter()
+            .filter(|m| lower.contains(&m.to_ascii_lowercase()))
+            .count() as f64
+            * weight
+    };
+    let bonus = count_marker(SALIENCE_STRONG_MARKERS, SALIENCE_SIGNAL_WEIGHT)
+        + count_marker(SALIENCE_ERROR_MARKERS, SALIENCE_SIGNAL_WEIGHT_ERROR)
+        + count_marker(SALIENCE_DECISION_MARKERS, SALIENCE_SIGNAL_WEIGHT_DECISION);
+    base + bonus.min(SALIENCE_CONTENT_BONUS_CAP)
+}
+
 /// f32 向量 → little-endian 字节(SQLite BLOB 存储)。
 fn f32_vec_to_le_bytes(vec: &[f32]) -> Vec<u8> {
     vec.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -734,6 +760,40 @@ const RRF_K: f64 = 60.0;
 /// 词法 FTS5 路径不受影响。
 pub const MAX_EMBED_CHARS: usize = 4096;
 
+// ── Phase 2:salience 重加权 ──
+// 对应 True Memory(L3 salience reweighter)检索期显著性加权。
+// 规则式、零 LLM 成本:按角色基值 + 内容信号词累加,乘子作用于 RRF 融合分数。
+
+/// decision 角色 salience 基值(决策点最优先;与 search() 内 decision rank×2.0 叠加,
+/// 总效应 ≈×3.0,符合"决策点最高优先"意图)。
+pub const SALIENCE_ROLE_DECISION: f64 = 1.5;
+/// assistant 角色 salience 基值(助手陈述多含结论)。
+pub const SALIENCE_ROLE_ASSISTANT: f64 = 1.2;
+/// user / tool 角色 salience 基线。
+pub const SALIENCE_ROLE_BASELINE: f64 = 1.0;
+/// 单次内容信号词命中的加成。
+pub const SALIENCE_SIGNAL_WEIGHT: f64 = 0.35;
+/// 错误信号词命中加成(低于结论强标记)。
+pub const SALIENCE_SIGNAL_WEIGHT_ERROR: f64 = 0.25;
+/// 决策信号词命中加成(低于错误)。
+pub const SALIENCE_SIGNAL_WEIGHT_DECISION: f64 = 0.2;
+/// 内容信号总加成上限(防止单一消息无限膨胀)。
+pub const SALIENCE_CONTENT_BONUS_CAP: f64 = 1.0;
+
+/// 结论强标记词 —— 命中即视为"已确认结论",salience 最高档。
+const SALIENCE_STRONG_MARKERS: &[&str] = &[
+    "根因是", "原因是", "确认", "已验证", "结论", "已修复", "修复了",
+    "PASS", "FAIL", "found that", "verified", "root cause",
+];
+/// 错误信号词 —— 工具失败/异常结果。
+const SALIENCE_ERROR_MARKERS: &[&str] = &[
+    "error", "panic", "fail", "failed", "报错", "失败", "异常",
+];
+/// 决策信号词 —— 决策/方案陈述。
+const SALIENCE_DECISION_MARKERS: &[&str] = &[
+    "decided", "decision", "决定", "方案", "alternatives",
+];
+
 /// Errors raised by [`HistoryIndex`] operations.
 #[derive(Debug)]
 pub struct HistoryIndexError {
@@ -764,7 +824,9 @@ impl From<rusqlite::Error> for HistoryIndexError {
 
 #[cfg(test)]
 mod tests {
-    use super::{detokenize_content, HistoryHit, HistoryIndex, MAX_EMBED_CHARS, rrf_merge};
+    use super::{
+        detokenize_content, salience_weight, HistoryHit, HistoryIndex, MAX_EMBED_CHARS, rrf_merge,
+    };
     use crate::memory_semantic::EmbeddingProvider;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
@@ -1472,5 +1534,64 @@ mod tests {
             )
             .expect("count history_vectors");
         assert_eq!(has_vec, 1, "history_vectors should exist after migration");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 2:salience 重加权
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn salience_weight_role_base_ordering() {
+        // 决策点 > 助手 > 用户/工具
+        let decision = salience_weight("decision", "plain text");
+        let assistant = salience_weight("assistant", "plain text");
+        let user = salience_weight("user", "plain text");
+        let tool = salience_weight("tool", "plain text");
+        assert!(decision > assistant, "decision should outrank assistant");
+        assert!(assistant > user, "assistant should outrank user");
+        assert_eq!(user, tool, "user and tool share the baseline");
+        assert_eq!(user, 1.0, "user baseline should be 1.0");
+    }
+
+    #[test]
+    fn salience_weight_content_signals_add_up() {
+        // 结论强标记提升 assistant 陈述
+        let with_conclusion = salience_weight("assistant", "根因是缓存失效,已修复,测试 PASS");
+        let plain = salience_weight("assistant", "plain text without signals");
+        assert!(
+            with_conclusion > plain,
+            "conclusion signals should raise salience: {} vs {}",
+            with_conclusion,
+            plain
+        );
+        // 错误信号提升 tool 结果
+        let with_error = salience_weight("tool", "command failed with panic: timeout");
+        let tool_plain = salience_weight("tool", "completed");
+        assert!(with_error > tool_plain, "error signals should raise salience");
+        // 决策信号提升 user 消息
+        let with_decision = salience_weight("user", "decided to use rust toolchain");
+        assert!(with_decision > 1.0, "decision signal should raise salience");
+    }
+
+    #[test]
+    fn salience_weight_caps_content_bonus() {
+        // 多个信号词命中,内容加成封顶 +1.0
+        let mut text = String::new();
+        for _ in 0..10 {
+            text.push_str("根因是 confirmed verified PASS ");
+        }
+        let score = salience_weight("user", &text);
+        assert!(
+            score <= 2.0,
+            "content bonus should cap at +1.0, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn salience_weight_case_insensitive() {
+        let upper = salience_weight("tool", "PANIC: VERIFIED FAIL");
+        let lower = salience_weight("tool", "panic: verified fail");
+        assert_eq!(upper, lower, "signals should be case-insensitive");
     }
 }
