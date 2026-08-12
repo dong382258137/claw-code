@@ -17,6 +17,7 @@ pub mod config_validate;
 pub mod content_classifier;
 pub mod content_compression;
 mod conversation;
+pub mod task_state;
 // Multi-Agent Hardening §4.1:统一诊断基础设施(panic hook + DiagLog)。
 // 提取自 rusty-claude-cli/src/lib.rs main_entry 内联闭包,供 main/headless/测试入口复用。
 pub mod decision_log;
@@ -58,6 +59,8 @@ pub mod plugin_lifecycle;
 mod policy_engine;
 pub mod poor_mode;
 mod prompt;
+pub mod session_bus;
+pub mod subworkspace;
 pub mod tool_result_archive;
 // Harness L(生命周期)层接入:在 run_turn 失败分支提供"最多 1 次自动恢复后升级"机制。
 // 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
@@ -101,6 +104,7 @@ pub mod multi_agent;
 // tool call count / compact 触发率直方图,简单失败聚类。
 // 详见 docs/harness-engineering-optimization-plan.md Step 3.3。
 // 阶段 4 将在此之上接入 K-means + Self-Improving Harness 闭环。
+pub mod harness_evolution;
 mod remote;
 pub mod repomap;
 mod report_schema;
@@ -108,7 +112,6 @@ pub mod sandbox;
 mod session;
 pub mod session_control;
 pub mod trace_analyzer;
-pub mod harness_evolution;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
@@ -161,9 +164,9 @@ pub use decision_log::{
 pub use vcs_snapshot::{RefactorTransaction, TransactionStatus, VcsError};
 
 pub use conversation::{
-    auto_compaction_threshold_from_env, auto_compaction_threshold_from_env_opt, ApiClient,
-    ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
-    default_subagent_tool_catalog, PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor,
+    auto_compaction_threshold_from_env, auto_compaction_threshold_from_env_opt,
+    default_subagent_tool_catalog, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
+    ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor,
     ToolError, ToolExecutor, ToolResultCallback, ToolSummary, TurnSummary,
 };
 pub use file_ops::{
@@ -299,9 +302,21 @@ pub use sandbox::{
     CREATE_NO_WINDOW,
     DETACHED_PROCESS,
 };
+// 目录层级控制：子工作区发现与校验（设计文档 2026-08-11-dir-hierarchy-control-design.md）。
+pub use subworkspace::{
+    cache_path as subworkspace_cache_path, discover_subworkspaces, discover_subworkspaces_cached,
+    is_project_dir as is_subworkspace_project_dir, read_cache as read_subworkspace_cache,
+    resolve_subworkspace, write_cache as write_subworkspace_cache, Subworkspace,
+    MAX_DISCOVER_DEPTH, SUBWORKSPACE_CACHE_FILENAME,
+};
+// 会话互通：SessionBus 注册/路由/状态（设计文档 2026-08-11-session-bus-design.md）。
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
     SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+};
+pub use session_bus::{
+    global as global_session_bus, now_ms as bus_now_ms, BusMessage, BusMessageKind, BusPeer,
+    PeerKind, PeerStatus, SessionBus, BUS_MAX_HOP,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
@@ -359,12 +374,18 @@ pub use worker_boot::{
     WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
 };
 
+use std::sync::{Arc, OnceLock};
+
 // ── Embedding runtime factory ──
 // Step 4.x: 将 embedding provider 的创建集中在一个工厂函数中,供 PersistentMemory、
 // TraceAnalyzer 等消费者注入。feature `embedding` 开启时优先使用 FastembedProvider
 // (BGE-small-en-v1.5,384 维),创建失败则自动降级到 HashEmbeddingProvider。
+//
+// v4:改为进程级 OnceLock 单例并返回 `Arc`。PersistentMemory 与 HistoryIndex
+// 共用同一模型实例,避免 embedding feature 下重复加载 ONNX 模型(~300MB/份)。
+// 首次调用可能耗时数秒(模型加载/下载),后续调用为 ~100ms。
 
-/// 根据编译 feature 创建 embedding provider。
+/// 根据编译 feature 创建(或复用)进程级共享的 embedding provider。
 ///
 /// - `feature = "embedding"` 开启且 FastembedProvider 初始化成功:返回 BGE-small 384 维。
 /// - `feature = "embedding"` 开启但初始化失败(如模型下载失败):自动降级为 HashEmbeddingProvider。
@@ -372,31 +393,36 @@ pub use worker_boot::{
 ///
 /// 返回 `None` 不表示错误,调用方应检测并退化为关键词匹配。
 #[must_use]
-pub fn build_embedding_provider() -> Option<Box<dyn EmbeddingProvider + Send + Sync>> {
-    #[cfg(feature = "embedding")]
-    {
-        match memory_semantic::fastembed_provider::FastembedProvider::try_new() {
-            Ok(provider) => {
-                eprintln!(
-                    "embedding provider: fastembed ({}-dim BGE-small-en-v1.5)",
-                    provider.dim()
-                );
-                Some(Box::new(provider))
+pub fn build_embedding_provider() -> Option<Arc<dyn EmbeddingProvider + Send + Sync>> {
+    static PROVIDER: OnceLock<Option<Arc<dyn EmbeddingProvider + Send + Sync>>> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| {
+            #[cfg(feature = "embedding")]
+            {
+                match memory_semantic::fastembed_provider::FastembedProvider::try_new() {
+                    Ok(provider) => {
+                        eprintln!(
+                            "embedding provider: fastembed ({}-dim BGE-small-en-v1.5)",
+                            provider.dim()
+                        );
+                        Some(Arc::new(provider) as Arc<dyn EmbeddingProvider + Send + Sync>)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "fastembed init failed ({}), falling back to hash embedding",
+                            e
+                        );
+                        Some(Arc::new(HashEmbeddingProvider::default_dim())
+                            as Arc<dyn EmbeddingProvider + Send + Sync>)
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "fastembed init failed ({}), falling back to hash embedding",
-                    e
-                );
-                Some(Box::new(HashEmbeddingProvider::default_dim()))
+            #[cfg(not(feature = "embedding"))]
+            {
+                None
             }
-        }
-    }
-    #[cfg(not(feature = "embedding"))]
-    {
-        // 未编译 embedding feature:不提供 provider,调用方走 keyword fallback。
-        None
-    }
+        })
+        .clone()
 }
 
 #[cfg(test)]
