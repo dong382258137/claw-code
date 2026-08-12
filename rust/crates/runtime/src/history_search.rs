@@ -96,12 +96,23 @@ impl HistoryIndex {
         })
     }
 
+    /// 注入稠密检索 embedder(进程级共享实例,见 `crate::build_embedding_provider`)。
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider + Send + Sync>) -> Self {
+        self.embedder = EmbeddingProviderRef::new(embedder);
+        self
+    }
+
     /// Index a single message.
     ///
     /// `content` is the searchable text (typically the rendered message
     /// body). `session_id`, `role`, `message_index`, and `timestamp_ms`
     /// are stored as unindexed metadata so they can be returned with each
     /// hit without polluting the FTS5 token stream.
+    ///
+    /// v4:若已注入 embedder 且内容长度 ≤ [`MAX_EMBED_CHARS`],在写入词法索引
+    /// 的同时增量计算向量并存入 `history_vectors`(message_id = 本行 rowid)。
+    /// 向量在锁外计算,避免阻塞其他索引/检索操作;嵌入失败静默跳过(词法兜底)。
     pub fn index_message(
         &self,
         content: &str,
@@ -110,6 +121,12 @@ impl HistoryIndex {
         message_index: usize,
         timestamp_ms: u64,
     ) -> Result<(), HistoryIndexError> {
+        let vector: Option<Vec<u8>> = self.embedder.provider().and_then(|embedder| {
+            if content.chars().count() > MAX_EMBED_CHARS {
+                return None;
+            }
+            embedder.embed(content).ok().map(|v| f32_vec_to_le_bytes(&v))
+        });
         let conn = self.conn.lock().expect("history index mutex poisoned");
         conn.execute(
             "INSERT INTO history (content, content_raw, session_id, role, message_index, timestamp_ms) \
@@ -123,6 +140,13 @@ impl HistoryIndex {
                 timestamp_ms as i64,
             ],
         )?;
+        if let Some(bytes) = vector {
+            let rowid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT OR REPLACE INTO history_vectors (message_id, vector) VALUES (?1, ?2)",
+                rusqlite::params![rowid, bytes],
+            )?;
+        }
         Ok(())
     }
 
@@ -415,6 +439,19 @@ fn detokenize_content(text: &str) -> String {
     out
 }
 
+/// f32 向量 → little-endian 字节(SQLite BLOB 存储)。
+fn f32_vec_to_le_bytes(vec: &[f32]) -> Vec<u8> {
+    vec.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// SQLite BLOB → f32 向量。
+fn f32_vec_from_le_bytes(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 /// 读取 history_meta 中的 schema_version(表/键缺失时返回 0,触发迁移)。
 ///
 /// 注意:history_meta.value 为 TEXT 列(SQLite 亲和性会强制把写入的数值转为
@@ -605,7 +642,9 @@ impl From<rusqlite::Error> for HistoryIndexError {
 
 #[cfg(test)]
 mod tests {
-    use super::{detokenize_content, HistoryIndex};
+    use super::{detokenize_content, HistoryIndex, MAX_EMBED_CHARS};
+    use crate::memory_semantic::EmbeddingProvider;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     fn open_temp_index() -> (NamedTempFile, HistoryIndex) {
@@ -1105,5 +1144,53 @@ mod tests {
             )
             .expect("count history_vectors");
         assert_eq!(has_vec, 1, "history_vectors table should exist");
+    }
+
+    #[test]
+    fn index_message_stores_vector_when_embedder_injected() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider);
+        index
+            .index_message("rust programming language", "s1", "user", 0, 1_000)
+            .expect("index msg");
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(count, 1, "one vector row should exist");
+    }
+
+    #[test]
+    fn index_message_skips_vector_without_embedder() {
+        let (_file, index) = open_temp_index();
+        index
+            .index_message("hello world", "s1", "user", 0, 1_000)
+            .expect("index msg");
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(count, 0, "no vector without embedder");
+    }
+
+    #[test]
+    fn index_message_skips_embedding_oversized_content() {
+        use crate::memory_semantic::HashEmbeddingProvider;
+        let (_file, index) = open_temp_index();
+        let provider: Arc<dyn EmbeddingProvider + Send + Sync> =
+            Arc::new(HashEmbeddingProvider::default_dim());
+        let index = index.with_embedder(provider);
+        let big = "x".repeat(MAX_EMBED_CHARS + 1);
+        index
+            .index_message(&big, "s1", "tool", 0, 1_000)
+            .expect("index big msg");
+        let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history_vectors", [], |row| row.get(0))
+            .expect("count vectors");
+        assert_eq!(count, 0, "oversized content should not embed");
     }
 }
