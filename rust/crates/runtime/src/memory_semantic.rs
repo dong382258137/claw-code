@@ -82,7 +82,19 @@ pub enum RecallStrategy {
 /// Debug/PartialEq 占位实现,使 `SemanticRecaller` 仍可 #[derive(Debug, PartialEq)]。
 /// Default 始终为 None(无 provider)。
 #[derive(Clone, Default)]
-struct EmbeddingProviderRef(Option<Arc<dyn EmbeddingProvider + Send + Sync>>);
+pub(crate) struct EmbeddingProviderRef(Option<Arc<dyn EmbeddingProvider + Send + Sync>>);
+
+impl EmbeddingProviderRef {
+    /// 包装一个新的 provider(供 HistoryIndex 注入)。
+    pub(crate) fn new(provider: Arc<dyn EmbeddingProvider + Send + Sync>) -> Self {
+        Self(Some(provider))
+    }
+
+    /// 借出底层 provider(若已注入)。
+    pub(crate) fn provider(&self) -> Option<&(dyn EmbeddingProvider + Send + Sync)> {
+        self.0.as_deref()
+    }
+}
 
 impl std::fmt::Debug for EmbeddingProviderRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
