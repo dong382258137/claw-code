@@ -329,11 +329,21 @@ fn extract_section<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> O
 }
 
 /// 提取形如 `field: value` 行的值(字段名大小写不敏感,按 ASCII 匹配)。
+///
+/// 兼容 LLM 摘要路径:`sanitize_llm_summary` 会把输出每一行规范化为
+/// `- {line}` bullet,因此真实入参形如 `- goal: X` / `- next_action: Y`。
+/// 之前只匹配行首 `goal:`,导致 LLM 路径的 goal/next_action 永远解析失败
+/// (2026-08-14 实证:会话摘要含 [active_task] 段但字段始终为空)。
 fn strip_field_prefix<'a>(line: &'a str, field: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
+    let trimmed = line.trim();
+    let bare = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed);
+    let lower = bare.to_ascii_lowercase();
     let prefix = format!("{field}:");
     if lower.starts_with(&prefix) {
-        Some(line[field.len() + 1..].trim().to_string())
+        Some(bare[field.len() + 1..].trim().to_string())
     } else {
         None
     }
@@ -477,6 +487,26 @@ mod tests {
         );
         assert_eq!(upper.active_goal.as_deref(), Some("优化模块 B"));
         assert!(parse_task_state_from_summary("").closed_tasks.is_empty());
+    }
+
+    #[test]
+    fn parse_summary_handles_bullet_prefixed_fields() {
+        // LLM 摘要路径:sanitize_llm_summary 给每行加 "- " 前缀。
+        // 修复前 strip_field_prefix 只匹配行首 "goal:",bullet 前缀
+        // 导致 goal/next_action 永远解析为空(2026-08-14 实证)。
+        let summary = "- [active_task]\n\
+                       - goal: 压缩摘要质量修复\n\
+                       - next_action: 重新编译部署并实机验证\n\
+                       \n\
+                       - [closed_tasks]\n\
+                       - workspace_root 注入: 已修复 PASS";
+        let extract = parse_task_state_from_summary(summary);
+        assert_eq!(extract.active_goal.as_deref(), Some("压缩摘要质量修复"));
+        assert_eq!(extract.next_action.as_deref(), Some("重新编译部署并实机验证"));
+        assert_eq!(
+            extract.closed_tasks,
+            vec!["workspace_root 注入: 已修复 PASS".to_string()]
+        );
     }
 
     #[test]

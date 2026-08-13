@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-const DEFAULT_MAX_CHARS: usize = 1_200;
-const DEFAULT_MAX_LINES: usize = 24;
+const DEFAULT_MAX_CHARS: usize = 2_000;
+const DEFAULT_MAX_LINES: usize = 36;
 const DEFAULT_MAX_LINE_CHARS: usize = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +193,16 @@ fn is_core_detail(line: &str) -> bool {
         "- Recent user requests:",
         "- Previously compacted context:",
         "- Newly compacted context:",
+        // P0(2026-08-14):机器可解析的结构化段必须保底存活。
+        // sanitize_llm_summary 后行形如 "- [active_task]" / "- goal: X",
+        // 之前它们落在 priority 2,预算(24 行)耗尽时整段被裁,导致
+        // apply_task_state_from_compaction / apply_lessons_from_compaction
+        // 拿不到任务锚点与教训。提升到 priority 0 保证优先入选。
+        "- [active_task]",
+        "- [closed_tasks]",
+        "- [lessons]",
+        "- goal:",
+        "- next_action:",
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix))

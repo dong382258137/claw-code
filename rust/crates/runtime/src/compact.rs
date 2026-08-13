@@ -74,7 +74,16 @@ fn global_compaction_summarizer() -> Option<Arc<dyn CompactionSummarizerClient>>
 /// 能通过 [`extract_summary_highlights`] 提取到内容。
 fn build_llm_summarize_prompt(messages: &[ConversationMessage]) -> String {
     let mut transcript = Vec::new();
-    for (idx, message) in messages.iter().enumerate() {
+    // P0(2026-08-14):跳过 System 角色消息 —— 压缩窗口内含上一轮压缩的
+    // `<summary>` system 消息,LLM 会把它当正文回声复述(逐条拷贝旧摘要的
+    // Scope:/Tools mentioned:/Key timeline: 等行),造成新摘要重复混乱
+    // (实测 1786557173235 会话:LLM 摘要末尾整段回声旧启发式摘要)。
+    // 旧摘要由 merge_compact_summaries 单独合并(previous highlights cap 9 行)。
+    for (idx, message) in messages
+        .iter()
+        .filter(|message| message.role != MessageRole::System)
+        .enumerate()
+    {
         let role = match message.role {
             MessageRole::System => "system",
             MessageRole::User => "user",
@@ -187,6 +196,13 @@ fn summarize_messages_with_client(
                 eprintln!("[compact] LLM summarizer failed ({e}); falling back to heuristic");
             }
         }
+    } else {
+        // P2(2026-08-14):未注册时静默降级是"摘要质量极差"的隐性来源
+        // (启发式会把原始转录碎片拼进 Key timeline)。打印一次可见告警,
+        // 便于用户判断是注册失败还是瞬时 LLM 故障。
+        eprintln!(
+            "[compact] LLM summarizer not registered; falling back to heuristic summary"
+        );
     }
     summarize_messages(messages)
 }
