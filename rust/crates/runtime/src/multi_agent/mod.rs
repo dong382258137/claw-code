@@ -1370,13 +1370,15 @@ pub struct ModelUpgrade {
     /// 升级目标模型名(如 "deepseek-v4-pro")
     pub target_model: String,
     /// 成本倍数:升级后单次调用成本 ≈ 原成本 × cost_multiplier。
-    /// deepseek-v4-pro 相对 flash 约 10 倍(输入)+ 30 倍(输出),MVP 取 10.0。
+    /// 按 2026-07 官方定价:pro 为 flash 的 3 倍(输入 ¥3/M vs ¥1/M)。
     pub cost_multiplier: f64,
 }
 
 /// 模型升级路径查询 — Multi-Agent Hardening §4.5 retry loop 调用。
 ///
-/// DeepSeek 升级链:`deepseek-v4-flash → deepseek-v4-pro`
+/// DeepSeek 自动路由链:`deepseek-v4-flash → deepseek-v4-pro`
+///
+/// 2026-08-13 V4-Pro 0813 正式版上线,能力大幅提升,自动路由升级链已重新启用。
 ///
 /// 完整的 `upgrade_map` 配置化在 `api::providers::model_tier`(运行时可访问),
 /// 本函数仅作为 runtime 内部的最小可用回退,避免循环依赖。
@@ -1389,7 +1391,7 @@ pub struct ModelUpgrade {
 /// # 升级表
 /// | 当前模型 | 目标模型 | cost_multiplier | 链 |
 /// |---|---|---|---|
-/// | deepseek-v4-flash | deepseek-v4-pro | 10.0 | DeepSeek |
+/// | deepseek-v4-flash | deepseek-v4-pro | 3.0 | DeepSeek |
 #[must_use]
 pub fn upgrade_model_for_subagent(current_model: &str) -> Option<ModelUpgrade> {
     let lower = current_model.to_ascii_lowercase();
@@ -1416,27 +1418,25 @@ fn is_flagship_model(lower: &str) -> bool {
 
 /// 升级表查询 — DeepSeek 系列升级路径。
 ///
-/// 2026-07-31 V4-Flash 正式版上线后,Agent 能力全面超越 Pro 预览版且价格更低,
-/// 自动升级链已关闭。Pro 正式版发布后再评估是否重新启用。
+/// 2026-08-13 V4-Pro 0813 正式版上线,能力大幅提升,自动路由升级链已重新启用。
 ///
 /// 返回 `Some(ModelUpgrade)` 若命中升级路径,`None` 若无升级路径或已是旗舰。
-fn upgrade_lookup(_lower: &str) -> Option<ModelUpgrade> {
-    // 自动升级已关闭 — 如需恢复,取消下方注释:
-    // // DeepSeek 链:flash → pro
-    // if _lower.contains("deepseek") && _lower.contains("flash") {
-    //     return Some(ModelUpgrade {
-    //         target_model: "deepseek-v4-pro".to_string(),
-    //         cost_multiplier: 10.0,
-    //     });
-    // }
-    // // 通用 flash → pro 升级(兜底:其他含 flash 的模型替换为 pro)
-    // if _lower.contains("flash") {
-    //     let target = _lower.replace("flash", "pro");
-    //     return Some(ModelUpgrade {
-    //         target_model: target,
-    //         cost_multiplier: 10.0,
-    //     });
-    // }
+fn upgrade_lookup(lower: &str) -> Option<ModelUpgrade> {
+    // DeepSeek 自动路由链:flash → pro
+    if lower.contains("deepseek") && lower.contains("flash") {
+        return Some(ModelUpgrade {
+            target_model: "deepseek-v4-pro".to_string(),
+            cost_multiplier: 3.0,
+        });
+    }
+    // 通用 flash → pro 升级(兜底:其他含 flash 的模型替换为 pro)
+    if lower.contains("flash") {
+        let target = lower.replace("flash", "pro");
+        return Some(ModelUpgrade {
+            target_model: target,
+            cost_multiplier: 3.0,
+        });
+    }
 
     // 无升级路径
     None
@@ -2479,11 +2479,14 @@ mod tests {
         assert!(!agent.validated);
     }
 
-    /// §10.4 upgrade_model_for_subagent:V4-Flash 正式版上线后自动升级已关闭,
-    /// flash 返回 None
+    /// §10.4 upgrade_model_for_subagent:自动路由链已启用(2026-08-13 Pro 0813),
+    /// flash 升级到 pro
     #[test]
-    fn upgrade_model_for_subagent_flash_returns_none_when_disabled() {
-        assert!(upgrade_model_for_subagent("deepseek-v4-flash").is_none());
+    fn upgrade_model_for_subagent_flash_upgrades_to_pro() {
+        let upgrade = upgrade_model_for_subagent("deepseek-v4-flash")
+            .expect("flash should upgrade to pro");
+        assert_eq!(upgrade.target_model, "deepseek-v4-pro");
+        assert_eq!(upgrade.cost_multiplier, 3.0);
     }
 
     /// §10.4 upgrade_model_for_subagent:pro 已顶级,返回 None

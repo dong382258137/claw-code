@@ -122,6 +122,7 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use telemetry::{JsonlTelemetrySink, SessionTracer};
 use tools::{
     execute_tool, init_lsp_from_config, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition,
     ToolSearchOutput,
@@ -3123,6 +3124,26 @@ pub(crate) fn build_runtime(
     )
 }
 
+/// 解析「质量敏感」辅助 LLM 子件应使用的旗舰模型。
+///
+/// 2026-08-13 DeepSeek V4-Pro 0813 正式版上线后,judge / summarizer /
+/// extractor / planner / research 等输出直接影响任务质量与记忆保真的子件,
+/// 应从 budget(flash)升级到 flagship(pro),吃到 Pro 0813 能力红利。
+///
+/// 这些子件都是进程级 `OnceLock` 单例,构造时绑定模型,无法运行时按任务
+/// 复杂度切换,因此采用「用途分级」而非运行时路由:
+/// - 质量敏感子件 → 旗舰(flash 升级到 pro,pro 保持 pro)
+/// - 成本敏感子件(assessor / query builder)→ 保持 budget(flash)
+///
+/// 规则:
+/// - 主模型是 flash → 升级到 pro(命中内置升级表)
+/// - 主模型已是 pro/旗舰 → 保持 pro(`upgrade_model` 返回 None)
+/// - 未知模型(无升级路径)→ 保持主模型(保守,不强行替换)
+#[must_use]
+fn resolve_quality_model(main_model: &str) -> String {
+    api::upgrade_model(main_model).unwrap_or_else(|| main_model.to_string())
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_runtime_with_plugin_state(
@@ -3168,6 +3189,9 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 稍后用于构造独立的 subagent api_client(DAG dispatch 用)。
     // AnthropicRuntimeClient 不是 Clone(内含 tokio::runtime::Runtime),只能重建。
     let model_for_subagent = model.clone();
+    // P0(2026-08-13 Pro 0813):为质量敏感的辅助 LLM 子件解析旗舰模型,
+    // 让 judge / summarizer / extractor / planner / research 吃到 Pro 0813 红利。
+    let quality_model = resolve_quality_model(&model_for_subagent);
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -3222,14 +3246,26 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 永远为 None，相关代码分支永远走 else 路径，harness 层形同虚设。
     //
     // 现在无条件注入：
-    // - VerifierAgent：内含 Rule/Visual/ModelJudge 三种 verifier。
-    //   Rule 已实现，Visual/ModelJudge 是 placeholder（P0-2 修复后保守通过）。
+    // - VerifierAgent：内含 Rule + 可选 ModelJudge 两种 verifier。
+    //   Rule 执行 verify_command 检查 exit_code；ModelJudge(2026-08-13 P2)
+    //   在 step 无 verify_command 时用 pro 模型语义校验 tool_result 是否
+    //   满足 acceptance_criteria,填补「无可执行命令」验证盲区。
     //   只在 `plan_mode_enabled && !plan.steps.is_empty()` 时被调用，
     //   未启用 plan mode 时不会有副作用。
     // - TraceAnalyzer：记录每次 turn 的 trace 数据（latency / failure_kind 等），
     //   未来可用于 CSV 导出和失败模式聚类。
+    let mut verifier_agent = runtime::VerifierAgent::new();
+    match crate::llm_clients::DeepSeekJudgeClient::new(&quality_model, Some(1024)) {
+        Ok(judge) => {
+            verifier_agent =
+                verifier_agent.with_model_judge(std::sync::Arc::new(judge));
+        }
+        Err(e) => {
+            eprintln!("[startup] VerifierAgent ModelJudge skipped (construction failed): {e}");
+        }
+    }
     runtime = runtime
-        .with_verifier_agent(runtime::VerifierAgent::new())
+        .with_verifier_agent(verifier_agent)
         .with_trace_analyzer(runtime::TraceAnalyzer::new());
     // design-gaps #2:注入 self-evolving harness archive。
     // 让会话运行时每 evolution_interval turn 自动执行 weakness mining +
@@ -3237,6 +3273,20 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 打开失败只静默跳过(archive 是可选增强,不应阻塞启动)。
     if let Ok(cwd) = env::current_dir() {
         runtime = runtime.with_harness_evolution(cwd);
+    }
+    // P0(2026-08-13 Pro 0813):注入 LLM harness Proposer(Phase 3)。
+    // 规则式 Proposer 未命中时,用 LLM 从失败模式提出新 harness 规则,
+    // 突破硬编码规则覆盖上限。构造失败(无 API key)静默跳过,
+    // 回退到纯规则式路径(零 LLM 调用)。
+    match crate::llm_clients::DeepSeekHarnessProposer::new(&quality_model, Some(512)) {
+        Ok(proposer) => {
+            runtime::harness_evolution::set_global_harness_proposer(std::sync::Arc::new(
+                proposer,
+            ));
+        }
+        Err(e) => {
+            eprintln!("[startup] HarnessProposer skipped (construction failed): {e}");
+        }
     }
     // Epic 2:注入 MultiAgentCoordinator,启用 subagent-as-tool 路由。
     // 注入后,主 agent 可通过 dispatch_subagent tool 派发子 agent,
@@ -3303,19 +3353,19 @@ pub(crate) fn build_runtime_with_plugin_state(
         // v2 Phase 2 Epic 5:注册 LlmJudgeGate(诊断/架构任务的 LLM-as-judge 评分)。
         //
         // 设计要点:
-        // - judge 模型用 subagent 同款模型(避免引入新配置项;用户可通过 --model 切换)
+        // - judge 模型用质量敏感子件的旗舰模型(pro),保证判断质量(Pro 0813 红利)
         // - max_tokens=1024(judge 只输出 0.0-1.0 分数 + 简短说明,1024 足够)
         // - 构造失败(无 API key / 模型名无效)时跳过注册,不阻断启动
         //   (降级为 MVP 行为:只有命令 gate,无 LLM judge)
         // - 注入后,LlmJudgeGate::validate 会在命令 gate 之后执行,
         //   对诊断/架构任务做四维评分(根因定位/方案可行性/完整性/副作用)
-        match crate::llm_clients::DeepSeekJudgeClient::new(&model_for_subagent, Some(1024)) {
+        match crate::llm_clients::DeepSeekJudgeClient::new(&quality_model, Some(1024)) {
             Ok(judge_client) => {
                 let judge: std::sync::Arc<dyn runtime::multi_agent::validation::JudgeClient> =
                     std::sync::Arc::new(judge_client);
                 coordinator.add_validation_gate(Box::new(
                     runtime::multi_agent::validation::LlmJudgeGate::diagnostic_default(
-                        &model_for_subagent,
+                        &quality_model,
                         workspace_root.clone(),
                     )
                     .with_client(judge),
@@ -3339,13 +3389,13 @@ pub(crate) fn build_runtime_with_plugin_state(
     // (context/decision/rationale/alternatives),而非降级为 Heuristic。
     //
     // 设计要点:
-    // - 用 subagent 同款模型(避免引入新配置项)
+    // - 用质量敏感子件的旗舰模型(pro):决策提取决定压缩后的记忆锚点保真,
+    //   低质提取会在压缩后丢关键决策(记忆丢失根因),故升级(Pro 0813 红利)
     // - max_tokens=2048(决策提取需输出 JSON 数组,2048 容纳多决策点)
     // - OnceLock 进程级单例,只能注册一次(重复调用静默忽略)
     // - 构造失败(无 API key / 模型名无效)时跳过,不阻断启动
     //   (降级为 Heuristic,保证不丢决策)
-    // - 用 budget 模型降低成本(提取任务对推理能力要求低于 judge)
-    match crate::llm_clients::DeepSeekDecisionExtractorClient::new(&model_for_subagent, Some(2048))
+    match crate::llm_clients::DeepSeekDecisionExtractorClient::new(&quality_model, Some(2048))
     {
         Ok(extractor) => {
             let extractor_client: std::sync::Arc<
@@ -3362,7 +3412,7 @@ pub(crate) fn build_runtime_with_plugin_state(
             // decision_log::extract_decisions_with_llm)。
             runtime = runtime.with_detection_strategy(
                 runtime::decision_log::DetectionStrategy::LlmExtract {
-                    model: model_for_subagent.clone(),
+                    model: quality_model.clone(),
                 },
             );
         }
@@ -3378,12 +3428,12 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 模型用过时参数知识自信地错答。Stable/Evolving 类不调研,零成本。
     //
     // 设计要点(镜像 DecisionExtractorClient 注入模式):
-    // - 用 budget 模型(摘要任务对推理能力要求低,降成本)
+    // - 用质量敏感子件的旗舰模型(pro):调研摘要质量直接影响诊断准确性
     // - max_tokens=2048(摘要输出上限)
     // - OnceLock 进程级单例,重复注册静默忽略
     // - 构造失败(无 API key)时跳过,降级为不调研(不阻塞任务)
     // - 网络失败/超时由 gate_task 降级为 None(不阻塞任务)
-    match crate::llm_clients::WebResearchClient::new(&model_for_subagent, Some(2048)) {
+    match crate::llm_clients::WebResearchClient::new(&quality_model, Some(2048)) {
         Ok(researcher) => {
             let research_client: std::sync::Arc<dyn runtime::knowledge_freshness::ResearchClient> =
                 std::sync::Arc::new(researcher);
@@ -3447,12 +3497,13 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 而非纯启发式规则摘要;失败/未注入自动降级回启发式,不阻塞压缩。
     //
     // 设计要点:
-    // - 用 budget 模型(与 decision extractor 同款),控制压缩成本
+    // - 用质量敏感子件的旗舰模型(pro):压缩摘要决定上下文保真,flash 误摘要
+    //   会丢任务锚点(记忆架构已多次修过这类问题),故升级(Pro 0813 红利)
     // - max_tokens=2048(摘要输出通常足够)
     // - OnceLock 进程级单例,重复注册静默忽略
     // - 构造失败(无 API key)时跳过,启动不失败
     match crate::llm_clients::DeepSeekCompactionSummarizerClient::new(
-        &model_for_subagent,
+        &quality_model,
         Some(2048),
     ) {
         Ok(summarizer) => {
@@ -3461,7 +3512,7 @@ pub(crate) fn build_runtime_with_plugin_state(
             > = std::sync::Arc::new(summarizer);
             runtime::compact::set_global_compaction_summarizer_client(summarizer_client);
             eprintln!(
-                "[startup] LLM compaction summarizer registered (model: {model_for_subagent})"
+                "[startup] LLM compaction summarizer registered (model: {quality_model})"
             );
         }
         Err(e) => {
@@ -3475,15 +3526,16 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 计划步骤(JSON),失败/未注入自动回退启发式 decompose_task。
     //
     // 设计要点:
-    // - 复用主模型(与 decision extractor 同款策略,避免引入新配置项)
+    // - 用质量敏感子件的旗舰模型(pro):计划质量决定执行路径,plan 复杂任务
+    //   对推理要求高,故升级(Pro 0813 红利)
     // - max_tokens=2048(计划 JSON 通常足够)
     // - OnceLock 进程级单例,构造失败跳过,不阻断启动
-    match crate::llm_clients::DeepSeekPlanGeneratorClient::new(&model_for_subagent, Some(2048)) {
+    match crate::llm_clients::DeepSeekPlanGeneratorClient::new(&quality_model, Some(2048)) {
         Ok(planner_client) => {
             let planner_client: std::sync::Arc<dyn runtime::planner::PlanGeneratorClient> =
                 std::sync::Arc::new(planner_client);
             runtime::planner::set_global_plan_generator_client(planner_client);
-            eprintln!("[startup] LLM plan generator registered (model: {model_for_subagent})");
+            eprintln!("[startup] LLM plan generator registered (model: {quality_model})");
         }
         Err(e) => {
             eprintln!("[startup] PlanGeneratorClient skipped (construction failed): {e}");
@@ -3559,6 +3611,26 @@ pub(crate) fn build_runtime_with_plugin_state(
         // RefactorTransaction：非 git 仓库自动进入 Disabled 状态，安全无副作用。
         let tx = runtime::RefactorTransaction::new(cwd.clone());
         runtime = runtime.with_refactor_transaction(tx);
+    }
+    // P1(2026-08-13):Telemetry SessionTracer 接入生产路径。
+    // 之前 runtime 侧 session_tracer 字段和 7 个 record 函数已完整实现,
+    // 但生产从未调用 with_session_tracer,turn/tool 追踪数据无落盘载体。
+    // 现在用 JsonlTelemetrySink 写入 <cwd>/.claw/telemetry.jsonl,
+    // 为后续 trace 分析 / 失败模式聚类 / CSV 导出提供数据依据。
+    // 失败(无 cwd / 目录不可写)时静默跳过,不阻塞启动。
+    if let Ok(cwd) = env::current_dir() {
+        let telemetry_path = cwd.join(".claw").join("telemetry.jsonl");
+        match JsonlTelemetrySink::new(&telemetry_path) {
+            Ok(sink) => {
+                let tracer = SessionTracer::new(session_id, Arc::new(sink));
+                runtime = runtime.with_session_tracer(tracer);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[startup] SessionTracer skipped (telemetry sink construction failed): {e}"
+                );
+            }
+        }
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }

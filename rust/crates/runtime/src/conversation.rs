@@ -1344,6 +1344,8 @@ pub struct ConversationRuntime<C, T> {
     /// 与 hook 的 cancelled 标志区分:普通 hook 取消只把工具结果标错,
     /// loop abort 则真正中断 turn。
     loop_abort_reason: Option<String>,
+    /// 阶段 2:doom loop 自动分支重试标记。防递归:每个 turn 只自动分支重试一次。
+    branch_retry_attempted: bool,
     /// Harness V(验证)层:幻觉/偷懒信号扫描器。
     /// 在 PostToolUse hook 中对 write_file/edit_file 产物扫描占位标记
     /// (unimplemented!/placeholder/TODO),命中时以 warning 追加到 hook
@@ -1700,6 +1702,56 @@ impl Drop for BusPeerDoneGuard {
     }
 }
 
+/// 读取子智能体上次尝试的 handoff,构建重试上下文注入文本。
+///
+/// 设计约束(2026-08-06-subagent-trae-alignment-design.md §8.1):自动路由升级链
+/// 启用后,retry 必须以原 task 为基、注入上次尝试 handoff 的 summary +
+/// tools_used + changed_files,否则重试子智能体会从零重新执行已完成的工具调用。
+/// 找不到 handoff 时返回 `None`(回退到原 task)。
+fn build_subagent_retry_context(
+    workspace_root: Option<&std::path::Path>,
+    workspace_override: Option<&std::path::Path>,
+    subagent_id: &str,
+) -> Option<String> {
+    let handoff_root = workspace_override.or(workspace_root)?;
+    let path = handoff_root
+        .join(".claw")
+        .join("subagents")
+        .join(format!("{subagent_id}.md"));
+    let h = crate::multi_agent::read_handoff(&path).ok()?;
+    let tools = if h.tools_used.is_empty() {
+        "(无)".to_string()
+    } else {
+        h.tools_used.join(", ")
+    };
+    let files = if h.changed_files.is_empty() {
+        "(无)".to_string()
+    } else {
+        h.changed_files.join(", ")
+    };
+    Some(format!(
+        "\n\n[上次尝试上下文 — 请在此基础上继续,不要重复已完成的操作]\n\
+         上次状态: {:?}\n\
+         已完成工具调用: {}\n\
+         已修改文件: {}\n\
+         上次摘要: {}\n",
+        h.status, tools, files, h.summary
+    ))
+}
+
+/// 阶段 2：构造 doom loop 分支重试的换方案 task。
+///
+/// 分支重试是"换一个完全不同的策略重试原任务"，不是重复失败的尝试。
+/// 纯函数（无状态），便于单元测试。
+#[must_use]
+pub(crate) fn build_branch_retry_task(reason: &str, user_input: &str) -> String {
+    format!(
+        "原任务：{user_input}\n\n\
+         上一方案陷入 doom loop（{reason}）。请换一个完全不同的策略重新完成，\
+         不要重复任何失败的尝试。"
+    )
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1769,6 +1821,7 @@ where
             workspace_root: None,
             loop_detector: LoopDetector::new(),
             loop_abort_reason: None,
+            branch_retry_attempted: false,
             slop_scanner: SlopScanner::new(),
             slop_scan_enabled: feature_config.slop_scan().unwrap_or(true),
             completion_verifier: crate::completion_verifier::CompletionVerifier::new(),
@@ -2975,6 +3028,9 @@ where
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut reactive_state = ReactiveCompactState::NotAttempted;
+        // 阶段 2b:分支重试成功标记。loop abort 检测点若分支重试成功则置 true,
+        // for 工具循环退出后据此跳出主循环,让 turn 以成功结果正常收尾。
+        let mut branch_retry_success = false;
 
         loop {
             iterations += 1;
@@ -3903,6 +3959,12 @@ where
                             }
                         }
 
+                        // 阶段 3:记录工具调用统计(成功+失败),供工具级失败率 z-test 使用。
+                        // 静默吞错:统计失败不阻断工具结果返回。
+                        if let Some(workspace_root) = &self.workspace_root {
+                            let _ = crate::tool_call_stats::record(workspace_root, &tool_name, is_error);
+                        }
+
                         // P0:失败的工具调用自动记录到 NOTEBOOK <attempted> 段。
                         // 循环中的 LLM 不会主动调用 notebook_update,此处由运行时记账,
                         // 使下一轮/下一 turn 看到"已尝试且失败"的路径,从源头消除重复诊断。
@@ -3924,6 +3986,23 @@ where
                         // 带诊断的错误;已尝试记录在 NOTEBOOK <attempted> 段
                         // (Task 2 自动记账),供下一 turn 改变策略。
                         if let Some(reason) = self.loop_abort_reason.take() {
+                            // 阶段 2b:分支重试成功 → 用成功结果替代 doom loop 失败。
+                            // 把 subagent 结果作为 assistant 消息注入会话,跳出工具循环,
+                            // 主循环据此正常收尾(返回成功 TurnSummary)。
+                            if let Some(result) =
+                                self.maybe_branch_retry(&reason, &user_input).await
+                            {
+                                let msg = ConversationMessage::assistant(vec![
+                                    ContentBlock::Text { text: result },
+                                ]);
+                                self.session
+                                    .push_message(msg.clone())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                assistant_messages.push(msg);
+                                branch_retry_success = true;
+                                break;
+                            }
+
                             let error = RuntimeError::new(format!(
                                 "doom loop detected, turn aborted: {reason}. \
                                  Failed attempts are recorded in the NOTEBOOK \
@@ -3985,6 +4064,11 @@ where
                     }
                 }
                 tool_results.push(result_message);
+            }
+
+            // 阶段 2b:分支重试成功 → 跳出主循环,让 turn 正常收尾。
+            if branch_retry_success {
+                break;
             }
         }
 
@@ -4262,7 +4346,27 @@ where
                 let config = crate::harness_evolution::EvolutionConfig::default();
                 if self.turns_since_last_evolution >= config.evolution_interval {
                     if let Ok(trace) = handle.lock() {
-                        match crate::harness_evolution::evolve(&trace, archive, &config) {
+                        // 阶段 1 接入：加载工具级失败轨迹，供 evolve 做工具级
+                        // weakness mining。加载失败（文件损坏/不可读）回退为空，
+                        // 不影响 turn 级信号。
+                        let failure_traces: Vec<crate::failure_trace::FailureTrace> = self
+                            .workspace_root
+                            .as_ref()
+                            .and_then(|root| crate::failure_trace::load_all(root).ok())
+                            .unwrap_or_default();
+                        // 阶段 3 接入：加载工具调用统计，供工具级 candidate 失败率 z-test。
+                        let tool_stats: Vec<crate::tool_call_stats::ToolCallStat> = self
+                            .workspace_root
+                            .as_ref()
+                            .and_then(|root| crate::tool_call_stats::load_all(root).ok())
+                            .unwrap_or_default();
+                        match crate::harness_evolution::evolve(
+                            &trace,
+                            &failure_traces,
+                            &tool_stats,
+                            archive,
+                            &config,
+                        ) {
                             Ok(report) => {
                                 self.emit_diag(format!(
                                     "harness evolution: {} weaknesses, {} proposals, {} promoted, {} retired, {} skipped",
@@ -4586,6 +4690,9 @@ where
             ));
         let max_attempts = max_attempts.max(1);
         let mut current_model = model_str.map(String::from);
+        // 重试时基于原 task 注入上次 handoff 上下文(避免重复执行已完成操作),
+        // 每次失败后重建(以原 task 为基,不累积)。
+        let mut effective_task = task.to_string();
         let mut final_status = "failed";
         let mut final_result_msg = String::new();
 
@@ -4637,7 +4744,7 @@ where
                 .run_subagent_turn_with_model(
                     &subagent_id,
                     name,
-                    task,
+                    &effective_task,
                     workspace_override.as_deref(),
                     current_model.as_deref(),
                     subagent_complexity,
@@ -4744,6 +4851,15 @@ where
                                 .and_then(upgrade_model_for_subagent);
                             match upgraded {
                                 Some(upgrade) => {
+                                    // 注入上次尝试的 handoff 上下文,避免重试子智能体
+                                    // 重复执行已完成的工具调用(设计文档 §8.1 约束)。
+                                    if let Some(ctx) = build_subagent_retry_context(
+                                        self.workspace_root.as_deref(),
+                                        workspace_override.as_deref(),
+                                        &subagent_id,
+                                    ) {
+                                        effective_task = format!("{task}{ctx}");
+                                    }
                                     let _ = coordinator.reset_for_retry(
                                         &subagent_id,
                                         Some(upgrade.target_model.clone()),
@@ -4810,6 +4926,15 @@ where
                         .and_then(upgrade_model_for_subagent);
                     match upgraded {
                         Some(upgrade) => {
+                            // 注入上次尝试的 handoff 上下文(截断等 Err 场景),
+                            // 避免重试子智能体重复执行已完成的工具调用(设计文档 §8.1 约束)。
+                            if let Some(ctx) = build_subagent_retry_context(
+                                self.workspace_root.as_deref(),
+                                workspace_override.as_deref(),
+                                &subagent_id,
+                            ) {
+                                effective_task = format!("{task}{ctx}");
+                            }
                             let _ = coordinator
                                 .reset_for_retry(&subagent_id, Some(upgrade.target_model.clone()));
                             let _ = coordinator.start(&subagent_id);
@@ -4886,6 +5011,63 @@ where
         }
 
         Ok(final_result_msg)
+    }
+
+    /// 阶段 2:doom loop 自动分支重试(换方案 subagent,只一次)。
+    ///
+    /// 主 agent 陷入 doom loop 时,自动 dispatch 一个"换方案"的 subagent,
+    /// 用独立上下文重试原任务。结果对比(原方案 doom loop vs 新方案成功/失败)
+    /// 记录到 FailureTrace,供阶段 3(成功替代方案喂自进化)消费。
+    ///
+    /// 返回 `Some(outcome)` 当换方案 subagent 成功(阶段 2b:主 turn 用成功结果
+    /// 替代 doom loop 失败);否则返回 `None`(跳过/失败,主 turn 保持 doom loop 终止)。
+    /// 防递归:每个 turn 只自动分支重试一次(`branch_retry_attempted`)。
+    async fn maybe_branch_retry(&mut self, reason: &str, user_input: &str) -> Option<String> {
+        if self.branch_retry_attempted || self.multi_agent_coordinator.is_none() {
+            return None;
+        }
+        self.branch_retry_attempted = true;
+
+        let retry_task = build_branch_retry_task(reason, user_input);
+        // max_attempts=1:分支重试只试一次,不做模型升级重试(控制成本 + 避免递归 doom loop)。
+        let input = serde_json::json!({
+            "name": "branch-retry",
+            "task": retry_task,
+            "mode": "fork",
+            "complexity": "simple",
+            "max_attempts": 1,
+        })
+        .to_string();
+
+        let outcome = match self.execute_dispatch_subagent_async(&input).await {
+            Ok(msg) => msg,
+            Err(e) => format!("branch retry dispatch error: {e}"),
+        };
+        // 启发式判断成功:final_result_msg 含 "completed" 且不含 "failed"。
+        let succeeded = outcome.contains("completed") && !outcome.contains("failed");
+
+        // 结果对比落盘:原方案 doom loop(reason)vs 新方案(成功/失败)。
+        if let Some(root) = &self.workspace_root {
+            let step = crate::failure_trace::TraceToolStep {
+                tool_name: "branch_retry".to_string(),
+                input: retry_task,
+                output: outcome.clone(),
+                is_error: !succeeded,
+            };
+            let trace = crate::failure_trace::FailureTrace::new(
+                format!("{}-branch-retry", self.session.session_id),
+                &self.session.session_id,
+                reason,
+                vec![step],
+            );
+            let _ = crate::failure_trace::append(root, &trace);
+        }
+
+        if succeeded {
+            Some(outcome)
+        } else {
+            None
+        }
     }
 
     /// 同步入口 — 为不在 tokio runtime 中的调用方(主要是单元测试)提供向后兼容。
@@ -6476,6 +6658,23 @@ where
             None,
         );
 
+        // 阶段 1:失败轨迹切片落盘 — tool 调用级失败点定位。
+        // 投影 TurnSummary 的 assistant_messages + tool_results,标记 is_error 失败点,
+        // 为 harness_evolution 提供比 turn 级 failure_kind 更细粒度的 weakness 信号。
+        // 独立于 session_tracer,无条件执行;落盘失败吞掉(不阻断主流程)。
+        let turn_id = format!("{}-{}", self.session.session_id, summary.iterations);
+        if let Some(trace) = crate::failure_trace::extract_from_turn_summary(
+            &turn_id,
+            &self.session.session_id,
+            "tool_error",
+            &summary.assistant_messages,
+            &summary.tool_results,
+        ) {
+            if let Some(root) = &self.workspace_root {
+                let _ = crate::failure_trace::append(root, &trace);
+            }
+        }
+
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };
@@ -6841,14 +7040,16 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, build_subagent_request, build_subagent_system_prompt,
-        compaction_threshold_for_context_window, default_subagent_tool_catalog,
-        is_repetition_warning, microcompact_preserve_recent, parse_auto_compaction_threshold,
-        parse_auto_compaction_threshold_opt, process_tool_uses, rewrite_path_to_workspace_relative,
-        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
-        PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor, SubagentContext,
-        ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
-        MICROCOMPACT_PRESERVE_RECENT, SESSION_SEARCH_TOOL_SPEC, SOFT_MAX_ITERATIONS,
+        build_assistant_message, build_branch_retry_task, build_subagent_request,
+        build_subagent_retry_context, build_subagent_system_prompt,
+        compaction_threshold_for_context_window,
+        default_subagent_tool_catalog, is_repetition_warning, microcompact_preserve_recent,
+        parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, process_tool_uses,
+        rewrite_path_to_workspace_relative, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError,
+        StaticToolExecutor, SubagentContext, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        DEFAULT_MAX_ITERATIONS, MICROCOMPACT_PRESERVE_RECENT, SESSION_SEARCH_TOOL_SPEC,
+        SOFT_MAX_ITERATIONS,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
@@ -7889,6 +8090,123 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
+    }
+
+    #[test]
+    fn build_branch_retry_task_contains_task_and_retry_hint() {
+        let task = build_branch_retry_task("doom loop detected: a.rs edited 10 times", "修复 bug");
+        assert!(task.contains("修复 bug"), "应包含原任务: {task}");
+        assert!(task.contains("doom loop"), "应包含 doom loop reason: {task}");
+        assert!(task.contains("换一个完全不同的策略"), "应包含换方案提示: {task}");
+    }
+
+    /// 阶段 1-3 端到端：doom loop → 自动分支重试 → 主 turn 恢复 → 落盘 → 工具级 candidate。
+    ///
+    /// 验证完整闭环：
+    /// 1. 主 agent 反复调用 failing_tool 触发 doom loop（LoopDetector Abort）
+    /// 2. maybe_branch_retry 自动 dispatch 换方案 subagent（成功）
+    /// 3. 主 turn 恢复（返回 Ok，而非 doom loop 错误）
+    /// 4. tool_call_stats + FailureTrace 落盘
+    /// 5. evolve 消费落盘数据 → 挖掘工具级 weakness → 产生 Candidate
+    #[test]
+    fn end_to_end_doom_loop_branch_retry_drives_tool_level_candidate() {
+        // mock ApiClient：主 agent 反复返回 failing_tool，subagent（分支重试）返回成功文本。
+        struct DoomLoopBranchApi {
+            main_calls: usize,
+        }
+        impl ApiClient for DoomLoopBranchApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                match request.request_kind {
+                    RequestKind::Main => {
+                        self.main_calls += 1;
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: format!("tool-{}", self.main_calls),
+                                name: "failing_tool".to_string(),
+                                input: "{}".to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    RequestKind::Subagent => Ok(vec![
+                        AssistantEvent::TextDelta("branch retry completed".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    other => unreachable!("unexpected request kind: {other:?}"),
+                }
+            }
+        }
+
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DoomLoopBranchApi { main_calls: 0 },
+            StaticToolExecutor::new().register("failing_tool", |_input| {
+                Err(ToolError::new("old_string not found"))
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_multi_agent_coordinator(coordinator)
+        .with_workspace_root(tempdir.path().to_path_buf());
+
+        // 分支重试成功 → 主 turn 恢复（返回 Ok，而非 doom loop 错误）。
+        let result = runtime.run_turn("fix the bug", None);
+        assert!(
+            result.is_ok(),
+            "分支重试成功应恢复主 turn，got {:?}",
+            result.err()
+        );
+
+        // 落盘验证：工具调用统计 + 失败轨迹。
+        let tool_stats = crate::tool_call_stats::load_all(tempdir.path()).expect("tool stats");
+        assert!(
+            tool_stats.iter().any(|s| s.tool_name == "failing_tool"),
+            "应记录 failing_tool 调用"
+        );
+        let failure_traces = crate::failure_trace::load_all(tempdir.path()).expect("traces");
+        assert!(
+            failure_traces
+                .iter()
+                .any(|ft| ft.steps.iter().any(|s| s.tool_name == "failing_tool" && s.is_error)),
+            "应记录 failing_tool 失败轨迹"
+        );
+        assert!(
+            failure_traces
+                .iter()
+                .any(|ft| ft.steps.iter().any(|s| s.tool_name == "branch_retry")),
+            "应记录分支重试"
+        );
+
+        // 自进化验证：evolve 消费落盘数据 → 挖掘工具级 weakness → 产生 Candidate。
+        let archive =
+            crate::harness_evolution::HarnessArchive::open(tempdir.path()).expect("open archive");
+        let analyzer = crate::trace_analyzer::TraceAnalyzer::new(); // 空：无 turn 级信号
+        let config = crate::harness_evolution::EvolutionConfig {
+            min_occurrences: 1, // 只有 1 条 failing_tool 失败，放宽低频过滤
+            ..crate::harness_evolution::EvolutionConfig::default()
+        };
+        let report = crate::harness_evolution::evolve(
+            &analyzer,
+            &failure_traces,
+            &tool_stats,
+            &archive,
+            &config,
+        )
+        .expect("evolve");
+        assert!(report.weaknesses_count >= 1, "应挖掘工具级 weakness");
+        let candidates = archive.candidate_edits().expect("candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.pathology.contains("failing_tool")),
+            "应产生 failing_tool 的工具级 candidate，got {:?}",
+            candidates.iter().map(|c| &c.pathology).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -12303,6 +12621,59 @@ mod tests {
         }
     }
 
+    /// build_subagent_retry_context:handoff 存在时返回注入文本,含 summary/tools_used/changed_files
+    #[test]
+    fn build_subagent_retry_context_injects_handoff_summary() {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let subagent_id = "retry-ctx-test-001";
+        let handoff = crate::multi_agent::SubagentHandoff::new(
+            subagent_id,
+            "agent",
+            crate::multi_agent::SubagentCapability::Analyze,
+            crate::multi_agent::TaskComplexity::Simple,
+            3,
+            vec!["bash".to_string(), "edit_file".to_string()],
+            vec!["src/a.rs".to_string()],
+            "完成了部分重构",
+            "details",
+        );
+        crate::multi_agent::write_handoff(tempdir.path(), &handoff).expect("write handoff");
+
+        let ctx = build_subagent_retry_context(
+            Some(tempdir.path()),
+            None,
+            subagent_id,
+        )
+        .expect("context should be Some");
+
+        assert!(ctx.contains("bash"), "tools_used should be injected: {ctx}");
+        assert!(
+            ctx.contains("edit_file"),
+            "tools_used should be injected: {ctx}"
+        );
+        assert!(
+            ctx.contains("src/a.rs"),
+            "changed_files should be injected: {ctx}"
+        );
+        assert!(ctx.contains("完成了部分重构"), "summary should be injected: {ctx}");
+        assert!(
+            ctx.contains("不要重复已完成的操作"),
+            "guidance should be injected: {ctx}"
+        );
+    }
+
+    /// build_subagent_retry_context:handoff 不存在时返回 None(回退原 task)
+    #[test]
+    fn build_subagent_retry_context_returns_none_without_handoff() {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        let ctx = build_subagent_retry_context(
+            Some(tempdir.path()),
+            None,
+            "missing-handoff-001",
+        );
+        assert!(ctx.is_none());
+    }
+
     /// 场景 1:简单任务路由到 flash,一次成功(§10.4 端到端流程 P0)
     /// 验收:简单任务 → flash → run → validate 通过 → completed
     #[test]
@@ -12415,22 +12786,21 @@ mod tests {
         );
     }
 
-    /// 场景 3:flash + Simple + max_attempts=2,validate 失败 → 无升级路径 → 立即 fail
+    /// 场景 3:flash + Simple + max_attempts=2,validate 失败 → 自动路由升级 pro → 重试成功
     ///
-    /// V4-Flash 正式版(2026-07-31)上线后自动升级链已关闭,
-    /// retryable 失败时无升级路径,直接 fail 而非升级重试。
+    /// 2026-08-13 V4-Pro 0813 正式版上线,自动路由升级链已重新启用,
+    /// retryable 失败时 flash 自动升级到 pro 重试,而非直接 fail。
     #[test]
-    fn dispatch_subagent_scenario3_no_upgrade_fails_immediately() {
+    fn dispatch_subagent_scenario3_flash_upgrades_to_pro_and_succeeds() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario3-no-upgrade-uuid-p0-9-s3";
+        let unique_task = "scenario3-upgrade-uuid-p0-9-s3";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
-        // gate 脚本:第一次 Err(retryable)
-        // 自动升级已关闭,第一次失败即终止,不会到达第二次
+        // gate 脚本:第一次 Err(retryable)→ 升级 pro;第二次 validate 通过
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
             Some(false), // attempt 1 validate: retryable Err
-            Some(true),  // 不会被消费
+            Some(true),  // attempt 2 validate: 通过(pro)
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
@@ -12451,10 +12821,10 @@ mod tests {
             .execute_dispatch_subagent(&input)
             .expect("dispatch should not propagate as hard error");
 
-        // 自动升级已关闭:失败即终止
+        // 自动路由:第一次失败后升级 pro,第二次 validate 通过 → completed
         assert!(
-            output.contains("Subagent `") && output.contains("failed"),
-            "scenario 3 should fail without upgrade: {output}"
+            output.contains("Subagent `") && output.contains("completed"),
+            "scenario 3 should complete after upgrade to pro: {output}"
         );
 
         let subagent_id = output
@@ -12463,31 +12833,34 @@ mod tests {
             .and_then(|s| s.split('`').next())
             .expect("extract subagent_id");
         let agent = coordinator.get(subagent_id).expect("agent exists");
-        // 模型不应升级,保持 flash
+        // 模型已自动升级到 pro
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-flash"),
-            "model should NOT be upgraded (auto-upgrade disabled)"
+            Some("deepseek-v4-pro"),
+            "model should be upgraded to pro (auto-routing enabled)"
         );
-        assert!(!agent.validated, "should not be validated");
-        assert_eq!(agent.status, crate::multi_agent::SubagentStatus::Failed);
+        assert!(agent.validated, "should be validated");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Completed,
+            "scenario 3: should be Completed"
+        );
     }
 
-    /// 场景 4:flash + Simple + max_attempts=2,validate 失败 → 无升级路径 → fail
+    /// 场景 4:flash + Simple + max_attempts=2,validate 连续失败 → 升级 pro 后仍失败 → fail
     ///
-    /// 自动升级已关闭,第一次失败即终止,模型保持 flash。
+    /// 自动路由已启用:第一次失败升级 pro;pro 已是旗舰,第二次失败无升级路径 → fail。
     #[test]
-    fn dispatch_subagent_scenario4_no_upgrade_fails() {
+    fn dispatch_subagent_scenario4_pro_cannot_upgrade_so_fails() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
         let unique_task = "scenario4-no-upgrade-uuid-p0-9-s4";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
         // gate 脚本:总是 retryable Err
-        // 自动升级已关闭,第一次失败即终止,第二次不会被消费
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
-            Some(false), // attempt 1: retryable Err
-            Some(false), // 不会被消费
+            Some(false), // attempt 1: retryable Err → 升级 pro
+            Some(false), // attempt 2: retryable Err(pro 已旗舰)→ fail
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
@@ -12508,10 +12881,10 @@ mod tests {
             .execute_dispatch_subagent(&input)
             .expect("dispatch should not propagate as hard error");
 
-        // 自动升级已关闭:第一次失败即 fail
+        // 升级 pro 后仍失败 → fail
         assert!(
             output.contains("Subagent `") && output.contains("failed"),
-            "scenario 4 should fail without upgrade: {output}"
+            "scenario 4 should fail after pro retry fails: {output}"
         );
 
         let subagent_id = output
@@ -12526,11 +12899,11 @@ mod tests {
             "should be Failed"
         );
         assert!(!agent.validated, "should not be validated");
-        // 模型不应升级,保持 flash
+        // 模型已升级到 pro(第一次失败后),pro 无升级路径 → fail
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-flash"),
-            "model should NOT be upgraded (auto-upgrade disabled)"
+            Some("deepseek-v4-pro"),
+            "model should be upgraded to pro before failing"
         );
     }
 
@@ -12603,27 +12976,27 @@ mod tests {
         );
     }
 
-    /// 场景 5 补充:cost_limit 足够大,但自动升级已关闭 → 仍 fail
+    /// 场景 5 补充:cost_limit 足够大 → 升级 pro → 重试成功
     ///
-    /// V4-Flash 正式版上线后自动升级链已关闭,
-    /// 即使成本上限足够,也不会升级到 pro,直接 fail。
+    /// 自动路由已启用(2026-08-13 Pro 0813),成本上限足够时 flash 升级到 pro,
+    /// 第二次 validate 通过 → completed。
     #[test]
-    fn dispatch_subagent_scenario5_high_cost_limit_no_upgrade_disabled() {
+    fn dispatch_subagent_scenario5_high_cost_limit_upgrades_to_pro() {
         let _guard = acquire_lane_event_lock();
         let _ = crate::lane_events::drain_lane_events();
-        let unique_task = "scenario5-high-limit-no-upgrade-uuid-p0-9-s5b";
+        let unique_task = "scenario5-high-limit-upgrade-uuid-p0-9-s5b";
 
         let coordinator = crate::multi_agent::MultiAgentCoordinator::new();
         coordinator.add_validation_gate(Box::new(ScriptedGate::new(vec![
-            Some(false), // attempt 1: retryable Err
-            Some(true),  // 不会被消费(自动升级已关闭)
+            Some(false), // attempt 1: retryable Err → 升级 pro
+            Some(true),  // attempt 2: validate 通过(pro)
         ])));
 
         let mut runtime = runtime_with_coordinator(coordinator.clone());
         let tempdir = tempfile::tempdir().expect("temp workspace");
         runtime.set_workspace_root(tempdir.path().to_path_buf());
 
-        // cost_limit=10.0:足够大,但自动升级已关闭
+        // cost_limit=10.0:足够大,允许升级到 pro
         let input = serde_json::json!({
             "name": "diag-agent",
             "task": unique_task,
@@ -12639,10 +13012,10 @@ mod tests {
             .execute_dispatch_subagent(&input)
             .expect("dispatch should not propagate as hard error");
 
-        // 自动升级已关闭:即使成本上限足够,也直接 fail
+        // 成本上限足够:升级 pro 后重试成功
         assert!(
-            output.contains("failed"),
-            "should fail without upgrade even with high cost_limit: {output}"
+            output.contains("Subagent `") && output.contains("completed"),
+            "should complete after upgrade with high cost_limit: {output}"
         );
 
         let subagent_id = output
@@ -12651,11 +13024,17 @@ mod tests {
             .and_then(|s| s.split('`').next())
             .expect("extract subagent_id");
         let agent = coordinator.get(subagent_id).expect("agent exists");
-        // 模型不应升级,保持 flash
+        // 模型已升级到 pro
         assert_eq!(
             agent.model.as_deref(),
-            Some("deepseek-v4-flash"),
-            "model should NOT be upgraded (auto-upgrade disabled)"
+            Some("deepseek-v4-pro"),
+            "model should be upgraded to pro when cost_limit allows"
+        );
+        assert!(agent.validated, "should be validated");
+        assert_eq!(
+            agent.status,
+            crate::multi_agent::SubagentStatus::Completed,
+            "should be Completed"
         );
     }
 

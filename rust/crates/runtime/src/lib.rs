@@ -113,6 +113,14 @@ pub mod sandbox;
 mod session;
 pub mod session_control;
 pub mod trace_analyzer;
+// Harness O(可观测性)层:FailureTrace — tool 调用级失败点定位(阶段 1)。
+// 把 TraceAnalyzer 的 turn 级 failure_kind 降粒度到工具调用序列,标记 is_error
+// 失败点,为自进化闭环提供更细粒度的 weakness 信号。详见 failure_trace.rs。
+pub mod failure_trace;
+// Harness O(可观测性)层:ToolCallStats — 工具调用统计(阶段 3)。
+// 记录每次工具调用的 (tool_name, is_error),为工具级 candidate 的失败率 z-test
+// 提供分母(FailureTrace 只记失败,无法算失败率)。详见 tool_call_stats.rs。
+pub mod tool_call_stats;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
@@ -359,6 +367,13 @@ pub use multi_agent::{
 pub use trace_analyzer::{
     FailureCluster, TraceAnalyzer, TraceRecord, TraceStats, CSV_HEADER as TRACE_CSV_HEADER,
     MAX_SAMPLE_ERRORS_PER_CLUSTER,
+};
+pub use failure_trace::{
+    extract_from_turn_summary, FailureTrace, FailureTraceError, TraceToolStep,
+    FAILURE_TRACES_FILENAME, FAILURE_TRACES_MAX_CHARS, TRACE_STEP_FIELD_MAX_CHARS,
+};
+pub use tool_call_stats::{
+    ToolCallStat, ToolCallStatsError, TOOL_CALL_STATS_FILENAME, TOOL_CALL_STATS_MAX_CHARS,
 };
 pub use trust_resolver::{
     detect_trust_prompt, TrustAllowlistEntry, TrustConfig, TrustDecision, TrustEvent, TrustPolicy,

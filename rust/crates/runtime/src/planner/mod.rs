@@ -194,16 +194,22 @@ pub fn is_auto_planner_enabled() -> bool {
     AUTO_PLANNER_ENABLED.get().copied().unwrap_or(false)
 }
 
-/// 默认模型(固定策略 — 所有 step 统一用 flash,通过 complexity 调整 max_retries)。
+/// budget 子 agent 模型 — 分层模型路由的低风险执行层。
+///
+/// 2026-08-13 分层模型路由(pro 大脑 + flash 执行):
+/// - `Low` risk step → 用此 flash 模型执行(机械操作,降成本)
+/// - `High` risk step → 用旗舰模型(pro)执行(架构决策,见 [`plan_steps_to_spawn_requests`])
 const DEFAULT_SUBAGENT_MODEL: &str = "deepseek-v4-flash";
 
 /// 将 PlanStep 列表转换为 SpawnRequest 列表(PlannerAgent 接入并行链路的桥接器)。
 ///
-/// 映射规则:
+/// 映射规则(2026-08-13 分层模型路由 — pro 大脑 + flash 执行):
 /// - `name` ← `step.id`
 /// - `task` ← `step.description`
 /// - `mode` ← `CoordinationMode::Fork`(并行派发)
-/// - `model` ← 固定 `deepseek-v4-flash`(P0 策略,通过 complexity 调整 max_retries)
+/// - `model` ← 按风险分层:
+///   - `High` → 旗舰模型(pro):架构决策/高风险操作需要强推理能力
+///   - `Low` → budget 模型(flash):机械操作,降成本
 /// - `complexity` ← 基于 `step.risk_level`:
 ///   - `High` → `Architectural`(max_retries=2,容错最强)
 ///   - `Low` → `Simple`(max_retries=0,机械操作)
@@ -215,20 +221,28 @@ const DEFAULT_SUBAGENT_MODEL: &str = "deepseek-v4-flash";
 /// 转换后的 SpawnRequest 列表(长度与输入一致)
 #[must_use]
 pub fn plan_steps_to_spawn_requests(steps: &[PlanStep]) -> Vec<crate::multi_agent::SpawnRequest> {
-    use crate::multi_agent::{CoordinationMode, SpawnRequest, TaskComplexity};
+    use crate::multi_agent::{
+        upgrade_model_for_subagent, CoordinationMode, SpawnRequest, TaskComplexity,
+    };
+
+    // 高风险任务的旗舰模型:沿 flash → pro 升级链推导(与 multi_agent 的
+    // upgrade_lookup 单源一致,避免硬编码 pro 名)。
+    let flagship_model = upgrade_model_for_subagent(DEFAULT_SUBAGENT_MODEL)
+        .map(|u| u.target_model)
+        .unwrap_or_else(|| DEFAULT_SUBAGENT_MODEL.to_string());
 
     steps
         .iter()
         .map(|step| {
-            let complexity = match step.risk_level {
-                StepRisk::High => TaskComplexity::Architectural,
-                StepRisk::Low => TaskComplexity::Simple,
+            let (model, complexity) = match step.risk_level {
+                StepRisk::High => (flagship_model.clone(), TaskComplexity::Architectural),
+                StepRisk::Low => (DEFAULT_SUBAGENT_MODEL.to_string(), TaskComplexity::Simple),
             };
             SpawnRequest::new(
                 step.id.clone(),
                 step.description.clone(),
                 CoordinationMode::Fork,
-                DEFAULT_SUBAGENT_MODEL,
+                model,
                 complexity,
             )
         })
@@ -372,6 +386,10 @@ pub fn is_plan_generator_registered() -> bool {
 /// 4. 解析失败 / 空数组 / LLM 调用失败 → `None`
 #[must_use]
 pub fn generate_steps_with_llm(user_input: &str) -> Option<Vec<PlanStep>> {
+    // Tier S #3 穷鬼模式:激活时跳过 LLM 计划生成,回退启发式分解(省 token)。
+    if crate::poor_mode::is_active() {
+        return None;
+    }
     let client = GLOBAL_PLAN_GENERATOR.get()?.as_ref()?;
     let prompt = build_plan_generation_prompt(user_input);
     let raw = client.generate_plan(&prompt).ok()?;
@@ -620,8 +638,8 @@ mod tests {
             requests[1].complexity,
             crate::multi_agent::TaskComplexity::Simple
         );
-        // 固定模型策略
-        assert_eq!(requests[0].model, "deepseek-v4-flash");
+        // 分层模型路由:High risk → pro,Low risk → flash
+        assert_eq!(requests[0].model, "deepseek-v4-pro");
         assert_eq!(requests[1].model, "deepseek-v4-flash");
         // 并行模式
         assert_eq!(requests[0].mode, crate::multi_agent::CoordinationMode::Fork);

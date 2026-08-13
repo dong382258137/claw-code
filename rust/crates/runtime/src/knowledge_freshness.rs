@@ -547,7 +547,8 @@ pub async fn gate_task(task: &str, attempt: u32) -> GatedTask {
     // 3. Phase 2.1:LLM 语义评估(仅当关键词评估为 Evolving 且 assessor 可用)。
     //    成本控制:Novel/Stable(强信号)不调 LLM,只对 Evolving(不确定)细化。
     //    非紧急(attempt=0)才评估;重试时跳过以减少延迟。
-    if !urgent && freshness == KnowledgeFreshness::Evolving {
+    //    Tier S #3 穷鬼模式:激活时跳过 LLM 语义评估(省 token)。
+    if !crate::poor_mode::is_active() && !urgent && freshness == KnowledgeFreshness::Evolving {
         if let Some(assessor) = get_global_freshness_assessor() {
             match assessor.assess(task).await {
                 Ok((llm_freshness, _reason)) => {
@@ -560,8 +561,12 @@ pub async fn gate_task(task: &str, attempt: u32) -> GatedTask {
         }
     }
 
-    // 4. 调研(仅 Novel 且非紧急 且 client 可用)
-    let research_summary = if !urgent && freshness.needs_research() {
+    // 4. 调研(仅 Novel 且非紧急 且 client 可用)。
+    //    Tier S #3 穷鬼模式:激活时跳过联网调研(省 token)。
+    let research_summary = if !crate::poor_mode::is_active()
+        && !urgent
+        && freshness.needs_research()
+    {
         if let Some(client) = get_global_research_client() {
             // Phase 2.3:优先用 LLM 提取关键实体构建查询,降级回启发式。
             let query = if let Some(builder) = get_global_query_builder() {

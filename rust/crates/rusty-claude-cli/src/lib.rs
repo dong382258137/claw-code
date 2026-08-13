@@ -151,8 +151,9 @@ use ultraplan::{
     InternalPromptProgressState, INTERNAL_PROGRESS_HEARTBEAT_INTERVAL,
 };
 
-// V4-Flash 正式版(2026-07-31)Agent 能力全面超越 Pro 预览版,且价格更低,
-// 作为默认模型。Pro 正式版发布后再评估是否切换。
+// V4-Pro 0813 正式版(2026-08-13)已上线,能力大幅提升,自动路由升级链已恢复。
+// 主会话默认仍用 flash(便宜、简单任务够用);复杂/失败子任务由自动路由
+// 升级到 pro(model_tier upgrade 表 flash→pro),兼顾成本与质量。
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
@@ -892,7 +893,18 @@ fn run_harness_command(
                 std::process::exit(1);
             };
             let config = runtime::harness_evolution::EvolutionConfig::default();
-            match runtime::harness_evolution::evolve(&analyzer, &archive, &config) {
+            // 阶段 1 接入：加载工具级失败轨迹（若存在），供 evolve 做工具级
+            // weakness mining。无文件或损坏时回退为空，不影响 turn 级信号。
+            let failure_traces = runtime::failure_trace::load_all(&cwd).unwrap_or_default();
+            // 阶段 3 接入：加载工具调用统计，供工具级 candidate 失败率 z-test。
+            let tool_stats = runtime::tool_call_stats::load_all(&cwd).unwrap_or_default();
+            match runtime::harness_evolution::evolve(
+                &analyzer,
+                &failure_traces,
+                &tool_stats,
+                &archive,
+                &config,
+            ) {
                 Ok(report) => match output_format {
                     CliOutputFormat::Text => {
                         println!(

@@ -96,26 +96,22 @@ impl UpgradeEntry {
 
 /// 内置升级表（配置文件不存在时使用）。
 ///
-/// 历史升级链(V4-Flash 正式版发布前):
-///   deepseek-v4-flash → deepseek-v4-pro (cost_multiplier=10.0)
+/// 2026-07-31 V4-Flash 正式版上线时曾因 Flash 能力超越 Pro 预览版而关闭升级链;
+/// 2026-08-13 DeepSeek V4-Pro 0813 正式版上线,能力大幅提升,
+/// 恢复自动路由升级链(简单任务用 flash,失败/复杂任务升级到 pro)。
 ///
-/// 2026-07-31 V4-Flash 正式版上线后,Agent 能力全面超越 Pro 预览版且价格更低,
-/// 自动升级链已关闭。Pro 正式版发布后再评估是否重新启用。
+/// cost_multiplier=3.0:按 2026-07 官方定价精确计算
+///   flash ¥1/M in + ¥2/M out;pro ¥3/M in + ¥6/M out(恰好 3 倍)。
 ///
-/// 配置文件 `~/.claw/model-upgrades.json` 仍可由用户自行覆盖。
+/// 配置文件 `~/.claw/model-upgrades.json` 存在时优先,可自行覆盖。
 fn default_upgrades() -> HashMap<String, UpgradeEntry> {
-    let map = HashMap::new();
+    let mut map = HashMap::new();
 
-    // 自动升级已关闭 — 如需恢复,取消下方注释:
-    // map.insert(
-    //     "deepseek-v4-flash".to_string(),
-    //     UpgradeEntry::new("deepseek-v4-pro", 10.0),
-    // );
-    // pro 本身是旗舰，返回自身作为哨兵值
-    // map.insert(
-    //     "deepseek-v4-pro".to_string(),
-    //     UpgradeEntry::new("deepseek-v4-pro", 1.0),
-    // );
+    // DeepSeek 自动路由链:flash → pro(成本门禁用)
+    map.insert(
+        "deepseek-v4-flash".to_string(),
+        UpgradeEntry::new("deepseek-v4-pro", 3.0),
+    );
 
     map
 }
@@ -259,10 +255,10 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_deepseek_flash_returns_none_when_disabled() {
-        // V4-Flash 正式版(2026-07-31)上线后自动升级链已关闭
+    fn upgrade_deepseek_flash_upgrades_to_pro() {
+        // 2026-08-13 V4-Pro 0813 正式版上线,自动路由升级链已重新启用
         let upgraded = upgrade_model("deepseek-v4-flash");
-        assert_eq!(upgraded, None);
+        assert_eq!(upgraded.as_deref(), Some("deepseek-v4-pro"));
     }
 
     #[test]
@@ -279,8 +275,9 @@ mod tests {
 
     #[test]
     fn upgrade_cost_multiplier_deepseek() {
-        // 自动升级已关闭,所有模型 cost_multiplier 均为 1.0
-        assert_eq!(upgrade_cost_multiplier("deepseek-v4-flash"), 1.0);
+        // 自动路由已启用:flash → pro,按 2026-07 官方定价 3 倍
+        assert_eq!(upgrade_cost_multiplier("deepseek-v4-flash"), 3.0);
+        // pro 已旗舰,无升级路径,倍数 1.0
         assert_eq!(upgrade_cost_multiplier("deepseek-v4-pro"), 1.0);
         assert_eq!(upgrade_cost_multiplier("unknown-model"), 1.0);
     }

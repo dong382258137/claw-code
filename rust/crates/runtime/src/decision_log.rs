@@ -1075,6 +1075,15 @@ pub fn extract_decisions_before_compaction(
             decisions
         }
         DetectionStrategy::LlmExtract { model } => {
+            // Tier S #3 穷鬼模式:激活时跳过 LLM 决策提取,回退纯启发式(省 token)。
+            if crate::poor_mode::is_active() {
+                let heuristic_strategy = DetectionStrategy::Heuristic;
+                return extract_decisions_before_compaction(
+                    messages,
+                    &heuristic_strategy,
+                    session_id,
+                );
+            }
             // v2 §10.5 Epic 6 实现:调用全局 DecisionExtractorClient 提取决策
             //
             // 降级策略:若未注册全局 client,回退到 Heuristic(零成本,不阻塞 compaction)

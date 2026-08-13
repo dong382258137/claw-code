@@ -627,6 +627,102 @@ impl runtime::knowledge_freshness::QueryBuilderClient for DeepSeekQueryBuilderCl
     }
 }
 
+/// 生产 `HarnessProposer` 实现(Phase 3)— 用 LLM 从失败模式提出新 harness 规则。
+///
+/// 封装 `LlmBridge`,把 `HarnessProposer::propose` 路由到 LLM。当规则式
+/// Proposer(`RULE_PATTERNS`)未命中时,本实现让模型从 pathology + 样本错误中
+/// 提炼一条可注入 system prompt 的指导规则,突破硬编码规则的覆盖上限。
+///
+/// # 防 misevolution
+/// - 只提议,不归因:两重门控(validity/significance)由确定性代码执行;
+/// - 输出 content 由 runtime 截断到 500 chars;
+/// - LLM 失败 / 响应无效 → 返回 None(保持规则式路径零 LLM 回退)。
+pub struct DeepSeekHarnessProposer {
+    bridge: LlmBridge,
+}
+
+impl DeepSeekHarnessProposer {
+    /// 构造 harness 提议器。
+    ///
+    /// # 参数
+    /// - `model`:提议模型名(建议旗舰模型保证规则质量,如 "deepseek-v4-pro")
+    /// - `max_tokens`:单次响应上限(规则 + 推理,512 足够)
+    pub fn new(model: &str, max_tokens: Option<u32>) -> Result<Self, String> {
+        Ok(Self {
+            bridge: LlmBridge::new(model, max_tokens)?,
+        })
+    }
+
+    /// 构建提议 prompt:让 LLM 从失败模式提炼一条可注入 system prompt 的规则。
+    fn build_propose_prompt(weakness: &runtime::harness_evolution::WeaknessSignal) -> String {
+        let samples = weakness
+            .sample_errors
+            .iter()
+            .take(5)
+            .map(|e| format!("- {e}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let samples = if samples.is_empty() {
+            "(无样本)".to_string()
+        } else {
+            samples
+        };
+        format!(
+            "你是一个 AI 编程助手的自进化工程师。以下是一个反复出现的失败模式(pathology),\
+             请为它提炼一条可直接注入 system prompt 的指导规则,帮助 AI 在未来避免同类失败。\n\
+             \n\
+             ## 失败模式\n\
+             {pathology}\n\
+             \n\
+             ## 样本错误\n\
+             {samples}\n\
+             \n\
+             ## 要求\n\
+             - 规则用英文书写(与 system prompt 语言一致),简洁可操作,不超过 400 字符\n\
+             - 聚焦「遇到此错误时该怎么做」,而非泛泛而谈\n\
+             - 不要重复已有规则(如 Grep before Edit / 分析测试失败等)\n\
+             \n\
+             ## 输出格式\n\
+             只返回一行 JSON,不要其他内容:\n\
+             {{\"content\": \"指导规则正文\", \"reasoning\": \"为什么这条规则有效\"}}",
+            pathology = weakness.pathology,
+        )
+    }
+
+    /// 解析 LLM 返回的 JSON,提取 `(content, reasoning)`;无效时返回 None。
+    fn parse_propose_response(response: &str) -> Option<(String, String)> {
+        let trimmed = response.trim();
+        let json_str = if let Some(start) = trimmed.find('{') {
+            let end = trimmed.rfind('}')?;
+            &trimmed[start..=end]
+        } else {
+            trimmed
+        };
+        let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
+        let content = parsed.get("content")?.as_str()?.to_string();
+        let reasoning = parsed
+            .get("reasoning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if content.trim().is_empty() {
+            return None;
+        }
+        Some((content, reasoning))
+    }
+}
+
+impl runtime::harness_evolution::HarnessProposer for DeepSeekHarnessProposer {
+    fn propose(
+        &self,
+        weakness: &runtime::harness_evolution::WeaknessSignal,
+    ) -> Option<(String, String)> {
+        let prompt = Self::build_propose_prompt(weakness);
+        let response = self.bridge.call(&prompt).ok()?;
+        Self::parse_propose_response(&response)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,5 +797,40 @@ mod tests {
     #[test]
     fn deepseek_decision_extractor_client_can_be_arc_dyn() {
         fn assert_arc_dyn(_x: std::sync::Arc<dyn DecisionExtractorClient>) {}
+    }
+
+    /// 验证 `DeepSeekHarnessProposer` 实现 `HarnessProposer` trait。
+    #[test]
+    fn deepseek_harness_proposer_implements_trait() {
+        fn assert_proposer<T: runtime::harness_evolution::HarnessProposer>() {}
+        assert_proposer::<DeepSeekHarnessProposer>();
+    }
+
+    /// 验证 `parse_propose_response` 正确解析 JSON 并容错包裹的 ```json。
+    #[test]
+    fn parse_propose_response_extracts_content_and_reasoning() {
+        let response = "```json\n{\"content\": \"check X first\", \"reasoning\": \"because Y\"}\n```";
+        let (content, reasoning) =
+            DeepSeekHarnessProposer::parse_propose_response(response).expect("parse ok");
+        assert_eq!(content, "check X first");
+        assert_eq!(reasoning, "because Y");
+    }
+
+    /// 验证 `parse_propose_response` 对缺失 content / 空 content 返回 None。
+    #[test]
+    fn parse_propose_response_rejects_invalid() {
+        // 缺 content 字段
+        assert!(
+            DeepSeekHarnessProposer::parse_propose_response("{\"reasoning\":\"r\"}").is_none()
+        );
+        // 空 content
+        assert!(
+            DeepSeekHarnessProposer::parse_propose_response(
+                "{\"content\":\"   \", \"reasoning\":\"r\"}"
+            )
+            .is_none()
+        );
+        // 非 JSON
+        assert!(DeepSeekHarnessProposer::parse_propose_response("not json at all").is_none());
     }
 }

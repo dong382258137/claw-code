@@ -162,6 +162,10 @@ fn sanitize_llm_summary(text: &str) -> String {
 /// 从全局注册表取 client;未注册 / 调用失败 / 返回空 → 回退
 /// [`summarize_messages`] 启发式规则摘要。
 fn summarize_messages_with_llm(messages: &[ConversationMessage]) -> String {
+    // Tier S #3 穷鬼模式:激活时跳过 LLM 摘要,直接回退启发式(省 token)。
+    if crate::poor_mode::is_active() {
+        return summarize_messages(messages);
+    }
     summarize_messages_with_client(messages, global_compaction_summarizer().as_deref())
 }
 
