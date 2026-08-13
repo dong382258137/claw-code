@@ -18,7 +18,9 @@ use std::cell::RefCell;
 
 use agent_client_protocol as acp;
 use async_trait::async_trait;
-use runtime::{ApiClient, ConversationRuntime, PermissionPolicy, Session, StaticToolExecutor};
+use runtime::{
+    ApiClient, AssistantEvent, ConversationRuntime, PermissionPolicy, Session, StaticToolExecutor,
+};
 
 use claw_acp::AcpGatewaySender;
 
@@ -57,6 +59,10 @@ where
     /// 保留一份供 cancel() 调用 abort()。
     /// 在 prompt 入口调用 reset() 清除上一个 turn 的 sticky 状态。
     turn_abort_signal: RefCell<Option<runtime::HookAbortSignal>>,
+    /// IDE 编辑器上下文（当前活动文件 + 选区 + 诊断），由前端经
+    /// `ExtNotification("session/context")` 推送。prompt 时附加到 user_input
+    /// 之前，让 agent 感知用户当前编辑位置与诊断状态（IDE 独有优势）。
+    pending_editor_context: RefCell<Option<String>>,
 }
 
 /// Builder:在 spawn 线程外构造,然后 `build()` 在 LocalSet 内完成。
@@ -131,6 +137,7 @@ where
             tool_executor: RefCell::new(Some(tool_executor)),
             client_gateway,
             turn_abort_signal: RefCell::new(None),
+            pending_editor_context: RefCell::new(None),
         }
     }
 }
@@ -139,13 +146,6 @@ impl<C> ClawAgent<C>
 where
     C: ApiClient + 'static,
 {
-    /// 向前端推送 `SessionNotification`(fire-and-forget)。
-    fn notify(&self, session_id: &acp::SessionId, update: acp::SessionUpdate) {
-        let notif = acp::SessionNotification::new(session_id.clone(), update);
-        // 走 gateway 的 fire-and-forget 路径,前端 channel 关闭不阻塞 agent
-        self.client_gateway.forward_fire_and_forget(notif);
-    }
-
     /// 从 `acp::PromptRequest.prompt`(Vec<ContentBlock>)中提取纯文本。
     ///
     /// 本地 `run_turn` 只接受 `String`,所以把所有 Text block 拼接。
@@ -161,25 +161,52 @@ where
             .join("\n")
     }
 
-    /// 从 runtime 中提取 assistant 文本(取最后一条 assistant 消息的所有 Text block)。
-    fn extract_assistant_text(runtime: &ConversationRuntime<C, StaticToolExecutor>) -> String {
-        runtime
-            .session()
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == runtime::MessageRole::Assistant)
-            .map(|m| {
-                m.blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        runtime::ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default()
+    /// 把单个 [`AssistantEvent`] 映射为 ACP `SessionNotification`（P0 IDE 流式）。
+    ///
+    /// - `TextDelta` → `AgentMessageChunk`（逐 delta 流式文本）
+    /// - `Thinking` → `AgentMessageChunk`（带 `[thinking]` 前缀，前端渲染为折叠卡片）
+    /// - `ToolUse` → `ToolCall`（InProgress，前端显示 ⏳）
+    /// - `Usage` / `MessageStop` / `PromptCache` → `None`（不推送，由 turn 结束统一处理）
+    fn assistant_event_to_session_update(
+        session_id: &acp::SessionId,
+        event: &AssistantEvent,
+    ) -> Option<acp::SessionNotification> {
+        match event {
+            AssistantEvent::TextDelta(delta) => {
+                if delta.is_empty() {
+                    return None;
+                }
+                Some(acp::SessionNotification::new(
+                    session_id.clone(),
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                        acp::ContentBlock::Text(acp::TextContent::new(delta.clone())),
+                    )),
+                ))
+            }
+            AssistantEvent::Thinking { thinking, .. } => {
+                if thinking.is_empty() {
+                    return None;
+                }
+                Some(acp::SessionNotification::new(
+                    session_id.clone(),
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                        acp::ContentBlock::Text(acp::TextContent::new(format!(
+                            "[thinking] {thinking}"
+                        ))),
+                    )),
+                ))
+            }
+            AssistantEvent::ToolUse { id, name, .. } => {
+                let mut call = acp::ToolCall::new(id.clone(), name.clone());
+                call.kind = acp::ToolKind::Other;
+                call.status = acp::ToolCallStatus::InProgress;
+                Some(acp::SessionNotification::new(
+                    session_id.clone(),
+                    acp::SessionUpdate::ToolCall(call),
+                ))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -262,6 +289,19 @@ where
         runtime = runtime.with_hook_abort_signal(abort_signal.clone());
         *self.turn_abort_signal.borrow_mut() = Some(abort_signal);
 
+        // P0 IDE 流式：注入流式事件回调，把 `AssistantEvent` 实时推给前端。
+        // 闭包捕获可 Clone 的 gateway sender + session_id（均 Send + 'static），
+        // 规避 run_turn_async 中 `&mut self` 借用与 `notify(&self)` 的冲突。
+        let stream_gateway = self.client_gateway.clone();
+        let stream_session_id = session_id.clone();
+        runtime = runtime.with_stream_event_callback(Box::new(move |event| {
+            if let Some(notification) =
+                Self::assistant_event_to_session_update(&stream_session_id, &event)
+            {
+                stream_gateway.forward_fire_and_forget(notification);
+            }
+        }));
+
         *self.runtime.borrow_mut() = Some(runtime);
 
         // Session Bus(设计文档 §2.4):面板会话注册为 Ide 对等会话,
@@ -292,9 +332,19 @@ where
 
     async fn set_session_mode(
         &self,
-        _arguments: acp::SetSessionModeRequest,
+        arguments: acp::SetSessionModeRequest,
     ) -> Result<acp::SetSessionModeResponse, acp::Error> {
-        Err(acp::Error::method_not_found())
+        // plan/act 模式切换：映射到 runtime 的 plan_mode_enabled 标志。
+        // `SessionModeId` 是字符串包装（如 "plan"/"act"），"plan" 开启规划模式。
+        let mode_str = arguments.mode_id.0.as_ref();
+        let plan = mode_str.eq_ignore_ascii_case("plan");
+        if let Some(runtime) = self.runtime.borrow_mut().as_mut() {
+            runtime.set_plan_mode_enabled(plan);
+            tracing::info!("claw-agent: session mode set to {mode_str} (plan={plan})");
+        } else {
+            tracing::debug!("claw-agent: set_session_mode ignored, no active runtime");
+        }
+        Ok(acp::SetSessionModeResponse::new())
     }
 
     async fn prompt(
@@ -313,7 +363,14 @@ where
         })?;
 
         let session_id = arguments.session_id.clone();
-        let user_input = Self::extract_user_text(&arguments.prompt);
+        // IDE 上下文：若前端推送了当前活动文件/选区/诊断，附加到 user_input 之前，
+        // 让 agent 感知用户当前编辑位置（IDE 独有优势，TUI 无此能力）。
+        let user_input = match self.pending_editor_context.borrow_mut().take() {
+            Some(ctx) if !ctx.trim().is_empty() => {
+                format!("[IDE context]\n{ctx}\n\n[User prompt]\n{}", Self::extract_user_text(&arguments.prompt))
+            }
+            _ => Self::extract_user_text(&arguments.prompt),
+        };
 
         // 清除上一个 turn 可能残留的 sticky abort 状态,
         // 否则 cancel signal 从 turn N 会立即 abort turn N+1。
@@ -366,18 +423,10 @@ where
             }
         }
 
-        // 推流 assistant 文本(本期简化:turn 完成后一次性推送,非真实流式)
-        let text = Self::extract_assistant_text(&runtime_rc);
-        if !text.is_empty() {
-            self.notify(
-                &session_id,
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    acp::ContentBlock::Text(acp::TextContent::new(text)),
-                )),
-            );
-        }
+        // P0 IDE 流式：assistant 文本已通过 stream_event_callback 实时逐 delta 推送，
+        // 此处不再重复一次性推送（否则前端会看到重复内容）。
 
-        // 推送 tool call 通知(简化:仅记日志)
+        // 推送 tool call 完成通知（闭合流式阶段 ToolUse 推的 InProgress 卡片）。
         for tool_msg in &turn_summary.tool_results {
             for block in &tool_msg.blocks {
                 if let runtime::ContentBlock::ToolResult { tool_name, .. } = block {
@@ -423,6 +472,33 @@ where
         // 复用 lane_bridge 的广播处理(注册面板为 Ide peer + publish)。
         if arguments.method.as_ref() == "session/broadcast" {
             crate::lane_bridge::handle_broadcast_notification(&arguments.params);
+            return Ok(());
+        }
+        // IDE 编辑器上下文：前端推送当前活动文件/选区/诊断，prompt 时注入。
+        // params 为 JSON：{"activeFile": "...", "selection": "...", "diagnostics": "..."}
+        if arguments.method.as_ref() == "session/context" {
+            let raw = arguments.params.get();
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(f) = json.get("activeFile").and_then(|v| v.as_str()) {
+                    if !f.is_empty() {
+                        parts.push(format!("Active file: {f}"));
+                    }
+                }
+                if let Some(s) = json.get("selection").and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        parts.push(format!("Selection: {s}"));
+                    }
+                }
+                if let Some(d) = json.get("diagnostics").and_then(|v| v.as_str()) {
+                    if !d.is_empty() {
+                        parts.push(format!("Diagnostics:\n{d}"));
+                    }
+                }
+                if !parts.is_empty() {
+                    *self.pending_editor_context.borrow_mut() = Some(parts.join("\n"));
+                }
+            }
         }
         Ok(())
     }

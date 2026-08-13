@@ -50,6 +50,8 @@ function mockDeps(overrides: Partial<SetupWizardDeps> = {}): {
             calls.checkBinary.push(binaryPath);
             return true;
         },
+        pickBinary: async () => undefined,
+        saveBinaryPath: async () => {},
         getApiKey: async () => 'sk-test-key',
         setApiKey: async (key) => {
             calls.setApiKey.push(key);

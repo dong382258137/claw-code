@@ -18,8 +18,12 @@ export const WIZARD_DONE_STATE_KEY = 'claw.wizardDone';
 
 /** 向导依赖（可注入 mock 测试） */
 export interface SetupWizardDeps {
-    /** 检测 binary 是否可执行（spawn --version 冒烟） */
+    /** 检测 binary 是否可执行（spawn --help 冒烟） */
     checkBinary(binaryPath: string): Promise<boolean>;
+    /** 用文件选择器定位 binary，返回绝对路径（取消返回 undefined） */
+    pickBinary(): Thenable<string | undefined>;
+    /** 将用户选择的 binary 路径写入配置（claw.binaryPath） */
+    saveBinaryPath(path: string): Thenable<void>;
     /** 读取已存 API key（SecretStorage） */
     getApiKey(): Thenable<string | undefined>;
     /** 保存 API key（SecretStorage） */
@@ -53,11 +57,13 @@ export interface WizardResult {
 /**
  * 探测 binary 是否可执行。
  *
- * 对绝对路径 / PATH 中的命令统一用 spawn --version 冒烟：
+ * 对绝对路径 / PATH 中的命令统一用 spawn --help 冒烟：
  * - 命令不存在 -> 'error' 事件 -> false
  * - 命令存在但无法启动 -> false
  * - 正常退出 -> true
  *
+ * 注意：不用 --version——claw-plus-headless 不支持该参数（会 exit(1)），
+ * 会导致探测误判 binary 不可用；--help 是 headless 明确支持的参数（exit 0）。
  * Windows 下 spawn 一个不存在的命令会同步抛 ENOENT 或异步 error 事件，两者都覆盖。
  */
 export async function checkBinaryAvailable(binaryPath: string): Promise<boolean> {
@@ -71,7 +77,7 @@ export async function checkBinaryAvailable(binaryPath: string): Promise<boolean>
             }
         };
         try {
-            const child = spawn(binaryPath, ['--version'], { stdio: 'ignore' });
+            const child = spawn(binaryPath, ['--help'], { stdio: 'ignore' });
             child.on('error', () => finish(false));
             child.on('exit', (code) => finish(code === 0));
         } catch {
@@ -87,6 +93,24 @@ export function createSetupWizard(
 ): SetupWizardDeps {
     return {
         checkBinary: checkBinaryAvailable,
+        pickBinary: async () => {
+            const picked = await vscodeApi.window.showOpenDialog({
+                canSelectFiles: true,
+                canSelectFolders: false,
+                canSelectMany: false,
+                openLabel: '选择 claw-plus-headless',
+                filters: {
+                    'Executable': ['exe'],
+                    'All files': ['*'],
+                },
+            });
+            return picked?.[0]?.fsPath;
+        },
+        saveBinaryPath: async (path) => {
+            await vscodeApi.workspace
+                .getConfiguration('claw')
+                .update('binaryPath', path, vscodeApi.ConfigurationTarget.Global);
+        },
         getApiKey: () => context.secrets.get(API_KEY_SECRET_KEY),
         setApiKey: (key) => context.secrets.store(API_KEY_SECRET_KEY, key),
         promptApiKey: (prompt) =>
@@ -151,11 +175,19 @@ export async function runSetupWizard(
     if (!binaryReady) {
         const action = await deps.showError(
             `找不到 Claw 二进制（${config.binaryPath}）。` +
-                '需要先安装 claw 才能使用扩展。是否现在一键安装？',
+                '可以手动选择二进制文件，或运行安装脚本。',
+            '选择文件',
             '一键安装',
             '稍后再说',
         );
-        if (action === '一键安装') {
+        if (action === '选择文件') {
+            // 文件选择器定位，根治 GUI 进程 PATH 不一致导致的 ENOENT
+            const picked = await deps.pickBinary();
+            if (picked) {
+                await deps.saveBinaryPath(picked);
+                binaryReady = await deps.checkBinary(picked);
+            }
+        } else if (action === '一键安装') {
             await deps.runInstaller();
             // 安装后自动重查一次
             binaryReady = await deps.checkBinary(config.binaryPath);

@@ -24,6 +24,8 @@ let transport: AcpTransport | null = null;
 let errorRecovery: ErrorRecovery;
 let statusBar: StatusBarManager;
 let chatManager: ChatPanelManager | null = null;
+/** 上次推送的编辑器上下文 JSON（去重用） */
+let lastEditorContextJson = '';
 /** 扩展 context（保存 SecretStorage 引用，供 startClawServer 读取 API key） */
 let extensionContext: vscode.ExtensionContext;
 
@@ -56,6 +58,36 @@ export function activate(context: vscode.ExtensionContext): void {
                 }
             }
         }),
+    );
+
+    // IDE 上下文感知（IDE 独有优势）：监听活动编辑器/选区/诊断变化，
+    // 经 ExtNotification("session/context") 推给 agent，prompt 时注入上下文。
+    const pushEditorContext = (): void => {
+        if (!transport?.isRunning()) return;
+        const editor = vscode.window.activeTextEditor;
+        const activeFile = editor?.document.uri.fsPath ?? '';
+        const selection = editor ? editor.document.getText(editor.selection) : '';
+        const diags = editor ? vscode.languages.getDiagnostics(editor.document.uri) : [];
+        const diagnostics = diags
+            .slice(0, 20)
+            .map((d) => {
+                const sev =
+                    d.severity === vscode.DiagnosticSeverity.Error ? 'ERROR' : 'WARN';
+                return `${sev}: ${d.message} @ L${d.range.start.line + 1}`;
+            })
+            .join('\n');
+        const payload = JSON.stringify({ activeFile, selection, diagnostics });
+        if (payload === lastEditorContextJson) return; // 去重，避免频繁推送
+        lastEditorContextJson = payload;
+        transport.notify('ext_notification', {
+            method: 'session/context',
+            params: payload,
+        });
+    };
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor(() => pushEditorContext()),
+        vscode.window.onDidChangeTextEditorSelection(() => pushEditorContext()),
+        vscode.languages.onDidChangeDiagnostics(() => pushEditorContext()),
     );
 
     // 首次运行：自动弹向导（已完成过则内部静默跳过）；autoStart 时启动服务
@@ -115,6 +147,21 @@ async function startClawServer(): Promise<void> {
     transport.on('stderr', (line) => {
         outputChannel.append(`[stderr] ${line}`);
     });
+    transport.on('error', (err) => {
+        // spawn 失败（最常见是 PATH 里找不到 binary，ENOENT）
+        const e = err as NodeJS.ErrnoException;
+        outputChannel.appendLine(
+            `[error] Spawn failed: ${err.message}${e.code ? ` (code=${e.code})` : ''}`,
+        );
+        if (e.code === 'ENOENT') {
+            void vscode.window.showErrorMessage(
+                `无法启动 Claw：找不到二进制 "${config.binaryPath}"。` +
+                    '请在设置（claw.binaryPath）中配置绝对路径，' +
+                    '例如 C:\\Users\\38225\\.cargo\\bin\\claw-plus-headless.exe，' +
+                    '然后重新加载窗口。',
+            );
+        }
+    });
     transport.on('exit', (info) => {
         outputChannel.appendLine(
             `[info] Claw exited: code=${info.code} signal=${info.signal}`,
@@ -149,6 +196,8 @@ async function startClawServer(): Promise<void> {
     try {
         await transport.start();
         await initializeSession();
+        statusBar.setModel(config.model);
+        statusBar.setCwd(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '');
         statusBar.setStatus('running');
         outputChannel.appendLine('[info] Claw server started');
     } catch (err) {
@@ -173,7 +222,9 @@ async function initializeSession(): Promise<void> {
     outputChannel.appendLine(`[debug] Initialized: ${JSON.stringify(result)}`);
     // 初始化后创建 ChatPanelManager（lazy 创建，避免未启动时空跑）
     if (!chatManager && transport) {
-        chatManager = new ChatPanelManager(vscode, transport);
+        chatManager = new ChatPanelManager(vscode, transport, (busy) =>
+            statusBar.setStreaming(busy),
+        );
     }
 }
 
@@ -193,7 +244,9 @@ async function openChat(): Promise<void> {
         if (!transport?.isRunning()) return;
     }
     if (!chatManager && transport) {
-        chatManager = new ChatPanelManager(vscode, transport);
+        chatManager = new ChatPanelManager(vscode, transport, (busy) =>
+            statusBar.setStreaming(busy),
+        );
     }
     await chatManager?.openChat(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
 }

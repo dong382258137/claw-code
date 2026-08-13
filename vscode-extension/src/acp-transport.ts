@@ -135,7 +135,14 @@ export class AcpTransport extends EventEmitter {
             this.emit('stderr', data.toString());
         });
 
-        this.process.on('error', (err) => this.emit('error', err));
+        // spawn 失败（ENOENT 等）:emit error 并把 process 置 null,
+        // 否则 isRunning() 误报 true、request() 抛 "Transport not started" 且无日志。
+        this.process.on('error', (err) => {
+            this.emit('error', err);
+            this.process = null;
+            this.stdoutRL?.close();
+            this.stdoutRL = null;
+        });
         this.process.on('exit', (code, signal) =>
             this.handleExit({ code, signal: signal as NodeJS.Signals | null }),
         );
