@@ -13,7 +13,7 @@
     "Chat",
     "Machine Learning"
   ],
-  "main": "./out/extension.js",
+  "main": "./out/src/extension.js",
   "activationEvents": [
     "onCommand:claw.setupWizard",
     "onCommand:claw.startServer",
