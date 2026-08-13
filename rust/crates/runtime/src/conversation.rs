@@ -54,7 +54,7 @@ use crate::lane_events::{try_publish as publish_lane_event, LaneEvent};
 // 在 PostToolUse hook 中调用 LoopDetector::record_edit,根据 LoopAction
 // 决定 Continue / InjectContext / Abort。详见
 // docs/harness-engineering-optimization-plan.md Step 2.2。
-use crate::loop_detection::{LoopAction, LoopDetector};
+use crate::loop_detection::{LoopAction, LoopDetector, COG_STALL_LESSON};
 use crate::slop_scanner::{extract_scan_target, is_file_modifying_tool, SlopScanner};
 // Harness C(Context Management)层接入:ContextAssembler 统一 prompt 注入。
 // 当注入时,PlanArtifact render 通过 assembler 收集到 Goal source,
@@ -1285,6 +1285,11 @@ pub struct ConversationRuntime<C, T> {
     /// 参数 (tool_use_id, tool_name, output, is_error)，供上层（TUI）
     /// 转发为 ToolResult 事件以闭合卡片。
     tool_result_callback: Option<ToolResultCallback>,
+    /// 流式事件回调（P0 IDE 流式）：`run_turn_async` 每拿到一批
+    /// [`AssistantEvent`]（`TextDelta`/`Thinking`/`ToolUse`/`Usage`）时调用，
+    /// 供上层（IDE ACP 桥接）实时推送给前端，实现逐 delta 流式而非
+    /// turn 结束后一次性推送。闭包 `Send`，可捕获可 `Clone` 的 channel sender。
+    stream_event_callback: Option<Box<dyn Fn(AssistantEvent) + Send>>,
     session_tracer: Option<SessionTracer>,
     /// Optional persistent memory surface. When present, the runtime runs a
     /// rule-based nudge pass every `NudgeConfig::interval_turns` turns to keep
@@ -1442,6 +1447,10 @@ pub struct ConversationRuntime<C, T> {
     /// 修复 v1.0 缺陷:`remediation` 字段完全丢失 — 主 agent 不知道
     /// 上一次 verify 为什么失败,只能盲目重试 → 必然陷入 doom loop。
     pending_remediation: Option<String>,
+    /// 认知停滞检测触发的"不确定性溯源"提示。主循环解析 thinking 时检测
+    /// 到连续纠结,把溯源提示存到此字段,下一次 request 构造时注入
+    /// `dynamic_sections`。读取后立即消费(与 `pending_remediation` 同生命周期)。
+    pending_cog_stall: Option<String>,
     decision_log: Option<crate::decision_log::DecisionLog>,
     /// v3 §4.7:决策检测策略。控制 `maybe_auto_compact` 在压缩前用何种方式
     /// 提取决策点。默认 `Heuristic`(零成本),可通过
@@ -1807,6 +1816,7 @@ where
             hook_progress_reporter: None,
             diag_callback: None,
             tool_result_callback: None,
+            stream_event_callback: None,
             session_tracer: None,
             persistent_memory: None,
             task_state: None,
@@ -1840,6 +1850,7 @@ where
             notebook_refresh_pending: false,
             archive_recall_hint_pending: false,
             pending_remediation: None,
+            pending_cog_stall: None,
             decision_log: None,
             detection_strategy: crate::decision_log::DetectionStrategy::Heuristic,
             project_topology: None,
@@ -1904,6 +1915,17 @@ where
     #[must_use]
     pub fn with_tool_result_callback(mut self, tool_result_callback: ToolResultCallback) -> Self {
         self.tool_result_callback = Some(tool_result_callback);
+        self
+    }
+
+    /// 注入流式事件回调（P0 IDE 流式）：`run_turn_async` 逐批 [`AssistantEvent`]
+    /// 触发，供上层（IDE ACP 桥接）实时推送 `TextDelta`/`Thinking`/`ToolUse`/`Usage`。
+    #[must_use]
+    pub fn with_stream_event_callback(
+        mut self,
+        stream_event_callback: Box<dyn Fn(AssistantEvent) + Send>,
+    ) -> Self {
+        self.stream_event_callback = Some(stream_event_callback);
         self
     }
 
@@ -3221,6 +3243,11 @@ where
                         // 让最易变的内容放最后,最大化前缀缓存命中率。
                         asm.add_auto(ContextSource::Goal, remediation.clone());
                     }
+                    if let Some(cog_stall) = &self.pending_cog_stall {
+                        // 认知停滞溯源提示:放在 remediation 之后(变动区最末尾),
+                        // 同样为了最大化前缀缓存命中率。
+                        asm.add_auto(ContextSource::Goal, cog_stall.clone());
+                    }
                     let volatile = asm.assemble().volatile_content();
                     if !volatile.is_empty() {
                         system_split.dynamic_sections.push(volatile);
@@ -3241,6 +3268,11 @@ where
                         // 顺序:放在 plan 之后(变动区最末尾),
                         // 让最易变的内容放最后,最大化前缀缓存命中率。
                         system_split.dynamic_sections.push(remediation.clone());
+                    }
+                    if let Some(cog_stall) = &self.pending_cog_stall {
+                        // 认知停滞溯源提示:放在 remediation 之后(变动区最末尾),
+                        // 同样为了最大化前缀缓存命中率。
+                        system_split.dynamic_sections.push(cog_stall.clone());
                     }
                     // Task State 注入:仅当会话经历过压缩时注入(平时会话历史
                     // 已含任务上下文,注入冗余反而浪费 token)。压缩后 AI 靠
@@ -3280,6 +3312,7 @@ where
                 // P3 完成声明校验也依赖此修复:break 点设置的 remediation
                 // 需要存活到下一 turn 被读取。
                 self.pending_remediation = None;
+                self.pending_cog_stall = None;
                 // 缓存保护(§5.2-enhanced):PlanArtifact 的 status_delta
                 // (step 状态标签 ⏳→▶→✓)每 turn 变化,若放在 system_prompt
                 // 的 dynamic_sections 会破坏隐式前缀缓存,导致之后的 tools
@@ -3417,6 +3450,14 @@ where
                     }
                 }
             };
+            // P0 IDE 流式：`build_assistant_message` 会 move 掉 `events`，
+            // 在此之前把本批 `AssistantEvent` 逐条推给上层回调，实现逐 delta 流式
+            // （粒度 = 单轮 API 响应），而非 turn 结束后一次性推送。
+            if let Some(cb) = &self.stream_event_callback {
+                for event in &events {
+                    cb(event.clone());
+                }
+            }
             let (assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
@@ -3506,6 +3547,36 @@ where
                 .any(|b| matches!(b, ContentBlock::Text { text } if !text.is_empty()))
             {
                 self.loop_detector.record_text_output();
+            }
+            // 认知停滞检测:提取本轮 thinking,检测"反复纠结同一问题"的认知循环。
+            // 连续多轮 thinking 命中纠结标记 → 存溯源提示到 pending_cog_stall,
+            // 下一轮 request 构造时注入 dynamic_sections。与无产出(工具维度)
+            // 检测正交,覆盖"用推理猜测一个只有外部才能回答的问题"的空转形态。
+            let thinking_text: String = assistant_message
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !thinking_text.is_empty() {
+                if let LoopAction::InjectContext(msg) =
+                    self.loop_detector.record_thinking(&thinking_text)
+                {
+                    self.pending_cog_stall = Some(msg);
+                    // 第 2 层(事后沉淀):认知停滞已确认发生,把通用失败模式
+                    // 教训写入 lessons.jsonl(跨会话持久化)。后续会话(压缩后)
+                    // 通过 lessons 注入反哺第 0 层认知框架 —— 形成自进化闭环。
+                    // 内容按 lessons 机制去重,重复触发只落盘一条,不重复堆积。
+                    if let Some(root) = &self.workspace_root {
+                        let _ = crate::lessons::append_lessons(
+                            root,
+                            std::slice::from_ref(&COG_STALL_LESSON.to_string()),
+                        );
+                    }
+                }
             }
             self.record_assistant_iteration(
                 iterations,

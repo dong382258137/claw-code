@@ -1053,6 +1053,15 @@ fn get_framework_switching_section() -> String {
      - **Wheel reinvention**: Building something that already exists. Search first.\n\
      - **Stubborn direction**: Current approach feels wrong. Explicitly acknowledge \
      and re-derive — admitting a wrong turn is rigor, not weakness.\n\
+     - **Guess loop (猜测循环)**: You keep re-deriving the same uncertain point \
+     in your thinking (\"wait\", \"I can't be sure\", \"need to confirm\") without \
+     converging. Stop guessing and trace the uncertainty to its source: \
+     (1) only the user knows → ask a concrete question immediately; \
+     (2) code/docs know → one precise search, and if repeated searches still \
+     don't resolve it, the answer may not be there; \
+     (3) logic can derive it → derive once and conclude; \
+     (4) no source can answer → mark as an assumption and proceed. \
+     Never use reasoning to guess a fact that only an external source can answer.\n\
      \n\
      Trigger protocol:\n\
      1. State the problem definition explicitly.\n\
@@ -1911,6 +1920,10 @@ mod tests {
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+        // 第 0 层(事前认知框架):Framework Switching 静态段应含"不确定性溯源"
+        // 的猜测循环触发模式(与第 1 层认知停滞检测的被动兜底互补)。
+        assert!(prompt.contains("Guess loop"));
+        assert!(prompt.contains("trace the uncertainty to its source"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
