@@ -111,8 +111,10 @@ pub struct LoopDetector {
     tool_warned: HashMap<String, u64>,
     /// 连续非文件修改工具调用计数(探索循环检测)。
     /// 命中文件修改工具时清零;达到 [`NO_OUTPUT_WARN_THRESHOLD`] /
-    /// [`NO_OUTPUT_ABORT_THRESHOLD`] 时警告/中止。跨 turn 保留
-    /// (由 [`LoopDetector::reset_edits`] 之外的路径自然延续)。
+    /// [`NO_OUTPUT_ABORT_THRESHOLD`] 时警告/中止。每 turn 由
+    /// [`LoopDetector::reset_edits`] 重置:跨 turn 的"连续无产出"语义不成立
+    /// (turn 之间有用户输入与模型重新评估),跨 turn 相同调用循环已由
+    /// [`LoopDetector::prune_decayed`] 覆盖的工具调用计数通道检测。
     no_output_run: u32,
     /// 是否已对当前无产出 streak 发出过警告(避免重复注入)。
     no_output_warned: bool,
@@ -290,10 +292,15 @@ impl LoopDetector {
     }
 
     /// 重置文件编辑跟踪(每个 turn 开始调用;工具调用计数保留,支持跨 turn 检测)。
+    ///
+    /// 同时重置无产出 streak:no-output 检测限定在单 turn 内,避免跨 turn 只读
+    /// 探索被线性累加误判,以及 abort 后下一 turn 因 streak 未清而反复触发。
     pub fn reset_edits(&mut self) {
         self.edit_counts.clear();
         self.warned.clear();
         self.total_edits = 0;
+        self.no_output_run = 0;
+        self.no_output_warned = false;
     }
 
     /// 按时间窗口衰减工具调用计数:超过 `max_age_ms` 未出现的调用从统计中移除。
@@ -621,6 +628,25 @@ mod tests {
             matches!(action, LoopAction::InjectContext(_)),
             "reset_edits 后 tool 计数应保留(第 3 次触发警告): {action:?}"
         );
+    }
+
+    #[test]
+    fn reset_edits_resets_no_output_streak() {
+        // abort 后 no_output_run 未清是反复触发的根因;reset_edits 应清零
+        // 无产出 streak,使下一 turn 从零重新累计(不再立即警告/中止)。
+        let mut detector = LoopDetector::new();
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD {
+            let _ = detector.record_tool_call("Bash", &format!("probe {i}"), &format!("out {i}"));
+        }
+        detector.reset_edits();
+        // 重置后重新累计到接近警告阈值,前几次应仍为 Continue
+        for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
+            let action = detector.record_tool_call("Bash", &format!("post {i}"), &format!("out {i}"));
+            assert!(
+                matches!(action, LoopAction::Continue),
+                "reset_edits 后无产出 streak 应清零,第 {i} 次应仍为 Continue: {action:?}"
+            );
+        }
     }
 
     #[test]
