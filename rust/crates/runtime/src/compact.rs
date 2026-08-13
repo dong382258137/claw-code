@@ -1023,6 +1023,44 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 }
 
 fn summarize_block(block: &ContentBlock) -> String {
+    // ToolResult 单独处理 —— 这是启发式兜底摘要"质量极差"的根因修复。
+    // 旧实现把大段只读输出(session_search/git status 等)截成 160 字符
+    // 碎片逐条罗列进 Key timeline;现改为复用 content_compression 的
+    // 结构化摘要(按 JSON/Code/Log/Tabular/Text 分类 + recall_full 指针),
+    // 与 microcompact 路径保持一致。
+    if let ContentBlock::ToolResult {
+        tool_use_id,
+        tool_name,
+        output,
+        is_error,
+    } = block
+    {
+        // error / 状态变更工具(Edit/Write/Delete/子 agent)保留原文,
+        // 模型需 verbatim 推理后续状态;输出通常短,160 截断安全。
+        if *is_error || is_critical_tool(tool_name) {
+            return truncate_summary(
+                &format!(
+                    "tool_result {tool_name}: {}{output}",
+                    if *is_error { "error " } else { "" }
+                ),
+                160,
+            );
+        }
+        // 已摘要的结果(microcompact 先行)保留原样,避免二次摘要破坏格式。
+        if is_already_summarized(output) {
+            return output.clone();
+        }
+        // 大体积只读输出(Read/Bash/Grep/Glob/LS)做结构化摘要,保留
+        // recall_full 指针;短输出(< SMALL_OUTPUT_PRESERVE_CHARS)保留原文,
+        // 摘要反而丢失精确内容。
+        if is_summarizable_tool(tool_name)
+            && output.chars().count() > SMALL_OUTPUT_PRESERVE_CHARS
+        {
+            return format_tool_result_summary(tool_name, tool_use_id, "", output);
+        }
+        return truncate_summary(&format!("tool_result {tool_name}: {output}"), 160);
+    }
+
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
         ContentBlock::Thinking { thinking, .. } => {
@@ -1036,15 +1074,7 @@ fn summarize_block(block: &ContentBlock) -> String {
             }
         }
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
-        ContentBlock::ToolResult {
-            tool_name,
-            output,
-            is_error,
-            ..
-        } => format!(
-            "tool_result {tool_name}: {}{output}",
-            if *is_error { "error " } else { "" }
-        ),
+        ContentBlock::ToolResult { .. } => unreachable!("ToolResult handled above"),
     };
     truncate_summary(&raw, 160)
 }
@@ -1815,6 +1845,77 @@ second para",
             summary.chars().count() < 300,
             "long thinking should be truncated, got {} chars",
             summary.chars().count()
+        );
+    }
+
+    #[test]
+    fn summarize_block_uses_structured_summary_for_large_tool_result() {
+        // 大体积只读输出(Bash)应走结构化摘要,而非 160 字符碎片。
+        // 这是启发式兜底摘要"质量极差"的根因修复回归测试。
+        let long_output = "line1\nline2\n".repeat(60); // 约 360 字符,> 200 阈值
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "call_bash_1".to_string(),
+            tool_name: "Bash".to_string(),
+            output: long_output,
+            is_error: false,
+        };
+        let summary = super::summarize_block(&block);
+        assert!(
+            summary.contains("summarized") && summary.contains("recall_full"),
+            "large read-only output should be structured-summarized, got: {summary}"
+        );
+        assert!(
+            !summary.starts_with("tool_result Bash:"),
+            "should not use naive fragment, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_block_keeps_error_and_critical_tool_verbatim() {
+        // error 输出保留原文(含 error 标记),不结构化摘要。
+        let err_block = ContentBlock::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            tool_name: "Bash".to_string(),
+            output: "command not found".to_string(),
+            is_error: true,
+        };
+        let err_summary = super::summarize_block(&err_block);
+        assert!(
+            err_summary.contains("error"),
+            "error output should keep error marker, got: {err_summary}"
+        );
+
+        // critical tool(Edit)保留原文,即使输出非空。
+        let edit_block = ContentBlock::ToolResult {
+            tool_use_id: "call_2".to_string(),
+            tool_name: "Edit".to_string(),
+            output: "modified 3 lines".to_string(),
+            is_error: false,
+        };
+        let edit_summary = super::summarize_block(&edit_block);
+        assert!(
+            edit_summary.starts_with("tool_result Edit:"),
+            "critical tool should stay verbatim, got: {edit_summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_block_keeps_short_tool_result_verbatim() {
+        // 短输出(< 200 字符)保留原文,避免摘要反而丢失精确内容。
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "call_3".to_string(),
+            tool_name: "Grep".to_string(),
+            output: "found 2 matches".to_string(),
+            is_error: false,
+        };
+        let summary = super::summarize_block(&block);
+        assert!(
+            summary.starts_with("tool_result Grep:"),
+            "short output should stay verbatim, got: {summary}"
+        );
+        assert!(
+            !summary.contains("summarized"),
+            "short output should not be summarized, got: {summary}"
         );
     }
 
