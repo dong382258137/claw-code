@@ -3611,6 +3611,16 @@ pub(crate) fn build_runtime_with_plugin_state(
         // RefactorTransaction：非 git 仓库自动进入 Disabled 状态，安全无副作用。
         let tx = runtime::RefactorTransaction::new(cwd.clone());
         runtime = runtime.with_refactor_transaction(tx);
+
+        // P2(2026-08-14):注入 runtime 层 workspace_root。
+        // 此前 ConversationRuntime.workspace_root 恒为 None(Session 层与 runtime
+        // 层独立,app.rs 从未调用 with_workspace_root),导致依赖它的记忆/持久化
+        // 功能全部静默失效:task_state.json 永不写(压缩后无任务锚点)、
+        // tool_result 归档不写、NOTEBOOK 决策落盘不写、notebook_update 返回
+        // "not available" 软失败、"失忆"体感(history_index 在 Session 层正常,
+        // session_search 可用掩盖了问题)。with_workspace_root 同时同步注入
+        // multi_agent_coordinator 的 workspace_root。
+        runtime = runtime.with_workspace_root(cwd.clone());
     }
     // P1(2026-08-13):Telemetry SessionTracer 接入生产路径。
     // 之前 runtime 侧 session_tracer 字段和 7 个 record 函数已完整实现,
