@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 本项目是 [dong382258137/claw-code](https://github.com/dong382258137/claw-code)（MIT License）的 fork，在此基础上进行了二次开发。
+> 本项目早期代码源自 [dong382258137/claw-code](https://github.com/dong382258137/claw-code)（MIT License），现已独立演进。
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 

@@ -1,7 +1,9 @@
-# Claw Plus
+# CLAW
+
+> 高性能 Rust 代码智能体（Agent Harness）—— 模型之外的一切工程化能力。
 
 <p align="center">
-  <a href="https://github.com/dong382258137/claw-code">dong382258137/claw-code</a>
+  <a href="https://github.com/dong382258137/claw-code">GitHub</a>
   ·
   <a href="./USAGE.md">Usage</a>
   ·
@@ -16,64 +18,28 @@
   <a href="./SECURITY.md">Security</a>
   ·
   <a href="./SERVICES.md">💼 商业服务 / Services</a>
-  ·
-  <a href="https://github.com/dong382258137/claw-code">GitHub</a>
 </p>
 
 <p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Plus" width="300" />
+  <img src="assets/claw-hero.jpeg" alt="CLAW" width="300" />
 </p>
 
-## 📜 项目渊源 (Project Lineage)
+## 核心能力概览
 
-本项目有清晰的来源链路，每一层都基于上一层进行改进和扩展：
+CLAW 是一个完全独立演进的 Rust 代码智能体，围绕「模型之外的一切工程化能力」构建 —— 工具调用、任务规划、记忆管理、上下文压缩、多智能体编排、失败自愈与经验沉淀。
 
-```
-Anthropic Claude Code（概念来源 / 架构参考）
-  └─ dong382258137/claw-code（MIT License 开源实现）
-       └─ dong382258137/claw-code → Claw Plus（本仓库）
-            ├─ IM 桥接集成 (IM Bridge)
-            └─ 其他功能增强与定制
-```
+| 能力 | 说明 |
+|------|------|
+| 🚀 高性能 Rust 引擎 | 单二进制、<50ms 冷启动、<50MB 空闲内存 |
+| 🔁 回放分支自进化闭环 | 失败点定位 → 自动分支重试 → 工具级晋升门控 |
+| 🤖 多智能体 DAG 编排 | 依赖图调度、worktree 写隔离、SAGA 补偿、团队编排 |
+| 🧬 自进化 Harness | 失败模式挖掘 + 双重门控 + 动态注入，越用越强 |
+| 🧠 记忆与上下文管理 | NOTEBOOK / TaskState / 教训库 / 决策日志 / 依赖感知压缩 |
+| 🔌 插件生态 | Skills / MCP / Hooks / 自定义 Agent |
+| 💬 IM 桥接 | 飞书 / 企业微信 / Discord 远程操控 |
+| 🖥️ 现代化 TUI | 侧边栏、工具卡片、Markdown 流式渲染 |
 
-| 层级 | 项目 | 角色 |
-|------|------|------|
-| 概念层 | [Anthropic Claude Code](https://claude.ai/code) | Anthropic 公司的闭源产品，CLI AI 编程助手的原始概念和架构参考 |
-| 实现层 | [dong382258137/claw-code](https://github.com/dong382258137/claw-code) | MIT License 开源实现，本项目直接 fork 的基座仓库 |
-| 扩展层 | **Claw Plus**（本仓库） | 在上游基础上增加 IM 桥接等功能的二次开发 |
-
-> [!IMPORTANT]
-> **本仓库是 [dong382258137/claw-code](https://github.com/dong382258137/claw-code) 的 fork（MIT License）。**
-> - 上游版权 © 2026 UltraWorkers and Claw Plus contributors
-> - 下游修改版权 © 2026 dong382258137（IM 桥接及下游改动）
-> - "Claude" 和 "Claude Code" 是 Anthropic 的商标，本项目与 Anthropic 无关联，亦非其官方产品
-
-## 参考与借鉴的项目 (Referenced Projects)
-
-以下项目为本项目的设计和实现提供了重要的参考和灵感，但它们是**独立维护的第三方项目**，各有自己的作者和许可证：
-
-| 项目 | 用途 | 作者/维护者 |
-|------|------|-------------|
-| [clawhip](https://github.com/Yeachan-Heo/clawhip) | 事件与通知路由系统 | [Yeachan-Heo](https://github.com/Yeachan-Heo) |
-| [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) | 多智能体协调框架 | [code-yeongyu](https://github.com/code-yeongyu) |
-| [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) | 工作流执行层 | [Yeachan-Heo](https://github.com/Yeachan-Heo) |
-| [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) | Claude Code 工作流 | [Yeachan-Heo](https://github.com/Yeachan-Heo) |
-
-> 以上项目均为独立开源项目。本仓库的 PHILOSOPHY.md 等文档中提及它们是为了说明多智能体协作生态的完整图景，并非声称对其拥有所有权。
-
-## 本仓库的独立贡献 (Original Contributions)
-
-在继承上游代码的基础上，本仓库增加了以下原创功能：
-
-- **IM 桥接集成 (IM Bridge)** — 位于 `rust/crates/im-bridge/`
-- **多智能体 DAG 并行编排** — 依赖图调度、worktree 隔离、异步子智能体分发
-- **现代 TUI 终端界面** — 侧边栏、状态栏、上下文窗口进度条、工具卡片渲染
-- **自进化 Harness (Self-Evolving Harness)** — LLM 驱动、两重门控防 misevolution 的失败模式学习与动态注入
-- **插件与扩展生态** — 插件管理器、Skills 系统、MCP 服务器生命周期、Hooks（支持配置热重载）
-- **ACP/IDE 应用层闭环** — ACP server（0.10.4 + 1.3 双路径）、VS Code 扩展首次运行配置向导
-- **其他功能增强与定制**
-
-> 完整特性清单见下方 [✨ 核心特性 / Key Features](#核心特性-key-features) 章节。
+> 完整特性见下方 [核心特性](#核心特性-key-features) 章节。
 
 ---
 
@@ -152,9 +118,10 @@ LLM 驱动的失败模式学习系统：从历史失败的轨迹中挖掘 weakne
 
 An LLM-driven failure-mode learning system: mines weaknesses from past failures, proposes fix rules, and injects them into the dynamic prompt sections after passing dual-gate validation.
 
-- **Weakness Mining（Stage 1）** — 复用 `TraceAnalyzer::cluster_failures` 聚类失败记录，过滤低频噪声（`occurrence_count < min_occurrences`）
+- **回放分支自进化闭环 / Replay-branch evolution loop** — 失败点定位（`FailureTrace` 工具级失败轨迹切片）→ 自动分支重试（doom loop 检测后 fork 子会话重试）→ 工具级晋升门控（失败率 z-test），失败经验被沉淀为可复用的 harness edit
+- **Weakness Mining（Stage 1）** — 双来源挖掘：turn 级复用 `TraceAnalyzer::cluster_failures` 聚类 + 工具级 `mine_weaknesses_from_traces` 按 `"{tool_name}:{keyword}"` pathology 签名挖掘，过滤低频噪声（`occurrence_count < min_occurrences`）
 - **规则式 Proposer（Stage 2）** — 7+ 种预定义错误模式（`old_string not found`、`unresolved import`、`connection refused` 等）直接映射为 HarnessEdit，MVP 零 LLM 调用；simhash 去重防重复提案
-- **两重门控验证 / Dual-gate validation** — Validity（基础设施噪声过滤 + pathology 出现确认）+ Significance（z-test, alpha=0.05），仅统计显著且有据可依的 edit 晋升为 Active
+- **两重门控验证 / Dual-gate validation** — Validity（基础设施噪声过滤 + pathology 出现确认）+ Significance：turn 级 candidate 走 task_success z-test，工具级 candidate 走失败率 z-test（`ToolCallStats` 提供失败率分母，alpha=0.05），仅统计显著且有据可依的 edit 晋升为 Active
 - **全量动态注入 / Dynamic injection** — Active edits（≤10 条）注入 `SystemPromptSplit::dynamic_sections`，约束总 token
 - **CLI 管理 / `claw harness`** — `list [--status]` / `stats` / `rollback --all | --id` / `evolve --dry-run`，支持 `--output-format json`
 - **SQLite 持久化 / SQLite persistence** — edits 存于 `.claw/decision_log.db` 的 `harness_edits` 表，进程重启后保留状态
@@ -191,14 +158,14 @@ Multi-layered security from permission modes to sandbox isolation.
 
 ### 💬 IM 桥接 / IM Bridge
 
-通过 Discord 等即时通讯平台远程操控 Claw Plus，实现"人在手机上，代码在服务器上"的工作流。
+通过 Discord 等即时通讯平台远程操控 CLAW，实现"人在手机上，代码在服务器上"的工作流。
 
-Remote control of Claw Plus via instant messaging platforms like Discord, enabling "human on mobile, code on server" workflows.
+Remote control of CLAW via instant messaging platforms like Discord, enabling "human on mobile, code on server" workflows.
 
-- **Discord 集成 / Discord integration** — 在 Discord 频道中发一条消息即可驱动 Claw Plus 执行任务
+- **Discord 集成 / Discord integration** — 在 Discord 频道中发一条消息即可驱动 CLAW 执行任务
 - **通知路由 / Notification routing** — 将 Agent 状态变更（任务完成/阻塞/失败）推送至 IM 频道
 - **频道级协调 / Channel-level coordination** — 多人通过 Discord 频道协作驱动多智能体并行工作
-- **异步工作流 / Async workflow** — 发送指令后可离线，Claw Plus 完成后通知结果
+- **异步工作流 / Async workflow** — 发送指令后可离线，CLAW 完成后通知结果
 - **Agent 工作区配置 / Agent workspace config** — `[agent]` 段自定义 `workspace_root` / `workspace_roots`（沙盒边界）；未配置时自动枚举本机所有盘符根作为白名单，默认零配置跨盘访问
 
 > 位于 `rust/crates/im-bridge/`；配置向导：`claw-im-bridge --setup`
@@ -246,10 +213,9 @@ First-class support for containerized and automated pipelines.
 
 ---
 
-Claw Plus is a Rust implementation of the `claw-plus` CLI agent harness.
-The canonical implementation lives in [`rust/`](./rust). This fork builds on
-the upstream [dong382258137/claw-code](https://github.com/dong382258137/claw-code)
-project with additional features and modifications.
+CLAW is a Rust implementation of the `claw` CLI agent harness. The canonical
+implementation lives in [`rust/`](./rust)。项目已从最初的 MIT License 代码库
+独立演进为完整的智能体工程底座，详见上方「核心能力概览」。
 
 > [!IMPORTANT]
 > Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md) or run the one-click installer [`install.ps1`](./install.ps1). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
@@ -258,7 +224,7 @@ project with additional features and modifications.
 
 ## Current repository shape
 
-- **`rust/`** — canonical Rust workspace and the `claw-plus` CLI binary
+- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
@@ -268,11 +234,11 @@ project with additional features and modifications.
 ## Quick start
 
 > [!WARNING]
-> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw-plus`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
+> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw-plus`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the renamed `agent-code` binary:
 > ```bash
-> cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
+> cargo install agent-code   # renamed binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
 > ```
-> This repo is the actively maintained fork — follow the steps below to build from source.
+> This repo is the actively maintained project — follow the steps below to build from source.
 
 ```bash
 # 1. Clone and build
@@ -446,9 +412,9 @@ cargo test --workspace
 
 ## Ecosystem
 
-This fork is part of a broader ecosystem of projects. The upstream base is
-[dong382258137/claw-code](https://github.com/dong382258137/claw-code) (MIT License).
-Related projects in the ecosystem (independently maintained by their respective authors):
+CLAW 与以下项目共同构成一个更广泛的开源生态，各自由其作者独立维护：
+
+Related projects (independently maintained by their respective authors):
 
 - [clawhip](https://github.com/Yeachan-Heo/clawhip) — event and notification routing (by [Yeachan-Heo](https://github.com/Yeachan-Heo))
 - [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) — multi-agent coordination (by [code-yeongyu](https://github.com/code-yeongyu))
@@ -457,9 +423,8 @@ Related projects in the ecosystem (independently maintained by their respective 
 
 ## Ownership / affiliation disclaimer
 
-- 本项目基于 MIT License 的 [dong382258137/claw-code](https://github.com/dong382258137/claw-code) 进行二次开发，尊重并保留上游版权声明。
+- 本项目早期代码源自 MIT License 的 [dong382258137/claw-code](https://github.com/dong382258137/claw-code)，现已独立演进；尊重并保留 MIT License 版权声明。
 - This repository does **not** claim ownership of the original Claude Code source material.
 - This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
 - "Claude" and "Claude Code" are trademarks of Anthropic.
-- This is an independent fork of the MIT-licensed [dong382258137/claw-code](https://github.com/dong382258137/claw-code) project.
 - 参考项目（clawhip、oh-my-openagent 等）均为独立开源项目，各有自己的作者和许可证，本仓库引用它们不代表对其拥有所有权。
