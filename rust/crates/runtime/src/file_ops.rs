@@ -597,7 +597,7 @@ pub fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_path_friendly(path, "edit_file")?;
     let original_file = fs::read_to_string(&absolute_path)?;
     let (updated, start_line, end_line, affected_line_count) =
         apply_string_edit(&original_file, old_string, new_string, replace_all)?;
@@ -780,7 +780,7 @@ pub fn replace_lines(
     end_line: usize,
     new_content: &str,
 ) -> io::Result<ReplaceLinesOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_path_friendly(path, "replace_lines")?;
     reject_leaf_symlink(&absolute_path)?;
 
     let original_file = fs::read_to_string(&absolute_path)?;
@@ -868,7 +868,7 @@ pub fn replace_lines_in_workspace_with_roots(
     workspace_root: &Path,
     extra_roots: &[PathBuf],
 ) -> io::Result<ReplaceLinesOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_path_friendly(path, "replace_lines")?;
     let roots = canonicalize_roots(workspace_root, extra_roots);
     validate_workspace_boundary_multi(&absolute_path, &roots)?;
     // BUG-P1-5 (TOCTOU): operate on the already-validated `absolute_path`
@@ -1489,7 +1489,7 @@ pub fn edit_file_in_workspace_with_roots(
     workspace_root: &Path,
     extra_roots: &[PathBuf],
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_path_friendly(path, "edit_file")?;
     let roots = canonicalize_roots(workspace_root, extra_roots);
     validate_workspace_boundary_multi(&absolute_path, &roots)?;
     // BUG-P1-5 (TOCTOU): write to the already-validated `absolute_path`
