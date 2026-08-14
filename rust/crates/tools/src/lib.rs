@@ -7444,7 +7444,12 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
 }
 
 fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
-    let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    let resolved = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "brief: attachment path '{path}' does not exist ({error}). \
+             Check the path spelling, or use glob_search to locate the correct path."
+        )
+    })?;
     let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
     Ok(ResolvedAttachment {
         path: resolved.display().to_string(),
