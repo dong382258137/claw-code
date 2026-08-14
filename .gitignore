@@ -8,13 +8,9 @@ archive/
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
-# Claw Plus local artifacts
-.claw/settings.local.json
-.claw/sessions/
-.claw/history.db
-.claw/plugins/
-.claw/decision_log.db*
-.claw/tool_results_archive.jsonl
+# Claw local artifacts (runtime state, sessions, subagents, plans — never commit)
+.claw/
+.vscode/
 .clawhip/
 # Local sandbox runtime state (transient, per-machine)
 .sandbox-home/
@@ -22,15 +18,7 @@ archive/
 .clawd-todos.json
 # Agent dispatch cache (transient)
 .clawd-agents/
-# Per-workspace claw artifacts (subdirectory mirrors of root entries above)
-**/.claw/settings.local.json
-**/.claw/plugins/
-**/.claw/history.db
-**/.claw/sessions/
-**/.claw/decision_log.db*
-**/.claw/tool_results_archive.jsonl
-**/.claw/checkpoints/
-**/.claw/subagents/
+# Per-workspace claw agent dispatch cache (transient)
 **/.clawd-todos.json
 **/.clawd-agents/
 status-help.txt
