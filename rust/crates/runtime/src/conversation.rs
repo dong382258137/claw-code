@@ -2223,8 +2223,8 @@ where
         if let Some(te) = tool_executor {
             dispatcher = dispatcher.with_tool_executor(Arc::new(Mutex::new(te)));
         }
-        let runner: SubagentRunner = Arc::new(move |id, task| {
-            let d = dispatcher.clone();
+        let runner: SubagentRunner = Arc::new(move |id, task, capability| {
+            let d = dispatcher.clone().with_capability(capability);
             Box::pin(async move { d.dispatch(id, task).await })
         });
         self.coordinator_executor = Some(Arc::new(
@@ -2482,6 +2482,7 @@ where
                 max_retries,
                 mode: task.mode,
                 retry_policy: RetryPolicy::default(),
+                capability: task.capability,
             };
             nodes.push((idx, node));
             results.push(Ok(String::new())); // 占位,后续填充

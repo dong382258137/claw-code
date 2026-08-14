@@ -15,7 +15,7 @@ use petgraph::visit::EdgeRef;
 use petgraph::{Directed, Graph};
 use serde::{Deserialize, Serialize};
 
-use crate::multi_agent::CoordinationMode;
+use crate::multi_agent::{CoordinationMode, SubagentCapability};
 
 /// Unique identifier for a DAG node.
 pub type DagNodeId = String;
@@ -51,6 +51,12 @@ pub struct DagNode {
     /// Retry policy (v0.2). Defaults to a conservative exponential-backoff policy.
     #[serde(default)]
     pub retry_policy: RetryPolicy,
+    /// Subagent capability tier (v3). Determines tool whitelist and max
+    /// tool-call iterations for the subagent dispatched for this node.
+    /// Defaults to `Analyze` (L0, no tools) for backward compatibility with
+    /// pre-capability DAG definitions.
+    #[serde(default)]
+    pub capability: SubagentCapability,
 }
 
 const fn default_max_retries() -> u32 {
@@ -721,6 +727,7 @@ mod graph_tests {
             max_retries: 1,
             mode: CoordinationMode::Fork,
             retry_policy: RetryPolicy::default(),
+            capability: SubagentCapability::Analyze,
         }
     }
 

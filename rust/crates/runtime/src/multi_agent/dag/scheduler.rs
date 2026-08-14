@@ -755,6 +755,7 @@ mod tests {
             max_retries: 0,
             mode: CoordinationMode::Fork,
             retry_policy: RetryPolicy::default(),
+            capability: crate::multi_agent::SubagentCapability::Analyze,
         }
     }
 

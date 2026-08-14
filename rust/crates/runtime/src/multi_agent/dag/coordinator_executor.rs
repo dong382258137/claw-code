@@ -39,11 +39,11 @@ use async_trait::async_trait;
 
 use super::executor_trait::{NodeError, SubagentExecutor};
 use super::types::{DagNode, NodeResult};
-use crate::multi_agent::MultiAgentCoordinator;
+use crate::multi_agent::{MultiAgentCoordinator, SubagentCapability};
 
 /// Type alias for the runner function that executes a subagent's LLM turn.
 ///
-/// The function receives `(subagent_id, task)` and returns the result
+/// The function receives `(subagent_id, task, capability)` and returns the result
 /// string (e.g. a `result_ref` path written to `.claw/subagents/{id}.md`)
 /// on success, or an error message on failure.
 ///
@@ -51,7 +51,8 @@ use crate::multi_agent::MultiAgentCoordinator;
 /// simple — the runner is stored as a single `Arc<dyn Fn ... + Send + Sync>`
 /// regardless of the concrete closure type.
 pub type SubagentRunner = Arc<
-    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+    dyn Fn(String, String, SubagentCapability)
+            -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -176,10 +177,11 @@ impl SubagentExecutor for CoordinatorExecutor {
         //    Created → Running transition and the terminal transition on
         //    completion / failure.
         let coordinator = self.coordinator.clone();
+        let capability = node.capability;
         let handle = coordinator
             .execute_async(&subagent_id, move |id, task| {
                 let runner = runner.clone();
-                Box::pin(async move { (runner)(id, task).await })
+                Box::pin(async move { (runner)(id, task, capability).await })
             })
             .map_err(NodeError::ExecutionFailed)?;
 
@@ -265,6 +267,7 @@ mod tests {
             max_retries: 0,
             mode: CoordinationMode::Fork,
             retry_policy: RetryPolicy::default(),
+            capability: SubagentCapability::Analyze,
         }
     }
 
@@ -308,7 +311,7 @@ mod tests {
         let coordinator = Arc::new(MultiAgentCoordinator::new());
         // Simple runner: returns a fake result_ref path.
         let runner: SubagentRunner =
-            Arc::new(|_id, _task| Box::pin(async { Ok(".claw/subagents/fake.md".to_string()) }));
+            Arc::new(|_id, _task, _cap| Box::pin(async { Ok(".claw/subagents/fake.md".to_string()) }));
         let executor = CoordinatorExecutor::new(coordinator).with_runner(runner);
         let node = sample_node();
         let result = executor
@@ -323,7 +326,7 @@ mod tests {
     async fn execute_with_failing_runner_returns_execution_failed() {
         let coordinator = Arc::new(MultiAgentCoordinator::new());
         let runner: SubagentRunner =
-            Arc::new(|_id, _task| Box::pin(async { Err("llm error".to_string()) }));
+            Arc::new(|_id, _task, _cap| Box::pin(async { Err("llm error".to_string()) }));
         let executor = CoordinatorExecutor::new(coordinator).with_runner(runner);
         let node = sample_node();
         let err = executor
@@ -339,7 +342,7 @@ mod tests {
     async fn execute_with_runner_transitions_coordinator_to_completed() {
         let coordinator = Arc::new(MultiAgentCoordinator::new());
         let runner: SubagentRunner =
-            Arc::new(|_id, _task| Box::pin(async { Ok("result".to_string()) }));
+            Arc::new(|_id, _task, _cap| Box::pin(async { Ok("result".to_string()) }));
         let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
         let node = sample_node();
         executor.execute(&node, 0).await.expect("should succeed");
@@ -355,7 +358,7 @@ mod tests {
     async fn execute_with_failing_runner_transitions_coordinator_to_failed() {
         let coordinator = Arc::new(MultiAgentCoordinator::new());
         let runner: SubagentRunner =
-            Arc::new(|_id, _task| Box::pin(async { Err("boom".to_string()) }));
+            Arc::new(|_id, _task, _cap| Box::pin(async { Err("boom".to_string()) }));
         let executor = CoordinatorExecutor::new(coordinator.clone()).with_runner(runner);
         let node = sample_node();
         let _ = executor.execute(&node, 0).await;
@@ -398,6 +401,7 @@ mod tests {
             max_retries: 0,
             mode: CoordinationMode::Fork,
             retry_policy: RetryPolicy::default(),
+            capability: SubagentCapability::Analyze,
         }
     }
 
@@ -428,7 +432,7 @@ mod tests {
 
         // Realistic runner: simulates LLM latency, then returns the result_ref
         // path (mirroring SubagentDispatcher::dispatch's return format).
-        let runner: SubagentRunner = Arc::new(move |id: String, task: String| {
+        let runner: SubagentRunner = Arc::new(move |id: String, task: String, _cap: SubagentCapability| {
             let dispatched = dispatched_clone.clone();
             Box::pin(async move {
                 // Simulate LLM call latency.
@@ -505,7 +509,7 @@ mod tests {
 
         // Runner that fails for the first spawned subagent ("subagent-1").
         // Since n1 is the only root, it will be spawned first.
-        let runner: SubagentRunner = Arc::new(|id: String, _task: String| {
+        let runner: SubagentRunner = Arc::new(|id: String, _task: String, _cap: SubagentCapability| {
             Box::pin(async move {
                 if id == "subagent-1" {
                     return Err(format!("simulated LLM failure for {id}"));
@@ -563,7 +567,7 @@ mod tests {
         // 1. Creates {workspace_root}/.claw/subagents/ dir
         // 2. Writes {workspace_root}/.claw/subagents/{id}.md (via tmp + rename)
         // 3. Returns the relative result_ref path ".claw/subagents/{id}.md"
-        let runner: SubagentRunner = Arc::new(move |id: String, task: String| {
+        let runner: SubagentRunner = Arc::new(move |id: String, task: String, _cap: SubagentCapability| {
             let workspace = workspace_for_runner.clone();
             let dispatched = dispatched_clone.clone();
             Box::pin(async move {
@@ -681,7 +685,7 @@ mod tests {
         coordinator.add_validation_gate(Box::new(AlwaysFailGate));
 
         // runner 成功返回(模拟 LLM turn 成功)
-        let runner: SubagentRunner = Arc::new(|id: String, _task: String| {
+        let runner: SubagentRunner = Arc::new(|id: String, _task: String, _cap: SubagentCapability| {
             Box::pin(async move { Ok(format!(".claw/subagents/{id}.md")) })
         });
 
@@ -719,7 +723,7 @@ mod tests {
         let coordinator = Arc::new(MultiAgentCoordinator::new());
         // 不注册任何 gate
 
-        let runner: SubagentRunner = Arc::new(|id: String, _task: String| {
+        let runner: SubagentRunner = Arc::new(|id: String, _task: String, _cap: SubagentCapability| {
             Box::pin(async move { Ok(format!(".claw/subagents/{id}.md")) })
         });
 
@@ -784,7 +788,7 @@ mod tests {
             count: AtomicU32::new(0),
         }));
 
-        let runner: SubagentRunner = Arc::new(|id: String, _task: String| {
+        let runner: SubagentRunner = Arc::new(|id: String, _task: String, _cap: SubagentCapability| {
             Box::pin(async move { Ok(format!(".claw/subagents/{id}.md")) })
         });
 
@@ -803,6 +807,7 @@ mod tests {
             max_retries: 1,
             mode: crate::multi_agent::CoordinationMode::Fork,
             retry_policy: RetryPolicy::default(),
+            capability: crate::multi_agent::SubagentCapability::Analyze,
         });
 
         // FailFast::Off:即使重试后仍失败,也返回 Ok(DagRunResult)
