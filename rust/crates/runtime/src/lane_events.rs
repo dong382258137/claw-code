@@ -1156,6 +1156,18 @@ impl LaneEvent {
         .with_terminal_fingerprint()
     }
 
+    /// 构造 lane 关闭(closeout)事件 — PolicyEngine 的 `CloseoutLane` 策略动作落地。
+    #[must_use]
+    pub fn closed(emitted_at: impl Into<String>, detail: Option<String>) -> Self {
+        Self::new(
+            LaneEventName::Closed,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_optional_detail(detail)
+        .with_terminal_fingerprint()
+    }
+
     #[must_use]
     pub fn commit_created(
         emitted_at: impl Into<String>,

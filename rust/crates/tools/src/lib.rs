@@ -5654,6 +5654,25 @@ fn persist_agent_terminal_state(
                     .expect("lane summary metadata should serialize"),
             ),
         );
+        // PolicyEngine 接入:lane 完成时评估策略,落地 closeout 事件。
+        // 此前 detect_lane_completion/evaluate_completed_lane 是死代码,
+        // 现在在 agent 成功完成(无 blocker)的路径上调用,把 CloseoutLane
+        // 策略动作落地为 lane.closed 事件(由 lane_bridge 推送给 IDE)。
+        let has_pushed = maybe_commit_provenance(result).is_some();
+        let test_green = finished_summary.data.review_verdict.as_deref() == Some("approve");
+        if let Some(context) =
+            crate::lane_completion::detect_lane_completion(&next_manifest, test_green, has_pushed)
+        {
+            let actions = crate::lane_completion::evaluate_completed_lane(&context);
+            if actions
+                .iter()
+                .any(|a| matches!(a, runtime::PolicyAction::CloseoutLane))
+            {
+                next_manifest
+                    .lane_events
+                    .push(LaneEvent::closed(iso8601_now(), Some(context.lane_id.clone())));
+            }
+        }
         if let Some(provenance) = maybe_commit_provenance(result) {
             next_manifest.lane_events.push(LaneEvent::commit_created(
                 iso8601_now(),
