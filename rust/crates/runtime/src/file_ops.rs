@@ -430,7 +430,7 @@ pub fn read_file(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_path_friendly(path, "read_file")?;
 
     // Check file size before reading
     let metadata = fs::metadata(&absolute_path)?;
@@ -973,10 +973,10 @@ fn glob_search_impl(
     extra_roots: &[PathBuf],
 ) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
-    let base_dir = path
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    let base_dir = match path {
+        Some(raw_path) => normalize_path_friendly(raw_path, "glob_search")?,
+        None => std::env::current_dir()?,
+    };
     let canonical_roots: Vec<PathBuf> = workspace_root
         .map(|root| canonicalize_roots(root, extra_roots))
         .unwrap_or_default();
@@ -1066,20 +1066,8 @@ fn grep_search_impl(
     workspace_root: Option<&Path>,
     extra_roots: &[PathBuf],
 ) -> io::Result<GrepSearchOutput> {
-    // 友好错误(2026-08-14):path 不存在时 normalize_path 的 canonicalize 会
-    // 返回裸系统错误 "系统找不到指定的文件 (os error 2)",直接冒泡给 LLM 无法
-    // 判断是路径拼错还是其他问题。这里包装成含原始 path + 可操作建议的
-    // NotFound 错误,让 LLM 能直接改用 glob_search 定位正确路径。
     let base_path = match input.path.as_deref() {
-        Some(raw_path) => normalize_path(raw_path).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "grep_search: path '{raw_path}' does not exist ({error}). \
-                     Check the path spelling, or use glob_search to locate the correct path."
-                ),
-            )
-        })?,
+        Some(raw_path) => normalize_path_friendly(raw_path, "grep_search")?,
         None => std::env::current_dir()?,
     };
     let canonical_roots: Vec<PathBuf> = workspace_root
@@ -1374,6 +1362,24 @@ fn normalize_path(path: &str) -> io::Result<PathBuf> {
     candidate.canonicalize()
 }
 
+/// 规范化路径,路径不存在时返回友好错误(含工具名 + 原始 path + 建议)。
+///
+/// 相比裸 [`normalize_path`](直接透传 "系统找不到指定的文件 os error 2"),
+/// 这里包装成含工具名 + 原始 path + glob_search 建议的 NotFound 错误,让 LLM
+/// 能立即判断是路径拼错并改用 glob_search 定位正确路径。供 read_file /
+/// glob_search / grep_search 统一使用。
+fn normalize_path_friendly(raw_path: &str, tool_name: &str) -> io::Result<PathBuf> {
+    normalize_path(raw_path).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{tool_name}: path '{raw_path}' does not exist ({error}). \
+                 Check the path spelling, or use glob_search to locate the correct path."
+            ),
+        )
+    })
+}
+
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
@@ -1418,7 +1424,7 @@ pub fn read_file_in_workspace_with_roots(
     workspace_root: &Path,
     extra_roots: &[PathBuf],
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_path_friendly(path, "read_file")?;
     let roots = canonicalize_roots(workspace_root, extra_roots);
     validate_workspace_boundary_multi(&absolute_path, &roots)?;
     read_file(path, offset, limit)
