@@ -2,7 +2,7 @@
   "name": "claw-code-plus-plus",
   "displayName": "Claw Plus",
   "description": "ACP-compatible AI coding agent for VS Code",
-  "version": "2026.7.0",
+  "version": "2026.8.14",
   "publisher": "claw-code-plus-plus",
   "license": "MIT",
   "engines": {
