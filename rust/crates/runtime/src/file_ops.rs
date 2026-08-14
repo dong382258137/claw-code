@@ -1066,12 +1066,22 @@ fn grep_search_impl(
     workspace_root: Option<&Path>,
     extra_roots: &[PathBuf],
 ) -> io::Result<GrepSearchOutput> {
-    let base_path = input
-        .path
-        .as_deref()
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    // 友好错误(2026-08-14):path 不存在时 normalize_path 的 canonicalize 会
+    // 返回裸系统错误 "系统找不到指定的文件 (os error 2)",直接冒泡给 LLM 无法
+    // 判断是路径拼错还是其他问题。这里包装成含原始 path + 可操作建议的
+    // NotFound 错误,让 LLM 能直接改用 glob_search 定位正确路径。
+    let base_path = match input.path.as_deref() {
+        Some(raw_path) => normalize_path(raw_path).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "grep_search: path '{raw_path}' does not exist ({error}). \
+                     Check the path spelling, or use glob_search to locate the correct path."
+                ),
+            )
+        })?,
+        None => std::env::current_dir()?,
+    };
     let canonical_roots: Vec<PathBuf> = workspace_root
         .map(|root| canonicalize_roots(root, extra_roots))
         .unwrap_or_default();
@@ -2138,6 +2148,32 @@ mod tests {
             out.filenames.iter().any(|f| f.contains("server.py")),
             "应找到 web/server.py;实际 {:?}",
             out.filenames
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:path 不存在时应返回友好错误(含原始 path + glob_search 建议),
+    /// 而非裸系统错误 "系统找不到指定的文件 (os error 2)"。
+    #[test]
+    fn grep_reports_friendly_error_for_missing_path() {
+        let dir = temp_path("grep-missing");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let missing = dir.join("does_not_exist");
+
+        let input = grep_files_with_matches("marker", missing.to_str().unwrap(), None);
+        let err = grep_search(&input).expect_err("不存在的 path 应返回 Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist"),
+            "错误应包含 does not exist;实际: {msg}"
+        );
+        assert!(
+            msg.contains("does_not_exist"),
+            "错误应包含原始 path;实际: {msg}"
+        );
+        assert!(
+            msg.contains("glob_search"),
+            "错误应包含 glob_search 建议;实际: {msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
