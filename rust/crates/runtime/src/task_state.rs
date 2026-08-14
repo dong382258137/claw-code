@@ -125,6 +125,10 @@ pub struct TaskState {
     pub findings: Vec<String>,
     #[serde(default)]
     pub closed_tasks: Vec<String>,
+    /// 第2项:已完成的子目标(对齐 PlanArtifact 的 `StepStatus::Succeeded`)。
+    /// 跨压缩/重开持久化,让 AI 从最近成功 step 续跑,不重跑已完成步骤。
+    #[serde(default)]
+    pub completed_subgoals: Vec<String>,
     pub updated_at_ms: i64,
 }
 
@@ -195,12 +199,29 @@ impl TaskState {
         self.updated_at_ms = now_ms();
     }
 
+    /// 第2项:合并已完成子目标(去重 + 截断 + 上限),供 plan Review 阶段同步。
+    ///
+    /// 子目标来自 PlanArtifact 的 `StepStatus::Succeeded` step 描述,跨压缩/
+    /// 重开持久化,让 AI 从最近成功 step 续跑,不重跑已完成步骤。
+    pub fn record_completed_subgoals(&mut self, subgoals: &[String]) {
+        for g in subgoals {
+            if self.completed_subgoals.len() >= TASK_FINDINGS_MAX {
+                break;
+            }
+            let g = truncate(g.trim(), TASK_FINDING_MAX_CHARS);
+            if g.is_empty() || self.completed_subgoals.contains(&g) {
+                continue;
+            }
+            self.completed_subgoals.push(g);
+        }
+    }
+
     /// 渲染为 system prompt 注入块(精简,恒定体积)。
     ///
     /// 空状态返回空串(调用方跳过注入,不增加 token 开销)。
     #[must_use]
     pub fn render_for_prompt(&self) -> String {
-        if self.goal.is_empty() && self.findings.is_empty() {
+        if self.goal.is_empty() && self.findings.is_empty() && self.completed_subgoals.is_empty() {
             return String::new();
         }
         let mut out = String::from("# 📌 当前任务状态(跨压缩持久化)\n");
@@ -211,6 +232,12 @@ impl TaskState {
             out.push_str("- 已确认的关键发现:\n");
             for f in &self.findings {
                 out.push_str(&format!("  · {f}\n"));
+            }
+        }
+        if !self.completed_subgoals.is_empty() {
+            out.push_str("- 已完成的子目标(勿重复执行):\n");
+            for g in &self.completed_subgoals {
+                out.push_str(&format!("  · {g}\n"));
             }
         }
         if !self.closed_tasks.is_empty() {
@@ -522,6 +549,47 @@ mod tests {
         let loaded = TaskState::load(&path).expect("load");
         assert_eq!(loaded.goal, state.goal);
         assert_eq!(loaded.findings, state.findings);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_completed_subgoals_dedupes_and_caps() {
+        let mut state = ts();
+        state.record_completed_subgoals(&[
+            "step A".to_string(),
+            "step A".to_string(), // 重复应去重
+            "step B".to_string(),
+        ]);
+        assert_eq!(state.completed_subgoals, vec!["step A", "step B"]);
+
+        // 上限:追加超过 TASK_FINDINGS_MAX 后,超出部分丢弃
+        for i in 0..(TASK_FINDINGS_MAX + 3) {
+            state.record_completed_subgoals(&[format!("extra {i}")]);
+        }
+        assert!(
+            state.completed_subgoals.len() <= TASK_FINDINGS_MAX,
+            "completed_subgoals should be capped, got {}",
+            state.completed_subgoals.len()
+        );
+    }
+
+    #[test]
+    fn completed_subgoals_render_and_roundtrip() {
+        let mut state = ts();
+        state.goal = "重构 auth 模块".to_string();
+        state.record_completed_subgoals(&["拆分 token 校验".to_string()]);
+        let rendered = state.render_for_prompt();
+        assert!(rendered.contains("已完成的子目标"));
+        assert!(rendered.contains("拆分 token 校验"));
+
+        let path = std::env::temp_dir().join(format!(
+            "claw-task-state-subgoals-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        state.save(&path).expect("save");
+        let loaded = TaskState::load(&path).expect("load");
+        assert_eq!(loaded.completed_subgoals, state.completed_subgoals);
         let _ = std::fs::remove_file(&path);
     }
 }

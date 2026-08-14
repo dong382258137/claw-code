@@ -615,6 +615,36 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["memory".to_string(), "notebook".to_string()],
     });
+    // 第1项:注册 plan_update 工具 — 让 LLM 推进 PlanArtifact 顺序状态机。
+    // 长程任务按 step 状态机执行(而非一次线性跑完),LLM 完成一个 step 后
+    // 调用 plan_update("done: <step_id>") 标记完成,Review 阶段据此判断
+    // AllPassed / Replan。step_id 见 Active Plan 中每步的 1-based 编号。
+    // 执行由 ConversationRuntime::run_turn 拦截,委托
+    // planner::update_plan 处理(推进 StepStatus 状态机)。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "plan_update".to_string(),
+        description: Some(
+            "Update the current execution plan's step status (Plan/Execute/Review cycle). \
+             Use this to mark a step done or failed, add a step, or trigger replan. \
+             Actions: 'done: <step_id>' marks a step succeeded; 'fail: <step_id>' marks it failed; \
+             'replan' resets failed steps to pending; 'add: <description>' appends a new step. \
+             <step_id> is the 1-based step number shown in the Active Plan (e.g. 'done: 1' or 'done: step_1'). \
+             Call this after each step completes so the review gate can verify progress."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "update": {
+                    "type": "string",
+                    "description": "Action string, e.g. 'done: 1', 'fail: 2', 'replan', or 'add: write unit tests'."
+                }
+            },
+            "required": ["update"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["planning".to_string(), "memory".to_string()],
+    });
     // P0:注册 recall_full 工具 — 从 ToolResultArchive 检索 microcompact
     // 摘要前的原始 tool result。
     //

@@ -29,7 +29,7 @@ use crate::recovery_recipes::RecoveryResult;
 // docs/harness-engineering-optimization-plan.md Step 2.1 与 §5.2。
 use crate::planner::{
     assess_complexity, decompose_task, is_auto_planner_enabled, persist_plan_artifact,
-    plan_and_convert_to_spawn_requests, ComplexityAssessment, PlanArtifact,
+    plan_and_convert_to_spawn_requests, update_plan, ComplexityAssessment, PlanArtifact,
     PreCompletionChecklistMiddleware, ReviewResult,
 };
 // Harness M(多 agent)层接入:MultiAgentCoordinator — Step 3.2-c。
@@ -3816,6 +3816,16 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
+                        } else if tool_name == "plan_update" {
+                            // 第1项:LLM 推进 PlanArtifact 顺序状态机。
+                            // 长程任务按 step 状态机执行,LLM 完成一个 step 后
+                            // 调用 plan_update("done: <step_id>") 标记完成,
+                            // Review 阶段据此判断 AllPassed / Replan,而非
+                            // 一次性线性跑完(降低有效 horizon + 验证门)。
+                            match self.execute_plan_update(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
                         } else if tool_name == "recall_full" {
                             // P0:从 ToolResultArchive 检索 microcompact 摘要前的
                             // 原始 tool result。直击"AI 看到摘要后无法判断是否需要
@@ -4228,6 +4238,11 @@ where
                         }
                     }
                 }
+
+                // 第2项:plan 仍可用时,把 Succeeded steps 同步进 task_state。
+                // 放在 verifier 之后(mark_failed 可能减少 Succeeded)、review 之前,
+                // 确保 AllPassed(active_plan 随后被清空)也能记录最终完成的子目标。
+                self.sync_completed_subgoals_from_plan(&plan);
 
                 match self.plan_reviewer.review(&mut plan, failed_verifications) {
                     ReviewResult::AllPassed => {
@@ -5979,6 +5994,88 @@ where
             Ok(message) => Ok(message),
             Err(error) => Ok(format!("notebook_update failed: {error}")),
         }
+    }
+
+    /// 第1项:执行 `plan_update` 工具调用,推进 PlanArtifact 顺序状态机。
+    ///
+    /// 长程任务按 step 状态机执行:LLM 完成一个 step 后调用
+    /// `plan_update("done: <step_id>")` 标记完成,Review 阶段据此判断
+    /// AllPassed / Replan。这是"降低有效 horizon + 每步验证门"的关键接线
+    /// —— 此前 `update_plan` 是死代码,step 永远无法推进到 Succeeded,
+    /// PlanArtifact 状态机无法闭环。
+    ///
+    /// step_id 兼容两种写法:1-based 纯数字("done: 1")与 step_N("done: step_1"),
+    /// 因 `render_for_prompt` 展示 1-based 序号而非 step.id。
+    fn execute_plan_update(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(serde::Deserialize)]
+        struct PlanUpdateInput {
+            update: String,
+        }
+        let parsed: PlanUpdateInput = serde_json::from_str(input)
+            .map_err(|e| format!("invalid plan_update input JSON: {e}"))?;
+        let Some(plan) = self.active_plan.as_mut() else {
+            return Ok(
+                "plan_update: no active plan. A plan is only created for complex tasks \
+                 (>200 chars or matching planning keywords). No state changed."
+                    .to_string(),
+            );
+        };
+        // 规范化纯数字 step 引用("done: 1" → "done: step_1"),对齐 step.id。
+        let normalized = crate::planner::normalize_plan_update(&parsed.update);
+        let changes = update_plan(plan, &normalized);
+        // 推进后立即持久化,支持断点续跑(会话中断后从最近成功 step 恢复)。
+        if let Some(root) = &self.workspace_root {
+            let _ = persist_plan_artifact(plan, root);
+        }
+        let status_summary: Vec<String> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let status = match s.status {
+                    crate::planner::StepStatus::Pending => "pending",
+                    crate::planner::StepStatus::Executing => "executing",
+                    crate::planner::StepStatus::Succeeded => "done",
+                    crate::planner::StepStatus::Failed => "failed",
+                    crate::planner::StepStatus::Skipped => "skipped",
+                };
+                format!("{}. {} [{}]", idx + 1, s.id, status)
+            })
+            .collect();
+        Ok(format!(
+            "plan_update applied ({changes} change(s)). Current steps:\n{}",
+            status_summary.join("\n")
+        ))
+    }
+
+    /// 第2项:从 PlanArtifact 提取 `Succeeded` steps 描述,合并进 task_state。
+    ///
+    /// 只更新内存态(`self.task_state`),落盘由 `maybe_update_task_state` 统一
+    /// 处理(避免 turn 内重复写盘)。Review 阶段在 plan 仍可用时调用,确保
+    /// AllPassed(active_plan 被清空)也能记录最终完成的子目标。
+    fn sync_completed_subgoals_from_plan(&mut self, plan: &PlanArtifact) {
+        let Some(root) = self.workspace_root.clone() else {
+            return;
+        };
+        let succeeded: Vec<String> = plan
+            .steps
+            .iter()
+            .filter(|s| s.status == crate::planner::StepStatus::Succeeded)
+            .map(|s| s.description.clone())
+            .collect();
+        if succeeded.is_empty() {
+            return;
+        }
+        let path = root.join(".claw").join(crate::task_state::TASK_STATE_FILE);
+        let mut state = self
+            .task_state
+            .clone()
+            .unwrap_or_else(|| crate::task_state::TaskState::load(&path).unwrap_or_default());
+        state.record_completed_subgoals(&succeeded);
+        self.task_state = Some(state);
     }
 
     /// P0:执行 `recall_full` 工具调用,从 ToolResultArchive 检索 microcompact

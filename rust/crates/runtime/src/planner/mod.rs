@@ -565,6 +565,35 @@ pub fn update_plan(artifact: &mut PlanArtifact, update: &str) -> usize {
     changes
 }
 
+/// 规范化 `plan_update` 工具的 step 引用:纯数字 id("done: 1")→ `step_N` 形式。
+///
+/// `render_for_prompt` 展示 step 为 1-based 序号(1, 2, 3),而 [`update_plan`]
+/// 按 `step.id`("step_1")精确匹配。此函数把纯数字引用映射到 `step_N`,使 LLM
+/// 用序号也能正确推进状态机(否则 `done: 1` 永远匹配不到 `step_1`)。
+#[must_use]
+pub fn normalize_plan_update(update: &str) -> String {
+    let trimmed = update.trim();
+    for keyword in ["done:", "fail:", "Done:", "Fail:", "DONE:", "FAIL:"] {
+        if let Some(rest) = trimmed.strip_prefix(keyword) {
+            let rest = rest.trim();
+            let (id_part, tail) = match rest.split_once(',') {
+                Some((id, tail)) => (id.trim(), Some(tail)),
+                None => (rest, None),
+            };
+            if !id_part.is_empty() && id_part.chars().all(|c| c.is_ascii_digit()) {
+                let mut out = format!("{keyword} step_{id_part}");
+                if let Some(tail) = tail {
+                    out.push(',');
+                    out.push_str(tail);
+                }
+                return out;
+            }
+            break;
+        }
+    }
+    trimmed.to_string()
+}
+
 fn extract_file_paths(text: &str) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -680,6 +709,27 @@ mod tests {
         // 注意:OnceLock 是进程级单例,其他测试可能已调用 set_auto_planner_enabled(true)
         // 这里只验证函数可调用,不断言具体值
         let _ = is_auto_planner_enabled();
+    }
+
+    #[test]
+    fn normalize_plan_update_maps_numeric_step_id() {
+        assert_eq!(normalize_plan_update("done: 1"), "done: step_1");
+        assert_eq!(normalize_plan_update("fail: 2"), "fail: step_2");
+        assert_eq!(normalize_plan_update("DONE: 3"), "DONE: step_3");
+        // 保留 fail 的 reason 尾缀
+        assert_eq!(
+            normalize_plan_update("fail: 2, reason: compile error"),
+            "fail: step_2, reason: compile error"
+        );
+    }
+
+    #[test]
+    fn normalize_plan_update_passthrough_non_numeric() {
+        // step_N 形式 / 非数字 / 其他 action 原样返回
+        assert_eq!(normalize_plan_update("done: step_1"), "done: step_1");
+        assert_eq!(normalize_plan_update("add: write unit tests"), "add: write unit tests");
+        assert_eq!(normalize_plan_update("replan"), "replan");
+        assert_eq!(normalize_plan_update("  done: 5  "), "done: step_5");
     }
 
     #[test]
