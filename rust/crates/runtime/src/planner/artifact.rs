@@ -346,12 +346,16 @@ impl PlanArtifact {
     }
 
     /// 渲染 PlanArtifact 的**稳定骨架**(task_summary + steps 描述),
-    /// 不包含 step 状态标签(⏳/▶/✓/✗/⊘)。
+    /// 不含 ⏳/▶/✓/✗/⊘ 状态标签。
     ///
-    /// 骨架在 turn 间不变(steps 列表创建后固定,只有 status/attempts 变),
+    /// 骨架在 turn 间基本不变(steps 列表创建后固定,只有 status/attempts 变),
     /// 因此可以安全放在 system_prompt 的 dynamic_sections 中而不破坏
     /// 隐式前缀缓存 —— system_prompt 在 turn 间字节稳定,之后的 tools
     /// 和 messages 都能被 DeepSeek 服务端 cache 命中。
+    ///
+    /// 第4项:已 `Succeeded` 的 step 折叠为单行 `[done]` 摘要(不再输出
+    /// acceptance/verify/attempts/pre-commitment),减少长任务 prompt 膨胀;
+    /// 未完成 step 仍输出完整详情。
     ///
     /// 与 [`render_status_delta`](Self::render_status_delta) 配合使用:
     /// skeleton → dynamic_sections(可缓存),delta → messages 末尾(不可缓存)。
@@ -375,6 +379,13 @@ impl PlanArtifact {
         }
         out.push_str("Steps:\n");
         for (idx, step) in self.steps.iter().enumerate() {
+            // 第4项:已闭环(Succeeded)的子目标折叠为单行摘要,减少长任务 prompt
+            // 膨胀。完成的 step 不再需要 acceptance/verify/attempts 详情,也无需
+            // pre-commitment 提示,只保留"已完成"锚点供 AI 识别进度。
+            if step.status == StepStatus::Succeeded {
+                out.push_str(&format!("{}. [done] {}\n", idx + 1, step.description));
+                continue;
+            }
             let risk_tag = if step.risk_level == StepRisk::High {
                 " ⚠ high-risk"
             } else {
@@ -605,6 +616,19 @@ mod tests {
         let rendered = artifact.render_for_prompt();
         assert!(!rendered.contains("PRE-COMMITMENT REQUIRED"));
         assert!(!rendered.contains("high-risk"));
+    }
+
+    #[test]
+    fn render_skeleton_folds_succeeded_steps() {
+        let mut artifact = PlanArtifact::new("fold task", sample_steps());
+        artifact.steps[0].mark_succeeded();
+        let rendered = artifact.render_skeleton();
+        // 已闭环 step 折叠为单行 [done],不再输出 acceptance/verify 详情
+        assert!(rendered.contains("1. [done] Read file"));
+        assert!(!rendered.contains("acceptance: file read"));
+        // 未完成 step 仍输出完整详情
+        assert!(rendered.contains("2. Edit file"));
+        assert!(rendered.contains("acceptance: edit applied"));
     }
 
     #[test]

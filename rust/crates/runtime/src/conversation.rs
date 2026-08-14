@@ -6016,6 +6016,8 @@ where
         }
         let parsed: PlanUpdateInput = serde_json::from_str(input)
             .map_err(|e| format!("invalid plan_update input JSON: {e}"))?;
+        // 先 clone verifier,避免与 active_plan 的可变借用冲突。
+        let verifier = self.verifier_agent.clone();
         let Some(plan) = self.active_plan.as_mut() else {
             return Ok(
                 "plan_update: no active plan. A plan is only created for complex tasks \
@@ -6026,6 +6028,34 @@ where
         // 规范化纯数字 step 引用("done: 1" → "done: step_1"),对齐 step.id。
         let normalized = crate::planner::normalize_plan_update(&parsed.update);
         let changes = update_plan(plan, &normalized);
+
+        // 第3项:done 动作 + verifier + verify_command → 立即验证(验证门下沉)。
+        // 此前只在 turn 收尾的 Review 阶段验证,一个 step 的错误要到整个 turn
+        // 结束才暴露;现在 done 即验,失败立即 mark_failed 并反馈 remediation。
+        let mut verify_note = String::new();
+        if let (Some(verifier), Some(step_id)) =
+            (&verifier, crate::planner::done_step_id(&normalized))
+        {
+            if let Some(step) = plan.steps.iter_mut().find(|s| s.id == step_id) {
+                if step.status == crate::planner::StepStatus::Succeeded {
+                    if let Some(cmd) = step.verify_command.clone() {
+                        let result = verifier.verify("", &step.acceptance_criteria, Some(&cmd));
+                        if !result.passed {
+                            step.mark_failed();
+                            let remediation = result
+                                .remediation
+                                .map(|r| format!(" (remediation: {r})"))
+                                .unwrap_or_default();
+                            verify_note = format!(
+                                "\n[verify] step '{}' FAILED: {}{}",
+                                step.id, result.detail, remediation
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // 推进后立即持久化,支持断点续跑(会话中断后从最近成功 step 恢复)。
         if let Some(root) = &self.workspace_root {
             let _ = persist_plan_artifact(plan, root);
@@ -6046,7 +6076,7 @@ where
             })
             .collect();
         Ok(format!(
-            "plan_update applied ({changes} change(s)). Current steps:\n{}",
+            "plan_update applied ({changes} change(s)).{verify_note}\nCurrent steps:\n{}",
             status_summary.join("\n")
         ))
     }

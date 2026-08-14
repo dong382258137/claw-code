@@ -594,6 +594,23 @@ pub fn normalize_plan_update(update: &str) -> String {
     trimmed.to_string()
 }
 
+/// 若 update 是 `done: <id>` 动作,返回 step id(已规范化);否则 `None`。
+///
+/// 用于第 3 项:plan_update 标记 done 后立即对该 step 执行 verify_command,
+/// 把验证门从"Review 阶段(turn 收尾)"下沉到"每步完成时",失败即反馈,
+/// 而非等到收尾才发现。
+#[must_use]
+pub fn done_step_id(update: &str) -> Option<&str> {
+    let trimmed = update.trim();
+    for keyword in ["done:", "Done:", "DONE:"] {
+        if let Some(rest) = trimmed.strip_prefix(keyword) {
+            let id = rest.trim();
+            return (!id.is_empty()).then_some(id);
+        }
+    }
+    None
+}
+
 fn extract_file_paths(text: &str) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -730,6 +747,17 @@ mod tests {
         assert_eq!(normalize_plan_update("add: write unit tests"), "add: write unit tests");
         assert_eq!(normalize_plan_update("replan"), "replan");
         assert_eq!(normalize_plan_update("  done: 5  "), "done: step_5");
+    }
+
+    #[test]
+    fn done_step_id_extracts_id_from_done_action() {
+        assert_eq!(done_step_id("done: step_1"), Some("step_1"));
+        assert_eq!(done_step_id("Done: step_2"), Some("step_2"));
+        assert_eq!(done_step_id("  DONE: step_3  "), Some("step_3"));
+        // 非 done 动作返回 None
+        assert_eq!(done_step_id("fail: step_1"), None);
+        assert_eq!(done_step_id("replan"), None);
+        assert_eq!(done_step_id("add: write tests"), None);
     }
 
     #[test]
