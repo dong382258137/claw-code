@@ -188,11 +188,6 @@ pub(crate) enum CliAction {
         /// (CloseoutLane/CleanupSession 等),发布到 lane_events。
         /// 默认关闭,向后兼容。
         enable_policy_engine: bool,
-        /// 启用 PlannerAgent 自动拆解(接入并行派发链路)。
-        /// 启用后,复杂用户输入会自动拆解为多个子任务并并行派发
-        /// (LLM 驱动优先,失败降级到启发式)。默认关闭。
-        /// 依赖 P0/P1 容错加固:retry + FailFast::Off + 限流 + validation gate。
-        enable_auto_planner: bool,
     },
     HelpTopic {
         topic: LocalHelpTopic,
@@ -272,10 +267,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // P1-1:`--enable-policy-engine` — 启用 PolicyEngine 策略引擎。
     // 默认关闭。启用后 lane 完成时调用 PolicyEngine::evaluate。
     let mut enable_policy_engine = false;
-    // `--enable-auto-planner` — 启用 PlannerAgent 自动拆解(接入并行派发链路)。
-    // 默认开启(true)。复杂输入自动拆解为子任务并并行派发。
-    // 用 `--no-auto-planner` 显式关闭。
-    let mut enable_auto_planner = true;
     // `--cache-stats`:仅对 `claw doctor` 生效,切换到 Cache Aligner 监控视图。
     let mut cache_stats = false;
     let mut rest: Vec<String> = Vec::new();
@@ -407,14 +398,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--enable-policy-engine" => {
                 enable_policy_engine = true;
-                index += 1;
-            }
-            "--enable-auto-planner" => {
-                enable_auto_planner = true;
-                index += 1;
-            }
-            "--no-auto-planner" => {
-                enable_auto_planner = false;
                 index += 1;
             }
             "--quiet" => {
@@ -572,7 +555,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             tui,
             enable_plan_mode,
             enable_policy_engine,
-            enable_auto_planner,
         });
     }
     if rest.first().map(String::as_str) == Some("--fork-session") {

@@ -380,7 +380,6 @@ fn defaults_to_repl_when_no_args() {
             tui: true,
             enable_plan_mode: false,
             enable_policy_engine: false,
-            enable_auto_planner: true,
         }
     );
 }
@@ -825,7 +824,6 @@ fn parses_permission_mode_flag() {
             tui: true,
             enable_plan_mode: false,
             enable_policy_engine: false,
-            enable_auto_planner: true,
         }
     );
 }
@@ -852,7 +850,6 @@ fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
             tui: true,
             enable_plan_mode: false,
             enable_policy_engine: false,
-            enable_auto_planner: true,
         }
     );
 }
@@ -917,7 +914,6 @@ fn parses_allowed_tools_flags_with_aliases_and_lists() {
             tui: true,
             enable_plan_mode: false,
             enable_policy_engine: false,
-            enable_auto_planner: true,
         }
     );
 }

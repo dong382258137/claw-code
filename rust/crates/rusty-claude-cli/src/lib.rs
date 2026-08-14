@@ -724,7 +724,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             tui,
             enable_plan_mode,
             enable_policy_engine,
-            enable_auto_planner,
         } => {
             if tui {
                 #[cfg(feature = "full-tui")]
@@ -760,7 +759,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 output_verbosity,
                 enable_plan_mode,
                 enable_policy_engine,
-                enable_auto_planner,
             )?
         }
         CliAction::Harness {

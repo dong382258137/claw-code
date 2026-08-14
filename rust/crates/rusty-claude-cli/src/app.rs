@@ -470,7 +470,6 @@ pub(crate) fn run_repl(
     output_verbosity: OutputVerbosity,
     enable_plan_mode: bool,
     enable_policy_engine: bool,
-    enable_auto_planner: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     correct_cwd_from_target_dir();
@@ -508,16 +507,6 @@ pub(crate) fn run_repl(
     // 实际接入在 P1-2/P1-3 中完成(green_contract 桥接 + g004 校验闭环)。
     if enable_policy_engine {
         eprintln!("[policy] PolicyEngine enabled (lane completion policy evaluation active)");
-    }
-    // PlannerAgent 自动拆解 flag — 启用后复杂输入自动拆解为子任务并并行派发。
-    // 依赖 P0/P1 容错加固:retry + FailFast::Off + 限流 + validation gate。
-    // 默认开启,用 `--no-auto-planner` 关闭。
-    if enable_auto_planner {
-        runtime::planner::set_auto_planner_enabled(true);
-        eprintln!("[planner] Auto-planner enabled (complex inputs will be decomposed and spawned in parallel)");
-    } else {
-        runtime::planner::set_auto_planner_enabled(false);
-        eprintln!("[planner] Auto-planner disabled (--no-auto-planner)");
     }
     let t_cli = t0.elapsed();
     let mut editor =

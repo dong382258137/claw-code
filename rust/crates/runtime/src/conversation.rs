@@ -28,9 +28,8 @@ use crate::recovery_recipes::RecoveryResult;
 // 不污染 system_prompt + tools_schema 的"绝对稳定区"。详见
 // docs/harness-engineering-optimization-plan.md Step 2.1 与 §5.2。
 use crate::planner::{
-    assess_complexity, decompose_task, is_auto_planner_enabled, persist_plan_artifact,
-    plan_and_convert_to_spawn_requests, update_plan, ComplexityAssessment, PlanArtifact,
-    PreCompletionChecklistMiddleware, ReviewResult,
+    assess_complexity, decompose_task, persist_plan_artifact, update_plan,
+    ComplexityAssessment, PlanArtifact, PreCompletionChecklistMiddleware, ReviewResult,
 };
 // Harness M(多 agent)层接入:MultiAgentCoordinator — Step 3.2-c。
 // 主 agent 通过 dispatch_subagent tool 派发任务给子 agent。
@@ -2292,73 +2291,6 @@ where
         // 避免"一颗老鼠屎坏了一锅粥"。调用方如需严格语义可显式调用
         // spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On)。
         self.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::Off)
-    }
-
-    /// PlannerAgent 自动拆解 + 并行派发入口。
-    ///
-    /// 当 `auto_planner` feature flag 开启时(通过 `planner::set_auto_planner_enabled(true)`),
-    /// 自动将用户输入拆解为多个子任务并并行派发。流程:
-    ///
-    /// 1. **复杂度评估**:用 `assess_complexity` 判断是否为复杂任务
-    ///    - `Simple` → 直接返回(不拆解,由主 agent 处理)
-    ///    - `Complex` → 继续拆解
-    /// 2. **LLM 驱动拆解**(优先):调用 `plan_and_convert_to_spawn_requests`
-    ///    - LLM 失败或未注册 client → 自动降级到启发式 `decompose_task`
-    /// 3. **并行派发**:调用 `spawn_parallel_via_dag`(FailFast::Off + retry + validation)
-    ///
-    /// # 返回
-    /// - `Ok(Some(results))`:已拆解并派发,results 为每个子任务的结果
-    /// - `Ok(None)`:未拆解(feature flag 关闭 / 任务太简单)
-    /// - `Err(e)`:拆解失败(理论上不会,因为启发式总是返回至少 1 个 step)
-    ///
-    /// # Feature flag
-    /// 默认关闭。开启方式:
-    /// ```ignore
-    /// runtime::planner::set_auto_planner_enabled(true);
-    /// ```
-    ///
-    /// # 安全保障
-    /// - 并行路径已补齐 retry(P0-a)+ FailFast::Off(P0-b)+ 限流(P1)+ validation gate(P0-d)
-    /// - High risk step → `TaskComplexity::Architectural`(max_retries=2)
-    /// - Low risk step → `TaskComplexity::Simple`(max_retries=0)
-    pub fn plan_and_spawn_parallel(
-        &mut self,
-        user_input: &str,
-    ) -> Result<Option<Vec<Result<String, String>>>, String> {
-        // 1. Feature flag 检查
-        if !is_auto_planner_enabled() {
-            return Ok(None);
-        }
-
-        // 2. 复杂度评估 — Simple 任务不拆解
-        match assess_complexity(user_input) {
-            ComplexityAssessment::Simple => Ok(None),
-            ComplexityAssessment::Complex { reason } => {
-                // 3. LLM 驱动拆解(优先)+ 降级到启发式
-                let spawn_requests = plan_and_convert_to_spawn_requests(user_input)
-                    .ok_or_else(|| "planner returned no spawn requests".to_string())?;
-
-                crate::diag::global().append(
-                    crate::diag::DiagEntry::new(
-                        crate::diag::DiagLevel::Info,
-                        "auto_planner",
-                        format!(
-                            "auto-planner triggered: {} steps, reason: {}",
-                            spawn_requests.len(),
-                            reason
-                        ),
-                    )
-                    .with_field(
-                        "step_count",
-                        serde_json::Value::Number(serde_json::Number::from(spawn_requests.len())),
-                    ),
-                );
-
-                // 4. 并行派发(FailFast::Off + retry + validation 已内置)
-                let results = self.spawn_parallel_via_dag(spawn_requests);
-                Ok(Some(results))
-            }
-        }
     }
 
     /// v3:同步版本的 `spawn_parallel_via_dag`,支持配置 [`FailFast`] 策略。
@@ -13829,69 +13761,6 @@ mod tests {
         let results = runtime.spawn_parallel_via_dag_with_fail_fast(tasks, FailFast::On);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok(), "should succeed: {:?}", results[0]);
-    }
-
-    // ===== PlannerAgent 自动拆解接入并行链路测试 =====
-
-    /// `plan_and_spawn_parallel` — feature flag 关闭时返回 Ok(None)
-    ///
-    /// 注意:library 层默认 false(unwrap_or(false)),CLI 层默认 true。
-    /// 此测试在 runtime crate 中运行,OnceLock 未被设置,默认 false。
-    #[test]
-    fn plan_and_spawn_parallel_disabled_returns_none() {
-        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
-        let tempdir = tempfile::tempdir().expect("temp workspace");
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            NoopApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_dag_coordinator(
-            coordinator,
-            NoopApi,
-            tempdir.path().to_path_buf(),
-            None,
-            None,
-        );
-
-        // library 层默认 false,应返回 Ok(None)
-        let result = runtime
-            .plan_and_spawn_parallel("refactor multiple files across modules")
-            .expect("should not error when disabled");
-        assert!(result.is_none(), "should return None when feature flag off");
-    }
-
-    /// `plan_and_spawn_parallel` — Simple 任务不拆解(即使 feature flag 开启)
-    #[test]
-    fn plan_and_spawn_parallel_simple_task_returns_none() {
-        // 注意:OnceLock 是进程级单例,可能已被其他测试开启
-        // 这里用 Simple 任务测试,无论 flag 状态都应返回 None
-        let coordinator = Arc::new(crate::multi_agent::MultiAgentCoordinator::new());
-        let tempdir = tempfile::tempdir().expect("temp workspace");
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            NoopApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_dag_coordinator(
-            coordinator,
-            NoopApi,
-            tempdir.path().to_path_buf(),
-            None,
-            None,
-        );
-
-        // "hello" 是 Simple 任务,不应触发拆解
-        let result = runtime
-            .plan_and_spawn_parallel("hello")
-            .expect("should not error for simple task");
-        assert!(result.is_none(), "simple task should not trigger planner");
     }
 
     // ===== v3 Phase 3:execute_spawn_parallel_subagents(CLI tool 接入)测试 =====
