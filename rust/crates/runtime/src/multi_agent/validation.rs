@@ -581,6 +581,17 @@ impl ValidationGate for LlmJudgeGate {
             retryable: false, // API 故障不重试(避免无限重试 + 成本失控)
         })?;
 
+        // 空响应降级:judge LLM 返回空文本(如 reasoning-only 响应,content 无 Text 块)时,
+        // 与"无 client"一致降级为 stub 放行,避免空响应硬失败所有子代理。
+        if response.trim().is_empty() {
+            crate::diag::global().append(crate::diag::DiagEntry::new(
+                crate::diag::DiagLevel::Warn,
+                "validation",
+                "LlmJudgeGate empty judge response: skipping LLM judge (stub mode)",
+            ));
+            return Ok(());
+        }
+
         // 3. 解析分数
         let score = Self::parse_score(&response).map_err(|e| ValidationError {
             message: e.to_string(),
@@ -1022,6 +1033,36 @@ mod tests {
 
         let err = gate.validate(&ctx).expect_err("解析失败应报错");
         assert!(!err.retryable, "解析失败不可重试");
+    }
+
+    /// 空响应(judge LLM 返回空文本,如 reasoning-only 响应)降级为 stub,避免硬失败所有子代理。
+    #[test]
+    fn llm_judge_gate_empty_response_degrades_to_stub() {
+        let tempdir = tempfile::tempdir().expect("create temp dir");
+        let result_path = tempdir.path().join("result.md");
+        std::fs::write(&result_path, "content").unwrap();
+
+        let mock = MockJudgeClient {
+            response: String::new(),
+            force_error: false,
+        };
+        let gate =
+            LlmJudgeGate::diagnostic_default("deepseek-v4-pro", tempdir.path().to_path_buf())
+                .with_client(std::sync::Arc::new(mock));
+
+        let ctx = make_ctx(
+            "sub-1",
+            "诊断任务",
+            &result_path,
+            tempdir.path(),
+            &[],
+            "deepseek-v4-flash",
+        );
+
+        assert!(
+            gate.validate(&ctx).is_ok(),
+            "空响应应降级为 stub 返回 Ok"
+        );
     }
 
     /// §10.5 Epic 5:build_judge_prompt 包含 task/model/rubric 三要素

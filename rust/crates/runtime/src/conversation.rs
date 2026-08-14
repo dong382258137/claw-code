@@ -161,7 +161,7 @@ pub const DISPATCH_SUBAGENT_TOOL_SPEC: &str = r#"{
                 "type": "string",
                 "enum": ["analyze", "read-only", "execute"],
                 "description": "Subagent capability tier: 'analyze' (L0, read-only reasoning, no tools), 'read-only' (L1, read/grep/glob/repomap tools), 'execute' (L2, edit_file/write_file/bash tools; note bash is unavailable when 'workspace' is bound). Determines tool whitelist and max tool-call iterations.",
-                "default": "analyze"
+                "default": "read-only"
             }
         },
         "required": ["name", "task"]
@@ -384,7 +384,7 @@ pub const SPAWN_PARALLEL_SUBAGENTS_TOOL_SPEC: &str = r#"{
                             "type": "string",
                             "enum": ["analyze", "read-only", "execute"],
                             "description": "Subagent capability tier: 'analyze' (L0, read-only reasoning, no tools), 'read-only' (L1, read/grep/glob/repomap tools), 'execute' (L2, edit/write/bash tools). Determines tool whitelist and max tool-call iterations.",
-                            "default": "analyze"
+                            "default": "read-only"
                         }
                     },
                     "required": ["name", "task", "model"]
@@ -6997,13 +6997,14 @@ fn parse_complexity(value: Option<&serde_json::Value>) -> TaskComplexity {
 fn parse_capability(value: Option<&serde_json::Value>) -> crate::multi_agent::SubagentCapability {
     let s = value
         .and_then(|v| v.as_str())
-        .unwrap_or("analyze")
+        .unwrap_or("read-only")
         .to_ascii_lowercase();
     match s.as_str() {
+        "analyze" => crate::multi_agent::SubagentCapability::Analyze,
         "read-only" | "readonly" | "read_only" => crate::multi_agent::SubagentCapability::ReadOnly,
         "execute" => crate::multi_agent::SubagentCapability::Execute,
-        // analyze / unknown / 缺失 — 均回退到 Analyze
-        _ => crate::multi_agent::SubagentCapability::Analyze,
+        // unknown / 缺失 — 回退 ReadOnly(子代理默认具备只读能力,避免 Analyze 空工具白名单)
+        _ => crate::multi_agent::SubagentCapability::ReadOnly,
     }
 }
 
@@ -7214,6 +7215,36 @@ mod tests {
         LANE_EVENT_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// parse_capability:缺失/未知默认 ReadOnly(避免 Analyze 空工具白名单),显式值精确解析。
+    #[test]
+    fn parse_capability_defaults_to_read_only_and_parses_explicit_values() {
+        // 缺失 → ReadOnly
+        assert_eq!(
+            super::parse_capability(None),
+            SubagentCapability::ReadOnly
+        );
+        // 未知值 → ReadOnly
+        assert_eq!(
+            super::parse_capability(Some(&serde_json::json!("bogus"))),
+            SubagentCapability::ReadOnly
+        );
+        // 显式 analyze → Analyze(保留 L0 纯推理选项)
+        assert_eq!(
+            super::parse_capability(Some(&serde_json::json!("analyze"))),
+            SubagentCapability::Analyze
+        );
+        // 显式 read-only → ReadOnly
+        assert_eq!(
+            super::parse_capability(Some(&serde_json::json!("read-only"))),
+            SubagentCapability::ReadOnly
+        );
+        // 显式 execute → Execute
+        assert_eq!(
+            super::parse_capability(Some(&serde_json::json!("execute"))),
+            SubagentCapability::Execute
+        );
     }
 
     struct ScriptedApiClient {
@@ -14102,7 +14133,7 @@ mod tests {
     }
 
     /// Epic 0(§3.1):`parse_spawn_parallel_input` 解析 capability 字段,
-    /// 缺失时默认 Analyze(向后兼容)。
+    /// 缺失时默认 ReadOnly(避免 Analyze 空工具白名单导致工具类任务必失败)。
     #[test]
     fn parse_spawn_parallel_input_capability_field() {
         let input = r#"{
@@ -14117,10 +14148,10 @@ mod tests {
             ConversationRuntime::<NoopApi, StaticToolExecutor>::parse_spawn_parallel_input(input)
                 .expect("valid input should parse");
         assert_eq!(tasks.len(), 3);
-        // 缺失字段默认 Analyze
+        // 缺失字段默认 ReadOnly
         assert_eq!(
             tasks[0].capability,
-            crate::multi_agent::SubagentCapability::Analyze
+            crate::multi_agent::SubagentCapability::ReadOnly
         );
         assert_eq!(
             tasks[1].capability,
