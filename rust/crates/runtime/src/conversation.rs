@@ -2213,13 +2213,15 @@ where
         workspace_root: PathBuf,
         tool_executor: Option<Box<dyn ToolExecutor + Send>>,
         workspace_override: Option<PathBuf>,
+        subagent_model: impl Into<String>,
     ) -> Self
     where
         C: ApiClient + Send + 'static,
     {
         let mut dispatcher =
             SubagentDispatcher::new(Arc::new(Mutex::new(Box::new(api_client))), workspace_root)
-                .with_workspace_override(workspace_override);
+                .with_workspace_override(workspace_override)
+                .with_model(subagent_model);
         if let Some(te) = tool_executor {
             dispatcher = dispatcher.with_tool_executor(Arc::new(Mutex::new(te)));
         }
@@ -13314,6 +13316,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let results = runtime.spawn_parallel_via_dag(vec![]);
@@ -13339,6 +13342,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         // 两个 task 都应被能力校验拒绝:flash+Diagnostic / flash+Architectural
@@ -13394,6 +13398,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let tasks = vec![
@@ -13481,6 +13486,7 @@ mod tests {
                     .register("read_file", |_| Ok("UNEXPECTED-READ".to_string())),
             )),
             Some(sub.clone()),
+            "m",
         );
 
         let tasks = vec![crate::multi_agent::SpawnRequest::new(
@@ -13542,6 +13548,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let tasks = vec![
@@ -13650,6 +13657,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let results = runtime
@@ -13677,6 +13685,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let tasks = vec![crate::multi_agent::SpawnRequest::new(
@@ -13720,6 +13729,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let tasks = vec![
@@ -13780,6 +13790,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let tasks = vec![crate::multi_agent::SpawnRequest::new(
@@ -13815,6 +13826,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let err = runtime
@@ -13841,6 +13853,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let err = runtime
@@ -13867,6 +13880,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let err = runtime
@@ -13893,6 +13907,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let input = r#"{"tasks":[{"name":"a","task":"b","model":"deepseek-v4-flash"}],"fail_fast":"bogus"}"#;
@@ -13920,6 +13935,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let input = r#"{"tasks":[{"name":"a","task":"b"}]}"#;
@@ -13950,6 +13966,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let input = r#"{
@@ -13990,6 +14007,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let input = r#"{
@@ -14030,6 +14048,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let err = runtime
@@ -14061,6 +14080,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let err = runtime
@@ -14092,6 +14112,7 @@ mod tests {
             tempdir.path().to_path_buf(),
             None,
             None,
+            "m",
         );
 
         let input = r#"{

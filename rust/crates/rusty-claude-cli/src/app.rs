@@ -3543,7 +3543,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     if let Ok(workspace_root) = env::current_dir() {
         let subagent_api_client = AnthropicRuntimeClient::new(
             session_id,
-            model_for_subagent,
+            model_for_subagent.clone(),
             false, // enable_tools
             false, // emit_output
             None,  // allowed_tools
@@ -3566,6 +3566,7 @@ pub(crate) fn build_runtime_with_plugin_state(
             workspace_root,
             Some(dag_tool_executor),
             None, // workspace_override — 路径 B 未绑定子目录(主 root,向后兼容);Some 时收窄工具作用域
+            model_for_subagent.clone(),
         );
     }
 

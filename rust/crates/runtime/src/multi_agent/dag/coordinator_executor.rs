@@ -113,14 +113,14 @@ impl CoordinatorExecutor {
     /// use std::future::Future;
     /// use std::pin::Pin;
     /// use std::sync::Arc;
-    /// use runtime::multi_agent::MultiAgentCoordinator;
+    /// use runtime::multi_agent::{MultiAgentCoordinator, SubagentCapability};
     /// use runtime::multi_agent::dag::coordinator_executor::CoordinatorExecutor;
     ///
     /// let coordinator = Arc::new(MultiAgentCoordinator::new());
     /// let runner: Arc<
-    ///     dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+    ///     dyn Fn(String, String, SubagentCapability) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
     ///         + Send + Sync,
-    /// > = Arc::new(|id, task| {
+    /// > = Arc::new(|id, _task, _cap| {
     ///     Box::pin(async move {
     ///         // ... call ConversationRuntime::run_subagent_turn here ...
     ///         Ok(format!(".claw/subagents/{id}.md"))

@@ -47,6 +47,10 @@ pub struct SubagentDispatcher {
     capability: SubagentCapability,
     /// 绑定的子目录 workspace(路径 B 目录隔离)。`None` = 主 root(向后兼容)。
     workspace_override: Option<PathBuf>,
+    /// 子 agent 模型名。`Some` 时按 capability 重建 client 以启用工具
+    /// (L5 修复:此前 DAG 子代理 client 固定 enable_tools=false,LLM 不发出 tool_use)。
+    /// `None` 保持旧行为(不重建,向后兼容)。
+    model: Option<String>,
 }
 
 impl SubagentDispatcher {
@@ -57,7 +61,16 @@ impl SubagentDispatcher {
             tool_executor: None,
             capability: SubagentCapability::Analyze,
             workspace_override: None,
+            model: None,
         }
+    }
+
+    /// 设置子 agent 模型名,使 `dispatch_impl` 能按 capability 重建 client
+    /// (调用 `ApiClient::with_model_and_capability`)以启用工具。
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// Epic 3b:注入工具执行器,启用多轮 tool call 循环。
@@ -115,6 +128,7 @@ impl SubagentDispatcher {
             &subagent_id,
             &name,
             &task,
+            self.model.as_deref(),
         )
         .await
     }
@@ -138,6 +152,7 @@ impl SubagentDispatcher {
         subagent_id: &str,
         name: &str,
         task: &str,
+        model: Option<&str>,
     ) -> Result<String, String> {
         // DAG 路径无 complexity 概念,与现状一致走 Simple(无 SOP)。
         let complexity = crate::multi_agent::TaskComplexity::Simple;
@@ -166,6 +181,7 @@ impl SubagentDispatcher {
         let subagent_id = subagent_id.to_string();
         let name = name.to_string();
         let task = task.to_string();
+        let model = model.map(str::to_string);
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         // move 进独立 OS 线程:自建 current_thread runtime 后 block_on 统一 async 执行链
@@ -176,9 +192,27 @@ impl SubagentDispatcher {
                     .enable_all()
                     .build()
                     .map_err(|e| format!("build subagent runtime failed: {e}"))?;
-                let mut client = api_client
-                    .lock()
-                    .map_err(|e| format!("api_client lock poisoned: {e}"))?;
+
+                // L5 修复:按 capability 重建 client 以启用工具(enable_tools)。
+                // 失败(实现不支持)或未设置 model 时回退到原 client(向后兼容)。
+                let mut rebuilt: Option<Box<dyn ApiClient + Send>> = None;
+                let mut fallback_guard: Option<
+                    std::sync::MutexGuard<'_, Box<dyn ApiClient + Send>>,
+                > = None;
+                {
+                    let guard = api_client
+                        .lock()
+                        .map_err(|e| format!("api_client lock poisoned: {e}"))?;
+                    if let Some(m) = model.as_deref() {
+                        match guard.with_model_and_capability(m, capability) {
+                            Ok(c) => rebuilt = Some(c),
+                            Err(_) => fallback_guard = Some(guard),
+                        }
+                    } else {
+                        fallback_guard = Some(guard);
+                    }
+                }
+
                 // 工具执行器:共享锁借用;None 时注入拒绝型 stub(保持统一签名完整 —
                 // 白名单外工具先被 Guard 2 拦,白名单内工具经 stub 报"no tool_executor configured")。
                 let mut te_guard = match &tool_executor {
@@ -193,10 +227,21 @@ impl SubagentDispatcher {
                     Some(g) => &mut ***g,
                     None => &mut noop_exec,
                 };
+
+                // 选择 client:优先重建后的,否则原 client guard。
+                let client_ref: &mut dyn ApiClient =
+                    match (&mut rebuilt, &mut fallback_guard) {
+                        (Some(c), _) => &mut **c,
+                        (None, Some(g)) => &mut ***g,
+                        (None, None) => {
+                            unreachable!("rebuilt or fallback guard must be set")
+                        }
+                    };
+
                 rt.block_on(execute_subagent_llm(
                     &workspace_root,
                     workspace_override.as_deref(),
-                    &mut **client,
+                    client_ref,
                     tool_exec,
                     &subagent_id,
                     &name,

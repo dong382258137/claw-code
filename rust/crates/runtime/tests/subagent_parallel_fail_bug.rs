@@ -40,6 +40,7 @@ fn spawn_parallel_all_nodes_fail_reports_real_reason() {
         tempdir.path().to_path_buf(),
         None,
         None,
+        "m",
     );
 
     // 3 个并行子任务,全部会失败(LLM 返回空流)
