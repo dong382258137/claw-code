@@ -1284,8 +1284,24 @@ fn matches_optional_filters(
     file_type: Option<&str>,
 ) -> bool {
     if let Some(glob_filter) = glob_filter {
+        // 匹配完整路径 + basename(文件名)。
+        //
+        // 根因(2026-08-14 会话记录实证):LLM 常传精确文件名(如 "server.py")
+        // 或无通配符的 basename 作 glob,而 `path` 是 collect_search_files 返回
+        // 的完整路径(含目录和 Windows `\\?\` verbatim 前缀)。精确文件名 glob
+        // 只能精确匹配整个字符串 → 匹配不上 → 所有文件被 glob 过滤 → 空结果。
+        // 带通配符的 glob(如 "*.js")反而"碰巧"能匹配,因为 glob::Pattern 把
+        // `\` 当转义字符而非路径分隔符,`*` 能吞掉整个路径前缀。修复:额外用
+        // basename 匹配,让精确文件名 glob 命中。
         let path_string = path.to_string_lossy();
-        if !glob_filter.matches(&path_string) && !glob_filter.matches_path(path) {
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| path_string.clone());
+        if !glob_filter.matches(&path_string)
+            && !glob_filter.matches_path(path)
+            && !glob_filter.matches(&file_name)
+        {
             return false;
         }
     }
@@ -2089,6 +2105,38 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("src") && f.contains("real.rs")),
             "应找到 src/real.rs;实际: {:?}",
+            out.filenames
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:精确文件名 glob(无通配符)应能匹配 basename,而非空结果。
+    ///
+    /// 根因(2026-08-14 会话记录实证):LLM 传 `glob: "server.py"` 时,完整路径
+    /// 含目录 + Windows `\\?\` 前缀,精确文件名 glob 只能精确匹配整个字符串
+    /// → 匹配不上 → 所有文件被 glob 过滤 → num_files=0。修复后额外用
+    /// basename 匹配,让精确文件名 glob 命中。
+    #[test]
+    fn grep_matches_exact_filename_glob() {
+        let dir = temp_path("grep-exact-glob");
+        std::fs::create_dir_all(dir.join("web")).expect("web");
+        std::fs::write(dir.join("web/server.py"), "def marker():\n    pass\n").expect("write server");
+        std::fs::write(dir.join("web/ws_server.py"), "def other():\n    pass\n").expect("write ws");
+
+        let out = grep_search(&grep_files_with_matches(
+            "marker",
+            dir.to_str().unwrap(),
+            Some("server.py"),
+        ))
+        .expect("grep");
+        assert_eq!(
+            out.num_files, 1,
+            "精确文件名 glob 应匹配 basename,而非空;实际 {:?}",
+            out.filenames
+        );
+        assert!(
+            out.filenames.iter().any(|f| f.contains("server.py")),
+            "应找到 web/server.py;实际 {:?}",
             out.filenames
         );
         let _ = std::fs::remove_dir_all(&dir);
