@@ -608,7 +608,7 @@ async fn handle_im_message<F, Fut>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::SessionBus;
+    use runtime::{BusMessage, BusPeer, PeerStatus, SessionBus};
 
     fn im_peer(id: &str) -> BusPeer {
         BusPeer {
