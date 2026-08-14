@@ -3550,11 +3550,21 @@ pub(crate) fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             None, // progress_reporter
         )?;
+        // DAG 并行派发子代理的 tool executor:执行层白名单覆盖所有能力工具
+        // (以 Execute 白名单为超集),实际能力分级过滤由 SubagentCapability
+        // 白名单在 process_tool_uses(Guard 2)完成。此前传 None → 子代理无工具。
+        let dag_tool_executor = tools::make_subagent_tool_executor(
+            runtime::multi_agent::SubagentCapability::Execute
+                .allowed_tools()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        );
         runtime = runtime.with_dag_coordinator(
             coordinator_arc,
             subagent_api_client,
             workspace_root,
-            None, // tool_executor — None=单轮无工具(向后兼容);Some(executor) 启用多轮 tool call
+            Some(dag_tool_executor),
             None, // workspace_override — 路径 B 未绑定子目录(主 root,向后兼容);Some 时收窄工具作用域
         );
     }

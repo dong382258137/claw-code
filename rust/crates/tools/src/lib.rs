@@ -6760,6 +6760,18 @@ impl ToolExecutor for SubagentToolExecutor {
     }
 }
 
+/// 构造 DAG 并行派发子代理用的 tool executor(公开入口)。
+///
+/// `allowed_tools` 是执行层白名单(工具规范名集合)。实际的能力分级过滤由
+/// `SubagentCapability` 白名单在 `process_tool_uses`(Guard 2)层完成,因此调用方
+/// 应传入覆盖所有能力工具的名称集合(如 `SubagentCapability::Execute` 白名单)。
+#[must_use]
+pub fn make_subagent_tool_executor(
+    allowed_tools: BTreeSet<String>,
+) -> Box<dyn ToolExecutor + Send> {
+    Box::new(SubagentToolExecutor::new(allowed_tools))
+}
+
 fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
