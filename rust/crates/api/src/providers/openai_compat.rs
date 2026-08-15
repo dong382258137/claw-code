@@ -26,6 +26,18 @@ const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
 
+/// Minimal placeholder echoed back as `reasoning_content` for DeepSeek
+/// thinking-mode tool-call turns (`call_01_*`).
+///
+/// Empirically verified on 2026-08-15 (deepseek-v4 endpoint) that the API only
+/// checks the **presence** of `reasoning_content`, never its content: values
+/// like `"x"*200`, `"thinking"`, `"1"`, `"…"` all return 200, while an omitted
+/// field returns 400. So instead of echoing the full thinking text (~1/3 of
+/// assistant tokens in thinking mode) we send a single-character placeholder.
+/// The model never reads it back — it is dead context the API only validates
+/// for existence.
+pub const REASONING_PLACEHOLDER: &str = "…";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
     pub provider_name: &'static str,
@@ -1190,15 +1202,17 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
-            let mut reasoning = String::new();
+            let mut has_reasoning = false;
             let mut tool_calls = Vec::new();
             let mut tool_call_ids = Vec::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
-                    InputContentBlock::Thinking {
-                        thinking: value, ..
-                    } => reasoning.push_str(value),
+                    InputContentBlock::Thinking { thinking: value, .. } => {
+                        if !value.is_empty() {
+                            has_reasoning = true;
+                        }
+                    }
                     InputContentBlock::ToolUse { id, name, input } => {
                         tool_call_ids.push(id.clone());
                         tool_calls.push(json!({
@@ -1217,7 +1231,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             // reasoning to be echoed back as `reasoning_content`; omitting it
             // yields 400. Non-thinking turns don't need it, so we only pay the
             // context cost when the API actually enforces passback.
-            let include_reasoning = !reasoning.is_empty()
+            let include_reasoning = has_reasoning
                 && (model_requires_reasoning_content_in_history(model)
                     || has_thinking_mode_tool_call(&tool_call_ids));
             if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
@@ -1228,7 +1242,9 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     "content": (!text.is_empty()).then_some(text),
                 });
                 if include_reasoning {
-                    msg["reasoning_content"] = json!(reasoning);
+                    // API 只校验 presence,不读内容 — 见 `REASONING_PLACEHOLDER`。
+                    // 回传最小占位符而非完整 thinking 文本,节省 input token。
+                    msg["reasoning_content"] = json!(REASONING_PLACEHOLDER);
                 }
                 // Only include tool_calls when non-empty: some providers reject
                 // assistant messages with an explicit empty tool_calls array.
@@ -1714,7 +1730,7 @@ mod tests {
         build_chat_completion_request, chat_completions_endpoint, has_thinking_mode_tool_call,
         is_reasoning_model, model_requires_reasoning_content_in_history, normalize_finish_reason,
         normalize_response, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig, StreamState,
+        OpenAiCompatConfig, REASONING_PLACEHOLDER, StreamState,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1857,8 +1873,9 @@ mod tests {
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
 
         // Then reasoning_content must be present (else the API returns 400).
+        // API 只校验 presence 不读内容,故回传占位符即可。
         let assistant = &payload["messages"][0];
-        assert_eq!(assistant["reasoning_content"], json!("prior reasoning"));
+        assert_eq!(assistant["reasoning_content"], json!(REASONING_PLACEHOLDER));
         assert_eq!(assistant["tool_calls"][0]["id"], json!("call_01_SeY7wrVwpFOzzZR2vM2c9683"));
     }
 

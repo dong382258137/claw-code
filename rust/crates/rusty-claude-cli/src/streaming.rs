@@ -23,7 +23,8 @@ use api::{
     has_thinking_mode_tool_call, model_requires_reasoning_content_in_history, CacheControl,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent,
-    SystemBlock, SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    REASONING_PLACEHOLDER, SystemBlock, SystemContent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use runtime::{
     multi_agent::SubagentCapability, ApiClient, ApiRequest, AssistantEvent, ContentBlock,
@@ -1435,10 +1436,13 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) ->
                 ContentBlock::Thinking { thinking, .. } => {
                     // 普通历史消息剥离 thinking 以节省 context token;仅
                     // `call_01_*` thinking 模式 tool call 的消息需要保留,以便
-                    // translate_message 回传 reasoning_content。
+                    // translate_message 回传 reasoning_content。API 只校验
+                    // presence 不读内容,故只保留占位符,避免把完整 thinking
+                    // 文本克隆进请求管线(省内存;token 由 translate_message
+                    // 侧的占位符保证)。
                     if keep_msg_thinking && !thinking.is_empty() {
                         Some(InputContentBlock::Thinking {
-                            thinking: thinking.clone(),
+                            thinking: REASONING_PLACEHOLDER.to_string(),
                             signature: None,
                         })
                     } else {
@@ -1578,9 +1582,13 @@ mod status_emitter_tests {
         assert_eq!(assistant.role, "assistant");
         assert!(
             assistant.content.iter().any(|b| {
-                matches!(b, InputContentBlock::Thinking { thinking, .. } if thinking == "prior reasoning")
+                matches!(
+                    b,
+                    InputContentBlock::Thinking { thinking, .. }
+                        if thinking == REASONING_PLACEHOLDER
+                )
             }),
-            "thinking 块应保留以回传 reasoning_content"
+            "thinking 块应保留(占位符)以回传 reasoning_content"
         );
     }
 
