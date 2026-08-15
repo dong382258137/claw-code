@@ -1069,7 +1069,14 @@ fn get_framework_switching_section() -> String {
      3. Re-derive from first principles: essential constraint? architectural requirement?\n\
      4. Only then decide to continue or switch.\n\
      \n\
-     This catches architectural bugs that patch-level thinking cannot reach."
+     This catches architectural bugs that patch-level thinking cannot reach.\n\
+     \n\
+     Root-cause analysis: when the goal is to diagnose WHY something failed / \
+     is absent / behaves unexpectedly, invoke the `root-cause-analysis` skill \
+     FIRST. It enforces a hypothesis-driven protocol (define the problem → \
+     generate 2+ hypotheses with falsifiable predictions → run a minimal \
+     discriminating test → converge, or ask the user) instead of unfocused \
+     exploration."
         .to_string()
 }
 fn get_transaction_safety_section() -> String {
@@ -1554,6 +1561,43 @@ mod tests {
             std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))
                 .expect("test cwd should be recoverable");
         }
+    }
+
+    /// 临时诊断:逐段打印 system prompt 的每个 section 字符数,定位上下文膨胀大头。
+    #[test]
+    fn dump_system_prompt_section_sizes() {
+        let builder = SystemPromptBuilder::new()
+            .with_model_family(ModelFamilyIdentity::DeepSeek)
+            .with_os("windows", "11")
+            .with_shell("powershell");
+        let sections = builder.build();
+        let mut total = 0usize;
+        let mut static_total = 0usize;
+        let mut dynamic_total = 0usize;
+        let mut past_boundary = false;
+        eprintln!("=== system prompt sections ({} total) ===", sections.len());
+        for (i, s) in sections.iter().enumerate() {
+            if s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY {
+                eprintln!("[{i:2}] -------- DYNAMIC BOUNDARY --------");
+                past_boundary = true;
+                continue;
+            }
+            let chars = s.chars().count();
+            total += chars;
+            if past_boundary {
+                dynamic_total += chars;
+            } else {
+                static_total += chars;
+            }
+            let head: String = s.chars().take(72).collect();
+            eprintln!("[{i:2}] {chars:6} chars | {head}");
+        }
+        eprintln!(
+            "=== static={static_total} chars (~{} tok) dynamic={dynamic_total} chars (~{} tok) total={total} chars (~{} tok) ===",
+            static_total / 2,
+            dynamic_total / 2,
+            total / 2
+        );
     }
 
     #[test]

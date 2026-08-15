@@ -519,11 +519,11 @@ pub(crate) fn summarize_tool_result(
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let num_matches = parsed_result
-                .get("num_matches")
+                .get("numMatches")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let num_files = parsed_result
-                .get("num_files")
+                .get("numFiles")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             format!("🔎 `{pattern}` · {num_matches}处 / {num_files}文件")
@@ -534,7 +534,7 @@ pub(crate) fn summarize_tool_result(
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let num_files = parsed_result
-                .get("num_files")
+                .get("numFiles")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             format!("🌐 `{pattern}` · {num_files}文件")
@@ -576,6 +576,33 @@ mod tests {
         assert!(grep.contains("🔎 `foo`"), "grep_search 应命中输入摘要: {grep}");
         let glob = summarize_tool_input("glob_search", r#"{"pattern":"*.rs"}"#);
         assert!(glob.contains("🌐 `*.rs`"), "glob_search 应命中输入摘要: {glob}");
+    }
+
+    #[test]
+    fn summarize_tool_result_glob_reads_num_files_camelcase() {
+        // GlobSearchOutput 序列化为 numFiles(camelCase),渲染必须读 numFiles
+        // 而非 num_files(snake_case),否则永远显示 0 文件。
+        let result = r#"{"durationMs":1,"numFiles":42,"filenames":["a.py"],"truncated":false}"#;
+        let summary = summarize_tool_result("glob_search", r#"{"pattern":"**/*.py"}"#, result, false);
+        assert!(
+            summary.contains("42文件"),
+            "glob 结果应显示 numFiles=42, 实际: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_tool_result_grep_reads_num_matches_camelcase() {
+        // GrepSearchOutput 的 num_matches/num_files 序列化为 numMatches/numFiles。
+        let result = r#"{"numFiles":3,"numMatches":7}"#;
+        let summary = summarize_tool_result("grep_search", r#"{"pattern":"foo"}"#, result, false);
+        assert!(
+            summary.contains("7处"),
+            "grep 结果应显示 numMatches=7, 实际: {summary}"
+        );
+        assert!(
+            summary.contains("3文件"),
+            "grep 结果应显示 numFiles=3, 实际: {summary}"
+        );
     }
 
     #[test]

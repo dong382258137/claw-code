@@ -903,13 +903,43 @@ pub fn is_reasoning_model(_model: &str) -> bool {
     false
 }
 
-/// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
-/// assistant reasoning to be echoed back as `reasoning_content` in history.
+/// Returns whether an OpenAI-compatible model requires prior assistant
+/// reasoning to be echoed back as `reasoning_content` in history.
+///
+/// Historically DeepSeek V4 (thinking mode) rejected requests that omitted
+/// `reasoning_content` on tool-call turns (400: "reasoning_content ... must be
+/// passed back"). Empirically verified on 2026-08-15 that the current
+/// deepseek-v4 build no longer enforces this for ordinary turns, so we strip
+/// prior thinking from the request to avoid carrying ~1/3 of assistant tokens
+/// as dead context. However, turns whose tool calls carry the `call_01_*`
+/// prefix (thinking mode) still enforce passback — see
+/// [`has_thinking_mode_tool_call`], which is the per-message gate that
+/// actually decides whether `reasoning_content` is emitted.
+/// Returns `false` for all models.
 #[must_use]
-pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
-    let lowered = model.to_ascii_lowercase();
-    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    canonical.starts_with("deepseek-v4")
+pub fn model_requires_reasoning_content_in_history(_model: &str) -> bool {
+    false
+}
+
+/// Returns true when any tool call id uses the `call_01_` prefix, which
+/// DeepSeek reserves for thinking-mode tool calls.
+///
+/// Empirically (2026-08-15, deepseek-v4 endpoint):
+/// - assistant turn with a `call_01_*` tool call and NO `reasoning_content` in
+///   history → 400 "The `reasoning_content` in the thinking mode must be passed
+///   back to the API".
+/// - the same turn WITH `reasoning_content` → 200.
+/// - `call_00_*` tool calls / pure-text turns (no tool call) → 200 without
+///   reasoning. So only thinking-mode tool-call turns require the echo.
+#[must_use]
+pub fn has_thinking_mode_tool_call<I, S>(tool_call_ids: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    tool_call_ids
+        .into_iter()
+        .any(|id| id.as_ref().starts_with("call_01_"))
 }
 
 /// Strip routing prefix (e.g., "deepseek/deepseek-v4-pro" → "deepseek-v4-pro")
@@ -1162,25 +1192,34 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             let mut text = String::new();
             let mut reasoning = String::new();
             let mut tool_calls = Vec::new();
+            let mut tool_call_ids = Vec::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
                     InputContentBlock::Thinking {
                         thinking: value, ..
                     } => reasoning.push_str(value),
-                    InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": input.to_string(),
-                        }
-                    })),
+                    InputContentBlock::ToolUse { id, name, input } => {
+                        tool_call_ids.push(id.clone());
+                        tool_calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": input.to_string(),
+                            }
+                        }))
+                    }
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            let include_reasoning =
-                model_requires_reasoning_content_in_history(model) && !reasoning.is_empty();
+            // DeepSeek thinking-mode tool calls (`call_01_*`) require the prior
+            // reasoning to be echoed back as `reasoning_content`; omitting it
+            // yields 400. Non-thinking turns don't need it, so we only pay the
+            // context cost when the API actually enforces passback.
+            let include_reasoning = !reasoning.is_empty()
+                && (model_requires_reasoning_content_in_history(model)
+                    || has_thinking_mode_tool_call(&tool_call_ids));
             if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
                 Vec::new()
             } else {
@@ -1672,10 +1711,10 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        model_requires_reasoning_content_in_history, normalize_finish_reason, normalize_response,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
-        StreamState,
+        build_chat_completion_request, chat_completions_endpoint, has_thinking_mode_tool_call,
+        is_reasoning_model, model_requires_reasoning_content_in_history, normalize_finish_reason,
+        normalize_response, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
+        OpenAiCompatConfig, StreamState,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1730,22 +1769,20 @@ mod tests {
     }
 
     #[test]
-    fn model_requires_reasoning_content_in_history_detects_deepseek_v4_models() {
-        // Given DeepSeek V4 and non-V4 model names.
-        let positive = [
+    fn model_requires_reasoning_content_in_history_is_false_for_all_models() {
+        // DeepSeek V4 no longer requires reasoning_content echo-back (verified
+        // empirically 2026-08-15); thinking is stripped to save context tokens.
+        let models = [
             "deepseek-v4-flash",
             "deepseek-v4-pro",
             "deepseek/deepseek-v4-pro",
             "deepseek/deepseek-v4-flash",
+            "deepseek-reasoner",
+            "deepseek-chat",
+            "unknown-model",
         ];
-        let negative = ["deepseek-reasoner", "deepseek-chat", "unknown-model"];
 
-        // When checking whether history reasoning_content is required.
-        // Then only DeepSeek V4 variants require it.
-        for model in positive {
-            assert!(model_requires_reasoning_content_in_history(model));
-        }
-        for model in negative {
+        for model in models {
             assert!(!model_requires_reasoning_content_in_history(model));
         }
     }
@@ -1765,30 +1802,105 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_pro_request_includes_reasoning_content_for_assistant_history() {
+    fn deepseek_v4_pro_request_omits_reasoning_content_for_assistant_history() {
         // Given an assistant history turn containing thinking.
         let request = assistant_history_with_thinking_request("openai/deepseek-v4-pro");
 
         // When serializing for DeepSeek V4 Pro.
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
 
-        // Then reasoning_content is included on the assistant message.
+        // Then reasoning_content is omitted (thinking stripped to save tokens).
         let assistant = &payload["messages"][0];
-        assert_eq!(assistant["reasoning_content"], json!("prior reasoning"));
+        assert!(assistant.get("reasoning_content").is_none());
         assert_eq!(assistant["content"], json!("answer"));
     }
 
     #[test]
-    fn deepseek_v4_flash_request_includes_reasoning_content_for_assistant_history() {
+    fn deepseek_v4_flash_request_omits_reasoning_content_for_assistant_history() {
         // Given an assistant history turn containing thinking.
         let request = assistant_history_with_thinking_request("deepseek-v4-flash");
 
         // When serializing for DeepSeek V4 Flash.
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
 
-        // Then reasoning_content is included on the assistant message.
+        // Then reasoning_content is omitted.
+        let assistant = &payload["messages"][0];
+        assert!(assistant.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn thinking_mode_tool_call_requires_reasoning_content_passback() {
+        // call_01_* 前缀(DeepSeek thinking 模式)必须回传 reasoning_content。
+        // Given an assistant turn with a call_01_* tool call + thinking.
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    InputContentBlock::Thinking {
+                        thinking: "prior reasoning".to_string(),
+                        signature: None,
+                    },
+                    InputContentBlock::ToolUse {
+                        id: "call_01_SeY7wrVwpFOzzZR2vM2c9683".to_string(),
+                        name: "grep_search".to_string(),
+                        input: json!({"pattern": "MACD"}),
+                    },
+                ],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        // When serializing for the DeepSeek endpoint.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
+
+        // Then reasoning_content must be present (else the API returns 400).
         let assistant = &payload["messages"][0];
         assert_eq!(assistant["reasoning_content"], json!("prior reasoning"));
+        assert_eq!(assistant["tool_calls"][0]["id"], json!("call_01_SeY7wrVwpFOzzZR2vM2c9683"));
+    }
+
+    #[test]
+    fn non_thinking_tool_call_omits_reasoning_content() {
+        // call_00_* 前缀(非 thinking 模式)不需要回传 reasoning_content。
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    InputContentBlock::Thinking {
+                        thinking: "prior reasoning".to_string(),
+                        signature: None,
+                    },
+                    InputContentBlock::ToolUse {
+                        id: "call_00_JvIHk6LO4kk0M9XZHAYR0592".to_string(),
+                        name: "grep_search".to_string(),
+                        input: json!({"pattern": "fn main"}),
+                    },
+                ],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        // When serializing for the DeepSeek endpoint.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
+
+        // Then reasoning_content is omitted (stripped to save context tokens).
+        let assistant = &payload["messages"][0];
+        assert!(assistant.get("reasoning_content").is_none());
+        assert_eq!(assistant["tool_calls"][0]["id"], json!("call_00_JvIHk6LO4kk0M9XZHAYR0592"));
+    }
+
+    #[test]
+    fn has_thinking_mode_tool_call_detects_call_01_prefix() {
+        assert!(has_thinking_mode_tool_call(&["call_01_SeY7wrVwpFOzzZR2vM2c9683"]));
+        assert!(!has_thinking_mode_tool_call(&["call_00_JvIHk6LO4kk0M9XZHAYR0592"]));
+        assert!(!has_thinking_mode_tool_call(std::iter::empty::<&str>()));
+        assert!(!has_thinking_mode_tool_call(&["toolu_01_abc"]));
     }
 
     #[test]

@@ -212,18 +212,6 @@ pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<Provide
     let capabilities = provider_capabilities_for_model(&request.model);
     let mut diagnostics = Vec::new();
 
-    if openai_compat::model_requires_reasoning_content_in_history(&request.model) {
-        diagnostics.push(ProviderDiagnostic {
-            code: "deepseek_v4_reasoning_history",
-            severity: ProviderDiagnosticSeverity::Info,
-            message: format!(
-                "Model `{}` requires assistant thinking history to be echoed as `reasoning_content`.",
-                request.model
-            ),
-            action: "Keep prior assistant Thinking blocks in history; the OpenAI-compatible serializer will emit `reasoning_content` for DeepSeek V4 models.".to_string(),
-        });
-    }
-
     if declares_tool(request, "web_search") {
         diagnostics.push(web_passthrough_diagnostic(
             "web_search_passthrough_tool",
@@ -556,7 +544,7 @@ mod tests {
         let deepseek = provider_capabilities_for_model("deepseek-v4-pro");
         assert_eq!(
             deepseek.reasoning_content_history,
-            ProviderFeatureSupport::Supported
+            ProviderFeatureSupport::Unsupported
         );
     }
 
@@ -590,7 +578,6 @@ mod tests {
             .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>();
 
-        assert!(codes.contains(&"deepseek_v4_reasoning_history"));
         assert!(codes.contains(&"web_search_passthrough_tool"));
         assert!(codes.contains(&"web_fetch_passthrough_tool"));
     }
@@ -602,7 +589,7 @@ mod tests {
         assert_eq!(diagnostics.provider, ProviderKind::DeepSeek);
         assert_eq!(diagnostics.auth_env, "DEEPSEEK_API_KEY");
         assert!(diagnostics.openai_compatible);
-        assert!(diagnostics.preserves_reasoning_content_in_history);
+        assert!(!diagnostics.preserves_reasoning_content_in_history);
         assert!(diagnostics.supports_extra_body_params);
         assert!(diagnostics.honors_proxy_env);
         assert!(diagnostics.preserves_slash_model_ids_on_custom_base_url);

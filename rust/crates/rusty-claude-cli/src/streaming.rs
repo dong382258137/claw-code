@@ -20,10 +20,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use api::{
-    model_requires_reasoning_content_in_history, CacheControl, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent, SystemBlock, SystemContent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    has_thinking_mode_tool_call, model_requires_reasoning_content_in_history, CacheControl,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent,
+    SystemBlock, SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
     multi_agent::SubagentCapability, ApiClient, ApiRequest, AssistantEvent, ContentBlock,
@@ -1419,16 +1419,24 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) ->
             MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
             MessageRole::Assistant => "assistant",
         };
+        // DeepSeek thinking 模式的 tool call(`call_01_*` 前缀)要求历史 assistant
+        // 消息必须回传 reasoning_content,否则 400。此类消息保留 thinking 块,
+        // 由 translate_message 作为 reasoning_content 发出;其余消息继续剥离以
+        // 节省 context token。
+        let thinking_mode_tool_call = message.blocks.iter().any(|b| {
+            matches!(b, ContentBlock::ToolUse { id, .. } if has_thinking_mode_tool_call(&[id]))
+        });
+        let keep_msg_thinking = keep_thinking || thinking_mode_tool_call;
         let content = message
             .blocks
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
                 ContentBlock::Thinking { thinking, .. } => {
-                    // 仅在 keep_thinking 且 thinking 内容非空时才回传。
-                    // 空的 thinking 内容会被 DeepSeek 的 thinking 模式拒绝
-                    // (400: reasoning_content must be passed back)。
-                    if keep_thinking && !thinking.is_empty() {
+                    // 普通历史消息剥离 thinking 以节省 context token;仅
+                    // `call_01_*` thinking 模式 tool call 的消息需要保留,以便
+                    // translate_message 回传 reasoning_content。
+                    if keep_msg_thinking && !thinking.is_empty() {
                         Some(InputContentBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: None,
@@ -1523,5 +1531,86 @@ mod status_emitter_tests {
         emitter(StatusEvent::StreamStart);
         emitter(StatusEvent::MessageStop);
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    fn conv_msg(role: MessageRole, blocks: Vec<ContentBlock>) -> ConversationMessage {
+        ConversationMessage {
+            role,
+            blocks,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn convert_messages_keeps_thinking_for_thinking_mode_tool_call() {
+        // DeepSeek thinking 模式的 tool call(`call_01_*`)必须保留 thinking,
+        // 以便 translate_message 回传 reasoning_content(否则 API 400)。
+        let msgs = vec![
+            conv_msg(
+                MessageRole::Assistant,
+                vec![
+                    ContentBlock::Thinking {
+                        thinking: "prior reasoning".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_01_SeY7wrVwpFOzzZR2vM2c9683".to_string(),
+                        name: "grep_search".to_string(),
+                        input: "{\"pattern\":\"MACD\"}".to_string(),
+                    },
+                ],
+            ),
+            conv_msg(
+                MessageRole::Tool,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_01_SeY7wrVwpFOzzZR2vM2c9683".to_string(),
+                    tool_name: "grep_search".to_string(),
+                    output: "{}".to_string(),
+                    is_error: false,
+                }],
+            ),
+        ];
+        let converted = convert_messages(&msgs, "deepseek-v4-flash");
+
+        // 首个 assistant 消息应保留 Thinking 块(与 ToolUse 同消息)。
+        assert_eq!(converted.len(), 2);
+        let assistant = &converted[0];
+        assert_eq!(assistant.role, "assistant");
+        assert!(
+            assistant.content.iter().any(|b| {
+                matches!(b, InputContentBlock::Thinking { thinking, .. } if thinking == "prior reasoning")
+            }),
+            "thinking 块应保留以回传 reasoning_content"
+        );
+    }
+
+    #[test]
+    fn convert_messages_strips_thinking_for_non_thinking_tool_call() {
+        // call_00_* 前缀(非 thinking 模式)不需要回传 reasoning,thinking 仍剥离。
+        let msgs = vec![conv_msg(
+            MessageRole::Assistant,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "prior reasoning".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_00_JvIHk6LO4kk0M9XZHAYR0592".to_string(),
+                    name: "grep_search".to_string(),
+                    input: "{\"pattern\":\"fn main\"}".to_string(),
+                },
+            ],
+        )];
+        let converted = convert_messages(&msgs, "deepseek-v4-flash");
+
+        assert_eq!(converted.len(), 1);
+        let assistant = &converted[0];
+        assert!(
+            !assistant
+                .content
+                .iter()
+                .any(|b| matches!(b, InputContentBlock::Thinking { .. })),
+            "非 thinking 模式的 thinking 块应被剥离以节省 context token"
+        );
     }
 }

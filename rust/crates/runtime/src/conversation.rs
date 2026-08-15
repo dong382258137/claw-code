@@ -1189,6 +1189,26 @@ pub const SOFT_MAX_ITERATIONS: usize = 64;
 /// 子代理(subagent)单独走 `DEFAULT_AGENT_MAX_ITERATIONS`(32)。
 pub const DEFAULT_MAX_ITERATIONS: usize = 192;
 
+/// 复杂任务单 turn 的软迭代阈值。
+///
+/// 与 [`SOFT_MAX_ITERATIONS`] 同义,但用于复杂任务(见
+/// [`COMPLEX_MAX_ITERATIONS`])。复杂任务的合法推进链更长,软警告需在
+/// 更晚的轮次注入,避免在任务仍持续推进时过早打断。
+pub const COMPLEX_SOFT_MAX_ITERATIONS: usize = 256;
+
+/// 复杂任务单 turn 的最大迭代次数(硬上限护栏)。
+///
+/// 史诗级多文件重构(如 EPIC-062 三层解耦,单 turn 192+ 次工具调用)会触发
+/// [`DEFAULT_MAX_ITERATIONS`] 硬上限,把**已成功执行**的合法长程任务误判为
+/// runaway loop(2026-08-15 实测误杀:9 个子任务、17 个文件的重构恰好用满
+/// 192 次迭代,在 notebook_update 完成后的第 193 次迭代检查被中止)。
+///
+/// 复杂任务(输入超长/命中复杂关键词/存在活跃 plan)使用更高的上限,避免误杀;
+/// 工具循环内还有"持续推进豁免"(写操作成功即放宽),覆盖"确认"这类短输入但
+/// 实际执行长程重构的 turn。真正的 runaway loop(反复相同 input/output)
+/// 仍由 [`LoopDetector`] 精确拦截,不依赖迭代计数兜底。
+pub const COMPLEX_MAX_ITERATIONS: usize = 1024;
+
 /// 工具调用循环检测的跨 turn 保留窗口(15 分钟)。
 /// 窗口内相同工具调用跨 turn 累积计数;超过窗口未出现则衰减清零。
 pub const LOOP_DECAY_WINDOW_MS: u64 = 15 * 60 * 1000;
@@ -2989,26 +3009,45 @@ where
         // for 工具循环退出后据此跳出主循环,让 turn 以成功结果正常收尾。
         let mut branch_retry_success = false;
 
+        // 复杂任务调高迭代上限(软硬双层)。
+        // 除静态识别(输入超长/命中复杂关键词/存在活跃 plan)外,工具循环内
+        // 还会做"持续推进豁免"(写操作成功即放宽硬上限),覆盖"确认"这类短输入
+        // 但实际执行长程重构的 turn(EPIC-062 误杀场景)。
+        let is_complex_turn = matches!(
+            assess_complexity(&user_input),
+            ComplexityAssessment::Complex { .. }
+        ) || self.active_plan.is_some();
+        let turn_soft_max = if is_complex_turn {
+            COMPLEX_SOFT_MAX_ITERATIONS
+        } else {
+            SOFT_MAX_ITERATIONS
+        };
+        let mut turn_hard_max = if is_complex_turn {
+            COMPLEX_MAX_ITERATIONS
+        } else {
+            self.max_iterations
+        };
+
         loop {
             iterations += 1;
             self.emit_diag(format!("[diag] loop_start iter={iterations}"));
-            // 软阈值(SOFT_MAX_ITERATIONS):达到时注入收敛警告,不中止。
+            // 软阈值:达到时注入收敛警告,不中止。
             // 模型在下一轮迭代即可看到该消息,被引导总结已有发现或询问用户,
             // 避免"合法的长程分析仍在推进却被硬上限误杀"。仅在恰好的轮次
             // 触发一次,注入失败静默吞错(不阻断主流程)。
-            if iterations == SOFT_MAX_ITERATIONS {
+            if iterations == turn_soft_max {
                 let warning = format!(
                     "[runtime] 已运行 {} 次迭代仍未收敛。若已接近结论,请总结 \
                      已有发现并输出最终答案;否则请改变策略或询问用户方向。",
-                    SOFT_MAX_ITERATIONS
+                    turn_soft_max
                 );
                 let _ = self
                     .session
                     .push_message(ConversationMessage::user_text(warning));
             }
 
-            // 硬上限(max_iterations):真正中止。
-            if iterations > self.max_iterations {
+            // 硬上限:真正中止。
+            if iterations > turn_hard_max {
                 // BUG-3 修复(升级):超限错误携带诊断上下文。
                 // 原实现裸错误,下一 turn 不知道上次为什么卡住 → 跨 turn 死循环
                 // 仍可能复发。现在错误明确指向 NOTEBOOK <attempted> 段
@@ -3018,7 +3057,7 @@ where
                      Turn aborted to prevent a runaway loop; failed attempts are \
                      recorded in the NOTEBOOK <attempted> section. Change strategy \
                      or ask the user before retrying.",
-                    self.max_iterations
+                    turn_hard_max
                 ));
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
@@ -4077,6 +4116,19 @@ where
                         self.emit_diag(format!(
                             "[diag] tool_done iter={iterations} name={name} is_error={is_err}"
                         ));
+                        // 持续推进豁免:写操作成功 = 长程重构在推进(而非空转),
+                        // 放宽硬上限。覆盖"确认"这类短输入但实际执行多任务重构
+                        // 的 turn(EPIC-062 恰好用满 192 次被误杀的根因)。
+                        // 真正的 runaway loop(反复相同 input/output)仍由
+                        // LoopDetector 精确拦截,不依赖迭代计数兜底。
+                        if !is_err
+                            && matches!(
+                                name.as_str(),
+                                "write_file" | "edit_file" | "replace_lines"
+                            )
+                        {
+                            turn_hard_max = turn_hard_max.max(COMPLEX_MAX_ITERATIONS);
+                        }
                     }
                 }
                 tool_results.push(result_message);
@@ -7123,8 +7175,9 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
 /// 解析失败或字段缺失时返回 None,不阻断主流程。
 fn extract_file_path_from_tool_input(tool_name: &str, tool_input: &str) -> Option<String> {
     // 只关心会修改文件的工具,避免 Read/Grep 等只读工具误计数。
-    let modifying_tools = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
-    if !modifying_tools.contains(&tool_name) {
+    // 复用 is_file_modifying_tool:dispatch 链使用小写工具名(write_file/edit_file),
+    // 原硬编码仅大写驼峰导致 record_edit 的"同文件编辑 doom loop"通道失效。
+    if !is_file_modifying_tool(tool_name) {
         return None;
     }
     let parsed: serde_json::Value = serde_json::from_str(tool_input).ok()?;
@@ -7176,7 +7229,7 @@ mod tests {
     use super::{
         build_assistant_message, build_branch_retry_task, build_subagent_request,
         build_subagent_retry_context, build_subagent_system_prompt,
-        compaction_threshold_for_context_window,
+        compaction_threshold_for_context_window, extract_file_path_from_tool_input,
         default_subagent_tool_catalog, is_repetition_warning, microcompact_preserve_recent,
         parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, process_tool_uses,
         rewrite_path_to_workspace_relative, ApiClient, ApiRequest, AssistantEvent,
@@ -7218,6 +7271,24 @@ mod tests {
         LANE_EVENT_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 层 1 回归:小写 dispatch 工具名(write_file/edit_file)必须被识别为文件
+    /// 修改工具,否则 record_edit 的"同文件编辑 doom loop"通道在小写链失效。
+    #[test]
+    fn extract_file_path_recognizes_lowercase_write_file() {
+        assert_eq!(
+            extract_file_path_from_tool_input("write_file", r#"{"file_path":"/x/a.py"}"#)
+                .as_deref(),
+            Some("/x/a.py")
+        );
+        assert_eq!(
+            extract_file_path_from_tool_input("edit_file", r#"{"file_path":"/x/b.rs"}"#)
+                .as_deref(),
+            Some("/x/b.rs")
+        );
+        // 只读工具仍应返回 None(不改文件,不进入 record_edit)。
+        assert!(extract_file_path_from_tool_input("read_file", r#"{"file_path":"/x/a.py"}"#).is_none());
     }
 
     /// parse_capability:缺失/未知默认 ReadOnly(避免 Analyze 空工具白名单),显式值精确解析。
@@ -8254,6 +8325,112 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
+    }
+
+    #[test]
+    fn write_success_relaxes_hard_limit_for_progressive_turn() {
+        // 持续推进豁免:短输入(Simple)但工具循环内 write_file 成功,说明长程
+        // 重构在推进(而非空转),硬上限应从 self.max_iterations 放宽到
+        // COMPLEX_MAX_ITERATIONS,避免 EPIC-062 这类"恰好用满默认上限"的
+        // 合法长程任务被误杀。
+        struct ProgressiveWriteApi {
+            remaining: usize,
+        }
+
+        impl ApiClient for ProgressiveWriteApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if self.remaining == 0 {
+                    // 自然收敛:无 tool_use,循环结束。
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                self.remaining -= 1;
+                let n = self.remaining;
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: format!("tool-{n}"),
+                        name: "write_file".to_string(),
+                        input: format!("payload-{n}"),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // 默认硬上限设得很小(3),模拟 192 的放大场景。write_file 成功应
+        // 放宽到 COMPLEX_MAX_ITERATIONS,使 6 次写操作远超 3 也不中止。
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ProgressiveWriteApi { remaining: 6 },
+            StaticToolExecutor::new()
+                .register("write_file", |input| Ok(format!("created {input}"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(3);
+
+        // when:短输入(Simple),但工具循环持续推进。
+        let result = runtime.run_turn("继续", None);
+
+        // then:不应被硬上限误杀,循环自然收敛返回 Ok。
+        if let Err(err) = &result {
+            panic!("写操作持续推进应放宽硬上限,不应被误杀: {err}");
+        }
+    }
+
+    #[test]
+    fn complex_input_uses_extended_hard_limit() {
+        // 复杂任务(输入超长)静态识别:直接使用 COMPLEX_MAX_ITERATIONS,
+        // 而非 self.max_iterations,避免史诗级任务被默认上限误杀。
+        struct EchoLoopApi {
+            remaining: usize,
+        }
+
+        impl ApiClient for EchoLoopApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if self.remaining == 0 {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                self.remaining -= 1;
+                let n = self.remaining;
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: format!("tool-{n}"),
+                        name: "echo".to_string(),
+                        input: format!("payload-{n}"),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // 输入超长(> 200 字符)触发 Complex;即使 with_max_iterations 设 3,
+        // Complex 也覆盖为 COMPLEX_MAX_ITERATIONS,6 次 echo 不会中止。
+        let long_input = "重构".repeat(120);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EchoLoopApi { remaining: 6 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(3);
+
+        let result = runtime.run_turn(&long_input, None);
+        if let Err(err) = &result {
+            panic!("复杂输入应使用更高迭代上限,不应被默认上限误杀: {err}");
+        }
     }
 
     #[test]

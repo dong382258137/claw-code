@@ -1093,7 +1093,7 @@ fn grep_search_impl(
     let output_mode = input
         .output_mode
         .clone()
-        .unwrap_or_else(|| String::from("files_with_matches"));
+        .unwrap_or_else(|| String::from("content"));
     let context = input.context.or(input.context_short).unwrap_or(0);
 
     let mut filenames = Vec::new();
@@ -1353,11 +1353,58 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
+/// 解析 Git Bash / MSYS 风格的盘符路径。
+///
+/// 返回 `Some((盘符, 子路径))`:
+/// - `/d/chanlunV2/chanlun_py` → `Some(("d", "chanlunV2/chanlun_py"))`
+/// - `/d`(盘符根) → `Some(("d", ""))`
+/// - 非盘符形式(`/tmp/foo`、`D:\\...`、相对路径) → `None`
+fn parse_git_bash_drive(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix('/')?;
+    let (drive, sub) = match rest.split_once('/') {
+        Some((d, s)) if d.len() == 1 && d.as_bytes()[0].is_ascii_alphabetic() => (d, s),
+        _ => {
+            if rest.len() == 1 && rest.as_bytes()[0].is_ascii_alphabetic() {
+                (rest, "")
+            } else {
+                return None;
+            }
+        }
+    };
+    Some((drive.to_string(), sub.to_string()))
+}
+
+/// 将 Git Bash 风格路径转换为 Windows 绝对路径(仅 Windows 生效)。
+///
+/// 例如 `/d/chanlunV2/chanlun_py` → `D:\chanlunV2\chanlun_py`。
+/// 仅当盘符对应的驱动器真实存在时才转换,避免把 `/tmp/...`、`/usr/...`
+/// 等 POSIX 相对路径误转成不存在的盘符(如 `T:\`)。非盘符形式原样返回。
+#[cfg(windows)]
+fn convert_git_bash_path(path: &str) -> String {
+    let Some((drive, sub)) = parse_git_bash_drive(path) else {
+        return path.to_string();
+    };
+    let drive_root = format!(r"{drive}:\");
+    if !Path::new(&drive_root).exists() {
+        return path.to_string();
+    }
+    if sub.is_empty() {
+        return drive_root;
+    }
+    format!(r"{drive}:\{}", sub.replace('/', "\\"))
+}
+
+#[cfg(not(windows))]
+fn convert_git_bash_path(path: &str) -> String {
+    path.to_string()
+}
+
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
+    let converted = convert_git_bash_path(path);
+    let candidate = if Path::new(&converted).is_absolute() {
+        PathBuf::from(converted)
     } else {
-        std::env::current_dir()?.join(path)
+        std::env::current_dir()?.join(converted)
     };
     candidate.canonicalize()
 }
@@ -1381,10 +1428,11 @@ fn normalize_path_friendly(raw_path: &str, tool_name: &str) -> io::Result<PathBu
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
+    let converted = convert_git_bash_path(path);
+    let candidate = if Path::new(&converted).is_absolute() {
+        PathBuf::from(converted)
     } else {
-        std::env::current_dir()?.join(path)
+        std::env::current_dir()?.join(converted)
     };
 
     if let Ok(canonical) = candidate.canonicalize() {
@@ -1580,9 +1628,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, replace_lines,
-        write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        component_contains_glob, convert_git_bash_path, derive_glob_walk_root, edit_file,
+        expand_braces, glob_search, grep_search, is_symlink_escape, normalize_path,
+        parse_git_bash_drive, read_file, read_file_in_workspace, replace_lines, write_file,
+        GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1944,6 +1993,27 @@ mod tests {
     }
 
     #[test]
+    fn glob_search_double_star_recursive() {
+        let dir = temp_path("glob-doublestar");
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::write(dir.join("a/b/c/deep.py"), "").unwrap();
+        std::fs::write(dir.join("top.py"), "").unwrap();
+        std::fs::write(dir.join("a/mid.py"), "").unwrap();
+
+        let result =
+            glob_search("**/*.py", Some(dir.to_str().unwrap())).expect("glob should succeed");
+        eprintln!(
+            "double-star num_files={} filenames={:?}",
+            result.num_files, result.filenames
+        );
+        assert_eq!(
+            result.num_files, 3,
+            "**/*.py should recursively find all .py files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn glob_search_skips_common_heavy_directories() {
         let dir = temp_path("glob-ignored-dirs");
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -2182,6 +2252,105 @@ mod tests {
             "错误应包含 glob_search 建议;实际: {msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:grep_search 省略 output_mode 时,默认应返回 content(匹配行),
+    /// 与工具 schema 文档 "content (default)" 一致,而非文件名列表。
+    /// 修复前默认是 files_with_matches,导致模型拿不到匹配行被迫重试。
+    #[test]
+    fn grep_default_output_mode_is_content() {
+        let dir = temp_path("grep-default-content");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("a.rs"), "fn marker_alpha() {}\nfn other() {}\n").expect("write");
+
+        let input = GrepSearchInput {
+            pattern: "marker".to_string(),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: Some("*.rs".to_string()),
+            output_mode: None, // 不指定,走默认
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: Some(false),
+            case_insensitive: Some(false),
+            file_type: None,
+            head_limit: Some(10),
+            offset: Some(0),
+            multiline: Some(false),
+        };
+        let out = grep_search(&input).expect("grep");
+        let content = out.content.unwrap_or_default();
+        assert!(
+            content.contains("marker_alpha"),
+            "默认 output_mode 应为 content,需包含匹配行;实际: {:?}",
+            content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归:Git Bash 盘符路径解析(纯解析,跨平台)。
+    #[test]
+    fn parse_git_bash_drive_parses_drive_paths() {
+        assert_eq!(
+            parse_git_bash_drive("/d/chanlunV2/chanlun_py"),
+            Some(("d".to_string(), "chanlunV2/chanlun_py".to_string()))
+        );
+        assert_eq!(
+            parse_git_bash_drive("/c/Program Files/x"),
+            Some(("c".to_string(), "Program Files/x".to_string()))
+        );
+        assert_eq!(parse_git_bash_drive("/d"), Some(("d".to_string(), "".to_string())));
+        assert_eq!(parse_git_bash_drive("/d/"), Some(("d".to_string(), "".to_string())));
+        // 非盘符形式返回 None
+        assert_eq!(parse_git_bash_drive("/tmp/foo"), None);
+        assert_eq!(parse_git_bash_drive("/usr/bin"), None);
+        assert_eq!(parse_git_bash_drive("/12/foo"), None);
+        assert_eq!(parse_git_bash_drive(r"D:\chanlunV2"), None);
+        assert_eq!(parse_git_bash_drive("chanlunV2/chanlun_py"), None);
+        assert_eq!(parse_git_bash_drive(""), None);
+    }
+
+    /// 回归:Git Bash 风格路径应转换为 Windows 绝对路径(仅 Windows 生效)。
+    #[test]
+    fn convert_git_bash_path_to_windows() {
+        #[cfg(windows)]
+        {
+            // D: 存在(本机工作区盘符)→ 转换
+            assert_eq!(convert_git_bash_path("/d/chanlunV2/chanlun_py"), r"d:\chanlunV2\chanlun_py");
+            // 盘符根 /c → c:\ (C: 几乎总是存在;盘符保留小写,Windows 不区分)
+            if std::path::Path::new(r"C:\").exists() {
+                assert_eq!(convert_git_bash_path("/c"), r"c:\");
+            }
+            // 不存在的盘符(如 T:)或非盘符形式 → 原样返回,不做误转换
+            assert_eq!(convert_git_bash_path("/tmp/foo"), "/tmp/foo");
+            assert_eq!(convert_git_bash_path(r"D:\chanlunV2"), r"D:\chanlunV2");
+            assert_eq!(convert_git_bash_path("chanlunV2/chanlun_py"), "chanlunV2/chanlun_py");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(convert_git_bash_path("/d/chanlunV2/chanlun_py"), "/d/chanlunV2/chanlun_py");
+            assert_eq!(convert_git_bash_path("/tmp/foo"), "/tmp/foo");
+        }
+    }
+
+    /// 回归:normalize_path 接受 Git Bash 风格路径并解析到真实文件(仅 Windows 生效)。
+    #[test]
+    fn normalize_path_accepts_git_bash_drive_path() {
+        #[cfg(windows)]
+        {
+            let dir = temp_path("grep-gitbash");
+            std::fs::create_dir_all(&dir).expect("dir");
+            let dir_str = dir.to_str().unwrap();
+            // 转成 Git Bash 风格,例如 D:\...\grep-gitbash → /d/.../grep-gitbash
+            let drive = dir_str.chars().next().unwrap();
+            let rest = &dir_str[2..];
+            let bash_style = format!("/{}{}", drive.to_ascii_lowercase(), rest.replace('\\', "/"));
+
+            let normalized = normalize_path(&bash_style).expect("git-bash 路径应能归一化");
+            assert_eq!(normalized, normalize_path(dir_str).expect("windows 路径应能归一化"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// 回归:totalFilesBeforeLimit 在截断时上报真实总数(诊断假阴性)。
