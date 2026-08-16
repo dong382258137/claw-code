@@ -33,6 +33,9 @@ use std::sync::{Arc, OnceLock};
 /// 触发 plan 子调用的用户输入字符数阈值(粗略估算多文件预期)。
 pub const COMPLEX_TASK_INPUT_CHARS_THRESHOLD: usize = 200;
 
+/// `create_plan` 工具 task_summary 的最大字符数(防止超长任务摘要撑爆 prompt)。
+pub const PLAN_SUMMARY_MAX_CHARS: usize = 1200;
+
 /// 触发 plan 的关键词(用户输入包含任一即视为复杂任务)。
 pub const COMPLEX_TASK_KEYWORDS: &[&str] = &[
     "multiple files",

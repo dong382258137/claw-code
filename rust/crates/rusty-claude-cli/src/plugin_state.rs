@@ -691,6 +691,41 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["memory".to_string(), "tool-result-archive".to_string()],
     });
+    // create_plan:复杂任务判定交给模型自主决定(2026-08-16)。
+    // 框架不再用启发式规则(字符数阈值 + 关键词 substring)在 run_turn 入口
+    // 自动创建 PlanArtifact —— 启发式规则存在漏判(短输入多文件任务)与误判
+    // (长输入但仅需解释/否定语境)。改为模型在执行过程中判断任务足够复杂时
+    // 主动调用本工具创建计划,框架随后进入 Plan/Execute/Review 循环。
+    // 执行由 ConversationRuntime::run_turn 拦截,调用
+    // execute_create_plan 生成 steps(LLM-driven,失败回退启发式 decompose_task)。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "create_plan".to_string(),
+        description: Some(
+            "Create a structured execution plan for a task that is complex, \
+             multi-step, or spans multiple files. Use your judgment: call this \
+             when the task would benefit from an ordered, staged sequence of \
+             changes with verification between phases (e.g. refactoring across \
+             several modules, a multi-file feature, or a task where you'd otherwise \
+             iterate many times). Do NOT call for trivial one-file edits or \
+             read-only questions. Returns a plan_id; the plan is injected into \
+             your context and used to guide execution with verification between \
+             steps. Optional: pass a plan_description describing what to plan \
+             (defaults to the latest user input)."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan_description": {
+                    "type": "string",
+                    "description": "Optional description of the task to plan. Defaults to the latest user input if omitted."
+                }
+            },
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["orchestration".to_string(), "planning".to_string()],
+    });
     // Epic 2:注册 dispatch_subagent / check_subagent 工具 — subagent-as-tool 路由。
     // 主 agent 通过 dispatch_subagent 派发子 agent(独立 LLM 请求 + 独立 prompt cache,
     // 不污染主 agent 缓存,详见 plan.md §5.2)。check_subagent 查询状态/结果。

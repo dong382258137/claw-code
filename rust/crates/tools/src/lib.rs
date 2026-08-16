@@ -364,6 +364,14 @@ fn global_dag_store() -> &'static dag::DagStore {
     STORE.get_or_init(dag::DagStore::new)
 }
 
+/// 注册一个 DAG 定义,供 `dag_define` 工具与启动时 YAML loader 复用。
+///
+/// 转发到 [`global_dag_store`] 的 [`DagStore::create_dag`],是生产代码中唯一
+/// 写入 DAG 定义的入口(此前 `create_dag` 仅在测试中被调用)。
+pub fn register_dag(dag: dag::Dag) -> Result<String, String> {
+    global_dag_store().create_dag(dag)
+}
+
 /// v0.2 生产接入:全局 CoordinatorExecutor registry。
 ///
 /// 由 app.rs 在 runtime 构造后调用 [`set_coordinator_executor`] 注入。
@@ -1643,6 +1651,48 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "dag_define",
+            description: "Register a DAG (Directed Acyclic Graph) definition for later execution via dag_run. Provide a unique dag_id and a nodes array; each node needs an id and task, and may specify depends_on (node ids that must finish first), acceptance_criteria, verify_command, max_retries, mode (fork/teammate/worktree), capability (analyze/read-only/execute). Run validation (dependency references + cycle check) and return dag_id on success. Use before dag_run.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "dag_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "label": { "type": "string" },
+                                "task": { "type": "string" },
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                },
+                                "acceptance_criteria": { "type": "string" },
+                                "verify_command": { "type": "string" },
+                                "max_retries": { "type": "integer" },
+                                "mode": {
+                                    "type": "string",
+                                    "enum": ["fork", "teammate", "worktree"]
+                                },
+                                "capability": {
+                                    "type": "string",
+                                    "enum": ["analyze", "read-only", "execute"]
+                                }
+                            },
+                            "required": ["id", "task"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["dag_id", "nodes"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "dag_run",
             description: "Start or continue a DAG (Directed Acyclic Graph) execution run. Use action: 'start' to begin, or action: 'continue' to resume.",
             input_schema: json!({
@@ -1972,6 +2022,7 @@ fn execute_tool_with_enforcer(
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
+        "dag_define" => from_value::<dag::DagDefineInput>(input).and_then(run_dag_define),
         "dag_run" => from_value::<dag::DagRunInput>(input).and_then(run_dag_run),
         "dag_status" => from_value::<dag::DagStatusInput>(input).and_then(run_dag_status),
         "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
@@ -3829,6 +3880,15 @@ impl ImBridgeServiceOutput {
 struct EnterPlanModeInput {}
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_dag_define(input: dag::DagDefineInput) -> Result<String, String> {
+    let dag = dag::build_dag_from_define(input)?;
+    // 环检测:petgraph Kosaraju SCC,有环则拒绝注册(避免死循环执行)。
+    let graph = dag::DagGraph::from_dag(&dag);
+    graph.validate_acyclic().map_err(|e| e.to_string())?;
+    let id = register_dag(dag)?;
+    Ok(format!("ok: registered DAG '{id}'"))
+}
+
 fn run_dag_run(input: dag::DagRunInput) -> Result<String, String> {
     let store = global_dag_store();
     match input.action.as_deref().unwrap_or("start") {
@@ -8953,6 +9013,59 @@ mod tests {
         assert!(poisoned.is_err(), "poisoning thread should panic");
 
         let _guard = env_guard();
+    }
+
+    #[test]
+    fn dag_define_registers_and_dag_run_finds_dag() {
+        // 定义 DAG:analyze → implement → test(依赖链)
+        let define = json!({
+            "dag_id": "e2e-pipeline",
+            "name": "E2E Pipeline",
+            "nodes": [
+                {"id": "analyze", "task": "分析代码", "depends_on": []},
+                {"id": "implement", "task": "实现修复", "depends_on": ["analyze"]},
+                {"id": "test", "task": "运行测试", "depends_on": ["implement"],
+                 "verify_command": "cargo test", "max_retries": 3}
+            ]
+        });
+        let out = execute_tool("dag_define", &define).expect("dag_define should succeed");
+        assert!(out.contains("registered DAG 'e2e-pipeline'"), "unexpected: {out}");
+
+        // 重复注册同一 id 应失败
+        let dup = execute_tool("dag_define", &define);
+        assert!(dup.is_err(), "duplicate dag_id should be rejected");
+
+        // dag_run start:未注入 CoordinatorExecutor → 回退 stub,但应能找到 DAG 并启动 run
+        let run = json!({"dag_id": "e2e-pipeline", "action": "start"});
+        let run_out = execute_tool("dag_run", &run).expect("dag_run should start");
+        assert!(run_out.contains("e2e-pipeline"), "unexpected: {run_out}");
+    }
+
+    #[test]
+    fn dag_define_rejects_unknown_dependency() {
+        let define = json!({
+            "dag_id": "bad-dag",
+            "nodes": [{"id": "n1", "task": "t", "depends_on": ["ghost"]}]
+        });
+        let err = execute_tool("dag_define", &define).expect_err("should reject unknown dep");
+        assert!(err.contains("unknown node 'ghost'"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn dag_define_rejects_cycle() {
+        // n1 依赖 n2,n2 依赖 n1 → 环,应被 validate_acyclic 拒绝
+        let define = json!({
+            "dag_id": "cycle-dag",
+            "nodes": [
+                {"id": "n1", "task": "t1", "depends_on": ["n2"]},
+                {"id": "n2", "task": "t2", "depends_on": ["n1"]}
+            ]
+        });
+        let err = execute_tool("dag_define", &define).expect_err("should reject cycle");
+        assert!(
+            err.contains("cycle") || err.contains("cyclic"),
+            "unexpected: {err}"
+        );
     }
 
     fn temp_path(name: &str) -> PathBuf {

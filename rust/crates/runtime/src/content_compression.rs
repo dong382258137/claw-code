@@ -698,6 +698,128 @@ fn extract_log_pattern(line: &str) -> String {
     }
 }
 
+// ============================================================================
+// 即时压缩(bash / read_file 大输出在入库前压缩)
+// ============================================================================
+//
+// 与 microcompact(旧结果压缩)互补:本函数在**结果刚产生**、即将进入活跃窗口
+// 时,就把超阈值的大输出压成结构化摘要,避免大输出原样占用上下文。
+// 压缩前必须归档原始内容(调用方持有 workspace_root 执行归档),
+// 压缩摘要带 `recall_full` 指针,LLM 可按 tool_use_id 取回全文 —— 压缩可逆。
+
+/// bash 即时压缩阈值(字节):stdout+stderr 合并内容超过此值才压缩。
+/// 低于此值保留原文 —— 短输出模型常需精确内容,压缩反而造成重复查询。
+const BASH_IMMEDIATE_COMPRESS_MIN_BYTES: usize = 12_000;
+/// read_file 即时压缩阈值(行数):content 行数超过此值才走 Code 压缩。
+const READ_IMMEDIATE_COMPRESS_MIN_LINES: usize = 300;
+/// read_file 即时压缩阈值(字节):content 字节数超过此值也走 Code 压缩。
+const READ_IMMEDIATE_COMPRESS_MIN_BYTES: usize = 30_000;
+
+/// 即时压缩入口:对 bash/read_file 的大输出在入库前压缩。
+///
+/// 仅当:
+/// - 工具是 bash / read_file
+/// - 非错误输出(错误输出保留原文,供模型诊断)
+/// - 输出未压缩过(避免双重压缩)
+/// - 输出超过阈值(短输出保留原文)
+///
+/// 返回 `(要入库的 output, 是否应归档原始 output)`。
+/// 归档由调用方执行(conversation.rs 持有 workspace_root)。
+#[must_use]
+pub fn maybe_immediate_compress(
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &str,
+    output: &str,
+    is_error: bool,
+) -> (String, bool) {
+    let is_bash = tool_name.eq_ignore_ascii_case("bash");
+    let is_read = tool_name.eq_ignore_ascii_case("read_file")
+        || tool_name.eq_ignore_ascii_case("Read");
+    if (!is_bash && !is_read) || is_error || is_summary_placeholder(output) {
+        return (output.to_string(), false);
+    }
+    if is_bash {
+        compress_bash_envelope(tool_use_id, tool_name, input, output)
+    } else {
+        compress_read_envelope(tool_use_id, tool_name, input, output)
+    }
+}
+
+/// 判断 output 是否已是压缩占位符(与 compact.rs::is_already_summarized 同规则)。
+fn is_summary_placeholder(output: &str) -> bool {
+    output.starts_with('[')
+        && output.contains(" summarized: ")
+        && output.ends_with("…]")
+        && output.contains(" chars → ")
+}
+
+/// Bash 即时压缩:解析 BashCommandOutput JSON 信封,提取 stdout+stderr 压缩。
+fn compress_bash_envelope(
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &str,
+    output: &str,
+) -> (String, bool) {
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        return (output.to_string(), false);
+    };
+    let stdout = value.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let stderr = value.get("stderr").and_then(Value::as_str).unwrap_or("");
+    let combined = if stderr.is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    if combined.len() < BASH_IMMEDIATE_COMPRESS_MIN_BYTES {
+        return (output.to_string(), false);
+    }
+    // 内容感知路由:Log(构建/测试日志)、JSON(结构化输出)、Tabular、Text 各有专用压缩器。
+    let summary = format_summary(tool_name, tool_use_id, input, &combined);
+    (summary, true)
+}
+
+/// Read 即时压缩:解析 ReadFileOutput JSON 信封,提取 file.content 走 Code 压缩。
+///
+/// 仅对**代码文件**压缩(Code 压缩器提取签名);文档/配置等非代码保留原文,
+/// 由截断逻辑(200 头 + 50 尾行)兜底 —— 对文档,保留整段文本比 3 行摘要更有用。
+/// 部分读取(offset/limit 只读某区间)也保留原文 —— 模型明确只想要这段,
+/// 压缩会丢失精确内容。
+fn compress_read_envelope(
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &str,
+    output: &str,
+) -> (String, bool) {
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        return (output.to_string(), false);
+    };
+    let Some(file) = value.get("file") else {
+        return (output.to_string(), false);
+    };
+    let Some(content) = file.get("content").and_then(Value::as_str) else {
+        return (output.to_string(), false);
+    };
+    // 部分读取(offset/limit)检测:返回行数 < 文件总行数 → 模型只要这段,不压缩。
+    let num_lines = file.get("numLines").and_then(Value::as_u64).unwrap_or(0);
+    let total_lines = file.get("totalLines").and_then(Value::as_u64).unwrap_or(0);
+    if total_lines > 0 && num_lines < total_lines {
+        return (output.to_string(), false);
+    }
+    let line_count = content.lines().count();
+    if content.len() < READ_IMMEDIATE_COMPRESS_MIN_BYTES
+        && line_count < READ_IMMEDIATE_COMPRESS_MIN_LINES
+    {
+        return (output.to_string(), false);
+    }
+    // 仅压缩代码文件(Code 压缩器提取签名);非代码保留原文。
+    if !matches!(classify(content), ContentType::Code(_)) {
+        return (output.to_string(), false);
+    }
+    let summary = format_summary(tool_name, tool_use_id, input, content);
+    (summary, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +1045,221 @@ mod tests {
         let input = "just plain text\nsecond line\n";
         let result = format_summary("Read", "call_f", "", input);
         assert!(result.contains("Text summarized"));
+    }
+
+    // ---- 即时压缩测试 ----
+
+    #[test]
+    fn immediate_compress_non_target_tool_keeps_verbatim() {
+        // 非 bash/read_file 工具(grep_search)不压缩。
+        let (out, archive) = maybe_immediate_compress(
+            "call_1",
+            "grep_search",
+            r#"{"pattern":"foo"}"#,
+            &"x".repeat(20_000),
+            false,
+        );
+        assert_eq!(out.len(), 20_000);
+        assert!(!archive);
+    }
+
+    #[test]
+    fn immediate_compress_error_output_keeps_verbatim() {
+        // 错误输出保留原文,供模型诊断。
+        let (out, archive) = maybe_immediate_compress(
+            "call_2",
+            "bash",
+            r#"{"command":"ls"}"#,
+            &"y".repeat(30_000),
+            true,
+        );
+        assert_eq!(out.len(), 30_000);
+        assert!(!archive);
+    }
+
+    #[test]
+    fn immediate_compress_small_bash_keeps_verbatim() {
+        // 短 bash 输出(< 阈值)保留原文,不压缩。
+        let output = serde_json::json!({
+            "stdout": "hello world\n",
+            "stderr": ""
+        })
+        .to_string();
+        let (out, archive) =
+            maybe_immediate_compress("call_3", "bash", r#"{"command":"echo hi"}"#, &output, false);
+        assert_eq!(out, output);
+        assert!(!archive);
+    }
+
+    #[test]
+    fn immediate_compress_large_bash_log_to_summary() {
+        // 大 bash 构建日志 → Log 压缩 + 归档标记。
+        let mut log_lines: Vec<String> = Vec::new();
+        for i in 0..800 {
+            log_lines.push(format!("Compiling crate-{i} v1.0.0"));
+        }
+        log_lines.push("error[E0308]: mismatched types".to_string());
+        log_lines.push("   --> src/main.rs:12:5".to_string());
+        log_lines.push("Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.2s".to_string());
+        let stdout = log_lines.join("\n");
+        let output = serde_json::json!({ "stdout": stdout, "stderr": "" }).to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_4",
+            "bash",
+            r#"{"command":"cargo build"}"#,
+            &output,
+            false,
+        );
+        assert!(archive, "超阈值 bash 日志应标记归档");
+        assert!(
+            out.contains("Log summarized") && out.contains("recall_full"),
+            "bash 日志应压缩为 Log 摘要且带 recall_full 指针: {out}"
+        );
+        assert!(out.contains("error[E0308]"), "错误行必须保留在摘要中: {out}");
+        assert!(
+            out.contains("Finished `dev` profile"),
+            "尾部结果摘要必须保留: {out}"
+        );
+        assert!(out.len() < output.len() / 3, "压缩率应显著: {} vs {}", out.len(), output.len());
+    }
+
+    #[test]
+    fn immediate_compress_large_bash_json_to_summary() {
+        // 大 bash 结构化 JSON 输出 → JSON 压缩。
+        let mut items = Vec::new();
+        for i in 0..300 {
+            items.push(serde_json::json!({"id": i, "name": format!("user_{i}"), "bio": "a".repeat(120)}));
+        }
+        let output = serde_json::json!({ "stdout": serde_json::Value::Array(items).to_string(), "stderr": "" }).to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_5",
+            "bash",
+            r#"{"command":"list users"}"#,
+            &output,
+            false,
+        );
+        assert!(archive);
+        assert!(out.contains("summarized") && out.contains("recall_full"));
+    }
+
+    #[test]
+    fn immediate_compress_large_read_code_to_summary() {
+        // 大代码文件全量读取 → Code 压缩(提取签名)。
+        let mut code_lines: Vec<String> = vec!["//! Module docs".to_string(), "use std::collections::HashMap;".to_string()];
+        for i in 0..500 {
+            code_lines.push(format!("pub fn func_{i}(x: i32) -> i32 {{ x + {i} }}"));
+        }
+        let content = code_lines.join("\n");
+        let output = serde_json::json!({
+            "type": "text",
+            "file": {
+                "filePath": "src/main.rs",
+                "content": content,
+                "numLines": 502,
+                "startLine": 1,
+                "totalLines": 502,
+            }
+        })
+        .to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_6",
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+            &output,
+            false,
+        );
+        assert!(archive, "超阈值全量读代码应压缩");
+        assert!(
+            out.contains("Code summarized") && out.contains("recall_full"),
+            "应为 Code 摘要且带 recall_full 指针: {out}"
+        );
+        assert!(out.contains("pub fn func_0"), "签名应保留: {out}");
+    }
+
+    #[test]
+    fn immediate_compress_partial_read_keeps_verbatim() {
+        // 部分读取(offset/limit)保留原文 —— 模型明确只要这段。
+        let mut code_lines: Vec<String> = Vec::new();
+        for i in 0..500 {
+            code_lines.push(format!("pub fn func_{i}(x: i32) -> i32 {{ x + {i} }}"));
+        }
+        let content = code_lines.join("\n");
+        let output = serde_json::json!({
+            "type": "text",
+            "file": {
+                "filePath": "src/main.rs",
+                "content": content,
+                "numLines": 300,
+                "startLine": 100,
+                "totalLines": 502,
+            }
+        })
+        .to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_7",
+            "read_file",
+            r#"{"path":"src/main.rs","offset":100,"limit":300}"#,
+            &output,
+            false,
+        );
+        assert_eq!(out, output, "部分读取应保留原文");
+        assert!(!archive);
+    }
+
+    #[test]
+    fn immediate_compress_non_code_read_keeps_verbatim() {
+        // 大文档文件(非代码)保留原文,由截断兜底。
+        let content = "plain documentation text ".repeat(2000);
+        let output = serde_json::json!({
+            "type": "text",
+            "file": {
+                "filePath": "README.md",
+                "content": content,
+                "numLines": 2000,
+                "startLine": 1,
+                "totalLines": 2000,
+            }
+        })
+        .to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_8",
+            "read_file",
+            r#"{"path":"README.md"}"#,
+            &output,
+            false,
+        );
+        assert_eq!(out, output, "非代码文件应保留原文");
+        assert!(!archive);
+    }
+
+    #[test]
+    fn immediate_compress_skips_already_summarized() {
+        // 已压缩占位符不再压缩(幂等)。
+        let already = "[bash Log summarized: 5000 chars → Finished… use recall_full with tool_use_id=call_x to retrieve full output…]";
+        let (out, archive) = maybe_immediate_compress(
+            "call_9",
+            "bash",
+            r#"{"command":"cargo build"}"#,
+            already,
+            false,
+        );
+        assert_eq!(out, already);
+        assert!(!archive);
+    }
+
+    #[test]
+    fn immediate_compress_bash_stderr_only() {
+        // stderr 单独很大的 bash 输出也压缩(合并内容超阈值)。
+        let stderr = "warning: unused variable: `x`\n".repeat(1500);
+        let output = serde_json::json!({ "stdout": "", "stderr": stderr }).to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_10",
+            "bash",
+            r#"{"command":"cargo check"}"#,
+            &output,
+            false,
+        );
+        assert!(archive);
+        assert!(out.contains("summarized"));
     }
 }

@@ -1213,7 +1213,7 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      You have access to a multi-agent system for decomposing and parallelizing \
      complex tasks. The core tools are `dispatch_subagent`, `check_subagent`, \
-     `TeamCreate`, `dag_run`, and `dag_status`.\n\
+     `TeamCreate`, `dag_define`, `dag_run`, and `dag_status`.\n\
      \n\
      ### Coordination Modes (mode parameter)\n\
      \n\
@@ -1240,17 +1240,34 @@ fn get_multi_agent_orchestration_section() -> String {
      | `dispatch_subagent` | Async sub-task: returns `subagent_id` immediately; poll with `check_subagent` for completion and results. |\n\
      | `check_subagent` | Poll a dispatched sub-agent; returns status (created/running/completed/failed/cancelled) + result if terminal. |\n\
      | `TeamCreate` | Group multiple tasks into a named team for collective monitoring via `TaskList`. |\n\
+     | `dag_define` | Register a DAG definition (dag_id + nodes with id/task/depends_on) for later execution. Returns the dag_id; use before `dag_run`. |\n\
      | `dag_run` | Execute a dependency graph: call with `dag_id` + `action: \"start\"`. Nodes with satisfied `depends_on` run in parallel (up to 4). |\n\
      | `dag_status` | Check progress of a DAG run: per-node status, overall completion. |\n\
      \n\
      ### DAG Workflow Pattern\n\
      \n\
      1. Analyze the task → decompose into independent and sequential work items.\n\
-     2. Call `TeamCreate` with individual task objects (each containing `prompt`).\n\
-     3. Call `dag_run` with `dag_id` + `action: \"start\"` — the scheduler \
-     automatically respects `depends_on` and runs ready nodes in parallel.\n\
+     2. Call `dag_define` to register the DAG: provide a unique `dag_id` and a `nodes` array — each node needs `id` + `task`, and may set `depends_on` (node ids that must finish first), `acceptance_criteria`, `verify_command`, `max_retries`, `mode`, `capability`. The DAG is validated (dependency references + cycle check) and registered.\n\
+     3. Call `dag_run` with `dag_id` + `action: \"start\"` — the scheduler automatically respects `depends_on` and runs ready nodes in parallel.\n\
      4. Call `dag_status` with the returned `run_id` to monitor progress.\n\
      5. If a node fails, its downstream dependents are automatically skipped.\n\
+     \n\
+     **Pre-defined DAGs**: DAGs may already be registered at startup from YAML files in the workspace `.claw` dags directory. Prefer reusing an existing `dag_id` over re-defining the same graph.\n\
+     \n\
+     **Example** — a dependency pipeline:\n\
+     \n\
+     ```\n\
+     dag_define({\n\
+       \"dag_id\": \"release-pipeline\",\n\
+       \"nodes\": [\n\
+         {\"id\": \"analyze\",   \"task\": \"分析改动影响面\", \"depends_on\": []},\n\
+         {\"id\": \"implement\", \"task\": \"实现修复\",      \"depends_on\": [\"analyze\"], \"verify_command\": \"cargo test\"},\n\
+         {\"id\": \"release\",   \"task\": \"打版本并发布\",    \"depends_on\": [\"implement\"]}\n\
+       ]\n\
+     })\n\
+     ```\n\
+     \n\
+     Then `dag_run({\"dag_id\": \"release-pipeline\", \"action\": \"start\"})` and poll with `dag_status`.\n\
      \n\
      ### Parallelism Decision Tree\n\
      \n\
@@ -1466,7 +1483,30 @@ fn get_tool_usage_guidance_section() -> String {
      The `task_id` for `TaskOutput`/`TaskGet`/`TaskStop`/`TaskUpdate` must \
      come from the return value of `TaskCreate` or `RunTaskPacket`. A bash \
      background PID (`backgroundPid` in bash output) is an OS process number, \
-     NOT a task_id — passing it to task tools fails with `task not found`."
+     NOT a task_id — passing it to task tools fails with `task not found`.\n\
+     \n\
+     ### 复杂任务规划(create_plan)\n\
+     Use your own judgment about task complexity: when a task is complex, \
+     multi-step, or spans multiple files, call `create_plan` to build an \
+     ordered execution plan before diving in. Use it for refactors across \
+     several modules, multi-file features, or any task where iterating \
+     one-off would waste turns. Do NOT call it for trivial one-file edits \
+     or read-only questions — just execute those directly. After the plan is \
+     created, it is injected into your context; execute it step by step and \
+     call `plan_update`(\\\"done: <step_id>\\\") after each verified step.\n\
+     \n\
+     ### 规划机制分水岭(create_plan vs brainstorming/writing-plans)\n\
+     Decide which planning mechanism fits before planning a complex task:\n\
+     - If the task needs the USER to approve a design first, or must produce a \
+       handoff document for another engineer/later session → invoke the \
+       `brainstorming` skill to design + get approval, then `writing-plans` \
+       skill to write the implementation plan. Do NOT call `create_plan` in \
+       this case.\n\
+     - If the task is well-specified and you can execute it yourself within \
+       this session (no design sign-off, no document handoff) → call \
+       `create_plan` and execute immediately.\n\
+     The two can chain: while executing a `create_plan` plan, if you hit a \
+     design decision that needs user sign-off, pause and invoke `brainstorming`."
         .to_string()
 }
 /// session even as new entries are written to disk.
@@ -1525,9 +1565,11 @@ fn render_skill_catalog_section(catalog: &str) -> String {
 /// duplication.
 fn render_plan_mode_constraint_section() -> String {
     "## Plan Mode Constraints (active)\n\
-     当前处于 Plan 模式。生成方案/计划前**必须**先调用 `brainstorming` skill,\n\
-     生成后**必须**调用 `writing-plans` skill 的 Self-Review 流程(含代码事实核查\n\
-     与实现可行性推演)。未调用 skill 的方案不得进入 Execute 阶段。"
+     当前处于 Plan 模式。复杂任务由你自主判断:调用 `create_plan` 工具创建\n\
+     执行计划,然后按步骤执行,每步完成后调用 `plan_update` 推进。生成方案/\n\
+     计划前**必须**先调用 `brainstorming` skill,生成后**必须**调用\n\
+     `writing-plans` skill 的 Self-Review 流程(含代码事实核查与实现可行性\n\
+     推演)。未调用 skill 的方案不得进入 Execute 阶段。"
         .to_string()
 }
 

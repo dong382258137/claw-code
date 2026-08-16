@@ -28,8 +28,8 @@ use crate::recovery_recipes::RecoveryResult;
 // 不污染 system_prompt + tools_schema 的"绝对稳定区"。详见
 // docs/harness-engineering-optimization-plan.md Step 2.1 与 §5.2。
 use crate::planner::{
-    assess_complexity, decompose_task, persist_plan_artifact, update_plan,
-    ComplexityAssessment, PlanArtifact, PreCompletionChecklistMiddleware, ReviewResult,
+    decompose_task, generate_steps_with_llm, persist_plan_artifact, update_plan, PlanArtifact,
+    PreCompletionChecklistMiddleware, ReviewResult,
 };
 // Harness M(多 agent)层接入:MultiAgentCoordinator — Step 3.2-c。
 // 主 agent 通过 dispatch_subagent tool 派发任务给子 agent。
@@ -947,10 +947,31 @@ pub(crate) fn process_tool_uses(
             ));
         }
 
+        // 即时压缩(Immediate Compression):与主会话 run_turn 一致,
+        // bash/read_file 的大输出在入库前压缩成结构化摘要,避免子智能体
+        // 上下文原样保留大输出并在多轮迭代(max_iter)中反复计 token。
+        // 压缩前归档原始内容到 ToolResultArchive(失败不阻断),摘要带
+        // recall_full 指针,LLM 可按 tool_use_id 取回全文。
+        let (output_to_store, should_archive) =
+            crate::content_compression::maybe_immediate_compress(
+                id,
+                name,
+                effective_input.as_ref(),
+                &output,
+                is_error,
+            );
+        if should_archive {
+            let _ = crate::tool_result_archive::archive_tool_result(
+                workspace_root,
+                id,
+                name,
+                &output,
+            );
+        }
         messages.push(ConversationMessage::tool_result(
             id.clone(),
             name.clone(),
-            output,
+            output_to_store,
             is_error,
         ));
     }
@@ -2972,33 +2993,11 @@ where
         // 不污染绝对稳定区(system_prompt + tools_schema)与半稳定区
         // (memory/goal/git_context)。预期命中率从 95% 降至 88-92%。
         //
-        // 复杂任务检测:用户输入 > 200 字符或包含 "refactor"/"多文件" 等关键词。
-        // Complex 时创建空 PlanArtifact(steps 由后续 Stage 3.1 VerifierAgent
-        // 或主 agent 自身填充)。Simple 时跳过,不创建 artifact。
-        if self.plan_mode_enabled && self.active_plan.is_none() {
-            match assess_complexity(&user_input) {
-                ComplexityAssessment::Complex { reason: _ } => {
-                    // D1.0:LLM-driven planning — 已注册 PlanGeneratorClient 时
-                    // 由模型生成步骤(JSON),失败/未注册回退启发式 decompose_task。
-                    // 模型输出经 parse_llm_plan_steps 容错解析,任何异常都不阻断
-                    // plan 创建(回退启发式,保证至少 1 个 step)。
-                    let steps = crate::planner::generate_steps_with_llm(&user_input)
-                        .unwrap_or_else(|| decompose_task(&user_input));
-                    let mut artifact = PlanArtifact::new(user_input.clone(), steps);
-                    // 尝试持久化(workspace_root 为 None 时跳过,不阻断主流程)。
-                    if let Some(root) = &self.workspace_root {
-                        if let Err(err) = persist_plan_artifact(&artifact, root) {
-                            eprintln!("warning: failed to persist plan artifact: {err}");
-                        }
-                    }
-                    artifact.transition_to_executing();
-                    self.active_plan = Some(artifact);
-                }
-                ComplexityAssessment::Simple => {
-                    // 简单任务,无需 plan。主 agent 走原生 ReAct 循环。
-                }
-            }
-        }
+        // 复杂任务判定交给模型自主决定(2026-08-16):不再用启发式规则
+        // (字符数阈值 + 关键词 substring)在 run_turn 入口自动创建 PlanArtifact。
+        // 模型在执行过程中若判断任务足够复杂,可主动调用 `create_plan` 工具
+        // 创建计划,框架随后进入 Plan/Execute/Review 循环。这样避免启发式
+        // 规则的漏判(短输入多文件任务)与误判(长输入但仅需解释/否定语境)。
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -3010,13 +3009,10 @@ where
         let mut branch_retry_success = false;
 
         // 复杂任务调高迭代上限(软硬双层)。
-        // 除静态识别(输入超长/命中复杂关键词/存在活跃 plan)外,工具循环内
-        // 还会做"持续推进豁免"(写操作成功即放宽硬上限),覆盖"确认"这类短输入
-        // 但实际执行长程重构的 turn(EPIC-062 误杀场景)。
-        let is_complex_turn = matches!(
-            assess_complexity(&user_input),
-            ComplexityAssessment::Complex { .. }
-        ) || self.active_plan.is_some();
+        // 判定完全交给模型:存在活跃 plan(模型调用 create_plan 创建)即视为
+        // 复杂任务。工具循环内另有"持续推进豁免"(写操作成功即放宽硬上限),
+        // 覆盖未创建 plan 但实际执行长程重构的 turn(EPIC-062 误杀场景)。
+        let is_complex_turn = self.active_plan.is_some();
         let turn_soft_max = if is_complex_turn {
             COMPLEX_SOFT_MAX_ITERATIONS
         } else {
@@ -3800,6 +3796,14 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
+                        } else if tool_name == "create_plan" {
+                            // 复杂任务判定交给模型自主决定(2026-08-16)。
+                            // 模型判断任务足够复杂时主动调用本工具创建计划,
+                            // 框架随后进入 Plan/Execute/Review 循环。
+                            match self.execute_create_plan(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
                         } else if tool_name == "recall_full" {
                             // P0:从 ToolResultArchive 检索 microcompact 摘要前的
                             // 原始 tool result。直击"AI 看到摘要后无法判断是否需要
@@ -4078,7 +4082,34 @@ where
                                 cb(&tool_use_id, &tool_name, &output, is_error);
                             }
                         }
-                        ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
+                        // 即时压缩(Immediate Compression):bash/read_file 的大输出在
+                        // 入库前压缩成结构化摘要,避免大输出原样占用活跃窗口。
+                        // 压缩前归档原始内容到 ToolResultArchive(失败不阻断),
+                        // 摘要带 recall_full 指针,LLM 可按 tool_use_id 取回全文。
+                        let (output_to_store, should_archive) =
+                            crate::content_compression::maybe_immediate_compress(
+                                &tool_use_id,
+                                &tool_name,
+                                &effective_input,
+                                &output,
+                                is_error,
+                            );
+                        if should_archive {
+                            if let Some(root) = &self.workspace_root {
+                                let _ = crate::tool_result_archive::archive_tool_result(
+                                    root,
+                                    &tool_use_id,
+                                    &tool_name,
+                                    &output,
+                                );
+                            }
+                        }
+                        ConversationMessage::tool_result(
+                            tool_use_id,
+                            tool_name,
+                            output_to_store,
+                            is_error,
+                        )
                     }
                     PermissionOutcome::Deny { reason } => {
                         // 触发 Notification hook:权限拒绝是用户通知的天然触发点
@@ -5981,6 +6012,110 @@ where
             Ok(message) => Ok(message),
             Err(error) => Ok(format!("notebook_update failed: {error}")),
         }
+    }
+
+    /// 执行 `create_plan` 工具调用 — 模型自主决定创建执行计划。
+    ///
+    /// 复杂任务判定交给模型(2026-08-16):框架不再用启发式规则在 run_turn
+    /// 入口自动创建 PlanArtifact,改为模型在执行过程中判断任务足够复杂时
+    /// 主动调用本工具。流程:
+    ///
+    /// 1. 解析 `{"plan_description": "..."}`(可选,缺省用最近用户输入)。
+    /// 2. 若已有活跃 plan,直接返回其摘要(幂等,不重复创建)。
+    /// 3. 用 LLM 生成步骤(`generate_steps_with_llm`),失败回退启发式
+    ///    [`decompose_task`](crate::planner::decompose_task)。
+    /// 4. 创建 [`PlanArtifact`] 并设置 `active_plan`,随后 run_turn 循环
+    ///    会把 plan 注入 dynamic_sections(缓存保护),进入 Plan/Execute/Review。
+    /// 5. persist 到 `<workspace>/.claw/plans/<id>.json`(失败不阻断)。
+    fn execute_create_plan(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(serde::Deserialize)]
+        struct CreatePlanInput {
+            plan_description: Option<String>,
+        }
+        let parsed: CreatePlanInput = serde_json::from_str(input)
+            .map_err(|e| format!("invalid create_plan input JSON: {e}"))?;
+
+        // 幂等:已有活跃 plan 时不重复创建,直接返回现状。
+        if let Some(plan) = &self.active_plan {
+            return Ok(format!(
+                "create_plan: an active plan already exists (id={}). \
+                 Continue executing it; use plan_update to mark steps done. \
+                 Task: {}",
+                plan.id, plan.task_summary
+            ));
+        }
+
+        let task_summary = parsed
+            .plan_description
+            .map(|d| {
+                let trimmed = d.trim();
+                let mut s = trimmed.to_string();
+                s.truncate(crate::planner::PLAN_SUMMARY_MAX_CHARS);
+                s
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                // 缺省用最近用户输入;session 无历史时回退通用描述。
+                self.session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::User)
+                    .and_then(|m| {
+                        let joined: String = m
+                            .blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let trimmed = joined.trim();
+                        if trimmed.is_empty() {
+                            return None;
+                        }
+                        let mut s = trimmed.to_string();
+                        s.truncate(crate::planner::PLAN_SUMMARY_MAX_CHARS);
+                        Some(s)
+                    })
+                    .unwrap_or_else(|| "User-requested task (no description provided)".to_string())
+            });
+
+        // LLM 生成步骤,失败回退启发式分解。
+        let steps = generate_steps_with_llm(&task_summary).unwrap_or_else(|| {
+            decompose_task(&task_summary)
+        });
+
+        let plan = PlanArtifact::new(task_summary, steps);
+        let plan_id = plan.id.clone();
+        let step_count = plan.steps.len();
+
+        // persist 到 plans 目录(失败不阻断创建)。
+        if let Some(root) = &self.workspace_root {
+            if let Err(e) = persist_plan_artifact(&plan, root) {
+                self.emit_diag(format!(
+                    "[diag] create_plan persist failed (id={plan_id}): {e}"
+                ));
+            }
+        }
+
+        self.active_plan = Some(plan);
+
+        Ok(format!(
+            "create_plan: plan created (id={plan_id}, {step_count} step(s)). \
+             The plan is now injected into your context. Execute it step by step, \
+             calling plan_update(\"done: <step_id>\") after each verified step. \
+             Next step: {}",
+            self.active_plan
+                .as_ref()
+                .and_then(|p| p.current_step())
+                .map(|s| s.description.clone())
+                .unwrap_or_default()
+        ))
     }
 
     /// 第1项:执行 `plan_update` 工具调用,推进 PlanArtifact 顺序状态机。
@@ -8384,8 +8519,9 @@ mod tests {
     }
 
     #[test]
-    fn complex_input_uses_extended_hard_limit() {
-        // 复杂任务(输入超长)静态识别:直接使用 COMPLEX_MAX_ITERATIONS,
+    fn active_plan_uses_extended_hard_limit() {
+        // 复杂任务判定交给模型(2026-08-16):存在活跃 plan(模型调用
+        // create_plan 创建)即视为复杂任务,直接使用 COMPLEX_MAX_ITERATIONS,
         // 而非 self.max_iterations,避免史诗级任务被默认上限误杀。
         struct EchoLoopApi {
             remaining: usize,
@@ -8415,9 +8551,6 @@ mod tests {
             }
         }
 
-        // 输入超长(> 200 字符)触发 Complex;即使 with_max_iterations 设 3,
-        // Complex 也覆盖为 COMPLEX_MAX_ITERATIONS,6 次 echo 不会中止。
-        let long_input = "重构".repeat(120);
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             EchoLoopApi { remaining: 6 },
@@ -8427,9 +8560,17 @@ mod tests {
         )
         .with_max_iterations(3);
 
-        let result = runtime.run_turn(&long_input, None);
+        // 模型先调用 create_plan 创建活跃 plan → 视为复杂任务。
+        runtime
+            .execute_create_plan(r#"{"plan_description": "Multi-step refactor task"}"#)
+            .expect("create_plan");
+        assert!(runtime.active_plan().is_some());
+
+        // 即使 with_max_iterations 设 3,活跃 plan 也覆盖为
+        // COMPLEX_MAX_ITERATIONS,6 次 echo 不会中止。
+        let result = runtime.run_turn("execute the plan", None);
         if let Err(err) = &result {
-            panic!("复杂输入应使用更高迭代上限,不应被默认上限误杀: {err}");
+            panic!("活跃 plan 应使用更高迭代上限,不应被默认上限误杀: {err}");
         }
     }
 
@@ -12918,6 +13059,174 @@ mod tests {
             .join("\n")
     }
 
+    // 即时压缩(Immediate Compression)集成测试:process_tool_uses 子代理路径
+    // 必须与主会话 run_turn 一致,bash/read_file 大输出入库前压缩并归档,
+    // 避免子智能体上下文原样保留大输出并在多轮迭代中反复计 token。
+
+    #[test]
+    fn process_tool_uses_bash_large_output_immediately_compressed_and_archived() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let workspace = tmp.path().to_path_buf();
+
+        // 构造超过 BASH_IMMEDIATE_COMPRESS_MIN_BYTES(12_000) 的 stdout
+        let big_stdout = "log line\n".repeat(2_000); // ~18KB
+        let envelope = serde_json::json!({
+            "stdout": big_stdout,
+            "stderr": "",
+            "interrupted": false,
+            "isImage": null,
+        })
+        .to_string();
+
+        let tool_uses = vec![ContentBlock::ToolUse {
+            id: "tu-bash-big".to_string(),
+            name: "bash".to_string(),
+            input: "echo big".to_string(),
+        }];
+        let mut executor = StaticToolExecutor::new()
+            .register("bash", move |_input| Ok(envelope.clone()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &tool_uses,
+            &mut executor,
+            &workspace,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            None,
+        );
+
+        assert!(result.is_ok(), "bash should execute");
+        assert_eq!(tools_used, vec!["bash"]);
+        let stored = tool_results_text(&messages);
+        assert!(
+            stored.contains("summarized"),
+            "large bash output should be compressed, got prefix: {}",
+            &stored.chars().take(120).collect::<String>()
+        );
+        assert!(
+            stored.contains("recall_full"),
+            "compressed summary should carry recall_full pointer"
+        );
+        // log 压缩器对重复模式保留前几行(MAX_REPEATED_PATTERN_KEEP),故摘要仍可能
+        // 含少量 "log line",但绝不能原样保留 2000 行重复内容 —— 验证压缩率。
+        assert!(
+            stored.matches("log line").count() < 50,
+            "raw stdout should be folded, summary kept {} of 2000 lines",
+            stored.matches("log line").count()
+        );
+        // 归档文件应已写入 workspace/.claw/
+        let archive = crate::tool_result_archive::archive_path(&workspace);
+        assert!(archive.exists(), "archive file should be written");
+        let contents = std::fs::read_to_string(&archive).expect("read archive");
+        assert!(
+            contents.contains("tu-bash-big"),
+            "archived record should be retrievable by tool_use_id"
+        );
+    }
+
+    #[test]
+    fn process_tool_uses_read_large_code_output_immediately_compressed() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let workspace = tmp.path().to_path_buf();
+
+        // 构造超过 READ_IMMEDIATE_COMPRESS_MIN_LINES(300 行) 的代码文件
+        let mut code = String::from("//! module doc\nuse std::fmt;\n");
+        for i in 0..400 {
+            code.push_str(&format!(
+                "pub fn func_{i}(x: i32) -> i32 {{ x + {i} }}\n"
+            ));
+        }
+        let envelope = serde_json::json!({
+            "file": {
+                "path": "src/big.rs",
+                "content": code,
+                "numLines": 402,
+                "totalLines": 402,
+            }
+        })
+        .to_string();
+
+        let tool_uses = vec![ContentBlock::ToolUse {
+            id: "tu-read-big".to_string(),
+            name: "read_file".to_string(),
+            input: r#"{"file_path":"src/big.rs"}"#.to_string(),
+        }];
+        let mut executor = StaticToolExecutor::new()
+            .register("read_file", move |_input| Ok(envelope.clone()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &tool_uses,
+            &mut executor,
+            &workspace,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            None,
+        );
+
+        assert!(result.is_ok(), "read_file should execute");
+        assert_eq!(tools_used, vec!["read_file"]);
+        let stored = tool_results_text(&messages);
+        assert!(
+            stored.contains("summarized"),
+            "large code read should be compressed"
+        );
+        assert!(
+            stored.contains("pub fn func_0"),
+            "code summary should retain first function signature"
+        );
+        assert!(
+            !stored.contains("func_399"),
+            "raw tail code should not remain in subagent context"
+        );
+    }
+
+    #[test]
+    fn process_tool_uses_small_output_kept_verbatim_no_archive() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let workspace = tmp.path().to_path_buf();
+
+        let tool_uses = vec![ContentBlock::ToolUse {
+            id: "tu-small".to_string(),
+            name: "bash".to_string(),
+            input: "echo hi".to_string(),
+        }];
+        let mut executor = StaticToolExecutor::new()
+            .register("bash", |_input| Ok("hello".to_string()));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &tool_uses,
+            &mut executor,
+            &workspace,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            None,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(tool_results_text(&messages), "hello");
+        // 小输出不触发压缩,也不应创建归档文件
+        let archive = crate::tool_result_archive::archive_path(&workspace);
+        assert!(
+            !archive.exists(),
+            "small output should not create archive file"
+        );
+    }
+
     /// 可控的 mock ValidationGate -- 通过 AtomicUsize 控制第 N 次返回 Ok/Err。
     /// 用于场景 3-5 端到端 retry loop 测试。
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -14829,5 +15138,99 @@ mod tests {
 
         bus.leave(&main_id);
         bus.leave(&sub_id);
+    }
+
+    #[test]
+    fn create_plan_creates_active_plan_and_persists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.path().to_path_buf());
+
+        let out = runtime
+            .execute_create_plan(r#"{"plan_description": "Refactor the authentication module"}"#)
+            .expect("create_plan should succeed");
+
+        // 返回消息包含 plan_id 与步数;活跃 plan 已设置。
+        assert!(out.contains("create_plan"), "output: {out}");
+        assert!(out.contains("plan created"), "output: {out}");
+        assert!(out.contains("step(s)"), "output: {out}");
+        let plan = runtime.active_plan().expect("active plan should be set");
+        assert_eq!(plan.task_summary, "Refactor the authentication module");
+        assert!(!plan.steps.is_empty(), "plan should have steps");
+
+        // 持久化到 <workspace>/.claw/plans/<id>.json。
+        let plans_dir = tmp.path().join(".claw").join("plans");
+        let artifact_path = plans_dir.join(format!("{}.json", plan.id));
+        assert!(artifact_path.exists(), "plan artifact should be persisted");
+    }
+
+    #[test]
+    fn create_plan_is_idempotent_when_active_plan_exists() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let first = runtime
+            .execute_create_plan(r#"{"plan_description": "First plan"}"#)
+            .expect("first create_plan");
+        assert!(first.contains("plan created"), "output: {first}");
+
+        // 第二次调用不重复创建,返回已有 plan 摘要。
+        let second = runtime
+            .execute_create_plan(r#"{"plan_description": "Second plan"}"#)
+            .expect("second create_plan should not error");
+        assert!(
+            second.contains("already exists"),
+            "second call should report existing plan: {second}"
+        );
+        let plan = runtime.active_plan().expect("active plan");
+        assert_eq!(plan.task_summary, "First plan");
+    }
+
+    #[test]
+    fn create_plan_defaults_to_latest_user_input() {
+        let mut session = Session::new();
+        session
+            .push_user_text("Fix the memory leak in the runtime")
+            .expect("push user text");
+        let mut runtime = ConversationRuntime::new(
+            session,
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        // 无 plan_description → 缺省取最近用户输入。
+        let out = runtime
+            .execute_create_plan("{}")
+            .expect("create_plan without description");
+        assert!(out.contains("plan created"), "output: {out}");
+        let plan = runtime.active_plan().expect("active plan");
+        assert_eq!(
+            plan.task_summary, "Fix the memory leak in the runtime",
+            "task_summary should default to latest user input"
+        );
+    }
+
+    #[test]
+    fn create_plan_rejects_invalid_json() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        assert!(runtime.execute_create_plan("not json").is_err());
+        assert!(runtime.active_plan().is_none());
     }
 }

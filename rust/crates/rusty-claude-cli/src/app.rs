@@ -2596,10 +2596,10 @@ impl LiveCli {
     /// - 启用 plan mode(本会话内生效,无需 `--enable-plan-mode` CLI flag)。
     /// - 设置 workspace_root(若未设置),用于 PlanArtifact 持久化到
     ///   `<workspace>/.claw/plans/<id>.json`。
-    /// - 若提供 `task` → 立即触发 `run_turn(task)`,让 runtime 内部的
-    ///   `assess_complexity` 自动检测为 Complex 并创建 PlanArtifact。
-    ///   PlanArtifact 通过末尾追加到 dynamic_sections 注入,不污染缓存
-    ///   绝对/半稳定区(§5.2 缓存保护)。
+    /// - 若提供 `task` → 立即触发 `run_turn(task)`,让模型在执行过程中
+    ///   自主判断是否调用 `create_plan` 创建 PlanArtifact(2026-08-16 起
+    ///   不再用启发式规则自动创建)。PlanArtifact 通过末尾追加到
+    ///   dynamic_sections 注入,不污染缓存绝对/半稳定区(§5.2 缓存保护)。
     /// - 若未提供 `task` → 仅打印提示信息,等用户后续输入触发 plan。
     ///
     /// 与 `--enable-plan-mode` CLI flag 的区别:
@@ -2618,19 +2618,19 @@ impl LiveCli {
             self.runtime.set_workspace_root(cwd);
         }
 
-        let plan_enabled_msg = "Plan mode enabled. Complex tasks (>200 chars or matching keywords) will trigger Plan→Execute→Review cycle.";
+        let plan_enabled_msg = "Plan mode enabled. The model decides when to create a plan (via create_plan) for complex tasks, then follows the Plan→Execute→Review cycle.";
         if !self.tui_println(plan_enabled_msg) {
             println!("{plan_enabled_msg}");
         }
 
         if let Some(task) = task.map(str::trim).filter(|s| !s.is_empty()) {
-            // 有 task → 立即触发 run_turn,让 runtime 自动通过 assess_complexity
-            // 检测并创建 PlanArtifact。run_turn 会处理 plan 的整个生命周期
-            // (Plan → Execute → Review → Replan/AllPassed/Failed)。
+            // 有 task → 立即触发 run_turn。复杂任务判定交给模型:模型判断
+            // 需要时可调用 create_plan 创建 PlanArtifact,run_turn 会处理
+            // plan 的整个生命周期(Plan → Execute → Review → Replan/AllPassed/Failed)。
             self.run_turn(task)?;
         } else {
             // 无 task → 仅启用 plan mode,提示用户后续输入。
-            let hint = "Now enter your task. The runtime will auto-detect complexity and create a PlanArtifact for complex tasks.";
+            let hint = "Now enter your task. The model will decide whether to create a plan (via create_plan) for complex tasks.";
             if !self.tui_println(hint) {
                 println!("{hint}");
             }
@@ -3576,6 +3576,22 @@ pub(crate) fn build_runtime_with_plugin_state(
     // Arc<dyn SubagentExecutor + Send + Sync>。
     if let Some(executor) = runtime.coordinator_executor() {
         tools::set_coordinator_executor(executor.clone());
+    }
+    // YAML 声明式 DAG 预注册:启动时扫描 <workspace>/.claw/dags/*.yaml,
+    // 注入全局 DagStore。与 dag_define 工具共用同一套校验/默认值逻辑,
+    // 让模型无需工具调用即可对预定义依赖图执行 dag_run。
+    if let Ok(workspace_root) = env::current_dir() {
+        let dags_dir = workspace_root.join(".claw").join("dags");
+        let (dags, errors) =
+            runtime::multi_agent::dag::yaml_loader::load_dag_definitions_with_errors(&dags_dir);
+        for err in &errors {
+            eprintln!("[dag-loader] {err}");
+        }
+        for dag in dags {
+            if let Err(e) = tools::register_dag(dag) {
+                eprintln!("[dag-loader] register failed: {e}");
+            }
+        }
     }
     // 根据模型 context window 动态设置 compaction 阈值。
     // 1M 模型(DeepSeek V4/GPT-5.4)阈值 650K,200K 模型(Claude)阈值 130K,

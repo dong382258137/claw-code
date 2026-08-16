@@ -26,9 +26,9 @@ pub mod validation;
 pub mod manifest;
 pub use dag::DagStore;
 pub use dag::{
-    CoordinatorExecutor, DagError, DagGraph, DagId, DagNode, DagRunResult, DagScheduler, FailFast,
-    NodeError, NodeResult, ProgressEvent, RetryPolicy, SubagentDispatcher, SubagentExecutor,
-    SubagentRunner, DEFAULT_MAX_PARALLELISM,
+    CoordinatorExecutor, Dag, DagError, DagGraph, DagId, DagNode, DagRunResult, DagScheduler,
+    FailFast, NodeError, NodeResult, ProgressEvent, RetryPolicy, SubagentDispatcher,
+    SubagentExecutor, SubagentRunner, DEFAULT_MAX_PARALLELISM,
 };
 pub use file_guard::{LockHandle, SubagentFileGuard};
 pub use handoff::{
