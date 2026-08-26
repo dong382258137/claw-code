@@ -200,9 +200,7 @@ fn summarize_messages_with_client(
         // P2(2026-08-14):未注册时静默降级是"摘要质量极差"的隐性来源
         // (启发式会把原始转录碎片拼进 Key timeline)。打印一次可见告警,
         // 便于用户判断是注册失败还是瞬时 LLM 故障。
-        eprintln!(
-            "[compact] LLM summarizer not registered; falling back to heuristic summary"
-        );
+        eprintln!("[compact] LLM summarizer not registered; falling back to heuristic summary");
     }
     summarize_messages(messages)
 }
@@ -1053,9 +1051,7 @@ fn summarize_block(block: &ContentBlock) -> String {
         // 大体积只读输出(Read/Bash/Grep/Glob/LS)做结构化摘要,保留
         // recall_full 指针;短输出(< SMALL_OUTPUT_PRESERVE_CHARS)保留原文,
         // 摘要反而丢失精确内容。
-        if is_summarizable_tool(tool_name)
-            && output.chars().count() > SMALL_OUTPUT_PRESERVE_CHARS
-        {
+        if is_summarizable_tool(tool_name) && output.chars().count() > SMALL_OUTPUT_PRESERVE_CHARS {
             return format_tool_result_summary(tool_name, tool_use_id, "", output);
         }
         return truncate_summary(&format!("tool_result {tool_name}: {output}"), 160);

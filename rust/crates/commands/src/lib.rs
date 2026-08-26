@@ -3809,14 +3809,14 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
 }
 
 pub fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
-    let mut lines = contents.lines();
+    let mut lines = contents.lines().peekable();
     if lines.next().map(str::trim) != Some("---") {
         return (None, None);
     }
 
     let mut name = None;
     let mut description = None;
-    for line in lines {
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed == "---" {
             break;
@@ -3829,9 +3829,45 @@ pub fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String
             continue;
         }
         if let Some(value) = trimmed.strip_prefix("description:") {
-            let value = unquote_frontmatter_value(value.trim());
-            if !value.is_empty() {
-                description = Some(value);
+            let v = unquote_frontmatter_value(value.trim());
+            // YAML 块标量:description: >(折叠)/ |(字面) 及其 chomping 变体 >- |+ 等。
+            // 内容为后续所有缩进(以空白开头)的非空行,折叠块用空格连接,字面块用换行连接。
+            let is_block = matches!(
+                v.as_str(),
+                ">" | ">-" | ">+" | "|" | "|-" | "|+"
+            );
+            if !is_block {
+                if !v.is_empty() {
+                    description = Some(v);
+                }
+                continue;
+            }
+            let fold = v.starts_with('>');
+            let mut parts: Vec<String> = Vec::new();
+            while let Some(next_line) = lines.peek() {
+                let next_trimmed = next_line.trim();
+                if next_trimmed.is_empty() {
+                    lines.next(); // 跳过块内空行
+                    continue;
+                }
+                let indented = next_line
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_whitespace());
+                if !indented {
+                    break; // 非缩进行 = 块结束
+                }
+                parts.push(next_trimmed.to_string());
+                lines.next();
+            }
+            let joined = if fold {
+                parts.join(" ")
+            } else {
+                parts.join("
+")
+            };
+            if !joined.is_empty() {
+                description = Some(joined);
             }
         }
     }
@@ -6281,6 +6317,58 @@ mod tests {
         let (name, description) = super::parse_skill_frontmatter(contents);
         assert_eq!(name.as_deref(), Some("hud"));
         assert_eq!(description.as_deref(), Some("Quoted description"));
+    }
+
+    #[test]
+    fn parses_block_scalar_folded_description() {
+        // YAML 折叠块标量:description: > 后续缩进行以空格连接
+        let contents = "---
+name: whiteboard
+description: >
+  飞书画板:查询
+  管理与分享画板
+---
+";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("whiteboard"));
+        assert_eq!(
+            description.as_deref(),
+            Some("飞书画板:查询 管理与分享画板")
+        );
+    }
+
+    #[test]
+    fn parses_block_scalar_literal_description() {
+        // YAML 字面块标量:description: | 后续缩进行保留换行
+        let contents = "---
+name: asr
+description: |
+  本地语音识别
+  支持多语言
+---
+";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("asr"));
+        assert_eq!(
+            description.as_deref(),
+            Some("本地语音识别
+支持多语言")
+        );
+    }
+
+    #[test]
+    fn block_scalar_ends_at_non_indented_line() {
+        // 块标量内容必须缩进;遇到非缩进行(如新 key)即结束
+        let contents = "---
+name: x
+description: >
+  第一行
+other: value
+---
+";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("x"));
+        assert_eq!(description.as_deref(), Some("第一行"));
     }
 
     #[test]

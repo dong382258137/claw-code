@@ -187,12 +187,7 @@ pub fn extract_from_turn_summary(
         return None;
     }
 
-    Some(FailureTrace::new(
-        turn_id,
-        session_id,
-        failure_kind,
-        steps,
-    ))
+    Some(FailureTrace::new(turn_id, session_id, failure_kind, steps))
 }
 
 /// 追加一条失败轨迹到 `.claw/failure_traces.jsonl`。
@@ -217,7 +212,8 @@ pub fn append(workspace_root: &Path, trace: &FailureTrace) -> Result<(), Failure
     })?;
     fs::create_dir_all(dir).map_err(|e| FailureTraceError::Io(e.to_string()))?;
 
-    let line = serde_json::to_string(trace).map_err(|e| FailureTraceError::Serialize(e.to_string()))?;
+    let line =
+        serde_json::to_string(trace).map_err(|e| FailureTraceError::Serialize(e.to_string()))?;
 
     let needs_prune = path.exists()
         && fs::metadata(&path)
@@ -294,8 +290,8 @@ pub fn prune(path: &Path) -> Result<usize, FailureTraceError> {
         let mut tmp_file =
             fs::File::create(&tmp_path).map_err(|e| FailureTraceError::Io(e.to_string()))?;
         for record in &records {
-            let line =
-                serde_json::to_string(record).map_err(|e| FailureTraceError::Serialize(e.to_string()))?;
+            let line = serde_json::to_string(record)
+                .map_err(|e| FailureTraceError::Serialize(e.to_string()))?;
             writeln!(tmp_file, "{line}").map_err(|e| FailureTraceError::Io(e.to_string()))?;
         }
         tmp_file
@@ -380,7 +376,12 @@ mod tests {
         ])];
         let results = vec![
             tool_msg(tool_result("call_1", "Read", "file contents", false)),
-            tool_msg(tool_result("call_2", "edit_file", "old_string not found", true)),
+            tool_msg(tool_result(
+                "call_2",
+                "edit_file",
+                "old_string not found",
+                true,
+            )),
         ];
 
         let trace = extract_from_turn_summary("sess-1", "sess", "tool_error", &assistant, &results)
@@ -397,11 +398,16 @@ mod tests {
 
     #[test]
     fn extract_returns_none_when_all_steps_succeed() {
-        let assistant = vec![assistant_with_blocks(vec![tool_use("call_1", "Read", "{}")])];
+        let assistant = vec![assistant_with_blocks(vec![tool_use(
+            "call_1", "Read", "{}",
+        )])];
         let results = vec![tool_msg(tool_result("call_1", "Read", "ok", false))];
 
         let trace = extract_from_turn_summary("sess-1", "sess", "tool_error", &assistant, &results);
-        assert!(trace.is_none(), "all-success turn should not produce a trace");
+        assert!(
+            trace.is_none(),
+            "all-success turn should not produce a trace"
+        );
     }
 
     #[test]
@@ -420,13 +426,21 @@ mod tests {
     #[test]
     fn extract_truncates_oversized_fields() {
         let huge = "x".repeat(TRACE_STEP_FIELD_MAX_CHARS + 500);
-        let assistant = vec![assistant_with_blocks(vec![tool_use("call_1", "Read", &huge)])];
+        let assistant = vec![assistant_with_blocks(vec![tool_use(
+            "call_1", "Read", &huge,
+        )])];
         let results = vec![tool_msg(tool_result("call_1", "Read", &huge, true))];
 
         let trace = extract_from_turn_summary("sess-1", "sess", "tool_error", &assistant, &results)
             .expect("trace");
-        assert_eq!(trace.steps[0].input.chars().count(), TRACE_STEP_FIELD_MAX_CHARS);
-        assert_eq!(trace.steps[0].output.chars().count(), TRACE_STEP_FIELD_MAX_CHARS);
+        assert_eq!(
+            trace.steps[0].input.chars().count(),
+            TRACE_STEP_FIELD_MAX_CHARS
+        );
+        assert_eq!(
+            trace.steps[0].output.chars().count(),
+            TRACE_STEP_FIELD_MAX_CHARS
+        );
     }
 
     #[test]
@@ -465,7 +479,10 @@ mod tests {
         fs::write(&path, "not json\n{}\n").unwrap();
 
         let loaded = load_all(workspace.path()).expect("load should succeed");
-        assert!(loaded.is_empty(), "corrupt lines should be skipped, got {loaded:?}");
+        assert!(
+            loaded.is_empty(),
+            "corrupt lines should be skipped, got {loaded:?}"
+        );
     }
 
     #[test]

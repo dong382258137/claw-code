@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -952,7 +952,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "replace_lines",
-            description: "Replace a range of lines in a workspace file by 1-based line numbers. The result includes replacedLineCount/newTotalLines to track how the file changed.",
+            description: "Replace a range of lines in a workspace file by 1-based line numbers. ONLY use for small, unambiguous, single-region changes. WARNING: every replacement shifts line numbers of all later lines — NEVER chain multiple replace_lines calls on the same file in one turn. ALWAYS call read_file on the target region first to confirm exact current line numbers, and re-read after replacing to verify function boundaries are not truncated or duplicated. Prefer edit_file with an exact old_string over replace_lines whenever possible.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1974,9 +1974,7 @@ fn execute_tool_with_enforcer(
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
-        "ImBridgeSetup" => {
-            from_value::<ImBridgeSetupInput>(input).and_then(run_im_bridge_setup)
-        }
+        "ImBridgeSetup" => from_value::<ImBridgeSetupInput>(input).and_then(run_im_bridge_setup),
         "ImBridgeService" => {
             from_value::<ImBridgeServiceInput>(input).and_then(run_im_bridge_service)
         }
@@ -3033,16 +3031,113 @@ fn branch_divergence_output(
 fn run_read_file(input: ReadFileInput, extra_roots: Option<&[PathBuf]>) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let extra = extra_roots.unwrap_or(&[]);
-    to_pretty_json(
-        read_file_in_workspace_with_roots(
-            &input.path,
-            input.offset,
-            input.limit,
-            &workspace,
-            extra,
-        )
-        .map_err(io_to_string)?,
+    let result = read_file_in_workspace_with_roots(
+        &input.path,
+        input.offset,
+        input.limit,
+        &workspace,
+        extra,
     )
+    .map_err(io_to_string)?;
+    // F4:成功读取该文件即解除门禁——模型已拿到最新内容，可安全重新规划后续编辑。
+    clear_edit_gate(Path::new(&input.path));
+    to_pretty_json(&result)
+}
+
+/// F4 反级联门禁:记录"上次写入后诊断失败"的文件与时间戳。
+///
+/// 解决本会话实证的级联损坏:AI 在 engine.py 连续编辑 25 次,头几次诊断失败后仍
+/// 继续无脑堆叠写入,越改越乱。门禁在同一时间窗口内(默认 90s,覆盖一轮编辑循环):
+/// - `write_file` / `edit_file` 命中 → 软警告附加到输出,不阻断(old_string 匹配本身可自纠);
+/// - `replace_lines` 命中 → 硬拦截,返回错误,强制模型先 read 再精确 edit;
+/// - `read_file` 该文件 → 清除门禁。
+fn edit_gate() -> &'static Mutex<HashMap<PathBuf, Instant>> {
+    static GATE: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 归一化门禁 key:去掉 verbatim 前缀(如 `\\?\D:\` → `D:\`)并统一分隔符为 `/`,
+/// 使不同工具调用间(write/edit/replace/read)的路径写法一致,避免误命中/漏命中。
+fn norm_to_path(p: &Path) -> PathBuf {
+    let stripped = strip_verbatim_prefix(p);
+    PathBuf::from(stripped.to_string_lossy().replace('\\', "/"))
+}
+
+/// 检查门禁。命中返回提示文本(软/硬由调用方决定)。
+fn check_edit_gate(p: &Path) -> Option<String> {
+    let key = norm_to_path(p);
+    let guard = edit_gate().lock().ok()?;
+    guard
+        .get(&key)
+        .filter(|at| at.elapsed() < Duration::from_secs(90))
+        .map(|_| {
+            format!(
+                "[F4 反级联门禁] 文件上次写入后诊断失败({});请先 read_file 重新读取确认最新内容,再以一次精确的 edit_file 修复,\
+                 不要继续叠加更多修改(行号已漂移,继续 replace_lines 会加剧级联损坏)。",
+                p.display()
+            )
+        })
+}
+
+/// 记录一次诊断失败(设置门禁)。
+fn set_edit_gate(p: &Path) {
+    if let Ok(mut guard) = edit_gate().lock() {
+        guard.insert(norm_to_path(p), Instant::now());
+    }
+}
+
+/// 解除门禁。
+fn clear_edit_gate(p: &Path) {
+    if let Ok(mut guard) = edit_gate().lock() {
+        guard.remove(&norm_to_path(p));
+    }
+}
+
+/// 诊断输出是否包含需要触发门禁的致命错误。
+///
+/// 覆盖 F2 的强错误标记(`[python-syntax] FAILED`)与 LSP/cargo 的 error 类型诊断。
+fn diagnostics_indicate_failure(diag_text: &str) -> bool {
+    diag_text.contains("[python-syntax] FAILED")
+        || diag_text.contains("error[")
+        || diag_text.contains("[error]")
+        || diag_text.contains("error:")
+}
+
+/// 附加写后诊断 + 依结果设置门禁。返回 `(写入结果, 附加的提示)`。
+///
+/// 供 `write_file`/`edit_file`/`replace_lines` 共用,统一 cargo check / LSP / F2 校验
+/// 的调用与门禁设置,避免三处重复逻辑。
+fn append_post_write_checks(
+    file_path: &Path,
+    json_out: String,
+    gate_path: &Path,
+) -> (String, Option<String>) {
+    let mut output = json_out;
+    // 门禁提示优先(软警告):即使本次诊断通过,若曾在窗口内失败也提醒先 read。
+    let gate_warning = check_edit_gate(gate_path);
+    let mut failure = false;
+    if let Some(check_output) = run_cargo_check_for_file(file_path) {
+        output.push_str("\n\n--- cargo check ---\n");
+        output.push_str(&check_output);
+        if diagnostics_indicate_failure(&check_output) {
+            failure = true;
+        }
+    }
+    if let Some(lsp_output) = run_lsp_diagnostics_for_file(file_path) {
+        output.push_str("\n\n--- LSP diagnostics ---\n");
+        output.push_str(&lsp_output);
+        if diagnostics_indicate_failure(&lsp_output) {
+            failure = true;
+        }
+    }
+    if let Some(ref w) = gate_warning {
+        output.push_str("\n\n");
+        output.push_str(w);
+    }
+    if failure {
+        set_edit_gate(gate_path);
+    }
+    (output, gate_warning.or(failure.then(String::new)))
 }
 
 /// 文件扩展名 → LSP 语言标识（与 `LspRegistry::dispatch` 的语言映射保持一致）。
@@ -3070,6 +3165,10 @@ fn lsp_language_for_extension(ext: &str) -> Option<&'static str> {
 /// - auto-start 首次失败 → 附安装提示引导安装;
 /// - 刷新成功但 0 问题 → 不附加(已确认刷新过,避免噪音)。
 /// - `.rs` 维持 cargo check 兜底,不叠加 LSP(避免双重同步等待)。
+///
+/// F2 `.py` 兜底:当 pylsp 未配置/不可用时,LSP 只会给出 `Skip`/`InstallHint`
+/// (本会话实证:编辑 engine.py 25 次毫无结构反馈)。此时回退到内置
+/// `python -m py_compile` 语法结构校验,用强错误标记提示,而不是静默通过。
 fn run_lsp_diagnostics_for_file(file_path: &Path) -> Option<String> {
     let ext = file_path.extension()?.to_str()?.to_ascii_lowercase();
     // 非代码文件直接跳过,避免无谓的 registry 加锁。
@@ -3078,16 +3177,58 @@ fn run_lsp_diagnostics_for_file(file_path: &Path) -> Option<String> {
     if ext == "rs" {
         return None;
     }
+    // F2: `.py` 先跑内置结构校验,作为 pylsp 缺失时的强兜底。
+    let python_syntax = if ext == "py" {
+        run_python_syntax_check(file_path)
+    } else {
+        None
+    };
     let registry = global_lsp_registry();
     let path = file_path.to_string_lossy();
     match registry.refresh_diagnostics_for_path(&path) {
         LspAutoDiagOutcome::Refresh(diags) if !diags.is_empty() => {
             Some(format_lsp_diagnostics(file_path, &diags))
         }
-        LspAutoDiagOutcome::Refresh(_) => None, // 0 问题:不附加(已确认刷新过)
-        LspAutoDiagOutcome::InstallHint(hint) => Some(hint),
-        LspAutoDiagOutcome::Skip => None,
+        // 0 问题:已确认刷新过,无需附加(pylsp 存在且结构无误)。
+        LspAutoDiagOutcome::Refresh(_) => None,
+        // pylsp 缺失/未启动成功:优先回退内置 .py 结构校验;pylsp 安装提示保留为后备。
+        LspAutoDiagOutcome::InstallHint(hint) => python_syntax.or(Some(hint)),
+        // 语言不支持/冷却期/等待推送超时:用内置 .py 校验兜底(py 无 server 时常走此分支)。
+        LspAutoDiagOutcome::Skip => python_syntax,
     }
+}
+
+/// F2: `.py` 文件内置语法结构校验回退。
+///
+/// 在 pylsp 缺失/不可用时,用 `python -m py_compile` 做语法级结构检查(不执行、
+/// 单文件、快速)。整个模块错(如缩进、未闭合、非法 from import)时 py_compile
+/// 报 `SyntaxError` 并退出非 0;结构正确则静默。仅验证语法,不做 import/运行,
+/// 避免把"编辑中间态"误判为坏文件。
+///
+/// 返回强错误标记文本;无语法错误或本机无 `python`/`python3` 时返回 `None`。
+fn run_python_syntax_check(file_path: &Path) -> Option<String> {
+    let file_clone = file_path.to_path_buf();
+    for interpreter in ["python", "python3"] {
+        // 本机无该解释器(命令不存在)则继续尝试下一个,而非提前返回 None。
+        let Ok(output) = Command::new(interpreter)
+            .args(["-m", "py_compile"])
+            .arg(&file_clone)
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let raw = stderr.trim().to_string();
+            // 强错误标记:affix 明确标注"结构校验失败",避免模型误以为是 INFO。
+            return Some(format!(
+                "[python-syntax] FAILED in {}:\n{}",
+                file_path.display(),
+                raw
+            ));
+        }
+    }
+    None
 }
 
 /// 将 LSP 诊断格式化为 AI 可读的文本块（1-based 行号）。
@@ -3199,9 +3340,62 @@ mod lsp_auto_diagnostics_tests {
             "编辑含语法错误的 .py 应返回诊断块(auto-start pylsp 并等待推送)"
         );
         let text = out.unwrap();
+        assert!(text.contains("issue(s)"), "诊断块应包含问题数,got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod python_syntax_fallback_tests {
+    use super::run_python_syntax_check;
+
+    fn has_python() -> bool {
+        ["python", "python3"].iter().any(|cmd| {
+            std::process::Command::new(cmd)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+    }
+
+    #[test]
+    fn clean_py_returns_none() {
+        if !has_python() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("claw-py-syntax-ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = dir.join("ok.py");
+        std::fs::write(&py, "def f(x):\n    return x + 1\n").unwrap();
         assert!(
-            text.contains("issue(s)"),
-            "诊断块应包含问题数,got: {text}"
+            run_python_syntax_check(&py).is_none(),
+            "结构正确的 .py 不应返回校验失败"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_py_reports_strong_error_marker() {
+        if !has_python() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("claw-py-syntax-bad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = dir.join("bad.py");
+        // 括号不匹配 → py_compile 必然 SyntaxError(与缩进无关,稳定可复现)。
+        std::fs::write(&py, "def f(:\n    return 1\n").unwrap();
+        let out = run_python_syntax_check(&py);
+        assert!(out.is_some(), "含语法错误的 .py 应返回强错误标记");
+        let text = out.unwrap();
+        assert!(
+            text.contains("[python-syntax] FAILED"),
+            "应含强错误标记 [python-syntax] FAILED,got: {text}"
+        );
+        assert!(
+            text.contains("SyntaxError"),
+            "应包含 python 的 SyntaxError 明细,got: {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3216,15 +3410,13 @@ fn run_write_file(
     let extra = extra_roots.unwrap_or(&[]);
     let result = write_file_in_workspace_with_roots(&input.path, &input.content, &workspace, extra)
         .map_err(io_to_string)?;
-    let mut output = to_pretty_json(&result)?;
-    if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
-        output.push_str("\n\n--- cargo check ---\n");
-        output.push_str(&check_output);
-    }
-    if let Some(lsp_output) = run_lsp_diagnostics_for_file(Path::new(&result.file_path)) {
-        output.push_str("\n\n--- LSP diagnostics ---\n");
-        output.push_str(&lsp_output);
-    }
+    // F4:统一写后诊断 + 门禁(软警告,old_string 无匹配概念,不阻断写入)。
+    let json_out = to_pretty_json(&result)?;
+    let (output, _) = append_post_write_checks(
+        Path::new(&result.file_path),
+        json_out,
+        Path::new(&input.path),
+    );
     Ok(output)
 }
 
@@ -3241,15 +3433,13 @@ fn run_edit_file(input: EditFileInput, extra_roots: Option<&[PathBuf]>) -> Resul
         extra,
     )
     .map_err(io_to_string)?;
-    let mut output = to_pretty_json(&result)?;
-    if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
-        output.push_str("\n\n--- cargo check ---\n");
-        output.push_str(&check_output);
-    }
-    if let Some(lsp_output) = run_lsp_diagnostics_for_file(Path::new(&result.file_path)) {
-        output.push_str("\n\n--- LSP diagnostics ---\n");
-        output.push_str(&lsp_output);
-    }
+    // F4:统一写后诊断 + 门禁(软警告,old_string 匹配本身可自纠,不阻断编辑)。
+    let json_out = to_pretty_json(&result)?;
+    let (output, _) = append_post_write_checks(
+        Path::new(&result.file_path),
+        json_out,
+        Path::new(&input.path),
+    );
     Ok(output)
 }
 
@@ -3258,6 +3448,11 @@ fn run_replace_lines(
     input: ReplaceLinesInput,
     extra_roots: Option<&[PathBuf]>,
 ) -> Result<String, String> {
+    // F4:硬拦截——若门禁命中(该文件上次写入后诊断失败,行号已漂移),直接返回错误,
+    // 强制模型先 read_file 拿到最新内容,再做一次精确的 edit_file/write_file 修复。
+    if let Some(warning) = check_edit_gate(Path::new(&input.path)) {
+        return Err(warning);
+    }
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     let extra = extra_roots.unwrap_or(&[]);
     let result = replace_lines_in_workspace_with_roots(
@@ -3269,15 +3464,13 @@ fn run_replace_lines(
         extra,
     )
     .map_err(io_to_string)?;
-    let mut output = to_pretty_json(&result)?;
-    if let Some(check_output) = run_cargo_check_for_file(Path::new(&result.file_path)) {
-        output.push_str("\n\n--- cargo check ---\n");
-        output.push_str(&check_output);
-    }
-    if let Some(lsp_output) = run_lsp_diagnostics_for_file(Path::new(&result.file_path)) {
-        output.push_str("\n\n--- LSP diagnostics ---\n");
-        output.push_str(&lsp_output);
-    }
+    // F4:统一写后诊断 + 门禁(本次若诊断失败,再次 replace_lines 会被硬拦截)。
+    let json_out = to_pretty_json(&result)?;
+    let (output, _) = append_post_write_checks(
+        Path::new(&result.file_path),
+        json_out,
+        Path::new(&input.path),
+    );
     Ok(output)
 }
 
@@ -3799,7 +3992,6 @@ struct ImBridgeSetupInput {
     agent_id: Option<i64>,
 }
 
-
 /// `ImBridgeSetup` 工具输出。
 #[derive(Debug, serde::Serialize)]
 struct ImBridgeSetupOutput {
@@ -3813,7 +4005,12 @@ struct ImBridgeSetupOutput {
 }
 
 impl ImBridgeSetupOutput {
-    fn ok(config_path: String, configured: bool, platforms: Vec<String>, message: impl Into<String>) -> Self {
+    fn ok(
+        config_path: String,
+        configured: bool,
+        platforms: Vec<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             success: true,
             config_path,
@@ -3846,7 +4043,6 @@ struct ImBridgeServiceInput {
     /// 配置文件的 listen_addr（不传则从 ~/.claw/im-bridge.toml 读取）。
     listen_addr: Option<String>,
 }
-
 
 /// `ImBridgeService` 工具输出。
 #[derive(Debug, serde::Serialize)]
@@ -5728,9 +5924,10 @@ fn persist_agent_terminal_state(
                 .iter()
                 .any(|a| matches!(a, runtime::PolicyAction::CloseoutLane))
             {
-                next_manifest
-                    .lane_events
-                    .push(LaneEvent::closed(iso8601_now(), Some(context.lane_id.clone())));
+                next_manifest.lane_events.push(LaneEvent::closed(
+                    iso8601_now(),
+                    Some(context.lane_id.clone()),
+                ));
             }
         }
         if let Some(provenance) = maybe_commit_provenance(result) {
@@ -7638,7 +7835,11 @@ fn render_im_bridge_section(input: &ImBridgeSetupInput) -> (String, Vec<String>)
                 section.push_str(&format!("mode = \"{mode}\"\n"));
                 section.push_str(&format!("app_id = \"{app_id}\"\n"));
                 section.push_str(&format!("app_secret = \"{app_secret}\"\n"));
-                if let Some(v) = input.verification_token.as_deref().filter(|s| !s.is_empty()) {
+                if let Some(v) = input
+                    .verification_token
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                {
                     section.push_str(&format!("verification_token = \"{v}\"\n"));
                 }
                 if let Some(k) = input.encrypt_key.as_deref().filter(|s| !s.is_empty()) {
@@ -7776,11 +7977,7 @@ fn execute_im_bridge_setup(input: ImBridgeSetupInput) -> Result<ImBridgeSetupOut
             None => "跨进程互通未启用：im-bridge 仅进程内互通，TUI 主会话无法与 IM 频道经文件队列互发。如需启用，用 action='setup' 并传入 bus_root（指向 TUI claw 进程所在项目的 .claw/bus 目录，例如项目根为 C:/proj 则填 C:/proj/.claw/bus）；若不知道项目目录请询问用户。".to_string(),
         };
         let msg = if configured {
-            format!(
-                "已配置平台: {}。{}",
-                platforms.join(", "),
-                interop
-            )
+            format!("已配置平台: {}。{}", platforms.join(", "), interop)
         } else {
             format!(
                 "未配置平台。{} 如需配置飞书，调用本工具并传入 action='setup'、platform='feishu'、app_id、app_secret；若未知凭据，请向用户询问。",
@@ -7796,7 +7993,9 @@ fn execute_im_bridge_setup(input: ImBridgeSetupInput) -> Result<ImBridgeSetupOut
     }
 
     if action != "setup" {
-        return Err(format!("未知 action: '{action}'（可选 'status' / 'setup'）"));
+        return Err(format!(
+            "未知 action: '{action}'（可选 'status' / 'setup'）"
+        ));
     }
 
     // 生成平台段并校验必填
@@ -7824,7 +8023,9 @@ fn execute_im_bridge_setup(input: ImBridgeSetupInput) -> Result<ImBridgeSetupOut
         .unwrap_or_else(|| "1800".to_string());
     let listen_addr = input.listen_addr.clone().unwrap_or(default_listen);
     // 审查补充(2026-08-12):跨进程互通目录——入参覆盖、否则继承已有配置。
-    let default_bus_root = existing.as_deref().and_then(|c| extract_toml_value(c, "bus_root"));
+    let default_bus_root = existing
+        .as_deref()
+        .and_then(|c| extract_toml_value(c, "bus_root"));
     let bus_root = input
         .bus_root
         .clone()
@@ -7860,7 +8061,8 @@ fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServ
 
     match action {
         "status" => {
-            let (running, running_pid) = im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
+            let (running, running_pid) =
+                im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
             let pid_label = running_pid
                 .map(|p| format!(" (PID {p})"))
                 .unwrap_or_default();
@@ -7869,17 +8071,20 @@ fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServ
             } else {
                 "IM Bridge 服务未运行。如需启动，调用本工具并传入 action='start'。".to_string()
             };
-            Ok(ImBridgeServiceOutput::ok(
-                "status",
-                running,
-                config_path.display().to_string(),
-                msg,
+            Ok(
+                ImBridgeServiceOutput::ok(
+                    "status",
+                    running,
+                    config_path.display().to_string(),
+                    msg,
+                )
+                .with_pid(running_pid),
             )
-            .with_pid(running_pid))
         }
         "start" => {
             // 已运行则直接返回成功
-            let (running, running_pid) = im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
+            let (running, running_pid) =
+                im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
             if running {
                 let pid_label = running_pid
                     .map(|p| format!(" (PID {p})"))
@@ -7900,8 +8105,8 @@ fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServ
                     config_path.display()
                 ));
             }
-            let content = std::fs::read_to_string(&config_path)
-                .map_err(|e| format!("读取配置失败: {e}"))?;
+            let content =
+                std::fs::read_to_string(&config_path).map_err(|e| format!("读取配置失败: {e}"))?;
             let issues = im_bridge_validate_config(&content);
             if !issues.is_empty() {
                 return Ok(ImBridgeServiceOutput {
@@ -7911,13 +8116,17 @@ fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServ
                     pid: None,
                     config_path: config_path.display().to_string(),
                     issues,
-                    message: Some("配置不完整，无法启动。请用 ImBridgeSetup 工具补齐缺失字段。".to_string()),
+                    message: Some(
+                        "配置不完整，无法启动。请用 ImBridgeSetup 工具补齐缺失字段。".to_string(),
+                    ),
                 });
             }
 
             // 定位可执行文件
-            let bin = resolve_im_bridge_binary()
-                .ok_or_else(|| "找不到 claw-im-bridge 可执行文件。请先构建: cargo build --release -p im-bridge".to_string())?;
+            let bin = resolve_im_bridge_binary().ok_or_else(|| {
+                "找不到 claw-im-bridge 可执行文件。请先构建: cargo build --release -p im-bridge"
+                    .to_string()
+            })?;
 
             // 启动进程，日志重定向到 ~/.claw/im-bridge.log
             let log_path = config_path.with_file_name("im-bridge.log");
@@ -7940,12 +8149,16 @@ fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServ
                 "start",
                 true,
                 config_path.display().to_string(),
-                format!("IM Bridge 服务已启动 (PID {pid})。日志: {}", log_path.display()),
+                format!(
+                    "IM Bridge 服务已启动 (PID {pid})。日志: {}",
+                    log_path.display()
+                ),
             )
             .with_pid(Some(pid)))
         }
         "stop" => {
-            let (running, pid) = im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
+            let (running, pid) =
+                im_bridge_probe_running(&config_path, input.listen_addr.as_deref());
             if !running {
                 return Ok(ImBridgeServiceOutput::ok(
                     "stop",
@@ -7955,8 +8168,7 @@ fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServ
                 ));
             }
             let pid = pid.ok_or_else(|| "服务在运行但无法获取 PID，请手动停止进程".to_string())?;
-            kill_im_bridge_process(pid)
-                .map_err(|e| format!("停止服务失败: {e}"))?;
+            kill_im_bridge_process(pid).map_err(|e| format!("停止服务失败: {e}"))?;
             Ok(ImBridgeServiceOutput::ok(
                 "stop",
                 false,
@@ -7964,7 +8176,9 @@ fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServ
                 format!("IM Bridge 服务已停止 (PID {pid})。"),
             ))
         }
-        other => Err(format!("未知 action: '{other}'（可选 'status' / 'start' / 'stop'）")),
+        other => Err(format!(
+            "未知 action: '{other}'（可选 'status' / 'start' / 'stop'）"
+        )),
     }
 }
 
@@ -8992,12 +9206,20 @@ mod tests {
     };
     use serde_json::json;
 
+    /// 跨平台判断 `path` 是否以给定相对后缀结尾。
+    ///
+    /// `Path::ends_with` 按**组件**比较,A需兼容 Windows(`\`)与 POSIX(`/`)分隔符;
+    /// 直接对字符串 `ends_with` 用 `/` 硬编码在其他平台会失败。
+    fn path_suffix(path: &str, suffix: &str) -> bool {
+        Path::new(path).ends_with(Path::new(suffix))
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -9015,6 +9237,131 @@ mod tests {
         let _guard = env_guard();
     }
 
+    // ---- F4 反级联门禁 ----
+
+    /// 门禁 key 归一化:verbatim 前缀被剥离,反斜杠统一为 `/`,不同写法应命中同一 key。
+    #[test]
+    fn f4_norm_to_path_normalizes_and_gate_roundtrip() {
+        let verbatim = Path::new(r"\\?\D:\proj\engine.py");
+        let slash = Path::new(r"D:\proj\engine.py");
+        let unix = Path::new(r"D:/proj/engine.py");
+        let k1 = super::norm_to_path(verbatim);
+        let k2 = super::norm_to_path(slash);
+        let k3 = super::norm_to_path(unix);
+        assert_eq!(
+            k1,
+            PathBuf::from("D:/proj/engine.py"),
+            "verbatim 前缀未剥离"
+        );
+        assert_eq!(k2, k1, "反斜杠未归一为 `/`");
+        assert_eq!(k3, k1, "不同分隔写法应命中同一门禁 key");
+
+        // 同一路径反复 set/clear 应可命中与解除(不因归一化产生漏命中)。
+        let p = Path::new(r"D:\proj\gate_roundtrip.py");
+        assert!(super::check_edit_gate(p).is_none(), "初始不应命中门禁");
+        super::set_edit_gate(p);
+        assert!(super::check_edit_gate(p).is_some(), "set 后应命中门禁");
+        super::clear_edit_gate(p);
+        assert!(super::check_edit_gate(p).is_none(), "clear 后应解除门禁");
+    }
+
+    /// 归一化后,用不同路径写法也能命中(set 与 check 写法不同)与解除。
+    #[test]
+    fn f4_gate_matches_across_path_notations() {
+        let set_path = Path::new(r"D:\proj\mixed_notation.py");
+        super::set_edit_gate(set_path);
+        // check 用不同归一化写法(verbatim),应仍命中。
+        let check_path = Path::new(r"\\?\D:/proj/mixed_notation.py");
+        assert!(
+            super::check_edit_gate(check_path).is_some(),
+            "不同写法应命中同一门禁"
+        );
+        super::clear_edit_gate(check_path);
+        assert!(
+            super::check_edit_gate(set_path).is_none(),
+            "clear 用另一写法也应解除"
+        );
+    }
+
+    /// 诊断失败判定:识别 F2 强错误标记与 LSP/cargo 的 error 类型。
+    #[test]
+    fn f4_diagnostics_indicate_failure_detects_fatal_errors() {
+        let python_syntax = concat!(
+            "src/engine.py:1:8: SyntaxError: invalid syntax\n",
+            "[python-syntax] FAILED"
+        );
+        assert!(
+            super::diagnostics_indicate_failure(python_syntax),
+            "F2 强标记应判定失败"
+        );
+        assert!(
+            super::diagnostics_indicate_failure("error[E0308]: mismatched types"),
+            "cargo error[...]"
+        );
+        assert!(
+            super::diagnostics_indicate_failure("error: could not compile"),
+            "error: 行"
+        );
+        assert!(
+            super::diagnostics_indicate_failure("rpc [error] java.lang.NullPointerException"),
+            "[error]"
+        );
+        assert!(
+            !super::diagnostics_indicate_failure("warning: unused variable"),
+            "warning 不应判定失败"
+        );
+        assert!(
+            !super::diagnostics_indicate_failure(""),
+            "空诊断不应判定失败"
+        );
+    }
+
+    /// 门禁命中时 replace_lines 硬拦截:返回错误而非执行替换(检查发生在磁盘访问之前)。
+    #[test]
+    fn f4_replace_lines_hard_blocked_when_gate_armed() {
+        let p = Path::new(r"D:\proj\hard_blocked.py");
+        super::set_edit_gate(p);
+        let input = super::ReplaceLinesInput {
+            path: r"D:\proj\hard_blocked.py".to_string(),
+            start_line: 1,
+            end_line: 5,
+            new_content: "x".to_string(),
+        };
+        let res = super::run_replace_lines(input, None);
+        assert!(
+            res.is_err(),
+            "门禁命中时 replace_lines 应被硬拦截,不应访问磁盘"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("[F4 反级联门禁]") && err.contains("read_file"),
+            "错误应给出门禁提示并引导 read_file,实际:{err}"
+        );
+        super::clear_edit_gate(p);
+    }
+
+    /// 门禁未命中时 replace_lines 应放行:走到 workspace 解析(路径不在工作区 → io 错误),
+    /// 而不是门禁拦截。以此证明门禁只在命中时拦截。
+    #[test]
+    fn f4_replace_lines_proceeds_when_gate_clear() {
+        // 显式清空,避免测试全局静态上的残留。
+        let p = Path::new(r"D:\proj\gate_clear_path.py");
+        super::clear_edit_gate(p);
+        let input = super::ReplaceLinesInput {
+            path: r"D:\proj\gate_clear_path.py".to_string(),
+            start_line: 1,
+            end_line: 1,
+            new_content: "y".to_string(),
+        };
+        let res = super::run_replace_lines(input, None);
+        assert!(res.is_err(), "文件不在工作区应报 io 错误");
+        let err = res.unwrap_err();
+        assert!(
+            !err.contains("[F4 反级联门禁]"),
+            "门禁未命中不应给出门禁提示,实际:{err}"
+        );
+    }
+
     #[test]
     fn dag_define_registers_and_dag_run_finds_dag() {
         // 定义 DAG:analyze → implement → test(依赖链)
@@ -9029,7 +9376,10 @@ mod tests {
             ]
         });
         let out = execute_tool("dag_define", &define).expect("dag_define should succeed");
-        assert!(out.contains("registered DAG 'e2e-pipeline'"), "unexpected: {out}");
+        assert!(
+            out.contains("registered DAG 'e2e-pipeline'"),
+            "unexpected: {out}"
+        );
 
         // 重复注册同一 id 应失败
         let dup = execute_tool("dag_define", &define);
@@ -9241,7 +9591,9 @@ mod tests {
         fs::create_dir_all(&claw_dir).expect("create .claw dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
+        // Use serde_json so Windows backslashes in temp_dir are escaped correctly
+        // (format! would emit invalid JSON like "\U", breaking ConfigLoader.load()).
+        let settings = serde_json::json!({ "trustedRoots": [tmp_root] }).to_string();
         fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
@@ -10510,10 +10862,10 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(path_suffix(
+            output["path"].as_str().expect("path"),
+            "help/SKILL.md"
+        ));
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -10529,10 +10881,10 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(path_suffix(
+            dollar_output["path"].as_str().expect("path"),
+            "help/SKILL.md"
+        ));
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -10568,19 +10920,19 @@ mod tests {
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
-        assert!(skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claw/skills/plan/SKILL.md"));
+        assert!(path_suffix(
+            skill_output["path"].as_str().expect("path"),
+            ".claw/skills/plan/SKILL.md"
+        ));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
-        assert!(command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claw/commands/handoff.md"));
+        assert!(path_suffix(
+            command_output["path"].as_str().expect("path"),
+            ".claw/commands/handoff.md"
+        ));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");
@@ -10615,10 +10967,10 @@ mod tests {
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/skills/trace/SKILL.md"));
+        assert!(path_suffix(
+            output["path"].as_str().expect("path"),
+            ".claude/skills/trace/SKILL.md"
+        ));
         assert_eq!(output["description"], "Project-local trace helper");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -10677,15 +11029,15 @@ mod tests {
         let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
         let agents_output: serde_json::Value =
             serde_json::from_str(&agents_result).expect("valid json");
-        assert!(omc_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".omc/skills/hud/SKILL.md"));
+        assert!(path_suffix(
+            omc_output["path"].as_str().expect("path"),
+            ".omc/skills/hud/SKILL.md"
+        ));
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
-        assert!(agents_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".agents/skills/trace/SKILL.md"));
+        assert!(path_suffix(
+            agents_output["path"].as_str().expect("path"),
+            ".agents/skills/trace/SKILL.md"
+        ));
         assert_eq!(
             agents_output["description"],
             "Project-local agents compatibility helper"
@@ -10737,10 +11089,10 @@ mod tests {
             .expect("learned skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/omc-learned/learned/SKILL.md"));
+        assert!(path_suffix(
+            output["path"].as_str().expect("path"),
+            "skills/omc-learned/learned/SKILL.md"
+        ));
         assert_eq!(output["description"], "Learned OMC skill");
 
         match original_home {
@@ -10796,20 +11148,20 @@ mod tests {
             execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
         let direct_skill_output: serde_json::Value =
             serde_json::from_str(&direct_skill).expect("valid skill json");
-        assert!(direct_skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/statusline/SKILL.md"));
+        assert!(path_suffix(
+            direct_skill_output["path"].as_str().expect("path"),
+            "skills/statusline/SKILL.md"
+        ));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
         let legacy_command =
             execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
         let legacy_command_output: serde_json::Value =
             serde_json::from_str(&legacy_command).expect("valid command json");
-        assert!(legacy_command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("commands/doctor-check.md"));
+        assert!(path_suffix(
+            legacy_command_output["path"].as_str().expect("path"),
+            "commands/doctor-check.md"
+        ));
         assert_eq!(
             legacy_command_output["description"],
             "Claude config command"
@@ -10863,10 +11215,10 @@ mod tests {
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/commands/team.md"));
+        assert!(path_suffix(
+            output["path"].as_str().expect("path"),
+            ".claude/commands/team.md"
+        ));
         assert_eq!(output["description"], "Legacy team workflow");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -12561,6 +12913,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn powershell_runs_via_stub_shell() {
         let _guard = env_lock()
             .lock()
@@ -12992,9 +13345,20 @@ printf 'pwsh:%s' "$1"
             "cargo test --workspace"
         );
         assert_eq!(output["task_packet"]["reporting_targets"][0], "leader");
+        // acceptance_tests 是 legacy 双轨字段,validate_packet 会清空它、
+        // 只保留 canonical acceptance_criteria(见 runtime task_packet.rs)。
+        assert!(
+            output["task_packet"]["acceptance_tests"].is_null()
+                || output["task_packet"]["acceptance_tests"]
+                    .as_array()
+                    .map(|a| a.is_empty())
+                    .unwrap_or(false),
+            "acceptance_tests legacy dual-track should be cleared by validate_packet"
+        );
+        // canonical 字段仍携带验收标准。
         assert_eq!(
-            output["task_packet"]["acceptance_tests"][1],
-            "cargo test --workspace"
+            output["task_packet"]["acceptance_criteria"][0],
+            "task packet is accepted"
         );
     }
 
@@ -13106,6 +13470,9 @@ printf 'pwsh:%s' "$1"
     #[test]
     fn ask_user_question_uses_injected_handler_when_set() {
         use std::sync::Arc;
+        // 两个 ask_user_question 测试共享全局 ASK_USER_QUESTION_HANDLER,
+        // 用全局 env 锁串行化,避免并发互相清空 handler 导致 answer 走错路径。
+        let _guard = env_guard();
         // handler 返回固定答案，验证路径正确
         let handler: super::AskUserQuestionHandler = Arc::new(|req| {
             // 模拟选项编号回传
@@ -13137,6 +13504,7 @@ printf 'pwsh:%s' "$1"
     /// 这里仅验证 handler=None 时 `set_ask_user_question_handler` 正确清理。
     #[test]
     fn ask_user_question_handler_can_be_cleared() {
+        let _guard = env_guard();
         // 设置后立即清理
         let handler: super::AskUserQuestionHandler = Arc::new(|_| Ok("dummy".to_string()));
         super::set_ask_user_question_handler(Some(handler));
@@ -13255,15 +13623,10 @@ mod skill_search_tests {
 
     use super::{execute_skill_search, SkillSearchInput};
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
+    // 复用 `tests` 模块的全局 env 锁,避免两个模块并行修改进程级
+    // HOME/cwd 导致 skill 解析互相污染(见 9207 处 env_lock)。
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::tests::env_guard()
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

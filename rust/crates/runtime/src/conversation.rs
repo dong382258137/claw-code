@@ -961,12 +961,8 @@ pub(crate) fn process_tool_uses(
                 is_error,
             );
         if should_archive {
-            let _ = crate::tool_result_archive::archive_tool_result(
-                workspace_root,
-                id,
-                name,
-                &output,
-            );
+            let _ =
+                crate::tool_result_archive::archive_tool_result(workspace_root, id, name, &output);
         }
         messages.push(ConversationMessage::tool_result(
             id.clone(),
@@ -2667,6 +2663,44 @@ where
         self.active_plan.as_ref()
     }
 
+    /// F5 计划文件集校验:若写入目标路径不在当前 active plan 涉及的文件集合内,
+    /// 返回一条软警告文本;否则返回 `None`。`input` 是写工具调用入参的 JSON。
+    ///
+    /// 仅在能从计划解析出文件集(非空)时生效;解析为空时"宁漏勿扰",直接返回
+    /// `None`,避免对无法确证越界的写入刷屏。
+    fn maybe_plan_scope_warning(&self, input: &str) -> Option<String> {
+        let plan = self.active_plan.as_ref()?;
+        // 计划涉及文件:从 step 描述解析;空集合(无法解析)宁漏勿扰。
+        let planned = crate::planner::plan_file_paths(plan);
+        if planned.is_empty() {
+            return None;
+        }
+        // 写类工具的目标文件字段:write/edit 用 path,兼容 file_path。
+        let parsed: serde_json::Value = serde_json::from_str(input).ok()?;
+        let target = parsed
+            .get("path")
+            .or_else(|| parsed.get("file_path"))
+            .and_then(|v| v.as_str())?;
+        // 跨平台归一化:按组件比较(兼容 / 与 \)、忽略 ./、Windows 忽略大小写。
+        let norm = |s: &str| {
+            std::path::Path::new(s)
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let target_norm = norm(target);
+        if planned.iter().any(|c| norm(c) == target_norm) {
+            return None;
+        }
+        Some(format!(
+            "[plan-scope] ⚠️ 目标文件 `{target}` 不在当前 Active Plan 涉及的文件列表(计划内: {})。\
+             若为有意的功能扩展可忽略;若偏离计划,建议先更新 Plan 再继续,避免越界改动。",
+            planned.join("、")
+        ))
+    }
+
     /// 是否启用了 Plan 模式。
     #[must_use]
     pub fn plan_mode_enabled(&self) -> bool {
@@ -3244,30 +3278,12 @@ where
                         // 同样为了最大化前缀缓存命中率。
                         system_split.dynamic_sections.push(cog_stall.clone());
                     }
-                    // Task State 注入:仅当会话经历过压缩时注入(平时会话历史
-                    // 已含任务上下文,注入冗余反而浪费 token)。压缩后 AI 靠
-                    // task_state 持有任务锚点,防止任务漂移与重复查询。
-                    if crate::compact::extract_compact_boundary(&self.session.messages).is_some() {
-                        if let Some(state) = &self.task_state {
-                            let rendered = state.render_for_prompt();
-                            if !rendered.is_empty() {
-                                system_split.dynamic_sections.push(rendered);
-                            }
-                        }
-                        // P2:历史操作教训注入 —— 压缩后读取 lessons.jsonl 最近
-                        // 教训,让 AI 下次执行同类操作时主动规避(覆盖成功 turn
-                        // 中工具级瑕疵的自进化盲区)。
-                        if let Some(root) = &self.workspace_root {
-                            let recent = crate::lessons::load_recent_lessons(
-                                root,
-                                crate::lessons::LESSONS_INJECT_MAX,
-                            );
-                            let rendered = crate::lessons::render_for_prompt(&recent);
-                            if !rendered.is_empty() {
-                                system_split.dynamic_sections.push(rendered);
-                            }
-                        }
-                    }
+                    // Task State / lessons 注入已迁移到 messages 末尾(见下方
+                    // messages.push 区域):两者由 runtime 规则式每 turn 更新
+                    // (findings 滑动窗口/lessons 落盘),放在 dynamic_sections
+                    // 会随每次更新打断 system 前缀缓存;放 messages 末尾只
+                    // 影响最后一条请求消息(session-1786886590898 实测
+                    // dynamic_section_changed ×10 的主要变源)。
                     // Verbosity steering(Headroom Output Token Reduction 对标):
                     // 在 dynamic 区末尾追加简洁指令,引导模型减少 output token。
                     // 放 dynamic 区不影响 static 缓存前缀;内容常量,不破坏隐式前缀缓存。
@@ -3294,6 +3310,34 @@ where
                     let delta = plan.render_status_delta();
                     if !delta.is_empty() {
                         messages.push(ConversationMessage::user_text(delta));
+                    }
+                }
+                // Task State + lessons 注入(messages 末尾模式,与 status_delta
+                // 同理):两者由 runtime 规则式每 turn 更新,若放 system 动态区
+                // 会随更新打断前缀缓存;追加到请求 messages 末尾只影响最后
+                // 一条消息,system_prompt + tools + 历史 messages 保持命中。
+                // 请求构造时追加,不写入 session —— 无累积。
+                // 注入条件与旧动态区实现一致:仅当会话经历过压缩。
+                if crate::compact::extract_compact_boundary(&self.session.messages).is_some() {
+                    let mut epilogue = String::new();
+                    if let Some(state) = &self.task_state {
+                        let rendered = state.render_for_prompt();
+                        if !rendered.is_empty() {
+                            epilogue.push_str(&rendered);
+                        }
+                    }
+                    if let Some(root) = &self.workspace_root {
+                        let recent = crate::lessons::load_recent_lessons(
+                            root,
+                            crate::lessons::LESSONS_INJECT_MAX,
+                        );
+                        let rendered = crate::lessons::render_for_prompt(&recent);
+                        if !rendered.is_empty() {
+                            epilogue.push_str(&rendered);
+                        }
+                    }
+                    if !epilogue.is_empty() {
+                        messages.push(ConversationMessage::user_text(epilogue));
                     }
                 }
                 ApiRequest {
@@ -4021,7 +4065,11 @@ where
                         // 阶段 3:记录工具调用统计(成功+失败),供工具级失败率 z-test 使用。
                         // 静默吞错:统计失败不阻断工具结果返回。
                         if let Some(workspace_root) = &self.workspace_root {
-                            let _ = crate::tool_call_stats::record(workspace_root, &tool_name, is_error);
+                            let _ = crate::tool_call_stats::record(
+                                workspace_root,
+                                &tool_name,
+                                is_error,
+                            );
                         }
 
                         // P0:失败的工具调用自动记录到 NOTEBOOK <attempted> 段。
@@ -4051,9 +4099,10 @@ where
                             if let Some(result) =
                                 self.maybe_branch_retry(&reason, &user_input).await
                             {
-                                let msg = ConversationMessage::assistant(vec![
-                                    ContentBlock::Text { text: result },
-                                ]);
+                                let msg =
+                                    ConversationMessage::assistant(vec![ContentBlock::Text {
+                                        text: result,
+                                    }]);
                                 self.session
                                     .push_message(msg.clone())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -4086,7 +4135,7 @@ where
                         // 入库前压缩成结构化摘要,避免大输出原样占用活跃窗口。
                         // 压缩前归档原始内容到 ToolResultArchive(失败不阻断),
                         // 摘要带 recall_full 指针,LLM 可按 tool_use_id 取回全文。
-                        let (output_to_store, should_archive) =
+                        let (mut output_to_store, should_archive) =
                             crate::content_compression::maybe_immediate_compress(
                                 &tool_use_id,
                                 &tool_name,
@@ -4102,6 +4151,20 @@ where
                                     &tool_name,
                                     &output,
                                 );
+                            }
+                        }
+                        // F5 计划文件集校验(软警告):写类工具的目标文件不在当前
+                        // active plan 涉及的文件列表时,在 tool result 末尾追加提示,
+                        // 提醒模型确认是否越界扩展。仅在能从计划解析出文件集时生效;
+                        // 解析为空(active_plan 存在但描述无路径)宁漏勿扰,不打扰。
+                        if !is_error
+                            && matches!(
+                                tool_name.as_str(),
+                                "write_file" | "edit_file" | "replace_lines"
+                            )
+                        {
+                            if let Some(hint) = self.maybe_plan_scope_warning(&effective_input) {
+                                output_to_store = format!("{output_to_store}\n\n{hint}");
                             }
                         }
                         ConversationMessage::tool_result(
@@ -4153,10 +4216,7 @@ where
                         // 真正的 runaway loop(反复相同 input/output)仍由
                         // LoopDetector 精确拦截,不依赖迭代计数兜底。
                         if !is_err
-                            && matches!(
-                                name.as_str(),
-                                "write_file" | "edit_file" | "replace_lines"
-                            )
+                            && matches!(name.as_str(), "write_file" | "edit_file" | "replace_lines")
                         {
                             turn_hard_max = turn_hard_max.max(COMPLEX_MAX_ITERATIONS);
                         }
@@ -5411,24 +5471,36 @@ where
                 let cwd = workspace_override
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| self.workspace_root.clone().unwrap_or_default());
-                ctx.project_context = match crate::prompt::ProjectContext::discover(&cwd, "unknown")
-                {
-                    Ok(mut pc) => {
-                        // 子代理上下文不注入 git 状态(diff 由 validation 阶段处理)
-                        pc.git_status = None;
-                        pc.git_diff = None;
-                        pc.git_context = None;
-                        Some(pc)
-                    }
-                    Err(_) => Some(crate::prompt::ProjectContext {
-                        cwd,
-                        current_date: "unknown".to_string(),
-                        git_status: None,
-                        git_diff: None,
-                        git_context: None,
-                        instruction_files: Vec::new(),
-                    }),
-                };
+                // 日期复用主会话 Environment 段的注入值(启动时计算的真实日期),
+                // 而非硬编码 "unknown" —— 子代理与主会话应看到同一天。
+                let date = section
+                    .lines()
+                    .find_map(|line| {
+                        let trimmed = line.trim();
+                        trimmed
+                            .strip_prefix("- Date: ")
+                            .or_else(|| trimmed.strip_prefix("Date: "))
+                    })
+                    .unwrap_or("unknown")
+                    .to_string();
+                ctx.project_context =
+                    match crate::prompt::ProjectContext::discover(&cwd, date.clone()) {
+                        Ok(mut pc) => {
+                            // 子代理上下文不注入 git 状态(diff 由 validation 阶段处理)
+                            pc.git_status = None;
+                            pc.git_diff = None;
+                            pc.git_context = None;
+                            Some(pc)
+                        }
+                        Err(_) => Some(crate::prompt::ProjectContext {
+                            cwd,
+                            current_date: date,
+                            git_status: None,
+                            git_diff: None,
+                            git_context: None,
+                            instruction_files: Vec::new(),
+                        }),
+                    };
             }
         }
         // L2 工具签名层(design-gaps #5):按 capability 白名单过滤注入。
@@ -6086,9 +6158,8 @@ where
             });
 
         // LLM 生成步骤,失败回退启发式分解。
-        let steps = generate_steps_with_llm(&task_summary).unwrap_or_else(|| {
-            decompose_task(&task_summary)
-        });
+        let steps =
+            generate_steps_with_llm(&task_summary).unwrap_or_else(|| decompose_task(&task_summary));
 
         let plan = PlanArtifact::new(task_summary, steps);
         let plan_id = plan.id.clone();
@@ -6667,10 +6738,14 @@ where
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
         let threshold = self.effective_compaction_threshold();
-        // 使用 context_tokens() 而非 input_tokens：
-        // DeepSeek 风格的 API 返回 input_tokens=0，所有 prompt tokens 在 cache 字段中。
-        // context_tokens() 通过 max(input_tokens, cache_creation + cache_read) 统一处理。
-        if self.usage_tracker.cumulative_usage().context_tokens() < threshold {
+        // 触发量必须是「当前上下文窗口大小」(最近一次请求的 prompt 量),
+        // 而非 cumulative(全会话累计,含 cache_read,压缩后不清零)。
+        // 用累计量对比阈值是语义错配:累计单调递增,跨过阈值后每次请求
+        // 都触发压缩 → 连环压缩循环(session-1786886590898 实测 22 分钟
+        // 3 次,其中 1 分钟内 2 次)。current_turn_usage().context_tokens()
+        // 才是压缩的作用对象;压缩后窗口缩小,自然回到阈值下方。
+        // context_tokens() 统一 DeepSeek(input=0) 与 Anthropic 风格。
+        if self.usage_tracker.current_turn_usage().context_tokens() < threshold {
             return None;
         }
 
@@ -6680,7 +6755,7 @@ where
         // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
         let pre_compact_context = format!(
             "auto_compaction: context_tokens={} threshold={}",
-            self.usage_tracker.cumulative_usage().context_tokens(),
+            self.usage_tracker.current_turn_usage().context_tokens(),
             threshold
         );
         self.hook_runner
@@ -7364,14 +7439,14 @@ mod tests {
     use super::{
         build_assistant_message, build_branch_retry_task, build_subagent_request,
         build_subagent_retry_context, build_subagent_system_prompt,
-        compaction_threshold_for_context_window, extract_file_path_from_tool_input,
-        default_subagent_tool_catalog, is_repetition_warning, microcompact_preserve_recent,
+        compaction_threshold_for_context_window, default_subagent_tool_catalog,
+        extract_file_path_from_tool_input, is_repetition_warning, microcompact_preserve_recent,
         parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, process_tool_uses,
         rewrite_path_to_workspace_relative, ApiClient, ApiRequest, AssistantEvent,
         AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError,
-        StaticToolExecutor, SubagentContext, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
-        DEFAULT_MAX_ITERATIONS, MICROCOMPACT_PRESERVE_RECENT, SESSION_SEARCH_TOOL_SPEC,
-        SOFT_MAX_ITERATIONS,
+        StaticToolExecutor, SubagentContext, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
+        MICROCOMPACT_PRESERVE_RECENT, SESSION_SEARCH_TOOL_SPEC, SOFT_MAX_ITERATIONS,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
@@ -7418,22 +7493,20 @@ mod tests {
             Some("/x/a.py")
         );
         assert_eq!(
-            extract_file_path_from_tool_input("edit_file", r#"{"file_path":"/x/b.rs"}"#)
-                .as_deref(),
+            extract_file_path_from_tool_input("edit_file", r#"{"file_path":"/x/b.rs"}"#).as_deref(),
             Some("/x/b.rs")
         );
         // 只读工具仍应返回 None(不改文件,不进入 record_edit)。
-        assert!(extract_file_path_from_tool_input("read_file", r#"{"file_path":"/x/a.py"}"#).is_none());
+        assert!(
+            extract_file_path_from_tool_input("read_file", r#"{"file_path":"/x/a.py"}"#).is_none()
+        );
     }
 
     /// parse_capability:缺失/未知默认 ReadOnly(避免 Analyze 空工具白名单),显式值精确解析。
     #[test]
     fn parse_capability_defaults_to_read_only_and_parses_explicit_values() {
         // 缺失 → ReadOnly
-        assert_eq!(
-            super::parse_capability(None),
-            SubagentCapability::ReadOnly
-        );
+        assert_eq!(super::parse_capability(None), SubagentCapability::ReadOnly);
         // 未知值 → ReadOnly
         assert_eq!(
             super::parse_capability(Some(&serde_json::json!("bogus"))),
@@ -8117,7 +8190,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_when_current_context_crosses_threshold() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -8210,6 +8283,75 @@ mod tests {
             .expect("turn should succeed");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    /// 连环压缩回归(session-1786886590898 实测 22 分钟 3 次压缩):
+    /// 触发量必须是「当前上下文窗口」而非「全会话累计」。
+    /// turn1 窗口 120K 超阈值 → 压缩;turn2 窗口回落 5K(压缩生效)
+    /// → 不得再触发,即便 cumulative(125K)仍在阈值之上。
+    #[test]
+    fn no_repeated_compaction_after_context_shrinks_below_threshold() {
+        struct SequenceApi {
+            call: std::cell::Cell<u32>,
+        }
+        impl ApiClient for SequenceApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let input = if self.call.get() == 0 { 120_000 } else { 5_000 };
+                self.call.set(self.call.get() + 1);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: input,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("x".repeat(20_000)),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SequenceApi {
+                call: std::cell::Cell::new(0),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        // turn1: 窗口 120K > 100K → 触发压缩
+        let s1 = runtime.run_turn("first", None).expect("turn 1");
+        assert!(
+            s1.auto_compaction.is_some(),
+            "turn 1 must compact (current window 120K > threshold)"
+        );
+
+        // turn2: 窗口回落 5K(压缩生效后小上下文) → 不再触发;
+        // 修复前 cumulative=125K 仍 > 阈值,会错误地连环压缩。
+        let s2 = runtime.run_turn("second", None).expect("turn 2");
+        assert_eq!(
+            s2.auto_compaction,
+            None,
+            "turn 2 must not compact again after window shrank (cumulative stays above threshold but current window is 5K)"
+        );
     }
 
     #[test]
@@ -8578,8 +8720,14 @@ mod tests {
     fn build_branch_retry_task_contains_task_and_retry_hint() {
         let task = build_branch_retry_task("doom loop detected: a.rs edited 10 times", "修复 bug");
         assert!(task.contains("修复 bug"), "应包含原任务: {task}");
-        assert!(task.contains("doom loop"), "应包含 doom loop reason: {task}");
-        assert!(task.contains("换一个完全不同的策略"), "应包含换方案提示: {task}");
+        assert!(
+            task.contains("doom loop"),
+            "应包含 doom loop reason: {task}"
+        );
+        assert!(
+            task.contains("换一个完全不同的策略"),
+            "应包含换方案提示: {task}"
+        );
     }
 
     /// 阶段 1-3 端到端：doom loop → 自动分支重试 → 主 turn 恢复 → 落盘 → 工具级 candidate。
@@ -8597,10 +8745,7 @@ mod tests {
             main_calls: usize,
         }
         impl ApiClient for DoomLoopBranchApi {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 match request.request_kind {
                     RequestKind::Main => {
                         self.main_calls += 1;
@@ -8652,9 +8797,10 @@ mod tests {
         );
         let failure_traces = crate::failure_trace::load_all(tempdir.path()).expect("traces");
         assert!(
-            failure_traces
+            failure_traces.iter().any(|ft| ft
+                .steps
                 .iter()
-                .any(|ft| ft.steps.iter().any(|s| s.tool_name == "failing_tool" && s.is_error)),
+                .any(|s| s.tool_name == "failing_tool" && s.is_error)),
             "应记录 failing_tool 失败轨迹"
         );
         assert!(
@@ -9300,10 +9446,25 @@ mod tests {
         }
         impl ApiClient for TaskStateApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                self.captured
-                    .lock()
-                    .expect("lock")
-                    .push(request.system_prompt.dynamic_sections.clone());
+                // 捕获请求尾部消息文本(task_state/lessons 迁移到 messages
+                // 末尾注入,不再进 dynamic_sections)。
+                let tail_texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(tail_texts);
                 let n = self.calls.fetch_add(1, AtomicOrdering4::SeqCst);
                 if n == 0 {
                     Ok(vec![
@@ -9402,14 +9563,25 @@ mod tests {
             captured: Arc<Mutex<Vec<Vec<String>>>>,
         }
         impl ApiClient for LessonApi {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                self.captured
-                    .lock()
-                    .expect("lock")
-                    .push(request.system_prompt.dynamic_sections.clone());
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                // lessons 与 task_state 同迁移到 messages 末尾注入。
+                let tail_texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(tail_texts);
                 let n = self.calls.fetch_add(1, AtomicOrdering5::SeqCst);
                 if n == 0 {
                     Ok(vec![
@@ -9466,9 +9638,7 @@ mod tests {
             blocks: vec![ContentBlock::Text { text: marker }],
             usage: None,
         });
-        runtime
-            .run_turn("继续", None)
-            .expect("turn should succeed");
+        runtime.run_turn("继续", None).expect("turn should succeed");
 
         let sections = captured.lock().expect("lock");
         let last = sections.last().expect("request captured");
@@ -9477,7 +9647,8 @@ mod tests {
             "lessons block should be injected, got: {last:?}"
         );
         assert!(
-            last.iter().any(|s| s.contains("git stash push 需用相对 cwd")),
+            last.iter()
+                .any(|s| s.contains("git stash push 需用相对 cwd")),
             "lesson content should be injected, got: {last:?}"
         );
 
@@ -13083,8 +13254,8 @@ mod tests {
             name: "bash".to_string(),
             input: "echo big".to_string(),
         }];
-        let mut executor = StaticToolExecutor::new()
-            .register("bash", move |_input| Ok(envelope.clone()));
+        let mut executor =
+            StaticToolExecutor::new().register("bash", move |_input| Ok(envelope.clone()));
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -13137,9 +13308,7 @@ mod tests {
         // 构造超过 READ_IMMEDIATE_COMPRESS_MIN_LINES(300 行) 的代码文件
         let mut code = String::from("//! module doc\nuse std::fmt;\n");
         for i in 0..400 {
-            code.push_str(&format!(
-                "pub fn func_{i}(x: i32) -> i32 {{ x + {i} }}\n"
-            ));
+            code.push_str(&format!("pub fn func_{i}(x: i32) -> i32 {{ x + {i} }}\n"));
         }
         let envelope = serde_json::json!({
             "file": {
@@ -13156,8 +13325,8 @@ mod tests {
             name: "read_file".to_string(),
             input: r#"{"file_path":"src/big.rs"}"#.to_string(),
         }];
-        let mut executor = StaticToolExecutor::new()
-            .register("read_file", move |_input| Ok(envelope.clone()));
+        let mut executor =
+            StaticToolExecutor::new().register("read_file", move |_input| Ok(envelope.clone()));
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -13200,8 +13369,8 @@ mod tests {
             name: "bash".to_string(),
             input: "echo hi".to_string(),
         }];
-        let mut executor = StaticToolExecutor::new()
-            .register("bash", |_input| Ok("hello".to_string()));
+        let mut executor =
+            StaticToolExecutor::new().register("bash", |_input| Ok("hello".to_string()));
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -13289,12 +13458,8 @@ mod tests {
         );
         crate::multi_agent::write_handoff(tempdir.path(), &handoff).expect("write handoff");
 
-        let ctx = build_subagent_retry_context(
-            Some(tempdir.path()),
-            None,
-            subagent_id,
-        )
-        .expect("context should be Some");
+        let ctx = build_subagent_retry_context(Some(tempdir.path()), None, subagent_id)
+            .expect("context should be Some");
 
         assert!(ctx.contains("bash"), "tools_used should be injected: {ctx}");
         assert!(
@@ -13305,7 +13470,10 @@ mod tests {
             ctx.contains("src/a.rs"),
             "changed_files should be injected: {ctx}"
         );
-        assert!(ctx.contains("完成了部分重构"), "summary should be injected: {ctx}");
+        assert!(
+            ctx.contains("完成了部分重构"),
+            "summary should be injected: {ctx}"
+        );
         assert!(
             ctx.contains("不要重复已完成的操作"),
             "guidance should be injected: {ctx}"
@@ -13316,11 +13484,7 @@ mod tests {
     #[test]
     fn build_subagent_retry_context_returns_none_without_handoff() {
         let tempdir = tempfile::tempdir().expect("temp workspace");
-        let ctx = build_subagent_retry_context(
-            Some(tempdir.path()),
-            None,
-            "missing-handoff-001",
-        );
+        let ctx = build_subagent_retry_context(Some(tempdir.path()), None, "missing-handoff-001");
         assert!(ctx.is_none());
     }
 
@@ -15232,5 +15396,68 @@ mod tests {
         );
         assert!(runtime.execute_create_plan("not json").is_err());
         assert!(runtime.active_plan().is_none());
+    }
+
+    // ---- F5 计划文件集校验(软警告) ----
+
+    #[test]
+    fn plan_scope_warning_silent_when_target_in_plan() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let out = runtime
+            .execute_create_plan(
+                r#"{"plan_description": "Replace the buggy parser in src/lib.rs"}"#,
+            )
+            .expect("create_plan");
+        assert!(out.contains("plan created"), "output: {out}");
+        // 计划内文件(src/lib.rs 由 decompose_task 提取进 step 描述)→ 不触发警告。
+        assert!(
+            runtime
+                .maybe_plan_scope_warning(r#"{"path": "src/lib.rs"}"#)
+                .is_none(),
+            "计划内目标不应发出 plan-scope 警告"
+        );
+    }
+
+    #[test]
+    fn plan_scope_warning_fires_for_out_of_plan_file() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        runtime
+            .execute_create_plan(r#"{"plan_description": "Fix src/a.rs"}"#)
+            .expect("create_plan");
+        let hint = runtime.maybe_plan_scope_warning(r#"{"path": "src/b.rs"}"#);
+        assert!(hint.is_some(), "计划外目标应触发软警告");
+        let hint = hint.expect("hint");
+        assert!(
+            hint.contains("[plan-scope]"),
+            "应带 [plan-scope] 标记: {hint}"
+        );
+        assert!(hint.contains("src/b.rs"), "应点名越界目标文件: {hint}");
+    }
+
+    #[test]
+    fn plan_scope_warning_silent_without_plan() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        // 无 active plan → 绝不出警告。
+        assert!(runtime
+            .maybe_plan_scope_warning(r#"{"path": "src/x.rs"}"#)
+            .is_none());
     }
 }

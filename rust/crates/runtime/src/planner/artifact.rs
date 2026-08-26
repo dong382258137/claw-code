@@ -391,14 +391,17 @@ impl PlanArtifact {
             } else {
                 ""
             };
+            // 骨架不含 attempts 计数:attempts 随 retry 递增,属 turn 间变化
+            // 的状态量(与 ⏳/▶/✓ 同类),放骨架会打断 dynamic_sections 前缀
+            // 缓存。attempts>0 的信息由 messages 末尾的 status_delta 上下文
+            // (Failed 状态)传达。
             out.push_str(&format!(
-                "{}.{} {}\n   acceptance: {}\n   verify: {} (attempts: {})\n",
+                "{}.{} {}\n   acceptance: {}\n   verify: {}\n",
                 idx + 1,
                 risk_tag,
                 step.description,
                 step.acceptance_criteria,
                 step.verify_command.as_deref().unwrap_or("(skip)"),
-                step.attempts,
             ));
             if step.risk_level == StepRisk::High {
                 out.push_str(

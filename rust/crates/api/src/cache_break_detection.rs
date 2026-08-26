@@ -30,12 +30,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{MessageRequest, Usage};
+use crate::types::{MessageRequest, SystemContent, Usage};
 
 const DEFAULT_PROMPT_TTL_SECS: u64 = 5 * 60;
 const DEFAULT_BREAK_MIN_DROP: u32 = 2_000;
 const MAX_SANITIZED_LENGTH: usize = 80;
-const REQUEST_FINGERPRINT_VERSION: u32 = 1;
+// v2:system 指纹从"整段哈希"改为"仅静态前缀哈希"(`system_hash` 语义变更),
+// 并新增 `system_full_hash` 单独度量动态段 churn。旧版本持久化的指纹语义
+// 已不兼容,故递增版本号以干净地失效旧 session-state。
+const REQUEST_FINGERPRINT_VERSION: u32 = 2;
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -95,6 +98,10 @@ pub struct CacheBreakReasons {
     pub system_prompt_changed: u64,
     pub tool_definitions_changed: u64,
     pub message_payload_changed: u64,
+    /// 静态 system 前缀未变,但整段 system(含动态段:memory/goal/git/plan)已变。
+    /// 这是每 turn 注入 volatile 上下文的预期 churn,不是静态区被污染。
+    #[serde(default)]
+    pub dynamic_section_changed: u64,
     pub ttl_expiry: u64,
     pub unknown: u64,
 }
@@ -106,6 +113,7 @@ impl CacheBreakReasons {
             + self.system_prompt_changed
             + self.tool_definitions_changed
             + self.message_payload_changed
+            + self.dynamic_section_changed
             + self.ttl_expiry
             + self.unknown
     }
@@ -262,7 +270,11 @@ struct TrackedPromptState {
     #[serde(default = "current_fingerprint_version")]
     fingerprint_version: u32,
     model_hash: u64,
+    /// 静态 system 前缀哈希(仅带 cache_control 的块)。动态段 churn 不改变它。
     system_hash: u64,
+    /// 整段 system(含动态段)哈希,用于单独量化动态段 churn。
+    #[serde(default)]
+    system_full_hash: u64,
     tools_hash: u64,
     messages_hash: u64,
     cache_read_input_tokens: u32,
@@ -275,7 +287,8 @@ impl TrackedPromptState {
             observed_at_unix_secs: now_unix_secs(),
             fingerprint_version: current_fingerprint_version(),
             model_hash: hashes.model,
-            system_hash: hashes.system,
+            system_hash: hashes.system_static,
+            system_full_hash: hashes.system_full,
             tools_hash: hashes.tools,
             messages_hash: hashes.messages,
             cache_read_input_tokens: usage.cache_read_input_tokens,
@@ -286,7 +299,8 @@ impl TrackedPromptState {
 #[derive(Debug, Clone, Copy)]
 struct RequestFingerprints {
     model: u64,
-    system: u64,
+    system_static: u64,
+    system_full: u64,
     tools: u64,
     messages: u64,
 }
@@ -295,10 +309,29 @@ impl RequestFingerprints {
     fn from_request(request: &MessageRequest) -> Self {
         Self {
             model: hash_serializable(&request.model),
-            system: hash_serializable(&request.system),
+            system_static: hash_static_system(&request.system),
+            system_full: hash_serializable(&request.system),
             tools: hash_serializable(&request.tools),
             messages: hash_serializable(&request.messages),
         }
+    }
+}
+
+/// 仅对 system 的静态(可缓存)前缀取哈希。
+///
+/// [`build_system_blocks`] 保证静态段在前(断点携带 `cache_control`),动态段
+/// 在后(不携带 marker)。因此静态前缀 = 直到最后一个带 cache marker 的块为止。
+/// volatile 动态段(memory/goal/git/plan)的 churn 不会改变此哈希——只有真正的
+/// 静态指令变化才会。无 cache marker 时(如 legacy `Text` 形式)回退到整段哈希。
+fn hash_static_system(system: &Option<SystemContent>) -> u64 {
+    match system {
+        Some(SystemContent::Blocks(blocks)) => {
+            match blocks.iter().rposition(|b| b.cache_control.is_some()) {
+                Some(end) => hash_serializable(&blocks[..=end]),
+                None => hash_serializable(system),
+            }
+        }
+        _ => hash_serializable(system),
     }
 }
 
@@ -335,6 +368,13 @@ fn detect_cache_break(
     }
     if previous.system_hash != current.system_hash {
         reasons.push("system prompt changed");
+    }
+    // 静态前缀未变但整段 system(含动态段:memory/goal/git/plan)已变:
+    // 这是每 turn 注入 volatile 上下文的预期 churn,单独归因以便量化。
+    if previous.system_hash == current.system_hash
+        && previous.system_full_hash != current.system_full_hash
+    {
+        reasons.push("dynamic section changed");
     }
     if previous.tools_hash != current.tools_hash {
         reasons.push("tool definitions changed");
@@ -413,6 +453,12 @@ fn detect_cache_break_multi_turn(
     if previous.system_hash != current.system_hash {
         reasons.push("system prompt changed");
     }
+    // 静态前缀未变但整段 system(含动态段)已变:预期 churn,单独归因。
+    if previous.system_hash == current.system_hash
+        && previous.system_full_hash != current.system_full_hash
+    {
+        reasons.push("dynamic section changed");
+    }
     if previous.tools_hash != current.tools_hash {
         reasons.push("tool definitions changed");
     }
@@ -453,6 +499,9 @@ fn classify_break_reason(reason: &str, reasons: &mut CacheBreakReasons) {
     }
     if reason.contains("system prompt changed") {
         reasons.system_prompt_changed += 1;
+    }
+    if reason.contains("dynamic section changed") {
+        reasons.dynamic_section_changed += 1;
     }
     if reason.contains("tool definitions changed") {
         reasons.tool_definitions_changed += 1;
@@ -506,7 +555,7 @@ fn request_hash_hex(request: &MessageRequest) -> String {
     )
 }
 
-fn hash_serializable<T: Serialize>(value: &T) -> u64 {
+fn hash_serializable<T: Serialize + ?Sized>(value: &T) -> u64 {
     let json = serde_json::to_vec(value).unwrap_or_default();
     stable_hash_bytes(&json)
 }
@@ -585,7 +634,9 @@ mod tests {
         detect_cache_break, read_json, request_hash_hex, sanitize_path_segment, CacheBreakConfig,
         CacheBreakDetector, CacheBreakPaths, TrackedPromptState,
     };
-    use crate::types::{InputMessage, MessageRequest, SystemContent, Usage};
+    use crate::types::{
+        CacheControl, InputMessage, MessageRequest, SystemBlock, SystemContent, Usage,
+    };
 
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -897,5 +948,182 @@ mod tests {
             .is_none(),
             "no drop → no break even in multi-turn"
         );
+    }
+
+    /// 构造带 [静态块(带 cache_control), 动态块(无 marker)] 的请求。
+    fn request_with_split_system(static_text: &str, dynamic_text: &str, msg: &str) -> MessageRequest {
+        MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text(msg)],
+            system: Some(SystemContent::Blocks(vec![
+                SystemBlock::new(static_text).with_cache_control(CacheControl::ephemeral()),
+                SystemBlock::new(dynamic_text),
+            ])),
+            ..Default::default()
+        }
+    }
+
+    fn throughput_request(state: &TrackedPromptState) -> TrackedPromptState {
+        // 由已构造的 state 派生同构 state:cpu 换 usage 无需重算,直接建同 shape。
+        state.clone()
+    }
+
+    /// 仅动态段(无 cache_control 的尾部块)变化 → 静态前缀未变。
+    /// 不应归因 "system prompt changed",而应归因 "dynamic section changed"(预期 churn)。
+    #[test]
+    fn dynamic_section_churn_is_not_attributed_to_static_system_change() {
+        let prev_request = request_with_split_system("STATIC", "mem-v1", "turn 1");
+        let curr_request = request_with_split_system("STATIC", "mem-v2", "turn 2");
+        let previous = TrackedPromptState::from_usage(
+            &prev_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 6_000,
+                output_tokens: 0,
+            },
+        );
+        let current = TrackedPromptState::from_usage(
+            &curr_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1_000,
+                output_tokens: 0,
+            },
+        );
+        let event = detect_cache_break(&CacheBreakConfig::default(), Some(&previous), &current)
+            .expect("drop should be surfaced");
+        assert!(!event.unexpected);
+        assert!(
+            !event.reason.contains("system prompt changed"),
+            "dynamic churn must not be attributed to static system change: {}",
+            event.reason
+        );
+        assert!(
+            event.reason.contains("dynamic section changed"),
+            "expected dynamic section changed, got: {}",
+            event.reason
+        );
+    }
+
+    /// 静态块(带 cache_control)变化 → 仍应归因 "system prompt changed"(真实静态破坏)。
+    #[test]
+    fn static_system_change_still_attributed_to_system_prompt_change() {
+        let prev_request = request_with_split_system("STATIC-v1", "mem", "turn 1");
+        let curr_request = request_with_split_system("STATIC-v2", "mem", "turn 2");
+        let previous = TrackedPromptState::from_usage(
+            &prev_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 6_000,
+                output_tokens: 0,
+            },
+        );
+        let current = TrackedPromptState::from_usage(
+            &curr_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1_000,
+                output_tokens: 0,
+            },
+        );
+        let event = detect_cache_break(&CacheBreakConfig::default(), Some(&previous), &current)
+            .expect("static change should be surfaced");
+        assert!(!event.unexpected);
+        assert!(
+            event.reason.contains("system prompt changed"),
+            "static change must be attributed to system prompt: {}",
+            event.reason
+        );
+    }
+
+    /// multi_turn 检测器同样能区分动态段 churn(预期)与静态破坏。
+    #[test]
+    fn multi_turn_flags_dynamic_section_churn_not_static_change() {
+        let prev_request = request_with_split_system("STATIC", "mem-v1", "turn 1");
+        let curr_request = request_with_split_system("STATIC", "mem-v2", "turn 2");
+        let previous = TrackedPromptState::from_usage(
+            &prev_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 6_000,
+                output_tokens: 0,
+            },
+        );
+        let current = TrackedPromptState::from_usage(
+            &curr_request,
+            &Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1_000,
+                output_tokens: 0,
+            },
+        );
+        let event = super::detect_cache_break_multi_turn(
+            &CacheBreakConfig::default(),
+            Some(&previous),
+            &current,
+        )
+        .expect("dynamic churn should be surfaced in multi-turn");
+        assert!(
+            !event.reason.contains("system prompt changed"),
+            "dynamic churn must not be attributed to static system change: {}",
+            event.reason
+        );
+        assert!(
+            event.reason.contains("dynamic section changed"),
+            "expected dynamic section changed, got: {}",
+            event.reason
+        );
+    }
+
+    /// `record_usage` 落盘后 `break_reasons.dynamic_section_changed` 计数正确。
+    #[test]
+    fn record_usage_counts_dynamic_section_churn() {
+        let _guard = test_env_lock();
+        let temp_root = std::env::temp_dir().join(format!(
+            "cache-break-dyn-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        let detector = CacheBreakDetector::new("unit-test-dynamic");
+        let request = request_with_split_system("STATIC", "mem-v1", "first turn");
+        let usage = Usage {
+            input_tokens: 0,
+            cache_creation_input_tokens: 5_000,
+            cache_read_input_tokens: 45_000,
+            output_tokens: 100,
+        };
+        let _ = detector.record_usage(&request, &usage);
+
+        // 同静态,动态段变化 + 命中率下降
+        let request2 = request_with_split_system("STATIC", "mem-v2", "second turn");
+        let usage2 = Usage {
+            input_tokens: 0,
+            cache_creation_input_tokens: 40_000,
+            cache_read_input_tokens: 10_000,
+            output_tokens: 100,
+        };
+        let record2 = detector.record_usage(&request2, &usage2);
+        let event = record2.cache_break.expect("break should be detected");
+        assert!(
+            event.reason.contains("dynamic section changed"),
+            "reason: {}",
+            event.reason
+        );
+        assert_eq!(record2.stats.break_reasons.dynamic_section_changed, 1);
+        assert_eq!(record2.stats.break_reasons.system_prompt_changed, 0);
+
+        std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 }

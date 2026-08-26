@@ -503,9 +503,7 @@ async fn execute_bash_async(
         } else {
             let mut interp = format!("exit_code:{code}");
             if has_shell_syntax_error(&stderr) {
-                interp.push_str(
-                    " — command has a shell syntax error (unmatched quotes/escaping)",
-                );
+                interp.push_str(" — command has a shell syntax error (unmatched quotes/escaping)");
             }
             Some(interp)
         }
@@ -1131,9 +1129,13 @@ mod tests {
         assert!(has_shell_syntax_error(
             "bash: syntax error near unexpected token `;'"
         ));
-        assert!(has_shell_syntax_error("sh: 1: Syntax error: \"(\" unexpected"));
+        assert!(has_shell_syntax_error(
+            "sh: 1: Syntax error: \"(\" unexpected"
+        ));
         // cmd.exe 特征
-        assert!(has_shell_syntax_error("The syntax of the command is incorrect."));
+        assert!(has_shell_syntax_error(
+            "The syntax of the command is incorrect."
+        ));
         assert!(has_shell_syntax_error("'&&' was unexpected at this time."));
         // 正常编译错误 / "命令不存在" 不应误报
         assert!(!has_shell_syntax_error("error[E0308]: mismatched types"));

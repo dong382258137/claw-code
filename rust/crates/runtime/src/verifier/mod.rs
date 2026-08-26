@@ -191,12 +191,10 @@ impl VerifierAgent {
             },
             Ok(verdict) => RuleVerdict {
                 passed: false,
-                detail: format!(
-                    "model judge failed (criteria: {acceptance_criteria})"
-                ),
-                remediation: verdict.remediation.or_else(|| {
-                    Some("model judge 判定未通过,请修复后重试。".to_owned())
-                }),
+                detail: format!("model judge failed (criteria: {acceptance_criteria})"),
+                remediation: verdict
+                    .remediation
+                    .or_else(|| Some("model judge 判定未通过,请修复后重试。".to_owned())),
             },
             Err(e) => RuleVerdict {
                 passed: true,

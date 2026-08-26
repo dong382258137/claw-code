@@ -2876,9 +2876,12 @@ pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn st
     crate::diag_log(
         "[build_system_prompt] load_prompt_extras OK, calling load_system_prompt_with_extras",
     );
+    // 系统提示词日期用启动时的真实日期(而非编译期 BUILD_DATE):
+    // 编译期日期跨天后即失真;本函数仅在会话启动时调用一次,session 内字节稳定。
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let result = load_system_prompt_with_extras(
         cwd,
-        DEFAULT_DATE,
+        &today,
         env::consts::OS,
         "unknown",
         model_family_identity_for(model),
@@ -3483,16 +3486,18 @@ pub(crate) fn build_runtime_with_plugin_state(
     //
     // 注入后,context compaction(`compact_session_with_trigger` →
     // `summarize_messages_with_llm`)会调用 LLM 生成模型摘要(语义压缩),
-    // 而非纯启发式规则摘要;失败/未注入自动降级回启发式,不阻塞压缩。
+    // 而非启发式规则摘要;失败/未注入自动降级回启发式,不阻塞压缩。
     //
     // 设计要点:
-    // - 用质量敏感子件的旗舰模型(pro):压缩摘要决定上下文保真,flash 误摘要
-    //   会丢任务锚点(记忆架构已多次修过这类问题),故升级(Pro 0813 红利)
+    // - 用主模型(flash)而非旗舰(pro):摘要输入是全量上下文的一次性 prompt,
+    //   前缀天然不可复用,缓存命中≈0(session-1786886590898 实测 0.14%,
+    //   22 分钟 3 次压缩 → 361K 全 miss,Pro 价格 ~10x)。摘要为模板化任务
+    //   (结构化 prompt + 解析失败自动降级启发式),flash 质量兜底已足够。
     // - max_tokens=2048(摘要输出通常足够)
     // - OnceLock 进程级单例,重复注册静默忽略
     // - 构造失败(无 API key)时跳过,启动不失败
     match crate::llm_clients::DeepSeekCompactionSummarizerClient::new(
-        &quality_model,
+        &model_for_subagent,
         Some(2048),
     ) {
         Ok(summarizer) => {
@@ -3501,7 +3506,7 @@ pub(crate) fn build_runtime_with_plugin_state(
             > = std::sync::Arc::new(summarizer);
             runtime::compact::set_global_compaction_summarizer_client(summarizer_client);
             eprintln!(
-                "[startup] LLM compaction summarizer registered (model: {quality_model})"
+                "[startup] LLM compaction summarizer registered (model: {model_for_subagent})"
             );
         }
         Err(e) => {

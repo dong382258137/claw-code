@@ -229,14 +229,13 @@ impl SubagentDispatcher {
                 };
 
                 // 选择 client:优先重建后的,否则原 client guard。
-                let client_ref: &mut dyn ApiClient =
-                    match (&mut rebuilt, &mut fallback_guard) {
-                        (Some(c), _) => &mut **c,
-                        (None, Some(g)) => &mut ***g,
-                        (None, None) => {
-                            unreachable!("rebuilt or fallback guard must be set")
-                        }
-                    };
+                let client_ref: &mut dyn ApiClient = match (&mut rebuilt, &mut fallback_guard) {
+                    (Some(c), _) => &mut **c,
+                    (None, Some(g)) => &mut ***g,
+                    (None, None) => {
+                        unreachable!("rebuilt or fallback guard must be set")
+                    }
+                };
 
                 rt.block_on(execute_subagent_llm(
                     &workspace_root,

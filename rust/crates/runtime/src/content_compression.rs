@@ -710,15 +710,30 @@ fn extract_log_pattern(line: &str) -> String {
 /// bash 即时压缩阈值(字节):stdout+stderr 合并内容超过此值才压缩。
 /// 低于此值保留原文 —— 短输出模型常需精确内容,压缩反而造成重复查询。
 const BASH_IMMEDIATE_COMPRESS_MIN_BYTES: usize = 12_000;
+/// bash 日志类内容(构建/测试/编译日志)的更低压缩阈值(字节)。
+/// 日志行高度重复、压缩率 80-94%,模型只需 ERROR/WARN+尾部摘要,
+/// 故阈值更低,避免大量重复日志行占用上下文。
+const BASH_LOG_COMPRESS_MIN_BYTES: usize = 6_000;
+/// grep_search 即时压缩阈值(字节):content 字段(匹配行文本)超过此值才压缩。
+/// content 是匹配行原文,常含大量重复上下文,但模型主要靠
+/// numFiles/numMatches/filenames 定位,content 只需保留预览。
+const GREP_IMMEDIATE_COMPRESS_MIN_BYTES: usize = 12_000;
+/// glob_search 即时压缩阈值(文件数):filenames 数组超过此值才压缩。
+/// 只有文件黄历需要全量,模型通常只需前几个 + 总数。
+const GLOB_IMMEDIATE_COMPRESS_MIN_FILES: usize = 300;
+/// grep_search 压缩后保留的 filenames 最大数量(其余折叠为省略计数)。
+const GREP_KEEP_FILENAMES: usize = 50;
+/// glob_search 压缩后保留的 filenames 最大数量(其余折叠为省略计数)。
+const GLOB_KEEP_FILENAMES: usize = 80;
 /// read_file 即时压缩阈值(行数):content 行数超过此值才走 Code 压缩。
 const READ_IMMEDIATE_COMPRESS_MIN_LINES: usize = 300;
 /// read_file 即时压缩阈值(字节):content 字节数超过此值也走 Code 压缩。
 const READ_IMMEDIATE_COMPRESS_MIN_BYTES: usize = 30_000;
 
-/// 即时压缩入口:对 bash/read_file 的大输出在入库前压缩。
+/// 即时压缩入口:对 bash/read_file/grep_search/glob_search 的大输出在入库前压缩。
 ///
 /// 仅当:
-/// - 工具是 bash / read_file
+/// - 工具是 bash / read_file / grep_search / glob_search
 /// - 非错误输出(错误输出保留原文,供模型诊断)
 /// - 输出未压缩过(避免双重压缩)
 /// - 输出超过阈值(短输出保留原文)
@@ -734,15 +749,22 @@ pub fn maybe_immediate_compress(
     is_error: bool,
 ) -> (String, bool) {
     let is_bash = tool_name.eq_ignore_ascii_case("bash");
-    let is_read = tool_name.eq_ignore_ascii_case("read_file")
-        || tool_name.eq_ignore_ascii_case("Read");
-    if (!is_bash && !is_read) || is_error || is_summary_placeholder(output) {
+    let is_read =
+        tool_name.eq_ignore_ascii_case("read_file") || tool_name.eq_ignore_ascii_case("Read");
+    let is_grep = tool_name.eq_ignore_ascii_case("grep_search");
+    let is_glob = tool_name.eq_ignore_ascii_case("glob_search");
+    if (!is_bash && !is_read && !is_grep && !is_glob) || is_error || is_summary_placeholder(output)
+    {
         return (output.to_string(), false);
     }
     if is_bash {
         compress_bash_envelope(tool_use_id, tool_name, input, output)
-    } else {
+    } else if is_read {
         compress_read_envelope(tool_use_id, tool_name, input, output)
+    } else if is_grep {
+        compress_grep_envelope(tool_use_id, tool_name, input, output)
+    } else {
+        compress_glob_envelope(tool_use_id, output)
     }
 }
 
@@ -771,7 +793,16 @@ fn compress_bash_envelope(
     } else {
         format!("{stdout}\n{stderr}")
     };
-    if combined.len() < BASH_IMMEDIATE_COMPRESS_MIN_BYTES {
+    // 差异化阈值:日志类内容(构建/测试/编译)行高度重复,压缩率 80-94%,
+    // 模型只需 ERROR/WARN+尾部摘要,故用更低阈值(6KB);其余类型保持 12KB,
+    // 避免对短结构化输出过度压缩导致模型重复查询。
+    let is_log = matches!(classify(&combined), ContentType::Log);
+    let threshold = if is_log {
+        BASH_LOG_COMPRESS_MIN_BYTES
+    } else {
+        BASH_IMMEDIATE_COMPRESS_MIN_BYTES
+    };
+    if combined.len() < threshold {
         return (output.to_string(), false);
     }
     // 内容感知路由:Log(构建/测试日志)、JSON(结构化输出)、Tabular、Text 各有专用压缩器。
@@ -818,6 +849,78 @@ fn compress_read_envelope(
     }
     let summary = format_summary(tool_name, tool_use_id, input, content);
     (summary, true)
+}
+
+/// GrepSearch 即时压缩:解析 GrepSearchOutput JSON,只压缩大字段 `content`。
+///
+/// `content` 是匹配行原文,常含大量上下文重复;但模型主要靠 `numFiles`/
+/// `numMatches`/`filenames` 定位"哪些文件命中、命中多少",content 只需保留预览。
+/// 因此压缩策略:保留统计字段与 filenames(截断到大列表保护),仅对 content
+/// 走内容感知压缩(Text/Log/JSON/Tabular 路由)。压缩可逆(recall_full)。
+fn compress_grep_envelope(
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &str,
+    output: &str,
+) -> (String, bool) {
+    let Ok(mut value) = serde_json::from_str::<Value>(output) else {
+        return (output.to_string(), false);
+    };
+    // content 字段是最大的匹配行文本;缺失或过短时保留原文。
+    let Some(content) = value.get("content").and_then(Value::as_str) else {
+        return (output.to_string(), false);
+    };
+    if content.len() < GREP_IMMEDIATE_COMPRESS_MIN_BYTES {
+        return (output.to_string(), false);
+    }
+    // 压缩 content:内容感知路由(通常 Text/Log/Tabular)。
+    let content_summary = format_summary(tool_name, tool_use_id, input, content);
+    // 替换 content 字段为摘要。
+    if let Value::Object(map) = &mut value {
+        map.insert("content".to_string(), Value::String(content_summary));
+    } else {
+        return (output.to_string(), false);
+    }
+    // filenames 大列表保护:超过 GREP_KEEP_FILENAMES 时截断,保留前数个 + 省略计数。
+    if let Some(Value::Array(fnames)) = value.get_mut("filenames") {
+        if fnames.len() > GREP_KEEP_FILENAMES {
+            let total = fnames.len();
+            fnames.truncate(GREP_KEEP_FILENAMES);
+            fnames.push(Value::String(format!(
+                "… {omitted} more files",
+                omitted = total - GREP_KEEP_FILENAMES
+            )));
+        }
+    }
+    let new_output = serde_json::to_string(&value).unwrap_or_else(|_| output.to_string());
+    if new_output == output {
+        return (output.to_string(), false);
+    }
+    (new_output, true)
+}
+
+/// GlobSearch 即时压缩:解析 GlobSearchOutput JSON,filenames 数组过大时截断。
+///
+/// glob 返回的是文件路径列表,模型通常只需前几个 + 总数即可定位,
+/// 全量列表占用上下文收益低。压缩后可逆(recall_full)。
+fn compress_glob_envelope(tool_use_id: &str, output: &str) -> (String, bool) {
+    let Ok(mut value) = serde_json::from_str::<Value>(output) else {
+        return (output.to_string(), false);
+    };
+    let Some(Value::Array(fnames)) = value.get_mut("filenames") else {
+        return (output.to_string(), false);
+    };
+    if fnames.len() < GLOB_IMMEDIATE_COMPRESS_MIN_FILES {
+        return (output.to_string(), false);
+    }
+    let total = fnames.len();
+    fnames.truncate(GLOB_KEEP_FILENAMES);
+    fnames.push(Value::String(format!(
+        "… {omitted} more files (use recall_full with tool_use_id={tool_use_id} to retrieve full list)",
+        omitted = total - GLOB_KEEP_FILENAMES
+    )));
+    let new_output = serde_json::to_string(&value).unwrap_or_else(|_| output.to_string());
+    (new_output, true)
 }
 
 #[cfg(test)]
@@ -1100,7 +1203,8 @@ mod tests {
         }
         log_lines.push("error[E0308]: mismatched types".to_string());
         log_lines.push("   --> src/main.rs:12:5".to_string());
-        log_lines.push("Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.2s".to_string());
+        log_lines
+            .push("Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.2s".to_string());
         let stdout = log_lines.join("\n");
         let output = serde_json::json!({ "stdout": stdout, "stderr": "" }).to_string();
         let (out, archive) = maybe_immediate_compress(
@@ -1115,12 +1219,20 @@ mod tests {
             out.contains("Log summarized") && out.contains("recall_full"),
             "bash 日志应压缩为 Log 摘要且带 recall_full 指针: {out}"
         );
-        assert!(out.contains("error[E0308]"), "错误行必须保留在摘要中: {out}");
+        assert!(
+            out.contains("error[E0308]"),
+            "错误行必须保留在摘要中: {out}"
+        );
         assert!(
             out.contains("Finished `dev` profile"),
             "尾部结果摘要必须保留: {out}"
         );
-        assert!(out.len() < output.len() / 3, "压缩率应显著: {} vs {}", out.len(), output.len());
+        assert!(
+            out.len() < output.len() / 3,
+            "压缩率应显著: {} vs {}",
+            out.len(),
+            output.len()
+        );
     }
 
     #[test]
@@ -1128,7 +1240,9 @@ mod tests {
         // 大 bash 结构化 JSON 输出 → JSON 压缩。
         let mut items = Vec::new();
         for i in 0..300 {
-            items.push(serde_json::json!({"id": i, "name": format!("user_{i}"), "bio": "a".repeat(120)}));
+            items.push(
+                serde_json::json!({"id": i, "name": format!("user_{i}"), "bio": "a".repeat(120)}),
+            );
         }
         let output = serde_json::json!({ "stdout": serde_json::Value::Array(items).to_string(), "stderr": "" }).to_string();
         let (out, archive) = maybe_immediate_compress(
@@ -1145,7 +1259,10 @@ mod tests {
     #[test]
     fn immediate_compress_large_read_code_to_summary() {
         // 大代码文件全量读取 → Code 压缩(提取签名)。
-        let mut code_lines: Vec<String> = vec!["//! Module docs".to_string(), "use std::collections::HashMap;".to_string()];
+        let mut code_lines: Vec<String> = vec![
+            "//! Module docs".to_string(),
+            "use std::collections::HashMap;".to_string(),
+        ];
         for i in 0..500 {
             code_lines.push(format!("pub fn func_{i}(x: i32) -> i32 {{ x + {i} }}"));
         }
@@ -1261,5 +1378,192 @@ mod tests {
         );
         assert!(archive);
         assert!(out.contains("summarized"));
+    }
+
+    // ---- grep_search 即时压缩测试 ----
+
+    #[test]
+    fn immediate_compress_grep_large_content_to_summary() {
+        // 大 content(匹配行文本) → 压缩为摘要,保留统计字段。
+        let mut content = String::new();
+        for i in 0..5000 {
+            content.push_str(&format!(
+                "src/file_{i}.rs:42:pub fn foo_{i}() {{ x + {i} }}\n"
+            ));
+        }
+        let output = serde_json::json!({
+            "mode": "content",
+            "numFiles": 5000,
+            "numMatches": 5000,
+            "filenames": ["src/file_0.rs", "src/file_1.rs"],
+            "content": content,
+        })
+        .to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_g1",
+            "grep_search",
+            r#"{"pattern":"foo"}"#,
+            &output,
+            false,
+        );
+        assert!(archive, "大 grep content 应压缩");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["numFiles"], 5000, "统计字段应保留");
+        assert_eq!(parsed["numMatches"], 5000, "统计字段应保留");
+        let stored_content = parsed["content"].as_str().unwrap();
+        assert!(
+            stored_content.contains("summarized") && stored_content.contains("recall_full"),
+            "content 应被压缩为摘要: {stored_content}"
+        );
+        assert!(stored_content.len() < content.len() / 10, "压缩率应显著");
+    }
+
+    #[test]
+    fn immediate_compress_grep_large_filenames_truncated() {
+        // filenames 超保护阈值时截断,保留前数个 + 省略计数。
+        let filenames: Vec<String> = (0..200).map(|i| format!("src/mod_{i}.rs")).collect();
+        let output = serde_json::json!({
+            "mode": "content",
+            "numFiles": 200,
+            "numMatches": 200,
+            "filenames": filenames,
+            "content": "x".repeat(20_000),
+        })
+        .to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_g2",
+            "grep_search",
+            r#"{"pattern":"foo"}"#,
+            &output,
+            false,
+        );
+        assert!(archive);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let files = parsed["filenames"].as_array().unwrap();
+        assert!(files.len() < 200, "filenames 应被截断");
+        assert!(out.contains("more files"), "应包含省略计数提示: {out}");
+    }
+
+    #[test]
+    fn immediate_compress_grep_small_content_keeps_verbatim() {
+        // 小 content 保留原文,不压缩。
+        let output = serde_json::json!({
+            "mode": "content",
+            "numFiles": 1,
+            "numMatches": 1,
+            "filenames": ["src/main.rs"],
+            "content": "src/main.rs:10:pub fn main() {}",
+        })
+        .to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_g3",
+            "grep_search",
+            r#"{"pattern":"main"}"#,
+            &output,
+            false,
+        );
+        assert_eq!(out, output, "小 grep 输出应保留原文");
+        assert!(!archive);
+    }
+
+    // ---- glob_search 即时压缩测试 ----
+
+    #[test]
+    fn immediate_compress_glob_large_filenames_truncated() {
+        // filenames 超阈值 → 截断 + 省略计数 + recall_full 提示。
+        let filenames: Vec<String> = (0..500).map(|i| format!("data/{i}.json")).collect();
+        let output = serde_json::json!({
+            "durationMs": 12,
+            "numFiles": 500,
+            "filenames": filenames,
+            "truncated": false,
+        })
+        .to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_g4",
+            "glob_search",
+            r#"{"pattern":"data/*.json"}"#,
+            &output,
+            false,
+        );
+        assert!(archive, "大 glob filenames 应压缩");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let files = parsed["filenames"].as_array().unwrap();
+        assert!(files.len() < 500, "filenames 应被截断");
+        assert!(
+            out.contains("more files") && out.contains("recall_full"),
+            "应包含省略计数与 recall_full 提示: {out}"
+        );
+    }
+
+    #[test]
+    fn immediate_compress_glob_small_keeps_verbatim() {
+        // 小列表保留原文。
+        let output = serde_json::json!({
+            "durationMs": 5,
+            "numFiles": 3,
+            "filenames": ["a.rs", "b.rs", "c.rs"],
+            "truncated": false,
+        })
+        .to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_g5",
+            "glob_search",
+            r#"{"pattern":"*.rs"}"#,
+            &output,
+            false,
+        );
+        assert_eq!(out, output, "小 glob 输出应保留原文");
+        assert!(!archive);
+    }
+
+    // ---- bash 差异化阈值测试 ----
+
+    #[test]
+    fn immediate_compress_bash_log_uses_lower_threshold() {
+        // 日志类内容(6KB-12KB 之间)应被压缩(差异化低阈值)。
+        // 若用统一 12KB 阈值,此样例会被保留原文。
+        let mut log_lines = Vec::new();
+        for i in 0..300 {
+            log_lines.push(format!("Compiling crate-{i} v1.0.0"));
+        }
+        log_lines.push("error[E0308]: mismatched types".to_string());
+        let stdout = log_lines.join("\n");
+        assert!(
+            stdout.len() > 6_000 && stdout.len() < 12_000,
+            "测试样例需落在 6KB-12KB 区间"
+        );
+        let output = serde_json::json!({ "stdout": stdout, "stderr": "" }).to_string();
+        let (out, archive) = maybe_immediate_compress(
+            "call_l1",
+            "bash",
+            r#"{"command":"cargo build"}"#,
+            &output,
+            false,
+        );
+        assert!(archive, "日志类 6KB-12KB 输出应被差异化压缩");
+        assert!(out.contains("Log summarized") && out.contains("recall_full"));
+    }
+
+    #[test]
+    fn immediate_compress_bash_non_log_keeps_verbatim_below_12k() {
+        // 非日志内容在 6KB-12KB 之间保留原文(差异化阈值不误伤短结构化输出)。
+        // 构造 Tabular 类内容(非 Log),落在 6KB-12KB。
+        let mut table = String::new();
+        for i in 0..300 {
+            table.push_str(&format!(
+                "file_{i}.rs | {i} | Some-symbol-{:0>6}\n",
+                i % 1000
+            ));
+        }
+        assert!(
+            table.len() > 6_000 && table.len() < 12_000,
+            "测试样例需落在 6KB-12KB 区间"
+        );
+        let output = serde_json::json!({ "stdout": table, "stderr": "" }).to_string();
+        let (out, archive) =
+            maybe_immediate_compress("call_l2", "bash", r#"{"command":"ls -l"}"#, &output, false);
+        assert!(!archive, "非日志内容 6KB-12KB 应保留原文(维持 12KB 阈值)");
+        assert_eq!(out, output);
     }
 }

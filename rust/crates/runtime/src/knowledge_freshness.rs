@@ -207,8 +207,8 @@ fn is_local_internal_task(lower: &str) -> bool {
         }
     }
     for ext in [
-        ".rs", ".py", ".ts", ".js", ".go", ".java", ".cpp", ".c", ".h", ".md", ".toml",
-        ".json", ".yaml", ".yml",
+        ".rs", ".py", ".ts", ".js", ".go", ".java", ".cpp", ".c", ".h", ".md", ".toml", ".json",
+        ".yaml", ".yml",
     ] {
         if lower.contains(ext) {
             return true;
@@ -563,27 +563,25 @@ pub async fn gate_task(task: &str, attempt: u32) -> GatedTask {
 
     // 4. 调研(仅 Novel 且非紧急 且 client 可用)。
     //    Tier S #3 穷鬼模式:激活时跳过联网调研(省 token)。
-    let research_summary = if !crate::poor_mode::is_active()
-        && !urgent
-        && freshness.needs_research()
-    {
-        if let Some(client) = get_global_research_client() {
-            // Phase 2.3:优先用 LLM 提取关键实体构建查询,降级回启发式。
-            let query = if let Some(builder) = get_global_query_builder() {
-                match builder.build_query(task).await {
-                    Ok(q) => q,
-                    Err(_) => build_research_query(task), // 降级:LLM 失败用启发式
-                }
+    let research_summary =
+        if !crate::poor_mode::is_active() && !urgent && freshness.needs_research() {
+            if let Some(client) = get_global_research_client() {
+                // Phase 2.3:优先用 LLM 提取关键实体构建查询,降级回启发式。
+                let query = if let Some(builder) = get_global_query_builder() {
+                    match builder.build_query(task).await {
+                        Ok(q) => q,
+                        Err(_) => build_research_query(task), // 降级:LLM 失败用启发式
+                    }
+                } else {
+                    build_research_query(task) // 默认:启发式
+                };
+                client.research(&query).await.ok() // 降级:调研失败不阻塞任务
             } else {
-                build_research_query(task) // 默认:启发式
-            };
-            client.research(&query).await.ok() // 降级:调研失败不阻塞任务
+                None // 降级:client 未注入(Phase 0 默认)
+            }
         } else {
-            None // 降级:client 未注入(Phase 0 默认)
-        }
-    } else {
-        None
-    };
+            None
+        };
 
     let gated = GatedTask {
         freshness,

@@ -566,18 +566,23 @@ fn apply_string_edit(
     let haystack = to_lf(original_file);
     let needle = to_lf(old_string);
     let (start_line, end_line, affected) = locate_match(&haystack, &needle).ok_or_else(|| {
-        // P1-3: 匹配失败时附带行尾诊断，避免 LLM 用相同参数盲目重试。
+        // P1-3: 匹配失败时给出重新定位的精确指导,避免盲试。
+        // 关键:上方 to_lf 已将 CRLF/LF 一并归一化,因此到达此处说明 old_string
+        // 与文件真实内容不符(缩进/字符/覆盖范围),而**不是**行尾问题。据此
+        // 明确禁止引导改用 replace_lines(行号寻址在连续编辑下会随行号漂移,
+        // 是"编辑级联损坏"的直接诱因,见 session-1787750909782)。
         let mut msg = format!(
             "old_string not found in file ({} lines, {} line endings)",
             original_file.lines().count(),
             if line_ending == "\r\n" { "CRLF" } else { "LF" }
         );
-        if line_ending == "\r\n" && old_string.contains('\n') && !old_string.contains("\r\n") {
-            msg.push_str(
-                " — the file uses CRLF line endings but old_string uses LF; \
-                 use replace_lines or include \\r\\n in old_string",
-            );
-        }
+        msg.push_str(
+            " — old_string does not match the file content (line endings are already \
+             normalized, so this is NOT a CRLF problem). Re-read the exact target region \
+             and copy it verbatim (indentation, quotes, trailing whitespace). Prefer \
+             edit_file with an exact old_string or write_file; do NOT switch to \
+             replace_lines line-number edits as a workaround for a mismatch.",
+        );
         io::Error::new(io::ErrorKind::NotFound, msg)
     })?;
     let replacement = to_lf(new_string);
@@ -1715,8 +1720,7 @@ mod tests {
     fn edit_file_lf_file_reports_location() {
         let path = temp_path("edit-lf-loc.txt");
         write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree").expect("write");
-        let output =
-            edit_file(path.to_string_lossy().as_ref(), "two", "TWO", false).expect("edit");
+        let output = edit_file(path.to_string_lossy().as_ref(), "two", "TWO", false).expect("edit");
         assert_eq!(output.start_line, 2);
         assert_eq!(output.end_line, 2);
         assert_eq!(output.affected_line_count, 1);
@@ -1757,16 +1761,25 @@ mod tests {
         assert_eq!(out2.new_total_lines, 3);
     }
 
-    /// PRD P1-3：匹配失败时错误信息附带 CRLF 行尾诊断。
+    /// PRD P1-3:匹配失败时给出精确指导,且**不得**引导改用 replace_lines。
+    /// 行尾已被归一化,失败=内容不匹配;禁止把模型推向行号编辑(级联损坏诱因)。
     #[test]
     fn edit_file_mismatch_reports_crlf_diagnostic() {
         let path = temp_path("edit-crlf-diag.txt");
         std::fs::write(&path, "line1\r\nline2").expect("seed crlf file");
-        let result = edit_file(path.to_string_lossy().as_ref(), "missing\ncontent", "x", false);
+        let result = edit_file(
+            path.to_string_lossy().as_ref(),
+            "missing\ncontent",
+            "x",
+            false,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("old_string not found"));
         assert!(err.contains("CRLF"));
+        // 不再误导性建议改用 replace_lines;明确指向重读+逐字复制。
+        assert!(err.contains("do NOT switch to replace_lines"));
+        assert!(err.contains("Re-read the exact target region"));
     }
 
     /// PRD P0-2：replace_lines 报告替换行数与替换后总行数。
@@ -2206,7 +2219,8 @@ mod tests {
     fn grep_matches_exact_filename_glob() {
         let dir = temp_path("grep-exact-glob");
         std::fs::create_dir_all(dir.join("web")).expect("web");
-        std::fs::write(dir.join("web/server.py"), "def marker():\n    pass\n").expect("write server");
+        std::fs::write(dir.join("web/server.py"), "def marker():\n    pass\n")
+            .expect("write server");
         std::fs::write(dir.join("web/ws_server.py"), "def other():\n    pass\n").expect("write ws");
 
         let out = grep_search(&grep_files_with_matches(
@@ -2300,8 +2314,14 @@ mod tests {
             parse_git_bash_drive("/c/Program Files/x"),
             Some(("c".to_string(), "Program Files/x".to_string()))
         );
-        assert_eq!(parse_git_bash_drive("/d"), Some(("d".to_string(), "".to_string())));
-        assert_eq!(parse_git_bash_drive("/d/"), Some(("d".to_string(), "".to_string())));
+        assert_eq!(
+            parse_git_bash_drive("/d"),
+            Some(("d".to_string(), "".to_string()))
+        );
+        assert_eq!(
+            parse_git_bash_drive("/d/"),
+            Some(("d".to_string(), "".to_string()))
+        );
         // 非盘符形式返回 None
         assert_eq!(parse_git_bash_drive("/tmp/foo"), None);
         assert_eq!(parse_git_bash_drive("/usr/bin"), None);
@@ -2317,7 +2337,10 @@ mod tests {
         #[cfg(windows)]
         {
             // D: 存在(本机工作区盘符)→ 转换
-            assert_eq!(convert_git_bash_path("/d/chanlunV2/chanlun_py"), r"d:\chanlunV2\chanlun_py");
+            assert_eq!(
+                convert_git_bash_path("/d/chanlunV2/chanlun_py"),
+                r"d:\chanlunV2\chanlun_py"
+            );
             // 盘符根 /c → c:\ (C: 几乎总是存在;盘符保留小写,Windows 不区分)
             if std::path::Path::new(r"C:\").exists() {
                 assert_eq!(convert_git_bash_path("/c"), r"c:\");
@@ -2325,11 +2348,17 @@ mod tests {
             // 不存在的盘符(如 T:)或非盘符形式 → 原样返回,不做误转换
             assert_eq!(convert_git_bash_path("/tmp/foo"), "/tmp/foo");
             assert_eq!(convert_git_bash_path(r"D:\chanlunV2"), r"D:\chanlunV2");
-            assert_eq!(convert_git_bash_path("chanlunV2/chanlun_py"), "chanlunV2/chanlun_py");
+            assert_eq!(
+                convert_git_bash_path("chanlunV2/chanlun_py"),
+                "chanlunV2/chanlun_py"
+            );
         }
         #[cfg(not(windows))]
         {
-            assert_eq!(convert_git_bash_path("/d/chanlunV2/chanlun_py"), "/d/chanlunV2/chanlun_py");
+            assert_eq!(
+                convert_git_bash_path("/d/chanlunV2/chanlun_py"),
+                "/d/chanlunV2/chanlun_py"
+            );
             assert_eq!(convert_git_bash_path("/tmp/foo"), "/tmp/foo");
         }
     }
@@ -2348,7 +2377,10 @@ mod tests {
             let bash_style = format!("/{}{}", drive.to_ascii_lowercase(), rest.replace('\\', "/"));
 
             let normalized = normalize_path(&bash_style).expect("git-bash 路径应能归一化");
-            assert_eq!(normalized, normalize_path(dir_str).expect("windows 路径应能归一化"));
+            assert_eq!(
+                normalized,
+                normalize_path(dir_str).expect("windows 路径应能归一化")
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

@@ -488,10 +488,7 @@ impl RepoMap {
         }
 
         // 为所有文件初始化 0,保证排名列表完整性。
-        self.lsp_importance = paths
-            .iter()
-            .map(|p| (p.clone(), 0usize))
-            .collect();
+        self.lsp_importance = paths.iter().map(|p| (p.clone(), 0usize)).collect();
 
         let mut refreshed = 0usize;
         for path in candidate_paths {
@@ -579,10 +576,7 @@ fn normalize_ref_path(p: &str) -> String {
     // Windows 盘符场景:`file:///C:/workspace/a.rs` → `/C:/workspace/a.rs`,
     // 去掉前导 `/` 与 `C:/workspace/a.rs` 对齐。
     let bytes = normalized.as_bytes();
-    if normalized.starts_with('/')
-        && normalized.len() >= 3
-        && bytes[2] == b':'
-    {
+    if normalized.starts_with('/') && normalized.len() >= 3 && bytes[2] == b':' {
         normalized[1..].to_string()
     } else {
         normalized

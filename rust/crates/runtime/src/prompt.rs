@@ -6,6 +6,7 @@ use std::process::Command;
 use crate::cache_alignment::DynamicValueExtractor;
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::git_context::GitContext;
+use crate::json::JsonValue;
 use crate::memory::PersistentMemory;
 
 /// Errors raised while assembling the final system prompt.
@@ -808,10 +809,14 @@ fn stable_content_hash(content: &str) -> u64 {
 
 fn describe_instruction_file(file: &ContextFile, files: &[ContextFile]) -> String {
     let path = display_context_path(&file.path);
+    // scope 取"最近的"祖先目录(路径组件最多),而非第一个匹配项。
+    // 旧实现用 find() 返回最外层祖先,导致嵌套仓库的子级 CLAUDE.md
+    // 被错误标注为根目录 scope(如 chanlun_py/CLAUDE.md 显示 D:\ )。
     let scope = files
         .iter()
         .filter_map(|candidate| candidate.path.parent())
-        .find(|parent| file.path.starts_with(parent))
+        .filter(|parent| file.path.starts_with(parent))
+        .max_by_key(|parent| parent.components().count())
         .map_or_else(
             || "workspace".to_string(),
             |parent| parent.display().to_string(),
@@ -946,24 +951,71 @@ pub fn load_system_prompt_with_extras(
 
 fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
-    if config.loaded_entries().is_empty() {
+    // 防御:仅列出磁盘上真实存在的配置条目(load() 已过滤,此处防其它
+    // 构造路径把不存在的 .claw.json 显示为 "Loaded",误导排查)。
+    let existing: Vec<_> = config
+        .loaded_entries()
+        .iter()
+        .filter(|entry| entry.path.exists())
+        .collect();
+    if existing.is_empty() {
         lines.extend(prepend_bullets(vec![
             "No Claw Plus settings files loaded.".to_string()
         ]));
-        return lines.join("\n");
+        return lines.join(
+            "
+",
+        );
     }
 
     lines.extend(prepend_bullets(
-        config
-            .loaded_entries()
+        existing
             .iter()
             .map(|entry| format!("Loaded {:?}: {}", entry.source, entry.path.display()))
             .collect(),
     ));
     lines.push(String::new());
-    lines.push(config.as_json().render());
-    lines.join("\n")
+    lines.push(redact_sensitive_json(&config.as_json()).render());
+    lines.join(
+        "
+",
+    )
 }
+
+/// 递归脱敏配置 JSON 中的敏感字段（apiKey / secret / password / token 等），
+/// 防止密钥明文进入系统提示词。键名做小写匹配，值统一替换为掩码。
+fn redact_sensitive_json(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => JsonValue::Object(
+            map.iter()
+                .map(|(key, val)| {
+                    if is_sensitive_config_key(key) {
+                        (key.clone(), JsonValue::String(REDACTED_MARKER.to_string()))
+                    } else {
+                        (key.clone(), redact_sensitive_json(val))
+                    }
+                })
+                .collect(),
+        ),
+        JsonValue::Array(items) => {
+            JsonValue::Array(items.iter().map(redact_sensitive_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// 判断配置键是否敏感（小写匹配）。精确命中常见密钥键名及其后缀变体。
+fn is_sensitive_config_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("apikey")
+        || lower.contains("api_key")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("token")
+}
+
+const REDACTED_MARKER: &str = "***redacted***";
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
     format!(
@@ -1039,9 +1091,11 @@ fn get_actions_section() -> String {
 fn get_framework_switching_section() -> String {
     "## Framework Switching (元认知触发)\n\
      \n\
-     Pre-commitment: generate 2+ solution approaches before committing; \
-     compare trade-offs (cost, risk, reversibility); only commit after \
-     explicit comparison. This prevents premature commitment to the first \
+     Pre-commitment: for non-trivial design decisions, generate 2+ solution \
+     approaches before committing; compare trade-offs (cost, risk, \
+     reversibility); only commit after explicit comparison. Trivial changes \
+     (one-line edits, obvious fixes, mechanical renames) are exempt — \
+     execute directly. This prevents premature commitment to the first \
      identified solution.\n\
      \n\
      STOP and re-examine when you notice:\n\
@@ -1315,10 +1369,10 @@ fn get_multi_agent_orchestration_section() -> String {
      ```
      spawn_parallel_subagents({\n\
        \"tasks\": [\n\
-         {\"name\": \"analyze-A\", \"task\": \"分析模块 A 的测试覆盖率\", \"model\": \"deepseek-v4-flash\", \"complexity\": \"simple\"},\n\
-         {\"name\": \"analyze-B\", \"task\": \"分析模块 B 的测试覆盖率\", \"model\": \"deepseek-v4-flash\", \"complexity\": \"simple\"},\n\
-         {\"name\": \"analyze-C\", \"task\": \"分析模块 C 的测试覆盖率\", \"model\": \"deepseek-v4-flash\", \"complexity\": \"simple\"},\n\
-         {\"name\": \"synthesize\", \"task\": \"综合三份分析,给出架构级改进建议\", \"model\": \"deepseek-v4-pro\", \"complexity\": \"architectural\"}\n\
+         {\"name\": \"analyze-A\", \"task\": \"分析模块 A 的测试覆盖率\", \"model\": \"{budget_model}\", \"complexity\": \"simple\"},\n\
+         {\"name\": \"analyze-B\", \"task\": \"分析模块 B 的测试覆盖率\", \"model\": \"{budget_model}\", \"complexity\": \"simple\"},\n\
+         {\"name\": \"analyze-C\", \"task\": \"分析模块 C 的测试覆盖率\", \"model\": \"{budget_model}\", \"complexity\": \"simple\"},\n\
+         {\"name\": \"synthesize\", \"task\": \"综合三份分析,给出架构级改进建议\", \"model\": \"{flagship_model}\", \"complexity\": \"architectural\"}\n\
        ],\n\
        \"fail_fast\": \"off\"\n\
      })\n\
@@ -1479,6 +1533,19 @@ fn get_tool_usage_guidance_section() -> String {
      count/line-ending hint and correct the old_string once instead of \
      retrying identical parameters.\n\
      \n\
+     ### replace_lines 行号漂移护栏\n\
+     `replace_lines` addresses lines by 1-based line numbers; EVERY replacement \
+     shifts the line numbers of all later content in that file. Therefore:\n\
+     - NEVER issue two `replace_lines` calls on the same file within one turn — \
+       line numbers from the first call are stale for the second. If you must \
+       make multiple changes to one file, batch them into a single `replace_lines` \
+       range, or prefer `edit_file` (old_string match) / `write_file` (full rewrite).\n\
+     - After each `replace_lines`, immediately `read_file` the replaced region to \
+       confirm function boundaries are intact (not truncated / duplicated).\n\
+     - When a series of edits triggers diagnostics errors, do NOT keep stacking \
+       more `replace_lines` on the already-broken file — stop, re-read the affected \
+       functions, and fix the underlying cause with one exact `edit_file`.\n\
+     \n\
      ### 任务 ID 来源\n\
      The `task_id` for `TaskOutput`/`TaskGet`/`TaskStop`/`TaskUpdate` must \
      come from the return value of `TaskCreate` or `RunTaskPacket`. A bash \
@@ -1506,7 +1573,37 @@ fn get_tool_usage_guidance_section() -> String {
        this session (no design sign-off, no document handoff) → call \
        `create_plan` and execute immediately.\n\
      The two can chain: while executing a `create_plan` plan, if you hit a \
-     design decision that needs user sign-off, pause and invoke `brainstorming`."
+     design decision that needs user sign-off, pause and invoke `brainstorming`.\n\
+     \n\
+     ### 确定性预算(Certainty Budget) — 求证前置,不靠猜测\n\
+     Before expanding a long reasoning chain, scan the facts you intend to\n\
+     rely on. Anything that a tool can verify is NOT something to derive by\n\
+     reasoning — query it first. Reserve reasoning exclusively for pure logic\n\
+     that no tool can answer. The goal: turn \"guess then verify\" into\n\
+     \"verify then think\", so your thinking chain stays short and accurate.\n\
+     \n\
+     Classify each uncertain point, then act immediately — do not reason about\n\
+     it inline:\n\
+     \n\
+     - **系统状态 / 运行时行为**(Python 包解析、sys.path、环境配置、文件存在、\n\
+       import 是否生效、进程/服务状态):never derive by reasoning — run a\n\
+       single `bash` probe (e.g. `python -c \"import X; print(X.__file__)\"`,\n\
+       `Test-Path`, `ls`). A single probe replaces many turns of guessing.\n\
+     - **代码结构事实**(函数签名、import 关系、文件内容、符号引用、死代码):\n\
+       run `grep_search` / `glob_search` / `read_file` to get the ground truth.\n\
+       Do not speculate about \"who imports this\" — grep it.\n\
+     - **需实证的运行结果**(测试失败根因、报错原因、数值行为):reproduce and\n\
+       inspect the actual output/backtrace instead of hypothesizing. Read the\n\
+       error, then search the exact code path it points to.\n\
+     - **规则/意图语义**(用户意图边界、plan 模式约束、\"该不该做 X\"):do not\n\
+       self-debate in thinking. State your reading in one line and either\n\
+       proceed or ask a short confirming question — never loop on it.\n\
+     \n\
+     If you catch yourself writing any of \"可能 / 也许 / 应该 / 猜测 / might /\n\
+     maybe / probably / I think\", STOP — that is a signal you are reasoning\n\
+     about a verifiable fact. Convert it into one tool call instead of\n\
+     continuing the guess. A single probe takes ~1-3s; a guess loop costs\n\
+     10-30s of tokens and is often wrong."
         .to_string()
 }
 /// session even as new entries are written to disk.
@@ -1558,28 +1655,32 @@ fn render_skill_catalog_section(catalog: &str) -> String {
 /// when `plan_mode` is enabled.
 ///
 /// This is the "C" component of the C+A combo: a minimal hard constraint that
-/// forces the model to invoke `brainstorming` and `writing-plans` skills before
-/// producing any design or plan for complex tasks. The detailed 9-item
+/// routes complex tasks through the planning watershed (see
+/// `get_tool_usage_guidance_section`): design-sign-off / handoff tasks must go
+/// through `brainstorming` + `writing-plans` (with Self-Review), while
+/// well-specified tasks go directly through `create_plan`. The detailed 9-item
 /// implementation-feasibility review lives in the skills' Self-Review sections
 /// (component A), not here — keeping the prompt minimal and avoiding
 /// duplication.
 fn render_plan_mode_constraint_section() -> String {
     "## Plan Mode Constraints (active)\n\
-     当前处于 Plan 模式。复杂任务由你自主判断:调用 `create_plan` 工具创建\n\
-     执行计划,然后按步骤执行,每步完成后调用 `plan_update` 推进。生成方案/\n\
-     计划前**必须**先调用 `brainstorming` skill,生成后**必须**调用\n\
-     `writing-plans` skill 的 Self-Review 流程(含代码事实核查与实现可行性\n\
-     推演)。未调用 skill 的方案不得进入 Execute 阶段。"
+     当前处于 Plan 模式。复杂任务先按系统提示词「规划机制分水岭(create_plan\n\
+     vs brainstorming/writing-plans)」路由:需要用户批准设计或产出交接文档\n\
+     的,必须走 `brainstorming` + `writing-plans` skill(含 Self-Review:代码\n\
+     事实核查与实现可行性推演),未走该 skill 流程的方案不得进入 Execute\n\
+     阶段;任务已明确、无需设计签核的,直接调用 `create_plan` 创建执行计划\n\
+     并逐步执行,每步完成后调用 `plan_update` 推进。"
         .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        collapse_blank_lines, display_context_path, normalize_instruction_content,
+        collapse_blank_lines, describe_instruction_file, display_context_path,
+        is_sensitive_config_key, normalize_instruction_content, redact_sensitive_json,
         render_instruction_content, render_instruction_files, truncate_diff_to_budget,
         truncate_instruction_content, ContextFile, ModelFamilyIdentity, ProjectContext,
-        SystemPromptBuilder, SystemPromptSplit, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        SystemPromptBuilder, SystemPromptSplit, REDACTED_MARKER, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -2010,7 +2111,42 @@ mod tests {
         // 的猜测循环触发模式(与第 1 层认知停滞检测的被动兜底互补)。
         assert!(prompt.contains("Guess loop"));
         assert!(prompt.contains("trace the uncertainty to its source"));
+        // 确定性预算(Certainty Budget):事前求证协议,与 Guess loop 事后兜底互补。
+        assert!(prompt.contains("确定性预算(Certainty Budget)"));
+        assert!(prompt.contains("verify then think"));
+        assert!(prompt.contains("系统状态 / 运行时行为"));
 
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn certainty_budget_section_is_static() {
+        // 确定性预算段必须位于静态区(boundary 前),session 内字节稳定,
+        // 不影响 prompt cache 前缀。
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".claw")).expect("claw dir");
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+        let project_context =
+            ProjectContext::discover(&root, "2026-03-31").expect("context should load");
+        let builder = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .with_runtime_config(config);
+        let split = builder.build_split();
+        let static_joined = split.static_sections.join("\n\n");
+        assert!(
+            static_joined.contains("确定性预算(Certainty Budget)"),
+            "Certainty Budget 段应位于静态区"
+        );
+        assert!(
+            !split
+                .dynamic_sections
+                .join("\n\n")
+                .contains("确定性预算(Certainty Budget)"),
+            "Certainty Budget 段不应位于动态区"
+        );
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -2054,6 +2190,36 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn scope_uses_nearest_ancestor_not_root() {
+        // 嵌套仓库: 根 /tmp/repo + 子 /tmp/repo/sub 各有 CLAUDE.md
+        // 旧实现 find() 返回最外层祖先,导致子级文件 scope 错标为 /tmp/repo
+        let files = vec![
+            ContextFile {
+                path: PathBuf::from("/tmp/repo/CLAUDE.md"),
+                content: "root rules".to_string(),
+            },
+            ContextFile {
+                path: PathBuf::from("/tmp/repo/sub/CLAUDE.md"),
+                content: "sub rules".to_string(),
+            },
+        ];
+        let root_desc = describe_instruction_file(&files[0], &files);
+        let sub_desc = describe_instruction_file(&files[1], &files);
+        assert!(
+            root_desc.contains("scope: /tmp/repo"),
+            "root scope wrong: {root_desc}"
+        );
+        assert!(
+            sub_desc.contains("scope: /tmp/repo/sub"),
+            "sub scope should be nearest ancestor: {sub_desc}"
+        );
+        assert!(
+            !sub_desc.contains("scope: /tmp/repo)"),
+            "sub scope must not be root"
+        );
     }
 
     #[test]
@@ -2701,4 +2867,47 @@ mod tests {
             );
         }
     }
+}
+
+#[test]
+fn redacts_api_key_in_wizard_settings() {
+    // 模拟用户 settings.json: _wizard.apiKey 是明文密钥
+    let config_json = "{\"_wizard\":{\"apiKey\":\"sk-cc67535a109048a187ef04720ef1fdb0\",\"provider\":\"anthropic\"},\"permissions\":{\"defaultMode\":\"dontAsk\"}}";
+    let parsed = crate::json::JsonValue::parse(config_json).expect("valid json");
+    let redacted = redact_sensitive_json(&parsed);
+    let rendered = redacted.render();
+    assert!(
+        !rendered.contains("cc67535a109048a187ef04720ef1fdb0"),
+        "apiKey 明文不应出现在渲染结果中"
+    );
+    assert!(rendered.contains(REDACTED_MARKER), "敏感值应被掩码替换");
+    // 非敏感字段应保留
+    assert!(rendered.contains("anthropic"));
+    assert!(rendered.contains("dontAsk"));
+}
+
+#[test]
+fn keeps_non_sensitive_config_values() {
+    let config_json =
+        "{\"model\":\"deepseek-v4-pro\",\"permissions\":{\"defaultMode\":\"dontAsk\"}}";
+    let parsed = crate::json::JsonValue::parse(config_json).expect("valid json");
+    let redacted = redact_sensitive_json(&parsed);
+    let rendered = redacted.render();
+    assert!(rendered.contains("deepseek-v4-pro"));
+    assert!(rendered.contains("dontAsk"));
+    assert!(!rendered.contains(REDACTED_MARKER));
+}
+
+#[test]
+fn sensitive_key_detection() {
+    assert!(is_sensitive_config_key("apiKey"));
+    assert!(is_sensitive_config_key("api_key"));
+    assert!(is_sensitive_config_key("secret"));
+    assert!(is_sensitive_config_key("client_secret"));
+    assert!(is_sensitive_config_key("password"));
+    assert!(is_sensitive_config_key("access_token"));
+    assert!(is_sensitive_config_key("_wizard.apiKey"));
+    assert!(!is_sensitive_config_key("model"));
+    assert!(!is_sensitive_config_key("defaultMode"));
+    assert!(!is_sensitive_config_key("permissions"));
 }

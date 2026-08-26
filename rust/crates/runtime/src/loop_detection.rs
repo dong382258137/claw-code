@@ -81,8 +81,17 @@ pub const COG_STALL_WARN_THRESHOLD: u32 = 5;
 /// 命中任一即视为一轮"停滞思考"。选择聚焦在"不确定性/否定/反复"的强信号,
 /// 排除"等等/不对/嗯"等过于常见、易误伤正常思考的弱词。
 const COG_STALL_MARKERS: &[&str] = &[
-    "不能猜", "不能凭空", "无法确定", "难以确定", "需要确认",
-    "我不确定", "不确定", "让我再想", "让我重新想", "纠结", "矛盾",
+    "不能猜",
+    "不能凭空",
+    "无法确定",
+    "难以确定",
+    "需要确认",
+    "我不确定",
+    "不确定",
+    "让我再想",
+    "让我重新想",
+    "纠结",
+    "矛盾",
 ];
 
 /// 认知停滞时注入的"不确定性溯源"提示(四分支,与领域无关)。
@@ -214,7 +223,12 @@ impl LoopDetector {
     /// 计数按时间戳保留,跨 turn 有效(由 [`LoopDetector::prune_decayed`]
     /// 衰减);优先返回完全相同调用的动作。
     #[must_use]
-    pub fn record_tool_call(&mut self, tool_name: &str, tool_input: &str, output: &str) -> LoopAction {
+    pub fn record_tool_call(
+        &mut self,
+        tool_name: &str,
+        tool_input: &str,
+        output: &str,
+    ) -> LoopAction {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -242,7 +256,10 @@ impl LoopDetector {
 
         let normalized = normalize_tool_input(tool_input);
         let call_key = (tool_name.to_owned(), normalized);
-        let entry = self.tool_call_counts.entry(call_key.clone()).or_insert((0, 0));
+        let entry = self
+            .tool_call_counts
+            .entry(call_key.clone())
+            .or_insert((0, 0));
         entry.0 += 1;
         entry.1 = now_ms;
 
@@ -255,8 +272,7 @@ impl LoopDetector {
         let mut action = LoopAction::Continue;
         if entry.0 == TOOL_WARN_THRESHOLD {
             let warn_key = format!("call:{tool_name}:{}", call_key.1);
-            if let std::collections::hash_map::Entry::Vacant(e) = self.tool_warned.entry(warn_key)
-            {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.tool_warned.entry(warn_key) {
                 e.insert(now_ms);
                 action = LoopAction::InjectContext(format!(
                     "consider reconsidering your approach — tool '{tool_name}' has been invoked \
@@ -269,7 +285,10 @@ impl LoopDetector {
         // 输出无变化信号(输入不同但结果相同);输出先规范化(剥离时间戳等易变部分)
         let normalized_output = normalize_output(output);
         let out_key = (tool_name.to_owned(), normalized_output);
-        let out_entry = self.tool_output_counts.entry(out_key.clone()).or_insert((0, 0));
+        let out_entry = self
+            .tool_output_counts
+            .entry(out_key.clone())
+            .or_insert((0, 0));
         out_entry.0 += 1;
         out_entry.1 = now_ms;
         if out_entry.0 >= SAME_OUTPUT_ABORT_THRESHOLD {
@@ -280,8 +299,7 @@ impl LoopDetector {
         }
         if out_entry.0 == SAME_OUTPUT_WARN_THRESHOLD && matches!(action, LoopAction::Continue) {
             let warn_key = format!("out:{tool_name}:{}", out_key.1);
-            if let std::collections::hash_map::Entry::Vacant(e) = self.tool_warned.entry(warn_key)
-            {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.tool_warned.entry(warn_key) {
                 e.insert(now_ms);
                 action = LoopAction::InjectContext(format!(
                     "consider reconsidering your approach — tool '{tool_name}' returned identical \
@@ -313,9 +331,9 @@ impl LoopDetector {
                 self.no_output_run
             );
             action = match action {
-                LoopAction::InjectContext(existing) => LoopAction::InjectContext(format!(
-                    "{existing}\n{msg}"
-                )),
+                LoopAction::InjectContext(existing) => {
+                    LoopAction::InjectContext(format!("{existing}\n{msg}"))
+                }
                 _ => LoopAction::InjectContext(msg),
             };
         }
@@ -602,8 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_skills_count_exceeds_limit() {
-    }
+    fn validate_skills_count_exceeds_limit() {}
 
     // -----------------------------------------------------------------
     // 工具调用循环检测(§修复:Bug-2 bash 诊断循环无防护)
@@ -712,7 +729,8 @@ mod tests {
         detector.reset_edits();
         // 重置后重新累计到接近警告阈值,前几次应仍为 Continue
         for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
-            let action = detector.record_tool_call("Bash", &format!("post {i}"), &format!("out {i}"));
+            let action =
+                detector.record_tool_call("Bash", &format!("post {i}"), &format!("out {i}"));
             assert!(
                 matches!(action, LoopAction::Continue),
                 "reset_edits 后无产出 streak 应清零,第 {i} 次应仍为 Continue: {action:?}"
@@ -831,7 +849,8 @@ mod tests {
         let mut detector = LoopDetector::new();
         // 累计到接近警告阈值
         for i in 0..NO_OUTPUT_WARN_THRESHOLD - 1 {
-            let _ = detector.record_tool_call("Read", &format!("file {i}"), &format!("content {i}"));
+            let _ =
+                detector.record_tool_call("Read", &format!("file {i}"), &format!("content {i}"));
         }
         // 模型输出文本 → streak 清零
         detector.record_text_output();
@@ -864,14 +883,15 @@ mod tests {
         let mut aborted = false;
         // 仅补到第 5 次(4、5 次应为 Continue/InjectContext),第 6 次留给循环外的最终断言
         for _ in TOOL_WARN_THRESHOLD..TOOL_ABORT_THRESHOLD - 1 {
-            let action = detector
-                .record_tool_call_at("Bash", "netstat", "LISTENING", now + 5 * 60 * 1000);
+            let action =
+                detector.record_tool_call_at("Bash", "netstat", "LISTENING", now + 5 * 60 * 1000);
             if matches!(action, LoopAction::Abort(_)) {
                 aborted = true;
             }
         }
         assert!(!aborted, "第 4-5 次应仍为 Continue/InjectContext");
-        let action = detector.record_tool_call_at("Bash", "netstat", "LISTENING", now + 5 * 60 * 1000);
+        let action =
+            detector.record_tool_call_at("Bash", "netstat", "LISTENING", now + 5 * 60 * 1000);
         assert!(
             matches!(action, LoopAction::Abort(_)),
             "跨 turn 循环(窗口内)应被检测: {action:?}"
@@ -889,8 +909,7 @@ mod tests {
         detector.prune_decayed(now + 20 * 60 * 1000, 15 * 60 * 1000);
         // 重新计数:前 2 次仍 Continue(而非立即警告/中止)
         for _ in 0..TOOL_WARN_THRESHOLD - 1 {
-            let action =
-                detector.record_tool_call_at("Bash", "netstat", "", now + 21 * 60 * 1000);
+            let action = detector.record_tool_call_at("Bash", "netstat", "", now + 21 * 60 * 1000);
             assert!(
                 matches!(action, LoopAction::Continue),
                 "prune 后计数应重置: {action:?}"
@@ -900,9 +919,15 @@ mod tests {
 
     #[test]
     fn normalize_output_strips_timestamps_and_whitespace() {
-        assert_eq!(normalize_output("2026-08-09T01:26:43.123Z listening"), "TS listening");
+        assert_eq!(
+            normalize_output("2026-08-09T01:26:43.123Z listening"),
+            "TS listening"
+        );
         assert_eq!(normalize_output("   abc   def  \r\n "), "abc def");
-        assert_eq!(normalize_output("error 404: page not found"), "error 404: page not found");
+        assert_eq!(
+            normalize_output("error 404: page not found"),
+            "error 404: page not found"
+        );
         assert_eq!(normalize_output("62112"), "62112"); // 纯数字端口号不受影响
     }
 

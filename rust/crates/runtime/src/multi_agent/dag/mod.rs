@@ -200,7 +200,9 @@ impl DagStore {
 }
 
 // Re-export DagStore input types for tool registration.
-pub use dag_input::{build_dag_from_define, DagDefineInput, DagNodeDefine, DagRunInput, DagStatusInput};
+pub use dag_input::{
+    build_dag_from_define, DagDefineInput, DagNodeDefine, DagRunInput, DagStatusInput,
+};
 
 mod dag_input {
     use std::collections::HashSet;
@@ -376,10 +378,18 @@ mod dag_input_tests {
         assert_eq!(dag.nodes[0].id, "analyze");
         assert_eq!(dag.nodes[0].label, "analyze"); // 空 label 回退到 id
         assert!(dag.nodes[0].depends_on.is_empty());
-        assert!(dag.nodes[0].acceptance_criteria.contains("Verify node 'analyze'"));
+        assert!(dag.nodes[0]
+            .acceptance_criteria
+            .contains("Verify node 'analyze'"));
         assert_eq!(dag.nodes[0].max_retries, 2); // 默认 2
-        assert_eq!(dag.nodes[0].mode, crate::multi_agent::CoordinationMode::Fork);
-        assert_eq!(dag.nodes[0].capability, crate::multi_agent::SubagentCapability::Execute);
+        assert_eq!(
+            dag.nodes[0].mode,
+            crate::multi_agent::CoordinationMode::Fork
+        );
+        assert_eq!(
+            dag.nodes[0].capability,
+            crate::multi_agent::SubagentCapability::Execute
+        );
         // implement node:显式值
         assert_eq!(dag.nodes[1].id, "implement");
         assert_eq!(dag.nodes[1].label, "Implement");

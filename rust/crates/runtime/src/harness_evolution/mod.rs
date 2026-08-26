@@ -15,7 +15,7 @@
 pub mod archive;
 pub mod types;
 
-pub use archive::{HarnessArchive, ArchiveError};
+pub use archive::{ArchiveError, HarnessArchive};
 pub use types::*;
 
 use crate::decision_log::compute_simhash;
@@ -120,7 +120,11 @@ pub fn mine_weaknesses(
         .filter(|c| c.count as usize >= min_occurrences)
         .map(|c| WeaknessSignal {
             pathology: c.label.clone(),
-            sample_errors: c.sample_errors.into_iter().take(MAX_SAMPLE_ERRORS).collect(),
+            sample_errors: c
+                .sample_errors
+                .into_iter()
+                .take(MAX_SAMPLE_ERRORS)
+                .collect(),
             occurrence_count: c.count,
             related_turns: extract_related_turns(window, &c.label),
         })
@@ -166,12 +170,14 @@ pub fn mine_weaknesses_from_traces(
     let mut signals: Vec<WeaknessSignal> = buckets
         .into_iter()
         .filter(|(_, (count, _, _))| *count as usize >= min_occurrences)
-        .map(|(pathology, (count, sample_errors, related_turns))| WeaknessSignal {
-            pathology,
-            sample_errors,
-            occurrence_count: count,
-            related_turns,
-        })
+        .map(
+            |(pathology, (count, sample_errors, related_turns))| WeaknessSignal {
+                pathology,
+                sample_errors,
+                occurrence_count: count,
+                related_turns,
+            },
+        )
         .collect();
     signals.sort_by(|a, b| {
         b.occurrence_count
@@ -199,7 +205,10 @@ fn tool_signature(step: &TraceToolStep) -> String {
 }
 
 /// 取最近 `lookback_turns` 条记录(用于关联 turn_id)。
-fn recent_window(analyzer: &TraceAnalyzer, lookback_turns: usize) -> &[crate::trace_analyzer::TraceRecord] {
+fn recent_window(
+    analyzer: &TraceAnalyzer,
+    lookback_turns: usize,
+) -> &[crate::trace_analyzer::TraceRecord] {
     let len = analyzer.records.len();
     let start = len.saturating_sub(lookback_turns);
     &analyzer.records[start..]
@@ -450,7 +459,11 @@ fn significance_gate(
 
     let diff = window_rate - baseline_rate;
     let std_error = (baseline_rate * (1.0 - baseline_rate) / n).sqrt();
-    let z_score = if std_error > 0.0 { diff / std_error } else { 0.0 };
+    let z_score = if std_error > 0.0 {
+        diff / std_error
+    } else {
+        0.0
+    };
 
     // alpha = 0.05 → |z| > 1.96
     let threshold = 1.96;
@@ -490,7 +503,10 @@ fn tool_level_significance_gate(
 
     // 基线：全部数据的失败率。
     let baseline_failures = count_pathology_failures(failure_traces, &candidate.pathology);
-    let baseline_calls = tool_stats.iter().filter(|ts| ts.tool_name == tool_name).count();
+    let baseline_calls = tool_stats
+        .iter()
+        .filter(|ts| ts.tool_name == tool_name)
+        .count();
     if baseline_calls < MIN_TOOL_CALLS {
         return SignificanceResult::Keep; // 样本不足
     }
@@ -508,7 +524,8 @@ fn tool_level_significance_gate(
         .iter()
         .filter(|ft| {
             ft.recorded_at_ms >= window_start
-                && ft.steps
+                && ft
+                    .steps
                     .iter()
                     .any(|s| s.is_error && tool_signature(s) == candidate.pathology)
         })
@@ -526,7 +543,11 @@ fn tool_level_significance_gate(
     // z-test：窗口失败率显著低于基线（diff > 0）→ 规则有效。
     let diff = baseline_rate - window_rate;
     let std_error = (baseline_rate * (1.0 - baseline_rate) / n).sqrt();
-    let z_score = if std_error > 0.0 { diff / std_error } else { 0.0 };
+    let z_score = if std_error > 0.0 {
+        diff / std_error
+    } else {
+        0.0
+    };
 
     let threshold = 1.96;
     if z_score > threshold {
@@ -552,9 +573,7 @@ fn count_pathology_failures(failure_traces: &[FailureTrace], pathology: &str) ->
 
 /// 窗口内 TaskSuccessRate。
 #[must_use]
-pub fn compute_task_success_rate(
-    trace_window: &[crate::trace_analyzer::TraceRecord],
-) -> f64 {
+pub fn compute_task_success_rate(trace_window: &[crate::trace_analyzer::TraceRecord]) -> f64 {
     if trace_window.is_empty() {
         return 0.0;
     }
@@ -607,7 +626,14 @@ pub fn evolve(
     }
 
     // Stage 3: 验证所有 Candidate edits（工具级走失败率 z-test）
-    validate_all_candidates(trace, failure_traces, tool_stats, archive, config, &mut report)?;
+    validate_all_candidates(
+        trace,
+        failure_traces,
+        tool_stats,
+        archive,
+        config,
+        &mut report,
+    )?;
 
     Ok(report)
 }
@@ -626,8 +652,14 @@ fn validate_all_candidates(
     let candidates = archive.candidate_edits()?;
 
     for candidate in candidates {
-        let outcome =
-            validate_candidate(&candidate, window, failure_traces, tool_stats, baseline_rate, config);
+        let outcome = validate_candidate(
+            &candidate,
+            window,
+            failure_traces,
+            tool_stats,
+            baseline_rate,
+            config,
+        );
         match outcome {
             ValidationOutcome::Promoted => {
                 archive.update_status(&candidate.id, EditStatus::Active)?;
@@ -769,7 +801,8 @@ mod tests {
             validation_window: 5,
             ..EvolutionConfig::default()
         };
-        let result = tool_level_significance_gate(&candidate, &failure_traces, &tool_stats, &config);
+        let result =
+            tool_level_significance_gate(&candidate, &failure_traces, &tool_stats, &config);
         assert!(
             matches!(result, SignificanceResult::Promote),
             "失败率下降应晋升，got {result:?}"
@@ -788,7 +821,8 @@ mod tests {
             validation_window: 5,
             ..EvolutionConfig::default()
         };
-        let result = tool_level_significance_gate(&candidate, &failure_traces, &tool_stats, &config);
+        let result =
+            tool_level_significance_gate(&candidate, &failure_traces, &tool_stats, &config);
         assert!(
             matches!(result, SignificanceResult::Reject),
             "失败率上升应退役，got {result:?}"
@@ -830,7 +864,11 @@ mod tests {
     #[test]
     fn mine_weaknesses_from_traces_groups_by_tool_signature() {
         let traces = vec![
-            failed_trace("t1", "edit_file", "error: old_string not found in src/lib.rs"),
+            failed_trace(
+                "t1",
+                "edit_file",
+                "error: old_string not found in src/lib.rs",
+            ),
             failed_trace("t2", "edit_file", "old_string not found"),
         ];
         let signals = mine_weaknesses_from_traces(&traces, 2);
@@ -915,9 +953,7 @@ mod tests {
         let cluster = crate::trace_analyzer::FailureCluster {
             label: "runtime_error".to_string(),
             count: 3,
-            sample_errors: vec![
-                "error: old_string not found in src/lib.rs".to_string(),
-            ],
+            sample_errors: vec!["error: old_string not found in src/lib.rs".to_string()],
         };
         let weakness = weakness_from_cluster(&cluster);
 
@@ -925,7 +961,9 @@ mod tests {
         assert_eq!(edit.status, EditStatus::Candidate);
         assert_eq!(edit.source, EditSource::RulePattern);
         assert!(edit.content.contains("old_string not found"));
-        assert!(edit.proposer_reasoning.contains("edit_old_string_not_found"));
+        assert!(edit
+            .proposer_reasoning
+            .contains("edit_old_string_not_found"));
     }
 
     #[test]
@@ -988,7 +1026,9 @@ mod tests {
             0.5,
             &EvolutionConfig::default(),
         );
-        assert!(matches!(outcome, ValidationOutcome::Retired(reason) if reason.contains("did not occur")));
+        assert!(
+            matches!(outcome, ValidationOutcome::Retired(reason) if reason.contains("did not occur"))
+        );
     }
 
     #[test]
@@ -1027,10 +1067,7 @@ mod tests {
 
     #[test]
     fn compute_task_success_rate_counts_successful_turns() {
-        let mut window = vec![
-            TraceRecord::new("t1", 10, 0),
-            TraceRecord::new("t2", 10, 0),
-        ];
+        let mut window = vec![TraceRecord::new("t1", 10, 0), TraceRecord::new("t2", 10, 0)];
         window.push(failed_record("t3", "runtime_error", "boom"));
         let rate = compute_task_success_rate(&window);
         assert!((rate - 2.0 / 3.0).abs() < 1e-9);
@@ -1129,11 +1166,7 @@ mod tests {
         impl HarnessProposer for StubProposer {
             fn propose(&self, weakness: &WeaknessSignal) -> Option<(String, String)> {
                 // 返回超长 content,验证 llm_based_propose 的截断逻辑。
-                let content = format!(
-                    "Always check {}{}",
-                    weakness.pathology,
-                    "x".repeat(2000)
-                );
+                let content = format!("Always check {}{}", weakness.pathology, "x".repeat(2000));
                 Some((content, "stub reasoning".to_string()))
             }
         }

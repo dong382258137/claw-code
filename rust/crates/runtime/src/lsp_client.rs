@@ -503,7 +503,8 @@ impl LspRegistry {
         line: u32,
         character: u32,
     ) -> Result<Vec<LspLocation>, String> {
-        let response = self.dispatch("references", Some(path), Some(line), Some(character), None)?;
+        let response =
+            self.dispatch("references", Some(path), Some(line), Some(character), None)?;
         Ok(parse_references(&response))
     }
 
@@ -664,8 +665,7 @@ impl LspRegistry {
         // 确保 server 已注册并 spawn(未就绪则 auto-start,含安装提示)。
         let server_ready = {
             let inner = self.inner.lock().expect("lsp registry lock poisoned");
-            inner.servers.contains_key(language)
-                && inner.process_transports.contains_key(language)
+            inner.servers.contains_key(language) && inner.process_transports.contains_key(language)
         };
         if !server_ready {
             if let Err(err) = self.try_auto_start(language) {
@@ -1868,7 +1868,11 @@ fn normalize_lsp_path(path: &str) -> Option<String> {
     let abs = if std::path::Path::new(&cleaned).is_absolute() {
         cleaned
     } else {
-        std::env::current_dir().ok()?.join(cleaned).display().to_string()
+        std::env::current_dir()
+            .ok()?
+            .join(cleaned)
+            .display()
+            .to_string()
     };
     Some(abs.replace('\\', "/"))
 }
@@ -2598,7 +2602,10 @@ mod tests {
         assert!(!rel.contains('\\'), "规范化后不应有反斜杠: {rel}");
         // 绝对路径的反斜杠 → 正斜杠(与 uri_to_path 输出一致;仅 Windows)。
         #[cfg(windows)]
-        assert_eq!(normalize_lsp_path("D:\\a\\b.rs").as_deref(), Some("D:/a/b.rs"));
+        assert_eq!(
+            normalize_lsp_path("D:\\a\\b.rs").as_deref(),
+            Some("D:/a/b.rs")
+        );
         // Windows verbatim 前缀 `\\?\` 剥离(编辑工具返回的 filePath 格式;仅 Windows)。
         #[cfg(windows)]
         assert_eq!(
@@ -2640,14 +2647,22 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(registry.get_diagnostics("d:/PROJ/src/MOD.py").len(), 1);
         // 无关路径不命中。
-        let other = if cfg!(windows) { "D:/other.py" } else { "/other.py" };
+        let other = if cfg!(windows) {
+            "D:/other.py"
+        } else {
+            "/other.py"
+        };
         assert!(registry.get_diagnostics(other).is_empty());
     }
 
     #[test]
     fn record_push_version_matches_backslash_query() {
         let registry = LspRegistry::new();
-        let key = if cfg!(windows) { "D:/proj/a.py" } else { "/proj/a.py" };
+        let key = if cfg!(windows) {
+            "D:/proj/a.py"
+        } else {
+            "/proj/a.py"
+        };
         {
             let mut inner = registry.inner.lock().expect("lock");
             record_push(&mut inner, key.to_string());
@@ -2656,7 +2671,11 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(registry.last_push_version("D:\\proj\\a.py"), 1);
         #[cfg(windows)]
-        assert_eq!(registry.last_push_version("d:/PROJ/A.PY"), 1, "大小写不敏感命中");
+        assert_eq!(
+            registry.last_push_version("d:/PROJ/A.PY"),
+            1,
+            "大小写不敏感命中"
+        );
         assert_eq!(registry.last_push_version(key), 1);
     }
 

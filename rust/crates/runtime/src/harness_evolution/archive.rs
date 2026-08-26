@@ -11,9 +11,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::decision_log::{compute_simhash, hamming_distance};
-use crate::harness_evolution::types::{
-    ArchiveStats, EditSource, EditStatus, HarnessEdit,
-};
+use crate::harness_evolution::types::{ArchiveStats, EditSource, EditStatus, HarnessEdit};
 
 /// 容量控制上限(design-doc §3.3)。
 pub const MAX_ACTIVE_EDITS: usize = 10;
@@ -176,10 +174,7 @@ impl HarnessArchive {
     }
 
     /// 按状态列出 edits(默认全部)。Active 按 success_rate 降序,其余按 created_at 升序。
-    pub fn list_edits(
-        &self,
-        status: Option<EditStatus>,
-    ) -> Result<Vec<HarnessEdit>, ArchiveError> {
+    pub fn list_edits(&self, status: Option<EditStatus>) -> Result<Vec<HarnessEdit>, ArchiveError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let (sql, params) = match status {
             Some(s) => (
@@ -369,14 +364,18 @@ fn map_edit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HarnessEdit> {
         rusqlite::Error::FromSqlConversionFailure(
             3,
             rusqlite::types::Type::Text,
-            Box::new(std::io::Error::other(format!("invalid status: {status_str}"))),
+            Box::new(std::io::Error::other(format!(
+                "invalid status: {status_str}"
+            ))),
         )
     })?;
     let source = EditSource::from_db_str(&source_str).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             4,
             rusqlite::types::Type::Text,
-            Box::new(std::io::Error::other(format!("invalid source: {source_str}"))),
+            Box::new(std::io::Error::other(format!(
+                "invalid source: {source_str}"
+            ))),
         )
     })?;
     Ok(HarnessEdit {
@@ -478,10 +477,7 @@ mod tests {
         assert_eq!(rolled, 1);
         let retired = archive.retired_edits().expect("retired");
         assert_eq!(retired.len(), 1);
-        assert_eq!(
-            retired[0].retire_reason.as_deref(),
-            Some("manual rollback")
-        );
+        assert_eq!(retired[0].retire_reason.as_deref(), Some("manual rollback"));
         assert!(archive.active_edits().expect("active").is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -535,7 +531,9 @@ mod tests {
         archive
             .add_candidate(sample_edit("e2", "p2", "c2", 2))
             .expect("add");
-        archive.update_status("e1", EditStatus::Active).expect("act");
+        archive
+            .update_status("e1", EditStatus::Active)
+            .expect("act");
         archive
             .update_status_and_stats("e1", EditStatus::Active, 2, 2)
             .expect("stats");

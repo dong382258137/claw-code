@@ -320,10 +320,14 @@ impl AnthropicRuntimeClient {
         // 子智能体经独立 `subagent-{session}` detector 统计(见 detector_for)。
         // 多轮 tool call 循环中 messages 增长是预期行为(§3.3.3),用
         // `record_usage_multi_turn` 忽略 messages_hash 变化,避免 "message
-        // payload changed" break 误报。主 agent 仍用 `record_usage`
-        // (messages 增长确实是 break 信号)。
+        // payload changed" break 误报。
+        // 🔧 主 agent 的工具循环续写(post-tool,以 tool_result 结尾)同样属于
+        // 预期增长,一并走 multi_turn;仅跨 turn 的新请求才用 `record_usage`
+        // 比对 messages_hash(此时 messages 重组才是真实的 break 信号)。
         let detector = self.detector_for(kind);
-        let _ = if kind == RequestKind::Subagent {
+        let is_tool_loop =
+            kind == RequestKind::Subagent || request_ends_with_tool_result_msg(request);
+        let _ = if is_tool_loop {
             detector.record_usage_multi_turn(request, &api_usage)
         } else {
             detector.record_usage(request, &api_usage)
@@ -566,9 +570,48 @@ impl ApiClient for AnthropicRuntimeClient {
     }
 }
 
+/// 传输层瞬时故障的自动重试预算（同轮最多自动重试 1 次）。
+///
+/// 仅当流在产生任何 UI 可见内容（思考/文本）之前就断掉时才自动重发；
+/// 一旦已有内容被渲染，重发会导致输出重复，故只把错误上报为"可重试"，
+/// 由上层决定是否手动重跑当前轮。
+const MAX_TRANSPORT_RETRIES: usize = 1;
+
+/// 单次流式尝试的失败类型，交给外层 [`consume_stream`] 决定是否干净重试。
+enum StreamAttemptError {
+    /// 传输/解码层瞬时故障（连接重置、body 解码失败等），可重试。
+    /// `emitted_any_event` 为 true 说明流中已产生 UI 可见内容，不宜重发。
+    Transport { message: String, emitted_any_event: bool },
+    /// 不可重试错误；通常已在内部 emit `StreamError` 事件。
+    Fatal(RuntimeError),
+}
+
+impl From<RuntimeError> for StreamAttemptError {
+    fn from(error: RuntimeError) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+/// 传输/解码层瞬时故障判定：reqwest 的 Http 错误（连接重置、body 解码失败、
+/// 连接/请求超时等）。这类错误通常是网络抖动，重试同一请求大概率能成功；
+/// 而 4xx/5xx 状态码会走 `ApiError::Api`，不属于此类，不作自动重试。
+fn is_transient_transport_error(error: &api::ApiError) -> bool {
+    matches!(error, api::ApiError::Http(_))
+}
+
+/// 是否对一次传输层瞬时故障做同轮自动重试。
+///
+/// 仅当流尚未产生任何 UI 可见内容（避免重发导致输出重复）且重试预算未耗尽时
+/// 才自动重试；否则把错误上报为可重试，交由上层/用户决定。
+fn should_auto_retry_transport(emitted_any_event: bool, retries_so_far: usize) -> bool {
+    !emitted_any_event && retries_so_far < MAX_TRANSPORT_RETRIES
+}
+
 impl AnthropicRuntimeClient {
-    /// Consume a single streaming response, optionally applying a stall
-    /// timeout on the first event for post-tool continuations.
+    /// Consume a streaming response, automatically retrying a single clean
+    /// transport-level failure (connection reset / body decode error that
+    /// occurs before any UI-visible content was emitted), then delegating to
+    /// [`consume_stream_attempt`](Self::consume_stream_attempt).
     #[allow(clippy::too_many_lines)]
     async fn consume_stream(
         &self,
@@ -576,15 +619,53 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
+        let mut retries = 0usize;
+        loop {
+            match self
+                .consume_stream_attempt(request_kind, message_request, apply_stall_timeout)
+                .await
+            {
+                Ok(events) => return Ok(events),
+                Err(StreamAttemptError::Fatal(error)) => return Err(error),
+                Err(StreamAttemptError::Transport {
+                    message,
+                    emitted_any_event,
+                }) => {
+                    // 未产生任何内容且重试预算未耗尽 → 同轮自动重发一次。
+                    if should_auto_retry_transport(emitted_any_event, retries) {
+                        retries += 1;
+                        continue;
+                    }
+                    // 已产生内容或预算耗尽 → 作为可重试错误上报，由上层/用户决定。
+                    return Err(self.emit_stream_error(message, true));
+                }
+            }
+        }
+    }
+
+    /// Consume a single streaming response, optionally applying a stall
+    /// timeout on the first event for post-tool continuations.
+    #[allow(clippy::too_many_lines)]
+    async fn consume_stream_attempt(
+        &self,
+        request_kind: RequestKind,
+        message_request: &MessageRequest,
+        apply_stall_timeout: bool,
+    ) -> Result<Vec<AssistantEvent>, StreamAttemptError> {
+        let mut stream = match self.client.stream_message(message_request).await {
+            Ok(stream) => stream,
+            Err(error) => {
                 // P0-1 修复 #1/9：stream_message 失败（API 错误、网络断开等）。
                 let msg = format_user_visible_api_error(&self.session_id, &error);
-                self.emit_stream_error(msg, false)
-            })?;
+                if is_transient_transport_error(&error) {
+                    return Err(StreamAttemptError::Transport {
+                        message: msg,
+                        emitted_any_event: false,
+                    });
+                }
+                return Err(StreamAttemptError::Fatal(self.emit_stream_error(msg, false)));
+            }
+        };
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         // v3:使用 `dyn Write + Send` 让 `consume_stream` 返回的 Future 为 `Send`,
@@ -624,11 +705,21 @@ impl AnthropicRuntimeClient {
                 INTER_EVENT_TIMEOUT
             };
             let next = match tokio::time::timeout(timeout_duration, stream.next_event()).await {
-                Ok(inner) => inner.map_err(|error| {
+                // next_event() 返回 Result<Option<StreamEvent>, ApiError>，故 event 已是 Option。
+                Ok(Ok(event)) => event,
+                Ok(Err(error)) => {
                     // P0-1 修复 #2/9：超时分支内 next_event 失败。
                     let msg = format_user_visible_api_error(&self.session_id, &error);
-                    self.emit_stream_error(msg, false)
-                })?,
+                    // 传输/解码层瞬时故障（连接重置、body 解码失败）→ 交给外层判断
+                    // 是否干净重试；其余错误视为不可重试，立即上报。
+                    if is_transient_transport_error(&error) {
+                        return Err(StreamAttemptError::Transport {
+                            message: msg,
+                            emitted_any_event: received_any_event,
+                        });
+                    }
+                    return Err(StreamAttemptError::Fatal(self.emit_stream_error(msg, false)));
+                }
                 Err(_elapsed) => {
                     // P0-1 修复 #3/9 + P3 扩展:stall 超时。
                     // 区分两种 stall 场景,提供更精确的错误消息:
@@ -640,7 +731,7 @@ impl AnthropicRuntimeClient {
                         // 这包括:非 post-tool 首事件 stall + 后续事件 stall
                         "inter-event stall: stream stalled waiting for next event (60s timeout)"
                     };
-                    return Err(self.emit_stream_error(msg, true));
+                    return Err(StreamAttemptError::Fatal(self.emit_stream_error(msg, true)));
                 }
             };
 
@@ -946,6 +1037,22 @@ pub(crate) fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .messages
         .last()
         .is_some_and(|message| message.role == MessageRole::Tool)
+}
+
+/// Returns `true` when a converted [`MessageRequest`] ends with a
+/// tool-result message, i.e. it is an in-turn tool-loop continuation rather
+/// than a fresh user turn.
+///
+/// `convert_messages` merges consecutive tool-result messages into the last
+/// user message, so we check the trailing message's content for any
+/// `ToolResult` block.
+pub(crate) fn request_ends_with_tool_result_msg(request: &MessageRequest) -> bool {
+    request.messages.last().is_some_and(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, InputContentBlock::ToolResult { .. }))
+    })
 }
 
 pub(crate) fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
@@ -1545,6 +1652,50 @@ mod status_emitter_tests {
         }
     }
 
+    fn msg_request_with_block(block: InputContentBlock) -> api::MessageRequest {
+        api::MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![api::InputMessage {
+                role: "user".to_string(),
+                content: vec![block],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 以 tool_result 结尾的请求 → 属于工具循环续写(post-tool),应判 true。
+    #[test]
+    fn request_ends_with_tool_result_msg_true_for_tool_result_tail() {
+        let request = msg_request_with_block(InputContentBlock::ToolResult {
+            tool_use_id: "call_01_abc".to_string(),
+            content: vec![api::ToolResultContentBlock::Text {
+                text: "ok".to_string(),
+            }],
+            is_error: false,
+        });
+        assert!(request_ends_with_tool_result_msg(&request));
+    }
+
+    /// 以纯文本结尾的请求 → 跨 turn 新请求,应判 false。
+    #[test]
+    fn request_ends_with_tool_result_msg_false_for_text_tail() {
+        let request = msg_request_with_block(InputContentBlock::Text {
+            text: "continue".to_string(),
+        });
+        assert!(!request_ends_with_tool_result_msg(&request));
+    }
+
+    /// 空 messages → 无尾部消息,应判 false(不会 panic)。
+    #[test]
+    fn request_ends_with_tool_result_msg_false_for_empty_messages() {
+        let request = api::MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![],
+            ..Default::default()
+        };
+        assert!(!request_ends_with_tool_result_msg(&request));
+    }
+
     #[test]
     fn convert_messages_keeps_thinking_for_thinking_mode_tool_call() {
         // DeepSeek thinking 模式的 tool call(`call_01_*`)必须保留 thinking,
@@ -1620,5 +1771,60 @@ mod status_emitter_tests {
                 .any(|b| matches!(b, InputContentBlock::Thinking { .. })),
             "非 thinking 模式的 thinking 块应被剥离以节省 context token"
         );
+    }
+
+    // ── 传输层瞬时故障自动重试 ──
+
+    #[test]
+    fn is_transient_transport_error_true_for_http() {
+        // reqwest Http 错误（连接重置 / body 解码失败等）应视为可重试的瞬时故障。
+        // 用非法代理 URL 构造一个确定性的 reqwest::Error（离线、无 async runtime）。
+        let reqwest_err = reqwest::Proxy::http("not a url").unwrap_err();
+        let err: api::ApiError = reqwest_err.into();
+        assert!(is_transient_transport_error(&err));
+    }
+
+    #[test]
+    fn is_transient_transport_error_false_for_api_status() {
+        // 4xx/5xx 状态码错误（Api 变体）不属于瞬时传输故障，不做自动重试。
+        let err = api::ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("rate_limit_error".to_string()),
+            message: Some("rate limit".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: true,
+            suggested_action: None,
+            retry_after: None,
+        };
+        assert!(!is_transient_transport_error(&err));
+    }
+
+    #[test]
+    fn should_auto_retry_clean_transport_within_budget() {
+        // 流尚未产生 UI 可见内容且预算未耗尽 → 自动重试。
+        assert!(should_auto_retry_transport(false, 0));
+        assert!(should_auto_retry_transport(false, MAX_TRANSPORT_RETRIES - 1));
+    }
+
+    #[test]
+    fn should_auto_retry_refuses_after_content_emitted() {
+        // 已有内容（思考/文本）被渲染 → 重发会重复，禁止自动重试。
+        assert!(!should_auto_retry_transport(true, 0));
+        assert!(!should_auto_retry_transport(true, MAX_TRANSPORT_RETRIES));
+    }
+
+    #[test]
+    fn should_auto_retry_refuses_when_budget_exhausted() {
+        // 虽然干净，但预算已耗尽（同轮最多重试 1 次）→ 不再自动重试。
+        assert!(!should_auto_retry_transport(false, MAX_TRANSPORT_RETRIES));
+    }
+
+    #[test]
+    fn runtime_error_converts_to_fatal_attempt_error() {
+        // 局部 `?` 路径的 RuntimeError 应映射为不可重试的 Fatal。
+        let re = RuntimeError::new("boom".to_string());
+        let se: StreamAttemptError = re.into();
+        assert!(matches!(se, StreamAttemptError::Fatal(_)));
     }
 }

@@ -69,7 +69,10 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("claw-yaml-loader-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "claw-yaml-loader-test-{name}-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
@@ -111,8 +114,14 @@ nodes:
         // 默认值填充:capability→Execute, mode→Fork, max_retries→2
         assert_eq!(dag.nodes[0].id, "analyze");
         assert_eq!(dag.nodes[0].label, "analyze");
-        assert_eq!(dag.nodes[0].capability, crate::multi_agent::SubagentCapability::Execute);
-        assert_eq!(dag.nodes[0].mode, crate::multi_agent::CoordinationMode::Fork);
+        assert_eq!(
+            dag.nodes[0].capability,
+            crate::multi_agent::SubagentCapability::Execute
+        );
+        assert_eq!(
+            dag.nodes[0].mode,
+            crate::multi_agent::CoordinationMode::Fork
+        );
         assert_eq!(dag.nodes[1].depends_on, vec!["analyze"]);
         assert_eq!(dag.nodes[1].max_retries, 3);
         assert_eq!(dag.nodes[1].verify_command.as_deref(), Some("cargo test"));
@@ -122,7 +131,8 @@ nodes:
 
     #[test]
     fn missing_dir_yields_empty() {
-        let (dags, errors) = load_dag_definitions_with_errors(&Path::new("Z:\\nonexistent-dir-xyz"));
+        let (dags, errors) =
+            load_dag_definitions_with_errors(&Path::new("Z:\\nonexistent-dir-xyz"));
         assert!(dags.is_empty());
         assert!(errors.is_empty());
     }

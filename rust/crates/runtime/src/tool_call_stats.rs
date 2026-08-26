@@ -96,7 +96,8 @@ pub fn record(
     fs::create_dir_all(dir).map_err(|e| ToolCallStatsError::Io(e.to_string()))?;
 
     let stat = ToolCallStat::new(tool_name, is_error);
-    let line = serde_json::to_string(&stat).map_err(|e| ToolCallStatsError::Serialize(e.to_string()))?;
+    let line =
+        serde_json::to_string(&stat).map_err(|e| ToolCallStatsError::Serialize(e.to_string()))?;
 
     let needs_prune = path.exists()
         && fs::metadata(&path)
@@ -165,8 +166,8 @@ fn prune(path: &Path) -> Result<usize, ToolCallStatsError> {
         let mut tmp_file =
             fs::File::create(&tmp_path).map_err(|e| ToolCallStatsError::Io(e.to_string()))?;
         for stat in &records {
-            let line =
-                serde_json::to_string(stat).map_err(|e| ToolCallStatsError::Serialize(e.to_string()))?;
+            let line = serde_json::to_string(stat)
+                .map_err(|e| ToolCallStatsError::Serialize(e.to_string()))?;
             writeln!(tmp_file, "{line}").map_err(|e| ToolCallStatsError::Io(e.to_string()))?;
         }
         tmp_file

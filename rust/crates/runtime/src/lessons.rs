@@ -43,7 +43,10 @@ pub fn parse_lessons_from_summary(summary: &str) -> Vec<String> {
     };
     let mut out = Vec::new();
     for line in sec.lines() {
-        let line = line.trim().trim_start_matches("- ").trim_start_matches("* ");
+        let line = line
+            .trim()
+            .trim_start_matches("- ")
+            .trim_start_matches("* ");
         if line.is_empty() || line.eq_ignore_ascii_case("none") {
             continue;
         }
@@ -71,10 +74,7 @@ pub fn append_lessons(root: &Path, lessons: &[String]) -> Result<usize, String> 
         if existing.iter().any(|e| e.lesson == lesson) {
             continue;
         }
-        existing.push(Lesson {
-            ts_ms: now,
-            lesson,
-        });
+        existing.push(Lesson { ts_ms: now, lesson });
         added += 1;
     }
     if added == 0 {
@@ -202,8 +202,11 @@ mod tests {
         assert_eq!(n, 2);
 
         // 重复追加被去重
-        let n2 = append_lessons(root, &["git stash 路径事故: 先 git rev-parse --show-toplevel".to_string()])
-            .expect("append dup");
+        let n2 = append_lessons(
+            root,
+            &["git stash 路径事故: 先 git rev-parse --show-toplevel".to_string()],
+        )
+        .expect("append dup");
         assert_eq!(n2, 0);
 
         // 读取最近 1 条(最新在前)

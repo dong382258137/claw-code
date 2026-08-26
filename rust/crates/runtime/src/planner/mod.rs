@@ -532,6 +532,24 @@ fn is_likely_path(s: &str) -> bool {
     has_sep && has_ext && s.len() >= 5 && s.len() <= 120
 }
 
+/// F5 计划文件集校验:从 Active Plan 的所有 step 描述中提取"计划涉及的文件"集合。
+///
+/// `PlanArtifact.steps` 并不显式记录文件字段;文件路径通常以反引号形式出现在 step
+/// 描述中(启发式分解会生成 `Modify \`<path>\`` 的描述)。复用 [`extract_file_paths`]
+/// 逐 step 聚合,去重后作为软警告的对比基线。
+///
+/// 返回空集合表示无法从计划解析出文件(E.g. 描述未含成对分隔符+受支持扩展名的路径),
+/// 调用方此时应"宁漏勿扰",不发出越界警告。
+pub fn plan_file_paths(plan: &crate::planner::PlanArtifact) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for step in &plan.steps {
+        for p in extract_file_paths(&step.description) {
+            seen.insert(p);
+        }
+    }
+    seen.into_iter().collect()
+}
+
 fn split_into_sentences(text: &str) -> Vec<String> {
     text.split_inclusive(&['.', '!', '?', '\n'])
         .map(|s| s.trim().to_string())
@@ -571,7 +589,10 @@ mod tests {
     fn normalize_plan_update_passthrough_non_numeric() {
         // step_N 形式 / 非数字 / 其他 action 原样返回
         assert_eq!(normalize_plan_update("done: step_1"), "done: step_1");
-        assert_eq!(normalize_plan_update("add: write unit tests"), "add: write unit tests");
+        assert_eq!(
+            normalize_plan_update("add: write unit tests"),
+            "add: write unit tests"
+        );
         assert_eq!(normalize_plan_update("replan"), "replan");
         assert_eq!(normalize_plan_update("  done: 5  "), "done: step_5");
     }

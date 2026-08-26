@@ -1059,10 +1059,7 @@ mod tests {
             "deepseek-v4-flash",
         );
 
-        assert!(
-            gate.validate(&ctx).is_ok(),
-            "空响应应降级为 stub 返回 Ok"
-        );
+        assert!(gate.validate(&ctx).is_ok(), "空响应应降级为 stub 返回 Ok");
     }
 
     /// §10.5 Epic 5:build_judge_prompt 包含 task/model/rubric 三要素

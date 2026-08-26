@@ -1010,7 +1010,9 @@ mod tests {
         append_attempt(dir.path(), "Bash", "netstat -an", "no output").expect("append");
         append_attempt(dir.path(), "Bash", "netstat -an", "no output").expect("append again");
         let nb = Notebook::load(dir.path()).expect("load");
-        let sec = nb.get_section("attempted").expect("attempted section exists");
+        let sec = nb
+            .get_section("attempted")
+            .expect("attempted section exists");
         assert_eq!(sec.lines().count(), 1, "完全相同的尝试只记录一次");
         assert!(sec.contains("netstat -an"));
     }

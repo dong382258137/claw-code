@@ -529,7 +529,10 @@ mod tests {
                        - workspace_root 注入: 已修复 PASS";
         let extract = parse_task_state_from_summary(summary);
         assert_eq!(extract.active_goal.as_deref(), Some("压缩摘要质量修复"));
-        assert_eq!(extract.next_action.as_deref(), Some("重新编译部署并实机验证"));
+        assert_eq!(
+            extract.next_action.as_deref(),
+            Some("重新编译部署并实机验证")
+        );
         assert_eq!(
             extract.closed_tasks,
             vec!["workspace_root 注入: 已修复 PASS".to_string()]

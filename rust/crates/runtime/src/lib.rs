@@ -17,8 +17,8 @@ pub mod config_validate;
 pub mod content_classifier;
 pub mod content_compression;
 mod conversation;
-pub mod task_state;
 pub mod lessons;
+pub mod task_state;
 // Multi-Agent Hardening §4.1:统一诊断基础设施(panic hook + DiagLog)。
 // 提取自 rusty-claude-cli/src/lib.rs main_entry 内联闭包,供 main/headless/测试入口复用。
 pub mod decision_log;
@@ -360,20 +360,20 @@ pub use multi_agent::{
     CoordinationMode, JoinStats, MultiAgentCoordinator, Subagent, SubagentStatus,
 };
 // v0.2 DAG 多 agent 编排基础设施:petgraph 图封装 + async scheduler + executor trait。
-pub use multi_agent::{
-    DagError, DagGraph, DagId, DagScheduler, NodeError, NodeResult, RetryPolicy, SubagentExecutor,
-    DEFAULT_MAX_PARALLELISM,
-};
-pub use trace_analyzer::{
-    FailureCluster, TraceAnalyzer, TraceRecord, TraceStats, CSV_HEADER as TRACE_CSV_HEADER,
-    MAX_SAMPLE_ERRORS_PER_CLUSTER,
-};
 pub use failure_trace::{
     extract_from_turn_summary, FailureTrace, FailureTraceError, TraceToolStep,
     FAILURE_TRACES_FILENAME, FAILURE_TRACES_MAX_CHARS, TRACE_STEP_FIELD_MAX_CHARS,
 };
+pub use multi_agent::{
+    DagError, DagGraph, DagId, DagScheduler, NodeError, NodeResult, RetryPolicy, SubagentExecutor,
+    DEFAULT_MAX_PARALLELISM,
+};
 pub use tool_call_stats::{
     ToolCallStat, ToolCallStatsError, TOOL_CALL_STATS_FILENAME, TOOL_CALL_STATS_MAX_CHARS,
+};
+pub use trace_analyzer::{
+    FailureCluster, TraceAnalyzer, TraceRecord, TraceStats, CSV_HEADER as TRACE_CSV_HEADER,
+    MAX_SAMPLE_ERRORS_PER_CLUSTER,
 };
 pub use trust_resolver::{
     detect_trust_prompt, TrustAllowlistEntry, TrustConfig, TrustDecision, TrustEvent, TrustPolicy,

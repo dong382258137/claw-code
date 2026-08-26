@@ -2483,8 +2483,8 @@ mod tests {
     /// flash 升级到 pro
     #[test]
     fn upgrade_model_for_subagent_flash_upgrades_to_pro() {
-        let upgrade = upgrade_model_for_subagent("deepseek-v4-flash")
-            .expect("flash should upgrade to pro");
+        let upgrade =
+            upgrade_model_for_subagent("deepseek-v4-flash").expect("flash should upgrade to pro");
         assert_eq!(upgrade.target_model, "deepseek-v4-pro");
         assert_eq!(upgrade.cost_multiplier, 3.0);
     }

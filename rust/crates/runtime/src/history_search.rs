@@ -135,7 +135,10 @@ impl HistoryIndex {
         // 向量在锁外计算,避免阻塞其他索引/检索操作;嵌入失败静默跳过(词法兜底)。
         let vector: Option<Vec<u8>> = if should_embed {
             self.embedder.provider().and_then(|embedder| {
-                embedder.embed(content).ok().map(|v| f32_vec_to_le_bytes(&v))
+                embedder
+                    .embed(content)
+                    .ok()
+                    .map(|v| f32_vec_to_le_bytes(&v))
             })
         } else {
             None
@@ -411,6 +414,15 @@ fn tokenize_content_for_index(text: &str) -> String {
     out
 }
 
+/// FTS5 查询语法中 bareword(裸 token)的安全字符集:
+/// ASCII 字母数字、下划线、非 ASCII 字符(含 CJK)。
+/// 其余 ASCII 标点(`.` `-` `+` `@` `#` `/` `=` `,` `!` `?` 等)出现在
+/// 裸 token 中都会触发 `fts5: syntax error near "<char>"`,
+/// 含 `.` 的词(如 `prompt.rs` / `v1.2` / URL)是会话实测失败场景。
+fn is_fts5_bareword_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || (c as u32) > 0x7f
+}
+
 /// 查询侧切分:按空白把查询拆成词,词内连续汉字串拆成单字 AND 连接
 /// (短语 `"..."` 内保持空格相邻),FTS5 运算符/复杂表达式原样透传。
 ///
@@ -419,10 +431,7 @@ fn tokenize_content_for_index(text: &str) -> String {
 fn tokenize_query_for_match(query: &str) -> String {
     /// FTS5 布尔运算符(大小写不敏感)。
     fn is_operator(part: &str) -> bool {
-        matches!(
-            part.to_ascii_uppercase().as_str(),
-            "AND" | "OR" | "NOT"
-        )
+        matches!(part.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT")
     }
 
     /// 把词中连续汉字拆为单字:phrase=true 用空格分隔(短语相邻语义),
@@ -514,10 +523,28 @@ fn tokenize_query_for_match(query: &str) -> String {
             out.push('"');
             continue;
         }
-        // 用户显式 FTS5 语法(前缀 `*` / 列 `:`)原样透传
+        // 用户显式 FTS5 语法(前缀 `*` / 列 `:`)仅当其余字符是 bareword
+        // 安全字符、且 `:` 呈列名形状(ASCII 标识符 + 单冒号)时透传;
+        // 否则(如 `http://x` 含多个 `:`、`foo.rs*` 含 `.`)透传必报
+        // 语法错误,落入下方字面短语分支。
         if part.contains('*') || part.contains(':') {
-            out.push_str(part);
-            continue;
+            let star_free = part.strip_suffix('*').unwrap_or(part);
+            let colon_shape_ok = match star_free.split_once(':') {
+                Some((col, rest)) => {
+                    !col.is_empty()
+                        && col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !rest.contains(':')
+                }
+                None => true,
+            };
+            let bareword_ok = star_free
+                .chars()
+                .filter(|c| *c != ':' && *c != '*')
+                .all(is_fts5_bareword_char);
+            if colon_shape_ok && bareword_ok {
+                out.push_str(part);
+                continue;
+            }
         }
         // 纯数字 token(如 `1786293120900`)会被 FTS5 解析为列名引用,
         // 报 `no such column`。转字面短语,按普通词匹配。
@@ -527,13 +554,22 @@ fn tokenize_query_for_match(query: &str) -> String {
             out.push('"');
             continue;
         }
-        // 含 `-` 的词(如 `EPIC-017` / `n-4` / `BTC-1m`)会被 FTS5 当作
-        // NOT 运算符,`-` 后的数字/词被解析成列名(`no such column: 017`)。
-        // 转字面短语,`-` 作为普通字符参与匹配。
-        if part.contains('-') {
+        // 含 bareword 非法字符(`.` `-` `+` `@` `#` `/` `=` `,` 等)的词
+        // (如 `prompt.rs` / `v1.2` / `EPIC-017` / `n-4`):裸传必触发
+        // `fts5: syntax error near "."`,含 `-` 还会被误解析为 NOT 运算符。
+        // 转双引号字面短语,特殊字符按普通字符参与匹配;尾部 `*` 保留
+        // 前缀语义(`foo.rs*` → `"foo.rs"*`);内部 `"` 剥离(FTS5 短语内
+        // 引号需翻倍转义,剥离比转义更简单且匹配行为几乎等价)。
+        let (body, star) = match part.strip_suffix('*') {
+            Some(b) => (b, "*"),
+            None => (part, ""),
+        };
+        if !body.chars().all(is_fts5_bareword_char) {
+            let sanitized: String = body.chars().filter(|c| *c != '"').collect();
             out.push('"');
-            push_split(&mut out, part, true);
+            push_split(&mut out, &sanitized, true);
             out.push('"');
+            out.push_str(star);
             continue;
         }
         push_split(&mut out, part, false);
@@ -592,10 +628,7 @@ fn rrf_merge(lexical: Vec<HistoryHit>, dense: Vec<HistoryHit>, top_k: usize) -> 
         entry.0 += 1.0 / (RRF_K + rank as f64 + 1.0);
     }
     let mut merged: Vec<(f64, HistoryHit)> = acc.into_values().collect();
-    merged.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    merged.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     merged.truncate(top_k);
     merged
         .into_iter()
@@ -868,17 +901,24 @@ pub const NOVELTY_CTX_MAX_CHARS: usize = 2000;
 
 /// 结论强标记词 —— 命中即视为"已确认结论",salience 最高档。
 const SALIENCE_STRONG_MARKERS: &[&str] = &[
-    "根因是", "原因是", "确认", "已验证", "结论", "已修复", "修复了",
-    "PASS", "FAIL", "found that", "verified", "root cause",
+    "根因是",
+    "原因是",
+    "确认",
+    "已验证",
+    "结论",
+    "已修复",
+    "修复了",
+    "PASS",
+    "FAIL",
+    "found that",
+    "verified",
+    "root cause",
 ];
 /// 错误信号词 —— 工具失败/异常结果。
-const SALIENCE_ERROR_MARKERS: &[&str] = &[
-    "error", "panic", "fail", "failed", "报错", "失败", "异常",
-];
+const SALIENCE_ERROR_MARKERS: &[&str] =
+    &["error", "panic", "fail", "failed", "报错", "失败", "异常"];
 /// 决策信号词 —— 决策/方案陈述。
-const SALIENCE_DECISION_MARKERS: &[&str] = &[
-    "decided", "decision", "决定", "方案", "alternatives",
-];
+const SALIENCE_DECISION_MARKERS: &[&str] = &["decided", "decision", "决定", "方案", "alternatives"];
 
 /// Errors raised by [`HistoryIndex`] operations.
 #[derive(Debug)]
@@ -911,7 +951,7 @@ impl From<rusqlite::Error> for HistoryIndexError {
 #[cfg(test)]
 mod tests {
     use super::{
-        detokenize_content, salience_weight, HistoryHit, HistoryIndex, MAX_EMBED_CHARS, rrf_merge,
+        detokenize_content, rrf_merge, salience_weight, HistoryHit, HistoryIndex, MAX_EMBED_CHARS,
     };
     use crate::memory_semantic::EmbeddingProvider;
     use std::sync::Arc;
@@ -1213,6 +1253,19 @@ mod tests {
             .index_message("今天天气如何", "sess-b", "user", 0, 2)
             .expect("index msg");
 
+        // 含 `.` / URL 的查询(session_search 实测触发
+        // `fts5: syntax error near "."`):转字面短语后不再报语法错误
+        index
+            .index_message("修改了 prompt.rs 的日期注入", "sess-c", "user", 0, 3)
+            .expect("index msg");
+        let hits = index.search("prompt.rs", 10).expect("search dotted token");
+        assert_eq!(
+            hits.len(),
+            1,
+            "dotted token should hit without fts5 syntax error"
+        );
+        assert_eq!(hits[0].session_id, "sess-c");
+
         // 2 字中文词(unicode61 下完全无法命中)现在可搜
         let hits = index.search("飞书", 10).expect("search 飞书");
         assert_eq!(hits.len(), 1, "2-char CJK query should hit");
@@ -1286,8 +1339,38 @@ mod tests {
             super::tokenize_query_for_match("1786293120900"),
             "\"1786293120900\""
         );
+        // 含 `.` 的词(session_search 实测失败场景:`fts5: syntax error
+        // near "."`)转字面短语,`.` 作为普通字符参与匹配
+        assert_eq!(
+            super::tokenize_query_for_match("prompt.rs"),
+            "\"prompt.rs\""
+        );
+        assert_eq!(super::tokenize_query_for_match("v1.2"), "\"v1.2\"");
+        // 尾部 `*` 保留前缀语义:`foo.rs*` → `"foo.rs"*`
+        assert_eq!(
+            super::tokenize_query_for_match("claw.exe*"),
+            "\"claw.exe\"*"
+        );
+        // URL/多冒号:非列名形状,转字面短语整体匹配
+        assert_eq!(
+            super::tokenize_query_for_match("http://localhost:8080"),
+            "\"http://localhost:8080\""
+        );
+        // 合法列过滤语法仍透传
+        assert_eq!(
+            super::tokenize_query_for_match("role:decision"),
+            "role:decision"
+        );
+        // 普通词 + 含 `.` 词混合:显式 AND 连接
+        assert_eq!(
+            super::tokenize_query_for_match("task_state.rs 修复"),
+            "\"task_state.rs\" AND (修 AND 复)"
+        );
         // CJK 与 ASCII 混合 token:片段间显式 AND,避免 `(规 AND 则)4` 粘连语法错误
-        assert_eq!(super::tokenize_query_for_match("规则4"), "(规 AND 则) AND 4");
+        assert_eq!(
+            super::tokenize_query_for_match("规则4"),
+            "(规 AND 则) AND 4"
+        );
         // 索引切分:连续汉字间插空格,英文不受影响
         assert_eq!(
             super::tokenize_content_for_index("如何配置飞书 Feishu"),
@@ -1317,7 +1400,9 @@ mod tests {
 
         // 首次 open 触发迁移
         let index = HistoryIndex::open(file.path()).expect("open migrates v1");
-        let hits = index.search("飞书", 10).expect("search 飞书 after migration");
+        let hits = index
+            .search("飞书", 10)
+            .expect("search 飞书 after migration");
         assert_eq!(
             hits.len(),
             1,
@@ -1335,7 +1420,9 @@ mod tests {
         // 二次 open 不重复迁移(幂等,count 不变)
         let index2 = HistoryIndex::open(file.path()).expect("open again");
         assert_eq!(index2.count().expect("count after second open"), 2);
-        let hits2 = index2.search("飞书", 10).expect("search 飞书 after second open");
+        let hits2 = index2
+            .search("飞书", 10)
+            .expect("search 飞书 after second open");
         assert_eq!(hits2.len(), 1);
     }
 
@@ -1361,7 +1448,9 @@ mod tests {
         }
 
         let index = HistoryIndex::open(file.path()).expect("open migrates v2 to v3");
-        let hits = index.search("飞书", 10).expect("search 飞书 after v3 migration");
+        let hits = index
+            .search("飞书", 10)
+            .expect("search 飞书 after v3 migration");
         assert_eq!(hits.len(), 1);
         assert_eq!(
             hits[0].content, "继续帮我配置飞书",
@@ -1375,7 +1464,10 @@ mod tests {
     #[test]
     fn detokenize_content_reconstructs_raw_text() {
         // 纯汉字串
-        assert_eq!(detokenize_content("继 续 帮 我 配 置 飞 书 "), "继续帮我配置飞书");
+        assert_eq!(
+            detokenize_content("继 续 帮 我 配 置 飞 书 "),
+            "继续帮我配置飞书"
+        );
         // 汉字 + 原文空格
         assert_eq!(detokenize_content("飞 书  配 置 "), "飞书 配置");
         // 汉字 + 英文(无空格)
@@ -1383,7 +1475,10 @@ mod tests {
         // 汉字 + 原文空格 + 英文
         assert_eq!(detokenize_content("飞 书  Feishu"), "飞书 Feishu");
         // 无汉字:原样
-        assert_eq!(detokenize_content("the quick brown fox"), "the quick brown fox");
+        assert_eq!(
+            detokenize_content("the quick brown fox"),
+            "the quick brown fox"
+        );
         // 汉字 + 标点
         assert_eq!(detokenize_content("配 置 完 成 。"), "配置完成。");
     }
@@ -1480,7 +1575,11 @@ mod tests {
         let hits = index
             .dense_search("rust programming", 5, &*provider)
             .expect("dense search");
-        assert_eq!(hits.len(), 1, "only identical bag-of-words should pass cos>0");
+        assert_eq!(
+            hits.len(),
+            1,
+            "only identical bag-of-words should pass cos>0"
+        );
         assert_eq!(hits[0].message_index, 0);
         assert!(
             (hits[0].rank - 1.0).abs() < 1e-5,
@@ -1501,10 +1600,22 @@ mod tests {
                 rank: 0.0,
             }
         }
-        let lexical = vec![hit("s", 0, "user"), hit("s", 1, "user"), hit("s", 2, "user")];
-        let dense = vec![hit("s", 1, "user"), hit("s", 2, "user"), hit("s", 3, "user")];
+        let lexical = vec![
+            hit("s", 0, "user"),
+            hit("s", 1, "user"),
+            hit("s", 2, "user"),
+        ];
+        let dense = vec![
+            hit("s", 1, "user"),
+            hit("s", 2, "user"),
+            hit("s", 3, "user"),
+        ];
         let merged = rrf_merge(lexical, dense, 5);
-        assert_eq!(merged.len(), 4, "union of {{0,1,2}} and {{1,2,3}} = 4 distinct");
+        assert_eq!(
+            merged.len(),
+            4,
+            "union of {{0,1,2}} and {{1,2,3}} = 4 distinct"
+        );
         // 双列命中(1,2)分数更高,排在最前
         assert_eq!(merged[0].message_index, 1);
         assert_eq!(merged[1].message_index, 2);
@@ -1653,7 +1764,10 @@ mod tests {
         // 错误信号提升 tool 结果
         let with_error = salience_weight("tool", "command failed with panic: timeout");
         let tool_plain = salience_weight("tool", "completed");
-        assert!(with_error > tool_plain, "error signals should raise salience");
+        assert!(
+            with_error > tool_plain,
+            "error signals should raise salience"
+        );
         // 决策信号提升 user 消息
         let with_decision = salience_weight("user", "decided to use rust toolchain");
         assert!(with_decision > 1.0, "decision signal should raise salience");
@@ -1695,7 +1809,13 @@ mod tests {
             .index_message("rust toolchain", "s1", "user", 0, 1_000)
             .expect("index user");
         index
-            .index_message("rust toolchain build cargo rustup project", "s1", "decision", 1, 2_000)
+            .index_message(
+                "rust toolchain build cargo rustup project",
+                "s1",
+                "decision",
+                1,
+                2_000,
+            )
             .expect("index decision");
         // 第三条消息仅稠密命中(词法缺 toolchain),把 decision 挤到 dense rank 2
         index
@@ -1707,7 +1827,10 @@ mod tests {
             .iter()
             .position(|h| h.role == "decision")
             .expect("decision hit present");
-        let user_pos = hits.iter().position(|h| h.role == "user").expect("user hit present");
+        let user_pos = hits
+            .iter()
+            .position(|h| h.role == "user")
+            .expect("user hit present");
         assert!(
             decision_pos < user_pos,
             "decision should rank above user after salience reweight: {decision_pos} vs {user_pos}"
@@ -1726,7 +1849,13 @@ mod tests {
             .index_message("rust toolchain setup complete", "s1", "assistant", 0, 1_000)
             .expect("index plain");
         index
-            .index_message("rust toolchain root cause verified, PASS", "s1", "assistant", 1, 2_000)
+            .index_message(
+                "rust toolchain root cause verified, PASS",
+                "s1",
+                "assistant",
+                1,
+                2_000,
+            )
             .expect("index conclusion");
         let hits = index.hybrid_search("rust toolchain", 5).expect("hybrid");
         assert_eq!(hits.len(), 2);
@@ -1778,10 +1907,7 @@ mod tests {
         let m = "user prefers dark mode for code review sessions because it reduces eye strain during long working hours";
         let e = "rust async runtime tokio worker pool sizing strategy for high concurrency web services with graceful shutdown";
         let n = super::gzip_novelty(m, e);
-        assert!(
-            n > 0.5,
-            "disparate text should score high novelty: {n}"
-        );
+        assert!(n > 0.5, "disparate text should score high novelty: {n}");
     }
 
     #[test]
@@ -1804,11 +1930,23 @@ mod tests {
         let index = index.with_embedder(provider);
         // 第一条:唯一内容 → 嵌入
         index
-            .index_message("unique rust toolchain setup content", "s1", "user", 0, 1_000)
+            .index_message(
+                "unique rust toolchain setup content",
+                "s1",
+                "user",
+                0,
+                1_000,
+            )
             .expect("index first");
         // 第二条:与第一条完全相同 → novelty≈0 → 跳过嵌入
         index
-            .index_message("unique rust toolchain setup content", "s1", "user", 1, 2_000)
+            .index_message(
+                "unique rust toolchain setup content",
+                "s1",
+                "user",
+                1,
+                2_000,
+            )
             .expect("index duplicate");
         let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: i64 = conn
@@ -1832,7 +1970,13 @@ mod tests {
             .expect("index first");
         // 内容迥异 → novelty 高 → 嵌入
         index
-            .index_message("completely different weather forecast discussion", "s1", "user", 1, 2_000)
+            .index_message(
+                "completely different weather forecast discussion",
+                "s1",
+                "user",
+                1,
+                2_000,
+            )
             .expect("index novel");
         let conn = index.conn.lock().unwrap_or_else(|e| e.into_inner());
         let count: i64 = conn
