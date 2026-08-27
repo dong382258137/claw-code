@@ -6984,6 +6984,141 @@ async fn stream_with_provider(
     Ok(events)
 }
 
+/// 解析 LLM 生成的工具调用参数 JSON（各工具执行器统一入口）。
+///
+/// 对 `TodoWrite` 启用"宽容修复"：LLM 手写工具参数偶发缺失分隔逗号
+/// （serde 报 `expected , or }` / `expected , or ]`）。本函数在原始解析失败时
+/// 对 TodoWrite 尝试补全常见笔误，修复后仍以 serde 严格校验兜底；无法修复时
+/// 返回带列号与修复指引的错误，帮助模型一次重发成功。
+pub fn parse_tool_call_input(tool_name: &str, raw: &str) -> Result<serde_json::Value, String> {
+    match serde_json::from_str(raw) {
+        Ok(value) => Ok(value),
+        Err(original) if tool_name == "TodoWrite" => {
+            let fixed = tolerant_fix_json(raw).and_then(|s| serde_json::from_str(&s).ok());
+            fixed.ok_or_else(|| {
+                format!(
+                    "invalid tool input JSON: {original}. TodoWrite 参数必须是合法 JSON 对象，\
+                     仅含 `todos` 数组；常见笔误：字段/数组元素间缺逗号、引号未闭合、\
+                     括号不配对。请修正后重发。"
+                )
+            })
+        }
+        Err(original) => Err(format!("invalid tool input JSON: {original}")),
+    }
+}
+
+/// 轻量"缺分隔逗号"修复器：仅在 TodoWrite 原始解析失败后尝试。
+///
+/// 字符级扫描，在"上一个值已结束、下一个值即将开始"处补 `,`：
+/// - 字符串值结束(`"`)、数字/字面量结束、容器结束(`}`/`]`)后直接跟
+///   下一个值开始(`"`/`{`/`[`/数字/字面量) → 中间插入逗号
+/// - 遇到引号未闭合、括号不配对、无法识别内容 → 返回 `None`（放弃修复，
+///   由调用方返回带 serde 原始错误的提示兜底）
+fn tolerant_fix_json(raw: &str) -> Option<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut stack: Vec<char> = Vec::new(); // 结构括号 '{' / '['
+    let mut prev_val = false; // 上一个 token 以"值"结尾 → 期待逗号或结构闭合
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' => {
+                // 值后直接跟下一个字符串（对象键或数组元素）→ 补逗号
+                if prev_val && !stack.is_empty() {
+                    out.push(',');
+                }
+                out.push(c);
+                i += 1;
+                let mut closed = false;
+                while i < chars.len() {
+                    let sc = chars[i];
+                    out.push(sc);
+                    i += 1;
+                    if sc == '\\' && i < chars.len() {
+                        out.push(chars[i]); // 转义字符原样保留
+                        i += 1;
+                    } else if sc == '"' {
+                        closed = true;
+                        break;
+                    }
+                }
+                if !closed {
+                    return None; // 字符串未闭合，放弃修复
+                }
+                prev_val = true;
+            }
+            '{' | '[' => {
+                if prev_val && !stack.is_empty() {
+                    out.push(',');
+                }
+                out.push(c);
+                stack.push(c);
+                prev_val = false;
+                i += 1;
+            }
+            '}' | ']' => {
+                if stack.is_empty() {
+                    return None; // 括号不配对
+                }
+                stack.pop();
+                out.push(c);
+                prev_val = true;
+                i += 1;
+            }
+            ',' | ':' => {
+                out.push(c);
+                prev_val = false;
+                i += 1;
+            }
+            c if c == '-' || c.is_ascii_digit() => {
+                if prev_val && !stack.is_empty() {
+                    out.push(',');
+                }
+                let start = i;
+                while i < chars.len()
+                    && (chars[i].is_ascii_digit()
+                        || matches!(chars[i], '.' | 'e' | 'E' | '+' | '-'))
+                {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+                prev_val = true;
+            }
+            't' | 'f' | 'n' => {
+                if prev_val && !stack.is_empty() {
+                    out.push(',');
+                }
+                let (lit, len) = if c == 't' {
+                    ("true", 4)
+                } else if c == 'f' {
+                    ("false", 5)
+                } else {
+                    ("null", 4)
+                };
+                if i + len > chars.len() || !chars[i..i + len].iter().copied().eq(lit.chars()) {
+                    return None;
+                }
+                out.push_str(lit);
+                i += len;
+                prev_val = true;
+            }
+            c if c.is_whitespace() => {
+                out.push(c);
+                i += 1;
+            }
+            _ => return None, // 无法识别的内容，不冒险修复
+        }
+    }
+    if !stack.is_empty() {
+        return None; // 括号未闭合
+    }
+    Some(out)
+}
+
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     enforcer: Option<PermissionEnforcer>,
@@ -7010,8 +7145,7 @@ impl ToolExecutor for SubagentToolExecutor {
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let value = crate::parse_tool_call_input(tool_name, input).map_err(ToolError::new)?;
         execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
             .map_err(ToolError::new)
     }
@@ -9196,7 +9330,7 @@ mod tests {
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, run_web_sync_guarded,
         AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        ProviderRuntimeClient, SubagentToolExecutor, make_subagent_tool_executor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -10835,6 +10969,91 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&nudge).expect("valid json");
         assert_eq!(output["verificationNudgeNeeded"], true);
+    }
+
+    // ===== 上游容错：TodoWrite 参数 JSON 宽容修复 =====
+
+    /// 对象内字段间缺逗号（值后直接跟下一个键）——S3 会话真实笔误类型。
+    #[test]
+    fn parse_tool_call_input_fixes_todo_missing_comma_between_fields() {
+        let raw = r#"{"todos":[{"content":"a""activeForm":"b"}]}"#;
+        let value = super::parse_tool_call_input("TodoWrite", raw)
+            .expect("TodoWrite 缺逗号应被宽容修复");
+        assert_eq!(value["todos"][0]["content"], "a");
+        assert_eq!(value["todos"][0]["activeForm"], "b");
+    }
+
+    /// 数组内对象元素间缺逗号。
+    #[test]
+    fn parse_tool_call_input_fixes_array_element_missing_comma() {
+        let raw = r#"{"todos":[{"content":"a"}{"content":"b"}]}"#;
+        let value = super::parse_tool_call_input("TodoWrite", raw)
+            .expect("数组元素间缺逗号应被修复");
+        assert_eq!(value["todos"].as_array().expect("array").len(), 2);
+    }
+
+    /// 数字值后缺逗号直接跟下一个键。
+    #[test]
+    fn parse_tool_call_input_fixes_number_then_key_missing_comma() {
+        let raw = r#"{"flag":1"extra":true}"#;
+        let value = super::parse_tool_call_input("TodoWrite", raw)
+            .expect("数字后缺逗号应被修复");
+        assert_eq!(value["flag"], 1);
+        assert_eq!(value["extra"], true);
+    }
+
+    /// 合法输入原样通过，不受影响。
+    #[test]
+    fn parse_tool_call_input_valid_json_passes_through() {
+        let raw = r#"{"todos":[{"content":"ok","activeForm":"OK","status":"pending"}]}"#;
+        let value = super::parse_tool_call_input("TodoWrite", raw).expect("合法输入应通过");
+        assert_eq!(value["todos"][0]["content"], "ok");
+    }
+
+    /// 不可修复（引号未闭合）→ 返回带修复指引的错误，而非裸 serde 报错。
+    #[test]
+    fn parse_tool_call_input_unfixable_returns_guidance() {
+        let raw = r#"{"todos":[{"content":"abc}]}"#; // 字符串未闭合
+        let err = super::parse_tool_call_input("TodoWrite", raw)
+            .expect_err("未闭合引号无法修复应报错");
+        assert!(err.contains("invalid tool input JSON"), "got: {err}");
+        assert!(err.contains("TodoWrite"), "应含 TodoWrite 修复指引: {err}");
+        assert!(err.contains("缺逗号"), "应列出常见笔误: {err}");
+    }
+
+    /// 宽容修复仅对 TodoWrite 生效，其他工具保持严格解析。
+    #[test]
+    fn parse_tool_call_input_only_fixes_todo_write() {
+        let raw = r#"{"path":"a""mode":1}"#; // 缺逗号
+        assert!(
+            super::parse_tool_call_input("TodoWrite", raw).is_ok(),
+            "TodoWrite 应被修复"
+        );
+        let err = super::parse_tool_call_input("read_file", raw)
+            .expect_err("非 TodoWrite 不应宽容修复");
+        assert!(err.contains("invalid tool input JSON"), "got: {err}");
+        assert!(!err.contains("缺逗号"), "非 TodoWrite 不应有修复指引: {err}");
+    }
+
+    /// 通过 SubagentToolExecutor 全链路执行：缺逗号 TodoWrite 输入应一次成功。
+    #[test]
+    fn subagent_executor_todo_write_survives_missing_comma() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store = temp_path("todos-tolerance.json");
+        std::env::set_var("CLAWD_TODO_STORE", &store);
+        let allowed: BTreeSet<String> =
+            ["TodoWrite"].into_iter().map(str::to_string).collect();
+        let mut executor = make_subagent_tool_executor(allowed);
+        let raw = r#"{"todos":[{"content":"ok""activeForm":"OK""status":"pending"}]}"#;
+        let result = executor.execute("TodoWrite", raw);
+        std::env::remove_var("CLAWD_TODO_STORE");
+        let _ = fs::remove_file(&store);
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!("缺逗号的 TodoWrite 应在执行层被宽容修复并成功: {e}"),
+        }
     }
 
     #[test]

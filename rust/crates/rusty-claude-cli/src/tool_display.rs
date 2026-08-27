@@ -254,8 +254,7 @@ impl ToolExecutor for CliToolExecutor {
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let value = tools::parse_tool_call_input(tool_name, input).map_err(ToolError::new)?;
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if tool_name == "refactor_algorithm_topo" {
