@@ -15,7 +15,7 @@ Because Computer Use operates directly in the user's local environment and can a
 |------|------|---------|---------|
 | 应用 UI 自动化（点击、输入、滚动、拖拽、按键） | **computer-use（本技能）** | MCP `ide_mcp.config.ext.computer-use` | 操作应用界面元素，无专用 API 时 |
 | Windows 系统配置管理（CPU/蓝牙/音量/主题/广告等） | **local-computer-use** | CLI `scripts\run.ps1 "<指令>"` | 用自然语言管理 Windows 系统设置 |
-| 浏览器自动化 | webapp-testing / agent-browser | Playwright / edge-cli | 网页操作 |
+| 浏览器自动化 | browser-control | 原生 `browser_control` 工具（CDP：AX 快照 + ref 定位） | 网页操作 |
 | Electron 应用自动化 | electron | Chrome DevTools Protocol | VS Code、Slack 等 Electron 应用 |
 
 **关键原则**：

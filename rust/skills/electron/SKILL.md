@@ -1,58 +1,47 @@
 ---
 name: electron
-description: Automate Electron desktop apps (VS Code, Slack, Discord, Figma, Notion, Spotify, etc.) using agent-browser via Chrome DevTools Protocol. Use when the user needs to interact with an Electron app, automate a desktop app, connect to a running app, control a native app, or test an Electron application. Triggers include "automate Slack app", "control VS Code", "interact with Discord app", "test this Electron app", "connect to desktop app", or any task requiring automation of a native Electron application.
-allowed-tools: Bash(agent-browser:*), Bash(npx agent-browser:*)
+description: Automate Electron desktop apps (VS Code, Slack, Discord, Figma, Notion, Spotify, etc.) by connecting the native browser_control tool to the app's Chrome DevTools Protocol port. Use when the user needs to interact with an Electron app, automate a desktop app, connect to a running app, control a native app, or test an Electron application. Triggers include "automate Slack app", "control VS Code", "interact with Discord app", "test this Electron app", "connect to desktop app", or any task requiring automation of a native Electron application.
+allowed-tools: browser_control
 ---
 
 # Electron App Automation
 
-Automate any Electron desktop app using agent-browser. Electron apps are built on Chromium and expose a Chrome DevTools Protocol (CDP) port that agent-browser can connect to, enabling the same snapshot-interact workflow used for web pages.
+Electron 应用基于 Chromium，会暴露 Chrome DevTools Protocol (CDP) 端口。用原生 `browser_control` 工具的 `connect` 动作附加到该端口，即可复用与网页相同的"快照 → 交互"工作流。不需要任何外部 CLI。
 
-## Core Workflow
+## 核心工作流
 
-1. **Launch** the Electron app with remote debugging enabled
-2. **Connect** agent-browser to the CDP port
-3. **Snapshot** to discover interactive elements
-4. **Interact** using element refs
-5. **Re-snapshot** after navigation or state changes
+1. **用 `--remote-debugging-port` 启动** Electron 应用（或让用户重启应用带上该参数）
+2. **`connect`** 附加到 CDP 端口（`port` 或 `url`）
+3. **`snapshot`** 发现可交互元素（拿到 `[ref=eN]`）
+4. **用 `ref` 交互**
+5. 状态变化后**重新 `snapshot`** 刷新 refs
 
-```bash
-# Launch an Electron app with remote debugging
-open -a "Slack" --args --remote-debugging-port=9222
+```text
+# 以远程调试端口启动应用（以 Slack 为例，Windows）
+"C:\Users\%USERNAME%\AppData\Local\slack\slack.exe" --remote-debugging-port=9222
 
-# Connect agent-browser to the app
-agent-browser connect 9222
+# 附加到该应用
+browser_control { action: "connect", port: 9222 }
+# → { "status": "connected", "tab_count": N, ... }  会话建立，已有页面被接管
 
-# Standard workflow from here
-agent-browser snapshot -i
-agent-browser click @e5
-agent-browser screenshot slack-desktop.png
+# 标准工作流
+browser_control { action: "snapshot" }
+browser_control { action: "click", ref: "e5" }
+browser_control { action: "screenshot", save_path: "slack.png" }
 ```
 
-## Launching Electron Apps with CDP
+## 启动 Electron 应用并开启 CDP
 
-Every Electron app supports the `--remote-debugging-port` flag since it's built into Chromium.
+所有 Electron 应用都内置 Chromium，支持 `--remote-debugging-port`。
 
 ### macOS
 
 ```bash
-# Slack
 open -a "Slack" --args --remote-debugging-port=9222
-
-# VS Code
 open -a "Visual Studio Code" --args --remote-debugging-port=9223
-
-# Discord
 open -a "Discord" --args --remote-debugging-port=9224
-
-# Figma
 open -a "Figma" --args --remote-debugging-port=9225
-
-# Notion
 open -a "Notion" --args --remote-debugging-port=9226
-
-# Spotify
-open -a "Spotify" --args --remote-debugging-port=9227
 ```
 
 ### Linux
@@ -65,172 +54,52 @@ discord --remote-debugging-port=9224
 
 ### Windows
 
-```bash
+```powershell
 "C:\Users\%USERNAME%\AppData\Local\slack\slack.exe" --remote-debugging-port=9222
 "C:\Users\%USERNAME%\AppData\Local\Programs\Microsoft VS Code\Code.exe" --remote-debugging-port=9223
 ```
 
-**Important:** If the app is already running, quit it first, then relaunch with the flag. The `--remote-debugging-port` flag must be present at launch time.
+**重要**：应用已在运行时，先退出再用带参数的方式重新启动；`--remote-debugging-port` 必须在启动时带上。连接前可 `sleep 3` 等待应用初始化。
 
-## Connecting
+## 连接
 
-```bash
-# Connect to a specific port
-agent-browser connect 9222
+```text
+# 按端口连接（推荐）
+browser_control { action: "connect", port: 9222 }
 
-# Or use --cdp on each command
-agent-browser --cdp 9222 snapshot -i
-
-# Auto-discover a running Chromium-based app
-agent-browser --auto-connect snapshot -i
+# 或直接给端点 URL
+browser_control { action: "connect", url: "http://127.0.0.1:9222" }
 ```
 
-After `connect`, all subsequent commands target the connected app without needing `--cdp`.
+`connect` 会接管目标中**已打开的窗口/页面**作为标签页；若目标没有页面则新开一个。之后所有动作都作用于该会话，无需重复 connect。
 
-## Tab Management
+## 多窗口 / Webview
 
-Electron apps often have multiple windows or webviews. Use tab commands to list and switch between them:
+Electron 应用的多个窗口/webview 会作为多个标签页列出：
 
-```bash
-# List all available targets (windows, webviews, etc.)
-agent-browser tab
-
-# Switch to a specific tab by index
-agent-browser tab 2
-
-# Switch by URL pattern
-agent-browser tab --url "*settings*"
+```text
+browser_control { action: "list_tabs" }
+browser_control { action: "switch_tab", index: 1 }
 ```
 
-## Webview Support
+## 常见模式
 
-Electron `<webview>` elements are automatically discovered and can be controlled like regular pages. Webviews appear as separate targets in the tab list with `type: "webview"`:
+**查看并导航应用**：connect → snapshot（读输出识别 UI 元素）→ click 目标 → 重新 snapshot。
 
-```bash
-# Connect to running Electron app
-agent-browser connect 9222
+**截图**：`browser_control { action: "screenshot", save_path: "app.png" }`。
 
-# List targets -- webviews appear alongside pages
-agent-browser tab
-# Example output:
-#   0: [page]    Slack - Main Window     https://app.slack.com/
-#   1: [webview] Embedded Content        https://example.com/widget
+**抽取数据**：connect → snapshot → 需要时 `get_state` 逐元素读取，或 `evaluate_js` 取结构化数据。
 
-# Switch to a webview
-agent-browser tab 1
+**填表**：connect → snapshot → fill 各输入 → press_key Enter 或 click 提交 → snapshot 验证。
 
-# Interact with the webview normally
-agent-browser snapshot -i
-agent-browser click @e3
-agent-browser screenshot webview.png
-```
+## 故障排查
 
-**Note:** Webview support works via raw CDP connection.
+- **连接被拒**：确认应用以 `--remote-debugging-port=NNNN` 启动；已在运行的应用需退出重启；确认端口未被占用。
+- **快照看不到元素**：应用可能有多个窗口/webview，用 `list_tabs` 列出并用 `switch_tab` 切换。
+- **输入框无法输入**：部分应用用自定义输入组件，可改用 `evaluate_js` 设置值或 `press_key` 组合键。
 
-## Common Patterns
+## 支持的应用
 
-### Inspect and Navigate an App
+任何 Electron 应用均可：Slack、Discord、Teams、VS Code、GitHub Desktop、Postman、Figma、Notion、Obsidian、Spotify、Todoist、Linear、1Password 等。只要应用支持 `--remote-debugging-port`，就能用 `browser_control` 自动化。
 
-```bash
-open -a "Slack" --args --remote-debugging-port=9222
-sleep 3  # Wait for app to start
-agent-browser connect 9222
-agent-browser snapshot -i
-# Read the snapshot output to identify UI elements
-agent-browser click @e10  # Navigate to a section
-agent-browser snapshot -i  # Re-snapshot after navigation
-```
-
-### Take Screenshots of Desktop Apps
-
-```bash
-agent-browser connect 9222
-agent-browser screenshot app-state.png
-agent-browser screenshot --full full-app.png
-agent-browser screenshot --annotate annotated-app.png
-```
-
-### Extract Data from a Desktop App
-
-```bash
-agent-browser connect 9222
-agent-browser snapshot -i
-agent-browser get text @e5
-agent-browser snapshot --json > app-state.json
-```
-
-### Fill Forms in Desktop Apps
-
-```bash
-agent-browser connect 9222
-agent-browser snapshot -i
-agent-browser fill @e3 "search query"
-agent-browser press Enter
-agent-browser wait 1000
-agent-browser snapshot -i
-```
-
-### Run Multiple Apps Simultaneously
-
-Use named sessions to control multiple Electron apps at the same time:
-
-```bash
-# Connect to Slack
-agent-browser --session slack connect 9222
-
-# Connect to VS Code
-agent-browser --session vscode connect 9223
-
-# Interact with each independently
-agent-browser --session slack snapshot -i
-agent-browser --session vscode snapshot -i
-```
-
-## Color Scheme
-
-The default color scheme when connecting via CDP may be `light`. To preserve dark mode:
-
-```bash
-agent-browser connect 9222
-agent-browser --color-scheme dark snapshot -i
-```
-
-Or set it globally:
-
-```bash
-AGENT_BROWSER_COLOR_SCHEME=dark agent-browser connect 9222
-```
-
-## Troubleshooting
-
-### "Connection refused" or "Cannot connect"
-
-- Make sure the app was launched with `--remote-debugging-port=NNNN`
-- If the app was already running, quit and relaunch with the flag
-- Check that the port isn't in use by another process: `lsof -i :9222`
-
-### App launches but connect fails
-
-- Wait a few seconds after launch before connecting (`sleep 3`)
-- Some apps take time to initialize their webview
-
-### Elements not appearing in snapshot
-
-- The app may use multiple webviews. Use `agent-browser tab` to list targets and switch to the right one
-
-### Cannot type in input fields
-
-- Try `agent-browser keyboard type "text"` to type at the current focus without a selector
-- Some Electron apps use custom input components; use `agent-browser keyboard inserttext "text"` to bypass key events
-
-## Supported Apps
-
-Any app built on Electron works, including:
-
-- **Communication:** Slack, Discord, Microsoft Teams, Signal, Telegram Desktop
-- **Development:** VS Code, GitHub Desktop, Postman, Insomnia
-- **Design:** Figma, Notion, Obsidian
-- **Media:** Spotify, Tidal
-- **Productivity:** Todoist, Linear, 1Password
-
-If an app is built with Electron, it supports `--remote-debugging-port` and can be automated with agent-browser.
+**注意**：`connect` 附加的外部应用，`close` 只会断开连接、不会关闭应用本身。

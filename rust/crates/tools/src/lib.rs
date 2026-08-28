@@ -1020,22 +1020,42 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "browser_control",
-            description: "Drive a persistent Chrome session over the DevTools Protocol. Actions: \
-                'launch' (open the browser, visible by default), 'goto' (navigate to a URL), \
-                'snapshot' (return current URL + page text), 'screenshot' (save a PNG and return its path), \
-                'click' (click an element by CSS selector), 'type' (focus an element and type text), \
-                'close' (shut down the session). The session persists across calls, so reuse the same tool \
-                to keep browsing the same tab. Prefer this tool over WebFetch for pages requiring \
-                JavaScript execution or user interaction.",
+            description: "Drive a persistent Chrome session over the DevTools Protocol. The session \
+                persists across calls, so reuse the same tool to keep browsing the same browser. \
+                Workflow: 1) 'launch' (or 'connect' to an already-running browser/Electron app on a \
+                CDP port) then 'goto' a URL; 2) 'snapshot' to get an accessibility tree \
+                where every interactive element carries a stable [ref=eN]; 3) address elements with \
+                click/type/fill/press_key/select_option/check/uncheck using 'ref' (or a CSS 'selector' \
+                fallback); 4) verify with 'get_state' (live element state) or 'screenshot'; 5) re-run \
+                'snapshot' after any navigation/change to refresh refs. Actions: \
+                navigation: 'goto' | 'back' | 'forward' | 'reload'; \
+                perception: 'snapshot' (AX tree + refs), 'screenshot', 'get_state' (page + element state), \
+                'wait_for' (condition: url:… | text:… | CSS selector | networkidle); \
+                interaction: 'click' | 'fill' (clear+type) | 'type' | 'press_key' (Enter/Tab/…) | 'hover' | \
+                'scroll' (up/down/top/bottom/element) | 'select_option' | 'check' | 'uncheck'; \
+                tabs: 'new_tab' | 'switch_tab' | 'list_tabs' | 'close_tab'; \
+                other: 'launch' | 'connect' (attach to existing CDP endpoint, e.g. 'url: http://127.0.0.1:9222' \
+                or 'port: 9222') | 'evaluate_js' | 'close'. Real CDP events are used (mouse coordinates, \
+                keyboard input), not JS injection, so sites behave as with a real user. Prefer this tool \
+                over WebFetch for pages requiring JavaScript execution or user interaction.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["launch", "goto", "snapshot", "screenshot", "click", "type", "close"] },
-                    "url": { "type": "string", "description": "URL for 'launch'/'goto'." },
-                    "selector": { "type": "string", "description": "CSS selector for 'click'/'type'." },
-                    "text": { "type": "string", "description": "Text for 'type'." },
+                    "action": { "type": "string", "enum": ["launch", "connect", "goto", "back", "forward", "reload", "snapshot", "screenshot", "get_state", "wait_for", "click", "fill", "type", "press_key", "hover", "scroll", "select_option", "check", "uncheck", "new_tab", "switch_tab", "list_tabs", "close_tab", "evaluate_js", "close"], "description": "Action to perform. Required." },
+                    "url": { "type": "string", "description": "URL for 'launch'/'goto'/'new_tab'; CDP endpoint (http://… or ws://…) for 'connect'." },
+                    "ref": { "type": "string", "description": "Element reference (e.g. 'e3') from the last 'snapshot'. Preferred over 'selector'." },
+                    "selector": { "type": "string", "description": "CSS selector fallback for element actions when 'ref' is unavailable." },
+                    "text": { "type": "string", "description": "Text for 'fill'/'type'." },
+                    "key": { "type": "string", "description": "Key for 'press_key' (Enter, Tab, Escape, Backspace, Delete, ArrowUp/…, Home, End, PageUp, PageDown, Space, or a single character)." },
+                    "value": { "type": "string", "description": "Option value for 'select_option'." },
+                    "direction": { "type": "string", "enum": ["up", "down", "top", "bottom", "element"], "description": "Scroll direction for 'scroll'; 'element' (+ref/selector) scrolls an element into view." },
+                    "script": { "type": "string", "description": "JavaScript expression for 'evaluate_js'." },
+                    "wait_for": { "type": "string", "description": "Wait condition for 'wait_for': 'url:…' | 'text:…' | CSS selector | 'networkidle'." },
+                    "timeout_ms": { "type": "integer", "description": "Timeout (ms) for 'wait_for'. Default 5000." },
+                    "index": { "type": "integer", "description": "Tab index for 'switch_tab'/'close_tab'." },
                     "save_path": { "type": "string", "description": "Output path for 'screenshot'; default: <cwd>/.claw/browser_shots/<timestamp>.png" },
-                    "headless": { "type": "boolean", "description": "Launch without a visible window. Default: false." }
+                    "headless": { "type": "boolean", "description": "Launch without a visible window. Default: false." },
+                    "port": { "type": "integer", "description": "CDP port for 'connect' (e.g. 9222); expands to http://127.0.0.1:<port>." }
                 },
                 "required": ["action"],
                 "additionalProperties": false
