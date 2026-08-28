@@ -2966,6 +2966,10 @@ pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
         persistent_memory,
         repomap,
         skill_catalog,
+        // MCP 目录不在此处填充:MCP runtime 此时尚未连接(build_system_prompt
+        // 先于 build_runtime_plugin_state 执行),实时连接状态由
+        // append_mcp_catalog 在 runtime 装配阶段注入,避免造出"全部 pending"的假目录。
+        mcp_catalog: None,
     }
 }
 
@@ -3136,13 +3140,39 @@ fn resolve_quality_model(main_model: &str) -> String {
     api::upgrade_model(main_model).unwrap_or_else(|| main_model.to_string())
 }
 
+/// Append the MCP server health overview to the system prompt.
+///
+/// Best-effort: no servers configured, feature toggle disabled, or a poisoned
+/// lock silently skip injection — the overview is an optional token-budget
+/// enhancement and must never block session startup.
+fn append_mcp_catalog(
+    system_prompt: &mut Vec<String>,
+    mcp_state: &Option<Arc<Mutex<RuntimeMcpState>>>,
+    feature_config: &runtime::RuntimeFeatureConfig,
+) {
+    if !feature_config.mcp_catalog_enabled_or_default() {
+        return;
+    }
+    let Some(mcp_state) = mcp_state.as_ref() else {
+        return;
+    };
+    let Some(catalog) = mcp_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .mcp_catalog_string()
+    else {
+        return;
+    };
+    system_prompt.push(catalog);
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_runtime_with_plugin_state(
     mut session: Session,
     session_id: &str,
     model: String,
-    system_prompt: Vec<String>,
+    mut system_prompt: Vec<String>,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -3168,6 +3198,12 @@ pub(crate) fn build_runtime_with_plugin_state(
     } = runtime_plugin_state;
     let tool_registry = tool_registry.with_workspace_roots(workspace_roots);
     plugin_registry.initialize()?;
+    // MCP 服务器健康总览注入:runtime registry 已在 RuntimeMcpState::new 中完成
+    // best-effort 连接,把每个服务器的实时状态(connected / error / unsupported)
+    // 渲染成一节动态 prompt,追加到 system prompt 末尾(动态区,保持静态前缀
+    // prompt-cache 稳定)。模型据此知道哪些外部服务器可用,无需盲目探测。
+    // 由配置开关 mcpCatalogEnabled 控制,默认启用。
+    append_mcp_catalog(&mut system_prompt, &mcp_state, &feature_config);
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     // Phase 4：提前创建 ProjectTopology 实例，供 CliToolExecutor 和 ConversationRuntime 共享。
@@ -3249,8 +3285,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     let mut verifier_agent = runtime::VerifierAgent::new();
     match crate::llm_clients::DeepSeekJudgeClient::new(&quality_model, Some(1024)) {
         Ok(judge) => {
-            verifier_agent =
-                verifier_agent.with_model_judge(std::sync::Arc::new(judge));
+            verifier_agent = verifier_agent.with_model_judge(std::sync::Arc::new(judge));
         }
         Err(e) => {
             eprintln!("[startup] VerifierAgent ModelJudge skipped (construction failed): {e}");
@@ -3272,9 +3307,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 回退到纯规则式路径(零 LLM 调用)。
     match crate::llm_clients::DeepSeekHarnessProposer::new(&quality_model, Some(512)) {
         Ok(proposer) => {
-            runtime::harness_evolution::set_global_harness_proposer(std::sync::Arc::new(
-                proposer,
-            ));
+            runtime::harness_evolution::set_global_harness_proposer(std::sync::Arc::new(proposer));
         }
         Err(e) => {
             eprintln!("[startup] HarnessProposer skipped (construction failed): {e}");
@@ -3387,8 +3420,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     // - OnceLock 进程级单例,只能注册一次(重复调用静默忽略)
     // - 构造失败(无 API key / 模型名无效)时跳过,不阻断启动
     //   (降级为 Heuristic,保证不丢决策)
-    match crate::llm_clients::DeepSeekDecisionExtractorClient::new(&quality_model, Some(2048))
-    {
+    match crate::llm_clients::DeepSeekDecisionExtractorClient::new(&quality_model, Some(2048)) {
         Ok(extractor) => {
             let extractor_client: std::sync::Arc<
                 dyn runtime::decision_log::DecisionExtractorClient,
@@ -3835,7 +3867,7 @@ pub fn run_acp_serve(
         feature_config,
         tool_registry,
         plugin_registry,
-        mcp_state: _mcp_state,
+        mcp_state,
     } = runtime_plugin_state;
     // plugin_registry.initialize() 在 build_runtime_with_plugin_state 中被调用;
     // 这里 stdio agent 不直接用 plugin_registry(留给未来 hook 扩展),但仍 initialize
@@ -3858,7 +3890,10 @@ pub fn run_acp_serve(
     )?;
 
     // 5. 构造 system_prompt
-    let system_prompt = build_system_prompt(&model)?;
+    let mut system_prompt = build_system_prompt(&model)?;
+    // MCP 服务器健康总览注入:mcp_state 已在步骤 2 中连接完成,
+    // 与 REPL 路径(build_runtime_with_plugin_state)一致地追加实时状态。
+    append_mcp_catalog(&mut system_prompt, &mcp_state, &feature_config);
 
     // 6. 按 feature 组装 builder 并启动 stdio ACP 服务器(阻塞直到 stdin EOF 或 cancel)
     //    默认 acp-0_10(0.10.4);acp-1_5(1.3) 需 --no-default-features --features acp-1_5 编译。

@@ -211,6 +211,69 @@ impl RuntimeMcpState {
             .server_names()
     }
 
+    /// Render the MCP server health overview for the system prompt.
+    ///
+    /// One line per configured server: `- <name>: <transport>, <status>`.
+    /// Status is derived from the runtime registry (not the config):
+    /// - `connected` — stdio server whose tool discovery succeeded
+    /// - `error` — discovery failed (spawn / handshake / tool list error)
+    /// - `unsupported (<transport>)` — transport not supported by this
+    ///   runtime (sse / http / ws / sdk / managed proxy), never connected
+    ///
+    /// Wrapped in the canonical `## MCP Servers` section header and injected
+    /// as a dynamic prompt section (after the skill catalog), so the model
+    /// sees which external servers are usable without probing them blindly.
+    /// Returns `None` when no servers are configured.
+    pub(crate) fn mcp_catalog_string(&self) -> Option<String> {
+        use runtime::McpTransport;
+        let manager = self.manager.lock().unwrap_or_else(|e| e.into_inner());
+        // Non-stdio transports are never managed; surface their transport so
+        // the model knows they exist but cannot be invoked through `MCPTool`.
+        let unsupported: std::collections::BTreeMap<&str, McpTransport> = manager
+            .unsupported_servers()
+            .iter()
+            .map(|server| (server.server_name.as_str(), server.transport))
+            .collect();
+        let pending: std::collections::BTreeSet<&str> =
+            self.pending_servers.iter().map(String::as_str).collect();
+        let managed_names = manager.server_names();
+        let mut names: std::collections::BTreeSet<&str> =
+            managed_names.iter().map(String::as_str).collect();
+        names.extend(unsupported.keys().copied());
+        if names.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        for name in names {
+            let transport = match unsupported.get(name) {
+                Some(transport) => match transport {
+                    McpTransport::Stdio => "stdio",
+                    McpTransport::Sse => "sse",
+                    McpTransport::Http => "http",
+                    McpTransport::Ws => "ws",
+                    McpTransport::Sdk => "sdk",
+                    McpTransport::ManagedProxy => "managed_proxy",
+                },
+                // `McpServerManager` only manages stdio servers; everything
+                // else lands in `unsupported_servers`.
+                None => "stdio",
+            };
+            let status = if unsupported.contains_key(name) {
+                // Unsupported transports are included in `pending_servers`
+                // via the discovery report chain; check unsupported first.
+                format!("unsupported ({transport})")
+            } else if pending.contains(name) {
+                "error".to_string()
+            } else {
+                "connected".to_string()
+            };
+            lines.push(format!("- {name}: {transport}, {status}"));
+        }
+        lines.sort();
+        let catalog = runtime::render_mcp_catalog_section(&lines.join("\n"));
+        (!catalog.is_empty()).then_some(catalog)
+    }
+
     pub(crate) fn call_tool(
         &mut self,
         qualified_tool_name: &str,

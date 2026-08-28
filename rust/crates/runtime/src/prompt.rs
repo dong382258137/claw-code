@@ -307,6 +307,11 @@ pub struct SystemPromptBuilder {
     /// dynamic section so it doesn't perturb the prompt-cache prefix.
     /// See `commands::render_skill_catalog`.
     skill_catalog: Option<String>,
+    /// Pre-rendered MCP server overview (one line per server: name,
+    /// transport, connection status). Injected as a dynamic section so the
+    /// model can see which MCP servers are usable without probing them
+    /// blindly. See `render_mcp_catalog_section`.
+    mcp_catalog: Option<String>,
 }
 
 impl SystemPromptBuilder {
@@ -406,6 +411,20 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Attach a pre-rendered MCP server overview string to be injected as a
+    /// dynamic section at the end of the system prompt.
+    ///
+    /// The overview should be pre-rendered by the caller (one line per
+    /// server, expected format `- <name>: <transport>, <status>`). Injected
+    /// in the **dynamic** region (after the cache boundary) so it doesn't
+    /// perturb the static prompt-cache prefix — mirroring
+    /// [`Self::with_skill_catalog`].
+    #[must_use]
+    pub fn with_mcp_catalog(mut self, catalog: impl Into<String>) -> Self {
+        self.mcp_catalog = Some(catalog.into());
+        self
+    }
+
     #[must_use]
     pub fn append_section(mut self, section: impl Into<String>) -> Self {
         self.append_sections.push(section.into());
@@ -491,6 +510,16 @@ impl SystemPromptBuilder {
         // prefix. Bytes are session-stable (captured at startup).
         if let Some(catalog) = &self.skill_catalog {
             let section = render_skill_catalog_section(catalog);
+            if !section.is_empty() {
+                sections.push(section);
+            }
+        }
+        // MCP server overview: one line per configured server (name +
+        // transport + runtime connection status). Injected after the skill
+        // catalog so the model sees which external servers are usable
+        // without blindly probing them. Session-stable, dynamic region.
+        if let Some(catalog) = &self.mcp_catalog {
+            let section = render_mcp_catalog_section(catalog);
             if !section.is_empty() {
                 sections.push(section);
             }
@@ -879,6 +908,12 @@ pub struct SystemPromptExtras {
     ///
     /// See `commands::render_skill_catalog` for the standard renderer.
     pub skill_catalog: Option<String>,
+    /// Pre-rendered MCP server overview string (one line per configured
+    /// server: name + transport + runtime connection status), injected as a
+    /// dynamic section right after the skill catalog. Lets the model see
+    /// which MCP servers are usable without probing them blindly. `None`
+    /// disables catalog injection.
+    pub mcp_catalog: Option<String>,
 }
 
 /// Loads config and project context, then renders the system prompt text.
@@ -933,6 +968,9 @@ pub fn load_system_prompt_with_extras(
     }
     if let Some(catalog) = extras.skill_catalog {
         builder = builder.with_skill_catalog(catalog);
+    }
+    if let Some(catalog) = extras.mcp_catalog {
+        builder = builder.with_mcp_catalog(catalog);
     }
     // Cache Aligner (Phase 1):走 build_split() 路径而非 build()，
     // 让 DynamicValueExtractor 对 static sections 提取动态值并用占位符替换，
@@ -1651,6 +1689,33 @@ fn render_skill_catalog_section(catalog: &str) -> String {
     )
 }
 
+/// Render the MCP server overview as a system prompt section.
+///
+/// The `catalog` is a pre-rendered string (one line per configured server,
+/// expected format `- <name>: <transport>, <status>`). This wrapper adds a
+/// header telling the model that the status reflects the last known runtime
+/// connection state and that tools remain discoverable via `ToolSearch` /
+/// `MCPTool`.
+///
+/// Placed in `dynamic_sections` like the skill catalog, so it doesn't
+/// perturb the static prompt-cache prefix. Empty input yields an empty
+/// section so the caller can skip pushing it.
+pub fn render_mcp_catalog_section(catalog: &str) -> String {
+    let trimmed = catalog.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "## MCP Servers\n\
+         The following MCP servers are configured. Status reflects the last\n\
+         known runtime connection state (connected / error / pending). Call\n\
+         `ToolSearch` to enumerate tools, or `MCPTool` to invoke a tool by its\n\
+         qualified name.\n\
+         \n\
+         {trimmed}"
+    )
+}
+
 /// Render the Plan Mode constraint section injected into the dynamic region
 /// when `plan_mode` is enabled.
 ///
@@ -1678,9 +1743,10 @@ mod tests {
     use super::{
         collapse_blank_lines, describe_instruction_file, display_context_path,
         is_sensitive_config_key, normalize_instruction_content, redact_sensitive_json,
-        render_instruction_content, render_instruction_files, truncate_diff_to_budget,
-        truncate_instruction_content, ContextFile, ModelFamilyIdentity, ProjectContext,
-        SystemPromptBuilder, SystemPromptSplit, REDACTED_MARKER, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, render_mcp_catalog_section,
+        truncate_diff_to_budget, truncate_instruction_content, ContextFile, ModelFamilyIdentity,
+        ProjectContext, SystemPromptBuilder, SystemPromptSplit, REDACTED_MARKER,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -2789,6 +2855,62 @@ mod tests {
             static_without, static_with,
             "static region must be unaffected by catalog injection"
         );
+    }
+
+    // ── MCP server catalog injection tests ──
+
+    #[test]
+    fn mcp_catalog_section_is_injected_into_dynamic_region() {
+        let catalog = "- home: stdio, connected\n- legacy: http, unsupported (http)";
+        let sections = SystemPromptBuilder::new().with_mcp_catalog(catalog).build();
+        // Catalog section should appear after the boundary marker.
+        let boundary_idx = sections
+            .iter()
+            .position(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("boundary should exist");
+        let catalog_section_idx = sections
+            .iter()
+            .position(|s| s.contains("## MCP Servers"))
+            .expect("catalog section should be present");
+        assert!(
+            catalog_section_idx > boundary_idx,
+            "catalog must be in dynamic region (after boundary)"
+        );
+        // Catalog should carry both server lines, verbatim.
+        let catalog_section = &sections[catalog_section_idx];
+        assert!(catalog_section.contains("- home: stdio, connected"));
+        assert!(catalog_section.contains("- legacy: http, unsupported (http)"));
+        // Should mention how to use the servers (ToolSearch / MCPTool).
+        assert!(catalog_section.contains("`ToolSearch`"));
+        assert!(catalog_section.contains("`MCPTool`"));
+    }
+
+    #[test]
+    fn mcp_catalog_section_not_injected_when_not_set() {
+        let sections = SystemPromptBuilder::new().build();
+        let has_catalog = sections.iter().any(|s| s.contains("## MCP Servers"));
+        assert!(
+            !has_catalog,
+            "no MCP catalog section when mcp_catalog is None"
+        );
+    }
+
+    #[test]
+    fn mcp_catalog_section_not_injected_when_empty() {
+        let sections = SystemPromptBuilder::new()
+            .with_mcp_catalog("   \n  \n")
+            .build();
+        let has_catalog = sections.iter().any(|s| s.contains("## MCP Servers"));
+        assert!(!has_catalog, "empty/whitespace catalog should be skipped");
+    }
+
+    #[test]
+    fn mcp_catalog_section_renderer_handles_empty_input() {
+        assert!(render_mcp_catalog_section("").is_empty());
+        assert!(render_mcp_catalog_section(" \n\t ").is_empty());
+        let rendered = render_mcp_catalog_section("- home: stdio, connected");
+        assert!(rendered.starts_with("## MCP Servers"));
+        assert!(rendered.contains("- home: stdio, connected"));
     }
 
     // ── Plan mode constraint injection tests (C component) ──

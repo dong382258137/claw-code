@@ -91,6 +91,13 @@ pub struct RuntimeFeatureConfig {
     /// semantic query without enumerating the full catalog. Set to `Some(false)`
     /// to hide the tool. `None` is treated as enabled.
     skills_tool_search_enabled: Option<bool>,
+    /// MCP server catalog injection into system prompt. `Some(true)` (default)
+    /// injects a one-server-per-line overview (server name, transport, and
+    /// connection status from the runtime registry) into the dynamic region of
+    /// the system prompt so the model can see which MCP servers are usable
+    /// without probing them blindly. Set to `Some(false)` to disable. `None`
+    /// is treated as enabled.
+    mcp_catalog_enabled: Option<bool>,
     /// Session Bus 互通白名单（`settings.sessionBus.allow`，设计文档
     /// 2026-08-11-session-bus-design.md §2.5）。每条规则 `"<from>:<to>"`，
     /// `*` 匹配任意 kind；省略冒号视为 `"<from>:*"`。启动时经
@@ -540,6 +547,7 @@ impl ConfigLoader {
                 &merged_value,
                 "skillsToolSearchEnabled",
             ),
+            mcp_catalog_enabled: parse_optional_bool(&merged_value, "mcpCatalogEnabled"),
             session_bus_allow: parse_optional_session_bus_allow(&merged_value),
         };
 
@@ -775,6 +783,15 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn skills_catalog_enabled_or_default(&self) -> bool {
         self.skills_catalog_enabled.unwrap_or(true)
+    }
+
+    /// Whether the MCP server catalog is injected into the system prompt.
+    /// Exactly like `skillsCatalogEnabled`, `mcpCatalogEnabled` defaults to
+    /// enabled; set to `Some(false)` to hide the `## MCP Servers` overview
+    /// section for token-budget-constrained sessions.
+    #[must_use]
+    pub fn mcp_catalog_enabled_or_default(&self) -> bool {
+        self.mcp_catalog_enabled.unwrap_or(true)
     }
 
     /// Skill search meta-tool (`SkillSearch`) visibility. `None` or

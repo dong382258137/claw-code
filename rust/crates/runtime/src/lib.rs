@@ -263,9 +263,10 @@ pub use policy_engine::{
     PolicyEvaluation, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
-    load_system_prompt, load_system_prompt_with_extras, prepend_bullets, ContextFile,
-    ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder, SystemPromptExtras,
-    SystemPromptSplit, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, load_system_prompt_with_extras, prepend_bullets,
+    render_mcp_catalog_section, ContextFile, ModelFamilyIdentity, ProjectContext, PromptBuildError,
+    SystemPromptBuilder, SystemPromptExtras, SystemPromptSplit, FRONTIER_MODEL_NAME,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_orchestrator::{RecoveryOrchestrator, RecoveryOutcome};
 pub use recovery_recipes::{
