@@ -115,18 +115,55 @@ pub fn run_browser_control(input: BrowserControlInput) -> Result<String, String>
         .map_err(|_| "browser session lock poisoned".to_string())?;
 
     if input.action == "close" {
-        guard.take(); // Browser's Drop impl kills the child process.
+        // 在 tokio runtime 上下文(如 claw 的 async 执行栈)直接 drop 会话会
+        // 触发 "Cannot drop a runtime in a context where blocking is not
+        // allowed" —— Runtime::drop 需要 blocking 上下文来关闭阻塞线程池。
+        // 用 thread::scope 把会话移到独立 OS 线程 drop(同步等待,保证返回时
+        // 浏览器进程已关闭)。浏览器进程由 Browser 的 Drop 触发 kill。
+        if let Some(session) = guard.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                std::thread::scope(|s| {
+                    s.spawn(|| drop(session));
+                });
+            } else {
+                drop(session);
+            }
+        }
         return Ok(json!({ "status": "closed" }).to_string());
     }
 
     if guard.is_none() {
         *guard = Some(create_session(&input)?);
     }
-    let session = guard.as_mut().expect("session just ensured");
-    // Arc: Clone is a cheap reference bump, so we can hold the runtime handle
-    // while `dispatch` reborrows the session mutably.
-    let runtime = session.runtime.clone();
-    runtime.block_on(dispatch(session, &input))
+
+    // 工具执行器可能在 tokio runtime 上下文中调用本函数(如 run_turn_async
+    // 调用栈内)。直接 `runtime.block_on` 会触发 "Cannot start a runtime from
+    // within a runtime" panic。检测到当前线程已在 runtime 中时,把会话移入
+    // 独立 OS 线程执行 `handle.block_on`(该线程不在任何 runtime 上下文)。
+    // `block_in_place` 不可用:claw-shell 使用 current_thread + LocalSet,
+    // block_in_place 在 current_thread runtime 上会 panic。参照 llm_clients.rs
+    // 的同款修复。
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let mut session = guard.take().expect("session just ensured");
+        let runtime = session.runtime.clone();
+        let handle = runtime.handle().clone();
+        // 闭包返回 (结果, 会话),便于 join 后放回 guard。
+        let joined = std::thread::spawn(move || {
+            let out = handle.block_on(dispatch(&mut session, &input));
+            (out, session)
+        })
+        .join()
+        .map_err(|e| format!("browser_control worker thread panicked: {e:?}"))?;
+        let (result, session) = joined;
+        *guard = Some(session);
+        result
+    } else {
+        let session = guard.as_mut().expect("session just ensured");
+        // Arc: Clone is a cheap reference bump, so we can hold the runtime handle
+        // while `dispatch` reborrows the session mutably.
+        let runtime = session.runtime.clone();
+        runtime.block_on(dispatch(session, &input))
+    }
 }
 
 /// Launch a fresh browser, or attach to an already-running one for `connect`.
@@ -138,27 +175,30 @@ fn create_session(input: &BrowserControlInput) -> Result<BrowserSession, String>
             .map_err(|e| format!("failed to start tokio runtime: {e}"))?,
     );
 
-    let (browser, handler) = {
-        let runtime = runtime.clone();
-        runtime.block_on(async move {
-            if input.action == "connect" {
-                let target = connect_target(input)?;
-                Browser::connect(target)
-                    .await
-                    .map_err(|e| format!("connect to CDP endpoint failed: {e}"))
+    // 与 run_browser_control 相同的嵌套 runtime 防护;future 需 'static,
+    // 故先克隆创建会话所需的输入字段。
+    let action = input.action.clone();
+    let headless = input.headless;
+    let url = input.url.clone();
+    let port = input.port;
+
+    let (browser, handler) = block_on_future(&runtime, async move {
+        if action == "connect" {
+            let target = connect_target_parts(url, port)?;
+            Browser::connect(target)
+                .await
+                .map_err(|e| format!("connect to CDP endpoint failed: {e}"))
+        } else {
+            let builder = BrowserConfig::builder().window_size(1280, 900);
+            let config = if headless.unwrap_or(false) {
+                builder.new_headless_mode().build()
             } else {
-                let headless = input.headless.unwrap_or(false);
-                let builder = BrowserConfig::builder().window_size(1280, 900);
-                let config = if headless {
-                    builder.new_headless_mode().build()
-                } else {
-                    builder.with_head().build()
-                };
-                let config = config.map_err(|e| format!("invalid browser config: {e}"))?;
-                Browser::launch(config).await.map_err(|e| e.to_string())
-            }
-        })?
-    };
+                builder.with_head().build()
+            };
+            let config = config.map_err(|e| format!("invalid browser config: {e}"))?;
+            Browser::launch(config).await.map_err(|e| e.to_string())
+        }
+    })?;
 
     // Drive the CDP handler in the background so the connection stays alive
     // between tool calls.
@@ -183,17 +223,34 @@ fn create_session(input: &BrowserControlInput) -> Result<BrowserSession, String>
     })
 }
 
-/// Resolve the CDP endpoint for `connect`. Accepts a `ws://` URL, an `http://`
-/// URL (the `/json/version` endpoint is queried automatically), or a bare port
-/// number that is expanded to `http://127.0.0.1:<port>`.
-fn connect_target(input: &BrowserControlInput) -> Result<String, String> {
-    if let Some(u) = &input.url {
+/// 安全驱动 `fut`:若当前线程已在某个 tokio runtime 上下文中,则在独立 OS
+/// 线程上执行 `handle.block_on`,避免 "Cannot start a runtime from within a
+/// runtime" panic;否则直接 `rt.block_on`。参照 llm_clients.rs 的同款修复。
+fn block_on_future<T: Send + 'static>(
+    rt: &Arc<tokio::runtime::Runtime>,
+    fut: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
+) -> Result<T, String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let handle = rt.handle().clone();
+        std::thread::spawn(move || handle.block_on(fut))
+            .join()
+            .map_err(|e| format!("browser_control worker thread panicked: {e:?}"))?
+    } else {
+        rt.block_on(fut)
+    }
+}
+
+/// Resolve the CDP endpoint from the raw inputs. Accepts a `ws://` URL, an
+/// `http://` URL (the `/json/version` endpoint is queried automatically), or a
+/// bare port number that is expanded to `http://127.0.0.1:<port>`.
+fn connect_target_parts(url: Option<String>, port: Option<u16>) -> Result<String, String> {
+    if let Some(u) = url {
         let u = u.trim();
         if !u.is_empty() {
             return Ok(u.to_string());
         }
     }
-    if let Some(p) = input.port {
+    if let Some(p) = port {
         return Ok(format!("http://127.0.0.1:{p}"));
     }
     Err("action 'connect' requires 'url' (e.g. \"http://127.0.0.1:9222\" or \
@@ -1448,21 +1505,82 @@ mod tests {
     #[test]
     fn connect_target_resolves_endpoint() {
         // Bare port expands to the local http endpoint.
-        let by_port = input_with(&[("action", json!("connect")), ("port", json!(9222))]);
-        assert_eq!(connect_target(&by_port).unwrap(), "http://127.0.0.1:9222");
+        let by_port = connect_target_parts(None, Some(9222));
+        assert_eq!(by_port.unwrap(), "http://127.0.0.1:9222");
         // Explicit URL wins over port.
-        let by_url = input_with(&[
-            ("action", json!("connect")),
-            ("port", json!(9222)),
-            ("url", json!("ws://127.0.0.1:9223/devtools/browser/x")),
-        ]);
+        let by_url = connect_target_parts(
+            Some("ws://127.0.0.1:9223/devtools/browser/x".into()),
+            Some(9222),
+        );
         assert_eq!(
-            connect_target(&by_url).unwrap(),
+            by_url.unwrap(),
             "ws://127.0.0.1:9223/devtools/browser/x"
         );
         // Missing both url and port is an error.
-        let missing = input_with(&[("action", json!("connect"))]);
-        assert!(connect_target(&missing).is_err());
+        assert!(connect_target_parts(None, None).is_err());
+    }
+
+    /// 回归测试:claw 在 tokio runtime 上下文(async 执行栈)中调用本工具时,
+    /// 不得触发 "Cannot start a runtime from within a runtime" panic。
+    /// `block_on_future` 检测到当前线程已在 runtime 内,应改走独立 OS 线程。
+    #[test]
+    fn block_on_future_avoids_nested_runtime_panic() {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        rt.block_on(async {
+            let res = block_on_future(&rt, async { Ok::<_, String>("hi".to_string()) })
+                .expect("no nested-runtime panic");
+            assert_eq!(res, "hi");
+        });
+    }
+
+    /// 端到端复现用户报错场景:在 tokio runtime 的 worker 里驱动完整
+    /// launch → goto → snapshot → close 流程,修复前第一步 launch 即 panic。
+    /// Opt-in: `cargo test -p tools browser_control_smoke_inside_runtime -- --ignored`.
+    #[test]
+    #[ignore]
+    fn browser_control_smoke_inside_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let input: BrowserControlInput = serde_json::from_value(json!({
+                "action": "launch",
+                "headless": true,
+            }))
+            .unwrap();
+            let launch = match run_browser_control(input) {
+                Ok(ok) => ok,
+                Err(e) => {
+                    eprintln!("browser_control smoke skip (launch failed): {e}");
+                    return;
+                }
+            };
+            assert!(
+                launch.contains("\"status\":\"ready\""),
+                "launch inside runtime: {launch}"
+            );
+
+            let gone = serde_json::from_value(json!({
+                "action": "goto",
+                "url": "https://example.com",
+            }))
+            .map(run_browser_control)
+            .unwrap()
+            .unwrap_or_else(|e| panic!("goto failed: {e}"));
+            assert!(gone.contains("example.com"), "goto: {gone}");
+
+            let close = serde_json::from_value(json!({ "action": "close" }))
+                .map(run_browser_control)
+                .unwrap()
+                .unwrap();
+            assert!(close.contains("closed"), "close: {close}");
+        });
     }
 
     #[test]
