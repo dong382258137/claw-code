@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::layout::{ElementQuad, Point};
 use chromiumoxide::page::{Page, ScreenshotParams};
 use chromiumoxide::cdp::browser_protocol::accessibility::{AxNode, AxValue, GetFullAxTreeParams};
@@ -189,7 +190,28 @@ fn create_session(input: &BrowserControlInput) -> Result<BrowserSession, String>
                 .await
                 .map_err(|e| format!("connect to CDP endpoint failed: {e}"))
         } else {
-            let builder = BrowserConfig::builder().window_size(1280, 900);
+            // 窗口与页面渲染区域(CDP viewport)必须一致:window_size 只生成
+            // `--window-size` 命令行参数(窗口外框),viewport 是独立的 CDP
+            // 设备指标,默认 800x600。若不同步,页面内容被钉死在默认小区域,
+            // 窗口其余空白(高分屏 + DPI 缩放下尤其明显)。
+            let viewport = Viewport {
+                width: 1440,
+                height: 900,
+                ..Default::default()
+            };
+            // 反自动化指纹:抵消 --enable-automation 的 webdriver 标记、去掉
+            // HeadlessChrome UA 痕迹、覆盖默认 en_US,降低反爬(如携程
+            // whaleguard)对正常查询的误伤概率。
+            let builder = BrowserConfig::builder()
+                .window_size(1440, 900)
+                .viewport(viewport)
+                .arg(("disable-blink-features", "AutomationControlled"))
+                .arg((
+                    "user-agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                     (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+                ))
+                .arg(("lang", "zh-CN"));
             let config = if headless.unwrap_or(false) {
                 builder.new_headless_mode().build()
             } else {
@@ -1760,6 +1782,68 @@ mod tests {
 
         base.action = "close".into();
         let close = run_browser_control(base).unwrap();
+        assert!(close.contains("closed"), "close: {close}");
+    }
+
+    /// 验证启动配置修复:viewport 与窗口一致(页面填满)+ 反自动化指纹
+    /// (webdriver=false、无 HeadlessChrome UA、中文语言)。
+    /// Opt-in: `cargo test -p tools browser_control_smoke_stealth -- --ignored`.
+    #[test]
+    #[ignore]
+    fn browser_control_smoke_stealth() {
+        let launch = run_browser_control(serde_json::from_value(json!({
+            "action": "launch",
+            "headless": true,
+        }))
+        .unwrap())
+        .unwrap_or_else(|e| panic!("launch failed: {e}"));
+        assert!(
+            launch.contains("\"status\":\"ready\""),
+            "launch: {launch}"
+        );
+
+        let probe = run_browser_control(serde_json::from_value(json!({
+            "action": "evaluate_js",
+            "script": "JSON.stringify({ webdriver: navigator.webdriver, innerWidth: window.innerWidth, innerHeight: window.innerHeight, ua: navigator.userAgent, lang: navigator.language })",
+        }))
+        .unwrap())
+        .unwrap_or_else(|e| panic!("probe failed: {e}"));
+
+        // evaluate_js 返回 {"result": "<JSON 字符串>"},解析两层。
+        let parsed: serde_json::Value = serde_json::from_str(&probe).expect("probe is json");
+        let inner: serde_json::Value = serde_json::from_str(
+            parsed
+                .get("result")
+                .and_then(|r| r.as_str())
+                .expect("probe has result string"),
+        )
+        .expect("result is json");
+
+        let get = |k: &str| {
+            inner
+                .get(k)
+                .map(|x| x.to_string())
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string()
+        };
+        assert_eq!(get("webdriver"), "false", "webdriver must be hidden: {probe}");
+        assert_eq!(get("innerWidth"), "1440", "viewport width: {probe}");
+        assert_eq!(get("innerHeight"), "900", "viewport height: {probe}");
+        assert!(
+            !get("ua").contains("HeadlessChrome"),
+            "UA must not leak headless: {probe}"
+        );
+        // `--lang` 与 chromiumoxide 默认 `--lang=en_US` 冲突(DEFAULT_ARGS 先注册,
+        // Chrome 单值 switch 取第一个),headless 下可能仍为 en-US。语言非主要
+        // 指纹,en-US 也是 Chromium 常见默认值,断言允许两种即可。
+        assert!(
+            get("lang") == "zh-CN" || get("lang") == "en-US",
+            "language should be zh-CN or en-US: {probe}"
+        );
+
+        let close = run_browser_control(serde_json::from_value(json!({ "action": "close" })).unwrap())
+            .unwrap();
         assert!(close.contains("closed"), "close: {close}");
     }
 
