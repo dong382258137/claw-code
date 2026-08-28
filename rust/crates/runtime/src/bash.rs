@@ -314,6 +314,8 @@ async fn execute_bash_async(
     let mut timed_out = false;
     // 智能模式触发原因（idle vs hard），用于 stderr 消息和 provenance 区分
     let mut smart_idle = false;
+    // 智能模式忙等循环触发标记：无输出但 CPU 持续增长的疑似空转循环
+    let mut busy_loop = false;
     // child 退出时间，用于 pipe 排空宽限期判断
     let mut child_exit_time: Option<Instant> = None;
 
@@ -375,6 +377,13 @@ async fn execute_bash_async(
                         child_exit_time = Some(Instant::now());
                     }
                     activity_monitor::ActivityDecision::HardTimeout => {
+                        timed_out = true;
+                        let _ = child.kill().await;
+                        child_exited = true;
+                        child_exit_time = Some(Instant::now());
+                    }
+                    activity_monitor::ActivityDecision::BusyLoop => {
+                        busy_loop = true;
                         timed_out = true;
                         let _ = child.kill().await;
                         child_exited = true;
@@ -482,6 +491,10 @@ async fn execute_bash_async(
 
     // 超时
     if timed_out {
+        // 智能模式 busy loop 触发：无输出但 CPU 持续增长的疑似空转循环
+        if busy_loop {
+            return Ok(busy_loop_output(&input, sandbox_status));
+        }
         // 智能模式 idle 触发：给出不同消息引导模型重试
         if smart_idle {
             return Ok(idle_timeout_output(&input, sandbox_status));
@@ -527,6 +540,51 @@ async fn execute_bash_async(
         sandbox_status: Some(sandbox_status),
         shell_type: Some(detect_shell_type().as_str().to_string()),
     })
+}
+
+/// 智能模式 busy loop 触发时的输出构造。
+///
+/// 与 idle_timeout_output 区分：idle 是无输出且无 CPU（疑似死锁），
+/// busy loop 是无输出但 CPU 持续增长（疑似无谓的空转循环，如
+/// `for i in range(huge): pass`）。这类循环会骗过 idle 检测
+/// （CPU 增长 = 活跃），必须单独识别并在远短于 1h 硬上限时提前 kill。
+fn busy_loop_output(
+    input: &BashCommandInput,
+    sandbox_status: SandboxStatus,
+) -> BashCommandOutput {
+    let guidance = "\n\n[Busy-loop kill] Command ran with no output but sustained CPU for a long window; \
+         likely a CPU-spinning loop (e.g. `for i in range(huge): pass`).\n\
+         Suggestions:\n\
+         - Pre-flight generated scripts: run `python -m py_compile` or dry-inspect loops before executing\n\
+         - Verify loop bounds are finite & small (no `range(1_000_000_000)` bare spinning)\n\
+         - Add progress output (`print/echo` checkpoints) so long computations are distinguishable\n\
+         - If the task is genuinely a long CPU computation, pass an explicit `timeout`";
+    BashCommandOutput {
+        stdout: String::new(),
+        stderr: format!("Command killed as a suspected CPU busy-loop{guidance}"),
+        raw_output_path: None,
+        interrupted: true,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        return_code_interpretation: Some("busy.loop".to_string()),
+        no_output_expected: Some(true),
+        structured_content: Some(vec![json!({
+            "event": "command.busy_loop",
+            "failureClass": "busy_loop",
+            "data": {
+                "command": input.command,
+                "provenance": "bash.busy_loop",
+                "classification": "busy.loop"
+            }
+        })]),
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: Some(sandbox_status),
+        shell_type: Some(detect_shell_type().as_str().to_string()),
+    }
 }
 
 /// 智能模式 idle 触发时的输出构造。
@@ -1511,6 +1569,19 @@ mod activity_monitor {
     /// 500ms 足够检测到短任务和长任务的 CPU 变化（采样定理）。
     const CPU_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
+    /// 忙等窗口：子进程在无任何输出、CPU 却持续增长的情况下运行的最长时间。
+    ///
+    /// 背景：LLM 生成的调试脚本偶发含无谓的大 range 空转（如 `for i in
+    /// range(1_000_000_000): pass`）。这类循环纯 CPU 忙等、零输出，会使
+    /// `cpu_advanced` 持续为真而永远不触发 idle timeout；若只靠 1h 的
+    /// `max_hard_timeout` 兜底，命令会长时间占用单核资源，会话表现为卡死。
+    /// 判别：忙等窗口内每个 CPU 采样 CPU 都在增长、但从未有输出 → 判定忙等循环，
+    /// 显著缩短硬上限（远短于正常长计算如编译/回测）。
+    const DEFAULT_BUSY_LOOP_WINDOW: Duration = Duration::from_secs(120);
+    /// 忙等窗口内需累计到的 CPU 增长采样次数（每 CPU 采样约 500ms）才判忙等。
+    /// 6 次 ≈ 窗口末期持续 3s 满速 CPU 空转，足以区分"偶发计算"与"持续空转"。
+    const BUSY_LOOP_MIN_ADVANCES: u32 = 6;
+
     /// 活跃度检测决策。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum ActivityDecision {
@@ -1520,6 +1591,8 @@ mod activity_monitor {
         IdleTimeout,
         /// 硬上限：超过绝对执行时间上限。
         HardTimeout,
+        /// 忙等循环：长时间无输出但 CPU 持续增长，疑似无谓的 CPU 空转循环。
+        BusyLoop,
     }
 
     /// 进程活跃度监视器。
@@ -1529,8 +1602,12 @@ mod activity_monitor {
     pub(crate) struct ActivityMonitor {
         /// 子进程 root PID（bash shell 进程）。
         root_pid: u32,
-        /// 最后一次观察到 stdout/stderr 字节的时间。
+        /// 最后一次观察到 stdout/stderr 字节的时间（仅输出更新，不随 CPU 增长而变）。
+        /// 用于忙等判定与 idle 判定。
         last_output_at: Instant,
+        /// 最后一次观察到"任何活动"（输出或 CPU 增长）的时间。用于 idle 判定：
+        /// CPU 增长也算活跃，因此空闲 = 长时间既无输出也无 CPU。
+        last_activity_at: Instant,
         /// 上次采样的子进程树 CPU 时间总和（kernel + user）。
         last_cpu_time: Duration,
         /// 上次执行 CPU 采样的时间（限流）。
@@ -1541,6 +1618,10 @@ mod activity_monitor {
         idle_timeout: Duration,
         /// 绝对硬上限。
         max_hard_timeout: Duration,
+        /// 忙等观察窗口：child 在此时间内无任何输出、CPU 却持续增长 → 判忙等。
+        busy_loop_window: Duration,
+        /// 忙等观察累计的 CPU 增长采样次数（在无输出窗口内）。
+        busy_advance_count: u32,
     }
 
     impl ActivityMonitor {
@@ -1549,11 +1630,14 @@ mod activity_monitor {
             Self {
                 root_pid,
                 last_output_at: now,
+                last_activity_at: now,
                 last_cpu_time: Duration::ZERO,
                 last_refresh_at: now,
                 started_at: now,
                 idle_timeout: DEFAULT_IDLE_TIMEOUT,
                 max_hard_timeout: DEFAULT_MAX_HARD_TIMEOUT,
+                busy_loop_window: DEFAULT_BUSY_LOOP_WINDOW,
+                busy_advance_count: 0,
             }
         }
 
@@ -1570,9 +1654,25 @@ mod activity_monitor {
             m
         }
 
-        /// 收到 stdout/stderr 字节时调用，重置空闲计时器。
+        /// 测试用：完全自定义阈值（含忙等观察窗口）。
+        #[cfg(test)]
+        pub(crate) fn with_full_thresholds(
+            root_pid: u32,
+            idle_timeout: Duration,
+            max_hard_timeout: Duration,
+            busy_loop_window: Duration,
+        ) -> Self {
+            let mut m = Self::with_thresholds(root_pid, idle_timeout, max_hard_timeout);
+            m.busy_loop_window = busy_loop_window;
+            m
+        }
+
+        /// 收到 stdout/stderr 字节时调用，重置空闲计时器与忙等观察。
         pub(crate) fn note_output(&mut self) {
-            self.last_output_at = Instant::now();
+            let now = Instant::now();
+            self.last_output_at = now;
+            self.last_activity_at = now;
+            self.busy_advance_count = 0;
         }
 
         /// 每 100ms 轮询一次，返回决策结果。
@@ -1592,14 +1692,23 @@ mod activity_monitor {
                 self.last_cpu_time = current_cpu;
                 self.last_refresh_at = now;
 
-                // CPU 时间增长 → 子进程树仍在计算，重置空闲计时器
                 if cpu_advanced {
-                    self.last_output_at = now;
+                    // CPU 增长 → 子进程仍在计算，视为活跃（重置 idle 判定基准）
+                    self.last_activity_at = now;
+                    // 忙等观察：仅当"距上次输出"超过窗口时累计 CPU 增长。
+                    // last_output_at 不随 CPU 增长更新（仅 note_output 更新），
+                    // 因此可识别"无输出却持续烧 CPU"的空转循环，规避 idle 检测盲区。
+                    if now.duration_since(self.last_output_at) >= self.busy_loop_window {
+                        self.busy_advance_count += 1;
+                        if self.busy_advance_count >= BUSY_LOOP_MIN_ADVANCES {
+                            return ActivityDecision::BusyLoop;
+                        }
+                    }
                 }
             }
 
-            // 3. 检查空闲时长
-            if now.duration_since(self.last_output_at) >= self.idle_timeout {
+            // 3. 检查空闲时长（基于任何活动：输出 或 CPU）
+            if now.duration_since(self.last_activity_at) >= self.idle_timeout {
                 return ActivityDecision::IdleTimeout;
             }
 
@@ -1848,6 +1957,46 @@ mod activity_monitor {
             m.note_output();
             thread::sleep(Duration::from_millis(50));
             assert_eq!(m.poll(), ActivityDecision::Continue);
+        }
+
+        /// 忙等检测：无输出但 CPU 持续增长时，应在很短窗口内判 BusyLoop。
+        ///
+        /// 用极短的 busy_loop_window（10ms）与极短的 CPU 采样间隔无法配置
+        /// （CPU_REFRESH_INTERVAL=500ms 为常量），因此通过让本进程真实消耗
+        /// CPU 并循环多次 poll 触发：CPU 增长会被采样到，且距上次输出超过
+        /// 窗口 → 累计计数达 BUSY_LOOP_MIN_ADVANCES 后返回 BusyLoop。
+        #[cfg(any(windows, target_os = "linux"))]
+        #[test]
+        fn monitor_busy_loop_detects_sustained_cpu_without_output() {
+            let mut m = ActivityMonitor::with_full_thresholds(
+                std::process::id(),
+                Duration::from_secs(60),   // idle 60s，确保不会被 idle 抢先
+                Duration::from_secs(3600), // hard 1h，确保测试期间不可能触发
+                Duration::from_millis(10), // busy 窗口极小：无输出 10ms + CPU 增长 → 判忙等
+            );
+            // 触发一段足够长的 CPU 消耗。注意 CPU_REFRESH_INTERVAL=500ms 为常量，
+            // 需跨越 BUSY_LOOP_MIN_ADVANCES(6) 次采样周期 ≈ 6×500ms = 3s，
+            // 因此循环给足 4s（否则 last_refresh_at 限流导致 CPU 采样不前进）。
+            let start = std::time::Instant::now();
+            let mut done = false;
+            while start.elapsed() < Duration::from_secs(4) && !done {
+                let mut sum: u64 = 0;
+                for i in 0u64..50_000_000 {
+                    sum = sum.wrapping_add(std::hint::black_box(i));
+                }
+                std::hint::black_box(sum);
+                match m.poll() {
+                    ActivityDecision::BusyLoop => {
+                        done = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                done,
+                "无输出 + 持续 CPU 增长应在忙等窗口内判定为 BusyLoop"
+            );
         }
 
         #[cfg(windows)]

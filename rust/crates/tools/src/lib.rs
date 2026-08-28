@@ -882,7 +882,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a shell command in the current workspace. \
+                When generated scripts or long-running commands are involved, follow these reliability rules:\n\
+                - Never generate a bare CPU-spinning loop (e.g. `for i in range(1_000_000_000): pass`); \
+                verify loop bounds are finite and small before running.\n\
+                - Pre-flight generated scripts with a syntax check (`python -m py_compile ...`, `bash -n ...`) \
+                before execution.\n\
+                - Prefer reusing an existing debug/trace mechanism (e.g. a `--trace` script, existing test harness) \
+                over writing throwaway trace scripts; if a trace script is needed, keep it minimal and add progress output.\n\
+                - For genuinely long computations (compile, backtest, training) pass an explicit `timeout`; \
+                otherwise the smart idle monitor may misjudge silent high-CPU loops and kill them.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
