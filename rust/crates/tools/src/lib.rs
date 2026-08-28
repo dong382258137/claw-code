@@ -1019,6 +1019,30 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "browser_control",
+            description: "Drive a persistent Chrome session over the DevTools Protocol. Actions: \
+                'launch' (open the browser, visible by default), 'goto' (navigate to a URL), \
+                'snapshot' (return current URL + page text), 'screenshot' (save a PNG and return its path), \
+                'click' (click an element by CSS selector), 'type' (focus an element and type text), \
+                'close' (shut down the session). The session persists across calls, so reuse the same tool \
+                to keep browsing the same tab. Prefer this tool over WebFetch for pages requiring \
+                JavaScript execution or user interaction.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["launch", "goto", "snapshot", "screenshot", "click", "type", "close"] },
+                    "url": { "type": "string", "description": "URL for 'launch'/'goto'." },
+                    "selector": { "type": "string", "description": "CSS selector for 'click'/'type'." },
+                    "text": { "type": "string", "description": "Text for 'type'." },
+                    "save_path": { "type": "string", "description": "Output path for 'screenshot'; default: <cwd>/.claw/browser_shots/<timestamp>.png" },
+                    "headless": { "type": "boolean", "description": "Launch without a visible window. Default: false." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "WebFetch",
             description:
                 "Fetch a URL, convert it into readable text, and answer a prompt about it.",
@@ -1972,6 +1996,8 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_grep_search(grep_input, None)
         }
+        "browser_control" => from_value::<browser_control::BrowserControlInput>(input)
+            .and_then(browser_control::run_browser_control),
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
@@ -9316,6 +9342,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
     None
 }
 
+pub mod browser_control;
 pub mod lane_completion;
 pub mod pdf_extract;
 
