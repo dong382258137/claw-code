@@ -40,7 +40,7 @@ browser_control { action: "snapshot" }             # 刷新 refs
 
 | 动作 | 用途 |
 |------|------|
-| `snapshot` | 可访问性树快照，含层级、角色、名称、状态标记（disabled/checked 等）与 `[ref=eN]`；大页面会截断（240 行）并提示缩小聚焦范围 |
+| `snapshot` | 可访问性树快照，含层级、角色、名称、状态标记（disabled/checked 等）与 `[ref=eN]`；**空树时自动等待重试（最多 5 次）**；重试后仍空会提示"页面可能仍在加载或被反爬挑战拦截"，此时先用 `wait_for` 再重试；大页面会截断（240 行）并提示缩小聚焦范围 |
 | `get_state` | 读当前 URL/标题 + 指定元素的实时状态（文本/值/选中/禁用/可见/坐标），用 `ref` 或 `selector` 指定元素；动作后用它验证 |
 | `screenshot` | 视觉反馈；默认存 `<cwd>/.claw/browser_shots/<时间戳>.png`，可用 `save_path` 指定 |
 | `wait_for` | 条件等待：`url:…`（URL 包含）\| `text:…`（页面文本出现）\| CSS 选择器 \| `networkidle`（网络空闲）；`timeout_ms` 默认 5000 |
@@ -77,5 +77,6 @@ browser_control { action: "snapshot" }             # 刷新 refs
 ## 注意事项
 
 - 会话跨调用持久：同一会话内多个 `browser_control` 调用共享浏览器与标签页，**不要重复 launch**。
+- **禁止 `evaluate_js` 盲猜 DOM**：页面感知一律用 `snapshot`（可访问性树 + ref）。`evaluate_js` 仅用于提取结构化数据（如取列表、算统计），不要用它探测元素选择器——snapshot 已提供全部可交互元素。若 snapshot 为空或提示警告，先用 `wait_for` 等待页面就绪再重新 snapshot，不要转 evaluate_js 盲试。
 - 权限为高危（DangerFullAccess）：涉及表单提交、账号操作、删除等敏感动作前向用户说明并确认。
 - 遇到弹窗/对话框卡住：优先 `evaluate_js` 处理或 `press_key { key: "Escape" }`，必要时 `close` 重启会话。

@@ -335,12 +335,39 @@ async fn dispatch(
                 .await
                 .map_err(|e| format!("navigate failed: {e}"))?;
             let _ = page.wait_for_navigation().await;
-            // Give client-side rendering a moment before snapshotting.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // 等待页面真正就绪:readyState=complete 且 body 有实际内容,且不在
+            // 反爬挑战页(Cloudflare "Pardon Our Interruption" / "Just a moment"
+            // 等)。挑战页在挑战通过前 AX 树近乎为空,过早返回会让 AI 拿到
+            // 空 snapshot 而放弃感知层转 evaluate_js 盲试(实测 60+ 次盲试)。
+            let mut ready = false;
+            for _ in 0..50 {
+                ready = page
+                    .evaluate_expression(
+                        "(() => { const t = document.body ? document.body.innerText : ''; \
+                         const challenge = /Pardon Our Interruption|Just a moment|Verify you are \
+                         human|请稍候|正在验证|cf-challenge/i; \
+                         return document.readyState === 'complete' && t.trim().length > 100 && \
+                         !challenge.test(t); })()",
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_value::<bool>().ok())
+                    .unwrap_or(false);
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             let (current, title) = page_basics(&page).await;
             // Navigation invalidates the previous ref map.
             session.refs.clear();
-            Ok(json!({ "status": "navigated", "url": current, "title": title }).to_string())
+            Ok(json!({
+                "status": "navigated",
+                "url": current,
+                "title": title,
+                "ready": ready,
+            })
+            .to_string())
         }
         "back" => {
             let page = ensure_active_page(session).await?;
@@ -675,15 +702,63 @@ const MAX_SNAPSHOT_LINES: usize = 240;
 const MAX_LINE_CHARS: usize = 160;
 
 /// Build an AX-tree snapshot string and fill `refs` with ref → backendNodeId.
+///
+/// AX 树的生成滞后于 DOM 就绪(重 JS / Cloudflare 挑战页在 readyState
+/// complete 后仍需数秒才产出完整 AX 树)。空树时自动等待 2 秒重试,
+/// 最多 5 次,避免 AI 拿到近乎空的快照而放弃感知层转 evaluate_js 盲试。
 async fn build_ax_snapshot(
     page: &Page,
     refs: &mut HashMap<String, BackendNodeId>,
 ) -> Result<String, String> {
+    let mut out = String::new();
+    let mut lines = 0usize;
+    let mut truncated = false;
+
+    for _ in 0..5 {
+        let (o, l, t) = render_ax_tree(page, refs).await?;
+        out = o;
+        lines = l;
+        truncated = t;
+        if lines > 2 {
+            break;
+        }
+        // AX 树尚未生成完整,短暂等待后重试。
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+    }
+
+    if out.trim().is_empty() {
+        out.push_str("(no accessible content)");
+    }
+    if truncated {
+        out.push_str(&format!(
+            "\n... snapshot truncated at {lines} lines. The page is large; narrow your focus."
+        ));
+    }
+    // 空树引导:重试后 AX 树仍近乎为空,通常是页面加载过慢或被反爬挑战页
+    // (如 Cloudflare "Pardon Our Interruption")挡住。引导 AI 等待后重试,
+    // 避免放弃感知层转 evaluate_js 盲猜 DOM。
+    if lines <= 2 {
+        out.push_str(
+            "\n[snapshot-warning] AX tree is nearly empty after retries — the page is \
+             probably still loading or behind a bot-challenge (e.g. Cloudflare). Run \
+             'wait_for' (networkidle or text:…) and then re-run 'snapshot'; do NOT fall \
+             back to guessing the DOM with evaluate_js.",
+        );
+    }
+    Ok(out)
+}
+
+/// 单次取 AX 树并渲染为快照文本,返回 (文本, 有效行数, 是否截断)。
+async fn render_ax_tree(
+    page: &Page,
+    refs: &mut HashMap<String, BackendNodeId>,
+) -> Result<(String, usize, bool), String> {
     let resp = page
         .execute(GetFullAxTreeParams::builder().build())
         .await
         .map_err(|e| format!("getFullAXTree failed: {e}"))?;
     let nodes = resp.nodes.clone();
+    refs.clear();
 
     // Index nodes by AX node id.
     let mut by_id: HashMap<&str, &AxNode> = HashMap::new();
@@ -691,12 +766,12 @@ async fn build_ax_snapshot(
         by_id.insert(node.node_id.inner().as_str(), node);
     }
 
-    // Find roots: nodes whose parent is absent from the map (or ignored).
+    // 组织父子关系。**不能跳过 ignored 节点**:ignored 中间容器(如无语义的
+    // div)虽然不渲染,但必须挂在父节点下、由 walk 穿过,否则其非 ignored
+    // 后代(表单控件、链接等)会整体不可达,导致快照只剩根节点(实测海航
+    // 官网 1856 节点 AX 树只渲染出 1 行)。
     let mut children = HashMap::<&str, Vec<&AxNode>>::new();
     for node in &nodes {
-        if node.ignored {
-            continue;
-        }
         match &node.parent_id {
             Some(parent) if by_id.contains_key(parent.inner().as_str()) => {
                 children
@@ -797,15 +872,7 @@ async fn build_ax_snapshot(
         );
     }
 
-    if out.trim().is_empty() {
-        out.push_str("(no accessible content)");
-    }
-    if truncated {
-        out.push_str(&format!(
-            "\n... snapshot truncated at {lines} lines. The page is large; narrow your focus."
-        ));
-    }
-    Ok(out)
+    Ok((out, lines, truncated))
 }
 
 /// Render one AX node as `- role "name" [ref=eN]` plus state markers.
@@ -1844,6 +1911,56 @@ mod tests {
 
         let close = run_browser_control(serde_json::from_value(json!({ "action": "close" })).unwrap())
             .unwrap();
+        assert!(close.contains("closed"), "close: {close}");
+    }
+
+    /// 验证 goto 的就绪等待:重 JS + Cloudflare 挑战页(海航官网)在 goto
+    /// 返回后立即 snapshot 应拿到完整 AX 树(而非空树导致 AI 转 evaluate_js 盲试)。
+    /// Opt-in: `cargo test -p tools browser_control_smoke_goto_ready_wait -- --ignored`.
+    #[test]
+    #[ignore]
+    fn browser_control_smoke_goto_ready_wait() {
+        let run = |action: &str, extra: &serde_json::Value| {
+            let mut v = json!({ "action": action });
+            if let Some(obj) = extra.as_object() {
+                for (k, val) in obj {
+                    v[k] = val.clone();
+                }
+            }
+            let input: BrowserControlInput = serde_json::from_value(v).unwrap();
+            run_browser_control(input)
+        };
+
+        run("launch", &json!({ "headless": true }))
+            .unwrap_or_else(|e| panic!("launch failed: {e}"));
+        let goto = run(
+            "goto",
+            &json!({ "url": "https://www.hainanairlines.com/CN/CN/Home" }),
+        )
+        .unwrap_or_else(|e| panic!("goto failed: {e}"));
+        eprintln!("goto: {goto}");
+        // goto 应等待页面就绪(ready=true 表示已过 Cloudflare 挑战加载出真实内容)。
+        assert!(
+            goto.contains("\"ready\":true") || goto.contains("海南航空"),
+            "goto should wait for page readiness: {goto}"
+        );
+
+        // goto 返回后立即 snapshot,应拿到完整 AX 树(含表单元素),而非空树。
+        let snap = run("snapshot", &json!({}))
+            .map_err(|e| panic!("snapshot failed: {e}"))
+            .unwrap();
+        eprintln!("snapshot head: {}", &snap[..snap.len().min(400)]);
+        assert!(
+            snap.contains("RootWebArea") && !snap.contains("snapshot-warning"),
+            "snapshot should contain real content, got: {snap}"
+        );
+        // 应包含表单元素(textbox/button 等可交互元素)。
+        assert!(
+            snap.contains("textbox") || snap.contains("button") || snap.contains("link"),
+            "snapshot should expose interactive elements: {snap}"
+        );
+
+        let close = run("close", &json!({})).unwrap();
         assert!(close.contains("closed"), "close: {close}");
     }
 
