@@ -3132,7 +3132,16 @@ where
                     if let Ok(notebook) = crate::notebook::Notebook::load(workspace_root) {
                         let notebook_prompt = notebook.render_for_prompt();
                         if !notebook_prompt.is_empty() {
-                            system_split.dynamic_sections.push(notebook_prompt);
+                            // 明确给出 NOTEBOOK.md 的完整路径,避免 LLM 用
+                            // read_file 读取原始文件时猜测根目录路径
+                            // (NOTEBOOK.md 实际位于 .claw/ 下)而报 os error 2。
+                            system_split.dynamic_sections.push(format!(
+                                "NOTEBOOK 原始文件位于 `{}`(需要时可用 read_file 读取)。\n\n{}",
+                                workspace_root
+                                    .join(crate::notebook::NOTEBOOK_FILENAME)
+                                    .display(),
+                                notebook_prompt
+                            ));
                         }
                     }
                     // NOTEBOOK 加载失败时不阻塞 turn(避免 NOTEBOOK 文件损坏
