@@ -1534,10 +1534,10 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) ->
             MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
             MessageRole::Assistant => "assistant",
         };
-        // DeepSeek thinking 模式的 tool call(`call_01_*` 前缀)要求历史 assistant
-        // 消息必须回传 reasoning_content,否则 400。此类消息保留 thinking 块,
-        // 由 translate_message 作为 reasoning_content 发出;其余消息继续剥离以
-        // 节省 context token。
+        // DeepSeek thinking 模式的 tool call(`call_0N_*`,N ≥ 1 前缀)要求历史
+        // assistant 消息必须回传 reasoning_content,否则 400。此类消息保留
+        // thinking 块,由 translate_message 作为 reasoning_content 发出;其余
+        // 消息继续剥离以节省 context token。
         let thinking_mode_tool_call = message.blocks.iter().any(
             |b| matches!(b, ContentBlock::ToolUse { id, .. } if has_thinking_mode_tool_call(&[id])),
         );
@@ -1549,7 +1549,7 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) ->
                 ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
                 ContentBlock::Thinking { thinking, .. } => {
                     // 普通历史消息剥离 thinking 以节省 context token;仅
-                    // `call_01_*` thinking 模式 tool call 的消息需要保留,以便
+                    // `call_0N_*` thinking 模式 tool call 的消息需要保留,以便
                     // translate_message 回传 reasoning_content。API 只校验
                     // presence 不读内容,故只保留占位符,避免把完整 thinking
                     // 文本克隆进请求管线(省内存;token 由 translate_message
@@ -1747,6 +1747,43 @@ mod status_emitter_tests {
                 )
             }),
             "thinking 块应保留(占位符)以回传 reasoning_content"
+        );
+    }
+
+    #[test]
+    fn convert_messages_keeps_thinking_for_non_one_leading_tool_call() {
+        // 回归(2026-08-30,线上复现):deepseek-v4 在 thinking 模式生成
+        // `call_02_*` tool call id,旧实现只认 call_01_* 前缀,导致该消息的
+        // thinking 被剥离 → 下一轮请求无 reasoning_content → API 400
+        // ("reasoning_content ... must be passed back to the API")。
+        // call_0N_(N ≥ 1)均为 thinking 模式前缀,thinking 必须保留。
+        let msgs = vec![conv_msg(
+            MessageRole::Assistant,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "prior reasoning".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_02_vFVFAg79gxanJZdXeWHb5001".to_string(),
+                    name: "bash".to_string(),
+                    input: r#"{"command":"ls"}"#.to_string(),
+                },
+            ],
+        )];
+        let converted = convert_messages(&msgs, "deepseek-v4-flash");
+
+        assert_eq!(converted.len(), 1);
+        let assistant = &converted[0];
+        assert!(
+            assistant.content.iter().any(|b| {
+                matches!(
+                    b,
+                    InputContentBlock::Thinking { thinking, .. }
+                        if thinking == REASONING_PLACEHOLDER
+                )
+            }),
+            "call_02_* tool call 消息 must keep thinking (placeholder)"
         );
     }
 

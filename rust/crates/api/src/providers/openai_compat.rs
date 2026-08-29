@@ -27,7 +27,7 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
 
 /// Minimal placeholder echoed back as `reasoning_content` for DeepSeek
-/// thinking-mode tool-call turns (`call_01_*`).
+/// thinking-mode tool-call turns (`call_0N_*`, N ≥ 1).
 ///
 /// Empirically verified on 2026-08-15 (deepseek-v4 endpoint) that the API only
 /// checks the **presence** of `reasoning_content`, never its content: values
@@ -923,8 +923,8 @@ pub fn is_reasoning_model(_model: &str) -> bool {
 /// passed back"). Empirically verified on 2026-08-15 that the current
 /// deepseek-v4 build no longer enforces this for ordinary turns, so we strip
 /// prior thinking from the request to avoid carrying ~1/3 of assistant tokens
-/// as dead context. However, turns whose tool calls carry the `call_01_*`
-/// prefix (thinking mode) still enforce passback — see
+/// as dead context. However, turns whose tool calls carry the `call_0N_*`
+/// prefix (N ≥ 1, thinking mode) still enforce passback — see
 /// [`has_thinking_mode_tool_call`], which is the per-message gate that
 /// actually decides whether `reasoning_content` is emitted.
 /// Returns `false` for all models.
@@ -933,25 +933,33 @@ pub fn model_requires_reasoning_content_in_history(_model: &str) -> bool {
     false
 }
 
-/// Returns true when any tool call id uses the `call_01_` prefix, which
-/// DeepSeek reserves for thinking-mode tool calls.
+/// Returns true when any tool call id uses the `call_0N_` (N ≥ 1) prefix,
+/// which DeepSeek reserves for thinking-mode tool calls.
 ///
-/// Empirically (2026-08-15, deepseek-v4 endpoint):
-/// - assistant turn with a `call_01_*` tool call and NO `reasoning_content` in
-///   history → 400 "The `reasoning_content` in the thinking mode must be passed
-///   back to the API".
+/// Empirically verified on the deepseek-v4 endpoint:
+/// - assistant turn with a `call_01_*` / `call_02_*` tool call and NO
+///   `reasoning_content` in history → 400 "The `reasoning_content` in the
+///   thinking mode must be passed back to the API" (call_01_ verified
+///   2026-08-15; call_02_ verified 2026-08-30, session-1788025620097).
 /// - the same turn WITH `reasoning_content` → 200.
 /// - `call_00_*` tool calls / pure-text turns (no tool call) → 200 without
-///   reasoning. So only thinking-mode tool-call turns require the echo.
+///   reasoning. So the thinking-mode numbering starts at 1; match `call_0N_`
+///   for N ≥ 1 rather than hard-coding a single number, leaving call_00_
+///   (non-thinking) and Anthropic-style ids (toolu_*) out.
 #[must_use]
 pub fn has_thinking_mode_tool_call<I, S>(tool_call_ids: I) -> bool
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    tool_call_ids
-        .into_iter()
-        .any(|id| id.as_ref().starts_with("call_01_"))
+    tool_call_ids.into_iter().any(|id| {
+        let b = id.as_ref().as_bytes();
+        b.len() >= 8
+            && &b[0..6] == b"call_0"
+            && b[6].is_ascii_digit()
+            && b[6] != b'0'
+            && b[7] == b'_'
+    })
 }
 
 /// Strip routing prefix (e.g., "deepseek/deepseek-v4-pro" → "deepseek-v4-pro")
@@ -1227,16 +1235,19 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            // DeepSeek thinking-mode tool calls (`call_01_*`) require the prior
-            // reasoning to be echoed back as `reasoning_content`; omitting it
-            // yields 400. Non-thinking turns don't need it, so we only pay the
-            // context cost when the API actually enforces passback.
+            // DeepSeek thinking-mode tool calls (`call_0N_*`, N ≥ 1) require
+            // the prior reasoning to be echoed back as `reasoning_content`;
+            // omitting it yields 400. Non-thinking turns don't need it, so we
+            // only pay the context cost when the API actually enforces passback.
             //
             // 修复(2026-08-29):回传条件**不依赖 has_reasoning**。会话压缩/微压缩
-            // 会剥离 thinking block,但保留 call_01_* tool call —— 此时
+            // 会剥离 thinking block,但保留 call_0N_* tool call —— 此时
             // has_reasoning=false 会导致占位符不回传,DeepSeek 仍返回 400
             // ("reasoning_content ... must be passed back to the API",线上复现)。
-            // call_01_* 前缀本身就是 thinking 模式的强信号,只要存在即回传。
+            // 修复(2026-08-30):前缀从 call_01_* 放宽到 call_0N_*(N ≥ 1)——
+            // deepseek-v4 已在 thinking 模式生成 call_02_* id(线上复现 400,
+            // 见 has_thinking_mode_tool_call)。call_0N_* 前缀本身就是 thinking
+            // 模式的强信号,只要存在即回传。
             let include_reasoning = model_requires_reasoning_content_in_history(model)
                 || has_thinking_mode_tool_call(&tool_call_ids);
             if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
@@ -1923,6 +1934,44 @@ mod tests {
     }
 
     #[test]
+    fn call_02_tool_call_passback_reasoning_content() {
+        // 回归(2026-08-30,线上复现 session-1788025620097):deepseek-v4 在
+        // thinking 模式生成 `call_02_*` tool call id(此处以真实 id
+        // call_02_vFVFAg79gxanJZdXeWHb5001 复现)。旧实现 has_thinking_mode_
+        // tool_call 只认 call_01_* 前缀 → include_reasoning=false →
+        // reasoning_content 不回传 → API 400。放宽到 call_0N_(N ≥ 1)后
+        // 必须回传占位符。
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    InputContentBlock::ToolUse {
+                        id: "call_02_vFVFAg79gxanJZdXeWHb5001".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({"command": "ls"}),
+                    },
+                ],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
+
+        let assistant = &payload["messages"][0];
+        assert_eq!(
+            assistant["reasoning_content"], json!(REASONING_PLACEHOLDER),
+            "call_02_* tool call 必须回传占位符(call_0N_ N≥1 均为 thinking 模式)"
+        );
+        assert_eq!(
+            assistant["tool_calls"][0]["id"],
+            json!("call_02_vFVFAg79gxanJZdXeWHb5001")
+        );
+    }
+
+    #[test]
     fn non_thinking_tool_call_omits_reasoning_content() {
         // call_00_* 前缀(非 thinking 模式)不需要回传 reasoning_content。
         let request = MessageRequest {
@@ -1956,9 +2005,12 @@ mod tests {
     }
 
     #[test]
-    fn has_thinking_mode_tool_call_detects_call_01_prefix() {
+    fn has_thinking_mode_tool_call_detects_call_0n_prefix() {
         assert!(has_thinking_mode_tool_call(&["call_01_SeY7wrVwpFOzzZR2vM2c9683"]));
+        assert!(has_thinking_mode_tool_call(&["call_02_vFVFAg79gxanJZdXeWHb5001"]));
+        assert!(has_thinking_mode_tool_call(&["call_09_future"]));
         assert!(!has_thinking_mode_tool_call(&["call_00_JvIHk6LO4kk0M9XZHAYR0592"]));
+        assert!(!has_thinking_mode_tool_call(&["call_0_short"]));
         assert!(!has_thinking_mode_tool_call(std::iter::empty::<&str>()));
         assert!(!has_thinking_mode_tool_call(&["toolu_01_abc"]));
     }
