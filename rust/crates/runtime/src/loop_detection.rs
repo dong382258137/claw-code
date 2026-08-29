@@ -12,8 +12,8 @@
 //!   诊断信息写入 NOTEBOOK `<attempted>` 段供下一轮改变策略。
 //!
 //! 阈值:
-//! - 5 次同文件编辑 → `InjectContext("consider reconsidering your approach")`
-//! - 10 次同文件编辑 → `Abort("doom loop detected")`
+//! - 10 次同文件编辑 → `InjectContext("consider reconsidering your approach")`
+//! - 30 次同文件编辑 → `Abort("doom loop detected")`
 //! - 3 次相同 (tool_name, 规范化 input) 调用 → `InjectContext`
 //! - 6 次相同 (tool_name, 规范化 input) 调用 → `Abort`
 //! - 5 次相同 (tool_name, 规范化 output) 调用 → `InjectContext`
@@ -28,10 +28,16 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const WARN_THRESHOLD: u32 = 5;
+/// 同文件编辑触发警告的阈值(Doom Loop 检测)。
+///
+/// 10 次软提醒:给"逐条追加/多轮收敛"的正常编辑留足空间,避免合法工作
+/// (如施工日记逐日补录)在第 5 次就被提示换策略。
+pub const WARN_THRESHOLD: u32 = 10;
 
 /// 同文件编辑触发中止的阈值(Doom Loop 检测)。
-pub const ABORT_THRESHOLD: u32 = 10;
+///
+/// 30 次硬终止:10 次提醒后仍不收敛才算死循环,兜底保护框架。
+pub const ABORT_THRESHOLD: u32 = 30;
 
 /// 相同 (tool_name, 规范化 input) 调用触发警告的阈值。
 ///

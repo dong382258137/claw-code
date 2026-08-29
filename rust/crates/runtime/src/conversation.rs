@@ -1378,7 +1378,7 @@ pub struct ConversationRuntime<C, T> {
     workspace_root: Option<PathBuf>,
     /// Harness O(可观测性)层:Doom Loop 检测器。
     /// 在 PostToolUse hook 中记录每次 Edit/Write/MultiEdit 工具的文件路径,
-    /// 同文件 5 次编辑触发 InjectContext,10 次触发 Abort。详见
+    /// 同文件 10 次编辑触发 InjectContext,30 次触发 Abort。详见
     /// docs/harness-engineering-optimization-plan.md Step 2.2。
     loop_detector: LoopDetector,
     /// LoopDetector Abort 触发时记录的原因;工具循环看到 Some 立即终止 turn。

@@ -682,12 +682,17 @@ fn gzip_len(text: &str) -> usize {
 /// `n = (|gz(memory ∥ event)| - |gz(memory)|) / |gz(event)|`
 /// - memory 与 event 完全相同 → n≈0(冗余)
 /// - memory 与 event 完全不同 → n≈1(新颖)
+///
+/// 注意:DEFLATE 输出长度**无单调性保证**,某些输入下 |gz(memory+event)| <
+/// |gz(memory)|(块边界 / 动态 Huffman 码表重排等),此时 `|gz(combined)| - |gz(m)|`
+/// 为负。用 `saturating_sub` 钳到 0 —— 语义上 event 未带来新压缩信息即视为冗余,
+/// 同时避免 debug 构建下 usize 下溢 panic(线上 crash:history_search.rs:690)。
 #[must_use]
 fn gzip_novelty(memory: &str, event: &str) -> f64 {
     let m_len = gzip_len(memory);
     let combined_len = gzip_len(&format!("{memory}{event}"));
     let e_len = gzip_len(event).max(1);
-    (combined_len - m_len) as f64 / e_len as f64
+    combined_len.saturating_sub(m_len) as f64 / e_len as f64
 }
 
 /// f32 向量 → little-endian 字节(SQLite BLOB 存储)。
@@ -1887,6 +1892,60 @@ mod tests {
     // -----------------------------------------------------------------
     // Phase 3:gzip novelty 门控
     // -----------------------------------------------------------------
+
+    #[test]
+    fn gzip_novelty_never_underflows() {
+        // 回归:线上 crash "attempt to subtract with overflow"(history_search.rs:690,
+        // 见 ~/.claw/claw-crash.log)。DEFLATE 输出长度**无单调性保证**:
+        // 某些输入下 |gz(memory+event)| < |gz(memory)|(块边界 / 动态 Huffman 码表
+        // 重排 / 尾部 stored block 开销),旧实现 `combined_len - m_len` 在 debug
+        // 构建下 usize 下溢 panic。修复:saturating_sub(combined ≤ m_len 视为
+        // event 未带来新压缩信息,novelty 取 0 —— 与公式语义一致)。
+        // 本测试用 checked_sub 复刻旧公式,corpus 中任一对触发下溢即失败。
+        let mut cases: Vec<(String, String)> = vec![
+            // 相同文本(冗余,n≈0)
+            ("user prefers dark mode for code review".into(), "user prefers dark mode for code review".into()),
+            // 迥异长文本(高 novelty)
+            ("user prefers dark mode for code review sessions because it reduces eye strain during long working hours".into(), "rust async runtime tokio worker pool sizing strategy for high concurrency web services with graceful shutdown".into()),
+            // 动态 Huffman 码表重排:memory 大量稀有符号,event 使其中一个变高频
+            ("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()".into(), "a".repeat(1500)),
+            // 可压缩前缀 + 不可压缩尾部
+            ("a".repeat(1900).into(), "b1c2d3e4f5g6h7i8j9k0".into()),
+            // 高重复 event
+            ("hello world\n".repeat(100).into(), "world".repeat(500)),
+            // 中文重复文本
+            ("分部分项节点汇总项目管理进度跟踪记录\n".repeat(60).into(), "分部分项节点汇总项目管理进度跟踪记录".repeat(40)),
+            // 中文 + 完全不同内容
+            ("分部分项节点汇总".repeat(50).into(), "这是完全不同的内容描述测试".repeat(30)),
+            // 生产形态:memory=相似历史消息拼接,event=当前消息
+            ("error: failed to run custom build command for package\nwarning: unused import\n".repeat(30).into(), "error: failed to run custom build command for package dependency".into()),
+            // 边界:空 event / 空 memory
+            ("some memory text".into(), String::new()),
+            (String::new(), "some event text".into()),
+            (String::new(), String::new()),
+        ];
+        // 稀有符号组合(覆盖更多码表形态,保持小 corpus 以兼容 debug 构建速度)
+        for k in 1..=8usize {
+            let rare: String = (0..40u8).map(|i| (b'!' + (i % 20)) as char).collect();
+            let ev = char::from(b'!' + (k % 20) as u8).to_string().repeat(k * 40);
+            cases.push((rare, ev));
+        }
+        for (m, e) in &cases {
+            let m_len = super::gzip_len(m);
+            let combined_len = super::gzip_len(&format!("{m}{e}"));
+            assert!(
+                combined_len.checked_sub(m_len).is_some(),
+                "combined_len {combined_len} < m_len {m_len} → 旧公式下溢(mem_len={}, ev_len={})",
+                m.chars().count(),
+                e.chars().count()
+            );
+            let n = super::gzip_novelty(m, e);
+            assert!(
+                n.is_finite() && n >= 0.0,
+                "gzip_novelty 应返回有限非负值,got {n}"
+            );
+        }
+    }
 
     #[test]
     fn gzip_novelty_identical_text_is_near_zero() {

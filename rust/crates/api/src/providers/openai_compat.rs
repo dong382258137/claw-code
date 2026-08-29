@@ -1231,9 +1231,14 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             // reasoning to be echoed back as `reasoning_content`; omitting it
             // yields 400. Non-thinking turns don't need it, so we only pay the
             // context cost when the API actually enforces passback.
-            let include_reasoning = has_reasoning
-                && (model_requires_reasoning_content_in_history(model)
-                    || has_thinking_mode_tool_call(&tool_call_ids));
+            //
+            // 修复(2026-08-29):回传条件**不依赖 has_reasoning**。会话压缩/微压缩
+            // 会剥离 thinking block,但保留 call_01_* tool call —— 此时
+            // has_reasoning=false 会导致占位符不回传,DeepSeek 仍返回 400
+            // ("reasoning_content ... must be passed back to the API",线上复现)。
+            // call_01_* 前缀本身就是 thinking 模式的强信号,只要存在即回传。
+            let include_reasoning = model_requires_reasoning_content_in_history(model)
+                || has_thinking_mode_tool_call(&tool_call_ids);
             if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
                 Vec::new()
             } else {
@@ -1877,6 +1882,44 @@ mod tests {
         let assistant = &payload["messages"][0];
         assert_eq!(assistant["reasoning_content"], json!(REASONING_PLACEHOLDER));
         assert_eq!(assistant["tool_calls"][0]["id"], json!("call_01_SeY7wrVwpFOzzZR2vM2c9683"));
+    }
+
+    #[test]
+    fn thinking_tool_call_passback_survives_stripped_thinking() {
+        // 回归(2026-08-29,线上复现):会话压缩/微压缩剥离 thinking block 后,
+        // assistant 消息只剩 call_01_* tool call。旧实现要求 has_reasoning=true
+        // 才回传 reasoning_content,此时 has_reasoning=false → 不回传 → DeepSeek
+        // 400 ("reasoning_content ... must be passed back to the API")。
+        // call_01_* 前缀本身即 thinking 模式强信号,占位符必须无条件回传。
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    // 无 Thinking block —— 压缩后被剥离的真实形态
+                    InputContentBlock::ToolUse {
+                        id: "call_01_SrippedThinkingToolCall0001".to_string(),
+                        name: "notebook_update".to_string(),
+                        input: json!({"section": "attempted"}),
+                    },
+                ],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
+
+        let assistant = &payload["messages"][0];
+        assert_eq!(
+            assistant["reasoning_content"], json!(REASONING_PLACEHOLDER),
+            "thinking 被剥离后 call_01_* tool call 仍必须回传占位符"
+        );
+        assert_eq!(
+            assistant["tool_calls"][0]["id"],
+            json!("call_01_SrippedThinkingToolCall0001")
+        );
     }
 
     #[test]
