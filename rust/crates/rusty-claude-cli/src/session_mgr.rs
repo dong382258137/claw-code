@@ -23,11 +23,11 @@ use crate::{
     classify_error_kind, classify_session_lifecycle_for, default_permission_mode,
     format_compact_report, format_cost_report, format_sandbox_report, format_status_report,
     format_unknown_slash_command, handle_bg_command, handle_bus_command, handle_goal_command,
-    handle_im_command, handle_poor_mode_action, init_json_value, render_config_json, render_config_report,
-    render_diff_json_for, render_diff_report_for, render_doctor_report, render_export_text,
-    render_memory_json, render_memory_report, render_repl_help, render_version_report,
-    sandbox_json_value, split_error_hint, status_context, status_json_value, version_json_value,
-    CliOutputFormat, StatusUsage, STUB_COMMANDS,
+    handle_im_command, handle_poor_mode_action, init_json_value, render_config_json,
+    render_config_report, render_diff_json_for, render_diff_report_for, render_doctor_report,
+    render_export_text, render_memory_json, render_memory_report, render_repl_help,
+    render_version_report, sandbox_json_value, split_error_hint, status_context, status_json_value,
+    version_json_value, CliOutputFormat, StatusUsage, STUB_COMMANDS,
 };
 
 pub(crate) const PRIMARY_SESSION_EXTENSION: &str = "jsonl";

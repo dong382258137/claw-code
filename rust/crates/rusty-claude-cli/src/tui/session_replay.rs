@@ -77,10 +77,7 @@ pub(crate) fn load_history_entries(
                     let summary = if thinking.is_empty() {
                         "\n▶ Thinking hidden\n".to_string()
                     } else {
-                        format!(
-                            "\n▶ Thinking ({} chars hidden)\n",
-                            thinking.chars().count()
-                        )
+                        format!("\n▶ Thinking ({} chars hidden)\n", thinking.chars().count())
                     };
                     buf.push_entry(OutputEntry::thinking(summary));
                 }
@@ -103,10 +100,7 @@ pub(crate) fn load_history_entries(
                     buf.push_entry(OutputEntry::tool_card_start(id, name, input));
                 }
                 "tool_result" => {
-                    let tool_use_id = b
-                        .get("tool_use_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let tool_use_id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
                     let tool_name = b
                         .get("tool_name")
                         .and_then(|v| v.as_str())
@@ -116,10 +110,7 @@ pub(crate) fn load_history_entries(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let is_error = b
-                        .get("is_error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                    let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                     if tool_use_id.is_empty() {
                         buf.complete_tool_card_by_name(tool_name, output, is_error);
                     } else {
@@ -140,8 +131,7 @@ mod tests {
 
     fn write_tmp_session(lines: &[&str]) -> std::path::PathBuf {
         // 用 target/tmp（不用 %TEMP%，避免触发 TRAE CN 监听）。
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/tmp");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
         std::fs::create_dir_all(&dir).unwrap();
         // 文件名加纳秒时间戳：多个测试并行运行（cargo test 默认线程并行）
         // 时避免共用同一 pid 文件互相覆盖/删除。

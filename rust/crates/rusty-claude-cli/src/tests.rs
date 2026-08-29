@@ -1354,8 +1354,12 @@ fn harness_subcommand_parses_list_stats_rollback_evolve() {
         }
     );
     assert_eq!(
-        parse_args(&["harness".to_string(), "rollback".to_string(), "--all".to_string()])
-            .expect("harness rollback --all should parse"),
+        parse_args(&[
+            "harness".to_string(),
+            "rollback".to_string(),
+            "--all".to_string()
+        ])
+        .expect("harness rollback --all should parse"),
         CliAction::Harness {
             subcommand: HarnessCommand::RollbackAll,
             output_format: CliOutputFormat::Text,
@@ -1389,19 +1393,18 @@ fn harness_subcommand_parses_list_stats_rollback_evolve() {
             output_format: CliOutputFormat::Text,
         }
     );
-    let no_dry_run =
-        parse_args(&["harness".to_string(), "evolve".to_string()])
-            .expect_err("evolve without --dry-run should be rejected");
+    let no_dry_run = parse_args(&["harness".to_string(), "evolve".to_string()])
+        .expect_err("evolve without --dry-run should be rejected");
     assert!(no_dry_run.contains("--dry-run"), "got: {no_dry_run}");
     let unknown = parse_args(&["harness".to_string(), "wat".to_string()])
         .expect_err("unknown harness subcommand should be rejected");
-    assert!(unknown.contains("unknown harness subcommand"), "got: {unknown}");
-    let missing = parse_args(&["harness".to_string()])
-        .expect_err("bare harness should require a subcommand");
     assert!(
-        missing.contains("requires a subcommand"),
-        "got: {missing}"
+        unknown.contains("unknown harness subcommand"),
+        "got: {unknown}"
     );
+    let missing =
+        parse_args(&["harness".to_string()]).expect_err("bare harness should require a subcommand");
+    assert!(missing.contains("requires a subcommand"), "got: {missing}");
 }
 
 #[test]

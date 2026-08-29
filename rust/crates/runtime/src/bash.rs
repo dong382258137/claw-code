@@ -548,10 +548,7 @@ async fn execute_bash_async(
 /// busy loop 是无输出但 CPU 持续增长（疑似无谓的空转循环，如
 /// `for i in range(huge): pass`）。这类循环会骗过 idle 检测
 /// （CPU 增长 = 活跃），必须单独识别并在远短于 1h 硬上限时提前 kill。
-fn busy_loop_output(
-    input: &BashCommandInput,
-    sandbox_status: SandboxStatus,
-) -> BashCommandOutput {
+fn busy_loop_output(input: &BashCommandInput, sandbox_status: SandboxStatus) -> BashCommandOutput {
     let guidance = "\n\n[Busy-loop kill] Command ran with no output but sustained CPU for a long window; \
          likely a CPU-spinning loop (e.g. `for i in range(huge): pass`).\n\
          Suggestions:\n\
@@ -1993,10 +1990,7 @@ mod activity_monitor {
                     _ => {}
                 }
             }
-            assert!(
-                done,
-                "无输出 + 持续 CPU 增长应在忙等窗口内判定为 BusyLoop"
-            );
+            assert!(done, "无输出 + 持续 CPU 增长应在忙等窗口内判定为 BusyLoop");
         }
 
         #[cfg(windows)]

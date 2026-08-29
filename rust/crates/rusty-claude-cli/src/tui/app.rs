@@ -659,7 +659,7 @@ fn run_event_loop(
         .map(|c| c.lines().count())
         .unwrap_or(0);
     const HISTORY_BATCH: usize = 50; // 单次回看加载的 JSONL 行数
-    // cli_holder: Some when idle, None when a turn is running in a thread
+                                     // cli_holder: Some when idle, None when a turn is running in a thread
     let mut cli_holder: Option<LiveCli> = Some(cli);
     // Turn completion channel: Some when a turn is running
     let mut turn_rx: Option<mpsc::Receiver<TurnResult>> = None;

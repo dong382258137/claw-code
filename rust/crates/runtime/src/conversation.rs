@@ -54,13 +54,8 @@ use crate::lane_events::{try_publish as publish_lane_event, LaneEvent};
 // 决定 Continue / InjectContext / Abort。详见
 // docs/harness-engineering-optimization-plan.md Step 2.2。
 use crate::loop_detection::{LoopAction, LoopDetector, COG_STALL_LESSON};
-use crate::slop_scanner::{extract_scan_target, is_file_modifying_tool, SlopScanner};
-// Harness C(Context Management)层接入:ContextAssembler 统一 prompt 注入。
-// 当注入时,PlanArtifact render 通过 assembler 收集到 Goal source,
-// 取 volatile_content() 作为 dynamic_sections。详见
-// docs/harness-engineering-optimization-plan.md Step 2.3。
-use crate::context_assembler::{ContextAssembler, ContextSource};
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::slop_scanner::{extract_scan_target, is_file_modifying_tool, SlopScanner};
 use crate::trace_analyzer::{TraceAnalyzer, TraceRecord};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::worker_boot::WorkerFailureKind;
@@ -78,6 +73,18 @@ const MICROCOMPACT_PRESERVE_RECENT: usize = 5;
 /// More aggressive preserve window used when recovering from a prompt-too-long
 /// error. Only the two most recent tool results are kept verbatim.
 const REACTIVE_MICROCOMPACT_PRESERVE_RECENT: usize = 2;
+
+/// 冻结槽位块最大字符数上限(≈12K tokens @2 chars/tok):防止末尾注入块
+/// 过大挤占上下文预算(超出时从后向前截断)。
+const RUNTIME_HINTS_MAX_CHARS: usize = 24_000;
+/// 冻结槽位块固定框架头。字节稳定(槽位顺序固定、空槽省略),便于
+/// 缓存命中率归因:任何尾部内容变化都不影响 system + 历史前缀。
+const RUNTIME_HINTS_HEADER: &str = "\
+# Runtime Context
+
+以下为系统自动注入的运行时上下文,槽位顺序固定、无内容的槽位自动省略：
+工作记忆、活跃计划、步骤状态、任务状态、语义召回、校验补救、
+认知停滞、压缩提醒、归档召回、会话交接、教训指令,最后为执行风格要求。";
 
 /// 微压缩保留窗口(默认 5,微软实证最优)。`CLAW_COMPACT_PRESERVE_RECENT`
 /// 环境变量可覆盖(1-10),便于按会话/工作负载微调 —— 长链任务可调高,
@@ -1403,18 +1410,12 @@ pub struct ConversationRuntime<C, T> {
     /// 改进点 7:`settings.completionVerifyCommands` 配置覆盖。
     /// 非空时优先于 `detect_project_commands` 的自动探测。
     completion_verify_commands: Vec<String>,
-    /// Harness C(Context Management)层:统一 prompt 注入器。
-    /// `None` 时走原 SystemPromptSplit + 手动 push 逻辑;
-    /// `Some` 时 PlanArtifact render 通过 assembler 收集到 Goal source,
-    /// 取 volatile_content() 作为 dynamic_sections。详见
-    /// docs/harness-engineering-optimization-plan.md Step 2.3。
-    context_assembler: Option<ContextAssembler>,
     /// BUG-6 修复:语义召回结果,在 run_turn 入口填充,request 构造时注入。
     ///
     /// 当 persistent_memory 存在时,run_turn 入口调用
     /// `persistent_memory.semantic_recall(user_input, k=3)` 获取 top-3 记忆,
-    /// 渲染成文本块存到此字段。request 构造时通过 ContextAssembler Memory
-    /// source 或手动 push 注入到 dynamic_sections。turn 结束时清空。
+    /// 渲染成文本块存到此字段。request 构造时以"冻结槽位"方式追加到
+    /// messages 末尾(见 render_runtime_hints)。turn 结束时清空。
     /// 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
     pending_semantic_context: Option<String>,
     /// BUG-7 修复:Harness V(验证)层接入 — VerifierAgent。
@@ -1876,7 +1877,6 @@ where
                 .completion_verify_commands()
                 .map(|cmds| cmds.to_vec())
                 .unwrap_or_default(),
-            context_assembler: None,
             pending_semantic_context: None,
             verifier_agent: None,
             trace_analyzer: None,
@@ -2144,27 +2144,6 @@ where
     ) -> Self {
         self.refactor_tx = Some(tx);
         self
-    }
-
-    /// BUG-5 修复:注入 ContextAssembler,启用统一 prompt 注入路径。
-    ///
-    /// 注入后,每个 turn 构造 request 时会:
-    /// 1. clone 一份 assembler(避免污染状态);
-    /// 2. clear 所有 source;
-    /// 3. 把 PlanArtifact render 后 add 到 Goal source;
-    /// 4. 调用 assemble() 取 volatile_content() 作为 dynamic_sections。
-    ///
-    /// 不注入时走原 SystemPromptSplit + 手动 push 逻辑,保持向后兼容。
-    /// 详见 docs/harness-engineering-optimization-plan.md Step 2.3。
-    #[must_use]
-    pub fn with_context_assembler(mut self, assembler: ContextAssembler) -> Self {
-        self.context_assembler = Some(assembler);
-        self
-    }
-
-    /// `&mut self` 版本的 `with_context_assembler`,用于已构造的 runtime。
-    pub fn set_context_assembler(&mut self, assembler: ContextAssembler) {
-        self.context_assembler = Some(assembler);
     }
 
     /// BUG-7 修复:注入 VerifierAgent,启用 acceptance_criteria 真实校验。
@@ -3105,201 +3084,23 @@ where
             let request = {
                 let sliced =
                     crate::compact::get_messages_after_compact_boundary(&self.session.messages);
-                // Harness O(编排)层:PlanArtifact 末尾追加到 system_prompt。
-                // 缓存保护(§5.2):把 PlanArtifact 渲染成文本块,
-                // 末尾追加到 dynamic_sections,不破坏前面 4 层缓存。
-                //
-                // BUG-5 修复:当注入 ContextAssembler 时,通过 assembler
-                // 收集 PlanArtifact render 到 Goal source,取 volatile_content()
-                // 作为 dynamic_sections;否则走原手动 push 逻辑。
-                //
-                // BUG-6 修复:语义召回结果(pending_semantic_context)同样
-                // 通过 assembler Memory source 或手动 push 注入。
-                let mut system_split = SystemPromptSplit::from_sections(self.system_prompt.clone());
-                // P0-1:NOTEBOOK 注入 — 跨压缩持久化的工作记忆。
-                // Anthropic《Effective Context Engineering》明确推荐:structured
-                // note-taking 是长程任务的关键技术,每个 turn 注入到 system_prompt
-                // 变动区,确保 LLM 始终能看到关键信息(决策、子智能体注册表、
-                // 已尝试方案、用户偏好、关键文件引用)。
-                //
-                // 关键不变量:NOTEBOOK.md 不在 message history 中,因此
-                // microcompact / compact_session 不会影响它。它通过 system_prompt
-                // 变动区每个 turn 重新注入,这是 Anthropic 推荐的标准模式。
-                //
-                // 注意:放在 assembler/手动注入路径之前,确保 NOTEBOOK 是变动区
-                // 的第一段(LLM 最先看到的工作记忆)。
-                if let Some(workspace_root) = &self.workspace_root {
-                    if let Ok(notebook) = crate::notebook::Notebook::load(workspace_root) {
-                        let notebook_prompt = notebook.render_for_prompt();
-                        if !notebook_prompt.is_empty() {
-                            // 明确给出 NOTEBOOK.md 的完整路径,避免 LLM 用
-                            // read_file 读取原始文件时猜测根目录路径
-                            // (NOTEBOOK.md 实际位于 .claw/ 下)而报 os error 2。
-                            system_split.dynamic_sections.push(format!(
-                                "NOTEBOOK 原始文件位于 `{}`(需要时可用 read_file 读取)。\n\n{}",
-                                workspace_root
-                                    .join(crate::notebook::NOTEBOOK_FILENAME)
-                                    .display(),
-                                notebook_prompt
-                            ));
-                        }
-                    }
-                    // NOTEBOOK 加载失败时不阻塞 turn(避免 NOTEBOOK 文件损坏
-                    // 导致整个 agent 无法运行),但记录到 stderr 供排查。
-                    // 实际加载错误在 else 分支已经被静默忽略(load 返回 Ok(empty)),
-                    // 只有 parse 错误才会进入 Err,这里不额外日志。
-
-                    // P0-3:压缩后 NOTEBOOK 刷新提醒。
-                    // 当 microcompact / auto_compaction / reactive compaction
-                    // 压缩了 tool result 后,flag 被置 true。这里注入提醒,
-                    // 引导 LLM 主动调用 notebook_update 刷新 <plan> 和 <subagents>
-                    // 段,确保关键信息(决策、子智能体注册表)在后续压缩中不丢失。
-                    // LLM 调用 notebook_update 后,execute_notebook_update 清除 flag。
-                    if self.notebook_refresh_pending {
-                        system_split.dynamic_sections.push(
-                            "# ⚠️ Context Compaction Detected — NOTEBOOK Refresh Required\n\
-                             上下文刚刚被压缩,部分旧 tool result 已被摘要替换。\n\
-                             **请立即调用 `notebook_update` 工具**刷新以下段:\n\
-                             - `<plan>`:当前任务的关键决策、约束、进度(若已变化)\n\
-                             - `<subagents>`:已 dispatch 的子智能体注册表(防止重复 dispatch)\n\
-                             - `<attempted>`:已尝试的方案(防止重复尝试失败方案)\n\
-                             这是防止长程任务中关键信息丢失的关键步骤。"
-                                .to_string(),
-                        );
-                    }
-
-                    // Phase 3(self-evolving harness):注入生效中的 harness edits
-                    // (全量注入,≤10 条)。每条内容为一段"失败教训 → 应对策略"
-                    // 指令,引导 LLM 在本 turn 避免重复犯同类错误。读取失败
-                    // (如 db 损坏)时静默跳过,不阻塞 turn。
-                    if let Some(archive) = &self.harness_archive {
-                        if let Ok(edit_sections) =
-                            crate::harness_evolution::render_for_injection(archive)
-                        {
-                            for section in edit_sections {
-                                system_split.dynamic_sections.push(section);
-                            }
-                        }
-                    }
-
-                    // 改进点 13:压缩后主动列出可 recall 的归档 tool result。
-                    // auto_compaction 删除了旧消息,但原始 tool result 已通过
-                    // microcompact 的 archiver 归档到 .claw/tool_results_archive.jsonl。
-                    // 这里列出最近的归档摘要,引导 LLM 在需要原始数据(如实验数值、
-                    // 完整文件内容)时调用 `recall_full` 工具按 tool_use_id 检索。
-                    // 一次性注入:注入后立即清除 flag,避免每 turn 重复注入。
-                    if self.archive_recall_hint_pending {
-                        self.archive_recall_hint_pending = false;
-                        if let Ok(summaries) =
-                            crate::tool_result_archive::list_archived_summary(workspace_root)
-                        {
-                            if !summaries.is_empty() {
-                                // 取最近 10 条归档(文件中靠后的更新),避免列表过长
-                                let recent: Vec<&(String, String, String, u64)> =
-                                    summaries.iter().rev().take(10).collect();
-                                let mut hint = String::with_capacity(512);
-                                hint.push_str(
-                                    "# 📦 Archived Tool Results Available for Recall\n\
-                                     上下文压缩已发生,部分旧 tool result 的原始内容已归档。\n\
-                                     若需要原始数据(完整文件内容、实验数值、命令输出等),\n\
-                                     可调用 `recall_full` 工具按 tool_use_id 检索。\n\
-                                     最近归档(最多 10 条):\n",
-                                );
-                                for (id, name, preview, _ts) in recent {
-                                    let p: String = preview.chars().take(60).collect();
-                                    hint.push_str(&format!("- id={id} tool={name} preview={p}\n"));
-                                }
-                                hint.push_str(
-                                    "调用示例:recall_full({\"tool_use_id\": \"<id>\"})\n\
-                                     或 recall_full({\"list_only\": true}) 查看全部归档。",
-                                );
-                                system_split.dynamic_sections.push(hint);
-                            }
-                        }
-                    }
-
-                    // 方案 C:跨会话 plan stale 检测。
-                    // 上一会话结束时通过 mark_plan_stale 写入标记文件,本会话
-                    // 首 turn 检测到则注入提醒,引导 LLM 调用 notebook_update
-                    // 把上一会话的任务摘要写入 <plan>,让本会话后续 turn 能看到。
-                    // 清除时机:LLM 成功调用 notebook_update 后由
-                    // execute_notebook_update 触发 clear_plan_stale。
-                    if crate::notebook::is_plan_stale(workspace_root) {
-                        system_split.dynamic_sections.push(
-                            "# 📝 New Session — NOTEBOOK <plan> Refresh Recommended\n\
-                             这是新会话的首个 turn,上一会话结束时标记了 <plan> 为 stale。\n\
-                             **请在处理完当前用户请求后,调用 `notebook_update` 工具**,\n\
-                             把上一会话的任务摘要写入 `<plan>` 段(若当前任务已变化):\n\
-                             - 本次会话的目标 / 关键决策 / 约束 / 进度\n\
-                             这样后续 turn 和下一会话能零延迟知道任务状态。\n\
-                             若当前任务与上一会话无关,可忽略此提醒。"
-                                .to_string(),
-                        );
-                    }
-                }
-                if let Some(assembler) = &self.context_assembler {
-                    // 统一注入路径:把所有动态内容通过 assembler 收集。
-                    let mut asm = assembler.clone();
-                    asm.clear();
-                    if let Some(memory_ctx) = &self.pending_semantic_context {
-                        asm.add_auto(ContextSource::Memory, memory_ctx.clone());
-                    }
-                    if let Some(plan) = &self.active_plan {
-                        let rendered = plan.render_skeleton();
-                        if !rendered.is_empty() {
-                            asm.add_auto(ContextSource::Goal, rendered);
-                        }
-                    }
-                    if let Some(remediation) = &self.pending_remediation {
-                        // v2.0:注入上一轮 verify 失败的 remediation。
-                        // 顺序:放在 plan 之后(变动区最末尾),
-                        // 让最易变的内容放最后,最大化前缀缓存命中率。
-                        asm.add_auto(ContextSource::Goal, remediation.clone());
-                    }
-                    if let Some(cog_stall) = &self.pending_cog_stall {
-                        // 认知停滞溯源提示:放在 remediation 之后(变动区最末尾),
-                        // 同样为了最大化前缀缓存命中率。
-                        asm.add_auto(ContextSource::Goal, cog_stall.clone());
-                    }
-                    let volatile = asm.assemble().volatile_content();
-                    if !volatile.is_empty() {
-                        system_split.dynamic_sections.push(volatile);
-                    }
-                } else {
-                    // 原生路径:手动 push 到 dynamic_sections。
-                    if let Some(memory_ctx) = &self.pending_semantic_context {
-                        system_split.dynamic_sections.push(memory_ctx.clone());
-                    }
-                    if let Some(plan) = &self.active_plan {
-                        let rendered = plan.render_skeleton();
-                        if !rendered.is_empty() {
-                            system_split.dynamic_sections.push(rendered);
-                        }
-                    }
-                    if let Some(remediation) = &self.pending_remediation {
-                        // v2.0:注入上一轮 verify 失败的 remediation。
-                        // 顺序:放在 plan 之后(变动区最末尾),
-                        // 让最易变的内容放最后,最大化前缀缓存命中率。
-                        system_split.dynamic_sections.push(remediation.clone());
-                    }
-                    if let Some(cog_stall) = &self.pending_cog_stall {
-                        // 认知停滞溯源提示:放在 remediation 之后(变动区最末尾),
-                        // 同样为了最大化前缀缓存命中率。
-                        system_split.dynamic_sections.push(cog_stall.clone());
-                    }
-                    // Task State / lessons 注入已迁移到 messages 末尾(见下方
-                    // messages.push 区域):两者由 runtime 规则式每 turn 更新
-                    // (findings 滑动窗口/lessons 落盘),放在 dynamic_sections
-                    // 会随每次更新打断 system 前缀缓存;放 messages 末尾只
-                    // 影响最后一条请求消息(session-1786886590898 实测
-                    // dynamic_section_changed ×10 的主要变源)。
-                    // Verbosity steering(Headroom Output Token Reduction 对标):
-                    // 在 dynamic 区末尾追加简洁指令,引导模型减少 output token。
-                    // 放 dynamic 区不影响 static 缓存前缀;内容常量,不破坏隐式前缀缓存。
-                    // 不复述上下文中已有的代码/文件内容,直接给出结论和行动。
-                    system_split.dynamic_sections.push(
-                        "Be concise. Do not restate context, repeat code already shown, or preface actions with restatements. Lead with the answer or the change.".to_string()
-                    );
+                // 统一收口(建议2):所有易变运行时内容(NOTEBOOK/计划骨架/步骤状态/
+                // 任务状态/语义召回/补救/认知停滞/各类提醒/教训指令/风格指令)
+                // 统一渲染成 messages 末尾的**单条冻结槽位块**。system_prompt
+                // 的 dynamic_sections 不再接收任何本层 push 的内容 —— 前缀
+                // (system + tools + 历史 messages)因不再被中途动态内容扰动而
+                // 保持字节稳定,变化只发生在最后一条请求消息,turn 间隐式
+                // 前缀缓存全量命中(目标 97%+)。自 BUG-5/BUG-6 起引入的
+                // ContextAssembler 双路径(assembler 注入 vs 手动 push)已删除,
+                // 只保留单一收口路径,降低复杂度并消除两条路径的行为漂移。
+                let system_split = SystemPromptSplit::from_sections(self.system_prompt.clone());
+                // 消费性内容在渲染后清空(见下方),保证下一 turn 不重复注入。
+                let mut messages = sliced.to_vec();
+                // 冻结槽位块:单条 user 消息。内容变化只影响这条消息,不破坏
+                // 前缀缓存;槽位顺序固定(与 system_prompt 变动区隔离),空槽
+                // 自动省略,框架头字节稳定,便于命中率归因分析。
+                if let Some(hints) = self.render_runtime_hints() {
+                    messages.push(ConversationMessage::user_text(hints));
                 }
                 // BUG 修复:pending_remediation 在此清空(读取后立即消费),
                 // 而非 turn 结束时清空。否则 Review 阶段新设置的 remediation
@@ -3308,47 +3109,6 @@ where
                 // 需要存活到下一 turn 被读取。
                 self.pending_remediation = None;
                 self.pending_cog_stall = None;
-                // 缓存保护(§5.2-enhanced):PlanArtifact 的 status_delta
-                // (step 状态标签 ⏳→▶→✓)每 turn 变化,若放在 system_prompt
-                // 的 dynamic_sections 会破坏隐式前缀缓存,导致之后的 tools
-                // 和 messages 全部 miss。改为追加到 messages 末尾,只影响
-                // 最后一条 message,system_prompt + tools + 历史 messages
-                // 全部保持 cache 命中。预期命中率从 88-92% 回升到 97%+。
-                let mut messages = sliced.to_vec();
-                if let Some(plan) = &self.active_plan {
-                    let delta = plan.render_status_delta();
-                    if !delta.is_empty() {
-                        messages.push(ConversationMessage::user_text(delta));
-                    }
-                }
-                // Task State + lessons 注入(messages 末尾模式,与 status_delta
-                // 同理):两者由 runtime 规则式每 turn 更新,若放 system 动态区
-                // 会随更新打断前缀缓存;追加到请求 messages 末尾只影响最后
-                // 一条消息,system_prompt + tools + 历史 messages 保持命中。
-                // 请求构造时追加,不写入 session —— 无累积。
-                // 注入条件与旧动态区实现一致:仅当会话经历过压缩。
-                if crate::compact::extract_compact_boundary(&self.session.messages).is_some() {
-                    let mut epilogue = String::new();
-                    if let Some(state) = &self.task_state {
-                        let rendered = state.render_for_prompt();
-                        if !rendered.is_empty() {
-                            epilogue.push_str(&rendered);
-                        }
-                    }
-                    if let Some(root) = &self.workspace_root {
-                        let recent = crate::lessons::load_recent_lessons(
-                            root,
-                            crate::lessons::LESSONS_INJECT_MAX,
-                        );
-                        let rendered = crate::lessons::render_for_prompt(&recent);
-                        if !rendered.is_empty() {
-                            epilogue.push_str(&rendered);
-                        }
-                    }
-                    if !epilogue.is_empty() {
-                        messages.push(ConversationMessage::user_text(epilogue));
-                    }
-                }
                 ApiRequest {
                     system_prompt: system_split,
                     messages,
@@ -5444,6 +5204,184 @@ where
         }
     }
 
+    /// 建议2(统一收口)— 渲染 messages 末尾的单条"冻结槽位块"。
+    ///
+    /// 按固定槽位顺序收集当前 turn 的易变运行时内容,交给
+    /// [`build_runtime_hints_block`] 拼装;全部槽位为空时返回 `None`,
+    /// 请求构造则不追加尾部消息。任何内容变化都只影响这条尾部消息,
+    /// 不破坏 system + tools + 历史 messages 的隐式前缀缓存。
+    ///
+    /// 副作用:仅 `archive_recall_hint_pending` 在读取归档列表后立即消费
+    /// (与旧实现一致,避免每 turn 重复注入);其余 flag(notebook_refresh /
+    /// plan_stale)保持旧语义 —— 由 notebook_update / clear_plan_stale 清除。
+    fn render_runtime_hints(&mut self) -> Option<String> {
+        let mut slots: Vec<(&str, String)> = Vec::with_capacity(13);
+
+        // 槽位 1:NOTEBOOK(工作记忆)— 跨压缩持久化,每 turn 重新注入。
+        // 明确给出 NOTEBOOK.md 的完整路径,避免 LLM 用 read_file 读取原始
+        // 文件时猜测根目录路径(NOTEBOOK.md 实际位于 .claw/ 下)而报
+        // os error 2。加载失败时不阻塞 turn(静默跳过)。
+        if let Some(root) = &self.workspace_root {
+            if let Some(prompt) = crate::notebook::Notebook::load(root)
+                .ok()
+                .map(|notebook| notebook.render_for_prompt())
+                .filter(|prompt| !prompt.is_empty())
+            {
+                slots.push((
+                    "Notebook(工作记忆)",
+                    format!(
+                        "NOTEBOOK 原始文件位于 `{}`(需要时可用 read_file 读取)。\n\n{}",
+                        root.join(crate::notebook::NOTEBOOK_FILENAME).display(),
+                        prompt
+                    ),
+                ));
+            }
+        }
+
+        // 槽位 2:Active Plan 骨架(计划结构,低频变化)。
+        if let Some(plan) = &self.active_plan {
+            let rendered = plan.render_skeleton();
+            if !rendered.is_empty() {
+                slots.push(("Active Plan", rendered));
+            }
+        }
+
+        // 槽位 3:Step Status(状态标签 ⏳→▶→✓,每 turn 变化)。
+        if let Some(plan) = &self.active_plan {
+            let delta = plan.render_status_delta();
+            if !delta.is_empty() {
+                slots.push(("Step Status", delta));
+            }
+        }
+
+        // 槽位 4:Task State + lessons 锚点(仅当会话经历过压缩时注入,
+        // 让压缩后的 AI 仍持有任务锚点,与旧实现条件一致)。
+        if crate::compact::extract_compact_boundary(&self.session.messages).is_some() {
+            let mut epilogue = String::new();
+            if let Some(state) = &self.task_state {
+                let rendered = state.render_for_prompt();
+                if !rendered.is_empty() {
+                    epilogue.push_str(&rendered);
+                }
+            }
+            if let Some(root) = &self.workspace_root {
+                let recent =
+                    crate::lessons::load_recent_lessons(root, crate::lessons::LESSONS_INJECT_MAX);
+                let rendered = crate::lessons::render_for_prompt(&recent);
+                if !rendered.is_empty() {
+                    epilogue.push_str(&rendered);
+                }
+            }
+            if !epilogue.is_empty() {
+                slots.push(("Task State & Lessons", epilogue));
+            }
+        }
+
+        // 槽位 5:语义召回结果(每 turn 的 top-k 记忆)。
+        if let Some(memory_ctx) = &self.pending_semantic_context {
+            slots.push(("Semantic Memory Recall", memory_ctx.clone()));
+        }
+
+        // 槽位 6:上一轮 verify 失败的 remediation(读取后由请求构造清空)。
+        if let Some(remediation) = &self.pending_remediation {
+            slots.push(("Verification Remediation", remediation.clone()));
+        }
+
+        // 槽位 7:认知停滞溯源提示(同上,一次性消费)。
+        if let Some(cog_stall) = &self.pending_cog_stall {
+            slots.push(("Cognitive Stall", cog_stall.clone()));
+        }
+
+        // 槽位 8:压缩后 NOTEBOOK 刷新提醒(flag 由 execute_notebook_update 清除)。
+        if self.notebook_refresh_pending {
+            slots.push((
+                "Compaction Notice",
+                "# ⚠️ Context Compaction Detected — NOTEBOOK Refresh Required\n\
+                 上下文刚刚被压缩,部分旧 tool result 已被摘要替换。\n\
+                 **请立即调用 `notebook_update` 工具**刷新以下段:\n\
+                 - `<plan>`:当前任务的关键决策、约束、进度(若已变化)\n\
+                 - `<subagents>`:已 dispatch 的子智能体注册表(防止重复 dispatch)\n\
+                 - `<attempted>`:已尝试的方案(防止重复尝试失败方案)\n\
+                 这是防止长程任务中关键信息丢失的关键步骤。"
+                    .to_string(),
+            ));
+        }
+
+        // 槽位 9:归档 tool result 召回提示(一次性注入,读取后立即清 flag)。
+        let mut archive_hint: Option<String> = None;
+        if self.archive_recall_hint_pending {
+            self.archive_recall_hint_pending = false;
+            if let Some(root) = &self.workspace_root {
+                if let Ok(summaries) = crate::tool_result_archive::list_archived_summary(root) {
+                    if !summaries.is_empty() {
+                        // 取最近 10 条归档(文件中靠后的更新),避免列表过长
+                        let recent: Vec<&(String, String, String, u64)> =
+                            summaries.iter().rev().take(10).collect();
+                        let mut hint = String::with_capacity(512);
+                        hint.push_str(
+                            "# 📦 Archived Tool Results Available for Recall\n\
+                             上下文压缩已发生,部分旧 tool result 的原始内容已归档。\n\
+                             若需要原始数据(完整文件内容、实验数值、命令输出等),\n\
+                             可调用 `recall_full` 工具按 tool_use_id 检索。\n\
+                             最近归档(最多 10 条):\n",
+                        );
+                        for (id, name, preview, _ts) in recent {
+                            let p: String = preview.chars().take(60).collect();
+                            hint.push_str(&format!("- id={id} tool={name} preview={p}\n"));
+                        }
+                        hint.push_str(
+                            "调用示例:recall_full({\"tool_use_id\": \"<id>\"})\n\
+                             或 recall_full({\"list_only\": true}) 查看全部归档。",
+                        );
+                        archive_hint = Some(hint);
+                    }
+                }
+            }
+        }
+        if let Some(hint) = archive_hint {
+            slots.push(("Archived Tool Results", hint));
+        }
+
+        // 槽位 10:跨会话 plan stale 提醒(flag 由 clear_plan_stale 清除)。
+        if let Some(root) = &self.workspace_root {
+            if crate::notebook::is_plan_stale(root) {
+                slots.push((
+                    "Session Handoff",
+                    "# 📝 New Session — NOTEBOOK <plan> Refresh Recommended\n\
+                     这是新会话的首个 turn,上一会话结束时标记了 <plan> 为 stale。\n\
+                     **请在处理完当前用户请求后,调用 `notebook_update` 工具**,\n\
+                     把上一会话的任务摘要写入 `<plan>` 段(若当前任务已变化):\n\
+                     - 本次会话的目标 / 关键决策 / 约束 / 进度\n\
+                     这样后续 turn 和下一会话能零延迟知道任务状态。\n\
+                     若当前任务与上一会话无关,可忽略此提醒。"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // 槽位 11:生效中的 harness edits(失败教训 → 应对策略指令,≤10 条)。
+        // 读取失败(如 db 损坏)时静默跳过,不阻塞 turn。
+        if let Some(archive) = &self.harness_archive {
+            if let Ok(edit_sections) = crate::harness_evolution::render_for_injection(archive) {
+                if !edit_sections.is_empty() {
+                    slots.push(("Harness Lessons", edit_sections.join("\n\n")));
+                }
+            }
+        }
+
+        // 槽位 12:执行风格要求(常量,Verbosity steering)。
+        slots.push((
+            "Execution Style",
+            "Be concise. Do not restate context, repeat code already shown, or preface actions with restatements. Lead with the answer or the change.".to_string(),
+        ));
+
+        let refs: Vec<(&str, &str)> = slots
+            .iter()
+            .map(|(heading, content)| (*heading, content.as_str()))
+            .collect();
+        build_runtime_hints_block(&refs, RUNTIME_HINTS_MAX_CHARS)
+    }
+
     /// Epic 1(§3.2):从主 agent `system_prompt` sections 提取 repo_map 和
     /// environment,构造子智能体上下文。复用已渲染内容,避免重复扫描。
     /// heading 已对齐 `static_cache_breakpoints`(§3.2 heading 对齐约束)。
@@ -7224,6 +7162,55 @@ pub fn tool_result_output_len(messages: &[ConversationMessage]) -> usize {
         .sum()
 }
 
+/// 建议2(统一收口)— 冻结槽位块纯函数构造器。
+///
+/// 把一组 (槽位标题, 内容) 按传入顺序拼装成单条运行时提示块:
+/// - 固定框架头 [`RUNTIME_HINTS_HEADER`],字节稳定;
+/// - 空内容槽位自动省略(trim 后为空即跳过);
+/// - 全部为空时返回 `None`,调用方不 push 任何尾部消息;
+/// - 超过 `max_chars` 时从后向前截断:末尾放不下的槽整槽丢弃,
+///   对最后放入截断标记的槽按剩余预算截断内容。
+#[must_use]
+pub(crate) fn build_runtime_hints_block(
+    slots: &[(&str, &str)],
+    max_chars: usize,
+) -> Option<String> {
+    let header = RUNTIME_HINTS_HEADER;
+    if header.chars().count() >= max_chars {
+        return None;
+    }
+    // 过滤空槽,保持传入顺序(即冻结槽位顺序)。
+    let non_empty: Vec<(&str, &str)> = slots
+        .iter()
+        .filter(|(_, content)| !content.trim().is_empty())
+        .map(|(heading, content)| (*heading, content.trim()))
+        .collect();
+    if non_empty.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(512);
+    out.push_str(header);
+    out.push('\n');
+    let mut used = out.chars().count();
+    for (heading, content) in non_empty {
+        let block = format!("\n## {heading}\n{content}\n");
+        let block_chars = block.chars().count();
+        if used + block_chars > max_chars {
+            // 本槽放不下完整内容:按剩余预算截断后停止,后续槽全部放弃。
+            let remaining = max_chars.saturating_sub(used);
+            if remaining > 24 {
+                let budget = remaining - 3; // 预留 "\n*" 截断标记
+                let truncated: String = content.chars().take(budget).collect();
+                out.push_str(&format!("\n## {heading}\n{truncated}\n…(truncated)"));
+            }
+            break;
+        }
+        used += block_chars;
+        out.push_str(&block);
+    }
+    Some(out)
+}
+
 /// 旧版解析函数,保留供测试验证向后兼容性。
 /// 生产代码请使用 [`parse_auto_compaction_threshold_opt`]。
 #[cfg(test)]
@@ -7446,8 +7433,8 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, build_branch_retry_task, build_subagent_request,
-        build_subagent_retry_context, build_subagent_system_prompt,
+        build_assistant_message, build_branch_retry_task, build_runtime_hints_block,
+        build_subagent_request, build_subagent_retry_context, build_subagent_system_prompt,
         compaction_threshold_for_context_window, default_subagent_tool_catalog,
         extract_file_path_from_tool_input, is_repetition_warning, microcompact_preserve_recent,
         parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, process_tool_uses,
@@ -7455,7 +7442,8 @@ mod tests {
         AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError,
         StaticToolExecutor, SubagentContext, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
-        MICROCOMPACT_PRESERVE_RECENT, SESSION_SEARCH_TOOL_SPEC, SOFT_MAX_ITERATIONS,
+        MICROCOMPACT_PRESERVE_RECENT, RUNTIME_HINTS_HEADER, SESSION_SEARCH_TOOL_SPEC,
+        SOFT_MAX_ITERATIONS,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
@@ -7568,11 +7556,12 @@ mod tests {
                     ])
                 }
                 2 => {
-                    let last_message = request
-                        .messages
-                        .last()
-                        .expect("tool result should be present");
-                    assert_eq!(last_message.role, MessageRole::Tool);
+                    // 建议2 统一收口后,冻结槽位块(user 角色)追加在请求末尾,
+                    // 工具结果不再是最后一条消息;断言请求中存在 Tool 结果即可。
+                    assert!(
+                        request.messages.iter().any(|m| m.role == MessageRole::Tool),
+                        "tool result should be present in second request"
+                    );
                     Ok(vec![
                         AssistantEvent::TextDelta("The answer is 4.".to_string()),
                         AssistantEvent::Usage(TokenUsage {
@@ -9138,8 +9127,9 @@ mod tests {
 
         let requests = captured.lock().expect("lock");
         let second_request = requests.last().expect("two requests captured");
-        // 消息链必须为 [user, assistant(tool_use), tool(interrupted), user]
-        let roles: Vec<MessageRole> = second_request.iter().map(|m| m.role.clone()).collect();
+        // 消息链必须为 [user, assistant(tool_use), tool(interrupted), user];
+        // 建议2 统一收口后请求末尾会追加冻结槽位块(user 角色),只校验前 4 条。
+        let roles: Vec<MessageRole> = second_request.iter().take(4).map(|m| m.role).collect();
         let expected = vec![
             MessageRole::User,
             MessageRole::Assistant,
@@ -9437,6 +9427,127 @@ mod tests {
             request_kind: RequestKind::Main,
         };
         assert_eq!(request.request_kind, RequestKind::Main);
+    }
+
+    // ===== 建议2 冻结槽位块:纯函数 build_runtime_hints_block =====
+
+    #[test]
+    fn build_runtime_hints_block_orders_and_filters_slots() {
+        // 全部槽位为空 → None(请求构造不追加尾部消息)
+        assert!(
+            build_runtime_hints_block(&[("a", ""), ("b", "   ")], 24_000).is_none(),
+            "all-empty slots must yield None"
+        );
+        // 部分为空:非空槽按传入顺序保留,空槽(含纯空白)跳过
+        let block = build_runtime_hints_block(
+            &[
+                ("Notebook", ""),
+                ("Plan", "  do x  "),
+                ("Style", "be terse"),
+            ],
+            24_000,
+        )
+        .expect("non-empty slots preserved");
+        assert!(block.starts_with(RUNTIME_HINTS_HEADER), "stable header");
+        let plan_pos = block.find("## Plan").expect("plan slot included");
+        let style_pos = block.find("## Style").expect("style slot included");
+        assert!(plan_pos < style_pos, "slot order preserved");
+        assert!(!block.contains("## Notebook"), "empty slot must be omitted");
+        assert!(block.contains("do x"), "trimmed content");
+    }
+
+    #[test]
+    fn build_runtime_hints_block_truncates_when_over_budget() {
+        // 预算只够 header + Long 槽的一小段:Long 内容截断,后续槽整体丢弃。
+        let header_len = RUNTIME_HINTS_HEADER.chars().count();
+        let small_max = header_len + 40;
+        let long = "y".repeat(500);
+        let long_str = long.as_str();
+        let block = build_runtime_hints_block(&[("Long", long_str), ("Next", "data")], small_max)
+            .expect("block with truncation");
+        assert!(block.contains("…(truncated)"), "truncation marker present");
+        assert!(
+            block.chars().count() <= small_max + 24,
+            "block length capped near budget: {}",
+            block.chars().count()
+        );
+        assert!(!block.contains("## Next"), "over-budget tail slot dropped");
+    }
+
+    // ===== 建议2 统一收口:请求构造只保留单条冻结槽位块 =====
+
+    #[test]
+    fn runtime_hints_consolidate_into_single_tail_message() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrderingH};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<ApiRequest>::new()));
+
+        struct HintsApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<ApiRequest>>>,
+        }
+        impl ApiClient for HintsApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured.lock().expect("lock").push(request);
+                let n = self.calls.fetch_add(1, AtomicOrderingH::SeqCst);
+                if n == 0 {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("ok".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "t1".to_string(),
+                            name: "noop".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            HintsApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("hello", None)
+            .expect("turn should succeed");
+
+        let reqs = captured.lock().expect("lock");
+        let req = reqs.first().expect("at least one request");
+        // 统一收口后:不再往 system_prompt 变动区 push 任何动态内容。
+        assert!(
+            req.system_prompt.dynamic_sections.is_empty(),
+            "dynamic_sections must stay empty after consolidation, got {:?}",
+            req.system_prompt.dynamic_sections
+        );
+        // 末尾只有一条冻结槽位块消息(否则前缀被中途动态内容扰动)。
+        let last = req.messages.last().expect("tail message");
+        let text: String = last
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains(RUNTIME_HINTS_HEADER),
+            "tail message carries hints block, got: {text}"
+        );
+        assert!(text.contains("## Execution Style"), "style slot present");
+        assert!(text.contains("Be concise."), "style content present");
     }
 
     /// 复现记忆丢失根因(方案 A):turn 结束后 task_state 自动提取并持久化;
@@ -10263,9 +10374,15 @@ mod tests {
                     2 => {
                         // The tool result must have been inserted with the
                         // formatted FTS5 hits before the second API call.
-                        let last = request.messages.last().expect("tool result present");
-                        assert_eq!(last.role, MessageRole::Tool);
-                        let output = match &last.blocks[0] {
+                        // 建议2 统一收口后请求末尾追加冻结槽位块(user 角色),
+                        // 改为查找请求中的 Tool 结果消息。
+                        let tool_msg = request
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == MessageRole::Tool)
+                            .expect("tool result present");
+                        let output = match &tool_msg.blocks[0] {
                             ContentBlock::ToolResult { output, .. } => output.clone(),
                             _ => panic!("expected tool result block"),
                         };

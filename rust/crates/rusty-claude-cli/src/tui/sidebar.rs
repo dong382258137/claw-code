@@ -169,10 +169,7 @@ fn render_session_section(area: Rect, buf: &mut Buffer, state: &StatusBarState) 
                 };
                 lines.push(Line::from(vec![
                     Span::raw(format!("  {} ", peer.label)),
-                    Span::styled(
-                        peer.status.as_str(),
-                        Style::default().fg(status_color),
-                    ),
+                    Span::styled(peer.status.as_str(), Style::default().fg(status_color)),
                     Span::raw(unread),
                 ]));
             }

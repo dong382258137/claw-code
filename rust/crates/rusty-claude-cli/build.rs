@@ -45,9 +45,7 @@ fn main() {
             // 跨平台当前日期:chrono(Windows 下 `date +%Y-%m-%d` 是 GNU 语法,
             // cmd.exe 的 date 不识别,导致 build_date 恒为 unknown)。
             // SOURCE_DATE_EPOCH 存在时上游 env 已处理,此处仅兜底。
-            chrono::Local::now()
-                .format("%Y-%m-%d")
-                .to_string()
+            chrono::Local::now().format("%Y-%m-%d").to_string()
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 

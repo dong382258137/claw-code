@@ -960,7 +960,9 @@ fn format_ms_timestamp(ms: i64) -> String {
     let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) else {
         return String::new();
     };
-    dt.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string()
+    dt.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 /// 单行截断(供 CLI 文本展示,保留可读性)。

@@ -79,9 +79,9 @@ pub mod domain_algorithm;
 // 默认不启用,需通过 CLI `--enable-plan-mode` 或 settings.json `planMode: true` 开启。
 // 缓存保护:PlanArtifact 末尾追加到 prompt 变动区,详见 docs/harness-engineering-optimization-plan.md §5.2。
 pub mod planner;
-// Harness C(上下文管理)层:统一 prompt 注入优先级栈,缓存保护(固定顺序,运行时不可变)。
-// 详见 docs/harness-engineering-optimization-plan.md Step 2.3。
-pub mod context_assembler;
+// Harness C(上下文管理)层:旧 ContextAssembler 统一注入架构已删除(建议2
+// 统一收口,易变内容改由 conversation.rs::render_runtime_hints 渲染成
+// messages 末尾冻结槽位块,不再注入 system_prompt 变动区)。
 // Harness O(可观测性)层:LoopDetectionMiddleware 打断 Doom Loop(同文件 10+ 次编辑)。
 // 详见 docs/harness-engineering-optimization-plan.md Step 2.2。
 pub mod loop_detection;
@@ -161,9 +161,6 @@ pub use config::{
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
-};
-pub use context_assembler::{
-    AssembledPrompt, CacheStrategy, ContextAssembler, ContextBlock, ContextSource, TokenBudget,
 };
 pub use decision_log::{
     compute_simhash, hamming_distance, is_decision_extractor_client_registered,

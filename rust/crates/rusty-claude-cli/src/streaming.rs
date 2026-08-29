@@ -23,8 +23,8 @@ use api::{
     has_thinking_mode_tool_call, model_requires_reasoning_content_in_history, CacheControl,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent,
-    REASONING_PLACEHOLDER, SystemBlock, SystemContent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    SystemBlock, SystemContent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    REASONING_PLACEHOLDER,
 };
 use runtime::{
     multi_agent::SubagentCapability, ApiClient, ApiRequest, AssistantEvent, ContentBlock,
@@ -581,7 +581,10 @@ const MAX_TRANSPORT_RETRIES: usize = 1;
 enum StreamAttemptError {
     /// 传输/解码层瞬时故障（连接重置、body 解码失败等），可重试。
     /// `emitted_any_event` 为 true 说明流中已产生 UI 可见内容，不宜重发。
-    Transport { message: String, emitted_any_event: bool },
+    Transport {
+        message: String,
+        emitted_any_event: bool,
+    },
     /// 不可重试错误；通常已在内部 emit `StreamError` 事件。
     Fatal(RuntimeError),
 }
@@ -663,7 +666,9 @@ impl AnthropicRuntimeClient {
                         emitted_any_event: false,
                     });
                 }
-                return Err(StreamAttemptError::Fatal(self.emit_stream_error(msg, false)));
+                return Err(StreamAttemptError::Fatal(
+                    self.emit_stream_error(msg, false),
+                ));
             }
         };
         let mut stdout = io::stdout();
@@ -718,7 +723,9 @@ impl AnthropicRuntimeClient {
                             emitted_any_event: received_any_event,
                         });
                     }
-                    return Err(StreamAttemptError::Fatal(self.emit_stream_error(msg, false)));
+                    return Err(StreamAttemptError::Fatal(
+                        self.emit_stream_error(msg, false),
+                    ));
                 }
                 Err(_elapsed) => {
                     // P0-1 修复 #3/9 + P3 扩展:stall 超时。
@@ -1531,9 +1538,9 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) ->
         // 消息必须回传 reasoning_content,否则 400。此类消息保留 thinking 块,
         // 由 translate_message 作为 reasoning_content 发出;其余消息继续剥离以
         // 节省 context token。
-        let thinking_mode_tool_call = message.blocks.iter().any(|b| {
-            matches!(b, ContentBlock::ToolUse { id, .. } if has_thinking_mode_tool_call(&[id]))
-        });
+        let thinking_mode_tool_call = message.blocks.iter().any(
+            |b| matches!(b, ContentBlock::ToolUse { id, .. } if has_thinking_mode_tool_call(&[id])),
+        );
         let keep_msg_thinking = keep_thinking || thinking_mode_tool_call;
         let content = message
             .blocks
@@ -1804,7 +1811,10 @@ mod status_emitter_tests {
     fn should_auto_retry_clean_transport_within_budget() {
         // 流尚未产生 UI 可见内容且预算未耗尽 → 自动重试。
         assert!(should_auto_retry_transport(false, 0));
-        assert!(should_auto_retry_transport(false, MAX_TRANSPORT_RETRIES - 1));
+        assert!(should_auto_retry_transport(
+            false,
+            MAX_TRANSPORT_RETRIES - 1
+        ));
     }
 
     #[test]

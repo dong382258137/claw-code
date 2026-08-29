@@ -2147,7 +2147,11 @@ pub(crate) fn handle_bus_command(args: Option<&str>, session_id: &str) -> String
 
     // 确保发送方已注册（REPL/TUI 已在启动时注册 Main；resume 模式按需注册）。
     let bus = runtime::global_session_bus();
-    if !bus.peers_snapshot().iter().any(|p| p.session_id == session_id) {
+    if !bus
+        .peers_snapshot()
+        .iter()
+        .any(|p| p.session_id == session_id)
+    {
         let _ = bus.register(runtime::BusPeer {
             session_id: session_id.to_string(),
             label: "主会话".to_string(),
@@ -2207,7 +2211,10 @@ fn render_bus_list(bus: &runtime::SessionBus, session_id: &str) -> String {
 
 /// 解析目标：`*` 广播；否则按 session_id 精确匹配，再按 label 匹配。
 /// 返回 (目标 session_id, 目标 kind)。
-fn resolve_bus_target(bus: &runtime::SessionBus, target: &str) -> Option<(String, runtime::PeerKind)> {
+fn resolve_bus_target(
+    bus: &runtime::SessionBus,
+    target: &str,
+) -> Option<(String, runtime::PeerKind)> {
     if target == "*" {
         return None;
     }
@@ -2362,7 +2369,11 @@ pub(crate) fn render_bus_message_line(m: &runtime::BusMessage) -> String {
             .to_string(),
     };
     // watch 镜像：标注原始目标（"→ sub-1: 内容"）
-    if payload.get("watch_relay").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if payload
+        .get("watch_relay")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         if let Some(original) = payload.get("original_to").and_then(|v| v.as_str()) {
             return format!("→ {original}: {summary}");
         }
@@ -2810,7 +2821,10 @@ fn resolve_im_bridge_binary() -> Option<std::path::PathBuf> {
 mod bus_tests {
     use super::*;
 
-    fn bus_message(kind: runtime::BusMessageKind, payload: serde_json::Value) -> runtime::BusMessage {
+    fn bus_message(
+        kind: runtime::BusMessageKind,
+        payload: serde_json::Value,
+    ) -> runtime::BusMessage {
         runtime::BusMessage {
             from: "sub-1".to_string(),
             to: "main-1".to_string(),

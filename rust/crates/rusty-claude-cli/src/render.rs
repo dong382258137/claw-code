@@ -766,10 +766,7 @@ impl MarkdownStreamState {
         self.pending.drain(..split);
         // 保留尾部换行：ready 以空行结尾，段落/表格与后续内容的换行边界
         // 必须原样保留，否则跨 flush 的内容（如下一个表格）会粘连错位。
-        Some(
-            renderer
-                .render_markdown_with_width_trim(&ready, self.max_width, false),
-        )
+        Some(renderer.render_markdown_with_width_trim(&ready, self.max_width, false))
     }
 
     #[must_use]

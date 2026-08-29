@@ -809,7 +809,8 @@ mod tests {
     /// 验证 `parse_propose_response` 正确解析 JSON 并容错包裹的 ```json。
     #[test]
     fn parse_propose_response_extracts_content_and_reasoning() {
-        let response = "```json\n{\"content\": \"check X first\", \"reasoning\": \"because Y\"}\n```";
+        let response =
+            "```json\n{\"content\": \"check X first\", \"reasoning\": \"because Y\"}\n```";
         let (content, reasoning) =
             DeepSeekHarnessProposer::parse_propose_response(response).expect("parse ok");
         assert_eq!(content, "check X first");
@@ -820,16 +821,12 @@ mod tests {
     #[test]
     fn parse_propose_response_rejects_invalid() {
         // 缺 content 字段
-        assert!(
-            DeepSeekHarnessProposer::parse_propose_response("{\"reasoning\":\"r\"}").is_none()
-        );
+        assert!(DeepSeekHarnessProposer::parse_propose_response("{\"reasoning\":\"r\"}").is_none());
         // 空 content
-        assert!(
-            DeepSeekHarnessProposer::parse_propose_response(
-                "{\"content\":\"   \", \"reasoning\":\"r\"}"
-            )
-            .is_none()
-        );
+        assert!(DeepSeekHarnessProposer::parse_propose_response(
+            "{\"content\":\"   \", \"reasoning\":\"r\"}"
+        )
+        .is_none());
         // 非 JSON
         assert!(DeepSeekHarnessProposer::parse_propose_response("not json at all").is_none());
     }

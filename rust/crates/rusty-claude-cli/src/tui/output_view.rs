@@ -313,9 +313,7 @@ impl OutputEntry {
                     format!("\x1b[38;5;240m[{timestamp}]\x1b[0m{summary}")
                 } else {
                     // 展开态：显示完整思考文本。
-                    format!(
-                        "\x1b[38;5;240m[{timestamp}]\x1b[0m\n▶ Thinking\n{full_text}"
-                    )
+                    format!("\x1b[38;5;240m[{timestamp}]\x1b[0m\n▶ Thinking\n{full_text}")
                 }
             }
             OutputEntry::Timeline { summary, timestamp } => {
@@ -589,11 +587,7 @@ impl OutputBuffer {
     /// 思考块结束：把最近一个 Thinking 条目折叠为摘要。
     /// 幂等 —— 已折叠或不存在时无操作。`char_count` 是思考总字符数
     /// （None 表示 provider 隐藏），`redacted` 表示内容被 provider 抹除。
-    pub(crate) fn complete_thinking(
-        &mut self,
-        char_count: Option<usize>,
-        redacted: bool,
-    ) {
+    pub(crate) fn complete_thinking(&mut self, char_count: Option<usize>, redacted: bool) {
         let summary = if redacted {
             "\n▶ Thinking block hidden by provider\n".to_string()
         } else if let Some(char_count) = char_count {
@@ -603,9 +597,13 @@ impl OutputBuffer {
         };
         // 从后往前找最近一个 Thinking 条目（完整块路径刚 append 后即折叠）。
         // 若不存在（如直接收到 done 信号的 RedactedThinking），新建折叠态条目。
-        if let Some(idx) = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
-            matches!(e, OutputEntry::Thinking { .. }).then_some(idx)
-        }) {
+        if let Some(idx) = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, e)| matches!(e, OutputEntry::Thinking { .. }).then_some(idx))
+        {
             if let OutputEntry::Thinking {
                 summary: s,
                 collapsed,
@@ -625,13 +623,18 @@ impl OutputBuffer {
     /// 优先 Thinking（流式思考卡片更常需要查看全文），否则 ToolCard。
     /// 返回 true 表示成功切换。
     pub(crate) fn toggle_latest_collapsible(&mut self) -> bool {
-        let found_idx = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
-            match e {
+        let found_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, e)| match e {
                 OutputEntry::Thinking { .. } => Some(idx),
-                OutputEntry::ToolCard { result: Some(_), .. } => Some(idx),
+                OutputEntry::ToolCard {
+                    result: Some(_), ..
+                } => Some(idx),
                 _ => None,
-            }
-        });
+            });
         if let Some(idx) = found_idx {
             match &mut self.entries[idx] {
                 OutputEntry::Thinking { collapsed, .. } => *collapsed = !*collapsed,
@@ -647,9 +650,12 @@ impl OutputBuffer {
     /// 切换最近一个 Thinking 条目的折叠/展开状态。
     /// 返回 true 表示成功切换。
     pub(crate) fn toggle_latest_thinking(&mut self) -> bool {
-        let found_idx = self.entries.iter().enumerate().rev().find_map(|(idx, e)| {
-            matches!(e, OutputEntry::Thinking { .. }).then_some(idx)
-        });
+        let found_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, e)| matches!(e, OutputEntry::Thinking { .. }).then_some(idx));
         if let Some(idx) = found_idx {
             if let OutputEntry::Thinking { collapsed, .. } = &mut self.entries[idx] {
                 *collapsed = !*collapsed;
@@ -1040,10 +1046,7 @@ impl OutputView {
 
     /// 只读访问版本号（内容变化即递增，供 draw 触发检测）。
     pub(crate) fn version(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .version
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).version
     }
 
     /// 返回所有 Text 类型 entry 的 display 起始行号（原始行，未 wrap）。
@@ -1186,12 +1189,18 @@ mod tests {
             "bash".to_string(),
             r#"{"command":"cat big.txt"}"#.to_string(),
         ));
-        let long_output = (1..=50).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let long_output = (1..=50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(buf.complete_tool_card("t1", long_output, false));
         let snap = buf.render_all();
         assert!(snap.contains("50 行"), "应显示总行数: {snap}");
         assert!(snap.contains("折叠"), "应显示折叠标记: {snap}");
-        assert!(!snap.contains("[+] 展开"), "单行标题折叠不应有展开提示: {snap}");
+        assert!(
+            !snap.contains("[+] 展开"),
+            "单行标题折叠不应有展开提示: {snap}"
+        );
     }
 
     #[test]
@@ -1328,7 +1337,10 @@ mod tests {
     #[test]
     fn toggle_expand_long_tool_card_shows_full_output() {
         let mut buf = OutputBuffer::default();
-        let long_output = (1..=20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let long_output = (1..=20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         buf.push_entry(OutputEntry::ToolCard {
             tool_id: "t1".to_string(),
             name: "bash".to_string(),
@@ -1387,14 +1399,12 @@ mod tests {
         for i in 0..MAX_WINDOW_ENTRIES + 50 {
             buf.push_entry(OutputEntry::text(format!("entry {i}")));
         }
-        assert_eq!(
-            buf.entry_count(),
-            MAX_WINDOW_ENTRIES,
-            "窗口应保持容量上限"
-        );
+        assert_eq!(buf.entry_count(), MAX_WINDOW_ENTRIES, "窗口应保持容量上限");
         // 最旧内容已弹出（数据权威在后端 session 文件，TUI 不保留）
         assert!(!buf.render_all().contains("entry 0"));
-        assert!(buf.render_all().contains(&format!("entry {}", MAX_WINDOW_ENTRIES + 49)));
+        assert!(buf
+            .render_all()
+            .contains(&format!("entry {}", MAX_WINDOW_ENTRIES + 49)));
     }
 
     /// 版本号：每次内容变化递增，供 draw 触发检测。
@@ -1671,7 +1681,10 @@ mod tests {
     #[test]
     fn compute_priority_read_file_20_lines_expands() {
         let input = r#"{"path":"foo.rs"}"#;
-        let result = (1..=20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let result = (1..=20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(
             compute_priority("read_file", input, &result, false),
             Priority::P1
@@ -1759,7 +1772,13 @@ mod tests {
             "点击区间1起点应命中卡片1"
         );
         assert!(
-            matches!(&buf.entries[1], OutputEntry::ToolCard { collapsed: false, .. }),
+            matches!(
+                &buf.entries[1],
+                OutputEntry::ToolCard {
+                    collapsed: false,
+                    ..
+                }
+            ),
             "卡片1 应被展开"
         );
         let ranges2 = buf.tool_card_line_ranges(width);
@@ -1768,7 +1787,13 @@ mod tests {
             "点击区间2起点应命中卡片2"
         );
         assert!(
-            matches!(&buf.entries[2], OutputEntry::ToolCard { collapsed: true, .. }),
+            matches!(
+                &buf.entries[2],
+                OutputEntry::ToolCard {
+                    collapsed: true,
+                    ..
+                }
+            ),
             "卡片2 应被折叠"
         );
         // 区间外（前置 Text entry 所在行）不应命中

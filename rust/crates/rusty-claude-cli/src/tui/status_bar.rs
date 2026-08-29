@@ -337,9 +337,7 @@ impl<'a> Widget for StatusBar<'a> {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
             };
             sections.push(vec![
                 Span::styled(" │ ", style_dim),

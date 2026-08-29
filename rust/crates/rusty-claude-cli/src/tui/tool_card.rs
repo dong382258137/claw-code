@@ -573,9 +573,15 @@ mod tests {
         // 子 agent 用规范名调用(grep_search/glob_search),输入摘要需命中专用分支,
         // 而不是 fallback 到 generic 键值对(防展示层短名/规范名双重失效回归)。
         let grep = summarize_tool_input("grep_search", r#"{"pattern":"foo"}"#);
-        assert!(grep.contains("🔎 `foo`"), "grep_search 应命中输入摘要: {grep}");
+        assert!(
+            grep.contains("🔎 `foo`"),
+            "grep_search 应命中输入摘要: {grep}"
+        );
         let glob = summarize_tool_input("glob_search", r#"{"pattern":"*.rs"}"#);
-        assert!(glob.contains("🌐 `*.rs`"), "glob_search 应命中输入摘要: {glob}");
+        assert!(
+            glob.contains("🌐 `*.rs`"),
+            "glob_search 应命中输入摘要: {glob}"
+        );
     }
 
     #[test]
@@ -583,7 +589,8 @@ mod tests {
         // GlobSearchOutput 序列化为 numFiles(camelCase),渲染必须读 numFiles
         // 而非 num_files(snake_case),否则永远显示 0 文件。
         let result = r#"{"durationMs":1,"numFiles":42,"filenames":["a.py"],"truncated":false}"#;
-        let summary = summarize_tool_result("glob_search", r#"{"pattern":"**/*.py"}"#, result, false);
+        let summary =
+            summarize_tool_result("glob_search", r#"{"pattern":"**/*.py"}"#, result, false);
         assert!(
             summary.contains("42文件"),
             "glob 结果应显示 numFiles=42, 实际: {summary}"

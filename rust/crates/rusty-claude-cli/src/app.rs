@@ -113,12 +113,11 @@ use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_system_prompt,
     load_system_prompt_with_extras, pricing_for_model, resolve_expected_base,
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ContextAssembler,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, HistoryIndex, McpServer, McpServerManager,
     McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
     ProjectContext, PromptCacheEvent, RepoMap, ResolvedPermissionMode, RuntimeError, Session,
-    SystemPromptExtras, SystemPromptSplit, TokenBudget, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    SystemPromptExtras, SystemPromptSplit, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -3255,19 +3254,10 @@ pub(crate) fn build_runtime_with_plugin_state(
     if let Ok(cwd) = env::current_dir() {
         runtime = runtime.with_hooks_hot_reload(ConfigLoader::default_for(cwd));
     }
-    // Harness C(Context Management)层接入:ContextAssembler 统一 prompt 注入。
-    // 收集 Memory/Goal/Plan/remediation 等动态内容到 assembler,
-    // 由 assemble() 按 7 级优先级栈排序,TokenBudget 控制各源上限。
-    // 1M 模型(DeepSeek V4/GPT-5.4)使用缩放预算(480K 全局),
-    // 200K 模型(Claude)使用标准预算(120K 全局)。
-    // 详见 docs/harness-engineering-optimization-plan.md Step 2.3。
-    {
-        let budget = match context_window {
-            Some(cw) => TokenBudget::for_context_window(cw),
-            None => TokenBudget::default_claude(),
-        };
-        runtime = runtime.with_context_assembler(ContextAssembler::new(budget));
-    }
+    // 建议2(统一收口):易变运行时内容不再经 ContextAssembler 注入
+    // system_prompt 变动区,统一由 runtime 内部的 render_runtime_hints
+    // 渲染成 messages 末尾的冻结槽位块(见 conversation.rs)。旧架构
+    // with_context_assembler / context_assembler 模块已删除,此处无需再注入。
     // P1-6 修复：注入 harness V(验证)层和 O(可观测性)层组件。
     // 之前 VerifierAgent / TraceAnalyzer 实现完整但从未注入主流程，
     // 导致 conversation.rs 中 `self.verifier_agent` / `self.trace_analyzer`
