@@ -3179,21 +3179,18 @@ where
                                 last_summary_msg_index: self.session.messages.len() as i64,
                             };
                             let _ = crate::fixed_memory::save(root, &snap);
-                            // C1:简报拆分为稳定段(前缀)与易变段(尾部槽位)。
-                            // 稳定段(已完成项/历史教训/注脚)低频变化,注入
-                            // messages[0];易变段(当前目标/下一步)由
-                            // render_runtime_hints 注入尾部冻结槽位块 —— 重建
-                            // fixed_memory 时前缀字节保持稳定,只动尾块。
+                            // 简报拆分为稳定段与易变段:稳定段(已完成项/历史教训/
+                            // 注脚)是跨任务有效的工作区经验,注入 messages[0] 前缀;
+                            // 易变段(当前目标/下一步)是会话级状态 —— 由
+                            // render_runtime_hints 的 Current Task 槽位从
+                            // active_plan 提供,此处**彻底丢弃**(工作区快照的
+                            // "当前目标"会残留旧任务,2026-08-31 实证污染)。
+                            // 稳定段为空(简报全为易变内容)时不注入,避免空消息。
                             let (stable, _volatile) =
                                 crate::fixed_memory::split_stable_volatile(&snap.content);
-                            messages.insert(0, ConversationMessage::user_text(
-                                if stable.trim().is_empty() {
-                                    // 简报全为易变内容时退化注入完整文本,避免空消息。
-                                    snap.content.clone()
-                                } else {
-                                    stable
-                                },
-                            ));
+                            if !stable.trim().is_empty() {
+                                messages.insert(0, ConversationMessage::user_text(stable));
+                            }
                             self.fixed_memory = Some(snap);
                             llm_triggered = true;
                         }
@@ -3225,21 +3222,18 @@ where
                             if is_rebuilt {
                                 let _ = crate::fixed_memory::save(root, snap);
                             }
-                            // C1:同上,前缀只注入稳定段;易变段(当前目标/下一步)
-                            // 走尾部冻结槽位块。复用路径(缓存热)字节保持不变。
+                            // 前缀只注入稳定段(已完成项/历史教训/注脚);易变段
+                            // (当前目标/下一步)不再注入 —— Current Task 由
+                            // active_plan 提供。复用路径(缓存热)字节保持不变。
                             let (stable, _volatile) =
                                 crate::fixed_memory::split_stable_volatile(&snap.content);
-                            messages.insert(0, ConversationMessage::user_text(
-                                if stable.trim().is_empty() {
-                                    snap.content.clone()
-                                } else {
-                                    stable
-                                },
-                            ));
+                            if !stable.trim().is_empty() {
+                                messages.insert(0, ConversationMessage::user_text(stable));
+                            }
                         }
                         self.fixed_memory = next;
                     }
-                    // 记录本请求时间戳,供下一轮 300s 前瞻触发判定。
+                    // 记录本请求时间戳,供冷启间隔触发判定。
                     self.last_request_at_ms = Some(now);
                 }
                 // NOTEBOOK 稳定段(decisions/evidence):前缀冻结区注入。
@@ -5465,13 +5459,13 @@ where
             }
         }
 
-        // 槽位 4:Current Task(固定记忆易变段:当前目标 + 下一步)。
-        // C1:从 messages[0] 前缀剥离的易变内容 —— 重建 fixed_memory 时前缀
-        // 字节保持稳定,此处变化只影响尾部冻结槽位块,不破坏缓存。
-        if let Some(fm) = &self.fixed_memory {
-            let (_stable, volatile) = crate::fixed_memory::split_stable_volatile(&fm.content);
-            if let Some(v) = volatile {
-                slots.push(("Current Task", v));
+        // 槽位 4:Current Task(会话内真实任务目标)。
+        // 来源:active_plan.task_summary(create_plan 创建的计划,与会话绑定)——
+        // 绝不读工作区级 fixed_memory/task_state 的"当前目标"(跨会话残留,
+        // 会把旧任务目标注入新会话,2026-08-31 实证污染)。无 plan 时不注入。
+        if let Some(plan) = &self.active_plan {
+            if !plan.task_summary.trim().is_empty() {
+                slots.push(("Current Task", plan.task_summary.clone()));
             }
         }
 
@@ -9837,6 +9831,115 @@ mod tests {
         }
     }
 
+    /// Current Task 槽位来源验证(2026-08-31):有 active_plan 时,尾部冻结
+    /// 槽位块注入 `plan.task_summary`(会话绑定任务目标);**绝不**注入工作区
+    /// 快照 fixed_memory/task_state 的"当前目标"(跨会话残留旧任务,曾导致
+    /// 新会话每轮被注入上一任务目标而反复回答无关内容)。
+    #[test]
+    fn current_task_slot_uses_active_plan_not_workspace_snapshot() {
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct PlanApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for PlanApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-current-task-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        // 预置"旧任务目标"的工作区快照(残留污染场景):fixed_memory 含旧目标,
+        // task_state 已被新会话更新为新目标。
+        let polluted = crate::fixed_memory::FixedMemorySnapshot {
+            content: "# 固定记忆(任务简报 · 锚点型)\n- 当前目标: 旧任务目标,与当前任务无关\n- 已完成项:\n  · 旧任务完成项\n- 注:测试。".to_string(),
+            fingerprint: 0,
+            injected_at_ms: 0,
+            last_summary_msg_index: 0,
+        };
+        crate::fixed_memory::save(&tmp, &polluted).expect("save polluted snapshot");
+        let ts = crate::task_state::TaskState {
+            goal: "把三类买卖点信号接入自动交易并回放调优".to_string(),
+            ..Default::default()
+        };
+        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
+            .expect("save task_state");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PlanApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+        // 会话内创建计划:task_summary = 当前任务的真实目标(与会话绑定)。
+        runtime.active_plan = Some(crate::planner::artifact::PlanArtifact::new(
+            "把三类买卖点信号接入自动交易并回放调优",
+            Vec::new(),
+        ));
+
+        runtime.run_turn("继续", None).expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let texts = shots.first().expect("request captured");
+        // 尾部冻结槽位块:Current Task = plan.task_summary,而非旧任务目标。
+        let tail = texts.last().expect("tail message");
+        assert!(
+            tail.contains("Current Task"),
+            "Current Task slot must be present: {tail}"
+        );
+        assert!(
+            tail.contains("把三类买卖点信号接入自动交易并回放调优"),
+            "Current Task must carry plan.task_summary: {tail}"
+        );
+        assert!(
+            !tail.contains("旧任务目标"),
+            "workspace snapshot goal must NOT leak into Current Task: {tail}"
+        );
+        // 前缀固定记忆(重建自新 task_state)只含稳定段,不含旧目标。
+        let head = texts.first().expect("head message");
+        assert!(
+            head.contains("# 固定记忆"),
+            "head must be fixed-memory brief: {head}"
+        );
+        assert!(
+            !head.contains("旧任务目标") && !head.contains("当前目标"),
+            "prefix must not carry old goal: {head}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// 复现记忆丢失根因(方案 A):turn 结束后 task_state 自动提取并持久化;
     /// 后续 turn 的请求构造经 fixed_memory 快照在 messages **最前部**注入
     /// 任务锚点(目标 + 已确认关键发现),防止任务漂移与重复查询。
@@ -10192,13 +10295,11 @@ mod tests {
             "C1: goal must be moved out of prefix head, got: {head}"
         );
         let tail = texts.last().expect("tail message");
+        // Current Task 改由 active_plan 提供;本测试无 plan → 尾部不再注入
+        // 工作区快照的"当前目标"(旧任务目标残留,2026-08-31 实证污染)。
         assert!(
-            tail.contains("当前目标"),
-            "C1: goal must be injected in tail Current Task slot, got: {tail}"
-        );
-        assert!(
-            tail.contains("重构 auth 模块"),
-            "goal content must be in tail slot, got: {tail}"
+            !tail.contains("当前目标"),
+            "no active_plan → current task must NOT come from workspace snapshot, got: {tail}"
         );
         let user_pos = texts
             .iter()
@@ -10531,23 +10632,17 @@ mod tests {
                 head.contains("# 固定记忆") && head.contains("验证指引"),
                 "turn1 head must be fixed-memory brief: {head}"
             );
-            // C1:goal(当前目标)从前缀剥离到尾部 Current Task 槽位。
+            // 当前目标从前缀剥离后不再注入(Current Task 由 active_plan 提供,
+            // 本测试无 plan → 不注入;无其他槽位内容时尾部也无冻结块)。
             assert!(
                 !head.contains("当前目标"),
-                "C1: goal must be moved out of prefix head: {head}"
+                "goal must be moved out of prefix head: {head}"
             );
             assert!(
                 texts
                     .last()
-                    .is_some_and(|t| t.starts_with(RUNTIME_HINTS_HEADER)),
-                "tail frozen block (RUNTIME_HINTS_HEADER) must be present, last={:?}",
-                texts.last()
-            );
-            assert!(
-                texts
-                    .last()
-                    .is_some_and(|t| t.contains("当前目标")),
-                "C1: goal must be injected in tail Current Task slot, last={:?}",
+                    .is_some_and(|t| !t.contains("当前目标")),
+                "no active_plan → current task must NOT come from workspace snapshot, last={:?}",
                 texts.last()
             );
             let user_pos = texts
@@ -11217,9 +11312,11 @@ mod tests {
             .expect("request captured")
             .last()
             .expect("tail message");
+        // Current Task 改由 active_plan 提供;本测试无 plan → 尾部不再注入
+        // 工作区快照的"当前目标"(旧任务目标残留,2026-08-31 实证污染)。
         assert!(
-            tail.contains("当前目标"),
-            "C1: goal must be injected in tail Current Task slot: {tail}"
+            !tail.contains("当前目标"),
+            "no active_plan → current task must NOT come from workspace snapshot: {tail}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();

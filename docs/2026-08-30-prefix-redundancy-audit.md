@@ -157,13 +157,17 @@ DeepSeek 上下文缓存按请求从头开始的连续字节序列匹配,因此�
 
 ## C 类:前缀稳定性隐患(真正的命中率杀手,优先级最高)
 
-### C1. fixed_memory 含高熵易变字段,却插在 messages[0] → **成立**
+### C1. fixed_memory 高熵字段移尾部 → **已实施 + 来源修正(2026-08-31)**
 - 请求构造 insert(0) — conversation.rs L3176 / L3208
-- **核实**:实测 `D:\chanlunV2\chanlun_py\.claw\fixed_memory.json` content 为 LLM 简报,
-  含"当前目标 / 已完成项 / 历史教训 / **下一步**"—— "当前目标/下一步"随任务推进
-  变化;300s 前瞻触发(conversation.rs L3131-3134)重建后字节全变 → 其后全部历史
-  消息缓存失效。建议:易变"当前目标/下一步"移到尾部冻结槽位块,前缀只留低频
-  稳定内容(已完成项/教训)。
+- **实证污染(2026-08-31)**:工作区级 fixed_memory/task_state 的"当前目标"跨会话
+  残留 —— 测试会话的输入被提取为 goal,新会话每轮注入旧任务目标,导致模型
+  反复回答与任务无关的内容。
+- **来源修正**:Current Task 槽位改由 **`active_plan.task_summary`**(create_plan
+  创建的计划,与会话绑定)提供;**工作区快照彻底不再携带"当前目标/下一步"**
+  (split_stable_volatile 拆出的易变段丢弃,stable 为空时不注入)。
+  旧任务目标永远不会被注入。
+- 新增测试 `current_task_slot_uses_active_plan_not_workspace_snapshot`:预置污染
+  快照 + 新 task_state + active_plan,验证 Current Task 注入 plan 目标、不泄漏旧目标。
 
 ### C2. lessons.jsonl 被压缩摘要污染 → **成立(机制+数据双重确认)**
 - 写入链路 — conversation.rs L7163-7174 → lessons.rs `parse_lessons_from_summary` L40-59
