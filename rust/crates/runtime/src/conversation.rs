@@ -3119,18 +3119,24 @@ where
                         .fixed_memory
                         .clone()
                         .or_else(|| crate::fixed_memory::load(root));
-                    // 300s 前瞻触发(LLM 写入 fixed_memory):距上次注入 > 270s
-                    // (TTL 的 90%,期间无请求重置缓存 → 下一请求大概率冷启)时,
-                    // 用 LLM 对增量消息生成锚点型简报重写 fixed_memory,把更新
-                    // 成本摊进"反正要重建"的冷启轮。与 cache_hot(A 修复)独立。
+                    // 保守冷启间隔触发(2026-08-31,悖论修正):距上次注入超过
+                    // 30 分钟(缓存几乎必然已冷)才触发 LLM 重写,把更新成本
+                    // 摊进"反正要全量重建"的冷启轮。
+                    // 悖论说明:不能用"上一轮命中状态"做判据 —— 上一轮未命中
+                    // 恰恰说明它刚重建了缓存,本轮保持字节稳定即可命中,此时
+                    // 重写等于主动打碎刚建立的缓存(双重浪费);上一轮命中则
+                    // 缓存仍热,重写同样打断。唯一可靠信号是距上次请求的间隔。
+                    // 依据:DeepSeek 官方未公布缓存 TTL(第三方实测口径不一:
+                    // 5 分钟刷新制 vs 几小时闲置清除制),见
+                    // docs/2026-08-30-prefix-redundancy-audit.md。
                     // 时间窗口用磁盘持久化的 injected_at_ms(上次注入≈上次请求),
                     // 而非内存字段——CLI prompt 每次都是新进程,内存时间戳会丢。
                     let last_req = prev.as_ref().map(|p| p.injected_at_ms).unwrap_or(0);
                     let since_last = now - last_req;
                     let mut llm_triggered = false;
                     if last_req > 0
-                        && since_last > crate::fixed_memory::FIXED_MEMORY_PRECEDING_WINDOW_MS
-                        && since_last > crate::fixed_memory::FIXED_MEMORY_MIN_SUMMARY_INTERVAL_MS
+                        && since_last
+                            > crate::fixed_memory::FIXED_MEMORY_COLD_THRESHOLD_MS
                     {
                         // 增量输入:自上次摘要点起的会话消息(排除注入的 fixed_memory
                         // 消息本身,防自循环)。marker 越界(跨进程新会话 marker 无意义)
@@ -10808,15 +10814,16 @@ mod tests {
         );
     }
 
-    /// P0:fixed_memory 300s 前瞻触发 — 距上次请求 > FIXED_MEMORY_PRECEDING_WINDOW_MS
-    /// (270s)时,用 LLM 对增量消息生成简报重写 fixed_memory:messages[0] 为 LLM
-    /// 简报(含 fake 标记与文件锚点),磁盘快照 injected_at_ms 刷新、摘要点游标推进。
+    /// P0:fixed_memory 保守冷启间隔触发 — 距上次注入 >
+    /// FIXED_MEMORY_COLD_THRESHOLD_MS(30 分钟,缓存几乎必然已冷)时,用 LLM
+    /// 对增量消息生成简报重写 fixed_memory:messages[0] 为 LLM 简报(含 fake
+    /// 标记与文件锚点),磁盘快照 injected_at_ms 刷新、摘要点游标推进。
     ///
     /// fake client 采用路由型:仅对固定记忆摘要 prompt 返回固定文本,其它 prompt
     /// 返回 Err → 走启发式兜底,避免污染依赖"全局未注册 → 启发式"的既有 compact
     /// 测试(OnceLock 单例不可还原,路由设计保证先注入/后注入行为一致)。
     #[test]
-    fn fixed_memory_llm_triggered_after_preceding_window() {
+    fn fixed_memory_llm_triggered_after_cold_interval() {
         use std::sync::Mutex;
 
         struct FakeFmSummarizer;
@@ -10879,7 +10886,7 @@ mod tests {
         let old_snap = crate::fixed_memory::FixedMemorySnapshot {
             content: "旧简报".to_string(),
             fingerprint: crate::fixed_memory::fingerprint("旧简报"),
-            injected_at_ms: t0 - crate::fixed_memory::FIXED_MEMORY_PRECEDING_WINDOW_MS - 1,
+            injected_at_ms: t0 - crate::fixed_memory::FIXED_MEMORY_COLD_THRESHOLD_MS - 1,
             last_summary_msg_index: 0,
         };
         crate::fixed_memory::save(&tmp, &old_snap).expect("save prev snapshot");
@@ -10915,7 +10922,7 @@ mod tests {
         )
         .with_workspace_root(tmp.clone());
 
-        // 触发窗口已由上面预置的磁盘快照 injected_at_ms 驱动(距上次注入 > 270s)。
+        // 触发已由上面预置的磁盘快照 injected_at_ms 驱动(距上次注入 > 30 分钟)。
         runtime.run_turn("继续", None).expect("turn should succeed");
 
         let shots = captured.lock().expect("lock");
@@ -11020,7 +11027,7 @@ mod tests {
         ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
             .expect("save task_state");
 
-        // 预置磁盘快照:injected_at_ms 拨到前瞻窗口之外,强制 LLM 路径触发
+        // 预置磁盘快照:injected_at_ms 拨到保守冷启间隔之外,强制 LLM 路径触发
         let t0 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -11028,7 +11035,7 @@ mod tests {
         let old_snap = crate::fixed_memory::FixedMemorySnapshot {
             content: "旧简报".to_string(),
             fingerprint: crate::fixed_memory::fingerprint("旧简报"),
-            injected_at_ms: t0 - crate::fixed_memory::FIXED_MEMORY_PRECEDING_WINDOW_MS - 1,
+            injected_at_ms: t0 - crate::fixed_memory::FIXED_MEMORY_COLD_THRESHOLD_MS - 1,
             last_summary_msg_index: 0,
         };
         crate::fixed_memory::save(&tmp, &old_snap).expect("save prev snapshot");
