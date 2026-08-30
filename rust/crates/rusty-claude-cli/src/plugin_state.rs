@@ -678,6 +678,36 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["memory".to_string(), "notebook".to_string()],
     });
+    // P2:注册 memory_update 工具 — MemGPT 模型主动管理 PersistentMemory 的
+    // 融合。LLM 通过此工具主动更新长期核心记忆:
+    // - Persona/Human/Tasks 块(下个会话进入 system 前缀;本会话前缀冻结
+    //   以维持缓存命中)
+    // - 语义记忆 entries 增删改(add_entry/replace_entry/remove_entry,
+    //   本会话经语义召回立即可见)
+    // 与 notebook_update(工作记忆 NOTEBOOK.md)互补。
+    // 执行由 ConversationRuntime::run_turn 拦截,委托
+    // ConversationRuntime::execute_memory_update 处理(需经
+    // with_persistent_memory 注入 memory surface)。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "memory_update".to_string(),
+        description: Some(
+            "主动管理持久记忆（MemGPT 风格）：更新 Persona/Human/Tasks 块（跨会话进入 system 前缀），或增删改语义记忆 entries（本会话经语义召回可见）。块写入下个会话生效，entries 本会话生效。"
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "block": {"type": "string", "enum": ["persona", "human", "tasks"]},
+                "content": {"type": "string"},
+                "op": {"type": "string", "enum": ["add_entry", "replace_entry", "remove_entry"]},
+                "pattern": {"type": "string"},
+                "source": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["memory".to_string(), "persistent-memory".to_string()],
+    });
     // 第1项:注册 plan_update 工具 — 让 LLM 推进 PlanArtifact 顺序状态机。
     // 长程任务按 step 状态机执行(而非一次线性跑完),LLM 完成一个 step 后
     // 调用 plan_update("done: <step_id>") 标记完成,Review 阶段据此判断

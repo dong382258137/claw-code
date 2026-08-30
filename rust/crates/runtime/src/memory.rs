@@ -239,9 +239,13 @@ impl MemoryEntry {
 ///
 /// The `frozen_snapshot` field is captured at session start by
 /// [`PersistentMemory::load_and_freeze`] and is the only view of memory that
-/// ever lands in the system prompt within that session — this keeps the
-/// prompt-cache prefix stable. New facts written mid-session land on disk
-/// immediately but only surface in the next session.
+/// ever lands in the system prompt prefix within that session — this keeps
+/// the prompt-cache prefix stable. New facts written mid-session (via nudge /
+/// [`PersistentMemory::add_entry`]) land on disk and are mirrored into the
+/// semantic L1 index **immediately**, so they surface in the current session
+/// through the semantic-recall channel (appended to the prompt's dynamic
+/// tail, not the frozen prefix); they additionally surface in the frozen
+/// prefix from the next session onward.
 ///
 /// `entries` holds only currently-active facts. Superseded / expired
 /// entries are migrated to `archive` during [`PersistentMemory::consolidate`]
@@ -376,6 +380,56 @@ impl PersistentMemory {
         &mut self.blocks
     }
 
+    /// Update one of the three typed blocks (Persona / Human / Tasks) in
+    /// place and persist to disk.
+    ///
+    /// `label` is matched case-insensitively against the block labels
+    /// (`persona` / `human` / `tasks`, case-insensitive). If the new content
+    /// exceeds the block's `max_chars` budget it is truncated to the budget
+    /// with a trailing `…` marker.
+    ///
+    /// The frozen snapshot is NOT mutated — the new block content joins the
+    /// system-prompt prefix from the next session onward (mid-session the
+    /// prefix stays byte-stable to preserve prompt-cache hits). The current
+    /// session observes the write through the returned confirmation text.
+    ///
+    /// Returns an error for unknown labels.
+    pub fn update_block(&mut self, label: &str, content: &str) -> Result<String, String> {
+        let normalized = label.trim().to_ascii_lowercase();
+        // 在块借用期间完成替换,提取标量结果后结束借用,再持久化(避免
+        // block 可变借用与 persist_or_warn 的 &self 冲突)。
+        let (block_label, max, written, truncated) = {
+            let Some(block) = self
+                .blocks
+                .iter_mut()
+                .find(|block| block.label().to_ascii_lowercase() == normalized)
+            else {
+                return Err(format!(
+                    "unknown memory block '{label}': expected one of persona / human / tasks"
+                ));
+            };
+            let max = block.max_chars();
+            let mut content = content.to_string();
+            let truncated = content.chars().count() > max;
+            if truncated {
+                content = content.chars().take(max).collect::<String>() + "…";
+            }
+            let written = content.chars().count();
+            let block_label = block.label();
+            block.replace_content(content);
+            (block_label, max, written, truncated)
+        };
+        self.persist_or_warn("update_block");
+        Ok(format!(
+            "memory block '{block_label}' updated ({written} chars, budget {max}{}).",
+            if truncated {
+                ", truncated to budget"
+            } else {
+                ""
+            },
+        ))
+    }
+
     /// Borrow all stored entries (active only; superseded / expired
     /// are migrated to [`PersistentMemory::archive`] during consolidation).
     #[must_use]
@@ -452,10 +506,12 @@ impl PersistentMemory {
     /// Append a new entry to the in-memory store and persist to disk.
     ///
     /// Also mirrors the new entry into the semantic L1 index so subsequent
-    /// [`PersistentMemory::semantic_recall`] calls can surface it. The
-    /// frozen snapshot is NOT mutated — the snapshot is the only view
-    /// surfaced to the system prompt within the current session, so new
-    /// entries only appear in the next session.
+    /// [`PersistentMemory::semantic_recall`] calls can surface it **in the
+    /// current session** (the recall channel is appended to the prompt's
+    /// dynamic tail, so this does not perturb the frozen prefix). The frozen
+    /// snapshot is NOT mutated — the prefix view captured at session start
+    /// stays byte-stable; the new entry joins that prefix from the next
+    /// session onward.
     pub fn add_entry(&mut self, content: &str, source: &str) {
         let now = now_ms();
         self.entries.push(MemoryEntry::new(
@@ -678,6 +734,27 @@ impl PersistentMemory {
         false
     }
 }
+
+/// `memory_update` 工具的 Tool specification(JSON schema)。
+///
+/// 注册到 LLM 的 tool list,让 LLM 主动管理 PersistentMemory(MemGPT 风格):
+/// 更新 Persona/Human/Tasks 块(下个会话进入 system 前缀)或增删改语义
+/// 记忆 entries(本会话经语义召回可见)。
+pub const MEMORY_UPDATE_TOOL_SPEC: &str = r#"{
+    "name": "memory_update",
+    "description": "主动管理持久记忆（MemGPT 风格）：更新 Persona/Human/Tasks 块（跨会话进入 system 前缀），或增删改语义记忆 entries（本会话经语义召回可见）。块写入下个会话生效，entries 本会话生效。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "block": {"type": "string", "enum": ["persona", "human", "tasks"]},
+            "content": {"type": "string"},
+            "op": {"type": "string", "enum": ["add_entry", "replace_entry", "remove_entry"]},
+            "pattern": {"type": "string"},
+            "source": {"type": "string"}
+        },
+        "additionalProperties": false
+    }
+}"#;
 
 /// Deduplicate a list of [`MemoryEntry`] by content, keeping the latest
 /// occurrence of each duplicate. Entries are assumed to be in chronological
@@ -1132,6 +1209,31 @@ mod tests {
     }
 
     #[test]
+    fn mid_session_entry_recallable_in_current_session_prefix_stable() {
+        // C 修复回归(2026-08-30):会话中 nudge/写入的 entry 立即可经语义召回
+        // 通道在本会话命中(add_entry 同步更新 L1 索引),而非"下个会话才生效";
+        // 同时冻结前缀字节保持稳定(召回走尾部动态槽位,不动前缀)。
+        // 用 empty() 构造避免测试环境注入全局 embedding provider,保证走
+        // 确定性 keyword 匹配,消除环境依赖 flaky。
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.add_entry("user prefers dark mode terminals", "test-session");
+        let hits = mem.semantic_recall("dark mode", 3);
+        assert!(
+            hits.iter().any(|h| h.entry.summary.contains("dark mode")),
+            "new entry must be recallable in the current session: {hits:?}"
+        );
+        let before = mem.frozen_render();
+        mem.add_entry("second fact: tabs preferred", "test-session");
+        assert_eq!(
+            before,
+            mem.frozen_render(),
+            "frozen prefix must stay byte-stable after mid-session add_entry"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn empty_captures_frozen_snapshot_for_byte_stability() {
         // B4 regression guard: `empty()` previously left frozen_snapshot
         // as None, so frozen_render() fell back to render_current() which
@@ -1567,5 +1669,103 @@ mod tests {
         ];
         let actions = extract_nudge_actions(&msgs, &mem, &cfg);
         assert_eq!(actions.len(), cfg.max_entries_per_nudge);
+    }
+
+    // --- P2: memory_update 工具 — 模型主动管理 PersistentMemory ------------
+
+    #[test]
+    fn update_block_updates_persona_human_tasks() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.update_block("persona", "资深 Rust 工程师,偏好简洁架构")
+            .expect("persona update");
+        mem.update_block("human", "用户使用 Windows,时区 Asia/Shanghai")
+            .expect("human update");
+        mem.update_block("tasks", "进行中:P2 memory_update 工具")
+            .expect("tasks update");
+        assert!(mem.blocks()[0].content().contains("Rust"));
+        assert!(mem.blocks()[1].content().contains("Windows"));
+        assert!(mem.blocks()[2].content().contains("P2 memory_update"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_block_label_is_case_insensitive() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.update_block("PERSONA", "lowercase match")
+            .expect("PERSONA");
+        mem.update_block("Human", "mixed case").expect("Human");
+        mem.update_block("  tasks  ", "trimmed")
+            .expect("tasks trimmed");
+        assert_eq!(mem.blocks()[0].content(), "lowercase match");
+        assert_eq!(mem.blocks()[1].content(), "mixed case");
+        assert_eq!(mem.blocks()[2].content(), "trimmed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_block_unknown_label_errors() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        let err = mem
+            .update_block("soul", "no such block")
+            .expect_err("must error");
+        assert!(err.contains("unknown memory block 'soul'"), "err: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_block_truncates_over_budget_with_ellipsis() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        // Persona block budget is 500 chars; feed 600.
+        let long = "字".repeat(600);
+        mem.update_block("persona", &long).expect("update");
+        let content = mem.blocks()[0].content();
+        assert_eq!(content.chars().count(), 501, "500 chars + trailing …");
+        assert!(content.ends_with('…'), "truncated content must end with …");
+        // Human block budget is 1000; feed exactly 1000 → no truncation.
+        mem.update_block("human", &"a".repeat(1000))
+            .expect("update");
+        assert_eq!(mem.blocks()[1].content().chars().count(), 1000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_block_persists_and_survives_reload() {
+        let path = temp_path();
+        {
+            let mut mem = PersistentMemory::empty(&path);
+            mem.update_block("persona", "跨会话持久化的 persona")
+                .expect("update");
+            mem.update_block("tasks", "归档任务清单").expect("update");
+        }
+        let reloaded = PersistentMemory::load_and_freeze(&path);
+        let frozen = reloaded.frozen_render();
+        assert!(
+            frozen.contains("跨会话持久化的 persona"),
+            "reloaded frozen render must contain updated persona block: {frozen}"
+        );
+        assert!(
+            frozen.contains("归档任务清单"),
+            "tasks block missing: {frozen}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn memory_update_tool_spec_is_valid_json() {
+        let spec: serde_json::Value = serde_json::from_str(MEMORY_UPDATE_TOOL_SPEC)
+            .expect("MEMORY_UPDATE_TOOL_SPEC must be valid JSON");
+        assert_eq!(spec["name"], "memory_update");
+        assert_eq!(
+            spec["input_schema"]["properties"]["block"]["enum"][0],
+            "persona"
+        );
+        assert_eq!(
+            spec["input_schema"]["properties"]["op"]["enum"][2],
+            "remove_entry"
+        );
     }
 }

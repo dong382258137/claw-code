@@ -22,8 +22,10 @@ pub mod task_state;
 // Multi-Agent Hardening §4.1:统一诊断基础设施(panic hook + DiagLog)。
 // 提取自 rusty-claude-cli/src/lib.rs main_entry 内联闭包,供 main/headless/测试入口复用。
 pub mod decision_log;
+pub mod decisions_archive;
 pub mod diag;
 mod file_ops;
+pub mod fixed_memory;
 pub mod g004_conformance;
 mod git_context;
 pub mod goal;
@@ -211,6 +213,7 @@ pub use mcp_lifecycle_hardened::{
     McpLifecycleValidator, McpPhaseResult,
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
+pub use memory::MEMORY_UPDATE_TOOL_SPEC;
 pub use memory::{
     detect_conflicts, extract_nudge_actions, should_nudge, MemoryBlock, MemoryEntry, NudgeAction,
     NudgeConfig, PersistentMemory, UNVERIFIED_THRESHOLD_MS,

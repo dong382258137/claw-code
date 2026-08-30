@@ -83,8 +83,8 @@ const RUNTIME_HINTS_HEADER: &str = "\
 # Runtime Context
 
 以下为系统自动注入的运行时上下文,槽位顺序固定、无内容的槽位自动省略：
-工作记忆、活跃计划、步骤状态、任务状态、语义召回、校验补救、
-认知停滞、压缩提醒、归档召回、会话交接、教训指令,最后为执行风格要求。";
+工作记忆、活跃计划、步骤状态、语义召回、校验补救、
+认知停滞、压缩提醒、归档召回、会话交接,最后为执行风格要求。";
 
 /// 微压缩保留窗口(默认 5,微软实证最优)。`CLAW_COMPACT_PRESERVE_RECENT`
 /// 环境变量可覆盖(1-10),便于按会话/工作负载微调 —— 长链任务可调高,
@@ -1344,6 +1344,12 @@ pub struct ConversationRuntime<C, T> {
     /// 压缩时注入 system 变动区,让 AI 在压缩后仍持有任务锚点,防止任务漂移
     /// 与重复查询。None 表示尚未初始化(惰性加载)。
     task_state: Option<crate::task_state::TaskState>,
+    /// 固定记忆快照缓存,首轮/超 TTL 重建,热窗复用字节。
+    fixed_memory: Option<crate::fixed_memory::FixedMemorySnapshot>,
+    /// 上一轮请求发出时间(epoch ms),供 fixed_memory 300s 前瞻触发判定
+    /// (距上次请求 > FIXED_MEMORY_PRECEDING_WINDOW_MS 时下一请求大概率冷启)。
+    /// None = 本会话尚未发出过请求(不触发前瞻)。
+    last_request_at_ms: Option<i64>,
     /// Turns elapsed since the last nudge fired. Reset to 0 whenever a nudge
     /// runs.
     turns_since_last_nudge: usize,
@@ -1857,6 +1863,8 @@ where
             session_tracer: None,
             persistent_memory: None,
             task_state: None,
+            fixed_memory: None,
+            last_request_at_ms: None,
             turns_since_last_nudge: 0,
             turns_since_last_evolution: 0,
             harness_archive: None,
@@ -3085,7 +3093,7 @@ where
                 let sliced =
                     crate::compact::get_messages_after_compact_boundary(&self.session.messages);
                 // 统一收口(建议2):所有易变运行时内容(NOTEBOOK/计划骨架/步骤状态/
-                // 任务状态/语义召回/补救/认知停滞/各类提醒/教训指令/风格指令)
+                // 语义召回/补救/认知停滞/各类提醒/风格指令)
                 // 统一渲染成 messages 末尾的**单条冻结槽位块**。system_prompt
                 // 的 dynamic_sections 不再接收任何本层 push 的内容 —— 前缀
                 // (system + tools + 历史 messages)因不再被中途动态内容扰动而
@@ -3096,6 +3104,152 @@ where
                 let system_split = SystemPromptSplit::from_sections(self.system_prompt.clone());
                 // 消费性内容在渲染后清空(见下方),保证下一 turn 不重复注入。
                 let mut messages = sliced.to_vec();
+                // 固定记忆:首轮/缓存超时(TTL≈300s)重建并替换,热窗内复用旧快照
+                // 字节,保持前缀稳定;更新成本摊进"反正要重建"的冷启轮。
+                if let Some(root) = &self.workspace_root {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    // 跨进程复用:内存缓存优先,缺失(如新会话进程)时从磁盘
+                    // 加载上次注入快照,依据持久化 injected_at_ms 判定热窗
+                    // 复用。修复前只认内存 → 每次新进程都按"从未注入"重建,
+                    // 违背 spec「≤TTL 复用旧快照字节」的跨进程语义。
+                    let prev = self
+                        .fixed_memory
+                        .clone()
+                        .or_else(|| crate::fixed_memory::load(root));
+                    // 300s 前瞻触发(LLM 写入 fixed_memory):距上次注入 > 270s
+                    // (TTL 的 90%,期间无请求重置缓存 → 下一请求大概率冷启)时,
+                    // 用 LLM 对增量消息生成锚点型简报重写 fixed_memory,把更新
+                    // 成本摊进"反正要重建"的冷启轮。与 cache_hot(A 修复)独立。
+                    // 时间窗口用磁盘持久化的 injected_at_ms(上次注入≈上次请求),
+                    // 而非内存字段——CLI prompt 每次都是新进程,内存时间戳会丢。
+                    let last_req = prev.as_ref().map(|p| p.injected_at_ms).unwrap_or(0);
+                    let since_last = now - last_req;
+                    let mut llm_triggered = false;
+                    if last_req > 0
+                        && since_last > crate::fixed_memory::FIXED_MEMORY_PRECEDING_WINDOW_MS
+                        && since_last > crate::fixed_memory::FIXED_MEMORY_MIN_SUMMARY_INTERVAL_MS
+                    {
+                        // 增量输入:自上次摘要点起的会话消息(排除注入的 fixed_memory
+                        // 消息本身,防自循环)。marker 越界(跨进程新会话 marker 无意义)
+                        // 回退全量。
+                        let marker = prev
+                            .as_ref()
+                            .map(|p| p.last_summary_msg_index)
+                            .unwrap_or(0)
+                            .max(0) as usize;
+                        let start = if marker < self.session.messages.len() {
+                            marker
+                        } else {
+                            0
+                        };
+                        let mut incr: Vec<ConversationMessage> =
+                            self.session.messages[start..].to_vec();
+                        if let Some(first) = incr.first() {
+                            let is_fm_injection = first.role == MessageRole::User
+                                && first.blocks.iter().any(|b| {
+                                    matches!(b, ContentBlock::Text { text }
+                                        if text.contains("固定记忆"))
+                                });
+                            if is_fm_injection {
+                                incr.remove(0);
+                            }
+                        }
+                        if let Some(llm) = crate::fixed_memory::maybe_llm_summary(root, &incr) {
+                            // P1 幻觉交叉校验护栏:用规则通道 task_state.findings
+                            // 交叉校验 LLM 简报,防止 LLM 编造未发生事项 —— 规则
+                            // 确认但简报未体现的结论以注脚追加到简报末尾。后续
+                            // content / fingerprint / insert 全部使用校验后的文本
+                            // (注脚可能被追加,指纹随之重算,保持三者一致)。
+                            let llm =
+                                crate::fixed_memory::cross_validate_with_task_state(&llm, root);
+                            // 新建 LLM 快照:指纹=LLM 文本,游标=当前消息数(摘要点)。
+                            let snap = crate::fixed_memory::FixedMemorySnapshot {
+                                content: llm.clone(),
+                                fingerprint: crate::fixed_memory::fingerprint(&llm),
+                                injected_at_ms: now,
+                                last_summary_msg_index: self.session.messages.len() as i64,
+                            };
+                            let _ = crate::fixed_memory::save(root, &snap);
+                            messages.insert(0, ConversationMessage::user_text(llm));
+                            self.fixed_memory = Some(snap);
+                            llm_triggered = true;
+                        }
+                    }
+                    if !llm_triggered {
+                        let built = crate::fixed_memory::build_snapshot(root);
+                        // A 修复:上一轮请求命中缓存(cache_read>0)视为"缓存仍热"——
+                        // 即使已超固定 300s 计时也复用旧快照字节,不主动打断前缀。
+                        let cache_hot = self.last_cache_hit();
+                        let next = crate::fixed_memory::next_injection(
+                            prev.as_ref(),
+                            built,
+                            now,
+                            cache_hot,
+                        );
+                        if let Some(snap) = &next {
+                            // 护栏:复用路径(时间戳未变)必须字节一致,否则前缀命中线回退
+                            if let Some(p) = &prev {
+                                if crate::fixed_memory::has_byte_drift(p, snap) {
+                                    self.emit_diag(format!(
+                                        "[diag] fixed_memory fingerprint drift: reused snapshot bytes changed (injected_at_ms={})",
+                                        snap.injected_at_ms
+                                    ));
+                                }
+                            }
+                            // 仅重建时落盘(新建快照 injected_at_ms=now,区别于复用的旧时间戳)
+                            let is_rebuilt = prev.as_ref().map(|p| p.injected_at_ms).unwrap_or(-1)
+                                != snap.injected_at_ms;
+                            if is_rebuilt {
+                                let _ = crate::fixed_memory::save(root, snap);
+                            }
+                            messages
+                                .insert(0, ConversationMessage::user_text(snap.content.clone()));
+                        }
+                        self.fixed_memory = next;
+                    }
+                    // 记录本请求时间戳,供下一轮 300s 前瞻触发判定。
+                    self.last_request_at_ms = Some(now);
+                }
+                // NOTEBOOK 稳定段(decisions/evidence):前缀冻结区注入。
+                // 低频变化但体量偏大 → 归入 messages 前缀长命区,TTL 热窗内
+                // 复用旧快照字节命中缓存;仅在 TTL 过期(冷启)轮重建注入,
+                // 把"反正要重建"的成本摊进冷启轮 —— 与 fixed_memory 同机制。
+                // 实时段(plan/attempted 等)仍留在尾部冻结槽位块(见下)。
+                if let Some(root) = &self.workspace_root {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let built = crate::notebook::Notebook::load(root)
+                        .ok()
+                        .map(|nb| nb.render_stable_sections())
+                        .filter(|s| !s.trim().is_empty());
+                    let prev = crate::notebook::load_stable_snapshot(root);
+                    let cache_hot = self.last_cache_hit();
+                    let next =
+                        crate::fixed_memory::next_injection(prev.as_ref(), built, now, cache_hot);
+                    if let Some(snap) = &next {
+                        // 护栏:复用路径(时间戳未变)必须字节一致。
+                        if let Some(p) = &prev {
+                            if crate::fixed_memory::has_byte_drift(p, snap) {
+                                self.emit_diag(format!(
+                                    "[diag] notebook stable snapshot byte drift (injected_at_ms={})",
+                                    snap.injected_at_ms
+                                ));
+                            }
+                        }
+                        // 仅重建时落盘。
+                        let is_rebuilt = prev.as_ref().map(|p| p.injected_at_ms).unwrap_or(-1)
+                            != snap.injected_at_ms;
+                        if is_rebuilt {
+                            let _ = crate::notebook::save_stable_snapshot(root, snap);
+                        }
+                        messages.insert(0, ConversationMessage::user_text(snap.content.clone()));
+                    }
+                }
                 // 冻结槽位块:单条 user 消息。内容变化只影响这条消息,不破坏
                 // 前缀缓存;槽位顺序固定(与 system_prompt 变动区隔离),空槽
                 // 自动省略,框架头字节稳定,便于命中率归因分析。
@@ -3596,6 +3750,16 @@ where
                             // here so you do not re-dispatch the same task later",
                             // 直击"AI 忘记已 dispatch 过子智能体"的问题。
                             match self.execute_notebook_update(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
+                        } else if tool_name == "memory_update" {
+                            // P2:LLM 主动管理 PersistentMemory(MemGPT 模型融合)。
+                            // 与 notebook_update 互补:后者维护工作记忆 NOTEBOOK.md,
+                            // 本工具维护长期核心记忆(Persona/Human/Tasks 块 + 语义
+                            // entries)。块写入下个会话进入 system 前缀(本会话前缀
+                            // 冻结以维持缓存命中),entries 本会话经语义召回立即可见。
+                            match self.execute_memory_update(&effective_input) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
@@ -5204,6 +5368,21 @@ where
         }
     }
 
+    /// 上一轮请求是否命中缓存前缀(`cache_read_input_tokens > 0`)。
+    ///
+    /// 供固定记忆的"缓存热"判定使用(A 修复):活跃会话中上一轮前缀命中说明
+    /// 缓存仍活跃,即使距上次注入超过固定 TTL(300s)也复用旧快照字节,避免
+    /// 主动打断本可命中的前缀。无历史请求时返回 false(走正常 TTL 判定)。
+    fn last_cache_hit(&self) -> bool {
+        self.session
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| m.usage.as_ref())
+            .map(|u| u.cache_read_input_tokens > 0)
+            .unwrap_or(false)
+    }
+
     /// 建议2(统一收口)— 渲染 messages 末尾的单条"冻结槽位块"。
     ///
     /// 按固定槽位顺序收集当前 turn 的易变运行时内容,交给
@@ -5218,13 +5397,16 @@ where
         let mut slots: Vec<(&str, String)> = Vec::with_capacity(13);
 
         // 槽位 1:NOTEBOOK(工作记忆)— 跨压缩持久化,每 turn 重新注入。
+        // 分段双轨:稳定段(decisions/evidence)已在前缀冻结区按 TTL 注入
+        // (见请求构造),此处只渲染**实时段**(plan/attempted/subagents 等)——
+        // 高频变化内容留在尾部冻结槽位块,不破坏前缀命中。
         // 明确给出 NOTEBOOK.md 的完整路径,避免 LLM 用 read_file 读取原始
         // 文件时猜测根目录路径(NOTEBOOK.md 实际位于 .claw/ 下)而报
         // os error 2。加载失败时不阻塞 turn(静默跳过)。
         if let Some(root) = &self.workspace_root {
             if let Some(prompt) = crate::notebook::Notebook::load(root)
                 .ok()
-                .map(|notebook| notebook.render_for_prompt())
+                .map(|notebook| notebook.render_volatile_sections())
                 .filter(|prompt| !prompt.is_empty())
             {
                 slots.push((
@@ -5251,29 +5433,6 @@ where
             let delta = plan.render_status_delta();
             if !delta.is_empty() {
                 slots.push(("Step Status", delta));
-            }
-        }
-
-        // 槽位 4:Task State + lessons 锚点(仅当会话经历过压缩时注入,
-        // 让压缩后的 AI 仍持有任务锚点,与旧实现条件一致)。
-        if crate::compact::extract_compact_boundary(&self.session.messages).is_some() {
-            let mut epilogue = String::new();
-            if let Some(state) = &self.task_state {
-                let rendered = state.render_for_prompt();
-                if !rendered.is_empty() {
-                    epilogue.push_str(&rendered);
-                }
-            }
-            if let Some(root) = &self.workspace_root {
-                let recent =
-                    crate::lessons::load_recent_lessons(root, crate::lessons::LESSONS_INJECT_MAX);
-                let rendered = crate::lessons::render_for_prompt(&recent);
-                if !rendered.is_empty() {
-                    epilogue.push_str(&rendered);
-                }
-            }
-            if !epilogue.is_empty() {
-                slots.push(("Task State & Lessons", epilogue));
             }
         }
 
@@ -6031,6 +6190,100 @@ where
             Ok(message) => Ok(message),
             Err(error) => Ok(format!("notebook_update failed: {error}")),
         }
+    }
+
+    /// P2:执行 `memory_update` 工具调用,让模型主动管理 PersistentMemory。
+    ///
+    /// 这是 MemGPT 模型的核心能力向本仓库的融合:模型自主决定何时把关键
+    /// 信息写入长期记忆(而非仅依赖规则式 nudge 被动吸收)。与 notebook_update
+    /// 互补 —— 后者维护跨压缩的工作记忆 NOTEBOOK.md,本工具维护长期核心记忆
+    /// (Persona/Human/Tasks 块 + 语义 entries)。支持两种形态:
+    ///
+    /// - 块更新:`{"block": "persona|human|tasks", "content": "..."}` →
+    ///   [`PersistentMemory::update_block`](crate::memory::PersistentMemory::update_block),
+    ///   内容落盘并在**下一个会话**进入 system 前缀(本会话前缀冻结以维持
+    ///   缓存命中)。
+    /// - entries 操作:
+    ///   - `{"op": "add_entry", "content": "...", "source": "..."}` →
+    ///     [`PersistentMemory::add_entry`](crate::memory::PersistentMemory::add_entry),
+    ///     同步更新语义 L1 索引,**本会话**经语义召回立即可见。
+    ///   - `{"op": "replace_entry", "pattern": "...", "content": "...", "source": "..."}` →
+    ///     [`PersistentMemory::replace_entry`](crate::memory::PersistentMemory::replace_entry)。
+    ///   - `{"op": "remove_entry", "pattern": "..."}` →
+    ///     [`PersistentMemory::remove_entry`](crate::memory::PersistentMemory::remove_entry)。
+    ///
+    /// 需要 [`ConversationRuntime::with_persistent_memory`] 已注入 memory surface,
+    /// 否则返回错误。
+    fn execute_memory_update(&mut self, input: &str) -> Result<String, String> {
+        let Some(memory) = self.persistent_memory.as_mut() else {
+            return Err("persistent memory 未启用(未通过 with_persistent_memory 注入)".to_string());
+        };
+        let parsed: serde_json::Value = serde_json::from_str(input)
+            .map_err(|e| format!("invalid memory_update input JSON: {e}"))?;
+        let obj = parsed
+            .as_object()
+            .ok_or_else(|| "memory_update input must be a JSON object".to_string())?;
+        let result = if let Some(block) = obj.get("block").and_then(serde_json::Value::as_str) {
+            // 块模式:block 与 op 二选一。
+            if obj.get("op").is_some() {
+                return Err("memory_update: 'block' 与 'op' 不能同时指定".to_string());
+            }
+            let content = obj
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "memory_update: block 模式必须提供 content 字段".to_string())?;
+            memory.update_block(block, content)?
+        } else {
+            let op = obj
+                .get("op")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "memory_update: 必须提供 block 或 op 字段".to_string())?;
+            let source = obj
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("memory_update");
+            match op {
+                "add_entry" => {
+                    let content = obj
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "memory_update: add_entry 必须提供 content 字段".to_string())?;
+                    memory.add_entry(content, source);
+                    format!("已写入语义记忆 entry({} 字符)。", content.chars().count())
+                }
+                "replace_entry" => {
+                    let pattern = obj
+                        .get("pattern")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "memory_update: replace_entry 必须提供 pattern 字段".to_string())?;
+                    let content = obj
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "memory_update: replace_entry 必须提供 content 字段".to_string())?;
+                    memory.replace_entry(pattern, content, source);
+                    format!("已替换语义记忆 entry(pattern '{pattern}' → 新内容)。")
+                }
+                "remove_entry" => {
+                    let pattern = obj
+                        .get("pattern")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "memory_update: remove_entry 必须提供 pattern 字段".to_string())?;
+                    if memory.remove_entry(pattern) {
+                        "已移除匹配的语义记忆 entry。".to_string()
+                    } else {
+                        format!("未找到匹配 '{pattern}' 的语义记忆 entry(无操作)。")
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "memory_update: 未知 op '{other}',可选 add_entry / replace_entry / remove_entry"
+                    ))
+                }
+            }
+        };
+        Ok(format!(
+            "{result} 已写入持久记忆;块内容将在下一个会话进入 system 前缀(本会话前缀冻结以维持缓存命中),entries 经语义召回本会话立即可见。"
+        ))
     }
 
     /// 执行 `create_plan` 工具调用 — 模型自主决定创建执行计划。
@@ -9551,10 +9804,11 @@ mod tests {
     }
 
     /// 复现记忆丢失根因(方案 A):turn 结束后 task_state 自动提取并持久化;
-    /// 会话经历压缩后,后续请求必须注入 task_state,让 AI 在压缩后仍持有
+    /// 后续 turn 的请求构造经 fixed_memory 快照在 messages **最前部**注入
     /// 任务锚点(目标 + 已确认关键发现),防止任务漂移与重复查询。
+    /// 不再按压缩边界门控:首轮 / TTL(≈300s)重建,热窗内复用旧字节。
     #[test]
-    fn task_state_persisted_and_injected_after_compact_boundary() {
+    fn task_state_persisted_and_injected_via_fixed_memory() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering4};
         use std::sync::Mutex;
 
@@ -9566,13 +9820,12 @@ mod tests {
         }
         impl ApiClient for TaskStateApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                // 捕获请求尾部消息文本(task_state/lessons 迁移到 messages
-                // 末尾注入,不再进 dynamic_sections)。
-                let tail_texts: Vec<String> = request
+                // 捕获请求头部消息文本(fixed_memory 在请求构造时注入
+                // messages 最前部,不再进末尾槽位)。
+                let head_texts: Vec<String> = request
                     .messages
                     .iter()
-                    .rev()
-                    .take(2)
+                    .take(1)
                     .map(|m| {
                         m.blocks
                             .iter()
@@ -9584,7 +9837,7 @@ mod tests {
                             .join("\n")
                     })
                     .collect();
-                self.captured.lock().expect("lock").push(tail_texts);
+                self.captured.lock().expect("lock").push(head_texts);
                 let n = self.calls.fetch_add(1, AtomicOrdering4::SeqCst);
                 if n == 0 {
                     Ok(vec![
@@ -9640,17 +9893,7 @@ mod tests {
             loaded.findings
         );
 
-        // 注入压缩边界(模拟会话被压缩过)
-        let marker = "<!-- compact_boundary: {\"trigger\":\"Auto\",\"pre_tokens\":500,\
-                      \"messages_summarized\":3,\"timestamp_ms\":1} -->"
-            .to_string();
-        let _ = runtime.session.push_message(ConversationMessage {
-            role: MessageRole::System,
-            blocks: vec![ContentBlock::Text { text: marker }],
-            usage: None,
-        });
-
-        // turn 2:压缩后请求必须注入 task state
+        // turn 2:task_state 已落盘,fixed_memory 快照在请求头部注入任务锚点
         runtime
             .run_turn("继续", None)
             .expect("turn2 should succeed");
@@ -9658,19 +9901,24 @@ mod tests {
         let sections = captured.lock().expect("lock");
         let last = sections.last().expect("two requests captured");
         assert!(
-            last.iter().any(|s| s.contains("当前任务状态")),
-            "task state block should be injected, got: {last:?}"
+            last.iter().any(|s| s.contains("固定记忆")),
+            "fixed memory block should be injected at head, got: {last:?}"
+        );
+        assert!(
+            last.iter().any(|s| s.contains("当前目标")),
+            "goal line should be injected, got: {last:?}"
         );
         assert!(
             last.iter().any(|s| s.contains("BTC")),
-            "goal should be injected, got: {last:?}"
+            "goal content should be injected, got: {last:?}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// P2 回归:压缩摘要 `[lessons]` 段 → 持久化到 lessons.jsonl,且压缩后
-    /// 请求注入历史教训(覆盖成功 turn 中工具级瑕疵的自进化盲区)。
+    /// P2 回归:压缩摘要 `[lessons]` 段 → 持久化到 lessons.jsonl,且后续
+    /// 请求经 fixed_memory 快照在 messages **最前部**注入历史教训
+    /// (覆盖成功 turn 中工具级瑕疵的自进化盲区)。
     #[test]
     fn compaction_summary_persists_and_injects_lessons() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering5};
@@ -9684,12 +9932,12 @@ mod tests {
         }
         impl ApiClient for LessonApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                // lessons 与 task_state 同迁移到 messages 末尾注入。
-                let tail_texts: Vec<String> = request
+                // 捕获请求头部消息文本(fixed_memory 在请求构造时注入
+                // messages 最前部,不再进末尾槽位)。
+                let head_texts: Vec<String> = request
                     .messages
                     .iter()
-                    .rev()
-                    .take(2)
+                    .take(1)
                     .map(|m| {
                         m.blocks
                             .iter()
@@ -9701,7 +9949,7 @@ mod tests {
                             .join("\n")
                     })
                     .collect();
-                self.captured.lock().expect("lock").push(tail_texts);
+                self.captured.lock().expect("lock").push(head_texts);
                 let n = self.calls.fetch_add(1, AtomicOrdering5::SeqCst);
                 if n == 0 {
                     Ok(vec![
@@ -9749,22 +9997,14 @@ mod tests {
         let lessons = crate::lessons::load_recent_lessons(&tmp, 10);
         assert_eq!(lessons.len(), 2, "two lessons should persist: {lessons:?}");
 
-        // 注入压缩边界 → turn 请求应含历史教训
-        let marker = "<!-- compact_boundary: {\"trigger\":\"Auto\",\"pre_tokens\":500,\
-                      \"messages_summarized\":3,\"timestamp_ms\":1} -->"
-            .to_string();
-        let _ = runtime.session.push_message(ConversationMessage {
-            role: MessageRole::System,
-            blocks: vec![ContentBlock::Text { text: marker }],
-            usage: None,
-        });
+        // 请求构造时 fixed_memory 快照在 messages 头部注入历史教训
         runtime.run_turn("继续", None).expect("turn should succeed");
 
         let sections = captured.lock().expect("lock");
         let last = sections.last().expect("request captured");
         assert!(
-            last.iter().any(|s| s.contains("历史操作教训")),
-            "lessons block should be injected, got: {last:?}"
+            last.iter().any(|s| s.contains("历史教训")),
+            "lessons block should be injected at head, got: {last:?}"
         );
         assert!(
             last.iter()
@@ -9823,6 +10063,1097 @@ mod tests {
             loaded.closed_tasks.iter().any(|t| t.contains("401")),
             "closed_tasks should be parsed, got: {:?}",
             loaded.closed_tasks
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ===== 固定记忆(fixed_memory)注入 =====
+
+    /// 固定记忆:首轮请求注入 messages 头部(用户输入之前),内容含简报头与目标。
+    #[test]
+    fn fixed_memory_injected_at_head_first_turn() {
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct FmApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for FmApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-fixed-memory-inject-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 首轮前手工落盘任务状态(goal + findings),确保固定记忆有内容可建
+        let ts = crate::task_state::TaskState {
+            goal: "重构 auth 模块,兼容旧 Session 格式".to_string(),
+            findings: vec!["关键结论:拆分 token 校验".to_string()],
+            ..Default::default()
+        };
+        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
+            .expect("save task_state");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FmApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime
+            .run_turn("请继续重构 auth 模块", None)
+            .expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let texts = shots.first().expect("request captured");
+        let head = texts.first().expect("head message");
+        assert!(
+            head.contains("# 固定记忆"),
+            "head must be fixed-memory brief, got: {head}"
+        );
+        assert!(
+            head.contains("当前目标"),
+            "head must include goal line, got: {head}"
+        );
+        assert!(
+            head.contains("验证指引"),
+            "head must include verification guidance, got: {head}"
+        );
+        assert!(
+            head.contains("不要全库搜索"),
+            "head must include no-full-repo-search guidance, got: {head}"
+        );
+        let user_pos = texts
+            .iter()
+            .position(|t| t.contains("请继续重构 auth 模块"))
+            .expect("user input present");
+        assert!(
+            user_pos > 0,
+            "fixed memory must sit before the user input (index {user_pos})"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 固定记忆:热窗(TTL≈300s)内第二次 turn 复用旧快照字节,
+    /// 各次请求 messages[0] 逐字节相等。
+    #[test]
+    fn fixed_memory_reused_within_ttl_keeps_bytes() {
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct FmApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for FmApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                // 捕获请求头部第一条消息的文本(固定记忆槽位)
+                let head = request
+                    .messages
+                    .first()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                self.captured.lock().expect("lock").push(vec![head]);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-fixed-memory-ttl-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let ts = crate::task_state::TaskState {
+            goal: "修复登录 401".to_string(),
+            findings: vec!["根因:缓存失效".to_string()],
+            ..Default::default()
+        };
+        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
+            .expect("save task_state");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FmApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime
+            .run_turn("第一轮", None)
+            .expect("turn1 should succeed");
+        runtime
+            .run_turn("第二轮", None)
+            .expect("turn2 should succeed");
+
+        let shots = captured.lock().expect("lock");
+        assert!(
+            shots.len() >= 2,
+            "at least two requests captured: {shots:?}"
+        );
+        let heads: Vec<&String> = shots.iter().map(|s| &s[0]).collect();
+        assert!(
+            heads.iter().all(|h| h.contains("# 固定记忆")),
+            "every request head should be fixed memory: {heads:?}"
+        );
+        assert!(
+            heads.windows(2).all(|w| w[0] == w[1]),
+            "within TTL the fixed-memory bytes must be reused verbatim: {heads:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 分段双轨 e2e:NOTebook 稳定段(decisions/evidence)注入 **messages 前缀**,
+    /// 尾部冻结槽位块(NOTEBOOK 槽位)只含实时段(plan/attempted),两段隔离,
+    /// 各司其职 —— 稳定段在前缀长命区命中缓存,实时段在尾块新建代价低。
+    #[test]
+    fn notebook_stable_sections_inject_prefix_not_tail() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrderingNb};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct NbApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for NbApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let first_text: String = request
+                    .messages
+                    .first()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                let last_text: String = request
+                    .messages
+                    .last()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                self.captured
+                    .lock()
+                    .expect("lock")
+                    .push(vec![first_text, last_text]);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-notebook-stable-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 构造含稳定段 + 实时段的 NOTEBOOK
+        let note = "\
+# NOTEBOOK — Structured Working Memory
+本文件是 AI 助手的工作记忆。
+<plan>
+任务计划: 修复登录 401
+</plan>
+<attempted>
+- 方案A 失败
+</attempted>
+<decisions>
+- [d1] 数据层选 SQLite
+- [d2] 认证用 JWT
+</decisions>
+<evidence>
+[Bash] 基准: 100 req/s
+</evidence>";
+        let nb_path = std::fs::create_dir_all(&tmp.join(".claw")).expect("mkdir");
+        let _ = nb_path;
+        std::fs::write(tmp.join(".claw").join("NOTEBOOK.md"), note).expect("write notebook");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NbApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime.run_turn("继续", None).expect("turn should succeed");
+        runtime
+            .run_turn("继续", None)
+            .expect("turn2 should succeed");
+
+        let shots = captured.lock().expect("lock");
+        assert!(shots.len() >= 1, "at least one request");
+        let (first_text, last_text) = (&shots[0][0], &shots[0][1]);
+        assert!(
+            first_text.contains("设计决策与实验证据"),
+            "prefix should carry stable sections: {first_text}"
+        );
+        assert!(
+            first_text.contains("选 SQLite") && first_text.contains("100 req/s"),
+            "prefix carries decisions+evidence: {first_text}"
+        );
+        assert!(
+            !last_text.contains("设计决策与实验证据"),
+            "tail block should NOT carry stable sections: {last_text}"
+        );
+        assert!(
+            last_text.contains("任务计划: 修复登录 401"),
+            "tail block carries volatile plan: {last_text}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 多轮稳定性 e2e:同一会话连续 run_turn,固定记忆头部在热窗内逐字节
+    /// 稳定(命中 prompt 前缀缓存),冷窗(模拟 TTL 超时)后重建为最新快照。
+    ///
+    /// 覆盖三层:
+    /// 1. turn1 头部注入固定记忆简报(含「固定记忆」「当前目标」),且该轮
+    ///    末尾冻结槽位块仍在(RUNTIME_HINTS_HEADER 出现在尾部消息);
+    /// 2. turn2/3 热窗复用:请求 messages[0] 与 turn1 逐字节相等;
+    /// 3. 冷窗重建:手动把 `.claw/fixed_memory.json` 的 `injected_at_ms` 改为
+    ///    now - (FIXED_MEMORY_TTL_SECS*1000 + 1000),下一 turn 的 messages[0]
+    ///    为最新快照(含 turn3 新产出的 finding),指纹变化,落盘同步更新。
+    #[test]
+    fn fixed_memory_multiturn_render_and_byte_stability() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrderingMulti};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct MultiTurnFmApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for MultiTurnFmApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                // 捕获本轮请求全部消息文本:头部固定记忆槽 + 用户输入 + 尾部冻结槽位块
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                let n = self.calls.fetch_add(1, AtomicOrderingMulti::SeqCst);
+                match n {
+                    // turn1 产出首个 finding
+                    0 => Ok(vec![
+                        AssistantEvent::TextDelta("关键发现:根因是缓存失效。".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // turn2 平淡推进,不产出新 finding
+                    1 => Ok(vec![
+                        AssistantEvent::TextDelta("推进中".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // turn3 产出新 finding(冷窗重建后应出现在最新快照)
+                    2 => Ok(vec![
+                        AssistantEvent::TextDelta("关键发现:冷窗重建后新结论。".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // turn4 冷窗轮,平淡收尾
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta("收尾".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-fixed-memory-multiturn-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 首轮前手工落盘任务状态,确保 turn1 即有固定记忆可注入
+        let ts = crate::task_state::TaskState {
+            goal: "重构 auth 模块,兼容旧 Session 格式".to_string(),
+            findings: vec!["关键结论:拆分 token 校验".to_string()],
+            ..Default::default()
+        };
+        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
+            .expect("save task_state");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MultiTurnFmApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        // ---- turn1:长任务描述 → 头部注入固定记忆,尾部冻结槽位块仍在 ----
+        runtime
+            .run_turn("请深入重构 auth 模块并兼容旧 Session 格式,逐步推进", None)
+            .expect("turn1 should succeed");
+        {
+            let shots = captured.lock().expect("lock");
+            let texts = shots.first().expect("turn1 request captured");
+            let head = texts.first().expect("head message");
+            assert!(
+                head.contains("# 固定记忆") && head.contains("当前目标"),
+                "turn1 head must be fixed-memory brief: {head}"
+            );
+            assert!(
+                head.contains("验证指引"),
+                "turn1 head must include verification guidance: {head}"
+            );
+            let user_pos = texts
+                .iter()
+                .position(|t| t.contains("请深入重构 auth 模块"))
+                .expect("user input present");
+            assert!(
+                user_pos > 0,
+                "fixed memory must sit before user input (index {user_pos})"
+            );
+            assert!(
+                texts
+                    .last()
+                    .is_some_and(|t| t.starts_with(RUNTIME_HINTS_HEADER)),
+                "tail frozen block (RUNTIME_HINTS_HEADER) must be present, last={:?}",
+                texts.last()
+            );
+        }
+
+        // ---- turn2/3:同一会话热窗内连续运行,头部字节与 turn1 逐字节相等 ----
+        runtime
+            .run_turn("继续", None)
+            .expect("turn2 should succeed");
+        runtime
+            .run_turn("继续推进,保持当前任务不变", None)
+            .expect("turn3 should succeed");
+
+        {
+            let shots = captured.lock().expect("lock");
+            assert!(
+                shots.len() >= 3,
+                "three requests captured, got: {}",
+                shots.len()
+            );
+            let heads: Vec<&String> = shots.iter().map(|s| &s[0]).collect();
+            assert!(
+                heads[0] == heads[1] && heads[1] == heads[2],
+                "hot-window heads must be byte-identical across turns: {heads:?}"
+            );
+        }
+
+        // ---- 冷窗:模拟缓存超时,重建替换生效 ----
+        // 1) 按任务要求改落盘 `.claw/fixed_memory.json` 的 injected_at_ms
+        //    (经 crate::fixed_memory::load/save 修改,保留原 content/fingerprint)。
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let stale_ms = now_ms - (crate::fixed_memory::FIXED_MEMORY_TTL_SECS * 1000 + 1000);
+        let old_fp = crate::fixed_memory::load(&tmp)
+            .expect("snapshot persisted after turn1")
+            .fingerprint;
+        let mut disk_snap = crate::fixed_memory::load(&tmp).expect("load snapshot");
+        disk_snap.injected_at_ms = stale_ms;
+        crate::fixed_memory::save(&tmp, &disk_snap).expect("save stale snapshot");
+
+        // 2) 运行时 TTL 判定依据的是内存快照(磁盘仅作持久化,重建时回写),
+        //    同步把内存快照时间戳拨到过去,确定性地模拟"距上次注入已超 TTL"
+        //    (无法真实等待 300s)。
+        if let Some(snap) = &mut runtime.fixed_memory {
+            snap.injected_at_ms = stale_ms;
+        }
+
+        runtime
+            .run_turn("继续", None)
+            .expect("turn4 should succeed");
+
+        {
+            let shots = captured.lock().expect("lock");
+            assert!(
+                shots.len() >= 4,
+                "four requests captured, got: {}",
+                shots.len()
+            );
+            let head = shots[3].first().expect("turn4 head message");
+            assert!(
+                head.contains("固定记忆") || head.contains("FAKE_LLM_BRIEF"),
+                "turn4 head must still be a fixed-memory brief: {head}"
+            );
+            assert_ne!(head, &shots[0][0], "cold window must rebuild head bytes");
+            // 冷窗重建后,turn3 产出的 finding 应经规则通道进入磁盘 task_state
+            // (task_state 独立于 fixed_memory,不因 LLM 简报路径而丢失)。
+            let ts_after = crate::task_state::TaskState::load(
+                &tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE),
+            )
+            .expect("task_state persisted");
+            assert!(
+                ts_after
+                    .findings
+                    .iter()
+                    .any(|f| f.contains("冷窗重建后新结论")),
+                "turn3 finding must be in task_state: {:?}",
+                ts_after.findings
+            );
+            assert_ne!(
+                crate::fixed_memory::fingerprint(head),
+                crate::fixed_memory::fingerprint(&shots[0][0]),
+                "fingerprint must change after cold-window rebuild"
+            );
+        }
+        // 落盘快照同步重建:指纹变化 + 注入时间戳回到当前
+        let rebuilt = crate::fixed_memory::load(&tmp).expect("snapshot persisted after turn4");
+        assert_ne!(
+            rebuilt.fingerprint, old_fp,
+            "on-disk fingerprint must change after cold-window rebuild"
+        );
+        assert!(
+            rebuilt.injected_at_ms > stale_ms,
+            "on-disk injected_at_ms must be refreshed, got {} (stale was {stale_ms})",
+            rebuilt.injected_at_ms
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 固定记忆跨进程复用回归(2026-08-30):新会话进程内存态 fixed_memory=None,
+    /// 必须从磁盘加载上次注入快照,按持久化 injected_at_ms 判定热窗复用,而非
+    /// 误判"从未注入"而重建。修复前每轮新进程都重建 → 前缀字节漂移。
+    #[test]
+    fn fixed_memory_reused_across_processes_from_disk() {
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct CrossFmApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for CrossFmApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-fixed-memory-cross-proc-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 模拟"上一次会话进程"落盘的快照(热窗内:injected_at_ms=now)。
+        // 不写 task_state.json → build_snapshot 返回 None,prev 完全来自磁盘。
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let disk_content = "跨进程快照内容 ABC,热窗内应原样复用".to_string();
+        let disk_snap = crate::fixed_memory::FixedMemorySnapshot {
+            content: disk_content.clone(),
+            fingerprint: crate::fixed_memory::fingerprint(&disk_content),
+            injected_at_ms: now_ms,
+            last_summary_msg_index: 0,
+        };
+        crate::fixed_memory::save(&tmp, &disk_snap).expect("save disk snapshot");
+
+        // 新进程:全新 runtime 实例,内存 fixed_memory=None
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CrossFmApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime
+            .run_turn("继续上次任务", None)
+            .expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let head = shots
+            .first()
+            .expect("request captured")
+            .first()
+            .expect("head");
+        assert_eq!(
+            head, &disk_content,
+            "cross-process reuse must serve disk snapshot bytes verbatim"
+        );
+        // 复用路径不得重建落盘:磁盘 injected_at_ms 与 content 均保持不变
+        let after = crate::fixed_memory::load(&tmp).expect("load after turn");
+        assert_eq!(
+            after.injected_at_ms, now_ms,
+            "hot-window reuse must not refresh injected_at_ms"
+        );
+        assert_eq!(after.content, disk_content, "content must stay verbatim");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 固定记忆:无 workspace_root(默认构造)不注入,messages 头部为普通历史消息。
+    #[test]
+    fn fixed_memory_not_injected_without_workspace_root() {
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct FmApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for FmApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FmApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        // 注意:不调用 with_workspace_root
+
+        runtime
+            .run_turn("普通用户输入", None)
+            .expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let texts = shots.first().expect("request captured");
+        assert!(
+            !texts.iter().any(|t| t.contains("# 固定记忆")),
+            "no workspace_root -> no fixed memory injection: {texts:?}"
+        );
+        assert!(
+            texts.first().is_some_and(|t| t.contains("普通用户输入")),
+            "head should be the user input: {texts:?}"
+        );
+    }
+
+    /// P0:fixed_memory 300s 前瞻触发 — 距上次请求 > FIXED_MEMORY_PRECEDING_WINDOW_MS
+    /// (270s)时,用 LLM 对增量消息生成简报重写 fixed_memory:messages[0] 为 LLM
+    /// 简报(含 fake 标记与文件锚点),磁盘快照 injected_at_ms 刷新、摘要点游标推进。
+    ///
+    /// fake client 采用路由型:仅对固定记忆摘要 prompt 返回固定文本,其它 prompt
+    /// 返回 Err → 走启发式兜底,避免污染依赖"全局未注册 → 启发式"的既有 compact
+    /// 测试(OnceLock 单例不可还原,路由设计保证先注入/后注入行为一致)。
+    #[test]
+    fn fixed_memory_llm_triggered_after_preceding_window() {
+        use std::sync::Mutex;
+
+        struct FakeFmSummarizer;
+        impl crate::compact::CompactionSummarizerClient for FakeFmSummarizer {
+            fn summarize(&self, prompt: &str) -> Result<String, String> {
+                if prompt.contains("固定记忆简报") {
+                    Ok("FAKE_LLM_BRIEF: 已完成登录 401 修复(auth.rs),下一步补回归测试".to_string())
+                } else {
+                    Err("not a fixed-memory prompt".to_string())
+                }
+            }
+        }
+        crate::compact::set_global_compaction_summarizer_client(Arc::new(FakeFmSummarizer));
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct FmApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for FmApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-fixed-memory-llm-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 预置磁盘快照(prev):injected_at_ms 距今 > 270s,使前瞻触发判定
+        // (基于磁盘持久化的上次注入时间)成立——跨进程语义下 last_request_at_ms
+        // 是内存字段,新进程会丢,因此触发窗口以 injected_at_ms 为准。
+        let t0 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let old_snap = crate::fixed_memory::FixedMemorySnapshot {
+            content: "旧简报".to_string(),
+            fingerprint: crate::fixed_memory::fingerprint("旧简报"),
+            injected_at_ms: t0 - crate::fixed_memory::FIXED_MEMORY_PRECEDING_WINDOW_MS - 1,
+            last_summary_msg_index: 0,
+        };
+        crate::fixed_memory::save(&tmp, &old_snap).expect("save prev snapshot");
+
+        // 预置会话消息:增量输入需有实质内容(user + assistant + tool_result),
+        // 否则 maybe_llm_summary 变更门控返回 None,无法走到 LLM 调用。
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::user_text("修复登录 401"))
+            .expect("push user");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "根因:缓存失效".to_string(),
+            }]))
+            .expect("push assistant");
+        session
+            .push_message(ConversationMessage::tool_result(
+                "1",
+                "Edit",
+                "auth.rs 修改完成",
+                false,
+            ))
+            .expect("push tool result");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            FmApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        // 触发窗口已由上面预置的磁盘快照 injected_at_ms 驱动(距上次注入 > 270s)。
+        runtime.run_turn("继续", None).expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let head = shots
+            .first()
+            .expect("request captured")
+            .first()
+            .expect("head message");
+        assert!(
+            head.contains("FAKE_LLM_BRIEF"),
+            "前瞻触发后 messages[0] 应为 LLM 简报: {head}"
+        );
+        assert!(head.contains("auth.rs"), "LLM 简报应含文件锚点: {head}");
+        // 磁盘快照:LLM 简报落盘 + injected_at_ms 刷新 + 摘要点游标推进
+        let disk = crate::fixed_memory::load(&tmp).expect("disk snapshot after LLM trigger");
+        assert!(
+            disk.content.contains("FAKE_LLM_BRIEF"),
+            "disk content must be the LLM brief: {}",
+            disk.content
+        );
+        assert!(
+            disk.injected_at_ms >= t0,
+            "injected_at_ms must refresh to now, got {} (t0={t0})",
+            disk.injected_at_ms
+        );
+        assert!(
+            disk.last_summary_msg_index > 0,
+            "summary cursor must advance: {}",
+            disk.last_summary_msg_index
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// P1 幻觉交叉校验端到端:LLM 前瞻触发轮,落盘/注入前用规则通道
+    /// task_state.findings 交叉校验 LLM 简报 —— LLM 漏报的规则结论以注脚追加
+    /// 到简报末尾;messages[0] 与磁盘快照的 content/fingerprint 均为校验后文本。
+    #[test]
+    fn fixed_memory_llm_brief_cross_validated_with_task_state() {
+        use std::sync::Mutex;
+
+        struct FakeFmXvalSummarizer;
+        impl crate::compact::CompactionSummarizerClient for FakeFmXvalSummarizer {
+            fn summarize(&self, prompt: &str) -> Result<String, String> {
+                if prompt.contains("固定记忆简报") {
+                    // 模拟 LLM 漏报规则已确认结论:简报不含预置 findings 关键词
+                    Ok("FAKE_LLM_BRIEF: 已完成登录 401 修复(auth.rs),下一步补回归测试".to_string())
+                } else {
+                    Err("not a fixed-memory prompt".to_string())
+                }
+            }
+        }
+        crate::compact::set_global_compaction_summarizer_client(Arc::new(FakeFmXvalSummarizer));
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct FmXvalApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for FmXvalApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-fixed-memory-xval-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 规则通道:task_state.findings —— 两条均不被 fake LLM 简报覆盖
+        let ts = crate::task_state::TaskState {
+            goal: "重构 auth 模块".to_string(),
+            findings: vec![
+                "关键结论:拆分 token 校验".to_string(),
+                "根因:缓存失效".to_string(),
+            ],
+            ..Default::default()
+        };
+        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
+            .expect("save task_state");
+
+        // 预置磁盘快照:injected_at_ms 拨到前瞻窗口之外,强制 LLM 路径触发
+        let t0 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let old_snap = crate::fixed_memory::FixedMemorySnapshot {
+            content: "旧简报".to_string(),
+            fingerprint: crate::fixed_memory::fingerprint("旧简报"),
+            injected_at_ms: t0 - crate::fixed_memory::FIXED_MEMORY_PRECEDING_WINDOW_MS - 1,
+            last_summary_msg_index: 0,
+        };
+        crate::fixed_memory::save(&tmp, &old_snap).expect("save prev snapshot");
+
+        // 预置会话消息:增量输入有实质内容,通过 maybe_llm_summary 变更门控
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::user_text("修复登录 401"))
+            .expect("push user");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "根因:缓存失效".to_string(),
+            }]))
+            .expect("push assistant");
+        session
+            .push_message(ConversationMessage::tool_result(
+                "1",
+                "Edit",
+                "auth.rs 修改完成",
+                false,
+            ))
+            .expect("push tool result");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            FmXvalApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime.run_turn("继续", None).expect("turn should succeed");
+
+        {
+            let shots = captured.lock().expect("lock");
+            let head = shots
+                .first()
+                .expect("request captured")
+                .first()
+                .expect("head message");
+            // LLM 路径已触发(而非规则 build_snapshot)
+            assert!(head.contains("FAKE_LLM_BRIEF"), "LLM brief at head: {head}");
+            // 交叉校验注脚:规则确认但简报未体现的结论追加到简报末尾
+            assert!(
+                head.contains("规则通道确认但简报未体现"),
+                "cross-validation footer must be appended: {head}"
+            );
+            assert!(
+                head.contains("拆分 token 校验"),
+                "missing finding 1: {head}"
+            );
+            assert!(head.contains("缓存失效"), "missing finding 2: {head}");
+        }
+        // 磁盘快照与注入文本一致:content 含注脚,fingerprint 对应校验后文本
+        let disk = crate::fixed_memory::load(&tmp).expect("disk snapshot after LLM trigger");
+        assert!(
+            disk.content.contains("规则通道确认"),
+            "disk content must include cross-validation footer: {}",
+            disk.content
+        );
+        assert_eq!(
+            disk.fingerprint,
+            crate::fixed_memory::fingerprint(&disk.content),
+            "disk fingerprint must match validated content (content/fingerprint/insert 一致)"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// P0 对照:未到前瞻窗口(距上次请求 < 270s)时,不触发 LLM 摘要,messages[0]
+    /// 仍是规则快照(含「# 固定记忆」「当前目标」),fake 标记不得出现。
+    #[test]
+    fn fixed_memory_not_llm_triggered_within_window() {
+        use std::sync::Mutex;
+
+        struct FakeFmSummarizer2;
+        impl crate::compact::CompactionSummarizerClient for FakeFmSummarizer2 {
+            fn summarize(&self, prompt: &str) -> Result<String, String> {
+                // 与 fixed_memory_llm_triggered_after_preceding_window 的 fake 返回
+                // 相同文本:OnceLock 单例下无论哪个测试先注册,行为一致(热窗内本
+                // 测试只断言标记不得出现,文本含 auth.rs 不影响)。
+                if prompt.contains("固定记忆简报") {
+                    Ok("FAKE_LLM_BRIEF: 已完成登录 401 修复(auth.rs),下一步补回归测试".to_string())
+                } else {
+                    Err("not a fixed-memory prompt".to_string())
+                }
+            }
+        }
+        crate::compact::set_global_compaction_summarizer_client(Arc::new(FakeFmSummarizer2));
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct FmApi2 {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for FmApi2 {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-fixed-memory-nowindow-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 写 task_state → 规则快照有内容可建(不依赖 LLM)
+        let ts = crate::task_state::TaskState {
+            goal: "修复登录 401".to_string(),
+            findings: vec!["根因:缓存失效".to_string()],
+            ..Default::default()
+        };
+        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
+            .expect("save task_state");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FmApi2 {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        // 窗口内:距上次请求 10s(< 270s)→ 不触发 LLM,走规则 next_injection
+        let now0 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        runtime.last_request_at_ms = Some(now0 - 10_000);
+
+        runtime.run_turn("继续", None).expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let head = shots
+            .first()
+            .expect("request captured")
+            .first()
+            .expect("head message");
+        assert!(head.contains("# 固定记忆"), "窗口内应为规则快照: {head}");
+        assert!(head.contains("当前目标"), "规则快照应含 goal 行: {head}");
+        assert!(
+            !head.contains("FAKE_LLM_BRIEF"),
+            "窗口内不得触发 LLM 摘要: {head}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -11587,6 +12918,245 @@ mod tests {
             memory.entries()
         );
 
+        let _ = std::fs::remove_file(&memory_path);
+    }
+
+    // ----- P2: memory_update 工具(模型主动管理 PersistentMemory) -----
+
+    #[test]
+    fn execute_memory_update_updates_persona_block_and_persists() {
+        let memory_path = temp_session_path("memory-update-block");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(PersistentMemory::empty(&memory_path));
+
+        let output = runtime
+            .execute_memory_update(r#"{"block":"persona","content":"资深 Rust 工程师"}"#)
+            .expect("block update should succeed");
+        assert!(
+            output.contains("Persona"),
+            "confirmation should name the block: {output}"
+        );
+        assert!(
+            output.contains("已写入持久记忆"),
+            "must include persistence hint: {output}"
+        );
+
+        // In-memory block updated.
+        let memory = runtime.persistent_memory().expect("memory attached");
+        assert!(memory.blocks()[0].content().contains("资深 Rust 工程师"));
+        // Frozen prefix stays stable within this session (cache-hit guarantee).
+        assert!(
+            !memory.frozen_render().contains("资深 Rust 工程师"),
+            "frozen prefix must not include mid-session block writes"
+        );
+
+        // Reload from disk — next session sees the block in the frozen render.
+        let reloaded = PersistentMemory::load_and_freeze(&memory_path);
+        assert!(reloaded.frozen_render().contains("资深 Rust 工程师"));
+        let _ = std::fs::remove_file(&memory_path);
+    }
+
+    #[test]
+    fn execute_memory_update_add_entry_recallable_in_current_session() {
+        let memory_path = temp_session_path("memory-update-entry");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(PersistentMemory::empty(&memory_path));
+
+        let output = runtime
+            .execute_memory_update(
+                r#"{"op":"add_entry","content":"user prefers dark mode terminals","source":"memory_update"}"#,
+            )
+            .expect("add_entry should succeed");
+        assert!(output.contains("已写入语义记忆 entry"), "output: {output}");
+
+        // Entry mirrored into the semantic L1 index → recallable this session.
+        let memory = runtime.persistent_memory().expect("memory attached");
+        let hits = memory.semantic_recall("dark mode", 3);
+        assert!(
+            hits.iter().any(|h| h.entry.summary.contains("dark mode")),
+            "entry must be recallable in the current session: {hits:?}"
+        );
+        let _ = std::fs::remove_file(&memory_path);
+    }
+
+    #[test]
+    fn execute_memory_update_replace_and_remove_entries() {
+        let memory_path = temp_session_path("memory-update-replace-remove");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(PersistentMemory::empty(&memory_path));
+
+        runtime
+            .execute_memory_update(r#"{"op":"add_entry","content":"user prefers tabs"}"#)
+            .expect("seed entry");
+
+        let output = runtime
+            .execute_memory_update(
+                r#"{"op":"replace_entry","pattern":"tabs","content":"user prefers spaces"}"#,
+            )
+            .expect("replace_entry should succeed");
+        assert!(output.contains("已替换语义记忆 entry"), "output: {output}");
+
+        let output = runtime
+            .execute_memory_update(r#"{"op":"remove_entry","pattern":"spaces"}"#)
+            .expect("remove_entry should succeed");
+        assert!(
+            output.contains("已移除匹配的语义记忆 entry"),
+            "output: {output}"
+        );
+
+        let memory = runtime.persistent_memory().expect("memory attached");
+        assert!(
+            memory
+                .entries()
+                .iter()
+                .all(|e| !e.content.contains("spaces")),
+            "removed entry must no longer be active"
+        );
+        let _ = std::fs::remove_file(&memory_path);
+    }
+
+    #[test]
+    fn execute_memory_update_errors_without_persistent_memory() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let err = runtime
+            .execute_memory_update(r#"{"block":"persona","content":"x"}"#)
+            .expect_err("must error without persistent memory");
+        assert!(err.contains("persistent memory 未启用"), "err: {err}");
+    }
+
+    #[test]
+    fn execute_memory_update_rejects_malformed_json_and_missing_fields() {
+        let memory_path = temp_session_path("memory-update-bad-input");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(PersistentMemory::empty(&memory_path));
+
+        let err = runtime
+            .execute_memory_update("not valid json")
+            .expect_err("malformed json must error");
+        assert!(
+            err.contains("invalid memory_update input JSON"),
+            "err: {err}"
+        );
+
+        let err = runtime
+            .execute_memory_update(r#"{"content":"no op or block"}"#)
+            .expect_err("missing block/op must error");
+        assert!(err.contains("必须提供 block 或 op"), "err: {err}");
+
+        let err = runtime
+            .execute_memory_update(r#"{"block":"soul","content":"x"}"#)
+            .expect_err("unknown block must error");
+        assert!(err.contains("unknown memory block"), "err: {err}");
+        let _ = std::fs::remove_file(&memory_path);
+    }
+
+    #[test]
+    fn run_turn_intercepts_memory_update_tool_call() {
+        struct MemoryApi {
+            calls: usize,
+        }
+        impl ApiClient for MemoryApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-mem-1".to_string(),
+                            name: "memory_update".to_string(),
+                            input: r#"{"block":"tasks","content":"当前任务:完成 P2 工具"}"#
+                                .to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        // The confirmation must be inserted as a tool result
+                        // before the second API call (intercept, not fall
+                        // through to StaticToolExecutor).
+                        let tool_msg = request
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == MessageRole::Tool)
+                            .expect("tool result present");
+                        let output = match &tool_msg.blocks[0] {
+                            ContentBlock::ToolResult { output, .. } => output.clone(),
+                            _ => panic!("expected tool result block"),
+                        };
+                        assert!(
+                            output.contains("Tasks") && output.contains("已写入持久记忆"),
+                            "expected memory_update confirmation: {output}"
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("memory updated".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("unexpected extra API call"),
+                }
+            }
+        }
+
+        let memory_path = temp_session_path("memory-update-intercepted");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MemoryApi { calls: 0 },
+            // Intentionally empty: memory_update must NOT fall through to the
+            // executor — it is intercepted inside run_turn.
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_persistent_memory(PersistentMemory::empty(&memory_path));
+
+        let summary = runtime
+            .run_turn("update memory", None)
+            .expect("turn should complete");
+        assert_eq!(summary.iterations, 2);
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(
+            !*is_error,
+            "memory_update should not produce an error result: {output}"
+        );
+
+        // Block persisted to disk — next session sees it in the frozen prefix.
+        let reloaded = PersistentMemory::load_and_freeze(&memory_path);
+        assert!(reloaded.frozen_render().contains("完成 P2 工具"));
         let _ = std::fs::remove_file(&memory_path);
     }
 

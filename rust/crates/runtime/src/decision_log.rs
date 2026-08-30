@@ -1379,11 +1379,22 @@ pub fn persist_decisions_to_notebook(
     }
     // 追加到 decisions 段(不覆盖,累积记录)
     let existing = notebook.get_section("decisions").unwrap_or_default();
+    // 备份兜底:在去重/裁剪前归档当前旧段。LLM 语义压缩与规则去重都会
+    // 缩减 decisions 段 —— 被缩减掉的独特决策细节(如某决策的 rationale /
+    // alternatives)可能因此丢失。先把旧段完整归档到
+    // `.claw/decisions_archive.jsonl`,AI 需要细节时可 read 找回。
+    if !existing.is_empty() {
+        let _ = crate::decisions_archive::archive_decisions_snapshot(workspace_root, existing);
+    }
     let combined = if existing.is_empty() {
         rendered
     } else {
         format!("{existing}\n{rendered}")
     };
+    // 追加前先做确定性去重(源头防膨胀):压缩已有段的重复行/同主题条目,
+    // 与 notebook_update 写入路径的 dedupe_decisions_section 保持一致,
+    // 避免反复追加同一主题思考过程导致段无限膨胀。
+    let combined = crate::notebook::dedupe_decisions_section(&combined);
     // 检查上限:NOTEBOOK_MAX_CHARS = 16_000,decisions 段预留 14_000 字符
     // 超限时保留最近 100 行(从末尾截取),丢弃旧决策
     if combined.len() > 14_000 {

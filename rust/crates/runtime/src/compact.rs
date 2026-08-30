@@ -61,6 +61,21 @@ pub fn is_compaction_summarizer_registered() -> bool {
         .is_some_and(|slot| slot.is_some())
 }
 
+/// 可复用的 LLM 摘要入口(fixed_memory 前瞻触发复用同一压缩摘要 client)。
+///
+/// 与 [`summarize_messages_with_llm`] 的区别:直接返回模型原文(不包装
+/// `<summary>` 块、不做 bullet 规范化),调用方按需处理。失败降级策略:
+/// 未注册 / 调用失败 / 返回空文本 → `None`(**不打印告警**,避免固定记忆
+/// 每 ~5 分钟空转噪声;降级由 fixed_memory 侧静默完成)。
+#[must_use]
+pub fn llm_summarize(prompt: &str) -> Option<String> {
+    let client = global_compaction_summarizer()?;
+    match client.summarize(prompt) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        _ => None,
+    }
+}
+
 fn global_compaction_summarizer() -> Option<Arc<dyn CompactionSummarizerClient>> {
     GLOBAL_COMPACTION_SUMMARIZER
         .get()

@@ -79,6 +79,185 @@ pub const NOTEBOOK_MAX_CHARS: usize = 16_000;
 /// 超出时从头部裁剪(保留最新的证据),避免证据段挤占其他段的容量。
 pub const EVIDENCE_MAX_CHARS: usize = 4_096;
 
+/// `<decisions>` 段最大字符数。
+///
+/// LLM 通过 `notebook_update` 向 decisions 段追加内容时不做任何去重,
+/// 同一主题的思考过程会被反复记录(实测单个会话可堆积 14 条近似重复),
+/// 导致该段膨胀至 7.6K 字符、占冻结槽位块 token 的 45%。超出此上限时
+/// 从头部裁剪(保留最新的决策),与 `<attempted>` 段容量策略一致。
+pub const DECISIONS_MAX_CHARS: usize = 6_144;
+
+/// 对 `<decisions>` 段做确定性去重(源头防膨胀,无损)。
+///
+/// 处理三类冗余(实测 7,614 字符 → 6,435,压缩 ~15%;语义级重复
+/// 需 LLM 压缩,本函数只做规则可判定的部分):
+/// 1. **bash 过程噪音**:纯工具调用记录(`bash` 行 + 紧随的 `{json}` 行),
+///    非决策内容,整块剔除;
+/// 2. **行级去重**:trim 后完全相同的行只保留首次出现;
+/// 3. **同 ID 首句归并**:`- [dXXXX] 首句...` 条目中,会话 ID 相同且首句
+///    (去 `- [id] ` 前缀后前 20 字符)相同的视为同一主题的重复记录,
+///    保留信息最全(字符数最多)的一条;
+/// 4. **上限裁剪**:超过 [`DECISIONS_MAX_CHARS`] 时从头部裁剪,保留最新。
+///
+/// 保序输出(首次出现顺序),不改变剩余条目的相对位置。
+#[must_use]
+pub fn dedupe_decisions_section(content: &str) -> String {
+    // 1) 剔除 bash 噪音块
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let is_bash_noise = lines[i].trim() == "bash"
+            && lines
+                .get(i + 1)
+                .is_some_and(|nxt| nxt.trim().starts_with('{'));
+        if is_bash_noise {
+            i += 2; // 跳过 bash 行与首个 JSON 行
+                    // 跳过 JSON 的续行(以 { / } / " 开头的行)
+            while i < lines.len()
+                && (lines[i].trim().starts_with('{')
+                    || lines[i].trim().starts_with('}')
+                    || lines[i].trim().starts_with('"'))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        kept.push(lines[i]);
+        i += 1;
+    }
+
+    // 2) 拆条目(以 "- [d" 开头的行作为新条目起点)
+    let mut entries: Vec<Vec<&str>> = Vec::new();
+    for line in kept {
+        if entries.is_empty() || line.trim().starts_with("- [d") {
+            entries.push(Vec::new());
+        }
+        let last = entries.last_mut().expect("entry exists");
+        last.push(line);
+    }
+
+    // 3) 行级去重(trim 后相同只保留首次)
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped: Vec<Vec<String>> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut ne: Vec<String> = Vec::with_capacity(entry.len());
+        for line in entry {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                ne.push(line.to_string());
+                continue;
+            }
+            if seen.contains(trimmed) {
+                continue;
+            }
+            seen.insert(trimmed.to_string());
+            ne.push(line.to_string());
+        }
+        deduped.push(ne);
+    }
+
+    // 4) 同 ID 首句归并:key = (id, 首句前20字符),保留字符数最多的条目
+    #[derive(Clone)]
+    struct Group {
+        key: (String, String),
+        text: String,
+        order: usize,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let entry_texts: Vec<String> = deduped
+        .iter()
+        .map(|e| e.join("\n"))
+        .collect::<Vec<String>>();
+
+    for (idx, text) in entry_texts.iter().enumerate() {
+        let first = text
+            .lines()
+            .find(|l| l.trim().starts_with("- [d"))
+            .unwrap_or("")
+            .trim();
+        let key = if let Some(rest) = first.strip_prefix("- [") {
+            if let Some(end) = rest.find(']') {
+                let id = rest[..end].to_string();
+                let sentence = rest[end + 1..].trim().chars().take(20).collect::<String>();
+                (id, sentence)
+            } else {
+                ("__noid__".to_string(), first.chars().take(20).collect())
+            }
+        } else {
+            ("__noid__".to_string(), first.chars().take(20).collect())
+        };
+        if let Some(g) = groups.iter_mut().find(|g| g.key == key) {
+            if text.len() > g.text.len() {
+                g.text = text.clone();
+            }
+        } else {
+            groups.push(Group {
+                key,
+                text: text.clone(),
+                order: idx,
+            });
+        }
+    }
+    groups.sort_by_key(|g| g.order);
+
+    // 5) 拼接
+    let joined = groups
+        .iter()
+        .map(|g| g.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // 6) 上限裁剪:从头部裁剪保留最新(尾部)
+    if joined.chars().count() <= DECISIONS_MAX_CHARS {
+        return joined;
+    }
+    let overflow = joined.chars().count() - DECISIONS_MAX_CHARS;
+    let skipped: String = joined.chars().skip(overflow).collect();
+    if let Some(nl) = skipped.find('\n') {
+        skipped[nl + 1..].to_string()
+    } else {
+        skipped
+    }
+}
+
+/// 前缀冻结区稳定段快照持久化文件名(位于 `.claw/` 下)。
+///
+/// NOTEBOOK 稳定段(decisions + evidence)低频变化但体量偏大,请求构造时按
+/// TTL 热窗决策注入 messages 前缀(与 [`crate::fixed_memory::FixedMemorySnapshot`]
+/// 同机制)。热窗内复用旧快照字节 → 前缀命中缓存;TTL 过期后重建注入。
+pub const NOTEBOOK_STABLE_SNAPSHOT_FILE: &str = "notebook_stable_snapshot.json";
+
+/// 返回稳定段快照的落盘路径:`<root>/.claw/notebook_stable_snapshot.json`。
+#[must_use]
+pub fn notebook_stable_snapshot_path(root: &Path) -> PathBuf {
+    root.join(".claw").join(NOTEBOOK_STABLE_SNAPSHOT_FILE)
+}
+
+/// 从磁盘加载 NOTEBOOK 稳定段快照,失败/不存在返回 None。
+///
+/// 复用 [`crate::fixed_memory::FixedMemorySnapshot`] 结构(含 last_summary_msg_index
+/// 字段,本场景恒为 0,仅作结构复用),保证与 fixed_memory 的热窗/TTL 决策
+/// 逻辑(`next_injection`)完全一致。
+#[must_use]
+pub fn load_stable_snapshot(root: &Path) -> Option<crate::fixed_memory::FixedMemorySnapshot> {
+    let content = std::fs::read_to_string(notebook_stable_snapshot_path(root)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// 持久化稳定段快照到磁盘(自动创建 `.claw/` 目录)。失败返回错误信息(不 panic)。
+pub fn save_stable_snapshot(
+    root: &Path,
+    snap: &crate::fixed_memory::FixedMemorySnapshot,
+) -> Result<(), String> {
+    let path = notebook_stable_snapshot_path(root);
+    let content = serde_json::to_string_pretty(snap).map_err(|e| format!("serialize: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    std::fs::write(path, content).map_err(|e| format!("write: {e}"))
+}
+
 /// NOTEBOOK.md 的段标识(Anthropic 推荐的 XML 标签分段)。
 ///
 /// 顺序固定,便于 LLM 解析和人类阅读。
@@ -96,6 +275,17 @@ pub const SECTION_TAGS: &[&str] = &[
     "decisions", // §4.7 v3 新增:设计决策持久化段(compaction 前自动提取)
     "evidence",  // 改进点 12 新增:实验证据持久化段(compaction 前自动提取)
 ];
+
+/// 前缀冻结区段:低频变化(决策/证据通常 compaction 前才追加)、体量偏大。
+/// 注入 messages 前缀后字节稳定,热窗内存续命中;与实时段分离的核心依据
+/// 是「变化频次 × 变化后长度」—— 稳定段每轮重建的代价远高于实时段,
+/// 因此归入可命中的长命区,实时段留在尾部新建区。
+pub const STABLE_SECTION_TAGS: &[&str] = &["decisions", "evidence"];
+
+/// 尾部冻结槽位块段:高频/实时变化(计划进度、失败记录、子智能体注册)。
+/// 留在 messages 末尾,变化只影响尾块不破坏前缀。
+pub const VOLATILE_SECTION_TAGS: &[&str] =
+    &["plan", "subagents", "attempted", "preferences", "key_files"];
 
 /// NOTEBOOK.md 的渲染头部,解释文档用途,引导 LLM 正确维护。
 pub const NOTEBOOK_HEADER: &str = "# NOTEBOOK — Structured Working Memory\n\
@@ -278,6 +468,66 @@ impl Notebook {
     pub fn render_for_prompt(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         for tag in SECTION_TAGS {
+            let Some(content) = self.sections.get(*tag) else {
+                continue;
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            parts.push(format!("<{tag}>\n{content}\n</{tag}>"));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        format!(
+            "# Working Memory (NOTEBOOK.md)\n\
+             以下是持久化的工作记忆,跨压缩不会丢失。\
+             使用 `notebook_update` 工具维护本记忆。\n\n\
+             {}\n\n\
+             提示:完成非平凡修复后,调用 `log_decision` 持久化经验(问题签名+根因+方案+验证结果);\
+             开始非平凡修复前,先 `search_past_decisions` 查是否遇到过类似问题。",
+            parts.join("\n\n")
+        )
+    }
+
+    /// 渲染**稳定段**(当前 [`STABLE_SECTION_TAGS`])为前缀冻结区注入文本。
+    ///
+    /// 这些段低频变化(决策/证据通常在 compaction 前才追加)且体量偏大,
+    /// 归入 **messages 前缀冻结区**:注入后字节稳定,配合 DeepSeek 缓存 TTL
+    /// 在热窗内持续命中,不再每轮全量重建。空段跳过,全部为空返回空串。
+    #[must_use]
+    pub fn render_stable_sections(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for tag in STABLE_SECTION_TAGS {
+            let Some(content) = self.sections.get(*tag) else {
+                continue;
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            parts.push(format!("<{tag}>\n{content}\n</{tag}>"));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        format!(
+            "# 设计决策与实验证据(前缀冻结)\n\
+             以下为 NOTEBOOK 中低频变化的稳定段,跨压缩持久化。\n\n\
+             {}\n\n\
+             提示:需要被压缩掉的历史决策细节时,可用 read_file 读取 `decisions_archive.jsonl`。",
+            parts.join("\n\n")
+        )
+    }
+
+    /// 渲染**实时段**(当前 [`VOLATILE_SECTION_TAGS`])为尾部冻结槽位块注入文本。
+    ///
+    /// 这些段高频变化(计划进度/失败记录/子智能体注册),
+    /// 留在 **messages 末尾冻结槽位块**(变化只影响尾块,不破坏前缀)。
+    /// 空段跳过,全部为空返回空串。
+    #[must_use]
+    pub fn render_volatile_sections(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for tag in VOLATILE_SECTION_TAGS {
             let Some(content) = self.sections.get(*tag) else {
                 continue;
             };
@@ -552,6 +802,15 @@ pub fn execute_notebook_update(workspace_root: &Path, input: &str) -> Result<Str
     // 加载现有 NOTEBOOK
     let mut notebook =
         Notebook::load(workspace_root).map_err(|e| format!("failed to load notebook: {e}"))?;
+    // 备份兜底:decisions 段即将被修改(set 覆盖 / append 追加后去重都会缩减
+    // 旧段),被合并/剔除的独特决策细节可能丢失。先把当前旧段完整归档到
+    // `.claw/decisions_archive.jsonl`,AI 需要细节时可 read 找回。
+    // 归档失败静默忽略(不阻断写入)。
+    if parsed.section == "decisions" {
+        if let Some(sec) = notebook.get_section("decisions") {
+            let _ = crate::decisions_archive::archive_decisions_snapshot(workspace_root, sec);
+        }
+    }
     // 应用更新
     match parsed.mode.as_str() {
         "set" => {
@@ -562,6 +821,14 @@ pub fn execute_notebook_update(workspace_root: &Path, input: &str) -> Result<Str
         }
         other => {
             return Err(format!("invalid mode '{other}': must be 'set' or 'append'"));
+        }
+    }
+    // decisions 段去重(源头防膨胀):LLM 通过 append 反复记录同一主题的
+    // 思考过程会堆积大量近似重复,每次写入后自动去重,防止段无限膨胀。
+    if parsed.section == "decisions" {
+        if let Some(sec) = notebook.get_section("decisions") {
+            let deduped = dedupe_decisions_section(sec);
+            notebook.set_section("decisions", &deduped);
         }
     }
     // 原子写回
@@ -1031,5 +1298,160 @@ mod tests {
         );
         assert!(sec.contains("cmd 99"), "保留最新的尝试");
         assert!(!sec.contains("cmd 0"), "最旧的尝试被裁剪");
+    }
+
+    // ---- decisions 段去重(源头防膨胀) ----
+
+    #[test]
+    fn dedupe_decisions_removes_bash_noise() {
+        let content = "\
+- [d1] 决策 A: 选 SQLite
+bash
+{\"command\": \"cargo test\", \"timeout\": 60}
+- [d1] 决策 B: 加索引";
+        let out = super::dedupe_decisions_section(content);
+        assert!(!out.contains("cargo test"), "bash 噪音应被剔除");
+        assert!(out.contains("决策 A"), "保留真实决策");
+        assert!(out.contains("决策 B"), "保留真实决策");
+    }
+
+    #[test]
+    fn dedupe_decisions_collapses_duplicate_lines() {
+        let content = "\
+- [d1] 决策 A
+重复的思考过程
+重复的思考过程
+- [d2] 决策 B";
+        let out = super::dedupe_decisions_section(content);
+        assert_eq!(out.matches("重复的思考过程").count(), 1, "相同行只保留一次");
+        assert!(out.contains("决策 A"));
+        assert!(out.contains("决策 B"));
+    }
+
+    #[test]
+    fn dedupe_decisions_merges_same_id_same_opening() {
+        let content = "\
+- [d1] 方案:用递归脱敏函数
+  细节 1
+- [d1] 方案:用递归脱敏函数
+  细节 1
+  细节 2";
+        let out = super::dedupe_decisions_section(content);
+        // 同 ID + 同首句 → 合并,保留信息最全(含细节 2)的一条
+        assert!(out.contains("细节 2"), "保留信息更全的条目");
+        assert!(out.matches("细节 1").count() == 1, "重复行合并");
+    }
+
+    #[test]
+    fn dedupe_decisions_preserves_order_and_distinct_ids() {
+        let content = "\
+- [d1] 主题 A
+- [d2] 主题 B
+- [d3] 主题 C";
+        let out = super::dedupe_decisions_section(content);
+        let pos_a = out.find("主题 A").expect("A");
+        let pos_b = out.find("主题 B").expect("B");
+        let pos_c = out.find("主题 C").expect("C");
+        assert!(pos_a < pos_b && pos_b < pos_c, "保序输出");
+    }
+
+    #[test]
+    fn dedupe_decisions_caps_at_max_chars_keeping_newest() {
+        // 构造超过 DECISIONS_MAX_CHARS 的内容
+        let long = "x".repeat(super::DECISIONS_MAX_CHARS / 2);
+        let content = format!("- [d1] 旧决策\n{long}\n- [d2] 新决策\n{long}");
+        let out = super::dedupe_decisions_section(&content);
+        assert!(
+            out.chars().count() <= super::DECISIONS_MAX_CHARS,
+            "必须被裁剪到上限内, got {}",
+            out.chars().count()
+        );
+        assert!(out.contains("新决策"), "保留最新决策");
+    }
+
+    #[test]
+    fn notebook_update_decisions_auto_dedupes() {
+        let dir = temp_workspace();
+        let input =
+            r#"{"mode": "append", "section": "decisions", "content": "- [d1] 同一主题的重复思考"}"#;
+        execute_notebook_update(dir.path(), input).expect("append 1");
+        execute_notebook_update(dir.path(), input).expect("append 2");
+        let nb = Notebook::load(dir.path()).expect("load");
+        let sec = nb.get_section("decisions").expect("decisions");
+        assert_eq!(
+            sec.matches("同一主题的重复思考").count(),
+            1,
+            "重复追加应被去重"
+        );
+        // 备份兜底:每次写入前旧段归档到 decisions_archive.jsonl
+        let archive_path = dir
+            .path()
+            .join(crate::decisions_archive::DECISIONS_ARCHIVE_FILENAME);
+        assert!(archive_path.exists(), "decisions 归档文件应被创建");
+        let archive_content = std::fs::read_to_string(&archive_path).expect("read archive");
+        assert_eq!(
+            archive_content.lines().count(),
+            1,
+            "首次写入前 decisions 段为空不归档,第二次写入前归档首条"
+        );
+        let record: crate::decisions_archive::ArchivedDecision =
+            serde_json::from_str(archive_content.lines().next().expect("line")).expect("parse");
+        assert_eq!(record.content, "- [d1] 同一主题的重复思考");
+    }
+
+    // ---- 分段双轨:稳定段(decisions/evidence) vs 实时段(plan/attempted 等) ----
+
+    #[test]
+    fn render_stable_sections_only_includes_decisions_and_evidence() {
+        let mut nb = Notebook::new();
+        nb.set_section("decisions", "- [d1] 选 SQLite");
+        nb.set_section("evidence", "[Bash] 基准: 100 req/s");
+        nb.set_section("plan", "任务计划");
+        nb.set_section("attempted", "- 方案A 失败");
+        let stable = nb.render_stable_sections();
+        assert!(stable.contains("<decisions>"), "稳定段应含 decisions");
+        assert!(stable.contains("选 SQLite"));
+        assert!(stable.contains("<evidence>"), "稳定段应含 evidence");
+        assert!(!stable.contains("任务计划"), "稳定段不应含 plan");
+        assert!(!stable.contains("方案A"), "稳定段不应含 attempted");
+    }
+
+    #[test]
+    fn render_volatile_sections_excludes_stable_sections() {
+        let mut nb = Notebook::new();
+        nb.set_section("decisions", "- [d1] 选 SQLite");
+        nb.set_section("evidence", "[Bash] 基准: 100 req/s");
+        nb.set_section("plan", "任务计划");
+        nb.set_section("attempted", "- 方案A 失败");
+        let volatile = nb.render_volatile_sections();
+        assert!(volatile.contains("任务计划"), "实时段应含 plan");
+        assert!(volatile.contains("方案A"), "实时段应含 attempted");
+        assert!(!volatile.contains("选 SQLite"), "实时段不应含 decisions");
+        assert!(!volatile.contains("基准: 100"), "实时段不应含 evidence");
+    }
+
+    #[test]
+    fn render_stable_sections_empty_when_no_stable_content() {
+        let mut nb = Notebook::new();
+        nb.set_section("plan", "任务计划");
+        assert_eq!(nb.render_stable_sections(), "", "无稳定段时应返回空");
+        assert!(nb.render_volatile_sections().contains("任务计划"));
+    }
+
+    #[test]
+    fn stable_snapshot_round_trips_to_disk() {
+        let dir = temp_workspace();
+        let snap = crate::fixed_memory::FixedMemorySnapshot {
+            content: "# 设计决策与实验证据(前缀冻结)\n<decisions>\n- [d1] 选 SQLite\n</decisions>"
+                .to_string(),
+            fingerprint: crate::fixed_memory::fingerprint("test"),
+            injected_at_ms: 1_700_000_000_000,
+            last_summary_msg_index: 0,
+        };
+        super::save_stable_snapshot(dir.path(), &snap).expect("save");
+        let loaded = super::load_stable_snapshot(dir.path()).expect("load");
+        assert_eq!(loaded, snap, "快照应能无损往返");
+        let path = super::notebook_stable_snapshot_path(dir.path());
+        assert!(path.exists(), "快照文件应位于 .claw/ 下");
     }
 }
