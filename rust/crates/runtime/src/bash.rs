@@ -255,6 +255,10 @@ async fn execute_bash_async(
     //          智能模式基于子进程树 CPU 时间 + stdout/stderr 流量判断是否真死锁，
     //          不再因"墙钟时间到"就误杀合法长任务（如回测、训练、编译）。
     let smart_mode = input.timeout.is_none();
+    // 后台服务模式(2026-08-31):命令含 `> log 2>&1 &` 等后台启动写法时,
+    // 后台进程会使 bash 不退出且 ActivityMonitor 判定"活跃"而永不超时。
+    // 检测到后使用短等待窗口,超时返回已收集输出(服务继续后台运行)。
+    let bg_service = is_background_service_command(&input.command);
     let timeout_ms = input.timeout.unwrap_or_else(|| {
         // 智能模式下的兜底硬上限：1 小时。
         // 真死锁会在 5min idle_timeout 时被提前 kill；
@@ -364,6 +368,21 @@ async fn execute_bash_async(
             // abort 时立即关闭 pipe，快速退出（不等残留数据）
             child_stdout = None;
             child_stderr = None;
+        } else if bg_service && !child_exited && start.elapsed() >= background_service_wait() {
+            // 后台服务模式:等待窗口到,命令本体未完成(后台服务持有管道/子进程树
+            // 导致 bash 不退出)。先终止整棵进程树(bash + 后台服务)释放 pipe
+            // 写端,再 kill bash。不杀进程树的话,后台进程持有 pipe 写端使
+            // blocking read 线程卡住,tokio Runtime drop 会一直等待
+            // (实测等待时长 = 后台进程剩余存活时间,如 sleep 300 → 300s)。
+            // 注意 `!child_exited`:kill 后不再进入本分支,避免每轮重置
+            // child_exit_time 导致 PIPE_DRAIN_GRACE 永不触发(死循环)。
+            timed_out = true;
+            if let Some(pid) = child.id() {
+                kill_process_tree(pid);
+            }
+            let _ = child.kill().await;
+            child_exited = true;
+            child_exit_time = Some(Instant::now());
         } else if !child_exited {
             if let Some(ref mut m) = monitor {
                 // 智能模式：基于子进程树活跃度决策
@@ -491,6 +510,15 @@ async fn execute_bash_async(
 
     // 超时
     if timed_out {
+        // 后台服务模式:返回已收集输出 + 服务继续后台运行提示(不 kill 服务)
+        if bg_service {
+            return Ok(background_service_output(
+                &input,
+                sandbox_status,
+                &stdout_buf,
+                &stderr_buf,
+            ));
+        }
         // 智能模式 busy loop 触发：无输出但 CPU 持续增长的疑似空转循环
         if busy_loop {
             return Ok(busy_loop_output(&input, sandbox_status));
@@ -540,6 +568,131 @@ async fn execute_bash_async(
         sandbox_status: Some(sandbox_status),
         shell_type: Some(detect_shell_type().as_str().to_string()),
     })
+}
+
+/// 后台服务命令等待窗口(秒):检测到"启动后台服务"模式后,命令本体在此窗口内
+/// 未完成则返回已收集输出(服务继续在后台运行),避免工具永久卡住。
+const BACKGROUND_SERVICE_WAIT_SECS: u64 = 30;
+
+/// 读取后台服务等待窗口(env 可覆盖,测试用):`CLAW_BACKGROUND_SERVICE_WAIT_SECS`,
+/// 越界/非法回退默认值。
+fn background_service_wait() -> Duration {
+    std::env::var("CLAW_BACKGROUND_SERVICE_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| (1..=300).contains(&n))
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(BACKGROUND_SERVICE_WAIT_SECS))
+}
+
+/// 后台服务命令检测(2026-08-31):`cmd > log 2>&1 &` / `cmd &> log &` /
+/// `nohup cmd > log 2>&1 &` 等后台启动模式。
+///
+/// 背景:这类命令启动常驻服务,后台进程继承管道/成为子进程树成员,导致 bash
+/// 可能永不退出;ActivityMonitor 又因后台服务"活跃"(在接受请求/处理数据)而
+/// 永不触发 idle/hard 超时 → Bash 工具永久卡住(实证:启动 ws_server 的 bash
+/// 命令阻塞会话 4 小时,期间 claw 无 CPU、不写会话文件)。检测到后使用短等待
+/// 窗口,超时终止 bash 及进程树并返回已收集输出(后台进程会持有输出管道,
+/// 不终止则 tokio Runtime drop 永久等待阻塞的 read 线程)。
+fn is_background_service_command(command: &str) -> bool {
+    let c = command.trim();
+    // 最常见的写法:重定向 + 后台(`> log 2>&1 &` / `>> log 2>&1 &` /
+    // `> /dev/null 2>&1 &`)。这类几乎总是"启动守护/服务进程且不等待"。
+    if c.contains("2>&1 &") || c.contains("> /dev/null &") {
+        return true;
+    }
+    // `&>` 合并重定向 + 后台(`cmd &> log &`)
+    if c.contains("&>") {
+        return true;
+    }
+    // 命令以 ` &` 结尾且前文含重定向 + nohup(显式守护化)
+    if let Some(body) = c.strip_suffix('&') {
+        let body = body.trim_end();
+        if body.contains('>') && (body.contains("nohup") || body.contains("2>&1")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 后台服务命令等待窗口到时的输出构造(2026-08-31)。
+///
+/// 命令含后台启动模式且命令本体在 BACKGROUND_SERVICE_WAIT_SECS 内未完成,
+/// 返回已收集输出。注意:为避免后台进程持有输出管道导致工具永久卡住
+/// (tokio Runtime drop 会等待阻塞的 read 线程),bash 及其进程树已被终止;
+/// 如需持久后台服务,应使用 `run_in_background=true`(输出重定向到空,
+/// 服务由 Job Object 保护独立运行)。
+fn background_service_output(
+    input: &BashCommandInput,
+    sandbox_status: SandboxStatus,
+    stdout_buf: &[u8],
+    stderr_buf: &[u8],
+) -> BashCommandOutput {
+    let stdout = truncate_output(&String::from_utf8_lossy(stdout_buf));
+    let stderr = truncate_output(&String::from_utf8_lossy(stderr_buf));
+    let guidance = "\n\n[Background service] Detected a background-start pattern \
+        (`> log 2>&1 &`). The foreground part did not finish within the wait window; \
+        the command and its process tree were terminated to prevent the tool from \
+        hanging on the inherited output pipe. If you need a persistent background \
+        service, use run_in_background=true instead.";
+    BashCommandOutput {
+        stdout,
+        stderr: format!("{stderr}{guidance}"),
+        raw_output_path: None,
+        interrupted: false,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        return_code_interpretation: Some("background.service".to_string()),
+        no_output_expected: Some(true),
+        structured_content: Some(vec![json!({
+            "event": "command.background_service",
+            "failureClass": "background_service",
+            "data": {
+                "command": input.command,
+                "provenance": "bash.background_service",
+                "classification": "background.service"
+            }
+        })]),
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: Some(sandbox_status),
+        shell_type: Some(detect_shell_type().as_str().to_string()),
+    }
+}
+
+/// 终止进程树(2026-08-31)。
+///
+/// 背景:bg 分支 kill bash 后,后台 `&` 启动的服务进程(Git Bash 下即使
+/// `> /dev/null 2>&1` 重定向,其后代仍可能持有 stdout/stderr pipe 写端)使
+/// pipe 不 EOF,阻塞的 blocking read 线程让 tokio Runtime drop 永久等待
+/// (实测等待时间 = 后台进程剩余存活时间,如 sleep 300 → 300s)。
+/// 因此 kill bash 后必须终止整棵进程树,释放 pipe 写端,工具才能及时返回。
+///
+/// Windows 用 taskkill /T /F(递归终止子孙进程),Unix 用 kill -KILL 进程组。
+fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // /T 递归终止子进程树,/F 强制终止。/PID 的进程可能已被 child.kill()
+        // 终止,taskkill 对已死进程返回非零,但 /T 仍会清理存活的后代;
+        // 忽略返回值(尽力而为)。
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // bash 通常为进程组组长,负 PID 表示信号发给整个进程组
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
 }
 
 /// 智能模式 busy loop 触发时的输出构造。
@@ -1174,6 +1327,64 @@ mod unix_shell_tests {
 mod tests {
     use super::{execute_bash, has_shell_syntax_error, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+
+    /// 后台服务命令模式检测(2026-08-31):`> log 2>&1 &` / `&> log &` 等后台
+    /// 启动写法应识别,普通命令不应误报。
+    #[test]
+    fn background_service_detection_patterns() {
+        assert!(super::is_background_service_command("python server.py > log 2>&1 &"));
+        assert!(super::is_background_service_command("python server.py >> log 2>&1 &"));
+        assert!(super::is_background_service_command("nohup server > log 2>&1 &"));
+        assert!(super::is_background_service_command(
+            "cd /d/chanlunV2 && python -B -m chanlun_py.web.server > /tmp/ws.log 2>&1 & echo $!"
+        ));
+        assert!(super::is_background_service_command("cmd &> log &"));
+        assert!(super::is_background_service_command("svc > /dev/null &"));
+        assert!(!super::is_background_service_command("ls -la"));
+        assert!(!super::is_background_service_command("cargo build"));
+        assert!(!super::is_background_service_command("git status"));
+        assert!(!super::is_background_service_command("sleep 5"));
+        assert!(!super::is_background_service_command("echo a && echo b"));
+    }
+
+    /// 后台服务集成测试(2026-08-31):后台启动命令在等待窗口内返回,不永久卡住。
+    /// 回归:启动 ws_server 的 bash 命令曾阻塞会话 4 小时(ActivityMonitor 因
+    /// 后台服务"活跃"而永不触发超时,后台进程持有输出管道使工具无法收尾)。
+    /// 窗口通过 env 缩短为 2s。
+    #[test]
+    fn background_service_command_returns_within_window() {
+        use std::time::Instant;
+
+        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS", "2");
+
+        let start = Instant::now();
+        let output = execute_bash(BashCommandInput {
+            command: "echo bg-start; sleep 300 > /dev/null 2>&1 & wait".to_string(),
+            timeout: None,
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("bg service command should return");
+        std::env::remove_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS");
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 30,
+            "background service command must return within window, took {elapsed:?}"
+        );
+        assert!(
+            output.stderr.contains("Background service"),
+            "stderr should hint background service, got: {}",
+            output.stderr
+        );
+    }
 
     /// PRD P2-5：shell 语法错误特征识别（bash/sh/cmd 通用）。
     #[test]
@@ -1982,12 +2193,9 @@ mod activity_monitor {
                     sum = sum.wrapping_add(std::hint::black_box(i));
                 }
                 std::hint::black_box(sum);
-                match m.poll() {
-                    ActivityDecision::BusyLoop => {
-                        done = true;
-                        break;
-                    }
-                    _ => {}
+                if matches!(m.poll(), ActivityDecision::BusyLoop) {
+                    done = true;
+                    break;
                 }
             }
             assert!(done, "无输出 + 持续 CPU 增长应在忙等窗口内判定为 BusyLoop");
