@@ -18,6 +18,10 @@ const CACHE_TTL_SECS: u64 = 60;
 /// Step 4.3:单文件一次引用解析最多查询的 symbol 数量。
 /// 防止 monorepo 中文件 symbol 过多导致 LSP 调用爆炸。
 const MAX_REF_SYMBOLS_PER_FILE: usize = 16;
+/// B2:渲染时单文件最多输出的 symbol/definition 条数 —— 防止符号密集型文件
+/// 独占 token 预算(1024 tokens 被少数文件占满,其余文件被挤出地图)。
+/// 语义重要性排序下,前 8 个通常是该文件的核心公开符号。
+const MAX_RENDER_SYMBOLS_PER_FILE: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct RepoMap {
@@ -279,7 +283,7 @@ impl RepoMap {
             if let Some(cached) = self.cache.get(path) {
                 // Step 4.2:若 lsp_symbols 非空,优先渲染 LSP symbols(语义更准确)
                 if !cached.lsp_symbols.is_empty() {
-                    for symbol in &cached.lsp_symbols {
+                    for symbol in cached.lsp_symbols.iter().take(MAX_RENDER_SYMBOLS_PER_FILE) {
                         out.push_str(&format!(
                             "  {} {} (L:{}:{})\n",
                             symbol.kind, symbol.name, symbol.line, symbol.character
@@ -287,7 +291,7 @@ impl RepoMap {
                     }
                 } else {
                     // Fallback:regex 提取的 definitions
-                    for def in &cached.definitions {
+                    for def in cached.definitions.iter().take(MAX_RENDER_SYMBOLS_PER_FILE) {
                         let kind_str = match def.kind {
                             DefinitionKind::Function => "fn",
                             DefinitionKind::Struct => "struct",

@@ -3173,7 +3173,21 @@ where
                                 last_summary_msg_index: self.session.messages.len() as i64,
                             };
                             let _ = crate::fixed_memory::save(root, &snap);
-                            messages.insert(0, ConversationMessage::user_text(llm));
+                            // C1:简报拆分为稳定段(前缀)与易变段(尾部槽位)。
+                            // 稳定段(已完成项/历史教训/注脚)低频变化,注入
+                            // messages[0];易变段(当前目标/下一步)由
+                            // render_runtime_hints 注入尾部冻结槽位块 —— 重建
+                            // fixed_memory 时前缀字节保持稳定,只动尾块。
+                            let (stable, _volatile) =
+                                crate::fixed_memory::split_stable_volatile(&snap.content);
+                            messages.insert(0, ConversationMessage::user_text(
+                                if stable.trim().is_empty() {
+                                    // 简报全为易变内容时退化注入完整文本,避免空消息。
+                                    snap.content.clone()
+                                } else {
+                                    stable
+                                },
+                            ));
                             self.fixed_memory = Some(snap);
                             llm_triggered = true;
                         }
@@ -3205,8 +3219,17 @@ where
                             if is_rebuilt {
                                 let _ = crate::fixed_memory::save(root, snap);
                             }
-                            messages
-                                .insert(0, ConversationMessage::user_text(snap.content.clone()));
+                            // C1:同上,前缀只注入稳定段;易变段(当前目标/下一步)
+                            // 走尾部冻结槽位块。复用路径(缓存热)字节保持不变。
+                            let (stable, _volatile) =
+                                crate::fixed_memory::split_stable_volatile(&snap.content);
+                            messages.insert(0, ConversationMessage::user_text(
+                                if stable.trim().is_empty() {
+                                    snap.content.clone()
+                                } else {
+                                    stable
+                                },
+                            ));
                         }
                         self.fixed_memory = next;
                     }
@@ -5436,6 +5459,16 @@ where
             }
         }
 
+        // 槽位 4:Current Task(固定记忆易变段:当前目标 + 下一步)。
+        // C1:从 messages[0] 前缀剥离的易变内容 —— 重建 fixed_memory 时前缀
+        // 字节保持稳定,此处变化只影响尾部冻结槽位块,不破坏缓存。
+        if let Some(fm) = &self.fixed_memory {
+            let (_stable, volatile) = crate::fixed_memory::split_stable_volatile(&fm.content);
+            if let Some(v) = volatile {
+                slots.push(("Current Task", v));
+            }
+        }
+
         // 槽位 5:语义召回结果(每 turn 的 top-k 记忆)。
         if let Some(memory_ctx) = &self.pending_semantic_context {
             slots.push(("Semantic Memory Recall", memory_ctx.clone()));
@@ -5527,12 +5560,9 @@ where
                 }
             }
         }
-
-        // 槽位 12:执行风格要求(常量,Verbosity steering)。
-        slots.push((
-            "Execution Style",
-            "Be concise. Do not restate context, repeat code already shown, or preface actions with restatements. Lead with the answer or the change.".to_string(),
-        ));
+        // A8:原槽位 12(Execution Style 常量)已移入前缀 static 区
+        // (get_execution_style_section)—— 恒定内容不再每轮在尾部重发,
+        // 减少尾部未命中 token;尾部冻结槽位块只保留真正逐轮变化的内容。
 
         let refs: Vec<(&str, &str)> = slots
             .iter()
@@ -5594,7 +5624,6 @@ where
                         Ok(mut pc) => {
                             // 子代理上下文不注入 git 状态(diff 由 validation 阶段处理)
                             pc.git_status = None;
-                            pc.git_diff = None;
                             pc.git_context = None;
                             Some(pc)
                         }
@@ -5602,7 +5631,6 @@ where
                             cwd,
                             current_date: date,
                             git_status: None,
-                            git_diff: None,
                             git_context: None,
                             instruction_files: Vec::new(),
                         }),
@@ -7865,7 +7893,6 @@ mod tests {
                 cwd: PathBuf::from("/tmp/project"),
                 current_date: "2026-03-31".to_string(),
                 git_status: None,
-                git_diff: None,
                 git_context: None,
                 instruction_files: Vec::new(),
             })
@@ -9785,22 +9812,23 @@ mod tests {
             "dynamic_sections must stay empty after consolidation, got {:?}",
             req.system_prompt.dynamic_sections
         );
-        // 末尾只有一条冻结槽位块消息(否则前缀被中途动态内容扰动)。
-        let last = req.messages.last().expect("tail message");
-        let text: String = last
-            .blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            text.contains(RUNTIME_HINTS_HEADER),
-            "tail message carries hints block, got: {text}"
-        );
-        assert!(text.contains("## Execution Style"), "style slot present");
-        assert!(text.contains("Be concise."), "style content present");
+        // A8:Execution Style 不再出现在任何消息中(含尾部冻结槽位块)。
+        // 测试环境的 system_prompt 为手工构造(非 SystemPromptBuilder),
+        // static 注入由 prompt::tests 覆盖。
+        for m in &req.messages {
+            let t: String = m
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !t.contains("## Execution Style"),
+                "A8: execution style leaked into message: {t}"
+            );
+        }
     }
 
     /// 复现记忆丢失根因(方案 A):turn 结束后 task_state 自动提取并持久化;
@@ -9900,17 +9928,16 @@ mod tests {
 
         let sections = captured.lock().expect("lock");
         let last = sections.last().expect("two requests captured");
+        let head = last.first().expect("head message");
         assert!(
-            last.iter().any(|s| s.contains("固定记忆")),
-            "fixed memory block should be injected at head, got: {last:?}"
+            head.contains("固定记忆"),
+            "fixed memory block should be injected at head, got: {head}"
         );
+        // C1:goal(当前目标/BTC)从前缀剥离到尾部 Current Task 槽位 ——
+        // 前缀只留低频稳定内容,易变目标变化不打断前缀缓存。
         assert!(
-            last.iter().any(|s| s.contains("当前目标")),
-            "goal line should be injected, got: {last:?}"
-        );
-        assert!(
-            last.iter().any(|s| s.contains("BTC")),
-            "goal content should be injected, got: {last:?}"
+            !head.contains("当前目标"),
+            "C1: goal must be moved out of prefix head, got: {head}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -10145,16 +10172,27 @@ mod tests {
             "head must be fixed-memory brief, got: {head}"
         );
         assert!(
-            head.contains("当前目标"),
-            "head must include goal line, got: {head}"
-        );
-        assert!(
             head.contains("验证指引"),
             "head must include verification guidance, got: {head}"
         );
         assert!(
             head.contains("不要全库搜索"),
             "head must include no-full-repo-search guidance, got: {head}"
+        );
+        // C1:goal(当前目标)从前缀剥离到尾部 Current Task 槽位 —— 前缀只留
+        // 低频稳定内容(已完成项/注脚),易变目标变化不打断前缀缓存。
+        assert!(
+            !head.contains("当前目标"),
+            "C1: goal must be moved out of prefix head, got: {head}"
+        );
+        let tail = texts.last().expect("tail message");
+        assert!(
+            tail.contains("当前目标"),
+            "C1: goal must be injected in tail Current Task slot, got: {tail}"
+        );
+        assert!(
+            tail.contains("重构 auth 模块"),
+            "goal content must be in tail slot, got: {tail}"
         );
         let user_pos = texts
             .iter()
@@ -10484,12 +10522,27 @@ mod tests {
             let texts = shots.first().expect("turn1 request captured");
             let head = texts.first().expect("head message");
             assert!(
-                head.contains("# 固定记忆") && head.contains("当前目标"),
+                head.contains("# 固定记忆") && head.contains("验证指引"),
                 "turn1 head must be fixed-memory brief: {head}"
             );
+            // C1:goal(当前目标)从前缀剥离到尾部 Current Task 槽位。
             assert!(
-                head.contains("验证指引"),
-                "turn1 head must include verification guidance: {head}"
+                !head.contains("当前目标"),
+                "C1: goal must be moved out of prefix head: {head}"
+            );
+            assert!(
+                texts
+                    .last()
+                    .is_some_and(|t| t.starts_with(RUNTIME_HINTS_HEADER)),
+                "tail frozen block (RUNTIME_HINTS_HEADER) must be present, last={:?}",
+                texts.last()
+            );
+            assert!(
+                texts
+                    .last()
+                    .is_some_and(|t| t.contains("当前目标")),
+                "C1: goal must be injected in tail Current Task slot, last={:?}",
+                texts.last()
             );
             let user_pos = texts
                 .iter()
@@ -10498,13 +10551,6 @@ mod tests {
             assert!(
                 user_pos > 0,
                 "fixed memory must sit before user input (index {user_pos})"
-            );
-            assert!(
-                texts
-                    .last()
-                    .is_some_and(|t| t.starts_with(RUNTIME_HINTS_HEADER)),
-                "tail frozen block (RUNTIME_HINTS_HEADER) must be present, last={:?}",
-                texts.last()
             );
         }
 
@@ -11150,10 +11196,23 @@ mod tests {
             .first()
             .expect("head message");
         assert!(head.contains("# 固定记忆"), "窗口内应为规则快照: {head}");
-        assert!(head.contains("当前目标"), "规则快照应含 goal 行: {head}");
+        // C1:goal(当前目标)从前缀剥离到尾部 Current Task 槽位。
+        assert!(
+            !head.contains("当前目标"),
+            "C1: goal must be moved out of head: {head}"
+        );
         assert!(
             !head.contains("FAKE_LLM_BRIEF"),
             "窗口内不得触发 LLM 摘要: {head}"
+        );
+        let tail = shots
+            .first()
+            .expect("request captured")
+            .last()
+            .expect("tail message");
+        assert!(
+            tail.contains("当前目标"),
+            "C1: goal must be injected in tail Current Task slot: {tail}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -13860,7 +13919,6 @@ mod tests {
                 cwd: std::path::PathBuf::from("/workspace"),
                 current_date: "2026-08-06".to_string(),
                 git_status: Some("M src/foo.rs".to_string()),
-                git_diff: None,
                 git_context: None,
                 instruction_files: Vec::new(),
             }),

@@ -325,7 +325,7 @@ pub fn parse_task_state_from_summary(summary: &str) -> SummaryTaskExtract {
                 .trim()
                 .trim_start_matches("- ")
                 .trim_start_matches("* ");
-            if line.is_empty() || is_none_value(line) {
+            if line.is_empty() || is_none_value(line) || !is_task_completion_like(line) {
                 continue;
             }
             let t = truncate(line, TASK_FINDING_MAX_CHARS);
@@ -338,6 +338,25 @@ pub fn parse_task_state_from_summary(summary: &str) -> SummaryTaskExtract {
         }
     }
     out
+}
+
+/// C3 防护:判定一行是否像"已完成任务声明",而非 LLM 字段混淆产物。
+///
+/// 压缩摘要的 `[closed_tasks]` 段由 LLM 填充,实测曾混入 `[lessons]` 标签行
+/// 与教训句式(如"应使用 ...")—— 污染 task_state.closed_tasks,进而使
+/// fixed_memory completed 列表冗余且字节抖动。此处剔除:
+/// - `[xxx]` 标签行(如 `[lessons]`)
+/// - 指令/教训句式(含 "应使用" / "不要 " / "需先",任务完成声明几乎不会
+///   以这些指令式措辞出现)
+#[must_use]
+fn is_task_completion_like(t: &str) -> bool {
+    let trimmed = t.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        return false;
+    }
+    !(trimmed.contains("应使用")
+        || trimmed.contains("不要 ")
+        || trimmed.contains("需先"))
 }
 
 /// 截取 `start_marker` 下一行起、`end_marker` 前的文本段。
@@ -514,6 +533,34 @@ mod tests {
         );
         assert_eq!(upper.active_goal.as_deref(), Some("优化模块 B"));
         assert!(parse_task_state_from_summary("").closed_tasks.is_empty());
+    }
+
+    #[test]
+    fn parse_summary_filters_label_and_lesson_lines_from_closed_tasks() {
+        // C3 实证污染:LLM 字段混淆,把 [lessons] 标签与教训句式写进
+        // [closed_tasks] 段。应被 is_task_completion_like 全部过滤。
+        let summary = "[active_task]\n\
+                       goal: 修复模块 A\n\
+                       \n\
+                       [closed_tasks]\n\
+                       - 已修复模块 A 的登录 401。PASS\n\
+                       - [lessons]\n\
+                       - 使用 `git stash` 做基线对比时进度输出混入 stdout,应使用 `git stash push -q`\n\
+                       - 完成提示词质量初步审查(结构化问题清单)PASS";
+        let extract = parse_task_state_from_summary(summary);
+        assert_eq!(extract.closed_tasks.len(), 2);
+        assert!(extract
+            .closed_tasks
+            .iter()
+            .all(|t| !t.starts_with('[') && !t.contains("应使用")));
+        assert!(extract
+            .closed_tasks
+            .iter()
+            .any(|t| t.contains("登录 401")));
+        assert!(extract
+            .closed_tasks
+            .iter()
+            .any(|t| t.contains("提示词质量初步审查")));
     }
 
     #[test]

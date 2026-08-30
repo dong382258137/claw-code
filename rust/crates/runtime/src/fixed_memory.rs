@@ -99,6 +99,68 @@ pub fn should_refresh(injected_at_ms: Option<i64>, now_ms: i64) -> bool {
     }
 }
 
+/// 固定记忆简报中的易变块标题(任务推进时高频变化,应从前缀剥离)。
+const VOLATILE_HEADINGS: [&str; 2] = ["当前目标", "下一步"];
+/// 稳定块标题:命中即切回稳定区。
+const STABLE_HEADINGS: [&str; 3] = ["已完成项", "历史教训", "注"];
+
+/// 将固定记忆简报拆分为"稳定段(注入 messages 前缀)"与"易变段(注入尾部
+/// 冻结槽位块)"。
+///
+/// 动机(C1):简报的 `当前目标` / `下一步` 随任务推进高频变化;若整体注入
+/// messages[0] 前缀,任何重建都会使其后全部历史消息缓存失效。拆出后:
+/// 前缀只保留低频稳定内容(已完成项 / 历史教训 / 注脚),易变段移到尾部
+/// 冻结槽位块 —— 变化只影响尾部消息,前缀字节稳定。
+///
+/// 兼容两种简报格式:
+/// - LLM 简报:`当前目标：...` / `下一步：...` 独立块;
+/// - 规则简报([`build_snapshot`]):`- 当前目标: ...` 单行 bullet。
+///
+/// 无易变块时返回 `(原内容, None)`。
+#[must_use]
+pub fn split_stable_volatile(content: &str) -> (String, Option<String>) {
+    let mut stable = String::with_capacity(content.len());
+    let mut volatile = String::new();
+    // false = 稳定区;true = 易变区(当前目标/下一步)。
+    let mut in_volatile = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let bare = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or(trimmed);
+        if is_heading(bare, &VOLATILE_HEADINGS) {
+            in_volatile = true;
+        } else if is_heading(bare, &STABLE_HEADINGS) {
+            in_volatile = false;
+        }
+        if in_volatile {
+            volatile.push_str(line);
+            volatile.push('\n');
+        } else {
+            stable.push_str(line);
+            stable.push('\n');
+        }
+    }
+
+    let stable = stable.trim_end().to_string();
+    let volatile = volatile.trim().to_string();
+    let volatile = if volatile.is_empty() { None } else { Some(volatile) };
+    (stable, volatile)
+}
+
+/// 判断 bare 行是否为给定标题之一(标题后跟中文或英文冒号)。
+fn is_heading(bare: &str, headings: &[&str]) -> bool {
+    headings.iter().any(|h| {
+        bare.starts_with(h)
+            && bare[h.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c == '：' || c == ':')
+    })
+}
+
 /// 从 task_state + lessons 规则式收敛锚点型简报(零 LLM 调用,只读既有落盘数据)。
 ///
 /// 空状态(task_state 无内容且 lessons 为空)返回 None。内容结构(markdown):
@@ -429,6 +491,53 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
         (tmp.clone(), tmp)
+    }
+
+    #[test]
+    fn split_stable_volatile_partitions_llm_brief() {
+        let content = "当前目标：为 3买/3卖 信号新增过滤层\n\n\
+                       已完成项：\n\
+                       - 已读 types.py 确认数据结构\n\n\
+                       历史教训：\n\
+                       - 对话中无显式历史教训记录。\n\n\
+                       下一步：\n\
+                       - 继续补齐调查空白\n\
+                       - ⚠ 规则通道确认但简报未体现:结论：**允许**。";
+        let (stable, volatile) = split_stable_volatile(content);
+        let v = volatile.expect("volatile present");
+        assert!(v.contains("当前目标") && v.contains("下一步"));
+        assert!(v.contains("继续补齐调查空白"));
+        assert!(!v.contains("已完成项"));
+        assert!(stable.contains("已完成项") && stable.contains("历史教训"));
+        assert!(!stable.contains("当前目标"));
+        assert!(!stable.contains("下一步"));
+    }
+
+    #[test]
+    fn split_stable_volatile_partitions_rule_brief() {
+        let content = "# 固定记忆(任务简报 · 锚点型)\n\
+                       - 当前目标: 修复模块 A\n\
+                       - 已完成项:\n\
+                         · 已修复登录 401\n\
+                       - 历史教训:\n\
+                         · git stash 用相对路径\n\
+                       - 注:以上由 runtime 自动记录。\n\
+                       - 验证指引:先 read 锚点文件。";
+        let (stable, volatile) = split_stable_volatile(content);
+        let v = volatile.expect("volatile present");
+        assert!(v.contains("当前目标"));
+        assert!(!v.contains("已完成项"));
+        assert!(stable.contains("已完成项"));
+        assert!(stable.contains("历史教训"));
+        assert!(stable.contains("注:"));
+    }
+
+    #[test]
+    fn split_stable_volatile_no_volatile_returns_none() {
+        let content = "# 固定记忆\n- 已完成项:\n  · aaa\n- 历史教训:\n  · bbb";
+        let (stable, volatile) = split_stable_volatile(content);
+        assert_eq!(volatile, None);
+        assert_eq!(stable, content);
     }
 
     fn write_sample_state(root: &Path) {

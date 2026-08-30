@@ -34,8 +34,61 @@ pub struct Lesson {
     pub lesson: String,
 }
 
+/// 摘要结构头黑名单:这些行属于压缩摘要的元信息/上下文描述(实证:
+/// lessons.jsonl 曾被大量此类残余污染),不是可执行的教训,解析时剔除。
+const SUMMARY_RESIDUE_PREFIXES: &[&str] = &[
+    "newly compacted context",
+    "scope:",
+    "tools mentioned",
+    "recent user requests",
+    "pending work",
+    "key files referenced",
+    "current work",
+    "key timeline",
+    "key decisions",
+    "key events",
+    "changes:",
+    "summary:",
+    "assistant:",
+    "user:",
+    "tool:",
+    "messages compacted",
+    "next steps",
+];
+
+/// 判定一行是否像"可执行的教训"(供 [`parse_lessons_from_summary`] 过滤)。
+///
+/// 拒绝:空行/NONE、markdown 标题与分隔、摘要结构残余、纯符号超短行。
+#[must_use]
+fn is_lesson_like(line: &str) -> bool {
+    let t = line
+        .trim()
+        .trim_start_matches("- ")
+        .trim_start_matches("* ");
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        return false;
+    }
+    if t.starts_with('#') || t.starts_with('|') || t.starts_with("```") {
+        return false;
+    }
+    let lower = t.to_ascii_lowercase();
+    if SUMMARY_RESIDUE_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return false;
+    }
+    // 纯符号/标点行信息量不足,剔除。
+    let meaningful = t
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '-' | '|' | ':' | '。' | '.' | '、'))
+        .count();
+    meaningful >= 4
+}
+
 /// 从压缩摘要解析 `[lessons]` 段(与 `task_state::parse_task_state_from_summary`
 /// 同构;摘要为启发式/无 `[lessons]` 段时返回空,调用方跳过)。
+///
+/// C2 质量过滤:逐行经 [`is_lesson_like`] 剔除摘要结构残余与无信息行,
+/// 防止 LLM 把摘要主体/字段头误写入 `[lessons]` 段导致 lessons.jsonl 污染
+/// (实测污染曾使 fixed_memory"历史教训"块每次重建字节抖动)。
 #[must_use]
 pub fn parse_lessons_from_summary(summary: &str) -> Vec<String> {
     let Some(sec) = extract_section(summary, "[lessons]", "") else {
@@ -43,14 +96,14 @@ pub fn parse_lessons_from_summary(summary: &str) -> Vec<String> {
     };
     let mut out = Vec::new();
     for line in sec.lines() {
-        let line = line
+        if !is_lesson_like(line) {
+            continue;
+        }
+        let bare = line
             .trim()
             .trim_start_matches("- ")
             .trim_start_matches("* ");
-        if line.is_empty() || line.eq_ignore_ascii_case("none") {
-            continue;
-        }
-        let lesson = truncate(line, LESSON_MAX_CHARS);
+        let lesson = truncate(bare, LESSON_MAX_CHARS);
         if !lesson.is_empty() && !out.contains(&lesson) {
             out.push(lesson);
         }
@@ -182,6 +235,36 @@ mod tests {
         assert!(parse_lessons_from_summary("- 普通摘要\n- 无教训段").is_empty());
         // 空文本
         assert!(parse_lessons_from_summary("").is_empty());
+    }
+
+    #[test]
+    fn parse_filters_summary_residue() {
+        // 实证污染样例:摘要残余混入 [lessons] 段,应被全部过滤,只留真教训。
+        let summary = "[lessons]\n\
+            - Newly compacted context:\n\
+            - Scope: 66 earlier messages compacted (user=1, assistant=33, tool=32).\n\
+            - Tools mentioned: bash, edit_file, grep_search, read_file.\n\
+            - Recent user requests:\n\
+            - Pending work:\n\
+            - 使用 `git stash push -q` 避免进度输出混入测试 stdout";
+        let lessons = parse_lessons_from_summary(summary);
+        assert_eq!(lessons.len(), 1);
+        assert!(lessons[0].contains("git stash"));
+    }
+
+    #[test]
+    fn parse_filters_markdown_and_short_lines() {
+        let summary = "[lessons]\n\
+            ## 段落标题\n\
+            - ---\n\
+            - 决定保留回退\n\
+            - **B2(已修复)**: 修复了 render_config_section 明文泄漏";
+        let lessons = parse_lessons_from_summary(summary);
+        // markdown 标题/分隔被过滤;"决定保留回退"是有意义的教训(>=4 有效字符);
+        // "**B2(已修复)**" 以 ** 开头但非标题,属正文,保留。
+        assert_eq!(lessons.len(), 2);
+        assert!(lessons.contains(&"决定保留回退".to_string()));
+        assert!(lessons.iter().any(|l| l.contains("render_config_section")));
     }
 
     #[test]

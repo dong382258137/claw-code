@@ -225,7 +225,6 @@ pub struct ProjectContext {
     pub cwd: PathBuf,
     pub current_date: String,
     pub git_status: Option<String>,
-    pub git_diff: Option<String>,
     pub git_context: Option<GitContext>,
     pub instruction_files: Vec<ContextFile>,
 }
@@ -241,7 +240,6 @@ impl ProjectContext {
             cwd,
             current_date: current_date.into(),
             git_status: None,
-            git_diff: None,
             git_context: None,
             instruction_files,
         })
@@ -253,7 +251,8 @@ impl ProjectContext {
     ) -> std::io::Result<Self> {
         let mut context = Self::discover(cwd, current_date)?;
         context.git_status = read_git_status(&context.cwd);
-        context.git_diff = read_git_diff(&context.cwd);
+        // B1:不再收集 git diff(≤8K 字符,模型极少直接消费,且跨会话变化
+        // 导致新会话首轮不命中缓存)。只保留 git status + recent commits。
         context.git_context = GitContext::detect(&context.cwd);
         Ok(context)
     }
@@ -272,7 +271,6 @@ impl ProjectContext {
             cwd,
             current_date: current_date.into(),
             git_status: None,
-            git_diff: None,
             git_context: None,
             instruction_files,
         })
@@ -440,16 +438,14 @@ impl SystemPromptBuilder {
         }
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
+        // 执行风格(A8):恒定简洁要求从前缀 static 区注入(命中缓存),不再
+        // 每轮在尾部冻结槽位块重发(按未命中计费)。
+        sections.push(get_execution_style_section());
         // 破局提示词段：元认知触发器，紧随 # Executing actions with care 之后，
         // 与 # Doing tasks 形成"如何做"→"何时停"的对照。
         sections.push(get_framework_switching_section());
-        // P1: 事务保护 — Framework Switching 协议的执行工具（rollback）。
-        // 紧接破局段之后，构成"意识到错误→执行回滚"的完整闭环。
-        sections.push(get_transaction_safety_section());
         sections.push(get_memory_verification_section());
         sections.push(get_context_recovery_section());
-        sections.push(get_decision_log_section());
-        sections.push(get_cross_session_recall_section());
         // ── P0+P1: 多 Agent 编排工具教程区（类 Decision Experience 模式）──
         // P0: 编排四件套 + 三种模式 + DAG 工作流
         sections.push(get_multi_agent_orchestration_section());
@@ -499,10 +495,14 @@ impl SystemPromptBuilder {
             sections.push(get_default_project_instructions());
         }
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
-        // 项目 git 快照留在 dynamic：语义上属于"项目快照"（git status/diff/
+        // 项目 git 快照留在 dynamic：语义上属于"项目快照"（git status/
         // commits），虽 build() 时一次性捕获，但将来可能支持 turn 间刷新。
+        // 渲染为空(无 instruction 文件且无 git 信息)时跳过,避免孤立标题。
         if let Some(project_context) = &self.project_context {
-            sections.push(render_project_context(project_context));
+            let section = render_project_context(project_context);
+            if !section.is_empty() {
+                sections.push(section);
+            }
         }
         // Skill catalog: pre-rendered one-line-per-skill summary letting the
         // model discover available skills without loading each SKILL.md.
@@ -525,15 +525,6 @@ impl SystemPromptBuilder {
             }
         }
         sections.extend(self.append_sections.iter().cloned());
-        // Plan mode constraint: 放在 dynamic region 最末端,最大化与旧版
-        // prompt 的公共前缀长度(append_sections 及之前的部分可命中服务端
-        // prefix cache),减少缓存失效范围。constraint 文本本身 session 内
-        // 稳定,放末端不影响 cache 命中,且 LLM 对末尾约束更敏感。
-        if let Some(config) = &self.config {
-            if config.feature_config().plan_mode().unwrap_or(true) {
-                sections.push(render_plan_mode_constraint_section());
-            }
-        }
         sections
     }
 
@@ -698,58 +689,12 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
-const MAX_GIT_DIFF_CHARS: usize = 8_000;
-const GIT_DIFF_TRUNCATION_MARKER: &str = "… [git diff truncated to keep prompt budget]";
-
-fn truncate_diff_to_budget(joined: &str, max_chars: usize) -> String {
-    if joined.chars().count() <= max_chars {
-        joined.to_string()
-    } else {
-        // Truncate by char count (not bytes) to avoid splitting multi-byte
-        // CJK characters. Append a marker so the model knows context was cut.
-        let truncated: String = joined.chars().take(max_chars).collect();
-        format!("{truncated}\n{GIT_DIFF_TRUNCATION_MARKER}")
-    }
-}
-
-fn read_git_diff(cwd: &Path) -> Option<String> {
-    let mut sections = Vec::new();
-
-    let staged = read_git_output(cwd, &["diff", "--cached"])?;
-    if !staged.trim().is_empty() {
-        sections.push(format!("Staged changes:\n{}", staged.trim_end()));
-    }
-
-    let unstaged = read_git_output(cwd, &["diff"])?;
-    if !unstaged.trim().is_empty() {
-        sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
-    }
-
-    if sections.is_empty() {
-        return None;
-    }
-    let joined = sections.join("\n\n");
-    Some(truncate_diff_to_budget(&joined, MAX_GIT_DIFF_CHARS))
-}
-
-fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-
 fn render_project_context(project_context: &ProjectContext) -> String {
+    // A1/A2:日期与工作目录已由 `# Environment context` 提供(static 区,经
+    // DynamicValueExtractor 占位符化 + `# Cache-aligned dynamic values` 映射段),
+    // 此处不再重复注入,避免同值两处浪费 token 且扩大前缀。
     let mut lines = vec!["# Project context".to_string()];
-    let mut bullets = vec![
-        format!("Today's date is {}.", project_context.current_date),
-        format!("Working directory: {}", project_context.cwd.display()),
-    ];
+    let mut bullets = Vec::new();
     if !project_context.instruction_files.is_empty() {
         bullets.push(format!(
             "Claude instruction files discovered: {}.",
@@ -771,11 +716,6 @@ fn render_project_context(project_context: &ProjectContext) -> String {
             }
         }
     }
-    if let Some(diff) = &project_context.git_diff {
-        lines.push(String::new());
-        lines.push("Git diff snapshot:".to_string());
-        lines.push(diff.clone());
-    }
     if let Some(git_context) = &project_context.git_context {
         let rendered = git_context.render();
         if !rendered.is_empty() {
@@ -783,7 +723,14 @@ fn render_project_context(project_context: &ProjectContext) -> String {
             lines.push(rendered);
         }
     }
-    lines.join("\n")
+    let rendered = lines.join("\n");
+    // 防御:无任何内容(无 instruction 文件、无 git 信息)时返回空串,
+    // 由调用方跳过注入,避免输出孤立的 `# Project context` 标题。
+    if rendered == "# Project context" {
+        String::new()
+    } else {
+        rendered
+    }
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
@@ -1012,8 +959,37 @@ fn render_config_section(config: &RuntimeConfig) -> String {
             .map(|entry| format!("Loaded {:?}: {}", entry.source, entry.path.display()))
             .collect(),
     ));
-    lines.push(String::new());
-    lines.push(redact_sensitive_json(&config.as_json()).render());
+    // B3:不再渲染全量 merged JSON(防御配置膨胀、减少低价值 token),只渲染
+    // 功能开关摘要 —— 模型感知当前运行时行为所需的最小集合。
+    let obj = config.as_json().as_object().cloned();
+    let mut switches: Vec<String> = Vec::new();
+    if let Some(m) = obj
+        .as_ref()
+        .and_then(|o| o.get("model"))
+        .and_then(|v| v.as_str())
+    {
+        switches.push(format!("model: {m}"));
+    }
+    if let Some(pm) = obj
+        .as_ref()
+        .and_then(|o| o.get("permissionMode"))
+        .and_then(|v| v.as_str())
+    {
+        switches.push(format!("permission_mode: {pm}"));
+    }
+    for key in ["planMode", "poorMode"] {
+        if let Some(b) = obj
+            .as_ref()
+            .and_then(|o| o.get(key))
+            .and_then(|v| v.as_bool())
+        {
+            switches.push(format!("{key}: {b}"));
+        }
+    }
+    if !switches.is_empty() {
+        lines.push(String::new());
+        lines.extend(prepend_bullets(switches));
+    }
     lines.join(
         "
 ",
@@ -1022,6 +998,11 @@ fn render_config_section(config: &RuntimeConfig) -> String {
 
 /// 递归脱敏配置 JSON 中的敏感字段（apiKey / secret / password / token 等），
 /// 防止密钥明文进入系统提示词。键名做小写匹配，值统一替换为掩码。
+///
+/// B3 后 `render_config_section` 不再渲染全量 merged JSON,此脱敏函数暂无
+/// 生产调用;保留(含测试覆盖)作为"密钥进入 prompt"路径的防御代码,未来
+/// 若恢复全量配置渲染或其他敏感输出必须再次启用。
+#[allow(dead_code)]
 fn redact_sensitive_json(value: &JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => JsonValue::Object(
@@ -1043,6 +1024,7 @@ fn redact_sensitive_json(value: &JsonValue) -> JsonValue {
 }
 
 /// 判断配置键是否敏感（小写匹配）。精确命中常见密钥键名及其后缀变体。
+#[allow(dead_code)]
 fn is_sensitive_config_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     lower.contains("apikey")
@@ -1053,6 +1035,7 @@ fn is_sensitive_config_key(key: &str) -> bool {
         || lower.contains("token")
 }
 
+#[allow(dead_code)]
 const REDACTED_MARKER: &str = "***redacted***";
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
@@ -1099,6 +1082,17 @@ fn get_simple_doing_tasks_section() -> String {
         .chain(items)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 执行风格要求(常量,Verbosity steering)。
+///
+/// A8:原为冻结槽位块槽位 12,每轮在尾部重发(恒定内容按未命中计费);
+/// 改为前缀 static 区注入 —— 字节稳定命中缓存,尾部只保留真正逐轮变化的内容。
+fn get_execution_style_section() -> String {
+    "## Execution Style\n\
+     Be concise. Do not restate context, repeat code already shown, or preface \
+     actions with restatements. Lead with the answer or the change."
+        .to_string()
 }
 
 #[allow(dead_code)] // 预先存在,保留供未来 actions section 使用
@@ -1168,23 +1162,21 @@ fn get_framework_switching_section() -> String {
      FIRST. It enforces a hypothesis-driven protocol (define the problem → \
      generate 2+ hypotheses with falsifiable predictions → run a minimal \
      discriminating test → converge, or ask the user) instead of unfocused \
-     exploration."
-        .to_string()
-}
-fn get_transaction_safety_section() -> String {
-    "## Transaction Safety (事务保护)\n\
+     exploration.\n\
      \n\
-     Each turn begins with an automatic file snapshot. If you realize your \
-     current approach is fundamentally wrong (see Framework Switching above):\n\
+     ### Rollback (Transaction Safety 事务保护)\n\
+     \n\
+     Each turn begins with an automatic file snapshot. If you realize the \
+     current approach is fundamentally wrong (per the trigger patterns above):\n\
      \n\
      - Call `transaction_status` to see which files have been modified this turn.\n\
      - Call `rollback_transaction` to revert ALL file changes made this turn \
-     in a single operation. This is faster and safer than manually reverting \
-     each file — especially when you have touched 5+ files.\n\
+     in a single operation — faster and safer than manually reverting each \
+     file, especially when you have touched 5+ files.\n\
      \n\
-     Use `rollback_transaction` as the execution arm of the Framework Switching \
-     trigger protocol. When you detect \"Stubborn direction\" or \"Patch thinking\", \
-     roll back first, then re-derive from first principles on a clean slate."
+     Use `rollback_transaction` as the execution arm of the trigger protocol \
+     above: when you detect \"Stubborn direction\" or \"Patch thinking\", roll \
+     back first, then re-derive from first principles on a clean slate."
         .to_string()
 }
 
@@ -1218,79 +1210,48 @@ fn get_memory_verification_section() -> String {
      - If a memory conflicts with the current file contents, trust the file contents and update the memory."
         .to_string()
 }
+/// 历史检索与决策日志综合段(A4:Context Recovery / Decision Experience /
+/// Cross-Session Recall 三合一)。保留各工具特定语义(recall_full / session_search /
+/// search_past_decisions / log_decision),精简重复的"何时检索"引导,省 ~0.6K 字符。
 fn get_context_recovery_section() -> String {
-    "## Context Recovery\n\
+    "## History & Decisions (历史检索与决策日志)\n\
+     \n\
+     ### 压缩后的找回\n\
      The system automatically compresses old conversation turns to fit context limits. \
      Summarized tool results show a `recall_full` hint with the `tool_use_id` — \
-     call that tool to retrieve the full original output. Use `session_search` to \
-     search across all conversation history (including compacted messages) for past \
-     discussions or decisions that may have been summarized away.\n\
+     call that tool to retrieve the full original output.\n\
      \n\
-     ### 何时使用历史检索(决策边界)\n\
-     - DO search history when the task depends on past decisions, earlier \
-     conventions, or prior work in this repo (e.g. \"之前怎么修的\", \"上次的结论\").\n\
-     - SKIP history for self-contained requests that need no prior context: \
-     trivial formatting, simple translation, one-line commands, current \
-     date/time questions.\n\
-     - Keep the lookup light: at most a couple of targeted `session_search` \
-     /`search_past_decisions` calls. If the first query finds nothing relevant, \
-     stop and proceed — do not keep re-querying with variants.\n\
-     - When a memory conflicts with actual file contents, trust the files."
-        .to_string()
-}
-
-/// DecisionLog 工具使用教程段(Phase 4-D 信号通道修复)。
-///
-/// 与 `get_context_recovery_section` 同模式:静态注入到 system prompt,
-/// 让 LLM 知道 **何时** 应该调用 `log_decision` / `search_past_decisions`。
-/// 修复 DecisionLog"有基础设施无引导"的问题:之前 LLM 只能在 tool list 的
-/// description 里看到这两个工具,信号过弱导致几乎从不主动调用。
-///
-/// 放在 boundary 之前(静态段),与 `get_context_recovery_section` 一同构成
-/// "工具使用教程"区,且 session 内字节稳定,不影响 prompt cache。
-fn get_decision_log_section() -> String {
-    "## Decision Experience (DecisionLog)\n\
-     You have access to a persistent repair decision log (`.claw/decision_log.db`) that survives across sessions.\n\
+     ### 何时检索历史(决策边界)\n\
+     - DO search when the task depends on past decisions, earlier conventions, \
+     or prior work in this repo (e.g. \"之前怎么修的\", \"上次的结论\").\n\
+     - SKIP for self-contained requests: trivial formatting, simple translation, \
+     one-line commands, current date/time questions.\n\
+     - Keep it light: at most a couple of targeted `session_search` / \
+     `search_past_decisions` calls; if the first query finds nothing relevant, \
+     stop and proceed — do not re-query with variants.\n\
      \n\
-     - BEFORE attempting a non-trivial fix (especially for errors, bugs, or root-cause analysis), call `search_past_decisions` with a short problem signature to check if a similar problem was solved before. If a match exists with high success_rate, reuse the solution instead of rediscovering it.\n\
-     - AFTER applying a fix AND verifying it works (tests pass / user confirms / command succeeds), call `log_decision` with: `problem_signature`, `root_cause_hypothesis`, `applied_solution`, `affected_files`, and `verification_result`. This records the experience for future sessions.\n\
-     - Even if a fix FAILED, still call `log_decision` with `verification_result=\"Refuted\"` — negative experience is equally valuable for avoiding repeated mistakes.\n\
-     - Skip `log_decision` for trivial changes (typo fixes, formatting, rename) — it is meant for non-obvious repairs that took diagnosis."
-        .to_string()
-}
-
-/// 跨会话回忆引导段（Phase：跨会话记忆缺口修复）。
-///
-/// 与 `get_context_recovery_section` / `get_decision_log_section` 同模式：
-/// 静态注入到 system prompt，让 LLM 知道**何时**应该用 `session_search`
-/// 检索跨会话历史。修复"用户问上次任务 → AI 凭空猜测/误用代码搜索"的问题：
-/// 之前 session_search 只在 Context Recovery 段被提及，且场景限定为
-/// "压缩后找回"，对"跨会话回忆"场景无引导，导致能力被埋没。
-///
-/// 放在 Decision Experience 段之后，与 Context Recovery / Decision Experience
-/// 共同构成"工具使用教程区"，且 session 内字节稳定，不影响 prompt cache。
-fn get_cross_session_recall_section() -> String {
-    "## Cross-Session Recall (跨会话回忆)\n\
-     You have access to `session_search`, which searches `.claw/history.db` — \
-     an FTS5 index that covers **ALL past sessions** (not just the current one). \
-     Every conversation turn is automatically mirrored there.\n\
+     ### 决策日志(DecisionLog)\n\
+     You have a persistent repair decision log (`.claw/decision_log.db`) that \
+     survives across sessions:\n\
+     - BEFORE a non-trivial fix (errors, bugs, root-cause analysis), call \
+     `search_past_decisions` with a short problem signature; if a high-\
+     success_rate match exists, reuse it instead of rediscovering.\n\
+     - AFTER a fix is verified (tests pass / user confirms / command succeeds), \
+     call `log_decision` with `problem_signature`, `root_cause_hypothesis`, \
+     `applied_solution`, `affected_files`, `verification_result`.\n\
+     - Record failures too (`verification_result=\"Refuted\"`) — negative \
+     experience is equally valuable. Skip `log_decision` for trivial changes \
+     (typo, formatting, rename).\n\
      \n\
-     When the user asks about PAST sessions, do NOT guess from current context \
-     or infer from retrieved documents. Instead:\n\
-     \n\
-     1. **\"上次做了什么\" / \"上次的任务\" / \"what did I do last time\" / \"continue from before\"** — \
-     call `session_search` with a query like `\"task\"`, `\"user\"`, or the specific topic. \
-     Read the top results to summarize what was done.\n\
-     2. **\"上次关于 X 的讨论\"** — call `session_search` with query `\"X\"`. \
-     FTS5 ranks by relevance; pick the top hits with the highest `rank` field.\n\
-     3. **\"上上次 / 上周\"** — call `session_search` with `top_k: 20` to widen the net.\n\
-     \n\
-     Also check the NOTEBOOK `<plan>` section (injected at the top of every turn): \
-     if the previous session refreshed it, it contains the last task's decisions, \
-     constraints, and progress — your fastest path to \"what was I doing\".\n\
-     \n\
-     Only if both NOTEBOOK `<plan>` is empty AND `session_search` returns no hits, \
-     tell the user you have no record of that session."
+     ### 跨会话回忆\n\
+     `session_search` covers **ALL past sessions** (`.claw/history.db`, FTS5). \
+     When the user asks about PAST sessions (\"上次做了什么\" / \"what did I do \
+     last time\" / \"continue from before\" / \"上次关于 X 的讨论\"), do NOT guess \
+     — call `session_search` with a topical query; widen with `top_k: 20` for \
+     \"上上次 / 上周\". Also check the NOTEBOOK `<plan>` section (injected every \
+     turn) for the last task's decisions. Only if both NOTEBOOK `<plan>` is empty \
+     AND `session_search` returns no hits, tell the user you have no record of \
+     that session."
         .to_string()
 }
 
@@ -1346,21 +1307,6 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      **Pre-defined DAGs**: DAGs may already be registered at startup from YAML files in the workspace `.claw` dags directory. Prefer reusing an existing `dag_id` over re-defining the same graph.\n\
      \n\
-     **Example** — a dependency pipeline:\n\
-     \n\
-     ```\n\
-     dag_define({\n\
-       \"dag_id\": \"release-pipeline\",\n\
-       \"nodes\": [\n\
-         {\"id\": \"analyze\",   \"task\": \"分析改动影响面\", \"depends_on\": []},\n\
-         {\"id\": \"implement\", \"task\": \"实现修复\",      \"depends_on\": [\"analyze\"], \"verify_command\": \"cargo test\"},\n\
-         {\"id\": \"release\",   \"task\": \"打版本并发布\",    \"depends_on\": [\"implement\"]}\n\
-       ]\n\
-     })\n\
-     ```\n\
-     \n\
-     Then `dag_run({\"dag_id\": \"release-pipeline\", \"action\": \"start\"})` and poll with `dag_status`.\n\
-     \n\
      ### Parallelism Decision Tree\n\
      \n\
      ```\n\
@@ -1401,20 +1347,6 @@ fn get_multi_agent_orchestration_section() -> String {
      When the user gives a high-level request, AUTOMATICALLY decompose it into \
      sub-tasks with per-task model selection. Do NOT ask the user which model \
      to use — decide yourself based on the task.\n\
-     \n\
-     **Example** — User: \"分析这三个模块的测试覆盖率并给出改进建议\"\n\
-     \n\
-     ```
-     spawn_parallel_subagents({\n\
-       \"tasks\": [\n\
-         {\"name\": \"analyze-A\", \"task\": \"分析模块 A 的测试覆盖率\", \"model\": \"{budget_model}\", \"complexity\": \"simple\"},\n\
-         {\"name\": \"analyze-B\", \"task\": \"分析模块 B 的测试覆盖率\", \"model\": \"{budget_model}\", \"complexity\": \"simple\"},\n\
-         {\"name\": \"analyze-C\", \"task\": \"分析模块 C 的测试覆盖率\", \"model\": \"{budget_model}\", \"complexity\": \"simple\"},\n\
-         {\"name\": \"synthesize\", \"task\": \"综合三份分析,给出架构级改进建议\", \"model\": \"{flagship_model}\", \"complexity\": \"architectural\"}\n\
-       ],\n\
-       \"fail_fast\": \"off\"\n\
-     })\n\
-     ```\n\
      \n\
      **Key principle**: parallelizable simple tasks use Budget models; the \
      final synthesis/judgment step uses a Flagship model. This cuts cost by \
@@ -1716,36 +1648,13 @@ pub fn render_mcp_catalog_section(catalog: &str) -> String {
     )
 }
 
-/// Render the Plan Mode constraint section injected into the dynamic region
-/// when `plan_mode` is enabled.
-///
-/// This is the "C" component of the C+A combo: a minimal hard constraint that
-/// routes complex tasks through the planning watershed (see
-/// `get_tool_usage_guidance_section`): design-sign-off / handoff tasks must go
-/// through `brainstorming` + `writing-plans` (with Self-Review), while
-/// well-specified tasks go directly through `create_plan`. The detailed 9-item
-/// implementation-feasibility review lives in the skills' Self-Review sections
-/// (component A), not here — keeping the prompt minimal and avoiding
-/// duplication.
-fn render_plan_mode_constraint_section() -> String {
-    "## Plan Mode Constraints (active)\n\
-     当前处于 Plan 模式。复杂任务先按系统提示词「规划机制分水岭(create_plan\n\
-     vs brainstorming/writing-plans)」路由:需要用户批准设计或产出交接文档\n\
-     的,必须走 `brainstorming` + `writing-plans` skill(含 Self-Review:代码\n\
-     事实核查与实现可行性推演),未走该 skill 流程的方案不得进入 Execute\n\
-     阶段;任务已明确、无需设计签核的,直接调用 `create_plan` 创建执行计划\n\
-     并逐步执行,每步完成后调用 `plan_update` 推进。"
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         collapse_blank_lines, describe_instruction_file, display_context_path,
-        is_sensitive_config_key, normalize_instruction_content, redact_sensitive_json,
-        render_instruction_content, render_instruction_files, render_mcp_catalog_section,
-        truncate_diff_to_budget, truncate_instruction_content, ContextFile, ModelFamilyIdentity,
-        ProjectContext, SystemPromptBuilder, SystemPromptSplit, REDACTED_MARKER,
+        normalize_instruction_content, render_instruction_content, render_instruction_files,
+        render_mcp_catalog_section, truncate_instruction_content, ContextFile,
+        ModelFamilyIdentity, ProjectContext, SystemPromptBuilder, SystemPromptSplit,
         SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
@@ -1920,7 +1829,6 @@ mod tests {
         assert!(status.contains("## No commits yet on") || status.contains("## "));
         assert!(status.contains("?? CLAUDE.md"));
         assert!(status.contains("?? tracked.txt"));
-        assert!(context.git_diff.is_none());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -2008,7 +1916,9 @@ mod tests {
     }
 
     #[test]
-    fn discover_with_git_includes_diff_snapshot_for_tracked_changes() {
+    fn discover_with_git_skips_diff_snapshot() {
+        // B1:git diff 不再收集/注入 —— 模型极少直接消费 diff,且跨会话变化
+        // 破坏缓存前缀。git status + recent commits 保留。
         let _guard = env_lock();
         ensure_valid_cwd();
         let root = temp_dir();
@@ -2043,10 +1953,22 @@ mod tests {
 
         let context =
             ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
+        let rendered = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(context.clone())
+            .render();
 
-        let diff = context.git_diff.expect("git diff should be present");
-        assert!(diff.contains("Unstaged changes:"));
-        assert!(diff.contains("tracked.txt"));
+        // git status 快照仍保留(含对 tracked.txt 的修改标记)
+        let status = context.git_status.as_deref().expect("status snapshot");
+        assert!(
+            status.contains("M tracked.txt"),
+            "status must still include modified marker: {status}"
+        );
+        // diff 不再注入 prompt
+        assert!(
+            !rendered.contains("Git diff snapshot:"),
+            "B1: git diff must not be injected, got: {rendered}"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -2096,7 +2018,8 @@ mod tests {
         }
 
         assert!(prompt.contains("Project rules"));
-        assert!(prompt.contains("permissionMode"));
+        // B3:功能开关摘要(permission_mode 替代全量 JSON 的键名)
+        assert!(prompt.contains("permission_mode"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -2170,8 +2093,12 @@ mod tests {
         assert!(prompt.contains("# System"));
         assert!(prompt.contains("# Project context"));
         assert!(prompt.contains("# Claude instructions"));
+        // A8:执行风格恒定内容注入前缀 static 区(命中缓存,不在尾部重发)。
+        assert!(prompt.contains("## Execution Style"));
+        assert!(prompt.contains("Be concise."));
         assert!(prompt.contains("Project rules"));
-        assert!(prompt.contains("permissionMode"));
+        // B3:功能开关摘要(permission_mode 替代全量 JSON 的键名)
+        assert!(prompt.contains("permission_mode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
         // 第 0 层(事前认知框架):Framework Switching 静态段应含"不确定性溯源"
         // 的猜测循环触发模式(与第 1 层认知停滞检测的被动兜底互补)。
@@ -2765,20 +2692,6 @@ mod tests {
         assert_eq!(bps, vec![1, 2, 3]);
     }
 
-    #[test]
-    fn truncate_diff_to_budget_preserves_short_input() {
-        let result = truncate_diff_to_budget("short", 100);
-        assert_eq!(result, "short");
-    }
-
-    #[test]
-    fn truncate_diff_to_budget_truncates_long_input() {
-        let long: String = "x".repeat(200);
-        let result = truncate_diff_to_budget(&long, 50);
-        assert!(result.chars().count() < 200);
-        assert!(result.contains("truncated"));
-    }
-
     // ── Skill catalog injection tests (Phase 1) ──
 
     #[test]
@@ -2911,83 +2824,6 @@ mod tests {
         let rendered = render_mcp_catalog_section("- home: stdio, connected");
         assert!(rendered.starts_with("## MCP Servers"));
         assert!(rendered.contains("- home: stdio, connected"));
-    }
-
-    // ── Plan mode constraint injection tests (C component) ──
-
-    #[test]
-    fn plan_mode_constraint_injected_when_config_present_and_default() {
-        // RuntimeConfig::empty() has plan_mode = None, which unwrap_or(true)
-        // treats as enabled → constraint should be injected.
-        let config = crate::config::RuntimeConfig::empty();
-        let sections = SystemPromptBuilder::new()
-            .with_runtime_config(config)
-            .build();
-        let has_constraint = sections
-            .iter()
-            .any(|s| s.contains("## Plan Mode Constraints (active)"));
-        assert!(
-            has_constraint,
-            "plan mode constraint should be injected when config is present and plan_mode is default (None→true)"
-        );
-        // Constraint must be in dynamic region (after boundary).
-        let boundary_idx = sections
-            .iter()
-            .position(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-            .expect("boundary should exist");
-        let constraint_idx = sections
-            .iter()
-            .position(|s| s.contains("## Plan Mode Constraints (active)"))
-            .expect("constraint section should be present");
-        assert!(
-            constraint_idx > boundary_idx,
-            "plan mode constraint must be in dynamic region (after boundary)"
-        );
-    }
-
-    #[test]
-    fn plan_mode_constraint_not_injected_when_no_config() {
-        // No config set → no plan_mode check → no constraint.
-        let sections = SystemPromptBuilder::new().build();
-        let has_constraint = sections
-            .iter()
-            .any(|s| s.contains("## Plan Mode Constraints (active)"));
-        assert!(
-            !has_constraint,
-            "plan mode constraint should NOT be injected when no config is set"
-        );
-    }
-
-    #[test]
-    fn plan_mode_constraint_does_not_perturb_static_region() {
-        // Both builders have the same config (so same static region);
-        // the only difference is plan_mode constraint injection in dynamic.
-        // We can't easily construct a Some(false) config (private field),
-        // so instead verify the constraint appears AFTER the boundary,
-        // and that the static region (before boundary) is unaffected by
-        // the presence of the constraint section (it's purely dynamic).
-        let sections = SystemPromptBuilder::new()
-            .with_runtime_config(crate::config::RuntimeConfig::empty())
-            .build();
-        let boundary_idx = sections
-            .iter()
-            .position(|s| s == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-            .expect("boundary");
-        let constraint_idx = sections
-            .iter()
-            .position(|s| s.contains("## Plan Mode Constraints (active)"))
-            .expect("constraint section should be present");
-        assert!(
-            constraint_idx > boundary_idx,
-            "constraint must be after boundary (dynamic region), got boundary={boundary_idx} constraint={constraint_idx}"
-        );
-        // Static region should not contain the constraint text.
-        for (i, section) in sections[..boundary_idx].iter().enumerate() {
-            assert!(
-                !section.contains("Plan Mode Constraints"),
-                "static section {i} should not contain plan mode constraint text"
-            );
-        }
     }
 }
 
