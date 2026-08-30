@@ -22,6 +22,7 @@ pub mod streaming;
 pub mod suggestion;
 pub mod tool_display;
 pub mod ultraplan;
+pub mod voice;
 
 #[cfg(feature = "full-tui")]
 pub mod tui;

@@ -832,6 +832,7 @@ pub(crate) fn run_resume_command(
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
+        | SlashCommand::Listen { .. }
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }

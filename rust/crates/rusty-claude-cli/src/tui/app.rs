@@ -635,6 +635,19 @@ fn run_event_loop(
     // Initialize status fields from cli state
     initialize_status(&status_state, &cli);
 
+    // 语音输入通道:worker 线程执行 /voice 或 /listen 时把本地识别文本通过
+    // crate::voice::emit_draft 投递回来,主循环 try_recv 后插入输入框。
+    // 退出时注销槽,防止残留 Sender 累积(TUI 生命周期内只有一个 loop)。
+    let (voice_tx, voice_rx) = mpsc::channel::<String>();
+    crate::voice::set_draft_sink(Some(voice_tx));
+    struct VoiceDraftGuard;
+    impl Drop for VoiceDraftGuard {
+        fn drop(&mut self) {
+            crate::voice::set_draft_sink(None);
+        }
+    }
+    let _voice_draft_guard = VoiceDraftGuard;
+
     // 分层兜底提示：检测项目根目录及祖先链是否有 CLAUDE.md 系列文件。
     // 如果没有，向 OutputView 推送一次性汉化提示，引导用户运行 /init。
     //
@@ -821,6 +834,27 @@ fn run_event_loop(
                     buf.append(&prompt);
                 }
                 pending_ask = Some(req);
+            }
+        }
+
+        // 语音输入：worker 线程识别完成后投递文本，插入输入框供用户编辑。
+        // 文本折叠为单行（识别结果里 '\n' 表示分句，不应触发多行粘贴风格拼写）。
+        while let Ok(voice_text) = voice_rx.try_recv() {
+            let display = voice_text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if display.is_empty() {
+                continue;
+            }
+            input.insert_paste(&display);
+            needs_redraw = true;
+            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                buf.push_entry(crate::tui::output_view::OutputEntry::text(format!(
+                    "🎤 语音已识别并填入输入框(可编辑后回车发送): {display}\n\n"
+                )));
             }
         }
 
@@ -1731,6 +1765,49 @@ fn run_event_loop(
                         if let Ok(mut buf) = handle.lock() {
                             buf.toggle_latest_collapsible();
                         };
+                    }
+                    InputAction::StartVoiceInput => {
+                        // F4 一键语音输入：离线录音转文字(与 `/voice` 等价)。
+                        // route_key 已做 busy 守卫,这里兜底 cli 存在性(线程崩溃后
+                        // cli_holder 可能为 None,此时忽略按键)。
+                        if let Some(mut cli) = cli_holder.take() {
+                            let output_handle = output_view.shared_handle();
+                            cli.set_tui_output(Arc::clone(&output_handle));
+                            let (tx, rx) = mpsc::channel();
+                            // 与 Submit 斜杠命令同一 worker 模式:catch_unwind 包裹,
+                            // panic 时仍通过 channel 返回 cli,避免 cli 永久丢失。
+                            std::thread::spawn(move || {
+                                use std::panic::{catch_unwind, AssertUnwindSafe};
+                                let mut cli = cli;
+                                let cli_ref = &mut cli;
+                                let result = catch_unwind(AssertUnwindSafe(move || {
+                                    execute_slash_command(
+                                        cli_ref,
+                                        commands::SlashCommand::Voice { mode: None },
+                                    )
+                                }));
+                                let turn_result = match result {
+                                    Ok(r) => TurnResult { cli, result: r },
+                                    Err(payload) => {
+                                        let msg = payload
+                                            .downcast_ref::<String>()
+                                            .cloned()
+                                            .or_else(|| {
+                                                payload
+                                                    .downcast_ref::<&str>()
+                                                    .map(|s| s.to_string())
+                                            })
+                                            .unwrap_or_else(|| "<unknown panic>".to_string());
+                                        TurnResult {
+                                            cli,
+                                            result: Err(format!("worker thread panicked: {msg}")),
+                                        }
+                                    }
+                                };
+                                let _ = tx.send(turn_result);
+                            });
+                            turn_rx = Some(rx);
+                        }
                     }
                     InputAction::ScrollUp => {
                         // PgUp: enter manual-scroll mode and move up by ~half
@@ -2685,6 +2762,14 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
         return InputAction::ToggleSidebar;
     }
 
+    // F4 → 一键语音输入(录音转文字,与 `/voice` 等价)。
+    // 与 E 键同一范式：busy(turn 运行中)时忽略,避免两个 worker 并发录音。
+    if let KeyCode::F(4) = key.code {
+        if !busy {
+            return InputAction::StartVoiceInput;
+        }
+    }
+
     // F12 → toggle debug overlay (FPS / sticky state / scroll)
     if let KeyCode::F(12) = key.code {
         return InputAction::ToggleDebugOverlay;
@@ -2971,6 +3056,8 @@ fn render_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         ("PgUp / PgDn", "滚动输出视图 上 / 下 一屏"),
         ("/", "打开斜杠命令菜单（模糊过滤）"),
         ("F2 / Ctrl+B", "打开/关闭右侧侧栏（默认隐藏，查看工具状态）"),
+        ("F4", "一键语音输入（录音→本地识别→填入输入框）"),
+        ("/voice / /listen", "语音输入（可带秒数，如 /voice 10）"),
         ("Alt+Up / Alt+Down", "滚动侧栏工具历史（看更早 / 回最新）"),
         ("Ctrl+T", "折叠 / 展开最近一个工具卡片"),
         ("鼠标左键", "点击工具卡片切换折叠 / 展开"),
@@ -4057,5 +4144,65 @@ fn wrap_preserves_span_styles_across_lines() {
             .iter()
             .any(|s| s.style.fg == Some(Color::Red)),
         "第二行应保留红色样式"
+    );
+}
+
+#[test]
+fn f4_triggers_voice_input_when_idle() {
+    let mut input = InputLine::new();
+    let action = route_key(
+        &mut input,
+        KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE),
+        false,
+        false,
+    );
+    assert_eq!(action, InputAction::StartVoiceInput);
+}
+
+#[test]
+fn f4_is_ignored_while_turn_running() {
+    let mut input = InputLine::new();
+    let action = route_key(
+        &mut input,
+        KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE),
+        false,
+        true,
+    );
+    assert_eq!(action, InputAction::Ignore);
+}
+
+#[test]
+fn f4_works_with_pending_text_in_buffer() {
+    let mut input = InputLine::new();
+    input.handle_key(Some('a'), "");
+    let action = route_key(
+        &mut input,
+        KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE),
+        false,
+        false,
+    );
+    assert_eq!(action, InputAction::StartVoiceInput);
+}
+
+#[test]
+fn existing_function_keys_unchanged() {
+    let mut input = InputLine::new();
+    assert_eq!(
+        route_key(
+            &mut input,
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            false,
+            false
+        ),
+        InputAction::ToggleSidebar
+    );
+    assert_eq!(
+        route_key(
+            &mut input,
+            KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
+            false,
+            false
+        ),
+        InputAction::ToggleDebugOverlay
     );
 }

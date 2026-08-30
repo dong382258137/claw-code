@@ -1326,6 +1326,14 @@ impl LiveCli {
                 self.print_sandbox_status();
                 false
             }
+            SlashCommand::Voice { mode } => {
+                crate::voice::run_voice_input(self, mode.as_deref())?;
+                false
+            }
+            SlashCommand::Listen { duration } => {
+                crate::voice::run_voice_input(self, duration.as_deref())?;
+                false
+            }
             SlashCommand::Compact => {
                 self.compact()?;
                 false
@@ -1611,7 +1619,6 @@ impl LiveCli {
             | SlashCommand::Review { .. }
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
-            | SlashCommand::Voice { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
@@ -2831,7 +2838,7 @@ impl LiveCli {
     /// 用于 `handle_repl_command` 中简单 println 分支，让斜杠命令在 TUI
     /// 模式下能把输出显示在输出区而非破坏 alternate screen。
     #[cfg(feature = "full-tui")]
-    fn tui_println(&self, msg: &str) -> bool {
+    pub(crate) fn tui_println(&self, msg: &str) -> bool {
         if let Some(handle) = &self.tui_output {
             if let Ok(mut buf) = handle.lock() {
                 buf.append(msg);
@@ -2844,7 +2851,7 @@ impl LiveCli {
     }
 
     #[cfg(not(feature = "full-tui"))]
-    fn tui_println(&self, _msg: &str) -> bool {
+    pub(crate) fn tui_println(&self, _msg: &str) -> bool {
         false
     }
 }

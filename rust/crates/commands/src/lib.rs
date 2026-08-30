@@ -330,8 +330,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "voice",
         aliases: &[],
-        summary: "Toggle voice input mode",
-        argument_hint: Some("[on|off]"),
+        summary: "Record voice and transcribe locally (fill input line)",
+        argument_hint: Some("[seconds]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -666,8 +666,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "listen",
         aliases: &[],
-        summary: "Listen for voice input",
-        argument_hint: None,
+        summary: "Record voice and transcribe locally (fill input line)",
+        argument_hint: Some("[seconds]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1216,6 +1216,11 @@ pub enum SlashCommand {
     Voice {
         mode: Option<String>,
     },
+    /// 一次录音转写：`/listen [seconds]` — 与 `/voice` 同义，独立成命令以便
+    /// 在帮助/补全里与「语音输入模式」语义区分。
+    Listen {
+        duration: Option<String>,
+    },
     Usage {
         scope: Option<String>,
     },
@@ -1361,6 +1366,7 @@ impl SlashCommand {
             Self::Tasks { .. } => "/tasks",
             Self::Theme { .. } => "/theme",
             Self::Voice { .. } => "/voice",
+            Self::Listen { .. } => "/listen",
             Self::Usage { .. } => "/usage",
             Self::Rename { .. } => "/rename",
             Self::Copy { .. } => "/copy",
@@ -1597,6 +1603,9 @@ pub fn validate_slash_command_input(
         "tasks" => SlashCommand::Tasks { args: remainder },
         "theme" => SlashCommand::Theme { name: remainder },
         "voice" => SlashCommand::Voice { mode: remainder },
+        "listen" => SlashCommand::Listen {
+            duration: optional_single_arg(command, &args, "[seconds]")?,
+        },
         "usage" => SlashCommand::Usage { scope: remainder },
         "rename" => SlashCommand::Rename { name: remainder },
         "copy" => SlashCommand::Copy { target: remainder },
@@ -3832,10 +3841,7 @@ pub fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String
             let v = unquote_frontmatter_value(value.trim());
             // YAML 块标量:description: >(折叠)/ |(字面) 及其 chomping 变体 >- |+ 等。
             // 内容为后续所有缩进(以空白开头)的非空行,折叠块用空格连接,字面块用换行连接。
-            let is_block = matches!(
-                v.as_str(),
-                ">" | ">-" | ">+" | "|" | "|-" | "|+"
-            );
+            let is_block = matches!(v.as_str(), ">" | ">-" | ">+" | "|" | "|-" | "|+");
             if !is_block {
                 if !v.is_empty() {
                     description = Some(v);
@@ -3863,8 +3869,10 @@ pub fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String
             let joined = if fold {
                 parts.join(" ")
             } else {
-                parts.join("
-")
+                parts.join(
+                    "
+",
+                )
             };
             if !joined.is_empty() {
                 description = Some(joined);
@@ -4710,6 +4718,7 @@ pub fn handle_slash_command(
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
+        | SlashCommand::Listen { .. }
         | SlashCommand::Usage { .. }
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
@@ -4864,6 +4873,27 @@ mod tests {
             SlashCommand::parse(" /status "),
             Ok(Some(SlashCommand::Status))
         );
+        assert_eq!(
+            SlashCommand::parse("/voice"),
+            Ok(Some(SlashCommand::Voice { mode: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/voice 8"),
+            Ok(Some(SlashCommand::Voice {
+                mode: Some("8".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/listen"),
+            Ok(Some(SlashCommand::Listen { duration: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/listen 10"),
+            Ok(Some(SlashCommand::Listen {
+                duration: Some("10".to_string())
+            }))
+        );
+        assert!(SlashCommand::parse("/listen 1 2").is_err());
         assert_eq!(
             SlashCommand::parse("/sandbox"),
             Ok(Some(SlashCommand::Sandbox))
@@ -6331,10 +6361,7 @@ description: >
 ";
         let (name, description) = super::parse_skill_frontmatter(contents);
         assert_eq!(name.as_deref(), Some("whiteboard"));
-        assert_eq!(
-            description.as_deref(),
-            Some("飞书画板:查询 管理与分享画板")
-        );
+        assert_eq!(description.as_deref(), Some("飞书画板:查询 管理与分享画板"));
     }
 
     #[test]
@@ -6351,8 +6378,10 @@ description: |
         assert_eq!(name.as_deref(), Some("asr"));
         assert_eq!(
             description.as_deref(),
-            Some("本地语音识别
-支持多语言")
+            Some(
+                "本地语音识别
+支持多语言"
+            )
         );
     }
 
