@@ -9134,6 +9134,43 @@ fn command_exists(command: &str) -> bool {
     }
 }
 
+/// 创建唯一的临时输出文件对（stdout/stderr 捕获用）。
+///
+/// 第一性原理修复（2026-09-01）：PowerShell 工具的命令输出从「管道」改为
+/// 「临时文件」捕获。管道方案下 `wait_with_output()` 等待管道 EOF，而 EOF
+/// 要求所有写端关闭——`Start-Process` 启动的常驻服务进程可无限持有写端，
+/// 导致工具永久阻塞（2026-09-01 实测 `Start-Process -NoNewWindow ...
+/// python.exe` 卡死会话 6+ 分钟）。文件方案下命令完成由主 shell 进程
+/// 退出决定，与后代进程是否持有句柄完全无关。
+fn capture_output_files() -> std::io::Result<(PathBuf, PathBuf, std::fs::File, std::fs::File)> {
+    let dir = std::env::temp_dir();
+    let uniq = format!(
+        "claw-cmd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let out_path = dir.join(format!("{uniq}-out.log"));
+    let err_path = dir.join(format!("{uniq}-err.log"));
+    let out_file = std::fs::File::create(&out_path)?;
+    let err_file = std::fs::File::create(&err_path)?;
+    Ok((out_path, err_path, out_file, err_file))
+}
+
+/// 读取并清理捕获文件（best-effort：后台服务可能仍持有句柄，删除失败忽略）。
+fn read_and_cleanup_capture(
+    out_path: &Path,
+    err_path: &Path,
+) -> (Vec<u8>, Vec<u8>) {
+    let stdout = std::fs::read(out_path).unwrap_or_default();
+    let stderr = std::fs::read(err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(out_path);
+    let _ = std::fs::remove_file(err_path);
+    (stdout, stderr)
+}
+
 #[allow(clippy::too_many_lines)]
 fn execute_shell_command(
     shell: &str,
@@ -9177,19 +9214,22 @@ fn execute_shell_command(
         .arg("-NonInteractive")
         .arg("-Command")
         .arg(command);
+    // 输出捕获用临时文件而非管道（见 capture_output_files 的第一性原理说明）：
+    // 命令完成由主 shell 进程退出决定（std `wait()`），不依赖管道 EOF。
+    let (out_path, err_path, out_file, err_file) = capture_output_files()?;
     process
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::from(out_file))
+        .stderr(std::process::Stdio::from(err_file));
 
     if let Some(timeout_ms) = timeout {
         let mut child = process.spawn()?;
         let started = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
+                let (stdout, stderr) = read_and_cleanup_capture(&out_path, &err_path);
                 return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
                     raw_output_path: None,
                     interrupted: false,
                     is_image: None,
@@ -9201,7 +9241,7 @@ fn execute_shell_command(
                         .code()
                         .filter(|code| *code != 0)
                         .map(|code| format!("exit_code:{code}")),
-                    no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
+                    no_output_expected: Some(stdout.is_empty() && stderr.is_empty()),
                     structured_content: None,
                     persisted_output_path: None,
                     persisted_output_size: None,
@@ -9211,8 +9251,9 @@ fn execute_shell_command(
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
                 let _ = child.kill();
-                let output = child.wait_with_output()?;
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let _ = child.wait();
+                let (stdout, stderr) = read_and_cleanup_capture(&out_path, &err_path);
+                let stderr = String::from_utf8_lossy(&stderr).into_owned();
                 let stderr = if stderr.trim().is_empty() {
                     format!("Command exceeded timeout of {timeout_ms} ms")
                 } else {
@@ -9225,7 +9266,7 @@ Command exceeded timeout of {timeout_ms} ms",
                 let is_test = is_test_command(command);
                 let return_code_interpretation = if is_test { "test.hung" } else { "timeout" };
                 return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
                     stderr,
                     raw_output_path: None,
                     interrupted: true,
@@ -9249,10 +9290,14 @@ Command exceeded timeout of {timeout_ms} ms",
         }
     }
 
-    let output = process.output()?;
+    let mut child = process.spawn()?;
+    // 等主 shell 进程退出（std `wait()` 不依赖管道 EOF；后台常驻服务进程
+    // 即使继承输出文件句柄也无关——文件方案下 claw 直接读文件返回）。
+    let status = child.wait()?;
+    let (stdout, stderr) = read_and_cleanup_capture(&out_path, &err_path);
     Ok(runtime::BashCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
         raw_output_path: None,
         interrupted: false,
         is_image: None,
@@ -9260,12 +9305,11 @@ Command exceeded timeout of {timeout_ms} ms",
         backgrounded_by_user: None,
         assistant_auto_backgrounded: None,
         dangerously_disable_sandbox: None,
-        return_code_interpretation: output
-            .status
+        return_code_interpretation: status
             .code()
             .filter(|code| *code != 0)
             .map(|code| format!("exit_code:{code}")),
-        no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
+        no_output_expected: Some(stdout.is_empty() && stderr.is_empty()),
         structured_content: None,
         persisted_output_path: None,
         persisted_output_size: None,

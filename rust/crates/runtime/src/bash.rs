@@ -1,12 +1,12 @@
 use std::env;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 
@@ -241,6 +241,48 @@ fn get_git_actor() -> Option<String> {
     Some(name)
 }
 
+/// 创建唯一的临时输出文件对（stdout/stderr 捕获用），返回 (out_path, err_path, out_file, err_file)。
+///
+/// 第一性原理修复（2026-09-01）：命令输出从「管道」改为「临时文件」捕获。
+///
+/// 背景：管道方案下，claw 读取直到 EOF，而 EOF 要求**所有**写端句柄关闭——
+/// 命令派生的常驻后代进程（`&` / nohup / Start-Process 启动的服务）可无限期
+/// 持有写端，导致工具永久阻塞。此前靠「后台命令模式检测 + 排空宽限 + 杀进程树」
+/// 组合兜底，但换一种命令写法或换工具路径就漏（PowerShell 工具无任何保护，
+/// 2026-09-01 实测 `Start-Process -NoNewWindow ... python.exe` 卡死会话）。
+///
+/// 文件方案：命令完成由**主 shell 进程退出**决定，claw 退出等待后直接读文件，
+/// 与后代进程是否持有句柄完全无关。后台服务命令自然立即返回且服务继续运行，
+/// 不再需要模式检测、排空宽限、为释放管道而杀进程树。
+fn capture_output_files() -> io::Result<(PathBuf, PathBuf, std::fs::File, std::fs::File)> {
+    let dir = std::env::temp_dir();
+    let uniq = format!(
+        "claw-cmd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let out_path = dir.join(format!("{uniq}-out.log"));
+    let err_path = dir.join(format!("{uniq}-err.log"));
+    let out_file = std::fs::File::create(&out_path)?;
+    let err_file = std::fs::File::create(&err_path)?;
+    Ok((out_path, err_path, out_file, err_file))
+}
+
+/// 读取并清理捕获文件（best-effort：后台服务可能仍持有句柄，删除失败忽略）。
+fn read_and_cleanup_capture(
+    out_path: &Path,
+    err_path: &Path,
+) -> (Vec<u8>, Vec<u8>) {
+    let stdout = std::fs::read(out_path).unwrap_or_default();
+    let stderr = std::fs::read(err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(out_path);
+    let _ = std::fs::remove_file(err_path);
+    (stdout, stderr)
+}
+
 async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
@@ -255,10 +297,6 @@ async fn execute_bash_async(
     //          智能模式基于子进程树 CPU 时间 + stdout/stderr 流量判断是否真死锁，
     //          不再因"墙钟时间到"就误杀合法长任务（如回测、训练、编译）。
     let smart_mode = input.timeout.is_none();
-    // 后台服务模式(2026-08-31):命令含 `> log 2>&1 &` 等后台启动写法时,
-    // 后台进程会使 bash 不退出且 ActivityMonitor 判定"活跃"而永不超时。
-    // 检测到后使用短等待窗口,超时返回已收集输出(服务继续后台运行)。
-    let bg_service = is_background_service_command(&input.command);
     let timeout_ms = input.timeout.unwrap_or_else(|| {
         // 智能模式下的兜底硬上限：1 小时。
         // 真死锁会在 5min idle_timeout 时被提前 kill；
@@ -267,12 +305,16 @@ async fn execute_bash_async(
         SMART_HARD_LIMIT_MS
     });
 
-    // 用 spawn + select! 替代 command.output()，支持：
+    // 用 spawn + 轮询替代 command.output()，支持：
     // 1. 超时 kill 子进程（原 timeout 只放弃 await，子进程可能残留）
     // 2. Ctrl+C 中断 kill 子进程（原实现完全无法中断）
-    // 3. 并发读 stdout/stderr 避免管道死锁（child 输出超过 64KB pipe buffer 会阻塞）
+    // 3. 输出捕获用临时文件而非管道（见 capture_output_files 的第一性原理说明：
+    //    彻底消除"后代进程持有管道写端导致 EOF 永不发生"这一类阻塞）
+    let (out_path, err_path, out_file, err_file) = capture_output_files()?;
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file));
     command.stdin(Stdio::null());
 
     let mut child = command.spawn()?;
@@ -284,25 +326,9 @@ async fn execute_bash_async(
         try_assign_sandbox_job(&sandbox_status, pid);
     }
 
-    // take stdout/stderr 用于并发读取，避免管道死锁
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
-
-    // 独立 buffer 避免 select! 分支间数据竞争
-    let mut stdout_buf: Vec<u8> = Vec::new();
-    let mut stderr_buf: Vec<u8> = Vec::new();
-    let mut tmp_out = [0u8; 8192];
-    let mut tmp_err = [0u8; 8192];
-
     let start = Instant::now();
     let timeout_dur = Duration::from_millis(timeout_ms);
     let poll_interval = Duration::from_millis(100);
-    /// child 退出后 pipe 排空宽限期。
-    ///
-    /// 背景：bash `&` 启动的后台进程会继承 pipe 写端，导致 child 退出后
-    /// pipe 永不 EOF。给 2s 宽限期读取 child 退出前写入的残留数据，
-    /// 超时强制关闭 pipe，防止 select! loop 永久阻塞。
-    const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
     // 智能模式：初始化 ActivityMonitor，跟踪子进程树活跃度
     let mut monitor: Option<activity_monitor::ActivityMonitor> = if smart_mode {
@@ -320,23 +346,15 @@ async fn execute_bash_async(
     let mut smart_idle = false;
     // 智能模式忙等循环触发标记：无输出但 CPU 持续增长的疑似空转循环
     let mut busy_loop = false;
-    // child 退出时间，用于 pipe 排空宽限期判断
-    let mut child_exit_time: Option<Instant> = None;
+    // 输出捕获文件大小（用于向 ActivityMonitor 喂"有输出"信号）
+    let mut last_out_size: u64 = 0;
+    let mut last_err_size: u64 = 0;
 
-    // select! loop：
-    // - child 未退出时：并发等待 child.wait() / 超时 / abort / 读 stdout / 读 stderr
-    // - child 退出后：继续读 stdout/stderr 直到 EOF（pipe 中可能有残留数据）
-    // - child 退出后若 pipe 长时间未 EOF（后台 `&` 进程继承 pipe 写端），
-    //   超过 PIPE_DRAIN_GRACE 后强制关闭 pipe，防止死锁
-    // - stdout/stderr 都 EOF 且 child 已退出时：break
-    //
-    // 关键设计：所有周期检查（try_wait / abort / 智能或固定超时 / PIPE_DRAIN_GRACE）
-    // 都放在循环顶部，每轮必执行，绝不依赖 select! 的某个分支触发。
-    // 背景（BUG）：此前超时/try_wait 检查放在 select! 的 sleep 分支里，而 select!
-    // 用 biased 优先读 stdout。当 stdout 持续有数据时，read 分支总是立即 ready，
-    // sleep 分支被饿死 → 固定 timeout 永不触发（实测 timeout=30s 的命令跑了 578s），
-    // 会话表现为"执行工具后卡死"。把检查移到顶部后，即使 stdout 满速输出，
-    // 每轮循环仍会执行超时判定，保证 30s 准时 kill。
+    // 轮询循环（无管道读取，见 capture_output_files 说明）：
+    // - 每轮先做周期检查（try_wait / abort / 智能或固定超时）
+    // - 再检查输出捕获文件是否增长（喂 ActivityMonitor 的"有输出"信号，
+    //   否则 busy-loop 判定会因检测不到输出而误杀正常长任务）
+    // - 心跳 sleep 保活
     loop {
         // 1. try_wait() 轮询子进程退出状态 → 提前到循环顶部。
         //    try_wait() 直接调用 GetExitCodeProcess（同步、非阻塞），
@@ -347,12 +365,10 @@ async fn execute_bash_async(
                 Ok(Some(status)) => {
                     exit_status = status.code();
                     child_exited = true;
-                    child_exit_time = Some(Instant::now());
                 }
                 Ok(None) => { /* child 仍在运行 */ }
                 Err(_) => {
                     child_exited = true;
-                    child_exit_time = Some(Instant::now());
                 }
             }
         }
@@ -361,23 +377,9 @@ async fn execute_bash_async(
         if is_bash_aborted() {
             aborted = true;
             if !child_exited {
-                // abort 时立即终止进程树并关闭 pipe,快速退出(不等残留数据)。
-                // 2026-08-31:统一走进程树终止,后台链持 pipe 也会被释放。
-                terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time).await;
+                // abort 时立即终止进程树，快速退出（不等残留数据）。
+                terminate_child_tree(&mut child, &mut child_exited).await;
             }
-            // abort 时立即关闭 pipe，快速退出（不等残留数据）
-            child_stdout = None;
-            child_stderr = None;
-        } else if bg_service && !child_exited && start.elapsed() >= background_service_wait() {
-            // 后台服务模式:等待窗口到,命令本体未完成(后台服务持有管道/子进程树
-            // 导致 bash 不退出)。先终止整棵进程树(bash + 后台服务)释放 pipe
-            // 写端,再 kill bash。不杀进程树的话,后台进程持有 pipe 写端使
-            // blocking read 线程卡住,tokio Runtime drop 会一直等待
-            // (实测等待时长 = 后台进程剩余存活时间,如 sleep 300 → 300s)。
-            // 注意 `!child_exited`:kill 后不再进入本分支,避免每轮重置
-            // child_exit_time 导致 PIPE_DRAIN_GRACE 永不触发(死循环)。
-            timed_out = true;
-            terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time).await;
         } else if !child_exited {
             if let Some(ref mut m) = monitor {
                 // 智能模式：基于子进程树活跃度决策
@@ -386,98 +388,54 @@ async fn execute_bash_async(
                     activity_monitor::ActivityDecision::IdleTimeout => {
                         timed_out = true;
                         smart_idle = true;
-                        terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time)
-                            .await;
+                        terminate_child_tree(&mut child, &mut child_exited).await;
                     }
                     activity_monitor::ActivityDecision::HardTimeout => {
                         timed_out = true;
-                        terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time)
-                            .await;
+                        terminate_child_tree(&mut child, &mut child_exited).await;
                     }
                     activity_monitor::ActivityDecision::BusyLoop => {
                         busy_loop = true;
                         timed_out = true;
-                        terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time)
-                            .await;
+                        terminate_child_tree(&mut child, &mut child_exited).await;
                     }
                 }
             } else if start.elapsed() >= timeout_dur {
                 // 固定超时模式（input.timeout 显式指定时）
                 timed_out = true;
-                terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time).await;
+                terminate_child_tree(&mut child, &mut child_exited).await;
             }
         }
 
-        // 3. PIPE_DRAIN_GRACE：child 退出后排空 pipe 的宽限期。
-        //    后台 `&` 进程继承 pipe 写端导致 child 退出后 pipe 不 EOF，
-        //    超过宽限期后强制关闭 pipe，防止 select! 永久阻塞。
-        if let Some(exit_time) = child_exit_time {
-            if exit_time.elapsed() >= PIPE_DRAIN_GRACE {
-                child_stdout = None;
-                child_stderr = None;
-            }
-        }
-
-        // 4. 退出条件：child 已退出且 stdout/stderr 都 EOF（或已关闭）
-        if child_exited && child_stdout.is_none() && child_stderr.is_none() {
+        // 3. 退出条件：child 已退出（输出已由捕获文件保存，无需等管道 EOF）。
+        if child_exited {
             break;
         }
 
-        // 事件循环：只负责读 stdout/stderr，外加 100ms 心跳保活。
-        // 周期检查全部在上方循环顶部完成，此处无需再放 sleep 分支的可判定逻辑。
-        tokio::select! {
-            biased;
-
-            // 分支 1：读 stdout
-            n = async {
-                if let Some(ref mut stdout) = child_stdout {
-                    stdout.read(&mut tmp_out).await
-                } else {
-                    std::future::pending::<io::Result<usize>>().await
-                }
-            }, if child_stdout.is_some() => {
-                match n {
-                    Ok(0) => { child_stdout = None; }
-                    Ok(n) => {
-                        stdout_buf.extend_from_slice(&tmp_out[..n]);
-                        if let Some(ref mut m) = monitor {
-                            m.note_output();
-                        }
-                    }
-                    Err(_) => { child_stdout = None; }
-                }
+        // 4. 检查输出捕获文件是否增长 → 喂 ActivityMonitor 的"有输出"信号。
+        if let Some(ref mut m) = monitor {
+            let out_now = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+            let err_now = std::fs::metadata(&err_path).map(|m| m.len()).unwrap_or(0);
+            if out_now > last_out_size || err_now > last_err_size {
+                m.note_output();
+                last_out_size = out_now;
+                last_err_size = err_now;
             }
-
-            // 分支 2：读 stderr
-            n = async {
-                if let Some(ref mut stderr) = child_stderr {
-                    stderr.read(&mut tmp_err).await
-                } else {
-                    std::future::pending::<io::Result<usize>>().await
-                }
-            }, if child_stderr.is_some() => {
-                match n {
-                    Ok(0) => { child_stderr = None; }
-                    Ok(n) => {
-                        stderr_buf.extend_from_slice(&tmp_err[..n]);
-                        if let Some(ref mut m) = monitor {
-                            m.note_output();
-                        }
-                    }
-                    Err(_) => { child_stderr = None; }
-                }
-            }
-
-            // 分支 3：静默期心跳（两边 pipe 都无数据时，保证至少每 100ms 醒来一次，
-            // 让循环顶部的 try_wait/超时检查定期执行）
-            _ = tokio::time::sleep(poll_interval) => {}
         }
+
+        // 5. 心跳保活。
+        tokio::time::sleep(poll_interval).await;
     }
+
+    // 命令已完成：从捕获文件读取输出并清理临时文件。
+    let (stdout_raw, stderr_raw) = read_and_cleanup_capture(&out_path, &err_path);
+    let stdout_text = String::from_utf8_lossy(&stdout_raw);
+    let stderr_text = String::from_utf8_lossy(&stderr_raw);
 
     // abort：用户 Ctrl+C 中断
     if aborted {
-        let stdout = truncate_output(&String::from_utf8_lossy(&stdout_buf));
-        let stderr = truncate_output(&String::from_utf8_lossy(&stderr_buf));
+        let stdout = truncate_output(&stdout_text);
+        let stderr = truncate_output(&stderr_text);
         return Ok(BashCommandOutput {
             stdout,
             stderr: format!("[interrupt] Command interrupted by user (Ctrl+C)\n{stderr}"),
@@ -500,15 +458,6 @@ async fn execute_bash_async(
 
     // 超时
     if timed_out {
-        // 后台服务模式:返回已收集输出 + 服务继续后台运行提示(不 kill 服务)
-        if bg_service {
-            return Ok(background_service_output(
-                &input,
-                sandbox_status,
-                &stdout_buf,
-                &stderr_buf,
-            ));
-        }
         // 智能模式 busy loop 触发：无输出但 CPU 持续增长的疑似空转循环
         if busy_loop {
             return Ok(busy_loop_output(&input, sandbox_status));
@@ -521,8 +470,8 @@ async fn execute_bash_async(
     }
 
     // 正常完成
-    let mut stdout = truncate_output(&String::from_utf8_lossy(&stdout_buf));
-    let stderr = truncate_output(&String::from_utf8_lossy(&stderr_buf));
+    let mut stdout = truncate_output(&stdout_text);
+    let stderr = truncate_output(&stderr_text);
     // P1-4: timeout 单位兜底提示。提示写入 stdout（LLM 直接可见），
     // 不写 stderr，避免污染 TUI alternate screen。必须在计算
     // no_output_expected 之前追加，否则提示被判定为"无输出"而隐藏。
@@ -560,111 +509,7 @@ async fn execute_bash_async(
     })
 }
 
-/// 后台服务命令等待窗口(秒):检测到"启动后台服务"模式后,命令本体在此窗口内
-/// 未完成则返回已收集输出(服务继续在后台运行),避免工具永久卡住。
-const BACKGROUND_SERVICE_WAIT_SECS: u64 = 30;
-
-/// 读取后台服务等待窗口(env 可覆盖,测试用):`CLAW_BACKGROUND_SERVICE_WAIT_SECS`,
-/// 越界/非法回退默认值。
-fn background_service_wait() -> Duration {
-    std::env::var("CLAW_BACKGROUND_SERVICE_WAIT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| (1..=300).contains(&n))
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(BACKGROUND_SERVICE_WAIT_SECS))
-}
-
-/// 后台服务命令检测(2026-08-31):`cmd > log 2>&1 &` / `cmd &> log &` /
-/// `nohup cmd > log 2>&1 &` 等后台启动模式。
-///
-/// 背景:这类命令启动常驻服务,后台进程继承管道/成为子进程树成员,导致 bash
-/// 可能永不退出;ActivityMonitor 又因后台服务"活跃"(在接受请求/处理数据)而
-/// 永不触发 idle/hard 超时 → Bash 工具永久卡住(实证:启动 ws_server 的 bash
-/// 命令阻塞会话 4 小时,期间 claw 无 CPU、不写会话文件)。检测到后使用短等待
-/// 窗口,超时终止 bash 及进程树并返回已收集输出(后台进程会持有输出管道,
-/// 不终止则 tokio Runtime drop 永久等待阻塞的 read 线程)。
-fn is_background_service_command(command: &str) -> bool {
-    // 先归一化换行/回车为空格:多行命令中 `&` 后跟换行符(`2>&1 &\necho ...`)
-    // 时,原子串匹配 "2>&1 &"(要求 & 后空格)会漏过 —— 2026-08-31 二次事故:
-    // `nohup ... > log 2>&1 &\necho ...` 未被识别 → 后台服务链持有输出管道,
-    // 固定超时只 kill 本体不杀进程树 → Bash 工具永久卡住(11 分钟无输出)。
-    let normalized: String = command.trim().replace(['\r', '\n'], " ");
-    let c = normalized.trim();
-    // 最常见的写法:重定向 + 后台(`> log 2>&1 &` / `>> log 2>&1 &` /
-    // `> /dev/null 2>&1 &`)。这类几乎总是"启动守护/服务进程且不等待"。
-    if c.contains("2>&1 &") || c.contains("> /dev/null &") {
-        return true;
-    }
-    // `&>` 合并重定向 + 后台(`cmd &> log &`)
-    if c.contains("&>") {
-        return true;
-    }
-    // 命令以 ` &` 结尾且前文含重定向 + nohup(显式守护化)
-    if let Some(body) = c.strip_suffix('&') {
-        let body = body.trim_end();
-        if body.contains('>') && (body.contains("nohup") || body.contains("2>&1")) {
-            return true;
-        }
-    }
-    false
-}
-
-/// 后台服务命令等待窗口到时的输出构造(2026-08-31)。
-///
-/// 命令含后台启动模式且命令本体在 BACKGROUND_SERVICE_WAIT_SECS 内未完成,
-/// 返回已收集输出。注意:为避免后台进程持有输出管道导致工具永久卡住
-/// (tokio Runtime drop 会等待阻塞的 read 线程),bash 及其进程树已被终止;
-/// 如需持久后台服务,应使用 `run_in_background=true`(输出重定向到空,
-/// 服务由 Job Object 保护独立运行)。
-fn background_service_output(
-    input: &BashCommandInput,
-    sandbox_status: SandboxStatus,
-    stdout_buf: &[u8],
-    stderr_buf: &[u8],
-) -> BashCommandOutput {
-    let stdout = truncate_output(&String::from_utf8_lossy(stdout_buf));
-    let stderr = truncate_output(&String::from_utf8_lossy(stderr_buf));
-    let guidance = "\n\n[Background service] Detected a background-start pattern \
-        (`> log 2>&1 &`). The foreground part did not finish within the wait window; \
-        the command and its process tree were terminated to prevent the tool from \
-        hanging on the inherited output pipe. If you need a persistent background \
-        service, use run_in_background=true instead.";
-    BashCommandOutput {
-        stdout,
-        stderr: format!("{stderr}{guidance}"),
-        raw_output_path: None,
-        interrupted: false,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-        return_code_interpretation: Some("background.service".to_string()),
-        no_output_expected: Some(true),
-        structured_content: Some(vec![json!({
-            "event": "command.background_service",
-            "failureClass": "background_service",
-            "data": {
-                "command": input.command,
-                "provenance": "bash.background_service",
-                "classification": "background.service"
-            }
-        })]),
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: Some(sandbox_status),
-        shell_type: Some(detect_shell_type().as_str().to_string()),
-    }
-}
-
-/// 终止进程树(2026-08-31)。
-///
-/// 背景:bg 分支 kill bash 后,后台 `&` 启动的服务进程(Git Bash 下即使
-/// `> /dev/null 2>&1` 重定向,其后代仍可能持有 stdout/stderr pipe 写端)使
-/// pipe 不 EOF,阻塞的 blocking read 线程让 tokio Runtime drop 永久等待
-/// (实测等待时间 = 后台进程剩余存活时间,如 sleep 300 → 300s)。
-/// 因此 kill bash 后必须终止整棵进程树,释放 pipe 写端,工具才能及时返回。
+/// 终止进程树。
 ///
 /// Windows 用 taskkill /T /F(递归终止子孙进程),Unix 用 kill -KILL 进程组。
 fn kill_process_tree(pid: u32) {
@@ -690,24 +535,13 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
-/// 终止子进程及其整棵进程树(释放继承的输出管道写端)。
-///
-/// 2026-08-31 二次事故:后台服务(`nohup ... &`)的后代进程即使父进程被杀,
-/// 仍持有输出管道 → Bash 工具 read 阻塞、tokio Runtime drop 永久等待
-/// (会话卡住 11 分钟无输出)。此前仅 bg_service 分支杀进程树;固定/智能
-/// 超时只 `child.kill()`(杀本体不杀树),后台链持 pipe 使工具卡死。
-/// 所有超时/中止路径统一改走此函数。
-async fn terminate_child_tree(
-    child: &mut tokio::process::Child,
-    child_exited: &mut bool,
-    child_exit_time: &mut Option<Instant>,
-) {
+/// 终止子进程及其整棵进程树（超时/中止时终止失控进程，输出已落捕获文件）。
+async fn terminate_child_tree(child: &mut tokio::process::Child, child_exited: &mut bool) {
     if let Some(pid) = child.id() {
         kill_process_tree(pid);
     }
     let _ = child.kill().await;
     *child_exited = true;
-    *child_exit_time = Some(Instant::now());
 }
 
 /// 智能模式 busy loop 触发时的输出构造。
@@ -1115,16 +949,16 @@ struct ShellKind {
     kind: ShellType,
 }
 
-/// 进程级 shell 探测缓存。
-/// 首次调用 `shell_kind()` 时执行探测（~0.2ms 命中固定路径，~2ms 命中 PATH），
-/// 之后所有 bash 命令直接读缓存，O(1)。
-static SHELL_KIND_CACHE: std::sync::OnceLock<ShellKind> = std::sync::OnceLock::new();
-
-/// 返回当前进程使用的 shell 启动器，首次调用时探测并缓存。
+/// 返回当前进程使用的 shell 启动器。
 /// Windows 探测顺序：CLAW_GIT_BASH 环境变量 → Program Files 固定路径 → PATH 搜索（过滤 WSL）。
 /// Unix 直接用 sh -lc。
+///
+/// 注意：**不做进程级缓存**。shell 检测依赖环境变量（CLAW_GIT_BASH / PATH），
+/// 全局缓存会在测试并行修改环境时被污染（首次初始化固定为 cmd.exe 后
+/// 所有后续命令行为漂移）。每次探测成本仅为几次文件 exists + PATH 扫描，
+/// 毫秒级，可忽略。
 fn shell_kind() -> ShellKind {
-    SHELL_KIND_CACHE.get_or_init(detect_shell_kind).clone()
+    detect_shell_kind()
 }
 
 /// 对外暴露的 shell 类型探测入口（供 system prompt 构造时调用）。
@@ -1243,9 +1077,12 @@ mod git_bash_detection_tests {
 
     // P11-2:这些测试共享环境变量 CLAW_GIT_BASH 和 PATH,Rust 默认多线程并行
     // 跑测试会导致竞态。用模块级 Mutex 串行化所有环境变量修改。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // 锁定义在 bash.rs 顶层,与 bash::tests 共享,防止 PATH 清空窗口污染
+    // 其他测试的 shell_kind() 首次初始化。
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::BASH_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// `CLAW_GIT_BASH` 指向一个真实存在的文件 → 直接返回该路径。
@@ -1338,64 +1175,28 @@ mod unix_shell_tests {
     }
 }
 
+/// 跨测试模块共享的环境变量锁（git_bash_detection_tests 修改 CLAW_GIT_BASH /
+/// PATH 时与其他执行命令的测试并行会互相干扰）。shell 检测每次实时探测
+/// （无进程级缓存），锁串行化 env 修改窗口，避免其他测试读到中间态。
+#[cfg(test)]
+pub(crate) static BASH_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::{execute_bash, has_shell_syntax_error, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
 
-    /// 后台服务命令模式检测(2026-08-31):`> log 2>&1 &` / `&> log &` 等后台
-    /// 启动写法应识别,普通命令不应误报。
+    /// 第一性原理回归(2026-09-01):输出捕获改为临时文件后,后台启动命令
+    /// (`cmd &` / nohup / Start-Process)在 bash 本体退出后**立即返回**,
+    /// 不再依赖"窗口等待 + 杀进程树",也不再产生旧 "Background service" 提示。
+    /// 后台服务进程继续运行(不再被杀),工具不卡住。
     #[test]
-    fn background_service_detection_patterns() {
-        assert!(super::is_background_service_command(
-            "python server.py > log 2>&1 &"
-        ));
-        assert!(super::is_background_service_command(
-            "python server.py >> log 2>&1 &"
-        ));
-        assert!(super::is_background_service_command(
-            "nohup server > log 2>&1 &"
-        ));
-        assert!(super::is_background_service_command(
-            "cd /d/chanlunV2 && python -B -m chanlun_py.web.server > /tmp/ws.log 2>&1 & echo $!"
-        ));
-        assert!(super::is_background_service_command("cmd &> log &"));
-        assert!(super::is_background_service_command("svc > /dev/null &"));
-        // 多行命令: `&` 后跟换行符(\n)而非空格 —— 2026-08-31 二次事故复现
-        // (nohup python > log 2>&1 &\necho ... 未被识别 → 后台链持 pipe 卡 11 分钟)。
-        assert!(super::is_background_service_command(
-            "cd /d/chanlunV2 && nohup \"python\" -B -m chanlun_py.web.server > chanlun_py/web_server.log 2>&1 &\necho \"启动中,等待就绪...\"; sleep 8; netstat -ano | grep \":8765.*LISTENING\" | head -3"
-        ));
-        assert!(super::is_background_service_command(
-            "nohup server > log 2>&1 &\nsleep 5"
-        ));
-        // 精确事故命令(2026-08-31 三次事故,绝对路径 python.exe + `2>&1 &\necho`):
-        // session-1788182483639 卡住命令,必须被识别。
-        assert!(super::is_background_service_command(
-            "cd /d/chanlunV2 && C:/Users/38225/AppData/Local/Programs/Python/Python311/python.exe -B -m chanlun_py.web.server > /d/chanlunV2/chanlun_py/.sandbox-tmp/ws_server_restart.log 2>&1 &\necho \"started, waiting for port...\"; sleep 8; netstat -ano 2>/dev/null | grep -E \":8765|5001\\s.*LISTENING\" | head -5"
-        ));
-        assert!(!super::is_background_service_command("ls -la"));
-        assert!(!super::is_background_service_command("cargo build"));
-        assert!(!super::is_background_service_command("git status"));
-        assert!(!super::is_background_service_command("sleep 5"));
-        assert!(!super::is_background_service_command("echo a && echo b"));
-    }
-
-    /// 后台服务集成测试(2026-08-31):后台启动命令在等待窗口内返回,不永久卡住。
-    /// 回归:启动 ws_server 的 bash 命令曾阻塞会话 4 小时(ActivityMonitor 因
-    /// 后台服务"活跃"而永不触发超时,后台进程持有输出管道使工具无法收尾)。
-    /// 窗口通过 env 缩短为 2s。
-    #[test]
-    fn background_service_command_returns_within_window() {
+    fn background_service_command_returns_when_shell_exits() {
         use std::time::Instant;
-
-        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS", "2");
 
         let start = Instant::now();
         let output = execute_bash(BashCommandInput {
-            command: "echo bg-start; sleep 300 > /dev/null 2>&1 & wait".to_string(),
+            command: "echo bg-start; nohup sleep 8 > /dev/null 2>&1 &".to_string(),
             timeout: None,
             description: None,
             run_in_background: Some(false),
@@ -1406,36 +1207,34 @@ mod tests {
             allowed_mounts: None,
         })
         .expect("bg service command should return");
-        std::env::remove_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS");
 
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_secs() < 30,
-            "background service command must return within window, took {elapsed:?}"
+            elapsed.as_secs() < 15,
+            "background service command must return when shell exits, took {elapsed:?}"
         );
         assert!(
-            output.stderr.contains("Background service"),
-            "stderr should hint background service, got: {}",
+            output.stdout.contains("bg-start"),
+            "stdout should contain foreground output, got: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stderr.contains("Background service"),
+            "file-based capture should not emit legacy background-service hint, got: {}",
             output.stderr
         );
+        // 后台 sleep 8 会在 8s 后自动退出,无需按镜像名清理(避免误杀并行测试的 sleep)。
     }
 
-    /// 回归(2026-08-31 二次事故):多行 `&\n` 后台命令必须在窗口内返回。
-    /// 事故命令 `nohup ... > log 2>&1 &\necho ...` 的 `&` 后是换行符而非空格,
-    /// 原检测漏过 → 固定超时只 kill 本体不杀进程树 → 后台链持 pipe 卡住 11 分钟。
+    /// 回归:多行 `&\n` 后台命令写法同样在 bash 本体退出后立即返回。
     #[test]
-    fn background_service_multiline_returns_within_window() {
+    fn background_service_multiline_returns_when_shell_exits() {
         use std::time::Instant;
-
-        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS", "2");
 
         let start = Instant::now();
         let output = execute_bash(BashCommandInput {
             command:
-                "cd /tmp && nohup python -m http.server > /tmp/svc.log 2>&1 &\necho \"启动中\"; sleep 10; true"
-                    .to_string(),
+                "cd /tmp && nohup sleep 8 > /tmp/svc.log 2>&1 &\necho \"启动中\"; true".to_string(),
             timeout: None,
             description: None,
             run_in_background: Some(false),
@@ -1446,30 +1245,24 @@ mod tests {
             allowed_mounts: None,
         })
         .expect("multiline bg service command should return");
-        std::env::remove_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS");
 
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_secs() < 30,
-            "multiline background command must return within window, took {elapsed:?}"
+            elapsed.as_secs() < 15,
+            "multiline background command must return when shell exits, took {elapsed:?}"
         );
         assert!(
-            output.stderr.contains("Background service"),
-            "stderr should hint background service, got: {}",
-            output.stderr
+            output.stdout.contains("启动中"),
+            "stdout should contain foreground output, got: {}",
+            output.stdout
         );
     }
 
-    /// 生产路径复现(2026-08-31 三次事故):execute_bash 在 tokio runtime context
-    /// 内被调用(production 走 spawn 线程 + block_on 分支)。验证多行后台命令
-    /// 同样在窗口内返回 —— 单元测试走无 runtime 分支,可能掩盖 runtime 分支 bug。
+    /// 生产路径复现:execute_bash 在 tokio runtime context 内被调用
+    /// (production 走 spawn 线程 + block_on 分支)。验证后台命令同样立即返回。
     #[test]
     fn background_service_returns_in_runtime_context() {
         use std::time::Instant;
-
-        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS", "2");
 
         let rt = tokio::runtime::Runtime::new().expect("tokio rt");
         let start = Instant::now();
@@ -1478,7 +1271,7 @@ mod tests {
             // (内部会检测到 Handle,spawn 线程 + block_on + mpsc recv)
             execute_bash(BashCommandInput {
                 command:
-                    "cd /tmp && nohup python -m http.server > /tmp/svc_rt.log 2>&1 &\necho \"rt started\"; sleep 10; true"
+                    "cd /tmp && nohup sleep 8 > /tmp/svc_rt.log 2>&1 &\necho \"rt started\"; true"
                         .to_string(),
                 timeout: None,
                 description: None,
@@ -1490,36 +1283,32 @@ mod tests {
                 allowed_mounts: None,
             })
         });
-        std::env::remove_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS");
         let output = result.expect("bg service should return in runtime context");
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_secs() < 30,
-            "runtime-context bg command must return within window, took {elapsed:?}"
+            elapsed.as_secs() < 15,
+            "runtime-context bg command must return when shell exits, took {elapsed:?}"
         );
         assert!(
-            output.stderr.contains("Background service"),
-            "stderr should hint background service, got: {}",
-            output.stderr
+            output.stdout.contains("rt started"),
+            "stdout should contain foreground output, got: {}",
+            output.stdout
         );
     }
 
-    /// 三次事故复现(session-1788182483639):AI 用 PowerShell Start-Process 后台
-    /// 启动服务 + sleep + netstat,timeout=None(智能模式)。后台进程有 CPU 持续
-    /// 活跃 → ActivityMonitor 永不 idle;若 bash 本体退出则 PIPE_DRAIN_GRACE
-    /// 兜底返回。验证 40s 内返回(不应卡死)。
+    /// 回归(session-1788195879056):AI 用 PowerShell Start-Process 后台启动服务
+    /// (python 长驻,持有继承句柄),timeout=None(智能模式)。文件方案下
+    /// bash 本体(Start-Process → echo → sleep → netstat)退出后立即返回,
+    /// 后台服务不再被误杀。验证 15s 内返回。
     #[test]
     fn start_process_bg_returns_in_smart_mode() {
         use std::time::Instant;
-
-        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let rt = tokio::runtime::Runtime::new().expect("tokio rt");
         let start = Instant::now();
         let result = rt.block_on(async {
             execute_bash(BashCommandInput {
-                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Windows\\System32\\cmd.exe' -ArgumentList '/c','timeout','300' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_err.log'\" && echo \"Start-Process done\"; sleep 5; netstat -ano | grep LISTENING | grep -E \"8765|5001\" | head -3".to_string(),
+                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Users\\38225\\AppData\\Local\\Programs\\Python\\Python311\\python.exe' -ArgumentList '-c','import time; time.sleep(5)' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_smart.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_smart_err.log'\" && echo \"Start-Process done\"; sleep 5; true".to_string(),
                 timeout: None,
                 description: None,
                 run_in_background: Some(false),
@@ -1533,38 +1322,28 @@ mod tests {
         let output = result.expect("start-process bg should return");
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_secs() < 40,
-            "start-process bg command must return within 40s, took {elapsed:?}"
+            elapsed.as_secs() < 15,
+            "start-process bg command must return when shell exits, took {elapsed:?}"
         );
         assert!(
             output.stdout.contains("Start-Process done"),
             "bash foreground should complete, stdout: {}",
             output.stdout
         );
-        // 清理后台进程
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "timeout.exe", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // 后台 python sleep(5) 会在 5s 后自动退出,无需按镜像名清理(避免误杀并行测试的进程)。
     }
 
-    /// 四事故复现(session-1788182483639 [253]):AI 用 PowerShell Start-Process 后台
-    /// 启动服务 + sleep + netstat,timeout=30000(固定超时模式)。与智能模式不同:
-    /// monitor=None,固定超时分支 30s 后杀进程树。bash 本体 ~5s 退出后应经
-    /// PIPE_DRAIN_GRACE 2s 兜底返回(而非等 30s 固定超时)。验证 20s 内返回。
+    /// 回归:Start-Process 后台服务 + timeout=30000(固定超时模式)。
+    /// 文件方案下 bash 本体退出即返回,不依赖固定超时杀进程树。验证 15s 内返回。
     #[test]
     fn start_process_bg_returns_in_fixed_timeout_mode() {
         use std::time::Instant;
-
-        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let rt = tokio::runtime::Runtime::new().expect("tokio rt");
         let start = Instant::now();
         let result = rt.block_on(async {
             execute_bash(BashCommandInput {
-                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Windows\\System32\\cmd.exe' -ArgumentList '/c','timeout','300' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_fixed.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_fixed_err.log'\" && echo \"Start-Process done\"; sleep 5; netstat -ano | grep LISTENING | grep -E \"8765|5001\" | head -3".to_string(),
+                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Users\\38225\\AppData\\Local\\Programs\\Python\\Python311\\python.exe' -ArgumentList '-c','import time; time.sleep(5)' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_fixed.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_fixed_err.log'\" && echo \"Start-Process done\"; sleep 5; true".to_string(),
                 timeout: Some(30_000),
                 description: None,
                 run_in_background: Some(false),
@@ -1578,66 +1357,14 @@ mod tests {
         let output = result.expect("start-process bg should return in fixed timeout mode");
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_secs() < 20,
-            "fixed-timeout start-process bg must return within 20s, took {elapsed:?}"
+            elapsed.as_secs() < 15,
+            "fixed-timeout start-process bg must return when shell exits, took {elapsed:?}"
         );
         assert!(
             output.stdout.contains("Start-Process done"),
             "bash foreground should complete, stdout: {}",
             output.stdout
         );
-        // 清理后台进程
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "timeout.exe", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-
-    /// 五事故复现(session-1788182483639 [253]):与 start_process_bg_returns_in_fixed_timeout_mode
-    /// 相同,但后台用**真实 python 长驻进程**(`python -c "time.sleep(99999)"`,不退出,模拟
-    /// ws_server 服务),验证 bash 退出 + PIPE_DRAIN_GRACE 兜底在"真长驻"场景同样生效。
-    /// 区别:cmd /c timeout 300 是 cmd 进程;python -c sleep 是解释器进程,句柄继承行为更接近
-    /// 事故现场(python.exe 持有 bash 管道写端)。
-    #[test]
-    fn start_process_python_long_lived_returns_in_fixed_timeout_mode() {
-        use std::time::Instant;
-
-        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
-        let start = Instant::now();
-        let result = rt.block_on(async {
-            execute_bash(BashCommandInput {
-                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Users\\38225\\AppData\\Local\\Programs\\Python\\Python311\\python.exe' -ArgumentList '-c','import time; time.sleep(99999)' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_py_fixed.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_py_fixed_err.log'\" && echo \"Start-Process done\"; sleep 5; netstat -ano | grep LISTENING | grep -E \"8765|5001\" | head -3".to_string(),
-                timeout: Some(30_000),
-                description: None,
-                run_in_background: Some(false),
-                dangerously_disable_sandbox: Some(false),
-                namespace_restrictions: Some(false),
-                isolate_network: Some(false),
-                filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
-                allowed_mounts: None,
-            })
-        });
-        let output = result.expect("start-process python long-lived should return");
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed.as_secs() < 20,
-            "fixed-timeout start-process python must return within 20s, took {elapsed:?}"
-        );
-        assert!(
-            output.stdout.contains("Start-Process done"),
-            "bash foreground should complete, stdout: {}",
-            output.stdout
-        );
-        // 清理后台 python(sleep 99999)进程
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "python.exe", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
     }
 
     /// PRD P2-5：shell 语法错误特征识别（bash/sh/cmd 通用）。
@@ -1759,6 +1486,11 @@ mod tests {
     /// 被中断的场景，避免"命令跑完才有提示、真超时反而无提示"的盲区。
     #[test]
     fn timeout_below_one_second_emits_unit_hint_even_on_timeout() {
+        // 与其他修改 PATH / CLAW_GIT_BASH 的测试共享 env 锁,防止 shell 检测
+        // 读到污染环境(并行测试竞态,2026-09-01 复现:interrupted 偶发变 false)。
+        let _guard = super::BASH_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let output = execute_bash(BashCommandInput {
             command: String::from("sleep 2"),
             timeout: Some(300),
@@ -2438,10 +2170,10 @@ mod activity_monitor {
             );
             // 触发一段足够长的 CPU 消耗。注意 CPU_REFRESH_INTERVAL=500ms 为常量，
             // 需跨越 BUSY_LOOP_MIN_ADVANCES(6) 次采样周期 ≈ 6×500ms = 3s，
-            // 因此循环给足 4s（否则 last_refresh_at 限流导致 CPU 采样不前进）。
+            // 因此循环给足 8s（并行测试下 CPU 采样可能被调度延迟，4s 曾偶发不足）。
             let start = std::time::Instant::now();
             let mut done = false;
-            while start.elapsed() < Duration::from_secs(4) && !done {
+            while start.elapsed() < Duration::from_secs(8) && !done {
                 let mut sum: u64 = 0;
                 for i in 0u64..50_000_000 {
                     sum = sum.wrapping_add(std::hint::black_box(i));
