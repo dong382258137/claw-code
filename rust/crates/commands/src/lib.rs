@@ -422,7 +422,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "thinking",
         aliases: &[],
         summary: "Toggle DeepSeek thinking mode (off disables reasoning, saves cost)",
-        argument_hint: Some("[on|off]"),
+        argument_hint: Some("[on|off|status]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1627,7 +1627,8 @@ pub fn validate_slash_command_input(
         "effort" => SlashCommand::Effort { level: remainder },
         "thinking" => {
             let enabled = match remainder.as_deref().map(str::trim).unwrap_or("") {
-                "" => None,
+                // 无参或 status/show/?：显示当前状态（app.rs 中 enabled=None 即查询）。
+                "" | "status" | "show" | "?" => None,
                 "on" | "enabled" | "true" => Some(true),
                 "off" | "disabled" | "false" | "none" => Some(false),
                 other => {
@@ -4939,6 +4940,10 @@ mod tests {
             Ok(Some(SlashCommand::Thinking {
                 enabled: Some(false)
             }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/thinking status"),
+            Ok(Some(SlashCommand::Thinking { enabled: None }))
         );
         assert!(SlashCommand::parse("/thinking maybe").is_err());
         assert_eq!(

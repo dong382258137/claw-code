@@ -603,6 +603,26 @@ fn sub_options_for(name: &str) -> Vec<SubOptionSpec> {
                 arg_hint: None,
             },
         ],
+        "thinking" => vec![
+            SubOptionSpec {
+                value: "on",
+                label: "开启思考模式",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "off",
+                label: "关闭思考模式（非思考，节省输出 token）",
+                requires_arg: false,
+                arg_hint: None,
+            },
+            SubOptionSpec {
+                value: "status",
+                label: "查看当前思考模式状态",
+                requires_arg: false,
+                arg_hint: None,
+            },
+        ],
         "poor" => vec![
             SubOptionSpec {
                 value: "on",
@@ -987,6 +1007,29 @@ mod tests {
             filtered.iter().any(|s| s.name == "thinking"),
             "query 'thinking ' should surface the 'thinking' command"
         );
+    }
+
+    #[test]
+    fn thinking_command_has_sub_options() {
+        // 回归(2026-09-01):/thinking 缺少子菜单选项,选中后只能手敲参数。
+        // 应与 /effort、/poor 一致提供 on/off/status 二级菜单。
+        let subs = sub_options_for("thinking");
+        let values: Vec<&str> = subs.iter().map(|s| s.value).collect();
+        assert_eq!(values, vec!["on", "off", "status"]);
+        assert!(subs.iter().all(|s| !s.requires_arg));
+    }
+
+    #[test]
+    fn thinking_enter_sub_menu_succeeds() {
+        let mut menu = SlashMenu::new();
+        assert!(
+            menu.enter_sub_menu("thinking"),
+            "thinking should have sub options"
+        );
+        assert_eq!(menu.level(), MenuLevel::Sub);
+        assert_eq!(menu.parent_name(), Some("thinking"));
+        let visible = menu.sub_visible_window();
+        assert!(visible.iter().any(|s| s.value == "off"));
     }
 
     #[test]
