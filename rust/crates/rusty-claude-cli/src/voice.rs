@@ -465,9 +465,101 @@ fn display_text(text: &str) -> String {
         .join(" ")
 }
 
+/// 从 info.json 读取首个模型的目录名 `dir_name`。
+fn asr_model_dir_name(root: &Path) -> Result<String, String> {
+    let info_text = std::fs::read_to_string(root.join("info.json"))
+        .map_err(|e| format!("读取 info.json 失败: {e}"))?;
+    let info: serde_json::Value =
+        serde_json::from_str(&info_text).map_err(|e| format!("解析 info.json 失败: {e}"))?;
+    let model = info
+        .get("models")
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| "info.json 缺少 models 配置".to_string())?;
+    model
+        .get("dir_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "info.json models 缺少 dir_name".to_string())
+}
+
+/// 模型正式目录:`~/.openvino/models/<dir_name>`(下载完成后的目录)。
+fn asr_model_dir(root: &Path) -> Result<PathBuf, String> {
+    let dir_name = asr_model_dir_name(root)?;
+    let home = home_dir()?;
+    Ok(home.join(".openvino").join("models").join(dir_name))
+}
+
+/// 从 info.json 读取首个模型要求的文件列表(相对路径)。
+fn asr_required_files(root: &Path) -> Result<Vec<String>, String> {
+    let info_text = std::fs::read_to_string(root.join("info.json"))
+        .map_err(|e| format!("读取 info.json 失败: {e}"))?;
+    let info: serde_json::Value =
+        serde_json::from_str(&info_text).map_err(|e| format!("解析 info.json 失败: {e}"))?;
+    let model = info
+        .get("models")
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| "info.json 缺少 models 配置".to_string())?;
+    Ok(model
+        .get("required_files")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| f.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// 识别模型是否已下载完整(required_files 全在正式目录)。
+pub(crate) fn asr_model_ready(root: &Path) -> Result<bool, String> {
+    let model_dir = asr_model_dir(root)?;
+    let required = asr_required_files(root)?;
+    Ok(model_ready_in(&model_dir, &required))
+}
+
+fn model_ready_in(model_dir: &Path, required: &[String]) -> bool {
+    required.iter().all(|f| model_dir.join(f).is_file())
+}
+
+/// 已下载字节数(partial 目录递归求和),用于提示下载进度。
+fn asr_partial_mb(root: &Path) -> u64 {
+    let Ok(dir) = asr_model_dir_name(root) else {
+        return 0;
+    };
+    let Ok(home) = home_dir() else {
+        return 0;
+    };
+    let partial = home
+        .join(".openvino")
+        .join("models")
+        .join(format!("{dir}.partial"));
+    dir_size_mb(&partial)
+}
+
+/// 目录递归大小(MB),用于下载进度提示。
+fn dir_size_mb(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if current.is_file() {
+            total += current.metadata().map(|m| m.len()).unwrap_or(0);
+        } else if let Ok(entries) = std::fs::read_dir(&current) {
+            stack.extend(entries.flatten().map(|e| e.path()));
+        }
+    }
+    total / (1024 * 1024)
+}
+
 /// `/voice [seconds]` / `/listen [seconds]` 的执行入口。
 ///
-/// 流程:录音 → 本地识别 → 文本填入输入框(TUI)draft 槽;无槽时直接打印。
+/// 流程:校验识别模型就绪 → 录音 → 本地识别 → 文本填入输入框(TUI)draft 槽;
+/// 无槽时直接打印。模型未就绪(首次下载中)时给出明确提示,不阻塞、不白录音。
 pub(crate) fn run_voice_input(cli: &mut LiveCli, hint: Option<&str>) -> Result<(), String> {
     let seconds = parse_seconds(hint)?;
     let progress = |msg: &str| {
@@ -475,6 +567,20 @@ pub(crate) fn run_voice_input(cli: &mut LiveCli, hint: Option<&str>) -> Result<(
             println!("{msg}");
         }
     };
+
+    // 先确认技能、虚拟环境与模型就绪,避免"录完才发现不能用"。
+    let skill_root = find_asr_skill_root().ok_or_else(|| {
+        "找不到 local-asr 技能(请确认已安装 claw 附带技能,或用 CLAW_ASR_SKILL_DIR 指定)".to_string()
+    })?;
+    let venv_py = asr_venv_python(&skill_root)?;
+    ensure_venv(&skill_root, &venv_py)?;
+    if !asr_model_ready(&skill_root)? {
+        let downloaded_mb = asr_partial_mb(&skill_root);
+        return Err(format!(
+            "识别模型尚未下载完成(首次使用约需 2GB,当前已下载约 {downloaded_mb} MB,后台持续下载中)。\
+             下载完成后再次按 F4(或输入 /voice)即可直接使用。"
+        ));
+    }
 
     progress(&format!("🎤 开始录音 {seconds} 秒,请开始说话…"));
     let ffmpeg = find_ffmpeg().ok_or_else(|| {
@@ -487,12 +593,7 @@ pub(crate) fn run_voice_input(cli: &mut LiveCli, hint: Option<&str>) -> Result<(
 
     record_audio(&ffmpeg, &device, seconds, &wav)?;
 
-    progress("录音完成,本地识别中(首次使用需下载模型,请耐心等待)…");
-    let skill_root = find_asr_skill_root().ok_or_else(|| {
-        "找不到 local-asr 技能(请确认已安装 claw 附带技能,或用 CLAW_ASR_SKILL_DIR 指定)".to_string()
-    })?;
-    let venv_py = asr_venv_python(&skill_root)?;
-    ensure_venv(&skill_root, &venv_py)?;
+    progress("录音完成,本地识别中…");
     let text = transcribe(&skill_root, &wav, &venv_py)?;
     let _ = std::fs::remove_file(&wav);
 
@@ -619,5 +720,65 @@ Error opening input file dummy.
     fn display_text_collapses_newlines() {
         assert_eq!(display_text("hello\nworld\n"), "hello world");
         assert_eq!(display_text("  spaced  \n\nnext  "), "spaced next");
+    }
+
+    #[test]
+    fn model_ready_requires_all_required_files() {
+        let dir = temp_test_dir("voice-model-ready");
+        let model = dir.join("Model");
+        std::fs::create_dir_all(&model).expect("create model dir");
+        std::fs::write(model.join("a.bin"), b"x").expect("write a");
+        let required = vec!["a.bin".to_string(), "b.bin".to_string()];
+        // 缺 b.bin → 未就绪
+        assert!(!model_ready_in(&model, &required));
+        std::fs::write(model.join("b.bin"), b"y").expect("write b");
+        assert!(model_ready_in(&model, &required));
+        // required 为空 → 视为就绪
+        assert!(model_ready_in(&model, &[]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_size_mb_counts_recursively() {
+        let dir = temp_test_dir("voice-dir-size");
+        std::fs::create_dir_all(dir.join("sub")).expect("sub dir");
+        std::fs::write(dir.join("f1"), vec![0u8; 1024 * 1024 + 1]).expect("f1");
+        std::fs::write(dir.join("sub/f2"), vec![0u8; 1024 * 1024]).expect("f2");
+        // (1MB + 1B + 1MB) / 1MB = 2
+        assert_eq!(dir_size_mb(&dir), 2);
+        assert_eq!(dir_size_mb(&dir.join("missing")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn asr_info_parsing_reads_first_model() {
+        let dir = temp_test_dir("voice-info");
+        std::fs::write(
+            dir.join("info.json"),
+            r#"{
+  "venv_name": "asr-cu",
+  "models": [
+    {
+      "model_id": "snake7gun/Qwen3-ASR-0.6B-fp16-ov",
+      "dir_name": "Qwen3-ASR-0.6B-fp16-ov",
+      "required_files": ["config.json", "thinker/a.bin", "thinker/b.bin"]
+    }
+  ]
+}"#,
+        )
+        .expect("write info.json");
+        assert_eq!(asr_model_dir_name(&dir).unwrap(), "Qwen3-ASR-0.6B-fp16-ov");
+        let required = asr_required_files(&dir).unwrap();
+        assert_eq!(
+            required,
+            vec!["config.json", "thinker/a.bin", "thinker/b.bin"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("claw-voice-test-{label}-{}", unique_suffix()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
     }
 }
