@@ -105,6 +105,7 @@ pub(crate) enum CliAction {
         compact: bool,
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
+        thinking_mode: Option<bool>,
         allow_broad_cwd: bool,
         /// 额外允许的工作区根目录（由 `--add-dir` CLI flag 添加）。
         /// 空表示仅允许 cwd；非空时与 cwd 一起构成多根白名单。
@@ -170,6 +171,7 @@ pub(crate) enum CliAction {
         permission_mode: PermissionMode,
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
+        thinking_mode: Option<bool>,
         allow_broad_cwd: bool,
         additional_workspace_roots: Vec<PathBuf>,
         /// 启动时设定的输出冗度（由 `--verbose`/`--quiet`/`--silent` 设置）。
@@ -252,6 +254,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut compact = false;
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
+    // `--no-thinking` / `--thinking=on|off`：DeepSeek 思考模式开关。
+    // None=不发送字段走模型默认;Some(false)=关闭思考(非思考模式)。
+    let mut thinking_mode: Option<bool> = None;
     let mut allow_broad_cwd = false;
     let mut additional_workspace_roots: Vec<PathBuf> = Vec::new();
     // `--verbose`/`--quiet`/`--silent` 设定的输出冗度。默认 `Full`。
@@ -439,6 +444,24 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 reasoning_effort = Some(value.to_string());
                 index += 1;
             }
+            "--no-thinking" => {
+                // 关闭 DeepSeek 思考模式(非思考模式,节省输出 token)。
+                thinking_mode = Some(false);
+                index += 1;
+            }
+            flag if flag.starts_with("--thinking=") => {
+                let value = &flag["--thinking=".len()..];
+                thinking_mode = Some(match value {
+                    "on" | "enabled" | "true" => true,
+                    "off" | "disabled" | "false" | "none" => false,
+                    other => {
+                        return Err(format!(
+                            "invalid value for --thinking: '{other}'; must be on or off"
+                        ))
+                    }
+                });
+                index += 1;
+            }
             "--allow-broad-cwd" => {
                 allow_broad_cwd = true;
                 index += 1;
@@ -459,6 +482,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     compact,
                     base_commit: base_commit.clone(),
                     reasoning_effort: reasoning_effort.clone(),
+                    thinking_mode,
                     allow_broad_cwd,
                     additional_workspace_roots: additional_workspace_roots.clone(),
                     output_verbosity,
@@ -537,6 +561,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     compact: false,
                     base_commit,
                     reasoning_effort,
+                    thinking_mode,
                     allow_broad_cwd,
                     additional_workspace_roots: additional_workspace_roots.clone(),
                     output_verbosity,
@@ -549,6 +574,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
+            thinking_mode,
             allow_broad_cwd,
             additional_workspace_roots: additional_workspace_roots.clone(),
             output_verbosity,
@@ -679,6 +705,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     compact,
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
+                    thinking_mode,
                     allow_broad_cwd,
                     additional_workspace_roots: additional_workspace_roots.clone(),
                     output_verbosity,
@@ -730,6 +757,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 compact,
                 base_commit: base_commit.clone(),
                 reasoning_effort: reasoning_effort.clone(),
+                thinking_mode,
                 allow_broad_cwd,
                 additional_workspace_roots: additional_workspace_roots.clone(),
                 output_verbosity,
@@ -744,6 +772,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             compact,
             base_commit,
             reasoning_effort,
+            thinking_mode,
             allow_broad_cwd,
             additional_workspace_roots.clone(),
             output_verbosity,
@@ -784,6 +813,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 compact,
                 base_commit,
                 reasoning_effort: reasoning_effort.clone(),
+                thinking_mode,
                 allow_broad_cwd,
                 additional_workspace_roots: additional_workspace_roots.clone(),
                 output_verbosity,
@@ -1111,6 +1141,7 @@ pub(crate) fn parse_direct_slash_cli_action(
     compact: bool,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
+    thinking_mode: Option<bool>,
     allow_broad_cwd: bool,
     additional_workspace_roots: Vec<PathBuf>,
     output_verbosity: OutputVerbosity,
@@ -1142,6 +1173,7 @@ pub(crate) fn parse_direct_slash_cli_action(
                     compact,
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
+                    thinking_mode,
                     allow_broad_cwd,
                     additional_workspace_roots: additional_workspace_roots.clone(),
                     output_verbosity,

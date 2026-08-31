@@ -33,6 +33,14 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// DeepSeek thinking-mode toggle. `Some(true)` sends
+    /// `thinking: {"type": "enabled"}`, `Some(false)` sends
+    /// `thinking: {"type": "disabled"}` (non-thinking mode). `None` omits the
+    /// field entirely, letting the backend use its default (enabled for
+    /// DeepSeek V4). Only injected for DeepSeek-compatible models; other
+    /// OpenAI-compatible gateways ignore unknown fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_mode: Option<bool>,
     /// Provider-specific OpenAI-compatible request body parameters. These are
     /// copied into the final JSON payload after core fields are populated so
     /// users can opt into gateway features such as `web_search_options`,

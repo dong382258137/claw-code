@@ -90,6 +90,7 @@ impl RuntimeApiClient for BridgeApiClient {
             presence_penalty: None,
             stop: None,
             reasoning_effort: None,
+            thinking_mode: None,
             extra_body: Default::default(),
         };
 

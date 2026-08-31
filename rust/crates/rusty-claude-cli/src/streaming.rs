@@ -185,6 +185,9 @@ pub(crate) struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    /// DeepSeek thinking-mode toggle: Some(true)=显式开启思考,
+    /// Some(false)=关闭思考(非思考模式), None=不发送字段走模型默认。
+    thinking_mode: Option<bool>,
     /// Optional callback for emitting streaming events to a status observer
     /// (e.g., the TUI's persistent status bar). None in non-TUI mode.
     status_emitter: Option<StatusEmitter>,
@@ -231,6 +234,7 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            thinking_mode: None,
             status_emitter: None,
             cache_break_detector: api::CacheBreakDetector::new(session_id),
             subagent_cache_break_detector: api::CacheBreakDetector::new(format!(
@@ -241,6 +245,16 @@ impl AnthropicRuntimeClient {
 
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    /// 设置 DeepSeek 思考模式开关。Some(true)=开启,Some(false)=关闭,None=模型默认。
+    pub(crate) fn set_thinking_mode(&mut self, thinking: Option<bool>) {
+        self.thinking_mode = thinking;
+    }
+
+    /// 读取当前 thinking_mode 设置(供 TUI 侧栏显示)。
+    pub(crate) fn thinking_mode(&self) -> Option<bool> {
+        self.thinking_mode
     }
 
     /// 读取当前 reasoning_effort 设置（供 TUI 侧栏显示）。
@@ -425,6 +439,7 @@ impl ApiClient for AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: effective_effort,
+            thinking_mode: self.thinking_mode,
             ..Default::default()
         };
 
@@ -498,6 +513,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
                 stream: true,
                 reasoning_effort: effective_effort,
+                thinking_mode: self.thinking_mode,
                 ..Default::default()
             };
 

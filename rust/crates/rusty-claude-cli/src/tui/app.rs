@@ -3736,6 +3736,7 @@ fn sync_status_from_cli_inner(guard: &mut StatusBarState, cli: &LiveCli) {
     guard.provider =
         crate::provider_label(api::detect_provider_kind(cli.model_snapshot())).to_string();
     guard.reasoning_effort = cli.reasoning_effort();
+    guard.thinking_mode = cli.thinking_mode();
     guard.turn_count = cli.turns_snapshot();
     // Git 工作区状态（简单缓存：3 秒内不重复调用 git）
     {

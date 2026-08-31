@@ -915,6 +915,15 @@ pub fn is_reasoning_model(_model: &str) -> bool {
     false
 }
 
+/// Returns whether the model identifier refers to a DeepSeek model, so the
+/// DeepSeek-specific `thinking` toggle is only injected for DeepSeek endpoints.
+fn model_is_deepseek(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("deepseek")
+        || lower.starts_with("ds/")
+        || lower.starts_with("deepseek/")
+}
+
 /// Returns whether an OpenAI-compatible model requires prior assistant
 /// reasoning to be echoed back as `reasoning_content` in history.
 ///
@@ -1185,6 +1194,19 @@ fn build_chat_completion_request_for_base_url(
     if let Some(effort) = &request.reasoning_effort {
         payload["reasoning_effort"] = json!(effort);
     }
+    // DeepSeek thinking-mode toggle(官方 `thinking` 顶层参数,见
+    // api-docs.deepseek.com/guides/thinking_mode):
+    //   Some(true)  → {"thinking": {"type": "enabled"}}
+    //   Some(false) → {"thinking": {"type": "disabled"}} (非思考模式)
+    // 仅对 DeepSeek 模型注入——其它 OpenAI 兼容网关不认识该字段,
+    // 避免污染 Anthropic 格式 / 第三方网关的请求体。
+    if let Some(thinking) = request.thinking_mode {
+        if model_is_deepseek(&request.model) {
+            payload["thinking"] = json!({
+                "type": if thinking { "enabled" } else { "disabled" }
+            });
+        }
+    }
 
     for (key, value) in &request.extra_body {
         if is_protected_extra_body_key(key) {
@@ -1210,19 +1232,16 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
-            let mut has_reasoning = false;
             let mut tool_calls = Vec::new();
             let mut tool_call_ids = Vec::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
-                    InputContentBlock::Thinking {
-                        thinking: value, ..
-                    } => {
-                        if !value.is_empty() {
-                            has_reasoning = true;
-                        }
-                    }
+                    // 历史 thinking 不回传:deepseek-v4 普通轮次不强制回传
+                    // reasoning_content(2026-08-15 实测),剥离以节省 input token。
+                    // thinking 模式工具调用轮次(call_0N_*)由下方
+                    // has_thinking_mode_tool_call 单独判定并回传占位符。
+                    InputContentBlock::Thinking { .. } => {}
                     InputContentBlock::ToolUse { id, name, input } => {
                         tool_call_ids.push(id.clone());
                         tool_calls.push(json!({
@@ -2218,6 +2237,66 @@ mod tests {
     }
 
     #[test]
+    fn thinking_disabled_injects_non_thinking_toggle() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-pro".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hi")],
+                thinking_mode: Some(false),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::deepseek(),
+        );
+        assert_eq!(payload["thinking"], json!({"type": "disabled"}));
+    }
+
+    #[test]
+    fn thinking_enabled_injects_enabled_toggle() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek/deepseek-v4-flash".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hi")],
+                thinking_mode: Some(true),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::deepseek(),
+        );
+        assert_eq!(payload["thinking"], json!({"type": "enabled"}));
+    }
+
+    #[test]
+    fn thinking_omitted_when_not_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-flash".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::deepseek(),
+        );
+        assert!(payload.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_not_injected_for_non_deepseek_models() {
+        // 非 DeepSeek 模型不注入 thinking 参数,避免污染其它 OpenAI 兼容网关。
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                thinking_mode: Some(false),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::deepseek(),
+        );
+        assert!(payload.get("thinking").is_none());
+    }
+
+    #[test]
     fn openai_streaming_requests_include_usage_opt_in() {
         let payload = build_chat_completion_request(
             &MessageRequest {
@@ -2337,6 +2416,7 @@ mod tests {
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
+            thinking_mode: None,
             extra_body: BTreeMap::new(),
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());

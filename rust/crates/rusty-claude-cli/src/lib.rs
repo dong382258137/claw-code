@@ -455,6 +455,7 @@ pub fn run_tui_repl_entry(
     permission_mode: PermissionMode,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
+    thinking_mode: Option<bool>,
     allow_broad_cwd: bool,
     additional_workspace_roots: Vec<PathBuf>,
     output_verbosity: OutputVerbosity,
@@ -502,6 +503,7 @@ pub fn run_tui_repl_entry(
         additional_workspace_roots,
         output_verbosity,
         reasoning_effort,
+        thinking_mode,
     )?;
     diag_log("build_live_cli_for_repl OK, entering TUI");
     tui::app::run_tui_repl(cli)
@@ -636,6 +638,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             compact,
             base_commit,
             reasoning_effort,
+            thinking_mode,
             allow_broad_cwd,
             additional_workspace_roots,
             output_verbosity,
@@ -662,6 +665,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 output_verbosity,
             )?;
             cli.set_reasoning_effort(reasoning_effort);
+            cli.set_thinking_mode(thinking_mode);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Doctor {
@@ -719,6 +723,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             base_commit,
             reasoning_effort,
+            thinking_mode,
             allow_broad_cwd,
             additional_workspace_roots,
             output_verbosity,
@@ -735,6 +740,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         permission_mode,
                         base_commit,
                         reasoning_effort,
+                        thinking_mode,
                         allow_broad_cwd,
                         additional_workspace_roots,
                         output_verbosity,
@@ -755,6 +761,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 permission_mode,
                 base_commit,
                 reasoning_effort,
+                thinking_mode,
                 allow_broad_cwd,
                 additional_workspace_roots,
                 output_verbosity,

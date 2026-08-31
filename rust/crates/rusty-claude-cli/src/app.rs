@@ -386,6 +386,7 @@ pub(crate) fn build_live_cli_for_repl(
     additional_workspace_roots: Vec<PathBuf>,
     output_verbosity: OutputVerbosity,
     reasoning_effort: Option<String>,
+    thinking_mode: Option<bool>,
 ) -> Result<LiveCli, Box<dyn std::error::Error>> {
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(
@@ -397,6 +398,7 @@ pub(crate) fn build_live_cli_for_repl(
         output_verbosity,
     )?;
     cli.set_reasoning_effort(reasoning_effort);
+    cli.set_thinking_mode(thinking_mode);
     // 会话互通(Session Bus,设计文档 2026-08-11-session-bus-design.md §2.2):
     // 主会话注册为 Main peer(REPL 与 TUI 共用此构造路径);子代理在
     // conversation.rs 派发时自动注册 Subagent peer。
@@ -464,6 +466,7 @@ pub(crate) fn run_repl(
     permission_mode: PermissionMode,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
+    thinking_mode: Option<bool>,
     allow_broad_cwd: bool,
     additional_workspace_roots: Vec<PathBuf>,
     output_verbosity: OutputVerbosity,
@@ -488,6 +491,7 @@ pub(crate) fn run_repl(
         additional_workspace_roots,
         output_verbosity,
         reasoning_effort,
+        thinking_mode,
     )?;
     // Harness O(编排)层:Plan/Execute/Review 三段循环接入(Step 2.1)。
     // `--enable-plan-mode` 时启用,默认关闭。详见
@@ -876,6 +880,22 @@ impl LiveCli {
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
+        }
+    }
+
+    /// 设置 DeepSeek 思考模式开关(Some(true)=开启,Some(false)=关闭,None=模型默认)。
+    pub(crate) fn set_thinking_mode(&mut self, thinking: Option<bool>) {
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().set_thinking_mode(thinking);
+        }
+    }
+
+    /// 读取当前 thinking_mode 设置(供 TUI 侧栏显示)。
+    pub(crate) fn thinking_mode(&self) -> Option<bool> {
+        if let Some(rt) = self.runtime.runtime.as_ref() {
+            rt.api_client().thinking_mode()
+        } else {
+            None
         }
     }
 
@@ -1589,6 +1609,37 @@ impl LiveCli {
                         format!(
                             "无效的思考强度: '{other}'\n有效值: low | medium | high | off\n用法: /effort low|medium|high|off"
                         )
+                    }
+                };
+                if !self.tui_println(&msg) {
+                    println!("{msg}");
+                }
+                false
+            }
+            // /thinking [on|off] — DeepSeek 思考模式开关。
+            // on  → 发送 thinking: {"type":"enabled"}
+            // off → 发送 thinking: {"type":"disabled"} (非思考模式,省输出 token)
+            // 无参 → 显示当前状态。
+            SlashCommand::Thinking { enabled } => {
+                let msg = match enabled {
+                    None => {
+                        let current = self.thinking_mode().map(|v| {
+                            if v { "开启" } else { "关闭" }
+                        });
+                        match current {
+                            Some(state) => format!("当前思考模式: {state}\n用法: /thinking on|off"),
+                            None => format!(
+                                "当前思考模式: 默认（跟随模型，DeepSeek 默认开启）\n用法: /thinking on|off"
+                            ),
+                        }
+                    }
+                    Some(true) => {
+                        self.set_thinking_mode(Some(true));
+                        "思考模式已开启 (thinking: enabled)".to_string()
+                    }
+                    Some(false) => {
+                        self.set_thinking_mode(Some(false));
+                        "思考模式已关闭 (thinking: disabled)，后续请求将节省输出 token".to_string()
                     }
                 };
                 if !self.tui_println(&msg) {

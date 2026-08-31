@@ -419,6 +419,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "thinking",
+        aliases: &[],
+        summary: "Toggle DeepSeek thinking mode (off disables reasoning, saves cost)",
+        argument_hint: Some("[on|off]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "fast",
         aliases: &[],
         summary: "Toggle fast/concise response mode",
@@ -1242,6 +1249,10 @@ pub enum SlashCommand {
     Effort {
         level: Option<String>,
     },
+    /// DeepSeek 思考模式开关：`/thinking [on|off]`。无参显示当前状态。
+    Thinking {
+        enabled: Option<bool>,
+    },
     Branch {
         name: Option<String>,
     },
@@ -1374,6 +1385,7 @@ impl SlashCommand {
             Self::Context { .. } => "/context",
             Self::Color { .. } => "/color",
             Self::Effort { .. } => "/effort",
+            Self::Thinking { .. } => "/thinking",
             Self::Branch { .. } => "/branch",
             Self::Rewind { .. } => "/rewind",
             Self::Ide { .. } => "/ide",
@@ -1613,6 +1625,23 @@ pub fn validate_slash_command_input(
         "context" => SlashCommand::Context { action: remainder },
         "color" => SlashCommand::Color { scheme: remainder },
         "effort" => SlashCommand::Effort { level: remainder },
+        "thinking" => {
+            let enabled = match remainder.as_deref().map(str::trim).unwrap_or("") {
+                "" => None,
+                "on" | "enabled" | "true" => Some(true),
+                "off" | "disabled" | "false" | "none" => Some(false),
+                other => {
+                    return Err(command_error(
+                        &format!(
+                            "invalid value for /thinking: '{other}'; use on or off"
+                        ),
+                        "thinking",
+                        "[on|off]",
+                    ))
+                }
+            };
+            SlashCommand::Thinking { enabled }
+        }
         "branch" => SlashCommand::Branch { name: remainder },
         "rewind" => SlashCommand::Rewind { steps: remainder },
         "ide" => SlashCommand::Ide { target: remainder },
@@ -4726,6 +4755,7 @@ pub fn handle_slash_command(
         | SlashCommand::Context { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
+        | SlashCommand::Thinking { .. }
         | SlashCommand::Branch { .. }
         | SlashCommand::Rewind { .. }
         | SlashCommand::Ide { .. }
@@ -4894,6 +4924,23 @@ mod tests {
             }))
         );
         assert!(SlashCommand::parse("/listen 1 2").is_err());
+        assert_eq!(
+            SlashCommand::parse("/thinking"),
+            Ok(Some(SlashCommand::Thinking { enabled: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/thinking on"),
+            Ok(Some(SlashCommand::Thinking {
+                enabled: Some(true)
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/thinking off"),
+            Ok(Some(SlashCommand::Thinking {
+                enabled: Some(false)
+            }))
+        );
+        assert!(SlashCommand::parse("/thinking maybe").is_err());
         assert_eq!(
             SlashCommand::parse("/sandbox"),
             Ok(Some(SlashCommand::Sandbox))
@@ -5425,7 +5472,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 148);
+        assert_eq!(slash_command_specs().len(), 149);
         assert!(resume_supported_slash_commands().len() >= 42);
     }
 

@@ -838,6 +838,7 @@ pub(crate) fn run_resume_command(
         | SlashCommand::Hooks { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
+        | SlashCommand::Thinking { .. }
         | SlashCommand::Branch { .. }
         | SlashCommand::Rewind { .. }
         | SlashCommand::Ide { .. }

@@ -374,6 +374,7 @@ fn defaults_to_repl_when_no_args() {
             permission_mode: PermissionMode::DangerFullAccess,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -472,6 +473,7 @@ fn parses_prompt_subcommand() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -565,6 +567,7 @@ fn parses_bare_prompt_and_json_output_flag() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -688,6 +691,7 @@ fn parses_compact_flag_for_prompt_mode() {
             compact: true,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -733,6 +737,7 @@ fn resolves_model_aliases_in_args() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -818,6 +823,7 @@ fn parses_permission_mode_flag() {
             permission_mode: PermissionMode::ReadOnly,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -844,6 +850,7 @@ fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
             permission_mode: PermissionMode::DangerFullAccess,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -879,6 +886,7 @@ fn dangerously_skip_permissions_flag_applies_to_prompt_subcommand() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -908,6 +916,7 @@ fn parses_allowed_tools_flags_with_aliases_and_lists() {
             permission_mode: PermissionMode::DangerFullAccess,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -1075,6 +1084,7 @@ fn removed_login_and_logout_subcommands_error_helpfully() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -2344,6 +2354,7 @@ fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -2416,6 +2427,7 @@ fn parses_direct_agents_mcp_and_skills_slash_commands() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -2445,6 +2457,7 @@ fn parses_direct_agents_mcp_and_skills_slash_commands() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -2548,6 +2561,7 @@ fn multi_word_prompt_still_bypasses_subcommand_typo_guard() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -2569,6 +2583,7 @@ fn prompt_subcommand_allows_literal_typo_word() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -2600,6 +2615,7 @@ fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
             compact: false,
             base_commit: None,
             reasoning_effort: None,
+            thinking_mode: None,
             allow_broad_cwd: false,
             additional_workspace_roots: Vec::new(),
             output_verbosity: OutputVerbosity::default(),
@@ -5089,6 +5105,55 @@ fn rejects_invalid_reasoning_effort_value() {
         "unexpected error: {err}"
     );
     assert!(err.contains("turbo"), "unexpected error: {err}");
+}
+
+#[test]
+fn no_thinking_flag_disables_thinking_mode() {
+    let result = parse_args(&[
+        "--no-thinking".to_string(),
+        "prompt".to_string(),
+        "hello".to_string(),
+    ]);
+    assert!(
+        result.is_ok(),
+        "--no-thinking should be accepted, got: {result:?}"
+    );
+    if let Ok(CliAction::Prompt { thinking_mode, .. }) = result {
+        assert_eq!(thinking_mode, Some(false));
+    }
+}
+
+#[test]
+fn thinking_equals_flag_accepts_on_and_off() {
+    for (flag, expected) in [("--thinking=off", Some(false)), ("--thinking=on", Some(true))] {
+        let result = parse_args(&[
+            flag.to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ]);
+        assert!(
+            result.is_ok(),
+            "{flag} should be accepted, got: {result:?}"
+        );
+        if let Ok(CliAction::Prompt { thinking_mode, .. }) = result {
+            assert_eq!(thinking_mode, expected, "{flag} maps to {expected:?}");
+        }
+    }
+}
+
+#[test]
+fn rejects_invalid_thinking_value() {
+    let err = parse_args(&[
+        "--thinking=maybe".to_string(),
+        "prompt".to_string(),
+        "hello".to_string(),
+    ])
+    .unwrap_err();
+    assert!(
+        err.contains("invalid value for --thinking"),
+        "unexpected error: {err}"
+    );
+    assert!(err.contains("maybe"), "unexpected error: {err}");
 }
 
 #[test]

@@ -46,6 +46,8 @@ pub(crate) struct StatusBarState {
     pub poor_mode: bool,
     /// 当前 reasoning effort 设置（None=默认，Some("low"/"medium"/"high")=已设置）。
     pub reasoning_effort: Option<String>,
+    /// DeepSeek 思考模式开关：Some(true)=开启,Some(false)=关闭(非思考),None=模型默认。
+    pub thinking_mode: Option<bool>,
     /// 累计 AI 思考轮次（每个 turn +1）。
     pub turn_count: u32,
     /// 标记当前 turn 是否已开始（用于多轮工具调用中避免重复 reset）。
@@ -205,6 +207,29 @@ impl<'a> Widget for StatusBar<'a> {
             sections.push(vec![
                 Span::styled(" │ ", style_dim),
                 Span::styled(icon, effort_style),
+            ]);
+        }
+
+        // P1.1b: Thinking-mode indicator（仅非默认时显示：关闭=非思考模式）
+        if let Some(thinking) = self.state.thinking_mode {
+            let (icon, thinking_style) = if thinking {
+                (
+                    "🤔T",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (
+                    "🚫T",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled(icon, thinking_style),
             ]);
         }
 
