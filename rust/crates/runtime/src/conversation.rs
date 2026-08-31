@@ -106,6 +106,22 @@ const SURVEY_TOOLS: [&str; 3] = ["read_file", "grep_search", "glob_search"];
 /// 任务跟踪文档"近期更新"判定窗口(秒):tracker 在此窗口内被更新过则视为
 /// 活跃,不重复提醒;超过窗口且再次达到阈值倍数才重新督促。
 const TRACKER_UPDATE_WINDOW_SECS: i64 = 120;
+/// 侦察预算(默认 0 = **禁用**;env `CLAW_SURVEY_BUDGET` 可临时启用):
+/// 单次 turn 内侦察类工具(read/grep/glob)累计达到此值即视为"侦察耗尽"。
+/// 2026-09-01 过度约束评估:该机制与侦察护栏/软阈值叠加形成提醒轰炸,且
+/// "累计次数"代理指标会误伤"合法但多"的深度调查 —— 收敛拖延的本质是
+/// "无新增证据的重复调查"而非"调查量超标"。故默认停用,改由模型在执行
+/// 任务前自主规划(create_plan)替代框架硬约束。保留实现与 env 开关供
+/// 试点:设为 0 或缺失 = 禁用;10..=200 之间 = 启用该值。
+const SURVEY_BUDGET: usize = 0;
+/// 预算耗尽且强收口消息已注入后,连续多少轮仍只做只读侦察(无任何动作
+/// 工具调用)即判定为"只读停滞",中止 turn 要求用户介入,防死循环。
+/// 预算默认禁用时该限制不生效。
+const SURVEY_STALL_LIMIT: usize = 3;
+/// 动态倒数触发比例:侦察消耗达到预算的此比例时注入一次"剩余 20%"倒数
+/// 提醒(方案4 动态倒数)。仅触发一次,避免刷屏。预算默认禁用时该提醒
+/// 不生效(方案4 随预算一并停用)。
+const SURVEY_COUNTDOWN_RATIO: f64 = 0.8;
 
 /// 读取侦察护栏阈值(env 可覆盖,越界/非法回退默认)。
 fn survey_guard_threshold() -> usize {
@@ -114,6 +130,16 @@ fn survey_guard_threshold() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| (4..=100).contains(&n))
         .unwrap_or(SURVEY_GUARD_THRESHOLD)
+}
+
+/// 读取侦察预算(env 可覆盖):`0` 或缺失 = 禁用;`10..=200` = 启用。
+/// 越界/非法回退默认(当前默认 0 = 禁用)。
+fn survey_budget() -> usize {
+    std::env::var("CLAW_SURVEY_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n == 0 || (10..=200).contains(&n))
+        .unwrap_or(SURVEY_BUDGET)
 }
 
 /// P1:并行子任务最大并发数上限。
@@ -3052,6 +3078,19 @@ where
         // 阶段 2b:分支重试成功标记。loop abort 检测点若分支重试成功则置 true,
         // for 工具循环退出后据此跳出主循环,让 turn 以成功结果正常收尾。
         let mut branch_retry_success = false;
+        // 侦察预算状态机(turn 级,跨迭代):
+        // - survey_budget_baseline:本 turn 开始时的全会话侦察计数。预算只统计
+        //   "本 turn 内新增"的侦察(计数 - baseline),因此用户输入新任务(新 turn)
+        //   自动重置预算 —— 上一任务用满预算不会牵连新任务。
+        // - survey_countdown_injected:动态倒数(剩 20%)已注入,仅一次
+        // - survey_hard_stop_injected:预算耗尽强收口消息已注入,仅一次
+        // - survey_stall_rounds:强收口后连续只读停滞轮数,达 SURVEY_STALL_LIMIT 中止
+        // - safety_net_notice_injected:回滚安全网提示已注入,仅一次
+        let survey_budget_baseline = self.count_survey_tool_calls();
+        let mut survey_countdown_injected = false;
+        let mut survey_hard_stop_injected = false;
+        let mut survey_stall_rounds: usize = 0;
+        let mut safety_net_notice_injected = false;
 
         // 复杂任务调高迭代上限(软硬双层)。
         // 判定完全交给模型:存在活跃 plan(模型调用 create_plan 创建)即视为
@@ -3095,6 +3134,8 @@ where
             // 并 create_plan 建立分阶段计划。每达阈值倍数注入一次(防重复)。
             // 该文档与会话绑定、落盘持久,上下文压缩后不丢失 —— 把"边调查
             // 边记录"从模型自觉变为框架强制,避免成果只存在于易失上下文中。
+            // 方案1(证据持久化)增强:提醒携带 tracker 未闭环待办数 —— "写了
+            // 文档"不等于"推进了任务",未打勾的 `- [ ]` 是自欺式更新的照妖镜。
             {
                 let threshold = survey_guard_threshold();
                 let survey_count = self.count_survey_tool_calls();
@@ -3115,21 +3156,113 @@ where
                         .unwrap_or_else(|| {
                             "<workspace>/.claw/trackers/<session_id>.md".to_string()
                         });
+                    let open_items = self.tracker_open_item_count();
                     let hint = format!(
                         "[runtime] 你已进行 {survey_count} 次代码侦察,但单会话任务跟踪 \
                          文档尚未创建或近期未更新。请立即:\n\
                          1. 用 write_file 创建/更新 `{tracker_path}`,记录:\n\
                             - 任务目标\n\
                             - 已确认的调查发现(每项含文件路径与结论)\n\
-                            - 计划步骤与当前进度\n\
+                            - 计划步骤与当前进度(每个 `- [ ]` 待办闭环时打勾并锚定证据:文件路径:行号 或 工具结果引用)\n\
                          2. 调用 `create_plan` 建立分阶段执行计划,然后按计划执行。\n\
                          跟踪文档与会话绑定、落盘持久,上下文压缩后不丢失;持续更新 \
-                         可防止重复调查同一区域。"
+                         可防止重复调查同一区域。\n\
+                         当前 tracker 未闭环待办: {open_items} 项 —— 未打勾的待办 \
+                         不计入收敛,请优先闭环或明确放弃。"
                     );
                     let _ = self
                         .session
                         .push_message(ConversationMessage::user_text(hint));
                 }
+            }
+
+            // 侦察预算(方案2 强制收口 + 方案4 动态倒数,2026-08-31):
+            // 第一性原理 —— 侦察是稀缺资源而非无限供给。预算耗尽后模型
+            // 只能二选一:提交证据式结论(tracker 全闭环 + 最终答案)或询问
+            // 用户;若强收口后仍连续 SURVEY_STALL_LIMIT 轮只做只读侦察,
+            // 中止 turn 要求用户介入,防"收敛后拖延"死循环。
+            // 计数口径:仅统计本 turn 内新增侦察(全会话计数 - turn 起始
+            // baseline),用户输入新任务(新 turn)自动重置;复杂任务
+            // (active_plan)预算翻倍,避免大型重构被预算误杀。
+            {
+                let mut budget = survey_budget();
+                if is_complex_turn {
+                    budget = budget.saturating_mul(2);
+                }
+                let survey_count = self
+                    .count_survey_tool_calls()
+                    .saturating_sub(survey_budget_baseline);
+                if budget > 0 && survey_count >= budget {
+                    if !survey_hard_stop_injected {
+                        survey_hard_stop_injected = true;
+                        let tracker_path = self
+                            .workspace_root
+                            .as_ref()
+                            .map(|root| {
+                                root.join(".claw")
+                                    .join("trackers")
+                                    .join(format!("{}.md", self.session.session_id))
+                                    .display()
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| {
+                                "<workspace>/.claw/trackers/<session_id>.md".to_string()
+                            });
+                        let open_items = self.tracker_open_item_count();
+                        let hint = format!(
+                            "[runtime] 侦察预算已耗尽(累计 {survey_count} 次只读侦察 ≥ 预算 {budget})。\
+                             请立即二选一收口,禁止继续无限只读侦察:\n\
+                             1. 提交证据式结论:把 `{tracker_path}` 的每个 `- [ ]` 待办项闭环 \
+                             (打勾并锚定证据:文件路径:行号 或 工具结果引用),然后输出最终答案;\n\
+                             2. 询问用户下一步方向。\n\
+                             当前 tracker 仍有 {open_items} 个未闭环待办项。\
+                             若后续仍持续只读侦察,本 turn 将被强制中止。"
+                        );
+                        let _ = self
+                            .session
+                            .push_message(ConversationMessage::user_text(hint));
+                    } else if self.last_assistant_rounds_only_survey(SURVEY_STALL_LIMIT) {
+                        survey_stall_rounds += 1;
+                        if survey_stall_rounds >= SURVEY_STALL_LIMIT {
+                            let error = RuntimeError::new(format!(
+                                "survey budget exhausted ({budget}) and the last {SURVEY_STALL_LIMIT} \
+                                 rounds only made read-only survey calls with no action. Turn aborted \
+                                 to force convergence; commit evidence-based conclusions to the tracker \
+                                 or ask the user for direction before retrying."
+                            ));
+                            self.record_turn_failed(iterations, &error);
+                            return Err(error);
+                        }
+                    }
+                } else if !survey_countdown_injected
+                    && budget > 0
+                    && survey_count >= (budget as f64 * SURVEY_COUNTDOWN_RATIO) as usize
+                {
+                    survey_countdown_injected = true;
+                    let remaining = budget.saturating_sub(survey_count);
+                    let open_items = self.tracker_open_item_count();
+                    let hint = format!(
+                        "[runtime] 侦察预算接近耗尽(已用 {survey_count}/{budget},剩 {remaining} 次)。\
+                         请优先用已确认证据收敛结论:把 `- [ ]` 待办闭环进 tracker(锚定证据),\
+                         或改变策略/询问用户方向。当前 tracker 未闭环 {open_items} 项。"
+                    );
+                    let _ = self
+                        .session
+                        .push_message(ConversationMessage::user_text(hint));
+                }
+            }
+
+            // 动手安全网提示(方案3,2026-08-31):工具执行处已自动建立 turn 级
+            // 回滚快照(见 edit_file/write_file 执行路径)。此处注入提示告知
+            // 模型"改错有安全网"—— 消除"再确认一次"的理性优势,让动手变便宜。
+            if self.refactor_tx.is_some() && !safety_net_notice_injected {
+                safety_net_notice_injected = true;
+                let hint = "[runtime] 已自动建立回滚安全网(本次修改可随时调用 \
+                    `rollback_transaction` 回滚)。改错可低成本恢复,无需反复只读确认; \
+                    建议先 `git commit` 基线后直接实施改动。";
+                let _ = self
+                    .session
+                    .push_message(ConversationMessage::user_text(hint));
             }
 
             // 硬上限:真正中止。
@@ -3999,6 +4132,25 @@ where
                             match lock_failure {
                                 Some(e) => (e, true),
                                 None => {
+                                    // 动手安全网(方案3,2026-08-31):首次 edit_file/write_file
+                                    // 执行前自动建立 turn 级回滚快照(vcs_snapshot:git stash
+                                    // create 不入栈,或 detached 时文件复制)。快照本身不注入
+                                    // 消息(避免打断 tool_use→tool_result 序列),提示在下一轮
+                                    // 循环头部经 safety_net_notice_injected 注入。
+                                    if matches!(tool_name.as_str(), "write_file" | "edit_file")
+                                        && self.refactor_tx.is_none()
+                                    {
+                                        if let Some(root) = self.workspace_root.clone() {
+                                            let mut tx =
+                                                crate::vcs_snapshot::RefactorTransaction::new(root);
+                                            let turn_id = format!(
+                                                "{}-iter{iterations}",
+                                                self.session.session_id
+                                            );
+                                            let _ = tx.pre_turn_snapshot(&turn_id);
+                                            self.refactor_tx = Some(tx);
+                                        }
+                                    }
                                     match self.tool_executor.execute(&tool_name, &effective_input) {
                                         Ok(output) => (output, false),
                                         Err(error) => (error.to_string(), true),
@@ -5497,6 +5649,51 @@ where
                     if SURVEY_TOOLS.contains(&name.as_str()))
             })
             .count()
+    }
+
+    /// tracker 中未打勾的待办项数量(`- [ ]` 行数,含全角空格变体)。
+    /// 文件不存在/读取失败返回 0(视为无待办,不误报)。
+    /// 方案1(证据持久化):让"写了文档"与"推进了任务"可区分 —— 仅 mtime
+    /// 新而待办未闭环,不算收敛,护栏仍会提醒"还有 N 项未闭环"。
+    fn tracker_open_item_count(&self) -> usize {
+        let Some(root) = &self.workspace_root else {
+            return 0;
+        };
+        let path = root
+            .join(".claw")
+            .join("trackers")
+            .join(format!("{}.md", self.session.session_id));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return 0;
+        };
+        content
+            .lines()
+            .filter(|l| l.contains("- [ ]") || l.contains("- [　]"))
+            .count()
+    }
+
+    /// 最近 `n` 个 assistant 消息是否**全部只含侦察类工具调用**(无任何动作
+    /// 工具 write/edit/bash/create_plan/ask 等)。纯文本块不视为动作,也不
+    /// 视为侦察 —— 若某轮没有任何 ToolUse,该轮算"通过"(不构成停滞)。
+    /// 供预算耗尽后的只读停滞判定(方案2 强制收口)。
+    fn last_assistant_rounds_only_survey(&self, n: usize) -> bool {
+        let assistant_msgs: Vec<&ConversationMessage> = self
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .rev()
+            .take(n)
+            .collect();
+        if assistant_msgs.len() < n {
+            return false;
+        }
+        assistant_msgs.iter().all(|m| {
+            m.blocks.iter().all(|b| match b {
+                ContentBlock::ToolUse { name, .. } => SURVEY_TOOLS.contains(&name.as_str()),
+                _ => true,
+            })
+        })
     }
 
     /// 单会话任务跟踪文档(`.claw/trackers/<session_id>.md`)是否近期更新过
@@ -10091,6 +10288,305 @@ mod tests {
         assert!(
             all_texts.iter().any(|t| t.contains("create_plan")),
             "reminder must ask for create_plan, got: {all_texts:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 侦察预算强制收口(方案2,2026-08-31):本 turn 内侦察累计达
+    /// CLAW_SURVEY_BUDGET 时注入"二选一"强收口消息(证据式结论 / 询问用户),
+    /// 禁止无限只读侦察。预算按 turn 内新增计数,与历史(含上一任务)无关。
+    #[test]
+    fn survey_budget_injects_hard_stop_at_exhaustion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        // 环境变量污染防护:与其它触碰 CLAW_SURVEY_* 的测试串行执行。
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct SurveyApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+            calls: AtomicUsize,
+        }
+        impl ApiClient for SurveyApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                // 前 10 轮每轮调一次 read_file(turn 内累计 10 次=预算),之后收尾。
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n < 10 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: format!("survey-tool-{n}"),
+                            name: "read_file".to_string(),
+                            input: format!("file{n}.py"),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("ok".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-survey-budget-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 预算缩到 10;同时预置历史侦察,验证"turn 内新增"口径 —— 历史不参与计数。
+        std::env::set_var("CLAW_SURVEY_BUDGET", "10");
+        let mut session = Session::new();
+        for i in 0..10usize {
+            session
+                .push_message(ConversationMessage::assistant(vec![
+                    ContentBlock::ToolUse {
+                        id: format!("old-tool-{i}"),
+                        name: "read_file".to_string(),
+                        input: format!("oldfile{i}.py"),
+                    },
+                ]))
+                .expect("push tool_use");
+            session
+                .push_message(ConversationMessage::tool_result(
+                    format!("old-tool-{i}"),
+                    "read_file",
+                    format!("内容 {i}"),
+                    false,
+                ))
+                .expect("push result");
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SurveyApi {
+                captured: captured.clone(),
+                calls: AtomicUsize::new(0),
+            },
+            StaticToolExecutor::new().register("read_file", |input| {
+                // 输出随输入变化,避免命中既有 doom-loop 检测(相同工具+相同输出)。
+                Ok(format!("content of {input}"))
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime.run_turn("继续", None).expect("turn should succeed");
+        std::env::remove_var("CLAW_SURVEY_BUDGET");
+
+        let shots = captured.lock().expect("lock");
+        let all_texts: Vec<String> = shots.iter().flat_map(|v| v.iter().cloned()).collect();
+        assert!(
+            all_texts
+                .iter()
+                .any(|t| t.contains("侦察预算已耗尽") && t.contains("二选一")),
+            "budget exhaustion must inject hard-stop message, got: {all_texts:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 动手安全网(方案3,2026-08-31):首次 edit_file 自动建立 turn 级回滚
+    /// 快照,并在下一轮注入"可回滚"提示 —— 改错有安全网,消除"再确认一次"
+    /// 的理性优势。
+    #[test]
+    fn first_edit_establishes_safety_net_and_injects_notice() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct EditApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+            calls: AtomicUsize,
+        }
+        impl ApiClient for EditApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // 第一轮:调用 edit_file(触发安全网建立)。
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "edit-1".to_string(),
+                            name: "edit_file".to_string(),
+                            input: r#"{"file_path":"a.py","old_string":"x","new_string":"y"}"#
+                                .to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-safety-net-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EditApi {
+                captured: captured.clone(),
+                calls: AtomicUsize::new(0),
+            },
+            StaticToolExecutor::new()
+                .register("edit_file", |_input| Ok("{\"ok\":true}".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime
+            .run_turn("改一下", None)
+            .expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let all_texts: Vec<String> = shots.iter().flat_map(|v| v.iter().cloned()).collect();
+        assert!(
+            all_texts
+                .iter()
+                .any(|t| t.contains("回滚安全网") && t.contains("rollback_transaction")),
+            "safety net notice must be injected after first edit, got: {all_texts:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 只读停滞中止(方案2,2026-08-31):预算耗尽且强收口已注入后,模型若
+    /// 仍连续只做只读侦察(SURVEY_STALL_LIMIT 轮无动作工具),turn 被强制
+    /// 中止返回 Err —— 防"收敛后拖延"死循环。
+    #[test]
+    fn read_only_stall_after_budget_exhaustion_aborts_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        // 环境变量污染防护:与其它触碰 CLAW_SURVEY_* 的测试串行执行。
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("env lock");
+
+        struct StallApi {
+            counter: AtomicUsize,
+        }
+        impl ApiClient for StallApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                // 每轮都只调 read_file(纯只读),模拟"强收口后仍拖延"。
+                let n = self.counter.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: format!("stall-tool-{n}"),
+                        name: "read_file".to_string(),
+                        // input 逐轮变化,避免既有 doom-loop 检测(相同工具+相同输出)。
+                        input: format!("file{n}.py"),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-survey-stall-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 预算缩到 10,预置 10 次只读侦察,保证耗尽后立即进入停滞检测。
+        std::env::set_var("CLAW_SURVEY_BUDGET", "10");
+        let mut session = Session::new();
+        for i in 0..10usize {
+            session
+                .push_message(ConversationMessage::assistant(vec![
+                    ContentBlock::ToolUse {
+                        id: format!("tool-{i}"),
+                        name: "read_file".to_string(),
+                        input: format!("file{i}.py"),
+                    },
+                ]))
+                .expect("push tool_use");
+            session
+                .push_message(ConversationMessage::tool_result(
+                    format!("tool-{i}"),
+                    "read_file",
+                    format!("内容 {i}"),
+                    false,
+                ))
+                .expect("push result");
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            StallApi {
+                counter: AtomicUsize::new(0),
+            },
+            StaticToolExecutor::new().register("read_file", |input| {
+                // 输出随输入变化,避免命中既有 doom-loop 检测(相同工具+相同输出)。
+                Ok(format!("content of {input}"))
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        let result = runtime.run_turn("继续", None);
+        std::env::remove_var("CLAW_SURVEY_BUDGET");
+
+        let err = result.expect_err("turn must abort on read-only stall");
+        assert!(
+            err.to_string().contains("survey budget exhausted"),
+            "abort error must explain the stall, got: {err}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
