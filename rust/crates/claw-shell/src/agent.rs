@@ -367,7 +367,10 @@ where
         // 让 agent 感知用户当前编辑位置（IDE 独有优势，TUI 无此能力）。
         let user_input = match self.pending_editor_context.borrow_mut().take() {
             Some(ctx) if !ctx.trim().is_empty() => {
-                format!("[IDE context]\n{ctx}\n\n[User prompt]\n{}", Self::extract_user_text(&arguments.prompt))
+                format!(
+                    "[IDE context]\n{ctx}\n\n[User prompt]\n{}",
+                    Self::extract_user_text(&arguments.prompt)
+                )
             }
             _ => Self::extract_user_text(&arguments.prompt),
         };

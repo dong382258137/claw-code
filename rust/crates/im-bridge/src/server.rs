@@ -146,7 +146,10 @@ pub async fn run_server(
     let bus_poll_task = if let Some(root) = config.bus_root.clone() {
         let manager = state.session_manager.clone();
         bus.set_bus_root(root.clone());
-        tracing::info!("Session Bus cross-process mailbox polling enabled at {}", root.display());
+        tracing::info!(
+            "Session Bus cross-process mailbox polling enabled at {}",
+            root.display()
+        );
         Some(manager.start_bus_mailbox_poller(root))
     } else {
         None
@@ -249,9 +252,7 @@ async fn bus_send_handler(
     // 仅当目标是本地 IM 频道时执行直发，不重复 publish）。
     let mut pushed_im = false;
     if req.to.starts_with("im:") {
-        let route = state
-            .session_manager
-            .bus_route_for(&req.to);
+        let route = state.session_manager.bus_route_for(&req.to);
         if route {
             pushed_im = state
                 .session_manager
@@ -390,15 +391,9 @@ async fn process_feishu_message(state: &AppState, msg: FeishuUserMessage) {
 
     match state.session_manager.handle_command(&req).await {
         Ok(Some(cmd_response)) => {
-            tracing::info!(
-                "command handled for feishu chat {}",
-                msg.chat_id
-            );
+            tracing::info!("command handled for feishu chat {}", msg.chat_id);
             if let Some(client) = &state.feishu_client {
-                if let Err(e) = client
-                    .send_text_message(&msg.chat_id, &cmd_response)
-                    .await
-                {
+                if let Err(e) = client.send_text_message(&msg.chat_id, &cmd_response).await {
                     tracing::error!("failed to send feishu command response: {e}");
                 }
             }
@@ -735,12 +730,17 @@ mod tests {
         assert!(bus.publish(msg.clone()).unwrap().is_empty());
         let mailbox = SessionBus::mailbox_dir(&root, "main-abc");
         let count = |p: &std::path::Path| -> usize {
-            std::fs::read_dir(p).map(|rd| rd.flatten().count()).unwrap_or(0)
+            std::fs::read_dir(p)
+                .map(|rd| rd.flatten().count())
+                .unwrap_or(0)
         };
         assert_eq!(count(&mailbox), 0, "denied: no file written");
         // 放行 im:ide(run_server 初始化)后文件路由生效
         bus.set_allow(PeerKind::Im, PeerKind::Ide, true);
-        assert!(bus.publish(msg).unwrap().is_empty(), "进程内仍不投递(未注册)");
+        assert!(
+            bus.publish(msg).unwrap().is_empty(),
+            "进程内仍不投递(未注册)"
+        );
         assert_eq!(count(&mailbox), 1, "file routed to main mailbox");
         std::fs::remove_dir_all(&root).ok();
     }

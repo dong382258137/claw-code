@@ -36,7 +36,9 @@ pub fn register_default_tools(executor: &mut StaticToolExecutor) {
             continue;
         }
         let tool_name = spec.name.to_string();
-        built = built.register(spec.name, move |input: &str| execute_tool(&tool_name, input));
+        built = built.register(spec.name, move |input: &str| {
+            execute_tool(&tool_name, input)
+        });
     }
     *executor = built;
 }
@@ -116,6 +118,9 @@ mod tests {
         let mut executor = fresh_executor();
         let result = executor.execute("read_file", "not json");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid JSON input"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid JSON input"));
     }
 }

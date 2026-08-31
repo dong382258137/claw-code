@@ -397,7 +397,10 @@ pub fn handle_broadcast_notification(params: &acp::RawValue) -> usize {
         return 0;
     }
     let to = json.get("to").and_then(|v| v.as_str()).unwrap_or("*");
-    let kind = json.get("kind").and_then(|v| v.as_str()).unwrap_or("message");
+    let kind = json
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("message");
     // 审查补充(2026-08-12):空 text 拒绝发布,防止 IDE 面板误发空消息广播噪音。
     let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("");
     if text.trim().is_empty() {
@@ -410,7 +413,9 @@ pub fn handle_broadcast_notification(params: &acp::RawValue) -> usize {
         return 0;
     }
     let kind = runtime::BusMessageKind::from_str(kind);
-    bus.publish_text(from, to, kind, text).map(|d| d.len()).unwrap_or(0)
+    bus.publish_text(from, to, kind, text)
+        .map(|d| d.len())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -786,8 +791,8 @@ mod tests {
     fn broadcast_rejects_missing_from() {
         let raw = serde_json::value::to_raw_value(&serde_json::json!({ "to": "x" })).unwrap();
         assert_eq!(handle_broadcast_notification(&raw), 0);
-        let raw = serde_json::value::to_raw_value(&serde_json::json!({ "from": "", "to": "x" }))
-            .unwrap();
+        let raw =
+            serde_json::value::to_raw_value(&serde_json::json!({ "from": "", "to": "x" })).unwrap();
         assert_eq!(handle_broadcast_notification(&raw), 0);
     }
 
@@ -815,7 +820,11 @@ mod tests {
         ];
         for c in cases {
             let raw = serde_json::value::to_raw_value(&c).unwrap();
-            assert_eq!(handle_broadcast_notification(&raw), 0, "empty text must be rejected");
+            assert_eq!(
+                handle_broadcast_notification(&raw),
+                0,
+                "empty text must be rejected"
+            );
         }
         assert!(bus.unread_messages(&main_id).is_empty());
         bus.leave(&main_id);

@@ -253,7 +253,9 @@ mod tests {
                 .map(|c| format!("{}:\\", c))
                 .unwrap_or_default();
             assert!(
-                roots.iter().any(|r| r.to_string_lossy().eq_ignore_ascii_case(&drive)),
+                roots
+                    .iter()
+                    .any(|r| r.to_string_lossy().eq_ignore_ascii_case(&drive)),
                 "应包含当前盘 {drive}: {roots:?}"
             );
         }

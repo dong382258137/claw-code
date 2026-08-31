@@ -133,8 +133,8 @@ pub fn run_setup() -> Result<(), String> {
     println!("  \u{251c} 选择要接入的 IM 平台:");
     println!("  \u{2502}   1) 飞书 Feishu/Lark");
     println!("  \u{2502}   2) 企业微信 WeCom");
-    let platform = prompt("平台", "[1]", Some("1"), true)
-        .ok_or_else(|| "输入被取消".to_string())?;
+    let platform =
+        prompt("平台", "[1]", Some("1"), true).ok_or_else(|| "输入被取消".to_string())?;
 
     let listen_addr = prompt(
         "HTTP 监听地址",
@@ -144,15 +144,10 @@ pub fn run_setup() -> Result<(), String> {
     )
     .ok_or_else(|| "输入被取消".to_string())?;
 
-    let session_timeout = prompt(
-        "会话空闲超时(秒)",
-        "(30 分钟 = 1800)",
-        Some("1800"),
-        true,
-    )
-    .ok_or_else(|| "输入被取消".to_string())?
-    .parse::<u64>()
-    .map_err(|_| "会话超时必须为数字".to_string())?;
+    let session_timeout = prompt("会话空闲超时(秒)", "(30 分钟 = 1800)", Some("1800"), true)
+        .ok_or_else(|| "输入被取消".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "会话超时必须为数字".to_string())?;
 
     // 审查补充(2026-08-12):跨进程互通目录(可选)——指向 TUI claw 进程的 .claw/bus,
     // 使 TUI 主会话 ↔ IM 频道经文件事件队列互通。
@@ -166,23 +161,21 @@ pub fn run_setup() -> Result<(), String> {
     // 生成配置，已存在则先备份
     if path.exists() {
         let backup = path.with_extension("toml.bak");
-        std::fs::copy(&path, &backup)
-            .map_err(|e| format!("备份旧配置失败: {e}"))?;
+        std::fs::copy(&path, &backup).map_err(|e| format!("备份旧配置失败: {e}"))?;
         println!("\n  \u{1f4c1} 旧配置已备份为 {}", backup.display());
     }
 
     let content = if platform == "2" {
-        let corp_id = prompt("企业 ID (corp_id)", "", None, true)
-            .ok_or_else(|| "输入被取消".to_string())?;
-        let secret = prompt("企业 Secret", "", None, true)
-            .ok_or_else(|| "输入被取消".to_string())?;
-        let token = prompt("Token", "", None, true)
-            .ok_or_else(|| "输入被取消".to_string())?;
+        let corp_id =
+            prompt("企业 ID (corp_id)", "", None, true).ok_or_else(|| "输入被取消".to_string())?;
+        let secret =
+            prompt("企业 Secret", "", None, true).ok_or_else(|| "输入被取消".to_string())?;
+        let token = prompt("Token", "", None, true).ok_or_else(|| "输入被取消".to_string())?;
         let aes = prompt("EncodingAESKey (43 字符)", "", None, true)
             .ok_or_else(|| "输入被取消".to_string())?;
         let webhook = prompt("Webhook URL (可选)", "", None, false);
-        let agent_id = prompt("Agent ID (可选)", "", None, false)
-            .and_then(|s| s.parse::<i64>().ok());
+        let agent_id =
+            prompt("Agent ID (可选)", "", None, false).and_then(|s| s.parse::<i64>().ok());
         render_wecom_toml(
             &listen_addr,
             session_timeout,
@@ -198,14 +191,19 @@ pub fn run_setup() -> Result<(), String> {
         println!("  \u{251c} 飞书事件订阅模式:");
         println!("  \u{2502}   1) ws —— 长连接 (推荐，无需公网地址/回调 URL)");
         println!("  \u{2502}   2) http —— webhook 回调 (需要公网地址)");
-        let mode = prompt("模式", "[1]", Some("1"), true)
-            .ok_or_else(|| "输入被取消".to_string())?;
+        let mode =
+            prompt("模式", "[1]", Some("1"), true).ok_or_else(|| "输入被取消".to_string())?;
         let mode = if mode == "2" { "http" } else { "ws" };
 
-        let app_id = prompt("App ID (cli_xxx)", "(飞书开放平台-凭证与基础信息)", None, true)
-            .ok_or_else(|| "输入被取消".to_string())?;
-        let app_secret = prompt("App Secret", "", None, true)
-            .ok_or_else(|| "输入被取消".to_string())?;
+        let app_id = prompt(
+            "App ID (cli_xxx)",
+            "(飞书开放平台-凭证与基础信息)",
+            None,
+            true,
+        )
+        .ok_or_else(|| "输入被取消".to_string())?;
+        let app_secret =
+            prompt("App Secret", "", None, true).ok_or_else(|| "输入被取消".to_string())?;
         let verification = prompt("Verification Token (可选)", "", None, false);
         let encrypt_key = prompt("Encrypt Key (可选)", "", None, false);
         render_feishu_toml(
@@ -227,7 +225,9 @@ pub fn run_setup() -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| format!("写入配置失败: {e}"))?;
 
     println!("\n  \u{2705} 配置文件已生成: {}", path.display());
-    println!("  \x1b[2m下一步：运行 \x1b[0m\x1b[1mclaw-im-bridge\x1b[0m\x1b[2m 启动桥接服务。\x1b[0m");
+    println!(
+        "  \x1b[2m下一步：运行 \x1b[0m\x1b[1mclaw-im-bridge\x1b[0m\x1b[2m 启动桥接服务。\x1b[0m"
+    );
     println!(
         "  \x1b[2m提示：还需在飞书/企微管理后台配置 webhook 回调地址指向本服务的 /feishu/webhook 或 /wecom/webhook。\x1b[0m"
     );

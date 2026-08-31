@@ -1216,7 +1216,9 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
-                    InputContentBlock::Thinking { thinking: value, .. } => {
+                    InputContentBlock::Thinking {
+                        thinking: value, ..
+                    } => {
                         if !value.is_empty() {
                             has_reasoning = true;
                         }
@@ -1746,7 +1748,7 @@ mod tests {
         build_chat_completion_request, chat_completions_endpoint, has_thinking_mode_tool_call,
         is_reasoning_model, model_requires_reasoning_content_in_history, normalize_finish_reason,
         normalize_response, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig, REASONING_PLACEHOLDER, StreamState,
+        OpenAiCompatConfig, StreamState, REASONING_PLACEHOLDER,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1892,7 +1894,10 @@ mod tests {
         // API 只校验 presence 不读内容,故回传占位符即可。
         let assistant = &payload["messages"][0];
         assert_eq!(assistant["reasoning_content"], json!(REASONING_PLACEHOLDER));
-        assert_eq!(assistant["tool_calls"][0]["id"], json!("call_01_SeY7wrVwpFOzzZR2vM2c9683"));
+        assert_eq!(
+            assistant["tool_calls"][0]["id"],
+            json!("call_01_SeY7wrVwpFOzzZR2vM2c9683")
+        );
     }
 
     #[test]
@@ -1924,7 +1929,8 @@ mod tests {
 
         let assistant = &payload["messages"][0];
         assert_eq!(
-            assistant["reasoning_content"], json!(REASONING_PLACEHOLDER),
+            assistant["reasoning_content"],
+            json!(REASONING_PLACEHOLDER),
             "thinking 被剥离后 call_01_* tool call 仍必须回传占位符"
         );
         assert_eq!(
@@ -1946,13 +1952,11 @@ mod tests {
             max_tokens: 100,
             messages: vec![InputMessage {
                 role: "assistant".to_string(),
-                content: vec![
-                    InputContentBlock::ToolUse {
-                        id: "call_02_vFVFAg79gxanJZdXeWHb5001".to_string(),
-                        name: "bash".to_string(),
-                        input: json!({"command": "ls"}),
-                    },
-                ],
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_02_vFVFAg79gxanJZdXeWHb5001".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command": "ls"}),
+                }],
             }],
             stream: false,
             ..Default::default()
@@ -1962,7 +1966,8 @@ mod tests {
 
         let assistant = &payload["messages"][0];
         assert_eq!(
-            assistant["reasoning_content"], json!(REASONING_PLACEHOLDER),
+            assistant["reasoning_content"],
+            json!(REASONING_PLACEHOLDER),
             "call_02_* tool call 必须回传占位符(call_0N_ N≥1 均为 thinking 模式)"
         );
         assert_eq!(
@@ -2001,15 +2006,24 @@ mod tests {
         // Then reasoning_content is omitted (stripped to save context tokens).
         let assistant = &payload["messages"][0];
         assert!(assistant.get("reasoning_content").is_none());
-        assert_eq!(assistant["tool_calls"][0]["id"], json!("call_00_JvIHk6LO4kk0M9XZHAYR0592"));
+        assert_eq!(
+            assistant["tool_calls"][0]["id"],
+            json!("call_00_JvIHk6LO4kk0M9XZHAYR0592")
+        );
     }
 
     #[test]
     fn has_thinking_mode_tool_call_detects_call_0n_prefix() {
-        assert!(has_thinking_mode_tool_call(&["call_01_SeY7wrVwpFOzzZR2vM2c9683"]));
-        assert!(has_thinking_mode_tool_call(&["call_02_vFVFAg79gxanJZdXeWHb5001"]));
+        assert!(has_thinking_mode_tool_call(&[
+            "call_01_SeY7wrVwpFOzzZR2vM2c9683"
+        ]));
+        assert!(has_thinking_mode_tool_call(&[
+            "call_02_vFVFAg79gxanJZdXeWHb5001"
+        ]));
         assert!(has_thinking_mode_tool_call(&["call_09_future"]));
-        assert!(!has_thinking_mode_tool_call(&["call_00_JvIHk6LO4kk0M9XZHAYR0592"]));
+        assert!(!has_thinking_mode_tool_call(&[
+            "call_00_JvIHk6LO4kk0M9XZHAYR0592"
+        ]));
         assert!(!has_thinking_mode_tool_call(&["call_0_short"]));
         assert!(!has_thinking_mode_tool_call(std::iter::empty::<&str>()));
         assert!(!has_thinking_mode_tool_call(&["toolu_01_abc"]));

@@ -48,10 +48,7 @@ pub fn parse_command(text: &str) -> CommandParseResult {
         "/history" | "/hist" => CommandParseResult::Command(ChatCommand::History),
         // /bus 前缀 → 子命令交给 SessionManager 执行（需 bus + 路由表）
         other if other == "/bus" || other.starts_with("/bus ") => {
-            let args = other
-                .trim_start_matches("/bus")
-                .trim()
-                .to_string();
+            let args = other.trim_start_matches("/bus").trim().to_string();
             CommandParseResult::Command(ChatCommand::Bus { args })
         }
         other => CommandParseResult::Message(other.to_string()),

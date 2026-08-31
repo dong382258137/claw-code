@@ -9383,10 +9383,10 @@ mod tests {
         agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
         build_http_client, classify_lane_failure, derive_agent_state, execute_agent_with_spawn,
         execute_tool, extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, run_web_sync_guarded,
-        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor, make_subagent_tool_executor,
+        make_subagent_tool_executor, maybe_commit_provenance, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_packet, run_web_sync_guarded, AgentInput, AgentJob, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -11033,8 +11033,8 @@ mod tests {
     #[test]
     fn parse_tool_call_input_fixes_todo_missing_comma_between_fields() {
         let raw = r#"{"todos":[{"content":"a""activeForm":"b"}]}"#;
-        let value = super::parse_tool_call_input("TodoWrite", raw)
-            .expect("TodoWrite 缺逗号应被宽容修复");
+        let value =
+            super::parse_tool_call_input("TodoWrite", raw).expect("TodoWrite 缺逗号应被宽容修复");
         assert_eq!(value["todos"][0]["content"], "a");
         assert_eq!(value["todos"][0]["activeForm"], "b");
     }
@@ -11043,8 +11043,8 @@ mod tests {
     #[test]
     fn parse_tool_call_input_fixes_array_element_missing_comma() {
         let raw = r#"{"todos":[{"content":"a"}{"content":"b"}]}"#;
-        let value = super::parse_tool_call_input("TodoWrite", raw)
-            .expect("数组元素间缺逗号应被修复");
+        let value =
+            super::parse_tool_call_input("TodoWrite", raw).expect("数组元素间缺逗号应被修复");
         assert_eq!(value["todos"].as_array().expect("array").len(), 2);
     }
 
@@ -11052,8 +11052,7 @@ mod tests {
     #[test]
     fn parse_tool_call_input_fixes_number_then_key_missing_comma() {
         let raw = r#"{"flag":1"extra":true}"#;
-        let value = super::parse_tool_call_input("TodoWrite", raw)
-            .expect("数字后缺逗号应被修复");
+        let value = super::parse_tool_call_input("TodoWrite", raw).expect("数字后缺逗号应被修复");
         assert_eq!(value["flag"], 1);
         assert_eq!(value["extra"], true);
     }
@@ -11070,8 +11069,8 @@ mod tests {
     #[test]
     fn parse_tool_call_input_unfixable_returns_guidance() {
         let raw = r#"{"todos":[{"content":"abc}]}"#; // 字符串未闭合
-        let err = super::parse_tool_call_input("TodoWrite", raw)
-            .expect_err("未闭合引号无法修复应报错");
+        let err =
+            super::parse_tool_call_input("TodoWrite", raw).expect_err("未闭合引号无法修复应报错");
         assert!(err.contains("invalid tool input JSON"), "got: {err}");
         assert!(err.contains("TodoWrite"), "应含 TodoWrite 修复指引: {err}");
         assert!(err.contains("缺逗号"), "应列出常见笔误: {err}");
@@ -11085,10 +11084,13 @@ mod tests {
             super::parse_tool_call_input("TodoWrite", raw).is_ok(),
             "TodoWrite 应被修复"
         );
-        let err = super::parse_tool_call_input("read_file", raw)
-            .expect_err("非 TodoWrite 不应宽容修复");
+        let err =
+            super::parse_tool_call_input("read_file", raw).expect_err("非 TodoWrite 不应宽容修复");
         assert!(err.contains("invalid tool input JSON"), "got: {err}");
-        assert!(!err.contains("缺逗号"), "非 TodoWrite 不应有修复指引: {err}");
+        assert!(
+            !err.contains("缺逗号"),
+            "非 TodoWrite 不应有修复指引: {err}"
+        );
     }
 
     /// 通过 SubagentToolExecutor 全链路执行：缺逗号 TodoWrite 输入应一次成功。
@@ -11099,8 +11101,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let store = temp_path("todos-tolerance.json");
         std::env::set_var("CLAWD_TODO_STORE", &store);
-        let allowed: BTreeSet<String> =
-            ["TodoWrite"].into_iter().map(str::to_string).collect();
+        let allowed: BTreeSet<String> = ["TodoWrite"].into_iter().map(str::to_string).collect();
         let mut executor = make_subagent_tool_executor(allowed);
         let raw = r#"{"todos":[{"content":"ok""activeForm":"OK""status":"pending"}]}"#;
         let result = executor.execute("TodoWrite", raw);

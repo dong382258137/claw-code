@@ -142,12 +142,13 @@ where
                 // 捕获 ConnectionTo<Client>,供反向请求方法使用。
                 slot.set_connection(cx.clone()).await;
                 tracing::debug!("claw-agent-v1-3: initialize");
-                let resp = schema::InitializeResponse::new(req.protocol_version).auth_methods(
-                    vec![schema::AuthMethod::Agent(schema::AuthMethodAgent::new(
-                        schema::AuthMethodId::new("api_key"),
-                        "API Key",
-                    ))],
-                );
+                let resp =
+                    schema::InitializeResponse::new(req.protocol_version).auth_methods(vec![
+                        schema::AuthMethod::Agent(schema::AuthMethodAgent::new(
+                            schema::AuthMethodId::new("api_key"),
+                            "API Key",
+                        )),
+                    ]);
                 responder.respond(resp)
             },
             acp::on_receive_request!(),
@@ -177,9 +178,7 @@ where
                         responder.respond(schema::NewSessionResponse::new(session_id))
                     }
                     Ok(Err(e)) => responder.respond_with_internal_error(e),
-                    Err(_) => {
-                        responder.respond_with_internal_error("session creation cancelled")
-                    }
+                    Err(_) => responder.respond_with_internal_error("session creation cancelled"),
                 }
             },
             acp::on_receive_request!(),
@@ -515,8 +514,8 @@ mod tests {
         rx: &mut (impl futures::Stream<Item = Result<acp::RawJsonRpcMessage, acp::Error>> + Unpin),
         expected_id: &acp::schema::v1::RequestId,
     ) -> serde_json::Value {
-        use futures::StreamExt;
         use acp::schema::v1 as schema;
+        use futures::StreamExt;
 
         loop {
             let msg = rx

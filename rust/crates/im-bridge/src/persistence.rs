@@ -225,7 +225,10 @@ mod tests {
                 name == format!("{stem}.tmp") || name.starts_with(&format!(".{stem}."))
             })
             .collect();
-        assert!(leftovers.is_empty(), "unexpected tmp leftovers: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "unexpected tmp leftovers: {leftovers:?}"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }

@@ -951,7 +951,11 @@ mod tests {
     }
 
     /// 构造带 [静态块(带 cache_control), 动态块(无 marker)] 的请求。
-    fn request_with_split_system(static_text: &str, dynamic_text: &str, msg: &str) -> MessageRequest {
+    fn request_with_split_system(
+        static_text: &str,
+        dynamic_text: &str,
+        msg: &str,
+    ) -> MessageRequest {
         MessageRequest {
             model: "deepseek-v4-flash".to_string(),
             max_tokens: 64,

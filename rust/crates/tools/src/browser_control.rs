@@ -33,9 +33,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::handler::viewport::Viewport;
-use chromiumoxide::layout::{ElementQuad, Point};
-use chromiumoxide::page::{Page, ScreenshotParams};
 use chromiumoxide::cdp::browser_protocol::accessibility::{AxNode, AxValue, GetFullAxTreeParams};
 use chromiumoxide::cdp::browser_protocol::dom::{
     BackendNodeId, DescribeNodeParams, GetContentQuadsParams, GetDocumentParams,
@@ -48,6 +45,9 @@ use chromiumoxide::cdp::browser_protocol::input::{
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallFunctionOnParams, RemoteObjectId, RemoteObjectType,
 };
+use chromiumoxide::handler::viewport::Viewport;
+use chromiumoxide::layout::{ElementQuad, Point};
+use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -275,9 +275,11 @@ fn connect_target_parts(url: Option<String>, port: Option<u16>) -> Result<String
     if let Some(p) = port {
         return Ok(format!("http://127.0.0.1:{p}"));
     }
-    Err("action 'connect' requires 'url' (e.g. \"http://127.0.0.1:9222\" or \
+    Err(
+        "action 'connect' requires 'url' (e.g. \"http://127.0.0.1:9222\" or \
          \"ws://127.0.0.1:9222/devtools/browser/…\") or 'port'"
-        .to_string())
+            .to_string(),
+    )
 }
 
 async fn dispatch(
@@ -385,7 +387,9 @@ async fn dispatch(
         }
         "reload" => {
             let page = ensure_active_page(session).await?;
-            page.reload().await.map_err(|e| format!("reload failed: {e}"))?;
+            page.reload()
+                .await
+                .map_err(|e| format!("reload failed: {e}"))?;
             tokio::time::sleep(Duration::from_millis(400)).await;
             session.refs.clear();
             let (url, title) = page_basics(&page).await;
@@ -610,7 +614,9 @@ async fn dispatch(
             let mut tabs = Vec::new();
             for (i, page) in session.tabs.iter().enumerate() {
                 let (url, title) = page_basics(page).await;
-                tabs.push(json!({ "tab": i, "url": url, "title": title, "active": i == session.active }));
+                tabs.push(
+                    json!({ "tab": i, "url": url, "title": title, "active": i == session.active }),
+                );
             }
             Ok(json!({ "tabs": tabs }).to_string())
         }
@@ -630,7 +636,9 @@ async fn dispatch(
                 return Ok(json!({ "status": "closed", "tabs": 0 }).to_string());
             }
             let page = session.tabs.remove(idx);
-            page.close().await.map_err(|e| format!("close tab failed: {e}"))?;
+            page.close()
+                .await
+                .map_err(|e| format!("close tab failed: {e}"))?;
             if session.tabs.is_empty() {
                 return Ok(json!({ "status": "closed", "tabs": 0 }).to_string());
             }
@@ -820,8 +828,8 @@ async fn render_ax_tree(
         if role == "generic" && ax_str(&node.name).is_none() {
             // Skip anonymous containers to keep the tree compact.
         } else if !node.ignored && !role.is_empty() {
-            let interactive = INTERACTIVE_ROLES.contains(&role.as_str())
-                || node.backend_dom_node_id.is_some();
+            let interactive =
+                INTERACTIVE_ROLES.contains(&role.as_str()) || node.backend_dom_node_id.is_some();
             let ref_id = if interactive {
                 *counter += 1;
                 let rid = format!("e{}", counter);
@@ -923,23 +931,19 @@ fn ax_str(v: &Option<AxValue>) -> Option<String> {
 }
 
 fn ax_prop_bool(node: &AxNode, name: &str) -> Option<bool> {
-    node.properties.as_ref().and_then(|props| {
-        props
-            .iter()
-            .find(|p| p.name.as_ref() == name)
-    })
-    .and_then(|p| p.value.value.as_ref())
-    .and_then(Value::as_bool)
+    node.properties
+        .as_ref()
+        .and_then(|props| props.iter().find(|p| p.name.as_ref() == name))
+        .and_then(|p| p.value.value.as_ref())
+        .and_then(Value::as_bool)
 }
 
 fn ax_prop_int(node: &AxNode, name: &str) -> Option<i64> {
-    node.properties.as_ref().and_then(|props| {
-        props
-            .iter()
-            .find(|p| p.name.as_ref() == name)
-    })
-    .and_then(|p| p.value.value.as_ref())
-    .and_then(Value::as_i64)
+    node.properties
+        .as_ref()
+        .and_then(|props| props.iter().find(|p| p.name.as_ref() == name))
+        .and_then(|p| p.value.value.as_ref())
+        .and_then(Value::as_i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1601,10 +1605,7 @@ mod tests {
             Some("ws://127.0.0.1:9223/devtools/browser/x".into()),
             Some(9222),
         );
-        assert_eq!(
-            by_url.unwrap(),
-            "ws://127.0.0.1:9223/devtools/browser/x"
-        );
+        assert_eq!(by_url.unwrap(), "ws://127.0.0.1:9223/devtools/browser/x");
         // Missing both url and port is an error.
         assert!(connect_target_parts(None, None).is_err());
     }
@@ -1696,7 +1697,10 @@ mod tests {
     #[test]
     fn key_code_maps_common_keys() {
         let (name, code, vk) = key_code("Enter");
-        assert_eq!((name, code, vk), ("Enter".to_string(), "Enter".to_string(), 13));
+        assert_eq!(
+            (name, code, vk),
+            ("Enter".to_string(), "Enter".to_string(), 13)
+        );
         let (name, code, vk) = key_code("Tab");
         assert_eq!((name, code, vk), ("Tab".to_string(), "Tab".to_string(), 9));
         let (name, code, vk) = key_code("a");
@@ -1858,16 +1862,15 @@ mod tests {
     #[test]
     #[ignore]
     fn browser_control_smoke_stealth() {
-        let launch = run_browser_control(serde_json::from_value(json!({
-            "action": "launch",
-            "headless": true,
-        }))
-        .unwrap())
+        let launch = run_browser_control(
+            serde_json::from_value(json!({
+                "action": "launch",
+                "headless": true,
+            }))
+            .unwrap(),
+        )
         .unwrap_or_else(|e| panic!("launch failed: {e}"));
-        assert!(
-            launch.contains("\"status\":\"ready\""),
-            "launch: {launch}"
-        );
+        assert!(launch.contains("\"status\":\"ready\""), "launch: {launch}");
 
         let probe = run_browser_control(serde_json::from_value(json!({
             "action": "evaluate_js",
@@ -1894,7 +1897,11 @@ mod tests {
                 .trim_matches('"')
                 .to_string()
         };
-        assert_eq!(get("webdriver"), "false", "webdriver must be hidden: {probe}");
+        assert_eq!(
+            get("webdriver"),
+            "false",
+            "webdriver must be hidden: {probe}"
+        );
         assert_eq!(get("innerWidth"), "1440", "viewport width: {probe}");
         assert_eq!(get("innerHeight"), "900", "viewport height: {probe}");
         assert!(
@@ -1909,8 +1916,9 @@ mod tests {
             "language should be zh-CN or en-US: {probe}"
         );
 
-        let close = run_browser_control(serde_json::from_value(json!({ "action": "close" })).unwrap())
-            .unwrap();
+        let close =
+            run_browser_control(serde_json::from_value(json!({ "action": "close" })).unwrap())
+                .unwrap();
         assert!(close.contains("closed"), "close: {close}");
     }
 

@@ -133,7 +133,9 @@ impl Default for ClawAgentV13Config {
     fn default() -> Self {
         Self {
             system_prompt: Vec::new(),
-            permission_policy: runtime::PermissionPolicy::new(runtime::PermissionMode::WorkspaceWrite),
+            permission_policy: runtime::PermissionPolicy::new(
+                runtime::PermissionMode::WorkspaceWrite,
+            ),
         }
     }
 }
@@ -527,9 +529,8 @@ where
         if let Ok(decision_log) = runtime::DecisionLog::open(&cwd) {
             runtime = runtime.with_decision_log(decision_log);
         }
-        let topology = std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(
-            cwd.clone(),
-        ));
+        let topology =
+            std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(cwd.clone()));
         runtime = runtime.with_project_topology(topology);
         let tx = runtime::RefactorTransaction::new(cwd.clone());
         runtime = runtime.with_refactor_transaction(tx);
@@ -639,15 +640,11 @@ pub enum AgentCommand {
         tx: tokio::sync::oneshot::Sender<Result<schema::StopReason, String>>,
     },
     /// 取消当前 turn。
-    Cancel {
-        session_id: schema::SessionId,
-    },
+    Cancel { session_id: schema::SessionId },
 }
 
 /// 从 `ConversationRuntime` 提取最后一条 assistant 消息的文本(对齐 0.10.4)。
-fn extract_assistant_text_v1_3<C>(
-    runtime: &ConversationRuntime<C, StaticToolExecutor>,
-) -> String
+fn extract_assistant_text_v1_3<C>(runtime: &ConversationRuntime<C, StaticToolExecutor>) -> String
 where
     C: ApiClient + 'static,
 {

@@ -263,7 +263,8 @@ fn decode_frame(buf: &[u8]) -> Result<Frame, String> {
                 if pos + len > buf.len() {
                     return Err("payload_type exceeds buffer".to_string());
                 }
-                frame.payload_type = Some(String::from_utf8_lossy(&buf[pos..pos + len]).to_string());
+                frame.payload_type =
+                    Some(String::from_utf8_lossy(&buf[pos..pos + len]).to_string());
                 pos += len;
             }
             8 => {
@@ -419,8 +420,7 @@ impl FeishuWsClient {
 
             // Jitter first, then the fixed reconnect interval.
             if settings.reconnect_nonce > 0 {
-                let jitter =
-                    rand::thread_rng().gen_range(0.0..settings.reconnect_nonce as f64);
+                let jitter = rand::thread_rng().gen_range(0.0..settings.reconnect_nonce as f64);
                 tokio::time::sleep(Duration::from_secs_f64(jitter)).await;
             }
             tokio::time::sleep(settings.reconnect_interval).await;
@@ -430,14 +430,20 @@ impl FeishuWsClient {
     /// Establish one connection and drive it until it breaks.
     async fn connect_once(&self, settings: &mut WsSettings) -> Result<(), String> {
         let endpoint = fetch_endpoint(&self.config).await?;
-        settings.apply(endpoint.data.as_ref().and_then(|d| d.client_config.as_ref()));
+        settings.apply(
+            endpoint
+                .data
+                .as_ref()
+                .and_then(|d| d.client_config.as_ref()),
+        );
         let url = endpoint
             .data
             .as_ref()
             .ok_or("endpoint response missing data")?
             .url
             .clone();
-        let service_id = query_param(&url, "service_id").ok_or("endpoint url missing service_id")?;
+        let service_id =
+            query_param(&url, "service_id").ok_or("endpoint url missing service_id")?;
 
         let (ws_stream, _resp) = tokio_tungstenite::connect_async(&url)
             .await
@@ -589,8 +595,8 @@ async fn fetch_endpoint(config: &FeishuConfig) -> Result<EndpointResp, String> {
     if !status.is_success() {
         return Err(format!("endpoint request status {status}: {text}"));
     }
-    let parsed: EndpointResp = serde_json::from_str(&text)
-        .map_err(|e| format!("endpoint response parse failed: {e}"))?;
+    let parsed: EndpointResp =
+        serde_json::from_str(&text).map_err(|e| format!("endpoint response parse failed: {e}"))?;
     if parsed.code != 0 {
         return Err(format!(
             "endpoint error (code {}): {}",

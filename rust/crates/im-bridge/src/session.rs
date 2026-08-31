@@ -269,12 +269,16 @@ impl SessionManager {
         let own_id = chat_key.bus_peer_id();
         let mut parts = args.split_whitespace();
         match parts.next() {
-            None | Some("") => crate::commands::handle_command(
-                &ChatCommand::Bus { args: String::new() },
-                &acp::SessionId::new("bus"),
-                0,
-            )
-            .await,
+            None | Some("") => {
+                crate::commands::handle_command(
+                    &ChatCommand::Bus {
+                        args: String::new(),
+                    },
+                    &acp::SessionId::new("bus"),
+                    0,
+                )
+                .await
+            }
             Some("list") => {
                 let mut lines = vec![format!("**Session Bus Peers**（本频道 `{own_id}`）")];
                 let mut peers = bus.peers_snapshot();
@@ -325,13 +329,17 @@ impl SessionManager {
                 bus.unwatch(&own_id, target);
                 format!("已取消订阅 `{target}`")
             }
-            Some(other) => format!("Unknown /bus subcommand: `{other}`\n\n{}", 
+            Some(other) => format!(
+                "Unknown /bus subcommand: `{other}`\n\n{}",
                 crate::commands::handle_command(
-                    &ChatCommand::Bus { args: String::new() },
+                    &ChatCommand::Bus {
+                        args: String::new()
+                    },
                     &acp::SessionId::new("bus"),
                     0,
                 )
-                .await),
+                .await
+            ),
         }
     }
 
@@ -574,7 +582,10 @@ impl SessionManager {
     /// 防止进程重启后第一轮 persist 用空内存 map 覆盖磁盘上的历史记录。
     fn merge_with_history(&self, active: Vec<PersistedSession>) -> Vec<PersistedSession> {
         let merged = {
-            let history = self.persisted_metadata.lock().unwrap_or_else(|e| e.into_inner());
+            let history = self
+                .persisted_metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             Self::merge_sessions(&history, &active)
         };
         // 更新历史缓存,下一轮 persist 以本轮为准(避免过期历史反复合入)。
