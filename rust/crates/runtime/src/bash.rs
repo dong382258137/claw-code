@@ -361,9 +361,9 @@ async fn execute_bash_async(
         if is_bash_aborted() {
             aborted = true;
             if !child_exited {
-                let _ = child.kill().await;
-                child_exited = true;
-                child_exit_time = Some(Instant::now());
+                // abort 时立即终止进程树并关闭 pipe,快速退出(不等残留数据)。
+                // 2026-08-31:统一走进程树终止,后台链持 pipe 也会被释放。
+                terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time).await;
             }
             // abort 时立即关闭 pipe，快速退出（不等残留数据）
             child_stdout = None;
@@ -377,12 +377,7 @@ async fn execute_bash_async(
             // 注意 `!child_exited`:kill 后不再进入本分支,避免每轮重置
             // child_exit_time 导致 PIPE_DRAIN_GRACE 永不触发(死循环)。
             timed_out = true;
-            if let Some(pid) = child.id() {
-                kill_process_tree(pid);
-            }
-            let _ = child.kill().await;
-            child_exited = true;
-            child_exit_time = Some(Instant::now());
+            terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time).await;
         } else if !child_exited {
             if let Some(ref mut m) = monitor {
                 // 智能模式：基于子进程树活跃度决策
@@ -391,30 +386,25 @@ async fn execute_bash_async(
                     activity_monitor::ActivityDecision::IdleTimeout => {
                         timed_out = true;
                         smart_idle = true;
-                        let _ = child.kill().await;
-                        child_exited = true;
-                        child_exit_time = Some(Instant::now());
+                        terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time)
+                            .await;
                     }
                     activity_monitor::ActivityDecision::HardTimeout => {
                         timed_out = true;
-                        let _ = child.kill().await;
-                        child_exited = true;
-                        child_exit_time = Some(Instant::now());
+                        terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time)
+                            .await;
                     }
                     activity_monitor::ActivityDecision::BusyLoop => {
                         busy_loop = true;
                         timed_out = true;
-                        let _ = child.kill().await;
-                        child_exited = true;
-                        child_exit_time = Some(Instant::now());
+                        terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time)
+                            .await;
                     }
                 }
             } else if start.elapsed() >= timeout_dur {
                 // 固定超时模式（input.timeout 显式指定时）
                 timed_out = true;
-                let _ = child.kill().await;
-                child_exited = true;
-                child_exit_time = Some(Instant::now());
+                terminate_child_tree(&mut child, &mut child_exited, &mut child_exit_time).await;
             }
         }
 
@@ -595,7 +585,12 @@ fn background_service_wait() -> Duration {
 /// 窗口,超时终止 bash 及进程树并返回已收集输出(后台进程会持有输出管道,
 /// 不终止则 tokio Runtime drop 永久等待阻塞的 read 线程)。
 fn is_background_service_command(command: &str) -> bool {
-    let c = command.trim();
+    // 先归一化换行/回车为空格:多行命令中 `&` 后跟换行符(`2>&1 &\necho ...`)
+    // 时,原子串匹配 "2>&1 &"(要求 & 后空格)会漏过 —— 2026-08-31 二次事故:
+    // `nohup ... > log 2>&1 &\necho ...` 未被识别 → 后台服务链持有输出管道,
+    // 固定超时只 kill 本体不杀进程树 → Bash 工具永久卡住(11 分钟无输出)。
+    let normalized: String = command.trim().replace(['\r', '\n'], " ");
+    let c = normalized.trim();
     // 最常见的写法:重定向 + 后台(`> log 2>&1 &` / `>> log 2>&1 &` /
     // `> /dev/null 2>&1 &`)。这类几乎总是"启动守护/服务进程且不等待"。
     if c.contains("2>&1 &") || c.contains("> /dev/null &") {
@@ -693,6 +688,26 @@ fn kill_process_tree(pid: u32) {
         // bash 通常为进程组组长,负 PID 表示信号发给整个进程组
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
+}
+
+/// 终止子进程及其整棵进程树(释放继承的输出管道写端)。
+///
+/// 2026-08-31 二次事故:后台服务(`nohup ... &`)的后代进程即使父进程被杀,
+/// 仍持有输出管道 → Bash 工具 read 阻塞、tokio Runtime drop 永久等待
+/// (会话卡住 11 分钟无输出)。此前仅 bg_service 分支杀进程树;固定/智能
+/// 超时只 `child.kill()`(杀本体不杀树),后台链持 pipe 使工具卡死。
+/// 所有超时/中止路径统一改走此函数。
+async fn terminate_child_tree(
+    child: &mut tokio::process::Child,
+    child_exited: &mut bool,
+    child_exit_time: &mut Option<Instant>,
+) {
+    if let Some(pid) = child.id() {
+        kill_process_tree(pid);
+    }
+    let _ = child.kill().await;
+    *child_exited = true;
+    *child_exit_time = Some(Instant::now());
 }
 
 /// 智能模式 busy loop 触发时的输出构造。
@@ -1346,6 +1361,14 @@ mod tests {
         ));
         assert!(super::is_background_service_command("cmd &> log &"));
         assert!(super::is_background_service_command("svc > /dev/null &"));
+        // 多行命令: `&` 后跟换行符(\n)而非空格 —— 2026-08-31 二次事故复现
+        // (nohup python > log 2>&1 &\necho ... 未被识别 → 后台链持 pipe 卡 11 分钟)。
+        assert!(super::is_background_service_command(
+            "cd /d/chanlunV2 && nohup \"python\" -B -m chanlun_py.web.server > chanlun_py/web_server.log 2>&1 &\necho \"启动中,等待就绪...\"; sleep 8; netstat -ano | grep \":8765.*LISTENING\" | head -3"
+        ));
+        assert!(super::is_background_service_command(
+            "nohup server > log 2>&1 &\nsleep 5"
+        ));
         assert!(!super::is_background_service_command("ls -la"));
         assert!(!super::is_background_service_command("cargo build"));
         assert!(!super::is_background_service_command("git status"));
@@ -1384,6 +1407,46 @@ mod tests {
         assert!(
             elapsed.as_secs() < 30,
             "background service command must return within window, took {elapsed:?}"
+        );
+        assert!(
+            output.stderr.contains("Background service"),
+            "stderr should hint background service, got: {}",
+            output.stderr
+        );
+    }
+
+    /// 回归(2026-08-31 二次事故):多行 `&\n` 后台命令必须在窗口内返回。
+    /// 事故命令 `nohup ... > log 2>&1 &\necho ...` 的 `&` 后是换行符而非空格,
+    /// 原检测漏过 → 固定超时只 kill 本体不杀进程树 → 后台链持 pipe 卡住 11 分钟。
+    #[test]
+    fn background_service_multiline_returns_within_window() {
+        use std::time::Instant;
+
+        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS", "2");
+
+        let start = Instant::now();
+        let output = execute_bash(BashCommandInput {
+            command:
+                "cd /tmp && nohup python -m http.server > /tmp/svc.log 2>&1 &\necho \"启动中\"; sleep 10; true"
+                    .to_string(),
+            timeout: None,
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("multiline bg service command should return");
+        std::env::remove_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS");
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 30,
+            "multiline background command must return within window, took {elapsed:?}"
         );
         assert!(
             output.stderr.contains("Background service"),
