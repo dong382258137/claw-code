@@ -1369,6 +1369,11 @@ mod tests {
         assert!(super::is_background_service_command(
             "nohup server > log 2>&1 &\nsleep 5"
         ));
+        // 精确事故命令(2026-08-31 三次事故,绝对路径 python.exe + `2>&1 &\necho`):
+        // session-1788182483639 卡住命令,必须被识别。
+        assert!(super::is_background_service_command(
+            "cd /d/chanlunV2 && C:/Users/38225/AppData/Local/Programs/Python/Python311/python.exe -B -m chanlun_py.web.server > /d/chanlunV2/chanlun_py/.sandbox-tmp/ws_server_restart.log 2>&1 &\necho \"started, waiting for port...\"; sleep 8; netstat -ano 2>/dev/null | grep -E \":8765|5001\\s.*LISTENING\" | head -5"
+        ));
         assert!(!super::is_background_service_command("ls -la"));
         assert!(!super::is_background_service_command("cargo build"));
         assert!(!super::is_background_service_command("git status"));
@@ -1453,6 +1458,186 @@ mod tests {
             "stderr should hint background service, got: {}",
             output.stderr
         );
+    }
+
+    /// 生产路径复现(2026-08-31 三次事故):execute_bash 在 tokio runtime context
+    /// 内被调用(production 走 spawn 线程 + block_on 分支)。验证多行后台命令
+    /// 同样在窗口内返回 —— 单元测试走无 runtime 分支,可能掩盖 runtime 分支 bug。
+    #[test]
+    fn background_service_returns_in_runtime_context() {
+        use std::time::Instant;
+
+        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS", "2");
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        let start = Instant::now();
+        let result = rt.block_on(async {
+            // 模拟生产: 在 runtime context 里同步调用 execute_bash
+            // (内部会检测到 Handle,spawn 线程 + block_on + mpsc recv)
+            execute_bash(BashCommandInput {
+                command:
+                    "cd /tmp && nohup python -m http.server > /tmp/svc_rt.log 2>&1 &\necho \"rt started\"; sleep 10; true"
+                        .to_string(),
+                timeout: None,
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(false),
+                namespace_restrictions: Some(false),
+                isolate_network: Some(false),
+                filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+                allowed_mounts: None,
+            })
+        });
+        std::env::remove_var("CLAW_BACKGROUND_SERVICE_WAIT_SECS");
+        let output = result.expect("bg service should return in runtime context");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 30,
+            "runtime-context bg command must return within window, took {elapsed:?}"
+        );
+        assert!(
+            output.stderr.contains("Background service"),
+            "stderr should hint background service, got: {}",
+            output.stderr
+        );
+    }
+
+    /// 三次事故复现(session-1788182483639):AI 用 PowerShell Start-Process 后台
+    /// 启动服务 + sleep + netstat,timeout=None(智能模式)。后台进程有 CPU 持续
+    /// 活跃 → ActivityMonitor 永不 idle;若 bash 本体退出则 PIPE_DRAIN_GRACE
+    /// 兜底返回。验证 40s 内返回(不应卡死)。
+    #[test]
+    fn start_process_bg_returns_in_smart_mode() {
+        use std::time::Instant;
+
+        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        let start = Instant::now();
+        let result = rt.block_on(async {
+            execute_bash(BashCommandInput {
+                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Windows\\System32\\cmd.exe' -ArgumentList '/c','timeout','300' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_err.log'\" && echo \"Start-Process done\"; sleep 5; netstat -ano | grep LISTENING | grep -E \"8765|5001\" | head -3".to_string(),
+                timeout: None,
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(false),
+                namespace_restrictions: Some(false),
+                isolate_network: Some(false),
+                filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+                allowed_mounts: None,
+            })
+        });
+        let output = result.expect("start-process bg should return");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 40,
+            "start-process bg command must return within 40s, took {elapsed:?}"
+        );
+        assert!(
+            output.stdout.contains("Start-Process done"),
+            "bash foreground should complete, stdout: {}",
+            output.stdout
+        );
+        // 清理后台进程
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "timeout.exe", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    /// 四事故复现(session-1788182483639 [253]):AI 用 PowerShell Start-Process 后台
+    /// 启动服务 + sleep + netstat,timeout=30000(固定超时模式)。与智能模式不同:
+    /// monitor=None,固定超时分支 30s 后杀进程树。bash 本体 ~5s 退出后应经
+    /// PIPE_DRAIN_GRACE 2s 兜底返回(而非等 30s 固定超时)。验证 20s 内返回。
+    #[test]
+    fn start_process_bg_returns_in_fixed_timeout_mode() {
+        use std::time::Instant;
+
+        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        let start = Instant::now();
+        let result = rt.block_on(async {
+            execute_bash(BashCommandInput {
+                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Windows\\System32\\cmd.exe' -ArgumentList '/c','timeout','300' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_fixed.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_fixed_err.log'\" && echo \"Start-Process done\"; sleep 5; netstat -ano | grep LISTENING | grep -E \"8765|5001\" | head -3".to_string(),
+                timeout: Some(30_000),
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(false),
+                namespace_restrictions: Some(false),
+                isolate_network: Some(false),
+                filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+                allowed_mounts: None,
+            })
+        });
+        let output = result.expect("start-process bg should return in fixed timeout mode");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 20,
+            "fixed-timeout start-process bg must return within 20s, took {elapsed:?}"
+        );
+        assert!(
+            output.stdout.contains("Start-Process done"),
+            "bash foreground should complete, stdout: {}",
+            output.stdout
+        );
+        // 清理后台进程
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "timeout.exe", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    /// 五事故复现(session-1788182483639 [253]):与 start_process_bg_returns_in_fixed_timeout_mode
+    /// 相同,但后台用**真实 python 长驻进程**(`python -c "time.sleep(99999)"`,不退出,模拟
+    /// ws_server 服务),验证 bash 退出 + PIPE_DRAIN_GRACE 兜底在"真长驻"场景同样生效。
+    /// 区别:cmd /c timeout 300 是 cmd 进程;python -c sleep 是解释器进程,句柄继承行为更接近
+    /// 事故现场(python.exe 持有 bash 管道写端)。
+    #[test]
+    fn start_process_python_long_lived_returns_in_fixed_timeout_mode() {
+        use std::time::Instant;
+
+        static BG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = BG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        let start = Instant::now();
+        let result = rt.block_on(async {
+            execute_bash(BashCommandInput {
+                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Users\\38225\\AppData\\Local\\Programs\\Python\\Python311\\python.exe' -ArgumentList '-c','import time; time.sleep(99999)' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_py_fixed.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_py_fixed_err.log'\" && echo \"Start-Process done\"; sleep 5; netstat -ano | grep LISTENING | grep -E \"8765|5001\" | head -3".to_string(),
+                timeout: Some(30_000),
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(false),
+                namespace_restrictions: Some(false),
+                isolate_network: Some(false),
+                filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+                allowed_mounts: None,
+            })
+        });
+        let output = result.expect("start-process python long-lived should return");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 20,
+            "fixed-timeout start-process python must return within 20s, took {elapsed:?}"
+        );
+        assert!(
+            output.stdout.contains("Start-Process done"),
+            "bash foreground should complete, stdout: {}",
+            output.stdout
+        );
+        // 清理后台 python(sleep 99999)进程
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "python.exe", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     /// PRD P2-5：shell 语法错误特征识别（bash/sh/cmd 通用）。
