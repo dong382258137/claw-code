@@ -273,7 +273,18 @@ impl SlashMenu {
         if self.query.is_empty() {
             return self.all_items.clone();
         }
-        let q = self.query.to_ascii_lowercase();
+        // 只取第一个词作为命令名过滤词：输入 `/thinking off` 时
+        // menu_query() 返回 "thinking off"，应只按 "thinking" 匹配命令，
+        // 参数不参与命令匹配（否则子串匹配永远为空）。
+        let q = self
+            .query
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if q.is_empty() {
+            return self.all_items.clone();
+        }
         self.all_items
             .iter()
             .filter(|spec| {
@@ -934,6 +945,48 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn query_with_argument_matches_command_name() {
+        // 回归(2026-09-01):输入 `/thinking off` 后 menu_query 返回
+        // "thinking off",旧实现用整段做子串匹配导致列表为空。
+        // 过滤词只取第一个词(命令名),参数不参与匹配。
+        let mut menu = SlashMenu::new();
+        menu.set_query("thinking off");
+        let filtered = menu.filtered();
+        assert!(
+            filtered.iter().any(|s| s.name == "thinking"),
+            "input '/thinking off' should surface the 'thinking' command, got: {:?}",
+            filtered.iter().map(|s| s.name).collect::<Vec<_>>()
+        );
+        // 所有返回项都应按首词 "thinking" 匹配(不应返回无关命令)。
+        for spec in filtered {
+            let name = spec.name.to_ascii_lowercase();
+            let summary = spec.summary.to_ascii_lowercase();
+            let alias_match = spec
+                .aliases
+                .iter()
+                .any(|a| a.to_ascii_lowercase().contains("thinking"));
+            assert!(
+                name.contains("thinking") || summary.contains("thinking") || alias_match,
+                "filtered item '{}' should match query first word 'thinking'",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn query_trailing_space_shows_all() {
+        // 输入 `/thinking `(命令名后带空格)时 query 为 "thinking ",
+        // 应仍按 "thinking" 匹配而非清空列表。
+        let mut menu = SlashMenu::new();
+        menu.set_query("thinking ");
+        let filtered = menu.filtered();
+        assert!(
+            filtered.iter().any(|s| s.name == "thinking"),
+            "query 'thinking ' should surface the 'thinking' command"
+        );
     }
 
     #[test]
