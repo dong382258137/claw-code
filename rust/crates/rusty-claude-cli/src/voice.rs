@@ -1,7 +1,11 @@
 //! 语音输入(本地离线语音转文字)。
 //!
-//! `/voice [seconds]` 与 `/listen [seconds]` 的实现:
-//! 1. 用系统 ffmpeg 录制麦克风 → 16kHz 单声道 WAV
+//! 两种入口共用同一套前置检查与转写管线:
+//! - `/voice [seconds]` 与 `/listen [seconds]`:固定时长录音(默认 5 秒)。
+//! - TUI F4 拨动式录音:第一次按下开始,第二次按下结束(微信语音消息交互)。
+//!   见 `spawn_toggle_recorder` / `RecordingSession`。
+//!
+//! 流程:1. 用系统 ffmpeg 录制麦克风 → 16kHz 单声道 WAV
 //! 2. 调用本地 `local-asr` 技能(Qwen3-ASR via OpenVINO,可跑 NPU/GPU/CPU)
 //! 3. 识别文本通过 draft 槽投递给 TUI 主循环,自动填入输入框;
 //!    无 draft 槽(普通 REPL)时直接打印识别结果
@@ -9,8 +13,9 @@
 //! 全部推理在本机完成,不依赖云端。首次使用会经 `install-env.ps1` 创建
 //! Python 虚拟环境并下载模型(约 2GB),耗时较长,已给出超时与提示。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -223,6 +228,235 @@ fn record_audio(ffmpeg: &Path, device_name: &str, seconds: u64, out: &Path) -> R
         .rfind(|l| !l.trim().is_empty())
         .unwrap_or("未知错误");
     Err(format!("录音失败(设备可能被占用): {last}"))
+}
+
+/// 录音前置上下文:一次录音所需的环境(技能根、venv、ffmpeg、设备)。
+struct RecorderContext {
+    skill_root: PathBuf,
+    venv_py: PathBuf,
+    ffmpeg: PathBuf,
+    device: String,
+}
+
+/// 录音前的全部前置检查(模型就绪 / ffmpeg / 设备),固定时长与拨动式共用。
+///
+/// 先确认识别模型已下载,避免"录完才发现不能用";再定位 ffmpeg 与麦克风。
+fn prepare_recorder() -> Result<RecorderContext, String> {
+    let skill_root = find_asr_skill_root().ok_or_else(|| {
+        "找不到 local-asr 技能(请确认已安装 claw 附带技能,或用 CLAW_ASR_SKILL_DIR 指定)".to_string()
+    })?;
+    let venv_py = asr_venv_python(&skill_root)?;
+    ensure_venv(&skill_root, &venv_py)?;
+    if !asr_model_ready(&skill_root)? {
+        let downloaded_mb = asr_partial_mb(&skill_root);
+        return Err(format!(
+            "识别模型尚未下载完成(首次使用约需 2GB,当前已下载约 {downloaded_mb} MB,后台持续下载中)。\
+             下载完成后再次按 F4(或输入 /voice)即可直接使用。"
+        ));
+    }
+    let ffmpeg = find_ffmpeg().ok_or_else(|| {
+        "未找到 ffmpeg,请安装并加入 PATH,或用环境变量 CLAW_FFMPEG 指定路径".to_string()
+    })?;
+    let devices = list_input_devices(&ffmpeg)?;
+    let device = pick_input_device(&devices)?;
+    Ok(RecorderContext {
+        skill_root,
+        venv_py,
+        ffmpeg,
+        device,
+    })
+}
+
+/// 可手动结束的录音会话(ffmpeg 子进程 + 输出 WAV)。
+///
+/// 与固定时长录音(`record_audio`)不同:启动时不设 `-t` 上限,由 `stop()`
+/// 向 ffmpeg stdin 写 `q` 优雅退出(正确写回 WAV 头),超时兜底 kill。
+/// stdout/stderr 走文件(避免管道缓冲死锁),stdin 走管道供停止信号。
+pub(crate) struct RecordingSession {
+    child: Child,
+    out: PathBuf,
+    /// ffmpeg stdout/stderr 日志文件,stop() 时清理,防止临时目录堆积。
+    log_file: PathBuf,
+}
+
+impl RecordingSession {
+    /// 启动录音(16kHz 单声道 PCM WAV),返回会话句柄。
+    ///
+    /// 启动后短暂等待 100ms 探测:若 ffmpeg 立即退出(如设备被占用),
+    /// 当场报错而不是等到停止时才发现。
+    pub(crate) fn start(ffmpeg: &Path, device_name: &str, out: &Path) -> Result<Self, String> {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dshow",
+            "-i",
+        ]);
+        cmd.arg(format!("audio={device_name}"));
+        cmd.args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"]);
+        cmd.arg(out);
+        let dir = temp_voice_dir()?;
+        let log_file = dir.join(format!("rec-{}.out", unique_suffix()));
+        let file = std::fs::File::create(&log_file)
+            .map_err(|e| format!("创建录音日志文件失败({log_file:?}): {e}"))?;
+        let mut child = cmd
+            .stdout(Stdio::from(
+                file.try_clone().map_err(|e| format!("克隆句柄失败: {e}"))?,
+            ))
+            .stderr(Stdio::from(file))
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("无法启动录音: {e}"))?;
+        // 短暂等待,探测 ffmpeg 是否立即失败(设备被占用等)。
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = std::fs::remove_file(&log_file);
+            return Err(format!("录音进程提前退出(状态 {status}),设备可能被占用"));
+        }
+        Ok(Self {
+            child,
+            out: out.to_path_buf(),
+            log_file,
+        })
+    }
+
+    /// 优雅结束录音:向 ffmpeg stdin 写 `q`,等待其退出并写回 WAV 头;
+    /// 10 秒未退出则 kill 兜底。
+    pub(crate) fn stop(mut self) -> Result<(), String> {
+        if let Some(mut stdin) = self.child.stdin.take() {
+            let _ = stdin.write_all(b"q");
+            let _ = stdin.flush();
+        } // drop stdin → ffmpeg 读到 EOF,自然退出
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        let _ = std::fs::remove_file(&self.log_file);
+                        return Err("停止录音超时(>10s),已强制终止".to_string());
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(e) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    let _ = std::fs::remove_file(&self.log_file);
+                    return Err(format!("等待录音结束失败: {e}"));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&self.log_file);
+        let size = self.out.metadata().map(|m| m.len()).unwrap_or(0);
+        if size > 0 {
+            Ok(())
+        } else {
+            Err("录音文件为空或未生成(设备可能被占用)".to_string())
+        }
+    }
+}
+
+/// 拨动式录音 worker → TUI 主循环的状态回传。
+#[derive(Debug)]
+pub(crate) enum VoiceCtlMsg {
+    /// 前置检查通过、ffmpeg 已开始采集(主循环进入 Recording 并开始计时)。
+    RecordingStarted,
+    /// 录音已结束,进入转写阶段(worker 主动上报,覆盖 60s 自动停止的场景;
+    /// 手动停止时主循环已先置 Transcribing,收到此消息为幂等)。
+    Transcribing,
+    /// 全部完成(转写文本已通过 draft 槽投递)。
+    Done,
+    /// 任一环节失败(前置检查 / 启动 / 停止 / 转写)。
+    Error(String),
+}
+
+/// 启动拨动式录音 worker,返回 (停止信号发送端, 状态接收端)。
+///
+/// 交互:主循环第一次收到 F4 时调用本函数,worker 做前置检查并开始录音,
+/// 随后阻塞等待停止信号;第二次 F4 时 `stop_tx.send(())` 让 worker 结束
+/// 录音并转写,结果经 draft 槽投递,状态经 `VoiceCtlMsg` 回传。
+///
+/// worker 全程不持有 `LiveCli`,录音期间主循环仍能响应按键(可再次按 F4
+/// 停止、Esc 退出等)。`progress` 为进度消息回调(TUI 下指向 OutputBuffer)。
+pub(crate) fn spawn_toggle_recorder(
+    progress: impl Fn(&str) + Send + 'static,
+) -> (mpsc::Sender<()>, mpsc::Receiver<VoiceCtlMsg>) {
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let (ctl_tx, ctl_rx) = mpsc::channel::<VoiceCtlMsg>();
+    std::thread::spawn(move || {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            toggle_recorder_main(&progress, &stop_rx, &ctl_tx)
+        }));
+        let msg = match result {
+            Ok(Ok(())) => VoiceCtlMsg::Done,
+            Ok(Err(e)) => VoiceCtlMsg::Error(e),
+            Err(payload) => VoiceCtlMsg::Error(
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown panic>".to_string()),
+            ),
+        };
+        let _ = ctl_tx.send(msg);
+    });
+    (stop_tx, ctl_rx)
+}
+
+/// 拨动式录音 worker 主体:前置检查 → 启动录音 → 等停止信号/硬上限 → 转写。
+fn toggle_recorder_main(
+    progress: &(dyn Fn(&str) + Send),
+    stop_rx: &mpsc::Receiver<()>,
+    ctl_tx: &mpsc::Sender<VoiceCtlMsg>,
+) -> Result<(), String> {
+    let ctx = prepare_recorder()?;
+    // 准备期间用户已再次按 F4(快速连按):直接放弃,不启动 ffmpeg。
+    if let Ok(()) = stop_rx.try_recv() {
+        return Err("录音已取消".to_string());
+    }
+    progress("🎤 开始录音,再按 F4 结束(最长 60 秒自动停止)");
+    let wav_dir = temp_voice_dir()?;
+    let wav = wav_dir.join(format!("voice-{}.wav", unique_suffix()));
+    let session = RecordingSession::start(&ctx.ffmpeg, &ctx.device, &wav)?;
+    let _ = ctl_tx.send(VoiceCtlMsg::RecordingStarted);
+
+    // 等待停止信号,或用硬上限兜底,防止忘按 F4 时无限录音。
+    let deadline = Instant::now() + Duration::from_secs(MAX_RECORD_SECONDS);
+    let mut manual_stop = false;
+    while Instant::now() < deadline {
+        match stop_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(()) => {
+                manual_stop = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // 主循环已退出,不再等待,直接结束录音。
+                manual_stop = true;
+                break;
+            }
+        }
+    }
+    if !manual_stop {
+        progress(&format!(
+            "已达最长录音时长({MAX_RECORD_SECONDS} 秒),自动结束"
+        ));
+    }
+    session.stop()?;
+    // 告知主循环进入转写阶段(自动停止时主循环还停在 Recording)。
+    let _ = ctl_tx.send(VoiceCtlMsg::Transcribing);
+    progress("录音结束,本地识别中…");
+    let text = transcribe(&ctx.skill_root, &wav, &ctx.venv_py)?;
+    let _ = std::fs::remove_file(&wav);
+    let display = display_text(&text);
+    emit_draft(display.clone());
+    progress(&format!("✅ 识别完成:{display}"));
+    Ok(())
 }
 
 /// 定位 local-asr 技能根目录:优先 `CLAW_ASR_SKILL_DIR`,其次常见安装位置。
@@ -568,33 +802,17 @@ pub(crate) fn run_voice_input(cli: &mut LiveCli, hint: Option<&str>) -> Result<(
         }
     };
 
-    // 先确认技能、虚拟环境与模型就绪,避免"录完才发现不能用"。
-    let skill_root = find_asr_skill_root().ok_or_else(|| {
-        "找不到 local-asr 技能(请确认已安装 claw 附带技能,或用 CLAW_ASR_SKILL_DIR 指定)".to_string()
-    })?;
-    let venv_py = asr_venv_python(&skill_root)?;
-    ensure_venv(&skill_root, &venv_py)?;
-    if !asr_model_ready(&skill_root)? {
-        let downloaded_mb = asr_partial_mb(&skill_root);
-        return Err(format!(
-            "识别模型尚未下载完成(首次使用约需 2GB,当前已下载约 {downloaded_mb} MB,后台持续下载中)。\
-             下载完成后再次按 F4(或输入 /voice)即可直接使用。"
-        ));
-    }
+    // 前置检查(模型就绪 / ffmpeg / 设备)与拨动式录音共用同一套逻辑。
+    let ctx = prepare_recorder()?;
 
     progress(&format!("🎤 开始录音 {seconds} 秒,请开始说话…"));
-    let ffmpeg = find_ffmpeg().ok_or_else(|| {
-        "未找到 ffmpeg,请安装并加入 PATH,或用环境变量 CLAW_FFMPEG 指定路径".to_string()
-    })?;
-    let devices = list_input_devices(&ffmpeg)?;
-    let device = pick_input_device(&devices)?;
     let wav_dir = temp_voice_dir()?;
     let wav = wav_dir.join(format!("voice-{}.wav", unique_suffix()));
 
-    record_audio(&ffmpeg, &device, seconds, &wav)?;
+    record_audio(&ctx.ffmpeg, &ctx.device, seconds, &wav)?;
 
     progress("录音完成,本地识别中…");
-    let text = transcribe(&skill_root, &wav, &venv_py)?;
+    let text = transcribe(&ctx.skill_root, &wav, &ctx.venv_py)?;
     let _ = std::fs::remove_file(&wav);
 
     let display = display_text(&text);

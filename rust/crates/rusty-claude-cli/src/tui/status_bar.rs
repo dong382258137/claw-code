@@ -63,6 +63,12 @@ pub(crate) struct StatusBarState {
     /// 上一轮完成时的 context token 数（用于 idle 状态显示，
     /// 避免 `cumulative.context_tokens()` 跨 turn 重复计数导致 100% 误报）。
     pub last_ctx: u128,
+    /// 语音录音进行中（底栏显示计时，F4 拨动式录音）。
+    pub voice_recording: bool,
+    /// 语音转写进行中（底栏显示"识别中"）。
+    pub voice_transcribing: bool,
+    /// 语音录音已持续毫秒数（仅 voice_recording 时更新，秒级重绘）。
+    pub voice_elapsed_ms: u64,
 }
 
 impl StatusBarState {
@@ -346,6 +352,29 @@ impl<'a> Widget for StatusBar<'a> {
             ]);
         }
 
+        // P4.75: 语音录音 / 转写状态（F4 拨动式录音）
+        if self.state.voice_transcribing {
+            let style_voice = Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled("🎤 识别中…", style_voice),
+            ]);
+        } else if self.state.voice_recording {
+            let style_voice = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+            sections.push(vec![
+                Span::styled(" │ ", style_dim),
+                Span::styled(
+                    format!(
+                        "🎤 录音中 {} · 再按 F4 结束",
+                        format_voice_elapsed(self.state.voice_elapsed_ms)
+                    ),
+                    style_voice,
+                ),
+            ]);
+        }
+
         // P5: Streaming timer
         if self.state.streaming {
             let elapsed_s = self.state.turn_elapsed_ms / 1000;
@@ -432,6 +461,12 @@ fn shorten_model_name(model: &str) -> String {
             model.to_string()
         }
     }
+}
+
+/// 录音计时格式化:`00:05` / `01:23`(分:秒,用于底栏录音状态)。
+fn format_voice_elapsed(ms: u64) -> String {
+    let secs = ms / 1000;
+    format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
 /// 根据模型名查询上下文窗口大小（tokens）。
@@ -711,5 +746,64 @@ mod tests {
         state.turn_usage.cache_creation_input_tokens = 0;
         // hit = 90, miss = 10 → 0.90
         assert!((state.cache_hit_rate().unwrap() - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn format_voice_elapsed_mmss() {
+        assert_eq!(format_voice_elapsed(0), "00:00");
+        assert_eq!(format_voice_elapsed(5_000), "00:05");
+        assert_eq!(format_voice_elapsed(59_999), "00:59");
+        assert_eq!(format_voice_elapsed(60_000), "01:00");
+        assert_eq!(format_voice_elapsed(83_000), "01:23");
+    }
+
+    #[test]
+    fn status_bar_shows_voice_recording_timer() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let state = StatusBarState {
+            model: "test-model".to_string(),
+            voice_recording: true,
+            voice_elapsed_ms: 8_000,
+            ..Default::default()
+        };
+        let widget = StatusBar { state: &state };
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        // ratatui Buffer 对宽字符(CJK)用空格占位补足两格,断言前去掉占位。
+        let content: String = buf
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        assert!(content.contains("录音中"), "voice timer: {content}");
+        assert!(content.contains("00:08"), "elapsed: {content}");
+        assert!(content.contains("F4"), "hint: {content}");
+    }
+
+    #[test]
+    fn status_bar_shows_voice_transcribing() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let state = StatusBarState {
+            model: "test-model".to_string(),
+            voice_transcribing: true,
+            ..Default::default()
+        };
+        let widget = StatusBar { state: &state };
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let content: String = buf
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        assert!(content.contains("识别中"), "transcribing: {content}");
     }
 }

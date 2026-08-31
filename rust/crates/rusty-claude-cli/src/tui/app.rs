@@ -807,6 +807,29 @@ fn run_event_loop(
     // scroll_offset 语义 = 距底部的行数，scroll_y = max_scroll - scroll_offset。
     let mut last_max_scroll: usize = 0;
 
+    // ── F4 拨动式语音录音状态机 ──
+    // Idle →(F4)→ Starting →(worker 回传)→ Recording{started} →(F4)→
+    // Transcribing →(worker 回传)→ Idle。worker 不持有 LiveCli,录音期间
+    // 主循环仍响应按键;状态经 voice_ctl_rx 回传,停止信号经 voice_stop_tx 发出。
+    // Copy:Instant 是 Copy,派生后 match 按值匹配不会移动状态变量。
+    #[derive(Copy, Clone)]
+    enum VoicePhase {
+        Idle,
+        /// worker 正在做前置检查/启动 ffmpeg(尚未开始采集)。
+        Starting,
+        /// ffmpeg 采集进行中,记录起始时刻供底栏秒级计时。
+        Recording {
+            started: Instant,
+        },
+        /// 已发停止信号,worker 正在结束录音并转写。
+        Transcribing,
+    }
+    let mut voice_phase = VoicePhase::Idle;
+    let mut voice_stop_tx: Option<mpsc::Sender<()>> = None;
+    let mut voice_ctl_rx: Option<mpsc::Receiver<crate::voice::VoiceCtlMsg>> = None;
+    // 秒级重绘跟踪:录音计时秒数变化时强制重绘(与 turn_elapsed 同一机制)。
+    let mut last_drawn_voice_s: u64 = u64::MAX;
+
     'main_loop: loop {
         // 处理 AskUserQuestion 请求：worker 线程通过 ask handler 投递的待回答问题。
         //
@@ -855,6 +878,53 @@ fn run_event_loop(
                 buf.push_entry(crate::tui::output_view::OutputEntry::text(format!(
                     "🎤 语音已识别并填入输入框(可编辑后回车发送): {display}\n\n"
                 )));
+            }
+        }
+
+        // 拨动式录音 worker 状态回传:录音开始 / 转写完成 / 失败。
+        // 驱动 VoicePhase 状态机推进;失败或断开时回到 Idle,防止状态悬挂。
+        if voice_ctl_rx.is_some() {
+            loop {
+                // try_recv 的借用随调用结束(NLL),分支内可安全置 None。
+                match voice_ctl_rx.as_ref().expect("checked").try_recv() {
+                    Ok(crate::voice::VoiceCtlMsg::RecordingStarted) => {
+                        voice_phase = VoicePhase::Recording {
+                            started: Instant::now(),
+                        };
+                        needs_redraw = true;
+                    }
+                    Ok(crate::voice::VoiceCtlMsg::Transcribing) => {
+                        // worker 已结束录音进入转写(自动停止场景),更新状态栏。
+                        voice_phase = VoicePhase::Transcribing;
+                        needs_redraw = true;
+                    }
+                    Ok(crate::voice::VoiceCtlMsg::Done) => {
+                        voice_phase = VoicePhase::Idle;
+                        voice_stop_tx = None;
+                        voice_ctl_rx = None;
+                        needs_redraw = true;
+                        break;
+                    }
+                    Ok(crate::voice::VoiceCtlMsg::Error(e)) => {
+                        if let Ok(mut buf) = output_view.shared_handle().lock() {
+                            buf.append(&format!("[voice] {e}\n\n"));
+                        }
+                        voice_phase = VoicePhase::Idle;
+                        voice_stop_tx = None;
+                        voice_ctl_rx = None;
+                        needs_redraw = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // worker 异常消亡(极少见),复位状态避免悬挂。
+                        voice_phase = VoicePhase::Idle;
+                        voice_stop_tx = None;
+                        voice_ctl_rx = None;
+                        needs_redraw = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -1045,22 +1115,55 @@ fn run_event_loop(
                     guard.turn_elapsed_ms = start.elapsed().as_millis() as u64;
                 }
             }
+            // 语音录音状态写入状态栏:Recording 时更新毫秒计时(秒级变化触发重绘),
+            // Transcribing/空闲时清空,保证底栏 "🎤 录音中 00:05" 实时跳动。
+            {
+                let mut guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
+                match voice_phase {
+                    VoicePhase::Recording { started } => {
+                        guard.voice_recording = true;
+                        guard.voice_transcribing = false;
+                        guard.voice_elapsed_ms = started.elapsed().as_millis() as u64;
+                    }
+                    VoicePhase::Transcribing => {
+                        guard.voice_recording = false;
+                        guard.voice_transcribing = true;
+                        guard.voice_elapsed_ms = 0;
+                    }
+                    _ => {
+                        guard.voice_recording = false;
+                        guard.voice_transcribing = false;
+                        guard.voice_elapsed_ms = 0;
+                    }
+                }
+            }
             let current_version = output_view.version();
-            let (current_elapsed_s, current_streaming) = {
+            let (current_elapsed_s, current_streaming, current_voice_s) = {
                 let guard = status_state.lock().unwrap_or_else(|e| e.into_inner());
-                (guard.turn_elapsed_ms / 1000, guard.streaming)
+                (
+                    guard.turn_elapsed_ms / 1000,
+                    guard.streaming,
+                    if guard.voice_recording {
+                        guard.voice_elapsed_ms / 1000
+                    } else {
+                        0
+                    },
+                )
             };
             let content_changed = current_version != last_drawn_version;
             let elapsed_changed = current_elapsed_s != last_drawn_elapsed_s;
             let streaming_flag_changed = current_streaming != last_drawn_streaming;
+            let voice_s_changed = current_voice_s != last_drawn_voice_s;
             let should_draw = needs_redraw
                 || content_changed
-                || (streaming && (elapsed_changed || streaming_flag_changed));
+                || (streaming && (elapsed_changed || streaming_flag_changed))
+                || voice_s_changed;
             if should_draw {
                 needs_redraw = false;
                 last_drawn_version = current_version;
                 last_drawn_elapsed_s = current_elapsed_s;
                 last_drawn_streaming = current_streaming;
+                last_drawn_voice_s = current_voice_s;
                 terminal.draw(|f| {
             // 调试 overlay FPS 更新(EMA):必须在 draw 闭包内,每帧更新。
             // debug_overlay 关闭时也更新(开启时能立即显示稳定值)。
@@ -1705,7 +1808,14 @@ fn run_event_loop(
                     }
                 }
                 match action {
-                    InputAction::Exit => break,
+                    InputAction::Exit => {
+                        // 退出前通知录音 worker 停止(ffmpeg 收到 'q' 后优雅退出),
+                        // 避免退出 TUI 后留下孤儿录音进程继续采集。
+                        if let Some(tx) = voice_stop_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        break;
+                    }
                     InputAction::InterruptTurn => {
                         // TUI 中断支持：Ctrl+C 在 busy 时取消当前 turn。
                         // abort signal 让 agent loop 在下一次迭代顶部退出。
@@ -1736,6 +1846,10 @@ fn run_event_loop(
                         // overlay modal so background typing is ignored.
                         // Exception: Exit must still break the loop.
                         if matches!(action, InputAction::Exit) {
+                            // 与 Exit 分支一致:退出前停止录音,防孤儿进程。
+                            if let Some(tx) = voice_stop_tx.take() {
+                                let _ = tx.send(());
+                            }
                             break;
                         }
                     }
@@ -1767,46 +1881,41 @@ fn run_event_loop(
                         };
                     }
                     InputAction::StartVoiceInput => {
-                        // F4 一键语音输入：离线录音转文字(与 `/voice` 等价)。
-                        // route_key 已做 busy 守卫,这里兜底 cli 存在性(线程崩溃后
-                        // cli_holder 可能为 None,此时忽略按键)。
-                        if let Some(mut cli) = cli_holder.take() {
-                            let output_handle = output_view.shared_handle();
-                            cli.set_tui_output(Arc::clone(&output_handle));
-                            let (tx, rx) = mpsc::channel();
-                            // 与 Submit 斜杠命令同一 worker 模式:catch_unwind 包裹,
-                            // panic 时仍通过 channel 返回 cli,避免 cli 永久丢失。
-                            std::thread::spawn(move || {
-                                use std::panic::{catch_unwind, AssertUnwindSafe};
-                                let mut cli = cli;
-                                let cli_ref = &mut cli;
-                                let result = catch_unwind(AssertUnwindSafe(move || {
-                                    execute_slash_command(
-                                        cli_ref,
-                                        commands::SlashCommand::Voice { mode: None },
-                                    )
-                                }));
-                                let turn_result = match result {
-                                    Ok(r) => TurnResult { cli, result: r },
-                                    Err(payload) => {
-                                        let msg = payload
-                                            .downcast_ref::<String>()
-                                            .cloned()
-                                            .or_else(|| {
-                                                payload
-                                                    .downcast_ref::<&str>()
-                                                    .map(|s| s.to_string())
-                                            })
-                                            .unwrap_or_else(|| "<unknown panic>".to_string());
-                                        TurnResult {
-                                            cli,
-                                            result: Err(format!("worker thread panicked: {msg}")),
+                        // F4 拨动式语音录音(微信语音消息交互):
+                        // 第一次按下 → 启动录音 worker;第二次按下 → 结束录音并转写。
+                        // route_key 已做 busy 守卫(真实 turn 运行中忽略 F4)。
+                        match voice_phase {
+                            VoicePhase::Idle => {
+                                let output_handle = output_view.shared_handle();
+                                let progress = {
+                                    let output_handle = Arc::clone(&output_handle);
+                                    move |msg: &str| {
+                                        if let Ok(mut buf) = output_handle.lock() {
+                                            buf.append(&format!("{msg}\n\n"));
                                         }
                                     }
                                 };
-                                let _ = tx.send(turn_result);
-                            });
-                            turn_rx = Some(rx);
+                                let (stop_tx, ctl_rx) =
+                                    crate::voice::spawn_toggle_recorder(progress);
+                                voice_stop_tx = Some(stop_tx);
+                                voice_ctl_rx = Some(ctl_rx);
+                                voice_phase = VoicePhase::Starting;
+                                needs_redraw = true;
+                            }
+                            VoicePhase::Starting | VoicePhase::Recording { started: _ } => {
+                                // 第二次按下:通知 worker 结束录音,转入转写阶段。
+                                if let Some(tx) = voice_stop_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                voice_phase = VoicePhase::Transcribing;
+                                if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                    buf.append("⏹ 录音已停止,正在本地识别…\n\n");
+                                }
+                                needs_redraw = true;
+                            }
+                            VoicePhase::Transcribing => {
+                                // 转写中忽略再次按下。
+                            }
                         }
                     }
                     InputAction::ScrollUp => {
@@ -2060,6 +2169,13 @@ fn run_event_loop(
                                 pending_paste_last_line = None;
                                 paste_diag_log("  pending_paste_lines 清空，重置 conhost_paste_intercepted=false, keep suppress_input=true");
                                 // @路径延后到 drain phase 填充
+                            }
+                        } else if !matches!(voice_phase, VoicePhase::Idle) {
+                            // 录音 / 转写期间禁止提交对话:回填输入框并提示。
+                            // (worker 不持有 cli,不阻止 F4 结束录音)
+                            input.restore_input(line.clone());
+                            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                                buf.append("[voice] 录音进行中,请先按 F4 结束录音再发送。\n\n");
                             }
                         } else if let Some(ask) = pending_ask.take() {
                             // AskUserQuestion 协作路径：worker 线程正在等待用户回答。
@@ -2762,8 +2878,8 @@ fn route_key(input: &mut InputLine, key: KeyEvent, help_visible: bool, busy: boo
         return InputAction::ToggleSidebar;
     }
 
-    // F4 → 一键语音输入(录音转文字,与 `/voice` 等价)。
-    // 与 E 键同一范式：busy(turn 运行中)时忽略,避免两个 worker 并发录音。
+    // F4 → 语音录音开关(第一次按下开始录音,第二次按下结束并转写)。
+    // busy(turn 运行中)时忽略,避免录音与对话 worker 并发。
     if let KeyCode::F(4) = key.code {
         if !busy {
             return InputAction::StartVoiceInput;
@@ -3056,8 +3172,14 @@ fn render_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         ("PgUp / PgDn", "滚动输出视图 上 / 下 一屏"),
         ("/", "打开斜杠命令菜单（模糊过滤）"),
         ("F2 / Ctrl+B", "打开/关闭右侧侧栏（默认隐藏，查看工具状态）"),
-        ("F4", "一键语音输入（录音→本地识别→填入输入框）"),
-        ("/voice / /listen", "语音输入（可带秒数，如 /voice 10）"),
+        (
+            "F4",
+            "语音录音开关（按一次开始/再按结束，识别后填入输入框）",
+        ),
+        (
+            "/voice / /listen",
+            "固定时长语音输入（可带秒数，如 /voice 10）",
+        ),
         ("Alt+Up / Alt+Down", "滚动侧栏工具历史（看更早 / 回最新）"),
         ("Ctrl+T", "折叠 / 展开最近一个工具卡片"),
         ("鼠标左键", "点击工具卡片切换折叠 / 展开"),
