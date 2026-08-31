@@ -36,6 +36,20 @@
     (injected_at_ms 拨到 30 分钟前)
 - **实机验证**:部署后新会话首轮命中率 92.6%(read=25,984 / creation=2,091)
 
+### 侦察护栏:单会话任务跟踪文档强制落盘(2026-08-31 新增)
+- **动机**:长程任务(如"3类买卖点→自动交易跑通")在无计划自主执行中,模型会
+  "侦察过度" —— 反复读文件不建计划、不落盘,成果只存在于易失上下文,压缩即丢。
+- **机制**(conversation.rs 工具循环迭代顶部):
+  - 统计本会话侦察类工具(read_file/grep_search/glob_search)调用数
+  - 累计 ≥ 阈值(默认 8 次,`CLAW_SURVEY_GUARD_THRESHOLD` 可覆盖,4-100)且
+    单会话任务跟踪文档(`.claw/trackers/<session_id>.md`)未创建或近 120s 未更新
+    → 注入强制提醒:用 write_file 写 tracker(任务目标/已确认发现含文件与结论/
+    计划进度),并 create_plan 建立分阶段计划
+  - 每达阈值倍数(8/16/24…)督促一次,防重复刷屏
+- **效果**:"边调查边记录"从模型自觉变框架强制;tracker 与会话绑定、落盘持久,
+  上下文压缩不丢失;create_plan 强制建立里程碑,防侦察跑偏
+- 新增测试 `survey_guard_injects_tracker_reminder_at_threshold`
+
 ---
 
 ## 0. 前缀结构全景

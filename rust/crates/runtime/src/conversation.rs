@@ -97,6 +97,25 @@ fn microcompact_preserve_recent() -> usize {
         .unwrap_or(MICROCOMPACT_PRESERVE_RECENT)
 }
 
+/// 侦察护栏阈值:本会话内侦察类工具(read/grep/glob)调用累计达到此值时,
+/// 框架强制提醒模型把调查成果写入单会话任务跟踪文档并 create_plan。
+/// `CLAW_SURVEY_GUARD_THRESHOLD` 环境变量可覆盖(4-100),默认 8。
+const SURVEY_GUARD_THRESHOLD: usize = 8;
+/// 计入"侦察"的工具:纯只读查询(不产生代码/文档副作用)。
+const SURVEY_TOOLS: [&str; 3] = ["read_file", "grep_search", "glob_search"];
+/// 任务跟踪文档"近期更新"判定窗口(秒):tracker 在此窗口内被更新过则视为
+/// 活跃,不重复提醒;超过窗口且再次达到阈值倍数才重新督促。
+const TRACKER_UPDATE_WINDOW_SECS: i64 = 120;
+
+/// 读取侦察护栏阈值(env 可覆盖,越界/非法回退默认)。
+fn survey_guard_threshold() -> usize {
+    std::env::var("CLAW_SURVEY_GUARD_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| (4..=100).contains(&n))
+        .unwrap_or(SURVEY_GUARD_THRESHOLD)
+}
+
 /// P1:并行子任务最大并发数上限。
 ///
 /// 参考 Anthropic 多智能体研究系统(lead agent 并行 spawn 3-5 subagents)。
@@ -3063,6 +3082,51 @@ where
                     .push_message(ConversationMessage::user_text(warning));
             }
 
+            // 侦察护栏(2026-08-31):长程任务防侦察过度 + 强制调查成果落盘。
+            // 本会话侦察类工具(read/grep/glob)累计达到阈值(默认 8 次,
+            // CLAW_SURVEY_GUARD_THRESHOLD 可覆盖)且单会话任务跟踪文档
+            // (`.claw/trackers/<session_id>.md`)未创建或近期未更新 →
+            // 注入强制提醒:把已确认调查发现写入 tracker(含文件与结论),
+            // 并 create_plan 建立分阶段计划。每达阈值倍数注入一次(防重复)。
+            // 该文档与会话绑定、落盘持久,上下文压缩后不丢失 —— 把"边调查
+            // 边记录"从模型自觉变为框架强制,避免成果只存在于易失上下文中。
+            {
+                let threshold = survey_guard_threshold();
+                let survey_count = self.count_survey_tool_calls();
+                if survey_count >= threshold
+                    && survey_count.is_multiple_of(threshold)
+                    && !self.tracker_recently_updated()
+                {
+                    let tracker_path = self
+                        .workspace_root
+                        .as_ref()
+                        .map(|root| {
+                            root.join(".claw")
+                                .join("trackers")
+                                .join(format!("{}.md", self.session.session_id))
+                                .display()
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| {
+                            "<workspace>/.claw/trackers/<session_id>.md".to_string()
+                        });
+                    let hint = format!(
+                        "[runtime] 你已进行 {survey_count} 次代码侦察,但单会话任务跟踪 \
+                         文档尚未创建或近期未更新。请立即:\n\
+                         1. 用 write_file 创建/更新 `{tracker_path}`,记录:\n\
+                            - 任务目标\n\
+                            - 已确认的调查发现(每项含文件路径与结论)\n\
+                            - 计划步骤与当前进度\n\
+                         2. 调用 `create_plan` 建立分阶段执行计划,然后按计划执行。\n\
+                         跟踪文档与会话绑定、落盘持久,上下文压缩后不丢失;持续更新 \
+                         可防止重复调查同一区域。"
+                    );
+                    let _ = self
+                        .session
+                        .push_message(ConversationMessage::user_text(hint));
+                }
+            }
+
             // 硬上限:真正中止。
             if iterations > turn_hard_max {
                 // BUG-3 修复(升级):超限错误携带诊断上下文。
@@ -5406,6 +5470,47 @@ where
             .unwrap_or(false)
     }
 
+    /// 本会话累计的侦察类工具调用次数(read_file / grep_search / glob_search)。
+    /// 供侦察护栏判定"已调查多少",超过阈值强制落盘 + 建计划。
+    fn count_survey_tool_calls(&self) -> usize {
+        self.session
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter(|b| {
+                matches!(b, ContentBlock::ToolUse { name, .. }
+                    if SURVEY_TOOLS.contains(&name.as_str()))
+            })
+            .count()
+    }
+
+    /// 单会话任务跟踪文档(`.claw/trackers/<session_id>.md`)是否近期更新过
+    /// (TRACKER_UPDATE_WINDOW_SECS 内)。文件不存在或读取失败视为未更新;
+    /// 无 workspace_root 时返回 true(无处落盘,不督促)。
+    fn tracker_recently_updated(&self) -> bool {
+        let Some(root) = &self.workspace_root else {
+            return true;
+        };
+        let path = root
+            .join(".claw")
+            .join("trackers")
+            .join(format!("{}.md", self.session.session_id));
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return false;
+        };
+        let Ok(modified) = meta.modified() else {
+            return false;
+        };
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        else {
+            return false;
+        };
+        let Ok(mtime) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            return false;
+        };
+        now.as_secs() as i64 - (mtime.as_secs() as i64) < TRACKER_UPDATE_WINDOW_SECS
+    }
+
     /// 建议2(统一收口)— 渲染 messages 末尾的单条"冻结槽位块"。
     ///
     /// 按固定槽位顺序收集当前 turn 的易变运行时内容,交给
@@ -7724,7 +7829,7 @@ mod tests {
         StaticToolExecutor, SubagentContext, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
         MICROCOMPACT_PRESERVE_RECENT, RUNTIME_HINTS_HEADER, SESSION_SEARCH_TOOL_SPEC,
-        SOFT_MAX_ITERATIONS,
+        SOFT_MAX_ITERATIONS, SURVEY_GUARD_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
@@ -9829,6 +9934,103 @@ mod tests {
                 "A8: execution style leaked into message: {t}"
             );
         }
+    }
+
+    /// 侦察护栏(2026-08-31):会话侦察类工具累计达阈值且 tracker 未创建时,
+    /// 框架注入强制提醒(写单会话任务跟踪文档 + create_plan);tracker 近期
+    /// 更新过则不重复提醒。
+    #[test]
+    fn survey_guard_injects_tracker_reminder_at_threshold() {
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct SurveyApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for SurveyApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-survey-guard-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // 预置 SURVEY_GUARD_THRESHOLD 次侦察(read_file)到会话(已侦察 8 个文件,
+        // 未创建 tracker)。
+        let mut session = Session::new();
+        for i in 0..SURVEY_GUARD_THRESHOLD {
+            session
+                .push_message(ConversationMessage::assistant(vec![
+                    ContentBlock::ToolUse {
+                        id: format!("tool-{i}"),
+                        name: "read_file".to_string(),
+                        input: format!("file{i}.py"),
+                    },
+                ]))
+                .expect("push tool_use");
+            session
+                .push_message(ConversationMessage::tool_result(
+                    format!("tool-{i}"),
+                    "read_file",
+                    format!("内容 {i}"),
+                    false,
+                ))
+                .expect("push result");
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SurveyApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        runtime.run_turn("继续", None).expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let all_texts: Vec<String> = shots.iter().flat_map(|v| v.iter().cloned()).collect();
+        assert!(
+            all_texts
+                .iter()
+                .any(|t| t.contains("[runtime] 你已进行") && t.contains("trackers")),
+            "survey guard must inject tracker reminder after {SURVEY_GUARD_THRESHOLD} surveys, got: {all_texts:?}"
+        );
+        assert!(
+            all_texts.iter().any(|t| t.contains("create_plan")),
+            "reminder must ask for create_plan, got: {all_texts:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// Current Task 槽位来源验证(2026-08-31):有 active_plan 时,尾部冻结
