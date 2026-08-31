@@ -1653,9 +1653,8 @@ mod tests {
     use super::{
         collapse_blank_lines, describe_instruction_file, display_context_path,
         normalize_instruction_content, render_instruction_content, render_instruction_files,
-        render_mcp_catalog_section, truncate_instruction_content, ContextFile,
-        ModelFamilyIdentity, ProjectContext, SystemPromptBuilder, SystemPromptSplit,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_mcp_catalog_section, truncate_instruction_content, ContextFile, ModelFamilyIdentity,
+        ProjectContext, SystemPromptBuilder, SystemPromptSplit, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;

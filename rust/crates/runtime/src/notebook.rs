@@ -287,6 +287,32 @@ pub const STABLE_SECTION_TAGS: &[&str] = &["decisions", "evidence"];
 pub const VOLATILE_SECTION_TAGS: &[&str] =
     &["plan", "subagents", "attempted", "preferences", "key_files"];
 
+/// 会话级段:绑定单一会话,跨会话不注入。
+///
+/// 2026-08-31 实证:工作区级 NOTEBOOK 的 `<plan>` 全量注入旧会话的完成记录,
+/// 新会话每轮读到"上一任务已完成",模型反复自我定位"新任务"并可能误用旧结论。
+/// 这些段改为存会话级文件(`<session_id>-notebook.md`),新会话天然看不到
+/// 旧会话的 plan/subagents/attempted。
+pub const SESSION_SECTION_TAGS: &[&str] = &["plan", "subagents", "attempted"];
+
+/// 工作区级段:跨会话复用(用户偏好/关键文件/设计决策/实验证据)。
+pub const WORKSPACE_SECTION_TAGS: &[&str] = &["preferences", "key_files", "decisions", "evidence"];
+
+/// 会话级 NOTEBOOK 文件路径:会话目录 + session_id。
+///
+/// 会话目录由调用方解析(与 task_state / tracker 同构,
+/// 见 `crate::session::workspace_sessions_dir`)。
+#[must_use]
+pub fn session_notebook_path(sessions_dir: &Path, session_id: &str) -> PathBuf {
+    sessions_dir.join(format!("{session_id}-notebook.md"))
+}
+
+/// 会话级 NOTEBOOK 文件路径(解析会话目录失败返回 None,调用方静默跳过)。
+fn session_notebook_file(workspace_root: &Path, session_id: &str) -> Option<PathBuf> {
+    let sessions_dir = crate::session::workspace_sessions_dir(workspace_root).ok()?;
+    Some(session_notebook_path(&sessions_dir, session_id))
+}
+
 /// NOTEBOOK.md 的渲染头部,解释文档用途,引导 LLM 正确维护。
 pub const NOTEBOOK_HEADER: &str = "# NOTEBOOK — Structured Working Memory\n\
     \n\
@@ -327,12 +353,42 @@ impl Notebook {
     /// 文件存在但解析失败时返回 Err(避免静默丢失用户数据)。
     pub fn load(workspace_root: &Path) -> Result<Self, NotebookError> {
         let path = workspace_root.join(NOTEBOOK_FILENAME);
+        Self::load_from(&path)
+    }
+
+    /// 从指定路径加载 NOTEBOOK 文件(内部共用;文件不存在返回空 NOTEBOOK)。
+    fn load_from(path: &Path) -> Result<Self, NotebookError> {
         if !path.exists() {
             return Ok(Self::new());
         }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| NotebookError::Io(path.clone(), e.to_string()))?;
-        Self::parse(&content).map_err(|e| NotebookError::Parse(path, e))
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| NotebookError::Io(path.to_path_buf(), e.to_string()))?;
+        Self::parse(&content).map_err(|e| NotebookError::Parse(path.to_path_buf(), e))
+    }
+
+    /// 加载"合并版" NOTEBOOK:工作区文件(所有段) + 会话文件(会话级段覆盖)。
+    ///
+    /// 用于渲染/更新 —— 会话级段(plan/subagents/attempted)取当前会话文件,
+    /// 工作区级段(preferences/key_files/decisions/evidence)取工作区文件。
+    /// 会话文件不存在(新会话首次)时仅工作区内容;工作区文件可能仍残留
+    /// 旧会话的会话级段,由 [`Notebook::save_with_session`] 落盘时清理
+    /// (工作区文件只写工作区级段),源头消除旧任务污染。
+    pub fn load_with_session(
+        workspace_root: &Path,
+        session_id: &str,
+    ) -> Result<Self, NotebookError> {
+        let mut notebook = Self::load(workspace_root)?;
+        let Some(session_path) = session_notebook_file(workspace_root, session_id) else {
+            return Ok(notebook);
+        };
+        if let Ok(session_nb) = Self::load_from(&session_path) {
+            for (tag, content) in session_nb.sections {
+                if SESSION_SECTION_TAGS.contains(&tag.as_str()) {
+                    notebook.sections.insert(tag, content);
+                }
+            }
+        }
+        Ok(notebook)
     }
 
     /// 原子写入 NOTEBOOK.md 文件。
@@ -341,6 +397,44 @@ impl Notebook {
     /// 这样即使写入中途崩溃,原文件也保持完整。
     pub fn save(&self, workspace_root: &Path) -> Result<(), NotebookError> {
         let path = workspace_root.join(NOTEBOOK_FILENAME);
+        self.save_to(&path)
+    }
+
+    /// 保存(按段归属拆分):会话级段写会话文件,工作区级段写工作区文件。
+    ///
+    /// 工作区文件里旧的会话级段残留在此被清除(源头清理,防旧任务污染
+    /// 2026-08-31 实证);会话文件不存在时自动创建。任何单文件失败均返回
+    /// Err(调用方决定是否阻断)。
+    pub fn save_with_session(
+        &self,
+        workspace_root: &Path,
+        session_id: &str,
+    ) -> Result<(), NotebookError> {
+        let workspace_nb = Self {
+            sections: self
+                .sections
+                .iter()
+                .filter(|(tag, _)| WORKSPACE_SECTION_TAGS.contains(&tag.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+        workspace_nb.save(workspace_root)?;
+        if let Some(session_path) = session_notebook_file(workspace_root, session_id) {
+            let session_nb = Self {
+                sections: self
+                    .sections
+                    .iter()
+                    .filter(|(tag, _)| SESSION_SECTION_TAGS.contains(&tag.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            };
+            session_nb.save_to(&session_path)?;
+        }
+        Ok(())
+    }
+
+    /// 原子写入指定路径(内部共用)。
+    fn save_to(&self, path: &Path) -> Result<(), NotebookError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| NotebookError::Io(parent.to_path_buf(), e.to_string()))?;
@@ -361,8 +455,8 @@ impl Notebook {
             file.flush()
                 .map_err(|e| NotebookError::Io(tmp_path.clone(), e.to_string()))?;
         }
-        std::fs::rename(&tmp_path, &path)
-            .map_err(|e| NotebookError::Io(path.clone(), e.to_string()))?;
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| NotebookError::Io(path.to_path_buf(), e.to_string()))?;
         Ok(())
     }
 
@@ -630,11 +724,12 @@ pub const ATTEMPTED_MAX_CHARS: usize = 2048;
 /// - 失败静默:NOTEBOOK 读写失败返回 Err,由调用方吞掉(不阻塞主流程)
 pub fn append_attempt(
     workspace_root: &Path,
+    session_id: &str,
     tool_name: &str,
     tool_input: &str,
     output: &str,
 ) -> Result<(), NotebookError> {
-    let mut notebook = Notebook::load(workspace_root)?;
+    let mut notebook = Notebook::load_with_session(workspace_root, session_id)?;
     let line = format!(
         "- [tool] {tool_name} | input={} | failed: {}",
         truncate_for_attempt(tool_input, 80),
@@ -658,7 +753,7 @@ pub fn append_attempt(
             notebook.set_section("attempted", &trimmed);
         }
     }
-    notebook.save(workspace_root)
+    notebook.save_with_session(workspace_root, session_id)
 }
 
 /// 按字符数截断文本,超出时加省略号。
@@ -786,10 +881,19 @@ pub const NOTEBOOK_UPDATE_TOOL_SPEC: &str = r#"{
 /// 执行 `notebook_update` 工具调用。
 ///
 /// 调用方:`ConversationRuntime::execute_notebook_update` 内部拦截。
-/// 流程:解析 JSON 输入 → 加载 NOTEBOOK → 修改 → 原子写回 → 返回成功消息。
+/// 流程:解析 JSON 输入 → 加载 NOTEBOOK(合并版:工作区 + 当前会话)→ 修改
+/// → 按段归属原子写回(会话级段写会话文件,工作区级段写工作区文件)→
+/// 返回成功消息。
+///
+/// `session_id`:当前会话标识,决定会话级段(plan/subagents/attempted)
+/// 的存储位置 —— 新会话不会读到旧会话的这些段(2026-08-31 污染修复)。
 ///
 /// 返回值:面向 LLM 的可读消息(成功 / 失败 + 原因)。
-pub fn execute_notebook_update(workspace_root: &Path, input: &str) -> Result<String, String> {
+pub fn execute_notebook_update(
+    workspace_root: &Path,
+    session_id: &str,
+    input: &str,
+) -> Result<String, String> {
     let parsed: NotebookUpdateInput = serde_json::from_str(input)
         .map_err(|e| format!("invalid notebook_update input JSON: {e}"))?;
     // 验证 section 名
@@ -799,9 +903,9 @@ pub fn execute_notebook_update(workspace_root: &Path, input: &str) -> Result<Str
             parsed.section, SECTION_TAGS
         ));
     }
-    // 加载现有 NOTEBOOK
-    let mut notebook =
-        Notebook::load(workspace_root).map_err(|e| format!("failed to load notebook: {e}"))?;
+    // 加载现有 NOTEBOOK(合并版:工作区文件 + 当前会话文件)
+    let mut notebook = Notebook::load_with_session(workspace_root, session_id)
+        .map_err(|e| format!("failed to load notebook: {e}"))?;
     // 备份兜底:decisions 段即将被修改(set 覆盖 / append 追加后去重都会缩减
     // 旧段),被合并/剔除的独特决策细节可能丢失。先把当前旧段完整归档到
     // `.claw/decisions_archive.jsonl`,AI 需要细节时可 read 找回。
@@ -831,9 +935,9 @@ pub fn execute_notebook_update(workspace_root: &Path, input: &str) -> Result<Str
             notebook.set_section("decisions", &deduped);
         }
     }
-    // 原子写回
+    // 原子写回(按段归属拆分)
     notebook
-        .save(workspace_root)
+        .save_with_session(workspace_root, session_id)
         .map_err(|e| format!("failed to save notebook: {e}"))?;
     Ok(format!(
         "NOTEBOOK.md updated: section '{}' {} ({} chars total).",
@@ -1094,30 +1198,32 @@ mod tests {
     #[test]
     fn execute_notebook_update_set_mode_works() {
         let dir = temp_workspace();
+        let session = "test-session";
         let input = serde_json::json!({
             "mode": "set",
             "section": "plan",
             "content": "实施 NOTEBOOK 模块"
         })
         .to_string();
-        let result = execute_notebook_update(dir.path(), &input);
+        let result = execute_notebook_update(dir.path(), session, &input);
         assert!(result.is_ok(), "execute should succeed: {:?}", result);
-        // 验证写入
-        let loaded = Notebook::load(dir.path()).unwrap();
+        // 验证写入(plan 为会话级段,从会话文件读回)
+        let loaded = Notebook::load_with_session(dir.path(), session).unwrap();
         assert_eq!(loaded.get_section("plan"), Some("实施 NOTEBOOK 模块"));
     }
 
     #[test]
     fn execute_notebook_update_append_mode_works() {
         let dir = temp_workspace();
-        // 先 set 一行
+        let session = "test-session";
+        // 先 append 一行
         let input1 = serde_json::json!({
             "mode": "append",
             "section": "subagents",
             "content": "subagent-1: task A | status=completed"
         })
         .to_string();
-        execute_notebook_update(dir.path(), &input1).unwrap();
+        execute_notebook_update(dir.path(), session, &input1).unwrap();
         // 再 append 一行
         let input2 = serde_json::json!({
             "mode": "append",
@@ -1125,9 +1231,9 @@ mod tests {
             "content": "subagent-2: task B | status=running"
         })
         .to_string();
-        execute_notebook_update(dir.path(), &input2).unwrap();
-        // 验证两行都在
-        let loaded = Notebook::load(dir.path()).unwrap();
+        execute_notebook_update(dir.path(), session, &input2).unwrap();
+        // 验证两行都在(subagents 为会话级段,从会话文件读回)
+        let loaded = Notebook::load_with_session(dir.path(), session).unwrap();
         let content = loaded.get_section("subagents").unwrap();
         assert!(content.contains("subagent-1"));
         assert!(content.contains("subagent-2"));
@@ -1142,7 +1248,7 @@ mod tests {
             "content": "test"
         })
         .to_string();
-        let result = execute_notebook_update(dir.path(), &input);
+        let result = execute_notebook_update(dir.path(), "test-session", &input);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("invalid section"));
@@ -1157,7 +1263,7 @@ mod tests {
             "content": "test"
         })
         .to_string();
-        let result = execute_notebook_update(dir.path(), &input);
+        let result = execute_notebook_update(dir.path(), "test-session", &input);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("invalid mode"));
@@ -1166,8 +1272,62 @@ mod tests {
     #[test]
     fn execute_notebook_update_rejects_malformed_json() {
         let dir = temp_workspace();
-        let result = execute_notebook_update(dir.path(), "not valid json");
+        let result = execute_notebook_update(dir.path(), "test-session", "not valid json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_scoped_sections_isolated_between_sessions() {
+        let dir = temp_workspace();
+        let s1 = "session-aaa";
+        let s2 = "session-bbb";
+        // 会话1 写入 plan(subagents/attempted 属会话级段)
+        let mut nb1 = Notebook::new();
+        nb1.set_section("plan", "会话1的计划");
+        nb1.set_section("decisions", "跨会话决策");
+        nb1.save_with_session(dir.path(), s1).expect("save s1");
+        // 会话2 加载 → 不应看到会话1的 plan;但应看到工作区级 decisions
+        let nb2 = Notebook::load_with_session(dir.path(), s2).expect("load s2");
+        assert_eq!(
+            nb2.get_section("plan"),
+            None,
+            "新会话不得看到旧会话的 plan(2026-08-31 污染修复)"
+        );
+        assert_eq!(nb2.get_section("decisions"), Some("跨会话决策"));
+        // 会话1 自己加载 → 能看到自己的 plan
+        let nb1_reload = Notebook::load_with_session(dir.path(), s1).expect("load s1");
+        assert_eq!(nb1_reload.get_section("plan"), Some("会话1的计划"));
+        // 工作区文件不含会话级段(源头上不残留)
+        let workspace = Notebook::load(dir.path()).expect("load workspace");
+        assert_eq!(workspace.get_section("plan"), None);
+        assert_eq!(workspace.get_section("decisions"), Some("跨会话决策"));
+    }
+
+    #[test]
+    fn session_save_cleans_workspace_residual_volatile_sections() {
+        let dir = temp_workspace();
+        let session = "test-session";
+        // 旧版本工作区 NOTEBOOK 残留 plan(旧会话内容),save_with_session 应清理
+        let mut legacy = Notebook::new();
+        legacy.set_section("plan", "旧会话的残留计划");
+        legacy.set_section("preferences", "跨会话用户偏好");
+        legacy.save(dir.path()).expect("save legacy");
+        // 新会话写入(仅工作区级段写回工作区文件)
+        let mut nb = Notebook::new();
+        nb.set_section("preferences", "更新后的偏好");
+        nb.save_with_session(dir.path(), session).expect("save");
+        // 工作区文件:旧 plan 残留被清理,preferences 保留新值
+        let workspace = Notebook::load(dir.path()).expect("load workspace");
+        assert_eq!(
+            workspace.get_section("plan"),
+            None,
+            "旧会话 plan 残留必须被清理"
+        );
+        assert_eq!(
+            workspace.get_section("preferences"),
+            Some("更新后的偏好"),
+            "工作区级段跨会话保留"
+        );
     }
 
     #[test]
@@ -1274,9 +1434,12 @@ mod tests {
     #[test]
     fn append_attempt_records_and_dedups() {
         let dir = temp_workspace();
-        append_attempt(dir.path(), "Bash", "netstat -an", "no output").expect("append");
-        append_attempt(dir.path(), "Bash", "netstat -an", "no output").expect("append again");
-        let nb = Notebook::load(dir.path()).expect("load");
+        let session = "test-session";
+        append_attempt(dir.path(), session, "Bash", "netstat -an", "no output").expect("append");
+        append_attempt(dir.path(), session, "Bash", "netstat -an", "no output")
+            .expect("append again");
+        // attempted 为会话级段,从会话文件读回
+        let nb = Notebook::load_with_session(dir.path(), session).expect("load");
         let sec = nb
             .get_section("attempted")
             .expect("attempted section exists");
@@ -1287,10 +1450,12 @@ mod tests {
     #[test]
     fn append_attempt_caps_section_size() {
         let dir = temp_workspace();
+        let session = "test-session";
         for i in 0..100 {
-            append_attempt(dir.path(), "Bash", &format!("cmd {i}"), "failed").expect("append");
+            append_attempt(dir.path(), session, "Bash", &format!("cmd {i}"), "failed")
+                .expect("append");
         }
-        let nb = Notebook::load(dir.path()).expect("load");
+        let nb = Notebook::load_with_session(dir.path(), session).expect("load");
         let sec = nb.get_section("attempted").expect("attempted");
         assert!(
             sec.chars().count() <= ATTEMPTED_MAX_CHARS,
@@ -1372,10 +1537,11 @@ bash
     #[test]
     fn notebook_update_decisions_auto_dedupes() {
         let dir = temp_workspace();
+        let session = "test-session";
         let input =
             r#"{"mode": "append", "section": "decisions", "content": "- [d1] 同一主题的重复思考"}"#;
-        execute_notebook_update(dir.path(), input).expect("append 1");
-        execute_notebook_update(dir.path(), input).expect("append 2");
+        execute_notebook_update(dir.path(), session, input).expect("append 1");
+        execute_notebook_update(dir.path(), session, input).expect("append 2");
         let nb = Notebook::load(dir.path()).expect("load");
         let sec = nb.get_section("decisions").expect("decisions");
         assert_eq!(

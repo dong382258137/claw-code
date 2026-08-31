@@ -2186,8 +2186,8 @@ mod tests {
 /// Per-worktree session isolation: returns a session directory namespaced
 /// by the workspace fingerprint of the given working directory.
 /// This prevents parallel `opencode serve` instances from colliding.
-/// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD.
-#[allow(dead_code)]
+/// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD,
+/// and by runtime modules (task_state / notebook) to place session-scoped files.
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
     let store = crate::session_control::SessionStore::from_cwd(cwd)
         .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))?;

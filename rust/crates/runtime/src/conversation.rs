@@ -3026,6 +3026,11 @@ where
             }
         }
 
+        // A'(任务锚点生命周期):请求构造前先从 user_input 提取 goal 到会话级
+        // task_state(goal-only)。create_plan 之前 Current Task 槽位即有任务
+        // 锚点,模型不再依赖 NOTEBOOK(旧任务)推断而反复自我定位"新任务"。
+        self.maybe_extract_goal_at_turn_start(&user_input);
+
         // Harness O(编排)层接入:Plan/Execute/Review 三段循环入口。
         // 详见 docs/harness-engineering-optimization-plan.md Step 2.1。
         //
@@ -3199,8 +3204,7 @@ where
                     let since_last = now - last_req;
                     let mut llm_triggered = false;
                     if last_req > 0
-                        && since_last
-                            > crate::fixed_memory::FIXED_MEMORY_COLD_THRESHOLD_MS
+                        && since_last > crate::fixed_memory::FIXED_MEMORY_COLD_THRESHOLD_MS
                     {
                         // 增量输入:自上次摘要点起的会话消息(排除注入的 fixed_memory
                         // 消息本身,防自循环)。marker 越界(跨进程新会话 marker 无意义)
@@ -3233,8 +3237,13 @@ where
                             // 确认但简报未体现的结论以注脚追加到简报末尾。后续
                             // content / fingerprint / insert 全部使用校验后的文本
                             // (注脚可能被追加,指纹随之重算,保持三者一致)。
-                            let llm =
-                                crate::fixed_memory::cross_validate_with_task_state(&llm, root);
+                            // 2026-08-31 起 task_state 为会话级文件(见
+                            // `task_state_path`),校验只对照当前会话的发现。
+                            let llm = if let Some(ts_path) = self.task_state_path() {
+                                crate::fixed_memory::cross_validate_with_task_state(&llm, &ts_path)
+                            } else {
+                                llm
+                            };
                             // 新建 LLM 快照:指纹=LLM 文本,游标=当前消息数(摘要点)。
                             let snap = crate::fixed_memory::FixedMemorySnapshot {
                                 content: llm.clone(),
@@ -3260,7 +3269,9 @@ where
                         }
                     }
                     if !llm_triggered {
-                        let built = crate::fixed_memory::build_snapshot(root);
+                        let built = self.task_state_path().and_then(|ts_path| {
+                            crate::fixed_memory::build_snapshot(root, &ts_path)
+                        });
                         // A 修复:上一轮请求命中缓存(cache_read>0)视为"缓存仍热"——
                         // 即使已超固定 300s 计时也复用旧快照字节,不主动打断前缀。
                         let cache_hot = self.last_cache_hit();
@@ -3310,10 +3321,13 @@ where
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
-                    let built = crate::notebook::Notebook::load(root)
-                        .ok()
-                        .map(|nb| nb.render_stable_sections())
-                        .filter(|s| !s.trim().is_empty());
+                    let built = crate::notebook::Notebook::load_with_session(
+                        root,
+                        &self.session.session_id,
+                    )
+                    .ok()
+                    .map(|nb| nb.render_stable_sections())
+                    .filter(|s| !s.trim().is_empty());
                     let prev = crate::notebook::load_stable_snapshot(root);
                     let cache_hot = self.last_cache_hit();
                     let next =
@@ -4100,6 +4114,7 @@ where
                             if let Some(workspace_root) = &self.workspace_root {
                                 let _ = crate::notebook::append_attempt(
                                     workspace_root,
+                                    &self.session.session_id,
                                     &tool_name,
                                     &effective_input,
                                     &output,
@@ -5501,8 +5516,7 @@ where
         let Ok(modified) = meta.modified() else {
             return false;
         };
-        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        else {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             return false;
         };
         let Ok(mtime) = modified.duration_since(std::time::UNIX_EPOCH) else {
@@ -5532,10 +5546,13 @@ where
         // 文件时猜测根目录路径(NOTEBOOK.md 实际位于 .claw/ 下)而报
         // os error 2。加载失败时不阻塞 turn(静默跳过)。
         if let Some(root) = &self.workspace_root {
-            if let Some(prompt) = crate::notebook::Notebook::load(root)
-                .ok()
-                .map(|notebook| notebook.render_volatile_sections())
-                .filter(|prompt| !prompt.is_empty())
+            // 2026-08-31 起实时段(plan/subagents/attempted)存会话级文件,
+            // 新会话不再注入旧会话的实时段(旧任务污染修复)。
+            if let Some(prompt) =
+                crate::notebook::Notebook::load_with_session(root, &self.session.session_id)
+                    .ok()
+                    .map(|notebook| notebook.render_volatile_sections())
+                    .filter(|prompt| !prompt.is_empty())
             {
                 slots.push((
                     "Notebook(工作记忆)",
@@ -5565,12 +5582,19 @@ where
         }
 
         // 槽位 4:Current Task(会话内真实任务目标)。
-        // 来源:active_plan.task_summary(create_plan 创建的计划,与会话绑定)——
-        // 绝不读工作区级 fixed_memory/task_state 的"当前目标"(跨会话残留,
-        // 会把旧任务目标注入新会话,2026-08-31 实证污染)。无 plan 时不注入。
+        // 来源:优先 active_plan.task_summary(create_plan 建立的计划,最精确);
+        // 兜底 task_state.goal(会话级,turn 开头从首条 user 消息提取)——
+        // 修复 create_plan 之前的"任务锚点空窗":模型不再从 NOTEBOOK(旧任务)
+        // 推断任务身份而反复自我定位"新任务"(2026-08-31 实证)。二者均为
+        // 会话级数据;工作区级 fixed_memory/task_state 的"当前目标"已由
+        // 会话级存储根治,不再有跨会话残留污染。
         if let Some(plan) = &self.active_plan {
             if !plan.task_summary.trim().is_empty() {
                 slots.push(("Current Task", plan.task_summary.clone()));
+            }
+        } else if let Some(goal) = self.task_state.as_ref().map(|ts| ts.goal.as_str()) {
+            if !goal.trim().is_empty() {
+                slots.push(("Current Task", goal.to_string()));
             }
         }
 
@@ -6311,7 +6335,11 @@ where
                     .to_string(),
             );
         };
-        let result = crate::notebook::execute_notebook_update(workspace_root, input);
+        let result = crate::notebook::execute_notebook_update(
+            workspace_root,
+            &self.session.session_id,
+            input,
+        );
         // P0-3:无论成功失败,只要 LLM 调用了 notebook_update,说明它已响应
         // 刷新提醒,清除 flag 避免重复提醒。失败时 LLM 会从返回消息看到错误
         // 并自行决定下一步,不需要继续提醒。
@@ -6613,7 +6641,7 @@ where
     /// 处理(避免 turn 内重复写盘)。Review 阶段在 plan 仍可用时调用,确保
     /// AllPassed(active_plan 被清空)也能记录最终完成的子目标。
     fn sync_completed_subgoals_from_plan(&mut self, plan: &PlanArtifact) {
-        let Some(root) = self.workspace_root.clone() else {
+        let Some(path) = self.task_state_path() else {
             return;
         };
         let succeeded: Vec<String> = plan
@@ -6625,7 +6653,6 @@ where
         if succeeded.is_empty() {
             return;
         }
-        let path = root.join(".claw").join(crate::task_state::TASK_STATE_FILE);
         let mut state = self
             .task_state
             .clone()
@@ -7210,17 +7237,31 @@ where
         })
     }
 
+    /// 会话级 task_state 文件路径(`.claw/sessions/<hash>/<session_id>-task_state.json`)。
+    ///
+    /// 会话级隔离:goal/findings/completed_subgoals 绑定单一会话,新会话使用
+    /// 自己的文件,从根上消除"旧任务目标注入新会话"的污染(2026-08-31 实证:
+    /// 工作区级 task_state 跨会话残留导致 Current Task 注入错误目标)。
+    /// 路径解析失败(无工作区 / 会话目录不可用)返回 None,调用方静默跳过。
+    fn task_state_path(&self) -> Option<std::path::PathBuf> {
+        let root = self.workspace_root.as_ref()?;
+        let sessions_dir = crate::session::workspace_sessions_dir(root).ok()?;
+        Some(crate::task_state::session_task_state_path(
+            &sessions_dir,
+            &self.session.session_id,
+        ))
+    }
+
     /// 任务状态自动更新:从本 turn 提取 goal + findings,持久化到
-    /// `.claw/task_state.json`,并更新内存缓存。失败静默(不阻断主流程)。
+    /// 会话级 task_state 文件,并更新内存缓存。失败静默(不阻断主流程)。
     fn maybe_update_task_state(
         &mut self,
         user_input: &str,
         assistant_messages: &[ConversationMessage],
     ) {
-        let Some(root) = self.workspace_root.clone() else {
+        let Some(path) = self.task_state_path() else {
             return;
         };
-        let path = root.join(".claw").join(crate::task_state::TASK_STATE_FILE);
         let mut state = self
             .task_state
             .clone()
@@ -7244,6 +7285,29 @@ where
         self.task_state = Some(state);
     }
 
+    /// A'(任务锚点生命周期):turn 开头从 user_input 提取 goal 到会话级
+    /// task_state(goal-only,findings 由 turn 结束的 [`maybe_update_task_state`]
+    /// 完整更新提取)。
+    ///
+    /// 修复"Current Task 空窗":create_plan 之前(通常前几轮 tool 迭代)
+    /// Current Task 槽位没有任务锚点,模型只能从 NOTEBOOK(旧任务)推断,
+    /// 反复自我定位"新任务"(2026-08-31 实证)。首轮请求构造前提取 goal,
+    /// 槽位即有值;与 turn 结束的完整更新互补(后者补全 findings)。
+    fn maybe_extract_goal_at_turn_start(&mut self, user_input: &str) {
+        let Some(path) = self.task_state_path() else {
+            return;
+        };
+        let mut state = self
+            .task_state
+            .clone()
+            .unwrap_or_else(|| crate::task_state::TaskState::load(&path).unwrap_or_default());
+        state.update_from_turn(user_input, &[]);
+        if let Err(e) = state.save(&path) {
+            eprintln!("[task_state] failed to persist goal at turn start: {e}");
+        }
+        self.task_state = Some(state);
+    }
+
     /// P1:压缩后从摘要解析任务状态(压缩摘要字段化)。
     ///
     /// 压缩时本来就要调一次 LLM 生成摘要(`CompactionSummarizerClient`),摘要
@@ -7256,10 +7320,9 @@ where
         if extract.active_goal.is_none() && extract.closed_tasks.is_empty() {
             return;
         }
-        let Some(root) = self.workspace_root.clone() else {
+        let Some(path) = self.task_state_path() else {
             return;
         };
-        let path = root.join(".claw").join(crate::task_state::TASK_STATE_FILE);
         let mut state = self
             .task_state
             .clone()
@@ -10087,12 +10150,6 @@ mod tests {
             last_summary_msg_index: 0,
         };
         crate::fixed_memory::save(&tmp, &polluted).expect("save polluted snapshot");
-        let ts = crate::task_state::TaskState {
-            goal: "把三类买卖点信号接入自动交易并回放调优".to_string(),
-            ..Default::default()
-        };
-        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -10104,6 +10161,14 @@ mod tests {
             vec!["system".to_string()],
         )
         .with_workspace_root(tmp.clone());
+        // 预置污染 task_state(会话级路径,与生产一致):旧任务目标仅作残留背景,
+        // Current Task 应取 active_plan.task_summary 而非它。
+        let ts = crate::task_state::TaskState {
+            goal: "把三类买卖点信号接入自动交易并回放调优".to_string(),
+            ..Default::default()
+        };
+        ts.save(&runtime.task_state_path().expect("ts path"))
+            .expect("save task_state");
         // 会话内创建计划:task_summary = 当前任务的真实目标(与会话绑定)。
         runtime.active_plan = Some(crate::planner::artifact::PlanArtifact::new(
             "把三类买卖点信号接入自动交易并回放调优",
@@ -10218,7 +10283,8 @@ mod tests {
             .run_turn("调查 BTC 30分钟笔绘制数量差异问题", None)
             .expect("turn1 should succeed");
 
-        let state_file = tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE);
+        // 2026-08-31 起 task_state 为会话级文件(会话目录下)
+        let state_file = runtime.task_state_path().expect("ts path");
         assert!(state_file.exists(), "task_state.json should be persisted");
         let loaded = crate::task_state::TaskState::load(&state_file).expect("load task_state");
         assert!(
@@ -10352,6 +10418,92 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
     }
+    /// A'(任务锚点生命周期):无 active_plan 时,Current Task 兜底注入会话级
+    /// task_state.goal(turn 开头从首条 user 消息提取)—— create_plan 之前
+    /// 模型即有任务锚点,不再依赖 NOTEBOOK(旧任务)推断而反复自我定位"新任务"。
+    #[test]
+    fn current_task_falls_back_to_session_goal_without_plan() {
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        struct CapApi {
+            captured: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        impl ApiClient for CapApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let texts: Vec<String> = request
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        m.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect();
+                self.captured.lock().expect("lock").push(texts);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-current-task-goal-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CapApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tmp.clone());
+
+        // 无 active_plan:Current Task 应兜底 task_state.goal(首条 user 消息提取)
+        runtime
+            .run_turn("检查链路 BUG:find_exit_signal 级别匹配缺陷", None)
+            .expect("turn should succeed");
+
+        let shots = captured.lock().expect("lock");
+        let tail = shots
+            .first()
+            .expect("request captured")
+            .last()
+            .expect("tail message");
+        assert!(
+            tail.contains("Current Task"),
+            "tail must carry Current Task slot, got: {tail}"
+        );
+        assert!(
+            tail.contains("检查链路 BUG"),
+            "Current Task = first user message goal, got: {tail}"
+        );
+        // 会话级隔离:其他 session_id 的文件不存在(旧任务目标不跨会话残留)
+        let sessions_dir = crate::session::workspace_sessions_dir(&tmp).expect("sessions dir");
+        let other = crate::task_state::session_task_state_path(&sessions_dir, "other-session");
+        assert!(
+            !other.exists(),
+            "other session must not see this session's task_state"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// P1 回归:压缩摘要字段化 —— 摘要含 `[active_task]`/`[closed_tasks]` 段时,
     /// `apply_task_state_from_compaction` 解析并持久化 goal + closed_tasks。
     #[test]
@@ -10390,7 +10542,8 @@ mod tests {
              [closed_tasks]\n- 登录 401 修复: 6/6 PASS\n- auth 重构: 已收尾",
         );
 
-        let state_file = tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE);
+        // 2026-08-31 起 task_state 为会话级文件(会话目录下)
+        let state_file = runtime.task_state_path().expect("ts path");
         assert!(state_file.exists(), "task_state.json should be persisted");
         let loaded = crate::task_state::TaskState::load(&state_file).expect("load task_state");
         assert_eq!(
@@ -10451,15 +10604,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
-        // 首轮前手工落盘任务状态(goal + findings),确保固定记忆有内容可建
-        let ts = crate::task_state::TaskState {
-            goal: "重构 auth 模块,兼容旧 Session 格式".to_string(),
-            findings: vec!["关键结论:拆分 token 校验".to_string()],
-            ..Default::default()
-        };
-        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
-
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             FmApi {
@@ -10497,11 +10641,13 @@ mod tests {
             "C1: goal must be moved out of prefix head, got: {head}"
         );
         let tail = texts.last().expect("tail message");
-        // Current Task 改由 active_plan 提供;本测试无 plan → 尾部不再注入
-        // 工作区快照的"当前目标"(旧任务目标残留,2026-08-31 实证污染)。
+        // Current Task 优先 active_plan.task_summary;本测试无 plan → 兜底
+        // 会话级 task_state.goal(turn 开头从 user_input 提取)。标题为英文
+        // "Current Task",不出现"当前目标"字样 —— 前缀快照的"当前目标"
+        // (旧任务残留)已彻底移除(2026-08-31 实证污染修复)。
         assert!(
             !tail.contains("当前目标"),
-            "no active_plan → current task must NOT come from workspace snapshot, got: {tail}"
+            "prefix snapshot must not carry 当前目标, got: {tail}"
         );
         let user_pos = texts
             .iter()
@@ -10560,14 +10706,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
-        let ts = crate::task_state::TaskState {
-            goal: "修复登录 401".to_string(),
-            findings: vec!["根因:缓存失效".to_string()],
-            ..Default::default()
-        };
-        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
-
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             FmApi {
@@ -10578,6 +10716,16 @@ mod tests {
             vec!["system".to_string()],
         )
         .with_workspace_root(tmp.clone());
+
+        // 预置会话级 task_state(与生产路径一致):user_input "第一轮" 短于
+        // MIN_GOAL_INPUT_CHARS → turn 开头 goal 提取不覆盖,预置值保留。
+        let ts = crate::task_state::TaskState {
+            goal: "修复登录 401".to_string(),
+            findings: vec!["根因:缓存失效".to_string()],
+            ..Default::default()
+        };
+        ts.save(&runtime.task_state_path().expect("ts path"))
+            .expect("save task_state");
 
         runtime
             .run_turn("第一轮", None)
@@ -10801,15 +10949,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
-        // 首轮前手工落盘任务状态,确保 turn1 即有固定记忆可注入
-        let ts = crate::task_state::TaskState {
-            goal: "重构 auth 模块,兼容旧 Session 格式".to_string(),
-            findings: vec!["关键结论:拆分 token 校验".to_string()],
-            ..Default::default()
-        };
-        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
-
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             MultiTurnFmApi {
@@ -10834,17 +10973,15 @@ mod tests {
                 head.contains("# 固定记忆") && head.contains("验证指引"),
                 "turn1 head must be fixed-memory brief: {head}"
             );
-            // 当前目标从前缀剥离后不再注入(Current Task 由 active_plan 提供,
-            // 本测试无 plan → 不注入;无其他槽位内容时尾部也无冻结块)。
+            // 当前目标从前缀剥离后不再注入(Current Task 由 active_plan 或
+            // 会话级 task_state.goal 提供,标题为英文,不含"当前目标"字样)。
             assert!(
                 !head.contains("当前目标"),
                 "goal must be moved out of prefix head: {head}"
             );
             assert!(
-                texts
-                    .last()
-                    .is_some_and(|t| !t.contains("当前目标")),
-                "no active_plan → current task must NOT come from workspace snapshot, last={:?}",
+                texts.last().is_some_and(|t| !t.contains("当前目标")),
+                "tail must not carry workspace snapshot's 当前目标, last={:?}",
                 texts.last()
             );
             let user_pos = texts
@@ -10920,10 +11057,9 @@ mod tests {
             assert_ne!(head, &shots[0][0], "cold window must rebuild head bytes");
             // 冷窗重建后,turn3 产出的 finding 应经规则通道进入磁盘 task_state
             // (task_state 独立于 fixed_memory,不因 LLM 简报路径而丢失)。
-            let ts_after = crate::task_state::TaskState::load(
-                &tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE),
-            )
-            .expect("task_state persisted");
+            let ts_after =
+                crate::task_state::TaskState::load(&runtime.task_state_path().expect("ts path"))
+                    .expect("task_state persisted");
             assert!(
                 ts_after
                     .findings
@@ -11312,18 +11448,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
-        // 规则通道:task_state.findings —— 两条均不被 fake LLM 简报覆盖
-        let ts = crate::task_state::TaskState {
-            goal: "重构 auth 模块".to_string(),
-            findings: vec![
-                "关键结论:拆分 token 校验".to_string(),
-                "根因:缓存失效".to_string(),
-            ],
-            ..Default::default()
-        };
-        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
-
         // 预置磁盘快照:injected_at_ms 拨到保守冷启间隔之外,强制 LLM 路径触发
         let t0 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -11366,6 +11490,20 @@ mod tests {
             vec!["system".to_string()],
         )
         .with_workspace_root(tmp.clone());
+
+        // 规则通道:task_state.findings —— 两条均不被 fake LLM 简报覆盖
+        // (会话级路径,与生产一致;user_input "继续" < MIN_GOAL_INPUT_CHARS,
+        // turn 开头 goal 提取不覆盖预置值)
+        let ts = crate::task_state::TaskState {
+            goal: "重构 auth 模块".to_string(),
+            findings: vec![
+                "关键结论:拆分 token 校验".to_string(),
+                "根因:缓存失效".to_string(),
+            ],
+            ..Default::default()
+        };
+        ts.save(&runtime.task_state_path().expect("ts path"))
+            .expect("save task_state");
 
         runtime.run_turn("继续", None).expect("turn should succeed");
 
@@ -11464,15 +11602,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
-        // 写 task_state → 规则快照有内容可建(不依赖 LLM)
-        let ts = crate::task_state::TaskState {
-            goal: "修复登录 401".to_string(),
-            findings: vec!["根因:缓存失效".to_string()],
-            ..Default::default()
-        };
-        ts.save(&tmp.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
-
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             FmApi2 {
@@ -11483,6 +11612,16 @@ mod tests {
             vec!["system".to_string()],
         )
         .with_workspace_root(tmp.clone());
+
+        // 写会话级 task_state → 规则快照有内容可建(不依赖 LLM);
+        // user_input "继续" < MIN_GOAL_INPUT_CHARS → turn 开头提取不覆盖。
+        let ts = crate::task_state::TaskState {
+            goal: "修复登录 401".to_string(),
+            findings: vec!["根因:缓存失效".to_string()],
+            ..Default::default()
+        };
+        ts.save(&runtime.task_state_path().expect("ts path"))
+            .expect("save task_state");
 
         // 窗口内:距上次请求 10s(< 270s)→ 不触发 LLM,走规则 next_injection
         let now0 = SystemTime::now()

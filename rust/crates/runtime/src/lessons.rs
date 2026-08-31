@@ -72,7 +72,10 @@ fn is_lesson_like(line: &str) -> bool {
         return false;
     }
     let lower = t.to_ascii_lowercase();
-    if SUMMARY_RESIDUE_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+    if SUMMARY_RESIDUE_PREFIXES
+        .iter()
+        .any(|p| lower.starts_with(p))
+    {
         return false;
     }
     // 纯符号/标点行信息量不足,剔除。

@@ -19,7 +19,7 @@
 //! 规则式提取,零 LLM 成本。
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 任务目标的最大字符数(恒定体积,避免无限增长)。
@@ -30,6 +30,19 @@ pub const TASK_FINDING_MAX_CHARS: usize = 120;
 pub const TASK_FINDINGS_MAX: usize = 6;
 /// task_state 持久化文件名(位于 `.claw/` 下)。
 pub const TASK_STATE_FILE: &str = "task_state.json";
+
+/// 会话级 task_state 文件路径:会话目录 + session_id。
+///
+/// 会话级隔离:goal/findings/completed_subgoals 绑定单一会话,新会话使用
+/// 自己的文件,从根上消除"旧任务目标注入新会话"的污染(2026-08-31 实证:
+/// 工作区级 task_state 跨会话残留导致 Current Task 注入错误目标)。
+/// 会话目录由调用方解析(与 NOTEBOOK / tracker 同构,见
+/// `crate::session::workspace_sessions_dir`)。
+#[must_use]
+pub fn session_task_state_path(sessions_dir: &Path, session_id: &str) -> PathBuf {
+    sessions_dir.join(format!("{session_id}-task_state.json"))
+}
+
 /// 判定"用户换新任务"的 goal 前缀比较长度。
 const GOAL_PREFIX_COMPARE_CHARS: usize = 30;
 /// 用户输入短于此字符数时不视为新任务描述(如"继续"/"好"),保留旧 goal。
@@ -354,9 +367,7 @@ fn is_task_completion_like(t: &str) -> bool {
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         return false;
     }
-    !(trimmed.contains("应使用")
-        || trimmed.contains("不要 ")
-        || trimmed.contains("需先"))
+    !(trimmed.contains("应使用") || trimmed.contains("不要 ") || trimmed.contains("需先"))
 }
 
 /// 截取 `start_marker` 下一行起、`end_marker` 前的文本段。
@@ -553,10 +564,7 @@ mod tests {
             .closed_tasks
             .iter()
             .all(|t| !t.starts_with('[') && !t.contains("应使用")));
-        assert!(extract
-            .closed_tasks
-            .iter()
-            .any(|t| t.contains("登录 401")));
+        assert!(extract.closed_tasks.iter().any(|t| t.contains("登录 401")));
         assert!(extract
             .closed_tasks
             .iter()

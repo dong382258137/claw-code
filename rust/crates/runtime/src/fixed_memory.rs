@@ -163,7 +163,11 @@ pub fn split_stable_volatile(content: &str) -> (String, Option<String>) {
 
     let stable = stable.trim_end().to_string();
     let volatile = volatile.trim().to_string();
-    let volatile = if volatile.is_empty() { None } else { Some(volatile) };
+    let volatile = if volatile.is_empty() {
+        None
+    } else {
+        Some(volatile)
+    };
     (stable, volatile)
 }
 
@@ -185,11 +189,13 @@ fn is_heading(bare: &str, headings: &[&str]) -> bool {
 /// 历史教训 + 注脚(置信来源 + 定点验证指引)。总字符数超
 /// [`FIXED_MEMORY_MAX_CHARS`] 时按块从末尾截断(先丢 lessons、再丢已完成项尾部),
 /// 保留标题与注脚。
+///
+/// `task_state_path`:会话级 task_state 文件路径(调用方按会话解析,
+/// 见 `crate::task_state::session_task_state_path`),避免工作区级
+/// 残留旧会话目标/发现。
 #[must_use]
-pub fn build_snapshot(root: &Path) -> Option<String> {
-    let task_state = crate::task_state::TaskState::load(
-        &root.join(".claw").join(crate::task_state::TASK_STATE_FILE),
-    );
+pub fn build_snapshot(root: &Path, task_state_path: &Path) -> Option<String> {
+    let task_state = crate::task_state::TaskState::load(task_state_path);
     let lessons = crate::lessons::load_recent_lessons(root, crate::lessons::LESSONS_INJECT_MAX);
 
     let goal = task_state
@@ -424,8 +430,9 @@ pub fn maybe_llm_summary(
 /// 固定记忆简报,防止 LLM 编造未发生事项(LLM 声称已发生的 vs 规则实际提取的)。
 ///
 /// 逻辑:
-/// - 加载 `<root>/.claw/task_state.json`,无 task_state(或 findings 为空)则
-///   原样返回 `llm_brief`(无规则证据可对照,不标注)。
+/// - 加载 `task_state_path`(会话级 task_state,由调用方按会话解析),无
+///   task_state(或 findings 为空)则原样返回 `llm_brief`(无规则证据可对照,
+///   不标注)。
 /// - 对每条 finding,取「截断到 20 字符的子串」作关键词(避免整句匹配失败),
 ///   若 `llm_brief`(小写)不含该关键词(小写)→ 记为「规则确认但简报未体现」。
 /// - 存在未体现项时在 `llm_brief` 末尾追加一行注脚:
@@ -434,7 +441,7 @@ pub fn maybe_llm_summary(
 /// - 总字符数超 [`FIXED_MEMORY_MAX_CHARS`] 时截断注脚优先(保留简报主体,
 ///   注脚不够截则整体丢弃,不动简报正文)。
 #[must_use]
-pub fn cross_validate_with_task_state(llm_brief: &str, root: &Path) -> String {
+pub fn cross_validate_with_task_state(llm_brief: &str, task_state_path: &Path) -> String {
     /// finding 关键词长度:取截断到 20 字符的子串作匹配关键词。
     const KEYWORD_CHARS: usize = 20;
     /// 注脚中单条 finding 的最大字符数。
@@ -442,9 +449,7 @@ pub fn cross_validate_with_task_state(llm_brief: &str, root: &Path) -> String {
     /// 注脚最多列出的未体现项条数,超出加"等 N 条"。
     const FOOTER_MAX_ITEMS: usize = 3;
 
-    let task_state = crate::task_state::TaskState::load(
-        &root.join(".claw").join(crate::task_state::TASK_STATE_FILE),
-    );
+    let task_state = crate::task_state::TaskState::load(task_state_path);
     let Some(ts) = task_state else {
         return llm_brief.to_string();
     };
@@ -510,6 +515,11 @@ mod tests {
         (tmp.clone(), tmp)
     }
 
+    /// 测试辅助:工作区 task_state 文件路径(与生产路径同构,便于调用签名统一)。
+    fn ts_path(root: &Path) -> std::path::PathBuf {
+        root.join(".claw").join(crate::task_state::TASK_STATE_FILE)
+    }
+
     #[test]
     fn split_stable_volatile_partitions_llm_brief() {
         let content = "当前目标：为 3买/3卖 信号新增过滤层\n\n\
@@ -568,8 +578,7 @@ mod tests {
             closed_tasks: vec!["登录 401 修复: 6/6 PASS".to_string()],
             ..Default::default()
         };
-        ts.save(&root.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
+        ts.save(&ts_path(root)).expect("save task_state");
 
         crate::lessons::append_lessons(
             root,
@@ -583,7 +592,7 @@ mod tests {
         let (tmp, root) = temp_root("build");
         write_sample_state(&root);
 
-        let built = build_snapshot(&root).expect("should build");
+        let built = build_snapshot(&root, &ts_path(&root)).expect("should build");
         assert!(built.contains("固定记忆"), "header: {built}");
         assert!(built.contains("当前目标"), "goal line: {built}");
         assert!(built.contains("重构 auth 模块"), "goal content: {built}");
@@ -608,13 +617,13 @@ mod tests {
     fn build_snapshot_empty_state_returns_none() {
         let (tmp, root) = temp_root("empty");
         // 无任何落盘数据
-        assert!(build_snapshot(&root).is_none());
+        assert!(build_snapshot(&root, &ts_path(&root)).is_none());
 
         // 落盘了但 task_state 为空且无 lessons
         crate::task_state::TaskState::default()
-            .save(&root.join(".claw").join(crate::task_state::TASK_STATE_FILE))
+            .save(&ts_path(&root))
             .expect("save empty task_state");
-        assert!(build_snapshot(&root).is_none());
+        assert!(build_snapshot(&root, &ts_path(&root)).is_none());
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -630,8 +639,7 @@ mod tests {
             closed_tasks: (0..6).map(|_| "收".repeat(120)).collect(),
             ..Default::default()
         };
-        ts.save(&root.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
+        ts.save(&ts_path(&root)).expect("save task_state");
         crate::lessons::append_lessons(
             &root,
             &(0..5)
@@ -640,7 +648,7 @@ mod tests {
         )
         .expect("append lessons");
 
-        let built = build_snapshot(&root).expect("should build");
+        let built = build_snapshot(&root, &ts_path(&root)).expect("should build");
         assert!(
             built.chars().count() <= FIXED_MEMORY_MAX_CHARS,
             "len={}",
@@ -976,8 +984,7 @@ mod tests {
             findings,
             ..Default::default()
         };
-        ts.save(&root.join(".claw").join(crate::task_state::TASK_STATE_FILE))
-            .expect("save task_state");
+        ts.save(&ts_path(root)).expect("save task_state");
     }
 
     #[test]
@@ -985,11 +992,17 @@ mod tests {
         let (tmp, root) = temp_root("xval-none");
         // 无 .claw/task_state.json → 无规则证据可对照,原样返回
         let brief = "# 固定记忆\n- 已完成项:\n  · 修复登录 401(auth.rs)";
-        assert_eq!(cross_validate_with_task_state(brief, &root), brief);
+        assert_eq!(
+            cross_validate_with_task_state(brief, &ts_path(&root)),
+            brief
+        );
 
         // findings 为空同样原样返回
         write_findings(&root, vec![]);
-        assert_eq!(cross_validate_with_task_state(brief, &root), brief);
+        assert_eq!(
+            cross_validate_with_task_state(brief, &ts_path(&root)),
+            brief
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1007,7 +1020,7 @@ mod tests {
         // 完整前缀才算已体现)
         let brief =
             "# 固定记忆\n- 已完成项:\n  · 关键结论:拆分 token 校验\n  · 根因:缓存失效 已定位";
-        let got = cross_validate_with_task_state(brief, &root);
+        let got = cross_validate_with_task_state(brief, &ts_path(&root));
         assert_eq!(got, brief, "findings 全覆盖 → 不应追加注脚: {got}");
         assert!(!got.contains("规则通道确认"), "{got}");
         std::fs::remove_dir_all(&tmp).ok();
@@ -1026,7 +1039,7 @@ mod tests {
         );
         // finding1 前 20 字符关键词完整出现在简报 → 已体现;finding2/3 未体现
         let brief = "# 固定记忆\n- 已完成项:\n  · 关键结论:拆分 token 校验";
-        let got = cross_validate_with_task_state(brief, &root);
+        let got = cross_validate_with_task_state(brief, &ts_path(&root));
         // 简报主体保留 + 注脚追加,只列未体现项
         assert!(got.starts_with(brief), "简报主体应保留在前: {got}");
         assert!(got.contains("规则通道确认但简报未体现"), "注脚标记: {got}");
@@ -1047,7 +1060,7 @@ mod tests {
         let findings = (0..5).map(|i| format!("关键结论:{i} 号修复")).collect();
         write_findings(&root, findings);
         let brief = "# 固定记忆\n- 已完成项:\n  · 无关内容";
-        let got = cross_validate_with_task_state(brief, &root);
+        let got = cross_validate_with_task_state(brief, &ts_path(&root));
         assert!(got.contains("等 5 条"), "超 3 条应带计数后缀: {got}");
         assert!(got.contains("0 号修复"), "前3条: {got}");
         assert!(got.contains("1 号修复"), "前3条: {got}");
@@ -1069,7 +1082,7 @@ mod tests {
         // 简报主体贴近上限:主体 1470 字符 + 注脚 ~58 字符必然超上限 → 注脚被截
         let brief = format!("# 固定记忆\n- 已完成项:\n  · {}", "主".repeat(1451));
         assert!(brief.chars().count() <= FIXED_MEMORY_MAX_CHARS);
-        let got = cross_validate_with_task_state(&brief, &root);
+        let got = cross_validate_with_task_state(&brief, &ts_path(&root));
         assert!(
             got.chars().count() <= FIXED_MEMORY_MAX_CHARS,
             "len={}",
@@ -1095,14 +1108,14 @@ mod tests {
             // 取 finding 尾部(第 25 字符起),不含前 20 字符关键词
             finding.chars().skip(25).collect::<String>()
         );
-        let got = cross_validate_with_task_state(&brief, &root);
+        let got = cross_validate_with_task_state(&brief, &ts_path(&root));
         assert!(
             got.contains("规则通道确认但简报未体现"),
             "缺少前 20 字符关键词应判未体现: {got}"
         );
         // 对照:简报含完整 finding 前 20 字符 → 判已体现,无注脚
         let brief_full = format!("# 固定记忆\n- 已完成项:\n  · {finding}");
-        let got_full = cross_validate_with_task_state(&brief_full, &root);
+        let got_full = cross_validate_with_task_state(&brief_full, &ts_path(&root));
         assert!(
             !got_full.contains("规则通道确认"),
             "含关键词应已体现: {got_full}"

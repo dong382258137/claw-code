@@ -1332,9 +1332,15 @@ mod tests {
     /// 启动写法应识别,普通命令不应误报。
     #[test]
     fn background_service_detection_patterns() {
-        assert!(super::is_background_service_command("python server.py > log 2>&1 &"));
-        assert!(super::is_background_service_command("python server.py >> log 2>&1 &"));
-        assert!(super::is_background_service_command("nohup server > log 2>&1 &"));
+        assert!(super::is_background_service_command(
+            "python server.py > log 2>&1 &"
+        ));
+        assert!(super::is_background_service_command(
+            "python server.py >> log 2>&1 &"
+        ));
+        assert!(super::is_background_service_command(
+            "nohup server > log 2>&1 &"
+        ));
         assert!(super::is_background_service_command(
             "cd /d/chanlunV2 && python -B -m chanlun_py.web.server > /tmp/ws.log 2>&1 & echo $!"
         ));
