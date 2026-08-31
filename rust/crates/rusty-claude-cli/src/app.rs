@@ -1032,6 +1032,22 @@ impl LiveCli {
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         runtime.set_tool_verbosity(self.output_verbosity);
+        // 推理状态同步：AnthropicRuntimeClient 每轮 turn 都会在
+        // prepare_turn_runtime 中重建(见 run_turn → replace_runtime 生命周期),
+        // 新 client 上 reasoning_effort / thinking_mode 均为默认值。
+        // /effort 与 /thinking 只写入了旧 client,若不显式注入,每轮请求都会
+        // 退化为模型默认(线上实测:--reasoning-effort low 与 --no-thinking
+        // 均未出现在请求体中,2026-09-01)。从 LiveCli 持有的旧 client 读取
+        // 并同步到本轮新建的 client。
+        {
+            let effort = self.reasoning_effort();
+            let thinking = self.thinking_mode();
+            if let Some(rt) = runtime.runtime.as_mut() {
+                let client = rt.api_client_mut();
+                client.set_reasoning_effort(effort);
+                client.set_thinking_mode(thinking);
+            }
+        }
         // Phase 2: if a status_emitter is attached (TUI mode), inject it
         // into the freshly-built AnthropicRuntimeClient so streaming events
         // drive the TUI's StatusBarState + OutputView in real time.
