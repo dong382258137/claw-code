@@ -1156,4 +1156,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn upgrade_command_is_not_stubbed_and_surfaceable() {
+        // 回归(2026-09-02):/upgrade 已实现(run_upgrade)却残留在 STUB_COMMANDS,
+        // 导致 TUI 菜单唤不出。从 stub 移除后,菜单应能模糊匹配到它。
+        assert!(
+            !STUB_COMMANDS.contains(&"upgrade"),
+            "/upgrade 已实现,不得再标记为 STUB"
+        );
+        let mut menu = SlashMenu::new();
+        menu.set_query("upgrade");
+        assert!(
+            menu.filtered().iter().any(|s| s.name == "upgrade"),
+            "菜单应能唤出 /upgrade"
+        );
+    }
 }

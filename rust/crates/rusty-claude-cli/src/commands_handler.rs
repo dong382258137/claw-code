@@ -1419,7 +1419,6 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "login",
     "logout",
     "vim",
-    "upgrade",
     "share",
     "feedback",
     "files",
