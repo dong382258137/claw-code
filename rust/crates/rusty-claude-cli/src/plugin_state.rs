@@ -1092,6 +1092,41 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["decision-log".to_string(), "memory".to_string()],
     });
+    // 双大脑架构:ask_brain — 管理脑 LLM 综合入口(批次 1)。
+    //
+    // 执行脑遇到需跨库推理的问题时调用:运行时确定性检索(decision_log /
+    // 会话历史 / harness 规则)→ spawn ReadOnly 管理脑会话综合 → 带来源答案。
+    // 管理脑只提议不直改;检索为空 / brain 不可用 / poor_mode 时降级返回
+    // 检索片段,不阻塞执行脑。与 search_past_decisions(零 LLM 查字典)互补:
+    // 查字典用 search_past_decisions,求综合用 ask_brain。
+    // 执行由 ConversationRuntime::run_turn 拦截,路由到 execute_ask_brain_async。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "ask_brain".to_string(),
+        description: Some(
+            "Ask the management brain (管理脑) a question that needs cross-referencing reasoning over the knowledge base (past decisions, evolution rules, session history). Deterministically retrieves relevant knowledge snippets and spawns a read-only brain session to synthesize an answer WITH source citations. Use this when you need 'what has worked before / why is my approach wrong / how did we solve X' — i.e. synthesis over multiple knowledge sources. For a plain keyword lookup (does this exact error exist?) prefer search_past_decisions / session_search which cost zero LLM tokens. The brain only advises — it cannot modify code; you decide whether to act on its answer, and the result of your action (compile/test) is the final judge.".to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The question to ask the management brain, e.g. 'my cargo build fails with E0433 — what similar tool failures have we fixed before and what was the verified fix?'."
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional current-task context (what you are doing, what failed, exact error text). Helps the brain tailor its synthesis."
+                },
+                "k": {
+                    "type": "integer",
+                    "description": "Number of top-k snippets to retrieve per knowledge source (default: 5)."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["dual-brain".to_string(), "knowledge".to_string(), "memory".to_string()],
+    });
     // Epic 4 延续:bus_list / bus_send / bus_watch — Session Bus 统一路由层工具。
     // 让 AI 自主调用多会话总线能力(查看 peer / 发消息 / 订阅消息流)。
     // 执行由 ConversationRuntime::run_turn 拦截,路由到 execute_bus_list /

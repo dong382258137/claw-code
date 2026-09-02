@@ -482,6 +482,38 @@ pub const SET_CURRENT_TASK_TOOL_SPEC: &str = r#"{
     }
 }"#;
 
+/// 双大脑架构:ask_brain 工具(管理脑 LLM 综合入口)。
+///
+/// 执行脑遇到**需要跨库推理**的问题(不是查字典)时调用此工具。执行脑只
+/// 提交问题,由确定性检索器拉取知识片段(decision_log / harness 规则 /
+/// 会话历史),spawn 一个 ReadOnly「管理脑会话」综合后返回**带来源的答案**。
+/// 管理脑只提议不直改(brain 会话无写工具);检索为空或 brain 会话失败时
+/// 降级返回原始检索片段,不阻塞执行脑。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const ASK_BRAIN_TOOL_SPEC: &str = r#"{
+    "name": "ask_brain",
+    "description": "Ask the management brain (管理脑) a question that needs cross-referencing reasoning over the knowledge base (past decisions, evolution rules, session history). Deterministically retrieves relevant knowledge snippets and spawns a read-only brain session to synthesize an answer WITH source citations. Use this when you need 'what has worked before / why is my approach wrong / how did we solve X' — i.e. synthesis over multiple knowledge sources. For a plain keyword lookup (does this exact error exist?) prefer search_past_decisions / session_search which cost zero LLM tokens. The brain only advises — it cannot modify code; you decide whether to act on its answer, and the result of your action (compile/test) is the final judge.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The question to ask the management brain, e.g. 'my cargo build fails with E0433 — what similar tool failures have we fixed before and what was the verified fix?'."
+            },
+            "context": {
+                "type": "string",
+                "description": "Optional current-task context (what you are doing, what failed, exact error text). Helps the brain tailor its synthesis."
+            },
+            "k": {
+                "type": "integer",
+                "description": "Number of top-k snippets to retrieve per knowledge source (default: 5)."
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    }
+}"#;
+
 /// 请求来源分类 — 用于缓存统计隔离。
 /// 子智能体请求经 cli 侧路由到独立的 `subagent-{session}` 统计,
 /// 不再污染主 agent 的缓存 break 检测(见设计文档 §4.2)。
@@ -4154,6 +4186,15 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
+                        } else if tool_name == "ask_brain" {
+                            // 双大脑架构:管理脑 LLM 综合入口(需跨库推理时用)。
+                            // 确定性检索(decision_log/会话历史/harness 规则)→
+                            // ReadOnly brain 会话综合 → 带来源答案;poor_mode 或
+                            // brain 不可用时降级返回检索片段,不阻塞执行脑。
+                            match self.execute_ask_brain_async(&effective_input).await {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
                         } else if tool_name == "query_project_graph" {
                             match self.execute_query_project_graph() {
                                 Ok(output) => (output, false),
@@ -6031,15 +6072,14 @@ where
             }
         }
 
-        // 槽位 11:生效中的 harness edits(失败教训 → 应对策略指令,≤10 条)。
-        // 读取失败(如 db 损坏)时静默跳过,不阻塞 turn。
-        if let Some(archive) = &self.harness_archive {
-            if let Ok(edit_sections) = crate::harness_evolution::render_for_injection(archive) {
-                if !edit_sections.is_empty() {
-                    slots.push(("Harness Lessons", edit_sections.join("\n\n")));
-                }
-            }
-        }
+        // 槽位 11(双大脑架构 v3 瘦身):停 harness Active edits 全量注入。
+        // 原实现 render_for_injection 无条件把 Active 规则注入每轮上下文:
+        // - 注入文本无法被外部验证(验证难题是注入结构固有属性)
+        // - 知识随库增长 → 上下文膨胀(Lost-in-the-Middle 实证)
+        // 双脑架构:知识归管理脑;执行脑经 ask_brain 问答按需获取;
+        // 工具失败时由"失败单条辅导"(批次 2)注入单条历史决策。
+        // harness_edits 现为空表(0 行),零迁移成本。
+        // harness_archive 字段仍被 retrieve_brain_context(ask_brain 检索器)使用。
         // A8:原槽位 12(Execution Style 常量)已移入前缀 static 区
         // (get_execution_style_section)—— 恒定内容不再每轮在尾部重发,
         // 减少尾部未命中 token;尾部冻结槽位块只保留真正逐轮变化的内容。
@@ -7181,6 +7221,151 @@ where
         decision_log
             .search_decisions(query, top_k)
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+    }
+
+    /// 检索片段总长上限(防止知识片段撑爆 brain 会话上下文)。
+    const MAX_ASK_BRAIN_CONTEXT_CHARS: usize = 6000;
+
+    /// 双大脑 · 确定性检索器:并行拉取三源知识片段(零 LLM)。
+    ///
+    /// - `decision_log`(FTS5 决策检索)
+    /// - 会话历史(`session_search`:history_index 混合检索或 workspace FTS5)
+    /// - harness Active 规则(`render_for_injection`)
+    ///
+    /// 任一源失败/为空则跳过该源;全部为空返回空串。独立方法便于单测。
+    fn retrieve_brain_context(&self, query: &str, k: usize) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        // 1. decision_log(FTS5)
+        if let Some(dl) = &self.decision_log {
+            if let Ok(decisions) = dl.search_decisions(query, k) {
+                if !decisions.trim().is_empty() {
+                    parts.push(format!("### Past Decisions (decision_log)\n{decisions}"));
+                }
+            }
+        }
+
+        // 2. 会话历史(session_search:history_index 或 workspace FTS5)
+        let q_json =
+            serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string());
+        let ss_input = format!(r#"{{"query": {q_json}, "top_k": {k}}}"#);
+        if let Ok(hist) = self.execute_session_search(&ss_input) {
+            if !hist.contains("not available") && !hist.trim().is_empty() {
+                parts.push(format!("### Session History\n{hist}"));
+            }
+        }
+
+        // 3. harness Active 规则
+        if let Some(archive) = &self.harness_archive {
+            if let Ok(rules) = crate::harness_evolution::render_for_injection(archive) {
+                if !rules.is_empty() {
+                    parts.push(format!(
+                        "### Active Evolution Rules (harness)\n{}",
+                        rules.join("\n")
+                    ));
+                }
+            }
+        }
+
+        parts.join("\n\n")
+    }
+
+    /// 双大脑 · 执行 `ask_brain` 工具(LLM 综合入口,按需)。
+    ///
+    /// 流程:
+    /// 1. 确定性检索([`Self::retrieve_brain_context`],零 LLM);
+    /// 2. `poor_mode` 激活时**跳过 brain 会话**,直接返回检索片段(成本门控);
+    /// 3. 否则 spawn 一个 **ReadOnly** 管理脑会话(可再读文件核实),
+    ///    综合后返回带来源答案;
+    /// 4. 失败降级:brain 会话不可用(无 workspace_root / 执行失败)→
+    ///    返回未综合的检索片段,不阻塞执行脑。
+    async fn execute_ask_brain_async(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let query = parsed
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("missing or empty 'query' field")?
+            .to_string();
+        let context = parsed
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let k = parsed.get("k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+        // 1. 确定性检索(零 LLM)
+        let retrieved = self.retrieve_brain_context(&query, k);
+        let trimmed: String = retrieved
+            .chars()
+            .take(Self::MAX_ASK_BRAIN_CONTEXT_CHARS)
+            .collect();
+        if trimmed.trim().is_empty() {
+            return Ok(
+                "ask_brain: 知识库中无相关记录(decision_log / 会话历史 / harness 规则均无命中)。\
+                 请换更具体的措辞重试,或先用 search_past_decisions 试不同关键词。"
+                    .to_string(),
+            );
+        }
+
+        // 2. poor_mode 门控:跳过 LLM 综合,零成本返回检索片段
+        if crate::poor_mode::is_active() {
+            return Ok(format!(
+                "ask_brain (poor_mode 激活:跳过 LLM 综合,以下为确定性检索片段):\n\n{trimmed}"
+            ));
+        }
+
+        // 3. brain 会话综合(ReadOnly)
+        let workspace_root = self.workspace_root.clone();
+        if workspace_root.is_none() {
+            return Ok(format!(
+                "ask_brain (brain 会话不可用:无 workspace_root。以下为确定性检索片段,可直接参考):\n\n{trimmed}"
+            ));
+        }
+        let _workspace_root = workspace_root; // 仅用于存在性降级;brain 会话自行从 self 取 root
+
+        let task = format!(
+            "# Management Brain Consultation\n\n\
+             ## 执行脑的问题\n{query}\n\n\
+             ## 执行脑当前上下文\n{context}\n\n\
+             ## 知识库检索片段(来源标注,供你综合与核实)\n{trimmed}\n\n\
+             ## 你的任务\n\
+             1. 基于上述检索片段(仅作为参考,不代表全部事实),回答执行脑的问题;\n\
+             2. 需要时可用 read_file/grep_search/glob_search 工具核实代码事实(只读,禁止修改任何文件);\n\
+             3. 输出格式:先给结论,再给依据。每条关键结论后附来源(如:decision_log 条目 / 会话历史 / 文件路径:行号);\n\
+             4. 若检索片段不足以回答,明确说明\"知识库无足够证据\",并给出基于代码事实的最佳建议;\n\
+             5. 你是管理脑(咨询角色):只提议不直改。执行脑会自行决定是否采纳,并以行动结果(编译/测试)为准。"
+        );
+        let subagent_id = format!(
+            "brain-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+
+        match self
+            .run_subagent_turn_with_model(
+                &subagent_id,
+                "management-brain",
+                &task,
+                None,
+                None,
+                crate::multi_agent::TaskComplexity::Simple,
+                crate::multi_agent::SubagentCapability::ReadOnly,
+            )
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(e) => Ok(format!(
+                "ask_brain: brain 会话暂不可用({e})。以下为确定性检索片段(未综合,可直接参考):\n\n{trimmed}"
+            )),
+        }
     }
 
     /// Phase 4-A P1-4:执行 `verify_decision` 工具调用,闭合 success_rate 学习环。
@@ -18170,6 +18355,172 @@ mod tests {
         let edit = archive.get_edit("e1").expect("get").expect("exists");
         assert_eq!(edit.verify_count, 0, "Pending must not touch verify_count");
         assert_eq!(edit.success_count, 0, "Pending must not touch success_count");
+    }
+
+    // ===== 双大脑 · ask_brain 工具(批次 1)=====
+
+    /// 检索器:decision_log 命中返回格式化的 Past Decisions 片段(零 LLM)。
+    #[test]
+    fn retrieve_brain_context_returns_decision_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log);
+
+        runtime
+            .execute_log_decision(
+                r#"{"session_id":"s1","problem_signature":"edit_file: old_string not found in file","root_cause_hypothesis":"stale line numbers","applied_solution":"re-read the file before editing","affected_files":["x.rs"],"verification_result":"Confirmed"}"#,
+            )
+            .expect("log_decision");
+
+        let ctx = runtime.retrieve_brain_context("old_string not found", 5);
+        assert!(ctx.contains("### Past Decisions (decision_log)"), "ctx: {ctx}");
+        assert!(ctx.contains("old_string not found"), "ctx: {ctx}");
+    }
+
+    /// ask_brain:知识库无命中 → 返回引导消息(不调 brain,零 LLM)。
+    #[tokio::test]
+    async fn execute_ask_brain_empty_knowledge_returns_guidance() {
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let out = runtime
+            .execute_ask_brain_async(r#"{"query":"nonexistent unique term xyzzy"}"#)
+            .await
+            .expect("must return Ok(guidance)");
+        assert!(out.contains("无相关记录"), "out: {out}");
+    }
+
+    /// ask_brain:命中但无 workspace_root → 降级返回检索片段(brain 不可用不阻塞)。
+    #[tokio::test]
+    async fn execute_ask_brain_degrades_without_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log);
+
+        runtime
+            .execute_log_decision(
+                r#"{"session_id":"s1","problem_signature":"bash: permission denied writing to file","root_cause_hypothesis":"perms","applied_solution":"chmod before write","affected_files":["b.sh"],"verification_result":"Confirmed"}"#,
+            )
+            .expect("log_decision");
+
+        let out = runtime
+            .execute_ask_brain_async(r#"{"query":"permission denied"}"#)
+            .await
+            .expect("must degrade gracefully");
+        assert!(out.contains("brain 会话不可用:无 workspace_root"), "out: {out}");
+        assert!(out.contains("permission denied"), "out: {out}");
+    }
+
+    /// ask_brain:poor_mode 激活 → 跳过 brain 综合,直接返回检索片段(成本门控)。
+    #[tokio::test]
+    async fn execute_ask_brain_poor_mode_skips_brain_synthesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log);
+
+        runtime
+            .execute_log_decision(
+                r#"{"session_id":"s1","problem_signature":"glob_search: no files matched pattern","root_cause_hypothesis":"wrong pattern","applied_solution":"verify pattern syntax","affected_files":[],"verification_result":"Confirmed"}"#,
+            )
+            .expect("log_decision");
+
+        crate::poor_mode::set_active(true);
+        let out = runtime
+            .execute_ask_brain_async(r#"{"query":"glob no files matched"}"#)
+            .await
+            .expect("poor_mode returns retrieved snippets");
+        crate::poor_mode::set_active(false); // 复位全局状态
+        assert!(out.contains("poor_mode 激活"), "out: {out}");
+        assert!(out.contains("glob"), "out: {out}");
+    }
+
+    /// 端到端:run_turn 真实拦截 ask_brain 工具调用(不经 StaticToolExecutor)。
+    /// 无 decision_log 时命中"知识库无相关记录"引导路径 → 证明路由分支生效。
+    #[test]
+    fn run_turn_intercepts_ask_brain_tool_call() {
+        struct BrainApi {
+            calls: usize,
+        }
+        impl ApiClient for BrainApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-brain-1".to_string(),
+                            name: "ask_brain".to_string(),
+                            input: r#"{"query":"nonexistent unique term xyzzy"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        // ask_brain 必须被运行时拦截执行;若落 StaticToolExecutor
+                        // 会返回 "unknown tool: ask_brain",此断言失败。
+                        let tool_msg = request
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == MessageRole::Tool)
+                            .expect("tool result present");
+                        let output = match &tool_msg.blocks[0] {
+                            ContentBlock::ToolResult { output, .. } => output.clone(),
+                            _ => panic!("expected tool result block"),
+                        };
+                        assert!(
+                            output.contains("无相关记录"),
+                            "expected intercepted ask_brain guidance, got: {output}"
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("unexpected extra API call"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            BrainApi { calls: 0 },
+            // Intentionally empty: ask_brain must NOT fall through to this executor.
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("ask the brain", None)
+            .expect("turn should complete");
+        assert_eq!(summary.iterations, 2);
     }
 
 
