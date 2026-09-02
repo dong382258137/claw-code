@@ -107,8 +107,11 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         old_exe.display()
     );
 
-    // 3. cargo build(workspace root = exe 上溯:debug → target → rust/)。
-    let workspace_root = workspace_root_from_exe(&exe)?;
+    // 3. cargo build。源码根优先从 user_cwd 推导 —— 部署版 exe 位于
+    //    `.cargo/bin`,从 exe 上溯到用户主目录不含 Cargo.toml,推导必失败
+    //    (2026-09-02 实测)。user_cwd 推导失败时回退 exe 推导(源码 target 布局)。
+    let workspace_root = workspace_root_from_user_cwd(user_cwd)
+        .or_else(|_| workspace_root_from_exe(&exe))?;
     println!(
         "[upgrade-helper] 编译: cargo build -p rusty-claude-cli @ {}",
         workspace_root.display()
@@ -180,6 +183,41 @@ fn workspace_root_from_exe(exe: &Path) -> Result<PathBuf, Box<dyn std::error::Er
         .into());
     }
     Ok(root.to_path_buf())
+}
+
+/// 从用户工作目录推导 cargo workspace root。
+///
+/// 部署版 exe 位于 `~/.cargo/bin`,`workspace_root_from_exe` 对其必然失败
+/// (上溯到用户主目录无 Cargo.toml)。因此 `/upgrade` 的自编译升级必须基于
+/// **用户当前工作目录**定位源码仓库:
+///
+/// 1. 从 `user_cwd` 向上逐级找含 `Cargo.toml` 的目录(在源码目录内运行)。
+/// 2. 回退:探测 `user_cwd` 的直接子目录(覆盖"cwd=仓库根、workspace 在
+///    `rust/` 子目录"的布局,如本项目 `D:\claw-code-src` → `D:\claw-code-src\rust`)。
+/// 3. 仍失败则报错,提示需在源码仓库内运行 `/upgrade`。
+fn workspace_root_from_user_cwd(
+    user_cwd: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut cursor = Some(user_cwd);
+    while let Some(dir) = cursor {
+        if dir.join("Cargo.toml").is_file() {
+            return Ok(dir.to_path_buf());
+        }
+        cursor = dir.parent();
+    }
+    if let Ok(entries) = std::fs::read_dir(user_cwd) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join("Cargo.toml").is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    Err(format!(
+        "无法从工作目录 {} 定位 cargo workspace(未找到含 Cargo.toml 的目录);请在源码仓库内运行 /upgrade",
+        user_cwd.display()
+    )
+    .into())
 }
 
 #[cfg(test)]
@@ -262,5 +300,50 @@ mod tests {
         // exited 缺 old_pid 且期望有 → 不归属(防异常标记)。
         let exited = serde_json::json!({"exited_at_ms": 1});
         assert!(!exited_belongs(&exited, Some(123)));
+    }
+
+    // ---- 2026-09-02 部署版源码根推导修复 ----
+
+    /// user_cwd 本身就是 workspace(cwd 含 Cargo.toml)→ 直接命中。
+    #[test]
+    fn workspace_root_from_user_cwd_hits_cwd_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let root = workspace_root_from_user_cwd(dir.path()).expect("derive");
+        assert_eq!(root, dir.path());
+    }
+
+    /// user_cwd 是仓库根、workspace 在子目录(本项目 rust/)→ 向下探测命中。
+    #[test]
+    fn workspace_root_from_user_cwd_hits_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("rust");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let root = workspace_root_from_user_cwd(dir.path()).expect("derive");
+        assert_eq!(root, sub);
+    }
+
+    /// 向上找:在 workspace 子目录内运行 /upgrade(cwd=rust/)→ 命中 cwd。
+    #[test]
+    fn workspace_root_from_user_cwd_hits_ancestor_when_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let nested = dir.path().join("crates").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = workspace_root_from_user_cwd(&nested).expect("derive");
+        assert_eq!(root, dir.path());
+    }
+
+    /// 完全找不到 Cargo.toml → 明确报错(提示在源码仓库内运行)。
+    #[test]
+    fn workspace_root_from_user_cwd_errors_when_no_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = workspace_root_from_user_cwd(dir.path())
+            .expect_err("should reject non-workspace dir");
+        assert!(
+            err.to_string().contains("无法从工作目录"),
+            "got: {err}"
+        );
     }
 }
