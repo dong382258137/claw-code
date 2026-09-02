@@ -271,16 +271,27 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     );
     let mut cmd = Command::new(&exe);
     cmd.current_dir(user_cwd);
-    // 新进程必须 CREATE_NEW_CONSOLE:若继承 helper 的 stdio,在旧进程(用户
-    // TUI)退出后,共享管道读端关闭,新进程初始化时任何 println!/eprintln!
-    // 触发 "failed printing to stderr: 管道正在被关闭 (os error 232)" panic
-    // (2026-09-03 claw-crash.log 多次实测;0:08 无 CREATE_NEW_CONSOLE 前台
-    // 跑时新进程正常,用户环境带 CREATE_NEW_CONSOLE 时必 232)。
-    // 独立新控制台后新进程拿到自己的有效标准句柄,不受 helper 终端影响。
+    // 显式把新进程 stdio 指向 helper 自己的控制台(不依赖继承):
+    // 用户 TUI 的 stdio 可能是管道(从 IDE/启动器启动),旧进程退出后管道读端
+    // 关闭 → 新进程初始化时 println! 触发 os error 232 panic。实测 CREATE_NEW_CONSOLE
+    // 子进程在父 stdio 是管道时默认 GetStdHandle 仍无效(errno 22),但**能显式打开
+    // CONIN$/CONOUT$**(conout-ok;conin-ok)——helper 是 CREATE_NEW_CONSOLE,有控制台。
+    // 故此处打开 helper 控制台句柄显式设为新进程 stdio:新进程写 helper 控制台,
+    // helper 驻留(wait)保持终端 → 真正无感衔接(同一终端,不弹新窗口)。
+    // 打开失败(极端环境无控制台)时回退为继承,保持旧行为。
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NEW_CONSOLE);
+        use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+        use std::process::Stdio;
+        if let Ok(conin) = std::fs::OpenOptions::new().read(true).open("CONIN$") {
+            cmd.stdin(unsafe { Stdio::from_raw_handle(conin.into_raw_handle()) });
+        }
+        if let Ok(conout) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+            cmd.stdout(unsafe { Stdio::from_raw_handle(conout.into_raw_handle()) });
+        }
+        if let Ok(conerr) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+            cmd.stderr(unsafe { Stdio::from_raw_handle(conerr.into_raw_handle()) });
+        }
     }
     let mut child = cmd.spawn()?;
 
@@ -291,8 +302,8 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         "[upgrade-helper] 新进程已启动(无感衔接),助手驻留保持终端。",
     );
 
-    // 6. 驻留监护:helper 不能立即退出 —— 若退出,CREATE_NEW_CONSOLE 终端
-    //    (helper 侧输出)随之关闭;wait 保持 helper 终端存活到新进程退出。
+    // 6. 驻留监护:helper 不能立即退出 —— 若退出,共用控制台随之关闭;wait 保持
+    //    终端存活到新进程(REPL)退出。
     let _ = child.wait();
     Ok(())
 }
