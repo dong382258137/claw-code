@@ -1454,7 +1454,21 @@ pub fn main_entry() {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         if let Err(e) = upgrade_helper::run_helper(&user_cwd) {
-            eprintln!("[upgrade-helper] 失败: {e}");
+            let msg = format!("[upgrade-helper] 失败: {e}");
+            eprintln!("{msg}");
+            // 错误落盘:helper 独立新终端关闭后输出即丢失,日志供事后诊断。
+            let log_path = upgrade_helper::upgrade_log_path(&user_cwd);
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(file, "{msg}");
+            }
             std::process::exit(1);
         }
         std::process::exit(0);

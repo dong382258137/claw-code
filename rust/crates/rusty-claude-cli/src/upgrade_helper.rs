@@ -20,6 +20,8 @@
 //!    → resume session + restore plan + 继续任务,无感衔接)。
 //! 5. 清理 exited 标记,本助手退出。
 
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -32,6 +34,38 @@ use crate::session_mgr::{
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// 等待旧进程退出标记的超时(旧进程需 persist 会话 + shutdown,给足 180s)。
 const WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 升级助手日志路径(`<user_cwd>/.claw/upgrade-helper.log`)。
+///
+/// helper 在独立新终端运行,stdout/stderr 随窗口关闭即丢失 —— 失败原因
+/// 事后无法定位(2026-09-03 实测)。关键输出(含错误)追加写此文件,
+/// 与终端输出同步,供 `Get-Content .claw/upgrade-helper.log` 诊断。
+#[must_use]
+pub(crate) fn upgrade_log_path(user_cwd: &Path) -> PathBuf {
+    user_cwd.join(".claw").join("upgrade-helper.log")
+}
+
+/// 打开升级日志(追加模式)。失败静默(日志是诊断辅助,不阻塞升级)。
+fn open_upgrade_log(user_cwd: &Path) -> Option<File> {
+    let path = upgrade_log_path(user_cwd);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// 同时输出到终端与升级日志。
+fn log_out(log_file: &Option<File>, msg: &str) {
+    println!("{msg}");
+    if let Some(file) = log_file {
+        let mut file = file;
+        let _ = writeln!(file, "{msg}");
+    }
+}
 
 #[cfg(windows)]
 /// CREATE_NEW_CONSOLE:让升级助手拥有独立控制台,编译输出对用户可见。
@@ -59,9 +93,10 @@ pub(crate) fn spawn(user_cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 /// 升级助手主入口(由 `main_entry` 在检测到 `--upgrade-helper` 时调用)。
 pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "[upgrade-helper] 升级助手启动: user_cwd={}",
-        user_cwd.display()
+    let log_file = open_upgrade_log(user_cwd);
+    log_out(
+        &log_file,
+        &format!("[upgrade-helper] 升级助手启动: user_cwd={}", user_cwd.display()),
     );
 
     // 1. 等旧进程写 exited 标记(校验 old_pid 归属)。
@@ -91,7 +126,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    println!("[upgrade-helper] 旧进程已退出,开始迁移");
+    log_out(&log_file, "[upgrade-helper] 旧进程已退出,开始迁移");
 
     // 2. mv 当前 exe → exe.old(备份;Windows 允许重命名运行中的文件)。
     let exe = std::env::current_exe()?;
@@ -101,17 +136,24 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         std::fs::remove_file(&old_exe)?;
     }
     std::fs::rename(&exe, &old_exe)?;
-    println!(
-        "[upgrade-helper] 备份: {} → {}",
-        exe.display(),
-        old_exe.display()
+    log_out(
+        &log_file,
+        &format!(
+            "[upgrade-helper] 备份: {} → {}",
+            exe.display(),
+            old_exe.display()
+        ),
     );
 
     // 3. cargo build。源码根优先从 user_cwd 推导 —— 部署版 exe 位于
     //    `.cargo/bin`,从 exe 上溯到用户主目录不含 Cargo.toml,推导必失败
     //    (2026-09-02 实测)。user_cwd 推导失败时回退 exe 推导(源码 target 布局)。
     let workspace_root = workspace_root_from_user_cwd(user_cwd)
-        .or_else(|_| workspace_root_from_exe(&exe))?;
+        .or_else(|_| workspace_root_from_exe(&exe))
+        .map_err(|err| {
+            log_out(&log_file, &format!("[upgrade-helper] workspace 定位失败: {err}"));
+            err
+        })?;
 
     // 3. cargo build。产物路径必须与"当前 exe 运行场景"对齐:
     //    - exe 在 `target/debug`(源码 debug 布局) → 默认 build(debug),产物已在原位
@@ -122,11 +164,14 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     let in_target_release = exe.starts_with(&workspace_root.join("target").join("release"));
     let use_release = !in_target_debug;
     let profile_dir = if use_release { "release" } else { "debug" };
-    println!(
-        "[upgrade-helper] 编译: cargo build {}{} @ {}",
-        if use_release { "--release " } else { "" },
-        "-p rusty-claude-cli",
-        workspace_root.display()
+    log_out(
+        &log_file,
+        &format!(
+            "[upgrade-helper] 编译: cargo build {}{} @ {}",
+            if use_release { "--release " } else { "" },
+            "-p rusty-claude-cli",
+            workspace_root.display()
+        ),
     );
     let mut args = vec!["build".to_string()];
     if use_release {
@@ -136,13 +181,22 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     let status = Command::new("cargo")
         .args(&args)
         .current_dir(&workspace_root)
-        .status()?;
+        .status()
+        .map_err(|err| {
+            log_out(
+                &log_file,
+                &format!("[upgrade-helper] 启动 cargo 失败: {err}(cargo 是否在 PATH?)"),
+            );
+            err
+        })?;
     if !status.success() {
-        eprintln!(
+        let msg = format!(
             "[upgrade-helper] 编译失败(exit={:?})。旧二进制已备份为 {},可手动恢复。",
             status.code(),
             old_exe.display()
         );
+        log_out(&log_file, &msg);
+        eprintln!("{msg}");
         return Err("cargo build failed".into());
     }
 
@@ -162,22 +216,28 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
             .into());
         }
         std::fs::copy(&built, &exe)?;
-        println!(
-            "[upgrade-helper] 已部署: {} ← {}",
-            exe.display(),
-            built.display()
+        log_out(
+            &log_file,
+            &format!(
+                "[upgrade-helper] 已部署: {} ← {}",
+                exe.display(),
+                built.display()
+            ),
         );
     }
 
     // 4. 启动新 exe(user_cwd 为工作目录 → 自动检测标记 → resume 会话)。
-    println!("[upgrade-helper] 编译成功,启动新进程: {}", exe.display());
+    log_out(
+        &log_file,
+        &format!("[upgrade-helper] 编译成功,启动新进程: {}", exe.display()),
+    );
     let mut cmd = Command::new(&exe);
     cmd.current_dir(user_cwd);
     cmd.spawn()?;
 
     // 5. 清理 exited 标记(本次升级完成),助手退出。
     clear_upgrade_exited(user_cwd);
-    println!("[upgrade-helper] 完成,新进程已启动(无感衔接)。");
+    log_out(&log_file, "[upgrade-helper] 完成,新进程已启动(无感衔接)。");
     Ok(())
 }
 
