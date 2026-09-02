@@ -267,7 +267,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     // 4. 启动新 exe(user_cwd 为工作目录 → 自动检测标记 → resume 会话)。
     log_out(
         &log_file,
-        &format!("[upgrade-helper] 编译成功,启动新进程: {}", exe.display()),
+        &format!("[upgrade-helper] 编译成功,准备启动新进程: {}", exe.display()),
     );
     let mut cmd = Command::new(&exe);
     cmd.current_dir(user_cwd);
@@ -276,35 +276,64 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     // 关闭 → 新进程初始化时 println! 触发 os error 232 panic。实测 CREATE_NEW_CONSOLE
     // 子进程在父 stdio 是管道时默认 GetStdHandle 仍无效(errno 22),但**能显式打开
     // CONIN$/CONOUT$**(conout-ok;conin-ok)——helper 是 CREATE_NEW_CONSOLE,有控制台。
-    // 故此处打开 helper 控制台句柄显式设为新进程 stdio:新进程写 helper 控制台,
-    // helper 驻留(wait)保持终端 → 真正无感衔接(同一终端,不弹新窗口)。
-    // 打开失败(极端环境无控制台)时回退为继承,保持旧行为。
+    // 打开失败(环境无有效控制台)时不 spawn 新进程,避免继承无效句柄崩溃:
+    // 改为提示用户手动运行 claw 接管(同样自动 resume 会话)。
     #[cfg(windows)]
-    {
+    let con_available = {
         use std::os::windows::io::{FromRawHandle, IntoRawHandle};
         use std::process::Stdio;
-        if let Ok(conin) = std::fs::OpenOptions::new().read(true).open("CONIN$") {
-            cmd.stdin(unsafe { Stdio::from_raw_handle(conin.into_raw_handle()) });
+        let conin = std::fs::OpenOptions::new().read(true).open("CONIN$");
+        let conout = std::fs::OpenOptions::new().write(true).open("CONOUT$");
+        match (conin, conout) {
+            (Ok(conin), Ok(conout)) => {
+                log_out(
+                    &log_file,
+                    "[upgrade-helper] 控制台句柄就绪(CONIN$/CONOUT$),将显式设置新进程 stdio",
+                );
+                let conout2 = conout
+                    .try_clone()
+                    .expect("CONOUT$ 句柄可克隆");
+                cmd.stdin(unsafe { Stdio::from_raw_handle(conin.into_raw_handle()) });
+                cmd.stdout(unsafe { Stdio::from_raw_handle(conout2.into_raw_handle()) });
+                cmd.stderr(unsafe { Stdio::from_raw_handle(conout.into_raw_handle()) });
+                true
+            }
+            (Err(_), _) => {
+                log_out(&log_file, "[upgrade-helper] CONIN$ 打开失败(环境无有效控制台)");
+                false
+            }
+            (_, Err(_)) => {
+                log_out(&log_file, "[upgrade-helper] CONOUT$ 打开失败(环境无有效控制台)");
+                false
+            }
         }
-        if let Ok(conout) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
-            cmd.stdout(unsafe { Stdio::from_raw_handle(conout.into_raw_handle()) });
-        }
-        if let Ok(conerr) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
-            cmd.stderr(unsafe { Stdio::from_raw_handle(conerr.into_raw_handle()) });
-        }
+    };
+    #[cfg(not(windows))]
+    let con_available = true;
+
+    if con_available {
+        let mut child = cmd.spawn()?;
+
+        // 5. 清理 exited 标记(本次升级完成)。
+        clear_upgrade_exited(user_cwd);
+        log_out(
+            &log_file,
+            "[upgrade-helper] 新进程已启动(无感衔接),助手驻留保持终端。",
+        );
+
+        // 6. 驻留监护:helper 不能立即退出 —— 若退出,共用控制台随之关闭;wait 保持
+        //    终端存活到新进程(REPL)退出。
+        let _ = child.wait();
+    } else {
+        // 无可用控制台:不 spawn(避免新进程继承无效 stdio 崩溃),提示手动接管。
+        clear_upgrade_exited(user_cwd);
+        log_out(
+            &log_file,
+            "[upgrade-helper] 本环境无可用控制台,未自动启动新进程。\
+             请在任意终端手动运行 `claw`(会自动检测升级标记,resume 会话并继续任务)。\
+             旧二进制已备份为 exe.old,可随时手动恢复。",
+        );
     }
-    let mut child = cmd.spawn()?;
-
-    // 5. 清理 exited 标记(本次升级完成)。
-    clear_upgrade_exited(user_cwd);
-    log_out(
-        &log_file,
-        "[upgrade-helper] 新进程已启动(无感衔接),助手驻留保持终端。",
-    );
-
-    // 6. 驻留监护:helper 不能立即退出 —— 若退出,共用控制台随之关闭;wait 保持
-    //    终端存活到新进程(REPL)退出。
-    let _ = child.wait();
     Ok(())
 }
 
