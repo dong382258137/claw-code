@@ -777,6 +777,82 @@ impl DecisionLog {
         Ok(rows)
     }
 
+    /// 双大脑 · 失败单条辅导:检索一条**高质量已验证修复方案**。
+    ///
+    /// 与 [`search_decisions`](Self::search_decisions) 的差异:后者返回原始
+    /// FTS5 命中(含 Pending/auto_captured/LLM 自评),供 LLM 浏览;本方法
+    /// 供**运行时确定性注入**(零 LLM),只接受:
+    /// - `verification_result = 'Confirmed'`(被验证为有效,含外部证据语义)
+    /// - `verify_count >= 1`(至少一次事后复验,过滤 LLM 单次自评)
+    /// - 排除 `tags LIKE '%auto_captured%'`(自动捕获的失败观测无方案)
+    ///
+    /// FTS5 BM25 命中中按上述条件过滤,返回格式化 top1(problem + solution
+    /// + success_rate + verify_count),供失败后下一轮注入执行脑上下文。
+    /// 无高质量命中返回 `None`(宁缺毋滥,不注入未验证方案)。
+    pub fn top_verified_solution(&self, query: &str) -> Result<Option<String>, DecisionLogError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // 词级 OR 召回(非短语):失败消息与决策签名措辞通常不完全一致,
+        // 短语匹配(escape_fts5_query 的双引号语义)会零命中。分词去重后
+        // 取前 6 词,OR 连接 → FTS5 BM25 对含词多的行排序靠前,LIMIT 1
+        // 取最相关;WHERE 过滤(Confirmed+verify_count≥1)保证质量。
+        let mut words: Vec<&str> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .map(str::trim)
+            .filter(|w| w.len() >= 2)
+            .collect();
+        let mut dedup: Vec<&str> = Vec::new();
+        for w in words.drain(..) {
+            if !dedup.contains(&w) {
+                dedup.push(w);
+            }
+        }
+        if dedup.is_empty() {
+            return Ok(None);
+        }
+        let fts_query = dedup.iter().take(6).copied().collect::<Vec<_>>().join(" OR ");
+        let mut stmt = conn.prepare(
+            "SELECT d.problem_signature, d.applied_solution, d.success_rate,
+                    d.verify_count, d.affected_files
+             FROM decisions d
+             JOIN decisions_fts fts ON d.id = fts.rowid
+             WHERE decisions_fts MATCH ?1
+               AND d.verification_result = 'Confirmed'
+               AND d.verify_count >= 1
+               AND (d.tags IS NULL OR d.tags NOT LIKE '%auto_captured%')
+             ORDER BY rank
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![fts_query], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        if let Some(row) = rows.next() {
+            let (problem, solution, success_rate, verify_count, affected_files) = row?;
+            let files = truncate_str(&affected_files, 200);
+            let advice = format!(
+                "## Verified Fix Suggestion (from past decisions)\n\
+                 problem: {}\n\
+                 verified solution: {}\n\
+                 success_rate: {:.0}% (verified {}x)\n\
+                 affected files: {}\n\
+                 NOTE: this is an advisory suggestion from the knowledge base. Verify it applies to your current context before acting.",
+                truncate_str(&problem, 200),
+                truncate_str(&solution, 400),
+                success_rate * 100.0,
+                verify_count,
+                files,
+            );
+            Ok(Some(advice))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// 验证已有决策,更新 success_rate 学习环(计划 §4.4)。
     ///
     /// 接受 decision_id 和验证结果(Confirmed/Refuted/Partial/Pending),
@@ -3061,5 +3137,63 @@ mod tests {
         let input = "[{\"a\":1}]";
         let stripped = strip_markdown_code_block(input);
         assert_eq!(stripped, "[{\"a\":1}]");
+    }
+
+    // ===== 双大脑 · 失败单条辅导(批次 2):top_verified_solution =====
+
+    /// 未复验(verify_count=0)的 Confirmed 决策不返回——过滤 LLM 单次自评。
+    #[test]
+    fn top_verified_solution_returns_none_for_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+        log.log_decision(
+            r#"{"session_id":"s1","problem_signature":"edit_file: old_string not found","root_cause_hypothesis":"stale","applied_solution":"re-read first","affected_files":["x.rs"],"verification_result":"Confirmed"}"#,
+        )
+        .unwrap();
+        let out = log
+            .top_verified_solution("old_string not found")
+            .unwrap();
+        assert!(out.is_none(), "verify_count=0 不应被注入: {out:?}");
+    }
+
+    /// Confirmed + verify_count≥1(经 verify_decision 复验)才返回格式化建议。
+    #[test]
+    fn top_verified_solution_returns_verified_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+        let logged = log
+            .log_decision(
+                r#"{"session_id":"s1","problem_signature":"bash: permission denied writing to file","root_cause_hypothesis":"perms","applied_solution":"chmod before write","affected_files":["b.sh"],"verification_result":"Confirmed"}"#,
+            )
+            .unwrap();
+        let decision_id: i64 = logged
+            .trim_start_matches("decision_logged id=")
+            .parse()
+            .expect("parse id");
+        log.verify_decision(
+            decision_id,
+            DecisionVerification::Confirmed,
+            Some("cargo test passed"),
+        )
+        .unwrap();
+
+        let out = log
+            .top_verified_solution("permission denied")
+            .unwrap()
+            .expect("verified fix must be returned");
+        assert!(out.contains("Verified Fix Suggestion"), "out: {out}");
+        assert!(out.contains("chmod before write"), "out: {out}");
+        assert!(out.contains("verified 1x"), "out: {out}");
+    }
+
+    /// auto_captured 失败观测(tags 含 auto_captured)即使 Confirmed 也排除。
+    #[test]
+    fn top_verified_solution_excludes_auto_captured() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+        log.log_auto_captured_failure("s1", "glob_search", "no files matched pattern")
+            .unwrap();
+        let out = log.top_verified_solution("no files matched").unwrap();
+        assert!(out.is_none(), "auto_captured 观测不应被注入: {out:?}");
     }
 }

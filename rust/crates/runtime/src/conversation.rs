@@ -1618,6 +1618,15 @@ pub struct ConversationRuntime<C, T> {
     /// 到连续纠结,把溯源提示存到此字段,下一次 request 构造时注入
     /// `dynamic_sections`。读取后立即消费(与 `pending_remediation` 同生命周期)。
     pending_cog_stall: Option<String>,
+    /// 双大脑 · 失败单条辅导注入(批次 2):上一轮工具失败的已验证修复建议。
+    ///
+    /// 主循环工具失败(is_error)时,用失败签名确定性检索 decision_log 中
+    /// 的高质量已验证方案([`crate::decision_log::DecisionLog::top_verified_solution`],
+    /// Confirmed + verify_count≥1 + 非 auto_captured),把格式化单条存到此字段;
+    /// 下一次 request 构造时注入 `dynamic_sections`(槽位),引导 LLM 针对性
+    /// 修复而非盲目重试。读取后立即消费(与 `pending_remediation` 同生命周期)。
+    /// 无高质量命中不设置(宁缺毋滥,不注入未验证方案)。零 LLM。
+    pending_failure_advice: Option<String>,
     decision_log: Option<crate::decision_log::DecisionLog>,
     /// v3 §4.7:决策检测策略。控制 `maybe_auto_compact` 在压缩前用何种方式
     /// 提取决策点。默认 `Heuristic`(零成本),可通过
@@ -2020,6 +2029,7 @@ where
             archive_recall_hint_pending: false,
             pending_remediation: None,
             pending_cog_stall: None,
+            pending_failure_advice: None,
             decision_log: None,
             detection_strategy: crate::decision_log::DetectionStrategy::Heuristic,
             project_topology: None,
@@ -3636,6 +3646,7 @@ where
                 // 需要存活到下一 turn 被读取。
                 self.pending_remediation = None;
                 self.pending_cog_stall = None;
+                self.pending_failure_advice = None;
                 ApiRequest {
                     system_prompt: system_split,
                     messages,
@@ -4441,6 +4452,25 @@ where
                         // 主动记录"已验证的修复",自动捕获"未修复的观测"。
                         // 普适:任何工具失败走同一条管道。静默吞错(与 append_attempt 一致)。
                         if is_error {
+                            // 双大脑 · 失败单条辅导(批次 2):先检索同签名已验证方案。
+                            // 用工具名 + 错误首行作 query(与 decision_log 内部签名提取
+                            // 同构),命中 Confirmed+verify_count≥1 的高质量方案时存入
+                            // pending_failure_advice,下一次 request 构造注入槽位
+                            // 引导 LLM 针对性修复(而非盲目重试)。零 LLM;无高质量命中
+                            // 不注入(宁缺毋滥)。静默降级,不阻断工具结果返回。
+                            let advice = self.decision_log.as_ref().and_then(|dl| {
+                                let first_line = output.lines().next().unwrap_or("").trim();
+                                let query = if first_line.is_empty() {
+                                    tool_name.clone()
+                                } else {
+                                    let head: String = first_line.chars().take(100).collect();
+                                    format!("{tool_name}: {head}")
+                                };
+                                dl.top_verified_solution(&query).ok().flatten()
+                            });
+                            if let Some(a) = advice {
+                                self.pending_failure_advice = Some(a);
+                            }
                             if let Some(decision_log) = &self.decision_log {
                                 let _ = decision_log.log_auto_captured_failure(
                                     &self.session.session_id,
@@ -6003,6 +6033,14 @@ where
         // 槽位 7:认知停滞溯源提示(同上,一次性消费)。
         if let Some(cog_stall) = &self.pending_cog_stall {
             slots.push(("Cognitive Stall", cog_stall.clone()));
+        }
+
+        // 槽位 7b:双大脑失败单条辅导(批次 2)——上一轮工具失败的已验证修复建议。
+        // 工具失败后由主循环检索同签名高质量方案(Confirmed+verify_count≥1)
+        // 存入 pending_failure_advice;此处注入引导 LLM 针对性修复而非盲目重试。
+        // 读取后由请求构造清空(与 pending_remediation 同生命周期,一次性消费)。
+        if let Some(advice) = &self.pending_failure_advice {
+            slots.push(("Failure Advice", advice.clone()));
         }
 
         // 槽位 8:压缩后 NOTEBOOK 刷新提醒(flag 由 execute_notebook_update 清除)。
@@ -18519,6 +18557,118 @@ mod tests {
 
         let summary = runtime
             .run_turn("ask the brain", None)
+            .expect("turn should complete");
+        assert_eq!(summary.iterations, 2);
+    }
+
+    // ===== 双大脑 · 失败单条辅导(批次 2)=====
+
+    /// pending_failure_advice 在 render_runtime_hints 注入 "Failure Advice" 槽位。
+    /// 渲染不清空字段(消费在请求构造后,与 pending_remediation 同生命周期)。
+    #[test]
+    fn render_runtime_hints_injects_failure_advice() {
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                NoopApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            );
+        runtime.pending_failure_advice = Some(
+            "## Verified Fix Suggestion\nverified solution: re-read the file before editing"
+                .to_string(),
+        );
+        let hints = runtime.render_runtime_hints().expect("hints rendered");
+        assert!(hints.contains("Failure Advice"), "hints: {hints}");
+        assert!(
+            hints.contains("re-read the file before editing"),
+            "hints: {hints}"
+        );
+    }
+
+    /// 失败单条辅导端到端:工具失败(is_error)→ decision_log 有已验证同签名方案
+    /// → 下一次请求 messages 注入 "Failure Advice"(零 LLM,非 StaticToolExecutor 产出)。
+    #[test]
+    fn run_turn_injects_failure_advice_after_tool_error() {
+        use crate::decision_log::DecisionLog;
+        use crate::decision_log::DecisionVerification;
+
+        struct FailingToolApi {
+            calls: usize,
+        }
+        impl ApiClient for FailingToolApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-fail-1".to_string(),
+                            name: "bash".to_string(),
+                            input: r#"{"command":"claw-brain-probe-fail"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        // 第 2 次请求应已注入 Failure Advice(失败后自动辅导)。
+                        let has_advice = request.messages.iter().any(|m| {
+                            m.blocks.iter().any(|b| match b {
+                                ContentBlock::Text { text } => {
+                                    text.contains("Failure Advice")
+                                }
+                                _ => false,
+                            })
+                        });
+                        assert!(
+                            has_advice,
+                            "expected Failure Advice injected after tool error"
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("recovered".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("unexpected extra API call"),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+        // 预置一条已复验(verify_count≥1)的 Confirmed 方案,与失败签名同源。
+        let logged = log
+            .log_decision(
+                r#"{"session_id":"s1","problem_signature":"bash: command not found: claw-brain-probe-fail","root_cause_hypothesis":"unknown binary","applied_solution":"check tool availability before invoking","affected_files":["a.sh"],"verification_result":"Confirmed"}"#,
+            )
+            .unwrap();
+        let decision_id: i64 = logged
+            .trim_start_matches("decision_logged id=")
+            .parse()
+            .expect("parse id");
+        log.verify_decision(
+            decision_id,
+            DecisionVerification::Confirmed,
+            Some("manual rerun passed"),
+        )
+        .unwrap();
+
+        let mut runtime: ConversationRuntime<FailingToolApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                FailingToolApi { calls: 0 },
+                // bash 未被 StaticToolExecutor 实现 → 返回 error → is_error=true,
+                // 从而触发失败自动捕获与同签名已验证方案检索。
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_decision_log(log);
+
+        let summary = runtime
+            .run_turn("run the command", None)
             .expect("turn should complete");
         assert_eq!(summary.iterations, 2);
     }
