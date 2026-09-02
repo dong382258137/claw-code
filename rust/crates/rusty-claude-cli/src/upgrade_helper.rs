@@ -25,7 +25,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::session_mgr::{
-    clear_upgrade_exited, read_upgrade_exited, UPGRADE_EXITED_REL,
+    clear_upgrade_exited, read_upgrade_exited, read_upgrade_request, UPGRADE_EXITED_REL,
 };
 
 /// 轮询"旧进程已退出"标记的间隔。
@@ -64,15 +64,22 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         user_cwd.display()
     );
 
-    // 0. 防残留误触发:启动时先清理可能存在的旧 exited 标记(上次升级失败
-    //    残留会导致本助手立即误判"旧进程已退出",跳过等待直接迁移)。
-    clear_upgrade_exited(user_cwd);
-
-    // 1. 等旧进程写 exited 标记(状态已落盘 + 同意退出)。
+    // 1. 等旧进程写 exited 标记(校验 old_pid 归属)。
+    //    注意:不能在启动时无条件 clear exited —— 那会与旧进程的
+    //    write_upgrade_exited 竞态:旧进程若已写好标记(如 shutdown 很快),
+    //    clear 会误删,本助手随后轮询永远等不到 → 卡满 180s 超时
+    //    (2026-09-02 实测复现)。防残留改由 old_pid 校验完成:
+    //    上次升级失败残留的 exited 携带旧 old_pid,与本次 request.old_pid
+    //    不匹配,判定为残留并清除,不会误触发本次迁移。
+    let expected_old_pid = read_upgrade_request(user_cwd).map(|req| req.old_pid);
     let started = Instant::now();
     loop {
-        if read_upgrade_exited(user_cwd).is_some() {
-            break;
+        if let Some(exited) = read_upgrade_exited(user_cwd) {
+            if exited_belongs(&exited, expected_old_pid) {
+                break;
+            }
+            // 上次升级失败残留:清除并继续等本次标记。
+            clear_upgrade_exited(user_cwd);
         }
         if started.elapsed() > WAIT_TIMEOUT {
             return Err(format!(
@@ -138,6 +145,21 @@ fn backup_path(exe: &Path) -> PathBuf {
     let mut os = exe.as_os_str().to_os_string();
     os.push(".old");
     PathBuf::from(os)
+}
+
+/// 判断 exited 标记是否属于本次升级(与 request 的 old_pid 匹配)。
+///
+/// - `expected_old_pid = None`(异常,无 request) → 保守信任 exited(返回 true)
+/// - exited 无 old_pid 且期望有 → 不归属(返回 false,防上次失败残留误触发)
+fn exited_belongs(exited: &serde_json::Value, expected_old_pid: Option<u32>) -> bool {
+    let exited_pid = exited
+        .get("old_pid")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    match expected_old_pid {
+        Some(expected) => exited_pid == Some(expected),
+        None => true,
+    }
 }
 
 /// 从 exe 路径推导 workspace root(源码仓库根,含 Cargo.toml)。
@@ -211,5 +233,34 @@ mod tests {
         let exe = Path::new("claw-plus.exe");
         let err = workspace_root_from_exe(exe).expect_err("should reject shallow path");
         assert!(err.to_string().contains("无法从 exe 路径推导"), "got: {err}");
+    }
+
+    // ---- 2026-09-02 竞态修复:exited 归属校验 ----
+
+    #[test]
+    fn exited_belongs_matching_pid() {
+        let exited = serde_json::json!({"old_pid": 123, "exited_at_ms": 1});
+        assert!(exited_belongs(&exited, Some(123)));
+    }
+
+    #[test]
+    fn exited_belongs_rejects_other_pid() {
+        // 上次升级失败残留的 exited(old_pid 不同)必须判为不归属,防止误触发。
+        let exited = serde_json::json!({"old_pid": 999, "exited_at_ms": 1});
+        assert!(!exited_belongs(&exited, Some(123)));
+    }
+
+    #[test]
+    fn exited_belongs_trusts_when_no_request() {
+        // 无 request(异常场景)时保守信任 exited。
+        let exited = serde_json::json!({"old_pid": 123, "exited_at_ms": 1});
+        assert!(exited_belongs(&exited, None));
+    }
+
+    #[test]
+    fn exited_belongs_missing_pid_is_not_belongs() {
+        // exited 缺 old_pid 且期望有 → 不归属(防异常标记)。
+        let exited = serde_json::json!({"exited_at_ms": 1});
+        assert!(!exited_belongs(&exited, Some(123)));
     }
 }
