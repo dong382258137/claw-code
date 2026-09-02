@@ -67,6 +67,35 @@ fn log_out(log_file: &Option<File>, msg: &str) {
     }
 }
 
+/// 截断超长文本(日志可读性)。
+fn truncate(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}\n…(截断)")
+    } else {
+        head
+    }
+}
+
+/// 记录关键环境变量到日志(诊断编译失败时的环境差异)。
+fn log_key_env(log_file: &Option<File>) {
+    for var in [
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTFLAGS",
+        "RUSTUP_TOOLCHAIN",
+        "MSYSTEM",
+        "MSYSTEM_CARCH",
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.trim().is_empty() {
+                log_out(log_file, &format!("[upgrade-helper] env {var}={}", truncate(&value, 300)));
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 /// CREATE_NEW_CONSOLE:让升级助手拥有独立控制台,编译输出对用户可见。
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
@@ -98,6 +127,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         &log_file,
         &format!("[upgrade-helper] 升级助手启动: user_cwd={}", user_cwd.display()),
     );
+    log_key_env(&log_file);
 
     // 1. 等旧进程写 exited 标记(校验 old_pid 归属)。
     //    注意:不能在启动时无条件 clear exited —— 那会与旧进程的
@@ -178,10 +208,13 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         args.push("--release".to_string());
     }
     args.extend(["-p".to_string(), "rusty-claude-cli".to_string()]);
-    let status = Command::new("cargo")
+    // 用 .output() 而非 .status():捕获 cargo 的 stdout/stderr 并写入日志,
+    // 否则编译错误只出现在独立新终端,窗口关闭即丢失,无法定位
+    // (2026-09-03 实测:仅剩 exit=101,原因不可见)。
+    let output = Command::new("cargo")
         .args(&args)
         .current_dir(&workspace_root)
-        .status()
+        .output()
         .map_err(|err| {
             log_out(
                 &log_file,
@@ -189,11 +222,16 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
             );
             err
         })?;
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let msg = format!(
-            "[upgrade-helper] 编译失败(exit={:?})。旧二进制已备份为 {},可手动恢复。",
-            status.code(),
-            old_exe.display()
+            "[upgrade-helper] 编译失败(exit={:?})。旧二进制已备份为 {},可手动恢复。\n\
+             --- cargo stderr ---\n{}\n--- cargo stdout ---\n{}",
+            output.status.code(),
+            old_exe.display(),
+            truncate(&stderr, 4000),
+            truncate(&stdout, 2000)
         );
         log_out(&log_file, &msg);
         eprintln!("{msg}");
