@@ -271,6 +271,17 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     );
     let mut cmd = Command::new(&exe);
     cmd.current_dir(user_cwd);
+    // 新进程必须 CREATE_NEW_CONSOLE:若继承 helper 的 stdio,在旧进程(用户
+    // TUI)退出后,共享管道读端关闭,新进程初始化时任何 println!/eprintln!
+    // 触发 "failed printing to stderr: 管道正在被关闭 (os error 232)" panic
+    // (2026-09-03 claw-crash.log 多次实测;0:08 无 CREATE_NEW_CONSOLE 前台
+    // 跑时新进程正常,用户环境带 CREATE_NEW_CONSOLE 时必 232)。
+    // 独立新控制台后新进程拿到自己的有效标准句柄,不受 helper 终端影响。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NEW_CONSOLE);
+    }
     let mut child = cmd.spawn()?;
 
     // 5. 清理 exited 标记(本次升级完成)。
@@ -281,10 +292,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     );
 
     // 6. 驻留监护:helper 不能立即退出 —— 若退出,CREATE_NEW_CONSOLE 终端
-    //    (新进程共享的 stdout/stderr 管道)随之关闭,新进程初始化时任何
-    //    println! 触发 "failed printing to stderr: 管道正在被关闭 (os error 232)"
-    //    panic(2026-09-03 claw-crash.log 实测,upgrade-request 残留未清理)。
-    //    wait 保持终端存活,直到新进程(REPL)退出,helper 随之退出。
+    //    (helper 侧输出)随之关闭;wait 保持 helper 终端存活到新进程退出。
     let _ = child.wait();
     Ok(())
 }
