@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -454,6 +455,32 @@ pub const SPAWN_PARALLEL_SUBAGENTS_TOOL_SPEC: &str = r#"{
     }
 }
 "#;
+
+/// Current Task 锚点修复(P2):LLM 主动维护任务目标。
+///
+/// 规则式 goal 提取(task_state.update_from_turn)是零成本快速反射,但依赖
+/// 输入长度/承接词表等启发式,短任务名("MVP-C1")与承接词("好滴")边界
+/// 存在误判(方案 C v5 已收敛 29/29,但规则永远有边界误差)。
+///
+/// 本工具让 LLM 作为**语义权威**:在明确的任务切换时刻(create_plan、
+/// 收到新任务指令、判断规则提取错误时)显式写入当前任务目标,
+/// 覆盖规则提取值。Current Task 槽位优先级变为:
+/// active_plan.task_summary > LLM 主动设置(set_current_task) > 规则提取 goal。
+#[allow(dead_code)] // Reserved for future registration via main.rs tool registry.
+pub const SET_CURRENT_TASK_TOOL_SPEC: &str = r#"{
+    "name": "set_current_task",
+    "description": "Explicitly set the current task goal (the 'Current Task' anchor injected every turn). Use this when starting a new task, switching tasks, or when the automatically-extracted goal is wrong or stale. The value overrides the auto-extracted goal until the next user input updates it. Keep it concise (<=150 chars) and task-identity-focused (what you are doing now, not how).",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "The current task goal, e.g. 'MVP-C1: 从 Confirmed 方案提炼规则提案' or '修复 task_state 锚点滞后缺陷'."
+            }
+        },
+        "required": ["goal"]
+    }
+}"#;
 
 /// 请求来源分类 — 用于缓存统计隔离。
 /// 子智能体请求经 cli 侧路由到独立的 `subagent-{session}` 统计,
@@ -991,6 +1018,21 @@ pub(crate) fn process_tool_uses(
             Err(e) => (e.to_string(), true),
         };
 
+        // 里程碑 2 方向 A:子代理工具失败自动捕获(与主循环 4279 同一管道)。
+        // 子代理内部工具失败在"子代理整体成功"时此前完全漏采(本循环无任何
+        // 失败记账);现在走 decision_log::auto_capture_failure 统一管道
+        // (签名提取 + simhash 去重 + Pending 入库),主/子代理共用同一经验库,
+        // 未来会话 search_past_decisions 可检索子代理失败经验(举一反三)。
+        // 静默降级:打开 DB 失败/写入失败返回 None,不阻断工具执行。
+        if is_error {
+            let _ = crate::decision_log::auto_capture_failure(
+                workspace_root,
+                "subagent",
+                &name,
+                &output,
+            );
+        }
+
         // changed_files 提取(edit_file/write_file 可能修改文件)
         if matches!(name.as_str(), "edit_file" | "write_file") {
             changed_files.extend(crate::multi_agent::extract_changed_files(
@@ -1363,6 +1405,11 @@ pub struct ConversationRuntime<C, T> {
     /// `None` 时回退到 `auto_compaction_input_tokens_threshold`。
     context_window: Option<u32>,
     hook_abort_signal: HookAbortSignal,
+    /// 热升级优雅中断信号(双大脑收官):`/upgrade` 命令置位后,
+    /// `run_turn` 循环在迭代顶部检测 → 注入"暂停通知"给 LLM → turn 自然
+    /// 收尾(不走 Err 路径)。新进程 resume 后注入"继续任务通知"。
+    /// 与 `hook_abort_signal`(硬中断,return Err)互补:本信号是优雅收尾。
+    upgrade_pending: Arc<AtomicBool>,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
     /// 细粒度诊断回调：在 `run_turn` 关键路径埋点，帮助定位"会话卡死"问题。
     /// 每个事件自动带时间戳，回调签名 `Fn(String) + Send`。
@@ -1901,6 +1948,7 @@ where
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
             context_window: None,
             hook_abort_signal: HookAbortSignal::default(),
+            upgrade_pending: Arc::new(AtomicBool::new(false)),
             hook_progress_reporter: None,
             diag_callback: None,
             tool_result_callback: None,
@@ -1977,6 +2025,29 @@ where
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         self.hook_abort_signal = hook_abort_signal;
         self
+    }
+
+    /// 注入热升级优雅中断信号(双大脑收官基石)。
+    ///
+    /// `/upgrade` 命令置位后,`run_turn` 循环在迭代顶部检测到 → 向 session
+    /// 注入"暂停通知"(告诉 LLM 正在热升级,请收尾) → turn 自然收尾(不走
+    /// Err 路径)。与 [`with_hook_abort_signal`](Self::with_hook_abort_signal)
+    /// (硬中断,return Err)互补:本信号是优雅收尾。
+    #[must_use]
+    pub fn with_upgrade_signal(mut self, upgrade_pending: Arc<AtomicBool>) -> Self {
+        self.upgrade_pending = upgrade_pending;
+        self
+    }
+
+    /// 查询热升级优雅中断信号是否已置位(供 `/upgrade` 命令预检)。
+    #[must_use]
+    pub fn upgrade_pending(&self) -> bool {
+        self.upgrade_pending.load(Ordering::SeqCst)
+    }
+
+    /// 设置热升级优雅中断信号(由 `/upgrade` 命令调用,旧进程内)。
+    pub fn request_upgrade(&self) {
+        self.upgrade_pending.store(true, Ordering::SeqCst);
     }
 
     #[must_use]
@@ -2695,6 +2766,18 @@ where
         self.active_plan.as_ref()
     }
 
+    /// 热升级恢复(双大脑收官基石):注入恢复的 PlanArtifact 到 active_plan。
+    ///
+    /// 新进程启动时检测到 `.claw/upgrade-request.json`(旧进程 `/upgrade` 写入),
+    /// 从 `.claw/plans/<id>.json` 加载 plan 后调用本方法恢复计划状态,
+    /// 使旧进程的 Plan/Execute/Review 循环在新进程无缝续跑。
+    /// 幂等:已有 active_plan 时不覆盖(保留当前计划的优先级)。
+    pub fn restore_active_plan(&mut self, plan: PlanArtifact) {
+        if self.active_plan.is_none() {
+            self.active_plan = Some(plan);
+        }
+    }
+
     /// F5 计划文件集校验:若写入目标路径不在当前 active plan 涉及的文件集合内,
     /// 返回一条软警告文本;否则返回 `None`。`input` 是写工具调用入参的 JSON。
     ///
@@ -3086,11 +3169,13 @@ where
         // - survey_hard_stop_injected:预算耗尽强收口消息已注入,仅一次
         // - survey_stall_rounds:强收口后连续只读停滞轮数,达 SURVEY_STALL_LIMIT 中止
         // - safety_net_notice_injected:回滚安全网提示已注入,仅一次
+        // - upgrade_notice_injected:热升级暂停通知已注入,仅一次(第二次检测强制收尾)
         let survey_budget_baseline = self.count_survey_tool_calls();
         let mut survey_countdown_injected = false;
         let mut survey_hard_stop_injected = false;
         let mut survey_stall_rounds: usize = 0;
         let mut safety_net_notice_injected = false;
+        let mut upgrade_notice_injected = false;
 
         // 复杂任务调高迭代上限(软硬双层)。
         // 判定完全交给模型:存在活跃 plan(模型调用 create_plan 创建)即视为
@@ -3289,6 +3374,28 @@ where
             if self.hook_abort_signal.is_aborted() {
                 self.record_turn_failed(iterations, &RuntimeError::new("turn interrupted by user"));
                 return Err(RuntimeError::new("turn interrupted by user"));
+            }
+
+            // 热升级优雅中断(双大脑收官基石):`/upgrade` 命令置位 upgrade_pending。
+            // 与 hook_abort_signal(硬中断,return Err)互补 —— 本路径是优雅收尾:
+            // 1. 首次检测:注入"暂停通知"给 LLM,引导其总结已有发现并收尾,
+            //    不发起新工具调用(状态已实时落盘,新进程可无缝续跑)。
+            // 2. 若 LLM 忽略通知继续调工具(下一迭代仍检测到)→ 直接 break
+            //    自然收尾(不走 Err),状态仍在盘上,可安全退出旧进程。
+            if self.upgrade_pending.load(Ordering::SeqCst) {
+                if !upgrade_notice_injected {
+                    upgrade_notice_injected = true;
+                    let notice = "[runtime] 热升级请求已收到：框架即将升级为新版本。\
+                        请立即收尾：总结当前任务的已有发现与进度（已实时落盘，\
+                        新进程将无缝恢复并继续），不要再发起新的工具调用。\
+                        若正在执行长任务，请把已完成/待办写入 NOTEBOOK <plan> 段。";
+                    let _ = self
+                        .session
+                        .push_message(ConversationMessage::user_text(notice));
+                } else {
+                    // 已注入过通知但 LLM 仍继续 → 强制自然收尾(状态已落盘)。
+                    break;
+                }
             }
 
             let request = {
@@ -4087,6 +4194,16 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
+                        } else if tool_name == "set_current_task" {
+                            // Current Task 锚点修复(P2):LLM 主动维护任务目标。
+                            // 规则式提取(task_state.update_from_turn)是零成本快速反射,
+                            // 但短任务名("MVP-C1")与承接词边界存在启发式误判;本工具
+                            // 让 LLM 在明确任务切换时刻显式写入 goal(语义权威),
+                            // 覆盖规则提取值。Current Task 槽位优先读 task_state.goal。
+                            match self.execute_set_current_task(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
                         } else {
                             // 外部自定义工具路径:经 ToolExecutor 注册的工具(含 MCP)。
                             // 成功执行后触发 PostCustomToolCall 事件(见下方接入点)。
@@ -4269,6 +4386,24 @@ where
                                     &self.session.session_id,
                                     &tool_name,
                                     &effective_input,
+                                    &output,
+                                );
+                            }
+                        }
+
+                        // 里程碑 1:自动感知→自动记忆闭环(与 append_attempt 同点)。
+                        // 失败观测此前只落会话内(<attempted> 段)或统计(tool_call_stats),
+                        // 均不可跨会话语义检索;decision_log 只收 LLM 主动写入 → 未修复
+                        // 失败系统性漏采,未来会话 search_past_decisions 搜不到,
+                        // 无法举一反三。此处把失败信号自动捕获入经验库(去重 + Pending +
+                        // auto_captured 标记),与 LLM 主动 log_decision 正交互补:
+                        // 主动记录"已验证的修复",自动捕获"未修复的观测"。
+                        // 普适:任何工具失败走同一条管道。静默吞错(与 append_attempt 一致)。
+                        if is_error {
+                            if let Some(decision_log) = &self.decision_log {
+                                let _ = decision_log.log_auto_captured_failure(
+                                    &self.session.session_id,
+                                    &tool_name,
                                     &output,
                                 );
                             }
@@ -4730,6 +4865,25 @@ where
                             }
                             Err(e) => {
                                 self.emit_diag(format!("harness evolution error: {e}"));
+                            }
+                        }
+                        // 阶段 4 接入(MVP-C1):从 decision_log 的 Confirmed 方案提炼
+                        // 规则提案。纵向数据流第二条连接:已验证修复方案 → 群体规则
+                        // Candidate。decision_log 未配置 / 提炼失败 → 静默打 diag,
+                        // 不阻断 evolve 主流程(与失败轨迹加载同语义)。
+                        if let Some(decision_log) = &self.decision_log {
+                            match crate::harness_evolution::propose_from_confirmed_solutions(
+                                decision_log,
+                                archive,
+                                &config,
+                            ) {
+                                Ok(n) if n > 0 => self.emit_diag(format!(
+                                    "harness evolution: {n} proposals from verified solutions"
+                                )),
+                                Ok(_) => {}
+                                Err(e) => self.emit_diag(format!(
+                                    "harness evolution verified-solution propose error: {e}"
+                                )),
                             }
                         }
                     }
@@ -7088,9 +7242,79 @@ where
 
         let evidence = parsed.get("verification_evidence").and_then(|v| v.as_str());
 
-        decision_log
+        let result = decision_log
             .verify_decision(decision_id, verification, evidence)
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+
+        // MVP-C2:验证反馈贯通(纵向数据流第一条连接)。
+        // verify_decision 成功后,把个体验证结果反馈到 harness_edits 关联规则:
+        // 1. 取该决策的 problem_signature(关联键)
+        // 2. Pending(撤销语义)不反馈;Confirmed/Refuted/Partial 反馈——
+        //    Confirmed 额外 success_count+1,Refuted/Partial 仅 verify_count+1
+        //    (与 archive::update_stats_for_pathology 的 confirmed 参数语义一致)
+        // 3. harness_archive 未配置(非进化激活)或更新失败 → 静默忽略,
+        //    不阻断 verify_decision 结果返回(与 log_decision 降级一致)
+        if verification.updates_stats() {
+            if let (Ok(signature), Some(archive)) = (
+                decision_log.get_problem_signature(decision_id),
+                &self.harness_archive,
+            ) {
+                let _ = archive.update_stats_for_pathology(
+                    &signature,
+                    verification == crate::decision_log::DecisionVerification::Confirmed,
+                );
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// P2(Current Task 锚点修复):LLM 主动维护任务目标。
+    ///
+    /// 规则式 goal 提取(task_state.update_from_turn)是零成本快速反射,但依赖
+    /// 长度/承接词表等启发式,短任务名("MVP-C1")与承接词("好滴")边界存在
+    /// 误判。本方法让 LLM 作为**语义权威**:在明确任务切换时刻显式写入 goal,
+    /// 覆盖规则提取值,并持久化到会话级 task_state 文件。
+    ///
+    /// 输入:`{"goal": "..."}`(goal 必填,截断到 [`crate::task_state::TASK_GOAL_MAX_CHARS`])。
+    /// task_state 未配置 / 保存失败 → 返回降级字符串(不阻断 LLM 工作流)。
+    fn execute_set_current_task(
+        &mut self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(path) = self.task_state_path() else {
+            return Ok(
+                "set_current_task is not available: no workspace_root configured. \
+                 Use --workspace-root or set_workspace_root to enable task state persistence."
+                    .to_string(),
+            );
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid input JSON: {e}"))?;
+        let goal = parsed
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'goal' field")?
+            .trim();
+        if goal.is_empty() {
+            return Err("'goal' must be non-empty".into());
+        }
+        let goal = crate::task_state::truncate_goal(goal);
+
+        // 更新内存缓存 + 持久化(失败静默降级,与 maybe_update_task_state 一致)。
+        let mut state = self
+            .task_state
+            .clone()
+            .unwrap_or_else(|| crate::task_state::TaskState::load(&path).unwrap_or_default());
+        state.goal = goal.clone();
+        state.updated_at_ms = crate::task_state::now_ms_pub();
+        if let Err(e) = state.save(&path) {
+            eprintln!("[task_state] set_current_task failed to persist: {e}");
+        }
+        self.task_state = Some(state);
+
+        Ok(format!("current task set: {goal}"))
     }
 
     fn execute_query_project_graph(
@@ -9357,6 +9581,76 @@ mod tests {
         if let Err(err) = &result {
             panic!("活跃 plan 应使用更高迭代上限,不应被默认上限误杀: {err}");
         }
+    }
+
+    /// 热升级(P2):restore_active_plan 注入恢复的 plan,幂等不覆盖已有 plan。
+    #[test]
+    fn restore_active_plan_injects_and_is_idempotent() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let plan = crate::planner::artifact::PlanArtifact::new(
+            "热升级恢复的任务".to_string(),
+            vec![],
+        );
+        assert!(runtime.active_plan().is_none());
+        runtime.restore_active_plan(plan.clone());
+        assert_eq!(runtime.active_plan().unwrap().task_summary, "热升级恢复的任务");
+        // 幂等:已有 plan 时新 plan 不覆盖。
+        let second = crate::planner::artifact::PlanArtifact::new("另一个计划".to_string(), vec![]);
+        runtime.restore_active_plan(second);
+        assert_eq!(
+            runtime.active_plan().unwrap().task_summary,
+            "热升级恢复的任务",
+            "已有 active_plan 时 restore 不应覆盖"
+        );
+    }
+
+    /// 热升级(P1):upgrade_pending 信号置位后,run_turn 检测到并注入暂停通知。
+    #[test]
+    fn upgrade_pending_triggers_pause_notice() {
+        use std::sync::atomic::AtomicBool;
+
+        struct UpgradeApi;
+        impl ApiClient for UpgradeApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                // 收到暂停通知后返回纯文本结束(不发起新工具调用)。
+                Ok(vec![
+                    AssistantEvent::TextDelta("好的,我将收尾当前任务。".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let signal = Arc::new(AtomicBool::new(true)); // 预置位:模拟 /upgrade 已请求
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            UpgradeApi,
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_upgrade_signal(signal)
+        .with_max_iterations(10);
+
+        // run_turn 应正常返回(优雅收尾,非 Err),且会话中出现暂停通知。
+        let result = runtime.run_turn("执行任务", None);
+        assert!(result.is_ok(), "upgrade 应优雅收尾而非 Err: {result:?}");
+        let msgs = &runtime.session.messages;
+        let has_notice = msgs.iter().any(|m| {
+            m.blocks.iter().any(|b| match b {
+                ContentBlock::Text { text } => text.contains("热升级请求已收到"),
+                _ => false,
+            })
+        });
+        assert!(has_notice, "应注入热升级暂停通知给 LLM");
     }
 
     #[test]
@@ -15119,6 +15413,49 @@ mod tests {
     }
 
     #[test]
+    fn process_tool_uses_failed_tool_auto_captured_to_decision_log() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let workspace = tmp.path().to_path_buf();
+
+        // 注册必然失败的工具(真实执行失败,走统一出口 → is_error=true)
+        let tool_uses = vec![make_edit_tool_use("tu1", "edit_file", "src/foo.rs")];
+        let mut executor = StaticToolExecutor::new()
+            .register("edit_file", |_input| Err(ToolError::new("old_string not found")));
+        let mut messages = Vec::new();
+        let mut tools_used = Vec::new();
+        let mut changed_files = Vec::new();
+
+        let result = process_tool_uses(
+            crate::multi_agent::SubagentCapability::Execute,
+            &tool_uses,
+            &mut executor,
+            &workspace,
+            &mut messages,
+            &mut tools_used,
+            &mut changed_files,
+            None,
+        );
+        assert!(result.is_ok(), "tool failure should not fail the loop");
+        assert!(messages.iter().any(|_m| true), "tool_result should be appended");
+
+        // 验证失败信号自动落入 workspace/.claw/decision_log.db(子代理循环路径)
+        let log = crate::decision_log::DecisionLog::open(&workspace).unwrap();
+        let hits = log
+            .search_decisions("old_string not found", 5)
+            .unwrap();
+        assert!(
+            hits.contains("edit_file: old_string not found"),
+            "auto-capture should have recorded the failure: {hits}"
+        );
+        assert!(hits.contains("Pending"), "should be Pending: {hits}");
+        assert!(
+            hits.contains("auto_captured"),
+            "should carry auto_captured tag: {hits}"
+        );
+    }
+
+
+    #[test]
     fn process_tool_uses_analyze_edit_rejected_by_whitelist() {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let workspace = tmp.path().to_path_buf();
@@ -17623,8 +17960,7 @@ mod tests {
 
     /// 显式传 knowledge_source → 原样保留(LLM 基于自身任务上下文精确标注)。
     #[test]
-    fn execute_log_decision_preserves_explicit_source() {
-        let dir = tempfile::tempdir().unwrap();
+    fn execute_log_decision_preserves_explicit_source() {        let dir = tempfile::tempdir().unwrap();
         let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
         let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
             Session::new(),
@@ -17648,6 +17984,194 @@ mod tests {
             .expect("stats");
         assert!(stats.contains("web_research"), "stats: {stats}");
     }
+
+    // ===== P2:set_current_task LLM 主动维护通道 =====
+
+    /// LLM 主动写入当前任务目标 → 覆盖规则提取值并持久化。
+    #[test]
+    fn execute_set_current_task_writes_goal_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                NoopApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_workspace_root(dir.path().to_path_buf());
+
+        let result = runtime
+            .execute_set_current_task(r#"{"goal":"MVP-C1: 从 Confirmed 方案提炼规则提案"}"#)
+            .expect("set_current_task");
+        assert!(result.contains("MVP-C1"), "got: {result}");
+
+        // 内存缓存已更新。
+        let goal = runtime.task_state.as_ref().map(|ts| ts.goal.clone());
+        assert_eq!(
+            goal.as_deref(),
+            Some("MVP-C1: 从 Confirmed 方案提炼规则提案"),
+            "goal should be set in memory"
+        );
+
+        // 已持久化到会话级 task_state 文件。
+        let path = runtime.task_state_path().expect("task_state_path");
+        let loaded = crate::task_state::TaskState::load(&path).expect("load");
+        assert_eq!(
+            loaded.goal, "MVP-C1: 从 Confirmed 方案提炼规则提案",
+            "goal should persist to disk"
+        );
+    }
+
+    /// 缺少 goal 字段 → 报错;空 goal → 报错。
+    #[test]
+    fn execute_set_current_task_rejects_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                NoopApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_workspace_root(dir.path().to_path_buf());
+
+        assert!(runtime.execute_set_current_task("{}").is_err(), "missing goal");
+        assert!(
+            runtime.execute_set_current_task(r#"{"goal":"   "}"#).is_err(),
+            "empty goal"
+        );
+    }
+
+    // ===== MVP-C2:verify_decision → harness_edits 后验更新(纵向数据流) =====
+
+    /// 端到端真实路径:log_decision 记录决策 → verify_decision(Confirmed)
+    /// → harness_edits 关联规则统计更新(verify_count+1, success_count+1)。
+    #[test]
+    fn execute_verify_decision_feedback_updates_harness_edit_stats() {
+        use crate::harness_evolution::types::{EditSource, EditStatus, HarnessEdit};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. 预置一条 Candidate 规则(与决策问题签名同工具、词集相似)。
+        let archive = crate::harness_evolution::HarnessArchive::open(dir.path()).unwrap();
+        archive
+            .add_candidate(HarnessEdit {
+                id: "e1".to_string(),
+                pathology: "edit_file: old_string not found".to_string(),
+                content: "When Edit fails with old_string not found, Grep first".to_string(),
+                status: EditStatus::Candidate,
+                source: EditSource::RulePattern,
+                verify_count: 0,
+                success_count: 0,
+                created_at: 0,
+                last_verified_at: None,
+                proposer_reasoning: "test".to_string(),
+                similarity_hash: 0,
+                retire_reason: None,
+            })
+            .expect("add candidate");
+
+        // 2. 构造带双系统(decision_log + harness_archive)的 runtime。
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log)
+        .with_harness_evolution(dir.path().to_path_buf());
+
+        // 3. 记录一条决策(problem_signature 与规则 pathology 同工具相似)。
+        let logged = runtime
+            .execute_log_decision(
+                r#"{"session_id":"s1","problem_signature":"edit_file: old_string not found in file.rs","root_cause_hypothesis":"stale text","applied_solution":"grep first","affected_files":["a.rs"],"verification_result":"Confirmed"}"#,
+            )
+            .expect("log_decision");
+        let decision_id: i64 = logged
+            .trim_start_matches("decision_logged id=")
+            .parse()
+            .expect("parse decision id");
+
+        // 4. 验证为 Confirmed → 应触发 harness 后验更新。
+        let verify_input = format!(
+            r#"{{"decision_id":{decision_id},"verification_result":"Confirmed","verification_evidence":"cargo test passed"}}"#
+        );
+        runtime
+            .execute_verify_decision(&verify_input)
+            .expect("verify_decision");
+
+        // 5. 断言 harness_edits 关联规则统计已更新。
+        let archive = crate::harness_evolution::HarnessArchive::open(dir.path()).unwrap();
+        let edit = archive.get_edit("e1").expect("get").expect("exists");
+        assert_eq!(edit.verify_count, 1, "verify_count should increment");
+        assert_eq!(edit.success_count, 1, "Confirmed should add success");
+        assert_eq!(edit.status, EditStatus::Candidate, "status unchanged");
+    }
+
+    /// Pending(撤销语义)不触发 harness 后验更新。
+    #[test]
+    fn execute_verify_decision_pending_does_not_feedback_to_harness() {
+        use crate::harness_evolution::types::{EditSource, EditStatus, HarnessEdit};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let archive = crate::harness_evolution::HarnessArchive::open(dir.path()).unwrap();
+        archive
+            .add_candidate(HarnessEdit {
+                id: "e1".to_string(),
+                pathology: "bash: permission denied".to_string(),
+                content: "check permissions before write".to_string(),
+                status: EditStatus::Candidate,
+                source: EditSource::RulePattern,
+                verify_count: 0,
+                success_count: 0,
+                created_at: 0,
+                last_verified_at: None,
+                proposer_reasoning: "test".to_string(),
+                similarity_hash: 0,
+                retire_reason: None,
+            })
+            .expect("add candidate");
+
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log)
+        .with_harness_evolution(dir.path().to_path_buf());
+
+        let logged = runtime
+            .execute_log_decision(
+                r#"{"session_id":"s1","problem_signature":"bash: permission denied writing to file","root_cause_hypothesis":"perms","applied_solution":"chmod","affected_files":["b.sh"],"verification_result":"Confirmed"}"#,
+            )
+            .expect("log_decision");
+        let decision_id: i64 = logged
+            .trim_start_matches("decision_logged id=")
+            .parse()
+            .expect("parse decision id");
+
+        // Pending = 撤销,不更新统计,也不反馈 harness。
+        let verify_input = format!(
+            r#"{{"decision_id":{decision_id},"verification_result":"Pending"}}"#
+        );
+        runtime
+            .execute_verify_decision(&verify_input)
+            .expect("verify_decision");
+
+        let archive = crate::harness_evolution::HarnessArchive::open(dir.path()).unwrap();
+        let edit = archive.get_edit("e1").expect("get").expect("exists");
+        assert_eq!(edit.verify_count, 0, "Pending must not touch verify_count");
+        assert_eq!(edit.success_count, 0, "Pending must not touch success_count");
+    }
+
 
     // ===== P-fix:内置工具完成后触发 tool_result_callback =====
 

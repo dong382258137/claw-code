@@ -1113,6 +1113,103 @@ pub(crate) fn current_session_store() -> Result<runtime::SessionStore, Box<dyn s
     runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
+/// 热升级请求(双大脑收官基石):旧进程 `/upgrade` 写入,新进程启动检测。
+///
+/// 放在工作区 `.claw/upgrade-request.json`(用户确认位置)。字段:
+/// - `session_id`:旧进程要恢复的会话 ID(新进程 --resume 用)
+/// - `plan_id`:旧进程活跃计划的文件 ID(新进程从 `.claw/plans/<plan_id>.json` 恢复)
+/// - `requested_at_ms`:请求时间戳(陈旧标记清理用,>10min 视为失效)
+/// - `from_version`:旧进程版本(诊断用)
+/// - `old_pid`:旧进程 PID(升级助手等它退出后才 mv exe;自动退出路径写 exited 标记用)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UpgradeRequest {
+    pub(crate) session_id: String,
+    pub(crate) plan_id: Option<String>,
+    pub(crate) requested_at_ms: i64,
+    pub(crate) from_version: String,
+    /// 旧进程 PID。0 = 未知(旧版标记,向后兼容)。
+    #[serde(default)]
+    pub(crate) old_pid: u32,
+}
+
+/// upgrade-request.json 相对工作区的路径。
+pub(crate) const UPGRADE_REQUEST_REL: &str = ".claw/upgrade-request.json";
+/// 旧进程"已退出"标记(升级助手轮询此文件确认可开始迁移 exe)。
+pub(crate) const UPGRADE_EXITED_REL: &str = ".claw/upgrade-exited.json";
+/// 升级标记陈旧阈值:超过此毫秒数的标记视为失效(崩溃残留),启动时忽略并清理。
+pub(crate) const UPGRADE_REQUEST_STALE_MS: i64 = 10 * 60 * 1000;
+
+/// 写入升级请求(旧进程 `/upgrade` 调用)。失败返回错误(不 panic)。
+pub(crate) fn write_upgrade_request(
+    workspace_root: &Path,
+    req: &UpgradeRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = workspace_root.join(UPGRADE_REQUEST_REL);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(req)?;
+    fs::write(&path, json)?;
+    Ok(())
+}
+
+/// 读取升级请求(新进程启动检测)。不存在/解析失败返回 None(降级为普通启动)。
+pub(crate) fn read_upgrade_request(
+    workspace_root: &Path,
+) -> Option<UpgradeRequest> {
+    let path = workspace_root.join(UPGRADE_REQUEST_REL);
+    let content = fs::read_to_string(path).ok()?;
+    let req: UpgradeRequest = serde_json::from_str(&content).ok()?;
+    Some(req)
+}
+
+/// 清理升级请求(新进程恢复完成后调用,幂等)。失败静默(非关键路径)。
+pub(crate) fn clear_upgrade_request(workspace_root: &Path) {
+    let path = workspace_root.join(UPGRADE_REQUEST_REL);
+    let _ = fs::remove_file(path);
+}
+
+/// 旧进程退出时写"已退出"标记(任务 2 一键化:旧进程自动退出前调用)。
+///
+/// 内容含 old_pid 与退出时间,升级助手轮询此文件出现即确认旧进程已退出、
+/// exe 文件锁已释放,可安全执行 `mv claw.exe claw.exe.old`。
+/// 幂等:文件已存在则覆写(无副作用)。
+pub(crate) fn write_upgrade_exited(
+    workspace_root: &Path,
+    old_pid: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = workspace_root.join(UPGRADE_EXITED_REL);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let exited_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let json = serde_json::json!({
+        "old_pid": old_pid,
+        "exited_at_ms": exited_ms,
+    });
+    fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+    Ok(())
+}
+
+/// 读取"已退出"标记(升级助手轮询)。不存在/解析失败返回 None。
+pub(crate) fn read_upgrade_exited(
+    workspace_root: &Path,
+) -> Option<serde_json::Value> {
+    let path = workspace_root.join(UPGRADE_EXITED_REL);
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// 清理"已退出"标记(升级助手完成迁移后调用,幂等)。
+pub(crate) fn clear_upgrade_exited(workspace_root: &Path) {
+    let path = workspace_root.join(UPGRADE_EXITED_REL);
+    let _ = fs::remove_file(path);
+}
+
+
 pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let mut session = Session::new().with_workspace_root(cwd.clone());
@@ -2299,5 +2396,61 @@ mod tests {
         let line = render_session_picker_line(1, &session, false);
         assert!(line.contains("branch=dev"));
         assert!(line.contains("from=parent-1"));
+    }
+
+    // ===== 热升级:UpgradeRequest 读写(双大脑收官基石) =====
+
+    #[test]
+    fn upgrade_request_write_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = UpgradeRequest {
+            session_id: "session-abc".to_string(),
+            plan_id: Some("plan-1".to_string()),
+            requested_at_ms: 12345,
+            from_version: "2026.9.1".to_string(),
+            old_pid: 12345,
+        };
+        write_upgrade_request(dir.path(), &req).expect("write");
+        let loaded = read_upgrade_request(dir.path()).expect("read");
+        assert_eq!(loaded.session_id, "session-abc");
+        assert_eq!(loaded.plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(loaded.requested_at_ms, 12345);
+        assert_eq!(loaded.from_version, "2026.9.1");
+        assert_eq!(loaded.old_pid, 12345);
+    }
+
+    #[test]
+    fn upgrade_request_clear_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = UpgradeRequest {
+            session_id: "session-abc".to_string(),
+            plan_id: None,
+            requested_at_ms: 12345,
+            from_version: "2026.9.1".to_string(),
+            old_pid: 12345,
+        };
+        write_upgrade_request(dir.path(), &req).expect("write");
+        assert!(dir.path().join(UPGRADE_REQUEST_REL).exists());
+        clear_upgrade_request(dir.path());
+        assert!(!dir.path().join(UPGRADE_REQUEST_REL).exists());
+    }
+
+    #[test]
+    fn upgrade_request_read_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_upgrade_request(dir.path()).is_none());
+    }
+
+    #[test]
+    fn upgrade_exited_write_read_clear_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        // write → read 应含 old_pid。
+        write_upgrade_exited(dir.path(), 4321).expect("write exited");
+        let value = read_upgrade_exited(dir.path()).expect("read exited");
+        assert_eq!(value["old_pid"], 4321);
+        assert!(value["exited_at_ms"].as_i64().is_some());
+        // clear → read None。
+        clear_upgrade_exited(dir.path());
+        assert!(read_upgrade_exited(dir.path()).is_none());
     }
 }

@@ -473,6 +473,115 @@ impl DecisionLog {
         Ok(format!("decision_logged id={id}"))
     }
 
+    /// 自动捕获失败信号的 simhash 去重阈值(汉明距离 ≤ 此值视为重复)。
+    const AUTO_CAPTURE_DEDUP_THRESHOLD: u32 = 3;
+
+    /// 自动捕获去重时扫描的最近记录数(决策库通常远小于此)。
+    const AUTO_CAPTURE_DEDUP_SCAN: usize = 500;
+
+    /// 从失败输出提取紧凑问题签名(普适:任何工具、任何错误消息)。
+    ///
+    /// 格式:`{tool_name}: {错误首行摘要}`(首行截断 ≤ 100 字符)。
+    /// 首行通常是错误消息中信息密度最高的部分(如 `old_string not found` /
+    /// `permission denied`),截断防止超长错误(多行 stack trace)污染签名。
+    fn extract_failure_signature(tool_name: &str, error_output: &str) -> String {
+        let first_line = error_output.lines().next().unwrap_or("").trim();
+        let summary = if first_line.is_empty() {
+            truncate_str(error_output.trim(), 100)
+        } else {
+            truncate_str(first_line, 100)
+        };
+        format!("{tool_name}: {summary}")
+    }
+
+    /// 自动捕获一次工具失败观测(里程碑 1:自动感知→自动记忆闭环)。
+    ///
+    /// 与 [`log_decision`] 正交互补:
+    /// - `log_decision` — LLM 主动调用,记录**已完成的修复决策**(verified)
+    /// - 本方法 — 运行时在工具执行统一失败出口自动调用,记录**未修复的失败观测**
+    ///
+    /// 根因缺口:失败观测(`<attempted>` 段 / `tool_call_stats` / `failure_trace`)
+    /// 此前均不落入本经验库,而经验库只接受 LLM 主动写入 → 任务循环中 LLM
+    /// 无法可靠记录未修复失败 → 失败经验系统性漏采,未来会话
+    /// `search_past_decisions` 搜不到"此前见过这个失败",无法举一反三。
+    /// 本方法在统一出口补全该管道,任何工具失败都受益(多任务普适)。
+    ///
+    /// 入库记录:
+    /// - `problem_signature` = `{tool_name}: {错误首行摘要}`(紧凑、可 FTS5 检索)
+    /// - `root_cause_hypothesis` = `auto_captured` 占位(运行时不做归因,待 LLM 分析)
+    /// - `applied_solution` = `auto_captured` 占位(未应用方案)
+    /// - `verification_result` = `Pending`(未验证)
+    /// - `tags` = `["auto_captured", "tool-failure"]`(与 LLM 主动记录可区分)
+    ///
+    /// 去重:对最近 [`AUTO_CAPTURE_DEDUP_SCAN`] 条记录的 simhash 做汉明距离比较,
+    /// 距离 ≤ [`AUTO_CAPTURE_DEDUP_THRESHOLD`] 视为重复 → 跳过并返回 `skipped`。
+    /// 同一失败反复出现不刷屏经验库,但首次出现即入库 → 未来会话可检索。
+    ///
+    /// 静默降级语义与 `append_attempt` 一致:任何失败都不阻断工具结果返回。
+    pub fn log_auto_captured_failure(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        error_output: &str,
+    ) -> Result<String, DecisionLogError> {
+        let signature = Self::extract_failure_signature(tool_name, error_output);
+
+        // simhash:签名 + 固定占位后缀(自动捕获记录签名域只有 signature,
+        // 避免与 LLM 完整记录的空间重叠过近导致误去重)。
+        let simhash_text = format!("{signature} auto_captured auto_captured");
+        let similarity_hash = compute_simhash(&simhash_text) as i64;
+
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+
+        // simhash 去重:扫描最近记录,汉明距离 ≤ 阈值视为重复。
+        let mut stmt =
+            conn.prepare("SELECT similarity_hash FROM decisions ORDER BY id DESC LIMIT ?1")?;
+        let existing: Vec<i64> = stmt
+            .query_map(params![Self::AUTO_CAPTURE_DEDUP_SCAN as i64], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let is_dup = existing.iter().any(|h| {
+            hamming_distance(h.unsigned_abs(), similarity_hash.unsigned_abs())
+                <= Self::AUTO_CAPTURE_DEDUP_THRESHOLD
+        });
+        if is_dup {
+            return Ok(format!("auto_captured skipped (duplicate): {signature}"));
+        }
+
+        conn.execute(
+            "INSERT INTO decisions (
+                session_id, timestamp_ms, problem_signature, root_cause_hypothesis,
+                applied_solution, affected_files, verification_result,
+                verification_evidence, context_hash, similarity_hash, tags,
+                knowledge_source
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                session_id,
+                timestamp_ms,
+                signature,
+                "auto_captured: failure signal captured by runtime, root cause pending analysis",
+                "auto_captured: no solution applied, retained as searchable failure experience",
+                "[]",
+                "Pending",
+                None::<String>,
+                None::<String>,
+                similarity_hash,
+                Some("auto_captured,tool-failure".to_string()),
+                "unknown",
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        Ok(format!("auto_captured id={id}"))
+    }
+
     /// 搜索历史决策。
     ///
     /// 使用 FTS5 全文检索 + simhash 去重,返回 top-k 匹配。
@@ -624,6 +733,48 @@ impl DecisionLog {
             ));
         }
         Ok(output)
+    }
+
+    /// 按 id 读取问题签名(MVP-C2:供 verify_decision 关联 harness 规则)。
+    ///
+    /// 返回决策的 `problem_signature` 字段,用于与 `harness_edits.pathology`
+    /// 做工具前缀 + simhash 关联。决策不存在时返回 `InvalidInput`。
+    pub fn get_problem_signature(&self, decision_id: i64) -> Result<String, DecisionLogError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row(
+            "SELECT problem_signature FROM decisions WHERE id = ?1",
+            params![decision_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => DecisionLogError::InvalidInput(format!(
+                "decision id={decision_id} not found"
+            )),
+            other => DecisionLogError::Sqlite(other),
+        })
+    }
+
+    /// 查询已验证为 Confirmed 的修复方案(MVP-C1:个体方案 → 群体规则数据源)。
+    ///
+    /// 返回 `(problem_signature, applied_solution)` 列表,条件:
+    /// - `verification_result = 'Confirmed'`(已验证有效的修复)
+    /// - 排除 `tags LIKE '%auto_captured%'`(自动捕获的失败观测无方案,不参与提案)
+    ///
+    /// 这些 applied_solution 是**已被验证的修复方案**,是规则提案最可靠的来源
+    /// (比硬编码 RULE_PATTERNS / 未注入的 LLM 更真实)。供 harness_evolution
+    /// 提炼为规则提案进入 evolve 管道。
+    pub fn confirmed_solutions(&self) -> Result<Vec<(String, String)>, DecisionLogError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT problem_signature, applied_solution FROM decisions
+             WHERE verification_result = 'Confirmed'
+               AND (tags IS NULL OR tags NOT LIKE '%auto_captured%')",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     /// 验证已有决策,更新 success_rate 学习环(计划 §4.4)。
@@ -785,6 +936,25 @@ impl DecisionLog {
             }
         }
     }
+}
+
+/// 无句柄自动捕获入口(里程碑 2 方向 A:子代理工具循环接入)。
+///
+/// 供无 `DecisionLog` 句柄的代码路径(如 `process_tool_uses` 子代理工具循环)
+/// 使用:打开 `root/.claw/decision_log.db` → 委托
+/// [`DecisionLog::log_auto_captured_failure`] 完成签名提取 + simhash 去重 + 入库。
+///
+/// 静默降级:打开/写入失败返回 `None`,不阻断工具执行(与 `append_attempt` 语义一致)。
+/// 主循环(持有句柄)与子代理循环(无句柄)共用同一管道——一条管道,多个失败面。
+pub fn auto_capture_failure(
+    root: &Path,
+    session_id: &str,
+    tool_name: &str,
+    error_output: &str,
+) -> Option<String> {
+    let log = DecisionLog::open(root).ok()?;
+    log.log_auto_captured_failure(session_id, tool_name, error_output)
+        .ok()
 }
 
 /// 对 FTS5 查询字符串进行基本转义,防止语法错误。
@@ -1497,6 +1667,143 @@ mod tests {
         assert!(result.is_ok(), "log_decision failed: {:?}", result.err());
         assert!(result.unwrap().starts_with("decision_logged id="));
     }
+
+    #[test]
+    fn extract_failure_signature_uses_first_line() {
+        // 首行是错误消息信息密度最高的部分
+        let sig = DecisionLog::extract_failure_signature(
+            "edit_file",
+            "old_string not found\nat src/main.rs:42\n  note: check whitespace",
+        );
+        assert_eq!(sig, "edit_file: old_string not found");
+    }
+
+    #[test]
+    fn extract_failure_signature_truncates_long_first_line() {
+        let long = "x".repeat(500);
+        let sig = DecisionLog::extract_failure_signature("bash", &long);
+        assert!(sig.len() < 150, "signature should be truncated, got len {}", sig.len());
+        assert!(sig.starts_with("bash: "));
+    }
+
+    #[test]
+    fn auto_capture_logs_pending_with_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let result = log
+            .log_auto_captured_failure("sess-1", "edit_file", "old_string not found in file.rs")
+            .unwrap();
+        assert!(result.starts_with("auto_captured id="), "got: {result}");
+
+        // 搜索验证可检索(举一反三的基础)
+        let hits = log.search_decisions("old_string not found", 5).unwrap();
+        assert!(hits.contains("edit_file: old_string not found"), "got: {hits}");
+        assert!(hits.contains("Pending"), "auto-captured should be Pending, got: {hits}");
+    }
+
+    #[test]
+    fn auto_capture_deduplicates_same_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let first = log
+            .log_auto_captured_failure("sess-1", "edit_file", "old_string not found in file.rs")
+            .unwrap();
+        assert!(first.starts_with("auto_captured id="));
+
+        // 相同失败再次出现 → simhash 去重跳过
+        let second = log
+            .log_auto_captured_failure("sess-1", "edit_file", "old_string not found in file.rs")
+            .unwrap();
+        assert!(second.starts_with("auto_captured skipped"), "got: {second}");
+    }
+
+    #[test]
+    fn auto_capture_different_failures_both_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        let a = log
+            .log_auto_captured_failure("sess-1", "edit_file", "old_string not found")
+            .unwrap();
+        let b = log
+            .log_auto_captured_failure("sess-1", "bash", "permission denied")
+            .unwrap();
+        assert!(a.starts_with("auto_captured id="), "got: {a}");
+        assert!(b.starts_with("auto_captured id="), "got: {b}");
+    }
+
+    #[test]
+    fn auto_capture_orthogonal_to_manual_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+
+        // LLM 主动记录"已验证的修复"
+        log.log_decision(
+            r#"{
+                "session_id": "sess-1",
+                "problem_signature": "null pointer dereference in auth_handler",
+                "root_cause_hypothesis": "missing null check after user lookup",
+                "applied_solution": "add if user.is_none() guard",
+                "affected_files": ["src/auth.rs"],
+                "tags": ["null-pointer"],
+                "verification_result": "Confirmed"
+            }"#,
+        )
+        .unwrap();
+
+        // 自动捕获"未修复的失败观测"→ 不应被手动记录误判为重复
+        let result = log
+            .log_auto_captured_failure("sess-1", "edit_file", "old_string not found")
+            .unwrap();
+        assert!(result.starts_with("auto_captured id="), "got: {result}");
+    }
+
+    #[test]
+    fn free_fn_auto_capture_failure_opens_db_and_logs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 无句柄入口:打开 DB + 签名提取 + Pending 入库(子代理循环路径)
+        let result = auto_capture_failure(dir.path(), "subagent", "read_file", "path not found");
+        assert!(result.is_some(), "free fn should succeed");
+        assert!(result.unwrap().starts_with("auto_captured id="));
+
+        // 打开同一 DB 验证可检索(与主循环共用同一经验库)
+        let log = DecisionLog::open(dir.path()).unwrap();
+        let hits = log.search_decisions("path not found", 5).unwrap();
+        assert!(hits.contains("read_file: path not found"), "got: {hits}");
+    }
+
+    #[test]
+    fn free_fn_auto_capture_failure_silent_degrade_on_bad_root() {
+        // 不可写根目录 → 静默降级返回 None,不 panic(append_attempt 同语义)
+        let result = auto_capture_failure(
+            Path::new("Z:\\nonexistent\\drive\\root"),
+            "subagent",
+            "bash",
+            "boom",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn free_fn_auto_capture_failure_deduplicates_across_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = auto_capture_failure(dir.path(), "subagent", "edit_file", "old_string not found");
+        assert!(first.unwrap().starts_with("auto_captured id="));
+
+        // 相同失败(不同 session_id)再次出现 → simhash 去重跳过
+        let second =
+            auto_capture_failure(dir.path(), "subagent-2", "edit_file", "old_string not found");
+        assert!(
+            second.as_deref().is_some_and(|s| s.starts_with("auto_captured skipped")),
+            "got: {second:?}"
+        );
+    }
+
+
 
     #[test]
     fn decision_log_search_returns_results() {

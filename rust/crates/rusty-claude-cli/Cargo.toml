@@ -64,6 +64,7 @@ missing_errors_doc = "allow"
 mock-deepseek-service = { path = "../mock-deepseek-service" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
+tempfile = "3"
 # 与 api 的 reqwest 对齐（default-features=false + rustls-tls），确保测试里
 # reqwest::Error 与 api::ApiError::Http 持的是同一个 reqwest 实例。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

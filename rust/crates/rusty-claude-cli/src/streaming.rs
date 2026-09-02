@@ -204,6 +204,10 @@ pub(crate) struct AnthropicRuntimeClient {
     /// 指纹,导致主 agent 的 break_reasons 被 "system prompt changed"
     /// 污染、本地命中率统计失真。独立 session 后两条曲线互不干扰。
     subagent_cache_break_detector: api::CacheBreakDetector,
+    /// P0-2 渐进式工具加载开关:开启后只注入核心工具 + 已激活工具,
+    /// 缩小静态前缀。默认 false(全量注入,向后兼容),可用环境变量
+    /// `RUSTY_CLAUDE_PROGRESSIVE_TOOLS=1` 开启。
+    progressive_tools: bool,
 }
 
 impl AnthropicRuntimeClient {
@@ -223,6 +227,16 @@ impl AnthropicRuntimeClient {
         // needed here.
         let resolved_model = api::resolve_model_alias(&model);
         let client = ApiProviderClient::from_model(&resolved_model)?;
+        // P0-2:渐进式工具加载默认关闭(全量注入),`RUSTY_CLAUDE_PROGRESSIVE_TOOLS=1`
+        // 开启后只注入核心工具 + 已激活工具。在 registry 进入共享前启用,确保
+        // 主/子 client 行为一致。
+        let progressive_tools = std::env::var("RUSTY_CLAUDE_PROGRESSIVE_TOOLS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let tool_registry = if progressive_tools {
+            tool_registry.with_progressive_tools()
+        } else {
+            tool_registry
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -240,7 +254,16 @@ impl AnthropicRuntimeClient {
             subagent_cache_break_detector: api::CacheBreakDetector::new(format!(
                 "subagent-{session_id}"
             )),
+            progressive_tools,
         })
+    }
+
+    /// 显式开关渐进式工具加载(运行时切换;注册表启用后立即生效于下一请求)。
+    pub(crate) fn set_progressive_tools(&mut self, on: bool) {
+        self.progressive_tools = on;
+        if on {
+            self.tool_registry.enable_progressive();
+        }
     }
 
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -443,6 +466,11 @@ impl ApiClient for AnthropicRuntimeClient {
             ..Default::default()
         };
 
+        // P0-1 Pre-flight Guard:请求发出前断言静态前缀不变式。
+        // 检测到 model/静态 system/tools 指纹漂移时,原因已计入 detector stats
+        // (`claw doctor --cache-stats` 可见),此处不改变请求行为、不新增 UI 输出。
+        let _ = self.cache_break_detector.note_request(&message_request);
+
         self.runtime.block_on(async {
             // Single attempt: re-sending the full request on stall doubles token
             // usage for no reliability gain (the stall is typically a transient
@@ -516,6 +544,9 @@ impl ApiClient for AnthropicRuntimeClient {
                 thinking_mode: self.thinking_mode,
                 ..Default::default()
             };
+
+            // P0-1 Pre-flight Guard(与同步 `stream` 一致):请求发出前断言静态前缀不变式。
+            let _ = self.cache_break_detector.note_request(&message_request);
 
             // 直接 await,无 runtime.block_on
             self.consume_stream(request_kind, &message_request, is_post_tool)

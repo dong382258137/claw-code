@@ -455,6 +455,14 @@ pub struct GlobalToolRegistry {
     /// 为空时 `classify_*_permission_with_roots` 退化为单根 cwd 行为。
     /// 非空时，路径落在任一根内即视为工作区内，允许 WorkspaceWrite/ReadOnly。
     workspace_roots: Vec<PathBuf>,
+    /// 渐进式工具加载(P0-2):启用覆盖集。
+    ///
+    /// - `None`:全量注入(默认,向后兼容)——`definitions()` 返回所有工具。
+    /// - `Some(overlay)`:渐进模式——只注入"核心工具 + overlay 中已激活的工具"。
+    ///   长尾工具(尤其 MCP runtime 工具)默认不进入请求的 tools 数组,
+    ///   显著缩小静态前缀;模型经 `ToolSearch` 发现后由 harness 调
+    ///   [`activate_tool`](Self::activate_tool) 按需激活,激活后下一请求注入。
+    enabled_overlay: Option<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -488,6 +496,7 @@ impl GlobalToolRegistry {
             runtime_tools: Vec::new(),
             enforcer: None,
             workspace_roots: Vec::new(),
+            enabled_overlay: None,
         }
     }
 
@@ -515,6 +524,7 @@ impl GlobalToolRegistry {
             runtime_tools: Vec::new(),
             enforcer: None,
             workspace_roots: Vec::new(),
+            enabled_overlay: None,
         })
     }
 
@@ -563,6 +573,55 @@ impl GlobalToolRegistry {
     #[must_use]
     pub fn workspace_roots(&self) -> &[PathBuf] {
         &self.workspace_roots
+    }
+
+    /// P0-2:开启渐进式工具加载(owned 形式)。
+    ///
+    /// 开启后 `definitions()` 只返回核心工具 + 已激活工具;未激活的长尾工具
+    /// (尤其 MCP runtime 工具)不再注入请求的 tools 数组,缩小静态前缀。
+    /// 默认(不调用)保持全量注入,行为与旧版完全一致。
+    #[must_use]
+    pub fn with_progressive_tools(mut self) -> Self {
+        self.enable_progressive();
+        self
+    }
+
+    /// P0-2:开启渐进式工具加载(就地修改)。
+    pub fn enable_progressive(&mut self) {
+        self.enabled_overlay.get_or_insert_with(BTreeSet::new);
+    }
+
+    /// P0-2:按需激活一个工具,使其进入渐进模式的注入集合。
+    ///
+    /// 仅在渐进模式(`enabled_overlay = Some`)下生效;全量模式下为空操作。
+    /// 返回该工具是否确实存在(存在才计入激活集,避免噪音)。
+    pub fn activate_tool(&mut self, name: &str) -> bool {
+        let exists = self
+            .runtime_tools
+            .iter()
+            .any(|t| t.name == name)
+            || self.plugin_tools.iter().any(|t| t.definition().name == name)
+            || mvp_tool_specs().iter().any(|s| s.name == name);
+        if let Some(overlay) = &mut self.enabled_overlay {
+            if exists {
+                overlay.insert(name.to_string());
+            }
+        }
+        exists
+    }
+
+    /// P0-2:当前渐进模式下已激活的工具名集合;全量模式返回 `None`。
+    #[must_use]
+    pub fn enabled_tool_names(&self) -> Option<Vec<String>> {
+        self.enabled_overlay
+            .as_ref()
+            .map(|set| set.iter().cloned().collect())
+    }
+
+    /// P0-2:当前是否处于渐进模式。
+    #[must_use]
+    pub fn is_progressive(&self) -> bool {
+        self.enabled_overlay.is_some()
     }
 
     pub fn normalize_allowed_tools(
@@ -628,9 +687,21 @@ impl GlobalToolRegistry {
 
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
+        // P0-2 渐进模式:`enabled_overlay = Some` 时只注入核心工具 + 已激活工具。
+        // `None` 时保持全量注入(默认行为,向后兼容)。
+        let overlay = self.enabled_overlay.as_ref();
+        let is_core = |name: &str| core_tool_names().contains(&name);
+        let allowed = |name: &str| allowed_tools.is_none_or(|allowed| allowed.contains(name));
+        // builtin:核心工具无条件注入;非核心工具仅在已激活(或全量模式)时注入。
+        let builtin_active = |name: &str| {
+            overlay.is_none_or(|set| is_core(name) || set.contains(name))
+        };
+        // runtime/plugin 无"核心"概念:渐进模式下只有已激活工具注入。
+        let tail_active = |name: &str| overlay.is_none_or(|set| set.contains(name));
+
         let builtin = mvp_tool_specs()
             .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+            .filter(|spec| allowed(spec.name) && builtin_active(spec.name))
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
@@ -640,7 +711,7 @@ impl GlobalToolRegistry {
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
+            .filter(|tool| allowed(tool.name.as_str()) && tail_active(tool.name.as_str()))
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
@@ -651,8 +722,8 @@ impl GlobalToolRegistry {
             .plugin_tools
             .iter()
             .filter(|tool| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+                let name = tool.definition().name.as_str();
+                allowed(name) && tail_active(name)
             })
             .map(|tool| ToolDefinition {
                 name: tool.definition().name.clone(),
@@ -7528,6 +7599,15 @@ fn deferred_tool_specs() -> Vec<ToolSpec> {
         .collect()
 }
 
+/// P0-2 渐进式工具加载:始终注入的核心工具名(与 [`deferred_tool_specs`] 排除集一致)。
+///
+/// 这 6 个工具是每次任务几乎必然用到的高频基础能力,永远进入请求的 tools 数组;
+/// 其余工具在渐进模式下默认延迟,经 `ToolSearch` 发现后按需激活。
+#[must_use]
+pub fn core_tool_names() -> [&'static str; 6] {
+    ["bash", "read_file", "write_file", "edit_file", "glob_search", "grep_search"]
+}
+
 fn search_tool_specs(query: &str, max_results: usize, specs: &[SearchableToolSpec]) -> Vec<String> {
     let lowered = query.to_lowercase();
     if let Some(selection) = lowered.strip_prefix("select:") {
@@ -9430,7 +9510,8 @@ mod tests {
         make_subagent_tool_executor, maybe_commit_provenance, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
         run_task_packet, run_web_sync_guarded, AgentInput, AgentJob, GlobalToolRegistry,
-        LaneEventName, LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
+        LaneEventName, LaneFailureClass, ProviderRuntimeClient, RuntimeToolDefinition,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -9469,6 +9550,131 @@ mod tests {
         assert!(poisoned.is_err(), "poisoning thread should panic");
 
         let _guard = env_guard();
+    }
+
+    // ---- P0-2 渐进式工具加载 ----
+
+    /// 全量模式(默认)行为不变:`definitions()` 返回所有 mvp 工具。
+    #[test]
+    fn full_mode_definitions_unchanged() {
+        let registry = GlobalToolRegistry::builtin();
+        let names: BTreeSet<String> = registry
+            .definitions(None)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let all: BTreeSet<String> = mvp_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name.to_string())
+            .collect();
+        assert_eq!(names, all, "全量模式必须保持向后兼容");
+        assert!(!registry.is_progressive());
+        assert!(registry.enabled_tool_names().is_none());
+    }
+
+    /// 渐进模式默认只注入 6 个核心工具(长尾工具被延迟)。
+    #[test]
+    fn progressive_definitions_core_only_by_default() {
+        let registry = GlobalToolRegistry::builtin().with_progressive_tools();
+        assert!(registry.is_progressive());
+        let names: Vec<String> = registry
+            .definitions(None)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "glob_search",
+                "grep_search"
+            ],
+            "渐进模式应只注入核心工具: {:?}",
+            names
+        );
+    }
+
+    /// 渐进模式激活工具后注入该工具定义。
+    #[test]
+    fn progressive_definitions_activate_adds_tool() {
+        let mut registry = GlobalToolRegistry::builtin().with_progressive_tools();
+        assert!(
+            registry.activate_tool("ToolSearch"),
+            "ToolSearch 是 mvp 工具,激活应成功"
+        );
+        let names: Vec<String> = registry
+            .definitions(None)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            names.contains(&"ToolSearch".to_string()),
+            "激活后应注入 ToolSearch: {:?}",
+            names
+        );
+        assert_eq!(names.len(), 7, "6 核心 + 1 激活");
+    }
+
+    /// 渐进模式对 runtime(MCP)工具同样生效:默认延迟,激活后注入。
+    #[test]
+    fn progressive_definitions_activates_runtime_tool() {
+        let runtime = vec![RuntimeToolDefinition {
+            name: "mcp_foo".to_string(),
+            description: Some("MCP 测试工具".to_string()),
+            input_schema: json!({"type": "object"}),
+            required_permission: PermissionMode::ReadOnly,
+            domain_tags: vec!["mcp".to_string()],
+        }];
+        let mut registry = GlobalToolRegistry::builtin()
+            .with_runtime_tools(runtime)
+            .expect("registry")
+            .with_progressive_tools();
+        let before: Vec<String> = registry
+            .definitions(None)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            !before.contains(&"mcp_foo".to_string()),
+            "未激活的 MCP 工具不应注入: {:?}",
+            before
+        );
+        assert!(registry.activate_tool("mcp_foo"));
+        let after: Vec<String> = registry
+            .definitions(None)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(after.contains(&"mcp_foo".to_string()));
+    }
+
+    /// activate_tool 对不存在的工具返回 false,且不污染激活集。
+    #[test]
+    fn activate_tool_returns_existence() {
+        let mut registry = GlobalToolRegistry::builtin().with_progressive_tools();
+        assert!(!registry.activate_tool("no_such_tool"));
+        let names = registry.enabled_tool_names().expect("progressive");
+        assert!(!names.contains(&"no_such_tool".to_string()));
+    }
+
+    /// 渐进模式与 allowed_tools 白名单交叉过滤。
+    #[test]
+    fn progressive_definitions_respects_allowed_tools() {
+        let mut allowed = BTreeSet::new();
+        allowed.insert("grep_search".to_string());
+        allowed.insert("ToolSearch".to_string());
+        let mut registry = GlobalToolRegistry::builtin().with_progressive_tools();
+        registry.activate_tool("ToolSearch");
+        let names: Vec<String> = registry
+            .definitions(Some(&allowed))
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        // 白名单放行 grep_search(核心)与 ToolSearch(已激活);其余核心工具被白名单拦截
+        assert_eq!(names, vec!["grep_search", "ToolSearch"]);
     }
 
     // ---- F4 反级联门禁 ----

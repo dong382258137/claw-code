@@ -22,6 +22,7 @@ pub mod streaming;
 pub mod suggestion;
 pub mod tool_display;
 pub mod ultraplan;
+pub mod upgrade_helper;
 pub mod voice;
 
 #[cfg(feature = "full-tui")]
@@ -496,7 +497,7 @@ pub fn run_tui_repl_entry(
     diag_log("calling run_stale_base_preflight");
     run_stale_base_preflight(base_commit.as_deref());
     diag_log("calling build_live_cli_for_repl");
-    let cli = build_live_cli_for_repl(
+    let mut cli = build_live_cli_for_repl(
         model,
         allowed_tools,
         permission_mode,
@@ -505,6 +506,10 @@ pub fn run_tui_repl_entry(
         reasoning_effort,
         thinking_mode,
     )?;
+    // 热升级启动检测(双大脑收官基石):TUI 是默认启动路径,必须在此
+    // (进入事件循环前)检测升级标记并恢复旧任务;REPL 路径已在
+    // run_repl 内接线。失败静默降级为普通启动。
+    let _ = cli.maybe_resume_from_upgrade()?;
     diag_log("build_live_cli_for_repl OK, entering TUI");
     tui::app::run_tui_repl(cli)
 }
@@ -1435,6 +1440,25 @@ pub fn main_entry() {
     // Multi-Agent Hardening §0.1 v2 修正:提取内联闭包到 runtime::diag 模块,
     // 供 main_entry/headless/测试入口复用,避免 hook 注册逻辑重复。
     runtime::diag::install_panic_hook();
+
+    // 热升级助手分支(任务 2 一键化):检测 --upgrade-helper <user_cwd>。
+    // 由旧进程 /upgrade spawn 的独立进程(新终端),自动化
+    // "等旧进程退出 → mv exe.old → cargo build → 启动新进程"。
+    // 此分支不进 REPL/TUI,直接执行迁移后退出。
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--upgrade-helper") {
+        let user_cwd = argv
+            .iter()
+            .position(|a| a == "--upgrade-helper")
+            .and_then(|i| argv.get(i + 1))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if let Err(e) = upgrade_helper::run_helper(&user_cwd) {
+            eprintln!("[upgrade-helper] 失败: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
 
     if let Err(error) = run() {
         let message = error.to_string();

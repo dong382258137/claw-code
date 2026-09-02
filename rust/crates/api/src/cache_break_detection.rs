@@ -71,6 +71,11 @@ pub struct CacheBreakPaths {
     pub root: PathBuf,
     pub session_dir: PathBuf,
     pub session_state_path: PathBuf,
+    /// 请求侧静态前缀指纹持久化(独立于响应侧 `session_state_path`)。
+    ///
+    /// 请求侧 `note_request` 只记录 model/system_static/tools 指纹,不触碰
+    /// 响应侧 `previous` 状态槽,两条检测链路互不干扰。
+    pub request_side_state_path: PathBuf,
     pub stats_path: PathBuf,
 }
 
@@ -82,6 +87,7 @@ impl CacheBreakPaths {
         Self {
             root,
             session_state_path: session_dir.join("session-state.json"),
+            request_side_state_path: session_dir.join("request-prefix-state.json"),
             stats_path: session_dir.join("stats.json"),
             session_dir,
         }
@@ -102,6 +108,13 @@ pub struct CacheBreakReasons {
     /// 这是每 turn 注入 volatile 上下文的预期 churn,不是静态区被污染。
     #[serde(default)]
     pub dynamic_section_changed: u64,
+    /// 请求侧静态前缀漂移计数(P0-1 Pre-flight Guard)。
+    ///
+    /// 由 `note_request` 在请求**发出前**比对上一轮 model/system_static/tools
+    /// 指纹得出 —— 任何未来代码把动态值(时间戳/UUID/路径/状态)写进静态前缀,
+    /// 会在首个 turn 就被此计数捕获,而非等命中率曲线慢慢暴露。
+    #[serde(default)]
+    pub prefix_drifted: u64,
     pub ttl_expiry: u64,
     pub unknown: u64,
 }
@@ -114,6 +127,7 @@ impl CacheBreakReasons {
             + self.tool_definitions_changed
             + self.message_payload_changed
             + self.dynamic_section_changed
+            + self.prefix_drifted
             + self.ttl_expiry
             + self.unknown
     }
@@ -154,12 +168,27 @@ pub struct CacheBreakDetector {
     inner: Arc<Mutex<CacheBreakInner>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CacheBreakInner {
     config: CacheBreakConfig,
     paths: CacheBreakPaths,
     stats: CacheBreakStats,
     previous: Option<TrackedPromptState>,
+    /// 请求侧静态前缀指纹(上一轮)。与响应侧 `previous` 独立维护:
+    /// `note_request` 只更新这里,`record_usage` 只更新 `previous`。
+    previous_request_side: Option<RequestSidePrefix>,
+}
+
+/// 请求侧静态前缀指纹(P0-1 Pre-flight Guard)。
+///
+/// 只记录会破坏前缀缓存的三个维度:model / 静态 system / tools。
+/// `messages` 数组增长是多轮/tool-loop 的预期行为,不参与比对。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RequestSidePrefix {
+    model_hash: u64,
+    system_hash: u64,
+    tools_hash: u64,
+    observed_at_unix_secs: u64,
 }
 
 impl CacheBreakDetector {
@@ -173,12 +202,14 @@ impl CacheBreakDetector {
         let paths = CacheBreakPaths::for_session(&config.session_id);
         let stats = read_json::<CacheBreakStats>(&paths.stats_path).unwrap_or_default();
         let previous = read_json::<TrackedPromptState>(&paths.session_state_path);
+        let previous_request_side = read_json::<RequestSidePrefix>(&paths.request_side_state_path);
         Self {
             inner: Arc::new(Mutex::new(CacheBreakInner {
                 config,
                 paths,
                 stats,
                 previous,
+                previous_request_side,
             })),
         }
     }
@@ -215,6 +246,58 @@ impl CacheBreakDetector {
         usage: &Usage,
     ) -> CacheBreakRecord {
         self.record_usage_inner(request, usage, /* multi_turn = */ true)
+    }
+
+    /// 请求侧静态前缀不变式断言(P0-1 Pre-flight Guard)。
+    ///
+    /// 在请求**发出前**调用:比对上一轮 model / 静态 system / tools 指纹。
+    /// 若静态前缀意外漂移(未来代码把动态值写进静态区、工具定义中途变化),
+    /// 返回漂移原因并累加 `break_reasons.prefix_drifted` 计数(供
+    /// `claw doctor --cache-stats` 诊断),不触发任何请求侧行为变更。
+    ///
+    /// `messages` 数组增长不参与比对(多轮/tool-loop 预期行为)。
+    /// 独立维护 `previous_request_side` 状态槽,与响应侧 `record_usage`
+    /// 的 `previous` 互不干扰。首次调用(`previous_request_side` 为 None)
+    /// 仅记录基线,不告警。
+    #[must_use]
+    pub fn note_request(&self, request: &MessageRequest) -> Option<String> {
+        let hashes = RequestFingerprints::from_request(request);
+        let current = RequestSidePrefix {
+            model_hash: hashes.model,
+            system_hash: hashes.system_static,
+            tools_hash: hashes.tools,
+            observed_at_unix_secs: now_unix_secs(),
+        };
+
+        let mut inner = self.lock();
+        let drift = match &inner.previous_request_side {
+            None => None,
+            Some(prev) => {
+                let mut reasons = Vec::new();
+                if prev.model_hash != current.model_hash {
+                    reasons.push("model changed");
+                }
+                if prev.system_hash != current.system_hash {
+                    reasons.push("system prompt changed");
+                }
+                if prev.tools_hash != current.tools_hash {
+                    reasons.push("tool definitions changed");
+                }
+                if reasons.is_empty() {
+                    None
+                } else {
+                    Some(reasons.join(", "))
+                }
+            }
+        };
+
+        if let Some(reason) = &drift {
+            inner.stats.break_reasons.prefix_drifted += 1;
+            inner.stats.last_break_reason = Some(reason.clone());
+        }
+        inner.previous_request_side = Some(current);
+        persist_request_side(&inner);
+        drift
     }
 
     /// `record_usage` / `record_usage_multi_turn` 共用实现。
@@ -530,6 +613,14 @@ fn persist_state(inner: &CacheBreakInner) {
     let _ = write_json(&inner.paths.stats_path, &inner.stats);
     if let Some(previous) = &inner.previous {
         let _ = write_json(&inner.paths.session_state_path, previous);
+    }
+}
+
+fn persist_request_side(inner: &CacheBreakInner) {
+    let _ = ensure_cache_dirs(&inner.paths);
+    let _ = write_json(&inner.paths.stats_path, &inner.stats);
+    if let Some(previous) = &inner.previous_request_side {
+        let _ = write_json(&inner.paths.request_side_state_path, previous);
     }
 }
 
@@ -1129,5 +1220,101 @@ mod tests {
 
         std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
         std::env::remove_var("CLAUDE_CONFIG_HOME");
+    }
+
+    /// 为 P0-1 测试隔离磁盘状态:临时 CLAUDE_CONFIG_HOME 根,测试后清理。
+    fn prefix_test_env(guard_tag: &str) -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
+        let guard = test_env_lock();
+        let temp_root = std::env::temp_dir().join(format!(
+            "cache-break-prefix-{guard_tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        (guard, temp_root)
+    }
+
+    fn prefix_test_cleanup(temp_root: std::path::PathBuf) {
+        std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+    }
+
+    /// P0-1 Pre-flight Guard:首次 note_request 仅建基线,不告警。
+    #[test]
+    fn note_request_first_call_establishes_baseline_without_alert() {
+        let (_guard, temp_root) = prefix_test_env("first");
+        let request = request_with_split_system("STATIC", "mem", "turn 1");
+        let detector = CacheBreakDetector::new("unit-test-prefix");
+        assert!(detector.note_request(&request).is_none());
+        assert_eq!(detector.stats().break_reasons.prefix_drifted, 0);
+        prefix_test_cleanup(temp_root);
+    }
+
+    /// P0-1:相同前缀重复请求 → 无漂移告警(messages 增长被忽略)。
+    #[test]
+    fn note_request_stable_prefix_no_drift() {
+        let (_guard, temp_root) = prefix_test_env("stable");
+        let detector = CacheBreakDetector::new("unit-test-prefix");
+        let first = request_with_split_system("STATIC", "mem-v1", "turn 1");
+        let second = request_with_split_system("STATIC", "mem-v2", "turn 2");
+        assert!(detector.note_request(&first).is_none());
+        // 动态段(mem)变化 + messages 变化都不应触发请求侧漂移
+        assert!(detector.note_request(&second).is_none());
+        assert_eq!(detector.stats().break_reasons.prefix_drifted, 0);
+        prefix_test_cleanup(temp_root);
+    }
+
+    /// P0-1:静态 system 前缀被污染(动态值泄漏进静态区)→ 首 turn 即告警并计数。
+    #[test]
+    fn note_request_flags_static_prefix_drift() {
+        let (_guard, temp_root) = prefix_test_env("static");
+        let detector = CacheBreakDetector::new("unit-test-prefix");
+        let stable = request_with_split_system("STATIC", "mem", "turn 1");
+        let polluted = request_with_split_system("STATIC-2026-09-02", "mem", "turn 2");
+        assert!(detector.note_request(&stable).is_none());
+        let reason = detector
+            .note_request(&polluted)
+            .expect("static prefix drift must be flagged");
+        assert!(
+            reason.contains("system prompt changed"),
+            "reason: {reason}"
+        );
+        assert_eq!(detector.stats().break_reasons.prefix_drifted, 1);
+        assert_eq!(detector.stats().break_reasons.system_prompt_changed, 0);
+        prefix_test_cleanup(temp_root);
+    }
+
+    /// P0-1:工具定义中途变化 → 请求侧告警归因 "tool definitions changed"。
+    #[test]
+    fn note_request_flags_tool_definition_drift() {
+        let (_guard, temp_root) = prefix_test_env("tool");
+        let detector = CacheBreakDetector::new("unit-test-prefix");
+        let mut request1 = request_with_split_system("STATIC", "mem", "turn 1");
+        request1.tools = Some(vec![crate::types::ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("v1".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            cache_control: None,
+        }]);
+        let mut request2 = request1.clone();
+        request2.tools.as_mut().expect("tools").push(crate::types::ToolDefinition {
+            name: "write_file".to_string(),
+            description: Some("v2".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            cache_control: None,
+        });
+        assert!(detector.note_request(&request1).is_none());
+        let reason = detector
+            .note_request(&request2)
+            .expect("tool drift must be flagged");
+        assert!(
+            reason.contains("tool definitions changed"),
+            "reason: {reason}"
+        );
+        assert_eq!(detector.stats().break_reasons.prefix_drifted, 1);
+        prefix_test_cleanup(temp_root);
     }
 }

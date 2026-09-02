@@ -21,6 +21,13 @@ pub const MAX_RETIRED_EDITS: usize = 50;
 pub const MAX_EDIT_CONTENT_CHARS: usize = 500;
 /// simhash 去重汉明距离阈值。
 pub const SIMHASH_DISTANCE_THRESHOLD: u32 = 3;
+/// 个体验证反馈关联阈值(MVP-C2):规则 pathology 与决策问题签名的
+/// **Jaccard 词集相似度** ≥ 此值视为关联。
+///
+/// 实测(短文本):同工具内相似失败词集重合 0.50-0.75,不同错误 ≤0.17,
+/// 0.4 阈值分离良好。不使用 simhash 汉明距离:短文本 simhash 对措辞增量
+/// 极敏感(加 2-3 个词距离即从 0 跳到 15+),与"错误签名"场景不匹配。
+pub const PATHOLOGY_JACCARD_THRESHOLD: f64 = 0.4;
 
 const SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS harness_edits (
@@ -28,7 +35,7 @@ CREATE TABLE IF NOT EXISTS harness_edits (
     pathology TEXT NOT NULL,
     content TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('Candidate', 'Active', 'Retired')),
-    source TEXT NOT NULL CHECK(source IN ('RulePattern', 'LlmProposer')),
+    source TEXT NOT NULL CHECK(source IN ('RulePattern', 'LlmProposer', 'VerifiedSolution')),
     verify_count INTEGER DEFAULT 0,
     success_count INTEGER DEFAULT 0,
     created_at INTEGER NOT NULL,
@@ -297,6 +304,67 @@ impl HarnessArchive {
             .collect())
     }
 
+    /// 个体验证反馈 → 群体规则后验更新(MVP-C2 纵向数据流第一条连接)。
+    ///
+    /// 当一条 decision_log 决策被 `verify_decision` 验证后,把验证结果反馈到
+    /// `harness_edits` 中与之关联的规则:
+    /// - **匹配条件**:规则 `pathology` 与决策问题签名的**工具前缀相同**(不跨
+    ///   工具误关联),且 **Jaccard 词集相似度** ≥ [`PATHOLOGY_JACCARD_THRESHOLD`]
+    ///   (同工具内相似失败即关联;实测短文本用 Jaccard 而非 simhash——simhash
+    ///   对措辞增量极敏感,加 2-3 词距离即跳 15+,不适合错误签名场景)
+    /// - **更新**:`verify_count + 1`;`confirmed=true`(Confirmed)时额外
+    ///   `success_count + 1`(Refuted/Partial 只增加验证次数,不增加成功次数)
+    /// - **范围**:仅 Candidate + Active 更新(Retired 规则不再学习)
+    /// - **返回**:被更新的 edit 数(0 = 无关联规则)
+    ///
+    /// 意义:evolve 的门控(z-test)原本只看统计失败率,现在能消费"来自个体
+    /// 验证的语义证据"——一条规则若有多次 Confirmed 决策背书,其 success_rate
+    /// 上升,后续参与更准确的晋升/退役判断。这是"失败→个体方案→群体规则"
+    /// 纵向数据流的第一条连接。
+    pub fn update_stats_for_pathology(
+        &self,
+        decision_signature: &str,
+        confirmed: bool,
+    ) -> Result<u32, ArchiveError> {
+        let tool_prefix = extract_tool_prefix(decision_signature);
+
+        // 关联候选:仅 Candidate + Active(Retired 不再学习)。
+        let candidates: Vec<HarnessEdit> = self
+            .list_edits(None)?
+            .into_iter()
+            .filter(|e| matches!(e.status, EditStatus::Candidate | EditStatus::Active))
+            .collect();
+
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut updated = 0u32;
+        for edit in &candidates {
+            // 工具前缀不同 → 跳过(防跨工具误关联)。
+            if extract_tool_prefix(&edit.pathology) != tool_prefix {
+                continue;
+            }
+            // Jaccard 词集相似度 ≥ 阈值:同工具内相似失败即关联。
+            if jaccard_similarity(&edit.pathology, decision_signature)
+                < PATHOLOGY_JACCARD_THRESHOLD
+            {
+                continue;
+            }
+            conn.execute(
+                "UPDATE harness_edits
+                 SET verify_count = verify_count + 1,
+                     success_count = success_count + ?1,
+                     last_verified_at = ?2
+                 WHERE id = ?3",
+                params![
+                    if confirmed { 1u32 } else { 0u32 },
+                    current_timestamp_ms(),
+                    edit.id,
+                ],
+            )?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
     /// 统计信息(供 CLI `claw harness stats`)。
     pub fn stats(&self) -> Result<ArchiveStats, ArchiveError> {
         let all = self.list_edits(None)?;
@@ -319,6 +387,7 @@ impl HarnessArchive {
             match edit.source {
                 EditSource::RulePattern => stats.rule_sourced += 1,
                 EditSource::LlmProposer => stats.llm_sourced += 1,
+                EditSource::VerifiedSolution => stats.verified_solution_sourced += 1,
             }
         }
         stats.avg_active_success_rate = if active_rates_count > 0 {
@@ -406,6 +475,41 @@ pub(crate) fn current_timestamp_ms() -> i64 {
 pub(crate) fn generate_edit_id(content: &str, pathology: &str) -> String {
     let hash = compute_simhash(&format!("{pathology} {content}"));
     format!("edit-{}-{:x}", current_timestamp_ms(), hash & 0xFFFF)
+}
+
+/// 从 pathology 签名提取工具前缀(`"edit_file:old_string not found"` → `"edit_file"`)。
+///
+/// 与 harness_evolution::mod.rs 的 `tool_signature` 同构:pathology 形如
+/// `"{tool_name}"` 或 `"{tool_name}:{keyword}"`,取冒号前部分。无冒号时整串即工具名。
+/// 用于 MVP-C2 关联前过滤,防止跨工具误关联(不同工具的错误签名不视为同一规则)。
+fn extract_tool_prefix(pathology: &str) -> &str {
+    pathology.split(':').next().unwrap_or(pathology).trim()
+}
+
+/// 两段错误签名的 Jaccard 词集相似度(交集 / 并集)。
+///
+/// MVP-C2 关联判定用;实测分离良好:同工具内相似失败 0.50-0.75,
+/// 不同错误 ≤0.17。不用 simhash 汉明距离:短文本 simhash 对措辞增量
+/// 极敏感(加 2-3 个词距离即跳 15+),不适合"错误签名"短文本场景。
+fn jaccard_similarity(a: &str, b: &str) -> f64 {
+    let norm = |s: &str| {
+        s.split_whitespace()
+            .map(|w| w.trim().to_lowercase())
+            .filter(|w| !w.is_empty())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let sa = norm(a);
+    let sb = norm(b);
+    if sa.is_empty() || sb.is_empty() {
+        return 0.0;
+    }
+    let intersection = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }
 
 #[cfg(test)]
@@ -547,5 +651,114 @@ mod tests {
         assert_eq!(stats.llm_sourced, 0);
         assert!((stats.avg_active_success_rate - 1.0).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_stats_confirmed_increments_verify_and_success() {
+        let dir = tmp_dir("mvp_c2_confirmed");
+        let archive = HarnessArchive::open(&dir).expect("open");
+        archive
+            .add_candidate(sample_edit("e1", "edit_file: old_string not found", "rule c1", 1))
+            .expect("add");
+
+        // decision_signature 与 pathology 同工具、内容相似 → 应匹配。
+        let updated = archive
+            .update_stats_for_pathology("edit_file: old_string not found in file.rs", true)
+            .expect("update");
+        assert_eq!(updated, 1, "one matching edit should update");
+
+        let edit = archive.get_edit("e1").expect("get").expect("exists");
+        assert_eq!(edit.verify_count, 1);
+        assert_eq!(edit.success_count, 1);
+        assert_eq!(edit.status, EditStatus::Candidate, "status unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_stats_refuted_increments_verify_only() {
+        let dir = tmp_dir("mvp_c2_refuted");
+        let archive = HarnessArchive::open(&dir).expect("open");
+        archive
+            .add_candidate(sample_edit("e1", "bash: permission denied", "rule c1", 1))
+            .expect("add");
+
+        let updated = archive
+            .update_stats_for_pathology("bash: permission denied writing to file", false)
+            .expect("update");
+        assert_eq!(updated, 1);
+
+        let edit = archive.get_edit("e1").expect("get").expect("exists");
+        assert_eq!(edit.verify_count, 1);
+        assert_eq!(edit.success_count, 0, "refuted should not add success");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_stats_skips_cross_tool_pathologies() {
+        let dir = tmp_dir("mvp_c2_cross_tool");
+        let archive = HarnessArchive::open(&dir).expect("open");
+        archive
+            .add_candidate(sample_edit("e1", "edit_file: old_string not found", "rule c1", 1))
+            .expect("add");
+
+        // 不同工具前缀(bash vs edit_file)→ 不关联。
+        let updated = archive
+            .update_stats_for_pathology("bash: old_string not found", true)
+            .expect("update");
+        assert_eq!(updated, 0, "cross-tool must not match");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_stats_skips_retired_and_unrelated() {
+        let dir = tmp_dir("mvp_c2_retired");
+        let archive = HarnessArchive::open(&dir).expect("open");
+        archive
+            .add_candidate(sample_edit("e1", "grep_search: no matches", "rule c1", 1))
+            .expect("add");
+        archive
+            .update_status("e1", EditStatus::Retired)
+            .expect("retire");
+        archive
+            .add_candidate(sample_edit("e2", "bash: connection refused", "rule c2", 2))
+            .expect("add");
+
+        // e1 已 Retired(不再学习)+ 签名不匹配 e2 → 0。
+        let updated = archive
+            .update_stats_for_pathology("grep_search: no matches anywhere", true)
+            .expect("update");
+        assert_eq!(updated, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_stats_accumulates_over_multiple_verifications() {
+        let dir = tmp_dir("mvp_c2_accumulate");
+        let archive = HarnessArchive::open(&dir).expect("open");
+        archive
+            .add_candidate(sample_edit("e1", "read_file: path not found", "rule c1", 1))
+            .expect("add");
+
+        archive
+            .update_stats_for_pathology("read_file: path not found for input", true)
+            .expect("update");
+        archive
+            .update_stats_for_pathology("read_file: path not found for input", false)
+            .expect("update");
+        archive
+            .update_stats_for_pathology("read_file: path not found for input", true)
+            .expect("update");
+
+        let edit = archive.get_edit("e1").expect("get").expect("exists");
+        assert_eq!(edit.verify_count, 3);
+        assert_eq!(edit.success_count, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_tool_prefix_splits_on_colon() {
+        assert_eq!(extract_tool_prefix("edit_file: old_string not found"), "edit_file");
+        assert_eq!(extract_tool_prefix("bash"), "bash");
+        assert_eq!(extract_tool_prefix("grep_search: no matches"), "grep_search");
     }
 }

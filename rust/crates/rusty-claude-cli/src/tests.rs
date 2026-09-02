@@ -3835,6 +3835,11 @@ fn parses_resume_and_config_slash_commands() {
             session_path: Some("saved-session.jsonl".to_string())
         }))
     );
+    // 热升级命令(双大脑收官基石):/upgrade 解析为 SlashCommand::Upgrade,无参数。
+    assert_eq!(
+        SlashCommand::parse("/upgrade"),
+        Ok(Some(SlashCommand::Upgrade))
+    );
     assert_eq!(
         SlashCommand::parse("/clear --confirm"),
         Ok(Some(SlashCommand::Clear { confirm: true }))

@@ -28,7 +28,6 @@ use std::sync::{Arc, OnceLock};
 
 /// 样本错误消息上限(每 cluster)。
 const MAX_SAMPLE_ERRORS: usize = 5;
-
 /// LLM 驱动的 harness 规则提议接口(依赖倒置,Phase 3)。
 ///
 /// runtime 不依赖 api,生产实现在 rusty-claude-cli 用 `LlmBridge` 注入。
@@ -336,6 +335,82 @@ fn llm_based_propose(weakness: &WeaknessSignal) -> Option<HarnessEdit> {
         reasoning,
         EditSource::LlmProposer,
     ))
+}
+
+/// 从 decision_log 的 Confirmed 方案提炼规则提案(MVP-C1:个体方案 → 群体规则)。
+///
+/// 纵向数据流第二条连接:decision_log 中 `verification_result=Confirmed` 的决策,
+/// 其 `applied_solution` 是**已被验证的修复方案**——比硬编码 [`RULE_PATTERNS`] /
+/// 未注入的 LLM 更真实的规则来源。提炼为 HarnessEdit Candidate 进入 evolve 管道。
+///
+/// # 提炼规则
+/// - `pathology` = 决策的 `problem_signature`(失败模式)
+/// - `content` = 决策的 `applied_solution`(已验证的修复方案,截断到单条上限)
+/// - `source` = [`EditSource::VerifiedSolution`]
+/// - 空方案跳过;与现有 edits 的 simhash 距离 ≤ [`archive::SIMHASH_DISTANCE_THRESHOLD`]
+///   视为重复跳过;单轮最多 `config.max_proposals` 条
+///
+/// # 返回
+/// 成功提炼并入库的提案数。`confirmed_solutions` 查询失败 / archive 写入失败
+/// 返回 `Err`(调用方应打 diag 降级,不阻断 evolve 主流程)。
+pub fn propose_from_confirmed_solutions(
+    decision_log: &crate::decision_log::DecisionLog,
+    archive: &HarnessArchive,
+    config: &EvolutionConfig,
+) -> Result<usize, String> {
+    let solutions = decision_log
+        .confirmed_solutions()
+        .map_err(|e| format!("confirmed_solutions failed: {e}"))?;
+    if solutions.is_empty() {
+        return Ok(0);
+    }
+
+    // 现有 edits 的 simhash 集合(去重)。
+    let existing = archive
+        .list_edits(None)
+        .map_err(|e| format!("list_edits failed: {e}"))?;
+    let mut existing_hashes: std::collections::HashSet<i64> =
+        existing.iter().map(|e| e.similarity_hash).collect();
+
+    let mut count = 0usize;
+    for (problem_signature, applied_solution) in &solutions {
+        if count >= config.max_proposals {
+            break;
+        }
+        let content: String = applied_solution
+            .chars()
+            .take(crate::harness_evolution::archive::MAX_EDIT_CONTENT_CHARS)
+            .collect();
+        if content.trim().is_empty() {
+            continue; // 空方案(如自动捕获占位)跳过
+        }
+        // 与 build_edit 同构,但 pathology/content 直接来自已验证决策。
+        let simhash_text = format!("{problem_signature} {content}");
+        let similarity_hash = compute_simhash(&simhash_text) as i64;
+        if existing_hashes.contains(&similarity_hash) {
+            continue; // 与现有 edits 重复
+        }
+        let edit = HarnessEdit {
+            id: generate_edit_id(&content, problem_signature),
+            pathology: problem_signature.clone(),
+            content: content.trim().to_string(),
+            status: EditStatus::Candidate,
+            source: EditSource::VerifiedSolution,
+            verify_count: 0,
+            success_count: 0,
+            created_at: current_timestamp_ms(),
+            last_verified_at: None,
+            proposer_reasoning: "verified solution from decision_log".to_string(),
+            similarity_hash,
+            retire_reason: None,
+        };
+        archive
+            .add_candidate(edit)
+            .map_err(|e| format!("add_candidate failed: {e}"))?;
+        existing_hashes.insert(similarity_hash);
+        count += 1;
+    }
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1070,94 @@ mod tests {
         // 同一 weakness 再次提议:与已有 edit simhash 重复 → 跳过。
         let second = propose_edits(&[weakness], &existing, &EvolutionConfig::default());
         assert_eq!(second.len(), 0, "simhash 重复的 edit 应被去重");
+    }
+
+    #[test]
+    fn propose_from_confirmed_solutions_distills_verified_fixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        log.log_decision(
+            r#"{"session_id":"s1","problem_signature":"edit_file: old_string not found","root_cause_hypothesis":"stale text","applied_solution":"grep before edit retry","affected_files":["a.rs"],"verification_result":"Confirmed"}"#,
+        )
+        .expect("log_decision");
+
+        let archive = HarnessArchive::open(dir.path()).unwrap();
+        let n = propose_from_confirmed_solutions(&log, &archive, &EvolutionConfig::default())
+            .expect("propose");
+        assert_eq!(n, 1, "one confirmed solution should become one proposal");
+
+        let candidates = archive.candidate_edits().expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source, EditSource::VerifiedSolution);
+        assert_eq!(candidates[0].pathology, "edit_file: old_string not found");
+        assert_eq!(candidates[0].content, "grep before edit retry");
+    }
+
+    #[test]
+    fn propose_from_confirmed_solutions_deduplicates_on_second_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        log.log_decision(
+            r#"{"session_id":"s1","problem_signature":"bash: permission denied","root_cause_hypothesis":"perms","applied_solution":"check file permissions before write","affected_files":["b.sh"],"verification_result":"Confirmed"}"#,
+        )
+        .expect("log_decision");
+
+        let archive = HarnessArchive::open(dir.path()).unwrap();
+        let first =
+            propose_from_confirmed_solutions(&log, &archive, &EvolutionConfig::default())
+                .expect("first");
+        assert_eq!(first, 1);
+
+        // 第二次提炼:与已有 edit simhash 重复 → 0。
+        let second =
+            propose_from_confirmed_solutions(&log, &archive, &EvolutionConfig::default())
+                .expect("second");
+        assert_eq!(second, 0, "already-proposed solution must be deduplicated");
+    }
+
+    #[test]
+    fn propose_from_confirmed_solutions_skips_auto_captured() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        // auto_captured 记录(失败观测,无方案)→ confirmed_solutions 应排除。
+        log.log_auto_captured_failure("s1", "read_file", "path not found")
+            .expect("auto_capture");
+        // 真实 Confirmed 决策。
+        log.log_decision(
+            r#"{"session_id":"s1","problem_signature":"read_file: path not found","root_cause_hypothesis":"bad path","applied_solution":"use glob to verify path first","affected_files":["c.rs"],"verification_result":"Confirmed"}"#,
+        )
+        .expect("log_decision");
+
+        let archive = HarnessArchive::open(dir.path()).unwrap();
+        let n = propose_from_confirmed_solutions(&log, &archive, &EvolutionConfig::default())
+            .expect("propose");
+        // auto_captured 被排除,只提炼真实 Confirmed。
+        assert_eq!(n, 1);
+        let candidates = archive.candidate_edits().expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].content, "use glob to verify path first");
+    }
+
+    #[test]
+    fn propose_from_confirmed_solutions_respects_max_proposals() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        log.log_decision(
+            r#"{"session_id":"s1","problem_signature":"edit_file: old_string not found","root_cause_hypothesis":"a","applied_solution":"grep first","affected_files":[],"verification_result":"Confirmed"}"#,
+        )
+        .expect("d1");
+        log.log_decision(
+            r#"{"session_id":"s1","problem_signature":"bash: connection refused","root_cause_hypothesis":"b","applied_solution":"check service port","affected_files":[],"verification_result":"Confirmed"}"#,
+        )
+        .expect("d2");
+
+        let archive = HarnessArchive::open(dir.path()).unwrap();
+        let config = EvolutionConfig {
+            max_proposals: 1,
+            ..EvolutionConfig::default()
+        };
+        let n = propose_from_confirmed_solutions(&log, &archive, &config).expect("propose");
+        assert_eq!(n, 1, "max_proposals=1 should cap to one proposal");
     }
 
     #[test]

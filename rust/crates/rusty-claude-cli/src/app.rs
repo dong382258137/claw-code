@@ -57,7 +57,8 @@ use crate::session_mgr::{
     session_exists_json, session_reference_exists, sessions_dir,
     summarize_tool_payload_for_markdown, write_session_clear_backup, ManagedSessionSummary,
     PromptHistoryEntry, ResumeCommandOutcome, SessionHandle, SessionLifecycleKind,
-    SessionLifecycleSummary, DEFAULT_HISTORY_LIMIT, LATEST_SESSION_REFERENCE,
+    SessionLifecycleSummary, UpgradeRequest, clear_upgrade_request, read_upgrade_request,
+    write_upgrade_exited, write_upgrade_request, DEFAULT_HISTORY_LIMIT, LATEST_SESSION_REFERENCE,
     LEGACY_SESSION_EXTENSION, PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT,
     SESSION_REFERENCE_ALIASES,
 };
@@ -504,6 +505,10 @@ pub(crate) fn run_repl(
     if enable_plan_mode {
         cli.runtime.set_plan_mode_enabled(true);
     }
+    // 热升级启动检测(双大脑收官基石):新进程启动时若存在升级标记,
+    // 自动 resume 旧会话 + 恢复活跃计划 + 注入继续通知 + 清理标记,
+    // 使旧进程的未完成任务在新进程无缝续跑。失败静默降级为普通启动。
+    let _ = cli.maybe_resume_from_upgrade()?;
     // P1-1:PolicyEngine 策略引擎 flag。
     // 当前 lane_completion 模块已实现 PolicyEngine 调用(tools/lane_completion.rs),
     // 但生产路径未接入。flag 用于控制后续 lane 完成时是否调用策略评估。
@@ -663,6 +668,14 @@ pub(crate) struct LiveCli {
     // the TUI's StatusBarState + OutputView in real time.
     #[cfg(feature = "full-tui")]
     status_emitter: Option<crate::streaming::StatusEmitter>,
+    /// 热升级优雅中断信号(双大脑收官基石)。
+    ///
+    /// `/upgrade` 命令置位后,当前正在执行的 turn 在下一次 run_turn 迭代
+    /// 顶部检测到 → 注入"暂停通知"给 LLM → turn 自然收尾。因
+    /// `prepare_turn_runtime` 每轮重建 runtime,信号必须存于此字段并在
+    /// 重建时经 `with_upgrade_signal` 注入,否则每轮新 runtime 的
+    /// upgrade_pending 都是默认 false,信号丢失。
+    upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// TUI 本地命令输出捕获：当设置时，`tui_println` 会把内容追加到此
     /// buffer 而不是打印到 stdout（避免破坏 alternate screen）。
     /// 由 TuiApp 在执行斜杠命令前设置，执行后清除。
@@ -720,6 +733,21 @@ impl BuiltRuntime {
             .take()
             .expect("runtime should exist before installing hook abort signal");
         self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
+        self
+    }
+
+    /// 注入热升级优雅中断信号(双大脑收官基石)。
+    ///
+    /// 与 [`with_hook_abort_signal`](Self::with_hook_abort_signal) 同构:
+    /// 把 LiveCli 持有的 `upgrade_signal`(跨 `prepare_turn_runtime` 重建
+    /// 持久)注入 runtime,使 `/upgrade` 命令置位后,当前正在执行的 turn
+    /// 在 run_turn 循环顶部检测到并优雅收尾。
+    fn with_upgrade_signal(mut self, upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing upgrade signal");
+        self.runtime = Some(runtime.with_upgrade_signal(upgrade_signal));
         self
     }
 
@@ -860,6 +888,7 @@ impl LiveCli {
             prompt_history: Vec::new(),
             cumulative_usage: runtime::TokenUsage::default(),
             goal_manager,
+            upgrade_signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "full-tui")]
             status_emitter: None,
             #[cfg(feature = "full-tui")]
@@ -1030,7 +1059,8 @@ impl LiveCli {
             self.permission_mode,
             None,
         )?
-        .with_hook_abort_signal(hook_abort_signal.clone());
+        .with_hook_abort_signal(hook_abort_signal.clone())
+        .with_upgrade_signal(self.upgrade_signal.clone());
         runtime.set_tool_verbosity(self.output_verbosity);
         // 推理状态同步：AnthropicRuntimeClient 每轮 turn 都会在
         // prepare_turn_runtime 中重建(见 run_turn → replace_runtime 生命周期),
@@ -1350,6 +1380,14 @@ impl LiveCli {
                 self.run_ultraplan(task.as_deref())?;
                 true
             }
+            SlashCommand::Upgrade => {
+                // 热升级(双大脑收官基石):优雅中断当前 turn + 写升级标记。
+                // 设 upgrade_pending 信号 → run_turn 循环检测后注入暂停通知,
+                // turn 自然收尾(状态已实时落盘)→ persist plan + 写标记。
+                // 用户随后执行:mv claw.exe claw.exe.old → cargo build → 启动新进程。
+                self.run_upgrade()?;
+                false
+            }
             SlashCommand::Teleport { target } => {
                 Self::run_teleport(target.as_deref())?;
                 false
@@ -1666,7 +1704,6 @@ impl LiveCli {
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
-            | SlashCommand::Upgrade
             | SlashCommand::Share
             | SlashCommand::Feedback
             | SlashCommand::Files
@@ -2709,6 +2746,168 @@ impl LiveCli {
             }
         }
         Ok(())
+    }
+
+    /// 热升级一键化(双大脑收官基石 + 任务 2):优雅中断 + 写标记 + 自动迁移。
+    ///
+    /// 流程(无感衔接,无需用户介入):
+    /// 1. 置位 `upgrade_pending` 信号 → 正在执行的 turn 收尾(状态已落盘)。
+    /// 2. persist 活跃计划 → `.claw/plans/<id>.json`。
+    /// 3. 写升级标记 `.claw/upgrade-request.json`(含 old_pid)。
+    /// 4. spawn 自身副本 `--upgrade-helper`(新终端)→ helper 负责:
+    ///    mv claw.exe → claw.exe.old → cargo build → 启动新 claw.exe。
+    /// 5. persist 会话 + shutdown MCP/plugins。
+    /// 6. 写 `.claw/upgrade-exited.json`(告知 helper 旧进程即将退出)。
+    /// 7. exit(0)—— 新进程检测到标记 → resume session → restore plan → 继续任务。
+    fn run_upgrade(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // 1. 置位优雅中断信号(正在执行的 turn 将收尾)。
+        self.upgrade_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // 2. persist 活跃计划(供新进程恢复)。
+        let mut plan_id = None;
+        if let Some(plan) = self.runtime.active_plan() {
+            if let Ok(cwd) = std::env::current_dir() {
+                if let Ok(path) = runtime::planner::persist_plan_artifact(plan, &cwd) {
+                    plan_id = Some(plan.id.clone());
+                    eprintln!("[upgrade] plan persisted: {}", path.display());
+                }
+            }
+        }
+
+        // 3. 写升级标记(含 old_pid;新进程启动检测 + helper 迁移)。
+        let cwd = std::env::current_dir()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let old_pid = std::process::id();
+        let req = UpgradeRequest {
+            session_id: self.session.id.clone(),
+            plan_id,
+            requested_at_ms: now_ms,
+            from_version: VERSION.to_string(),
+            old_pid,
+        };
+        write_upgrade_request(&cwd, &req)?;
+
+        // 4. spawn 升级助手(独立进程,新终端显示编译输出)。
+        //    助手负责:等 exited → mv exe.old → cargo build → 启动新 claw。
+        crate::upgrade_helper::spawn(&cwd)?;
+
+        // 5. persist 会话(兜底;消息本已实时落盘)。
+        self.persist_session()?;
+
+        // 6. shutdown MCP + plugins(释放子进程资源,准备退出)。
+        let _ = self.runtime.shutdown_mcp();
+        let _ = self.runtime.shutdown_plugins();
+
+        // 7. 写"已退出"标记(helper 确认可开始迁移 exe),然后退出。
+        //    注:Windows 允许重命名运行中的 exe,helper 收到 exited 后立即
+        //    mv claw.exe → claw.exe.old,即使本进程尚未完全退出也安全。
+        write_upgrade_exited(&cwd, old_pid)?;
+
+        let msg = format!(
+            "热升级已启动(自动,无需手动操作):\n\
+             - session={} plan={} old_pid={}\n\
+             - 升级助手已在独立窗口运行:备份 exe → cargo build → 启动新进程\n\
+             - 新进程将自动 resume 会话并继续任务(无感衔接)\n\
+             【本进程即将退出】",
+            req.session_id,
+            req.plan_id.as_deref().unwrap_or("(无活跃计划)"),
+            old_pid,
+        );
+        if !self.tui_println(&msg) {
+            println!("{msg}");
+        }
+        std::process::exit(0);
+    }
+
+    /// 新进程启动检测(双大脑收官基石):检测热升级标记并恢复旧任务。
+    ///
+    /// 新 claw.exe 启动时调用:若 `.claw/upgrade-request.json` 存在(且未过期),
+    /// 则:
+    /// 1. 用 `session_id` resume 旧会话(会话消息已在 jsonl 落盘)。
+    /// 2. 若标记含 `plan_id`,从 `.claw/plans/<plan_id>.json` 恢复活跃计划。
+    /// 3. 注入"继续任务通知"给 LLM(下一 turn 可见)。
+    /// 4. 清理升级标记(幂等)。
+    ///
+    /// 陈旧标记(> [`UPGRADE_REQUEST_STALE_MS`])视为崩溃残留,忽略并清理,
+    /// 降级为普通启动。返回是否成功恢复(供调用方打日志)。
+    pub(crate) fn maybe_resume_from_upgrade(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        let cwd = std::env::current_dir()?;
+        let Some(req) = read_upgrade_request(&cwd) else {
+            return Ok(false); // 无升级标记,普通启动
+        };
+        // 陈旧标记(崩溃残留)→ 忽略并清理,降级为普通启动。
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if now_ms.saturating_sub(req.requested_at_ms) > crate::session_mgr::UPGRADE_REQUEST_STALE_MS
+        {
+            eprintln!(
+                "[upgrade] stale upgrade request ignored (age {}ms > {}ms)",
+                now_ms.saturating_sub(req.requested_at_ms),
+                crate::session_mgr::UPGRADE_REQUEST_STALE_MS
+            );
+            clear_upgrade_request(&cwd);
+            return Ok(false);
+        }
+
+        // 1. resume 旧会话(复用现有 resume_session:session_id 是合法 reference)。
+        let resumed = self.resume_session(Some(req.session_id.clone()))?;
+        if !resumed {
+            eprintln!("[upgrade] resume session '{}' failed; continuing without it", req.session_id);
+            clear_upgrade_request(&cwd);
+            return Ok(false);
+        }
+
+        // 2. 恢复活跃计划(若有)。
+        let mut restored_plan_id = None;
+        if let Some(plan_id) = &req.plan_id {
+            let plan_path = cwd.join(".claw").join("plans").join(format!("{plan_id}.json"));
+            match runtime::planner::load_plan_artifact(&plan_path) {
+                Ok(plan) => {
+                    self.runtime.restore_active_plan(plan);
+                    restored_plan_id = Some(plan_id.clone());
+                }
+                Err(e) => eprintln!(
+                    "[upgrade] plan '{plan_id}' load failed: {e}; continuing without plan"
+                ),
+            }
+        }
+
+        // 3. 注入"继续任务通知"给 LLM(下一 turn 请求构造时可见)。
+        let notice = match (&restored_plan_id, &req.from_version) {
+            (Some(plan_id), _) => format!(
+                "[runtime] 热升级完成：新版本已接管此会话(v{from})，会话与计划已恢复 \
+                 (plan={plan_id})。请从上次收尾处继续执行当前任务。",
+                from = req.from_version
+            ),
+            (None, _) => format!(
+                "[runtime] 热升级完成：新版本已接管此会话(v{from})，会话已恢复 \
+                 (旧进程无活跃计划)。请从上次收尾处继续执行当前任务。",
+                from = req.from_version
+            ),
+        };
+        self.runtime
+            .session_mut()
+            .push_user_text(notice)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+
+        // 4. 清理升级标记(幂等)。
+        clear_upgrade_request(&cwd);
+
+        let report = format!(
+            "[upgrade] 热升级恢复完成：session={} plan={} (from v{})。任务将在下一轮无缝续跑。",
+            req.session_id,
+            restored_plan_id.as_deref().unwrap_or("(none)"),
+            req.from_version,
+        );
+        if !self.tui_println(&report) {
+            println!("{report}");
+        }
+        Ok(true)
     }
 
     fn run_teleport(target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {

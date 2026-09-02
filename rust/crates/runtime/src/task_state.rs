@@ -45,8 +45,54 @@ pub fn session_task_state_path(sessions_dir: &Path, session_id: &str) -> PathBuf
 
 /// 判定"用户换新任务"的 goal 前缀比较长度。
 const GOAL_PREFIX_COMPARE_CHARS: usize = 30;
-/// 用户输入短于此字符数时不视为新任务描述(如"继续"/"好"),保留旧 goal。
+/// 用户输入短于此字符数时不视为完整任务描述,进入短输入语义判定。
 const MIN_GOAL_INPUT_CHARS: usize = 8;
+
+/// 纯承接词 —— 不携带任务语义的短输入,不应覆盖任务锚点。
+///
+/// v5 迭代修复:原逻辑 `chars >= MIN_GOAL_INPUT_CHARS` 一刀切拦截短输入,
+/// 导致短任务名("MVP-C1"=6字符)被丢弃、Current Task 锚点停留旧任务;
+/// 同时宽松化后 '好滴'/'没问题'/'abc'/'abcde' 等又会误判为新任务。
+/// 这里显式枚举承接词,命中即不更新 goal(大小写不敏感)。
+const ACK_WORDS: &[&str] = &[
+    "继续", "好", "好的", "ok", "嗯", "收到", "知道了", "明白",
+    "可以", "行", "好的好的", "好滴", "没问题", "嗯嗯", "很好",
+    "了解了", "好的吧", "okay", "okey", "了解", "晓得了",
+    "是", "对", "不错", "继续吧", "继续做", "继续干",
+    "随便", "随便吧", "无所谓", "都行", "都行吧", "随意",
+    "好嘞", "好勒", "好呀", "行吧", "好吧",
+];
+
+/// 判定用户输入是否应更新任务目标(v5 语义判定,替代原长度一刀切)。
+///
+/// 第一性原理:任务身份切换的判据是"输入是否携带任务语义",而非"输入长度"。
+/// 原逻辑用长度代理语义,导致短任务名被拦截(Current Task 锚点滞后缺陷根因)。
+/// v5 规则(原型 29/29 收敛,修复 '好滴'/'没问题'/'abc'/'abcde' 四误判):
+/// 1. 纯承接词(继续/好滴/没问题/随便…)→ 不更新(防覆盖锚点)
+/// 2. 长输入(≥[`MIN_GOAL_INPUT_CHARS`])→ 完整任务描述,更新
+/// 3. 短输入纯 ASCII 小写字母+数字(abc/abcde/123)→ 噪声,不更新
+/// 4. 其余短输入(含大写/连字符/中文任务名,如 MVP-C1/方案C/任务3)→ 更新
+fn should_update_goal(new_goal: &str) -> bool {
+    let trimmed = new_goal.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // 1. 纯承接词 → 不更新。
+    let lower = trimmed.to_lowercase();
+    if ACK_WORDS.iter().any(|w| *w == lower) {
+        return false;
+    }
+    // 2. 长输入 → 更新(完整任务描述)。
+    if trimmed.chars().count() >= MIN_GOAL_INPUT_CHARS {
+        return true;
+    }
+    // 3. 短输入纯 ASCII 小写字母+数字 → 噪声,不更新。
+    if trimmed.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        return false;
+    }
+    // 4. 其余短输入(任务名信号:大写/连字符/中文)→ 更新。
+    true
+}
 
 /// 过程性/行动性开头词 —— 以这些开头的行描述的是"正在做什么/计划做什么"
 /// (如"开始调查根因"),不是已确认的结论,不应进入 findings。
@@ -164,14 +210,15 @@ impl TaskState {
 
     /// 从本 turn 规则式更新任务状态(零 LLM 成本)。
     ///
-    /// - `user_input`:本 turn 的用户消息。长度 >= [`MIN_GOAL_INPUT_CHARS`] 时
-    ///   视为任务描述;与旧 goal 前缀不同则判定为换任务,清空旧 findings。
+    /// - `user_input`:本 turn 的用户消息。经 [`should_update_goal`] 语义判定
+    ///   (承接词/噪声不更新,短任务名/长描述更新);与旧 goal 前缀不同则判定
+    ///   为换任务,清空旧 findings。
     /// - `assistant_texts`:本 turn 的 assistant 文本块。逐行扫描含
     ///   [`FINDING_KEYWORDS`] 信号词的行,去重后追加为新发现(保留最新 N 条)。
     pub fn update_from_turn(&mut self, user_input: &str, assistant_texts: &[String]) {
         let trimmed = user_input.trim();
         let goal = truncate(trimmed, TASK_GOAL_MAX_CHARS);
-        if !goal.is_empty() && trimmed.chars().count() >= MIN_GOAL_INPUT_CHARS {
+        if should_update_goal(&goal) {
             if !is_same_task(&self.goal, &goal) {
                 self.findings.clear();
             }
@@ -291,6 +338,18 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// 截断任务目标到 [`TASK_GOAL_MAX_CHARS`](公共包装,供 `set_current_task` 使用)。
+#[must_use]
+pub fn truncate_goal(s: &str) -> String {
+    truncate(s, TASK_GOAL_MAX_CHARS)
+}
+
+/// 当前时间戳(ms,公共包装,供 `set_current_task` 持久化使用)。
+#[must_use]
+pub fn now_ms_pub() -> i64 {
+    now_ms()
 }
 
 /// 从压缩摘要中解析出的任务状态(P1:压缩摘要字段化)。
@@ -443,6 +502,60 @@ mod tests {
         state.update_from_turn("继续", &["根因确认:xxx".to_string()]);
         assert_eq!(state.goal, goal_before, "短输入不应覆盖 goal");
         assert_eq!(state.findings.len(), 1);
+    }
+
+    #[test]
+    fn short_task_name_updates_goal() {
+        // v5 修复:短任务名("MVP-C1" 6 字符)应更新 goal,不再被 8 字符门槛拦截。
+        let mut state = ts();
+        state.update_from_turn("先把 MVP-C2 落地", &[]);
+        assert_eq!(state.goal, "先把 MVP-C2 落地");
+        state.update_from_turn("MVP-C1", &[]);
+        assert_eq!(state.goal, "MVP-C1", "短任务名应切换 goal");
+    }
+
+    #[test]
+    fn ack_words_do_not_update_goal() {
+        // v5 修复:承接词(继续/好滴/没问题/随便…)不更新 goal(防覆盖锚点)。
+        let mut state = ts();
+        state.update_from_turn("调查根因:缓存失效", &[]);
+        let goal_before = state.goal.clone();
+        for ack in ["继续", "好滴", "没问题", "随便", "好的", "OK", "收到"] {
+            state.update_from_turn(ack, &[]);
+            assert_eq!(state.goal, goal_before, "承接词 '{ack}' 不应覆盖 goal");
+        }
+    }
+
+    #[test]
+    fn noise_words_do_not_update_goal() {
+        // v5 修复:纯小写字母数字噪声(abc/abcde/123)不更新 goal。
+        let mut state = ts();
+        state.update_from_turn("修复决策日志去重", &[]);
+        let goal_before = state.goal.clone();
+        for noise in ["abc", "abcde", "123", "xyz", "abc123"] {
+            state.update_from_turn(noise, &[]);
+            assert_eq!(state.goal, goal_before, "噪声 '{noise}' 不应覆盖 goal");
+        }
+    }
+
+    #[test]
+    fn should_update_goal_covers_all_v5_cases() {
+        // 直接验证 should_update_goal 的完整判定面。
+        // 更新:
+        for input in ["MVP-C1", "方案C", "任务3", "先把 MVP-C2 落地", "修复 task_state 缺陷"] {
+            assert!(should_update_goal(input), "'{input}' 应更新 goal");
+        }
+        // 不更新(承接词):
+        for input in ["继续", "好滴", "没问题", "随便", "好的", "OK", "嗯", "收到"] {
+            assert!(!should_update_goal(input), "'{input}' 不应更新 goal");
+        }
+        // 不更新(噪声):
+        for input in ["abc", "abcde", "123", "xyz"] {
+            assert!(!should_update_goal(input), "'{input}' 不应更新 goal");
+        }
+        // 空输入:
+        assert!(!should_update_goal(""));
+        assert!(!should_update_goal("   "));
     }
 
     #[test]

@@ -738,6 +738,36 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["planning".to_string(), "memory".to_string()],
     });
+    // P2(Current Task 锚点修复):注册 set_current_task 工具 — LLM 主动维护
+    // 任务目标。规则式 goal 提取(task_state.update_from_turn)是零成本快速
+    // 反射,但依赖长度/承接词表启发式,短任务名("MVP-C1")与承接词边界存在
+    // 误判(方案 C v5 已收敛 29/29)。本工具让 LLM 作为语义权威,在明确任务
+    // 切换时刻显式写入 goal,覆盖规则提取值并持久化到会话级 task_state。
+    // 执行由 ConversationRuntime::run_turn 拦截,委托
+    // ConversationRuntime::execute_set_current_task 处理。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "set_current_task".to_string(),
+        description: Some(
+            "Explicitly set the current task goal (the 'Current Task' anchor injected every turn). \
+             Use this when starting a new task, switching tasks, or when the automatically-extracted \
+             goal is wrong or stale. The value overrides the auto-extracted goal until the next user \
+             input updates it. Keep it concise (<=150 chars) and task-identity-focused (what you are \
+             doing now, not how)."
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "The current task goal, e.g. 'MVP-C1: 从 Confirmed 方案提炼规则提案' or '修复 task_state 锚点滞后缺陷'."
+                }
+            },
+            "required": ["goal"]
+        }),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["memory".to_string(), "task-state".to_string()],
+    });
     // P0:注册 recall_full 工具 — 从 ToolResultArchive 检索 microcompact
     // 摘要前的原始 tool result。
     //

@@ -90,6 +90,9 @@ pub enum EditSource {
     RulePattern,
     /// LLM 生成(Phase 3 扩展)
     LlmProposer,
+    /// 已验证方案提炼(MVP-C1):decision_log 中 verification_result=Confirmed
+    /// 的 applied_solution 提炼为规则——已被真实修复验证,比硬编码规则更可靠。
+    VerifiedSolution,
 }
 
 impl EditSource {
@@ -98,6 +101,7 @@ impl EditSource {
         match self {
             Self::RulePattern => "RulePattern",
             Self::LlmProposer => "LlmProposer",
+            Self::VerifiedSolution => "VerifiedSolution",
         }
     }
 
@@ -105,6 +109,7 @@ impl EditSource {
         match s {
             "RulePattern" => Some(Self::RulePattern),
             "LlmProposer" => Some(Self::LlmProposer),
+            "VerifiedSolution" => Some(Self::VerifiedSolution),
             _ => None,
         }
     }
@@ -194,4 +199,6 @@ pub struct ArchiveStats {
     /// 规则来源占比
     pub rule_sourced: u64,
     pub llm_sourced: u64,
+    /// 已验证方案提炼来源(MVP-C1)
+    pub verified_solution_sourced: u64,
 }
