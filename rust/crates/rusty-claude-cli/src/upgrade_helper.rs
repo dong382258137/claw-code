@@ -271,11 +271,21 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     );
     let mut cmd = Command::new(&exe);
     cmd.current_dir(user_cwd);
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
 
-    // 5. 清理 exited 标记(本次升级完成),助手退出。
+    // 5. 清理 exited 标记(本次升级完成)。
     clear_upgrade_exited(user_cwd);
-    log_out(&log_file, "[upgrade-helper] 完成,新进程已启动(无感衔接)。");
+    log_out(
+        &log_file,
+        "[upgrade-helper] 新进程已启动(无感衔接),助手驻留保持终端。",
+    );
+
+    // 6. 驻留监护:helper 不能立即退出 —— 若退出,CREATE_NEW_CONSOLE 终端
+    //    (新进程共享的 stdout/stderr 管道)随之关闭,新进程初始化时任何
+    //    println! 触发 "failed printing to stderr: 管道正在被关闭 (os error 232)"
+    //    panic(2026-09-03 claw-crash.log 实测,upgrade-request 残留未清理)。
+    //    wait 保持终端存活,直到新进程(REPL)退出,helper 随之退出。
+    let _ = child.wait();
     Ok(())
 }
 
