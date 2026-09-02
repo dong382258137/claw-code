@@ -51,6 +51,9 @@ pub mod memory_semantic;
 // 跨压缩持久化的工作记忆,LLM 通过 `notebook_update` 工具主动维护。
 // 详见 docs/harness-engineering-optimization-plan.md P0-1。
 pub mod notebook;
+// 双大脑架构:管理脑落盘区(设计文档 2026-09-03-dual-brain-architecture.md §5.3)。
+// 会话 digest 确定性聚合(零 LLM)落盘 .claw/management_brain/ + 新会话首 turn 读取。
+pub mod management_brain;
 // P0:ToolResultArchive — microcompact 真无损化的 Layer 3 持久存储。
 // 在 microcompact 摘要前归档原始 tool result,LLM 可通过 `recall_full` 工具
 // 按 `tool_use_id` 主动检索原始内容。直击"AI 忘记原始 tool output 导致重复调用"

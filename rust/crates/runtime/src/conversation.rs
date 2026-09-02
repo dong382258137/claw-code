@@ -1627,6 +1627,13 @@ pub struct ConversationRuntime<C, T> {
     /// 修复而非盲目重试。读取后立即消费(与 `pending_remediation` 同生命周期)。
     /// 无高质量命中不设置(宁缺毋滥,不注入未验证方案)。零 LLM。
     pending_failure_advice: Option<String>,
+    /// 双大脑 · 上一会话 digest 注入(批次 3):新会话首 turn 感知遗留。
+    ///
+    /// run_turn_async 开头检测(首 turn 且 workspace_root 存在)读取最近一份
+    /// `.claw/management_brain/digest-<session_id>.md` 存入;render_runtime_hints
+    /// 注入 "Previous Session Digest" 槽位后由请求构造清空(一次性消费)。
+    /// 无 digest 文件时为 None(不注入)。零 LLM;读失败静默降级。
+    pending_session_digest: Option<String>,
     decision_log: Option<crate::decision_log::DecisionLog>,
     /// v3 §4.7:决策检测策略。控制 `maybe_auto_compact` 在压缩前用何种方式
     /// 提取决策点。默认 `Heuristic`(零成本),可通过
@@ -2030,6 +2037,7 @@ where
             pending_remediation: None,
             pending_cog_stall: None,
             pending_failure_advice: None,
+            pending_session_digest: None,
             decision_log: None,
             detection_strategy: crate::decision_log::DetectionStrategy::Heuristic,
             project_topology: None,
@@ -3115,6 +3123,18 @@ where
         self.hook_runner
             .spawn_lifecycle_event(HookEvent::SessionStart, self.session.session_id.clone());
 
+        // 双大脑架构(批次 3):新会话首 turn 读取上一会话 digest 注入。
+        // 本会话首条消息触发前(即本 turn 开头)读取最近一份管理脑 digest,
+        // 存入 pending_session_digest;render_runtime_hints 注入
+        // "Previous Session Digest" 槽位后由请求构造清空(一次性消费)。
+        // 同会话后续 turn(首 turn 已消费)不重复读取。零 LLM;失败静默。
+        if self.pending_session_digest.is_none() {
+            if let Some(root) = &self.workspace_root {
+                self.pending_session_digest =
+                    crate::management_brain::latest_digest_text(root);
+            }
+        }
+
         // P2-7 修复(升级 v2):跨 turn 循环检测。
         // 原实现每 turn 全量 reset(),跨 turn 的"换参数再诊断"循环不可见
         // (turn 1 诊断失败 → turn 2 换参数再诊断 → ...)。现改为:
@@ -3647,6 +3667,7 @@ where
                 self.pending_remediation = None;
                 self.pending_cog_stall = None;
                 self.pending_failure_advice = None;
+                self.pending_session_digest = None;
                 ApiRequest {
                     system_prompt: system_split,
                     messages,
@@ -4979,6 +5000,45 @@ where
             crate::notebook::mark_plan_stale(workspace_root);
         }
 
+        // 双大脑架构(批次 3):会话结束确定性聚合 digest → 落盘管理脑区。
+        // 数据源:本会话 tool results 的 is_error 失败(提取工具名+首行签名)
+        // + usage_tracker 累计用量成本行。零 LLM;失败静默降级(非关键路径)。
+        if let Some(workspace_root) = &self.workspace_root {
+            // 1. 聚合失败记录:扫描 session messages 中 ToolResult.is_error。
+            let mut failures: Vec<(String, String)> = Vec::new();
+            for msg in &self.session.messages {
+                for block in &msg.blocks {
+                    if let crate::session::ContentBlock::ToolResult {
+                        tool_name,
+                        output,
+                        is_error: true,
+                        ..
+                    } = block
+                    {
+                        let first_line = output.lines().next().unwrap_or("").trim();
+                        let sig = if first_line.is_empty() {
+                            output.chars().take(100).collect()
+                        } else {
+                            first_line.chars().take(100).collect()
+                        };
+                        failures.push((tool_name.clone(), sig));
+                    }
+                }
+            }
+            // 去重:同工具同签名只留一条(避免 digest 刷屏)。
+            failures.sort();
+            failures.dedup();
+            // 2. 用量成本行。
+            let usage_lines = self
+                .usage_tracker
+                .cumulative_usage()
+                .summary_lines("session-total");
+            // 3. 渲染 + 落盘。
+            let digest =
+                crate::management_brain::render_digest(&self.session.session_id, &failures, &usage_lines);
+            let _ = crate::management_brain::write_digest(workspace_root, &self.session.session_id, &digest);
+        }
+
         // G9.1: SessionEnd lifecycle hook — turn 完全结束(含 nudge 等清理)后触发,
         // 让外部观察者(session 审计、状态持久化、清理逻辑等)感知会话结束。
         // 异步 fire-and-forget:不阻塞对话循环,返回值不影响主流程。
@@ -6041,6 +6101,14 @@ where
         // 读取后由请求构造清空(与 pending_remediation 同生命周期,一次性消费)。
         if let Some(advice) = &self.pending_failure_advice {
             slots.push(("Failure Advice", advice.clone()));
+        }
+
+        // 槽位 7c:双大脑上一会话 digest(批次 3)——新会话首 turn 感知遗留。
+        // run_turn_async 开头读取最近一份管理脑 digest 存入 pending_session_digest;
+        // 此处注入让执行脑感知上一会话的失败模式与用量参考(架构守护的跨会话面)。
+        // 读取后由请求构造清空(一次性消费;同会话后续 turn 不再注入)。
+        if let Some(digest) = &self.pending_session_digest {
+            slots.push(("Previous Session Digest", digest.clone()));
         }
 
         // 槽位 8:压缩后 NOTEBOOK 刷新提醒(flag 由 execute_notebook_update 清除)。
@@ -18673,6 +18741,79 @@ mod tests {
         assert_eq!(summary.iterations, 2);
     }
 
+    // ===== 双大脑 · 会话 digest(批次 3)=====
+
+    /// pending_session_digest 在 render_runtime_hints 注入 "Previous Session Digest" 槽位。
+    #[test]
+    fn render_runtime_hints_injects_previous_session_digest() {
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                NoopApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            );
+        runtime.pending_session_digest =
+            Some("# Session Digest · old-sess\n失败模式".to_string());
+        let hints = runtime.render_runtime_hints().expect("hints rendered");
+        assert!(hints.contains("Previous Session Digest"), "hints: {hints}");
+        assert!(hints.contains("old-sess"), "hints: {hints}");
+    }
+
+    /// 端到端:run_turn 正常结束后在管理脑区落盘 digest(含失败签名与用量)。
+    /// 用 failing tool 触发 is_error → digest 应含该工具失败签名。
+    #[test]
+    fn run_turn_writes_session_digest_on_completion() {
+        struct DigestApi {
+            calls: usize,
+        }
+        impl ApiClient for DigestApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-digest-1".to_string(),
+                            name: "bash".to_string(),
+                            input: r#"{"command":"digest-probe-missing-cmd"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime: ConversationRuntime<DigestApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                DigestApi { calls: 0 },
+                // bash 未实现 → is_error=true → 失败进 digest。
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_workspace_root(dir.path().to_path_buf());
+
+        runtime
+            .run_turn("trigger digest", None)
+            .expect("turn should complete");
+
+        // digest 文件已落盘且包含失败签名与用量段。
+        let latest = crate::management_brain::latest_digest_text(dir.path())
+            .expect("digest written after turn");
+        assert!(latest.contains("Session Digest"), "latest: {latest}");
+        assert!(latest.contains("bash"), "latest: {latest}");
+        assert!(crate::management_brain::digest_dir_exists(dir.path()));
+    }
 
     // ===== P-fix:内置工具完成后触发 tool_result_callback =====
 
