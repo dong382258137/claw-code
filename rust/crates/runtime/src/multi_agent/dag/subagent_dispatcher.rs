@@ -51,6 +51,10 @@ pub struct SubagentDispatcher {
     /// (L5 修复:此前 DAG 子代理 client 固定 enable_tools=false,LLM 不发出 tool_use)。
     /// `None` 保持旧行为(不重建,向后兼容)。
     model: Option<String>,
+    /// 任务级多轮 tool call 上限覆盖(2026-09-03,网络调研任务修复)。
+    /// `Some(n)` 时覆盖 `capability.max_iterations()`(如调研类任务放宽到 15+);
+    /// `None` 保持能力默认上限,向后兼容。
+    max_iterations: Option<usize>,
 }
 
 impl SubagentDispatcher {
@@ -62,6 +66,7 @@ impl SubagentDispatcher {
             capability: SubagentCapability::Analyze,
             workspace_override: None,
             model: None,
+            max_iterations: None,
         }
     }
 
@@ -108,6 +113,17 @@ impl SubagentDispatcher {
         self
     }
 
+    /// 2026-09-03:任务级多轮 tool call 上限覆盖。
+    ///
+    /// `Some(n)` 覆盖 [`SubagentCapability::max_iterations`] 默认上限(如网络
+    /// 调研类任务放宽到 15+);`None` 保持能力默认,向后兼容。由 DAG 节点的
+    /// `max_iterations` 字段经 `SubagentRunner` 传入。
+    #[must_use]
+    pub fn with_max_iterations(mut self, max_iterations: Option<usize>) -> Self {
+        self.max_iterations = max_iterations;
+        self
+    }
+
     /// 执行子 agent turn(异步包装同步 stream 调用)。
     ///
     /// 逻辑与 ConversationRuntime::run_subagent_turn 一致:
@@ -129,6 +145,7 @@ impl SubagentDispatcher {
             &name,
             &task,
             self.model.as_deref(),
+            self.max_iterations,
         )
         .await
     }
@@ -153,6 +170,7 @@ impl SubagentDispatcher {
         name: &str,
         task: &str,
         model: Option<&str>,
+        max_iterations: Option<usize>,
     ) -> Result<String, String> {
         // DAG 路径无 complexity 概念,与现状一致走 Simple(无 SOP)。
         let complexity = crate::multi_agent::TaskComplexity::Simple;
@@ -163,6 +181,7 @@ impl SubagentDispatcher {
                 .into_iter()
                 .filter(|ts| capability.allowed_tools().contains(&ts.name.as_str()))
                 .collect(),
+            max_iterations,
             ..SubagentContext::default()
         };
 
@@ -479,6 +498,49 @@ mod tests {
         let handoff_path = tmp.path().join(".claw/subagents/subagent-noteexec-1.md");
         let content = std::fs::read_to_string(&handoff_path).expect("read handoff");
         assert!(content.contains("status: truncated"));
+    }
+
+    /// 2026-09-03:网络调研修复 — `with_max_iterations(Some(n))` 覆盖能力默认
+    /// 上限并透传到执行循环。ReadOnly 默认上限 5,覆盖为 2 时 LLM 持续请求
+    /// 工具 → 第 3 轮检测截断,handoff 记录实际执行的 2 轮(不虚报)。
+    #[tokio::test]
+    async fn dispatch_max_iterations_override_reaches_execution_loop() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let workspace = tmp.path().to_path_buf();
+
+        // LLM 永不终止:每轮都请求工具(模拟长链调研一直有下一步)
+        let client = MockApiClient::new(vec![make_tool_use_event(
+            "tu-1",
+            "read_file",
+            r#"{"file_path":"test.txt"}"#,
+        )]);
+
+        let api_client: Arc<Mutex<Box<dyn ApiClient + Send>>> =
+            Arc::new(Mutex::new(Box::new(client)));
+        let tool_executor: Arc<Mutex<Box<dyn ToolExecutor + Send>>> =
+            Arc::new(Mutex::new(Box::new(StaticToolExecutor::new())));
+
+        let dispatcher = SubagentDispatcher::new(api_client, workspace)
+            .with_capability(SubagentCapability::ReadOnly)
+            .with_tool_executor(tool_executor)
+            .with_max_iterations(Some(2));
+
+        let err = dispatcher
+            .dispatch("subagent-mi-1".into(), "long research task".into())
+            .await
+            .expect_err("should hit the overridden cap");
+
+        assert!(err.contains("exceeded max_iterations"), "got: {err}");
+        assert!(err.contains("(2)"), "cap value should appear, got: {err}");
+
+        // handoff 记录实际执行的 2 轮(截断修复:不虚报为 3)
+        let handoff_path = tmp.path().join(".claw/subagents/subagent-mi-1.md");
+        let content = std::fs::read_to_string(&handoff_path).expect("read handoff");
+        assert!(content.contains("status: truncated"));
+        assert!(
+            content.contains("iterations: 2"),
+            "handoff should record 2 executed rounds, got: {content}"
+        );
     }
 
     #[tokio::test]

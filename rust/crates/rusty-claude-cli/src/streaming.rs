@@ -13,6 +13,7 @@
 
 #![allow(dead_code, unused_imports, unused_variables)]
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -419,6 +420,28 @@ pub(crate) fn mark_last_tool_with_cache_control(tools: &mut [ToolDefinition]) {
     }
 }
 
+/// P1(轮次感知上下文编译器 · Task 3):按分诊档位裁剪主对话 tools。
+///
+/// Trivial 档(状态/问答短轮)只注入核心工具集 —— 复用渐进式工具加载的
+/// `tools::core_tool_names()` 清单(与 `GlobalToolRegistry` 渐进模式下
+/// 「核心工具无条件注入」口径一致),跳过能力层长尾工具;Standard 档与
+/// 子智能体请求(`triage_tier = None`)保持现状全量,与 P0 等价。
+fn tools_for_triage(
+    tool_registry: &GlobalToolRegistry,
+    allowed_tools: Option<&AllowedToolSet>,
+    triage_tier: Option<runtime::triage::TriageTier>,
+) -> Vec<ToolDefinition> {
+    if triage_tier == Some(runtime::triage::TriageTier::Trivial) {
+        let core: AllowedToolSet = tools::core_tool_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        filter_tool_specs(tool_registry, Some(&core))
+    } else {
+        filter_tool_specs(tool_registry, allowed_tools)
+    }
+}
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -431,6 +454,8 @@ impl ApiClient for AnthropicRuntimeClient {
         // (eligible for prompt caching) instead of being flattened into messages.
         let (system_text, filtered_messages) = extract_system_messages(&request.messages);
         let request_kind = request.request_kind;
+        // P1(Task 3):主对话分诊档位 —— Trivial 档 tools 裁剪为核心工具集。
+        let triage_tier = request.triage_tier;
         let mut split = request.system_prompt;
         if !system_text.is_empty() {
             split.dynamic_sections.push(system_text);
@@ -455,7 +480,11 @@ impl ApiClient for AnthropicRuntimeClient {
             messages: convert_messages(&filtered_messages, &self.model),
             system: build_system_blocks(&split),
             tools: self.enable_tools.then(|| {
-                let mut tools = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+                let mut tools = tools_for_triage(
+                    &self.tool_registry,
+                    self.allowed_tools.as_ref(),
+                    triage_tier,
+                );
                 mark_last_tool_with_cache_control(&mut tools);
                 tools
             }),
@@ -514,6 +543,8 @@ impl ApiClient for AnthropicRuntimeClient {
             // 与同步 `stream` 一致:抽离 system 角色消息走 system 字段(prompt cache)
             let (system_text, filtered_messages) = extract_system_messages(&request.messages);
             let request_kind = request.request_kind;
+            // P1(Task 3):主对话分诊档位 —— Trivial 档 tools 裁剪为核心工具集。
+            let triage_tier = request.triage_tier;
             let mut split = request.system_prompt;
             if !system_text.is_empty() {
                 split.dynamic_sections.push(system_text);
@@ -533,8 +564,11 @@ impl ApiClient for AnthropicRuntimeClient {
                 messages: convert_messages(&filtered_messages, &self.model),
                 system: build_system_blocks(&split),
                 tools: self.enable_tools.then(|| {
-                    let mut tools =
-                        filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+                    let mut tools = tools_for_triage(
+                        &self.tool_registry,
+                        self.allowed_tools.as_ref(),
+                        triage_tier,
+                    );
                     mark_last_tool_with_cache_control(&mut tools);
                     tools
                 }),
@@ -1586,7 +1620,7 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage], model: &str) ->
         // thinking 块,由 translate_message 作为 reasoning_content 发出;其余
         // 消息继续剥离以节省 context token。
         let thinking_mode_tool_call = message.blocks.iter().any(
-            |b| matches!(b, ContentBlock::ToolUse { id, .. } if has_thinking_mode_tool_call(&[id])),
+            |b| matches!(b, ContentBlock::ToolUse { id, .. } if has_thinking_mode_tool_call([id])),
         );
         let keep_msg_thinking = keep_thinking || thinking_mode_tool_call;
         let content = message

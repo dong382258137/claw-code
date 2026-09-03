@@ -1910,15 +1910,25 @@ mod tests {
             // 动态 Huffman 码表重排:memory 大量稀有符号,event 使其中一个变高频
             ("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()".into(), "a".repeat(1500)),
             // 可压缩前缀 + 不可压缩尾部
-            ("a".repeat(1900).into(), "b1c2d3e4f5g6h7i8j9k0".into()),
+            ("a".repeat(1900), "b1c2d3e4f5g6h7i8j9k0".into()),
             // 高重复 event
-            ("hello world\n".repeat(100).into(), "world".repeat(500)),
+            ("hello world\n".repeat(100), "world".repeat(500)),
             // 中文重复文本
-            ("分部分项节点汇总项目管理进度跟踪记录\n".repeat(60).into(), "分部分项节点汇总项目管理进度跟踪记录".repeat(40)),
+            (
+                "分部分项节点汇总项目管理进度跟踪记录\n".repeat(60),
+                "分部分项节点汇总项目管理进度跟踪记录".repeat(40),
+            ),
             // 中文 + 完全不同内容
-            ("分部分项节点汇总".repeat(50).into(), "这是完全不同的内容描述测试".repeat(30)),
+            (
+                "分部分项节点汇总".repeat(50),
+                "这是完全不同的内容描述测试".repeat(30),
+            ),
             // 生产形态:memory=相似历史消息拼接,event=当前消息
-            ("error: failed to run custom build command for package\nwarning: unused import\n".repeat(30).into(), "error: failed to run custom build command for package dependency".into()),
+            (
+                "error: failed to run custom build command for package\nwarning: unused import\n"
+                    .repeat(30),
+                "error: failed to run custom build command for package dependency".into(),
+            ),
             // 边界:空 event / 空 memory
             ("some memory text".into(), String::new()),
             (String::new(), "some event text".into()),
@@ -1975,7 +1985,7 @@ mod tests {
         let e = "rust toolchain configuration via rustup";
         let n = super::gzip_novelty(m, e);
         assert!(
-            n >= 0.0 && n < 0.8,
+            (0.0..0.8).contains(&n),
             "partial overlap should land in (0, 0.8): {n}"
         );
     }

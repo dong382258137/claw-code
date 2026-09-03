@@ -747,9 +747,9 @@ impl DecisionLog {
             |r| r.get(0),
         )
         .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => DecisionLogError::InvalidInput(format!(
-                "decision id={decision_id} not found"
-            )),
+            rusqlite::Error::QueryReturnedNoRows => {
+                DecisionLogError::InvalidInput(format!("decision id={decision_id} not found"))
+            }
             other => DecisionLogError::Sqlite(other),
         })
     }
@@ -771,7 +771,9 @@ impl DecisionLog {
                AND (tags IS NULL OR tags NOT LIKE '%auto_captured%')",
         )?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -788,6 +790,7 @@ impl DecisionLog {
     ///
     /// FTS5 BM25 命中中按上述条件过滤,返回格式化 top1(problem + solution
     /// + success_rate + verify_count),供失败后下一轮注入执行脑上下文。
+    ///
     /// 无高质量命中返回 `None`(宁缺毋滥,不注入未验证方案)。
     pub fn top_verified_solution(&self, query: &str) -> Result<Option<String>, DecisionLogError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -809,7 +812,12 @@ impl DecisionLog {
         if dedup.is_empty() {
             return Ok(None);
         }
-        let fts_query = dedup.iter().take(6).copied().collect::<Vec<_>>().join(" OR ");
+        let fts_query = dedup
+            .iter()
+            .take(6)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" OR ");
         let mut stmt = conn.prepare(
             "SELECT d.problem_signature, d.applied_solution, d.success_rate,
                     d.verify_count, d.affected_files
@@ -1758,7 +1766,11 @@ mod tests {
     fn extract_failure_signature_truncates_long_first_line() {
         let long = "x".repeat(500);
         let sig = DecisionLog::extract_failure_signature("bash", &long);
-        assert!(sig.len() < 150, "signature should be truncated, got len {}", sig.len());
+        assert!(
+            sig.len() < 150,
+            "signature should be truncated, got len {}",
+            sig.len()
+        );
         assert!(sig.starts_with("bash: "));
     }
 
@@ -1774,8 +1786,14 @@ mod tests {
 
         // 搜索验证可检索(举一反三的基础)
         let hits = log.search_decisions("old_string not found", 5).unwrap();
-        assert!(hits.contains("edit_file: old_string not found"), "got: {hits}");
-        assert!(hits.contains("Pending"), "auto-captured should be Pending, got: {hits}");
+        assert!(
+            hits.contains("edit_file: old_string not found"),
+            "got: {hits}"
+        );
+        assert!(
+            hits.contains("Pending"),
+            "auto-captured should be Pending, got: {hits}"
+        );
     }
 
     #[test]
@@ -1867,19 +1885,24 @@ mod tests {
     fn free_fn_auto_capture_failure_deduplicates_across_sessions() {
         let dir = tempfile::tempdir().unwrap();
 
-        let first = auto_capture_failure(dir.path(), "subagent", "edit_file", "old_string not found");
+        let first =
+            auto_capture_failure(dir.path(), "subagent", "edit_file", "old_string not found");
         assert!(first.unwrap().starts_with("auto_captured id="));
 
         // 相同失败(不同 session_id)再次出现 → simhash 去重跳过
-        let second =
-            auto_capture_failure(dir.path(), "subagent-2", "edit_file", "old_string not found");
+        let second = auto_capture_failure(
+            dir.path(),
+            "subagent-2",
+            "edit_file",
+            "old_string not found",
+        );
         assert!(
-            second.as_deref().is_some_and(|s| s.starts_with("auto_captured skipped")),
+            second
+                .as_deref()
+                .is_some_and(|s| s.starts_with("auto_captured skipped")),
             "got: {second:?}"
         );
     }
-
-
 
     #[test]
     fn decision_log_search_returns_results() {
@@ -3150,9 +3173,7 @@ mod tests {
             r#"{"session_id":"s1","problem_signature":"edit_file: old_string not found","root_cause_hypothesis":"stale","applied_solution":"re-read first","affected_files":["x.rs"],"verification_result":"Confirmed"}"#,
         )
         .unwrap();
-        let out = log
-            .top_verified_solution("old_string not found")
-            .unwrap();
+        let out = log.top_verified_solution("old_string not found").unwrap();
         assert!(out.is_none(), "verify_count=0 不应被注入: {out:?}");
     }
 

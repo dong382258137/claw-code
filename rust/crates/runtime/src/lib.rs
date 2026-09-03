@@ -17,8 +17,19 @@ pub mod config_validate;
 pub mod content_classifier;
 pub mod content_compression;
 mod conversation;
+// 轮次感知上下文编译器 P2:充分性契约(Sufficiency Contract)— 让模型
+// 在侦察链前显式声明停止判据(`[SUFFICIENCY: ...]`),框架机械校验"判据
+// 是否已满足",给"何时足够"装上可验证的价格。
 pub mod lessons;
+mod sufficiency;
+// 轮次感知上下文编译器 P2:成本反馈注记(Cost Feedback Notes)— 会话级
+// output token / 工具调用累计器,把"本 turn 燃烧率"作为 [runtime] 注记
+// 注入给模型,超阈值(20K)显式警示,闭合成本反馈环(零 LLM)。
+mod cost_meter;
 pub mod task_state;
+// 轮次感知上下文编译器 P1:分诊门(triage gate)— 纯确定性规则(零 LLM)
+// 把用户轮次分为 Trivial(状态/问答,裁剪注入)与 Standard(全量注入)两档。
+pub mod triage;
 // Multi-Agent Hardening §4.1:统一诊断基础设施(panic hook + DiagLog)。
 // 提取自 rusty-claude-cli/src/lib.rs main_entry 内联闭包,供 main/headless/测试入口复用。
 pub mod decision_log;
@@ -268,8 +279,8 @@ pub use policy_engine::{
 pub use prompt::{
     load_system_prompt, load_system_prompt_with_extras, prepend_bullets,
     render_mcp_catalog_section, ContextFile, ModelFamilyIdentity, ProjectContext, PromptBuildError,
-    SystemPromptBuilder, SystemPromptExtras, SystemPromptSplit, FRONTIER_MODEL_NAME,
-    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    PromptLayers, SectionTier, SystemPromptBuilder, SystemPromptExtras, SystemPromptSplit,
+    FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_orchestrator::{RecoveryOrchestrator, RecoveryOutcome};
 pub use recovery_recipes::{

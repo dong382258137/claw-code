@@ -5130,16 +5130,12 @@ fn no_thinking_flag_disables_thinking_mode() {
 
 #[test]
 fn thinking_equals_flag_accepts_on_and_off() {
-    for (flag, expected) in [("--thinking=off", Some(false)), ("--thinking=on", Some(true))] {
-        let result = parse_args(&[
-            flag.to_string(),
-            "prompt".to_string(),
-            "hello".to_string(),
-        ]);
-        assert!(
-            result.is_ok(),
-            "{flag} should be accepted, got: {result:?}"
-        );
+    for (flag, expected) in [
+        ("--thinking=off", Some(false)),
+        ("--thinking=on", Some(true)),
+    ] {
+        let result = parse_args(&[flag.to_string(), "prompt".to_string(), "hello".to_string()]);
+        assert!(result.is_ok(), "{flag} should be accepted, got: {result:?}");
         if let Ok(CliAction::Prompt { thinking_mode, .. }) = result {
             assert_eq!(thinking_mode, expected, "{flag} maps to {expected:?}");
         }

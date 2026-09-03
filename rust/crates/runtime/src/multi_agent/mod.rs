@@ -94,6 +94,11 @@ impl SubagentCapability {
     /// guard / API 工具暴露 / 执行 / `## Available Tools` 层全链路一致,
     /// 子 agent 不再"短名通过 guard 却无法执行 / API 只见 bash"。
     ///
+    /// `WebSearch` / `WebFetch` 自 2026-09-03 起纳入 ReadOnly 白名单(网络调研
+    /// 类任务修复,见 session-1788367889972 子代理派发失败复盘):两者在
+    /// `mvp_tool_specs` 均为 `PermissionMode::ReadOnly`(只读,无副作用),
+    /// 执行层 `execute_tool` 已支持 — 之前缺失导致"网络调研"子代理无网可用。
+    ///
     /// 注:`dispatch_subagent` / `spawn_parallel_subagents` 不放入白名单,
     /// 递归派发禁止由 §3.3.1 guard 在 tool_use 提取阶段显式检查实现
     /// (见 execute_subagent_llm 内 `if tu.name == "dispatch_subagent" ...` 分支)。
@@ -107,6 +112,8 @@ impl SubagentCapability {
                 "glob_search",
                 "repomap",
                 "lsp_diagnostics",
+                "WebSearch",
+                "WebFetch",
             ],
             Self::Execute => &[
                 "read_file",
@@ -114,6 +121,8 @@ impl SubagentCapability {
                 "glob_search",
                 "repomap",
                 "lsp_diagnostics",
+                "WebSearch",
+                "WebFetch",
                 "edit_file",
                 "write_file",
                 "bash",
@@ -294,6 +303,10 @@ pub struct SpawnRequest {
     /// 绑定的子工作区目录(Epic 2 A2.3a:None = 主会话 cwd)。
     /// 默认 `None`(`new()` 不接收此参数,调用方通过 `with_workspace()` 设置)。
     pub workspace: Option<PathBuf>,
+    /// 多轮 tool call 循环上限覆盖(2026-09-03,网络调研任务修复)。
+    /// `Some(n)` 覆盖 `capability.max_iterations()`(如调研类任务放宽到 15+);
+    /// `None` 保持能力默认上限,向后兼容。经 DagNode 透传到执行循环。
+    pub max_iterations: Option<usize>,
 }
 
 impl SpawnRequest {
@@ -317,6 +330,7 @@ impl SpawnRequest {
             complexity,
             capability: SubagentCapability::Analyze,
             workspace: None,
+            max_iterations: None,
         }
     }
 
@@ -331,6 +345,16 @@ impl SpawnRequest {
     #[must_use]
     pub fn with_workspace(mut self, workspace: Option<PathBuf>) -> Self {
         self.workspace = workspace;
+        self
+    }
+
+    /// Builder:设置多轮 tool call 循环上限覆盖(2026-09-03,链式调用)。
+    ///
+    /// `Some(n)` 覆盖 `capability.max_iterations()`(如网络调研类任务放宽到 15+);
+    /// `None` 保持能力默认上限,向后兼容。经 DagNode 透传到执行循环。
+    #[must_use]
+    pub fn with_max_iterations(mut self, max_iterations: Option<usize>) -> Self {
+        self.max_iterations = max_iterations;
         self
     }
 }
@@ -1834,7 +1858,9 @@ mod tests {
                 "grep_search",
                 "glob_search",
                 "repomap",
-                "lsp_diagnostics"
+                "lsp_diagnostics",
+                "WebSearch",
+                "WebFetch"
             ]
         );
         let ex = SubagentCapability::Execute.allowed_tools();

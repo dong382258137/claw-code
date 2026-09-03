@@ -919,9 +919,7 @@ pub fn is_reasoning_model(_model: &str) -> bool {
 /// DeepSeek-specific `thinking` toggle is only injected for DeepSeek endpoints.
 fn model_is_deepseek(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    lower.contains("deepseek")
-        || lower.starts_with("ds/")
-        || lower.starts_with("deepseek/")
+    lower.contains("deepseek") || lower.starts_with("ds/") || lower.starts_with("deepseek/")
 }
 
 /// Returns whether an OpenAI-compatible model requires prior assistant
@@ -2033,19 +2031,19 @@ mod tests {
 
     #[test]
     fn has_thinking_mode_tool_call_detects_call_0n_prefix() {
-        assert!(has_thinking_mode_tool_call(&[
+        assert!(has_thinking_mode_tool_call([
             "call_01_SeY7wrVwpFOzzZR2vM2c9683"
         ]));
-        assert!(has_thinking_mode_tool_call(&[
+        assert!(has_thinking_mode_tool_call([
             "call_02_vFVFAg79gxanJZdXeWHb5001"
         ]));
-        assert!(has_thinking_mode_tool_call(&["call_09_future"]));
-        assert!(!has_thinking_mode_tool_call(&[
+        assert!(has_thinking_mode_tool_call(["call_09_future"]));
+        assert!(!has_thinking_mode_tool_call([
             "call_00_JvIHk6LO4kk0M9XZHAYR0592"
         ]));
-        assert!(!has_thinking_mode_tool_call(&["call_0_short"]));
+        assert!(!has_thinking_mode_tool_call(["call_0_short"]));
         assert!(!has_thinking_mode_tool_call(std::iter::empty::<&str>()));
-        assert!(!has_thinking_mode_tool_call(&["toolu_01_abc"]));
+        assert!(!has_thinking_mode_tool_call(["toolu_01_abc"]));
     }
 
     #[test]

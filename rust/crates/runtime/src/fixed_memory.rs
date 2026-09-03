@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn build_llm_summary_prompt_includes_transcript_and_instructions() {
-        use crate::session::{ContentBlock, ConversationMessage, MessageRole};
+        use crate::session::{ContentBlock, ConversationMessage};
         let messages = vec![
             ConversationMessage::user_text("修复登录 401"),
             ConversationMessage::assistant(vec![ContentBlock::Text {
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn maybe_llm_summary_empty_or_blank_incremental_returns_none() {
-        use crate::session::{ContentBlock, ConversationMessage};
+        use crate::session::ConversationMessage;
         let (tmp, root) = temp_root("gate");
         // 空增量 → None(不调用 LLM)
         assert!(maybe_llm_summary(&root, &[]).is_none());

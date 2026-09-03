@@ -272,10 +272,7 @@ fn capture_output_files() -> io::Result<(PathBuf, PathBuf, std::fs::File, std::f
 }
 
 /// 读取并清理捕获文件（best-effort：后台服务可能仍持有句柄，删除失败忽略）。
-fn read_and_cleanup_capture(
-    out_path: &Path,
-    err_path: &Path,
-) -> (Vec<u8>, Vec<u8>) {
+fn read_and_cleanup_capture(out_path: &Path, err_path: &Path) -> (Vec<u8>, Vec<u8>) {
     let stdout = std::fs::read(out_path).unwrap_or_default();
     let stderr = std::fs::read(err_path).unwrap_or_default();
     let _ = std::fs::remove_file(out_path);
@@ -1233,8 +1230,8 @@ mod tests {
 
         let start = Instant::now();
         let output = execute_bash(BashCommandInput {
-            command:
-                "cd /tmp && nohup sleep 8 > /tmp/svc.log 2>&1 &\necho \"启动中\"; true".to_string(),
+            command: "cd /tmp && nohup sleep 8 > /tmp/svc.log 2>&1 &\necho \"启动中\"; true"
+                .to_string(),
             timeout: None,
             description: None,
             run_in_background: Some(false),

@@ -55,12 +55,44 @@ const MIN_GOAL_INPUT_CHARS: usize = 8;
 /// 同时宽松化后 '好滴'/'没问题'/'abc'/'abcde' 等又会误判为新任务。
 /// 这里显式枚举承接词,命中即不更新 goal(大小写不敏感)。
 const ACK_WORDS: &[&str] = &[
-    "继续", "好", "好的", "ok", "嗯", "收到", "知道了", "明白",
-    "可以", "行", "好的好的", "好滴", "没问题", "嗯嗯", "很好",
-    "了解了", "好的吧", "okay", "okey", "了解", "晓得了",
-    "是", "对", "不错", "继续吧", "继续做", "继续干",
-    "随便", "随便吧", "无所谓", "都行", "都行吧", "随意",
-    "好嘞", "好勒", "好呀", "行吧", "好吧",
+    "继续",
+    "好",
+    "好的",
+    "ok",
+    "嗯",
+    "收到",
+    "知道了",
+    "明白",
+    "可以",
+    "行",
+    "好的好的",
+    "好滴",
+    "没问题",
+    "嗯嗯",
+    "很好",
+    "了解了",
+    "好的吧",
+    "okay",
+    "okey",
+    "了解",
+    "晓得了",
+    "是",
+    "对",
+    "不错",
+    "继续吧",
+    "继续做",
+    "继续干",
+    "随便",
+    "随便吧",
+    "无所谓",
+    "都行",
+    "都行吧",
+    "随意",
+    "好嘞",
+    "好勒",
+    "好呀",
+    "行吧",
+    "好吧",
 ];
 
 /// 判定用户输入是否应更新任务目标(v5 语义判定,替代原长度一刀切)。
@@ -87,7 +119,10 @@ fn should_update_goal(new_goal: &str) -> bool {
         return true;
     }
     // 3. 短输入纯 ASCII 小写字母+数字 → 噪声,不更新。
-    if trimmed.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
         return false;
     }
     // 4. 其余短输入(任务名信号:大写/连字符/中文)→ 更新。
@@ -450,7 +485,7 @@ fn extract_section<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> O
 /// `- {line}` bullet,因此真实入参形如 `- goal: X` / `- next_action: Y`。
 /// 之前只匹配行首 `goal:`,导致 LLM 路径的 goal/next_action 永远解析失败
 /// (2026-08-14 实证:会话摘要含 [active_task] 段但字段始终为空)。
-fn strip_field_prefix<'a>(line: &'a str, field: &str) -> Option<String> {
+fn strip_field_prefix(line: &str, field: &str) -> Option<String> {
     let trimmed = line.trim();
     let bare = trimmed
         .strip_prefix("- ")
@@ -542,7 +577,13 @@ mod tests {
     fn should_update_goal_covers_all_v5_cases() {
         // 直接验证 should_update_goal 的完整判定面。
         // 更新:
-        for input in ["MVP-C1", "方案C", "任务3", "先把 MVP-C2 落地", "修复 task_state 缺陷"] {
+        for input in [
+            "MVP-C1",
+            "方案C",
+            "任务3",
+            "先把 MVP-C2 落地",
+            "修复 task_state 缺陷",
+        ] {
             assert!(should_update_goal(input), "'{input}' 应更新 goal");
         }
         // 不更新(承接词):

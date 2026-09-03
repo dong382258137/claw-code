@@ -129,6 +129,7 @@ mod tests {
             mode: CoordinationMode::Fork,
             retry_policy: RetryPolicy::default(),
             capability: crate::multi_agent::SubagentCapability::Analyze,
+            max_iterations: None,
         }
     }
 

@@ -2193,11 +2193,11 @@ pub(crate) fn handle_bus_command(args: Option<&str>, session_id: &str) -> String
     }
 
     match subcommand.as_str() {
-        "" | "list" => render_bus_list(&bus, session_id),
+        "" | "list" => render_bus_list(bus, session_id),
         "help" => render_bus_help(),
-        "send" => run_bus_send(&bus, session_id, &rest),
-        "watch" => run_bus_watch(&bus, session_id, &rest),
-        "unwatch" => run_bus_unwatch(&bus, session_id, &rest),
+        "send" => run_bus_send(bus, session_id, &rest),
+        "watch" => run_bus_watch(bus, session_id, &rest),
+        "unwatch" => run_bus_unwatch(bus, session_id, &rest),
         other => format!(
             "Unknown bus subcommand: '{other}'.\n\x1b[2m用法: /bus [list|send|watch|unwatch|help]\x1b[0m"
         ),

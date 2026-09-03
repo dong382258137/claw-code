@@ -1522,13 +1522,13 @@ mod tests {
         while pos < chars.len() {
             let end = (pos + 80).min(chars.len());
             let delta: String = chars[pos..end].iter().collect();
-            if let Some(rendered) = ms.push(&renderer, &delta) {
+            if let Some(rendered) = ms.push(renderer, &delta) {
                 buf.append(&rendered);
                 appended += rendered.len();
             }
             pos = end;
         }
-        if let Some(rendered) = ms.flush(&renderer) {
+        if let Some(rendered) = ms.flush(renderer) {
             buf.append(&rendered);
             appended += rendered.len();
         }
@@ -1669,7 +1669,7 @@ mod tests {
         let input = r#"{"command":"cargo test"}"#;
         let result = format!(
             "{{\"returnCodeInterpretation\":\"exit_code:0\",\"stdout\":\"{}\"}}",
-            "running 41 tests\ntest result: ok. 41 passed; 0 failed".to_string()
+            "running 41 tests\ntest result: ok. 41 passed; 0 failed"
         );
         assert_eq!(
             compute_priority("bash", input, &result, false),

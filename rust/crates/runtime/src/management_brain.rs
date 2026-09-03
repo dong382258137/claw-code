@@ -118,7 +118,10 @@ mod tests {
             "sess-1",
             &[
                 ("edit_file".to_string(), "old_string not found".to_string()),
-                ("edit_file".to_string(), "old_string not found again".to_string()),
+                (
+                    "edit_file".to_string(),
+                    "old_string not found again".to_string(),
+                ),
                 ("bash".to_string(), "command not found".to_string()),
             ],
             &[],

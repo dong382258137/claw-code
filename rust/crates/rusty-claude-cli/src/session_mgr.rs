@@ -1154,9 +1154,7 @@ pub(crate) fn write_upgrade_request(
 }
 
 /// 读取升级请求(新进程启动检测)。不存在/解析失败返回 None(降级为普通启动)。
-pub(crate) fn read_upgrade_request(
-    workspace_root: &Path,
-) -> Option<UpgradeRequest> {
+pub(crate) fn read_upgrade_request(workspace_root: &Path) -> Option<UpgradeRequest> {
     let path = workspace_root.join(UPGRADE_REQUEST_REL);
     let content = fs::read_to_string(path).ok()?;
     let req: UpgradeRequest = serde_json::from_str(&content).ok()?;
@@ -1195,9 +1193,7 @@ pub(crate) fn write_upgrade_exited(
 }
 
 /// 读取"已退出"标记(升级助手轮询)。不存在/解析失败返回 None。
-pub(crate) fn read_upgrade_exited(
-    workspace_root: &Path,
-) -> Option<serde_json::Value> {
+pub(crate) fn read_upgrade_exited(workspace_root: &Path) -> Option<serde_json::Value> {
     let path = workspace_root.join(UPGRADE_EXITED_REL);
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
@@ -1208,7 +1204,6 @@ pub(crate) fn clear_upgrade_exited(workspace_root: &Path) {
     let path = workspace_root.join(UPGRADE_EXITED_REL);
     let _ = fs::remove_file(path);
 }
-
 
 pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;

@@ -582,7 +582,7 @@ pub fn format_workspace_suggestions(g: &ModuleGraph, query: Option<&str>) -> Str
         .filter(|c| {
             query_lower
                 .as_ref()
-                .map_or(true, |q| c.name.to_lowercase().contains(q))
+                .is_none_or(|q| c.name.to_lowercase().contains(q))
         })
         .collect();
     crates.sort_by(|a, b| a.name.cmp(&b.name));

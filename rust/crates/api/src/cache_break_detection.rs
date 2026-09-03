@@ -1059,6 +1059,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn throughput_request(state: &TrackedPromptState) -> TrackedPromptState {
         // 由已构造的 state 派生同构 state:cpu 换 usage 无需重算,直接建同 shape。
         state.clone()
@@ -1223,7 +1224,9 @@ mod tests {
     }
 
     /// 为 P0-1 测试隔离磁盘状态:临时 CLAUDE_CONFIG_HOME 根,测试后清理。
-    fn prefix_test_env(guard_tag: &str) -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
+    fn prefix_test_env(
+        guard_tag: &str,
+    ) -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
         let guard = test_env_lock();
         let temp_root = std::env::temp_dir().join(format!(
             "cache-break-prefix-{guard_tag}-{}-{}",
@@ -1278,10 +1281,7 @@ mod tests {
         let reason = detector
             .note_request(&polluted)
             .expect("static prefix drift must be flagged");
-        assert!(
-            reason.contains("system prompt changed"),
-            "reason: {reason}"
-        );
+        assert!(reason.contains("system prompt changed"), "reason: {reason}");
         assert_eq!(detector.stats().break_reasons.prefix_drifted, 1);
         assert_eq!(detector.stats().break_reasons.system_prompt_changed, 0);
         prefix_test_cleanup(temp_root);
@@ -1300,12 +1300,16 @@ mod tests {
             cache_control: None,
         }]);
         let mut request2 = request1.clone();
-        request2.tools.as_mut().expect("tools").push(crate::types::ToolDefinition {
-            name: "write_file".to_string(),
-            description: Some("v2".to_string()),
-            input_schema: serde_json::json!({"type": "object"}),
-            cache_control: None,
-        });
+        request2
+            .tools
+            .as_mut()
+            .expect("tools")
+            .push(crate::types::ToolDefinition {
+                name: "write_file".to_string(),
+                description: Some("v2".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            });
         assert!(detector.note_request(&request1).is_none());
         let reason = detector
             .note_request(&request2)

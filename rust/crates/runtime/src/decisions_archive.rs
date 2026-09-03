@@ -178,7 +178,6 @@ fn current_time_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn temp_workspace(tag: &str) -> tempfile::TempDir {
         let tmp = std::env::temp_dir().join(format!(

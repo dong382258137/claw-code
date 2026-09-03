@@ -466,6 +466,7 @@ pub fn validate_candidate(
 /// pathology 出现检查同时覆盖两个来源：
 /// - turn 级 trace 的 `failure_kind`（turn 级 weakness）
 /// - failure_traces 的工具级签名（tool 级 weakness）
+///
 /// 任一来源出现即视为可归因。
 fn validity_gate(
     candidate: &HarnessEdit,
@@ -669,7 +670,7 @@ fn compute_baseline_rate(trace: &TraceAnalyzer) -> f64 {
 ///
 /// 在 conversation.rs 每 `evolution_interval` turn 调用一次:
 /// 1. Weakness Mining(工具级 `failure_traces` + turn 级 `trace` 合并)
-/// → 2. 规则 Proposer → 3. 新增 Candidate → 4. 验证所有 Candidate(两重门控)。
+///    → 2. 规则 Proposer → 3. 新增 Candidate → 4. 验证所有 Candidate(两重门控)。
 pub fn evolve(
     trace: &TraceAnalyzer,
     failure_traces: &[FailureTrace],
@@ -1103,15 +1104,13 @@ mod tests {
         .expect("log_decision");
 
         let archive = HarnessArchive::open(dir.path()).unwrap();
-        let first =
-            propose_from_confirmed_solutions(&log, &archive, &EvolutionConfig::default())
-                .expect("first");
+        let first = propose_from_confirmed_solutions(&log, &archive, &EvolutionConfig::default())
+            .expect("first");
         assert_eq!(first, 1);
 
         // 第二次提炼:与已有 edit simhash 重复 → 0。
-        let second =
-            propose_from_confirmed_solutions(&log, &archive, &EvolutionConfig::default())
-                .expect("second");
+        let second = propose_from_confirmed_solutions(&log, &archive, &EvolutionConfig::default())
+            .expect("second");
         assert_eq!(second, 0, "already-proposed solution must be deduplicated");
     }
 

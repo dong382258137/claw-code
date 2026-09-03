@@ -57,6 +57,10 @@ pub struct DagNode {
     /// pre-capability DAG definitions.
     #[serde(default)]
     pub capability: SubagentCapability,
+    /// 多轮 tool call 循环上限覆盖(2026-09-03)。`Some(n)` 覆盖能力默认上限
+    /// (如网络调研类任务放宽),`None` 用 `capability.max_iterations()`,向后兼容。
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
 }
 
 const fn default_max_retries() -> u32 {
@@ -728,6 +732,7 @@ mod graph_tests {
             mode: CoordinationMode::Fork,
             retry_policy: RetryPolicy::default(),
             capability: SubagentCapability::Analyze,
+            max_iterations: None,
         }
     }
 

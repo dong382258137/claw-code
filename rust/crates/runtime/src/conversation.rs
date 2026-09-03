@@ -19,6 +19,10 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::prompt::SystemPromptSplit;
+// P1(轮次感知上下文编译器 · Task 3):分诊门接入请求构造 ——
+// Trivial 档(状态/问答短轮)只注入不变核+状态层+核心工具集,
+// 豁免工程类强制提醒;Standard 档保持现状全量注入。
+use crate::triage::{detect_upgrade_request, triage_turn, TriageContext, TriageTier};
 // Harness L(生命周期)层接入:run_turn 失败分支调用 RecoveryOrchestrator 尝试一次自动恢复。
 // 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
 use crate::recovery_orchestrator::RecoveryOrchestrator;
@@ -438,6 +442,11 @@ pub const SPAWN_PARALLEL_SUBAGENTS_TOOL_SPEC: &str = r#"{
                             "enum": ["analyze", "read-only", "execute"],
                             "description": "Subagent capability tier: 'analyze' (L0, read-only reasoning, no tools), 'read-only' (L1, read/grep/glob/repomap tools), 'execute' (L2, edit/write/bash tools). Determines tool whitelist and max tool-call iterations.",
                             "default": "read-only"
+                        },
+                        "max_iterations": {
+                            "type": "integer",
+                            "description": "Optional override for the multi-round tool-call loop cap. Defaults to the capability tier limit (read-only=5, execute=10, analyze=1). Set higher (e.g. 15-20) for research-heavy tasks that need many WebSearch/WebFetch rounds.",
+                            "default": null
                         }
                     },
                     "required": ["name", "task", "model"]
@@ -539,6 +548,10 @@ pub struct SubagentContext {
     /// L2 静态工具:capability 白名单对应的工具签名摘要(name+description)。
     /// 空时不注入工具签名层(Analyze capability 无工具,自然为空)。
     pub tool_summaries: Vec<ToolSummary>,
+    /// 多轮 tool call 循环上限覆盖(2026-09-03,网络调研任务修复)。
+    /// `Some(n)` 时覆盖 `capability.max_iterations()`(如调研类任务放宽到 15+);
+    /// `None` 保持能力默认上限,向后兼容。
+    pub max_iterations: Option<usize>,
 }
 
 /// Epic 1(§3.2):工具签名摘要(不含完整 schema,减少 token 占用)。
@@ -563,8 +576,8 @@ pub struct ToolSummary {
 /// edit_file/write_file 结果的附加诊断),广告它们只会诱导子 agent 试错被拒。
 ///
 /// `build_subagent_context` 按 capability 白名单过滤后再注入
-/// `## Available Tools` 层(ReadOnly=read_file/grep_search/glob_search,
-/// Execute 加 edit_file/write_file/bash)。
+/// `## Available Tools` 层(ReadOnly=read_file/grep_search/glob_search/
+/// WebSearch/WebFetch,Execute 再加 edit_file/write_file/bash)。
 #[must_use]
 pub fn default_subagent_tool_catalog() -> Vec<ToolSummary> {
     vec![
@@ -579,6 +592,14 @@ pub fn default_subagent_tool_catalog() -> Vec<ToolSummary> {
         ToolSummary {
             name: "glob_search".into(),
             description: "按 glob 模式查找文件。".into(),
+        },
+        ToolSummary {
+            name: "WebSearch".into(),
+            description: "搜索网络获取当前信息,返回带引用的结果。用于调研业界实践/论文/最新资料。".into(),
+        },
+        ToolSummary {
+            name: "WebFetch".into(),
+            description: "抓取一个 URL 并转成可读文本,针对给定 prompt 回答内容。".into(),
         },
         ToolSummary {
             name: "edit_file".into(),
@@ -601,6 +622,14 @@ pub struct ApiRequest {
     pub system_prompt: SystemPromptSplit,
     pub messages: Vec<ConversationMessage>,
     pub request_kind: RequestKind,
+    /// P1(轮次感知上下文编译器 · Task 3):主对话请求的分诊档位。
+    ///
+    /// - `Some(TriageTier::Trivial)`:下游(CLI api client)把 tools 裁剪为
+    ///   核心工具集(`tools::core_tool_names()`);
+    /// - `Some(TriageTier::Standard)`:全量注入,与现状等价;
+    /// - `None`:非分诊路径(子智能体请求,工具白名单已按 capability
+    ///   限定,不参与主对话分诊)。
+    pub triage_tier: Option<TriageTier>,
 }
 /// 构造子智能体 system_prompt — §4.6 诊断 SOP 注入 + Epic 1(§3.2)上下文注入。
 ///
@@ -749,6 +778,9 @@ pub(crate) fn build_subagent_request(
         system_prompt,
         messages: vec![user_message],
         request_kind: RequestKind::Subagent,
+        // 子智能体不参与主对话分诊:能力白名单已限定工具,系统提示词
+        // 按 capability 定制,无需 Triage tier 标记。
+        triage_tier: None,
     }
 }
 
@@ -770,14 +802,14 @@ fn rewrite_path_to_workspace_relative(
     let obj = value.as_object_mut()?;
     let replaced = if obj
         .get("file_path")
-        .map_or(false, serde_json::Value::is_string)
+        .is_some_and(serde_json::Value::is_string)
     {
         obj.insert(
             "file_path".to_string(),
             serde_json::Value::String(rel_str.clone()),
         );
         true
-    } else if obj.get("path").map_or(false, serde_json::Value::is_string) {
+    } else if obj.get("path").is_some_and(serde_json::Value::is_string) {
         obj.insert(
             "path".to_string(),
             serde_json::Value::String(rel_str.clone()),
@@ -847,6 +879,7 @@ fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
 /// # 返回
 /// - `Ok(())`:所有工具调用已执行并回填
 /// - `Err(ToolError)`:guard 违规(递归/白名单),调用方应中止子智能体
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_tool_uses(
     capability: crate::multi_agent::SubagentCapability,
     tool_uses: &[ContentBlock],
@@ -1060,7 +1093,7 @@ pub(crate) fn process_tool_uses(
             let _ = crate::decision_log::auto_capture_failure(
                 workspace_root,
                 "subagent",
-                &name,
+                name,
                 &output,
             );
         }
@@ -1474,6 +1507,30 @@ pub struct ConversationRuntime<C, T> {
     /// (距上次请求 > FIXED_MEMORY_PRECEDING_WINDOW_MS 时下一请求大概率冷启)。
     /// None = 本会话尚未发出过请求(不触发前瞻)。
     last_request_at_ms: Option<i64>,
+    /// P1(轮次感知上下文编译器 · Task 3):会话级单向升级锁存。
+    ///
+    /// 模型在 assistant 文本中显式请求加载完整上下文(协议标记
+    /// `[LOAD_FULL_CONTEXT]` 或自然语言兜底,见 [`detect_upgrade_request`])
+    /// 后置 true,本会话内恒返回 `Standard` 档(不自动降级)。
+    triage_upgrade_requested: bool,
+    /// P2(充分性契约 · Task 4):会话级判据契约(见 [`crate::sufficiency`])。
+    ///
+    /// turn 开头 [`reset`](crate::sufficiency::SufficiencyContract::reset);
+    /// assistant 文本出现 `[SUFFICIENCY: ...]` 声明时
+    /// [`declare`](crate::sufficiency::SufficiencyContract::declare);
+    /// 侦察类工具执行中登记已读源;判据满足后注入「充分即停」提醒(每 turn
+    /// 一次),并把判据满足后仍发起的只读侦察在 tool_result 末尾追加冗余
+    /// 注记。未声明判据(declared_sources 空)时全程零干扰。
+    sufficiency_contract: crate::sufficiency::SufficiencyContract,
+    /// P2(成本反馈注记 · Task 5):会话级成本累计器(见 [`crate::cost_meter`])。
+    ///
+    /// turn 开头 [`reset_turn`](crate::cost_meter::CostMeter::reset_turn);
+    /// 每条 API 响应 usage 到达时 [`record_output`](crate::cost_meter::CostMeter::record_output);
+    /// 每个工具批处理开始时 [`add_tool_calls`](crate::cost_meter::CostMeter::add_tool_calls);
+    /// 每个工具批处理迭代末尾 [`poll_note`](crate::cost_meter::CostMeter::poll_note)
+    /// 决策是否注入「成本提示/警示」`[runtime]` 注记(频率上限在 meter 内部,
+    /// 普通提示每 ~5 次工具调用一条、警示每 ~10K output 一条)。
+    cost_meter: crate::cost_meter::CostMeter,
     /// Turns elapsed since the last nudge fired. Reset to 0 whenever a nudge
     /// runs.
     turns_since_last_nudge: usize,
@@ -1705,7 +1762,11 @@ pub(crate) async fn execute_subagent_llm(
 
     // system_prompt 构建一次,多轮循环中不变(保 prefix cache 命中)
     let system_prompt = build_subagent_system_prompt(complexity, capability, ctx);
-    let max_iter = capability.max_iterations();
+    // 2026-09-03:max_iterations 支持按任务覆盖(ctx.max_iterations),
+    // 默认回退到能力上限(ReadOnly=5 / Execute=10 / Analyze=1)。
+    let max_iter = ctx
+        .max_iterations
+        .unwrap_or_else(|| capability.max_iterations());
     let mut messages = vec![ConversationMessage::user_text(format!(
         "# Subagent: {name} ({subagent_id})\n\n请执行以下任务:\n\n{enhanced_task}"
     ))];
@@ -1718,12 +1779,15 @@ pub(crate) async fn execute_subagent_llm(
         iterations += 1;
         if iterations > max_iter {
             // §8.1:截断 → 落盘 Truncated handoff + Err
+            // 2026-09-03:handoff 记录实际执行的 LLM 轮数(iterations-1)。
+            // 此前直接写 iterations(在未发出 LLM 请求的检测轮自增后)导致多报 1
+            // (实测 ReadOnly=5 时 handoff 显示 iterations: 6,误导诊断)。
             let handoff = SubagentHandoff::new(
                 subagent_id,
                 name,
                 capability,
                 complexity,
-                iterations,
+                iterations.saturating_sub(1),
                 tools_used.clone(),
                 changed_files.clone(),
                 &final_text,
@@ -1733,7 +1797,8 @@ pub(crate) async fn execute_subagent_llm(
             .with_task(task);
             let _ = write_handoff(handoff_root, &handoff);
             return Err(format!(
-                "subagent exceeded max_iterations ({max_iter}); partial result at .claw/subagents/{subagent_id}.md"
+                "subagent exceeded max_iterations ({max_iter}); tools_used: [{}]; partial result at .claw/subagents/{subagent_id}.md",
+                tools_used.join(", ")
             ));
         }
 
@@ -1758,7 +1823,8 @@ pub(crate) async fn execute_subagent_llm(
                             name,
                             capability,
                             complexity,
-                            iterations,
+                            // 与实际执行轮数一致(同截断修复,2026-09-03)
+                            iterations.saturating_sub(1),
                             tools_used.clone(),
                             changed_files.clone(),
                             &final_text,
@@ -1786,6 +1852,7 @@ pub(crate) async fn execute_subagent_llm(
             system_prompt: system_prompt.clone(),
             messages: messages.clone(),
             request_kind: RequestKind::Subagent,
+            triage_tier: None,
         };
 
         // v3:async 调用 LLM — stream_async 避免 nested block_on panic
@@ -2006,6 +2073,9 @@ where
             task_state: None,
             fixed_memory: None,
             last_request_at_ms: None,
+            triage_upgrade_requested: false,
+            sufficiency_contract: crate::sufficiency::SufficiencyContract::default(),
+            cost_meter: crate::cost_meter::CostMeter::default(),
             turns_since_last_nudge: 0,
             turns_since_last_evolution: 0,
             harness_archive: None,
@@ -2415,8 +2485,13 @@ where
         if let Some(te) = tool_executor {
             dispatcher = dispatcher.with_tool_executor(Arc::new(Mutex::new(te)));
         }
-        let runner: SubagentRunner = Arc::new(move |id, task, capability| {
-            let d = dispatcher.clone().with_capability(capability);
+        let runner: SubagentRunner = Arc::new(move |id, task, capability, max_iterations| {
+            // 2026-09-03:max_iterations(来自 DagNode)经 dispatcher 覆盖能力默认
+            // 上限(如网络调研类任务放宽到 15+);None 保持 capability 默认,向后兼容。
+            let d = dispatcher
+                .clone()
+                .with_capability(capability)
+                .with_max_iterations(max_iterations);
             Box::pin(async move { d.dispatch(id, task).await })
         });
         self.coordinator_executor = Some(Arc::new(
@@ -2675,6 +2750,7 @@ where
                 mode: task.mode,
                 retry_policy: RetryPolicy::default(),
                 capability: task.capability,
+                max_iterations: task.max_iterations,
             };
             nodes.push((idx, node));
             results.push(Ok(String::new())); // 占位,后续填充
@@ -3130,8 +3206,7 @@ where
         // 同会话后续 turn(首 turn 已消费)不重复读取。零 LLM;失败静默。
         if self.pending_session_digest.is_none() {
             if let Some(root) = &self.workspace_root {
-                self.pending_session_digest =
-                    crate::management_brain::latest_digest_text(root);
+                self.pending_session_digest = crate::management_brain::latest_digest_text(root);
             }
         }
 
@@ -3202,6 +3277,20 @@ where
         // 锚点,模型不再依赖 NOTEBOOK(旧任务)推断而反复自我定位"新任务"。
         self.maybe_extract_goal_at_turn_start(&user_input);
 
+        // P1(轮次感知上下文编译器 · Task 3):分诊接入请求构造 —— 本 turn 档位。
+        // 规则(见 triage.rs):单向升级锁存 > 超长 > 工程动词 > 状态特征,
+        // 纯确定性零 LLM。Trivial 档(状态/问答短轮)在请求构造时只注入
+        // 不变核 + 状态层 + 核心工具集,并豁免工程类强制提醒;Standard 档
+        // 保持现状全量(与 P0 快照等价)。档位在 turn 开头判定一次,
+        // 本 turn 所有迭代共用(turn 是分诊的最小单位)。
+        let turn_tier = {
+            let ctx = TriageContext {
+                upgrade_requested: self.triage_upgrade_requested,
+            };
+            triage_turn(&user_input, &ctx)
+        };
+        self.emit_diag(format!("[diag] triage_tier={turn_tier:?}"));
+
         // Harness O(编排)层接入:Plan/Execute/Review 三段循环入口。
         // 详见 docs/harness-engineering-optimization-plan.md Step 2.1。
         //
@@ -3238,6 +3327,19 @@ where
         let mut survey_stall_rounds: usize = 0;
         let mut safety_net_notice_injected = false;
         let mut upgrade_notice_injected = false;
+        // P2(充分性契约 · Task 4):turn 开头复位 —— 契约按"声明所在任务轮"
+        // 生效,上一 turn 的已满足判据不跨 turn 延续(避免陈旧判据干扰新问题
+        // 的正常侦察)。`sufficiency_notice_injected` 是本 turn 的"判据已满足"
+        // 提醒注入标志(每 turn 只注入一次)。
+        self.sufficiency_contract.reset();
+        let mut sufficiency_notice_injected = false;
+        // P2(成本反馈注记 · Task 5):turn 开头复位成本累计器 —— turn 级计数
+        // (output tokens / 工具调用)与注记位点清零,全会话累计保留跨 turn。
+        self.cost_meter.reset_turn();
+        // 警示阈值在 turn 开头读取一次(env `CLAW_COST_WARN_OUTPUT_THRESHOLD`
+        // 可覆盖),全 turn 复用 —— 避免每个工具批都做 env 查询;测试可在
+        // run_turn 前设置好环境变量,阈值随 turn 固定。
+        let cost_warn_threshold = crate::cost_meter::cost_warn_output_threshold();
 
         // 复杂任务调高迭代上限(软硬双层)。
         // 判定完全交给模型:存在活跃 plan(模型调用 create_plan 创建)即视为
@@ -3286,7 +3388,11 @@ where
             {
                 let threshold = survey_guard_threshold();
                 let survey_count = self.count_survey_tool_calls();
-                if survey_count >= threshold
+                // Trivial 档豁免工程类提醒(Task 3 SubTask 3.3):状态/问答
+                // 轮只读现状即可作答,不需要被"把调查写入 tracker + 建计划"
+                // 的工程工作流指令打扰。
+                if turn_tier == TriageTier::Standard
+                    && survey_count >= threshold
                     && survey_count.is_multiple_of(threshold)
                     && !self.tracker_recently_updated()
                 {
@@ -3339,7 +3445,8 @@ where
                 let survey_count = self
                     .count_survey_tool_calls()
                     .saturating_sub(survey_budget_baseline);
-                if budget > 0 && survey_count >= budget {
+                // Trivial 档豁免侦察预算强制收口(与侦察护栏同理,Task 3)。
+                if turn_tier == TriageTier::Standard && budget > 0 && survey_count >= budget {
                     if !survey_hard_stop_injected {
                         survey_hard_stop_injected = true;
                         let tracker_path = self
@@ -3381,7 +3488,8 @@ where
                             return Err(error);
                         }
                     }
-                } else if !survey_countdown_injected
+                } else if turn_tier == TriageTier::Standard
+                    && !survey_countdown_injected
                     && budget > 0
                     && survey_count >= (budget as f64 * SURVEY_COUNTDOWN_RATIO) as usize
                 {
@@ -3402,7 +3510,11 @@ where
             // 动手安全网提示(方案3,2026-08-31):工具执行处已自动建立 turn 级
             // 回滚快照(见 edit_file/write_file 执行路径)。此处注入提示告知
             // 模型"改错有安全网"—— 消除"再确认一次"的理性优势,让动手变便宜。
-            if self.refactor_tx.is_some() && !safety_net_notice_injected {
+            // Trivial 档豁免(状态/问答轮不动手,无安全网可谈,Task 3)。
+            if turn_tier == TriageTier::Standard
+                && self.refactor_tx.is_some()
+                && !safety_net_notice_injected
+            {
                 safety_net_notice_injected = true;
                 let hint = "[runtime] 已自动建立回滚安全网(本次修改可随时调用 \
                     `rollback_transaction` 回滚)。改错可低成本恢复,无需反复只读确认; \
@@ -3472,7 +3584,19 @@ where
                 // 前缀缓存全量命中(目标 97%+)。自 BUG-5/BUG-6 起引入的
                 // ContextAssembler 双路径(assembler 注入 vs 手动 push)已删除,
                 // 只保留单一收口路径,降低复杂度并消除两条路径的行为漂移。
-                let system_split = SystemPromptSplit::from_sections(self.system_prompt.clone());
+                // P1(Task 3):分诊接入 —— Trivial 档的 system prompt 只保留
+                // 不变核 + 状态层(按标题过滤能力层 section);Standard 档
+                // 原样全量(与 P0 快照逐字节等价)。
+                let system_sections = if turn_tier == TriageTier::Trivial {
+                    self.system_prompt
+                        .iter()
+                        .filter(|section| !crate::prompt::is_capability_layer_section(section))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                } else {
+                    self.system_prompt.clone()
+                };
+                let system_split = SystemPromptSplit::from_sections(system_sections);
                 // 消费性内容在渲染后清空(见下方),保证下一 turn 不重复注入。
                 let mut messages = sliced.to_vec();
                 // 固定记忆:首轮/缓存超时(TTL≈300s)重建并替换,热窗内复用旧快照
@@ -3672,6 +3796,9 @@ where
                     system_prompt: system_split,
                     messages,
                     request_kind: RequestKind::Main,
+                    // 分诊档位随请求下发:CLI api client 据此把 Trivial 档的
+                    // tools 裁剪为核心工具集(见 streaming.rs)。
+                    triage_tier: Some(turn_tier),
                 }
             };
             self.emit_diag("[diag] api_stream_start".to_string());
@@ -3855,8 +3982,43 @@ where
 
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
+                // P2(成本反馈注记 · Task 5):把本条响应的 output_tokens 累加进
+                // 成本累计器(口径与 usage_tracker 同源:同一份 usage;u32 → u64
+                // 无损)。turn 内超阈值警示与全会话统计都从这里喂数据。
+                self.cost_meter
+                    .record_output(u64::from(usage.output_tokens));
             }
             prompt_cache_events.extend(turn_prompt_cache_events);
+            // P1(Task 3)单向升级通道:模型在 assistant 文本中显式请求加载
+            // 完整上下文(协议标记 `[LOAD_FULL_CONTEXT]` 或自然语言兜底,
+            // 见 triage::detect_upgrade_request)→ 会话级锁存 upgrade 标志,
+            // 下一轮请求(含同 turn 后续迭代)起恒 Standard,本会话不降级。
+            // 检测在 assistant 消息解析后立即执行;无文本时返回 false,零成本。
+            let assistant_text: String = assistant_message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if detect_upgrade_request(&assistant_text) {
+                if !self.triage_upgrade_requested {
+                    self.emit_diag(
+                        "[diag] triage upgrade requested by model -> Standard locked".to_string(),
+                    );
+                }
+                self.triage_upgrade_requested = true;
+            }
+            // P2(充分性契约 · Task 4):解析模型本次声明的停止判据
+            // (`[SUFFICIENCY: <源1>, <源2>, ...]`,见 crate::sufficiency)。
+            // 出现标记 → (重新)声明契约(替换旧判据并清空已读状态);
+            // 无标记 → 沿用现有契约(未声明时保持空,全程零干扰)。
+            let declared_sources =
+                crate::sufficiency::parse_sufficiency_declaration(&assistant_text);
+            if !declared_sources.is_empty() {
+                self.sufficiency_contract.declare(declared_sources);
+            }
             let pending_tool_uses = assistant_message
                 .blocks
                 .iter()
@@ -4002,6 +4164,9 @@ where
             self.emit_diag(format!(
                 "[diag] tool_loop_enter iter={iterations} tool_count={tool_count}"
             ));
+            // P2(成本反馈注记 · Task 5):本批工具调用计入成本累计器(按模型
+            // 声明的 tool_use 数;权限拒绝也算一次 LLM↔工具往返,同样烧 token)。
+            self.cost_meter.add_tool_calls(tool_count);
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 // 细粒度中断检查：执行下一个工具前检查 abort signal。
                 // 若上一个工具执行时间较长（如 cargo build），用户在等待期间
@@ -4581,6 +4746,29 @@ where
                                 output_to_store = format!("{output_to_store}\n\n{hint}");
                             }
                         }
+                        // P2(充分性契约 · Task 4):侦察类工具调用后的契约记账与
+                        // 冗余注记(实现方式与上方 F5 越界提示一致 —— 在 tool_result
+                        // content 入库前追加文本)。三态:
+                        // - 未声明判据:零干扰(不记账、不注记);
+                        // - 判据已满足:本次调用为冗余侦察 → 在 tool_result 末尾
+                        //   追加注记,引导模型直接作答;
+                        // - 判据未满足:把本次调用涉及的源登记进已读集合
+                        //   (先判定冗余再登记,保证"恰好补足判据的那次调用"不被误标)。
+                        let is_recon =
+                            crate::sufficiency::is_recon_tool(&tool_name, &effective_input);
+                        if is_recon && self.sufficiency_contract.is_declared() {
+                            if self.sufficiency_contract.is_contract_satisfied() {
+                                output_to_store = format!(
+                                    "{output_to_store}\n\n[runtime] 充分性判据已满足,本次调用为冗余侦察;若无新证据,请直接作答"
+                                );
+                            } else {
+                                let candidates = crate::sufficiency::recon_sources_from_tool(
+                                    &tool_name,
+                                    &effective_input,
+                                );
+                                self.sufficiency_contract.note_sources_read(candidates);
+                            }
+                        }
                         ConversationMessage::tool_result(
                             tool_use_id,
                             tool_name,
@@ -4637,6 +4825,35 @@ where
                     }
                 }
                 tool_results.push(result_message);
+            }
+
+            // P2(充分性契约 · Task 4):本迭代工具批处理结束 —— 若判据在本批内
+            // 从 false 变 true,注入「充分即停」提醒(模仿既有侦察提醒的
+            // push_message 模式;每 turn 只注入一次,由上方
+            // `sufficiency_notice_injected` 标志保证)。提醒作为 user 消息,
+            // 下一次迭代请求构造时对模型可见。
+            if !sufficiency_notice_injected
+                && self.sufficiency_contract.is_declared()
+                && self.sufficiency_contract.is_contract_satisfied()
+            {
+                sufficiency_notice_injected = true;
+                let hint = "[runtime] 已声明的充分性判据已满足(声明源均已读取),请基于现有信息直接作答,不要再发起新的只读侦察。";
+                let _ = self
+                    .session
+                    .push_message(ConversationMessage::user_text(hint));
+            }
+
+            // P2(成本反馈注记 · Task 5):本迭代工具批处理结束 → 评估成本累计,
+            // 需要时注入「成本提示/警示」[runtime] 注记(作为 user 消息,下一次
+            // 请求构造时对模型可见 —— 与上方充分性提醒同通道)。频率上限在
+            // meter 内部(普通提示每 ~5 次工具调用一条、警示每 ~10K output
+            // 一条),防止注记本身刷屏变成新的成本。Trivial/Standard 两档都
+            // 注入 —— 成本失控恰在 Trivial 问答轮最严重,不按档位豁免。
+            // 阈值复用 turn 开头读取的 `cost_warn_threshold`(见 run_turn 入口)。
+            if let Some(note) = self.cost_meter.poll_note(cost_warn_threshold) {
+                let _ = self
+                    .session
+                    .push_message(ConversationMessage::user_text(note));
             }
 
             // 阶段 2b:分支重试成功 → 跳出主循环,让 turn 正常收尾。
@@ -5034,9 +5251,16 @@ where
                 .cumulative_usage()
                 .summary_lines("session-total");
             // 3. 渲染 + 落盘。
-            let digest =
-                crate::management_brain::render_digest(&self.session.session_id, &failures, &usage_lines);
-            let _ = crate::management_brain::write_digest(workspace_root, &self.session.session_id, &digest);
+            let digest = crate::management_brain::render_digest(
+                &self.session.session_id,
+                &failures,
+                &usage_lines,
+            );
+            let _ = crate::management_brain::write_digest(
+                workspace_root,
+                &self.session.session_id,
+                &digest,
+            );
         }
 
         // G9.1: SessionEnd lifecycle hook — turn 完全结束(含 nudge 等清理)后触发,
@@ -5631,7 +5855,7 @@ where
         // Handoff 摘要到主会话/同侪,使 Sidebar peer 视图与未读计数可见。
         {
             let bus = crate::session_bus::global();
-            let _ = bus.update_status(&subagent_id, crate::session_bus::PeerStatus::Done);
+            bus.update_status(&subagent_id, crate::session_bus::PeerStatus::Done);
             let _ = bus.publish(crate::session_bus::BusMessage {
                 from: subagent_id.clone(),
                 to: "*".to_string(),
@@ -5792,6 +6016,7 @@ where
     /// 若 `with_model` 返回 `Err`(默认实现或生产实现构造失败),
     /// 记录诊断日志并回退到主 agent client — 保证 retry loop 不因
     /// client 构造失败而中止,降级为"同模型重试"。
+    #[allow(clippy::too_many_arguments)]
     async fn run_subagent_turn_with_model(
         &mut self,
         subagent_id: &str,
@@ -6437,8 +6662,14 @@ where
 
             let complexity = parse_complexity(item.get("complexity"));
             let capability = parse_capability(item.get("capability"));
+            let max_iterations = item
+                .get("max_iterations")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
             tasks.push(
-                SpawnRequest::new(name, task, mode, model, complexity).with_capability(capability),
+                SpawnRequest::new(name, task, mode, model, complexity)
+                    .with_capability(capability)
+                    .with_max_iterations(max_iterations),
             );
         }
 
@@ -7352,8 +7583,7 @@ where
         }
 
         // 2. 会话历史(session_search:history_index 或 workspace FTS5)
-        let q_json =
-            serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string());
+        let q_json = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".to_string());
         let ss_input = format!(r#"{{"query": {q_json}, "top_k": {k}}}"#);
         if let Ok(hist) = self.execute_session_search(&ss_input) {
             if !hist.contains("not available") && !hist.trim().is_empty() {
@@ -8620,6 +8850,7 @@ mod tests {
         ProjectContext, SystemPromptBuilder, SystemPromptSplit, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::triage::TriageTier;
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use std::fs;
@@ -9884,13 +10115,14 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         );
-        let plan = crate::planner::artifact::PlanArtifact::new(
-            "热升级恢复的任务".to_string(),
-            vec![],
-        );
+        let plan =
+            crate::planner::artifact::PlanArtifact::new("热升级恢复的任务".to_string(), vec![]);
         assert!(runtime.active_plan().is_none());
         runtime.restore_active_plan(plan.clone());
-        assert_eq!(runtime.active_plan().unwrap().task_summary, "热升级恢复的任务");
+        assert_eq!(
+            runtime.active_plan().unwrap().task_summary,
+            "热升级恢复的任务"
+        );
         // 幂等:已有 plan 时新 plan 不覆盖。
         let second = crate::planner::artifact::PlanArtifact::new("另一个计划".to_string(), vec![]);
         runtime.restore_active_plan(second);
@@ -9990,7 +10222,6 @@ mod tests {
                         AssistantEvent::TextDelta("branch retry completed".to_string()),
                         AssistantEvent::MessageStop,
                     ]),
-                    other => unreachable!("unexpected request kind: {other:?}"),
                 }
             }
         }
@@ -10281,10 +10512,7 @@ mod tests {
             assistant_msgs,
             1,
             "turn2 request must retain turn-1 assistant reply; roles={:?}",
-            second_request
-                .iter()
-                .map(|m| m.role.clone())
-                .collect::<Vec<_>>()
+            second_request.iter().map(|m| m.role).collect::<Vec<_>>()
         );
     }
 
@@ -10644,6 +10872,7 @@ mod tests {
             system_prompt: split,
             messages: Vec::new(),
             request_kind: RequestKind::Main,
+            triage_tier: Some(TriageTier::Standard),
         };
         assert_eq!(request.system_prompt.static_sections, vec!["static"]);
         assert_eq!(request.system_prompt.dynamic_sections, vec!["dynamic"]);
@@ -10655,6 +10884,7 @@ mod tests {
             system_prompt: SystemPromptSplit::from_sections(vec!["static".to_string()]),
             messages: Vec::new(),
             request_kind: RequestKind::Main,
+            triage_tier: None,
         };
         assert_eq!(request.request_kind, RequestKind::Main);
     }
@@ -11083,6 +11313,503 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ===== P2 充分性契约(Task 4):判据满足提醒 + 冗余侦察注记 =====
+
+    /// 充分性契约集成(2026-09,Task 4):assistant 文本声明
+    /// `[SUFFICIENCY: a.md, b.md]` → 依次读 a.md、b.md → 判据满足,注入
+    /// 「判据已满足」提醒(每 turn 仅一次);再发起第三次读(c.md) →
+    /// 该 tool_result 末尾带冗余侦察注记,且不重复注入提醒。
+    #[test]
+    fn sufficiency_contract_injects_notice_once_and_annotates_redundant_recon() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+
+        struct DeclareApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+        }
+        impl ApiClient for DeclareApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured
+                    .lock()
+                    .expect("lock")
+                    .push(request.messages.clone());
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    // 迭代 1:声明停止判据 + 读 a.md。
+                    0 => Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "[SUFFICIENCY: a.md, b.md]\n先读取声明源确认内容。".to_string(),
+                        ),
+                        AssistantEvent::ToolUse {
+                            id: "t-a".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"a.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // 迭代 2:读 b.md(补足判据 → 批处理后应注入提醒)。
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "t-b".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"b.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // 迭代 3:判据已满足后仍发起只读侦察(c.md)→ 冗余注记。
+                    2 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "t-c".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"c.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // 迭代 4:收尾作答。
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta("好的,已基于读取内容作答。".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DeclareApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new()
+                .register("read_file", |input| Ok(format!("content of {input}"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("请基于文件回答", None)
+            .expect("turn should succeed");
+
+        let requests = captured.lock().expect("lock");
+        assert!(
+            requests.len() >= 4,
+            "至少 4 次请求(声明+读 a/b/c+收尾),got {}",
+            requests.len()
+        );
+
+        // 文本统计辅助:某次请求中文本块含子串的 user/assistant 消息数。
+        let count_text_msgs = |msgs: &[ConversationMessage], needle: &str| -> usize {
+            msgs.iter()
+                .filter(|m| {
+                    m.blocks.iter().any(|b| match b {
+                        ContentBlock::Text { text } => text.contains(needle),
+                        _ => false,
+                    })
+                })
+                .count()
+        };
+        // ToolResult 输出统计辅助:输出中含子串的 tool_result 块数。
+        let count_tool_outputs = |msgs: &[ConversationMessage], needle: &str| -> usize {
+            msgs.iter()
+                .flat_map(|m| &m.blocks)
+                .filter(|b| match b {
+                    ContentBlock::ToolResult { output, .. } => output.contains(needle),
+                    _ => false,
+                })
+                .count()
+        };
+
+        let last = requests.last().expect("at least one request");
+        // 提醒只注入一次:最后一次请求的历史里该提醒恰好 1 条(若注入两次会成 2)。
+        assert_eq!(
+            count_text_msgs(last, "已声明的充分性判据已满足"),
+            1,
+            "判据满足提醒必须恰好注入一次, got messages: {last:?}"
+        );
+        // 冗余注记恰好一条(只落在第三次读 c.md 的 tool_result 上)。
+        assert_eq!(
+            count_tool_outputs(last, "本次调用为冗余侦察"),
+            1,
+            "冗余侦察注记应只追加到 c.md 的 tool_result, got: {last:?}"
+        );
+        // 注记落在 c.md 那次读取的输出上(与读取内容同处一条 output)。
+        assert_eq!(
+            count_tool_outputs(last, "content of {\"file_path\":\"c.md\"}"),
+            1,
+            "c.md 的读取结果必须存在"
+        );
+        // 前两次读取(a.md/b.md)不携带冗余注记 —— 它们是判据满足的合法来源。
+        let annotated_a = count_tool_outputs(
+            last,
+            "content of {\"file_path\":\"a.md\"}\n\n[runtime] 充分性判据已满足",
+        );
+        let annotated_b = count_tool_outputs(
+            last,
+            "content of {\"file_path\":\"b.md\"}\n\n[runtime] 充分性判据已满足",
+        );
+        assert_eq!(annotated_a, 0, "a.md 读取(补足前)不应带冗余注记");
+        assert_eq!(annotated_b, 0, "b.md 读取(恰好补足判据)不应带冗余注记");
+        // 首次请求(声明前)不应出现提醒。
+        assert_eq!(
+            count_text_msgs(&requests[0], "已声明的充分性判据已满足"),
+            0,
+            "声明轮请求中不应已有提醒"
+        );
+    }
+
+    /// 充分性契约零干扰(2026-09,Task 4):未声明判据(无 `[SUFFICIENCY:]`
+    /// 标记)时,反复读文件不注入任何提醒、不追加任何冗余注记 —— 既有
+    /// 侦察护栏之外的纯只读流程保持原样。
+    #[test]
+    fn sufficiency_contract_undeclared_zero_interference() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+
+        struct NoDeclareApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+        }
+        impl ApiClient for NoDeclareApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured
+                    .lock()
+                    .expect("lock")
+                    .push(request.messages.clone());
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => Ok(vec![
+                        AssistantEvent::TextDelta("先读取几个文件看看。".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "r-a".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"a.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "r-b".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"b.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "r-c".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"c.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta("看完了,直接作答。".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoDeclareApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new()
+                .register("read_file", |input| Ok(format!("content of {input}"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("看一下", None)
+            .expect("turn should succeed");
+
+        let requests = captured.lock().expect("lock");
+        let last = requests.last().expect("at least one request");
+        let text_has = |msgs: &[ConversationMessage], needle: &str| -> bool {
+            msgs.iter().any(|m| {
+                m.blocks.iter().any(|b| match b {
+                    ContentBlock::Text { text } => text.contains(needle),
+                    _ => false,
+                })
+            })
+        };
+        let output_has = |msgs: &[ConversationMessage], needle: &str| -> bool {
+            msgs.iter().any(|m| {
+                m.blocks.iter().any(|b| match b {
+                    ContentBlock::ToolResult { output, .. } => output.contains(needle),
+                    _ => false,
+                })
+            })
+        };
+        assert!(
+            !text_has(last, "充分性判据已满足"),
+            "未声明判据时不得注入满足提醒, got: {last:?}"
+        );
+        assert!(
+            !output_has(last, "本次调用为冗余侦察"),
+            "未声明判据时不得追加冗余注记, got: {last:?}"
+        );
+        // 三次读取照常执行(内容完整入库,契约不干扰正常侦察)。
+        assert!(
+            output_has(last, "content of {\"file_path\":\"a.md\"}")
+                && output_has(last, "content of {\"file_path\":\"b.md\"}")
+                && output_has(last, "content of {\"file_path\":\"c.md\"}"),
+            "三次只读读取必须全部正常完成, got: {last:?}"
+        );
+    }
+
+    // ===== P2 成本反馈注记(Task 5):成本提示/警示注入 =====
+
+    /// 成本反馈集成(2026-09,Task 5):脚本化 API 逐步返回大 usage(15K →
+    /// 累计 25K)→ 第一轮工具批处理后注入「成本提示」(output 15K ≥ 5K),
+    /// 第二轮工具批处理后注入升级「成本警示」(累计 25K ≥ 20K 阈值)。
+    /// 注记作为 [runtime] user 消息,下一次请求构造对模型可见。
+    #[test]
+    fn cost_meter_injects_hint_then_warning_for_large_usage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+
+        struct BurnApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+        }
+        impl ApiClient for BurnApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured
+                    .lock()
+                    .expect("lock")
+                    .push(request.messages.clone());
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    // 迭代 1:15K output + 一次读(批处理后应注入成本提示)。
+                    0 => Ok(vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 15_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::TextDelta("先读取 a 验证内容。".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "c-a".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"a.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // 迭代 2:再 10K output(累计 25K ≥ 20K)→ 注入成本警示。
+                    1 => Ok(vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 10_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::ToolUse {
+                            id: "c-b".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"b.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // 迭代 3:收尾作答(无工具 → turn 结束)。
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta("已基于读取内容作答。".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        // 环境变量隔离:警示阈值可被 `CLAW_COST_WARN_OUTPUT_THRESHOLD` 覆盖,
+        // 持共享锁并移除该变量(回退默认 20K),与 env 覆盖单测互斥,也免受
+        // CI 残留 env 影响。run_turn 结束后恢复原值。
+        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
+        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
+        std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV);
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            BurnApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new()
+                .register("read_file", |input| Ok(format!("content of {input}"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("请查证后回答", None)
+            .expect("turn should succeed");
+
+        match saved_warn_env {
+            Some(value) => {
+                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
+            }
+            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+
+        let requests = captured.lock().expect("lock");
+        assert!(requests.len() >= 3, "至少 3 次请求, got {}", requests.len());
+
+        // 文本统计辅助:某次请求中文本块含子串的 user/assistant 消息数。
+        let count_text_msgs = |msgs: &[ConversationMessage], needle: &str| -> usize {
+            msgs.iter()
+                .filter(|m| {
+                    m.blocks.iter().any(|b| match b {
+                        ContentBlock::Text { text } => text.contains(needle),
+                        _ => false,
+                    })
+                })
+                .count()
+        };
+
+        let last = requests.last().expect("at least one request");
+        // 提示与警示各恰好一条(注入后作为历史消息保留在最终请求中)。
+        assert_eq!(
+            count_text_msgs(last, "成本提示:本 turn 已消耗 output ~15000 tokens"),
+            1,
+            "15K output 后应注入成本提示, got: {last:?}"
+        );
+        assert_eq!(
+            count_text_msgs(last, "成本警示:本 turn output 已超 25000 tokens"),
+            1,
+            "累计 25K ≥ 20K 阈值应注入成本警示, got: {last:?}"
+        );
+        // 警示携带收敛指令。
+        assert!(
+            count_text_msgs(last, "建议立即收敛") >= 1,
+            "警示应携带收敛引导, got: {last:?}"
+        );
+        // 首次请求(尚未有任何工具批处理结束)不应出现成本注记。
+        assert_eq!(
+            count_text_msgs(&requests[0], "成本提示") + count_text_msgs(&requests[0], "成本警示"),
+            0,
+            "首轮请求构造前不应有成本注记"
+        );
+    }
+
+    /// 成本反馈零干扰(2026-09,Task 5):小 usage 场景(累计 1K output、2 次
+    /// 工具往返,均未达提示基线 5K/3 次)不注入任何成本注记。
+    #[test]
+    fn cost_meter_zero_notes_for_small_usage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+
+        struct CheapApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+        }
+        impl ApiClient for CheapApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured
+                    .lock()
+                    .expect("lock")
+                    .push(request.messages.clone());
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    // 迭代 1:500 output + 读 a(工具 1 次)。
+                    0 => Ok(vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 500,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::ToolUse {
+                            id: "s-a".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"a.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // 迭代 2:再 500 output + 读 b(工具 2 次,累计 1K output)。
+                    1 => Ok(vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 500,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::ToolUse {
+                            id: "s-b".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"b.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // 迭代 3:收尾作答。
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta("内容足够,直接作答。".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        // 环境变量隔离:同上(与大 usage 集成测试共用一把锁;移除 env 回退
+        // 默认 20K 阈值,小 usage 场景即使阈值被 env 改小也不应触发注记 ——
+        // 1K output 与 2 次工具往返低于任何 >=1K 阈值的提示基线)。
+        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
+        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
+        std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV);
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CheapApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new()
+                .register("read_file", |input| Ok(format!("content of {input}"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("简单看一下", None)
+            .expect("turn should succeed");
+
+        match saved_warn_env {
+            Some(value) => {
+                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
+            }
+            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+
+        let requests = captured.lock().expect("lock");
+        // 文本统计辅助。
+        let text_has = |msgs: &[ConversationMessage], needle: &str| -> bool {
+            msgs.iter().any(|m| {
+                m.blocks.iter().any(|b| match b {
+                    ContentBlock::Text { text } => text.contains(needle),
+                    _ => false,
+                })
+            })
+        };
+        // 小 usage 全程(含最终请求)零成本注记。
+        for (idx, req) in requests.iter().enumerate() {
+            assert!(
+                !text_has(req, "成本提示") && !text_has(req, "成本警示"),
+                "小 usage 场景第 {idx} 次请求不应含成本注记, got: {req:?}"
+            );
+        }
     }
 
     /// 只读停滞中止(方案2,2026-08-31):预算耗尽且强收口已注入后,模型若
@@ -11838,7 +12565,6 @@ mod tests {
     /// 各司其职 —— 稳定段在前缀长命区命中缓存,实时段在尾块新建代价低。
     #[test]
     fn notebook_stable_sections_inject_prefix_not_tail() {
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrderingNb};
         use std::sync::Mutex;
 
         let captured = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
@@ -11913,8 +12639,7 @@ mod tests {
 <evidence>
 [Bash] 基准: 100 req/s
 </evidence>";
-        let nb_path = std::fs::create_dir_all(&tmp.join(".claw")).expect("mkdir");
-        let _ = nb_path;
+        std::fs::create_dir_all(tmp.join(".claw")).expect("mkdir");
         std::fs::write(tmp.join(".claw").join("NOTEBOOK.md"), note).expect("write notebook");
 
         let mut runtime = ConversationRuntime::new(
@@ -11934,7 +12659,7 @@ mod tests {
             .expect("turn2 should succeed");
 
         let shots = captured.lock().expect("lock");
-        assert!(shots.len() >= 1, "at least one request");
+        assert!(!shots.is_empty(), "at least one request");
         let (first_text, last_text) = (&shots[0][0], &shots[0][1]);
         assert!(
             first_text.contains("设计决策与实验证据"),
@@ -15449,6 +16174,7 @@ mod tests {
                 instruction_files: Vec::new(),
             }),
             tool_summaries: Vec::new(),
+            max_iterations: None,
         };
         let split = build_subagent_system_prompt(
             crate::multi_agent::TaskComplexity::Simple,
@@ -15503,6 +16229,7 @@ mod tests {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
             }],
+            max_iterations: None,
         };
         let split_ro = build_subagent_system_prompt(
             crate::multi_agent::TaskComplexity::Simple,
@@ -15536,7 +16263,7 @@ mod tests {
             &RuntimeFeatureConfig::default(),
         );
 
-        // ReadOnly:仅只读子集(read_file/grep_search/glob_search),不含写入工具
+        // ReadOnly:仅只读子集(read_file/grep_search/glob_search + 网络调研只读工具),不含写入工具
         let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly, None);
         let ro_names: Vec<&str> = ro
             .tool_summaries
@@ -15545,11 +16272,17 @@ mod tests {
             .collect();
         assert_eq!(
             ro_names,
-            vec!["read_file", "grep_search", "glob_search"],
+            vec![
+                "read_file",
+                "grep_search",
+                "glob_search",
+                "WebSearch",
+                "WebFetch"
+            ],
             "ReadOnly should only expose read-only subset"
         );
 
-        // Execute:全量可执行目录(read_file/grep_search/glob_search/edit_file/write_file/bash)
+        // Execute:全量可执行目录(read_file/grep_search/glob_search + 网络调研 + edit/write/bash)
         let ex = runtime.build_subagent_context(SubagentCapability::Execute, None);
         let ex_names: Vec<&str> = ex
             .tool_summaries
@@ -15562,6 +16295,8 @@ mod tests {
                 "read_file",
                 "grep_search",
                 "glob_search",
+                "WebSearch",
+                "WebFetch",
                 "edit_file",
                 "write_file",
                 "bash"
@@ -15641,6 +16376,8 @@ mod tests {
                 "read_file",
                 "grep_search",
                 "glob_search",
+                "WebSearch",
+                "WebFetch",
                 "edit_file",
                 "write_file",
                 "bash"
@@ -15710,8 +16447,9 @@ mod tests {
 
         // 注册必然失败的工具(真实执行失败,走统一出口 → is_error=true)
         let tool_uses = vec![make_edit_tool_use("tu1", "edit_file", "src/foo.rs")];
-        let mut executor = StaticToolExecutor::new()
-            .register("edit_file", |_input| Err(ToolError::new("old_string not found")));
+        let mut executor = StaticToolExecutor::new().register("edit_file", |_input| {
+            Err(ToolError::new("old_string not found"))
+        });
         let mut messages = Vec::new();
         let mut tools_used = Vec::new();
         let mut changed_files = Vec::new();
@@ -15727,13 +16465,14 @@ mod tests {
             None,
         );
         assert!(result.is_ok(), "tool failure should not fail the loop");
-        assert!(messages.iter().any(|_m| true), "tool_result should be appended");
+        assert!(
+            messages.iter().any(|_m| true),
+            "tool_result should be appended"
+        );
 
         // 验证失败信号自动落入 workspace/.claw/decision_log.db(子代理循环路径)
         let log = crate::decision_log::DecisionLog::open(&workspace).unwrap();
-        let hits = log
-            .search_decisions("old_string not found", 5)
-            .unwrap();
+        let hits = log.search_decisions("old_string not found", 5).unwrap();
         assert!(
             hits.contains("edit_file: old_string not found"),
             "auto-capture should have recorded the failure: {hits}"
@@ -15744,7 +16483,6 @@ mod tests {
             "should carry auto_captured tag: {hits}"
         );
     }
-
 
     #[test]
     fn process_tool_uses_analyze_edit_rejected_by_whitelist() {
@@ -16404,7 +17142,7 @@ mod tests {
     fn process_tool_uses_write_conflicts_with_parent_lock() {
         // 缩短锁超时,避免测试等待默认 30s。
         std::env::set_var("CLAW_SUBAGENT_FILE_LOCK_TIMEOUT", "1");
-        let body = (|| {
+        let body = {
             let tmp = tempfile::tempdir().expect("temp workspace");
             let workspace = tmp.path().to_path_buf();
             std::fs::create_dir_all(workspace.join("src")).expect("create src");
@@ -16456,7 +17194,7 @@ mod tests {
             );
             drop(parent_lock);
             Ok::<(), String>(())
-        })();
+        };
         std::env::remove_var("CLAW_SUBAGENT_FILE_LOCK_TIMEOUT");
         body.expect("test body should succeed");
     }
@@ -18158,6 +18896,26 @@ mod tests {
         );
     }
 
+    /// 2026-09-03:网络调研修复 — `parse_spawn_parallel_input` 解析
+    /// `max_iterations` 字段,缺失时保持 `None`(能力默认上限)。
+    #[test]
+    fn parse_spawn_parallel_input_max_iterations_field() {
+        let input = r#"{
+            "tasks": [
+                {"name":"a","task":"do A","model":"deepseek-v4-pro"},
+                {"name":"b","task":"do B","model":"deepseek-v4-pro","max_iterations":20}
+            ],
+            "fail_fast":"off"
+        }"#;
+        let (tasks, _, _) =
+            ConversationRuntime::<NoopApi, StaticToolExecutor>::parse_spawn_parallel_input(input)
+                .expect("valid input should parse");
+        assert_eq!(tasks.len(), 2);
+        // 缺失字段默认 None(能力默认上限)
+        assert_eq!(tasks[0].max_iterations, None);
+        assert_eq!(tasks[1].max_iterations, Some(20));
+    }
+
     /// v3:`format_spawn_parallel_results` — 共享格式化逻辑的单元测试
     #[test]
     fn format_spawn_parallel_results_mixed_success_failure() {
@@ -18251,7 +19009,8 @@ mod tests {
 
     /// 显式传 knowledge_source → 原样保留(LLM 基于自身任务上下文精确标注)。
     #[test]
-    fn execute_log_decision_preserves_explicit_source() {        let dir = tempfile::tempdir().unwrap();
+    fn execute_log_decision_preserves_explicit_source() {
+        let dir = tempfile::tempdir().unwrap();
         let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
         let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
             Session::new(),
@@ -18328,9 +19087,14 @@ mod tests {
             )
             .with_workspace_root(dir.path().to_path_buf());
 
-        assert!(runtime.execute_set_current_task("{}").is_err(), "missing goal");
         assert!(
-            runtime.execute_set_current_task(r#"{"goal":"   "}"#).is_err(),
+            runtime.execute_set_current_task("{}").is_err(),
+            "missing goal"
+        );
+        assert!(
+            runtime
+                .execute_set_current_task(r#"{"goal":"   "}"#)
+                .is_err(),
             "empty goal"
         );
     }
@@ -18450,9 +19214,8 @@ mod tests {
             .expect("parse decision id");
 
         // Pending = 撤销,不更新统计,也不反馈 harness。
-        let verify_input = format!(
-            r#"{{"decision_id":{decision_id},"verification_result":"Pending"}}"#
-        );
+        let verify_input =
+            format!(r#"{{"decision_id":{decision_id},"verification_result":"Pending"}}"#);
         runtime
             .execute_verify_decision(&verify_input)
             .expect("verify_decision");
@@ -18460,7 +19223,10 @@ mod tests {
         let archive = crate::harness_evolution::HarnessArchive::open(dir.path()).unwrap();
         let edit = archive.get_edit("e1").expect("get").expect("exists");
         assert_eq!(edit.verify_count, 0, "Pending must not touch verify_count");
-        assert_eq!(edit.success_count, 0, "Pending must not touch success_count");
+        assert_eq!(
+            edit.success_count, 0,
+            "Pending must not touch success_count"
+        );
     }
 
     // ===== 双大脑 · ask_brain 工具(批次 1)=====
@@ -18486,20 +19252,24 @@ mod tests {
             .expect("log_decision");
 
         let ctx = runtime.retrieve_brain_context("old_string not found", 5);
-        assert!(ctx.contains("### Past Decisions (decision_log)"), "ctx: {ctx}");
+        assert!(
+            ctx.contains("### Past Decisions (decision_log)"),
+            "ctx: {ctx}"
+        );
         assert!(ctx.contains("old_string not found"), "ctx: {ctx}");
     }
 
     /// ask_brain:知识库无命中 → 返回引导消息(不调 brain,零 LLM)。
     #[tokio::test]
     async fn execute_ask_brain_empty_knowledge_returns_guidance() {
-        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
-            Session::new(),
-            NoopApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        );
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                NoopApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            );
         let out = runtime
             .execute_ask_brain_async(r#"{"query":"nonexistent unique term xyzzy"}"#)
             .await
@@ -18512,14 +19282,15 @@ mod tests {
     async fn execute_ask_brain_degrades_without_workspace_root() {
         let dir = tempfile::tempdir().unwrap();
         let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
-        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
-            Session::new(),
-            NoopApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_decision_log(log);
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                NoopApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_decision_log(log);
 
         runtime
             .execute_log_decision(
@@ -18531,7 +19302,10 @@ mod tests {
             .execute_ask_brain_async(r#"{"query":"permission denied"}"#)
             .await
             .expect("must degrade gracefully");
-        assert!(out.contains("brain 会话不可用:无 workspace_root"), "out: {out}");
+        assert!(
+            out.contains("brain 会话不可用:无 workspace_root"),
+            "out: {out}"
+        );
         assert!(out.contains("permission denied"), "out: {out}");
     }
 
@@ -18540,14 +19314,15 @@ mod tests {
     async fn execute_ask_brain_poor_mode_skips_brain_synthesis() {
         let dir = tempfile::tempdir().unwrap();
         let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
-        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
-            Session::new(),
-            NoopApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_decision_log(log);
+        let mut runtime: ConversationRuntime<NoopApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                NoopApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_decision_log(log);
 
         runtime
             .execute_log_decision(
@@ -18573,10 +19348,7 @@ mod tests {
             calls: usize,
         }
         impl ApiClient for BrainApi {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.calls += 1;
                 match self.calls {
                     1 => Ok(vec![
@@ -18666,10 +19438,7 @@ mod tests {
             calls: usize,
         }
         impl ApiClient for FailingToolApi {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.calls += 1;
                 match self.calls {
                     1 => Ok(vec![
@@ -18684,9 +19453,7 @@ mod tests {
                         // 第 2 次请求应已注入 Failure Advice(失败后自动辅导)。
                         let has_advice = request.messages.iter().any(|m| {
                             m.blocks.iter().any(|b| match b {
-                                ContentBlock::Text { text } => {
-                                    text.contains("Failure Advice")
-                                }
+                                ContentBlock::Text { text } => text.contains("Failure Advice"),
                                 _ => false,
                             })
                         });
@@ -18741,6 +19508,292 @@ mod tests {
         assert_eq!(summary.iterations, 2);
     }
 
+    // ===== P1(轮次感知上下文编译器)Task 3:分诊接入请求构造 =====
+
+    /// 捕获每次主对话请求的假 API:按调用顺序保存 request 快照,
+    /// 每轮返回纯文本答复(无工具调用),供档位/prompt 断言。
+    struct CaptureRequestApi {
+        captured: Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+        reply: String,
+    }
+    impl ApiClient for CaptureRequestApi {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.captured.lock().unwrap().push(request.clone());
+            Ok(vec![
+                AssistantEvent::TextDelta(self.reply.clone()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    /// 渲染 split 的全部 section(static + dynamic,原顺序)。
+    fn render_split(split: &SystemPromptSplit) -> String {
+        let mut parts = split.static_sections.clone();
+        parts.extend(split.dynamic_sections.iter().cloned());
+        parts.join("\n\n")
+    }
+
+    /// 真实分层 system prompt sections(builder 全量,含三层)。
+    fn real_prompt_sections() -> Vec<String> {
+        SystemPromptBuilder::new().build()
+    }
+
+    /// 预置 8 组侦察(grep_search)历史 —— 达到默认侦察护栏阈值
+    /// (SURVEY_GUARD_THRESHOLD=8)且 tracker 从未创建(未更新),
+    /// 使"把调查写入 tracker + 建计划"的强制提醒在下一轮请求前就绪。
+    fn seed_survey_history(
+        runtime: &mut ConversationRuntime<CaptureRequestApi, StaticToolExecutor>,
+    ) {
+        runtime
+            .session
+            .push_message(ConversationMessage::user_text("先前让我排查一些符号"))
+            .expect("seed user message");
+        for i in 0..8usize {
+            let id = format!("survey-{i}");
+            runtime
+                .session
+                .push_message(ConversationMessage {
+                    role: MessageRole::Assistant,
+                    blocks: vec![ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: "grep_search".to_string(),
+                        input: r#"{"query":"probe","path":"."}"#.to_string(),
+                    }],
+                    usage: None,
+                })
+                .expect("seed assistant tool_use");
+            runtime
+                .session
+                .push_message(ConversationMessage::tool_result(
+                    id,
+                    "grep_search",
+                    "no match",
+                    false,
+                ))
+                .expect("seed tool_result");
+        }
+    }
+
+    /// SubTask 3.2:Trivial 档(状态问答轮)请求构造 —— system prompt 只注入
+    /// 不变核 + 状态层,能力层关键词全部缺席;档位随请求下发。
+    #[test]
+    fn trivial_turn_strips_capability_layer_from_system_prompt() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime: ConversationRuntime<CaptureRequestApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                CaptureRequestApi {
+                    captured: Arc::clone(&captured),
+                    reply: "上次任务已到第 3 步。".to_string(),
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                real_prompt_sections(),
+            );
+        runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("turn should complete");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "纯文本答复应一次请求结束");
+        let request = &requests[0];
+        assert_eq!(
+            request.triage_tier,
+            Some(crate::triage::TriageTier::Trivial),
+            "状态问答轮应判 Trivial 档"
+        );
+        let rendered = render_split(&request.system_prompt);
+        // 能力层关键词(多 Agent / Session Bus / 元认知段等)全部缺席。
+        for keyword in [
+            "## Framework Switching",
+            "## Memory Verification",
+            "## History & Decisions",
+            "## Multi-Agent Orchestration",
+            "## Session Bus",
+            "## Agent Subagent Types",
+            "## Worker Lifecycle",
+            "## Tool Usage Guidance",
+        ] {
+            assert!(
+                !rendered.contains(keyword),
+                "Trivial 档 prompt 不应含能力层 section {keyword:?}"
+            );
+        }
+        // 不变核与状态层保留。
+        assert!(
+            rendered.contains("You are an interactive agent"),
+            "不变核 Intro 应保留"
+        );
+        assert!(
+            rendered.contains("# Doing tasks"),
+            "不变核 Doing tasks 应保留"
+        );
+        assert!(
+            rendered.contains("# Environment context"),
+            "状态层环境段应保留"
+        );
+        assert!(
+            rendered.contains("# Claude instructions"),
+            "状态层指令段应保留"
+        );
+    }
+
+    /// SubTask 3.2:Standard 档(工程请求)system prompt 与 P0 全量快照
+    /// 逐字节等价(分诊不改变 Standard 档行为)。
+    #[test]
+    fn standard_turn_system_prompt_matches_full_snapshot() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime: ConversationRuntime<CaptureRequestApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                CaptureRequestApi {
+                    captured: Arc::clone(&captured),
+                    reply: "已修复。".to_string(),
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                real_prompt_sections(),
+            );
+        runtime
+            .run_turn("帮我修复这个 bug", None)
+            .expect("turn should complete");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            request.triage_tier,
+            Some(crate::triage::TriageTier::Standard),
+            "工程动词请求应判 Standard 档"
+        );
+        let expected = SystemPromptSplit::from_sections(real_prompt_sections());
+        assert_eq!(
+            request.system_prompt, expected,
+            "Standard 档 system prompt 应与 P0 全量快照逐字节等价"
+        );
+        // 能力层确实保留(与 Trivial 档形成对照)。
+        let rendered = render_split(&request.system_prompt);
+        assert!(rendered.contains("## Multi-Agent Orchestration"));
+        assert!(rendered.contains("## Framework Switching"));
+    }
+
+    /// SubTask 3.3:注记兼容 —— 侦察 tracker 强制提醒在 Trivial 档被豁免
+    /// (状态问答轮不被工程工作流指令打扰),Standard 档照常注入。
+    #[test]
+    fn trivial_turn_skips_survey_tracker_reminder() {
+        // Trivial 档:8 次侦察历史存在,但不注入强制提醒。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime: ConversationRuntime<CaptureRequestApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                CaptureRequestApi {
+                    captured: Arc::clone(&captured),
+                    reply: "状态摘要如上。".to_string(),
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                real_prompt_sections(),
+            )
+            .with_workspace_root(dir.path().to_path_buf());
+        seed_survey_history(&mut runtime);
+        runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("turn should complete");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let trivial_has_reminder = requests[0].messages.iter().any(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("你已进行")))
+        });
+        assert!(
+            !trivial_has_reminder,
+            "Trivial 档应豁免侦察 tracker 强制提醒"
+        );
+        drop(requests);
+
+        // Standard 档:同一侦察历史下,强制提醒照常注入(对照组)。
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        let captured2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime2: ConversationRuntime<CaptureRequestApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                CaptureRequestApi {
+                    captured: Arc::clone(&captured2),
+                    reply: "开始修复。".to_string(),
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                real_prompt_sections(),
+            )
+            .with_workspace_root(dir2.path().to_path_buf());
+        seed_survey_history(&mut runtime2);
+        runtime2
+            .run_turn("帮我修复这个 bug", None)
+            .expect("turn should complete");
+
+        let requests2 = captured2.lock().unwrap();
+        assert_eq!(requests2.len(), 1);
+        let standard_has_reminder = requests2[0].messages.iter().any(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("你已进行")))
+        });
+        assert!(
+            standard_has_reminder,
+            "Standard 档应照常注入侦察 tracker 强制提醒"
+        );
+    }
+
+    /// SubTask 2.3 验收(经 Task 3 接入):单向升级 —— 模型在 Trivial 档
+    /// assistant 文本显式请求完整上下文(`[LOAD_FULL_CONTEXT]`)后,
+    /// 下一 turn 起升级为 Standard 全量注入,本会话不降级。
+    #[test]
+    fn upgrade_request_locks_subsequent_turns_to_standard() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime: ConversationRuntime<CaptureRequestApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                CaptureRequestApi {
+                    captured: Arc::clone(&captured),
+                    reply: "[LOAD_FULL_CONTEXT] 这个状态问题需要多 Agent 与完整工具上下文。"
+                        .to_string(),
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                real_prompt_sections(),
+            );
+        // turn 1:状态问答命中 Trivial,请求以 Trivial 档发出。
+        runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("turn 1 ok");
+        // turn 2:模型已请求升级 → 同输入也判 Standard(单向,不降级)。
+        runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("turn 2 ok");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].triage_tier,
+            Some(crate::triage::TriageTier::Trivial)
+        );
+        assert_eq!(
+            requests[1].triage_tier,
+            Some(crate::triage::TriageTier::Standard),
+            "升级请求后下一轮应恒 Standard"
+        );
+        let rendered1 = render_split(&requests[0].system_prompt);
+        let rendered2 = render_split(&requests[1].system_prompt);
+        assert!(!rendered1.contains("## Multi-Agent Orchestration"));
+        assert!(
+            rendered2.contains("## Multi-Agent Orchestration"),
+            "升级后应恢复全量能力层注入"
+        );
+    }
+
     // ===== 双大脑 · 会话 digest(批次 3)=====
 
     /// pending_session_digest 在 render_runtime_hints 注入 "Previous Session Digest" 槽位。
@@ -18754,8 +19807,7 @@ mod tests {
                 PermissionPolicy::new(PermissionMode::DangerFullAccess),
                 vec!["system".to_string()],
             );
-        runtime.pending_session_digest =
-            Some("# Session Digest · old-sess\n失败模式".to_string());
+        runtime.pending_session_digest = Some("# Session Digest · old-sess\n失败模式".to_string());
         let hints = runtime.render_runtime_hints().expect("hints rendered");
         assert!(hints.contains("Previous Session Digest"), "hints: {hints}");
         assert!(hints.contains("old-sess"), "hints: {hints}");
@@ -19320,5 +20372,116 @@ mod tests {
         assert!(runtime
             .maybe_plan_scope_warning(r#"{"path": "src/x.rs"}"#)
             .is_none());
+    }
+
+    // ===== P1(轮次感知上下文编译器)Task 7:回放式验收测试(回归守门)=====
+
+    /// Task 7.1/7.2:回放式验收测试 —— 审计会话第一问「上次任务执行到哪里了」。
+    ///
+    /// 端到端验收守门指标(spec「回归守门测试」,真实模型运行的运行时目标):
+    /// - **≤2 次工具调用**
+    /// - **output <3K token**
+    ///
+    /// 历史基线:该问题曾消耗 19 轮迭代 / 18 次工具调用 / 42,978 output
+    /// token(占全会话 24%)。新架构下状态层直接携带答案,模型无需考古。
+    /// 上述指标依赖模型行为,单测不可精确复现;本测试验证其**充分条件**:
+    /// 请求构造保证「答案已在上下文中 + 无多余工具可用」:
+    /// 1. 该 turn 被确定性分诊为 Trivial(档位随请求下发 `triage_tier`);
+    /// 2. 请求携带上一会话 digest 文本(经真实注入路径进入尾部冻结槽位块,
+    ///    含「#4 / MACD 交叉」答案关键词),模型无需考古即可作答;
+    /// 3. system prompt 只含不变核 + 状态层,不含能力层(多 Agent / Session
+    ///    Bus / 元认知段),不会诱导模型堆砌工具链。
+    ///
+    /// tools 裁剪(Trivial 档 = `tools::core_tool_names()` 6 核心工具)发生在
+    /// CLI 层(streaming.rs `tools_for_triage`;runtime 的 [`ApiRequest`] 无
+    /// tools 字段),故本测试只断言 prompt 侧 + 档位;tools 侧由
+    /// rusty-claude-cli tests 覆盖。
+    #[test]
+    fn task7_replay_first_question_digest_carries_answer_in_state_layer() {
+        // 真实 digest 注入路径:在临时 workspace_root 造管理脑 digest 文件。
+        // run_turn_async 开头经 management_brain::latest_digest_text 读取 →
+        // pending_session_digest → render_runtime_hints「Previous Session
+        // Digest」槽位 → 请求尾部冻结槽位块(一次性消费,prefix 字节稳定)。
+        let digest_text = "\
+# Session Digest · 上一会话
+已完成: #2 盘整背驰进场回测;
+进行中: #4 MACD 交叉 vs 面积缩量确认回测(脚本已写好待全量跑)";
+        let dir = tempfile::tempdir().expect("temp workspace_root");
+        crate::management_brain::write_digest(dir.path(), "prev-chanlun-sess", digest_text)
+            .expect("seed digest file");
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime: ConversationRuntime<CaptureRequestApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                CaptureRequestApi {
+                    captured: Arc::clone(&captured),
+                    // 脚本化 API 第一轮即直接作答(不发起工具调用)—— 等价于
+                    // "模型无需考古即可从上下文作答"的行为下限。
+                    reply: "上次任务执行到 #4 MACD 交叉回测:脚本已写好待全量跑。".to_string(),
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                real_prompt_sections(),
+            )
+            .with_workspace_root(dir.path().to_path_buf());
+
+        let summary = runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("turn should complete");
+
+        // 断言组 B(行为收敛的守门充分条件):首轮即直接作答 → 0 次工具调用,
+        // 满足端到端守门指标「≤2 次工具调用」的行为下限。
+        assert!(summary.iterations <= 2, "iterations={}", summary.iterations);
+        assert_eq!(
+            summary.tool_results.len(),
+            0,
+            "状态层已携带答案,不应发起工具调用"
+        );
+
+        // 断言组 A(请求侧充分条件)。
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "纯文本答复应一次请求结束");
+        let request = &requests[0];
+        assert_eq!(
+            request.triage_tier,
+            Some(TriageTier::Trivial),
+            "状态问答轮应判 Trivial 档"
+        );
+        // system prompt(不变核 + 状态层):能力层关键词全部缺席。
+        let rendered = render_split(&request.system_prompt);
+        for keyword in [
+            "## Framework Switching",
+            "## Multi-Agent Orchestration",
+            "## Session Bus",
+            "## Agent Subagent Types",
+        ] {
+            assert!(
+                !rendered.contains(keyword),
+                "Trivial 档 prompt 不应含能力层 section {keyword:?}"
+            );
+        }
+        assert!(rendered.contains("# Doing tasks"), "不变核应保留");
+        // 状态层答案载体:真实注入路径下 digest 经 render_runtime_hints 进入
+        // 请求尾部冻结槽位块(而非 system prompt sections —— 前缀字节稳定
+        // 优先)。断言请求消息携带完整 digest 答案。
+        let request_text: String = request
+            .messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            request_text.contains("Previous Session Digest"),
+            "应注入 Previous Session Digest 槽位"
+        );
+        assert!(
+            request_text.contains("#4 MACD 交叉 vs 面积缩量确认回测(脚本已写好待全量跑)"),
+            "digest 应直接携带答案,避免模型考古"
+        );
     }
 }

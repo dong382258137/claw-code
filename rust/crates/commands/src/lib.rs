@@ -1633,9 +1633,7 @@ pub fn validate_slash_command_input(
                 "off" | "disabled" | "false" | "none" => Some(false),
                 other => {
                     return Err(command_error(
-                        &format!(
-                            "invalid value for /thinking: '{other}'; use on or off"
-                        ),
+                        &format!("invalid value for /thinking: '{other}'; use on or off"),
                         "thinking",
                         "[on|off]",
                     ))
@@ -3886,10 +3884,7 @@ pub fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String
                     lines.next(); // 跳过块内空行
                     continue;
                 }
-                let indented = next_line
-                    .chars()
-                    .next()
-                    .map_or(false, |c| c.is_whitespace());
+                let indented = next_line.chars().next().is_some_and(|c| c.is_whitespace());
                 if !indented {
                     break; // 非缩进行 = 块结束
                 }

@@ -44,23 +44,22 @@ use crate::plugin_state::{
 };
 use crate::render::{MarkdownStreamState, OutputVerbosity, Spinner, TerminalRenderer};
 use crate::session_mgr::{
-    civil_from_days, collect_session_prompt_history, confirm_session_deletion,
-    create_managed_session_handle, current_session_store, default_export_filename,
-    delete_managed_session, format_history_timestamp, format_session_modified_age,
-    interactive_session_pick, latest_managed_session, list_managed_sessions,
-    load_session_reference, looks_like_slash_command_token, new_cli_session,
-    new_cli_session_with_roots, parse_history_count, recent_user_context,
+    civil_from_days, clear_upgrade_request, collect_session_prompt_history,
+    confirm_session_deletion, create_managed_session_handle, current_session_store,
+    default_export_filename, delete_managed_session, format_history_timestamp,
+    format_session_modified_age, interactive_session_pick, latest_managed_session,
+    list_managed_sessions, load_session_reference, looks_like_slash_command_token, new_cli_session,
+    new_cli_session_with_roots, parse_history_count, read_upgrade_request, recent_user_context,
     render_prompt_history_report, render_session_list, render_session_markdown,
     resolve_export_path, resolve_managed_session_path, resolve_session_reference,
     resume_command_can_absorb_token, resume_session, run_export, run_resume_command,
     run_resumed_session_command, session_clear_backup_path, session_details_json,
     session_exists_json, session_reference_exists, sessions_dir,
-    summarize_tool_payload_for_markdown, write_session_clear_backup, ManagedSessionSummary,
-    PromptHistoryEntry, ResumeCommandOutcome, SessionHandle, SessionLifecycleKind,
-    SessionLifecycleSummary, UpgradeRequest, clear_upgrade_request, read_upgrade_request,
-    write_upgrade_exited, write_upgrade_request, DEFAULT_HISTORY_LIMIT, LATEST_SESSION_REFERENCE,
-    LEGACY_SESSION_EXTENSION, PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT,
-    SESSION_REFERENCE_ALIASES,
+    summarize_tool_payload_for_markdown, write_session_clear_backup, write_upgrade_exited,
+    write_upgrade_request, ManagedSessionSummary, PromptHistoryEntry, ResumeCommandOutcome,
+    SessionHandle, SessionLifecycleKind, SessionLifecycleSummary, UpgradeRequest,
+    DEFAULT_HISTORY_LIMIT, LATEST_SESSION_REFERENCE, LEGACY_SESSION_EXTENSION,
+    PRIMARY_SESSION_EXTENSION, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT, SESSION_REFERENCE_ALIASES,
 };
 use crate::streaming::{
     build_system_blocks, collect_prompt_cache_events, collect_tool_results, collect_tool_uses,
@@ -742,7 +741,10 @@ impl BuiltRuntime {
     /// 把 LiveCli 持有的 `upgrade_signal`(跨 `prepare_turn_runtime` 重建
     /// 持久)注入 runtime,使 `/upgrade` 命令置位后,当前正在执行的 turn
     /// 在 run_turn 循环顶部检测到并优雅收尾。
-    fn with_upgrade_signal(mut self, upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+    fn with_upgrade_signal(
+        mut self,
+        upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         let runtime = self
             .runtime
             .take()
@@ -1677,14 +1679,15 @@ impl LiveCli {
             SlashCommand::Thinking { enabled } => {
                 let msg = match enabled {
                     None => {
-                        let current = self.thinking_mode().map(|v| {
-                            if v { "开启" } else { "关闭" }
-                        });
+                        let current = self
+                            .thinking_mode()
+                            .map(|v| if v { "开启" } else { "关闭" });
                         match current {
                             Some(state) => format!("当前思考模式: {state}\n用法: /thinking on|off"),
-                            None => format!(
+                            None => {
                                 "当前思考模式: 默认（跟随模型，DeepSeek 默认开启）\n用法: /thinking on|off"
-                            ),
+                                    .to_string()
+                            }
                         }
                     }
                     Some(true) => {
@@ -2761,7 +2764,8 @@ impl LiveCli {
     /// 7. exit(0)—— 新进程检测到标记 → resume session → restore plan → 继续任务。
     fn run_upgrade(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // 1. 置位优雅中断信号(正在执行的 turn 将收尾)。
-        self.upgrade_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.upgrade_signal
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // 2. persist 活跃计划(供新进程恢复)。
         let mut plan_id = None;
@@ -2857,7 +2861,10 @@ impl LiveCli {
         // 1. resume 旧会话(复用现有 resume_session:session_id 是合法 reference)。
         let resumed = self.resume_session(Some(req.session_id.clone()))?;
         if !resumed {
-            eprintln!("[upgrade] resume session '{}' failed; continuing without it", req.session_id);
+            eprintln!(
+                "[upgrade] resume session '{}' failed; continuing without it",
+                req.session_id
+            );
             clear_upgrade_request(&cwd);
             return Ok(false);
         }
@@ -2865,7 +2872,10 @@ impl LiveCli {
         // 2. 恢复活跃计划(若有)。
         let mut restored_plan_id = None;
         if let Some(plan_id) = &req.plan_id {
-            let plan_path = cwd.join(".claw").join("plans").join(format!("{plan_id}.json"));
+            let plan_path = cwd
+                .join(".claw")
+                .join("plans")
+                .join(format!("{plan_id}.json"));
             match runtime::planner::load_plan_artifact(&plan_path) {
                 Ok(plan) => {
                     self.runtime.restore_active_plan(plan);

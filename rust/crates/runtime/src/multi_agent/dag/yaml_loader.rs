@@ -131,8 +131,7 @@ nodes:
 
     #[test]
     fn missing_dir_yields_empty() {
-        let (dags, errors) =
-            load_dag_definitions_with_errors(&Path::new("Z:\\nonexistent-dir-xyz"));
+        let (dags, errors) = load_dag_definitions_with_errors(Path::new("Z:\\nonexistent-dir-xyz"));
         assert!(dags.is_empty());
         assert!(errors.is_empty());
     }

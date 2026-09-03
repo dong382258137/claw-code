@@ -90,7 +90,10 @@ fn log_key_env(log_file: &Option<File>) {
     ] {
         if let Ok(value) = std::env::var(var) {
             if !value.trim().is_empty() {
-                log_out(log_file, &format!("[upgrade-helper] env {var}={}", truncate(&value, 300)));
+                log_out(
+                    log_file,
+                    &format!("[upgrade-helper] env {var}={}", truncate(&value, 300)),
+                );
             }
         }
     }
@@ -125,7 +128,10 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     let log_file = open_upgrade_log(user_cwd);
     log_out(
         &log_file,
-        &format!("[upgrade-helper] 升级助手启动: user_cwd={}", user_cwd.display()),
+        &format!(
+            "[upgrade-helper] 升级助手启动: user_cwd={}",
+            user_cwd.display()
+        ),
     );
     log_key_env(&log_file);
 
@@ -181,7 +187,10 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     let workspace_root = workspace_root_from_user_cwd(user_cwd)
         .or_else(|_| workspace_root_from_exe(&exe))
         .map_err(|err| {
-            log_out(&log_file, &format!("[upgrade-helper] workspace 定位失败: {err}"));
+            log_out(
+                &log_file,
+                &format!("[upgrade-helper] workspace 定位失败: {err}"),
+            );
             err
         })?;
 
@@ -190,8 +199,8 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     //    - exe 在 `target/release`(源码 release 布局) → `--release`,产物已在原位
     //    - 其余位置(`~/.cargo/bin` 部署版) → `--release`,产物在 target/release,
     //      需回拷到 exe 原路径(原文件已被 mv 成 .old,不复制则启动必然失败)。
-    let in_target_debug = exe.starts_with(&workspace_root.join("target").join("debug"));
-    let in_target_release = exe.starts_with(&workspace_root.join("target").join("release"));
+    let in_target_debug = exe.starts_with(workspace_root.join("target").join("debug"));
+    let in_target_release = exe.starts_with(workspace_root.join("target").join("release"));
     let use_release = !in_target_debug;
     let profile_dir = if use_release { "release" } else { "debug" };
     log_out(
@@ -244,7 +253,10 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or("无法获取 exe 文件名")?;
-        let built = workspace_root.join("target").join(profile_dir).join(exe_name);
+        let built = workspace_root
+            .join("target")
+            .join(profile_dir)
+            .join(exe_name);
         if !built.is_file() {
             return Err(format!(
                 "构建产物缺失: {}(预期 profile={})",
@@ -267,7 +279,10 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     // 4. 启动新 exe(user_cwd 为工作目录 → 自动检测标记 → resume 会话)。
     log_out(
         &log_file,
-        &format!("[upgrade-helper] 编译成功,准备启动新进程: {}", exe.display()),
+        &format!(
+            "[upgrade-helper] 编译成功,准备启动新进程: {}",
+            exe.display()
+        ),
     );
     let mut cmd = Command::new(&exe);
     cmd.current_dir(user_cwd);
@@ -290,20 +305,24 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
                     &log_file,
                     "[upgrade-helper] 控制台句柄就绪(CONIN$/CONOUT$),将显式设置新进程 stdio",
                 );
-                let conout2 = conout
-                    .try_clone()
-                    .expect("CONOUT$ 句柄可克隆");
+                let conout2 = conout.try_clone().expect("CONOUT$ 句柄可克隆");
                 cmd.stdin(unsafe { Stdio::from_raw_handle(conin.into_raw_handle()) });
                 cmd.stdout(unsafe { Stdio::from_raw_handle(conout2.into_raw_handle()) });
                 cmd.stderr(unsafe { Stdio::from_raw_handle(conout.into_raw_handle()) });
                 true
             }
             (Err(_), _) => {
-                log_out(&log_file, "[upgrade-helper] CONIN$ 打开失败(环境无有效控制台)");
+                log_out(
+                    &log_file,
+                    "[upgrade-helper] CONIN$ 打开失败(环境无有效控制台)",
+                );
                 false
             }
             (_, Err(_)) => {
-                log_out(&log_file, "[upgrade-helper] CONOUT$ 打开失败(环境无有效控制台)");
+                log_out(
+                    &log_file,
+                    "[upgrade-helper] CONOUT$ 打开失败(环境无有效控制台)",
+                );
                 false
             }
         }
@@ -405,9 +424,7 @@ fn is_rusty_claude_workspace(dir: &Path) -> bool {
 /// 2. 回退:探测 `user_cwd` 的直接子目录(覆盖"cwd=仓库根、workspace 在
 ///    `rust/` 子目录"的布局,如本项目 `D:\claw-code-src` → `D:\claw-code-src\rust`)。
 /// 3. 仍失败则报错,提示需在源码仓库内运行 `/upgrade`。
-fn workspace_root_from_user_cwd(
-    user_cwd: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn workspace_root_from_user_cwd(user_cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut cursor = Some(user_cwd);
     while let Some(dir) = cursor {
         if is_rusty_claude_workspace(dir) {
@@ -437,13 +454,19 @@ mod tests {
     #[test]
     fn backup_path_appends_old() {
         let exe = Path::new(r"C:\rust\target\debug\claw-plus.exe");
-        assert_eq!(backup_path(exe), PathBuf::from(r"C:\rust\target\debug\claw-plus.exe.old"));
+        assert_eq!(
+            backup_path(exe),
+            PathBuf::from(r"C:\rust\target\debug\claw-plus.exe.old")
+        );
     }
 
     #[test]
     fn backup_path_preserves_extensionless_names() {
         let exe = Path::new("/usr/local/bin/claw-plus");
-        assert_eq!(backup_path(exe), PathBuf::from("/usr/local/bin/claw-plus.old"));
+        assert_eq!(
+            backup_path(exe),
+            PathBuf::from("/usr/local/bin/claw-plus.old")
+        );
     }
 
     #[test]
@@ -464,7 +487,11 @@ mod tests {
     fn workspace_root_from_exe_rejects_missing_cargo_toml() {
         // target/debug/exe 上溯 3 层后无 Cargo.toml(如安装到 Program Files)→ 报错。
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("target").join("debug").join("claw-plus.exe");
+        let exe = dir
+            .path()
+            .join("target")
+            .join("debug")
+            .join("claw-plus.exe");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, b"fake exe").unwrap();
 
@@ -480,7 +507,10 @@ mod tests {
         // 在第 3 次 and_then 前耗尽,会落入 Cargo.toml 检查分支。
         let exe = Path::new("claw-plus.exe");
         let err = workspace_root_from_exe(exe).expect_err("should reject shallow path");
-        assert!(err.to_string().contains("无法从 exe 路径推导"), "got: {err}");
+        assert!(
+            err.to_string().contains("无法从 exe 路径推导"),
+            "got: {err}"
+        );
     }
 
     // ---- 2026-09-02 竞态修复:exited 归属校验 ----
@@ -575,11 +605,8 @@ mod tests {
     #[test]
     fn workspace_root_from_user_cwd_errors_when_no_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        let err = workspace_root_from_user_cwd(dir.path())
-            .expect_err("should reject non-workspace dir");
-        assert!(
-            err.to_string().contains("无法从工作目录"),
-            "got: {err}"
-        );
+        let err =
+            workspace_root_from_user_cwd(dir.path()).expect_err("should reject non-workspace dir");
+        assert!(err.to_string().contains("无法从工作目录"), "got: {err}");
     }
 }

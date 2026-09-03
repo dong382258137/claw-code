@@ -189,6 +189,84 @@ impl SystemPromptSplit {
     }
 }
 
+/// P0(轮次感知上下文编译器):system prompt section 的层级标注。
+///
+/// P0 阶段不改变 `build()` 的 section 输出顺序(逐字节等价由测试守护),
+/// 仅按内容语义为每个 section 标注所属层级,供 `build_layers()` 分组提取,
+/// 为 P1 的按层编译做准备。
+///
+/// 归类判定(以实际代码内容为准,与 Spec 的映射出入已在测试注释记录):
+/// - [`Self::InvariantCore`]:身份/行为规范永久段 — Intro、# Output Style、
+///   # System、# Doing tasks、## Execution Style。
+/// - [`Self::StateLayer`]:会话/工作区动态状态段 — ## Persistent Memory
+///   (fixed memory 冻结快照)、## Repository Map、# Environment context、
+///   # Runtime config、# Claude instructions(含 built-in defaults 兜底段,
+///   语义上属项目级指令状态)、# Project context(git 快照)、
+///   ## Available Skills、## MCP Servers、append_sections 注入段。
+/// - [`Self::CapabilityLayer`]:按需能力教程段 — ## Framework Switching
+///   (元认知触发)、## Memory Verification(召回记忆使用协议,纯静态教程)、
+///   ## History & Decisions(Context Recovery,纯静态协议文本,不含动态
+///   状态,故归能力层而非状态层)、## Multi-Agent Orchestration、
+///   ## Agent Subagent Types、## Session Bus、## Worker Lifecycle、
+///   ## Tool Usage Guidance。
+/// - [`Self::Boundary`]:[`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] 结构性标记,
+///   不是内容 section,不属于三层中任何一层;仅用于 `build()` 原序还原,
+///   `build_layers()` 分组时跳过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionTier {
+    /// 不变核:身份/行为规范(Intro/System/Doing tasks/Execution Style 等
+    /// 跨项目、跨会话恒定的永久段)。
+    InvariantCore,
+    /// 状态层:会话/工作区状态(git 快照、环境信息、技能/MCP 目录、
+    /// persistent memory 冻结快照等动态段)。
+    StateLayer,
+    /// 能力层:按需能力教程(Framework Switching 元认知段、多 Agent 编排、
+    /// 子智能体、Session Bus、Worker 生命周期、工具使用引导等)。
+    CapabilityLayer,
+    /// 动态边界标记(`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`)。结构性条目,
+    /// 不参与三层分组。
+    Boundary,
+}
+
+/// P0:system prompt 的三层视图(不变核/状态层/能力层)。
+///
+/// 由 [`SystemPromptBuilder::build_layers`] 产出。每层文本是该层全部
+/// section 按原 `build()` 中的相对顺序以 `\n\n` 拼接的产物(与
+/// `render()` / `SystemPromptSplit::render` 的 section 间隔一致)。
+/// 三层内部各自保序,但 P0 不改变 `build()` 的整体输出顺序 —— 三层是
+/// 交错出现在原 prompt 中的,按层提取仅供 P1 按需编译使用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptLayers {
+    /// 不变核:身份/行为规范(Intro/System/Doing tasks/Execution Style 等)。
+    pub invariant_core: String,
+    /// 状态层:会话/工作区状态(环境信息、git 快照、技能/MCP 目录等)。
+    pub state_layer: String,
+    /// 能力层:按需能力教程(Framework Switching、多 Agent 编排、
+    /// 工具使用引导等)。
+    pub capability_layer: String,
+}
+
+/// 内部:带层级标注的单个 system prompt 片段。
+///
+/// `build()` 与 `build_layers()` 共享同一片段序列(由
+/// [`SystemPromptBuilder::collect_fragments`] 产出),避免两套 section
+/// 生成逻辑漂移导致等价性破坏。`content` 对 Boundary 层级即
+/// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] 标记文本本身。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptFragment {
+    tier: SectionTier,
+    content: String,
+}
+
+impl PromptFragment {
+    fn new(tier: SectionTier, content: impl Into<String>) -> Self {
+        Self {
+            tier,
+            content: content.into(),
+        }
+    }
+}
+
 /// Human-readable default frontier model name embedded into generated prompts.
 pub const FRONTIER_MODEL_NAME: &str = "DeepSeek V4 Pro";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
@@ -431,39 +509,138 @@ impl SystemPromptBuilder {
 
     #[must_use]
     pub fn build(&self) -> Vec<String> {
-        let mut sections = Vec::new();
-        sections.push(get_simple_intro_section(self.output_style_name.is_some()));
-        if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
-            sections.push(format!("# Output Style: {name}\n{prompt}"));
+        // P0(轮次感知上下文编译器):build() 与 build_layers() 共享同一
+        // section 片段序列(collect_fragments),按原序拼接片段文本。
+        // 片段顺序与重构前的 push 顺序逐字节一致(等价性由
+        // build_matches_original_section_sequence 测试守护)。
+        self.collect_fragments()
+            .into_iter()
+            .map(|fragment| fragment.content)
+            .collect()
+    }
+
+    /// P0:按 [`SectionTier`] 归类组装 system prompt 的三层视图。
+    ///
+    /// 与 `build()` 共享同一 section 片段序列(`collect_fragments`),
+    /// 仅分组方式不同:按层级分组后,层内保持原 `build()` 中的相对顺序,
+    /// 以 `\n\n` 拼接(与 `render()` / `SystemPromptSplit::render` 的
+    /// section 间隔一致)。`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 为结构性
+    /// 标记(SectionTier::Boundary),不归属三层中任何一层,不出现
+    /// 在三层文本中。
+    ///
+    /// P0 不改变 `build()` 的整体输出顺序 —— 三层在原 prompt 中是交错
+    /// 排列的,本方法仅做按层提取,供 P1 按需编译使用。
+    #[must_use]
+    pub fn build_layers(&self) -> PromptLayers {
+        let mut invariant_core: Vec<String> = Vec::new();
+        let mut state_layer: Vec<String> = Vec::new();
+        let mut capability_layer: Vec<String> = Vec::new();
+        for fragment in self.collect_fragments() {
+            let PromptFragment { tier, content } = fragment;
+            match tier {
+                SectionTier::InvariantCore => invariant_core.push(content),
+                SectionTier::StateLayer => state_layer.push(content),
+                SectionTier::CapabilityLayer => capability_layer.push(content),
+                // 结构性标记不参与三层分组。
+                SectionTier::Boundary => {}
+            }
         }
-        sections.push(get_simple_system_section());
-        sections.push(get_simple_doing_tasks_section());
+        PromptLayers {
+            invariant_core: invariant_core.join("\n\n"),
+            state_layer: state_layer.join("\n\n"),
+            capability_layer: capability_layer.join("\n\n"),
+        }
+    }
+
+    /// 按重构前 `build()` 的 push 顺序生成全部 section 片段(带层级标注)。
+    ///
+    /// 这是 `build()` 与 `build_layers()` 的单一事实来源:片段顺序、条件
+    /// 注入分支(空 section 跳过等)与重构前的 build() 完全一致,每个内容
+    /// section 恰好标注一个层级,Boundary 层级对应
+    /// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] 标记。
+    fn collect_fragments(&self) -> Vec<PromptFragment> {
+        let mut fragments = Vec::new();
+        // ── 不变核 InvariantCore:身份/行为规范永久段 ──
+        fragments.push(PromptFragment::new(
+            SectionTier::InvariantCore,
+            get_simple_intro_section(self.output_style_name.is_some()),
+        ));
+        if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
+            fragments.push(PromptFragment::new(
+                SectionTier::InvariantCore,
+                format!("# Output Style: {name}\n{prompt}"),
+            ));
+        }
+        fragments.push(PromptFragment::new(
+            SectionTier::InvariantCore,
+            get_simple_system_section(),
+        ));
+        fragments.push(PromptFragment::new(
+            SectionTier::InvariantCore,
+            get_simple_doing_tasks_section(),
+        ));
         // 执行风格(A8):恒定简洁要求从前缀 static 区注入(命中缓存),不再
         // 每轮在尾部冻结槽位块重发(按未命中计费)。
-        sections.push(get_execution_style_section());
+        fragments.push(PromptFragment::new(
+            SectionTier::InvariantCore,
+            get_execution_style_section(),
+        ));
+        // ── 能力层 CapabilityLayer:按需能力教程段 ──
         // 破局提示词段：元认知触发器，紧随 # Executing actions with care 之后，
         // 与 # Doing tasks 形成"如何做"→"何时停"的对照。
-        sections.push(get_framework_switching_section());
-        sections.push(get_memory_verification_section());
-        sections.push(get_context_recovery_section());
+        fragments.push(PromptFragment::new(
+            SectionTier::CapabilityLayer,
+            get_framework_switching_section(),
+        ));
+        // Memory Verification:召回记忆使用协议(纯静态教程,无动态状态)。
+        fragments.push(PromptFragment::new(
+            SectionTier::CapabilityLayer,
+            get_memory_verification_section(),
+        ));
+        // Context Recovery:历史检索/决策日志教程 —— 文本为纯静态协议,
+        // 不含动态状态(动态的召回内容在 conversation.rs 尾部注入),
+        // 故归能力层而非状态层。
+        fragments.push(PromptFragment::new(
+            SectionTier::CapabilityLayer,
+            get_context_recovery_section(),
+        ));
         // ── P0+P1: 多 Agent 编排工具教程区（类 Decision Experience 模式）──
         // P0: 编排四件套 + 三种模式 + DAG 工作流
-        sections.push(get_multi_agent_orchestration_section());
+        fragments.push(PromptFragment::new(
+            SectionTier::CapabilityLayer,
+            get_multi_agent_orchestration_section(),
+        ));
         // P0: Agent 子智能体类型指南（Explore / Plan / Verification）
-        sections.push(get_agent_subagent_types_section());
+        fragments.push(PromptFragment::new(
+            SectionTier::CapabilityLayer,
+            get_agent_subagent_types_section(),
+        ));
         // P0: Session Bus 会话总线工具教程区（bus_list / bus_send / bus_watch）
-        sections.push(get_session_bus_section());
+        fragments.push(PromptFragment::new(
+            SectionTier::CapabilityLayer,
+            get_session_bus_section(),
+        ));
         // P1: Worker 生命周期（9 步状态机）
-        sections.push(get_worker_lifecycle_section());
+        fragments.push(PromptFragment::new(
+            SectionTier::CapabilityLayer,
+            get_worker_lifecycle_section(),
+        ));
         // 工具使用引导（WebSearch 优先 / 知识新鲜度 / ToolSearch / TaskUpdate）
-        sections.push(get_tool_usage_guidance_section());
+        fragments.push(PromptFragment::new(
+            SectionTier::CapabilityLayer,
+            get_tool_usage_guidance_section(),
+        ));
+        // ── 状态层 StateLayer:会话/工作区动态状态段 ──
         if let Some(memory) = &self.persistent_memory {
-            sections.push(render_persistent_memory_section(memory));
+            fragments.push(PromptFragment::new(
+                SectionTier::StateLayer,
+                render_persistent_memory_section(memory),
+            ));
         }
         if let Some(map) = &self.repomap_rendered {
             let section = render_repomap_section(map);
             if !section.is_empty() {
-                sections.push(section);
+                fragments.push(PromptFragment::new(SectionTier::StateLayer, section));
             }
         }
         // 缓存优化：以下三个 section 在 session 内字节完全稳定（build()
@@ -477,31 +654,49 @@ impl SystemPromptBuilder {
         // 真正的 dynamic 内容（per-turn 变化）在 conversation.rs 中通过
         // dynamic_sections.push() 追加：NOTEBOOK、语义召回、PlanArtifact、
         // remediation 等。
-        sections.push(self.environment_section());
+        fragments.push(PromptFragment::new(
+            SectionTier::StateLayer,
+            self.environment_section(),
+        ));
         if let Some(config) = &self.config {
-            sections.push(render_config_section(config));
+            fragments.push(PromptFragment::new(
+                SectionTier::StateLayer,
+                render_config_section(config),
+            ));
         }
         if let Some(project_context) = &self.project_context {
             if !project_context.instruction_files.is_empty() {
-                sections.push(render_instruction_files(&project_context.instruction_files));
+                fragments.push(PromptFragment::new(
+                    SectionTier::StateLayer,
+                    render_instruction_files(&project_context.instruction_files),
+                ));
             } else {
                 // 分层兜底：无 CLAUDE.md 时注入内存态默认指令段。
                 // 不落盘，避免目录污染和误检测导致的错误指令持久化。
                 // 用户可通过 `claw init` 生成物理 CLAUDE.md 覆盖此默认段。
-                sections.push(get_default_project_instructions());
+                fragments.push(PromptFragment::new(
+                    SectionTier::StateLayer,
+                    get_default_project_instructions(),
+                ));
             }
         } else {
             // 无 project_context（极端情况，如测试环境）同样注入默认指令。
-            sections.push(get_default_project_instructions());
+            fragments.push(PromptFragment::new(
+                SectionTier::StateLayer,
+                get_default_project_instructions(),
+            ));
         }
-        sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
+        fragments.push(PromptFragment::new(
+            SectionTier::Boundary,
+            SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        ));
         // 项目 git 快照留在 dynamic：语义上属于"项目快照"（git status/
         // commits），虽 build() 时一次性捕获，但将来可能支持 turn 间刷新。
         // 渲染为空(无 instruction 文件且无 git 信息)时跳过,避免孤立标题。
         if let Some(project_context) = &self.project_context {
             let section = render_project_context(project_context);
             if !section.is_empty() {
-                sections.push(section);
+                fragments.push(PromptFragment::new(SectionTier::StateLayer, section));
             }
         }
         // Skill catalog: pre-rendered one-line-per-skill summary letting the
@@ -511,7 +706,7 @@ impl SystemPromptBuilder {
         if let Some(catalog) = &self.skill_catalog {
             let section = render_skill_catalog_section(catalog);
             if !section.is_empty() {
-                sections.push(section);
+                fragments.push(PromptFragment::new(SectionTier::StateLayer, section));
             }
         }
         // MCP server overview: one line per configured server (name +
@@ -521,11 +716,17 @@ impl SystemPromptBuilder {
         if let Some(catalog) = &self.mcp_catalog {
             let section = render_mcp_catalog_section(catalog);
             if !section.is_empty() {
-                sections.push(section);
+                fragments.push(PromptFragment::new(SectionTier::StateLayer, section));
             }
         }
-        sections.extend(self.append_sections.iter().cloned());
-        sections
+        // append_sections:调用方注入的动态段(如 task_state 等),归状态层。
+        for section in &self.append_sections {
+            fragments.push(PromptFragment::new(
+                SectionTier::StateLayer,
+                section.clone(),
+            ));
+        }
+        fragments
     }
 
     /// Build the system prompt split at the dynamic boundary.
@@ -619,6 +820,40 @@ impl SystemPromptBuilder {
         lines.extend(prepend_bullets(bullets));
         lines.join("\n")
     }
+}
+
+/// P1(轮次感知上下文编译器 · Task 3):能力层 section 的首行标题前缀表。
+///
+/// 与 [`SectionTier::CapabilityLayer`] 的归类完全一致(见
+/// [`SystemPromptBuilder::collect_fragments`] 中每个 CapabilityLayer 片段)。
+/// conversation.rs 请求构造在 Trivial 档用 [`is_capability_layer_section`]
+/// 从**已渲染**的 section 文本过滤能力层 —— 该表是能力层 section 标题的
+/// 单一事实来源,避免判定逻辑与 builder 标注两处漂移。
+pub const CAPABILITY_LAYER_HEADING_PREFIXES: &[&str] = &[
+    "## Framework Switching",
+    "## Memory Verification",
+    "## History & Decisions",
+    "## Multi-Agent Orchestration",
+    "## Session Bus",
+    "## Agent Subagent Types",
+    "## Worker Lifecycle",
+    "## Tool Usage Guidance",
+];
+
+/// P1:判定一个已渲染的 system prompt section 文本是否属于能力层。
+///
+/// 基于首行标题前缀匹配(每个能力层 section 一律以其唯一标题开头,
+/// 见 [`CAPABILITY_LAYER_HEADING_PREFIXES`]);其余(不变核/状态层/
+/// dynamic boundary 标记)一律返回 `false`。
+///
+/// 用途:Trivial 档请求构造时从 `Vec<String>` sections 过滤能力层,
+/// 只注入「不变核 + 状态层」。判定与 builder 标注的一致性由
+/// `capability_layer_heading_prefixes_match_fragment_tiers` 测试守护。
+#[must_use]
+pub fn is_capability_layer_section(section: &str) -> bool {
+    CAPABILITY_LAYER_HEADING_PREFIXES
+        .iter()
+        .any(|heading| section.starts_with(heading))
 }
 
 /// Formats each item as an indented bullet for prompt sections.
@@ -1076,6 +1311,10 @@ fn get_simple_doing_tasks_section() -> String {
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
         "On Windows, prefer built-in tools (read_file, write_file, edit_file, replace_lines) for file I/O — they handle UTF-8 correctly. Only when using bash/PowerShell commands on files with non-ASCII content, set `$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8` first or pipe through `python -c \\\"import sys; sys.stdout.reconfigure(encoding='utf-8')\\\"`.".to_string(),
         "Reconnaissance-before-execution: before expensive commands (large grep, recursive ls, cargo build, git diff), do a lightweight check first (e.g. `ls -la`, `du -sh`, `git diff --stat`). Restrict scope with glob/subdirectory. This prevents multi-minute hangs.".to_string(),
+        // P2(充分性契约 · Task 4):一对对称同级指令 —— 取证义务与停止条件
+        // 并列同强度(同为祈使句),避免"只强调取证、不强调收手"导致侦察过度。
+        "「事实需要证据」:对未知事实的断言必须基于检索/读文件等证据来源,禁止凭记忆猜测。".to_string(),
+        "「充分即停」:发起只读侦察前,可用 `[SUFFICIENCY: <源1>, <源2>, ...]` 显式声明停止判据;判据一旦满足(runtime 会提示),继续追加只读侦察是错误的,应基于现有信息直接作答。".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())
@@ -1652,11 +1891,20 @@ pub fn render_mcp_catalog_section(catalog: &str) -> String {
 mod tests {
     use super::{
         collapse_blank_lines, describe_instruction_file, display_context_path,
-        normalize_instruction_content, render_instruction_content, render_instruction_files,
-        render_mcp_catalog_section, truncate_instruction_content, ContextFile, ModelFamilyIdentity,
-        ProjectContext, SystemPromptBuilder, SystemPromptSplit, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        get_agent_subagent_types_section, get_context_recovery_section,
+        get_execution_style_section, get_framework_switching_section,
+        get_memory_verification_section, get_multi_agent_orchestration_section,
+        get_session_bus_section, get_simple_doing_tasks_section, get_simple_intro_section,
+        get_simple_system_section, get_tool_usage_guidance_section, get_worker_lifecycle_section,
+        is_capability_layer_section, normalize_instruction_content, render_config_section,
+        render_instruction_content, render_instruction_files, render_mcp_catalog_section,
+        render_persistent_memory_section, render_project_context, render_repomap_section,
+        render_skill_catalog_section, truncate_instruction_content, ContextFile,
+        ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier, SystemPromptBuilder,
+        SystemPromptSplit, CAPABILITY_LAYER_HEADING_PREFIXES, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
-    use crate::config::ConfigLoader;
+    use crate::config::{ConfigLoader, RuntimeConfig};
+    use crate::memory::PersistentMemory;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2823,6 +3071,338 @@ mod tests {
         let rendered = render_mcp_catalog_section("- home: stdio, connected");
         assert!(rendered.starts_with("## MCP Servers"));
         assert!(rendered.contains("- home: stdio, connected"));
+    }
+
+    // ── P0 轮次感知上下文编译器:三层分层重构测试 ──
+
+    /// P0 测试共用:含各类可选段的代表性 builder fixture。
+    ///
+    /// 覆盖的可选段:output style / os / shell / model family /
+    /// project_context(指令文件 + git 快照)/ runtime config /
+    /// persistent memory / repomap / skill catalog / mcp catalog /
+    /// append_sections。
+    struct RepresentativePromptFixture {
+        root: PathBuf,
+        project_context: ProjectContext,
+        config: RuntimeConfig,
+        memory: PersistentMemory,
+    }
+
+    impl RepresentativePromptFixture {
+        fn new() -> Self {
+            let root = temp_dir();
+            fs::create_dir_all(root.join(".claw")).expect("claw dir");
+            fs::write(root.join("CLAUDE.md"), "Project rules").expect("write CLAUDE.md");
+            fs::write(
+                root.join(".claw").join("settings.json"),
+                r#"{"permissionMode":"acceptEdits"}"#,
+            )
+            .expect("write settings");
+            let config = ConfigLoader::new(&root, root.join("missing-home"))
+                .load()
+                .expect("config should load");
+            let project_context = ProjectContext {
+                cwd: root.clone(),
+                current_date: "2026-09-03".to_string(),
+                git_status: Some("## main\n M src/lib.rs".to_string()),
+                git_context: None,
+                instruction_files: vec![ContextFile {
+                    path: root.join("CLAUDE.md"),
+                    content: "Project rules".to_string(),
+                }],
+            };
+            let memory = PersistentMemory::empty(root.join("memory.md"));
+            Self {
+                root,
+                project_context,
+                config,
+                memory,
+            }
+        }
+
+        fn builder(&self) -> SystemPromptBuilder {
+            SystemPromptBuilder::new()
+                .with_output_style("Concise", "Prefer short answers.")
+                .with_os("linux", "6.8")
+                .with_shell("bash")
+                .with_model_family(ModelFamilyIdentity::DeepSeek)
+                .with_project_context(self.project_context.clone())
+                .with_runtime_config(self.config.clone())
+                .with_persistent_memory(self.memory.clone())
+                .with_repomap("src/main.rs (refs: 5)\n  fn main")
+                .with_skill_catalog("- alpha-skill: First skill\n- beta-skill: Second skill")
+                .with_mcp_catalog("- home: stdio, connected")
+                .append_section("# Appended\nextra")
+        }
+    }
+
+    impl Drop for RepresentativePromptFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// 测试 A(逐字节等价):重构后的 `build()` 输出必须与"重构前的
+    /// section push 顺序"完全一致。
+    ///
+    /// 等价性基准:用未改动的各 section 渲染函数,按重构前 `build()` 的
+    /// push 顺序(现 `collect_fragments`)手工拼出预期序列 —— 任何顺序
+    /// 调整、条件分支变化、层级重构引入的改动都会在此暴露。
+    /// 覆盖全部可选段(见 `RepresentativePromptFixture`)。
+    #[test]
+    fn build_matches_original_section_sequence() {
+        let fixture = RepresentativePromptFixture::new();
+        let builder = fixture.builder();
+
+        let expected = vec![
+            get_simple_intro_section(true),
+            "# Output Style: Concise\nPrefer short answers.".to_string(),
+            get_simple_system_section(),
+            get_simple_doing_tasks_section(),
+            get_execution_style_section(),
+            get_framework_switching_section(),
+            get_memory_verification_section(),
+            get_context_recovery_section(),
+            get_multi_agent_orchestration_section(),
+            get_agent_subagent_types_section(),
+            get_session_bus_section(),
+            get_worker_lifecycle_section(),
+            get_tool_usage_guidance_section(),
+            render_persistent_memory_section(&fixture.memory),
+            render_repomap_section("src/main.rs (refs: 5)\n  fn main"),
+            builder.environment_section(),
+            render_config_section(&fixture.config),
+            render_instruction_files(&fixture.project_context.instruction_files),
+            SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            render_project_context(&fixture.project_context),
+            render_skill_catalog_section("- alpha-skill: First skill\n- beta-skill: Second skill"),
+            render_mcp_catalog_section("- home: stdio, connected"),
+            "# Appended\nextra".to_string(),
+        ];
+
+        assert_eq!(
+            builder.build(),
+            expected,
+            "P0 重构后 build() 必须与重构前 section 序列逐字节等价"
+        );
+    }
+
+    /// 测试 A(分组覆盖):`build_layers()` 三段(按层序:不变核→状态→
+    /// 能力)的内容总和恰好覆盖 `build()` 的全部内容 section(多集等价,
+    /// 无丢失、无重复),且每层文本等于该层 section 按原相对顺序以
+    /// `\n\n` 拼接(与 `render()` / `SystemPromptSplit::render` 的
+    /// section 间隔一致)。
+    #[test]
+    fn build_layers_covers_all_sections_without_loss_or_duplication() {
+        let fixture = RepresentativePromptFixture::new();
+        let builder = fixture.builder();
+        let layers = builder.build_layers();
+
+        // (1) 按层序分组拼接的 section 多集 == build() 的全部内容 section
+        //     多集(排除结构性 Boundary 标记)。
+        let mut built_sorted: Vec<String> = builder
+            .build()
+            .into_iter()
+            .filter(|section| section.as_str() != SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .collect();
+        built_sorted.sort();
+        let layer_sections = |tier: SectionTier| -> Vec<String> {
+            builder
+                .collect_fragments()
+                .into_iter()
+                .filter(|fragment| fragment.tier == tier)
+                .map(|fragment| fragment.content)
+                .collect::<Vec<_>>()
+        };
+        let mut grouped: Vec<String> = Vec::new();
+        for tier in [
+            SectionTier::InvariantCore,
+            SectionTier::StateLayer,
+            SectionTier::CapabilityLayer,
+        ] {
+            grouped.extend(layer_sections(tier));
+        }
+        grouped.sort();
+        assert_eq!(
+            grouped, built_sorted,
+            "三层分组应无丢失、无重复地覆盖 build() 的全部内容 section"
+        );
+
+        // (2) 每层文本 == 该层 section(按原相对顺序)以 \n\n 拼接。
+        assert_eq!(
+            layers.invariant_core,
+            layer_sections(SectionTier::InvariantCore).join("\n\n")
+        );
+        assert_eq!(
+            layers.state_layer,
+            layer_sections(SectionTier::StateLayer).join("\n\n")
+        );
+        assert_eq!(
+            layers.capability_layer,
+            layer_sections(SectionTier::CapabilityLayer).join("\n\n")
+        );
+
+        // (3) 三个内容层级均非空。
+        assert!(!layers.invariant_core.is_empty());
+        assert!(!layers.state_layer.is_empty());
+        assert!(!layers.capability_layer.is_empty());
+    }
+
+    /// 测试 B(层级标注覆盖):遍历 section 片段列表,每个内容 section
+    /// 恰好标注一个层级(结构性 Boundary 标记恰好占位一次),三个内容
+    /// 层级都非空,且关键 section 的层级归属与归类表一致。
+    ///
+    /// 归类表(与 `SectionTier` 文档一致,以实际代码内容判断;
+    /// 与任务描述的出入已在此记录):
+    /// - 不变核:Intro / # Output Style / # System / # Doing tasks /
+    ///   ## Execution Style(交互/输出规范类永久段)。
+    /// - 状态层:## Persistent Memory(fixed memory 冻结快照)/
+    ///   ## Repository Map / # Environment context / # Runtime config /
+    ///   # Claude instructions(含 built-in defaults 兜底段 — 项目级
+    ///   指令状态,随工作区变化)/ # Project context(git 快照)/
+    ///   ## Available Skills / ## MCP Servers / append_sections 注入段。
+    /// - 能力层:## Framework Switching(元认知触发)/
+    ///   ## Memory Verification(召回记忆使用协议,纯静态教程)/
+    ///   ## History & Decisions(Context Recovery — 经判断为纯静态协议
+    ///   文本,不含动态状态,归能力层而非状态层)/
+    ///   ## Multi-Agent Orchestration / ## Agent Subagent Types /
+    ///   ## Session Bus / ## Worker Lifecycle / ## Tool Usage Guidance。
+    #[test]
+    fn every_section_fragment_has_exactly_one_tier_and_all_tiers_non_empty() {
+        let fixture = RepresentativePromptFixture::new();
+        let builder = fixture.builder();
+        let fragments = builder.collect_fragments();
+
+        let mut core_count = 0usize;
+        let mut state_count = 0usize;
+        let mut capability_count = 0usize;
+        let mut boundary_count = 0usize;
+        for PromptFragment { tier, content } in &fragments {
+            assert!(!content.is_empty(), "section 内容不应为空");
+            match tier {
+                SectionTier::InvariantCore => core_count += 1,
+                SectionTier::StateLayer => state_count += 1,
+                SectionTier::CapabilityLayer => capability_count += 1,
+                SectionTier::Boundary => boundary_count += 1,
+            }
+        }
+        // 结构性 Boundary 标记恰好占位一次(不属于三层)。
+        assert_eq!(boundary_count, 1, "Boundary 标记应恰好出现一次");
+        // 三个内容层级均非空。
+        assert!(
+            core_count >= 4,
+            "不变核至少含 intro/output style/system/doing/execution,实际 {core_count}"
+        );
+        assert!(
+            state_count >= 5,
+            "状态层至少含 memory/repomap/environment/config/instructions/project/catalog/appended,实际 {state_count}"
+        );
+        assert!(
+            capability_count >= 8,
+            "能力层至少含 framework/memory-verification/context-recovery/multi-agent/subagent/session-bus/worker/tool-guidance,实际 {capability_count}"
+        );
+
+        // 关键 section 的层级归属抽查(按标题前缀定位)。
+        let tier_of = |prefix: &str| -> SectionTier {
+            fragments
+                .iter()
+                .find(|fragment| fragment.content.starts_with(prefix))
+                .map_or_else(
+                    || panic!("未找到以 {prefix} 开头的 section"),
+                    |fragment| fragment.tier,
+                )
+        };
+        // 不变核:身份/行为规范永久段。
+        assert_eq!(
+            tier_of("You are an interactive agent"),
+            SectionTier::InvariantCore
+        );
+        assert_eq!(tier_of("# Output Style"), SectionTier::InvariantCore);
+        assert_eq!(tier_of("# System"), SectionTier::InvariantCore);
+        assert_eq!(tier_of("# Doing tasks"), SectionTier::InvariantCore);
+        assert_eq!(tier_of("## Execution Style"), SectionTier::InvariantCore);
+        // 能力层:按需能力教程段。
+        assert_eq!(
+            tier_of("## Framework Switching"),
+            SectionTier::CapabilityLayer
+        );
+        assert_eq!(
+            tier_of("## Memory Verification"),
+            SectionTier::CapabilityLayer
+        );
+        assert_eq!(
+            tier_of("## History & Decisions"),
+            SectionTier::CapabilityLayer
+        );
+        assert_eq!(
+            tier_of("## Multi-Agent Orchestration"),
+            SectionTier::CapabilityLayer
+        );
+        assert_eq!(
+            tier_of("## Agent Subagent Types"),
+            SectionTier::CapabilityLayer
+        );
+        assert_eq!(tier_of("## Session Bus"), SectionTier::CapabilityLayer);
+        assert_eq!(tier_of("## Worker Lifecycle"), SectionTier::CapabilityLayer);
+        assert_eq!(
+            tier_of("## Tool Usage Guidance"),
+            SectionTier::CapabilityLayer
+        );
+        // 状态层:会话/工作区动态状态段。
+        assert_eq!(tier_of("# Persistent Memory"), SectionTier::StateLayer);
+        assert_eq!(tier_of("## Repository Map"), SectionTier::StateLayer);
+        assert_eq!(tier_of("# Environment context"), SectionTier::StateLayer);
+        assert_eq!(tier_of("# Runtime config"), SectionTier::StateLayer);
+        assert_eq!(tier_of("# Claude instructions"), SectionTier::StateLayer);
+        assert_eq!(tier_of("# Project context"), SectionTier::StateLayer);
+        assert_eq!(tier_of("## Available Skills"), SectionTier::StateLayer);
+        assert_eq!(tier_of("## MCP Servers"), SectionTier::StateLayer);
+        assert_eq!(tier_of("# Appended"), SectionTier::StateLayer);
+    }
+
+    /// Task 3 守护:文本判定 [`is_capability_layer_section`] 必须与
+    /// builder 的 [`SectionTier::CapabilityLayer`] 标注**完全一致** ——
+    /// 遍历全部片段,`is_capability_layer_section(content)`
+    /// 当且仅当 `tier == CapabilityLayer`。防止 conversation.rs 的
+    /// Trivial 档裁剪(基于已渲染文本)与 prompt.rs 的层级标注漂移。
+    #[test]
+    fn capability_layer_heading_prefixes_match_fragment_tiers() {
+        let fixture = RepresentativePromptFixture::new();
+        let builder = fixture.builder();
+        for fragment in builder.collect_fragments() {
+            if fragment.tier == SectionTier::Boundary {
+                continue;
+            }
+            assert_eq!(
+                is_capability_layer_section(&fragment.content),
+                fragment.tier == SectionTier::CapabilityLayer,
+                "section 文本判定与层级标注不一致: tier={:?} content_prefix={:?}",
+                fragment.tier,
+                fragment
+                    .content
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(48)
+                    .collect::<String>()
+            );
+        }
+    }
+
+    /// Task 3 守护:前缀表无孤儿条目 —— 每个 heading 前缀都能在真实
+    /// `build()` 产出中命中一个能力层 section(删改能力层 section 时
+    /// 必须同步更新 [`CAPABILITY_LAYER_HEADING_PREFIXES`],否则此处失败)。
+    #[test]
+    fn capability_layer_heading_prefixes_all_hit_real_sections() {
+        let fixture = RepresentativePromptFixture::new();
+        let sections = fixture.builder().build();
+        for heading in CAPABILITY_LAYER_HEADING_PREFIXES {
+            assert!(
+                sections.iter().any(|section| section.starts_with(heading)),
+                "前缀 {heading:?} 未命中任何真实 section —— 需同步前缀表"
+            );
+        }
     }
 }
 

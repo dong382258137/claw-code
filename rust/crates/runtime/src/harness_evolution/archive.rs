@@ -343,8 +343,7 @@ impl HarnessArchive {
                 continue;
             }
             // Jaccard 词集相似度 ≥ 阈值:同工具内相似失败即关联。
-            if jaccard_similarity(&edit.pathology, decision_signature)
-                < PATHOLOGY_JACCARD_THRESHOLD
+            if jaccard_similarity(&edit.pathology, decision_signature) < PATHOLOGY_JACCARD_THRESHOLD
             {
                 continue;
             }
@@ -658,7 +657,12 @@ mod tests {
         let dir = tmp_dir("mvp_c2_confirmed");
         let archive = HarnessArchive::open(&dir).expect("open");
         archive
-            .add_candidate(sample_edit("e1", "edit_file: old_string not found", "rule c1", 1))
+            .add_candidate(sample_edit(
+                "e1",
+                "edit_file: old_string not found",
+                "rule c1",
+                1,
+            ))
             .expect("add");
 
         // decision_signature 与 pathology 同工具、内容相似 → 应匹配。
@@ -698,7 +702,12 @@ mod tests {
         let dir = tmp_dir("mvp_c2_cross_tool");
         let archive = HarnessArchive::open(&dir).expect("open");
         archive
-            .add_candidate(sample_edit("e1", "edit_file: old_string not found", "rule c1", 1))
+            .add_candidate(sample_edit(
+                "e1",
+                "edit_file: old_string not found",
+                "rule c1",
+                1,
+            ))
             .expect("add");
 
         // 不同工具前缀(bash vs edit_file)→ 不关联。
@@ -757,8 +766,14 @@ mod tests {
 
     #[test]
     fn extract_tool_prefix_splits_on_colon() {
-        assert_eq!(extract_tool_prefix("edit_file: old_string not found"), "edit_file");
+        assert_eq!(
+            extract_tool_prefix("edit_file: old_string not found"),
+            "edit_file"
+        );
         assert_eq!(extract_tool_prefix("bash"), "bash");
-        assert_eq!(extract_tool_prefix("grep_search: no matches"), "grep_search");
+        assert_eq!(
+            extract_tool_prefix("grep_search: no matches"),
+            "grep_search"
+        );
     }
 }

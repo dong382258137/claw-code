@@ -14,7 +14,6 @@
 //!   stable across turns within a single session.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -340,8 +339,6 @@ impl PersistentMemory {
         // Step 4.x:注入全局 embedding provider(若可用),使 semantic_recall
         // 自动使用向量搜索而非退化为 keyword。
         if let Some(provider) = crate::build_embedding_provider() {
-            let provider: Arc<dyn crate::memory_semantic::EmbeddingProvider + Send + Sync> =
-                Arc::from(provider);
             let mut recaller =
                 std::mem::take(&mut memory.semantic).with_embedding_provider(provider.clone());
             // 语义记忆接线:load 时批量预计算全部 entry 的向量。

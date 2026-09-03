@@ -268,6 +268,9 @@ mod dag_input {
         /// 能力分级:analyze / read-only / execute(缺省 execute,保证节点可用工具)。
         #[serde(default)]
         pub capability: Option<SubagentCapability>,
+        /// 多轮 tool call 循环上限覆盖(缺省由能力级决定,即 None)。
+        #[serde(default)]
+        pub max_iterations: Option<usize>,
     }
 
     /// 校验并构造 `Dag`,供 `dag_define` 工具调用。
@@ -329,6 +332,7 @@ mod dag_input {
                 mode: n.mode.unwrap_or(CoordinationMode::Fork),
                 retry_policy: Default::default(),
                 capability: n.capability.unwrap_or(SubagentCapability::Execute),
+                max_iterations: n.max_iterations,
             })
             .collect();
 
@@ -356,6 +360,7 @@ mod dag_input_tests {
                     max_retries: None,
                     mode: None,
                     capability: None,
+                    max_iterations: None,
                 },
                 DagNodeDefine {
                     id: "implement".to_string(),
@@ -367,6 +372,7 @@ mod dag_input_tests {
                     max_retries: Some(3),
                     mode: None,
                     capability: Some(crate::multi_agent::SubagentCapability::Execute),
+                    max_iterations: None,
                 },
             ],
         };
@@ -414,6 +420,7 @@ mod dag_input_tests {
                 max_retries: None,
                 mode: None,
                 capability: None,
+                max_iterations: None,
             }],
         };
         let err = build_dag_from_define(input).expect_err("should reject empty dag_id");
@@ -446,6 +453,7 @@ mod dag_input_tests {
                 max_retries: None,
                 mode: None,
                 capability: None,
+                max_iterations: None,
             }],
         };
         let err = build_dag_from_define(input).expect_err("should reject unknown dependency");
@@ -467,6 +475,7 @@ mod dag_input_tests {
                 max_retries: None,
                 mode: None,
                 capability: None,
+                max_iterations: None,
             }],
         };
         let dag = build_dag_from_define(input).expect("should build");

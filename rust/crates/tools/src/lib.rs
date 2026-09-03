@@ -596,11 +596,11 @@ impl GlobalToolRegistry {
     /// 仅在渐进模式(`enabled_overlay = Some`)下生效;全量模式下为空操作。
     /// 返回该工具是否确实存在(存在才计入激活集,避免噪音)。
     pub fn activate_tool(&mut self, name: &str) -> bool {
-        let exists = self
-            .runtime_tools
-            .iter()
-            .any(|t| t.name == name)
-            || self.plugin_tools.iter().any(|t| t.definition().name == name)
+        let exists = self.runtime_tools.iter().any(|t| t.name == name)
+            || self
+                .plugin_tools
+                .iter()
+                .any(|t| t.definition().name == name)
             || mvp_tool_specs().iter().any(|s| s.name == name);
         if let Some(overlay) = &mut self.enabled_overlay {
             if exists {
@@ -693,9 +693,8 @@ impl GlobalToolRegistry {
         let is_core = |name: &str| core_tool_names().contains(&name);
         let allowed = |name: &str| allowed_tools.is_none_or(|allowed| allowed.contains(name));
         // builtin:核心工具无条件注入;非核心工具仅在已激活(或全量模式)时注入。
-        let builtin_active = |name: &str| {
-            overlay.is_none_or(|set| is_core(name) || set.contains(name))
-        };
+        let builtin_active =
+            |name: &str| overlay.is_none_or(|set| is_core(name) || set.contains(name));
         // runtime/plugin 无"核心"概念:渐进模式下只有已激活工具注入。
         let tail_active = |name: &str| overlay.is_none_or(|set| set.contains(name));
 
@@ -7605,7 +7604,14 @@ fn deferred_tool_specs() -> Vec<ToolSpec> {
 /// 其余工具在渐进模式下默认延迟,经 `ToolSearch` 发现后按需激活。
 #[must_use]
 pub fn core_tool_names() -> [&'static str; 6] {
-    ["bash", "read_file", "write_file", "edit_file", "glob_search", "grep_search"]
+    [
+        "bash",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob_search",
+        "grep_search",
+    ]
 }
 
 fn search_tool_specs(query: &str, max_results: usize, specs: &[SearchableToolSpec]) -> Vec<String> {
@@ -9240,10 +9246,7 @@ fn capture_output_files() -> std::io::Result<(PathBuf, PathBuf, std::fs::File, s
 }
 
 /// 读取并清理捕获文件（best-effort：后台服务可能仍持有句柄，删除失败忽略）。
-fn read_and_cleanup_capture(
-    out_path: &Path,
-    err_path: &Path,
-) -> (Vec<u8>, Vec<u8>) {
+fn read_and_cleanup_capture(out_path: &Path, err_path: &Path) -> (Vec<u8>, Vec<u8>) {
     let stdout = std::fs::read(out_path).unwrap_or_default();
     let stderr = std::fs::read(err_path).unwrap_or_default();
     let _ = std::fs::remove_file(out_path);

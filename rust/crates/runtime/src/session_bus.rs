@@ -111,6 +111,7 @@ impl BusMessageKind {
     ///
     /// 供外部通道（IDE ACP / IM HTTP）复用，消除各端重复的 match 映射。
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "state" => Self::State,
