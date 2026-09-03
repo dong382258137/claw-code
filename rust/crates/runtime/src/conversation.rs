@@ -5713,6 +5713,7 @@ where
                     &effective_task,
                     workspace_override.as_deref(),
                     current_model.as_deref(),
+                    None,
                     subagent_complexity,
                     subagent_capability,
                 )
@@ -6101,6 +6102,7 @@ where
             task,
             None,
             None,
+            None,
             complexity,
             capability,
         )
@@ -6130,6 +6132,7 @@ where
         task: &str,
         workspace_override: Option<&std::path::Path>,
         model: Option<&str>,
+        max_iterations: Option<usize>,
         complexity: crate::multi_agent::TaskComplexity,
         capability: crate::multi_agent::SubagentCapability,
     ) -> Result<String, String> {
@@ -6168,6 +6171,12 @@ where
         // T4(方案 A 4-1):workspace_override 存在时,project_context.cwd 切到子目录,
         // 指令文件从子目录收集,使 LLM 路径视角与执行基准一致。
         let ctx = self.build_subagent_context(capability, workspace_override.as_deref());
+        // 双大脑批次1:显式传入的 max_iterations 覆盖能力默认上限(如 brain 综合
+        // 放宽到 10 轮)。仅 Some(n) 时覆盖;None 保持 ctx 原值(可能已被任务注入)。
+        let mut ctx = ctx;
+        if max_iterations.is_some() {
+            ctx.max_iterations = max_iterations;
+        }
 
         // model 为 None:走原 run_subagent_turn 路径(复用主 agent client)
         let model = match model {
@@ -7796,6 +7805,7 @@ where
                 &subagent_id,
                 "management-brain",
                 &task,
+                None,
                 None,
                 None,
                 crate::multi_agent::TaskComplexity::Simple,
@@ -17091,6 +17101,7 @@ mod tests {
                 "worker",
                 "do work [test-t5-uuid-41c2]",
                 Some(&ws),
+                None,
                 None,
                 crate::multi_agent::TaskComplexity::Simple,
                 crate::multi_agent::SubagentCapability::ReadOnly,
