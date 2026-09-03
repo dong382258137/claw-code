@@ -27,14 +27,15 @@ mod sufficiency;
 // 注入给模型,超阈值(20K)显式警示,闭合成本反馈环(零 LLM)。
 mod cost_meter;
 pub mod task_state;
-// 轮次感知上下文编译器 P1:分诊门(triage gate)— 纯确定性规则(零 LLM)
-// 把用户轮次分为 Trivial(状态/问答,裁剪注入)与 Standard(全量注入)两档。
+// 轮次感知上下文编译器 P1:分诊门(triage gate)— 档位类型 Trivial(状态/
+// 问答,裁剪注入)与 Standard(全量注入)两档 + 单向升级检测。纯规则分诊
+// (triage_turn)已于 2026-09-04 移除(命中率 ~1% 无效)。
 pub mod triage;
 // 轮次感知上下文编译器 P1(升级):入口全量 LLM 分诊 — 每个用户 turn 在请求
-// 构造前用一次轻量 LLM 调用(deepseek-v4-flash)判断档位;纯规则 triage_turn
-// 降级为 fallback(LLM 失败/禁用/with_model 不可用时)。router 模式未来可
-// 复用到其它"纯规则判断不达标"的场景。只含纯函数(可离线单测),异步调用
-// 接入在 conversation.rs::ConversationRuntime::triage_turn_llm。
+// 构造前用一次轻量 LLM 调用(deepseek-v4-flash)判断档位;LLM 失败/超时/
+// 被禁用(CLAW_TRIAGE_MODE=off)/with_model 不可用 → 直接跳过分诊返回
+// Standard(全量注入),不降级纯规则(已移除)。只含纯函数(可离线单测),
+// 异步调用接入在 conversation.rs::ConversationRuntime::triage_turn_llm。
 mod triage_llm;
 // Multi-Agent Hardening §4.1:统一诊断基础设施(panic hook + DiagLog)。
 // 提取自 rusty-claude-cli/src/lib.rs main_entry 内联闭包,供 main/headless/测试入口复用。

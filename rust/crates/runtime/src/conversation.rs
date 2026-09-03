@@ -22,11 +22,13 @@ use crate::prompt::SystemPromptSplit;
 // P1(轮次感知上下文编译器 · Task 3):分诊门接入请求构造 ——
 // Trivial 档(状态/问答短轮)只注入不变核+状态层+核心工具集,
 // 豁免工程类强制提醒;Standard 档保持现状全量注入。
-use crate::triage::{detect_upgrade_request, triage_turn, TriageContext, TriageTier};
-// P1(升级):入口全量 LLM 分诊 —— 纯规则 triage 降级为 fallback(见
-// triage_llm.rs)。ConversationRuntime::triage_turn_llm 每 turn 优先用一次
-// 轻量 LLM 调用(deepseek-v4-flash)判断档位;LLM 失败/禁用/with_model
-// 不可用时回退 triage_turn 纯规则。
+// 纯规则分诊已于 2026-09-04 移除(命中率 ~1%),本模块现仅提供
+// 档位类型 TriageTier 与单向升级检测 detect_upgrade_request。
+use crate::triage::{detect_upgrade_request, TriageTier};
+// P1(升级):入口全量 LLM 分诊(见 triage_llm.rs)。
+// ConversationRuntime::triage_turn_llm 每 turn 优先用一次轻量 LLM 调用
+// (deepseek-v4-flash)判断档位;LLM 失败/超时/被禁用(CLAW_TRIAGE_MODE=off)/
+// with_model 不可用 → 直接跳过分诊返回 Standard(全量注入),不降级纯规则。
 use crate::triage_llm::{parse_triage_label, triage_llm_enabled, TRIAGE_LLM_SYSTEM, TRIAGE_MODEL};
 // Harness L(生命周期)层接入:run_turn 失败分支调用 RecoveryOrchestrator 尝试一次自动恢复。
 // 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
@@ -3181,32 +3183,21 @@ where
         }
     }
 
-    /// 纯规则分诊 —— LLM 分诊的降级路径。
-    ///
-    /// 语义与 Task 3 完全一致(见 [`crate::triage::triage_turn`]):
-    /// 单向升级锁存 > 超长 > 工程动词 > 状态特征,纯确定性零 LLM。
-    /// 仅在 LLM 分诊不可用(env `CLAW_TRIAGE_MODE=rule`)/ LLM 请求失败 /
-    /// 解析无结果 / `with_model` 不可用时调用。
-    fn rule_triage(&self, user_text: &str) -> TriageTier {
-        let ctx = TriageContext {
-            upgrade_requested: self.triage_upgrade_requested,
-        };
-        triage_turn(user_text, &ctx)
-    }
-
     /// 入口全量 LLM 分诊:每个用户 turn 在请求构造前,用一次轻量 LLM 调用
     /// (deepseek-v4-flash,见 [`crate::triage_llm`])判断档位。
     ///
     /// # 流程
-    /// 1. `CLAW_TRIAGE_MODE=rule` → 直接走纯规则([`Self::rule_triage`]);
+    /// 1. 跳过分诊开关 `CLAW_TRIAGE_MODE=off` → 直接返回
+    ///    [`TriageTier::Standard`](全量注入,与无分诊等价;旧 `rule` 纯规则
+    ///    降级已于 2026-09-04 随纯规则分诊一并移除);
     /// 2. 会话已单向升级(`triage_upgrade_requested`)→ 恒 Standard
-    ///    (与纯规则优先级 1 语义一致,且省一次 LLM 调用);
+    ///    (锁存语义:升级后本会话不再裁剪,且省一次 LLM 调用);
     /// 3. 构造最小 `ApiRequest`:仅分诊 system prompt + 单条 user 文本;
     /// 4. 优先 `api_client.with_model(TRIAGE_MODEL)` 拿独立 flash client,
     ///    取其首轮 assistant 文本(参考 [`execute_subagent_llm`] 的事件消费);
     /// 5. [`parse_triage_label`] 容错解析档位;
-    /// 6. 任何失败(网络/解析/无文本)→ 记录 diag → 回退纯规则。
-    ///    绝不因分诊失败阻断主流程。
+    /// 6. 任何失败(网络/解析/无文本/`with_model` Err)→ 记录 diag →
+    ///    **跳过分诊**返回 Standard。绝不因分诊失败阻断主流程。
     ///
     /// # 模型选择与「关闭思考」说明
     /// - 模型固定 [`TRIAGE_MODEL`](`deepseek-v4-flash`):budget 档轻量模型,
@@ -3216,27 +3207,29 @@ where
     ///   `thinking: disabled`;`with_model` 新建 client 的 thinking_mode 为
     ///   None(CLI 侧默认),实际请求体不发送 thinking 参数、走后端默认。
     ///
-    /// # with_model 失败的处理(与"回退主 client"的取舍)
-    /// 原型设计为「with_model Err → 回退主 client 再发一次」。这里改为
-    /// **直接回退纯规则**:生产 `AnthropicRuntimeClient::with_model` 恒 Ok,
-    /// Err 分支实际只命中不支持换模型的 client(测试 mock / 简化实现)。
-    /// 若回退主 client 会向其注入一次额外分诊请求,打乱既有调用方的
-    /// 请求-响应配对(所有既有 run_turn 测试的 mock 均不实现 with_model);
-    /// 直接纯规则零成本且语义保守,符合「宁可不裁剪也不误伤」。
+    /// # with_model 失败的处理(直接跳过分诊,不回退)
+    /// 生产 `AnthropicRuntimeClient::with_model` 恒 Ok,Err 分支实际只命中
+    /// 不支持换模型的 client(测试 mock / 简化实现)。若回退主 client 会向
+    /// 其注入一次额外分诊请求,打乱既有调用方的请求-响应配对;因此这里
+    /// **直接跳过分诊返回 Standard**(全量注入,语义保守,符合「宁可不
+    /// 裁剪也不误伤」;旧实现回退纯规则,纯规则已移除)。
     async fn triage_turn_llm(&mut self, user_text: &str) -> TriageTier {
-        // 1. env 开关:CLAW_TRIAGE_MODE=rule → 纯规则(默认 llm,缺失/非法同 llm)。
+        // 1. env 开关:CLAW_TRIAGE_MODE=off → 跳过分诊(Standard 全量注入)。
+        //    默认 llm,缺失/其他同 llm。
         if !triage_llm_enabled() {
-            return self.rule_triage(user_text);
+            return TriageTier::Standard;
         }
-        // 2. 单向升级锁存:会话内恒 Standard(省一次调用,与纯规则优先级 1 一致)。
+        // 2. 单向升级锁存:会话内恒 Standard(省一次调用)。
         if self.triage_upgrade_requested {
             return TriageTier::Standard;
         }
         // 4a. 独立 flash client(with_model 构造 enable_tools=false 轻量子 client)。
-        //     with_model 不可用 → 纯规则降级(见方法级注释的取舍说明)。
+        //     with_model 不可用 → 跳过分诊返回 Standard(见方法级注释)。
         let Ok(mut triage_client) = self.api_client.with_model(TRIAGE_MODEL) else {
-            self.emit_diag("[diag] triage_llm with_model unsupported -> rule fallback".to_string());
-            return self.rule_triage(user_text);
+            self.emit_diag(
+                "[diag] triage_llm with_model unsupported -> skip triage (Standard)".to_string(),
+            );
+            return TriageTier::Standard;
         };
         // 3. 最小请求:单条 user 文本 + 分诊 system prompt(全静态,保缓存命中)。
         let request = ApiRequest {
@@ -3263,9 +3256,11 @@ where
                         })
                         .collect();
                     if text.trim().is_empty() {
-                        // 无文本(如思考块独占)视为解析失败 → 纯规则兜底。
-                        self.emit_diag("[diag] triage_llm empty text -> rule fallback".to_string());
-                        return self.rule_triage(user_text);
+                        // 无文本(如思考块独占)视为解析失败 → 跳过分诊(Standard)。
+                        self.emit_diag(
+                            "[diag] triage_llm empty text -> skip triage (Standard)".to_string(),
+                        );
+                        return TriageTier::Standard;
                     }
                     // 5. 容错解析(无匹配 → Standard 保守兜底)。
                     let tier = parse_triage_label(&text);
@@ -3273,19 +3268,19 @@ where
                     tier
                 }
                 Err(e) => {
-                    // 6. 解析失败 → 纯规则降级,绝不阻断主流程。
+                    // 6. 解析失败 → 跳过分诊(Standard),绝不阻断主流程。
                     self.emit_diag(format!(
-                        "[diag] triage_llm parse failed ({e}) -> rule fallback"
+                        "[diag] triage_llm parse failed ({e}) -> skip triage (Standard)"
                     ));
-                    self.rule_triage(user_text)
+                    TriageTier::Standard
                 }
             },
             Err(e) => {
-                // 6. 网络/API 失败 → 纯规则降级,绝不阻断主流程。
+                // 6. 网络/API 失败 → 跳过分诊(Standard),绝不阻断主流程。
                 self.emit_diag(format!(
-                    "[diag] triage_llm request failed ({e}) -> rule fallback"
+                    "[diag] triage_llm request failed ({e}) -> skip triage (Standard)"
                 ));
-                self.rule_triage(user_text)
+                TriageTier::Standard
             }
         }
     }
@@ -3393,12 +3388,12 @@ where
 
         // P1(轮次感知上下文编译器 · Task 3 → 升级):分诊接入请求构造 ——
         // 本 turn 档位。入口全量 LLM 分诊(见 triage_llm.rs):每 turn 在请求
-        // 构造前用一次轻量 LLM 调用(deepseek-v4-flash)判断档位;纯规则
-        // triage_turn 降级为 fallback(CLAW_TRIAGE_MODE=rule / LLM 失败 /
-        // with_model 不可用)。Trivial 档(状态/问答短轮)在请求构造时只注入
-        // 不变核 + 状态层 + 核心工具集,并豁免工程类强制提醒;Standard 档
-        // 保持现状全量(与 P0 快照等价)。档位在 turn 开头判定一次,
-        // 本 turn 所有迭代共用(turn 是分诊的最小单位)。
+        // 构造前用一次轻量 LLM 调用(deepseek-v4-flash)判断档位;LLM 失败/
+        // 超时/被禁用(CLAW_TRIAGE_MODE=off)/with_model 不可用 → 跳过分诊
+        // 返回 Standard(全量注入;纯规则降级已于 2026-09-04 移除)。Trivial
+        // 档(状态/问答短轮)在请求构造时只注入不变核 + 状态层 + 核心工具集,
+        // 并豁免工程类强制提醒;Standard 档保持现状全量(与 P0 快照等价)。
+        // 档位在 turn 开头判定一次,本 turn 所有迭代共用(turn 是分诊的最小单位)。
         let turn_tier = self.triage_turn_llm(&user_input).await;
         self.emit_diag(format!("[diag] triage_tier={turn_tier:?}"));
 
@@ -19623,13 +19618,47 @@ mod tests {
 
     /// 捕获每次主对话请求的假 API:按调用顺序保存 request 快照,
     /// 每轮返回纯文本答复(无工具调用),供档位/prompt 断言。
+    ///
+    /// 2026-09-04 起(纯规则分诊移除)实现 `with_model`:需要特定档位的测试
+    /// 经 [`Self::triage_label`] 让分诊子 client 直接回复该档位
+    /// (mock 直接返回档位,不再依赖纯规则判定)。
     struct CaptureRequestApi {
         captured: Arc<std::sync::Mutex<Vec<ApiRequest>>>,
         reply: String,
+        /// 分诊子 client 的回复标签(如 "trivial"/"standard")。
+        /// `None` → `with_model` 返回 Err → 调用方跳过分诊(Standard 全量注入)。
+        triage_label: Option<&'static str>,
     }
     impl ApiClient for CaptureRequestApi {
         fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
             self.captured.lock().unwrap().push(request.clone());
+            Ok(vec![
+                AssistantEvent::TextDelta(self.reply.clone()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+        fn with_model(&self, model: &str) -> Result<Box<dyn ApiClient>, String> {
+            assert_eq!(
+                model,
+                crate::triage_llm::TRIAGE_MODEL,
+                "分诊应固定走 deepseek-v4-flash 轻量模型"
+            );
+            match self.triage_label {
+                Some(label) => Ok(Box::new(TriageLabelSubApi {
+                    reply: label.to_string(),
+                })),
+                // 无标签 → 与 trait 默认一致(不支持换模型)→ 跳过分诊(Standard)。
+                None => Err("model swap not supported".to_string()),
+            }
+        }
+    }
+
+    /// 分诊子 client:按固定标签回复一行文本(仅 [`CaptureRequestApi::with_model`] 使用)。
+    struct TriageLabelSubApi {
+        reply: String,
+    }
+    impl ApiClient for TriageLabelSubApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
             Ok(vec![
                 AssistantEvent::TextDelta(self.reply.clone()),
                 AssistantEvent::MessageStop,
@@ -19696,6 +19725,7 @@ mod tests {
                 CaptureRequestApi {
                     captured: Arc::clone(&captured),
                     reply: "上次任务已到第 3 步。".to_string(),
+                    triage_label: Some("trivial"),
                 },
                 StaticToolExecutor::new(),
                 PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -19760,6 +19790,7 @@ mod tests {
                 CaptureRequestApi {
                     captured: Arc::clone(&captured),
                     reply: "已修复。".to_string(),
+                    triage_label: Some("standard"),
                 },
                 StaticToolExecutor::new(),
                 PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -19801,6 +19832,7 @@ mod tests {
                 CaptureRequestApi {
                     captured: Arc::clone(&captured),
                     reply: "状态摘要如上。".to_string(),
+                    triage_label: Some("trivial"),
                 },
                 StaticToolExecutor::new(),
                 PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -19834,6 +19866,7 @@ mod tests {
                 CaptureRequestApi {
                     captured: Arc::clone(&captured2),
                     reply: "开始修复。".to_string(),
+                    triage_label: Some("standard"),
                 },
                 StaticToolExecutor::new(),
                 PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -19871,6 +19904,8 @@ mod tests {
                     captured: Arc::clone(&captured),
                     reply: "[LOAD_FULL_CONTEXT] 这个状态问题需要多 Agent 与完整工具上下文。"
                         .to_string(),
+                    // 分诊 mock 直接返回 trivial(turn 1 为 Trivial 档)。
+                    triage_label: Some("trivial"),
                 },
                 StaticToolExecutor::new(),
                 PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -20497,7 +20532,8 @@ mod tests {
     /// token(占全会话 24%)。新架构下状态层直接携带答案,模型无需考古。
     /// 上述指标依赖模型行为,单测不可精确复现;本测试验证其**充分条件**:
     /// 请求构造保证「答案已在上下文中 + 无多余工具可用」:
-    /// 1. 该 turn 被确定性分诊为 Trivial(档位随请求下发 `triage_tier`);
+    /// 1. 该 turn 被分诊为 Trivial(档位随请求下发 `triage_tier`;
+    ///    分诊 mock 直接返回 `trivial`,2026-09-04 起不再依赖纯规则判定);
     /// 2. 请求携带上一会话 digest 文本(经真实注入路径进入尾部冻结槽位块,
     ///    含「#4 / MACD 交叉」答案关键词),模型无需考古即可作答;
     /// 3. system prompt 只含不变核 + 状态层,不含能力层(多 Agent / Session
@@ -20530,6 +20566,8 @@ mod tests {
                     // 脚本化 API 第一轮即直接作答(不发起工具调用)—— 等价于
                     // "模型无需考古即可从上下文作答"的行为下限。
                     reply: "上次任务执行到 #4 MACD 交叉回测:脚本已写好待全量跑。".to_string(),
+                    // 分诊 mock 直接返回 trivial → 本 turn 为 Trivial 档。
+                    triage_label: Some("trivial"),
                 },
                 StaticToolExecutor::new(),
                 PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -20599,8 +20637,8 @@ mod tests {
     // ===== P1(升级):入口全量 LLM 分诊 —— 集成测试(mock 脚本化)=====
     //
     // 这些测试的 client 实现 `with_model`,使分诊请求经独立"分诊子 client"
-    // 与主对话请求互不串扰;既有测试的 mock 不实现 with_model
-    // (→ 默认 Err → 纯规则降级),因此不受本次升级影响。
+    // 与主对话请求互不串扰;不实现 with_model 的 mock(→ 默认 Err →
+    // 跳过分诊返回 Standard,2026-09-04 起纯规则降级已移除)不受影响。
     //
     // 所有触碰 `CLAW_TRIAGE_MODE`(或依赖其默认值)的测试共享
     // `crate::triage_llm::TRIAGE_ENV_LOCK`,避免并行污染环境变量。
@@ -20608,7 +20646,7 @@ mod tests {
 
     /// `with_model` 下发的分诊子 client:只接收 triage 请求,按脚本回复。
     struct TriageSubApi {
-        /// 每次调用依次返回的 assistant 文本(耗尽 → 空文本,走解析失败降级)。
+        /// 每次调用依次返回的 assistant 文本(耗尽 → 空文本,走解析失败 → 跳过分诊 Standard)。
         replies: Vec<String>,
         /// 非 None 时 stream 直接返回 Err(模拟网络/API 失败)。
         err: Option<String>,
@@ -20640,7 +20678,7 @@ mod tests {
         /// 主请求文本回复脚本(耗尽 → 复用最后一条)。
         replies: Vec<String>,
         next_reply: Arc<std::sync::atomic::AtomicUsize>,
-        /// with_model 被调用次数(rule 模式 / 升级锁存后应不增长)。
+        /// with_model 被调用次数(off 模式 / 升级锁存后应不增长)。
         with_model_calls: Arc<std::sync::atomic::AtomicUsize>,
         sub_replies: Vec<String>,
         sub_err: Option<String>,
@@ -20693,7 +20731,7 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
         // 注意:本 helper 不触碰 `CLAW_TRIAGE_MODE` env —— env 由各测试自行
-        // 显式设置(llm 默认 / rule),避免 helper 误清 rule 测试刚设的值。
+        // 显式设置(llm 默认 / off),避免 helper 误清 off 测试刚设的值。
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sub_captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let with_model_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -20803,9 +20841,10 @@ mod tests {
         );
     }
 
-    /// LLM 分诊返回 Err → 降级走纯规则,主流程正常不 panic。
+    /// LLM 分诊返回 Err → 跳过分诊(Standard 全量注入),主流程正常不 panic。
+    /// (2026-09-04 起纯规则已移除,失败不再降级到纯规则判 Trivial。)
     #[test]
-    fn llm_triage_stream_error_falls_back_to_rule() {
+    fn llm_triage_stream_error_skips_to_standard() {
         let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -20823,17 +20862,17 @@ mod tests {
         assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
         let reqs = captured.lock().expect("lock");
         assert_eq!(reqs.len(), 1);
-        // 纯规则对状态问句判 Trivial(与 triage_turn 结果一致)。
+        // LLM Err → 跳过分诊:无论输入语义,档位恒 Standard(全量注入)。
         assert_eq!(
             reqs[0].triage_tier,
-            Some(TriageTier::Trivial),
-            "LLM Err → 回退纯规则:状态问句应判 Trivial"
+            Some(TriageTier::Standard),
+            "LLM Err → 跳过分诊:主请求应判 Standard"
         );
     }
 
-    /// LLM 分诊返回空文本 → 解析失败 → 降级走纯规则,主流程正常。
+    /// LLM 分诊返回空文本 → 解析失败 → 跳过分诊(Standard),主流程正常。
     #[test]
-    fn llm_triage_empty_reply_falls_back_to_rule() {
+    fn llm_triage_empty_reply_skips_to_standard() {
         let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -20847,21 +20886,22 @@ mod tests {
         assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
         let reqs = captured.lock().expect("lock");
         assert_eq!(reqs.len(), 1);
-        // 纯规则对工程句判 Standard(与 triage_turn 结果一致)。
+        // 空回复 → 跳过分诊 → Standard(全量注入)。
         assert_eq!(
             reqs[0].triage_tier,
             Some(TriageTier::Standard),
-            "LLM 空回复 → 回退纯规则:工程句应判 Standard"
+            "LLM 空回复 → 跳过分诊:主请求应判 Standard"
         );
     }
 
-    /// `CLAW_TRIAGE_MODE=rule` → 不调用 mock(with_model 0 次),走纯规则。
+    /// `CLAW_TRIAGE_MODE=off` → 跳过分诊:不调用 mock(with_model 0 次),
+    /// 全量注入(Standard),与无分诊等价。
     #[test]
-    fn rule_mode_skips_llm_triage_entirely() {
+    fn off_mode_skips_llm_triage_entirely() {
         let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(crate::triage_llm::TRIAGE_MODE_ENV, "rule");
+        std::env::set_var(crate::triage_llm::TRIAGE_MODE_ENV, "off");
         let (mut runtime, captured, sub_captured, with_model_calls, sub_calls) = llm_triage_runtime(
             vec!["已修复。".to_string()],
             vec!["trivial".to_string()],
@@ -20874,24 +20914,24 @@ mod tests {
         assert_eq!(
             with_model_calls.load(Ordering::SeqCst),
             0,
-            "rule 模式不得触发 with_model"
+            "off 模式不得触发 with_model"
         );
         assert_eq!(
             sub_calls.load(Ordering::SeqCst),
             0,
-            "rule 模式不得调分诊 mock"
+            "off 模式不得调分诊 mock"
         );
         assert_eq!(
             sub_captured.lock().expect("lock").len(),
             0,
-            "rule 模式不应产生分诊请求"
+            "off 模式不应产生分诊请求"
         );
         let reqs = captured.lock().expect("lock");
-        assert_eq!(reqs.len(), 1, "rule 模式只发主请求");
+        assert_eq!(reqs.len(), 1, "off 模式只发主请求");
         assert_eq!(
             reqs[0].triage_tier,
             Some(TriageTier::Standard),
-            "纯规则对工程句判 Standard"
+            "off 模式跳过分诊 → 主请求恒 Standard(全量注入)"
         );
     }
 

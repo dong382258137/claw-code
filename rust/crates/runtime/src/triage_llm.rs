@@ -1,14 +1,13 @@
-//! 入口全量 LLM 分诊(轮次分诊门升级)—— 把纯规则 triage 升级为
-//! 「每个用户 turn 在请求构造前,用一次轻量 LLM 调用判断档位」的路由器模式。
+//! 入口全量 LLM 分诊 —— 「每个用户 turn 在请求构造前,用一次轻量 LLM 调用
+//! (deepseek-v4-flash)判断档位」的路由器模式。
 //!
-//! # 背景
-//! 纯规则分诊([`crate::triage::triage_turn`])是词汇近似,命中率低(真实回放
-//! 102 条仅 1 条 Trivial),无法语义识别任务类型,且词表需要不断打补丁。
-//! 升级后:
+//! # 背景(2026-09-04)
+//! 原纯规则分诊是词汇近似,命中率低(真实回放 102 条仅 1 条 Trivial),
+//! 判定无效,已于同日**移除**(见 [`crate::triage`])。现分诊只走 LLM:
 //! - 入口用一次轻量 LLM 调用(deepseek-v4-flash)判断本轮档位;
-//! - [`crate::triage::triage_turn`] 纯规则降级为 fallback(LLM 调用失败/
-//!   被禁用/`with_model` 不可用时使用),**语义不变**;
-//! - 此 router 模式未来可复用到其它"纯规则判断不达标"的场景。
+//! - LLM 失败 / 超时 / 被禁用(`CLAW_TRIAGE_MODE=off`)/ `with_model`
+//!   不可用 → **直接跳过分诊**,调用方返回 [`TriageTier::Standard`]
+//!   (全量注入,与无分诊等价);不降级到纯规则(已不存在)。
 //!
 //! 本模块只含纯函数(system prompt / 解析 / 开关),不依赖 `ApiClient` 类型,
 //! 全部可离线单测;异步调用接入见
@@ -62,9 +61,12 @@ pub const TRIAGE_LLM_SYSTEM: &str = "\
 
 /// `CLAW_TRIAGE_MODE` 环境变量名。
 ///
-/// 取值:
-/// - `llm`(默认):入口全量 LLM 分诊;
-/// - `rule`:纯规则降级([`crate::triage::triage_turn`])。
+/// 取值(两态):
+/// - 缺失 / `llm` / 其他任何值(默认):LLM 分诊;
+/// - `off`(大小写不敏感):跳过分诊 —— 调用方直接返回 Standard 全量注入。
+///
+/// `rule`(旧纯规则降级)语义已于 2026-09-04 随纯规则分诊一并移除:
+/// 该值现在按「非 off」处理,即照常走 LLM 分诊。
 pub const TRIAGE_MODE_ENV: &str = "CLAW_TRIAGE_MODE";
 
 /// 串行化「触碰 `CLAW_TRIAGE_MODE` env」的测试。
@@ -76,12 +78,13 @@ pub const TRIAGE_MODE_ENV: &str = "CLAW_TRIAGE_MODE";
 #[cfg(test)]
 pub(crate) static TRIAGE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 入口全量 LLM 分诊是否启用(env `CLAW_TRIAGE_MODE` 解析)。
+/// LLM 分诊是否启用(env `CLAW_TRIAGE_MODE` 解析)。
 ///
-/// - 值 `rule`(大小写不敏感)→ `false`:回退纯规则分诊;
-/// - 值 `llm` / 缺失 / 任何非法值 → `true`:开启入口 LLM 分诊(默认)。
+/// - 值 `off`(大小写不敏感)→ `false`:跳过分诊 —— 调用方返回
+///   [`TriageTier::Standard`](全量注入),不降级纯规则(已移除);
+/// - 其余(缺失 / `llm` / 其他值)→ `true`:开启 LLM 分诊(默认)。
 pub fn triage_llm_enabled() -> bool {
-    !std::env::var(TRIAGE_MODE_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("rule"))
+    !std::env::var(TRIAGE_MODE_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("off"))
 }
 
 /// 从 LLM 回复文本中容错提取分诊档位。
@@ -189,14 +192,28 @@ mod tests {
         });
     }
 
-    /// 显式 `rule`(大小写不敏感)→ 关闭,走纯规则。
+    /// 显式 `off`(大小写不敏感)→ 关闭 LLM 分诊(调用方跳过分诊)。
     #[test]
-    fn disabled_when_env_is_rule() {
+    fn disabled_when_env_is_off() {
+        with_triage_mode(Some("off"), || {
+            assert!(!triage_llm_enabled(), "off 应关闭 LLM 分诊");
+        });
+        with_triage_mode(Some("OFF"), || {
+            assert!(!triage_llm_enabled(), "大小写不敏感");
+        });
+    }
+
+    /// `rule`(旧纯规则语义)不再是特例 → 按默认 `llm` 处理(开启分诊)。
+    #[test]
+    fn enabled_when_env_is_legacy_rule() {
         with_triage_mode(Some("rule"), || {
-            assert!(!triage_llm_enabled(), "rule 应关闭 LLM 分诊");
+            assert!(
+                triage_llm_enabled(),
+                "rule 语义已移除,应回退默认 llm(开启分诊)"
+            );
         });
         with_triage_mode(Some("RULE"), || {
-            assert!(!triage_llm_enabled(), "大小写不敏感");
+            assert!(triage_llm_enabled(), "大小写不敏感");
         });
     }
 
