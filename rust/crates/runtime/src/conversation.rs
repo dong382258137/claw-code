@@ -7815,9 +7815,24 @@ where
             .await
         {
             Ok(result) => Ok(result),
-            Err(e) => Ok(format!(
-                "ask_brain: brain 会话暂不可用({e})。以下为确定性检索片段(未综合,可直接参考):\n\n{trimmed}"
-            )),
+            Err(e) => {
+                // 机制 3 结构性兜底(批次 1):brain 会话超轮或失败时,若已产出部分
+                // 结论(handoff 落盘于 .claw/subagents/brain-*.md),提示执行脑可去
+                // 读取;同时附检索片段保证不阻塞。超轮≠不可用,文案须区分,
+                // 避免把"已达轮次上限、有部分产物"误导成"brain 不可用"。
+                let hint = if e.contains("max_iterations") {
+                    format!(
+                        "ask_brain: brain 会话达到轮次上限,部分结论已落盘 \
+                         (见 .claw/subagents/{subagent_id}.md,含 summary/details)。\n\
+                         可直接读取该文件获取已核实结论;以下为检索片段(供参考):\n\n{trimmed}"
+                    )
+                } else {
+                    format!(
+                        "ask_brain: brain 会话执行失败({e})。以下为确定性检索片段(未综合,可直接参考):\n\n{trimmed}"
+                    )
+                };
+                Ok(hint)
+            }
         }
     }
 
