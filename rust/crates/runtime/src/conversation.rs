@@ -7787,7 +7787,8 @@ where
              ## 知识库检索片段(来源标注,供你综合与核实)\n{trimmed}\n\n\
              ## 你的任务\n\
              1. 基于上述检索片段(仅作为参考,不代表全部事实),回答执行脑的问题;\n\
-             2. 需要时可用 read_file/grep_search/glob_search 工具核实代码事实(只读,禁止修改任何文件);\n\
+             2. 轮次预算:先综合后核实。最多核实 2 个文件(优先读检索片段已引用的),\n\
+                不要逐文件侦察——本会话总轮次上限已放宽到 10,但请尽快产出结论;\n\
              3. 输出格式:先给结论,再给依据。每条关键结论后附来源(如:decision_log 条目 / 会话历史 / 文件路径:行号);\n\
              4. 若检索片段不足以回答,明确说明\"知识库无足够证据\",并给出基于代码事实的最佳建议;\n\
              5. 你是管理脑(咨询角色):只提议不直改。执行脑会自行决定是否采纳,并以行动结果(编译/测试)为准。"
@@ -7807,7 +7808,7 @@ where
                 &task,
                 None,
                 None,
-                None,
+                Some(10), // max_iterations:brain 综合放宽到 10 轮(ReadOnly 默认 5 会在文件侦察上耗尽)
                 crate::multi_agent::TaskComplexity::Simple,
                 crate::multi_agent::SubagentCapability::ReadOnly,
             )
@@ -19455,6 +19456,68 @@ mod tests {
         crate::poor_mode::set_active(false); // 复位全局状态
         assert!(out.contains("poor_mode 激活"), "out: {out}");
         assert!(out.contains("glob"), "out: {out}");
+    }
+
+    /// 机制 3(批次 1):ask_brain 的 task 文本必须携带"先综合后核实,最多核实
+    /// 2 个文件"的轮次预算约束,防止 brain 会话把轮次耗在文件侦察上。
+    /// 用 RecordingApi 捕获 subagent 请求文本验证(不真调 LLM)。
+    #[tokio::test]
+    async fn ask_brain_task_contains_iteration_budget_constraint() {
+        struct RecordingApi {
+            captured: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        impl ApiClient for RecordingApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                for m in &request.messages {
+                    for block in &m.blocks {
+                        if let ContentBlock::Text { text } = block {
+                            self.captured.lock().unwrap().push(text.clone());
+                        }
+                    }
+                }
+                // 返回一段文本使 subagent 正常完成(final_text 非空)。
+                Ok(vec![
+                    AssistantEvent::TextDelta("brain: 已综合检索片段,给出建议。".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime: ConversationRuntime<RecordingApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                RecordingApi {
+                    captured: captured.clone(),
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_decision_log(log)
+            .with_workspace_root(dir.path().to_path_buf());
+        // 注入一条决策使检索非空(否则走"无相关知识"早退路径,不会调 brain)。
+        runtime
+            .execute_log_decision(
+                r#"{"session_id":"s1","problem_signature":"edit_file: old_string not found","root_cause_hypothesis":"stale content","applied_solution":"re-read file before edit","affected_files":[],"verification_result":"Confirmed"}"#,
+            )
+            .expect("log_decision");
+
+        runtime
+            .execute_ask_brain_async(r#"{"query":"old_string not found"}"#)
+            .await
+            .expect("ask_brain should complete");
+
+        let all: Vec<String> = captured.lock().unwrap().clone();
+        assert!(
+            all.iter().any(|t| t.contains("先综合后核实")),
+            "task 缺轮次预算约束;捕获文本: {all:?}"
+        );
     }
 
     /// 端到端:run_turn 真实拦截 ask_brain 工具调用(不经 StaticToolExecutor)。
