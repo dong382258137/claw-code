@@ -1,11 +1,11 @@
-# 2026-09-03 双大脑架构优化设计(brain-daemon 独立进程版)
+# 2026-09-03 双大脑架构优化设计 v5(brain-daemon 独立进程版 · 评审修订)
 
-> 状态:设计定稿(brainstorming 获准) · 前置审查:2026-09-03-dual-brain-architecture.md(v3)
-> 本设计修正 v3 的角色定位:管理脑从"ReadOnly 按需顾问"升格为"常驻、有写权、主导 claw 自身架构升级的守护进程"。
+> 状态:设计定稿 v5(架构评审通过,4 缺口已收编) · 前置:2026-09-03-dual-brain-architecture.md(v3)
+> v5 变更:失败签名规格 / 守护进程心跳与自检 / 注入通道协议 / UpgradeRunner 安全栏 / KPI 度量 / 证据口径收紧 / shadow mode / 重复劳动检测 / 生命周期=独立常驻服务
 
 ## 1. 背景与设计动机
 
-原双大脑 v3 经审查发现四项缺陷(详见评估):
+原双大脑 v3 经审查发现四项缺陷:
 1. **验证环断裂**:决策库 verify_count 全为 0,`top_verified_solution` 要求 `Confirmed + verify_count≥1` 恒不满足 → 失败单条辅导"设计有、永不触发"。
 2. **管理脑无主动性**:管理脑只在执行脑 ask_brain 时被动应答;北极星"实时在线辅助执行脑"未兑现。
 3. **brain 会话截断**:ReadOnly max_iterations=5,实测 brain 会话 5 轮耗尽在文件侦察上,返回降级片段而非综合答案。
@@ -25,19 +25,19 @@
 └───────────▲──────────────────────────────┬────────┘
             │ ③主动投喂(失败/重复)          │ ②按需 ask_brain
 ┌───────────┴──────────────────────────────▼────────┐
-│ 管理脑(brain-daemon,常驻独立进程)                    │
+│ 管理脑(brain-daemon,独立常驻服务)                    │
 │  A 持有+治理知识资产(决策库/会话史/digest/规则)          │
-│  B 主导 claw 架构升级:亲自实施 → 验证层裁决            │
+│  B 主导 claw 架构升级:亲自实施 → 验证层裁决 + 安全栏     │
 │  C 主动旁听:静默监视,失败/重复才投喂                   │
 └────────────────────────────────────────────────────┘
             ▲ 验证层(编译/测试/用户验收)仲裁一切
 ```
 
 - 执行脑不再承担自主进化责任,进化责任移交管理脑。
-- 管理脑是**常驻、有写权、自我进化的守护者**,而非"会话后消化器"或"ReadOnly 顾问"。
+- 管理脑是**独立常驻服务、有写权、自我进化的守护者**(用户裁决生命周期=常驻服务,非随 CLI 起停)。
 - 两脑通过 `.claw/` 共享媒介通信;验证层是共同仲裁。
 
-## 3. 关键决策记录(brainstorming 用户裁决)
+## 3. 关键决策记录(brainstorming + 评审裁决)
 
 | 决策点 | 裁决 |
 |---|---|
@@ -45,27 +45,38 @@
 | 角色定位 | 执行脑=干活;管理脑=知识资产+claw架构升级+辅助执行脑 |
 | 架构升级对象 | claw 自身代码 + 领域知识资产 |
 | 升级实施方式 | **亲自实施**(管理脑持写工具),验证层裁决 — 推翻 v3 的 ReadOnly |
-| 组织载体 | **独立第二进程**(brain-daemon,与 claw-im-bridge 同构) |
-| LLM 使用 | 允许轻 LLM 消化(守护进程可用小/预算模型) |
+| 组织载体 | **独立第二进程**(brain-daemon) |
+| 生命周期 | **独立常驻服务**(评审后用户裁决) |
+| LLM 使用 | 允许轻 LLM 消化(守护进程可用小/预算模型),需频率/token 门控 |
 | 辅助模式 | 主动旁听辅助(非拉取式) |
-| 旁听介入策略 | **失败/重复才介入**(正常推进不动嘴) |
-| 验证信号 | 同签名演进:连续 N 次未见失败即视为被绕开(N=3) |
-| digest 选取 | 按任务相关度检索(非时间取最新) |
-| 实施分批 | 4 批独立可测 |
+| 旁听介入策略 | 失败/重复才介入;**含重复劳动**(用户裁决,需加行为检测维度) |
+| 验证信号 | 同签名演进(证据口径见 §4.3:以"同归一化调用后续成功"为主证据) |
+| digest 选取 | 按任务相关度检索(相关度+时间衰减混合,兜底不劣于纯时间) |
+| 实施分批 | 4 批独立可测,批次 2 含 shadow mode |
 
 ## 4. 组件设计
 
-### 4.1 brain-daemon(新独立二进制 / crate)
+### 4.0 ★失败签名提取规格(全体系基石,批次 2 前置)
+
+机制 1/2/3 全部依赖失败签名 `(tool, sig)`,签名规则必须先定:
+- **工具名**:规范名(read_file/grep_search/... 与 GlobalToolRegistry 一致,非短名)。
+- **错误类别**:从错误文本提取类别键,如 `old_string_not_found` / `command_not_found` / `permission_denied` / `nested_runtime`(分类词表,按需扩展;提取失败归 `unclassified`)。
+- **归一化消息**:错误首行剥离变量部分(文件路径/行号/具体字符串)→ 截断 ≤160 字符 → 哈希(现有 simhash 可比价)。
+- **签名 = 工具名 + 错误类别 + 归一化哈希**。
+- 规则约束:归一化**过宽会误合并**(投喂错误建议、错误计数),**过窄永不重复**(证据不累积)。类别词表与剥离规则纳入批次 2/3 测试用例(黄金样例集)。
+
+### 4.1 brain-daemon(独立常驻服务)
 
 ```
-brain-daemon(常驻进程)
+brain-daemon(常驻服务,生命周期与 CLI 解耦)
 ├─ SessionWatcher   尾随 session_bus 事件/文件,监听执行脑工具流
-├─ FailureMatcher   失败签名 vs decision_log,触发投喂判定
-├─ EvidenceTracker  同签名演进:跨会话计数"连续未见失败 N 次"→ 更新 verify_count
-├─ DigestRouter     按任务相关度检索 digest(替代时间取最新)
-├─ DigestGovernor   写端重要性门控(去噪)
-├─ BrainAgent       LLM 综合/提炼(轻模型):知识提炼、架构升级执行
-└─ UpgradeRunner    架构升级亲自实施(Execute 能力,验证层裁决)
+├─ FailureMatcher   失败签名 vs decision_log;触发投喂判定(含重复劳动检测)
+├─ EvidenceTracker  同签名演进:跨会话证据累积 → 更新 verify_count
+├─ DigestRouter     按任务相关度+时间衰减检索 digest
+├─ DigestGovernor   写端重要性门控(去噪)+ decision_log 清理治理
+├─ BrainAgent       LLM 综合/提炼(轻模型,频率/token 门控)
+├─ UpgradeRunner    架构升级亲自实施(Execute,验证层裁决 + 安全栏)
+└─ Heartbeat       健康心跳 + 有效性仪表(自检,见 §6)
 ```
 
 每个单元职责单一、接口清晰、可独立测试。与执行进程仅通过 `.claw/` 共享媒介通信,无 in-process 调用。
@@ -74,70 +85,123 @@ brain-daemon(常驻进程)
 
 - 状态死锁:v3 要求 `Confirmed + verify_count≥1`,无人调用 verify_decision → 永不触发。
 - 演进判定(守护进程 EvidenceTracker,零 LLM):
-  1. 扫描会话工具结果,提取失败签名 `(tool, sig)`;
-  2. 查决策库同签名 Pending 条目(simhash 已有);
-  3. **后续连续 N 个会话(默认 N=3)该签名未再出现为失败** → 视为"被绕开/修复" → Pending 递增验证计数;
-  4. 规则:须有外部信号(该工具调用成功 / 用户显式确认)佐证,单次未出现不构成证据。
-- 效果:verify_count 自然增长 → `top_verified_solution` 条件满足 → 失败单条辅导复活。
+  1. 扫描会话工具结果,按 §4.0 提取失败签名;
+  2. 查决策库同签名 Pending 条目;
+  3. 证据判定见 §4.3;
+  4. 效果:verify_count 自然增长 → `top_verified_solution` 条件满足 → 失败单条辅导复活。
 
-### 4.3 机制 2:主动旁听辅助(brain-daemon)
+### 4.3 ★证据口径收紧(评审缺口 3)
+
+- **主证据**:同归一化调用在后续会话**成功执行**(该工具以相近输入成功返回)→ 强证据。
+- **辅助条件**:连续 N 个"该工具被调用过的会话"(N=3)未再失败 → 弱证据。
+- **会话计数口径**:只计**该工具实际被调用过的会话**,从未触发该工具的会话不计入 N(否则"任务不再涉及"被误判为"已修复")。
+- 两者合并:主证据直接计数;无主证据时连续弱证据达 N 亦可计数(降级但可用)。
+
+### 4.4 机制 2:主动旁听辅助(brain-daemon)
 
 - SessionWatcher 实时同步执行脑工具结果流(经 session_bus 事件或文件尾随);
-- FailureMatcher 静默比对:失败模式 vs 知识库(decision_log / 历史 FTS5);
-- **触发条件**:
-  - 高匹配已验证方案(阈值命中)→ 投喂单条(复用 `pending_failure_advice` 机制,dynamic_sections 注入);
-  - 重复失败(同签名 ≥2 次)→ 预警;
+- FailureMatcher 静默比对:
+  - **触发条件 A(重复失败)**:同签名失败 ≥2 次 → 投喂高匹配已验证方案或预警;
+  - **触发条件 B(重复劳动,用户裁决纳入)**:检测到执行脑在重复已完成的事/死循环迹象(复用既有 loop_detector 信号 + 行为维度)→ 投喂"已完成/已验证"提示;
   - 正常推进 → 静默,零开销;
-- 投喂走 dynamic_sections 尾部注入,不污染 prefix 缓存。
+- **投喂通道协议(评审缺口 5)**:
+  - 注入落点:守护进程写 `.claw/management_brain/injections/<session_id>.jsonl`(带 signature/severity/dedup_key/created_ms);
+  - 读入时机:执行脑下一 turn 的 request 构造时由 runtime 读取 → 注入 dynamic_sections(尾部,不污染 prefix cache)→ 消费即删;
+  - 会话结束未消费的投喂:**不跨会话补投**(会话语义隔离,防陈旧建议干扰新任务),守护进程清理孤儿 injection 文件;
+  - **投喂硬上限**:≤2 条/会话,同 dedup_key 去重("宁缺毋滥"是机制不是态度);
+  - 投喂仅走确定性匹配产物(格式化单条),**原始会话内容不进注入文本**,从源头防提示注入。
 
-### 4.4 机制 3:brain 会话截断修复(快修,执行进程内)
+### 4.5 机制 3:brain 会话截断修复(快修,执行进程内)
 
 - `ask_brain` 调用 `run_subagent_turn_with_model` 时传 `ctx.max_iterations` 覆盖(8~10,现为 ReadOnly 默认 5);
 - task 文本约束:"先综合后核实,最多核实 2 个文件";
-- 输出预算:强制返回"结论+依据"格式,避免中途截断成降级片段。
+- 输出预算:强制返回"结论+依据"格式,避免中途截断成降级片段;
+- **结构性兜底**(评审:prompt 级约束不够):`execute_ask_brain_async` 在超轮时若已有部分结论则返回"部分结论+标注未核实项",而非错误串。
 
-### 4.5 机制 4:digest 治理
+### 4.6 机制 4:digest 治理
 
 - **写端(DigestGovernor)**:重要性门控,只记录"重复失败/高价值结论/成本异常",去噪;
-- **读端(DigestRouter)**:新会话首 turn 以任务目标为 query 检索 digest(本地相似度),替代 `latest_digest_text` 按时间取最新。
+- **读端(DigestRouter)**:新会话首 turn 以任务目标为 query,**相关度 + 时间衰减混合排序**(FTS5/simhash 词法相关度对"任务表述 vs digest 表述"偏弱,混合排序保证兜底不劣于纯时间取最新),替代 `latest_digest_text`;
+- **decision_log 清理治理**(评审次要建议):定期归档"签名永不复发且长期 Pending"的条目,防无限累积。
 
-## 5. 数据流
+## 5. KPI 与成功度量(评审缺口:全文无 KPI)
 
-```
-执行脑工具流 → (session_bus/文件) → SessionWatcher
-  ├─→ FailureMatcher → 命中 → 投喂注入(单条 dynamic_sections)
-  ├─→ EvidenceTracker → 连续未见失败 N 次 → decision_log.verify_count++
-  └─→ DigestGovernor → 会话结束写门控 digest
-新会话首 turn → DigestRouter(任务相关度检索)→ 注入 "Previous Session Digest"
-```
+- **核心 KPI:投喂后同签名失败终止率** —— 一次投喂注入后,该签名失败是否在后续会话终止。优雅闭环:机制 2 的投喂改变执行脑行为 → 同签名失败消失 → 机制 1 的 verify_count 增长。**机制 1 隐式度量机制 2 的有效性**,写入仪表。
+- 辅助指标:verify_count 周增长率 / 失败辅导触发率 / ask_brain 使用率 / digest 注入采纳率(注入后 turn 是否减少重试)。
+- 对照实验(v3 §6 可证伪验收延续):shadow mode 记录"本应投喂"对照,开闸后对比失败终止率。
 
-## 6. 错误处理与降级
+## 6. 错误处理、降级与自检(评审缺口 1:静默失效悖论)
 
 - 守护进程任何失败 → 静默降级,绝不影响执行脑主链路;
 - 守护进程崩溃 → 无状态,重启重扫(幂等);
+- **★心跳与自检(补 v3 病根)**:守护进程常驻心跳 + 有效性仪表:
+  - watcher lag(工具流同步延迟)、投喂次数、verify_count 增长速率;
+  - **自检规则:N 天(默认 7)内 verify_count 零增长 → 告警**;"守护进程挂掉 = 回到 v3 且无人察觉"必须被机制阻止;
+  - 心跳落盘 `.claw/management_brain/heartbeat.json`,执行进程可读(健康状态可观测)。
 - decision_log 写冲突 → 复用既有 SQLite 事务;
 - 轻 LLM 不可用 / poor_mode → 守护进程退化为纯确定性(仅 watcher/matcher/evidence,不做语义提炼)。
 
-## 7. 测试策略
+## 7. UpgradeRunner 最小安全栏(评审缺口 4,批次 4 验收条件)
+
+架构改动常"编译过、测试绿、但方向错",且会话内容可能成为提示注入攻击面。安全栏(不能只靠"试点"):
+- **可写路径白名单**:UpgradeRunner 仅可写 claw workspace 内声明的源码/配置路径(列表硬编码校验),用户项目/任意仓库文件不可写;
+- **分支隔离**:升级在独立分支(如 `brain-upgrade/<topic>`)实施,不得直接改 main;
+- **人审门禁**:升级完成(编译+测试绿)后产出**结构化提案**(改动清单+依据+验证证据),**强制用户显式批准**才合入;
+- **回滚方案**:升级分支保留,合入前记录基线 commit;失败/方向错可整体回滚;
+- **执行脑运行期间禁止升级**:升级实施与执行脑会话互斥(升级触发时等待执行脑空闲),避免写冲突;
+- **提示注入缓解**:
+  - FailureMatcher/EvidenceTracker 只用 §4.0 **结构化签名**,原始会话内容不进 LLM;
+  - BrainAgent 输入来自白名单媒介(digest/决策库),非任意文件;
+  - 升级输出约束为提案 schema(结构字段),天然限制自由文本指令注入的影响面;
+  - 升级前强制人审门禁 = 最终防线(恶意提案可被人在合入前拦截)。
+
+## 8. BrainAgent LLM 预算门控(评审次要建议)
+
+常驻进程 + 持续监听,不能只靠 DigestGovernor 管写端:
+- **频率门控**:提炼/综合任务最频繁度(默认 1 次/小时/workspace,可配);
+- **token 门控**:单次提炼预算上限;轻模型选择;
+- **成本入账**:BrainAgent 用量写入 digest 成本行(与执行脑 usage 同表口径),可审计。
+
+## 9. 数据流
+
+```
+执行脑工具流 → (session_bus/文件) → SessionWatcher
+  ├─→ FailureMatcher(签名匹配 + 重复劳动检测)
+  │     └─ 命中 → 写 injections/<session_id>.jsonl(≤2条/会话,dedup)
+  │              → 执行脑下一 turn request 构造读取 → dynamic_sections 注入 → 消费即删
+  ├─→ EvidenceTracker → 主证据(同调用后续成功)/ 弱证据(连续N会话未见失败,只计该工具被调用的会话)
+  │     └─ → decision_log.verify_count++
+  └─→ DigestGovernor → 会话结束写门控 digest;定期清理决策库/孤儿 injection
+新会话首 turn → DigestRouter(相关度+时间衰减)→ 注入 "Previous Session Digest"
+Heartbeat → 心跳落盘 + 自检(verify_count 零增长告警)
+```
+
+## 10. 测试策略
 
 | 组件 | 测试 |
 |---|---|
-| EvidenceTracker | 合成失败序列,验证 N 次未见失败后计数递增;单次未出现不计 |
-| DigestRouter | 多 digest,验证相关度优先于时间 |
-| FailureMatcher | 命中/未命中/重复失败阈值 |
-| DigestGovernor | 噪音会话不产出 digest;重复失败必产出 |
-| brain 截断修复 | ask_brain 端到端返回综合答案(非降级片段) |
+| 签名规格(§4.0) | 黄金样例集:过宽/过窄归一化用例;类别词表提取 |
+| EvidenceTracker | 主证据直接计数;弱证据仅计"该工具被调用的会话";单次未出现不计 |
+| DigestRouter | 相关度优先于时间;相关度平局时时间衰减兜底不劣于纯时间 |
+| FailureMatcher | 命中/未命中/重复失败阈值/重复劳动检测 |
+| DigestGovernor | 噪音会话不产出 digest;重复失败必产出;孤儿 injection 清理 |
+| 注入通道 | ≤2条/会话硬上限;dedup_key 去重;未消费不跨会话补投 |
+| Heartbeat | 心跳落盘;verify_count 零增长 N 天触发告警 |
+| UpgradeRunner | 白名单外路径拒绝写;分支隔离;人审门禁流程 |
+| brain 截断修复 | ask_brain 端到端返回综合答案(非降级片段);超轮返回部分结论 |
 | 并发隔离 | 守护进程与执行脑并发写 decision_log 无冲突 |
 
-## 8. 分批实施(每批独立可测)
+## 11. 分批实施(每批独立可测,批次 2 前补齐 4 缺口)
 
-- **批次 1(快修,执行进程内)**:brain 会话截断修复(迭代覆盖+输出预算)+ digest 写端门控。
-- **批次 2(守护进程骨架)**:brain-daemon 二进制 + SessionWatcher + FailureMatcher + 投喂注入。
-- **批次 3(验证环)**:EvidenceTracker 同签名演进 → verify_count 自然增长 → 失败辅导复活。
-- **批次 4(治理与升级)**:DigestRouter 相关度检索 + DigestGovernor 完善 + BrainAgent/UpgradeRunner(轻 LLM 提炼 + claw 架构升级亲自实施)。
+- **批次 1(快修,执行进程内)**:brain 会话截断修复(迭代覆盖+输出预算+超轮部分结论)+ digest 写端门控。
+- **批次 2(守护进程骨架)**:★失败签名规格(§4.0)+ brain-daemon 二进制 + SessionWatcher + FailureMatcher + **注入通道协议**(injections/ + 硬上限 + 读入机制)+ **Heartbeat 心跳与自检** + **shadow mode**(只记录本应投喂,不注入;用真实会话校准阈值后开闸)。
+- **批次 3(验证环)**:EvidenceTracker(主/弱证据口径)→ verify_count 自然增长 → 失败辅导复活。
+- **批次 4(治理与升级)**:DigestRouter 混合排序 + decision_log 清理 + BrainAgent(频率/token 门控)+ **UpgradeRunner(安全栏为验收条件:白名单/分支/人审/回滚/互斥/注入缓解)**。
 
-## 9. 诚实的不确定性
+## 12. 诚实的不确定性(评审后收编)
 
-- 连续未见失败 N 次作为"被绕开"证据是启发式:可能漏判(修复靠改环境而非改调用)或误判(任务变化导致不再触发)。批次 3 用真实决策库回测验证。
-- 主动旁听投喂频率未知:阈值需在批次 2 以真实会话校准,宁缺毋滥。
-- 管理脑亲自实施 claw 架构升级的风险:与用户项目工作区隔离需明确(管理脑仅对 claw workspace 有写权)。批次 4 先行试点低风险升级验证流程。
+- 主证据"同归一化调用后续成功"依赖对"相近输入"的判定,仍需黄金样例校准;批次 3 用真实决策库回测。
+- 投喂阈值与重复劳动检测维度需 shadow mode 用真实会话校准,宁缺毋滥。
+- DigestRouter 相关度对"任务表述 vs digest 表述"的语义鸿沟:混合排序是工程兜底,若实测不足再评估轻语义检索。
+- 管理脑写权隔离:白名单路径 + 分支 + 人审三层防线,批次 4 以低风险升级验证全流程。
+- "实时"实际语义 = 下一 turn 生效(投喂经注入通道,非运行中打断)。
