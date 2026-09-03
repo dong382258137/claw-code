@@ -1,5 +1,12 @@
 //! 轮次分诊门(Triage Gate)— 轮次感知上下文编译器(Phase 1)的第一环。
 //!
+//! # LLM 分诊降级路径(2026-09-04 升级后定位)
+//! 自入口全量 LLM 分诊上线(见 [`crate::triage_llm`])起,本模块的纯规则分诊
+//! **降级为 fallback**:LLM 调用被禁用(`CLAW_TRIAGE_MODE=rule`)/ 失败 /
+//! `with_model` 不可用等任何无法走 LLM 的路径,回退到这里按原语义判定。
+//! 本模块语义与实现保持稳定(不改动);升级只发生在调用方
+//! ([`crate::conversation::ConversationRuntime::triage_turn_llm`] 优先走 LLM)。
+//!
 //! 设计动机:状态/问答类简单轮次(如「上次任务执行到哪里了」)并不需要
 //! 完整的工具目录与能力层注入。在 prompt 组装之前,用一个纯确定性、零 LLM
 //! 的分诊门把用户轮次划分为两档:

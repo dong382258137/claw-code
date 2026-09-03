@@ -23,6 +23,11 @@ use crate::prompt::SystemPromptSplit;
 // Trivial 档(状态/问答短轮)只注入不变核+状态层+核心工具集,
 // 豁免工程类强制提醒;Standard 档保持现状全量注入。
 use crate::triage::{detect_upgrade_request, triage_turn, TriageContext, TriageTier};
+// P1(升级):入口全量 LLM 分诊 —— 纯规则 triage 降级为 fallback(见
+// triage_llm.rs)。ConversationRuntime::triage_turn_llm 每 turn 优先用一次
+// 轻量 LLM 调用(deepseek-v4-flash)判断档位;LLM 失败/禁用/with_model
+// 不可用时回退 triage_turn 纯规则。
+use crate::triage_llm::{parse_triage_label, triage_llm_enabled, TRIAGE_LLM_SYSTEM, TRIAGE_MODEL};
 // Harness L(生命周期)层接入:run_turn 失败分支调用 RecoveryOrchestrator 尝试一次自动恢复。
 // 详见 docs/harness-engineering-optimization-plan.md Step 1.2。
 use crate::recovery_orchestrator::RecoveryOrchestrator;
@@ -3176,6 +3181,115 @@ where
         }
     }
 
+    /// 纯规则分诊 —— LLM 分诊的降级路径。
+    ///
+    /// 语义与 Task 3 完全一致(见 [`crate::triage::triage_turn`]):
+    /// 单向升级锁存 > 超长 > 工程动词 > 状态特征,纯确定性零 LLM。
+    /// 仅在 LLM 分诊不可用(env `CLAW_TRIAGE_MODE=rule`)/ LLM 请求失败 /
+    /// 解析无结果 / `with_model` 不可用时调用。
+    fn rule_triage(&self, user_text: &str) -> TriageTier {
+        let ctx = TriageContext {
+            upgrade_requested: self.triage_upgrade_requested,
+        };
+        triage_turn(user_text, &ctx)
+    }
+
+    /// 入口全量 LLM 分诊:每个用户 turn 在请求构造前,用一次轻量 LLM 调用
+    /// (deepseek-v4-flash,见 [`crate::triage_llm`])判断档位。
+    ///
+    /// # 流程
+    /// 1. `CLAW_TRIAGE_MODE=rule` → 直接走纯规则([`Self::rule_triage`]);
+    /// 2. 会话已单向升级(`triage_upgrade_requested`)→ 恒 Standard
+    ///    (与纯规则优先级 1 语义一致,且省一次 LLM 调用);
+    /// 3. 构造最小 `ApiRequest`:仅分诊 system prompt + 单条 user 文本;
+    /// 4. 优先 `api_client.with_model(TRIAGE_MODEL)` 拿独立 flash client,
+    ///    取其首轮 assistant 文本(参考 [`execute_subagent_llm`] 的事件消费);
+    /// 5. [`parse_triage_label`] 容错解析档位;
+    /// 6. 任何失败(网络/解析/无文本)→ 记录 diag → 回退纯规则。
+    ///    绝不因分诊失败阻断主流程。
+    ///
+    /// # 模型选择与「关闭思考」说明
+    /// - 模型固定 [`TRIAGE_MODEL`](`deepseek-v4-flash`):budget 档轻量模型,
+    ///   关闭思考即可胜任档位判断;
+    /// - 「关闭思考」在代码中的形态见 [`crate::triage_llm`] 模块注释:
+    ///   runtime `ApiRequest`(trait 边界)无 thinking 字段,无法显式携带
+    ///   `thinking: disabled`;`with_model` 新建 client 的 thinking_mode 为
+    ///   None(CLI 侧默认),实际请求体不发送 thinking 参数、走后端默认。
+    ///
+    /// # with_model 失败的处理(与"回退主 client"的取舍)
+    /// 原型设计为「with_model Err → 回退主 client 再发一次」。这里改为
+    /// **直接回退纯规则**:生产 `AnthropicRuntimeClient::with_model` 恒 Ok,
+    /// Err 分支实际只命中不支持换模型的 client(测试 mock / 简化实现)。
+    /// 若回退主 client 会向其注入一次额外分诊请求,打乱既有调用方的
+    /// 请求-响应配对(所有既有 run_turn 测试的 mock 均不实现 with_model);
+    /// 直接纯规则零成本且语义保守,符合「宁可不裁剪也不误伤」。
+    async fn triage_turn_llm(&mut self, user_text: &str) -> TriageTier {
+        // 1. env 开关:CLAW_TRIAGE_MODE=rule → 纯规则(默认 llm,缺失/非法同 llm)。
+        if !triage_llm_enabled() {
+            return self.rule_triage(user_text);
+        }
+        // 2. 单向升级锁存:会话内恒 Standard(省一次调用,与纯规则优先级 1 一致)。
+        if self.triage_upgrade_requested {
+            return TriageTier::Standard;
+        }
+        // 4a. 独立 flash client(with_model 构造 enable_tools=false 轻量子 client)。
+        //     with_model 不可用 → 纯规则降级(见方法级注释的取舍说明)。
+        let Ok(mut triage_client) = self.api_client.with_model(TRIAGE_MODEL) else {
+            self.emit_diag("[diag] triage_llm with_model unsupported -> rule fallback".to_string());
+            return self.rule_triage(user_text);
+        };
+        // 3. 最小请求:单条 user 文本 + 分诊 system prompt(全静态,保缓存命中)。
+        let request = ApiRequest {
+            system_prompt: SystemPromptSplit::from_sections(vec![TRIAGE_LLM_SYSTEM.to_string()]),
+            messages: vec![ConversationMessage::user_text(user_text.to_string())],
+            // 与 execute_subagent_llm 一致用 Subagent 路由:分诊请求经 CLI client
+            // 归入 `subagent-{session}` 独立缓存统计,不污染主对话 session 统计。
+            // (Main 路由会把分诊 usage 记进主 session 指纹序列,干扰 cache-stats。)
+            request_kind: RequestKind::Subagent,
+            // 分诊请求不参与下游 tools 裁剪(with_model client 已 enable_tools=false),
+            // tier 标记留空即可。
+            triage_tier: None,
+        };
+        // 4b. 只取第一轮 assistant 文本(参考 execute_subagent_llm 的事件消费方式)。
+        match triage_client.stream_async(request).await {
+            Ok(events) => match build_assistant_message(events) {
+                Ok((message, _, _)) => {
+                    let text: String = message
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if text.trim().is_empty() {
+                        // 无文本(如思考块独占)视为解析失败 → 纯规则兜底。
+                        self.emit_diag("[diag] triage_llm empty text -> rule fallback".to_string());
+                        return self.rule_triage(user_text);
+                    }
+                    // 5. 容错解析(无匹配 → Standard 保守兜底)。
+                    let tier = parse_triage_label(&text);
+                    self.emit_diag(format!("[diag] triage_llm_tier={tier:?}"));
+                    tier
+                }
+                Err(e) => {
+                    // 6. 解析失败 → 纯规则降级,绝不阻断主流程。
+                    self.emit_diag(format!(
+                        "[diag] triage_llm parse failed ({e}) -> rule fallback"
+                    ));
+                    self.rule_triage(user_text)
+                }
+            },
+            Err(e) => {
+                // 6. 网络/API 失败 → 纯规则降级,绝不阻断主流程。
+                self.emit_diag(format!(
+                    "[diag] triage_llm request failed ({e}) -> rule fallback"
+                ));
+                self.rule_triage(user_text)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn run_turn_async(
         &mut self,
@@ -3277,18 +3391,15 @@ where
         // 锚点,模型不再依赖 NOTEBOOK(旧任务)推断而反复自我定位"新任务"。
         self.maybe_extract_goal_at_turn_start(&user_input);
 
-        // P1(轮次感知上下文编译器 · Task 3):分诊接入请求构造 —— 本 turn 档位。
-        // 规则(见 triage.rs):单向升级锁存 > 超长 > 工程动词 > 状态特征,
-        // 纯确定性零 LLM。Trivial 档(状态/问答短轮)在请求构造时只注入
+        // P1(轮次感知上下文编译器 · Task 3 → 升级):分诊接入请求构造 ——
+        // 本 turn 档位。入口全量 LLM 分诊(见 triage_llm.rs):每 turn 在请求
+        // 构造前用一次轻量 LLM 调用(deepseek-v4-flash)判断档位;纯规则
+        // triage_turn 降级为 fallback(CLAW_TRIAGE_MODE=rule / LLM 失败 /
+        // with_model 不可用)。Trivial 档(状态/问答短轮)在请求构造时只注入
         // 不变核 + 状态层 + 核心工具集,并豁免工程类强制提醒;Standard 档
         // 保持现状全量(与 P0 快照等价)。档位在 turn 开头判定一次,
         // 本 turn 所有迭代共用(turn 是分诊的最小单位)。
-        let turn_tier = {
-            let ctx = TriageContext {
-                upgrade_requested: self.triage_upgrade_requested,
-            };
-            triage_turn(&user_input, &ctx)
-        };
+        let turn_tier = self.triage_turn_llm(&user_input).await;
         self.emit_diag(format!("[diag] triage_tier={turn_tier:?}"));
 
         // Harness O(编排)层接入:Plan/Execute/Review 三段循环入口。
@@ -20482,6 +20593,351 @@ mod tests {
         assert!(
             request_text.contains("#4 MACD 交叉 vs 面积缩量确认回测(脚本已写好待全量跑)"),
             "digest 应直接携带答案,避免模型考古"
+        );
+    }
+
+    // ===== P1(升级):入口全量 LLM 分诊 —— 集成测试(mock 脚本化)=====
+    //
+    // 这些测试的 client 实现 `with_model`,使分诊请求经独立"分诊子 client"
+    // 与主对话请求互不串扰;既有测试的 mock 不实现 with_model
+    // (→ 默认 Err → 纯规则降级),因此不受本次升级影响。
+    //
+    // 所有触碰 `CLAW_TRIAGE_MODE`(或依赖其默认值)的测试共享
+    // `crate::triage_llm::TRIAGE_ENV_LOCK`,避免并行污染环境变量。
+    use std::sync::atomic::Ordering;
+
+    /// `with_model` 下发的分诊子 client:只接收 triage 请求,按脚本回复。
+    struct TriageSubApi {
+        /// 每次调用依次返回的 assistant 文本(耗尽 → 空文本,走解析失败降级)。
+        replies: Vec<String>,
+        /// 非 None 时 stream 直接返回 Err(模拟网络/API 失败)。
+        err: Option<String>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        captured: Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+    }
+    impl ApiClient for TriageSubApi {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.captured.lock().expect("lock").push(request.clone());
+            if let Some(message) = &self.err {
+                return Err(RuntimeError::new(message.clone()));
+            }
+            let index = self
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(1);
+            let text = self.replies.get(index).cloned().unwrap_or_default();
+            Ok(vec![
+                AssistantEvent::TextDelta(text),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    /// 主对话 client:捕获主请求 + 按脚本回复;`with_model` 返回分诊子 client。
+    struct TriageMainApi {
+        captured: Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+        /// 主请求文本回复脚本(耗尽 → 复用最后一条)。
+        replies: Vec<String>,
+        next_reply: Arc<std::sync::atomic::AtomicUsize>,
+        /// with_model 被调用次数(rule 模式 / 升级锁存后应不增长)。
+        with_model_calls: Arc<std::sync::atomic::AtomicUsize>,
+        sub_replies: Vec<String>,
+        sub_err: Option<String>,
+        sub_calls: Arc<std::sync::atomic::AtomicUsize>,
+        sub_captured: Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+    }
+    impl ApiClient for TriageMainApi {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.captured.lock().expect("lock").push(request.clone());
+            let index = self
+                .next_reply
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = self
+                .replies
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| self.replies.last().cloned().unwrap_or_default());
+            Ok(vec![
+                AssistantEvent::TextDelta(text),
+                AssistantEvent::MessageStop,
+            ])
+        }
+        fn with_model(&self, model: &str) -> Result<Box<dyn ApiClient>, String> {
+            assert_eq!(
+                model,
+                crate::triage_llm::TRIAGE_MODEL,
+                "分诊应固定走 deepseek-v4-flash 轻量模型"
+            );
+            self.with_model_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(TriageSubApi {
+                replies: self.sub_replies.clone(),
+                err: self.sub_err.clone(),
+                calls: Arc::clone(&self.sub_calls),
+                captured: Arc::clone(&self.sub_captured),
+            }))
+        }
+    }
+
+    /// 组装带 LLM 分诊能力的测试 runtime(默认 llm 模式;测试开头先清 env)。
+    fn llm_triage_runtime(
+        main_replies: Vec<String>,
+        sub_replies: Vec<String>,
+        sub_err: Option<String>,
+    ) -> (
+        ConversationRuntime<TriageMainApi, StaticToolExecutor>,
+        Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+        Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        // 注意:本 helper 不触碰 `CLAW_TRIAGE_MODE` env —— env 由各测试自行
+        // 显式设置(llm 默认 / rule),避免 helper 误清 rule 测试刚设的值。
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub_captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let with_model_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sub_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            TriageMainApi {
+                captured: Arc::clone(&captured),
+                replies: main_replies,
+                next_reply: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                with_model_calls: Arc::clone(&with_model_calls),
+                sub_replies,
+                sub_err,
+                sub_calls: Arc::clone(&sub_calls),
+                sub_captured: Arc::clone(&sub_captured),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        (runtime, captured, sub_captured, with_model_calls, sub_calls)
+    }
+
+    /// 断言分诊请求的最小形态:单条 user 文本 + 分诊 system prompt。
+    fn assert_triage_request_shape(request: &ApiRequest, user_text: &str) {
+        assert_eq!(
+            request.system_prompt,
+            SystemPromptSplit::from_sections(
+                vec![crate::triage_llm::TRIAGE_LLM_SYSTEM.to_string()]
+            ),
+            "分诊请求应只带分诊 system prompt"
+        );
+        assert_eq!(request.messages.len(), 1, "分诊请求应只有一条 user 消息");
+        assert_eq!(request.messages[0].role, MessageRole::User);
+        let text: String = request.messages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains(user_text),
+            "分诊请求应携带原始用户文本: {text}"
+        );
+        assert_eq!(request.request_kind, RequestKind::Subagent);
+        assert_eq!(request.triage_tier, None, "分诊请求本身不参与裁剪");
+    }
+
+    /// LLM 分诊返回 `trivial` → 状态问句 turn 的主请求档位 = Trivial。
+    #[test]
+    fn llm_triage_trivial_marks_status_turn_trivial() {
+        let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(crate::triage_llm::TRIAGE_MODE_ENV); // 显式 llm 默认
+        let (mut runtime, captured, sub_captured, with_model_calls, sub_calls) = llm_triage_runtime(
+            vec!["上次任务已到第 3 步。".to_string()],
+            vec!["trivial".to_string()],
+            None,
+        );
+        runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("turn should succeed");
+        assert_eq!(with_model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
+        // 分诊请求形态 + 解析结果。
+        let sub_reqs = sub_captured.lock().expect("lock");
+        assert_eq!(sub_reqs.len(), 1);
+        assert_triage_request_shape(&sub_reqs[0], "上次任务执行到哪里了");
+        drop(sub_reqs);
+        // 主请求档位随 LLM 分诊结果下发。
+        let reqs = captured.lock().expect("lock");
+        assert_eq!(reqs.len(), 1, "纯文本答复应一次主请求结束");
+        assert_eq!(
+            reqs[0].triage_tier,
+            Some(TriageTier::Trivial),
+            "LLM 判 trivial → 主请求应为 Trivial 档"
+        );
+    }
+
+    /// LLM 分诊返回 `standard` → 工程句 turn 得 Standard。
+    #[test]
+    fn llm_triage_standard_marks_engineering_turn_standard() {
+        let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(crate::triage_llm::TRIAGE_MODE_ENV); // 显式 llm 默认
+        let (mut runtime, captured, _sub_captured, with_model_calls, sub_calls) =
+            llm_triage_runtime(
+                vec!["已修复。".to_string()],
+                vec!["standard".to_string()],
+                None,
+            );
+        runtime
+            .run_turn("帮我修复这个 bug", None)
+            .expect("turn should succeed");
+        assert_eq!(with_model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
+        let reqs = captured.lock().expect("lock");
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].triage_tier,
+            Some(TriageTier::Standard),
+            "LLM 判 standard → 主请求应为 Standard 档"
+        );
+    }
+
+    /// LLM 分诊返回 Err → 降级走纯规则,主流程正常不 panic。
+    #[test]
+    fn llm_triage_stream_error_falls_back_to_rule() {
+        let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(crate::triage_llm::TRIAGE_MODE_ENV); // 显式 llm 默认
+        let (mut runtime, captured, _sub_captured, with_model_calls, sub_calls) =
+            llm_triage_runtime(
+                vec!["上次任务已到第 3 步。".to_string()],
+                Vec::new(),
+                Some("upstream failed".to_string()),
+            );
+        runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("triage 失败不得阻断主流程");
+        assert_eq!(with_model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
+        let reqs = captured.lock().expect("lock");
+        assert_eq!(reqs.len(), 1);
+        // 纯规则对状态问句判 Trivial(与 triage_turn 结果一致)。
+        assert_eq!(
+            reqs[0].triage_tier,
+            Some(TriageTier::Trivial),
+            "LLM Err → 回退纯规则:状态问句应判 Trivial"
+        );
+    }
+
+    /// LLM 分诊返回空文本 → 解析失败 → 降级走纯规则,主流程正常。
+    #[test]
+    fn llm_triage_empty_reply_falls_back_to_rule() {
+        let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(crate::triage_llm::TRIAGE_MODE_ENV); // 显式 llm 默认
+        let (mut runtime, captured, _sub_captured, with_model_calls, sub_calls) =
+            llm_triage_runtime(vec!["已修复。".to_string()], Vec::new(), None);
+        runtime
+            .run_turn("帮我修复这个 bug", None)
+            .expect("triage 空回复不得阻断主流程");
+        assert_eq!(with_model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
+        let reqs = captured.lock().expect("lock");
+        assert_eq!(reqs.len(), 1);
+        // 纯规则对工程句判 Standard(与 triage_turn 结果一致)。
+        assert_eq!(
+            reqs[0].triage_tier,
+            Some(TriageTier::Standard),
+            "LLM 空回复 → 回退纯规则:工程句应判 Standard"
+        );
+    }
+
+    /// `CLAW_TRIAGE_MODE=rule` → 不调用 mock(with_model 0 次),走纯规则。
+    #[test]
+    fn rule_mode_skips_llm_triage_entirely() {
+        let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(crate::triage_llm::TRIAGE_MODE_ENV, "rule");
+        let (mut runtime, captured, sub_captured, with_model_calls, sub_calls) = llm_triage_runtime(
+            vec!["已修复。".to_string()],
+            vec!["trivial".to_string()],
+            None,
+        );
+        runtime
+            .run_turn("帮我修复这个 bug", None)
+            .expect("turn should succeed");
+        std::env::remove_var(crate::triage_llm::TRIAGE_MODE_ENV);
+        assert_eq!(
+            with_model_calls.load(Ordering::SeqCst),
+            0,
+            "rule 模式不得触发 with_model"
+        );
+        assert_eq!(
+            sub_calls.load(Ordering::SeqCst),
+            0,
+            "rule 模式不得调分诊 mock"
+        );
+        assert_eq!(
+            sub_captured.lock().expect("lock").len(),
+            0,
+            "rule 模式不应产生分诊请求"
+        );
+        let reqs = captured.lock().expect("lock");
+        assert_eq!(reqs.len(), 1, "rule 模式只发主请求");
+        assert_eq!(
+            reqs[0].triage_tier,
+            Some(TriageTier::Standard),
+            "纯规则对工程句判 Standard"
+        );
+    }
+
+    /// 会话已单向升级锁存后:后续 turn 不再调分诊 mock,恒 Standard。
+    #[test]
+    fn upgraded_latch_skips_llm_triage_and_locks_standard() {
+        let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(crate::triage_llm::TRIAGE_MODE_ENV); // 显式 llm 默认
+        let (mut runtime, captured, _sub_captured, with_model_calls, sub_calls) =
+            llm_triage_runtime(
+                vec![
+                    "分析完成。[LOAD_FULL_CONTEXT] 请继续。".to_string(),
+                    "好的,已按完整上下文继续。".to_string(),
+                ],
+                vec!["trivial".to_string()],
+                None,
+            );
+        // turn 1:LLM 分诊正常(1 次调用),主回复带升级标记 → 锁存。
+        runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("turn 1 should succeed");
+        assert_eq!(with_model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
+        // turn 2:已锁存 → 直接 Standard,不再调分诊 mock。
+        runtime
+            .run_turn("上次任务执行到哪里了", None)
+            .expect("turn 2 should succeed");
+        assert_eq!(
+            with_model_calls.load(Ordering::SeqCst),
+            1,
+            "升级锁存后不得再调 with_model"
+        );
+        assert_eq!(
+            sub_calls.load(Ordering::SeqCst),
+            1,
+            "升级锁存后不得再调分诊 mock"
+        );
+        let reqs = captured.lock().expect("lock");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].triage_tier, Some(TriageTier::Trivial));
+        assert_eq!(
+            reqs[1].triage_tier,
+            Some(TriageTier::Standard),
+            "升级锁存后恒 Standard"
         );
     }
 }
