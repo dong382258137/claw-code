@@ -942,15 +942,8 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
     }
-    if let Some(ref gc) = project_context.git_context {
-        if !gc.recent_commits.is_empty() {
-            lines.push(String::new());
-            lines.push("Recent commits (last 5):".to_string());
-            for c in &gc.recent_commits {
-                lines.push(format!("  {} {}", c.hash, c.subject));
-            }
-        }
-    }
+    // 单一事实来源:commits/branch/staged 统一由 GitContext::render() 输出,
+    // 不再在此手写循环重复渲染同一批 recent_commits(曾导致同段内 commits 双份)。
     if let Some(git_context) = &project_context.git_context {
         let rendered = git_context.render();
         if !rendered.is_empty() {
@@ -2154,8 +2147,15 @@ mod tests {
         assert!(status.contains("## main"));
         assert!(status.contains("A  d.txt"));
 
-        assert!(rendered.contains("Recent commits (last 5):"));
-        assert!(rendered.contains("first commit"));
+        // 单一事实来源(重复渲染修复):commits 只经 GitContext::render() 输出一次,
+        // 不再出现手写的 "Recent commits (last 5):" 独立块。
+        assert!(!rendered.contains("Recent commits (last 5):"));
+        assert!(rendered.contains("Recent commits:"));
+        assert_eq!(
+            rendered.matches("first commit").count(),
+            1,
+            "commit subject 不得在同段内重复渲染"
+        );
         assert!(rendered.contains("Git status snapshot:"));
         assert!(rendered.contains("## main"));
 

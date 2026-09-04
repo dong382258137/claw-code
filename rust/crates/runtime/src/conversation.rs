@@ -1245,6 +1245,31 @@ pub trait ApiClient: Send {
     }
 }
 
+/// 在 async 上下文中安全 drop 一个持有 `tokio::runtime::Runtime` 的值
+/// (如 `with_model` / `with_model_and_capability` 新建的独立 client)。
+///
+/// # 背景
+/// tokio 1.50 中多线程 `Runtime::drop` 需要进入 blocking region
+/// (runtime/blocking/shutdown.rs:44 `try_enter_blocking_region`);若 drop 发生
+/// 在 async 上下文(当前线程已 Entered 某个 runtime,如 [`run_turn`] 内部
+/// `rt.block_on(self.run_turn_async(...))` 的调用栈)会 panic:
+/// "Cannot drop a runtime in a context where blocking is not allowed"。
+/// 实测(2026-09-04):即使 runtime 未被驱动过,在 async 上下文 drop 同样 panic。
+///
+/// # 方案
+/// 当前线程在 runtime 上下文中时,把值 move 进 `tokio::task::spawn_blocking`,
+/// 在 blocking 线程池线程上 drop(该上下文允许 blocking,且不阻塞 async 驱动
+/// 线程),await 保证 drop 在 async 调用方返回前完成;否则(非 async 调用方)
+/// 原地 drop。与 `LlmBridge::call` / `run_web_sync_guarded` 的"运行时上下文外
+/// 执行"隔离思路一致。
+async fn drop_value_outside_async_ctx<T: Send + 'static>(value: T) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let _ = tokio::task::spawn_blocking(move || drop(value)).await;
+    } else {
+        drop(value);
+    }
+}
+
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 ///
 /// Epic 2.5(TRAE 架构对齐 §2.5.2):`Send` supertrait 使 `&mut dyn ToolExecutor`
@@ -3244,7 +3269,13 @@ where
             triage_tier: None,
         };
         // 4b. 只取第一轮 assistant 文本(参考 execute_subagent_llm 的事件消费方式)。
-        match triage_client.stream_async(request).await {
+        // 注意:分诊 client 由 with_model 新建,内部持有独立 tokio Runtime,不能在
+        // 本 async 上下文内直接 drop(多线程 Runtime::drop 需 blocking region,
+        // async 内会 panic "Cannot drop a runtime in a context where blocking is
+        // not allowed")。故请求完成后把 client 移到 spawn_blocking 线程上 drop。
+        let events_result = triage_client.stream_async(request).await;
+        drop_value_outside_async_ctx(triage_client).await;
+        match events_result {
             Ok(events) => match build_assistant_message(events) {
                 Ok((message, _, _)) => {
                     let text: String = message
@@ -6202,7 +6233,7 @@ where
         // Analyze 不启用工具;ReadOnly/Execute 按白名单启用
         match self.api_client.with_model_and_capability(model, capability) {
             Ok(mut sub_client) => {
-                execute_subagent_llm(
+                let outcome = execute_subagent_llm(
                     workspace_root,
                     workspace_override.as_deref(),
                     &mut *sub_client,
@@ -6214,7 +6245,12 @@ where
                     capability,
                     &ctx,
                 )
-                .await
+                .await;
+                // 与 triage_turn_llm 相同的 async 上下文 drop 约束:with_model_and_capability
+                // 新建的 client 持独立 tokio Runtime,不能在本 async 上下文内直接 drop
+                // (见 drop_value_outside_async_ctx),移到 spawn_blocking 线程上 drop。
+                drop_value_outside_async_ctx(sub_client).await;
+                outcome
             }
             Err(e) => {
                 // 降级:client 构造失败时回退到主 agent client(同模型重试)
@@ -8218,36 +8254,52 @@ where
             &self.session.session_id,
         );
         if !decisions.is_empty() {
+            let total = decisions.len();
+            // 改道(第一批):写入资格门控 —— 只放行产出了**可入库结论**的条目,
+            // 过程级提取(逐字推理草稿 / 原始工具回显 / 任务重述)不再写入
+            // NOTEBOOK `<decisions>` 注入段(曾导致前缀堆积同一任务的近似草稿)。
+            // 结论级条目改入 SQLite 经验库(auto_captured,process-extract),
+            // 可被 search_past_decisions 跨会话检索,但不注入前缀。
+            let graded: Vec<crate::decision_log::DecisionPoint> = decisions
+                .into_iter()
+                .filter(|d| crate::decision_log::is_conclusion_grade(&d.decision))
+                .collect();
+            let dropped = total - graded.len();
+            if !graded.is_empty() {
+                if let Some(decision_log) = &self.decision_log {
+                    for d in &graded {
+                        if let Err(e) =
+                            decision_log.log_process_extract(&self.session.session_id, d)
+                        {
+                            eprintln!("[decision_log] failed to persist process-extract: {e}");
+                        }
+                    }
+                }
+                // 同步写入 FTS5 索引(role="decision"),提升可检索性(§4.7.4)
+                if let Some(history_index) = self.session.history_index.as_ref() {
+                    for d in &graded {
+                        let content = format!(
+                            "[DECISION {}] context: {}\ndecision: {}\nrationale: {}\nalternatives: {}",
+                            d.id,
+                            d.context,
+                            d.decision,
+                            d.rationale,
+                            d.alternatives.join("; "),
+                        );
+                        let _ = history_index.index_message(
+                            &content,
+                            &d.session_id,
+                            "decision", // §4.7 v3 新增 role 类型
+                            0,          // message_index=0 表示决策点
+                            d.timestamp_ms,
+                        );
+                    }
+                }
+            }
             eprintln!(
-                "[decision_log] extracted {} decision point(s) before compaction",
-                decisions.len()
+                "[decision_log] compaction extract: {total} total, {} conclusion-grade kept, {dropped} process-noise dropped",
+                graded.len()
             );
-            // 持久化到 NOTEBOOK.md decisions 段(§4.7.2)
-            if let Some(ws) = &self.workspace_root {
-                if let Err(e) = crate::decision_log::persist_decisions_to_notebook(ws, &decisions) {
-                    eprintln!("[decision_log] failed to persist decisions to notebook: {e}");
-                }
-            }
-            // 同步写入 FTS5 索引(role="decision"),提升可检索性(§4.7.4)
-            if let Some(history_index) = self.session.history_index.as_ref() {
-                for d in &decisions {
-                    let content = format!(
-                        "[DECISION {}] context: {}\ndecision: {}\nrationale: {}\nalternatives: {}",
-                        d.id,
-                        d.context,
-                        d.decision,
-                        d.rationale,
-                        d.alternatives.join("; "),
-                    );
-                    let _ = history_index.index_message(
-                        &content,
-                        &d.session_id,
-                        "decision", // §4.7 v3 新增 role 类型
-                        0,          // message_index=0 表示决策点
-                        d.timestamp_ms,
-                    );
-                }
-            }
         }
 
         // 改进点 12:compaction 前提取实验证据(对比矩阵/基准数值等),
@@ -8959,12 +9011,12 @@ mod tests {
         build_assistant_message, build_branch_retry_task, build_runtime_hints_block,
         build_subagent_request, build_subagent_retry_context, build_subagent_system_prompt,
         compaction_threshold_for_context_window, default_subagent_tool_catalog,
-        extract_file_path_from_tool_input, is_repetition_warning, microcompact_preserve_recent,
-        parse_auto_compaction_threshold, parse_auto_compaction_threshold_opt, process_tool_uses,
-        rewrite_path_to_workspace_relative, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError,
-        StaticToolExecutor, SubagentContext, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
+        drop_value_outside_async_ctx, extract_file_path_from_tool_input, is_repetition_warning,
+        microcompact_preserve_recent, parse_auto_compaction_threshold,
+        parse_auto_compaction_threshold_opt, process_tool_uses, rewrite_path_to_workspace_relative,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor, SubagentContext,
+        ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
         MICROCOMPACT_PRESERVE_RECENT, RUNTIME_HINTS_HEADER, SESSION_SEARCH_TOOL_SPEC,
         SOFT_MAX_ITERATIONS, SURVEY_GUARD_THRESHOLD,
     };
@@ -19482,10 +19534,7 @@ mod tests {
             captured: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         }
         impl ApiClient for RecordingApi {
-            fn stream(
-                &mut self,
-                request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 for m in &request.messages {
                     for block in &m.blocks {
                         if let ContentBlock::Text { text } = block {
@@ -20807,18 +20856,22 @@ mod tests {
         }
     }
 
-    /// 组装带 LLM 分诊能力的测试 runtime(默认 llm 模式;测试开头先清 env)。
-    fn llm_triage_runtime(
-        main_replies: Vec<String>,
-        sub_replies: Vec<String>,
-        sub_err: Option<String>,
-    ) -> (
+    /// [`llm_triage_runtime`] 的返回类型(runtime + 两路请求捕获 + 两路调用计数),
+    /// 提取为 type alias 以满足 clippy::type-complexity。
+    type LlmTriageRuntime = (
         ConversationRuntime<TriageMainApi, StaticToolExecutor>,
         Arc<std::sync::Mutex<Vec<ApiRequest>>>,
         Arc<std::sync::Mutex<Vec<ApiRequest>>>,
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::atomic::AtomicUsize>,
-    ) {
+    );
+
+    /// 组装带 LLM 分诊能力的测试 runtime(默认 llm 模式;测试开头先清 env)。
+    fn llm_triage_runtime(
+        main_replies: Vec<String>,
+        sub_replies: Vec<String>,
+        sub_err: Option<String>,
+    ) -> LlmTriageRuntime {
         // 注意:本 helper 不触碰 `CLAW_TRIAGE_MODE` env —— env 由各测试自行
         // 显式设置(llm 默认 / off),避免 helper 误清 off 测试刚设的值。
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -21068,5 +21121,44 @@ mod tests {
             Some(TriageTier::Standard),
             "升级锁存后恒 Standard"
         );
+    }
+
+    /// 回归(2026-09-04):tokio 多线程 `Runtime` 在 async 上下文内 drop 会 panic
+    /// ("Cannot drop a runtime in a context where blocking is not allowed")。
+    /// 该语义是 `triage_turn_llm` / `run_subagent_turn_with_model` 必须经
+    /// `drop_value_outside_async_ctx` 释放 `with_model` 新建 client 的原因。
+    #[test]
+    fn raw_runtime_drop_inside_async_context_panics() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current_thread runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                let inner = tokio::runtime::Runtime::new().expect("create inner runtime");
+                drop(inner);
+            });
+        }));
+        assert!(
+            result.is_err(),
+            "tokio 1.50:多线程 Runtime 在 async 上下文 drop 必须 panic \
+             (见 drop_value_outside_async_ctx 注释),got {result:?}"
+        );
+    }
+
+    /// 回归(2026-09-04):`drop_value_outside_async_ctx` 把持 tokio Runtime 的值
+    /// 移到 spawn_blocking 线程上 drop,async 上下文内调用不得 panic ——
+    /// 生产 `AnthropicRuntimeClient::with_model` 新建的 client(持多线程
+    /// Runtime)经 `triage_turn_llm` / `run_subagent_turn_with_model` 走此路径。
+    #[test]
+    fn drop_value_outside_async_ctx_does_not_panic_in_async_context() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current_thread runtime");
+        rt.block_on(async {
+            drop_value_outside_async_ctx(tokio::runtime::Runtime::new().expect("inner runtime"))
+                .await;
+        });
     }
 }

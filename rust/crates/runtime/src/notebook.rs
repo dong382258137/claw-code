@@ -262,8 +262,11 @@ pub fn save_stable_snapshot(
 ///
 /// 顺序固定,便于 LLM 解析和人类阅读。
 ///
-/// §4.7 v3 新增 `decisions` 段:由 `decision_log::persist_decisions_to_notebook`
-/// 在 compaction 前自动写入,记录设计决策(为什么选 A 不选 B、权衡了什么)。
+/// §4.7 v3 新增 `decisions` 段。写入口(第一批改道后):**显式**通道 ——
+/// LLM 主动 `notebook_update`(结论级、自持格式)。compaction 前自动提取
+/// 已改道:结论级条目写入 SQLite 经验库(`log_process_extract`,
+/// `auto_captured,process-extract`),不再 append 本段 —— 曾导致过程级
+/// 草稿整条堆积注入前缀(实测同一验证任务 13 条近似重复)。
 /// 与 `attempted` 段(已尝试的方案及结论)正交:attempted 记录"做了什么",
 /// decisions 记录"为什么决定这样做"。
 pub const SECTION_TAGS: &[&str] = &[

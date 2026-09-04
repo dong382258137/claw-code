@@ -582,6 +582,89 @@ impl DecisionLog {
         Ok(format!("auto_captured id={id}"))
     }
 
+    /// compaction 前自动提取的**结论级**决策点入库(第一批改道)。
+    ///
+    /// 背景:改道前自动提取结果写入 NOTEBOOK.md `<decisions>` 注入段,过程级
+    /// 消息整条入库导致前缀堆积(实测同一验证任务 13 条近似草稿)。改道后:
+    /// - 结论级条目经 [`is_conclusion_grade`] 放行后由本方法写入 SQLite,
+    ///   可经 `search_past_decisions` 跨会话检索,**不注入**前缀;
+    /// - 过程级条目在调用方直接丢弃(不占检索面)。
+    ///
+    /// 字段映射(自动捕获无 LLM 结构化输出,对齐 tool-failure 通道语义):
+    /// - `problem_signature` = decision 文本首行(≤160 字符,紧凑可 FTS5 检索)
+    /// - `root_cause_hypothesis` = rationale(提取器已截断 ≤500)
+    /// - `applied_solution` = decision 全文(提取器已截断 ≤300)
+    /// - `verification_result` = `Pending`(未验证)
+    /// - `tags` = `["auto_captured", "process-extract"]`(与 LLM 主动记录/失败
+    ///   通道可区分)
+    ///
+    /// 去重:与 [`log_auto_captured_failure`] 同机制(simhash 汉明距离),重复跳过。
+    pub fn log_process_extract(
+        &self,
+        session_id: &str,
+        point: &DecisionPoint,
+    ) -> Result<String, DecisionLogError> {
+        let first_line = point.decision.lines().next().unwrap_or("").trim();
+        let signature = if first_line.is_empty() {
+            truncate_str(&point.decision, 160)
+        } else {
+            truncate_str(first_line, 160)
+        };
+
+        // simhash:签名 + process-extract 占位后缀(与 tool-failure 通道的
+        // `auto_captured` 后缀区分,避免两通道签名空间过近误去重)。
+        let simhash_text = format!("{signature} process-extract process-extract");
+        let similarity_hash = compute_simhash(&simhash_text) as i64;
+
+        // 用提取时间戳而非当前时间,保留决策发生的时序信息。
+        let timestamp_ms = point.timestamp_ms.max(1) as i64;
+
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+
+        // simhash 去重:扫描最近记录,汉明距离 ≤ 阈值视为重复。
+        let mut stmt =
+            conn.prepare("SELECT similarity_hash FROM decisions ORDER BY id DESC LIMIT ?1")?;
+        let existing: Vec<i64> = stmt
+            .query_map(params![Self::AUTO_CAPTURE_DEDUP_SCAN as i64], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let is_dup = existing.iter().any(|h| {
+            hamming_distance(h.unsigned_abs(), similarity_hash.unsigned_abs())
+                <= Self::AUTO_CAPTURE_DEDUP_THRESHOLD
+        });
+        if is_dup {
+            return Ok(format!("process-extract skipped (duplicate): {signature}"));
+        }
+
+        conn.execute(
+            "INSERT INTO decisions (
+                session_id, timestamp_ms, problem_signature, root_cause_hypothesis,
+                applied_solution, affected_files, verification_result,
+                verification_evidence, context_hash, similarity_hash, tags,
+                knowledge_source
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                session_id,
+                timestamp_ms,
+                signature,
+                truncate_str(&point.rationale, 500),
+                truncate_str(&point.decision, 300),
+                "[]",
+                "Pending",
+                None::<String>,
+                None::<String>,
+                similarity_hash,
+                Some("auto_captured,process-extract".to_string()),
+                "unknown",
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        Ok(format!("process-extract id={id}"))
+    }
+
     /// 搜索历史决策。
     ///
     /// 使用 FTS5 全文检索 + simhash 去重,返回 top-k 匹配。
@@ -1132,11 +1215,16 @@ fn migrate_schema(conn: &Connection) -> Result<(), DecisionLogError> {
 }
 
 // ===========================================================================
-// §4.7 设计决策自动提取(DecisionPoint)— compaction 前持久化设计决策
+// §4.7 设计决策自动提取(DecisionPoint)— compaction 前提取设计决策
 //
 // 与 §4.4 的 `DecisionLog`(修复经验库)正交:
 // - `DecisionLog` = LLM 主动调用的 SQLite 修复经验库
-// - `DecisionPoint` = compaction 前自动启发式提取的设计决策,持久化到 NOTEBOOK.md
+// - `DecisionPoint` = compaction 前自动启发式提取的设计决策候选
+//
+// 注入面改道(第一批):提取结果经 `is_conclusion_grade` 门控后,结论级条目
+// 经 `DecisionLog::log_process_extract` 写入 SQLite 经验库(可检索、不注入),
+// **不再**持久化到 NOTEBOOK.md `<decisions>` 注入段 —— 过程级草稿整条堆积
+// 注入前缀是旧行为(实测同一验证任务 13 条近似重复)。
 //
 // 与 §4.1 的 `diag!` 互补:
 // - `diag!` 记录"发生了什么"(运行时信号:panic/error/状态变更)
@@ -1145,8 +1233,10 @@ fn migrate_schema(conn: &Connection) -> Result<(), DecisionLogError> {
 
 /// 决策点 — 一个关键设计决策的完整记录(§4.7)。
 ///
-/// 在 context compaction 触发前,从待压缩消息中启发式提取,
-/// 持久化到 NOTEBOOK.md `<decisions>` 段 + FTS5 history_index(role="decision")。
+/// 在 context compaction 触发前,从待压缩消息中启发式提取。经
+/// [`is_conclusion_grade`] 门控的结论级条目写入 SQLite 经验库
+/// ([`DecisionLog::log_process_extract`])并索引 FTS5 history_index
+/// (role="decision");不再持久化到 NOTEBOOK.md 注入段(第一批改道)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionPoint {
     /// 决策 ID(时间戳 + 消息序号哈希)。
@@ -1269,6 +1359,57 @@ pub fn detect_decision_signal(message_text: &str) -> bool {
     DECISION_KEYWORDS
         .iter()
         .any(|kw| lower.contains(&kw.to_ascii_lowercase()))
+}
+
+/// 结论级门控判定:一段文本是否产出了**可入库的结论**,而非过程叙述。
+///
+/// 供 compaction 自动提取改道使用(第一批)。写入资格 = 有显式结论信号:
+/// 逐字推理草稿("Let me continue verifying...")、原始工具回显(read_file
+/// JSON)、任务重述均不满足,应被丢弃;只有命中显式总结/验证收尾/状态判定
+/// 的条目才值得占用检索面(SQLite)与 FTS 索引。
+///
+/// 判定策略:命中任一强结论信号词即视为结论级。宁紧勿松 —— 过程级半成品
+/// 分析的确定性结论由 `log_auto_captured_failure`(工具失败通道)承载,
+/// 此处漏掉过程消息是可接受的,总好过再让流水草稿进注入面。
+#[must_use]
+pub fn is_conclusion_grade(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    // 中文信号 + 多词英文短语:contains 精确匹配即可,误伤率低。
+    const PHRASE_SIGNALS: &[&str] = &[
+        "总结",
+        "结论",
+        "综上",
+        "综上所述",
+        "验证完成",
+        "交叉验证完成",
+        "修复完成",
+        "已修复",
+        "验证结果",
+        "最终",
+        "CROSS-VERIFICATION",
+        "VERIFICATION COMPLETE",
+    ];
+    if PHRASE_SIGNALS.iter().any(|s| upper.contains(s)) {
+        return true;
+    }
+    // 单 token 英文状态词:按词边界匹配(非字母数字分割),
+    // 避免 "failure / failed / pass-through" 之类子串误伤 "FAIL"/"PASS"。
+    const WORD_SIGNALS: &[&str] = &[
+        "CONCLUSION",
+        "SUMMARY",
+        "DECIDED",
+        "CONFIRMED",
+        "REJECTED",
+        "VERIFIED",
+        "PASS",
+        "FAIL",
+        "SUCCESS",
+        "SUCCEED",
+        "FIXED",
+    ];
+    upper
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| !t.is_empty() && WORD_SIGNALS.contains(&t))
 }
 
 /// 从待压缩的消息列表中提取决策点(§4.7)。
@@ -2683,6 +2824,118 @@ mod tests {
         let decisions =
             extract_decisions_before_compaction(&messages, &DetectionStrategy::Heuristic, "sess");
         assert!(decisions.is_empty());
+    }
+
+    // ---- 结论级门控(第一批改道) ----
+
+    #[test]
+    fn is_conclusion_grade_rejects_process_noise() {
+        // 取自 NOTEBOOK <decisions> 段实证的过程级条目:逐字推理草稿、原始
+        // 工具 JSON 回显、任务重述 —— 均不满足"产出了可入库的结论"。
+        let process_samples = [
+            // d1786708 逐字推理草稿
+            "Let me continue verifying. I have enough evidence now. Let me look at the key finding: \
+             both parallel subagents (subagent-2, subagent-3) reported tools_used: [] and claimed \
+             they were configured to not need to call tools. This is interesting",
+            // d1786708 read_file 原始 JSON 回显
+            r#"read_file
+{
+  "type": "text",
+  "file": {
+    "filePath": "\\?\D:\claw-code-src\rust\crates\runtime\src\conversation.rs",
+    "content": "fn run_turn_async"
+  }
+}"#,
+            // d1786708 中途状态复述
+            "Let me look at the plan status. It says 1=pending. Let me continue verifying. \
+             I have the key evidence. Let me now understand the failure better.",
+            // d1786713 任务指令重述
+            "The user wants me to execute a real DAG parallel subagent end-to-end verification. \
+             Let me proceed with the verification task. The user's instructions: 1. Call \
+             spawn_parallel_subagents with 3 subagents, capability=read-only.",
+        ];
+        for sample in process_samples {
+            assert!(
+                !is_conclusion_grade(sample),
+                "过程级样本不应判定为结论级: {:.60}",
+                sample
+            );
+        }
+    }
+
+    #[test]
+    fn is_conclusion_grade_accepts_final_summary() {
+        // 终稿级条目:显式总结 + 状态判定 / 验证收尾。
+        let conclusion_samples = [
+            // d1786713 交叉验证完成总结
+            "所有交叉验证完成。现在总结: 1. subagent-1 (probe-read-file): tools_used: [read_file], \
+             报告第 2 行 members = [\"crates/*\"], 与主机侧真实文件逐字符一致。PASS",
+            // 带 PASS/FAIL 的测试收尾
+            "Let me analyze what happened: Test 1 (dispatch_subagent): SUCCESS. \
+             Test 2 (spawn_parallel_subagents): FAIL with judge score below threshold.",
+            // 中文显式结论
+            "结论: 采用 SQLite 存储决策日志,因为 FTS5 支持全文检索且零额外依赖。",
+        ];
+        for sample in conclusion_samples {
+            assert!(
+                is_conclusion_grade(sample),
+                "结论级样本应被判定为结论级: {:.60}",
+                sample
+            );
+        }
+    }
+
+    #[test]
+    fn log_process_extract_persists_searchable_with_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+        let point = DecisionPoint {
+            id: "d_test-1".to_string(),
+            context: "verify orchestration fixes".to_string(),
+            decision: "所有交叉验证完成。现在总结: subagent-1 (probe-read-file) PASS, \
+                       subagent-2 (probe-grep) PASS, subagent-3 (probe-glob) PASS"
+                .to_string(),
+            rationale: "three probes match host-side ground truth character by character"
+                .to_string(),
+            alternatives: Vec::new(),
+            timestamp_ms: 1_700_000_000_000,
+            session_id: "test-sess".to_string(),
+        };
+
+        let result = log.log_process_extract("test-sess", &point).unwrap();
+        assert!(result.starts_with("process-extract id="), "{result}");
+
+        // 可被 search_past_decisions 检索,且带 auto_captured,process-extract 标记
+        let hits = log.search_decisions("probe-read-file", 5).unwrap();
+        assert!(hits.contains("probe-read-file"), "{hits}");
+        assert!(
+            hits.contains("auto_captured,process-extract"),
+            "应带 process-extract 标记: {hits}"
+        );
+    }
+
+    #[test]
+    fn log_process_extract_dedups_repeat_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DecisionLog::open(dir.path()).unwrap();
+        let point = DecisionPoint {
+            id: "d_test-2".to_string(),
+            context: String::new(),
+            decision: "验证完成: 三个探针与主机侧一致,全部 PASS".to_string(),
+            rationale: String::new(),
+            alternatives: Vec::new(),
+            timestamp_ms: 1_700_000_000_001,
+            session_id: "test-sess".to_string(),
+        };
+
+        let first = log.log_process_extract("test-sess", &point).unwrap();
+        assert!(first.starts_with("process-extract id="), "{first}");
+        // 同签名重复 → simhash 去重跳过,不刷屏
+        let second = log.log_process_extract("test-sess", &point).unwrap();
+        assert!(
+            second.contains("skipped (duplicate)"),
+            "重复记录应被去重跳过: {second}"
+        );
     }
 
     #[test]
