@@ -837,6 +837,27 @@ pub fn mark_plan_stale(workspace_root: &Path) {
     let _ = std::fs::write(&path, b"");
 }
 
+/// P1-7:仅当会话 `<plan>` 段真有内容时标记 stale(源头结构省略)。
+///
+/// 背景:旧实现无条件在会话结束标记 stale,下一会话首 turn 便注入
+/// "刷新 plan" 的 Session Handoff 待办 —— 元问答 / 无计划会话的 plan
+/// 为空,该提醒毫无意义,且注入文本里的"若与上会话无关可忽略"只是软
+/// 提示(会话实测仍造成干扰)。本函数把条件放到源头:plan 为空的会话
+/// 根本不产生 marker,下一会话的 Session Handoff 槽位整段省略,无需
+/// LLM 判断"这是不是元问答"。
+///
+/// 返回 `true` 表示已写入 marker(plan 有内容),`false` 表示跳过。
+pub fn mark_plan_stale_if_content(workspace_root: &Path, session_id: &str) -> bool {
+    let plan_has_content = Notebook::load_with_session(workspace_root, session_id)
+        .ok()
+        .and_then(|nb| nb.get_section("plan").map(|p| !p.trim().is_empty()))
+        .unwrap_or(false);
+    if plan_has_content {
+        mark_plan_stale(workspace_root);
+    }
+    plan_has_content
+}
+
 /// 检测 NOTEBOOK `<plan>` 段是否被标记为 stale。
 ///
 /// 返回 `true` 表示上一会话结束时标记了 stale,当前会话首 turn 应注入
@@ -1510,6 +1531,36 @@ mod tests {
         );
         assert!(sec.contains("cmd 99"), "保留最新的尝试");
         assert!(!sec.contains("cmd 0"), "最旧的尝试被裁剪");
+    }
+
+    // ---- P1-7:plan stale marker 源头条件化(plan 非空才标记) ----
+
+    #[test]
+    fn mark_plan_stale_only_when_plan_has_content() {
+        let dir = temp_workspace();
+        let session = "sess-a";
+        // plan 为空(新会话默认)→ 不产生 marker(元问答/无计划会话)。
+        assert!(!mark_plan_stale_if_content(dir.path(), session));
+        assert!(!is_plan_stale(dir.path()), "空 plan 不应产生 marker");
+
+        // 写入会话级 plan 段(真实任务会话)。
+        let mut nb = Notebook::new();
+        nb.set_section(
+            "plan",
+            "验证编排双修复:dispatch_subagent + spawn_parallel_subagents",
+        );
+        nb.save_with_session(dir.path(), session)
+            .expect("save session notebook");
+
+        assert!(
+            mark_plan_stale_if_content(dir.path(), session),
+            "plan 非空应标记 stale"
+        );
+        assert!(is_plan_stale(dir.path()), "marker 应存在");
+
+        // 清理 marker。
+        clear_plan_stale(dir.path());
+        assert!(!is_plan_stale(dir.path()), "clear 后 marker 应消失");
     }
 
     // ---- decisions 段精炼回显(第二批:注入资格 = 显式 log_decision) ----

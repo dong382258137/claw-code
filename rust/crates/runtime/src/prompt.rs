@@ -632,10 +632,13 @@ impl SystemPromptBuilder {
         ));
         // ── 状态层 StateLayer:会话/工作区动态状态段 ──
         if let Some(memory) = &self.persistent_memory {
-            fragments.push(PromptFragment::new(
-                SectionTier::StateLayer,
-                render_persistent_memory_section(memory),
-            ));
+            // P1-5a:全空时省略整段(避免每轮注入 `_(empty)_` 占位噪音)。
+            if memory.has_content() {
+                fragments.push(PromptFragment::new(
+                    SectionTier::StateLayer,
+                    render_persistent_memory_section(memory),
+                ));
+            }
         }
         if let Some(map) = &self.repomap_rendered {
             let section = render_repomap_section(map);
@@ -891,7 +894,21 @@ fn discover_instruction_files(
             push_context_file(&mut files, candidate)?;
         }
     }
+    // P1-6:样板跳过 —— 脚手架模板残留(如用户主目录 CLAUDE.md)无项目规则,
+    // 注入只会与真实规则并存产生伪冲突,收集阶段直接剔除。
+    files.retain(|f| !is_template_placeholder(&f.content));
     Ok(dedupe_instruction_files(files))
+}
+
+/// 无信息量样板检测:内容是脚手架模板占位(未检测语言 / 验证命令留空),
+/// 而非项目真实规则。
+///
+/// 模板特征(Claw/Claude 脚手架生成文件):含 "No specific language markers"
+/// 或 "no specific starter markers" 占位语。正常项目文件不会出现这些短语。
+#[must_use]
+fn is_template_placeholder(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("no specific language markers") || lower.contains("no specific starter markers")
 }
 
 fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {
@@ -1323,7 +1340,16 @@ fn get_simple_doing_tasks_section() -> String {
 fn get_execution_style_section() -> String {
     "## Execution Style\n\
      Be concise. Do not restate context, repeat code already shown, or preface \
-     actions with restatements. Lead with the answer or the change."
+     actions with restatements. Lead with the answer or the change.\n\
+     \n\
+     ### Incremental output (分析/评审类回复)\n\
+     当回复是分析、诊断、评审、问题列举类内容时:\n\
+     - 结论先行:首段直接给出判定/答案,依据随后,不把结论埋在文末。\n\
+     - 每条发现 = 一句话断言 + 至多一条锚点(文件/行号/引用);\n\
+       禁止整段转述注入内容或工具输出的原文 —— 能指路就不引用。\n\
+     - 同根因只列一条,同类实例用计数归并(如 同类 ×N),不逐条罗列。\n\
+     - 篇幅上限:此类回复默认 ≤ 3000 token;将超时先收敛到已得结论,\n\
+       再询问是否展开。"
         .to_string()
 }
 
@@ -2027,6 +2053,40 @@ mod tests {
     }
 
     #[test]
+    fn template_placeholder_claude_md_is_skipped() {
+        // P1-6:脚手架模板残留(如用户主目录 CLAUDE.md)无项目规则 —— 收集阶段
+        // 直接跳过,避免与真实规则并存产生伪冲突。
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(root.join("CLAUDE.md"), "- Languages: Rust.").expect("write real");
+        let nested = root.join("apps");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(
+            nested.join("CLAUDE.md"),
+            "# CLAUDE.md\n\nThis file provides guidance to Claw Plus when working with code in this repository.\n\n## Detected stack\n- No specific language markers were detected yet; document the primary language and verification commands once the project structure settles.\n- Frameworks: none detected from the supported starter markers.",
+        )
+        .expect("write template");
+
+        // 祖先链上真实规则 + 内层样板 → 只保留真实规则。
+        // (boundary=root 隔离用户主目录 C:\Users\{user}\CLAUDE.md,同 P11-2)
+        let files = super::discover_instruction_files(&nested, Some(&root)).expect("discover");
+        assert_eq!(files.len(), 1, "样板应被跳过,只留真实规则: {files:?}");
+        assert!(files[0].content.contains("Rust"), "剩余应为真实规则");
+
+        // 全部是样板 → 空(不注入)。
+        fs::remove_file(root.join("CLAUDE.md")).expect("remove real");
+        fs::remove_file(nested.join("CLAUDE.md")).expect("remove template");
+        fs::write(
+            root.join("CLAUDE.md"),
+            "- No specific language markers were detected yet.",
+        )
+        .expect("write template only");
+        let files = super::discover_instruction_files(&root, Some(&root)).expect("discover");
+        assert!(files.is_empty(), "全样板时应为空");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn truncates_large_instruction_content_for_rendering() {
         let rendered = render_instruction_content(&"x".repeat(4500));
         assert!(rendered.contains("[truncated]"));
@@ -2343,6 +2403,9 @@ mod tests {
         // A8:执行风格恒定内容注入前缀 static 区(命中缓存,不在尾部重发)。
         assert!(prompt.contains("## Execution Style"));
         assert!(prompt.contains("Be concise."));
+        // P2-8:分析/评审类回复的增量输出契约(结论先行/锚点引用/同根因归并)。
+        assert!(prompt.contains("### Incremental output (分析/评审类回复)"));
+        assert!(prompt.contains("结论先行"));
         assert!(prompt.contains("Project rules"));
         // B3:功能开关摘要(permission_mode 替代全量 JSON 的键名)
         assert!(prompt.contains("permission_mode"));
@@ -3111,7 +3174,12 @@ mod tests {
                     content: "Project rules".to_string(),
                 }],
             };
-            let memory = PersistentMemory::empty(root.join("memory.md"));
+            // P1-5a:fixture 给 memory 填充内容(有内容时才会渲染该段)。
+            // 全空省略由 `empty_persistent_memory_section_is_omitted` 单独守护。
+            let mut memory = PersistentMemory::empty(root.join("memory.md"));
+            memory
+                .update_block("Persona", "沟通语言:中文")
+                .expect("seed memory block");
             Self {
                 root,
                 project_context,
@@ -3140,6 +3208,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// P1-5a 守护:全空 Persistent Memory(三块空 + 无活跃条目)时,
+    /// 注入面整段省略 —— 不再输出 `## Persona\n_(empty)_` 占位噪音。
+    #[test]
+    fn empty_persistent_memory_section_is_omitted() {
+        let root = temp_dir();
+        let memory = PersistentMemory::empty(root.join("memory.md"));
+        assert!(!memory.has_content(), "空 memory 应判定无内容");
+        let fragments = SystemPromptBuilder::new()
+            .with_persistent_memory(memory)
+            .collect_fragments();
+        assert!(
+            !fragments
+                .iter()
+                .any(|f| f.content.starts_with("# Persistent Memory")),
+            "全空 memory 段不应注入"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 测试 A(逐字节等价):重构后的 `build()` 输出必须与"重构前的

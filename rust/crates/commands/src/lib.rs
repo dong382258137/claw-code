@@ -3925,6 +3925,13 @@ pub fn list_skill_summaries(cwd: &Path) -> std::io::Result<Vec<SkillSummary>> {
     Ok(skills)
 }
 
+/// 注入 catalog 的常显单行数上限。
+///
+/// 超过后软折叠(超量技能收进一行计数提示,由 `SkillSearch` 语义发现):
+/// 130+ 技能 × ~30 token 的固定开销与"每条都要评估要不要用"的注意力负担
+/// 均被消除;技能本身零丢失(发现走语义检索),不存在"找不到"。
+pub const SKILL_CATALOG_MAX_VISIBLE: usize = 24;
+
 /// Render a compact skill catalog string suitable for system prompt injection.
 ///
 /// Format (one line per skill, ~30-50 tokens each):
@@ -3936,6 +3943,11 @@ pub fn list_skill_summaries(cwd: &Path) -> std::io::Result<Vec<SkillSummary>> {
 /// Description is truncated to the first sentence (up to 120 chars) to keep
 /// the catalog compact. Skills without a description are still listed with
 /// just their name.
+///
+/// 软折叠:技能总数超过 [`SKILL_CATALOG_MAX_VISIBLE`] 时,只逐行罗列前
+/// `SKILL_CATALOG_MAX_VISIBLE` 条(保持发现顺序稳定),其余折叠为一行计数
+/// 提示 —— 模型可经 `SkillSearch` 语义发现,或 `Skill` 按名加载(名字可由
+/// SkillSearch 结果获得),不损失可发现性、不产生 repo 误伤。
 pub fn render_skill_catalog(skills: &[SkillSummary]) -> String {
     let mut lines = Vec::with_capacity(skills.len());
     for skill in skills {
@@ -3948,7 +3960,18 @@ pub fn render_skill_catalog(skills: &[SkillSummary]) -> String {
             lines.push(format!("- {name}: {summary}"));
         }
     }
-    lines.join("\n")
+    let visible_count = lines.len().min(SKILL_CATALOG_MAX_VISIBLE);
+    let mut out = lines[..visible_count].join("\n");
+    let hidden = lines.len() - visible_count;
+    if hidden > 0 {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "- (另有 {hidden} 个技能可用,未逐行罗列 —— 用 `SkillSearch` 语义发现,或 `Skill` 按名加载)"
+        ));
+    }
+    out
 }
 
 /// Truncate a skill description to a compact single-line summary.
@@ -6680,6 +6703,48 @@ other: value
         // The rendered line should be shorter than the original description.
         let line = catalog.lines().next().expect("at least one line");
         assert!(line.len() < long_desc.len() + 10, "should be truncated");
+    }
+
+    #[test]
+    fn render_skill_catalog_folds_when_exceeding_visible_limit() {
+        // 软折叠:超过 SKILL_CATALOG_MAX_VISIBLE 后,超量技能收进一行计数提示。
+        let mut skills = Vec::new();
+        for i in 0..(super::SKILL_CATALOG_MAX_VISIBLE + 6) {
+            skills.push(super::SkillSummary {
+                name: format!("skill-{i:02}"),
+                description: Some(format!("Description {i}")),
+                source: super::DefinitionSource::BuiltinShipped,
+                shadowed_by: None,
+                origin: super::SkillOrigin::SkillsDir,
+            });
+        }
+        let catalog = super::render_skill_catalog(&skills);
+        let lines: Vec<&str> = catalog.lines().collect();
+        assert_eq!(
+            lines.len(),
+            super::SKILL_CATALOG_MAX_VISIBLE + 1,
+            "常显 N 行 + 1 折叠行"
+        );
+        assert!(lines[0].starts_with("- skill-00"));
+        let tail = lines[super::SKILL_CATALOG_MAX_VISIBLE];
+        assert!(tail.contains("另有 6 个技能"), "折叠行应含计数: {tail}");
+        assert!(tail.contains("SkillSearch"), "折叠行应指向语义发现: {tail}");
+    }
+
+    #[test]
+    fn render_skill_catalog_no_fold_below_limit() {
+        let skills = (0..5)
+            .map(|i| super::SkillSummary {
+                name: format!("s{i}"),
+                description: None,
+                source: super::DefinitionSource::BuiltinShipped,
+                shadowed_by: None,
+                origin: super::SkillOrigin::SkillsDir,
+            })
+            .collect::<Vec<_>>();
+        let catalog = super::render_skill_catalog(&skills);
+        assert_eq!(catalog.lines().count(), 5, "未超限不折叠");
+        assert!(!catalog.contains("SkillSearch"));
     }
 
     #[test]

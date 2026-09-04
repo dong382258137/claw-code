@@ -463,6 +463,18 @@ impl PersistentMemory {
         }
     }
 
+    /// 是否有可注入内容(任一类型块非空,或存在活跃条目)。
+    ///
+    /// 全空时注入端应省略整段(P1-5a):旧行为无条件注入
+    /// `## Persona\n_(empty)_ / ## Human / ## Tasks` 占位,每轮浪费 ~100 token
+    /// 且制造"空槽位噪音"。省略整段后缓存前缀变化一次(会话启动捕获),
+    /// 之后字节仍稳定。
+    #[must_use]
+    pub fn has_content(&self) -> bool {
+        self.blocks.iter().any(|b| !b.content().trim().is_empty())
+            || !self.active_entries(now_ms()).is_empty()
+    }
+
     /// Render the current in-memory state to a string.
     ///
     /// Used to capture the frozen snapshot and as a fallback when no
@@ -482,9 +494,10 @@ impl PersistentMemory {
 
     /// Render the three typed blocks in fixed order (Persona → Human → Tasks).
     ///
-    /// Empty blocks are still emitted with their label so the prefix length
-    /// stays stable across runs even when a block is later filled in — this
-    /// matters for prompt cache hit rates.
+    /// Empty blocks are still emitted with their label so the rendered bytes
+    /// stay stable across runs even when a block is later filled in. 注入端
+    /// 是否携带本段由 [`Self::has_content`] 决定:全空时整段省略(P1-5a),
+    /// 有内容后(会话启动捕获)前缀字节保持稳定。
     #[must_use]
     pub fn render_blocks(&self) -> String {
         let mut sections = Vec::new();
@@ -1245,6 +1258,27 @@ mod tests {
         let after = mem.frozen_render();
         assert_eq!(before, after, "empty() must capture a stable snapshot");
         assert!(!after.contains("user likes rust"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn has_content_reflects_blocks_and_active_entries() {
+        // P1-5a:全空(三块空 + 无活跃条目)判定无内容 → 注入端省略整段。
+        let path = temp_path();
+        let mem = PersistentMemory::empty(&path);
+        assert!(!mem.has_content(), "全空时应判定无内容");
+
+        // 类型块有内容 → 有内容。
+        let mut mem = PersistentMemory::empty(&path);
+        mem.update_block("Persona", "沟通语言:中文")
+            .expect("update block");
+        assert!(mem.has_content(), "块有内容后应有内容");
+
+        // 仅活跃条目 → 也有内容。
+        let mut mem2 = PersistentMemory::empty(&path);
+        mem2.add_entry("临时事实条目", "test-session");
+        assert!(mem2.has_content(), "活跃条目也计入内容判定");
+
         let _ = std::fs::remove_file(&path);
     }
 

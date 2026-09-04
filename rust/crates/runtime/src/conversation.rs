@@ -5346,12 +5346,16 @@ where
         self.hook_runner
             .spawn_lifecycle_event(HookEvent::Stop, "turn_completed".to_string());
 
-        // 方案 C:会话结束时标记 NOTEBOOK <plan> 为 stale。
-        // 下一会话首 turn 检测到此标记会注入"刷新 <plan>"提醒,引导 LLM
-        // 调用 notebook_update 把本次会话的任务摘要写入 <plan> 段,让下一会话
-        // 零延迟知道上次任务状态。失败静默忽略(非关键路径)。
+        // 方案 C(P1-7 源头结构省略):会话结束时标记 NOTEBOOK <plan> 为 stale,
+        // 但**仅当本会话 <plan> 段真有内容**(见 notebook::mark_plan_stale_if_content)。
+        // 元问答 / 无计划会话的 plan 为空 → 不产生 marker → 下一会话首 turn
+        // 的 Session Handoff 槽位整段省略,无需 LLM 判断"这是不是元问答"
+        // (旧实现靠注入文本软提示豁免,会话实测仍造成干扰)。静默失败(非关键路径)。
         if let Some(workspace_root) = &self.workspace_root {
-            crate::notebook::mark_plan_stale(workspace_root);
+            let _ = crate::notebook::mark_plan_stale_if_content(
+                workspace_root,
+                &self.session.session_id,
+            );
         }
 
         // 双大脑架构(批次 3):会话结束确定性聚合 digest → 落盘管理脑区。
