@@ -328,7 +328,8 @@ pub const NOTEBOOK_HEADER: &str = "# NOTEBOOK — Structured Working Memory\n\
     - `<attempted>`:已尝试的方案及结论(成功/失败 + 原因)\n\
     - `<preferences>`:用户明确表达的偏好/约束\n\
     - `<key_files>`:关键文件引用 + 一句话摘要\n\
-    - `<decisions>`:设计决策持久化(§4.7,compaction 前自动提取,LLM 一般不直接写)\n\
+    - `<decisions>`:结论级决策索引(log_decision 成功自动回显精炼行;
+      完整细节存 SQLite,经 search_past_decisions / verify_decision 访问)\n\
     - `<evidence>`:实验证据持久化(改进点 12,compaction 前自动提取,含数值对比/基准数据)\n";
 
 /// NOTEBOOK 数据模型 — 按 XML 段组织的内容。
@@ -757,6 +758,49 @@ pub fn append_attempt(
         }
     }
     notebook.save_with_session(workspace_root, session_id)
+}
+
+/// `<decisions>` 段精炼回显行前缀:同一次 `log_decision` 只回显一次。
+const LOGGED_DECISION_MARKER_PREFIX: &str = "[dl-";
+
+/// `<decisions>` 段写入资格(第二批):把一次成功 `log_decision` 的**精炼行**
+/// 回显到 NOTEBOOK.md `<decisions>` 段(每轮注入的展示面)。完整细节留在
+/// SQLite 决策库,LLM 需要时经 `search_past_decisions` / `verify_decision`
+/// 按行内 id 访问 —— 注入面只承担"扫读索引",不再承担全文存储。
+///
+/// 约束:
+/// - 幂等:段内已存在同 rowid 的行(`[dl-{rowid}]`)时跳过,同一决策不重复回显;
+/// - 精炼:单行 `- [dl-{rowid}] {signature}`,signature 截断 ≤ 120 字符;
+/// - 上限:写入后经 [`dedupe_decisions_section`] 行级去重 + 超限头部裁剪,
+///   段始终是"近期结论索引"而非无限日志。
+///
+/// 返回 `Ok(true)` 表示本次写入,`Ok(false)` 表示幂等跳过或入参无效;
+/// Err 表示 NOTEBOOK 读写失败(调用方吞掉,不阻断 log_decision 返回)。
+pub fn mirror_logged_decision(
+    workspace_root: &Path,
+    rowid: i64,
+    signature: &str,
+) -> Result<bool, NotebookError> {
+    if rowid <= 0 || signature.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut notebook = Notebook::load(workspace_root)?;
+    let marker = format!("{LOGGED_DECISION_MARKER_PREFIX}{rowid}]");
+    let existing = notebook.get_section("decisions").unwrap_or_default();
+    if existing.contains(&marker) {
+        return Ok(false);
+    }
+    let trimmed: String = signature.trim().chars().take(120).collect();
+    let entry = format!("- [dl-{rowid}] {trimmed}");
+    let combined = if existing.trim().is_empty() {
+        entry
+    } else {
+        format!("{existing}\n{entry}")
+    };
+    let deduped = dedupe_decisions_section(&combined);
+    notebook.set_section("decisions", &deduped);
+    notebook.save(workspace_root)?;
+    Ok(true)
 }
 
 /// 按字符数截断文本,超出时加省略号。
@@ -1466,6 +1510,66 @@ mod tests {
         );
         assert!(sec.contains("cmd 99"), "保留最新的尝试");
         assert!(!sec.contains("cmd 0"), "最旧的尝试被裁剪");
+    }
+
+    // ---- decisions 段精炼回显(第二批:注入资格 = 显式 log_decision) ----
+
+    #[test]
+    fn mirror_logged_decision_writes_refined_line() {
+        let dir = temp_workspace();
+        let written = mirror_logged_decision(dir.path(), 7, "edit_file old_string not found")
+            .expect("mirror ok");
+        assert!(written, "首次写入应返回 true");
+        let nb = Notebook::load(dir.path()).expect("load");
+        let sec = nb.get_section("decisions").expect("decisions");
+        assert!(
+            sec.contains("- [dl-7] edit_file old_string not found"),
+            "got: {sec}"
+        );
+    }
+
+    #[test]
+    fn mirror_logged_decision_is_idempotent_per_rowid() {
+        let dir = temp_workspace();
+        assert!(mirror_logged_decision(dir.path(), 3, "sig one").expect("first"));
+        assert!(
+            !mirror_logged_decision(dir.path(), 3, "sig one").expect("second"),
+            "同 rowid 重复回显应跳过"
+        );
+        let nb = Notebook::load(dir.path()).expect("load");
+        let sec = nb.get_section("decisions").unwrap_or_default();
+        assert_eq!(sec.matches("[dl-3]").count(), 1, "got: {sec}");
+        // 不同 rowid 仍可继续追加
+        assert!(mirror_logged_decision(dir.path(), 4, "sig two").expect("other"));
+        let nb2 = Notebook::load(dir.path()).expect("load");
+        let sec2 = nb2.get_section("decisions").unwrap_or_default();
+        assert!(
+            sec2.contains("[dl-3]") && sec2.contains("[dl-4]"),
+            "got: {sec2}"
+        );
+    }
+
+    #[test]
+    fn mirror_logged_decision_truncates_long_signature_and_rejects_invalid() {
+        let dir = temp_workspace();
+        let long = "x".repeat(300);
+        assert!(mirror_logged_decision(dir.path(), 5, &long).expect("write"));
+        let nb = Notebook::load(dir.path()).expect("load");
+        let sec = nb.get_section("decisions").unwrap_or_default();
+        assert!(
+            sec.chars().count() < 300,
+            "signature 应截断到 120 字符: {sec}"
+        );
+        // 无效入参:rowid<=0 / 空 signature → false 且不写
+        assert!(!mirror_logged_decision(dir.path(), 0, "sig").expect("rowid 0"));
+        assert!(!mirror_logged_decision(dir.path(), 6, "   ").expect("empty sig"));
+        let nb2 = Notebook::load(dir.path()).expect("load");
+        assert!(
+            !nb2.get_section("decisions")
+                .unwrap_or_default()
+                .contains("[dl-6]"),
+            "无效入参不应写入"
+        );
     }
 
     // ---- decisions 段去重(源头防膨胀) ----

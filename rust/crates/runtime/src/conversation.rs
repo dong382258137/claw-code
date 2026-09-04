@@ -7679,9 +7679,32 @@ where
             Err(_) => input.to_string(), // JSON 解析失败,原样传入让 log_decision 报错
         };
 
-        decision_log
+        let result = decision_log
             .log_decision(&effective_input)
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()));
+
+        // 第二批(A-2):注入资格收敛 —— log_decision 成功时把**精炼行**
+        // 回显到 NOTEBOOK <decisions> 注入段(扫读索引),完整细节留在
+        // SQLite 决策库(经 search_past_decisions / verify_decision 访问)。
+        // 静默失败:mirror 失败不阻断 log_decision 结果返回(备份兜底语义)。
+        if let Ok(text) = &result {
+            if let Some(id_part) = text.strip_prefix("decision_logged id=") {
+                if let Ok(rowid) = id_part.trim().parse::<i64>() {
+                    if let Some(ws) = &self.workspace_root {
+                        let signature = serde_json::from_str::<serde_json::Value>(&effective_input)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("problem_signature")
+                                    .and_then(|s| s.as_str())
+                                    .map(ToOwned::to_owned)
+                            })
+                            .unwrap_or_default();
+                        let _ = crate::notebook::mirror_logged_decision(ws, rowid, &signature);
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Phase 4-A:执行  工具调用,搜索历史修复决策。
@@ -19218,6 +19241,61 @@ mod tests {
             .stats_by_knowledge_source()
             .expect("stats");
         assert!(stats.contains("web_research"), "stats: {stats}");
+    }
+
+    /// 第二批 A-2 集成:log_decision 成功且配置了 workspace_root 时,
+    /// NOTEBOOK <decisions> 段出现精炼回显行(注入索引面)。
+    #[test]
+    fn execute_log_decision_mirrors_refined_line_to_notebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log)
+        .with_workspace_root(dir.path().to_path_buf());
+
+        let input = r#"{"session_id":"s1","problem_signature":"edit_file old_string not found (18868 lines, LF)","root_cause_hypothesis":"line-ending mismatch","applied_solution":"normalize to LF","affected_files":["x.rs"],"verification_result":"Confirmed"}"#;
+        runtime
+            .execute_log_decision(input)
+            .expect("log_decision should succeed");
+
+        let nb = crate::notebook::Notebook::load(dir.path()).expect("load notebook");
+        let decisions = nb.get_section("decisions").unwrap_or_default();
+        assert!(
+            decisions.contains("[dl-"),
+            "NOTEBOOK decisions 段应出现精炼回显行: {decisions}"
+        );
+        assert!(
+            decisions.contains("edit_file old_string not found"),
+            "精炼行应含 problem_signature: {decisions}"
+        );
+    }
+
+    /// 无 workspace_root 时 log_decision 仍成功(不 panic,不做 NOTEBOOK 回显)。
+    #[test]
+    fn execute_log_decision_without_workspace_root_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::decision_log::DecisionLog::open(dir.path()).unwrap();
+        let runtime: ConversationRuntime<NoopApi, StaticToolExecutor> = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_decision_log(log);
+        // 注意:未配置 workspace_root → mirror 分支静默跳过
+
+        let input = r#"{"session_id":"s1","problem_signature":"p-no-root","root_cause_hypothesis":"r","applied_solution":"s","affected_files":[],"verification_result":"Pending"}"#;
+        let out = runtime
+            .execute_log_decision(input)
+            .expect("log_decision should still succeed without workspace_root");
+        assert!(out.contains("decision_logged id="), "got: {out}");
     }
 
     // ===== P2:set_current_task LLM 主动维护通道 =====
