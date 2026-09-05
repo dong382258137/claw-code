@@ -219,3 +219,315 @@ mod tests {
         assert_eq!(cls("为什么现在的上下文缓存命中率这么低？是不是以前的机制被破坏了？"), PunchbackClass::Strong);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// 收敛契约 P1 窄版(2026-09-05,§5.1):收敛声明解析 + evidence 事实校验。
+//
+// 模块边界(与 docs §4 主权分离一致):
+// - 本文件只含**纯函数**:入参为模型文本 + 运行时已采集的信号集合
+//   (`available: &[SignalKind]`),与具体 ToolResult/session 类型解耦,可单测。
+// - tool history → SignalKind 的投影(哪些信号在本会话真实存在)由调用方
+//   conversation.rs 负责(步骤 3 接线),本模块不做 I/O。
+//
+// 宽松校验(§5.1):claimed_complete=true 时,evidence 能映射出至少一种
+// 信号且该信号存在于 available 集合 → Verified;运行时无任何信号可参照
+// (available 为空) → 放行(不误伤无测试类任务);强校验(≥2 类多样性、
+// 子项覆盖)延后,随打回率数据驱动收紧。
+// ════════════════════════════════════════════════════════════════════
+
+/// 收敛声明起始标记(模型输出格式见 docs §4.2)。
+pub const CONVERGENCE_MARKER: &str = "[收敛声明]";
+
+/// 解析后的收敛声明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvergenceDeclaration {
+    /// 任务目标一句话。
+    pub goal: String,
+    /// 声称任务是否完成。
+    pub claimed_complete: bool,
+    /// 支撑声称的客观信号描述(如 "regression 11 passed, exit 0")。
+    pub evidence: String,
+    /// 结论列表(≤5 条)。
+    pub conclusions: Vec<String>,
+    /// 未完成项列表(空 = 无)。
+    pub todos: Vec<String>,
+    /// 是否可以停止(可与 claimed_complete 拆分:有结论但需用户裁决)。
+    pub can_stop: bool,
+}
+
+/// 运行时可采集的客观信号类型(§6.2 注册表 P0 两档;其余延后)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalKind {
+    /// Bash stdout 含 "N passed" 且 exit_code=0。
+    TestSuccess,
+    /// 文件产物已生成(write_file 等 is_error=false + 文件存在)。
+    FileProduced,
+}
+
+impl SignalKind {
+    /// 稳定的调试/序列化名。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SignalKind::TestSuccess => "test_success",
+            SignalKind::FileProduced => "file_produced",
+        }
+    }
+}
+
+/// evidence 文本 → 期望信号类型的关键词映射(宽松,不区分大小写)。
+const TEST_SIGNAL_WORDS: &[&str] = &[
+    "passed", "pass", "exit 0", "exit_code=0", "通过", "成功", "success", "ok",
+];
+const FILE_SIGNAL_WORDS: &[&str] = &[
+    "已写入", "写入", "已生成", "生成", "created", "wrote", "produced", "write_file", "文件已",
+];
+
+/// 声明校验裁定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceVerdict {
+    /// 声称的证据信号在运行时 tool history 中存在 → 可放行。
+    Verified,
+    /// 声称完成但 evidence 为空,或映射出的信号在 available 中不存在 → 证据缺失。
+    Missing,
+    /// evidence 非空但无法映射到任何已知信号类型 → 由调用方按宽松规则放行。
+    Unverifiable,
+}
+
+/// 宽松解析收敛声明:含 `[收敛声明]` 且能读到 claimed_complete 与 can_stop
+/// 两个布尔键才返回 `Some`(缺任一键视为未按格式声明)。
+#[must_use]
+pub fn parse_convergence_declaration(text: &str) -> Option<ConvergenceDeclaration> {
+    if !text.contains(CONVERGENCE_MARKER) {
+        return None;
+    }
+    #[derive(PartialEq)]
+    enum Sec {
+        Goal,
+        Evidence,
+        Conclusions,
+        Todos,
+        Other,
+    }
+    let mut sec = Sec::Other;
+    let mut d = ConvergenceDeclaration {
+        goal: String::new(),
+        claimed_complete: false,
+        evidence: String::new(),
+        conclusions: Vec::new(),
+        todos: Vec::new(),
+        can_stop: false,
+    };
+    let mut saw_complete = false;
+    let mut saw_stop = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let (k, v) = (k.trim(), v.trim());
+            sec = match k {
+                "goal" => {
+                    d.goal = v.to_string();
+                    Sec::Goal
+                }
+                "claimed_complete" => {
+                    if let Some(b) = parse_bool(v) {
+                        d.claimed_complete = b;
+                        saw_complete = true;
+                    }
+                    Sec::Other
+                }
+                "evidence" => {
+                    d.evidence = v.to_string();
+                    Sec::Evidence
+                }
+                "can_stop" => {
+                    if let Some(b) = parse_bool(v) {
+                        d.can_stop = b;
+                        saw_stop = true;
+                    }
+                    Sec::Other
+                }
+                "conclusions" => {
+                    if !v.is_empty() && v != "无" {
+                        d.conclusions.push(v.to_string());
+                    }
+                    Sec::Conclusions
+                }
+                "todos" => {
+                    if !v.is_empty() && v != "无" {
+                        d.todos.push(v.to_string());
+                    }
+                    Sec::Todos
+                }
+                _ => Sec::Other,
+            };
+        } else if let Some(item) = line.strip_prefix("- ") {
+            let item = item.trim();
+            if !item.is_empty() {
+                match sec {
+                    Sec::Conclusions => d.conclusions.push(item.to_string()),
+                    Sec::Todos => d.todos.push(item.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        // 其他键值/散行:忽略(容忍模型格式漂移,宽松解析)。
+    }
+    if !saw_complete || !saw_stop {
+        return None;
+    }
+    Some(d)
+}
+
+/// 布尔值宽松解析:true/yes/是 → true;false/no/否 → false;其余 → None。
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "是" | "1" => Some(true),
+        "false" | "no" | "否" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// 把 evidence 文本粗分类为期望信号类型(可命中多种,宽松含 "ok"/"success")。
+#[must_use]
+pub fn evidence_signal_kinds(evidence: &str) -> Vec<SignalKind> {
+    let lower = evidence.to_ascii_lowercase();
+    let mut out = Vec::new();
+    if TEST_SIGNAL_WORDS.iter().any(|w| lower.contains(w)) {
+        out.push(SignalKind::TestSuccess);
+    }
+    if FILE_SIGNAL_WORDS.iter().any(|w| lower.contains(w)) {
+        out.push(SignalKind::FileProduced);
+    }
+    out
+}
+
+/// evidence 事实校验(纯规则,零 LLM)。
+///
+/// 宽松语义(§5.1):
+/// - evidence 为空 → `Missing`;
+/// - evidence 无法映射到任何信号类型 → `Unverifiable`(调用方可放行,防误伤);
+/// - 映射出的信号与 `available` 无交集 → `Missing`(声称的证据不存在于 tool history);
+/// - 有交集 → `Verified`。
+/// 特例:`available` 为空(运行时未采到任何信号,如无测试的问答任务)→ 一律
+/// `Verified`(不误伤;打回率超阈值后再收紧,数据驱动)。
+#[must_use]
+pub fn validate_evidence(decl: &ConvergenceDeclaration, available: &[SignalKind]) -> EvidenceVerdict {
+    if decl.evidence.trim().is_empty() {
+        return EvidenceVerdict::Missing;
+    }
+    let kinds = evidence_signal_kinds(&decl.evidence);
+    if kinds.is_empty() {
+        return EvidenceVerdict::Unverifiable;
+    }
+    if available.is_empty() {
+        return EvidenceVerdict::Verified;
+    }
+    if kinds.iter().any(|k| available.contains(k)) {
+        EvidenceVerdict::Verified
+    } else {
+        EvidenceVerdict::Missing
+    }
+}
+
+#[cfg(test)]
+mod convergence_p1_tests {
+    use super::*;
+
+    fn sample_decl() -> &'static str {
+        "[收敛声明]\ngoal: 修复线段漏确认\nclaimed_complete: true\nevidence: regression 11 passed, exit 0\nconclusions:\n- 根因是分型宽松\n- 端点需校准\ntodos: 无\ncan_stop: true\n"
+    }
+
+    #[test]
+    fn parses_valid_declaration() {
+        let d = parse_convergence_declaration(sample_decl()).expect("should parse");
+        assert_eq!(d.goal, "修复线段漏确认");
+        assert!(d.claimed_complete);
+        assert!(d.can_stop);
+        assert!(d.evidence.contains("11 passed"));
+        assert_eq!(d.conclusions.len(), 2);
+        assert_eq!(d.conclusions[0], "根因是分型宽松");
+        assert!(d.todos.is_empty());
+    }
+
+    #[test]
+    fn missing_marker_returns_none() {
+        assert!(parse_convergence_declaration("任务完成,无声明格式").is_none());
+        assert!(parse_convergence_declaration("").is_none());
+    }
+
+    #[test]
+    fn missing_boolean_key_returns_none() {
+        let txt = "[收敛声明]\ngoal: x\nclaimed_complete: true\ncan_stop: 没写\n";
+        assert!(parse_convergence_declaration(txt).is_none());
+    }
+
+    #[test]
+    fn evidence_kinds_mapping() {
+        assert_eq!(
+            evidence_signal_kinds("regression 11 passed, exit 0"),
+            vec![SignalKind::TestSuccess]
+        );
+        assert_eq!(
+            evidence_signal_kinds("文件已写入 out/digest.md"),
+            vec![SignalKind::FileProduced]
+        );
+        let both = evidence_signal_kinds("regression 11 passed, 已生成 report.csv");
+        assert!(both.contains(&SignalKind::TestSuccess));
+        assert!(both.contains(&SignalKind::FileProduced));
+        assert!(evidence_signal_kinds("完成分析,无客观信号").is_empty());
+    }
+
+    #[test]
+    fn validate_verified_and_missing() {
+        let d = parse_convergence_declaration(sample_decl()).unwrap();
+        assert_eq!(
+            validate_evidence(&d, &[SignalKind::TestSuccess]),
+            EvidenceVerdict::Verified
+        );
+        // available 只有 FileProduced,而 evidence 引用 TestSuccess → Missing
+        assert_eq!(
+            validate_evidence(&d, &[SignalKind::FileProduced]),
+            EvidenceVerdict::Missing
+        );
+    }
+
+    #[test]
+    fn validate_empty_evidence_is_missing() {
+        let mut d = parse_convergence_declaration(sample_decl()).unwrap();
+        d.evidence.clear();
+        assert_eq!(
+            validate_evidence(&d, &[SignalKind::TestSuccess]),
+            EvidenceVerdict::Missing
+        );
+    }
+
+    #[test]
+    fn validate_no_runtime_signal_is_lenient() {
+        let d = parse_convergence_declaration(sample_decl()).unwrap();
+        // available 为空 → 宽松放行,不误伤无测试任务。
+        assert_eq!(validate_evidence(&d, &[]), EvidenceVerdict::Verified);
+    }
+
+    #[test]
+    fn validate_unverifiable_evidence() {
+        let mut d = parse_convergence_declaration(sample_decl()).unwrap();
+        d.evidence = "已完成架构分析".to_string();
+        assert_eq!(
+            validate_evidence(&d, &[SignalKind::TestSuccess]),
+            EvidenceVerdict::Unverifiable
+        );
+    }
+
+    #[test]
+    fn can_stop_false_with_complete_true() {
+        // claimed_complete=true 但 can_stop=false(需用户裁决)→ 可解析出,由接线方决定是否停止。
+        let txt = "[收敛声明]\ngoal: 等裁决方案 B\nclaimed_complete: true\nevidence: 回归通过\ntodos: 无\ncan_stop: false\n";
+        let d = parse_convergence_declaration(txt).unwrap();
+        assert!(d.claimed_complete);
+        assert!(!d.can_stop);
+    }
+}
