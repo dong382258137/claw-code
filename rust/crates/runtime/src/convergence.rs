@@ -433,6 +433,150 @@ pub fn validate_evidence(decl: &ConvergenceDeclaration, available: &[SignalKind]
     }
 }
 
+/// 收敛契约 P1 软阈值(output tokens,文档 §4.3):达到时注入声明提示。
+pub const CONVERGENCE_SOFT1_OUTPUT: u64 = 15_000;
+pub const CONVERGENCE_SOFT2_OUTPUT: u64 = 25_000;
+
+/// 证据打回(缺失)提示的上限次数:超过则不再打回,交既有成本护栏兜底,防死循环。
+pub const CONVERGENCE_MAX_PUNCHBACKS: u8 = 2;
+
+/// 读取收敛契约 P1 开关:默认开启;env `CLAW_CONVERGENCE_P1` 为 "0" 时关闭
+/// (一键关,热升级后按打回率数据决定是否全量开,见 docs §5.1)。
+#[must_use]
+pub fn convergence_enabled() -> bool {
+    convergence_enabled_from_env(std::env::var("CLAW_CONVERGENCE_P1").ok().as_deref())
+}
+
+/// env 原始值 → 开关(纯函数,可单测;零 unsafe,适配 crate deny(unsafe_code))。
+#[must_use]
+pub fn convergence_enabled_from_env(v: Option<&str>) -> bool {
+    !matches!(v, Some("0"))
+}
+
+/// tool history 中一次工具结果的轻量投影输入(由 conversation.rs 映射,
+/// 本模块不依赖 session/ContentBlock 类型,保持纯函数可单测)。
+#[derive(Debug, Clone, Copy)]
+pub struct ToolOutcome<'a> {
+    pub tool_name: &'a str,
+    pub is_error: bool,
+    pub output: &'a str,
+}
+
+/// 文件写入类工具判定(宽松子串):write/edit/replace/patch/rename/append。
+fn is_file_write_tool(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["write", "edit", "replace", "patch", "rename", "append"]
+        .iter()
+        .any(|k| n.contains(k))
+}
+
+/// 测试成功判定(宽松):排除真实失败("N failed",N>0),接受成功形态
+/// (含 "passed" / "passing" / "all tests ok" / "test result: ok")。
+/// 注:Rust 真实成功输出形如 "test result: ok. 11 passed; 0 failed" ——
+/// "0 failed" 是成功信号而非失败,故不能简单用 `contains("failed")` 排除。
+fn looks_like_test_success(output: &str) -> bool {
+    let o = output.to_ascii_lowercase();
+    // 真实失败:含 "failed" 但非 "0 failed"/"0 failures"(如 "1 failed"/"2 failed")。
+    let real_failure = o.contains("failed")
+        && !o.contains("0 failed")
+        && !o.contains("0 failures")
+        && !o.contains("passed, 0 failed");
+    !real_failure
+        && (o.contains("passed")
+            || o.contains("passing")
+            || o.contains("all tests ok")
+            || o.contains("test result: ok"))
+}
+
+/// 把 tool history 投影为运行时客观信号集合(§6.2 P0 两档;零 LLM)。
+///
+/// - 文件写入类工具成功 → `FileProduced`;
+/// - 任意工具成功且输出像测试通过 → `TestSuccess`(工具名不限,覆盖
+///   bash/cargo test/pytest 等;宽松原则,防误伤)。
+#[must_use]
+pub fn project_signals<'a, I: IntoIterator<Item = ToolOutcome<'a>>>(
+    outcomes: I,
+) -> Vec<SignalKind> {
+    let mut out = Vec::new();
+    for o in outcomes {
+        if o.is_error {
+            continue;
+        }
+        if is_file_write_tool(o.tool_name) {
+            if !out.contains(&SignalKind::FileProduced) {
+                out.push(SignalKind::FileProduced);
+            }
+        }
+        if looks_like_test_success(o.output) && !out.contains(&SignalKind::TestSuccess) {
+            out.push(SignalKind::TestSuccess);
+        }
+    }
+    out
+}
+
+/// 单条工具结果 → 信号集合(供 conversation.rs 逐条投影后去重合并)。
+#[must_use]
+pub fn project_one(outcome: ToolOutcome<'_>) -> Vec<SignalKind> {
+    let mut v = Vec::new();
+    if outcome.is_error {
+        return v;
+    }
+    if is_file_write_tool(outcome.tool_name) {
+        v.push(SignalKind::FileProduced);
+    }
+    if looks_like_test_success(outcome.output) {
+        v.push(SignalKind::TestSuccess);
+    }
+    v
+}
+
+/// 收敛声明提示模板(注入为 user 消息;零 LLM,纯文本)。
+///
+/// `first=true` 为软阈值 1(15K)首次提示;`false` 为软阈值 2(25K)二次
+/// 强调(已多次提示仍未收敛,要求解释)。
+#[must_use]
+pub fn convergence_prompt_text(first: bool) -> String {
+    let header = if first {
+        "本 turn 已消耗较多 output 仍未见收敛声明。请在回复开头输出一次【收敛声明】\
+         (结构化格式),运行时将校验 evidence 是否真实存在于本会话 tool history,\
+         校验通过即视为可收敛收尾。"
+    } else {
+        "已多次提示仍未收到可校验的收敛声明。若仍声称进行中,请在【收敛声明】中\
+         明确剩余 todos 与尚未获得的客观信号;若已可收尾,请按格式声明。\
+         不要用无证据的\"即将完成\"式文本继续推进。"
+    };
+    format!(
+        "{header}\n\n[收敛声明]\ngoal: <任务目标一句话>\n\
+         claimed_complete: true | false\n\
+         evidence: <支撑声称的客观信号,如 \"regression 11 passed, exit 0\">\n\
+         conclusions: <≤5 条,- 列表>\ntodos: <未完成项,- 列表;空则 \"无\">\n\
+         can_stop: true | false\n\n\
+         如实填写即可:仍需要继续调查时 claimed_complete 填 false 并说明剩余 todo,\
+         运行时不会因此强停。"
+    )
+}
+
+/// 证据缺失打回提示:告知模型 evidence 引用的信号未在本会话 tool history 中找到。
+#[must_use]
+pub fn render_missing_hint(decl: &ConvergenceDeclaration) -> String {
+    let goal = if decl.goal.trim().is_empty() {
+        "(未声明)".to_string()
+    } else {
+        decl.goal.clone()
+    };
+    let evidence = if decl.evidence.trim().is_empty() {
+        "(空)".to_string()
+    } else {
+        decl.evidence.clone()
+    };
+    format!(
+        "[runtime] 收敛声明校验未通过:你声称完成任务(goal: {goal}),但 evidence \
+         \"{evidence}\" 引用的信号在本会话 tool history 中不存在(或为空)。\
+         请补充本会话真实出现过的客观信号(如实际的测试输出/已写入文件),\
+         或如实把 claimed_complete 改为 false 并继续。"
+    )
+}
+
 #[cfg(test)]
 mod convergence_p1_tests {
     use super::*;
@@ -529,5 +673,81 @@ mod convergence_p1_tests {
         let d = parse_convergence_declaration(txt).unwrap();
         assert!(d.claimed_complete);
         assert!(!d.can_stop);
+    }
+
+    // ── P1 接线层纯函数单测(步骤 4)──
+
+    fn outcome<'a>(tool: &'a str, err: bool, out: &'a str) -> ToolOutcome<'a> {
+        ToolOutcome {
+            tool_name: tool,
+            is_error: err,
+            output: out,
+        }
+    }
+
+    #[test]
+    fn project_one_maps_file_write_and_test_success() {
+        // 文件写成功 → FileProduced
+        assert_eq!(
+            project_one(outcome("write_file", false, "已写入 3 个文件")),
+            vec![SignalKind::FileProduced]
+        );
+        // bash 测试通过 → TestSuccess
+        assert_eq!(
+            project_one(outcome("bash", false, "test result: ok. 11 passed; 0 failed")),
+            vec![SignalKind::TestSuccess]
+        );
+        // 错误结果 → 空(不产生信号)
+        assert!(project_one(outcome("write_file", true, "permission denied")).is_empty());
+        // 失败输出含 failed → 不判 TestSuccess
+        assert!(project_one(outcome("bash", false, "2 failed; 0 passed")).is_empty());
+        // 读类工具成功 → 不产生信号
+        assert!(project_one(outcome("read_file", false, "内容")).is_empty());
+    }
+
+    #[test]
+    fn convergence_prompt_contains_marker_and_differs_by_tier() {
+        let first = convergence_prompt_text(true);
+        let second = convergence_prompt_text(false);
+        assert!(first.contains("[收敛声明]"));
+        assert!(first.contains("claimed_complete"));
+        assert!(first.contains("evidence"));
+        assert!(first != second, "首提与二次强调提示应不同");
+        // 两种提示都不含会诱导提前收尾的强制口吻(均声明运行时不强停)。
+        assert!(first.contains("不会因此强停"));
+    }
+
+    #[test]
+    fn render_missing_hint_carries_goal_and_evidence() {
+        let d = parse_convergence_declaration(sample_decl()).unwrap();
+        let hint = render_missing_hint(&d);
+        assert!(hint.contains("校验未通过"));
+        assert!(hint.contains("修复线段漏确认")); // goal 原文
+        assert!(hint.contains("11 passed")); // evidence 原文
+        // 空 evidence 也应可渲染(不 panic)
+        let mut empty = d.clone();
+        empty.evidence.clear();
+        assert!(render_missing_hint(&empty).contains("(空)"));
+    }
+
+    #[test]
+    fn convergence_enabled_defaults_on_and_env_off() {
+        // 纯函数:None → 开(默认)
+        assert!(convergence_enabled_from_env(None));
+        // "0" → 关
+        assert!(!convergence_enabled_from_env(Some("0")));
+        // 其他值 → 开
+        assert!(convergence_enabled_from_env(Some("1")));
+        assert!(convergence_enabled_from_env(Some("true")));
+    }
+
+    #[test]
+    fn parser_tolerates_extra_noise_lines() {
+        // 模型格式漂移:marker 前有前言、键间有散行 → 仍可解析(宽松)。
+        let txt = "好的,以下是声明:\n[收敛声明]\ngoal: 修 bug\n一些过渡文字\nclaimed_complete: true\nevidence: test 1 passed\ncan_stop: true\n";
+        let d = parse_convergence_declaration(txt).unwrap();
+        assert_eq!(d.goal, "修 bug");
+        assert!(d.claimed_complete);
+        assert!(d.can_stop);
     }
 }

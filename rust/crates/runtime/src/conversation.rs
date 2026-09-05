@@ -3478,8 +3478,8 @@ where
         // 创建计划,框架随后进入 Plan/Execute/Review 循环。这样避免启发式
         // 规则的漏判(短输入多文件任务)与误判(长输入但仅需解释/否定语境)。
 
-        let mut assistant_messages = Vec::new();
-        let mut tool_results = Vec::new();
+        let mut assistant_messages: Vec<ConversationMessage> = Vec::new();
+        let mut tool_results: Vec<ConversationMessage> = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut reactive_state = ReactiveCompactState::NotAttempted;
@@ -3507,6 +3507,14 @@ where
         // 提醒注入标志(每 turn 只注入一次)。
         self.sufficiency_contract.reset();
         let mut sufficiency_notice_injected = false;
+        // 收敛契约 P1(§5.1 窄版):软阈值注入声明提示的标志(15K/25K 各一次)
+        // + 证据缺失打回计数(上限 2,防死循环,超限交既有成本护栏兜底)。
+        let mut convergence_soft1_injected = false;
+        let mut convergence_soft2_injected = false;
+        let mut convergence_punchbacks: u8 = 0;
+        // 打回后继续标志:证据缺失打回 hint 注入后,不 break 而是回到 loop
+        // 顶部重新请求(模型下轮看到 hint 重新决策)。上限 2 保证不无限循环。
+        let mut convergence_should_continue = false;
         // P2(成本反馈注记 · Task 5):turn 开头复位成本累计器 —— turn 级计数
         // (output tokens / 工具调用)与注记位点清零,全会话累计保留跨 turn。
         self.cost_meter.reset_turn();
@@ -4324,6 +4332,92 @@ where
                         }
                     }
                 }
+                // 收敛契约 P1(§5.1 窄版,方案 A 事件驱动):模型无工具调用将
+                // 收尾时(此处 break 前),若本 turn 已注入过收敛提示,解析其
+                // 文本中的【收敛声明】。校验规则:
+                // - 未按格式声明(parse None)→ 静默放行(不强制,宽松原则);
+                // - claimed_complete && can_stop → evidence 校验:Verified 则
+                //   正常 break 收尾;Missing/Unverifiable → 打回注入
+                //   (上限 2 次,防死循环,超限放行交成本护栏);
+                // - claimed_complete=false 或 can_stop=false → 正常 break
+                //   (模型声明未完成/需用户裁决,不强停)。
+                if crate::convergence::convergence_enabled()
+                    && (convergence_soft1_injected || convergence_soft2_injected)
+                {
+                    let llm_text_full: String = assistant_messages
+                        .iter()
+                        .flat_map(|msg| msg.blocks.iter())
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if let Some(decl) =
+                        crate::convergence::parse_convergence_declaration(&llm_text_full)
+                    {
+                        if decl.claimed_complete && decl.can_stop {
+                            let mut available: Vec<crate::convergence::SignalKind> = Vec::new();
+                            for msg in &tool_results {
+                                for blk in &msg.blocks {
+                                    if let ContentBlock::ToolResult {
+                                        tool_use_id: _,
+                                        tool_name,
+                                        is_error,
+                                        output,
+                                    } = blk
+                                    {
+                                        let outcome = crate::convergence::ToolOutcome {
+                                            tool_name: tool_name.as_str(),
+                                            is_error: *is_error,
+                                            output: output.as_str(),
+                                        };
+                                        for kind in crate::convergence::project_one(outcome) {
+                                            if !available.contains(&kind) {
+                                                available.push(kind);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            match crate::convergence::validate_evidence(&decl, &available) {
+                                crate::convergence::EvidenceVerdict::Verified => {
+                                    self.emit_diag(
+                                        "[diag] convergence: declaration verified, stopping"
+                                            .to_string(),
+                                    );
+                                }
+                                _ if convergence_punchbacks
+                                    < crate::convergence::CONVERGENCE_MAX_PUNCHBACKS =>
+                                {
+                                    convergence_punchbacks += 1;
+                                    let hint =
+                                        crate::convergence::render_missing_hint(&decl);
+                                    let _ = self
+                                        .session
+                                        .push_message(ConversationMessage::user_text(hint));
+                                    // 打回后不 break:置标志,循环回到顶部重新请求,
+                                    // 模型下轮看到 hint 后修正 evidence 或如实改 claimed_complete=false。
+                                    convergence_should_continue = true;
+                                }
+                                _ => {
+                                    // 超打回上限:放行,交既有成本护栏兜底。
+                                    self.emit_diag(
+                                        "[diag] convergence: punchback limit reached, letting through"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if convergence_should_continue {
+                    // 打回已注入:回到 loop 顶部重新请求,让模型下轮看到 hint
+                    // 后修正 evidence 或如实改 claimed_complete=false。标志每轮
+                    // 只消费一次(重置),防止 Verified 后仍被旧标志带偏。
+                    convergence_should_continue = false;
+                    continue;
+                }
                 break;
             }
 
@@ -5029,6 +5123,34 @@ where
                 let _ = self
                     .session
                     .push_message(ConversationMessage::user_text(note));
+            }
+
+            // 收敛契约 P1(§5.1 窄版,方案 A):软阈值门控注入【收敛声明】提示。
+            // - 触发:output ≥ 15K(soft1)与 ≥ 25K(soft2),各一次(文档 §4.3);
+            // - 仅非 Trivial 档(§6.2:Simple 不开,复用 turn_tier);
+            // - 注入为 user 消息,下一次请求构造对模型可见(与 poll_note 同通道);
+            // - env `CLAW_CONVERGENCE_P1=0` 一键关(见 convergence::convergence_enabled)。
+            // 模型回复含声明后,由 break 前的校验段(见 ~L4341)解析并决定收尾/打回。
+            if crate::convergence::convergence_enabled() && turn_tier != TriageTier::Trivial {
+                let turn_output = self.cost_meter.turn_output_tokens();
+                if !convergence_soft1_injected
+                    && turn_output >= crate::convergence::CONVERGENCE_SOFT1_OUTPUT
+                {
+                    convergence_soft1_injected = true;
+                    let hint = crate::convergence::convergence_prompt_text(true);
+                    let _ = self
+                        .session
+                        .push_message(ConversationMessage::user_text(hint));
+                } else if convergence_soft1_injected
+                    && !convergence_soft2_injected
+                    && turn_output >= crate::convergence::CONVERGENCE_SOFT2_OUTPUT
+                {
+                    convergence_soft2_injected = true;
+                    let hint = crate::convergence::convergence_prompt_text(false);
+                    let _ = self
+                        .session
+                        .push_message(ConversationMessage::user_text(hint));
+                }
             }
 
             // 阶段 2b:分支重试成功 → 跳出主循环,让 turn 正常收尾。
