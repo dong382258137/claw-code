@@ -117,6 +117,18 @@ impl CostMeter {
         self.last_warn_output = 0;
     }
 
+    /// 当前 turn 累计 output tokens(只读;供收敛契约门控读取燃烧状态)。
+    #[must_use]
+    pub fn turn_output_tokens(&self) -> u64 {
+        self.turn_output_tokens
+    }
+
+    /// 当前 turn 累计工具调用数(只读;供收敛契约门控读取)。
+    #[must_use]
+    pub fn turn_tool_calls(&self) -> usize {
+        self.turn_tool_calls
+    }
+
     /// 工具批处理迭代末尾调用:决策 + 更新注记位点 + 渲染注记文本。
     ///
     /// 返回需要注入的 `[runtime]` 注记(至多一条);`None` = 本轮不注记。
