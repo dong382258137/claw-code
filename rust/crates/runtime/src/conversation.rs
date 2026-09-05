@@ -1723,6 +1723,12 @@ pub struct ConversationRuntime<C, T> {
     /// 注入 "Previous Session Digest" 槽位后由请求构造清空(一次性消费)。
     /// 无 digest 文件时为 None(不注入)。零 LLM;读失败静默降级。
     pending_session_digest: Option<String>,
+    /// 双大脑 · 执行脑自写总结提示(试点):turn 首轮请求注入一次。
+    ///
+    /// 引导执行脑在**最终答复**末尾输出 [`SESSION_SUMMARY`](crate::management_brain::SESSION_SUMMARY_MARKER)
+    /// 标记总结;digest 写侧解析后落盘"会话总结"段。渲染后由请求构造清空
+    /// (一次性消费;后续迭代不再注入,避免工具循环重复提示)。
+    pending_summary_prompt: bool,
     decision_log: Option<crate::decision_log::DecisionLog>,
     /// v3 §4.7:决策检测策略。控制 `maybe_auto_compact` 在压缩前用何种方式
     /// 提取决策点。默认 `Heuristic`(零成本),可通过
@@ -2140,6 +2146,7 @@ where
             pending_cog_stall: None,
             pending_failure_advice: None,
             pending_session_digest: None,
+            pending_summary_prompt: true,
             decision_log: None,
             detection_strategy: crate::decision_log::DetectionStrategy::Heuristic,
             project_topology: None,
@@ -3339,14 +3346,23 @@ where
         self.hook_runner
             .spawn_lifecycle_event(HookEvent::SessionStart, self.session.session_id.clone());
 
+        // 执行脑自写总结提示(试点):每个 turn 开头重置 flag,使 turn 首轮
+        // 请求注入 [SESSION_SUMMARY] 引导(见 render_runtime_hints 槽位 7d)。
+        self.pending_summary_prompt = true;
+
         // 双大脑架构(批次 3):新会话首 turn 读取上一会话 digest 注入。
         // 本会话首条消息触发前(即本 turn 开头)读取最近一份管理脑 digest,
         // 存入 pending_session_digest;render_runtime_hints 注入
         // "Previous Session Digest" 槽位后由请求构造清空(一次性消费)。
+        // 排除本会话自己的 digest(多 turn 会话在 turn 收尾会覆盖写自己的
+        // digest,不排除会把"自己上一轮"误注入成"上一会话遗留")。
         // 同会话后续 turn(首 turn 已消费)不重复读取。零 LLM;失败静默。
         if self.pending_session_digest.is_none() {
             if let Some(root) = &self.workspace_root {
-                self.pending_session_digest = crate::management_brain::latest_digest_text(root);
+                self.pending_session_digest = crate::management_brain::latest_digest_text(
+                    root,
+                    Some(&self.session.session_id),
+                );
             }
         }
 
@@ -3380,6 +3396,27 @@ where
         self.turn_start.set(Some(Instant::now()));
 
         self.record_turn_started(&user_input);
+
+        // 收敛契约 · 打回率埋点(基线阶段,零 LLM):本 turn 的前置若存在 assistant
+        // 收尾答复(即非会话首 turn),则对该 user 输入做打回判定并落盘会话级
+        // punchback 文件，用于量"无契约状态"下的打回率基线(与 docs 设计文档
+        // §6.1.3 口径一致)。非关键路径:任何失败静默忽略,不阻断主流程。
+        // 注:last_assistant_text() 在 turn 开头返回上一 turn 收尾答复(跨 turn
+        // 时无工具循环隔断);首 turn messages 为空 → 返回 None → 不计入。
+        if self.last_assistant_text().is_some() {
+            let class = crate::convergence::classify_punchback(&user_input);
+            if let Some(root) = &self.workspace_root {
+                if let Ok(sessions_dir) = crate::session::workspace_sessions_dir(root) {
+                    let _ = crate::convergence::record_turn(
+                        &sessions_dir,
+                        &self.session.session_id,
+                        &user_input,
+                        class,
+                    );
+                }
+            }
+        }
+
         self.session
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -3929,6 +3966,7 @@ where
                 self.pending_cog_stall = None;
                 self.pending_failure_advice = None;
                 self.pending_session_digest = None;
+                self.pending_summary_prompt = false;
                 ApiRequest {
                     system_prompt: system_split,
                     messages,
@@ -5358,10 +5396,11 @@ where
             );
         }
 
-        // 双大脑架构(批次 3):会话结束确定性聚合 digest → 落盘管理脑区。
-        // 数据源:本会话 tool results 的 is_error 失败(提取工具名+首行签名)
-        // + usage_tracker 累计用量成本行。零 LLM;失败静默降级(非关键路径)。
-        if let Some(workspace_root) = &self.workspace_root {
+        // 双大脑架构(批次 3):会话收尾确定性聚合 digest → 落盘管理脑区。
+        // 数据源:本会话 tool results 的 is_error 失败(工具名+首行签名)
+        // + usage_tracker 累计用量成本行 + 执行脑自写总结(解析最终答复中的
+        // [SESSION_SUMMARY] 标记,试点)。失败静默降级(非关键路径)。
+        if let Some(workspace_root) = self.workspace_root.clone() {
             // 1. 聚合失败记录:扫描 session messages 中 ToolResult.is_error。
             let mut failures: Vec<(String, String)> = Vec::new();
             for msg in &self.session.messages {
@@ -5391,14 +5430,23 @@ where
                 .usage_tracker
                 .cumulative_usage()
                 .summary_lines("session-total");
-            // 3. 渲染 + 落盘。
+            // 3. 执行脑自写总结段(试点):解析本 turn 最终答复中的 [SESSION_SUMMARY]。
+            let mut extra_sections: Vec<(&str, String)> = Vec::new();
+            if let Some(final_text) = self.last_assistant_text() {
+                if let Some(summary) = crate::management_brain::extract_session_summary(&final_text)
+                {
+                    extra_sections.push(("会话总结(执行脑)", summary));
+                }
+            }
+            // 4. 渲染 + 落盘。
             let digest = crate::management_brain::render_digest(
                 &self.session.session_id,
                 &failures,
                 &usage_lines,
+                &extra_sections,
             );
             let _ = crate::management_brain::write_digest(
-                workspace_root,
+                &workspace_root,
                 &self.session.session_id,
                 &digest,
             );
@@ -6489,6 +6537,17 @@ where
         // 读取后由请求构造清空(一次性消费;同会话后续 turn 不再注入)。
         if let Some(digest) = &self.pending_session_digest {
             slots.push(("Previous Session Digest", digest.clone()));
+        }
+
+        // 槽位 7d:执行脑自写总结提示(试点)——turn 首轮请求注入一次。
+        // 引导执行脑在最终答复末尾输出 [SESSION_SUMMARY] 标记总结(用完整上下文
+        // 而非独立提炼通道);digest 写侧解析后落盘"会话总结"段。渲染后由请求
+        // 构造清空 flag,工具循环的后续迭代不再重复注入。
+        if self.pending_summary_prompt {
+            slots.push((
+                "Session Summary Prompt",
+                crate::management_brain::SESSION_SUMMARY_PROMPT.to_string(),
+            ));
         }
 
         // 槽位 8:压缩后 NOTEBOOK 刷新提醒(flag 由 execute_notebook_update 清除)。
@@ -8436,6 +8495,31 @@ where
             eprintln!("[task_state] failed to persist: {e}");
         }
         self.task_state = Some(state);
+    }
+
+    /// 取本会话最后一条含文本的 assistant 消息全文(供 digest 解析执行脑总结)。
+    ///
+    /// 从消息尾部回溯最近一条 role=Assistant 且有 Text 块的消息;无则返回 None
+    /// (纯工具 turn 异常结束等场景,digest 侧静默跳过总结段)。
+    fn last_assistant_text(&self) -> Option<String> {
+        for msg in self.session.messages.iter().rev() {
+            if msg.role != crate::session::MessageRole::Assistant {
+                continue;
+            }
+            let parts: Vec<&str> = msg
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    crate::session::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            return Some(parts.join("\n"));
+        }
+        None
     }
 
     /// A'(任务锚点生命周期):turn 开头从 user_input 提取 goal 到会话级
@@ -20226,11 +20310,63 @@ mod tests {
             .expect("turn should complete");
 
         // digest 文件已落盘且包含失败签名与用量段。
-        let latest = crate::management_brain::latest_digest_text(dir.path())
+        let latest = crate::management_brain::latest_digest_text(dir.path(), None)
             .expect("digest written after turn");
         assert!(latest.contains("Session Digest"), "latest: {latest}");
         assert!(latest.contains("bash"), "latest: {latest}");
+        // 执行脑未输出 [SESSION_SUMMARY] 标记(试点软点)→ 无总结段,不阻断落盘。
+        assert!(
+            !latest.contains("会话总结"),
+            "无标记时不应有执行脑总结段: {latest}"
+        );
         assert!(crate::management_brain::digest_dir_exists(dir.path()));
+    }
+
+    /// 端到端(试点):执行脑在最终答复输出 [SESSION_SUMMARY] 标记 → digest 落盘
+    /// "会话总结(执行脑)"段,供下一会话首 turn 感知。
+    #[test]
+    fn run_turn_digest_captures_executive_summary_marker() {
+        struct SummaryApi;
+        impl ApiClient for SummaryApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta(
+                        "已修复热升级文案。\n\n[SESSION_SUMMARY]\n- 目标: 修 P3 文案\n- 结论: 文案改为 v{from} → v{current}\n- 待办: 确认下会话验证"
+                            .to_string(),
+                    ),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime: ConversationRuntime<SummaryApi, StaticToolExecutor> =
+            ConversationRuntime::new(
+                Session::new(),
+                SummaryApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_workspace_root(dir.path().to_path_buf());
+
+        runtime
+            .run_turn("修复热升级文案", None)
+            .expect("turn should complete");
+
+        let latest = crate::management_brain::latest_digest_text(dir.path(), None)
+            .expect("digest written after turn");
+        assert!(latest.contains("会话总结(执行脑)"), "latest: {latest}");
+        assert!(latest.contains("目标: 修 P3 文案"), "latest: {latest}");
+        assert!(latest.contains("结论: 文案改为"), "latest: {latest}");
+        // 标记行本身不应残留在总结段内。
+        assert!(
+            !latest.contains("[SESSION_SUMMARY]"),
+            "标记行不应进 digest: {latest}"
+        );
     }
 
     // ===== P-fix:内置工具完成后触发 tool_result_callback =====

@@ -27,6 +27,10 @@ mod sufficiency;
 // 注入给模型,超阈值(20K)显式警示,闭合成本反馈环(零 LLM)。
 mod cost_meter;
 pub mod task_state;
+// 收敛契约 · 打回率埋点(基线阶段):判定 user 输入是否为对上条收尾答复的"打回",
+// 落盘会话级 <session_id>-punchback.jsonl 供无契约基线对照。只含纯函数(可单测),
+// 埋点接入在 conversation.rs::ConversationRuntime(非关键路径,静默降级)。
+pub mod convergence;
 // 轮次感知上下文编译器 P1:分诊门(triage gate)— 档位类型 Trivial(状态/
 // 问答,裁剪注入)与 Standard(全量注入)两档 + 单向升级检测。纯规则分诊
 // (triage_turn)已于 2026-09-04 移除(命中率 ~1% 无效)。

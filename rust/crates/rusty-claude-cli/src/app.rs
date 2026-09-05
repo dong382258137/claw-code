@@ -2890,14 +2890,16 @@ impl LiveCli {
         // 3. 注入"继续任务通知"给 LLM(下一 turn 请求构造时可见)。
         let notice = match (&restored_plan_id, &req.from_version) {
             (Some(plan_id), _) => format!(
-                "[runtime] 热升级完成：新版本已接管此会话(v{from})，会话与计划已恢复 \
+                "[runtime] 热升级完成：新版本已接管此会话 (v{from} → v{current})，会话与计划已恢复 \
                  (plan={plan_id})。请从上次收尾处继续执行当前任务。",
-                from = req.from_version
+                from = req.from_version,
+                current = VERSION
             ),
             (None, _) => format!(
-                "[runtime] 热升级完成：新版本已接管此会话(v{from})，会话已恢复 \
+                "[runtime] 热升级完成：新版本已接管此会话 (v{from} → v{current})，会话已恢复 \
                  (旧进程无活跃计划)。请从上次收尾处继续执行当前任务。",
-                from = req.from_version
+                from = req.from_version,
+                current = VERSION
             ),
         };
         self.runtime
