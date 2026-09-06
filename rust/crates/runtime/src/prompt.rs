@@ -796,16 +796,18 @@ impl SystemPromptBuilder {
             |context| context.current_date.clone(),
         );
         let identity = self.model_family.unwrap_or_default();
+        let platform = match (self.os_name.as_deref(), self.os_version.as_deref()) {
+            (Some(os), Some(version)) => format!("{os} {version}"),
+            (Some(os), None) => os.to_string(),
+            (None, Some(version)) => version.to_string(),
+            (None, None) => "unknown".to_string(),
+        };
         let mut lines = vec!["# Environment context".to_string()];
         let mut bullets = vec![
             format!("Model family: {}", identity.family_label()),
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
-            format!(
-                "Platform: {} {}",
-                self.os_name.as_deref().unwrap_or("unknown"),
-                self.os_version.as_deref().unwrap_or("unknown")
-            ),
+            format!("Platform: {platform}"),
         ];
         // Shell 类型 + cmd.exe 专属提示：模型在 Windows cmd.exe 下需要
         // 显式告知避免使用 Unix 命令（ls/cat/grep/rm 等会失败）。

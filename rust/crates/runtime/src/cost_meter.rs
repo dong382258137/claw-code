@@ -199,7 +199,9 @@ pub fn decide_note(
 pub fn render_hint(turn_output_tokens: u64, turn_tool_calls: usize) -> String {
     format!(
         "[runtime] 成本提示:本 turn 已消耗 output ~{turn_output_tokens} tokens、\
-         工具调用 {turn_tool_calls} 次。若已接近结论请直接作答,避免为低价值验证追加调用。"
+         工具调用 {turn_tool_calls} 次(口径:均按当前 turn 累计,自 turn 开头清零,\
+         与侦察护栏按会话累计的口径不同)。若已接近结论请直接作答,\
+         避免为低价值验证追加调用。"
     )
 }
 
