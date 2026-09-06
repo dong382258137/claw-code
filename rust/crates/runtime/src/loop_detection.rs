@@ -383,6 +383,16 @@ impl LoopDetector {
         LoopAction::Continue
     }
 
+    /// 本轮存在实质推进动作(工具调用)时清零认知停滞累计。
+    ///
+    /// 修复 F5 误报:thinking 含"不确定/需确认"措辞的**核查型思考**若伴随
+    /// 工具调用(正在查证),是"查证-推进"而非"空转纠结"——用推理猜只有
+    /// 外部才能回答的问题。纯按词面累计会把合法深度调查误判为认知停滞。
+    pub fn clear_cog_stall(&mut self) {
+        self.cog_stall_run = 0;
+        self.cog_stall_warned = false;
+    }
+
     /// 重置文件编辑跟踪(每个 turn 开始调用;工具调用计数保留,支持跨 turn 检测)。
     ///
     /// 同时重置无产出 streak:no-output 检测限定在单 turn 内,避免跨 turn 只读

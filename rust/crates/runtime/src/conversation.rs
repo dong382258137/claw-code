@@ -4249,7 +4249,12 @@ where
                 .collect::<Vec<_>>()
                 .join("\n");
             if !thinking_text.is_empty() {
-                if let LoopAction::InjectContext(msg) =
+                // F5 收紧:本轮含工具调用(模型正在查证/执行动作)= 核查型思考,
+                // 非"用推理猜外部问题"的空转 —— 清零停滞累计,本轮不计入。
+                // 认知停滞只在"连续多轮纯思考无动作却仍纠结"时触发。
+                if !pending_tool_uses.is_empty() {
+                    self.loop_detector.clear_cog_stall();
+                } else if let LoopAction::InjectContext(msg) =
                     self.loop_detector.record_thinking(&thinking_text)
                 {
                     self.pending_cog_stall = Some(msg);
