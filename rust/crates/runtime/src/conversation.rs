@@ -3538,6 +3538,29 @@ where
         } else {
             self.max_iterations
         };
+
+        // F1(批3):监管注记仲裁槽 —— 收敛控制回路"单动作原则"。
+        // 侦察护栏/充分性/成本/收敛四类 [runtime] 注记本质是同一收敛回路的
+        // 不同扳机(都在问"模型是否高效推进"),若各自独立 push,一轮请求会
+        // 收到互相矛盾的指令(一催写文档、一催少调用、一催收尾)。仲裁槽使
+        // 每轮请求至多注入一条:检测点只 stage(高优先级覆盖),请求构造前
+        // flush 单条。被压注记的 fire-once 标志已在检测点置位,本轮放弃
+        // 无害 —— 强收口类(预算硬收口/收敛soft2)优先级高必达,轻提醒
+        // (成本提示/充分性)丢失可接受。优先级:收敛soft2=90 > 预算硬收口=85
+        // > 成本警示=80 > 收敛soft1=70 > 侦察护栏=60 > 充分性=55 >
+        // 成本提示=50 > 预算倒数=45。注记在工具批后触发时对下一迭代可见,
+        // 在循环顶触发时对本迭代可见 —— 与改造前 push_message 语义一致。
+        let mut arbiter_note: Option<(u8, String)> = None;
+        macro_rules! arbiter_stage {
+            ($pri:expr, $hint:expr) => {{
+                let pri: u8 = $pri;
+                match &arbiter_note {
+                    Some((cur, _)) if *cur >= pri => {}
+                    _ => arbiter_note = Some((pri, $hint)),
+                }
+            }};
+        }
+
         loop {
             iterations += 1;
             self.emit_diag(format!("[diag] loop_start iter={iterations}"));
@@ -3604,9 +3627,7 @@ where
                          当前 tracker 未闭环待办: {open_items} 项 —— 未打勾的待办 \
                          不计入收敛,请优先闭环或明确放弃。"
                     );
-                    let _ = self
-                        .session
-                        .push_message(ConversationMessage::user_text(hint));
+                    arbiter_stage!(60, hint);
                 }
             }
 
@@ -3653,9 +3674,7 @@ where
                              当前 tracker 仍有 {open_items} 个未闭环待办项。\
                              若后续仍持续只读侦察,本 turn 将被强制中止。"
                         );
-                        let _ = self
-                            .session
-                            .push_message(ConversationMessage::user_text(hint));
+                        arbiter_stage!(85, hint);
                     } else if self.last_assistant_rounds_only_survey(SURVEY_STALL_LIMIT) {
                         survey_stall_rounds += 1;
                         if survey_stall_rounds >= SURVEY_STALL_LIMIT {
@@ -3682,9 +3701,7 @@ where
                          请优先用已确认证据收敛结论:把 `- [ ]` 待办闭环进 tracker(锚定证据),\
                          或改变策略/询问用户方向。当前 tracker 未闭环 {open_items} 项。"
                     );
-                    let _ = self
-                        .session
-                        .push_message(ConversationMessage::user_text(hint));
+                    arbiter_stage!(45, hint);
                 }
             }
 
@@ -3751,6 +3768,16 @@ where
                     // 已注入过通知但 LLM 仍继续 → 强制自然收尾(状态已落盘)。
                     break;
                 }
+            }
+
+            // F1(批3):仲裁槽 flush —— 请求构造前把本轮最高优先级监管注记
+            // 作为单条 user 消息注入(收敛控制回路单动作原则:每轮请求至多
+            // 一条 [runtime] 注记,避免多类监管互搏)。staged 在循环顶的注记
+            // 对本迭代可见(与改造前一致);工具批后 staged 的对下一迭代可见。
+            if let Some((_pri, note)) = arbiter_note.take() {
+                let _ = self
+                    .session
+                    .push_message(ConversationMessage::user_text(note));
             }
 
             let request = {
@@ -5111,9 +5138,7 @@ where
             {
                 sufficiency_notice_injected = true;
                 let hint = "[runtime] 已声明的充分性判据已满足(声明源均已读取),请基于现有信息直接作答,不要再发起新的只读侦察。";
-                let _ = self
-                    .session
-                    .push_message(ConversationMessage::user_text(hint));
+                arbiter_stage!(55, hint.to_string());
             }
 
             // P2(成本反馈注记 · Task 5):本迭代工具批处理结束 → 评估成本累计,
@@ -5124,9 +5149,9 @@ where
             // 注入 —— 成本失控恰在 Trivial 问答轮最严重,不按档位豁免。
             // 阈值复用 turn 开头读取的 `cost_warn_threshold`(见 run_turn 入口)。
             if let Some(note) = self.cost_meter.poll_note(cost_warn_threshold) {
-                let _ = self
-                    .session
-                    .push_message(ConversationMessage::user_text(note));
+                // 警示(高燃烧,>20K)优先于普通提示(>5K):按注记类型定级。
+                let pri: u8 = if note.contains("成本警示") { 80 } else { 50 };
+                arbiter_stage!(pri, note);
             }
 
             // 收敛契约 P1(§5.1 窄版,方案 A):软阈值门控注入【收敛声明】提示。
@@ -5142,18 +5167,14 @@ where
                 {
                     convergence_soft1_injected = true;
                     let hint = crate::convergence::convergence_prompt_text(true);
-                    let _ = self
-                        .session
-                        .push_message(ConversationMessage::user_text(hint));
+                    arbiter_stage!(70, hint);
                 } else if convergence_soft1_injected
                     && !convergence_soft2_injected
                     && turn_output >= crate::convergence::CONVERGENCE_SOFT2_OUTPUT
                 {
                     convergence_soft2_injected = true;
                     let hint = crate::convergence::convergence_prompt_text(false);
-                    let _ = self
-                        .session
-                        .push_message(ConversationMessage::user_text(hint));
+                    arbiter_stage!(90, hint);
                 }
             }
 
@@ -12071,6 +12092,11 @@ mod tests {
         let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
         let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
         std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV);
+        // F1 仲裁隔离:本测试意图验证**纯成本通道**(提示→警示逐轮注入)。
+        // 收敛契约 soft1(15K,pri 70)会压过成本提示(50),使断言失败 ——
+        // 这是 F1 单动作原则的预期行为,故禁用收敛,让成本通道独占验证。
+        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
+        std::env::set_var("CLAW_CONVERGENCE_P1", "0");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -12093,6 +12119,10 @@ mod tests {
                 std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
             }
             None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+        match saved_convergence_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
         }
 
         let requests = captured.lock().expect("lock");
