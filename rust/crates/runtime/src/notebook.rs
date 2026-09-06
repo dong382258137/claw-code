@@ -826,15 +826,16 @@ pub const PLAN_STALE_MARKER: &str = ".claw/.notebook_plan_stale";
 
 /// 标记 NOTEBOOK `<plan>` 段为 stale(会话结束时调用)。
 ///
-/// 写入一个空标记文件 `.claw/.notebook_plan_stale`,下一会话首 turn 通过
+/// 写入一个标记文件 `.claw/.notebook_plan_stale`,**内容为标记时所属的
+/// session_id**(见 [`mark_plan_stale_if_content`])。下一会话首 turn 通过
 /// [`is_plan_stale`] 检测。失败静默忽略(非关键路径,最坏情况是下一会话
 /// 不提醒刷新,与现有行为一致)。
-pub fn mark_plan_stale(workspace_root: &Path) {
+pub fn mark_plan_stale(workspace_root: &Path, session_id: &str) {
     let path = workspace_root.join(PLAN_STALE_MARKER);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, b"");
+    let _ = std::fs::write(&path, session_id);
 }
 
 /// P1-7:仅当会话 `<plan>` 段真有内容时标记 stale(源头结构省略)。
@@ -846,6 +847,15 @@ pub fn mark_plan_stale(workspace_root: &Path) {
 /// 根本不产生 marker,下一会话的 Session Handoff 槽位整段省略,无需
 /// LLM 判断"这是不是元问答"。
 ///
+/// **热升级/同会话续跑修复(2026-09)**:marker 内容写入**标记时所属的
+/// session_id**。`run_turn` 收尾每 turn 都会执行本函数(per-turn 架构
+/// 无法区分"turn 结束"与"会话结束"),若 marker 是空文件,同会话的
+/// 下一 turn `is_plan_stale` 恒真 → Session Handoff 每 turn 注入(热升级
+/// 续跑会话实测:即使每轮 notebook_update 更新 plan 触发 clear_plan_stale,
+/// 本 turn 收尾又重写 marker → 永不消失)。带 session 归属后,
+/// [`is_plan_stale`] 只在"marker 归属 ≠ 当前会话"时返回 true —— 同会话
+/// (含热升级续跑、普通多 turn)永不自触发,真新会话仍保留提醒。
+///
 /// 返回 `true` 表示已写入 marker(plan 有内容),`false` 表示跳过。
 pub fn mark_plan_stale_if_content(workspace_root: &Path, session_id: &str) -> bool {
     let plan_has_content = Notebook::load_with_session(workspace_root, session_id)
@@ -853,18 +863,26 @@ pub fn mark_plan_stale_if_content(workspace_root: &Path, session_id: &str) -> bo
         .and_then(|nb| nb.get_section("plan").map(|p| !p.trim().is_empty()))
         .unwrap_or(false);
     if plan_has_content {
-        mark_plan_stale(workspace_root);
+        mark_plan_stale(workspace_root, session_id);
     }
     plan_has_content
 }
 
-/// 检测 NOTEBOOK `<plan>` 段是否被标记为 stale。
+/// 检测 NOTEBOOK `<plan>` 段是否被标记为 stale(**且归属其他会话**)。
 ///
-/// 返回 `true` 表示上一会话结束时标记了 stale,当前会话首 turn 应注入
-/// 刷新提醒。检测后**不自动删除** —— 删除时机由 `execute_notebook_update`
-/// 成功后触发(确认 LLM 已响应提醒)。
-pub fn is_plan_stale(workspace_root: &Path) -> bool {
-    workspace_root.join(PLAN_STALE_MARKER).exists()
+/// 返回 `true` 表示上一会话结束时标记了 stale 且标记不属于当前会话,
+/// 当前会话首 turn 应注入刷新提醒。检测后**不自动删除** —— 删除时机由
+/// `execute_notebook_update` 成功后触发(确认 LLM 已响应提醒)。
+///
+/// marker 内容为标记时的 session_id(空/缺失 = 旧版无归属标记,按 stale
+/// 处理,向前兼容:旧标记只可能由旧进程写入,新进程冷启即真新会话)。
+pub fn is_plan_stale(workspace_root: &Path, current_session_id: &str) -> bool {
+    let path = workspace_root.join(PLAN_STALE_MARKER);
+    if !path.exists() {
+        return false;
+    }
+    let owner = std::fs::read_to_string(&path).unwrap_or_default();
+    owner.trim() != current_session_id
 }
 
 /// 清除 plan stale 标记。
@@ -1541,7 +1559,7 @@ mod tests {
         let session = "sess-a";
         // plan 为空(新会话默认)→ 不产生 marker(元问答/无计划会话)。
         assert!(!mark_plan_stale_if_content(dir.path(), session));
-        assert!(!is_plan_stale(dir.path()), "空 plan 不应产生 marker");
+        assert!(!is_plan_stale(dir.path(), session), "空 plan 不应产生 marker");
 
         // 写入会话级 plan 段(真实任务会话)。
         let mut nb = Notebook::new();
@@ -1556,11 +1574,20 @@ mod tests {
             mark_plan_stale_if_content(dir.path(), session),
             "plan 非空应标记 stale"
         );
-        assert!(is_plan_stale(dir.path()), "marker 应存在");
+        // 标记归属 == 当前会话(同会话续跑:热升级/多 turn)→ 不视为 stale。
+        assert!(
+            !is_plan_stale(dir.path(), "sess-a"),
+            "marker 归属同会话不应视为 stale(热升级续跑修复)"
+        );
+        // 另一会话(真新会话)视为 stale。
+        assert!(
+            is_plan_stale(dir.path(), "sess-b"),
+            "marker 归属其他会话应视为 stale"
+        );
 
         // 清理 marker。
         clear_plan_stale(dir.path());
-        assert!(!is_plan_stale(dir.path()), "clear 后 marker 应消失");
+        assert!(!is_plan_stale(dir.path(), "sess-b"), "clear 后 marker 应消失");
     }
 
     // ---- decisions 段精炼回显(第二批:注入资格 = 显式 log_decision) ----

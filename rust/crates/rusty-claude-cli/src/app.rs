@@ -2907,6 +2907,16 @@ impl LiveCli {
             .push_user_text(notice)
             .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
+        // 3b. 热升级是"同会话进程切换"而非"新会话开始":旧进程(含历史版本)
+        // 可能已在收尾时标记了 NOTEBOOK <plan> stale(见 run_turn 收尾段的
+        // mark_plan_stale_if_content)。该标记的语义是"下一**新会话**首 turn
+        // 提醒刷新 plan";热升级 resume 同一 session_id,模型上下文由历史消息
+        // 完整承载,plan 也由 restore_active_plan 恢复 —— 残留 stale 标记只会
+        // 让续跑会话每个 turn 注入 Session Handoff 刷新催促(纯冗余 token)。
+        // 此处清除标记(幂等),使热升级续跑与进程内继续等价。
+        // 失败静默:最坏情况是多提醒一次,无副作用。
+        runtime::notebook::clear_plan_stale(&cwd);
+
         // 4. 清理升级标记(幂等)。
         clear_upgrade_request(&cwd);
 

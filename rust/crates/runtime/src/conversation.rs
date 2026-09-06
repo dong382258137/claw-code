@@ -3538,7 +3538,6 @@ where
         } else {
             self.max_iterations
         };
-
         loop {
             iterations += 1;
             self.emit_diag(format!("[diag] loop_start iter={iterations}"));
@@ -5516,11 +5515,20 @@ where
         // 元问答 / 无计划会话的 plan 为空 → 不产生 marker → 下一会话首 turn
         // 的 Session Handoff 槽位整段省略,无需 LLM 判断"这是不是元问答"
         // (旧实现靠注入文本软提示豁免,会话实测仍造成干扰)。静默失败(非关键路径)。
-        if let Some(workspace_root) = &self.workspace_root {
-            let _ = crate::notebook::mark_plan_stale_if_content(
-                workspace_root,
-                &self.session.session_id,
-            );
+        //
+        // 热升级例外:upgrade_pending 置位 = 优雅收尾是**进程切换而非会话结束**
+        // (新进程 resume 同一 session_id 继续跑),若在此标记 stale,新进程会被
+        // 误判为"新会话首 turn",每个 turn 注入 Session Handoff 刷新提醒
+        // (plan 明明已 restore_active_plan 恢复)—— 纯冗余 token。判断放收尾段
+        // 而非 upgrade break 点:无论热升级走 upgrade break 还是模型收到暂停
+        // 通知后自然收尾(两条路径),只要信号仍置位即跳过,全覆盖。
+        if !self.upgrade_pending.load(Ordering::SeqCst) {
+            if let Some(workspace_root) = &self.workspace_root {
+                let _ = crate::notebook::mark_plan_stale_if_content(
+                    workspace_root,
+                    &self.session.session_id,
+                );
+            }
         }
 
         // 双大脑架构(批次 3):会话收尾确定性聚合 digest → 落盘管理脑区。
@@ -6728,8 +6736,10 @@ where
         }
 
         // 槽位 10:跨会话 plan stale 提醒(flag 由 clear_plan_stale 清除)。
+        // is_plan_stale 带当前 session_id:marker 归属其他会话才触发 ——
+        // 同会话续跑(含热升级 resume、普通多 turn)永不自触发。
         if let Some(root) = &self.workspace_root {
-            if crate::notebook::is_plan_stale(root) {
+            if crate::notebook::is_plan_stale(root, &self.session.session_id) {
                 slots.push((
                     "Session Handoff",
                     "# 📝 New Session — NOTEBOOK <plan> Refresh Recommended\n\
