@@ -3604,6 +3604,7 @@ where
                     && survey_count >= threshold
                     && survey_count.is_multiple_of(threshold)
                     && !self.tracker_recently_updated()
+                    && self.loop_detector.total_edits() == 0
                 {
                     let tracker_path = self
                         .workspace_root
@@ -3714,17 +3715,18 @@ where
             // 回滚快照(见 edit_file/write_file 执行路径)。此处注入提示告知
             // 模型"改错有安全网"—— 消除"再确认一次"的理性优势,让动手变便宜。
             // Trivial 档豁免(状态/问答轮不动手,无安全网可谈,Task 3)。
+            // 批A2(P2 减噪):改走 diag 不进模型上下文 —— 回滚能力由工具清单中
+            // rollback_transaction 的描述自明,注入 user 消息只占注意力槽、
+            // 与用户目标竞争(本会话亲历:每 turn 开场被该通知占据)。
             if turn_tier == TriageTier::Standard
                 && self.refactor_tx.is_some()
                 && !safety_net_notice_injected
             {
                 safety_net_notice_injected = true;
-                let hint = "[runtime] 已自动建立回滚安全网(本次修改可随时调用 \
-                    `rollback_transaction` 回滚)。改错可低成本恢复,无需反复只读确认; \
-                    建议先 `git commit` 基线后直接实施改动。";
-                let _ = self
-                    .session
-                    .push_message(ConversationMessage::user_text(hint));
+                self.emit_diag(
+                    "[diag] safety_net active: 本次修改可随时调用 rollback_transaction 回滚;改错可低成本恢复,无需反复只读确认。"
+                        .to_string(),
+                );
             }
 
             // 硬上限:真正中止。
