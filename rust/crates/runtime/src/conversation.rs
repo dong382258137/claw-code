@@ -4260,12 +4260,16 @@ where
             // 无产出循环检测:模型输出可见文本 → 弱产出信号,重置无产出 streak。
             // 复杂诊断任务(如根因分析)会边说明进度边探索,若仅按"无文件修改"
             // 判定会被误判为探索循环;文本输出证明模型在推进思考,应放宽。
+            // 批A3(P3 度量收紧):仅当本轮**同时含文本与工具调用**时才视为
+            // "边说明边探索"的合法推进并豁免 —— 纯叙述轮(无任何工具动作,
+            // 如复述/声明/打转文本)不再清零 no_output streak。修复"叙述即
+            // 重置"度量错位:活动(文本复述)≠ 进度(朝目标动作)。
             // 注意:在 record_assistant_iteration 之前调用,不改变消息流。
-            if assistant_message
+            let has_text = assistant_message
                 .blocks
                 .iter()
-                .any(|b| matches!(b, ContentBlock::Text { text } if !text.is_empty()))
-            {
+                .any(|b| matches!(b, ContentBlock::Text { text } if !text.is_empty()));
+            if has_text && !pending_tool_uses.is_empty() {
                 self.loop_detector.record_text_output();
             }
             // 认知停滞检测:提取本轮 thinking,检测"反复纠结同一问题"的认知循环。
