@@ -5149,9 +5149,17 @@ where
             // 注入 —— 成本失控恰在 Trivial 问答轮最严重,不按档位豁免。
             // 阈值复用 turn 开头读取的 `cost_warn_threshold`(见 run_turn 入口)。
             if let Some(note) = self.cost_meter.poll_note(cost_warn_threshold) {
-                // 警示(高燃烧,>20K)优先于普通提示(>5K):按注记类型定级。
-                let pri: u8 = if note.contains("成本警示") { 80 } else { 50 };
-                arbiter_stage!(pri, note);
+                if note.contains("成本警示") {
+                    // 警示(≥20K 高燃烧):强收口最后防线,注入 user 消息对模型
+                    // 可见(下一轮请求前逼停收敛 —— dl-19 的收敛机制)。
+                    arbiter_stage!(80, note);
+                } else {
+                    // 普通提示(≥5K):改走面板/日志(diag_callback),不进模型
+                    // 上下文 —— 成本反馈对任务零信息量,注入只会牵引注意力、
+                    // 与收敛契约抢仲裁槽。频率上限(每 ~5 次工具调用一条)与
+                    // 注记位点更新仍在 meter 内生效,不产生新开销。
+                    self.emit_diag(format!("[diag] cost_hint {note}"));
+                }
             }
 
             // 收敛契约 P1(§5.1 窄版,方案 A):软阈值门控注入【收敛声明】提示。
@@ -12033,6 +12041,7 @@ mod tests {
         use std::sync::Mutex;
 
         let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+        let diag_captured = Arc::new(Mutex::new(Vec::<String>::new()));
 
         struct BurnApi {
             calls: AtomicUsize,
@@ -12098,6 +12107,7 @@ mod tests {
         let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
         std::env::set_var("CLAW_CONVERGENCE_P1", "0");
 
+        let diag_log: Arc<Mutex<Vec<String>>> = diag_captured.clone();
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             BurnApi {
@@ -12108,7 +12118,10 @@ mod tests {
                 .register("read_file", |input| Ok(format!("content of {input}"))),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
-        );
+        )
+        .with_diag_callback(Box::new(move |msg| {
+            diag_log.lock().expect("diag lock").push(msg);
+        }));
 
         runtime
             .run_turn("请查证后回答", None)
@@ -12141,16 +12154,26 @@ mod tests {
         };
 
         let last = requests.last().expect("at least one request");
-        // 提示与警示各恰好一条(注入后作为历史消息保留在最终请求中)。
+        // 普通提示(≥5K)已改走 diag 面板/日志通道,不进模型上下文 ——
+        // user 消息中不得再出现成本提示(成本反馈对任务零信息量)。
         assert_eq!(
-            count_text_msgs(last, "成本提示:本 turn 已消耗 output ~15000 tokens"),
-            1,
-            "15K output 后应注入成本提示, got: {last:?}"
+            count_text_msgs(last, "成本提示"),
+            0,
+            "成本提示应走 diag 通道而非 user 消息, got: {last:?}"
         );
+        // 升级警示(累计 25K ≥ 20K)仍注入 user 消息 —— 强收口防线。
         assert_eq!(
             count_text_msgs(last, "成本警示:本 turn output 已超 25000 tokens"),
             1,
             "累计 25K ≥ 20K 阈值应注入成本警示, got: {last:?}"
+        );
+        // diag 面板应收到普通成本提示(带实际 output 数)。
+        let diags = diag_captured.lock().expect("lock");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.contains("cost_hint") && d.contains("~15000 tokens")),
+            "普通成本提示应出现在 diag 通道, got: {diags:?}"
         );
         // 警示携带收敛指令。
         assert!(

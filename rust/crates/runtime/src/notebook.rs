@@ -612,12 +612,9 @@ impl Notebook {
             "# 设计决策与实验证据(前缀冻结)\n\
              以下为 NOTEBOOK 中低频变化的稳定段,跨压缩持久化。\n\n\
              {}\n\n\
-             提示:需要被压缩掉的历史决策细节时,可用 read_file 读取 `decisions_archive.jsonl`。\n\
-             记忆写入路由(同一结论只写一处,勿多处重复):\n\
-             - 结论性修复经验(问题签名+根因+方案+验证)→ `log_decision`(可检索决策日志)\n\
-             - 跨会话任务状态/进度 → `notebook_update`(维护本 NOTEBOOK)\n\
-             - 长期用户偏好/画像 → `memory_update`(PersistentMemory 块)\n\
-             - 查询过去方案 → `search_past_decisions` / `session_search`",
+             记忆写入路由:结论 → `log_decision`;任务进度 → `notebook_update`;\n\
+             画像偏好 → `memory_update`;查询过去 → `search_past_decisions` / `session_search`;\n\
+             历史决策细节 → read `.claw/decisions_archive.jsonl`。",
             parts.join("\n\n")
         )
     }

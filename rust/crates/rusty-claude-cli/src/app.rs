@@ -2858,16 +2858,45 @@ impl LiveCli {
             return Ok(false);
         }
 
-        // 1. resume 旧会话(复用现有 resume_session:session_id 是合法 reference)。
-        let resumed = self.resume_session(Some(req.session_id.clone()))?;
-        if !resumed {
-            eprintln!(
-                "[upgrade] resume session '{}' failed; continuing without it",
-                req.session_id
-            );
-            clear_upgrade_request(&cwd);
-            return Ok(false);
+        // 1. 恢复旧会话(复用 load_session_reference:session_id 是合法 reference)。
+        //    热升级是"同会话进程切换",恢复的是旧会话完整消息;若直接全部塞回,
+        //    历史极长(尤其经历过多次热升级累积)时模型会倾向复述历史。因此这里
+        //    对超长会话先压缩(摘要 + 保留最近消息),与普通会话压缩行为一致:
+        //    避免无条件把全部历史塞回新 runtime 而引发历史复述刷屏。
+        let (handle, session) = load_session_reference(&req.session_id)?;
+        // 仅对超过压缩预算的会话做压缩;短会话(未达阈值)保持原样,行为与
+        // 普通恢复一致(compact_session_with_trigger 内部对未达阈值直接返回原 session)。
+        let compacted = runtime::compact::compact_session_with_trigger(
+            &session,
+            runtime::compact::CompactionConfig::default(),
+            runtime::compact::CompactTrigger::Reactive,
+        );
+        let session_for_runtime = compacted.compacted_session;
+        let session_id = session.session_id.clone();
+        let runtime = build_runtime(
+            session_for_runtime,
+            &handle.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        if compacted.removed_message_count > 0 {
+            crate::diag_log(&format!(
+                "[upgrade] resume session '{}' compacted {} old messages (kept tail): {}",
+                session_id,
+                compacted.removed_message_count,
+                compacted.summary.chars().count()
+            ));
         }
+        self.replace_runtime(runtime)?;
+        self.session = SessionHandle {
+            id: session_id,
+            path: handle.path,
+        };
 
         // 2. 恢复活跃计划(若有)。
         let mut restored_plan_id = None;

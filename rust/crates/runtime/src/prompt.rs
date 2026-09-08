@@ -1872,10 +1872,7 @@ fn render_skill_catalog_section(catalog: &str) -> String {
     }
     format!(
         "## Available Skills\n\
-         The following skills are available. To load a skill's full instructions,\n\
-         call the `Skill` tool with the skill name. To discover skills by semantic\n\
-         query (e.g. when you don't know the exact name), call `SkillSearch` with\n\
-         a capability description.\n\
+         Load full instructions via `Skill` <name>; discover others via `SkillSearch`.\n\
          \n\
          {trimmed}"
     )

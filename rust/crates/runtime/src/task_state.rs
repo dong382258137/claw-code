@@ -341,9 +341,6 @@ impl TaskState {
                 out.push_str(&format!("  · {t}\n"));
             }
         }
-        // 可信度注脚:该状态由 runtime 规则自动记录,可能存在误提取;
-        // 以对话实际内容为准,防止错误状态误导模型。
-        out.push_str("- 注:此状态由 runtime 自动记录,如与当前对话不符,请以最新对话为准。\n");
         out
     }
 }
