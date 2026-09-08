@@ -570,10 +570,11 @@ pub fn render_missing_hint(decl: &ConvergenceDeclaration) -> String {
         decl.evidence.clone()
     };
     format!(
-        "[runtime] 收敛声明校验未通过:你声称完成任务(goal: {goal}),但 evidence \
-         \"{evidence}\" 引用的信号在本会话 tool history 中不存在(或为空)。\
-         请补充本会话真实出现过的客观信号(如实际的测试输出/已写入文件),\
-         或如实把 claimed_complete 改为 false 并继续。"
+        "[runtime] 收敛声明未通过自动验证(evidence \\\"{evidence}\\\" 未能映射到本会话 \\\
+         tool history 中的真实信号)。这**不是**对任务结果的否定:若任务确未完成,请直接如实 \\\
+         声明 claimed_complete: false 并继续,无需构造 evidence —— 声称未完成时 evidence \\\
+         允许为空。仅当你确实已产出可验证的客观产出(测试通过/文件写入)时才声明完成。\\\
+         (goal: {goal})"
     )
 }
 
@@ -721,13 +722,16 @@ mod convergence_p1_tests {
     fn render_missing_hint_carries_goal_and_evidence() {
         let d = parse_convergence_declaration(sample_decl()).unwrap();
         let hint = render_missing_hint(&d);
-        assert!(hint.contains("校验未通过"));
+        assert!(hint.contains("未能映射到本会话"));
         assert!(hint.contains("修复线段漏确认")); // goal 原文
         assert!(hint.contains("11 passed")); // evidence 原文
         // 空 evidence 也应可渲染(不 panic)
         let mut empty = d.clone();
         empty.evidence.clear();
         assert!(render_missing_hint(&empty).contains("(空)"));
+        // P4:打回文案应含"声明未完成时 evidence 允许为空"的宽松指引(消除编造动机)。
+        assert!(hint.contains("claimed_complete: false"));
+        assert!(hint.contains("允许为空"));
     }
 
     #[test]
