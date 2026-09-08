@@ -3512,6 +3512,11 @@ where
         let mut convergence_soft1_injected = false;
         let mut convergence_soft2_injected = false;
         let mut convergence_punchbacks: u8 = 0;
+        // P1 批5(收敛催缴冷却):模型本 turn 已输出过格式合法【收敛声明】
+        // (无论 claimed_complete true/false)的标志。置位后注入段 soft1/soft2
+        // 不再重复催缴 —— 消除"催缴 → 被迫重复输出声明段 → output 增长 →
+        // 再催缴"微循环(批5 审计实证,见 tracker session-1788871932809-0)。
+        let mut convergence_acknowledged = false;
         // 打回后继续标志:证据缺失打回 hint 注入后,不 break 而是回到 loop
         // 顶部重新请求(模型下轮看到 hint 重新决策)。上限 2 保证不无限循环。
         let mut convergence_should_continue = false;
@@ -4306,6 +4311,30 @@ where
                 .push_message(assistant_message.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
+            // P1 批5(收敛催缴冷却):模型本轮文本若含格式合法【收敛声明】
+            // (无论 claimed_complete true/false — false 表示"仍需继续/需用户
+            // 裁决",同样应视为已响应催缴),置位 acknowledged,soft1/soft2
+            // 不再重复注入。复用 parse 的宽松语义,与 break 前校验段一致。
+            if crate::convergence::convergence_enabled() && !convergence_acknowledged {
+                if let Some(last_assistant) = assistant_messages.last() {
+                    let text: String = last_assistant
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if crate::convergence::parse_convergence_declaration(&text).is_some() {
+                        convergence_acknowledged = true;
+                        self.emit_diag(
+                            "[diag] convergence: declaration acknowledged, cooling soft-threshold prompts"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
 
             if pending_tool_uses.is_empty() {
                 // P3:完成声明校验 — 四条件严格 gating + 30s 超时
@@ -5170,13 +5199,18 @@ where
             // 模型回复含声明后,由 break 前的校验段(见 ~L4341)解析并决定收尾/打回。
             if crate::convergence::convergence_enabled() && turn_tier != TriageTier::Trivial {
                 let turn_output = self.cost_meter.turn_output_tokens();
-                if !convergence_soft1_injected
+                // 批5:acknowledged(模型已输出合法声明)后不再重复催缴 ——
+                // 消除"催缴 → 重复输出声明段 → 再催缴"微循环。false 声明
+                // (仍需继续/需用户裁决)同样视为已响应,不注入 soft2。
+                if !convergence_acknowledged
+                    && !convergence_soft1_injected
                     && turn_output >= crate::convergence::CONVERGENCE_SOFT1_OUTPUT
                 {
                     convergence_soft1_injected = true;
                     let hint = crate::convergence::convergence_prompt_text(true);
                     arbiter_stage!(70, hint);
-                } else if convergence_soft1_injected
+                } else if !convergence_acknowledged
+                    && convergence_soft1_injected
                     && !convergence_soft2_injected
                     && turn_output >= crate::convergence::CONVERGENCE_SOFT2_OUTPUT
                 {
@@ -11244,6 +11278,131 @@ mod tests {
             "第 {SOFT_MAX_ITERATIONS} 轮应恰好注入一次收敛警告,实际 {warning_count} 次"
         );
     }
+
+    /// 批5(收敛催缴冷却)回归:模型输出格式合法【收敛声明】(claimed_complete=false,
+    /// 仍需继续调查)后,soft1/soft2 不再重复催缴 —— 消除"催缴 → 被迫重复输出
+    /// 声明段 → output 增长 → 再催缴"微循环(审计实证见 tracker)。
+    #[test]
+    fn convergence_declaration_acknowledged_suppresses_soft2_prompt() {
+        // mock:迭代1 达 soft1(15K);迭代2 再 10K(累计 25K ≥ soft2 阈值)且输出
+        // 合法 false 声明 + 继续调工具(改前:soft2 在此重复催缴);迭代3 收尾。
+        struct DeclApi {
+            calls: usize,
+        }
+
+        impl ApiClient for DeclApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                Ok(match self.calls {
+                    // 迭代1:15K output(触发 soft1 注入)+ 一次工具调用。
+                    1 => vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 15_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::TextDelta("starting investigation".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "d-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "probe-1".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ],
+                    // 迭代2:累计 25K ≥ soft2,输出合法 false 声明并继续调工具。
+                    2 => vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 10_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::TextDelta(
+                            "[收敛声明]\ngoal: 调查进行中\nclaimed_complete: false\n\
+                             evidence: 尚无结论\ntodos:\n- 继续侦察\ncan_stop: false\n"
+                                .to_string(),
+                        ),
+                        AssistantEvent::ToolUse {
+                            id: "d-2".to_string(),
+                            name: "echo".to_string(),
+                            input: "probe-2".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ],
+                    // 迭代3:收尾作答(无工具 → turn 结束)。
+                    _ => vec![
+                        AssistantEvent::TextDelta("wrapping up the investigation".to_string()),
+                        AssistantEvent::MessageStop,
+                    ],
+                })
+            }
+        }
+
+        // env 隔离:抬高成本警示阈值(soft2=25K 天然越过默认 20K 警示线,
+        // 警示文本含"收敛"字样会污染断言),持共享锁与并行测试互斥。
+        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
+        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
+        std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, "100000000");
+
+        let diag_log: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let diag_captured = diag_log.clone();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DeclApi { calls: 0 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_diag_callback(Box::new(move |msg| {
+            diag_captured.lock().expect("diag lock").push(msg);
+        }));
+
+        runtime
+            .run_turn("请调查该问题并给出结论", None)
+            .expect("turn should succeed");
+
+        match saved_warn_env {
+            Some(value) => {
+                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
+            }
+            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+
+        // then:收敛提示(user 注入的催缴模板)全程恰好 1 条 —— 模型声明后 soft2 被冷却。
+        let prompt_count = runtime
+            .session
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(m.role, MessageRole::User)
+                    && m.blocks.iter().any(|b| {
+                        matches!(b, ContentBlock::Text { text } if text.contains("收敛"))
+                    })
+            })
+            .count();
+        assert_eq!(
+            prompt_count, 1,
+            "模型输出合法声明后 soft2 不应重复催缴,实际注入 {prompt_count} 条收敛提示"
+        );
+
+        // acknowledged 置位由 diag 记录佐证(模型自身的 false 声明在 assistant 消息,
+        // 不计入上方 user 提示计数)。
+        let ack = diag_log
+            .lock()
+            .expect("diag lock")
+            .iter()
+            .any(|m| m.contains("convergence: declaration acknowledged"));
+        assert!(
+            ack,
+            "acknowledged 置位应通过 diag 记录,实际日志: {diag_log:?}"
+        );
+    }
+
     #[test]
     fn run_turn_propagates_api_errors() {
         struct FailingApi;
