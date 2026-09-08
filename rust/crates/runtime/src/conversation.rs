@@ -5630,10 +5630,36 @@ where
                 .summary_lines("session-total");
             // 3. 执行脑自写总结段(试点):解析本 turn 最终答复中的 [SESSION_SUMMARY]。
             let mut extra_sections: Vec<(&str, String)> = Vec::new();
+            let mut exec_summary: Option<String> = None;
             if let Some(final_text) = self.last_assistant_text() {
                 if let Some(summary) = crate::management_brain::extract_session_summary(&final_text)
                 {
-                    extra_sections.push(("会话总结(执行脑)", summary));
+                    extra_sections.push(("会话总结(执行脑)", summary.clone()));
+                    exec_summary = Some(summary);
+                }
+            }
+            // P1(批 A1):收尾摘要同步写回 NOTEBOOK plan 段 —— 延续性目标/待办
+            // 的结构化注入通道。仅当 plan 段为空(跨会话目标表示缺失场景)时写回,
+            // plan 段非空视为存在活动计划,不覆盖。复用 Notebook API,失败静默。
+            if let (Some(summary), Ok(mut nb)) = (
+                exec_summary,
+                crate::notebook::Notebook::load(&workspace_root),
+            ) {
+                let plan_empty = nb
+                    .get_section("plan")
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty();
+                if plan_empty {
+                    nb.set_section(
+                        "plan",
+                        &format!(
+                            "会话收尾同步({}):{}",
+                            self.session.session_id,
+                            summary.trim()
+                        ),
+                    );
+                    let _ = nb.save(&workspace_root);
                 }
             }
             // 4. 渲染 + 落盘。
