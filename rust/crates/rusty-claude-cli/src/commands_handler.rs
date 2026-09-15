@@ -127,16 +127,6 @@ pub(crate) enum CliAction {
         subcommand: HarnessCommand,
         output_format: CliOutputFormat,
     },
-    Acp {
-        output_format: CliOutputFormat,
-    },
-    /// `claw acp serve`:启动 stdio ACP 服务器,通过 stdin/stdout 与外部
-    /// ACP 客户端(Zed / VS Code 等)通信。阻塞调用,直到 stdin EOF 或 cancel。
-    AcpServe {
-        model: String,
-        permission_mode: PermissionMode,
-        output_format: CliOutputFormat,
-    },
     State {
         output_format: CliOutputFormat,
     },
@@ -228,7 +218,6 @@ pub(crate) enum LocalHelpTopic {
     Status,
     Sandbox,
     Doctor,
-    Acp,
     // #141: extend the local-help pattern to every subcommand so
     // `claw <subcommand> --help` has one consistent contract.
     Init,
@@ -502,10 +491,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 rest.push(flag[9..].to_string());
                 index += 1;
             }
-            "--acp" | "-acp" => {
-                rest.push("acp".to_string());
-                index += 1;
-            }
             "--allowedTools" | "--allowed-tools" => {
                 let value = args
                     .get(index + 1)
@@ -717,12 +702,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
-        "acp" => parse_acp_args(
-            &rest[1..],
-            model.clone(),
-            permission_mode_override,
-            output_format,
-        ),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => {
             let mut force = false;
@@ -834,7 +813,6 @@ pub(crate) fn parse_local_help_action(
         "status" => LocalHelpTopic::Status,
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
-        "acp" => LocalHelpTopic::Acp,
         // #141: add the subcommands that were previously falling back
         // to global help (init/state/export/version) or erroring out
         // (system-prompt/dump-manifests) or printing their primary
@@ -1085,28 +1063,6 @@ pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> 
 
 pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
     format!("`claw {command_name}` has been removed. Set DEEPSEEK_API_KEY instead.")
-}
-
-pub(crate) fn parse_acp_args(
-    args: &[String],
-    model: String,
-    permission_mode_override: Option<PermissionMode>,
-    output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
-    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
-    match args {
-        // `claw acp` / `claw --acp` / `claw -acp`:仅打印状态(向后兼容)
-        [] => Ok(CliAction::Acp { output_format }),
-        // `claw acp serve`:启动 stdio ACP 服务器
-        [subcommand] if subcommand == "serve" => Ok(CliAction::AcpServe {
-            model,
-            permission_mode,
-            output_format,
-        }),
-        _ => Err(String::from(
-            "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
-        )),
-    }
 }
 
 pub(crate) fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {

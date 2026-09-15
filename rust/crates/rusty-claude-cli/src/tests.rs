@@ -3,8 +3,8 @@
 use crate::*;
 
 use crate::{
-    acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-    classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
+    build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state, classify_error_kind,
+    classify_session_lifecycle_from_panes, collect_session_prompt_history,
     create_managed_session_handle, describe_tool_progress, filter_tool_specs,
     format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
     format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
@@ -1445,76 +1445,6 @@ fn dump_manifests_subcommand_accepts_explicit_manifest_dir() {
 }
 
 #[test]
-fn parses_acp_command_surfaces() {
-    assert_eq!(
-        parse_args(&["acp".to_string()]).expect("acp should parse"),
-        CliAction::Acp {
-            output_format: CliOutputFormat::Text,
-        }
-    );
-    assert_eq!(
-        parse_args(&["acp".to_string(), "serve".to_string()]).expect("acp serve should parse"),
-        CliAction::AcpServe {
-            model: DEFAULT_MODEL.to_string(),
-            permission_mode: default_permission_mode(),
-            output_format: CliOutputFormat::Text,
-        }
-    );
-    assert_eq!(
-        parse_args(&["--acp".to_string()]).expect("--acp should parse"),
-        CliAction::Acp {
-            output_format: CliOutputFormat::Text,
-        }
-    );
-    assert_eq!(
-        parse_args(&["-acp".to_string()]).expect("-acp should parse"),
-        CliAction::Acp {
-            output_format: CliOutputFormat::Text,
-        }
-    );
-    assert_eq!(
-        parse_args(&[
-            "acp".to_string(),
-            "serve".to_string(),
-            "--output-format".to_string(),
-            "json".to_string()
-        ])
-        .expect("acp serve json should parse"),
-        CliAction::AcpServe {
-            model: DEFAULT_MODEL.to_string(),
-            permission_mode: default_permission_mode(),
-            output_format: CliOutputFormat::Json,
-        }
-    );
-    let unsupported = parse_args(&["acp".to_string(), "start".to_string()])
-        .expect_err("unknown ACP subcommand should fail with a typed contract");
-    assert!(unsupported.contains("unsupported ACP invocation"));
-}
-
-#[test]
-fn acp_status_json_reflects_stdio_server_contract() {
-    let value = acp_status_json();
-    assert_eq!(value["schema_version"], "1.1");
-    assert_eq!(value["kind"], "acp");
-    assert_eq!(value["status"], "supported");
-    assert_eq!(value["phase"], "stdio_server");
-    assert_eq!(value["supported"], true);
-    assert_eq!(value["exit_code"], 0);
-    assert_eq!(value["serve_alias_only"], false);
-    assert_eq!(value["launch_command"], "claw acp serve");
-    assert_eq!(value["protocol"]["json_rpc"], true);
-    assert_eq!(value["protocol"]["transport"], "newline_delimited_json");
-    assert_eq!(value["protocol"]["daemon"], false);
-    assert_eq!(value["protocol"]["endpoint"], "stdio");
-    assert_eq!(value["protocol"]["serve_starts_daemon"], false);
-    assert_eq!(
-        value["contracts"]["unsupported_invocation_kind"],
-        "unsupported_acp_invocation"
-    );
-    assert_eq!(value["contracts"]["serve_subcommand"], "claw acp serve");
-}
-
-#[test]
 fn local_command_help_flags_stay_on_the_local_parser_path() {
     assert_eq!(
         parse_args(&["status".to_string(), "--help".to_string()])
@@ -1539,13 +1469,6 @@ fn local_command_help_flags_stay_on_the_local_parser_path() {
             output_format: CliOutputFormat::Text,
         }
     );
-    assert_eq!(
-        parse_args(&["acp".to_string(), "--help".to_string()]).expect("acp help should parse"),
-        CliAction::HelpTopic {
-            topic: LocalHelpTopic::Acp,
-            output_format: CliOutputFormat::Text,
-        }
-    );
 }
 
 #[test]
@@ -1557,7 +1480,6 @@ fn subcommand_help_flag_has_one_contract_across_all_subcommands_141() {
         ("status", LocalHelpTopic::Status),
         ("sandbox", LocalHelpTopic::Sandbox),
         ("doctor", LocalHelpTopic::Doctor),
-        ("acp", LocalHelpTopic::Acp),
         ("init", LocalHelpTopic::Init),
         ("state", LocalHelpTopic::State),
         ("export", LocalHelpTopic::Export),
@@ -1993,10 +1915,6 @@ fn classify_error_kind_returns_correct_discriminants() {
     assert_eq!(
         classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
         "cli_parse"
-    );
-    assert_eq!(
-        classify_error_kind("unsupported ACP invocation. Use `claw acp`."),
-        "unsupported_acp_invocation"
     );
     assert_eq!(
         classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."),
@@ -3186,7 +3104,6 @@ fn init_help_mentions_direct_subcommand() {
     assert!(help.contains("claw status"));
     assert!(help.contains("claw sandbox"));
     assert!(help.contains("claw init"));
-    assert!(help.contains("claw acp [serve]"));
     assert!(help.contains("claw agents"));
     assert!(help.contains("claw mcp"));
     assert!(help.contains("claw skills"));

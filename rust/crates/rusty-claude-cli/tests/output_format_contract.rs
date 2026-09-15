@@ -119,35 +119,6 @@ fn status_json_surfaces_permission_mode_override_for_security_audit() {
 }
 
 #[test]
-fn acp_guidance_emits_json_when_requested() {
-    let root = unique_temp_dir("acp-json");
-    fs::create_dir_all(&root).expect("temp dir should exist");
-
-    let acp = assert_json_command(&root, &["--output-format", "json", "acp"]);
-    assert_eq!(acp["kind"], "acp");
-    assert_eq!(acp["schema_version"], "1.1");
-    assert_eq!(acp["status"], "supported");
-    assert_eq!(acp["phase"], "stdio_server");
-    assert_eq!(acp["supported"], true);
-    assert_eq!(acp["exit_code"], 0);
-    assert_eq!(acp["serve_alias_only"], false);
-    assert_eq!(acp["protocol"]["json_rpc"], true);
-    assert_eq!(acp["protocol"]["transport"], "newline_delimited_json");
-    assert_eq!(acp["protocol"]["endpoint"], "stdio");
-    assert_eq!(acp["protocol"]["version"], 1);
-    assert_eq!(acp["launch_command"], "claw acp serve");
-    assert_eq!(
-        acp["contracts"]["unsupported_invocation_kind"],
-        "unsupported_acp_invocation"
-    );
-    assert_eq!(acp["tracking"], "ROADMAP #76 / #3033 / #3004");
-    assert!(acp["message"]
-        .as_str()
-        .expect("acp message")
-        .contains("stdio ACP"));
-}
-
-#[test]
 fn inventory_commands_emit_structured_json_when_requested() {
     let root = unique_temp_dir("inventory-json");
     fs::create_dir_all(&root).expect("temp dir should exist");

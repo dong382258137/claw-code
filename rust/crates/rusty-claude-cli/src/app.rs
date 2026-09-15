@@ -127,15 +127,6 @@ use tools::{
     ToolSearchOutput,
 };
 
-// ACP stdio server:把 ClawAgent 通过 stdin/stdout JSON-RPC 暴露给外部编辑器
-// 协议版本由 feature 决定:默认 acp-0_10(0.10.4),acp-1_5(1.3) 需
-// --no-default-features --features acp-1_5 编译。
-#[cfg(all(feature = "acp-0_10", not(feature = "acp-1_5")))]
-use claw_shell::{run_stdio_agent, ClawAgentBuilder};
-#[cfg(feature = "acp-1_5")]
-use claw_shell::{run_stdio_agent_v1_3, ClawAgentV13Builder};
-use tokio_util::sync::CancellationToken;
-
 // 从 crate root 引入共享符号（CliOutputFormat、ModelProvenance、共享 helper 等）
 use crate::{
     classify_error_kind, command_exists, config_alias_for_current_dir,
@@ -4151,83 +4142,4 @@ impl runtime::PermissionPrompter for TuiSilentPermissionPrompter {
             ),
         }
     }
-}
-
-// ===== ACP stdio server entrypoint =====
-//
-// `claw acp serve` 的入口:复用 AnthropicRuntimeClient + build_system_prompt +
-// permission_policy 三件套构造 ClawAgentBuilder,然后交给 claw_shell::run_stdio_agent
-// 在 current_thread + LocalSet 上跑 stdio ACP 服务器。
-//
-// 设计说明:
-// - 不 emit CLI 输出(emit_output=false):stdout 被 JSON-RPC 流占用,任何 CLI 打印
-//   都会污染协议
-// - 不接 progress_reporter / status_emitter:stdio 模式下没有 TUI status bar 消费
-// - session_id 用 UUID 生成:new_session 时 agent 会用 ACP 传入的 cwd 初始化 Session,
-//   这里的 session_id 仅用于 AnthropicRuntimeClient 的 prompt cache 隔离
-// - CancellationToken 暂不接 Ctrl+C:MVP 阶段靠 stdin EOF 退出;后续可加 signal handler
-
-#[allow(clippy::needless_pass_by_value)]
-pub fn run_acp_serve(
-    model: String,
-    permission_mode: PermissionMode,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. 生成 session_id(仅用于 prompt cache 隔离)
-    let session_id = uuid::Uuid::new_v4().to_string();
-
-    // 2. 构造 plugin state(feature_config + tool_registry + plugin_registry + mcp_state)
-    let runtime_plugin_state = build_runtime_plugin_state()?;
-    let RuntimePluginState {
-        feature_config,
-        tool_registry,
-        plugin_registry,
-        mcp_state,
-    } = runtime_plugin_state;
-    // plugin_registry.initialize() 在 build_runtime_with_plugin_state 中被调用;
-    // 这里 stdio agent 不直接用 plugin_registry(留给未来 hook 扩展),但仍 initialize
-    // 以保持与 REPL 路径一致的副作用(注册 hooks 等)。
-    plugin_registry.initialize()?;
-
-    // 3. 构造 permission_policy(借用 tool_registry,不消耗)
-    let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
-        .map_err(std::io::Error::other)?;
-
-    // 4. 构造 api_client(clone tool_registry,因 AnthropicRuntimeClient 要持有)
-    let api_client = AnthropicRuntimeClient::new(
-        &session_id,
-        model.clone(),
-        true,  // enable_tools
-        false, // emit_output(stdio 模式禁止 CLI 打印)
-        None,  // allowed_tools
-        tool_registry.clone(),
-        None, // progress_reporter
-    )?;
-
-    // 5. 构造 system_prompt
-    let mut system_prompt = build_system_prompt(&model)?;
-    // MCP 服务器健康总览注入:mcp_state 已在步骤 2 中连接完成,
-    // 与 REPL 路径(build_runtime_with_plugin_state)一致地追加实时状态。
-    append_mcp_catalog(&mut system_prompt, &mcp_state, &feature_config);
-
-    // 6. 按 feature 组装 builder 并启动 stdio ACP 服务器(阻塞直到 stdin EOF 或 cancel)
-    //    默认 acp-0_10(0.10.4);acp-1_5(1.3) 需 --no-default-features --features acp-1_5 编译。
-    //    MVP 阶段不接 Ctrl+C,靠 stdin EOF 退出。
-    let cancel = CancellationToken::new();
-
-    #[cfg(all(feature = "acp-0_10", not(feature = "acp-1_5")))]
-    {
-        let builder = ClawAgentBuilder::new(api_client, policy, system_prompt);
-        run_stdio_agent(builder, cancel)?;
-    }
-
-    #[cfg(feature = "acp-1_5")]
-    {
-        // 1.3 路径:ClawAgentV13Builder 注入 api_client,turn 在命令循环中
-        // 真实驱动 ConversationRuntime(Stage 3 接线)。
-        let builder = ClawAgentV13Builder::new(api_client, policy, system_prompt);
-        let agent = builder.build();
-        run_stdio_agent_v1_3(agent, cancel)?;
-    }
-
-    Ok(())
 }

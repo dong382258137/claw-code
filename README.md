@@ -219,8 +219,6 @@ implementation lives in [`rust/`](./rust)。项目已从最初的 MIT License �
 
 > [!IMPORTANT]
 > Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md) or run the one-click installer [`install.ps1`](./install.ps1). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
->
-> **ACP / IDE status:** `claw acp serve` is a real ACP server supporting dual paths — ACP 0.10.4 by default and ACP 1.3 (initialize/auth/session-new/session-prompt/session-cancel) via the `acp-1_5` feature. The bundled VS Code extension (`vscode-extension/`) uses it for IDE integration and ships a first-run setup wizard plus a full-chain smoke test (`vscode-extension/scripts/acp-smoke-test.mjs`). For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
 
 ## Current repository shape
 
@@ -268,7 +266,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ./install.ps1
 ```
 
-It detects the environment, checks the Rust toolchain, builds `claw` + `claw-plus-headless`, deploys them to `~/.cargo/bin` (already on PATH), verifies the install, and guides API key setup.
+It detects the environment, checks the Rust toolchain, builds `claw`, deploys it to `~/.cargo/bin` (already on PATH), verifies the install, and guides API key setup.
 
 The common manual onboarding issues on Windows are:
 

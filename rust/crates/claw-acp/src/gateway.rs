@@ -4,9 +4,6 @@ use std::rc::Rc;
 
 #[cfg(feature = "acp-0_10")]
 use agent_client_protocol as acp;
-// 同时启用 acp-0_10 和 acp-1_5 时,0.10.4 优先(向后兼容)。
-#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
-use agent_client_protocol_v1::schema::v1 as acp;
 #[cfg(feature = "acp-0_10")]
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
@@ -125,22 +122,6 @@ pub type AcpAgentGatewaySender = AcpGatewaySender<acp::AgentSide>;
 pub type AcpClientGatewayReceiver = AcpGatewayReceiver<acp::ClientSide, acp::ClientSideConnection>;
 #[cfg(feature = "acp-0_10")]
 pub type AcpClientGatewaySender = AcpGatewaySender<acp::ClientSide>;
-
-// 1.3: AgentSide/ClientSide/AgentSideConnection/ClientSideConnection were removed.
-// Use the local stub marker types and a placeholder connection. The gateway
-// dispatch path is non-functional under `acp-1_5` until Phase 2 implements
-// the 1.3 Component/Connection model.
-//
-// 同时启用 acp-0_10 和 acp-1_5 时,0.10.4 的别名优先(上面已定义)。
-// 此处的 1.3 别名仅在 acp-0_10 未启用时生效,避免 E0428 重复定义。
-#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
-pub type AcpAgentGatewayReceiver = AcpGatewayReceiver<crate::message::AgentSide, ()>;
-#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
-pub type AcpAgentGatewaySender = AcpGatewaySender<crate::message::AgentSide>;
-#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
-pub type AcpClientGatewayReceiver = AcpGatewayReceiver<crate::message::ClientSide, ()>;
-#[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
-pub type AcpClientGatewaySender = AcpGatewaySender<crate::message::ClientSide>;
 
 #[cfg(feature = "acp-0_10")]
 fn before_request<T: AcpRequest>(args: &AcpArgs<T>, tracing: bool) -> Option<String> {
@@ -577,8 +558,6 @@ mod tests {
 
     #[cfg(feature = "acp-0_10")]
     use agent_client_protocol as acp;
-    #[cfg(all(feature = "acp-1_5", not(feature = "acp-0_10")))]
-    use agent_client_protocol_v1::schema::v1 as acp;
 
     struct OrderTrackingClient {
         log: Rc<RefCell<Vec<String>>>,

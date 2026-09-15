@@ -1146,7 +1146,7 @@ TUI 启用 bracketed paste（DECSET 2004）。conhost 终端不支持时，Ctrl+
 
 ### 20.10 ACP / Zed 支持
 
-`claw acp`（或 `claw --acp`）查询当前状态。`claw acp serve` 仅为发现性别名，返回状态并 exit 0。真正的 ACP/Zed daemon 尚未实现，详见 `ROADMAP.md`。JSON 契约见 [`docs/g011-acp-json-rpc-status-contract.md`](./g011-acp-json-rpc-status-contract.md)。
+ACP（Agent Communication Protocol）对外通道已移除：`claw acp` / `claw acp serve` / `claw-plus-headless` 不再提供，编辑器集成入口已全部下线。IDE 场景请使用 TUI（`claw`）、REPL 或 `claw prompt <text>`。
 
 ---
 

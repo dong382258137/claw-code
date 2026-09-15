@@ -124,7 +124,7 @@ if ($MISSING.Count -gt 0) {
 # Step 3: build claw binaries
 # =========================================================
 Step "Building claw ($BUILD_PROFILE)"
-$CARGO_FLAGS = @('build', '-p', 'rusty-claude-cli', '--bin', 'claw', '--bin', 'claw-plus-headless')
+$CARGO_FLAGS = @('build', '-p', 'rusty-claude-cli', '--bin', 'claw')
 if ($BUILD_PROFILE -eq 'release') { $CARGO_FLAGS += '--release' }
 Info "Running: cargo $($CARGO_FLAGS -join ' ')"
 Info "First build may take a few minutes. Please wait..."
@@ -149,7 +149,7 @@ if (-not (Test-Path $DEPLOY_DIR)) {
     New-Item -ItemType Directory -Path $DEPLOY_DIR -Force | Out-Null
 }
 $BIN_SRC = Join-Path $RUST_DIR "target\$BUILD_PROFILE"
-$BINARIES = @('claw.exe', 'claw-plus-headless.exe')
+$BINARIES = @('claw.exe')
 foreach ($bin in $BINARIES) {
     $src = Join-Path $BIN_SRC $bin
     if (-not (Test-Path $src)) {
@@ -213,8 +213,5 @@ Write-Host "${ColorGreen}Claw Plus installed successfully!${ColorReset}"
 Write-Host ""
 Write-Host "  Try these commands:"
 Write-Host "    ${ColorBold}claw${ColorReset}                  # interactive REPL"
-Write-Host "    ${ColorBold}claw acp serve${ColorReset}       # ACP server (IDE integration)"
-Write-Host ""
-Write-Host "  VS Code IDE integration: install the Claw Plus extension from the"
-Write-Host "  marketplace, then set the API key in extension settings."
+Write-Host "    ${ColorBold}claw prompt TEXT${ColorReset}      # one-shot prompt"
 Write-Host ""

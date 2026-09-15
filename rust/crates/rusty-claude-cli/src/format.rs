@@ -889,15 +889,6 @@ pub(crate) fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          /doctor · claw --resume latest /doctor"
             .to_string(),
-        LocalHelpTopic::Acp => "ACP (Agent Client Protocol)
-  Usage            claw acp [serve] [--output-format <format>]
-  Aliases          claw --acp · claw -acp
-  Purpose          `claw acp serve` starts a stdio ACP JSON-RPC server for editor integration
-  Status           supported (stdio server, newline-delimited JSON-RPC over stdin/stdout)
-  Connect          spawn `claw acp serve` as the agent process from ACP-compatible editors (Zed, etc.)
-  Formats          text (default), json
-  Related          claw status · claw doctor · claw --help"
-            .to_string(),
         LocalHelpTopic::Init => "Init
   Usage            claw init [--output-format <format>]
   Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
@@ -958,7 +949,6 @@ pub(crate) fn local_help_topic_command(topic: LocalHelpTopic) -> &'static str {
         LocalHelpTopic::Status => "status",
         LocalHelpTopic::Sandbox => "sandbox",
         LocalHelpTopic::Doctor => "doctor",
-        LocalHelpTopic::Acp => "acp",
         LocalHelpTopic::Init => "init",
         LocalHelpTopic::State => "state",
         LocalHelpTopic::Export => "export",
@@ -1035,67 +1025,6 @@ pub(crate) fn print_help_topic(
             "{}",
             serde_json::to_string_pretty(&render_help_topic_json(topic))?
         ),
-    }
-    Ok(())
-}
-
-pub(crate) fn acp_status_message() -> &'static str {
-    "`claw acp serve` launches a stdio ACP (Agent Client Protocol) JSON-RPC server. \
-     Connect from ACP-compatible editors (Zed, VS Code extensions, etc.) by spawning \
-     `claw acp serve` as the editor's agent process; it speaks newline-delimited JSON-RPC \
-     over stdin/stdout and supports initialize/authenticate/new_session/prompt. \
-     `claw acp` (without `serve`) prints this status surface only."
-}
-
-pub(crate) fn acp_status_json() -> serde_json::Value {
-    json!({
-        "schema_version": "1.1",
-        "kind": "acp",
-        "status": "supported",
-        "phase": "stdio_server",
-        "supported": true,
-        "exit_code": 0,
-        "serve_alias_only": false,
-        "message": acp_status_message(),
-        "launch_command": "claw acp serve",
-        "protocol": {
-            "name": "ACP",
-            "version": 1,
-            "json_rpc": true,
-            "transport": "newline_delimited_json",
-            "daemon": false,
-            "endpoint": "stdio",
-            "serve_starts_daemon": false
-        },
-        "contracts": {
-            "stable_status_surface": "claw acp [serve] --output-format json",
-            "unsupported_invocation_kind": "unsupported_acp_invocation",
-            "serve_subcommand": "claw acp serve"
-        },
-        "aliases": ["acp", "--acp", "-acp"],
-        "tracking": "ROADMAP #76 / #3033 / #3004",
-        "recommended_workflows": [
-            "claw acp serve",
-            "claw prompt TEXT",
-            "claw",
-            "claw doctor"
-        ],
-    })
-}
-
-pub(crate) fn print_acp_status(
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match output_format {
-        CliOutputFormat::Text => {
-            println!(
-                "ACP (Agent Client Protocol)\n  Status           supported (stdio server)\n  Transport        newline-delimited JSON-RPC over stdin/stdout\n  Protocol version 1\n  Launch           `claw acp serve` starts the stdio ACP server\n  Status surface   `claw acp` / `claw --acp` / `claw -acp` print this report\n  Connect          spawn `claw acp serve` from ACP-compatible editors (Zed, etc.)\n  Today            use `claw prompt`, the REPL, or `claw doctor` for non-ACP workflows\n  Tracking         ROADMAP #76 / #3033 / #3004\n  Message          {}",
-                acp_status_message()
-            );
-        }
-        CliOutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&acp_status_json())?);
-        }
     }
     Ok(())
 }
@@ -2001,11 +1930,6 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
-    )?;
-    writeln!(out, "  claw acp [serve]")?;
-    writeln!(
-        out,
-        "      `claw acp serve` starts a stdio ACP JSON-RPC server for editor integration; aliases: --acp, -acp"
     )?;
     writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
     writeln!(

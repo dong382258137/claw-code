@@ -297,8 +297,6 @@ pub fn classify_error_kind(message: &str) -> &'static str {
         "session_load_failed"
     } else if message.contains("no managed sessions found") {
         "no_managed_sessions"
-    } else if message.contains("unsupported ACP invocation") {
-        "unsupported_acp_invocation"
     } else if message.contains("unrecognized argument") || message.contains("unknown option") {
         "cli_parse"
     } else if message.contains("invalid model syntax") {
@@ -677,12 +675,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             cache_stats,
         } => run_doctor(output_format, cache_stats)?,
-        CliAction::Acp { output_format } => print_acp_status(output_format)?,
-        CliAction::AcpServe {
-            model,
-            permission_mode,
-            output_format: _output_format,
-        } => run_acp_serve(model, permission_mode)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init {
             output_format,

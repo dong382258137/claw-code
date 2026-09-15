@@ -15,10 +15,10 @@
 //! - 阻塞通知(Blocked/Red)→ `Plan`(单条目,状态 = InProgress)
 //! - Git/Ship/Subagent 操作 → `ToolCall`
 //!
-//! ## 不依赖 1.3 API
+//! ## 依赖说明
 //!
 //! 本模块只使用 0.10.4 的 `agent_client_protocol`(claw-shell 直接依赖),
-//! 不受 `acp-1_5` feature 影响,在默认构建下即可工作。
+//! 在默认构建下即可工作。
 
 use agent_client_protocol as acp;
 // 注意:runtime crate 的 `lane_events` 模块本身是私有的,但其内容通过
