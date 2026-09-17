@@ -8,7 +8,6 @@ description = "DeepSeek web page bridge: turns the logged-in web chat into the m
 
 [dependencies]
 agent-client-protocol = { version = "0.10.4", features = ["unstable"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 claw-acp = { path = "../claw-acp" }
@@ -26,6 +25,9 @@ tools = { path = "../tools" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wasmi = { version = "0.31", default-features = false }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 
 [[bin]]
 name = "claw-web-bridge"

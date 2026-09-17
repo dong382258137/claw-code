@@ -1,4 +1,4 @@
-//! `claw-web-bridge` 守护/CLI：DeepSeek 网页版(登录态、零 Token)作为 claw 的模型后端。
+//! `claw-web-bridge` CLI：DeepSeek 网页版(登录态、零 Token)作为 claw 的模型后端。
 //!
 //! 子命令：
 //! - `login`   — 打开本机 Edge/Chrome（专用 profile）登录 chat.deepseek.com 一次，
@@ -6,22 +6,18 @@
 //! - `import`  — 手动粘贴浏览器 cookie（DevTools→Network→任一请求→Cookie 头），
 //!               自动调 users/current 取 token 并保存
 //! - `run "<任务>"` — 用网页版会话跑完整 claw agent 回合（本地工具执行），打印最终文本
-//! - `serve`   — 旧 WS 网关模式（浏览器扩展/桌面壳对接，新链路验证后退役）
+//!
+//! 旧链路（Electron 桌面壳 / 浏览器扩展 / WS 网关 `serve`）已退役并移除。
 //!
 //! 环境变量：
-//! - `WEB_BRIDGE_PORT`(默认 18793) / `WEB_BRIDGE_TOKEN`(默认 dev-claw-token)：serve 用
 //! - `DEEPSEEK_WEB_BASE`：覆盖 API 基址（测试/代理用）
 //! - `DEEPSEEK_WEB_AUTH` / `CLAW_HOME`：auth.json 位置
 //! - `CHROME_PATH`：登录使用的浏览器可执行文件
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
-use std::sync::{Arc, OnceLock};
 
 use web_bridge::deepseek_web::{fetch_user_token, DeepseekWebClient};
-use web_bridge::server::{serve, spawn_bridge};
 use web_bridge::web_session::WebAuth;
-use web_bridge::ws_exchange::{make_user_turn_runner, TurnRequest};
 use web_bridge::{driver, WebApiClient};
 
 fn system_prompt() -> Vec<String> {
@@ -40,11 +36,10 @@ fn system_prompt() -> Vec<String> {
 
 fn usage() -> ! {
     eprintln!(
-        "用法: claw-web-bridge <login|import|run|serve>\n\
+        "用法: claw-web-bridge <login|import|run>\n\
          \x20 login                       登录一次并保存凭证\n\
          \x20 import --cookie \"<cookie>\"   手动粘贴浏览器 Cookie(自动取 token)\n\
-         \x20 run \"<任务文本>\"             跑完整 claw 回合(本地工具执行)\n\
-         \x20 serve                       旧 WS 网关模式(兼容桌面壳/扩展)"
+         \x20 run \"<任务文本>\"             跑完整 claw 回合(本地工具执行)"
     );
     std::process::exit(2);
 }
@@ -69,7 +64,6 @@ fn main() -> ExitCode {
         "login" => rt.block_on(login(&args)),
         "import" => rt.block_on(import(&args)),
         "run" => rt.block_on(run_task(&args)),
-        "serve" => rt.block_on(serve_wg(&args)),
         _ => {
             if cmd.is_empty() {
                 usage();
@@ -132,32 +126,4 @@ async fn run_task(args: &[String]) -> Result<(), String> {
 
 async fn login(_args: &[String]) -> Result<(), String> {
     web_bridge::login::run().await
-}
-
-// ========== serve：旧 WS 网关（兼容桌面壳/扩展，新链路验证后退役） ==========
-
-async fn serve_wg(_args: &[String]) -> Result<(), String> {
-    let port: u16 = std::env::var("WEB_BRIDGE_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(18793);
-    let token = std::env::var("WEB_BRIDGE_TOKEN").unwrap_or_else(|_| "dev-claw-token".to_string());
-
-    let turn_slot: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<TurnRequest>>> =
-        Arc::new(OnceLock::new());
-    let runner = make_user_turn_runner(turn_slot.clone(), system_prompt());
-    let (broker, turn_bus) = spawn_bridge(runner);
-    turn_slot
-        .set(turn_bus)
-        .map_err(|_| "turn channel already initialized".to_string())?;
-
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let (resolved, _http_handle) = serve(addr, broker, token.clone()).await?;
-    tracing::info!(
-        "claw-web-bridge (serve 旧网关) listening on ws://{resolved}/ws/ext (token: {token})"
-    );
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|e| format!("ctrl_c failed: {e}"))?;
-    Ok(())
 }

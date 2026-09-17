@@ -1,39 +1,24 @@
 //! Web Bridge:把 DeepSeek 网页版当作 claw 引擎的"模型后端"。
 //!
-//! M0 试点目标:用 [`mock_web::MockWebExchange`](模拟网页回复、无浏览器)端到端
-//! 验证 `网页回复 → WebApiClient → claw agent 循环 → 本地工具执行 → 最终回复`
-//! 这条链路成立。
-//!
-//! 架构:
-//! ```text
-//! DeepSeek 网页 → 浏览器扩展(M1+)→ WebExchange(WS)→ WebApiClient
-//!              → claw agent 循环(`runtime::ApiClient` 接缝,复用全部工具/权限)
-//!              → 本地文件/Shell/MCP 执行 → 回复回填网页
-//! ```
-//!
-//! 与 `im-bridge::api_adapter::BridgeApiClient` 平级:`stream()` 实现了同一个
-//! `runtime::ApiClient` trait,agent 循环完全复用,只有"模型回复从哪来"不同 ——
-//! 这里不是 DeepSeek API,而是登录态的 DeepSeek 网页版。
+//! 早期 M0(模拟回复)/M1(浏览器扩展 + WS 网关)/Electron 桌面壳链路已全部退役并
+//! 移除,现仅保留 `login`/`import`(凭证)与直连网页 API 的模型后端一条路径。
 
 pub mod deepseek_web;
 pub mod driver;
 pub mod login;
-pub mod mock_web;
 pub mod pow;
 pub mod protocol;
 pub mod safe_commands;
-pub mod server;
 pub mod tools;
 pub mod web_session;
-pub mod ws_exchange;
 
 use ::tools::GlobalToolRegistry;
 use runtime::{ApiRequest, AssistantEvent, RuntimeError, TokenUsage};
 
 /// 模型后端对接抽象:一次"把增强提示发给网页并取回整段回复"的往返。
 ///
-/// - M0:[`mock_web::MockWebExchange`](脚本化模拟,无浏览器)
-/// - M1+:WS 实现(经本机 WebSocket 驱动浏览器扩展:填输入框发送 + 读回最终回复)
+/// 唯一实现为 [`deepseek_web::DeepseekWebClient`](直连 chat.deepseek.com 内部 API);
+/// 早期 M0 的脚本化模拟与 M1 的 WS 实现均已退役。
 pub trait WebExchange: Send {
     fn round_trip(&mut self, prompt: &str) -> Result<String, String>;
 }

@@ -41,7 +41,7 @@ cargo run -p web-bridge -- run "读取 CLAUDE.md 并总结"   # 跑完整 agent 
 - 凭证位置：`~/.claw/web-bridge/deepseek-auth.json`（`DEEPSEEK_WEB_AUTH` 覆盖）
 - 库级 API：`web_bridge::deepseek_web::DeepseekWebClient` 实现 `WebExchange`，
   配合 `WebApiClient`/`driver::run_prompt` 复用 claw 全部回合与工具链
-- `serve` 子命令为旧 WS 网关（兼容桌面壳/浏览器扩展），新链路验证后退役
+- 旧链路（Electron 桌面壳、浏览器扩展、WS 网关 `serve`）已退役并移除
 
 ## Configuration
 
