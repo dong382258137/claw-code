@@ -694,7 +694,10 @@ pub(crate) struct LiveCli {
 }
 
 pub(crate) struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    /// `Box<dyn runtime::ApiClient>`:允许 `--model deepseek-web` 时注入
+    /// web-bridge 的网页版客户端(登录态、零 Token),与默认 API 后端运行时
+    /// 切换,无需改动 ConversationRuntime 泛型约束。
+    runtime: Option<ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -703,7 +706,7 @@ pub(crate) struct BuiltRuntime {
 
 impl BuiltRuntime {
     fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+        runtime: ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
@@ -772,7 +775,7 @@ impl BuiltRuntime {
 }
 
 impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
+    type Target = ConversationRuntime<Box<dyn runtime::ApiClient>, CliToolExecutor>;
 
     fn deref(&self) -> &Self::Target {
         self.runtime
@@ -3433,6 +3436,44 @@ pub(crate) fn build_runtime(
     )
 }
 
+/// 构造主/子 agent 的 API client(**深度后端路由**)。
+///
+/// - `--model deepseek-web`:走 web-bridge 网页后端(登录态、零 Token)。
+///   复用 tools 注册表把可用工具渲染成增强提示,回复解析出的工具调用仍由
+///   runtime 的 agent 循环执行(工具/权限/MCP/斜杠命令全部复用)。
+/// - 其余模型:默认 API provider(`AnthropicRuntimeClient`)。
+///
+/// 返回 `Box<dyn runtime::ApiClient>`,`ConversationRuntime` 的泛型 slot
+/// 已 box 成 trait object,两种后端可在运行时切换。
+fn build_api_client(
+    session_id: &str,
+    model: &str,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    tool_registry: GlobalToolRegistry,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+) -> Result<Box<dyn runtime::ApiClient>, Box<dyn std::error::Error>> {
+    if model == crate::WEB_MODEL_NAME {
+        let auth = web_bridge::web_session::WebAuth::load()
+            .map_err(|e| format!("--model {} 需要已登录的网页凭证:{e}", crate::WEB_MODEL_NAME))?;
+        eprintln!("[deepseek-web] 使用 chat.deepseek.com 登录态凭证(零 Token)");
+        return Ok(Box::new(web_bridge::WebApiClient::new(
+            Box::new(web_bridge::deepseek_web::DeepseekWebClient::new(auth)),
+            tool_registry,
+        )));
+    }
+    Ok(Box::new(AnthropicRuntimeClient::new(
+        session_id,
+        model.to_string(),
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        tool_registry,
+        progress_reporter,
+    )?))
+}
+
 /// 解析「质量敏感」辅助 LLM 子件应使用的旗舰模型。
 ///
 /// 2026-08-13 DeepSeek V4-Pro 0813 正式版上线后,judge / summarizer /
@@ -3533,17 +3574,18 @@ pub(crate) fn build_runtime_with_plugin_state(
     // P0(2026-08-13 Pro 0813):为质量敏感的辅助 LLM 子件解析旗舰模型,
     // 让 judge / summarizer / extractor / planner / research 吃到 Pro 0813 红利。
     let quality_model = resolve_quality_model(&model_for_subagent);
+    let api_client = build_api_client(
+        session_id,
+        &model,
+        enable_tools,
+        emit_output,
+        allowed_tools.clone(),
+        tool_registry.clone(),
+        progress_reporter,
+    )?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
-            session_id,
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools.clone(),
-            tool_registry.clone(),
-            progress_reporter,
-        )?,
+        api_client,
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
@@ -3882,9 +3924,9 @@ pub(crate) fn build_runtime_with_plugin_state(
     // emit_output=false(避免子 agent 输出污染主 CLI),
     // progress_reporter=None(subagent 不需要进度回调)。
     if let Ok(workspace_root) = env::current_dir() {
-        let subagent_api_client = AnthropicRuntimeClient::new(
+        let subagent_api_client = build_api_client(
             session_id,
-            model_for_subagent.clone(),
+            &model_for_subagent,
             false, // enable_tools
             false, // emit_output
             None,  // allowed_tools

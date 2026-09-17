@@ -43,6 +43,18 @@ cargo run -p web-bridge -- run "读取 CLAUDE.md 并总结"   # 跑完整 agent 
   配合 `WebApiClient`/`driver::run_prompt` 复用 claw 全部回合与工具链
 - 旧链路（Electron 桌面壳、浏览器扩展、WS 网关 `serve`）已退役并移除
 
+### 主 CLI 直接使用（推荐）
+
+登录一次后，`claw` 主程序即可直接以网页版作为模型后端运行，无需单独的
+`claw-web-bridge run`：
+
+```bash
+claw.exe --model deepseek-web "读取 CLAUDE.md 并总结"     # 完整 agent 回合,零 API 消耗
+```
+
+网页後端同样走完整 agent 循环（工具调用有 claw 代码块协议保护），
+推理参数（`--reasoning-effort` / thinking 模式）对其无效。
+
 ## Configuration
 
 Set your API credentials:

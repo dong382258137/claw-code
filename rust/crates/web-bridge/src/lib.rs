@@ -1,7 +1,18 @@
-//! Web Bridge:把 DeepSeek 网页版当作 claw 引擎的"模型后端"。
+//! Web Bridge:把 DeepSeek 网页版(登录态、零 Token)当作 claw 引擎的"模型后端"。
 //!
-//! 早期 M0(模拟回复)/M1(浏览器扩展 + WS 网关)/Electron 桌面壳链路已全部退役并
-//! 移除,现仅保留 `login`/`import`(凭证)与直连网页 API 的模型后端一条路径。
+//! 一次性登录(`login`/`import`)保存凭证后,运行时直接调用 chat.deepseek.com
+//! 内部 API(async round_trip):PoW(`sha256`/`DeepSeekHashV1`,wasmtime 执行官方
+//! wasm) + `chat/completion` SSE 流(以服务端 FINISHED 为完成信号)。
+//!
+//! 架构:
+//! ```text
+//! claw agent 循环(`runtime::ApiClient` 接缝,复用全部工具/权限)
+//!   └─ WebApiClient ─ DeepseekWebClient(WebExchange, worker 线程 HTTP)
+//!        └─ chat.deepseek.com 内部 API(cookie + userToken 鉴权)
+//! ```
+//!
+//! 说明:早期 M0(模拟回复)/M1(浏览器扩展 + WS 网关)/Electron 壳链路已全部退役,
+//! 现仅保留直连网页 API 一条路径。
 
 pub mod deepseek_web;
 pub mod driver;
@@ -17,8 +28,8 @@ use runtime::{ApiRequest, AssistantEvent, RuntimeError, TokenUsage};
 
 /// 模型后端对接抽象:一次"把增强提示发给网页并取回整段回复"的往返。
 ///
-/// 唯一实现为 [`deepseek_web::DeepseekWebClient`](直连 chat.deepseek.com 内部 API);
-/// 早期 M0 的脚本化模拟与 M1 的 WS 实现均已退役。
+/// - M0:[`mock_web::MockWebExchange`](脚本化模拟,无浏览器)
+/// - M1+:WS 实现(经本机 WebSocket 驱动浏览器扩展:填输入框发送 + 读回最终回复)
 pub trait WebExchange: Send {
     fn round_trip(&mut self, prompt: &str) -> Result<String, String>;
 }
@@ -34,6 +45,11 @@ pub struct WebApiClient {
     /// 是否把工具清单渲染进增强提示(广告 = 可执行)。
     enable_tools: bool,
     tool_use_counter: u64,
+    /// TUI 状态转发:网页后端一次性返回完整回复,没有原生流式事件;
+    /// TUI 的回复显示完全依赖 StatusEvent(见 tui/app.rs 对
+    /// StatusEvent::TextDelta 的消费),因此需把「整段文本 + 收尾事件」
+    /// 模拟成流式事件转发出去,否则 TUI 输出区永远空白(CLI 不受影响)。
+    status_emitter: Option<runtime::StatusEmitter>,
 }
 
 impl WebApiClient {
@@ -44,6 +60,7 @@ impl WebApiClient {
             registry,
             enable_tools: true,
             tool_use_counter: 0,
+            status_emitter: None,
         }
     }
 
@@ -79,9 +96,20 @@ impl runtime::ApiClient for WebApiClient {
             .exchange
             .round_trip(&prompt)
             .map_err(|e| RuntimeError::new(format!("web round-trip failed: {e}")))?;
+        crate::deepseek_web::debug_log(&format!(
+            "WebApiClient::stream 拿到 reply ({} chars)",
+            reply.len()
+        ));
 
-        let (outcome) = protocol::parse_reply(&reply);
+        let outcome = protocol::parse_reply(&reply);
         let text = outcome.text;
+        crate::deepseek_web::debug_log(&format!(
+            "parse_reply: text={} chars calls={} unparsed={} truncated={}",
+            text.len(),
+            outcome.calls.len(),
+            outcome.unparsed.len(),
+            outcome.truncated
+        ));
 
         let mut events: Vec<AssistantEvent> = Vec::new();
         let mut blocked: Vec<String> = Vec::new();
@@ -131,6 +159,37 @@ impl runtime::ApiClient for WebApiClient {
             cache_read_input_tokens: 0,
         }));
         events.push(AssistantEvent::MessageStop);
+
+        // TUI 适配:网页后端无原生流式事件,把「整段回复文本 + usage + 收尾」
+        // 模拟成 StatusEvent 序列转发,驱动 TUI 输出区/状态栏实时显示
+        // (CLI 模式 emitter 为 None,零影响)。
+        if let Some(emitter) = &self.status_emitter {
+            crate::deepseek_web::debug_log("emitter 存在,转发 StatusEvent 序列");
+            emitter(runtime::StatusEvent::StreamStart);
+            let mut forwarded = 0;
+            for text in events.iter().filter_map(|e| match e {
+                AssistantEvent::TextDelta(t) => Some(t),
+                _ => None,
+            }) {
+                emitter(runtime::StatusEvent::TextDelta(text.clone()));
+                forwarded += 1;
+            }
+            crate::deepseek_web::debug_log(&format!("转发 {forwarded} 个 TextDelta 事件"));
+            if let Some(AssistantEvent::Usage(u)) = events
+                .iter()
+                .rfind(|e| matches!(e, AssistantEvent::Usage(_)))
+            {
+                emitter(runtime::StatusEvent::Usage(*u));
+            }
+            emitter(runtime::StatusEvent::MessageStop);
+        } else {
+            crate::deepseek_web::debug_log("emitter 为 None(未设置)");
+        }
         Ok(events)
+    }
+
+    fn set_status_emitter(&mut self, emitter: runtime::StatusEmitter) {
+        crate::deepseek_web::debug_log("WebApiClient::set_status_emitter 被调用");
+        self.status_emitter = Some(emitter);
     }
 }

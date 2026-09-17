@@ -36,6 +36,8 @@ ratatui = { version = "0.29", optional = true, default-features = false, feature
 tools = { path = "../tools" }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
+# DeepSeek 网页后端(登录态、零 Token):`claw --model deepseek-web "任务"`。
+web-bridge = { path = "../web-bridge" }
 
 [lints.rust]
 # stderr_guard.rs 需要 Win32 FFI（CreatePipe / SetStdHandle / ReadFile）

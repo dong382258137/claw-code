@@ -132,7 +132,7 @@ pub fn parse_reply(reply: &str) -> ParseOutcome {
     let mut saw_fence_open = false;
 
     // 逐行扫描围栏;记录未闭合(截断)。
-    let mut flush = |outcome: &mut ParseOutcome, lang: &str, code: &str, only_fences: bool| {
+    let flush = |outcome: &mut ParseOutcome, lang: &str, code: &str, only_fences: bool| {
         let code = code.trim();
         if code.is_empty() {
             return;
@@ -144,13 +144,11 @@ pub fn parse_reply(reply: &str) -> ParseOutcome {
                 outcome.calls.extend(calls);
                 outcome.unparsed.extend(unparsed);
             }
-            "js" | "javascript" => {
+            "js" | "javascript" if only_fences && contains_tool_call(code) => {
                 // 仅当整条回复只含代码块且命中工具函数调用才执行(防误判)。
-                if only_fences && contains_tool_call(code) {
-                    let (calls, unparsed) = extract_calls_from_code(code);
-                    outcome.calls.extend(calls);
-                    outcome.unparsed.extend(unparsed);
-                }
+                let (calls, unparsed) = extract_calls_from_code(code);
+                outcome.calls.extend(calls);
+                outcome.unparsed.extend(unparsed);
             }
             "bash" | "sh" | "shell" => {
                 outcome.calls.push(WebToolCall {
@@ -285,7 +283,7 @@ fn contains_tool_call(code: &str) -> bool {
     let mut i = 0;
     while i + 6 <= chars.len() {
         // 找 "await"
-        if &chars[i..i + 5] != ['a', 'w', 'a', 'i', 't'] {
+        if chars[i..i + 5] != ['a', 'w', 'a', 'i', 't'] {
             i += 1;
             continue;
         }
@@ -706,9 +704,6 @@ impl JsParser {
         }
     }
 }
-
-/// bash/sh/shell 代码块围栏语言标记(兼容旧协议)。
-const SHELL_FENCE_BASH: &str = "```bash";
 
 #[cfg(test)]
 mod tests {

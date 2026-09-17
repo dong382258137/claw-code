@@ -201,7 +201,8 @@ pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_from_env_opt,
     default_subagent_tool_catalog, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor,
-    ToolError, ToolExecutor, ToolResultCallback, ToolSummary, TurnSummary,
+    StatusEmitter, StatusEvent, ToolError, ToolExecutor, ToolResultCallback, ToolSummary,
+    TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_roots, glob_search,

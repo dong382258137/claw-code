@@ -24,7 +24,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tools = { path = "../tools" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wasmi = { version = "0.31", default-features = false }
+wasmtime = "26"
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }

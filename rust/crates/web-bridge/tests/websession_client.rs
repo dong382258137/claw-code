@@ -48,7 +48,8 @@ async fn chat_completion(
     headers: HeaderMap,
     body: Json<Value>,
 ) -> Result<axum::response::Response, StatusCode> {
-    stub.completion_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    stub.completion_hits
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     // 校验 PoW 头存在且 answer 正确（用 sha256 重算验证）。
     let pow_header = headers
@@ -61,7 +62,12 @@ async fn chat_completion(
     assert_eq!(obj["algorithm"], "sha256");
     assert_eq!(obj["target_path"], "/api/v0/chat/completion");
     let nonce = obj["answer"].as_u64().expect("sha256 answer");
-    let input = format!("{}{}{}", obj["salt"].as_str().unwrap(), obj["challenge"].as_str().unwrap(), nonce);
+    let input = format!(
+        "{}{}{}",
+        obj["salt"].as_str().unwrap(),
+        obj["challenge"].as_str().unwrap(),
+        nonce
+    );
     let digest = sha2::Sha256::digest(input.as_bytes());
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     let leading = hex.chars().next().unwrap().to_digit(16).unwrap();
@@ -97,9 +103,10 @@ async fn deepseek_web_client_full_round_trip_via_stub() {
             completion_hits: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
 
-    let listener = tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-        .await
-        .expect("bind stub");
+    let listener =
+        tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind stub");
     let addr = listener.local_addr().expect("local addr");
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -114,7 +121,9 @@ async fn deepseek_web_client_full_round_trip_via_stub() {
         captured_at: None,
     };
     let mut client = DeepseekWebClient::new(auth);
-    let reply = client.round_trip("你好，帮我读一个文件").expect("round trip ok");
+    let reply = client
+        .round_trip("你好，帮我读一个文件")
+        .expect("round trip ok");
     assert!(reply.contains("完成。"), "回复应含结尾: {reply}");
     assert!(reply.contains("```claw"), "回复应含工具代码块: {reply}");
 

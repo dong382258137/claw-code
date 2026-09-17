@@ -41,14 +41,21 @@ pub fn default_auth_path() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".claw").join("web-bridge").join("deepseek-auth.json")
+    PathBuf::from(home)
+        .join(".claw")
+        .join("web-bridge")
+        .join("deepseek-auth.json")
 }
 
 impl WebAuth {
     pub fn load() -> Result<Self, String> {
         let path = default_auth_path();
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("读取凭证失败 {}（先运行 `claw-web-bridge login` 或 `import`）: {e}", path.display()))?;
+        let text = fs::read_to_string(&path).map_err(|e| {
+            format!(
+                "读取凭证失败 {}（先运行 `claw-web-bridge login` 或 `import`）: {e}",
+                path.display()
+            )
+        })?;
         let auth: WebAuth = serde_json::from_str(&text)
             .map_err(|e| format!("凭证格式解析失败 {}: {e}", path.display()))?;
         if auth.cookie.trim().is_empty() {
@@ -63,8 +70,11 @@ impl WebAuth {
             fs::create_dir_all(dir)
                 .map_err(|e| format!("创建凭证目录失败 {}: {e}", dir.display()))?;
         }
-        fs::write(&path, serde_json::to_string_pretty(self).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("写入凭证失败 {}: {e}", path.display()))?;
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(self).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("写入凭证失败 {}: {e}", path.display()))?;
         Ok(path)
     }
 

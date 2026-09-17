@@ -1561,7 +1561,10 @@ mod tests {
         let session = "sess-a";
         // plan 为空(新会话默认)→ 不产生 marker(元问答/无计划会话)。
         assert!(!mark_plan_stale_if_content(dir.path(), session));
-        assert!(!is_plan_stale(dir.path(), session), "空 plan 不应产生 marker");
+        assert!(
+            !is_plan_stale(dir.path(), session),
+            "空 plan 不应产生 marker"
+        );
 
         // 写入会话级 plan 段(真实任务会话)。
         let mut nb = Notebook::new();
@@ -1589,7 +1592,10 @@ mod tests {
 
         // 清理 marker。
         clear_plan_stale(dir.path());
-        assert!(!is_plan_stale(dir.path(), "sess-b"), "clear 后 marker 应消失");
+        assert!(
+            !is_plan_stale(dir.path(), "sess-b"),
+            "clear 后 marker 应消失"
+        );
     }
 
     // ---- decisions 段精炼回显(第二批:注入资格 = 显式 log_decision) ----

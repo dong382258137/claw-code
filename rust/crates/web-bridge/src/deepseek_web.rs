@@ -1,4 +1,4 @@
-//! DeepSeek 网页版模型后端：登录态直连 `chat.deepseek.com` 内部 API。
+﻿//! DeepSeek 网页版模型后端：登录态直连 `chat.deepseek.com` 内部 API。
 //!
 //! 链路（端点/请求体/头参考 openclaw-zero-token・MIT）：
 //! `create_pow_challenge` → 求解 PoW → `chat/completion`（SSE）→ 完整回复文本。
@@ -17,6 +17,23 @@ use crate::WebExchange;
 
 const BASE_URL: &str = "https://chat.deepseek.com";
 
+/// 可选文件日志(`CLAW_WEB_LOG_FILE`):TUI 下 stderr 被 StderrGuard 重定向,
+/// tracing::info 不可见;排查网络卡点时把关键阶段落盘。
+pub(crate) fn debug_log(msg: &str) {
+    if let Ok(path) = std::env::var("CLAW_WEB_LOG_FILE") {
+        use std::io::Write;
+        let t = chrono::Local::now().format("%H:%M:%S%.3f");
+        let th = std::thread::current().name().unwrap_or("?").to_string();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{t} [{th}] {msg}");
+        }
+    }
+}
+
 // ========== SSE 帧解码（与 deepseek.js createFrameDecoder 等价） ==========
 
 struct FrameDecoder {
@@ -26,7 +43,10 @@ struct FrameDecoder {
 
 impl FrameDecoder {
     fn new() -> Self {
-        Self { buffer: String::new(), scan_from: 0 }
+        Self {
+            buffer: String::new(),
+            scan_from: 0,
+        }
     }
 
     /// JS 的 `/\r?\n\r?\n/g` 等价处理：先把 `\r\n` 归一为 `\n` 再按 `\n\n` 切帧；
@@ -50,7 +70,11 @@ impl FrameDecoder {
 
     fn finish(mut self) -> Vec<String> {
         let rest = std::mem::take(&mut self.buffer);
-        if rest.trim().is_empty() { Vec::new() } else { vec![rest] }
+        if rest.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![rest]
+        }
     }
 }
 
@@ -91,12 +115,20 @@ fn is_think(t: &str) -> bool {
 
 impl Extractor {
     fn new() -> Self {
-        Self { fragment_types: Vec::new(), current_index: -1, observed: false, text: String::new(), finished: false }
+        Self {
+            fragment_types: Vec::new(),
+            current_index: -1,
+            observed: false,
+            text: String::new(),
+            finished: false,
+        }
     }
 
     fn type_at(&self, slot: i32) -> Option<&str> {
         let i = if slot == -1 { self.current_index } else { slot };
-        if i < 0 { return None; }
+        if i < 0 {
+            return None;
+        }
         self.fragment_types.get(i as usize).map(|s| s.as_str())
     }
 
@@ -110,13 +142,20 @@ impl Extractor {
     fn snapshot_fragments(v: &Value) -> Option<Vec<Value>> {
         let r = v.get("v")?.get("response")?;
         let f = r.get("fragments")?;
-        if !f.is_array() { return None; }
+        if !f.is_array() {
+            return None;
+        }
         let arr = f.as_array()?;
-        if arr.is_empty() { None } else { Some(arr.clone()) }
+        if arr.is_empty() {
+            None
+        } else {
+            Some(arr.clone())
+        }
     }
 
     fn frag_text(f: &Value) -> String {
-        f.get("content").and_then(|x| x.as_str())
+        f.get("content")
+            .and_then(|x| x.as_str())
             .or_else(|| f.get("text").and_then(|x| x.as_str()))
             .unwrap_or("")
             .to_string()
@@ -135,7 +174,9 @@ impl Extractor {
     }
 
     fn consume(&mut self, parsed: &Value) {
-        if !parsed.is_object() { return; }
+        if !parsed.is_object() {
+            return;
+        }
         if parsed.get("o").and_then(|x| x.as_str()) == Some("BATCH") {
             if let Some(arr) = parsed.get("v").and_then(|x| x.as_array()) {
                 for item in arr {
@@ -157,7 +198,12 @@ impl Extractor {
             let n = self.fragment_types.len();
             for (i, f) in arr.iter().enumerate() {
                 let idx = n - arr.len() + i;
-                if !is_think(self.fragment_types.get(idx).map(|s| s.as_str()).unwrap_or("")) {
+                if !is_think(
+                    self.fragment_types
+                        .get(idx)
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                ) {
                     self.text.push_str(&Self::frag_text(f));
                 }
             }
@@ -202,12 +248,10 @@ impl Extractor {
             }
             return;
         }
-        if parsed.get("p").and_then(|x| x.as_str()) == Some("response/status")
-            && parsed.get("v").and_then(|x| x.as_str()) == Some("FINISHED")
-        {
-            self.finished = true;
-        } else if parsed.get("p").and_then(|x| x.as_str()) == Some("quasi_status")
-            && parsed.get("v").and_then(|x| x.as_str()) == Some("FINISHED")
+        if matches!(
+            parsed.get("p").and_then(|x| x.as_str()),
+            Some("response/status") | Some("quasi_status")
+        ) && parsed.get("v").and_then(|x| x.as_str()) == Some("FINISHED")
         {
             self.finished = true;
         }
@@ -217,7 +261,10 @@ impl Extractor {
 /// 从 `response/fragments/<idx>/...` 提取片段槽位。
 fn regex_slot(p: &str) -> i64 {
     let rest = p.strip_prefix("response/fragments/").unwrap_or("");
-    let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+    let num: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
     num.parse().unwrap_or(-1)
 }
 
@@ -265,7 +312,14 @@ fn create_pow_challenge(
     base: &str,
     target_path: &str,
 ) -> Result<PowChallenge, String> {
-    let resp = post_json(http, auth, base, "/api/v0/chat/create_pow_challenge", json!({ "target_path": target_path }), vec![])?;
+    let resp = post_json(
+        http,
+        auth,
+        base,
+        "/api/v0/chat/create_pow_challenge",
+        json!({ "target_path": target_path }),
+        vec![],
+    )?;
     let status = resp.status();
     let text = resp.text().map_err(|e| format!("读取 PoW 响应失败: {e}"))?;
     if !status.is_success() {
@@ -282,15 +336,28 @@ fn create_pow_challenge(
     Ok(ch)
 }
 
-fn create_chat_session(http: &reqwest::blocking::Client, auth: &WebAuth, base: &str) -> Result<String, String> {
-    let resp = post_json(http, auth, base, "/api/v0/chat_session/create", json!({}), vec![])?;
+fn create_chat_session(
+    http: &reqwest::blocking::Client,
+    auth: &WebAuth,
+    base: &str,
+) -> Result<String, String> {
+    let resp = post_json(
+        http,
+        auth,
+        base,
+        "/api/v0/chat_session/create",
+        json!({}),
+        vec![],
+    )?;
     let status = resp.status();
     let text = resp.text().map_err(|e| format!("读取会话响应失败: {e}"))?;
     if !status.is_success() {
         return Err(format!("chat_session/create 返回 {status}: {text}"));
     }
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("会话 JSON 解析失败: {e}"))?;
-    let biz = v.pointer("/data/biz_data").ok_or_else(|| format!("缺少 biz_data: {text}"))?;
+    let biz = v
+        .pointer("/data/biz_data")
+        .ok_or_else(|| format!("缺少 biz_data: {text}"))?;
     let id = biz
         .get("id")
         .or_else(|| biz.get("chat_session_id"))
@@ -307,11 +374,13 @@ fn completion_round(
     session_slot: &mut Option<String>,
     prompt: &str,
 ) -> Result<String, String> {
+    debug_log(&format!("round_trip 开始 (prompt {} chars)", prompt.len()));
     let session_id = match session_slot {
         Some(s) => s.clone(),
         None => {
             let id = create_chat_session(http, auth, base)?;
             tracing::info!("deepseek web: created chat session {id}");
+            debug_log(&format!("会话创建成功 {id}"));
             *session_slot = Some(id.clone());
             id
         }
@@ -320,8 +389,10 @@ fn completion_round(
     let target_path = "/api/v0/chat/completion";
     let challenge = create_pow_challenge(http, auth, base, target_path)?;
     tracing::info!("PoW challenge: {challenge:?}");
+    debug_log(&format!("PoW challenge 拿到: {challenge:?}"));
     let pow_header = pow::solve_to_header(&challenge, target_path)?;
     tracing::info!("PoW header: {pow_header}");
+    debug_log("PoW 求解完成");
 
     let body = json!({
         "chat_session_id": session_id,
@@ -332,23 +403,35 @@ fn completion_round(
         "search_enabled": true,
         "preempt": false,
     });
-    let resp = post_json(http, auth, base, target_path, body, vec![("x-ds-pow-response", pow_header)])?;
+    debug_log("发送 chat/completion 请求...");
+    let resp = post_json(
+        http,
+        auth,
+        base,
+        target_path,
+        body,
+        vec![("x-ds-pow-response", pow_header)],
+    )?;
     let status = resp.status();
+    debug_log(&format!("chat/completion 响应状态: {status}"));
     if !status.is_success() {
         let text = resp.text().unwrap_or_default();
         return Err(format!("chat/completion 返回 {status}: {text}"));
     }
     let text = resp.text().map_err(|e| format!("读取流失败: {e}"))?;
+    debug_log(&format!("SSE 流读取完成 ({} chars)", text.len()));
     // 诊断：记录原始响应开头（区分 SSE 流 / 错误 JSON / 空响应）
-    tracing::info!(
-        "chat/completion 原始响应头: {}",
-        truncate(&text, 600)
-    );
+    tracing::info!("chat/completion 原始响应头: {}", truncate(&text, 600));
     if !text.starts_with("event:") && !text.contains("\ndata:") && !text.starts_with("data:") {
         // 非 SSE 形态，多半是 JSON 错误体或新协议，直接报出来
-        return Err(format!("chat/completion 响应非 SSE 流，前600字: {}", truncate(&text, 600)));
+        return Err(format!(
+            "chat/completion 响应非 SSE 流，前600字: {}",
+            truncate(&text, 600)
+        ));
     }
-    Ok(extract_reply(text.as_bytes()))
+    let reply = extract_reply(text.as_bytes());
+    debug_log(&format!("extract 完成 ({} chars)", reply.len()));
+    Ok(reply)
 }
 
 /// 把 SSE 字节流喂给提取器，返回服务端 FINISHED 时的完整回复文本。
@@ -393,15 +476,25 @@ pub fn fetch_user_token(base: &str, cookie: &str) -> Result<String, String> {
                 let status = resp.status();
                 let text = resp.text().unwrap_or_default();
                 if !status.is_success() {
-                    return Err(format!("users/current 返回 {status}，响应体前300字: {}", truncate(&text, 300)));
+                    return Err(format!(
+                        "users/current 返回 {status}，响应体前300字: {}",
+                        truncate(&text, 300)
+                    ));
                 }
-                let v: Value = serde_json::from_str(&text)
-                    .map_err(|e| format!("users/current JSON 解析失败({e})，响应体前300字: {}", truncate(&text, 300)))?;
+                let v: Value = serde_json::from_str(&text).map_err(|e| {
+                    format!(
+                        "users/current JSON 解析失败({e})，响应体前300字: {}",
+                        truncate(&text, 300)
+                    )
+                })?;
                 v.pointer("/data/biz_data/token")
                     .and_then(|t| t.as_str())
                     .map(|s| s.to_string())
                     .ok_or_else(|| {
-                        format!("users/current 响应缺少 token，响应体前300字: {}", truncate(&text, 300))
+                        format!(
+                            "users/current 响应缺少 token，响应体前300字: {}",
+                            truncate(&text, 300)
+                        )
                     })
             });
         let _ = tx.send(result);
@@ -412,13 +505,20 @@ pub fn fetch_user_token(base: &str, cookie: &str) -> Result<String, String> {
 
 fn truncate(s: &str, n: usize) -> String {
     let t: String = s.chars().take(n).collect();
-    if s.chars().count() > n { format!("{t}…") } else { t }
+    if s.chars().count() > n {
+        format!("{t}…")
+    } else {
+        t
+    }
 }
 
 // ========== 会话客户端（worker 线程模型） ==========
 
 enum WorkerJob {
-    Chat { prompt: String, reply: std::sync::mpsc::Sender<Result<String, String>> },
+    Chat {
+        prompt: String,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
 }
 
 /// DeepSeek 网页会话客户端。
@@ -436,8 +536,8 @@ impl DeepseekWebClient {
         std::thread::Builder::new()
             .name("deepseek-web-worker".to_string())
             .spawn(move || {
-                let base = std::env::var("DEEPSEEK_WEB_BASE")
-                    .unwrap_or_else(|_| BASE_URL.to_string());
+                let base =
+                    std::env::var("DEEPSEEK_WEB_BASE").unwrap_or_else(|_| BASE_URL.to_string());
                 // 专用线程内构造阻塞客户端：该线程无 tokio 上下文，安全。
                 let http = reqwest::blocking::Client::builder()
                     .user_agent("Mozilla/5.0")
@@ -447,7 +547,8 @@ impl DeepseekWebClient {
                 while let Ok(job) = rx.recv() {
                     match job {
                         WorkerJob::Chat { prompt, reply } => {
-                            let result = completion_round(&http, &auth, &base, &mut session_slot, &prompt);
+                            let result =
+                                completion_round(&http, &auth, &base, &mut session_slot, &prompt);
                             let _ = reply.send(result);
                         }
                     }
@@ -463,17 +564,27 @@ impl WebExchange for DeepseekWebClient {
         tracing::info!("deepseek web: round_trip prompt ({} chars)", prompt.len());
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.tx
-            .send(WorkerJob::Chat { prompt: prompt.to_string(), reply: reply_tx })
+            .send(WorkerJob::Chat {
+                prompt: prompt.to_string(),
+                reply: reply_tx,
+            })
             .map_err(|e| format!("deepseek worker 已退出: {e}"))?;
         let reply = match reply_rx.recv_timeout(Duration::from_secs(300)) {
             Ok(Ok(t)) => t,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                debug_log(&format!("worker 返回错误: {e}"));
+                return Err(e);
+            }
             Err(mpsc_recv_timeout) => {
+                debug_log(&format!("300s 等待网页回复超时: {mpsc_recv_timeout}"));
                 return Err(format!("等待网页回复超时: {mpsc_recv_timeout}"));
             }
         };
         let preview: String = reply.chars().take(120).collect();
-        tracing::info!("deepseek web: reply ({} chars) preview: {preview}", reply.len());
+        tracing::info!(
+            "deepseek web: reply ({} chars) preview: {preview}",
+            reply.len()
+        );
         Ok(reply)
     }
 }

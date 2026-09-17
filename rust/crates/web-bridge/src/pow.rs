@@ -57,7 +57,10 @@ impl PowAnswer {
         loop {
             let input = format!("{}{}{}", ch.salt, ch.challenge, nonce);
             let digest = Sha256::digest(input.as_bytes());
-            let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let hex = digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             if Self::sha256_zero_bits(&hex) as u64 >= target {
                 return Ok(nonce);
             }
@@ -70,149 +73,131 @@ impl PowAnswer {
 }
 
 /// 组装 `x-ds-pow-response` 头值：base64(JSON{...challenge, answer, target_path})。
-pub fn build_pow_header(ch: &PowChallenge, answer: serde_json::Value, target_path: &str) -> Result<String, String> {
+pub fn build_pow_header(
+    ch: &PowChallenge,
+    answer: serde_json::Value,
+    target_path: &str,
+) -> Result<String, String> {
     let mut obj = serde_json::to_value(ch).map_err(|e| e.to_string())?;
     if let Some(m) = obj.as_object_mut() {
         m.insert("answer".to_string(), answer);
         m.insert("target_path".to_string(), json!(target_path));
     }
     let bytes = serde_json::to_vec(&obj).map_err(|e| e.to_string())?;
-    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes))
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        bytes,
+    ))
 }
 
 // ========== DeepSeekHashV1（wasmi 运行官方 wasm） ==========
 
 const HASHV1_WASM_B64: &str = include_str!("deepseek_hash_v1.wasm.b64.txt");
 
+/// wasmtime 引擎跑官方 DeepSeekHashV1 wasm（行为与浏览器 V8 一致；
+/// wasmi 解释器对该 wasm 的求解结果与 V8 不符，已弃用）。
 struct HashV1Engine {
-    store: wasmi::Store<()>,
-    alloc: wasmi::Func,
-    stack_ptr: wasmi::Func,
-    solve: wasmi::Func,
-    memory: wasmi::Memory,
+    store: wasmtime::Store<()>,
+    alloc: wasmtime::TypedFunc<(i32, i32), i32>,
+    stack_ptr: wasmtime::TypedFunc<(i32,), i32>,
+    solve: wasmtime::TypedFunc<(i32, i32, i32, i32, i32, f64), ()>,
+    memory: wasmtime::Memory,
 }
 
 impl HashV1Engine {
     fn new() -> Result<Self, String> {
-        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, HASHV1_WASM_B64)
-            .map_err(|e| format!("wasm base64 解码失败: {e}"))?;
-        let engine = wasmi::Engine::default();
-        let module = wasmi::Module::new(&engine, bytes.as_slice()).map_err(|e| format!("wasm 解析失败: {e}"))?;
-        let mut store = wasmi::Store::new(&engine, ());
-        let linker = wasmi::Linker::new(&engine);
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, HASHV1_WASM_B64)
+                .map_err(|e| format!("wasm base64 解码失败: {e}"))?;
+        let engine = wasmtime::Engine::default();
+        let module =
+            wasmtime::Module::new(&engine, &bytes).map_err(|e| format!("wasm 解析失败: {e}"))?;
+        let mut store = wasmtime::Store::new(&engine, ());
+        let linker = wasmtime::Linker::new(&engine);
         let instance = linker
             .instantiate(&mut store, &module)
-            .and_then(|i| i.start(&mut store))
             .map_err(|e| format!("wasm 实例化失败: {e}"))?;
-        let get = |name: &str| -> Result<wasmi::Func, String> {
-            instance
-                .get_export(&store, name)
-                .and_then(|v| v.into_func())
-                .ok_or_else(|| format!("wasm 缺少导出 {name}"))
-        };
-        let solve = get("wasm_solve")?;
-        let alloc = get("__wbindgen_export_0")?;
-        let stack_ptr = get("__wbindgen_add_to_stack_pointer")?;
         let memory = instance
-            .get_export(&store, "memory")
-            .and_then(|v| v.into_memory())
-            .ok_or_else(|| "wasm 缺少 memory 导出".to_string())?;
-        Ok(Self { store, alloc, stack_ptr, solve, memory })
+            .get_memory(&mut store, "memory")
+            .ok_or("wasm 缺少 memory 导出")?;
+        let alloc = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "__wbindgen_export_0")
+            .map_err(|e| format!("wasm alloc 导出异常: {e}"))?;
+        let stack_ptr = instance
+            .get_typed_func::<(i32,), i32>(&mut store, "__wbindgen_add_to_stack_pointer")
+            .map_err(|e| format!("wasm stack_ptr 导出异常: {e}"))?;
+        let solve = instance
+            .get_typed_func::<(i32, i32, i32, i32, i32, f64), ()>(&mut store, "wasm_solve")
+            .map_err(|e| format!("wasm_solve 导出异常（签名不符?）: {e}"))?;
+        Ok(Self {
+            store,
+            alloc,
+            stack_ptr,
+            solve,
+            memory,
+        })
     }
 
     fn call_alloc(&mut self, n: usize) -> Result<u32, String> {
-        let mut results = [wasmi::Value::I32(0)];
         self.alloc
-            .call(
-                &mut self.store,
-                &[wasmi::Value::I32(n as i32), wasmi::Value::I32(1)],
-                &mut results,
-            )
-            .map_err(|e| format!("wasm alloc 失败: {e}"))?;
-        match results[0] {
-            wasmi::Value::I32(p) => Ok(p as u32),
-            _ => Err("alloc 返回异常".to_string()),
-        }
+            .call(&mut self.store, (n as i32, 1))
+            .map(|p| p as u32)
+            .map_err(|e| format!("wasm alloc 失败: {e}"))
     }
 
-    fn write_memory(&mut self, ptr: u32, data: &[u8]) {
-        let _ = self.memory.write(&mut self.store, ptr as usize, data);
+    fn write_memory(&mut self, ptr: u32, data: &[u8]) -> Result<(), String> {
+        self.memory
+            .write(&mut self.store, ptr as usize, data)
+            .map_err(|e| format!("wasm 内存写入失败: {e}"))
     }
 
     /// 求解 DeepSeekHashV1：`prefix = {salt}_{expire_at}_`，返回 f64 答案。
-    fn solve_challenge(&mut self, target: &str, prefix: &str, difficulty: u64) -> Result<f64, String> {
+    fn solve_challenge(
+        &mut self,
+        target: &str,
+        prefix: &str,
+        difficulty: u64,
+    ) -> Result<f64, String> {
         let (p_c, l_c) = (self.call_alloc(target.len())?, target.len() as u32);
         let (p_p, l_p) = (self.call_alloc(prefix.len())?, prefix.len() as u32);
         tracing::info!("HashV1 alloc: target@{p_c} len={l_c} prefix@{p_p} len={l_p}");
-        self.write_memory(p_c, target.as_bytes());
-        self.write_memory(p_p, prefix.as_bytes());
-        // 回读校验写入
-        let mut rb = vec![0u8; 16.min(l_c as usize)];
-        let _ = self.memory.read(&mut self.store, p_c as usize, &mut rb);
-        tracing::info!(
-            "HashV1 写入回读 target前{}: {:02x?}",
-            rb.len(),
-            &rb[..]
-        );
-        let mut rbp = vec![0u8; 16.min(l_p as usize)];
-        let _ = self.memory.read(&mut self.store, p_p as usize, &mut rbp);
-        tracing::info!(
-            "HashV1 写入回读 prefix前{}: {:02x?}",
-            rbp.len(),
-            &rbp[..]
-        );
+        self.write_memory(p_c, target.as_bytes())?;
+        self.write_memory(p_p, prefix.as_bytes())?;
 
         // 取一段栈上 16 字节作回执区。
-        let mut stack_result = [wasmi::Value::I32(0)];
-        self.stack_ptr
-            .call(&mut self.store, &[wasmi::Value::I32(-16)], &mut stack_result)
-            .map_err(|e| format!("栈指针失败: {e}"))?;
-        let ret = match stack_result[0] {
-            wasmi::Value::I32(v) => v as u32,
-            _ => return Err("栈指针返回异常".to_string()),
-        };
+        let ret = self
+            .stack_ptr
+            .call(&mut self.store, (-16,))
+            .map_err(|e| format!("栈指针失败: {e}"))? as u32;
 
-        // 按 wasm 声明的函数签名动态组装参数（官方 wasm 的 difficulty
-        // 参数类型可能随版本变化，i32 与 f64 均按签名适配）。
-        let ty = self.solve.ty(&self.store);
-        let params = ty.params().to_vec();
-        let mut fixed = vec![
-            wasmi::Value::I32(ret as i32),
-            wasmi::Value::I32(p_c as i32),
-            wasmi::Value::I32(l_c as i32),
-            wasmi::Value::I32(p_p as i32),
-            wasmi::Value::I32(l_p as i32),
-        ];
-        for (i, pt) in params.iter().enumerate() {
-            if i < fixed.len() {
-                continue;
-            }
-            match pt {
-                wasmi::core::ValueType::I32 => fixed.push(wasmi::Value::I32(difficulty as i32)),
-                wasmi::core::ValueType::I64 => fixed.push(wasmi::Value::I64(difficulty as i64)),
-                wasmi::core::ValueType::F32 => fixed.push(wasmi::Value::F32((difficulty as f32).into())),
-                wasmi::core::ValueType::F64 => fixed.push(wasmi::Value::F64(difficulty.into())),
-                _ => return Err(format!("wasm_solve 含不支持参数类型 {pt:?}")),
-            }
-        }
-        tracing::debug!("wasm_solve 签名: params={:?}", ty.params());
-
-        let mut solve_result = vec![wasmi::Value::I32(0); ty.results().len()];
+        let start = std::time::Instant::now();
         self.solve
-            .call(&mut self.store, &fixed, &mut solve_result)
+            .call(
+                &mut self.store,
+                (
+                    ret as i32,
+                    p_c as i32,
+                    l_c as i32,
+                    p_p as i32,
+                    l_p as i32,
+                    difficulty as f64,
+                ),
+            )
             .map_err(|e| format!("wasm_solve 失败: {e}"))?;
+        tracing::info!("HashV1 求解耗时: {:?}", start.elapsed());
 
-        let mut stack_restore = [wasmi::Value::I32(0)];
-        self.stack_ptr
-            .call(&mut self.store, &[wasmi::Value::I32(16)], &mut stack_restore)
-            .map_err(|e| format!("栈指针归还失败: {e}"))?;
-
+        // 与 JS 参考实现顺序一致：先读回执区，再归还栈指针。
         let status = self.read_i32(ret).ok_or("读取 status 失败")?;
         let mut ret_bytes = [0u8; 16];
-        let _ = self.memory.read(&mut self.store, ret as usize, &mut ret_bytes);
-        let answer = self.read_f64(ret + 8).ok_or_else(|| "读取 answer 失败".to_string())?;
+        let _ = self.memory.read(&self.store, ret as usize, &mut ret_bytes);
+        let answer = self
+            .read_f64(ret + 8)
+            .ok_or_else(|| "读取 answer 失败".to_string())?;
+        let _ = self.stack_ptr.call(&mut self.store, (16,));
+
         tracing::info!("HashV1 结果: status={status} answer={answer} ret16={ret_bytes:02x?}");
-        if status != 0 {
+        // 与 JS 参考一致：status == 0 表示未找到解，非 0 表示求解成功。
+        if status == 0 {
             return Err("DeepSeekHashV1 未找到解".to_string());
         }
         Ok(answer)
@@ -220,13 +205,13 @@ impl HashV1Engine {
 
     fn read_i32(&mut self, ptr: u32) -> Option<i32> {
         let mut buf = [0u8; 4];
-        self.memory.read(&mut self.store, ptr as usize, &mut buf).ok()?;
+        self.memory.read(&self.store, ptr as usize, &mut buf).ok()?;
         Some(i32::from_le_bytes(buf))
     }
 
     fn read_f64(&mut self, ptr: u32) -> Option<f64> {
         let mut buf = [0u8; 8];
-        self.memory.read(&mut self.store, ptr as usize, &mut buf).ok()?;
+        self.memory.read(&self.store, ptr as usize, &mut buf).ok()?;
         Some(f64::from_le_bytes(buf))
     }
 }
@@ -241,9 +226,29 @@ pub fn solve(ch: &PowChallenge) -> Result<serde_json::Value, String> {
         "DeepSeekHashV1" => {
             let expire = ch.expire_at.ok_or("DeepSeekHashV1 缺少 expire_at")?;
             let prefix = format!("{}_{}_", ch.salt, expire);
-            let mut engine = HashV1Engine::new()?;
-            let answer = engine.solve_challenge(&ch.challenge, &prefix, ch.difficulty)?;
-            Ok(json!(answer))
+            // 高难度下偶发求解失败，重建引擎重试（每次全新实例，避免状态残留）。
+            let mut last_err = String::from("求解未尝试");
+            for attempt in 1..=3 {
+                match HashV1Engine::new()
+                    .and_then(|mut e| e.solve_challenge(&ch.challenge, &prefix, ch.difficulty))
+                {
+                    Ok(answer) => {
+                        tracing::info!("HashV1 求解成功（尝试 {attempt}）answer={answer}");
+                        // 整数 f64 必须以整数形式入 JSON（服务端校验数字格式，
+                        // 参考实现 JS 序列化无小数点）。
+                        return Ok(if answer.fract() == 0.0 {
+                            json!(answer as i64)
+                        } else {
+                            json!(answer)
+                        });
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        tracing::warn!("HashV1 第 {attempt} 次求解失败: {last_err}");
+                    }
+                }
+            }
+            Err(format!("DeepSeekHashV1 连续 3 次未找到解：{last_err}"))
         }
         other => Err(format!("不支持的 PoW 算法: {other}")),
     }
@@ -272,7 +277,14 @@ mod tests {
         };
         let nonce = PowAnswer { value: json!(0) }.solve_sha256(&ch).unwrap();
         let input = format!("{}{}{}", ch.salt, ch.challenge, nonce);
-        let hex: String = Sha256::digest(input.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-        assert!(PowAnswer::sha256_zero_bits(&hex) >= 5, "nonce={nonce} bits={}", PowAnswer::sha256_zero_bits(&hex));
+        let hex: String = Sha256::digest(input.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(
+            PowAnswer::sha256_zero_bits(&hex) >= 5,
+            "nonce={nonce} bits={}",
+            PowAnswer::sha256_zero_bits(&hex)
+        );
     }
 }

@@ -32,7 +32,10 @@ fn find_chrome() -> Option<String> {
         "/usr/bin/google-chrome",
         "/usr/bin/chromium",
     ];
-    CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()).map(|s| s.to_string())
+    CANDIDATES
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string())
 }
 
 fn pick_free_port() -> Result<u16, String> {
@@ -64,15 +67,25 @@ async fn wait_cdp_page_ws(port: u16) -> Result<String, String> {
     let list_url = format!("http://127.0.0.1:{port}/json");
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let Ok(resp) = reqwest::get(&list_url).await else { continue };
-        let Ok(list) = resp.json::<Vec<Value>>().await else { continue };
+        let Ok(resp) = reqwest::get(&list_url).await else {
+            continue;
+        };
+        let Ok(list) = resp.json::<Vec<Value>>().await else {
+            continue;
+        };
         let target = list
             .iter()
             .find(|t| {
                 t.get("type").and_then(|x| x.as_str()) == Some("page")
-                    && t.get("url").and_then(|x| x.as_str()).map(|u| u.contains("deepseek.com")).unwrap_or(false)
+                    && t.get("url")
+                        .and_then(|x| x.as_str())
+                        .map(|u| u.contains("deepseek.com"))
+                        .unwrap_or(false)
             })
-            .or_else(|| list.iter().find(|t| t.get("type").and_then(|x| x.as_str()) == Some("page")));
+            .or_else(|| {
+                list.iter()
+                    .find(|t| t.get("type").and_then(|x| x.as_str()) == Some("page"))
+            });
         if let Some(t) = target {
             if let Some(ws) = t.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
                 return Ok(ws.to_string());
@@ -84,7 +97,8 @@ async fn wait_cdp_page_ws(port: u16) -> Result<String, String> {
 
 pub async fn run() -> Result<(), String> {
     let chrome = find_chrome().ok_or_else(|| {
-        "未找到 Edge/Chrome。请设置 CHROME_PATH 环境变量，或用 `import` 手动粘贴 cookie。".to_string()
+        "未找到 Edge/Chrome。请设置 CHROME_PATH 环境变量，或用 `import` 手动粘贴 cookie。"
+            .to_string()
     })?;
     let port = pick_free_port()?;
     let profile_dir = default_auth_path()
@@ -107,7 +121,9 @@ type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>;
 /// CDP 会话：发送命令（响应由后台 reader 投递到 pending 表）。
 struct Cdp {
     tx: futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
         WsMsg,
     >,
     next_id: u64,
@@ -122,7 +138,7 @@ impl Cdp {
         self.pending.lock().unwrap().insert(id, tx);
         let msg = json!({ "id": id, "method": method, "params": params });
         self.tx
-            .send(WsMsg::Text(msg.to_string().into()))
+            .send(WsMsg::Text(msg.to_string()))
             .await
             .map_err(|e| format!("CDP 发送失败: {e}"))?;
         tokio::time::timeout(Duration::from_secs(10), rx)
@@ -135,7 +151,9 @@ impl Cdp {
 /// 后台 reader：把 ws 上按序到达的响应按 id 路由给等待方。
 fn spawn_cdp_reader(
     rx: futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     >,
     pending: Pending,
 ) {
@@ -143,8 +161,12 @@ fn spawn_cdp_reader(
         let mut rx = rx;
         while let Some(Ok(msg)) = rx.next().await {
             let Ok(text) = msg.into_text() else { continue };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-            let Some(id) = v.get("id").and_then(|x| x.as_u64()) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
+                continue;
+            };
             if let Some(tx) = pending.lock().unwrap().remove(&id) {
                 let _ = tx.send(v);
             }
@@ -160,7 +182,11 @@ async fn capture(port: u16) -> Result<(), String> {
     let (tx, rx) = ws.split();
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     spawn_cdp_reader(rx, pending.clone());
-    let mut cdp = Cdp { tx, next_id: 0, pending };
+    let mut cdp = Cdp {
+        tx,
+        next_id: 0,
+        pending,
+    };
 
     let _ = cdp.call("Network.enable", json!({})).await;
     let _ = cdp.call("Runtime.enable", json!({})).await;
@@ -179,14 +205,17 @@ async fn capture(port: u16) -> Result<(), String> {
         let Some(cookies) = resp
             .pointer("/result/cookies")
             .and_then(|c| c.as_array())
-            .map(|arr| arr.clone())
+            .cloned()
         else {
             continue;
         };
         let cookie = cookies
             .iter()
             .filter(|c| {
-                c.get("domain").and_then(|d| d.as_str()).map(|d| d.contains("deepseek.com")).unwrap_or(false)
+                c.get("domain")
+                    .and_then(|d| d.as_str())
+                    .map(|d| d.contains("deepseek.com"))
+                    .unwrap_or(false)
             })
             .filter_map(|c| {
                 Some(format!(

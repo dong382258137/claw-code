@@ -1168,6 +1168,56 @@ pub struct PromptCacheEvent {
     pub token_drop: u32,
 }
 
+/// Events emitted during streaming for the status bar / output view to consume.
+///
+/// 原定义在 rusty-claude-cli 的 streaming.rs(pub(crate)),后因 `ApiClient`
+/// 泛型参数需 box 成 trait object(接入 DeepSeek 网页后端),状态注入必须
+/// 经 trait 方法完成,故将事件类型上移到本 crate。
+#[derive(Debug, Clone)]
+pub enum StatusEvent {
+    /// A usage delta arrived (input/output tokens updated).
+    Usage(TokenUsage),
+    /// A text delta arrived (incremental assistant output).
+    TextDelta(String),
+    /// A tool use started (tool name + input JSON provided).
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    /// A tool finished executing (id, name, output, is_error).
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+    /// A thinking block was observed during streaming.
+    ///
+    /// - `text`: 本次事件的 thinking 增量文本。流式路径每次携带一个 delta
+    ///   (`done=false`);完整块路径携带整段 thinking (`done=true`)。
+    /// - `done`: 思考块是否已结束。
+    /// - `char_count`: 思考块总字符数(`done=true` 时可知;流式期间为 None)。
+    /// - `redacted`: 是否 `RedactedThinking`(provider 隐藏了内容)。
+    Thinking {
+        text: String,
+        done: bool,
+        char_count: Option<usize>,
+        redacted: bool,
+    },
+    /// The model finished responding (MessageStop received).
+    MessageStop,
+    /// Streaming turn started (first event received).
+    StreamStart,
+    /// 流式过程中发生错误(API 5xx / 网络断开 / 写入失败等)。
+    /// `recoverable` 为 true 表示错误可重试(如 429 限流),false 表示致命错误。
+    StreamError { message: String, recoverable: bool },
+}
+
+/// Callback type for emitting streaming events to a status observer.
+/// Set via `ApiClient::set_status_emitter`. No-op by default.
+pub type StatusEmitter = std::sync::Arc<dyn Fn(StatusEvent) + Send + Sync>;
+
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 ///
 /// v3:`ApiClient: Send` supertrait — 所有实现必须 `Send`。这让 `dyn ApiClient`
@@ -1242,6 +1292,84 @@ pub trait ApiClient: Send {
         _capability: crate::multi_agent::SubagentCapability,
     ) -> Result<Box<dyn ApiClient>, String> {
         self.with_model(model)
+    }
+
+    /// 设置推理强度(仅 API provider 实现有意义;默认 no-op)。
+    fn set_reasoning_effort(&mut self, _effort: Option<String>) {}
+
+    /// 设置思考模式开关(仅 API provider 实现有意义;默认 no-op)。
+    fn set_thinking_mode(&mut self, _thinking: Option<bool>) {}
+
+    /// 读取当前 thinking_mode(供 TUI 侧栏显示;默认 None)。
+    fn thinking_mode(&self) -> Option<bool> {
+        None
+    }
+
+    /// 读取当前 reasoning_effort(供 TUI 侧栏显示;默认 None)。
+    fn reasoning_effort(&self) -> Option<String> {
+        None
+    }
+
+    /// 注入流式状态回调(供 TUI 状态栏/输出视图实时消费;默认 no-op)。
+    /// 该类型上移自 CLI 的 streaming.rs,使得 box 成 trait object 后仍可注入。
+    fn set_status_emitter(&mut self, _emitter: StatusEmitter) {}
+}
+
+/// `ApiClient` 的 trait-object 包装:让 `ConversationRuntime<Box<dyn ApiClient>>`
+/// 可在纯 API 后端与网页后端(DWS,见 web-bridge crate)之间运行时切换。
+///
+/// `set_*` / getter 四个推理配置方法与 `set_status_emitter` 均为默认 no-op:
+/// 只有 API provider 实现(`AnthropicRuntimeClient`)会改写它们,非 API 后端
+/// (如网页版,无滑块/思考模式参数)使用默认行为,无需额外实现。
+impl ApiClient for Box<dyn ApiClient + 'static> {
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        (**self).stream(request)
+    }
+
+    fn stream_async<'a>(
+        &'a mut self,
+        request: ApiRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<AssistantEvent>, RuntimeError>> + Send + 'a,
+        >,
+    > {
+        (**self).stream_async(request)
+    }
+
+    fn with_model(&self, model: &str) -> Result<Box<dyn ApiClient>, String> {
+        (**self).with_model(model)
+    }
+
+    fn with_model_and_capability(
+        &self,
+        model: &str,
+        capability: crate::multi_agent::SubagentCapability,
+    ) -> Result<Box<dyn ApiClient>, String> {
+        (**self).with_model_and_capability(model, capability)
+    }
+
+    // 配置/状态注入必须转发到内层:若缺失,调用会命中 trait 默认 no-op,
+    // 内层实现的 WebApiClient(网页后端)或 AnthropicRuntimeClient 永远收不到
+    // emitter / 推理参数(TUI 模式下回复不显示、/effort 失效)。
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        (**self).set_reasoning_effort(effort);
+    }
+
+    fn set_thinking_mode(&mut self, thinking: Option<bool>) {
+        (**self).set_thinking_mode(thinking);
+    }
+
+    fn thinking_mode(&self) -> Option<bool> {
+        (**self).thinking_mode()
+    }
+
+    fn reasoning_effort(&self) -> Option<String> {
+        (**self).reasoning_effort()
+    }
+
+    fn set_status_emitter(&mut self, emitter: StatusEmitter) {
+        (**self).set_status_emitter(emitter);
     }
 }
 

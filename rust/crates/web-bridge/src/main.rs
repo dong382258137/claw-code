@@ -2,12 +2,12 @@
 //!
 //! 子命令：
 //! - `login`   — 打开本机 Edge/Chrome（专用 profile）登录 chat.deepseek.com 一次，
-//!               自动抓取 cookie + bearer 保存到 auth.json（之后不再需要浏览器）
+//!   自动抓取 cookie + userToken 保存到 auth.json（之后不再需要浏览器）
 //! - `import`  — 手动粘贴浏览器 cookie（DevTools→Network→任一请求→Cookie 头），
-//!               自动调 users/current 取 token 并保存
+//!   自动调 users/current 取 token 并保存
 //! - `run "<任务>"` — 用网页版会话跑完整 claw agent 回合（本地工具执行），打印最终文本
 //!
-//! 旧链路（Electron 桌面壳 / 浏览器扩展 / WS 网关 `serve`）已退役并移除。
+//! 旧链路（Electron 壳 / 浏览器扩展 / WS 网关）已退役。
 //!
 //! 环境变量：
 //! - `DEEPSEEK_WEB_BASE`：覆盖 API 基址（测试/代理用）
@@ -90,7 +90,9 @@ async fn import(args: &[String]) -> Result<(), String> {
         .windows(2)
         .find(|w| w[0] == "--cookie")
         .map(|w| w[1].clone())
-        .ok_or_else(|| "缺少 cookie，用法: claw-web-bridge import --cookie \"<cookie>\"".to_string())?;
+        .ok_or_else(|| {
+            "缺少 cookie，用法: claw-web-bridge import --cookie \"<cookie>\"".to_string()
+        })?;
     let base = std::env::var("DEEPSEEK_WEB_BASE")
         .unwrap_or_else(|_| "https://chat.deepseek.com".to_string());
     let bearer = fetch_user_token(&base, &cookie)?;
@@ -102,7 +104,10 @@ async fn import(args: &[String]) -> Result<(), String> {
     };
     let path = auth.save()?;
     println!("凭证已保存: {}", path.display());
-    println!("token 获取成功(bearer 长度 {})，现在可以 `claw-web-bridge run \"任务\"`", auth.bearer.len());
+    println!(
+        "token 获取成功(bearer 长度 {})，现在可以 `claw-web-bridge run \"任务\"`",
+        auth.bearer.len()
+    );
     Ok(())
 }
 
@@ -118,7 +123,7 @@ async fn run_task(args: &[String]) -> Result<(), String> {
         ::tools::GlobalToolRegistry::builtin(),
     );
     let text = driver::run_prompt(client, system_prompt(), task).await?;
-    print!("{text}\n");
+    println!("{text}");
     Ok(())
 }
 

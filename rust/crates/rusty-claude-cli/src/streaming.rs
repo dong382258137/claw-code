@@ -41,57 +41,9 @@ use crate::ultraplan::InternalPromptProgressReporter;
 use crate::{filter_tool_specs, max_tokens_for_model, AllowedToolSet};
 
 /// Callback type for emitting streaming events to a status observer.
-/// Receives a snapshot of the runtime's turn-usage accumulator and
-/// an elapsed millis counter, so the observer can update its display.
-/// Set via `AnthropicRuntimeClient::with_status_emitter`. No-op by default.
-pub(crate) type StatusEmitter = Arc<dyn Fn(StatusEvent) + Send + Sync>;
-
-/// Events emitted during streaming for the status bar to consume.
-#[derive(Debug, Clone)]
-pub(crate) enum StatusEvent {
-    /// A usage delta arrived (input/output tokens updated).
-    Usage(TokenUsage),
-    /// A text delta arrived (incremental assistant output).
-    TextDelta(String),
-    /// A tool use started (tool name + input JSON provided).
-    ToolUse {
-        id: String,
-        name: String,
-        input: String,
-    },
-    /// A tool finished executing (id, name, output, is_error).
-    ToolResult {
-        id: String,
-        name: String,
-        output: String,
-        is_error: bool,
-    },
-    /// A thinking block was observed during streaming.
-    ///
-    /// - `text`: 本次事件的 thinking 增量文本。流式路径每次携带一个 delta
-    ///   （`done=false`）；完整块路径携带整段 thinking（`done=true`）。
-    ///   结束信号（`done=true`）时 `text` 可为空，TUI 据此折叠卡片。
-    /// - `done`: 思考块是否已结束（ContentBlockStop / 完整块到达）。
-    ///   TUI 收到 `done=true` 时把 Thinking 卡片折叠为摘要。
-    /// - `char_count`: 思考块总字符数（`done=true` 时可知；流式期间为 None）。
-    /// - `redacted`: 是否 `RedactedThinking`（provider 隐藏了内容）。
-    Thinking {
-        text: String,
-        done: bool,
-        char_count: Option<usize>,
-        redacted: bool,
-    },
-    /// The model finished responding (MessageStop received).
-    MessageStop,
-    /// Streaming turn started (first event received).
-    StreamStart,
-    /// P0-1 修复：流式过程中发生错误（API 5xx / 网络断开 / 写入失败等）。
-    /// 之前所有错误返回路径都不 emit 事件，TUI 在错误发生时收不到任何信号，
-    /// `streaming: true` 一直保留导致 UI 假死。现在在每个 `return Err(...)` 前
-    /// emit 此事件，让 TUI 能即时调用 `finish_turn()` 并向用户显示错误。
-    /// `recoverable` 为 true 表示错误可重试（如 429 限流），false 表示致命错误。
-    StreamError { message: String, recoverable: bool },
-}
+/// Type 已上移到 runtime crate(供 `Box<dyn ApiClient>` 经 trait 注入),
+/// 这里再导出,保持既有 `crate::streaming::StatusEvent/StatusEmitter` 路径不变。
+pub(crate) use runtime::{StatusEmitter, StatusEvent};
 
 pub(crate) const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -267,40 +219,12 @@ impl AnthropicRuntimeClient {
         }
     }
 
-    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        self.reasoning_effort = effort;
-    }
-
-    /// 设置 DeepSeek 思考模式开关。Some(true)=开启,Some(false)=关闭,None=模型默认。
-    pub(crate) fn set_thinking_mode(&mut self, thinking: Option<bool>) {
-        self.thinking_mode = thinking;
-    }
-
-    /// 读取当前 thinking_mode 设置(供 TUI 侧栏显示)。
-    pub(crate) fn thinking_mode(&self) -> Option<bool> {
-        self.thinking_mode
-    }
-
-    /// 读取当前 reasoning_effort 设置（供 TUI 侧栏显示）。
-    /// None 表示使用模型默认（不发送 reasoning_effort 字段到 API）。
-    pub(crate) fn reasoning_effort(&self) -> Option<String> {
-        self.reasoning_effort.clone()
-    }
-
     /// Attach a status emitter callback. The callback is invoked on
     /// each streaming event (Usage, TextDelta, ToolUse, MessageStop)
     /// so the observer can update its display in real-time.
     pub(crate) fn with_status_emitter(mut self, emitter: StatusEmitter) -> Self {
         self.status_emitter = Some(emitter);
         self
-    }
-
-    /// Attach a status emitter callback to an already-constructed client.
-    /// This is the `&mut self` counterpart to `with_status_emitter` — used
-    /// when the client is already wrapped inside a `ConversationRuntime`
-    /// and we only have `api_client_mut()` access.
-    pub(crate) fn set_status_emitter(&mut self, emitter: StatusEmitter) {
-        self.status_emitter = Some(emitter);
     }
 
     /// Emit a status event if an emitter is attached. No-op otherwise.
@@ -443,6 +367,26 @@ fn tools_for_triage(
 }
 
 impl ApiClient for AnthropicRuntimeClient {
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
+    }
+
+    fn set_thinking_mode(&mut self, thinking: Option<bool>) {
+        self.thinking_mode = thinking;
+    }
+
+    fn thinking_mode(&self) -> Option<bool> {
+        self.thinking_mode
+    }
+
+    fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort.clone()
+    }
+
+    fn set_status_emitter(&mut self, emitter: StatusEmitter) {
+        self.status_emitter = Some(emitter);
+    }
+
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {

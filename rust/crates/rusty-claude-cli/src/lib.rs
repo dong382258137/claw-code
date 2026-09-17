@@ -157,6 +157,12 @@ use ultraplan::{
 // 升级到 pro(model_tier upgrade 表 flash→pro),兼顾成本与质量。
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
+/// 网页版后端模型名:走 chat.deepseek.com 登录态(零 Token),实现见
+/// web-bridge crate(`WebApiClient` + `DeepseekWebClient`)。用
+/// `claw.exe --model deepseek-web "任务"` 直接驱动主 agent,凭证
+/// 位于 `~/.claw/web-bridge/deepseek-auth.json`,需先登录一次。
+pub const WEB_MODEL_NAME: &str = "deepseek-web";
+
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
 /// to audit whether their `--model` flag was honored vs falling back to env
@@ -1020,6 +1026,11 @@ pub fn validate_model_syntax(model: &str) -> Result<(), String> {
             "invalid model syntax: '{}' contains spaces. Use provider/model format or a known DeepSeek model name",
             trimmed
         ));
+    }
+    // 网页版后端(deepseek-web)不是 API provider 模型,单独放行,由运行时
+    // 路由到 web-bridge 的登录态客户端(见 build_api_client)。
+    if trimmed == WEB_MODEL_NAME {
+        return Ok(());
     }
     // Check provider/model format: provider_id/model_id
     let parts: Vec<&str> = trimmed.split('/').collect();
