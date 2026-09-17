@@ -1418,33 +1418,6 @@ fn harness_subcommand_parses_list_stats_rollback_evolve() {
 }
 
 #[test]
-fn dump_manifests_subcommand_accepts_explicit_manifest_dir() {
-    assert_eq!(
-        parse_args(&[
-            "dump-manifests".to_string(),
-            "--manifests-dir".to_string(),
-            "/tmp/upstream".to_string(),
-        ])
-        .expect("dump-manifests should parse"),
-        CliAction::DumpManifests {
-            output_format: CliOutputFormat::Text,
-            manifests_dir: Some(PathBuf::from("/tmp/upstream")),
-        }
-    );
-    assert_eq!(
-        parse_args(&[
-            "dump-manifests".to_string(),
-            "--manifests-dir=/tmp/upstream".to_string()
-        ])
-        .expect("inline dump-manifests flag should parse"),
-        CliAction::DumpManifests {
-            output_format: CliOutputFormat::Text,
-            manifests_dir: Some(PathBuf::from("/tmp/upstream")),
-        }
-    );
-}
-
-#[test]
 fn local_command_help_flags_stay_on_the_local_parser_path() {
     assert_eq!(
         parse_args(&["status".to_string(), "--help".to_string()])
@@ -1485,7 +1458,6 @@ fn subcommand_help_flag_has_one_contract_across_all_subcommands_141() {
         ("export", LocalHelpTopic::Export),
         ("version", LocalHelpTopic::Version),
         ("system-prompt", LocalHelpTopic::SystemPrompt),
-        ("dump-manifests", LocalHelpTopic::DumpManifests),
         ("bootstrap-plan", LocalHelpTopic::BootstrapPlan),
     ];
     for (subcommand, expected_topic) in cases {
@@ -5288,85 +5260,6 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
-    }
-}
-
-#[cfg(test)]
-mod dump_manifests_tests {
-    use crate::{dump_manifests_at_path, CliOutputFormat};
-    use std::fs;
-
-    #[test]
-    fn dump_manifests_shows_helpful_error_when_manifests_missing() {
-        let root = std::env::temp_dir().join(format!(
-            "claw_test_missing_manifests_{}",
-            std::process::id()
-        ));
-        let workspace = root.join("workspace");
-        std::fs::create_dir_all(&workspace).expect("failed to create temp workspace");
-
-        let result = dump_manifests_at_path(&workspace, None, CliOutputFormat::Text);
-        assert!(
-            result.is_err(),
-            "expected an error when manifests are missing"
-        );
-
-        let error_msg = result.unwrap_err().to_string();
-
-        assert!(
-            error_msg.contains("Manifest source files are missing"),
-            "error message should mention missing manifest sources: {error_msg}"
-        );
-        assert!(
-            error_msg.contains(&root.display().to_string()),
-            "error message should contain the resolved repo root path: {error_msg}"
-        );
-        assert!(
-            error_msg.contains("src/commands.ts"),
-            "error message should mention missing commands.ts: {error_msg}"
-        );
-        assert!(
-            error_msg.contains("CLAUDE_CODE_UPSTREAM"),
-            "error message should explain how to supply the upstream path: {error_msg}"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn dump_manifests_uses_explicit_manifest_dir() {
-        let root = std::env::temp_dir().join(format!(
-            "claw_test_explicit_manifest_dir_{}",
-            std::process::id()
-        ));
-        let workspace = root.join("workspace");
-        let upstream = root.join("upstream");
-        fs::create_dir_all(workspace.join("nested")).expect("workspace should exist");
-        fs::create_dir_all(upstream.join("src/entrypoints"))
-            .expect("upstream fixture should exist");
-        fs::write(
-            upstream.join("src/commands.ts"),
-            "import FooCommand from './commands/foo'\n",
-        )
-        .expect("commands fixture should write");
-        fs::write(
-            upstream.join("src/tools.ts"),
-            "import ReadTool from './tools/read'\n",
-        )
-        .expect("tools fixture should write");
-        fs::write(
-            upstream.join("src/entrypoints/cli.tsx"),
-            "startupProfiler()\n",
-        )
-        .expect("cli fixture should write");
-
-        let result = dump_manifests_at_path(&workspace, Some(&upstream), CliOutputFormat::Text);
-        assert!(
-            result.is_ok(),
-            "explicit manifest dir should succeed: {result:?}"
-        );
-
-        let _ = fs::remove_dir_all(&root);
     }
 }
 

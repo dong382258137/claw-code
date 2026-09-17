@@ -349,33 +349,6 @@ fn bootstrap_and_system_prompt_emit_json_when_requested() {
 }
 
 #[test]
-fn dump_manifests_and_init_emit_json_when_requested() {
-    let root = unique_temp_dir("manifest-init-json");
-    fs::create_dir_all(&root).expect("temp dir should exist");
-
-    let upstream = write_upstream_fixture(&root);
-    let manifests = assert_json_command(
-        &root,
-        &[
-            "--output-format",
-            "json",
-            "dump-manifests",
-            "--manifests-dir",
-            upstream.to_str().expect("utf8 upstream"),
-        ],
-    );
-    assert_eq!(manifests["kind"], "dump-manifests");
-    assert_eq!(manifests["commands"], 1);
-    assert_eq!(manifests["tools"], 1);
-
-    let workspace = root.join("workspace");
-    fs::create_dir_all(&workspace).expect("workspace should exist");
-    let init = assert_json_command(&workspace, &["--output-format", "json", "init"]);
-    assert_eq!(init["kind"], "init");
-    assert!(workspace.join("CLAUDE.md").exists());
-}
-
-#[test]
 fn doctor_and_resume_status_emit_json_when_requested() {
     let root = unique_temp_dir("doctor-resume-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
@@ -825,29 +798,6 @@ fn run_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output 
         command.env(key, value);
     }
     command.output().expect("claw should launch")
-}
-
-fn write_upstream_fixture(root: &Path) -> PathBuf {
-    let upstream = root.join("claw-code");
-    let src = upstream.join("src");
-    let entrypoints = src.join("entrypoints");
-    fs::create_dir_all(&entrypoints).expect("upstream entrypoints dir should exist");
-    fs::write(
-        src.join("commands.ts"),
-        "import FooCommand from './commands/foo'\n",
-    )
-    .expect("commands fixture should write");
-    fs::write(
-        src.join("tools.ts"),
-        "import ReadTool from './tools/read'\n",
-    )
-    .expect("tools fixture should write");
-    fs::write(
-        entrypoints.join("cli.tsx"),
-        "if (args[0] === '--version') {}\nstartupProfiler()\n",
-    )
-    .expect("cli fixture should write");
-    upstream
 }
 
 fn write_session_fixture(root: &Path, session_id: &str, user_text: Option<&str>) -> PathBuf {

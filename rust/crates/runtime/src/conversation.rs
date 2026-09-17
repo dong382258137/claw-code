@@ -4457,8 +4457,7 @@ where
                                     < crate::convergence::CONVERGENCE_MAX_PUNCHBACKS =>
                                 {
                                     convergence_punchbacks += 1;
-                                    let hint =
-                                        crate::convergence::render_missing_hint(&decl);
+                                    let hint = crate::convergence::render_missing_hint(&decl);
                                     let _ = self
                                         .session
                                         .push_message(ConversationMessage::user_text(hint));
@@ -11378,7 +11377,10 @@ mod tests {
         // 警示文本含"收敛"字样会污染断言),持共享锁与并行测试互斥。
         let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
         let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
-        std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, "100000000");
+        std::env::set_var(
+            crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
+            "100000000",
+        );
 
         let diag_log: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -11412,9 +11414,9 @@ mod tests {
             .iter()
             .filter(|m| {
                 matches!(m.role, MessageRole::User)
-                    && m.blocks.iter().any(|b| {
-                        matches!(b, ContentBlock::Text { text } if text.contains("收敛"))
-                    })
+                    && m.blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("收敛")))
             })
             .count();
         assert_eq!(
@@ -11878,10 +11880,10 @@ mod tests {
     }
 
     /// 动手安全网(方案3,2026-08-31):首次 edit_file 自动建立 turn 级回滚
-    /// 快照,并在下一轮注入"可回滚"提示 —— 改错有安全网,消除"再确认一次"
-    /// 的理性优势。
+    /// 快照。批A2(P2 减噪,2026-09):提示走 diag 不进上下文 —— 回滚能力由
+    /// rollback_transaction 工具描述自明,注入只占模型注意力槽。
     #[test]
-    fn first_edit_establishes_safety_net_and_injects_notice() {
+    fn first_edit_establishes_safety_net_diag_not_context() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
@@ -11938,6 +11940,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
+        let diag_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let diag_capture = diag_seen.clone();
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             EditApi {
@@ -11949,19 +11953,34 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_workspace_root(tmp.clone());
+        .with_workspace_root(tmp.clone())
+        .with_diag_callback(Box::new(move |msg| {
+            diag_capture.lock().expect("lock").push(msg);
+        }));
 
         runtime
             .run_turn("改一下", None)
             .expect("turn should succeed");
 
+        // 批A2(P2 减噪):安全网通知走 diag,不允许注入模型上下文
+        // (回滚能力由 rollback_transaction 工具描述自明,注入只占注意力槽)。
         let shots = captured.lock().expect("lock");
         let all_texts: Vec<String> = shots.iter().flat_map(|v| v.iter().cloned()).collect();
         assert!(
             all_texts
                 .iter()
-                .any(|t| t.contains("回滚安全网") && t.contains("rollback_transaction")),
-            "safety net notice must be injected after first edit, got: {all_texts:?}"
+                .all(|t| !t.contains("safety_net") && !t.contains("回滚安全网")),
+            "safety net notice must NOT be injected into model context after 批A2 减噪, got: {all_texts:?}"
+        );
+        // 安全网仍然生效:diag 通道恰好命中一次。
+        let diag_msgs = diag_seen.lock().expect("lock");
+        assert_eq!(
+            diag_msgs
+                .iter()
+                .filter(|m| m.contains("safety_net active"))
+                .count(),
+            1,
+            "safety net diag should be emitted exactly once, got: {diag_msgs:?}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();

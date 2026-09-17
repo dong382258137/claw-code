@@ -23,7 +23,6 @@ use commands::{
     classify_skills_slash_command, resolve_skill_invocation, slash_command_specs,
     SkillSlashDispatch, SlashCommand,
 };
-use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{load_system_prompt, PermissionMode};
 use serde_json::json;
 
@@ -35,20 +34,15 @@ use crate::suggestion::{
 use crate::{
     config_alias_for_current_dir, config_model_for_current_dir,
     config_permission_mode_for_current_dir, current_tool_registry, default_permission_mode,
-    format_connected_line, normalize_allowed_tools, parse_dump_manifests_args, parse_export_args,
-    parse_permission_mode_arg, parse_resume_args, parse_system_prompt_args,
-    permission_mode_from_label, permission_mode_from_resolved, provider_label,
-    render_version_report, resolve_model_alias, resolve_model_alias_with_config,
-    resolve_repl_model, validate_model_syntax, AllowedToolSet, CliOutputFormat, BUILD_TARGET,
-    DEFAULT_DATE, DEFAULT_MODEL, GIT_SHA, VERSION,
+    format_connected_line, normalize_allowed_tools, parse_export_args, parse_permission_mode_arg,
+    parse_resume_args, parse_system_prompt_args, permission_mode_from_label,
+    permission_mode_from_resolved, provider_label, render_version_report, resolve_model_alias,
+    resolve_model_alias_with_config, resolve_repl_model, validate_model_syntax, AllowedToolSet,
+    CliOutputFormat, BUILD_TARGET, DEFAULT_DATE, DEFAULT_MODEL, GIT_SHA, VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliAction {
-    DumpManifests {
-        output_format: CliOutputFormat,
-        manifests_dir: Option<PathBuf>,
-    },
     BootstrapPlan {
         output_format: CliOutputFormat,
     },
@@ -225,7 +219,6 @@ pub(crate) enum LocalHelpTopic {
     Export,
     Version,
     SystemPrompt,
-    DumpManifests,
     BootstrapPlan,
 }
 
@@ -281,7 +274,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor, init, state, export,
-                // version, system-prompt, dump-manifests, bootstrap-plan) must
+                // version, system-prompt, bootstrap-plan) must
                 // NOT be intercepted here — they handle --help in their own
                 // dispatch paths via parse_local_help_action(). See #141.
                 wants_help = true;
@@ -599,7 +592,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
-        "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
@@ -815,14 +807,13 @@ pub(crate) fn parse_local_help_action(
         "doctor" => LocalHelpTopic::Doctor,
         // #141: add the subcommands that were previously falling back
         // to global help (init/state/export/version) or erroring out
-        // (system-prompt/dump-manifests) or printing their primary
+        // (system-prompt) or printing their primary
         // output instead of help text (bootstrap-plan).
         "init" => LocalHelpTopic::Init,
         "state" => LocalHelpTopic::State,
         "export" => LocalHelpTopic::Export,
         "version" => LocalHelpTopic::Version,
         "system-prompt" => LocalHelpTopic::SystemPrompt,
-        "dump-manifests" => LocalHelpTopic::DumpManifests,
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
         _ => return None,
     };
@@ -1031,8 +1022,7 @@ pub(crate) fn parse_harness_args(
 pub(crate) fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
     if matches!(
         command_name,
-        "dump-manifests"
-            | "bootstrap-plan"
+        "bootstrap-plan"
             | "agents"
             | "mcp"
             | "plugin"
@@ -1200,90 +1190,6 @@ pub(crate) fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Op
         .then_some(
             "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
         )
-}
-
-pub(crate) fn dump_manifests(
-    manifests_dir: Option<&Path>,
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    dump_manifests_at_path(&workspace_dir, manifests_dir, output_format)
-}
-
-pub(crate) const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
-    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
-
-// Internal function for testing that accepts a workspace directory path.
-pub(crate) fn dump_manifests_at_path(
-    workspace_dir: &std::path::Path,
-    manifests_dir: Option<&Path>,
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let paths = if let Some(dir) = manifests_dir {
-        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        UpstreamPaths::from_repo_root(resolved)
-    } else {
-        // Surface the resolved path in the error so users can diagnose missing
-        // manifest files without guessing what path the binary expected.
-        let resolved = workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_dir.to_path_buf());
-        UpstreamPaths::from_workspace_dir(&resolved)
-    };
-
-    let source_root = paths.repo_root();
-    if !source_root.exists() {
-        return Err(format!(
-            "Manifest source directory does not exist.\n  looked in: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
-            source_root.display(),
-        )
-        .into());
-    }
-
-    let required_paths = [
-        ("src/commands.ts", paths.commands_path()),
-        ("src/tools.ts", paths.tools_path()),
-        ("src/entrypoints/cli.tsx", paths.cli_path()),
-    ];
-    let missing = required_paths
-        .iter()
-        .filter_map(|(label, path)| (!path.is_file()).then_some(*label))
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "Manifest source files are missing.\n  repo root: {}\n  missing: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
-            source_root.display(),
-            missing.join(", "),
-        )
-        .into());
-    }
-
-    match extract_manifest(&paths) {
-        Ok(manifest) => {
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("commands: {}", manifest.commands.entries().len());
-                    println!("tools: {}", manifest.tools.entries().len());
-                    println!("bootstrap phases: {}", manifest.bootstrap.phases().len());
-                }
-                CliOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "kind": "dump-manifests",
-                        "commands": manifest.commands.entries().len(),
-                        "tools": manifest.tools.entries().len(),
-                        "bootstrap_phases": manifest.bootstrap.phases().len(),
-                    }))?
-                ),
-            }
-            Ok(())
-        }
-        Err(error) => Err(format!(
-            "failed to extract manifests: {error}\n  looked in: {path}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
-            path = paths.repo_root().display()
-        )
-        .into()),
-    }
 }
 
 pub(crate) fn print_bootstrap_plan(

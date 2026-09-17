@@ -16,6 +16,7 @@ mod config;
 pub mod config_validate;
 pub mod content_classifier;
 pub mod content_compression;
+pub mod context_source;
 mod conversation;
 // 轮次感知上下文编译器 P2:充分性契约(Sufficiency Contract)— 让模型
 // 在侦察链前显式声明停止判据(`[SUFFICIENCY: ...]`),框架机械校验"判据

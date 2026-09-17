@@ -69,7 +69,6 @@ use commands::{
     SlashCommand,
 };
 use commands_handler::*;
-use compat_harness::{extract_manifest, UpstreamPaths};
 use doctor::*;
 use format::*;
 use init::initialize_repo;
@@ -524,10 +523,6 @@ fn inject_wizard_env_vars(settings: &runtime::WizardSettings) {
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
-        CliAction::DumpManifests {
-            output_format,
-            manifests_dir,
-        } => dump_manifests(manifests_dir.as_deref(), output_format)?,
         CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
         CliAction::Agents {
             args,
@@ -1287,39 +1282,6 @@ pub(crate) fn parse_export_args(
         session_reference,
         output_path,
         output_format,
-    })
-}
-
-pub(crate) fn parse_dump_manifests_args(
-    args: &[String],
-    output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
-    let mut manifests_dir: Option<PathBuf> = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--manifests-dir" {
-            let value = args
-                .get(index + 1)
-                .ok_or_else(|| String::from("--manifests-dir requires a path"))?;
-            manifests_dir = Some(PathBuf::from(value));
-            index += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--manifests-dir=") {
-            if value.is_empty() {
-                return Err(String::from("--manifests-dir requires a path"));
-            }
-            manifests_dir = Some(PathBuf::from(value));
-            index += 1;
-            continue;
-        }
-        return Err(format!("unknown dump-manifests option: {arg}"));
-    }
-
-    Ok(CliAction::DumpManifests {
-        output_format,
-        manifests_dir,
     })
 }
 

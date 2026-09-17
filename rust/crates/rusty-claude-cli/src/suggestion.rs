@@ -55,7 +55,6 @@ pub(crate) fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "sandbox",
         "doctor",
         "state",
-        "dump-manifests",
         "bootstrap-plan",
         "agents",
         "mcp",

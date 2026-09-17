@@ -4834,43 +4834,87 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     run_web_sync_guarded(move || {
         let started = Instant::now();
         let client = build_http_client()?;
-        let search_url = build_search_url(&input.query)?;
-        let response = client
-            .get(search_url)
-            .send()
-            .map_err(|error| error.to_string())?;
+        let candidate_urls = candidate_search_urls(&input.query)?;
 
-        let final_url = response.url().clone();
-        let html = response.text().map_err(|error| error.to_string())?;
-        let mut hits = extract_search_hits(&html);
+        // 多后端降级:连接失败 / HTTP 错误 / 解析不到结果的后端记录原因后
+        // 尝试下一个,首个产出非空结果的后端获胜(见 candidate_search_urls)。
+        let mut attempts: Vec<String> = Vec::new();
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let mut hit_source: Option<String> = None;
 
-        if hits.is_empty() && final_url.host_str().is_some() {
-            hits = extract_search_hits_from_generic_links(&html);
+        for url in candidate_urls {
+            let url_text = url.to_string();
+            let response = match client.get(url).send() {
+                Ok(response) => response,
+                Err(error) => {
+                    attempts.push(format!("{url_text} -> {}", describe_reqwest_error(&error)));
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                attempts.push(format!("{url_text} -> HTTP {}", response.status().as_u16()));
+                continue;
+            }
+
+            let final_url = response.url().clone();
+            let html = match response.text() {
+                Ok(html) => html,
+                Err(error) => {
+                    attempts.push(format!("{url_text} -> read body: {error}"));
+                    continue;
+                }
+            };
+
+            let mut extracted = extract_search_hits(&html);
+            if extracted.is_empty() && final_url.host_str().is_some() {
+                extracted = extract_search_hits_from_generic_links(&html);
+            }
+            if let Some(allowed) = input.allowed_domains.as_ref() {
+                extracted.retain(|hit| host_matches_list(&hit.url, allowed));
+            }
+            if let Some(blocked) = input.blocked_domains.as_ref() {
+                extracted.retain(|hit| !host_matches_list(&hit.url, blocked));
+            }
+            dedupe_hits(&mut extracted);
+            extracted.truncate(8);
+
+            if extracted.is_empty() {
+                attempts.push(format!("{url_text} -> 0 hits"));
+                continue;
+            }
+            hits = extracted;
+            hit_source = Some(final_url.to_string());
+            break;
         }
 
-        if let Some(allowed) = input.allowed_domains.as_ref() {
-            hits.retain(|hit| host_matches_list(&hit.url, allowed));
+        if hits.is_empty() && attempts.is_empty() {
+            return Ok(empty_web_search_output(
+                &input.query,
+                format!("No web search results matched the query {:?}.", input.query),
+                started,
+            ));
         }
-        if let Some(blocked) = input.blocked_domains.as_ref() {
-            hits.retain(|hit| !host_matches_list(&hit.url, blocked));
+        if hits.is_empty() {
+            return Err(format!(
+                "Web search failed for query {:?}: all backend attempt(s) failed:\n{}",
+                input.query,
+                attempts.join("\n")
+            ));
         }
 
-        dedupe_hits(&mut hits);
-        hits.truncate(8);
-
-        let summary = if hits.is_empty() {
-            format!("No web search results matched the query {:?}.", input.query)
-        } else {
-            let rendered_hits = hits
-                .iter()
-                .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "Search results for {:?}. Include a Sources section in the final answer.\n{}",
-                input.query, rendered_hits
-            )
-        };
+        let rendered_hits = hits
+            .iter()
+            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source_note = hit_source
+            .map(|source| format!(" (source: {source})"))
+            .unwrap_or_default();
+        let summary = format!(
+            "Search results for {:?}. Include a Sources section in the final answer.{}\n{}",
+            input.query, source_note, rendered_hits
+        );
 
         Ok(WebSearchOutput {
             query: input.query.clone(),
@@ -4884,6 +4928,14 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
             duration_seconds: started.elapsed().as_secs_f64(),
         })
     })
+}
+
+fn empty_web_search_output(query: &str, summary: String, started: Instant) -> WebSearchOutput {
+    WebSearchOutput {
+        query: query.to_string(),
+        results: vec![WebSearchResultItem::Commentary(summary)],
+        duration_seconds: started.elapsed().as_secs_f64(),
+    }
 }
 
 fn build_http_client() -> Result<Client, String> {
@@ -4910,17 +4962,56 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
     Ok(parsed.to_string())
 }
 
-fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
+/// 生成搜索候选 URL,按优先级降级。
+///
+/// 1. 显式指定 `CLAWD_WEB_SEARCH_BASE_URL` → 唯一后端(保持旧行为,便于
+///    自建网关 / 测试注入;base URL 非法则硬失败,不静默降级);
+/// 2. DuckDuckGo HTML 端点(无网络封锁环境下解析质量最好,与原实现一致);
+/// 3. Bing(国内可直连);
+/// 4. 百度(国内最后兜底,查询参数为 `wd`)。
+///
+/// 返回多个候选的场景由 `execute_web_search` 逐个尝试,首个产出非空结果的后端获胜。
+fn candidate_search_urls(query: &str) -> Result<Vec<reqwest::Url>, String> {
+    let mut urls = Vec::new();
+
     if let Ok(base) = std::env::var("CLAWD_WEB_SEARCH_BASE_URL") {
         let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
         url.query_pairs_mut().append_pair("q", query);
-        return Ok(url);
+        urls.push(url);
+        return Ok(urls);
     }
 
-    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")
-        .map_err(|error| error.to_string())?;
-    url.query_pairs_mut().append_pair("q", query);
-    Ok(url)
+    for (base, param) in [
+        ("https://html.duckduckgo.com/html/", "q"),
+        ("https://www.bing.com/search", "q"),
+        ("https://cn.bing.com/search", "q"),
+        ("https://www.baidu.com/s", "wd"),
+    ] {
+        let mut url = reqwest::Url::parse(base).map_err(|error| error.to_string())?;
+        url.query_pairs_mut().append_pair(param, query);
+        urls.push(url);
+    }
+    Ok(urls)
+}
+
+/// 展开 reqwest 错误链,给出分层原因。
+///
+/// `reqwest::Error` 的 Display 只输出 `error sending request for url (...)`,
+/// 真正的底层原因(连接被拒 / DNS / TLS / 超时)在 source 链上,例如被墙的
+/// 域名会呈现为 `tcp connect error / connection refused`。逐层拼接可读原因,
+/// 供模型与日志判断是偶发故障还是网络策略问题。
+fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+    for _ in 0..4 {
+        let Some(current) = source else { break };
+        let message = current.to_string();
+        if !parts.contains(&message) {
+            parts.push(message);
+        }
+        source = std::error::Error::source(current);
+    }
+    parts.join(" <- ")
 }
 
 fn normalize_fetched_content(body: &str, content_type: &str) -> String {
@@ -11009,6 +11100,57 @@ mod tests {
     }
 
     #[test]
+    fn web_search_reports_backend_failures_when_all_error() {
+        // 单后端(显式 env 覆盖)一律失败时,应返回包含各次尝试明细的 Err,
+        // 而不是无信息的 "no results"(便于模型区分"没结果"与"搜不到")。
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|_request_line: &str| {
+            HttpResponse::html(500, "Internal Server Error", "boom")
+        }));
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "rust web search" }))
+            .expect_err("all-backend failure should surface an error");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        assert!(
+            error.contains("HTTP 500"),
+            "error should cite backend status: {error}"
+        );
+    }
+
+    #[test]
+    fn candidate_search_urls_defaults_to_multi_backend() {
+        // 未显式配置后端时,应按优先级生成多后端候选:DDG 在前、百度兜底,
+        // 且百度使用 `wd` 查询参数。
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        let urls = crate::candidate_search_urls("雨污分流 定额").expect("defaults should parse");
+        assert_eq!(urls.len(), 4, "expected DDG + bing + cn.bing + baidu");
+        assert!(
+            urls[0]
+                .host_str()
+                .unwrap_or_default()
+                .contains("duckduckgo"),
+            "DDG should be the first candidate: {}",
+            urls[0]
+        );
+        assert!(
+            urls[3].host_str().unwrap_or_default().contains("baidu"),
+            "baidu should be the last fallback: {}",
+            urls[3]
+        );
+        let last_query = urls[3].query_pairs().collect::<Vec<_>>();
+        assert_eq!(last_query[0].0, "wd", "baidu uses wd param: {urls:?}");
+    }
+
+    #[test]
     fn web_blocking_client_safe_inside_runtime_context() {
         // 回归(debug 构建):直接在 Entered 上下文构建并 drop reqwest blocking
         // client,会触发 reqwest 的 debug 自检(blocking/wait.rs::enter)drop 临时
@@ -12513,7 +12655,25 @@ mod tests {
             self.calls += 1;
             match self.calls {
                 1 => {
-                    assert_eq!(request.messages.len(), 1);
+                    // 收口架构(建议2):首轮请求 = 用户输入 + 末尾 Runtime Context
+                    // 注入块(冻结槽位,单条 user 消息)。详见 runtime conversation.rs。
+                    assert_eq!(request.messages.len(), 2);
+                    assert!(
+                        request.messages[0].blocks.iter().any(|b| matches!(
+                            b,
+                            runtime::ContentBlock::Text { text }
+                                if text.contains("Inspect the delegated file")
+                        )),
+                        "first message should be the user prompt"
+                    );
+                    assert!(
+                        request.messages[1].blocks.iter().any(|b| matches!(
+                            b,
+                            runtime::ContentBlock::Text { text }
+                                if text.contains("# Runtime Context")
+                        )),
+                        "last message should be the runtime context injection"
+                    );
                     Ok(vec![
                         AssistantEvent::ToolUse {
                             id: "tool-1".to_string(),

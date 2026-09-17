@@ -37,45 +37,183 @@ pub enum PunchbackClass {
 
 /// 纯承接词(精确匹配整条输入 → 不视为打回)。
 const ACK_SET: &[&str] = &[
-    "好", "好的", "好呀", "好嘞", "好勒", "ok", "okay", "嗯", "嗯嗯", "收到", "知道了", "明白了",
-    "明白", "可以", "行", "行吧", "好吧", "好滴", "没问题", "了解", "了解了", "晓得了", "是",
-    "对", "不错", "继续", "继续吧", "继续做", "继续干", "随便", "随意", "都行", "都行吧",
-    "无所谓", "谢谢", "感谢",
+    "好",
+    "好的",
+    "好呀",
+    "好嘞",
+    "好勒",
+    "ok",
+    "okay",
+    "嗯",
+    "嗯嗯",
+    "收到",
+    "知道了",
+    "明白了",
+    "明白",
+    "可以",
+    "行",
+    "行吧",
+    "好吧",
+    "好滴",
+    "没问题",
+    "了解",
+    "了解了",
+    "晓得了",
+    "是",
+    "对",
+    "不错",
+    "继续",
+    "继续吧",
+    "继续做",
+    "继续干",
+    "随便",
+    "随意",
+    "都行",
+    "都行吧",
+    "无所谓",
+    "谢谢",
+    "感谢",
 ];
 
 /// 强打回词(窄口径):直接质疑上次收尾结果 / 重做 / 未解决 / 无输出。
 const STRONG_PUNCH_WORDS: &[&str] = &[
-    "不对", "不是", "错了", "怎么还", "怎么还是", "仍然", "依然", "依旧", "还是不行", "没解决",
-    "还没", "未完成", "不成立", "无效", "没效果", "不起作用", "没反应", "卡住", "死循环", "推翻",
-    "白做", "白干", "越改越", "更差", "更糟", "没生效", "不生效", "还是老问题", "仍然不对",
-    "还是不", "没变", "误判", "误导", "方向不对", "错了方向", "理解错", "理解有误", "不对吧",
-    "不对啊", "这不对", "这样不对", "重新执行", "重新设计", "重新论证", "重新分析", "重新检查",
-    "重新弄", "重新搞", "重新来", "重新", "为什么还没有", "为什么还没", "为什么没有解决",
-    "怎么还没有", "怎么还没", "还没解决", "仍然没有", "卡住了", "没看到你的输出", "看不到输出",
-    "没有输出", "无输出", "并不构成", "不构成", "不是那样", "不是这样", "搞反", "白费",
+    "不对",
+    "不是",
+    "错了",
+    "怎么还",
+    "怎么还是",
+    "仍然",
+    "依然",
+    "依旧",
+    "还是不行",
+    "没解决",
+    "还没",
+    "未完成",
+    "不成立",
+    "无效",
+    "没效果",
+    "不起作用",
+    "没反应",
+    "卡住",
+    "死循环",
+    "推翻",
+    "白做",
+    "白干",
+    "越改越",
+    "更差",
+    "更糟",
+    "没生效",
+    "不生效",
+    "还是老问题",
+    "仍然不对",
+    "还是不",
+    "没变",
+    "误判",
+    "误导",
+    "方向不对",
+    "错了方向",
+    "理解错",
+    "理解有误",
+    "不对吧",
+    "不对啊",
+    "这不对",
+    "这样不对",
+    "重新执行",
+    "重新设计",
+    "重新论证",
+    "重新分析",
+    "重新检查",
+    "重新弄",
+    "重新搞",
+    "重新来",
+    "重新",
+    "为什么还没有",
+    "为什么还没",
+    "为什么没有解决",
+    "怎么还没有",
+    "怎么还没",
+    "还没解决",
+    "仍然没有",
+    "卡住了",
+    "没看到你的输出",
+    "看不到输出",
+    "没有输出",
+    "无输出",
+    "并不构成",
+    "不构成",
+    "不是那样",
+    "不是这样",
+    "搞反",
+    "白费",
 ];
 
 /// 弱打回词(宽口径):含双义词(问题/缺/漏…),可能是同域新问题报告。
 const WEAK_PUNCH_WORDS: &[&str] = &[
-    "有问题", "少了", "漏了", "漏掉", "缺", "再检查", "再查一下", "弄错", "问题依旧", "没到位",
-    "没落实", "不是", "没做完", "怎么还", "怎么还是", "仍然", "依然", "依旧",
+    "有问题",
+    "少了",
+    "漏了",
+    "漏掉",
+    "缺",
+    "再检查",
+    "再查一下",
+    "弄错",
+    "问题依旧",
+    "没到位",
+    "没落实",
+    "不是",
+    "没做完",
+    "怎么还",
+    "怎么还是",
+    "仍然",
+    "依然",
+    "依旧",
 ];
 
 /// 疑似推进词:未命中打回词但含"再/继续修"类推进语义,单独成桶。
 const FORCE_WORDS: &[&str] = &[
-    "再跑", "再试", "再验证", "再来", "接着", "继续排查", "继续修", "继续改", "再加", "再确认",
-    "还有", "另外一个", "补充一下", "另外", "再往下", "继续做", "继续完成", "继续分析",
+    "再跑",
+    "再试",
+    "再验证",
+    "再来",
+    "接着",
+    "继续排查",
+    "继续修",
+    "继续改",
+    "再加",
+    "再确认",
+    "还有",
+    "另外一个",
+    "补充一下",
+    "另外",
+    "再往下",
+    "继续做",
+    "继续完成",
+    "继续分析",
     "继续调查",
 ];
 
 /// 自澄清前缀:用户发现自己误解(剔除,非打回)。
 const SELF_CLARIFY_PREFIX: &[&str] = &[
-    "是", "我说错", "我误", "我明", "明白了", "是我", "算我", "我自己",
+    "是",
+    "我说错",
+    "我误",
+    "我明",
+    "明白了",
+    "是我",
+    "算我",
+    "我自己",
 ];
 
 /// 新域报告前缀:同域新问题报告(不视为对上次收尾质量不满)。
 const NEW_DOMAIN_PREFIX: &[&str] = &[
-    "我看到", "我发现", "现在的", "当前", "关于", "我注意到", "刚才看到", "再补充一个",
+    "我看到",
+    "我发现",
+    "现在的",
+    "当前",
+    "关于",
+    "我注意到",
+    "刚才看到",
+    "再补充一个",
 ];
 
 /// 分类:判定一条 user 输入是否为"打回"。
@@ -86,10 +224,11 @@ const NEW_DOMAIN_PREFIX: &[&str] = &[
 /// 3. 自澄清 / 新域报告前缀 → None;
 /// 4. 命中 强/弱/疑似 词表(子串匹配)→ 对应类;
 /// 5. 长度 < 4(无命中时)→ None。
+///
 /// 注:与 python 基线不同,此处**先命中词表再判长度**,使"不对"/"不是"等短强打回
 /// 不再被长度裁剪误剔(口径改进,量化影响极小)。
 pub fn classify_punchback(text: &str) -> PunchbackClass {
-    let trimmed = text.replace('\u{2028}', "").replace('\r', "");
+    let trimmed = text.replace(['\u{2028}', '\r'], "");
     let trimmed = trimmed.trim();
     if trimmed.is_empty() {
         return PunchbackClass::None;
@@ -98,7 +237,7 @@ pub fn classify_punchback(text: &str) -> PunchbackClass {
     if n < 2 {
         return PunchbackClass::None;
     }
-    if ACK_SET.iter().any(|w| *w == trimmed) {
+    if ACK_SET.contains(&trimmed) {
         return PunchbackClass::None;
     }
     // 剔除前缀(先于词表命中,防假阳性)。
@@ -171,11 +310,23 @@ mod tests {
     #[test]
     fn strong_qaulifies_examples() {
         // 从基线扫描中标定的真·强打回
-        assert_eq!(cls("重新执行#2回测验证盘整背驰1买或1卖是否适合立即进场"), PunchbackClass::Strong);
+        assert_eq!(
+            cls("重新执行#2回测验证盘整背驰1买或1卖是否适合立即进场"),
+            PunchbackClass::Strong
+        );
         assert_eq!(cls("代码已经根据这些问题做了修复为什么还没有解决？是不是编译的新版本二进制不包含这些改动吗？"), PunchbackClass::Strong);
-        assert_eq!(cls("你卡住了吗怎么到现在都没有看到你的输出"), PunchbackClass::Strong); // "卡住"
-        assert_eq!(cls("在我看来04:25并不构成底分型，是否分型识别过于宽松？"), PunchbackClass::Strong);
-        assert_eq!(cls("这个方向到了架构层，你先重新设计方案"), PunchbackClass::Strong);
+        assert_eq!(
+            cls("你卡住了吗怎么到现在都没有看到你的输出"),
+            PunchbackClass::Strong
+        ); // "卡住"
+        assert_eq!(
+            cls("在我看来04:25并不构成底分型，是否分型识别过于宽松？"),
+            PunchbackClass::Strong
+        );
+        assert_eq!(
+            cls("这个方向到了架构层，你先重新设计方案"),
+            PunchbackClass::Strong
+        );
         assert_eq!(cls("仍然没有解决"), PunchbackClass::Strong);
         assert_eq!(cls("不对"), PunchbackClass::Strong); // 短强打回不被长度裁剪
     }
@@ -194,14 +345,23 @@ mod tests {
 
     #[test]
     fn self_clarify_excluded() {
-        assert_eq!(cls("是我误认为没解决，被热升级提示误导了"), PunchbackClass::None);
+        assert_eq!(
+            cls("是我误认为没解决，被热升级提示误导了"),
+            PunchbackClass::None
+        );
         assert_eq!(cls("明白了，是编译版本的问题"), PunchbackClass::None);
     }
 
     #[test]
     fn new_domain_report_excluded() {
-        assert_eq!(cls("我看到图表上有些线段内部满足中枢条件但没有绘制出中枢，是不是BUG"), PunchbackClass::None);
-        assert_eq!(cls("关于中枢的定义代码实现和原文有什么区别？"), PunchbackClass::None);
+        assert_eq!(
+            cls("我看到图表上有些线段内部满足中枢条件但没有绘制出中枢，是不是BUG"),
+            PunchbackClass::None
+        );
+        assert_eq!(
+            cls("关于中枢的定义代码实现和原文有什么区别？"),
+            PunchbackClass::None
+        );
     }
 
     #[test]
@@ -216,7 +376,10 @@ mod tests {
     #[test]
     fn known_false_positive_of_shi_bu_shi() {
         // 已知残留误判(文档 §6.1.3):"是不是"可命中 STRONG 的"不是",验收按 x0.85 修正。
-        assert_eq!(cls("为什么现在的上下文缓存命中率这么低？是不是以前的机制被破坏了？"), PunchbackClass::Strong);
+        assert_eq!(
+            cls("为什么现在的上下文缓存命中率这么低？是不是以前的机制被破坏了？"),
+            PunchbackClass::Strong
+        );
     }
 }
 
@@ -277,10 +440,25 @@ impl SignalKind {
 
 /// evidence 文本 → 期望信号类型的关键词映射(宽松,不区分大小写)。
 const TEST_SIGNAL_WORDS: &[&str] = &[
-    "passed", "pass", "exit 0", "exit_code=0", "通过", "成功", "success", "ok",
+    "passed",
+    "pass",
+    "exit 0",
+    "exit_code=0",
+    "通过",
+    "成功",
+    "success",
+    "ok",
 ];
 const FILE_SIGNAL_WORDS: &[&str] = &[
-    "已写入", "写入", "已生成", "生成", "created", "wrote", "produced", "write_file", "文件已",
+    "已写入",
+    "写入",
+    "已生成",
+    "生成",
+    "created",
+    "wrote",
+    "produced",
+    "write_file",
+    "文件已",
 ];
 
 /// 声明校验裁定。
@@ -412,10 +590,14 @@ pub fn evidence_signal_kinds(evidence: &str) -> Vec<SignalKind> {
 /// - evidence 无法映射到任何信号类型 → `Unverifiable`(调用方可放行,防误伤);
 /// - 映射出的信号与 `available` 无交集 → `Missing`(声称的证据不存在于 tool history);
 /// - 有交集 → `Verified`。
+///
 /// 特例:`available` 为空(运行时未采到任何信号,如无测试的问答任务)→ 一律
 /// `Verified`(不误伤;打回率超阈值后再收紧,数据驱动)。
 #[must_use]
-pub fn validate_evidence(decl: &ConvergenceDeclaration, available: &[SignalKind]) -> EvidenceVerdict {
+pub fn validate_evidence(
+    decl: &ConvergenceDeclaration,
+    available: &[SignalKind],
+) -> EvidenceVerdict {
     if decl.evidence.trim().is_empty() {
         return EvidenceVerdict::Missing;
     }
@@ -502,10 +684,8 @@ pub fn project_signals<'a, I: IntoIterator<Item = ToolOutcome<'a>>>(
         if o.is_error {
             continue;
         }
-        if is_file_write_tool(o.tool_name) {
-            if !out.contains(&SignalKind::FileProduced) {
-                out.push(SignalKind::FileProduced);
-            }
+        if is_file_write_tool(o.tool_name) && !out.contains(&SignalKind::FileProduced) {
+            out.push(SignalKind::FileProduced);
         }
         if looks_like_test_success(o.output) && !out.contains(&SignalKind::TestSuccess) {
             out.push(SignalKind::TestSuccess);
@@ -695,7 +875,11 @@ mod convergence_p1_tests {
         );
         // bash 测试通过 → TestSuccess
         assert_eq!(
-            project_one(outcome("bash", false, "test result: ok. 11 passed; 0 failed")),
+            project_one(outcome(
+                "bash",
+                false,
+                "test result: ok. 11 passed; 0 failed"
+            )),
             vec![SignalKind::TestSuccess]
         );
         // 错误结果 → 空(不产生信号)
@@ -725,7 +909,7 @@ mod convergence_p1_tests {
         assert!(hint.contains("未能映射到本会话"));
         assert!(hint.contains("修复线段漏确认")); // goal 原文
         assert!(hint.contains("11 passed")); // evidence 原文
-        // 空 evidence 也应可渲染(不 panic)
+                                             // 空 evidence 也应可渲染(不 panic)
         let mut empty = d.clone();
         empty.evidence.clear();
         assert!(render_missing_hint(&empty).contains("(空)"));

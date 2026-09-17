@@ -925,14 +925,7 @@ pub(crate) fn render_help_topic(topic: LocalHelpTopic) -> String {
   Purpose          render the resolved system prompt that `claw` would send for the given cwd + date
   Options          --cwd overrides the workspace dir · --date injects a deterministic date stamp
   Formats          text (default), json
-  Related          claw doctor · claw dump-manifests"
-            .to_string(),
-        LocalHelpTopic::DumpManifests => "Dump Manifests
-  Usage            claw dump-manifests [--manifests-dir <path>] [--output-format <format>]
-  Purpose          emit every skill/agent/tool manifest the resolver would load for the current cwd
-  Options          --manifests-dir scopes discovery to a specific directory
-  Formats          text (default), json
-  Related          claw skills · claw agents · claw doctor"
+  Related          claw doctor"
             .to_string(),
         LocalHelpTopic::BootstrapPlan => "Bootstrap Plan
   Usage            claw bootstrap-plan [--output-format <format>]
@@ -954,7 +947,6 @@ pub(crate) fn local_help_topic_command(topic: LocalHelpTopic) -> &'static str {
         LocalHelpTopic::Export => "export",
         LocalHelpTopic::Version => "version",
         LocalHelpTopic::SystemPrompt => "system-prompt",
-        LocalHelpTopic::DumpManifests => "dump-manifests",
         LocalHelpTopic::BootstrapPlan => "bootstrap-plan",
     }
 }
@@ -1936,7 +1928,6 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
     )?;
-    writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;

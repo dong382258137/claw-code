@@ -107,7 +107,6 @@ use commands::{
     slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
     SlashCommand,
 };
-use compat_harness::{extract_manifest, UpstreamPaths};
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_system_prompt,
@@ -132,13 +131,13 @@ use crate::{
     classify_error_kind, command_exists, config_alias_for_current_dir,
     config_model_for_current_dir, config_permission_mode_for_current_dir, current_tool_registry,
     default_permission_mode, filter_tool_specs, format_connected_line, git_output, git_status_ok,
-    merge_prompt_with_stdin, normalize_allowed_tools, parse_dump_manifests_args, parse_export_args,
-    parse_permission_mode_arg, parse_resume_args, parse_system_prompt_args,
-    permission_mode_from_label, permission_mode_from_resolved, plugin_command_json,
-    plugin_load_failure_json, plugin_summary_json, provider_label, read_piped_stdin,
-    resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model, split_error_hint,
-    validate_model_syntax, write_temp_text_file, AllowedToolSet, CliOutputFormat, ModelProvenance,
-    ModelSource, BUILD_TARGET, DEFAULT_DATE, DEFAULT_MODEL, DEPRECATED_INSTALL_COMMAND, GIT_SHA,
+    merge_prompt_with_stdin, normalize_allowed_tools, parse_export_args, parse_permission_mode_arg,
+    parse_resume_args, parse_system_prompt_args, permission_mode_from_label,
+    permission_mode_from_resolved, plugin_command_json, plugin_load_failure_json,
+    plugin_summary_json, provider_label, read_piped_stdin, resolve_model_alias,
+    resolve_model_alias_with_config, resolve_repl_model, split_error_hint, validate_model_syntax,
+    write_temp_text_file, AllowedToolSet, CliOutputFormat, ModelProvenance, ModelSource,
+    BUILD_TARGET, DEFAULT_DATE, DEFAULT_MODEL, DEPRECATED_INSTALL_COMMAND, GIT_SHA,
     OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL, VERSION,
 };
 
