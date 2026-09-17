@@ -42,6 +42,19 @@ impl From<ConfigError> for PromptBuildError {
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 
+/// P1(系统提示词评估 2026-09-17):占位符就地指针行。
+///
+/// `DynamicValueExtractor` 会把静态区里的日期/路径替换成 `<path_1>` 这类
+/// 占位符,真值映射表放在动态区尾部(`# Cache-aligned dynamic values`)。
+/// 模型读到静态区中段的占位符时,映射表还在后面几十 KB 处 —— 曾被实测评为
+/// "模板渲染泄漏"(看到 `<path_2>` 却无从得知其含义)。
+///
+/// 修复方式:`build_split` 在**首个含占位符的静态 section 开头**内联本行,
+/// 让读者在遇到占位符的当下就知道真值去哪找。本行是常量文本(不含具体
+/// 值),字节稳定,不扰动 prompt cache 前缀;且 `is_already_placeholder`
+/// 会把行内的 `<path_N>` 识别为既有占位符,重复执行不会二次提取。
+pub const PLACEHOLDER_POINTER_MARKER: &str = "> 说明:本段出现的 `<path_N>` / `<datetime_N>` 等占位符是动态值的稳定替身(用于命中 prompt cache),真值见本文档末尾 `# Cache-aligned dynamic values` 映射表。";
+
 /// Partitioned system prompt: stable sections (cached) vs dynamic sections.
 ///
 /// Produced by [`SystemPromptBuilder::build_split`]. The `static_sections` are
@@ -767,10 +780,24 @@ impl SystemPromptBuilder {
         // dynamic values prevents accidental cache poisoning when new code
         // embeds time/path/ID values in what should be stable text.
         let mut extractor = DynamicValueExtractor::new();
-        let cleaned_static: Vec<String> = static_sections
+        let mut cleaned_static: Vec<String> = static_sections
             .into_iter()
             .map(|s| extractor.extract_replace(&s).into_owned())
             .collect();
+        // P1(系统提示词评估 2026-09-17):占位符就地指针。
+        // 映射表在动态区尾部,而占位符出现在静态区中段 —— 模型读到
+        // `<path_2>` 时无法得知其含义(实测被评为"模板渲染泄漏")。
+        // 修复:在**首个含占位符的静态 section 开头**内联一行指针。
+        // 仅当确有占位符产生时才插入,且指针文本为常量(字节稳定,
+        // 不扰动 prompt cache 前缀)。
+        if extractor.extracted_count() > 0 {
+            if let Some(section) = cleaned_static
+                .iter_mut()
+                .find(|s| crate::cache_alignment::contains_placeholder(s))
+            {
+                *section = format!("{PLACEHOLDER_POINTER_MARKER}\n{section}");
+            }
+        }
         let extracted_summary = extractor.collect_section();
         if !extracted_summary.is_empty() {
             dynamic_sections.insert(0, extracted_summary);
@@ -959,7 +986,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     if let Some(status) = &project_context.git_status {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
-        lines.push(status.clone());
+        lines.push(compact_git_status(status));
     }
     // 单一事实来源:commits/branch/staged 统一由 GitContext::render() 输出,
     // 不再在此手写循环重复渲染同一批 recent_commits(曾导致同段内 commits 双份)。
@@ -978,6 +1005,39 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     } else {
         rendered
     }
+}
+
+/// Git status 快照聚合:超过 [`MAX_GIT_STATUS_LINES`] 行时保留前 N 行,
+/// 余下按 porcelain 状态码聚合计数(2026-09-17 系统提示词评估 P2 修复:
+/// 大量 `D path` 删除记录曾挤占 token 且稀释政策指令注意力)。
+fn compact_git_status(status: &str) -> String {
+    const MAX_GIT_STATUS_LINES: usize = 30;
+    let lines: Vec<&str> = status.lines().collect();
+    if lines.len() <= MAX_GIT_STATUS_LINES {
+        return status.to_string();
+    }
+    let visible = &lines[..MAX_GIT_STATUS_LINES];
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for line in &lines[MAX_GIT_STATUS_LINES..] {
+        // porcelain 格式 "XY path":取两字符状态码聚合,路径不保留。
+        let code: String = line.chars().take(2).collect::<String>().trim().to_string();
+        let key = if code.is_empty() {
+            "other".to_string()
+        } else {
+            code
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    let summary = counts
+        .into_iter()
+        .map(|(code, n)| format!("{code}×{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}\n(…另有 {} 个文件变更,按状态聚合: {summary};需要完整清单用 git status 查看)",
+        visible.join("\n"),
+        lines.len() - MAX_GIT_STATUS_LINES
+    )
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
@@ -1832,8 +1892,10 @@ fn get_tool_usage_guidance_section() -> String {
      If you catch yourself writing any of \"可能 / 也许 / 应该 / 猜测 / might /\n\
      maybe / probably / I think\", STOP — that is a signal you are reasoning\n\
      about a verifiable fact. Convert it into one tool call instead of\n\
-     continuing the guess. A single probe takes ~1-3s; a guess loop costs\n\
-     10-30s of tokens and is often wrong."
+     continuing the guess (the four uncertainty classes above ARE the\n\
+     **Guess loop** source-triage order in `## Framework Switching` — same\n\
+     protocol, no second rulebook). A single probe takes ~1-3s; a guess\n\
+     loop costs 10-30s of tokens and is often wrong."
         .to_string()
 }
 /// session even as new entries are written to disk.
@@ -1852,7 +1914,13 @@ fn render_repomap_section(rendered_map: &str) -> String {
     if rendered_map.trim().is_empty() {
         return String::new();
     }
-    format!("## Repository Map\n{rendered_map}")
+    // refs 字段含义说明(2026-09-17 系统提示词评估 P2 修复):`refs: N` 曾被
+    // 评为"含义未定义",模型无法利用;补一行让计数可用(重要性排序依据)。
+    format!(
+        "## Repository Map\n\
+         `refs: N` = 该文件在仓库中被其他文件引用的估算次数(排序依据,高 refs 优先)。\n\
+         \n{rendered_map}"
+    )
 }
 
 /// Render the skill catalog as a system prompt section.
@@ -1919,8 +1987,10 @@ mod tests {
         render_persistent_memory_section, render_project_context, render_repomap_section,
         render_skill_catalog_section, truncate_instruction_content, ContextFile,
         ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier, SystemPromptBuilder,
-        SystemPromptSplit, CAPABILITY_LAYER_HEADING_PREFIXES, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        SystemPromptSplit, CAPABILITY_LAYER_HEADING_PREFIXES, PLACEHOLDER_POINTER_MARKER,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
+    use crate::cache_alignment::DynamicValueExtractor;
     use crate::config::{ConfigLoader, RuntimeConfig};
     use crate::memory::PersistentMemory;
     use std::fs;
@@ -2419,6 +2489,67 @@ mod tests {
         assert!(prompt.contains("系统状态 / 运行时行为"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// P1(系统提示词评估 2026-09-17):占位符就近解释守护。
+    ///
+    /// 缺陷:`DynamicValueExtractor` 把静态区动态值替换为 `<path_N>` 等占位符,
+    /// 但真值映射表(`# Cache-aligned dynamic values`)位于**动态区末尾**。模型
+    /// 读到静态区中段的占位符时,映射表还在几十 KB 之后 —— 实测被评为
+    /// "模板渲染泄漏"(看到 `<path_2>` 却无从得知其含义)。
+    ///
+    /// 守护:一旦静态区产生占位符,承载它的那个 section 开头必须出现就地
+    /// 指针行,且指针必须指向映射段的标题。同时指针行本身含 `<path_N>` 字面
+    /// 量,不得被二次提取(否则每轮字节漂移,破坏 prompt cache 前缀)。
+    #[test]
+    fn placeholder_sections_carry_inline_pointer() {
+        // 构造一个含绝对路径的**静态** section —— 必定触发占位符提取。
+        // 注意:不能用 `append_section`(其内容归动态区,见 collect_fragments),
+        // 必须走 output_style(静态区承载者)。
+        let builder = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_output_style(
+                "Probe",
+                "Reference path: /tmp/some/deep/path/for/extraction",
+            );
+        let split = builder.build_split();
+        let static_joined = split.static_sections.join("\n\n");
+
+        assert!(
+            static_joined.contains("<path_"),
+            "test fixture must produce at least one placeholder"
+        );
+        assert!(
+            static_joined.contains(PLACEHOLDER_POINTER_MARKER),
+            "静态区出现占位符时,必须内联指针行说明其含义"
+        );
+        // 指针必须指向真正的映射段标题(否则读者仍找不到真值)。
+        assert!(
+            PLACEHOLDER_POINTER_MARKER.contains("# Cache-aligned dynamic values"),
+            "指针行必须引用映射段标题"
+        );
+        // 映射段必须在动态区(真值可达)。
+        let dynamic_joined = split.dynamic_sections.join("\n\n");
+        assert!(
+            dynamic_joined.contains("# Cache-aligned dynamic values"),
+            "映射段必须在动态区存在"
+        );
+    }
+
+    /// P1 守护:指针行是幂等常量 —— 重复经过 extractor 不得产生新占位符。
+    ///
+    /// 若指针行自身的 `<path_N>` 字面量被再次提取,静态区字节将随轮次漂移,
+    /// 直接击穿 prompt cache 前缀稳定性。
+    #[test]
+    fn placeholder_pointer_is_cache_stable() {
+        let mut extractor = DynamicValueExtractor::new();
+        let first = extractor.extract_replace(PLACEHOLDER_POINTER_MARKER);
+        let second = extractor.extract_replace(first.as_ref());
+        assert_eq!(
+            first.as_ref(),
+            second.as_ref(),
+            "指针行重复提取后必须字节不变(不得二次占位符化)"
+        );
     }
 
     #[test]

@@ -6957,22 +6957,36 @@ where
             slots.push(("Archived Tool Results", hint));
         }
 
-        // 槽位 10:跨会话 plan stale 提醒(flag 由 clear_plan_stale 清除)。
+        // 槽位 10:跨会话 plan stale 提醒(一次性)。
+        //
         // is_plan_stale 带当前 session_id:marker 归属其他会话才触发 ——
         // 同会话续跑(含热升级 resume、普通多 turn)永不自触发。
+        //
+        // P3 修复(系统提示词评估 2026-09-17):原实现"每 turn 注入直到 LLM
+        // 调用 notebook_update",实测产生两类缺陷:
+        //   (1) **事实冲突** —— 会话第 N turn 仍宣称"这是新会话的首个 turn",
+        //       与同块上方 `Current Task` 槽位(已给出当前目标)自相矛盾,
+        //       模型需自行裁决哪条权威(本轮注入即为活体复现:<plan> 为空、
+        //       Current Task 已置位、<attempted> 已有本轮记录,仍被宣告首 turn)。
+        //   (2) **持久泄漏** —— 本会话 <plan> 为空时,收尾的
+        //       `mark_plan_stale_if_content` 因"无内容"跳过重写,旧会话 marker
+        //       便永不归属当前会话 → is_plan_stale 恒真 → 每 turn 重复注入。
+        // 修复:改为**一次性注入** —— 提示发出后立即清除 marker。语义上也更
+        // 贴合本槽位用途(通知"上一会话的 plan 已被标记陈旧"一次即可,无需
+        // 追问到 LLM 动作为止;真实 plan 状态由槽位 1 NOTEBOOK 持续承载)。
         if let Some(root) = &self.workspace_root {
             if crate::notebook::is_plan_stale(root, &self.session.session_id) {
                 slots.push((
                     "Session Handoff",
-                    "# 📝 New Session — NOTEBOOK <plan> Refresh Recommended\n\
-                     这是新会话的首个 turn,上一会话结束时标记了 <plan> 为 stale。\n\
-                     **请在处理完当前用户请求后,调用 `notebook_update` 工具**,\n\
-                     把上一会话的任务摘要写入 `<plan>` 段(若当前任务已变化):\n\
+                    "# 📝 NOTEBOOK <plan> 待刷新(上一会话遗留)\n\
+                     上一会话结束时把 <plan> 标记为 stale。若当前任务与上一会话\n\
+                     有关/相承,可调用 `notebook_update` 把任务摘要写入 `<plan>` 段:\n\
                      - 本次会话的目标 / 关键决策 / 约束 / 进度\n\
-                     这样后续 turn 和下一会话能零延迟知道任务状态。\n\
-                     若当前任务与上一会话无关,可忽略此提醒。"
+                     若当前任务与上一会话无关,直接忽略即可(本提示只出现一次)。"
                         .to_string(),
                 ));
+                // 一次性消费:注入后清除,避免后续 turn 重复(且虚假)宣告。
+                crate::notebook::clear_plan_stale(root);
             }
         }
 

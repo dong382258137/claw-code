@@ -290,7 +290,9 @@ impl RepoMap {
                         ));
                     }
                 } else {
-                    // Fallback:regex 提取的 definitions
+                    // Fallback:regex 提取的 definitions。带行号——同名符号
+                    // (如多个 `fn new`/`fn fmt`)无行号时无区分度,曾被评为
+                    // "重复裸函数名,信噪比低"(2026-09-17 系统提示词评估 P2)。
                     for def in cached.definitions.iter().take(MAX_RENDER_SYMBOLS_PER_FILE) {
                         let kind_str = match def.kind {
                             DefinitionKind::Function => "fn",
@@ -302,7 +304,7 @@ impl RepoMap {
                             DefinitionKind::Const => "const",
                             DefinitionKind::Type => "type",
                         };
-                        out.push_str(&format!("  {} {}\n", kind_str, def.name));
+                        out.push_str(&format!("  {} {} (L:{})\n", kind_str, def.name, def.line));
                     }
                 }
             }

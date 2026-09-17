@@ -110,8 +110,16 @@ impl DynamicValueExtractor {
         if self.replacements.is_empty() {
             return String::new();
         }
-
-        let mut lines = vec!["# Cache-aligned dynamic values".to_string()];
+        // 自解释说明(2026-09-17 系统提示词评估 P1 修复):占位符在 static
+        // 区出现时模型不知道映射表存在,曾被评为"模板渲染泄漏"。说明行只
+        // 加在 dynamic 映射段,static 区字节零变动(prompt cache 零影响)。
+        let mut lines = vec![
+            "# Cache-aligned dynamic values".to_string(),
+            "上文静态段落中的 <path_N>/<datetime_N> 等占位符是真实动态值的\
+             稳定替身(保持前缀字节稳定以命中 prompt cache),真实值见下方映射;\
+             解析路径/时间等请以本映射为准。"
+                .to_string(),
+        ];
         for (placeholder, original) in &self.replacements {
             lines.push(format!("  {placeholder} = {original}"));
         }
@@ -141,8 +149,32 @@ impl DynamicValueExtractor {
 }
 
 /// Returns true when `s` looks like a placeholder we generated.
-fn is_already_placeholder(s: &str) -> bool {
+///
+/// P1(2026-09-17):`pub(crate)` —— `prompt.rs` 插入就地指针行时需复用同一
+/// 占位符形态判定,避免两处解析规则漂移。
+pub(crate) fn is_already_placeholder(s: &str) -> bool {
     s.starts_with('<') && s.ends_with('>') && s.len() > 4 && s[1..s.len() - 1].contains('_')
+}
+
+/// 检测长文本中是否**含有**至少一个生成的占位符(如 `<path_2>`)。
+///
+/// 与 [`is_already_placeholder`] 的区别:后者判定"整个字符串就是一个占位符"
+/// (extract 时用于跳过重复提取),此处判定"文本里出现过占位符" ——
+/// 静态 section 是长文本,整段等于占位符永不成立,`prompt.rs` 需要的是后者
+/// (定位承载占位符的 section 以插入就地指针行)。
+pub(crate) fn contains_placeholder(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        let after = &rest[open..];
+        let Some(close) = after.find('>') else {
+            break;
+        };
+        if is_already_placeholder(&after[..=close]) {
+            return true;
+        }
+        rest = &after[close + 1..];
+    }
+    false
 }
 
 /// Classifies a dynamic value into a short label used in placeholder names.
