@@ -872,35 +872,28 @@ fn run_harness_command(
             Err(e) => return Err(format!("cannot read harness edit `{id}`: {e}").into()),
         },
         HarnessCommand::EvolveDryRun => {
-            // 从 `.claw/traces.csv` 加载历史 trace 预览一轮 evolution,
-            // 不写入 archive(MVP:规则式 Proposer 零 LLM 调用)。
-            let trace_csv = cwd.join(".claw").join("traces.csv");
-            let analyzer = if trace_csv.exists() {
-                match runtime::trace_analyzer::TraceAnalyzer::load_csv(&trace_csv) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        eprintln!("failed to load trace csv: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                eprintln!(
-                    "no trace data found at {}; run a session first, then export traces",
-                    trace_csv.display()
-                );
-                std::process::exit(1);
-            };
+            // 预览一轮 evolution(不污染真实 archive):
+            // - 工具级信号:真实 failure_traces.jsonl + tool_call_stats.jsonl
+            //   (与 conversation.rs 运行时一致,见 failure_trace::load_all)。
+            // - turn 级信号:turn 级 TraceAnalyzer 在生产中是会话内存态,从不
+            //   落盘 traces.csv;无文件时用空 analyzer 继续(工具级信号仍可用)。
             let config = runtime::harness_evolution::EvolutionConfig::default();
-            // 阶段 1 接入：加载工具级失败轨迹（若存在），供 evolve 做工具级
-            // weakness mining。无文件或损坏时回退为空，不影响 turn 级信号。
             let failure_traces = runtime::failure_trace::load_all(&cwd).unwrap_or_default();
-            // 阶段 3 接入：加载工具调用统计，供工具级 candidate 失败率 z-test。
             let tool_stats = runtime::tool_call_stats::load_all(&cwd).unwrap_or_default();
+            // 临时 archive:dry-run 语义「预览不写入」,在临时目录打开一个空库,
+            // 跑完整 evolve 后丢弃,真实 decision_log.db 的 harness_edits 不受影响。
+            let dry_run_root =
+                std::env::temp_dir().join(format!("claw-evolve-dryrun-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dry_run_root);
+            std::fs::create_dir_all(dry_run_root.join(".claw")).map_err(std::io::Error::other)?;
+            let dry_archive = runtime::harness_evolution::HarnessArchive::open(&dry_run_root)
+                .map_err(|e| format!("cannot open dry-run archive: {e}"))?;
+            let analyzer = runtime::trace_analyzer::TraceAnalyzer::new();
             match runtime::harness_evolution::evolve(
                 &analyzer,
                 &failure_traces,
                 &tool_stats,
-                &archive,
+                &dry_archive,
                 &config,
             ) {
                 Ok(report) => match output_format {
@@ -923,6 +916,7 @@ fn run_harness_command(
                     std::process::exit(1);
                 }
             }
+            let _ = std::fs::remove_dir_all(&dry_run_root);
         }
     }
     Ok(())
