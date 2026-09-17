@@ -526,7 +526,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plugins"
-version = "2026.8.8"
+version = "2026.9.17"
 dependencies = [
  "serde",
  "serde_json",
@@ -590,7 +590,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "runtime"
-version = "2026.8.8"
+version = "2026.9.17"
 dependencies = [
  "async-trait",
  "flate2",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "2026.8.8"
+version = "2026.9.17"
 dependencies = [
  "serde",
  "serde_json",
