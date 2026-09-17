@@ -110,6 +110,12 @@ impl HarnessArchive {
         let db_path = db_dir.join("decision_log.db");
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // 迁移：早期 SCHEMA 的 source CHECK 只含 ('RulePattern','LlmProposer')，
+        // 缺少 'VerifiedSolution' → validate_candidate / propose_from_confirmed_solutions
+        // 入库时 CHECK 失败，VerifiedSolution 提案永远无法持久化。
+        // 表存在且 schema 不含 'VerifiedSolution' 时 DROP 重建（数据全部为 0 行，
+        // 无损）。见 types.rs EditSource::VerifiedSolution。
+        migrate_harness_edits_schema(&conn)?;
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -470,6 +476,39 @@ pub(crate) fn current_timestamp_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 迁移 `harness_edits` 表 schema(幂等)。
+///
+/// 旧 schema 的 `source` CHECK 约束为
+/// `('RulePattern','LlmProposer')`，不含 `VerifiedSolution`，
+/// 导致 `add_candidate` 插入该来源时 CHECK 失败。检测到旧 schema 时
+/// DROP 主表 + FTS 表 + 触发器后由调用方 SCHEMA_SQL 重建。
+/// 迁移会清空 `harness_edits` 数据 — 旧 schema 下 VerifiedSolution
+/// 根本无法入库，实际数据均为 0 行，丢弃无损。
+fn migrate_harness_edits_schema(conn: &Connection) -> Result<(), ArchiveError> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='harness_edits'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(()); // 表不存在(首次建库),由 SCHEMA_SQL 创建。
+    };
+    let has_verified = sql.contains("'VerifiedSolution'");
+    if has_verified {
+        return Ok(()); // 已迁移或新 schema。
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS harness_edits_ai;
+         DROP TRIGGER IF EXISTS harness_edits_ad;
+         DROP TRIGGER IF EXISTS harness_edits_au;
+         DROP TABLE IF EXISTS harness_edits_fts;
+         DROP TABLE IF EXISTS harness_edits;",
+    )?;
+    Ok(())
+}
+
 /// 生成 edit id:`edit-{timestamp}-{short_hash}`。
 pub(crate) fn generate_edit_id(content: &str, pathology: &str) -> String {
     let hash = compute_simhash(&format!("{pathology} {content}"));
@@ -621,6 +660,65 @@ mod tests {
         let long_content = "x".repeat(MAX_EDIT_CONTENT_CHARS + 1);
         let result = archive.add_candidate(sample_edit("e1", "p1", &long_content, 1));
         assert!(result.is_err(), "超长 content 应被拒绝");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_accepts_verified_solution_source() {
+        // 回归:B1(bug) — source CHECK 曾缺少 'VerifiedSolution'，
+        // 导致 propose_from_confirmed_solutions 入库必失败。见 archive.rs SCHEMA。
+        let dir = tmp_dir("verified");
+        let archive = HarnessArchive::open(&dir).expect("open");
+        let mut edit = sample_edit("e1", "p1", "content one", 111);
+        edit.source = EditSource::VerifiedSolution;
+        archive
+            .add_candidate(edit)
+            .expect("add VerifiedSolution ok");
+        let stored = archive.get_edit("e1").expect("get").expect("exists");
+        assert_eq!(stored.source, EditSource::VerifiedSolution);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_migrates_legacy_schema_missing_verified_source() {
+        // 回归:B1(bug) — 存量库的 harness_edits 表 source CHECK 只有
+        // ('RulePattern','LlmProposer')，open() 后应自动 DROP 重建为含
+        // 'VerifiedSolution' 的新 schema，否则 VerifiedSolution 永远入库失败。
+        let dir = tmp_dir("migrate");
+        let db_dir = dir.join(".claw");
+        std::fs::create_dir_all(&db_dir).expect("mkdir");
+        let db_path = db_dir.join("decision_log.db");
+        {
+            // 手工创建旧 schema 表(模拟存量库)。
+            let conn = rusqlite::Connection::open(&db_path).expect("open legacy db");
+            conn.execute_batch(
+                "CREATE TABLE harness_edits (
+                    id TEXT PRIMARY KEY,
+                    pathology TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('Candidate', 'Active', 'Retired')),
+                    source TEXT NOT NULL CHECK(source IN ('RulePattern', 'LlmProposer')),
+                    verify_count INTEGER DEFAULT 0,
+                    success_count INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    last_verified_at INTEGER,
+                    proposer_reasoning TEXT,
+                    similarity_hash INTEGER NOT NULL,
+                    retire_reason TEXT
+                );",
+            )
+            .expect("create legacy table");
+        }
+
+        // open() 触发迁移 → 重建为含 VerifiedSolution 的 schema。
+        let archive = HarnessArchive::open(&dir).expect("open migrated");
+        let mut edit = sample_edit("e1", "p1", "content one", 111);
+        edit.source = EditSource::VerifiedSolution;
+        archive
+            .add_candidate(edit)
+            .expect("add VerifiedSolution after migration");
+        let stored = archive.get_edit("e1").expect("get").expect("exists");
+        assert_eq!(stored.source, EditSource::VerifiedSolution);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
