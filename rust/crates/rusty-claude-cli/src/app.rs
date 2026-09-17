@@ -138,7 +138,7 @@ use crate::{
     resolve_model_alias_with_config, resolve_repl_model, split_error_hint, validate_model_syntax,
     write_temp_text_file, AllowedToolSet, CliOutputFormat, ModelProvenance, ModelSource,
     BUILD_TARGET, DEFAULT_DATE, DEFAULT_MODEL, DEPRECATED_INSTALL_COMMAND, GIT_SHA,
-    OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL, VERSION,
+    OFFICIAL_REPO_SLUG, OFFICIAL_REPO_URL,
 };
 
 // ===== Block A: detect_broad_cwd .. impl LiveCli (main.rs lines 987-2584) =====
@@ -2782,7 +2782,7 @@ impl LiveCli {
             session_id: self.session.id.clone(),
             plan_id,
             requested_at_ms: now_ms,
-            from_version: VERSION.to_string(),
+            from_version: crate::version_label(),
             old_pid,
         };
         write_upgrade_request(&cwd, &req)?;
@@ -2912,16 +2912,16 @@ impl LiveCli {
         // 3. 注入"继续任务通知"给 LLM(下一 turn 请求构造时可见)。
         let notice = match (&restored_plan_id, &req.from_version) {
             (Some(plan_id), _) => format!(
-                "[runtime] 热升级完成：新版本已接管此会话 (v{from} → v{current})，会话与计划已恢复 \
+                "[runtime] 热升级完成：新版本已接管此会话 ({from} → {current})，会话与计划已恢复 \
                  (plan={plan_id})。请从上次收尾处继续执行当前任务。",
                 from = req.from_version,
-                current = VERSION
+                current = crate::version_label()
             ),
             (None, _) => format!(
-                "[runtime] 热升级完成：新版本已接管此会话 (v{from} → v{current})，会话已恢复 \
+                "[runtime] 热升级完成：新版本已接管此会话 ({from} → {current})，会话已恢复 \
                  (旧进程无活跃计划)。请从上次收尾处继续执行当前任务。",
                 from = req.from_version,
-                current = VERSION
+                current = crate::version_label()
             ),
         };
         self.runtime
@@ -2943,7 +2943,7 @@ impl LiveCli {
         clear_upgrade_request(&cwd);
 
         let report = format!(
-            "[upgrade] 热升级恢复完成：session={} plan={} (from v{})。任务将在下一轮无缝续跑。",
+            "[upgrade] 热升级恢复完成：session={} plan={} (from {})。任务将在下一轮无缝续跑。",
             req.session_id,
             restored_plan_id.as_deref().unwrap_or("(none)"),
             req.from_version,
