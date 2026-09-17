@@ -409,10 +409,10 @@ impl<'a> Widget for StatusBar<'a> {
             ]);
         }
 
-        // P6: Version
+        // P6: Version(含构建指纹,使热升级后能看出二进制确实已换代)
         sections.push(vec![
             Span::styled(" │ ", style_dim),
-            Span::styled(format!("v{}", crate::VERSION), style_version),
+            Span::styled(crate::version_label(), style_version),
         ]);
 
         // Flatten sections up to available width

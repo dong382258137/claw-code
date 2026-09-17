@@ -275,6 +275,22 @@ pub const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
 };
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 构建指纹(build.rs 注入):工作树干净时为 git 短 sha,脏树时为内容哈希,
+/// 非 git 环境为空串。用于状态栏区分"同版本号的不同构建"——热升级只重编译、
+/// 不改 `Cargo.toml`,版本号本身在升级后不变,无法证明新二进制已接管。
+pub const GIT_FINGERPRINT: &str = match option_env!("GIT_FINGERPRINT") {
+    Some(f) => f,
+    None => "",
+};
+/// 状态栏展示的版本标签:`v<VERSION>+<指纹>`;无指纹时降级为 `v<VERSION>`。
+#[must_use]
+pub fn version_label() -> String {
+    if GIT_FINGERPRINT.is_empty() {
+        format!("v{VERSION}")
+    } else {
+        format!("v{VERSION}+{GIT_FINGERPRINT}")
+    }
+}
 pub const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 pub const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 pub const OFFICIAL_REPO_URL: &str = "https://github.com/dong382258137/claw-code";

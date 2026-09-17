@@ -25,6 +25,15 @@ fn main() {
 
     println!("cargo:rustc-env=GIT_SHA={git_sha}");
 
+    // 构建指纹(热升级可观测性)。版本号是编译期常量,而热升级只重编译、
+    // 不改 Cargo.toml,故状态栏版本号在升级后不变,用户无法确认新二进制
+    // 是否真的接管(2026-09-17 实测回执 `v2026.9.17 → v2026.9.17`)。这里
+    // 注入一个随源码内容变化的指纹:干净工作树取 git 短 sha;脏工作树取
+    // (sha + porcelain + diff) 的内容哈希,使"未提交就升级"也能区分。
+    // 非 git 环境注入空串,调用方降级为只显示版本号。
+    let fingerprint = compute_fingerprint(&git_sha);
+    println!("cargo:rustc-env=GIT_FINGERPRINT={fingerprint}");
+
     // TARGET is always set by Cargo during build
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=TARGET={target}");
@@ -98,6 +107,97 @@ fn emit_rerun_if_changed() {
     if skills_dir.exists() {
         println!("cargo::rerun-if-changed={}", skills_dir.display());
     }
+    // 源码内容变化须触发 build.rs 重跑 —— 否则 GIT_FINGERPRINT 会像修复前的
+    // GIT_SHA 一样停留在旧构建,未提交改动无法反映到状态栏。逐 crate 声明
+    // `src/` 而非整个 rust/ 目录:后者会把 target/ 纳入跟踪,而构建自身不断
+    // 写入 target/,会导致 build.rs 每次重跑、构建永不收敛。
+    for dir in workspace_source_inputs() {
+        if dir.exists() {
+            println!("cargo::rerun-if-changed={}", dir.display());
+        }
+    }
+}
+
+/// 参与构建的源码输入集合:workspace 清单 + 各 crate 的 `src/`。
+///
+/// 覆盖"未提交改动"的前提是 build.rs 会因此重跑;Cargo 一旦收到
+/// rerun-if-changed 即只在这些路径上跟踪变化,故必须显式枚举。刻意排除
+/// `target/`(构建产物会自我触发,见调用处说明)。
+fn workspace_source_inputs() -> Vec<PathBuf> {
+    let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") else {
+        return Vec::new();
+    };
+    // CARGO_MANIFEST_DIR = <rust>/crates/rusty-claude-cli
+    let crates_dir = PathBuf::from(&manifest_dir).join("..");
+    let rust_root = crates_dir.join("..");
+    let mut inputs = vec![
+        rust_root.join("Cargo.toml"),
+        rust_root.join("Cargo.lock"),
+        crates_dir.join("Cargo.toml"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(&crates_dir) {
+        for entry in entries.flatten() {
+            let src = entry.path().join("src");
+            if src.is_dir() {
+                inputs.push(src);
+            }
+        }
+    }
+    inputs
+}
+
+/// FNV-1a 64 位哈希(自实现,避免为 build script 引入新依赖)。
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 计算构建指纹(7 位十六进制),用于状态栏版本号后缀。
+///
+/// - 非 git 环境 → 空串(调用方降级为只显示版本号)
+/// - 工作树干净 → git 短 sha(可读、可追溯到具体提交)
+/// - 工作树脏 → FNV-1a(sha + `status --porcelain` + `diff HEAD`) 取低 28 位
+///
+/// 脏树必须纳入 porcelain 与 diff,不能只用 sha:未提交改动不改变 HEAD,
+/// 仅凭 sha 无法区分"同一次提交下的不同工作树状态",而这恰是热升级最常见
+/// 的触发场景(改完源码立即 `/upgrade`,尚未 commit)。
+fn compute_fingerprint(git_sha: &str) -> String {
+    if git_sha == "unknown" {
+        return String::new();
+    }
+    let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") else {
+        return String::new();
+    };
+    // git 在子目录执行时 status/diff 仍是全仓库范围,无需先定位 toplevel。
+    let run_git = |args: &[&str]| -> Option<String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&manifest_dir)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let Some(status) = run_git(&["status", "--porcelain"]) else {
+        return String::new();
+    };
+    if status.trim().is_empty() {
+        return git_sha.to_string(); // 干净树:sha 本身即指纹
+    }
+    let diff = run_git(&["diff", "HEAD"]).unwrap_or_default();
+    let mut buf = String::with_capacity(git_sha.len() + status.len() + diff.len() + 8);
+    buf.push_str(git_sha);
+    buf.push('\n');
+    buf.push_str(&status);
+    buf.push('\n');
+    buf.push_str(&diff);
+    format!("{:07x}", fnv1a_64(buf.as_bytes()) & 0x0fff_ffff)
 }
 
 /// 从 CARGO_MANIFEST_DIR 向上定位 git 仓库根的 .git 条目。

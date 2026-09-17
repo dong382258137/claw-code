@@ -813,6 +813,28 @@ fn parses_version_flags_without_initializing_prompt_mode() {
 }
 
 #[test]
+fn version_label_carries_build_fingerprint_shape() {
+    // 守护:状态栏版本标签必须形如 `v<version>` 或 `v<version>+<指纹>`。
+    // 回归背景 —— 版本号是编译期常量,热升级只重编译不改 Cargo.toml,
+    // 若标签退回纯版本号(或指纹恒空),升级后状态栏不再变化,用户无法
+    // 确认新二进制是否接管(2026-09-17 实测 `v2026.9.17 → v2026.9.17`)。
+    let label = crate::version_label();
+    let expected = if crate::GIT_FINGERPRINT.is_empty() {
+        format!("v{}", crate::VERSION)
+    } else {
+        format!("v{}+{}", crate::VERSION, crate::GIT_FINGERPRINT)
+    };
+    assert_eq!(label, expected);
+    assert!(label.starts_with(&format!("v{}", crate::VERSION)));
+    // 指纹非空时必须是 7 位小写十六进制(build.rs 的 `{:07x}` 约定)。
+    let fp = crate::GIT_FINGERPRINT;
+    assert!(
+        fp.is_empty() || (fp.len() == 7 && fp.chars().all(|c| c.is_ascii_hexdigit())),
+        "unexpected fingerprint format: {fp:?}"
+    );
+}
+
+#[test]
 fn parses_permission_mode_flag() {
     let args = vec!["--permission-mode=read-only".to_string()];
     assert_eq!(
