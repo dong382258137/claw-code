@@ -420,6 +420,17 @@ fn completion_round(
     }
     let text = resp.text().map_err(|e| format!("读取流失败: {e}"))?;
     debug_log(&format!("SSE 流读取完成 ({} chars)", text.len()));
+    // 可选 SSE 原始帧落盘(`CLAW_WEB_DUMP_SSE`):排查 extractor 丢帧 vs
+    // 模型真实输出截断(两者在 debug_log 中表现相同,需原始帧区分)。
+    if let Ok(path) = std::env::var("CLAW_WEB_DUMP_SSE") {
+        let stamp = chrono::Local::now().format("%H%M%S%.3f");
+        let dump = format!("{path}.{stamp}.sse");
+        if let Err(e) = std::fs::write(&dump, &text) {
+            debug_log(&format!("SSE dump 写入失败: {e}"));
+        } else {
+            debug_log(&format!("SSE 原始帧已落盘: {dump}"));
+        }
+    }
     // 诊断：记录原始响应开头（区分 SSE 流 / 错误 JSON / 空响应）
     tracing::info!("chat/completion 原始响应头: {}", truncate(&text, 600));
     if !text.starts_with("event:") && !text.contains("\ndata:") && !text.starts_with("data:") {

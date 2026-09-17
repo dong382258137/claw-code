@@ -118,10 +118,7 @@ async fn run_task(args: &[String]) -> Result<(), String> {
         .get(1)
         .ok_or_else(|| "缺少任务文本，用法: claw-web-bridge run \"<任务>\"".to_string())?;
     let auth = WebAuth::load()?;
-    let client = WebApiClient::new(
-        Box::new(DeepseekWebClient::new(auth)),
-        ::tools::GlobalToolRegistry::builtin(),
-    );
+    let client = WebApiClient::new(Box::new(DeepseekWebClient::new(auth)));
     let text = driver::run_prompt(client, system_prompt(), task).await?;
     println!("{text}");
     Ok(())

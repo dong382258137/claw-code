@@ -36,17 +36,33 @@ todoWrite(todos)、webFetch(url)。\n\
 - 只是展示给你的代码内容请放普通代码块,不要使用 claw;\n\
 - 任务全部完成后,用纯文字总结结果,不要再输出代码块。";
 
+/// 网页后端模式声明:消除"双工具协议"歧义。
+///
+/// claw 系统提示词为原生 API(tool_use 块)编写,含工具映射表与调用纪律;
+/// 网页后端没有原生 tool-calling,若不声明优先级,模型会读到两套互不
+/// 兼容的调用约定(原生指令 vs 文末 claw 代码块协议),诱发接口误用。
+const WEB_BACKEND_MODE_HEADER: &str = "\
+[web backend mode]\n\
+你现在以网页后端模式运行:下文 claw instructions 中所有关于工具调用的\
+说明(工具映射表、tool_use/antml 块格式等)均面向原生 API,在本模式下\
+不适用。你执行本地操作的唯一方式是文末 [claw 工具协议] 定义的 claw\
+代码块,可用函数以该协议白名单为准,不要尝试其他调用形式。\n";
+
 /// 把一个 `ApiRequest` 渲染成发给网页的"增强提示"文本。
 ///
-/// 结构:claw 系统提示 → 可用工具清单 → 对话记录(带 `<|tool_result|>` 标记)→ 协议。
+/// 结构:模式声明 → claw 系统提示 → 对话记录(带 `<|tool_result|>` 标记)→ 协议。
+///
+/// 注意:不再单独渲染"[available tools]"清单——协议白名单(PROTOCOL_SUFFIX)
+/// 是唯一事实源,两份清单并存曾导致"广告 registry 全量名、实际仅 8 个函数
+/// 可映射"的矛盾(2026-09-17 系统提示词评估 P0 修复)。
 #[must_use]
 pub fn render_enhanced_prompt(
     system: &SystemPromptSplit,
     messages: &[ConversationMessage],
-    tool_names: &str,
 ) -> String {
     let mut out = String::new();
-    out.push_str("[claw instructions]\n");
+    out.push_str(WEB_BACKEND_MODE_HEADER);
+    out.push_str("\n[claw instructions]\n");
     for section in system
         .static_sections
         .iter()
@@ -56,12 +72,6 @@ pub fn render_enhanced_prompt(
             out.push_str(section);
             out.push('\n');
         }
-    }
-    out.push_str("\n[available tools]\n");
-    if tool_names.is_empty() {
-        out.push_str("(none)");
-    } else {
-        out.push_str(tool_names);
     }
     out.push_str("\n\n[conversation]\n");
     for msg in messages {
@@ -746,11 +756,14 @@ mod tests {
                     },
                 ),
             ],
-            "read_file, bash",
         );
+        // 模式声明在最前,消除与原生工具指令的歧义
+        assert!(prompt.contains("[web backend mode]"));
+        assert!(prompt.contains("唯一方式是文末 [claw 工具协议]"));
         assert!(prompt.contains("<|user|> hello"));
         assert!(prompt.contains("<|tool_result|> [read_file]\nfile-content"));
-        assert!(prompt.contains("read_file, bash"));
+        // 不再渲染 [available tools] 清单(协议白名单是唯一事实源)
+        assert!(!prompt.contains("[available tools]"));
         // 主协议:claw 代码块
         assert!(prompt.contains(CLAW_FENCE));
     }

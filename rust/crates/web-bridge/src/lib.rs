@@ -23,27 +23,23 @@ pub mod safe_commands;
 pub mod tools;
 pub mod web_session;
 
-use ::tools::GlobalToolRegistry;
-use runtime::{ApiRequest, AssistantEvent, RuntimeError, TokenUsage};
+use ::runtime::{ApiRequest, AssistantEvent, RuntimeError, TokenUsage};
 
 /// 模型后端对接抽象:一次"把增强提示发给网页并取回整段回复"的往返。
-///
-/// - M0:[`mock_web::MockWebExchange`](脚本化模拟,无浏览器)
-/// - M1+:WS 实现(经本机 WebSocket 驱动浏览器扩展:填输入框发送 + 读回最终回复)
 pub trait WebExchange: Send {
     fn round_trip(&mut self, prompt: &str) -> Result<String, String>;
 }
 
 /// 实现 `runtime::ApiClient` 的网页版模型客户端。
 ///
-/// 网页版聊天没有原生 tool-calling,所以把"可用工具 + 对话记录 + 调用协议"
-/// 渲染成一段增强提示发给网页;回复按 [`protocol::parse_reply`] 解析出
-/// 工具调用与最终文本,转成 `AssistantEvent` 交给 agent 循环执行。
+/// 网页版聊天没有原生 tool-calling,所以把"对话记录 + 调用协议"渲染成
+/// 一段增强提示发给网页;回复按 [`protocol::parse_reply`] 解析出工具调用
+/// 与最终文本,转成 `AssistantEvent` 交给 agent 循环执行。
+///
+/// 工具可用性不在客户端侧声明——协议白名单(`protocol::PROTOCOL_SUFFIX`)
+/// 是唯一事实源,不再从 registry 广告全量工具名(曾导致双工具协议冲突)。
 pub struct WebApiClient {
     exchange: Box<dyn WebExchange>,
-    registry: GlobalToolRegistry,
-    /// 是否把工具清单渲染进增强提示(广告 = 可执行)。
-    enable_tools: bool,
     tool_use_counter: u64,
     /// TUI 状态转发:网页后端一次性返回完整回复,没有原生流式事件;
     /// TUI 的回复显示完全依赖 StatusEvent(见 tui/app.rs 对
@@ -54,11 +50,9 @@ pub struct WebApiClient {
 
 impl WebApiClient {
     #[must_use]
-    pub fn new(exchange: Box<dyn WebExchange>, registry: GlobalToolRegistry) -> Self {
+    pub fn new(exchange: Box<dyn WebExchange>) -> Self {
         Self {
             exchange,
-            registry,
-            enable_tools: true,
             tool_use_counter: 0,
             status_emitter: None,
         }
@@ -72,25 +66,7 @@ impl WebApiClient {
 
 impl runtime::ApiClient for WebApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tool_names = if self.enable_tools {
-            let mut names = self
-                .registry
-                .definitions(None)
-                .into_iter()
-                .filter(|def| !crate::tools::WEB_BRIDGE_EXCLUDED_TOOLS.contains(&def.name.as_str()))
-                .map(|def| def.name)
-                .collect::<Vec<_>>();
-            names.sort();
-            names.join(", ")
-        } else {
-            String::new()
-        };
-
-        let prompt = protocol::render_enhanced_prompt(
-            &request.system_prompt,
-            &request.messages,
-            &tool_names,
-        );
+        let prompt = protocol::render_enhanced_prompt(&request.system_prompt, &request.messages);
 
         let reply = self
             .exchange

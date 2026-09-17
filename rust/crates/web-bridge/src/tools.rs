@@ -7,7 +7,8 @@
 use runtime::{StaticToolExecutor, ToolError};
 
 /// 网页通道不应暴露给模型的工具:AskUserQuestion 读 stdin,网页侧无交互
-/// 终端,调用会永久阻塞 agent 线程。广告列表与执行器都剔除(广告 = 可执行)。
+/// 终端,调用会永久阻塞 agent 线程,执行器剔除(增强提示不再从 registry
+/// 广告工具清单,协议白名单见 `protocol::PROTOCOL_SUFFIX`)。
 pub const WEB_BRIDGE_EXCLUDED_TOOLS: &[&str] = &["AskUserQuestion"];
 
 /// 把所有默认工具注册到 executor(排除网页不适用的工具)。

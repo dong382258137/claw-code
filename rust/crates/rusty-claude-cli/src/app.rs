@@ -3458,10 +3458,9 @@ fn build_api_client(
         let auth = web_bridge::web_session::WebAuth::load()
             .map_err(|e| format!("--model {} 需要已登录的网页凭证:{e}", crate::WEB_MODEL_NAME))?;
         eprintln!("[deepseek-web] 使用 chat.deepseek.com 登录态凭证(零 Token)");
-        return Ok(Box::new(web_bridge::WebApiClient::new(
-            Box::new(web_bridge::deepseek_web::DeepseekWebClient::new(auth)),
-            tool_registry,
-        )));
+        return Ok(Box::new(web_bridge::WebApiClient::new(Box::new(
+            web_bridge::deepseek_web::DeepseekWebClient::new(auth),
+        ))));
     }
     Ok(Box::new(AnthropicRuntimeClient::new(
         session_id,
