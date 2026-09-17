@@ -26,6 +26,23 @@ cargo run -p rusty-claude-cli -- prompt "explain this codebase"
 cargo run -p rusty-claude-cli -- --output-format json prompt "summarize src/main.rs"
 ```
 
+## 网页版模型后端（零 Token，无 Electron）
+
+`crates/web-bridge` 提供「DeepSeek 网页登录会话 → claw 模型后端」的能力，**不依赖
+Electron 壳/浏览器扩展**：登录一次保存凭证，之后运行时直接调用 chat.deepseek.com
+内部 API（PoW challenge + SSE `FINISHED` 完成信号，工具经增强提示协议注入并本地执行）。
+
+```bash
+cargo run -p web-bridge -- login                       # 一次登录：打开浏览器，抓 cookie+bearer 存 auth.json
+cargo run -p web-bridge -- import --cookie "<cookie>"  # 或手动粘贴浏览器 Cookie，自动取 token
+cargo run -p web-bridge -- run "读取 CLAUDE.md 并总结"   # 跑完整 agent 回合（本地工具执行），打印最终结果
+```
+
+- 凭证位置：`~/.claw/web-bridge/deepseek-auth.json`（`DEEPSEEK_WEB_AUTH` 覆盖）
+- 库级 API：`web_bridge::deepseek_web::DeepseekWebClient` 实现 `WebExchange`，
+  配合 `WebApiClient`/`driver::run_prompt` 复用 claw 全部回合与工具链
+- `serve` 子命令为旧 WS 网关（兼容桌面壳/浏览器扩展），新链路验证后退役
+
 ## Configuration
 
 Set your API credentials:
