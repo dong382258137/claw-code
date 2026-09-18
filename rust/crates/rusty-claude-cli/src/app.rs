@@ -3457,7 +3457,12 @@ fn build_api_client(
     if model == crate::WEB_MODEL_NAME {
         let auth = web_bridge::web_session::WebAuth::load()
             .map_err(|e| format!("--model {} 需要已登录的网页凭证:{e}", crate::WEB_MODEL_NAME))?;
-        eprintln!("[deepseek-web] 使用 chat.deepseek.com 登录态凭证(零 Token)");
+        // TUI(emit_output=false)下必须 gate stderr:stray write 会打到
+        // alternate screen,输出被 crossterm 读回输入行,污染用户消息
+        // (2026-09-18 TUI 实测:用户输入前缀被混入"[deepseek-web] ..."碎片)。
+        if emit_output {
+            eprintln!("[deepseek-web] 使用 chat.deepseek.com 登录态凭证(零 Token)");
+        }
         return Ok(Box::new(web_bridge::WebApiClient::new(Box::new(
             web_bridge::deepseek_web::DeepseekWebClient::new(auth),
         ))));

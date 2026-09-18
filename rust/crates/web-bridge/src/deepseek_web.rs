@@ -1,4 +1,4 @@
-﻿//! DeepSeek 网页版模型后端：登录态直连 `chat.deepseek.com` 内部 API。
+//! DeepSeek 网页版模型后端：登录态直连 `chat.deepseek.com` 内部 API。
 //!
 //! 链路（端点/请求体/头参考 openclaw-zero-token・MIT）：
 //! `create_pow_challenge` → 求解 PoW → `chat/completion`（SSE）→ 完整回复文本。
@@ -219,8 +219,15 @@ impl Extractor {
             self.fragment_types = types;
             self.observed = true;
             if first {
-                for f in &snap {
-                    self.text.push_str(&Self::frag_text(f));
+                for (i, f) in snap.iter().enumerate() {
+                    // THINK fragment 的初始 content 不得进正文(与 APPEND 分支的
+                    // is_think 过滤对齐)。漏判会把思考首词拼进回复开头(如
+                    // "The"+"```claw"),破坏 ```claw 围栏识别 → parse_reply 把
+                    // 后续真围栏误配对、判 truncated,工具调用永不执行
+                    // (2026-09-19 SSE dump 实证:THINK snapshot content="The")。
+                    if !is_think(self.fragment_types.get(i).map(|s| s.as_str()).unwrap_or("")) {
+                        self.text.push_str(&Self::frag_text(f));
+                    }
                 }
             }
             return;
@@ -366,22 +373,91 @@ fn create_chat_session(
     Ok(id.to_string())
 }
 
+/// 网页会话生命周期状态（worker 线程内维护）。
+///
+/// 长程任务的 turn 内每次 tool 迭代复用同一网页会话，但每 iter 都全量
+/// 回灌 → 单会话按 iter 数近似 O(n²) 膨胀；同时每 turn 新建的会话从不
+/// 删除 → 长程任务会在账号累积无主会话（消耗会话上限 + 污染手动会话列表）。
+/// 用「阈值轮换 + 用完即删」治理（2026-09-19 探测确认删除协议：
+/// `POST /api/v0/chat_session/delete` body `{"id": ...}`，无 PoW）。
+struct SessionState {
+    id: String,
+    msg_count: u32,
+    sent_bytes: u64,
+}
+
+/// 轮换阈值：单会话消息数上限（防单会话膨胀）。
+const SESSION_MSG_LIMIT: u32 = 5;
+/// 轮换阈值：单会话累计发送字节上限（全量回灌下防长 iter 任务撑爆）。
+const SESSION_BYTES_LIMIT: u64 = 256 * 1024;
+
+/// 会话是否达到轮换阈值（纯判定，便于单测）。
+fn should_rotate(state: &SessionState) -> bool {
+    state.msg_count >= SESSION_MSG_LIMIT || state.sent_bytes >= SESSION_BYTES_LIMIT
+}
+
+/// 删除网页会话（自动清理）。返回 Err 供调用方记日志，不影响主流程。
+fn delete_chat_session(
+    http: &reqwest::blocking::Client,
+    auth: &WebAuth,
+    base: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let resp = post_json(
+        http,
+        auth,
+        base,
+        "/api/v0/chat_session/delete",
+        json!({ "id": session_id }),
+        vec![],
+    )?;
+    let status = resp.status();
+    let text = resp.text().map_err(|e| format!("读取删除响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("chat_session/delete 返回 {status}: {text}"));
+    }
+    let v: Value =
+        serde_json::from_str(&text).map_err(|e| format!("删除响应 JSON 解析失败: {e}"))?;
+    if v.get("code").and_then(|c| c.as_i64()) != Some(0) {
+        return Err(format!("chat_session/delete code 非 0: {text}"));
+    }
+    Ok(())
+}
+
 /// 单轮：确保会话 → PoW → chat/completion（SSE FINISHED）→ 完整回复文本。
 fn completion_round(
     http: &reqwest::blocking::Client,
     auth: &WebAuth,
     base: &str,
-    session_slot: &mut Option<String>,
+    session_slot: &mut Option<SessionState>,
     prompt: &str,
 ) -> Result<String, String> {
     debug_log(&format!("round_trip 开始 (prompt {} chars)", prompt.len()));
+    // 轮换检查：会话超阈值（消息数/字节）则删旧建新，防单会话膨胀。
+    if let Some(st) = session_slot.as_ref() {
+        if should_rotate(st) {
+            let old = st.id.clone();
+            match delete_chat_session(http, auth, base, &old) {
+                Ok(()) => debug_log(&format!(
+                    "会话轮换: 已删除旧会话 {old} (msg={} bytes={})",
+                    st.msg_count, st.sent_bytes
+                )),
+                Err(e) => debug_log(&format!("会话轮换: 删除旧会话 {old} 失败(忽略): {e}")),
+            }
+            *session_slot = None;
+        }
+    }
     let session_id = match session_slot {
-        Some(s) => s.clone(),
+        Some(st) => st.id.clone(),
         None => {
             let id = create_chat_session(http, auth, base)?;
             tracing::info!("deepseek web: created chat session {id}");
             debug_log(&format!("会话创建成功 {id}"));
-            *session_slot = Some(id.clone());
+            *session_slot = Some(SessionState {
+                id: id.clone(),
+                msg_count: 0,
+                sent_bytes: 0,
+            });
             id
         }
     };
@@ -440,13 +516,31 @@ fn completion_round(
             truncate(&text, 600)
         ));
     }
-    let reply = extract_reply(text.as_bytes());
-    debug_log(&format!("extract 完成 ({} chars)", reply.len()));
+    let (reply, finished) = extract_reply(text.as_bytes());
+    debug_log(&format!(
+        "extract 完成 ({} chars, finished={finished})",
+        reply.len()
+    ));
+    // FINISHED 帧缺失 = SSE 流被截断(网络波动/代理断连),部分 delta 拼出的
+    // 文本不完整。静默返回会被上层当完整回复 → 工具代码块未闭合被判
+    // truncated、工具永不执行(2026-09-19 TUI 实测:三次同样的 168 chars
+    // 截断回复)。必须报 Err 让上层重试,而不是吞掉。
+    if !finished {
+        return Err(format!(
+            "SSE 流未收到 FINISHED(疑被网络截断),部分回复 {} chars 已丢弃",
+            reply.len()
+        ));
+    }
+    // 成功一次 = 会话多一条消息；计数用于后续轮换判定。
+    if let Some(st) = session_slot.as_mut() {
+        st.msg_count += 1;
+        st.sent_bytes += prompt.len() as u64;
+    }
     Ok(reply)
 }
 
-/// 把 SSE 字节流喂给提取器，返回服务端 FINISHED 时的完整回复文本。
-fn extract_reply(bytes: &[u8]) -> String {
+/// 把 SSE 字节流喂给提取器，返回(完整回复文本, 是否收到 FINISHED)。
+fn extract_reply(bytes: &[u8]) -> (String, bool) {
     let text = String::from_utf8_lossy(bytes);
     let mut decoder = FrameDecoder::new();
     let mut extractor = Extractor::new();
@@ -460,7 +554,7 @@ fn extract_reply(bytes: &[u8]) -> String {
             extractor.consume(&v);
         }
     }
-    extractor.text
+    (extractor.text, extractor.finished)
 }
 
 /// 一次性隔离线程里取 token（避免阻塞 Client 在异步上下文构造/析构 panic）。
@@ -530,6 +624,12 @@ enum WorkerJob {
         prompt: String,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
+    /// 显式关闭信号：删除当前会话后退出循环。
+    /// 删除不可依赖「worker 线程退出」时机——它是分离线程，进程退出或
+    /// runtime 重装时循环外代码可能不执行（2026-09-19 CLI 实测：turn 结束
+    /// 后无清理日志）。由 Drop impl 主动 send 本消息驱动；`done` 回执让
+    /// Drop 侧限时等待删除完成再返回。
+    Shutdown { done: std::sync::mpsc::Sender<()> },
 }
 
 /// DeepSeek 网页会话客户端。
@@ -554,12 +654,43 @@ impl DeepseekWebClient {
                     .user_agent("Mozilla/5.0")
                     .build()
                     .expect("http client build");
-                let mut session_slot: Option<String> = None;
+                let mut session_state: Option<SessionState> = None;
                 while let Ok(job) = rx.recv() {
                     match job {
+                        WorkerJob::Shutdown { done } => {
+                            // 显式关闭：删除残留会话后退出循环。
+                            if let Some(st) = session_state.take() {
+                                match delete_chat_session(&http, &auth, &base, &st.id) {
+                                    Ok(()) => {
+                                        debug_log(&format!("会话清理: Shutdown 已删除 {}", st.id))
+                                    }
+                                    Err(e) => debug_log(&format!(
+                                        "会话清理: Shutdown 删除 {} 失败(忽略): {e}",
+                                        st.id
+                                    )),
+                                }
+                            }
+                            let _ = done.send(());
+                            break;
+                        }
                         WorkerJob::Chat { prompt, reply } => {
                             let result =
-                                completion_round(&http, &auth, &base, &mut session_slot, &prompt);
+                                completion_round(&http, &auth, &base, &mut session_state, &prompt);
+                            if result.is_err() {
+                                // 会话状态不可信（网络/协议/截断）：丢弃并删除，
+                                // 下次 round_trip 新建干净会话（防御性回退）。
+                                if let Some(st) = session_state.take() {
+                                    match delete_chat_session(&http, &auth, &base, &st.id) {
+                                        Ok(()) => {
+                                            debug_log(&format!("会话清理: 错误后已删除 {}", st.id))
+                                        }
+                                        Err(e) => debug_log(&format!(
+                                            "会话清理: 删除 {}(错误后) 失败(忽略): {e}",
+                                            st.id
+                                        )),
+                                    }
+                                }
+                            }
                             let _ = reply.send(result);
                         }
                     }
@@ -567,6 +698,20 @@ impl DeepseekWebClient {
             })
             .expect("spawn worker thread");
         Self { tx }
+    }
+}
+
+impl std::ops::Drop for DeepseekWebClient {
+    fn drop(&mut self) {
+        // 用完即删：发 Shutdown 让 worker 删除残留会话后退出，并限时等待
+        // 回执——否则 CLI 进程在 main 返回后立即退出、分离 worker 来不及
+        // 执行删除（2026-09-19 实测）。Drop 可能在 tokio/UI 上下文执行，
+        // 限时（3s）避免拖死调用线程；TUI 的 execute_turn 运行在独立
+        // spawn 线程，此阻塞不影响 UI。
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        if self.tx.send(WorkerJob::Shutdown { done: done_tx }).is_ok() {
+            let _ = done_rx.recv_timeout(Duration::from_secs(3));
+        }
     }
 }
 
@@ -616,7 +761,73 @@ mod tests {
             "event: data\ndata: {\"o\":\"BATCH\",\"v\":[{\"p\":\"response/fragments/0/content\",\"v\":\" world\"}]}\n\n",
             "event: data\ndata: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n",
         );
-        let text = extract_reply(sse.as_bytes());
+        let (text, finished) = extract_reply(sse.as_bytes());
         assert_eq!(text, "hello world");
+        assert!(finished, "含 FINISHED 帧的 SSE 应置完成信号");
+    }
+
+    #[test]
+    fn truncated_sse_reports_unfinished() {
+        // 网络截断:有 delta 无 FINISHED 帧,extractor 必须报 finished=false,
+        // 供 completion_round 报错重试(2026-09-19 TUI 实测 168 chars 截断)。
+        let sse = concat!(
+            "event: status\ndata: {\"p\":\"response/status\",\"v\":\"RUNNING\"}\n\n",
+            "event: data\ndata: {\"o\":\"BATCH\",\"v\":[{\"p\":\"response/fragments/0/content\",\"v\":\"partial\"}]}\n\n",
+        );
+        let (text, finished) = extract_reply(sse.as_bytes());
+        assert_eq!(text, "partial");
+        assert!(!finished, "无 FINISHED 帧的 SSE 不得视为完成");
+    }
+
+    #[test]
+    fn session_rotate_thresholds() {
+        // 阈值轮换判定:未达阈值不轮换,消息数/字节任一超限即轮换。
+        let mut st = SessionState {
+            id: "s1".into(),
+            msg_count: SESSION_MSG_LIMIT - 1,
+            sent_bytes: SESSION_BYTES_LIMIT - 1,
+        };
+        assert!(!should_rotate(&st), "未达阈值不应轮换");
+
+        st.msg_count += 1; // 消息数触顶
+        assert!(should_rotate(&st), "消息数达阈值应轮换");
+
+        let st2 = SessionState {
+            id: "s2".into(),
+            msg_count: 1,
+            sent_bytes: SESSION_BYTES_LIMIT, // 字节触顶
+        };
+        assert!(should_rotate(&st2), "字节达阈值应轮换");
+    }
+
+    #[test]
+    fn session_state_counts_after_success() {
+        // 成功一次后消息数/字节应累加(轮换判定依赖的计数来自这里)。
+        let mut st = SessionState {
+            id: "s1".into(),
+            msg_count: 0,
+            sent_bytes: 0,
+        };
+        st.msg_count += 1;
+        st.sent_bytes += 4096u64;
+        assert_eq!(st.msg_count, 1);
+        assert_eq!(st.sent_bytes, 4096);
+        assert!(!should_rotate(&st));
+    }
+
+    #[test]
+    fn first_snapshot_think_content_excluded() {
+        // 首个 snapshot 带 THINK fragment(思考首词如"The")时,THINK 初始
+        // content 不得进正文,否则拼成 "The```claw" 破坏围栏识别
+        // (2026-09-19 SSE dump 实证)。
+        let sse = concat!(
+            "event: data\ndata: {\"v\":{\"response\":{\"fragments\":[{\"id\":2,\"type\":\"THINK\",\"content\":\"The\"}]}}}\n\n",
+            "event: data\ndata: {\"p\":\"response/fragments\",\"o\":\"APPEND\",\"v\":[{\"id\":3,\"type\":\"RESPONSE\",\"content\":\"```claw\"}]}\n\n",
+            "event: data\ndata: {\"v\":\"\\nawait read(\\\"x\\\")\"}\n\n",
+            "event: data\ndata: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n",
+        );
+        let (text, finished) = extract_reply(sse.as_bytes());
+        assert_eq!(text, "```claw\nawait read(\"x\")");
+        assert!(finished);
     }
 }

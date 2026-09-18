@@ -136,21 +136,40 @@ impl runtime::ApiClient for WebApiClient {
         }));
         events.push(AssistantEvent::MessageStop);
 
-        // TUI 适配:网页后端无原生流式事件,把「整段回复文本 + usage + 收尾」
-        // 模拟成 StatusEvent 序列转发,驱动 TUI 输出区/状态栏实时显示
-        // (CLI 模式 emitter 为 None,零影响)。
+        // TUI 适配:网页后端无原生流式事件,把「整段回复文本 + 工具调用 +
+        // usage + 收尾」模拟成 StatusEvent 序列转发,驱动 TUI 输出区/状态栏/
+        // ToolCard 实时显示(CLI 模式 emitter 为 None,零影响)。
+        //
+        // ToolUse 必须转发:官方 API 路径(AnthropicRuntimeClient::stream)会
+        // emit StatusEvent::ToolUse 驱动 TUI 工具卡片,网页后端若只转发
+        // TextDelta,工具调用在 TUI 上完全不可见(2026-09-18 实测:卡片不显示,
+        // 用户以为工具调用未实现)。ToolResult 由 runtime 的 tool_executor
+        // emitter 补发(prepare_turn_runtime 已注入),id 与此处 ToolUse 一致。
         if let Some(emitter) = &self.status_emitter {
             crate::deepseek_web::debug_log("emitter 存在,转发 StatusEvent 序列");
             emitter(runtime::StatusEvent::StreamStart);
-            let mut forwarded = 0;
-            for text in events.iter().filter_map(|e| match e {
-                AssistantEvent::TextDelta(t) => Some(t),
-                _ => None,
-            }) {
-                emitter(runtime::StatusEvent::TextDelta(text.clone()));
-                forwarded += 1;
+            let mut text_count = 0usize;
+            let mut tool_count = 0usize;
+            for event in &events {
+                match event {
+                    AssistantEvent::TextDelta(text) => {
+                        emitter(runtime::StatusEvent::TextDelta(text.clone()));
+                        text_count += 1;
+                    }
+                    AssistantEvent::ToolUse { id, name, input } => {
+                        emitter(runtime::StatusEvent::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+                        tool_count += 1;
+                    }
+                    _ => {}
+                }
             }
-            crate::deepseek_web::debug_log(&format!("转发 {forwarded} 个 TextDelta 事件"));
+            crate::deepseek_web::debug_log(&format!(
+                "转发 TextDelta x{text_count}, ToolUse x{tool_count}"
+            ));
             if let Some(AssistantEvent::Usage(u)) = events
                 .iter()
                 .rfind(|e| matches!(e, AssistantEvent::Usage(_)))
