@@ -1609,6 +1609,31 @@ impl HookReloadWatch {
 /// 上层（TUI）注入后转发为 `StatusEvent::ToolResult` 闭合 ToolCard。
 pub type ToolResultCallback = Box<dyn Fn(&str, &str, &str, bool) + Send>;
 
+/// 站5/3/4(2026-09-19 首迭代延迟修复):把 per-turn 易变的 system sections
+/// 拆分为 (保留在 system prompt 的段, 尾部消息注入段)。
+///
+/// 提取对象(heading 契约见 prompt.rs 常量):
+/// - [`crate::prompt::PROJECT_CONTEXT_HEADING`]:git status/commits 快照
+/// - [`crate::prompt::MCP_CATALOG_HEADING`]:MCP server 连接状态目录
+///
+/// 这两段在 CLI 单次 prompt 模式下每 turn 新进程重新捕获,字节几乎必然
+/// 变化;留在 system(dynamic 区)会令 DeepSeek 前缀缓存在 system 截断点
+/// 失效,全部历史 messages 缓存报废。提取后由请求构造注入 messages 尾部。
+fn extract_message_injected_sections(sections: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut keep = Vec::with_capacity(sections.len());
+    let mut injected = Vec::new();
+    for section in sections {
+        if section.starts_with(crate::prompt::PROJECT_CONTEXT_HEADING)
+            || section.starts_with(crate::prompt::MCP_CATALOG_HEADING)
+        {
+            injected.push(section);
+        } else {
+            keep.push(section);
+        }
+    }
+    (keep, injected)
+}
+
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
     session: Session,
@@ -1616,6 +1641,23 @@ pub struct ConversationRuntime<C, T> {
     tool_executor: T,
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
+    /// 站5/3/4(2026-09-19 首迭代延迟修复):从 system prompt 提取的
+    /// "尾部消息注入段"(git 快照 `# Project context` + MCP 目录
+    /// `## MCP Servers`,见 [`extract_message_injected_sections`])。
+    ///
+    /// 根因:CLI 单次 prompt 模式每 turn 都是新进程,git status 随任务执行
+    /// 漂移、MCP 连接状态可能抖动 —— 它们原位于 system dynamic 区,字节
+    /// 变化使 DeepSeek 前缀缓存从 system 截断,其后**全部历史 messages 的
+    /// 缓存一并报废**,每 turn 首迭代多付 12-20s prefill(实测 turn 边界
+    /// cache 命中率 52% vs turn 内 98%,归因脚本 .claw/tmp_first_iter.py)。
+    ///
+    /// 迁移后 system prompt 跨进程字节稳定;快照作为 user 消息注入请求
+    /// messages **尾部**(render_runtime_hints 之前,不持久化到 session),
+    /// 变化只落在最后一条请求消息上,前缀(system+tools+历史 messages)
+    /// 缓存全量保持。turn 内字节稳定(构造时捕获一次);CLI 每 turn 新
+    /// 进程自然刷新,常驻进程(TUI/ws)与原行为等价(原本也只在 build() 时
+    /// 捕获一次)。
+    message_injected_sections: Vec<String>,
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
@@ -2211,12 +2253,17 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        // 站5/3/4:提取 per-turn 易变段(git 快照/MCP 目录)到 messages
+        // 尾部注入通道,system prompt 从此跨进程字节稳定(见字段注释)。
+        let (system_prompt, message_injected_sections) =
+            extract_message_injected_sections(system_prompt);
         Self {
             session,
             api_client,
             tool_executor,
             permission_policy,
             system_prompt,
+            message_injected_sections,
             // P2-8 修复:主对话单 turn 设置有限迭代护栏(默认 64)。
             // 原值 usize::MAX 意味着诊断/工具调用死循环(如反复 netstat/tail
             // 验证同一状态)只能靠用户 Ctrl+C 终止。64 轮足以完成绝大多数
@@ -4120,6 +4167,13 @@ where
                         }
                         messages.insert(0, ConversationMessage::user_text(snap.content.clone()));
                     }
+                }
+                // 站5/3/4:项目快照段(git status/commits、MCP 目录)注入
+                // messages 尾部。turn 内字节稳定(构造时捕获一次),跨 turn
+                // 变化只影响最后一条请求消息,不破坏前缀缓存(字段注释有
+                // 完整归因)。不持久化到 session,历史请求的旧快照不堆积。
+                for section in &self.message_injected_sections {
+                    messages.push(ConversationMessage::user_text(section.clone()));
                 }
                 // 冻结槽位块:单条 user 消息。内容变化只影响这条消息,不破坏
                 // 前缀缓存;槽位顺序固定(与 system_prompt 变动区隔离),空槽
@@ -11840,6 +11894,148 @@ mod tests {
                 "A8: execution style leaked into message: {t}"
             );
         }
+    }
+
+    /// 站5/3/4(2026-09-19 首迭代延迟修复)回归:git 快照
+    /// (`# Project context`)与 MCP 目录(`## MCP Servers`)不再进 system
+    /// prompt,改为每请求注入 messages 尾部。CLI 单次 prompt 每 turn 新
+    /// 进程,git 状态/连接状态漂移不再从 system 截断点打碎全部历史
+    /// messages 的前缀缓存(归因:.claw/tmp_first_iter.py,turn 边界
+    /// cache 命中率 52% vs turn 内 98%)。
+    #[test]
+    fn project_snapshot_sections_move_to_tail_messages() {
+        use std::sync::Mutex;
+
+        struct SnapshotApi {
+            captured: Arc<Mutex<Vec<ApiRequest>>>,
+        }
+        impl ApiClient for SnapshotApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured.lock().expect("lock").push(request);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::<ApiRequest>::new()));
+        let git_section = format!(
+            "{}\n\nGit status snapshot:\n M src/a.rs",
+            crate::prompt::PROJECT_CONTEXT_HEADING
+        );
+        let mcp_section = format!(
+            "{}\n- mcp1: stdio, connected",
+            crate::prompt::MCP_CATALOG_HEADING
+        );
+        // 模拟 load_system_prompt_with_extras + append_mcp_catalog 的输出:
+        // static 段 + boundary + dynamic 区(git 快照/skill catalog/MCP 目录)。
+        let system_prompt = vec![
+            "system static".to_string(),
+            crate::prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            git_section.clone(),
+            "## Available Skills\n- skill-a".to_string(),
+            mcp_section.clone(),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SnapshotApi {
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            system_prompt,
+        );
+
+        runtime
+            .run_turn("hello", None)
+            .expect("turn should succeed");
+
+        let reqs = captured.lock().expect("lock");
+        let req = reqs.first().expect("at least one request");
+        // 1. system prompt(static + dynamic)不再含 git 快照与 MCP 目录段。
+        for s in req
+            .system_prompt
+            .static_sections
+            .iter()
+            .chain(req.system_prompt.dynamic_sections.iter())
+        {
+            assert!(
+                !s.starts_with(crate::prompt::PROJECT_CONTEXT_HEADING),
+                "git snapshot must not stay in system prompt: {s}"
+            );
+            assert!(
+                !s.starts_with(crate::prompt::MCP_CATALOG_HEADING),
+                "MCP catalog must not stay in system prompt: {s}"
+            );
+        }
+        // 2. 未误伤:skill catalog 段(字节稳定,安装才变)仍留在 dynamic 区。
+        assert!(
+            req.system_prompt
+                .dynamic_sections
+                .iter()
+                .any(|s| s.starts_with("## Available Skills")),
+            "skill catalog should remain in dynamic sections"
+        );
+        // 3. git 快照/MCP 目录作为 user 消息出现在 messages 尾部(位于
+        //    turn 输入 "hello" 之后,不持久化,下轮不堆积)。
+        let user_texts: Vec<String> = req
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .map(|m| {
+                m.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        let hello_idx = user_texts
+            .iter()
+            .position(|t| t == "hello")
+            .expect("turn input message present");
+        let git_idx = user_texts
+            .iter()
+            .position(|t| *t == git_section)
+            .expect("git snapshot injected as tail user message");
+        let mcp_idx = user_texts
+            .iter()
+            .position(|t| *t == mcp_section)
+            .expect("MCP catalog injected as tail user message");
+        assert!(
+            git_idx > hello_idx && mcp_idx > hello_idx,
+            "snapshot sections must come after persistent turn input"
+        );
+        // 4. turn 收尾后 session 不残留注入的快照消息(不持久化)。
+        let persisted: Vec<String> = runtime
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .map(|m| {
+                m.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        assert!(
+            !persisted.iter().any(|t| t == &git_section),
+            "git snapshot must not persist into session messages"
+        );
+        assert!(
+            !persisted.iter().any(|t| t == &mcp_section),
+            "MCP catalog must not persist into session messages"
+        );
     }
 
     /// 侦察护栏(2026-08-31):会话侦察类工具累计达阈值且 tracker 未创建时,

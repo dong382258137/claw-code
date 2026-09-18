@@ -970,11 +970,21 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
+/// 项目 git 快照段 heading。以此开头的 system section 会被
+/// `ConversationRuntime::new_with_features` 提取到 messages 尾部注入
+/// (见 conversation.rs `extract_message_injected_sections`),不进 system
+/// prompt —— git status 随任务执行漂移,留在 system 会打碎跨 turn 前缀缓存。
+pub const PROJECT_CONTEXT_HEADING: &str = "# Project context";
+
+/// MCP server 目录段 heading。同上 —— runtime 连接状态(connected/error)
+/// 在 CLI 每 turn 新进程时可能抖动,尾部注入保持 system 字节稳定。
+pub const MCP_CATALOG_HEADING: &str = "## MCP Servers";
+
 fn render_project_context(project_context: &ProjectContext) -> String {
     // A1/A2:日期与工作目录已由 `# Environment context` 提供(static 区,经
     // DynamicValueExtractor 占位符化 + `# Cache-aligned dynamic values` 映射段),
     // 此处不再重复注入,避免同值两处浪费 token 且扩大前缀。
-    let mut lines = vec!["# Project context".to_string()];
+    let mut lines = vec![PROJECT_CONTEXT_HEADING.to_string()];
     let mut bullets = Vec::new();
     if !project_context.instruction_files.is_empty() {
         bullets.push(format!(
@@ -1000,7 +1010,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     let rendered = lines.join("\n");
     // 防御:无任何内容(无 instruction 文件、无 git 信息)时返回空串,
     // 由调用方跳过注入,避免输出孤立的 `# Project context` 标题。
-    if rendered == "# Project context" {
+    if rendered == PROJECT_CONTEXT_HEADING {
         String::new()
     } else {
         rendered
@@ -1963,13 +1973,14 @@ pub fn render_mcp_catalog_section(catalog: &str) -> String {
         return String::new();
     }
     format!(
-        "## MCP Servers\n\
+        "{}\n\
          The following MCP servers are configured. Status reflects the last\n\
          known runtime connection state (connected / error / pending). Call\n\
          `ToolSearch` to enumerate tools, or `MCPTool` to invoke a tool by its\n\
          qualified name.\n\
          \n\
-         {trimmed}"
+         {trimmed}",
+        MCP_CATALOG_HEADING
     )
 }
 
