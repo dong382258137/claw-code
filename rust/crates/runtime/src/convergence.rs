@@ -714,16 +714,19 @@ pub fn project_one(outcome: ToolOutcome<'_>) -> Vec<SignalKind> {
 ///
 /// `first=true` 为软阈值 1(15K)首次提示;`false` 为软阈值 2(25K)二次
 /// 强调(已多次提示仍未收敛,要求解释)。
+///
+/// 站7(2026-09-19)瘦身:保留结构化协议字段(解析依赖),压缩说明性文字,
+/// soft1 由 567B → ~410B(-28%)、soft2 由 589B → ~430B(-27%)。协议段
+/// (goal/claimed_complete/evidence/conclusions/todos/can_stop)是解析
+/// 语义的事实现实来源,不可裁剪。
 #[must_use]
 pub fn convergence_prompt_text(first: bool) -> String {
     let header = if first {
-        "本 turn 已消耗较多 output 仍未见收敛声明。请在回复开头输出一次【收敛声明】\
-         (结构化格式),运行时将校验 evidence 是否真实存在于本会话 tool history,\
-         校验通过即视为可收敛收尾。"
+        "本 turn 输出已较高,请在回复开头输出一次【收敛声明】(下方格式);\
+         运行时校验 evidence 是否真实存在于本会话 tool history,通过即可收尾。"
     } else {
-        "已多次提示仍未收到可校验的收敛声明。若仍声称进行中,请在【收敛声明】中\
-         明确剩余 todos 与尚未获得的客观信号;若已可收尾,请按格式声明。\
-         不要用无证据的\"即将完成\"式文本继续推进。"
+        "仍未收到可校验的收敛声明。若进行中,请列出剩余 todos 与尚未获得的\
+         客观信号;可收尾则按格式声明。禁止用无证据的\"即将完成\"式文本推进。"
     };
     format!(
         "{header}\n\n[收敛声明]\ngoal: <任务目标一句话>\n\
@@ -731,8 +734,29 @@ pub fn convergence_prompt_text(first: bool) -> String {
          evidence: <支撑声称的客观信号,如 \"regression 11 passed, exit 0\">\n\
          conclusions: <≤5 条,- 列表>\ntodos: <未完成项,- 列表;空则 \"无\">\n\
          can_stop: true | false\n\n\
-         如实填写即可:仍需要继续调查时 claimed_complete 填 false 并说明剩余 todo,\
-         运行时不会因此强停。"
+         填写原则:未完成时 claimed_complete=false 并列出剩余 todo,\
+         不会因声明非 true 而强停。"
+    )
+}
+
+/// 成本警示 × 收敛契约合并注记(站7 合并去重)。
+///
+/// 收敛契约存续但 soft1 尚未注入且模型未响应时,把成本警示文本升格为
+/// 「报成本 + 收敛声明格式」一条合并注记 —— 两系统独立渲染会让"高 output
+/// 喊收敛"的同一意图同 turn 交替注入多条(基线实证:单 turn 最高 6 次成本
+/// 警示 + 6 次催缴),合并后一条完成两个职能。协议字段与
+/// [`convergence_prompt_text`] 一致,解析路径复用。
+#[must_use]
+pub fn merged_cost_warning(cost_warning: &str) -> String {
+    format!(
+        "{cost_warning}\n请输出一次【收敛声明】(下方格式),运行时将校验 \
+         evidence 是否真实存在于本会话 tool history,通过即可收尾:\n\
+         [收敛声明]\ngoal: <一句话>\n\
+         claimed_complete: true | false\n\
+         evidence: <客观信号,如 \"regression 11 passed, exit 0\">\n\
+         conclusions: <≤5 条>\ntodos: <未完成项;空则 \"无\">\n\
+         can_stop: true | false\n\
+         未完成时 claimed_complete=false 并列出剩余 todo,不会因声明非 true 而强停。"
     )
 }
 
@@ -899,7 +923,29 @@ mod convergence_p1_tests {
         assert!(first.contains("evidence"));
         assert!(first != second, "首提与二次强调提示应不同");
         // 两种提示都不含会诱导提前收尾的强制口吻(均声明运行时不强停)。
-        assert!(first.contains("不会因此强停"));
+        assert!(first.contains("不会因声明非 true 而强停"));
+    }
+
+    #[test]
+    fn merged_cost_warning_embeds_declaration_format() {
+        // 站7:成本警示 × 收敛契约合并注记 —— 保留成本原文前缀(测试与解析
+        // 均复用 "成本警示" 前缀),追加完整收敛声明格式(解析路径可复用),
+        // 未完成不诱导编造(明示 claimed_complete=false 不遭强停)。
+        let cost = "[runtime] 成本警示:本 turn output 已超 30000 tokens(高燃烧)。建议立即收敛:...";
+        let merged = merged_cost_warning(cost);
+        assert!(
+            merged.contains("[runtime] 成本警示"),
+            "成本原文前缀必须保留"
+        );
+        assert!(merged.contains("[收敛声明]"));
+        assert!(merged.contains("claimed_complete"));
+        assert!(merged.contains("evidence"));
+        assert!(merged.contains("can_stop"));
+        assert!(
+            merged.contains("不会因声明非 true 而强停"),
+            "不得诱导编造完成态"
+        );
+        assert!(merged.len() >= cost.len());
     }
 
     #[test]

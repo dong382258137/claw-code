@@ -3683,33 +3683,41 @@ where
         // > 成本警示=80 > 收敛soft1=70 > 侦察护栏=60 > 充分性=55 >
         // 成本提示=50 > 预算倒数=45。注记在工具批后触发时对下一迭代可见,
         // 在循环顶触发时对本迭代可见 —— 与改造前 push_message 语义一致。
+        // 站7(2026-09-19):`stage_note` 返回是否成功 —— 被高优先级压掉的
+        // 注记若携带 fire-once 语义(收敛 soft1/soft2、充分性),调用方应
+        // **回滚其注入标志**(仅成功才置位),否则该注记被占槽一次即永久
+        // 丢失(实证:soft1=70 被成本警示=80 抢占后从未注入过收敛声明)。
         let mut arbiter_note: Option<(u8, String)> = None;
-        macro_rules! arbiter_stage {
-            ($pri:expr, $hint:expr) => {{
-                let pri: u8 = $pri;
-                match &arbiter_note {
-                    Some((cur, _)) if *cur >= pri => {}
-                    _ => arbiter_note = Some((pri, $hint)),
+        /// stage 一条监管注记:槽位为空或本注记优先级更高时占槽并返回 `true`。
+        /// 返回 `false` 表示被槽内更高优先级注记压掉(调用方应回滚 fire-once 标志)。
+        fn stage_note(arbiter: &mut Option<(u8, String)>, pri: u8, hint: String) -> bool {
+            match arbiter {
+                Some((cur, _)) if *cur >= pri => false,
+                _ => {
+                    *arbiter = Some((pri, hint));
+                    true
                 }
-            }};
+            }
         }
 
         loop {
             iterations += 1;
             self.emit_diag(format!("[diag] loop_start iter={iterations}"));
+            // 站7:本迭代是否注入了"成本×收敛"合并警示(每迭代重置)。
+            // 收敛 soft2 据此让位,避免同轮连发两条收敛注记。
+            let mut warn_merged_this_iter = false;
             // 软阈值:达到时注入收敛警告,不中止。
             // 模型在下一轮迭代即可看到该消息,被引导总结已有发现或询问用户,
             // 避免"合法的长程分析仍在推进却被硬上限误杀"。仅在恰好的轮次
-            // 触发一次,注入失败静默吞错(不阻断主流程)。
+            // 触发一次;走仲裁槽(pri 45)而非直推 —— 循环顶槽位为空必达,
+            // 与直推语义等价,但不再存在"绕过 F1 单动作原则"的旁路通道。
             if iterations == turn_soft_max {
                 let warning = format!(
                     "[runtime] 已运行 {} 次迭代仍未收敛。若已接近结论,请总结 \
                      已有发现并输出最终答案;否则请改变策略或询问用户方向。",
                     turn_soft_max
                 );
-                let _ = self
-                    .session
-                    .push_message(ConversationMessage::user_text(warning));
+                let _ = stage_note(&mut arbiter_note, 45, warning);
             }
 
             // 侦察护栏(2026-08-31):长程任务防侦察过度 + 强制调查成果落盘。
@@ -3749,19 +3757,12 @@ where
                         });
                     let open_items = self.tracker_open_item_count();
                     let hint = format!(
-                        "[runtime] 你已进行 {survey_count} 次代码侦察,但单会话任务跟踪 \
-                         文档尚未创建或近期未更新。请立即:\n\
-                         1. 用 write_file 创建/更新 `{tracker_path}`,记录:\n\
-                            - 任务目标\n\
-                            - 已确认的调查发现(每项含文件路径与结论)\n\
-                            - 计划步骤与当前进度(每个 `- [ ]` 待办闭环时打勾并锚定证据:文件路径:行号 或 工具结果引用)\n\
-                         2. 调用 `create_plan` 建立分阶段执行计划,然后按计划执行。\n\
-                         跟踪文档与会话绑定、落盘持久,上下文压缩后不丢失;持续更新 \
-                         可防止重复调查同一区域。\n\
-                         当前 tracker 未闭环待办: {open_items} 项 —— 未打勾的待办 \
-                         不计入收敛,请优先闭环或明确放弃。"
+                        "[runtime] 已进行 {survey_count} 次代码侦察,但任务跟踪文档尚未创建或近期未更新。请立即:\n\
+                         1. 用 write_file 创建/更新 `{tracker_path}`,记录任务目标、已确认发现(文件+结论)、计划进度(每个 `- [ ]` 闭环时锚定证据 文件:行号);\n\
+                         2. 调用 `create_plan` 建立分阶段计划,按计划执行(文档落盘、跨压缩不丢,持续更新防重复调查)。\n\
+                         当前未闭环待办 {open_items} 项 —— 未打勾不计收敛,请优先闭环或明确放弃。"
                     );
-                    arbiter_stage!(60, hint);
+                    stage_note(&mut arbiter_note, 60, hint);
                 }
             }
 
@@ -3808,7 +3809,7 @@ where
                              当前 tracker 仍有 {open_items} 个未闭环待办项。\
                              若后续仍持续只读侦察,本 turn 将被强制中止。"
                         );
-                        arbiter_stage!(85, hint);
+                        stage_note(&mut arbiter_note, 85, hint);
                     } else if self.last_assistant_rounds_only_survey(SURVEY_STALL_LIMIT) {
                         survey_stall_rounds += 1;
                         if survey_stall_rounds >= SURVEY_STALL_LIMIT {
@@ -3835,7 +3836,7 @@ where
                          请优先用已确认证据收敛结论:把 `- [ ]` 待办闭环进 tracker(锚定证据),\
                          或改变策略/询问用户方向。当前 tracker 未闭环 {open_items} 项。"
                     );
-                    arbiter_stage!(45, hint);
+                    stage_note(&mut arbiter_note, 45, hint);
                 }
             }
 
@@ -5298,9 +5299,13 @@ where
                 && self.sufficiency_contract.is_declared()
                 && self.sufficiency_contract.is_contract_satisfied()
             {
-                sufficiency_notice_injected = true;
+                // 站7:仅 stage 成功才置 fire-once 标志 —— 被更高优先级
+                // (成本警示 80 / 收敛 70+)抢占时回滚,下轮空槽仍有机会注入,
+                // 修复"占槽一次即永久丢失"缺陷。
                 let hint = "[runtime] 已声明的充分性判据已满足(声明源均已读取),请基于现有信息直接作答,不要再发起新的只读侦察。";
-                arbiter_stage!(55, hint.to_string());
+                if stage_note(&mut arbiter_note, 55, hint.to_string()) {
+                    sufficiency_notice_injected = true;
+                }
             }
 
             // P2(成本反馈注记 · Task 5):本迭代工具批处理结束 → 评估成本累计,
@@ -5314,7 +5319,27 @@ where
                 if note.contains("成本警示") {
                     // 警示(≥20K 高燃烧):强收口最后防线,注入 user 消息对模型
                     // 可见(下一轮请求前逼停收敛 —— dl-19 的收敛机制)。
-                    arbiter_stage!(80, note);
+                    //
+                    // 站7:成本警示 × 收敛契约合并去重 —— 两者都是"高 output
+                    // 喊收敛"的同一意图,独立渲染会同 turn 交替注入(基线实证:
+                    // 高输出 turn 6 次成本警示 + 6 次收敛催缴轮流出场,单条都
+                    // 各自完整,信息重叠)。收敛契约存续、模型未响应且 soft1
+                    // 尚未注入时,把警示文本升格为「成本 + 收敛声明」合并注记
+                    // (一条完成报成本+给声明格式两个职能,替代即将独立注入的
+                    // soft1),置 soft1 注入标志防后续重复。soft1 已注入后,警示
+                    // 恢复纯成本文本,收敛渐进交给 soft2(90 优先)正常推进。
+                    let note = if crate::convergence::convergence_enabled()
+                        && turn_tier != TriageTier::Trivial
+                        && !convergence_acknowledged
+                        && !convergence_soft1_injected
+                    {
+                        convergence_soft1_injected = true;
+                        warn_merged_this_iter = true;
+                        crate::convergence::merged_cost_warning(&note)
+                    } else {
+                        note
+                    };
+                    stage_note(&mut arbiter_note, 80, note);
                 } else {
                     // 普通提示(≥5K):改走面板/日志(diag_callback),不进模型
                     // 上下文 —— 成本反馈对任务零信息量,注入只会牵引注意力、
@@ -5339,17 +5364,27 @@ where
                     && !convergence_soft1_injected
                     && turn_output >= crate::convergence::CONVERGENCE_SOFT1_OUTPUT
                 {
-                    convergence_soft1_injected = true;
+                    // 站7:仅 stage 成功才置 fire-once 标志 —— 修复 soft1(70)
+                    // 被更高优先级(如成本警示 80)抢占后 `claimed` 已置位、
+                    // 后续轮次永不注入的缺陷。抢占时回滚,下轮空槽再试。
                     let hint = crate::convergence::convergence_prompt_text(true);
-                    arbiter_stage!(70, hint);
+                    if stage_note(&mut arbiter_note, 70, hint) {
+                        convergence_soft1_injected = true;
+                    }
                 } else if !convergence_acknowledged
                     && convergence_soft1_injected
                     && !convergence_soft2_injected
+                    && !warn_merged_this_iter
                     && turn_output >= crate::convergence::CONVERGENCE_SOFT2_OUTPUT
                 {
-                    convergence_soft2_injected = true;
+                    // 站7:同轮内 merged warn 已表达收敛要求(soft1 语义注入),
+                    // soft2 让位下一迭代 —— 避免"输出跳变至 25K+"时同轮连发
+                    // merged warn(80)与 soft2(90,文案言"已多次提示"但模型其实
+                    // 一条都没见过)两条收敛注记,破坏渐进语义。
                     let hint = crate::convergence::convergence_prompt_text(false);
-                    arbiter_stage!(90, hint);
+                    if stage_note(&mut arbiter_note, 90, hint) {
+                        convergence_soft2_injected = true;
+                    }
                 }
             }
 
@@ -11893,7 +11928,7 @@ mod tests {
         assert!(
             all_texts
                 .iter()
-                .any(|t| t.contains("[runtime] 你已进行") && t.contains("trackers")),
+                .any(|t| t.contains("[runtime] 已进行") && t.contains("trackers")),
             "survey guard must inject tracker reminder after {SURVEY_GUARD_THRESHOLD} surveys, got: {all_texts:?}"
         );
         assert!(
@@ -12537,6 +12572,141 @@ mod tests {
             count_text_msgs(&requests[0], "成本提示") + count_text_msgs(&requests[0], "成本警示"),
             0,
             "首轮请求构造前不应有成本注记"
+        );
+    }
+
+    /// 站7:成本警示 × 收敛契约合并去重 —— 输出跳变场景(一次迭代 output
+    /// 直达 30K,soft1(15K) 从未独立触发)。要求:
+    /// - 成本警示升格为「成本 + 收敛声明」合并注记(一条同含两个职能);
+    /// - 同轮不再追加 soft2(90 文案"可校验的收敛声明"让位下一迭代),
+    ///   避免"输出跳变后同轮连发两条收敛注记、且 soft2 言'已多次提示'
+    ///   而模型实际一条未见过"的失实渐进;
+    /// - 独立 soft1 文案("本 turn 输出已较高")不重复出现(被合并注记取代)。
+    #[test]
+    fn station7_cost_warning_merges_convergence_on_output_jump() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
+        let diag_captured = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        struct JumpApi {
+            calls: AtomicUsize,
+            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+        }
+        impl ApiClient for JumpApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.captured
+                    .lock()
+                    .expect("lock")
+                    .push(request.messages.clone());
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    // 迭代 1:单次 30K output(跳变越过 soft1=15K)→ 应触发合并警示。
+                    0 => Ok(vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 30_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::TextDelta("先读取材料。".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "j-a".to_string(),
+                            name: "read_file".to_string(),
+                            input: r#"{"file_path":"a.md"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // 迭代 2:收尾(无收敛声明,未 ack → 触发路径全走仲裁)。
+                    _ => Ok(vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 1_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::TextDelta("已基于材料作答。".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
+        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
+        std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV);
+        // 显式启用收敛契约,避免 CI 残留 env 停用之。
+        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
+        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
+
+        let diag_log: Arc<Mutex<Vec<String>>> = diag_captured.clone();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            JumpApi {
+                calls: AtomicUsize::new(0),
+                captured: captured.clone(),
+            },
+            StaticToolExecutor::new().register("read_file", |_| Ok("材料内容".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_diag_callback(Box::new(move |msg| {
+            diag_log.lock().expect("diag lock").push(msg);
+        }));
+
+        runtime
+            .run_turn("请查证后回答", None)
+            .expect("turn should succeed");
+
+        match saved_warn_env {
+            Some(value) => {
+                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
+            }
+            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+        match saved_convergence_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
+        }
+
+        let requests = captured.lock().expect("lock");
+        assert!(requests.len() >= 2, "至少 2 次请求, got {}", requests.len());
+
+        let count_text_msgs = |msgs: &[ConversationMessage], needle: &str| -> usize {
+            msgs.iter()
+                .filter(|m| {
+                    m.blocks.iter().any(|b| match b {
+                        ContentBlock::Text { text } => text.contains(needle),
+                        _ => false,
+                    })
+                })
+                .count()
+        };
+
+        // 第二次请求(工具批处理后):同步含"成本警示"与"[收敛声明]"格式段
+        // —— 合并注记一条完成报成本+催收敛两个职能。
+        let second = &requests[1];
+        assert_eq!(
+            count_text_msgs(second, "[收敛声明]"),
+            1,
+            "jump 场景收敛要求应恰好一条(合并注记), got: {second:?}"
+        );
+        assert!(
+            count_text_msgs(second, "成本警示") >= 1,
+            "合并注记必须保留成本警示前缀, got: {second:?}"
+        );
+        // 同轮互斥:soft2(文案"可校验的收敛声明")让位下一迭代,不得与本轮
+        // 合并警示连发;独立 soft1("本 turn 输出已较高")也不再出现(被取代)。
+        assert_eq!(
+            count_text_msgs(second, "可校验的收敛声明"),
+            0,
+            "soft2 不应与合并警示同轮连发, got: {second:?}"
+        );
+        assert_eq!(
+            count_text_msgs(second, "本 turn 输出已较高"),
+            0,
+            "soft1 文案不应重复出现(合并注记已含其语义), got: {second:?}"
         );
     }
 
@@ -20695,7 +20865,7 @@ mod tests {
         let trivial_has_reminder = requests[0].messages.iter().any(|m| {
             m.blocks
                 .iter()
-                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("你已进行")))
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("已进行")))
         });
         assert!(
             !trivial_has_reminder,
@@ -20729,7 +20899,7 @@ mod tests {
         let standard_has_reminder = requests2[0].messages.iter().any(|m| {
             m.blocks
                 .iter()
-                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("你已进行")))
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("已进行")))
         });
         assert!(
             standard_has_reminder,
