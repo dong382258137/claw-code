@@ -785,7 +785,20 @@ where
                 // P0:归档原始 output 到 ToolResultArchive,再替换为摘要。
                 archiver(tool_use_id, tool_name, output);
                 let input = input_by_id.get(tool_use_id.as_str()).copied().unwrap_or("");
-                *output = format_tool_result_summary(tool_name, tool_use_id, input, output);
+                // 站2/8(2026-09-19 上下文缩水修复):bash/read_file 的 JSON
+                // 信封先解包内容字段做内容感知压缩(Log/Text/Code/...),避免
+                // 信封走 JSON 压缩器把 stdout/stderr/content 截断到 80 字符
+                // 导致模型重复查询(实测 373 占位符 / 0 recall / 2061 重查)。
+                // 非信封工具回退原逻辑。
+                *output = crate::content_compression::summarize_envelope_content(
+                    tool_name,
+                    tool_use_id,
+                    input,
+                    output,
+                )
+                .unwrap_or_else(|| {
+                    format_tool_result_summary(tool_name, tool_use_id, input, output)
+                });
             }
             new_message
         })
@@ -2525,35 +2538,27 @@ second para",
 
     /// P1:format_tool_result_summary 从"只保留第一行"改为"保留前 N 行 + 行数信息"。
     ///
-    /// 验证多行 Read 结果的摘要包含前 3 行 + 总行数提示,
-    /// 而非旧格式只包含第一行。
+    /// 站2/8(2026-09-19 上下文缩水修复)更新:≤5 行且总长 ≤240 字符的短输出
+    /// 全量保留(小输出截断无收益,反而丢失精确内容导致模型重复查询);
+    /// 多行长输出才做头尾双预览。
     #[test]
     fn format_tool_result_summary_preserves_multiple_lines() {
         let multi_line_output = "line1: file header\nline2: import statement\nline3: function start\nline4: function body\nline5: function end";
         let summary = format_tool_result_summary("Read", "call_test1", "", multi_line_output);
 
-        // 应包含前 3 行(不是只第一行)
+        // 5 行短输出全量保留(新语义:≤5 行不截断)。
         assert!(
             summary.contains("line1: file header"),
             "summary should contain line1: {summary}"
         );
         assert!(
-            summary.contains("line2: import statement"),
-            "P1: summary should contain line2 (multi-line preview): {summary}"
+            summary.contains("line5: function end"),
+            "站2/8: 尾部行应全量保留: {summary}"
         );
+        // 短输出不再显示总行数提示。
         assert!(
-            summary.contains("line3: function start"),
-            "P1: summary should contain line3 (multi-line preview): {summary}"
-        );
-        // 第 4、5 行不应在 preview 中(只保留前 3 行)
-        assert!(
-            !summary.contains("line4: function body"),
-            "summary should not contain line4 (beyond MAX_PREVIEW_LINES=3): {summary}"
-        );
-        // 应包含总行数提示(5 lines total)
-        assert!(
-            summary.contains("5 lines total"),
-            "P1: summary should include total line count: {summary}"
+            !summary.contains("lines total"),
+            "短输出应全量保留、不显示省略行数: {summary}"
         );
         // 应包含原字符数
         assert!(

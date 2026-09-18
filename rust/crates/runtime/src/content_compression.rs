@@ -53,6 +53,56 @@ pub fn format_summary(tool_name: &str, tool_use_id: &str, input: &str, output: &
     }
 }
 
+/// microcompact 专用信封解包:对 bash / read_file 的 JSON 信封,取内容字段
+/// (stdout+stderr / file.content)做内容感知压缩,而非对信封本身走 JSON
+/// 压缩器。
+///
+/// 站2/8(2026-09-19 上下文缩水根因):microcompact 的历史输出压缩把整个
+/// `BashCommandOutput`/`ReadFileOutput` JSON 信封交给 `classify` → JSON
+/// 压缩器,stdout/stderr/content 这类长字符串叶子被截断到
+/// [`MAX_STRING_VALUE_CHARS`] 字符,信息几乎全丢 —— 模型只能看到
+/// `{"stdout": "前80字符…", ...}` 占位符,既不知结果又不调用 `recall_full`
+/// (实测 0 次),只能重新执行命令(实测 2061 次重复查询)。
+///
+/// 本函数对内容字段直接走内容感知路由(Log→ERROR/WARN+尾部、Text→头尾
+/// 双预览、Code→签名、JSON/Tabular→结构),与即时压缩路径同构。
+/// 返回 `None` 表示非 bash/read 信封或解包失败,调用方回退原压缩逻辑。
+#[must_use]
+pub fn summarize_envelope_content(
+    tool_name: &str,
+    tool_use_id: &str,
+    input: &str,
+    output: &str,
+) -> Option<String> {
+    let is_bash = tool_name.eq_ignore_ascii_case("bash");
+    let is_read =
+        tool_name.eq_ignore_ascii_case("read_file") || tool_name.eq_ignore_ascii_case("Read");
+    if !is_bash && !is_read {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(output).ok()?;
+    let content = if is_bash {
+        let stdout = value.get("stdout").and_then(Value::as_str).unwrap_or("");
+        let stderr = value.get("stderr").and_then(Value::as_str).unwrap_or("");
+        if stderr.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("{stdout}\n{stderr}")
+        }
+    } else {
+        value
+            .get("file")?
+            .get("content")
+            .and_then(Value::as_str)?
+            .to_string()
+    };
+    // 空/超短内容不摘要(无收益,保留原文)。
+    if content.trim().is_empty() {
+        return None;
+    }
+    Some(format_summary(tool_name, tool_use_id, input, &content))
+}
+
 /// 从 tool_use 入参 JSON 中提取可读提示(截断到 48 字符)。
 ///
 /// 优先取常见命令/查询字段的值(pattern/command/query/path/glob),
@@ -455,23 +505,48 @@ fn is_likely_header(line: &str) -> bool {
 /// 这是原 `format_tool_result_summary` 的逻辑,保留作为兜底。
 /// 输出格式与原格式兼容(以 `[` 开头,`…]` 结尾),但 content_type 标记为 `Text`
 /// 以便 `is_already_summarized` 识别新格式。
+///
+/// 站2/8(2026-09-19 上下文缩水修复):Text 输出(ls/echo/python 脚本等 bash
+/// 输出)的关键信息通常在**尾部**(结果/统计/最后一行),原实现只保留前 3 行,
+/// 模型无法从占位符获知结果只能重新执行命令(实测 session-1788260574430:
+/// 373 个 bash 摘要占位符 + 0 次 recall_full + 2061 次重复查询)。改为
+/// 头尾双预览:前 2 行 + 尾部 3 行(总长 240 chars 内),与 Log 压缩器
+/// 的尾部保留语义对齐。
 #[must_use]
 pub fn format_text_summary(tool_name: &str, tool_use_id: &str, output: &str) -> String {
     let original_len = output.chars().count();
     let total_lines = output.lines().count();
 
-    const MAX_PREVIEW_LINES: usize = 3;
+    const MAX_HEAD_LINES: usize = 2;
+    const MAX_TAIL_LINES: usize = 3;
     const MAX_PREVIEW_CHARS: usize = 240;
 
-    let preview_lines: Vec<&str> = output.lines().take(MAX_PREVIEW_LINES).collect();
-    let mut preview = preview_lines.join("\n");
+    let lines: Vec<&str> = output.lines().collect();
+    let preview = if lines.len() <= MAX_HEAD_LINES + MAX_TAIL_LINES
+        && output.chars().count() <= MAX_PREVIEW_CHARS
+    {
+        // 行数少且总长短:全量保留(小输出截断无收益)。
+        lines.join("\n")
+    } else if lines.len() <= MAX_HEAD_LINES + MAX_TAIL_LINES {
+        // 行数少但单行超长:截断到预算。
+        head_trimmed(&lines.join("\n"), MAX_PREVIEW_CHARS)
+    } else {
+        // 头尾双预览:头部(命令/上下文) + 尾部(结果,通常承载关键信息)。
+        let head = lines[..MAX_HEAD_LINES].join("\n");
+        let tail = lines[lines.len() - MAX_TAIL_LINES..].join("\n");
+        let omitted = lines.len() - MAX_HEAD_LINES - MAX_TAIL_LINES;
+        // 预算内优先保尾部(关键结果),头部截断。
+        let tail_budget = tail.chars().count().min(MAX_PREVIEW_CHARS / 2);
+        let head_budget = MAX_PREVIEW_CHARS.saturating_sub(tail_budget + 8);
+        let tail_trimmed: String = tail.chars().take(tail_budget).collect();
+        format!(
+            "{}\n… {omitted} lines omitted …\n{}",
+            head_trimmed(&head, head_budget),
+            tail_trimmed
+        )
+    };
 
-    if preview.chars().count() > MAX_PREVIEW_CHARS {
-        let truncated: String = preview.chars().take(MAX_PREVIEW_CHARS).collect();
-        preview = format!("{truncated}…");
-    }
-
-    let line_info = if total_lines > MAX_PREVIEW_LINES {
+    let line_info = if total_lines > MAX_HEAD_LINES + MAX_TAIL_LINES {
         format!(" ({total_lines} lines total)")
     } else {
         String::new()
@@ -480,6 +555,16 @@ pub fn format_text_summary(tool_name: &str, tool_use_id: &str, output: &str) -> 
     format!(
         "[{tool_name} Text summarized: {original_len} chars → {preview}{line_info}… use recall_full with tool_use_id={tool_use_id} to retrieve full output…]"
     )
+}
+
+/// 截断后的头部预览(不超过 `budget` 字符)。
+fn head_trimmed(head: &str, budget: usize) -> String {
+    let head = head.trim_end();
+    if head.chars().count() <= budget {
+        head.to_string()
+    } else {
+        format!("{}…", head.chars().take(budget).collect::<String>())
+    }
 }
 
 // ============================================================================
@@ -1035,16 +1120,32 @@ mod tests {
     // ---- Text 压缩器测试 ----
 
     #[test]
-    fn text_summary_preserves_first_three_lines() {
+    fn text_summary_preserves_short_output_verbatim() {
+        // 站2/8:≤5 行且总长 ≤240 字符的短输出全量保留,不截断。
         let input = "line one\nline two\nline three\nline four\nline five\n";
         let result = format_text_summary("Read", "call_a", input);
         assert!(result.starts_with("[Read Text summarized:"));
         assert!(result.contains("line one"));
-        assert!(result.contains("line two"));
-        assert!(result.contains("line three"));
-        assert!(!result.contains("line four"));
-        assert!(result.contains("(5 lines total)"));
+        assert!(result.contains("line five"));
+        assert!(!result.contains("lines total"));
         assert!(result.contains("use recall_full with tool_use_id=call_a"));
+    }
+
+    #[test]
+    fn text_summary_keeps_tail_for_long_multi_line_output() {
+        // 站2/8:多行长输出保留尾部(关键结果在末尾),头部截断,中间标注省略。
+        let mut input = String::new();
+        for i in 0..20 {
+            input.push_str(&format!("line {i:02}\n"));
+        }
+        let result = format_text_summary("Read", "call_tail", &input);
+        assert!(result.contains("(20 lines total)"));
+        // 尾部行(结果)必须保留。
+        assert!(result.contains("line 19"), "尾部结果行必须保留");
+        assert!(result.contains("lines omitted"), "应标注省略行数");
+        // 头部仅保留前 2 行。
+        assert!(result.contains("line 00"));
+        assert!(!result.contains("line 05"), "中间行不应出现在预览");
     }
 
     #[test]
@@ -1565,5 +1666,72 @@ mod tests {
             maybe_immediate_compress("call_l2", "bash", r#"{"command":"ls -l"}"#, &output, false);
         assert!(!archive, "非日志内容 6KB-12KB 应保留原文(维持 12KB 阈值)");
         assert_eq!(out, output);
+    }
+
+    // ---- 信封解包测试(站2/8 microcompact 上下文缩水修复)----
+
+    #[test]
+    fn envelope_bash_stdout_summarized_by_content() {
+        // 大 bash stdout:信封解包后按内容类型压缩(Tabular/Text/Log),而非对
+        // 信封走 JSON 压缩器(旧路径会把 stdout 截断到 80 字符,信息几乎全丢)。
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..200 {
+            lines.push(format!("item-{i:03} | value-{i}"));
+        }
+        lines.push("total: 200 items".to_string());
+        let stdout = lines.join("\n");
+        let output = serde_json::json!({ "stdout": stdout, "stderr": "" }).to_string();
+        let summary =
+            summarize_envelope_content("bash", "call_env1", r#"{"command":"ls"}"#, &output)
+                .expect("bash 信封应可解包压缩");
+        // 内容感知路由生效(Tabular/Text 均可),而非 JSON 信封压缩。
+        assert!(
+            summary.contains("Tabular summarized") || summary.contains("Text summarized"),
+            "stdout 应按内容类型压缩: {summary}"
+        );
+        assert!(
+            !summary.contains("{\"stdout\""),
+            "不得残留 JSON 信封截断: {summary}"
+        );
+        assert!(summary.contains("recall_full"));
+    }
+
+    #[test]
+    fn envelope_read_content_code_summarized() {
+        // 大代码文件 content:解包后走 Code 压缩(保留签名),而非 JSON 信封截断。
+        let mut code: Vec<String> = vec!["//! docs".to_string(), "pub fn anchor() {}".to_string()];
+        for i in 0..500 {
+            code.push(format!("pub fn func_{i}(x: i32) -> i32 {{ x + {i} }}"));
+        }
+        let content = code.join("\n");
+        let output = serde_json::json!({
+            "type": "text",
+            "file": { "filePath": "src/main.rs", "content": content }
+        })
+        .to_string();
+        let summary = summarize_envelope_content(
+            "read_file",
+            "call_env2",
+            r#"{"path":"src/main.rs"}"#,
+            &output,
+        )
+        .expect("read_file 信封应可解包压缩");
+        assert!(
+            summary.contains("Code summarized"),
+            "代码应按 Code 压缩: {summary}"
+        );
+        assert!(
+            summary.contains("pub fn func_0"),
+            "函数签名应保留: {summary}"
+        );
+        assert!(summary.contains("recall_full"));
+    }
+
+    #[test]
+    fn envelope_non_envelope_returns_none() {
+        // 非 bash/read 工具(如 grep_search 已是结构输出)不解包,回退原逻辑。
+        assert!(summarize_envelope_content("grep_search", "call_env3", "{}", "{}").is_none());
+        // 非 JSON 信封(纯文本 output)返回 None。
+        assert!(summarize_envelope_content("bash", "call_env4", "{}", "plain text").is_none());
     }
 }
