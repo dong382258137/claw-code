@@ -3240,6 +3240,16 @@ fn append_post_write_checks(
     let mut output = json_out;
     // 门禁提示优先(软警告):即使本次诊断通过,若曾在窗口内失败也提醒先 read。
     let gate_warning = check_edit_gate(gate_path);
+    // 站6(2026-09-19 工具延迟):同文件冷却窗口内跳过写后子进程诊断
+    // (cargo check / LSP / py_compile),且**不追加任何提示文本** —— 工具
+    // 输出契约是"JSON + 可选诊断附加",cooldown 命中时保持纯 JSON(测试
+    // 与调用方按 `from_str(&output)` 解析;模型连续编辑同一文件时,中间态
+    // 诊断本就是噪声)。模型连续编辑 666 次中 415 次(62%)可省 —— 实测
+    // 基线 edit_file med=2.4s total=12.6min。窗口命中不重置计时:停顿超
+    // 窗口后的下一次写自然重新诊断(末态兜底)。
+    if within_diag_cooldown(file_path, DIAG_COOLDOWN_MS) {
+        return (output, gate_warning);
+    }
     let mut failure = false;
     if let Some(check_output) = run_cargo_check_for_file(file_path) {
         output.push_str("\n\n--- cargo check ---\n");
@@ -3255,6 +3265,7 @@ fn append_post_write_checks(
             failure = true;
         }
     }
+    mark_diag_done(file_path);
     if let Some(ref w) = gate_warning {
         output.push_str("\n\n");
         output.push_str(w);
@@ -3263,6 +3274,39 @@ fn append_post_write_checks(
         set_edit_gate(gate_path);
     }
     (output, gate_warning.or(failure.then(String::new)))
+}
+
+/// 站6:写后诊断冷却窗口时长(毫秒)。同一文件在此窗口内被重复编辑时,
+/// 跳过中间态的子进程诊断。
+const DIAG_COOLDOWN_MS: u128 = 3_000;
+
+/// 站6:写后诊断冷却表(进程内存,路径 → 最近一次实际诊断时刻)。
+fn diag_cooldown_map() -> &'static Mutex<HashMap<PathBuf, Instant>> {
+    static COOLDOWN: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 判定 `file_path` 是否处于写后诊断的冷却窗口内。
+///
+/// 命中返回 `true`(调用方跳过诊断并保持纯 JSON 输出);窗口外返回 `false`。
+/// 命中时不更新计时 —— 冷却窗口只从最近一次**实际诊断**起算,模型停顿
+/// 超过窗口后的下一次写必然重新触发诊断,覆盖"末态必检"语义。
+fn within_diag_cooldown(file_path: &Path, window_ms: u128) -> bool {
+    let key = norm_to_path(file_path);
+    let Ok(guard) = diag_cooldown_map().lock() else {
+        return false;
+    };
+    guard
+        .get(&key)
+        .map(|last| last.elapsed().as_millis() < window_ms)
+        .unwrap_or(false)
+}
+
+/// 记录一次已完成的写后诊断(重置该文件的冷却窗口起点)。
+fn mark_diag_done(file_path: &Path) {
+    if let Ok(mut guard) = diag_cooldown_map().lock() {
+        guard.insert(norm_to_path(file_path), Instant::now());
+    }
 }
 
 /// 文件扩展名 → LSP 语言标识（与 `LspRegistry::dispatch` 的语言映射保持一致）。
@@ -3467,6 +3511,109 @@ mod lsp_auto_diagnostics_tests {
         let text = out.unwrap();
         assert!(text.contains("issue(s)"), "诊断块应包含问题数,got: {text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod diag_cooldown_tests {
+    use super::tests::{env_lock, temp_path};
+    use super::{execute_tool, mark_diag_done, within_diag_cooldown};
+    use serde_json::json;
+    use std::fs;
+    use std::path::Path;
+
+    fn unique_path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        format!(r"{}:{}:{}", std::env::temp_dir().display(), tag, nanos)
+    }
+
+    /// 站6:同一路径在窗口内再诊断 → 跳过(true);窗口外(0ms 窗口恒过期)-> false。
+    #[test]
+    fn cooldown_skips_rapid_repeat_and_expires() {
+        let p = unique_path("cooldown-a");
+        // 首次无记录 → 不跳过(false),随后标记诊断完成。
+        assert!(!within_diag_cooldown(Path::new(&p), 10_000));
+        mark_diag_done(Path::new(&p));
+        // 刚诊断过 → 窗口(10s)内命中冷却。
+        assert!(within_diag_cooldown(Path::new(&p), 10_000));
+        // 0ms 窗口:elapsed < 0 恒假 → 视为窗口过期,允许诊断。
+        assert!(
+            !within_diag_cooldown(Path::new(&p), 0),
+            "0ms 窗口应恒过期(不跳过)"
+        );
+    }
+
+    /// 站6:不同路径互不影响冷却表条目。
+    #[test]
+    fn cooldown_is_per_path() {
+        let a = unique_path("cooldown-x");
+        let b = unique_path("cooldown-y");
+        mark_diag_done(Path::new(&a));
+        assert!(within_diag_cooldown(Path::new(&a), 10_000));
+        assert!(
+            !within_diag_cooldown(Path::new(&b), 10_000),
+            "未诊断过的文件不应命中冷却窗口"
+        );
+    }
+
+    /// 站6:路径规范化(verbatim 前缀 / 分隔符)不影响冷却命中 —— 写盘返回的
+    /// 是绝对路径(可能带 \\?\),工具输入是原始路径,二者必须是同一 key。
+    #[test]
+    fn cooldown_normalizes_verbatim_paths() {
+        // 模拟 edit_file 绝对路径(Windows 常带 \\?\ 前缀与反斜杠分隔)。
+        let verbatim = format!(r"\\?\{}\cooldown-norm.rs", std::env::temp_dir().display());
+        // norm_to_path 统一为 "/" 分隔且剥离 \\?\ 前缀 —— 两种写法应命中同一 key。
+        mark_diag_done(Path::new(&format!(
+            r"{}\cooldown-norm.rs",
+            std::env::temp_dir().display()
+        )));
+        assert!(
+            within_diag_cooldown(Path::new(&verbatim), 10_000),
+            "\\?\\ 前缀 + 反斜杠写法应命中同一冷却条目"
+        );
+    }
+
+    /// 站6:同文件连续编辑触发冷却 —— 第一次 edit_file 附带写后诊断
+    /// (cargo check 附加块),3s 内第二次命中冷却窗口 → 输出保持纯 JSON
+    /// (无诊断附加),不破坏 JSON 输出契约。
+    #[test]
+    fn consecutive_edits_hit_cooldown_keep_json_pure() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("cooldown-e2e");
+        fs::create_dir_all(&root).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+        fs::write(root.join("demo.rs"), "fn main() {}\n").expect("seed rs file");
+
+        let first = execute_tool(
+            "edit_file",
+            &json!({ "path": "demo.rs", "old_string": "fn main() {}", "new_string": "fn main() { println!(\"a\"); }" }),
+        )
+        .expect("first edit should succeed");
+        // 第一次:非冷却命中 → 可能附加 cargo check(若有 cargo 环境);至少 JSON 前缀可解析。
+        assert!(
+            first.starts_with('{'),
+            "first edit should be JSON-headed: {first}"
+        );
+
+        let second = execute_tool(
+            "edit_file",
+            &json!({ "path": "demo.rs", "old_string": "println!", "new_string": "eprintln!" }),
+        )
+        .expect("second edit should succeed");
+        // 第二次:同一文件 3s 窗口内 → 冷却命中,输出必须仍是**纯 JSON**(无附加文本),
+        // 保证 serde 可整体解析 —— 这是工具输出契约。
+        let parsed: serde_json::Value =
+            serde_json::from_str(&second).expect("cooldown-hit output must stay pure JSON");
+        assert_eq!(parsed["replaceAll"], false);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -9623,7 +9770,7 @@ mod tests {
         Path::new(path).ends_with(Path::new(suffix))
     }
 
-    fn env_lock() -> &'static Mutex<()> {
+    pub(super) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -9952,7 +10099,7 @@ mod tests {
         );
     }
 
-    fn temp_path(name: &str) -> PathBuf {
+    pub(super) fn temp_path(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
