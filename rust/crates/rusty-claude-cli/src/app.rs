@@ -3467,6 +3467,26 @@ fn build_api_client(
             web_bridge::deepseek_web::DeepseekWebClient::new(auth),
         ))));
     }
+    // 混合分工:主后端为 API(Anthropic)时,若本机已登录网页凭证,自动包一层
+    // RoutingApiClient——把 Trivial 纯推理回合(含分诊)路由到网页零 token,
+    // Standard/子智能体回合仍走 API 原生工具。无凭证则退回纯 API(原行为)。
+    if let Ok(auth) = web_bridge::web_session::WebAuth::load() {
+        let api = Box::new(AnthropicRuntimeClient::new(
+            session_id,
+            model.to_string(),
+            enable_tools,
+            emit_output,
+            allowed_tools,
+            tool_registry,
+            progress_reporter,
+        )?);
+        let web = Box::new(web_bridge::WebApiClient::new(Box::new(
+            web_bridge::deepseek_web::DeepseekWebClient::new(auth),
+        )));
+        return Ok(Box::new(web_bridge::routing::RoutingApiClient::new(
+            api, web,
+        )));
+    }
     Ok(Box::new(AnthropicRuntimeClient::new(
         session_id,
         model.to_string(),
