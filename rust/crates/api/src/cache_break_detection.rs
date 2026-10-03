@@ -30,7 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{MessageRequest, SystemContent, Usage};
+use crate::types::{InputContentBlock, MessageRequest, SystemContent, Usage};
 
 const DEFAULT_PROMPT_TTL_SECS: u64 = 5 * 60;
 const DEFAULT_BREAK_MIN_DROP: u32 = 2_000;
@@ -345,6 +345,461 @@ impl CacheBreakDetector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+// ===========================================================================
+// 请求分歧探针(Request Divergence Probe)
+// ===========================================================================
+// 目的:在 wire 层(`MessageRequest`,即发给上游的真实请求体)记录消息级/块级
+// 指纹,做两件事:
+//   1. 定位"首个分叉单元"——上一请求与本请求在 [system 块 / tools / 第 N 条
+//      消息] 中哪里开始不一致,把整段前缀失效归因到具体单元(而非整体 hash)。
+//   2. 轮边界复现——当新一"轮"的首个请求出现(判定见 [`ProbeNote`])时,把
+//      「上一请求 + 本请求」的**完整请求体**落盘到
+//      `<session_dir>/dumps/req-<seq>.json`,供离线做字节级 diff,复现
+//      "轮边界缓存整段失效"(实测:轮首请求 read 回落到仅系统前缀)。
+//
+// 与 [`CacheBreakDetector`] 的关系:detector 只做整指纹命中率下降检测+分类
+// (`claw doctor --cache-stats`);probe 补充"分叉位置 + 请求体证据"。二者
+// 独立持久化,互不修改对方状态文件。
+//
+// 存储(沿用 detector 的 session 目录,见 [`CacheBreakPaths`]):
+//   <session_dir>/probe.json            统计(requests/turn_boundaries/dumps)
+//   <session_dir>/dumps/req-<seq>.json  轮边界/深层分叉时成对请求体快照
+//
+// 轮边界判定(不依赖 `is_post_tool`,彼被 runtime 尾部注入段干扰):
+// 比较相邻两个请求的消息单元序列,首个分叉点 d 上——
+//   - 本请求在该位置被 `role="tool"`(ToolResult)消息顶替 → 轮内工具循环
+//     自然增长(尾部位移损耗,已量化 ~2.3k/iter),不落盘;
+//   - 被 `user`/`assistant`/其他角色顶替,或被 system/tools 分叉、历史缩短
+//     (MessagesShrunk) → 视为轮边界/深层分叉,成对落盘。
+// (分类逻辑见 ProbeNote::describe / classify_units)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeMeta {
+    pub request_kind: String,
+    pub triage_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeStats {
+    #[serde(default)]
+    pub requests_observed: u64,
+    #[serde(default)]
+    pub turn_boundaries: u64,
+    #[serde(default)]
+    pub mid_divergences: u64,
+    #[serde(default)]
+    pub dumps_written: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeReport {
+    /// 落盘触发原因:`turn_boundary` / `system_changed` / `tools_changed` /
+    /// `message_divergence` / `messages_shrunk`。`None` 表示仅观察(轮内增长)。
+    pub reason: String,
+    /// 首个分叉单元描述,如 `sys#2` / `tools` / `msg#5(user)`。
+    pub first_divergence: String,
+    /// 本次落盘序号(0 = 未落盘)。
+    pub dump_seq: u32,
+}
+
+/// 单元级指纹:一个可序列化的请求构成块([system 块 | tools | 单条消息])。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProbeUnit {
+    tag: String,
+    role: String,
+    /// 消息内容块类型签名(`text|thinking|tool_use|tool_result`,以 `|` 连接)。
+    /// wire 层 tool_result 会被合并进 `role="user"` 消息(见 cli convert_messages),
+    /// 不能按 role 判别轮内/轮边界,需按块类型。
+    blocks: String,
+    len: usize,
+    hash: u64,
+}
+
+/// 单次请求的单元指纹序列(`units` 顺序 = system 块 → tools → messages)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WireProfile {
+    observed_at_unix_ms: u64,
+    meta: ProbeMeta,
+    units: Vec<ProbeUnit>,
+}
+
+#[derive(Debug, Clone)]
+struct ProbeInner {
+    paths: CacheBreakPaths,
+    dumps_dir: PathBuf,
+    stats: ProbeStats,
+    previous: Option<WireProfile>,
+    /// 上一请求的完整请求体(轮边界成对落盘用)。
+    prev_request: Option<MessageRequest>,
+    seq: u32,
+}
+
+/// 轮边界 / 深层分叉时的成对请求体快照。
+#[derive(Debug, Serialize)]
+struct DumpBody<'a> {
+    dump_seq: u32,
+    observed_at_unix_ms: u64,
+    reason: &'a str,
+    first_divergence: String,
+    meta_previous: &'a ProbeMeta,
+    previous_request: &'a MessageRequest,
+    meta_current: &'a ProbeMeta,
+    current_request: &'a MessageRequest,
+}
+
+/// 磁盘持久化的配对状态:CLI/TUI 每轮 turn 会重建 AnthropicRuntimeClient
+/// (见 cli app.rs prepare_turn_runtime → replace_runtime 生命周期),探针内存态
+/// (previous / prev_request)随之丢失,跨轮配对断裂 → 轮边界永远捕获不到。
+/// 这里把上一请求的指纹+请求体落盘,client 重建后从磁盘恢复配对。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedProbeState {
+    #[serde(default)]
+    seq: u32,
+    #[serde(default)]
+    previous: Option<WireProfile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestDivergenceProbe {
+    inner: Arc<Mutex<ProbeInner>>,
+}
+
+impl RequestDivergenceProbe {
+    #[must_use]
+    pub fn new(session_id: impl Into<String>) -> Self {
+        let paths = CacheBreakPaths::for_session(&session_id.into());
+        let dumps_dir = paths.session_dir.join("dumps");
+        let stats =
+            read_json::<ProbeStats>(&paths.session_dir.join("probe.json")).unwrap_or_default();
+        // 从磁盘恢复跨轮配对状态(client 每轮重建,内存态会丢)。
+        let persisted: Option<PersistedProbeState> =
+            read_json(&paths.session_dir.join("probe-state.json"));
+        let previous = persisted.as_ref().and_then(|s| s.previous.clone());
+        let prev_request = read_json(&paths.session_dir.join("last-request.json"));
+        let seq = std::cmp::max(
+            persisted.as_ref().map(|s| s.seq).unwrap_or(0),
+            existing_dump_seq(&dumps_dir),
+        );
+        Self {
+            inner: Arc::new(Mutex::new(ProbeInner {
+                paths,
+                dumps_dir,
+                stats,
+                previous,
+                prev_request,
+                seq,
+            })),
+        }
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> ProbeStats {
+        self.lock().stats.clone()
+    }
+
+    /// 探针持久化路径(session 目录;body dump 在 `<session_dir>/dumps` 下)。
+    #[must_use]
+    pub fn paths(&self) -> CacheBreakPaths {
+        self.lock().paths.clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProbeInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 请求发出前调用。返回 `Some(report)` 表示捕获到轮边界/深层分叉(已落盘
+    /// 成对请求体或仅记录);`None` 表示轮内自然增长,无需关注。
+    #[must_use]
+    pub fn note_request(&self, request: &MessageRequest, meta: ProbeMeta) -> Option<ProbeReport> {
+        if probe_disabled() || meta.request_kind != "Main" {
+            return None;
+        }
+        let profile = WireProfile {
+            observed_at_unix_ms: now_unix_ms(),
+            meta: meta.clone(),
+            units: profile_units(request),
+        };
+
+        let mut inner = self.lock();
+        inner.stats.requests_observed += 1;
+
+        // 先只读分类(避免对 inner 的可变更新与不可变借用冲突),事件数据取快照。
+        let classified = inner.previous.as_ref().map(|prev| {
+            (
+                classify_units(prev.units.as_slice(), &profile.units),
+                prev.meta.clone(),
+            )
+        });
+
+        let report = match classified {
+            None => None, // 会话首请求:仅建基线
+            Some((note, prev_meta)) => {
+                let (reason, first_divergence) = note.describe();
+                if let Some(reason) = reason {
+                    if let Some(prev_request) = inner.prev_request.clone() {
+                        inner.seq += 1;
+                        let dump_seq = inner.seq;
+                        if persist_dump(
+                            &inner.dumps_dir,
+                            &DumpBody {
+                                dump_seq,
+                                observed_at_unix_ms: profile.observed_at_unix_ms,
+                                reason: &reason,
+                                first_divergence: first_divergence.clone(),
+                                meta_previous: &prev_meta,
+                                previous_request: &prev_request,
+                                meta_current: &meta,
+                                current_request: request,
+                            },
+                        ) {
+                            inner.stats.dumps_written += 1;
+                        }
+                        if note.is_turn_boundary() {
+                            inner.stats.turn_boundaries += 1;
+                        } else {
+                            inner.stats.mid_divergences += 1;
+                        }
+                        Some(ProbeReport {
+                            reason,
+                            first_divergence,
+                            dump_seq,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        inner.previous = Some(profile);
+        inner.prev_request = Some(request.clone());
+        persist_probe(&inner);
+        persist_pairing_state(&inner, request);
+        report
+    }
+}
+
+/// 落盘配对状态:指纹 + 上一请求体 + 序号。client 每轮重建后从磁盘恢复,
+/// 保证跨轮(乃至跨进程)的轮边界成对捕获不丢失。
+fn persist_pairing_state(inner: &ProbeInner, request: &MessageRequest) {
+    let state = PersistedProbeState {
+        seq: inner.seq,
+        previous: inner.previous.clone(),
+    };
+    let _ = fs::create_dir_all(&inner.paths.session_dir);
+    let _ = write_json(&inner.paths.session_dir.join("probe-state.json"), &state);
+    // 上一请求体(为下一请求的成对落盘准备)。单文件覆盖,不增长。
+    let _ = write_json(&inner.paths.session_dir.join("last-request.json"), request);
+}
+
+/// 分歧分类:比较相邻两个请求的单元序列,确定"首个分叉点"属性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeNote {
+    /// 上一请求是当前请求的严格前缀(轮内纯增长,尾部无 shift)。
+    TailGrowth,
+    /// 分叉点落在尾部注入段 zone(最后 1-2 单元被 ToolResult 顶替)。
+    TailShift,
+    /// system 第 i 个块分叉。
+    SystemBlock(usize),
+    /// tools 整集分叉(含分诊裁剪)。
+    ToolsChanged,
+    /// 第 i 条消息深层分叉(不在尾部位移 zone)。
+    MessageMid(usize),
+    /// 轮边界:尾部位移 zone 被非 tool 消息(新 user 输入/新 assistant)顶替。
+    TurnBoundary(usize),
+    /// 当前请求消息数少于上一请求(历史被压缩/截断)。
+    MessagesShrunk,
+}
+
+impl ProbeNote {
+    /// 产出 (reason 标签, 首分叉描述)。`None` = 轮内自然增长(不落盘)。
+    /// 轮内工具循环(`role="tool"` 顶替)在 classify 阶段已归 TailShift。
+    fn describe(self) -> (Option<String>, String) {
+        match self {
+            ProbeNote::TailGrowth | ProbeNote::TailShift => (None, String::new()),
+            ProbeNote::SystemBlock(i) => (Some("system_changed".into()), format!("sys#{i}")),
+            ProbeNote::ToolsChanged => (Some("tools_changed".into()), "tools".into()),
+            ProbeNote::MessageMid(i) => (Some("message_divergence".into()), format!("msg#{i}")),
+            ProbeNote::TurnBoundary(i) => (Some("turn_boundary".into()), format!("msg#{i}")),
+            ProbeNote::MessagesShrunk => (Some("messages_shrunk".into()), "len-short".into()),
+        }
+    }
+
+    /// 是否视为"轮边界"(新用户消息后的首个请求)—— 用于统计 turn_boundaries。
+    fn is_turn_boundary(self) -> bool {
+        matches!(self, Self::TurnBoundary(_))
+    }
+}
+
+/// 计算首个分叉单元索引(上一请求 vs 当前请求,按顺序单元)。无分叉返回 None。
+fn first_divergence_index(prev_units: &[ProbeUnit], curr_units: &[ProbeUnit]) -> Option<usize> {
+    prev_units
+        .iter()
+        .zip(curr_units.iter())
+        .position(|(previous, current)| previous != current)
+}
+
+fn classify_units(prev_units: &[ProbeUnit], curr_units: &[ProbeUnit]) -> ProbeNote {
+    match first_divergence_index(prev_units, curr_units) {
+        None => {
+            if curr_units.len() >= prev_units.len() {
+                ProbeNote::TailGrowth
+            } else {
+                ProbeNote::MessagesShrunk
+            }
+        }
+        Some(d) => {
+            let tag = curr_units
+                .get(d)
+                .map(|u| u.tag.as_str())
+                .or_else(|| prev_units.get(d).map(|u| u.tag.as_str()))
+                .unwrap_or("");
+            if tag == "tools" {
+                ProbeNote::ToolsChanged
+            } else if let Some(rest) = tag.strip_prefix("sys#") {
+                let idx = rest.split('^').next().unwrap_or("0");
+                ProbeNote::SystemBlock(idx.parse().unwrap_or(0))
+            } else if let Some(rest) = tag.strip_prefix("msg#") {
+                let msg_idx = rest.split('^').next().unwrap_or("0").parse().unwrap_or(d);
+                // 尾部位移 zone:分叉点落在上一请求最后 1-2 个单元(注入段 S/H)。
+                let tail_zone = d >= prev_units.len().saturating_sub(2) && prev_units.len() >= 2;
+                if tail_zone {
+                    // 轮内工具循环:该位置被「assistant tool_use 或合并的
+                    // tool_result」顶替(实测:wire 层 tool_use 在 tool_result
+                    // 之前,首迭代时占据尾部落差位置);
+                    // 轮边界:被纯文本(新用户输入 / 上一轮最终 assistant text)
+                    // 顶替。
+                    let blocks = curr_units.get(d).map(|u| u.blocks.as_str()).unwrap_or("");
+                    let is_tool_related =
+                        blocks.contains("tool_result") || blocks.contains("tool_use");
+                    if is_tool_related {
+                        ProbeNote::TailShift
+                    } else {
+                        ProbeNote::TurnBoundary(msg_idx)
+                    }
+                } else {
+                    ProbeNote::MessageMid(msg_idx)
+                }
+            } else {
+                ProbeNote::MessagesShrunk
+            }
+        }
+    }
+}
+
+/// 构建请求的单元指纹序列:system 块 → tools → 逐条消息。
+fn profile_units(request: &MessageRequest) -> Vec<ProbeUnit> {
+    let mut units = Vec::new();
+    if let Some(system) = &request.system {
+        match system {
+            SystemContent::Text(text) => {
+                units.push(ProbeUnit {
+                    tag: "sys#0".into(),
+                    role: "system".into(),
+                    blocks: String::new(),
+                    len: text.len(),
+                    hash: hash_string(text),
+                });
+            }
+            SystemContent::Blocks(blocks) => {
+                for (i, block) in blocks.iter().enumerate() {
+                    let dynamic = block.cache_control.is_none();
+                    let bytes = serde_json::to_vec(block).unwrap_or_default();
+                    units.push(ProbeUnit {
+                        tag: format!("sys#{i}{}", if dynamic { "^dyn" } else { "" }),
+                        role: "system".into(),
+                        blocks: String::new(),
+                        len: bytes.len(),
+                        hash: stable_hash_bytes(&bytes),
+                    });
+                }
+            }
+        }
+    }
+    if let Some(tools) = &request.tools {
+        let bytes = serde_json::to_vec(tools).unwrap_or_default();
+        units.push(ProbeUnit {
+            tag: "tools".into(),
+            role: "tools".into(),
+            blocks: String::new(),
+            len: bytes.len(),
+            hash: stable_hash_bytes(&bytes),
+        });
+    }
+    for (i, message) in request.messages.iter().enumerate() {
+        let kinds: Vec<&str> = message
+            .content
+            .iter()
+            .map(|block| match block {
+                InputContentBlock::Text { .. } => "text",
+                InputContentBlock::Thinking { .. } => "thinking",
+                InputContentBlock::ToolUse { .. } => "tool_use",
+                InputContentBlock::ToolResult { .. } => "tool_result",
+            })
+            .collect();
+        let bytes = serde_json::to_vec(message).unwrap_or_default();
+        units.push(ProbeUnit {
+            tag: format!("msg#{i}"),
+            role: message.role.clone(),
+            blocks: kinds.join("|"),
+            len: bytes.len(),
+            hash: stable_hash_bytes(&bytes),
+        });
+    }
+    units
+}
+
+fn persist_probe(inner: &ProbeInner) {
+    let _ = fs::create_dir_all(&inner.paths.session_dir);
+    let _ = write_json(&inner.paths.session_dir.join("probe.json"), &inner.stats);
+}
+
+fn persist_dump(dumps_dir: &Path, body: &DumpBody<'_>) -> bool {
+    if fs::create_dir_all(dumps_dir).is_err() {
+        return false;
+    }
+    let path = dumps_dir.join(format!("req-{:05}.json", body.dump_seq));
+    match serde_json::to_vec_pretty(body) {
+        Ok(bytes) => fs::write(path, bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// 扫描已有 dump 序号,新进程续写不覆盖。跨进程序号可能复用,但 session_id
+/// 基本唯一,且文件名带时间戳信息(见 manifest),风险可接受。
+fn existing_dump_seq(dumps_dir: &Path) -> u32 {
+    let Ok(entries) = fs::read_dir(dumps_dir) else {
+        return 0;
+    };
+    let mut max = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix("req-") {
+            if let Some(num) = rest.strip_suffix(".json") {
+                if let Ok(n) = num.parse::<u32>() {
+                    max = max.max(n);
+                }
+            }
+        }
+    }
+    max
+}
+
+/// 环境变量 `RUSTY_CLAUDE_PROBE_DISABLE=1` 可完全关闭探针(无磁盘写)。
+fn probe_disabled() -> bool {
+    std::env::var("RUSTY_CLAUDE_PROBE_DISABLE")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,11 +1177,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        detect_cache_break, read_json, request_hash_hex, sanitize_path_segment, CacheBreakConfig,
-        CacheBreakDetector, CacheBreakPaths, TrackedPromptState,
+        classify_units, detect_cache_break, read_json, request_hash_hex, sanitize_path_segment,
+        CacheBreakConfig, CacheBreakDetector, CacheBreakPaths, ProbeMeta, ProbeNote, ProbeStats,
+        ProbeUnit, RequestDivergenceProbe, TrackedPromptState,
     };
     use crate::types::{
-        CacheControl, InputMessage, MessageRequest, SystemBlock, SystemContent, Usage,
+        CacheControl, InputContentBlock, InputMessage, MessageRequest, SystemBlock, SystemContent,
+        Usage,
     };
 
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1320,5 +1777,459 @@ mod tests {
         );
         assert_eq!(detector.stats().break_reasons.prefix_drifted, 1);
         prefix_test_cleanup(temp_root);
+    }
+
+    // ---------------- RequestDivergenceProbe tests ----------------
+
+    fn probe_unit(tag: &str, role: &str, blocks: &str) -> ProbeUnit {
+        ProbeUnit {
+            tag: tag.to_string(),
+            role: role.to_string(),
+            blocks: blocks.to_string(),
+            len: 1,
+            hash: 0,
+        }
+    }
+
+    /// 轮内纯增长(prev 是 curr 严格前缀)→ TailGrowth(不落盘)。
+    #[test]
+    fn probe_classifies_tail_growth() {
+        let prev = vec![probe_unit("msg#0", "user", "text")];
+        let curr = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+        ];
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::TailGrowth);
+    }
+
+    /// 轮内工具循环:尾部位移 zone 被 tool_result 块顶替 → TailShift(不落盘,
+    /// 即已量化的 ~2.3k/iter 结构性损耗,不是本轮要抓的异常)。
+    #[test]
+    fn probe_classifies_in_turn_tool_loop_as_tail_shift() {
+        // prev = [u0, a1(tool_use), S(user text), H(user text)]
+        let prev = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+            probe_unit("msg#5", "user", "text"),
+            probe_unit("msg#6", "user", "text"),
+        ];
+        // curr = [u0, a1(相同), TR(合并进 user,tool_result 块), S, H]
+        let curr = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+            probe_unit("msg#2", "user", "tool_result"),
+            probe_unit("msg#5", "user", "text"),
+            probe_unit("msg#6", "user", "text"),
+        ];
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::TailShift);
+    }
+
+    /// 2026-09-19 实测抓包回归:turn1 初始请求 [fm, u0, S, H] → turn1 工具
+    /// 续写请求 [fm, u0, a(tool_use), u(tool_result), S, H]。wire 层
+    /// assistant tool_use 占据尾部落差位置(tool_result 在其后合并进 user),
+    /// 此前的判别只认 tool_result 导致误判为轮边界。修复后必须归 TailShift。
+    #[test]
+    fn probe_classifies_tool_use_at_tail_zone_as_tail_shift() {
+        // prev = turn1 初始请求: [固定记忆(fm), u0, S(Project context), H(Runtime context)]
+        let prev = vec![
+            probe_unit("msg#0", "user", "text"), // 固定记忆
+            probe_unit("msg#1", "user", "text"), // 用户 round-1 输入
+            probe_unit("msg#2", "user", "text"), // # Project context 尾部注入
+            probe_unit("msg#3", "user", "text"), // # Runtime Context 尾部注入
+        ];
+        // curr = turn1 工具续写: 尾部注入段位移,assistant tool_use 顶到 msg#2
+        let curr = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "user", "text"),
+            probe_unit("msg#2", "assistant", "tool_use"), // 新工具调用
+            probe_unit("msg#3", "user", "tool_result"),   // 合并的 tool_result
+            probe_unit("msg#4", "user", "text"),          // S(Project context)
+            probe_unit("msg#5", "user", "text"),          // H(Runtime context)
+        ];
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::TailShift);
+    }
+
+    /// 真实轮边界:上一轮末请求 [..., S, H] → 新一轮首请求 [..., 新 user 输入(text), S, H]。
+    #[test]
+    fn probe_classifies_turn_boundary_with_new_user_text() {
+        let prev = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+            probe_unit("msg#2", "user", "tool_result"),
+            probe_unit("msg#5", "user", "text"), // S
+            probe_unit("msg#6", "user", "text"), // H
+        ];
+        let curr = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+            probe_unit("msg#2", "user", "tool_result"),
+            probe_unit("msg#3", "user", "text"), // 新一轮用户输入
+            probe_unit("msg#5", "user", "text"), // S
+            probe_unit("msg#6", "user", "text"), // H
+        ];
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::TurnBoundary(3));
+    }
+
+    /// 真实轮边界变体:上一轮末请求 [..., S, H] → 新一轮首请求 含上一轮最终
+    /// assistant 文本块 [..., a(final text), u_new, S, H],分叉单元为 assistant 文本。
+    #[test]
+    fn probe_classifies_turn_boundary_with_assistant_final_text() {
+        let prev = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+            probe_unit("msg#2", "user", "tool_result"),
+            probe_unit("msg#5", "user", "text"), // S
+            probe_unit("msg#6", "user", "text"), // H
+        ];
+        let curr = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+            probe_unit("msg#2", "user", "tool_result"),
+            probe_unit("msg#3", "assistant", "text"), // 上一轮最终答复
+            probe_unit("msg#4", "user", "text"),      // 新一轮用户输入
+            probe_unit("msg#5", "user", "text"),      // S
+            probe_unit("msg#6", "user", "text"),      // H
+        ];
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::TurnBoundary(3));
+    }
+
+    /// 轮边界:尾部位移 zone 被新的纯文本 user 消息顶替 → TurnBoundary(落盘)。
+    #[test]
+    fn probe_classifies_turn_boundary() {
+        // prev = 上一轮最后一个请求:[..., TR, S, H]
+        let prev = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+            probe_unit("msg#2", "user", "tool_result"),
+            probe_unit("msg#5", "user", "text"),
+            probe_unit("msg#6", "user", "text"),
+        ];
+        // curr = 新一轮首请求:[..., TR, 新 user 输入(text), S, H]
+        let curr = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "tool_use"),
+            probe_unit("msg#2", "user", "tool_result"),
+            probe_unit("msg#3", "user", "text"),
+            probe_unit("msg#5", "user", "text"),
+            probe_unit("msg#6", "user", "text"),
+        ];
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::TurnBoundary(3));
+    }
+
+    /// 深层分叉(消息区中部内容变化,如 fixed_memory 重写注入 messages[0])
+    /// → MessageMid(落盘)。这正是轮边界整段失效的头号嫌疑。
+    #[test]
+    fn probe_classifies_deep_message_divergence() {
+        // prev 4 条消息,第 1 条消息内容变化(仅 hash 不同)→ d=1,不在尾部位移
+        // zone(prev.len()-2=2)→ MessageMid(1)。
+        let prev = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "user", "text"),
+            probe_unit("msg#2", "user", "text"),
+            probe_unit("msg#3", "user", "text"),
+        ];
+        let mut curr = prev.clone();
+        curr[1].hash = 42; // 第 1 条消息内容变化
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::MessageMid(1));
+    }
+
+    /// system 块分叉 → SystemBlock(落盘)。
+    #[test]
+    fn probe_classifies_system_block_change() {
+        let prev = vec![probe_unit("sys#0", "system", "")];
+        let curr = vec![probe_unit("sys#0", "system", "")];
+        // 需要用不同 hash 表示内容变化
+        let mut prev = prev;
+        let mut curr = curr;
+        prev[0].hash = 1;
+        curr[0].hash = 2;
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::SystemBlock(0));
+    }
+
+    /// 历史缩短(压缩/截断)→ MessagesShrunk(落盘)。
+    #[test]
+    fn probe_classifies_messages_shrunk() {
+        let prev = vec![
+            probe_unit("msg#0", "user", "text"),
+            probe_unit("msg#1", "assistant", "text"),
+        ];
+        let curr = vec![probe_unit("msg#0", "user", "text")];
+        assert_eq!(classify_units(&prev, &curr), ProbeNote::MessagesShrunk);
+    }
+
+    /// 端到端:轮边界成对请求体落盘 + 轮内增长不落盘。
+    #[test]
+    fn probe_dumps_pair_on_turn_boundary_only() {
+        let _guard = test_env_lock();
+        let temp_root = std::env::temp_dir().join(format!(
+            "probe-dump-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        let probe = RequestDivergenceProbe::new("unit-test-probe");
+        let meta = ProbeMeta {
+            request_kind: "Main".to_string(),
+            triage_tier: Some("Standard".to_string()),
+        };
+
+        // 1) 会话首请求:仅建基线,不落盘。
+        let first = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![
+                InputMessage::user_text("hello"),
+                InputMessage {
+                    role: "assistant".into(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_01_x".into(),
+                        name: "noop".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+                InputMessage::user_text("snapshot"),
+                InputMessage::user_text("hints"),
+            ],
+            ..Default::default()
+        };
+        assert!(probe.note_request(&first, meta.clone()).is_none());
+
+        // 2) 轮内工具循环(带 tool_result 的续写请求)→ 不落盘。
+        let in_turn = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![
+                InputMessage::user_text("hello"),
+                InputMessage {
+                    role: "assistant".into(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_01_x".into(),
+                        name: "noop".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+                InputMessage {
+                    role: "user".into(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_01_x".into(),
+                        content: vec![crate::types::ToolResultContentBlock::Text {
+                            text: "ok".into(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+                InputMessage::user_text("snapshot"),
+                InputMessage::user_text("hints"),
+            ],
+            ..Default::default()
+        };
+        assert!(probe.note_request(&in_turn, meta.clone()).is_none());
+
+        // 3) 轮边界(新用户消息)→ 落盘成对请求体,report.reason == "turn_boundary"。
+        let turn_first = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![
+                InputMessage::user_text("hello"),
+                InputMessage {
+                    role: "assistant".into(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_01_x".into(),
+                        name: "noop".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+                InputMessage {
+                    role: "user".into(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_01_x".into(),
+                        content: vec![crate::types::ToolResultContentBlock::Text {
+                            text: "ok".into(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+                InputMessage::user_text("新的一轮开始"),
+                InputMessage::user_text("snapshot"),
+                InputMessage::user_text("hints"),
+            ],
+            ..Default::default()
+        };
+        let report = probe
+            .note_request(&turn_first, meta.clone())
+            .expect("turn boundary should be captured");
+        assert_eq!(report.reason, "turn_boundary");
+        assert_eq!(report.dump_seq, 1);
+
+        // dump 文件存在且含 prev + current 两个请求体。
+        let dumps_dir = probe.paths().session_dir.join("dumps");
+        let dump_path = dumps_dir.join("req-00001.json");
+        assert!(dump_path.exists(), "dump file should exist: {dump_path:?}");
+        let raw = std::fs::read_to_string(&dump_path).expect("read dump");
+        assert!(
+            raw.contains("previous_request"),
+            "dump should include prev body"
+        );
+        assert!(
+            raw.contains("current_request"),
+            "dump should include curr body"
+        );
+        // 解析 JSON 校验 current_request 携带新轮输入(避免字符串转义歧义)。
+        let dump: serde_json::Value = serde_json::from_str(&raw).expect("dump is valid json");
+        let curr_msgs = dump["current_request"]["messages"]
+            .as_array()
+            .expect("current_request.messages");
+        assert_eq!(
+            curr_msgs.len(),
+            6,
+            "current request should carry 6 messages"
+        );
+        assert_eq!(
+            curr_msgs[3]["content"][0]["text"].as_str(),
+            Some("新的一轮开始"),
+            "current request should carry the new turn input"
+        );
+
+        // probe.json 统计落盘。
+        let stats_path = probe.paths().session_dir.join("probe.json");
+        let persisted = read_json::<ProbeStats>(&stats_path).expect("probe.json");
+        assert_eq!(persisted.requests_observed, 3);
+        assert_eq!(persisted.turn_boundaries, 1);
+        assert_eq!(persisted.dumps_written, 1);
+
+        std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+    }
+
+    /// 跨轮配对恢复:CLI 每轮 turn 重建 AnthropicRuntimeClient(内存配对态丢失),
+    /// 新 probe 实例应能从磁盘恢复上一请求,使轮边界仍可成对落盘。
+    #[test]
+    fn probe_restores_pairing_across_client_rebuild() {
+        let _guard = test_env_lock();
+        let temp_root = std::env::temp_dir().join(format!(
+            "probe-rebuild-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        let meta = ProbeMeta {
+            request_kind: "Main".to_string(),
+            triage_tier: Some("Standard".to_string()),
+        };
+        // turn1 末请求 [fm, u0, a1(tool_use), u2(tool_result), S, H] → 基线观察。
+        let turn1_last = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![
+                InputMessage::user_text("fm"),
+                InputMessage::user_text("hello"),
+                InputMessage {
+                    role: "assistant".into(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_01_x".into(),
+                        name: "noop".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+                InputMessage {
+                    role: "user".into(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_01_x".into(),
+                        content: vec![crate::types::ToolResultContentBlock::Text {
+                            text: "ok".into(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+                InputMessage::user_text("S"),
+                InputMessage::user_text("H"),
+            ],
+            ..Default::default()
+        };
+        let p1 = RequestDivergenceProbe::new("rebuild-test");
+        assert!(p1.note_request(&turn1_last, meta.clone()).is_none());
+
+        // 模拟 client 每轮重建:new 一个新实例(内存 previous=None,从磁盘恢复)。
+        let p2 = RequestDivergenceProbe::new("rebuild-test");
+        let turn2_first = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![
+                InputMessage::user_text("fm"),
+                InputMessage::user_text("hello"),
+                InputMessage {
+                    role: "assistant".into(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_01_x".into(),
+                        name: "noop".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+                InputMessage {
+                    role: "user".into(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_01_x".into(),
+                        content: vec![crate::types::ToolResultContentBlock::Text {
+                            text: "ok".into(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+                InputMessage::user_text("新的一轮"), // 新用户输入
+                InputMessage::user_text("S"),
+                InputMessage::user_text("H"),
+            ],
+            ..Default::default()
+        };
+        let report = p2
+            .note_request(&turn2_first, meta)
+            .expect("turn boundary should be captured across client rebuild");
+        assert_eq!(report.reason, "turn_boundary");
+        let dump = p2.paths().session_dir.join("dumps/req-00001.json");
+        assert!(dump.exists(), "pair dump should exist: {dump:?}");
+        let dump_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dump).expect("read dump"))
+                .expect("valid json");
+        assert_eq!(
+            dump_json["current_request"]["messages"]
+                .as_array()
+                .expect("messages")[4]["content"][0]["text"],
+            "新的一轮"
+        );
+
+        std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+    }
+
+    /// `RUSTY_CLAUDE_PROBE_DISABLE=1` → 完全关闭(不写盘)。
+    #[test]
+    fn probe_can_be_disabled_via_env() {
+        let _guard = test_env_lock();
+        let temp_root = std::env::temp_dir().join(format!(
+            "probe-disable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        std::env::set_var("RUSTY_CLAUDE_PROBE_DISABLE", "1");
+        let probe = RequestDivergenceProbe::new("unit-test-probe-off");
+        let meta = ProbeMeta {
+            request_kind: "Main".to_string(),
+            triage_tier: None,
+        };
+        let first = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![InputMessage::user_text("hi")],
+            ..Default::default()
+        };
+        assert!(probe.note_request(&first, meta.clone()).is_none());
+        assert!(probe.note_request(&first, meta).is_none());
+        std::env::remove_var("RUSTY_CLAUDE_PROBE_DISABLE");
+        let _ = std::fs::remove_dir_all(temp_root); // 禁用时无文件生成,目录可能不存在
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
     }
 }

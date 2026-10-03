@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use api::{cache_break_root, CacheBreakReasons, CacheBreakStats};
+use api::{cache_break_root, CacheBreakReasons, CacheBreakStats, ProbeStats};
 use runtime::{
     format_stale_base_warning, resolve_sandbox_status, BaseCommitState, ConfigLoader, McpServer,
     McpServerSpec, McpTool, ProjectContext, TokenUsage,
@@ -342,6 +342,11 @@ fn run_doctor_cache_stats(
     let mut main_agg = CacheStatsAggregate::default();
     for session in &main_sessions {
         main_agg.push(&session.stats);
+        if let Some(probe) = &session.probe {
+            main_agg.probe_dumps += probe.dumps_written;
+            main_agg.probe_turn_boundaries += probe.turn_boundaries;
+            main_agg.probe_mid_divergences += probe.mid_divergences;
+        }
     }
     let mut subagent_agg = CacheStatsAggregate::default();
     for session in &subagent_sessions {
@@ -388,6 +393,8 @@ struct SessionCacheStatsSnapshot {
     name: String,
     is_subagent: bool,
     stats: CacheBreakStats,
+    /// 请求分歧探针统计(session 目录下 probe.json;无探针时为 None)。
+    probe: Option<ProbeStats>,
     modified_at: Option<SystemTime>,
 }
 
@@ -401,6 +408,10 @@ struct CacheStatsAggregate {
     unexpected_breaks: u64,
     expected_invalidations: u64,
     breaks: CacheBreakReasons,
+    /// 探针聚合(仅主 session;subagent 不接入探针)。
+    probe_dumps: u64,
+    probe_turn_boundaries: u64,
+    probe_mid_divergences: u64,
 }
 
 impl CacheStatsAggregate {
@@ -455,10 +466,14 @@ fn collect_session_cache_stats(root: &Path) -> Vec<SessionCacheStatsSnapshot> {
         let modified_at = fs::metadata(&stats_path)
             .ok()
             .and_then(|metadata| metadata.modified().ok());
+        let probe = fs::read(entry.path().join("probe.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<ProbeStats>(&raw).ok());
         sessions.push(SessionCacheStatsSnapshot {
             name,
             is_subagent,
             stats,
+            probe,
             modified_at,
         });
     }
@@ -495,6 +510,9 @@ fn render_cache_stats_text(
         main_agg,
         newest_session(main_sessions),
     ));
+    lines.push(String::new());
+    lines.push("== 请求分歧探针(主 session,轮边界成对请求体落盘)==".to_string());
+    lines.extend(render_probe_lines(main_agg));
     if subagent_agg.session_count > 0 {
         lines.push(String::new());
         lines.push("== Subagent 汇总(subagent-session-* 独立统计)==".to_string());
@@ -638,7 +656,7 @@ fn render_subagent_lines(
 
 fn render_session_line(session: &SessionCacheStatsSnapshot) -> String {
     let kind = if session.is_subagent { "子" } else { "主" };
-    format!(
+    let mut line = format!(
         "  [{kind}] {:48} : tracked={} read={} creation={} hit={}% unexpected={} expected={} last_break={}",
         session.name,
         session.stats.tracked_requests,
@@ -651,7 +669,29 @@ fn render_session_line(session: &SessionCacheStatsSnapshot) -> String {
         session.stats.unexpected_cache_breaks,
         session.stats.expected_invalidations,
         session.stats.last_break_reason.as_deref().unwrap_or("<无>"),
-    )
+    );
+    if let Some(probe) = &session.probe {
+        line.push_str(&format!(
+            " | probe: turn_boundaries={} mid_divergences={} dumps={}",
+            probe.turn_boundaries, probe.mid_divergences, probe.dumps_written
+        ));
+    }
+    line
+}
+
+/// 探针聚合行:轮边界/深层分叉捕获量 + dump 落盘位置提示。
+fn render_probe_lines(agg: &CacheStatsAggregate) -> Vec<String> {
+    if agg.probe_turn_boundaries + agg.probe_mid_divergences + agg.probe_dumps == 0 {
+        return vec!["  未捕获异常(无轮边界/深层分叉请求体落盘)".to_string()];
+    }
+    vec![
+        format!("  轮边界捕获               : {} (新用户消息后的首请求)", agg.probe_turn_boundaries),
+        format!("  深层分叉捕获             : {}", agg.probe_mid_divergences),
+        format!(
+            "  成对请求体落盘           : {} (见 <cacheroot>/<session>/dumps/req-*.json)",
+            agg.probe_dumps
+        ),
+    ]
 }
 
 fn break_reasons_json(breaks: &CacheBreakReasons) -> Value {
@@ -707,6 +747,11 @@ fn render_cache_stats_json(
                 "last_break_reason": newest.and_then(|s| s.stats.last_break_reason.clone()),
                 "last_response": last_response_json(newest),
             },
+            "divergence_probe": {
+                "turn_boundaries": agg.probe_turn_boundaries,
+                "mid_divergences": agg.probe_mid_divergences,
+                "pair_dumps_written": agg.probe_dumps,
+            },
         })
     };
 
@@ -735,6 +780,13 @@ fn render_cache_stats_json(
                 "unexpected_cache_breaks": s.stats.unexpected_cache_breaks,
                 "expected_invalidations": s.stats.expected_invalidations,
                 "last_break_reason": s.stats.last_break_reason,
+                "divergence_probe": s.probe.as_ref().map(|probe| {
+                    json!({
+                        "turn_boundaries": probe.turn_boundaries,
+                        "mid_divergences": probe.mid_divergences,
+                        "pair_dumps_written": probe.dumps_written,
+                    })
+                }),
             })
         })
         .collect::<Vec<_>>();
@@ -2579,12 +2631,14 @@ mod cache_stats_tests {
                 name: "session-old".into(),
                 is_subagent: false,
                 stats: CacheBreakStats::default(),
+                probe: None,
                 modified_at: Some(older),
             },
             SessionCacheStatsSnapshot {
                 name: "subagent-session-new".into(),
                 is_subagent: true,
                 stats: CacheBreakStats::default(),
+                probe: None,
                 modified_at: Some(newer),
             },
         ];

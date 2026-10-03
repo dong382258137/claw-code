@@ -161,6 +161,10 @@ pub(crate) struct AnthropicRuntimeClient {
     /// 缩小静态前缀。默认 false(全量注入,向后兼容),可用环境变量
     /// `RUSTY_CLAUDE_PROGRESSIVE_TOOLS=1` 开启。
     progressive_tools: bool,
+    /// 请求分歧探针:wire 层消息级指纹 + 轮边界成对请求体落盘
+    /// (`~/.claude/cache/prompt-cache/<session>/dumps/req-*.json`)。
+    /// 见 api::RequestDivergenceProbe 的模块文档(轮边界失效复现)。
+    request_divergence_probe: api::RequestDivergenceProbe,
 }
 
 impl AnthropicRuntimeClient {
@@ -208,6 +212,7 @@ impl AnthropicRuntimeClient {
                 "subagent-{session_id}"
             )),
             progressive_tools,
+            request_divergence_probe: api::RequestDivergenceProbe::new(session_id),
         })
     }
 
@@ -444,6 +449,17 @@ impl ApiClient for AnthropicRuntimeClient {
         // (`claw doctor --cache-stats` 可见),此处不改变请求行为、不新增 UI 输出。
         let _ = self.cache_break_detector.note_request(&message_request);
 
+        // 请求分歧探针:wire 层消息级指纹 + 轮边界成对请求体落盘(仅 Main 请求)。
+        // 见 api::RequestDivergenceProbe 模块文档。返回 report 时已在
+        // <cacheroot>/<session>/dumps/req-<seq>.json 写入「上一请求+本请求」。
+        let _ = self.request_divergence_probe.note_request(
+            &message_request,
+            api::ProbeMeta {
+                request_kind: format!("{request_kind:?}"),
+                triage_tier: triage_tier.map(|tier| format!("{tier:?}")),
+            },
+        );
+
         self.runtime.block_on(async {
             // Single attempt: re-sending the full request on stall doubles token
             // usage for no reliability gain (the stall is typically a transient
@@ -525,6 +541,16 @@ impl ApiClient for AnthropicRuntimeClient {
 
             // P0-1 Pre-flight Guard(与同步 `stream` 一致):请求发出前断言静态前缀不变式。
             let _ = self.cache_break_detector.note_request(&message_request);
+
+            // 请求分歧探针(与同步 `stream` 一致)。轮边界/深层分叉时成对落盘
+            // 真实请求体,供离线字节级 diff 复现「轮边界缓存整段失效」。
+            let _ = self.request_divergence_probe.note_request(
+                &message_request,
+                api::ProbeMeta {
+                    request_kind: format!("{request_kind:?}"),
+                    triage_tier: triage_tier.map(|tier| format!("{tier:?}")),
+                },
+            );
 
             // 直接 await,无 runtime.block_on
             self.consume_stream(request_kind, &message_request, is_post_tool)
