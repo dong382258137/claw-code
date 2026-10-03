@@ -1207,6 +1207,14 @@ pub(crate) fn build_runtime_plugin_state_with_loader(
         required_permission: PermissionMode::ReadOnly,
         domain_tags: vec!["topology".to_string(), "analysis".to_string()],
     });
+    // P3: 爆炸半径查询 — 修改符号前评估影响面。
+    runtime_tools.push(RuntimeToolDefinition {
+        name: "find_references".to_string(),
+        description: Some("Assess the blast radius of a symbol before modifying it: returns the call sites (file + line) that reference the symbol, grouped by file and deduplicated across files. Best-effort based on the topology symbol index; grep_search may find additional references. If topology is building/ready, this does NOT block — use grep_search instead.".to_string()),
+        input_schema: serde_json::json!({"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"], "additionalProperties": false}),
+        required_permission: PermissionMode::ReadOnly,
+        domain_tags: vec!["topology".to_string(), "analysis".to_string()],
+    });
     // DomainTools: stateless algorithm tools.
     runtime_tools.push(RuntimeToolDefinition {
         name: "refactor_algorithm_topo".to_string(),

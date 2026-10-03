@@ -4945,6 +4945,13 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             }
+                        } else if tool_name == "find_references" {
+                            // P3:爆炸半径查询。修改符号前向 LLM 暴露"影响哪些
+                            // 调用文件",复用 SymbolIndex.callers(按 caller 文件去重)。
+                            match self.execute_find_references(&effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            }
                         } else if tool_name == "rollback_transaction" {
                             match self.execute_rollback_transaction() {
                                 Ok(output) => (output, false),
@@ -8613,6 +8620,23 @@ where
             .and_then(|v| v.as_str())
             .ok_or("missing symbol")?;
         t.get_symbol_info(s)
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+    }
+
+    fn execute_find_references(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(t) = &self.project_topology else {
+            return Ok("find_references not available.".to_string());
+        };
+        let p: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| format!("invalid JSON: {e}"))?;
+        let s = p
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .ok_or("missing symbol")?;
+        t.find_references(s)
             .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
 

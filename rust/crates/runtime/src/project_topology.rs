@@ -133,19 +133,28 @@ pub struct TopologyData {
 ///
 /// 懒加载:首次查询时触发 `cargo metadata` 构建 ModuleGraph。
 /// SymbolIndex 需要 LspRegistry(可选,首次查询时异步构建)。
+///
+/// P1:磁盘缓存 — 首次构建成功后写入 `.claw/topology_<language>.json`,
+/// 下次会话 `ensure_built` 先查缓存(经指纹校验)命中即 `Ready`,跨会话免重建。
+/// 主语言由 [`crate::topology_cache::pick_primary_language`] 选定;
+/// 无支持语言时直接 `Failed`,不进入 Building。
 #[derive(Debug)]
 pub struct ProjectTopology {
     state: Arc<Mutex<TopologyState>>,
     workspace_root: PathBuf,
+    /// 主语言(混合项目策略选定)。None = 无支持语言 → 构建直接 Failed。
+    language: Option<crate::topology_cache::Language>,
     lsp_registry: Option<Arc<crate::lsp_client::LspRegistry>>,
 }
 
 impl ProjectTopology {
     /// 创建新的 ProjectTopology，初始状态为 Uninitialized。
     pub fn new(workspace_root: PathBuf) -> Self {
+        let language = crate::topology_cache::pick_primary_language(&workspace_root);
         Self {
             state: Arc::new(Mutex::new(TopologyState::Uninitialized)),
             workspace_root,
+            language,
             lsp_registry: None,
         }
     }
@@ -164,9 +173,11 @@ impl ProjectTopology {
     /// **非阻塞**地尝试构建拓扑(P2-1)。
     ///
     /// 如果当前状态为 `Uninitialized`:
-    /// 1. 在锁内将状态转为 `Building { started_at }`
-    /// 2. 派发一个 `std::thread::spawn` 后台线程执行实际构建
-    /// 3. 立即返回 `Building`(不等待构建完成)
+    /// 1. 无主语言(无支持语言标记)→ 直接置 `Failed`,不进入 Building(防死循环);
+    /// 2. 先查磁盘缓存(P1,经指纹校验)→ 命中直接置 `Ready`,跨会话免重建;
+    /// 3. 未命中则在锁内将状态转为 `Building { started_at }`,派发
+    ///    `std::thread::spawn` 后台线程执行实际构建,立即返回 `Building`;
+    /// 4. 后台构建成功后写入磁盘缓存(仅成功时落盘,防缓存误导)。
     ///
     /// 如果当前状态为 `Ready`/`Failed`/`Building`,直接返回当前状态(不重复派发)。
     ///
@@ -185,6 +196,22 @@ impl ProjectTopology {
             TopologyState::Uninitialized => {}
         }
 
+        // 无支持语言 → 直接 Failed,不进入 Uninitialized→Building(防"永远 Building")。
+        let Some(language) = self.language else {
+            *guard = TopologyState::Failed(
+                "no supported language detected (requires a cargo workspace or \
+                 Python project markers: pyproject.toml/setup.py/setup.cfg/requirements.txt)"
+                    .to_string(),
+            );
+            return guard.clone();
+        };
+
+        // P1:先查磁盘缓存(指纹校验)。命中即 Ready,跳过 cargo metadata + rg。
+        if let Some(cached) = crate::topology_cache::load_cache(&self.workspace_root, language) {
+            *guard = TopologyState::Ready(Box::new(cached.data));
+            return guard.clone();
+        }
+
         // Uninitialized → Building,派发后台线程
         let started_at = Instant::now();
         *guard = TopologyState::Building { started_at };
@@ -195,11 +222,14 @@ impl ProjectTopology {
         let workspace_root = self.workspace_root.clone();
 
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| build_topology_data(&workspace_root));
+            let result =
+                std::panic::catch_unwind(|| build_topology_data(&workspace_root, language));
 
             let mut guard = state_clone.lock().unwrap_or_else(|e| e.into_inner());
             match result {
                 Ok(Ok(data)) => {
+                    // P1:构建成功后落盘(仅成功时;best-effort,失败静默)。
+                    crate::topology_cache::save_cache(&workspace_root, language, &data);
                     *guard = TopologyState::Ready(Box::new(data));
                 }
                 Ok(Err(e)) => {
@@ -229,6 +259,8 @@ impl ProjectTopology {
     /// `ensure_built()` 相同(返回当前状态)。在 `Uninitialized` 状态下
     /// 同步执行 `build_topology_data` 并更新状态,返回最终结果。
     ///
+    /// P1:Uninitialized 时同样先查磁盘缓存;构建成功后落盘。
+    ///
     /// 注意:此方法会阻塞调用线程直到 `cargo metadata` + `build_symbol_index_fast`
     /// 完成(通常 < 5 秒,大项目可能更久)。生产路径应使用 `ensure_built()`。
     pub fn ensure_built_blocking(&self) -> TopologyState {
@@ -245,18 +277,36 @@ impl ProjectTopology {
             TopologyState::Uninitialized => {}
         }
 
+        // 无支持语言 → 直接 Failed。
+        let Some(language) = self.language else {
+            *guard = TopologyState::Failed(
+                "no supported language detected (requires a cargo workspace or \
+                 Python project markers: pyproject.toml/setup.py/setup.cfg/requirements.txt)"
+                    .to_string(),
+            );
+            return guard.clone();
+        };
+
+        // P1:先查磁盘缓存(指纹校验)。
+        if let Some(cached) = crate::topology_cache::load_cache(&self.workspace_root, language) {
+            *guard = TopologyState::Ready(Box::new(cached.data));
+            return guard.clone();
+        }
+
         // Uninitialized → Building,同步执行构建
         let started_at = Instant::now();
         *guard = TopologyState::Building { started_at };
         drop(guard);
 
-        let result = build_topology_data(&self.workspace_root);
+        let result = build_topology_data(&self.workspace_root, language);
         let elapsed = started_at.elapsed();
 
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match result {
             Ok(mut data) => {
                 data.built_at_ms = elapsed.as_millis() as u64;
+                // P1:构建成功后落盘。
+                crate::topology_cache::save_cache(&self.workspace_root, language, &data);
                 *guard = TopologyState::Ready(Box::new(data));
             }
             Err(e) => {
@@ -470,6 +520,88 @@ impl ProjectTopology {
         }
     }
 
+    /// P3:查找符号的引用点(爆炸半径)。
+    ///
+    /// 基于 SymbolIndex 的 `callers` 表,输出按 caller 文件分组、**按不同 caller
+    /// 文件去重**的紧凑列表(避免单文件多次调用放大权重)。用于 LLM 在修改
+    /// 符号前评估影响面。
+    ///
+    /// 未找到符号或仅有定义无调用时引导 `grep_search`;topology 未 Ready 时
+    /// 返回"构建中/不可用"提示(沿用 Building 分支模式,不阻塞)。
+    pub fn find_references(&self, symbol: &str) -> Result<String, String> {
+        let state = self.ensure_built();
+        match state {
+            TopologyState::Ready(data) => {
+                let Some(si) = &data.symbol_index else {
+                    return Ok(format!(
+                        "Symbol index is not available (no symbol index in topology data). \
+                         Use `grep_search` to find references to `{symbol}` manually."
+                    ));
+                };
+                // 校验符号存在(定义或引用皆可);严格按定义查询。
+                let defined = si.definitions.contains_key(symbol);
+                let called = si
+                    .callers
+                    .get(symbol)
+                    .map(|c| !c.is_empty())
+                    .unwrap_or(false);
+                if !defined && !called {
+                    return Ok(format!(
+                        "Symbol `{symbol}` not found in topology index. \
+                         Use `grep_search` or `read_file` to locate it."
+                    ));
+                }
+                if !called {
+                    return Ok(format!(
+                        "Symbol `{symbol}` is defined but no call sites were found in the \
+                         topology index. Verify with `grep_search` if unsure."
+                    ));
+                }
+                // 按 caller 文件分组去重。
+                let mut by_file: std::collections::BTreeMap<PathBuf, Vec<u32>> =
+                    std::collections::BTreeMap::new();
+                if let Some(callers) = si.callers.get(symbol) {
+                    for cs in callers {
+                        by_file.entry(cs.file.clone()).or_default().push(cs.line);
+                    }
+                }
+                let mut out = format!(
+                    "## References to `{symbol}` ({} calling file(s)):\n",
+                    by_file.len()
+                );
+                for (file, mut lines) in by_file {
+                    lines.sort_unstable();
+                    lines.dedup();
+                    let rel = if file.is_absolute() {
+                        file.strip_prefix(&data.module_graph.workspace_root)
+                            .map(|r| r.to_path_buf())
+                            .unwrap_or(file.clone())
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    } else {
+                        file.to_string_lossy().replace('\\', "/")
+                    };
+                    let shown: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+                    out.push_str(&format!("  {}: {}\n", rel, shown.join(", ")));
+                }
+                out.push_str(
+                    "\nUse this to assess blast radius before modifying `{symbol}`. \
+                     grep_search may find additional references the index missed.",
+                );
+                Ok(out)
+            }
+            TopologyState::Building { .. } => Ok(
+                "ProjectTopology is still building. Use `grep_search` to find references \
+                 now, or retry after a moment. Do NOT retry immediately."
+                    .to_string(),
+            ),
+            TopologyState::Failed(e) => Ok(format!(
+                "ProjectTopology failed to build: {e}. Use `grep_search` to find references."
+            )),
+            TopologyState::Uninitialized => Ok("ProjectTopology is uninitialized.".to_string()),
+        }
+    }
+
     /// 获取符号信息。
     ///
     /// 如果 LspRegistry 可用，会尝试通过 LSP 获取引用信息。
@@ -654,12 +786,29 @@ fn crate_path_display(g: &ModuleGraph, path: &Path) -> String {
 ///
 /// 返回 `Result<TopologyData, String>`:
 /// - `Ok(data)`:ModuleGraph 构建成功;SymbolIndex 可能仍为 None(best-effort)
-/// - `Err(e)`:cargo metadata 失败(非 cargo 目录、cargo 不可用等)
-fn build_topology_data(workspace_root: &Path) -> Result<TopologyData, String> {
+/// - `Err(e)`:cargo metadata 失败且无 Python 降级路径(非 cargo 目录、cargo 不可用等)
+fn build_topology_data(
+    workspace_root: &Path,
+    language: crate::topology_cache::Language,
+) -> Result<TopologyData, String> {
     let started_at = Instant::now();
 
-    // Build ModuleGraph via cargo metadata
-    let module_graph = build_module_graph(workspace_root)?;
+    // Build ModuleGraph(cargo workspace)或 Python 降级(单伪 crate)。
+    let module_graph = match build_module_graph(workspace_root) {
+        Ok(g) => g,
+        // P2:非 cargo 项目 → 若为 Python 项目,退化出单伪 crate 的 ModuleGraph,
+        // 使 query_project_graph/find_boundary_crossings/get_symbol_info 全部可用。
+        // 不做目录模块图(改动最小)。非 Python 项目维持 Failed。
+        Err(e) => match language {
+            crate::topology_cache::Language::Python => {
+                match build_python_fallback_graph(workspace_root) {
+                    Some(g) => g,
+                    None => return Err(e),
+                }
+            }
+            crate::topology_cache::Language::Rust => return Err(e),
+        },
+    };
 
     // Phase 4 P0-5:用 grep/rg 填充 SymbolIndex(best-effort)。
     // 之前 symbol_index 恒为 None,导致 DomainTools 的 refactor_algorithm_topo
@@ -673,7 +822,7 @@ fn build_topology_data(workspace_root: &Path) -> Result<TopologyData, String> {
     let symbol_index = if source_dirs.is_empty() {
         None
     } else {
-        build_symbol_index_fast(&source_dirs).ok()
+        build_symbol_index_fast(&source_dirs, language).ok()
     };
 
     Ok(TopologyData {
@@ -681,6 +830,74 @@ fn build_topology_data(workspace_root: &Path) -> Result<TopologyData, String> {
         symbol_index,
         built_at_ms: started_at.elapsed().as_millis() as u64,
     })
+}
+
+/// P2:Python 项目的退化 ModuleGraph(单伪 crate)。
+/// `source_paths` = 含 `__init__.py` 的包目录;无包结构时退回 [root]。
+fn build_python_fallback_graph(root: &Path) -> Option<ModuleGraph> {
+    if !has_python_project_from_meta(root) {
+        return None;
+    }
+    // 收集含 __init__.py 的包目录;为空则用 root 本身。
+    let mut pkg_dirs: Vec<PathBuf> = Vec::new();
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            if e.file_type().is_dir() {
+                let name = e.file_name().to_string_lossy();
+                !matches!(
+                    name.as_ref(),
+                    "target" | "node_modules" | "__pycache__" | "venv" | ".venv"
+                ) && !name.starts_with('.')
+            } else {
+                true
+            }
+        })
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.is_dir() && path.join("__init__.py").is_file() {
+            pkg_dirs.push(path.to_path_buf());
+        }
+    }
+    let source_paths = if pkg_dirs.is_empty() {
+        vec![root.to_path_buf()]
+    } else {
+        pkg_dirs
+    };
+    Some(ModuleGraph {
+        workspace_root: root.to_path_buf(),
+        crates: vec![CrateInfo {
+            name: "python-project".to_string(),
+            version: "0.0.0".to_string(),
+            manifest_path: {
+                let pyproject = root.join("pyproject.toml");
+                if pyproject.exists() {
+                    pyproject
+                } else {
+                    root.to_path_buf()
+                }
+            },
+            dependencies: Vec::new(),
+            source_paths,
+        }],
+        reverse_deps: HashMap::new(),
+    })
+}
+
+/// 判断目录是否含 Python 项目标记(与 topology_cache::pick_primary_language
+/// 的判定一致;此处避免循环依赖,只做文件存在检查)。
+fn has_python_project_from_meta(root: &Path) -> bool {
+    const PY_MARKERS: [&str; 4] = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+    ];
+    PY_MARKERS.iter().any(|m| root.join(m).exists())
 }
 
 /// 通过 `cargo metadata` 构建 ModuleGraph。
@@ -777,25 +994,42 @@ fn build_module_graph(root: &Path) -> Result<ModuleGraph, String> {
 
 /// 通过 grep 快速构建符号索引。
 ///
-/// 这是 best-effort 实现:使用 `grep -rn` 搜 Rust 符号定义
-/// (`pub fn`, `pub struct`, `pub trait`, `pub enum`, `pub mod` 等)。
-/// 比 LSP 快但不支持宏展开/条件编译。
-pub fn build_symbol_index_fast(source_dirs: &[PathBuf]) -> Result<SymbolIndex, String> {
+/// 这是 best-effort 实现:使用 `rg`/`grep` 搜符号定义。
+/// - Rust:`pub fn`, `pub struct`, `pub trait`, `pub enum`, `pub mod` 等;
+/// - Python:`def` / `async def` / `class`。
+///
+/// 比 LSP 快但不支持宏展开/条件编译/动态定义。
+pub fn build_symbol_index_fast(
+    source_dirs: &[PathBuf],
+    language: crate::topology_cache::Language,
+) -> Result<SymbolIndex, String> {
     let mut definitions: HashMap<String, Vec<SymbolDef>> = HashMap::new();
     let mut file_symbols: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
     for dir in source_dirs {
-        // Use cargo's ripgrep or grep to find pub declarations
+        // Use ripgrep to find symbol declarations (language-specific pattern).
         // P2-3 修复:在 `pub` 前加 `\b` 词边界,避免匹配 `repub fn foo()` 中的 `pub`。
         // rg 使用 Rust regex 语法,支持 `\b`;grep -E (POSIX ERE) 不支持 `\b`,
         // 但 grep fallback 用了不同的 pattern(见下方),所以这里 rg pattern 用 \b。
+        let (pattern, grep_pattern, include): (&str, &str, &str) = match language {
+            crate::topology_cache::Language::Rust => (
+                r"\bpub(?:\(\s*(?:crate|super)\s*\))?\s+(fn|struct|trait|enum|mod|type|const|static)\s+(\w+)",
+                r"(^|[^a-zA-Z0-9_])pub(\([[:space:]]*(crate|super)[[:space:]]*\))?[[:space:]]+(fn|struct|trait|enum|mod|type|const|static)[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*",
+                "*.rs",
+            ),
+            crate::topology_cache::Language::Python => (
+                r"^\s*(?:async\s+)?(def|class)\s+(\w+)",
+                r"^[[:space:]]*(\[[:space:]]*async[[:space:]]+)?(def|class)[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*",
+                "*.py",
+            ),
+        };
         let result = Command::new("rg")
             .args([
                 "--no-heading",
                 "--line-number",
                 "--type",
-                "rust",
-                r"\bpub(?:\(\s*(?:crate|super)\s*\))?\s+(fn|struct|trait|enum|mod|type|const|static)\s+(\w+)",
+                language.grep_type(),
+                pattern,
             ])
             .arg(dir)
             .output();
@@ -807,12 +1041,7 @@ pub fn build_symbol_index_fast(source_dirs: &[PathBuf]) -> Result<SymbolIndex, S
         let output = match result {
             Ok(o) if o.status.success() => o,
             _ => Command::new("grep")
-                .args([
-                    "-rn",
-                    "--include=*.rs",
-                    "-E",
-                    r"(^|[^a-zA-Z0-9_])pub(\([[:space:]]*(crate|super)[[:space:]]*\))?[[:space:]]+(fn|struct|trait|enum|mod|type|const|static)[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*",
-                ])
+                .args(["-rn", &format!("--include={include}"), "-E", grep_pattern])
                 .arg(dir)
                 .output()
                 .map_err(|e| format!("grep failed: {e}"))?,
@@ -821,7 +1050,7 @@ pub fn build_symbol_index_fast(source_dirs: &[PathBuf]) -> Result<SymbolIndex, S
         if output.status.success() {
             for line in output.stdout.lines() {
                 let line = line.map_err(|e| format!("read line: {e}"))?;
-                if let Some(sym) = parse_grep_line(&line, dir) {
+                if let Some(sym) = parse_grep_line(&line, dir, language) {
                     definitions
                         .entry(sym.name.clone())
                         .or_default()
@@ -836,10 +1065,10 @@ pub fn build_symbol_index_fast(source_dirs: &[PathBuf]) -> Result<SymbolIndex, S
     }
 
     // Callers are harder to get without LSP; use a simplified approach
-    // by finding all function/method invocations
+    // by finding all function/method invocations.
     let mut callers: HashMap<String, Vec<CallSite>> = HashMap::new();
     for dir in source_dirs {
-        if let Ok(lines) = find_callers_fast(dir, &definitions) {
+        if let Ok(lines) = find_callers_fast(dir, &definitions, language) {
             for (func_name, sites) in lines {
                 callers.entry(func_name).or_default().extend(sites);
             }
@@ -853,7 +1082,11 @@ pub fn build_symbol_index_fast(source_dirs: &[PathBuf]) -> Result<SymbolIndex, S
     })
 }
 
-fn parse_grep_line(line: &str, base_dir: &Path) -> Option<SymbolDef> {
+fn parse_grep_line(
+    line: &str,
+    base_dir: &Path,
+    language: crate::topology_cache::Language,
+) -> Option<SymbolDef> {
     // Format: path:line:content
     //
     // P2-3 修复:Windows 路径解析。
@@ -872,19 +1105,34 @@ fn parse_grep_line(line: &str, base_dir: &Path) -> Option<SymbolDef> {
         return None;
     }
 
-    // Extract symbol kind and name
-    // 支持 pub、pub(crate)、pub(super) 三种可见性,与 build_symbol_index_fast 的 grep regex 一致
-    //
-    // P2-3 修复:在 `pub` 前加 `\b` 词边界,避免匹配 `repub fn foo()`
+    // 按语言提取符号 kind 与 name。
+    // Rust:P2-3 修复 在 `pub` 前加 `\b` 词边界,避免匹配 `repub fn foo()`
     // 中的 `pub`(否则会把 `repub fn` 误识别为 `pub fn`,捕获到错误的符号名)。
-    // `\b` 在 `repub` 的 `e`→`p` 位置不成立(都是单词字符),所以会跳过。
-    let re = regex::Regex::new(
-        r"\bpub(?:\(\s*(?:crate|super)\s*\))?\s+(fn|struct|trait|enum|mod|type|const|static)\s+(\w+)"
-    ).ok()?;
+    // Python:def / async def / class。
+    let re = match language {
+        crate::topology_cache::Language::Rust => regex::Regex::new(
+            r"\bpub(?:\(\s*(?:crate|super)\s*\))?\s+(fn|struct|trait|enum|mod|type|const|static)\s+(\w+)",
+        )
+        .ok()?,
+        crate::topology_cache::Language::Python => {
+            regex::Regex::new(r"^\s*(?:async\s+)?(def|class)\s+(\w+)").ok()?
+        }
+    };
     let caps = re.captures(content)?;
 
-    let kind = caps.get(1)?.as_str().to_string();
-    let name = caps.get(2)?.as_str().to_string();
+    // Python:def 归一为 "fn"(函数语义,与 callers 过滤 `kind == "fn"` 一致),
+    // class 保持 "class";Rust 沿用捕获组。
+    let (kind, name) = match language {
+        crate::topology_cache::Language::Rust => (
+            caps.get(1)?.as_str().to_string(),
+            caps.get(2)?.as_str().to_string(),
+        ),
+        crate::topology_cache::Language::Python => {
+            let raw_kind = caps.get(1)?.as_str();
+            let kind = if raw_kind == "def" { "fn" } else { raw_kind }.to_string();
+            (kind, caps.get(2)?.as_str().to_string())
+        }
+    };
 
     let relative_path = Path::new(file_path)
         .strip_prefix(base_dir)
@@ -892,15 +1140,20 @@ fn parse_grep_line(line: &str, base_dir: &Path) -> Option<SymbolDef> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(file_path));
 
-    // Determine visibility
-    let visibility = if content.contains("pub(crate)") {
-        Some("pub(crate)".to_string())
-    } else if content.contains("pub(super)") {
-        Some("pub(super)".to_string())
-    } else if content.contains("pub ") {
-        Some("pub".to_string())
-    } else {
-        None
+    // Determine visibility(Rust 专属;Python 无 pub 概念)。
+    let visibility = match language {
+        crate::topology_cache::Language::Rust => {
+            if content.contains("pub(crate)") {
+                Some("pub(crate)".to_string())
+            } else if content.contains("pub(super)") {
+                Some("pub(super)".to_string())
+            } else if content.contains("pub ") {
+                Some("pub".to_string())
+            } else {
+                None
+            }
+        }
+        crate::topology_cache::Language::Python => None,
     };
 
     Some(SymbolDef {
@@ -913,88 +1166,203 @@ fn parse_grep_line(line: &str, base_dir: &Path) -> Option<SymbolDef> {
     })
 }
 
+/// 批量 rg 查找调用点(P2 重写,替代"每符号一次 rg"的 O(N) 子进程开销)。
+///
+/// 实现要点:
+/// - 每目录一次 `rg --json` + 交替 pattern,子进程数从「符号数」降到「目录数」。
+/// - `--json` 事件流:仅处理 `match` 事件,路径取 `data.path.text`,行号取
+///   `data.lines.line_number`,符号名优先取捕获组 `submatches[1].match.text`
+///   (`submatches[0]` 为整体匹配)。
+/// - 符号名必须 `regex::escape`;按 **pattern 字节数**(≤ 8KB,而非数量)分块,
+///   防 ARG_MAX / rg 编译过慢。
+/// - 超时:复用 `topology_cache::run_command_with_timeout`(30s,try_wait 轮询 +
+///   超时 kill + wait 回收僵尸进程),返回部分结果。
+/// - 调用点按匹配到的符号名分桶;被调函数同名的定义行会被过滤。
 fn find_callers_fast(
     dir: &Path,
     definitions: &HashMap<String, Vec<SymbolDef>>,
+    language: crate::topology_cache::Language,
 ) -> Result<HashMap<String, Vec<CallSite>>, String> {
+    // 函数类型符号(kind == "fn"):匹配 `name(`。
+    let fn_names: Vec<&str> = definitions
+        .iter()
+        .filter(|(_, defs)| defs.iter().any(|d| d.kind == "fn"))
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    // struct / enum / class 类型符号:词用引用(不带 `(`),避免与方法调用混淆。
+    let type_names: Vec<&str> = definitions
+        .iter()
+        .filter(|(_, defs)| {
+            defs.iter().any(|d| {
+                d.kind != "fn" && d.kind != "mod" && d.kind != "const" && d.kind != "static"
+            })
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+
     let mut result: HashMap<String, Vec<CallSite>> = HashMap::new();
 
-    // P2-3:预编译 regex,避免在内层 line 循环中重复编译。
-    // 用于解析 grep 输出 `path:line:content`,Windows 盘符冒号免疫。
-    let separator_re =
-        regex::Regex::new(r":(\d+):").map_err(|e| format!("regex compile failed: {e}"))?;
-
-    // For each known function name, search for its usage
-    for func_name in definitions
-        .iter()
-        .filter_map(|(name, defs)| {
-            if defs.iter().any(|d| d.kind == "fn") {
-                Some(name.as_str())
-            } else {
-                None
-            }
-        })
-        .take(100)
-    {
-        let output = Command::new("rg")
-            .args([
-                "--no-heading",
-                "--line-number",
-                "--type",
-                "rust",
-                &format!(r"\b{func_name}\("),
-            ])
-            .arg(dir)
-            .output();
-
-        let lines = match output {
-            Ok(o) if o.status.success() => o.stdout,
-            _ => continue,
-        };
-
-        for line in lines.lines() {
-            let line = line.map_err(|e| format!("read line: {e}"))?;
-            // P2-3 修复:Windows 路径解析,与 parse_grep_line 同样的策略。
-            // 之前 `line.find(':')` 在 `C:\project\src\main.rs:42:foo()` 上
-            // 会定位到盘符后的冒号,导致 file_path="C" 解析失败。
-            // 现在用预编译的 separator_re 找到真正的 "行号分隔符" 位置。
-            let Some(caps) = separator_re.captures(&line) else {
-                continue;
-            };
-            let Some(whole_match) = caps.get(0) else {
-                continue;
-            };
-            let Some(cap1) = caps.get(1) else {
-                continue;
-            };
-            let Ok(line_num) = cap1.as_str().parse::<u32>() else {
-                continue;
-            };
-            let file_path = &line[..whole_match.start()];
-            let context = line[whole_match.end()..].to_string();
-            if file_path.is_empty() {
-                continue;
-            }
-
-            let file_path_path = Path::new(file_path);
-            let relative_path = file_path_path
-                .strip_prefix(dir)
-                .ok()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from(file_path));
-
-            result
-                .entry(func_name.to_string())
-                .or_default()
-                .push(CallSite {
-                    file: relative_path,
-                    line: line_num,
-                    context: Some(context),
-                });
+    // 函数调用:name(
+    for pattern in chunked_alternation(&fn_names, r"\b({})\s*\(", 8 * 1024) {
+        let sites = run_batch_rg(dir, &pattern, language)?;
+        for (symbol, callsites) in sites {
+            result.entry(symbol).or_default().extend(callsites);
+        }
+    }
+    // 类型词用:name(不带括号,宽松匹配跨文件引用)
+    for pattern in chunked_alternation(&type_names, r"\b({})\b", 8 * 1024) {
+        let sites = run_batch_rg(dir, &pattern, language)?;
+        for (symbol, callsites) in sites {
+            result.entry(symbol).or_default().extend(callsites);
         }
     }
 
     Ok(result)
+}
+
+/// 把符号名按 **pattern 字节数**分块(不是按数量),避免单次 rg pattern 过大。
+/// `template` 含一个 `{}` 占位符用于包住交替组。
+fn chunked_alternation(names: &[&str], template: &str, max_bytes: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_len = 0usize;
+    for name in names {
+        let escaped = regex::escape(name);
+        let add_len = escaped.len() + 1; // 交替分隔符
+        if !current.is_empty() && current_len + add_len > max_bytes {
+            chunks.push(template.replace("{}", &current.join("|")));
+            current.clear();
+            current_len = 0;
+        }
+        current_len += add_len;
+        current.push(escaped);
+    }
+    if !current.is_empty() {
+        chunks.push(template.replace("{}", &current.join("|")));
+    }
+    chunks
+}
+
+/// 跑一次批量 rg(--json),解析匹配事件并按符号名分桶。
+fn run_batch_rg(
+    dir: &Path,
+    pattern: &str,
+    language: crate::topology_cache::Language,
+) -> Result<HashMap<String, Vec<CallSite>>, String> {
+    let mut cmd = Command::new("rg");
+    cmd.args(["-o", "-n", "--no-heading", "--json", "--type"])
+        .arg(language.grep_type())
+        .arg(pattern)
+        .arg(dir);
+
+    // 30s 超时:复用 topology_cache 的轮询实现(kill 后 wait 回收僵尸进程)。
+    let Some(out) = crate::topology_cache::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(30),
+    ) else {
+        return Ok(HashMap::new());
+    };
+
+    let mut result: HashMap<String, Vec<CallSite>> = HashMap::new();
+    for line in out.stdout.lines() {
+        let Ok(line) = line else { continue };
+        let Ok(ev) = serde_json::from_str::<RgEvent>(&line) else {
+            continue;
+        };
+        // 仅处理 match 事件(begin/end 跳过)。
+        if ev.typ != "match" {
+            continue;
+        }
+        let Some(data) = ev.data else { continue };
+        let path = data.path.map(|p| p.text).unwrap_or_default();
+        let line_num = data.lines.as_ref().map(|l| l.line_number).unwrap_or(0);
+        let context = data.lines.map(|l| l.text).unwrap_or_default();
+        if path.is_empty() {
+            continue;
+        }
+        // 符号名:优先捕获组(submatches[1]),否则整体匹配(submatches[0])。
+        let symbol = data
+            .submatches
+            .as_deref()
+            .and_then(|s| s.get(1))
+            .map(|m| m.match_.text.clone())
+            .or_else(|| {
+                data.submatches
+                    .as_deref()
+                    .and_then(|s| s.first())
+                    .map(|m| m.match_.text.clone())
+            });
+        let Some(symbol) = symbol else {
+            continue;
+        };
+        // 排除被调函数自身的定义行:统一按语言识别定义行前缀,
+        // 避免 `def foo(` / `fn foo(` 自身的定义行计入调用点。
+        if is_definition_line(&context, language) {
+            continue;
+        }
+        let relative_path = Path::new(&path)
+            .strip_prefix(dir)
+            .ok()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(&path));
+        result.entry(symbol).or_default().push(CallSite {
+            file: relative_path,
+            line: line_num,
+            context: Some(context),
+        });
+    }
+    Ok(result)
+}
+
+/// 判断一行是否为符号**定义行**(仅覆盖文本可见的常见修饰符组合,best-effort;
+/// `default fn` nightly 特化 / 宏生成的 fn 不在文本可判范围,可接受漏判)。
+fn is_definition_line(line: &str, language: crate::topology_cache::Language) -> bool {
+    match language {
+        crate::topology_cache::Language::Rust => {
+            // 覆盖 pub / pub(crate) / pub(in path) / async / unsafe / const / extern "C"。
+            regex::Regex::new(
+                r#"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+"#,
+            )
+            .is_ok_and(|re| re.is_match(line))
+        }
+        crate::topology_cache::Language::Python => {
+            regex::Regex::new(r"^\s*(?:async\s+)?(?:def|class)\s+")
+                .is_ok_and(|re| re.is_match(line))
+        }
+    }
+}
+
+/// rg `--json` 事件的最小结构(只取需要的字段)。
+#[derive(Debug, serde::Deserialize)]
+struct RgEvent {
+    #[serde(rename = "type")]
+    typ: String,
+    data: Option<RgData>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RgData {
+    path: Option<RgText>,
+    lines: Option<RgLines>,
+    submatches: Option<Vec<RgSubmatch>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RgText {
+    text: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RgLines {
+    text: String,
+    line_number: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RgSubmatch {
+    #[serde(rename = "match")]
+    match_: RgText,
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,7 +1399,8 @@ mod tests {
     fn parse_grep_line_parses_pub_fn() {
         let base = PathBuf::from("/project/src");
         let line = "/project/src/main.rs:42:pub fn hello_world() {";
-        let sym = parse_grep_line(line, &base).expect("should parse");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse");
         assert_eq!(sym.name, "hello_world");
         assert_eq!(sym.kind, "fn");
         assert_eq!(sym.line, 42);
@@ -1042,7 +1411,8 @@ mod tests {
     fn parse_grep_line_parses_pub_struct() {
         let base = PathBuf::from("/project/src");
         let line = "/project/src/lib.rs:10:pub struct MyStruct<T> {";
-        let sym = parse_grep_line(line, &base).expect("should parse");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse");
         assert_eq!(sym.name, "MyStruct");
         assert_eq!(sym.kind, "struct");
     }
@@ -1051,8 +1421,8 @@ mod tests {
         let base = PathBuf::from("/project/src");
         let line = "/project/src/internal.rs:5:pub(crate) fn internal_helper() {";
         // P2-3 修复：regex 现在支持 pub(crate) 可见性，不再容忍解析失败
-        let sym =
-            parse_grep_line(line, &base).expect("pub(crate) fn should be parsed with fixed regex");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("pub(crate) fn should be parsed with fixed regex");
         assert_eq!(sym.name, "internal_helper");
         assert_eq!(sym.kind, "fn");
         assert_eq!(sym.visibility.as_deref(), Some("pub(crate)"));
@@ -1062,8 +1432,8 @@ mod tests {
     fn parse_grep_line_parses_pub_super_fn() {
         let base = PathBuf::from("/project/src");
         let line = "/project/src/mod.rs:12:pub(super) fn super_helper() {";
-        let sym =
-            parse_grep_line(line, &base).expect("pub(super) fn should be parsed with fixed regex");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("pub(super) fn should be parsed with fixed regex");
         assert_eq!(sym.name, "super_helper");
         assert_eq!(sym.kind, "fn");
         assert_eq!(sym.visibility.as_deref(), Some("pub(super)"));
@@ -1080,7 +1450,8 @@ mod tests {
         // 导致 file_path="C",line_num 解析失败,返回 None。
         let base = PathBuf::from(r"C:\project\src");
         let line = r"C:\project\src\main.rs:42:pub fn hello_world() {";
-        let sym = parse_grep_line(line, &base).expect("should parse Windows path");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse Windows path");
         assert_eq!(sym.name, "hello_world");
         assert_eq!(sym.kind, "fn");
         assert_eq!(sym.line, 42);
@@ -1097,7 +1468,8 @@ mod tests {
         // 组合测试:Windows 路径 + pub(crate) 可见性
         let base = PathBuf::from(r"C:\project\src");
         let line = r"C:\project\src\internal.rs:5:pub(crate) fn internal_helper() {";
-        let sym = parse_grep_line(line, &base).expect("should parse Windows path + pub(crate) fn");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse Windows path + pub(crate) fn");
         assert_eq!(sym.name, "internal_helper");
         assert_eq!(sym.kind, "fn");
         assert_eq!(sym.line, 5);
@@ -1115,11 +1487,124 @@ mod tests {
         let line = "/project/src/main.rs:42:fn repub_fn() { pub fn real_pub() {}";
         // 第一行 `fn repub_fn()` 不匹配 `pub fn` 模式(没有 pub 前缀)。
         // `pub fn real_pub()` 是合法的 pub fn,应该被解析到 `real_pub`。
-        let sym = parse_grep_line(line, &base).expect("should parse the real pub fn");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse the real pub fn");
         assert_eq!(
             sym.name, "real_pub",
             "should capture real_pub, not repub_fn (word boundary bug)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // P2 — Python 符号索引 / 批量 callers / 定义行排除
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_grep_line_parses_python_def_and_class() {
+        let base = PathBuf::from("/proj/pkg");
+        let line = "/proj/pkg/mod.py:5:def hello(x):";
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Python)
+            .expect("python def should parse");
+        assert_eq!(sym.name, "hello");
+        assert_eq!(sym.kind, "fn");
+        assert_eq!(sym.visibility, None);
+
+        let line2 = "/proj/pkg/mod.py:10:class Foo:";
+        let sym2 = parse_grep_line(line2, &base, crate::topology_cache::Language::Python)
+            .expect("python class should parse");
+        assert_eq!(sym2.name, "Foo");
+        assert_eq!(sym2.kind, "class");
+    }
+
+    #[test]
+    fn chunked_alternation_splits_by_bytes_and_escapes() {
+        let owned: Vec<String> = (0..20).map(|i| format!("func_{i}")).collect();
+        let names: Vec<&str> = owned.iter().map(String::as_str).collect();
+        // 足够大的预算 → 单块,且符号被转义。
+        let chunks = chunked_alternation(&names, r"\b({})\s*\(", usize::MAX);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains(r"\b(func_0|func_1"));
+        // 极小的预算 → 逐符号分块。
+        let tiny = chunked_alternation(&names, r"\b({})\s*\(", 4);
+        assert!(tiny.len() > 1);
+        // 元字符符号必须被转义。
+        let tricky: Vec<&str> = vec!["a.b", "c+d"];
+        let esc = chunked_alternation(&tricky, r"\b({})\s*\(", usize::MAX);
+        assert!(esc[0].contains(r"(a\.b"), "should escape dot: {}", esc[0]);
+    }
+
+    #[test]
+    fn is_definition_line_rust_covers_modifier_variants() {
+        fn is_def(line: &str) -> bool {
+            is_definition_line(line, crate::topology_cache::Language::Rust)
+        }
+        assert!(is_def("fn foo() {}"));
+        assert!(is_def("pub fn foo() {}"));
+        assert!(is_def("pub(crate) fn foo() {}"));
+        assert!(is_def("pub(in crate::x) fn foo() {}"));
+        assert!(is_def("async fn foo() {}"));
+        assert!(is_def("unsafe fn foo() {}"));
+        assert!(is_def("const fn foo() {}"));
+        assert!(is_def(r#"extern "C" fn foo() {}"#));
+        assert!(!is_def("    foo();"));
+        assert!(!is_def("let x = foo();"));
+    }
+
+    #[test]
+    fn is_definition_line_python_def_and_class() {
+        fn is_def(line: &str) -> bool {
+            is_definition_line(line, crate::topology_cache::Language::Python)
+        }
+        assert!(is_def("def foo():"));
+        assert!(is_def("async def foo():"));
+        assert!(is_def("class Foo:"));
+        assert!(is_def("    def method(self):"));
+        assert!(!is_def("foo()"));
+        assert!(!is_def("x = foo(1)"));
+    }
+
+    #[test]
+    fn build_python_fallback_graph_recognizes_pyproject() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg").join("__init__.py"), "").unwrap();
+        let g = build_python_fallback_graph(dir.path()).expect("should build fallback graph");
+        assert_eq!(g.crates.len(), 1);
+        assert_eq!(g.crates[0].name, "python-project");
+        // source_paths 收敛到含 __init__.py 的包目录。
+        assert!(
+            g.crates[0].source_paths.iter().any(|p| p.ends_with("pkg")),
+            "should include pkg dir, got: {:?}",
+            g.crates[0].source_paths
+        );
+    }
+
+    #[test]
+    fn build_topology_python_project_succeeds_with_fallback() {
+        // Python 项目(cargo 不存在/失败)→ 退化 ModuleGraph + 符号索引,不可用 Failed。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname=\"demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("demo.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+        let result = build_topology_data(dir.path(), crate::topology_cache::Language::Python);
+        let data = result.expect("python project should build with fallback graph");
+        assert_eq!(data.module_graph.crates.len(), 1);
+        assert_eq!(data.module_graph.crates[0].name, "python-project");
+        // 符号索引应含 add(需本机有 rg;无 rg 时 all). 至少不应是 None 之外报错。
+        if let Some(si) = &data.symbol_index {
+            assert!(
+                si.definitions.contains_key("add"),
+                "symbol index should contain add"
+            );
+        }
     }
 
     #[test]
@@ -1131,7 +1616,8 @@ mod tests {
         // 否则会匹配到错误位置。我们用一个含 URL 的 content 来验证。
         let base = PathBuf::from("/project/src");
         let line = "/project/src/main.rs:42:pub fn fetch(url: &str) -> String {";
-        let sym = parse_grep_line(line, &base).expect("should parse");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse");
         assert_eq!(sym.name, "fetch");
         assert_eq!(sym.line, 42);
     }
@@ -1142,7 +1628,7 @@ mod tests {
         // 这不应该发生在真实 grep 输出中,但作为防御性编程需要处理。
         let base = PathBuf::from("/project/src");
         let line = ":42:pub fn foo() {}";
-        let result = parse_grep_line(line, &base);
+        let result = parse_grep_line(line, &base, crate::topology_cache::Language::Rust);
         assert!(
             result.is_none(),
             "empty file_path should return None, got {result:?}"
@@ -1154,7 +1640,8 @@ mod tests {
         // 测试 const 关键字
         let base = PathBuf::from("/project/src");
         let line = "/project/src/constants.rs:10:pub const MAX_RETRIES: u32 = 3;";
-        let sym = parse_grep_line(line, &base).expect("should parse pub const");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse pub const");
         assert_eq!(sym.name, "MAX_RETRIES");
         assert_eq!(sym.kind, "const");
         assert_eq!(sym.visibility.as_deref(), Some("pub"));
@@ -1165,7 +1652,8 @@ mod tests {
         // 测试 static 关键字
         let base = PathBuf::from("/project/src");
         let line = "/project/src/globals.rs:5:pub static COUNTER: AtomicU64 = AtomicU64::new(0);";
-        let sym = parse_grep_line(line, &base).expect("should parse pub static");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse pub static");
         assert_eq!(sym.name, "COUNTER");
         assert_eq!(sym.kind, "static");
     }
@@ -1175,7 +1663,8 @@ mod tests {
         // 测试 type 关键字(类型别名)
         let base = PathBuf::from("/project/src");
         let line = "/project/src/types.rs:8:pub type Result<T> = std::result::Result<T, MyError>;";
-        let sym = parse_grep_line(line, &base).expect("should parse pub type");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse pub type");
         assert_eq!(sym.name, "Result");
         assert_eq!(sym.kind, "type");
     }
@@ -1185,7 +1674,8 @@ mod tests {
         // 测试 mod 关键字
         let base = PathBuf::from("/project/src");
         let line = "/project/src/lib.rs:1:pub mod network;";
-        let sym = parse_grep_line(line, &base).expect("should parse pub mod");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse pub mod");
         assert_eq!(sym.name, "network");
         assert_eq!(sym.kind, "mod");
     }
@@ -1195,7 +1685,8 @@ mod tests {
         // 测试 enum 关键字
         let base = PathBuf::from("/project/src");
         let line = "/project/src/enums.rs:3:pub enum Color { Red, Green, Blue }";
-        let sym = parse_grep_line(line, &base).expect("should parse pub enum");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse pub enum");
         assert_eq!(sym.name, "Color");
         assert_eq!(sym.kind, "enum");
     }
@@ -1205,7 +1696,8 @@ mod tests {
         // 测试 trait 关键字
         let base = PathBuf::from("/project/src");
         let line = "/project/src/traits.rs:7:pub trait Serializable { fn serialize(&self); }";
-        let sym = parse_grep_line(line, &base).expect("should parse pub trait");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse pub trait");
         assert_eq!(sym.name, "Serializable");
         assert_eq!(sym.kind, "trait");
     }
@@ -1215,7 +1707,7 @@ mod tests {
         // 非 pub 声明不应被索引(私有符号不在 SymbolIndex 范围内)
         let base = PathBuf::from("/project/src");
         let line = "/project/src/internal.rs:5:fn private_helper() {}";
-        let result = parse_grep_line(line, &base);
+        let result = parse_grep_line(line, &base, crate::topology_cache::Language::Rust);
         assert!(
             result.is_none(),
             "non-pub fn should not be indexed, got {result:?}"
@@ -1227,7 +1719,8 @@ mod tests {
         // 缩进的 pub fn(在 mod 块内)也应被解析
         let base = PathBuf::from("/project/src");
         let line = "/project/src/lib.rs:10:    pub fn indented_fn() {}";
-        let sym = parse_grep_line(line, &base).expect("should parse indented pub fn");
+        let sym = parse_grep_line(line, &base, crate::topology_cache::Language::Rust)
+            .expect("should parse indented pub fn");
         assert_eq!(sym.name, "indented_fn");
         assert_eq!(sym.kind, "fn");
     }
@@ -1358,6 +1851,9 @@ mod tests {
     fn p2_1_ensure_built_returns_building_immediately() {
         // ensure_built() 应立即返回 Building,不阻塞等待 cargo metadata
         let dir = tempfile::tempdir().unwrap();
+        // P1:需有语言标记(否则直接 Failed)。用损坏 Cargo.toml:语言= Rust 但
+        // cargo metadata 必然失败 → 终态 Failed,使异步化测试聚焦状态机行为。
+        std::fs::write(dir.path().join("Cargo.toml"), "[package").unwrap();
         let topo = ProjectTopology::new(dir.path().to_path_buf());
         let state = topo.ensure_built();
         // 首次调用必须立即返回 Building(而非 Ready/Failed)
@@ -1371,6 +1867,7 @@ mod tests {
     fn p2_1_ensure_built_does_not_respawn_while_building() {
         // 在 Building 状态下再次调用 ensure_built() 应返回 Building,不重复派发
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package").unwrap();
         let topo = ProjectTopology::new(dir.path().to_path_buf());
         let state1 = topo.ensure_built();
         assert!(matches!(state1, TopologyState::Building { .. }));
@@ -1417,6 +1914,7 @@ mod tests {
     fn p2_1_ensure_built_blocking_waits_for_existing_build() {
         // 如果已有后台构建在进行,ensure_built_blocking 应等待其完成
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package").unwrap();
         let topo = ProjectTopology::new(dir.path().to_path_buf());
         topo.ensure_built(); // 启动后台构建
                              // 此时状态应为 Building
@@ -1450,7 +1948,7 @@ mod tests {
     fn p2_1_build_topology_data_function_directly() {
         // 直接测试提取出的 build_topology_data 函数(不经状态机)
         let dir = tempfile::tempdir().unwrap();
-        let result = build_topology_data(dir.path());
+        let result = build_topology_data(dir.path(), crate::topology_cache::Language::Rust);
         // 非 cargo 目录应返回 Err
         assert!(result.is_err(), "expected error in non-cargo dir");
         let err = result.unwrap_err();
@@ -1487,6 +1985,146 @@ mod tests {
         assert!(
             matches!(final_state, TopologyState::Failed(_)),
             "expected Failed (not stuck Building), got {final_state}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1:磁盘缓存命中 / 无语言状态机
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn p1_ensure_built_hits_disk_cache_and_skips_build() {
+        // 手工构造缓存文件(模拟上次会话落盘),ensure_built 应直接 Ready,
+        // 不触发 cargo metadata(不进入 Building)。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let data = TopologyData {
+            module_graph: ModuleGraph {
+                workspace_root: dir.path().to_path_buf(),
+                crates: Vec::new(),
+                reverse_deps: HashMap::new(),
+            },
+            symbol_index: None,
+            built_at_ms: 0,
+        };
+        crate::topology_cache::save_cache(dir.path(), crate::topology_cache::Language::Rust, &data);
+
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        let state = topo.ensure_built();
+        if let TopologyState::Ready(d) = &state {
+            assert_eq!(d.built_at_ms, 0);
+        } else {
+            panic!("expected Ready from disk cache, got {state}");
+        }
+    }
+
+    #[test]
+    fn p1_ensure_built_fails_fast_without_supported_language() {
+        // 无任何语言标记 → 直接 Failed,不进入 Building(防"永远 Building")。
+        let dir = tempfile::tempdir().unwrap();
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        let state = topo.ensure_built();
+        assert!(
+            matches!(state, TopologyState::Failed(_)),
+            "expected Failed without supported language, got {state}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P3:find_references 爆炸半径
+    // -----------------------------------------------------------------------
+
+    fn refs_sample_topo() -> (ProjectTopology, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        // workspace 根 Cargo.toml 使语言探测为 Rust;缓存命中即 Ready。
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let data = TopologyData {
+            module_graph: ModuleGraph {
+                workspace_root: dir.path().to_path_buf(),
+                crates: Vec::new(),
+                reverse_deps: HashMap::new(),
+            },
+            symbol_index: Some(SymbolIndex {
+                definitions: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "target_fn".to_string(),
+                        vec![SymbolDef {
+                            name: "target_fn".to_string(),
+                            kind: "fn".to_string(),
+                            file: PathBuf::from("src/a.rs"),
+                            line: 1,
+                            crate_name: None,
+                            visibility: Some("pub".to_string()),
+                        }],
+                    );
+                    m
+                },
+                callers: {
+                    let mut m: HashMap<String, Vec<CallSite>> = HashMap::new();
+                    m.insert(
+                        "target_fn".to_string(),
+                        vec![
+                            CallSite {
+                                file: PathBuf::from("src/b.rs"),
+                                line: 10,
+                                context: Some("target_fn()".to_string()),
+                            },
+                            CallSite {
+                                file: PathBuf::from("src/b.rs"),
+                                line: 12,
+                                context: Some("target_fn(1)".to_string()),
+                            },
+                            CallSite {
+                                file: PathBuf::from("src/c.rs"),
+                                line: 5,
+                                context: Some("target_fn()".to_string()),
+                            },
+                        ],
+                    );
+                    m
+                },
+                file_symbols: HashMap::new(),
+            }),
+            built_at_ms: 0,
+        };
+        crate::topology_cache::save_cache(dir.path(), crate::topology_cache::Language::Rust, &data);
+        // 注意:必须随返回值持有 TempDir,否则函数返回即被 Drop 删除缓存文件。
+        (ProjectTopology::new(dir.path().to_path_buf()), dir)
+    }
+
+    #[test]
+    fn find_references_groups_by_file_and_dedups_lines() {
+        let (topo, _keep) = refs_sample_topo();
+        let out = topo.find_references("target_fn").expect("should not err");
+        // 两个调用文件(src/b.rs 的 10、12 两处去重行号仍保留;按文件分组)。
+        assert!(out.contains("src/b.rs"), "got: {out}");
+        assert!(out.contains("src/c.rs"), "got: {out}");
+        // 两个文件 → "2 calling file(s)"。
+        assert!(out.contains("2 calling file(s)"), "got: {out}");
+        // BTreeMap 按文件路径排序 → src/b.rs 在 src/c.rs 前。
+        let b_pos = out.find("src/b.rs").unwrap();
+        let c_pos = out.find("src/c.rs").unwrap();
+        assert!(b_pos < c_pos);
+    }
+
+    #[test]
+    fn find_references_unknown_symbol_guides_grep() {
+        let (topo, _keep) = refs_sample_topo();
+        let out = topo.find_references("nope").expect("should not err");
+        assert!(out.contains("not found"), "got: {out}");
+        assert!(out.contains("grep_search"), "got: {out}");
+    }
+
+    #[test]
+    fn find_references_building_state_returns_non_blocking_hint() {
+        // 无语言 → Failed;但确保 find_references 在这些状态下不 panic 且返回提示。
+        let dir = tempfile::tempdir().unwrap();
+        let topo = ProjectTopology::new(dir.path().to_path_buf());
+        let out = topo.find_references("x").expect("should not err");
+        assert!(
+            out.contains("Failed") || out.contains("not found") || out.contains("grep_search"),
+            "got: {out}"
         );
     }
 }

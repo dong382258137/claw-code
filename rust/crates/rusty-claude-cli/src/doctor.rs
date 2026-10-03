@@ -685,7 +685,10 @@ fn render_probe_lines(agg: &CacheStatsAggregate) -> Vec<String> {
         return vec!["  未捕获异常(无轮边界/深层分叉请求体落盘)".to_string()];
     }
     vec![
-        format!("  轮边界捕获               : {} (新用户消息后的首请求)", agg.probe_turn_boundaries),
+        format!(
+            "  轮边界捕获               : {} (新用户消息后的首请求)",
+            agg.probe_turn_boundaries
+        ),
         format!("  深层分叉捕获             : {}", agg.probe_mid_divergences),
         format!(
             "  成对请求体落盘           : {} (见 <cacheroot>/<session>/dumps/req-*.json)",

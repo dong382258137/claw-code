@@ -8,12 +8,17 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_TOKENS: usize = 1024;
 const CACHE_TTL_SECS: u64 = 60;
+
+/// RepoMap 磁盘缓存 schema 版本。序列化语义变化时递增(如 P4 semantic_importance
+/// 改变 Definition 序列化语义 → bump 到 2,旧缓存作废重建)。
+pub const REPOMAP_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Step 4.3:单文件一次引用解析最多查询的 symbol 数量。
 /// 防止 monorepo 中文件 symbol 过多导致 LSP 调用爆炸。
@@ -33,30 +38,43 @@ pub struct RepoMap {
     /// key 是"定义所在文件"(绝对路径),value 是该文件符号被其他文件引用的次数。
     /// 仅在 LSP 可用时填充,优先级高于 regex 子串匹配的 importance。
     lsp_importance: HashMap<PathBuf, usize>,
+    /// P4:基于 ProjectTopology SymbolIndex 的语义重要性(cross-caller 文件去重数)。
+    /// 与 lsp_importance 并列,优先级 lsp > semantic > regex。
+    semantic_importance: HashMap<PathBuf, usize>,
+    /// P1/性能:内存 cache 与磁盘缓存是否不一致。仅在 `refresh_cache_if_stale`
+    /// 实际发生重解析/增删时置位,`save_disk` 据此跳过无变化的全量写盘
+    /// (避免每次启动都把 ~1MB JSON 序列化重写一遍)。
+    dirty: bool,
 }
 
-#[derive(Debug, Clone)]
+/// 单个文件的缓存条目(mtime 变化时增量重解析)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedFileMap {
     definitions: Vec<Definition>,
     references: Vec<String>,
+    /// UNIX_EPOCH 起的毫秒数(自定义 serde,规避 SystemTime 在 JSON 下的序列化不确定性)。
+    #[serde(with = "serde_mtime_ms")]
     mtime: SystemTime,
     /// Step 4.2:从 LSP 获取的 symbol 信息(可选)。
     /// 若存在,render 时优先使用 LSP symbols(语义准确),
     /// 否则 fallback 到 regex 提取的 definitions。
+    /// 磁盘缓存不落盘(LSP 数据易过期),加载后走 regex 路径,由运行时重新注入。
+    #[serde(skip_serializing, default)]
     lsp_symbols: Vec<crate::lsp_client::LspSymbol>,
     /// Step 4.3:该文件是否已尝试过 LSP references 解析。
     /// 用于区分"LSP 不可用(fallback regex)"与"LSP 可用但符号无跨文件引用"。
+    #[serde(skip_serializing, default)]
     lsp_refs_resolved: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Definition {
     pub name: String,
     pub kind: DefinitionKind,
     pub line: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DefinitionKind {
     Function,
     Struct,
@@ -66,6 +84,26 @@ pub enum DefinitionKind {
     Module,
     Const,
     Type,
+    /// P2:Python 类(Rust 项目不会产生该变体)。
+    Class,
+}
+
+/// RepoMap 支持的源语言(P1 仅 Rust;P2 扩展 Python)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    Rust,
+    Python,
+}
+
+impl Lang {
+    /// 识别文件扩展名对应的语言;不支持 → None(跳过该文件)。
+    fn from_path(path: &Path) -> Option<Lang> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("rs") => Some(Lang::Rust),
+            Some("py") => Some(Lang::Python),
+            _ => None,
+        }
+    }
 }
 
 impl RepoMap {
@@ -76,6 +114,8 @@ impl RepoMap {
             cache: HashMap::new(),
             cache_time: None,
             lsp_importance: HashMap::new(),
+            semantic_importance: HashMap::new(),
+            dirty: false,
         }
     }
 
@@ -85,12 +125,101 @@ impl RepoMap {
         self
     }
 
+    /// 当前支持的源语言列表(磁盘缓存按此校验;范围变化 → 缓存作废重建)。
+    /// P2:支持 Rust + Python。
+    fn supported_languages() -> Vec<String> {
+        vec!["rust".to_string(), "python".to_string()]
+    }
+
+    /// P1:从 `.claw/repomap_cache.json` 加载磁盘缓存(best-effort)。
+    ///
+    /// 校验:逃生阀 / 大小守卫 / schema / root / 语言范围。加载后将 `cache_time`
+    /// 置为过期,使首次 `render()` 必然执行一次 walkdir mtime 校验遍历:
+    /// ① mtime 变化文件增量重扫;② 新增文件被发现;③ 删除文件被清理。
+    /// 返回 false 表示未加载(调用方继续走全量构建路径)。
+    #[must_use]
+    pub fn load_disk(&mut self) -> bool {
+        if crate::topology_cache::cache_disabled("repomap") {
+            return false;
+        }
+        let root_norm = crate::topology_cache::normalize_root(&self.root);
+        let path = root_norm.join(".claw").join("repomap_cache.json");
+        let size_ok = std::fs::metadata(&path)
+            .map(|m| m.len() <= crate::topology_cache::cache_max_bytes())
+            .unwrap_or(false);
+        if !size_ok {
+            return false;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(cached) = serde_json::from_str::<RepoMapCache>(&content) else {
+            return false;
+        };
+        if cached.schema_version != REPOMAP_CACHE_SCHEMA_VERSION {
+            return false;
+        }
+        if cached.root != root_norm.to_string_lossy() {
+            return false;
+        }
+        if cached.languages != Self::supported_languages() {
+            return false;
+        }
+        self.cache = cached.files;
+        // 强制首次 render 走 mtime 校验遍历(增量重扫 + 新文件发现 + 删除清理)。
+        self.cache_time = Some(SystemTime::now() - Duration::from_secs(CACHE_TTL_SECS + 1));
+        true
+    }
+
+    /// P1:将当前内存缓存落盘到 `.claw/repomap_cache.json`(best-effort,失败静默)。
+    ///
+    /// 跨平台写盘:写唯一 tmp(带 pid)→ rename;Windows 上 rename 无法覆盖已存在
+    /// 目标时降级为 remove 目标再 rename;仍失败则丢弃(接受竞态,最坏下次重建)。
+    /// 性能:仅当 `dirty`(缓存实际发生变化)时写盘,无变化启动(纯 mtime 校验通过)
+    /// 直接跳过 ~1MB JSON 序列化重写。
+    pub fn save_disk(&self) {
+        if crate::topology_cache::cache_disabled("repomap") {
+            return;
+        }
+        if !self.dirty {
+            return;
+        }
+        let root_norm = crate::topology_cache::normalize_root(&self.root);
+        let claw_dir = root_norm.join(".claw");
+        if std::fs::create_dir_all(&claw_dir).is_err() {
+            return;
+        }
+        let final_path = claw_dir.join("repomap_cache.json");
+        let tmp = claw_dir.join(format!("repomap_cache.{}.tmp", std::process::id()));
+        let cache = RepoMapCache {
+            schema_version: REPOMAP_CACHE_SCHEMA_VERSION,
+            languages: Self::supported_languages(),
+            root: root_norm.to_string_lossy().to_string(),
+            files: self.cache.clone(),
+        };
+        let Ok(json) = serde_json::to_string(&cache) else {
+            return;
+        };
+        if std::fs::write(&tmp, json).is_err() {
+            return;
+        }
+        if std::fs::rename(&tmp, &final_path).is_err() {
+            let _ = std::fs::remove_file(&final_path);
+            let _ = std::fs::rename(&tmp, &final_path);
+        }
+    }
+
     pub fn render(&mut self) -> String {
+        let t0 = cache_verbose_timer();
         self.refresh_cache_if_stale();
+        cache_verbose_log("render.refresh", &t0);
         let importance = self.calculate_importance();
+        cache_verbose_log("render.importance", &t0);
         let mut ranked: Vec<(PathBuf, usize)> = importance.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        self.build_map_with_budget(&ranked)
+        let out = self.build_map_with_budget(&ranked);
+        cache_verbose_log("render.budget", &t0);
+        out
     }
 
     /// SP4.2-B5:render with LSP symbols augmentation.
@@ -114,8 +243,20 @@ impl RepoMap {
 
     #[must_use]
     pub fn extract_definitions(content: &str) -> Vec<Definition> {
+        Self::extract_definitions_lang(content, Lang::Rust)
+    }
+
+    /// P2:按语言提取定义(Rust 或 Python)。
+    ///
+    /// best-effort 边界(注释声明,测试只覆盖该子集):不支持装饰器、多行定义、
+    /// 相对导入、import 别名(as)、条件导入、动态定义、嵌套函数/类。
+    pub fn extract_definitions_lang(content: &str, lang: Lang) -> Vec<Definition> {
         let mut defs = Vec::new();
-        for (kind, re) in DEFINITION_REGEXES.get_or_init(init_definition_regexes) {
+        let re = match lang {
+            Lang::Rust => DEFINITION_REGEXES.get_or_init(init_definition_regexes),
+            Lang::Python => PY_DEFINITION_REGEXES.get_or_init(init_py_definition_regexes),
+        };
+        for (kind, re) in re {
             for caps in re.captures_iter(content) {
                 if let Some(name_match) = caps.get(1) {
                     let line = content[..name_match.start()].matches('\n').count() + 1;
@@ -132,8 +273,18 @@ impl RepoMap {
 
     #[must_use]
     pub fn extract_references(content: &str) -> Vec<String> {
+        Self::extract_references_lang(content, Lang::Rust)
+    }
+
+    /// P2:按语言提取引用(Rust 或 Python)。
+    /// Python 引用:`from x import y` / `import x`(别名 as 不支持,best-effort)。
+    pub fn extract_references_lang(content: &str, lang: Lang) -> Vec<String> {
         let mut refs = Vec::new();
-        for re in REFERENCE_REGEXES.get_or_init(init_reference_regexes) {
+        let re = match lang {
+            Lang::Rust => REFERENCE_REGEXES.get_or_init(init_reference_regexes),
+            Lang::Python => PY_REFERENCE_REGEXES.get_or_init(init_py_reference_regexes),
+        };
+        for re in re {
             for caps in re.captures_iter(content) {
                 if let Some(m) = caps.get(1) {
                     refs.push(m.as_str().to_string());
@@ -221,23 +372,84 @@ impl RepoMap {
             return self.lsp_importance.clone();
         }
 
+        // P4:否则若已注入 SymbolIndex 语义重要性,其次使用之。
+        // 优先级 lsp > semantic > regex。
+        if !self.semantic_importance.is_empty() {
+            return self.semantic_importance.clone();
+        }
+
+        // regex 路径(O(N) 倒排,替代原 O(N²) 子串匹配)。
+        // 语义:def.name 作为**完整标识符段**出现在其他文件的引用串中即计 1 次
+        // 引用。与原 `ref_str.contains(def.name)` 相比:
+        // ① 消除 O(N²)(建段倒排一次遍历,查询 O(total defs));
+        // ② 修复 `Foo` 误匹配 `FooBar`(段精确匹配);
+        // ③ 注释/字符串中的同名标识符不再误计。
+        // 兼容性:`use b::func_b` → 段 {b, func_b} 精确命中 def.name=func_b ✓。
+        let mut seg_index: HashMap<&str, Vec<PathBuf>> = HashMap::new();
+        for (path, cached) in &self.cache {
+            for ref_str in &cached.references {
+                for seg in split_identifiers(ref_str) {
+                    seg_index.entry(seg).or_default().push(path.clone());
+                }
+            }
+        }
         for (path, cached) in &self.cache {
             let mut count = 0usize;
             for def in &cached.definitions {
-                for (other_path, other_cached) in &self.cache {
-                    if other_path == path {
-                        continue;
-                    }
-                    for ref_str in &other_cached.references {
-                        if ref_str.contains(def.name.as_str()) {
-                            count += 1;
-                        }
-                    }
+                if let Some(files) = seg_index.get(def.name.as_str()) {
+                    // 排除自身文件后的引用方文件数。
+                    count += files.iter().filter(|f| *f != path).count();
                 }
             }
             importance.insert(path.clone(), count);
         }
         importance
+    }
+
+    /// P4:注入 ProjectTopology SymbolIndex 的语义重要性。
+    ///
+    /// 统计"被不同 caller 文件引用的次数"(按 `caller.file → def.file` 映射,
+    /// 跨调用者文件**去重**计数,避免单文件多次调用放大权重),存入
+    /// `semantic_importance`。`calculate_importance` 因此在缺少 LSP 时优先使用
+    /// 语义计数,替代 regex 子串匹配(`Foo` 误匹配 `FooBar` / 注释/字符串)。
+    ///
+    /// 注:此方法仅供 best-effort 排序增强;若读到的 SymbolIndex 略过期(来自
+    /// P1 磁盘缓存,未校验指纹),只影响排序权重,不影响查询正确性。
+    pub fn augment_with_symbol_index(
+        &mut self,
+        symbol_index: &crate::project_topology::SymbolIndex,
+    ) {
+        let mut semantic: HashMap<PathBuf, usize> = HashMap::new();
+        for (symbol, callers) in &symbol_index.callers {
+            // 找到该符号的定义所在文件(取首个定义;SymbolDef.file 为相对路径)。
+            let Some(def_file) = symbol_index.definitions.get(symbol).and_then(|d| d.first())
+            else {
+                continue;
+            };
+            let def_abs = self.root.join(&def_file.file);
+            // 跨调用者文件去重(不在定义文件内的 caller 文件计数)。
+            let mut caller_files: std::collections::HashSet<PathBuf> =
+                std::collections::HashSet::new();
+            for cs in callers {
+                let caller_abs = if cs.file.is_absolute() {
+                    cs.file.clone()
+                } else {
+                    self.root.join(&cs.file)
+                };
+                if caller_abs == def_abs {
+                    continue;
+                }
+                caller_files.insert(caller_abs);
+            }
+            let count = caller_files.len();
+            if count > 0 {
+                *semantic.entry(def_abs).or_default() += count;
+            }
+        }
+        // 非空才启用(与 lsp_importance 语义一致:空表 = 该路径不可用)。
+        if !semantic.is_empty() {
+            self.semantic_importance = semantic;
+        }
     }
 
     fn build_map_with_budget(&self, ranked: &[(PathBuf, usize)]) -> String {
@@ -303,6 +515,7 @@ impl RepoMap {
                             DefinitionKind::Module => "mod",
                             DefinitionKind::Const => "const",
                             DefinitionKind::Type => "type",
+                            DefinitionKind::Class => "class",
                         };
                         out.push_str(&format!("  {} {} (L:{})\n", kind_str, def.name, def.line));
                     }
@@ -326,49 +539,40 @@ impl RepoMap {
             return;
         }
 
-        for entry in walkdir::WalkDir::new(&self.root)
-            .into_iter()
-            .filter_entry(|e| {
-                if e.depth() == 0 {
-                    return true;
-                }
-                if e.file_type().is_dir() {
-                    let name = e.file_name().to_string_lossy();
-                    name != "target" && !name.starts_with('.')
-                } else {
-                    true
-                }
-            })
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
+        // 本次遍历前缓存为空 → 全新构建(必写盘);否则只有发生重解析才置 dirty。
+        let had_cache = !self.cache.is_empty();
 
-            let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-                Ok(t) => t,
-                Err(_) => continue,
+        // 自写 READDIR 遍历替代 walkdir:walkdir 对**每个条目**调用 file_type()
+        // (Windows 上每次≈一次 syscall,大仓库 1400+ 条目即数百 ms)。
+        // 此处按文件名先做零 syscall 过滤(目录名/扩展名),非目标文件完全跳过;
+        // 每个目标条目至多一次 fs::metadata(可同时取类型+mtime)。
+        let walk_t = cache_verbose_timer();
+        let walked = walk_source_files(&self.root);
+        cache_verbose_log("render.walk", &walk_t);
+        for (path, mtime) in walked {
+            let Some(lang) = Lang::from_path(&path) else {
+                continue;
             };
 
-            let needs_reparse = match self.cache.get(path) {
+            let needs_reparse = match self.cache.get(&path) {
                 None => true,
-                Some(cached) => cached.mtime != mtime,
+                // 统一毫秒精度比较:磁盘缓存经 serde_mtime_ms 序列化为毫秒,
+                // 而 walk_source_files 返回纳秒级 SystemTime,直接 `!=` 会因
+                // 截断导致缓存永远被视为过期 → 每次启动全量重解析。
+                Some(cached) => mtime_ms(&cached.mtime) != mtime_ms(&mtime),
             };
             if !needs_reparse {
                 continue;
             }
+            self.dirty = true;
 
-            let content = match std::fs::read_to_string(path) {
+            let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
 
-            let definitions = Self::extract_definitions(&content);
-            let references = Self::extract_references(&content);
+            let definitions = Self::extract_definitions_lang(&content, lang);
+            let references = Self::extract_references_lang(&content, lang);
 
             // SP4.2-B5:re-parse 时保留已有的 LSP symbols(避免 refresh 清空)
             // LSP symbols 由 augment_with_lsp_symbols 单独注入,refresh_cache_if_stale
@@ -377,18 +581,18 @@ impl RepoMap {
             // (略有过期,但比清空好;下次 augment_with_lsp_symbols 调用会刷新)。
             let existing_lsp_symbols = self
                 .cache
-                .get(path)
+                .get(&path)
                 .map(|c| c.lsp_symbols.clone())
                 .unwrap_or_default();
 
             let existing_lsp_refs_resolved = self
                 .cache
-                .get(path)
+                .get(&path)
                 .map(|c| c.lsp_refs_resolved)
                 .unwrap_or(false);
 
             self.cache.insert(
-                path.to_path_buf(),
+                path,
                 CachedFileMap {
                     definitions,
                     references,
@@ -400,7 +604,15 @@ impl RepoMap {
         }
 
         // Drop cache entries for files that no longer exist on disk.
+        let before_retain = self.cache.len();
         self.cache.retain(|p, _| p.exists());
+        if self.cache.len() != before_retain {
+            self.dirty = true;
+        }
+        // 全新构建(此前无缓存)也视为 dirty,保证写盘。
+        if !had_cache && !self.cache.is_empty() {
+            self.dirty = true;
+        }
 
         self.cache_time = Some(now);
     }
@@ -567,6 +779,127 @@ impl RepoMap {
     }
 }
 
+/// RepoMap 磁盘缓存文件结构(`.claw/repomap_cache.json`)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoMapCache {
+    schema_version: u32,
+    /// 支持的源语言列表(范围变化 → 缓存作废重建)。
+    languages: Vec<String>,
+    /// 规范化后的 root。
+    root: String,
+    files: HashMap<PathBuf, CachedFileMap>,
+}
+
+/// SystemTime → UNIX_EPOCH 起的毫秒数(与 `serde_mtime_ms` 序列化精度一致)。
+/// 用于跨序列化边界的 mtime 比较,避免纳秒/毫秒精度差导致缓存误判过期。
+fn mtime_ms(t: &SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 自定义 `SystemTime` 序列化:UNIX_EPOCH 起的毫秒数。
+/// 规避 serde 对 `std::time::SystemTime` 的默认 JSON 表示(平台相关的 struct)
+/// 在跨进程/跨版本下的不确定性。
+mod serde_mtime_ms {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S: Serializer>(t: &SystemTime, s: S) -> Result<S::Ok, S::Error> {
+        let ms = t
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        s.serialize_u64(ms)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SystemTime, D::Error> {
+        let ms = u64::deserialize(d)?;
+        Ok(UNIX_EPOCH + std::time::Duration::from_millis(ms))
+    }
+}
+
+/// P4(regex 路径):把引用串按标识符段拆分成倒排索引键。
+/// `use b::func_b` → `["b", "func_b"]`;`from a import A` → `["a", "A"]`;
+/// 纯字面/命名空间串(`std::io`)同样拆分。段精确匹配避免 `Foo` 命中 `FooBar`
+/// 注释/字符串误计(参考 LSP 语义分隔语义,仍是 best-effort)。
+fn split_identifiers(s: &str) -> Vec<&str> {
+    s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|seg| !seg.is_empty())
+        .collect()
+}
+
+/// 遍历仓库返回目标源文件(.rs/.py)及其 mtime。
+///
+/// 自写 `read_dir` 递归替代 walkdir:`DirEntry::file_type()` 在 Windows 上
+/// 每次≈一次 syscall,walkdir 会对**所有条目**(含 node_modules 等)都触发,
+/// 大仓库下仅遍历就数百 ms。这里:
+/// 1. 目录名(构建产物/依赖/隐藏目录)按字符串过滤,不 stat;
+/// 2. 非目标扩展名的文件按字符串过滤,完全不 stat;
+/// 3. 仅对目标候选调用一次 `fs::metadata`,同时取类型与 mtime。
+fn walk_source_files(root: &Path) -> Vec<(PathBuf, SystemTime)> {
+    fn is_ignored_dir(name: &str) -> bool {
+        matches!(
+            name,
+            "target" | "node_modules" | "__pycache__" | "venv" | ".venv"
+        ) || name.starts_with('.')
+    }
+    fn is_target_file(name: &str) -> bool {
+        name.rsplit('.')
+            .next()
+            .is_some_and(|e| matches!(e, "rs" | "py"))
+    }
+
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if is_target_file(&name) {
+                if let Ok(md) = std::fs::metadata(&path) {
+                    if md.is_file() {
+                        if let Ok(t) = md.modified() {
+                            out.push((path, t));
+                        }
+                    }
+                }
+                continue;
+            }
+            // 非目标文件但可能是目录:仅当目录名未被忽略时才下钻。
+            // 目录检查也会触发一次 syscall,但数量远小于文件数。
+            if is_ignored_dir(&name) {
+                continue;
+            }
+            if let Ok(md) = std::fs::metadata(&path) {
+                if md.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// P1/诊断:Repomap 性能分段时间(门控,`CLAW_REPOMAP_VERBOSE=1` 时输出 stderr)。
+/// 用于定位缓存命中路径的耗时组成,默认关闭零开销。
+fn cache_verbose_timer() -> Option<std::time::Instant> {
+    std::env::var("CLAW_REPOMAP_VERBOSE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+        .then(std::time::Instant::now)
+}
+
+fn cache_verbose_log(label: &str, t0: &Option<std::time::Instant>) {
+    if let Some(t) = t0 {
+        eprintln!("[repomap-verbose] {label}={:?}", t.elapsed());
+    }
+}
+
 fn estimate_tokens(s: &str) -> usize {
     s.chars().count() / 2 + 1
 }
@@ -594,6 +927,30 @@ type RefRegexVec = Vec<Regex>;
 
 static DEFINITION_REGEXES: OnceLock<DefRegexVec> = OnceLock::new();
 static REFERENCE_REGEXES: OnceLock<RefRegexVec> = OnceLock::new();
+/// P2:Python 定义/引用 regex。best-effort:不支持装饰器、多行定义、
+/// 嵌套函数/类(嵌套 def 仍会被捕获但归类为平铺符号,可接受)。
+static PY_DEFINITION_REGEXES: OnceLock<DefRegexVec> = OnceLock::new();
+static PY_REFERENCE_REGEXES: OnceLock<RefRegexVec> = OnceLock::new();
+
+fn init_py_definition_regexes() -> DefRegexVec {
+    vec![
+        (
+            DefinitionKind::Function,
+            Regex::new(r"(?:async\s+)?def\s+(\w+)").expect("valid regex literal"),
+        ),
+        (
+            DefinitionKind::Class,
+            Regex::new(r"(?:class\s+(\w+))").expect("valid regex literal"),
+        ),
+    ]
+}
+
+fn init_py_reference_regexes() -> RefRegexVec {
+    vec![
+        Regex::new(r"from\s+([\w.]+)\s+import").expect("valid regex literal"),
+        Regex::new(r"import\s+([\w.]+)").expect("valid regex literal"),
+    ]
+}
 
 fn init_definition_regexes() -> DefRegexVec {
     vec![
@@ -655,6 +1012,55 @@ mod tests {
         assert_eq!(defs[0].kind, DefinitionKind::Function);
     }
 
+    // ========================================================================
+    // P2 — Python 符号提取
+    // ========================================================================
+
+    #[test]
+    fn py_extract_definitions_finds_def_and_class() {
+        let code = "def hello():\n    pass\n\nasync def fetch():\n    pass\n\nclass Foo:\n    def bar(self):\n        pass";
+        let defs = RepoMap::extract_definitions_lang(code, Lang::Python);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"hello"));
+        assert!(names.contains(&"fetch"));
+        assert!(names.contains(&"Foo"));
+        assert!(names.contains(&"bar"), "nested method should be captured");
+        let foo = defs.iter().find(|d| d.name == "Foo").unwrap();
+        assert_eq!(foo.kind, DefinitionKind::Class);
+    }
+
+    #[test]
+    fn py_extract_references_finds_imports() {
+        let code = "import os\nfrom pathlib import Path\nfrom . import sibling";
+        let refs = RepoMap::extract_references_lang(code, Lang::Python);
+        assert!(refs.contains(&"os".to_string()));
+        assert!(refs.contains(&"pathlib".to_string()));
+        // `from . import x` 捕获 "."(相对导入为 best-effort,不解析导入对象)。
+        assert!(refs.contains(&".".to_string()));
+    }
+
+    #[test]
+    fn lang_from_path_recognizes_rs_and_py() {
+        assert_eq!(Lang::from_path(Path::new("a.rs")), Some(Lang::Rust));
+        assert_eq!(Lang::from_path(Path::new("b.py")), Some(Lang::Python));
+        assert_eq!(Lang::from_path(Path::new("c.txt")), None);
+        assert_eq!(Lang::from_path(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn render_outputs_class_kind_for_python() {
+        let temp = tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("mod.py"),
+            "class Foo:\n    pass\n\ndef bar():\n    pass",
+        )
+        .unwrap();
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        let rendered = map.render();
+        assert!(rendered.contains("class Foo"), "got: {rendered}");
+        assert!(rendered.contains("fn bar"), "got: {rendered}");
+    }
+
     #[test]
     fn test_extract_definitions_finds_structs_and_enums() {
         let code = "pub struct Foo {}\nenum Bar { A, B }";
@@ -691,6 +1097,39 @@ mod tests {
         let b_path = temp.path().join("b.rs");
         let b_importance = importance.get(&b_path).copied().unwrap_or(0);
         assert!(b_importance > 0, "b.rs should have positive importance");
+    }
+
+    #[test]
+    fn segment_index_matches_identifiers_exactly() {
+        // P4:段精确匹配(`Foo` 不命中 `FooBar`),且 `use b::func_b` 命中 func_b。
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("d.rs"), "pub fn Foo() {}\n").unwrap();
+        std::fs::write(temp.path().join("e.rs"), "use b::FooBar;\npub fn e() {}").unwrap();
+        std::fs::write(temp.path().join("f.rs"), "use b::Foo;\npub fn f() {}").unwrap();
+
+        let mut map = RepoMap::new(temp.path());
+        map.refresh_cache_if_stale();
+        let importance = map.calculate_importance();
+        // d.rs 定义 Foo:FooBar 不算引用(段不匹配),只有 f.rs 的 Foo 算 1 次。
+        let d_path = temp.path().join("d.rs");
+        let d_importance = importance.get(&d_path).copied().unwrap_or(0);
+        assert_eq!(
+            d_importance, 1,
+            "Foo should be referenced once (FooBar must not match): {d_importance}"
+        );
+    }
+
+    #[test]
+    fn split_identifiers_splits_paths_and_spaces() {
+        assert_eq!(
+            split_identifiers("use b::func_b"),
+            vec!["use", "b", "func_b"]
+        );
+        assert_eq!(
+            split_identifiers("std::io::Read"),
+            vec!["std", "io", "Read"]
+        );
+        assert_eq!(split_identifiers("foo.bar_baz"), vec!["foo", "bar_baz"]);
     }
 
     #[test]
@@ -1020,5 +1459,238 @@ mod tests {
         // 未 spawn → calculate_importance 走 regex,不会全零
         let importance = map.calculate_importance();
         assert!(!importance.is_empty());
+    }
+
+    // ========================================================================
+    // P1 — RepoMap 磁盘缓存
+    // ========================================================================
+
+    #[test]
+    fn disk_cache_round_trips_across_instances() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("b.rs"),
+            "use a::func_a;\npub fn func_b() {}\n",
+        )
+        .unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        assert!(!map.load_disk(), "no cache yet");
+        let rendered1 = map.render();
+        map.save_disk();
+        assert!(
+            temp.path()
+                .join(".claw")
+                .join("repomap_cache.json")
+                .exists(),
+            "cache file should be written"
+        );
+
+        // 新实例加载磁盘缓存后 render 结果与首轮一致。
+        let mut map2 = RepoMap::new(temp.path()).with_max_tokens(500);
+        assert!(map2.load_disk(), "cache should load");
+        let rendered2 = map2.render();
+        assert_eq!(rendered1, rendered2);
+    }
+
+    #[test]
+    fn disk_cache_discovers_new_files_incrementally() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}\n").unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        map.render();
+        map.save_disk();
+
+        // save 之后新增文件:加载缓存后 render 应通过 walkdir mtime 校验发现它。
+        std::fs::write(temp.path().join("c.rs"), "pub fn func_c() {}\n").unwrap();
+        let mut map2 = RepoMap::new(temp.path()).with_max_tokens(500);
+        assert!(map2.load_disk());
+        let rendered = map2.render();
+        assert!(
+            rendered.contains("c.rs"),
+            "new file should appear: {rendered}"
+        );
+    }
+
+    #[test]
+    fn disk_cache_warm_load_does_not_reparse_unchanged_files() {
+        // 回归:save 经 serde_mtime_ms 截断为毫秒,load 后与纳秒级 SystemTime
+        // 直接 `!=` 会误判全部过期 → 每次启动全量重解析。毫秒精度比较修复后,
+        // 无变化文件不应触发 dirty(不写盘)、mtime 缓存不被替换。
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}\n").unwrap();
+        std::fs::write(temp.path().join("b.rs"), "pub fn func_b() {}\n").unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        map.render();
+        map.save_disk();
+
+        let mut map2 = RepoMap::new(temp.path()).with_max_tokens(500);
+        assert!(map2.load_disk());
+        let before_mtime = map2.cache.values().next().unwrap().mtime;
+        map2.render(); // 热启:walk 后所有 mtime 毫秒相等 → 不重解析
+        assert!(
+            !map2.dirty,
+            "unchanged files must not mark cache dirty (ms precision fix)"
+        );
+        assert_eq!(
+            map2.cache.values().next().unwrap().mtime,
+            before_mtime,
+            "cache entries must not be replaced on warm load"
+        );
+    }
+
+    #[test]
+    fn disk_cache_skips_lsp_symbols() {
+        // LSP symbols 不落盘:save 后 load,LSP symbols 应为空 → render 走 regex。
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}\n").unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        map.render();
+        map.augment_with_lsp_symbols(
+            Path::new("a.rs"),
+            vec![crate::lsp_client::LspSymbol {
+                name: "lsp_only".to_string(),
+                kind: "function".to_string(),
+                path: "a.rs".to_string(),
+                line: 0,
+                character: 3,
+            }],
+        );
+        assert!(map.has_lsp_symbols(Path::new("a.rs")));
+        map.save_disk();
+
+        let mut map2 = RepoMap::new(temp.path()).with_max_tokens(500);
+        assert!(map2.load_disk());
+        assert!(!map2.has_lsp_symbols(Path::new("a.rs")));
+        let rendered = map2.render();
+        assert!(
+            rendered.contains("fn func_a"),
+            "should fall back to regex definitions: {rendered}"
+        );
+    }
+
+    #[test]
+    fn disk_cache_invalidated_when_supported_languages_change() {
+        // languages 范围变化 → 缓存作废(直接改写缓存文件模拟旧版本)。
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}\n").unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        map.render();
+        map.save_disk();
+
+        // 用错误的 languages 字段重写缓存。
+        let cache_path = temp.path().join(".claw").join("repomap_cache.json");
+        let mut cached: RepoMapCache =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).unwrap()).unwrap();
+        cached.languages = vec!["python".to_string()];
+        std::fs::write(&cache_path, serde_json::to_string(&cached).unwrap()).unwrap();
+
+        let mut map2 = RepoMap::new(temp.path()).with_max_tokens(500);
+        assert!(
+            !map2.load_disk(),
+            "language mismatch should invalidate cache"
+        );
+    }
+
+    // ========================================================================
+    // P4 — 语义重要性
+    // ========================================================================
+
+    #[test]
+    fn semantic_importance_counts_cross_caller_files_deduped() {
+        use crate::project_topology::{CallSite, SymbolDef, SymbolIndex};
+        let temp = tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("a.rs"),
+            "pub fn target_fn() {}\npub fn other() {}",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("b.rs"), "pub fn b() {}\n").unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        map.render(); // 填充 cache
+
+        let si = SymbolIndex {
+            definitions: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "target_fn".to_string(),
+                    vec![SymbolDef {
+                        name: "target_fn".to_string(),
+                        kind: "fn".to_string(),
+                        file: PathBuf::from("a.rs"),
+                        line: 1,
+                        crate_name: None,
+                        visibility: Some("pub".to_string()),
+                    }],
+                );
+                m
+            },
+            callers: {
+                let mut m: std::collections::HashMap<String, Vec<CallSite>> =
+                    std::collections::HashMap::new();
+                m.insert(
+                    "target_fn".to_string(),
+                    vec![
+                        CallSite {
+                            file: PathBuf::from("b.rs"),
+                            line: 1,
+                            context: None,
+                        },
+                        CallSite {
+                            file: PathBuf::from("b.rs"),
+                            line: 2,
+                            context: None,
+                        },
+                        CallSite {
+                            file: PathBuf::from("c.rs"),
+                            line: 1,
+                            context: None,
+                        },
+                    ],
+                );
+                m
+            },
+            file_symbols: std::collections::HashMap::new(),
+        };
+        map.augment_with_symbol_index(&si);
+        let importance = map.calculate_importance();
+        // 同一 caller 文件 b.rs 的两处调用去重为 1,加上 c.rs → 共 2。
+        let a = temp.path().join("a.rs");
+        let got = importance.get(&a).copied().unwrap_or(0);
+        assert_eq!(got, 2, "should count 2 distinct caller files, got {got}");
+    }
+
+    #[test]
+    fn semantic_importance_falls_back_to_regex_when_empty() {
+        use crate::project_topology::SymbolIndex;
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "pub fn func_a() {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("b.rs"),
+            "use a::func_a;\npub fn func_b() {}",
+        )
+        .unwrap();
+
+        let mut map = RepoMap::new(temp.path()).with_max_tokens(500);
+        map.render();
+        // 空 SymbolIndex → augment 不改变状态 → calculate 走 regex 路径。
+        map.augment_with_symbol_index(&SymbolIndex {
+            definitions: std::collections::HashMap::new(),
+            callers: std::collections::HashMap::new(),
+            file_symbols: std::collections::HashMap::new(),
+        });
+        let importance = map.calculate_importance();
+        // regex 路径:a.rs 的 func_a 被 b.rs 的 `use a::func_a` 引用 → a.rs importance > 0。
+        let a = temp.path().join("a.rs");
+        assert!(
+            importance.get(&a).copied().unwrap_or(0) > 0,
+            "regex importance should apply when semantic empty"
+        );
     }
 }

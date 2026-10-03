@@ -3242,6 +3242,34 @@ pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
         None
     } else {
         let mut map = RepoMap::new(cwd).with_max_tokens(1024);
+        let rt = std::time::Instant::now();
+        let verbose = std::env::var("CLAW_REPOMAP_VERBOSE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let mark = |label: &str, t: &std::time::Instant| {
+            if verbose {
+                eprintln!("[repomap-verbose] {label}={:?}", t.elapsed());
+            }
+        };
+        // P1:先加载磁盘缓存(.claw/repomap_cache.json)。命中后 render 内部
+        // 仍会做一次 walkdir mtime 校验遍历(增量重扫 + 新文件发现 + 删除清理),
+        // 只在 mtime 变化的文件上重新解析,避免每次新会话全量重建。
+        // 逃生阀:CLAW_DISABLE_REPOMAP_CACHE / CLAW_DISABLE_CACHE=1 时跳过。
+        let _ = map.load_disk();
+        mark("load_disk", &rt);
+        // P4:注入拓扑符号索引语义重要性(best-effort 排序增强)。
+        // load_prompt_extras 先于 shared_topology 构造(见 build_runtime)执行,
+        // 无法访问内存拓扑实例 → 用 load_cache_quick 轻量读(不校验指纹,
+        // 只检查存在+schema+root+language;读到旧索引只影响排序权重,
+        // 不影响查询正确性;成本 ~ms 级)。
+        if let Some(lang) = runtime::topology_cache::pick_primary_language(cwd) {
+            if let Some(data) = runtime::topology_cache::load_cache_quick(cwd, lang) {
+                if let Some(si) = &data.symbol_index {
+                    map.augment_with_symbol_index(si);
+                }
+            }
+        }
+        mark("semantic_augment", &rt);
         // Step 4.3:若 rust-analyzer 已 spawn,用 render_with_lsp 获得 LSP
         // references 语义重要性(regex 子串匹配在 monorepo 跨模块定位不准)。
         // 仅在已 spawn 时启用,避免 prompt 组装阶段意外触发 slow auto-start。
@@ -3251,6 +3279,10 @@ pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
         } else {
             map.render()
         };
+        mark("render", &rt);
+        // P1:渲染后落盘(best-effort,失败静默;禁用时跳过)。
+        map.save_disk();
+        mark("save_disk", &rt);
         if rendered.trim().is_empty() {
             None
         } else {

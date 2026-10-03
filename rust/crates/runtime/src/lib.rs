@@ -98,8 +98,11 @@ pub mod tool_result_archive;
 // 缓存保护:PlanArtifact 末尾追加到 prompt 变动区,详见
 // docs/harness-engineering-optimization-plan.md §5.2。
 pub mod project_topology;
+// 项目认知磁盘缓存(Topology + RepoMap 通用工具):跨会话复用 cargo metadata /
+// 符号索引,指纹校验防"启动快但数据旧"。详见 docs 与 topology_cache.rs 模块注释。
 pub mod recovery_orchestrator;
 pub mod recovery_recipes;
+pub mod topology_cache;
 pub mod vcs_snapshot;
 // Phase 4-B:DomainTools — 算法级重构建议(建议模式)+ 基准对比。无状态。
 pub mod domain_algorithm;
