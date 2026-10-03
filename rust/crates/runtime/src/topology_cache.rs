@@ -118,7 +118,14 @@ fn has_python_marker(root: &Path) -> bool {
 /// Cargo.toml 存在而含 Rust 且排在首位，仍判 Rust。无歧义。
 #[must_use]
 pub fn pick_primary_language(root: &Path) -> Option<Language> {
-    if let Ok(v) = std::env::var("CLAW_PRIMARY_LANGUAGE") {
+    pick_primary_language_with(root, std::env::var("CLAW_PRIMARY_LANGUAGE").ok().as_deref())
+}
+
+/// `pick_primary_language` 的纯函数内核：`override_lang` 为环境变量值（可注入），
+/// 便于确定性单测覆盖 `CLAW_PRIMARY_LANGUAGE` 分支（env 全局态无法安全并发测试）。
+#[must_use]
+pub fn pick_primary_language_with(root: &Path, override_lang: Option<&str>) -> Option<Language> {
+    if let Some(v) = override_lang {
         match v.to_ascii_lowercase().as_str() {
             "rust" => return Some(Language::Rust),
             "python" => return Some(Language::Python),
@@ -310,16 +317,40 @@ pub fn topology_cache_path(root: &Path, language: Language) -> PathBuf {
 
 /// 加载缓存。任一校验（存在/schema/root/语言/指纹）不通过 → `None`（重建）。
 /// 指纹比较分两步：先结构部分（便宜），命中后再比较 dirty（`git status` 慢）。
+/// 超限策略判定：是否需要对该缓存 kind 施加 `CLAW_CACHE_MAX_BYTES` 网关。
+///
+/// 策略为 **Topology 优先持久化，RepoMap 放弃**：Topology 更小、查询价值更高，
+/// 豁免大小网关（读/写均不受限）；RepoMap 双向受限，超限即放弃（不写、不读）。
+#[must_use]
+fn size_gate_applies(kind: &str) -> bool {
+    kind == "repomap"
+}
+
+#[must_use]
+fn within_limit_with(kind: &str, size: u64, max: u64) -> bool {
+    if size_gate_applies(kind) {
+        size <= max
+    } else {
+        true
+    }
+}
+
+/// 给定缓存 `kind` 与字节数是否在缓存上限内（Topology 恒为 `true`）。
+#[must_use]
+pub fn cache_within_limit(kind: &str, size: u64) -> bool {
+    within_limit_with(kind, size, cache_max_bytes())
+}
+
 pub fn load_cache(root: &Path, language: Language) -> Option<TopologyCache> {
     if cache_disabled("topology") {
         return None;
     }
     let root_norm = normalize_root(root);
     let path = topology_cache_path(&root_norm, language);
-    if fs::metadata(&path)
-        .map(|m| m.len() > cache_max_bytes())
-        .unwrap_or(true)
-    {
+    let Ok(meta) = fs::metadata(&path) else {
+        return None;
+    };
+    if !cache_within_limit("topology", meta.len()) {
         return None;
     }
     let content = fs::read_to_string(&path).ok()?;
@@ -358,10 +389,10 @@ pub fn load_cache_quick(root: &Path, language: Language) -> Option<TopologyData>
     }
     let root_norm = normalize_root(root);
     let path = topology_cache_path(&root_norm, language);
-    if fs::metadata(&path)
-        .map(|m| m.len() > cache_max_bytes())
-        .unwrap_or(true)
-    {
+    let Ok(meta) = fs::metadata(&path) else {
+        return None;
+    };
+    if !cache_within_limit("topology", meta.len()) {
         return None;
     }
     let content = fs::read_to_string(&path).ok()?;
@@ -395,6 +426,10 @@ pub fn save_cache(root: &Path, language: Language, data: &TopologyData) {
         Ok(j) => j,
         Err(_) => return,
     };
+    // 写侧网关：Topology 优先持久化（豁免）；仅当策略要求受限且超限时放弃。
+    if !cache_within_limit("topology", json.len() as u64) {
+        return;
+    }
     let claw_dir = root_norm.join(".claw");
     if fs::create_dir_all(&claw_dir).is_err() {
         return;
@@ -647,6 +682,52 @@ mod tests {
         assert!(load_cache(dir.path(), Language::Rust).is_none());
         let quick = load_cache_quick(dir.path(), Language::Rust);
         assert_eq!(quick.map(|d| d.built_at_ms), Some(7));
+    }
+
+    #[test]
+    fn within_limit_topology_exempt_repomap_gated() {
+        // 超限策略：Topology 优先持久化（豁免），RepoMap 受上限约束。
+        let max = 50;
+        assert!(within_limit_with("topology", max + 1, max));
+        assert!(within_limit_with("topology", u64::MAX, max));
+        assert!(within_limit_with("repomap", max, max));
+        assert!(!within_limit_with("repomap", max + 1, max));
+    }
+
+    #[test]
+    fn pick_primary_language_with_override_wins() {
+        // 显式覆盖优先于所有探测规则（含 workspace 根与 Python 标记）。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(dir.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(
+            pick_primary_language_with(dir.path(), Some("python")),
+            Some(Language::Python)
+        );
+        assert_eq!(
+            pick_primary_language_with(dir.path(), Some("RUST")),
+            Some(Language::Rust)
+        );
+        // 无效值 → 回落到常规规则（workspace 根 → Rust）。
+        assert_eq!(
+            pick_primary_language_with(dir.path(), Some("golang")),
+            Some(Language::Rust)
+        );
+    }
+
+    #[test]
+    fn pick_primary_language_override_python_on_single_crate() {
+        // 单 crate Rust 项目 + 覆盖 python → Python（覆盖压过规则 2/4）。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert_eq!(
+            pick_primary_language_with(dir.path(), Some("python")),
+            Some(Language::Python)
+        );
+        assert_eq!(
+            pick_primary_language_with(dir.path(), None),
+            Some(Language::Rust)
+        );
     }
 
     #[test]

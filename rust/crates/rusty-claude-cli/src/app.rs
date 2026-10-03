@@ -10,7 +10,8 @@
     clippy::unused_self
 )]
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -3168,6 +3169,27 @@ impl LiveCli {
 
 // ===== Block B: build_system_prompt / load_prompt_extras / is_broad_working_directory (main.rs lines 2626-2750) =====
 
+thread_local! {
+    /// D1: 规范化 cwd → 共享 `ProjectTopology`。让 `build_system_prompt`
+    /// （在 `load_prompt_extras` 之前构造并 `ensure_built`）与随后调用 14 处的
+    /// `build_runtime` 复用同一个 `Arc`，避免重复 `cargo metadata`，并使 RepoMap
+    /// 注入走内存拓扑（而非 `load_cache_quick` 退化路径）。按规范化 cwd 键控，
+    /// 多 cwd 场景不串味（单一 `OnceLock` 会串味，故不可用）。
+    static TOPOLOGY_REGISTRY: RefCell<HashMap<PathBuf, Arc<runtime::project_topology::ProjectTopology>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// D1: 取得（必要时创建）规范化 `cwd` 对应的共享 `ProjectTopology`。
+fn topology_for(cwd: &Path) -> Arc<runtime::project_topology::ProjectTopology> {
+    let key = runtime::topology_cache::normalize_root(cwd);
+    TOPOLOGY_REGISTRY.with(|reg| {
+        reg.borrow_mut()
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(runtime::project_topology::ProjectTopology::new(key)))
+            .clone()
+    })
+}
+
 pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     #[cfg(feature = "full-tui")]
     crate::diag_log(&format!("[build_system_prompt] start, model={model}"));
@@ -3187,7 +3209,13 @@ pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn st
         let _ = init_lsp_from_config(&config, &cwd);
     }
 
-    let extras = load_prompt_extras(&cwd);
+    // D1:提前构造共享 ProjectTopology 并 ensure_built(命中磁盘缓存即 Ready,
+    // 否则派发后台构建),使下方 load_prompt_extras 能直接读内存符号索引;
+    // 随后 build_runtime 经 topology_for 复用同一 Arc,不重复构建。
+    let topology = topology_for(&cwd);
+    let _ = topology.ensure_built();
+
+    let extras = load_prompt_extras(&cwd, &topology);
     #[cfg(feature = "full-tui")]
     crate::diag_log(
         "[build_system_prompt] load_prompt_extras OK, calling load_system_prompt_with_extras",
@@ -3219,7 +3247,10 @@ pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn st
 /// 时跳过 RepoMap 扫描。RepoMap 会递归扫描整个 cwd 子树为每个源文件计算符号树，
 /// 在用户主目录下会遍历 AppData / .cargo / .rustup 等数十万文件，耗时 30+ 秒。
 /// persistent_memory 不受影响（只是读一个 JSON 文件）。
-pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
+pub(crate) fn load_prompt_extras(
+    cwd: &Path,
+    topology: &Arc<runtime::project_topology::ProjectTopology>,
+) -> SystemPromptExtras {
     let t0 = std::time::Instant::now();
     // load_and_freeze 内部已处理文件不存在的情况（返回空记忆），
     // 始终构造 PersistentMemory 以启用 nudge → add_entry → persist 链路，
@@ -3258,14 +3289,23 @@ pub(crate) fn load_prompt_extras(cwd: &Path) -> SystemPromptExtras {
         let _ = map.load_disk();
         mark("load_disk", &rt);
         // P4:注入拓扑符号索引语义重要性(best-effort 排序增强)。
-        // load_prompt_extras 先于 shared_topology 构造(见 build_runtime)执行,
-        // 无法访问内存拓扑实例 → 用 load_cache_quick 轻量读(不校验指纹,
-        // 只检查存在+schema+root+language;读到旧索引只影响排序权重,
-        // 不影响查询正确性;成本 ~ms 级)。
-        if let Some(lang) = runtime::topology_cache::pick_primary_language(cwd) {
-            if let Some(data) = runtime::topology_cache::load_cache_quick(cwd, lang) {
+        // D1:`build_system_prompt` 已在构造期创建共享拓扑并 ensure_built,
+        // 此处直接读内存 `state()`,命中 Ready 即用(不再走 load_cache_quick
+        // 退化路径);未 Ready(Building/Failed/无缓存)时退化为 regex 排序。
+        match topology.state() {
+            runtime::project_topology::TopologyState::Ready(data) => {
                 if let Some(si) = &data.symbol_index {
                     map.augment_with_symbol_index(si);
+                }
+            }
+            _ => {
+                // 内存拓扑未就绪:轻量磁盘兜底(不校验指纹,只影响排序权重)。
+                if let Some(lang) = runtime::topology_cache::pick_primary_language(cwd) {
+                    if let Some(data) = runtime::topology_cache::load_cache_quick(cwd, lang) {
+                        if let Some(si) = &data.symbol_index {
+                            map.augment_with_symbol_index(si);
+                        }
+                    }
                 }
             }
         }
@@ -3603,9 +3643,9 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 之前 CliToolExecutor 和 ConversationRuntime 各自独立，topology 只在 runtime 构造后注入，
     // 导致 CliToolExecutor 调用 refactor_algorithm_topo 时没有 topology 实例可用。
     // 现在提前创建，共享同一个 Arc。
-    let shared_topology = env::current_dir()
-        .ok()
-        .map(|cwd| std::sync::Arc::new(runtime::project_topology::ProjectTopology::new(cwd)));
+    // D1:改用线程局部注册表按规范化 cwd 复用 build_system_prompt 已构造的实例
+    // （同一 cwd 下不重复建，多个 build_runtime 调用点共享同一拓扑）。
+    let shared_topology = env::current_dir().ok().map(|cwd| topology_for(&cwd));
     // v0.2 生产接入:在 model 被 move 进 AnthropicRuntimeClient 之前先 clone 一份,
     // 稍后用于构造独立的 subagent api_client(DAG dispatch 用)。
     // AnthropicRuntimeClient 不是 Clone(内含 tokio::runtime::Runtime),只能重建。

@@ -145,7 +145,7 @@ impl RepoMap {
         let root_norm = crate::topology_cache::normalize_root(&self.root);
         let path = root_norm.join(".claw").join("repomap_cache.json");
         let size_ok = std::fs::metadata(&path)
-            .map(|m| m.len() <= crate::topology_cache::cache_max_bytes())
+            .map(|m| crate::topology_cache::cache_within_limit("repomap", m.len()))
             .unwrap_or(false);
         if !size_ok {
             return false;
@@ -200,6 +200,10 @@ impl RepoMap {
         let Ok(json) = serde_json::to_string(&cache) else {
             return;
         };
+        // 写侧网关：RepoMap 在超限策略下放弃落盘（Topology 优先持久化）。
+        if !crate::topology_cache::cache_within_limit("repomap", json.len() as u64) {
+            return;
+        }
         if std::fs::write(&tmp, json).is_err() {
             return;
         }
