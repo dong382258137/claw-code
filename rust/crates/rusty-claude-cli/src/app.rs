@@ -4278,3 +4278,50 @@ impl runtime::PermissionPrompter for TuiSilentPermissionPrompter {
         }
     }
 }
+
+#[cfg(test)]
+mod topology_registry_tests {
+    use super::*;
+
+    /// D1 定向测试：同一规范化 cwd 重复取用必须返回**同一 Arc 实例**，
+    /// 这是「一次构造、多处复用、不重复 cargo metadata」的核心不变量。
+    #[test]
+    fn topology_for_same_cwd_returns_same_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = topology_for(dir.path());
+        let b = topology_for(dir.path());
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same cwd must reuse the same shared ProjectTopology Arc"
+        );
+    }
+
+    /// D1 定向测试：不同 cwd 必须得到**不同实例**，防止跨项目串味
+    /// （这正是放弃单一 `OnceLock`、改用 cwd 键控注册表的原因）。
+    #[test]
+    fn topology_for_different_cwd_returns_distinct_instances() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let a = topology_for(dir1.path());
+        let b = topology_for(dir2.path());
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "different cwd must not share a ProjectTopology instance"
+        );
+    }
+
+    /// D1 定向测试：含 `.` / `..` 的等价路径经 `normalize_root` 折叠后
+    /// 命中原实例——保证 `build_system_prompt` 与 `build_runtime` 即使传入
+    /// 字面不同的 cwd 路径，只要指向同一目录就复用同一拓扑。
+    #[test]
+    fn topology_for_normalizes_equivalent_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = topology_for(dir.path());
+        let roundabout = dir.path().join("nested").join("..");
+        let again = topology_for(&roundabout);
+        assert!(
+            Arc::ptr_eq(&base, &again),
+            "path with .. must normalize to the same registry entry"
+        );
+    }
+}
