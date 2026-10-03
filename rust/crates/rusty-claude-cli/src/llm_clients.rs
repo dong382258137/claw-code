@@ -38,11 +38,35 @@
 //!
 //! 适配器只需把 `ApiError` 转为 `Err(String)`,上层降级逻辑已就位。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use api::{max_tokens_for_model, InputMessage, MessageRequest, OutputContentBlock, ProviderClient};
 use runtime::decision_log::DecisionExtractorClient;
 use runtime::multi_agent::validation::JudgeClient;
+use runtime::{
+    ApiClient, ApiRequest, AssistantEvent, ConversationMessage, RequestKind, SystemPromptSplit,
+};
+
+/// 共享的网页后端(进程级 OnceLock)。
+///
+/// 2026-09-19 混合分工第二层:启动时检测到已登录网页凭证(chat.deepseek.com,
+/// deepseek V4.1,零 token)即注入一份共享 `WebApiClient`。注入后,所有经
+/// [`LlmBridge`] 的一次性总结/判断子件(压缩摘要、judge、决策提取、计划、
+/// research 摘要、新鲜度评估、查询构建)优先走网页端;网页不可用/调用失败/
+/// 空回复时自动回退 API `ProviderClient`(原逻辑),绝不因网页故障影响质量。
+///
+/// 无凭证 → 不注入 → 全部子件走 API(原行为,零回归)。
+static SHARED_WEB_CLIENT: std::sync::OnceLock<Option<Arc<Mutex<web_bridge::WebApiClient>>>> =
+    std::sync::OnceLock::new();
+
+/// 注入共享网页后端(进程级单例,重复调用静默忽略)。
+pub fn set_shared_web_client(client: Arc<Mutex<web_bridge::WebApiClient>>) {
+    let _ = SHARED_WEB_CLIENT.set(Some(client));
+}
+
+fn shared_web_client() -> Option<Arc<Mutex<web_bridge::WebApiClient>>> {
+    SHARED_WEB_CLIENT.get().and_then(Clone::clone)
+}
 
 /// LLM 调用桥接 — 同步接口包裹 async `ProviderClient::send_message`。
 ///
@@ -86,14 +110,34 @@ impl LlmBridge {
     /// 同步调用 LLM,返回纯文本响应。
     ///
     /// # 流程
-    /// 1. 构造 `MessageRequest`(单条 user message,stream=false)
-    /// 2. `runtime.block_on(client.send_message(&request))`
-    /// 3. 从 `MessageResponse.content` 提取所有 `Text` 块拼接为字符串
+    /// 1. 网页优先:若注入共享网页后端,先尝试网页端(deepseek V4.1,零 token);
+    /// 2. 网页不可用/失败/空回复 → 回退 API:
+    ///    构造 `MessageRequest`(单条 user message,stream=false)、
+    ///    `runtime.block_on(client.send_message(&request))`、
+    ///    从 `MessageResponse.content` 提取所有 `Text` 块拼接为字符串
     ///
     /// # 错误
     /// 网络/API/超时等返回 `Err(String)`,由上层降级处理。
     #[allow(clippy::result_large_err)]
     fn call(&self, prompt: &str) -> Result<String, String> {
+        // 网页优先:共享网页后端存在时先试网页。
+        if let Some(web) = shared_web_client() {
+            match call_web(&web, prompt) {
+                Ok(text) if !text.trim().is_empty() => return Ok(text),
+                Ok(_) => {
+                    eprintln!("[llm-bridge] web 返回空回复,回退 API");
+                }
+                Err(e) => {
+                    eprintln!("[llm-bridge] web 调用失败({e}),回退 API");
+                }
+            }
+        }
+        self.call_with_api(prompt)
+    }
+
+    /// API 兜底路径(原 `call` 逻辑):`ProviderClient::send_message`。
+    #[allow(clippy::result_large_err)]
+    fn call_with_api(&self, prompt: &str) -> Result<String, String> {
         let request = MessageRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
@@ -139,6 +183,44 @@ impl LlmBridge {
             .collect::<Vec<_>>()
             .join("");
         Ok(text)
+    }
+}
+
+/// 同步调用共享网页后端:构造最小 `ApiRequest`(空 system + 单条 user 文本),
+/// 从 `WebApiClient::stream` 的事件中提取所有 `TextDelta` 拼接。
+///
+/// `WebApiClient::stream` 是同步 round_trip(阻塞等待网页回复),与
+/// [`LlmBridge::call_with_api`] 相同的 tokio 上下文处理:c051bac0 后子件可能
+/// 从 `run_turn_async` 调用栈触发,直接同步调用会阻塞 current_thread 的
+/// 唯一 worker;检测到已处 runtime 时在独立 OS 线程上执行并 join 等待。
+fn call_web(web: &Arc<Mutex<web_bridge::WebApiClient>>, prompt: &str) -> Result<String, String> {
+    let request = ApiRequest {
+        system_prompt: SystemPromptSplit::from_sections(Vec::new()),
+        messages: vec![ConversationMessage::user_text(prompt.to_string())],
+        request_kind: RequestKind::Subagent,
+        triage_tier: None,
+    };
+    let web = Arc::clone(web);
+    let run = move || {
+        let mut guard = web
+            .lock()
+            .map_err(|_| "web bridge lock poisoned".to_string())?;
+        let events = guard.stream(request.clone()).map_err(|e| e.to_string())?;
+        let text: String = events
+            .iter()
+            .filter_map(|ev| match ev {
+                AssistantEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        Ok(text)
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(run)
+            .join()
+            .map_err(|_| "web call worker thread panicked".to_string())?
+    } else {
+        run()
     }
 }
 
@@ -829,5 +911,53 @@ mod tests {
         .is_none());
         // 非 JSON
         assert!(DeepSeekHarnessProposer::parse_propose_response("not json at all").is_none());
+    }
+
+    /// Mock `WebExchange`:成功返回固定文本,或按标记失败。
+    struct MockExchange {
+        reply: String,
+        fail: bool,
+    }
+
+    impl web_bridge::WebExchange for MockExchange {
+        fn round_trip(&mut self, _prompt: &str) -> Result<String, String> {
+            if self.fail {
+                Err("mock web failure".to_string())
+            } else {
+                Ok(self.reply.clone())
+            }
+        }
+    }
+
+    fn mock_web(reply: &str, fail: bool) -> Arc<Mutex<web_bridge::WebApiClient>> {
+        Arc::new(Mutex::new(web_bridge::WebApiClient::new(Box::new(
+            MockExchange {
+                reply: reply.to_string(),
+                fail,
+            },
+        ))))
+    }
+
+    /// 网页成功:从共享网页后端取回纯文本回复(提取 TextDelta 拼接)。
+    #[test]
+    fn call_web_extracts_text_from_reply() {
+        let web = mock_web("网页端摘要结果", false);
+        let got = call_web(&web, "总结这段对话").expect("web call ok");
+        assert_eq!(got, "网页端摘要结果");
+        assert!(!got.trim().is_empty(), "非空文本应被保留");
+    }
+
+    /// 网页失败(round_trip 返回 Err):错误向上传播 → 上层 `call` 触发 API 兜底。
+    #[test]
+    fn call_web_propagates_exchange_error() {
+        let web = mock_web("", true);
+        let got = call_web(&web, "总结这段对话");
+        assert!(got.is_err(), "web 失败应返回 Err(触发 API 兜底)");
+    }
+
+    /// 未注入共享网页后端时,getter 返回 None(全部子件走 API,原行为)。
+    #[test]
+    fn shared_web_client_is_none_by_default() {
+        assert!(shared_web_client().is_none());
     }
 }
