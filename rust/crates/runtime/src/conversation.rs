@@ -3409,10 +3409,13 @@ where
     /// # 模型选择与「关闭思考」说明
     /// - 模型固定 [`TRIAGE_MODEL`](`deepseek-v4-flash`):budget 档轻量模型,
     ///   关闭思考即可胜任档位判断;
-    /// - 「关闭思考」在代码中的形态见 [`crate::triage_llm`] 模块注释:
-    ///   runtime `ApiRequest`(trait 边界)无 thinking 字段,无法显式携带
-    ///   `thinking: disabled`;`with_model` 新建 client 的 thinking_mode 为
-    ///   None(CLI 侧默认),实际请求体不发送 thinking 参数、走后端默认。
+    /// - 「关闭思考」:本方法在 `with_model` 后显式调用
+    ///   `set_thinking_mode(Some(false))`,经 trait 动态分发到 API client
+    ///   (`AnthropicRuntimeClient` 设置 `thinking_mode=Some(false)`,请求体注入
+    ///   `"thinking": {"type": "disabled"}`,仅 DeepSeek 模型);不设置则走后端
+    ///   默认(DeepSeek V4 默认开思考)。
+    /// - 路由:分诊请求走 API 端(2026-10-03 起,网页混合分工 `RoutingApiClient`
+    ///   已停用删除 —— 网页高频调用曾被 DeepSeek 官方风控,账号被禁)。
     ///
     /// # with_model 失败的处理(直接跳过分诊,不回退)
     /// 生产 `AnthropicRuntimeClient::with_model` 恒 Ok,Err 分支实际只命中
@@ -3438,6 +3441,10 @@ where
             );
             return TriageTier::Standard;
         };
+        // 分诊:显式关闭思考模式(轻量档位判断无需推理链)。Some(false) → API
+        // 请求体注入 `"thinking": {"type": "disabled"}`(仅 DeepSeek 模型);不设
+        // 则走后端默认(DeepSeek V4 默认开思考,徒增成本与延迟)。
+        triage_client.set_thinking_mode(Some(false));
         // 3. 最小请求:单条 user 文本 + 分诊 system prompt(全静态,保缓存命中)。
         let request = ApiRequest {
             system_prompt: SystemPromptSplit::from_sections(vec![TRIAGE_LLM_SYSTEM.to_string()]),
@@ -3639,6 +3646,20 @@ where
         // 档位在 turn 开头判定一次,本 turn 所有迭代共用(turn 是分诊的最小单位)。
         let turn_tier = self.triage_turn_llm(&user_input).await;
         self.emit_diag(format!("[diag] triage_tier={turn_tier:?}"));
+
+        // 按档位自动设置主 client 思考模式(2026-10-03):
+        // - Trivial 档(纯状态/问答)→ 显式关闭思考(Some(false)),请求体注入
+        //   `"thinking": {"type": "disabled"}`,纯问答无需推理链,省输出 token
+        //   与延迟;
+        // - Standard 档 → 恢复 CLI 基线设置:每 turn 开头 client 由
+        //   prepare_turn_runtime 重建(thinking_mode 为 CLI 同步值),但上一 turn
+        //   若是 Trivial 已把 client 覆写为 Some(false),这里显式写回基线,
+        //   避免 CLI 的 --no-thinking/默认设置被 Trivial 档覆盖残留。
+        let baseline_thinking = self.api_client.thinking_mode();
+        match turn_tier {
+            TriageTier::Trivial => self.api_client.set_thinking_mode(Some(false)),
+            TriageTier::Standard => self.api_client.set_thinking_mode(baseline_thinking),
+        }
 
         // Harness O(编排)层接入:Plan/Execute/Review 三段循环入口。
         // 详见 docs/harness-engineering-optimization-plan.md Step 2.1。

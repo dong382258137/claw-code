@@ -13,22 +13,25 @@
 //! 全部可离线单测;异步调用接入见
 //! [`crate::conversation::ConversationRuntime::triage_turn_llm`]。
 //!
-//! # 「关闭思考」的实际形态(以代码为准,2026-09-04 勘察)
+//! # 「关闭思考」的实际形态(以代码为准,2026-10-03 更新)
 //! - `deepseek-v4-flash` 就是普通模型别名(`resolve_model_alias("flash")` →
 //!   `"deepseek-v4-flash"`,见 api::providers),**不存在独立的"无思考"模型名**。
 //! - API 层思考开关是 `api::MessageRequest.thinking_mode: Option<bool>`:
 //!   `Some(false)` → 请求体注入 `"thinking": {"type": "disabled"}`
 //!   (仅 DeepSeek 模型,见 api::providers::openai_compat 的 payload 构造);
 //!   `None` → 不发送该字段,走后端默认(DeepSeek V4 默认开思考)。
-//! - runtime 的 [`ApiRequest`](crate::conversation::ApiRequest)(trait 边界)
-//!   **没有** thinking 字段;生产 `AnthropicRuntimeClient`(rusty-claude-cli)
-//!   把 `thinking_mode` 作为 client 级状态(构造默认 `None`,由 CLI
-//!   `--no-thinking` 设置),`with_model(...)` 新建的 client 同样为 `None`。
-//! - 因此本实现直接使用普通 `deepseek-v4-flash` 别名发请求,不显式携带
-//!   thinking 参数(该参数位在 runtime → API 的 trait 边界不可达);若要在
-//!   请求体显式 `thinking: disabled`,需在 CLI/client 层让 `with_model`
-//!   继承主 client 的 `thinking_mode`(超出本模块范围)。分诊解析只取
-//!   assistant 文本块 —— 即便模型默认思考,thinking 块也被忽略,输出不受影响。
+//! - 分诊请求走 API 端(2026-10-03 起;此前曾路由到网页零 token,被 DeepSeek
+//!   官方风控、账号被禁,网页混合分工 `RoutingApiClient` 已停用删除)。
+//!   由 [`crate::conversation::ConversationRuntime::triage_turn_llm`] 在
+//!   `with_model(TRIAGE_MODEL)` 后显式调用 `set_thinking_mode(Some(false))`
+//!   (经 trait 动态分发到 `AnthropicRuntimeClient`,请求体注入
+//!   `thinking: disabled`),确保档位判断不走思考、成本与延迟最低。
+//! - Trivial 档**主回复**同样关闭思考:`run_turn_async` 判定 `turn_tier` 后
+//!   按档位设置主 client 的 thinking_mode(Trivial → Some(false),Standard →
+//!   恢复 CLI 基线),见 [`crate::conversation`] 中「按档位自动设置主 client
+//!   思考模式」注释。
+//! - 分诊解析只取 assistant 文本块 —— 即便模型默认思考,thinking 块也被
+//!   忽略,输出不受影响;关闭思考进一步降低该轻量调用的开销。
 
 use crate::triage::TriageTier;
 
@@ -43,19 +46,26 @@ pub const TRIAGE_MODEL: &str = "deepseek-v4-flash";
 /// 分诊 LLM 的 system prompt(中文,轻量)。
 ///
 /// 内容要点:让模型只输出一个词档位。保守优先(不确定 → standard),
-/// 宁可不裁剪也不误伤正常工程轮次。全静态文本(单 section),
-/// 同内容请求可命中 DeepSeek prefix cache。
+/// 宁可不裁剪也不误伤正常工程轮次。含「档位后果」说明(trivial 会裁剪
+/// 能力层教程与长尾工具,只留状态层 + 核心工具)与易混淆边界 few-shot
+/// 对比示例,降低「解释现状」与「动手修改」的误判率。全静态文本
+/// (单 section),同内容请求可命中 DeepSeek prefix cache。
 pub const TRIAGE_LLM_SYSTEM: &str = "\
 你是任务分诊器。根据用户输入判断本轮对话应注入哪种上下文档位,只输出一个词:trivial 或 standard。
 
-- trivial:纯状态/问答/简单说明类轮次。典型例子:「上次任务执行到哪里了」
-  「当前工作目录是什么」「任务完成的怎么样了」「这个报错信息是什么意思」。
-  这类轮次只需状态信息与核心工具即可回答,不需要完整工具目录与
-  多 Agent / 架构教程。
-- standard:任何工程任务或不确定的情况。典型例子:修改/修复/实现/重构/
-  调试/检查分析代码、前端调整、写脚本、执行多步任务等。
+- trivial:纯状态/问答/简单说明类轮次。注入时会裁剪能力层教程与长尾工具,
+  仅保留状态层与核心工具集(读/查文件等),关闭思考模式。
+- standard:任何工程任务或不确定的情况。全量注入完整上下文与全部工具。
 
-保守优先:不确定一律 standard —— 宁可不裁剪,也不误伤正常工程轮次。
+易混淆边界(重点区分「解释现状」与「动手修改」):
+- 「这个报错信息是什么意思」→ trivial(解释现状)
+- 「帮我修这个报错」→ standard(修改代码)
+- 「上次任务执行到哪里了」→ trivial(读状态)
+- 「继续执行上次的任务」→ standard(接续工程)
+- 「当前工作目录是什么」→ trivial(状态问答)
+- 「检查分析这段代码为什么慢」→ standard(调试分析)
+
+保守优先:不确定一律 standard —— 宁可多花 token,也不把工程轮次裁剪成能力残缺。
 
 只输出一个词(trivial 或 standard),禁止输出任何其他内容、解释、标点或引号。";
 

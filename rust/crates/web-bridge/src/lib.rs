@@ -19,7 +19,6 @@ pub mod driver;
 pub mod login;
 pub mod pow;
 pub mod protocol;
-pub mod routing;
 pub mod safe_commands;
 pub mod tools;
 pub mod web_session;
