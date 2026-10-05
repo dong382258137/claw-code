@@ -261,30 +261,43 @@ impl LoopDetector {
         }
 
         let normalized = normalize_tool_input(tool_input);
-        let call_key = (tool_name.to_owned(), normalized);
-        let entry = self
-            .tool_call_counts
-            .entry(call_key.clone())
-            .or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 = now_ms;
-
-        if entry.0 >= TOOL_ABORT_THRESHOLD {
-            return LoopAction::Abort(format!(
-                "doom loop detected: tool '{tool_name}' invoked {} times with identical input",
-                entry.0
-            ));
-        }
+        // 快照类调用豁免相同-input 通道:browser_control 的标准用法是
+        // "点击 → snapshot 刷新 refs",输入恒为 {"action":"snapshot"},
+        // 相同-input 计数(3/6)会误杀正常推进的浏览器操作序列(2026-10-04
+        // 实测:登录后台逐页检查被 6 次相同 snapshot 判为 doom loop)。
+        // 豁免后,相同-input 不再累积;真正的"页面无变化死循环"仍由
+        // 相同-output 通道(5/10)与无产出通道(15/30)兜底。
+        let snapshot_like = is_snapshot_like_call(tool_name, &normalized);
         let mut action = LoopAction::Continue;
-        if entry.0 == TOOL_WARN_THRESHOLD {
-            let warn_key = format!("call:{tool_name}:{}", call_key.1);
-            if let std::collections::hash_map::Entry::Vacant(e) = self.tool_warned.entry(warn_key) {
-                e.insert(now_ms);
-                action = LoopAction::InjectContext(format!(
-                    "consider reconsidering your approach — tool '{tool_name}' has been invoked \
-                     {} times with identical input; the result has not changed",
+        if snapshot_like {
+            // 仅跳过相同-input 计数,仍走相同-output / 无产出通道。
+        } else {
+            let call_key = (tool_name.to_owned(), normalized);
+            let entry = self
+                .tool_call_counts
+                .entry(call_key.clone())
+                .or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = now_ms;
+
+            if entry.0 >= TOOL_ABORT_THRESHOLD {
+                return LoopAction::Abort(format!(
+                    "doom loop detected: tool '{tool_name}' invoked {} times with identical input",
                     entry.0
                 ));
+            }
+            if entry.0 == TOOL_WARN_THRESHOLD {
+                let warn_key = format!("call:{tool_name}:{}", call_key.1);
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.tool_warned.entry(warn_key)
+                {
+                    e.insert(now_ms);
+                    action = LoopAction::InjectContext(format!(
+                        "consider reconsidering your approach — tool '{tool_name}' has been invoked \
+                         {} times with identical input; the result has not changed",
+                        entry.0
+                    ));
+                }
             }
         }
 
@@ -463,6 +476,23 @@ fn normalize_tool_input(input: &str) -> String {
         return value.to_string();
     }
     input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 判定一次工具调用是否为"快照/刷新类"操作 —— 输入恒定是标准用法,
+/// 不应被相同-input 循环检测误判(3 次警告 / 6 次中止)。
+///
+/// 典型场景:`browser_control` 的 `snapshot` 是浏览器自动化常规流程中
+/// "点击/操作后刷新页面 refs"的固定动作,输入恒为 `{"action":"snapshot"}`;
+/// 每次输出(页面结构)不同,说明操作在推进,不应按"bash 诊断循环"
+/// 语义计数。仅豁免相同-input 通道,相同-output 通道仍保留 —— 页面
+/// 真正无变化时由 (5/10) 兜底拦截。
+fn is_snapshot_like_call(tool_name: &str, normalized_input: &str) -> bool {
+    if tool_name != "browser_control" {
+        return false;
+    }
+    // 仅豁免无参快照类 action(snapshot);带参动作(get_state/click/fill 等)
+    // 输入含 ref 等可变字段,正常不会构成相同-input,无需豁免。
+    normalized_input.contains("\"action\":\"snapshot\"")
 }
 
 /// 规范化工具输出,使"语义相同、文本不同"的调用互相匹配(验证循环检测):
@@ -704,6 +734,48 @@ mod tests {
         }
         let action = detector.record_tool_call("Bash", "step-final", "status: ok");
         assert!(matches!(action, LoopAction::Abort(_)));
+    }
+
+    #[test]
+    fn browser_snapshot_exempt_from_identical_input_channel() {
+        // 浏览器自动化的"点击 → snapshot 刷新 refs"是标准推进流程,
+        // 输入恒为 {"action":"snapshot"},相同-input 通道应豁免;
+        // 超过 6 次也不中止(推进中,输出在变)。
+        let mut detector = LoopDetector::new();
+        for i in 0..TOOL_ABORT_THRESHOLD + 3 {
+            let output = format!("page-state-{i}");
+            let action = detector.record_tool_call(
+                "browser_control",
+                r#"{"action":"snapshot"}"#,
+                &output,
+            );
+            assert!(
+                matches!(action, LoopAction::Continue),
+                "快照类调用不应被相同-input 通道拦截(第 {i} 次)"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_snapshot_still_caught_by_same_output_channel() {
+        // 豁免相同-input 后,页面真正无变化(输出相同)仍由相同-output 通道兜底。
+        let mut detector = LoopDetector::new();
+        for _ in 0..SAME_OUTPUT_ABORT_THRESHOLD {
+            let _ = detector.record_tool_call(
+                "browser_control",
+                r#"{"action":"snapshot"}"#,
+                "same-page-state",
+            );
+        }
+        let action = detector.record_tool_call(
+            "browser_control",
+            r#"{"action":"snapshot"}"#,
+            "same-page-state",
+        );
+        assert!(
+            matches!(action, LoopAction::Abort(_)),
+            "相同输出应触发 Abort(兜底通道仍生效)"
+        );
     }
 
     #[test]

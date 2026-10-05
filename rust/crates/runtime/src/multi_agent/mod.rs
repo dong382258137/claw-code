@@ -76,10 +76,12 @@ pub enum TaskComplexity {
 #[serde(rename_all = "kebab-case")]
 pub enum SubagentCapability {
     /// L0 分析型:只读 + 推理,无副作用。用于调研、方案设计、代码审查。
-    #[default]
     Analyze,
     /// L1 只读型:可调用只读工具(read_file/grep_search/glob_search/repomap/lsp_diagnostics),
-    /// 禁止写入。
+    /// 禁止写入。**缺省值**(2026-10-04 统一):`parse_capability` 缺省、
+    /// `Subagent` 反序列化缺省、`SpawnRequest::new` 缺省三者一致,
+    /// 避免"同一语义两个默认"导致部分路径子代理零工具。
+    #[default]
     ReadOnly,
     /// L2 执行型:可调用写入工具(edit_file/write_file/bash),受白名单约束。
     Execute,
@@ -257,6 +259,16 @@ pub struct Subagent {
     /// §v3 P0:与 `cost_limit` 配合,达上限后中止 retry。
     #[serde(default)]
     pub cost_accumulated: f64,
+
+    /// 白名单外附加工具(2026-10-04,注册表感知修复)。
+    ///
+    /// `capability.allowed_tools()` 是硬编码内置工具表,不含插件/MCP 工具
+    /// (如 browser_control)。此字段允许派发方按任务实际需求显式附加工具,
+    /// Guard 2 白名单检查与 `## Available Tools` 注入均合并本集合。
+    /// 安全边界:由派发方(如 branch-retry 继承主 agent 本次 turn 实际用过的
+    /// 工具集)显式注入,不放大主 agent 自身已获授权的权限。
+    #[serde(default)]
+    pub extra_tools: Vec<String>,
 }
 
 fn default_complexity() -> TaskComplexity {
@@ -312,8 +324,9 @@ pub struct SpawnRequest {
 impl SpawnRequest {
     /// 创建一个新的 `SpawnRequest`。
     ///
-    /// `capability` 默认为 `Analyze`(向后兼容,现有调用方零改动)。
-    /// 需要指定能力时链式调用 [`SpawnRequest::with_capability`]。
+    /// `capability` 默认为 `ReadOnly`(2026-10-04 统一,与 `parse_capability`
+    /// 缺省、`Subagent` 反序列化缺省一致;此前为 `Analyze` 导致部分路径
+    /// 子代理零工具)。需要指定能力时链式调用 [`SpawnRequest::with_capability`]。
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -328,7 +341,7 @@ impl SpawnRequest {
             mode,
             model: model.into(),
             complexity,
-            capability: SubagentCapability::Analyze,
+            capability: SubagentCapability::ReadOnly,
             workspace: None,
             max_iterations: None,
         }
@@ -458,7 +471,7 @@ impl MultiAgentCoordinator {
             // v3 扩展字段默认值
             model: None,
             complexity: TaskComplexity::Simple,
-            capability: SubagentCapability::Analyze,
+            capability: SubagentCapability::ReadOnly,
             max_attempts: 1,
             attempts: 0,
             validated: false,
@@ -466,6 +479,7 @@ impl MultiAgentCoordinator {
             checkpoint_path: None,
             cost_limit: None,
             cost_accumulated: 0.0,
+            extra_tools: Vec::new(),
         };
 
         let mut agents = self.subagents.lock().expect("subagents lock poisoned");
@@ -972,6 +986,24 @@ impl MultiAgentCoordinator {
             .get_mut(subagent_id)
             .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
         agent.capability = capability;
+        Ok(())
+    }
+
+    /// 设置子 agent 白名单外附加工具 — 注册表感知修复(2026-10-04)。
+    ///
+    /// 由 `execute_dispatch_subagent` 在 spawn 后根据 JSON `extra_tools` 字段注入。
+    /// 合并进 Guard 2 白名单检查与 `## Available Tools` 注入(见
+    /// [`Subagent::extra_tools`](Subagent::extra_tools) 的安全边界说明)。
+    pub fn set_extra_tools(
+        &self,
+        subagent_id: &str,
+        extra_tools: Vec<String>,
+    ) -> Result<(), String> {
+        let mut agents = self.subagents.lock().expect("subagents lock");
+        let agent = agents
+            .get_mut(subagent_id)
+            .ok_or_else(|| format!("subagent not found: {subagent_id}"))?;
+        agent.extra_tools = extra_tools;
         Ok(())
     }
 
@@ -1888,7 +1920,7 @@ mod tests {
         assert_eq!(SubagentCapability::Execute.max_iterations(), 10);
     }
 
-    /// Epic 0:`SpawnRequest::new` 默认 capability = Analyze(向后兼容)。
+    /// Epic 0:`SpawnRequest::new` 默认 capability = ReadOnly(2026-10-04 统一)。
     /// `with_capability` builder 正确设置。
     #[test]
     fn spawn_request_default_capability_and_builder() {
@@ -1899,16 +1931,17 @@ mod tests {
             "m",
             TaskComplexity::Simple,
         );
-        assert_eq!(req.capability, SubagentCapability::Analyze);
+        assert_eq!(req.capability, SubagentCapability::ReadOnly);
 
         let req = req.with_capability(SubagentCapability::Execute);
         assert_eq!(req.capability, SubagentCapability::Execute);
     }
 
-    /// Epic 0:`Subagent` 缺 `capability` 字段反序列化默认 Analyze(向后兼容)。
+    /// Epic 0:`Subagent` 缺 `capability` 字段反序列化默认 ReadOnly
+    /// (2026-10-04 统一:与 `parse_capability` 缺省、`SpawnRequest::new` 缺省一致)。
     #[test]
-    fn subagent_deserialize_missing_capability_defaults_analyze() {
-        // 旧格式 JSON(无 capability 字段)应能正确反序列化,capability 默认 Analyze
+    fn subagent_deserialize_missing_capability_defaults_read_only() {
+        // 旧格式 JSON(无 capability 字段)应能正确反序列化,capability 默认 ReadOnly
         let json = r#"{
             "id": "test-id",
             "name": "test",
@@ -1930,7 +1963,48 @@ mod tests {
             "cost_accumulated": 0.0
         }"#;
         let agent: Subagent = serde_json::from_str(json).expect("deserialize old format");
-        assert_eq!(agent.capability, SubagentCapability::Analyze);
+        assert_eq!(agent.capability, SubagentCapability::ReadOnly);
+        assert!(
+            agent.extra_tools.is_empty(),
+            "missing extra_tools should default to empty"
+        );
+    }
+
+    /// 注册表感知(2026-10-04):`extra_tools` 反序列化与 `set_extra_tools` 注入。
+    #[test]
+    fn subagent_extra_tools_deserialize_and_setter() {
+        let json = r#"{
+            "id": "x",
+            "name": "x",
+            "mode": "fork",
+            "task": "x",
+            "status": "created",
+            "workdir": null,
+            "created_at": 0,
+            "completed_at": null,
+            "result": null,
+            "complexity": "simple",
+            "capability": "execute",
+            "max_attempts": 1,
+            "attempts": 0,
+            "validated": false,
+            "notes": [],
+            "checkpoint_path": null,
+            "cost_limit": null,
+            "cost_accumulated": 0.0,
+            "extra_tools": ["browser_control", "mcp_sql"]
+        }"#;
+        let agent: Subagent = serde_json::from_str(json).expect("deserialize with extra_tools");
+        assert_eq!(agent.extra_tools, vec!["browser_control", "mcp_sql"]);
+
+        // set_extra_tools 覆盖注入
+        let coord = MultiAgentCoordinator::new();
+        let id = coord.spawn("b", "t", CoordinationMode::Fork);
+        coord
+            .set_extra_tools(&id, vec!["browser_control".to_string()])
+            .expect("set_extra_tools");
+        let agent = coord.get(&id).expect("agent");
+        assert_eq!(agent.extra_tools, vec!["browser_control"]);
     }
 
     /// Epic 0:`Subagent` 含 `capability` 字段反序列化(kebab-case)。
@@ -1967,7 +2041,7 @@ mod tests {
         let id = coord.spawn("a", "t", CoordinationMode::Fork);
         assert_eq!(
             coord.get(&id).unwrap().capability,
-            SubagentCapability::Analyze
+            SubagentCapability::ReadOnly
         );
         coord
             .set_capability(&id, SubagentCapability::Execute)

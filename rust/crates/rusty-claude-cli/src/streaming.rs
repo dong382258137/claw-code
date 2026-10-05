@@ -591,6 +591,9 @@ impl ApiClient for AnthropicRuntimeClient {
     /// - `Analyze`:`enable_tools=false`(纯 LLM 推理,等同原 `with_model` 行为)
     /// - `ReadOnly`/`Execute`:`enable_tools=true`,按 `capability.allowed_tools()`
     ///   设置 `AllowedToolSet` 白名单,仅暴露白名单内的工具定义
+    /// - `extra_tools`(2026-10-04,注册表感知):白名单外附加工具(插件/MCP,
+    ///   如 browser_control)合并进 `AllowedToolSet`,使子代理可真正调用
+    ///   它们——否则 API 层 schema 缺失,模型不会生成对应 tool_use
     ///
     /// 子 agent client 其余配置与 `with_model` 一致:静默执行、无进度/状态订阅、
     /// 复用主 agent 的 `session_id` 前缀 + `tool_registry`。
@@ -598,12 +601,15 @@ impl ApiClient for AnthropicRuntimeClient {
         &self,
         model: &str,
         capability: SubagentCapability,
+        extra_tools: &[String],
     ) -> Result<Box<dyn ApiClient>, String> {
         let enable_tools = capability.enables_tools();
         let allowed_tools = if enable_tools {
-            Some(AllowedToolSet::from_iter(
+            let mut set = AllowedToolSet::from_iter(
                 capability.allowed_tools().iter().map(|s| s.to_string()),
-            ))
+            );
+            set.extend(extra_tools.iter().cloned());
+            Some(set)
         } else {
             None
         };

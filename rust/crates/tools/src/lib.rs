@@ -1133,6 +1133,69 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "windows_control",
+            description: "Drive local Windows desktop apps through the cua-driver \
+                backend (UIA accessibility tree + background input injection; no focus \
+                stealing, humans and the agent can work simultaneously). The session state \
+                lives in the cua-driver daemon, so calls are stateless and the same tool is \
+                reused across calls. Workflow: 1) 'list_windows' (or 'list_apps'/'launch_app') \
+                to find the target pid + window_id; 2) 'snapshot' with pid + window_id to get \
+                the UIA element tree (every element carries [ref=<element_token>] like \
+                's00000001:0') plus a window screenshot; 3) address elements with \
+                click/double_click/right_click/type_text/press_key/hotkey/scroll/drag/set_value \
+                using 'ref' (preferred, UIA Invoke) or window-local 'x'/'y' pixels (for \
+                canvas/WebGL/self-drawn surfaces); 4) verify with 'verify' (bounded \
+                postconditions) or another 'snapshot'; 5) re-run 'snapshot' after any change to \
+                refresh refs (new snapshot invalidates old element tokens). Screenshots are \
+                saved to <cwd>/.claw/windows_shots/ and reported as 'screenshot_path'. \
+                'desktop' captures the full screen for desktop-scope coordinate work. Prefer \
+                this tool over screenshot+visual-model loops for Windows app UI automation. \
+                For Chromium-based 'fake desktop' apps (Electron / WebView2 / Chrome) whose \
+                UIA tree is empty, use action 'cdp_open' (pid or name) to restart the app \
+                with a remote debugging port, then drive its DOM with browser_control \
+                'connect' port=<port>.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list_windows", "list_apps", "launch_app", "snapshot", "desktop", "click", "double_click", "right_click", "type_text", "press_key", "hotkey", "scroll", "drag", "set_value", "verify", "cdp_open"], "description": "Action to perform. Required." },
+                    "pid": { "type": "integer", "description": "Process id of the target app (required by snapshot/click/verify/…)." },
+                    "window_id": { "type": "integer", "description": "Window handle id from 'list_windows' (required by snapshot/verify)." },
+                    "ref": { "type": "string", "description": "Element reference (element_token like 's00000001:0') from the last 'snapshot'. Preferred over x/y." },
+                    "x": { "type": "integer", "description": "Window-local screenshot pixel X (fallback addressing when UIA cannot cover the surface)." },
+                    "y": { "type": "integer", "description": "Window-local screenshot pixel Y." },
+                    "text": { "type": "string", "description": "Text for 'type_text'." },
+                    "key": { "type": "string", "description": "Single key for 'press_key' (return/tab/escape/up/down/left/right/space/delete/home/end/pageup/pagedown/f1-f12/letters/digits)." },
+                    "keys": { "type": "array", "items": { "type": "string" }, "description": "Combination keys for 'hotkey', e.g. ['ctrl','c']." },
+                    "modifiers": { "type": "array", "items": { "type": "string" }, "description": "Modifier keys for 'press_key'." },
+                    "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button for 'click'." },
+                    "count": { "type": "integer", "enum": [1, 2, 3], "description": "Click count for 'click'." },
+                    "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction for 'scroll'. Required." },
+                    "amount": { "type": "integer", "description": "Scroll amount for 'scroll'." },
+                    "by": { "type": "string", "enum": ["line", "page"], "description": "Scroll unit for 'scroll'." },
+                    "value": { "type": "string", "description": "Value for 'set_value'." },
+                    "from_x": { "type": "integer", "description": "Drag start X (window-local pixels)." },
+                    "from_y": { "type": "integer", "description": "Drag start Y." },
+                    "to_x": { "type": "integer", "description": "Drag end X." },
+                    "to_y": { "type": "integer", "description": "Drag end Y." },
+                    "expect": { "type": "array", "items": { "type": "object" }, "description": "Keyed expectations for 'verify' (bounded postconditions), e.g. [{\"field\": \"value\", \"equals\": \"hello\"}]." },
+                    "stable_samples": { "type": "integer", "description": "Stable samples for 'verify'." },
+                    "name": { "type": "string", "description": "App name for 'launch_app' (name or path required)." },
+                    "path": { "type": "string", "description": "Executable path for 'launch_app'." },
+                    "query": { "type": "string", "description": "Case-insensitive substring projection of the snapshot element tree." },
+                    "max_elements": { "type": "integer", "description": "Bound the UIA walk for 'snapshot' (large Electron/web trees)." },
+                    "max_depth": { "type": "integer", "description": "Bound the UIA walk depth for 'snapshot'." },
+                    "timeout_ms": { "type": "integer", "description": "Timeout (ms) for 'verify'." },
+                    "delay_ms": { "type": "integer", "description": "Keystroke delay (ms) for 'type_text'." },
+                    "delivery_mode": { "type": "string", "enum": ["background", "foreground"], "description": "'click' delivery; background is the default preferred mode (upgrade to foreground only on background_unavailable errors)." },
+                    "save_path": { "type": "string", "description": "Output path for screenshots; default: <cwd>/.claw/windows_shots/<timestamp>.png" },
+                    "port": { "type": "integer", "description": "CDP debug port for 'cdp_open'; default: first free port in 9000-9999." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "WebFetch",
             description:
                 "Fetch a URL, convert it into readable text, and answer a prompt about it.",
@@ -2088,6 +2151,8 @@ fn execute_tool_with_enforcer(
         }
         "browser_control" => from_value::<browser_control::BrowserControlInput>(input)
             .and_then(browser_control::run_browser_control),
+        "windows_control" => from_value::<windows_control::WindowsControlInput>(input)
+            .and_then(windows_control::run_windows_control),
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
@@ -9728,6 +9793,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 pub mod browser_control;
+pub mod windows_control;
 pub mod lane_completion;
 pub mod pdf_extract;
 

@@ -223,7 +223,7 @@ impl SubagentDispatcher {
                         .lock()
                         .map_err(|e| format!("api_client lock poisoned: {e}"))?;
                     if let Some(m) = model.as_deref() {
-                        match guard.with_model_and_capability(m, capability) {
+                        match guard.with_model_and_capability(m, capability, &[]) {
                             Ok(c) => rebuilt = Some(c),
                             Err(_) => fallback_guard = Some(guard),
                         }
@@ -266,6 +266,7 @@ impl SubagentDispatcher {
                     &task,
                     complexity,
                     capability,
+                    &[],
                     &ctx,
                 ))
             })();

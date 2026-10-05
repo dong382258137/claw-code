@@ -3944,21 +3944,6 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 注入后,context compaction(`compact_session_with_trigger` →
     // `summarize_messages_with_llm`)会调用 LLM 生成模型摘要(语义压缩),
     // 而非启发式规则摘要;失败/未注入自动降级回启发式,不阻塞压缩。
-
-    // 混合分工第二层:一次性总结/判断子件网页优先(deepseek V4.1,零 token)。
-    // 检测到已登录网页凭证时,向 LlmBridge 注入共享 WebApiClient——压缩摘要/
-    // judge/决策提取/计划/research 摘要/新鲜度评估/查询构建全部优先走网页,
-    // 网页不可用/失败自动回退 API ProviderClient(见 llm_clients.rs call)。
-    // 无凭证 → 不注入 → 全部走 API(零回归)。OnceLock 进程级单例,重复注入静默忽略。
-    if let Ok(web_auth) = web_bridge::web_session::WebAuth::load() {
-        let web = web_bridge::WebApiClient::new(Box::new(
-            web_bridge::deepseek_web::DeepseekWebClient::new(web_auth),
-        ));
-        crate::llm_clients::set_shared_web_client(std::sync::Arc::new(std::sync::Mutex::new(web)));
-        if emit_output {
-            eprintln!("[llm-bridge] 总结/判断子件优先路由网页端(零 token,失败回退 API)");
-        }
-    }
     //
     // 设计要点:
     // - 用主模型(flash)而非旗舰(pro):摘要输入是全量上下文的一次性 prompt,

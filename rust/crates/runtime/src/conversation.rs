@@ -872,7 +872,8 @@ fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
 ///
 /// 对每个 `ToolUse` block 执行:
 /// 1. **递归派发 guard**:`dispatch_subagent` / `spawn_parallel_subagents` → 立即 Err
-/// 2. **白名单 guard**:不在 `capability.allowed_tools()` → 立即 Err
+/// 2. **白名单 guard**:不在 `capability.allowed_tools()` 且不在 `extra_tools`
+///    (注册表感知附加工具,2026-10-04)→ 立即 Err
 /// 3. **工具执行**:调用 `tool_executor.execute(name, input)`,失败时返回
 ///    `is_error=true` 的 `ToolResult`(不中断循环,让 LLM 决定下一步)
 /// 4. **changed_files 提取**:`edit_file`/`write_file` 工具的 `file_path` 提取并规范化
@@ -882,6 +883,8 @@ fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
 /// - `tool_uses`:已过滤的 `ToolUse` block 列表(owned,不含 Text/Thinking)
 /// - `tool_executor`:工具执行器(路径 A 传 `&mut dyn ToolExecutor`,
 ///   路径 B 传 `&mut *Box<dyn ToolExecutor>`)
+/// - `extra_tools`:白名单外附加工具(插件/MCP 等),与 `capability.allowed_tools()`
+///   合并做白名单判断。缺省调用传 `&[]`。
 ///
 /// # 返回
 /// - `Ok(())`:所有工具调用已执行并回填
@@ -896,6 +899,7 @@ pub(crate) fn process_tool_uses(
     tools_used: &mut Vec<String>,
     changed_files: &mut Vec<String>,
     scope: Option<&crate::file_ops::WorkspacePathScope>,
+    extra_tools: &[String],
 ) -> Result<(), ToolError> {
     for tu in tool_uses {
         let (id, name, input) = match tu {
@@ -915,10 +919,13 @@ pub(crate) fn process_tool_uses(
                 "subagent recursion forbidden: {name}"
             )));
         }
-        // Guard 2:白名单(§3.1)
-        if !capability.allowed_tools().contains(&name.as_str()) {
+        // Guard 2:白名单(§3.1)— capability 内置表 ∪ extra_tools(注册表感知,2026-10-04)
+        let in_capability = capability.allowed_tools().contains(&name.as_str());
+        let in_extra = extra_tools.iter().any(|t| t == name);
+        if !in_capability && !in_extra {
             return Err(ToolError::new(format!(
-                "tool {name} not allowed for capability {capability:?}"
+                "tool {name} not allowed for capability {capability:?} (extra_tools: {})",
+                extra_tools.join(", ")
             )));
         }
 
@@ -1275,6 +1282,9 @@ pub trait ApiClient: Send {
     /// 子 agent client。与 [`with_model`](Self::with_model) 的差异:
     /// - 按 `capability.enables_tools()` 决定是否启用工具(Analyze 不启用)
     /// - 按 `capability.allowed_tools()` 设置工具白名单(ReadOnly/Execute 受限)
+    /// - `extra_tools`:白名单外附加工具(注册表感知,2026-10-04),与
+    ///   `allowed_tools()` 合并进 API 工具白名单,使子代理可**真正调用**
+    ///   插件/MCP 工具(browser_control 等),而非仅 guard 放行。
     ///
     /// 默认实现委托给 [`with_model`](Self::with_model),忽略 capability
     /// (向后兼容,不支持的实现保持原 `enable_tools=false` 行为)。
@@ -1283,6 +1293,7 @@ pub trait ApiClient: Send {
     /// # 参数
     /// - `model`:目标模型名
     /// - `capability`:子智能体能力分级,决定工具启用与白名单
+    /// - `extra_tools`:白名单外附加工具(与 capability 白名单合并)
     ///
     /// # 返回
     /// `Ok(boxed_client)` 若构造成功。
@@ -1290,6 +1301,7 @@ pub trait ApiClient: Send {
         &self,
         model: &str,
         _capability: crate::multi_agent::SubagentCapability,
+        _extra_tools: &[String],
     ) -> Result<Box<dyn ApiClient>, String> {
         self.with_model(model)
     }
@@ -1345,8 +1357,9 @@ impl ApiClient for Box<dyn ApiClient + 'static> {
         &self,
         model: &str,
         capability: crate::multi_agent::SubagentCapability,
+        extra_tools: &[String],
     ) -> Result<Box<dyn ApiClient>, String> {
-        (**self).with_model_and_capability(model, capability)
+        (**self).with_model_and_capability(model, capability, extra_tools)
     }
 
     // 配置/状态注入必须转发到内层:若缺失,调用会命中 trait 默认 no-op,
@@ -1937,6 +1950,7 @@ pub(crate) async fn execute_subagent_llm(
     task: &str,
     complexity: crate::multi_agent::TaskComplexity,
     capability: crate::multi_agent::SubagentCapability,
+    extra_tools: &[String],
     ctx: &SubagentContext,
 ) -> Result<String, String> {
     use crate::multi_agent::{write_handoff, HandoffStatus, SubagentHandoff};
@@ -2104,6 +2118,7 @@ pub(crate) async fn execute_subagent_llm(
             &mut tools_used,
             &mut changed_files,
             subagent_scope.as_ref(),
+            extra_tools,
         ) {
             // guard 违规(递归/白名单)→ 落盘 Failed handoff + Err
             let handoff = SubagentHandoff::new(
@@ -2210,13 +2225,121 @@ fn build_subagent_retry_context(
 ///
 /// 分支重试是"换一个完全不同的策略重试原任务"，不是重复失败的尝试。
 /// 纯函数（无状态），便于单元测试。
+///
+/// `attempt_summary`:主 agent 本次 turn 已尝试的工具调用摘要(见
+/// [`extract_turn_tool_summary`])。注入后子代理知道"已做过什么、得到什么、
+/// 哪里失败"，避免从零盲试重蹈覆辙(2026-10-04,限制 B 修复)。
 #[must_use]
-pub(crate) fn build_branch_retry_task(reason: &str, user_input: &str) -> String {
+pub(crate) fn build_branch_retry_task(
+    reason: &str,
+    user_input: &str,
+    attempt_summary: &str,
+) -> String {
     format!(
         "原任务：{user_input}\n\n\
          上一方案陷入 doom loop（{reason}）。请换一个完全不同的策略重新完成，\
-         不要重复任何失败的尝试。"
+         不要重复任何失败的尝试。\n\n\
+         主 agent 本次已尝试的工具调用（背景信息，不要照搬）：\n{attempt_summary}"
     )
+}
+
+/// 提取主 agent 最近一个 turn 的工具调用与结果摘要(branch-retry 上下文注入)。
+///
+/// 数据源是会话消息流(非猜测):定位最后一条用户消息之后的所有
+/// assistant `ToolUse` 与配对 `ToolResult`,按序压缩为多行文本。
+/// 信息量控制:工具名 + 输入截断 120 字符,结果只保留错误(200 字符)与
+/// 短结果(80 字符),总长截断 `max_chars`。abort 打断留下的未闭合
+/// tool_use 行(无配对结果)如实保留,反映"中断在哪一步"。
+#[must_use]
+fn extract_turn_tool_summary(messages: &[ConversationMessage], max_chars: usize) -> String {
+    let mut start_idx = 0;
+    for (i, m) in messages.iter().enumerate() {
+        if m.role == MessageRole::User {
+            start_idx = i + 1;
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for m in &messages[start_idx..] {
+        match m.role {
+            MessageRole::Assistant => {
+                for b in &m.blocks {
+                    if let ContentBlock::ToolUse { name, input, .. } = b {
+                        lines.push(format!("- {name}: {}", truncate_str(input, 120)));
+                    }
+                }
+            }
+            MessageRole::Tool => {
+                for b in &m.blocks {
+                    if let ContentBlock::ToolResult {
+                        is_error,
+                        output,
+                        ..
+                    } = b
+                    {
+                        if *is_error {
+                            lines.push(format!("  → 错误: {}", truncate_str(output, 200)));
+                        } else {
+                            lines.push(format!("  → {}", truncate_str(output, 80)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        return "(本 turn 尚无工具调用记录)".to_string();
+    }
+    let mut out = String::new();
+    for l in lines {
+        if out.len() + l.len() + 1 > max_chars {
+            break;
+        }
+        out.push_str(&l);
+        out.push('\n');
+    }
+    out
+}
+
+/// 收集主 agent 最近一个 turn 实际用过的工具名(branch-retry extra_tools 继承)。
+///
+/// 从最后一条用户消息之后的 assistant `ToolUse` 提取,去重、排除 Execute
+/// 内置白名单,仅返回"白名单外"的工具(插件/MCP 等,如 browser_control),
+/// 作为子代理 `extra_tools` 注入 —— 注册表感知修复(2026-10-04,限制 A)。
+/// 安全边界:只继承主 agent 本次 turn 已获授权执行过的工具,不放大权限。
+#[must_use]
+fn collect_turn_tools_used(messages: &[ConversationMessage]) -> Vec<String> {
+    let mut start_idx = 0;
+    for (i, m) in messages.iter().enumerate() {
+        if m.role == MessageRole::User {
+            start_idx = i + 1;
+        }
+    }
+    let builtin = crate::multi_agent::SubagentCapability::Execute.allowed_tools();
+    let mut seen: Vec<String> = Vec::new();
+    for m in &messages[start_idx..] {
+        if m.role != MessageRole::Assistant {
+            continue;
+        }
+        for b in &m.blocks {
+            if let ContentBlock::ToolUse { name, .. } = b {
+                if !builtin.contains(&name.as_str()) && !seen.contains(name) {
+                    seen.push(name.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// 按字符数截断字符串(避免 UTF-8 边界 panic),超长追加省略号。
+#[must_use]
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    format!("{head}…")
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -3268,6 +3391,30 @@ where
             LoopAction::Continue => {}
         }
         action
+    }
+
+    /// 弹出最后一条未闭合的 assistant 消息(含 tool_use 但无配对 tool_result)。
+    ///
+    /// LoopDetector Abort 在工具循环中被触发时,最后一条 assistant 消息已
+    /// push 进 session,但其 tool_use 没有对应 tool_result(`sanitize_tool_message_pairing`
+    /// 只清理"孤儿 tool 消息",不清理"孤儿 tool_use")。下一 turn 请求会把这个
+    /// 悬空 tool_use 原样发给 API —— 模型看到自己"发出了调用但从未收到结果",
+    /// 会误判动作未完成/页面状态未确认,重复执行已完成的流程(如重新登录)。
+    /// 返回前弹出该消息,保持消息流闭合(assistant tool_use 必须紧跟 tool_result)。
+    fn prune_unclosed_tool_use_messages(&mut self) {
+        // 只处理"最后一条消息是 assistant 且含 tool_use"的悬空形态;
+        // 其前方消息(正常闭合的 assistant/tool 对)不动。
+        let last_is_dangling = self
+            .session
+            .messages
+            .last()
+            .is_some_and(|m| {
+                m.role == MessageRole::Assistant
+                    && m.blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            });
+        if last_is_dangling {
+            self.session.messages.pop();
+        }
     }
 
     fn run_post_tool_use_hook(
@@ -5217,6 +5364,28 @@ where
                         // 带诊断的错误;已尝试记录在 NOTEBOOK <attempted> 段
                         // (Task 2 自动记账),供下一 turn 改变策略。
                         if let Some(reason) = self.loop_abort_reason.take() {
+                            // abort 打断的 tool_use 无配对 tool_result,sanitize
+                            // 只清理孤儿 tool 消息、不清理孤儿 tool_use,会把
+                            // "assistant 带 tool_calls 但无结果"原样发给 API,
+                            // 干扰模型对"当前在哪/做了什么"的状态认知。返回前
+                            // 弹出最后一条未闭合的 assistant 消息,保持消息流闭合。
+                            self.prune_unclosed_tool_use_messages();
+
+                            // doom loop 根因落盘 attempted 段(会话级,注入可见):
+                            // 上方 append_attempt 只记单次工具失败,abort 的整体
+                            // 根因("N 次相同调用"的循环形态)此前仅落 failure_traces,
+                            // 后续 turn / branch-retry 注入时看不到"为何失败"。
+                            // 此处补一条完整根因记录,使换策略重试有据可依。
+                            if let Some(workspace_root) = &self.workspace_root {
+                                let _ = crate::notebook::append_attempt(
+                                    workspace_root,
+                                    &self.session.session_id,
+                                    "doom_loop",
+                                    "loop abort reason",
+                                    &reason,
+                                );
+                            }
+
                             // 阶段 2b:分支重试成功 → 用成功结果替代 doom loop 失败。
                             // 把 subagent 结果作为 assistant 消息注入会话,跳出工具循环,
                             // 主循环据此正常收尾(返回成功 TurnSummary)。
@@ -6162,6 +6331,19 @@ where
             };
             // 注入 capability — TRAE 架构对齐(§3.1)
             let _ = coordinator.set_capability(&id, capability);
+            // 注入 extra_tools — 注册表感知(2026-10-04):白名单外附加工具,
+            // 如 branch-retry 继承主 agent 本次 turn 实际用过的插件/MCP 工具。
+            // 缺省为 None → 空集合,行为与旧版一致。
+            let extra_tools: Vec<String> = parsed
+                .get("extra_tools")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let _ = coordinator.set_extra_tools(&id, extra_tools);
             // 注入 workspace — Epic 2 A2.3a(目录层级控制派发,None = 主会话 cwd)
             let _ = coordinator.set_workspace(&id, workspace_override.clone());
             // 注入 cost_limit(如有)
@@ -6200,16 +6382,24 @@ where
 
         // 读取 max_attempts(用于 retry loop 上限)和 complexity(用于 §4.6 诊断 SOP 注入)
         // 和 capability(用于 Epic 1 上下文注入 + Epic 3 工具白名单)
-        // 注:complexity/capability 在 retry 过程中不变(只升级 model,不改变任务属性),故循环外读取一次即可
-        let (max_attempts, subagent_complexity, subagent_capability) = self
+        // 注:complexity/capability/extra_tools 在 retry 过程中不变(只升级 model,不改变任务属性),故循环外读取一次即可
+        let (max_attempts, subagent_complexity, subagent_capability, subagent_extra_tools) = self
             .multi_agent_coordinator
             .as_ref()
             .and_then(|c| c.get(&subagent_id))
-            .map(|a| (a.max_attempts, a.complexity, a.capability))
+            .map(|a| {
+                (
+                    a.max_attempts,
+                    a.complexity,
+                    a.capability,
+                    a.extra_tools.clone(),
+                )
+            })
             .unwrap_or((
                 1,
                 crate::multi_agent::TaskComplexity::Simple,
-                crate::multi_agent::SubagentCapability::Analyze,
+                crate::multi_agent::SubagentCapability::ReadOnly,
+                Vec::new(),
             ));
         let max_attempts = max_attempts.max(1);
         let mut current_model = model_str.map(String::from);
@@ -6273,6 +6463,7 @@ where
                     None,
                     subagent_complexity,
                     subagent_capability,
+                    subagent_extra_tools.clone(),
                 )
                 .await;
 
@@ -6552,14 +6743,28 @@ where
         }
         self.branch_retry_attempted = true;
 
-        let retry_task = build_branch_retry_task(reason, user_input);
+        // 2026-10-04 限制 B/C 修复:注入主 agent 本次 turn 已尝试的步骤摘要
+        // (子代理知道"已做过什么、哪里失败",避免从零盲试重蹈覆辙),并继承
+        // 主 agent 实际用过的白名单外工具(browser_control 等插件/MCP),
+        // 使子代理可继续浏览器/外部流程而非只能换路线。
+        let attempt_summary = extract_turn_tool_summary(&self.session.messages, 2000);
+        let retry_task = build_branch_retry_task(reason, user_input, &attempt_summary);
+        let inherited_tools = collect_turn_tools_used(&self.session.messages);
         // max_attempts=1:分支重试只试一次,不做模型升级重试(控制成本 + 避免递归 doom loop)。
+        // capability 显式指定 execute(2026-10-04 修复):缺省时 parse_capability
+        // 回退 ReadOnly,而原任务(尤其浏览器/进程/工作区诊断类)实际需要
+        // bash 等执行工具 —— 重试子代理白名单不含 bash 会注定失败
+        // (session-1791046299416 实测:branch-retry 撞 "tool bash not allowed
+        // for capability ReadOnly")。execute 提供 read+write+bash,覆盖
+        // "换完全不同的策略"所需的完整工具集。
         let input = serde_json::json!({
             "name": "branch-retry",
             "task": retry_task,
             "mode": "fork",
             "complexity": "simple",
             "max_attempts": 1,
+            "capability": "execute",
+            "extra_tools": inherited_tools,
         })
         .to_string();
 
@@ -6662,6 +6867,7 @@ where
             None,
             complexity,
             capability,
+            Vec::new(),
         )
         .await
     }
@@ -6692,6 +6898,7 @@ where
         max_iterations: Option<usize>,
         complexity: crate::multi_agent::TaskComplexity,
         capability: crate::multi_agent::SubagentCapability,
+        extra_tools: Vec<String>,
     ) -> Result<String, String> {
         let workspace_root = self.workspace_root.as_ref().ok_or_else(|| {
             "workspace_root not configured — subagent requires filesystem access for result persistence".to_string()
@@ -6727,7 +6934,7 @@ where
         // 复用已渲染内容(避免重复扫描),heading 已对齐 static_cache_breakpoints。
         // T4(方案 A 4-1):workspace_override 存在时,project_context.cwd 切到子目录,
         // 指令文件从子目录收集,使 LLM 路径视角与执行基准一致。
-        let ctx = self.build_subagent_context(capability, workspace_override.as_deref());
+        let ctx = self.build_subagent_context(capability, workspace_override.as_deref(), &extra_tools);
         // 双大脑批次1:显式传入的 max_iterations 覆盖能力默认上限(如 brain 综合
         // 放宽到 10 轮)。仅 Some(n) 时覆盖;None 保持 ctx 原值(可能已被任务注入)。
         let mut ctx = ctx;
@@ -6748,6 +6955,7 @@ where
                     task,
                     complexity,
                     capability,
+                    &extra_tools,
                     &ctx,
                 )
                 .await;
@@ -6757,7 +6965,10 @@ where
 
         // Epic 2:按 capability 构造独立 client — Multi-Agent Hardening §4.5.3
         // Analyze 不启用工具;ReadOnly/Execute 按白名单启用
-        match self.api_client.with_model_and_capability(model, capability) {
+        match self
+            .api_client
+            .with_model_and_capability(model, capability, &extra_tools)
+        {
             Ok(mut sub_client) => {
                 let outcome = execute_subagent_llm(
                     workspace_root,
@@ -6769,6 +6980,7 @@ where
                     task,
                     complexity,
                     capability,
+                    &extra_tools,
                     &ctx,
                 )
                 .await;
@@ -6802,6 +7014,7 @@ where
                     task,
                     complexity,
                     capability,
+                    &extra_tools,
                     &ctx,
                 )
                 .await
@@ -7138,6 +7351,7 @@ where
         &self,
         capability: crate::multi_agent::SubagentCapability,
         workspace_override: Option<&std::path::Path>,
+        extra_tools: &[String],
     ) -> SubagentContext {
         let mut ctx = SubagentContext::default();
         // 从主 agent system_prompt sections 提取 repo_map 和 environment
@@ -7196,11 +7410,13 @@ where
         // 名称与白名单短名一致(read/grep/glob/edit/write/bash),
         // 使 `## Available Tools` 层展示的可调用名与 capability guard 一致。
         // Analyze 白名单为空 → tool_summaries 为空(不注入工具层)。
+        // 2026-10-04:合并 `extra_tools`(注册表感知,插件/MCP 工具),
+        // 使子代理可调用且**可感知**附加工具(guard 与注入两侧对齐)。
         let allowed = capability.allowed_tools();
         ctx.tool_summaries = self
             .tool_catalog
             .iter()
-            .filter(|ts| allowed.contains(&ts.name.as_str()))
+            .filter(|ts| allowed.contains(&ts.name.as_str()) || extra_tools.iter().any(|t| t == &ts.name))
             .cloned()
             .collect();
         ctx
@@ -8423,6 +8639,7 @@ where
                 Some(10), // max_iterations:brain 综合放宽到 10 轮(ReadOnly 默认 5 会在文件侦察上耗尽)
                 crate::multi_agent::TaskComplexity::Simple,
                 crate::multi_agent::SubagentCapability::ReadOnly,
+                Vec::new(),
             )
             .await
         {
@@ -9447,7 +9664,8 @@ fn parse_complexity(value: Option<&serde_json::Value>) -> TaskComplexity {
 ///
 /// 接受字符串("analyze"/"read-only"/"execute",大小写不敏感,
 /// 与 `SubagentCapability` 的 `kebab-case` serde 表示一致)。
-/// 缺失或无法识别时返回 `Analyze`(向后兼容,与 Subagent 默认值一致)。
+/// 缺失或无法识别时返回 `ReadOnly`(2026-10-04 与 `Subagent` 反序列化缺省、
+/// `SpawnRequest::new` 缺省统一,此前注释声称 Analyze 但实现已回退 ReadOnly)。
 fn parse_capability(value: Option<&serde_json::Value>) -> crate::multi_agent::SubagentCapability {
     let s = value
         .and_then(|v| v.as_str())
@@ -10980,7 +11198,11 @@ mod tests {
 
     #[test]
     fn build_branch_retry_task_contains_task_and_retry_hint() {
-        let task = build_branch_retry_task("doom loop detected: a.rs edited 10 times", "修复 bug");
+        let task = build_branch_retry_task(
+            "doom loop detected: a.rs edited 10 times",
+            "修复 bug",
+            "- bash: echo 1\n  → 错误: boom",
+        );
         assert!(task.contains("修复 bug"), "应包含原任务: {task}");
         assert!(
             task.contains("doom loop"),
@@ -10989,6 +11211,14 @@ mod tests {
         assert!(
             task.contains("换一个完全不同的策略"),
             "应包含换方案提示: {task}"
+        );
+        assert!(
+            task.contains("已尝试的工具调用"),
+            "应包含已尝试步骤摘要: {task}"
+        );
+        assert!(
+            task.contains("bash: echo 1"),
+            "应注入主 agent 已尝试的工具调用: {task}"
         );
     }
 
@@ -15708,6 +15938,7 @@ mod tests {
             "task",
             crate::multi_agent::TaskComplexity::Simple,
             crate::multi_agent::SubagentCapability::ReadOnly,
+            &[],
             &SubagentContext::default(),
         )
         .await;
@@ -15836,6 +16067,7 @@ mod tests {
             "task",
             crate::multi_agent::TaskComplexity::Simple,
             crate::multi_agent::SubagentCapability::ReadOnly,
+            &[],
             &SubagentContext::default(),
         )
         .await;
@@ -17512,7 +17744,7 @@ mod tests {
         );
 
         // ReadOnly:仅只读子集(read_file/grep_search/glob_search + 网络调研只读工具),不含写入工具
-        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly, None);
+        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly, None, &[]);
         let ro_names: Vec<&str> = ro
             .tool_summaries
             .iter()
@@ -17531,7 +17763,7 @@ mod tests {
         );
 
         // Execute:全量可执行目录(read_file/grep_search/glob_search + 网络调研 + edit/write/bash)
-        let ex = runtime.build_subagent_context(SubagentCapability::Execute, None);
+        let ex = runtime.build_subagent_context(SubagentCapability::Execute, None, &[]);
         let ex_names: Vec<&str> = ex
             .tool_summaries
             .iter()
@@ -17559,7 +17791,7 @@ mod tests {
         );
 
         // Analyze:白名单为空 → 不注入工具层
-        let an = runtime.build_subagent_context(SubagentCapability::Analyze, None);
+        let an = runtime.build_subagent_context(SubagentCapability::Analyze, None, &[]);
         assert!(
             an.tool_summaries.is_empty(),
             "Analyze should expose no tools"
@@ -17588,7 +17820,7 @@ mod tests {
             },
         ]);
 
-        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly, None);
+        let ro = runtime.build_subagent_context(SubagentCapability::ReadOnly, None, &[]);
         let ro_names: Vec<&str> = ro
             .tool_summaries
             .iter()
@@ -17600,7 +17832,7 @@ mod tests {
             "override catalog filtered to ReadOnly"
         );
 
-        let ex = runtime.build_subagent_context(SubagentCapability::Execute, None);
+        let ex = runtime.build_subagent_context(SubagentCapability::Execute, None, &[]);
         let ex_names: Vec<&str> = ex
             .tool_summaries
             .iter()
@@ -17676,6 +17908,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             None,
+            &[],
         );
 
         assert!(result.is_ok(), "Execute + edit_file should succeed");
@@ -17711,6 +17944,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             None,
+            &[],
         );
         assert!(result.is_ok(), "tool failure should not fail the loop");
         assert!(
@@ -17753,6 +17987,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             None,
+            &[],
         );
 
         // Analyze 白名单不含 edit_file -> Guard 2 拒绝,返回 Err
@@ -17791,6 +18026,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             None,
+            &[],
         );
 
         assert!(
@@ -17821,6 +18057,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             None,
+            &[],
         );
 
         assert!(result.is_ok(), "Execute + write_file should succeed");
@@ -17862,6 +18099,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         assert!(
             result.is_ok(),
@@ -17892,6 +18130,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         assert!(result.is_ok());
         assert!(tools_used.is_empty(), "tool must not execute on ../ escape");
@@ -17926,6 +18165,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         assert!(
             result.is_ok(),
@@ -17959,6 +18199,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         assert!(result.is_ok(), "in-scope path must be allowed");
         assert_eq!(tools_used, vec!["read_file"]);
@@ -17991,6 +18232,7 @@ mod tests {
                 &mut tools_used,
                 &mut changed_files,
                 Some(&scope),
+                &[],
             );
             assert!(
                 result.is_err(),
@@ -18034,6 +18276,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         assert!(
             result.is_err(),
@@ -18083,6 +18326,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         assert!(result.is_ok(), "in-scope write should succeed");
         assert_eq!(tools_used, vec!["write_file"], "write_file must execute");
@@ -18128,6 +18372,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         // 越界是回填 is_error,不中止循环(result ok)
         assert!(
@@ -18174,7 +18419,7 @@ mod tests {
         runtime.set_workspace_root(tmp.path().to_path_buf());
 
         // 未绑定:保持主 root
-        let ctx = runtime.build_subagent_context(SubagentCapability::ReadOnly, None);
+        let ctx = runtime.build_subagent_context(SubagentCapability::ReadOnly, None, &[]);
         let pc = ctx.project_context.expect("project_context should be set");
         assert_eq!(
             pc.cwd,
@@ -18183,7 +18428,7 @@ mod tests {
         );
 
         // 绑定:切到子目录 + 子目录指令文件收集
-        let ctx2 = runtime.build_subagent_context(SubagentCapability::ReadOnly, Some(&sub));
+        let ctx2 = runtime.build_subagent_context(SubagentCapability::ReadOnly, Some(&sub), &[]);
         let pc2 = ctx2.project_context.expect("project_context should be set");
         assert_eq!(
             pc2.cwd, sub,
@@ -18237,6 +18482,7 @@ mod tests {
                 None,
                 crate::multi_agent::TaskComplexity::Simple,
                 crate::multi_agent::SubagentCapability::ReadOnly,
+                Vec::new(),
             )
             .await
             .expect_err("turn must fail when workspace vanished");
@@ -18288,6 +18534,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         assert!(result.is_ok(), "scope-relative write should be accepted");
         assert_eq!(tools_used, vec!["write_file"], "write_file must execute");
@@ -18340,6 +18587,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         // 越界是回填 is_error,不中止循环
         assert!(
@@ -18422,6 +18670,7 @@ mod tests {
                 &mut tools_used,
                 &mut changed_files,
                 None,
+                &[],
             );
             assert!(
                 process_result.is_ok(),
@@ -18491,6 +18740,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             Some(&scope),
+            &[],
         );
         assert!(
             result.is_ok(),
@@ -18579,6 +18829,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             None,
+            &[],
         );
 
         assert!(result.is_ok(), "bash should execute");
@@ -18650,6 +18901,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             None,
+            &[],
         );
 
         assert!(result.is_ok(), "read_file should execute");
@@ -18694,6 +18946,7 @@ mod tests {
             &mut tools_used,
             &mut changed_files,
             None,
+            &[],
         );
 
         assert!(result.is_ok());
@@ -19455,11 +19708,16 @@ mod tests {
             crate::multi_agent::CoordinationMode::Fork,
             "deepseek-v4-flash",
             crate::multi_agent::TaskComplexity::Simple,
-        )];
+        )
+        // 显式声明 Analyze:read_file 不在其白名单 → Guard 2 硬拒绝
+        // (缺省已统一为 ReadOnly,read_file 会通过白名单、仅被 Guard 3
+        // 以 tool_result 拒绝而非硬 Err,不满足本测试的硬拒绝断言)。
+        .with_capability(crate::multi_agent::SubagentCapability::Analyze)];
         let results = runtime.spawn_parallel_via_dag(tasks);
         assert_eq!(results.len(), 1);
-        // 路径 B 绑定 workspace 后治理生效:工具请求被 guard 拒绝(dispatcher 默认
-        // Analyze,read_file 先被 Guard 2 白名单拦;Guard 3/2.5 精确越界拒绝见
+        // 路径 B 绑定 workspace 后治理生效:工具请求被 guard 拒绝(dispatcher
+        // 默认 ReadOnly,read_file 在 ReadOnly 白名单内;此处显式 Analyze 使
+        // read_file 先被 Guard 2 白名单拦;Guard 3/2.5 精确越界拒绝见
         // subagent_dispatcher 单元测试,那里以 ReadOnly/Execute 触发)。
         let err = results[0]
             .as_ref()
