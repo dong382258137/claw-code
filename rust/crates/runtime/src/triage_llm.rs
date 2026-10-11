@@ -97,6 +97,83 @@ pub fn triage_llm_enabled() -> bool {
     !std::env::var(TRIAGE_MODE_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("off"))
 }
 
+/// 预筛最小字符数:达到即视为长输入(工程任务描述/粘贴报错/多行需求)。
+const PRESCREEN_MIN_CHARS: usize = 24;
+
+/// 预筛用的**明确工程动作词表**。
+///
+/// 刻意**不含**「执行 / 检查 / 分析」等歧义词 —— 它们同样出现在状态问答里
+/// (如 few-shot 的「上次任务执行到哪里了」→ trivial),纳入会削弱预筛精度。
+/// 保守起见只收「几乎只可能出现在动手/深读轮次」的词。
+const PRESCREEN_ENGINEERING_VERBS: &[&str] = &[
+    "修改",
+    "修复",
+    "实现",
+    "重构",
+    "新增",
+    "添加",
+    "删除",
+    "移除",
+    "优化",
+    "部署",
+    "编写",
+    "重写",
+    "迁移",
+    "接入",
+    "改成",
+    "改为",
+    "替换",
+    "跑一下",
+    "edit",
+    "fix",
+    "implement",
+    "refactor",
+    "debug",
+    "patch",
+    "migrate",
+    "rename",
+];
+
+/// 本地零成本预筛:在触发 LLM 分诊**之前**,用廉价规则识别「确定属 Standard」的
+/// 轮次并短路,从而省掉该 turn 的一次完整网络往返。
+///
+/// # 动机(2026-10-09)
+/// [`crate::conversation::ConversationRuntime::triage_turn_llm`] 是**每 turn 一次
+/// 完整 LLM 往返**,且位于 `turn_started` 与首次主请求之间 —— 直接落在首轮关键
+/// 路径上(实测本仓库单次 provider 往返 8–140s)。而档位裁剪的收益(Trivial 档
+/// 省下的长尾工具描述 + 关闭思考)只是一次往返墙钟成本的零头。工程轮次占多数,
+/// 本可本地判定,无需为此付费。
+///
+/// # 安全性质(为什么可以放心短路)
+/// 本函数**只输出「Standard / 不判定」,永不输出 Trivial**。因此它最多让一个本可
+/// 裁剪的 Trivial 轮次退回全量注入(损失一次 token 优化),绝不会把工程轮次误裁
+/// 成 Trivial —— 与分诊一贯的「保守优先:宁可不裁剪,也不误伤工程轮次」一致。
+/// 任何不确定的输入返回 `false`,交由既有 LLM 分诊按原语义判定。
+///
+/// # 判据(任一命中即 Standard)
+/// 1. 绝对长度 ≥ [`PRESCREEN_MIN_CHARS`];
+/// 2. 含路径分隔符(`/` 或 `\`)—— 涉及具体文件几乎必然要动手或深读;
+/// 3. 命中 [`PRESCREEN_ENGINEERING_VERBS`] 中的明确工程动作词。
+pub fn prescreen_standard(user_text: &str) -> bool {
+    let trimmed = user_text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // 信号 1:长输入。
+    if trimmed.chars().count() >= PRESCREEN_MIN_CHARS {
+        return true;
+    }
+    // 信号 2:路径/文件名引用。
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return true;
+    }
+    // 信号 3:明确工程动作动词(ASCII 大小写不敏感)。
+    let lowered = trimmed.to_lowercase();
+    PRESCREEN_ENGINEERING_VERBS
+        .iter()
+        .any(|kw| lowered.contains(kw))
+}
+
 /// 从 LLM 回复文本中容错提取分诊档位。
 ///
 /// 容错规则(全部大小写不敏感,在文本任意位置做子串匹配):
@@ -233,5 +310,52 @@ mod tests {
         with_triage_mode(Some("bogus"), || {
             assert!(triage_llm_enabled(), "非法值应回退默认 llm");
         });
+    }
+
+    // ── prescreen_standard:本地零成本预筛(2026-10-09)──
+
+    /// 长输入(≥ 阈值) → Standard,免一次 LLM 往返。
+    #[test]
+    fn prescreen_long_input_is_standard() {
+        let long = "帮我看看这段代码为什么会偶发失败并且给出根因".repeat(2);
+        assert!(prescreen_standard(&long), "长输入应预筛为 Standard");
+    }
+
+    /// 含路径分隔符 → Standard。
+    #[test]
+    fn prescreen_path_reference_is_standard() {
+        assert!(prescreen_standard("看下 src/main.rs"));
+        assert!(prescreen_standard("打开 D:\\proj\\a.py"));
+    }
+
+    /// 明确工程动作词 → Standard(中英文,ASCII 大小写不敏感)。
+    #[test]
+    fn prescreen_engineering_verb_is_standard() {
+        assert!(prescreen_standard("修复它"));
+        assert!(prescreen_standard("refactor this"));
+        assert!(prescreen_standard("FIX it"));
+    }
+
+    /// 关键安全性质:状态问答**不得**被预筛为 Standard。
+    #[test]
+    fn prescreen_status_questions_are_not_standard() {
+        assert!(!prescreen_standard("上次任务执行到哪里了"));
+        assert!(!prescreen_standard("当前工作目录是什么"));
+        assert!(!prescreen_standard("这个报错信息是什么意思"));
+    }
+
+    /// 空/空白输入 → 不判定(false),交由既有 LLM 分诊。
+    #[test]
+    fn prescreen_empty_is_not_determined() {
+        assert!(!prescreen_standard(""));
+        assert!(!prescreen_standard("   \n\t "));
+    }
+
+    /// 「执行/检查/分析」等歧义词**不得**单独触发预筛(否则会削弱精度)。
+    #[test]
+    fn prescreen_ambiguous_verbs_do_not_trigger() {
+        assert!(!prescreen_standard("执行"));
+        assert!(!prescreen_standard("检查"));
+        assert!(!prescreen_standard("分析"));
     }
 }
