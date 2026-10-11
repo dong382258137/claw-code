@@ -528,9 +528,11 @@ pub fn run_tui_repl_entry(
     // 热升级启动检测(双大脑收官基石):TUI 是默认启动路径,必须在此
     // (进入事件循环前)检测升级标记并恢复旧任务;REPL 路径已在
     // run_repl 内接线。失败静默降级为普通启动。
-    let _ = cli.maybe_resume_from_upgrade()?;
+    // 返回 Some(notice) 时把通知传入 run_tui_repl,由其在进入事件循环前
+    // 派发首轮 —— 这才是"自动续跑";仅 push 通知不触发那一轮是旧 bug。
+    let resume_notice = cli.maybe_resume_from_upgrade()?;
     diag_log("build_live_cli_for_repl OK, entering TUI");
-    tui::app::run_tui_repl(cli)
+    tui::app::run_tui_repl(cli, resume_notice)
 }
 
 /// Inject wizard-saved credentials as environment variables for the current

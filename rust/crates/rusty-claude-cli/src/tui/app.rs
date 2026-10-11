@@ -61,7 +61,10 @@ use crate::paste::{
 };
 
 /// Entry point: run the TUI REPL until user exits.
-pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_tui_repl(
+    cli: LiveCli,
+    resume_notice: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 静默 paste.rs 中的 [paste-dbg] eprintln 日志，避免污染 alternate screen。
     // 退出时恢复 false（用 drop guard 确保异常退出也恢复）。
     struct TuiSilentGuard;
@@ -259,7 +262,7 @@ pub(crate) fn run_tui_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run_event_loop(&mut terminal, cli, ask_rx);
+    let result = run_event_loop(&mut terminal, cli, ask_rx, resume_notice);
     // Drop guard 会恢复终端状态，这里直接返回结果。
     result
 }
@@ -623,10 +626,84 @@ struct TurnResult {
     result: Result<(), String>,
 }
 
+/// 在 worker 线程派发一轮对话(供"用户插话自动提交"与"热升级启动自动续跑"共用)。
+///
+/// 返回 `(turn_rx, abort_signal)`:调用方负责把 rx 存入 `turn_rx`、把
+/// abort_signal 存入 `current_abort_signal`、置 `turn_start`。
+/// 状态栏 reset / 工具历史清空等 turn 起始副作用一并在此处理。
+fn spawn_tui_turn(
+    mut cli: LiveCli,
+    pending: String,
+    output_view: &OutputView,
+    status_state: &Arc<Mutex<StatusBarState>>,
+    tool_history_shared: &Arc<Mutex<ToolHistory>>,
+    skill_history_shared: &Arc<Mutex<SkillHistory>>,
+) -> (mpsc::Receiver<TurnResult>, runtime::HookAbortSignal) {
+    crate::diag_log(&format!("[turn-start] auto turn len={}", pending.len()));
+    if let Ok(mut h) = tool_history_shared.lock() {
+        h.clear();
+    }
+    if let Ok(mut h) = skill_history_shared.lock() {
+        h.clear();
+    }
+    if let Ok(mut guard) = status_state.lock() {
+        guard.reset_turn();
+    }
+
+    let output_handle = output_view.shared_handle();
+    let status_handle = Arc::clone(status_state);
+    let tool_history_handle = Arc::clone(tool_history_shared);
+    let skill_history_handle = Arc::clone(skill_history_shared);
+
+    let (tx, rx) = mpsc::channel();
+    let abort_signal = runtime::HookAbortSignal::new();
+    cli.set_external_abort_signal(abort_signal.clone());
+    let status_handle_for_panic = Arc::clone(&status_handle);
+
+    std::thread::spawn(move || {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let mut cli = cli;
+        let cli_ref = &mut cli;
+        let result = catch_unwind(AssertUnwindSafe(move || {
+            execute_turn(
+                cli_ref,
+                &pending,
+                &output_handle,
+                &status_handle,
+                &tool_history_handle,
+                &skill_history_handle,
+            )
+        }));
+        let turn_result = match result {
+            Ok(r) => TurnResult { cli, result: r },
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "<unknown panic>".to_string());
+                if let Ok(mut guard) = status_handle_for_panic.lock() {
+                    if guard.streaming {
+                        guard.finish_turn();
+                    }
+                }
+                TurnResult {
+                    cli,
+                    result: Err(format!("worker thread panicked: {msg}")),
+                }
+            }
+        };
+        let _ = tx.send(turn_result);
+    });
+
+    (rx, abort_signal)
+}
+
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: LiveCli,
     ask_rx: mpsc::Receiver<AskRequest>,
+    resume_notice: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = InputLine::new();
     let mut menu = SlashMenu::new();
@@ -830,6 +907,35 @@ fn run_event_loop(
     // 秒级重绘跟踪:录音计时秒数变化时强制重绘(与 turn_elapsed 同一机制)。
     let mut last_drawn_voice_s: u64 = u64::MAX;
 
+    // ── 热升级启动自动续跑 ──
+    // 新进程经热升级启动且成功 resume 时,resume_notice 为 Some("继续任务"提示)。
+    // 在进入事件循环前就把它派发为一轮 turn —— 这才是"无缝续跑"的兑现。
+    // 旧实现把通知 push 成 user 消息就返回,TUI 落入事件循环等待按键,通知
+    // 无人消费,"自动续跑"从未发生。此处直接 spawn(与用户插话自动提交同构)。
+    if let Some(notice) = resume_notice {
+        if let Some(cli) = cli_holder.take() {
+            // 回显提示到 OutputView,保持对话连贯性(与插话自动提交一致)。
+            if let Ok(mut buf) = output_view.shared_handle().lock() {
+                buf.push_entry(crate::tui::output_view::OutputEntry::text(format!(
+                    "> {notice}\n\n"
+                )));
+            }
+            let (rx, abort_signal) = spawn_tui_turn(
+                cli,
+                notice,
+                &output_view,
+                &status_state,
+                &tool_history_shared,
+                &skill_history_shared,
+            );
+            cli_holder = None;
+            turn_start = Some(Instant::now());
+            current_abort_signal = Some(abort_signal);
+            turn_rx = Some(rx);
+            needs_redraw = true;
+        }
+    }
+
     'main_loop: loop {
         // 处理 AskUserQuestion 请求：worker 线程通过 ask handler 投递的待回答问题。
         //
@@ -984,77 +1090,17 @@ fn run_event_loop(
                             }
                         }
 
-                        if let Some(mut cli) = cli_holder.take() {
-                            crate::diag_log(&format!(
-                                "[turn-start] auto_submit pending_input len={}",
-                                pending.len()
-                            ));
-                            // 清空上一轮的工具历史和技能历史，避免污染。
-                            if let Ok(mut h) = tool_history_shared.lock() {
-                                h.clear();
-                            }
-                            if let Ok(mut h) = skill_history_shared.lock() {
-                                h.clear();
-                            }
-
-                            // 设置状态栏为 streaming（turn 开始）。
-                            if let Ok(mut guard) = status_state.lock() {
-                                guard.reset_turn();
-                            }
-
-                            let output_handle = output_view.shared_handle();
-                            let status_handle = Arc::clone(&status_state);
-                            let tool_history_handle = Arc::clone(&tool_history_shared);
-                            let skill_history_handle = Arc::clone(&skill_history_shared);
-
+                        if let Some(cli) = cli_holder.take() {
+                            let (rx, abort_signal) = spawn_tui_turn(
+                                cli,
+                                pending,
+                                &output_view,
+                                &status_state,
+                                &tool_history_shared,
+                                &skill_history_shared,
+                            );
                             turn_start = Some(Instant::now());
-
-                            let (tx, rx) = mpsc::channel();
-                            let abort_signal = runtime::HookAbortSignal::new();
-                            cli.set_external_abort_signal(abort_signal.clone());
                             current_abort_signal = Some(abort_signal);
-                            let status_handle_for_panic = Arc::clone(&status_handle);
-
-                            std::thread::spawn(move || {
-                                use std::panic::{catch_unwind, AssertUnwindSafe};
-                                let mut cli = cli;
-                                let cli_ref = &mut cli;
-                                let result = catch_unwind(AssertUnwindSafe(move || {
-                                    execute_turn(
-                                        cli_ref,
-                                        &pending,
-                                        &output_handle,
-                                        &status_handle,
-                                        &tool_history_handle,
-                                        &skill_history_handle,
-                                    )
-                                }));
-                                let turn_result = match result {
-                                    Ok(r) => TurnResult { cli, result: r },
-                                    Err(payload) => {
-                                        let msg = payload
-                                            .downcast_ref::<String>()
-                                            .cloned()
-                                            .or_else(|| {
-                                                payload
-                                                    .downcast_ref::<&str>()
-                                                    .map(|s| s.to_string())
-                                            })
-                                            .unwrap_or_else(|| "<unknown panic>".to_string());
-                                        if let Ok(mut guard) = status_handle_for_panic.lock() {
-                                            if guard.streaming {
-                                                guard.finish_turn();
-                                            }
-                                        }
-                                        TurnResult {
-                                            cli,
-                                            result: Err(format!("worker thread panicked: {msg}")),
-                                        }
-                                    }
-                                };
-                                let _ = tx.send(turn_result);
-                            });
-
                             turn_rx = Some(rx);
                         }
                     }

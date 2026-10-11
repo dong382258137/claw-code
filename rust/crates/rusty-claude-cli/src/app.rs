@@ -496,9 +496,12 @@ pub(crate) fn run_repl(
         cli.runtime.set_plan_mode_enabled(true);
     }
     // 热升级启动检测(双大脑收官基石):新进程启动时若存在升级标记,
-    // 自动 resume 旧会话 + 恢复活跃计划 + 注入继续通知 + 清理标记,
-    // 使旧进程的未完成任务在新进程无缝续跑。失败静默降级为普通启动。
-    let _ = cli.maybe_resume_from_upgrade()?;
+    // 自动 resume 旧会话 + 恢复活跃计划 + 清理标记。
+    // 返回 Some(notice) 时,**主动开跑一轮**把 notice 作为首轮输入交给
+    // run_turn —— 这才是"无缝续跑"的兑现;旧实现只 push 通知就返回,
+    // 通知排进 session 却无人消费,进程落入下面的 read_line() 阻塞。
+    // 失败静默降级为普通启动。
+    let resume_notice = cli.maybe_resume_from_upgrade()?;
     // P1-1:PolicyEngine 策略引擎 flag。
     // 当前 lane_completion 模块已实现 PolicyEngine 调用(tools/lane_completion.rs),
     // 但生产路径未接入。flag 用于控制后续 lane 完成时是否调用策略评估。
@@ -518,6 +521,16 @@ pub(crate) fn run_repl(
         "[timing] LiveCli::new={:?} editor={:?} banner={:?} total={:?}",
         t_cli, t_editor, t_banner, t_total
     );
+
+    // 热升级自动续跑(兑现承诺):resume 成功时立即把 notice 作为首轮输入
+    // 交给 run_turn,主动开跑那一轮。run_turn 内部会 push_user_text(notice),
+    // 故此处仅传文本、不预先注入 session,避免双重 push。
+    if let Some(notice) = resume_notice {
+        print_user_card(&notice);
+        if let Err(e) = cli.run_turn(&notice) {
+            eprintln!("[upgrade] 自动续跑失败(降级为等待用户输入): {e}");
+        }
+    }
 
     loop {
         // 会话互通(Session Bus):drain 主会话未读 bus 消息(子代理 Handoff /
@@ -2841,10 +2854,15 @@ impl LiveCli {
     ///
     /// 陈旧标记(> [`UPGRADE_REQUEST_STALE_MS`])视为崩溃残留,忽略并清理,
     /// 降级为普通启动。返回是否成功恢复(供调用方打日志)。
-    pub(crate) fn maybe_resume_from_upgrade(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+    /// 返回 `Some(notice)`:成功 resume,`notice` 是"继续任务"提示文本,**尚未**
+    /// 注入 session —— 由调用方作为首轮输入交给 `run_turn`(它内部会 push)。
+    /// 这样新进程才会**真正开跑新一轮**,而不是把通知排进队列却无人消费。
+    pub(crate) fn maybe_resume_from_upgrade(
+        &mut self,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let cwd = std::env::current_dir()?;
         let Some(req) = read_upgrade_request(&cwd) else {
-            return Ok(false); // 无升级标记,普通启动
+            return Ok(None); // 无升级标记,普通启动
         };
         // 陈旧标记(崩溃残留)→ 忽略并清理,降级为普通启动。
         let now_ms = std::time::SystemTime::now()
@@ -2859,7 +2877,7 @@ impl LiveCli {
                 crate::session_mgr::UPGRADE_REQUEST_STALE_MS
             );
             clear_upgrade_request(&cwd);
-            return Ok(false);
+            return Ok(None);
         }
 
         // 1. 恢复旧会话(复用 load_session_reference:session_id 是合法 reference)。
@@ -2920,7 +2938,12 @@ impl LiveCli {
             }
         }
 
-        // 3. 注入"继续任务通知"给 LLM(下一 turn 请求构造时可见)。
+        // 3. 构造"继续任务通知"。**不在此处注入 session** —— 若在此 push 成一条
+        //    user 消息就返回,新进程会落入 REPL 的 read_line / TUI 事件循环
+        //    阻塞等待用户输入,该通知永远无人消费,"自动续跑"从未发生。
+        //    改为把它**返回**给调用方,由启动路径作为首轮输入交给 run_turn
+        //    (run_turn 内部 conversation.rs:3837 会自行 push_user_text,
+        //    故此处绝不能再 push,否则双重注入)。
         let notice = match (&restored_plan_id, &req.from_version) {
             (Some(plan_id), _) => format!(
                 "[runtime] 热升级完成：新版本已接管此会话 ({from} → {current})，会话与计划已恢复 \
@@ -2935,10 +2958,6 @@ impl LiveCli {
                 current = crate::version_label()
             ),
         };
-        self.runtime
-            .session_mut()
-            .push_user_text(notice)
-            .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
         // 3b. 热升级是"同会话进程切换"而非"新会话开始":旧进程(含历史版本)
         // 可能已在收尾时标记了 NOTEBOOK <plan> stale(见 run_turn 收尾段的
@@ -2954,7 +2973,7 @@ impl LiveCli {
         clear_upgrade_request(&cwd);
 
         let report = format!(
-            "[upgrade] 热升级恢复完成：session={} plan={} (from {})。任务将在下一轮无缝续跑。",
+            "[upgrade] 热升级恢复完成：session={} plan={} (from {})。",
             req.session_id,
             restored_plan_id.as_deref().unwrap_or("(none)"),
             req.from_version,
@@ -2962,7 +2981,7 @@ impl LiveCli {
         if !self.tui_println(&report) {
             println!("{report}");
         }
-        Ok(true)
+        Ok(Some(notice))
     }
 
     fn run_teleport(target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
