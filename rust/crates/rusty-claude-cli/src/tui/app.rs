@@ -97,14 +97,23 @@ pub(crate) fn run_tui_repl(
     tools::set_ask_user_question_handler(Some(Arc::new(
         move |req: tools::AskUserQuestionRequest| {
             let (resp_tx, resp_rx) = mpsc::channel::<String>();
+            let timeout = req.timeout;
             ask_tx_for_handler
                 .send(AskRequest {
                     question: req.question,
                     options: req.options,
                     resp_tx,
+                    timeout,
                 })
                 .map_err(|_| "TUI 主循环已退出，AskUserQuestion 无法投递".to_string())?;
-            resp_rx.recv().map_err(|_| "TUI 响应通道关闭".to_string())
+            // 提问计时器:超时以哨兵 Err 上报(而非永久阻塞 worker 线程)。
+            match timeout {
+                Some(d) => match resp_rx.recv_timeout(d) {
+                    Ok(ans) => Ok(ans),
+                    Err(_) => Err(tools::ASK_TIMEOUT_SENTINEL.to_string()),
+                },
+                None => resp_rx.recv().map_err(|_| "TUI 响应通道关闭".to_string()),
+            }
         },
     )));
 
@@ -275,6 +284,9 @@ struct AskRequest {
     question: String,
     options: Option<Vec<String>>,
     resp_tx: mpsc::Sender<String>,
+    /// 提问计时器:超时后 handler 以 [`tools::ASK_TIMEOUT_SENTINEL`] 返回,
+    /// 主循环亦据此清除 stale `pending_ask`(避免吞掉用户下一次输入)。
+    timeout: Option<std::time::Duration>,
 }
 
 /// 会话互通(Session Bus)：drain 主会话未读 bus 消息 → OutputView PeerMessage 条目。
@@ -830,6 +842,8 @@ fn run_event_loop(
     // 主循环每次 iteration 从 ask_rx try_recv 新请求，收到时把问题显示到
     // OutputView 并设 pending_ask = Some(...)。
     let mut pending_ask: Option<AskRequest> = None;
+    // 提问计时器:到点后清除 stale pending_ask,避免吞掉用户下一次输入。
+    let mut pending_ask_deadline: Option<Instant> = None;
 
     // 鼠标点击支持：把 draw 闭包内的 main_area 和 scroll_y 缓存到 loop 外，
     // 这样 Event::Mouse 分支可以访问它们，把点击坐标映射到逻辑行号。
@@ -942,6 +956,21 @@ fn run_event_loop(
         // 只在 pending_ask 为空（没有正在等待回答的问题）时 try_recv 新请求。
         // 一次 turn 内最多有一个 pending ask（worker 线程同步阻塞等答案，
         // 不会并发投递多个问题）。
+        // 提问计时器:到点后清除 stale pending_ask,避免其吞掉用户下一次输入。
+        // (worker 侧 handler 亦以 recv_timeout 自行超时;此处清理保证主循环状态同步。)
+        if let Some(dl) = pending_ask_deadline {
+            if Instant::now() >= dl {
+                if let Some(stale) = pending_ask.take() {
+                    drop(stale.resp_tx); // 关闭通道 → worker recv 立即返回,不再等待
+                    if let Ok(mut buf) = output_view.shared_handle().lock() {
+                        buf.append("\n[提问已超时] 已按第一性原理自主决策继续。\n\n");
+                    }
+                }
+                pending_ask_deadline = None;
+                needs_redraw = true;
+            }
+        }
+
         if pending_ask.is_none() {
             if let Ok(req) = ask_rx.try_recv() {
                 // 把问题渲染到 OutputView，让用户能看到 AI 在问什么。
@@ -959,9 +988,16 @@ fn run_event_loop(
                 } else {
                     prompt.push_str("请输入回答后回车：\n");
                 }
+                if let Some(d) = req.timeout {
+                    prompt.push_str(&format!(
+                        "(将在 {}s 后超时,届时自动按第一性原理决策)\n",
+                        d.as_secs()
+                    ));
+                }
                 if let Ok(mut buf) = output_view.shared_handle().lock() {
                     buf.append(&prompt);
                 }
+                pending_ask_deadline = req.timeout.map(|d| Instant::now() + d);
                 pending_ask = Some(req);
             }
         }

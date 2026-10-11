@@ -1516,7 +1516,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "AskUserQuestion",
-            description: "Ask the user a question and wait for their response. Use when you need clarification, want to validate assumptions, or must choose a direction the user should decide. When the user explicitly invites discussion (\"discuss\", \"decide together\", \"你觉得呢\") and the request has not converged, use this tool to structure the discussion into clear options. The user can always pick \"Other\" — options are suggestions, not a closed set. Put your recommended option first with \"(Recommended)\".",
+            description: "Ask the user a question and wait for their response. Use when you need clarification, want to validate assumptions, or must choose a direction the user should decide. When the user explicitly invites discussion (\"discuss\", \"decide together\", \"你觉得呢\") and the request has not converged, use this tool to structure the discussion into clear options. The user can always pick \"Other\" — options are suggestions, not a closed set. Put your recommended option first with \"(Recommended)\". NOTE: this tool is time-boxed (default 300s, override `timeout_secs`; 0 = wait forever). If the user does not answer in time it returns status:\"timeout\" — you must then decide autonomously from first principles and continue; never repeat the same question.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1524,7 +1524,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "options": {
                         "type": "array",
                         "items": { "type": "string" }
-                    }
+                    },
+                    "timeout_secs": { "type": "integer", "description": "提问计时器(秒);默认 300,0=无限等待" }
                 },
                 "required": ["question"],
                 "additionalProperties": false
@@ -2274,6 +2275,14 @@ fn maybe_enforce_permission_check_with_mode(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    // 提问计时器(第一性):turn 一旦停在工具调用即挂起,agent 无法自行为提问设闹钟。
+    // 故超时必须落在**工具层** —— 超时后返回结构化哨兵 `status:"timeout"`,
+    // 模型在**同一 turn 内**据哨兵按第一性原理自行决策并继续,而非无限阻塞。
+    // 默认 300s;`CLAW_ASK_TIMEOUT_SECS` 可覆盖;工具入参 `timeout_secs` 优先;
+    // 显式 `timeout_secs: 0` = 无限等待(旧行为)。
+    let timeout_secs = input.timeout_secs.unwrap_or_else(default_ask_timeout_secs);
+    let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+
     // TUI 模式优先：若注册了 handler，则把请求转交给 handler。
     // 这是为了修复 TUI 模式下 worker 线程直接用 io::stdout/stdin 导致：
     //   1. writeln 到 stdout 破坏 alternate screen 但用户看不到
@@ -2284,20 +2293,26 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
         let request = AskUserQuestionRequest {
             question: input.question.clone(),
             options: input.options.clone(),
+            timeout,
         };
-        let answer = handler(request)?;
-        return to_pretty_json(json!({
-            "question": input.question,
-            "answer": answer,
-            "status": "answered"
-        }));
+        return match handler(request) {
+            Ok(answer) => to_pretty_json(json!({
+                "question": input.question,
+                "answer": answer,
+                "status": "answered"
+            })),
+            // handler 超时以哨兵 Err 上报 → 产出 timeout 哨兵(而非普通取消错误)。
+            Err(e) if e == ASK_TIMEOUT_SENTINEL => {
+                Ok(ask_timeout_json(&input.question, timeout_secs))
+            }
+            Err(e) => Err(e),
+        };
     }
 
     use std::io::{self, BufRead, Write};
 
     // Display the question to the user via stdout
     let stdout = io::stdout();
-    let stdin = io::stdin();
     let mut out = stdout.lock();
 
     writeln!(out, "\n[Question] {}", input.question).map_err(|e| e.to_string())?;
@@ -2312,12 +2327,26 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
     }
     out.flush().map_err(|e| e.to_string())?;
 
-    // Read user response from stdin
-    let mut response = String::new();
-    stdin
-        .lock()
-        .read_line(&mut response)
-        .map_err(|e| e.to_string())?;
+    // 原生路径:reader 线程 + recv_timeout,避免 read_line 无限阻塞。
+    // (超时后 reader 线程仍挂在 stdin 上,会吞掉下一行——CLI 非 TUI 场景可接受;
+    //  TUI 场景走上面的 handler 路径,不受影响。)
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut response = String::new();
+        if io::stdin().lock().read_line(&mut response).is_ok() {
+            let _ = tx.send(response);
+        }
+    });
+    let response = match timeout {
+        Some(d) => match rx.recv_timeout(d) {
+            Ok(r) => r,
+            Err(_) => return Ok(ask_timeout_json(&input.question, timeout_secs)),
+        },
+        None => match rx.recv() {
+            Ok(r) => r,
+            Err(_) => return Err("stdin closed before answer".to_string()),
+        },
+    };
     let response = response.trim().to_string();
 
     // If options were provided, resolve the numeric choice
@@ -2342,6 +2371,36 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
     }))
 }
 
+/// AskUserQuestion 超时哨兵:handler 超时后以该串作为 `Err` 返回,
+/// `run_ask_user_question` 据此产出 `status:"timeout"`(而非普通取消错误)。
+pub const ASK_TIMEOUT_SENTINEL: &str = "__claw_ask_timeout__";
+
+/// 默认提问超时(秒)。`CLAW_ASK_TIMEOUT_SECS` 可覆盖;工具入参 `timeout_secs` 优先。
+fn default_ask_timeout_secs() -> u64 {
+    std::env::var("CLAW_ASK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+/// 构造提问超时的结构化哨兵:指示模型依据第一性原理自行决策并继续,勿重复提问。
+fn ask_timeout_json(question: &str, timeout_secs: u64) -> String {
+    to_pretty_json(json!({
+        "question": question,
+        "status": "timeout",
+        "timeout_secs": timeout_secs,
+        "instruction": "用户未在时限内回答。请依据第一性原理、现有证据与任务目标自行做出最优决策,\
+                        并在回复中明确标注『因提问超时,已自主决策:<决策 + 依据>』。\
+                        不要再次发起同一问题;若确需澄清,改以默认假设推进。"
+    }))
+    .unwrap_or_else(|_| {
+        format!(
+            "{{\"question\":{:?},\"status\":\"timeout\",\"timeout_secs\":{}}}",
+            question, timeout_secs
+        )
+    })
+}
+
 /// TUI 模式下 [`run_ask_user_question`] 的请求载荷。
 ///
 /// 字段与 [`AskUserQuestionInput`] 对应，但全部 `pub` 以便 TUI 主循环读取。
@@ -2351,6 +2410,9 @@ pub struct AskUserQuestionRequest {
     pub question: String,
     /// 可选项列表。`None` 表示自由文本回答，`Some(vec)` 表示编号选项。
     pub options: Option<Vec<String>>,
+    /// 提问计时器。`None` = 无限等待(旧行为)。
+    /// Handler 超时时须返回 [`ASK_TIMEOUT_SENTINEL`] 作为 `Err`。
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// TUI 主循环注入的 ask handler 签名。
@@ -4663,6 +4725,9 @@ struct AskUserQuestionInput {
     question: String,
     #[serde(default)]
     options: Option<Vec<String>>,
+    /// 提问计时器(秒)。`None` → 默认 300s;`Some(0)` → 无限等待(旧行为)。
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -9858,9 +9923,9 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 pub mod browser_control;
-pub mod windows_control;
 pub mod lane_completion;
 pub mod pdf_extract;
+pub mod windows_control;
 
 #[cfg(test)]
 mod tests {
@@ -14498,6 +14563,28 @@ printf 'pwsh:%s' "$1"
         assert_eq!(parsed["status"], "answered");
     }
 
+    /// 回归测试：handler 返回超时哨兵时，工具产出 `status:"timeout"` 结构化哨兵
+    /// （而非普通 Err），指示模型依第一性原理自主决策继续。
+    #[test]
+    fn ask_user_question_timeout_returns_structured_sentinel() {
+        use std::sync::Arc;
+        let _guard = env_guard();
+        let handler: super::AskUserQuestionHandler =
+            Arc::new(|_req| Err(super::ASK_TIMEOUT_SENTINEL.to_string()));
+        super::set_ask_user_question_handler(Some(handler));
+
+        let input = json!({ "question": "Pick a color", "options": ["red", "green"] });
+        let result = execute_tool("AskUserQuestion", &input);
+        super::set_ask_user_question_handler(None);
+
+        let result = result.expect("timeout should be a structured Ok, not Err");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["status"], "timeout");
+        assert!(parsed["instruction"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+    }
+
     /// 回归测试：未注册 handler 时，`AskUserQuestion` 走原生 stdin/stdout 路径
     /// （在测试环境会 read_line 失败或返回空，但不应 panic）。
     /// 这里仅验证 handler=None 时 `set_ask_user_question_handler` 正确清理。
@@ -14527,7 +14614,10 @@ printf 'pwsh:%s' "$1"
             "应回执 requested=true, got {out}"
         );
 
-        assert!(super::take_hot_upgrade_request(), "置位后首次 take 应为 true");
+        assert!(
+            super::take_hot_upgrade_request(),
+            "置位后首次 take 应为 true"
+        );
         assert!(
             !super::take_hot_upgrade_request(),
             "take 后应清零(只升级一次,避免重启后重复触发)"
