@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import groundtruth_tasks as gt  # noqa: E402
+import validate_two_sided as vts  # noqa: E402
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -109,7 +110,14 @@ def eval_one(
     try:
         solve = run_claw(claw_bin, str(wt), task["prompt"], args.task_timeout, args.claw_arg)
         result["solve"] = {k: solve[k] for k in ("exit", "timeout", "seconds")}
-        code, out = gt.run_acceptance(task, str(wt), repo, timeout_s=args.accept_timeout)
+        # 判分口径与任务校验**必须一致**:任务集是拿 `--own-tests`(只跑任务自身回归
+        # 测试函数)校验的;若这里用整 crate `cargo test -p <crate>`,无关 flaky 测试
+        # (需 Chromium/网络/计时/环境锁)会污染判分 → 假阴性(实测 runtime-607e2c11 /
+        # runtime-6f4c0e4b 因此被误判 compile_error,实则自身测试无关失败)。
+        t2 = dict(task)
+        t2["acceptance"] = dict(task["acceptance"])
+        t2["acceptance"]["command"] = vts._acceptance_cmd(task, args.own_tests)
+        code, out = gt.run_acceptance(t2, str(wt), repo, timeout_s=args.accept_timeout)
         expect = task["acceptance"]["expect_exit"]
         result["accept_exit"] = code
         result["resolved"] = code == expect
@@ -151,6 +159,19 @@ def main() -> int:
     ap.add_argument("--claw-arg", action="append", default=None,
                     help="透传给 claw 的 flag(置于 -p 之前);可重复")
     ap.add_argument("--keep", action="store_true", help="保留 worktree 供排查")
+    ap.add_argument(
+        "--own-tests",
+        dest="own_tests",
+        action="store_true",
+        default=True,
+        help="只用任务自身回归测试函数判分(默认开;与任务集校验口径一致)",
+    )
+    ap.add_argument(
+        "--no-own-tests",
+        dest="own_tests",
+        action="store_false",
+        help="改用整 crate 判分(会引入无关 flaky → 假阴性,不推荐)",
+    )
     args = ap.parse_args()
 
     if args.claw_arg is None:
