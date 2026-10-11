@@ -103,9 +103,28 @@ pub struct BashCommandOutput {
     pub shell_type: Option<String>,
 }
 
+/// 解析执行 bash 的工作目录。进程继承的 CWD 可能已失效(目录被删除,实测 Windows
+/// os error 267「目录名称无效」会让整个 bash 工具**完全不可用**),此时回退到用户
+/// 家目录,再退到临时目录,保证 bash 仍可执行(命令自身 cwd 语义退化为家目录)。
+fn resolve_exec_cwd() -> PathBuf {
+    resolve_exec_cwd_from(env::current_dir().ok())
+}
+
+/// 纯函数内核(可测):给定「当前目录探测结果」返回可用的执行目录。
+fn resolve_exec_cwd_from(current: Option<PathBuf>) -> PathBuf {
+    match current {
+        Some(dir) => dir,
+        None => env::var_os("USERPROFILE")
+            .or_else(|| env::var_os("HOME"))
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(env::temp_dir),
+    }
+}
+
 /// Executes a shell command with the requested sandbox settings.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = env::current_dir()?;
+    let cwd = resolve_exec_cwd();
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     // 每次执行前清除中止标志,避免上一轮的 abort 残留影响本次。
@@ -256,13 +275,20 @@ fn get_git_actor() -> Option<String> {
 /// 不再需要模式检测、排空宽限、为释放管道而杀进程树。
 fn capture_output_files() -> io::Result<(PathBuf, PathBuf, std::fs::File, std::fs::File)> {
     let dir = std::env::temp_dir();
+    // 唯一性:pid + 时钟纳秒 + **进程内原子计数**。
+    // 仅用 pid+时钟不够 —— Windows 时钟分辨率粗(~ms 级),同一进程内并发调用
+    // (并行子智能体各跑 bash)可能取到相同纳秒 → 复用同一捕获文件 → 输出互相污染
+    // (实测偶发 `hello` 与另一命令的 `tick` 串台)。原子计数保证进程内严格唯一。
+    static CAPTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = CAPTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uniq = format!(
-        "claw-cmd-{}-{}",
+        "claw-cmd-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        seq
     );
     let out_path = dir.join(format!("{uniq}-out.log"));
     let err_path = dir.join(format!("{uniq}-err.log"));
@@ -1180,7 +1206,7 @@ pub(crate) static BASH_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, has_shell_syntax_error, BashCommandInput};
+    use super::{execute_bash, has_shell_syntax_error, resolve_exec_cwd_from, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
 
     /// 第一性原理回归(2026-09-01):输出捕获改为临时文件后,后台启动命令
@@ -1305,7 +1331,7 @@ mod tests {
         let start = Instant::now();
         let result = rt.block_on(async {
             execute_bash(BashCommandInput {
-                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Users\\38225\\AppData\\Local\\Programs\\Python\\Python311\\python.exe' -ArgumentList '-c','import time; time.sleep(5)' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_smart.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_smart_err.log'\" && echo \"Start-Process done\"; sleep 5; true".to_string(),
+                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'powershell' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden\" && echo \"Start-Process done\"; sleep 5; true".to_string(),
                 timeout: None,
                 description: None,
                 run_in_background: Some(false),
@@ -1327,7 +1353,7 @@ mod tests {
             "bash foreground should complete, stdout: {}",
             output.stdout
         );
-        // 后台 python sleep(5) 会在 5s 后自动退出,无需按镜像名清理(避免误杀并行测试的进程)。
+        // 后台 powershell Start-Sleep(5) 会在 5s 后自动退出,无需按镜像名清理(避免误杀并行测试的进程)。
     }
 
     /// 回归:Start-Process 后台服务 + timeout=30000(固定超时模式)。
@@ -1340,7 +1366,7 @@ mod tests {
         let start = Instant::now();
         let result = rt.block_on(async {
             execute_bash(BashCommandInput {
-                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\Users\\38225\\AppData\\Local\\Programs\\Python\\Python311\\python.exe' -ArgumentList '-c','import time; time.sleep(5)' -WindowStyle Hidden -RedirectStandardOutput 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_fixed.log' -RedirectStandardError 'C:\\Users\\38225\\AppData\\Local\\Temp\\bgtest_fixed_err.log'\" && echo \"Start-Process done\"; sleep 5; true".to_string(),
+                command: "powershell -NoProfile -Command \"Start-Process -FilePath 'powershell' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden\" && echo \"Start-Process done\"; sleep 5; true".to_string(),
                 timeout: Some(30_000),
                 description: None,
                 run_in_background: Some(false),
@@ -1362,6 +1388,21 @@ mod tests {
             "bash foreground should complete, stdout: {}",
             output.stdout
         );
+    }
+
+    /// CWD 失效(目录被删除)时,执行目录回退到家目录/临时目录,而不是让整个
+    /// bash 工具报 os error 267 不可用。回归钉子:execute_bash 的 CWD 解析内核。
+    #[test]
+    fn resolve_exec_cwd_falls_back_when_current_dir_invalid() {
+        // 探测失败(None)= CWD 已失效 → 必须给出一个真实存在的目录。
+        let fallback = resolve_exec_cwd_from(None);
+        assert!(
+            fallback.is_dir(),
+            "fallback exec cwd must exist, got {fallback:?}"
+        );
+        // 探测成功 → 原样使用(正常路径不改变语义)。
+        let good = std::env::temp_dir();
+        assert_eq!(resolve_exec_cwd_from(Some(good.clone())), good);
     }
 
     /// PRD P2-5：shell 语法错误特征识别（bash/sh/cmd 通用）。

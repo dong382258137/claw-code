@@ -2016,6 +2016,23 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-prompt-{nanos}"))
     }
 
+    /// Windows 上 `remove_dir_all` 会因杀毒/索引器/未释放句柄而**偶发**失败
+    /// (Os code 32「另一个程序正在使用此文件」)。清理失败不改变本测试的断言结论,
+    /// 故重试数次后静默放弃 —— 避免把一次**与测试意图无关的**文件锁竞争变成
+    /// flaky 失败(实测:全量并发时该清理偶发 panic,把有效任务误判为 baseline_red)。
+    fn cleanup_temp_dir(root: &Path) {
+        for attempt in 0..5 {
+            match fs::remove_dir_all(root) {
+                Ok(()) => return,
+                Err(_) if attempt < 4 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+                }
+                // 最终仍失败:残留一个临时目录无害,绝不让测试因此变红。
+                Err(_) => return,
+            }
+        }
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_env_lock()
     }
@@ -2110,7 +2127,7 @@ mod tests {
                 "nested instructions"
             ]
         );
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -2129,7 +2146,7 @@ mod tests {
             normalize_instruction_content(&context.instruction_files[0].content),
             "same rules"
         );
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -2163,7 +2180,7 @@ mod tests {
         .expect("write template only");
         let files = super::discover_instruction_files(&root, Some(&root)).expect("discover");
         assert!(files.is_empty(), "全样板时应为空");
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -2210,7 +2227,7 @@ mod tests {
         assert!(status.contains("?? CLAUDE.md"));
         assert!(status.contains("?? tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -2299,7 +2316,7 @@ mod tests {
         assert!(rendered.contains("Git status snapshot:"));
         assert!(rendered.contains("## main"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -2357,7 +2374,7 @@ mod tests {
             "B1: git diff must not be injected, got: {rendered}"
         );
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -2407,7 +2424,7 @@ mod tests {
         assert!(prompt.contains("Project rules"));
         // B3:功能开关摘要(permission_mode 替代全量 JSON 的键名)
         assert!(prompt.contains("permission_mode"));
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -2499,7 +2516,7 @@ mod tests {
         assert!(prompt.contains("verify then think"));
         assert!(prompt.contains("系统状态 / 运行时行为"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     /// P1(系统提示词评估 2026-09-17):占位符就近解释守护。
@@ -2591,7 +2608,7 @@ mod tests {
                 .contains("确定性预算(Certainty Budget)"),
             "Certainty Budget 段不应位于动态区"
         );
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -2622,7 +2639,7 @@ mod tests {
             render_instruction_files(&context.instruction_files).contains("instruction markdown")
         );
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]

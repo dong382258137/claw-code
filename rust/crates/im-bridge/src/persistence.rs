@@ -118,14 +118,18 @@ impl PersistenceManager {
 
         // Atomic write: write to unique temp file, then rename.
         // 固定 tmp 名在多实例并发写同一路径时会被对方持有句柄 → os error 5。
-        // 用 pid + 纳秒后缀保证唯一,消除实例间冲突。
+        // 唯一性需 pid + 纳秒 + **进程内原子计数**:仅 subsec_nanos 每秒重复一次,
+        // 同进程同一秒内两次保存会撞名 → 互相覆盖/rename 冲突(真实并发保存缺陷)。
+        static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = self.path.with_file_name(format!(
-            ".{}.{}.tmp",
+            ".{}.{}.{}.tmp",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or_default()
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+            seq
         ));
         std::fs::write(&tmp_path, content).map_err(|e| format!("write failed: {e}"))?;
         std::fs::rename(&tmp_path, &self.path).map_err(|e| format!("rename failed: {e}"))?;

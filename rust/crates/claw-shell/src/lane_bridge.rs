@@ -437,6 +437,20 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// 测试序列化锁:全局 SessionBus 同样是进程级单例。多个测试通过
+    /// `set_allow(Ide, Main, true/false)` 开关同一份**全局**权限位,并行执行时
+    /// 一个测试收尾的 `set_allow(.., false)` 可能落在另一个测试
+    /// `set_allow(true)`→`publish` 的窗口内 → 投递被拒,`delivered` 偶发为 0
+    /// (实测 `broadcast_from_ide_registers_peer_and_delivers` 断言 delivered==1
+    /// 偶发失败;单跑恒过)。用独立于 sink_lock 的锁确保这些测试互斥。
+    fn bus_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 构造一个带最小 metadata 的测试 LaneEvent。
     fn make_event(name: LaneEventName, status: LaneEventStatus, seq: u64) -> LaneEvent {
         LaneEventBuilder::new(
@@ -741,6 +755,7 @@ mod tests {
 
     #[test]
     fn broadcast_from_ide_registers_peer_and_delivers() {
+        let _guard = bus_lock();
         let bus = runtime::global_session_bus();
         let main_id = unique_id("main-acp");
         let ide_id = unique_id("ide-panel");
@@ -799,6 +814,7 @@ mod tests {
     // 审查补充(2026-08-12):空 text 拒绝发布,防止 IDE 面板误发空消息广播噪音。
     #[test]
     fn broadcast_rejects_empty_text() {
+        let _guard = bus_lock();
         let bus = runtime::global_session_bus();
         let main_id = unique_id("main-empty");
         let ide_id = unique_id("ide-empty");

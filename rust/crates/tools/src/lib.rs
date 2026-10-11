@@ -9799,6 +9799,19 @@ pub mod pdf_extract;
 
 #[cfg(test)]
 mod tests {
+
+    /// 测试序列化锁:多个测试经 `std::env::set_current_dir` 改动**进程级** CWD,
+    /// 并在收尾删除临时目录。并行执行时,某测试把 CWD 指向已删除目录(或在其上
+    /// spawn 子进程)会触发 Windows os error 267「目录名称无效」,表现为 bash 工具
+    /// 测试偶发失败(实测 `bash_tool_reports_success_...` 等)。用共享锁让所有
+    /// 改动 CWD / 起 bash 子进程的测试互斥。
+    fn cwd_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::fs;
@@ -11780,6 +11793,7 @@ mod tests {
 
     #[test]
     fn skill_resolves_project_local_skills_and_legacy_commands() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_guard();
         let root = temp_path("project-skills");
         let skill_dir = root.join(".claw").join("skills").join("plan");
@@ -11824,6 +11838,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_claude_skill_prompt() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_guard();
         let root = temp_path("project-skills");
         let home = root.join("home");
@@ -11875,6 +11890,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_omc_and_agents_skill_prompts() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_guard();
         let root = temp_path("project-omc-skills");
         let home = root.join("home");
@@ -12072,6 +12088,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_legacy_command_markdown() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_guard();
         let root = temp_path("project-legacy-command");
         let home = root.join("home");
@@ -12837,6 +12854,7 @@ mod tests {
 
     #[test]
     fn subagent_system_prompt_uses_resolved_model_identity() {
+        let _cwd_guard = cwd_test_lock();
         // given: a temporary workspace and an OpenAI-compatible subagent model
         let _guard = env_guard();
         let root = temp_path("subagent-prompt-identity");
@@ -12910,6 +12928,7 @@ mod tests {
 
     #[test]
     fn subagent_runtime_executes_tool_loop_with_isolated_session() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13103,6 +13122,7 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
+        let _cwd_guard = cwd_test_lock();
         let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
@@ -13140,6 +13160,7 @@ mod tests {
 
     #[test]
     fn bash_tool_classifies_test_timeout_as_hung_with_provenance() {
+        let _cwd_guard = cwd_test_lock();
         let timeout = execute_tool(
             "bash",
             &json!({ "command": "sleep 1 # cargo test slow_case", "timeout": 10 }),
@@ -13157,6 +13178,7 @@ mod tests {
 
     #[test]
     fn bash_workspace_tests_are_blocked_when_branch_is_behind_main() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13207,6 +13229,7 @@ mod tests {
 
     #[test]
     fn bash_targeted_tests_skip_branch_preflight() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13241,6 +13264,7 @@ mod tests {
 
     #[test]
     fn file_tools_cover_read_write_and_edit_behaviors() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13352,6 +13376,7 @@ mod tests {
 
     #[test]
     fn glob_and_grep_tools_cover_success_and_errors() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13425,6 +13450,7 @@ mod tests {
 
     #[test]
     fn file_tools_reject_paths_outside_current_workspace() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13473,6 +13499,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn file_tools_reject_symlink_escape_from_current_workspace() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13555,6 +13582,7 @@ mod tests {
 
     #[test]
     fn config_reads_and_writes_supported_values() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13621,6 +13649,7 @@ mod tests {
 
     #[test]
     fn enter_and_exit_plan_mode_round_trip_existing_local_override() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13694,6 +13723,7 @@ mod tests {
 
     #[test]
     fn exit_plan_mode_clears_override_when_enter_created_it_from_empty_local_state() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13965,6 +13995,7 @@ printf 'pwsh:%s' "$1"
     #[test]
     #[cfg(unix)]
     fn given_workspace_write_enforcer_when_bash_reads_symlink_escape_then_denied() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14024,6 +14055,7 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn given_read_only_enforcer_when_read_file_then_not_permission_denied() {
+        let _cwd_guard = cwd_test_lock();
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
