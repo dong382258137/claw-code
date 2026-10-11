@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -223,6 +223,9 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         preflight_message_request(request)?;
+        // TTFT 起点:以「发出请求」为 0 点(OTel gen_ai.client.inference.
+        // time_to_first_chunk 语义 —— 从客户端发起生成请求起算)。
+        let started_at = Instant::now();
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;
@@ -233,6 +236,7 @@ impl OpenAiCompatClient {
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone(), self.base_url.clone()),
+            ttft: TtftClock::start_at(started_at),
         })
     }
 
@@ -366,12 +370,54 @@ pub struct MessageStream {
     pending: VecDeque<StreamEvent>,
     done: bool,
     state: StreamState,
+    /// TTFT 测量器:记录「发出请求 → 首个响应 chunk」的墙钟。
+    ttft: TtftClock,
+}
+
+/// TTFT(首 chunk 延迟)测量器 —— 对齐 OTel
+/// `gen_ai.client.inference.time_to_first_chunk` 语义:从客户端发起生成请求起,
+/// 到收到响应流**首个 chunk** 为止的墙钟时长。首 chunk 只记一次(幂等)。
+#[derive(Debug)]
+struct TtftClock {
+    started_at: Instant,
+    first_chunk_at: Option<Instant>,
+}
+
+impl TtftClock {
+    fn start_at(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            first_chunk_at: None,
+        }
+    }
+
+    /// 记录首个 chunk 到达(仅首次生效,幂等)。
+    fn note_chunk(&mut self) {
+        if self.first_chunk_at.is_none() {
+            self.first_chunk_at = Some(Instant::now());
+        }
+    }
+
+    /// 首 chunk 延迟(毫秒);首 chunk 未到达时返回 `None`。
+    fn time_to_first_chunk_ms(&self) -> Option<u64> {
+        self.first_chunk_at.map(|at| {
+            u64::try_from(at.saturating_duration_since(self.started_at).as_millis())
+                .unwrap_or(u64::MAX)
+        })
+    }
 }
 
 impl MessageStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+
+    /// 首 chunk 延迟(毫秒),对齐 OTel
+    /// `gen_ai.client.inference.time_to_first_chunk`。在首 chunk 到达前返回 `None`。
+    #[must_use]
+    pub fn time_to_first_chunk_ms(&self) -> Option<u64> {
+        self.ttft.time_to_first_chunk_ms()
     }
 
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
@@ -390,6 +436,8 @@ impl MessageStream {
 
             match self.response.chunk().await? {
                 Some(chunk) => {
+                    // TTFT 锚点:首个网络 chunk 到达即记账(幂等)。
+                    self.ttft.note_chunk();
                     for parsed in self.parser.push(&chunk)? {
                         self.pending.extend(self.state.ingest_chunk(parsed)?);
                     }
@@ -2700,5 +2748,36 @@ mod tests {
             super::strip_routing_prefix("deepseek-v4-pro"),
             "deepseek-v4-pro"
         ); // no prefix, unchanged
+    }
+
+    // ── TtftClock:OTel gen_ai.client.inference.time_to_first_chunk ──
+
+    /// 首 chunk 到达前 → None(尚未测量)。
+    #[test]
+    fn ttft_none_before_first_chunk() {
+        let clock = super::TtftClock::start_at(std::time::Instant::now());
+        assert_eq!(clock.time_to_first_chunk_ms(), None);
+    }
+
+    /// 首 chunk 到达后 → Some(ms),且**幂等**(只记首次)。
+    #[test]
+    fn ttft_records_first_chunk_and_is_idempotent() {
+        let mut clock = super::TtftClock::start_at(std::time::Instant::now());
+        assert_eq!(clock.time_to_first_chunk_ms(), None);
+        clock.note_chunk();
+        let first = clock.time_to_first_chunk_ms();
+        assert!(first.is_some(), "首 chunk 后应有 TTFT 值");
+        // 再次 note_chunk 不得改写首次锚点(幂等)。
+        clock.note_chunk();
+        assert_eq!(clock.time_to_first_chunk_ms(), first, "TTFT 必须幂等");
+    }
+
+    /// 已流逝时间 ≥ 0(墙钟单调)。
+    #[test]
+    fn ttft_is_non_negative() {
+        let mut clock = super::TtftClock::start_at(std::time::Instant::now());
+        clock.note_chunk();
+        let ms = clock.time_to_first_chunk_ms().expect("ttft");
+        assert!(ms < 60_000, "本测试内 TTFT 不应超过 60s,got {ms}ms");
     }
 }

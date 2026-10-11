@@ -60,6 +60,18 @@ impl MessageStream {
         }
     }
 
+    /// 首 chunk 延迟(毫秒) —— 对齐 OTel
+    /// `gen_ai.client.inference.time_to_first_chunk`。
+    ///
+    /// `ProviderClient::stream_message` 返回后、首个 `next_event` 返回前为 `None`;
+    /// 首 chunk 到达后恒为 `Some`(幂等,只记首次)。
+    #[must_use]
+    pub fn time_to_first_chunk_ms(&self) -> Option<u64> {
+        match self {
+            Self::OpenAiCompat(stream) => stream.time_to_first_chunk_ms(),
+        }
+    }
+
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
         match self {
             Self::OpenAiCompat(stream) => stream.next_event().await,

@@ -165,6 +165,13 @@ pub(crate) struct AnthropicRuntimeClient {
     /// (`~/.claude/cache/prompt-cache/<session>/dumps/req-*.json`)。
     /// 见 api::RequestDivergenceProbe 的模块文档(轮边界失效复现)。
     request_divergence_probe: api::RequestDivergenceProbe,
+    /// 最近一次流式请求的首 chunk 延迟(毫秒),对齐 OTel
+    /// `gen_ai.client.inference.time_to_first_chunk`。
+    ///
+    /// `u64::MAX` 哨兵 = 尚无测量(未收到首 chunk / 非流式)。用原子存储
+    /// 以便 `&self` 的 [`ApiClient::last_time_to_first_chunk_ms`] 读取;
+    /// 每次流式请求在首个 chunk 到达时写入(见 `consume_stream_attempt`)。
+    last_ttft_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AnthropicRuntimeClient {
@@ -213,6 +220,7 @@ impl AnthropicRuntimeClient {
             )),
             progressive_tools,
             request_divergence_probe: api::RequestDivergenceProbe::new(session_id),
+            last_ttft_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         })
     }
 
@@ -372,6 +380,14 @@ fn tools_for_triage(
 }
 
 impl ApiClient for AnthropicRuntimeClient {
+    fn last_time_to_first_chunk_ms(&self) -> Option<u64> {
+        // `u64::MAX` 哨兵 = 尚无测量(未收到首 chunk / 非流式)。
+        match self.last_ttft_ms.load(std::sync::atomic::Ordering::Relaxed) {
+            u64::MAX => None,
+            ms => Some(ms),
+        }
+    }
+
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
     }
@@ -804,6 +820,14 @@ impl AnthropicRuntimeClient {
             };
             if !received_any_event {
                 self.emit_status(StatusEvent::StreamStart);
+                // TTFT 落盘锚点(OTel gen_ai.client.inference.time_to_first_chunk):
+                // 首个流事件到达即从 api 层读取已记账的首 chunk 延迟,存入原子
+                // 字段,供 runtime 在 assistant_iteration_completed 时落 telemetry。
+                // 幂等:每次流式请求首个事件只写一次(后续事件不覆盖)。
+                if let Some(ms) = stream.time_to_first_chunk_ms() {
+                    self.last_ttft_ms
+                        .store(ms, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             received_any_event = true;
 
