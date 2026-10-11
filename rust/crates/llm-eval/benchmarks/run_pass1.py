@@ -175,6 +175,12 @@ def main() -> int:
         action="store_false",
         help="改用整 crate 判分(会引入无关 flaky → 假阴性,不推荐)",
     )
+    ap.add_argument(
+        "--skip",
+        action="append",
+        default=[],
+        help="额外跳过已知 toxic 任务的 id;可重复(默认已跳过 runtime-1aa64fc9/runtime-4ebb08f5)",
+    )
     args = ap.parse_args()
 
     if args.claw_arg is None:
@@ -186,6 +192,32 @@ def main() -> int:
 
     work_root = Path(gt.normalize_path(args.work_root)).resolve()
     work_root.mkdir(parents=True, exist_ok=True)
+
+    # 已知 toxic/跳过任务:实测 runtime-1aa64fc9 会使批处理整体死亡
+    # (任务自杀 taskkill),runtime-4ebb08f5 同理(README §已知不稳定项)。
+    skip_ids = {"runtime-1aa64fc9", "runtime-4ebb08f5"} | set(args.skip)
+    tasks = [t for t in tasks if t["id"] not in skip_ids]
+
+    def write_report(results: list[dict]) -> None:
+        """增量落盘:每任务后写一次,崩溃不丢已得进度。"""
+        total = len(results)
+        passed = sum(1 for r in results if r.get("resolved"))
+        summary = {
+            "benchmark": "groundtruth-regression-pin",
+            "note": "内部回归(路径 C),不可与 SWE-bench leaderboard 比较",
+            "total": total,
+            "resolved": passed,
+            "pass1": round(passed / total, 4) if total else 0.0,
+            "verdicts": {},
+        }
+        for r in results:
+            v = r.get("verdict", "unknown")
+            summary["verdicts"][v] = summary["verdicts"].get(v, 0) + 1
+        if args.out:
+            Path(gt.normalize_path(args.out)).write_text(
+                json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     results = []
     for i, task in enumerate(tasks, 1):
@@ -199,6 +231,7 @@ def main() -> int:
             flush=True,
         )
         results.append(r)
+        write_report(results)  # 增量落盘(崩溃可恢复)
 
     total = len(results)
     passed = sum(1 for r in results if r.get("resolved"))
