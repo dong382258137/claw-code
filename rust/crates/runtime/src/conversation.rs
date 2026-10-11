@@ -1235,6 +1235,17 @@ pub type StatusEmitter = std::sync::Arc<dyn Fn(StatusEvent) + Send + Sync>;
 pub trait ApiClient: Send {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
 
+    /// 最近一次流式请求的首 chunk 延迟(毫秒) —— 对齐 OTel
+    /// `gen_ai.client.inference.time_to_first_chunk`。
+    ///
+    /// 默认返回 `None`(非流式 / 未实现本地埋点的 client);生产
+    /// `AnthropicRuntimeClient` 在流消费层记账后返回 `Some`。
+    /// runtime 在每轮 `assistant_iteration_completed` 时读取并记入 telemetry
+    /// (`ttft_ms` 属性),使首响应时间可落盘、可聚合。
+    fn last_time_to_first_chunk_ms(&self) -> Option<u64> {
+        None
+    }
+
     /// v3:async 变体 — 供已在 tokio runtime 中的调用方使用,避免嵌套 runtime 开销。
     ///
     /// 默认实现委托给同步 [`stream`](Self::stream),仍会触发 production impl
@@ -3580,6 +3591,17 @@ where
         if self.triage_upgrade_requested {
             return TriageTier::Standard;
         }
+        // 3. 本地零成本预筛(2026-10-09):明确属工程轮次者直接短路 Standard,
+        //    省掉本 turn 的一次完整网络往返 —— 分诊调用位于首轮关键路径
+        //    (turn_started → 首次主请求之间),而档位裁剪省下的 token 远不及
+        //    一次往返的墙钟成本。预筛只输出 Standard/不判定,永不输出 Trivial,
+        //    故只会让个别 Trivial 轮次退回全量注入,绝不误裁工程轮次。
+        if crate::triage_llm::prescreen_standard(user_text) {
+            self.emit_diag(
+                "[diag] triage_llm prescreen -> Standard (skip LLM round-trip)".to_string(),
+            );
+            return TriageTier::Standard;
+        }
         // 4a. 独立 flash client(with_model 构造 enable_tools=false 轻量子 client)。
         //     with_model 不可用 → 跳过分诊返回 Standard(见方法级注释)。
         let Ok(mut triage_client) = self.api_client.with_model(TRIAGE_MODEL) else {
@@ -3659,6 +3681,13 @@ where
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
+
+        // id=61 修复:每 turn 用**实时** git 状态刷新注入的 `# Project context` 段。
+        // 交互式 REPL 是单个长进程,构造期捕获一次的坐标快照会永久停留会话开始时刻
+        // (git commit 只改 git 状态、不改工作区文件内容 → 无任何失效触发点),导致
+        // 模型读到过期的 ahead/branch/commits(实测:显示 ahead 58,实际 ahead 61)。
+        // 该段走 messages 尾部注入通道,不参与 system 前缀缓存,故逐 turn 重渲染无缓存代价。
+        self.refresh_project_context_section();
 
         // design-gaps #1:配置热重载 — 每 turn 检查 hooks 配置源是否有变化,
         // 变化则通过 HookRunner 原子替换,下一轮 hook 调用立即生效,无需重启会话。
@@ -6132,6 +6161,34 @@ where
             .build()
             .map_err(|e| RuntimeError::new(format!("failed to create tokio runtime: {e}")))?;
         rt.block_on(self.run_turn_async(user_input, prompter))
+    }
+
+    /// id=61 修复:用实时 git 状态刷新注入的 `# Project context` 段(原地替换)。
+    ///
+    /// 仅当该段已存在于尾部注入通道时才动作(未配置 workspace_root / 段被提取但
+    /// 内容为空的情形自然跳过)。instruction 文件计数从旧段解析保留(低频稳态,
+    /// 避免每 turn 重扫祖先链);git status / commits / branch 用实时值重渲染。
+    fn refresh_project_context_section(&mut self) {
+        let Some(root) = self.workspace_root.clone() else {
+            return;
+        };
+        let Some(idx) = self
+            .message_injected_sections
+            .iter()
+            .position(|s| s.starts_with(crate::prompt::PROJECT_CONTEXT_HEADING))
+        else {
+            return;
+        };
+        let instruction_count = crate::prompt::parse_project_context_instruction_count(
+            &self.message_injected_sections[idx],
+        );
+        let fresh = crate::prompt::render_project_context_fresh(&root, instruction_count);
+        // 段渲染为空(无 instruction 文件且非 git 仓库)则移除,避免残留孤立标题。
+        if fresh.is_empty() {
+            self.message_injected_sections.remove(idx);
+        } else {
+            self.message_injected_sections[idx] = fresh;
+        }
     }
 
     /// Execute the `session_search` tool: query the FTS5 history index.
@@ -9363,6 +9420,12 @@ where
             "pending_tool_use_count".to_string(),
             Value::from(pending_tool_use_count as u64),
         );
+        // M1 首响应时间落盘(OTel gen_ai.client.inference.time_to_first_chunk):
+        // 从 api client 读取最近一次流式请求的首 chunk 延迟。非流式/未采集时
+        // 不注入该属性(保持既有事件形状不变)。
+        if let Some(ttft_ms) = self.api_client.last_time_to_first_chunk_ms() {
+            attributes.insert("ttft_ms".to_string(), Value::from(ttft_ms));
+        }
         session_tracer.record("assistant_iteration_completed", attributes);
     }
 
@@ -10092,6 +10155,88 @@ mod tests {
         assert!(trace_names.contains(&"tool_execution_started"));
         assert!(trace_names.contains(&"tool_execution_finished"));
         assert!(trace_names.contains(&"turn_completed"));
+    }
+
+    /// M1:TTFT 值落盘 —— 当 api client 报告首 chunk 延迟时,
+    /// `assistant_iteration_completed` 事件应携带 `ttft_ms` 属性(OTel
+    /// `gen_ai.client.inference.time_to_first_chunk`)。
+    #[test]
+    fn records_ttft_ms_on_assistant_iteration() {
+        struct TtftApiClient;
+        impl ApiClient for TtftApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+            fn last_time_to_first_chunk_ms(&self) -> Option<u64> {
+                Some(1234)
+            }
+        }
+
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("session-ttft", sink.clone());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TtftApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        )
+        .with_session_tracer(tracer);
+
+        runtime.run_turn("hi", None).expect("turn should succeed");
+
+        let ttft = sink.events().into_iter().find_map(|event| match event {
+            TelemetryEvent::SessionTrace(trace)
+                if trace.name == "assistant_iteration_completed" =>
+            {
+                trace
+                    .attributes
+                    .get("ttft_ms")
+                    .and_then(serde_json::Value::as_u64)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            ttft,
+            Some(1234),
+            "ttft_ms 应落盘到 assistant_iteration_completed"
+        );
+    }
+
+    /// M1 反例:api client 未报告 TTFT(None)时,不得注入 `ttft_ms` 属性
+    /// (保持既有事件形状不变,避免污染聚合)。
+    #[test]
+    fn omits_ttft_ms_when_unavailable() {
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("session-no-ttft", sink.clone());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_session_tracer(tracer);
+
+        runtime
+            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .expect("turn should succeed");
+
+        let has_ttft = sink.events().iter().any(|event| match event {
+            TelemetryEvent::SessionTrace(trace)
+                if trace.name == "assistant_iteration_completed" =>
+            {
+                trace.attributes.contains_key("ttft_ms")
+            }
+            _ => false,
+        });
+        assert!(!has_ttft, "无可测量 TTFT 时不得注入 ttft_ms 属性");
     }
 
     #[test]
@@ -22386,6 +22531,8 @@ mod tests {
     }
 
     /// LLM 分诊返回 `standard` → 工程句 turn 得 Standard。
+    /// 注:输入刻意选**不触发本地预筛**的短句(无工程动词/无路径/短),
+    /// 以确保本测试真正走到 LLM 分诊路径(预筛短路另有专测)。
     #[test]
     fn llm_triage_standard_marks_engineering_turn_standard() {
         let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
@@ -22399,7 +22546,7 @@ mod tests {
                 None,
             );
         runtime
-            .run_turn("帮我修复这个 bug", None)
+            .run_turn("看看这个方案", None)
             .expect("turn should succeed");
         assert_eq!(with_model_calls.load(Ordering::SeqCst), 1);
         assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
@@ -22442,6 +22589,7 @@ mod tests {
     }
 
     /// LLM 分诊返回空文本 → 解析失败 → 跳过分诊(Standard),主流程正常。
+    /// 注:输入刻意选不触发本地预筛的短句,确保走到 LLM 分诊路径。
     #[test]
     fn llm_triage_empty_reply_skips_to_standard() {
         let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
@@ -22451,7 +22599,7 @@ mod tests {
         let (mut runtime, captured, _sub_captured, with_model_calls, sub_calls) =
             llm_triage_runtime(vec!["已修复。".to_string()], Vec::new(), None);
         runtime
-            .run_turn("帮我修复这个 bug", None)
+            .run_turn("看看这个方案", None)
             .expect("triage 空回复不得阻断主流程");
         assert_eq!(with_model_calls.load(Ordering::SeqCst), 1);
         assert_eq!(sub_calls.load(Ordering::SeqCst), 1);
@@ -22503,6 +22651,48 @@ mod tests {
             reqs[0].triage_tier,
             Some(TriageTier::Standard),
             "off 模式跳过分诊 → 主请求恒 Standard(全量注入)"
+        );
+    }
+
+    /// 预筛短路(2026-10-09):明确工程输入 → 不触发任何分诊网络调用
+    /// (with_model 0 次、分诊 mock 0 次),主请求直接 Standard。
+    /// 验证「省掉一次 turn 关键路径网络往返」的核心收益。
+    #[test]
+    fn prescreen_skips_triage_round_trip_for_engineering_turn() {
+        let _guard = crate::triage_llm::TRIAGE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(crate::triage_llm::TRIAGE_MODE_ENV); // 显式 llm 默认
+        let (mut runtime, captured, sub_captured, with_model_calls, sub_calls) = llm_triage_runtime(
+            vec!["已修复。".to_string()],
+            vec!["trivial".to_string()],
+            None,
+        );
+        // 「修复」命中预筛工程动词 → 应在触达 LLM 分诊前短路。
+        runtime
+            .run_turn("帮我修复这个 bug", None)
+            .expect("turn should succeed");
+        assert_eq!(
+            with_model_calls.load(Ordering::SeqCst),
+            0,
+            "预筛命中不得触发 with_model(省一次往返)"
+        );
+        assert_eq!(
+            sub_calls.load(Ordering::SeqCst),
+            0,
+            "预筛命中不得调分诊 mock"
+        );
+        assert_eq!(
+            sub_captured.lock().expect("lock").len(),
+            0,
+            "预筛命中不应产生分诊请求"
+        );
+        let reqs = captured.lock().expect("lock");
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].triage_tier,
+            Some(TriageTier::Standard),
+            "预筛命中 → 主请求 Standard"
         );
     }
 

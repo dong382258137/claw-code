@@ -981,26 +981,43 @@ pub const PROJECT_CONTEXT_HEADING: &str = "# Project context";
 pub const MCP_CATALOG_HEADING: &str = "## MCP Servers";
 
 fn render_project_context(project_context: &ProjectContext) -> String {
+    render_project_context_parts(
+        project_context.instruction_files.len(),
+        project_context.git_status.as_deref(),
+        project_context.git_context.as_ref(),
+    )
+}
+
+/// `# Project context` 段的渲染内核:instruction 计数 + 实时 git 字段。
+///
+/// 拆出该内核是为了支持 **每 turn 刷新**(见 [`render_project_context_fresh`]):
+/// 交互式 REPL 是单个长进程,构造期捕获一次的 git 快照会永久停留在会话
+/// 开始时刻(`git commit` 只改 git 状态、不改工作区文件内容,故无任何失效
+/// 触发点),从而让模型读到过期的 ahead/branch/commits。
+fn render_project_context_parts(
+    instruction_file_count: usize,
+    git_status: Option<&str>,
+    git_context: Option<&GitContext>,
+) -> String {
     // A1/A2:日期与工作目录已由 `# Environment context` 提供(static 区,经
     // DynamicValueExtractor 占位符化 + `# Cache-aligned dynamic values` 映射段),
     // 此处不再重复注入,避免同值两处浪费 token 且扩大前缀。
     let mut lines = vec![PROJECT_CONTEXT_HEADING.to_string()];
     let mut bullets = Vec::new();
-    if !project_context.instruction_files.is_empty() {
+    if instruction_file_count > 0 {
         bullets.push(format!(
-            "Claude instruction files discovered: {}.",
-            project_context.instruction_files.len()
+            "Claude instruction files discovered: {instruction_file_count}."
         ));
     }
     lines.extend(prepend_bullets(bullets));
-    if let Some(status) = &project_context.git_status {
+    if let Some(status) = git_status {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
         lines.push(compact_git_status(status));
     }
     // 单一事实来源:commits/branch/staged 统一由 GitContext::render() 输出,
     // 不再在此手写循环重复渲染同一批 recent_commits(曾导致同段内 commits 双份)。
-    if let Some(git_context) = &project_context.git_context {
+    if let Some(git_context) = git_context {
         let rendered = git_context.render();
         if !rendered.is_empty() {
             lines.push(String::new());
@@ -1015,6 +1032,35 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     } else {
         rendered
     }
+}
+
+/// 用**实时** git 状态重渲染 `# Project context` 段(供 runtime 每 turn 调用)。
+///
+/// `instruction_file_count` 由调用方保留(低频稳态字段,不必每 turn 重扫祖先链)。
+/// 段内不含日期/cwd,故无需重新计算它们。git 命令实测 ~26–31ms,可承受。
+pub fn render_project_context_fresh(cwd: &Path, instruction_file_count: usize) -> String {
+    let git_status = read_git_status(cwd);
+    let git_context = GitContext::detect(cwd);
+    render_project_context_parts(
+        instruction_file_count,
+        git_status.as_deref(),
+        git_context.as_ref(),
+    )
+}
+
+/// 从已渲染的 `# Project context` 段解析 instruction 文件计数,供每 turn 刷新时
+/// 保留该稳态字段。解析失败返回 0(退化为省略该 bullet)。格式由
+/// [`render_project_context_parts`] 单方决定,故解析是确定性的。
+#[must_use]
+pub fn parse_project_context_instruction_count(section: &str) -> usize {
+    section
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("- Claude instruction files discovered: ")
+        })
+        .and_then(|rest| rest.trim_end_matches('.').trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// Git status 快照聚合:超过 [`MAX_GIT_STATUS_LINES`] 行时保留前 N 行,
@@ -1993,9 +2039,10 @@ mod tests {
         get_memory_verification_section, get_multi_agent_orchestration_section,
         get_session_bus_section, get_simple_doing_tasks_section, get_simple_intro_section,
         get_simple_system_section, get_tool_usage_guidance_section, get_worker_lifecycle_section,
-        is_capability_layer_section, normalize_instruction_content, render_config_section,
-        render_instruction_content, render_instruction_files, render_mcp_catalog_section,
-        render_persistent_memory_section, render_project_context, render_repomap_section,
+        is_capability_layer_section, normalize_instruction_content,
+        parse_project_context_instruction_count, render_config_section, render_instruction_content,
+        render_instruction_files, render_mcp_catalog_section, render_persistent_memory_section,
+        render_project_context, render_project_context_fresh, render_repomap_section,
         render_skill_catalog_section, truncate_instruction_content, ContextFile,
         ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier, SystemPromptBuilder,
         SystemPromptSplit, CAPABILITY_LAYER_HEADING_PREFIXES, PLACEHOLDER_POINTER_MARKER,
@@ -2202,6 +2249,66 @@ mod tests {
         assert_eq!(
             display_context_path(Path::new("/tmp/project/.claw/CLAUDE.md")),
             "CLAUDE.md"
+        );
+    }
+
+    #[test]
+    fn render_project_context_fresh_reflects_new_commits() {
+        // id=61 回归:同一会话(长进程)内,`# Project context` 必须反映**实时** git 状态。
+        // 旧实现只在构造期捕获一次快照 → commit 后注入段仍停留在旧 commits(实测
+        // 显示 ahead 58 而实际 ahead 61),误导模型。本测试构造仓库 → 首次渲染 →
+        // 追加 commit → 再次渲染,断言第二次反映新提交。
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git should run");
+        };
+        run(&["init", "--quiet", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        fs::write(root.join("a.txt"), "1").expect("write");
+        run(&["add", "."]);
+        run(&["commit", "--quiet", "-m", "first-commit-marker"]);
+
+        let first = render_project_context_fresh(&root, 0);
+        assert!(
+            first.contains("first-commit-marker"),
+            "首次渲染应含首个提交, got:\n{first}"
+        );
+
+        // 新增第二个提交(模拟会话进行中的 git commit —— 只改 git 状态、不改文件内容)。
+        fs::write(root.join("b.txt"), "2").expect("write");
+        run(&["add", "."]);
+        run(&["commit", "--quiet", "-m", "second-commit-marker"]);
+
+        let second = render_project_context_fresh(&root, 0);
+        assert!(
+            second.contains("second-commit-marker"),
+            "重渲染必须反映新提交(id=61 修复);got:\n{second}"
+        );
+        assert_ne!(
+            first, second,
+            "git 状态变化后重渲染结果必须不同(旧实现会因冻结而相同)"
+        );
+
+        cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn parse_project_context_instruction_count_roundtrips() {
+        // instruction 计数是低频稳态字段,刷新时从旧段解析保留,避免每 turn 重扫祖先链。
+        let rendered = super::render_project_context_parts(3, None, None);
+        assert!(rendered.contains("Claude instruction files discovered: 3."));
+        assert_eq!(parse_project_context_instruction_count(&rendered), 3);
+        assert_eq!(
+            parse_project_context_instruction_count("# Project context"),
+            0
         );
     }
 
