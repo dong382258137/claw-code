@@ -1357,6 +1357,26 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "HotUpgrade",
+            description: "Request a hot upgrade: the running claw rebuilds itself and restarts, \
+                          then automatically resumes this session and continues the task. Call this \
+                          after you have changed claw's own source code and want the changes to take \
+                          effect in the running process. The request only takes effect after the \
+                          current turn finishes; the process then exits and a new one resumes.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional short note on why the upgrade is needed (for logs)."
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "SendUserMessage",
             description: "Send a message to the user.",
             input_schema: json!({
@@ -2162,6 +2182,7 @@ fn execute_tool_with_enforcer(
         "SkillSearch" => from_value::<SkillSearchInput>(input).and_then(run_skill_search),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
+        "HotUpgrade" => from_value::<HotUpgradeInput>(input).and_then(run_hot_upgrade),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
         "ImBridgeSetup" => from_value::<ImBridgeSetupInput>(input).and_then(run_im_bridge_setup),
@@ -2360,6 +2381,32 @@ fn current_ask_user_question_handler() -> Option<AskUserQuestionHandler> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.clone()
+}
+
+/// 热升级请求标志(agent 自触发)。
+///
+/// 与 [`set_bash_abort`](../../runtime/src/bash.rs) 同构的跨 crate 信号:`HotUpgrade`
+/// 工具**只置位**此标志,绝不自行重启。host 主循环在**当前 turn 正常收尾后**检测到
+/// 标志,才调用 `LiveCli::run_upgrade()`(持久化计划 → 写升级标记 → spawn 升级助手
+/// 重建/重启 → 退出)。新进程经 `maybe_resume_from_upgrade()` 自动 resume 本会话,
+/// 从而让 agent"自行热升级并续跑"。
+static HOT_UPGRADE_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 置位热升级请求(`HotUpgrade` 工具调用)。
+pub fn request_hot_upgrade() {
+    HOT_UPGRADE_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// host 主循环取走请求(原子清零)。返回 true 表示应立即执行热升级。
+/// 取走即清零,保证"只升级一次",避免重启后残留标志再次触发。
+pub fn take_hot_upgrade_request() -> bool {
+    HOT_UPGRADE_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 清除请求(注销/测试用)。
+pub fn clear_hot_upgrade_request() {
+    HOT_UPGRADE_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -4277,6 +4324,24 @@ enum NotebookEditMode {
 #[derive(Debug, Deserialize)]
 struct SleepInput {
     duration_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HotUpgradeInput {
+    #[serde(default)]
+    #[allow(dead_code)]
+    reason: Option<String>,
+}
+
+fn run_hot_upgrade(input: HotUpgradeInput) -> Result<String, String> {
+    let _ = input.reason;
+    // 仅置位信号,绝不自行重启 —— 由 host 主循环在**本 turn 收尾后**执行升级,
+    // 保证正在进行的 turn 状态完整落盘、工具调用不会中途被切断。
+    request_hot_upgrade();
+    to_pretty_json(serde_json::json!({
+        "requested": true,
+        "note": "hot upgrade 已登记,将在本 turn 收尾后自动重建/重启并 resume 本会话",
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -14446,6 +14511,27 @@ printf 'pwsh:%s' "$1"
         // current_ask_user_question_handler 是私有的，通过行为验证：
         // execute_tool 不应走 handler 路径（这里不实际调用，因为 stdin
         // 会阻塞测试线程）。仅验证 setter/clearer 不 panic。
+    }
+
+    /// HotUpgrade 工具:调用后置位跨 crate 信号,且 `take` 语义为"取一次即清零"
+    /// (防止重启后残留标志再次触发升级)。host 主循环据此在 turn 收尾后执行升级。
+    #[test]
+    fn hot_upgrade_tool_sets_and_takes_signal_once() {
+        super::clear_hot_upgrade_request();
+        assert!(!super::take_hot_upgrade_request(), "初始应为未请求");
+
+        let out = super::execute_tool("HotUpgrade", &json!({ "reason": "test" }))
+            .expect("HotUpgrade should succeed");
+        assert!(
+            out.contains("\"requested\": true"),
+            "应回执 requested=true, got {out}"
+        );
+
+        assert!(super::take_hot_upgrade_request(), "置位后首次 take 应为 true");
+        assert!(
+            !super::take_hot_upgrade_request(),
+            "take 后应清零(只升级一次,避免重启后重复触发)"
+        );
     }
 }
 

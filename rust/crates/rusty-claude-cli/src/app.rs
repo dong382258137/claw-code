@@ -1167,6 +1167,12 @@ impl LiveCli {
                 self.print_status_bar();
                 println!();
                 self.persist_session()?;
+                // Agent 自触发热升级:若本 turn 调用了 `HotUpgrade` 工具,状态已全部
+                // 落盘,此刻执行升级(重建 → 重启 → 新进程 resume 本会话并续跑)。
+                // run_upgrade 内部会 std::process::exit(0),故放在 turn 成功收尾之后。
+                if tools::take_hot_upgrade_request() {
+                    self.run_upgrade()?;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -1229,6 +1235,10 @@ impl LiveCli {
                 self.persist_session()?;
                 // TUI 中断支持：turn 成功结束后清空 abort signal handle。
                 self.current_abort_signal = None;
+                // Agent 自触发热升级:与 run_turn 同构,状态已落盘后执行升级。
+                if tools::take_hot_upgrade_request() {
+                    self.run_upgrade()?;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -3553,24 +3563,18 @@ fn build_api_client(
     )?))
 }
 
-/// 解析「质量敏感」辅助 LLM 子件应使用的旗舰模型。
+/// 解析「质量敏感」辅助 LLM 子件应使用的模型。
 ///
-/// 2026-08-13 DeepSeek V4-Pro 0813 正式版上线后,judge / summarizer /
-/// extractor / planner / research 等输出直接影响任务质量与记忆保真的子件,
-/// 应从 budget(flash)升级到 flagship(pro),吃到 Pro 0813 能力红利。
+/// 2026-10-11 起改为直接使用主模型(不升级到 pro):
+/// 实测 pro 相对 flash 能力不占优且成本约 10 倍,而 judge / harness
+/// proposer / decision extractor / research / planner 均为有降级兜底的
+/// 辅助性子件,flash 质量已足够(与 CompactionSummarizer / FreshnessAssessor
+/// 的取舍一致)。保留功能、成本降到最低。
 ///
-/// 这些子件都是进程级 `OnceLock` 单例,构造时绑定模型,无法运行时按任务
-/// 复杂度切换,因此采用「用途分级」而非运行时路由:
-/// - 质量敏感子件 → 旗舰(flash 升级到 pro,pro 保持 pro)
-/// - 成本敏感子件(assessor / query builder)→ 保持 budget(flash)
-///
-/// 规则:
-/// - 主模型是 flash → 升级到 pro(命中内置升级表)
-/// - 主模型已是 pro/旗舰 → 保持 pro(`upgrade_model` 返回 None)
-/// - 未知模型(无升级路径)→ 保持主模型(保守,不强行替换)
+/// 恢复 pro:改回 `api::upgrade_model(main_model).unwrap_or_else(|| main_model.to_string())`
 #[must_use]
 fn resolve_quality_model(main_model: &str) -> String {
-    api::upgrade_model(main_model).unwrap_or_else(|| main_model.to_string())
+    main_model.to_string()
 }
 
 /// Append the MCP server health overview to the system prompt.
