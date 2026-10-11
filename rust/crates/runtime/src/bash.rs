@@ -1405,6 +1405,50 @@ mod tests {
         assert_eq!(resolve_exec_cwd_from(Some(good.clone())), good);
     }
 
+    /// 回归(并发捕获文件碰撞):多条 `execute_bash` 并发执行时,每条命令必须拿到
+    /// **自己的** stdout,不得与他人输出串台。修复前捕获文件名仅用 `pid + 时钟纳秒`,
+    /// Windows 时钟精度粗(~ms) → 并发调用取到相同纳秒 → 复用同一捕获文件 →
+    /// 输出互相追加(实测 `"hello"` 被追加成 `"hellotick..."`)。本测试并发 24 条
+    /// 各写不同 marker,断言逐条精确匹配,可稳定捕获该缺陷。
+    #[test]
+    fn concurrent_bash_calls_do_not_share_capture_files() {
+        use std::sync::{Arc, Barrier};
+
+        const N: usize = 24;
+        let barrier = Arc::new(Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // 汇合点:尽量让 N 条命令在同一时间窗口内进入捕获文件创建。
+                    barrier.wait();
+                    let output = execute_bash(BashCommandInput {
+                        command: format!("printf 'marker-{i}'"),
+                        timeout: Some(30_000),
+                        description: None,
+                        run_in_background: Some(false),
+                        dangerously_disable_sandbox: Some(false),
+                        namespace_restrictions: Some(false),
+                        isolate_network: Some(false),
+                        filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+                        allowed_mounts: None,
+                    })
+                    .expect("concurrent bash should execute");
+                    (i, output.stdout)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (i, stdout) = handle.join().expect("worker thread should not panic");
+            assert_eq!(
+                stdout.trim(),
+                format!("marker-{i}"),
+                "并发 bash 输出串台:预期 marker-{i},实际 {stdout:?}(捕获文件被复用)"
+            );
+        }
+    }
+
     /// PRD P2-5：shell 语法错误特征识别（bash/sh/cmd 通用）。
     #[test]
     fn detects_shell_syntax_errors() {
