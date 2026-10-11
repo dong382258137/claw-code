@@ -47,3 +47,12 @@ _screenshot.ps1
 
 # Temporary example/test scratch files
 rust/crates/rusty-claude-cli/examples/
+
+# Benchmark task data. Regenerable/intermediate fetch outputs stay ignored,
+# but the *validated* pass^1 denominators are curated artifacts (each task
+# survived two-sided validation) and MUST be version-controlled — see
+# rust/crates/llm-eval/benchmarks/README.md for the frozen criteria.
+rust/crates/llm-eval/benchmarks/*.jsonl
+!rust/crates/llm-eval/benchmarks/groundtruth_validated.jsonl
+!rust/crates/llm-eval/benchmarks/groundtruth_validated_40.jsonl
+rust/crates/llm-eval/benchmarks/__pycache__/

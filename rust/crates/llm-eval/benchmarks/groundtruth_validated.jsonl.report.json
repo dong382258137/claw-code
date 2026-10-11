@@ -1,0 +1,148 @@
+{
+  "summary": {
+    "total": 15,
+    "valid": 8,
+    "verdicts": {
+      "baseline_red": 6,
+      "valid": 8,
+      "pin_side_failed": 1
+    }
+  },
+  "results": [
+    {
+      "task_id": "rusty-claude-cli-081d9e4d",
+      "crate": "rusty-claude-cli",
+      "valid": false,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 101,
+      "verdict": "baseline_red"
+    },
+    {
+      "task_id": "runtime-607e2c11",
+      "crate": "runtime",
+      "valid": true,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 0,
+      "verdict": "valid"
+    },
+    {
+      "task_id": "tools-7ab735ac",
+      "crate": "tools",
+      "valid": true,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 0,
+      "verdict": "valid"
+    },
+    {
+      "task_id": "runtime-97c8ae57",
+      "crate": "runtime",
+      "valid": true,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 0,
+      "verdict": "valid"
+    },
+    {
+      "task_id": "runtime-6f4c0e4b",
+      "crate": "runtime",
+      "valid": false,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 101,
+      "verdict": "baseline_red"
+    },
+    {
+      "task_id": "rusty-claude-cli-82959065",
+      "crate": "rusty-claude-cli",
+      "valid": false,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 101,
+      "verdict": "baseline_red"
+    },
+    {
+      "task_id": "runtime-72bbd80c",
+      "crate": "runtime",
+      "valid": false,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 101,
+      "verdict": "baseline_red"
+    },
+    {
+      "task_id": "web-bridge-ff3f8563",
+      "crate": "web-bridge",
+      "valid": false,
+      "pin_exit": null,
+      "pin_kind": "pin_failed",
+      "fixed_exit": 0,
+      "verdict": "pin_side_failed"
+    },
+    {
+      "task_id": "runtime-f27e4026",
+      "crate": "runtime",
+      "valid": true,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 0,
+      "verdict": "valid"
+    },
+    {
+      "task_id": "runtime-e7b1cebd",
+      "crate": "runtime",
+      "valid": true,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 0,
+      "verdict": "valid"
+    },
+    {
+      "task_id": "runtime-74645f4a",
+      "crate": "runtime",
+      "valid": false,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 101,
+      "verdict": "baseline_red"
+    },
+    {
+      "task_id": "runtime-2c0156c9",
+      "crate": "runtime",
+      "valid": true,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 0,
+      "verdict": "valid"
+    },
+    {
+      "task_id": "runtime-c3600f4a",
+      "crate": "runtime",
+      "valid": true,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 0,
+      "verdict": "valid"
+    },
+    {
+      "task_id": "runtime-160c226e",
+      "crate": "runtime",
+      "valid": false,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 101,
+      "verdict": "baseline_red"
+    },
+    {
+      "task_id": "runtime-bcd9a6eb",
+      "crate": "runtime",
+      "valid": true,
+      "pin_exit": 101,
+      "pin_kind": "compile_error",
+      "fixed_exit": 0,
+      "verdict": "valid"
+    }
+  ]
+}
