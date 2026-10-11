@@ -3290,6 +3290,64 @@ where
         ))
     }
 
+    /// claw 自身源码判定 + 热升级提醒(根因修复 · HotUpgrade 从未被触发)。
+    ///
+    /// 当写类工具的目标文件位于本工作区的 `rust/crates/` 之内时,说明模型
+    /// 正在修改 claw 自身源码。此时磁盘改动**不会**作用于当前运行进程 ——
+    /// 必须调用 `HotUpgrade` 工具才能重建并重启生效。
+    ///
+    /// 根因(会话实证):`HotUpgrade` 工具早已注册(tools/src/lib.rs 的 ToolSpec),
+    /// 但全仓库**没有任何提示**把「改了自身源码」与「应触发热升级」关联起来
+    /// (`grep HotUpgrade` 在 prompt.rs/conversation.rs 命中数为 0)。模型因此
+    /// 改完 api/cli/runtime 并提交后从不主动调用,运行进程始终跑旧码。
+    /// 本函数在 tool_result 末尾追加提醒,复用 F5 plan-scope 的直写通道
+    /// (下一次迭代请求构造时对模型可见)。
+    ///
+    /// 宁缺勿扰:仅当工作区存在 `rust/crates` 布局、且目标为 `.rs`/`.toml`
+    /// 且归一化后确实位于其下方时才触发;无 workspace_root(纯单测)返回 `None`。
+    fn maybe_hot_upgrade_note(&self, input: &str) -> Option<String> {
+        let root = self.workspace_root.as_ref()?;
+        // 仅当工作区具备 claw 源码布局(根下 rust/crates)时才判定,避免误伤
+        // 其他 Rust 仓库。
+        if !root.join("rust").join("crates").is_dir() {
+            return None;
+        }
+        let parsed: serde_json::Value = serde_json::from_str(input).ok()?;
+        let target = parsed
+            .get("path")
+            .or_else(|| parsed.get("file_path"))
+            .and_then(|v| v.as_str())?;
+        if !(target.ends_with(".rs") || target.ends_with(".toml")) {
+            return None;
+        }
+        // 跨平台归一化(兼容 / 与 \,忽略 ./,Windows 忽略大小写),与
+        // `maybe_plan_scope_warning` 同法。
+        let norm = |s: &std::path::Path| {
+            s.components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let p = std::path::Path::new(target);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        };
+        let abs_norm = norm(&abs);
+        let root_norm = norm(root.as_path());
+        // 必须落在工作区内(带 / 边界,避免 /a/b 误匹配 /a/bc)。
+        if !abs_norm.starts_with(&format!("{root_norm}/")) || !abs_norm.contains("/rust/crates/") {
+            return None;
+        }
+        Some(format!(
+            "[hot-upgrade] 目标文件 `{target}` 属于 claw 自身源码。磁盘改动不会作用于\
+             **当前运行进程** —— 如需本次修改在当前会话生效,请在本 turn 结束后调用 \
+             `HotUpgrade` 工具(进程将重建并重启,自动恢复本会话继续任务)。"
+        ))
+    }
+
     /// 是否启用了 Plan 模式。
     #[must_use]
     pub fn plan_mode_enabled(&self) -> bool {
@@ -5486,6 +5544,12 @@ where
                             )
                         {
                             if let Some(hint) = self.maybe_plan_scope_warning(&effective_input) {
+                                output_to_store = format!("{output_to_store}\n\n{hint}");
+                            }
+                            // 热升级提醒(根因修复):目标为 claw 自身源码时提示
+                            // 磁盘改动不入当前进程,需 HotUpgrade 才生效。与 F5
+                            // 同通道,同一 tool_result 末尾追加。
+                            if let Some(hint) = self.maybe_hot_upgrade_note(&effective_input) {
                                 output_to_store = format!("{output_to_store}\n\n{hint}");
                             }
                         }
@@ -22229,6 +22293,66 @@ mod tests {
         // 无 active plan → 绝不出警告。
         assert!(runtime
             .maybe_plan_scope_warning(r#"{"path": "src/x.rs"}"#)
+            .is_none());
+    }
+
+    // ===== 热升级提醒(根因修复:HotUpgrade 从未被触发)=====
+
+    /// 建一个带 claw 源码布局(rust/crates/)的临时工作区 runtime。
+    fn runtime_with_claw_layout() -> (ConversationRuntime<NoopApi, StaticToolExecutor>, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().expect("temp workspace");
+        std::fs::create_dir_all(tempdir.path().join("rust").join("crates")).expect("mkdir");
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_workspace_root(tempdir.path().to_path_buf());
+        (runtime, tempdir)
+    }
+
+    /// 改动 claw 自身源码(工作区内 rust/crates 下的 .rs)→ 触发热升级提醒。
+    #[test]
+    fn hot_upgrade_note_fires_for_own_source() {
+        let (runtime, _tmp) = runtime_with_claw_layout();
+        let hint = runtime.maybe_hot_upgrade_note(r#"{"path": "rust/crates/runtime/src/a.rs"}"#);
+        let hint = hint.expect("自身源码应触发热升级提醒");
+        assert!(hint.contains("[hot-upgrade]"), "应带标记: {hint}");
+        assert!(hint.contains("HotUpgrade"), "应点名 HotUpgrade 工具: {hint}");
+    }
+
+    /// 非源码文件(如 .md)不触发 —— 避免误扰。
+    #[test]
+    fn hot_upgrade_note_silent_for_non_source() {
+        let (runtime, _tmp) = runtime_with_claw_layout();
+        assert!(runtime
+            .maybe_hot_upgrade_note(r#"{"path": "rust/crates/runtime/README.md"}"#)
+            .is_none());
+    }
+
+    /// 工作区内的普通 Rust 文件(不在 rust/crates 下)不触发 —— 只针对自身源码。
+    #[test]
+    fn hot_upgrade_note_silent_outside_crates() {
+        let (runtime, _tmp) = runtime_with_claw_layout();
+        assert!(runtime
+            .maybe_hot_upgrade_note(r#"{"path": "examples/demo.rs"}"#)
+            .is_none());
+    }
+
+    /// 无 workspace_root(如纯单测)→ 静默,不得 panic。
+    #[test]
+    fn hot_upgrade_note_silent_without_workspace_root() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        assert!(runtime
+            .maybe_hot_upgrade_note(r#"{"path": "rust/crates/runtime/src/a.rs"}"#)
             .is_none());
     }
 
