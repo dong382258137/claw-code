@@ -110,6 +110,9 @@ def eval_one(
     try:
         solve = run_claw(claw_bin, str(wt), task["prompt"], args.task_timeout, args.claw_arg)
         result["solve"] = {k: solve[k] for k in ("exit", "timeout", "seconds")}
+        # 始终保留 solve 输出尾部:超时任务(agent 完成修复却未自行退出)的根因证据
+        # 只能从这里取 —— 否则只见 timeout=True 而无从判断是"预算不足"还是"收尾挂起"。
+        result["solve"]["output_tail"] = solve["output_tail"]
         # 判分口径与任务校验**必须一致**:任务集是拿 `--own-tests`(只跑任务自身回归
         # 测试函数)校验的;若这里用整 crate `cargo test -p <crate>`,无关 flaky 测试
         # (需 Chromium/网络/计时/环境锁)会污染判分 → 假阴性(实测 runtime-607e2c11 /
