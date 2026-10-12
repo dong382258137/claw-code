@@ -282,13 +282,28 @@ pub const GIT_FINGERPRINT: &str = match option_env!("GIT_FINGERPRINT") {
     Some(f) => f,
     None => "",
 };
-/// 状态栏展示的版本标签:`v<VERSION>+<指纹>`;无指纹时降级为 `v<VERSION>`。
+/// 构建时刻(build.rs 注入,`MMDD-HHMM`,分钟精度)。
+///
+/// 为何需要它:`GIT_FINGERPRINT` 对**相同源码内容**是确定性的(干净树=git sha,
+/// 脏树=内容哈希)⇒ 若热升级未改变源码内容(重部署/重启/无新提交),重建后指纹
+/// 与版本号**完全相同**,用户仍无法确认新二进制是否接管 —— 恰是该机制本要
+/// 解决的问题。注入构建时刻后,每次重编译都产生可区分的标签。
+/// `SOURCE_DATE_EPOCH` 存在时由 build.rs 取该值(保可复现构建)。
+pub const BUILD_TIME: &str = match option_env!("BUILD_TIME") {
+    Some(t) => t,
+    None => "",
+};
+/// 状态栏展示的版本标签:`v<VERSION>+<指纹>@<构建时刻>`。
+///
+/// 降级:无指纹时用 `v<VERSION>@<时刻>`;无时刻时退回 `v<VERSION>+<指纹>`;
+/// 两者皆无 → `v<VERSION>`。
 #[must_use]
 pub fn version_label() -> String {
-    if GIT_FINGERPRINT.is_empty() {
-        format!("v{VERSION}")
-    } else {
-        format!("v{VERSION}+{GIT_FINGERPRINT}")
+    match (GIT_FINGERPRINT.is_empty(), BUILD_TIME.is_empty()) {
+        (false, false) => format!("v{VERSION}+{GIT_FINGERPRINT}@{BUILD_TIME}"),
+        (false, true) => format!("v{VERSION}+{GIT_FINGERPRINT}"),
+        (true, false) => format!("v{VERSION}@{BUILD_TIME}"),
+        (true, true) => format!("v{VERSION}"),
     }
 }
 pub const BUILD_TARGET: Option<&str> = option_env!("TARGET");

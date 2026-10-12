@@ -58,6 +58,23 @@ fn main() {
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
+    // Build time stamp (minute precision). Injected so that **every rebuild**
+    // yields a distinguishable version label: VERSION (Cargo.toml) is constant
+    // across hot upgrades, and GIT_FINGERPRINT is deterministic for identical
+    // source content (clean tree = git sha; dirty = content hash). Hence a
+    // rebuild that does not change source content (hot-upgrade re-deploy /
+    // restart / no new commit) previously showed an unchanged label — the very
+    // situation the fingerprint was added to disambiguate. Minute-precision
+    // time makes each build observable while staying short for the status bar.
+    // Reproducible builds: honour `SOURCE_DATE_EPOCH` (same override as above).
+    let build_time = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|epoch| epoch.parse::<i64>().ok())
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map(|dt| dt.format("%m%d-%H%M").to_string())
+        .unwrap_or_else(|| chrono::Local::now().format("%m%d-%H%M").to_string());
+    println!("cargo:rustc-env=BUILD_TIME={build_time}");
+
     // 部署 builtin skills 到 target/<profile>/skills/
     //
     // 背景:claw 二进制通过 `discover_skill_roots` 搜索 skill,其中一条路径

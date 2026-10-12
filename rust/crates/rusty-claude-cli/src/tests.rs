@@ -814,16 +814,23 @@ fn parses_version_flags_without_initializing_prompt_mode() {
 
 #[test]
 fn version_label_carries_build_fingerprint_shape() {
-    // 守护:状态栏版本标签必须形如 `v<version>` 或 `v<version>+<指纹>`。
+    // 守护:状态栏版本标签必须形如 `v<version>` / `v<version>+<指纹>` /
+    // `v<version>+<指纹>@<时刻>` / `v<version>@<时刻>`。
     // 回归背景 —— 版本号是编译期常量,热升级只重编译不改 Cargo.toml,
     // 若标签退回纯版本号(或指纹恒空),升级后状态栏不再变化,用户无法
     // 确认新二进制是否接管(2026-09-17 实测 `v2026.9.17 → v2026.9.17`)。
+    // 二次回归(2026-10-13):指纹对**相同源码内容**是确定性的 ⇒ 内容未变的
+    // 热升级重建仍显示相同标签;故纳入构建时刻 BUILD_TIME 使其可区分。
     let label = crate::version_label();
-    let expected = if crate::GIT_FINGERPRINT.is_empty() {
-        format!("v{}", crate::VERSION)
-    } else {
-        format!("v{}+{}", crate::VERSION, crate::GIT_FINGERPRINT)
-    };
+    let mut expected = format!("v{}", crate::VERSION);
+    if !crate::GIT_FINGERPRINT.is_empty() {
+        expected.push('+');
+        expected.push_str(crate::GIT_FINGERPRINT);
+    }
+    if !crate::BUILD_TIME.is_empty() {
+        expected.push('@');
+        expected.push_str(crate::BUILD_TIME);
+    }
     assert_eq!(label, expected);
     assert!(label.starts_with(&format!("v{}", crate::VERSION)));
     // 指纹非空时必须是 7 位小写十六进制(build.rs 的 `{:07x}` 约定)。
@@ -831,6 +838,12 @@ fn version_label_carries_build_fingerprint_shape() {
     assert!(
         fp.is_empty() || (fp.len() == 7 && fp.chars().all(|c| c.is_ascii_hexdigit())),
         "unexpected fingerprint format: {fp:?}"
+    );
+    // 构建时刻非空时必须形如 `MMDD-HHMM`(分钟精度,长度 9)。
+    let bt = crate::BUILD_TIME;
+    assert!(
+        bt.is_empty() || bt.len() == 9,
+        "unexpected build-time format: {bt:?}"
     );
 }
 
