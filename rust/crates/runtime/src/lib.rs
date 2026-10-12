@@ -155,6 +155,9 @@ pub mod evolution_gate;
 // 进化运行器(P3):把 inbox 提案转为进化子智能体的可执行任务(纯逻辑)。
 // 详见 evolution_runner.rs。
 pub mod evolution_runner;
+// 进化文件锁(P4):防多实例并发 build/部署竞争(无依赖,create_new 原子锁)。
+// 详见 evolution_lock.rs。
+pub mod evolution_lock;
 pub mod trace_analyzer;
 // Harness O(可观测性)层:FailureTrace — tool 调用级失败点定位(阶段 1)。
 // 把 TraceAnalyzer 的 turn 级 failure_kind 降粒度到工具调用序列,标记 is_error

@@ -1047,6 +1047,17 @@ fn run_evolve_source(
                     "未登记源码根:请先设置 CLAW_SOURCE_ROOT 或在源码树内运行一次热升级".into(),
                 );
             };
+            // P4: 获取进化锁,防多实例并发 cargo build / exe 覆盖竞争。
+            let _lock = match runtime::evolution_lock::EvolutionLock::acquire(&source_root)? {
+                Some(l) => l,
+                None => {
+                    return Err(
+                        "另一个进化会话正在运行(进化锁被持有);请等待其结束或删除 \
+                         <源码根>/.claw/evolution/.lock"
+                            .into(),
+                    )
+                }
+            };
             // 目标:优先指定提案文件,否则取 inbox 第一条待处理。
             let proposal_path = match target {
                 Some(t) => PathBuf::from(t),
