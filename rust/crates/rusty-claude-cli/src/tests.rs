@@ -1440,6 +1440,51 @@ fn harness_subcommand_parses_list_stats_rollback_evolve() {
 }
 
 #[test]
+fn evolve_source_subcommand_parses_list_process_show() {
+    // 默认(list)
+    assert_eq!(
+        parse_args(&["evolve-source".to_string()]).expect("bare evolve-source should parse"),
+        CliAction::EvolveSource {
+            action: None,
+            target: None,
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    // list
+    assert_eq!(
+        parse_args(&["evolve-source".to_string(), "list".to_string()]).expect("list should parse"),
+        CliAction::EvolveSource {
+            action: Some("list".to_string()),
+            target: None,
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    // show <file>
+    assert_eq!(
+        parse_args(&[
+            "evolve-source".to_string(),
+            "show".to_string(),
+            "proposal.md".to_string(),
+        ])
+        .expect("show should parse"),
+        CliAction::EvolveSource {
+            action: Some("show".to_string()),
+            target: Some("proposal.md".to_string()),
+            output_format: CliOutputFormat::Text,
+        }
+    );
+    // 多余参数应被拒绝
+    let extra = parse_args(&[
+        "evolve-source".to_string(),
+        "show".to_string(),
+        "a.md".to_string(),
+        "extra".to_string(),
+    ])
+    .expect_err("extra args should be rejected");
+    assert!(extra.contains("unexpected extra arguments"), "got: {extra}");
+}
+
+#[test]
 fn local_command_help_flags_stay_on_the_local_parser_path() {
     assert_eq!(
         parse_args(&["status".to_string(), "--help".to_string()])

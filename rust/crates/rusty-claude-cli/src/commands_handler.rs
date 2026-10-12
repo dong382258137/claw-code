@@ -179,6 +179,16 @@ pub(crate) enum CliAction {
         topic: LocalHelpTopic,
         output_format: CliOutputFormat,
     },
+    /// `claw evolve-source`:扫描源码根的 evolution inbox(P2 元认知闭环)。
+    ///
+    /// - `list`(默认):列出待处理提案(`.claw/evolution/inbox/*.md`)
+    /// - `process`:把自 `--since <id>` 之后的提案标记为已处理(移入 `processed/`)
+    /// - `show <file>`:打印指定提案内容
+    EvolveSource {
+        action: Option<String>,
+        target: Option<String>,
+        output_format: CliOutputFormat,
+    },
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
         output_format: CliOutputFormat,
@@ -647,6 +657,26 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             Ok(CliAction::Config {
                 section,
+                output_format,
+            })
+        }
+        // P2 元认知闭环: `claw evolve-source` — 扫描源码根 evolution inbox。
+        // 与既有 `claw harness evolve`(进化 prompt 规则)区分:本命令面向
+        // **源码级**提案(见 docs/2026-10-11-metacognitive-evolution-design.md §8)。
+        "evolve-source" => {
+            let tail = &rest[1..];
+            let action = tail.first().cloned();
+            let target = tail.get(1).cloned();
+            if tail.len() > 2 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw evolve-source {}`: {}",
+                    tail[..2].join(" "),
+                    tail[2..].join(" ")
+                ));
+            }
+            Ok(CliAction::EvolveSource {
+                action,
+                target,
                 output_format,
             })
         }

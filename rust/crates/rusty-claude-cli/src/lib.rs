@@ -789,6 +789,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             subcommand,
             output_format,
         } => run_harness_command(subcommand, output_format)?,
+        CliAction::EvolveSource {
+            action,
+            target,
+            output_format,
+        } => run_evolve_source(action.as_deref(), target.as_deref(), output_format)?,
         CliAction::HelpTopic {
             topic,
             output_format,
@@ -946,7 +951,98 @@ fn run_harness_command(
     Ok(())
 }
 
-/// text 模式渲染 harness edits 列表。
+/// `claw evolve-source` 实现(P2 元认知闭环)。
+///
+/// 扫描源码根的 evolution inbox(见 `runtime::evolution_inbox`),操作:
+/// - `list`(默认):列出待处理提案
+/// - `process`:把提案标记为已处理(移入 `processed/`)
+/// - `show <file>`:打印指定提案内容
+fn run_evolve_source(
+    action: Option<&str>,
+    target: Option<&str>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let inbox = runtime::evolution_inbox::resolve_inbox_dir(&cwd);
+    let action = action.unwrap_or("list");
+    match action {
+        "list" => {
+            let pending = runtime::evolution_inbox::list_pending(&inbox);
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("evolution inbox: {}", inbox.display());
+                    if pending.is_empty() {
+                        println!("(无待处理提案)");
+                    } else {
+                        for p in &pending {
+                            println!("  - {}", p.display());
+                        }
+                        println!("共 {} 条待处理。", pending.len());
+                    }
+                }
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "inbox": inbox.display().to_string(),
+                        "pending_count": pending.len(),
+                        "pending": pending.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    }))?
+                ),
+            }
+        }
+        "process" => {
+            let pending = runtime::evolution_inbox::list_pending(&inbox);
+            let mut moved = Vec::new();
+            for p in &pending {
+                if let Some(dst) =
+                    runtime::evolution_inbox::mark_processed(&inbox, p)?
+                {
+                    moved.push(dst.display().to_string());
+                }
+            }
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("已处理 {} 条提案 → {}", moved.len(), inbox.join("processed").display());
+                }
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "processed_count": moved.len(),
+                        "processed": moved,
+                    }))?
+                ),
+            }
+        }
+        "show" => {
+            let Some(target) = target else {
+                return Err("`claw evolve-source show` requires a proposal file path".into());
+            };
+            let path = PathBuf::from(target);
+            let body = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            match output_format {
+                CliOutputFormat::Text => println!("{body}"),
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "path": path.display().to_string(),
+                        "content": body,
+                    }))?
+                ),
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown evolve-source action `{other}`; expected list | process | show"
+            )
+            .into())
+        }
+    }
+    Ok(())
+}
 fn print_harness_edits_text(edits: &[runtime::harness_evolution::HarnessEdit]) {
     if edits.is_empty() {
         println!("no harness edits");
