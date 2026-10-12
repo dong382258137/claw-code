@@ -293,16 +293,20 @@ pub const BUILD_TIME: &str = match option_env!("BUILD_TIME") {
     Some(t) => t,
     None => "",
 };
-/// 状态栏展示的版本标签:`v<VERSION>+<指纹>@<构建时刻>`。
+/// 状态栏展示的**构建标签**:`<指纹>@<构建时刻>`。
 ///
-/// 降级:无指纹时用 `v<VERSION>@<时刻>`;无时刻时退回 `v<VERSION>+<指纹>`;
-/// 两者皆无 → `v<VERSION>`。
+/// 不再包含 `VERSION`(即 `Cargo.toml` 里手写的 `2026.10.5`):该常量形如日期
+/// 却**不随构建变化**,在热升级场景下既误导人又无区分度,故从展示中移除。
+/// 真正能区分新旧二进制的是构建指纹 + 构建时刻 —— 二者随每次重编译更新。
+/// 版本号本身仍可通过 `claw --version` / `claw doctor`(直接读 `VERSION`)获取。
+///
+/// 降级:无指纹时用 `@<时刻>`;无时刻时用 `<指纹>`;两者皆无 → `v<VERSION>`(最后兜底)。
 #[must_use]
 pub fn version_label() -> String {
     match (GIT_FINGERPRINT.is_empty(), BUILD_TIME.is_empty()) {
-        (false, false) => format!("v{VERSION}+{GIT_FINGERPRINT}@{BUILD_TIME}"),
-        (false, true) => format!("v{VERSION}+{GIT_FINGERPRINT}"),
-        (true, false) => format!("v{VERSION}@{BUILD_TIME}"),
+        (false, false) => format!("{GIT_FINGERPRINT}@{BUILD_TIME}"),
+        (false, true) => GIT_FINGERPRINT.to_string(),
+        (true, false) => format!("@{BUILD_TIME}"),
         (true, true) => format!("v{VERSION}"),
     }
 }
