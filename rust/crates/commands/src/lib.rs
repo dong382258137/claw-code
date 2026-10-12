@@ -3744,6 +3744,96 @@ fn load_agents_from_roots(
     Ok(agents)
 }
 
+/// Load `.claw/agents/*.md` sub-agent definitions (Claude Code 生态格式)。
+///
+/// 文件格式:YAML frontmatter 携带 `name`,正文为该系统提示词的角色专属指令。
+/// 返回 `(name, instructions)` 列表;按 name 大小写不敏感去重(先出现的 root
+/// 优先,与 skills 的 shadow 规则一致)。
+///
+/// 与 [`load_agents_from_roots`](`.toml`,仅元数据、供 `/agents list` 展示)
+/// 互补:本函数提供**可执行的系统提示词正文**,供子智能体派发路径按 type 名
+/// 注入 —— 使 `.claw/agents/Explore.md` 之类的文件能覆盖内置角色提示词。
+pub fn load_agent_instructions(cwd: &Path) -> Vec<(String, String)> {
+    let roots = discover_definition_roots(cwd, "agents");
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen = BTreeMap::<String, ()>::new();
+    for (_source, root) in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let fallback = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let (name, body) = parse_agent_markdown(&contents, &fallback);
+            if name.is_empty() || body.trim().is_empty() {
+                continue;
+            }
+            let key = name.to_ascii_lowercase();
+            if seen.contains_key(&key) {
+                continue;
+            }
+            seen.insert(key, ());
+            out.push((name, body));
+        }
+    }
+    out
+}
+
+/// 解析子智能体 Markdown 定义:返回 `(name, body)`。
+///
+/// frontmatter(`---` 包裹)中的 `name:` 决定名字;`---` 之后全部内容为正文
+/// (即注入的系统提示词片段)。无 frontmatter 时用文件名作名字、全文为正文。
+fn parse_agent_markdown(contents: &str, fallback_name: &str) -> (String, String) {
+    if !contents.trim_start().starts_with("---") {
+        return (fallback_name.to_string(), contents.to_string());
+    }
+    let mut name = None;
+    let mut in_frontmatter = true;
+    let mut body = String::new();
+    for line in contents.lines().skip(1) {
+        if in_frontmatter {
+            if line.trim() == "---" {
+                in_frontmatter = false;
+                continue;
+            }
+            if let Some(value) = line.trim().strip_prefix("name:") {
+                let value = unquote_frontmatter_value(value.trim());
+                if !value.is_empty() {
+                    name = Some(value);
+                }
+            }
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    let name = name.unwrap_or_else(|| fallback_name.to_string());
+    (name, body)
+}
+
+/// 按 type 名(大小写不敏感)查找 `.claw/agents/*.md` 定义的正文。
+///
+/// 便捷封装:子智能体派发路径只需按 `subagent_type` 取角色专属指令。
+pub fn agent_instructions_for(cwd: &Path, subagent_type: &str) -> Option<String> {
+    let target = subagent_type.trim();
+    if target.is_empty() {
+        return None;
+    }
+    load_agent_instructions(cwd)
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(target))
+        .map(|(_, body)| body)
+}
+
 pub fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
     let mut skills = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
@@ -4795,14 +4885,15 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_skills_slash_command, handle_agents_slash_command_json,
+        agent_instructions_for, classify_skills_slash_command, handle_agents_slash_command_json,
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
-        load_agents_from_roots, load_skills_from_roots, render_agents_report,
-        render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
-        render_plugins_report_with_failures, render_skills_report, render_slash_command_help,
-        render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        slash_command_specs, suggest_slash_commands, validate_slash_command_input,
-        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
+        load_agent_instructions, load_agents_from_roots, load_skills_from_roots,
+        render_agents_report, render_agents_report_json, render_mcp_report_json_for,
+        render_plugins_report, render_plugins_report_with_failures, render_skills_report,
+        render_slash_command_help, render_slash_command_help_detail, resolve_skill_path,
+        resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
+        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
+        SlashCommand,
     };
     use plugins::{
         PluginError, PluginKind, PluginLifecycle, PluginLoadFailure, PluginManager,
@@ -5832,6 +5923,39 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(user_home);
+    }
+
+    #[test]
+    fn loads_agent_markdown_instructions_by_type_name() {
+        let workspace = temp_dir("agent-instructions");
+        let agents_dir = workspace.join(".claw").join("agents");
+        fs::create_dir_all(&agents_dir).expect("create agents dir");
+        fs::write(
+            agents_dir.join("Explore.md"),
+            "---\nname: Explore\ndescription: fast search\n---\nYou are a fast search agent.\nKeep reports short.\n",
+        )
+        .expect("write explore agent");
+        // 无 frontmatter:文件名作 name,全文为正文。
+        fs::write(
+            agents_dir.join("Verifier.md"),
+            "Verify everything with a command.\n",
+        )
+        .expect("write verifier agent");
+
+        let loaded = load_agent_instructions(&workspace);
+        assert!(loaded.iter().any(|(n, b)| n == "Explore"
+            && b.contains("You are a fast search agent.")
+            && b.contains("Keep reports short.")));
+        assert!(loaded
+            .iter()
+            .any(|(n, b)| n == "Verifier" && b.contains("Verify everything")));
+
+        // 大小写不敏感查找 + 缺失返回 None。
+        let found = agent_instructions_for(&workspace, "explore").expect("case-insensitive hit");
+        assert!(found.contains("Keep reports short."));
+        assert!(agent_instructions_for(&workspace, "nonexistent").is_none());
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]

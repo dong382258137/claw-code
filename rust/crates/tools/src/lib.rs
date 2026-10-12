@@ -2439,7 +2439,8 @@ fn run_report_framework_gap(input: FrameworkGapInput) -> Result<String, String> 
     if input.evidence.is_empty() {
         // 诚实性红线:证据必须是可执行判据,不是"感觉"。
         return Err(
-            "evidence 不能为空:请提供可执行/可复现判据(文件:行号 / 命令输出 / 指标数值)".to_string(),
+            "evidence 不能为空:请提供可执行/可复现判据(文件:行号 / 命令输出 / 指标数值)"
+                .to_string(),
         );
     }
     let cwd = std::env::current_dir().map_err(|e| format!("读取 cwd 失败: {e}"))?;
@@ -2456,7 +2457,8 @@ fn run_report_framework_gap(input: FrameworkGapInput) -> Result<String, String> 
         suggestion: input.suggestion,
         acceptance: input.acceptance,
         source_cwd: cwd.display().to_string(),
-        source_session: std::env::var("CLAW_SESSION_ID").unwrap_or_else(|_| "(unknown)".to_string()),
+        source_session: std::env::var("CLAW_SESSION_ID")
+            .unwrap_or_else(|_| "(unknown)".to_string()),
     };
     let path = runtime::evolution_inbox::archive_gap(&cwd, &gap, now_ms)?;
     to_pretty_json(json!({
@@ -6386,6 +6388,14 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
     prompt.push(format!(
         "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
+    // 文件化角色提示词:.claw/agents/<type>.md(frontmatter 后正文)按 type 名
+    // 注入 —— 让使用者无需改代码即可为某类子智能体定制系统提示词。文件是
+    // 静态内容,同一 type 的所有子智能体注入相同字节,不破坏前缀缓存。
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(custom) = commands::agent_instructions_for(&cwd, subagent_type) {
+            prompt.push(custom);
+        }
+    }
     if subagent_type == "Explore" {
         // 借鉴 Trae search 子智能体策略:搜索 agent 是快速 agent,追求吞吐与低 token 浪费。
         prompt.push(
