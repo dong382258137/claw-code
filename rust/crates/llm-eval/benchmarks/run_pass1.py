@@ -99,6 +99,26 @@ def run_claw(
     }
 
 
+def _preserve_telemetry(wt: Path, task_id: str, dest_dir: str) -> None:
+    """把 worktree 内的 telemetry 拷到 dest_dir(删 worktree 前必须做)。
+
+    M1(TTFT)/M3(迭代数)的权威来源是 worktree 内 `<wt>/rust/.claw/telemetry.jsonl`
+    (`assistant_iteration_completed` 计数 = M3;`turn_completed.latency_ms` = M2)。
+    该文件在 `git worktree remove` 时随 `.claw/` 一起被删,故先拷出。
+    """
+    src = wt / "rust" / ".claw" / "telemetry.jsonl"
+    if not src.exists():
+        return
+    try:
+        dest = Path(gt.normalize_path(dest_dir))
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / f"{task_id}.telemetry.jsonl").write_text(
+            src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001
+        pass  # 留存是观测增强,失败不应破坏评测
+
+
 def eval_one(
     claw_bin: str, repo: str, task: dict, work_root: Path, args: argparse.Namespace
 ) -> dict:
@@ -138,6 +158,10 @@ def eval_one(
         )
         if not result["resolved"]:
             result["accept_tail"] = out[-1500:]
+        # 留存本任务的 telemetry(否则随 worktree 删除而丢失):M1/M3 的权威来源
+        # (`assistant_iteration_completed` 计数 = M3 迭代数;`turn_completed.latency_ms`
+        # = M2)。worktree 清理会连 `<wt>/rust/.claw/` 一起删,故必须先拷出。
+        _preserve_telemetry(wt, task_id, args.telemetry_dir)
     finally:
         if args.keep:
             result["worktree"] = str(wt)
@@ -171,6 +195,11 @@ def main() -> int:
     ap.add_argument("--claw-arg", action="append", default=None,
                     help="透传给 claw 的 flag(置于 -p 之前);可重复")
     ap.add_argument("--keep", action="store_true", help="保留 worktree 供排查")
+    ap.add_argument(
+        "--telemetry-dir",
+        default=".gt-run/telemetry",
+        help="留存每任务 telemetry 的目录(删 worktree 前拷出;M1/M3 权威来源)",
+    )
     ap.add_argument(
         "--own-tests",
         dest="own_tests",
