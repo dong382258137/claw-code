@@ -4424,9 +4424,15 @@ where
                     }
                 }
                 // 站5/3/4:项目快照段(git status/commits、MCP 目录)注入
-                // messages 尾部。turn 内字节稳定(构造时捕获一次),跨 turn
-                // 变化只影响最后一条请求消息,不破坏前缀缓存(字段注释有
-                // 完整归因)。不持久化到 session,历史请求的旧快照不堆积。
+                // messages 尾部。该段走尾部注入通道、不参与 system 前缀缓存,
+                // 故**每迭代**用实时 git 状态重渲染(而非仅 turn 起始捕获一次):
+                // 否则 agent 在本 turn 内编辑文件后,注入的 git 快照仍停留于
+                // turn 起始时刻,与之矛盾的实测结果会诱使 agent 花轮次"证伪"
+                // 陈旧快照(实测 3/7 慢任务因此损耗迭代)。逐次重渲染无缓存
+                // 代价(git status ~tens of ms,相对单次推理秒级可忽略);无变更
+                // 时重渲染字节一致,不引入抖动。不持久化到 session,历史请求的
+                // 旧快照不堆积。
+                self.refresh_project_context_section();
                 for section in &self.message_injected_sections {
                     messages.push(ConversationMessage::user_text(section.clone()));
                 }
