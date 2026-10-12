@@ -3753,9 +3753,19 @@ fn load_agents_from_roots(
 /// 与 [`load_agents_from_roots`](`.toml`,仅元数据、供 `/agents list` 展示)
 /// 互补:本函数提供**可执行的系统提示词正文**,供子智能体派发路径按 type 名
 /// 注入 —— 使 `.claw/agents/Explore.md` 之类的文件能覆盖内置角色提示词。
-pub fn load_agent_instructions(cwd: &Path) -> Vec<(String, String)> {
+/// Load `.claw/agents/*.md` sub-agent definitions (Claude Code 生态格式)。
+///
+/// 文件格式:YAML frontmatter 携带 `name`(可选 `tools:` 覆盖工具白名单),正文
+/// 为该系统提示词的角色专属指令。返回 `(name, instructions, tools)` 列表;按
+/// name 大小写不敏感去重(先出现的 root 优先,与 skills 的 shadow 规则一致)。
+///
+/// 与 [`load_agents_from_roots`](`.toml`,仅元数据、供 `/agents list` 展示)
+/// 互补:本函数提供**可执行的系统提示词正文与工具白名单**,供子智能体派发
+/// 路径按 type 名注入 —— 使 `.claw/agents/Explore.md` 之类的文件能覆盖内置
+/// 角色提示词与工具集。
+pub fn load_agent_definitions(cwd: &Path) -> Vec<(String, String, Vec<String>)> {
     let roots = discover_definition_roots(cwd, "agents");
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<(String, String, Vec<String>)> = Vec::new();
     let mut seen = BTreeMap::<String, ()>::new();
     for (_source, root) in roots {
         let Ok(entries) = fs::read_dir(&root) else {
@@ -3773,7 +3783,7 @@ pub fn load_agent_instructions(cwd: &Path) -> Vec<(String, String)> {
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let (name, body) = parse_agent_markdown(&contents, &fallback);
+            let (name, body, tools) = parse_agent_markdown(&contents, &fallback);
             if name.is_empty() || body.trim().is_empty() {
                 continue;
             }
@@ -3782,33 +3792,71 @@ pub fn load_agent_instructions(cwd: &Path) -> Vec<(String, String)> {
                 continue;
             }
             seen.insert(key, ());
-            out.push((name, body));
+            out.push((name, body, tools));
         }
     }
     out
 }
 
-/// 解析子智能体 Markdown 定义:返回 `(name, body)`。
+/// 仅取 `(name, instructions)` 的便捷视图(向后兼容第一批 API)。
+pub fn load_agent_instructions(cwd: &Path) -> Vec<(String, String)> {
+    load_agent_definitions(cwd)
+        .into_iter()
+        .map(|(name, body, _)| (name, body))
+        .collect()
+}
+
+/// 解析子智能体 Markdown 定义:返回 `(name, body, tools)`。
 ///
-/// frontmatter(`---` 包裹)中的 `name:` 决定名字;`---` 之后全部内容为正文
-/// (即注入的系统提示词片段)。无 frontmatter 时用文件名作名字、全文为正文。
-fn parse_agent_markdown(contents: &str, fallback_name: &str) -> (String, String) {
+/// frontmatter(`---` 包裹)中的 `name:` 决定名字、`tools:` 给出工具白名单覆盖
+/// (支持 `tools: a, b` 逗号分隔与 YAML 块列表两种写法);`---` 之后全部内容为
+/// 正文(即注入的系统提示词片段)。无 frontmatter 时用文件名作名字、全文为
+/// 正文、无工具覆盖。
+fn parse_agent_markdown(contents: &str, fallback_name: &str) -> (String, String, Vec<String>) {
     if !contents.trim_start().starts_with("---") {
-        return (fallback_name.to_string(), contents.to_string());
+        return (fallback_name.to_string(), contents.to_string(), Vec::new());
     }
     let mut name = None;
+    let mut tools: Vec<String> = Vec::new();
     let mut in_frontmatter = true;
+    let mut in_tools_block = false;
     let mut body = String::new();
     for line in contents.lines().skip(1) {
         if in_frontmatter {
-            if line.trim() == "---" {
+            let trimmed = line.trim();
+            if trimmed == "---" {
                 in_frontmatter = false;
                 continue;
             }
-            if let Some(value) = line.trim().strip_prefix("name:") {
+            if in_tools_block {
+                if let Some(item) = trimmed.strip_prefix('-') {
+                    let value = unquote_frontmatter_value(item.trim());
+                    if !value.is_empty() {
+                        tools.push(value);
+                    }
+                    continue;
+                }
+                in_tools_block = false;
+            }
+            if let Some(value) = trimmed.strip_prefix("name:") {
                 let value = unquote_frontmatter_value(value.trim());
                 if !value.is_empty() {
                     name = Some(value);
+                }
+                continue;
+            }
+            if let Some(value) = trimmed.strip_prefix("tools:") {
+                let value = value.trim();
+                if value.is_empty() {
+                    // `tools:` 后无内联值 ⇒ 后续缩进的 `- item` 行为块列表。
+                    in_tools_block = true;
+                } else {
+                    for part in value.split(',') {
+                        let item = unquote_frontmatter_value(part.trim());
+                        if !item.is_empty() {
+                            tools.push(item);
+                        }
+                    }
                 }
             }
         } else {
@@ -3817,21 +3865,40 @@ fn parse_agent_markdown(contents: &str, fallback_name: &str) -> (String, String)
         }
     }
     let name = name.unwrap_or_else(|| fallback_name.to_string());
-    (name, body)
+    (name, body, tools)
 }
 
 /// 按 type 名(大小写不敏感)查找 `.claw/agents/*.md` 定义的正文。
 ///
 /// 便捷封装:子智能体派发路径只需按 `subagent_type` 取角色专属指令。
 pub fn agent_instructions_for(cwd: &Path, subagent_type: &str) -> Option<String> {
+    agent_definition_for(cwd, subagent_type).map(|(_, body, _)| body)
+}
+
+/// 按 type 名(大小写不敏感)查找 `.claw/agents/*.md` 定义的工具白名单覆盖。
+///
+/// 返回 `None` 表示该 type 无文件化定义或定义未声明 `tools:` —— 调用方应回退
+/// 到内置默认白名单。返回空 `Vec` 是**显式**含义(声明了 `tools:` 但为空 ⇒
+/// 无工具),与 `None`(未声明)区分。
+pub fn agent_tools_for(cwd: &Path, subagent_type: &str) -> Option<Vec<String>> {
+    agent_definition_for(cwd, subagent_type).and_then(|(_, _, tools)| {
+        if tools.is_empty() {
+            None
+        } else {
+            Some(tools)
+        }
+    })
+}
+
+/// 按 type 名查找首个匹配的文件化定义(名字/正文/工具覆盖)。
+fn agent_definition_for(cwd: &Path, subagent_type: &str) -> Option<(String, String, Vec<String>)> {
     let target = subagent_type.trim();
     if target.is_empty() {
         return None;
     }
-    load_agent_instructions(cwd)
+    load_agent_definitions(cwd)
         .into_iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(target))
-        .map(|(_, body)| body)
+        .find(|(name, _, _)| name.eq_ignore_ascii_case(target))
 }
 
 pub fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
@@ -4885,8 +4952,9 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_instructions_for, classify_skills_slash_command, handle_agents_slash_command_json,
-        handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
+        agent_instructions_for, agent_tools_for, classify_skills_slash_command,
+        handle_agents_slash_command_json, handle_plugins_slash_command,
+        handle_skills_slash_command_json, handle_slash_command, load_agent_definitions,
         load_agent_instructions, load_agents_from_roots, load_skills_from_roots,
         render_agents_report, render_agents_report_json, render_mcp_report_json_for,
         render_plugins_report, render_plugins_report_with_failures, render_skills_report,
@@ -5954,6 +6022,49 @@ mod tests {
         let found = agent_instructions_for(&workspace, "explore").expect("case-insensitive hit");
         assert!(found.contains("Keep reports short."));
         assert!(agent_instructions_for(&workspace, "nonexistent").is_none());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn parses_agent_tools_override_from_frontmatter() {
+        let workspace = temp_dir("agent-tools");
+        let agents_dir = workspace.join(".claw").join("agents");
+        fs::create_dir_all(&agents_dir).expect("create agents dir");
+        // 逗号分隔写法。
+        fs::write(
+            agents_dir.join("Explore.md"),
+            "---\nname: Explore\ntools: read_file, grep_search\n---\nfast search\n",
+        )
+        .expect("write comma agent");
+        // YAML 块列表写法。
+        fs::write(
+            agents_dir.join("Verification.md"),
+            "---\nname: Verification\ntools:\n  - bash\n  - read_file\n  - PowerShell\n---\nverify\n",
+        )
+        .expect("write block agent");
+        // 无 tools: 声明 ⇒ None(回退内置白名单)。
+        fs::write(
+            agents_dir.join("Plan.md"),
+            "---\nname: Plan\n---\nplan it\n",
+        )
+        .expect("write plan agent");
+        // 显式空 tools ⇒ 无覆盖(返回 None,不误清空为无工具)。
+
+        let explore = agent_tools_for(&workspace, "Explore").expect("comma tools");
+        assert_eq!(explore, vec!["read_file", "grep_search"]);
+
+        let verification = agent_tools_for(&workspace, "Verification").expect("block tools");
+        assert_eq!(verification, vec!["bash", "read_file", "PowerShell"]);
+
+        assert!(agent_tools_for(&workspace, "plan").is_none());
+        assert!(agent_tools_for(&workspace, "nonexistent").is_none());
+
+        // load_agent_definitions 返回三元组且 tools 正确。
+        let defs = load_agent_definitions(&workspace);
+        let explore_def = defs.iter().find(|(n, _, _)| n == "Explore").expect("def");
+        assert_eq!(explore_def.2.len(), 2);
+        assert!(explore_def.1.contains("fast search"));
 
         let _ = fs::remove_dir_all(workspace);
     }

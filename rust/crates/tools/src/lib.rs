@@ -6426,6 +6426,14 @@ fn resolve_agent_model(model: Option<&str>) -> String {
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
+    // 文件化覆盖优先:.claw/agents/<type>.md 的 frontmatter `tools:` 若存在,
+    // 完全取代内置白名单(而非并集)—— 让使用者可精确收敛/扩展某类子智能体的
+    // 工具集,无需改代码。无覆盖时回退内置 6 类默认(向后兼容)。
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(custom) = commands::agent_tools_for(&cwd, subagent_type) {
+            return custom.into_iter().collect();
+        }
+    }
     let tools = match subagent_type {
         "Explore" => vec![
             "read_file",
