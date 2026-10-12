@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -50,7 +51,7 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 def run_claw(
-    claw_bin: str, worktree: str, prompt: str, timeout_s: int, extra_args: list[str]
+    claw_bin: str, repo: str, worktree: str, prompt: str, timeout_s: int, extra_args: list[str]
 ) -> dict:
     """在 worktree 内以无头 `-p` 模式驱动 claw 解题。
 
@@ -63,8 +64,15 @@ def run_claw(
 
     输出重定向到临时文件(而非管道):避免子进程持有管道导致 wait 永久死锁
     —— 与 `run_acceptance` 同因。
+
+    环境:`CARGO_TARGET_DIR` 指向主仓库**预热** target(与 `gt.run_acceptance`
+    一致)。否则 agent 在 worktree 内用本地冷 target → 每次 `cargo test`
+    从零编译全依赖图。实测(最小判别实验):冷 93.4s/177 Compiling vs 暖
+    38.2s/6 Compiling,每任务浪费约 55s —— 这是 M2 时长的主要来源。
     """
     cmd = [claw_bin, *extra_args, "-p", prompt]
+    env = dict(os.environ)
+    env["CARGO_TARGET_DIR"] = gt.shared_target_dir(repo)
     t0 = time.time()
     timed_out = False
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as outf:
@@ -74,6 +82,7 @@ def run_claw(
             stdin=subprocess.DEVNULL,
             stdout=outf,
             stderr=subprocess.STDOUT,
+            env=env,
         )
         try:
             proc.wait(timeout=timeout_s)
@@ -108,7 +117,7 @@ def eval_one(
         return result
 
     try:
-        solve = run_claw(claw_bin, str(wt), task["prompt"], args.task_timeout, args.claw_arg)
+        solve = run_claw(claw_bin, repo, str(wt), task["prompt"], args.task_timeout, args.claw_arg)
         result["solve"] = {k: solve[k] for k in ("exit", "timeout", "seconds")}
         # 始终保留 solve 输出尾部:超时任务(agent 完成修复却未自行退出)的根因证据
         # 只能从这里取 —— 否则只见 timeout=True 而无从判断是"预算不足"还是"收尾挂起"。
