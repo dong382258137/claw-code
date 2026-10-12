@@ -1997,6 +1997,15 @@ pub struct ConversationRuntime<C, T> {
     /// 标记总结;digest 写侧解析后落盘"会话总结"段。渲染后由请求构造清空
     /// (一次性消费;后续迭代不再注入,避免工具循环重复提示)。
     pending_summary_prompt: bool,
+    /// Q4(2026-10-13):热升级债务标志 —— 本会话是否改过 claw 自身源码。
+    ///
+    /// 根因(defect class):`maybe_hot_upgrade_note` 是**无状态**的每条
+    /// tool_result 软提示;模型改完自身源码、提交、宣告完成后,运行进程仍是
+    /// 旧二进制(磁盘态 desired ≠ 进程态 observed)。控制论解法(Kubernetes
+    /// reconcile loop):维护 dirty 标志,直到 `upgrade_pending` 置位
+    /// (HotUpgrade 被调用)才消除;turn 收尾若仍 dirty 则升级提醒强度
+    /// (从"建议"变为"阻塞性债务")。零 LLM。
+    own_source_dirty: bool,
     decision_log: Option<crate::decision_log::DecisionLog>,
     /// v3 §4.7:决策检测策略。控制 `maybe_auto_compact` 在压缩前用何种方式
     /// 提取决策点。默认 `Heuristic`(零成本),可通过
@@ -2531,6 +2540,7 @@ where
             pending_failure_advice: None,
             pending_session_digest: None,
             pending_summary_prompt: true,
+            own_source_dirty: false,
             decision_log: None,
             detection_strategy: crate::decision_log::DetectionStrategy::Heuristic,
             project_topology: None,
@@ -5708,11 +5718,18 @@ where
                             if let Some(hint) = self.maybe_plan_scope_warning(&effective_input) {
                                 output_to_store = format!("{output_to_store}\n\n{hint}");
                             }
-                            // 热升级提醒(根因修复):目标为 claw 自身源码时提示
-                            // 磁盘改动不入当前进程,需 HotUpgrade 才生效。与 F5
-                            // 同通道,同一 tool_result 末尾追加。
-                            if let Some(hint) = self.maybe_hot_upgrade_note(&effective_input) {
-                                output_to_store = format!("{output_to_store}\n\n{hint}");
+                            // 热升级债务(Q4 系统级加固):一旦本会话改过 claw 自身
+                            // 源码,该债务对**后续每次工具调用**保持(粘性),直到
+                            // HotUpgrade 置位才清偿 —— 避免"改完就忘"。控制论
+                            // reconcile 语义:desired(磁盘)≠observed(进程)期间持续告警。
+                            if self.maybe_hot_upgrade_note(&effective_input).is_some() {
+                                self.own_source_dirty = true;
+                            }
+                            if self.own_source_dirty && !self.upgrade_pending() {
+                                output_to_store = format!(
+                                    "{output_to_store}\n\n[hot-upgrade-debt] 本会话已修改 claw 自身源码,但运行进程仍为旧二进制。\
+                                     结束前请调用 `HotUpgrade` 工具,否则改动不会在当前会话生效。"
+                                );
                             }
                         }
                         // P2(充分性契约 · Task 4):侦察类工具调用后的契约记账与
