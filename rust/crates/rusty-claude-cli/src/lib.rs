@@ -1101,9 +1101,72 @@ fn run_evolve_source(
             // 成功后把提案标记为已处理(移入 processed/)。
             let _ = runtime::evolution_inbox::mark_processed(&inbox, &proposal_path);
         }
+        "install" => {
+            // P4(人工闸门):显式部署 —— 构建 release 并回拷到当前运行路径,
+            // **下次启动生效**(不强制重启,与 §3.4 约束 3 的"人工闸门"一致)。
+            let Some(source_root) = runtime::source_root::resolve_source_root() else {
+                return Err("未登记源码根:请先设置 CLAW_SOURCE_ROOT".into());
+            };
+            let _lock = match runtime::evolution_lock::EvolutionLock::acquire(&source_root)? {
+                Some(l) => l,
+                None => return Err("另一个进化会话正在运行(进化锁被持有)".into()),
+            };
+            // 1. 构建 release。
+            let status = std::process::Command::new("cargo")
+                .args(["build", "--release", "-p", "rusty-claude-cli"])
+                .current_dir(&source_root)
+                .status()
+                .map_err(|e| format!("启动 cargo 失败: {e}"))?;
+            if !status.success() {
+                return Err("cargo build --release 失败,拒绝部署".into());
+            }
+            // 2. 定位产物与部署目标。
+            let exe = env::current_exe()?;
+            let name = exe
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("无法获取当前 exe 文件名")?;
+            let built = source_root.join("target").join("release").join(name);
+            if !built.is_file() {
+                return Err(format!("构建产物缺失: {}", built.display()).into());
+            }
+            // 3. Windows 不允许覆盖运行中的 exe:先 rename 旧文件为 .old。
+            let old = {
+                let mut s = exe.clone().into_os_string();
+                s.push(".old");
+                PathBuf::from(s)
+            };
+            let _ = std::fs::remove_file(&old);
+            if let Err(e) = std::fs::rename(&exe, &old) {
+                return Err(format!("备份 {} 失败: {e}", exe.display()).into());
+            }
+            if let Err(e) = std::fs::copy(&built, &exe) {
+                // 回滚:恢复旧 exe,避免 brick。
+                let _ = std::fs::rename(&old, &exe);
+                return Err(format!("回拷到 {} 失败(已回滚): {e}", exe.display()).into());
+            }
+            match output_format {
+                CliOutputFormat::Text => println!(
+                    "已部署: {} → {}\n旧二进制备份: {}\n**下次启动生效**;如需立即生效请执行热升级(/upgrade)。",
+                    built.display(),
+                    exe.display(),
+                    old.display()
+                ),
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "built": built.display().to_string(),
+                        "installed": exe.display().to_string(),
+                        "backup": old.display().to_string(),
+                        "takes_effect": "next_start",
+                    }))?
+                ),
+            }
+        }
         other => {
             return Err(format!(
-                "unknown evolve-source action `{other}`; expected list | process | show | run"
+                "unknown evolve-source action `{other}`; expected list | process | show | run | install"
             )
             .into())
         }
