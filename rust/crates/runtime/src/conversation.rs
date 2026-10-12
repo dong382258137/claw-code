@@ -1614,6 +1614,14 @@ pub const COMPLEX_MAX_ITERATIONS: usize = 1024;
 /// 可覆盖;设为 0 禁用。
 pub const TURN_TIME_SOFT_SECS: u64 = 600;
 
+/// P1 元认知自动归档的最小间隔(ms,默认 10 分钟)。
+///
+/// 限流理由:一次长任务的**每个 turn 收尾**都可能命中软阈值信号(如 elapsed≥600s),
+/// 若每次都归档会刷屏 inbox 并淹没真正有价值的提案。故自动归档(软阈值/循环类)
+/// 之间至少间隔该时长;**高价值信号(task_failed / punchback)不受限流**
+/// (它们罕见且指向明确,漏掉代价高)。
+pub const GAP_REPORT_MIN_INTERVAL_MS: i64 = 10 * 60 * 1000;
+
 /// 工具调用循环检测的跨 turn 保留窗口(15 分钟)。
 /// 窗口内相同工具调用跨 turn 累积计数;超过窗口未出现则衰减清零。
 pub const LOOP_DECAY_WINDOW_MS: u64 = 15 * 60 * 1000;
@@ -1852,6 +1860,14 @@ pub struct ConversationRuntime<C, T> {
     loop_abort_reason: Option<String>,
     /// 阶段 2:doom loop 自动分支重试标记。防递归:每个 turn 只自动分支重试一次。
     branch_retry_attempted: bool,
+    /// P1 元认知门控:本 turn 起始时对 user 输入的打回判定结果
+    /// (`classify_punchback`)。turn 起始算一次、收尾消费 —— 避免收尾时
+    /// 重复分类(且收尾时 user_input 已不在手)。
+    turn_punchback: bool,
+    /// P1 元认知门控:上次自动归档提案的时间戳(ms),用于**限流** ——
+    /// 防止一次长任务在其每个 turn 收尾都触发软阈值信号,刷屏 inbox。
+    /// 默认最小间隔见 [`GAP_REPORT_MIN_INTERVAL_MS`]。
+    last_gap_report_ms: Cell<i64>,
     /// Harness V(验证)层:幻觉/偷懒信号扫描器。
     /// 在 PostToolUse hook 中对 write_file/edit_file 产物扫描占位标记
     /// (unimplemented!/placeholder/TODO),命中时以 warning 追加到 hook
@@ -2480,6 +2496,8 @@ where
             loop_detector: LoopDetector::new(),
             loop_abort_reason: None,
             branch_retry_attempted: false,
+            turn_punchback: false,
+            last_gap_report_ms: Cell::new(0),
             slop_scanner: SlopScanner::new(),
             slop_scan_enabled: feature_config.slop_scan().unwrap_or(true),
             completion_verifier: crate::completion_verifier::CompletionVerifier::new(),
@@ -3866,6 +3884,13 @@ where
         // 时无工具循环隔断);首 turn messages 为空 → 返回 None → 不计入。
         if self.last_assistant_text().is_some() {
             let class = crate::convergence::classify_punchback(&user_input);
+            // P1 元认知门控:留存打回判定,供 turn 收尾的门控消费。
+            // 强/弱打回均为"上一轮答复被否定"的信号(Force/None 不计)。
+            self.turn_punchback = matches!(
+                class,
+                crate::convergence::PunchbackClass::Strong
+                    | crate::convergence::PunchbackClass::Weak
+            );
             if let Some(root) = &self.workspace_root {
                 if let Ok(sessions_dir) = crate::session::workspace_sessions_dir(root) {
                     let _ = crate::convergence::record_turn(
@@ -9603,6 +9628,12 @@ where
     }
 
     fn record_turn_completed(&self, summary: &TurnSummary) {
+        // P1 元认知门控:耗时须在 `record_trace`(会清空 turn_start)**之前**捕获。
+        let elapsed_secs = self
+            .turn_start
+            .get()
+            .map(|s| s.elapsed().as_secs())
+            .unwrap_or(0);
         // BUG-9:TraceAnalyzer 记录 — 独立于 session_tracer,无条件执行。
         self.record_trace(
             summary.iterations,
@@ -9650,9 +9681,82 @@ where
             Value::from(summary.prompt_cache_events.len() as u64),
         );
         session_tracer.record("turn_completed", attributes);
+        // P1 元认知门控:成功收尾也可能暴露框架缺陷(软阈值/循环/打回)。
+        self.maybe_report_framework_gap(summary.iterations, elapsed_secs, false, None);
+    }
+
+    /// P1 元认知门控:廉价信号命中时自动归档一条框架缺陷提案到 evolution inbox。
+    ///
+    /// **零 LLM**:只做本地判据(见 [`crate::evolution_gate`])+ 文件落盘;
+    /// 真正"是否值得改"的复盘由进化子智能体(P2/P3)离线做 —— 故本方法在
+    /// 每次 turn 收尾都调用也不会增加 LLM 成本。
+    ///
+    /// 限流:软阈值/循环类信号两次归档间隔至少 [`GAP_REPORT_MIN_INTERVAL_MS`];
+    /// `task_failed` / `punchback` 属高价值信号,不受限流。
+    fn maybe_report_framework_gap(
+        &self,
+        iterations: usize,
+        elapsed_secs: u64,
+        loop_detected: bool,
+        failure: Option<&str>,
+    ) {
+        let Some(root) = &self.workspace_root else {
+            return;
+        };
+        let signals = crate::evolution_gate::TurnSignals {
+            punchback: self.turn_punchback,
+            loop_detected,
+            tool_fail_streak: 0,
+            elapsed_secs,
+            iterations,
+            turn_failed: failure.is_some(),
+        };
+        let th = crate::evolution_gate::thresholds_from_env();
+        let Some(trigger) = crate::evolution_gate::should_trigger_metacognition(&signals, &th) else {
+            return;
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // 限流:软阈值/循环类信号低频化(高价值信号除外)。
+        let high_value = matches!(trigger, "task_failed" | "punchback");
+        let last = self.last_gap_report_ms.get();
+        if !high_value && last != 0 && now_ms.saturating_sub(last) < GAP_REPORT_MIN_INTERVAL_MS {
+            return;
+        }
+        self.last_gap_report_ms.set(now_ms);
+        let mut evidence = vec![format!(
+            "turn: iterations={iterations} elapsed={elapsed_secs}s trigger={trigger}"
+        )];
+        if let Some(msg) = failure {
+            evidence.push(format!("failure: {msg}"));
+        }
+        let gap = crate::evolution_inbox::FrameworkGap {
+            trigger: trigger.to_string(),
+            severity: if high_value { "high" } else { "low" }.to_string(),
+            category: if failure.is_some() { "bug" } else { "perf" }.to_string(),
+            observation: format!(
+                "turn 收尾命中廉价信号 `{trigger}`(iterations={iterations}, \
+                 elapsed={elapsed_secs}s) —— 可能指向框架层缺陷/优化点,待进化子智能体复核。"
+            ),
+            evidence,
+            suggestion: None,
+            acceptance: None,
+            source_cwd: root.display().to_string(),
+            source_session: self.session.session_id.clone(),
+        };
+        // 归档到源码根 inbox(源码根未登记则落回工作区)。
+        let _ = crate::evolution_inbox::archive_gap(root, &gap, now_ms);
     }
 
     fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
+        // P1 元认知门控:失败是最强信号,捕获耗时后归档(不受限流)。
+        let elapsed_secs = self
+            .turn_start
+            .get()
+            .map(|s| s.elapsed().as_secs())
+            .unwrap_or(0);
         // BUG-9:TraceAnalyzer 记录 — 失败 turn。
         // tool_calls/compact 在失败路径无法准确获取,记 0/false。
         let error_msg = error.to_string();
@@ -9671,6 +9775,8 @@ where
         attributes.insert("iteration".to_string(), Value::from(iteration as u64));
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
+        // P1 元认知门控:失败是最强信号(不受限流)。
+        self.maybe_report_framework_gap(iteration, elapsed_secs, false, Some(&error_msg));
     }
 
     /// BUG-9:构造一条 [`TraceRecord`] 并写入 `trace_analyzer`(若注入)。
