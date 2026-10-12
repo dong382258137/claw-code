@@ -149,6 +149,9 @@ pub mod source_root;
 // 进化提案归档(P1):把"框架需改进"的观察结构化落盘 → 唤醒进化子智能体。
 // 详见 evolution_inbox.rs。
 pub mod evolution_inbox;
+// 元认知触发门控(P1):廉价本地信号筛选,避免每次收敛都付费跑 LLM。
+// 详见 evolution_gate.rs。
+pub mod evolution_gate;
 pub mod trace_analyzer;
 // Harness O(可观测性)层:FailureTrace — tool 调用级失败点定位(阶段 1)。
 // 把 TraceAnalyzer 的 turn 级 failure_kind 降粒度到工具调用序列,标记 is_error
