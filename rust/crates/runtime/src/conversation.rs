@@ -154,6 +154,34 @@ fn survey_budget() -> usize {
         .unwrap_or(SURVEY_BUDGET)
 }
 
+/// 读取单 turn 墙钟软阈值秒数(env 可覆盖,越界/非法回退默认)。
+///
+/// `0` = 禁用墙钟收敛信号(仅按迭代数收敛)。合理区间 60..=7200,防误配
+/// (如 1s)导致几乎每个 turn 都被提醒。
+fn turn_time_soft_secs() -> u64 {
+    std::env::var("CLAW_TURN_TIME_SOFT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n == 0 || (60..=7200).contains(&n))
+        .unwrap_or(TURN_TIME_SOFT_SECS)
+}
+
+/// 墙钟软阈值判定(纯函数,便于单测):`time_soft==0` 禁用;已注入过不重复;
+/// 否则当 `elapsed_secs >= time_soft` 时注入。
+fn should_inject_time_soft(already_injected: bool, elapsed_secs: u64, time_soft: u64) -> bool {
+    !already_injected && time_soft > 0 && elapsed_secs >= time_soft
+}
+
+/// 墙钟收敛提醒文本(纯函数,便于单测)。
+fn time_soft_warning(elapsed_secs: u64, time_soft: u64) -> String {
+    format!(
+        "[runtime] 本 turn 已耗时约 {} 秒(阈值 {}s)仍未收敛。\
+         若已接近结论,请总结已有发现并输出最终答案;否则请改变策略\
+         或询问用户方向。注意:收敛不应仅看轮次——多数轮次也可能累积很久。",
+        elapsed_secs, time_soft
+    )
+}
+
 /// P1:并行子任务最大并发数上限。
 ///
 /// 参考 Anthropic 多智能体研究系统(lead agent 并行 spawn 3-5 subagents)。
@@ -1568,6 +1596,23 @@ pub const COMPLEX_SOFT_MAX_ITERATIONS: usize = 256;
 /// 实际执行长程重构的 turn。真正的 runaway loop(反复相同 input/output)
 /// 仍由 [`LoopDetector`] 精确拦截,不依赖迭代计数兜底。
 pub const COMPLEX_MAX_ITERATIONS: usize = 1024;
+
+/// 单 turn 墙钟软阈值(秒)。**与迭代计数正交的第二收敛信号。**
+///
+/// 根因(实测 `runtime-6f4c0e4b`):收敛控制全部按**迭代数**计数
+/// (`SOFT_MAX_ITERATIONS=64` 等),但推理型长任务可在**远低于 64 轮**时
+/// 就已耗时 1700s+(实测该任务 60 轮 / 95.6% 时间花在模型推理,单轮推理
+/// 随上下文膨胀从 15s 增至 27s)。此时迭代计数未达软阈值 → **全程无收尾
+/// 触发**,直到外部预算强杀。仅按迭代数收敛对"少数但极贵的轮次"失效。
+///
+/// 本常量提供墙钟维度:turn 从开始到当前超过该秒数即注入与
+/// `SOFT_MAX_ITERATIONS` 同构的收敛提醒(走同一仲裁槽 pri 45),让模型
+/// 感知"时间已花很多"并自主决定收尾或继续。仅在恰好的跨越点触发一次。
+///
+/// 取 600s(10min):显著低于常见外部预算(900–1800s),给模型留收尾余量;
+/// 又高于多数任务的总时长(p50≈271s),避免误扰短任务。`CLAW_TURN_TIME_SOFT_SECS`
+/// 可覆盖;设为 0 禁用。
+pub const TURN_TIME_SOFT_SECS: u64 = 600;
 
 /// 工具调用循环检测的跨 turn 保留窗口(15 分钟)。
 /// 窗口内相同工具调用跨 turn 累积计数;超过窗口未出现则衰减清零。
@@ -3941,6 +3986,10 @@ where
         // + 证据缺失打回计数(上限 2,防死循环,超限交既有成本护栏兜底)。
         let mut convergence_soft1_injected = false;
         let mut convergence_soft2_injected = false;
+        // 墙钟软阈值(fire-once):turn 累计耗时跨越 TURN_TIME_SOFT_SECS 时注入
+        // 一次收敛提醒。与迭代软阈值正交 —— 覆盖"轮次少但单轮极贵"的推理型
+        // 长任务(迭代计数未达软上限即已烧光预算)。
+        let mut time_soft_injected = false;
         let mut convergence_punchbacks: u8 = 0;
         // P1 批5(收敛催缴冷却):模型本 turn 已输出过格式合法【收敛声明】
         // (无论 claimed_complete true/false)的标志。置位后注入段 soft1/soft2
@@ -4019,6 +4068,25 @@ where
                      已有发现并输出最终答案;否则请改变策略或询问用户方向。",
                     turn_soft_max
                 );
+                let _ = stage_note(&mut arbiter_note, 45, warning);
+            }
+
+            // 墙钟软阈值:与迭代计数**正交**的第二收敛信号。
+            // 根因(实测 runtime-6f4c0e4b):收敛控制全按迭代数计数,但推理型
+            // 长任务可在远低于软上限的轮次就耗时千秒(60 轮 / 95.6% 时间在推理,
+            // 单轮从 15s 涨到 27s 上下文膨胀)。迭代数信号此时静默 → 全程无收尾
+            // 触发 → 被外部预算强杀。此处在 turn 累计耗时跨过阈值时注入同构
+            // 收敛提醒(同一仲裁槽 pri 45),使模型获得"时间已花很多"的感知,
+            // 自主决定收尾或继续。仅跨阈值那一刻触发一次(fire-once)。
+            let time_soft = turn_time_soft_secs();
+            let elapsed_secs = self
+                .turn_start
+                .get()
+                .map(|s| s.elapsed().as_secs())
+                .unwrap_or(0);
+            if should_inject_time_soft(time_soft_injected, elapsed_secs, time_soft) {
+                time_soft_injected = true;
+                let warning = time_soft_warning(elapsed_secs, time_soft);
                 let _ = stage_note(&mut arbiter_note, 45, warning);
             }
 
@@ -9983,6 +10051,7 @@ mod tests {
         drop_value_outside_async_ctx, extract_file_path_from_tool_input, is_repetition_warning,
         microcompact_preserve_recent, parse_auto_compaction_threshold,
         parse_auto_compaction_threshold_opt, process_tool_uses, rewrite_path_to_workspace_relative,
+        should_inject_time_soft, time_soft_warning,
         ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
         PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor, SubagentContext,
         ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
@@ -11956,6 +12025,30 @@ mod tests {
             suppressed,
             "identical output 应在警告阈值处被抑制为提示文本"
         );
+    }
+
+    /// A(墙钟收敛信号):覆盖"轮次少但单轮极贵"的推理型长任务。
+    /// 根因 runtime-6f4c0e4b:60 轮(未达 SOFT_MAX=64)× 单轮推理随上下文膨胀
+    /// → 1784s 耗时,迭代信号全程静默 → 无收尾触发 → 被外部预算强杀。
+    #[test]
+    fn time_soft_signal_fires_independently_of_iteration_count() {
+        // 未跨阈值 → 不注入
+        assert!(!should_inject_time_soft(false, 599, 600));
+        // 跨阈值且未注入过 → 注入
+        assert!(should_inject_time_soft(false, 600, 600));
+        assert!(should_inject_time_soft(false, 1700, 600));
+        // fire-once:已注入过不重复
+        assert!(!should_inject_time_soft(true, 1700, 600));
+        // time_soft==0 → 禁用(仅按迭代数收敛)
+        assert!(!should_inject_time_soft(false, 99999, 0));
+    }
+
+    #[test]
+    fn time_soft_warning_mentions_elapsed_and_threshold() {
+        let w = time_soft_warning(1234, 600);
+        assert!(w.contains("1234"), "应含实际耗时: {w}");
+        assert!(w.contains("600"), "应含阈值: {w}");
+        assert!(w.contains("轮次"), "应点明收敛不应仅看轮次: {w}");
     }
 
     #[test]
