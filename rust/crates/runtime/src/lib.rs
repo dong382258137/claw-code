@@ -146,6 +146,9 @@ pub mod session_control;
 // 源码根注册表(热升级元认知闭环 P0):任意目录下定位源码树。
 // 详见 source_root.rs 与 docs/2026-10-11-metacognitive-evolution-design.md。
 pub mod source_root;
+// 进化提案归档(P1):把"框架需改进"的观察结构化落盘 → 唤醒进化子智能体。
+// 详见 evolution_inbox.rs。
+pub mod evolution_inbox;
 pub mod trace_analyzer;
 // Harness O(可观测性)层:FailureTrace — tool 调用级失败点定位(阶段 1)。
 // 把 TraceAnalyzer 的 turn 级 failure_kind 降粒度到工具调用序列,标记 is_error

@@ -1533,6 +1533,28 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "report_framework_gap",
+            description: "Report a deficiency/optimization/feature-gap in the CLAW FRAMEWORK ITSELF (not the user's task). Use ONLY when you observe during a real task that the framework (runtime/CLI/tools/prompt) — not the user's project — is the cause of poor behavior. Examples: a convergence signal misfires, a snapshot is stale, a tool blocks forever, a metric is unmeasurable, a mechanism is missing. This files a structured proposal into the source tree's .claw/evolution/inbox/ for the evolution subagent. IMPORTANT: `evidence` must be executable/reproducible (file:line, command output, metric value) — NOT a feeling. Do NOT use for ordinary task bugs in the user's own code.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "observation": { "type": "string", "description": "框架在哪里表现不佳(一段话)" },
+                    "evidence": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "可执行/可复现判据:文件:行号 / 命令输出 / 指标数值"
+                    },
+                    "category": { "type": "string", "enum": ["bug", "perf", "feature", "dx"] },
+                    "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+                    "suggestion": { "type": "string", "description": "可选:初步修改方向" },
+                    "acceptance": { "type": "string", "description": "可选:改完怎么算成功(可执行)" }
+                },
+                "required": ["observation", "evidence"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "TaskCreate",
             description: "Create a background task that runs in a separate subprocess.",
             input_schema: json!({
@@ -2206,6 +2228,9 @@ fn execute_tool_with_enforcer(
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
+        "report_framework_gap" => {
+            from_value::<FrameworkGapInput>(input).and_then(run_report_framework_gap)
+        }
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
         "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
@@ -2399,6 +2424,46 @@ fn ask_timeout_json(question: &str, timeout_secs: u64) -> String {
             question, timeout_secs
         )
     })
+}
+
+/// `report_framework_gap` 工具实现(P1 元认知闭环)。
+///
+/// 把 agent 在实时任务中观察到的**框架级**缺陷/优化/缺功能,结构化归档到
+/// `<源码根>/.claw/evolution/inbox/`,供进化子智能体(P2/P3)消费。
+///
+/// 与"收敛后元认知总结"互补:本通道是**进行中**的即时观察,零额外 LLM 往返。
+fn run_report_framework_gap(input: FrameworkGapInput) -> Result<String, String> {
+    if input.observation.trim().is_empty() {
+        return Err("observation 不能为空".to_string());
+    }
+    if input.evidence.is_empty() {
+        // 诚实性红线:证据必须是可执行判据,不是"感觉"。
+        return Err(
+            "evidence 不能为空:请提供可执行/可复现判据(文件:行号 / 命令输出 / 指标数值)".to_string(),
+        );
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("读取 cwd 失败: {e}"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let gap = runtime::evolution_inbox::FrameworkGap {
+        trigger: "agent_reported".to_string(),
+        severity: input.severity.unwrap_or_else(|| "medium".to_string()),
+        category: input.category.unwrap_or_else(|| "dx".to_string()),
+        observation: input.observation,
+        evidence: input.evidence,
+        suggestion: input.suggestion,
+        acceptance: input.acceptance,
+        source_cwd: cwd.display().to_string(),
+        source_session: std::env::var("CLAW_SESSION_ID").unwrap_or_else(|_| "(unknown)".to_string()),
+    };
+    let path = runtime::evolution_inbox::archive_gap(&cwd, &gap, now_ms)?;
+    to_pretty_json(json!({
+        "status": "archived",
+        "path": path.display().to_string(),
+        "note": "已归档到源码根的 evolution inbox;进化子智能体将在下次扫描时处理。"
+    }))
 }
 
 /// TUI 模式下 [`run_ask_user_question`] 的请求载荷。
@@ -4728,6 +4793,21 @@ struct AskUserQuestionInput {
     /// 提问计时器(秒)。`None` → 默认 300s;`Some(0)` → 无限等待(旧行为)。
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+/// `report_framework_gap` 工具入参(P1 元认知闭环)。
+#[derive(Debug, Deserialize)]
+struct FrameworkGapInput {
+    observation: String,
+    evidence: Vec<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    suggestion: Option<String>,
+    #[serde(default)]
+    acceptance: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -14598,6 +14678,49 @@ printf 'pwsh:%s' "$1"
         // current_ask_user_question_handler 是私有的，通过行为验证：
         // execute_tool 不应走 handler 路径（这里不实际调用，因为 stdin
         // 会阻塞测试线程）。仅验证 setter/clearer 不 panic。
+    }
+
+    /// P1 元认知闭环:`report_framework_gap` 归档提案;空 evidence 被硬拒
+    /// (诚实性红线:证据必须是可执行判据,不是"感觉")。
+    #[test]
+    fn report_framework_gap_rejects_empty_evidence_and_archives_valid() {
+        let _guard = env_guard();
+        // 空 evidence → 拒绝
+        let bad = execute_tool(
+            "report_framework_gap",
+            &json!({ "observation": "框架慢", "evidence": [] }),
+        )
+        .expect_err("空 evidence 应被拒");
+        assert!(bad.contains("evidence 不能为空"), "err={bad}");
+
+        // 指向临时源码根,避免污染全局 ~/.claw
+        let tmp = std::env::temp_dir().join(format!("claw-gap-tool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let saved = std::env::var_os(runtime::source_root::SOURCE_ROOT_ENV);
+        std::env::set_var(runtime::source_root::SOURCE_ROOT_ENV, &tmp);
+
+        let out = super::execute_tool(
+            "report_framework_gap",
+            &json!({
+                "observation": "收敛信号对推理型长尾失效",
+                "evidence": ["runtime-6f4c0e4b: 60 轮 1784s, 95.6% 在推理"],
+                "category": "perf",
+                "severity": "high"
+            }),
+        )
+        .expect("valid gap should archive");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(parsed["status"], "archived");
+        let path = parsed["path"].as_str().expect("path");
+        assert!(path.contains("evolution"), "path={path}");
+        assert!(std::path::Path::new(path).is_file(), "提案文件应存在");
+
+        match saved {
+            Some(v) => std::env::set_var(runtime::source_root::SOURCE_ROOT_ENV, v),
+            None => std::env::remove_var(runtime::source_root::SOURCE_ROOT_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// HotUpgrade 工具:调用后置位跨 crate 信号,且 `take` 语义为"取一次即清零"
