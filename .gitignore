@@ -56,3 +56,21 @@ rust/crates/llm-eval/benchmarks/*.jsonl
 !rust/crates/llm-eval/benchmarks/groundtruth_validated.jsonl
 !rust/crates/llm-eval/benchmarks/groundtruth_validated_40.jsonl
 rust/crates/llm-eval/benchmarks/__pycache__/
+# Benchmark run scratch (logs, one-off check outputs) — regenerable, transient
+rust/crates/llm-eval/benchmarks/*.log
+rust/crates/llm-eval/benchmarks/fixed_check.json
+
+# pass^1 evaluation run scratch (worktrees, telemetry, run reports).
+# Transient, can grow to GBs; never commit.
+.gt-run/
+
+# Trae IDE workspace (specs/documents authored in-IDE; churns with the editor)
+.trae/
+
+# One-off audit scratch scripts bound to external project paths
+# (D:\chanlunV2\...) — not part of this repo's tooling.
+tools/_reaudit.py
+tools/_reaudit2.py
+
+# Scratch
+self-introduction.txt
