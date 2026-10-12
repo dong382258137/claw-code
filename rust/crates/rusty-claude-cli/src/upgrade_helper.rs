@@ -181,11 +181,20 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         ),
     );
 
-    // 3. cargo build。源码根优先从 user_cwd 推导 —— 部署版 exe 位于
-    //    `.cargo/bin`,从 exe 上溯到用户主目录不含 Cargo.toml,推导必失败
-    //    (2026-09-02 实测)。user_cwd 推导失败时回退 exe 推导(源码 target 布局)。
-    let workspace_root = workspace_root_from_user_cwd(user_cwd)
-        .or_else(|_| workspace_root_from_exe(&exe))
+    // 3. cargo build。源码根定位优先级(P0 注册表):
+    //    ① 源码根注册表(`~/.claw/source-root` / env),使**任意目录**下运行的
+    //       热升级也能找到源码树 —— 这是元认知进化闭环的地基(见
+    //       docs/2026-10-11-metacognitive-evolution-design.md §3.1);
+    //    ② user_cwd 上溯(在源码目录内运行时的旧路径);
+    //    ③ exe 上溯(源码 target 布局)。
+    //    历史教训:部署版 exe 位于 `.cargo/bin`,从 exe 上溯到用户主目录不含
+    //    Cargo.toml,推导必失败(2026-09-02 实测);注册表正是为此补的缺口。
+    let workspace_root = runtime::source_root::resolve_source_root()
+        .filter(|p| is_rusty_claude_workspace(p))
+        .map(Ok)
+        .unwrap_or_else(|| {
+            workspace_root_from_user_cwd(user_cwd).or_else(|_| workspace_root_from_exe(&exe))
+        })
         .map_err(|err| {
             log_out(
                 &log_file,
@@ -193,6 +202,8 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
             );
             err
         })?;
+    // 定位成功即自动登记(P0):源码树内首次热升级后,后续任意目录都能定位。
+    let _ = runtime::source_root::register_source_root(&workspace_root);
 
     // 3. cargo build。产物路径必须与"当前 exe 运行场景"对齐:
     //    - exe 在 `target/debug`(源码 debug 布局) → 默认 build(debug),产物已在原位
