@@ -1034,9 +1034,65 @@ fn run_evolve_source(
                 ),
             }
         }
+        "run" => {
+            // P3: 唤醒进化子智能体 —— 以 cwd=源码根 启动一个无头 claw 进程,
+            // 喂入"进化任务提示"(见 evolution_runner::evolution_prompt)。
+            // 安全:① 递归防护(CLAW_EVOLUTION_ACTIVE);② 子智能体提示内嵌硬性
+            // 约束(不改测试/黑名单/测试门);③ 子智能体**不自行部署**(人工闸门)。
+            if std::env::var_os("CLAW_EVOLUTION_ACTIVE").is_some() {
+                return Err("递归防护:当前已处于进化会话,拒绝再次 spawn 进化子智能体".into());
+            }
+            let Some(source_root) = runtime::source_root::resolve_source_root() else {
+                return Err(
+                    "未登记源码根:请先设置 CLAW_SOURCE_ROOT 或在源码树内运行一次热升级".into(),
+                );
+            };
+            // 目标:优先指定提案文件,否则取 inbox 第一条待处理。
+            let proposal_path = match target {
+                Some(t) => PathBuf::from(t),
+                None => {
+                    let pending = runtime::evolution_inbox::list_pending(&inbox);
+                    match pending.into_iter().next() {
+                        Some(p) => p,
+                        None => return Err("inbox 无待处理提案,无可进化目标".into()),
+                    }
+                }
+            };
+            let text = std::fs::read_to_string(&proposal_path)
+                .map_err(|e| format!("cannot read {}: {e}", proposal_path.display()))?;
+            let parsed = runtime::evolution_runner::parse_proposal(&text);
+            let prompt = runtime::evolution_runner::evolution_prompt(&proposal_path, &parsed);
+            let exe = env::current_exe()?;
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.current_dir(&source_root)
+                .env("CLAW_EVOLUTION_ACTIVE", "1")
+                .args(["--dangerously-skip-permissions", "-p", &prompt]);
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("唤醒进化子智能体:\n  cwd={}\n  提案={}", source_root.display(), proposal_path.display());
+                    println!("（子智能体将改码→测试门→提交,不自行部署;完成后请人工复核）");
+                }
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "source_root": source_root.display().to_string(),
+                        "proposal": proposal_path.display().to_string(),
+                        "spawned": true,
+                    }))?
+                ),
+            }
+            // 前台执行:子智能体输出直接可见(TUI 模式下用户可观察)。
+            let status = cmd.status()?;
+            if !status.success() {
+                return Err(format!("进化子智能体退出码非零: {status}").into());
+            }
+            // 成功后把提案标记为已处理(移入 processed/)。
+            let _ = runtime::evolution_inbox::mark_processed(&inbox, &proposal_path);
+        }
         other => {
             return Err(format!(
-                "unknown evolve-source action `{other}`; expected list | process | show"
+                "unknown evolve-source action `{other}`; expected list | process | show | run"
             )
             .into())
         }
