@@ -761,7 +761,11 @@ fn run_event_loop(
         .map(|c| c.lines().count())
         .unwrap_or(0);
     const HISTORY_BATCH: usize = 50; // 单次回看加载的 JSONL 行数
-                                     // cli_holder: Some when idle, None when a turn is running in a thread
+                                     // 主会话 mid-turn steering：在 cli move 进 cli_holder 之前取队列句柄。
+                                     // busy 时 cli_holder 为 None，无法再经 cli 访问；此 clone 让 TUI 主线程在
+                                     // turn 执行期间也能把用户输入投入 runtime 的 steer_inbox。
+    let steer_inbox_handle = cli.steer_inbox_handle();
+    // cli_holder: Some when idle, None when a turn is running in a thread
     let mut cli_holder: Option<LiveCli> = Some(cli);
     // Turn completion channel: Some when a turn is running
     let mut turn_rx: Option<mpsc::Receiver<TurnResult>> = None;
@@ -770,10 +774,6 @@ fn run_event_loop(
     // spawn worker thread 前创建，设置到 cli（通过 set_external_abort_signal），
     // Ctrl+C（busy 时）通过此 handle 取消当前 turn。
     let mut current_abort_signal: Option<runtime::HookAbortSignal> = None;
-
-    // TUI 插话支持：busy 时用户输入的待处理队列。
-    // turn 完成（含中断）后自动检查并提交，实现"任务间隙插话"。
-    let mut pending_input: Option<String> = None;
 
     // P0-4 修复：标记 worker 线程已因 Disconnected 崩溃。
     // 一旦置 true，后续 Submit 不再静默丢弃输入，而是向 OutputView 反馈。
@@ -1085,8 +1085,11 @@ fn run_event_loop(
                         "err"
                     };
                     crate::diag_log(&format!(
-                        "[turn-end] result={status} elapsed_ms={elapsed} pending_input={}",
-                        pending_input.is_some()
+                        "[turn-end] result={status} elapsed_ms={elapsed} steer_inbox_len={}",
+                        steer_inbox_handle
+                            .lock()
+                            .map(|inbox| inbox.len())
+                            .unwrap_or(0)
                     ));
                     if let Err(e) = &turn_result.result {
                         let handle = output_view.shared_handle();
@@ -1109,10 +1112,21 @@ fn run_event_loop(
                     if let Some(ref cli) = cli_holder {
                         sync_status_from_cli(&status_state, cli);
                     }
-                    // TUI 插话支持：turn 完成（含中断）后检查 pending_input。
-                    // 如果有排队输入，自动提交（不等待用户再次按 Enter），
-                    // 实现"任务间隙插话后无缝继续对话"。
-                    if let Some(pending) = pending_input.take() {
+                    // 主会话 mid-turn steering：turn 完成后检查 steer_inbox 是否有
+                    // 残留消息 —— 用户输入若在 turn 最后一次迭代之后到达，run_turn
+                    // 已无机会消费。此处兜底 drain 并自动提交为新 turn（回退语义，
+                    // 保证插话永不丢失）。旧 pending_input 路径已被 steer_inbox 取代。
+                    let residual: Option<String> = {
+                        let mut inbox = steer_inbox_handle
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if inbox.is_empty() {
+                            None
+                        } else {
+                            Some(std::mem::take(&mut *inbox).join("\n"))
+                        }
+                    };
+                    if let Some(pending) = residual {
                         // 回显排队消息到 OutputView（保持对话连贯性）。
                         {
                             if let Ok(mut buf) = output_view.shared_handle().lock() {
@@ -2686,13 +2700,20 @@ fn run_event_loop(
                                 );
                             }
                         } else {
-                            // TUI 插话支持：turn 正在运行时用户敲 Enter，输入进入
-                            // pending_input 队列。turn 完成（含中断）后自动提交，
-                            // 实现"任务间隙插话"。InputLine 已 reset() 清空 buffer，
-                            // 用户可以继续输入新的内容。
-                            pending_input = Some(line);
+                            // 主会话 mid-turn steering（inject 模式）：turn 正在运行时
+                            // 用户敲 Enter，输入投入 runtime 的 steer_inbox。run_turn
+                            // 在下一次迭代顶部取出并折叠进模型调用 —— 不停流地改方向
+                            // （对比旧的"任务间隙插话"，无需等 turn 结束）。InputLine
+                            // 已 reset() 清空 buffer，用户可继续输入新内容。
+                            // 若输入到达时 turn 恰好已结束，残留消息由下方 turn-end
+                            // 处理取出并自动提交为新 turn（回退语义，不丢失）。
+                            if let Ok(mut inbox) = steer_inbox_handle.lock() {
+                                inbox.push(line.clone());
+                            }
                             if let Ok(mut buf) = output_view.shared_handle().lock() {
-                                buf.append("\n[queued] 输入已排队，当前任务结束后自动发送。\n");
+                                buf.append(
+                                    "\n[steered] 意见已注入，将在下一步生效（不打断当前执行）。\n",
+                                );
                             }
                         }
                     }

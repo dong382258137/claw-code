@@ -679,6 +679,14 @@ pub(crate) struct LiveCli {
     /// 重建时经 `with_upgrade_signal` 注入,否则每轮新 runtime 的
     /// upgrade_pending 都是默认 false,信号丢失。
     upgrade_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 主会话 mid-turn steering 收件箱（inject 模式）。
+    ///
+    /// 与 `upgrade_signal` 同构：TUI/CLI 在 turn 执行期间（busy）把用户输入投入
+    /// 此队列，`run_turn` 每次迭代顶部取出并注入为 user 消息（折叠进下一轮模型
+    /// 调用，不中断当前流）。因 `prepare_turn_runtime` 每轮重建 runtime，队列必须
+    /// 存于此字段并在重建时经 `with_steer_inbox` 注入，否则每轮新 runtime 的队列
+    /// 都是空的、插话丢失。
+    steer_inbox: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// TUI 本地命令输出捕获：当设置时，`tui_println` 会把内容追加到此
     /// buffer 而不是打印到 stdout（避免破坏 alternate screen）。
     /// 由 TuiApp 在执行斜杠命令前设置，执行后清除。
@@ -757,6 +765,23 @@ impl BuiltRuntime {
             .take()
             .expect("runtime should exist before installing upgrade signal");
         self.runtime = Some(runtime.with_upgrade_signal(upgrade_signal));
+        self
+    }
+
+    /// 注入主会话 mid-turn steering 收件箱（inject 模式）。
+    ///
+    /// 与 [`with_upgrade_signal`](Self::with_upgrade_signal) 同构：把 LiveCli
+    /// 持有的 `steer_inbox`（跨 `prepare_turn_runtime` 重建持久）注入 runtime，
+    /// 使 busy 期间用户投入的插话能在下一次迭代被取出并折叠进模型调用。
+    fn with_steer_inbox(
+        mut self,
+        steer_inbox: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing steer inbox");
+        self.runtime = Some(runtime.with_steer_inbox(steer_inbox));
         self
     }
 
@@ -898,6 +923,7 @@ impl LiveCli {
             cumulative_usage: runtime::TokenUsage::default(),
             goal_manager,
             upgrade_signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            steer_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(feature = "full-tui")]
             status_emitter: None,
             #[cfg(feature = "full-tui")]
@@ -1069,7 +1095,8 @@ impl LiveCli {
             None,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone())
-        .with_upgrade_signal(self.upgrade_signal.clone());
+        .with_upgrade_signal(self.upgrade_signal.clone())
+        .with_steer_inbox(self.steer_inbox.clone());
         runtime.set_tool_verbosity(self.output_verbosity);
         // 推理状态同步：AnthropicRuntimeClient 每轮 turn 都会在
         // prepare_turn_runtime 中重建(见 run_turn → replace_runtime 生命周期),
@@ -3127,6 +3154,16 @@ impl LiveCli {
     #[cfg(feature = "full-tui")]
     pub(crate) fn clear_external_abort_signal(&mut self) {
         self.external_abort_signal = None;
+    }
+
+    /// 主会话 mid-turn steering：取 `steer_inbox` 的共享句柄。
+    ///
+    /// TUI 主线程在把 `cli` move 进 worker 线程**之前**调用此方法取得 clone
+    /// （busy 时 `cli_holder` 为 None，无法再经 cli 访问）。此后 busy 期间用户
+    /// 输入可直接投入该队列，`run_turn` 下一次迭代取出并折叠进模型调用。
+    #[cfg(feature = "full-tui")]
+    pub(crate) fn steer_inbox_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        self.steer_inbox.clone()
     }
 
     /// 细粒度诊断支持：设置 diag callback，在 run_turn 关键路径埋点。

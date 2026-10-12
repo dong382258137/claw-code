@@ -1754,6 +1754,18 @@ pub struct ConversationRuntime<C, T> {
     /// 收尾(不走 Err 路径)。新进程 resume 后注入"继续任务通知"。
     /// 与 `hook_abort_signal`(硬中断,return Err)互补:本信号是优雅收尾。
     upgrade_pending: Arc<AtomicBool>,
+    /// 主会话 mid-turn steering 收件箱(inject 模式)。
+    ///
+    /// 用户在本 turn 执行期间输入的插话消息经 CLI/TUI 投入此队列。`run_turn`
+    /// 在**每次迭代顶部**检查:非空则取出全部条目,以单条 user 消息注入
+    /// session messages —— 下一次模型调用即看到,实现"不停流地改方向"
+    /// (inject 模式;与 `hook_abort_signal` 硬中断、`upgrade_pending` 优雅
+    /// 收尾三者互补)。消息入 messages 尾部(在所有 cache_control 断点之后),
+    /// 不击穿前缀缓存。
+    ///
+    /// 与 `upgrade_pending` 同构:`Arc` 由 CLI 持有并跨 `prepare_turn_runtime`
+    /// 重建注入,否则每轮新 runtime 的队列都会是空的、插话丢失。
+    steer_inbox: Arc<Mutex<Vec<String>>>,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
     /// 细粒度诊断回调：在 `run_turn` 关键路径埋点，帮助定位"会话卡死"问题。
     /// 每个事件自动带时间戳，回调签名 `Fn(String) + Send`。
@@ -2343,9 +2355,7 @@ fn extract_turn_tool_summary(messages: &[ConversationMessage], max_chars: usize)
             MessageRole::Tool => {
                 for b in &m.blocks {
                     if let ContentBlock::ToolResult {
-                        is_error,
-                        output,
-                        ..
+                        is_error, output, ..
                     } = b
                     {
                         if *is_error {
@@ -2472,6 +2482,7 @@ where
             context_window: None,
             hook_abort_signal: HookAbortSignal::default(),
             upgrade_pending: Arc::new(AtomicBool::new(false)),
+            steer_inbox: Arc::new(Mutex::new(Vec::new())),
             hook_progress_reporter: None,
             diag_callback: None,
             tool_result_callback: None,
@@ -2579,6 +2590,30 @@ where
     /// 设置热升级优雅中断信号(由 `/upgrade` 命令调用,旧进程内)。
     pub fn request_upgrade(&self) {
         self.upgrade_pending.store(true, Ordering::SeqCst);
+    }
+
+    /// 注入主会话 mid-turn steering 收件箱(inject 模式)。
+    ///
+    /// 与 [`with_upgrade_signal`](Self::with_upgrade_signal) 同构:CLI 持有
+    /// `Arc<Mutex<Vec<String>>>` 并跨 `prepare_turn_runtime` 重建注入,使
+    /// 用户在本 turn 执行期间的插话能在下一次迭代被取出。
+    #[must_use]
+    pub fn with_steer_inbox(mut self, steer_inbox: Arc<Mutex<Vec<String>>>) -> Self {
+        self.steer_inbox = steer_inbox;
+        self
+    }
+
+    /// 投入一条主会话插话消息(inject 模式;CLI/TUI 在 busy 时调用)。
+    ///
+    /// 线程安全:内部 `Mutex`,可从 TUI 输入线程与 turn 执行线程并发访问。
+    pub fn push_steer_message(&self, message: impl Into<String>) {
+        let text = message.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut inbox) = self.steer_inbox.lock() {
+            inbox.push(text);
+        }
     }
 
     #[must_use]
@@ -3536,14 +3571,12 @@ where
     fn prune_unclosed_tool_use_messages(&mut self) {
         // 只处理"最后一条消息是 assistant 且含 tool_use"的悬空形态;
         // 其前方消息(正常闭合的 assistant/tool 对)不动。
-        let last_is_dangling = self
-            .session
-            .messages
-            .last()
-            .is_some_and(|m| {
-                m.role == MessageRole::Assistant
-                    && m.blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-            });
+        let last_is_dangling = self.session.messages.last().is_some_and(|m| {
+            m.role == MessageRole::Assistant
+                && m.blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        });
         if last_is_dangling {
             self.session.messages.pop();
         }
@@ -4274,6 +4307,35 @@ where
             // 在每次 agent loop 迭代顶部检查，让用户能在工具调用间隙打断 AI。
             // 注意：正在进行的 API 流式请求无法中断（阻塞 IO），但可以阻止
             // 下一轮迭代（不再发起新请求、不再执行新工具）。
+            // 主会话 mid-turn steering(inject 模式):用户在本 turn 执行期间的
+            // 插话经 CLI/TUI 投入 steer_inbox。此处(迭代顶部、请求构造前)取出
+            // 全部条目,合成单条 user 消息注入 session —— 下一次模型调用即看到,
+            // 实现"不停流地改方向"(不取消当前正在进行的推理/工具批)。
+            // 消息入 messages 尾部(所有 cache_control 断点之后),不击穿前缀缓存。
+            {
+                let pending: Vec<String> = {
+                    let mut inbox = self
+                        .steer_inbox
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if inbox.is_empty() {
+                        Vec::new()
+                    } else {
+                        std::mem::take(&mut *inbox)
+                    }
+                };
+                if !pending.is_empty() {
+                    let mut text =
+                        String::from("[用户插话] 你在执行任务期间用户追加了以下意见,请优先遵循:\n");
+                    for (idx, msg) in pending.iter().enumerate() {
+                        text.push_str(&format!("{}. {}\n", idx + 1, msg.trim()));
+                    }
+                    let _ = self
+                        .session
+                        .push_message(ConversationMessage::user_text(text));
+                }
+            }
+
             if self.hook_abort_signal.is_aborted() {
                 self.record_turn_failed(iterations, &RuntimeError::new("turn interrupted by user"));
                 return Err(RuntimeError::new("turn interrupted by user"));
@@ -7154,7 +7216,8 @@ where
         // 复用已渲染内容(避免重复扫描),heading 已对齐 static_cache_breakpoints。
         // T4(方案 A 4-1):workspace_override 存在时,project_context.cwd 切到子目录,
         // 指令文件从子目录收集,使 LLM 路径视角与执行基准一致。
-        let ctx = self.build_subagent_context(capability, workspace_override.as_deref(), &extra_tools);
+        let ctx =
+            self.build_subagent_context(capability, workspace_override.as_deref(), &extra_tools);
         // 双大脑批次1:显式传入的 max_iterations 覆盖能力默认上限(如 brain 综合
         // 放宽到 10 轮)。仅 Some(n) 时覆盖;None 保持 ctx 原值(可能已被任务注入)。
         let mut ctx = ctx;
@@ -7636,7 +7699,9 @@ where
         ctx.tool_summaries = self
             .tool_catalog
             .iter()
-            .filter(|ts| allowed.contains(&ts.name.as_str()) || extra_tools.iter().any(|t| t == &ts.name))
+            .filter(|ts| {
+                allowed.contains(&ts.name.as_str()) || extra_tools.iter().any(|t| t == &ts.name)
+            })
             .cloned()
             .collect();
         ctx
@@ -9712,7 +9777,8 @@ where
             turn_failed: failure.is_some(),
         };
         let th = crate::evolution_gate::thresholds_from_env();
-        let Some(trigger) = crate::evolution_gate::should_trigger_metacognition(&signals, &th) else {
+        let Some(trigger) = crate::evolution_gate::should_trigger_metacognition(&signals, &th)
+        else {
             return;
         };
         let now_ms = std::time::SystemTime::now()
@@ -10157,10 +10223,10 @@ mod tests {
         drop_value_outside_async_ctx, extract_file_path_from_tool_input, is_repetition_warning,
         microcompact_preserve_recent, parse_auto_compaction_threshold,
         parse_auto_compaction_threshold_opt, process_tool_uses, rewrite_path_to_workspace_relative,
-        should_inject_time_soft, time_soft_warning,
-        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
-        PromptCacheEvent, RequestKind, RuntimeError, StaticToolExecutor, SubagentContext,
-        ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
+        should_inject_time_soft, time_soft_warning, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError,
+        StaticToolExecutor, SubagentContext, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
         MICROCOMPACT_PRESERVE_RECENT, RUNTIME_HINTS_HEADER, SESSION_SEARCH_TOOL_SPEC,
         SOFT_MAX_ITERATIONS, SURVEY_GUARD_THRESHOLD,
     };
@@ -11584,6 +11650,57 @@ mod tests {
             })
         });
         assert!(has_notice, "应注入热升级暂停通知给 LLM");
+    }
+
+    /// B:主会话 mid-turn steering(inject 模式)—— 预置插话队列,run_turn
+    /// 在下一次迭代顶部取出并注入为 user 消息。
+    #[test]
+    fn steer_inbox_injects_user_message_into_turn() {
+        use std::sync::Mutex;
+
+        struct SteerApi;
+        impl ApiClient for SteerApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("已按插话调整方向。".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let inbox: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SteerApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_steer_inbox(inbox.clone())
+        .with_max_iterations(3);
+        // 模拟 busy 期间用户插话(经 push_steer_message 投递)。
+        runtime.push_steer_message("先专注修复测试,不要重构");
+        // 空白消息应被忽略。
+        runtime.push_steer_message("   ");
+
+        let result = runtime.run_turn("执行任务", None);
+        assert!(result.is_ok(), "run_turn 应正常返回: {result:?}");
+
+        let msgs = &runtime.session.messages;
+        let has_steer = msgs.iter().any(|m| {
+            m.blocks.iter().any(|b| match b {
+                ContentBlock::Text { text } => {
+                    text.contains("[用户插话]") && text.contains("先专注修复测试")
+                }
+                _ => false,
+            })
+        });
+        assert!(has_steer, "插话应作为 user 消息注入 session");
+        // 消费后队列清空(不重复注入)。
+        assert!(inbox.lock().unwrap().is_empty(), "插话消费后队列应清空");
     }
 
     #[test]
@@ -22504,7 +22621,10 @@ mod tests {
     // ===== 热升级提醒(根因修复:HotUpgrade 从未被触发)=====
 
     /// 建一个带 claw 源码布局(rust/crates/)的临时工作区 runtime。
-    fn runtime_with_claw_layout() -> (ConversationRuntime<NoopApi, StaticToolExecutor>, tempfile::TempDir) {
+    fn runtime_with_claw_layout() -> (
+        ConversationRuntime<NoopApi, StaticToolExecutor>,
+        tempfile::TempDir,
+    ) {
         let tempdir = tempfile::tempdir().expect("temp workspace");
         std::fs::create_dir_all(tempdir.path().join("rust").join("crates")).expect("mkdir");
         let runtime = ConversationRuntime::new(
@@ -22525,7 +22645,10 @@ mod tests {
         let hint = runtime.maybe_hot_upgrade_note(r#"{"path": "rust/crates/runtime/src/a.rs"}"#);
         let hint = hint.expect("自身源码应触发热升级提醒");
         assert!(hint.contains("[hot-upgrade]"), "应带标记: {hint}");
-        assert!(hint.contains("HotUpgrade"), "应点名 HotUpgrade 工具: {hint}");
+        assert!(
+            hint.contains("HotUpgrade"),
+            "应点名 HotUpgrade 工具: {hint}"
+        );
     }
 
     /// 非源码文件(如 .md)不触发 —— 避免误扰。
