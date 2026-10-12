@@ -184,10 +184,7 @@ fn build_call(input: &WindowsControlInput) -> Result<(String, Value), String> {
             } else {
                 key
             };
-            return Err(format!(
-                "action '{}' requires '{}'",
-                input.action, field
-            ));
+            return Err(format!("action '{}' requires '{}'", input.action, field));
         }
     }
 
@@ -219,7 +216,10 @@ fn build_call(input: &WindowsControlInput) -> Result<(String, Value), String> {
     put("max_depth", input.max_depth.map(Value::from));
     put("timeout_ms", input.timeout_ms.map(Value::from));
     put("delay_ms", input.delay_ms.map(Value::from));
-    put("delivery_mode", input.delivery_mode.as_deref().map(Value::from));
+    put(
+        "delivery_mode",
+        input.delivery_mode.as_deref().map(Value::from),
+    );
 
     Ok((tool.to_string(), Value::Object(a)))
 }
@@ -263,7 +263,9 @@ fn ensure_session(exe: &Path) -> Result<String, String> {
     static READY: OnceLock<Mutex<bool>> = OnceLock::new();
     let ready = READY.get_or_init(|| Mutex::new(false));
     {
-        let r = ready.lock().map_err(|_| "session lock poisoned".to_string())?;
+        let r = ready
+            .lock()
+            .map_err(|_| "session lock poisoned".to_string())?;
         if *r {
             return Ok(session_name().to_string());
         }
@@ -287,7 +289,9 @@ fn ensure_session(exe: &Path) -> Result<String, String> {
             Err(e) => last_err = e,
         }
     }
-    Err(format!("failed to create cua-driver session '{name}': {last_err}"))
+    Err(format!(
+        "failed to create cua-driver session '{name}': {last_err}"
+    ))
 }
 
 /// Stamp a session label onto call args (no-op for `start_session`).
@@ -335,8 +339,7 @@ fn invoke_once(exe: &Path, tool: &str, args: &Value) -> Result<String, String> {
         };
         return Err(format!(
             "cua-driver '{}' failed ({}): {msg}",
-            tool,
-            out.status
+            tool, out.status
         ));
     }
     Ok(stdout.trim().to_string())
@@ -400,7 +403,10 @@ fn resolve_screenshot_path(save_path: Option<&str>) -> Result<PathBuf, String> {
         .map_err(|e| format!("system clock error: {e}"))?
         .as_millis();
     let cwd = std::env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?;
-    Ok(cwd.join(".claw").join("windows_shots").join(format!("{ts}.png")))
+    Ok(cwd
+        .join(".claw")
+        .join("windows_shots")
+        .join(format!("{ts}.png")))
 }
 
 // ---------------------------------------------------------------------------
@@ -626,8 +632,15 @@ fn detect_mode(exe: &Path, pid: u64) -> Result<CdpMode, String> {
         .and_then(|f| f.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if ["chrome.exe", "msedge.exe", "chromium.exe", "brave.exe", "vivaldi.exe", "opera.exe"]
-        .contains(&name.as_str())
+    if [
+        "chrome.exe",
+        "msedge.exe",
+        "chromium.exe",
+        "brave.exe",
+        "vivaldi.exe",
+        "opera.exe",
+    ]
+    .contains(&name.as_str())
     {
         return Ok(CdpMode::Chromium);
     }
@@ -657,7 +670,10 @@ fn kill_tree(pid: u64) -> Result<(), String> {
 fn wait_process_gone(pid: u64, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if ps_exe_path(pid).map(|p| p.trim().is_empty()).unwrap_or(true) {
+        if ps_exe_path(pid)
+            .map(|p| p.trim().is_empty())
+            .unwrap_or(true)
+        {
             return;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -809,12 +825,10 @@ fn resolve_cua_driver() -> Result<PathBuf, String> {
                 return Ok(candidate);
             }
         }
-        Err(
-            "cua-driver executable not found. Install it with: \
+        Err("cua-driver executable not found. Install it with: \
              irm https://cua.ai/driver/install.ps1 | iex \
              (or set CLAW_CUA_DRIVER to the cua-driver.exe path)"
-                .to_string(),
-        )
+            .to_string())
     })
     .clone()
 }
