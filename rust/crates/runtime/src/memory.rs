@@ -1170,6 +1170,101 @@ fn extract_after_phrase(text: &str, phrase: &str) -> String {
         .to_string()
 }
 
+// ===== Q5(2026-10-13):逐轮用户风格/偏好观察 =====
+//
+// 用户诉求:「提取我的每一次发言，从中理解我的喜好和风格，并固化到记忆中」。
+// 既有 `extract_nudge_actions` 只在「显式记忆关键词」(remember/prefer/记住…)
+// 命中且有 5 轮节流时才动作,覆盖不到**每一条发言**的风格信号。本模块补一条
+// **纯确定性**(零 LLM 调用 ⇒ 零成本、可单测、可每轮运行)的观察通道:
+// 对每条 user 消息做模式匹配,产出短小风格事实,去重后写入记忆
+// (source = "style-observer")。写入遵循既有 frozen-snapshot 语义:
+// 本会话经语义召回可见,下个会话进入 system 前缀,不扰动当前前缀缓存。
+
+/// 从单条用户发言中提取确定性的喜好/风格信号(零 LLM)。
+///
+/// 返回短小、可直接持久化为记忆条目的风格事实;无信号时返回空 vec。
+/// 只做**保守**判定(高质量信号优于数量),避免把噪音写进长期记忆。
+#[must_use]
+pub fn extract_style_signals(text: &str) -> Vec<String> {
+    let mut signals = Vec::new();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return signals;
+    }
+    let lower = trimmed.to_lowercase();
+    let contains_any = |keys: &[&str]| keys.iter().any(|k| lower.contains(k));
+
+    // 1. 语言偏好:CJK 存在 ⇒ 用户以中文交流,默认用中文回复。
+    if trimmed
+        .chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    {
+        signals.push("user writes in Chinese; reply in Chinese by default".to_string());
+    }
+
+    // 2. 简洁 vs 详尽。
+    if contains_any(&[
+        "简洁", "简短", "精简", "别啰嗦", "concise", "be brief", "keep it short",
+    ]) {
+        signals.push("user prefers concise, to-the-point answers".to_string());
+    }
+    if contains_any(&[
+        "详细", "展开", "具体说明", "逐条", "in detail", "elaborate", "explain fully",
+    ]) {
+        signals.push("user wants thorough, detailed explanations".to_string());
+    }
+
+    // 3. 结构化输出偏好。
+    if contains_any(&["表格", "列表", "清单", "table", "bullet"]) {
+        signals.push("user likes structured output (tables/lists)".to_string());
+    }
+
+    // 4. 自主性:用户明确表示不要被反问。
+    if contains_any(&[
+        "不要问我", "别问我", "自行决策", "自己决定", "don't ask me", "decide yourself",
+        "no questions",
+    ]) {
+        signals.push(
+            "user wants autonomous decisions — do not ask, decide and proceed".to_string(),
+        );
+    }
+
+    // 5. 严谨性:第一性原理 / 权威来源。
+    if contains_any(&["第一性原理", "first principle"]) {
+        signals.push("user values first-principles reasoning".to_string());
+    }
+    if contains_any(&[
+        "论文", "权威", "引用", "paper", "citation", "cite", "reference",
+    ]) {
+        signals.push("user expects authoritative sources/citations for claims".to_string());
+    }
+
+    signals
+}
+
+/// 把逐轮风格信号折入记忆:仅添加**尚未记录**的信号(按活跃条目的内容精确
+/// 去重,含 source=`style-observer` 的历史写入),返回新增条目数。
+///
+/// 传入的 `texts` 通常是最近若干条 user 发言(至少含本轮发言)。零副作用于
+/// 已存在信号 ⇒ 重复发言不会无限膨胀记忆。
+pub fn observe_user_style(memory: &mut PersistentMemory, texts: &[String]) -> usize {
+    let now = now_ms();
+    let mut added = 0usize;
+    for text in texts {
+        for signal in extract_style_signals(text) {
+            let exists = memory
+                .entries()
+                .iter()
+                .any(|entry| entry.is_active(now) && entry.content == signal);
+            if !exists {
+                memory.add_entry(&signal, "style-observer");
+                added += 1;
+            }
+        }
+    }
+    added
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1703,6 +1798,34 @@ mod tests {
     }
 
     // --- P2: memory_update 工具 — 模型主动管理 PersistentMemory ------------
+
+    #[test]
+    fn extract_style_signals_detects_preferences() {
+        let zh = extract_style_signals("请你简洁一点，不要问我，自行决策，参考权威论文");
+        assert!(zh.iter().any(|s| s.contains("Chinese")), "应检出中文偏好: {zh:?}");
+        assert!(zh.iter().any(|s| s.contains("concise")), "应检出简洁偏好: {zh:?}");
+        assert!(zh.iter().any(|s| s.contains("autonomous")), "应检出自主性: {zh:?}");
+        assert!(zh.iter().any(|s| s.contains("authoritative")), "应检出引用要求: {zh:?}");
+        // 无信号文本 ⇒ 空(不写噪音)。
+        assert!(extract_style_signals("ok").is_empty());
+        assert!(extract_style_signals("   ").is_empty());
+    }
+
+    #[test]
+    fn observe_user_style_is_idempotent() {
+        let mut mem = PersistentMemory::empty(temp_path());
+        let texts = vec!["please be concise".to_string()];
+        let first = observe_user_style(&mut mem, &texts);
+        assert_eq!(first, 1, "首次应写入 1 条风格条目");
+        let again = observe_user_style(&mut mem, &texts);
+        assert_eq!(again, 0, "重复观测应去重、不膨胀");
+        assert!(
+            mem.entries()
+                .iter()
+                .any(|e| e.source == "style-observer"),
+            "条目来源应为 style-observer"
+        );
+    }
 
     #[test]
     fn update_block_updates_persona_human_tasks() {

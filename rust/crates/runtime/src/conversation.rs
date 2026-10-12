@@ -13,7 +13,8 @@ use crate::compact::{
 use crate::config::{ConfigLoader, RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::hooks::{HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner};
 use crate::memory::{
-    extract_nudge_actions, should_nudge, NudgeAction, NudgeConfig, PersistentMemory,
+    extract_nudge_actions, observe_user_style, should_nudge, NudgeAction, NudgeConfig,
+    PersistentMemory,
 };
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
@@ -6104,6 +6105,37 @@ where
         // 不消耗 LLM token，但仍会写入 memory.json 增加后续 prompt 体积；
         // 穷鬼模式下用户明确希望最小化副作用）。
         if !crate::poor_mode::is_active() {
+            // Q5(2026-10-13):逐轮用户风格观察(纯确定性,零 LLM)。与下方
+            // 节流式 nudge(每 N 轮、仅显式关键词)不同,本通道**每轮**运行:
+            // 从最近 3 条 user 发言提取喜好/风格信号,去重后写入记忆
+            // (source=style-observer)。幂等 ⇒ 重复发言不膨胀;写入遵循
+            // frozen-snapshot 语义 ⇒ 本会话经语义召回可见,下会话进前缀。
+            if let Some(memory) = &mut self.persistent_memory {
+                let style_texts: Vec<String> = {
+                    let mut picked: Vec<String> = Vec::new();
+                    for msg in self.session.messages.iter().rev() {
+                        if msg.role == MessageRole::User {
+                            let text = msg
+                                .blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    ContentBlock::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !text.trim().is_empty() {
+                                picked.push(text);
+                            }
+                            if picked.len() >= 3 {
+                                break;
+                            }
+                        }
+                    }
+                    picked
+                };
+                observe_user_style(memory, &style_texts);
+            }
             self.turns_since_last_nudge += 1;
             let nudge_config = NudgeConfig::default();
             if let Some(memory) = &mut self.persistent_memory {
