@@ -4491,16 +4491,23 @@ where
                             };
                             let _ = crate::fixed_memory::save(root, &snap);
                             // 简报拆分为稳定段与易变段:稳定段(已完成项/历史教训/
-                            // 注脚)是跨任务有效的工作区经验,注入 messages[0] 前缀;
-                            // 易变段(当前目标/下一步)是会话级状态 —— 由
-                            // render_runtime_hints 的 Current Task 槽位从
-                            // active_plan 提供,此处**彻底丢弃**(工作区快照的
-                            // "当前目标"会残留旧任务,2026-08-31 实证污染)。
-                            // 稳定段为空(简报全为易变内容)时不注入,避免空消息。
+                            // 注脚)是跨任务有效的工作区经验;易变段(当前目标/
+                            // 下一步)是会话级状态 —— 由 render_runtime_hints 的
+                            // Current Task 槽位从 active_plan 提供,此处**彻底
+                            // 丢弃**(工作区快照的"当前目标"会残留旧任务,
+                            // 2026-08-31 实证污染)。稳定段为空时不注入,避免空消息。
+                            //
+                            // 注入位置=**messages 尾部**(2026-10-15 改,原为
+                            // messages[0] 前缀):简报在 TTL 冷窗重建时字节必变,
+                            // 而缓存是**前缀缓存** —— 落在头部则一变即作废其后全部
+                            // 历史 token。实测(dumps/req-00008.json)该消息从
+                            // 1868B 变 884B 时,cache_read 由 126080 塌回 26880
+                            // (static tools+system),差额整段转 cache_creation。
+                            // 移到尾部后,重建只影响最后一条消息,前缀保持命中。
                             let (stable, _volatile) =
                                 crate::fixed_memory::split_stable_volatile(&snap.content);
                             if !stable.trim().is_empty() {
-                                messages.insert(0, ConversationMessage::user_text(stable));
+                                messages.push(ConversationMessage::user_text(stable));
                             }
                             self.fixed_memory = Some(snap);
                             llm_triggered = true;
@@ -4538,10 +4545,16 @@ where
                             // 前缀只注入稳定段(已完成项/历史教训/注脚);易变段
                             // (当前目标/下一步)不再注入 —— Current Task 由
                             // active_plan 提供。复用路径(缓存热)字节保持不变。
+                            //
+                            // 注入位置=**messages 尾部**(2026-10-15 改,原为
+                            // messages[0] 前缀):简报在冷窗重建时字节必变
+                            // (实测 1868B→884B),落在头部则一变即作废其后全部
+                            // 历史 token(cache_read 126080→26880)。移尾部后
+                            // 重建只影响末条消息,前缀保持命中。
                             let (stable, _volatile) =
                                 crate::fixed_memory::split_stable_volatile(&snap.content);
                             if !stable.trim().is_empty() {
-                                messages.insert(0, ConversationMessage::user_text(stable));
+                                messages.push(ConversationMessage::user_text(stable));
                             }
                         }
                         self.fixed_memory = next;
@@ -14059,15 +14072,19 @@ mod tests {
             !tail.contains("旧任务目标"),
             "workspace snapshot goal must NOT leak into Current Task: {tail}"
         );
-        // 前缀固定记忆(重建自新 task_state)只含稳定段,不含旧目标。
-        let head = texts.first().expect("head message");
+        // 固定记忆(重建自新 task_state)只含稳定段,不含旧目标。
+        // 2026-10-15:注入位置改 messages **尾部**,按内容检索。
+        let head = texts
+            .iter()
+            .find(|t| t.contains("# 固定记忆"))
+            .expect("fixed-memory brief present");
         assert!(
             head.contains("# 固定记忆"),
-            "head must be fixed-memory brief: {head}"
+            "brief must be fixed-memory: {head}"
         );
         assert!(
             !head.contains("旧任务目标") && !head.contains("当前目标"),
-            "prefix must not carry old goal: {head}"
+            "brief must not carry old goal: {head}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -14090,12 +14107,10 @@ mod tests {
         }
         impl ApiClient for TaskStateApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                // 捕获请求头部消息文本(fixed_memory 在请求构造时注入
-                // messages 最前部,不再进末尾槽位)。
+                // 捕获请求全部消息文本(fixed_memory 现注入 messages 尾部)。
                 let head_texts: Vec<String> = request
                     .messages
                     .iter()
-                    .take(1)
                     .map(|m| {
                         m.blocks
                             .iter()
@@ -14171,16 +14186,18 @@ mod tests {
 
         let sections = captured.lock().expect("lock");
         let last = sections.last().expect("two requests captured");
-        let head = last.first().expect("head message");
+        // 2026-10-15:固定记忆改注入 messages **尾部**(原 messages[1] 前缀)——
+        // 其在冷窗重建时字节必变,落头部会作废其后全部历史 token。故在全部
+        // 消息中检索,而非只看头部。
+        let joined = last.join("\n");
         assert!(
-            head.contains("固定记忆"),
-            "fixed memory block should be injected at head, got: {head}"
+            joined.contains("固定记忆"),
+            "fixed memory block should be injected, got: {joined}"
         );
-        // C1:goal(当前目标/BTC)从前缀剥离到尾部 Current Task 槽位 ——
-        // 前缀只留低频稳定内容,易变目标变化不打断前缀缓存。
+        // C1:goal(当前目标/BTC)不注入固定记忆 —— 只留低频稳定内容。
         assert!(
-            !head.contains("当前目标"),
-            "C1: goal must be moved out of prefix head, got: {head}"
+            !joined.contains("当前目标"),
+            "C1: goal must not leak into fixed memory, got: {joined}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -14202,12 +14219,11 @@ mod tests {
         }
         impl ApiClient for LessonApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                // 捕获请求头部消息文本(fixed_memory 在请求构造时注入
-                // messages 最前部,不再进末尾槽位)。
+                // 捕获请求全部消息文本(2026-10-15 起 fixed_memory 注入 messages
+                // **尾部**,不再取 take(1))。
                 let head_texts: Vec<String> = request
                     .messages
                     .iter()
-                    .take(1)
                     .map(|m| {
                         m.blocks
                             .iter()
@@ -14487,41 +14503,39 @@ mod tests {
 
         let shots = captured.lock().expect("lock");
         let texts = shots.first().expect("request captured");
-        let head = texts.first().expect("head message");
+        // 2026-10-15:固定记忆改注入 messages **尾部**(原 messages[1])——它在
+        // 冷窗重建时字节必变,落头部会作废其后全部历史 token(cache_read 实测
+        // 126080→26880);移尾部后重建只影响末条消息,前缀保持命中。
+        let fm = texts
+            .iter()
+            .find(|t| t.contains("# 固定记忆"))
+            .expect("fixed-memory block must be injected");
         assert!(
-            head.contains("# 固定记忆"),
-            "head must be fixed-memory brief, got: {head}"
+            fm.contains("验证指引"),
+            "brief must include verification guidance, got: {fm}"
         );
         assert!(
-            head.contains("验证指引"),
-            "head must include verification guidance, got: {head}"
+            fm.contains("不要全库搜索"),
+            "brief must include no-full-repo-search guidance, got: {fm}"
         );
+        // C1:goal(当前目标)不注入固定记忆 —— 由尾部 Current Task 槽位从
+        // active_plan 提供,避免工作区级旧目标残留污染。
         assert!(
-            head.contains("不要全库搜索"),
-            "head must include no-full-repo-search guidance, got: {head}"
+            !fm.contains("当前目标"),
+            "C1: goal must not leak into brief, got: {fm}"
         );
-        // C1:goal(当前目标)从前缀剥离到尾部 Current Task 槽位 —— 前缀只留
-        // 低频稳定内容(已完成项/注脚),易变目标变化不打断前缀缓存。
-        assert!(
-            !head.contains("当前目标"),
-            "C1: goal must be moved out of prefix head, got: {head}"
-        );
-        let tail = texts.last().expect("tail message");
-        // Current Task 优先 active_plan.task_summary;本测试无 plan → 兜底
-        // 会话级 task_state.goal(turn 开头从 user_input 提取)。标题为英文
-        // "Current Task",不出现"当前目标"字样 —— 前缀快照的"当前目标"
-        // (旧任务残留)已彻底移除(2026-08-31 实证污染修复)。
-        assert!(
-            !tail.contains("当前目标"),
-            "prefix snapshot must not carry 当前目标, got: {tail}"
-        );
+        // 位置契约反转:固定记忆须排在用户输入**之后**(前缀冻结)。
         let user_pos = texts
             .iter()
             .position(|t| t.contains("请继续重构 auth 模块"))
             .expect("user input present");
+        let fm_pos = texts
+            .iter()
+            .position(|t| t.contains("# 固定记忆"))
+            .expect("fixed memory present");
         assert!(
-            user_pos > 0,
-            "fixed memory must sit before the user input (index {user_pos})"
+            fm_pos > user_pos,
+            "fixed memory must sit after the user input (fm={fm_pos}, user={user_pos})"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -14540,10 +14554,16 @@ mod tests {
         }
         impl ApiClient for FmApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                // 捕获请求头部第一条消息的文本(固定记忆槽位)
-                let head = request
+                // 捕获请求中的固定记忆消息(2026-10-15 起注入 messages **尾部**,
+                // 故按内容检索而非取 first())。
+                let fm = request
                     .messages
-                    .first()
+                    .iter()
+                    .find(|m| {
+                        m.blocks.iter().any(|b| {
+                            matches!(b, ContentBlock::Text { text } if text.contains("# 固定记忆"))
+                        })
+                    })
                     .map(|m| {
                         m.blocks
                             .iter()
@@ -14555,7 +14575,7 @@ mod tests {
                             .join("\n")
                     })
                     .unwrap_or_default();
-                self.captured.lock().expect("lock").push(vec![head]);
+                self.captured.lock().expect("lock").push(vec![fm]);
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
@@ -14832,29 +14852,33 @@ mod tests {
         {
             let shots = captured.lock().expect("lock");
             let texts = shots.first().expect("turn1 request captured");
-            let head = texts.first().expect("head message");
+            // 2026-10-15:固定记忆注入位置由头部改到**尾部**,故按内容检索而非
+            // 取 messages[0];断言其排在用户输入之后(前缀冻结契约)。
+            let fm = texts
+                .iter()
+                .find(|t| t.contains("# 固定记忆"))
+                .expect("turn1 must inject fixed-memory brief");
             assert!(
-                head.contains("# 固定记忆") && head.contains("验证指引"),
-                "turn1 head must be fixed-memory brief: {head}"
+                fm.contains("验证指引"),
+                "turn1 brief must carry verification guidance: {fm}"
             );
-            // 当前目标从前缀剥离后不再注入(Current Task 由 active_plan 或
-            // 会话级 task_state.goal 提供,标题为英文,不含"当前目标"字样)。
+            // 当前目标不注入固定记忆(Current Task 由 active_plan 或会话级
+            // task_state.goal 提供,标题为英文,不含"当前目标"字样)。
             assert!(
-                !head.contains("当前目标"),
-                "goal must be moved out of prefix head: {head}"
-            );
-            assert!(
-                texts.last().is_some_and(|t| !t.contains("当前目标")),
-                "tail must not carry workspace snapshot's 当前目标, last={:?}",
-                texts.last()
+                !fm.contains("当前目标"),
+                "goal must not leak into brief: {fm}"
             );
             let user_pos = texts
                 .iter()
                 .position(|t| t.contains("请深入重构 auth 模块"))
                 .expect("user input present");
+            let fm_pos = texts
+                .iter()
+                .position(|t| t.contains("# 固定记忆"))
+                .expect("fixed memory present");
             assert!(
-                user_pos > 0,
-                "fixed memory must sit before user input (index {user_pos})"
+                fm_pos > user_pos,
+                "fixed memory must sit after user input (fm={fm_pos}, user={user_pos})"
             );
         }
 
@@ -14913,12 +14937,20 @@ mod tests {
                 "four requests captured, got: {}",
                 shots.len()
             );
-            let head = shots[3].first().expect("turn4 head message");
+            // 2026-10-15:固定记忆改注入 messages **尾部**,按内容检索简报。
+            let head = shots[3]
+                .iter()
+                .find(|t| t.contains("固定记忆") || t.contains("FAKE_LLM_BRIEF"))
+                .expect("turn4 must still inject a fixed-memory brief");
             assert!(
                 head.contains("固定记忆") || head.contains("FAKE_LLM_BRIEF"),
-                "turn4 head must still be a fixed-memory brief: {head}"
+                "turn4 must still be a fixed-memory brief: {head}"
             );
-            assert_ne!(head, &shots[0][0], "cold window must rebuild head bytes");
+            let prev_head = shots[0]
+                .iter()
+                .find(|t| t.contains("固定记忆") || t.contains("FAKE_LLM_BRIEF"))
+                .expect("turn1 brief present");
+            assert_ne!(head, prev_head, "cold window must rebuild brief bytes");
             // 冷窗重建后,turn3 产出的 finding 应经规则通道进入磁盘 task_state
             // (task_state 独立于 fixed_memory,不因 LLM 简报路径而丢失)。
             let ts_after =
@@ -14932,9 +14964,18 @@ mod tests {
                 "turn3 finding must be in task_state: {:?}",
                 ts_after.findings
             );
+            // 核心回归不变量(2026-10-15):冷窗重建简报时,**前缀头部字节必须
+            // 保持不变** —— 简报已移到尾部,其重建不得触碰 messages 前缀,否则
+            // 会作废其后全部历史 token(原缺陷:head 1868B→884B 时 cache_read
+            // 由 126080 塌回 26880)。shots[0][0] 与 shots[3][0] 分别是 turn1/
+            // turn4 的**首条消息**(用户输入),两者应为同一字节。
+            assert_eq!(
+                shots[0][0], shots[3][0],
+                "cold-window rebuild must NOT mutate the prefix head"
+            );
             assert_ne!(
                 crate::fixed_memory::fingerprint(head),
-                crate::fixed_memory::fingerprint(&shots[0][0]),
+                crate::fixed_memory::fingerprint(prev_head),
                 "fingerprint must change after cold-window rebuild"
             );
         }
@@ -15030,11 +15071,13 @@ mod tests {
             .expect("turn should succeed");
 
         let shots = captured.lock().expect("lock");
+        // 2026-10-15:固定记忆改注入 messages **尾部**,按内容检索(不再取 first())。
         let head = shots
             .first()
             .expect("request captured")
-            .first()
-            .expect("head");
+            .iter()
+            .find(|t| t.contains("跨进程快照内容 ABC"))
+            .expect("disk snapshot must be injected");
         assert_eq!(
             head, &disk_content,
             "cross-process reuse must serve disk snapshot bytes verbatim"
@@ -15223,14 +15266,16 @@ mod tests {
         runtime.run_turn("继续", None).expect("turn should succeed");
 
         let shots = captured.lock().expect("lock");
+        // 2026-10-15:固定记忆注入位置由 messages[0] 改为**尾部**,按内容检索。
         let head = shots
             .first()
             .expect("request captured")
-            .first()
-            .expect("head message");
+            .iter()
+            .find(|t| t.contains("FAKE_LLM_BRIEF") || t.contains("# 固定记忆"))
+            .expect("fixed-memory brief present");
         assert!(
             head.contains("FAKE_LLM_BRIEF"),
-            "前瞻触发后 messages[0] 应为 LLM 简报: {head}"
+            "前瞻触发后简报应为 LLM 版本: {head}"
         );
         assert!(head.contains("auth.rs"), "LLM 简报应含文件锚点: {head}");
         // 磁盘快照:LLM 简报落盘 + injected_at_ms 刷新 + 摘要点游标推进
@@ -15376,10 +15421,11 @@ mod tests {
             let head = shots
                 .first()
                 .expect("request captured")
-                .first()
-                .expect("head message");
+                .iter()
+                .find(|t| t.contains("FAKE_LLM_BRIEF"))
+                .expect("LLM brief present");
             // LLM 路径已触发(而非规则 build_snapshot)
-            assert!(head.contains("FAKE_LLM_BRIEF"), "LLM brief at head: {head}");
+            assert!(head.contains("FAKE_LLM_BRIEF"), "LLM brief: {head}");
             // 交叉校验注脚:规则确认但简报未体现的结论追加到简报末尾
             assert!(
                 head.contains("规则通道确认但简报未体现"),
@@ -15497,11 +15543,13 @@ mod tests {
         runtime.run_turn("继续", None).expect("turn should succeed");
 
         let shots = captured.lock().expect("lock");
+        // 2026-10-15:固定记忆改注入 messages **尾部**,按内容检索。
         let head = shots
             .first()
             .expect("request captured")
-            .first()
-            .expect("head message");
+            .iter()
+            .find(|t| t.contains("# 固定记忆"))
+            .expect("rule snapshot must be injected");
         assert!(head.contains("# 固定记忆"), "窗口内应为规则快照: {head}");
         // C1:goal(当前目标)从前缀剥离到尾部 Current Task 槽位。
         assert!(
