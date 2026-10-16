@@ -100,14 +100,18 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         {
-            let first = EvolutionLock::acquire(&root).expect("acquire").expect("some");
+            let first = EvolutionLock::acquire(&root)
+                .expect("acquire")
+                .expect("some");
             // 第二个应失败(已被持有)。
             let second = EvolutionLock::acquire(&root).expect("acquire2");
             assert!(second.is_none(), "锁被持有时第二个应为 None");
             drop(first);
         }
         // 释放后可再获取。
-        let again = EvolutionLock::acquire(&root).expect("acquire3").expect("some");
+        let again = EvolutionLock::acquire(&root)
+            .expect("acquire3")
+            .expect("some");
         drop(again);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -122,7 +126,9 @@ mod tests {
         // 写一个很旧的锁。
         std::fs::write(dir.join(".lock"), "pid=1 at_ms=1000\n").unwrap();
 
-        let lock = EvolutionLock::acquire(&root).expect("acquire").expect("应回收陈旧锁");
+        let lock = EvolutionLock::acquire(&root)
+            .expect("acquire")
+            .expect("应回收陈旧锁");
         assert!(lock.path().exists());
         drop(lock);
         let _ = std::fs::remove_dir_all(&root);

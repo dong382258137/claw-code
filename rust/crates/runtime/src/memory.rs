@@ -1204,12 +1204,24 @@ pub fn extract_style_signals(text: &str) -> Vec<String> {
 
     // 2. 简洁 vs 详尽。
     if contains_any(&[
-        "简洁", "简短", "精简", "别啰嗦", "concise", "be brief", "keep it short",
+        "简洁",
+        "简短",
+        "精简",
+        "别啰嗦",
+        "concise",
+        "be brief",
+        "keep it short",
     ]) {
         signals.push("user prefers concise, to-the-point answers".to_string());
     }
     if contains_any(&[
-        "详细", "展开", "具体说明", "逐条", "in detail", "elaborate", "explain fully",
+        "详细",
+        "展开",
+        "具体说明",
+        "逐条",
+        "in detail",
+        "elaborate",
+        "explain fully",
     ]) {
         signals.push("user wants thorough, detailed explanations".to_string());
     }
@@ -1221,12 +1233,16 @@ pub fn extract_style_signals(text: &str) -> Vec<String> {
 
     // 4. 自主性:用户明确表示不要被反问。
     if contains_any(&[
-        "不要问我", "别问我", "自行决策", "自己决定", "don't ask me", "decide yourself",
+        "不要问我",
+        "别问我",
+        "自行决策",
+        "自己决定",
+        "don't ask me",
+        "decide yourself",
         "no questions",
     ]) {
-        signals.push(
-            "user wants autonomous decisions — do not ask, decide and proceed".to_string(),
-        );
+        signals
+            .push("user wants autonomous decisions — do not ask, decide and proceed".to_string());
     }
 
     // 5. 严谨性:第一性原理 / 权威来源。
@@ -1234,7 +1250,13 @@ pub fn extract_style_signals(text: &str) -> Vec<String> {
         signals.push("user values first-principles reasoning".to_string());
     }
     if contains_any(&[
-        "论文", "权威", "引用", "paper", "citation", "cite", "reference",
+        "论文",
+        "权威",
+        "引用",
+        "paper",
+        "citation",
+        "cite",
+        "reference",
     ]) {
         signals.push("user expects authoritative sources/citations for claims".to_string());
     }
@@ -1802,10 +1824,22 @@ mod tests {
     #[test]
     fn extract_style_signals_detects_preferences() {
         let zh = extract_style_signals("请你简洁一点，不要问我，自行决策，参考权威论文");
-        assert!(zh.iter().any(|s| s.contains("Chinese")), "应检出中文偏好: {zh:?}");
-        assert!(zh.iter().any(|s| s.contains("concise")), "应检出简洁偏好: {zh:?}");
-        assert!(zh.iter().any(|s| s.contains("autonomous")), "应检出自主性: {zh:?}");
-        assert!(zh.iter().any(|s| s.contains("authoritative")), "应检出引用要求: {zh:?}");
+        assert!(
+            zh.iter().any(|s| s.contains("Chinese")),
+            "应检出中文偏好: {zh:?}"
+        );
+        assert!(
+            zh.iter().any(|s| s.contains("concise")),
+            "应检出简洁偏好: {zh:?}"
+        );
+        assert!(
+            zh.iter().any(|s| s.contains("autonomous")),
+            "应检出自主性: {zh:?}"
+        );
+        assert!(
+            zh.iter().any(|s| s.contains("authoritative")),
+            "应检出引用要求: {zh:?}"
+        );
         // 无信号文本 ⇒ 空(不写噪音)。
         assert!(extract_style_signals("ok").is_empty());
         assert!(extract_style_signals("   ").is_empty());
@@ -1820,9 +1854,7 @@ mod tests {
         let again = observe_user_style(&mut mem, &texts);
         assert_eq!(again, 0, "重复观测应去重、不膨胀");
         assert!(
-            mem.entries()
-                .iter()
-                .any(|e| e.source == "style-observer"),
+            mem.entries().iter().any(|e| e.source == "style-observer"),
             "条目来源应为 style-observer"
         );
     }

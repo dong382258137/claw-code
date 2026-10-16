@@ -744,11 +744,8 @@ mod tests {
         let mut detector = LoopDetector::new();
         for i in 0..TOOL_ABORT_THRESHOLD + 3 {
             let output = format!("page-state-{i}");
-            let action = detector.record_tool_call(
-                "browser_control",
-                r#"{"action":"snapshot"}"#,
-                &output,
-            );
+            let action =
+                detector.record_tool_call("browser_control", r#"{"action":"snapshot"}"#, &output);
             assert!(
                 matches!(action, LoopAction::Continue),
                 "快照类调用不应被相同-input 通道拦截(第 {i} 次)"

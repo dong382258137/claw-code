@@ -123,8 +123,7 @@ pub fn evolution_prompt(proposal_path: &Path, proposal: &ParsedProposal) -> Stri
          ## 交付\n\
          - 若修复成功且测试门全过:用 git 提交(不要 push),并在最终答复里列出\n\
            改动文件 + 测试证据。**不要**自行触发部署/热升级(那需人工闸门)。\n\
-         - 若无法修复或测试门不过:如实报告失败原因,不做部分提交。"
-        ,
+         - 若无法修复或测试门不过:如实报告失败原因,不做部分提交。",
         path = proposal_path.display(),
         trigger = proposal.trigger.as_deref().unwrap_or("(unknown)"),
         severity = proposal.severity.as_deref().unwrap_or("(unknown)"),
@@ -167,6 +166,9 @@ mod tests {
         assert!(prompt.contains("黑名单"), "应含黑名单约束");
         assert!(prompt.contains("cargo test --workspace"), "应含测试门");
         assert!(prompt.contains("upgrade_helper.rs"), "黑名单应含升级助手");
-        assert!(prompt.contains("不要") && prompt.contains("部署"), "应含人工闸门说明");
+        assert!(
+            prompt.contains("不要") && prompt.contains("部署"),
+            "应含人工闸门说明"
+        );
     }
 }

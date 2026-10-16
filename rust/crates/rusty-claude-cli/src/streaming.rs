@@ -621,9 +621,8 @@ impl ApiClient for AnthropicRuntimeClient {
     ) -> Result<Box<dyn ApiClient>, String> {
         let enable_tools = capability.enables_tools();
         let allowed_tools = if enable_tools {
-            let mut set = AllowedToolSet::from_iter(
-                capability.allowed_tools().iter().map(|s| s.to_string()),
-            );
+            let mut set =
+                AllowedToolSet::from_iter(capability.allowed_tools().iter().map(|s| s.to_string()));
             set.extend(extra_tools.iter().cloned());
             Some(set)
         } else {

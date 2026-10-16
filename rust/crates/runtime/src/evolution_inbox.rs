@@ -137,12 +137,14 @@ pub fn mark_processed(inbox_dir: &Path, proposal: &Path) -> Result<Option<PathBu
         return Ok(None);
     }
     let dst_dir = inbox_dir.join(PROCESSED_DIR);
-    std::fs::create_dir_all(&dst_dir).map_err(|e| format!("创建 {} 失败: {e}", dst_dir.display()))?;
+    std::fs::create_dir_all(&dst_dir)
+        .map_err(|e| format!("创建 {} 失败: {e}", dst_dir.display()))?;
     let name = proposal
         .file_name()
         .ok_or_else(|| format!("无效提案路径: {}", proposal.display()))?;
     let dst = dst_dir.join(name);
-    std::fs::rename(proposal, &dst).map_err(|e| format!("移动 {} 失败: {e}", proposal.display()))?;
+    std::fs::rename(proposal, &dst)
+        .map_err(|e| format!("移动 {} 失败: {e}", proposal.display()))?;
     Ok(Some(dst))
 }
 
@@ -228,8 +230,13 @@ mod tests {
         let pending = list_pending(&inbox);
         assert_eq!(pending.len(), 1, "pending={pending:?}");
 
-        let moved = mark_processed(&inbox, &pending[0]).expect("mark").expect("some");
-        assert!(moved.ends_with("processed/424242-punchback.md") || moved.ends_with("424242-punchback.md"));
+        let moved = mark_processed(&inbox, &pending[0])
+            .expect("mark")
+            .expect("some");
+        assert!(
+            moved.ends_with("processed/424242-punchback.md")
+                || moved.ends_with("424242-punchback.md")
+        );
         assert!(list_pending(&inbox).is_empty(), "处理后 pending 应为空");
 
         match saved {
