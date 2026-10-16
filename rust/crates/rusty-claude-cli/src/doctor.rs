@@ -444,6 +444,46 @@ fn hit_rate_pct(read_tokens: u64, creation_tokens: u64) -> u64 {
     }
 }
 
+/// DeepSeek 官方口径:**单请求** `hit / (hit + miss)`,即一次请求内命中 token 占
+/// 该次请求全部 prompt token 的比例。
+///
+/// 官方 usage 只提供单请求级 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+/// (见 api-docs.deepseek.com/guides/kv_cache),**未定义任何会话累计口径**。
+/// 因此对外主指标取最新一次请求的比值;`None` 表示该 session 尚无单请求快照。
+fn official_hit_rate_pct(newest: Option<&SessionCacheStatsSnapshot>) -> Option<u64> {
+    let session = newest?;
+    match (
+        session.stats.last_cache_read_input_tokens,
+        session.stats.last_cache_creation_input_tokens,
+    ) {
+        (Some(read), Some(creation)) => Some(hit_rate_pct(u64::from(read), u64::from(creation))),
+        _ => None,
+    }
+}
+
+/// 官方口径命中率展示段:单请求值 + 与 claw 自加「累计」口径的差异说明。
+fn render_official_hit_rate_lines(
+    main_newest: Option<&SessionCacheStatsSnapshot>,
+    subagent_newest: Option<&SessionCacheStatsSnapshot>,
+) -> Vec<String> {
+    let fmt = |newest: Option<&SessionCacheStatsSnapshot>, label: &str| match official_hit_rate_pct(
+        newest,
+    ) {
+        Some(pct) => {
+            let name = newest.map_or("<无>", |s| s.name.as_str());
+            format!("  {label}: {pct}%   [{name}]")
+        }
+        None => format!("  {label}: <无单请求快照>"),
+    };
+    vec![
+        fmt(main_newest, "单请求命中率(最新主 session)"),
+        fmt(subagent_newest, "单请求命中率(最新 subagent)"),
+        "  说明:DeepSeek 官方 usage 仅定义单请求 prompt_cache_hit_tokens /".to_string(),
+        "        prompt_cache_miss_tokens,无会话累计口径;下方「累计」为 claw 自加,".to_string(),
+        "        仅供会话内趋势参考,不可直接与官方数值对比。".to_string(),
+    ]
+}
+
 /// 扫描 cache stats 根目录,收集所有含 stats.json 的 session 快照。
 fn collect_session_cache_stats(root: &Path) -> Vec<SessionCacheStatsSnapshot> {
     let mut sessions = Vec::new();
@@ -498,6 +538,12 @@ fn render_cache_stats_text(
         subagent_agg.session_count,
         root.display()
     )];
+    lines.push(String::new());
+    lines.push("== 命中率(DeepSeek 官方口径:单请求 hit/(hit+miss))==".to_string());
+    lines.extend(render_official_hit_rate_lines(
+        newest_session(main_sessions),
+        newest_session(subagent_sessions),
+    ));
     lines.push(String::new());
     lines.push("== Cache Break 原因分布(主 session,排除 subagent)==".to_string());
     lines.extend(render_break_reasons_lines(&main_agg.breaks));
@@ -581,7 +627,10 @@ fn render_token_lines(agg: &CacheStatsAggregate) -> Vec<String> {
             "  total_cache_creation_tokens: {} (未命中写入)",
             agg.creation_tokens
         ),
-        format!("  累计命中率:{}%", agg.hit_rate_pct()),
+        format!(
+            "  累计命中率:{}%  (claw 自加口径:read/(read+creation),非 DeepSeek 官方)",
+            agg.hit_rate_pct()
+        ),
     ]
 }
 
@@ -634,7 +683,10 @@ fn render_subagent_lines(
             "  total_cache_creation_tokens: {} (未命中写入)",
             agg.creation_tokens
         ),
-        format!("  累计命中率:{}%", agg.hit_rate_pct()),
+        format!(
+            "  累计命中率:{}%  (claw 自加口径:read/(read+creation),非 DeepSeek 官方)",
+            agg.hit_rate_pct()
+        ),
         format!("  总 break 事件             : {}", agg.breaks.total()),
     ];
     if let Some(session) = newest {
@@ -743,6 +795,8 @@ fn render_cache_stats_json(
                 "total_cache_read_input_tokens": agg.read_tokens,
                 "total_cache_creation_input_tokens": agg.creation_tokens,
                 "cumulative_hit_rate_pct": agg.hit_rate_pct(),
+                "cumulative_hit_rate_pct_note": "claw 自加口径 read/(read+creation);DeepSeek 官方无会话累计定义",
+                "official_hit_rate_pct": official_hit_rate_pct(newest),
             },
             "anomalies": {
                 "unexpected_cache_breaks": agg.unexpected_breaks,
@@ -807,6 +861,8 @@ fn render_cache_stats_json(
             "total_cache_read_input_tokens": main_agg.read_tokens,
             "total_cache_creation_input_tokens": main_agg.creation_tokens,
             "cumulative_hit_rate_pct": main_agg.hit_rate_pct(),
+            "cumulative_hit_rate_pct_note": "claw 自加口径 read/(read+creation);DeepSeek 官方无会话累计定义",
+            "official_hit_rate_pct": official_hit_rate_pct(newest_session(main_sessions)),
         },
         "anomalies": {
             "unexpected_cache_breaks": main_agg.unexpected_breaks,
@@ -2545,8 +2601,9 @@ mod cache_stats_tests {
     use serde_json::Value;
 
     use super::{
-        collect_session_cache_stats, hit_rate_pct, newest_session, render_cache_stats_json,
-        render_cache_stats_text, CacheBreakStats, CacheStatsAggregate, SessionCacheStatsSnapshot,
+        collect_session_cache_stats, hit_rate_pct, newest_session, official_hit_rate_pct,
+        render_cache_stats_json, render_cache_stats_text, CacheBreakStats, CacheStatsAggregate,
+        SessionCacheStatsSnapshot,
     };
 
     fn temp_root(prefix: &str) -> PathBuf {
@@ -2740,5 +2797,115 @@ mod cache_stats_tests {
         assert_eq!(hit_rate_pct(1_000, 0), 100);
         assert_eq!(hit_rate_pct(0, 1_696), 0);
         assert_eq!(hit_rate_pct(9, 1), 90);
+    }
+
+    /// 官方口径 = 单请求 hit/(hit+miss),取最新一条 session 的 last_response 快照;
+    /// 无快照时必须返回 None(而非 0),避免把"没数据"误报成"命中率 0%"。
+    #[test]
+    fn official_hit_rate_uses_single_request_snapshot_only() {
+        // 无 last_* 快照 -> None(会话累计值不得冒充官方口径)
+        let aggregate_only = SessionCacheStatsSnapshot {
+            name: "session-agg-only".into(),
+            is_subagent: false,
+            stats: CacheBreakStats {
+                tracked_requests: 250,
+                total_cache_read_input_tokens: 34_715_776,
+                total_cache_creation_input_tokens: 822_825,
+                ..Default::default()
+            },
+            probe: None,
+            modified_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+        };
+        assert_eq!(official_hit_rate_pct(Some(&aggregate_only)), None);
+        assert_eq!(official_hit_rate_pct(None), None);
+
+        // 有 last_* 快照 -> 单请求比值 28032/(28032+5962) = 0.8246 ~= 82%
+        let with_last = SessionCacheStatsSnapshot {
+            name: "session-last".into(),
+            is_subagent: false,
+            stats: CacheBreakStats {
+                tracked_requests: 6,
+                total_cache_read_input_tokens: 148_736,
+                total_cache_creation_input_tokens: 52_535,
+                last_cache_read_input_tokens: Some(28_032),
+                last_cache_creation_input_tokens: Some(5_962),
+                ..Default::default()
+            },
+            probe: None,
+            modified_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+        };
+        assert_eq!(official_hit_rate_pct(Some(&with_last)), Some(82));
+        // 同一 session:累计口径 74% 与官方单请求口径 82% 必然不同 —— 这正是
+        // 短会话"80+"错觉的来源(累计被首轮全量 creation 摊薄)。
+        assert_eq!(with_last.stats.total_cache_read_input_tokens, 148_736);
+    }
+
+    /// text 报告必须把官方口径单请求值置于最前,且明确标注累计值为 claw 自加。
+    #[test]
+    fn text_report_marks_official_vs_cumulative_hit_rate() {
+        let root = temp_root("doctor-cache-official");
+        let dir = root.join("session-last");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stats = CacheBreakStats {
+            tracked_requests: 6,
+            total_cache_read_input_tokens: 148_736,
+            total_cache_creation_input_tokens: 52_535,
+            last_cache_read_input_tokens: Some(28_032),
+            last_cache_creation_input_tokens: Some(5_962),
+            ..Default::default()
+        };
+        std::fs::write(dir.join("stats.json"), serde_json::to_vec(&stats).unwrap()).unwrap();
+        let sessions = collect_session_cache_stats(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let mut main_agg = CacheStatsAggregate::default();
+        for s in &sessions {
+            main_agg.push(&s.stats);
+        }
+        let sub_agg = CacheStatsAggregate::default();
+        let text = render_cache_stats_text(&root, &sessions, &[], &main_agg, &sub_agg);
+
+        assert!(
+            text.contains("== 命中率(DeepSeek 官方口径:单请求 hit/(hit+miss))=="),
+            "官方口径小节标题缺失: {text}"
+        );
+        assert!(
+            text.contains("单请求命中率(最新主 session): 82%"),
+            "官方单请求命中率缺失: {text}"
+        );
+        assert!(
+            text.contains("非 DeepSeek 官方"),
+            "累计口径未标注为 claw 自加: {text}"
+        );
+    }
+
+    /// JSON 报告需同时暴露官方单请求字段与带 note 的累计字段,且顶层口径指向主 session。
+    #[test]
+    fn json_report_exposes_official_hit_rate_field() {
+        let root = temp_root("doctor-cache-official-json");
+        let dir = root.join("session-last");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stats = CacheBreakStats {
+            tracked_requests: 6,
+            total_cache_read_input_tokens: 148_736,
+            total_cache_creation_input_tokens: 52_535,
+            last_cache_read_input_tokens: Some(28_032),
+            last_cache_creation_input_tokens: Some(5_962),
+            ..Default::default()
+        };
+        std::fs::write(dir.join("stats.json"), serde_json::to_vec(&stats).unwrap()).unwrap();
+        let sessions = collect_session_cache_stats(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let mut main_agg = CacheStatsAggregate::default();
+        for s in &sessions {
+            main_agg.push(&s.stats);
+        }
+        let sub_agg = CacheStatsAggregate::default();
+        let value: Value = render_cache_stats_json(&sessions, &[], &main_agg, &sub_agg);
+
+        assert_eq!(value["tokens"]["official_hit_rate_pct"], 82);
+        assert_eq!(value["tokens"]["cumulative_hit_rate_pct"], 74);
+        assert!(value["tokens"]["cumulative_hit_rate_pct_note"].is_string());
     }
 }
