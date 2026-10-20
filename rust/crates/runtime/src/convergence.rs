@@ -522,6 +522,31 @@ pub fn parse_convergence_declaration(text: &str) -> Option<ConvergenceDeclaratio
         if line.is_empty() {
             continue;
         }
+        // bullet 判定必须在 `split_once(':')` **之前**:
+        // ① 层级上 bullet 是上一节内容的延续,不是新的 key;
+        // ② evidence/结论项常自带冒号(如 `- turn: iterations=22`),若先切冒号
+        //    会得到 k="- turn" 落进 `_ => Sec::Other`,既丢掉该项,又把 sec 置错,
+        //    导致其后的 bullet 也一并丢失。
+        if let Some(item) = line.strip_prefix("- ") {
+            let item = item.trim();
+            if !item.is_empty() {
+                match sec {
+                    Sec::Conclusions => d.conclusions.push(item.to_string()),
+                    Sec::Todos => d.todos.push(item.to_string()),
+                    // BUG 修复:此前 evidence 的多行/列表写法被 `_ => {}` 吞掉,
+                    // 解析出空串 → validate_evidence 判 Missing → 打回提示渲染成
+                    // `evidence "(空)"`。agent 因此无法收尾、反复重发声明。
+                    Sec::Evidence => {
+                        if !d.evidence.is_empty() {
+                            d.evidence.push_str("; ");
+                        }
+                        d.evidence.push_str(item);
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
         if let Some((k, v)) = line.split_once(':') {
             let (k, v) = (k.trim(), v.trim());
             sec = match k {
@@ -561,15 +586,6 @@ pub fn parse_convergence_declaration(text: &str) -> Option<ConvergenceDeclaratio
                 }
                 _ => Sec::Other,
             };
-        } else if let Some(item) = line.strip_prefix("- ") {
-            let item = item.trim();
-            if !item.is_empty() {
-                match sec {
-                    Sec::Conclusions => d.conclusions.push(item.to_string()),
-                    Sec::Todos => d.todos.push(item.to_string()),
-                    _ => {}
-                }
-            }
         }
         // 其他键值/散行:忽略(容忍模型格式漂移,宽松解析)。
     }
@@ -861,6 +877,73 @@ mod convergence_p1_tests {
         assert_eq!(d.conclusions.len(), 2);
         assert_eq!(d.conclusions[0], "根因是分型宽松");
         assert!(d.todos.is_empty());
+    }
+
+    /// BUG 回归:`evidence` 写成 YAML 列表(多行)时必须被完整收集。
+    ///
+    /// 缺陷:evidence 的多行写法此前落进 bullet 分支的 `_ => {}` 被丢弃,
+    /// `d.evidence` 恒为空 → `validate_evidence` 判 `Missing` → 打回提示渲染
+    /// `evidence "(空)"`。模型于是无法收尾、反复重发声明。现实样本见
+    /// `inbox/1792064820141-agent-reported.md`。
+    #[test]
+    fn parses_evidence_written_as_bullet_list() {
+        let txt = "[收敛声明]\n\
+                   goal: 修 BUG-1\n\
+                   claimed_complete: true\n\
+                   evidence:\n\
+                   - 二进制 Git SHA b9dad87d\n\
+                   - cargo test 1 passed, exit 0\n\
+                   conclusions:\n\
+                   - 根因是 bullet 被吞\n\
+                   todos: 无\n\
+                   can_stop: true\n";
+        let d = parse_convergence_declaration(txt).expect("should parse");
+        assert_eq!(d.goal, "修 BUG-1");
+        assert!(
+            d.evidence.contains("b9dad87d"),
+            "首项 evidence 丢失: {:?}",
+            d.evidence
+        );
+        assert!(
+            d.evidence.contains("1 passed"),
+            "次项 evidence 丢失: {:?}",
+            d.evidence
+        );
+        // 关键:evidence 非空,否则 validate_evidence → Missing → "(空)"
+        assert!(!d.evidence.trim().is_empty());
+        // conclusions 的 bullet 归属不被 evidence 抢走
+        assert_eq!(d.conclusions.len(), 1);
+        assert_eq!(d.conclusions[0], "根因是 bullet 被吞");
+    }
+
+    /// BUG 回归:bullet 内容自带冒号时不得被 `split_once(':')` 切成新 key。
+    ///
+    /// `- turn: iterations=22` 若先切冒号会得到 k="- turn",落进 `_ => Sec::Other`,
+    /// 既丢掉该项又把 `sec` 置错,使其后所有 bullet 一并失效。
+    #[test]
+    fn bullet_containing_colon_stays_in_current_section() {
+        let txt = "[收敛声明]\n\
+                   goal: x\n\
+                   claimed_complete: false\n\
+                   evidence:\n\
+                   - turn: iterations=22 elapsed=298s\n\
+                   todos:\n\
+                   - 待办: 继续验证\n\
+                   can_stop: false\n";
+        let d = parse_convergence_declaration(txt).expect("should parse");
+        assert_eq!(
+            d.evidence, "turn: iterations=22 elapsed=298s",
+            "带冒号的 bullet 被误切为新 key"
+        );
+        assert_eq!(d.todos.len(), 1, "todos 的 bullet 丢失");
+        assert_eq!(d.todos[0], "待办: 继续验证");
+    }
+
+    /// 单行 evidence 写法必须保持原行为(此次修复不能回归它)。
+    #[test]
+    fn single_line_evidence_still_parses() {
+        let d = parse_convergence_declaration(sample_decl()).expect("should parse");
+        assert_eq!(d.evidence, "regression 11 passed, exit 0");
     }
 
     #[test]
