@@ -4068,6 +4068,13 @@ where
         // 打回后继续标志:证据缺失打回 hint 注入后,不 break 而是回到 loop
         // 顶部重新请求(模型下轮看到 hint 重新决策)。上限 2 保证不无限循环。
         let mut convergence_should_continue = false;
+        // 收敛停滞计数(修复"按 token 量催缴"缺陷):连续多少个工具批没有任何
+        // 进度信号(file_produced / test_success)。有进展即清零。soft1/soft2
+        // 除 token 量级门外还需本计数达标 —— 正在干活的长任务不该被催收尾。
+        // 初值取阈值(而非 0):纯推理、根本不调工具的 turn 从未产生过进度信号,
+        // 应保持"按量催缴"的既有行为,不被新门控静默豁免。
+        let mut convergence_stagnant_iters: u32 =
+            crate::convergence::CONVERGENCE_MIN_STAGNANT_ITERS;
         // P2(成本反馈注记 · Task 5):turn 开头复位成本累计器 —— turn 级计数
         // (output tokens / 工具调用)与注记位点清零,全会话累计保留跨 turn。
         self.cost_meter.reset_turn();
@@ -5124,6 +5131,8 @@ where
             // P2(成本反馈注记 · Task 5):本批工具调用计入成本累计器(按模型
             // 声明的 tool_use 数;权限拒绝也算一次 LLM↔工具往返,同样烧 token)。
             self.cost_meter.add_tool_calls(tool_count);
+            // 收敛停滞判定的批起点:本批结束后只看新增的 tool 结果。
+            let batch_start = tool_results.len();
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 // 细粒度中断检查：执行下一个工具前检查 abort signal。
                 // 若上一个工具执行时间较长（如 cargo build），用户在等待期间
@@ -5826,6 +5835,38 @@ where
                 tool_results.push(result_message);
             }
 
+            // 收敛停滞判定(c):本批是否产生任何进度信号。写文件/测试通过
+            // 都是"任务在推进"的客观证据 —— 此时不该催收尾。全部无信号才累加,
+            // 一旦有进展立即清零,回到"按 token 量催缴"的保守侧。
+            {
+                let mut produced_signal = false;
+                for msg in &tool_results[batch_start..] {
+                    for blk in &msg.blocks {
+                        if let ContentBlock::ToolResult {
+                            tool_name,
+                            is_error,
+                            output,
+                            ..
+                        } = blk
+                        {
+                            let outcome = crate::convergence::ToolOutcome {
+                                tool_name: tool_name.as_str(),
+                                is_error: *is_error,
+                                output: output.as_str(),
+                            };
+                            if !crate::convergence::project_one(outcome).is_empty() {
+                                produced_signal = true;
+                            }
+                        }
+                    }
+                }
+                if produced_signal {
+                    convergence_stagnant_iters = 0;
+                } else {
+                    convergence_stagnant_iters = convergence_stagnant_iters.saturating_add(1);
+                }
+            }
+
             // P2(充分性契约 · Task 4):本迭代工具批处理结束 —— 若判据在本批内
             // 从 false 变 true,注入「充分即停」提醒(模仿既有侦察提醒的
             // push_message 模式;每 turn 只注入一次,由上方
@@ -5896,8 +5937,13 @@ where
                 // 批5:acknowledged(模型已输出合法声明)后不再重复催缴 ——
                 // 消除"催缴 → 重复输出声明段 → 再催缴"微循环。false 声明
                 // (仍需继续/需用户裁决)同样视为已响应,不注入 soft2。
+                // 新增第二道门:除 token 量级外还需连续无进度信号 —— 正在
+                // 产出文件/测试通过的长任务不催收尾(见 CONVERGENCE_MIN_STAGNANT_ITERS)。
+                let convergence_stalled = convergence_stagnant_iters
+                    >= crate::convergence::CONVERGENCE_MIN_STAGNANT_ITERS;
                 if !convergence_acknowledged
                     && !convergence_soft1_injected
+                    && convergence_stalled
                     && turn_output >= crate::convergence::CONVERGENCE_SOFT1_OUTPUT
                 {
                     // 站7:仅 stage 成功才置 fire-once 标志 —— 修复 soft1(70)
@@ -5911,6 +5957,7 @@ where
                     && convergence_soft1_injected
                     && !convergence_soft2_injected
                     && !warn_merged_this_iter
+                    && convergence_stalled
                     && turn_output >= crate::convergence::CONVERGENCE_SOFT2_OUTPUT
                 {
                     // 站7:同轮内 merged warn 已表达收敛要求(soft1 语义注入),
@@ -12480,6 +12527,13 @@ mod tests {
             crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
             "100000000",
         );
+        // 显式启用收敛契约:本测试验证 soft1/soft2 与 acknowledged 的交互,前提
+        // 是收敛开着。不 pin 该 env 会被**外部环境**污染 —— `.claw.json` 的
+        // `env` 块注入进程后,claw 派生的 `cargo test` 子进程会继承
+        // `CLAW_CONVERGENCE_P1=0`,于是收敛被静默关闭、注入 0 条提示而失败
+        // (实测:基线 stash 后同样失败,去掉该 env 即通过)。
+        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
+        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
 
         let diag_log: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -12504,6 +12558,10 @@ mod tests {
                 std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
             }
             None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+        match saved_convergence_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
         }
 
         // then:收敛提示(user 注入的催缴模板)全程恰好 1 条 —— 模型声明后 soft2 被冷却。

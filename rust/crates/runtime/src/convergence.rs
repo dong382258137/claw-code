@@ -619,6 +619,18 @@ pub fn validate_evidence(
 pub const CONVERGENCE_SOFT1_OUTPUT: u64 = 15_000;
 pub const CONVERGENCE_SOFT2_OUTPUT: u64 = 25_000;
 
+/// 触发收敛催缴所需的**最少连续停滞迭代数**。
+///
+/// 缺陷:原实现仅以 `turn_output >= 15K/25K` 触发,把"token 燃烧量"当作
+/// "任务未完成"的代理 —— 但推理型长任务本就烧 token,且 turn 内仍在产出
+/// `file_produced` / `test_success` 时,token 是在**推进**而非空转。按量催缴
+/// 的结果是催一个正在干活的模型收尾(实测长会话被连续催缴多轮)。
+///
+/// 修正:token 阈值仍作为必要条件(便宜的量级门),另需**连续若干迭代无任何
+/// 进度信号**才注入。有进展即清零。阈值 2 = 容忍单个"纯思考/纯读取"迭代,
+/// 两个连续迭代毫无产出的落盘/测试信号才判定停滞。
+pub const CONVERGENCE_MIN_STAGNANT_ITERS: u32 = 2;
+
 /// 证据打回(缺失)提示的上限次数:超过则不再打回,交既有成本护栏兜底,防死循环。
 pub const CONVERGENCE_MAX_PUNCHBACKS: u8 = 2;
 

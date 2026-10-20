@@ -1439,10 +1439,12 @@ fn get_simple_doing_tasks_section() -> String {
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
         "On Windows, prefer built-in tools (read_file, write_file, edit_file, replace_lines) for file I/O — they handle UTF-8 correctly. Only when using bash/PowerShell commands on files with non-ASCII content, set `$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8` first or pipe through `python -c \\\"import sys; sys.stdout.reconfigure(encoding='utf-8')\\\"`.".to_string(),
         "Reconnaissance-before-execution: before expensive commands (large grep, recursive ls, cargo build, git diff), do a lightweight check first (e.g. `ls -la`, `du -sh`, `git diff --stat`). Restrict scope with glob/subdirectory. This prevents multi-minute hangs.".to_string(),
-        // P2(充分性契约 · Task 4):一对对称同级指令 —— 取证义务与停止条件
-        // 并列同强度(同为祈使句),避免"只强调取证、不强调收手"导致侦察过度。
-        "「事实需要证据」:对未知事实的断言必须基于检索/读文件等证据来源,禁止凭记忆猜测。".to_string(),
-        "「充分即停」:发起只读侦察前,可用 `[SUFFICIENCY: <源1>, <源2>, ...]` 显式声明停止判据;判据一旦满足(runtime 会提示),继续追加只读侦察是错误的,应基于现有信息直接作答。".to_string(),
+        // P2(充分性契约 · Task 4):取证义务与停止条件 —— **主从关系,非并列**。
+        // 旧版写成"对称同级祈使句",实测导致停止条件压过取证义务:该查的断言
+        // 凭记忆写出,反被"继续侦察是错误的"这句挡住。改后:证据义务无例外,
+        // 停止条件只在"信息已足以支撑结论"时生效,且明确不豁免证据义务。
+        "「事实需要证据」:对未知事实的断言必须基于检索/读文件等证据来源,禁止凭记忆猜测。**此条无例外,且优先于下方的停止条件** —— 尚缺证据时继续取证是正确的。".to_string(),
+        "「充分即停」:当已掌握的信息足以支撑你将给出的结论时,不必再追加只读侦察;判据是否足够由你判断,`[SUFFICIENCY: <源1>, <源2>, ...]` 只是可选的自助声明(runtime 可据此提醒)。**此条只针对\"验证已足够\",不豁免证据义务** —— 若某条断言还缺来源,那不算充分。".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())

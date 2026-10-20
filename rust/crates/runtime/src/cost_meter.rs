@@ -36,6 +36,18 @@ pub const COST_WARN_OUTPUT_THRESHOLD: u64 = 20_000;
 /// 警示频率上限:距上次警示 ≥ 此值(output tokens)才允许再次警示。
 pub const WARN_OUTPUT_INTERVAL: u64 = 10_000;
 
+/// 单 turn 内高燃烧警示的次数上限。
+///
+/// 修复正反馈自激:警示本身是注入会话的 user 消息,会推高下一次请求的
+/// output,再次跨过阈值就再警示一次 —— 原实现只有 `WARN_OUTPUT_INTERVAL`
+/// 的间隔约束,间隔内模型一说话(kimi/deepseek 单轮数千 token)就重新满足,
+/// 于是"警示 → 增 token → 再警示"自我维持。实测单 turn 连发 4 条:
+/// 20_027 → 31_610 → 42_236 → 55_074 tokens。
+///
+/// 封顶后警示退化为**有限次提醒**:警告过一次仍不收尾,说明该 turn 的高
+/// output 是任务本身需要的(推理型长任务),继续喊停只是刷屏。
+pub const COST_WARN_MAX_PER_TURN: u8 = 2;
+
 /// 覆盖警示阈值的环境变量名(`CLAW_COST_WARN_OUTPUT_THRESHOLD`)。
 pub const COST_WARN_OUTPUT_THRESHOLD_ENV: &str = "CLAW_COST_WARN_OUTPUT_THRESHOLD";
 
@@ -94,6 +106,8 @@ pub struct CostMeter {
     last_hint_tool_calls: usize,
     /// 上次警示时的 `turn_output_tokens`。`0` = 本 turn 尚未警示过。
     last_warn_output: u64,
+    /// 本 turn 已注入的警示次数(封顶 [`COST_WARN_MAX_PER_TURN`],防正反馈自激)。
+    warns_this_turn: u8,
 }
 
 impl CostMeter {
@@ -115,6 +129,7 @@ impl CostMeter {
         self.turn_tool_calls = 0;
         self.last_hint_tool_calls = 0;
         self.last_warn_output = 0;
+        self.warns_this_turn = 0;
     }
 
     /// 当前 turn 累计 output tokens(只读;供收敛契约门控读取燃烧状态)。
@@ -129,14 +144,22 @@ impl CostMeter {
     /// 位点更新保证同一 turn 内普通提示每 ~5 次工具调用一条、警示每 ~10K
     /// output 一条,不会在连续迭代中反复注入。
     pub fn poll_note(&mut self, warn_threshold: u64) -> Option<String> {
+        // 警示封顶:已达上限则把阈值抬到不可达,后续降级为普通提示 ——
+        // 消除"警示→增 token→再警示"的正反馈(见 COST_WARN_MAX_PER_TURN)。
+        let effective_warn_threshold = if self.warns_this_turn >= COST_WARN_MAX_PER_TURN {
+            u64::MAX
+        } else {
+            warn_threshold
+        };
         match decide_note(
             self.turn_output_tokens,
             self.turn_tool_calls,
             self.last_hint_tool_calls,
             self.last_warn_output,
-            warn_threshold,
+            effective_warn_threshold,
         ) {
             Some(CostNoteKind::Warn) => {
+                self.warns_this_turn = self.warns_this_turn.saturating_add(1);
                 self.last_warn_output = self.turn_output_tokens;
                 // 警示比提示更重:同时占用普通提示额度,避免警示后紧接着提示。
                 self.last_hint_tool_calls = self.turn_tool_calls;
@@ -349,6 +372,56 @@ mod tests {
             "警示应携带实际累计 output,note: {note}"
         );
         assert!(!note.contains("成本提示"));
+    }
+
+    /// 警示次数封顶:单 turn 至多 `COST_WARN_MAX_PER_TURN` 条,防正反馈自激。
+    ///
+    /// 回归实证(2026-10-20 长会话):原实现仅靠 `WARN_OUTPUT_INTERVAL` 间隔,
+    /// 模型每轮说话都推高 output 并重新跨过阈值,单 turn 连发 4 条警示
+    /// (20_027 → 31_610 → 42_236 → 55_074),每条警示本身又助推下一次增长。
+    #[test]
+    fn warn_capped_per_turn_to_stop_feedback_loop() {
+        let mut meter = CostMeter::default();
+        let mut warns = 0u8;
+        // 模拟"警示 → output 继续增长 → 再次跨阈"的自激链路:每轮 +12K output。
+        for _ in 0..6 {
+            meter.record_output(12_000);
+            if let Some(note) = meter.poll_note(COST_WARN_OUTPUT_THRESHOLD) {
+                if note.contains("成本警示") {
+                    warns += 1;
+                }
+            }
+        }
+        assert_eq!(
+            warns, COST_WARN_MAX_PER_TURN,
+            "单 turn 警示应封顶 {COST_WARN_MAX_PER_TURN} 条,实际 {warns} 条"
+        );
+    }
+
+    /// 封顶后降级为普通提示(不静默),且 reset_turn 后额度恢复。
+    #[test]
+    fn warn_cap_resets_per_turn_and_degrades_to_hint() {
+        let mut meter = CostMeter::default();
+        for _ in 0..COST_WARN_MAX_PER_TURN {
+            // 每轮 +25K:首轮即跨 20K 阈值,次轮起间隔 25K ≥ 10K 仍满足警示条件。
+            meter.record_output(25_000);
+            let note = meter.poll_note(COST_WARN_OUTPUT_THRESHOLD).expect("warn");
+            assert!(note.contains("成本警示"), "note: {note}");
+        }
+        // 第三次:警示额度已尽 —— 不再出警示(可能出普通提示,但绝不再是警示)。
+        meter.record_output(25_000);
+        if let Some(note) = meter.poll_note(COST_WARN_OUTPUT_THRESHOLD) {
+            assert!(
+                !note.contains("成本警示"),
+                "封顶后不应再注入警示,note: {note}"
+            );
+        }
+
+        // 新 turn:额度重置,警示能力恢复。
+        meter.reset_turn();
+        meter.record_output(25_000);
+        let note = meter.poll_note(COST_WARN_OUTPUT_THRESHOLD).expect("warn");
+        assert!(note.contains("成本警示"), "新 turn 应恢复警示,note: {note}");
     }
 
     /// 注记文本渲染:提示携带 output 与工具调用数。
