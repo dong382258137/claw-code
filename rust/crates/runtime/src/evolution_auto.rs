@@ -203,6 +203,42 @@ pub fn install_binary(source_root: &Path) -> Result<std::path::PathBuf, String> 
     Ok(exe)
 }
 
+/// 跑一遍测试门,返回首个失败的**命令串**(全部通过返回 `None`)。
+///
+/// 执行器用闭包注入,使单测无需真的跑 `cargo test --workspace`(数分钟)。
+fn run_test_gate_with<F>(source_root: &Path, mut run: F) -> Option<String>
+where
+    F: FnMut(&Path, &str) -> Result<bool, String>,
+{
+    for cmd in crate::evolution_runner::test_gate_commands() {
+        match run(source_root, cmd) {
+            Ok(true) => {}
+            Ok(false) => return Some(cmd.to_string()),
+            Err(e) => return Some(format!("{cmd} ({e})")),
+        }
+    }
+    None
+}
+
+/// 真跑测试门。命令串按空白切分为 程序 + 参数。
+///
+/// **为什么必须由代码跑,而不是交给提示词**: 提示词对模型的约束只是"请求",
+/// 被审查对象可能不遵守。若只信 prompt, 子智能体改完就提交、跳过测试, 只要
+/// 不碰黑名单路径就会被自动部署到全局 —— 在"用 claw 改 claw"的场景下代价是 brick。
+fn run_test_gate(source_root: &Path) -> Option<String> {
+    run_test_gate_with(source_root, |root, cmd| {
+        let mut parts = cmd.split_whitespace();
+        let prog = parts.next().ok_or_else(|| "空命令".to_string())?;
+        let args: Vec<&str> = parts.collect();
+        let status = std::process::Command::new(prog)
+            .args(&args)
+            .current_dir(root)
+            .status()
+            .map_err(|e| format!("启动失败: {e}"))?;
+        Ok(status.success())
+    })
+}
+
 /// 单条提案的最大尝试次数。超过则移入 `quarantine/`,不再自动重试。
 ///
 /// **为什么必须有**: `run_pipeline` 取 inbox 排序后的第一条。若某条提案永远
@@ -357,6 +393,15 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
         return Err(format!(
             "改动命中黑名单 `{frag}`,拒绝部署(已隔离,不再自动重试)"
         ));
+    }
+
+    // 2.5 测试门:由**代码**跑,不信提示词。
+    //    `evolution_runner::test_gate_commands` 早已定义门禁命令, 但此前只拼进
+    //    提示词、无任何执行者 —— 子智能体跳过测试直接提交也能走到部署。本节
+    //    补上执行侧: 任一门失败即中止, 提案留 inbox 计次重试, 绝不半截部署。
+    if let Some(failed) = run_test_gate(source_root) {
+        let tag = note_failure(&inbox, &proposal_path);
+        return Err(format!("测试门未过(`{failed}`),拒绝部署{tag}"));
     }
 
     // 3. 自动部署到全局。失败则回滚,提案保留。
@@ -555,5 +600,39 @@ mod tests {
         }
         assert_eq!(next_attemptable(&tmp, &[p]), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_gate_passes_when_all_commands_succeed() {
+        // 全过 ⇒ None(允许继续部署)
+        let root = Path::new("/src");
+        let got = run_test_gate_with(root, |_, _| Ok(true));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_gate_stops_at_first_failure() {
+        // 首个失败即返回, 且返回的是**失败的那条命令**(便于日志定位)
+        let root = Path::new("/src");
+        let mut seen = 0;
+        let got = run_test_gate_with(root, |_, _| {
+            seen += 1;
+            Ok(seen == 1) // 第一条过, 第二条挂
+        });
+        let expected = crate::evolution_runner::test_gate_commands()[1];
+        assert_eq!(got.as_deref(), Some(expected), "应返回第二条(失败)命令");
+        assert_eq!(seen, 2, "失败后不应再跑后续命令");
+    }
+
+    #[test]
+    fn test_gate_treats_spawn_error_as_failure() {
+        // 命令启动不起来(cargo 不在 PATH 等)也算门不过 —— 绝不能放行部署
+        let root = Path::new("/src");
+        let got = run_test_gate_with(root, |_, cmd| Err(format!("启动失败: {cmd}")));
+        assert!(got.is_some(), "启动失败必须视为门未过");
+        assert!(
+            got.unwrap().contains("启动失败"),
+            "错误信息应保留原因, 便于日志判断是环境问题还是测试红灯"
+        );
     }
 }
