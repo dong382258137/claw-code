@@ -5974,7 +5974,18 @@ where
                     // 被更高优先级(如成本警示 80)抢占后 `claimed` 已置位、
                     // 后续轮次永不注入的缺陷。抢占时回滚,下轮空槽再试。
                     let hint = crate::convergence::convergence_prompt_text(true);
-                    if stage_note(&mut arbiter_note, 70, hint) {
+                    let staged = stage_note(&mut arbiter_note, 70, hint);
+                    // 埋点:契约"帮忙还是添乱"只能靠日志判定 —— 记录注入时刻的
+                    // 迭代号/输出量/阈值/是否只读轮,回看时可与后续 `tool_start
+                    // iter=N` 对齐,数出"催缴后还跑了几轮才收尾"。
+                    // 抢占同样记录:soft1 被更高优先级注记挤掉说明仲裁在杀收敛,
+                    // 这种"该催没催"与"乱催"一样是判断契约有效性的证据。
+                    self.emit_diag(format!(
+                        "[diag] convergence: soft1 {} iter={iterations} output={turn_output} \
+                         threshold={soft1_output} readonly={readonly_turn}",
+                        if staged { "injected" } else { "preempted" }
+                    ));
+                    if staged {
                         convergence_soft1_injected = true;
                     }
                 } else if !convergence_acknowledged
@@ -5989,7 +6000,13 @@ where
                     // merged warn(80)与 soft2(90,文案言"已多次提示"但模型其实
                     // 一条都没见过)两条收敛注记,破坏渐进语义。
                     let hint = crate::convergence::convergence_prompt_text(false);
-                    if stage_note(&mut arbiter_note, 90, hint) {
+                    let staged = stage_note(&mut arbiter_note, 90, hint);
+                    self.emit_diag(format!(
+                        "[diag] convergence: soft2 {} iter={iterations} output={turn_output} \
+                         threshold={soft2_output} readonly={readonly_turn}",
+                        if staged { "injected" } else { "preempted" }
+                    ));
+                    if staged {
                         convergence_soft2_injected = true;
                     }
                 }
@@ -12808,6 +12825,113 @@ mod tests {
         assert_eq!(
             prompt_count, 0,
             "只读侦察轮越过旧 15K/25K 但未越过放宽阈值时不应催缴,实际注入 {prompt_count} 条"
+        );
+    }
+
+    /// 埋点回归:soft1 注入必须留下可判定的 diag 记录。
+    ///
+    /// 为什么需要:收敛契约已默认开启(P1 未设即开),但触发时若零埋点,
+    /// "契约是帮忙还是添乱"只能靠猜 —— 无法回答"本次 turn 催了几次、
+    /// 催在多少 token、催完又跑了几轮才收尾"。本测试锁住日志契约:
+    /// tag 形如 `convergence: soft1 injected iter=… output=… threshold=…
+    /// readonly=…`,四要素缺一不可,回看时才能与 `tool_start iter=N` 对齐。
+    #[test]
+    fn convergence_soft1_emits_auditable_diag_record() {
+        struct ProbeApi {
+            calls: usize,
+        }
+
+        impl ApiClient for ProbeApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                Ok(match self.calls {
+                    // 迭代1:16K output 越过干活轮 soft1=15K。用 `echo` 而非
+                    // read_file —— 侦察类工具会把只读轮阈值放宽到 40K,于是
+                    // 本 turn 拿的是 readonly=false 的 15K,**正是干活轮场景**。
+                    1 => vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 16_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::TextDelta("investigating".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "p-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "probe".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ],
+                    _ => vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ],
+                })
+            }
+        }
+
+        // env 隔离:契约必须开着(否则整测退化为空测);成本警示阈值抬高,
+        // 避免 [runtime] 警示注记以更高优先权抢占 soft1 注记槽。
+        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
+        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
+        std::env::set_var(
+            crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
+            "100000000",
+        );
+        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
+        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
+
+        let diag_log: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let diag_captured = diag_log.clone();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ProbeApi { calls: 0 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_diag_callback(Box::new(move |msg| {
+            diag_captured.lock().expect("diag lock").push(msg);
+        }));
+
+        runtime
+            .run_turn("调查这个模块", None)
+            .expect("turn should succeed");
+
+        match saved_warn_env {
+            Some(value) => {
+                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
+            }
+            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+        match saved_convergence_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
+        }
+
+        let log = diag_log.lock().expect("diag lock");
+        let soft1 = log
+            .iter()
+            .find(|m| m.contains("convergence: soft1 injected"))
+            .unwrap_or_else(|| {
+                panic!("soft1 注入应留下 diag 记录,便于回看判定契约有效性,实际日志: {log:?}")
+            });
+        // 四要素齐备 = 记录可审计:何时(iter)、多贵(output)、按哪个阈值
+        // (threshold)、走的哪档语义(readonly) —— 缺任一项都无法复算"该不该催"。
+        for field in ["iter=", "output=", "threshold=", "readonly=false"] {
+            assert!(
+                soft1.contains(field),
+                "soft1 diag 记录缺少 {field} 字段,记录={soft1}"
+            );
+        }
+        assert!(
+            soft1.contains("output=16000") && soft1.contains("threshold=15000"),
+            "干活轮应按 15K 阈值触发并记录真实输出量,记录={soft1}"
         );
     }
 
