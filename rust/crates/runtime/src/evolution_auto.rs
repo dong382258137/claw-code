@@ -20,12 +20,6 @@ pub const AUTO_ENV: &str = "CLAW_EVOLUTION_AUTO";
 /// 两次自动进化之间的最小间隔(毫秒)。默认 30 分钟。
 pub const AUTO_ENV_COOLDOWN_MS: &str = "CLAW_EVOLUTION_COOLDOWN_MS";
 
-/// 部署完成标记:由进化进程写,父进程(有会话可重启者)读取后触发热升级。
-///
-/// 这是断点③的解法核心 —— 部署动作发生在哪个进程,热升级就必须发生在
-/// **能重启会话的那个进程**,两者不能混为一谈。
-pub const DEPLOYED_MARKER_REL: &str = ".claw/evolution/deployed.json";
-
 /// 自动进化门控配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoGateConfig {
@@ -96,12 +90,6 @@ pub fn should_auto_evolve(
     Some("pending_proposals")
 }
 
-/// 部署完成标记的绝对路径。
-#[must_use]
-pub fn deployed_marker_path(workspace: &Path) -> std::path::PathBuf {
-    workspace.join(DEPLOYED_MARKER_REL)
-}
-
 /// 上次拉起进化进程的时间戳标记(冷却期依据)。
 ///
 /// 必须落盘:进程重启后内存值丢失,否则每次启动都会立刻再拉一次进化,
@@ -144,7 +132,22 @@ pub fn in_evolution_process() -> bool {
     std::env::var_os(ACTIVE_ENV).is_some()
 }
 
-/// 取本次改动的文件清单(`git show --name-only HEAD`,子智能体已提交)。
+/// 取当前 HEAD 提交号(失败返回空串)。
+///
+/// 用于「子智能体到底有没有提交」的判定 —— 只比 `git show HEAD` 的文件清单
+/// 是不够的: 若子智能体**没提交**, HEAD 仍指向上一个提交, 清单非空, 守卫
+/// 会失效进而部署旧代码。必须比对运行前后的 HEAD 是否变化。
+#[must_use]
+pub fn head_sha(source_root: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(source_root)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
 ///
 /// 用已提交的 HEAD 而非 `git status`:子智能体被要求"测试门全过才提交",
 /// 所以 HEAD 存在即代表改动已过测试;未提交的残留工作区不应被部署。
@@ -231,6 +234,7 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
     let prompt = crate::evolution_runner::evolution_prompt(&proposal_path, &parsed);
 
     // 1. 在源码根拉起 claw 子进程修复(继承其自身可执行文件, 不依赖 PATH)。
+    let head_before = head_sha(source_root);
     let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 失败: {e}"))?;
     let status = std::process::Command::new(&exe)
         .current_dir(source_root)
@@ -243,10 +247,17 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
         return Err(format!("进化子智能体退出码非零: {status}(未部署)"));
     }
 
-    // 2. 部署前硬校验:真实改动不得触碰黑名单。
+    // 2. 部署前硬校验。
+    //    ⚠ 必须先确认"确实产生了新提交": 只看 `git show HEAD` 的文件清单不够 ——
+    //    子智能体若**没提交**, HEAD 仍指向上一个提交、清单非空, 守卫会失效,
+    //    进而把**旧代码**当成本次修复部署出去。故比对运行前后的 HEAD。
+    let head_after = head_sha(source_root);
+    if head_after.is_empty() || head_after == head_before {
+        return Err("子智能体未产生新提交,跳过部署(提案保留)".to_string());
+    }
     let files = committed_file_list(source_root);
     if files.trim().is_empty() {
-        return Err("子智能体未产生提交,跳过部署".to_string());
+        return Err("无法读取本次提交的文件清单,跳过部署".to_string());
     }
     if let Some(frag) = crate::evolution_runner::diff_violates_forbidden(&files) {
         return Err(format!("改动命中黑名单 `{frag}`,拒绝部署(提案保留)"));
@@ -257,7 +268,6 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
 
     // 4. 标记提案已处理 + 写下部署标记(供 TUI 决定是否热升级当前会话)。
     let _ = crate::evolution_inbox::mark_processed(&inbox, &proposal_path);
-    let _ = write_deployed_marker(source_root, "auto");
     Ok(format!(
         "已修复并部署: {} → {}",
         proposal_path.display(),
@@ -295,42 +305,15 @@ pub fn spawn_pipeline_detached(workspace: &Path) -> Result<(), String> {
         // 复用已存在的 `evolve-source` 子命令而非新隐藏参数: 旧二进制不认
         // `auto` 动作会直接报错退出(安全无副作用), 新版才真正执行全管道。
         .args(["evolve-source", "auto"])
+        // 断掉 stdio 继承: 否则子进程的 cargo 构建输出会直接打到用户正在用的
+        // TUI 终端上, 污染界面。日志走 .claw 下的既有文件, 不依赖 stdout。
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("拉起进化管道失败: {e}"))?;
     write_last_spawn(&source_root, now);
     Ok(())
-}
-
-/// 写入部署完成标记(由执行部署的进程调用)。
-///
-/// `commit` 为本次部署对应的提交号/版本标签,供热升级前后对比。
-pub fn write_deployed_marker(workspace: &Path, commit: &str) -> Result<std::path::PathBuf, String> {
-    let path = deployed_marker_path(workspace);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建目录 {} 失败: {e}", parent.display()))?;
-    }
-    let body = format!("{{\"commit\":\"{commit}\"}}\n");
-    std::fs::write(&path, body).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
-    Ok(path)
-}
-
-/// 读取并**消费**部署标记(读完即删,保证一次部署只触发一次热升级)。
-///
-/// 返回标记里的 commit 字符串;无标记或内容损坏时返回 `None`。
-#[must_use]
-pub fn take_deployed_marker(workspace: &Path) -> Option<String> {
-    let path = deployed_marker_path(workspace);
-    let text = std::fs::read_to_string(&path).ok()?;
-    // 消费语义:无论内容是否可解析,读走即删,避免死循环触发。
-    let _ = std::fs::remove_file(&path);
-    let start = text.find("\"commit\"")?;
-    let rest = &text[start..];
-    let colon = rest.find(':')?;
-    let quoted = rest[colon + 1..].trim_start();
-    let quoted = quoted.strip_prefix('"')?;
-    let end = quoted.find('"')?;
-    Some(quoted[..end].to_string())
 }
 
 #[cfg(test)]
@@ -392,24 +375,5 @@ mod tests {
             should_auto_evolve(1, 999_999, 1_000_000, false, &c),
             Some("pending_proposals")
         );
-    }
-
-    #[test]
-    fn deployed_marker_roundtrip_is_consumed_once() {
-        let tmp = std::env::temp_dir().join(format!(
-            "claw-evo-marker-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let path = write_deployed_marker(&tmp, "abc1234").expect("write marker");
-        assert!(path.is_file());
-        assert_eq!(take_deployed_marker(&tmp).as_deref(), Some("abc1234"));
-        // 消费语义:第二次必须为空,否则父进程会反复热升级
-        assert_eq!(take_deployed_marker(&tmp), None);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
