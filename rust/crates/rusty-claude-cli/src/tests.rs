@@ -840,9 +840,16 @@ fn version_label_carries_build_fingerprint_shape() {
             "build label must not embed VERSION: {label:?}"
         );
     }
-    // 指纹非空时必须是 7 位小写十六进制(build.rs 的 `{:07x}` 约定)。
+    // 指纹非空时必须是纯十六进制串。两条合法来源, 长度不同:
+    // - 脏工作树: build.rs 走内容哈希 `{:07x}` → 恒 7 位;
+    // - 干净工作树: 直接取 `git rev-parse --short HEAD` → 长度随仓库规模变化
+    //   (本仓库实测 8 位, 大仓库可达 12+), 6~40 位都可能。
+    // 曾经此处硬断言 7 位, 注释也只记录了哈希路径 —— 结果**工作树一提交变干净
+    // 这条测试就必然失败**, 使 `cargo test --workspace` 在干净树上恒红, 直接
+    // 卡死自动进化管道的部署环节(测试门永不过)。
     assert!(
-        fp.is_empty() || (fp.len() == 7 && fp.chars().all(|c| c.is_ascii_hexdigit())),
+        fp.is_empty()
+            || ((7..=40).contains(&fp.len()) && fp.chars().all(|c| c.is_ascii_hexdigit())),
         "unexpected fingerprint format: {fp:?}"
     );
     // 构建时刻非空时必须形如 `MMDD-HHMM`(分钟精度,长度 9)。
