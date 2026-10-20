@@ -1,11 +1,17 @@
-//! 进化自动化闸门的决策核心(断点①②)。
+//! 进化自动化:决策核心(断点①②)+ 管道执行端(断点③)。
 //!
-//! 现状缺陷(实测):`turn 收尾 → inbox` 这一段是通的(38 条积压 8 天),
-//! 但 **inbox → 修复** 零消费者 —— 全仓库只有 `claw evolve-source` 手动入口,
-//! `app.rs` / `tui/` 下无任何 daemon、cron、后台轮询。提案因此永久积压。
+//! 接线状态(实测):`turn 收尾 → inbox` 与 `inbox → 修复` 两段都已接通 ——
+//! 上报落地后由 `spawn_pipeline_detached` 在后台拉起完整管道,该函数共有
+//! 两个自动调用点,分别位于 turn 收尾(`conversation.rs`)与显式上报工具
+//! (`tools`)。手动入口 `claw evolve-source` 仍然保留,但不是唯一入口。
 //!
-//! 本模块只做**纯决策**(输入信号 → 是否拉起进化 + 是否该热升级),不落盘、
-//! 不 spawn、不调 LLM,便于单测。真正执行由调用方负责。
+//! 本模块同时包含两类函数,改动时注意区分:
+//! - **纯决策**:输入廉价本地信号 → 是否拉起进化 + 是否该热升级
+//!   (`should_auto_evolve` 等),零 IO、零 LLM,便于单测;
+//! - **执行**:pipeline 本体 —— 落盘冷却标记(`.claw/evolution/.last_spawn`)、
+//!   spawn 后台子进程、在子进程里跑 `cargo test` / `cargo build --release`,
+//!   并经 `install_binary` 把 exe 回拷到全局部署。子进程内是一次完整 agent
+//!   会话,会调 LLM(故本模块间接依赖模型,而非纯逻辑模块)。
 //!
 //! 设计约束(与 `evolution_runner` 一致):
 //! - 默认开启,`CLAW_EVOLUTION_AUTO=0` 一键关;
