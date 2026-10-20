@@ -81,6 +81,19 @@ impl EvolutionLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// 锁当前是否被他人持有(陈旧锁视为未持有)。
+    ///
+    /// 供「是否拉起自动进化」判断用:只是**查询**不获取锁,否则调用方会把锁
+    /// 拿在手里却并不进化,反而挡住真正的进化进程。
+    #[must_use]
+    pub fn is_held(source_root: &Path) -> bool {
+        let path = source_root.join(".claw").join("evolution").join(".lock");
+        if !path.exists() {
+            return false;
+        }
+        !Self::is_stale(&path)
+    }
 }
 
 impl Drop for EvolutionLock {

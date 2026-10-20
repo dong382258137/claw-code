@@ -1201,9 +1201,35 @@ fn run_evolve_source(
                 ),
             }
         }
+        "auto" => {
+            // 自动进化管道入口: 由上报钩子以 detached 方式拉起(`evolve-source auto`)。
+            // 全流程 = 取 inbox 首条 → 源码根拉起 claw 子进程修复(测试门)→
+            // 真实 diff 黑名单硬校验 → 自动部署到全局回拷。
+            // 任何一步不过即中止, 提案保留在 inbox 等下次重试, 绝不半截部署。
+            let Some(source_root) = runtime::source_root::resolve_source_root() else {
+                return Err("未登记源码根,无法执行自动进化".into());
+            };
+            match runtime::evolution_auto::run_pipeline(&source_root) {
+                Ok(msg) => match output_format {
+                    CliOutputFormat::Text => println!("[evolve-auto] {msg}"),
+                    CliOutputFormat::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "result": msg,
+                        }))?
+                    ),
+                },
+                Err(e) => {
+                    // 失败不是异常路径(常见的: 无待办/锁被占/无法复现),
+                    // 但仍要可见 —— 否则自动管道哑火时无人知晓。
+                    eprintln!("[evolve-auto] 未部署: {e}");
+                }
+            }
+        }
         other => {
             return Err(format!(
-                "unknown evolve-source action `{other}`; expected list | process | show | run | install"
+                "unknown evolve-source action `{other}`; expected list | process | show | run | install | auto"
             )
             .into())
         }

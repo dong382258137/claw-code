@@ -2461,10 +2461,24 @@ fn run_report_framework_gap(input: FrameworkGapInput) -> Result<String, String> 
             .unwrap_or_else(|_| "(unknown)".to_string()),
     };
     let path = runtime::evolution_inbox::archive_gap(&cwd, &gap, now_ms)?;
+    // 上报即触发(用户构思核心):归档成功后立刻在后台拉起进化管道 ——
+    // 在源码根起一个 claw 子进程修复, 测试门过则自动部署到全局。
+    //
+    // 三个安全前提由 spawn_pipeline_detached 内部保证:
+    // ① 递归防护(进化子进程内不再拉起, 否则自我繁殖);
+    // ② 进化锁(已有进化在跑则跳过, 避免并发 cargo build);
+    // ③ 冷却期(默认 30 分钟, 一次上报风暴不会拉起多个进程)。
+    // 这里不等待、不阻塞: 修复要数分钟, 绝不拖住用户当前 turn。
+    let spawned = runtime::evolution_auto::spawn_pipeline_detached(&cwd).is_ok();
     to_pretty_json(json!({
         "status": "archived",
         "path": path.display().to_string(),
-        "note": "已归档到源码根的 evolution inbox;进化子智能体将在下次扫描时处理。"
+        "auto_evolution_triggered": spawned,
+        "note": if spawned {
+            "已归档, 并在后台拉起进化子进程(修复→测试门→自动部署)"
+        } else {
+            "已归档; 自动进化未拉起(冷却中/已有进化在跑/未登记源码根)"
+        }
     }))
 }
 
