@@ -9963,7 +9963,18 @@ where
             source_session: self.session.session_id.clone(),
         };
         // 归档到源码根 inbox(源码根未登记则落回工作区)。
-        let _ = crate::evolution_inbox::archive_gap(root, &gap, now_ms);
+        let archived = crate::evolution_inbox::archive_gap(root, &gap, now_ms).is_ok();
+        // 上报即触发(用户构思): 归档成功后立刻在后台拉起进化管道。
+        //
+        // 此前只有 agent 主动调 `report_framework_gap` 才触发, 而**占绝大多数的**
+        // turn 收尾自动上报(soft_threshold/punchback, 实测 38 条中 36 条)归档后
+        // 无人处理 —— 这正是"38 条积压 8 天"的主因。两条上报通道必须一致。
+        //
+        // 递归/锁/冷却三道防护在 spawn_pipeline_detached 内部:
+        // 进化子进程内(CLAW_EVOLUTION_ACTIVE)不会二次拉起。
+        if archived {
+            let _ = crate::evolution_auto::spawn_pipeline_detached(root);
+        }
     }
 
     fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
