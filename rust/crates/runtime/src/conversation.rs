@@ -4075,6 +4075,16 @@ where
         // 应保持"按量催缴"的既有行为,不被新门控静默豁免。
         let mut convergence_stagnant_iters: u32 =
             crate::convergence::CONVERGENCE_MIN_STAGNANT_ITERS;
+        // 本 turn 是否调用过工具。纯推理轮(一次工具都没调)不算只读轮 ——
+        // 它不调工具就没有"检索"这件事,保留按量催缴的既有护栏。
+        let mut turn_called_tools = false;
+        // 本 turn 是否**只**调用了侦察类只读工具(`SURVEY_TOOLS`:read_file /
+        // grep_search / glob_search)。初值 true,遇到任何非侦察工具即置 false。
+        //
+        // 为什么按工具名判而非按「有无进度信号」判:后者会把 `echo`、`bash`
+        // 之类也归入"只读侦察"(它们同样不落盘),导致阈值被放宽到 40K/60K、
+        // 该催的时候不催。只读侦察是**工具属性**,不是"没产出"的副作用。
+        let mut turn_survey_only = true;
         // P2(成本反馈注记 · Task 5):turn 开头复位成本累计器 —— turn 级计数
         // (output tokens / 工具调用)与注记位点清零,全会话累计保留跨 turn。
         self.cost_meter.reset_turn();
@@ -5849,6 +5859,12 @@ where
                             ..
                         } = blk
                         {
+                            // 有 ToolResult ⇒ 本 turn 确实调过工具。
+                            turn_called_tools = true;
+                            // 出现任何非侦察类工具 ⇒ 本 turn 不再是"纯只读侦察"。
+                            if !SURVEY_TOOLS.contains(&tool_name.as_str()) {
+                                turn_survey_only = false;
+                            }
                             let outcome = crate::convergence::ToolOutcome {
                                 tool_name: tool_name.as_str(),
                                 is_error: *is_error,
@@ -5941,10 +5957,18 @@ where
                 // 产出文件/测试通过的长任务不催收尾(见 CONVERGENCE_MIN_STAGNANT_ITERS)。
                 let convergence_stalled = convergence_stagnant_iters
                     >= crate::convergence::CONVERGENCE_MIN_STAGNANT_ITERS;
+                // 按「本 turn 是否只读侦察轮」选软阈值对:干活轮用 15K/25K,
+                // 纯侦察轮(只调 read_file/grep_search/glob_search)用 40K/60K
+                // (见 convergence::soft_thresholds)。侦察轮天然烧 token 却不
+                // 落盘,用干活轮的阈值判它停滞在语义上不成立。
+                // 纯推理轮(一次工具都没调)不算侦察轮 —— 保留原按量催缴护栏。
+                let readonly_turn = turn_called_tools && turn_survey_only;
+                let (soft1_output, soft2_output) =
+                    crate::convergence::soft_thresholds(readonly_turn);
                 if !convergence_acknowledged
                     && !convergence_soft1_injected
                     && convergence_stalled
-                    && turn_output >= crate::convergence::CONVERGENCE_SOFT1_OUTPUT
+                    && turn_output >= soft1_output
                 {
                     // 站7:仅 stage 成功才置 fire-once 标志 —— 修复 soft1(70)
                     // 被更高优先级(如成本警示 80)抢占后 `claimed` 已置位、
@@ -5958,7 +5982,7 @@ where
                     && !convergence_soft2_injected
                     && !warn_merged_this_iter
                     && convergence_stalled
-                    && turn_output >= crate::convergence::CONVERGENCE_SOFT2_OUTPUT
+                    && turn_output >= soft2_output
                 {
                     // 站7:同轮内 merged warn 已表达收敛要求(soft1 语义注入),
                     // soft2 让位下一迭代 —— 避免"输出跳变至 25K+"时同轮连发
@@ -12688,6 +12712,102 @@ mod tests {
         assert_eq!(
             prompt_count, 0,
             "有进度信号时不应催缴收尾,实际注入 {prompt_count} 条"
+        );
+    }
+
+    /// 只读侦察轮直证:全程只调 `read_file`(从不落盘)、累计 output 已越过
+    /// 旧的 15K/25K,但未越过放宽后的 40K ⇒ 不应被催缴收尾。
+    ///
+    /// 这是方案 C 的核心行为:`project_one` 只把「写文件 / 测试通过」当作进度,
+    /// 纯读取必然被判为停滞。若沿用干活轮的 15K 阈值,这种轮次会被催收尾。
+    #[test]
+    fn readonly_reconnaissance_turn_is_not_nagged_at_legacy_threshold() {
+        struct ReadOnlyApi {
+            calls: usize,
+        }
+
+        impl ApiClient for ReadOnlyApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                Ok(match self.calls {
+                    // 迭代1/2:各 16K output(累计 32K —— 已越过旧 soft1=15K
+                    // 与旧 soft2=25K),但只做读取,不产生任何进度信号。
+                    1 | 2 => vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 16_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::TextDelta("inspecting".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: format!("r-{}", self.calls),
+                            name: "read_file".to_string(),
+                            input: "src/lib.rs".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ],
+                    // 迭代3:收尾(无工具 → turn 结束)。
+                    _ => vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ],
+                })
+            }
+        }
+
+        // env 隔离:启用收敛契约(否则本测试在 P1=0 下退化为空测试),并抬高
+        // 成本警示阈值避免 [runtime] 注记污染计数。
+        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
+        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
+        std::env::set_var(
+            crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
+            "100000000",
+        );
+        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
+        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ReadOnlyApi { calls: 0 },
+            StaticToolExecutor::new().register("read_file", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("调查这个模块", None)
+            .expect("turn should succeed");
+
+        match saved_warn_env {
+            Some(value) => {
+                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
+            }
+            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+        match saved_convergence_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
+        }
+
+        // then:累计 32K 全只读 → 落在只读轮阈值(40K)之内,不应被催缴。
+        let prompt_count = runtime
+            .session
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(m.role, MessageRole::User)
+                    && m.blocks.iter().any(
+                        |b| matches!(b, ContentBlock::Text { text } if text.contains("收敛声明")),
+                    )
+            })
+            .count();
+        assert_eq!(
+            prompt_count, 0,
+            "只读侦察轮越过旧 15K/25K 但未越过放宽阈值时不应催缴,实际注入 {prompt_count} 条"
         );
     }
 

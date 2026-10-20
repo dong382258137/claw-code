@@ -303,6 +303,25 @@ pub fn record_turn(
 mod tests {
     use super::*;
 
+    #[test]
+    fn soft_thresholds_widens_for_readonly_turns() {
+        // 干活轮(写过文件/测试通过):沿用原阈值。
+        assert_eq!(
+            soft_thresholds(false),
+            (CONVERGENCE_SOFT1_OUTPUT, CONVERGENCE_SOFT2_OUTPUT)
+        );
+        // 只读侦察轮:显著放宽,避免把"正在检索"误判为"停滞"。
+        assert_eq!(
+            soft_thresholds(true),
+            (
+                CONVERGENCE_SOFT1_OUTPUT_READONLY,
+                CONVERGENCE_SOFT2_OUTPUT_READONLY
+            )
+        );
+        // 放宽方向由上面两组 assert_eq! 的取值本身保证(40K/60K vs 15K/25K),
+        // 无需再写常量不等式断言(clippy::assertions_on_constants)。
+    }
+
     fn cls(s: &str) -> PunchbackClass {
         classify_punchback(s)
     }
@@ -618,6 +637,36 @@ pub fn validate_evidence(
 /// 收敛契约 P1 软阈值(output tokens,文档 §4.3):达到时注入声明提示。
 pub const CONVERGENCE_SOFT1_OUTPUT: u64 = 15_000;
 pub const CONVERGENCE_SOFT2_OUTPUT: u64 = 25_000;
+
+/// **只读侦察轮**的软阈值。
+///
+/// 缺陷:写文件轮与本轮无任何进度信号的只读轮共用 15K/25K 阈值。但只读轮
+/// (grep/read/bash 调查)天然烧 token 却**不落盘** —— `project_one` 只把
+/// `file_produced` / `test_success` 记作进度,纯读取必然被判为"停滞"。实测
+/// 长调研 turn(30K+ output、几十次检索、零写入)会被连续催缴收尾,而它正在
+/// 正常工作。语义上「用写文件轮的阈值判定只读轮停滞」不成立。
+///
+/// 修正:按本 turn 是否产生过进度信号选阈值对 —— 只读轮用显著更宽的阈值,
+/// 保留对真 runaway 的拦截,又不误伤正常调研。
+pub const CONVERGENCE_SOFT1_OUTPUT_READONLY: u64 = 40_000;
+pub const CONVERGENCE_SOFT2_OUTPUT_READONLY: u64 = 60_000;
+
+/// 按「本 turn 是否为只读侦察轮」选取软阈值对 `(soft1, soft2)`。
+///
+/// 纯函数,零 env 依赖,可单测。`readonly=true` 用放宽阈值,`false` 用标准
+/// 阈值。只读轮的定义见调用点:本 turn **调用过工具**但从未产生进度信号。
+/// 纯推理轮(一次工具都没调)不算只读轮 —— 它保留按量催缴的既有护栏。
+#[must_use]
+pub const fn soft_thresholds(readonly: bool) -> (u64, u64) {
+    if readonly {
+        (
+            CONVERGENCE_SOFT1_OUTPUT_READONLY,
+            CONVERGENCE_SOFT2_OUTPUT_READONLY,
+        )
+    } else {
+        (CONVERGENCE_SOFT1_OUTPUT, CONVERGENCE_SOFT2_OUTPUT)
+    }
+}
 
 /// 触发收敛催缴所需的**最少连续停滞迭代数**。
 ///

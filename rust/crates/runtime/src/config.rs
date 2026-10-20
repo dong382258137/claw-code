@@ -602,6 +602,17 @@ impl RuntimeConfig {
         };
         let mut applied = 0usize;
         for (key, value) in env {
+            // 显式 null ⇒ 「确保该变量不存在」。用于清除**上一进程注入、被本
+            // 进程继承**的旧值 —— 热升级时新进程继承父进程全部环境,而下面的
+            // "外部优先"规则会把继承值当成用户显式设置,于是删掉配置键也无法
+            // 让它失效(实测:`.claw.json` 删掉 `CLAW_CONVERGENCE_P1` 后,
+            // `convergence_enabled()` 仍读到继承来的 "0")。写 null 是唯一能
+            // 表达"要它不存在"的方式,且幂等,跨多次热升级自我维持。
+            if matches!(value, JsonValue::Null) {
+                std::env::remove_var(key);
+                applied += 1;
+                continue;
+            }
             // 显式外部环境优先,配置不覆盖。
             if std::env::var_os(key).is_some() {
                 continue;
@@ -1946,6 +1957,44 @@ mod tests {
             feature_config: super::RuntimeFeatureConfig::default(),
         };
         assert_eq!(config.apply_env_to_process(), 0);
+    }
+
+    /// null 值 ⇒ 「确保该变量不存在」。
+    ///
+    /// 场景是热升级:新进程继承旧进程环境,旧进程由配置注入的
+    /// `CLAW_CONVERGENCE_P1=0` 会被"外部优先"规则当成用户显式设置,于是
+    /// **删掉配置键也无效**。写 null 才能清掉它,使开关回到默认开启。
+    #[test]
+    fn apply_env_to_process_null_value_clears_inherited_var() {
+        let _guard = config_env_lock();
+        let key = "CLAW_TEST_APPLY_ENV_NULL_CLEARS";
+
+        // 模拟"从父进程继承来的"值:既存在于环境,又无任何来源标记。
+        std::env::set_var(key, "0");
+        assert!(std::env::var_os(key).is_some());
+
+        let merged = JsonValue::parse(&format!(r#"{{"env":{{"{key}":null}}}}"#))
+            .expect("parse merged")
+            .as_object()
+            .expect("object")
+            .clone();
+        let config = super::RuntimeConfig {
+            merged,
+            loaded_entries: Vec::new(),
+            feature_config: super::RuntimeFeatureConfig::default(),
+        };
+
+        let applied = config.apply_env_to_process();
+
+        assert_eq!(
+            std::env::var_os(key),
+            None,
+            "null must remove the inherited value, otherwise deleting the key \
+             can never turn the convergence contract back on"
+        );
+        assert_eq!(applied, 1, "null entry counts as an applied change");
+
+        std::env::remove_var(key);
     }
 
     fn temp_dir() -> std::path::PathBuf {

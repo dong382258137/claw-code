@@ -3,6 +3,6 @@
     "quick": "haiku"
   },
   "env": {
-    "CLAW_CONVERGENCE_P1": "0"
+    "CLAW_CONVERGENCE_P1": null
   }
 }
