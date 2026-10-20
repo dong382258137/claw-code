@@ -12594,6 +12594,103 @@ mod tests {
         );
     }
 
+    /// (c) 直证:高 token 但**持续产生进度信号**的 turn 不应被催缴收尾。
+    ///
+    /// 这是「用任务进度而非 token 燃量触发收敛」的核心行为。改前:只要
+    /// output ≥ 15K 就注 soft1,不论模型是否正在写文件推进任务。改后:本批有
+    /// file_produced 信号即清零停滞计数 ⇒ soft1 门控的 `convergence_stalled`
+    /// 不成立 ⇒ 0 条催缴。
+    #[test]
+    fn high_output_with_progress_signals_is_not_nagged_to_converge() {
+        struct ProgressApi {
+            calls: usize,
+        }
+
+        impl ApiClient for ProgressApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                Ok(match self.calls {
+                    // 迭代1/2:各 16K output(累计 32K,已越过 soft1=15K 与
+                    // soft2=25K),但每次都在成功写文件 = 任务确实在推进。
+                    1 | 2 => vec![
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 16_000,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::TextDelta("writing the fix".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: format!("w-{}", self.calls),
+                            name: "write_file".to_string(),
+                            input: "src/lib.rs".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ],
+                    // 迭代3:收尾(无工具 → turn 结束)。
+                    _ => vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ],
+                })
+            }
+        }
+
+        // env 隔离:抬高成本警示阈值,避免 [runtime] 成本注记污染计数;并显式
+        // 启用收敛契约 —— 外部 `CLAW_CONVERGENCE_P1=0` 会被子进程继承。
+        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
+        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
+        std::env::set_var(
+            crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
+            "100000000",
+        );
+        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
+        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ProgressApi { calls: 0 },
+            StaticToolExecutor::new().register("write_file", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("重构该模块", None)
+            .expect("turn should succeed");
+
+        match saved_warn_env {
+            Some(value) => {
+                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
+            }
+            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
+        }
+        match saved_convergence_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
+        }
+
+        // then:累计 output 32K 却全程在产出文件 → 不应收到任何收敛催缴。
+        let prompt_count = runtime
+            .session
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(m.role, MessageRole::User)
+                    && m.blocks.iter().any(
+                        |b| matches!(b, ContentBlock::Text { text } if text.contains("收敛声明")),
+                    )
+            })
+            .count();
+        assert_eq!(
+            prompt_count, 0,
+            "有进度信号时不应催缴收尾,实际注入 {prompt_count} 条"
+        );
+    }
+
     #[test]
     fn run_turn_propagates_api_errors() {
         struct FailingApi;
