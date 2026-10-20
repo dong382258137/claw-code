@@ -13,7 +13,7 @@
 //! - 部署后必须让**父进程**(TUI,有可重启会话)去热升级 —— `-p` 子进程
 //!   本轮结束即退,没有可被重启的会话,它自己升级等于丢改动。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 自动进化总开关环境变量。默认为 `1`(开启);`0` 关闭。
 pub const AUTO_ENV: &str = "CLAW_EVOLUTION_AUTO";
@@ -203,6 +203,91 @@ pub fn install_binary(source_root: &Path) -> Result<std::path::PathBuf, String> 
     Ok(exe)
 }
 
+/// 单条提案的最大尝试次数。超过则移入 `quarantine/`,不再自动重试。
+///
+/// **为什么必须有**: `run_pipeline` 取 inbox 排序后的第一条。若某条提案永远
+/// 修不好(无法复现/与现有架构冲突),它会被每轮重试,既永久占住队首把后面
+/// 几十条堵死,又每 30 分钟烧一次完整进化会话的 token。自动化系统里这是死锁。
+pub const MAX_ATTEMPTS: u32 = 3;
+
+/// 隔离目录名:超过重试上限的提案移入此处,留档但不再自动处理。
+pub const QUARANTINE_DIR: &str = "quarantine";
+
+/// 尝试计数目录名(与 inbox 同级,文件名与提案同名 + `.n`)。
+pub const ATTEMPTS_DIR: &str = ".attempts";
+
+/// 读取某条提案已尝试次数。
+#[must_use]
+pub fn attempts_of(inbox: &Path, proposal: &Path) -> u32 {
+    let Some(name) = proposal.file_name().and_then(|n| n.to_str()) else {
+        return 0;
+    };
+    std::fs::read_to_string(inbox.join(ATTEMPTS_DIR).join(format!("{name}.n")))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// 记录一次失败尝试,返回累计次数。失败静默(顶多退化为多试几次)。
+pub fn bump_attempts(inbox: &Path, proposal: &Path) -> u32 {
+    let n = attempts_of(inbox, proposal) + 1;
+    let Some(name) = proposal.file_name().and_then(|f| f.to_str()) else {
+        return n;
+    };
+    let dir = inbox.join(ATTEMPTS_DIR);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(format!("{name}.n")), format!("{n}\n"));
+    }
+    n
+}
+
+/// 把超出重试上限的提案移入 `quarantine/`,避免继续阻塞队首。
+pub fn quarantine_proposal(inbox: &Path, proposal: &Path) -> Result<PathBuf, String> {
+    let dir = inbox.join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败: {e}", dir.display()))?;
+    let name = proposal
+        .file_name()
+        .ok_or_else(|| format!("无效提案路径: {}", proposal.display()))?;
+    let dst = dir.join(name);
+    std::fs::rename(proposal, &dst)
+        .map_err(|e| format!("隔离 {} 失败: {e}", proposal.display()))?;
+    Ok(dst)
+}
+
+/// 从待处理列表中挑出**可尝试**的第一条(跳过已超上限者)。
+///
+/// 防御性过滤: 正常情况下超限提案已被移入 quarantine, 但进程可能在
+/// `bump_attempts` 之后、`quarantine_proposal` 之前被杀, 留下超限残留。
+#[must_use]
+pub fn next_attemptable(inbox: &Path, pending: &[PathBuf]) -> Option<PathBuf> {
+    pending
+        .iter()
+        .find(|p| attempts_of(inbox, p) < MAX_ATTEMPTS)
+        .cloned()
+}
+
+/// 记录一次失败尝试,达上限则隔离。返回一段可读后缀,拼进错误信息。
+///
+/// 达到上限必须**移出 inbox**: 否则它会一直排在队首(排序稳定), 每轮被选中、
+/// 每轮失败, 后面几十条永远轮不到 —— 自动化系统里的饥饿死锁。
+fn note_failure(inbox: &Path, proposal: &Path) -> String {
+    let n = bump_attempts(inbox, proposal);
+    if n < MAX_ATTEMPTS {
+        return format!("(第 {n}/{MAX_ATTEMPTS} 次尝试, 保留待重试)");
+    }
+    match quarantine_proposal(inbox, proposal) {
+        Ok(_) => format!("(已尝试 {n} 次, 移入 quarantine 不再自动重试)"),
+        Err(e) => format!("(已尝试 {n} 次, 隔离失败: {e})"),
+    }
+}
+
+/// 成功处理后清理尝试计数,避免残留文件被下一条同名提案误用。
+fn clear_attempts(inbox: &Path, proposal: &Path) {
+    if let Some(name) = proposal.file_name().and_then(|n| n.to_str()) {
+        let _ = std::fs::remove_file(inbox.join(ATTEMPTS_DIR).join(format!("{name}.n")));
+    }
+}
+
 /// 进化管道(断点①②③的完整自动链路)。
 ///
 /// 用户构思的直接实现:**一个 BUG 提案 → 在源码根拉起 claw 子进程修 → 测试门
@@ -225,8 +310,10 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
     };
     let inbox = crate::evolution_inbox::resolve_inbox_dir(source_root);
     let pending = crate::evolution_inbox::list_pending(&inbox);
-    let Some(proposal_path) = pending.into_iter().next() else {
-        return Err("inbox 无待处理提案".to_string());
+    // 跳过已达重试上限者: 一条永远修不好的提案若一直占队首, 会把它后面
+    // 几十条全部饿死, 且每轮重试都烧一次完整进化会话。
+    let Some(proposal_path) = next_attemptable(&inbox, &pending) else {
+        return Err("inbox 无待处理提案(或均已超重试上限)".to_string());
     };
     let text = std::fs::read_to_string(&proposal_path)
         .map_err(|e| format!("读取提案失败 {}: {e}", proposal_path.display()))?;
@@ -243,8 +330,10 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
         .status()
         .map_err(|e| format!("启动进化子进程失败: {e}"))?;
     if !status.success() {
-        // 失败不部署、不标记已处理 —— 提案留在 inbox 等下次重试。
-        return Err(format!("进化子智能体退出码非零: {status}(未部署)"));
+        // 失败不部署、不标记已处理 —— 提案留在 inbox 等下次重试, 但要计入
+        // 尝试次数: 反复修不好的提案必须到期隔离, 否则永久占住队首。
+        let tag = note_failure(&inbox, &proposal_path);
+        return Err(format!("进化子智能体退出码非零: {status}(未部署){tag}"));
     }
 
     // 2. 部署前硬校验。
@@ -253,21 +342,35 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
     //    进而把**旧代码**当成本次修复部署出去。故比对运行前后的 HEAD。
     let head_after = head_sha(source_root);
     if head_after.is_empty() || head_after == head_before {
-        return Err("子智能体未产生新提交,跳过部署(提案保留)".to_string());
+        let tag = note_failure(&inbox, &proposal_path);
+        return Err(format!("子智能体未产生新提交,跳过部署{tag}"));
     }
     let files = committed_file_list(source_root);
     if files.trim().is_empty() {
-        return Err("无法读取本次提交的文件清单,跳过部署".to_string());
+        let tag = note_failure(&inbox, &proposal_path);
+        return Err(format!("无法读取本次提交的文件清单,跳过部署{tag}"));
     }
     if let Some(frag) = crate::evolution_runner::diff_violates_forbidden(&files) {
-        return Err(format!("改动命中黑名单 `{frag}`,拒绝部署(提案保留)"));
+        // 黑名单命中是**安全否决**, 不是"再试一次能好"的失败: 同一条提案
+        // 重试必然还是同一批文件。直接隔离, 不留它反复消耗。
+        let _ = quarantine_proposal(&inbox, &proposal_path);
+        return Err(format!(
+            "改动命中黑名单 `{frag}`,拒绝部署(已隔离,不再自动重试)"
+        ));
     }
 
     // 3. 自动部署到全局。失败则回滚,提案保留。
-    let installed = install_binary(source_root)?;
+    let installed = match install_binary(source_root) {
+        Ok(p) => p,
+        Err(e) => {
+            let tag = note_failure(&inbox, &proposal_path);
+            return Err(format!("{e}{tag}"));
+        }
+    };
 
-    // 4. 标记提案已处理 + 写下部署标记(供 TUI 决定是否热升级当前会话)。
+    // 4. 标记提案已处理 + 清理尝试计数。
     let _ = crate::evolution_inbox::mark_processed(&inbox, &proposal_path);
+    clear_attempts(&inbox, &proposal_path);
     Ok(format!(
         "已修复并部署: {} → {}",
         proposal_path.display(),
@@ -375,5 +478,82 @@ mod tests {
             should_auto_evolve(1, 999_999, 1_000_000, false, &c),
             Some("pending_proposals")
         );
+    }
+
+    /// 队首饥饿死锁回归:一条永远修不好的提案不得永久阻塞其后所有提案。
+    ///
+    /// 缺陷: `run_pipeline` 原先直接取 `pending.into_iter().next()`, 即排序后
+    /// 第一条。若该条永远修不好(无法复现/与架构冲突), 它会被每轮重试:
+    /// ①永久占住队首, 后面几十条饿死; ②每 30 分钟烧一次完整进化会话。
+    #[test]
+    fn exhausted_proposal_is_skipped_not_blocking_queue() {
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-evo-attempts-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let first = tmp.join("100-bad.md");
+        let second = tmp.join("200-good.md");
+        std::fs::write(&first, "x").unwrap();
+        std::fs::write(&second, "y").unwrap();
+        let pending = vec![first.clone(), second.clone()];
+
+        // 初始:两条都可尝试, 选第一条
+        assert_eq!(next_attemptable(&tmp, &pending), Some(first.clone()));
+
+        // 第一条失败到上限 → 必须被跳过, 轮到第二条
+        for _ in 0..MAX_ATTEMPTS {
+            bump_attempts(&tmp, &first);
+        }
+        assert_eq!(attempts_of(&tmp, &first), MAX_ATTEMPTS);
+        assert_eq!(
+            next_attemptable(&tmp, &pending),
+            Some(second.clone()),
+            "超限提案仍占队首 ⇒ 后面全部饿死"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn quarantine_moves_proposal_out_of_pending() {
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-evo-quar-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = tmp.join("100-bad.md");
+        std::fs::write(&p, "x").unwrap();
+
+        let dst = quarantine_proposal(&tmp, &p).expect("quarantine");
+        assert!(!p.exists(), "原文件应已移走");
+        assert!(dst.exists(), "应已移入 quarantine");
+        assert!(dst.to_string_lossy().contains(QUARANTINE_DIR));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn all_proposals_exhausted_returns_none() {
+        // 全部超限 ⇒ 无目标(而不是反复重试第一条)
+        let tmp = std::env::temp_dir().join(format!(
+            "claw-evo-allbad-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = tmp.join("100-bad.md");
+        std::fs::write(&p, "x").unwrap();
+        for _ in 0..MAX_ATTEMPTS {
+            bump_attempts(&tmp, &p);
+        }
+        assert_eq!(next_attemptable(&tmp, &[p]), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
