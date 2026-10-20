@@ -29,6 +29,30 @@ pub fn test_gate_commands() -> Vec<&'static str> {
     vec!["cargo test --workspace", "cargo fmt --check"]
 }
 
+/// 自动闸门:校验本次进化改动的文件列表是否触碰黑名单。
+///
+/// 提示词里的「不得修改」只是**请求**,被审查对象(模型)可能不遵守 ——
+/// 自动部署前必须用**真实 diff** 做一次硬校验,否则「自动闸门」等于把
+/// 安全边界交给被审查者自己。
+///
+/// 入参为 `git diff --name-only` 的输出(每行一个路径);返回首个命中的
+/// 黑名单片段。零依赖纯函数,便于单测。
+#[must_use]
+pub fn diff_violates_forbidden(file_list: &str) -> Option<&'static str> {
+    for line in file_list.lines() {
+        let path = line.trim().to_ascii_lowercase();
+        if path.is_empty() {
+            continue;
+        }
+        for &frag in FORBIDDEN_PATH_FRAGMENTS {
+            if path.contains(frag) {
+                return Some(frag);
+            }
+        }
+    }
+    None
+}
+
 /// 一份被解析的提案(仅取进化所需字段)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedProposal {
@@ -169,6 +193,35 @@ mod tests {
         assert!(
             prompt.contains("不要") && prompt.contains("部署"),
             "应含人工闸门说明"
+        );
+    }
+
+    /// 自动闸门的安全核心:黑名单必须由**真实 diff** 硬校验, 不能只靠提示词。
+    ///
+    /// 被审查对象是模型本身 —— 提示词里的"不得修改"只是请求。若部署前不核对
+    /// 实际改动文件, 自动闸门等于把安全边界交给被审查者自己。
+    #[test]
+    fn diff_violates_forbidden_detects_blacklisted_paths() {
+        // 正常改动放行
+        assert_eq!(
+            diff_violates_forbidden("rust/crates/runtime/src/convergence.rs\n"),
+            None
+        );
+        // 空 diff 放行
+        assert_eq!(diff_violates_forbidden(""), None);
+        assert_eq!(diff_violates_forbidden("\n \n"), None);
+        // 黑名单命中(大小写不敏感)
+        assert_eq!(
+            diff_violates_forbidden("rust/crates/rusty-claude-cli/src/upgrade_helper.rs"),
+            Some("upgrade_helper.rs")
+        );
+        assert_eq!(
+            diff_violates_forbidden("src/Foo/PERMISSION_gate.rs"),
+            Some("permission")
+        );
+        assert_eq!(
+            diff_violates_forbidden("a.rs\nb/trust_resolver.rs\nc.rs"),
+            Some("trust_resolver")
         );
     }
 }
