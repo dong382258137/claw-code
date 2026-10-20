@@ -584,6 +584,37 @@ impl RuntimeConfig {
         self.merged.get(key)
     }
 
+    /// 把合并后的 `env` 块应用到**当前进程**环境。
+    ///
+    /// 设计要点(2026-10-20):
+    /// - **真实环境变量优先**:已存在的 env var 不被配置覆盖,便于
+    ///   `CLAW_X=1 claw ...` 做临时调试;配置只负责补缺。
+    /// - 仅接受字符串值;非字符串条目跳过(校验层已保证 `env` 为 object)。
+    /// - 返回实际写入的变量个数,供调用方日志与测试断言。
+    ///
+    /// 背景:在此之前 `env` 块只被 MCP 子进程消费(`mcp_stdio::apply_env`),
+    /// 进程自身从不 `set_var` —— 于是在 `.claw.json` 写
+    /// `env.CLAW_CONVERGENCE_P1 = "0"` 时,`convergence_enabled()` 读
+    /// `std::env::var` 永远读不到,该键实际是死键。
+    pub fn apply_env_to_process(&self) -> usize {
+        let Some(env) = self.merged.get("env").and_then(JsonValue::as_object) else {
+            return 0;
+        };
+        let mut applied = 0usize;
+        for (key, value) in env {
+            // 显式外部环境优先,配置不覆盖。
+            if std::env::var_os(key).is_some() {
+                continue;
+            }
+            let Some(text) = value.as_str() else {
+                continue;
+            };
+            std::env::set_var(key, text);
+            applied += 1;
+        }
+        applied
+    }
+
     #[must_use]
     pub fn as_json(&self) -> JsonValue {
         JsonValue::Object(self.merged.clone())
@@ -1855,6 +1886,67 @@ mod tests {
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 串行化触碰进程环境的测试(与其它 crate 的 env_lock 同模式)。
+    fn config_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn apply_env_to_process_writes_config_env_and_keeps_external_priority() {
+        let _guard = config_env_lock();
+        let key = "CLAW_TEST_APPLY_ENV_FROM_CONFIG";
+        let seeded = "CLAW_TEST_APPLY_ENV_EXTERNAL_PRIORITY";
+        std::env::remove_var(key);
+        std::env::remove_var(seeded);
+
+        let merged = JsonValue::parse(&format!(
+            r#"{{"env":{{"{key}":"from-config","{seeded}":"from-config","NUM":1}}}}"#
+        ))
+        .expect("parse merged")
+        .as_object()
+        .expect("object")
+        .clone();
+        let config = super::RuntimeConfig {
+            merged,
+            loaded_entries: Vec::new(),
+            feature_config: super::RuntimeFeatureConfig::default(),
+        };
+
+        // 预置一个外部变量,验证"真实环境优先、配置不覆盖"。
+        std::env::set_var(seeded, "from-external");
+
+        let applied = config.apply_env_to_process();
+
+        assert_eq!(std::env::var(key).ok().as_deref(), Some("from-config"));
+        assert_eq!(
+            std::env::var(seeded).ok().as_deref(),
+            Some("from-external"),
+            "external env must win over config"
+        );
+        assert_eq!(
+            applied, 1,
+            "only the missing key should be written; non-string NUM skipped"
+        );
+
+        // 收尾:不污染其它测试。
+        std::env::remove_var(key);
+        std::env::remove_var(seeded);
+    }
+
+    #[test]
+    fn apply_env_to_process_is_noop_without_env_block() {
+        let _guard = config_env_lock();
+        let config = super::RuntimeConfig {
+            merged: std::collections::BTreeMap::new(),
+            loaded_entries: Vec::new(),
+            feature_config: super::RuntimeFeatureConfig::default(),
+        };
+        assert_eq!(config.apply_env_to_process(), 0);
+    }
 
     fn temp_dir() -> std::path::PathBuf {
         // #149: previously used `runtime-config-{nanos}` which collided

@@ -1,5 +1,8 @@
 {
   "aliases": {
     "quick": "haiku"
+  },
+  "env": {
+    "CLAW_CONVERGENCE_P1": "0"
   }
 }

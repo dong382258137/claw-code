@@ -564,6 +564,24 @@ fn inject_wizard_env_vars(settings: &runtime::WizardSettings) {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // 启动最早期把 `.claw.json` 的 `env` 块应用到当前进程。
+    //
+    // 必须早于任何 `std::env::var` 读取的功能开关判定 —— 例如
+    // `convergence::convergence_enabled()` 读 `CLAW_CONVERGENCE_P1`。
+    // 在此之前 `env` 块只被 MCP 子进程消费(`mcp_stdio::apply_env`),
+    // 进程自身从不 set_var, 故该键在配置里是死键。
+    // 外部真实环境变量优先(见 `RuntimeConfig::apply_env_to_process`)。
+    if let Ok(cwd) = env::current_dir() {
+        if let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() {
+            let applied = config.apply_env_to_process();
+            if applied > 0 {
+                runtime::diag::global().info(
+                    "config",
+                    &format!("applied {applied} env var(s) from config"),
+                );
+            }
+        }
+    }
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
         CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
