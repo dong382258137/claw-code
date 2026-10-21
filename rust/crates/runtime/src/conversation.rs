@@ -9988,7 +9988,11 @@ where
             source_session: self.session.session_id.clone(),
         };
         // 归档到源码根 inbox(源码根未登记则落回工作区)。
-        let archived = crate::evolution_inbox::archive_gap(root, &gap, now_ms).is_ok();
+        // 仅**新立案**才拉起管道:同 trigger 已有待处理提案时 archive_gap 返回
+        // `Duplicate`,再拉一次 `evolve-source auto` 纯属重复跑 cargo build
+        // (实测 9 条同源 soft_threshold 提案正文 md5 全同)。
+        let archived =
+            crate::evolution_inbox::archive_gap(root, &gap, now_ms).is_ok_and(|o| o.is_created());
         // 上报即触发(用户构思): 归档成功后立刻在后台拉起进化管道。
         //
         // 此前只有 agent 主动调 `report_framework_gap` 才触发, 而**占绝大多数的**

@@ -2460,22 +2460,29 @@ fn run_report_framework_gap(input: FrameworkGapInput) -> Result<String, String> 
         source_session: std::env::var("CLAW_SESSION_ID")
             .unwrap_or_else(|_| "(unknown)".to_string()),
     };
-    let path = runtime::evolution_inbox::archive_gap(&cwd, &gap, now_ms)?;
-    // 上报即触发(用户构思核心):归档成功后立刻在后台拉起进化管道 ——
+    let outcome = runtime::evolution_inbox::archive_gap(&cwd, &gap, now_ms)?;
+    let path = outcome.path().to_path_buf();
+    let created = outcome.is_created();
+    // 上报即触发(用户构思核心):**新立案**时才在后台拉起进化管道 ——
     // 在源码根起一个 claw 子进程修复, 测试门过则自动部署到全局。
+    //
+    // 同一 trigger 已有待处理提案(= 已有一次进化在路上/待处理)时不重复拉起:
+    // 重复立项会重复跑整条 cargo 构建管道(实测 9 条同源 soft_threshold 提案)。
     //
     // 三个安全前提由 spawn_pipeline_detached 内部保证:
     // ① 递归防护(进化子进程内不再拉起, 否则自我繁殖);
     // ② 进化锁(已有进化在跑则跳过, 避免并发 cargo build);
     // ③ 冷却期(默认 30 分钟, 一次上报风暴不会拉起多个进程)。
     // 这里不等待、不阻塞: 修复要数分钟, 绝不拖住用户当前 turn。
-    let spawned = runtime::evolution_auto::spawn_pipeline_detached(&cwd).is_ok();
+    let spawned = created && runtime::evolution_auto::spawn_pipeline_detached(&cwd).is_ok();
     to_pretty_json(json!({
-        "status": "archived",
+        "status": if created { "archived" } else { "duplicate" },
         "path": path.display().to_string(),
         "auto_evolution_triggered": spawned,
         "note": if spawned {
             "已归档, 并在后台拉起进化子进程(修复→测试门→自动部署)"
+        } else if !created {
+            "同 trigger 已有待处理提案, 未重复立项、未重复拉起进化(避免重复构建)"
         } else {
             "已归档; 自动进化未拉起(冷却中/已有进化在跑/未登记源码根)"
         }

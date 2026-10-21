@@ -97,23 +97,75 @@ pub fn resolve_inbox_dir(workspace_cwd: &Path) -> PathBuf {
     workspace_cwd.join(INBOX_REL)
 }
 
-/// 归档一条提案,返回写入的文件路径。
+/// 归档结果:新立案 vs 与**待处理**提案重复。
+///
+/// 调用方必须据此决定是否拉起进化管道 —— 重复立项再各拉起一次
+/// `evolve-source auto`(含 cargo build)是纯浪费,且会把 inbox 灌成
+/// 同一发现的 N 份副本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveOutcome {
+    /// 新提案已落盘(路径为新文件)。
+    Created(PathBuf),
+    /// 同一 trigger 已有待处理提案 —— 未写新文件,路径为**已存在**的那份。
+    Duplicate(PathBuf),
+}
+
+impl ArchiveOutcome {
+    /// 相关提案路径(新建的 / 已存在的)。
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Created(p) | Self::Duplicate(p) => p,
+        }
+    }
+
+    /// 是否为本次新立案。
+    #[must_use]
+    pub fn is_created(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
+/// 归档一条提案,返回 `ArchiveOutcome`。
 ///
 /// 文件名:`<created_at_ms>-<slug>.md`。slug 由 trigger 派生(稳定、可读)。
 /// 目录不存在则创建。写入失败返回 `Err`。
+///
+/// **去重(实测缺陷)**:inbox 曾无任何内容级去重,实测 9 条 `soft-threshold`
+/// 提案正文去易变字段(id/created_at/source_session/iterations)后 md5 完全相同
+/// (86f5b36d...),来自 6 个不同 session —— 即同一发现被重复立项 9 次,并
+/// 各拉起一次完整进化管道。会话内限流(`GAP_REPORT_MIN_INTERVAL_MS`)是
+/// 进程内内存态,跨 session 完全失效,挡不住这条路径。
+///
+/// 判据:inbox 待处理区已有同 `slug`(由 trigger 派生)的提案 → 不再写新文件,
+/// 返回 [`ArchiveOutcome::Duplicate`]。只对**待处理**提案去重:一旦被
+/// `mark_processed` 移走,同一 trigger 的后续发现可重新立案(否则会永久失声)。
 pub fn archive_gap(
     workspace_cwd: &Path,
     gap: &FrameworkGap,
     created_at_ms: i64,
-) -> Result<PathBuf, String> {
+) -> Result<ArchiveOutcome, String> {
     let dir = resolve_inbox_dir(workspace_cwd);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 inbox {} 失败: {e}", dir.display()))?;
-    let id = format!("{}-{}", gap.source_session, created_at_ms);
     let slug = slugify(&gap.trigger);
+    if let Some(existing) = find_pending_with_slug(&dir, &slug) {
+        return Ok(ArchiveOutcome::Duplicate(existing));
+    }
+    let id = format!("{}-{}", gap.source_session, created_at_ms);
     let path = dir.join(format!("{created_at_ms}-{slug}.md"));
     let body = render_proposal(gap, &id, created_at_ms);
     std::fs::write(&path, body).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
-    Ok(path)
+    Ok(ArchiveOutcome::Created(path))
+}
+
+/// 在待处理区查找 `*-<slug>.md`。文件名第二段即 trigger slug,无需解析正文。
+fn find_pending_with_slug(inbox_dir: &Path, slug: &str) -> Option<PathBuf> {
+    let suffix = format!("-{slug}.md");
+    list_pending(inbox_dir).into_iter().find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(&suffix))
+    })
 }
 
 /// 列出 inbox 中待处理提案(未处理的 `.md`,排除 processed/ 子目录)。
@@ -216,6 +268,42 @@ mod tests {
         assert_eq!(slugify("high"), "high");
     }
 
+    /// 回归(实测缺陷):同一 trigger 的提案会跨 session 重复立案 —— 实测 inbox
+    /// 9 条 `soft-threshold` 正文去易变字段后 md5 全同(86f5b36d...),来自 6 个
+    /// session;会话内限流是进程内内存态,跨 session 完全失效。
+    ///
+    /// `archive_gap` 的去重判据 = 待处理区是否已有 `*-<slug>.md`。此处直接验证
+    /// 该判据(纯目录操作,不动 `CLAW_SOURCE_ROOT`,避免与其他用例的 env 竞争)。
+    #[test]
+    fn pending_with_same_trigger_is_deduped() {
+        let tmp = std::env::temp_dir().join(format!("claw-inbox-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+
+        // 空目录 → 无重复。
+        assert_eq!(find_pending_with_slug(&tmp, "soft-threshold"), None);
+
+        std::fs::write(tmp.join("1000-soft-threshold.md"), "body").expect("write");
+
+        // 同 trigger(仅时间戳不同)→ 命中已有那份,不再新增。
+        let hit = find_pending_with_slug(&tmp, "soft-threshold").expect("应命中已有提案");
+        assert!(hit.ends_with("1000-soft-threshold.md"), "hit={hit:?}");
+
+        // 不同 trigger → 不误判为重复。
+        assert_eq!(find_pending_with_slug(&tmp, "punchback"), None);
+
+        // 已处理(processed/ 子目录)不算待处理:否则该 trigger 会永久失声。
+        std::fs::create_dir_all(tmp.join(PROCESSED_DIR)).expect("mkdir processed");
+        std::fs::rename(
+            tmp.join("1000-soft-threshold.md"),
+            tmp.join(PROCESSED_DIR).join("1000-soft-threshold.md"),
+        )
+        .expect("rename");
+        assert_eq!(find_pending_with_slug(&tmp, "soft-threshold"), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn archive_list_mark_processed_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("claw-inbox-{}", std::process::id()));
@@ -224,7 +312,9 @@ mod tests {
         let saved = std::env::var_os(crate::source_root::SOURCE_ROOT_ENV);
         std::env::set_var(crate::source_root::SOURCE_ROOT_ENV, &tmp);
 
-        let path = archive_gap(&tmp, &sample(), 424_242).expect("archive");
+        let outcome = archive_gap(&tmp, &sample(), 424_242).expect("archive");
+        assert!(outcome.is_created(), "首次归档应为 Created: {outcome:?}");
+        let path = outcome.path().to_path_buf();
         let inbox = resolve_inbox_dir(&tmp);
         assert!(path.starts_with(&inbox), "path={path:?} inbox={inbox:?}");
         let pending = list_pending(&inbox);
