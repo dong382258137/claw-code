@@ -9897,7 +9897,29 @@ where
         );
         session_tracer.record("turn_completed", attributes);
         // P1 元认知门控:成功收尾也可能暴露框架缺陷(软阈值/循环/打回)。
-        self.maybe_report_framework_gap(summary.iterations, elapsed_secs, false, None);
+        // 从本 turn 的 tool 结果派生两个真实信号 —— 此前 `tool_fail_streak`
+        // 被硬编码为 0(该轴永不触发),且耗时轴缺"无进展"必要条件,导致
+        // 门控退化成"turn 慢即上报"。见 `evolution_gate::derive_turn_signals`。
+        let (progress_made, tool_fail_streak) =
+            crate::evolution_gate::derive_turn_signals(summary.tool_results.iter().flat_map(|m| {
+                m.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::ToolResult {
+                        tool_name,
+                        is_error,
+                        output,
+                        ..
+                    } => Some((tool_name.as_str(), *is_error, output.as_str())),
+                    _ => None,
+                })
+            }));
+        self.maybe_report_framework_gap(
+            summary.iterations,
+            elapsed_secs,
+            false,
+            None,
+            progress_made,
+            tool_fail_streak,
+        );
     }
 
     /// P1 元认知门控:廉价信号命中时自动归档一条框架缺陷提案到 evolution inbox。
@@ -9914,6 +9936,8 @@ where
         elapsed_secs: u64,
         loop_detected: bool,
         failure: Option<&str>,
+        progress_made: bool,
+        tool_fail_streak: u32,
     ) {
         let Some(root) = &self.workspace_root else {
             return;
@@ -9921,10 +9945,11 @@ where
         let signals = crate::evolution_gate::TurnSignals {
             punchback: self.turn_punchback,
             loop_detected,
-            tool_fail_streak: 0,
+            tool_fail_streak,
             elapsed_secs,
             iterations,
             turn_failed: failure.is_some(),
+            progress_made,
         };
         let th = crate::evolution_gate::thresholds_from_env();
         let Some(trigger) = crate::evolution_gate::should_trigger_metacognition(&signals, &th)
@@ -10003,7 +10028,9 @@ where
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
         // P1 元认知门控:失败是最强信号(不受限流)。
-        self.maybe_report_framework_gap(iteration, elapsed_secs, false, Some(&error_msg));
+        // 失败路径上 `turn_failed` 已具最高优先级,其余两信号仅占位(该路径
+        // 拿不到可信的工具批结果)。
+        self.maybe_report_framework_gap(iteration, elapsed_secs, false, Some(&error_msg), false, 0);
     }
 
     /// BUG-9:构造一条 [`TraceRecord`] 并写入 `trace_analyzer`(若注入)。
