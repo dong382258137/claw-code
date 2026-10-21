@@ -9897,10 +9897,12 @@ where
         );
         session_tracer.record("turn_completed", attributes);
         // P1 元认知门控:成功收尾也可能暴露框架缺陷(软阈值/循环/打回)。
-        // 从本 turn 的 tool 结果派生两个真实信号 —— 此前 `tool_fail_streak`
+        // 从本 turn 的 tool 结果派生三个真实信号 —— 此前 `tool_fail_streak`
         // 被硬编码为 0(该轴永不触发),且耗时轴缺"无进展"必要条件,导致
         // 门控退化成"turn 慢即上报"。见 `evolution_gate::derive_turn_signals`。
-        let (progress_made, tool_fail_streak) =
+        // `tool_calls` 用于识别只读侦察轮:缺它时 `!progress_made` 对只读轮
+        // 结构性恒真,「无进展」必要条件对这类 turn 等于没加(见 evolution_gate)。
+        let (progress_made, tool_fail_streak, tool_calls) =
             crate::evolution_gate::derive_turn_signals(summary.tool_results.iter().flat_map(|m| {
                 m.blocks.iter().filter_map(|b| match b {
                     ContentBlock::ToolResult {
@@ -9919,6 +9921,7 @@ where
             None,
             progress_made,
             tool_fail_streak,
+            tool_calls,
         );
     }
 
@@ -9938,6 +9941,7 @@ where
         failure: Option<&str>,
         progress_made: bool,
         tool_fail_streak: u32,
+        tool_calls: usize,
     ) {
         let Some(root) = &self.workspace_root else {
             return;
@@ -9949,6 +9953,7 @@ where
             elapsed_secs,
             iterations,
             turn_failed: failure.is_some(),
+            tool_calls,
             progress_made,
         };
         let th = crate::evolution_gate::thresholds_from_env();
@@ -10032,9 +10037,17 @@ where
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
         // P1 元认知门控:失败是最强信号(不受限流)。
-        // 失败路径上 `turn_failed` 已具最高优先级,其余两信号仅占位(该路径
+        // 失败路径上 `turn_failed` 已具最高优先级,其余信号仅占位(该路径
         // 拿不到可信的工具批结果)。
-        self.maybe_report_framework_gap(iteration, elapsed_secs, false, Some(&error_msg), false, 0);
+        self.maybe_report_framework_gap(
+            iteration,
+            elapsed_secs,
+            false,
+            Some(&error_msg),
+            false,
+            0,
+            0,
+        );
     }
 
     /// BUG-9:构造一条 [`TraceRecord`] 并写入 `trace_analyzer`(若注入)。
