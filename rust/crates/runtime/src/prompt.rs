@@ -285,8 +285,25 @@ impl PromptFragment {
 
 /// Human-readable default frontier model name embedded into generated prompts.
 pub const FRONTIER_MODEL_NAME: &str = "DeepSeek V4 Pro";
-const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
-const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+/// 单个指令文件的字符上限(超出即截断并追加 `[truncated]`)。
+///
+/// 32 KiB 对齐 Codex 的 `project_doc_max_bytes`(业界同量级基线);
+/// Claude Code 单文件上限为 4 MiB、总量 32 KiB,本项目取「单文件 32 KiB +
+/// 总量 64 KiB」,既容纳一份完整项目约定,也留出嵌套/覆盖文件的余量。
+///
+/// **单位说明**:本项目按 `chars()` 计,不是字节。CJK 1 字符 ≈ 3 字节 UTF-8,
+/// 故中文项目的 32 KiB 字符 ≈ 96 KiB 字节 —— 比字节口径更宽松。
+/// 这是既有实现的口径(截断用 `chars().take()`),本次不改,只调阈值。
+///
+/// 历史:原为 4_000 字符,远低于业界基线,导致稍长的 CLAUDE.md 被静默截断
+/// (`[truncated]` 混在正文里,模型看到的是残缺约定且不知被截 —— 违反 I5)。
+const MAX_INSTRUCTION_FILE_CHARS: usize = 32 * 1024;
+/// 全部指令文件的合计字符上限(跨文件共享预算)。
+///
+/// **必须 ≥ [`MAX_INSTRUCTION_FILE_CHARS`]**:否则单文件上限被总量先卡住,
+/// 成为永不生效的死阈值(此前 12_000 < 32 KiB 即为此类耦合缺陷)。
+/// 取单文件上限的 2 倍,允许「根 CLAUDE.md + 嵌套覆盖」各占满一份。
+const MAX_TOTAL_INSTRUCTION_CHARS: usize = 64 * 1024;
 
 /// Neutral identity for the model family line in generated prompts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2027,6 +2044,19 @@ fn render_blueprint_section(raw: &str) -> String {
     if raw.trim().is_empty() {
         return String::new();
     }
+    // 空骨架(`<!-- TODO ... -->` 占位未填)不注入全文,改为一段诚实短提示。
+    //
+    // 两条理由:
+    // 1) 成本:骨架约 1.6KB,位于缓存前缀区,每轮为一个"没有任何答案的装配图"
+    //    付 token;
+    // 2) 更关键 —— 它制造"有图可依"的假象。骨架里那句「决策前先查本段,第 1/4/5
+    //    节已有答案的直接执行,不要询问用户」在未填写时是**反向误导**:第 6 节
+    //    决策权边界是空的,模型却被告知"别问了,自己定",于是对着空依据自裁。
+    //    (dl-113/114:模型上抛询问的真实成因正是缺装配图;挂一张空图不治本,
+    //    反而把"缺依据"伪装成"有依据"。)
+    if is_blueprint_skeleton(raw) {
+        return SKELETON_NOTICE.to_string();
+    }
     format!(
         "## Project Blueprint\n\
          本项目的装配图(使命/边界/分层/铁律/阶段优先级/决策权边界)。\
@@ -2043,6 +2073,36 @@ fn render_blueprint_section(raw: &str) -> String {
          或弱化既有条目**。\n\
          \n{raw}"
     )
+}
+
+/// 未填写的骨架提示(替代整份空模板注入)。
+///
+/// 措辞必须**诚实且可操作**:明确告知"装配图缺失 ⇒ 方向性取舍无依据 ⇒ 该问就问",
+/// 而不是继续宣称"决策前先查本段、不要询问用户"(那会对着空段自裁)。
+const SKELETON_NOTICE: &str = "## Project Blueprint\n\
+    本项目的装配图(使命/边界/分层/铁律/阶段优先级/决策权边界)**尚未填写** ——\n\
+    `BLUEPRINT.md` 当前只有自动生成的 `<!-- TODO -->` 占位。\n\
+    \n\
+    因此:**第 6 节决策权边界在本项目中无依据**。遇到「做不做 / 先做哪个 / 值不值」\n\
+    这类只有项目所有者能定方向的问题,不要凭猜测自裁,应直接询问用户;局部、可逆、\n\
+    单文件内的实现选择仍可自决(回复中一句话声明假设)。\n\
+    \n\
+    维护契约:本文件由你(AI)维护,只在两个里程碑边界写 —— ①一个任务收敛完成时;\n\
+    ②首次探索完一个新项目之后。填写依据只能是**仓库事实**(README、Cargo.toml /\n\
+    package.json 依赖、测试、决策记录),不得臆测业务意图。它位于缓存前缀区,\n\
+    其余时间不要改动。";
+
+/// 判断 BLUEPRINT 是否为**未填写的自动骨架**。
+///
+/// 判据取自模板自身的维护约定(见 `ensure_blueprint` 生成的 `<!-- TODO: ... -->`
+/// 注释,以及模板头「不要保留 TODO 占位符」):
+/// - 含 `<!-- TODO` 标记 ⇒ 未被人工/AI 填写过 ⇒ 骨架。
+///
+/// 说明:只认 `<!-- TODO` 注释而非裸 "TODO" 字样,避免正文里正常出现的
+/// "TODO 列表"误判;填写后的文件按约定已删除全部 TODO 注释。
+#[must_use]
+fn is_blueprint_skeleton(raw: &str) -> bool {
+    raw.contains("<!-- TODO")
 }
 
 /// Render the repository map as a system prompt section.
@@ -2125,14 +2185,15 @@ mod tests {
         get_memory_verification_section, get_multi_agent_orchestration_section,
         get_session_bus_section, get_simple_doing_tasks_section, get_simple_intro_section,
         get_simple_system_section, get_tool_usage_guidance_section, get_worker_lifecycle_section,
-        is_capability_layer_section, normalize_instruction_content,
+        is_blueprint_skeleton, is_capability_layer_section, normalize_instruction_content,
         parse_project_context_instruction_count, render_blueprint_section, render_config_section,
         render_instruction_content, render_instruction_files, render_mcp_catalog_section,
         render_persistent_memory_section, render_project_context, render_project_context_fresh,
         render_repomap_section, render_skill_catalog_section, truncate_instruction_content,
         ContextFile, ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier,
         SystemPromptBuilder, SystemPromptSplit, CAPABILITY_LAYER_HEADING_PREFIXES,
-        PLACEHOLDER_POINTER_MARKER, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        MAX_INSTRUCTION_FILE_CHARS, MAX_TOTAL_INSTRUCTION_CHARS, PLACEHOLDER_POINTER_MARKER,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::cache_alignment::DynamicValueExtractor;
     use crate::config::{ConfigLoader, RuntimeConfig};
@@ -2318,9 +2379,34 @@ mod tests {
 
     #[test]
     fn truncates_large_instruction_content_for_rendering() {
-        let rendered = render_instruction_content(&"x".repeat(4500));
+        // 阈值改为 32 KiB 后,用「刚好越过上限」的样本验证截断仍然生效。
+        // 断言语义保持:超限 ⇒ 出现 [truncated] 且结果长度不超过上限+标记。
+        let over = MAX_INSTRUCTION_FILE_CHARS + 500;
+        let rendered = render_instruction_content(&"x".repeat(over));
         assert!(rendered.contains("[truncated]"));
-        assert!(rendered.len() < 4_100);
+        assert!(
+            rendered.chars().count() <= MAX_INSTRUCTION_FILE_CHARS + "\n\n[truncated]".len(),
+            "截断后长度应受上限约束, got {}",
+            rendered.chars().count()
+        );
+    }
+
+    #[test]
+    fn max_instruction_file_budget_matches_32kib_and_total_not_binding() {
+        // 防回归(本次修复的核心不变量):单文件上限必须真正可达 ——
+        // 若总量预算 < 单文件上限,单文件阈值会被总量先卡住而永不生效。
+        //
+        // 用 const 断言而非 assert!:两个操作数都是编译期常量,
+        // clippy::assertions_on_constants 会拒绝运行期断言。
+        const _: () = assert!(MAX_INSTRUCTION_FILE_CHARS == 32 * 1024);
+        const _: () = assert!(MAX_TOTAL_INSTRUCTION_CHARS >= MAX_INSTRUCTION_FILE_CHARS);
+
+        // 行为断言:总量预算够容纳"根文件 + 一份嵌套覆盖"各自接近上限。
+        let budget = MAX_TOTAL_INSTRUCTION_CHARS.div_ceil(MAX_INSTRUCTION_FILE_CHARS);
+        assert!(
+            budget >= 2,
+            "总量预算应至少容纳 {MAX_INSTRUCTION_FILE_CHARS} 字符的 2 份文件, 实际仅 {budget} 份"
+        );
     }
 
     #[test]
@@ -3184,6 +3270,66 @@ mod tests {
             !rendered.contains("## Project Blueprint"),
             "空白 blueprint 不应产生标题"
         );
+    }
+
+    #[test]
+    fn blueprint_skeleton_emits_honest_notice_not_full_template() {
+        // 未填写的骨架(含 `<!-- TODO -->`)不得注入整份模板:它约 1.6KB,
+        // 位于缓存前缀区,且那句「决策前先查本段…不要询问用户」在空段上
+        // 是反向误导(第 6 节决策权边界为空,模型却被告知别问)。
+        let skeleton =
+            "# Project Blueprint\n\n## 1. 使命\n\n<!-- TODO: 一句话说明本项目为谁解决什么问题 -->\n";
+        let section = render_blueprint_section(skeleton);
+        // 骨架的占位内容不得被注入(取该 TODO 注释的独有正文做判据)。
+        assert!(
+            !section.contains("一句话说明本项目为谁解决什么问题"),
+            "骨架占位内容不应进入注入文本, got: {section}"
+        );
+        // 必须诚实告知「尚无依据 ⇒ 该问就问」。
+        assert!(
+            section.contains("尚未填写"),
+            "骨架应明确说明未填写, got: {section}"
+        );
+        assert!(
+            section.contains("询问用户"),
+            "骨架状态下应明确允许上抛询问, got: {section}"
+        );
+        // 不得再宣称「决策前先查本段…不要询问用户」——空依据会诱导误自裁。
+        assert!(
+            !section.contains("决策前先查本段"),
+            "骨架状态下不得宣称「决策前先查本段」(该段本身是空的), got: {section}"
+        );
+        // 骨架提示必须显著短于整份模板(省缓存前缀 token)。
+        assert!(
+            section.chars().count() < 900,
+            "骨架提示应精简, got {} chars",
+            section.chars().count()
+        );
+    }
+
+    #[test]
+    fn filled_blueprint_keeps_decision_first_instruction() {
+        // 填写后(无 TODO 占位)必须恢复「先查本段再问」的完整契约。
+        let filled = "# Project Blueprint\n\n## 1. 使命\n让 LLM 不跑偏。\n";
+        assert!(!is_blueprint_skeleton(filled), "已填写文件不应判为骨架");
+        let section = render_blueprint_section(filled);
+        assert!(section.contains("决策前先查本段"), "got: {section}");
+        assert!(section.contains("让 LLM 不跑偏"), "填充内容应被注入");
+        // 已填写时不应走骨架提示分支(骨架提示以「**尚未填写**」加粗表态)。
+        assert!(
+            !section.contains("**尚未填写**"),
+            "已填写不应走骨架提示分支, got: {section}"
+        );
+    }
+
+    #[test]
+    fn is_blueprint_skeleton_detects_todo_marker_only() {
+        assert!(is_blueprint_skeleton("<!-- TODO: x -->"));
+        // 正文正常出现 "TODO 列表" 字样不算骨架(只认 HTML 注释标记)。
+        assert!(!is_blueprint_skeleton(
+            "## 5. 当前阶段\n- TODO 列表见 backlog"
+        ));
+        assert!(!is_blueprint_skeleton("# 已填写"));
     }
 
     #[test]

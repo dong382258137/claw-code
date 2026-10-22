@@ -840,9 +840,44 @@ const EVIDENCE_KEYWORDS: &[&str] = &[
 /// 每条证据摘要的最大字符数(含截断标记)。
 const EVIDENCE_SUMMARY_MAX_CHARS: usize = 500;
 
+/// 允许贡献实验证据的工具白名单(执行/度量类)。
+///
+/// 此前 `extract_evidence_from_output` 接收 `tool_name` 却完全没用它做过滤,
+/// 只看输出形状(表格 / 连续数字 / 关键词)。结果 `read_file` 读到的源码
+/// (含 `result`、`结果`、三行数字)与 `grep_search` 的 JSON 全被当成"实验证据"
+/// 写进 `<evidence>` 段 —— 实测该段堆积的是整段 Python 源码,不是实验数据。
+///
+/// 语义边界:evidence 段记录的是**运行输出得到的观测数据**(基准、对比矩阵、
+/// 通过率),只有跑命令/跑测试才可能产生;读文件、搜索、编辑类工具的输出
+/// 是**输入材料**,不是证据。
+const EVIDENCE_TOOL_ALLOWLIST: &[&str] = &[
+    "bash",
+    "sh",
+    "shell",
+    "execute_bash",
+    "run_command",
+    "run",
+    "repl",
+    "test",
+    "run_tests",
+    "cargo",
+    "pytest",
+    "npm",
+    "verification",
+];
+
+/// 该工具的输出是否可作为实验证据来源(大小写不敏感)。
+#[must_use]
+fn is_evidence_tool(tool_name: &str) -> bool {
+    let lower = tool_name.trim().to_ascii_lowercase();
+    EVIDENCE_TOOL_ALLOWLIST.contains(&lower.as_str())
+}
+
 /// 改进点 12:从待压缩的消息中提取实验证据(Heuristic,零 LLM 成本)。
 ///
-/// 识别策略(任一命中即视为实验证据):
+/// 识别策略(先过工具白名单,再任一形状命中即视为实验证据):
+/// - **工具白名单**:只有执行/度量类工具([`EVIDENCE_TOOL_ALLOWLIST`])的输出
+///   参与判定;`read_file` / `grep_search` / `edit_file` 等一律跳过。
 /// - **表格数据**:包含 `|` 分隔的多列,且至少 2 行
 /// - **数值列表**:连续 ≥ 3 行纯数字(含小数/逗号/正负号)
 /// - **关键词**:包含"对比/基准/矩阵/结果/成功率/失败率/UA/协议"等
@@ -868,6 +903,10 @@ pub fn extract_evidence_before_compaction(messages: &[ConversationMessage]) -> V
             };
             // 错误结果不含实验证据
             if *is_error {
+                continue;
+            }
+            // 工具白名单:读文件/搜索/编辑的输出是输入材料,不是实验证据。
+            if !is_evidence_tool(tool_name) {
                 continue;
             }
             if let Some(summary) = extract_evidence_from_output(tool_name, output) {

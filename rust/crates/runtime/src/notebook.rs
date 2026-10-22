@@ -523,7 +523,9 @@ impl Notebook {
     ///
     /// 写入流程:`.claw/` 目录创建 → 写 `NOTEBOOK.md.tmp` → `rename` 为 `NOTEBOOK.md`。
     /// 这样即使写入中途崩溃,原文件也保持完整。
-    pub fn save(&self, workspace_root: &Path) -> Result<(), NotebookError> {
+    ///
+    /// 返回值 = 被容量裁剪的段名列表(空表示未裁剪)。
+    pub fn save(&self, workspace_root: &Path) -> Result<Vec<&'static str>, NotebookError> {
         let path = workspace_root.join(NOTEBOOK_FILENAME);
         self.save_to(&path)
     }
@@ -533,11 +535,13 @@ impl Notebook {
     /// 工作区文件里旧的会话级段残留在此被清除(源头清理,防旧任务污染
     /// 2026-08-31 实证);会话文件不存在时自动创建。任何单文件失败均返回
     /// Err(调用方决定是否阻断)。
+    ///
+    /// 返回值 = 两个文件合计被容量裁剪的段名列表(去重保序)。
     pub fn save_with_session(
         &self,
         workspace_root: &Path,
         session_id: &str,
-    ) -> Result<(), NotebookError> {
+    ) -> Result<Vec<&'static str>, NotebookError> {
         let workspace_nb = Self {
             sections: self
                 .sections
@@ -546,7 +550,7 @@ impl Notebook {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         };
-        workspace_nb.save(workspace_root)?;
+        let mut shaved = workspace_nb.save(workspace_root)?;
         if let Some(session_path) = session_notebook_file(workspace_root, session_id) {
             let session_nb = Self {
                 sections: self
@@ -556,9 +560,13 @@ impl Notebook {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             };
-            session_nb.save_to(&session_path)?;
+            for tag in session_nb.save_to(&session_path)? {
+                if !shaved.contains(&tag) {
+                    shaved.push(tag);
+                }
+            }
         }
-        Ok(())
+        Ok(shaved)
     }
 
     /// 原子写入指定路径(内部共用)。
@@ -566,16 +574,25 @@ impl Notebook {
     /// 容量处理:超限不再硬失败(旧行为返回 `TooLarge`,使写入路径彻底不可用、
     /// turn 空转),改为先 [`Self::shrink_to_fit`] 腾位再写。裁剪只从头部丢弃
     /// 最旧条目,与各段 append 路径的既有策略一致。
-    fn save_to(&self, path: &Path) -> Result<(), NotebookError> {
+    ///
+    /// **返回值 = 被裁剪的段名列表**(写侧回执)。此前该函数静默裁剪并返回
+    /// `Ok(())`,调用方(及 LLM)完全不知道记忆被砍,丢掉的条目永不回流 ——
+    /// 这是「记忆文档慢慢变坏却没人察觉」的总根因。对照 Claude Code 的
+    /// write-time feedback(`the write still succeeds, but it returns an error
+    /// telling Claude to rewrite the index`),此处把裁剪事实回传,由
+    /// [`execute_notebook_update`] 拼进工具结果告知 LLM。
+    fn save_to(&self, path: &Path) -> Result<Vec<&'static str>, NotebookError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| NotebookError::Io(parent.to_path_buf(), e.to_string()))?;
         }
         let tmp_path = path.with_extension("md.tmp");
         let mut shrunk = self.clone();
-        if shrunk.render().chars().count() > NOTEBOOK_MAX_CHARS {
-            shrunk.shrink_to_fit();
-        }
+        let shaved = if shrunk.render().chars().count() > NOTEBOOK_MAX_CHARS {
+            shrunk.shrink_to_fit()
+        } else {
+            Vec::new()
+        };
         let content = shrunk.render();
         // 极端情形(单段无法再裁)仍超限时明确报错,而不是静默写超容文件。
         if content.chars().count() > NOTEBOOK_MAX_CHARS {
@@ -594,7 +611,7 @@ impl Notebook {
         }
         std::fs::rename(&tmp_path, path)
             .map_err(|e| NotebookError::Io(path.to_path_buf(), e.to_string()))?;
-        Ok(())
+        Ok(shaved)
     }
 
     /// 解析 NOTEBOOK.md 文本内容为 Notebook 结构。
@@ -952,7 +969,11 @@ pub fn append_attempt(
             notebook.set_section("attempted", &trimmed);
         }
     }
-    notebook.save_with_session(workspace_root, session_id)
+    // 裁剪回执在此丢弃:append_attempt 是运行时记账通道(非 LLM 直调),
+    // 无对话面可回传。容量告警走 execute_notebook_update 的显式通道。
+    notebook
+        .save_with_session(workspace_root, session_id)
+        .map(|_shaved| ())
 }
 
 /// `<decisions>` 段精炼回显行前缀:同一次 `log_decision` 只回显一次。
@@ -1217,18 +1238,33 @@ pub fn execute_notebook_update(
         }
     }
     // 原子写回(按段归属拆分)
-    notebook
+    let shaved = notebook
         .save_with_session(workspace_root, session_id)
         .map_err(|e| format!("failed to save notebook: {e}"))?;
+    let total = notebook.render().chars().count();
+    let base = match parsed.mode.as_str() {
+        "set" => format!(
+            "NOTEBOOK.md updated: section '{}' set ({total} chars total).",
+            parsed.section
+        ),
+        "append" => format!(
+            "NOTEBOOK.md updated: section '{}' appended ({total} chars total).",
+            parsed.section
+        ),
+        _ => format!(
+            "NOTEBOOK.md updated: section '{}' modified ({total} chars total).",
+            parsed.section
+        ),
+    };
+    // 写侧回执:容量超限时内容被裁剪过。必须明确告知,否则 LLM 会以为
+    // 自己刚写的内容完整保存(此前静默裁剪是「记忆越用越少却无人察觉」的根因)。
+    if shaved.is_empty() {
+        return Ok(base);
+    }
     Ok(format!(
-        "NOTEBOOK.md updated: section '{}' {} ({} chars total).",
-        parsed.section,
-        match parsed.mode.as_str() {
-            "set" => "set",
-            "append" => "appended",
-            _ => "modified",
-        },
-        notebook.render().chars().count()
+        "{base}\n\n[容量裁剪] NOTEBOOK 超过 {NOTEBOOK_MAX_CHARS} 字符上限,以下段的**最旧条目已被丢弃**以腾出空间: {}。\n\
+         如需保留其中信息,请把它们改写到更紧凑的段(如把长记录压成一行结论),或删除已失效的旧条目。",
+        shaved.join(", ")
     ))
 }
 
@@ -1444,6 +1480,54 @@ mod tests {
         // 裁剪后仍保留该段(不是整段丢弃)。
         let loaded = Notebook::load(dir.path()).expect("load");
         assert!(loaded.get_section("plan").is_some());
+    }
+
+    #[test]
+    fn notebook_save_reports_shaved_sections() {
+        // 写侧回执契约:超限裁剪必须**回传被裁剪的段名**,不能静默。
+        // 静默裁剪是「记忆越用越少却无人察觉」的根因(dl-118)。
+        let dir = temp_workspace();
+        let mut nb = Notebook::new();
+        nb.set_section("plan", &"x".repeat(NOTEBOOK_MAX_CHARS));
+        let shaved = nb.save(dir.path()).expect("save should succeed");
+        assert!(!shaved.is_empty(), "超限裁剪必须回传被裁剪段名, 实际返回空");
+        assert!(
+            shaved.contains(&"plan"),
+            "plan 是被裁剪的段, 应出现在回执中, got {shaved:?}"
+        );
+    }
+
+    #[test]
+    fn notebook_save_reports_nothing_when_within_capacity() {
+        // 未超限时不得虚报裁剪(否则 LLM 会收到噪音告警)。
+        let dir = temp_workspace();
+        let mut nb = Notebook::new();
+        nb.set_section("plan", "短计划");
+        let shaved = nb.save(dir.path()).expect("save should succeed");
+        assert!(shaved.is_empty(), "未超限不应报告裁剪, got {shaved:?}");
+    }
+
+    #[test]
+    fn execute_notebook_update_reports_capacity_trim() {
+        // 端到端:LLM 通过工具写超限内容时,工具结果必须明确告知被裁剪,
+        // 且指出段名 —— 对照 Claude Code 的 write-time feedback。
+        let dir = temp_workspace();
+        let payload = serde_json::json!({
+            "section": "plan",
+            "mode": "set",
+            "content": "y".repeat(NOTEBOOK_MAX_CHARS + 500),
+        })
+        .to_string();
+        let result = execute_notebook_update(dir.path(), "sess-trim", &payload)
+            .expect("update should succeed");
+        assert!(
+            result.contains("容量裁剪"),
+            "超限写入必须在工具结果中说明被裁剪, got: {result}"
+        );
+        assert!(
+            result.contains("plan"),
+            "容量告警应指出被裁剪的段名, got: {result}"
+        );
     }
 
     #[test]

@@ -129,9 +129,48 @@ pub fn render_digest(
     out
 }
 
+/// digest 保留上限(按文件数)。超出时删除最旧的 digest。
+///
+/// 动机:此前无任何清理(doc 注释明确「不做自动清理」),实测累积 18 份且
+/// 无上限。digest 是**会话交接载体**,不是永久审计库 —— 审计轨迹由
+/// `.claw/history.db`(FTS5 全文)承担,digest 只保留近期窗口。
+pub const MAX_DIGEST_FILES: usize = 50;
+
+/// 判断一份 digest 是否含**实质交接内容**。
+///
+/// 背景:实测最新一份 digest 全文只有「失败模式:本会话无工具失败」+
+/// 「用量与成本」两段 —— 新会话首 turn 花一个槽位读到的是上一会话的账单,
+/// 而非交接。若最新一份是这种空转 digest 而更早有一份真交接,按 mtime
+/// 取最新会让**空转覆盖有效交接**。
+///
+/// 判定(保守:不确定为实质,宁可注入也不静默丢信息):
+/// - 符合本模块 [`render_digest`] 输出格式(含 `## 失败模式`):有真实失败
+///   记录,或含 `## 会话总结` 段 ⇒ 实质;两者皆无 ⇒ 空转;
+/// - 不符合本模块格式(外部手写/旧版本):视为实质,不做判断。
+#[must_use]
+pub fn digest_is_substantive(content: &str) -> bool {
+    let Some(pos) = content.find("## 失败模式") else {
+        // 非本模块格式:保守放行。
+        return true;
+    };
+    // 失败模式段的边界:下一个 `\n## ` 标题或文末。
+    let rest = &content[pos + "## 失败模式".len()..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    let failure_body = &rest[..end];
+    // render_digest 在无失败时写入的占位行。
+    let no_failures = failure_body.contains("(本会话无工具失败)");
+    let has_failures = !no_failures
+        && failure_body
+            .lines()
+            .any(|l| l.trim_start().starts_with("- **"));
+    let has_summary = content.contains("## 会话总结");
+    has_failures || has_summary
+}
+
 /// 落盘会话 digest 到 `.claw/management_brain/digest-<session_id>.md`。
 ///
 /// 目录不存在时自动创建。失败返回 `Err`(调用方应静默忽略,非关键路径)。
+/// 写入后按 [`MAX_DIGEST_FILES`] 修剪最旧文件(修剪失败不影响写入结果)。
 pub fn write_digest(
     workspace_root: &std::path::Path,
     session_id: &str,
@@ -141,13 +180,47 @@ pub fn write_digest(
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("digest-{session_id}.md"));
     std::fs::write(&path, content)?;
+    prune_digests(&dir, MAX_DIGEST_FILES);
     Ok(path)
 }
 
-/// 读取**最近**一份会话 digest 的文本(按文件修改时间倒序取最新)。
+/// 修剪 digest 目录,只保留最新的 `keep` 份(按 mtime 倒序)。
+///
+/// 失败静默(非关键路径):目录不可读 / 删除失败都不影响主流程。
+fn prune_digests(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(Option<std::time::SystemTime>, std::path::PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("digest-") && n.ends_with(".md"))
+        })
+        .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).ok(), p))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    // 最新在前;超出 keep 的部分删除。
+    files.sort_by_key(|b| std::cmp::Reverse(b.0));
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 读取**最近一份含实质交接内容的**会话 digest 文本。
 ///
 /// `exclude_session_id`:排除指定会话的 digest(读侧注入时传当前会话 id,
 /// 避免多 turn 会话把"自己上一轮写的 digest"误当成"上一会话遗留")。
+///
+/// 选取规则(按 mtime 倒序):
+/// - 优先返回最新一份**实质**digest(见 [`digest_is_substantive`]);
+/// - 若全部为空转(只有用量账单),返回 `None` —— 注入空转 digest 会白占
+///   新会话首 turn 的槽位且误导模型「上一会话什么都没做」。
+///
 /// 目录不存在 / 无 digest 文件 / 读取失败均返回 `None`(静默降级)。
 pub fn latest_digest_text(
     workspace_root: &std::path::Path,
@@ -182,7 +255,11 @@ pub fn latest_digest_text(
     // 文件名含 session_id + 时间特征;按文件修改时间倒序取最新。
     paths.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
     paths.reverse();
-    std::fs::read_to_string(&paths[0]).ok()
+    // 跳过空转 digest:取最新一份实质内容;全为空转则不注入。
+    paths
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(&p).ok())
+        .find(|content| digest_is_substantive(content))
 }
 
 /// 校验 digest 目录是否存在(供测试断言)。
@@ -296,6 +373,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(latest_digest_text(dir.path(), None).is_none());
         assert!(latest_digest_text(dir.path(), Some("any-sess")).is_none());
+    }
+
+    #[test]
+    fn latest_digest_skips_substantive_less_recent_in_favor_of_real_handoff() {
+        // 病灶:最新一份 digest 只有「无工具失败 + 用量账单」,新会话首 turn
+        // 花槽位读到的是账单而非交接。修复后应回退到更早的实质 digest。
+        let dir = tempfile::tempdir().unwrap();
+        let substantive = render_digest(
+            "real-handoff",
+            &[("bash".to_string(), "command failed".to_string())],
+            &[],
+            &[],
+        );
+        write_digest(dir.path(), "real-handoff", &substantive).expect("write real");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // 更新的一份:无失败、无总结 ⇒ 空转。
+        let hollow = render_digest("hollow-newer", &[], &["total=1".to_string()], &[]);
+        write_digest(dir.path(), "hollow-newer", &hollow).expect("write hollow");
+
+        let got = latest_digest_text(dir.path(), None).expect("should fall back to real");
+        assert!(
+            got.contains("real-handoff"),
+            "应跳过空转 digest 回退到实质交接, got: {got}"
+        );
+    }
+
+    #[test]
+    fn latest_digest_none_when_all_are_hollow() {
+        // 全为空转时不注入:否则会误导模型「上一会话什么都没做」。
+        let dir = tempfile::tempdir().unwrap();
+        let hollow = render_digest("only-hollow", &[], &["total=1".to_string()], &[]);
+        write_digest(dir.path(), "only-hollow", &hollow).expect("write");
+        assert!(
+            latest_digest_text(dir.path(), None).is_none(),
+            "全为空转 digest 时不应注入"
+        );
+    }
+
+    #[test]
+    fn digest_is_substantive_distinguishes_cases() {
+        // 有失败记录 ⇒ 实质。
+        assert!(digest_is_substantive(&render_digest(
+            "s1",
+            &[("bash".to_string(), "boom".to_string())],
+            &[],
+            &[]
+        )));
+        // 只有会话总结 ⇒ 实质。
+        assert!(digest_is_substantive(&render_digest(
+            "s2",
+            &[],
+            &[],
+            &[("会话总结(执行脑)", "- 目标: 修 X".to_string())]
+        )));
+        // 无失败无总结 ⇒ 空转。
+        assert!(!digest_is_substantive(&render_digest(
+            "s3",
+            &[],
+            &["total=1".to_string()],
+            &[]
+        )));
+        // 非本模块格式(手写)⇒ 保守放行。
+        assert!(digest_is_substantive("手写交接: 明天继续"));
+    }
+
+    #[test]
+    fn write_digest_prunes_to_max_files() {
+        // 保留策略:digest 是交接载体不是永久审计库(审计由 history.db 承担)。
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(MAX_DIGEST_FILES + 5) {
+            write_digest(dir.path(), &format!("sess-{i:03}"), "content").expect("write");
+        }
+        let count = std::fs::read_dir(dir.path().join(DIGEST_DIR))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("digest-") && n.ends_with(".md"))
+            })
+            .count();
+        assert_eq!(count, MAX_DIGEST_FILES, "应修剪到保留上限, got {count}");
     }
 
     #[test]
