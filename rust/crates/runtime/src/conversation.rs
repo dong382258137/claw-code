@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -10291,10 +10291,20 @@ pub(crate) fn build_assistant_message(
                 signature,
             } => {
                 flush_text_block(&mut text, &mut blocks);
-                blocks.push(ContentBlock::Thinking {
-                    thinking,
-                    signature,
-                });
+                match strip_inline_tool_markers(&thinking) {
+                    Some((cleaned, _removed)) => {
+                        // 剥离改动了 thinking 正文,原 signature 因此失效
+                        // (provider 会对内容与签名做一致性校验),必须一并丢弃。
+                        blocks.push(ContentBlock::Thinking {
+                            thinking: cleaned,
+                            signature: None,
+                        });
+                    }
+                    None => blocks.push(ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    }),
+                }
             }
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
             AssistantEvent::ToolUse { id, name, input } => {
@@ -10327,11 +10337,116 @@ pub(crate) fn build_assistant_message(
     ))
 }
 
+/// 畸形内联工具调用标记的开头(全角竖线 U+FF5C)。
+///
+/// 现象:个别 provider 不把工具调用放进结构化 `tool_calls`,而是把
+/// `<｜｜DSML｜｜ invoke name="...">` 之类的标记吐进正文/思考文本。后果是双重的:
+///   1. 工具从未执行(派发层只认结构化事件);
+///   2. 标记被当作正文落盘,下一轮又被读回上下文,模型把自己的畸形输出
+///      误当成"用户消息里的异常内容",于是在"防注入"上空转。
+///
+/// A 阶段只剥离 + 计数(不恢复被丢弃的调用);B 阶段再解析回填。
+const INLINE_TOOL_MARKER: &str = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}";
+const INLINE_TOOL_BLOCK_CLOSE: &str = "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>";
+
+static INLINE_TOOL_MARKERS_STRIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// 剥离正文中的畸形内联工具调用标记,返回 (清洗后文本, 移除个数)。
+///
+/// 三种形态:
+/// - 完整块(有 calls 闭标记):整段丢弃;
+/// - 未闭合(流被截断):从开标记丢到文本末尾;
+/// - 末尾残片(标记被 chunk 切断):丢掉不完整的标记前缀。
+fn strip_inline_tool_markers(text: &str) -> Option<(String, u64)> {
+    let mut removed = 0_u64;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(pos) = rest.find(INLINE_TOOL_MARKER) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        removed += 1;
+        if let Some(close_at) = after.find(INLINE_TOOL_BLOCK_CLOSE) {
+            // 完整块:连闭标记一起丢掉。
+            rest = &after[close_at + INLINE_TOOL_BLOCK_CLOSE.len()..];
+        } else {
+            // 未闭合:其后没有可信正文,直接截断。
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+
+    // chunk 边界可能把标记切成半截,例如末尾只剩 "<｜｜DS"。
+    if let Some(tail_start) = partial_marker_suffix_start(&out) {
+        out.truncate(tail_start);
+        removed += 1;
+    }
+
+    if removed == 0 {
+        return None;
+    }
+    INLINE_TOOL_MARKERS_STRIPPED.fetch_add(removed, Ordering::Relaxed);
+    Some((collapse_blank_lines(&out), removed))
+}
+
+/// 若 `text` 末尾是标记的不完整前缀,返回该前缀起始字节位置。
+///
+/// 只认长度 ≥ 2 的前缀(`<｜` 起),单个行尾 `<` 在代码正文里太常见,
+/// 判定为残片会造成误伤。
+fn partial_marker_suffix_start(text: &str) -> Option<usize> {
+    let marker_chars: Vec<char> = INLINE_TOOL_MARKER.chars().collect();
+    let tail: Vec<char> = text.chars().rev().take(marker_chars.len()).collect();
+    let tail_len = tail.len();
+    for len in 2..tail_len {
+        let suffix: Vec<char> = tail[..len].iter().rev().copied().collect();
+        if suffix == marker_chars[..len] {
+            return Some(text.len() - suffix.iter().map(|c| c.len_utf8()).sum::<usize>());
+        }
+    }
+    None
+}
+
+/// 合并剥离后残留的连续空行,避免正文出现大片空白。
+fn collapse_blank_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    out.trim_end_matches('\n').to_string()
+}
+
+/// 剥离后若正文被清空,用一行可读提示占位,避免整条消息变成空的。
+const INLINE_TOOL_STRIPPED_NOTICE: &str = "… [已移除畸形的内联工具调用标记,该调用未被执行]";
+
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
-    if !text.is_empty() {
-        blocks.push(ContentBlock::Text {
-            text: std::mem::take(text),
-        });
+    if text.is_empty() {
+        return;
+    }
+    let raw = std::mem::take(text);
+    match strip_inline_tool_markers(&raw) {
+        Some((cleaned, _removed)) => {
+            // 剥离后若正文被清空,用一行可读提示占位,避免整条消息变成空的。
+            let body = if cleaned.trim().is_empty() {
+                INLINE_TOOL_STRIPPED_NOTICE.to_string()
+            } else {
+                cleaned
+            };
+            blocks.push(ContentBlock::Text { text: body });
+        }
+        None => blocks.push(ContentBlock::Text { text: raw }),
     }
 }
 
@@ -23792,5 +23907,110 @@ mod tests {
             drop_value_outside_async_ctx(tokio::runtime::Runtime::new().expect("inner runtime"))
                 .await;
         });
+    }
+}
+
+/// 畸形内联工具调用标记的剥离回归。
+///
+/// 样本取自真实会话记录(assistant 正文/思考中出现 `<｜｜DSML｜｜ invoke ...>`)。
+#[cfg(test)]
+mod inline_tool_marker_tests {
+    use super::{build_assistant_message, strip_inline_tool_markers, AssistantEvent};
+    use crate::session::ContentBlock;
+
+    /// 全角竖线(U+FF5C)构成的畸形标记开头。
+    const MARK: &str = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}";
+    const CLOSE: &str = "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>";
+
+    fn sample_block() -> String {
+        format!(
+            "{m} calls>\n{m} invoke name=\"bash\">\n{m} parameter name=\"command\" string=\"true\">ls</{m} parameter>\n</{m} invoke>\n{close}",
+            m = MARK,
+            close = CLOSE
+        )
+    }
+
+    #[test]
+    fn strips_complete_block_and_keeps_surrounding_text() {
+        let text = format!("前文\n{}\n后文", sample_block());
+        let (cleaned, removed) = strip_inline_tool_markers(&text).expect("应命中去污");
+        assert_eq!(removed, 1);
+        // 剥离点会留下一个空行(标记原本独占行),这是可接受的;
+        // 有意义的不变量是:标记全消失、前后文都保留且顺序不变。
+        let kept: Vec<&str> = cleaned.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(kept, vec!["前文", "后文"]);
+        assert!(!cleaned.contains("DSML"));
+        assert!(!cleaned.contains('\u{FF5C}'));
+    }
+
+    #[test]
+    fn returns_none_when_no_marker_present() {
+        assert!(strip_inline_tool_markers("普通正文,无畸形标记").is_none());
+    }
+
+    #[test]
+    fn truncates_after_unclosed_marker() {
+        let text = format!("结论在这里\n{m} invoke name=\"bash\">\n未闭合", m = MARK);
+        let (cleaned, removed) = strip_inline_tool_markers(&text).expect("应命中未闭合块");
+        assert_eq!(removed, 1);
+        assert_eq!(cleaned, "结论在这里");
+    }
+
+    #[test]
+    fn drops_partial_marker_at_chunk_boundary() {
+        // chunk 把标记切成半截:"<｜｜DS" 不是完整标记,但仍属残片。
+        let text = "hello <\u{FF5C}\u{FF5C}DS";
+        let (cleaned, removed) = strip_inline_tool_markers(text).expect("应命中残片");
+        assert_eq!(removed, 1);
+        assert_eq!(cleaned.trim(), "hello");
+        assert!(!cleaned.contains('\u{FF5C}'));
+    }
+
+    #[test]
+    fn keeps_single_trailing_angle_bracket() {
+        // 代码正文里常见的行尾 `<` 不得被误判为残片。
+        assert!(strip_inline_tool_markers("if a < b {").is_none());
+        assert!(strip_inline_tool_markers("Vec<").is_none());
+    }
+
+    #[test]
+    fn thinking_marker_is_stripped_and_signature_dropped() {
+        let events = vec![
+            AssistantEvent::Thinking {
+                thinking: format!("思考中\n{}", sample_block()),
+                signature: Some("sig-abc".to_string()),
+            },
+            AssistantEvent::MessageStop,
+        ];
+        let (message, _, _) = build_assistant_message(events).expect("应构建成功");
+        assert!(
+            matches!(&message.blocks[0], ContentBlock::Thinking { .. }),
+            "期望 Thinking 块"
+        );
+        if let ContentBlock::Thinking {
+            thinking,
+            signature,
+        } = &message.blocks[0]
+        {
+            assert!(!thinking.contains("DSML"), "thinking 应已去污: {thinking}");
+            assert!(signature.is_none(), "正文被改动后签名必须丢弃");
+        }
+    }
+
+    #[test]
+    fn text_block_becomes_notice_when_only_marker_remains() {
+        let events = vec![
+            AssistantEvent::TextDelta(sample_block()),
+            AssistantEvent::MessageStop,
+        ];
+        let (message, _, _) = build_assistant_message(events).expect("应构建成功");
+        assert!(
+            matches!(&message.blocks[0], ContentBlock::Text { .. }),
+            "期望 Text 块"
+        );
+        if let ContentBlock::Text { text } = &message.blocks[0] {
+            assert!(text.contains("已移除畸形"), "应留占位提示: {text}");
+            assert!(!text.contains("DSML"));
+        }
     }
 }
