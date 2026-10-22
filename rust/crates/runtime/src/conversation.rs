@@ -9789,6 +9789,11 @@ where
         assistant_message: &ConversationMessage,
         pending_tool_use_count: usize,
     ) {
+        // 畸形内联工具标记的剥离次数:每迭代取一次增量(swap 归零)。
+        // 若只写不读,该计数器就是死埋点,"修复在生产里是否真的触发"无从判定
+        // (与 dl-106 同类的可观测性缺陷)。放在 tracer 早退之前,保证始终归零。
+        let inline_stripped = INLINE_TOOL_MARKERS_STRIPPED.swap(0, Ordering::Relaxed);
+
         let Some(session_tracer) = &self.session_tracer else {
             return;
         };
@@ -9803,6 +9808,13 @@ where
             "pending_tool_use_count".to_string(),
             Value::from(pending_tool_use_count as u64),
         );
+        // 仅在本迭代真的剥离过畸形标记时才注入该属性,保持既有事件形状不变。
+        if inline_stripped > 0 {
+            attributes.insert(
+                "inline_tool_markers_stripped".to_string(),
+                Value::from(inline_stripped),
+            );
+        }
         // M1 首响应时间落盘(OTel gen_ai.client.inference.time_to_first_chunk):
         // 从 api client 读取最近一次流式请求的首 chunk 延迟。非流式/未采集时
         // 不注入该属性(保持既有事件形状不变)。
