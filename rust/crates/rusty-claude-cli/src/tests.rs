@@ -5750,4 +5750,44 @@ mod blueprint_tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// 缺失时在真项目目录自动创建空模板,且模板不含预填结论
+    /// —— 预填内容会让新项目的蓝图全是臆造事实,比没有更糟。
+    #[test]
+    fn ensure_blueprint_creates_skeleton_in_real_project() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("create root");
+
+        let got = crate::app::ensure_blueprint(&root, false).expect("应创建模板");
+        assert!(got.contains("## 1. 使命"), "模板需含六节骨架");
+        assert!(got.contains("TODO"), "模板应保留 TODO 提示待 AI 填写");
+        assert!(
+            root.join("BLUEPRINT.md").exists(),
+            "模板必须真的落盘, 否则下个会话仍缺装配图"
+        );
+        // 二次调用读取已存在的文件, 不覆盖 AI 已填写的内容。
+        fs::write(root.join("BLUEPRINT.md"), "# 已填写").expect("write filled");
+        let again = crate::app::ensure_blueprint(&root, false).expect("应读到已填内容");
+        assert_eq!(again, "# 已填写", "已存在的蓝图不得被模板覆盖");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 主目录/盘根等宽泛目录不得生成蓝图(否则污染用户环境)。
+    #[test]
+    fn ensure_blueprint_skips_broad_directory() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("create root");
+
+        assert!(
+            crate::app::ensure_blueprint(&root, true).is_none(),
+            "宽泛目录应跳过创建"
+        );
+        assert!(
+            !root.join("BLUEPRINT.md").exists(),
+            "宽泛目录不得落盘 BLUEPRINT.md"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

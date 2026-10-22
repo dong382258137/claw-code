@@ -3413,7 +3413,7 @@ pub(crate) fn load_prompt_extras(
     // symbol index. Best-effort: a missing file simply disables injection.
     // Static content ⇒ session-stable ⇒ costs nothing after the first cache
     // write.
-    let blueprint = load_blueprint(cwd);
+    let blueprint = ensure_blueprint(cwd, is_broad_cwd);
     let t_blueprint = t0.elapsed();
 
     eprintln!(
@@ -3460,6 +3460,74 @@ pub(crate) fn load_blueprint(cwd: &Path) -> Option<String> {
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
         .find(|content| !content.trim().is_empty())
+}
+
+/// 首次启动时补齐蓝图:文件不存在则在项目根创建**空模板**,由 AI 在里程碑
+/// 边界填写。
+///
+/// 两条防呆(缺任一都会到处乱建):
+/// 1. `is_broad_cwd` 为真时**不建** —— 主目录/盘根/无项目标识文件的目录不算
+///    项目,在那里生成 BLUEPRINT.md 只会污染用户环境;
+/// 2. 模板必须是**空槽**(标题 + `<!-- TODO -->`),不得预填结论 —— 预填内容会
+///    让新项目的蓝图全是臆造事实,比没有蓝图更糟(模型会当真事实援引)。
+///
+/// 落盘失败仍返回模板:本会话至少拿到结构指引,不因写权限问题退回"无装配图"。
+pub(crate) fn ensure_blueprint(cwd: &Path, is_broad_cwd: bool) -> Option<String> {
+    if let Some(existing) = load_blueprint(cwd) {
+        return Some(existing);
+    }
+    if is_broad_cwd {
+        return None;
+    }
+    let skeleton = blueprint_skeleton();
+    let _ = std::fs::write(cwd.join("BLUEPRINT.md"), &skeleton);
+    Some(skeleton)
+}
+
+/// 蓝图空模板:只给结构与填写指引,不给任何结论。
+fn blueprint_skeleton() -> String {
+    r#"# Project Blueprint
+
+> 本文件由 claw 首次启动时自动创建,当前是**空模板** —— 由 AI 在里程碑边界
+> 依据仓库事实填写,不要保留 TODO 占位符。
+>
+> **维护时机(只有两个,其余时间不要动本文件)**:
+> 1. 一个任务收敛完成时;
+> 2. 首次探索完一个新项目之后。
+>
+> 本文件注入 system prompt 的缓存前缀区,随意改动会击穿前缀缓存,故属
+> **低频演进资产**。填写原则:只写能从仓库事实(README、各 crate 的
+> Cargo.toml 依赖、测试、决策记录)验证的内容,不臆测业务意图。
+
+## 1. 使命
+
+<!-- TODO: 一句话说明本项目为谁解决什么问题。取自 README 首段与主入口代码。 -->
+
+## 2. 能力边界
+
+<!-- TODO: 分「做」与「不做」两张清单;每条「不做」要写明理由,否则会成为盲区。 -->
+
+## 3. 架构分层
+
+<!-- TODO: 从 workspace 各 crate 的真实 Cargo.toml 本地依赖推导,不要凭印象。
+     标注依赖方向(只能向下)与每层职责。 -->
+
+## 4. 铁律(不可违反的不变量)
+
+<!-- TODO: 每条都必须有实证出处(决策编号 / 测试名 / 历史事故),否则不是铁律。
+     **本节只允许增补,不允许删除或弱化既有条目。** -->
+
+## 5. 当前阶段目标与优先级
+
+<!-- TODO: 按优先级排序;并显式列出「明确欠着」(已知但不做)的事项与理由 ——
+     没有这一段,模型的每次上抛询问都缺乏依据。 -->
+
+## 6. 决策权边界
+
+<!-- TODO: 哪些属于自决、哪些必须问用户。默认姿态应为
+     「选可逆方案 + 声明假设 + 给出回退路径」,而非默认上抛。 -->
+"#
+    .to_string()
 }
 
 /// Load active skill summaries from all roots (project + user + builtin
