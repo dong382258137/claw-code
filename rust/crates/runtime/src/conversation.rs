@@ -10291,20 +10291,12 @@ pub(crate) fn build_assistant_message(
                 signature,
             } => {
                 flush_text_block(&mut text, &mut blocks);
-                match strip_inline_tool_markers(&thinking) {
-                    Some((cleaned, _removed)) => {
-                        // 剥离改动了 thinking 正文,原 signature 因此失效
-                        // (provider 会对内容与签名做一致性校验),必须一并丢弃。
-                        blocks.push(ContentBlock::Thinking {
-                            thinking: cleaned,
-                            signature: None,
-                        });
-                    }
-                    None => blocks.push(ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    }),
-                }
+                // 剥离/还原统一在装配末尾由 recover_and_strip_inline 处理,
+                // 单点集中避免"thinking 已剥、text 未剥"的不一致。
+                blocks.push(ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                });
             }
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
             AssistantEvent::ToolUse { id, name, input } => {
@@ -10328,6 +10320,15 @@ pub(crate) fn build_assistant_message(
     }
     if blocks.is_empty() {
         return Err(RuntimeError::new("assistant stream produced no content"));
+    }
+
+    // B 阶段:把模型写成文本的内联调用还原为结构化 ToolUse,并剥离残余标记。
+    // 只在 assistant 装配点做,避免影响用户输入与工具输出通道。
+    let blocks = recover_and_strip_inline(blocks);
+    if blocks.is_empty() {
+        return Err(RuntimeError::new(
+            "assistant stream produced only malformed inline tool markers",
+        ));
     }
 
     Ok((
@@ -10432,22 +10433,212 @@ fn collapse_blank_lines(text: &str) -> String {
 const INLINE_TOOL_STRIPPED_NOTICE: &str = "… [已移除畸形的内联工具调用标记,该调用未被执行]";
 
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
-    if text.is_empty() {
-        return;
+    if !text.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: std::mem::take(text),
+        });
     }
-    let raw = std::mem::take(text);
-    match strip_inline_tool_markers(&raw) {
-        Some((cleaned, _removed)) => {
-            // 剥离后若正文被清空,用一行可读提示占位,避免整条消息变成空的。
-            let body = if cleaned.trim().is_empty() {
-                INLINE_TOOL_STRIPPED_NOTICE.to_string()
-            } else {
-                cleaned
-            };
-            blocks.push(ContentBlock::Text { text: body });
+}
+
+/// 内联工具调用的参数开标记(全角竖线 U+FF5C)。
+const INLINE_PARAM_OPEN: &str = " parameter name=\"";
+const INLINE_INVOKE_CLOSE: &str = "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>";
+const INLINE_PARAM_CLOSE: &str = "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>";
+
+/// 把模型写成文本的内联调用解析为 `(工具名, input JSON)` 列表。
+///
+/// 只接受紧邻形态:`<marker> invoke name="..."`,其余(如块开标记
+/// `<marker> calls>`)一律跳过。解析失败的部分直接忽略,不产生半成品调用。
+fn parse_inline_tool_calls(text: &str) -> Vec<(String, String)> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find(INLINE_TOOL_MARKER) {
+        let after = &rest[pos + INLINE_TOOL_MARKER.len()..];
+        let Some(after) = after.strip_prefix(" invoke name=\"") else {
+            rest = after;
+            continue;
+        };
+        let Some(quote) = after.find('"') else { break };
+        let name = after[..quote].to_string();
+        let after_name = &after[quote + 1..];
+        let Some(body_close) = after_name.find(INLINE_INVOKE_CLOSE) else {
+            break;
+        };
+        // 跳过 invoke 开标记的剩余部分(name="..." 之后的 `>` 及空白)。
+        let body = after_name[..body_close]
+            .split_once('>')
+            .map(|(_, tail)| tail)
+            .unwrap_or("");
+        if !name.is_empty() {
+            calls.push((name, parse_inline_params(body)));
         }
-        None => blocks.push(ContentBlock::Text { text: raw }),
+        rest = &after_name[body_close + INLINE_INVOKE_CLOSE.len()..];
     }
+    calls
+}
+
+/// 解析 invoke 体内的 `parameter name="k" ...>v</marker parameter>` 序列为 JSON 对象。
+fn parse_inline_params(body: &str) -> String {
+    let mut object = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find(INLINE_TOOL_MARKER) {
+        let after = &rest[pos + INLINE_TOOL_MARKER.len()..];
+        let Some(after) = after.strip_prefix(INLINE_PARAM_OPEN) else {
+            rest = after;
+            continue;
+        };
+        let Some(quote) = after.find('"') else { break };
+        let key = after[..quote].to_string();
+        let after_key = &after[quote + 1..];
+        let Some(gt) = after_key.find('>') else { break };
+        let flags = &after_key[..gt];
+        let after_value = &after_key[gt + 1..];
+        let Some(close) = after_value.find(INLINE_PARAM_CLOSE) else {
+            break;
+        };
+        let raw = &after_value[..close];
+        // `string="false"` 表示该值是 JSON 字面量,解析失败时退化为字符串。
+        let value = if flags.contains("string=\"false\"") {
+            serde_json::from_str::<serde_json::Value>(raw.trim())
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+        } else {
+            serde_json::Value::String(raw.to_string())
+        };
+        object.insert(key, value);
+        rest = &after_value[close + INLINE_PARAM_CLOSE.len()..];
+    }
+    serde_json::Value::Object(object).to_string()
+}
+
+/// Markdown 围栏代码块(```)在 `text` 中的字节区间。
+///
+/// 围栏内的畸形标记属于文档示例(用户要求解释该格式时,模型会把示例写进围栏),
+/// 既不得被还原为真实调用(否则示例会被执行),也不得被剥离(否则文档被破坏)。
+fn fenced_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut open: Option<usize> = None;
+    for (idx, m) in text.match_indices("```") {
+        match open.take() {
+            None => open = Some(idx),
+            Some(start) => ranges.push((start, idx + m.len())),
+        }
+    }
+    if let Some(start) = open {
+        // 未闭合围栏:视为延伸到文本末尾。
+        ranges.push((start, text.len()));
+    }
+    ranges
+}
+
+/// 处理一段围栏外的文本:按需还原内联调用,再剥离残余标记。
+///
+/// `allow_synthesis` 为假时只剥离不还原(已存在结构化调用,或该段来自思考块)。
+fn recover_text_segment(
+    segment: &str,
+    allow_synthesis: bool,
+    seq: &mut usize,
+    out: &mut Vec<ContentBlock>,
+) {
+    let mut synthesized = 0_usize;
+    if allow_synthesis {
+        for (name, input) in parse_inline_tool_calls(segment) {
+            *seq += 1;
+            synthesized += 1;
+            out.push(ContentBlock::ToolUse {
+                id: format!("inline-call-{seq}"),
+                name,
+                input,
+            });
+        }
+    }
+    match strip_inline_tool_markers(segment) {
+        // 剥离后仍有正文:保留。
+        Some((cleaned, _)) if !cleaned.trim().is_empty() => {
+            out.push(ContentBlock::Text { text: cleaned });
+        }
+        // 纯标记且调用已还原:不留占位(否则会产生空消息)。
+        Some(_) if synthesized > 0 => {}
+        // 纯标记且无法还原:留一行可读占位,提示调用未被执行。
+        Some(_) => out.push(ContentBlock::Text {
+            text: INLINE_TOOL_STRIPPED_NOTICE.to_string(),
+        }),
+        None if !segment.is_empty() => out.push(ContentBlock::Text {
+            text: segment.to_string(),
+        }),
+        None => {}
+    }
+}
+
+/// B 阶段收尾处理:先还原内联调用,再剥离残余标记。
+///
+/// 安全约束(四条,缺一不可):
+/// 1. 只处理 assistant 自身产出的块(本函数仅在装配 assistant 消息时调用);
+/// 2. 仅在**完全没有**结构化工具调用时还原,避免同一操作被执行两次;
+/// 3. 还原出的调用仍作为普通 ToolUse 进入既有权限管线,此处不授予任何额外权限;
+/// 4. 围栏代码块内的标记不做任何改动(文档示例,见 `fenced_ranges`)。
+fn recover_and_strip_inline(blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    let has_structured_tool_use = blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    let mut out = Vec::with_capacity(blocks.len());
+    let mut seq = 0_usize;
+    for block in blocks {
+        match block {
+            // 思考块只剥离,绝不用于还原调用:thinking 不是可信的指令通道。
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => match strip_inline_tool_markers(&thinking) {
+                Some((cleaned, _)) => out.push(ContentBlock::Thinking {
+                    thinking: cleaned,
+                    // 正文被改动后原签名失效(provider 校验内容/签名一致性)。
+                    signature: None,
+                }),
+                None => out.push(ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                }),
+            },
+            ContentBlock::Text { text } => {
+                if !text.contains(INLINE_TOOL_MARKER) {
+                    out.push(ContentBlock::Text { text });
+                    continue;
+                }
+                // 围栏内的标记是文档示例:原样保留,既不解析也不剥离
+                // (解析会让示例被执行,剥离会把文档改坏)。
+                let fences = fenced_ranges(&text);
+                if fences.is_empty() {
+                    recover_text_segment(&text, !has_structured_tool_use, &mut seq, &mut out);
+                    continue;
+                }
+                let mut cursor = 0_usize;
+                for (start, end) in fences {
+                    if start > cursor {
+                        recover_text_segment(
+                            &text[cursor..start],
+                            !has_structured_tool_use,
+                            &mut seq,
+                            &mut out,
+                        );
+                    }
+                    out.push(ContentBlock::Text {
+                        text: text[start..end].to_string(),
+                    });
+                    cursor = end;
+                }
+                if cursor < text.len() {
+                    recover_text_segment(
+                        &text[cursor..],
+                        !has_structured_tool_use,
+                        &mut seq,
+                        &mut out,
+                    );
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn format_hook_message(result: &HookRunResult, fallback: &str) -> String {
@@ -23918,15 +24109,18 @@ mod inline_tool_marker_tests {
     use super::{build_assistant_message, strip_inline_tool_markers, AssistantEvent};
     use crate::session::ContentBlock;
 
-    /// 全角竖线(U+FF5C)构成的畸形标记开头。
+    /// 全角竖线(U+FF5C)构成的畸形标记开头(带前导 `<`)。
     const MARK: &str = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}";
-    const CLOSE: &str = "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>";
+    /// 不含前导 `<` 的标记体,只用于拼闭标记。
+    /// 闭标记形如 `</｜｜DSML｜｜ parameter>`,前导只有一个 `<`;
+    /// 若写成 `</{MARK}`,会多出一个 `<` 而匹配不上。
+    const TAG: &str = "\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}";
 
     fn sample_block() -> String {
         format!(
-            "{m} calls>\n{m} invoke name=\"bash\">\n{m} parameter name=\"command\" string=\"true\">ls</{m} parameter>\n</{m} invoke>\n{close}",
+            "{m} calls>\n{m} invoke name=\"bash\">\n{m} parameter name=\"command\" string=\"true\">ls</{t} parameter>\n</{t} invoke>\n</{t} calls>",
             m = MARK,
-            close = CLOSE
+            t = TAG
         )
     }
 
@@ -23998,19 +24192,173 @@ mod inline_tool_marker_tests {
     }
 
     #[test]
-    fn text_block_becomes_notice_when_only_marker_remains() {
+    fn unparsable_marker_only_text_becomes_notice() {
+        // 只有开标记、没有可解析的 invoke 体 → 无法还原调用,留占位提示。
         let events = vec![
-            AssistantEvent::TextDelta(sample_block()),
+            AssistantEvent::TextDelta(format!("{m} calls>\n无调用体", m = MARK)),
             AssistantEvent::MessageStop,
         ];
         let (message, _, _) = build_assistant_message(events).expect("应构建成功");
         assert!(
             matches!(&message.blocks[0], ContentBlock::Text { .. }),
-            "期望 Text 块"
+            "期望 Text 块,实际 {:?}",
+            message.blocks
         );
         if let ContentBlock::Text { text } = &message.blocks[0] {
             assert!(text.contains("已移除畸形"), "应留占位提示: {text}");
             assert!(!text.contains("DSML"));
         }
+    }
+
+    /// B 阶段核心:文本形态的完整调用应被还原为结构化 ToolUse。
+    /// 样本结构取自真实会话记录中的 assistant 输出。
+    #[test]
+    fn recovers_inline_call_into_structured_tool_use() {
+        // 闭标记形如 `</｜｜DSML｜｜ parameter>` —— 前导只有一个 '<',
+        // 不能用 `</{MARK}` 拼接(会多出一个 '<')。
+        const C: &str = "\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}";
+        let text = format!(
+            "我先执行。\n{m} calls>\n{m} invoke name=\"bash\">\n{m} parameter name=\"command\" string=\"true\">echo hi</{c} parameter>\n{m} parameter name=\"timeout\" string=\"false\">30</{c} parameter>\n</{c} invoke>\n</{c} calls>",
+            m = MARK,
+            c = C
+        );
+        let events = vec![AssistantEvent::TextDelta(text), AssistantEvent::MessageStop];
+        let (message, _, _) = build_assistant_message(events).expect("应构建成功");
+
+        let tool_uses: Vec<&ContentBlock> = message
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .collect();
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "应还原出 1 个调用: {:?}",
+            message.blocks
+        );
+
+        if let ContentBlock::ToolUse { name, input, .. } = tool_uses[0] {
+            assert_eq!(name, "bash");
+            let parsed: serde_json::Value =
+                serde_json::from_str(input).expect("input 应为合法 JSON");
+            assert_eq!(parsed["command"], "echo hi");
+            assert_eq!(parsed["timeout"], 30, "string=false 应解析为数字");
+        }
+        // 残余标记不得留在正文里。
+        for block in &message.blocks {
+            if let ContentBlock::Text { text } = block {
+                assert!(!text.contains("DSML"), "正文残留标记: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn does_not_double_execute_when_structured_call_present() {
+        // 已有结构化调用时,文本里的同名调用不得再次还原(防重复执行)。
+        let text = format!(
+            "{m} calls>\n{m} invoke name=\"bash\">\n{m} parameter name=\"command\">echo dup</{t} parameter>\n</{t} invoke>\n</{t} calls>",
+            m = MARK,
+            t = TAG
+        );
+        let events = vec![
+            AssistantEvent::ToolUse {
+                id: "real-1".to_string(),
+                name: "bash".to_string(),
+                input: "{\"command\":\"echo real\"}".to_string(),
+            },
+            AssistantEvent::TextDelta(text),
+            AssistantEvent::MessageStop,
+        ];
+        let (message, _, _) = build_assistant_message(events).expect("应构建成功");
+        let count = message
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .count();
+        assert_eq!(count, 1, "不得重复还原: {:?}", message.blocks);
+    }
+
+    #[test]
+    fn thinking_never_synthesizes_tool_calls() {
+        // thinking 不是可信指令通道:只剥离,不还原。
+        let events = vec![
+            AssistantEvent::Thinking {
+                thinking: format!(
+                    "{m} invoke name=\"bash\">\n{m} parameter name=\"command\">rm -rf /</{t} parameter>\n</{t} invoke>",
+                    m = MARK,
+                    t = TAG
+                ),
+                signature: Some("sig".to_string()),
+            },
+            AssistantEvent::TextDelta("正常回答".to_string()),
+            AssistantEvent::MessageStop,
+        ];
+        let (message, _, _) = build_assistant_message(events).expect("应构建成功");
+        assert!(
+            !message
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+            "thinking 中的调用不得被还原: {:?}",
+            message.blocks
+        );
+    }
+
+    /// 围栏代码块内的标记是文档示例:不还原、不剥离。
+    #[test]
+    fn fenced_marker_is_never_executed_nor_stripped() {
+        let fenced = format!(
+            "示例:\n```\n{m} calls>\n{m} invoke name=\"bash\">\n{m} parameter name=\"command\">rm -rf /</{t} parameter>\n</{t} invoke>\n</{t} calls>\n```\n以上是格式说明。",
+            m = MARK,
+            t = TAG
+        );
+        let events = vec![
+            AssistantEvent::TextDelta(fenced.clone()),
+            AssistantEvent::MessageStop,
+        ];
+        let (message, _, _) = build_assistant_message(events).expect("应构建成功");
+        assert!(
+            !message
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+            "围栏内的示例不得被还原为调用: {:?}",
+            message.blocks
+        );
+        let joined: String = message
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            joined.contains("DSML"),
+            "围栏内容应原样保留(不剥离): {joined}"
+        );
+        assert!(joined.contains("以上是格式说明"), "围栏外正文应保留");
+    }
+
+    /// 围栏外仍照常还原与剥离。
+    #[test]
+    fn fence_boundary_keeps_out_outside_recovery() {
+        let text = format!(
+            "{m} calls>\n{m} invoke name=\"bash\">\n{m} parameter name=\"command\">echo run</{t} parameter>\n</{t} invoke>\n</{t} calls>\n```\n{m} invoke name=\"bash\">\n```",
+            m = MARK,
+            t = TAG
+        );
+        let events = vec![AssistantEvent::TextDelta(text), AssistantEvent::MessageStop];
+        let (message, _, _) = build_assistant_message(events).expect("应构建成功");
+        let count = message
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .count();
+        assert_eq!(
+            count, 1,
+            "围栏外调用应还原且仅还原一次: {:?}",
+            message.blocks
+        );
     }
 }
