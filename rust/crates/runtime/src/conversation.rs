@@ -4583,7 +4583,14 @@ where
                 // 低频变化但体量偏大 → 归入 messages 前缀长命区,TTL 热窗内
                 // 复用旧快照字节命中缓存;仅在 TTL 过期(冷启)轮重建注入,
                 // 把"反正要重建"的成本摊进冷启轮 —— 与 fixed_memory 同机制。
-                // 实时段(plan/attempted 等)仍留在尾部冻结槽位块(见下)。
+                // 方案1(会话内冻结):稳定段前缀**本会话永不重建** —— 冻结时机
+                // 由会话边界决定,而非「缓存热/TTL」。旧实现在 cache_hot==false
+                // 且超 TTL 时重建,重建时机不可预测且每次改写前缀字节(违背
+                // 「静态进稳定层、变化只进尾部」);provider 不回传缓存统计时
+                // cache_hot 恒 false,冻结会退化为固定 TTL 定时解冻。
+                // 新增内容改走 delta 尾部通道(本会话新写的 decisions/evidence
+                // 立即可见,不动前缀)。实时段仍在尾部冻结槽位块(见下)。
+                let mut notebook_delta: Option<String> = None;
                 if let Some(root) = &self.workspace_root {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -4596,27 +4603,16 @@ where
                     .ok()
                     .map(|nb| nb.render_stable_sections())
                     .filter(|s| !s.trim().is_empty());
-                    let prev = crate::notebook::load_stable_snapshot(root);
-                    let cache_hot = self.last_cache_hit();
-                    let next =
-                        crate::fixed_memory::next_injection(prev.as_ref(), built, now, cache_hot);
-                    if let Some(snap) = &next {
-                        // 护栏:复用路径(时间戳未变)必须字节一致。
-                        if let Some(p) = &prev {
-                            if crate::fixed_memory::has_byte_drift(p, snap) {
-                                self.emit_diag(format!(
-                                    "[diag] notebook stable snapshot byte drift (injected_at_ms={})",
-                                    snap.injected_at_ms
-                                ));
-                            }
-                        }
-                        // 仅重建时落盘。
-                        let is_rebuilt = prev.as_ref().map(|p| p.injected_at_ms).unwrap_or(-1)
-                            != snap.injected_at_ms;
-                        if is_rebuilt {
-                            let _ = crate::notebook::save_stable_snapshot(root, snap);
-                        }
+                    if let Some((snap, delta)) = crate::notebook::resolve_frozen_snapshot(
+                        root,
+                        &self.session.session_id,
+                        built,
+                        now,
+                    ) {
                         messages.insert(0, ConversationMessage::user_text(snap.content.clone()));
+                        if !delta.trim().is_empty() {
+                            notebook_delta = Some(delta);
+                        }
                     }
                 }
                 // 站5/3/4:项目快照段(git status/commits、MCP 目录)注入
@@ -4631,6 +4627,15 @@ where
                 self.refresh_project_context_section();
                 for section in &self.message_injected_sections {
                     messages.push(ConversationMessage::user_text(section.clone()));
+                }
+                // 方案1 delta 尾部通道:本会话新写入稳定段(decisions/evidence)的
+                // 增量。前缀已由会话内冻结钉死,新结论若也塞进前缀会击穿缓存;
+                // 放到尾部则在**不动前缀**的前提下立即可见 —— 「冻结不失忆」。
+                if let Some(delta) = notebook_delta {
+                    messages.push(ConversationMessage::user_text(format!(
+                        "# 设计决策与实验证据(本会话新增)\n\
+                         以下条目为本会话在冻结之后新增、尚未进入前缀的部分。\n\n{delta}"
+                    )));
                 }
                 // 冻结槽位块:单条 user 消息。内容变化只影响这条消息,不破坏
                 // 前缀缓存;槽位顺序固定(与 system_prompt 变动区隔离),空槽

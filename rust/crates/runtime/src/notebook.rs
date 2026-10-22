@@ -79,6 +79,15 @@ pub const NOTEBOOK_MAX_CHARS: usize = 16_000;
 /// 超出时从头部裁剪(保留最新的证据),避免证据段挤占其他段的容量。
 pub const EVIDENCE_MAX_CHARS: usize = 4_096;
 
+/// `<key_files>` 段最大字符数。
+///
+/// 实测该段是 NOTEBOOK 体积的最大来源:45 行 / 8,577 字符 / 平均 197 字符/行,
+/// 占总量 55%,且此前**没有任何段级上限** —— 写入时直接把总量顶破
+/// [`NOTEBOOK_MAX_CHARS`] 触发 `TooLarge` 硬失败(turn 空转)。
+/// 该段走 volatile 尾部通道,不占前缀缓存,故这是**体积问题而非缓存问题**;
+/// 上限值与 evidence 对齐(4K),超限从头部裁剪保留最新条目。
+pub const KEY_FILES_MAX_CHARS: usize = 4_096;
+
 /// `<decisions>` 段最大字符数。
 ///
 /// LLM 通过 `notebook_update` 向 decisions 段追加内容时不做任何去重,
@@ -256,6 +265,121 @@ pub fn save_stable_snapshot(
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
     std::fs::write(path, content).map_err(|e| format!("write: {e}"))
+}
+
+/// 稳定段快照的「会话归属」标记文件(方案1:会话内冻结)。
+pub const NOTEBOOK_STABLE_SESSION_FILE: &str = "notebook_stable_session.txt";
+
+/// 尾部增量通道(`delta`)的最大字符数。
+pub const NOTEBOOK_DELTA_MAX_CHARS: usize = 2_000;
+
+/// 返回稳定段会话标记文件的落盘路径:`<root>/.claw/notebook_stable_session.txt`。
+#[must_use]
+pub fn notebook_stable_session_path(root: &Path) -> PathBuf {
+    root.join(".claw").join(NOTEBOOK_STABLE_SESSION_FILE)
+}
+
+/// 从尾部保留不超过 `max_chars` 字符的**完整行**(行首对齐,不截断半行)。
+#[must_use]
+pub fn tail_lines_within(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in content.lines().rev() {
+        let cost = line.chars().count() + usize::from(!kept.is_empty());
+        if used + cost > max_chars {
+            break;
+        }
+        used += cost;
+        kept.push(line);
+    }
+    kept.reverse();
+    if kept.is_empty() {
+        // 单行超长(无换行可对齐)时退化为保留该内容尾部,而不是整段丢弃
+        // —— 裁剪应"丢最旧",不应让整个段消失。
+        let total = content.chars().count();
+        return content.chars().skip(total - max_chars).collect();
+    }
+    kept.join("\n")
+}
+
+/// 计算 `built` 相对冻结基线 `frozen` 的**新增**部分(尾部 delta 通道)。
+///
+/// 两种对齐情形:
+/// 1. **行前缀对齐**(常态):`built` 前 n 行与 `frozen` 逐行一致 → delta = 其余行;
+/// 2. **非前缀**(段被头部裁剪/重排):退化为「`built` 中 `frozen` 未出现过的行」,
+///    按原序取尾部并受 [`NOTEBOOK_DELTA_MAX_CHARS`] 约束 —— 宁可少记也不乱序注入。
+#[must_use]
+pub fn split_delta(frozen: &str, built: &str) -> String {
+    let frozen_lines: Vec<&str> = frozen.lines().collect();
+    let built_lines: Vec<&str> = built.lines().collect();
+    let is_prefix = built_lines.len() >= frozen_lines.len()
+        && built_lines.iter().zip(&frozen_lines).all(|(a, b)| a == b);
+    if is_prefix {
+        let rest = built_lines[frozen_lines.len()..].join("\n");
+        return tail_lines_within(&rest, NOTEBOOK_DELTA_MAX_CHARS);
+    }
+    let seen: std::collections::HashSet<&str> = frozen_lines.iter().copied().collect();
+    let fresh: Vec<&str> = built_lines
+        .iter()
+        .copied()
+        .filter(|line| !seen.contains(line))
+        .collect();
+    tail_lines_within(&fresh.join("\n"), NOTEBOOK_DELTA_MAX_CHARS)
+}
+
+/// 方案1(会话内冻结):返回本会话应注入的稳定段快照与尾部增量。
+///
+/// 与 [`crate::fixed_memory::next_injection`] 的分歧点:后者按「缓存热 / TTL」
+/// 条件重建,而重建时机取决于 provider 是否回传缓存统计 —— 不回传时
+/// `cache_hot` 恒为 false,冻结退化为固定 TTL 定时解冻,每次解冻都改写
+/// messages 前缀字节(与铁律 I1「静态内容进稳定层、变化只进尾部」相悖)。
+///
+/// 本函数改为纯**会话边界**判定:
+/// - 快照存在且会话标记 == `session_id` → 复用旧字节,本会话永不重建(前缀零抖动);
+/// - 否则(首次注入 / 会话已切换)→ 用 `built` 重建一次并写入会话标记。
+///
+/// 返回 `(快照, delta)`:`delta` 是本会话新增、尚未进入冻结前缀的尾部内容,
+/// 由调用方注入 messages 尾部,使新结论立即可见而不动前缀。
+#[must_use]
+pub fn resolve_frozen_snapshot(
+    root: &Path,
+    session_id: &str,
+    built: Option<String>,
+    now_ms: i64,
+) -> Option<(crate::fixed_memory::FixedMemorySnapshot, String)> {
+    let prev = load_stable_snapshot(root);
+    let same_session = std::fs::read_to_string(notebook_stable_session_path(root))
+        .ok()
+        .is_some_and(|s| s.trim() == session_id);
+    if same_session {
+        if let Some(p) = prev {
+            let delta = built
+                .as_deref()
+                .map_or_else(String::new, |b| split_delta(&p.content, b));
+            return Some((p, delta));
+        }
+    }
+    let built = built?;
+    if built.trim().is_empty() {
+        return prev.map(|p| (p, String::new()));
+    }
+    let snap = crate::fixed_memory::FixedMemorySnapshot {
+        fingerprint: crate::fixed_memory::fingerprint(&built),
+        content: built,
+        injected_at_ms: now_ms,
+        last_summary_msg_index: 0,
+    };
+    let _ = save_stable_snapshot(root, &snap);
+    // 会话标记写入失败不阻断注入:下次仍会重建,行为退化为旧语义(安全侧)。
+    let marker = notebook_stable_session_path(root);
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(marker, session_id);
+    Some((snap, String::new()))
 }
 
 /// NOTEBOOK.md 的段标识(Anthropic 推荐的 XML 标签分段)。
@@ -438,13 +562,22 @@ impl Notebook {
     }
 
     /// 原子写入指定路径(内部共用)。
+    ///
+    /// 容量处理:超限不再硬失败(旧行为返回 `TooLarge`,使写入路径彻底不可用、
+    /// turn 空转),改为先 [`Self::shrink_to_fit`] 腾位再写。裁剪只从头部丢弃
+    /// 最旧条目,与各段 append 路径的既有策略一致。
     fn save_to(&self, path: &Path) -> Result<(), NotebookError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| NotebookError::Io(parent.to_path_buf(), e.to_string()))?;
         }
         let tmp_path = path.with_extension("md.tmp");
-        let content = self.render();
+        let mut shrunk = self.clone();
+        if shrunk.render().chars().count() > NOTEBOOK_MAX_CHARS {
+            shrunk.shrink_to_fit();
+        }
+        let content = shrunk.render();
+        // 极端情形(单段无法再裁)仍超限时明确报错,而不是静默写超容文件。
         if content.chars().count() > NOTEBOOK_MAX_CHARS {
             return Err(NotebookError::TooLarge {
                 actual: content.chars().count(),
@@ -712,6 +845,66 @@ impl Notebook {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sections.values().all(|s| s.trim().is_empty())
+    }
+
+    /// 按「最易再生 → 最难再生」优先级裁剪各段,使渲染总量回落到
+    /// [`NOTEBOOK_MAX_CHARS`] 以内。返回被裁剪的段名(供调用方回执)。
+    ///
+    /// 动机:此前总量超限直接返回 `Err(TooLarge)`,写入失败导致 turn 空转
+    /// (实测 `key_files` 独占 8,577 字符 / 总量 55%,把总量顶破)。改为
+    /// 先腾位再写,写入路径不再因容量硬失败;裁剪只从头部丢弃最旧条目,
+    /// 与各段 append 路径的既有策略一致。
+    pub fn shrink_to_fit(&mut self) -> Vec<&'static str> {
+        let mut shaved: Vec<&'static str> = Vec::new();
+        // 阶段 1:逐段应用段级上限(与各段 append 路径策略对齐)。
+        for (tag, cap) in [
+            ("key_files", KEY_FILES_MAX_CHARS),
+            ("attempted", ATTEMPTED_MAX_CHARS),
+            ("evidence", EVIDENCE_MAX_CHARS),
+            ("decisions", DECISIONS_MAX_CHARS),
+        ] {
+            let Some(sec) = self.sections.get(tag).cloned() else {
+                continue;
+            };
+            if sec.chars().count() > cap {
+                self.sections
+                    .insert(tag.to_string(), tail_lines_within(&sec, cap));
+                shaved.push(tag);
+            }
+        }
+        // 阶段 2:仍超总量时,按「最易再生在前」的顺序把最大段减半。
+        const SHRINK_ORDER: [&str; 5] =
+            ["key_files", "attempted", "plan", "subagents", "decisions"];
+        let mut guard = 0;
+        while self.render().chars().count() > NOTEBOOK_MAX_CHARS && guard < 32 {
+            guard += 1;
+            let mut shrunk_any = false;
+            for tag in SHRINK_ORDER {
+                let Some(sec) = self.sections.get(tag).cloned() else {
+                    continue;
+                };
+                let len = sec.chars().count();
+                if len <= 64 {
+                    continue;
+                }
+                let kept = tail_lines_within(&sec, len / 2);
+                if kept.chars().count() >= len {
+                    continue;
+                }
+                self.sections.insert(tag.to_string(), kept);
+                if !shaved.contains(&tag) {
+                    shaved.push(tag);
+                }
+                shrunk_any = true;
+                if self.render().chars().count() <= NOTEBOOK_MAX_CHARS {
+                    break;
+                }
+            }
+            if !shrunk_any {
+                break;
+            }
+        }
+        shaved
     }
 }
 
@@ -1229,22 +1422,112 @@ mod tests {
     }
 
     #[test]
-    fn notebook_save_rejects_oversized_content() {
+    fn notebook_save_shrinks_oversized_content_instead_of_failing() {
+        // 旧契约「超限即 Err(TooLarge)」已废除:它使写入路径彻底不可用、
+        // turn 空转(实测 key_files 8577 字符把总量顶破 16K)。新契约=先腾位再写。
         let dir = temp_workspace();
         let mut nb = Notebook::new();
-        // 创建超过 NOTEBOOK_MAX_CHARS 的内容(实际 render 总字符数 = header + 段)
         let huge_content = "x".repeat(NOTEBOOK_MAX_CHARS);
         nb.set_section("plan", &huge_content);
         let result = nb.save(dir.path());
-        assert!(result.is_err());
-        match result {
-            Err(NotebookError::TooLarge { actual, max }) => {
-                // actual 是 render() 总字符数(包含 header),一定 > max
-                assert!(actual > max, "actual ({actual}) should be > max ({max})");
-                assert_eq!(max, NOTEBOOK_MAX_CHARS);
-            }
-            other => panic!("expected TooLarge error, got {other:?}"),
+        assert!(
+            result.is_ok(),
+            "oversized save should shrink and succeed, got {result:?}"
+        );
+        // 落盘文件必须真的落在上限内(不是静默写超容文件)。
+        let raw = std::fs::read_to_string(dir.path().join(NOTEBOOK_FILENAME)).expect("read");
+        assert!(
+            raw.chars().count() <= NOTEBOOK_MAX_CHARS,
+            "persisted size {} should be <= {NOTEBOOK_MAX_CHARS}",
+            raw.chars().count()
+        );
+        // 裁剪后仍保留该段(不是整段丢弃)。
+        let loaded = Notebook::load(dir.path()).expect("load");
+        assert!(loaded.get_section("plan").is_some());
+    }
+
+    #[test]
+    fn key_files_section_is_capped_from_head() {
+        // key_files 曾无任何段级上限,独占 8577 字符(总量 55%)。
+        let mut nb = Notebook::new();
+        for i in 0..200 {
+            nb.append_to_section("key_files", &format!("- 文件{i}: {}", "y".repeat(60)));
         }
+        let shaved = nb.shrink_to_fit();
+        assert!(shaved.contains(&"key_files"), "key_files should be shaved");
+        let kept = nb.get_section("key_files").expect("key_files kept");
+        assert!(
+            kept.chars().count() <= KEY_FILES_MAX_CHARS,
+            "key_files {} should be <= {KEY_FILES_MAX_CHARS}",
+            kept.chars().count()
+        );
+        // 头部丢弃、尾部保留:最后一条一定还在。
+        assert!(kept.contains("文件199"), "newest entry must survive");
+        assert!(!kept.contains("文件0:"), "oldest entries should be dropped");
+    }
+
+    #[test]
+    fn tail_lines_within_keeps_whole_lines_only() {
+        let content = "aaa\nbbb\nccc";
+        // 恰好装下最后一行
+        assert_eq!(tail_lines_within(content, 3), "ccc");
+        // 装两行(含换行符)= 3+1+3 = 7
+        assert_eq!(tail_lines_within(content, 7), "bbb\nccc");
+        // 未超限原样返回
+        assert_eq!(tail_lines_within(content, 999), content);
+        // 上限为 0 时不产生半行
+        assert_eq!(tail_lines_within(content, 0), "");
+    }
+
+    #[test]
+    fn split_delta_returns_only_new_tail_lines() {
+        let frozen = "<decisions>\n- [dl-1] 旧结论\n</decisions>";
+        let built = "<decisions>\n- [dl-1] 旧结论\n- [dl-2] 新结论\n</decisions>";
+        let delta = split_delta(frozen, built);
+        // 闭标签 `</decisions>` 在冻结基线中已出现过,会被 fallback 判为"已见"
+        // 并正确剔除 —— delta 只保留真正新增的语义行。
+        assert_eq!(delta, "- [dl-2] 新结论");
+        // 无新增 → 空 delta(不重复注入已有内容)
+        assert!(split_delta(frozen, frozen).is_empty());
+    }
+
+    #[test]
+    fn split_delta_falls_back_to_unseen_lines_when_not_prefix() {
+        // 非前缀(段被头部裁剪):只保留 frozen 中未出现过的行,不乱序。
+        let frozen = "a\nb\nc";
+        let built = "b\nc\nd\ne";
+        let delta = split_delta(frozen, built);
+        assert_eq!(delta, "d\ne");
+    }
+
+    #[test]
+    fn frozen_snapshot_is_stable_within_same_session() {
+        let dir = temp_workspace();
+        let root = dir.path();
+        let first = resolve_frozen_snapshot(root, "s1", Some("A\ndl-1".to_string()), 1000)
+            .expect("first injection");
+        // 同会话内内容变化:前缀快照字节必须不变,新增走 delta。
+        let second = resolve_frozen_snapshot(root, "s1", Some("A\ndl-1\ndl-2".to_string()), 2000)
+            .expect("second injection");
+        assert_eq!(
+            first.0.content, second.0.content,
+            "frozen snapshot must not be rebuilt within the same session"
+        );
+        assert_eq!(second.0.injected_at_ms, 1000, "timestamp must be pinned");
+        assert_eq!(second.1, "dl-2", "new entry must surface via delta");
+    }
+
+    #[test]
+    fn frozen_snapshot_rebuilds_on_session_switch() {
+        let dir = temp_workspace();
+        let root = dir.path();
+        let _ = resolve_frozen_snapshot(root, "s1", Some("旧会话内容".to_string()), 1000);
+        // 新会话:应重建快照(旧会话的冻结基线不再适用)。
+        let next = resolve_frozen_snapshot(root, "s2", Some("新会话内容".to_string()), 2000)
+            .expect("rebuild");
+        assert_eq!(next.0.content, "新会话内容");
+        assert_eq!(next.0.injected_at_ms, 2000);
+        assert!(next.1.is_empty(), "first injection has no delta");
     }
 
     #[test]
