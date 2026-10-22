@@ -9933,6 +9933,11 @@ where
     ///
     /// 限流:软阈值/循环类信号两次归档间隔至少 [`GAP_REPORT_MIN_INTERVAL_MS`];
     /// `task_failed` / `punchback` 属高价值信号,不受限流。
+    ///
+    /// 8 个入参对应 turn 收尾的独立信号源(迭代数/耗时/循环/失败/进度/
+    /// 工具失败连续数/工具调用数),拆成结构体会迫使调用点先建临时对象,
+    /// 且这些信号本就同源同命,故保留扁平签名。
+    #[allow(clippy::too_many_arguments)]
     fn maybe_report_framework_gap(
         &self,
         iterations: usize,

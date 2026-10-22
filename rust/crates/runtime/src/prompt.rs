@@ -162,9 +162,12 @@ impl SystemPromptSplit {
             .iter()
             .position(|s| s.starts_with("# Environment context"));
 
-        // Snapshot tier starts at "# Persistent Memory" or "## Repository Map".
+        // Snapshot tier starts at "# Persistent Memory", "## Project
+        // Blueprint" or "## Repository Map".
         let snapshot_start = self.static_sections.iter().position(|s| {
-            s.starts_with("# Persistent Memory") || s.starts_with("## Repository Map")
+            s.starts_with("# Persistent Memory")
+                || s.starts_with("## Project Blueprint")
+                || s.starts_with("## Repository Map")
         });
 
         // BP1: end of instruction tier (section just before snapshot tier).
@@ -392,6 +395,15 @@ pub struct SystemPromptBuilder {
     // `PartialEq`/`Eq` derive issues with `RepoMap`'s internal
     // `HashMap`/`SystemTime` fields. Callers pre-render via `RepoMap::render()`.
     repomap_rendered: Option<String>,
+    /// Pre-rendered project blueprint (`.claw/BLUEPRINT.md`): mission,
+    /// capability boundary, crate layering, iron rules, current-stage
+    /// priorities and decision-authority boundary.
+    ///
+    /// Injected as a static section (before the dynamic boundary) so it is
+    /// prompt-cached. It complements `RepoMap`: the map answers "where to
+    /// edit", the blueprint answers "whether to edit at all". Owner-
+    /// maintained and therefore session-stable.
+    blueprint: Option<String>,
     /// Pre-rendered skill catalog (one line per skill). Injected as a
     /// dynamic section so it doesn't perturb the prompt-cache prefix.
     /// See `commands::render_skill_catalog`.
@@ -478,6 +490,25 @@ impl SystemPromptBuilder {
     #[must_use]
     pub fn with_repomap(mut self, rendered_map: impl Into<String>) -> Self {
         self.repomap_rendered = Some(rendered_map.into());
+        self
+    }
+
+    /// Attach the project blueprint (`.claw/BLUEPRINT.md`) as a static
+    /// section.
+    ///
+    /// The blueprint is the project's **assembly drawing**: mission,
+    /// capability boundary, crate layering, iron rules, current-stage
+    /// priorities and the decision-authority boundary. The repository map
+    /// tells the model *where* to edit; the blueprint tells it *whether* to
+    /// edit and *who decides*.
+    ///
+    /// Injected in `static_sections` (before the dynamic boundary) so it is
+    /// prompt-cached. Blueprint content is maintained by the project owner
+    /// and is byte-stable for the session, so the cache prefix stays stable.
+    /// An empty/whitespace blueprint emits no section.
+    #[must_use]
+    pub fn with_blueprint(mut self, blueprint: impl Into<String>) -> Self {
+        self.blueprint = Some(blueprint.into());
         self
     }
 
@@ -651,6 +682,16 @@ impl SystemPromptBuilder {
                     SectionTier::StateLayer,
                     render_persistent_memory_section(memory),
                 ));
+            }
+        }
+        // Project blueprint: the "assembly drawing" that complements the
+        // repository map ("parts list"). Emitted before the repomap so the
+        // model reads mission/rules/priorities *before* the symbol index.
+        // Static content ⇒ sits before the boundary and is prompt-cached.
+        if let Some(blueprint) = &self.blueprint {
+            let section = render_blueprint_section(blueprint);
+            if !section.is_empty() {
+                fragments.push(PromptFragment::new(SectionTier::StateLayer, section));
             }
         }
         if let Some(map) = &self.repomap_rendered {
@@ -1211,6 +1252,12 @@ pub struct SystemPromptExtras {
     pub persistent_memory: Option<PersistentMemory>,
     /// Pre-rendered repository map string injected as a static section.
     pub repomap: Option<String>,
+    /// Raw markdown of `.claw/BLUEPRINT.md` injected as a static section.
+    ///
+    /// The blueprint is the project's assembly drawing (mission, boundary,
+    /// layering, iron rules, stage priorities, decision authority). `None`
+    /// disables injection; empty/whitespace content emits no section.
+    pub blueprint: Option<String>,
     /// Pre-rendered skill catalog string (one line per skill, name + short
     /// description) injected as a dynamic section at the end of the system
     /// prompt. Lets the model discover available skills without loading
@@ -1275,6 +1322,9 @@ pub fn load_system_prompt_with_extras(
     }
     if let Some(map) = extras.repomap {
         builder = builder.with_repomap(map);
+    }
+    if let Some(blueprint) = extras.blueprint {
+        builder = builder.with_blueprint(blueprint);
     }
     if let Some(catalog) = extras.skill_catalog {
         builder = builder.with_skill_catalog(catalog);
@@ -1961,6 +2011,32 @@ fn render_persistent_memory_section(memory: &PersistentMemory) -> String {
     memory.frozen_render()
 }
 
+/// Render the project blueprint as a system prompt section.
+///
+/// `raw` is the raw markdown of `.claw/BLUEPRINT.md` (owner-maintained).
+/// This wrapper adds a header explaining how the section relates to the
+/// repository map and, crucially, the **decision-first** instruction: the
+/// blueprint is the default authority for direction questions, so the model
+/// must consult it before escalating to the user. That single line is what
+/// converts the blueprint from "documentation" into "an escape from asking".
+///
+/// Placed in `static_sections` (before the boundary marker) so it benefits
+/// from prompt caching. Returns an empty `String` when the input is
+/// empty/whitespace so the caller can skip pushing an empty section.
+fn render_blueprint_section(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "## Project Blueprint\n\
+         本项目的装配图(使命/边界/分层/铁律/阶段优先级/决策权边界)。\
+         `## Repository Map` 回答\"改哪里\",本段回答\"该不该改、由谁定\"。\n\
+         **决策前先查本段**: 第 1/4/5 节已有答案的,直接按其执行,不要询问用户;\n\
+         第 6 节标为\"必须问\"的才升级给用户。\n\
+         \n{raw}"
+    )
+}
+
 /// Render the repository map as a system prompt section.
 ///
 /// Placed in `static_sections` (before the boundary marker) so it benefits
@@ -2042,13 +2118,13 @@ mod tests {
         get_session_bus_section, get_simple_doing_tasks_section, get_simple_intro_section,
         get_simple_system_section, get_tool_usage_guidance_section, get_worker_lifecycle_section,
         is_capability_layer_section, normalize_instruction_content,
-        parse_project_context_instruction_count, render_config_section, render_instruction_content,
-        render_instruction_files, render_mcp_catalog_section, render_persistent_memory_section,
-        render_project_context, render_project_context_fresh, render_repomap_section,
-        render_skill_catalog_section, truncate_instruction_content, ContextFile,
-        ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier, SystemPromptBuilder,
-        SystemPromptSplit, CAPABILITY_LAYER_HEADING_PREFIXES, PLACEHOLDER_POINTER_MARKER,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        parse_project_context_instruction_count, render_blueprint_section, render_config_section,
+        render_instruction_content, render_instruction_files, render_mcp_catalog_section,
+        render_persistent_memory_section, render_project_context, render_project_context_fresh,
+        render_repomap_section, render_skill_catalog_section, truncate_instruction_content,
+        ContextFile, ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier,
+        SystemPromptBuilder, SystemPromptSplit, CAPABILITY_LAYER_HEADING_PREFIXES,
+        PLACEHOLDER_POINTER_MARKER, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::cache_alignment::DynamicValueExtractor;
     use crate::config::{ConfigLoader, RuntimeConfig};
@@ -3021,6 +3097,84 @@ mod tests {
         assert!(
             !rendered.contains("## Repository Map"),
             "empty repomap should not produce a heading in the rendered prompt"
+        );
+    }
+
+    #[test]
+    fn blueprint_section_injected_before_repomap_in_static() {
+        // The blueprint is the project "assembly drawing": it must land in the
+        // static (prompt-cached) tier and precede the repository map, so the
+        // model reads mission/rules/priorities *before* the symbol index.
+        let builder = SystemPromptBuilder::new()
+            .with_blueprint("# Project Blueprint\n\n## 1. 使命\n让 LLM 不跑偏。")
+            .with_repomap("src/lib.rs (refs: 3)\n  fn helper");
+        let split = builder.build_split();
+        let bp = split
+            .static_sections
+            .iter()
+            .position(|s| s.starts_with("## Project Blueprint"))
+            .expect("blueprint 应注入 static_sections");
+        let rm = split
+            .static_sections
+            .iter()
+            .position(|s| s.starts_with("## Repository Map"))
+            .expect("repomap 应注入 static_sections");
+        assert!(bp < rm, "blueprint 必须先于 repomap 出现");
+    }
+
+    #[test]
+    fn blueprint_section_carries_decision_first_instruction() {
+        // The header must tell the model to consult the blueprint before
+        // escalating to the user — otherwise the section is inert docs and
+        // the "ask the user" escape stays the default.
+        let rendered = SystemPromptBuilder::new()
+            .with_blueprint("## 6. 决策权边界\n| 局部可逆 | 自决 |")
+            .build_split()
+            .render();
+        assert!(rendered.contains("## Project Blueprint"));
+        assert!(
+            rendered.contains("决策前先查本段"),
+            "blueprint 段必须携带「先查本段再问」指令"
+        );
+        assert!(
+            rendered.contains("不要询问用户"),
+            "blueprint 段必须显式抑制越权上抛"
+        );
+        assert!(!rendered.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+    }
+
+    #[test]
+    fn blueprint_section_joins_snapshot_tier_breakpoint() {
+        // A blueprint-only prompt (no persistent memory) must still be
+        // recognized as the start of the snapshot tier, otherwise BP1 lands on
+        // the wrong section and the instruction/snapshot boundary blurs.
+        let builder = SystemPromptBuilder::new().with_blueprint("# Project Blueprint\n\n使命。");
+        let split = builder.build_split();
+        let bps = split.static_cache_breakpoints();
+        let bp_idx = split
+            .static_sections
+            .iter()
+            .position(|s| s.starts_with("## Project Blueprint"))
+            .expect("blueprint 应在 static");
+        assert!(
+            bps.contains(&(bp_idx - 1)),
+            "BP1 应落在 blueprint 之前一个 section, got breakpoints={bps:?}, bp_idx={bp_idx}"
+        );
+    }
+
+    #[test]
+    fn empty_blueprint_not_injected() {
+        // Empty / whitespace-only blueprint must emit no section at all — no
+        // `## Project Blueprint` heading noise in the prompt.
+        assert_eq!(render_blueprint_section(""), "");
+        assert_eq!(render_blueprint_section("   \n\t\n "), "");
+        let rendered = SystemPromptBuilder::new()
+            .with_blueprint("   ")
+            .build_split()
+            .render();
+        assert!(
+            !rendered.contains("## Project Blueprint"),
+            "空白 blueprint 不应产生标题"
         );
     }
 

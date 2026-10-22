@@ -3408,23 +3408,58 @@ pub(crate) fn load_prompt_extras(
     let skill_catalog = load_skill_catalog(cwd);
     let t_catalog = t0.elapsed();
 
+    // Project blueprint: owner-maintained `.claw/BLUEPRINT.md` injected into
+    // the *static* tier so the model sees mission/rules/priorities before any
+    // symbol index. Best-effort: a missing file simply disables injection.
+    // Static content ⇒ session-stable ⇒ costs nothing after the first cache
+    // write.
+    let blueprint = load_blueprint(cwd);
+    let t_blueprint = t0.elapsed();
+
     eprintln!(
-        "[timing] load_prompt_extras: memory={:?} repomap={:?} catalog={:?} broad_cwd={} (cwd={})",
+        "[timing] load_prompt_extras: memory={:?} repomap={:?} catalog={:?} blueprint={:?} broad_cwd={} (cwd={})",
         t_mem,
         t_map,
         t_catalog,
+        t_blueprint,
         is_broad_cwd,
         cwd.display()
     );
     SystemPromptExtras {
         persistent_memory,
         repomap,
+        blueprint,
         skill_catalog,
         // MCP 目录不在此处填充:MCP runtime 此时尚未连接(build_system_prompt
         // 先于 build_runtime_plugin_state 执行),实时连接状态由
         // append_mcp_catalog 在 runtime 装配阶段注入,避免造出"全部 pending"的假目录。
         mcp_catalog: None,
     }
+}
+
+/// Load the project blueprint (`BLUEPRINT.md`) as raw markdown.
+///
+/// Lookup order:
+/// 1. `<cwd>/BLUEPRINT.md` — the tracked location. The blueprint is a
+///    project instruction asset like `CLAUDE.md`, so it must live in version
+///    control; `.claw/` is gitignored (local runtime state) and would make the
+///    mechanism disappear for anyone who clones the repo.
+/// 2. `<cwd>/.claw/BLUEPRINT.md` — per-machine override, mirroring the
+///    `.claw/settings.local.json` convention for local-only state.
+///
+/// Returns `None` when neither file exists, is unreadable, or is empty — the
+/// prompt builder then simply omits the section (no placeholder noise). The
+/// file is owner-maintained, so it is session-stable by construction and
+/// therefore safe to inject into the static (prompt-cached) tier.
+fn load_blueprint(cwd: &Path) -> Option<String> {
+    let candidates = [
+        cwd.join("BLUEPRINT.md"),
+        cwd.join(".claw").join("BLUEPRINT.md"),
+    ];
+    candidates
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .find(|content| !content.trim().is_empty())
 }
 
 /// Load active skill summaries from all roots (project + user + builtin
