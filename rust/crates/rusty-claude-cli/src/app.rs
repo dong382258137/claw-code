@@ -3451,7 +3451,7 @@ pub(crate) fn load_prompt_extras(
 /// prompt builder then simply omits the section (no placeholder noise). The
 /// file is owner-maintained, so it is session-stable by construction and
 /// therefore safe to inject into the static (prompt-cached) tier.
-fn load_blueprint(cwd: &Path) -> Option<String> {
+pub(crate) fn load_blueprint(cwd: &Path) -> Option<String> {
     let candidates = [
         cwd.join("BLUEPRINT.md"),
         cwd.join(".claw").join("BLUEPRINT.md"),

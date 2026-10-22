@@ -5684,3 +5684,70 @@ mod system_extraction_tests {
         }
     }
 }
+
+/// Blueprint 加载契约。
+///
+/// 这些测试守护的是**静默失效**风险：`load_blueprint` 找不到文件时返回
+/// `None`，注入端会安静地跳过整段 —— 路径写错不会 panic、不会告警，模型
+/// 只是悄悄失去项目装配图。故必须用测试钉死查找顺序与空白降级行为。
+#[cfg(test)]
+mod blueprint_tests {
+    use super::temp_dir;
+    use std::fs;
+
+    /// 根目录 `BLUEPRINT.md` 是入库位置，必须优先于 `.claw/` 本机覆盖。
+    /// 若顺序反了，clone 下来的人会看到别人的本机覆盖而非仓库蓝图。
+    #[test]
+    fn load_blueprint_prefers_tracked_root_file() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".claw")).expect("create .claw");
+        fs::write(
+            root.join("BLUEPRINT.md"),
+            "# Project Blueprint\n\n使命:不跑偏。",
+        )
+        .expect("write root blueprint");
+        fs::write(root.join(".claw").join("BLUEPRINT.md"), "本机临时覆盖").expect("write override");
+
+        let got = crate::app::load_blueprint(&root).expect("应读到根目录蓝图");
+        assert!(
+            got.contains("不跑偏"),
+            "根目录 BLUEPRINT.md 必须优先于 .claw 覆盖, got: {got}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 只有本机覆盖时才回退到 `.claw/BLUEPRINT.md`，对齐
+    /// `.claw/settings.local.json` 的"本机专属状态"约定。
+    #[test]
+    fn load_blueprint_falls_back_to_local_override() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".claw")).expect("create .claw");
+        fs::write(root.join(".claw").join("BLUEPRINT.md"), "本机覆盖生效").expect("write override");
+
+        let got = crate::app::load_blueprint(&root).expect("应回退到 .claw 覆盖");
+        assert!(got.contains("本机覆盖生效"), "got: {got}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 缺失或纯空白都必须返回 `None`（而非空串），避免注入端产出
+    /// `## Project Blueprint` 空壳标题浪费 token。
+    #[test]
+    fn load_blueprint_returns_none_when_absent_or_blank() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("create root");
+        assert!(
+            crate::app::load_blueprint(&root).is_none(),
+            "文件缺失时应返回 None"
+        );
+
+        fs::write(root.join("BLUEPRINT.md"), "   \n\t\n  ").expect("write blank");
+        assert!(
+            crate::app::load_blueprint(&root).is_none(),
+            "纯空白时应返回 None, 否则会注入空壳段"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
