@@ -106,9 +106,16 @@ pub struct LineEditor {
 impl LineEditor {
     #[must_use]
     pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
+        Self::new_with_mode(prompt, completions, false)
+    }
+
+    /// 构造编辑器；`vi` 为真时使用 vi 键位（`/vim` 设置的持久化结果）。
+    #[must_use]
+    pub fn new_with_mode(prompt: impl Into<String>, completions: Vec<String>, vi: bool) -> Self {
+        let edit_mode = if vi { EditMode::Vi } else { EditMode::Emacs };
         let config = Config::builder()
             .completion_type(CompletionType::List)
-            .edit_mode(EditMode::Emacs)
+            .edit_mode(edit_mode)
             // 启用 bracketed paste mode：终端会用 `\e[200~` ... `\e[201~`
             // 包裹粘贴内容，rustyline 据此把整段粘贴作为一个 `Cmd::Insert`
             // 一次性插入，而不是逐行触发 `Cmd::AcceptLine`。

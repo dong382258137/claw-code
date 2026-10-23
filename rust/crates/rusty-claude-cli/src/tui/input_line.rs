@@ -74,6 +74,15 @@ enum CsiState {
     ConsumingOsc,
 }
 
+/// vim 编辑模式（`/vim` 开启后才生效）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VimMode {
+    /// 普通输入模式（默认）。
+    Insert,
+    /// 命令模式：按键解释为动作而非文本。
+    Normal,
+}
+
 /// Single-line input state.
 #[derive(Debug, Clone)]
 pub(crate) struct InputLine {
@@ -88,6 +97,16 @@ pub(crate) struct InputLine {
     /// CSI 消费状态机：防止逐字符路径（无 bracketed paste 终端）中
     /// ANSI 转义序列字符污染 input buffer。见 handle_key 中的消费逻辑。
     csi_state: CsiState,
+    /// vim 模式开关（`/vim` 切换，持久化在 `~/.claw/settings.json`）。
+    vim_enabled: bool,
+    /// 当前编辑模式；未开启 vim 时恒为 `Insert`。
+    vim_mode: VimMode,
+    /// 等待第二个键的操作符（`d` / `c`）。
+    vim_pending: Option<char>,
+    /// 最近一次删除的文本，供 `p` 粘贴。
+    vim_register: String,
+    /// 单步撤销快照：(buffer, cursor)。
+    vim_undo: Option<(String, usize)>,
 }
 
 impl InputLine {
@@ -99,6 +118,47 @@ impl InputLine {
             menu_open: false,
             menu_locked: false,
             csi_state: CsiState::Normal,
+            vim_enabled: false,
+            vim_mode: VimMode::Insert,
+            vim_pending: None,
+            vim_register: String::new(),
+            vim_undo: None,
+        }
+    }
+
+    /// 开启/关闭 vim 模式。关闭时强制回到插入态，避免残留命令态吞字符。
+    pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
+        self.vim_enabled = enabled;
+        if !enabled {
+            self.vim_mode = VimMode::Insert;
+            self.vim_pending = None;
+        }
+    }
+
+    /// vim 模式是否开启。
+    pub(crate) fn vim_enabled(&self) -> bool {
+        self.vim_enabled
+    }
+
+    /// 当前模式标签（仅 vim 开启时返回），用于输入框提示符。
+    pub(crate) fn vim_mode_label(&self) -> Option<&'static str> {
+        if !self.vim_enabled {
+            return None;
+        }
+        Some(match self.vim_mode {
+            VimMode::Insert => "-- INSERT --",
+            VimMode::Normal => "-- NORMAL --",
+        })
+    }
+
+    /// 输入框提示符：vim 开启时把模式并入前缀，宽度计算与实际渲染共用。
+    pub(crate) fn prompt_label(&self) -> &'static str {
+        if !self.vim_enabled {
+            return "> ";
+        }
+        match self.vim_mode {
+            VimMode::Insert => "[I]> ",
+            VimMode::Normal => "[N]> ",
         }
     }
 
@@ -155,6 +215,7 @@ impl InputLine {
         self.menu_open = false;
         self.menu_locked = false;
         self.csi_state = CsiState::Normal;
+        self.vim_pending = None;
     }
 
     /// Bug L1 修复：恢复 buffer 内容（用于 Submit 后发现不能提交时回填）。
@@ -202,6 +263,10 @@ impl InputLine {
     /// logical key name for non-char keys (e.g., "Enter", "Esc", "Up", "Down",
     /// "Backspace", "Left", "Right", "Tab", "Newline").
     pub(crate) fn handle_key(&mut self, c: Option<char>, key: &str) -> InputAction {
+        // vim 命令态优先接管：所有按键都解释为动作，不插入文本。
+        if self.vim_enabled && self.vim_mode == VimMode::Normal {
+            return self.handle_normal_key(c, key);
+        }
         if self.menu_open {
             match key {
                 "Up" => return InputAction::MenuUp,
@@ -248,6 +313,15 @@ impl InputLine {
         }
 
         if key == "Esc" {
+            // vim 开启时 Esc = 退出插入态（不清空、不退出程序）。
+            if self.vim_enabled && self.vim_mode == VimMode::Insert {
+                self.vim_mode = VimMode::Normal;
+                self.vim_pending = None;
+                self.menu_open = false;
+                // vim 习惯：离开插入态时光标左移一格。
+                self.vim_move_left();
+                return InputAction::Continue;
+            }
             if self.buffer.is_empty() {
                 return InputAction::Exit;
             }
@@ -384,6 +458,254 @@ impl InputLine {
         }
 
         InputAction::Ignore
+    }
+
+    /// vim 命令态按键处理：动作不写 buffer，只有进入插入态后才插入字符。
+    fn handle_normal_key(&mut self, c: Option<char>, key: &str) -> InputAction {
+        match key {
+            "Esc" => {
+                self.vim_pending = None;
+                return InputAction::Continue;
+            }
+            "Enter" => {
+                if self.buffer.trim().is_empty() {
+                    return InputAction::Continue;
+                }
+                let submitted = self.buffer.clone();
+                self.reset();
+                return InputAction::Submit(submitted);
+            }
+            "CtrlC" | "CtrlD" => return InputAction::Exit,
+            "Left" => {
+                self.vim_move_left();
+                return InputAction::Continue;
+            }
+            "Right" => {
+                self.vim_move_right();
+                return InputAction::Continue;
+            }
+            "Backspace" => {
+                self.vim_move_left();
+                return InputAction::Continue;
+            }
+            "Up" | "Down" => return InputAction::Ignore,
+            _ => {}
+        }
+        let Some(ch) = c else {
+            return InputAction::Ignore;
+        };
+
+        // 二段操作符（d / c）优先消费第二个键。
+        if let Some(pending) = self.vim_pending.take() {
+            match (pending, ch) {
+                ('d', 'd') => {
+                    self.vim_snapshot();
+                    self.vim_register = std::mem::take(&mut self.buffer);
+                    self.cursor = 0;
+                }
+                ('d', 'w') => {
+                    let end = self.vim_word_boundary_forward();
+                    self.vim_delete_range(self.cursor, end);
+                }
+                ('d', '$') => {
+                    let end = self.buffer.len();
+                    self.vim_delete_range(self.cursor, end);
+                }
+                ('c', 'w') => {
+                    let end = self.vim_word_boundary_forward();
+                    self.vim_delete_range(self.cursor, end);
+                    self.vim_mode = VimMode::Insert;
+                }
+                _ => {}
+            }
+            self.update_menu_state();
+            return InputAction::Continue;
+        }
+
+        match ch {
+            'h' => self.vim_move_left(),
+            'l' => self.vim_move_right(),
+            '0' | '^' => self.cursor = 0,
+            '$' => self.cursor = self.buffer.len(),
+            'w' => self.vim_move_word_forward(),
+            'b' => self.vim_move_word_backward(),
+            'e' => self.vim_move_word_end(),
+            'x' if self.cursor < self.buffer.len() => {
+                let len = self.buffer[self.cursor..]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+                self.vim_delete_range(self.cursor, self.cursor + len);
+            }
+            'X' if self.cursor > 0 => {
+                let start = self.buffer[..self.cursor]
+                    .char_indices()
+                    .last()
+                    .map_or(0, |(i, _)| i);
+                self.vim_delete_range(start, self.cursor);
+            }
+            'D' => {
+                let end = self.buffer.len();
+                self.vim_delete_range(self.cursor, end);
+            }
+            'd' | 'c' => self.vim_pending = Some(ch),
+            'i' => self.vim_mode = VimMode::Insert,
+            'a' => {
+                self.vim_move_right();
+                self.vim_mode = VimMode::Insert;
+            }
+            'A' => {
+                self.cursor = self.buffer.len();
+                self.vim_mode = VimMode::Insert;
+            }
+            'I' => {
+                self.cursor = 0;
+                self.vim_mode = VimMode::Insert;
+            }
+            'p' if !self.vim_register.is_empty() => {
+                self.vim_snapshot();
+                let text = std::mem::take(&mut self.vim_register);
+                let at = self.buffer[self.cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map_or(self.buffer.len(), |(i, _)| self.cursor + i);
+                self.buffer.insert_str(at, &text);
+                self.cursor = at;
+                self.vim_register = text;
+            }
+            'u' => {
+                if let Some((buffer, cursor)) = self.vim_undo.take() {
+                    self.buffer = buffer;
+                    self.cursor = cursor.min(self.buffer.len());
+                }
+            }
+            _ => {}
+        }
+        self.update_menu_state();
+        InputAction::Continue
+    }
+
+    /// 记录单步撤销快照。
+    fn vim_snapshot(&mut self) {
+        self.vim_undo = Some((self.buffer.clone(), self.cursor));
+    }
+
+    fn vim_move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.buffer[..self.cursor]
+                .char_indices()
+                .last()
+                .map_or(0, |(i, _)| i);
+        }
+    }
+
+    fn vim_move_right(&mut self) {
+        if self.cursor < self.buffer.len() {
+            self.cursor = self.buffer[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map_or(self.buffer.len(), |(i, _)| self.cursor + i);
+        }
+    }
+
+    /// 删除 `[start, end)` 并把内容存入寄存器。
+    fn vim_delete_range(&mut self, start: usize, end: usize) {
+        if end <= start || start >= self.buffer.len() {
+            return;
+        }
+        self.vim_snapshot();
+        let end = end.min(self.buffer.len());
+        self.vim_register = self.buffer[start..end].to_string();
+        self.buffer.replace_range(start..end, "");
+        self.cursor = start.min(self.buffer.len());
+    }
+
+    fn vim_word_class(ch: char) -> u8 {
+        if ch.is_whitespace() {
+            0
+        } else if ch.is_alphanumeric() || ch == '_' {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn vim_char_index(&self) -> usize {
+        self.buffer[..self.cursor].chars().count()
+    }
+
+    fn vim_byte_index(chars: &[char], idx: usize) -> usize {
+        chars[..idx].iter().map(|c| c.len_utf8()).sum()
+    }
+
+    fn vim_move_word_forward(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut idx = self.vim_char_index();
+        if idx >= chars.len() {
+            return;
+        }
+        let class = Self::vim_word_class(chars[idx]);
+        while idx < chars.len() && Self::vim_word_class(chars[idx]) == class && class != 0 {
+            idx += 1;
+        }
+        while idx < chars.len() && Self::vim_word_class(chars[idx]) == 0 {
+            idx += 1;
+        }
+        self.cursor = Self::vim_byte_index(&chars, idx);
+    }
+
+    fn vim_move_word_backward(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut idx = self.vim_char_index();
+        if idx == 0 {
+            return;
+        }
+        idx -= 1;
+        while idx > 0 && Self::vim_word_class(chars[idx]) == 0 {
+            idx -= 1;
+        }
+        let class = Self::vim_word_class(chars[idx]);
+        if class != 0 {
+            while idx > 0 && Self::vim_word_class(chars[idx - 1]) == class {
+                idx -= 1;
+            }
+        }
+        self.cursor = Self::vim_byte_index(&chars, idx);
+    }
+
+    fn vim_move_word_end(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut idx = self.vim_char_index();
+        if idx + 1 >= chars.len() {
+            self.cursor = Self::vim_byte_index(&chars, chars.len());
+            return;
+        }
+        idx += 1;
+        while idx < chars.len() && Self::vim_word_class(chars[idx]) == 0 {
+            idx += 1;
+        }
+        let class = Self::vim_word_class(chars[idx.min(chars.len() - 1)]);
+        while idx + 1 < chars.len() && Self::vim_word_class(chars[idx + 1]) == class && class != 0 {
+            idx += 1;
+        }
+        self.cursor = Self::vim_byte_index(&chars, idx.min(chars.len()));
+    }
+
+    /// `dw` 的删除边界（下一个词首）。
+    fn vim_word_boundary_forward(&mut self) -> usize {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut idx = self.vim_char_index();
+        if idx >= chars.len() {
+            return self.buffer.len();
+        }
+        let class = Self::vim_word_class(chars[idx]);
+        while idx < chars.len() && Self::vim_word_class(chars[idx]) == class && class != 0 {
+            idx += 1;
+        }
+        while idx < chars.len() && Self::vim_word_class(chars[idx]) == 0 {
+            idx += 1;
+        }
+        Self::vim_byte_index(&chars, idx)
     }
 
     /// Accept a menu selection: replace buffer with the selected command
@@ -1260,5 +1582,99 @@ mod tests {
             "t::tests::upgrade_model_for_subagent_pro_returns_none ... ok"
         );
         assert!(!line.is_consuming_ansi());
+    }
+
+    #[test]
+    fn vim_disabled_by_default() {
+        let line = InputLine::new();
+        assert!(!line.vim_enabled());
+        assert_eq!(line.prompt_label(), "> ");
+        assert_eq!(line.vim_mode_label(), None);
+    }
+
+    #[test]
+    fn enabling_vim_keeps_insert_until_esc() {
+        let mut line = InputLine::new();
+        line.set_vim_enabled(true);
+        assert_eq!(line.prompt_label(), "[I]> ");
+        for ch in "abc".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        assert_eq!(line.buffer(), "abc");
+        assert_eq!(line.handle_key(None, "Esc"), InputAction::Continue);
+        // vim 的 Esc 不清空 buffer，只切模式并左移一格。
+        assert_eq!(line.buffer(), "abc");
+        assert_eq!(line.prompt_label(), "[N]> ");
+        assert_eq!(line.cursor(), 2);
+    }
+
+    #[test]
+    fn normal_mode_moves_and_deletes_with_undo() {
+        let mut line = InputLine::new();
+        line.set_vim_enabled(true);
+        for ch in "abc".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        line.handle_key(None, "Esc"); // Normal, cursor=2
+        line.handle_key(Some('0'), "");
+        assert_eq!(line.cursor(), 0);
+        line.handle_key(Some('l'), "");
+        assert_eq!(line.cursor(), 1);
+        line.handle_key(Some('x'), ""); // 删除 'b'
+        assert_eq!(line.buffer(), "ac");
+        line.handle_key(Some('u'), ""); // 单步撤销
+        assert_eq!(line.buffer(), "abc");
+    }
+
+    #[test]
+    fn normal_mode_dd_then_p_pastes() {
+        let mut line = InputLine::new();
+        line.set_vim_enabled(true);
+        for ch in "hello".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        line.handle_key(None, "Esc");
+        line.handle_key(Some('d'), "");
+        line.handle_key(Some('d'), "");
+        assert_eq!(line.buffer(), "");
+        line.handle_key(Some('p'), "");
+        assert_eq!(line.buffer(), "hello");
+    }
+
+    #[test]
+    fn normal_mode_i_returns_to_insert() {
+        let mut line = InputLine::new();
+        line.set_vim_enabled(true);
+        line.handle_key(Some('h'), ""); // 插入态：字面 h
+        assert_eq!(line.buffer(), "h");
+        line.handle_key(None, "Esc");
+        line.handle_key(Some('i'), "");
+        line.handle_key(Some('x'), "");
+        assert_eq!(line.buffer(), "xh");
+    }
+
+    #[test]
+    fn dw_deletes_word() {
+        let mut line = InputLine::new();
+        line.set_vim_enabled(true);
+        for ch in "one two".chars() {
+            line.handle_key(Some(ch), "");
+        }
+        line.handle_key(None, "Esc");
+        line.handle_key(Some('0'), "");
+        line.handle_key(Some('d'), "");
+        line.handle_key(Some('w'), "");
+        assert_eq!(line.buffer(), "two");
+    }
+
+    #[test]
+    fn disabling_vim_restores_insert_semantics() {
+        let mut line = InputLine::new();
+        line.set_vim_enabled(true);
+        line.handle_key(None, "Esc");
+        line.set_vim_enabled(false);
+        line.handle_key(Some('l'), "");
+        assert_eq!(line.buffer(), "l");
+        assert_eq!(line.prompt_label(), "> ");
     }
 }

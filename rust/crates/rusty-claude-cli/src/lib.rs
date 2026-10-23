@@ -17,7 +17,9 @@ pub mod locale;
 pub mod paste;
 pub mod plugin_state;
 pub mod render;
+pub mod serve;
 pub mod session_mgr;
+pub mod settings;
 pub mod streaming;
 pub mod suggestion;
 pub mod tool_display;
@@ -725,6 +727,24 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.set_thinking_mode(thinking_mode);
+            // 内部交接：`claw serve` 的写入通道通过该环境变量让子进程在既有会话上继续，
+            // 而不是新建会话。仅当变量存在且指向可读文件时生效。
+            if let Some(session_file) = std::env::var_os("CLAW_RESUME_SESSION") {
+                let path = std::path::Path::new(&session_file);
+                if path.is_file() {
+                    // LiveCli::new 会先按当前时间建一个空会话；恢复成功后把这份
+                    // 只有 header 的弃用文件删掉，避免在会话列表里留下垃圾条目。
+                    let abandoned = cli.session_file_path();
+                    cli.resume_from_path(path)?;
+                    if abandoned != path
+                        && std::fs::metadata(&abandoned)
+                            .map(|meta| meta.len() < 4096)
+                            .unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_file(&abandoned);
+                    }
+                }
+            }
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Doctor {
@@ -1738,6 +1758,16 @@ pub fn main_entry() {
             std::process::exit(1);
         }
         std::process::exit(0);
+    }
+
+    // B1 本地只读 Web 视图：独立于 REPL/TUI 的子命令，走早期分支。
+    // 只绑定 127.0.0.1，启动时打印带一次性 token 的 URL。
+    if argv.get(1).map(String::as_str) == Some("serve") {
+        if let Err(error) = serve::run_web(&argv[2..]) {
+            eprintln!("serve failed: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if let Err(error) = run() {

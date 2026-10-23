@@ -718,6 +718,7 @@ fn run_event_loop(
     resume_notice: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = InputLine::new();
+    input.set_vim_enabled(crate::settings::load().vim);
     let mut menu = SlashMenu::new();
     let output_view = OutputView::new();
     let status_state = StatusBarState::shared();
@@ -1570,7 +1571,8 @@ fn run_event_loop(
             // 彻底修复（与输出区修复一致）：自己按字符 wrap + 裁剪显示行，
             // 传给 Paragraph 时不用 .wrap()。这样渲染与光标定位使用完全相同的
             // wrap 策略，光标永远准确。
-            let input_text = format!("> {}", input.buffer());
+            let prompt = input.prompt_label();
+            let input_text = format!("{prompt}{}", input.buffer());
             let input_width = outer[1].width as usize;
             let input_wrapped: Vec<String> = wrap_plain_text(&input_text, input_width);
             // 裁剪：只取可见高度内的行（输入区可能不够高）
@@ -1593,7 +1595,7 @@ fn run_event_loop(
             //
             // 用 "> " + buffer 的完整文本中光标之前的子串做 wrap，
             // 行数 - 1 即光标所在显示行号，最后一行的显示宽度即 X。
-            let prompt_prefix_len: usize = 2; // "> "
+            let prompt_prefix_len: usize = UnicodeWidthStr::width(prompt); // "> " 或 "[N]> "
             let cursor_byte = prompt_prefix_len + input.cursor();
             let cursor_before = &input_text[..cursor_byte.min(input_text.len())];
             let cursor_wrapped = wrap_plain_text(cursor_before, input_width);
@@ -2138,6 +2140,25 @@ fn run_event_loop(
                         }
                     }
                     InputAction::Submit(line) => {
+                        // /vim：输入框状态属于 UI 线程，必须就地切换（不能走
+                        // worker 线程的命令分发），并持久化到 ~/.claw/settings.json。
+                        if line.trim() == "/vim" {
+                            let enabled = !input.vim_enabled();
+                            input.set_vim_enabled(enabled);
+                            crate::settings::set_vim(enabled);
+                            paste_diag_log(&format!("vim mode toggled: {enabled}"));
+                            needs_redraw = true;
+                            continue 'main_loop;
+                        }
+                        // /exit /quit：空闲时直接退出；有 turn 在跑时不打断（避免
+                        // 线程仍持有 cli，UI 先行退出留下孤儿 turn）。
+                        if matches!(line.trim(), "/exit" | "/quit" | "/q") {
+                            if cli_holder.is_some() {
+                                break 'main_loop;
+                            }
+                            paste_diag_log("/exit ignored: a turn is still running");
+                            continue 'main_loop;
+                        }
                         // 重置 conhost_paste_intercepted 标志（每次 Submit 入口）
                         // 注意：如果上次设置了 conhost_paste_intercepted，后续的
                         // pending_paste_lines 仍需被丢弃，所以这里不能简单重置。

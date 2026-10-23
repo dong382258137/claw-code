@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claw · 只读会话视图</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a21; --border: #262c36;
+    --fg: #d7dce3; --dim: #8b95a5; --accent: #4f8cff;
+    --user: #7dd3a0; --assistant: #8ab4f8; --tool: #c9a227; --system: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; background: var(--bg); color: var(--fg);
+         font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+  aside { border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; }
+  aside header { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; color: var(--dim); }
+  #sessions { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+  #sessions li { padding: 9px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  #sessions li:hover { background: #1d2330; }
+  #sessions li.active { background: #1f2940; border-left: 2px solid var(--accent); }
+  #sessions .meta { color: var(--dim); font-size: 11px; }
+  #sessions .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  main { display: flex; flex-direction: column; min-width: 0; }
+  main header { padding: 10px 14px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; color: var(--dim); }
+  #messages { flex: 1; overflow-y: auto; padding: 14px 18px; }
+  .msg { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: #12161d; }
+  .msg .role { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 6px; }
+  .msg.user .role { color: var(--user); }
+  .msg.assistant .role { color: var(--assistant); }
+  .msg.tool .role { color: var(--tool); }
+  .msg.system .role { color: var(--system); }
+  .msg .text { white-space: pre-wrap; word-break: break-word; }
+  .tools { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .tool { font-size: 11px; color: var(--tool); border: 1px solid #3a3320; border-radius: 4px; padding: 1px 6px; }
+  button { background: #1f2532; color: var(--fg); border: 1px solid var(--border); border-radius: 5px; padding: 3px 8px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  .empty { color: var(--dim); padding: 20px; }
+  #composer { border-top: 1px solid var(--border); padding: 10px 12px; display: flex; gap: 8px; align-items: flex-end; background: var(--panel); }
+  #composer textarea { flex: 1; resize: vertical; min-height: 40px; background: #12161d; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
+  #composer .row { display: flex; flex-direction: column; gap: 6px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside>
+    <header><span>会话</span><button id="refresh" type="button">刷新</button></header>
+    <ul id="sessions"></ul>
+  </aside>
+  <main>
+    <header><span id="title">选择左侧会话</span><span id="status"></span></header>
+    <section id="messages"><div class="empty">只读视图：数据来自本地会话 JSONL，不会写入或驱动模型。</div></section>
+    <form id="composer">
+      <textarea id="prompt" rows="2" placeholder="输入内容；Ctrl+Enter 发送（需要 DEEPSEEK_API_KEY）"></textarea>
+      <div class="row">
+        <button id="send" type="submit">发送</button>
+        <button id="stop" type="button">停止</button>
+      </div>
+    </form>
+  </main>
+</div>
+<script>
+(function () {
+  const token = new URLSearchParams(location.search).get('t') || '';
+  const withToken = (path) => path + '?t=' + encodeURIComponent(token);
+  const $ = (id) => document.getElementById(id);
+  let currentId = null;
+  let source = null;
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, (ch) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[ch]);
+  }
+
+  function formatTime(seconds) {
+    if (!seconds) return '';
+    const date = new Date(seconds * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getMonth() + 1}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function renderMessages(view) {
+    const box = $('messages');
+    const items = (view.messages || []).filter((m) => (m.text && m.text.trim()) || (m.tools && m.tools.length));
+    if (!items.length) {
+      box.innerHTML = '<div class="empty">该会话还没有消息。</div>';
+      return;
+    }
+    box.innerHTML = items.map((m) => {
+      const tools = (m.tools || []).map((t) => `<span class="tool">${escapeHtml(t)}</span>`).join('');
+      const text = m.text ? `<div class="text">${escapeHtml(m.text)}</div>` : '';
+      return `<div class="msg ${escapeHtml(m.role)}"><div class="role">${escapeHtml(m.role)}</div>${text}${tools ? `<div class="tools">${tools}</div>` : ''}</div>`;
+    }).join('');
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function setStatus(text) { $('status').textContent = text; }
+
+  async function loadSessions() {
+    setStatus('加载中…');
+    const response = await fetch(withToken('/api/sessions'));
+    if (!response.ok) { setStatus('HTTP ' + response.status); return; }
+    const sessions = await response.json();
+    const list = $('sessions');
+    if (!sessions.length) {
+      list.innerHTML = '<li class="meta">没有找到会话</li>';
+    } else {
+      list.innerHTML = sessions.map((s) => {
+        const workspace = (s.workspace || '').split(/[\\/]/).filter(Boolean).pop() || '';
+        return `<li data-id="${escapeHtml(s.id)}" class="${s.id === currentId ? 'active' : ''}">
+           <div class="title">${escapeHtml(s.title || s.id)}</div>
+           <div class="meta" title="${escapeHtml(s.workspace || '')}">${escapeHtml(workspace)} · ${formatTime(s.modified)}</div>
+         </li>`;
+      }).join('');
+      list.querySelectorAll('li[data-id]').forEach((node) => {
+        node.addEventListener('click', () => openSession(node.dataset.id));
+      });
+    }
+    setStatus(sessions.length + ' 个会话');
+  }
+
+  async function openSession(id) {
+    currentId = id;
+    if (source) { source.close(); source = null; }
+    document.querySelectorAll('#sessions li').forEach((node) => {
+      node.classList.toggle('active', node.dataset.id === id);
+    });
+    $('title').textContent = id;
+    const response = await fetch(withToken('/api/session/' + encodeURIComponent(id)));
+    if (!response.ok) { setStatus('HTTP ' + response.status); return; }
+    renderMessages(await response.json());
+    setStatus('已连接 · 实时跟随');
+
+    source = new EventSource(withToken('/api/session/' + encodeURIComponent(id) + '/stream'));
+    source.addEventListener('snapshot', (event) => {
+      try { renderMessages(JSON.parse(event.data)); } catch (_) {}
+    });
+    source.onerror = () => setStatus('连接中断，正在重连…');
+    source.onopen = () => setStatus('已连接 · 实时跟随');
+  }
+
+  $('refresh').addEventListener('click', loadSessions);
+
+  async function sendPrompt() {
+    if (!currentId) { setStatus('先选择一个会话'); return; }
+    const text = $('prompt').value.trim();
+    if (!text) return;
+    const response = await fetch(withToken('/api/session/' + encodeURIComponent(currentId) + '/prompt'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text, permission: 'workspace-write' }),
+    });
+    if (response.ok) {
+      $('prompt').value = '';
+      setStatus('已发送，等待模型…');
+    } else {
+      setStatus('发送失败 HTTP ' + response.status);
+    }
+  }
+
+  $('composer').addEventListener('submit', (event) => {
+    event.preventDefault();
+    sendPrompt();
+  });
+  $('prompt').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      sendPrompt();
+    }
+  });
+  $('stop').addEventListener('click', async () => {
+    if (!currentId) return;
+    const response = await fetch(withToken('/api/session/' + encodeURIComponent(currentId) + '/interrupt'), { method: 'POST' });
+    setStatus(response.ok ? '已请求中断' : '当前没有运行中的 turn');
+  });
+
+  loadSessions();
+})();
+</script>
+</body>
+</html>

@@ -510,8 +510,11 @@ pub(crate) fn run_repl(
         eprintln!("[policy] PolicyEngine enabled (lane completion policy evaluation active)");
     }
     let t_cli = t0.elapsed();
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    let mut editor = input::LineEditor::new_with_mode(
+        "> ",
+        cli.repl_completion_candidates().unwrap_or_default(),
+        crate::settings::load().vim,
+    );
     let t_editor = t0.elapsed();
     println!("{}", cli.startup_banner());
     let t_banner = t0.elapsed();
@@ -546,6 +549,22 @@ pub(crate) fn run_repl(
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
+                }
+                // /vim：REPL 的编辑器在构造时决定键位，切换写盘后下次启动生效。
+                if trimmed == "/vim" {
+                    let mut settings = crate::settings::load();
+                    settings.vim = !settings.vim;
+                    let saved = crate::settings::save(&settings).is_ok();
+                    println!(
+                        "vim 模式已{}（{}）",
+                        if settings.vim { "开启" } else { "关闭" },
+                        if saved {
+                            "已写入 ~/.claw/settings.json，下次启动生效"
+                        } else {
+                            "写入设置失败，仅内存生效到本次退出"
+                        }
+                    );
+                    continue;
                 }
                 // P3 自动剪贴板检测：如果 pending_paste_lines 非空，说明上一次检测到
                 // 右键粘贴多行内容，此行是 conhost 逐行发送的后续行之一。
@@ -1748,14 +1767,77 @@ impl LiveCli {
                 }
                 false
             }
+            SlashCommand::Keybindings => {
+                let text = keybindings_help();
+                if !self.tui_println(&text) {
+                    println!("{text}");
+                }
+                false
+            }
+            SlashCommand::Files => {
+                let text = list_workspace_files();
+                if !self.tui_println(&text) {
+                    println!("{text}");
+                }
+                false
+            }
+            SlashCommand::Tasks { args } => {
+                let text = list_tasks(args.as_deref());
+                if !self.tui_println(&text) {
+                    println!("{text}");
+                }
+                false
+            }
+            SlashCommand::Exit => {
+                // REPL/TUI 的输入层直接拦截 /exit；这里是脚本或降级路径。
+                let msg = "退出：REPL 用 /exit 或 Ctrl+D，TUI 用 Esc（空输入）/ Ctrl+D。";
+                if !self.tui_println(msg) {
+                    println!("{msg}");
+                }
+                false
+            }
+            SlashCommand::Vim => {
+                // 正常路径由 REPL/TUI 输入层拦截（需要就地切换编辑器状态）。
+                let msg =
+                    "vim 模式：直接输入 /vim 切换（TUI 即时生效，REPL 写入设置后下次启动生效）。";
+                if !self.tui_println(msg) {
+                    println!("{msg}");
+                }
+                false
+            }
+            SlashCommand::Copy { target } => {
+                let mode = target.as_deref().unwrap_or("last").trim();
+                let text = if mode == "all" {
+                    render_export_text(self.runtime.session())
+                } else {
+                    last_assistant_text(self.runtime.session())
+                };
+                let msg = deliver_to_clipboard(&text);
+                if !self.tui_println(&msg) {
+                    println!("{msg}");
+                }
+                false
+            }
+            SlashCommand::Fast => {
+                let target = if self.model.contains("flash") {
+                    "pro"
+                } else {
+                    "flash"
+                };
+                self.set_model(Some(target.to_string()))?;
+                false
+            }
+            SlashCommand::Feedback => {
+                let last_user = last_user_text(self.runtime.session());
+                let msg = write_feedback_entry(&self.session.id, &self.model, &last_user);
+                if !self.tui_println(&msg) {
+                    println!("{msg}");
+                }
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
-            | SlashCommand::Vim
             | SlashCommand::Share
-            | SlashCommand::Feedback
-            | SlashCommand::Files
-            | SlashCommand::Fast
-            | SlashCommand::Exit
             | SlashCommand::Desktop
             | SlashCommand::Brief
             | SlashCommand::Advisor
@@ -1764,14 +1846,11 @@ impl LiveCli {
             | SlashCommand::Thinkback
             | SlashCommand::ReleaseNotes
             | SlashCommand::SecurityReview
-            | SlashCommand::Keybindings
             | SlashCommand::PrivacySettings
             | SlashCommand::Plan { .. }
             | SlashCommand::Review { .. }
-            | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Rename { .. }
-            | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Branch { .. }
@@ -1780,7 +1859,8 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::AddDir { .. } => {
                 let cmd_name = command.slash_name();
-                let msg = format!("{cmd_name} is not yet implemented in this build.");
+                let msg =
+                    format!("{cmd_name} 在本构建未启用（单人自用精简版）；/help 查看已支持命令。");
                 if !self.tui_println(&msg) {
                     eprintln!("{msg}");
                 }
@@ -1921,28 +2001,24 @@ impl LiveCli {
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
-            println!(
-                "{}",
-                format_model_report(
-                    &self.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
-                )
+            let message = format_model_report(
+                &self.model,
+                self.runtime.session().messages.len(),
+                self.runtime.usage().turns(),
             );
+            self.print_out(&message);
             return Ok(false);
         };
 
         let model = resolve_model_alias_with_config(&model);
 
         if model == self.model {
-            println!(
-                "{}",
-                format_model_report(
-                    &self.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
-                )
+            let message = format_model_report(
+                &self.model,
+                self.runtime.session().messages.len(),
+                self.runtime.usage().turns(),
             );
+            self.print_out(&message);
             return Ok(false);
         }
 
@@ -1962,11 +2038,19 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
-        println!(
-            "{}",
-            format_model_switch_report(&previous, &model, message_count)
-        );
+        self.print_out(&format_model_switch_report(
+            &previous,
+            &model,
+            message_count,
+        ));
         Ok(true)
+    }
+
+    /// 输出一条提示：TUI 下走面板，非 TUI 下回落 stdout。
+    fn print_out(&self, message: &str) {
+        if !self.tui_println(message) {
+            println!("{message}");
+        }
     }
 
     fn set_permissions(
@@ -2163,6 +2247,14 @@ impl LiveCli {
         if !self.tui_println(&content) {
             println!("{content}");
         }
+    }
+
+    /// Web 写入通道（`claw serve` 子进程）用：从磁盘会话恢复后继续跑。
+    pub(crate) fn resume_from_path(
+        &mut self,
+        session_path: &std::path::Path,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.resume_session(Some(session_path.to_string_lossy().to_string()))
     }
 
     fn resume_session(
@@ -4427,6 +4519,236 @@ impl runtime::PermissionPrompter for TuiSilentPermissionPrompter {
     }
 }
 
+/// `/keybindings` 的静态说明（与 TUI 实际键位保持一致）。
+fn keybindings_help() -> String {
+    [
+        "键盘快捷键：",
+        "  输入        Enter 提交 / Ctrl+J、Shift+Enter 换行 / Tab 补全斜杠命令",
+        "  斜杠菜单    ↑↓ 选择 / Enter 或 Tab 确认 / Esc 关闭",
+        "  中断        Ctrl+C（有输入时清空，空输入时退出）/ Ctrl+D 退出",
+        "  vim         /vim 开关；普通模式 i a A I 插入，h l 0 $ w b e 移动，",
+        "              x X D dd dw d$ cw 删除，u 撤销，p 粘贴，Esc 回普通模式",
+        "  浏览        PgUp / PgDn 翻页，End 回到最新，J / K 上一条 / 下一条回复",
+        "  面板        F2 侧栏，Ctrl+T 折叠最近工具卡，F12 调试浮层，? 帮助",
+        "  语音        F4 一次性语音输入",
+    ]
+    .join("\n")
+}
+
+/// `/files`：列出当前工作区文件（跳过隐藏目录与构建产物，最多 100 条）。
+fn list_workspace_files() -> String {
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut out = String::from("当前目录文件（最多 100 条，跳过 target/node_modules/.git 等）：\n");
+    let mut count = 0usize;
+    collect_workspace_files(&root, &root, 0, &mut out, &mut count);
+    if count == 0 {
+        out.push_str("  （空）\n");
+    }
+    out
+}
+
+fn collect_workspace_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut String,
+    count: &mut usize,
+) {
+    const MAX_ENTRIES: usize = 100;
+    const MAX_DEPTH: usize = 3;
+    if depth > MAX_DEPTH || *count >= MAX_ENTRIES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            if matches!(name.as_str(), "target" | "node_modules" | "dist" | "build") {
+                continue;
+            }
+            collect_workspace_files(root, &path, depth + 1, out, count);
+        } else {
+            if *count >= MAX_ENTRIES {
+                return;
+            }
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            out.push_str(&format!("  {}\n", rel.display()));
+            *count += 1;
+        }
+    }
+}
+
+/// `/tasks [list|get <id>]`：读取全局任务注册表。
+fn list_tasks(args: Option<&str>) -> String {
+    let tasks = runtime::task_registry::global().list(None);
+    let sub = args.unwrap_or("list").trim();
+    if let Some(raw_id) = sub.strip_prefix("get ") {
+        let id = raw_id.trim();
+        return match tasks.iter().find(|task| task.task_id == id) {
+            Some(task) => format!(
+                "任务 {}\n  状态: {:?}\n  提示: {}\n  创建: {}\n  更新: {}\n  输出: {}",
+                task.task_id,
+                task.status,
+                truncate_text(&task.prompt, 200),
+                task.created_at,
+                task.updated_at,
+                truncate_text(&task.output, 400),
+            ),
+            None => format!("没有找到任务 {id}"),
+        };
+    }
+    if tasks.is_empty() {
+        return "任务列表为空。".to_string();
+    }
+    let mut out = String::from("任务列表（最多 30 条）：\n");
+    for task in tasks.iter().take(30) {
+        out.push_str(&format!(
+            "  {:<12} {:<9} {}\n",
+            task.task_id,
+            format!("{:?}", task.status),
+            truncate_text(&task.prompt, 60),
+        ));
+    }
+    out
+}
+
+/// 按字符截断，避免在 UTF-8 边界切开。
+fn truncate_text(text: &str, limit: usize) -> String {
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// 取最后一条指定角色的文本消息（跳过工具块与思考块）。
+fn message_text(session: &runtime::Session, role: runtime::MessageRole) -> Option<String> {
+    let message = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == role)?;
+    let text = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            runtime::ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn last_assistant_text(session: &runtime::Session) -> String {
+    message_text(session, runtime::MessageRole::Assistant).unwrap_or_default()
+}
+
+fn last_user_text(session: &runtime::Session) -> String {
+    message_text(session, runtime::MessageRole::User).unwrap_or_default()
+}
+
+/// `/copy`：优先 OSC52（SSH 也可用），同时落一份本地备份便于终端不支持时取用。
+fn deliver_to_clipboard(text: &str) -> String {
+    if text.trim().is_empty() {
+        return "没有可复制的内容（当前会话还没有模型回复）。".to_string();
+    }
+    let backup =
+        crate::settings::path().and_then(|path| path.parent().map(|dir| dir.join("last-copy.txt")));
+    let saved = backup.and_then(|path| {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        std::fs::write(&path, text).ok().map(|()| path)
+    });
+
+    let encoded = base64_encode(text.as_bytes());
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+    let _ = stdout.flush();
+
+    match saved {
+        Some(path) => format!(
+            "已发送 OSC52 复制序列（{} 字节）。终端不支持时，全文备份在 {}",
+            text.len(),
+            path.display()
+        ),
+        None => {
+            "已发送 OSC52 复制序列，但本地备份写入失败；终端不支持 OSC52 时可能无效。".to_string()
+        }
+    }
+}
+
+/// 极简 base64（OSC52 需要），避免为此引入依赖。
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// `/feedback`：只写本地 JSONL，不外发。
+fn write_feedback_entry(session_id: &str, model: &str, last_user: &str) -> String {
+    let Some(base) =
+        crate::settings::path().and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+    else {
+        return "无法定位 ~/.claw，反馈未记录。".to_string();
+    };
+    if let Err(error) = std::fs::create_dir_all(&base) {
+        return format!("创建 {} 失败: {error}", base.display());
+    }
+    let path = base.join("feedback.jsonl");
+    let entry = serde_json::json!({
+        "ts_ms": now_ms(),
+        "session": session_id,
+        "model": model,
+        "last_user": truncate_text(last_user, 500),
+    });
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{entry}"))
+    {
+        Ok(()) => format!("反馈已记录到 {}", path.display()),
+        Err(error) => format!("写入 {} 失败: {error}", path.display()),
+    }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis())
+}
+
 #[cfg(test)]
 mod topology_registry_tests {
     use super::*;
@@ -4471,5 +4793,62 @@ mod topology_registry_tests {
             Arc::ptr_eq(&base, &again),
             "path with .. must normalize to the same registry entry"
         );
+    }
+}
+
+#[cfg(test)]
+mod slash_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn keybindings_mention_vim_and_interrupt() {
+        let text = keybindings_help();
+        assert!(text.contains("vim"));
+        assert!(text.contains("Ctrl+C"));
+    }
+
+    #[test]
+    fn truncate_text_adds_ellipsis_only_when_truncated() {
+        assert_eq!(truncate_text("abc", 5), "abc");
+        assert_eq!(truncate_text("abcdef", 3), "abc…");
+        // CJK 按字符切，不按字节切。
+        assert_eq!(truncate_text("中文测试", 2), "中文…");
+    }
+
+    #[test]
+    fn workspace_listing_skips_build_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target").join("artifact.bin"), "x").unwrap();
+        let mut out = String::new();
+        let mut count = 0;
+        collect_workspace_files(dir.path(), dir.path(), 0, &mut out, &mut count);
+        assert!(out.contains("keep.txt"));
+        assert!(!out.contains("artifact.bin"));
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn tasks_get_missing_returns_message() {
+        let text = list_tasks(Some("get does-not-exist"));
+        assert!(text.contains("没有找到任务"));
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // 多字节 UTF-8 必须按字节编码，不能按字符。
+        assert_eq!(base64_encode("中".as_bytes()), "5Lit");
+    }
+
+    #[test]
+    fn copy_with_empty_text_reports_nothing_to_copy() {
+        assert!(deliver_to_clipboard("").contains("没有可复制的内容"));
+        assert!(deliver_to_clipboard("   \n").contains("没有可复制的内容"));
     }
 }
