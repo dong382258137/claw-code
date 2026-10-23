@@ -122,6 +122,7 @@ async fn serve(addr: SocketAddr, state: AppState) -> Result<(), Box<dyn std::err
         .route("/api/session/{id}/stream", get(api_stream))
         .route("/api/session/{id}/prompt", post(api_prompt))
         .route("/api/session/{id}/interrupt", post(api_interrupt))
+        .route("/api/session/{id}/status", get(api_status))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -329,6 +330,25 @@ async fn api_interrupt(
     } else {
         (StatusCode::CONFLICT, "no running turn for this session").into_response()
     }
+}
+
+/// 会话是否正在跑 turn（前端据此禁用在跑期间的发送按钮并显示状态）。
+async fn api_status(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let running = {
+        let guard = state
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.contains_key(&id)
+    };
+    Json(json!({ "session": id, "running": running })).into_response()
 }
 
 fn authorize(state: &AppState, auth: &AuthQuery) -> bool {

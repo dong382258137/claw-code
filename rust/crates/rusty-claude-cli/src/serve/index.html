@@ -40,6 +40,7 @@
   #composer { border-top: 1px solid var(--border); padding: 10px 12px; display: flex; gap: 8px; align-items: flex-end; background: var(--panel); }
   #composer textarea { flex: 1; resize: vertical; min-height: 40px; background: #12161d; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
   #composer .row { display: flex; flex-direction: column; gap: 6px; }
+  #composer select { background: #12161d; color: var(--fg); border: 1px solid var(--border); border-radius: 5px; padding: 3px 6px; font: inherit; }
 </style>
 </head>
 <body>
@@ -54,6 +55,11 @@
     <form id="composer">
       <textarea id="prompt" rows="2" placeholder="输入内容；Ctrl+Enter 发送（需要 DEEPSEEK_API_KEY）"></textarea>
       <div class="row">
+        <select id="permission" title="本轮权限模式">
+          <option value="workspace-write">workspace-write</option>
+          <option value="read-only">read-only</option>
+          <option value="danger-full-access">danger-full-access</option>
+        </select>
         <button id="send" type="submit">发送</button>
         <button id="stop" type="button">停止</button>
       </div>
@@ -139,6 +145,22 @@
     });
     source.onerror = () => setStatus('连接中断，正在重连…');
     source.onopen = () => setStatus('已连接 · 实时跟随');
+    startStatusPolling();
+  }
+
+  let statusTimer = null;
+  function startStatusPolling() {
+    if (statusTimer) clearInterval(statusTimer);
+    statusTimer = setInterval(async () => {
+      if (!currentId) return;
+      try {
+        const response = await fetch(withToken('/api/session/' + encodeURIComponent(currentId) + '/status'));
+        if (!response.ok) return;
+        const state = await response.json();
+        $('send').disabled = Boolean(state.running);
+        if (state.running) setStatus('运行中…（可点停止）');
+      } catch (_) {}
+    }, 1500);
   }
 
   $('refresh').addEventListener('click', loadSessions);
@@ -150,7 +172,7 @@
     const response = await fetch(withToken('/api/session/' + encodeURIComponent(currentId) + '/prompt'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text, permission: 'workspace-write' }),
+      body: JSON.stringify({ text: text, permission: $('permission').value }),
     });
     if (response.ok) {
       $('prompt').value = '';

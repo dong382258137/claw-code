@@ -349,3 +349,21 @@ claw serve --port 4317 --cwd D:\claw-code-src
 - `/add-dir` 会话内热加工作根
 - 多用户/鉴权体系/公网访问
 
+---
+
+## 10. 提交后的一步：Web 安全控制切片（2026-10-24）
+
+在逐次审批可用之前，先补上单人使用真正需要的三个控制：
+
+| 能力 | 实现 | 验证 |
+|---|---|---|
+| 每轮权限模式选择 | 输入框旁下拉：`workspace-write`（默认）/`read-only`/`danger-full-access`，随 prompt 发送；服务端白名单校验 | 非法模式 → 400；`read-only` → 202 |
+| 运行状态 | `GET /api/session/{id}/status` → `{running}`；前端每 1.5s 轮询，运行中禁用发送并显示"运行中…（可点停止）" | 返回 `{"running":false}` 初始态；prompt 后由 `running` 表驱动 |
+| 停止 | 复用 `POST /interrupt`（杀掉子进程） | 运行中 200 / 无运行 409 |
+
+**为什么逐次审批仍推迟**：当前写入是子进程 `claw -p`，审批回调在子进程内部且是非交互的；要做逐次 Approve/Deny，必须二选一：
+1. 把 turn 改为 serve 进程内执行，并注入自定义 `PermissionPrompter`（需要给 `LiveCli` 增加可注入 prompter 的入口 + 线程内运行 + 中断信号）；
+2. 保留子进程，增加父子审批代理（本地 socket/HTTP 往返 + CLI 侧 prompter 改造）。
+
+两条路都涉及 runtime/CLI 的接口改动，且需要真实 `DEEPSEEK_API_KEY` 才能端到端验证，因此单独作为下一步，不混进本次提交。
+
