@@ -25,6 +25,7 @@
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: not-allowed; }
   .app { display: grid; grid-template-columns: auto 1fr 4px auto; height: 100vh; }
+  .app.dock-left { grid-template-columns: auto 4px auto 1fr; }
   aside { width: 280px; min-width: 264px; max-width: 320px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
   aside.collapsed { width: 56px; min-width: 56px; max-width: 56px; }
   aside.collapsed .search, aside.collapsed .list, aside.collapsed .brand b, aside.collapsed .brand .dot, aside.collapsed #theme, aside.collapsed #collapseSidebar { display: none; }
@@ -240,6 +241,7 @@
       <button class="tabbtn" data-tab="terminal">终端</button>
       <button class="tabbtn" data-tab="preview">预览</button>
       <span style="flex:1"></span>
+      <button id="panelDock" title="切换停靠侧（左/右）" type="button">⇄</button>
       <button id="panelClose" title="收起面板" type="button">×</button>
     </div>
     <div class="panel-body">
@@ -294,7 +296,7 @@
   const state = {
     sessions: [], currentId: null, source: null, running: false, atBottom: true,
     filter: '', files: [], fileFilter: '', diff: null, tab: 'files',
-    version: '', workspace: '',
+    version: '', workspace: '', dockSide: 'right',
   };
 
   const escapeHtml = (text) => String(text).replace(/[&<>"']/g, (ch) => ({
@@ -459,23 +461,50 @@
     if (name === 'tasks') loadTasks();
     if (name === 'attachments') loadAttachments();
     if (name === 'terminal') connectTerminal();
+    saveWebSettings({ panel_tab: name });
   }
   function openPanel(tab) {
     $('panel').classList.remove('collapsed');
     showTab(tab || state.tab);
+    saveWebSettings({ panel_open: true });
   }
   document.querySelectorAll('.tabbtn').forEach((btn) => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
   $('togglePanel').addEventListener('click', () => {
     if ($('panel').classList.contains('collapsed')) openPanel();
-    else $('panel').classList.add('collapsed');
+    else { $('panel').classList.add('collapsed'); saveWebSettings({ panel_open: false }); }
   });
-  $('panelClose').addEventListener('click', () => $('panel').classList.add('collapsed'));
+  $('panelClose').addEventListener('click', () => {
+    $('panel').classList.add('collapsed');
+    saveWebSettings({ panel_open: false });
+  });
   $('previewBack').addEventListener('click', () => showTab('files'));
 
+  /* ---------- 停靠侧 ---------- */
+  function dockPanel(side, persist = true) {
+    const app = document.querySelector('.app');
+    const panel = $('panel');
+    const splitter = $('splitter');
+    const main = document.querySelector('main');
+    if (side === 'left') {
+      app.classList.add('dock-left');
+      app.insertBefore(panel, main);
+      app.insertBefore(splitter, panel);
+    } else {
+      app.classList.remove('dock-left');
+      app.appendChild(splitter);
+      app.appendChild(panel);
+    }
+    state.dockSide = side;
+    $('panel').classList.remove('collapsed');
+    if (persist) saveWebSettings({ panel_side: side, panel_open: true });
+  }
+  $('panelDock').addEventListener('click', () => dockPanel(state.dockSide === 'left' ? 'right' : 'left'));
+
   /* ---------- 侧栏 / 设置页 ---------- */
-  function toggleSidebar(force) {
+  function toggleSidebar(force, persist = true) {
     const collapsed = force === undefined ? !$('sidebar').classList.contains('collapsed') : force;
     $('sidebar').classList.toggle('collapsed', collapsed);
+    if (persist) saveWebSettings({ sidebar_collapsed: collapsed });
   }
   $('collapseSidebar').addEventListener('click', () => toggleSidebar(true));
   $('railExpand').addEventListener('click', () => toggleSidebar(false));
@@ -752,6 +781,15 @@
 
   /* ---------- 设置 ---------- */
   let webSettings = { theme: 'dark', permission: 'workspace-write', panel_width: 380 };
+  async function saveWebSettings(patch) {
+    Object.assign(webSettings, patch);
+    try {
+      const response = await fetch(withToken('/api/web-settings'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+      });
+      if (response.ok) webSettings = await response.json();
+    } catch (_) {}
+  }
   async function loadWebSettings() {
     try {
       const response = await fetch(withToken('/api/web-settings'));
@@ -773,6 +811,15 @@
     $('setWidth').value = clampPanelWidth(webSettings.panel_width);
     $('setTheme').value = webSettings.theme || 'dark';
     $('setPermission').value = webSettings.permission || 'workspace-write';
+
+    // P4：恢复侧栏折叠、面板停靠侧、开关与当前标签（不触发保存）。
+    toggleSidebar(Boolean(webSettings.sidebar_collapsed), false);
+    dockPanel(webSettings.panel_side === 'left' ? 'left' : 'right', false);
+    const tab = webSettings.panel_tab || 'files';
+    state.tab = tab;
+    document.querySelectorAll('.tabbtn').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === tab));
+    document.querySelectorAll('.tabpane').forEach((pane) => pane.classList.toggle('active', pane.id === 'tab-' + tab));
+    if (webSettings.panel_open === false) $('panel').classList.add('collapsed');
   }
   async function saveSettings() {
     const payload = {
@@ -809,7 +856,10 @@
   });
   window.addEventListener('mousemove', (event) => {
     if (!dragging) return;
-    const width = clampPanelWidth(window.innerWidth - event.clientX);
+    const sidebar = $('sidebar').classList.contains('collapsed') ? 56 : 280;
+    const width = state.dockSide === 'left'
+      ? clampPanelWidth(event.clientX - sidebar - 4)
+      : clampPanelWidth(window.innerWidth - event.clientX);
     $('panel').style.width = width + 'px';
     $('panel').classList.remove('collapsed');
   });

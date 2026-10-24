@@ -66,6 +66,10 @@ struct WebSettingsBody {
     theme: Option<String>,
     permission: Option<String>,
     panel_width: Option<u32>,
+    panel_open: Option<bool>,
+    panel_tab: Option<String>,
+    panel_side: Option<String>,
+    sidebar_collapsed: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1161,6 +1165,10 @@ fn load_web_settings() -> Value {
         "theme": "dark",
         "permission": "workspace-write",
         "panel_width": 380,
+        "panel_open": true,
+        "panel_tab": "files",
+        "panel_side": "right",
+        "sidebar_collapsed": false,
     });
     if let Some(path) = web_settings_path() {
         if let Ok(text) = std::fs::read_to_string(path) {
@@ -1205,6 +1213,25 @@ async fn api_web_settings_set(
     }
     if let Some(width) = body.panel_width {
         settings["panel_width"] = json!(width.clamp(260, 720));
+    }
+    if let Some(open) = body.panel_open {
+        settings["panel_open"] = json!(open);
+    }
+    if let Some(tab) = body.panel_tab {
+        if matches!(
+            tab.as_str(),
+            "files" | "diff" | "tasks" | "preview" | "attachments" | "terminal"
+        ) {
+            settings["panel_tab"] = json!(tab);
+        }
+    }
+    if let Some(side) = body.panel_side {
+        if side == "left" || side == "right" {
+            settings["panel_side"] = json!(side);
+        }
+    }
+    if let Some(collapsed) = body.sidebar_collapsed {
+        settings["sidebar_collapsed"] = json!(collapsed);
     }
     if let Some(path) = web_settings_path() {
         if let Some(parent) = path.parent() {
