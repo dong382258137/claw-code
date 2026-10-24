@@ -427,6 +427,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 get(api_workspaces).post(api_workspace_add),
             )
             .route("/api/workspaces/pick", post(api_workspace_pick))
+            .route("/api/client-error", post(api_client_error))
             .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
             .route("/ws/terminal", get(ws_terminal))
@@ -1698,6 +1699,49 @@ async fn api_workspace_pick(
         Ok(Err(message)) => (StatusCode::NOT_IMPLEMENTED, message).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct ClientErrorBody {
+    message: String,
+    stack: Option<String>,
+    url: Option<String>,
+}
+
+/// 前端渲染错误上报：写入工作区 `.claw/web-client-errors.log`，便于定位白屏。
+async fn api_client_error(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<ClientErrorBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let path = state.workspace.join(".claw").join("web-client-errors.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let line = format!(
+        "[{}] {}\nurl: {}\nstack:\n{}\n\n",
+        now_ms(),
+        body.message.chars().take(500).collect::<String>(),
+        body.url.as_deref().unwrap_or(""),
+        body.stack
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(8000)
+            .collect::<String>()
+    );
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn api_attachments(

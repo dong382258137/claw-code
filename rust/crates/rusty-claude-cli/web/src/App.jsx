@@ -35,6 +35,53 @@ function useToasts() {
   return { toasts, push }
 }
 
+/* ---------------- 错误边界 ---------------- */
+
+function reportClientError(message, stack) {
+  try {
+    fetch(withToken('/api/client-error'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: String(message || ''), stack: stack ? String(stack).slice(0, 8000) : null, url: location.href }),
+      keepalive: true,
+    }).catch(() => {})
+  } catch (_) {}
+}
+
+export class ClientErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error }
+  }
+
+  componentDidCatch(error, info) {
+    reportClientError(error?.message || error, `${error?.stack || ''}\n${info?.componentStack || ''}`)
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children
+    return (
+      <div className="crash">
+        <h2>界面渲染出错</h2>
+        <pre>{String(this.state.error?.message || this.state.error)}</pre>
+        <p>错误已记录到工作区 <code>.claw/web-client-errors.log</code>，请把这个文件发给开发者。</p>
+        <button onClick={() => { this.setState({ error: null }); location.reload() }}>重新加载</button>
+      </div>
+    )
+  }
+}
+
+window.addEventListener('error', (event) => {
+  reportClientError(event.message, event.error?.stack || `${event.filename}:${event.lineno}:${event.colno}`)
+})
+window.addEventListener('unhandledrejection', (event) => {
+  reportClientError(event.reason?.message || event.reason, event.reason?.stack)
+})
+
 export default function App() {
   const [sessions, setSessions] = useState([])
   const [sessionTotal, setSessionTotal] = useState(0)
@@ -1349,7 +1396,18 @@ function DiffPane({ workspace, onError }) {
         {diff.untracked.map((path) => (
           <button key={path} className="diff-row" onClick={() => openFile(path)}><span>{path}</span><span className="muted">新增</span></button>
         ))}
-        <pre className="patch">{colorizePatch(diff.patch)}</pre>
+        <pre className="patch">
+          {(() => {
+            const lines = String(diff.patch || '').split('\n')
+            const shown = lines.slice(0, 4000)
+            return (
+              <>
+                {shown.map((line, index) => <span key={index} className={line.startsWith('+') ? 'l-add' : line.startsWith('-') ? 'l-del' : line.startsWith('@@') ? 'l-hunk' : ''}>{line + '\n'}</span>)}
+                {lines.length > shown.length && <span className="muted">{`…已截断 ${lines.length - shown.length} 行…`}</span>}
+              </>
+            )
+          })()}
+        </pre>
         {selected && <div className="hint">当前查看：{selected}</div>}
       </div>
     </div>
