@@ -1766,7 +1766,12 @@ pub fn main_entry() {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .is_some_and(|stem| stem.eq_ignore_ascii_case("claw-web"));
-    if invoked_as_web && argv.get(1).map(String::as_str) != Some("serve") {
+    // --version/--help 原样透传，方便确认启动器版本。
+    let passthrough = argv
+        .get(1)
+        .map(String::as_str)
+        .is_some_and(|arg| matches!(arg, "--version" | "-V" | "--help" | "-h"));
+    if invoked_as_web && !passthrough && argv.get(1).map(String::as_str) != Some("serve") {
         argv.insert(1, "serve".to_string());
     }
 

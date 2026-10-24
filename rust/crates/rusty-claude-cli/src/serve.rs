@@ -98,8 +98,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let cwd = match cwd {
-        Some(path) => path,
-        None => default_workspace(),
+        Some(path) => strip_verbatim(path),
+        None => strip_verbatim(default_workspace()),
     };
     let store = runtime::SessionStore::from_cwd(&cwd)?;
     let sessions = store.sessions_dir().to_path_buf();
@@ -164,12 +164,16 @@ fn default_workspace() -> PathBuf {
 }
 
 fn looks_like_workspace(path: &Path) -> bool {
+    // 用户主目录里的 `.claw` 是配置目录，不能作为“这是项目”的判据。
+    if home_dir().as_deref() == Some(path) {
+        return false;
+    }
     [
-        ".git",
-        ".claw",
         "Cargo.toml",
         "package.json",
         "pyproject.toml",
+        "go.mod",
+        ".git",
     ]
     .iter()
     .any(|marker| path.join(marker).exists())
@@ -180,6 +184,18 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME"))
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// Windows 的 canonicalize 会带上 `\\?\` 前缀；显示与持久化时去掉，避免用户困惑。
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 fn last_workspace_file() -> Option<PathBuf> {
