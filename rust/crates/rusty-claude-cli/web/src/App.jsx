@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, postJson, token, withToken, wsUrl, rawUrl } from './api'
 import { Markdown } from './markdown'
-
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-_]/g
 const TABS = [
   { id: 'files', label: '文件' },
@@ -41,6 +40,7 @@ export default function App() {
   const [live, setLive] = useState('')
   const [liveThinking, setLiveThinking] = useState('')
   const [liveTools, setLiveTools] = useState([])
+  const [approvals, setApprovals] = useState([])
   const [loadingSession, setLoadingSession] = useState(false)
   const [connected, setConnected] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -131,6 +131,7 @@ export default function App() {
         if (data.kind === 'delta') setLive((previous) => previous + data.text)
         else if (data.kind === 'start') setRunning(true)
         else if (data.kind === 'thinking') setLiveThinking((previous) => (data.done && data.text ? data.text : previous + (data.done ? '' : data.text)))
+        else if (data.kind === 'approval_request') setApprovals((list) => (list.some((item) => item.id === data.id) ? list : [...list, data]))
         else if (data.kind === 'tool_use') setLiveTools((list) => [...list, { id: data.id, name: data.name, input: data.input, output: '', done: false, is_error: false }])
         else if (data.kind === 'tool_result') {
           setLiveTools((list) => {
@@ -259,6 +260,7 @@ export default function App() {
     setMessages([])
     setLive('')
     setOptimistic(null)
+    setApprovals([])
   }, [])
 
   const createSession = useCallback(async () => {
@@ -303,10 +305,20 @@ export default function App() {
         setMessages([])
         setLive('')
         setLiveTools([])
+        setApprovals([])
       }
       push('会话已删除')
     } catch (error) {
       push(`删除失败：${error.message}`, 'error')
+    }
+  }, [currentId, push])
+
+  const decideApproval = useCallback(async (approval, allow) => {
+    setApprovals((list) => list.filter((item) => item.id !== approval.id))
+    try {
+      await postJson(`/api/session/${encodeURIComponent(currentId)}/approval`, { id: approval.id, allow })
+    } catch (error) {
+      push(`审批应答失败：${error.message}`, 'error')
     }
   }, [currentId, push])
 
@@ -433,6 +445,27 @@ export default function App() {
       {dock === 'right' && panelOpen && <div className="splitter" onMouseDown={startResize} />}
       {dock === 'right' && panel}
       <Toasts toasts={toasts} />
+      {approvals.length > 0 && (
+        <div className="approval-mask">
+          <div className="approval">
+            <h3>需要你的批准</h3>
+            {approvals.map((approval) => (
+              <div key={approval.id} className="approval-item">
+                <div>
+                  工具 <b>{approval.tool}</b> 需要「{approval.required_mode}」权限
+                  {approval.reason ? `：${approval.reason}` : ''}
+                </div>
+                {approval.input && <pre>{approval.input}</pre>}
+                <div className="approval-actions">
+                  <button className="danger" onClick={() => decideApproval(approval, false)}>拒绝</button>
+                  <button className="primary" onClick={() => decideApproval(approval, true)}>允许</button>
+                </div>
+              </div>
+            ))}
+            <div className="muted">不操作会在 120 秒后自动拒绝。</div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -737,10 +770,12 @@ function Block({ block }) {
     )
   }
   if (block.kind === 'tool_result') {
+    const output = block.output || ''
+    const isDiff = /^(diff --git|@@ )/m.test(output) || output.includes('\n@@ ')
     return (
-      <details className={`tool ${block.is_error ? 'error' : ''}`} open={(block.output || '').length <= 600}>
-        <summary><span className="tool-name">{block.is_error ? '✗' : '✓'} {block.name}</span></summary>
-        <pre>{block.output || ''}</pre>
+      <details className={`tool ${block.is_error ? 'error' : ''}`} open={output.length <= 600 || isDiff}>
+        <summary><span className="tool-name">{block.is_error ? '✗' : '✓'} {block.name}{isDiff ? ' · diff' : ''}</span></summary>
+        {isDiff ? <pre className="patch">{colorizePatch(output)}</pre> : <pre>{output}</pre>}
       </details>
     )
   }
@@ -1161,8 +1196,10 @@ function TasksPane({ currentId, onError }) {
 }
 
 function AttachmentsPane({ onError }) {
-  const [data, setData] = useState({ items: [], pastes: [] })
+  const [data, setData] = useState({ items: [], pastes: [], uploads: [] })
   const [preview, setPreview] = useState(null)
+  const [uploading, setUploading] = useState(false)
+  const inputRef = useRef(null)
   const load = useCallback(() => {
     api('/api/attachments').then(setData).catch((error) => onError?.(`附件加载失败：${error.message}`))
   }, [onError])
@@ -1176,6 +1213,28 @@ function AttachmentsPane({ onError }) {
       onError?.(`读取粘贴内容失败：${error.message}`)
     }
   }, [onError])
+
+  const upload = useCallback(async (files) => {
+    const file = files?.[0]
+    if (!file) return
+    setUploading(true)
+    try {
+      const response = await fetch(withToken('/api/upload?name=' + encodeURIComponent(file.name)), {
+        method: 'POST',
+        body: file,
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status} ${await response.text()}`)
+      const body = await response.json()
+      load()
+      onError?.(null)
+      setPreview(file.type.startsWith('image/') ? { kind: 'image', path: body.path } : { kind: 'text', path: body.path, content: `已上传：${body.path}` })
+    } catch (error) {
+      onError?.(`上传失败：${error.message}`)
+    } finally {
+      setUploading(false)
+      if (inputRef.current) inputRef.current.value = ''
+    }
+  }, [load, onError])
 
   if (preview) {
     return (
@@ -1195,7 +1254,12 @@ function AttachmentsPane({ onError }) {
 
   return (
     <div className="pane">
-      <div className="pane-toolbar"><button onClick={load}>刷新</button><span className="hint">{data.items.length} 图 / {data.pastes.length} 粘贴</span></div>
+      <div className="pane-toolbar">
+        <button onClick={load}>刷新</button>
+        <button onClick={() => inputRef.current?.click()} disabled={uploading}>{uploading ? '上传中…' : '上传'}</button>
+        <input ref={inputRef} type="file" style={{ display: 'none' }} onChange={(event) => upload(event.target.files)} />
+        <span className="hint">{data.items.length} 图 / {data.pastes.length} 粘贴 / {data.uploads.length} 上传</span>
+      </div>
       <div className="pane-body scroll">
         {data.items.length > 0 && <div className="group">工作区图片</div>}
         <div className="attach-grid">
@@ -1206,13 +1270,23 @@ function AttachmentsPane({ onError }) {
             </button>
           ))}
         </div>
+        {data.uploads.length > 0 && <div className="group">上传（.claw/uploads）</div>}
+        {data.uploads.map((item) => (
+          <div key={item.path} className="row upload-row">
+            <button type="button" className="link" onClick={() => (item.image ? setPreview({ kind: 'image', path: item.path }) : openPaste(item.path))}>
+              {item.name}
+            </button>
+            <span className="muted">{Math.max(1, Math.round((item.size || 0) / 1024))}K</span>
+            <button className="ghost" title="复制引用路径" onClick={() => navigator.clipboard?.writeText('@' + item.path)}>复制路径</button>
+          </div>
+        ))}
         {data.pastes.length > 0 && <div className="group">粘贴缓存</div>}
         {data.pastes.map((item) => (
           <button key={item.path} type="button" className="row" onClick={() => openPaste(item.path)}>
             <span>{basename(item.path)}</span><span className="muted">{Math.max(1, Math.round((item.size || 0) / 1024))}K</span>
           </button>
         ))}
-        {data.items.length === 0 && data.pastes.length === 0 && <div className="empty">没有附件</div>}
+        {data.items.length === 0 && data.pastes.length === 0 && data.uploads.length === 0 && <div className="empty">没有附件，点“上传”添加</div>}
       </div>
     </div>
   )

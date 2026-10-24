@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
@@ -45,6 +46,14 @@ struct AppState {
     running: Arc<Mutex<HashMap<String, RunningTurn>>>,
     /// 流式事件广播：`{session, kind, ...}`，供 `/api/session/{id}/events` 订阅。
     events: tokio::sync::broadcast::Sender<Value>,
+    /// 等待用户在 Web 端批准的越权工具调用（id → 会话 + 应答通道）。
+    approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+}
+
+#[derive(Clone)]
+struct PendingApproval {
+    session: String,
+    sender: std::sync::mpsc::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -219,6 +228,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             workspace: cwd.clone(),
             running: Arc::new(Mutex::new(HashMap::new())),
             events,
+            approvals: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = Router::new()
             .route("/", get(index))
@@ -240,6 +250,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/workspace/goal", get(api_goal))
             .route("/api/workspace/plans", get(api_plans))
             .route("/api/attachments", get(api_attachments))
+            .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
             .route("/ws/terminal", get(ws_terminal))
             .route("/api/session/{id}/tasks", get(api_tasks))
@@ -248,6 +259,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 get(api_todos_get).post(api_todos_set),
             )
             .route("/api/session/{id}/events", get(api_events))
+            .route("/api/session/{id}/approval", post(api_approval))
             .route(
                 "/api/web-settings",
                 get(api_web_settings_get).post(api_web_settings_set),
@@ -494,10 +506,22 @@ async fn api_stream(
 
 const PERMISSION_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
 
-/// Web 端非交互审批：只有在 danger-full-access 下放行越权工具，
-/// 其余模式拒绝并说明原因（逐次审批尚未接入）。
+/// Web 端审批：danger-full-access 直接放行；其余模式把越权工具发给前端，
+/// 阻塞等待用户点击“允许/拒绝”（120 秒超时按拒绝处理）。
 struct WebPermissionPrompter {
     mode: runtime::PermissionMode,
+    session_id: String,
+    events: tokio::sync::broadcast::Sender<Value>,
+    approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+}
+
+fn permission_label(mode: runtime::PermissionMode) -> &'static str {
+    match mode {
+        runtime::PermissionMode::ReadOnly => "只读",
+        runtime::PermissionMode::WorkspaceWrite => "工作区可写",
+        runtime::PermissionMode::DangerFullAccess => "完全访问",
+        _ => "更高",
+    }
 }
 
 impl runtime::PermissionPrompter for WebPermissionPrompter {
@@ -506,34 +530,76 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
         if self.mode == runtime::PermissionMode::DangerFullAccess {
+            return runtime::PermissionPromptDecision::Allow;
+        }
+
+        let id = format!("approval-{}", now_ms());
+        let (sender, receiver) = std::sync::mpsc::channel::<bool>();
+        {
+            let mut map = self
+                .approvals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.insert(
+                id.clone(),
+                PendingApproval {
+                    session: self.session_id.clone(),
+                    sender,
+                },
+            );
+        }
+        let _ = self.events.send(json!({
+            "session": self.session_id,
+            "kind": "approval_request",
+            "id": id,
+            "tool": request.tool_name,
+            "input": truncate_chars(&request.input, 2000),
+            "required_mode": permission_label(request.required_mode),
+            "reason": request.reason,
+        }));
+
+        let allowed = receiver
+            .recv_timeout(Duration::from_secs(120))
+            .unwrap_or(false);
+        self.approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+
+        if allowed {
             runtime::PermissionPromptDecision::Allow
         } else {
             runtime::PermissionPromptDecision::Deny {
-                reason: format!(
-                    "Web 端未启用逐次审批：{} 需要「{}」权限；如需放行请把权限模式切到「完全访问」或改用 TUI",
-                    request.tool_name,
-                    match request.required_mode {
-                        runtime::PermissionMode::ReadOnly => "只读",
-                        runtime::PermissionMode::WorkspaceWrite => "工作区可写",
-                        runtime::PermissionMode::DangerFullAccess => "完全访问",
-                        _ => "更高",
-                    }
-                ),
+                reason: "用户拒绝或审批超时（120 秒）".to_string(),
             }
         }
     }
 }
 
-/// 在 serve 进程内跑一轮（不再拉子进程），从而拿到 token 级流式事件。
-fn run_web_turn(
-    session_path: &Path,
-    text: &str,
+/// 一次 Web turn 的输入。
+struct WebTurn<'a> {
+    session_path: &'a Path,
+    text: &'a str,
     mode: runtime::PermissionMode,
     model_override: Option<String>,
     signal: runtime::HookAbortSignal,
     events: tokio::sync::broadcast::Sender<Value>,
-    session_id: &str,
-) -> Result<(), String> {
+    approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+    session_id: &'a str,
+}
+
+/// 在 serve 进程内跑一轮（不再拉子进程），从而拿到 token 级流式事件。
+fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
+    let WebTurn {
+        session_path,
+        text,
+        mode,
+        model_override,
+        signal,
+        events,
+        approvals,
+        session_id,
+    } = turn;
     let model = model_override
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| {
@@ -582,7 +648,12 @@ fn run_web_turn(
         let _ = sender.send(payload);
     }));
 
-    let mut prompter = WebPermissionPrompter { mode };
+    let mut prompter = WebPermissionPrompter {
+        mode,
+        session_id: session_id.to_string(),
+        events: events.clone(),
+        approvals,
+    };
     cli.run_turn_silent_with(text, &mut prompter)
         .map_err(|error| error.to_string())
 }
@@ -632,21 +703,23 @@ async fn api_prompt(
 
     let events = state.events.clone();
     let worker_events = events.clone();
+    let approvals = Arc::clone(&state.approvals);
     let running_map = Arc::clone(&state.running);
     let session_id = id.clone();
     let text = prompt_with_web_todos(&state.workspace, &id, &body.text);
     let mode = crate::permission_mode_from_label(permission);
     let model = body.model.clone();
     std::thread::spawn(move || {
-        let outcome = run_web_turn(
-            &path,
-            &text,
+        let outcome = run_web_turn(WebTurn {
+            session_path: &path,
+            text: &text,
             mode,
-            model,
+            model_override: model,
             signal,
-            worker_events,
-            &session_id,
-        );
+            events: worker_events,
+            approvals,
+            session_id: &session_id,
+        });
         if let Err(message) = outcome {
             let _ =
                 events.send(json!({ "session": session_id, "kind": "error", "message": message }));
@@ -1287,7 +1360,87 @@ async fn api_attachments(
     }
     pastes.sort_by_key(|item| std::cmp::Reverse(item["updated_ms"].as_u64().unwrap_or(0)));
 
-    Json(json!({ "items": items, "pastes": pastes })).into_response()
+    let upload_dir = state.workspace.join(".claw").join("uploads");
+    let mut uploads = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&upload_dir) {
+        for entry in entries.flatten().take(100) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            uploads.push(json!({
+                "kind": "upload",
+                "name": name,
+                "path": format!(".claw/uploads/{name}"),
+                "size": entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+                "image": file_kind(&path) == "image",
+                "updated_ms": modified_ms(&path),
+            }));
+        }
+    }
+    uploads.sort_by_key(|item| std::cmp::Reverse(item["updated_ms"].as_u64().unwrap_or(0)));
+
+    Json(json!({ "items": items, "pastes": pastes, "uploads": uploads })).into_response()
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    t: Option<String>,
+    name: Option<String>,
+}
+
+/// 浏览器上传：原始字节写入 `.claw/uploads/`（10MB 上限）。
+async fn api_upload(
+    State(state): State<AppState>,
+    Query(query): Query<UploadQuery>,
+    body: Bytes,
+) -> Response {
+    const MAX_UPLOAD: usize = 10 * 1024 * 1024;
+    if query.t.as_deref() != Some(state.token.as_str()) {
+        return unauthorized();
+    }
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "空文件").into_response();
+    }
+    if body.len() > MAX_UPLOAD {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "文件超过 10MB").into_response();
+    }
+    let raw_name = query.name.as_deref().unwrap_or("upload.bin");
+    let base = raw_name.rsplit(['/', '\\']).next().unwrap_or("upload.bin");
+    let sanitized: String = base
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = if sanitized.trim_matches('_').is_empty() {
+        "upload.bin".to_string()
+    } else {
+        sanitized
+    };
+    let dir = state.workspace.join(".claw").join("uploads");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+    let name = format!("{}-{}", now_ms(), sanitized);
+    let path = dir.join(&name);
+    match std::fs::write(&path, &body) {
+        Ok(()) => Json(json!({
+            "name": name,
+            "path": format!(".claw/uploads/{name}"),
+            "size": body.len(),
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
 }
 
 async fn api_raw(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
@@ -1391,6 +1544,41 @@ async fn api_goal(State(state): State<AppState>, Query(query): Query<PathQuery>)
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or(Value::Null);
     Json(json!({ "goal": goal })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ApprovalBody {
+    id: String,
+    allow: bool,
+}
+
+/// 用户在 Web 端对越权工具的批准/拒绝。
+async fn api_approval(
+    State(state): State<AppState>,
+    UrlPath(session_id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<ApprovalBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let pending = {
+        let map = state
+            .approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(&body.id).cloned()
+    };
+    let Some(pending) = pending else {
+        return (StatusCode::NOT_FOUND, "审批请求已失效").into_response();
+    };
+    if pending.session != session_id {
+        return (StatusCode::NOT_FOUND, "审批请求不属于该会话").into_response();
+    }
+    match pending.sender.send(body.allow) {
+        Ok(()) => Json(json!({ "id": body.id, "allow": body.allow })).into_response(),
+        Err(_) => (StatusCode::CONFLICT, "审批请求已结束").into_response(),
+    }
 }
 
 /// Web 端维护的待办清单（sidecar JSON），发送消息时会作为上下文注入。

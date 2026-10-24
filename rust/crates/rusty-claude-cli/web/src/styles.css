@@ -232,3 +232,11 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .load-earlier { padding: 4px 0 10px; text-align: center; }
 .toast { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
 .toast-action { padding: 1px 8px; font-size: 11px; }
+
+.approval-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 50; display: grid; place-items: center; }
+.approval { width: min(560px, 92vw); background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; max-height: 80vh; overflow: auto; }
+.approval h3 { margin: 0 0 10px; font-size: 14px; }
+.approval-item { border-top: 1px solid var(--border); padding: 10px 0; }
+.approval-item pre { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+.approval-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
+.upload-row .link { background: transparent; border: 0; padding: 0; color: var(--accent); text-align: left; overflow: hidden; text-overflow: ellipsis; }
