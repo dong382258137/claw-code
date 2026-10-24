@@ -1,4 +1,4 @@
-﻿//! B1：本地只读 Web 视图（单人自用）。
+//! B1：本地只读 Web 视图（单人自用）。
 //!
 //! 只绑定 `127.0.0.1`，所有 API 需要启动时打印的一次性 token。
 //! 端点：
@@ -378,8 +378,14 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
         } else {
             runtime::PermissionPromptDecision::Deny {
                 reason: format!(
-                    "Web 端未启用逐次审批：{} 需要 {:?} 权限；如需放行请切到 danger-full-access 或使用 TUI",
-                    request.tool_name, request.required_mode
+                    "Web 端未启用逐次审批：{} 需要「{}」权限；如需放行请把权限模式切到「完全访问」或改用 TUI",
+                    request.tool_name,
+                    match request.required_mode {
+                        runtime::PermissionMode::ReadOnly => "只读",
+                        runtime::PermissionMode::WorkspaceWrite => "工作区可写",
+                        runtime::PermissionMode::DangerFullAccess => "完全访问",
+                        _ => "更高",
+                    }
                 ),
             }
         }

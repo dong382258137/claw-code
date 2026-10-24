@@ -724,6 +724,9 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
 /* ---------------- 右侧面板 ---------------- */
 
 function Panel({ tab, onTab, onClose, onDock, width, currentId, meta, onError, onToast }) {
+  // 终端只在第一次打开时挂载，之后保持连接；避免每次加载页面都起一个 PTY。
+  const [terminalMounted, setTerminalMounted] = useState(tab === 'terminal')
+  useEffect(() => { if (tab === 'terminal') setTerminalMounted(true) }, [tab])
   return (
     <section className="panel" style={{ width }}>
       <div className="panel-head">
@@ -740,7 +743,7 @@ function Panel({ tab, onTab, onClose, onDock, width, currentId, meta, onError, o
         <div className={`pane-wrap ${tab === 'diff' ? 'active' : ''}`}><DiffPane onError={onError} /></div>
         <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} onError={onError} /></div>
         <div className={`pane-wrap ${tab === 'attachments' ? 'active' : ''}`}><AttachmentsPane onError={onError} /></div>
-        <div className={`pane-wrap ${tab === 'terminal' ? 'active' : ''}`}><TerminalPane /></div>
+        <div className={`pane-wrap ${tab === 'terminal' ? 'active' : ''}`}>{terminalMounted && <TerminalPane />}</div>
       </div>
     </section>
   )
