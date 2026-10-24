@@ -24,9 +24,14 @@
   button { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: not-allowed; }
-  .app { display: grid; grid-template-columns: 280px 1fr 4px auto; height: 100vh; }
-  aside { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; }
-  .brand { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .app { display: grid; grid-template-columns: auto 1fr 4px auto; height: 100vh; }
+  aside { width: 280px; min-width: 264px; max-width: 320px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+  aside.collapsed { width: 56px; min-width: 56px; max-width: 56px; }
+  aside.collapsed .search, aside.collapsed .list, aside.collapsed .brand b, aside.collapsed .brand .dot, aside.collapsed #theme, aside.collapsed #collapseSidebar { display: none; }
+  aside.collapsed .rail { display: flex; }
+  .rail { display: none; flex-direction: column; gap: 6px; align-items: center; padding: 8px 0; }
+  .rail button { width: 38px; height: 32px; padding: 0; display: grid; place-items: center; }
+  .brand { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); gap: 6px; }
   .brand b { letter-spacing: .12em; font-size: 12px; }
   .brand .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-left: 8px; vertical-align: middle; }
   .brand .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
@@ -41,6 +46,13 @@
   .item .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .item .m { color: var(--faint); font-size: 11px; display: flex; gap: 8px; }
   main { display: flex; flex-direction: column; min-width: 0; position: relative; }
+  #settingsPage { position: absolute; inset: 0; background: var(--bg); z-index: 4; display: none; flex-direction: column; }
+  #settingsPage.show { display: flex; }
+  .settings-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .settings-head .title { font-weight: 600; }
+  .settings-body { padding: 16px 20px; overflow: auto; max-width: 720px; }
+  .settings-section { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; background: var(--panel); }
+  .settings-section h3 { margin: 0; padding: 9px 12px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--dim); letter-spacing: .06em; }
   .topbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
   .topbar .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; color: var(--dim); font-size: 11px; margin-left: auto; }
@@ -133,6 +145,12 @@
     <div class="brand">
       <span><b>CLAW</b><span id="runDot" class="dot" title="运行状态"></span></span>
       <button id="theme" title="切换主题" type="button">◐</button>
+      <button id="collapseSidebar" title="收起侧栏 (Ctrl+B)" type="button">‹</button>
+    </div>
+    <div class="rail">
+      <button id="railExpand" title="展开侧栏 (Ctrl+B)" type="button">☰</button>
+      <button id="railSettings" title="设置" type="button">⚙</button>
+      <button id="railTheme" title="切换主题" type="button">◐</button>
     </div>
     <div class="search"><input id="q" placeholder="搜索会话 / Ctrl+K" autocomplete="off"></div>
     <div class="list" id="list"></div>
@@ -141,6 +159,7 @@
   <main>
     <div class="topbar">
       <button class="menu-btn" id="menu" type="button">☰</button>
+      <button id="topSettings" type="button" title="设置">⚙</button>
       <span class="title" id="title">未选择会话</span>
       <div class="chips" id="chips"></div>
       <button id="togglePanel" type="button" title="显示/隐藏右侧面板">面板</button>
@@ -161,8 +180,42 @@
         <button id="send" type="submit">发送</button>
         <button id="stop" type="button">停止</button>
       </div>
-      <div class="hint"><span>Ctrl+K 搜索 · Ctrl+Enter 发送</span><span id="meta"></span></div>
+      <div class="hint"><span>Ctrl+K 搜索 · Ctrl+B 侧栏 · Ctrl+Enter 发送</span><span id="meta"></span></div>
     </form>
+
+    <section id="settingsPage">
+      <div class="settings-head">
+        <button id="settingsBack" type="button">‹ 返回</button>
+        <span class="title">设置</span>
+      </div>
+      <div class="settings-body">
+        <div class="settings-section">
+          <h3>外观</h3>
+          <div class="settings-row"><span>主题</span>
+            <select id="setTheme"><option value="dark">dark</option><option value="light">light</option></select>
+          </div>
+          <div class="settings-row"><span>右侧面板宽度</span><input id="setWidth" type="number" min="260" max="720" step="10" style="width:90px"></div>
+        </div>
+        <div class="settings-section">
+          <h3>Agent</h3>
+          <div class="settings-row"><span>默认权限模式</span>
+            <select id="setPermission">
+              <option value="workspace-write">workspace-write</option>
+              <option value="read-only">read-only</option>
+              <option value="danger-full-access">danger-full-access</option>
+            </select>
+          </div>
+        </div>
+        <div class="settings-section">
+          <h3>关于</h3>
+          <div class="settings-row"><span>版本 / 构建</span><span id="aboutBuild" class="faint">—</span></div>
+          <div class="settings-row"><span>工作区</span><span id="aboutWorkspace" class="faint">—</span></div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="saveSettings" type="button">保存</button><span id="settingsHint" class="faint"></span>
+        </div>
+      </div>
+    </section>
   </main>
 
   <div id="splitter" title="拖动调整面板宽度"></div>
@@ -170,9 +223,8 @@
   <section id="panel">
     <div class="panel-head">
       <button class="tabbtn active" data-tab="files">文件</button>
-      <button class="tabbtn" data-tab="diff">Diff</button>
+      <button class="tabbtn" data-tab="diff">变更</button>
       <button class="tabbtn" data-tab="tasks">任务</button>
-      <button class="tabbtn" data-tab="settings">设置</button>
       <button class="tabbtn" data-tab="preview">预览</button>
       <span style="flex:1"></span>
       <button id="panelClose" title="收起面板" type="button">×</button>
@@ -189,22 +241,6 @@
       <div class="tabpane" id="tab-tasks">
         <div class="pane-toolbar"><button id="tasksRefresh" type="button">刷新</button></div>
         <div class="pane-scroll" id="tasksBody"><div class="empty">先选择会话</div></div>
-      </div>
-      <div class="tabpane" id="tab-settings">
-        <div class="pane-scroll" id="settingsBody">
-          <div class="settings-row"><span>主题</span>
-            <select id="setTheme"><option value="dark">dark</option><option value="light">light</option></select>
-          </div>
-          <div class="settings-row"><span>默认权限</span>
-            <select id="setPermission">
-              <option value="workspace-write">workspace-write</option>
-              <option value="read-only">read-only</option>
-              <option value="danger-full-access">danger-full-access</option>
-            </select>
-          </div>
-          <div class="settings-row"><span>面板宽度</span><input id="setWidth" type="number" min="260" max="720" step="10" style="width:90px"></div>
-          <div class="pane-toolbar" style="border:0;padding:10px 0"><button id="saveSettings" type="button">保存</button><span id="settingsHint" class="faint"></span></div>
-        </div>
       </div>
       <div class="tabpane" id="tab-preview">
         <div class="pane-toolbar"><span id="previewPath" class="faint">未选择文件</span><span style="flex:1"></span><button id="previewBack" type="button">文件</button></div>
@@ -223,6 +259,7 @@
   const state = {
     sessions: [], currentId: null, source: null, running: false, atBottom: true,
     filter: '', files: [], fileFilter: '', diff: null, tab: 'files',
+    version: '', workspace: '',
   };
 
   const escapeHtml = (text) => String(text).replace(/[&<>"']/g, (ch) => ({
@@ -385,19 +422,37 @@
     if (name === 'files') loadFiles();
     if (name === 'diff') loadDiff();
     if (name === 'tasks') loadTasks();
-    if (name === 'settings') fillSettings();
   }
   function openPanel(tab) {
     $('panel').classList.remove('collapsed');
-    if (tab) showTab(tab);
+    showTab(tab || state.tab);
   }
   document.querySelectorAll('.tabbtn').forEach((btn) => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
   $('togglePanel').addEventListener('click', () => {
-    const collapsed = $('panel').classList.toggle('collapsed');
-    if (!collapsed) showTab(state.tab);
+    if ($('panel').classList.contains('collapsed')) openPanel();
+    else $('panel').classList.add('collapsed');
   });
   $('panelClose').addEventListener('click', () => $('panel').classList.add('collapsed'));
   $('previewBack').addEventListener('click', () => showTab('files'));
+
+  /* ---------- 侧栏 / 设置页 ---------- */
+  function toggleSidebar(force) {
+    const collapsed = force === undefined ? !$('sidebar').classList.contains('collapsed') : force;
+    $('sidebar').classList.toggle('collapsed', collapsed);
+  }
+  $('collapseSidebar').addEventListener('click', () => toggleSidebar(true));
+  $('railExpand').addEventListener('click', () => toggleSidebar(false));
+  $('menu').addEventListener('click', () => $('sidebar').classList.toggle('open'));
+
+  function openSettings() {
+    fillSettings();
+    $('settingsPage').classList.add('show');
+  }
+  function closeSettings() { $('settingsPage').classList.remove('show'); }
+  $('topSettings').addEventListener('click', openSettings);
+  $('railSettings').addEventListener('click', openSettings);
+  $('settingsBack').addEventListener('click', closeSettings);
+  $('railTheme').addEventListener('click', () => $('theme').click());
 
   async function loadFiles() {
     const response = await fetch(withToken('/api/workspace/files'));
@@ -515,11 +570,18 @@
     } catch (_) {}
     applySettings();
   }
+  function clampPanelWidth(desired) {
+    const sidebar = $('sidebar').classList.contains('collapsed') ? 56 : 280;
+    const available = window.innerWidth - sidebar - 400 - 4;
+    const viewportCap = Math.floor(window.innerWidth * 0.7);
+    const upper = Math.max(300, Math.min(viewportCap, available));
+    return Math.max(300, Math.min(Math.round(desired || window.innerWidth * 0.45), upper));
+  }
   function applySettings() {
     if (webSettings.theme) document.documentElement.dataset.theme = webSettings.theme;
     if (webSettings.permission) $('permission').value = webSettings.permission;
-    if (webSettings.panel_width) $('panel').style.width = webSettings.panel_width + 'px';
-    if (webSettings.panel_width) $('setWidth').value = webSettings.panel_width;
+    $('panel').style.width = clampPanelWidth(webSettings.panel_width) + 'px';
+    $('setWidth').value = clampPanelWidth(webSettings.panel_width);
     $('setTheme').value = webSettings.theme || 'dark';
     $('setPermission').value = webSettings.permission || 'workspace-write';
   }
@@ -527,7 +589,7 @@
     const payload = {
       theme: $('setTheme').value,
       permission: $('setPermission').value,
-      panel_width: Number($('setWidth').value) || 380,
+      panel_width: clampPanelWidth(Number($('setWidth').value) || 380),
     };
     const response = await fetch(withToken('/api/web-settings'), {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
@@ -545,6 +607,8 @@
     $('setTheme').value = document.documentElement.dataset.theme || 'dark';
     $('setPermission').value = $('permission').value;
     $('setWidth').value = parseInt($('panel').style.width || '380', 10);
+    $('aboutBuild').textContent = 'claw ' + (state.version || '—');
+    $('aboutWorkspace').textContent = state.workspace || '—';
   }
 
   /* ---------- 拖拽宽度 ---------- */
@@ -556,7 +620,7 @@
   });
   window.addEventListener('mousemove', (event) => {
     if (!dragging) return;
-    const width = Math.max(260, Math.min(720, window.innerWidth - event.clientX));
+    const width = clampPanelWidth(window.innerWidth - event.clientX);
     $('panel').style.width = width + 'px';
     $('panel').classList.remove('collapsed');
   });
@@ -604,9 +668,10 @@
   $('messages').addEventListener('scroll', updateJump);
   $('jump').addEventListener('click', () => { $('messages').scrollTop = $('messages').scrollHeight; });
   $('q').addEventListener('input', (event) => { state.filter = event.target.value; renderList(); });
-  $('menu').addEventListener('click', () => $('sidebar').classList.toggle('open'));
   document.addEventListener('keydown', (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); $('q').focus(); }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'b') { event.preventDefault(); toggleSidebar(); }
+    if (event.key === 'Escape' && $('settingsPage').classList.contains('show')) closeSettings();
   });
   $('theme').addEventListener('click', () => {
     const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
@@ -615,7 +680,18 @@
     fetch(withToken('/api/web-settings'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ theme: next }) }).catch(() => {});
   });
 
+  async function loadMeta() {
+    try {
+      const response = await fetch(withToken('/api/meta'));
+      if (!response.ok) return;
+      const meta = await response.json();
+      state.version = meta.version + (meta.git_sha ? ' · ' + meta.git_sha : '');
+      state.workspace = meta.workspace || '';
+    } catch (_) {}
+  }
+
   loadWebSettings();
+  loadMeta();
   loadSessions();
 })();
 </script>

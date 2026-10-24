@@ -155,6 +155,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/workspace/raw", get(api_raw))
             .route("/api/workspace/diff", get(api_diff))
             .route("/api/workspace/goal", get(api_goal))
+            .route("/api/meta", get(api_meta))
             .route("/api/session/{id}/tasks", get(api_tasks))
             .route(
                 "/api/web-settings",
@@ -811,6 +812,18 @@ async fn api_tasks(
         "plan_mode": plan_mode,
         "todos": todos.unwrap_or_default(),
         "tasks": tasks,
+    }))
+    .into_response()
+}
+
+async fn api_meta(State(state): State<AppState>, Query(auth): Query<AuthQuery>) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_sha": crate::GIT_SHA,
+        "workspace": state.workspace.display().to_string(),
     }))
     .into_response()
 }
