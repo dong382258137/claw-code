@@ -34,6 +34,7 @@ export default function App() {
   const [sessions, setSessions] = useState([])
   const [sessionTotal, setSessionTotal] = useState(0)
   const [workspaces, setWorkspaces] = useState([])
+  const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false)
   const [filter, setFilter] = useState('')
   const [current, setCurrent] = useState(null)
   const [messages, setMessages] = useState([])
@@ -106,23 +107,15 @@ export default function App() {
     }
   }, [loadSessions, push])
 
-  // 打开服务端原生文件夹选择框；非 Windows/失败时回退到手动输入。
-  const pickWorkspace = useCallback(async () => {
-    try {
-      const body = await postJson('/api/workspaces/pick', {})
-      if (body.workspace) {
-        await loadSessions()
-        push(`已添加工作区：${body.workspace.name}`)
-      }
-    } catch (error) {
-      if (String(error.message).includes('HTTP 501')) {
-        const path = window.prompt('当前平台不支持文件夹选择框，请输入工作区绝对路径')
-        if (path) await addWorkspace(path)
-      } else {
-        push(`选择工作区失败：${error.message}`, 'error')
-      }
+  // 原生文件夹选择框：返回选中的工作区（取消返回 null）。
+  const pickWorkspaceFolder = useCallback(async () => {
+    const body = await postJson('/api/workspaces/pick', {})
+    if (body.workspace) {
+      await loadSessions()
+      return body.workspace
     }
-  }, [addWorkspace, loadSessions, push])
+    return null
+  }, [loadSessions])
   useEffect(() => {
     loadSessions()
     const timer = setInterval(loadSessions, 10000)
@@ -341,6 +334,28 @@ export default function App() {
     }
   }, [activeWorkspace, push, selectSession])
 
+  const startInFolder = useCallback((path) => {
+    setWorkspacePickerOpen(false)
+    createSession(path)
+  }, [createSession])
+
+  const pickAndStart = useCallback(async () => {
+    try {
+      const workspace = await pickWorkspaceFolder()
+      if (workspace) startInFolder(workspace.path)
+    } catch (error) {
+      if (String(error.message).includes('HTTP 501')) {
+        const path = window.prompt('当前平台不支持文件夹选择框，请输入工作区绝对路径')
+        if (path) {
+          await addWorkspace(path)
+          startInFolder(path)
+        }
+      } else {
+        push(`选择工作区失败：${error.message}`, 'error')
+      }
+    }
+  }, [addWorkspace, pickWorkspaceFolder, push, startInFolder])
+
   const renameSession = useCallback(async (session) => {
     const title = window.prompt('重命名会话', session.title || session.id)
     if (title === null) return
@@ -437,7 +452,7 @@ export default function App() {
       onNew={createSession}
       onNewIn={(workspace) => createSession(workspace)}
       onAddWorkspace={addWorkspace}
-      onPickWorkspace={pickWorkspace}
+      onOpenPicker={() => setWorkspacePickerOpen(true)}
       workspaces={workspaces}
       activeWorkspace={activeWorkspace}
       onRename={renameSession}
@@ -519,6 +534,14 @@ export default function App() {
       {main}
       {dock === 'right' && panelOpen && <div className="splitter" onMouseDown={startResize} />}
       {dock === 'right' && panel}
+      {workspacePickerOpen && (
+        <WorkspacePicker
+          workspaces={workspaces}
+          onChoose={startInFolder}
+          onNativePick={pickAndStart}
+          onClose={() => setWorkspacePickerOpen(false)}
+        />
+      )}
       <Toasts toasts={toasts} />
       {approvals.length > 0 && (
         <div className="approval-mask">
@@ -597,9 +620,8 @@ function Toasts({ toasts }) {
   )
 }
 
-function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onNewIn, onAddWorkspace, onPickWorkspace, workspaces, activeWorkspace, onRename, onDelete, total, onLoadMore, onSettings, onTheme, theme }) {
+function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onNewIn, onAddWorkspace, onOpenPicker, workspaces, activeWorkspace, onRename, onDelete, total, onLoadMore, onSettings, onTheme, theme }) {
   const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
-  const [picking, setPicking] = useState(false)
   const query = filter.trim().toLowerCase()
   const filtered = sessions.filter((session) =>
     !query ||
@@ -663,13 +685,8 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
             <span>项目</span>
             <button
               title="选择工作区文件夹"
-              disabled={picking}
-              onClick={async () => {
-                if (picking) return
-                setPicking(true)
-                try { await onPickWorkspace() } finally { setPicking(false) }
-              }}
-            >{picking ? '…' : '＋'}</button>
+              onClick={onOpenPicker}
+            >＋</button>
           </div>
           <div className="session-list">
             {projects.length === 0 && <div className="empty">没有匹配的会话</div>}
@@ -713,6 +730,55 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
         </>
       )}
     </aside>
+  )
+}
+
+function WorkspacePicker({ workspaces, onChoose, onNativePick, onClose }) {
+  const [query, setQuery] = useState('')
+  const [busy, setBusy] = useState(false)
+  const inputRef = useRef(null)
+  useEffect(() => {
+    inputRef.current?.focus()
+    const onKey = (event) => { if (event.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  const filtered = workspaces.filter((item) => {
+    const text = query.trim().toLowerCase()
+    return !text || item.name.toLowerCase().includes(text) || item.path.toLowerCase().includes(text)
+  })
+  return (
+    <div className="picker-mask" onMouseDown={onClose}>
+      <div className="workspace-picker" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="picker-search">
+          <span>🔍</span>
+          <input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件夹" />
+        </div>
+        <div className="picker-list">
+          {filtered.map((item) => (
+            <button key={item.path} className="picker-row" onClick={() => onChoose(item.path)} title={item.path}>
+              <span className="picker-icon">📁</span>
+              <span className="picker-text">
+                <b>{item.name}</b>
+                <small>{item.path}</small>
+              </span>
+              {item.session_count > 0 && <span className="picker-count">{item.session_count}</span>}
+            </button>
+          ))}
+          {filtered.length === 0 && <div className="empty">没有匹配的文件夹</div>}
+        </div>
+        <button
+          className="picker-native"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true)
+            try { await onNativePick() } finally { setBusy(false) }
+          }}
+        >
+          <span>＋</span> {busy ? '正在选择…' : '选择文件夹…'}
+        </button>
+      </div>
+    </div>
   )
 }
 
