@@ -2560,11 +2560,10 @@ fn session_view(path: &Path) -> Result<Value, String> {
         }
     }
     let stats_total = stats_input + stats_output;
-    let stats_cache_pct = if stats_input + stats_cache_read > 0 {
-        stats_cache_read * 100 / (stats_input + stats_cache_read)
-    } else {
-        0
-    };
+    let stats_cache_pct = stats_cache_read
+        .saturating_mul(100)
+        .checked_div(stats_input + stats_cache_read)
+        .unwrap_or(0);
 
     Ok(json!({
         "id": session.session_id,
