@@ -1,4 +1,4 @@
-//! B1：本地只读 Web 视图（单人自用）。
+﻿//! B1：本地只读 Web 视图（单人自用）。
 //!
 //! 只绑定 `127.0.0.1`，所有 API 需要启动时打印的一次性 token。
 //! 端点：
@@ -337,7 +337,7 @@ async fn api_stream(
         Err((code, message)) => return (code, message).into_response(),
     };
     if !path.exists() {
-        return (StatusCode::NOT_FOUND, "session not found").into_response();
+        return (StatusCode::NOT_FOUND, "会话不存在").into_response();
     }
 
     let stream = futures_util::stream::unfold((path, String::new()), |(path, last)| async move {
@@ -455,7 +455,7 @@ async fn api_prompt(
         return unauthorized();
     }
     if body.text.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "prompt text is empty").into_response();
+        return (StatusCode::BAD_REQUEST, "消息内容为空").into_response();
     }
     let path = match session_path(&state.sessions, &id) {
         Ok(path) => path,
@@ -465,7 +465,7 @@ async fn api_prompt(
     if !PERMISSION_MODES.contains(&permission) {
         return (
             StatusCode::BAD_REQUEST,
-            format!("unsupported permission mode: {permission}"),
+            format!("不支持的权限模式：{permission}"),
         )
             .into_response();
     }
@@ -477,7 +477,7 @@ async fn api_prompt(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if running.contains_key(&id) {
-            return (StatusCode::CONFLICT, "session is busy with another turn").into_response();
+            return (StatusCode::CONFLICT, "该会话正在执行另一轮，请稍候").into_response();
         }
         running.insert(
             id.clone(),
@@ -572,7 +572,7 @@ async fn api_interrupt(
         )
             .into_response()
     } else {
-        (StatusCode::CONFLICT, "no running turn for this session").into_response()
+        (StatusCode::CONFLICT, "该会话没有正在执行的任务").into_response()
     }
 }
 
@@ -1117,7 +1117,7 @@ async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>)
             let text = String::from_utf8_lossy(&output.stdout).to_string();
             truncate_middle(&text, 200_000)
         }
-        Ok(output) => format!("git diff 失败: {}", String::from_utf8_lossy(&output.stderr)),
+        Ok(output) => format!("git diff 失败：{}", String::from_utf8_lossy(&output.stderr)),
         Err(error) => format!("无法执行 git: {error}"),
     };
 
@@ -1344,7 +1344,7 @@ fn authorize(state: &AppState, auth: &AuthQuery) -> bool {
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, "invalid or missing token").into_response()
+    (StatusCode::UNAUTHORIZED, "缺少或无效的访问令牌").into_response()
 }
 
 fn list_sessions(dir: &Path) -> Result<Value, String> {
@@ -1437,12 +1437,12 @@ fn session_path(dir: &Path, id: &str) -> Result<PathBuf, (StatusCode, String)> {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
     if !valid {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "无效的会话 ID".to_string()));
     }
     session_files(dir)
         .into_iter()
         .find(|path| path.file_stem().and_then(|stem| stem.to_str()) == Some(id))
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("session {id} not found")))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("会话 {id} 不存在")))
 }
 
 /// 只读会话头部与第一条用户消息，避免为列表完整解析大文件。

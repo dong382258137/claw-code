@@ -188,3 +188,12 @@ details.tool.error { border-left-color: var(--error); }
 .msg.live .msg-body { border-left-color: var(--assistant); }
 .cursor { display: inline-block; width: 7px; height: 14px; background: var(--assistant); vertical-align: text-bottom; animation: blink 1s steps(2, start) infinite; }
 @keyframes blink { to { visibility: hidden; } }
+
+.pane-wrap { display: none; flex: 1; min-height: 0; }
+.pane-wrap.active { display: flex; }
+.skeleton-list { padding: 20px 4px; display: flex; flex-direction: column; gap: 12px; }
+.skeleton { height: 14px; border-radius: 4px; background: linear-gradient(90deg, var(--panel-2), var(--panel-3), var(--panel-2)); background-size: 200% 100%; animation: shimmer 1.2s infinite linear; width: 80%; }
+.skeleton.short { width: 45%; }
+@keyframes shimmer { to { background-position: -200% 0; } }
+.empty-hint { margin-top: 8px; font-size: 11px; color: var(--faint); }
+.jump { position: absolute; right: 20px; bottom: 120px; z-index: 5; border-radius: 999px; padding: 4px 12px; background: var(--panel); box-shadow: 0 6px 18px rgba(0,0,0,.35); }

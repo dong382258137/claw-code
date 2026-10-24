@@ -22,6 +22,7 @@ const QUICK_ACTIONS = [
 function useToasts() {
   const [toasts, setToasts] = useState([])
   const push = useCallback((text, kind = 'info') => {
+    if (!text) return
     const id = `${Date.now()}-${Math.random()}`
     setToasts((list) => [...list, { id, text, kind }])
     setTimeout(() => setToasts((list) => list.filter((toast) => toast.id !== id)), 3600)
@@ -37,6 +38,8 @@ export default function App() {
   const [optimistic, setOptimistic] = useState(null)
   const [running, setRunning] = useState(false)
   const [live, setLive] = useState('')
+  const [liveTools, setLiveTools] = useState([])
+  const [loadingSession, setLoadingSession] = useState(false)
   const [connected, setConnected] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [panelOpen, setPanelOpen] = useState(true)
@@ -78,19 +81,23 @@ export default function App() {
     if (!currentId) return undefined
     let closed = false
     setOptimistic(null)
+    setLive('')
+    setMessages([])
+    setLoadingSession(true)
     api(`/api/session/${encodeURIComponent(currentId)}`)
-      .then((view) => { if (!closed) { setCurrent(view); setMessages(view.messages || []) } })
-      .catch((error) => push(`读取会话失败：${error.message}`, 'error'))
+      .then((view) => { if (!closed) { setCurrent((current) => ({ ...view, title: current?.title || view.id })); setMessages(view.messages || []); setLoadingSession(false) } })
+      .catch((error) => { setLoadingSession(false); push(`读取会话失败：${error.message}`, 'error') })
 
     const source = new EventSource(withToken(`/api/session/${encodeURIComponent(currentId)}/stream`))
     source.addEventListener('snapshot', (event) => {
       if (closed) return
       try {
         const view = JSON.parse(event.data)
-        setCurrent(view)
+        setCurrent((current) => ({ ...view, title: current?.title || view.id }))
         setMessages(view.messages || [])
+        setLoadingSession(false)
         const last = view.messages?.[view.messages.length - 1]
-        if (last && last.role === 'assistant') setLive('')
+        if (last && last.role === 'assistant') { setLive(''); setLiveTools([]) }
         setOptimistic((pending) => {
           if (!pending) return null
           return last && last.role === 'user' ? null : pending
@@ -108,8 +115,18 @@ export default function App() {
         const data = JSON.parse(event.data)
         if (data.kind === 'delta') setLive((previous) => previous + data.text)
         else if (data.kind === 'start') setRunning(true)
+        else if (data.kind === 'tool_use') setLiveTools((list) => [...list, { id: data.id, name: data.name, input: data.input, output: '', done: false, is_error: false }])
+        else if (data.kind === 'tool_result') {
+          setLiveTools((list) => {
+            const index = list.findIndex((tool) => tool.id === data.id)
+            if (index === -1) return [...list, { id: data.id, name: data.name, input: '', output: data.output, done: true, is_error: data.is_error }]
+            const next = list.slice()
+            next[index] = { ...next[index], output: data.output, done: true, is_error: data.is_error }
+            return next
+          })
+        }
         else if (data.kind === 'done') { setRunning(false) }
-        else if (data.kind === 'error') { setLive(''); push(`流式错误：${data.message}`, 'error') }
+        else if (data.kind === 'error') { setLive(''); setLiveTools([]); push(`流式错误：${data.message}`, 'error') }
       } catch (_) {}
     })
     return () => { closed = true; source.close(); events.close() }
@@ -191,6 +208,12 @@ export default function App() {
     document.addEventListener('mouseup', onUp)
   }, [dock, saveSettings, sidebarCollapsed])
 
+  useEffect(() => {
+    const onResize = () => setPanelWidth((width) => clampWidth(width, dock, sidebarCollapsed))
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [dock, sidebarCollapsed])
+
   /* ---------- 快捷键 ---------- */
   useEffect(() => {
     const onKey = (event) => {
@@ -209,13 +232,19 @@ export default function App() {
   }, [settingsOpen, toggleSidebar])
 
   /* ---------- 动作 ---------- */
-  const selectSession = useCallback((id) => setCurrent((view) => ({ ...(view || {}), id })), [])
+  const selectSession = useCallback((session) => {
+    setCurrent({ id: session.id, title: session.title })
+    setMessages([])
+    setLive('')
+    setOptimistic(null)
+  }, [])
 
   const send = useCallback(async (text) => {
-    if (!currentId) { push('先选择一个会话', 'error'); return }
+    if (!currentId) { push('请先在左侧选择一个会话', 'error'); return }
     const trimmed = text.trim()
     if (!trimmed) return
     setLive('')
+    setLiveTools([])
     setOptimistic({ text: trimmed, at: Date.now() })
     setRunning(true)
     try {
@@ -231,7 +260,7 @@ export default function App() {
   }, [currentId, push, webSettings.permission])
 
   const stop = useCallback(async () => {
-    if (!currentId) return
+    if (!currentId || !running) return
     try {
       await api(`/api/session/${encodeURIComponent(currentId)}/interrupt`, { method: 'POST' })
       setRunning(false)
@@ -239,7 +268,7 @@ export default function App() {
     } catch (error) {
       push(`中断失败：${error.message}`, 'error')
     }
-  }, [currentId, push])
+  }, [currentId, push, running])
 
   const runQuickAction = useCallback((action) => {
     if (action === 'settings') setSettingsOpen(true)
@@ -254,7 +283,7 @@ export default function App() {
       currentId={currentId}
       collapsed={sidebarCollapsed}
       onToggle={toggleSidebar}
-      onSelect={(id) => { selectSession(id); setOptimistic(null) }}
+      onSelect={(session) => selectSession(session)}
       onSettings={() => setSettingsOpen(true)}
       onTheme={() => saveSettings({ theme: webSettings.theme === 'dark' ? 'light' : 'dark' })}
       theme={webSettings.theme}
@@ -264,7 +293,7 @@ export default function App() {
   const main = (
     <main>
       <TopBar
-        title={current?.id || '未选择会话'}
+        title={current?.title || current?.id || '未选择会话'}
         chips={[
           current?.model,
           current?.workspace ? basename(current.workspace) : null,
@@ -278,7 +307,7 @@ export default function App() {
         panelOpen={panelOpen}
       />
       {!connected && <div className="banner">连接中断，正在重连…</div>}
-      <Conversation messages={messages} optimistic={optimistic} live={live} />
+      <Conversation messages={messages} optimistic={optimistic} live={live} liveTools={liveTools} loading={loadingSession} />
       <Composer
         running={running}
         onSend={send}
@@ -286,6 +315,8 @@ export default function App() {
         onQuickAction={runQuickAction}
         onError={(message) => push(message, 'error')}
         currentId={currentId}
+        permission={webSettings.permission || 'workspace-write'}
+        onPermission={(value) => saveSettings({ permission: value })}
       />
       {settingsOpen && (
         <SettingsPage
@@ -415,7 +446,7 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
                   <button
                     key={session.id}
                     className={`session ${session.id === currentId ? 'active' : ''}`}
-                    onClick={() => onSelect(session.id)}
+                    onClick={() => onSelect(session)}
                     title={session.workspace || ''}
                   >
                     <span className="title">{session.title || session.id}</span>
@@ -445,43 +476,78 @@ function TopBar({ title, chips, connected, running, onSettings, onTogglePanel, p
   )
 }
 
-function Conversation({ messages, optimistic, live }) {
+function Conversation({ messages, optimistic, live, liveTools, loading }) {
   const ref = useRef(null)
   const stick = useRef(true)
+  const [atBottom, setAtBottom] = useState(true)
   useEffect(() => {
     const node = ref.current
     if (!node) return
     if (stick.current) node.scrollTop = node.scrollHeight
-  }, [messages, optimistic, live])
+  }, [messages, optimistic, live, liveTools])
   const onScroll = () => {
     const node = ref.current
     if (!node) return
-    stick.current = node.scrollHeight - node.scrollTop - node.clientHeight < 48
+    const bottom = node.scrollHeight - node.scrollTop - node.clientHeight < 48
+    stick.current = bottom
+    setAtBottom(bottom)
+  }
+  const jumpToLatest = () => {
+    const node = ref.current
+    if (node) node.scrollTop = node.scrollHeight
+    stick.current = true
+    setAtBottom(true)
   }
   const visible = useMemo(
     () => (messages || []).filter((message) => (message.blocks || []).length > 0),
     [messages],
   )
   return (
-    <div className="messages" ref={ref} onScroll={onScroll}>
-      {visible.length === 0 && !optimistic && !live && <div className="empty">选择一个会话，或直接在下方输入。</div>}
-      {visible.map((message, index) => <Message key={index} message={message} />)}
-      {optimistic && (
-        <div className="msg user optimistic" key="optimistic">
-          <div className="msg-head"><span className="who">user</span><span className="pending">发送中…</span></div>
-          <div className="msg-body"><Markdown text={optimistic.text} /></div>
-        </div>
-      )}
-      {live && (
-        <div className="msg assistant live" key="live">
-          <div className="msg-head"><span className="who">assistant</span><span className="pending">流式输出…</span></div>
-          <div className="msg-body">
-            <Markdown text={live} />
-            <span className="cursor" />
+    <>
+      <div className="messages" ref={ref} onScroll={onScroll}>
+        {loading && visible.length === 0 && (
+          <div className="skeleton-list">
+            <div className="skeleton" /><div className="skeleton short" /><div className="skeleton" />
           </div>
-        </div>
-      )}
-    </div>
+        )}
+        {!loading && visible.length === 0 && !optimistic && !live && (
+          <div className="empty">
+            <div>选择一个会话，或直接在下方输入。</div>
+            <div className="empty-hint">Enter 发送 · Shift+Enter 换行 · / 快捷操作 · @ 引用文件</div>
+          </div>
+        )}
+        {visible.map((message, index) => <Message key={index} message={message} />)}
+        {optimistic && (
+          <div className="msg user optimistic" key="optimistic">
+            <div className="msg-head"><span className="who">你</span><span className="pending">发送中…</span></div>
+            <div className="msg-body"><Markdown text={optimistic.text} /></div>
+          </div>
+        )}
+        {live && (
+          <div className="msg assistant live" key="live">
+            <div className="msg-head"><span className="who">助手</span><span className="pending">流式输出…</span></div>
+            <div className="msg-body">
+              <Markdown text={live} />
+              <span className="cursor" />
+            </div>
+          </div>
+        )}
+        {(liveTools || []).length > 0 && (
+          <div className="msg tool live-tools" key="live-tools">
+            <div className="msg-head"><span className="who">工具</span><span className="pending">执行中…</span></div>
+            <div className="msg-body">
+              {(liveTools || []).map((tool) => (
+                <details className={`tool ${tool.is_error ? 'error' : ''}`} key={tool.id} open={!tool.done || (tool.output || '').length < 600}>
+                  <summary><span className="tool-name">{tool.done ? (tool.is_error ? '✗' : '✓') : '▶'} {tool.name}{tool.done ? '' : '（运行中）'}</span></summary>
+                  <pre>{tool.done ? tool.output : tool.input}</pre>
+                </details>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+      {!atBottom && <button className="jump" onClick={jumpToLatest}>回到最新 ↓</button>}
+    </>
   )
 }
 
@@ -498,7 +564,7 @@ function Message({ message }) {
   return (
     <div className={`msg ${message.role}`}>
       <div className="msg-head">
-        <span className="who">{message.role}</span>
+        <span className="who">{{ user: '你', assistant: '助手', tool: '工具', system: '系统' }[message.role] || message.role}</span>
         {text && <button className="ghost" onClick={copy}>{copied ? '已复制' : '复制'}</button>}
       </div>
       <div className="msg-body">
@@ -536,7 +602,7 @@ function Block({ block }) {
   return <Markdown text={block.text || ''} />
 }
 
-function Composer({ running, onSend, onStop, onQuickAction, onError, currentId }) {
+function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
   const [menu, setMenu] = useState(null)
@@ -638,8 +704,10 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId }
         onKeyDown={onKeyDown}
       />
       <div className="composer-actions">
-        <select value="workspace-write" disabled title="权限模式在设置里调整">
-          <option>workspace-write</option>
+        <select value={permission} onChange={(event) => onPermission(event.target.value)} title="本轮权限模式">
+          <option value="read-only">只读</option>
+          <option value="workspace-write">工作区可写</option>
+          <option value="danger-full-access">完全访问</option>
         </select>
         {running
           ? <button type="button" className="danger" onClick={onStop}>停止</button>
@@ -667,11 +735,12 @@ function Panel({ tab, onTab, onClose, onDock, width, currentId, meta, onError, o
         <button onClick={onClose} title="收起">×</button>
       </div>
       <div className="panel-body">
-        {tab === 'files' && <FilesPane onError={onError} />}
-        {tab === 'diff' && <DiffPane onError={onError} />}
-        {tab === 'tasks' && <TasksPane currentId={currentId} onError={onError} />}
-        {tab === 'attachments' && <AttachmentsPane onError={onError} />}
-        {tab === 'terminal' && <TerminalPane />}
+        {/* 五个面板常驻，切换只隐藏：终端连接、文件浏览状态不会因切标签丢失。 */}
+        <div className={`pane-wrap ${tab === 'files' ? 'active' : ''}`}><FilesPane onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'diff' ? 'active' : ''}`}><DiffPane onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'attachments' ? 'active' : ''}`}><AttachmentsPane onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'terminal' ? 'active' : ''}`}><TerminalPane /></div>
       </div>
     </section>
   )
@@ -719,7 +788,11 @@ function FilesPane({ onError }) {
     return (
       <div className="pane">
         <div className="pane-toolbar">
-          <button onClick={() => setPreview(null)}>‹ 文件</button>
+          <button onClick={() => {
+            if (editing && !window.confirm('有未保存的修改，确定放弃？')) return
+            setEditing(false)
+            setPreview(null)
+          }}>‹ 文件</button>
           <span className="path" title={preview.path}>{preview.path}</span>
           <span className="spacer" />
           {!editing && (preview.kind === 'text' || preview.kind === 'markdown') && <button onClick={() => setEditing(true)}>编辑</button>}
@@ -782,7 +855,9 @@ function DiffPane({ onError }) {
   return (
     <div className="pane">
       <div className="pane-toolbar">
-        <button onClick={load}>刷新</button>
+        {selected
+          ? <button onClick={() => { setSelected(''); load() }}>‹ 列表</button>
+          : <button onClick={load}>刷新</button>}
         <span className="hint">{diff.files.length} 个已修改 · {diff.untracked.length} 个未跟踪</span>
       </div>
       <div className="pane-body scroll">
@@ -794,7 +869,7 @@ function DiffPane({ onError }) {
         ))}
         {diff.untracked.length > 0 && <div className="group">未跟踪</div>}
         {diff.untracked.map((path) => (
-          <button key={path} className="diff-row" onClick={() => openFile(path)}><span>{path}</span><span className="muted">new</span></button>
+          <button key={path} className="diff-row" onClick={() => openFile(path)}><span>{path}</span><span className="muted">新增</span></button>
         ))}
         <pre className="patch">{colorizePatch(diff.patch)}</pre>
         {selected && <div className="hint">当前查看：{selected}</div>}
@@ -835,12 +910,12 @@ function TasksPane({ currentId, onError }) {
   const goalHtml = goal && (goal.text || goal.state) && (
     <div className="goal">
       <b>目标</b> {goal.text}
-      <div className="muted">状态 {goal.state || '—'} · token {goal.tokens_used || 0}{goal.token_budget ? ` / ${goal.token_budget}` : ''} · 阻塞 {goal.blocked_count || 0} 次</div>
+      <div className="muted">状态 {goal.state || '—'} · tokens {goal.tokens_used || 0}{goal.token_budget ? ` / ${goal.token_budget}` : ''} · 阻塞 {goal.blocked_count || 0} 次</div>
     </div>
   )
   return (
     <div className="pane">
-      <div className="pane-toolbar"><button onClick={load}>刷新</button>{data.plan_mode && <span className="chip">Plan 模式</span>}</div>
+      <div className="pane-toolbar"><button onClick={load}>刷新</button>{data.plan_mode && <span className="chip">计划模式</span>}</div>
       <div className="pane-body scroll">
         {goalHtml}
         {plans.length > 0 && <div className="group">计划</div>}
@@ -964,8 +1039,8 @@ function SettingsPage({ settings, meta, onClose, onSave }) {
           <label className="row">
             <span>主题</span>
             <select value={theme} onChange={(event) => setTheme(event.target.value)}>
-              <option value="dark">dark</option>
-              <option value="light">light</option>
+              <option value="dark">深色</option>
+              <option value="light">浅色</option>
             </select>
           </label>
         </div>
@@ -974,11 +1049,12 @@ function SettingsPage({ settings, meta, onClose, onSave }) {
           <label className="row">
             <span>默认权限模式</span>
             <select value={permission} onChange={(event) => setPermission(event.target.value)}>
-              <option value="workspace-write">workspace-write</option>
-              <option value="read-only">read-only</option>
-              <option value="danger-full-access">danger-full-access</option>
+              <option value="read-only">只读（不允许写文件）</option>
+              <option value="workspace-write">工作区可写</option>
+              <option value="danger-full-access">完全访问（危险）</option>
             </select>
           </label>
+          <div className="row"><span className="muted">越权工具在 Web 端默认拒绝，完全访问会直接放行</span></div>
         </div>
         <div className="section">
           <h3>关于</h3>
