@@ -42,6 +42,7 @@ function renderBlocks(text) {
   const out = []
   let index = 0
   let list = []
+  let paragraph = []
 
   const flushList = () => {
     if (list.length) {
@@ -49,13 +50,23 @@ function renderBlocks(text) {
       list = []
     }
   }
+  const flushParagraph = () => {
+    if (paragraph.length) {
+      out.push(`<p>${paragraph.join('<br>')}</p>`)
+      paragraph = []
+    }
+  }
+  const flush = () => {
+    flushList()
+    flushParagraph()
+  }
 
   while (index < lines.length) {
     const line = lines[index]
 
     // 围栏代码块
     if (/^\s*```/.test(line)) {
-      flushList()
+      flush()
       const language = line.replace(/^\s*```/, '').trim()
       const body = []
       index += 1
@@ -74,7 +85,7 @@ function renderBlocks(text) {
 
     // 表格：当前行是 |...| 且下一行是分隔行
     if (isTableRow(line) && index + 1 < lines.length && TABLE_SEPARATOR.test(lines[index + 1])) {
-      flushList()
+      flush()
       const rows = [line]
       index += 2
       while (index < lines.length && isTableRow(lines[index])) {
@@ -86,21 +97,32 @@ function renderBlocks(text) {
     }
 
     if (/^\s*[-*]\s+/.test(line)) {
+      flushParagraph()
       list.push(renderInline(line.replace(/^\s*[-*]\s+/, '')))
       index += 1
       continue
     }
 
-    flushList()
-    if (/^###\s+/.test(line)) out.push(`<h3>${renderInline(line.replace(/^###\s+/, ''))}</h3>`)
-    else if (/^##\s+/.test(line)) out.push(`<h2>${renderInline(line.replace(/^##\s+/, ''))}</h2>`)
-    else if (/^#\s+/.test(line)) out.push(`<h1>${renderInline(line.replace(/^#\s+/, ''))}</h1>`)
-    else if (/^\s*>\s?/.test(line)) out.push(`<blockquote>${renderInline(line.replace(/^\s*>\s?/, ''))}</blockquote>`)
-    else if (line.trim() === '') out.push('\n')
-    else out.push(renderInline(line))
+    if (/^\s*$/.test(line)) {
+      flush()
+      index += 1
+      continue
+    }
+
+    if (/^###\s+/.test(line) || /^##\s+/.test(line) || /^#\s+/.test(line) || /^\s*>\s?/.test(line)) {
+      flush()
+      if (/^###\s+/.test(line)) out.push(`<h3>${renderInline(line.replace(/^###\s+/, ''))}</h3>`)
+      else if (/^##\s+/.test(line)) out.push(`<h2>${renderInline(line.replace(/^##\s+/, ''))}</h2>`)
+      else if (/^#\s+/.test(line)) out.push(`<h1>${renderInline(line.replace(/^#\s+/, ''))}</h1>`)
+      else out.push(`<blockquote>${renderInline(line.replace(/^\s*>\s?/, ''))}</blockquote>`)
+      index += 1
+      continue
+    }
+
+    paragraph.push(renderInline(line))
     index += 1
   }
-  flushList()
+  flush()
   return out.join('\n')
 }
 
