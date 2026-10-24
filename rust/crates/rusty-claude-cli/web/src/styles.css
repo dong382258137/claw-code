@@ -657,3 +657,16 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .panel.fullscreen .pane-body, .panel.fullscreen .pane-toolbar { width: 100%; max-width: 960px; margin-left: auto; margin-right: auto; }
 
 .banner.upgrade { background: rgba(122, 170, 255, 0.12); color: var(--link); }
+
+.projects-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 4px; color: var(--label-3); font-size: 12px; letter-spacing: .04em; }
+.projects-head button { border: 0; background: transparent; color: var(--label-3); cursor: pointer; font-size: 14px; }
+.project { margin: 2px 6px; }
+.project-head { display: flex; align-items: center; gap: 4px; border-radius: 8px; }
+.project-head:hover { background: rgba(255,255,255,.04); }
+.project-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; border: 0; background: transparent; color: var(--label-2); text-align: left; padding: 6px 6px; cursor: pointer; font-size: 13px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.project-count { margin-left: auto; color: var(--label-4); font-size: 11px; }
+.project-new { border: 0; background: transparent; color: var(--label-3); cursor: pointer; padding: 4px 8px; opacity: 0; }
+.project:hover .project-new { opacity: 1; }
+.project.active-workspace > .project-head { background: rgba(122,170,255,.08); }
+.session-row.nested { margin-left: 14px; }
+.session-row.nested .session { padding-left: 10px; }

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, postJson, token, withToken, wsUrl, rawUrl } from './api'
+import { api, postJson, token, withToken, withWorkspace, wsUrl, rawUrl } from './api'
 import { Markdown } from './markdown'
 import { groupTurns, processTitle } from './turns'
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-_]/g
@@ -33,6 +33,7 @@ function useToasts() {
 export default function App() {
   const [sessions, setSessions] = useState([])
   const [sessionTotal, setSessionTotal] = useState(0)
+  const [workspaces, setWorkspaces] = useState([])
   const [filter, setFilter] = useState('')
   const [current, setCurrent] = useState(null)
   const [messages, setMessages] = useState([])
@@ -56,6 +57,7 @@ export default function App() {
   const { toasts, push } = useToasts()
 
   const currentId = current?.id || null
+  const activeWorkspace = current?.workspace || meta.workspace || ''
 
   /* ---------- 初始化：设置 / 元信息 / 会话列表 ---------- */
   useEffect(() => {
@@ -73,20 +75,36 @@ export default function App() {
 
   const loadSessions = useCallback(async () => {
     try {
-      const body = await api('/api/sessions?limit=50&offset=0')
+      const [body, wsBody] = await Promise.all([
+        api('/api/sessions?all=1&limit=200&offset=0'),
+        api('/api/workspaces').catch(() => ({ workspaces: [] })),
+      ])
       setSessions(body.sessions || [])
       setSessionTotal(body.total || 0)
+      setWorkspaces(wsBody.workspaces || [])
     } catch (_) {}
   }, [])
   const loadMoreSessions = useCallback(async () => {
     try {
-      const body = await api(`/api/sessions?limit=50&offset=${sessions.length}`)
+      const body = await api(`/api/sessions?all=1&limit=200&offset=${sessions.length}`)
       setSessions((list) => [...list, ...(body.sessions || []).filter((item) => !list.some((old) => old.id === item.id))])
       setSessionTotal(body.total || 0)
     } catch (error) {
       push(`加载更多失败：${error.message}`, 'error')
     }
   }, [push, sessions.length])
+
+  const addWorkspace = useCallback(async (path) => {
+    const trimmed = String(path || '').trim()
+    if (!trimmed) return
+    try {
+      await postJson('/api/workspaces', { path: trimmed })
+      await loadSessions()
+      push('工作区已添加')
+    } catch (error) {
+      push(`添加工作区失败：${error.message}`, 'error')
+    }
+  }, [loadSessions, push])
   useEffect(() => {
     loadSessions()
     const timer = setInterval(loadSessions, 10000)
@@ -280,17 +298,22 @@ export default function App() {
 
   /* ---------- 动作 ---------- */
   const selectSession = useCallback((session) => {
-    setCurrent({ id: session.id, title: session.title, modified: session.modified })
+    setCurrent({ id: session.id, title: session.title, modified: session.modified, workspace: session.workspace })
     setMessages([])
     setLive('')
     setOptimistic(null)
     setApprovals([])
   }, [])
 
-  const createSession = useCallback(async () => {
+  const createSession = useCallback(async (workspace) => {
     try {
-      const created = await postJson('/api/sessions', {})
-      const session = { id: created.id, title: created.title || '新会话', modified: Math.floor(Date.now() / 1000) }
+      const created = await postJson('/api/sessions', { workspace: workspace || activeWorkspace || undefined })
+      const session = {
+        id: created.id,
+        title: created.title || '新会话',
+        modified: Math.floor(Date.now() / 1000),
+        workspace: created.workspace || workspace || activeWorkspace,
+      }
       setSessions((list) => [session, ...list.filter((item) => item.id !== session.id)])
       selectSession(session)
       setTimeout(() => document.querySelector('.composer textarea')?.focus(), 80)
@@ -298,7 +321,7 @@ export default function App() {
     } catch (error) {
       push(`新建会话失败：${error.message}`, 'error')
     }
-  }, [push, selectSession])
+  }, [activeWorkspace, push, selectSession])
 
   const renameSession = useCallback(async (session) => {
     const title = window.prompt('重命名会话', session.title || session.id)
@@ -394,6 +417,10 @@ export default function App() {
       onToggle={toggleSidebar}
       onSelect={(session) => selectSession(session)}
       onNew={createSession}
+      onNewIn={(workspace) => createSession(workspace)}
+      onAddWorkspace={addWorkspace}
+      workspaces={workspaces}
+      activeWorkspace={activeWorkspace}
       onRename={renameSession}
       onDelete={deleteSession}
       total={sessionTotal}
@@ -437,6 +464,7 @@ export default function App() {
         onPermission={(value) => saveSettings({ permission: value })}
         model={webSettings.model || ''}
         onModel={(value) => saveSettings({ model: value })}
+        workspace={activeWorkspace}
       />
       {settingsOpen && (
         <SettingsPage
@@ -457,6 +485,7 @@ export default function App() {
       onDock={switchDock}
       width={panelWidth}
       currentId={currentId}
+      workspace={activeWorkspace}
       meta={meta}
       onError={(message) => push(message, 'error')}
       onToast={push}
@@ -549,22 +578,39 @@ function Toasts({ toasts }) {
   )
 }
 
-function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onRename, onDelete, total, onLoadMore, onSettings, onTheme, theme }) {
-  const grouped = useMemo(() => {
-    const query = filter.trim().toLowerCase()
-    const filtered = sessions.filter((session) =>
-      !query ||
-      (session.title || '').toLowerCase().includes(query) ||
-      session.id.toLowerCase().includes(query) ||
-      (session.workspace || '').toLowerCase().includes(query))
-    const map = new Map()
-    for (const session of filtered) {
-      const key = basename(session.workspace) || '未知工作区'
-      if (!map.has(key)) map.set(key, [])
-      map.get(key).push(session)
+function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onNewIn, onAddWorkspace, workspaces, activeWorkspace, onRename, onDelete, total, onLoadMore, onSettings, onTheme, theme }) {
+  const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
+  const query = filter.trim().toLowerCase()
+  const filtered = sessions.filter((session) =>
+    !query ||
+    (session.title || '').toLowerCase().includes(query) ||
+    session.id.toLowerCase().includes(query) ||
+    (session.workspace || '').toLowerCase().includes(query))
+
+  const projects = useMemo(() => {
+    const order = []
+    for (const item of workspaces) {
+      if (item.path && !order.includes(item.path)) order.push(item.path)
     }
-    return [...map.entries()]
-  }, [sessions, filter])
+    for (const session of sessions) {
+      if (session.workspace && !order.includes(session.workspace)) order.push(session.workspace)
+    }
+    return order.map((path) => ({
+      path,
+      label: basename(path) || path,
+      sessions: filtered.filter((session) => session.workspace === path),
+      count: sessions.filter((session) => session.workspace === path).length,
+    })).filter((project) => !query || project.sessions.length > 0)
+  }, [workspaces, sessions, filtered, query])
+
+  const toggleGroup = (path) => {
+    setCollapsedGroups((current) => {
+      const next = new Set(current)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  }
 
   return (
     <aside className={collapsed ? 'collapsed' : ''}>
@@ -572,7 +618,7 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
         <span><b>CLAW</b></span>
         {!collapsed && (
           <div className="brand-actions">
-            <button onClick={onNew} title="新建会话">＋</button>
+            <button onClick={() => onNew(activeWorkspace)} title="在当前工作区新建任务">＋</button>
             <button onClick={onTheme} title="切换主题">{theme === 'dark' ? '◐' : '◑'}</button>
             <button onClick={onSettings} title="设置">⚙</button>
             <button onClick={onToggle} title="收起侧栏 (Ctrl+B)">‹</button>
@@ -581,7 +627,7 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
       </div>
       {collapsed && (
         <div className="rail">
-          <button onClick={onNew} title="新建会话">＋</button>
+          <button onClick={() => onNew(activeWorkspace)} title="新建任务">＋</button>
           <button onClick={onToggle} title="展开侧栏 (Ctrl+B)">☰</button>
           <button onClick={onSettings} title="设置">⚙</button>
           <button onClick={onTheme} title="切换主题">◐</button>
@@ -589,33 +635,53 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
       )}
       {!collapsed && (
         <>
+          <button className="new-session" onClick={() => onNew(activeWorkspace)}>＋ 新建任务</button>
           <div className="search">
             <input id="session-search" value={filter} onChange={(event) => onFilter(event.target.value)} placeholder="搜索会话 / Ctrl+K" />
           </div>
-          <button className="new-session" onClick={onNew}>＋ 新建会话</button>
+          <div className="projects-head">
+            <span>项目</span>
+            <button
+              title="添加工作区目录"
+              onClick={() => {
+                const path = window.prompt('工作区目录（绝对路径）')
+                if (path) onAddWorkspace(path)
+              }}
+            >＋</button>
+          </div>
           <div className="session-list">
-            {grouped.length === 0 && <div className="empty">没有匹配的会话</div>}
-            {grouped.map(([workspace, items]) => (
-              <React.Fragment key={workspace}>
-                <div className="group">{workspace} · {items.length}</div>
-                {items.map((session) => (
-                  <div key={session.id} className={`session-row ${session.id === currentId ? 'active' : ''}`}>
-                    <button
-                      className="session"
-                      onClick={() => onSelect(session)}
-                      title={session.workspace || ''}
-                    >
-                      <span className="title">{session.title || session.id}</span>
-                      <span className="meta">{relTime(session.modified)}</span>
+            {projects.length === 0 && <div className="empty">没有匹配的会话</div>}
+            {projects.map((project) => {
+              const isCollapsed = collapsedGroups.has(project.path)
+              const active = project.path === activeWorkspace
+              return (
+                <div className={`project ${active ? 'active-workspace' : ''}`} key={project.path}>
+                  <div className="project-head" title={project.path}>
+                    <button className="project-toggle" onClick={() => toggleGroup(project.path)}>
+                      {isCollapsed ? '▸' : '▾'} 📁 {project.label}
+                      <span className="project-count">{project.count}</span>
                     </button>
-                    <span className="session-actions">
-                      <button title="重命名" onClick={(event) => { event.stopPropagation(); onRename(session) }}>✎</button>
-                      <button title="删除" onClick={(event) => { event.stopPropagation(); onDelete(session) }}>×</button>
-                    </span>
+                    <button
+                      className="project-new"
+                      title={`在 ${project.label} 新建任务`}
+                      onClick={() => onNewIn(project.path)}
+                    >＋</button>
                   </div>
-                ))}
-              </React.Fragment>
-            ))}
+                  {!isCollapsed && project.sessions.map((session) => (
+                    <div key={session.id} className={`session-row nested ${session.id === currentId ? 'active' : ''}`}>
+                      <button className="session" onClick={() => onSelect(session)} title={session.workspace || ''}>
+                        <span className="title">{session.title || session.id}</span>
+                        <span className="meta">{relTime(session.modified)}</span>
+                      </button>
+                      <span className="session-actions">
+                        <button title="重命名" onClick={(event) => { event.stopPropagation(); onRename(session) }}>✎</button>
+                        <button title="删除" onClick={(event) => { event.stopPropagation(); onDelete(session) }}>×</button>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )
+            })}
             {total > sessions.length && (
               <div className="session-more">
                 <button onClick={onLoadMore}>加载更多（{sessions.length}/{total}）</button>
@@ -824,7 +890,7 @@ function LiveTurn({ thinking, tools, text }) {
   )
 }
 
-function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel }) {
+function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
   const [menu, setMenu] = useState(null)
@@ -910,7 +976,7 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
     if (!file) return
     setUploading(true)
     try {
-      const response = await fetch(withToken('/api/upload?name=' + encodeURIComponent(file.name)), { method: 'POST', body: file })
+      const response = await fetch(withToken(withWorkspace('/api/upload?name=' + encodeURIComponent(file.name), workspace)), { method: 'POST', body: file })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const body = await response.json()
       setAttachments((items) => [...items, { name: file.name, path: body.path, size: file.size }])
@@ -1012,7 +1078,7 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
 
 /* ---------------- 右侧面板 ---------------- */
 
-function Panel({ tab, onTab, onClose, onDock, width, currentId, meta, onError, onToast }) {
+function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace, meta, onError, onToast }) {
   // 终端只在第一次打开时挂载，之后保持连接；避免每次加载页面都起一个 PTY。
   const [terminalMounted, setTerminalMounted] = useState(tab === 'terminal')
   const [fullscreen, setFullscreen] = useState(false)
@@ -1036,17 +1102,17 @@ function Panel({ tab, onTab, onClose, onDock, width, currentId, meta, onError, o
       </div>
       <div className="panel-body">
         {/* 五个面板常驻，切换只隐藏：终端连接、文件浏览状态不会因切标签丢失。 */}
-        <div className={`pane-wrap ${tab === 'files' ? 'active' : ''}`}><FilesPane onError={onError} /></div>
-        <div className={`pane-wrap ${tab === 'diff' ? 'active' : ''}`}><DiffPane onError={onError} /></div>
-        <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} onError={onError} /></div>
-        <div className={`pane-wrap ${tab === 'attachments' ? 'active' : ''}`}><AttachmentsPane onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'files' ? 'active' : ''}`}><FilesPane workspace={workspace} onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'diff' ? 'active' : ''}`}><DiffPane workspace={workspace} onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} workspace={workspace} onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'attachments' ? 'active' : ''}`}><AttachmentsPane workspace={workspace} onError={onError} /></div>
         <div className={`pane-wrap ${tab === 'terminal' ? 'active' : ''}`}>{terminalMounted && <TerminalPane />}</div>
       </div>
     </section>
   )
 }
 
-function FilesPane({ onError }) {
+function FilesPane({ workspace, onError }) {
   const [files, setFiles] = useState([])
   const [filter, setFilter] = useState('')
   const [preview, setPreview] = useState(null)
@@ -1056,26 +1122,26 @@ function FilesPane({ onError }) {
 
   const load = useCallback(() => {
     setLoading(true)
-    api('/api/workspace/files').then((body) => setFiles(body.files || [])).catch((error) => onError?.(`文件列表失败：${error.message}`)).finally(() => setLoading(false))
-  }, [onError])
+    api(withWorkspace('/api/workspace/files', workspace)).then((body) => setFiles(body.files || [])).catch((error) => onError?.(`文件列表失败：${error.message}`)).finally(() => setLoading(false))
+  }, [onError, workspace])
 
   useEffect(() => { load() }, [load])
 
   const open = useCallback(async (path) => {
     try {
-      const file = await api(`/api/workspace/file?path=${encodeURIComponent(path)}`)
+      const file = await api(withWorkspace(`/api/workspace/file?path=${encodeURIComponent(path)}`, workspace))
       setPreview(file)
       setEditing(false)
       setDraft(file.content || '')
     } catch (error) {
       onError?.(`预览失败：${error.message}`)
     }
-  }, [onError])
+  }, [onError, workspace])
 
   const save = async () => {
     if (!preview) return
     try {
-      const result = await postJson('/api/workspace/file', { path: preview.path, content: draft, expected_mtime_ms: preview.mtime_ms || null })
+      const result = await postJson('/api/workspace/file', { path: preview.path, content: draft, expected_mtime_ms: preview.mtime_ms || null, workspace: workspace || undefined })
       setPreview({ ...preview, content: draft, mtime_ms: result.mtime_ms })
       setEditing(false)
       onError?.(null)
@@ -1103,9 +1169,9 @@ function FilesPane({ onError }) {
           {editing
             ? <textarea className="editor" value={draft} onChange={(event) => setDraft(event.target.value)} />
             : preview.kind === 'image'
-              ? <img className="preview-image" src={rawUrl(preview.path)} alt={preview.path} />
+              ? <img className="preview-image" src={rawUrl(preview.path, workspace)} alt={preview.path} />
               : preview.kind === 'pdf'
-                ? <iframe className="preview-frame" src={rawUrl(preview.path)} title={preview.path} />
+                ? <iframe className="preview-frame" src={rawUrl(preview.path, workspace)} title={preview.path} />
                 : preview.kind === 'binary'
                   ? <div className="empty">二进制文件（{Math.max(1, Math.round((preview.size || 0) / 1024))} KB）</div>
                   : preview.kind === 'markdown'
@@ -1136,16 +1202,16 @@ function FilesPane({ onError }) {
   )
 }
 
-function DiffPane({ onError }) {
+function DiffPane({ workspace, onError }) {
   const [diff, setDiff] = useState({ files: [], untracked: [], patch: '' })
   const [selected, setSelected] = useState('')
   const load = useCallback(() => {
-    api('/api/workspace/diff').then(setDiff).catch((error) => onError?.(`diff 失败：${error.message}`))
-  }, [onError])
+    api(withWorkspace('/api/workspace/diff', workspace)).then(setDiff).catch((error) => onError?.(`diff 失败：${error.message}`))
+  }, [onError, workspace])
   useEffect(() => { load() }, [load])
   const openFile = async (path) => {
     try {
-      const single = await api(`/api/workspace/diff?path=${encodeURIComponent(path)}`)
+      const single = await api(withWorkspace(`/api/workspace/diff?path=${encodeURIComponent(path)}`, workspace))
       setSelected(path)
       setDiff((current) => ({ ...current, patch: single.patch || '' }))
     } catch (error) {
@@ -1189,7 +1255,7 @@ function colorizePatch(patch) {
   })
 }
 
-function TasksPane({ currentId, onError }) {
+function TasksPane({ currentId, workspace, onError }) {
   const [data, setData] = useState({ todos: [], tasks: [], crons: [], plan_mode: null })
   const [goal, setGoal] = useState(null)
   const [plans, setPlans] = useState([])
@@ -1200,8 +1266,8 @@ function TasksPane({ currentId, onError }) {
     if (!currentId) return
     Promise.all([
       api(`/api/session/${encodeURIComponent(currentId)}/tasks`).catch(() => ({ todos: [], tasks: [], crons: [] })),
-      api('/api/workspace/goal').catch(() => ({ goal: null })),
-      api('/api/workspace/plans').catch(() => ({ plans: [] })),
+      api(withWorkspace('/api/workspace/goal', workspace)).catch(() => ({ goal: null })),
+      api(withWorkspace('/api/workspace/plans', workspace)).catch(() => ({ plans: [] })),
       api(`/api/session/${encodeURIComponent(currentId)}/todos`).catch(() => ({ items: [] })),
     ]).then(([tasks, goalBody, planBody, todoBody]) => {
       setData(tasks)
@@ -1209,7 +1275,7 @@ function TasksPane({ currentId, onError }) {
       setPlans(planBody.plans || [])
       setWebTodos(todoBody.items || [])
     }).catch((error) => onError?.(`任务加载失败：${error.message}`))
-  }, [currentId, onError])
+  }, [currentId, onError, workspace])
   useEffect(() => { load() }, [load])
 
   const saveTodos = useCallback(async (items) => {
@@ -1312,34 +1378,34 @@ function TasksPane({ currentId, onError }) {
   )
 }
 
-function AttachmentsPane({ onError }) {
+function AttachmentsPane({ workspace, onError }) {
   const [data, setData] = useState({ items: [], pastes: [], uploads: [] })
   const [preview, setPreview] = useState(null)
   const [uploading, setUploading] = useState(false)
   const inputRef = useRef(null)
   const load = useCallback(() => {
-    api('/api/attachments').then(setData).catch((error) => onError?.(`附件加载失败：${error.message}`))
-  }, [onError])
+    api(withWorkspace('/api/attachments', workspace)).then(setData).catch((error) => onError?.(`附件加载失败：${error.message}`))
+  }, [onError, workspace])
   useEffect(() => { load() }, [load])
 
   const openPaste = useCallback(async (path) => {
     try {
-      const file = await api(`/api/workspace/file?path=${encodeURIComponent(path)}`)
+      const file = await api(withWorkspace(`/api/workspace/file?path=${encodeURIComponent(path)}`, workspace))
       setPreview({ kind: 'text', path, content: file.content || '' })
     } catch (error) {
       onError?.(`读取粘贴内容失败：${error.message}`)
     }
-  }, [onError])
+  }, [onError, workspace])
 
   const upload = useCallback(async (files) => {
     const file = files?.[0]
     if (!file) return
     setUploading(true)
     try {
-      const response = await fetch(withToken('/api/upload?name=' + encodeURIComponent(file.name)), {
-        method: 'POST',
-        body: file,
-      })
+      const response = await fetch(
+        withToken(withWorkspace('/api/upload?name=' + encodeURIComponent(file.name), workspace)),
+        { method: 'POST', body: file },
+      )
       if (!response.ok) throw new Error(`HTTP ${response.status} ${await response.text()}`)
       const body = await response.json()
       load()
@@ -1362,7 +1428,7 @@ function AttachmentsPane({ onError }) {
         </div>
         <div className="pane-body">
           {preview.kind === 'image'
-            ? <img className="preview-image" src={rawUrl(preview.path)} alt={preview.path} />
+            ? <img className="preview-image" src={rawUrl(preview.path, workspace)} alt={preview.path} />
             : <pre className="file-text">{preview.content}</pre>}
         </div>
       </div>

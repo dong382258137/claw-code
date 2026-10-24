@@ -50,6 +50,8 @@ struct AppState {
     events: tokio::sync::broadcast::Sender<Value>,
     /// 等待用户在 Web 端批准的越权工具调用（id → 会话 + 应答通道）。
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+    /// 多工作区下串行切换进程 cwd（LiveCli 以 cwd 作为工作区根）。
+    turn_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -125,10 +127,132 @@ fn prompt_with_web_todos(workspace: &Path, id: &str, text: &str) -> String {
     )
 }
 
+/// 已登记工作区注册表：`~/.claw/web-workspaces.json`（数组 of path）。
+fn workspaces_registry_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".claw").join("web-workspaces.json"))
+}
+
+fn load_workspaces() -> Vec<PathBuf> {
+    let Some(path) = workspaces_registry_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(raw) = item.as_str() else {
+            continue;
+        };
+        let path = PathBuf::from(raw);
+        if path.is_dir() && !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn save_workspaces(list: &[PathBuf]) {
+    let Some(path) = workspaces_registry_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let value = Value::Array(
+        list.iter()
+            .map(|item| Value::String(item.display().to_string()))
+            .collect(),
+    );
+    let _ = atomic_write(&path, &value.to_string());
+}
+
+fn register_workspace(path: &Path) {
+    let mut list = load_workspaces();
+    if list.iter().any(|item| item == path) {
+        return;
+    }
+    list.push(path.to_path_buf());
+    save_workspaces(&list);
+}
+
+/// 解析请求里的 workspace 参数：缺省=当前默认工作区；显式路径必须存在，并自动登记。
+fn resolve_workspace(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let Some(raw) = requested.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(state.workspace.clone());
+    };
+    let canonical = std::fs::canonicalize(raw)
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("工作区不存在：{raw}")))?;
+    let path = strip_verbatim(canonical);
+    if !path.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "工作区不是目录".to_string()));
+    }
+    register_workspace(&path);
+    Ok(path)
+}
+
+fn session_roots(state: &AppState) -> Vec<PathBuf> {
+    let mut roots = vec![state.workspace.clone()];
+    for root in load_workspaces() {
+        if root != state.workspace && !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+fn validate_session_id(id: &str) -> Result<(), (StatusCode, String)> {
+    let valid = !id.is_empty()
+        && !id.contains("..")
+        && !id.contains('/')
+        && !id.contains('\\')
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+    if valid {
+        Ok(())
+    } else {
+        Err((StatusCode::BAD_REQUEST, "无效的会话 ID".to_string()))
+    }
+}
+
+fn find_session_file(dir: &Path, id: &str) -> Option<PathBuf> {
+    session_files(dir)
+        .into_iter()
+        .find(|path| path.file_stem().and_then(|stem| stem.to_str()) == Some(id))
+}
+
+/// 跨工作区定位会话：先当前工作区，再已登记工作区。返回 (会话文件, 工作区根)。
+fn resolve_session(state: &AppState, id: &str) -> Result<(PathBuf, PathBuf), (StatusCode, String)> {
+    validate_session_id(id)?;
+    for root in session_roots(state) {
+        let Ok(store) = runtime::SessionStore::from_cwd(&root) else {
+            continue;
+        };
+        if let Some(path) = find_session_file(store.sessions_dir(), id) {
+            return Ok((path, root));
+        }
+    }
+    Err((StatusCode::NOT_FOUND, format!("会话 {id} 不存在")))
+}
+
+/// `.claw/sessions/<fp>/file.jsonl` → `<workspace>`。
+fn workspace_of_session_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors().nth(3).map(Path::to_path_buf)
+}
+
 #[derive(Deserialize)]
 struct PathQuery {
     t: Option<String>,
     path: Option<String>,
+    /// 非默认工作区时指定（多工作区文件/预览/diff）。
+    workspace: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +273,8 @@ struct WriteBody {
     content: String,
     /// 读取时的 mtime（毫秒）；不匹配说明文件在编辑期间被改动。
     expected_mtime_ms: Option<u64>,
+    /// 非默认工作区时指定。
+    workspace: Option<String>,
 }
 
 const IGNORED_DIRS: [&str; 7] = [
@@ -214,6 +340,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // serve 进程内跑 turn 时，LiveCli 以进程 cwd 作为工作区；因此把 cwd 对齐到
     // `--cwd`（同时让 `.env` 从工作区加载）。serve 是单工作区进程，这样是安全的。
     let _ = std::env::set_current_dir(&cwd);
+    // 默认工作区自动登记，侧栏才能把它的会话与其它工作区一起展示。
+    register_workspace(&cwd);
     let store = runtime::SessionStore::from_cwd(&cwd)?;
     let sessions = store.sessions_dir().to_path_buf();
     // 热升级交接：helper 通过 CLAW_WEB_TOKEN 传入旧 token，新进程复用它，
@@ -272,6 +400,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             running: Arc::new(Mutex::new(HashMap::new())),
             events,
             approvals: Arc::new(Mutex::new(HashMap::new())),
+            turn_lock: Arc::new(Mutex::new(())),
         };
         let app = Router::new()
             .route("/", get(index))
@@ -293,6 +422,10 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/workspace/goal", get(api_goal))
             .route("/api/workspace/plans", get(api_plans))
             .route("/api/attachments", get(api_attachments))
+            .route(
+                "/api/workspaces",
+                get(api_workspaces).post(api_workspace_add),
+            )
             .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
             .route("/ws/terminal", get(ws_terminal))
@@ -407,6 +540,25 @@ struct SessionsQuery {
     t: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+    /// 聚合所有已登记工作区的会话（侧栏多工作区视图）。接受 `1`/`true`。
+    all: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateSessionBody {
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceQuery {
+    t: Option<String>,
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceAddBody {
+    path: String,
 }
 
 async fn api_sessions(
@@ -418,7 +570,39 @@ async fn api_sessions(
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = query.offset.unwrap_or(0);
-    match list_sessions(&state.sessions, &state.workspace, offset, limit) {
+
+    if matches!(query.all.as_deref(), Some("1" | "true")) {
+        let mut sessions: Vec<Value> = Vec::new();
+        for root in session_roots(&state) {
+            let Ok(store) = runtime::SessionStore::from_cwd(&root) else {
+                continue;
+            };
+            if let Ok(Value::Object(map)) = list_sessions(store.sessions_dir(), &root, 0, 50) {
+                if let Some(items) = map.get("sessions").and_then(Value::as_array) {
+                    sessions.extend(items.iter().cloned());
+                }
+            }
+        }
+        sessions.sort_by_key(|item| std::cmp::Reverse(item["modified"].as_u64().unwrap_or(0)));
+        let total = sessions.len();
+        let page: Vec<Value> = sessions.into_iter().skip(offset).take(limit).collect();
+        return Json(json!({
+            "sessions": page,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }))
+        .into_response();
+    }
+
+    let workspace = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let Ok(store) = runtime::SessionStore::from_cwd(&workspace) else {
+        return (StatusCode::BAD_REQUEST, "无法读取该工作区的会话目录").into_response();
+    };
+    match list_sessions(store.sessions_dir(), &workspace, offset, limit) {
         Ok(value) => Json(value).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     }
@@ -438,15 +622,16 @@ async fn api_session_rename(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    if let Err((code, message)) = session_path(&state.sessions, &id) {
-        return (code, message).into_response();
-    }
+    let (_path, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
     let title = body.title.trim();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "标题不能为空").into_response();
     }
     let title = truncate_chars(title, 120);
-    match save_session_title(&state.workspace, &id, &title) {
+    match save_session_title(&workspace, &id, &title) {
         Ok(()) => Json(json!({ "id": id, "title": title })).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     }
@@ -460,8 +645,8 @@ async fn api_session_delete(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let path = match session_path(&state.sessions, &id) {
-        Ok(path) => path,
+    let (path, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
         Err((code, message)) => return (code, message).into_response(),
     };
     {
@@ -476,8 +661,8 @@ async fn api_session_delete(
     if let Err(error) = std::fs::remove_file(&path) {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
-    remove_session_title(&state.workspace, &id);
-    let _ = std::fs::remove_file(web_todos_path(&state.workspace, &id));
+    remove_session_title(&workspace, &id);
+    let _ = std::fs::remove_file(web_todos_path(&workspace, &id));
     Json(json!({ "deleted": id })).into_response()
 }
 
@@ -489,8 +674,8 @@ async fn api_session(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let path = match session_path(&state.sessions, &id) {
-        Ok(path) => path,
+    let path = match resolve_session(&state, &id) {
+        Ok((path, _workspace)) => path,
         Err((code, message)) => return (code, message).into_response(),
     };
     match session_view(&path) {
@@ -511,8 +696,8 @@ async fn api_stream(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let path = match session_path(&state.sessions, &id) {
-        Ok(path) => path,
+    let path = match resolve_session(&state, &id) {
+        Ok((path, _workspace)) => path,
         Err((code, message)) => return (code, message).into_response(),
     };
     if !path.exists() {
@@ -614,6 +799,8 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
 /// 一次 Web turn 的输入。
 struct WebTurn<'a> {
     session_path: &'a Path,
+    workspace: PathBuf,
+    lock: Arc<Mutex<()>>,
     text: &'a str,
     mode: runtime::PermissionMode,
     model_override: Option<String>,
@@ -627,6 +814,8 @@ struct WebTurn<'a> {
 fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
     let WebTurn {
         session_path,
+        workspace,
+        lock,
         text,
         mode,
         model_override,
@@ -635,6 +824,17 @@ fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
         approvals,
         session_id,
     } = turn;
+    // LiveCli 以进程 cwd 作为工作区根，而 serve 可能服务多个工作区；
+    // 用全局锁串行切换 cwd，turn 结束后不恢复（其他 API 都用绝对路径）。
+    let _turn_guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Err(error) = std::env::set_current_dir(&workspace) {
+        return Err(format!(
+            "切换工作区失败（{}）：{error}",
+            workspace.display()
+        ));
+    }
     let model = model_override
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| {
@@ -706,8 +906,8 @@ async fn api_prompt(
     if body.text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "消息内容为空").into_response();
     }
-    let path = match session_path(&state.sessions, &id) {
-        Ok(path) => path,
+    let (path, session_workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
         Err((code, message)) => return (code, message).into_response(),
     };
     let permission = body.permission.as_deref().unwrap_or("workspace-write");
@@ -741,15 +941,18 @@ async fn api_prompt(
     let approvals = Arc::clone(&state.approvals);
     let running_map = Arc::clone(&state.running);
     let session_id = id.clone();
-    let workspace = state.workspace.clone();
+    let workspace = session_workspace.clone();
+    let lock = Arc::clone(&state.turn_lock);
     let port = state.port;
     let token = state.token.clone();
-    let text = prompt_with_web_todos(&state.workspace, &id, &body.text);
+    let text = prompt_with_web_todos(&session_workspace, &id, &body.text);
     let mode = crate::permission_mode_from_label(permission);
     let model = body.model.clone();
     std::thread::spawn(move || {
         let outcome = run_web_turn(WebTurn {
             session_path: &path,
+            workspace: workspace.clone(),
+            lock,
             text: &text,
             mode,
             model_override: model,
@@ -1090,10 +1293,14 @@ async fn api_files(State(state): State<AppState>, Query(query): Query<PathQuery>
     if !authorize_path(&state, &query) {
         return unauthorized();
     }
+    let root = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
     let mut files = Vec::new();
-    collect_workspace_entries(&state.workspace, &state.workspace, 0, &mut files);
+    collect_workspace_entries(&root, &root, 0, &mut files);
     Json(json!({
-        "root": state.workspace.display().to_string(),
+        "root": root.display().to_string(),
         "files": files,
     }))
     .into_response()
@@ -1140,7 +1347,11 @@ async fn api_file(State(state): State<AppState>, Query(query): Query<PathQuery>)
     let Some(rel) = query.path.as_deref() else {
         return (StatusCode::BAD_REQUEST, "缺少 path").into_response();
     };
-    let path = match resolve_in_workspace(&state.workspace, rel) {
+    let root = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let path = match resolve_in_workspace(&root, rel) {
         Ok(path) => path,
         Err((code, message)) => return (code, message).into_response(),
     };
@@ -1208,10 +1419,22 @@ async fn api_file(State(state): State<AppState>, Query(query): Query<PathQuery>)
 async fn api_create_session(
     State(state): State<AppState>,
     Query(auth): Query<AuthQuery>,
+    body: Option<Json<CreateSessionBody>>,
 ) -> Response {
     if !authorize(&state, &auth) {
         return unauthorized();
     }
+    let requested = body
+        .as_ref()
+        .and_then(|Json(body)| body.workspace.as_deref());
+    let workspace = match resolve_workspace(&state, requested) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let Ok(store) = runtime::SessionStore::from_cwd(&workspace) else {
+        return (StatusCode::BAD_REQUEST, "无法读取该工作区的会话目录").into_response();
+    };
+    let sessions_dir = store.sessions_dir().to_path_buf();
     let now = now_ms();
     let model =
         crate::config_model_for_current_dir().unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
@@ -1222,13 +1445,13 @@ async fn api_create_session(
         } else {
             format!("session-{now}-{attempt}")
         };
-        let path = state.sessions.join(format!("{id}.jsonl"));
+        let path = sessions_dir.join(format!("{id}.jsonl"));
         if !path.exists() || attempt >= 100 {
             break (id, path);
         }
         attempt += 1;
     };
-    if let Err(error) = std::fs::create_dir_all(&state.sessions) {
+    if let Err(error) = std::fs::create_dir_all(&sessions_dir) {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
     let meta = json!({
@@ -1238,14 +1461,14 @@ async fn api_create_session(
         "model": model,
         "created_at_ms": now,
         "updated_at_ms": now,
-        "workspace_root": state.workspace.display().to_string(),
+        "workspace_root": workspace.display().to_string(),
     });
     match std::fs::write(&path, format!("{meta}\n")) {
         Ok(()) => Json(json!({
             "id": id,
             "title": "新会话",
             "created_at_ms": now,
-            "workspace": state.workspace.display().to_string(),
+            "workspace": workspace.display().to_string(),
         }))
         .into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
@@ -1287,7 +1510,14 @@ async fn api_file_write(
     if !authorize_path(&state, &query) {
         return unauthorized();
     }
-    let path = match resolve_in_workspace(&state.workspace, &body.path) {
+    let root = match resolve_workspace(
+        &state,
+        body.workspace.as_deref().or(query.workspace.as_deref()),
+    ) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let path = match resolve_in_workspace(&root, &body.path) {
         Ok(path) => path,
         Err((code, message)) => return (code, message).into_response(),
     };
@@ -1331,7 +1561,11 @@ async fn api_plans(State(state): State<AppState>, Query(query): Query<PathQuery>
     if !authorize_path(&state, &query) {
         return unauthorized();
     }
-    let dir = state.workspace.join(".claw").join("plans");
+    let root = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let dir = root.join(".claw").join("plans");
     let mut plans = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -1358,6 +1592,59 @@ async fn api_plans(State(state): State<AppState>, Query(query): Query<PathQuery>
 }
 
 /// 附件：工作区图片 + `.claw/paste-cache` 里的粘贴文本，供预览面板列取。
+fn workspace_item(root: &Path) -> Value {
+    let (count, modified) = runtime::SessionStore::from_cwd(root)
+        .ok()
+        .map(|store| {
+            let files = session_files(store.sessions_dir());
+            let modified = files
+                .iter()
+                .filter_map(|path| modified_ms(path))
+                .max()
+                .unwrap_or(0);
+            (files.len(), modified)
+        })
+        .unwrap_or((0, 0));
+    json!({
+        "path": root.display().to_string(),
+        "name": root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| root.display().to_string()),
+        "session_count": count,
+        "modified_ms": modified,
+        "exists": root.is_dir(),
+    })
+}
+
+/// 已登记工作区列表（侧栏“项目”分组）。
+async fn api_workspaces(State(state): State<AppState>, Query(auth): Query<AuthQuery>) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let items: Vec<Value> = session_roots(&state)
+        .iter()
+        .map(|root| workspace_item(root))
+        .collect();
+    Json(json!({ "workspaces": items })).into_response()
+}
+
+/// 手动添加工作区（目录路径）。
+async fn api_workspace_add(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<WorkspaceAddBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    match resolve_workspace(&state, Some(&body.path)) {
+        Ok(root) => Json(json!({ "workspace": workspace_item(&root) })).into_response(),
+        Err((code, message)) => (code, message).into_response(),
+    }
+}
+
 async fn api_attachments(
     State(state): State<AppState>,
     Query(query): Query<PathQuery>,
@@ -1365,9 +1652,13 @@ async fn api_attachments(
     if !authorize_path(&state, &query) {
         return unauthorized();
     }
+    let root = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
     let mut items = Vec::new();
     let mut files = Vec::new();
-    collect_workspace_entries(&state.workspace, &state.workspace, 0, &mut files);
+    collect_workspace_entries(&root, &root, 0, &mut files);
     for file in files {
         let Some(path) = file["path"].as_str() else {
             continue;
@@ -1384,7 +1675,7 @@ async fn api_attachments(
         }
     }
 
-    let paste_dir = state.workspace.join(".claw").join("paste-cache");
+    let paste_dir = root.join(".claw").join("paste-cache");
     let mut pastes = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&paste_dir) {
         for entry in entries.flatten().take(100) {
@@ -1405,7 +1696,7 @@ async fn api_attachments(
     }
     pastes.sort_by_key(|item| std::cmp::Reverse(item["updated_ms"].as_u64().unwrap_or(0)));
 
-    let upload_dir = state.workspace.join(".claw").join("uploads");
+    let upload_dir = root.join(".claw").join("uploads");
     let mut uploads = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&upload_dir) {
         for entry in entries.flatten().take(100) {
@@ -1436,6 +1727,7 @@ async fn api_attachments(
 struct UploadQuery {
     t: Option<String>,
     name: Option<String>,
+    workspace: Option<String>,
 }
 
 /// 浏览器上传：原始字节写入 `.claw/uploads/`（10MB 上限）。
@@ -1471,7 +1763,11 @@ async fn api_upload(
     } else {
         sanitized
     };
-    let dir = state.workspace.join(".claw").join("uploads");
+    let root = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let dir = root.join(".claw").join("uploads");
     if let Err(error) = std::fs::create_dir_all(&dir) {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
@@ -1495,7 +1791,11 @@ async fn api_raw(State(state): State<AppState>, Query(query): Query<PathQuery>) 
     let Some(rel) = query.path.as_deref() else {
         return (StatusCode::BAD_REQUEST, "缺少 path").into_response();
     };
-    let path = match resolve_in_workspace(&state.workspace, rel) {
+    let root = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let path = match resolve_in_workspace(&root, rel) {
         Ok(path) => path,
         Err((code, message)) => return (code, message).into_response(),
     };
@@ -1515,7 +1815,11 @@ async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>)
     if !authorize_path(&state, &query) {
         return unauthorized();
     }
-    let workspace = &state.workspace;
+    let workspace = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let workspace = &workspace;
     let mut patch_cmd = std::process::Command::new("git");
     patch_cmd
         .arg("-C")
@@ -1583,7 +1887,11 @@ async fn api_goal(State(state): State<AppState>, Query(query): Query<PathQuery>)
     if !authorize_path(&state, &query) {
         return unauthorized();
     }
-    let path = state.workspace.join(".claw").join("goal.json");
+    let root = match resolve_workspace(&state, query.workspace.as_deref()) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let path = root.join(".claw").join("goal.json");
     let goal: Value = std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
@@ -1635,10 +1943,11 @@ async fn api_todos_get(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    if let Err((code, message)) = session_path(&state.sessions, &id) {
-        return (code, message).into_response();
-    }
-    Json(json!({ "session": id, "items": load_web_todos(&state.workspace, &id) })).into_response()
+    let (_path, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    Json(json!({ "session": id, "items": load_web_todos(&workspace, &id) })).into_response()
 }
 
 async fn api_todos_set(
@@ -1650,9 +1959,10 @@ async fn api_todos_set(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    if let Err((code, message)) = session_path(&state.sessions, &id) {
-        return (code, message).into_response();
-    }
+    let (_session_path, workspace) = match resolve_session(&state, &id) {
+        Ok(found) => found,
+        Err((code, message)) => return (code, message).into_response(),
+    };
     let items: Vec<Value> = body
         .items
         .iter()
@@ -1665,7 +1975,7 @@ async fn api_todos_set(
             Some(json!({ "text": truncate_chars(text, 500), "done": item.done }))
         })
         .collect();
-    let path = web_todos_path(&state.workspace, &id);
+    let path = web_todos_path(&workspace, &id);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1683,8 +1993,8 @@ async fn api_tasks(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let path = match session_path(&state.sessions, &id) {
-        Ok(path) => path,
+    let path = match resolve_session(&state, &id) {
+        Ok((path, _workspace)) => path,
         Err((code, message)) => return (code, message).into_response(),
     };
     let session = match runtime::Session::load_from_path(&path) {
