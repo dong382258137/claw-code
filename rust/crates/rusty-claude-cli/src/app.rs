@@ -1343,6 +1343,22 @@ impl LiveCli {
         Ok(())
     }
 
+    /// Web（`claw serve`）用：跑一轮但不写终端输出；审批由调用方提供的 prompter 决定，
+    /// 流式事件通过 `set_status_emitter` 注入的回调输出。
+    pub(crate) fn run_turn_silent_with(
+        &mut self,
+        input: &str,
+        prompter: &mut dyn runtime::PermissionPrompter,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
+        let result = runtime.run_turn(input, Some(prompter));
+        hook_abort_monitor.stop();
+        let _summary = result?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        Ok(())
+    }
+
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);

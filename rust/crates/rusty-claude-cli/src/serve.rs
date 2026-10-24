@@ -39,10 +39,17 @@ struct AppState {
     token: String,
     /// 当前工作区的会话目录：`<workspace>/.claw/sessions/<fingerprint>/`。
     sessions: PathBuf,
-    /// 工作区根，子进程的 cwd。
+    /// 工作区根，作为 turn 的 cwd。
     workspace: PathBuf,
-    /// 正在跑 turn 的子进程（同一会话同时只允许一个写入者）。
-    running: Arc<Mutex<HashMap<String, std::process::Child>>>,
+    /// 正在跑 turn 的会话（同一会话同时只允许一个写入者）。
+    running: Arc<Mutex<HashMap<String, RunningTurn>>>,
+    /// 流式事件广播：`{session, kind, ...}`，供 `/api/session/{id}/events` 订阅。
+    events: tokio::sync::broadcast::Sender<Value>,
+}
+
+#[derive(Clone)]
+struct RunningTurn {
+    signal: runtime::HookAbortSignal,
 }
 
 #[derive(Deserialize)]
@@ -151,11 +158,13 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     runtime.block_on(async move {
+        let (events, _) = tokio::sync::broadcast::channel(256);
         let state = AppState {
             token: token.clone(),
             sessions,
             workspace: cwd.clone(),
             running: Arc::new(Mutex::new(HashMap::new())),
+            events,
         };
         let app = Router::new()
             .route("/", get(index))
@@ -175,6 +184,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/meta", get(api_meta))
             .route("/ws/terminal", get(ws_terminal))
             .route("/api/session/{id}/tasks", get(api_tasks))
+            .route("/api/session/{id}/events", get(api_events))
             .route(
                 "/api/web-settings",
                 get(api_web_settings_get).post(api_web_settings_set),
@@ -352,8 +362,89 @@ async fn api_stream(
 
 const PERMISSION_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
 
-/// 写入通道：在既有会话上跑一轮。通过子进程 `claw -p` 复用完整 turn 逻辑，
-/// 子进程用 `CLAW_RESUME_SESSION` 指回同一个 JSONL，SSE 会自然跟随其变化。
+/// Web 端非交互审批：只有在 danger-full-access 下放行越权工具，
+/// 其余模式拒绝并说明原因（逐次审批尚未接入）。
+struct WebPermissionPrompter {
+    mode: runtime::PermissionMode,
+}
+
+impl runtime::PermissionPrompter for WebPermissionPrompter {
+    fn decide(
+        &mut self,
+        request: &runtime::PermissionRequest,
+    ) -> runtime::PermissionPromptDecision {
+        if self.mode == runtime::PermissionMode::DangerFullAccess {
+            runtime::PermissionPromptDecision::Allow
+        } else {
+            runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "Web 端未启用逐次审批：{} 需要 {:?} 权限；如需放行请切到 danger-full-access 或使用 TUI",
+                    request.tool_name, request.required_mode
+                ),
+            }
+        }
+    }
+}
+
+/// 在 serve 进程内跑一轮（不再拉子进程），从而拿到 token 级流式事件。
+fn run_web_turn(
+    session_path: &Path,
+    text: &str,
+    mode: runtime::PermissionMode,
+    signal: runtime::HookAbortSignal,
+    events: tokio::sync::broadcast::Sender<Value>,
+    session_id: &str,
+) -> Result<(), String> {
+    let model =
+        crate::config_model_for_current_dir().unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
+    let mut cli = crate::app::LiveCli::new(
+        model,
+        true,
+        None,
+        mode,
+        Vec::new(),
+        crate::render::OutputVerbosity::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    cli.resume_from_path(session_path)
+        .map_err(|error| error.to_string())?;
+    cli.set_external_abort_signal(signal);
+
+    let sender = events.clone();
+    let sid = session_id.to_string();
+    cli.set_status_emitter(Arc::new(move |event: runtime::StatusEvent| {
+        let payload = match event {
+            runtime::StatusEvent::TextDelta(text) => {
+                json!({ "session": sid, "kind": "delta", "text": text })
+            }
+            runtime::StatusEvent::ToolUse { id, name, input } => {
+                json!({ "session": sid, "kind": "tool_use", "id": id, "name": name, "input": input })
+            }
+            runtime::StatusEvent::ToolResult {
+                id,
+                name,
+                output,
+                is_error,
+            } => json!({ "session": sid, "kind": "tool_result", "id": id, "name": name, "output": output, "is_error": is_error }),
+            runtime::StatusEvent::Thinking { text, done, .. } => {
+                json!({ "session": sid, "kind": "thinking", "text": text, "done": done })
+            }
+            runtime::StatusEvent::StreamError { message, recoverable } => {
+                json!({ "session": sid, "kind": "error", "message": message, "recoverable": recoverable })
+            }
+            runtime::StatusEvent::StreamStart => json!({ "session": sid, "kind": "start" }),
+            runtime::StatusEvent::MessageStop => json!({ "session": sid, "kind": "message_stop" }),
+            runtime::StatusEvent::Usage(_) => return,
+        };
+        let _ = sender.send(payload);
+    }));
+
+    let mut prompter = WebPermissionPrompter { mode };
+    cli.run_turn_silent_with(text, &mut prompter)
+        .map_err(|error| error.to_string())
+}
+
+/// 写入通道：在 serve 进程内跑一轮，流式事件走 `/api/session/{id}/events`。
 async fn api_prompt(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -379,73 +470,78 @@ async fn api_prompt(
             .into_response();
     }
 
+    let signal = runtime::HookAbortSignal::new();
     {
-        let running = state
+        let mut running = state
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if running.contains_key(&id) {
             return (StatusCode::CONFLICT, "session is busy with another turn").into_response();
         }
+        running.insert(
+            id.clone(),
+            RunningTurn {
+                signal: signal.clone(),
+            },
+        );
     }
 
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+    let events = state.events.clone();
+    let worker_events = events.clone();
+    let running_map = Arc::clone(&state.running);
+    let session_id = id.clone();
+    let text = body.text.clone();
+    let mode = crate::permission_mode_from_label(permission);
+    std::thread::spawn(move || {
+        let outcome = run_web_turn(&path, &text, mode, signal, worker_events, &session_id);
+        if let Err(message) = outcome {
+            let _ =
+                events.send(json!({ "session": session_id, "kind": "error", "message": message }));
         }
-    };
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("--permission-mode")
-        .arg(permission)
-        .arg("-p")
-        .arg(&body.text)
-        .current_dir(&state.workspace)
-        .env("CLAW_RESUME_SESSION", &path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-    };
-    let pid = child.id();
-    {
-        let mut running = state
-            .running
+        let _ = events.send(json!({ "session": session_id, "kind": "done" }));
+        running_map
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        running.insert(id.clone(), child);
-    }
-    spawn_reaper(Arc::clone(&state.running), id.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id);
+    });
 
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "status": "running", "pid": pid, "session": id })),
+        Json(json!({ "status": "running", "session": id })),
     )
         .into_response()
 }
 
-/// 后台回收已退出的子进程，避免 `running` 表无限增长。
-fn spawn_reaper(running: Arc<Mutex<HashMap<String, std::process::Child>>>, id: String) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(400));
-        let mut guard = running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let finished = match guard.get_mut(&id) {
-            Some(child) => !matches!(child.try_wait(), Ok(None)),
-            None => true,
-        };
-        if finished {
-            guard.remove(&id);
-            break;
+/// 流式事件 SSE：只转发当前会话的事件。
+async fn api_events(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let receiver = state.events.subscribe();
+    let stream = futures_util::stream::unfold((receiver, id), |(mut receiver, id)| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(value) => {
+                    if value["session"].as_str() == Some(id.as_str()) {
+                        return Some((
+                            Ok::<Event, Infallible>(
+                                Event::default().event("stream").data(value.to_string()),
+                            ),
+                            (receiver, id),
+                        ));
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
         }
     });
+    Sse::new(stream).into_response()
 }
 
 async fn api_interrupt(
@@ -461,10 +557,9 @@ async fn api_interrupt(
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match running.get_mut(&id) {
-            Some(child) => {
-                let _ = child.kill();
-                let _ = child.wait();
+        match running.remove(&id) {
+            Some(turn) => {
+                turn.signal.abort();
                 true
             }
             None => false,

@@ -184,3 +184,7 @@ details.tool.error { border-left-color: var(--error); }
   .app { grid-template-columns: 1fr; }
   aside { position: absolute; z-index: 9; width: 84vw; height: 100%; }
 }
+
+.msg.live .msg-body { border-left-color: var(--assistant); }
+.cursor { display: inline-block; width: 7px; height: 14px; background: var(--assistant); vertical-align: text-bottom; animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }

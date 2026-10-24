@@ -36,6 +36,7 @@ export default function App() {
   const [messages, setMessages] = useState([])
   const [optimistic, setOptimistic] = useState(null)
   const [running, setRunning] = useState(false)
+  const [live, setLive] = useState('')
   const [connected, setConnected] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [panelOpen, setPanelOpen] = useState(true)
@@ -88,16 +89,30 @@ export default function App() {
         const view = JSON.parse(event.data)
         setCurrent(view)
         setMessages(view.messages || [])
+        const last = view.messages?.[view.messages.length - 1]
+        if (last && last.role === 'assistant') setLive('')
         setOptimistic((pending) => {
           if (!pending) return null
-          const last = view.messages?.[view.messages.length - 1]
           return last && last.role === 'user' ? null : pending
         })
       } catch (_) {}
     })
     source.onopen = () => setConnected(true)
     source.onerror = () => setConnected(false)
-    return () => { closed = true; source.close() }
+
+    // token 级流式事件（进程内 turn 的 StatusEmitter → SSE）。
+    const events = new EventSource(withToken(`/api/session/${encodeURIComponent(currentId)}/events`))
+    events.addEventListener('stream', (event) => {
+      if (closed) return
+      try {
+        const data = JSON.parse(event.data)
+        if (data.kind === 'delta') setLive((previous) => previous + data.text)
+        else if (data.kind === 'start') setRunning(true)
+        else if (data.kind === 'done') { setLive(''); setRunning(false) }
+        else if (data.kind === 'error') push(`流式错误：${data.message}`, 'error')
+      } catch (_) {}
+    })
+    return () => { closed = true; source.close(); events.close() }
   }, [currentId, push])
 
   useEffect(() => {
@@ -262,7 +277,7 @@ export default function App() {
         panelOpen={panelOpen}
       />
       {!connected && <div className="banner">连接中断，正在重连…</div>}
-      <Conversation messages={messages} optimistic={optimistic} />
+      <Conversation messages={messages} optimistic={optimistic} live={live} />
       <Composer
         running={running}
         onSend={send}
@@ -429,14 +444,14 @@ function TopBar({ title, chips, connected, running, onSettings, onTogglePanel, p
   )
 }
 
-function Conversation({ messages, optimistic }) {
+function Conversation({ messages, optimistic, live }) {
   const ref = useRef(null)
   const stick = useRef(true)
   useEffect(() => {
     const node = ref.current
     if (!node) return
     if (stick.current) node.scrollTop = node.scrollHeight
-  }, [messages, optimistic])
+  }, [messages, optimistic, live])
   const onScroll = () => {
     const node = ref.current
     if (!node) return
@@ -448,12 +463,21 @@ function Conversation({ messages, optimistic }) {
   )
   return (
     <div className="messages" ref={ref} onScroll={onScroll}>
-      {visible.length === 0 && !optimistic && <div className="empty">选择一个会话，或直接在下方输入。</div>}
+      {visible.length === 0 && !optimistic && !live && <div className="empty">选择一个会话，或直接在下方输入。</div>}
       {visible.map((message, index) => <Message key={index} message={message} />)}
       {optimistic && (
         <div className="msg user optimistic" key="optimistic">
           <div className="msg-head"><span className="who">user</span><span className="pending">发送中…</span></div>
           <div className="msg-body"><Markdown text={optimistic.text} /></div>
+        </div>
+      )}
+      {live && (
+        <div className="msg assistant live" key="live">
+          <div className="msg-head"><span className="who">assistant</span><span className="pending">流式输出…</span></div>
+          <div className="msg-body">
+            <Markdown text={live} />
+            <span className="cursor" />
+          </div>
         </div>
       )}
     </div>
