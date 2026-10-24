@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, postJson, token, withToken, wsUrl, rawUrl } from './api'
 import { Markdown } from './markdown'
 import { groupTurns, processTitle } from './turns'
@@ -411,6 +411,8 @@ export default function App() {
         currentId={currentId}
         permission={webSettings.permission || 'workspace-write'}
         onPermission={(value) => saveSettings({ permission: value })}
+        model={webSettings.model || ''}
+        onModel={(value) => saveSettings({ model: value })}
       />
       {settingsOpen && (
         <SettingsPage
@@ -602,36 +604,16 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
   )
 }
 
-function TopBar({ title, chips, connected, running, onSettings, onTogglePanel, panelOpen, model, onModel }) {
-  const [draft, setDraft] = useState(model || '')
-  useEffect(() => { setDraft(model || '') }, [model])
-  const commit = () => {
-    const value = draft.trim()
-    if (value !== (model || '')) onModel(value)
-  }
+function TopBar({ title, chips, connected, running, onSettings, onTogglePanel, panelOpen }) {
   return (
     <div className="topbar">
       <span className="title">{title}</span>
-      <input
-        className="model-input"
-        list="model-presets"
-        value={draft}
-        placeholder="默认模型"
-        title="本轮模型（留空使用工作区默认）"
-        onChange={(event) => setDraft(event.target.value)}
-        onBlur={commit}
-        onKeyDown={(event) => { if (event.key === 'Enter') { commit(); event.target.blur() } }}
-      />
-      <datalist id="model-presets">
-        <option value="deepseek-v4-flash" />
-        <option value="deepseek-chat" />
-        <option value="deepseek-reasoner" />
-      </datalist>
       <div className="chips">
         {chips.map((chip, index) => <span key={index} className="chip">{chip}</span>)}
         {!connected && <span className="chip warn">离线</span>}
         {running && <span className="chip running">运行中</span>}
       </div>
+      <button onClick={onSettings} title="设置">⚙</button>
       <button onClick={onTogglePanel}>{panelOpen ? '隐藏面板' : '显示面板'}</button>
     </div>
   )
@@ -818,15 +800,20 @@ function LiveTurn({ thinking, tools, text }) {
   )
 }
 
-function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission }) {
+function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
   const [menu, setMenu] = useState(null)
   const [cursor, setCursor] = useState(0)
+  const [attachments, setAttachments] = useState([])
+  const [uploading, setUploading] = useState(false)
+  const [modelDraft, setModelDraft] = useState(model || '')
   const ref = useRef(null)
   const areaRef = useRef(null)
+  const uploadRef = useRef(null)
 
   useEffect(() => { ref.current = value }, [value])
+  useEffect(() => { setModelDraft(model || '') }, [model])
   useEffect(() => {
     if (menu?.kind !== 'file' || files.length) return
     api('/api/workspace/files').then((body) => setFiles(body.files || [])).catch(() => {})
@@ -894,6 +881,35 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
     node.style.height = `${Math.min(180, node.scrollHeight)}px`
   }
 
+  const uploadFile = async (list) => {
+    const file = list?.[0]
+    if (!file) return
+    setUploading(true)
+    try {
+      const response = await fetch(withToken('/api/upload?name=' + encodeURIComponent(file.name)), { method: 'POST', body: file })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const body = await response.json()
+      setAttachments((items) => [...items, { name: file.name, path: body.path, size: file.size }])
+      setValue((previous) => (previous.trim() ? previous.replace(/\s*$/, '') + '\n' : '') + '@' + body.path + ' ')
+      requestAnimationFrame(() => areaRef.current?.focus())
+    } catch (error) {
+      onError?.(`上传失败：${error.message}`)
+    } finally {
+      setUploading(false)
+      if (uploadRef.current) uploadRef.current.value = ''
+    }
+  }
+
+  const removeAttachment = (path) => {
+    setAttachments((items) => items.filter((item) => item.path !== path))
+    setValue((previous) => previous.split('\n').filter((line) => line.trim() !== '@' + path).join('\n'))
+  }
+
+  const commitModel = () => {
+    const next = modelDraft.trim()
+    if (next !== (model || '')) onModel(next)
+  }
+
   return (
     <form className="composer" onSubmit={(event) => { event.preventDefault(); submit() }}>
       {menu && (
@@ -911,6 +927,16 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
               ))}
         </div>
       )}
+      {attachments.length > 0 && (
+        <div className="composer-attachments">
+          {attachments.map((item) => (
+            <span key={item.path} className="attachment-chip" title={item.path}>
+              📎 {item.name}
+              <button type="button" className="ghost" onClick={() => removeAttachment(item.path)}>×</button>
+            </span>
+          ))}
+        </div>
+      )}
       <textarea
         ref={areaRef}
         value={value}
@@ -919,15 +945,38 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
         onChange={(event) => { setValue(event.target.value); grow(event) }}
         onKeyDown={onKeyDown}
       />
-      <div className="composer-actions">
-        <select value={permission} onChange={(event) => onPermission(event.target.value)} title="本轮权限模式">
-          <option value="read-only">只读</option>
-          <option value="workspace-write">工作区可写</option>
-          <option value="danger-full-access">完全访问</option>
-        </select>
-        {running
-          ? <button type="button" className="danger" onClick={onStop}>停止</button>
-          : <button type="submit" className="primary">发送</button>}
+      <div className="composer-toolbar">
+        <div className="composer-tools">
+          <button type="button" className="tool-icon" title="上传附件" onClick={() => uploadRef.current?.click()} disabled={uploading}>
+            {uploading ? '…' : '＋'}
+          </button>
+          <input ref={uploadRef} type="file" style={{ display: 'none' }} onChange={(event) => uploadFile(event.target.files)} />
+          <select value={permission} onChange={(event) => onPermission(event.target.value)} title="本轮权限模式">
+            <option value="read-only">只读</option>
+            <option value="workspace-write">工作区可写</option>
+            <option value="danger-full-access">完全访问</option>
+          </select>
+          <input
+            className="model-chip"
+            list="model-presets"
+            value={modelDraft}
+            placeholder="默认模型"
+            title="本轮模型（留空使用工作区默认）"
+            onChange={(event) => setModelDraft(event.target.value)}
+            onBlur={commitModel}
+            onKeyDown={(event) => { if (event.key === 'Enter') { commitModel(); event.target.blur() } }}
+          />
+          <datalist id="model-presets">
+            <option value="deepseek-v4-flash" />
+            <option value="deepseek-chat" />
+            <option value="deepseek-reasoner" />
+          </datalist>
+        </div>
+        <div className="composer-send">
+          {running
+            ? <button type="button" className="danger" onClick={onStop}>停止</button>
+            : <button type="submit" className="primary">发送</button>}
+        </div>
       </div>
       <div className="composer-hint">
         <span>/ 快捷操作 · @ 引用文件 · Ctrl+B 侧栏</span>
@@ -942,15 +991,23 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
 function Panel({ tab, onTab, onClose, onDock, width, currentId, meta, onError, onToast }) {
   // 终端只在第一次打开时挂载，之后保持连接；避免每次加载页面都起一个 PTY。
   const [terminalMounted, setTerminalMounted] = useState(tab === 'terminal')
+  const [fullscreen, setFullscreen] = useState(false)
   useEffect(() => { if (tab === 'terminal') setTerminalMounted(true) }, [tab])
+  useEffect(() => {
+    if (!fullscreen) return undefined
+    const onKey = (event) => { if (event.key === 'Escape') setFullscreen(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [fullscreen])
   return (
-    <section className="panel" style={{ width }}>
+    <section className={`panel ${fullscreen ? 'fullscreen' : ''}`} style={fullscreen ? undefined : { width }}>
       <div className="panel-head">
         {TABS.map((item) => (
           <button key={item.id} className={tab === item.id ? 'tab active' : 'tab'} onClick={() => onTab(item.id)}>{item.label}</button>
         ))}
         <span className="spacer" />
         <button onClick={onDock} title="切换停靠侧">⇄</button>
+        <button onClick={() => setFullscreen((value) => !value)} title={fullscreen ? '退出全屏 (Esc)' : '全屏'}>{fullscreen ? '⤢' : '⛶'}</button>
         <button onClick={onClose} title="收起">×</button>
       </div>
       <div className="panel-body">
