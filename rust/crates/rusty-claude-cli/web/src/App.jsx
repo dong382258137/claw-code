@@ -118,8 +118,14 @@ export default function App() {
         else if (data.kind === 'tool_use') setLiveTools((list) => [...list, { id: data.id, name: data.name, input: data.input, output: '', done: false, is_error: false }])
         else if (data.kind === 'tool_result') {
           setLiveTools((list) => {
-            const index = list.findIndex((tool) => tool.id === data.id)
-            if (index === -1) return [...list, { id: data.id, name: data.name, input: '', output: data.output, done: true, is_error: data.is_error }]
+            // runtime 的 ToolResult 事件可能不带 id：退化为匹配最近的同名未完成工具。
+            let index = data.id ? list.findIndex((tool) => tool.id === data.id) : -1
+            if (index === -1) {
+              for (let i = list.length - 1; i >= 0; i -= 1) {
+                if (!list[i].done && list[i].name === data.name) { index = i; break }
+              }
+            }
+            if (index === -1) return [...list, { id: data.id || `${data.name}-${Date.now()}`, name: data.name, input: '', output: data.output, done: true, is_error: data.is_error }]
             const next = list.slice()
             next[index] = { ...next[index], output: data.output, done: true, is_error: data.is_error }
             return next
