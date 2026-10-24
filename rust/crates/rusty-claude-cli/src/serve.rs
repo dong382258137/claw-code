@@ -28,7 +28,9 @@ use serde_json::{json, Value};
 
 use crate::session_mgr::PRIMARY_SESSION_EXTENSION;
 
-const INDEX_HTML: &str = include_str!("serve/index.html");
+// React 前端的单文件构建产物（web/dist/index.html，由 web/ 下的 Vite 工程生成并提交）。
+// 构建期不需要 Node：dist 已内联 JS/CSS。
+const INDEX_HTML: &str = include_str!("../web/dist/index.html");
 const MAX_SESSIONS: usize = 50;
 const STREAM_INTERVAL: Duration = Duration::from_millis(900);
 
