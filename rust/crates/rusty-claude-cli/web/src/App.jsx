@@ -108,8 +108,8 @@ export default function App() {
         const data = JSON.parse(event.data)
         if (data.kind === 'delta') setLive((previous) => previous + data.text)
         else if (data.kind === 'start') setRunning(true)
-        else if (data.kind === 'done') { setLive(''); setRunning(false) }
-        else if (data.kind === 'error') push(`流式错误：${data.message}`, 'error')
+        else if (data.kind === 'done') { setRunning(false) }
+        else if (data.kind === 'error') { setLive(''); push(`流式错误：${data.message}`, 'error') }
       } catch (_) {}
     })
     return () => { closed = true; source.close(); events.close() }
@@ -215,6 +215,7 @@ export default function App() {
     if (!currentId) { push('先选择一个会话', 'error'); return }
     const trimmed = text.trim()
     if (!trimmed) return
+    setLive('')
     setOptimistic({ text: trimmed, at: Date.now() })
     setRunning(true)
     try {
