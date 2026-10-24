@@ -1731,7 +1731,7 @@ pub fn main_entry() {
     // 由旧进程 /upgrade spawn 的独立进程(新终端),自动化
     // "等旧进程退出 → mv exe.old → cargo build → 启动新进程"。
     // 此分支不进 REPL/TUI,直接执行迁移后退出。
-    let argv: Vec<String> = std::env::args().collect();
+    let mut argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--upgrade-helper") {
         let user_cwd = argv
             .iter()
@@ -1758,6 +1758,16 @@ pub fn main_entry() {
             std::process::exit(1);
         }
         std::process::exit(0);
+    }
+
+    // 快速启动器：同一个二进制以 `claw-web` 命名（副本或硬链接）时等价于
+    // `claw serve`，便于建桌面快捷方式后双击启动 Web UI。
+    let invoked_as_web = std::path::Path::new(&argv[0])
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("claw-web"));
+    if invoked_as_web && argv.get(1).map(String::as_str) != Some("serve") {
+        argv.insert(1, "serve".to_string());
     }
 
     // B1 本地只读 Web 视图：独立于 REPL/TUI 的子命令，走早期分支。

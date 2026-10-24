@@ -55,28 +55,38 @@ struct PromptBody {
 }
 
 /// 解析参数并启动服务；阻塞到进程退出。
+///
+/// `claw-web.exe`（同一二进制的副本/硬链接）双击启动时等价于 `claw serve`：
+/// 未显式给 `--cwd` 时按"当前目录 → 上次工作区 → 用户主目录"推断，
+/// 端口被占用时自动改用系统分配端口。
 pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut port: u16 = 4317;
     let mut open = true;
-    let mut cwd = std::env::current_dir()?;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut cwd: Option<PathBuf> = None;
+    let mut arg_index = 0;
+    while arg_index < args.len() {
+        match args[arg_index].as_str() {
             "--port" | "-p" => {
-                index += 1;
+                arg_index += 1;
                 port = args
-                    .get(index)
+                    .get(arg_index)
                     .and_then(|value| value.parse().ok())
                     .ok_or("--port 需要一个有效端口号")?;
             }
             "--cwd" | "-C" => {
-                index += 1;
-                let raw = args.get(index).ok_or("--cwd 需要一个目录")?;
-                cwd = std::fs::canonicalize(raw)
-                    .map_err(|error| format!("--cwd {raw} 无效: {error}"))?;
+                arg_index += 1;
+                let raw = args.get(arg_index).ok_or("--cwd 需要一个目录")?;
+                cwd = Some(
+                    std::fs::canonicalize(raw)
+                        .map_err(|error| format!("--cwd {raw} 无效: {error}"))?,
+                );
             }
             "--no-open" => open = false,
             "--open" => open = true,
+            other if cwd.is_none() && Path::new(other).is_dir() => {
+                // 支持把项目文件夹拖到 claw-web.exe 上：第一个存在的目录即工作区。
+                cwd = Some(std::fs::canonicalize(other)?);
+            }
             other => {
                 return Err(format!(
                     "未知参数 {other}；用法: claw serve [--port 4317] [--cwd DIR] [--no-open]"
@@ -84,49 +94,117 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .into())
             }
         }
-        index += 1;
+        arg_index += 1;
     }
 
+    let cwd = match cwd {
+        Some(path) => path,
+        None => default_workspace(),
+    };
     let store = runtime::SessionStore::from_cwd(&cwd)?;
     let sessions = store.sessions_dir().to_path_buf();
     let token = generate_token();
-    let url = format!("http://127.0.0.1:{port}/?t={token}");
-    println!("claw web（只读）: {url}");
-    println!("工作区: {}", cwd.display());
-    println!("按 Ctrl+C 停止。");
-    if open {
-        open_browser(&url);
-    }
-
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve(
-        addr,
-        AppState {
-            token,
+
+    runtime.block_on(async move {
+        let state = AppState {
+            token: token.clone(),
             sessions,
-            workspace: cwd,
+            workspace: cwd.clone(),
             running: Arc::new(Mutex::new(HashMap::new())),
-        },
-    ))?;
+        };
+        let app = Router::new()
+            .route("/", get(index))
+            .route("/api/sessions", get(api_sessions))
+            .route("/api/session/{id}", get(api_session))
+            .route("/api/session/{id}/stream", get(api_stream))
+            .route("/api/session/{id}/prompt", post(api_prompt))
+            .route("/api/session/{id}/interrupt", post(api_interrupt))
+            .route("/api/session/{id}/status", get(api_status))
+            .with_state(state);
+
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("端口 {port} 不可用（{error}），改用系统分配端口。");
+                tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?
+            }
+        };
+        let actual_port = listener.local_addr()?.port();
+        let url = format!("http://127.0.0.1:{actual_port}/?t={token}");
+        println!("claw web: {url}");
+        println!("工作区: {}", cwd.display());
+        println!("按 Ctrl+C 停止。");
+        save_last_workspace(&cwd);
+        if open {
+            open_browser(&url);
+        }
+
+        axum::serve(listener, app).await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
     Ok(())
 }
 
-async fn serve(addr: SocketAddr, state: AppState) -> Result<(), Box<dyn std::error::Error>> {
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/api/sessions", get(api_sessions))
-        .route("/api/session/{id}", get(api_session))
-        .route("/api/session/{id}/stream", get(api_stream))
-        .route("/api/session/{id}/prompt", post(api_prompt))
-        .route("/api/session/{id}/interrupt", post(api_interrupt))
-        .route("/api/session/{id}/status", get(api_status))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+/// 双击启动时的默认工作区：当前目录若像项目就用它，否则用上次的项目，最后退回主目录。
+fn default_workspace() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if looks_like_workspace(&cwd) {
+        return cwd;
+    }
+    if let Some(saved) = load_last_workspace() {
+        if saved.is_dir() {
+            return saved;
+        }
+    }
+    home_dir().unwrap_or(cwd)
+}
+
+fn looks_like_workspace(path: &Path) -> bool {
+    [
+        ".git",
+        ".claw",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+    ]
+    .iter()
+    .any(|marker| path.join(marker).exists())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn last_workspace_file() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".claw").join("web-last-workspace.txt"))
+}
+
+fn load_last_workspace() -> Option<PathBuf> {
+    let path = last_workspace_file()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+fn save_last_workspace(workspace: &Path) {
+    let Some(path) = last_workspace_file() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, workspace.display().to_string());
 }
 
 async fn index() -> Html<&'static str> {
