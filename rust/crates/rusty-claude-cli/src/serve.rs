@@ -426,6 +426,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "/api/workspaces",
                 get(api_workspaces).post(api_workspace_add),
             )
+            .route("/api/workspaces/pick", post(api_workspace_pick))
             .route("/api/upload", post(api_upload))
             .route("/api/meta", get(api_meta))
             .route("/ws/terminal", get(ws_terminal))
@@ -1642,6 +1643,60 @@ async fn api_workspace_add(
     match resolve_workspace(&state, Some(&body.path)) {
         Ok(root) => Json(json!({ "workspace": workspace_item(&root) })).into_response(),
         Err((code, message)) => (code, message).into_response(),
+    }
+}
+
+/// 弹系统文件夹选择框（Windows）。返回 None 表示用户取消。
+#[cfg(windows)]
+fn pick_folder_dialog() -> Result<Option<PathBuf>, String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = r#"Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = '选择 CLAW 工作区目录'; $dialog.ShowNewFolderButton = $true; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }"#;
+    let mut last_error = String::new();
+    for exe in ["powershell.exe", "pwsh.exe"] {
+        match std::process::Command::new(exe)
+            .args(["-NoProfile", "-STA", "-Command", script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if text.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(PathBuf::from(text)));
+            }
+            Ok(output) => {
+                last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    Err(format!("无法打开文件夹选择框：{last_error}"))
+}
+
+#[cfg(not(windows))]
+fn pick_folder_dialog() -> Result<Option<PathBuf>, String> {
+    Err("当前平台不支持系统文件夹选择框".to_string())
+}
+
+/// 弹出系统文件夹选择框并登记选中的工作区。
+async fn api_workspace_pick(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    match tokio::task::spawn_blocking(pick_folder_dialog).await {
+        Ok(Ok(Some(path))) => match resolve_workspace(&state, Some(&path.display().to_string())) {
+            Ok(root) => Json(json!({ "workspace": workspace_item(&root) })).into_response(),
+            Err((code, message)) => (code, message).into_response(),
+        },
+        Ok(Ok(None)) => Json(json!({ "workspace": null })).into_response(),
+        Ok(Err(message)) => (StatusCode::NOT_IMPLEMENTED, message).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 

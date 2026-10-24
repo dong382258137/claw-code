@@ -105,6 +105,24 @@ export default function App() {
       push(`添加工作区失败：${error.message}`, 'error')
     }
   }, [loadSessions, push])
+
+  // 打开服务端原生文件夹选择框；非 Windows/失败时回退到手动输入。
+  const pickWorkspace = useCallback(async () => {
+    try {
+      const body = await postJson('/api/workspaces/pick', {})
+      if (body.workspace) {
+        await loadSessions()
+        push(`已添加工作区：${body.workspace.name}`)
+      }
+    } catch (error) {
+      if (String(error.message).includes('HTTP 501')) {
+        const path = window.prompt('当前平台不支持文件夹选择框，请输入工作区绝对路径')
+        if (path) await addWorkspace(path)
+      } else {
+        push(`选择工作区失败：${error.message}`, 'error')
+      }
+    }
+  }, [addWorkspace, loadSessions, push])
   useEffect(() => {
     loadSessions()
     const timer = setInterval(loadSessions, 10000)
@@ -419,6 +437,7 @@ export default function App() {
       onNew={createSession}
       onNewIn={(workspace) => createSession(workspace)}
       onAddWorkspace={addWorkspace}
+      onPickWorkspace={pickWorkspace}
       workspaces={workspaces}
       activeWorkspace={activeWorkspace}
       onRename={renameSession}
@@ -578,8 +597,9 @@ function Toasts({ toasts }) {
   )
 }
 
-function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onNewIn, onAddWorkspace, workspaces, activeWorkspace, onRename, onDelete, total, onLoadMore, onSettings, onTheme, theme }) {
+function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onNewIn, onAddWorkspace, onPickWorkspace, workspaces, activeWorkspace, onRename, onDelete, total, onLoadMore, onSettings, onTheme, theme }) {
   const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
+  const [picking, setPicking] = useState(false)
   const query = filter.trim().toLowerCase()
   const filtered = sessions.filter((session) =>
     !query ||
@@ -642,12 +662,14 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
           <div className="projects-head">
             <span>项目</span>
             <button
-              title="添加工作区目录"
-              onClick={() => {
-                const path = window.prompt('工作区目录（绝对路径）')
-                if (path) onAddWorkspace(path)
+              title="选择工作区文件夹"
+              disabled={picking}
+              onClick={async () => {
+                if (picking) return
+                setPicking(true)
+                try { await onPickWorkspace() } finally { setPicking(false) }
               }}
-            >＋</button>
+            >{picking ? '…' : '＋'}</button>
           </div>
           <div className="session-list">
             {projects.length === 0 && <div className="empty">没有匹配的会话</div>}
