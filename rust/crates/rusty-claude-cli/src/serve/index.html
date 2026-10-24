@@ -93,6 +93,10 @@
   .attach:hover { border-color: var(--accent); }
   .attach img { width: 100%; height: 72px; object-fit: cover; display: block; }
   .attach span { display: block; font-size: 10px; padding: 3px 5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .term-out { flex: 1; margin: 0; padding: 8px 10px; overflow: auto; background: #0a0d11; color: #cfe3d6; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .term-input { border-top: 1px solid var(--border); padding: 5px 8px; }
+  .term-input input { width: 100%; background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 4px 8px; outline: none; }
+  .term-input input:focus { border-color: var(--accent); }
   .jump { position: absolute; right: 18px; bottom: 104px; display: none; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
   .jump.show { display: block; }
   #composer { border-top: 1px solid var(--border); background: var(--panel); padding: 9px 12px; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
@@ -233,6 +237,7 @@
       <button class="tabbtn" data-tab="diff">变更</button>
       <button class="tabbtn" data-tab="tasks">任务</button>
       <button class="tabbtn" data-tab="attachments">附件</button>
+      <button class="tabbtn" data-tab="terminal">终端</button>
       <button class="tabbtn" data-tab="preview">预览</button>
       <span style="flex:1"></span>
       <button id="panelClose" title="收起面板" type="button">×</button>
@@ -264,6 +269,17 @@
       <div class="tabpane" id="tab-attachments">
         <div class="pane-toolbar"><button id="attachRefresh" type="button">刷新</button><span class="faint" id="attachHint"></span></div>
         <div class="pane-scroll" id="attachBody"><div class="empty">点击“刷新”加载附件</div></div>
+      </div>
+      <div class="tabpane" id="tab-terminal">
+        <div class="pane-toolbar">
+          <button id="termConnect" type="button">连接</button>
+          <button id="termDisconnect" type="button">断开</button>
+          <button id="termClear" type="button">清屏</button>
+          <button id="termInterrupt" type="button">Ctrl+C</button>
+          <span class="faint" id="termHint"></span>
+        </div>
+        <pre class="term-out" id="termOut"></pre>
+        <div class="term-input"><input id="termInput" placeholder="输入命令，Enter 发送（真 PTY，工作区为 cwd）" autocomplete="off"></div>
       </div>
     </div>
   </section>
@@ -442,6 +458,7 @@
     if (name === 'diff') loadDiff();
     if (name === 'tasks') loadTasks();
     if (name === 'attachments') loadAttachments();
+    if (name === 'terminal') connectTerminal();
   }
   function openPanel(tab) {
     $('panel').classList.remove('collapsed');
@@ -603,6 +620,59 @@
     });
   }
   $('attachRefresh').addEventListener('click', loadAttachments);
+
+  /* ---------- 终端（PTY over WebSocket） ---------- */
+  let termSocket = null;
+  let termBuffer = '';
+  const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-_]/g;
+
+  function appendTerminal(text) {
+    termBuffer += text;
+    if (termBuffer.length > 200000) termBuffer = termBuffer.slice(-200000);
+    const out = $('termOut');
+    out.textContent = termBuffer;
+    out.scrollTop = out.scrollHeight;
+  }
+  function terminalStatus(text) { $('termHint').textContent = text; }
+
+  function connectTerminal() {
+    if (termSocket && termSocket.readyState <= 1) return;
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const url = `${scheme}://${location.host}/ws/terminal?t=${encodeURIComponent(token)}`;
+    try { termSocket = new WebSocket(url); } catch (error) { terminalStatus('无法连接: ' + error.message); return; }
+    termSocket.binaryType = 'arraybuffer';
+    termSocket.onopen = () => terminalStatus('已连接');
+    termSocket.onmessage = (event) => {
+      if (typeof event.data === 'string') {
+        appendTerminal(event.data.replace(ANSI_RE, ''));
+      } else {
+        appendTerminal(new TextDecoder().decode(event.data).replace(ANSI_RE, ''));
+      }
+    };
+    termSocket.onclose = () => { terminalStatus('已断开'); };
+    termSocket.onerror = () => { terminalStatus('连接失败'); };
+  }
+  function disconnectTerminal() {
+    if (termSocket) { termSocket.close(); termSocket = null; }
+    terminalStatus('已断开');
+  }
+  function sendTerminal(data) {
+    if (!termSocket || termSocket.readyState !== 1) { appendTerminal('\n（未连接，先点“连接”）\n'); return; }
+    termSocket.send(JSON.stringify({ type: 'input', data }));
+  }
+  $('termConnect').addEventListener('click', connectTerminal);
+  $('termDisconnect').addEventListener('click', disconnectTerminal);
+  $('termClear').addEventListener('click', () => { termBuffer = ''; $('termOut').textContent = ''; });
+  $('termInterrupt').addEventListener('click', () => {
+    if (termSocket && termSocket.readyState === 1) termSocket.send(JSON.stringify({ type: 'interrupt' }));
+  });
+  $('termInput').addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    const value = $('termInput').value;
+    $('termInput').value = '';
+    sendTerminal(value + '\r');
+  });
 
   async function loadDiff() {
     $('diffHint').textContent = '加载中…';

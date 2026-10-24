@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
@@ -166,6 +167,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/workspace/plans", get(api_plans))
             .route("/api/attachments", get(api_attachments))
             .route("/api/meta", get(api_meta))
+            .route("/ws/terminal", get(ws_terminal))
             .route("/api/session/{id}/tasks", get(api_tasks))
             .route(
                 "/api/web-settings",
@@ -490,6 +492,155 @@ async fn api_status(
         guard.contains_key(&id)
     };
     Json(json!({ "session": id, "running": running })).into_response()
+}
+
+// ---------------- P3：终端面板（PTY + WebSocket） ----------------
+
+/// WebSocket 终端：升级后在工作区里开一个真实 PTY（Windows 为 ConPTY）。
+async fn ws_terminal(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let workspace = state.workspace.clone();
+    ws.on_upgrade(move |socket| terminal_session(socket, workspace))
+}
+
+struct PtySession {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    input: std::sync::mpsc::Sender<Vec<u8>>,
+    /// 必须持有 master，否则 drop 会关闭 ConPTY 并让子进程立刻退出。
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+fn spawn_pty(
+    workspace: &Path,
+    output: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> Result<PtySession, String> {
+    use std::io::Read;
+
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| error.to_string())?;
+
+    // Windows 上用 COMSPEC（cmd.exe）最稳；PowerShell 路径因机器而异。
+    let shell = if cfg!(windows) {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string())
+    } else {
+        "/bin/bash".to_string()
+    };
+    let mut command = portable_pty::CommandBuilder::new(shell);
+    command.cwd(workspace);
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| error.to_string())?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| error.to_string())?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| error.to_string())?;
+
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if output.blocking_send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        while let Ok(data) = input_rx.recv() {
+            if writer.write_all(&data).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
+    Ok(PtySession {
+        child,
+        input: input_tx,
+        _master: pair.master,
+    })
+}
+
+async fn terminal_session(mut socket: WebSocket, workspace: PathBuf) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let mut session = match spawn_pty(&workspace, tx) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = socket
+                .send(Message::Text(format!("无法启动终端: {error}\n").into()))
+                .await;
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            chunk = rx.recv() => {
+                match chunk {
+                    Some(bytes) => {
+                        if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Binary(data))) => {
+                        let _ = session.input.send(data.to_vec());
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                        match value["type"].as_str() {
+                            Some("input") => {
+                                if let Some(data) = value["data"].as_str() {
+                                    let _ = session.input.send(data.as_bytes().to_vec());
+                                }
+                            }
+                            Some("interrupt") => {
+                                let _ = session.child.kill();
+                                break;
+                            }
+                            _ => {
+                                let _ = session.input.send(text.as_bytes().to_vec());
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    let _ = session.child.kill();
 }
 
 // ---------------- 工作区：文件 / 预览 / diff / 任务 / goal / Web 设置 ----------------
