@@ -2485,6 +2485,43 @@ fn session_view(path: &Path) -> Result<Value, String> {
         })
         .collect();
 
+    let mut stats_turns = 0u64;
+    let mut stats_steps = 0u64;
+    let mut stats_input = 0u64;
+    let mut stats_output = 0u64;
+    let mut stats_cache_read = 0u64;
+    let mut stats_first_ts = 0u64;
+    let mut stats_last_ts = 0u64;
+    for message in &session.messages {
+        if matches!(message.role, runtime::MessageRole::User) {
+            stats_turns += 1;
+        }
+        if matches!(message.role, runtime::MessageRole::Assistant) {
+            stats_steps += message
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, runtime::ContentBlock::ToolUse { .. }))
+                .count() as u64;
+        }
+        if let Some(usage) = message.usage {
+            stats_input += u64::from(usage.input_tokens);
+            stats_output += u64::from(usage.output_tokens);
+            stats_cache_read += u64::from(usage.cache_read_input_tokens);
+        }
+        if message.created_at_ms > 0 {
+            if stats_first_ts == 0 {
+                stats_first_ts = message.created_at_ms;
+            }
+            stats_last_ts = message.created_at_ms;
+        }
+    }
+    let stats_total = stats_input + stats_output;
+    let stats_cache_pct = if stats_input + stats_cache_read > 0 {
+        stats_cache_read * 100 / (stats_input + stats_cache_read)
+    } else {
+        0
+    };
+
     Ok(json!({
         "id": session.session_id,
         "model": session.model,
@@ -2495,6 +2532,16 @@ fn session_view(path: &Path) -> Result<Value, String> {
         "created_at_ms": session.created_at_ms,
         "messages": messages,
         "message_count": session.messages.len(),
+        "stats": {
+            "turns": stats_turns,
+            "steps": stats_steps,
+            "input_tokens": stats_input,
+            "output_tokens": stats_output,
+            "total_tokens": stats_total,
+            "cache_read_tokens": stats_cache_read,
+            "cache_hit_pct": stats_cache_pct,
+            "duration_ms": stats_last_ts.saturating_sub(stats_first_ts),
+        },
     }))
 }
 

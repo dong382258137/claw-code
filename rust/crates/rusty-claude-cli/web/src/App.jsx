@@ -508,6 +508,7 @@ export default function App() {
         model={webSettings.model || ''}
         onModel={(value) => saveSettings({ model: value })}
         workspace={activeWorkspace}
+        stats={current?.stats}
       />
       {settingsOpen && (
         <SettingsPage
@@ -987,7 +988,7 @@ function LiveTurn({ thinking, tools, text }) {
   )
 }
 
-function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace }) {
+function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, stats }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
   const [menu, setMenu] = useState(null)
@@ -1124,53 +1125,67 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
           ))}
         </div>
       )}
-      <textarea
-        ref={areaRef}
-        value={value}
-        rows={2}
-        placeholder={currentId ? '输入消息；Enter 发送，Shift+Enter 换行，/ 快捷操作，@ 引用文件' : '先选择一个会话'}
-        onChange={(event) => { setValue(event.target.value); grow(event) }}
-        onKeyDown={onKeyDown}
-      />
-      <div className="composer-toolbar">
-        <div className="composer-tools">
-          <button type="button" className="tool-icon" title="上传附件" onClick={() => uploadRef.current?.click()} disabled={uploading}>
+      <div className="composer-box">
+        <textarea
+          ref={areaRef}
+          value={value}
+          rows={2}
+          placeholder={currentId ? '输入消息…' : '先选择一个会话'}
+          onChange={(event) => { setValue(event.target.value); grow(event) }}
+          onKeyDown={onKeyDown}
+        />
+        <div className="composer-bar">
+          <button type="button" className="composer-plus" title="上传附件" onClick={() => uploadRef.current?.click()} disabled={uploading}>
             {uploading ? '…' : '＋'}
           </button>
           <input ref={uploadRef} type="file" style={{ display: 'none' }} onChange={(event) => uploadFile(event.target.files)} />
-          <select value={permission} onChange={(event) => onPermission(event.target.value)} title="本轮权限模式">
-            <option value="read-only">只读</option>
-            <option value="workspace-write">工作区可写</option>
-            <option value="danger-full-access">完全访问</option>
-          </select>
-          <input
-            className="model-chip"
-            list="model-presets"
-            value={modelDraft}
-            placeholder="默认模型"
-            title="本轮模型（留空使用工作区默认）"
-            onChange={(event) => setModelDraft(event.target.value)}
-            onBlur={commitModel}
-            onKeyDown={(event) => { if (event.key === 'Enter') { commitModel(); event.target.blur() } }}
-          />
+          <label className="permission-chip" title="本轮权限模式">
+            <span className="permission-shield">🛡</span>
+            <select value={permission} onChange={(event) => onPermission(event.target.value)}>
+              <option value="read-only">只读</option>
+              <option value="workspace-write">工作区可写</option>
+              <option value="danger-full-access">完全权限</option>
+            </select>
+            <span className="chevron">⌄</span>
+          </label>
+          <span className="bar-spacer" />
+          <label className="model-select" title="本轮模型（留空使用工作区默认）">
+            <input
+              list="model-presets"
+              value={modelDraft}
+              placeholder="默认模型"
+              onChange={(event) => setModelDraft(event.target.value)}
+              onBlur={commitModel}
+              onKeyDown={(event) => { if (event.key === 'Enter') { commitModel(); event.target.blur() } }}
+            />
+            <span className="chevron">⌄</span>
+          </label>
           <datalist id="model-presets">
             <option value="deepseek-v4-flash" />
             <option value="deepseek-chat" />
             <option value="deepseek-reasoner" />
           </datalist>
-        </div>
-        <div className="composer-send">
           {running
-            ? <button type="button" className="danger" onClick={onStop}>停止</button>
-            : <button type="submit" className="primary">发送</button>}
+            ? <button type="button" className="send-circle stop" onClick={onStop} title="停止">■</button>
+            : <button type="submit" className="send-circle" disabled={!value.trim()} title="发送（Enter）">↑</button>}
         </div>
       </div>
-      <div className="composer-hint">
-        <span>/ 快捷操作 · @ 引用文件 · Ctrl+B 侧栏</span>
-        <span>{value.length} 字符</span>
-      </div>
+      {(stats?.turns > 0 || stats?.total_tokens > 0) && (
+        <div className="composer-metrics">
+          <span>↻ {stats.turns || 0} 轮 {stats.steps || 0} 步{stats.duration_ms > 0 && stats.output_tokens > 0 ? ` · ${Math.max(1, Math.round((stats.output_tokens || 0) / (stats.duration_ms / 1000)))} tok/s` : ''}</span>
+          <span>💾 {formatTokens(stats.total_tokens || 0)} tok · 缓存命中 {stats.cache_hit_pct || 0}%</span>
+        </div>
+      )}
     </form>
   )
+}
+
+function formatTokens(value) {
+  const count = Number(value) || 0
+  if (count >= 1e9) return `${(count / 1e9).toFixed(1)}B`
+  if (count >= 1e6) return `${(count / 1e6).toFixed(1)}M`
+  if (count >= 1e3) return `${(count / 1e3).toFixed(1)}k`
+  return String(count)
 }
 
 /* ---------------- 右侧面板 ---------------- */
