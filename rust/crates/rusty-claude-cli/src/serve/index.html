@@ -86,6 +86,13 @@
   .tool .name { color: var(--tool); }
   .tool.error .name { color: var(--error); }
   .empty { color: var(--dim); padding: 30px 18px; text-align: center; }
+  #editor { width: 100%; height: 100%; min-height: 420px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; resize: vertical; outline: none; }
+  #editor:focus { border-color: var(--accent); }
+  .attach-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; padding: 4px 0 10px; }
+  .attach { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; cursor: pointer; background: var(--panel-2); }
+  .attach:hover { border-color: var(--accent); }
+  .attach img { width: 100%; height: 72px; object-fit: cover; display: block; }
+  .attach span { display: block; font-size: 10px; padding: 3px 5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .jump { position: absolute; right: 18px; bottom: 104px; display: none; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
   .jump.show { display: block; }
   #composer { border-top: 1px solid var(--border); background: var(--panel); padding: 9px 12px; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
@@ -225,6 +232,7 @@
       <button class="tabbtn active" data-tab="files">文件</button>
       <button class="tabbtn" data-tab="diff">变更</button>
       <button class="tabbtn" data-tab="tasks">任务</button>
+      <button class="tabbtn" data-tab="attachments">附件</button>
       <button class="tabbtn" data-tab="preview">预览</button>
       <span style="flex:1"></span>
       <button id="panelClose" title="收起面板" type="button">×</button>
@@ -243,8 +251,19 @@
         <div class="pane-scroll" id="tasksBody"><div class="empty">先选择会话</div></div>
       </div>
       <div class="tabpane" id="tab-preview">
-        <div class="pane-toolbar"><span id="previewPath" class="faint">未选择文件</span><span style="flex:1"></span><button id="previewBack" type="button">文件</button></div>
+        <div class="pane-toolbar">
+          <span id="previewPath" class="faint">未选择文件</span>
+          <span style="flex:1"></span>
+          <button id="editBtn" type="button" style="display:none">编辑</button>
+          <button id="saveBtn" type="button" style="display:none">保存</button>
+          <button id="cancelBtn" type="button" style="display:none">取消</button>
+          <button id="previewBack" type="button">文件</button>
+        </div>
         <div id="preview"><div class="empty">在“文件”里点击一个文件</div></div>
+      </div>
+      <div class="tabpane" id="tab-attachments">
+        <div class="pane-toolbar"><button id="attachRefresh" type="button">刷新</button><span class="faint" id="attachHint"></span></div>
+        <div class="pane-scroll" id="attachBody"><div class="empty">点击“刷新”加载附件</div></div>
       </div>
     </div>
   </section>
@@ -422,6 +441,7 @@
     if (name === 'files') loadFiles();
     if (name === 'diff') loadDiff();
     if (name === 'tasks') loadTasks();
+    if (name === 'attachments') loadAttachments();
   }
   function openPanel(tab) {
     $('panel').classList.remove('collapsed');
@@ -477,16 +497,27 @@
   $('fileFilter').addEventListener('input', (event) => { state.fileFilter = event.target.value; renderFiles(); });
   $('filesRefresh').addEventListener('click', loadFiles);
 
+  function showPreview(file) {
+    const content = file.truncated ? file.content + '\n…（已截断）' : file.content;
+    $('preview').innerHTML = file.kind === 'markdown'
+      ? `<div class="text">${renderMarkdown(content)}</div>`
+      : `<pre>${escapeHtml(content)}</pre>`;
+  }
+
   async function openFile(path) {
     $('previewPath').textContent = path;
     showTab('preview');
     $('preview').innerHTML = '<div class="empty">加载中…</div>';
+    $('editBtn').style.display = 'none';
+    $('saveBtn').style.display = 'none';
+    $('cancelBtn').style.display = 'none';
     const response = await fetch(withToken('/api/workspace/file?path=' + encodeURIComponent(path)));
     if (!response.ok) {
       $('preview').innerHTML = `<div class="empty">预览失败 HTTP ${response.status}<br>${escapeHtml(await response.text())}</div>`;
       return;
     }
     const file = await response.json();
+    state.file = file;
     if (file.kind === 'image') {
       $('preview').innerHTML = `<img src="${withToken('/api/workspace/raw?path=' + encodeURIComponent(path))}" alt="${escapeHtml(path)}">`;
       return;
@@ -499,11 +530,79 @@
       $('preview').innerHTML = `<div class="empty">二进制文件（${Math.round((file.size || 0) / 1024)} KB），不提供文本预览</div>`;
       return;
     }
-    const content = file.truncated ? file.content + '\n…（已截断）' : file.content;
-    $('preview').innerHTML = file.kind === 'markdown'
-      ? `<div class="text">${renderMarkdown(content)}</div>`
-      : `<pre>${escapeHtml(content)}</pre>`;
+    showPreview(file);
+    if (!file.truncated) $('editBtn').style.display = '';
   }
+
+  $('editBtn').addEventListener('click', () => {
+    const file = state.file;
+    if (!file || file.content === undefined) return;
+    $('editBtn').style.display = 'none';
+    $('saveBtn').style.display = '';
+    $('cancelBtn').style.display = '';
+    $('preview').innerHTML = `<textarea id="editor" spellcheck="false"></textarea>`;
+    const editor = $('editor');
+    editor.value = file.content;
+    editor.focus();
+  });
+  $('cancelBtn').addEventListener('click', () => {
+    if (state.file) showPreview(state.file);
+    $('editBtn').style.display = state.file && !state.file.truncated ? '' : 'none';
+    $('saveBtn').style.display = 'none';
+    $('cancelBtn').style.display = 'none';
+  });
+  $('saveBtn').addEventListener('click', async () => {
+    if (!state.file) return;
+    const content = $('editor').value;
+    const response = await fetch(withToken('/api/workspace/file'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: state.file.path,
+        content,
+        expected_mtime_ms: state.file.mtime_ms || null,
+      }),
+    });
+    if (response.ok) {
+      $('saveBtn').style.display = 'none';
+      $('cancelBtn').style.display = 'none';
+      showBanner('已保存：' + state.file.path);
+      hideBannerLater();
+      await openFile(state.file.path);
+    } else if (response.status === 409) {
+      showBanner('保存冲突：文件已被外部修改。请取消后重新打开，再决定是否覆盖。');
+    } else {
+      showBanner('保存失败 HTTP ' + response.status + '：' + (await response.text()));
+    }
+  });
+  let bannerTimer = null;
+  function hideBannerLater() {
+    if (bannerTimer) clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(hideBanner, 2500);
+  }
+
+  async function loadAttachments() {
+    $('attachHint').textContent = '加载中…';
+    const response = await fetch(withToken('/api/attachments'));
+    if (!response.ok) { $('attachBody').innerHTML = '<div class="empty">附件加载失败 HTTP ' + response.status + '</div>'; return; }
+    const body = await response.json();
+    const images = (body.items || []).map((item) =>
+      `<div class="attach" data-path="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}">
+         <img src="${withToken('/api/workspace/raw?path=' + encodeURIComponent(item.path))}" alt="">
+         <span>${escapeHtml(item.path.split('/').pop())}</span>
+       </div>`).join('');
+    const pastes = (body.pastes || []).map((item) =>
+      `<div class="fitem" data-path="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}">${escapeHtml(item.path.split('/').pop())}<span class="sz">${Math.max(1, Math.round((item.size || 0) / 1024))}K</span></div>`).join('');
+    $('attachHint').textContent = `${(body.items || []).length} 张图片 / ${(body.pastes || []).length} 个粘贴缓存`;
+    $('attachBody').innerHTML =
+      (images ? `<div class="group">工作区图片</div><div class="attach-grid">${images}</div>` : '') +
+      (pastes ? `<div class="group">粘贴缓存</div>${pastes}` : '') +
+      (!images && !pastes ? '<div class="empty">没有图片或粘贴缓存</div>' : '');
+    $('attachBody').querySelectorAll('[data-path]').forEach((node) => {
+      node.addEventListener('click', () => openFile(node.dataset.path));
+    });
+  }
+  $('attachRefresh').addEventListener('click', loadAttachments);
 
   async function loadDiff() {
     $('diffHint').textContent = '加载中…';
@@ -543,21 +642,41 @@
   async function loadTasks() {
     if (!state.currentId) { $('tasksBody').innerHTML = '<div class="empty">先选择会话</div>'; return; }
     $('tasksBody').innerHTML = '<div class="empty">加载中…</div>';
-    const [tasksResponse, goalResponse] = await Promise.all([
+    const [tasksResponse, goalResponse, plansResponse] = await Promise.all([
       fetch(withToken('/api/session/' + encodeURIComponent(state.currentId) + '/tasks')),
       fetch(withToken('/api/workspace/goal')),
+      fetch(withToken('/api/workspace/plans')),
     ]);
-    const body = tasksResponse.ok ? await tasksResponse.json() : { todos: [], tasks: [], plan_mode: null };
+    const body = tasksResponse.ok ? await tasksResponse.json() : { todos: [], tasks: [], crons: [], plan_mode: null };
     const goal = goalResponse.ok ? (await goalResponse.json()).goal : null;
-    const goals = goal && goal.status ? `<div class="goal"><b>目标</b> ${escapeHtml(goal.text || goal.title || '')}<br><span class="faint">状态: ${escapeHtml(goal.status)}</span></div>` : '';
+    const plans = plansResponse.ok ? ((await plansResponse.json()).plans || []) : [];
+
+    const goalHtml = goal && (goal.text || goal.state)
+      ? `<div class="goal"><b>目标</b> ${escapeHtml(goal.text || '')}<br>
+          <span class="faint">状态 ${escapeHtml(goal.state || '—')} · token ${goal.tokens_used || 0}${goal.token_budget ? ' / ' + goal.token_budget : ''} · 阻塞 ${goal.blocked_count || 0} 次</span></div>`
+      : '';
+    const plansHtml = plans.length
+      ? '<div class="group">计划</div>' + plans.map((plan) => {
+          const steps = plan.plan && Array.isArray(plan.plan.steps) ? plan.plan.steps : [];
+          const done = steps.filter((step) => step.status === 'completed' || step.status === 'done').length;
+          return `<div class="todo"><span class="st">▤</span><span class="txt"><b>${escapeHtml(plan.id)}</b> ${steps.length ? done + '/' + steps.length + ' 步' : ''} <span class="faint">${plan.updated_ms ? new Date(plan.updated_ms).toLocaleString() : ''}</span></span></div>`;
+        }).join('')
+      : '';
     const todos = (body.todos || []).map((todo) => {
       const done = todo.status === 'completed';
       const mark = done ? '✔' : todo.status === 'in_progress' ? '▶' : '○';
       return `<div class="todo${done ? ' done' : ''}"><span class="st">${mark}</span><span class="txt">${escapeHtml(todo.content || '')}</span></div>`;
     }).join('');
     const tasks = (body.tasks || []).map((task) => `<div class="todo"><span class="st">◆</span><span class="txt"><b>${escapeHtml(task.tool)}</b> ${escapeHtml(task.detail || '')}</span></div>`).join('');
+    const crons = (body.crons || []).map((cron) => `<div class="todo"><span class="st">⏱</span><span class="txt"><b>${escapeHtml(cron.tool)}</b> ${escapeHtml(cron.detail || '')}</span></div>`).join('');
     const plan = body.plan_mode === true ? '<span class="chip">Plan 模式</span>' : '';
-    $('tasksBody').innerHTML = `${goals}<div style="margin:6px 0">${plan}</div>${todos ? '<div class="group">待办</div>' + todos : ''}${tasks ? '<div class="group">任务工具调用</div>' + tasks : ''}${!goals && !todos && !tasks ? '<div class="empty">该会话没有待办或任务记录</div>' : ''}`;
+    $('tasksBody').innerHTML =
+      `${goalHtml}<div style="margin:6px 0">${plan}</div>` +
+      plansHtml +
+      (todos ? '<div class="group">待办</div>' + todos : '') +
+      (tasks ? '<div class="group">任务工具调用</div>' + tasks : '') +
+      (crons ? '<div class="group">定时任务（历史）</div>' + crons : '') +
+      (!goalHtml && !plansHtml && !todos && !tasks && !crons ? '<div class="empty">该会话没有目标、计划、待办或定时记录</div>' : '');
   }
   $('tasksRefresh').addEventListener('click', loadTasks);
 

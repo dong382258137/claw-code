@@ -67,6 +67,14 @@ struct WebSettingsBody {
     panel_width: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct WriteBody {
+    path: String,
+    content: String,
+    /// 读取时的 mtime（毫秒）；不匹配说明文件在编辑期间被改动。
+    expected_mtime_ms: Option<u64>,
+}
+
 const IGNORED_DIRS: [&str; 7] = [
     ".git",
     "target",
@@ -151,10 +159,12 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/session/{id}/interrupt", post(api_interrupt))
             .route("/api/session/{id}/status", get(api_status))
             .route("/api/workspace/files", get(api_files))
-            .route("/api/workspace/file", get(api_file))
+            .route("/api/workspace/file", get(api_file).post(api_file_write))
             .route("/api/workspace/raw", get(api_raw))
             .route("/api/workspace/diff", get(api_diff))
             .route("/api/workspace/goal", get(api_goal))
+            .route("/api/workspace/plans", get(api_plans))
+            .route("/api/attachments", get(api_attachments))
             .route("/api/meta", get(api_meta))
             .route("/api/session/{id}/tasks", get(api_tasks))
             .route(
@@ -620,11 +630,13 @@ async fn api_file(State(state): State<AppState>, Query(query): Query<PathQuery>)
     }
 
     let kind = file_kind(&path);
+    let mtime_ms = modified_ms(&path);
     if kind == "image" || kind == "pdf" {
         return Json(json!({
             "kind": kind,
             "path": rel,
             "size": metadata.len(),
+            "mtime_ms": mtime_ms,
         }))
         .into_response();
     }
@@ -646,14 +658,169 @@ async fn api_file(State(state): State<AppState>, Query(query): Query<PathQuery>)
             "kind": if kind == "markdown" { "markdown" } else { "text" },
             "path": rel,
             "size": metadata.len(),
+            "mtime_ms": mtime_ms,
             "truncated": truncated,
             "content": text,
         }))
         .into_response(),
-        Err(_) => {
-            Json(json!({ "kind": "binary", "path": rel, "size": metadata.len() })).into_response()
+        Err(_) => Json(json!({
+            "kind": "binary",
+            "path": rel,
+            "size": metadata.len(),
+            "mtime_ms": mtime_ms,
+        }))
+        .into_response(),
+    }
+}
+
+fn modified_ms(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_millis() as u64)
+}
+
+fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// 写文件：只允许工作区内文本文件；带 mtime 乐观锁，避免覆盖并发修改。
+async fn api_file_write(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+    Json(body): Json<WriteBody>,
+) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let path = match resolve_in_workspace(&state.workspace, &body.path) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return (StatusCode::NOT_FOUND, "文件不存在").into_response();
+    };
+    if !metadata.is_file() {
+        return (StatusCode::BAD_REQUEST, "不是文件").into_response();
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "文件过大，不支持在线编辑").into_response();
+    }
+    if body.content.len() > MAX_TEXT_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "内容超过 512KB，拒绝写入").into_response();
+    }
+    if let Some(expected) = body.expected_mtime_ms {
+        if let Some(actual) = modified_ms(&path) {
+            if actual != expected {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("文件已被修改（{actual} != {expected}），请重新加载后再编辑"),
+                )
+                    .into_response();
+            }
         }
     }
+    match atomic_write(&path, &body.content) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "path": body.path,
+            "mtime_ms": modified_ms(&path),
+            "size": body.content.len(),
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+/// `.claw/plans/*.json`：计划步骤与状态（由 CLI 的计划执行器写入）。
+async fn api_plans(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let dir = state.workspace.join(".claw").join("plans");
+    let mut plans = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .unwrap_or(Value::Null);
+            plans.push(json!({
+                "id": id,
+                "updated_ms": modified_ms(&path),
+                "plan": value,
+            }));
+        }
+    }
+    plans.sort_by_key(|plan| std::cmp::Reverse(plan["updated_ms"].as_u64().unwrap_or(0)));
+    Json(json!({ "plans": plans })).into_response()
+}
+
+/// 附件：工作区图片 + `.claw/paste-cache` 里的粘贴文本，供预览面板列取。
+async fn api_attachments(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let mut items = Vec::new();
+    let mut files = Vec::new();
+    collect_workspace_entries(&state.workspace, &state.workspace, 0, &mut files);
+    for file in files {
+        let Some(path) = file["path"].as_str() else {
+            continue;
+        };
+        if file_kind(Path::new(path)) == "image" {
+            items.push(json!({
+                "kind": "image",
+                "path": path,
+                "size": file["size"],
+            }));
+        }
+        if items.len() >= 100 {
+            break;
+        }
+    }
+
+    let paste_dir = state.workspace.join(".claw").join("paste-cache");
+    let mut pastes = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&paste_dir) {
+        for entry in entries.flatten().take(100) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+            pastes.push(json!({
+                "kind": "paste",
+                "path": format!(".claw/paste-cache/{}", name.unwrap_or_default()),
+                "size": entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+                "updated_ms": modified_ms(&path),
+            }));
+        }
+    }
+    pastes.sort_by_key(|item| std::cmp::Reverse(item["updated_ms"].as_u64().unwrap_or(0)));
+
+    Json(json!({ "items": items, "pastes": pastes })).into_response()
 }
 
 async fn api_raw(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
@@ -778,6 +945,7 @@ async fn api_tasks(
 
     let mut todos: Option<Vec<Value>> = None;
     let mut tasks: Vec<Value> = Vec::new();
+    let mut crons: Vec<Value> = Vec::new();
     let mut plan_mode: Option<bool> = None;
 
     'outer: for message in session.messages.iter().rev() {
@@ -799,9 +967,13 @@ async fn api_tasks(
                     "tool": name,
                     "detail": truncate_middle(input, 240),
                 })),
+                "CronCreate" | "CronDelete" if crons.len() < 20 => crons.push(json!({
+                    "tool": name,
+                    "detail": truncate_middle(input, 240),
+                })),
                 _ => {}
             }
-            if todos.is_some() && plan_mode.is_some() && tasks.len() >= 20 {
+            if todos.is_some() && plan_mode.is_some() && tasks.len() >= 20 && crons.len() >= 20 {
                 break 'outer;
             }
         }
@@ -812,6 +984,7 @@ async fn api_tasks(
         "plan_mode": plan_mode,
         "todos": todos.unwrap_or_default(),
         "tasks": tasks,
+        "crons": crons,
     }))
     .into_response()
 }
@@ -1260,5 +1433,16 @@ mod tests {
         assert_eq!(file_kind(Path::new("a/b.rs")), "text");
         assert_eq!(file_kind(Path::new("a/b.md")), "markdown");
         assert_eq!(file_kind(Path::new("a/b.bin")), "binary");
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_reports_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        std::fs::write(&path, "old").unwrap();
+        let before = modified_ms(&path).expect("mtime");
+        atomic_write(&path, "new content").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+        assert!(modified_ms(&path).expect("mtime") >= before);
     }
 }
