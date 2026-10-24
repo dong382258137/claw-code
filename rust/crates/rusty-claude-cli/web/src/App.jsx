@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, postJson, token, withToken, wsUrl, rawUrl } from './api'
 import { Markdown } from './markdown'
+import { groupTurns, processTitle } from './turns'
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-_]/g
 const TABS = [
   { id: 'files', label: '文件' },
@@ -667,6 +668,7 @@ function Conversation({ messages, optimistic, live, liveThinking, liveTools, loa
     [messages],
   )
   const shown = visible.length > visibleCount ? visible.slice(-visibleCount) : visible
+  const turns = useMemo(() => groupTurns(shown), [shown])
   return (
     <>
       <div className="messages" ref={ref} onScroll={onScroll}>
@@ -689,41 +691,14 @@ function Conversation({ messages, optimistic, live, liveThinking, liveTools, loa
             </button>
           </div>
         )}
-        {shown.map((message, index) => <Message key={index} message={message} />)}
+        {turns.map((turn, index) => <TurnView key={index} turn={turn} />)}
         {optimistic && (
-          <div className="msg user optimistic" key="optimistic">
-            <div className="msg-head"><span className="who">你</span><span className="ts">{fmtClock(optimistic.at)}</span><span className="pending">发送中…</span></div>
-            <div className="msg-body"><Markdown text={optimistic.text} /></div>
-          </div>
+          <UserMessage
+            pending
+            message={{ role: 'user', blocks: [{ kind: 'text', text: optimistic.text }], ts: optimistic.at }}
+          />
         )}
-        {live && (
-          <div className="msg assistant live" key="live">
-            <div className="msg-head"><span className="who">助手</span><span className="pending">流式输出…</span></div>
-            <div className="msg-body">
-              {liveThinking && (
-                <details className="thinking" open>
-                  <summary>思考中…</summary>
-                  <pre>{liveThinking}</pre>
-                </details>
-              )}
-              <Markdown text={live} />
-              <span className="cursor" />
-            </div>
-          </div>
-        )}
-        {(liveTools || []).length > 0 && (
-          <div className="msg tool live-tools" key="live-tools">
-            <div className="msg-head"><span className="who">工具</span><span className="pending">执行中…</span></div>
-            <div className="msg-body">
-              {(liveTools || []).map((tool) => (
-                <details className={`tool ${tool.is_error ? 'error' : ''}`} key={tool.id} open={!tool.done || (tool.output || '').length < 600}>
-                  <summary><span className="tool-name">{tool.done ? (tool.is_error ? '✗' : '✓') : '▶'} {tool.name}{tool.done ? '' : '（运行中）'}</span></summary>
-                  <pre>{tool.done ? tool.output : tool.input}</pre>
-                </details>
-              ))}
-            </div>
-          </div>
-        )}
+        {live && <LiveTurn thinking={liveThinking} tools={liveTools || []} text={live} />}
         </div>
       </div>
       {!atBottom && <button className="jump" onClick={jumpToLatest}>回到最新 ↓</button>}
@@ -731,9 +706,22 @@ function Conversation({ messages, optimistic, live, liveThinking, liveTools, loa
   )
 }
 
-function Message({ message }) {
-  const [copied, setCopied] = useState(false)
+function UserMessage({ message, pending }) {
   const text = (message.blocks || []).filter((block) => block.kind === 'text').map((block) => block.text).join('\n')
+  return (
+    <div className="msg user">
+      <div className="msg-head">
+        <span className="who">你</span>
+        {message.ts ? <span className="ts">{fmtClock(message.ts)}</span> : null}
+        {pending ? <span className="pending">发送中…</span> : null}
+      </div>
+      <div className="msg-body"><Markdown text={text} /></div>
+    </div>
+  )
+}
+
+function AnswerMessage({ text, ts }) {
+  const [copied, setCopied] = useState(false)
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(text)
@@ -742,47 +730,92 @@ function Message({ message }) {
     } catch (_) {}
   }
   return (
-    <div className={`msg ${message.role}`}>
+    <div className="msg assistant">
       <div className="msg-head">
-        <span className="who">{{ user: '你', assistant: '助手', tool: '工具', system: '系统' }[message.role] || message.role}</span>
-        {message.ts ? <span className="ts" title={new Date(message.ts).toLocaleString()}>{fmtClock(message.ts)}</span> : null}
-        {text && <button className="ghost" onClick={copy}>{copied ? '已复制' : '复制'}</button>}
+        <span className="who">助手</span>
+        {ts ? <span className="ts">{fmtClock(ts)}</span> : null}
+        <button className="ghost" onClick={copy}>{copied ? '已复制' : '复制'}</button>
       </div>
-      <div className="msg-body">
-        {(message.blocks || []).map((block, index) => <Block key={index} block={block} />)}
-      </div>
+      <div className="msg-body"><Markdown text={text} /></div>
     </div>
   )
 }
 
-function Block({ block }) {
-  if (block.kind === 'thinking') {
+function ProcessRow({ row }) {
+  if (row.kind === 'thinking') {
     return (
-      <details className="thinking">
-        <summary>思考过程</summary>
-        <pre>{block.text || ''}</pre>
+      <details className="process-thinking">
+        <summary>思考</summary>
+        <pre>{row.text}</pre>
       </details>
     )
   }
-  if (block.kind === 'tool_use') {
-    return (
-      <details className="tool" open={(block.input || '').length <= 240}>
-        <summary><span className="tool-name">▶ {block.name}</span></summary>
-        <pre>{block.input || ''}</pre>
-      </details>
-    )
-  }
-  if (block.kind === 'tool_result') {
-    const output = block.output || ''
+  if (row.kind === 'tool') {
+    const state = row.output === null ? 'running' : row.error ? 'error' : 'done'
+    const mark = state === 'running' ? '◌' : state === 'error' ? '✗' : '✓'
+    const output = row.output || ''
     const isDiff = /^(diff --git|@@ )/m.test(output) || output.includes('\n@@ ')
     return (
-      <details className={`tool ${block.is_error ? 'error' : ''}`} open={output.length <= 600 || isDiff}>
-        <summary><span className="tool-name">{block.is_error ? '✗' : '✓'} {block.name}{isDiff ? ' · diff' : ''}</span></summary>
-        {isDiff ? <pre className="patch">{colorizePatch(output)}</pre> : <pre>{output}</pre>}
+      <details className={`process-tool ${state}`} open={state === 'running'}>
+        <summary><span className="tool-mark">{mark}</span> {row.name}</summary>
+        {row.input ? <pre className="tool-input">{row.input}</pre> : null}
+        {output ? (isDiff ? <pre className="patch">{colorizePatch(output)}</pre> : <pre>{output}</pre>) : null}
       </details>
     )
   }
-  return <Markdown text={block.text || ''} />
+  return <div className="process-text"><Markdown text={row.text} /></div>
+}
+
+function ProcessGroup({ rows, live = false, durationMs = 0 }) {
+  const [open, setOpen] = useState(live)
+  useEffect(() => { if (live) setOpen(true) }, [live])
+  if (!rows.length) return null
+  return (
+    <div className={`process ${live ? 'live' : ''}`}>
+      <button type="button" className="process-head" onClick={() => setOpen((value) => !value)}>
+        <span className="process-icon">✦</span>
+        <span className="process-label">{processTitle(rows, live, durationMs)}</span>
+        <span className={`process-chevron ${open ? 'open' : ''}`}>⌄</span>
+      </button>
+      {open && <div className="process-body">{rows.map((row, index) => <ProcessRow key={index} row={row} />)}</div>}
+    </div>
+  )
+}
+
+function TurnView({ turn }) {
+  const durationMs = turn.ts && turn.end ? Math.max(0, turn.end - turn.ts) : 0
+  return (
+    <div className="turn">
+      {turn.user && <UserMessage message={turn.user} />}
+      {turn.rows.length > 0 && <ProcessGroup rows={turn.rows} durationMs={durationMs} />}
+      {turn.answer && <AnswerMessage text={turn.answer} ts={turn.end} />}
+    </div>
+  )
+}
+
+function LiveTurn({ thinking, tools, text }) {
+  const rows = []
+  if (thinking) rows.push({ kind: 'thinking', text: thinking })
+  for (const tool of tools) {
+    rows.push({
+      kind: 'tool',
+      name: tool.name,
+      input: tool.input || '',
+      output: tool.done ? (tool.output || '') : null,
+      error: Boolean(tool.is_error),
+    })
+  }
+  return (
+    <div className="turn live">
+      {rows.length > 0 && <ProcessGroup rows={rows} live />}
+      {text && (
+        <div className="msg assistant">
+          <div className="msg-head"><span className="who">助手</span><span className="pending">流式输出…</span></div>
+          <div className="msg-body"><Markdown text={text} /><span className="cursor" /></div>
+        </div>
+      )}
+    </div>
+  )
 }
 
 function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission }) {

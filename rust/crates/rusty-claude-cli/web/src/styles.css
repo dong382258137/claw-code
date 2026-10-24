@@ -616,3 +616,25 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 
 .new-session { width: calc(100% - 8px); margin: 4px 4px 2px; padding: 8px 12px; border-radius: var(--r-md); background: var(--layer-2); color: var(--label-primary); font-size: 14px; text-align: left; border: 0; }
 .new-session:hover { background: var(--nav-active); }
+
+/* Turn 结构（对齐 DSH 的 Turn process 折叠） */
+.turn { margin-bottom: 18px; }
+.turn .msg.user { margin-bottom: 10px; }
+.turn .msg.assistant { margin-top: 2px; }
+.process { margin: 2px 0 10px; }
+.process-head { display: inline-flex; align-items: center; gap: 6px; background: transparent; border: 0; padding: 3px 0; color: var(--label-secondary); font-size: 13px; border-radius: var(--r-sm); }
+.process-head:hover { background: transparent; color: var(--label-primary); }
+.process-icon { color: var(--label-caption); font-size: 11px; }
+.process-chevron { font-size: 12px; color: var(--label-caption); transition: transform 0.15s var(--ease); }
+.process-chevron.open { transform: rotate(180deg); }
+.process-body { margin: 2px 0 0 6px; padding-left: 14px; border-left: 1px solid var(--border-l1); }
+.process-body details { background: transparent; border: 0; margin: 1px 0; }
+.process-body details > summary { padding: 2px 0; color: var(--label-caption); font-size: 12.5px; }
+.process-body details[open] > summary { border-bottom: 0; }
+.process-tool .tool-mark { color: var(--label-caption); }
+.process-tool.done .tool-mark { color: var(--success); }
+.process-tool.error .tool-mark { color: var(--danger); }
+.process-tool pre { max-height: 320px; padding: 6px 8px; background: var(--code-block); border-radius: var(--r-sm); margin: 4px 0; }
+.process-tool pre.tool-input { color: var(--label-caption); max-height: 120px; }
+.process-thinking pre { max-height: 240px; color: var(--label-caption); }
+.process-text { margin: 6px 0; color: var(--label-secondary); }
