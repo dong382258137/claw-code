@@ -24,7 +24,12 @@ function useToasts() {
   const push = useCallback((text, kind = 'info', action = null) => {
     if (!text) return
     const id = `${Date.now()}-${Math.random()}`
-    setToasts((list) => [...list, { id, text, kind, action }])
+    setToasts((list) => {
+      const last = list[list.length - 1]
+      // 同类错误 2 秒内只提示一次，避免失败重试时刷屏。
+      if (last && last.text === text && last.kind === kind && Date.now() - last.at < 2000) return list
+      return [...list, { id, text, kind, action, at: Date.now() }]
+    })
     setTimeout(() => setToasts((list) => list.filter((toast) => toast.id !== id)), 5000)
   }, [])
   return { toasts, push }
@@ -56,6 +61,10 @@ export default function App() {
   const [webSettings, setWebSettings] = useState({ theme: 'dark', permission: 'workspace-write' })
   const [meta, setMeta] = useState({ version: '', git_sha: '', workspace: '' })
   const { toasts, push } = useToasts()
+  // 稳定的错误回调：面板的 load 依赖它，若每次渲染换新函数会触发无限重取。
+  const panelError = useCallback((message) => {
+    if (message) push(message, 'error')
+  }, [push])
 
   const currentId = current?.id || null
   const activeWorkspace = current?.workspace || meta.workspace || ''
@@ -521,7 +530,7 @@ export default function App() {
       currentId={currentId}
       workspace={activeWorkspace}
       meta={meta}
-      onError={(message) => push(message, 'error')}
+      onError={panelError}
       onToast={push}
     />
   )
