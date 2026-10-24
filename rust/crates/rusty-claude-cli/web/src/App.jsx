@@ -21,23 +21,25 @@ const QUICK_ACTIONS = [
 
 function useToasts() {
   const [toasts, setToasts] = useState([])
-  const push = useCallback((text, kind = 'info') => {
+  const push = useCallback((text, kind = 'info', action = null) => {
     if (!text) return
     const id = `${Date.now()}-${Math.random()}`
-    setToasts((list) => [...list, { id, text, kind }])
-    setTimeout(() => setToasts((list) => list.filter((toast) => toast.id !== id)), 3600)
+    setToasts((list) => [...list, { id, text, kind, action }])
+    setTimeout(() => setToasts((list) => list.filter((toast) => toast.id !== id)), 5000)
   }, [])
   return { toasts, push }
 }
 
 export default function App() {
   const [sessions, setSessions] = useState([])
+  const [sessionTotal, setSessionTotal] = useState(0)
   const [filter, setFilter] = useState('')
   const [current, setCurrent] = useState(null)
   const [messages, setMessages] = useState([])
   const [optimistic, setOptimistic] = useState(null)
   const [running, setRunning] = useState(false)
   const [live, setLive] = useState('')
+  const [liveThinking, setLiveThinking] = useState('')
   const [liveTools, setLiveTools] = useState([])
   const [loadingSession, setLoadingSession] = useState(false)
   const [connected, setConnected] = useState(true)
@@ -67,9 +69,22 @@ export default function App() {
     api('/api/meta').then(setMeta).catch(() => {})
   }, [])
 
-  const loadSessions = useCallback(() => {
-    api('/api/sessions').then(setSessions).catch(() => {})
+  const loadSessions = useCallback(async () => {
+    try {
+      const body = await api('/api/sessions?limit=50&offset=0')
+      setSessions(body.sessions || [])
+      setSessionTotal(body.total || 0)
+    } catch (_) {}
   }, [])
+  const loadMoreSessions = useCallback(async () => {
+    try {
+      const body = await api(`/api/sessions?limit=50&offset=${sessions.length}`)
+      setSessions((list) => [...list, ...(body.sessions || []).filter((item) => !list.some((old) => old.id === item.id))])
+      setSessionTotal(body.total || 0)
+    } catch (error) {
+      push(`加载更多失败：${error.message}`, 'error')
+    }
+  }, [push, sessions.length])
   useEffect(() => {
     loadSessions()
     const timer = setInterval(loadSessions, 10000)
@@ -97,7 +112,7 @@ export default function App() {
         setMessages(view.messages || [])
         setLoadingSession(false)
         const last = view.messages?.[view.messages.length - 1]
-        if (last && last.role === 'assistant') { setLive(''); setLiveTools([]) }
+        if (last && last.role === 'assistant') { setLive(''); setLiveThinking(''); setLiveTools([]) }
         setOptimistic((pending) => {
           if (!pending) return null
           return last && last.role === 'user' ? null : pending
@@ -115,6 +130,7 @@ export default function App() {
         const data = JSON.parse(event.data)
         if (data.kind === 'delta') setLive((previous) => previous + data.text)
         else if (data.kind === 'start') setRunning(true)
+        else if (data.kind === 'thinking') setLiveThinking((previous) => (data.done && data.text ? data.text : previous + (data.done ? '' : data.text)))
         else if (data.kind === 'tool_use') setLiveTools((list) => [...list, { id: data.id, name: data.name, input: data.input, output: '', done: false, is_error: false }])
         else if (data.kind === 'tool_result') {
           setLiveTools((list) => {
@@ -132,7 +148,7 @@ export default function App() {
           })
         }
         else if (data.kind === 'done') { setRunning(false) }
-        else if (data.kind === 'error') { setLive(''); setLiveTools([]); push(`流式错误：${data.message}`, 'error') }
+        else if (data.kind === 'error') { setLive(''); setLiveThinking(''); setLiveTools([]); push(`流式错误：${data.message}`, 'error') }
       } catch (_) {}
     })
     return () => { closed = true; source.close(); events.close() }
@@ -258,11 +274,48 @@ export default function App() {
     }
   }, [push, selectSession])
 
+  const renameSession = useCallback(async (session) => {
+    const title = window.prompt('重命名会话', session.title || session.id)
+    if (title === null) return
+    const trimmed = title.trim()
+    if (!trimmed) { push('标题不能为空', 'error'); return }
+    try {
+      await api(`/api/session/${encodeURIComponent(session.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: trimmed }),
+      })
+      setSessions((list) => list.map((item) => (item.id === session.id ? { ...item, title: trimmed } : item)))
+      setCurrent((value) => (value?.id === session.id ? { ...value, title: trimmed } : value))
+    } catch (error) {
+      push(`重命名失败：${error.message}`, 'error')
+    }
+  }, [push])
+
+  const deleteSession = useCallback(async (session) => {
+    if (!window.confirm(`删除会话「${session.title || session.id}」？此操作不可恢复。`)) return
+    try {
+      await api(`/api/session/${encodeURIComponent(session.id)}`, { method: 'DELETE' })
+      setSessions((list) => list.filter((item) => item.id !== session.id))
+      setSessionTotal((total) => Math.max(0, total - 1))
+      if (currentId === session.id) {
+        setCurrent(null)
+        setMessages([])
+        setLive('')
+        setLiveTools([])
+      }
+      push('会话已删除')
+    } catch (error) {
+      push(`删除失败：${error.message}`, 'error')
+    }
+  }, [currentId, push])
+
   const send = useCallback(async (text) => {
     if (!currentId) { push('请先在左侧选择一个会话', 'error'); return }
     const trimmed = text.trim()
     if (!trimmed) return
     setLive('')
+    setLiveThinking('')
     setLiveTools([])
     setOptimistic({ text: trimmed, at: Date.now() })
     setRunning(true)
@@ -270,11 +323,12 @@ export default function App() {
       await postJson(`/api/session/${encodeURIComponent(currentId)}/prompt`, {
         text: trimmed,
         permission: webSettings.permission || 'workspace-write',
+        model: webSettings.model || undefined,
       })
     } catch (error) {
       setOptimistic(null)
       setRunning(false)
-      push(`发送失败：${error.message}`, 'error')
+      push(`发送失败：${error.message}`, 'error', { label: '重试', run: () => send(text) })
     }
   }, [currentId, push, webSettings.permission])
 
@@ -304,6 +358,10 @@ export default function App() {
       onToggle={toggleSidebar}
       onSelect={(session) => selectSession(session)}
       onNew={createSession}
+      onRename={renameSession}
+      onDelete={deleteSession}
+      total={sessionTotal}
+      onLoadMore={loadMoreSessions}
       onSettings={() => setSettingsOpen(true)}
       onTheme={() => saveSettings({ theme: webSettings.theme === 'dark' ? 'light' : 'dark' })}
       theme={webSettings.theme}
@@ -323,12 +381,14 @@ export default function App() {
         ].filter(Boolean)}
         connected={connected}
         running={running}
+        model={webSettings.model || ''}
+        onModel={(value) => saveSettings({ model: value })}
         onSettings={() => setSettingsOpen(true)}
         onTogglePanel={() => (panelOpen ? closePanel() : openPanel())}
         panelOpen={panelOpen}
       />
       {!connected && <div className="banner">连接中断，正在重连…</div>}
-      <Conversation messages={messages} optimistic={optimistic} live={live} liveTools={liveTools} loading={loadingSession} />
+      <Conversation messages={messages} optimistic={optimistic} live={live} liveThinking={liveThinking} liveTools={liveTools} loading={loadingSession} />
       <Composer
         running={running}
         onSend={send}
@@ -418,13 +478,18 @@ function Toasts({ toasts }) {
   return (
     <div className="toasts">
       {toasts.map((toast) => (
-        <div key={toast.id} className={`toast ${toast.kind}`}>{toast.text}</div>
+        <div key={toast.id} className={`toast ${toast.kind}`}>
+          <span>{toast.text}</span>
+          {toast.action && (
+            <button className="toast-action" onClick={() => toast.action.run()}>{toast.action.label}</button>
+          )}
+        </div>
       ))}
     </div>
   )
 }
 
-function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onSettings, onTheme, theme }) {
+function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onRename, onDelete, total, onLoadMore, onSettings, onTheme, theme }) {
   const grouped = useMemo(() => {
     const query = filter.trim().toLowerCase()
     const filtered = sessions.filter((session) =>
@@ -473,18 +538,28 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
               <React.Fragment key={workspace}>
                 <div className="group">{workspace} · {items.length}</div>
                 {items.map((session) => (
-                  <button
-                    key={session.id}
-                    className={`session ${session.id === currentId ? 'active' : ''}`}
-                    onClick={() => onSelect(session)}
-                    title={session.workspace || ''}
-                  >
-                    <span className="title">{session.title || session.id}</span>
-                    <span className="meta">{relTime(session.modified)}</span>
-                  </button>
+                  <div key={session.id} className={`session-row ${session.id === currentId ? 'active' : ''}`}>
+                    <button
+                      className="session"
+                      onClick={() => onSelect(session)}
+                      title={session.workspace || ''}
+                    >
+                      <span className="title">{session.title || session.id}</span>
+                      <span className="meta">{relTime(session.modified)}</span>
+                    </button>
+                    <span className="session-actions">
+                      <button title="重命名" onClick={(event) => { event.stopPropagation(); onRename(session) }}>✎</button>
+                      <button title="删除" onClick={(event) => { event.stopPropagation(); onDelete(session) }}>×</button>
+                    </span>
+                  </div>
                 ))}
               </React.Fragment>
             ))}
+            {total > sessions.length && (
+              <div className="session-more">
+                <button onClick={onLoadMore}>加载更多（{sessions.length}/{total}）</button>
+              </div>
+            )}
           </div>
         </>
       )}
@@ -492,10 +567,31 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
   )
 }
 
-function TopBar({ title, chips, connected, running, onSettings, onTogglePanel, panelOpen }) {
+function TopBar({ title, chips, connected, running, onSettings, onTogglePanel, panelOpen, model, onModel }) {
+  const [draft, setDraft] = useState(model || '')
+  useEffect(() => { setDraft(model || '') }, [model])
+  const commit = () => {
+    const value = draft.trim()
+    if (value !== (model || '')) onModel(value)
+  }
   return (
     <div className="topbar">
       <span className="title">{title}</span>
+      <input
+        className="model-input"
+        list="model-presets"
+        value={draft}
+        placeholder="默认模型"
+        title="本轮模型（留空使用工作区默认）"
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => { if (event.key === 'Enter') { commit(); event.target.blur() } }}
+      />
+      <datalist id="model-presets">
+        <option value="deepseek-v4-flash" />
+        <option value="deepseek-chat" />
+        <option value="deepseek-reasoner" />
+      </datalist>
       <div className="chips">
         {chips.map((chip, index) => <span key={index} className="chip">{chip}</span>)}
         {!connected && <span className="chip warn">离线</span>}
@@ -506,15 +602,19 @@ function TopBar({ title, chips, connected, running, onSettings, onTogglePanel, p
   )
 }
 
-function Conversation({ messages, optimistic, live, liveTools, loading }) {
+function Conversation({ messages, optimistic, live, liveThinking, liveTools, loading }) {
   const ref = useRef(null)
   const stick = useRef(true)
   const [atBottom, setAtBottom] = useState(true)
+  const [visibleCount, setVisibleCount] = useState(120)
   useEffect(() => {
     const node = ref.current
     if (!node) return
     if (stick.current) node.scrollTop = node.scrollHeight
-  }, [messages, optimistic, live, liveTools])
+  }, [messages, optimistic, live, liveThinking, liveTools])
+  useEffect(() => {
+    if ((messages || []).length === 0) setVisibleCount(120)
+  }, [messages.length])
   const onScroll = () => {
     const node = ref.current
     if (!node) return
@@ -532,6 +632,7 @@ function Conversation({ messages, optimistic, live, liveTools, loading }) {
     () => (messages || []).filter((message) => (message.blocks || []).length > 0),
     [messages],
   )
+  const shown = visible.length > visibleCount ? visible.slice(-visibleCount) : visible
   return (
     <>
       <div className="messages" ref={ref} onScroll={onScroll}>
@@ -546,7 +647,14 @@ function Conversation({ messages, optimistic, live, liveTools, loading }) {
             <div className="empty-hint">Enter 发送 · Shift+Enter 换行 · / 快捷操作 · @ 引用文件</div>
           </div>
         )}
-        {visible.map((message, index) => <Message key={index} message={message} />)}
+        {visible.length > shown.length && (
+          <div className="load-earlier">
+            <button onClick={() => setVisibleCount((count) => count + 120)}>
+              加载更早（还有 {visible.length - shown.length} 条）
+            </button>
+          </div>
+        )}
+        {shown.map((message, index) => <Message key={index} message={message} />)}
         {optimistic && (
           <div className="msg user optimistic" key="optimistic">
             <div className="msg-head"><span className="who">你</span><span className="ts">{fmtClock(optimistic.at)}</span><span className="pending">发送中…</span></div>
@@ -557,6 +665,12 @@ function Conversation({ messages, optimistic, live, liveTools, loading }) {
           <div className="msg assistant live" key="live">
             <div className="msg-head"><span className="who">助手</span><span className="pending">流式输出…</span></div>
             <div className="msg-body">
+              {liveThinking && (
+                <details className="thinking" open>
+                  <summary>思考中…</summary>
+                  <pre>{liveThinking}</pre>
+                </details>
+              )}
               <Markdown text={live} />
               <span className="cursor" />
             </div>

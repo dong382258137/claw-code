@@ -62,6 +62,8 @@ struct PromptBody {
     text: String,
     /// 权限模式：read-only / workspace-write / danger-full-access（默认 workspace-write）。
     permission: Option<String>,
+    /// 本轮使用的模型；缺省时用工作区配置的默认模型。
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +129,7 @@ struct WebSettingsBody {
     panel_tab: Option<String>,
     panel_side: Option<String>,
     sidebar_collapsed: Option<bool>,
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -220,7 +223,12 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let app = Router::new()
             .route("/", get(index))
             .route("/api/sessions", get(api_sessions).post(api_create_session))
-            .route("/api/session/{id}", get(api_session))
+            .route(
+                "/api/session/{id}",
+                get(api_session)
+                    .patch(api_session_rename)
+                    .delete(api_session_delete),
+            )
             .route("/api/session/{id}/stream", get(api_stream))
             .route("/api/session/{id}/prompt", post(api_prompt))
             .route("/api/session/{id}/interrupt", post(api_interrupt))
@@ -347,14 +355,83 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn api_sessions(State(state): State<AppState>, Query(auth): Query<AuthQuery>) -> Response {
-    if !authorize(&state, &auth) {
+#[derive(Deserialize)]
+struct SessionsQuery {
+    t: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn api_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<SessionsQuery>,
+) -> Response {
+    if query.t.as_deref() != Some(state.token.as_str()) {
         return unauthorized();
     }
-    match list_sessions(&state.sessions) {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0);
+    match list_sessions(&state.sessions, &state.workspace, offset, limit) {
         Ok(value) => Json(value).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    title: String,
+}
+
+async fn api_session_rename(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<RenameBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    if let Err((code, message)) = session_path(&state.sessions, &id) {
+        return (code, message).into_response();
+    }
+    let title = body.title.trim();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "标题不能为空").into_response();
+    }
+    let title = truncate_chars(title, 120);
+    match save_session_title(&state.workspace, &id, &title) {
+        Ok(()) => Json(json!({ "id": id, "title": title })).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+async fn api_session_delete(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let path = match session_path(&state.sessions, &id) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    {
+        let running = state
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if running.contains_key(&id) {
+            return (StatusCode::CONFLICT, "会话正在执行任务，不能删除").into_response();
+        }
+    }
+    if let Err(error) = std::fs::remove_file(&path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+    remove_session_title(&state.workspace, &id);
+    let _ = std::fs::remove_file(web_todos_path(&state.workspace, &id));
+    Json(json!({ "deleted": id })).into_response()
 }
 
 async fn api_session(
@@ -452,12 +529,17 @@ fn run_web_turn(
     session_path: &Path,
     text: &str,
     mode: runtime::PermissionMode,
+    model_override: Option<String>,
     signal: runtime::HookAbortSignal,
     events: tokio::sync::broadcast::Sender<Value>,
     session_id: &str,
 ) -> Result<(), String> {
-    let model =
-        crate::config_model_for_current_dir().unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
+    let model = model_override
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| {
+            crate::config_model_for_current_dir()
+                .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+        });
     let mut cli = crate::app::LiveCli::new(
         model,
         true,
@@ -554,8 +636,17 @@ async fn api_prompt(
     let session_id = id.clone();
     let text = prompt_with_web_todos(&state.workspace, &id, &body.text);
     let mode = crate::permission_mode_from_label(permission);
+    let model = body.model.clone();
     std::thread::spawn(move || {
-        let outcome = run_web_turn(&path, &text, mode, signal, worker_events, &session_id);
+        let outcome = run_web_turn(
+            &path,
+            &text,
+            mode,
+            model,
+            signal,
+            worker_events,
+            &session_id,
+        );
         if let Err(message) = outcome {
             let _ =
                 events.send(json!({ "session": session_id, "kind": "error", "message": message }));
@@ -1436,6 +1527,7 @@ fn load_web_settings() -> Value {
         "permission": "workspace-write",
         "panel_width": 380,
         "panel_open": true,
+        "model": "",
         "panel_tab": "files",
         "panel_side": "right",
         "sidebar_collapsed": false,
@@ -1484,6 +1576,12 @@ async fn api_web_settings_set(
     if let Some(width) = body.panel_width {
         settings["panel_width"] = json!(width.clamp(260, 720));
     }
+    if let Some(model) = body.model {
+        let model = model.trim();
+        if model.chars().count() <= 100 {
+            settings["model"] = json!(model);
+        }
+    }
     if let Some(open) = body.panel_open {
         settings["panel_open"] = json!(open);
     }
@@ -1520,7 +1618,12 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "缺少或无效的访问令牌").into_response()
 }
 
-fn list_sessions(dir: &Path) -> Result<Value, String> {
+fn list_sessions(
+    dir: &Path,
+    workspace: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<Value, String> {
     // 先只做元数据扫描并排序截断，再对入选的少数会话读标题——
     // 避免为列出 50 条会话而完整解析上百个大 JSONL。
     let mut entries: Vec<(PathBuf, u64, u64)> = session_files(dir)
@@ -1540,23 +1643,81 @@ fn list_sessions(dir: &Path) -> Result<Value, String> {
         })
         .collect();
     entries.sort_by_key(|(_, modified, _)| std::cmp::Reverse(*modified));
-    entries.truncate(MAX_SESSIONS);
+    let total = entries.len();
+    let titles = load_session_titles(workspace);
 
     let sessions: Vec<Value> = entries
         .into_iter()
+        .skip(offset)
+        .take(limit)
         .filter_map(|(path, modified, size)| {
             let id = path.file_stem().and_then(|stem| stem.to_str())?.to_string();
-            let (title, workspace) = session_summary(&path);
+            let (computed_title, workspace_label) = session_summary(&path);
+            let title = titles.get(&id).cloned().unwrap_or(computed_title);
             Some(json!({
                 "id": id,
                 "modified": modified,
                 "size": size,
                 "title": title,
-                "workspace": workspace,
+                "workspace": workspace_label,
             }))
         })
         .collect();
-    Ok(json!(sessions))
+    Ok(json!({
+        "sessions": sessions,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }))
+}
+
+fn session_titles_path(workspace: &Path) -> PathBuf {
+    workspace.join(".claw").join("session-titles.json")
+}
+
+fn load_session_titles(workspace: &Path) -> HashMap<String, String> {
+    std::fs::read_to_string(session_titles_path(workspace))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .map(|object| {
+            object
+                .into_iter()
+                .filter_map(|(key, value)| value.as_str().map(|title| (key, title.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_session_title(workspace: &Path, id: &str, title: &str) -> Result<(), String> {
+    let mut titles = load_session_titles(workspace);
+    titles.insert(id.to_string(), title.to_string());
+    let path = session_titles_path(workspace);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let value = Value::Object(
+        titles
+            .into_iter()
+            .map(|(key, title)| (key, Value::String(title)))
+            .collect(),
+    );
+    atomic_write(&path, &value.to_string()).map_err(|error| error.to_string())
+}
+
+fn remove_session_title(workspace: &Path, id: &str) {
+    let mut titles = load_session_titles(workspace);
+    if titles.remove(id).is_none() {
+        return;
+    }
+    let path = session_titles_path(workspace);
+    let value = Value::Object(
+        titles
+            .into_iter()
+            .map(|(key, title)| (key, Value::String(title)))
+            .collect(),
+    );
+    let _ = atomic_write(&path, &value.to_string());
 }
 
 fn session_files(dir: &Path) -> Vec<PathBuf> {

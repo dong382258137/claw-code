@@ -218,3 +218,17 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .todo-add { display: flex; gap: 6px; padding: 6px 4px; }
 .todo-add input { flex: 1; background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 8px; outline: none; }
 .todo-add input:focus { border-color: var(--accent); }
+
+.model-input { width: 150px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; font-size: 11px; outline: none; }
+.model-input:focus { border-color: var(--accent); }
+.session-row { position: relative; display: flex; }
+.session-row .session { flex: 1; }
+.session-row.active .session { background: color-mix(in srgb, var(--accent) 14%, var(--panel)); border-left-color: var(--accent); color: var(--fg); }
+.session-actions { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); display: none; gap: 2px; background: var(--panel); padding-left: 4px; }
+.session-row:hover .session-actions { display: flex; }
+.session-actions button { padding: 0 5px; font-size: 11px; }
+.session-more { padding: 8px 10px; }
+.session-more button { width: 100%; }
+.load-earlier { padding: 4px 0 10px; text-align: center; }
+.toast { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.toast-action { padding: 1px 8px; font-size: 11px; }
