@@ -1,5 +1,5 @@
-/* 视觉层对�?DSH�? * 颜色/圆角/字体来自 packages/client/ui-theme/src/styles/{design-platform,base}.css
- * 聊天宽度与间距来�?ui-chat/ChatView.module.css、ui-conversation/ConversationRoot.module.css
+﻿/* 视觉层对�?DSH�? * 颜色/圆角/字体来自 packages/client/ui-theme/src/styles/{design-platform,base}.css
+ * 聊天宽度与间距来�?ui-chat/ChatView.module.css、ui-conversation/ConversationRoot.module.css
  * 用户气泡来自 ui-chat/MessageItem.module.css；输入卡来自 ui-conversation/InputBar.module.css
  * 侧栏来自 ui-sidebar/SidebarRoot.module.css
  */
@@ -114,7 +114,7 @@ button.danger:hover:not(:disabled) { background: rgba(242, 90, 90, 0.12); }
 button.ghost { background: transparent; border-color: transparent; color: var(--label-caption); padding: 1px 6px; font-size: 12px; }
 button.ghost:hover { color: var(--label-primary); background: var(--hover); }
 
-.app { display: grid; grid-template-columns: auto 1fr 4px auto; height: 100vh; background: var(--bg-base); }
+.app { display: grid; grid-template-columns: auto 1fr 4px auto; grid-template-rows: minmax(0, 1fr); height: 100vh; overflow: hidden; background: var(--bg-base); }
 .app.dock-left { grid-template-columns: auto 4px auto 1fr; }
 
 aside {
@@ -191,7 +191,7 @@ aside.collapsed .brand b, aside.collapsed .search, aside.collapsed .session-list
 .session-more { padding: 8px 4px; }
 .session-more button { width: 100%; border: 1px solid var(--border-l2); }
 
-main { display: flex; flex-direction: column; min-width: 0; position: relative; background: var(--bg-base); }
+main { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; position: relative; background: var(--bg-base); }
 
 .topbar {
   display: flex;
@@ -407,16 +407,17 @@ details.tool.error .tool-name { color: var(--danger); }
   border-left: 0.5px solid var(--border-l3);
   display: flex;
   flex-direction: column;
-  min-width: 300px;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 .app.dock-left .panel { border-left: 0; border-right: 0.5px solid var(--border-l3); }
 .panel-head { display: flex; align-items: center; gap: 2px; padding: 8px 10px; border-bottom: 1px solid var(--border-l1); }
 .tab { background: transparent; border-color: transparent; color: var(--label-tertiary); padding: 3px 10px; border-radius: var(--r-sm); font-size: 13px; }
 .tab.active { color: var(--label-primary); background: var(--hover); }
 .spacer { flex: 1; }
-.panel-body { flex: 1; min-height: 0; display: flex; }
-.pane-wrap { display: none; flex: 1; min-height: 0; }
+.panel-body { flex: 1; min-width: 0; min-height: 0; display: flex; }
+.pane-wrap { display: none; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .pane-wrap.active { display: flex; }
 .pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .pane-toolbar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border-l1); }
@@ -430,7 +431,7 @@ details.tool.error .tool-name { color: var(--danger); }
   font-size: 13px;
 }
 .pane-toolbar .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--label-caption); font-size: 12px; }
-.pane-body { flex: 1; min-height: 0; padding: 8px 10px; overflow: auto; font-size: 13px; }
+.pane-body { flex: 1; min-height: 0; padding: 8px 10px; overflow: auto; overflow-x: hidden; font-size: 13px; }
 .pane-body.scroll { display: block; }
 .file {
   display: flex;
@@ -500,7 +501,9 @@ details.tool.error .tool-name { color: var(--danger); }
   text-align: left;
   color: var(--label-primary);
   font-size: 13px;
+  min-width: 0;
 }
+.row > span { min-width: 0; overflow-wrap: anywhere; }
 .row.todo.done { color: var(--label-caption); text-decoration: line-through; }
 .muted { color: var(--label-caption); font-size: 12px; }
 details.plan { margin: 4px 0; }
@@ -617,7 +620,7 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .new-session { width: calc(100% - 8px); margin: 4px 4px 2px; padding: 8px 12px; border-radius: var(--r-md); background: var(--layer-2); color: var(--label-primary); font-size: 14px; text-align: left; border: 0; }
 .new-session:hover { background: var(--nav-active); }
 
-/* Turn �ṹ������ DSH �� Turn process �۵��� */
+/* Turn �ṹ������ DSH �� Turn process �۵��� */
 .turn { margin-bottom: 18px; }
 .turn .msg.user { margin-bottom: 10px; }
 .turn .msg.assistant { margin-top: 2px; }
