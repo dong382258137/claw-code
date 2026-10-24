@@ -1,4 +1,4 @@
-﻿//! Session CRUD, history, export, resume.
+//! Session CRUD, history, export, resume.
 
 use std::env;
 use std::fs;
@@ -1130,6 +1130,12 @@ pub(crate) struct UpgradeRequest {
     /// 旧进程 PID。0 = 未知(旧版标记,向后兼容)。
     #[serde(default)]
     pub(crate) old_pid: u32,
+    /// Web 热升级:旧 `claw serve` 实际监听端口。`None` = CLI/TUI 升级。
+    #[serde(default)]
+    pub(crate) web_port: Option<u16>,
+    /// Web 热升级:新 serve 复用旧 token,使已打开页面无需重新拿 URL。
+    #[serde(default)]
+    pub(crate) web_token: Option<String>,
 }
 
 /// upgrade-request.json 相对工作区的路径。
@@ -2407,6 +2413,8 @@ mod tests {
             requested_at_ms: 12345,
             from_version: "2026.9.1".to_string(),
             old_pid: 12345,
+            web_port: Some(4399),
+            web_token: Some("abc123".to_string()),
         };
         write_upgrade_request(dir.path(), &req).expect("write");
         let loaded = read_upgrade_request(dir.path()).expect("read");
@@ -2415,6 +2423,8 @@ mod tests {
         assert_eq!(loaded.requested_at_ms, 12345);
         assert_eq!(loaded.from_version, "2026.9.1");
         assert_eq!(loaded.old_pid, 12345);
+        assert_eq!(loaded.web_port, Some(4399));
+        assert_eq!(loaded.web_token.as_deref(), Some("abc123"));
     }
 
     #[test]
@@ -2426,6 +2436,8 @@ mod tests {
             requested_at_ms: 12345,
             from_version: "2026.9.1".to_string(),
             old_pid: 12345,
+            web_port: None,
+            web_token: None,
         };
         write_upgrade_request(dir.path(), &req).expect("write");
         assert!(dir.path().join(UPGRADE_REQUEST_REL).exists());

@@ -2943,6 +2943,8 @@ impl LiveCli {
             requested_at_ms: now_ms,
             from_version: crate::version_label(),
             old_pid,
+            web_port: None,
+            web_token: None,
         };
         write_upgrade_request(&cwd, &req)?;
 

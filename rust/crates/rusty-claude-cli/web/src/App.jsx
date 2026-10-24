@@ -42,6 +42,7 @@ export default function App() {
   const [liveThinking, setLiveThinking] = useState('')
   const [liveTools, setLiveTools] = useState([])
   const [approvals, setApprovals] = useState([])
+  const [upgrading, setUpgrading] = useState('')
   const [loadingSession, setLoadingSession] = useState(false)
   const [connected, setConnected] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -150,6 +151,7 @@ export default function App() {
           })
         }
         else if (data.kind === 'done') { setRunning(false) }
+        else if (data.kind === 'upgrading') { setUpgrading(data.message || '正在热升级：重建并重启 Web 服务…'); setRunning(false) }
         else if (data.kind === 'error') { setLive(''); setLiveThinking(''); setLiveTools([]); push(`流式错误：${data.message}`, 'error') }
       } catch (_) {}
     })
@@ -165,6 +167,27 @@ export default function App() {
     }, 1200)
     return () => clearInterval(timer)
   }, [currentId])
+
+  // Web 热升级：服务重启期间轮询 /api/meta，恢复后自动 reload 拿到新前端。
+  useEffect(() => {
+    if (!upgrading) return undefined
+    const started = Date.now()
+    const timer = setInterval(async () => {
+      if (Date.now() - started > 240_000) {
+        clearInterval(timer)
+        setUpgrading('升级超时：请查看 .claw/upgrade-helper.log，或手动重启 claw-web')
+        return
+      }
+      try {
+        const response = await fetch(withToken('/api/meta'))
+        if (response.ok) {
+          clearInterval(timer)
+          location.reload()
+        }
+      } catch (_) {}
+    }, 1500)
+    return () => clearInterval(timer)
+  }, [upgrading])
 
   /* ---------- 布局 ---------- */
   const saveSettings = useCallback(async (patch, { silent = true } = {}) => {
@@ -401,6 +424,7 @@ export default function App() {
         panelOpen={panelOpen}
       />
       {!connected && <div className="banner">连接中断，正在重连…</div>}
+      {upgrading && <div className="banner upgrade">⚙ {upgrading}</div>}
       <Conversation messages={messages} optimistic={optimistic} live={live} liveThinking={liveThinking} liveTools={liveTools} loading={loadingSession} />
       <Composer
         running={running}

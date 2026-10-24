@@ -655,3 +655,5 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .attachment-chip .ghost { padding: 0 2px; }
 
 .panel.fullscreen .pane-body, .panel.fullscreen .pane-toolbar { width: 100%; max-width: 960px; margin-left: auto; margin-right: auto; }
+
+.banner.upgrade { background: rgba(122, 170, 255, 0.12); color: var(--link); }

@@ -1,4 +1,4 @@
-//! 升级助手(任务 2:热升级一键化,无感衔接)。
+﻿//! 升级助手(任务 2:热升级一键化,无感衔接)。
 //!
 //! 由 `/upgrade` 命令 spawn 的**独立进程**(自带新控制台,编译输出可见)。
 //! 自动化"备份 exe → cargo build → 启动新进程"三步,使用户无需手动介入。
@@ -23,11 +23,12 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::session_mgr::{
-    clear_upgrade_exited, read_upgrade_exited, read_upgrade_request, UPGRADE_EXITED_REL,
+    clear_upgrade_exited, clear_upgrade_request, read_upgrade_exited, read_upgrade_request,
+    UPGRADE_EXITED_REL,
 };
 
 /// 轮询"旧进程已退出"标记的间隔。
@@ -285,6 +286,9 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
                 built.display()
             ),
         );
+        // 部署目录里通常同时存在 claw.exe 与 claw-web.exe（硬链接快捷入口）。
+        // 替换其中一个后另一个仍指向旧内容，必须一起同步，否则双击快捷方式还是旧版本。
+        sync_launcher_siblings(&exe, &built, &log_file);
     }
 
     // 4. 启动新 exe(user_cwd 为工作目录 → 自动检测标记 → resume 会话)。
@@ -297,7 +301,56 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     );
     let mut cmd = Command::new(&exe);
     cmd.current_dir(user_cwd);
-    // 显式把新进程 stdio 指向 helper 自己的控制台(不依赖继承):
+
+    // Web 模式：旧进程是 `claw serve`。启动新进程继续跑 serve（同端口、同 token），
+    // 并脱离 helper 的控制台，避免用户关掉升级窗口时把 Web 服务一起带走。
+    let web_request = read_upgrade_request(user_cwd).filter(|req| req.web_port.is_some());
+    if let Some(request) = web_request {
+        let port = request.web_port.expect("filtered web_port");
+        std::thread::sleep(Duration::from_millis(1200));
+        let mut web_cmd = Command::new(&exe);
+        web_cmd.current_dir(user_cwd);
+        for arg in web_restart_args(port, user_cwd) {
+            web_cmd.arg(arg);
+        }
+        if let Some(token) = request.web_token.as_deref() {
+            web_cmd.env("CLAW_WEB_TOKEN", token);
+        }
+        web_cmd.stdin(Stdio::null());
+        match open_web_server_log(user_cwd) {
+            Some(file) => {
+                if let Ok(clone) = file.try_clone() {
+                    web_cmd.stdout(Stdio::from(file));
+                    web_cmd.stderr(Stdio::from(clone));
+                }
+            }
+            None => {
+                web_cmd.stdout(Stdio::null());
+                web_cmd.stderr(Stdio::null());
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            web_cmd.creation_flags(DETACHED_PROCESS);
+        }
+        let child = web_cmd.spawn()?;
+        log_out(
+            &log_file,
+            &format!(
+                "[upgrade-helper] Web 服务已重启: pid={} port={} (日志 .claw/web-server.log)",
+                child.id(),
+                port
+            ),
+        );
+        clear_upgrade_exited(user_cwd);
+        // 请求标记已消费：避免下次手动启动 CLI 时误 resume 旧会话。
+        clear_upgrade_request(user_cwd);
+        return Ok(());
+    }
+
+    // CLI/TUI 模式：把新进程 stdio 指向 helper 自己的控制台(不依赖继承):
     // 用户 TUI 的 stdio 可能是管道(从 IDE/启动器启动),旧进程退出后管道读端
     // 关闭 → 新进程初始化时 println! 触发 os error 232 panic。实测 CREATE_NEW_CONSOLE
     // 子进程在父 stdio 是管道时默认 GetStdHandle 仍无效(errno 22),但**能显式打开
@@ -365,6 +418,69 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         );
     }
     Ok(())
+}
+
+/// Web 热升级：新 serve 的启动参数（纯函数便于测试）。
+fn web_restart_args(port: u16, user_cwd: &Path) -> Vec<String> {
+    vec![
+        "serve".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--cwd".to_string(),
+        user_cwd.display().to_string(),
+        "--no-open".to_string(),
+    ]
+}
+
+/// Web 热升级：新 serve 的日志（stdout/stderr 追加）。
+fn open_web_server_log(user_cwd: &Path) -> Option<File> {
+    let path = user_cwd.join(".claw").join("web-server.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// 部署目录里同时存在 `claw.exe` / `claw-web.exe` 时，把构建产物同步到另一个入口。
+fn sync_launcher_siblings(exe: &Path, built: &Path, log_file: &Option<File>) {
+    let Some(parent) = exe.parent() else {
+        return;
+    };
+    let Some(current) = exe.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    for name in ["claw.exe", "claw-web.exe"] {
+        if name == current {
+            continue;
+        }
+        let sibling = parent.join(name);
+        if !sibling.exists() {
+            continue;
+        }
+        if std::fs::remove_file(&sibling).is_ok() {
+            match std::fs::copy(built, &sibling) {
+                Ok(_) => log_out(
+                    log_file,
+                    &format!(
+                        "[upgrade-helper] 同步入口: {} ← {}",
+                        sibling.display(),
+                        built.display()
+                    ),
+                ),
+                Err(error) => log_out(
+                    log_file,
+                    &format!(
+                        "[upgrade-helper] 同步入口失败 {}: {error}",
+                        sibling.display()
+                    ),
+                ),
+            }
+        }
+    }
 }
 
 /// 备份路径:`claw-plus.exe` → `claw-plus.exe.old`。
@@ -619,5 +735,45 @@ mod tests {
         let err =
             workspace_root_from_user_cwd(dir.path()).expect_err("should reject non-workspace dir");
         assert!(err.to_string().contains("无法从工作目录"), "got: {err}");
+    }
+
+    #[test]
+    fn web_restart_args_keep_port_cwd_and_disable_browser() {
+        let args = web_restart_args(4399, Path::new(r"D:\work\repo"));
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "--port",
+                "4399",
+                "--cwd",
+                r"D:\work\repo",
+                "--no-open"
+            ]
+        );
+    }
+
+    #[test]
+    fn sync_launcher_siblings_replaces_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("claw.exe");
+        let sibling = dir.path().join("claw-web.exe");
+        let built = dir.path().join("built.exe");
+        std::fs::write(&exe, "new").unwrap();
+        std::fs::write(&sibling, "old").unwrap();
+        std::fs::write(&built, "new").unwrap();
+        sync_launcher_siblings(&exe, &built, &None);
+        assert_eq!(std::fs::read_to_string(&sibling).unwrap(), "new");
+    }
+
+    #[test]
+    fn sync_launcher_siblings_skips_missing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("claw.exe");
+        let built = dir.path().join("built.exe");
+        std::fs::write(&exe, "new").unwrap();
+        std::fs::write(&built, "new").unwrap();
+        sync_launcher_siblings(&exe, &built, &None);
+        assert!(!dir.path().join("claw-web.exe").exists());
     }
 }

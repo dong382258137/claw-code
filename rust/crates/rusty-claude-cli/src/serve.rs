@@ -42,6 +42,8 @@ struct AppState {
     sessions: PathBuf,
     /// 工作区根，作为 turn 的 cwd。
     workspace: PathBuf,
+    /// 实际监听端口（热升级时传给 helper，重启后沿用同一端口）。
+    port: u16,
     /// 正在跑 turn 的会话（同一会话同时只允许一个写入者）。
     running: Arc<Mutex<HashMap<String, RunningTurn>>>,
     /// 流式事件广播：`{session, kind, ...}`，供 `/api/session/{id}/events` 订阅。
@@ -214,18 +216,59 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::env::set_current_dir(&cwd);
     let store = runtime::SessionStore::from_cwd(&cwd)?;
     let sessions = store.sessions_dir().to_path_buf();
-    let token = generate_token();
+    // 热升级交接：helper 通过 CLAW_WEB_TOKEN 传入旧 token，新进程复用它，
+    // 已打开的页面才能在服务重启后继续重连。手动启动则始终生成新 token。
+    let token = web_token_from_env().unwrap_or_else(generate_token);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     runtime.block_on(async move {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                // 热升级交接：旧进程刚 exit，Windows 上端口可能还被残留的监听
+                // 条目占着（owner 已是死 PID）。此时必须等它释放并复用同一端口，
+                // 否则会退回随机端口，已打开的页面就失联了。
+                if std::env::var("CLAW_WEB_TOKEN").is_ok() && port != 0 {
+                    eprintln!("端口 {port} 暂未释放（{error}），等待旧进程退出后接管…");
+                    let mut bound = None;
+                    for _ in 0..40 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+                            bound = Some(listener);
+                            break;
+                        }
+                    }
+                    match bound {
+                        Some(listener) => listener,
+                        None => {
+                            eprintln!("端口 {port} 10 秒内未释放，退回随机端口（页面需手动用新 URL 打开）。");
+                            tokio::net::TcpListener::bind(SocketAddr::from((
+                                Ipv4Addr::LOCALHOST,
+                                0,
+                            )))
+                            .await?
+                        }
+                    }
+                } else {
+                    eprintln!("端口 {port} 不可用（{error}），改用系统分配端口。");
+                    tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?
+                }
+            }
+        };
+        let actual_port = listener.local_addr()?.port();
+        // Windows 句柄继承陷阱：serve 会 spawn helper / PTY / git 等子进程，
+        // 默认它们会继承监听 socket。旧进程退出后，子进程仍持有 4399 的
+        // LISTEN 句柄，新进程就永远 bind 不上。这里显式清掉继承标志。
+        make_listener_non_inheritable(&listener);
         let (events, _) = tokio::sync::broadcast::channel(256);
         let state = AppState {
             token: token.clone(),
             sessions,
             workspace: cwd.clone(),
+            port: actual_port,
             running: Arc::new(Mutex::new(HashMap::new())),
             events,
             approvals: Arc::new(Mutex::new(HashMap::new())),
@@ -266,14 +309,6 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             )
             .with_state(state);
 
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!("端口 {port} 不可用（{error}），改用系统分配端口。");
-                tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?
-            }
-        };
-        let actual_port = listener.local_addr()?.port();
         let url = format!("http://127.0.0.1:{actual_port}/?t={token}");
         println!("claw web: {url}");
         println!("工作区: {}", cwd.display());
@@ -706,6 +741,9 @@ async fn api_prompt(
     let approvals = Arc::clone(&state.approvals);
     let running_map = Arc::clone(&state.running);
     let session_id = id.clone();
+    let workspace = state.workspace.clone();
+    let port = state.port;
+    let token = state.token.clone();
     let text = prompt_with_web_todos(&state.workspace, &id, &body.text);
     let mode = crate::permission_mode_from_label(permission);
     let model = body.model.clone();
@@ -720,7 +758,8 @@ async fn api_prompt(
             approvals,
             session_id: &session_id,
         });
-        if let Err(message) = outcome {
+        let failed = outcome.is_err();
+        if let Err(message) = &outcome {
             let _ =
                 events.send(json!({ "session": session_id, "kind": "error", "message": message }));
         }
@@ -729,6 +768,12 @@ async fn api_prompt(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&session_id);
+
+        // Agent 在 turn 里调用了 `HotUpgrade`：状态已落盘，turn 也已收尾，
+        // 此刻执行 Web 热升级（重建 → 同端口重启 → 页面凭同一 token 重连）。
+        if !failed && tools::take_hot_upgrade_request() {
+            begin_web_upgrade(&workspace, port, &token, &session_id, &events);
+        }
     });
 
     (
@@ -2116,6 +2161,86 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     }
     out
 }
+
+/// Web 热升级：helper 通过 `CLAW_WEB_TOKEN` 传入旧 token，新进程复用。
+/// 只接受 32 位十六进制，避免环境变量被塞入怪值。
+fn web_token_from_env() -> Option<String> {
+    std::env::var("CLAW_WEB_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| token.len() == 32 && token.chars().all(|ch| ch.is_ascii_hexdigit()))
+}
+
+/// Web 热升级：写请求 → spawn helper → 通知页面 → 退出旧进程。
+///
+/// 新进程由 helper 以 `serve --port <同端口>` 启动，并继承旧 token；页面上的
+/// EventSource 会在服务恢复后自动重连，随后前端轮询 `/api/meta` 成功即 reload。
+fn begin_web_upgrade(
+    workspace: &Path,
+    port: u16,
+    token: &str,
+    session_id: &str,
+    events: &tokio::sync::broadcast::Sender<Value>,
+) {
+    let old_pid = std::process::id();
+    let request = crate::session_mgr::UpgradeRequest {
+        session_id: session_id.to_string(),
+        plan_id: None,
+        requested_at_ms: now_ms() as i64,
+        from_version: crate::version_label(),
+        old_pid,
+        web_port: Some(port),
+        web_token: Some(token.to_string()),
+    };
+    if let Err(error) = crate::session_mgr::write_upgrade_request(workspace, &request) {
+        let _ = events.send(json!({
+            "session": session_id,
+            "kind": "error",
+            "message": format!("热升级请求写入失败：{error}"),
+        }));
+        return;
+    }
+    if let Err(error) = crate::upgrade_helper::spawn(workspace) {
+        crate::session_mgr::clear_upgrade_request(workspace);
+        let _ = events.send(json!({
+            "session": session_id,
+            "kind": "error",
+            "message": format!("热升级助手启动失败：{error}"),
+        }));
+        return;
+    }
+
+    let _ = events.send(json!({
+        "session": session_id,
+        "kind": "upgrading",
+        "port": port,
+        "message": "正在热升级：重建并重启 Web 服务，页面会自动恢复…",
+    }));
+    // 给 SSE 一点时间把升级通知刷到浏览器，再写 exited 让 helper 开始迁移。
+    std::thread::sleep(Duration::from_millis(700));
+    let _ = crate::session_mgr::write_upgrade_exited(workspace, old_pid);
+    std::process::exit(0);
+}
+
+/// 禁止监听 socket 被后续子进程继承（Windows 热升级必需）。
+#[cfg(windows)]
+fn make_listener_non_inheritable(listener: &tokio::net::TcpListener) {
+    use std::os::windows::io::AsRawSocket;
+
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetHandleInformation(handle: *mut core::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    let socket = listener.as_raw_socket();
+    // SAFETY: socket 来自存活的 TcpListener；只清除继承位，不关闭句柄。
+    unsafe {
+        let _ = SetHandleInformation(socket as *mut core::ffi::c_void, HANDLE_FLAG_INHERIT, 0);
+    }
+}
+
+#[cfg(not(windows))]
+fn make_listener_non_inheritable(_listener: &tokio::net::TcpListener) {}
 
 fn generate_token() -> String {
     let nanos = SystemTime::now()
