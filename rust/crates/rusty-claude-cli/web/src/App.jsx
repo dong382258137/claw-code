@@ -565,6 +565,7 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
           <div className="search">
             <input id="session-search" value={filter} onChange={(event) => onFilter(event.target.value)} placeholder="搜索会话 / Ctrl+K" />
           </div>
+          <button className="new-session" onClick={onNew}>＋ 新建会话</button>
           <div className="session-list">
             {grouped.length === 0 && <div className="empty">没有匹配的会话</div>}
             {grouped.map(([workspace, items]) => (
@@ -669,6 +670,7 @@ function Conversation({ messages, optimistic, live, liveThinking, liveTools, loa
   return (
     <>
       <div className="messages" ref={ref} onScroll={onScroll}>
+        <div className="chat-column">
         {loading && visible.length === 0 && (
           <div className="skeleton-list">
             <div className="skeleton" /><div className="skeleton short" /><div className="skeleton" />
@@ -722,6 +724,7 @@ function Conversation({ messages, optimistic, live, liveThinking, liveTools, loa
             </div>
           </div>
         )}
+        </div>
       </div>
       {!atBottom && <button className="jump" onClick={jumpToLatest}>回到最新 ↓</button>}
     </>
