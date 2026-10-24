@@ -527,36 +527,74 @@ fn session_view(path: &Path) -> Result<Value, String> {
                 runtime::MessageRole::Assistant => "assistant",
                 runtime::MessageRole::Tool => "tool",
             };
-            let mut text = Vec::new();
-            let mut tools = Vec::new();
+            // 保持原始 block 顺序：思考 → 文本 → 工具调用 → 工具结果。
+            let mut blocks = Vec::new();
             for block in &message.blocks {
                 match block {
-                    runtime::ContentBlock::Text { text: value } => text.push(value.clone()),
-                    runtime::ContentBlock::ToolUse { name, .. } => tools.push(name.clone()),
+                    runtime::ContentBlock::Text { text } => blocks.push(json!({
+                        "kind": "text",
+                        "text": truncate_middle(text, 12_000),
+                    })),
+                    runtime::ContentBlock::Thinking { thinking, .. } => blocks.push(json!({
+                        "kind": "thinking",
+                        "text": truncate_middle(thinking, 4_000),
+                    })),
+                    runtime::ContentBlock::ToolUse { name, input, .. } => blocks.push(json!({
+                        "kind": "tool_use",
+                        "name": name,
+                        "input": truncate_middle(input, 2_000),
+                    })),
                     runtime::ContentBlock::ToolResult {
                         tool_name,
+                        output,
                         is_error,
                         ..
-                    } => tools.push(format!(
-                        "{tool_name}{}",
-                        if *is_error { "（失败）" } else { "" }
-                    )),
-                    _ => {}
+                    } => blocks.push(json!({
+                        "kind": "tool_result",
+                        "name": tool_name,
+                        "output": truncate_middle(output, 4_000),
+                        "is_error": is_error,
+                    })),
                 }
             }
             json!({
                 "role": role,
-                "text": text.join("\n"),
-                "tools": tools,
+                "blocks": blocks,
             })
         })
         .collect();
 
     Ok(json!({
         "id": session.session_id,
+        "model": session.model,
+        "workspace": session
+            .workspace_root
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        "created_at_ms": session.created_at_ms,
         "messages": messages,
         "message_count": session.messages.len(),
     }))
+}
+
+/// 中间截断：保留头尾，避免长工具输出把 SSE 帧撑爆。
+fn truncate_middle(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_string();
+    }
+    let head_len = limit * 3 / 4;
+    let tail_len = limit - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}\n…（截断 {} 字符）…\n{tail}", count - limit)
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
@@ -654,5 +692,15 @@ mod tests {
     fn truncate_chars_respects_utf8_boundaries() {
         assert_eq!(truncate_chars("abc", 5), "abc");
         assert_eq!(truncate_chars("中文测试", 2), "中文…");
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        let text = "abcdefghij";
+        assert_eq!(truncate_middle(text, 100), text);
+        let cut = truncate_middle(text, 4);
+        assert!(cut.starts_with("abc"), "head kept: {cut}");
+        assert!(cut.ends_with('j'), "tail kept: {cut}");
+        assert!(cut.contains("截断"), "marker present: {cut}");
     }
 }

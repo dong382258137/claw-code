@@ -1,60 +1,121 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claw · 只读会话视图</title>
+<title>claw · 会话视图</title>
 <style>
-  :root {
-    --bg: #0f1115; --panel: #161a21; --border: #262c36;
-    --fg: #d7dce3; --dim: #8b95a5; --accent: #4f8cff;
-    --user: #7dd3a0; --assistant: #8ab4f8; --tool: #c9a227; --system: #a78bfa;
+  :root, [data-theme="dark"] {
+    --bg: #0d1014; --panel: #12161c; --panel-2: #171c24; --border: #232a35;
+    --fg: #d8dee8; --dim: #8792a3; --faint: #5d6878;
+    --accent: #5b8cff; --user: #7dd3a0; --assistant: #8ab4f8; --tool: #d3a63a;
+    --system: #a78bfa; --error: #ef6b6b; --ok: #58c08a;
+  }
+  [data-theme="light"] {
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #eef1f5; --border: #d8dee7;
+    --fg: #1e242e; --dim: #5c6675; --faint: #8b95a4;
+    --accent: #2f6fed; --user: #1f8a5b; --assistant: #235fbf; --tool: #9a6b00;
+    --system: #6d4fd1; --error: #c0392b; --ok: #1f8a5b;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; height: 100vh; background: var(--bg); color: var(--fg);
-         font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  #app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
-  aside { border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; }
-  aside header { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; color: var(--dim); }
-  #sessions { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
-  #sessions li { padding: 9px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
-  #sessions li:hover { background: #1d2330; }
-  #sessions li.active { background: #1f2940; border-left: 2px solid var(--accent); }
-  #sessions .meta { color: var(--dim); font-size: 11px; }
-  #sessions .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  main { display: flex; flex-direction: column; min-width: 0; }
-  main header { padding: 10px 14px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; color: var(--dim); }
-  #messages { flex: 1; overflow-y: auto; padding: 14px 18px; }
-  .msg { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: #12161d; }
-  .msg .role { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 6px; }
-  .msg.user .role { color: var(--user); }
-  .msg.assistant .role { color: var(--assistant); }
-  .msg.tool .role { color: var(--tool); }
-  .msg.system .role { color: var(--system); }
-  .msg .text { white-space: pre-wrap; word-break: break-word; }
-  .tools { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
-  .tool { font-size: 11px; color: var(--tool); border: 1px solid #3a3320; border-radius: 4px; padding: 1px 6px; }
-  button { background: #1f2532; color: var(--fg); border: 1px solid var(--border); border-radius: 5px; padding: 3px 8px; cursor: pointer; font: inherit; }
-  button:hover { border-color: var(--accent); }
-  .empty { color: var(--dim); padding: 20px; }
-  #composer { border-top: 1px solid var(--border); padding: 10px 12px; display: flex; gap: 8px; align-items: flex-end; background: var(--panel); }
-  #composer textarea { flex: 1; resize: vertical; min-height: 40px; background: #12161d; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
-  #composer .row { display: flex; flex-direction: column; gap: 6px; }
-  #composer select { background: #12161d; color: var(--fg); border: 1px solid var(--border); border-radius: 5px; padding: 3px 6px; font: inherit; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, "Noto Sans Mono CJK SC", monospace; }
+  button, select, input, textarea { font: inherit; color: inherit; }
+  button { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+  aside { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; }
+  .brand { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .brand b { letter-spacing: .12em; font-size: 13px; }
+  .brand .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-left: 8px; vertical-align: middle; }
+  .brand .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .search { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  .search input { width: 100%; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; outline: none; }
+  .search input:focus { border-color: var(--accent); }
+  .list { overflow-y: auto; flex: 1; }
+  .group { padding: 8px 12px 4px; color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item { padding: 8px 12px; border-bottom: 1px solid var(--border); cursor: pointer; border-left: 2px solid transparent; }
+  .item:hover { background: var(--panel-2); }
+  .item.active { background: color-mix(in srgb, var(--accent) 14%, var(--panel)); border-left-color: var(--accent); }
+  .item .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item .m { color: var(--faint); font-size: 11px; display: flex; gap: 8px; }
+  main { display: flex; flex-direction: column; min-width: 0; position: relative; }
+  .topbar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .topbar .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; color: var(--dim); font-size: 11px; margin-left: auto; }
+  .chip { border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; background: var(--panel-2); white-space: nowrap; }
+  .banner { display: none; padding: 6px 14px; background: color-mix(in srgb, var(--error) 16%, var(--bg)); color: var(--error); font-size: 12px; }
+  .banner.show { display: block; }
+  .messages { flex: 1; overflow-y: auto; padding: 16px 18px 24px; }
+  .msg { margin: 0 0 16px; }
+  .msg .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .msg .head .who { font-weight: 700; }
+  .msg.user .who { color: var(--user); } .msg.assistant .who { color: var(--assistant); }
+  .msg.tool .who { color: var(--tool); } .msg.system .who { color: var(--system); }
+  .msg .body { border-left: 2px solid var(--border); padding-left: 12px; }
+  .msg.user .body { border-left-color: color-mix(in srgb, var(--user) 55%, transparent); }
+  .msg.assistant .body { border-left-color: color-mix(in srgb, var(--assistant) 45%, transparent); }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .text h1, .text h2, .text h3 { margin: 14px 0 6px; line-height: 1.3; white-space: normal; }
+  .text h1 { font-size: 18px; } .text h2 { font-size: 16px; } .text h3 { font-size: 15px; }
+  .text code { background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  .text pre { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; white-space: pre; }
+  .text pre code { border: 0; background: none; padding: 0; }
+  .text a { color: var(--accent); }
+  .text ul { margin: 6px 0; padding-left: 20px; }
+  details { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); }
+  details > summary { cursor: pointer; padding: 5px 10px; color: var(--dim); font-size: 12px; user-select: none; }
+  details[open] > summary { border-bottom: 1px solid var(--border); }
+  details pre { margin: 0; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow: auto; }
+  details.thinking { border-left: 2px solid var(--system); }
+  details.tool { border-left: 2px solid var(--tool); }
+  details.tool.error { border-left-color: var(--error); }
+  .tool .name { color: var(--tool); }
+  .tool.error .name { color: var(--error); }
+  .empty { color: var(--dim); padding: 40px 20px; text-align: center; }
+  .jump { position: absolute; right: 22px; bottom: 110px; display: none; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
+  .jump.show { display: block; }
+  #composer { border-top: 1px solid var(--border); background: var(--panel); padding: 10px 12px; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
+  #composer textarea { resize: none; min-height: 42px; max-height: 180px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; outline: none; overflow-y: auto; }
+  #composer textarea:focus { border-color: var(--accent); }
+  .controls { display: flex; flex-direction: column; gap: 6px; }
+  .controls select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; font-size: 12px; }
+  .hint { grid-column: 1 / -1; color: var(--faint); font-size: 11px; display: flex; justify-content: space-between; }
+  @media (max-width: 860px) {
+    .app { grid-template-columns: 1fr; }
+    aside { position: absolute; z-index: 5; width: 84vw; height: 100%; transform: translateX(-100%); transition: transform .18s ease; }
+    aside.open { transform: none; box-shadow: 0 0 40px rgba(0,0,0,.4); }
+    .menu-btn { display: inline-block !important; }
+  }
+  .menu-btn { display: none; }
 </style>
 </head>
 <body>
-<div id="app">
-  <aside>
-    <header><span>会话</span><button id="refresh" type="button">刷新</button></header>
-    <ul id="sessions"></ul>
+<div class="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <span><b>CLAW</b><span id="runDot" class="dot" title="运行状态"></span></span>
+      <button id="theme" title="切换主题" type="button">◐</button>
+    </div>
+    <div class="search"><input id="q" placeholder="搜索会话 / Ctrl+K" autocomplete="off"></div>
+    <div class="list" id="list"></div>
   </aside>
+
   <main>
-    <header><span id="title">选择左侧会话</span><span id="status"></span></header>
-    <section id="messages"><div class="empty">只读视图：数据来自本地会话 JSONL，不会写入或驱动模型。</div></section>
+    <div class="topbar">
+      <button class="menu-btn" id="menu" type="button">☰</button>
+      <span class="title" id="title">未选择会话</span>
+      <div class="chips" id="chips"></div>
+    </div>
+    <div class="banner" id="banner"></div>
+    <div class="messages" id="messages">
+      <div class="empty">从左侧选择一个会话；这里只读取本地 JSONL，不会改动会话。</div>
+    </div>
+    <button class="jump" id="jump" type="button">跳到最新 ↓</button>
     <form id="composer">
-      <textarea id="prompt" rows="2" placeholder="输入内容；Ctrl+Enter 发送（需要 DEEPSEEK_API_KEY）"></textarea>
-      <div class="row">
+      <textarea id="prompt" rows="2" placeholder="输入消息；Ctrl+Enter 发送（需 DEEPSEEK_API_KEY）"></textarea>
+      <div class="controls">
         <select id="permission" title="本轮权限模式">
           <option value="workspace-write">workspace-write</option>
           <option value="read-only">read-only</option>
@@ -63,139 +124,249 @@
         <button id="send" type="submit">发送</button>
         <button id="stop" type="button">停止</button>
       </div>
+      <div class="hint"><span>Ctrl+K 搜索 · Esc 退出输入</span><span id="meta"></span></div>
     </form>
   </main>
 </div>
+
 <script>
 (function () {
+  'use strict';
   const token = new URLSearchParams(location.search).get('t') || '';
   const withToken = (path) => path + '?t=' + encodeURIComponent(token);
   const $ = (id) => document.getElementById(id);
-  let currentId = null;
-  let source = null;
+  const state = { sessions: [], currentId: null, source: null, running: false, atBottom: true, filter: '' };
 
-  function escapeHtml(text) {
-    return String(text).replace(/[&<>"']/g, (ch) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    })[ch]);
+  const escapeHtml = (text) => String(text).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[ch]);
+
+  function fmtTime(ms) {
+    if (!ms) return '';
+    const d = new Date(ms);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  function relTime(sec) {
+    if (!sec) return '';
+    const diff = Math.max(0, Date.now() / 1000 - sec);
+    if (diff < 60) return '刚刚';
+    if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+    if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+    return Math.floor(diff / 86400) + ' 天前';
   }
 
-  function formatTime(seconds) {
-    if (!seconds) return '';
-    const date = new Date(seconds * 1000);
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${date.getMonth() + 1}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  // 轻量 Markdown：代码块 / 行内代码 / 粗体 / 标题 / 列表 / 链接；先转义再加标签。
+  function renderMarkdown(raw) {
+    const parts = String(raw).split(/```/);
+    return parts.map((part, index) => {
+      if (index % 2 === 1) {
+        const body = part.replace(/^([a-zA-Z0-9_+-]*)\n/, '');
+        return `<pre><code>${escapeHtml(body)}</code></pre>`;
+      }
+      return part.split('\n').map((line) => {
+        let text = escapeHtml(line);
+        text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+        text = text.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+        text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+        if (/^###\s+/.test(line)) return `<h3>${text.replace(/^###\s+/, '')}</h3>`;
+        if (/^##\s+/.test(line)) return `<h2>${text.replace(/^##\s+/, '')}</h2>`;
+        if (/^#\s+/.test(line)) return `<h1>${text.replace(/^#\s+/, '')}</h1>`;
+        if (/^\s*[-*]\s+/.test(line)) return `<ul><li>${text.replace(/^\s*[-*]\s+/, '')}</li></ul>`;
+        return text;
+      }).join('\n').replace(/<\/ul>\n<ul>/g, '');
+    }).join('');
   }
 
-  function renderMessages(view) {
-    const box = $('messages');
-    const items = (view.messages || []).filter((m) => (m.text && m.text.trim()) || (m.tools && m.tools.length));
-    if (!items.length) {
-      box.innerHTML = '<div class="empty">该会话还没有消息。</div>';
+  function renderList() {
+    const q = state.filter.trim().toLowerCase();
+    const sessions = state.sessions.filter((s) =>
+      !q || (s.title || '').toLowerCase().includes(q) || s.id.toLowerCase().includes(q) || (s.workspace || '').toLowerCase().includes(q));
+    const list = $('list');
+    if (!sessions.length) {
+      list.innerHTML = '<div class="empty">没有匹配的会话</div>';
       return;
     }
-    box.innerHTML = items.map((m) => {
-      const tools = (m.tools || []).map((t) => `<span class="tool">${escapeHtml(t)}</span>`).join('');
-      const text = m.text ? `<div class="text">${escapeHtml(m.text)}</div>` : '';
-      return `<div class="msg ${escapeHtml(m.role)}"><div class="role">${escapeHtml(m.role)}</div>${text}${tools ? `<div class="tools">${tools}</div>` : ''}</div>`;
-    }).join('');
-    box.scrollTop = box.scrollHeight;
+    const groups = new Map();
+    for (const s of sessions) {
+      const key = (s.workspace || '').split(/[\\/]/).filter(Boolean).pop() || '未知工作区';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(s);
+    }
+    const html = [];
+    for (const [workspace, items] of groups) {
+      html.push(`<div class="group" title="${escapeHtml(items[0].workspace || '')}">${escapeHtml(workspace)} · ${items.length}</div>`);
+      for (const s of items) {
+        const active = s.id === state.currentId ? ' active' : '';
+        const size = s.size ? Math.max(1, Math.round(s.size / 1024)) + ' KB' : '';
+        html.push(`<div class="item${active}" data-id="${escapeHtml(s.id)}" title="${escapeHtml(s.workspace || '')}">
+          <div class="t">${escapeHtml(s.title || s.id)}</div>
+          <div class="m"><span>${relTime(s.modified)}</span><span>${size}</span></div>
+        </div>`);
+      }
+    }
+    list.innerHTML = html.join('');
+    list.querySelectorAll('.item').forEach((node) => {
+      node.addEventListener('click', () => { openSession(node.dataset.id); $('sidebar').classList.remove('open'); });
+    });
   }
 
-  function setStatus(text) { $('status').textContent = text; }
+  function blockHtml(block) {
+    if (block.kind === 'thinking') {
+      return `<details class="thinking"><summary>思考过程</summary><pre>${escapeHtml(block.text || '')}</pre></details>`;
+    }
+    if (block.kind === 'tool_use') {
+      const input = block.input || '';
+      const short = input.length <= 240;
+      return `<details class="tool"${short ? ' open' : ''}><summary><span class="name">▶ ${escapeHtml(block.name)}</span></summary><pre>${escapeHtml(input)}</pre></details>`;
+    }
+    if (block.kind === 'tool_result') {
+      const output = block.output || '';
+      const short = output.length <= 600;
+      return `<details class="tool${block.is_error ? ' error' : ''}"${short ? ' open' : ''}><summary><span class="name">${block.is_error ? '✗' : '✓'} ${escapeHtml(block.name)}</span></summary><pre>${escapeHtml(output)}</pre></details>`;
+    }
+    return `<div class="text">${renderMarkdown(block.text || '')}</div>`;
+  }
+
+  function renderView(view) {
+    const box = $('messages');
+    const stick = state.atBottom;
+    const items = (view.messages || []).filter((m) => (m.blocks || []).length);
+    if (!items.length) {
+      box.innerHTML = '<div class="empty">该会话还没有消息。</div>';
+    } else {
+      box.innerHTML = items.map((m) => `
+        <div class="msg ${escapeHtml(m.role)}">
+          <div class="head"><span class="who">${escapeHtml(m.role)}</span></div>
+          <div class="body">${(m.blocks || []).map(blockHtml).join('')}</div>
+        </div>`).join('');
+    }
+    $('title').textContent = view.id || '';
+    const chips = [];
+    if (view.model) chips.push(`<span class="chip">${escapeHtml(view.model)}</span>`);
+    if (view.workspace) chips.push(`<span class="chip" title="${escapeHtml(view.workspace)}">${escapeHtml(view.workspace.split(/[\\/]/).filter(Boolean).pop())}</span>`);
+    chips.push(`<span class="chip">${view.message_count} 条</span>`);
+    if (view.created_at_ms) chips.push(`<span class="chip">${fmtTime(view.created_at_ms)}</span>`);
+    $('chips').innerHTML = chips.join('');
+    $('meta').textContent = `${view.message_count} 条消息`;
+    if (stick) box.scrollTop = box.scrollHeight;
+    updateJump();
+  }
+
+  function updateJump() {
+    const box = $('messages');
+    state.atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    $('jump').classList.toggle('show', !state.atBottom);
+  }
+
+  function setRunning(running) {
+    state.running = running;
+    $('runDot').classList.toggle('on', running);
+    $('send').disabled = running;
+    if (running) $('meta').textContent = '运行中…';
+  }
+
+  function showBanner(text) { const b = $('banner'); b.textContent = text; b.classList.add('show'); }
+  function hideBanner() { $('banner').classList.remove('show'); }
 
   async function loadSessions() {
-    setStatus('加载中…');
     const response = await fetch(withToken('/api/sessions'));
-    if (!response.ok) { setStatus('HTTP ' + response.status); return; }
-    const sessions = await response.json();
-    const list = $('sessions');
-    if (!sessions.length) {
-      list.innerHTML = '<li class="meta">没有找到会话</li>';
-    } else {
-      list.innerHTML = sessions.map((s) => {
-        const workspace = (s.workspace || '').split(/[\\/]/).filter(Boolean).pop() || '';
-        return `<li data-id="${escapeHtml(s.id)}" class="${s.id === currentId ? 'active' : ''}">
-           <div class="title">${escapeHtml(s.title || s.id)}</div>
-           <div class="meta" title="${escapeHtml(s.workspace || '')}">${escapeHtml(workspace)} · ${formatTime(s.modified)}</div>
-         </li>`;
-      }).join('');
-      list.querySelectorAll('li[data-id]').forEach((node) => {
-        node.addEventListener('click', () => openSession(node.dataset.id));
-      });
-    }
-    setStatus(sessions.length + ' 个会话');
+    if (!response.ok) { showBanner('会话列表加载失败 HTTP ' + response.status); return; }
+    state.sessions = await response.json();
+    renderList();
   }
 
   async function openSession(id) {
-    currentId = id;
-    if (source) { source.close(); source = null; }
-    document.querySelectorAll('#sessions li').forEach((node) => {
-      node.classList.toggle('active', node.dataset.id === id);
-    });
-    $('title').textContent = id;
+    state.currentId = id;
+    if (state.source) { state.source.close(); state.source = null; }
+    renderList();
     const response = await fetch(withToken('/api/session/' + encodeURIComponent(id)));
-    if (!response.ok) { setStatus('HTTP ' + response.status); return; }
-    renderMessages(await response.json());
-    setStatus('已连接 · 实时跟随');
-
-    source = new EventSource(withToken('/api/session/' + encodeURIComponent(id) + '/stream'));
-    source.addEventListener('snapshot', (event) => {
-      try { renderMessages(JSON.parse(event.data)); } catch (_) {}
-    });
-    source.onerror = () => setStatus('连接中断，正在重连…');
-    source.onopen = () => setStatus('已连接 · 实时跟随');
-    startStatusPolling();
+    if (!response.ok) { showBanner('会话读取失败 HTTP ' + response.status); return; }
+    state.atBottom = true;
+    renderView(await response.json());
+    connectStream(id);
+    pollStatus(id);
   }
 
-  let statusTimer = null;
-  function startStatusPolling() {
-    if (statusTimer) clearInterval(statusTimer);
-    statusTimer = setInterval(async () => {
-      if (!currentId) return;
+  function connectStream(id) {
+    const source = new EventSource(withToken('/api/session/' + encodeURIComponent(id) + '/stream'));
+    source.addEventListener('snapshot', (event) => {
+      hideBanner();
+      try { renderView(JSON.parse(event.data)); } catch (_) {}
+    });
+    source.onerror = () => showBanner('连接中断，正在重连…');
+    source.onopen = () => hideBanner();
+    state.source = source;
+  }
+
+  let pollTimer = null;
+  function pollStatus(id) {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+      if (state.currentId !== id) return;
       try {
-        const response = await fetch(withToken('/api/session/' + encodeURIComponent(currentId) + '/status'));
+        const response = await fetch(withToken('/api/session/' + encodeURIComponent(id) + '/status'));
         if (!response.ok) return;
-        const state = await response.json();
-        $('send').disabled = Boolean(state.running);
-        if (state.running) setStatus('运行中…（可点停止）');
+        const body = await response.json();
+        setRunning(Boolean(body.running));
       } catch (_) {}
     }, 1500);
   }
 
-  $('refresh').addEventListener('click', loadSessions);
-
   async function sendPrompt() {
-    if (!currentId) { setStatus('先选择一个会话'); return; }
+    if (!state.currentId) { showBanner('先选择一个会话'); return; }
     const text = $('prompt').value.trim();
     if (!text) return;
-    const response = await fetch(withToken('/api/session/' + encodeURIComponent(currentId) + '/prompt'), {
+    const response = await fetch(withToken('/api/session/' + encodeURIComponent(state.currentId) + '/prompt'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text, permission: $('permission').value }),
+      body: JSON.stringify({ text, permission: $('permission').value }),
     });
     if (response.ok) {
       $('prompt').value = '';
-      setStatus('已发送，等待模型…');
+      autoGrow();
+      setRunning(true);
+      $('meta').textContent = '已发送，等待模型…';
     } else {
-      setStatus('发送失败 HTTP ' + response.status);
+      showBanner('发送失败 HTTP ' + response.status);
     }
   }
 
-  $('composer').addEventListener('submit', (event) => {
-    event.preventDefault();
-    sendPrompt();
+  async function stopTurn() {
+    if (!state.currentId) return;
+    const response = await fetch(withToken('/api/session/' + encodeURIComponent(state.currentId) + '/interrupt'), { method: 'POST' });
+    if (response.ok) { setRunning(false); $('meta').textContent = '已请求中断'; }
+    else showBanner('当前没有运行中的 turn');
+  }
+
+  function autoGrow() {
+    const node = $('prompt');
+    node.style.height = 'auto';
+    node.style.height = Math.min(180, node.scrollHeight) + 'px';
+  }
+
+  $('composer').addEventListener('submit', (e) => { e.preventDefault(); sendPrompt(); });
+  $('stop').addEventListener('click', stopTurn);
+  $('prompt').addEventListener('input', autoGrow);
+  $('prompt').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendPrompt(); }
+    if (e.key === 'Escape') $('prompt').blur();
   });
-  $('prompt').addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-      event.preventDefault();
-      sendPrompt();
-    }
+  $('messages').addEventListener('scroll', updateJump);
+  $('jump').addEventListener('click', () => { $('messages').scrollTop = $('messages').scrollHeight; });
+  $('q').addEventListener('input', (e) => { state.filter = e.target.value; renderList(); });
+  $('menu').addEventListener('click', () => $('sidebar').classList.toggle('open'));
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); $('q').focus(); }
   });
-  $('stop').addEventListener('click', async () => {
-    if (!currentId) return;
-    const response = await fetch(withToken('/api/session/' + encodeURIComponent(currentId) + '/interrupt'), { method: 'POST' });
-    setStatus(response.ok ? '已请求中断' : '当前没有运行中的 turn');
+
+  const themeButton = $('theme');
+  const savedTheme = localStorage.getItem('claw-theme');
+  if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+  themeButton.addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('claw-theme', next);
   });
 
   loadSessions();
