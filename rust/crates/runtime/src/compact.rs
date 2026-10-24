@@ -1,4 +1,4 @@
-use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+﻿use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -476,6 +476,7 @@ pub fn compact_session_with_trigger(
             text: continuation_with_marker,
         }],
         usage: None,
+        created_at_ms: 0,
     }];
     compacted_messages.extend(preserved);
 
@@ -1526,6 +1527,7 @@ second para",
                     text: "recent".to_string(),
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
         ];
 
@@ -1638,6 +1640,7 @@ second para",
                     text: get_compact_continuation_message(summary, true, true),
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
             ConversationMessage::user_text("tiny"),
             ConversationMessage::assistant(vec![ContentBlock::Text {
@@ -1777,6 +1780,7 @@ second para",
                     ),
                 }],
                 usage: None,
+                created_at_ms: 0,
             };
             session.push_message(assistant_msg).unwrap();
         }
@@ -1855,6 +1859,7 @@ second para",
                 text: cjk_text.to_string(),
             }],
             usage: None,
+            created_at_ms: 0,
         };
         let estimated = estimate_message_tokens(&message);
         // chars().count() / 2 + 1 for 12 chars = 7
@@ -1870,6 +1875,7 @@ second para",
                 text: ascii_text.to_string(),
             }],
             usage: None,
+            created_at_ms: 0,
         };
         let ascii_estimated = estimate_message_tokens(&ascii_msg);
         // ASCII: 12/2+1 = 7; CJK: 12/2+1 = 7 — comparable, as they should be.
@@ -2027,6 +2033,7 @@ second para",
                     text: "recent".to_string(),
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
         ];
 
@@ -2075,6 +2082,7 @@ second para",
                     text: "recent".to_string(),
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
         ];
 
@@ -2106,6 +2114,7 @@ second para",
                 text: boundary_text,
             }],
             usage: None,
+            created_at_ms: 0,
         };
         let fresh_user = ConversationMessage::user_text("fresh question");
         let fresh_assistant = ConversationMessage::assistant(vec![ContentBlock::Text {
@@ -2144,6 +2153,7 @@ second para",
                 text: "old summary\n<!-- compact_boundary: {\"trigger\":\"auto\",\"pre_tokens\":500,\"messages_summarized\":1,\"timestamp_ms\":1} -->".to_string(),
             }],
             usage: None,
+            created_at_ms: 0,
         };
         let middle_user = ConversationMessage::user_text("middle");
         let new_boundary = ConversationMessage {
@@ -2152,6 +2162,7 @@ second para",
                 text: "new summary\n<!-- compact_boundary: {\"trigger\":\"auto\",\"pre_tokens\":800,\"messages_summarized\":2,\"timestamp_ms\":2} -->".to_string(),
             }],
             usage: None,
+            created_at_ms: 0,
         };
         let fresh_user = ConversationMessage::user_text("fresh");
 
@@ -2207,6 +2218,7 @@ second para",
                 role: MessageRole::System,
                 blocks: vec![ContentBlock::Text { text: marked }],
                 usage: None,
+                created_at_ms: 0,
             },
             ConversationMessage::user_text("follow up"),
             ConversationMessage::assistant(vec![ContentBlock::Text {

@@ -1,4 +1,4 @@
-//! Session CRUD, history, export, resume.
+﻿//! Session CRUD, history, export, resume.
 
 use std::env;
 use std::fs;
@@ -2053,6 +2053,7 @@ mod tests {
             role,
             blocks,
             usage: None,
+            created_at_ms: 0,
         });
         session
     }
@@ -2240,6 +2241,7 @@ mod tests {
                 ),
             ],
             usage: None,
+            created_at_ms: 0,
         });
         session.messages.push(ConversationMessage {
             role: MessageRole::Assistant,
@@ -2249,6 +2251,7 @@ mod tests {
                 r#"{"filePath":"/tmp/newer.rs","oldString":"x","newString":"y"}"#,
             )],
             usage: None,
+            created_at_ms: 0,
         });
         // Don't actually run undo (file doesn't exist on disk); instead
         // verify we got past the "nothing to undo" guard and into the

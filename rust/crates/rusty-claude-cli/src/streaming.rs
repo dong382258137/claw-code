@@ -1,4 +1,4 @@
-//! Streaming API client: SSE consumption, message conversion, error formatting.
+﻿//! Streaming API client: SSE consumption, message conversion, error formatting.
 //!
 //! This module groups the API client wiring (`AnthropicRuntimeClient`), the
 //! streaming SSE consumption loop (`consume_stream`), the request building
@@ -1736,6 +1736,7 @@ mod status_emitter_tests {
             role,
             blocks,
             usage: None,
+            created_at_ms: 0,
         }
     }
 

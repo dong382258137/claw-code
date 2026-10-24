@@ -211,3 +211,10 @@ details.tool.error { border-left-color: var(--error); }
 .attach { cursor: pointer; text-align: left; }
 details.plan { margin: 4px 0; }
 details.plan > summary { display: flex; justify-content: space-between; gap: 10px; }
+
+.msg-head .ts { color: var(--faint); font-size: 10px; }
+.todo-check { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; }
+.todo-check input { accent-color: var(--accent); }
+.todo-add { display: flex; gap: 6px; padding: 6px 4px; }
+.todo-add input { flex: 1; background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 8px; outline: none; }
+.todo-add input:focus { border-color: var(--accent); }

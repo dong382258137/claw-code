@@ -65,6 +65,54 @@ struct PromptBody {
 }
 
 #[derive(Deserialize)]
+struct TodoItemBody {
+    text: String,
+    #[serde(default)]
+    done: bool,
+}
+
+#[derive(Deserialize)]
+struct TodosBody {
+    items: Vec<TodoItemBody>,
+}
+
+fn web_todos_path(workspace: &Path, id: &str) -> PathBuf {
+    workspace
+        .join(".claw")
+        .join("web-todos")
+        .join(format!("{id}.json"))
+}
+
+fn load_web_todos(workspace: &Path, id: &str) -> Vec<Value> {
+    std::fs::read_to_string(web_todos_path(workspace, id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value["items"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// 把 Web 端维护的待办清单作为上下文前缀注入 prompt，让 agent 看得到当前进度。
+fn prompt_with_web_todos(workspace: &Path, id: &str, text: &str) -> String {
+    let mut lines = Vec::new();
+    for item in load_web_todos(workspace, id).iter().take(100) {
+        let label = item["text"].as_str().unwrap_or("").trim();
+        if label.is_empty() {
+            continue;
+        }
+        let done = item["done"].as_bool().unwrap_or(false);
+        lines.push(format!("- [{}] {}", if done { 'x' } else { ' ' }, label));
+    }
+    if lines.is_empty() {
+        return text.to_string();
+    }
+    format!(
+        "[Web 待办状态（用户在 Web 端维护，可作为当前任务清单）]\n{}\n\n{}",
+        lines.join("\n"),
+        text
+    )
+}
+
+#[derive(Deserialize)]
 struct PathQuery {
     t: Option<String>,
     path: Option<String>,
@@ -149,6 +197,9 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => strip_verbatim(path),
         None => strip_verbatim(default_workspace()),
     };
+    // serve 进程内跑 turn 时，LiveCli 以进程 cwd 作为工作区；因此把 cwd 对齐到
+    // `--cwd`（同时让 `.env` 从工作区加载）。serve 是单工作区进程，这样是安全的。
+    let _ = std::env::set_current_dir(&cwd);
     let store = runtime::SessionStore::from_cwd(&cwd)?;
     let sessions = store.sessions_dir().to_path_buf();
     let token = generate_token();
@@ -184,6 +235,10 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/meta", get(api_meta))
             .route("/ws/terminal", get(ws_terminal))
             .route("/api/session/{id}/tasks", get(api_tasks))
+            .route(
+                "/api/session/{id}/todos",
+                get(api_todos_get).post(api_todos_set),
+            )
             .route("/api/session/{id}/events", get(api_events))
             .route(
                 "/api/web-settings",
@@ -497,7 +552,7 @@ async fn api_prompt(
     let worker_events = events.clone();
     let running_map = Arc::clone(&state.running);
     let session_id = id.clone();
-    let text = body.text.clone();
+    let text = prompt_with_web_todos(&state.workspace, &id, &body.text);
     let mode = crate::permission_mode_from_label(permission);
     std::thread::spawn(move || {
         let outcome = run_web_turn(&path, &text, mode, signal, worker_events, &session_id);
@@ -1247,6 +1302,55 @@ async fn api_goal(State(state): State<AppState>, Query(query): Query<PathQuery>)
     Json(json!({ "goal": goal })).into_response()
 }
 
+/// Web 端维护的待办清单（sidecar JSON），发送消息时会作为上下文注入。
+async fn api_todos_get(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    if let Err((code, message)) = session_path(&state.sessions, &id) {
+        return (code, message).into_response();
+    }
+    Json(json!({ "session": id, "items": load_web_todos(&state.workspace, &id) })).into_response()
+}
+
+async fn api_todos_set(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<TodosBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    if let Err((code, message)) = session_path(&state.sessions, &id) {
+        return (code, message).into_response();
+    }
+    let items: Vec<Value> = body
+        .items
+        .iter()
+        .take(100)
+        .filter_map(|item| {
+            let text = item.text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(json!({ "text": truncate_chars(text, 500), "done": item.done }))
+        })
+        .collect();
+    let path = web_todos_path(&state.workspace, &id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match atomic_write(&path, &json!({ "items": items }).to_string()) {
+        Ok(()) => Json(json!({ "session": id, "items": items })).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn api_tasks(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -1616,6 +1720,7 @@ fn session_view(path: &Path) -> Result<Value, String> {
             }
             json!({
                 "role": role,
+                "ts": message.created_at_ms,
                 "blocks": blocks,
             })
         })
@@ -1788,5 +1893,32 @@ mod tests {
         atomic_write(&path, "new content").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
         assert!(modified_ms(&path).expect("mtime") >= before);
+    }
+
+    #[test]
+    fn web_todos_roundtrip_and_inject_into_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "session-1-0";
+        let path = web_todos_path(dir.path(), id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        atomic_write(
+            &path,
+            &serde_json::json!({
+                "items": [
+                    { "text": "写测试", "done": false },
+                    { "text": "跑测试", "done": true }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let items = load_web_todos(dir.path(), id);
+        assert_eq!(items.len(), 2);
+
+        let prompt = prompt_with_web_todos(dir.path(), id, "继续");
+        assert!(prompt.contains("- [ ] 写测试"), "prompt: {prompt}");
+        assert!(prompt.contains("- [x] 跑测试"), "prompt: {prompt}");
+        assert!(prompt.ends_with("继续"));
     }
 }

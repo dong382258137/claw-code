@@ -725,6 +725,7 @@ mod tests {
             role,
             blocks: vec![block],
             usage: None,
+            created_at_ms: 0,
         }
     }
 

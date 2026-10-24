@@ -1,4 +1,4 @@
-use crate::session::Session;
+﻿use crate::session::Session;
 
 const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;
 const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;
@@ -547,6 +547,7 @@ mod tests {
                 cache_creation_input_tokens: 1,
                 cache_read_input_tokens: 0,
             }),
+            created_at_ms: 0,
         }];
 
         let tracker = UsageTracker::from_session(&session);

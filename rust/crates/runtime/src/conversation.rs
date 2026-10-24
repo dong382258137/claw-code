@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+﻿use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -809,6 +809,7 @@ pub(crate) fn build_subagent_request(
             text: format!("# Subagent: {name} ({subagent_id})\n\n请执行以下任务:\n\n{task}"),
         }],
         usage: None,
+        created_at_ms: 0,
     };
     ApiRequest {
         system_prompt,
@@ -18410,6 +18411,7 @@ mod tests {
                     text: "user query".to_string(),
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
             ConversationMessage {
                 role: MessageRole::Tool,
@@ -18420,6 +18422,7 @@ mod tests {
                     is_error: false,
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
             ConversationMessage {
                 role: MessageRole::Tool,
@@ -18436,6 +18439,7 @@ mod tests {
                     },
                 ],
                 usage: None,
+                created_at_ms: 0,
             },
         ];
         // "line1\nline2\nline3" (17) + "output2" (7) = 24
@@ -18458,6 +18462,7 @@ mod tests {
                 text: "hello".to_string(),
             }],
             usage: None,
+            created_at_ms: 0,
         }];
         assert_eq!(super::tool_result_output_len(&no_tool), 0);
     }
@@ -18477,6 +18482,7 @@ mod tests {
                 is_error: false,
             }],
             usage: None,
+            created_at_ms: 0,
         }];
         let after = vec![ConversationMessage {
             role: MessageRole::Tool,
@@ -18487,6 +18493,7 @@ mod tests {
                 is_error: false,
             }],
             usage: None,
+            created_at_ms: 0,
         }];
         let before_len = super::tool_result_output_len(&before);
         let after_len = super::tool_result_output_len(&after);
@@ -18721,6 +18728,7 @@ mod tests {
                     is_error: false,
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
             ConversationMessage {
                 role: MessageRole::Tool,
@@ -18731,6 +18739,7 @@ mod tests {
                     is_error: false,
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
             ConversationMessage {
                 role: MessageRole::Tool,
@@ -18741,6 +18750,7 @@ mod tests {
                     is_error: false,
                 }],
                 usage: None,
+                created_at_ms: 0,
             },
         ];
 
@@ -22625,6 +22635,7 @@ mod tests {
                         input: r#"{"query":"probe","path":"."}"#.to_string(),
                     }],
                     usage: None,
+                    created_at_ms: 0,
                 })
                 .expect("seed assistant tool_use");
             runtime

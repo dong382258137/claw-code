@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables)]
+﻿#![allow(dead_code, unused_imports, unused_variables)]
 
 use crate::*;
 
@@ -2195,6 +2195,7 @@ fn render_session_markdown_includes_header_and_summarized_tool_calls() {
                 is_error: false,
             }],
             usage: None,
+            created_at_ms: 0,
         },
     ];
 
@@ -2235,6 +2236,7 @@ fn render_session_markdown_marks_tool_errors_and_skips_empty_summaries() {
             is_error: true,
         }],
         usage: None,
+        created_at_ms: 0,
     }];
 
     // when
@@ -4126,6 +4128,7 @@ fn converts_tool_roundtrip_messages() {
                 is_error: false,
             }],
             usage: None,
+            created_at_ms: 0,
         },
     ];
 
@@ -5579,6 +5582,7 @@ mod system_extraction_tests {
                 text: text.to_string(),
             }],
             usage: None,
+            created_at_ms: 0,
         }
     }
 
@@ -5589,6 +5593,7 @@ mod system_extraction_tests {
                 text: text.to_string(),
             }],
             usage: None,
+            created_at_ms: 0,
         }
     }
 
@@ -5599,6 +5604,7 @@ mod system_extraction_tests {
                 text: text.to_string(),
             }],
             usage: None,
+            created_at_ms: 0,
         }
     }
 

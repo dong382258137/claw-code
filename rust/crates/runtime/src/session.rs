@@ -174,6 +174,8 @@ pub struct ConversationMessage {
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
+    /// 消息创建时间（Unix 毫秒）。旧存档没有 `ts` 字段时为 0。
+    pub created_at_ms: u64,
 }
 
 /// Metadata describing the latest compaction that summarized a session.
@@ -932,6 +934,7 @@ impl ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             usage: None,
+            created_at_ms: current_time_millis(),
         }
     }
 
@@ -941,6 +944,7 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage: None,
+            created_at_ms: current_time_millis(),
         }
     }
 
@@ -950,6 +954,7 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage,
+            created_at_ms: current_time_millis(),
         }
     }
 
@@ -971,6 +976,7 @@ impl ConversationMessage {
                 is_error,
             }],
             usage: None,
+            created_at_ms: current_time_millis(),
         }
     }
 
@@ -996,6 +1002,10 @@ impl ConversationMessage {
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));
         }
+        object.insert(
+            "ts".to_string(),
+            JsonValue::Number(i64::try_from(self.created_at_ms).unwrap_or(0)),
+        );
         JsonValue::Object(object)
     }
 
@@ -1026,10 +1036,16 @@ impl ConversationMessage {
             .map(ContentBlock::from_json)
             .collect::<Result<Vec<_>, _>>()?;
         let usage = object.get("usage").map(usage_from_json).transpose()?;
+        let created_at_ms = object
+            .get("ts")
+            .and_then(JsonValue::as_i64)
+            .unwrap_or(0)
+            .max(0) as u64;
         Ok(Self {
             role,
             blocks,
             usage,
+            created_at_ms,
         })
     }
 }
@@ -1307,6 +1323,10 @@ fn persisted_message_json(message: &ConversationMessage) -> JsonValue {
     if let Some(usage) = message.usage {
         object.insert("usage".to_string(), usage_to_json(usage));
     }
+    object.insert(
+        "ts".to_string(),
+        JsonValue::Number(i64::try_from(message.created_at_ms).unwrap_or(0)),
+    );
     JsonValue::Object(object)
 }
 
@@ -1789,11 +1809,20 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.messages[0].role, MessageRole::User);
         assert_eq!(
-            restored.messages[0],
-            ConversationMessage::user_text("legacy")
+            restored.messages[0].blocks,
+            ConversationMessage::user_text("legacy").blocks
         );
         assert!(!restored.session_id.is_empty());
+    }
+
+    #[test]
+    fn message_timestamp_roundtrips_through_json() {
+        let message = ConversationMessage::user_text("ts");
+        assert!(message.created_at_ms > 0);
+        let restored = ConversationMessage::from_json(&message.to_json()).expect("json");
+        assert_eq!(restored.created_at_ms, message.created_at_ms);
     }
 
     #[test]
@@ -1816,7 +1845,11 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored.messages.len(), 2);
-        assert_eq!(restored.messages[0], ConversationMessage::user_text("hi"));
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert_eq!(
+            restored.messages[0].blocks,
+            ConversationMessage::user_text("hi").blocks
+        );
     }
 
     #[test]

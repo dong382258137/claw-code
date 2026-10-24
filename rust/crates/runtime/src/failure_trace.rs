@@ -1,4 +1,4 @@
-//! FailureTrace — 失败轨迹切片（tool 调用级失败点定位）。
+﻿//! FailureTrace — 失败轨迹切片（tool 调用级失败点定位）。
 //!
 //! # 设计动机
 //!
@@ -353,6 +353,7 @@ mod tests {
             role: MessageRole::Assistant,
             blocks,
             usage: None,
+            created_at_ms: 0,
         }
     }
 
@@ -361,6 +362,7 @@ mod tests {
             role: MessageRole::Tool,
             blocks: vec![block],
             usage: None,
+            created_at_ms: 0,
         }
     }
 
