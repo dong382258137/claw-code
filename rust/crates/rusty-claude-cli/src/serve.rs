@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path as UrlPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -53,6 +53,32 @@ struct PromptBody {
     /// 权限模式：read-only / workspace-write / danger-full-access（默认 workspace-write）。
     permission: Option<String>,
 }
+
+#[derive(Deserialize)]
+struct PathQuery {
+    t: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WebSettingsBody {
+    theme: Option<String>,
+    permission: Option<String>,
+    panel_width: Option<u32>,
+}
+
+const IGNORED_DIRS: [&str; 7] = [
+    ".git",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".claw",
+    ".venv",
+];
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_TEXT_BYTES: usize = 512 * 1024;
+const MAX_FILES: usize = 2000;
 
 /// 解析参数并启动服务；阻塞到进程退出。
 ///
@@ -124,6 +150,16 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/session/{id}/prompt", post(api_prompt))
             .route("/api/session/{id}/interrupt", post(api_interrupt))
             .route("/api/session/{id}/status", get(api_status))
+            .route("/api/workspace/files", get(api_files))
+            .route("/api/workspace/file", get(api_file))
+            .route("/api/workspace/raw", get(api_raw))
+            .route("/api/workspace/diff", get(api_diff))
+            .route("/api/workspace/goal", get(api_goal))
+            .route("/api/session/{id}/tasks", get(api_tasks))
+            .route(
+                "/api/web-settings",
+                get(api_web_settings_get).post(api_web_settings_set),
+            )
             .with_state(state);
 
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -443,6 +479,403 @@ async fn api_status(
         guard.contains_key(&id)
     };
     Json(json!({ "session": id, "running": running })).into_response()
+}
+
+// ---------------- 工作区：文件 / 预览 / diff / 任务 / goal / Web 设置 ----------------
+
+fn authorize_path(state: &AppState, query: &PathQuery) -> bool {
+    query.t.as_deref() == Some(state.token.as_str())
+}
+
+fn resolve_in_workspace(root: &Path, rel: &str) -> Result<PathBuf, (StatusCode, String)> {
+    if rel.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "path 不能为空".to_string()));
+    }
+    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let candidate = root_canon.join(rel);
+    let canonical = std::fs::canonicalize(&candidate)
+        .map_err(|_| (StatusCode::NOT_FOUND, format!("文件不存在: {rel}")))?;
+    if !canonical.starts_with(&root_canon) {
+        return Err((StatusCode::FORBIDDEN, "path 越出工作区".to_string()));
+    }
+    Ok(canonical)
+}
+
+fn file_kind(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" => "image",
+        "pdf" => "pdf",
+        "md" | "markdown" => "markdown",
+        "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp"
+        | "cs" | "rb" | "php" | "sh" | "ps1" | "bat" | "toml" | "yaml" | "yml" | "json"
+        | "jsonl" | "workflow" | "lock" | "txt" | "csv" | "log" | "env" | "ini" | "cfg"
+        | "html" | "css" | "scss" | "sql" | "proto" => "text",
+        _ => "binary",
+    }
+}
+
+fn mime_for(path: &Path) -> &'static str {
+    match file_kind(path) {
+        "image" => match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "svg" => "image/svg+xml",
+            _ => "image/jpeg",
+        },
+        "pdf" => "application/pdf",
+        "markdown" => "text/markdown; charset=utf-8",
+        "text" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn api_files(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let mut files = Vec::new();
+    collect_workspace_entries(&state.workspace, &state.workspace, 0, &mut files);
+    Json(json!({
+        "root": state.workspace.display().to_string(),
+        "files": files,
+    }))
+    .into_response()
+}
+
+fn collect_workspace_entries(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Value>) {
+    if depth > 6 || out.len() >= MAX_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if out.len() >= MAX_FILES {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            if IGNORED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            collect_workspace_entries(root, &path, depth + 1, out);
+        } else {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            out.push(json!({
+                "path": relative.display().to_string().replace('\\', "/"),
+                "size": size,
+            }));
+        }
+    }
+}
+
+async fn api_file(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let Some(rel) = query.path.as_deref() else {
+        return (StatusCode::BAD_REQUEST, "缺少 path").into_response();
+    };
+    let path = match resolve_in_workspace(&state.workspace, rel) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return (StatusCode::NOT_FOUND, "文件不存在").into_response();
+    };
+    if !metadata.is_file() {
+        return (StatusCode::BAD_REQUEST, "不是文件").into_response();
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "文件过大（{} MB），只做下载预览",
+                metadata.len() / 1024 / 1024
+            ),
+        )
+            .into_response();
+    }
+
+    let kind = file_kind(&path);
+    if kind == "image" || kind == "pdf" {
+        return Json(json!({
+            "kind": kind,
+            "path": rel,
+            "size": metadata.len(),
+        }))
+        .into_response();
+    }
+
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let truncated = bytes.len() > MAX_TEXT_BYTES;
+    let slice = if truncated {
+        &bytes[..MAX_TEXT_BYTES]
+    } else {
+        &bytes[..]
+    };
+    match String::from_utf8(slice.to_vec()) {
+        Ok(text) => Json(json!({
+            "kind": if kind == "markdown" { "markdown" } else { "text" },
+            "path": rel,
+            "size": metadata.len(),
+            "truncated": truncated,
+            "content": text,
+        }))
+        .into_response(),
+        Err(_) => {
+            Json(json!({ "kind": "binary", "path": rel, "size": metadata.len() })).into_response()
+        }
+    }
+}
+
+async fn api_raw(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let Some(rel) = query.path.as_deref() else {
+        return (StatusCode::BAD_REQUEST, "缺少 path").into_response();
+    };
+    let path = match resolve_in_workspace(&state.workspace, rel) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return (StatusCode::NOT_FOUND, "文件不存在").into_response();
+    };
+    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "文件不可直接预览").into_response();
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => ([(header::CONTENT_TYPE, mime_for(&path))], bytes).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let workspace = &state.workspace;
+    let mut patch_cmd = std::process::Command::new("git");
+    patch_cmd
+        .arg("-C")
+        .arg(workspace)
+        .arg("diff")
+        .arg("--no-color");
+    if let Some(path) = query.path.as_deref().filter(|path| !path.is_empty()) {
+        patch_cmd.arg("--").arg(path);
+    }
+    let patch = match patch_cmd.output() {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            truncate_middle(&text, 200_000)
+        }
+        Ok(output) => format!("git diff 失败: {}", String::from_utf8_lossy(&output.stderr)),
+        Err(error) => format!("无法执行 git: {error}"),
+    };
+
+    let mut stat_cmd = std::process::Command::new("git");
+    stat_cmd
+        .arg("-C")
+        .arg(workspace)
+        .args(["diff", "--numstat"]);
+    let mut files = Vec::new();
+    if let Ok(output) = stat_cmd.output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut parts = line.split('\t');
+            let adds = parts.next().unwrap_or_default();
+            let dels = parts.next().unwrap_or_default();
+            let path = parts.next().unwrap_or_default();
+            if path.is_empty() {
+                continue;
+            }
+            files.push(json!({
+                "path": path,
+                "added": adds.parse::<i64>().unwrap_or(0),
+                "removed": dels.parse::<i64>().unwrap_or(0),
+            }));
+        }
+    }
+
+    let mut status_cmd = std::process::Command::new("git");
+    status_cmd
+        .arg("-C")
+        .arg(workspace)
+        .args(["status", "--porcelain", "--untracked-files=all"]);
+    let mut untracked = Vec::new();
+    if let Ok(output) = status_cmd.output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(path) = line.strip_prefix("?? ") {
+                untracked.push(path.trim().to_string());
+            }
+        }
+    }
+
+    Json(json!({
+        "patch": patch,
+        "files": files,
+        "untracked": untracked,
+    }))
+    .into_response()
+}
+
+async fn api_goal(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let path = state.workspace.join(".claw").join("goal.json");
+    let goal: Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    Json(json!({ "goal": goal })).into_response()
+}
+
+async fn api_tasks(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let path = match session_path(&state.sessions, &id) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let session = match runtime::Session::load_from_path(&path) {
+        Ok(session) => session,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+
+    let mut todos: Option<Vec<Value>> = None;
+    let mut tasks: Vec<Value> = Vec::new();
+    let mut plan_mode: Option<bool> = None;
+
+    'outer: for message in session.messages.iter().rev() {
+        for block in message.blocks.iter().rev() {
+            let runtime::ContentBlock::ToolUse { name, input, .. } = block else {
+                continue;
+            };
+            match name.as_str() {
+                "TodoWrite" if todos.is_none() => {
+                    if let Ok(value) = serde_json::from_str::<Value>(input) {
+                        if let Some(list) = value["todos"].as_array() {
+                            todos = Some(list.clone());
+                        }
+                    }
+                }
+                "EnterPlanMode" if plan_mode.is_none() => plan_mode = Some(true),
+                "ExitPlanMode" if plan_mode.is_none() => plan_mode = Some(false),
+                "TaskCreate" | "TaskUpdate" if tasks.len() < 20 => tasks.push(json!({
+                    "tool": name,
+                    "detail": truncate_middle(input, 240),
+                })),
+                _ => {}
+            }
+            if todos.is_some() && plan_mode.is_some() && tasks.len() >= 20 {
+                break 'outer;
+            }
+        }
+    }
+
+    Json(json!({
+        "session": id,
+        "plan_mode": plan_mode,
+        "todos": todos.unwrap_or_default(),
+        "tasks": tasks,
+    }))
+    .into_response()
+}
+
+fn web_settings_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".claw").join("web-settings.json"))
+}
+
+fn load_web_settings() -> Value {
+    let mut settings = json!({
+        "theme": "dark",
+        "permission": "workspace-write",
+        "panel_width": 380,
+    });
+    if let Some(path) = web_settings_path() {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+                for (key, value) in map {
+                    settings[&key] = value;
+                }
+            }
+        }
+    }
+    settings
+}
+
+async fn api_web_settings_get(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    Json(load_web_settings()).into_response()
+}
+
+async fn api_web_settings_set(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<WebSettingsBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let mut settings = load_web_settings();
+    if let Some(theme) = body.theme {
+        if theme == "dark" || theme == "light" {
+            settings["theme"] = json!(theme);
+        }
+    }
+    if let Some(permission) = body.permission {
+        if PERMISSION_MODES.contains(&permission.as_str()) {
+            settings["permission"] = json!(permission);
+        }
+    }
+    if let Some(width) = body.panel_width {
+        settings["panel_width"] = json!(width.clamp(260, 720));
+    }
+    if let Some(path) = web_settings_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, settings.to_string());
+    }
+    Json(settings).into_response()
 }
 
 fn authorize(state: &AppState, auth: &AuthQuery) -> bool {
@@ -796,5 +1229,23 @@ mod tests {
         assert!(cut.starts_with("abc"), "head kept: {cut}");
         assert!(cut.ends_with('j'), "tail kept: {cut}");
         assert!(cut.contains("截断"), "marker present: {cut}");
+    }
+
+    #[test]
+    fn workspace_path_resolution_blocks_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"), "hi").unwrap();
+        assert!(resolve_in_workspace(dir.path(), "ok.txt").is_ok());
+        assert!(resolve_in_workspace(dir.path(), "../outside.txt").is_err());
+        assert!(resolve_in_workspace(dir.path(), "").is_err());
+    }
+
+    #[test]
+    fn file_kind_classifies_common_types() {
+        assert_eq!(file_kind(Path::new("a/b.png")), "image");
+        assert_eq!(file_kind(Path::new("a/b.pdf")), "pdf");
+        assert_eq!(file_kind(Path::new("a/b.rs")), "text");
+        assert_eq!(file_kind(Path::new("a/b.md")), "markdown");
+        assert_eq!(file_kind(Path::new("a/b.bin")), "binary");
     }
 }
