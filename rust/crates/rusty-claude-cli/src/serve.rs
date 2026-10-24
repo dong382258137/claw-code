@@ -168,7 +168,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         };
         let app = Router::new()
             .route("/", get(index))
-            .route("/api/sessions", get(api_sessions))
+            .route("/api/sessions", get(api_sessions).post(api_create_session))
             .route("/api/session/{id}", get(api_session))
             .route("/api/session/{id}/stream", get(api_stream))
             .route("/api/session/{id}/prompt", post(api_prompt))
@@ -736,6 +736,16 @@ async fn terminal_session(mut socket: WebSocket, workspace: PathBuf) {
                                 let _ = session.child.kill();
                                 break;
                             }
+                            Some("resize") => {
+                                let cols = value["cols"].as_u64().unwrap_or(120).clamp(20, 400) as u16;
+                                let rows = value["rows"].as_u64().unwrap_or(30).clamp(5, 200) as u16;
+                                let _ = session._master.resize(portable_pty::PtySize {
+                                    rows,
+                                    cols,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                });
+                            }
                             _ => {
                                 let _ = session.input.send(text.as_bytes().to_vec());
                             }
@@ -929,6 +939,59 @@ async fn api_file(State(state): State<AppState>, Query(query): Query<PathQuery>)
         }))
         .into_response(),
     }
+}
+
+async fn api_create_session(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    let now = now_ms();
+    let model =
+        crate::config_model_for_current_dir().unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
+    let mut attempt = 0u32;
+    let (id, path) = loop {
+        let id = if attempt == 0 {
+            format!("session-{now}-0")
+        } else {
+            format!("session-{now}-{attempt}")
+        };
+        let path = state.sessions.join(format!("{id}.jsonl"));
+        if !path.exists() || attempt >= 100 {
+            break (id, path);
+        }
+        attempt += 1;
+    };
+    if let Err(error) = std::fs::create_dir_all(&state.sessions) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+    let meta = json!({
+        "type": "session_meta",
+        "version": 1,
+        "session_id": id,
+        "model": model,
+        "created_at_ms": now,
+        "updated_at_ms": now,
+        "workspace_root": state.workspace.display().to_string(),
+    });
+    match std::fs::write(&path, format!("{meta}\n")) {
+        Ok(()) => Json(json!({
+            "id": id,
+            "title": "新会话",
+            "created_at_ms": now,
+            "workspace": state.workspace.display().to_string(),
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 fn modified_ms(path: &Path) -> Option<u64> {
@@ -1361,7 +1424,7 @@ fn list_sessions(dir: &Path) -> Result<Value, String> {
         .filter_map(|path| {
             let metadata = std::fs::metadata(&path).ok()?;
             // 只有 header 的空会话（例如中断的恢复流程留下）不进入列表。
-            if metadata.len() < 512 {
+            if metadata.len() < 64 {
                 return None;
             }
             let modified = metadata

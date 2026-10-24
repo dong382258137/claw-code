@@ -197,3 +197,17 @@ details.tool.error { border-left-color: var(--error); }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .empty-hint { margin-top: 8px; font-size: 11px; color: var(--faint); }
 .jump { position: absolute; right: 20px; bottom: 120px; z-index: 5; border-radius: 999px; padding: 4px 12px; background: var(--panel); box-shadow: 0 6px 18px rgba(0,0,0,.35); }
+
+.md table { border-collapse: collapse; margin: 8px 0; font-size: 12px; }
+.md th, .md td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+.md th { background: var(--panel-2); }
+.md blockquote { border-left: 3px solid var(--border); margin: 6px 0; padding-left: 10px; color: var(--dim); }
+.code-block { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; overflow: hidden; background: var(--panel-2); }
+.code-head { display: flex; justify-content: space-between; align-items: center; padding: 3px 8px; border-bottom: 1px solid var(--border); color: var(--faint); font-size: 11px; }
+.code-head button { padding: 0 6px; font-size: 11px; }
+.code-block pre { margin: 0; border: 0; background: transparent; }
+
+.pane.term-fullscreen { position: fixed; inset: 0; z-index: 40; background: var(--bg); border: 0; }
+.attach { cursor: pointer; text-align: left; }
+details.plan { margin: 4px 0; }
+details.plan > summary { display: flex; justify-content: space-between; gap: 10px; }

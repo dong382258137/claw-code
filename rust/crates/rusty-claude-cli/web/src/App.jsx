@@ -239,11 +239,24 @@ export default function App() {
 
   /* ---------- 动作 ---------- */
   const selectSession = useCallback((session) => {
-    setCurrent({ id: session.id, title: session.title })
+    setCurrent({ id: session.id, title: session.title, modified: session.modified })
     setMessages([])
     setLive('')
     setOptimistic(null)
   }, [])
+
+  const createSession = useCallback(async () => {
+    try {
+      const created = await postJson('/api/sessions', {})
+      const session = { id: created.id, title: created.title || '新会话', modified: Math.floor(Date.now() / 1000) }
+      setSessions((list) => [session, ...list.filter((item) => item.id !== session.id)])
+      selectSession(session)
+      setTimeout(() => document.querySelector('.composer textarea')?.focus(), 80)
+      push('已新建会话')
+    } catch (error) {
+      push(`新建会话失败：${error.message}`, 'error')
+    }
+  }, [push, selectSession])
 
   const send = useCallback(async (text) => {
     if (!currentId) { push('请先在左侧选择一个会话', 'error'); return }
@@ -290,6 +303,7 @@ export default function App() {
       collapsed={sidebarCollapsed}
       onToggle={toggleSidebar}
       onSelect={(session) => selectSession(session)}
+      onNew={createSession}
       onSettings={() => setSettingsOpen(true)}
       onTheme={() => saveSettings({ theme: webSettings.theme === 'dark' ? 'light' : 'dark' })}
       theme={webSettings.theme}
@@ -304,6 +318,7 @@ export default function App() {
           current?.model,
           current?.workspace ? basename(current.workspace) : null,
           current ? `${current.message_count ?? messages.length} 条` : null,
+          current?.modified ? `更新于 ${relTime(current.modified)}` : null,
           running ? '运行中' : null,
         ].filter(Boolean)}
         connected={connected}
@@ -402,7 +417,7 @@ function Toasts({ toasts }) {
   )
 }
 
-function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onSettings, onTheme, theme }) {
+function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onSettings, onTheme, theme }) {
   const grouped = useMemo(() => {
     const query = filter.trim().toLowerCase()
     const filtered = sessions.filter((session) =>
@@ -425,6 +440,7 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
         <span><b>CLAW</b></span>
         {!collapsed && (
           <div className="brand-actions">
+            <button onClick={onNew} title="新建会话">＋</button>
             <button onClick={onTheme} title="切换主题">{theme === 'dark' ? '◐' : '◑'}</button>
             <button onClick={onSettings} title="设置">⚙</button>
             <button onClick={onToggle} title="收起侧栏 (Ctrl+B)">‹</button>
@@ -433,6 +449,7 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
       </div>
       {collapsed && (
         <div className="rail">
+          <button onClick={onNew} title="新建会话">＋</button>
           <button onClick={onToggle} title="展开侧栏 (Ctrl+B)">☰</button>
           <button onClick={onSettings} title="设置">⚙</button>
           <button onClick={onTheme} title="切换主题">◐</button>
@@ -931,11 +948,27 @@ function TasksPane({ currentId, onError }) {
         {plans.map((plan) => {
           const steps = plan.plan && Array.isArray(plan.plan.steps) ? plan.plan.steps : []
           const done = steps.filter((step) => step.status === 'completed' || step.status === 'done').length
+          const status = plan.plan?.status || ''
           return (
-            <div key={plan.id} className="row">
-              <span>▤ {plan.id}</span>
-              <span className="muted">{steps.length ? `${done}/${steps.length} 步` : ''}</span>
-            </div>
+            <details key={plan.id} className="plan">
+              <summary>
+                <span>▤ {plan.plan?.title || plan.id}</span>
+                <span className="muted">{status ? `${status} · ` : ''}{steps.length ? `${done}/${steps.length} 步` : ''}</span>
+              </summary>
+              {steps.length > 0
+                ? steps.map((step, index) => {
+                    const stepStatus = step.status || ''
+                    const finished = stepStatus === 'completed' || stepStatus === 'done'
+                    const running = stepStatus === 'in_progress' || stepStatus === 'running'
+                    return (
+                      <div key={index} className={`row todo ${finished ? 'done' : ''}`}>
+                        <span>{finished ? '✔' : running ? '▶' : '○'} {step.description || step.title || step.id || `第 ${index + 1} 步`}</span>
+                        <span className="muted">{stepStatus}</span>
+                      </div>
+                    )
+                  })
+                : <div className="muted" style={{ padding: '4px 8px' }}>该计划没有步骤明细</div>}
+            </details>
           )
         })}
         {data.todos.length > 0 && <div className="group">待办</div>}
@@ -955,10 +988,37 @@ function TasksPane({ currentId, onError }) {
 
 function AttachmentsPane({ onError }) {
   const [data, setData] = useState({ items: [], pastes: [] })
+  const [preview, setPreview] = useState(null)
   const load = useCallback(() => {
     api('/api/attachments').then(setData).catch((error) => onError?.(`附件加载失败：${error.message}`))
   }, [onError])
   useEffect(() => { load() }, [load])
+
+  const openPaste = useCallback(async (path) => {
+    try {
+      const file = await api(`/api/workspace/file?path=${encodeURIComponent(path)}`)
+      setPreview({ kind: 'text', path, content: file.content || '' })
+    } catch (error) {
+      onError?.(`读取粘贴内容失败：${error.message}`)
+    }
+  }, [onError])
+
+  if (preview) {
+    return (
+      <div className="pane">
+        <div className="pane-toolbar">
+          <button onClick={() => setPreview(null)}>‹ 附件</button>
+          <span className="path" title={preview.path}>{preview.path}</span>
+        </div>
+        <div className="pane-body">
+          {preview.kind === 'image'
+            ? <img className="preview-image" src={rawUrl(preview.path)} alt={preview.path} />
+            : <pre className="file-text">{preview.content}</pre>}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="pane">
       <div className="pane-toolbar"><button onClick={load}>刷新</button><span className="hint">{data.items.length} 图 / {data.pastes.length} 粘贴</span></div>
@@ -966,17 +1026,17 @@ function AttachmentsPane({ onError }) {
         {data.items.length > 0 && <div className="group">工作区图片</div>}
         <div className="attach-grid">
           {data.items.map((item) => (
-            <a key={item.path} href={rawUrl(item.path)} target="_blank" rel="noreferrer" className="attach" title={item.path}>
+            <button key={item.path} type="button" className="attach" title={item.path} onClick={() => setPreview({ kind: 'image', path: item.path })}>
               <img src={rawUrl(item.path)} alt="" />
               <span>{basename(item.path)}</span>
-            </a>
+            </button>
           ))}
         </div>
         {data.pastes.length > 0 && <div className="group">粘贴缓存</div>}
         {data.pastes.map((item) => (
-          <a key={item.path} href={rawUrl(item.path)} target="_blank" rel="noreferrer" className="row">
+          <button key={item.path} type="button" className="row" onClick={() => openPaste(item.path)}>
             <span>{basename(item.path)}</span><span className="muted">{Math.max(1, Math.round((item.size || 0) / 1024))}K</span>
-          </a>
+          </button>
         ))}
         {data.items.length === 0 && data.pastes.length === 0 && <div className="empty">没有附件</div>}
       </div>
@@ -988,13 +1048,27 @@ function TerminalPane() {
   const [text, setText] = useState('')
   const [status, setStatus] = useState('未连接')
   const [line, setLine] = useState('')
+  const [fullscreen, setFullscreen] = useState(false)
   const socketRef = useRef(null)
   const outRef = useRef(null)
+
+  const sendJson = useCallback((payload) => {
+    const socket = socketRef.current
+    if (socket?.readyState === 1) socket.send(JSON.stringify(payload))
+  }, [])
+
+  const pushResize = useCallback(() => {
+    const node = outRef.current
+    if (!node) return
+    const cols = Math.max(20, Math.min(400, Math.floor(node.clientWidth / 8)))
+    const rows = Math.max(5, Math.min(200, Math.floor(node.clientHeight / 18)))
+    sendJson({ type: 'resize', cols, rows })
+  }, [sendJson])
 
   useEffect(() => {
     const socket = new WebSocket(wsUrl('/ws/terminal'))
     socket.binaryType = 'arraybuffer'
-    socket.onopen = () => setStatus('已连接')
+    socket.onopen = () => { setStatus('已连接'); setTimeout(pushResize, 120) }
     socket.onmessage = (event) => {
       const chunk = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data)
       setText((previous) => (previous + chunk.replace(ANSI_RE, '')).slice(-200000))
@@ -1002,23 +1076,39 @@ function TerminalPane() {
     socket.onclose = () => setStatus('已断开')
     socket.onerror = () => setStatus('连接失败')
     socketRef.current = socket
-    return () => socket.close()
-  }, [])
+    const observer = new ResizeObserver(() => pushResize())
+    if (outRef.current) observer.observe(outRef.current)
+    window.addEventListener('resize', pushResize)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', pushResize)
+      socket.close()
+    }
+  }, [pushResize])
 
   useEffect(() => {
     if (outRef.current) outRef.current.scrollTop = outRef.current.scrollHeight
   }, [text])
 
-  const send = (data) => {
-    if (socketRef.current?.readyState === 1) socketRef.current.send(JSON.stringify({ type: 'input', data }))
-  }
+  useEffect(() => {
+    if (fullscreen) setTimeout(pushResize, 80)
+  }, [fullscreen, pushResize])
+
+  useEffect(() => {
+    const onKey = (event) => { if (event.key === 'Escape') setFullscreen(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const send = (data) => sendJson({ type: 'input', data })
   return (
-    <div className="pane">
+    <div className={`pane ${fullscreen ? 'term-fullscreen' : ''}`}>
       <div className="pane-toolbar">
         <span className="hint">{status}</span>
         <span className="spacer" />
         <button onClick={() => setText('')}>清屏</button>
         <button onClick={() => send('\u0003')}>Ctrl+C</button>
+        <button onClick={() => setFullscreen((value) => !value)}>{fullscreen ? '退出全屏' : '全屏'}</button>
       </div>
       <pre className="terminal" ref={outRef}>{text}</pre>
       <div className="term-input">
@@ -1026,7 +1116,7 @@ function TerminalPane() {
           value={line}
           onChange={(event) => setLine(event.target.value)}
           onKeyDown={(event) => { if (event.key === 'Enter') { send(line + '\r'); setLine('') } }}
-          placeholder="输入命令，Enter 发送（真 PTY）"
+          placeholder="输入命令，Enter 发送（真 PTY，Esc 退出全屏）"
         />
       </div>
     </div>
