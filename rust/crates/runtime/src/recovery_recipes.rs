@@ -123,7 +123,9 @@ impl RecoveryStepExecutor for RealStepExecutor {
     fn execute(&self, step: &RecoveryStep, scenario: &FailureScenario) -> (bool, String) {
         match step {
             RecoveryStep::RebaseBranch => {
-                let output = std::process::Command::new("git").args(["rebase"]).output();
+                let output = crate::sandbox::quiet_command("git")
+                    .args(["rebase"])
+                    .output();
                 match output {
                     Ok(o) if o.status.success() => (true, "git rebase succeeded".to_string()),
                     Ok(o) => {

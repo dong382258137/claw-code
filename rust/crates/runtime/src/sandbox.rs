@@ -461,6 +461,26 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const DETACHED_PROCESS: u32 = 0x0000_0008;
 pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
+/// 构造一个不会在 Windows 上弹出控制台窗口的 `Command`。
+///
+/// 背景:Web 服务长期驻留,而每轮 project context、面板刷新、diff 查看都会
+/// spawn 短命的 `git` / `rg`。Windows 下若不带 `CREATE_NO_WINDOW`,系统会为
+/// 每个这种子进程新建一个控制台窗口——用户看到的就是「点一下界面就闪几个
+/// 黑框」。这不是渲染问题,是子进程缺 flag。
+///
+/// 非 Windows 平台直接透传,无行为差异。
+#[must_use]
+pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 impl Default for WindowsSandboxBuilder {
     fn default() -> Self {
         Self {

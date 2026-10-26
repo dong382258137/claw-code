@@ -1,6 +1,5 @@
 #![allow(clippy::must_use_candidate)]
 use std::path::Path;
-use std::process::Command;
 
 /// Outcome of comparing the worktree HEAD against the expected base commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +106,7 @@ fn resolve_head_sha(cwd: &Path) -> Option<String> {
 }
 
 fn resolve_rev(cwd: &Path, rev: &str) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(["rev-parse", rev])
         .current_dir(cwd)
         .output()
@@ -128,7 +127,6 @@ fn resolve_rev(cwd: &Path, rev: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
@@ -150,7 +148,7 @@ mod tests {
     }
 
     fn run(cwd: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::sandbox::quiet_command("git")
             .args(args)
             .current_dir(cwd)
             .status()
@@ -169,7 +167,7 @@ mod tests {
     }
 
     fn head_sha(repo: &std::path::Path) -> String {
-        let output = Command::new("git")
+        let output = crate::sandbox::quiet_command("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo)
             .output()

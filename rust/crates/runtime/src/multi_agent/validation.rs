@@ -263,7 +263,7 @@ pub fn detect_changed_files(workspace_root: &Path) -> Vec<PathBuf> {
 /// 运行 git 子命令,成功时返回相对路径行(正斜杠);失败(非 git 仓库/git 不可用)
 /// 返回空 Vec(门禁可能跳过,向后兼容)。
 fn run_git(args: &[&str], workspace_root: &Path) -> Vec<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(args)
         .current_dir(workspace_root)
         .output();
@@ -1238,7 +1238,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let root = tmp.path();
         // git 不可用(如精简环境)→ 跳过本测试
-        let init = std::process::Command::new("git")
+        let init = crate::sandbox::quiet_command("git")
             .args(["init"])
             .current_dir(root)
             .output();
@@ -1249,11 +1249,11 @@ mod tests {
         std::fs::write(root.join("tracked.txt"), "v1").expect("write tracked");
 
         // 首次提交(tracked 基线)
-        let _ = std::process::Command::new("git")
+        let _ = crate::sandbox::quiet_command("git")
             .args(["add", "tracked.txt"])
             .current_dir(root)
             .output();
-        let commit = std::process::Command::new("git")
+        let commit = crate::sandbox::quiet_command("git")
             .args([
                 "-c",
                 "user.name=test",

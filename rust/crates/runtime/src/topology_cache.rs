@@ -536,7 +536,7 @@ pub fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<
 }
 
 fn run_git(root: &Path, args: &[&str], timeout: Duration) -> Option<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::sandbox::quiet_command("git");
     cmd.args(args).current_dir(root);
     let out = run_command_with_timeout(&mut cmd, timeout)?;
     if !out.status.success() {

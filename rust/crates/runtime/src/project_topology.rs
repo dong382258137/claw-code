@@ -1023,7 +1023,7 @@ pub fn build_symbol_index_fast(
                 "*.py",
             ),
         };
-        let result = Command::new("rg")
+        let result = crate::sandbox::quiet_command("rg")
             .args([
                 "--no-heading",
                 "--line-number",
@@ -1040,7 +1040,7 @@ pub fn build_symbol_index_fast(
         // 注意:grep -E 中 `\s` 不被所有版本支持,用 `[[:space:]]` 替代。
         let output = match result {
             Ok(o) if o.status.success() => o,
-            _ => Command::new("grep")
+            _ => crate::sandbox::quiet_command("grep")
                 .args(["-rn", &format!("--include={include}"), "-E", grep_pattern])
                 .arg(dir)
                 .output()
@@ -1250,7 +1250,7 @@ fn run_batch_rg(
     pattern: &str,
     language: crate::topology_cache::Language,
 ) -> Result<HashMap<String, Vec<CallSite>>, String> {
-    let mut cmd = Command::new("rg");
+    let mut cmd = crate::sandbox::quiet_command("rg");
     cmd.args(["-o", "-n", "--no-heading", "--json", "--type"])
         .arg(language.grep_type())
         .arg(pattern)

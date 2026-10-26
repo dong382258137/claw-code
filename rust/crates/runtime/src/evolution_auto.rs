@@ -145,7 +145,7 @@ pub fn in_evolution_process() -> bool {
 /// 会失效进而部署旧代码。必须比对运行前后的 HEAD 是否变化。
 #[must_use]
 pub fn head_sha(source_root: &Path) -> String {
-    let out = std::process::Command::new("git")
+    let out = crate::sandbox::quiet_command("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(source_root)
         .output();
@@ -159,7 +159,7 @@ pub fn head_sha(source_root: &Path) -> String {
 /// 所以 HEAD 存在即代表改动已过测试;未提交的残留工作区不应被部署。
 #[must_use]
 pub fn committed_file_list(source_root: &Path) -> String {
-    let out = std::process::Command::new("git")
+    let out = crate::sandbox::quiet_command("git")
         .args(["show", "--name-only", "--format=", "HEAD"])
         .current_dir(source_root)
         .output();

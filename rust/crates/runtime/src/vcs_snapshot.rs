@@ -15,7 +15,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // VcsError
@@ -118,7 +117,7 @@ impl RefactorTransaction {
 
     /// Check if HEAD is detached.
     fn check_detached_head(root: &Path) -> bool {
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(root)
             .output()
@@ -146,7 +145,7 @@ impl RefactorTransaction {
         }
 
         // Check for uncommitted changes
-        let output = Command::new("git")
+        let output = crate::sandbox::quiet_command("git")
             .args(["status", "--porcelain"])
             .current_dir(&self.root)
             .output()
@@ -165,7 +164,7 @@ impl RefactorTransaction {
         // 避免污染用户的 stash 栈。返回值是 commit hash，可直接用于 `git stash apply`。
         // 之前用 `git stash push --include-untracked` 会全量 stash 整个工作树，
         // 且用 `stash@{0}` 引用会在并发 stash 时 pop 错误的 stash。
-        let stash_output = Command::new("git")
+        let stash_output = crate::sandbox::quiet_command("git")
             .args(["stash", "create"])
             .current_dir(&self.root)
             .output()
@@ -223,13 +222,13 @@ impl RefactorTransaction {
 
         if let Some(ref stash_ref) = self.stash_ref {
             // Step 1: Restore all tracked files to HEAD state (discard turn modifications)
-            let _ = Command::new("git")
+            let _ = crate::sandbox::quiet_command("git")
                 .args(["checkout", "--", "."])
                 .current_dir(&self.root)
                 .output();
 
             // Step 2: Apply the pre-turn stash to restore user's original modifications
-            let apply = Command::new("git")
+            let apply = crate::sandbox::quiet_command("git")
                 .args(["stash", "apply", stash_ref])
                 .current_dir(&self.root)
                 .output()
@@ -273,7 +272,7 @@ impl RefactorTransaction {
                 .filter_map(|p| p.to_str())
                 .collect();
             if !tracked_files.is_empty() {
-                let _ = Command::new("git")
+                let _ = crate::sandbox::quiet_command("git")
                     .args(["checkout", "--"])
                     .args(&tracked_files)
                     .current_dir(&self.root)
@@ -287,7 +286,7 @@ impl RefactorTransaction {
             if !untracked_files.is_empty() {
                 let clean_files: Vec<&str> =
                     untracked_files.iter().filter_map(|p| p.to_str()).collect();
-                let _ = Command::new("git")
+                let _ = crate::sandbox::quiet_command("git")
                     .args(["clean", "-fd", "--"])
                     .args(&clean_files)
                     .current_dir(&self.root)
@@ -302,7 +301,7 @@ impl RefactorTransaction {
 
     /// 获取当前冲突文件列表（通过 `git diff --name-only --diff-filter=U`）。
     fn get_conflicted_files(&self) -> Vec<PathBuf> {
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["diff", "--name-only", "--diff-filter=U"])
             .current_dir(&self.root)
             .output()
@@ -319,7 +318,7 @@ impl RefactorTransaction {
 
     /// 获取当前 untracked 文件列表（通过 `git ls-files --others --exclude-standard`）。
     fn get_untracked_files(&self) -> Vec<PathBuf> {
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["ls-files", "--others", "--exclude-standard"])
             .current_dir(&self.root)
             .output()
@@ -526,7 +525,7 @@ mod tests {
     fn new_transaction_detects_git_repo() {
         let dir = tempfile::tempdir().unwrap();
         // Init a git repo
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -549,30 +548,30 @@ mod tests {
     #[test]
     fn pre_turn_snapshot_with_clean_tree() {
         let dir = tempfile::tempdir().unwrap();
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["init"])
             .current_dir(dir.path())
             .output()
             .unwrap();
         // Configure git user for stash
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(dir.path())
             .output()
             .unwrap();
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["config", "user.name", "test"])
             .current_dir(dir.path())
             .output()
             .unwrap();
         // Create and commit a file so working tree is clean-ish
         fs::write(dir.path().join("f.txt"), "hello").unwrap();
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["add", "f.txt"])
             .current_dir(dir.path())
             .output()
             .unwrap();
-        Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["commit", "-m", "init"])
             .current_dir(dir.path())
             .output()

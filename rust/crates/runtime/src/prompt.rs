@@ -1,7 +1,6 @@
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::cache_alignment::DynamicValueExtractor;
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
@@ -1011,7 +1010,7 @@ fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Re
 }
 
 fn read_git_status(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(["--no-optional-locks", "status", "--short", "--branch"])
         .current_dir(cwd)
         .output()
@@ -2435,7 +2434,7 @@ mod tests {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
+            crate::sandbox::quiet_command("git")
                 .args(args)
                 .current_dir(&root)
                 .output()
@@ -2490,7 +2489,7 @@ mod tests {
         ensure_valid_cwd();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["init", "--quiet"])
             .current_dir(&root)
             .status()
@@ -2516,17 +2515,17 @@ mod tests {
         ensure_valid_cwd();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["init", "--quiet", "-b", "main"])
             .current_dir(&root)
             .status()
             .expect("git init should run");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["config", "user.email", "tests@example.com"])
             .current_dir(&root)
             .status()
             .expect("git config email should run");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["config", "user.name", "Runtime Prompt Tests"])
             .current_dir(&root)
             .status()
@@ -2537,19 +2536,19 @@ mod tests {
             ("c.txt", "third commit"),
         ] {
             fs::write(root.join(file), "x\n").expect("write commit file");
-            std::process::Command::new("git")
+            crate::sandbox::quiet_command("git")
                 .args(["add", file])
                 .current_dir(&root)
                 .status()
                 .expect("git add should run");
-            std::process::Command::new("git")
+            crate::sandbox::quiet_command("git")
                 .args(["commit", "-m", message, "--quiet"])
                 .current_dir(&root)
                 .status()
                 .expect("git commit should run");
         }
         fs::write(root.join("d.txt"), "staged\n").expect("write staged file");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["add", "d.txt"])
             .current_dir(&root)
             .status()
@@ -2606,28 +2605,28 @@ mod tests {
         ensure_valid_cwd();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["init", "--quiet"])
             .current_dir(&root)
             .status()
             .expect("git init should run");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["config", "user.email", "tests@example.com"])
             .current_dir(&root)
             .status()
             .expect("git config email should run");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["config", "user.name", "Runtime Prompt Tests"])
             .current_dir(&root)
             .status()
             .expect("git config name should run");
         fs::write(root.join("tracked.txt"), "hello\n").expect("write tracked file");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["add", "tracked.txt"])
             .current_dir(&root)
             .status()
             .expect("git add should run");
-        std::process::Command::new("git")
+        crate::sandbox::quiet_command("git")
             .args(["commit", "-m", "init", "--quiet"])
             .current_dir(&root)
             .status()

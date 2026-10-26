@@ -758,7 +758,7 @@ pub struct ReplaceLinesOutput {
 /// (relative to the repo root) as a string. Returns `None` when the file is
 /// not tracked by a git repo or git is unavailable.
 fn git_diff_for_path(absolute_path: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .arg("diff")
         .arg("--")
         .arg(absolute_path)

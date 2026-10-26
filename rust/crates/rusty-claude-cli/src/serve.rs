@@ -2474,7 +2474,7 @@ fn revert_hunk(content: &str, hunk: &DiffHunk) -> Result<String, String> {
 }
 
 fn git_diff_text(root: &Path, path: Option<&str>) -> String {
-    let mut command = std::process::Command::new("git");
+    let mut command = runtime::sandbox::quiet_command("git");
     command.arg("-C").arg(root).args(["diff", "--no-color"]);
     if let Some(path) = path.filter(|path| !path.is_empty()) {
         command.arg("--").arg(path);
@@ -2502,7 +2502,7 @@ async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>)
     let patch = truncate_middle(&raw, 200_000);
     let diffs = parse_unified_diff(&raw);
 
-    let mut stat_cmd = std::process::Command::new("git");
+    let mut stat_cmd = runtime::sandbox::quiet_command("git");
     stat_cmd
         .arg("-C")
         .arg(workspace)
@@ -2525,7 +2525,7 @@ async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>)
         }
     }
 
-    let mut status_cmd = std::process::Command::new("git");
+    let mut status_cmd = runtime::sandbox::quiet_command("git");
     status_cmd
         .arg("-C")
         .arg(workspace)

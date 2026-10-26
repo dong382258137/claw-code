@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::process::Command;
 
 /// A single git commit entry from the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +24,7 @@ impl GitContext {
     #[must_use]
     pub fn detect(cwd: &Path) -> Option<Self> {
         // Quick gate: is this a git repo at all?
-        let rev_parse = Command::new("git")
+        let rev_parse = crate::sandbox::quiet_command("git")
             .args(["rev-parse", "--is-inside-work-tree"])
             .current_dir(cwd)
             .output()
@@ -71,7 +70,7 @@ impl GitContext {
 }
 
 fn read_branch(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(cwd)
         .output()
@@ -89,7 +88,7 @@ fn read_branch(cwd: &Path) -> Option<String> {
 }
 
 fn read_recent_commits(cwd: &Path) -> Vec<GitCommitEntry> {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args([
             "--no-optional-locks",
             "log",
@@ -125,7 +124,7 @@ fn read_recent_commits(cwd: &Path) -> Vec<GitCommitEntry> {
 }
 
 fn read_staged_files(cwd: &Path) -> Vec<String> {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(["--no-optional-locks", "diff", "--cached", "--name-only"])
         .current_dir(cwd)
         .output()
@@ -148,7 +147,6 @@ fn read_staged_files(cwd: &Path) -> Vec<String> {
 mod tests {
     use super::{GitCommitEntry, GitContext};
     use std::fs;
-    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -313,7 +311,7 @@ mod tests {
     }
 
     fn git(cwd: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::sandbox::quiet_command("git")
             .args(args)
             .current_dir(cwd)
             .output()

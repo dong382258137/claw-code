@@ -1,6 +1,5 @@
 #![allow(clippy::must_use_candidate)]
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchFreshness {
@@ -138,7 +137,7 @@ fn format_missing_fixes(missing_fixes: &[String]) -> String {
 }
 
 fn rev_list_count(a: &str, b: &str, repo_path: &Path) -> usize {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(["rev-list", "--count", &format!("{b}..{a}")])
         .current_dir(repo_path)
         .output();
@@ -152,7 +151,7 @@ fn rev_list_count(a: &str, b: &str, repo_path: &Path) -> usize {
 }
 
 fn missing_fix_subjects(a: &str, b: &str, repo_path: &Path) -> Vec<String> {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(["log", "--format=%s", &format!("{b}..{a}")])
         .current_dir(repo_path)
         .output();
@@ -191,7 +190,7 @@ mod tests {
     }
 
     fn run(cwd: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::sandbox::quiet_command("git")
             .args(args)
             .current_dir(cwd)
             .status()

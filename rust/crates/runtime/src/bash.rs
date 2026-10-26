@@ -227,7 +227,7 @@ fn detect_and_emit_ship_prepared(command: &str) {
 }
 
 fn get_current_branch() -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(["branch", "--show-current"])
         .output()
         .ok()?;
@@ -239,7 +239,7 @@ fn get_current_branch() -> Option<String> {
 }
 
 fn get_head_commit() -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::sandbox::quiet_command("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()?;
@@ -251,7 +251,7 @@ fn get_head_commit() -> Option<String> {
 }
 
 fn get_git_actor() -> Option<String> {
-    let name = Command::new("git")
+    let name = crate::sandbox::quiet_command("git")
         .args(["config", "user.name"])
         .output()
         .ok()
