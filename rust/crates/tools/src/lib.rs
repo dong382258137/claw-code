@@ -1361,8 +1361,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             description: "Request a hot upgrade: the running claw rebuilds itself and restarts, \
                           then automatically resumes this session and continues the task. Call this \
                           after you have changed claw's own source code and want the changes to take \
-                          effect in the running process. The request only takes effect after the \
-                          current turn finishes; the process then exits and a new one resumes.",
+                          effect in the running process. This works in both TUI/CLI and Web \
+                          (`claw serve`) sessions. In Web mode the replacement server reuses the \
+                          same port and access token, so open pages reconnect and reload \
+                          automatically. If you changed Web frontend sources under \
+                          `rust/crates/rusty-claude-cli/web/src`, run `npm run build` in \
+                          `rust/crates/rusty-claude-cli/web` BEFORE calling this tool: the UI is \
+                          embedded from `web/dist` at compile time, so skipping that build upgrades \
+                          the backend but keeps the old frontend. The request only takes effect \
+                          after the current turn finishes; the process then exits and a new one \
+                          resumes.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

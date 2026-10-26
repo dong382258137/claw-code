@@ -535,7 +535,7 @@ async fn execute_bash_async(
 /// 终止进程树。
 ///
 /// Windows 用 taskkill /T /F(递归终止子孙进程),Unix 用 kill -KILL 进程组。
-fn kill_process_tree(pid: u32) {
+pub(crate) fn kill_process_tree(pid: u32) {
     if pid == 0 {
         return;
     }

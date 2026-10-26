@@ -917,58 +917,97 @@ pub fn run_cargo_check_for_file(file_path: &Path) -> Option<String> {
         .spawn()
         .ok()?;
 
+    // 先接管管道再等进程：Windows 下 `cargo` 是 rustup 代理，cargo 进程退出后
+    // 其后代（真 cargo/rustc）仍可能持有管道写端。若等 `try_wait` 之后再
+    // `read_to_string`，读端会永久阻塞——2026-10-25 Web turn 卡死 43 分钟
+    // 即由此触发。改为两个后台线程并发读到 EOF，主线程只负责超时收口，
+    // 任何情况下都不做无界阻塞读。
+    let (pipe_tx, pipe_rx) = std::sync::mpsc::channel::<(bool, String)>();
+    if let Some(stdout) = child.stdout.take() {
+        let tx = pipe_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((true, read_pipe_to_string(stdout)));
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let tx = pipe_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((false, read_pipe_to_string(stderr)));
+        });
+    }
+    drop(pipe_tx);
+
     let timeout = std::time::Duration::from_secs(60);
     let start = std::time::Instant::now();
+    let mut timed_out = false;
 
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|mut s| {
-                        use std::io::Read;
-                        let mut buf = String::new();
-                        let _ = s.read_to_string(&mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|mut s| {
-                        use std::io::Read;
-                        let mut buf = String::new();
-                        let _ = s.read_to_string(&mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-
-                let combined = format!("{stdout}{stderr}");
-                if combined.trim().is_empty() {
-                    return Some("cargo check: OK (no output)".to_string());
-                }
-                // Truncate to prevent massive responses
-                let max_len = 5000;
-                if combined.len() > max_len {
-                    return Some(format!(
-                        "cargo check:\n{}\n...(truncated, {} total bytes)",
-                        &combined[..max_len],
-                        combined.len()
-                    ));
-                }
-                return Some(format!("cargo check:\n{combined}"));
-            }
+            Ok(Some(_status)) => break,
             Ok(None) => {
                 if start.elapsed() > timeout {
+                    timed_out = true;
+                    // 杀掉整棵进程树（含 rustc 后代），否则管道写端残留会让
+                    // 读取线程继续挂在 EOF 之前。
+                    crate::bash::kill_process_tree(child.id());
                     let _ = child.kill();
-                    return Some("cargo check timed out (60s)".to_string());
+                    let _ = child.wait();
+                    break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(e) => return Some(format!("cargo check error: {e}")),
+            Err(e) => {
+                crate::bash::kill_process_tree(child.id());
+                let _ = child.kill();
+                return Some(format!("cargo check error: {e}"));
+            }
         }
     }
+
+    // 进程结束后给读取线程有限宽限期：正常情况读到 EOF 立即返回；若仍有
+    // 后代攥着写端，宽限期到点即放弃，绝不无界等待。
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut received = 0;
+    while received < 2 {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match pipe_rx.recv_timeout(deadline - now) {
+            Ok((true, text)) => stdout = text,
+            Ok((false, text)) => stderr = text,
+            Err(_) => break,
+        }
+        received += 1;
+    }
+
+    if timed_out {
+        return Some("cargo check timed out (60s)".to_string());
+    }
+
+    let combined = format!("{stdout}{stderr}");
+    if combined.trim().is_empty() {
+        return Some("cargo check: OK (no output)".to_string());
+    }
+    // Truncate to prevent massive responses
+    let max_len = 5000;
+    if combined.len() > max_len {
+        return Some(format!(
+            "cargo check:\n{}\n...(truncated, {} total bytes)",
+            &combined[..max_len],
+            combined.len()
+        ));
+    }
+    Some(format!("cargo check:\n{combined}"))
+}
+
+/// 把一个子进程管道读到字符串。阻塞语义，调用方负责放到独立线程执行。
+fn read_pipe_to_string(mut pipe: impl std::io::Read) -> String {
+    let mut buffer = String::new();
+    let _ = pipe.read_to_string(&mut buffer);
+    buffer
 }
 
 fn glob_search_impl(

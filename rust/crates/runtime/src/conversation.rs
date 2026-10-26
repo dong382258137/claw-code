@@ -1,4 +1,4 @@
-﻿use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3427,7 +3427,14 @@ where
             .get("path")
             .or_else(|| parsed.get("file_path"))
             .and_then(|v| v.as_str())?;
-        if !(target.ends_with(".rs") || target.ends_with(".toml")) {
+        let is_backend = target.ends_with(".rs") || target.ends_with(".toml");
+        let is_web = target.ends_with(".jsx")
+            || target.ends_with(".tsx")
+            || target.ends_with(".js")
+            || target.ends_with(".ts")
+            || target.ends_with(".css")
+            || target.ends_with(".html");
+        if !(is_backend || is_web) {
             return None;
         }
         // 跨平台归一化(兼容 / 与 \,忽略 ./,Windows 忽略大小写),与
@@ -3451,10 +3458,20 @@ where
         if !abs_norm.starts_with(&format!("{root_norm}/")) || !abs_norm.contains("/rust/crates/") {
             return None;
         }
+        let is_web_source = abs_norm.contains("/rusty-claude-cli/web/src/");
+        if is_web_source {
+            return Some(format!(
+                "[hot-upgrade] 目标文件 `{target}` 属于 claw Web 前端源码。前端产物不会自动构建 —— \
+                 请先在工作区运行 `npm run build`（目录 `rust/crates/rusty-claude-cli/web`），\
+                 再在本 turn 结束后调用 `HotUpgrade` 工具。Web 模式下新进程会复用同端口和同 token，\
+                 已打开的页面会自动重连并 reload 出新界面。"
+            ));
+        }
         Some(format!(
             "[hot-upgrade] 目标文件 `{target}` 属于 claw 自身源码。磁盘改动不会作用于\
              **当前运行进程** —— 如需本次修改在当前会话生效,请在本 turn 结束后调用 \
-             `HotUpgrade` 工具(进程将重建并重启,自动恢复本会话继续任务)。"
+             `HotUpgrade` 工具(进程将重建并重启,自动恢复本会话继续任务;TUI 与 Web 均支持,\
+             Web 会复用同端口/token 并自动刷新页面)。"
         ))
     }
 
@@ -5765,8 +5782,9 @@ where
                             }
                             if self.own_source_dirty && !self.upgrade_pending() {
                                 output_to_store = format!(
-                                    "{output_to_store}\n\n[hot-upgrade-debt] 本会话已修改 claw 自身源码,但运行进程仍为旧二进制。\
-                                     结束前请调用 `HotUpgrade` 工具,否则改动不会在当前会话生效。"
+                                    "{output_to_store}\n\n[hot-upgrade-debt] 本会话已修改 claw 自身源码（含 Web 前端），但运行进程/前端产物仍是旧的。\
+                                     结束前请：Web 前端改动先 `npm run build`（`rust/crates/rusty-claude-cli/web`），\
+                                     再调用 `HotUpgrade`；TUI 与 Web 均支持，Web 会复用端口/token 并自动刷新页面。"
                                 );
                             }
                         }
@@ -5908,37 +5926,31 @@ where
             }
 
             // P2(成本反馈注记 · Task 5):本迭代工具批处理结束 → 评估成本累计,
-            // 需要时注入「成本提示/警示」[runtime] 注记(作为 user 消息,下一次
-            // 请求构造时对模型可见 —— 与上方充分性提醒同通道)。频率上限在
+            // 默认把成本提示/警示写进 diag/面板(不进模型上下文)。频率上限在
             // meter 内部(普通提示每 ~5 次工具调用一条、警示每 ~10K output
-            // 一条),防止注记本身刷屏变成新的成本。Trivial/Standard 两档都
-            // 注入 —— 成本失控恰在 Trivial 问答轮最严重,不按档位豁免。
+            // 一条),防止注记本身刷屏变成新的成本。
             // 阈值复用 turn 开头读取的 `cost_warn_threshold`(见 run_turn 入口)。
             if let Some(note) = self.cost_meter.poll_note(cost_warn_threshold) {
                 if note.contains("成本警示") {
-                    // 警示(≥20K 高燃烧):强收口最后防线,注入 user 消息对模型
-                    // 可见(下一轮请求前逼停收敛 —— dl-19 的收敛机制)。
-                    //
-                    // 站7:成本警示 × 收敛契约合并去重 —— 两者都是"高 output
-                    // 喊收敛"的同一意图,独立渲染会同 turn 交替注入(基线实证:
-                    // 高输出 turn 6 次成本警示 + 6 次收敛催缴轮流出场,单条都
-                    // 各自完整,信息重叠)。收敛契约存续、模型未响应且 soft1
-                    // 尚未注入时,把警示文本升格为「成本 + 收敛声明」合并注记
-                    // (一条完成报成本+给声明格式两个职能,替代即将独立注入的
-                    // soft1),置 soft1 注入标志防后续重复。soft1 已注入后,警示
-                    // 恢复纯成本文本,收敛渐进交给 soft2(90 优先)正常推进。
-                    let note = if crate::convergence::convergence_enabled()
-                        && turn_tier != TriageTier::Trivial
-                        && !convergence_acknowledged
-                        && !convergence_soft1_injected
-                    {
-                        convergence_soft1_injected = true;
-                        warn_merged_this_iter = true;
-                        crate::convergence::merged_cost_warning(&note)
+                    // 2026-10-26:成本警示默认不再注入模型 —— 它同样属于
+                    // “中途催收尾”,实证会把任务拽向提前收口。只进 diag/面板;
+                    // `CLAW_CONVERGENCE_NAG=1` 可回滚旧的「成本+收敛声明」合并注记。
+                    if crate::convergence::convergence_nag_enabled() {
+                        let note = if crate::convergence::convergence_enabled()
+                            && turn_tier != TriageTier::Trivial
+                            && !convergence_acknowledged
+                            && !convergence_soft1_injected
+                        {
+                            convergence_soft1_injected = true;
+                            warn_merged_this_iter = true;
+                            crate::convergence::merged_cost_warning(&note)
+                        } else {
+                            note
+                        };
+                        stage_note(&mut arbiter_note, 80, note);
                     } else {
-                        note
-                    };
-                    stage_note(&mut arbiter_note, 80, note);
+                        self.emit_diag(format!("[diag] cost_warn {note}"));
+                    }
                 } else {
                     // 普通提示(≥5K):改走面板/日志(diag_callback),不进模型
                     // 上下文 —— 成本反馈对任务零信息量,注入只会牵引注意力、
@@ -5949,12 +5961,12 @@ where
             }
 
             // 收敛契约 P1(§5.1 窄版,方案 A):软阈值门控注入【收敛声明】提示。
-            // - 触发:output ≥ 15K(soft1)与 ≥ 25K(soft2),各一次(文档 §4.3);
-            // - 仅非 Trivial 档(§6.2:Simple 不开,复用 turn_tier);
-            // - 注入为 user 消息,下一次请求构造对模型可见(与 poll_note 同通道);
-            // - env `CLAW_CONVERGENCE_P1=0` 一键关(见 convergence::convergence_enabled)。
-            // 模型回复含声明后,由 break 前的校验段(见 ~L4341)解析并决定收尾/打回。
-            if crate::convergence::convergence_enabled() && turn_tier != TriageTier::Trivial {
+            // 2026-10-26 默认**停用**“中途催收尾”:实证模型会把该注入当成用户
+            // 意图而中途停下反问。保留实现供回滚,`CLAW_CONVERGENCE_NAG=1` 启用。
+            if crate::convergence::convergence_nag_enabled()
+                && crate::convergence::convergence_enabled()
+                && turn_tier != TriageTier::Trivial
+            {
                 let turn_output = self.cost_meter.turn_output_tokens();
                 // 批5:acknowledged(模型已输出合法声明)后不再重复催缴 ——
                 // 消除"催缴 → 重复输出声明段 → 再催缴"微循环。false 声明
@@ -12959,6 +12971,9 @@ mod tests {
         // (实测:基线 stash 后同样失败,去掉该 env 即通过)。
         let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
         std::env::set_var("CLAW_CONVERGENCE_P1", "1");
+        // 2026-10-26:中途催缴默认停用;本测试验证的是回滚路径(P1 旧行为)。
+        let saved_nag_env = std::env::var("CLAW_CONVERGENCE_NAG").ok();
+        std::env::set_var("CLAW_CONVERGENCE_NAG", "1");
 
         let diag_log: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -12987,6 +13002,10 @@ mod tests {
         match saved_convergence_env {
             Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
             None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
+        }
+        match saved_nag_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_NAG", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_NAG"),
         }
 
         // then:收敛提示(user 注入的催缴模板)全程恰好 1 条 —— 模型声明后 soft2 被冷却。
@@ -13268,6 +13287,9 @@ mod tests {
         );
         let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
         std::env::set_var("CLAW_CONVERGENCE_P1", "1");
+        // 2026-10-26:中途催缴默认停用;本测试验证回滚路径的埋点契约。
+        let saved_nag_env = std::env::var("CLAW_CONVERGENCE_NAG").ok();
+        std::env::set_var("CLAW_CONVERGENCE_NAG", "1");
 
         let diag_log: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -13296,6 +13318,10 @@ mod tests {
         match saved_convergence_env {
             Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
             None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
+        }
+        match saved_nag_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_NAG", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_NAG"),
         }
 
         let log = diag_log.lock().expect("diag lock");
@@ -14340,6 +14366,10 @@ mod tests {
         // 这是 F1 单动作原则的预期行为,故禁用收敛,让成本通道独占验证。
         let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
         std::env::set_var("CLAW_CONVERGENCE_P1", "0");
+        // 2026-10-26:成本警示默认随中途催缴一起停用;本测试验证该通道本身,
+        // 显式启用(收敛仍由上面的 P1=0 隔离,保证走纯成本分支)。
+        let saved_nag_env = std::env::var("CLAW_CONVERGENCE_NAG").ok();
+        std::env::set_var("CLAW_CONVERGENCE_NAG", "1");
 
         let diag_log: Arc<Mutex<Vec<String>>> = diag_captured.clone();
         let mut runtime = ConversationRuntime::new(
@@ -14370,6 +14400,10 @@ mod tests {
         match saved_convergence_env {
             Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
             None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
+        }
+        match saved_nag_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_NAG", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_NAG"),
         }
 
         let requests = captured.lock().expect("lock");
@@ -14486,6 +14520,9 @@ mod tests {
         // 显式启用收敛契约,避免 CI 残留 env 停用之。
         let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
         std::env::set_var("CLAW_CONVERGENCE_P1", "1");
+        // 2026-10-26:中途催缴默认停用;合并注记属于回滚路径,显式启用。
+        let saved_nag_env = std::env::var("CLAW_CONVERGENCE_NAG").ok();
+        std::env::set_var("CLAW_CONVERGENCE_NAG", "1");
 
         let diag_log: Arc<Mutex<Vec<String>>> = diag_captured.clone();
         let mut runtime = ConversationRuntime::new(
@@ -14515,6 +14552,10 @@ mod tests {
         match saved_convergence_env {
             Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
             None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
+        }
+        match saved_nag_env {
+            Some(value) => std::env::set_var("CLAW_CONVERGENCE_NAG", value),
+            None => std::env::remove_var("CLAW_CONVERGENCE_NAG"),
         }
 
         let requests = captured.lock().expect("lock");
@@ -23548,6 +23589,22 @@ mod tests {
         assert!(runtime
             .maybe_hot_upgrade_note(r#"{"path": "rust/crates/runtime/README.md"}"#)
             .is_none());
+    }
+
+    /// Web 前端源码(.jsx/.css 等)→ 提醒先 npm run build，再 HotUpgrade。
+    #[test]
+    fn hot_upgrade_note_fires_for_web_frontend() {
+        let (runtime, _tmp) = runtime_with_claw_layout();
+        let hint = runtime
+            .maybe_hot_upgrade_note(r#"{"path": "rust/crates/rusty-claude-cli/web/src/App.jsx"}"#)
+            .expect("Web 前端源码应触发热升级提醒");
+        assert!(hint.contains("[hot-upgrade]"), "应带标记: {hint}");
+        assert!(hint.contains("npm run build"), "应提示先构建前端: {hint}");
+        assert!(
+            hint.contains("HotUpgrade"),
+            "应点名 HotUpgrade 工具: {hint}"
+        );
+        assert!(hint.contains("token"), "应说明 Web 复用 token: {hint}");
     }
 
     /// 工作区内的普通 Rust 文件(不在 rust/crates 下)不触发 —— 只针对自身源码。

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -336,6 +336,74 @@ impl Session {
     pub fn with_persistence_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.persistence = Some(SessionPersistence { path: path.into() });
         self
+    }
+
+    /// 修补“悬空 tool_use”：assistant 消息里的工具调用若没有对应的 tool_result
+    /// （上一轮在工具执行中被中断、进程被杀或 Web turn 卡死），续聊时 API 会以
+    /// 400 拒绝整段历史：
+    /// `An assistant message with 'tool_calls' must be followed by tool messages...`
+    /// 这里为每个缺失的调用补一条 `is_error` 的合成结果，让会话可以继续恢复。
+    /// 返回补写的结果条数。
+    pub fn repair_dangling_tool_uses(&mut self) -> usize {
+        let mut repaired = 0;
+        let mut index = 0;
+        while index < self.messages.len() {
+            if self.messages[index].role != MessageRole::Assistant {
+                index += 1;
+                continue;
+            }
+            let used: Vec<(String, String)> = self.messages[index]
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
+                    _ => None,
+                })
+                .collect();
+            if used.is_empty() {
+                index += 1;
+                continue;
+            }
+            let mut answered: HashSet<String> = HashSet::new();
+            let mut cursor = index + 1;
+            while cursor < self.messages.len() && self.messages[cursor].role == MessageRole::Tool {
+                for block in &self.messages[cursor].blocks {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                        answered.insert(tool_use_id.clone());
+                    }
+                }
+                cursor += 1;
+            }
+            let missing: Vec<(String, String)> = used
+                .into_iter()
+                .filter(|(id, _)| !answered.contains(id))
+                .collect();
+            if !missing.is_empty() {
+                let created_at_ms = self.messages[index].created_at_ms;
+                let blocks = missing
+                    .iter()
+                    .map(|(id, name)| ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        output: "[interrupted] 该工具调用在上一轮执行中被中断，未返回结果。"
+                            .to_string(),
+                        is_error: true,
+                    })
+                    .collect();
+                self.messages.insert(
+                    cursor,
+                    ConversationMessage {
+                        role: MessageRole::Tool,
+                        blocks,
+                        usage: None,
+                        created_at_ms,
+                    },
+                );
+                repaired += missing.len();
+            }
+            index = cursor.max(index + 1);
+        }
+        repaired
     }
 
     /// Bind this session to the workspace root it was created in.
@@ -1691,6 +1759,49 @@ mod tests {
 
         assert!(first < second);
         assert!(second < third);
+    }
+
+    #[test]
+    fn repair_dangling_tool_uses_backfills_interrupted_calls() {
+        let mut session = Session::new();
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "edit_file".to_string(),
+                input: "{}".to_string(),
+            }],
+            usage: None,
+            created_at_ms: 1,
+        });
+        session.messages.push(ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: "继续".to_string(),
+            }],
+            usage: None,
+            created_at_ms: 2,
+        });
+
+        let repaired = session.repair_dangling_tool_uses();
+
+        assert_eq!(repaired, 1);
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[1].role, MessageRole::Tool);
+        match &session.messages[1].blocks[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "toolu_1");
+                assert!(*is_error);
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+        // 幂等：补齐后再调用一次不应重复插入。
+        assert_eq!(session.repair_dangling_tool_uses(), 0);
+        assert_eq!(session.messages.len(), 3);
     }
 
     #[test]

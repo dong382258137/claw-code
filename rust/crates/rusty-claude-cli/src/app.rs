@@ -2285,7 +2285,10 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let (handle, mut session) = load_session_reference(&session_ref)?;
+        // 上次 turn 若在工具执行中被中断（进程被杀/卡死），会话末尾会留下
+        // 没有 tool_result 的 tool_use，API 会以 400 拒绝续聊。恢复时补齐。
+        session.repair_dangling_tool_uses();
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(

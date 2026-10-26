@@ -712,6 +712,23 @@ pub fn convergence_enabled_from_env(v: Option<&str>) -> bool {
     !matches!(v, Some("0"))
 }
 
+/// 中途催缴开关(soft1/soft2 收敛声明提示 + 成本警示注入)。
+///
+/// 2026-10-26 默认**关闭**:实证(session-1792876430758-0)显示模型会把
+/// `[runtime]` 注入的声明模板当成用户意图,在任务中途停下反问用户,
+/// 与"降低总成本"的目标相反。声明解析/校验实现保留,供试点回滚:
+/// `CLAW_CONVERGENCE_NAG=1` 重新启用。
+#[must_use]
+pub fn convergence_nag_enabled() -> bool {
+    nag_enabled_from_env(std::env::var("CLAW_CONVERGENCE_NAG").ok().as_deref())
+}
+
+/// env 原始值 → 中途催缴开关(纯函数,默认关闭)。
+#[must_use]
+pub fn nag_enabled_from_env(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1"))
+}
+
 /// tool history 中一次工具结果的轻量投影输入(由 conversation.rs 映射,
 /// 本模块不依赖 session/ContentBlock 类型,保持纯函数可单测)。
 #[derive(Debug, Clone, Copy)]
@@ -1117,6 +1134,16 @@ mod convergence_p1_tests {
         // 其他值 → 开
         assert!(convergence_enabled_from_env(Some("1")));
         assert!(convergence_enabled_from_env(Some("true")));
+    }
+
+    #[test]
+    fn nag_switch_is_off_by_default() {
+        // 2026-10-26:默认停用“中途催收尾”,只有显式 "1" 才回滚启用。
+        assert!(!nag_enabled_from_env(None));
+        assert!(!nag_enabled_from_env(Some("0")));
+        assert!(!nag_enabled_from_env(Some("true")));
+        assert!(nag_enabled_from_env(Some("1")));
+        assert!(nag_enabled_from_env(Some(" 1 ")));
     }
 
     #[test]
