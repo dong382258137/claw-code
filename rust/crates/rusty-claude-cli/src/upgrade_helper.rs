@@ -217,6 +217,22 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     //      需回拷到 exe 原路径(原文件已被 mv 成 .old,不复制则启动必然失败)。
     let in_target_debug = exe.starts_with(workspace_root.join("target").join("debug"));
     let in_target_release = exe.starts_with(workspace_root.join("target").join("release"));
+    let target_layout = in_target_debug || in_target_release;
+    if target_layout {
+        // target 布局下 cargo 会把新产物写到 exe 原路径；helper 自身正运行于
+        // 该路径，Windows 不允许覆盖运行中的镜像。先把自身改名为 .old
+        // （Windows 允许 rename 运行中的 exe），构建失败时再改回来。
+        let _ = std::fs::remove_file(&old_exe);
+        std::fs::rename(&exe, &old_exe)?;
+        log_out(
+            &log_file,
+            &format!(
+                "[upgrade-helper] 释放 exe 路径: {} → {}",
+                exe.display(),
+                old_exe.display()
+            ),
+        );
+    }
     let use_release = !in_target_debug;
     let profile_dir = if use_release { "release" } else { "debug" };
     log_out(
@@ -260,6 +276,10 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         );
         log_out(&log_file, &msg);
         eprintln!("{msg}");
+        if target_layout {
+            // 构建失败：把旧镜像改回原路径，保证入口仍可启动旧版本。
+            let _ = std::fs::rename(&old_exe, &exe);
+        }
         return Err("cargo build failed".into());
     }
 
@@ -280,7 +300,15 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
                     "claw.exe"
                 )
             })?;
-        copy_with_retry(&built, &exe, Duration::from_secs(15))?;
+        // helper 自身就运行在 exe 路径上，不能直接覆盖；先把自身改名成
+        // .old 释放路径（备份副本已存在，这里覆盖它），再落新产物。
+        let _ = std::fs::remove_file(&old_exe);
+        std::fs::rename(&exe, &old_exe)?;
+        if let Err(error) = copy_with_retry(&built, &exe, Duration::from_secs(15)) {
+            // 失败回滚：把旧镜像改回原路径，快捷方式仍然可用。
+            let _ = std::fs::rename(&old_exe, &exe);
+            return Err(error.into());
+        }
         log_out(
             &log_file,
             &format!(
