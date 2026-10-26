@@ -1962,12 +1962,47 @@ async fn api_workspace_add(
 }
 
 /// 弹系统文件夹选择框（Windows）。返回 None 表示用户取消。
+///
+/// Windows 上有两个必须在这里处理的坑，否则 Web UI 里点“+”会出现
+/// “选择框弹在其它窗口后面”和“工作区不存在：D:\+乱码”（GBK 被当成 UTF-8）。
+///
+/// 1. 没有所有者窗口的 `FolderBrowserDialog` 从后台进程（`claw serve`）里弹出时
+///    不算前台窗口，会被系统压到所有窗口后面；这里先用一个 1x1 全透明的
+///    TopMost 窗体当 owner，对话框作为它的 owned window 同样保持置顶。
+/// 2. 中文 Windows 上 `[Console]::Out` 默认按 GBK(CP936) 输出，Rust 端按 UTF-8
+///    解析会把 `D:\测试项目` 读成一串替换字符（`�`），`canonicalize` 必然失败。
+///    脚本因此绕开 `Console`，直接用 UTF-8（无 BOM）把路径写进标准输出。
 #[cfg(windows)]
 fn pick_folder_dialog() -> Result<Option<PathBuf>, String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = r#"Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = '选择 CLAW 工作区目录'; $dialog.ShowNewFolderButton = $true; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }"#;
+    let script = r#"Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$owner = New-Object System.Windows.Forms.Form
+$owner.StartPosition = 'CenterScreen'
+$owner.FormBorderStyle = 'None'
+$owner.ShowInTaskbar = $false
+$owner.TopMost = $true
+$owner.Opacity = 0
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Show()
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择 CLAW 工作区目录'
+$dialog.ShowNewFolderButton = $true
+$result = [System.Windows.Forms.DialogResult]::Cancel
+try {
+  $result = $dialog.ShowDialog($owner)
+} finally {
+  $owner.Close()
+  $owner.Dispose()
+}
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+  $writer = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding($false)))
+  $writer.Write($dialog.SelectedPath)
+  $writer.Flush()
+  $writer.Dispose()
+}"#;
     let mut last_error = String::new();
     for exe in ["powershell.exe", "pwsh.exe"] {
         match std::process::Command::new(exe)
@@ -1975,20 +2010,28 @@ fn pick_folder_dialog() -> Result<Option<PathBuf>, String> {
             .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
-            Ok(output) if output.status.success() => {
-                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if text.is_empty() {
+            Ok(output) => {
+                if let Some(path) = parse_picker_output(&output.stdout) {
+                    return Ok(Some(path));
+                }
+                // 正常退出但没有输出 = 用户点了取消。
+                if output.status.success() {
                     return Ok(None);
                 }
-                return Ok(Some(PathBuf::from(text)));
-            }
-            Ok(output) => {
                 last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
             }
             Err(error) => last_error = error.to_string(),
         }
     }
     Err(format!("无法打开文件夹选择框：{last_error}"))
+}
+
+/// 解析选择框的标准输出：脚本固定写 UTF-8，空输出表示用户取消。
+#[cfg(windows)]
+fn parse_picker_output(stdout: &[u8]) -> Option<PathBuf> {
+    let text = String::from_utf8_lossy(stdout);
+    let text = text.trim();
+    (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
 #[cfg(not(windows))]
@@ -3870,5 +3913,21 @@ mod tests {
         let expansions = out.matches("[引用 a.txt").count();
         assert_eq!(expansions, super::MAX_MENTIONS, "expansions={expansions}");
         assert_eq!(out.matches("@a.txt").count(), 5, "剩余原文应保留");
+    }
+
+    /// 回归：中文 Windows 上旧脚本用 [Console]::Out 写出 GBK 字节，Rust 端按
+    /// UTF-8 解析后路径变成 `D:\������Ŀ`，前端报“工作区不存在”。脚本现在固定
+    /// 写 UTF-8，这里锁住解码约定。
+    #[cfg(windows)]
+    #[test]
+    fn picker_output_decodes_utf8_paths() {
+        let path =
+            parse_picker_output("D:\\测试项目\r\n".as_bytes()).expect("非空输出应解析出路径");
+        assert_eq!(path.to_string_lossy(), "D:\\测试项目");
+        assert!(parse_picker_output(b"").is_none(), "空输出=用户取消");
+        assert!(
+            parse_picker_output(b" \r\n\t").is_none(),
+            "纯空白也视为取消"
+        );
     }
 }

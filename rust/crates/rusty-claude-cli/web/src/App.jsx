@@ -112,11 +112,15 @@ export default function App() {
   const [dock, setDock] = useState('right')
   const [panelWidth, setPanelWidth] = useState(420)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [voiceDiscussionOpen, setVoiceDiscussionOpen] = useState(false)
   const [webSettings, setWebSettings] = useState({ theme: 'dark', permission: 'workspace-write' })
   const [meta, setMeta] = useState({ version: '', git_sha: '', workspace: '' })
   const { toasts, push } = useToasts()
   // 文件面板「引用选区」→ 输入框的通道。带时间戳，便于同一引用重复插入。
   const [pendingRef, setPendingRef] = useState(null)
+  // 语音讨论「结束并整理」→ 输入框的通道。整理结果只填入待编辑，绝不直接发送；
+  // 语音转写难免有错字，直接发出去用户没有任何纠正机会（这正是本通道存在的原因）。
+  const [pendingDraft, setPendingDraft] = useState(null)
   // 稳定的错误回调：面板的 load 依赖它，若每次渲染换新函数会触发无限重取。
   const panelError = useCallback((message) => {
     if (message) push(message, 'error')
@@ -523,6 +527,12 @@ export default function App() {
     }
   }, [currentId, push, running])
 
+  const openVoiceDiscussion = useCallback(() => {
+    if (!currentId) { push('请先在左侧选择或新建一个会话', 'error'); return }
+    if (running) { push('请等待当前回复结束后再开始语音讨论', 'error'); return }
+    setVoiceDiscussionOpen(true)
+  }, [currentId, push, running])
+
   const runQuickAction = useCallback((action) => {
     if (action === 'settings') setSettingsOpen(true)
     else openPanel(action)
@@ -587,9 +597,16 @@ export default function App() {
         model={webSettings.model || ''}
         onModel={(value) => saveSettings({ model: value })}
         workspace={activeWorkspace}
+        workspaces={workspaces}
+        sessionModel={current?.model || ''}
+        onVoiceDiscussion={openVoiceDiscussion}
+        onNewInWorkspace={startInFolder}
+        onOpenWorkspacePicker={() => setWorkspacePickerOpen(true)}
         stats={current?.stats}
         pendingRef={pendingRef}
         onRefUsed={setPendingRef}
+        pendingDraft={pendingDraft}
+        onDraftUsed={setPendingDraft}
       />
       {settingsOpen && (
         <SettingsPage
@@ -655,6 +672,18 @@ export default function App() {
             <div className="muted">不操作会在 120 秒后自动拒绝。</div>
           </div>
         </div>
+      )}
+      {voiceDiscussionOpen && currentId && (
+        <VoiceDiscussion
+          running={running}
+          live={live}
+          messages={messages}
+          onSend={send}
+          onStop={stop}
+          onClose={() => setVoiceDiscussionOpen(false)}
+          onError={(message) => push(message, 'error')}
+          onDraft={setPendingDraft}
+        />
       )}
     </div>
   )
@@ -1070,34 +1099,265 @@ function LiveTurn({ thinking, tools, text }) {
   )
 }
 
-function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, stats, pendingRef, onRefUsed }) {
+/* ---------------- 输入区（Trae 风格） ---------------- */
+
+const MODEL_PRESETS = [
+  { id: '', label: '默认模型', hint: '跟随工作区配置' },
+  { id: 'deepseek-v4-flash', label: 'DeepSeek-V4.1-Flash', badge: 'Max', hint: '速度优先，日常默认' },
+  { id: 'deepseek-v4-pro', label: 'DeepSeek-V4.1-Pro', hint: '质量优先，响应较慢' },
+  { id: 'deepseek-chat', label: 'DeepSeek-Chat', hint: '通用对话' },
+  { id: 'deepseek-reasoner', label: 'DeepSeek-Reasoner', hint: '深度思考' },
+]
+const MODEL_LOOKUP = Object.fromEntries(MODEL_PRESETS.filter((item) => item.id).map((item) => [item.id, item]))
+
+const PERMISSION_PRESETS = [
+  { id: 'read-only', label: '只读', hint: '仅查看文件与只读命令', tone: 'muted' },
+  { id: 'workspace-write', label: '工作区可写', hint: '可修改工作区，敏感操作需确认', tone: 'blue' },
+  { id: 'danger-full-access', label: '完全访问', hint: '不再逐次确认，请谨慎使用', tone: 'orange' },
+]
+const PERMISSION_LOOKUP = Object.fromEntries(PERMISSION_PRESETS.map((item) => [item.id, item]))
+
+const CAP_ICONS = {
+  files: 'folder',
+  diff: 'diff',
+  tasks: 'check',
+  attachments: 'paperclip',
+  terminal: 'terminal',
+  settings: 'settings',
+}
+
+const ICONS = {
+  plus: <><path d="M12 5v14M5 12h14" /></>,
+  chevron: <path d="m6 9.5 6 6 6-6" />,
+  shield: <path d="M12 3.2 19 5.8v5.7c0 4.3-3 7.6-7 9.3-4-1.7-7-5-7-9.3V5.8L12 3.2Z" />,
+  mic: <><rect x="9.2" y="3" width="5.6" height="10.5" rx="2.8" /><path d="M5.8 11.5a6.2 6.2 0 0 0 12.4 0M12 17.7V21" /></>,
+  wave: <><path d="M3.5 10v4M7 6.5v11M10.5 9v6M14 4.5v15M17.5 10v4" /><circle cx="20.5" cy="12" r="1" fill="currentColor" stroke="none" /></>,
+  arrowUp: <><path d="M12 19V5" /><path d="m5.5 11.5 6.5-6.5 6.5 6.5" /></>,
+  stop: <rect x="6.5" y="6.5" width="11" height="11" rx="2.5" fill="currentColor" stroke="none" />,
+  laptop: <><rect x="4.5" y="5" width="15" height="10.5" rx="1.8" /><path d="M2.5 18.5h19" /></>,
+  folder: <path d="M3 7.2c0-.9.7-1.6 1.6-1.6h4.3l2 2.4h7.7c.9 0 1.6.7 1.6 1.6v7.6c0 .9-.7 1.6-1.6 1.6H4.6c-.9 0-1.6-.7-1.6-1.6V7.2Z" />,
+  paperclip: <path d="m20 11.2-8.1 8.1a4.8 4.8 0 0 1-6.8-6.8l8.6-8.6a3.2 3.2 0 0 1 4.5 4.5l-8.2 8.2a1.7 1.7 0 0 1-2.4-2.4l7.4-7.4" />,
+  doc: <><rect x="5" y="3" width="14" height="18" rx="2" /><path d="M8.5 8h7M8.5 12h7M8.5 16h4.5" /></>,
+  search: <><circle cx="11" cy="11" r="6.5" /><path d="m20 20-3.6-3.6" /></>,
+  check: <path d="m5 12.5 4.5 4.5L19 7" />,
+  terminal: <><path d="m5 8 4 4-4 4M12.5 16H19" /></>,
+  settings: <><path d="M4 7h9M18 7h2M4 17h2M10 17h10" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /></>,
+  diff: <><path d="M6 5v14M12 7h6M12 12h6M12 17h6" /><circle cx="6" cy="5" r="1.5" fill="currentColor" stroke="none" /></>,
+  cloud: <path d="M7 18h9.5a3.5 3.5 0 0 0 .6-6.9A5.5 5.5 0 0 0 6.3 9.8 4.1 4.1 0 0 0 7 18Z" />,
+  x: <><path d="M6 6l12 12M18 6 6 18" /></>,
+  pause: <><path d="M8 5v14M16 5v14" /></>,
+  volume: <><path d="M4 9.5v5h3l4 3.5V6L7 9.5H4Z" /><path d="M15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11" /></>,
+  volumeOff: <><path d="M4 9.5v5h3l4 3.5V6L7 9.5H4Z" /><path d="m15 9 6 6M21 9l-6 6" /></>,
+}
+
+function assistantReplyAfter(messages, cursor) {
+  for (let index = (messages || []).length - 1; index >= cursor; index -= 1) {
+    const message = messages[index]
+    if (!message || message.role !== 'assistant') continue
+    const text = (message.blocks || [])
+      .filter((block) => block.kind === 'text')
+      .map((block) => block.text || '')
+      .join('\n')
+      .trim()
+    if (text) return text
+  }
+  return ''
+}
+
+function speechText(text) {
+  return String(text || '')
+    .replace(/```[\s\S]*?```/g, ' 代码块 ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/https?:\/\/\S+/g, ' 链接 ')
+    .replace(/[*_>#~-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 1200)
+}
+
+const VOICE_BAR_COUNT = 100
+const VOICE_FLAT_BARS = Array.from({ length: VOICE_BAR_COUNT }, () => 0.06)
+
+function voiceClock(seconds) {
+  const value = Math.max(0, Number(seconds) || 0)
+  return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`
+}
+
+function Icon({ name, size = 18, className = '' }) {
+  return (
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {ICONS[name] || null}
+    </svg>
+  )
+}
+
+function Popover({ className = '', children }) {
+  return <div className={`popover ${className}`} role="menu">{children}</div>
+}
+
+function PopoverItem({ icon, glyph, label, hint, badge, selected = false, iconTone = '', onClick, disabled = false }) {
+  return (
+    <button type="button" className={`popover-item ${selected ? 'selected' : ''}`} onClick={onClick} disabled={disabled} role="menuitem">
+      <span className={`popover-icon ${iconTone}`}>{glyph ? <span className="popover-glyph">{glyph}</span> : icon ? <Icon name={icon} size={15} /> : null}</span>
+      <span className="popover-text">
+        <span className="popover-label">{label}{badge ? <span className="model-badge">{badge}</span> : null}</span>
+        {hint ? <span className="popover-hint">{hint}</span> : null}
+      </span>
+      {selected ? <Icon name="check" size={14} className="popover-check" /> : null}
+    </button>
+  )
+}
+
+function resolveModelLabel(model, sessionModel) {
+  const id = String(model || sessionModel || '').trim()
+  if (!id) return { label: '默认模型', badge: '' }
+  const preset = MODEL_LOOKUP[id]
+  if (preset) return { label: preset.label, badge: preset.badge || '' }
+  return { label: id, badge: '' }
+}
+
+function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, workspaces = [], sessionModel = '', onVoiceDiscussion, onNewInWorkspace, onOpenWorkspacePicker, stats, pendingRef, onRefUsed, pendingDraft, onDraftUsed }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
-  const [menu, setMenu] = useState(null)
+  const [suggest, setSuggest] = useState(null)
   const [cursor, setCursor] = useState(0)
   const [attachments, setAttachments] = useState([])
   const [uploading, setUploading] = useState(false)
+  const [openMenu, setOpenMenu] = useState(null)
+  const [footerMenu, setFooterMenu] = useState(null)
   const [modelDraft, setModelDraft] = useState(model || '')
+  const [dragging, setDragging] = useState(false)
+  const [voiceActive, setVoiceActive] = useState(false)
+  const [voiceElapsed, setVoiceElapsed] = useState(0)
+  const [waveBars, setWaveBars] = useState(VOICE_FLAT_BARS)
   const ref = useRef(null)
   const areaRef = useRef(null)
   const uploadRef = useRef(null)
+  const rootRef = useRef(null)
+  const filesLoading = useRef(false)
+  const speechRef = useRef(null)
+  const voiceActiveRef = useRef(false)
+  const voiceBaseRef = useRef('')
+  const voiceFinalRef = useRef('')
+  const voiceInterimRef = useRef('')
+  const sessionFinalBaseRef = useRef('')
+  const voiceStartedRef = useRef(0)
+  const waveTimerRef = useRef(0)
+  const elapsedTimerRef = useRef(0)
+  const restartTimerRef = useRef(0)
+  const mediaStreamRef = useRef(null)
+  const audioCtxRef = useRef(null)
+  const analyserRef = useRef(null)
 
   useEffect(() => { ref.current = value }, [value])
+
+  const focusEnd = () => {
+    const area = areaRef.current
+    if (!area) return
+    area.focus()
+    area.selectionStart = area.selectionEnd = area.value.length
+  }
+
+  const insert = (text) => {
+    setValue((previous) => {
+      if (!previous.trim()) return text
+      return /[\s]$/.test(previous) ? previous + text : previous + ' ' + text
+    })
+    requestAnimationFrame(focusEnd)
+  }
+
+  // 每个会话一份草稿：切换会话时不丢正在输入的内容。
+  const draftKey = currentId ? `claw-draft:${currentId}` : ''
+  useEffect(() => {
+    if (!draftKey) { setValue(''); return }
+    try { setValue(sessionStorage.getItem(draftKey) || '') } catch (_) { setValue('') }
+  }, [draftKey])
+  useEffect(() => {
+    if (!draftKey) return
+    try {
+      if (value) sessionStorage.setItem(draftKey, value)
+      else sessionStorage.removeItem(draftKey)
+    } catch (_) {}
+  }, [draftKey, value])
+
   // 文件面板点「引用选区」后，把 `@path:12-40` 追加到输入框并把光标放到末尾。
   useEffect(() => {
     if (!pendingRef) return
     setValue((previous) => (previous.trim() ? previous.replace(/\s*$/, '') + ' ' : '') + pendingRef)
     onRefUsed?.(null)
-    const area = areaRef.current
-    if (area) {
-      requestAnimationFrame(() => { area.focus(); area.selectionStart = area.value.length; area.selectionEnd = area.value.length })
-    }
+    requestAnimationFrame(focusEnd)
   }, [pendingRef, onRefUsed])
-  useEffect(() => { setModelDraft(model || '') }, [model])
+
+  // 语音讨论「结束并整理」后，把整理出的 prompt 填入输入框**等待编辑**，不直接发送。
+  // 语音转写难免有错字/断句错误，直接发出去用户没有任何纠正机会。
+  // 已有草稿时追加而非覆盖，避免吞掉用户已输入的内容。
   useEffect(() => {
-    if (menu?.kind !== 'file' || files.length) return
-    api('/api/workspace/files').then((body) => setFiles(body.files || [])).catch(() => {})
-  }, [menu, files.length])
+    if (!pendingDraft) return
+    setValue((previous) => (previous.trim() ? `${previous.replace(/\s*$/, '')}\n\n${pendingDraft}` : pendingDraft))
+    onDraftUsed?.(null)
+    requestAnimationFrame(focusEnd)
+  }, [pendingDraft, onDraftUsed])
+
+  useEffect(() => { setModelDraft(model || '') }, [model])
+
+  // 高度跟随内容：历史引用、上传、@ 选择都会改写 value，不能只依赖 onChange。
+  useEffect(() => {
+    const node = areaRef.current
+    if (!node) return
+    node.style.height = 'auto'
+    node.style.height = `${Math.min(220, Math.max(72, node.scrollHeight))}px`
+  }, [value])
+
+  useEffect(() => {
+    if (suggest?.kind !== 'file' || files.length || filesLoading.current) return
+    filesLoading.current = true
+    api('/api/workspace/files')
+      .then((body) => setFiles(body.files || []))
+      .catch(() => {})
+      .finally(() => { filesLoading.current = false })
+  }, [suggest, files.length])
+
+  // 点击外部或按 Esc 收起下拉浮层。
+  useEffect(() => {
+    if (!openMenu && !footerMenu) return undefined
+    const onDown = (event) => {
+      if (!rootRef.current?.contains(event.target)) { setOpenMenu(null); setFooterMenu(null) }
+    }
+    const onKey = (event) => { if (event.key === 'Escape') { setOpenMenu(null); setFooterMenu(null) } }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [openMenu, footerMenu])
+
+  useEffect(() => () => {
+    voiceActiveRef.current = false
+    if (restartTimerRef.current) clearTimeout(restartTimerRef.current)
+    if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current)
+    if (waveTimerRef.current) clearInterval(waveTimerRef.current)
+    try { speechRef.current?.stop?.() } catch (_) {}
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop())
+      mediaStreamRef.current = null
+    }
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close() } catch (_) {}
+      audioCtxRef.current = null
+    }
+  }, [])
 
   const slashMatches = useMemo(() => {
     if (!value.startsWith('/') || value.includes(' ')) return []
@@ -1110,68 +1370,91 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
   }, [value])
 
   const fileMatches = useMemo(() => {
-    if (fileFragment === null) return []
+    if (fileFragment === null) return null
     const query = fileFragment.toLowerCase()
     return files.filter((file) => file.path.toLowerCase().includes(query)).slice(0, 8)
   }, [fileFragment, files])
 
   useEffect(() => {
-    if (slashMatches.length) setMenu({ kind: 'slash', items: slashMatches })
-    else if (fileMatches.length) setMenu({ kind: 'file', items: fileMatches })
-    else setMenu(null)
+    if (slashMatches.length) setSuggest({ kind: 'slash', items: slashMatches })
+    else if (fileMatches !== null) setSuggest({ kind: 'file', items: fileMatches })
+    else setSuggest(null)
     setCursor(0)
   }, [slashMatches, fileMatches])
 
   const choose = (item) => {
-    if (menu?.kind === 'slash') {
+    if (suggest?.kind === 'slash') {
       onQuickAction(item.run)
       setValue('')
-    } else if (menu?.kind === 'file') {
-      const replaced = value.replace(/@([^\s]*)$/, '@' + item.path)
-      setValue(replaced + ' ')
+    } else if (item.upload) {
+      uploadRef.current?.click()
+    } else if (suggest?.kind === 'file') {
+      setValue((previous) => previous.replace(/@([^\s]*)$/, '@' + item.path + ' '))
     }
-    setMenu(null)
-    areaRef.current?.focus()
+    setSuggest(null)
+    requestAnimationFrame(focusEnd)
   }
 
   const submit = () => {
-    if (running) return
+    if (!currentId) { onError?.('请先在左侧选择或新建一个会话'); return }
+    if (running || voiceActiveRef.current) return
     const text = value
     if (!text.trim()) return
+    setSuggest(null)
+    setOpenMenu(null)
+    setFooterMenu(null)
     setValue('')
     onSend(text)
   }
 
+  const submitCustomModel = () => {
+    const next = modelDraft.trim()
+    if (next !== (model || '')) onModel(next)
+    setOpenMenu(null)
+  }
+
   const onKeyDown = (event) => {
-    if (menu) {
-      if (event.key === 'ArrowDown') { event.preventDefault(); setCursor((index) => (index + 1) % menu.items.length); return }
-      if (event.key === 'ArrowUp') { event.preventDefault(); setCursor((index) => (index - 1 + menu.items.length) % menu.items.length); return }
-      if (event.key === 'Tab' || (event.key === 'Enter' && !event.ctrlKey)) { event.preventDefault(); choose(menu.items[cursor]); return }
-      if (event.key === 'Escape') { setMenu(null); return }
+    if (voiceActiveRef.current) {
+      if (event.key === 'Escape') { event.preventDefault(); finishVoice(true) }
+      return
     }
-    if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey) {
+    if (suggest) {
+      const count = suggest.items.length + (suggest.kind === 'file' ? 1 : 0)
+      if (event.key === 'ArrowDown') { event.preventDefault(); setCursor((index) => (index + 1) % count); return }
+      if (event.key === 'ArrowUp') { event.preventDefault(); setCursor((index) => (index - 1 + count) % count); return }
+      if (event.key === 'Tab' || (event.key === 'Enter' && !event.nativeEvent.isComposing)) {
+        event.preventDefault()
+        if (suggest.kind === 'file') {
+          if (cursor === suggest.items.length) choose({ upload: true })
+          else choose(suggest.items[cursor])
+        } else {
+          choose(suggest.items[cursor])
+        }
+        return
+      }
+      if (event.key === 'Escape') { event.preventDefault(); setSuggest(null); return }
+    }
+    if (event.key === 'Escape' && (openMenu || footerMenu)) { setOpenMenu(null); setFooterMenu(null); return }
+    // 中文输入法回车确认候选词时不能提交。
+    if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.nativeEvent.isComposing) {
       event.preventDefault()
       submit()
     }
   }
 
-  const grow = (event) => {
-    const node = event.target
-    node.style.height = 'auto'
-    node.style.height = `${Math.min(180, node.scrollHeight)}px`
-  }
-
   const uploadFile = async (list) => {
-    const file = list?.[0]
-    if (!file) return
+    const items = Array.from(list || [])
+    if (!items.length) return
     setUploading(true)
     try {
-      const response = await fetch(withToken(withWorkspace('/api/upload?name=' + encodeURIComponent(file.name), workspace)), { method: 'POST', body: file })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const body = await response.json()
-      setAttachments((items) => [...items, { name: file.name, path: body.path, size: file.size }])
-      setValue((previous) => (previous.trim() ? previous.replace(/\s*$/, '') + '\n' : '') + '@' + body.path + ' ')
-      requestAnimationFrame(() => areaRef.current?.focus())
+      for (const file of items) {
+        const response = await fetch(withToken(withWorkspace('/api/upload?name=' + encodeURIComponent(file.name), workspace)), { method: 'POST', body: file })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        const body = await response.json()
+        setAttachments((previous) => [...previous, { name: file.name, path: body.path, size: file.size }])
+        setValue((previous) => (previous.trim() ? previous.replace(/\s*$/, '') + '\n' : '') + '@' + body.path + ' ')
+      }
+      requestAnimationFrame(focusEnd)
     } catch (error) {
       onError?.(`上传失败：${error.message}`)
     } finally {
@@ -1185,81 +1468,444 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
     setValue((previous) => previous.split('\n').filter((line) => line.trim() !== '@' + path).join('\n'))
   }
 
-  const commitModel = () => {
-    const next = modelDraft.trim()
-    if (next !== (model || '')) onModel(next)
+  const onPaste = (event) => {
+    const pasted = Array.from(event.clipboardData?.files || [])
+    if (!pasted.length) return
+    event.preventDefault()
+    uploadFile(pasted)
   }
 
+  const stopWaveform = () => {
+    if (waveTimerRef.current) { clearInterval(waveTimerRef.current); waveTimerRef.current = 0 }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop())
+      mediaStreamRef.current = null
+    }
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close() } catch (_) {}
+      audioCtxRef.current = null
+    }
+    analyserRef.current = null
+    setWaveBars(VOICE_FLAT_BARS)
+  }
+
+  // 声波优先取真实麦克风音量；拿不到权限时退化为合成波形，不阻断转写。
+  const startWaveform = async () => {
+    let analyser = null
+    let data = null
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('no media devices')
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (!voiceActiveRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
+      mediaStreamRef.current = stream
+      const AudioCtx = window.AudioContext || window.webkitAudioContext
+      if (!AudioCtx) throw new Error('no audio context')
+      const context = new AudioCtx()
+      audioCtxRef.current = context
+      const source = context.createMediaStreamSource(stream)
+      analyser = context.createAnalyser()
+      analyser.fftSize = 128
+      analyser.smoothingTimeConstant = 0.75
+      source.connect(analyser)
+      analyserRef.current = analyser
+      data = new Uint8Array(analyser.frequencyBinCount)
+    } catch (_) {
+      analyser = null
+      data = null
+    }
+    const startedAt = Date.now()
+    waveTimerRef.current = setInterval(() => {
+      if (!voiceActiveRef.current) return
+      let bars
+      if (analyser && data) {
+        analyser.getByteFrequencyData(data)
+        bars = Array.from({ length: VOICE_BAR_COUNT }, (_, index) => {
+          const bin = Math.min(data.length - 1, Math.floor((index / VOICE_BAR_COUNT) * data.length * 0.72))
+          const peak = Math.max(data[bin], data[Math.min(data.length - 1, bin + 2)] || 0)
+          return Math.min(1, Math.max(0.06, (peak / 255) * 1.8))
+        })
+      } else {
+        const tick = (Date.now() - startedAt) / 160
+        bars = Array.from({ length: VOICE_BAR_COUNT }, (_, index) => {
+          const wave = Math.sin(tick + index * 0.42) * 0.28 + Math.sin(tick * 1.9 + index * 0.13) * 0.22 + 0.38
+          const spike = Math.random() < 0.06 ? Math.random() * 0.55 : 0
+          return Math.min(1, Math.max(0.06, wave + spike))
+        })
+      }
+      setWaveBars(bars)
+    }, 70)
+  }
+
+  const startVoiceTimer = () => {
+    voiceStartedRef.current = Date.now()
+    setVoiceElapsed(0)
+    if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current)
+    elapsedTimerRef.current = setInterval(() => {
+      if (!voiceActiveRef.current) return
+      setVoiceElapsed(Math.floor((Date.now() - voiceStartedRef.current) / 1000))
+    }, 250)
+  }
+
+  const stopVoiceTimer = () => {
+    if (elapsedTimerRef.current) { clearInterval(elapsedTimerRef.current); elapsedTimerRef.current = 0 }
+  }
+
+  const finishVoice = (restore) => {
+    if (!voiceActiveRef.current) return
+    voiceActiveRef.current = false
+    setVoiceActive(false)
+    if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = 0 }
+    try { speechRef.current?.stop() } catch (_) {}
+    speechRef.current = null
+    stopVoiceTimer()
+    stopWaveform()
+    const base = voiceBaseRef.current
+    const spoken = (voiceFinalRef.current + voiceInterimRef.current).trim()
+    if (restore) {
+      setValue(base)
+    } else {
+      setValue(base && spoken ? base.replace(/\s*$/, '') + ' ' + spoken : base || spoken)
+      requestAnimationFrame(focusEnd)
+    }
+    voiceFinalRef.current = ''
+    voiceInterimRef.current = ''
+    sessionFinalBaseRef.current = ''
+  }
+
+  // 实时语音输入：转写显示在输入框，底栏切换为取消 / 声波 / 计时 / 确认。
+  const startVoice = () => {
+    if (voiceActiveRef.current) return
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!Recognition) { onError?.('当前浏览器不支持实时语音输入，请使用 Chrome / Edge'); return }
+    voiceActiveRef.current = true
+    voiceBaseRef.current = value
+    voiceFinalRef.current = ''
+    voiceInterimRef.current = ''
+    sessionFinalBaseRef.current = ''
+    setSuggest(null)
+    setOpenMenu(null)
+    setFooterMenu(null)
+    setVoiceActive(true)
+    startVoiceTimer()
+    startWaveform()
+    const recognition = new Recognition()
+    recognition.lang = navigator.language || 'zh-CN'
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.onresult = (event) => {
+      let finalText = ''
+      let interimText = ''
+      for (let index = 0; index < event.results.length; index += 1) {
+        const result = event.results[index]
+        const transcript = result?.[0]?.transcript || ''
+        if (result.isFinal) finalText += transcript
+        else interimText += transcript
+      }
+      voiceFinalRef.current = sessionFinalBaseRef.current + finalText
+      voiceInterimRef.current = interimText
+      const base = voiceBaseRef.current
+      const spoken = (voiceFinalRef.current + voiceInterimRef.current).trim()
+      setValue(base && spoken ? base.replace(/\s*$/, '') + ' ' + spoken : base || spoken)
+    }
+    recognition.onerror = (event) => {
+      const code = event.error
+      if (code === 'aborted' || code === 'no-speech') return
+      const messages = {
+        'not-allowed': '麦克风权限被拒绝，无法语音输入',
+        'service-not-allowed': '麦克风权限被拒绝，无法语音输入',
+        'audio-capture': '没有检测到可用的麦克风',
+        network: '语音识别服务不可用（需要联网）',
+      }
+      if (messages[code]) {
+        onError?.(messages[code])
+        finishVoice(true)
+      }
+    }
+    recognition.onend = () => {
+      if (!voiceActiveRef.current) return
+      // Chrome 静音后会结束当前识别周期；自动续接，保留已识别文本。
+      if (voiceInterimRef.current) {
+        voiceFinalRef.current += voiceInterimRef.current
+        voiceInterimRef.current = ''
+      }
+      sessionFinalBaseRef.current = voiceFinalRef.current
+      restartTimerRef.current = window.setTimeout(() => {
+        if (!voiceActiveRef.current) return
+        try { recognition.start() } catch (_) {}
+      }, 250)
+    }
+    speechRef.current = recognition
+    try {
+      recognition.start()
+    } catch (error) {
+      onError?.(`语音输入启动失败：${error.message}`)
+      finishVoice(true)
+    }
+  }
+
+  const perm = PERMISSION_LOOKUP[permission] || PERMISSION_PRESETS[1]
+  const shownModel = resolveModelLabel(model, sessionModel)
+  const canSend = Boolean(value.trim()) && Boolean(currentId)
+
   return (
-    <form className="composer" onSubmit={(event) => { event.preventDefault(); submit() }}>
-      {menu && (
-        <div className="menu">
-          {menu.kind === 'slash'
-            ? menu.items.map((item, index) => (
-                <button type="button" key={item.cmd} className={index === cursor ? 'active' : ''} onMouseDown={(event) => { event.preventDefault(); choose(item) }}>
-                  <b>{item.cmd}</b><span>{item.label}</span>
-                </button>
-              ))
-            : menu.items.map((item, index) => (
-                <button type="button" key={item.path} className={index === cursor ? 'active' : ''} onMouseDown={(event) => { event.preventDefault(); choose(item) }}>
-                  <b>{item.path}</b><span>{Math.max(1, Math.round((item.size || 0) / 1024))}K</span>
-                </button>
-              ))}
+    <form className="composer" ref={rootRef} onSubmit={(event) => { event.preventDefault(); submit() }}>
+      {suggest && (
+        <div className="menu" role="listbox">
+          <div className="menu-head">
+            <span>{suggest.kind === 'slash' ? '命令与技能' : '添加上下文'}</span>
+            <span className="menu-hint">↑↓ 选择 · Tab 补全 · Esc 关闭</span>
+          </div>
+          {suggest.items.map((item, position) => {
+            const index = position
+            return suggest.kind === 'slash' ? (
+              <button type="button" key={item.cmd} className={`menu-item ${index === cursor ? 'active' : ''}`} onMouseDown={(event) => { event.preventDefault(); choose(item) }}>
+                <b>{item.cmd}</b><span>{item.label}</span>
+              </button>
+            ) : (
+              <button type="button" key={item.path} className={`menu-item ${index === cursor ? 'active' : ''}`} onMouseDown={(event) => { event.preventDefault(); choose(item) }}>
+                <b>{item.path}</b><span>{Math.max(1, Math.round((item.size || 0) / 1024))}K</span>
+              </button>
+            )
+          })}
+          {suggest.kind === 'file' && suggest.items.length === 0 && (
+            <div className="menu-empty">没有匹配的文件</div>
+          )}
+          {suggest.kind === 'file' && (
+            <button
+              type="button"
+              className={`menu-item ${cursor === suggest.items.length ? 'active' : ''}`}
+              onMouseDown={(event) => { event.preventDefault(); choose({ upload: true }) }}
+            >
+              <b>上传文件…</b><span>图片 / 文档</span>
+            </button>
+          )}
         </div>
       )}
       {attachments.length > 0 && (
         <div className="composer-attachments">
           {attachments.map((item) => (
             <span key={item.path} className="attachment-chip" title={item.path}>
-              📎 {item.name}
-              <button type="button" className="ghost" onClick={() => removeAttachment(item.path)}>×</button>
+              <Icon name="paperclip" size={12} />
+              <span className="attachment-name">{item.name}</span>
+              <button type="button" className="attachment-remove" onClick={() => removeAttachment(item.path)} aria-label={`移除 ${item.name}`}>×</button>
             </span>
           ))}
         </div>
       )}
-      <div className="composer-box">
+      <div
+        className={`composer-box ${dragging ? 'dragging' : ''}`}
+        onClick={(event) => { if (!event.target.closest('button, input, textarea, .popover')) areaRef.current?.focus() }}
+        onDragOver={(event) => { event.preventDefault(); setDragging(true) }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(event) => { event.preventDefault(); setDragging(false); uploadFile(event.dataTransfer.files) }}
+      >
         <textarea
           ref={areaRef}
           value={value}
-          rows={2}
-          placeholder={currentId ? '输入消息…' : '先选择一个会话'}
-          onChange={(event) => { setValue(event.target.value); grow(event) }}
+          rows={1}
+          readOnly={voiceActive}
+          className={voiceActive ? 'voice-input' : ''}
+          placeholder={voiceActive ? '正在聆听…' : currentId ? '@ 添加上下文，/ 使用命令和技能' : '先选择一个会话，或新建任务'}
+          onChange={(event) => setValue(event.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
         />
+        {dragging && <div className="composer-drop">松开以上传文件</div>}
+        {voiceActive ? (
+          <div className="composer-bar voice-bar">
+            <button type="button" className="voice-btn cancel" onClick={() => finishVoice(true)} title="取消语音输入" aria-label="取消语音输入">
+              <Icon name="x" size={18} />
+            </button>
+            <div className="voice-wave" aria-hidden="true">
+              {waveBars.map((level, index) => (
+                <span key={index} style={{ height: `${Math.round(3 + level * 25)}px` }} />
+              ))}
+            </div>
+            <span className="voice-time">{voiceClock(voiceElapsed)}</span>
+            <button type="button" className="voice-btn confirm" onClick={() => finishVoice(false)} title="确认语音输入" aria-label="确认语音输入">
+              <Icon name="check" size={18} />
+            </button>
+          </div>
+        ) : (
         <div className="composer-bar">
-          <button type="button" className="composer-plus" title="上传附件" onClick={() => uploadRef.current?.click()} disabled={uploading}>
-            {uploading ? '…' : '＋'}
-          </button>
-          <input ref={uploadRef} type="file" style={{ display: 'none' }} onChange={(event) => uploadFile(event.target.files)} />
-          <label className="permission-chip" title="本轮权限模式">
-            <span className="permission-shield">🛡</span>
-            <select value={permission} onChange={(event) => onPermission(event.target.value)}>
-              <option value="read-only">只读</option>
-              <option value="workspace-write">工作区可写</option>
-              <option value="danger-full-access">完全权限</option>
-            </select>
-            <span className="chevron">⌄</span>
-          </label>
+          <div className="bar-left">
+            <div className="bar-item">
+              <button
+                type="button"
+                className={`icon-btn ${openMenu === 'plus' ? 'active' : ''}`}
+                title="添加上下文"
+                aria-label="添加上下文"
+                onClick={() => setOpenMenu(openMenu === 'plus' ? null : 'plus')}
+                disabled={uploading}
+              >
+                <Icon name="plus" />
+              </button>
+              {openMenu === 'plus' && (
+                <Popover className="left">
+                  <PopoverItem icon="paperclip" label="上传文件" hint="图片 / 文档，也可直接粘贴" onClick={() => { setOpenMenu(null); uploadRef.current?.click() }} />
+                  <PopoverItem glyph="@" label="引用文件" hint="输入 @ 选择工作区文件" onClick={() => { setOpenMenu(null); insert('@') }} />
+                  <PopoverItem glyph="/" label="命令与技能" hint="输入 / 打开快捷命令" onClick={() => { setOpenMenu(null); insert('/') }} />
+                  <div className="popover-sep" />
+                  <PopoverItem icon="paperclip" label="打开附件面板" onClick={() => { setOpenMenu(null); onQuickAction('attachments') }} />
+                </Popover>
+              )}
+            </div>
+            <div className="bar-item">
+              <button
+                type="button"
+                className={`permission-chip tone-${perm.tone} ${openMenu === 'permission' ? 'active' : ''}`}
+                title="本轮权限模式"
+                onClick={() => setOpenMenu(openMenu === 'permission' ? null : 'permission')}
+              >
+                <Icon name="shield" size={15} />
+                <span>{perm.label}</span>
+                <Icon name="chevron" size={12} className="chevron" />
+              </button>
+              {openMenu === 'permission' && (
+                <Popover className="left perm-pop">
+                  <div className="popover-head">本轮权限</div>
+                  {PERMISSION_PRESETS.map((option) => (
+                    <PopoverItem
+                      key={option.id}
+                      icon="shield"
+                      iconTone={`tone-${option.tone}`}
+                      label={option.label}
+                      hint={option.hint}
+                      selected={option.id === permission}
+                      onClick={() => { onPermission(option.id); setOpenMenu(null) }}
+                    />
+                  ))}
+                </Popover>
+              )}
+            </div>
+            <div className="bar-item">
+              <button
+                type="button"
+                className={`caps-pill ${openMenu === 'caps' ? 'active' : ''}`}
+                title="能力"
+                aria-label="能力"
+                onClick={() => setOpenMenu(openMenu === 'caps' ? null : 'caps')}
+              >
+                <span className="caps-brand">
+                  <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+                    <path d="M4 15.4c3-4.6 6.6-6.1 10.7-4.4l-1.3 2.7c-2.2 1.3-4.5 1.7-7 1.1L4 15.4Z" fill="#ffffff" opacity=".95" />
+                    <path d="M9.7 6.8c3.9-.2 7.3 1.7 10 5.6-2.3.7-4.4.5-6.4-.5-1.9-1-3.1-2.7-3.6-5.1Z" fill="#ffffff" opacity=".8" />
+                  </svg>
+                </span>
+                <span className="caps-mini"><Icon name="search" size={11} /></span>
+                <span className="caps-mini"><Icon name="doc" size={11} /></span>
+              </button>
+              {openMenu === 'caps' && (
+                <Popover className="left caps-pop">
+                  <div className="popover-head">能力</div>
+                  {QUICK_ACTIONS.map((action) => (
+                    <PopoverItem
+                      key={action.cmd}
+                      icon={CAP_ICONS[action.run]}
+                      label={action.label}
+                      hint={action.cmd}
+                      onClick={() => { setOpenMenu(null); onQuickAction(action.run) }}
+                    />
+                  ))}
+                </Popover>
+              )}
+            </div>
+          </div>
           <span className="bar-spacer" />
-          <label className="model-select" title="本轮模型（留空使用工作区默认）">
-            <input
-              list="model-presets"
-              value={modelDraft}
-              placeholder="默认模型"
-              onChange={(event) => setModelDraft(event.target.value)}
-              onBlur={commitModel}
-              onKeyDown={(event) => { if (event.key === 'Enter') { commitModel(); event.target.blur() } }}
-            />
-            <span className="chevron">⌄</span>
-          </label>
-          <datalist id="model-presets">
-            <option value="deepseek-v4-flash" />
-            <option value="deepseek-chat" />
-            <option value="deepseek-reasoner" />
-          </datalist>
+          <div className="bar-item model-wrap">
+            <button
+              type="button"
+              className={`model-btn ${openMenu === 'model' ? 'active' : ''}`}
+              title="本轮模型"
+              onClick={() => { setModelDraft(model || ''); setOpenMenu(openMenu === 'model' ? null : 'model') }}
+            >
+              <span className="model-name">{shownModel.label}</span>
+              {shownModel.badge ? <span className="model-badge">{shownModel.badge}</span> : null}
+              <Icon name="chevron" size={12} className="chevron" />
+            </button>
+            {openMenu === 'model' && (
+              <Popover className="right model-pop">
+                <div className="popover-head">模型</div>
+                {MODEL_PRESETS.map((option) => (
+                  <PopoverItem
+                    key={option.id || 'default'}
+                    label={option.label}
+                    badge={option.badge}
+                    hint={option.hint}
+                    selected={(model || '') === option.id}
+                    onClick={() => { onModel(option.id); setOpenMenu(null) }}
+                  />
+                ))}
+                <div className="popover-sep" />
+                <div className="model-custom">
+                  <input
+                    value={modelDraft}
+                    placeholder="自定义模型名"
+                    onChange={(event) => setModelDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); submitCustomModel() }
+                    }}
+                  />
+                  <button type="button" onClick={submitCustomModel} disabled={!modelDraft.trim()}>应用</button>
+                </div>
+              </Popover>
+            )}
+          </div>
+          <button type="button" className="icon-btn" title="语音输入" aria-label="语音输入" onClick={startVoice}>
+            <Icon name="mic" />
+          </button>
+          <button type="button" className="icon-btn" title="语音讨论" aria-label="语音讨论" onClick={onVoiceDiscussion}>
+            <Icon name="wave" />
+          </button>
           {running
-            ? <button type="button" className="send-circle stop" onClick={onStop} title="停止">■</button>
-            : <button type="submit" className="send-circle" disabled={!value.trim()} title="发送（Enter）">↑</button>}
+            ? <button type="button" className="send-btn stop" onClick={onStop} title="停止" aria-label="停止"><Icon name="stop" size={16} /></button>
+            : <button type="submit" className="send-btn" disabled={!canSend} title={!currentId ? '请先选择会话' : canSend ? '发送（Enter）' : '输入内容后发送（Enter）'} aria-label="发送"><Icon name="arrowUp" /></button>}
+        </div>
+        )}
+        <input ref={uploadRef} type="file" multiple style={{ display: 'none' }} onChange={(event) => uploadFile(event.target.files)} />
+      </div>
+      <div className="composer-footer">
+        <div className="footer-item">
+          <button type="button" className="footer-btn" onClick={() => setFooterMenu(footerMenu === 'env' ? null : 'env')}>
+            <Icon name="laptop" size={16} />
+            <span>本地</span>
+            <Icon name="chevron" size={12} className="chevron" />
+          </button>
+          {footerMenu === 'env' && (
+            <Popover className="left footer-pop">
+              <div className="popover-head">运行环境</div>
+              <PopoverItem icon="laptop" label="本地" hint="claw serve 运行在本机" selected onClick={() => setFooterMenu(null)} />
+              <PopoverItem icon="cloud" label="远程 / 云端" hint="当前构建未启用" disabled />
+            </Popover>
+          )}
+        </div>
+        <div className="footer-item">
+          <button type="button" className="footer-btn" onClick={() => setFooterMenu(footerMenu === 'workspace' ? null : 'workspace')}>
+            <Icon name="folder" size={16} />
+            <span className="workspace-name">{basename(workspace) || '未选择工作区'}</span>
+            <Icon name="chevron" size={12} className="chevron" />
+          </button>
+          {footerMenu === 'workspace' && (
+            <Popover className="left footer-pop workspace-pop">
+              <div className="popover-head">工作区 · 切换会新建任务</div>
+              {workspaces.map((item) => (
+                <PopoverItem
+                  key={item.path}
+                  icon="folder"
+                  label={basename(item.path)}
+                  hint={item.path}
+                  selected={item.path === workspace}
+                  onClick={() => { setFooterMenu(null); if (item.path !== workspace) onNewInWorkspace?.(item.path) }}
+                />
+              ))}
+              {workspaces.length === 0 && <div className="popover-empty">还没有工作区</div>}
+              <div className="popover-sep" />
+              <PopoverItem icon="plus" label="选择其他文件夹…" onClick={() => { setFooterMenu(null); onOpenWorkspacePicker?.() }} />
+            </Popover>
+          )}
         </div>
       </div>
       {(stats?.turns > 0 || stats?.total_tokens > 0) && (
@@ -1269,6 +1915,468 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
         </div>
       )}
     </form>
+  )
+}
+
+/* ---------------- 语音讨论 ---------------- */
+
+function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onError, onDraft }) {
+  const [phase, setPhase] = useState('listening')
+  const [log, setLog] = useState([])
+  const [interim, setInterim] = useState('')
+  const [elapsed, setElapsed] = useState(0)
+  const [waveBars, setWaveBars] = useState(VOICE_FLAT_BARS)
+  const [ttsOn, setTtsOn] = useState(true)
+
+  const bodyRef = useRef(null)
+  const openRef = useRef(true)
+  const listeningRef = useRef(false)
+  const phaseRef = useRef('listening')
+  const recognitionRef = useRef(null)
+  const finalRef = useRef('')
+  const interimRef = useRef('')
+  const sessionBaseRef = useRef('')
+  const turnTimerRef = useRef(0)
+  const restartTimerRef = useRef(0)
+  const watchdogRef = useRef(0)
+  const startedRef = useRef(Date.now())
+  const elapsedTimerRef = useRef(0)
+  const waveTimerRef = useRef(0)
+  const mediaStreamRef = useRef(null)
+  const audioCtxRef = useRef(null)
+  const analyserRef = useRef(null)
+  const pendingSendRef = useRef(false)
+  const seenRunningRef = useRef(false)
+  const cursorRef = useRef(0)
+  const lastLiveRef = useRef('')
+  const interruptedRef = useRef(false)
+  const ttsOnRef = useRef(true)
+  const messagesRef = useRef(messages)
+  const logRef = useRef(log)
+  messagesRef.current = messages
+  logRef.current = log
+
+  const changePhase = (next) => {
+    phaseRef.current = next
+    setPhase(next)
+  }
+
+  const stopWaveform = () => {
+    if (waveTimerRef.current) { clearInterval(waveTimerRef.current); waveTimerRef.current = 0 }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop())
+      mediaStreamRef.current = null
+    }
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close() } catch (_) {}
+      audioCtxRef.current = null
+    }
+    analyserRef.current = null
+    setWaveBars(VOICE_FLAT_BARS)
+  }
+
+  const startWaveform = async () => {
+    let analyser = null
+    let data = null
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('no media devices')
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (!listeningRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
+      mediaStreamRef.current = stream
+      const AudioCtx = window.AudioContext || window.webkitAudioContext
+      if (!AudioCtx) throw new Error('no audio context')
+      const context = new AudioCtx()
+      audioCtxRef.current = context
+      const source = context.createMediaStreamSource(stream)
+      analyser = context.createAnalyser()
+      analyser.fftSize = 128
+      analyser.smoothingTimeConstant = 0.75
+      source.connect(analyser)
+      analyserRef.current = analyser
+      data = new Uint8Array(analyser.frequencyBinCount)
+    } catch (_) {
+      analyser = null
+      data = null
+    }
+    const startedAt = Date.now()
+    waveTimerRef.current = setInterval(() => {
+      if (!listeningRef.current) return
+      let bars
+      if (analyser && data) {
+        analyser.getByteFrequencyData(data)
+        bars = Array.from({ length: VOICE_BAR_COUNT }, (_, index) => {
+          const bin = Math.min(data.length - 1, Math.floor((index / VOICE_BAR_COUNT) * data.length * 0.72))
+          const peak = Math.max(data[bin], data[Math.min(data.length - 1, bin + 2)] || 0)
+          return Math.min(1, Math.max(0.06, (peak / 255) * 1.8))
+        })
+      } else {
+        const tick = (Date.now() - startedAt) / 160
+        bars = Array.from({ length: VOICE_BAR_COUNT }, (_, index) => {
+          const wave = Math.sin(tick + index * 0.42) * 0.28 + Math.sin(tick * 1.9 + index * 0.13) * 0.22 + 0.38
+          const spike = Math.random() < 0.06 ? Math.random() * 0.55 : 0
+          return Math.min(1, Math.max(0.06, wave + spike))
+        })
+      }
+      setWaveBars(bars)
+    }, 70)
+  }
+
+  const stopAll = () => {
+    openRef.current = false
+    listeningRef.current = false
+    clearTimeout(turnTimerRef.current)
+    clearTimeout(restartTimerRef.current)
+    clearTimeout(watchdogRef.current)
+    clearInterval(elapsedTimerRef.current)
+    const recognition = recognitionRef.current
+    recognitionRef.current = null
+    if (recognition) { try { recognition.stop() } catch (_) {} }
+    stopWaveform()
+    try { window.speechSynthesis?.cancel() } catch (_) {}
+    pendingSendRef.current = false
+  }
+
+  const speakReply = (text, done) => {
+    let finished = false
+    const finish = () => { if (finished) return; finished = true; done() }
+    if (!ttsOnRef.current || !window.speechSynthesis) { window.setTimeout(finish, 200); return }
+    try {
+      const utterance = new SpeechSynthesisUtterance(speechText(text))
+      utterance.lang = navigator.language || 'zh-CN'
+      utterance.rate = 1
+      utterance.onend = finish
+      utterance.onerror = finish
+      window.speechSynthesis.cancel()
+      window.speechSynthesis.speak(utterance)
+    } catch (_) {
+      finish()
+    }
+  }
+
+  const resumeListening = () => {
+    if (!openRef.current || listeningRef.current) return
+    changePhase('listening')
+    startListening()
+  }
+
+  const scheduleTurn = () => {
+    clearTimeout(turnTimerRef.current)
+    turnTimerRef.current = window.setTimeout(() => {
+      if (!listeningRef.current) return
+      const text = (finalRef.current + interimRef.current).trim()
+      if (text) sendUtterance(text)
+    }, 1400)
+  }
+
+  const sendUtterance = (text) => {
+    clearTimeout(turnTimerRef.current)
+    listeningRef.current = false
+    const recognition = recognitionRef.current
+    recognitionRef.current = null
+    if (recognition) { try { recognition.stop() } catch (_) {} }
+    stopWaveform()
+    setInterim('')
+    changePhase('thinking')
+    setLog((previous) => [...previous, { role: 'user', text }])
+    cursorRef.current = messagesRef.current.length
+    pendingSendRef.current = true
+    seenRunningRef.current = false
+    interruptedRef.current = false
+    lastLiveRef.current = ''
+    onSend(text)
+    clearTimeout(watchdogRef.current)
+    watchdogRef.current = window.setTimeout(() => {
+      if (pendingSendRef.current && !seenRunningRef.current) {
+        pendingSendRef.current = false
+        resumeListening()
+      }
+    }, 3000)
+  }
+
+  const startListening = () => {
+    if (!openRef.current || listeningRef.current) return
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!Recognition) {
+      onError?.('当前浏览器不支持语音讨论，请使用 Chrome / Edge')
+      stopAll()
+      onClose()
+      return
+    }
+    listeningRef.current = true
+    finalRef.current = ''
+    interimRef.current = ''
+    sessionBaseRef.current = ''
+    setInterim('')
+    startWaveform()
+    const recognition = new Recognition()
+    recognition.lang = navigator.language || 'zh-CN'
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.onresult = (event) => {
+      if (!listeningRef.current) return
+      let finalText = ''
+      let interimText = ''
+      for (let index = 0; index < event.results.length; index += 1) {
+        const result = event.results[index]
+        const transcript = result?.[0]?.transcript || ''
+        if (result.isFinal) finalText += transcript
+        else interimText += transcript
+      }
+      finalRef.current = sessionBaseRef.current + finalText
+      interimRef.current = interimText
+      const total = (finalRef.current + interimText).trim()
+      setInterim(total)
+      if (total) scheduleTurn()
+    }
+    recognition.onerror = (event) => {
+      const code = event.error
+      if (code === 'aborted' || code === 'no-speech') return
+      const map = {
+        'not-allowed': '麦克风权限被拒绝，无法语音讨论',
+        'service-not-allowed': '麦克风权限被拒绝，无法语音讨论',
+        'audio-capture': '没有检测到可用的麦克风',
+        network: '语音识别服务不可用（需要联网）',
+      }
+      if (map[code]) {
+        onError?.(map[code])
+        stopAll()
+        onClose()
+      }
+    }
+    recognition.onend = () => {
+      if (!listeningRef.current) return
+      if (interimRef.current) {
+        finalRef.current += interimRef.current
+        interimRef.current = ''
+      }
+      sessionBaseRef.current = finalRef.current
+      restartTimerRef.current = window.setTimeout(() => {
+        if (!listeningRef.current) return
+        try { recognition.start() } catch (_) {}
+      }, 200)
+    }
+    recognitionRef.current = recognition
+    try {
+      recognition.start()
+    } catch (error) {
+      onError?.(`语音讨论启动失败：${error.message}`)
+      stopAll()
+      onClose()
+    }
+  }
+
+  const finalizeReply = () => {
+    if (!pendingSendRef.current) return
+    pendingSendRef.current = false
+    seenRunningRef.current = false
+    clearTimeout(watchdogRef.current)
+    const reply = assistantReplyAfter(messagesRef.current, cursorRef.current) || lastLiveRef.current
+    lastLiveRef.current = ''
+    if (reply) {
+      setLog((previous) => [...previous, { role: 'assistant', text: reply }])
+    }
+    if (!reply || interruptedRef.current) {
+      interruptedRef.current = false
+      resumeListening()
+      return
+    }
+    if (ttsOnRef.current && window.speechSynthesis) {
+      changePhase('speaking')
+      speakReply(reply, resumeListening)
+    } else {
+      resumeListening()
+    }
+  }
+
+  const pauseListening = () => {
+    if (!listeningRef.current) return
+    listeningRef.current = false
+    clearTimeout(turnTimerRef.current)
+    clearTimeout(restartTimerRef.current)
+    const recognition = recognitionRef.current
+    recognitionRef.current = null
+    if (recognition) { try { recognition.stop() } catch (_) {} }
+    stopWaveform()
+    setInterim('')
+    changePhase('paused')
+  }
+
+  const interruptReply = () => {
+    if (running) {
+      interruptedRef.current = true
+      onStop?.()
+      return
+    }
+    try { window.speechSynthesis?.cancel() } catch (_) {}
+    resumeListening()
+  }
+
+  const toggleTts = () => {
+    const next = !ttsOn
+    setTtsOn(next)
+    ttsOnRef.current = next
+    if (!next) { try { window.speechSynthesis?.cancel() } catch (_) {} }
+  }
+
+  const closeDiscussion = () => {
+    stopAll()
+    onClose()
+  }
+
+  const finishDiscussion = () => {
+    if (pendingSendRef.current) return
+    const items = [...logRef.current]
+    if (interim.trim()) items.push({ role: 'user', text: interim.trim() })
+    stopAll()
+    onClose()
+    if (!items.length) return
+    const transcript = items
+      .map((item) => `${item.role === 'user' ? '我' : 'AI'}：${item.text}`)
+      .join('\n')
+    // 只填入输入框等待编辑，绝不直接发送：语音转写难免有错字与断句错误，
+    // 直接发出去用户没有任何纠正机会（原先 onSend 此处即发送，是缺陷根源）。
+    onDraft?.(`请把我们刚才的语音讨论整理成清晰的思路，按以下结构输出：\n1. 核心问题\n2. 关键观点与取舍\n3. 结论\n4. 下一步行动\n\n讨论记录：\n${transcript}`)
+  }
+
+  useEffect(() => {
+    openRef.current = true
+    startedRef.current = Date.now()
+    elapsedTimerRef.current = window.setInterval(() => {
+      if (!openRef.current) return
+      setElapsed(Math.floor((Date.now() - startedRef.current) / 1000))
+    }, 500)
+    const timer = window.setTimeout(() => { if (openRef.current) startListening() }, 200)
+    return () => {
+      clearTimeout(timer)
+      stopAll()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (live) lastLiveRef.current = live
+    if (running) {
+      if (!pendingSendRef.current) return
+      seenRunningRef.current = true
+      clearTimeout(watchdogRef.current)
+      changePhase(live ? 'replying' : 'thinking')
+      return
+    }
+    if (!pendingSendRef.current || !seenRunningRef.current) return
+    const timer = window.setTimeout(finalizeReply, 600)
+    return () => clearTimeout(timer)
+  }, [running, live, messages])
+
+  useEffect(() => {
+    const node = bodyRef.current
+    if (node) node.scrollTop = node.scrollHeight
+  }, [log, interim, live, phase])
+
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      stopAll()
+      onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const statusText = {
+    listening: '正在聆听…',
+    paused: '已暂停',
+    thinking: '思考中…',
+    replying: '回答中…',
+    speaking: '朗读中…',
+  }[phase] || ''
+
+  return (
+    <div className="vd-mask" role="dialog" aria-modal="true">
+      <div className="vd-panel">
+        <div className="vd-head">
+          <div>
+            <div className="vd-title">语音讨论</div>
+            <div className="vd-sub">说完停顿片刻 AI 会自动接话，结束时可整理成思路</div>
+          </div>
+          <div className="vd-head-actions">
+            <button
+              type="button"
+              className={`icon-btn ${ttsOn ? 'active' : ''}`}
+              onClick={toggleTts}
+              title={ttsOn ? '关闭语音播报' : '开启语音播报'}
+              aria-label="语音播报"
+            >
+              <Icon name={ttsOn ? 'volume' : 'volumeOff'} size={16} />
+            </button>
+            <button type="button" className="icon-btn" onClick={closeDiscussion} title="关闭" aria-label="关闭语音讨论">
+              <Icon name="x" size={17} />
+            </button>
+          </div>
+        </div>
+        <div className="vd-body" ref={bodyRef}>
+          {log.length === 0 && !interim && !live && (
+            <div className="vd-empty">
+              <div className="vd-empty-icon"><Icon name="wave" size={24} /></div>
+              点击下方麦克风开始说话。你可以随意讲，AI 会接话帮你梳理；结束时会生成结构化思路。
+            </div>
+          )}
+          {log.map((item, index) => (
+            <div key={`${item.role}-${index}`} className={`vd-msg ${item.role}`}>
+              <span className="vd-who">{item.role === 'user' ? '你' : 'AI'}</span>
+              <div className="vd-text">{item.text}</div>
+            </div>
+          ))}
+          {phase === 'replying' && live && (
+            <div className="vd-msg assistant">
+              <span className="vd-who">AI</span>
+              <div className="vd-text">{live}<span className="cursor" /></div>
+            </div>
+          )}
+          {interim && (
+            <div className="vd-msg user interim">
+              <span className="vd-who">你</span>
+              <div className="vd-text">{interim}</div>
+            </div>
+          )}
+        </div>
+        <div className="vd-foot">
+          {phase === 'listening' ? (
+            <button type="button" className="voice-btn cancel" onClick={pauseListening} title="暂停聆听" aria-label="暂停聆听">
+              <Icon name="pause" size={18} />
+            </button>
+          ) : phase === 'paused' ? (
+            <button type="button" className="voice-btn cancel" onClick={resumeListening} title="继续聆听" aria-label="继续聆听">
+              <Icon name="mic" size={18} />
+            </button>
+          ) : (
+            <button type="button" className="voice-btn cancel" onClick={interruptReply} title="打断" aria-label="打断">
+              <Icon name="stop" size={16} />
+            </button>
+          )}
+          <div className="vd-status">
+            <span className={`vd-dot ${phase}`} />
+            <span>{statusText}</span>
+          </div>
+          <div className={`voice-wave vd-wave ${phase === 'listening' ? '' : 'idle'}`} aria-hidden="true">
+            {waveBars.map((level, index) => (
+              <span key={index} style={{ height: `${Math.round(3 + level * 23)}px` }} />
+            ))}
+          </div>
+          <span className="voice-time">{voiceClock(elapsed)}</span>
+          <button
+            type="button"
+            className="vd-end"
+            disabled={phase === 'thinking' || phase === 'replying'}
+            onClick={finishDiscussion}
+          >
+            结束并整理
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 
