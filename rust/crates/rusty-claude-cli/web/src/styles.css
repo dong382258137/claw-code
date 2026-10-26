@@ -560,6 +560,13 @@ details.tool.error .tool-name { color: var(--danger); }
 .preview-image { max-width: 100%; border-radius: var(--r-md); }
 .preview-frame { width: 100%; height: 100%; border: 0; border-radius: var(--r-md); }
 .file-text { white-space: pre-wrap; margin: 0; font-family: var(--font-code); font-size: 12.5px; }
+/* 带行号的只读预览：点行建立选区，用于生成 @path:12-40 引用。 */
+.file-lines { font-family: var(--font-code); font-size: 12.5px; line-height: 1.5; }
+.file-line { display: flex; gap: 8px; cursor: pointer; padding: 0 4px; border-radius: 2px; }
+.file-line:hover { background: var(--hover); }
+.file-line.sel { background: var(--select-bg, rgba(64, 132, 255, 0.18)); }
+.file-line .ln { flex: 0 0 auto; min-width: 3ch; text-align: right; color: var(--label-caption); user-select: none; }
+.file-line .lc { flex: 1 1 auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .editor {
   width: 100%;
   height: 100%;

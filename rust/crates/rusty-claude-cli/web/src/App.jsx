@@ -115,6 +115,8 @@ export default function App() {
   const [webSettings, setWebSettings] = useState({ theme: 'dark', permission: 'workspace-write' })
   const [meta, setMeta] = useState({ version: '', git_sha: '', workspace: '' })
   const { toasts, push } = useToasts()
+  // 文件面板「引用选区」→ 输入框的通道。带时间戳，便于同一引用重复插入。
+  const [pendingRef, setPendingRef] = useState(null)
   // 稳定的错误回调：面板的 load 依赖它，若每次渲染换新函数会触发无限重取。
   const panelError = useCallback((message) => {
     if (message) push(message, 'error')
@@ -586,6 +588,8 @@ export default function App() {
         onModel={(value) => saveSettings({ model: value })}
         workspace={activeWorkspace}
         stats={current?.stats}
+        pendingRef={pendingRef}
+        onRefUsed={setPendingRef}
       />
       {settingsOpen && (
         <SettingsPage
@@ -610,6 +614,7 @@ export default function App() {
       meta={meta}
       onError={panelError}
       onToast={push}
+      onReference={setPendingRef}
     />
   )
 
@@ -1065,7 +1070,7 @@ function LiveTurn({ thinking, tools, text }) {
   )
 }
 
-function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, stats }) {
+function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, stats, pendingRef, onRefUsed }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
   const [menu, setMenu] = useState(null)
@@ -1078,6 +1083,16 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
   const uploadRef = useRef(null)
 
   useEffect(() => { ref.current = value }, [value])
+  // 文件面板点「引用选区」后，把 `@path:12-40` 追加到输入框并把光标放到末尾。
+  useEffect(() => {
+    if (!pendingRef) return
+    setValue((previous) => (previous.trim() ? previous.replace(/\s*$/, '') + ' ' : '') + pendingRef)
+    onRefUsed?.(null)
+    const area = areaRef.current
+    if (area) {
+      requestAnimationFrame(() => { area.focus(); area.selectionStart = area.value.length; area.selectionEnd = area.value.length })
+    }
+  }, [pendingRef, onRefUsed])
   useEffect(() => { setModelDraft(model || '') }, [model])
   useEffect(() => {
     if (menu?.kind !== 'file' || files.length) return
@@ -1267,7 +1282,7 @@ function formatTokens(value) {
 
 /* ---------------- 右侧面板 ---------------- */
 
-function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace, meta, onError, onToast }) {
+function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace, meta, onError, onToast, onReference }) {
   // 终端只在第一次打开时挂载，之后保持连接；避免每次加载页面都起一个 PTY。
   const [terminalMounted, setTerminalMounted] = useState(tab === 'terminal')
   const [fullscreen, setFullscreen] = useState(false)
@@ -1291,7 +1306,7 @@ function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace, meta,
       </div>
       <div className="panel-body">
         {/* 五个面板常驻，切换只隐藏：终端连接、文件浏览状态不会因切标签丢失。 */}
-        <div className={`pane-wrap ${tab === 'files' ? 'active' : ''}`}><FilesPane workspace={workspace} onError={onError} /></div>
+        <div className={`pane-wrap ${tab === 'files' ? 'active' : ''}`}><FilesPane workspace={workspace} onError={onError} onReference={onReference} /></div>
         <div className={`pane-wrap ${tab === 'diff' ? 'active' : ''}`}><DiffPane workspace={workspace} onError={onError} /></div>
         <div className={`pane-wrap ${tab === 'tasks' ? 'active' : ''}`}><TasksPane currentId={currentId} workspace={workspace} onError={onError} /></div>
         <div className={`pane-wrap ${tab === 'attachments' ? 'active' : ''}`}><AttachmentsPane workspace={workspace} onError={onError} /></div>
@@ -1301,13 +1316,43 @@ function Panel({ tab, onTab, onClose, onDock, width, currentId, workspace, meta,
   )
 }
 
-function FilesPane({ workspace, onError }) {
+/// 带行号的只读预览：点击行首建立选区（第一次起点、第二次终点），供「引用选区」生成 `@path:12-40`。
+function FileLines({ content, selStart, selEnd, onPick }) {
+  const lines = String(content || '').split('\n')
+  // 选区可能反向拖（先点后面再点前面），统一成 lo..hi。
+  const lo = selStart === null ? null : Math.min(selStart, selEnd ?? selStart)
+  const hi = selStart === null ? null : Math.max(selStart, selEnd ?? selStart)
+  return (
+    <div className="file-lines">
+      {lines.map((line, index) => {
+        const number = index + 1
+        const selected = lo !== null && number >= lo && number <= hi
+        return (
+          <div
+            key={index}
+            className={`file-line ${selected ? 'sel' : ''}`}
+            onClick={() => onPick(number)}
+            title={`第 ${number} 行`}
+          >
+            <span className="ln">{number}</span>
+            <span className="lc">{line || ' '}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function FilesPane({ workspace, onError, onReference }) {
   const [files, setFiles] = useState([])
   const [filter, setFilter] = useState('')
   const [preview, setPreview] = useState(null)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
+  // 行选区：首次点击设起点，再次点击设终点（成区间），第三次点击重新开始。
+  const [selStart, setSelStart] = useState(null)
+  const [selEnd, setSelEnd] = useState(null)
 
   const load = useCallback(() => {
     setLoading(true)
@@ -1322,6 +1367,9 @@ function FilesPane({ workspace, onError }) {
       setPreview(file)
       setEditing(false)
       setDraft(file.content || '')
+      // 换文件时旧行号无意义，必须清掉，否则会引用到新文件的错误位置。
+      setSelStart(null)
+      setSelEnd(null)
     } catch (error) {
       onError?.(`预览失败：${error.message}`)
     }
@@ -1351,6 +1399,20 @@ function FilesPane({ workspace, onError }) {
           <span className="path" title={preview.path}>{preview.path}</span>
           <span className="spacer" />
           {!editing && (preview.kind === 'text' || preview.kind === 'markdown') && <button onClick={() => setEditing(true)}>编辑</button>}
+          {!editing && selStart !== null && (
+            <button
+              title="把选中行作为 @path:起始-结束 引用插入输入框"
+              onClick={() => {
+                const lo = Math.min(selStart, selEnd ?? selStart)
+                const hi = Math.max(selStart, selEnd ?? selStart)
+                const ref = lo === hi ? `@${preview.path}:${lo} ` : `@${preview.path}:${lo}-${hi} `
+                onReference?.(ref)
+                setSelStart(null)
+                setSelEnd(null)
+              }}
+            >引用第 {Math.min(selStart, selEnd ?? selStart)}-{Math.max(selStart, selEnd ?? selStart)} 行</button>
+          )}
+          {(selStart !== null) && <button onClick={() => { setSelStart(null); setSelEnd(null) }}>清除选区</button>}
           {editing && <button onClick={save}>保存</button>}
           {editing && <button onClick={() => { setEditing(false); setDraft(preview.content || '') }}>取消</button>}
         </div>
@@ -1365,7 +1427,15 @@ function FilesPane({ workspace, onError }) {
                   ? <div className="empty">二进制文件（{Math.max(1, Math.round((preview.size || 0) / 1024))} KB）</div>
                   : preview.kind === 'markdown'
                     ? <Markdown text={preview.content || ''} />
-                    : <pre className="file-text">{preview.content || ''}</pre>}
+                    : <FileLines
+                        content={preview.content || ''}
+                        selStart={selStart}
+                        selEnd={selEnd}
+                        onPick={(line) => {
+                          if (selStart === null || selEnd !== null) { setSelStart(line); setSelEnd(null) }
+                          else setSelEnd(line)
+                        }}
+                      />}
         </div>
       </div>
     )

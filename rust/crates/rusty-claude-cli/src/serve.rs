@@ -177,6 +177,153 @@ fn prompt_with_web_todos(workspace: &Path, id: &str, text: &str) -> String {
     )
 }
 
+/// 上下文引用：`@path` / `@path:12` / `@path:12-40`（行号从 1 起）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mention {
+    path: String,
+    start: usize,
+    end: usize,
+}
+
+/// 单次展开的引用数上限、单个引用的行数上限、整条消息的展开字符预算。
+const MAX_MENTIONS: usize = 20;
+const MAX_MENTION_LINES: usize = 200;
+const MAX_MENTION_CHARS: usize = 40_000;
+
+/// 解析 `12` / `12-40`。非法或倒序返回 None。
+fn parse_line_range(text: &str) -> Option<(usize, usize)> {
+    let (start, end) = match text.split_once('-') {
+        Some((left, right)) => (left.parse().ok()?, right.parse().ok()?),
+        None => {
+            let line = text.parse().ok()?;
+            (line, line)
+        }
+    };
+    if start == 0 || end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// 解析单个 `@...` token。不是合法引用返回 None，调用方据此保留原文。
+fn parse_mention(token: &str) -> Option<Mention> {
+    let body = token.strip_prefix('@')?;
+    if body.is_empty() {
+        return None;
+    }
+    // 从最后一个冒号试切行号：`src/a.rs:12-40`。Windows 盘符不会出现（路径恒为工作区相对路径），
+    // 且行号段必须是纯数字，所以 `@a:b.rs` 这类仍会整体当作路径。
+    if let Some((path, range)) = body.rsplit_once(':') {
+        if !path.is_empty() {
+            if let Some((start, end)) = parse_line_range(range) {
+                return Some(Mention {
+                    path: path.to_string(),
+                    start,
+                    end,
+                });
+            }
+        }
+    }
+    Some(Mention {
+        path: body.to_string(),
+        start: 1,
+        end: usize::MAX,
+    })
+}
+
+/// 把引用渲染成「带行号的代码块」注入 prompt，省掉 agent 一次 read_file 往返。
+fn render_mention(root: &Path, mention: &Mention, budget: usize) -> Option<String> {
+    if budget == 0 {
+        return None;
+    }
+    let path = resolve_in_workspace(root, &mention.path).ok()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let content = std::fs::read_to_string(&path).ok()?;
+    // lines() 顺带吃掉 CRLF 的 \r，行号与编辑器一致。
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if total == 0 || mention.start > total {
+        return None;
+    }
+    let end = mention
+        .end
+        .min(total)
+        .min(mention.start + MAX_MENTION_LINES - 1);
+    let width = end.to_string().len();
+    let mut block = String::new();
+    block.push_str(&format!(
+        "[引用 {} 第 {}-{} 行（文件共 {} 行）]\n",
+        mention.path, mention.start, end, total
+    ));
+    for (offset, line) in lines[mention.start - 1..end].iter().enumerate() {
+        let number = mention.start + offset;
+        block.push_str(&format!("{number:>width$}| {line}\n"));
+    }
+    // 行数按 EOF 收敛后再算剩余量：请求 2-999 而文件只有 2 行时不该出现「还有 0 行」。
+    let remaining = mention.end.min(total) - end;
+    if remaining > 0 {
+        block.push_str(&format!("…（该引用还有 {remaining} 行未展开）\n"));
+    }
+    // 预算不足时整块丢弃，避免把半截代码塞进上下文。
+    if block.len() > budget {
+        return None;
+    }
+    Some(block)
+}
+
+/// 展开消息里所有 `@path[:range]` 引用，其余字节原样保留。
+fn expand_mentions(root: &Path, text: &str) -> String {
+    const BOUNDARY_BEFORE: &str = "([{\"'";
+    // 注意：`:` 不能作为 token 终止符，否则 `@a.rs:12-40` 会在冒号处被截断、行号丢失。
+    // 行号段的合法性交给 parse_mention 判断（非数字即整体回退为路径）。
+    const BOUNDARY_AFTER: &str = ")]}\"'`,;。，、";
+    let mut out = String::with_capacity(text.len());
+    let mut expanded = 0usize;
+    let mut used = 0usize;
+    let mut index = 0usize;
+    while index < text.len() {
+        let ch = text[index..].chars().next().unwrap_or(' ');
+        if ch == '@' {
+            let left_ok = index == 0
+                || text[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|prev| prev.is_whitespace() || BOUNDARY_BEFORE.contains(prev));
+            if left_ok {
+                let start = index + 1;
+                let mut end = start;
+                for (offset, current) in text[start..].char_indices() {
+                    if current.is_whitespace() || BOUNDARY_AFTER.contains(current) {
+                        break;
+                    }
+                    end = start + offset + current.len_utf8();
+                }
+                if end > start {
+                    let token = &text[index..end];
+                    if let Some(mention) = parse_mention(token) {
+                        if expanded < MAX_MENTIONS {
+                            let budget = MAX_MENTION_CHARS.saturating_sub(used);
+                            if let Some(block) = render_mention(root, &mention, budget) {
+                                used += block.len();
+                                expanded += 1;
+                                out.push_str(&block);
+                                index = end;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
 /// 已登记工作区注册表：`~/.claw/web-workspaces.json`（数组 of path）。
 fn workspaces_registry_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".claw").join("web-workspaces.json"))
@@ -1058,7 +1205,9 @@ async fn api_prompt(
     let lock = Arc::clone(&state.turn_lock);
     let port = state.port;
     let token = state.token.clone();
-    let text = prompt_with_web_todos(&session_workspace, &id, &body.text);
+    // `@path:12-40` 这类引用直接展开成带行号的代码块，省掉 agent 首轮 read_file 往返。
+    let expanded_text = expand_mentions(&session_workspace, &body.text);
+    let text = prompt_with_web_todos(&session_workspace, &id, &expanded_text);
     let mode = crate::permission_mode_from_label(permission);
     let model = body.model.clone();
     // 收尾权（guard 与看门狗共享）+ 活动心跳（每个流式事件刷新）。
@@ -3590,5 +3739,136 @@ mod tests {
         let hunk = &files[0].hunks[0];
         let reverted = super::revert_hunk("new\r\ntail\r\n", hunk).expect("CRLF 文件应能还原");
         assert_eq!(reverted, "old\r\ntail\r\n");
+    }
+
+    // ---------------- @ 引用展开 ----------------
+
+    fn write_file(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn parse_mention_handles_all_three_forms() {
+        let plain = super::parse_mention("@src/a.rs").expect("纯路径");
+        assert_eq!(
+            (plain.path.as_str(), plain.start, plain.end),
+            ("src/a.rs", 1, usize::MAX)
+        );
+
+        let single = super::parse_mention("@src/a.rs:7").expect("单行");
+        assert_eq!(
+            (single.path.as_str(), single.start, single.end),
+            ("src/a.rs", 7, 7)
+        );
+
+        let range = super::parse_mention("@src/a.rs:12-40").expect("区间");
+        assert_eq!(
+            (range.path.as_str(), range.start, range.end),
+            ("src/a.rs", 12, 40)
+        );
+    }
+
+    #[test]
+    fn parse_mention_rejects_bad_ranges() {
+        // 倒序、0 行、非数字一律不认作区间，整体回退为路径（不吞掉原文）。
+        assert_eq!(
+            super::parse_mention("@a.rs:40-12").unwrap().path,
+            "a.rs:40-12"
+        );
+        assert_eq!(super::parse_mention("@a.rs:0").unwrap().path, "a.rs:0");
+        assert_eq!(super::parse_mention("@a.rs:x-y").unwrap().path, "a.rs:x-y");
+        assert!(super::parse_mention("@").is_none());
+    }
+
+    #[test]
+    fn expand_mentions_inlines_numbered_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/a.rs", "l1\nl2\nl3\nl4\nl5\n");
+        let out = super::expand_mentions(dir.path(), "看这里 @src/a.rs:2-3 再说");
+        assert!(
+            out.contains("[引用 src/a.rs 第 2-3 行（文件共 5 行）]"),
+            "out: {out}"
+        );
+        assert!(out.contains("2| l2"), "out: {out}");
+        assert!(out.contains("3| l3"), "out: {out}");
+        // 未在引用范围内的行不得出现。
+        assert!(!out.contains("l4"), "out: {out}");
+        // 引用之外的原文保留。
+        assert!(out.contains("看这里 "), "out: {out}");
+        assert!(out.contains(" 再说"), "out: {out}");
+    }
+
+    #[test]
+    fn expand_mentions_without_range_reads_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "n.txt", "a\nb\n");
+        let out = super::expand_mentions(dir.path(), "@n.txt");
+        assert!(out.contains("1| a"), "out: {out}");
+        assert!(out.contains("2| b"), "out: {out}");
+    }
+
+    #[test]
+    fn expand_mentions_clamps_and_reports_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=500).map(|i| format!("line{i}\n")).collect();
+        write_file(dir.path(), "big.txt", &body);
+        // 请求 1-400，单次展开上限 200 行，必须截断并说明还有多少行。
+        let out = super::expand_mentions(dir.path(), "@big.txt:1-400");
+        assert!(
+            out.contains("[引用 big.txt 第 1-200 行（文件共 500 行）]"),
+            "out head: {}",
+            &out[..120.min(out.len())]
+        );
+        assert!(
+            out.contains("该引用还有 200 行未展开"),
+            "tail: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+    }
+
+    #[test]
+    fn expand_mentions_clamps_range_beyond_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "n.txt", "a\nb\n");
+        let out = super::expand_mentions(dir.path(), "@n.txt:2-999");
+        assert!(out.contains("第 2-2 行（文件共 2 行）"), "out: {out}");
+    }
+
+    #[test]
+    fn expand_mentions_ignores_unknown_and_escaping_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        // 不存在的文件：保留原文，不注入空块。
+        let missing = super::expand_mentions(dir.path(), "@nope/x.txt");
+        assert_eq!(missing, "@nope/x.txt");
+
+        // 路径穿越必须被 resolve_in_workspace 拦下，原文保留。
+        let escape = super::expand_mentions(dir.path(), "@../../etc/passwd");
+        assert_eq!(escape, "@../../etc/passwd");
+    }
+
+    #[test]
+    fn expand_mentions_leaves_email_and_quoted_at_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.txt", "x\n");
+        // 邮箱中间的 @ 左侧是字母，不构成引用边界。
+        assert_eq!(super::expand_mentions(dir.path(), "me@a.txt"), "me@a.txt");
+        // 引号内的 @ 仍算引用起点（左侧是边界字符），这是刻意行为：粘贴路径时好用。
+        assert!(super::expand_mentions(dir.path(), "\"@a.txt\"").contains("1| x"));
+    }
+
+    #[test]
+    fn expand_mentions_caps_count_and_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.txt", "x\n");
+        // 超过 MAX_MENTIONS 的部分不再展开，但原文全部保留。
+        let input = "@a.txt ".repeat(super::MAX_MENTIONS + 5);
+        let out = super::expand_mentions(dir.path(), &input);
+        let expansions = out.matches("[引用 a.txt").count();
+        assert_eq!(expansions, super::MAX_MENTIONS, "expansions={expansions}");
+        assert_eq!(out.matches("@a.txt").count(), 5, "剩余原文应保留");
     }
 }
