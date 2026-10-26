@@ -552,6 +552,11 @@ details.tool.error .tool-name { color: var(--danger); }
 .patch .l-del { color: var(--diff-del-fg); background: var(--diff-del-bg); display: inline-block; width: 100%; }
 .patch .l-hunk { color: var(--link); }
 .patch .l-meta { color: var(--label-caption); }
+/* 逐 hunk 审查：每块自带标题行与「丢弃此块」。 */
+.hunk { border: 1px solid var(--border-l1); border-radius: var(--r-md); margin: 8px 0; overflow: hidden; }
+.hunk-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px; background: var(--sidebar-fill); border-bottom: 1px solid var(--border-l1); }
+.hunk-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--link); font-family: var(--font-code); font-size: 12px; }
+.hunk .patch { padding: 4px 8px; margin: 0; }
 .preview-image { max-width: 100%; border-radius: var(--r-md); }
 .preview-frame { width: 100%; height: 100%; border: 0; border-radius: var(--r-md); }
 .file-text { white-space: pre-wrap; margin: 0; font-family: var(--font-code); font-size: 12.5px; }
@@ -608,18 +613,10 @@ details.plan > summary { display: flex; justify-content: space-between; gap: 10p
 .attach img { width: 100%; height: 72px; object-fit: cover; display: block; }
 .attach span { display: block; font-size: 11px; padding: 4px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .upload-row .link { background: transparent; border: 0; padding: 0; color: var(--link); text-align: left; overflow: hidden; text-overflow: ellipsis; font-family: var(--font-code); font-size: 12.5px; }
-.terminal { flex: 1; margin: 0; padding: 10px 12px; overflow: auto; background: #0a0d11; color: #cfe3d6; font-family: var(--font-code); font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
-.term-input { border-top: 1px solid var(--border-l1); padding: 6px 8px; }
-.term-input input {
-  width: 100%;
-  background: var(--layer-2);
-  border: 1px solid var(--border-l2);
-  border-radius: var(--r-sm);
-  padding: 4px 8px;
-  outline: none;
-  font-family: var(--font-code);
-  font-size: 12.5px;
-}
+/* xterm 主机容器：铺满面板，尺寸由 FitAddon 拟合后回报给 PTY。 */
+.term-host { flex: 1; min-height: 0; padding: 8px 10px; overflow: hidden; background: #0a0d11; }
+.term-host .xterm { height: 100%; }
+.term-host .xterm-viewport { overflow-y: auto; }
 .pane.term-fullscreen { position: fixed; inset: 0; z-index: 40; background: var(--bg-base); border: 0; }
 .pane.term-fullscreen .pane-toolbar { background: var(--sidebar-fill); }
 

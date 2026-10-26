@@ -13,8 +13,9 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -63,6 +64,55 @@ struct PendingApproval {
 #[derive(Clone)]
 struct RunningTurn {
     signal: runtime::HookAbortSignal,
+}
+
+/// turn 线程的兜底守卫：无论正常结束、提前返回还是 panic 逃生，都必须
+/// 清掉 running 表并补发一次 `done`，避免前端永久停在“运行中”且该会话
+/// 后续请求全被 409 拒绝。
+struct TurnGuard {
+    running: Arc<Mutex<HashMap<String, RunningTurn>>>,
+    events: tokio::sync::broadcast::Sender<Value>,
+    session_id: String,
+    /// 与看门狗共享的“已收尾”标志：谁先 `swap` 成功谁负责发 done。
+    finished: Arc<AtomicBool>,
+    released: bool,
+}
+
+impl TurnGuard {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        // 看门狗已先行收尾（发过 error+done、清过 running），这里不重复。
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.session_id);
+        let _ = self
+            .events
+            .send(json!({ "session": self.session_id, "kind": "done" }));
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// 提取 panic payload 的可读信息（`&str` / `String` 两种常见形态）。
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "未知 panic 载荷".to_string()
+    }
 }
 
 #[derive(Deserialize)]
@@ -419,6 +469,7 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/workspace/file", get(api_file).post(api_file_write))
             .route("/api/workspace/raw", get(api_raw))
             .route("/api/workspace/diff", get(api_diff))
+            .route("/api/workspace/diff/discard", post(api_diff_discard))
             .route("/api/workspace/goal", get(api_goal))
             .route("/api/workspace/plans", get(api_plans))
             .route("/api/attachments", get(api_attachments))
@@ -810,6 +861,63 @@ struct WebTurn<'a> {
     events: tokio::sync::broadcast::Sender<Value>,
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
     session_id: &'a str,
+    /// 流式事件心跳，看门狗据此判断本轮是否还在推进。
+    activity: ActivityClock,
+}
+
+/// 活动心跳：每个流式事件都会刷新，供看门狗判断“是否还有进展”。
+type ActivityClock = Arc<AtomicU64>;
+
+/// turn 看门狗：超过阈值没有任何流式事件就主动收尾。
+///
+/// Rust 线程无法被强杀，所以这里不能真正终止底层调用；但至少保证前端拿到
+/// error+done、`running` 被释放，不会像 2026-10-25 那次一样永久转圈。
+/// 阈值由 `CLAW_WEB_TURN_WATCHDOG_SECS` 覆盖，默认 900 秒，`0` 表示禁用。
+fn spawn_turn_watchdog(
+    events: tokio::sync::broadcast::Sender<Value>,
+    running: Arc<Mutex<HashMap<String, RunningTurn>>>,
+    session_id: String,
+    signal: runtime::HookAbortSignal,
+    finished: Arc<AtomicBool>,
+    activity: ActivityClock,
+) {
+    let threshold_secs = std::env::var("CLAW_WEB_TURN_WATCHDOG_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(900);
+    if threshold_secs == 0 {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        if finished.load(Ordering::SeqCst) {
+            return;
+        }
+        let silent_ms = now_ms().saturating_sub(activity.load(Ordering::SeqCst));
+        if silent_ms < threshold_secs.saturating_mul(1000) {
+            continue;
+        }
+        // 抢占收尾权：失败说明 turn 刚好自己结束了，交给它正常收尾。
+        if finished.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // 尝试协作式中止（LLM/工具循环会检查该信号）。
+        signal.abort();
+        let _ = events.send(json!({
+            "session": session_id,
+            "kind": "error",
+            "message": format!(
+                "[看门狗] 已 {} 秒没有任何输出，本轮已中止；后台线程可能仍在收尾。",
+                silent_ms / 1000
+            ),
+        }));
+        running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id);
+        let _ = events.send(json!({ "session": session_id, "kind": "done" }));
+        return;
+    });
 }
 
 /// 在 serve 进程内跑一轮（不再拉子进程），从而拿到 token 级流式事件。
@@ -825,12 +933,12 @@ fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
         events,
         approvals,
         session_id,
+        activity,
     } = turn;
     // LiveCli 以进程 cwd 作为工作区根，而 serve 可能服务多个工作区；
     // 用全局锁串行切换 cwd，turn 结束后不恢复（其他 API 都用绝对路径）。
-    let _turn_guard = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 带超时等待：若上一轮卡死，这里不能无限阻塞，否则所有会话一起静默。
+    let _turn_guard = acquire_turn_lock(&lock, Duration::from_secs(10))?;
     if let Err(error) = std::env::set_current_dir(&workspace) {
         return Err(format!(
             "切换工作区失败（{}）：{error}",
@@ -858,7 +966,10 @@ fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
 
     let sender = events.clone();
     let sid = session_id.to_string();
+    let activity_clock = Arc::clone(&activity);
     cli.set_status_emitter(Arc::new(move |event: runtime::StatusEvent| {
+        // 任何流式事件都算“有进展”，刷新看门狗的心跳。
+        activity_clock.store(now_ms(), Ordering::SeqCst);
         let payload = match event {
             runtime::StatusEvent::TextDelta(text) => {
                 json!({ "session": sid, "kind": "delta", "text": text })
@@ -950,29 +1061,57 @@ async fn api_prompt(
     let text = prompt_with_web_todos(&session_workspace, &id, &body.text);
     let mode = crate::permission_mode_from_label(permission);
     let model = body.model.clone();
+    // 收尾权（guard 与看门狗共享）+ 活动心跳（每个流式事件刷新）。
+    let finished = Arc::new(AtomicBool::new(false));
+    let activity: ActivityClock = Arc::new(AtomicU64::new(now_ms()));
+    let watchdog_signal = signal.clone();
+    spawn_turn_watchdog(
+        events.clone(),
+        Arc::clone(&running_map),
+        session_id.clone(),
+        watchdog_signal,
+        Arc::clone(&finished),
+        Arc::clone(&activity),
+    );
     std::thread::spawn(move || {
-        let outcome = run_web_turn(WebTurn {
-            session_path: &path,
-            workspace: workspace.clone(),
-            lock,
-            text: &text,
-            mode,
-            model_override: model,
-            signal,
-            events: worker_events,
-            approvals,
-            session_id: &session_id,
+        let mut guard = TurnGuard {
+            running: Arc::clone(&running_map),
+            events: events.clone(),
+            session_id: session_id.clone(),
+            finished: Arc::clone(&finished),
+            released: false,
+        };
+        // turn 线程一旦 panic，旧实现会直接消失：不发 error/done、不清 running，
+        // 前端永久转圈且该会话后续请求全被 409 拒绝。catch_unwind 把 panic
+        // 转成普通错误，统一走下面的收尾路径。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_web_turn(WebTurn {
+                session_path: &path,
+                workspace: workspace.clone(),
+                lock,
+                text: &text,
+                mode,
+                model_override: model,
+                signal,
+                events: worker_events,
+                approvals,
+                session_id: &session_id,
+                activity,
+            })
+        }))
+        .unwrap_or_else(|payload| {
+            Err(format!(
+                "本轮执行线程异常终止（panic）：{}",
+                panic_payload_message(&*payload)
+            ))
         });
         let failed = outcome.is_err();
         if let Err(message) = &outcome {
             let _ =
                 events.send(json!({ "session": session_id, "kind": "error", "message": message }));
         }
-        let _ = events.send(json!({ "session": session_id, "kind": "done" }));
-        running_map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&session_id);
+        // release() 负责补发 done 并清 running；Drop 兜底不会重复执行。
+        guard.release();
 
         // Agent 在 turn 里调用了 `HotUpgrade`：状态已落盘，turn 也已收尾，
         // 此刻执行 Web 热升级（重建 → 同端口重启 → 页面凭同一 token 重连）。
@@ -1483,6 +1622,32 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
+/// 带超时地获取 turn 全局锁。
+///
+/// 该锁串行化“切换进程 cwd + 跑一轮”，一旦某个 turn 卡死，无限 `lock()`
+/// 会让后续所有会话静默挂起。超时后直接报错，把问题暴露给用户。
+fn acquire_turn_lock<'a>(
+    lock: &'a Mutex<()>,
+    timeout: Duration,
+) -> Result<std::sync::MutexGuard<'a, ()>, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "上一个 turn 仍在执行（等待工作区锁 {} 秒未释放），请稍后重试",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 fn modified_ms(path: &Path) -> Option<u64> {
     std::fs::metadata(path)
         .ok()?
@@ -1910,6 +2075,227 @@ async fn api_raw(State(state): State<AppState>, Query(query): Query<PathQuery>) 
     }
 }
 
+/// 一个 unified diff hunk 的结构化视图（供 Web 端逐块审查）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffHunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    /// `@@ ... @@` 之后的段标题（无则为空）。
+    section: String,
+    /// 正文行，保留 ` `/`-`/`+` 前缀。
+    lines: Vec<String>,
+}
+
+/// hunk 正文行的一侧归属：`Some(' ')` 上下文、`Some('+')` 新增、`Some('-')` 删除；
+/// `None` 表示非正文行（`\ No newline at end of file` 之类）。
+fn hunk_tag(line: &str) -> Option<char> {
+    if line.starts_with('\\') {
+        return None;
+    }
+    match line.chars().next() {
+        Some(ch @ (' ' | '+' | '-')) => Some(ch),
+        // 容错：某些工具会裁掉空上下文行的尾随空格。
+        _ => Some(' '),
+    }
+}
+
+fn hunk_body(line: &str) -> &str {
+    if line.is_empty() {
+        ""
+    } else {
+        &line[1..]
+    }
+}
+
+impl DiffHunk {
+    /// 内容指纹：校验「前端展示的 hunk」与「服务端当前 hunk」是否同一个。
+    fn fingerprint(&self) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.old_start.hash(&mut hasher);
+        self.new_start.hash(&mut hasher);
+        for line in &self.lines {
+            line.hash(&mut hasher);
+        }
+        format!("{:016x}", hasher.finish())
+    }
+
+    /// 新文件侧内容（上下文 + 新增行），即当前工作区里应有的样子。
+    fn new_side(&self) -> Vec<&str> {
+        self.side(true)
+    }
+
+    /// 旧文件侧内容（上下文 + 删除行），即撤销后应恢复的样子。
+    fn old_side(&self) -> Vec<&str> {
+        self.side(false)
+    }
+
+    fn side(&self, keep_added: bool) -> Vec<&str> {
+        let mut out = Vec::new();
+        for line in &self.lines {
+            match hunk_tag(line) {
+                Some(' ') => out.push(hunk_body(line)),
+                Some('+') if keep_added => out.push(hunk_body(line)),
+                Some('-') if !keep_added => out.push(hunk_body(line)),
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// 单个文件的 diff（hunk 顺序与 `git diff` 输出一致，index 即数组下标）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FileDiff {
+    path: String,
+    hunks: Vec<DiffHunk>,
+}
+
+fn parse_hunk_range(text: &str) -> Option<(usize, usize)> {
+    let mut parts = text.split(',');
+    let start = parts.next()?.parse().ok()?;
+    // `-1,+1` 省略计数时默认 1。
+    let count = match parts.next() {
+        Some(value) => value.parse().ok()?,
+        None => 1,
+    };
+    Some((start, count))
+}
+
+/// 解析 `@@ -1,2 +1,3 @@ section` 中 `@@ ` 之后的部分。
+fn parse_hunk_header(rest: &str) -> Option<DiffHunk> {
+    let (ranges, section) = match rest.find("@@") {
+        Some(pos) => (&rest[..pos], rest[pos + 2..].trim().to_string()),
+        None => (rest, String::new()),
+    };
+    let mut parts = ranges.split_whitespace();
+    let (old_start, old_count) = parse_hunk_range(parts.next()?.trim_start_matches('-'))?;
+    let (new_start, new_count) = parse_hunk_range(parts.next()?.trim_start_matches('+'))?;
+    Some(DiffHunk {
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+        section,
+        lines: Vec::new(),
+    })
+}
+
+/// 把 `git diff --no-color` 文本解析成按文件分组的 hunk 列表。
+fn parse_unified_diff(text: &str) -> Vec<FileDiff> {
+    fn push_hunk(files: &mut [FileDiff], file_index: Option<usize>, hunk: Option<DiffHunk>) {
+        if let (Some(index), Some(hunk)) = (file_index, hunk) {
+            files[index].hunks.push(hunk);
+        }
+    }
+
+    let mut files: Vec<FileDiff> = Vec::new();
+    let mut file_index: Option<usize> = None;
+    let mut hunk: Option<DiffHunk> = None;
+
+    // patch 以换行结尾时 split 会产生末尾空串，它不是 hunk 正文（否则会给最后一块
+    // 凭空加一条上下文行，导致 new_side 与非 revert 校验错位）。
+    let mut lines = text.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let is_trailing_artifact = line.is_empty() && lines.peek().is_none();
+        if is_trailing_artifact {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            push_hunk(&mut files, file_index, hunk.take());
+            let path = rest.split(" b/").nth(1).unwrap_or("").to_string();
+            files.push(FileDiff {
+                path,
+                hunks: Vec::new(),
+            });
+            file_index = Some(files.len() - 1);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            // 删除文件时右侧是 /dev/null，保留 diff --git 推出来的路径。
+            if !rest.starts_with("/dev/null") {
+                if let Some(index) = file_index {
+                    if files[index].path.is_empty() {
+                        files[index].path = rest.trim_start_matches("b/").to_string();
+                    }
+                }
+            }
+            continue;
+        }
+        if line.starts_with("--- ") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@@ ") {
+            push_hunk(&mut files, file_index, hunk.take());
+            hunk = parse_hunk_header(rest);
+            continue;
+        }
+        if let Some(current) = hunk.as_mut() {
+            current.lines.push(line.to_string());
+        }
+    }
+    push_hunk(&mut files, file_index, hunk);
+
+    // 丢掉没有 hunk 的文件（纯 mode 变更等）。
+    files.retain(|file| !file.hunks.is_empty());
+    files
+}
+
+/// 从工作区文件内容中撤销单个 hunk（等价 `git checkout -p` 里对该块答 no）。
+///
+/// 失败即拒绝：只有当前文件在 `new_start` 处的内容与 hunk 的新侧完全一致才动手，
+/// 否则说明文件在展示后被改过，按索引硬改会错位。
+fn revert_hunk(content: &str, hunk: &DiffHunk) -> Result<String, String> {
+    let expected = hunk.new_side();
+    let replacement = hunk.old_side();
+    // git diff 输出恒为 LF，而 Windows 工作树里读到的文件是 CRLF：
+    // 比较前统一剥掉行尾 \r，写回时再按原文件风格还原，否则每行都会误判"已变化"。
+    let crlf = content.contains("\r\n");
+    let mut lines: Vec<String> = content
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect();
+    let start = hunk.new_start.saturating_sub(1);
+    let end = start + expected.len();
+    if end > lines.len() {
+        return Err(format!(
+            "hunk 越界：文件 {len} 行，该块需要第 {start}–{end} 行",
+            len = lines.len(),
+            start = start + 1,
+            end = end
+        ));
+    }
+    let actual: Vec<&str> = lines[start..end].iter().map(|line| line.as_str()).collect();
+    if actual != expected {
+        return Err("文件内容在展示后已变化，请刷新后重试".to_string());
+    }
+    // 前缀保留 → 中间换成旧侧 → 跳过错位图里的新侧区域后接回尾部。
+    // （必须 drain 掉 `expected.len()` 行，否则新增行会被原样留在文件里。）
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 8);
+    out.extend(lines.drain(..start));
+    out.extend(replacement.into_iter().map(|line| line.to_string()));
+    out.extend(lines.drain(expected.len()..));
+    Ok(out.join(if crlf { "\r\n" } else { "\n" }))
+}
+
+fn git_diff_text(root: &Path, path: Option<&str>) -> String {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(root).args(["diff", "--no-color"]);
+    if let Some(path) = path.filter(|path| !path.is_empty()) {
+        command.arg("--").arg(path);
+    }
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+        Ok(output) => format!("git diff 失败：{}", String::from_utf8_lossy(&output.stderr)),
+        Err(error) => format!("无法执行 git: {error}"),
+    }
+}
+
 async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     if !authorize_path(&state, &query) {
         return unauthorized();
@@ -1919,23 +2305,10 @@ async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>)
         Err((code, message)) => return (code, message).into_response(),
     };
     let workspace = &workspace;
-    let mut patch_cmd = std::process::Command::new("git");
-    patch_cmd
-        .arg("-C")
-        .arg(workspace)
-        .arg("diff")
-        .arg("--no-color");
-    if let Some(path) = query.path.as_deref().filter(|path| !path.is_empty()) {
-        patch_cmd.arg("--").arg(path);
-    }
-    let patch = match patch_cmd.output() {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout).to_string();
-            truncate_middle(&text, 200_000)
-        }
-        Ok(output) => format!("git diff 失败：{}", String::from_utf8_lossy(&output.stderr)),
-        Err(error) => format!("无法执行 git: {error}"),
-    };
+    // 结构化解析必须基于完整 patch（截断会切断 hunk），展示用的 patch 才截断。
+    let raw = git_diff_text(workspace, query.path.as_deref());
+    let patch = truncate_middle(&raw, 200_000);
+    let diffs = parse_unified_diff(&raw);
 
     let mut stat_cmd = std::process::Command::new("git");
     stat_cmd
@@ -1974,12 +2347,119 @@ async fn api_diff(State(state): State<AppState>, Query(query): Query<PathQuery>)
         }
     }
 
+    // 结构化 hunk：前端按块渲染「采纳/丢弃」，index 即数组下标。
+    let hunks: Vec<Value> = diffs
+        .iter()
+        .flat_map(|file| {
+            file.hunks.iter().enumerate().map(move |(index, hunk)| {
+                json!({
+                    "path": file.path,
+                    "index": index,
+                    "old_start": hunk.old_start,
+                    "old_count": hunk.old_count,
+                    "new_start": hunk.new_start,
+                    "new_count": hunk.new_count,
+                    "section": hunk.section,
+                    "fingerprint": hunk.fingerprint(),
+                    "header": format!(
+                        "@@ -{},{} +{},{} @@ {}",
+                        hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count, hunk.section
+                    ),
+                    "lines": hunk.lines,
+                })
+            })
+        })
+        .collect();
+
     Json(json!({
         "patch": patch,
         "files": files,
         "untracked": untracked,
+        "hunks": hunks,
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct DiscardHunkBody {
+    path: String,
+    /// 来自 GET /api/workspace/diff 的 `hunks[].fingerprint`。
+    fingerprint: String,
+    /// 来自 GET /api/workspace/diff 的 `hunks[].index`；仅用于定位，最终以 fingerprint 为准。
+    index: usize,
+    /// 读取时的 mtime（毫秒）；不匹配说明文件在展示后被改动。
+    expected_mtime_ms: Option<u64>,
+    workspace: Option<String>,
+}
+
+/// 丢弃单个 hunk（= `git checkout -p` 对该块答 no）：把工作区文件里这一块改回 HEAD 的样子。
+///
+/// 双重校验，任一不符即整块拒绝而非猜测位置：
+/// - `fingerprint` 必须与当前 diff 中该 `index` 处 hunk 一致 → 证明讨论的是同一块；
+/// - 文件对应行内容必须仍等于该 hunk 的新侧 → 证明文件未被并发改动。
+async fn api_diff_discard(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+    Json(body): Json<DiscardHunkBody>,
+) -> Response {
+    if !authorize_path(&state, &query) {
+        return unauthorized();
+    }
+    let root = match resolve_workspace(
+        &state,
+        body.workspace.as_deref().or(query.workspace.as_deref()),
+    ) {
+        Ok(root) => root,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    let absolute = match resolve_in_workspace(&root, &body.path) {
+        Ok(path) => path,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+
+    let diffs = parse_unified_diff(&git_diff_text(&root, Some(&body.path)));
+    let Some(hunk) = diffs
+        .iter()
+        .find(|file| file.path == body.path)
+        .and_then(|file| file.hunks.get(body.index))
+    else {
+        return (
+            StatusCode::CONFLICT,
+            "该 hunk 已不存在（文件可能已被修改或还原），请刷新后重试",
+        )
+            .into_response();
+    };
+    if hunk.fingerprint() != body.fingerprint {
+        return (StatusCode::CONFLICT, "hunk 内容已变化，请刷新后重试").into_response();
+    }
+    if let Some(expected) = body.expected_mtime_ms {
+        if let Some(actual) = modified_ms(&absolute) {
+            if actual != expected {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("文件已被修改（{actual} != {expected}），请刷新后重试"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let Ok(content) = std::fs::read_to_string(&absolute) else {
+        return (StatusCode::NOT_FOUND, "文件不存在或不是文本文件").into_response();
+    };
+    let reverted = match revert_hunk(&content, hunk) {
+        Ok(text) => text,
+        Err(message) => return (StatusCode::CONFLICT, message).into_response(),
+    };
+    match atomic_write(&absolute, &reverted) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "path": body.path,
+            "mtime_ms": modified_ms(&absolute),
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
 }
 
 async fn api_goal(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
@@ -2268,12 +2748,19 @@ fn list_sessions(
 ) -> Result<Value, String> {
     // 先只做元数据扫描并排序截断，再对入选的少数会话读标题——
     // 避免为列出 50 条会话而完整解析上百个大 JSONL。
+    //
+    // 归属工作区以“会话文件所在的 store”为准，而不是回读 `session_meta` 里的
+    // `workspace_root`：后者是创建时写下的路径字符串，Windows 上同一目录可能
+    // 留下 `d:\foo` / `D:\foo` 两种拼写，前端按字符串分组会把一个工作区拆成
+    // 两个同名分组。
+    let workspace_label = workspace.display().to_string();
     let mut entries: Vec<(PathBuf, u64, u64)> = session_files(dir)
         .into_iter()
         .filter_map(|path| {
             let metadata = std::fs::metadata(&path).ok()?;
-            // 只有 header 的空会话（例如中断的恢复流程留下）不进入列表。
-            if metadata.len() < 64 {
+            // 只有 session_meta 头、从未产生消息的空会话不进入列表：它们没有
+            // 标题也没有内容，只会在侧栏留下一条以会话 id 命名的空记录。
+            if is_header_only_session(&path, metadata.len()) {
                 return None;
             }
             let modified = metadata
@@ -2294,14 +2781,16 @@ fn list_sessions(
         .take(limit)
         .filter_map(|(path, modified, size)| {
             let id = path.file_stem().and_then(|stem| stem.to_str())?.to_string();
-            let (computed_title, workspace_label) = session_summary(&path);
-            let title = titles.get(&id).cloned().unwrap_or(computed_title);
+            let title = titles
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| session_title(&path));
             Some(json!({
                 "id": id,
                 "modified": modified,
                 "size": size,
                 "title": title,
-                "workspace": workspace_label,
+                "workspace": workspace_label.clone(),
             }))
         })
         .collect();
@@ -2384,6 +2873,27 @@ fn is_session_file(path: &Path) -> bool {
     text.contains("\"type\":\"session_meta\"") || text.contains("\"type\": \"session_meta\"")
 }
 
+/// 只有 `session_meta` 头、从未产生任何消息的会话（典型：点了“新建任务”之后
+/// 没发消息就离开）。这类文件没有标题也没有内容，列进侧栏只会得到一条以会话
+/// id 命名的空记录。
+///
+/// 正常会话会随首条消息增长到远大于 4 KiB：先按体积快速排除，再确认第一行之后
+/// 没有内容，避免为了过滤空会话去读全部 JSONL。
+fn is_header_only_session(path: &Path, size: u64) -> bool {
+    const HEADER_PROBE_LIMIT: u64 = 4096;
+    if size > HEADER_PROBE_LIMIT {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match text.split_once('\n') {
+        Some((_header, rest)) => rest.trim().is_empty(),
+        // 没有换行同样是“只有一行”：只要不是空文件就判定为只有会话头。
+        None => !text.trim().is_empty(),
+    }
+}
+
 fn collect_session_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
     const MAX_DEPTH: usize = 3;
     if depth > MAX_DEPTH {
@@ -2422,21 +2932,13 @@ fn session_path(dir: &Path, id: &str) -> Result<PathBuf, (StatusCode, String)> {
 }
 
 /// 只读会话头部与第一条用户消息，避免为列表完整解析大文件。
-fn session_summary(path: &Path) -> (String, String) {
+fn session_title(path: &Path) -> String {
     use std::io::{BufRead, BufReader};
 
-    let fallback_workspace = path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_string();
-
     let Ok(file) = std::fs::File::open(path) else {
-        return (String::new(), fallback_workspace);
+        return String::new();
     };
     let reader = BufReader::new(file);
-    let mut workspace = String::new();
     let mut title = String::new();
     let mut budget: usize = 96 * 1024;
 
@@ -2451,12 +2953,6 @@ fn session_summary(path: &Path) -> (String, String) {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if workspace.is_empty() && value["type"] == "session_meta" {
-            workspace = value["workspace_root"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-        }
         if title.is_empty() && value["message"]["role"] == "user" {
             if let Some(blocks) = value["message"]["blocks"].as_array() {
                 let text = blocks
@@ -2469,14 +2965,11 @@ fn session_summary(path: &Path) -> (String, String) {
                 }
             }
         }
-        if !workspace.is_empty() && !title.is_empty() {
+        if !title.is_empty() {
             break;
         }
     }
-    if workspace.is_empty() {
-        workspace = fallback_workspace;
-    }
-    (title, workspace)
+    title
 }
 
 fn session_view(path: &Path) -> Result<Value, String> {
@@ -2779,6 +3272,102 @@ mod tests {
         );
     }
 
+    /// 会话归属必须以“文件所在的 store”为准：`session_meta` 里的
+    /// `workspace_root` 是创建时写下的字符串，可能大小写/写法不同（Windows
+    /// 盘符 `d:` 与 `D:`）。回读它会让前端按字符串分组时把一个工作区拆成
+    /// 两个同名分组。
+    #[test]
+    fn session_listing_labels_sessions_with_store_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("fingerprint");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let recorded_roots = [
+            dir.path().display().to_string(),
+            r"D:\stale\claw-code-src".to_string(),
+        ];
+        for (index, workspace_root) in recorded_roots.iter().enumerate() {
+            let id = format!("session-{index}-0");
+            let meta = serde_json::json!({
+                "type": "session_meta",
+                "version": 1,
+                "session_id": id.as_str(),
+                "workspace_root": workspace_root,
+            });
+            let message = serde_json::json!({
+                "type": "message",
+                "message": { "role": "user", "blocks": [{ "text": "你好" }] },
+            });
+            std::fs::write(
+                sessions_dir.join(format!("{id}.jsonl")),
+                format!("{meta}\n{message}\n"),
+            )
+            .unwrap();
+        }
+
+        let value = list_sessions(&sessions_dir, dir.path(), 0, 10).unwrap();
+        let sessions = value["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2, "两条会话都应进入列表");
+        let expected = dir.path().display().to_string();
+        for session in sessions {
+            assert_eq!(
+                session["workspace"].as_str(),
+                Some(expected.as_str()),
+                "workspace 必须取 store root，而不是 session_meta 里的字符串"
+            );
+        }
+    }
+
+    /// “新建任务”后没发消息就离开会留下只有 `session_meta` 头的文件：不进入
+    /// 列表，否则侧栏会多出一条以会话 id 命名的空记录。
+    #[test]
+    fn session_listing_skips_header_only_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("fingerprint");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let empty_path = sessions_dir.join("session-empty-0.jsonl");
+        // 真实形状的会话头本身就 ≥ 64 字节：旧的“< 64 字节”过滤挡不住它。
+        let empty_meta = serde_json::json!({
+            "type": "session_meta",
+            "version": 1,
+            "session_id": "session-empty-0",
+            "model": "deepseek-v4-flash",
+            "created_at_ms": 1,
+            "updated_at_ms": 1,
+            "workspace_root": dir.path().display().to_string(),
+        });
+        std::fs::write(&empty_path, format!("{empty_meta}\n")).unwrap();
+        assert!(
+            std::fs::metadata(&empty_path).unwrap().len() > 64,
+            "测试要覆盖旧阈值挡不住的真实头部体积"
+        );
+
+        let real_meta = serde_json::json!({
+            "type": "session_meta",
+            "version": 1,
+            "session_id": "session-real-0",
+            "model": "deepseek-v4-flash",
+            "created_at_ms": 2,
+            "updated_at_ms": 2,
+            "workspace_root": dir.path().display().to_string(),
+        });
+        let first_message = serde_json::json!({
+            "type": "message",
+            "message": { "role": "user", "blocks": [{ "text": "第一条消息" }] },
+        });
+        std::fs::write(
+            sessions_dir.join("session-real-0.jsonl"),
+            format!("{real_meta}\n{first_message}\n"),
+        )
+        .unwrap();
+
+        let value = list_sessions(&sessions_dir, dir.path(), 0, 10).unwrap();
+        let sessions = value["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "空会话不应进入列表");
+        assert_eq!(value["total"].as_u64(), Some(1), "total 也不应计入空会话");
+        assert_eq!(sessions[0]["id"], "session-real-0");
+        assert_eq!(sessions[0]["title"], "第一条消息");
+    }
+
     #[test]
     fn truncate_chars_respects_utf8_boundaries() {
         assert_eq!(truncate_chars("abc", 5), "abc");
@@ -2849,5 +3438,157 @@ mod tests {
         assert!(prompt.contains("- [ ] 写测试"), "prompt: {prompt}");
         assert!(prompt.contains("- [x] 跑测试"), "prompt: {prompt}");
         assert!(prompt.ends_with("继续"));
+    }
+
+    #[test]
+    fn acquire_turn_lock_times_out_instead_of_blocking_forever() {
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let shared = std::sync::Arc::clone(&lock);
+        let held = lock.lock().unwrap();
+        let started = std::time::Instant::now();
+        let result = super::acquire_turn_lock(&shared, std::time::Duration::from_millis(200));
+        assert!(result.is_err(), "卡住的 turn 不应让后续 turn 无限等待");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(held);
+        assert!(super::acquire_turn_lock(&shared, std::time::Duration::from_millis(200)).is_ok());
+    }
+
+    /// 一个真实形状的 patch：两文件、多 hunk，含 section 标题。
+    /// 用 concat! 而非 `\` 续行——续行会吞掉行首空格，破坏上下文行的 ` ` 前缀。
+    const SAMPLE_PATCH: &str = concat!(
+        "diff --git a/src/a.rs b/src/a.rs\n",
+        "index 1111111..2222222 100644\n",
+        "--- a/src/a.rs\n",
+        "+++ b/src/a.rs\n",
+        "@@ -1,3 +1,4 @@ fn main() {\n",
+        " let a = 1;\n",
+        "-let b = 2;\n",
+        "+let b = 3;\n",
+        "+let c = 4;\n",
+        " let d = 5;\n",
+        "diff --git a/src/b.rs b/src/b.rs\n",
+        "index 3333333..4444444 100644\n",
+        "--- a/src/b.rs\n",
+        "+++ b/src/b.rs\n",
+        "@@ -10,2 +10,2 @@\n",
+        "-old\n",
+        "+new\n",
+        " tail\n",
+    );
+
+    /// 单 hunk、new_start=1，用于验证末尾换行状态。
+    const SMALL_PATCH: &str = concat!(
+        "diff --git a/n.txt b/n.txt\n",
+        "--- a/n.txt\n",
+        "+++ b/n.txt\n",
+        "@@ -1,2 +1,2 @@\n",
+        "-old\n",
+        "+new\n",
+        " tail\n",
+    );
+
+    #[test]
+    fn parse_unified_diff_groups_hunks_by_file() {
+        let files = super::parse_unified_diff(SAMPLE_PATCH);
+        assert_eq!(files.len(), 2, "两个文件");
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[0].hunks.len(), 1);
+        assert_eq!(files[1].hunks.len(), 1);
+        let hunk = &files[0].hunks[0];
+        assert_eq!((hunk.old_start, hunk.old_count), (1, 3));
+        assert_eq!((hunk.new_start, hunk.new_count), (1, 4));
+        assert_eq!(hunk.section, "fn main() {");
+        // 正文行数 = 上下文 2 + 删除 1 + 新增 2。
+        assert_eq!(hunk.lines.len(), 5);
+    }
+
+    #[test]
+    fn parse_unified_diff_ignores_trailing_newline_artifact() {
+        // 末尾换行不能让最后一个 hunk 多出一条空白上下文行。
+        let files = super::parse_unified_diff(SAMPLE_PATCH);
+        let last = &files[1].hunks[0];
+        assert_eq!(last.lines.len(), 3, "lines: {:?}", last.lines);
+        assert!(!last.lines.iter().any(|line| line.is_empty()));
+    }
+
+    #[test]
+    fn parse_unified_diff_without_trailing_newline() {
+        let text = SAMPLE_PATCH.trim_end_matches('\n');
+        let files = super::parse_unified_diff(text);
+        assert_eq!(files[1].hunks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn hunk_sides_split_by_prefix() {
+        let files = super::parse_unified_diff(SAMPLE_PATCH);
+        let hunk = &files[0].hunks[0];
+        // 新侧 = 上下文 + 新增（文件当前应有内容）。
+        assert_eq!(
+            hunk.new_side(),
+            vec!["let a = 1;", "let b = 3;", "let c = 4;", "let d = 5;"]
+        );
+        // 旧侧 = 上下文 + 删除（还原后应有内容）。
+        assert_eq!(
+            hunk.old_side(),
+            vec!["let a = 1;", "let b = 2;", "let d = 5;"]
+        );
+    }
+
+    #[test]
+    fn fingerprint_tracks_content_changes() {
+        let files = super::parse_unified_diff(SAMPLE_PATCH);
+        let first = files[0].hunks[0].fingerprint();
+        assert_eq!(first, files[0].hunks[0].fingerprint(), "同内容指纹稳定");
+        assert_ne!(first, files[1].hunks[0].fingerprint(), "不同 hunk 指纹不同");
+
+        let mutated = SAMPLE_PATCH.replace("+let c = 4;", "+let c = 9;");
+        let files2 = super::parse_unified_diff(&mutated);
+        assert_ne!(first, files2[0].hunks[0].fingerprint(), "改内容必须改指纹");
+    }
+
+    #[test]
+    fn revert_hunk_restores_old_side() {
+        let files = super::parse_unified_diff(SAMPLE_PATCH);
+        let hunk = &files[0].hunks[0];
+        let current = "let a = 1;\nlet b = 3;\nlet c = 4;\nlet d = 5;\n";
+        let reverted = super::revert_hunk(current, hunk).expect("应能还原");
+        assert_eq!(reverted, "let a = 1;\nlet b = 2;\nlet d = 5;\n");
+    }
+
+    #[test]
+    fn revert_hunk_rejects_when_file_drifted() {
+        let files = super::parse_unified_diff(SAMPLE_PATCH);
+        let hunk = &files[0].hunks[0];
+        // 第 2 行已被改成 99：与 hunk 新侧不符，必须拒绝而不是猜位置。
+        let drifted = "let a = 1;\nlet b = 99;\nlet c = 4;\nlet d = 5;\n";
+        let error = super::revert_hunk(drifted, hunk).unwrap_err();
+        assert!(error.contains("已变化"), "error: {error}");
+    }
+
+    #[test]
+    fn revert_hunk_rejects_out_of_range() {
+        let files = super::parse_unified_diff(SAMPLE_PATCH);
+        let hunk = &files[0].hunks[0];
+        let error = super::revert_hunk("let a = 1;\n", hunk).unwrap_err();
+        assert!(error.contains("越界"), "error: {error}");
+    }
+
+    #[test]
+    fn revert_hunk_preserves_trailing_newline_state() {
+        // 用 new_start=1 的小 patch；SAMPLE_PATCH 第二块从第 10 行开始，不适用于 2 行文件。
+        let files = super::parse_unified_diff(SMALL_PATCH);
+        let hunk = &files[0].hunks[0];
+        // 无尾随换行的文件，还原后也不应凭空多出换行。
+        let reverted = super::revert_hunk("new\ntail", hunk).expect("应能还原");
+        assert_eq!(reverted, "old\ntail");
+    }
+
+    #[test]
+    fn revert_hunk_handles_crlf_working_tree() {
+        // Windows 工作树是 CRLF、git diff 输出是 LF：比较必须归一，写回必须保留 CRLF。
+        let files = super::parse_unified_diff(SMALL_PATCH);
+        let hunk = &files[0].hunks[0];
+        let reverted = super::revert_hunk("new\r\ntail\r\n", hunk).expect("CRLF 文件应能还原");
+        assert_eq!(reverted, "old\r\ntail\r\n");
     }
 }

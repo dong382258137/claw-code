@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import '@xterm/xterm/css/xterm.css'
 import { api, postJson, token, withToken, withWorkspace, wsUrl, rawUrl } from './api'
 import { Markdown } from './markdown'
 import { groupTurns, processTitle } from './turns'
-const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-_]/g
 const TABS = [
   { id: 'files', label: '文件' },
   { id: 'diff', label: '变更' },
@@ -28,9 +30,14 @@ function useToasts() {
       const last = list[list.length - 1]
       // 同类错误 2 秒内只提示一次，避免失败重试时刷屏。
       if (last && last.text === text && last.kind === kind && Date.now() - last.at < 2000) return list
-      return [...list, { id, text, kind, action, at: Date.now() }]
+      // 错误提示常驻且只保留最新一条：断流/失败的原因需要用户读到，
+      // 不能像普通提示那样 5 秒后自己消失。
+      const base = kind === 'error' ? list.filter((toast) => toast.kind !== 'error') : list
+      return [...base, { id, text, kind, action, at: Date.now() }]
     })
-    setTimeout(() => setToasts((list) => list.filter((toast) => toast.id !== id)), 5000)
+    if (kind !== 'error') {
+      setTimeout(() => setToasts((list) => list.filter((toast) => toast.id !== id)), 5000)
+    }
   }, [])
   return { toasts, push }
 }
@@ -206,8 +213,30 @@ export default function App() {
         })
       } catch (_) {}
     })
+    // 服务端可能已经退出或重启（token 随之更换）：断线时对账一次真实 running
+    // 状态，别让 UI 永远停在“运行中”。
+    let lastReconcile = 0
+    const reconcile = () => {
+      if (closed) return
+      const now = Date.now()
+      if (now - lastReconcile < 5000) return
+      lastReconcile = now
+      api(`/api/session/${encodeURIComponent(currentId)}/status`)
+        .then((status) => {
+          if (status?.running) return
+          setRunning(false)
+          setLive('')
+          setLiveThinking('')
+          setLiveTools([])
+          setOptimistic(null)
+        })
+        .catch(() => {
+          setRunning(false)
+          push('与本地服务断开：服务可能已重启（token 已更换），请用新打开的页面继续。', 'error')
+        })
+    }
     source.onopen = () => setConnected(true)
-    source.onerror = () => setConnected(false)
+    source.onerror = () => { setConnected(false); reconcile() }
 
     // token 级流式事件（进程内 turn 的 StatusEmitter → SSE）。
     const events = new EventSource(withToken(`/api/session/${encodeURIComponent(currentId)}/events`))
@@ -240,6 +269,7 @@ export default function App() {
         else if (data.kind === 'error') { setLive(''); setLiveThinking(''); setLiveTools([]); push(`流式错误：${data.message}`, 'error') }
       } catch (_) {}
     })
+    events.onerror = () => { setConnected(false); reconcile() }
     return () => { closed = true; source.close(); events.close() }
   }, [currentId, push])
 
@@ -1361,22 +1391,58 @@ function FilesPane({ workspace, onError }) {
   )
 }
 
+/// 逐 hunk 审查：每个 hunk 可单独「丢弃」，等价 `git checkout -p` 对该块答 no。
 function DiffPane({ workspace, onError }) {
-  const [diff, setDiff] = useState({ files: [], untracked: [], patch: '' })
+  const [diff, setDiff] = useState({ files: [], untracked: [], patch: '', hunks: [] })
   const [selected, setSelected] = useState('')
+  // 选中文件的单文件 patch：未跟踪文件没有 hunk，只能靠它展示内容。
+  const [filePatch, setFilePatch] = useState('')
+  const [busy, setBusy] = useState('')
+
   const load = useCallback(() => {
-    api(withWorkspace('/api/workspace/diff', workspace)).then(setDiff).catch((error) => onError?.(`diff 失败：${error.message}`))
+    api(withWorkspace('/api/workspace/diff', workspace))
+      .then((next) => setDiff({
+        files: next.files || [],
+        untracked: next.untracked || [],
+        patch: next.patch || '',
+        hunks: next.hunks || [],
+      }))
+      .catch((error) => onError?.(`diff 失败：${error.message}`))
   }, [onError, workspace])
   useEffect(() => { load() }, [load])
-  const openFile = async (path) => {
+
+  // 选中文件变化时取该文件的单文件 patch（未跟踪文件没有 hunk，只有这条路能展示）。
+  useEffect(() => {
+    if (!selected) { setFilePatch(''); return }
+    api(withWorkspace(`/api/workspace/diff?path=${encodeURIComponent(selected)}`, workspace))
+      .then((single) => setFilePatch(single.patch || ''))
+      .catch(() => setFilePatch(''))
+  }, [selected, workspace])
+
+  const discard = async (hunk) => {
+    const key = `${hunk.path}#${hunk.index}`
+    setBusy(key)
     try {
-      const single = await api(withWorkspace(`/api/workspace/diff?path=${encodeURIComponent(path)}`, workspace))
-      setSelected(path)
-      setDiff((current) => ({ ...current, patch: single.patch || '' }))
+      await postJson(withWorkspace('/api/workspace/diff/discard', workspace), {
+        path: hunk.path,
+        index: hunk.index,
+        // 指纹是唯一权威判据：服务端用它确认「讨论的是同一块」，
+        // 再逐行比对文件内容，任一不符即整块拒绝。
+        fingerprint: hunk.fingerprint,
+      })
+      // 丢弃一块后，同文件其余 hunk 的行号与 index 都会重排，必须整表重取。
+      load()
     } catch (error) {
-      onError?.(`diff 失败：${error.message}`)
+      onError?.(`丢弃失败：${error.message}`)
+      load()
+    } finally {
+      setBusy('')
     }
   }
+
+  const visible = selected ? diff.hunks.filter((hunk) => hunk.path === selected) : []
+  const hasHunks = visible.length > 0
+
   return (
     <div className="pane">
       <div className="pane-toolbar">
@@ -1386,28 +1452,58 @@ function DiffPane({ workspace, onError }) {
         <span className="hint">{diff.files.length} 个已修改 · {diff.untracked.length} 个未跟踪</span>
       </div>
       <div className="pane-body scroll">
-        {diff.files.map((file) => (
-          <button key={file.path} className="diff-row" onClick={() => openFile(file.path)}>
+        {!selected && diff.files.map((file) => (
+          <button key={file.path} className="diff-row" onClick={() => setSelected(file.path)}>
             <span>{file.path}</span>
             <span><span className="add">+{file.added}</span> <span className="del">-{file.removed}</span></span>
           </button>
         ))}
-        {diff.untracked.length > 0 && <div className="group">未跟踪</div>}
-        {diff.untracked.map((path) => (
-          <button key={path} className="diff-row" onClick={() => openFile(path)}><span>{path}</span><span className="muted">新增</span></button>
+        {!selected && diff.untracked.length > 0 && <div className="group">未跟踪</div>}
+        {!selected && diff.untracked.map((path) => (
+          <button key={path} className="diff-row" onClick={() => setSelected(path)}><span>{path}</span><span className="muted">新增</span></button>
         ))}
-        <pre className="patch">
-          {(() => {
-            const lines = String(diff.patch || '').split('\n')
-            const shown = lines.slice(0, 4000)
-            return (
-              <>
-                {shown.map((line, index) => <span key={index} className={line.startsWith('+') ? 'l-add' : line.startsWith('-') ? 'l-del' : line.startsWith('@@') ? 'l-hunk' : ''}>{line + '\n'}</span>)}
-                {lines.length > shown.length && <span className="muted">{`…已截断 ${lines.length - shown.length} 行…`}</span>}
-              </>
-            )
-          })()}
-        </pre>
+
+        {selected && hasHunks && visible.map((hunk) => {
+          const key = `${hunk.path}#${hunk.index}`
+          return (
+            <div key={key} className="hunk">
+              <div className="hunk-head">
+                <span className="hunk-title">{hunk.header || `@@ 第 ${hunk.new_start} 行`}</span>
+                <button
+                  className="ghost"
+                  disabled={busy === key}
+                  title="把这一块改回未修改状态（其余块保留）"
+                  onClick={() => discard(hunk)}
+                >{busy === key ? '丢弃中…' : '丢弃此块'}</button>
+              </div>
+              <pre className="patch">
+                {(hunk.lines || []).map((line, index) => (
+                  <span
+                    key={index}
+                    className={line.startsWith('+') ? 'l-add' : line.startsWith('-') ? 'l-del' : ''}
+                  >{line + '\n'}</span>
+                ))}
+              </pre>
+            </div>
+          )
+        })}
+
+        {/* 无 hunk 时（未跟踪文件、二进制、纯 mode 变更）回退到该文件的原始 patch 文本。 */}
+        {selected && !hasHunks && (
+          <pre className="patch">
+            {(() => {
+              const lines = String(filePatch || '').split('\n')
+              const shown = lines.slice(0, 4000)
+              return (
+                <>
+                  {shown.map((line, index) => <span key={index} className={line.startsWith('+') ? 'l-add' : line.startsWith('-') ? 'l-del' : line.startsWith('@@') ? 'l-hunk' : ''}>{line + '\n'}</span>)}
+                  {lines.length > shown.length && <span className="muted">{`…已截断 ${lines.length - shown.length} 行…`}</span>}
+                  {!filePatch && <span className="muted">该文件没有可展示的文本差异（未跟踪或二进制）。</span>}
+                </>
+              )
+            })()}
+          </pre>
+        )}
         {selected && <div className="hint">当前查看：{selected}</div>}
       </div>
     </div>
@@ -1646,50 +1742,82 @@ function AttachmentsPane({ workspace, onError }) {
 }
 
 function TerminalPane() {
-  const [text, setText] = useState('')
   const [status, setStatus] = useState('未连接')
-  const [line, setLine] = useState('')
   const [fullscreen, setFullscreen] = useState(false)
+  const hostRef = useRef(null)
+  const termRef = useRef(null)
+  const fitRef = useRef(null)
   const socketRef = useRef(null)
-  const outRef = useRef(null)
 
   const sendJson = useCallback((payload) => {
     const socket = socketRef.current
     if (socket?.readyState === 1) socket.send(JSON.stringify(payload))
   }, [])
 
+  // 尺寸以 xterm 拟合出的 cols/rows 为准（字符网格），不再按像素估算。
   const pushResize = useCallback(() => {
-    const node = outRef.current
-    if (!node) return
-    const cols = Math.max(20, Math.min(400, Math.floor(node.clientWidth / 8)))
-    const rows = Math.max(5, Math.min(200, Math.floor(node.clientHeight / 18)))
-    sendJson({ type: 'resize', cols, rows })
+    const fit = fitRef.current
+    const term = termRef.current
+    if (!fit || !term) return
+    try {
+      fit.fit()
+    } catch (_) {
+      return
+    }
+    sendJson({ type: 'resize', cols: term.cols, rows: term.rows })
   }, [sendJson])
 
+  // 终端只初始化一次：xterm 实例随渲染重建会丢掉滚屏缓冲区与光标状态。
   useEffect(() => {
+    const host = hostRef.current
+    if (!host) return
+    const term = new Terminal({
+      cursorBlink: true,
+      fontFamily: 'Consolas, "Cascadia Mono", monospace',
+      fontSize: 13,
+      scrollback: 5000,
+    })
+    const fit = new FitAddon()
+    term.loadAddon(fit)
+    term.open(host)
+    termRef.current = term
+    fitRef.current = fit
+    try {
+      fit.fit()
+    } catch (_) {}
+
     const socket = new WebSocket(wsUrl('/ws/terminal'))
     socket.binaryType = 'arraybuffer'
-    socket.onopen = () => { setStatus('已连接'); setTimeout(pushResize, 120) }
+    socket.onopen = () => {
+      setStatus('已连接')
+      setTimeout(pushResize, 120)
+    }
+    // 原始字节直通 xterm：由它解析 ANSI/颜色/光标/清屏，不再丢掉控制序列，
+    // 这样 vim/htop/top 这类全屏程序才能正常工作。
     socket.onmessage = (event) => {
-      const chunk = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data)
-      setText((previous) => (previous + chunk.replace(ANSI_RE, '')).slice(-200000))
+      if (typeof event.data === 'string') term.write(event.data)
+      else term.write(new Uint8Array(event.data))
     }
     socket.onclose = () => setStatus('已断开')
     socket.onerror = () => setStatus('连接失败')
     socketRef.current = socket
+
+    // 键盘输入直通 PTY：方向键、Tab 补全、Ctrl+C 都走 xterm 的按键编码。
+    const disposable = term.onData((data) => sendJson({ type: 'input', data }))
+
     const observer = new ResizeObserver(() => pushResize())
-    if (outRef.current) observer.observe(outRef.current)
+    observer.observe(host)
     window.addEventListener('resize', pushResize)
     return () => {
+      disposable.dispose()
       observer.disconnect()
       window.removeEventListener('resize', pushResize)
       socket.close()
+      term.dispose()
+      termRef.current = null
+      fitRef.current = null
     }
   }, [pushResize])
-
-  useEffect(() => {
-    if (outRef.current) outRef.current.scrollTop = outRef.current.scrollHeight
-  }, [text])
 
   useEffect(() => {
     if (fullscreen) setTimeout(pushResize, 80)
@@ -1707,19 +1835,11 @@ function TerminalPane() {
       <div className="pane-toolbar">
         <span className="hint">{status}</span>
         <span className="spacer" />
-        <button onClick={() => setText('')}>清屏</button>
+        <button onClick={() => termRef.current?.clear()}>清屏</button>
         <button onClick={() => send('\u0003')}>Ctrl+C</button>
         <button onClick={() => setFullscreen((value) => !value)}>{fullscreen ? '退出全屏' : '全屏'}</button>
       </div>
-      <pre className="terminal" ref={outRef}>{text}</pre>
-      <div className="term-input">
-        <input
-          value={line}
-          onChange={(event) => setLine(event.target.value)}
-          onKeyDown={(event) => { if (event.key === 'Enter') { send(line + '\r'); setLine('') } }}
-          placeholder="输入命令，Enter 发送（真 PTY，Esc 退出全屏）"
-        />
-      </div>
+      <div className="term-host" ref={hostRef} />
     </div>
   )
 }
