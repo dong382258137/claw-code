@@ -2062,13 +2062,10 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
     startListening()
   }
 
-  const scheduleTurn = () => {
-    clearTimeout(turnTimerRef.current)
-    turnTimerRef.current = window.setTimeout(() => {
-      if (!listeningRef.current) return
-      const text = (finalRef.current + interimRef.current).trim()
-      if (text) sendUtterance(text)
-    }, 1400)
+  const submitUtterance = () => {
+    const text = (finalRef.current + interimRef.current).trim()
+    if (!text) return
+    sendUtterance(text)
   }
 
   const sendUtterance = (text) => {
@@ -2129,7 +2126,9 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
       interimRef.current = interimText
       const total = (finalRef.current + interimText).trim()
       setInterim(total)
-      if (total) scheduleTurn()
+      // 刻意不在此处自动提交:原先静默 1.4s 就 sendUtterance,导致
+      // 说话中途的思考停顿被当成"说完了",半句话被送出且无法撤回。
+      // 现在只在本地累积,由用户点「发送这句」显式提交。
     }
     recognition.onerror = (event) => {
       const code = event.error
@@ -2366,6 +2365,15 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
             ))}
           </div>
           <span className="voice-time">{voiceClock(elapsed)}</span>
+          <button
+            type="button"
+            className="vd-send"
+            disabled={!interim.trim() || phase === 'thinking' || phase === 'replying'}
+            onClick={submitUtterance}
+            title="把这句话发给 AI"
+          >
+            发送这句
+          </button>
           <button
             type="button"
             className="vd-end"

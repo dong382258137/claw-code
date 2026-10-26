@@ -533,6 +533,22 @@ details.tool.error .tool-name { color: var(--danger); }
 }
 .vd-end:hover:not(:disabled) { background: var(--trae-voice-green); filter: brightness(1.08); }
 .vd-end:disabled { opacity: 0.45; cursor: not-allowed; }
+/* 手动提交:与「结束并整理」同高同圆角,但视觉上更轻,主行动仍是结束整理。 */
+.vd-send {
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--separator);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--label-primary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  flex: none;
+  transition: background 0.12s ease;
+}
+.vd-send:hover:not(:disabled) { background: var(--fill-quaternary); }
+.vd-send:disabled { opacity: 0.4; cursor: not-allowed; }
 @keyframes vd-pulse {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
