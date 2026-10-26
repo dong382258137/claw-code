@@ -176,7 +176,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
         // 上次升级残留的 .old:先删除旧备份(它已不是本次运行的二进制)。
         std::fs::remove_file(&old_exe)?;
     }
-    std::fs::copy(&exe, &old_exe)?;
+    copy_with_retry(&exe, &old_exe, Duration::from_secs(10))?;
     log_out(
         &log_file,
         &format!(
@@ -280,7 +280,7 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
                     "claw.exe"
                 )
             })?;
-        std::fs::copy(&built, &exe)?;
+        copy_with_retry(&built, &exe, Duration::from_secs(15))?;
         log_out(
             &log_file,
             &format!(
@@ -481,6 +481,24 @@ fn sync_launcher_siblings(exe: &Path, built: &Path, log_file: &Option<File>) {
                         sibling.display()
                     ),
                 ),
+            }
+        }
+    }
+}
+
+/// 拷贝文件并重试：旧进程在写 exited 标记后还要几十/几百毫秒才真正释放
+/// exe（Windows 会以 os error 32 拒绝覆盖正在运行的镜像）。固定 sleep
+/// 不可靠，这里按小步长重试直到超时。
+fn copy_with_retry(from: &Path, to: &Path, timeout: Duration) -> std::io::Result<()> {
+    let started = Instant::now();
+    loop {
+        match std::fs::copy(from, to) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if started.elapsed() >= timeout {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(300));
             }
         }
     }
@@ -811,6 +829,16 @@ mod tests {
         std::fs::write(&built, "new").unwrap();
         sync_launcher_siblings(&exe, &built, &None);
         assert!(!dir.path().join("claw-web.exe").exists());
+    }
+
+    #[test]
+    fn copy_with_retry_copies_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a.exe");
+        let to = dir.path().join("b.exe");
+        std::fs::write(&from, "bin").unwrap();
+        copy_with_retry(&from, &to, Duration::from_secs(1)).unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "bin");
     }
 
     #[test]
