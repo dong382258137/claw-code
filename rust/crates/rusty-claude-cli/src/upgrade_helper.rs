@@ -1,4 +1,4 @@
-﻿//! 升级助手(任务 2:热升级一键化,无感衔接)。
+//! 升级助手(任务 2:热升级一键化,无感衔接)。
 //!
 //! 由 `/upgrade` 命令 spawn 的**独立进程**(自带新控制台,编译输出可见)。
 //! 自动化"备份 exe → cargo build → 启动新进程"三步,使用户无需手动介入。
@@ -165,14 +165,18 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
     }
     log_out(&log_file, "[upgrade-helper] 旧进程已退出,开始迁移");
 
-    // 2. mv 当前 exe → exe.old(备份;Windows 允许重命名运行中的文件)。
+    // 2. 备份当前 exe → exe.old（**复制**而不是改名）。
+    //    历史事故：部署版从 claw-web.exe 启动时，旧实现先把入口改名成 .old，
+    //    随后构建产物名对不上（cargo 只产出 claw.exe）而失败，桌面快捷方式
+    //    的目标直接消失。复制备份保证构建失败时入口仍然可用（旧版本）。
+    //    旧进程在等待 exited 标记后已退出，文件不再被占用。
     let exe = std::env::current_exe()?;
     let old_exe = backup_path(&exe);
     if old_exe.exists() {
         // 上次升级残留的 .old:先删除旧备份(它已不是本次运行的二进制)。
         std::fs::remove_file(&old_exe)?;
     }
-    std::fs::rename(&exe, &old_exe)?;
+    std::fs::copy(&exe, &old_exe)?;
     log_out(
         &log_file,
         &format!(
@@ -265,18 +269,17 @@ pub(crate) fn run_helper(user_cwd: &Path) -> Result<(), Box<dyn std::error::Erro
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or("无法获取 exe 文件名")?;
-        let built = workspace_root
-            .join("target")
-            .join(profile_dir)
-            .join(exe_name);
-        if !built.is_file() {
-            return Err(format!(
-                "构建产物缺失: {}(预期 profile={})",
-                built.display(),
-                profile_dir
-            )
-            .into());
-        }
+        // 入口名不一定是 cargo 产物名：桌面快捷方式用 claw-web.exe，但
+        // `cargo build -p rusty-claude-cli` 只产出 claw.exe。按产物名解析，
+        // 避免再次出现“构建成功却找不到产物、入口已被改名”的事故。
+        let built =
+            resolve_built_product(&workspace_root, profile_dir, exe_name).ok_or_else(|| {
+                format!(
+                    "构建产物缺失: {}/{}（入口={exe_name}, profile={profile_dir}）",
+                    workspace_root.join("target").join(profile_dir).display(),
+                    "claw.exe"
+                )
+            })?;
         std::fs::copy(&built, &exe)?;
         log_out(
             &log_file,
@@ -458,7 +461,7 @@ fn sync_launcher_siblings(exe: &Path, built: &Path, log_file: &Option<File>) {
             continue;
         }
         let sibling = parent.join(name);
-        if !sibling.exists() {
+        if sibling == built || !sibling.exists() {
             continue;
         }
         if std::fs::remove_file(&sibling).is_ok() {
@@ -481,6 +484,39 @@ fn sync_launcher_siblings(exe: &Path, built: &Path, log_file: &Option<File>) {
             }
         }
     }
+}
+
+/// 入口文件名 → cargo 产物文件名。`claw-web.exe` 只是 claw.exe 的硬链接入口。
+fn build_product_name(exe_name: &str) -> String {
+    if exe_name.eq_ignore_ascii_case("claw-web.exe") || exe_name.eq_ignore_ascii_case("claw-web") {
+        if exe_name.to_ascii_lowercase().ends_with(".exe") {
+            "claw.exe".to_string()
+        } else {
+            "claw".to_string()
+        }
+    } else {
+        exe_name.to_string()
+    }
+}
+
+/// 在 target/<profile> 里定位构建产物：优先入口映射名，再回退到 claw(.exe)。
+fn resolve_built_product(
+    workspace_root: &Path,
+    profile_dir: &str,
+    exe_name: &str,
+) -> Option<PathBuf> {
+    let dir = workspace_root.join("target").join(profile_dir);
+    let primary = dir.join(build_product_name(exe_name));
+    if primary.is_file() {
+        return Some(primary);
+    }
+    for fallback in ["claw.exe", "claw"] {
+        let candidate = dir.join(fallback);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// 备份路径:`claw-plus.exe` → `claw-plus.exe.old`。
@@ -775,5 +811,23 @@ mod tests {
         std::fs::write(&built, "new").unwrap();
         sync_launcher_siblings(&exe, &built, &None);
         assert!(!dir.path().join("claw-web.exe").exists());
+    }
+
+    #[test]
+    fn build_product_name_maps_web_launcher_to_claw() {
+        assert_eq!(build_product_name("claw-web.exe"), "claw.exe");
+        assert_eq!(build_product_name("claw.exe"), "claw.exe");
+        assert_eq!(build_product_name("claw-plus.exe"), "claw-plus.exe");
+    }
+
+    #[test]
+    fn resolve_built_product_falls_back_to_claw() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("target").join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(release.join("claw.exe"), "bin").unwrap();
+        let built = resolve_built_product(dir.path(), "release", "claw-web.exe")
+            .expect("应回退到 claw.exe");
+        assert_eq!(built, release.join("claw.exe"));
     }
 }
