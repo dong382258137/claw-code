@@ -121,6 +121,9 @@ export default function App() {
   // 语音讨论「结束并整理」→ 输入框的通道。整理结果只填入待编辑，绝不直接发送；
   // 语音转写难免有错字，直接发出去用户没有任何纠正机会（这正是本通道存在的原因）。
   const [pendingDraft, setPendingDraft] = useState(null)
+  // 语音讨论进入前的原会话快照。讨论期间所有轮次发往专用会话，
+  // 结束后切回这里，主会话历史不被讨论内容污染。
+  const voiceReturnRef = useRef(null)
   // 稳定的错误回调：面板的 load 依赖它，若每次渲染换新函数会触发无限重取。
   const panelError = useCallback((message) => {
     if (message) push(message, 'error')
@@ -527,11 +530,51 @@ export default function App() {
     }
   }, [currentId, push, running])
 
-  const openVoiceDiscussion = useCallback(() => {
-    if (!currentId) { push('请先在左侧选择或新建一个会话', 'error'); return }
+  const openVoiceDiscussion = useCallback(async () => {
     if (running) { push('请等待当前回复结束后再开始语音讨论', 'error'); return }
-    setVoiceDiscussionOpen(true)
-  }, [currentId, push, running])
+    // 讨论期间切到专用会话：语音轮次不再写进主会话，
+    // 聊天界面也就不会出现讨论内容（用户要求独立上下文）。
+    // 原会话快照留到 voiceReturnRef，关闭时切回。
+    voiceReturnRef.current = current?.id
+      ? { id: current.id, title: current.title, modified: current.modified, workspace: current.workspace }
+      : null
+    try {
+      const created = await postJson('/api/sessions', { workspace: activeWorkspace || undefined })
+      const session = {
+        id: created.id,
+        title: '语音讨论',
+        modified: Math.floor(Date.now() / 1000),
+        workspace: created.workspace || activeWorkspace,
+      }
+      // 刻意不加入 sessions 列表：讨论会话是临时的，混进侧边栏会与工作会话混淆。
+      setCurrent(session)
+      setMessages([])
+      setRunning(false)
+      setLive('')
+      setLiveThinking('')
+      setLiveTools([])
+      setOptimistic(null)
+      setVoiceDiscussionOpen(true)
+    } catch (error) {
+      push(`创建语音讨论会话失败：${error.message}`, 'error')
+    }
+  }, [current, activeWorkspace, push, running])
+
+  // 关闭语音讨论：切回进入前的会话，主会话重新可见。
+  const closeVoiceDiscussion = useCallback(() => {
+    setVoiceDiscussionOpen(false)
+    const back = voiceReturnRef.current
+    voiceReturnRef.current = null
+    if (back?.id) {
+      setCurrent(back)
+      setMessages([])
+      setRunning(false)
+      setLive('')
+      setLiveThinking('')
+      setLiveTools([])
+      setOptimistic(null)
+    }
+  }, [])
 
   const runQuickAction = useCallback((action) => {
     if (action === 'settings') setSettingsOpen(true)
@@ -680,7 +723,7 @@ export default function App() {
           messages={messages}
           onSend={send}
           onStop={stop}
-          onClose={() => setVoiceDiscussionOpen(false)}
+          onClose={closeVoiceDiscussion}
           onError={(message) => push(message, 'error')}
           onDraft={setPendingDraft}
         />
@@ -2298,7 +2341,7 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
         <div className="vd-head">
           <div>
             <div className="vd-title">语音讨论</div>
-            <div className="vd-sub">说完停顿片刻 AI 会自动接话，结束时可整理成思路</div>
+            <div className="vd-sub">说完点「发送这句」，AI 才会接话；结束时可整理成思路</div>
           </div>
           <div className="vd-head-actions">
             <button
@@ -2319,7 +2362,7 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
           {log.length === 0 && !interim && !live && (
             <div className="vd-empty">
               <div className="vd-empty-icon"><Icon name="wave" size={24} /></div>
-              点击下方麦克风开始说话。你可以随意讲，AI 会接话帮你梳理；结束时会生成结构化思路。
+              点击下方麦克风开始说话。你说完点「发送这句」，AI 才会接话帮你梳理；结束时会生成结构化思路。
             </div>
           )}
           {log.map((item, index) => (
