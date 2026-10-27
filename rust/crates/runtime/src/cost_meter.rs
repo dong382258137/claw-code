@@ -4,15 +4,16 @@
 //! 成本开环。典型场景:Trivial 档轻量问答单 turn 烧掉 43K output 仍不自知。
 //! 本模块提供会话级成本累计器 [`CostMeter`]:运行时把每条 API 响应的
 //! `output_tokens` 与已执行工具调用数累计进 meter,在工具循环迭代末尾
-//! 评估是否需要注入 `[runtime]` 成本注记(user 消息,下一次请求构造对模型
-//! 可见),让模型第一次能看见"本 turn 已消耗 output ~n tokens、工具调用
-//! m 次";超阈值(默认 20K,env `CLAW_COST_WARN_OUTPUT_THRESHOLD` 可覆盖)
-//! 时注入升级版警示,引导立即收敛。
+//! 评估是否产生 `[runtime]` 成本注记。
+//!
+//! 通道(P0-3,2026-10-27):注记**只写 diag/面板,永不进入模型上下文**。
+//! 实证成本播报对任务零信息量,注入只会牵引注意力、诱发提前收口;而真
+//! runaway 时它又拦不住(单 turn 64 迭代 / 103K output / 11 条提示被无视)。
 //!
 //! 设计原则(与 Task 4 充分性契约对齐):
 //! - **零 LLM**:累计与决策纯确定性,不消耗 token。
-//! - **非关键路径**:注记注入失败静默(与既有 `[runtime]` 提醒一致)。
-//! - **注记本身也有成本**:注入频率设上限(普通提示每 ~5 次工具调用至多
+//! - **非关键路径**:注记写入失败静默(与既有 `[runtime]` 提醒一致)。
+//! - **注记本身也有成本**:频率上限(普通提示每 ~5 次工具调用至多
 //!   一条、警示每 ~10K output 至多一条),防刷屏变成新的成本源。
 //! - **Trivial/Standard 两档都生效**:成本失控在 Trivial(轻量问答)场景最
 //!   严重,不按档位豁免,也不需要读档位。
@@ -132,17 +133,11 @@ impl CostMeter {
         self.warns_this_turn = 0;
     }
 
-    /// 当前 turn 累计 output tokens(只读;供收敛契约门控读取燃烧状态)。
-    #[must_use]
-    pub fn turn_output_tokens(&self) -> u64 {
-        self.turn_output_tokens
-    }
-
     /// 工具批处理迭代末尾调用:决策 + 更新注记位点 + 渲染注记文本。
     ///
-    /// 返回需要注入的 `[runtime]` 注记(至多一条);`None` = 本轮不注记。
-    /// 位点更新保证同一 turn 内普通提示每 ~5 次工具调用一条、警示每 ~10K
-    /// output 一条,不会在连续迭代中反复注入。
+    /// 返回需要写入 diag/面板的 `[runtime]` 注记(至多一条);`None` = 本轮
+    /// 不注记。位点更新保证同一 turn 内普通提示每 ~5 次工具调用一条、警示
+    /// 每 ~10K output 一条,不会在连续迭代中反复出现。
     pub fn poll_note(&mut self, warn_threshold: u64) -> Option<String> {
         // 警示封顶:已达上限则把阈值抬到不可达,后续降级为普通提示 ——
         // 消除"警示→增 token→再警示"的正反馈(见 COST_WARN_MAX_PER_TURN)。
@@ -222,12 +217,12 @@ pub fn render_hint(turn_output_tokens: u64, turn_tool_calls: usize) -> String {
     )
 }
 
-/// 渲染升级版成本警示注记文本。
+/// 渲染升级版成本警示注记文本(diag/面板用,不进模型上下文)。
 #[must_use]
 pub fn render_warning(turn_output_tokens: u64) -> String {
     format!(
         "[runtime] 成本警示:本 turn output 已超 {turn_output_tokens} tokens(高燃烧)。\
-         建议立即收敛:若判据已满足,直接输出最终答案;确需更多信息请先询问用户方向。"
+         诊断建议:检查是否存在无新证据的重复侦察或空转;不要为低价值验证追加调用。"
     )
 }
 

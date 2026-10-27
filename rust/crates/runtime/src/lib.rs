@@ -24,8 +24,8 @@ mod conversation;
 pub mod lessons;
 mod sufficiency;
 // 轮次感知上下文编译器 P2:成本反馈注记(Cost Feedback Notes)— 会话级
-// output token / 工具调用累计器,把"本 turn 燃烧率"作为 [runtime] 注记
-// 注入给模型,超阈值(20K)显式警示,闭合成本反馈环(零 LLM)。
+// output token / 工具调用累计器。注记只写 diag/面板,不进模型上下文
+// (P0-3:成本播报对任务零信息量,注入只会牵引注意力并诱发提前收口)。
 mod cost_meter;
 pub mod task_state;
 // 收敛契约 · 打回率埋点(基线阶段):判定 user 输入是否为对上条收尾答复的"打回",

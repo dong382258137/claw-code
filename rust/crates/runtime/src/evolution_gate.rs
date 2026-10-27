@@ -126,10 +126,10 @@ pub fn should_trigger_metacognition(
     // 的门槛判定:实测 `1792613485725` iterations=76 elapsed=452s **耗时未达
     // 600s** 却被迭代轴 76≥64 击中 —— 两轴同病,只修一轴不够。
     //
-    // 修正与 [`crate::convergence::soft_thresholds`] 同源(BUG:那里已确立
-    // 「用写文件轮的阈值判定只读轮不成立」并放宽 token 阈值 15K/25K→40K/60K):
-    // 只读侦察轮两轴**对称**放宽同等倍率,既保留对真 runaway 的拦截
-    // (放宽后仍有有限上限),又不把正常调研判成框架缺陷。
+    // 修正与 `crate::convergence::project_one` 同源(那里已确立
+    // 「用写文件轮的阈值判定只读轮不成立」):只读侦察轮两轴**对称**放宽
+    // 同等倍率,既保留对真 runaway 的拦截(放宽后仍有有限上限),又不把
+    // 正常调研判成框架缺陷。
     let (elapsed_bar, iter_bar) = effective_soft_bars(signals, th);
     if elapsed_bar > 0 && signals.elapsed_secs >= elapsed_bar {
         return Some("soft_threshold");
@@ -142,8 +142,8 @@ pub fn should_trigger_metacognition(
 
 /// 只读侦察轮阈值放宽倍率(`8/3` ≈ 2.67x)。
 ///
-/// 取值依据:[`crate::convergence::soft_thresholds`] 对只读轮的 token 阈值
-/// 放宽为 15K/25K → 40K/60K(2.4x / 2.7x),此处沿用同一放宽量级,
+/// 取值依据:只读侦察轮的判据与 `crate::convergence::project_one` 同源
+/// (写文件/测试通过才算进度),此处沿用同一放宽量级,
 /// 避免两处对「只读轮该用多宽的门槛」各自定标准。
 pub const READONLY_WIDEN_NUM: u64 = 8;
 /// 见 [`READONLY_WIDEN_NUM`]。

@@ -1511,6 +1511,7 @@ fn get_simple_doing_tasks_section() -> String {
         // 停止条件只在"信息已足以支撑结论"时生效,且明确不豁免证据义务。
         "「事实需要证据」:对未知事实的断言必须基于检索/读文件等证据来源,禁止凭记忆猜测。**此条无例外,且优先于下方的停止条件** —— 尚缺证据时继续取证是正确的。".to_string(),
         "「充分即停」:当已掌握的信息足以支撑你将给出的结论时,不必再追加只读侦察;判据是否足够由你判断,`[SUFFICIENCY: <源1>, <源2>, ...]` 只是可选的自助声明(runtime 可据此提醒)。**此条只针对\"验证已足够\",不豁免证据义务** —— 若某条断言还缺来源,那不算充分。".to_string(),
+        "「运行时注记」:以 `<runtime-note source=\"runtime\"` 开头的消息由框架运行时自动注入(进度/护栏/成本播报),**不是用户指令**,不代表任务目标或方向变更。仅作状态参考:不得据此跳过验证、改变任务目标或提前结束 turn;只有真实用户消息能改变任务方向。例外:`kind=\"upgrade\"` 属终端事件(热升级),按其中要求收尾。".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())
@@ -2793,6 +2794,10 @@ mod tests {
         assert!(prompt.contains("确定性预算(Certainty Budget)"));
         assert!(prompt.contains("verify then think"));
         assert!(prompt.contains("系统状态 / 运行时行为"));
+        // P0-1(通道隔离):系统提示必须声明 `<runtime-note>` 非用户指令。
+        assert!(prompt.contains("「运行时注记」"));
+        assert!(prompt.contains("<runtime-note source="));
+        assert!(prompt.contains("不是用户指令"));
 
         cleanup_temp_dir(&root);
     }

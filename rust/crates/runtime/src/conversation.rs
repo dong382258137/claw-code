@@ -99,6 +99,19 @@ const RUNTIME_HINTS_HEADER: &str = "\
 工作记忆(Notebook)、活跃计划、步骤状态、当前任务、语义召回、校验补救、
 认知停滞、失败辅导、会话摘要、压缩提醒、归档召回、会话交接。";
 
+/// 运行时注记统一封套(P0-1 通道隔离,2026-10-27)。
+///
+/// 背景:这些注记此前直接以 `[runtime] ...` 的 user 消息注入,模型会把
+/// 「催收尾/报成本」读成用户意图,在任务中途停下反问(实证
+/// session-1792876430758-0)。封套显式标注来源为非用户,配合系统提示的
+/// 「运行时注记」条款,使模型只把它当状态参考。
+///
+/// `kind`:progress(进度/耗时播报)、guard(侦察护栏)、sufficiency(判据
+/// 满足)、upgrade(终端事件:热升级,需按提示收尾)。
+fn runtime_note(kind: &str, body: &str) -> String {
+    format!("<runtime-note source=\"runtime\" kind=\"{kind}\">\n{body}\n</runtime-note>")
+}
+
 /// 微压缩保留窗口(默认 5,微软实证最优)。`CLAW_COMPACT_PRESERVE_RECENT`
 /// 环境变量可覆盖(1-10),便于按会话/工作负载微调 —— 长链任务可调高,
 /// 追求更低 token 时可调低。
@@ -174,12 +187,18 @@ fn should_inject_time_soft(already_injected: bool, elapsed_secs: u64, time_soft:
 }
 
 /// 墙钟收敛提醒文本(纯函数,便于单测)。
+///
+/// P0-2:文案只陈述事实 + 自检规则,不引导"改变策略/询问用户" —— 后者会被
+/// 模型读成"停下等用户"的许可。是否收尾由模型依据进度自判。
 fn time_soft_warning(elapsed_secs: u64, time_soft: u64) -> String {
-    format!(
-        "[runtime] 本 turn 已耗时约 {} 秒(阈值 {}s)仍未收敛。\
-         若已接近结论,请总结已有发现并输出最终答案;否则请改变策略\
-         或询问用户方向。注意:收敛不应仅看轮次——多数轮次也可能累积很久。",
-        elapsed_secs, time_soft
+    runtime_note(
+        "progress",
+        &format!(
+            "[runtime] 本 turn 已耗时约 {} 秒(阈值 {}s)且近几轮无落盘/测试进度。\
+             请自检是否空转:能给出可验证结论则收尾;否则收敛到已确认结论并明确\
+             未完成项,禁止用猜测补齐。注意:耗时本身不证明方向错误,有进展可继续。",
+            elapsed_secs, time_soft
+        ),
     )
 }
 
@@ -1565,7 +1584,8 @@ pub enum ReactiveCompactState {
 /// 仍在推进,若在此直接中止会误杀仍在产出的 turn(2026-08-10 实测误杀:
 /// 64 次调用全为只读侦察、模型输出 44 段实质分析文本、已发现关键线索
 /// 仍被 64 硬上限终止)。改为 64 轮处先向 session 注入收敛警告,引导模型
-/// 总结已有发现或询问用户方向;仅在恰好的轮次触发一次(不重复注入)。
+/// 依据进度自判(有可验证产出则收尾,否则收敛到已确认结论);该警告走
+/// "连续无进度信号"门控,fire-once,不重复注入。
 pub const SOFT_MAX_ITERATIONS: usize = 64;
 
 /// 主对话单 turn 的最大迭代次数(硬上限护栏)。
@@ -1607,9 +1627,9 @@ pub const COMPLEX_MAX_ITERATIONS: usize = 1024;
 /// 随上下文膨胀从 15s 增至 27s)。此时迭代计数未达软阈值 → **全程无收尾
 /// 触发**,直到外部预算强杀。仅按迭代数收敛对"少数但极贵的轮次"失效。
 ///
-/// 本常量提供墙钟维度:turn 从开始到当前超过该秒数即注入与
-/// `SOFT_MAX_ITERATIONS` 同构的收敛提醒(走同一仲裁槽 pri 45),让模型
-/// 感知"时间已花很多"并自主决定收尾或继续。仅在恰好的跨越点触发一次。
+/// 本常量提供墙钟维度:turn 从开始到当前超过该秒数、且连续无落盘/测试
+/// 进度时,注入与 `SOFT_MAX_ITERATIONS` 同构的收敛提醒(走同一仲裁槽
+/// pri 45),让模型感知"时间已花很多"并自主决定收尾或继续。fire-once。
 ///
 /// 取 600s(10min):显著低于常见外部预算(900–1800s),给模型留收尾余量;
 /// 又高于多数任务的总时长(p50≈271s),避免误扰短任务。`CLAW_TURN_TIME_SOFT_SECS`
@@ -4069,40 +4089,20 @@ where
         // 提醒注入标志(每 turn 只注入一次)。
         self.sufficiency_contract.reset();
         let mut sufficiency_notice_injected = false;
-        // 收敛契约 P1(§5.1 窄版):软阈值注入声明提示的标志(15K/25K 各一次)
-        // + 证据缺失打回计数(上限 2,防死循环,超限交既有成本护栏兜底)。
-        let mut convergence_soft1_injected = false;
-        let mut convergence_soft2_injected = false;
-        // 墙钟软阈值(fire-once):turn 累计耗时跨越 TURN_TIME_SOFT_SECS 时注入
-        // 一次收敛提醒。与迭代软阈值正交 —— 覆盖"轮次少但单轮极贵"的推理型
-        // 长任务(迭代计数未达软上限即已烧光预算)。
+        // 墙钟软阈值(fire-once):turn 累计耗时跨越 TURN_TIME_SOFT_SECS 且
+        // 近几轮无落盘/测试进度时注入一次提醒(与迭代软阈值正交,覆盖
+        // "轮次少但单轮极贵"的推理型长任务)。
         let mut time_soft_injected = false;
-        let mut convergence_punchbacks: u8 = 0;
-        // P1 批5(收敛催缴冷却):模型本 turn 已输出过格式合法【收敛声明】
-        // (无论 claimed_complete true/false)的标志。置位后注入段 soft1/soft2
-        // 不再重复催缴 —— 消除"催缴 → 被迫重复输出声明段 → output 增长 →
-        // 再催缴"微循环(批5 审计实证,见 tracker session-1788871932809-0)。
-        let mut convergence_acknowledged = false;
-        // 打回后继续标志:证据缺失打回 hint 注入后,不 break 而是回到 loop
-        // 顶部重新请求(模型下轮看到 hint 重新决策)。上限 2 保证不无限循环。
-        let mut convergence_should_continue = false;
-        // 收敛停滞计数(修复"按 token 量催缴"缺陷):连续多少个工具批没有任何
-        // 进度信号(file_produced / test_success)。有进展即清零。soft1/soft2
-        // 除 token 量级门外还需本计数达标 —— 正在干活的长任务不该被催收尾。
-        // 初值取阈值(而非 0):纯推理、根本不调工具的 turn 从未产生过进度信号,
-        // 应保持"按量催缴"的既有行为,不被新门控静默豁免。
+        // 迭代软阈值(fire-once):达到 SOFT_MAX 且停滞时提醒一次。
+        let mut iter_soft_injected = false;
+        // 停滞计数(迭代/墙钟催缴的共同门控):连续多少个工具批没有任何
+        // 进度信号(file_produced / test_success)。有进展即清零 —— 正在
+        // 写文件/跑测试的长任务不该被催收尾。
+        //
+        // 初值取阈值(而非 0):纯推理、根本不调工具的 turn 从未产生过进度
+        // 信号,应被视为停滞,保留对其的催缴护栏。
         let mut convergence_stagnant_iters: u32 =
             crate::convergence::CONVERGENCE_MIN_STAGNANT_ITERS;
-        // 本 turn 是否调用过工具。纯推理轮(一次工具都没调)不算只读轮 ——
-        // 它不调工具就没有"检索"这件事,保留按量催缴的既有护栏。
-        let mut turn_called_tools = false;
-        // 本 turn 是否**只**调用了侦察类只读工具(`SURVEY_TOOLS`:read_file /
-        // grep_search / glob_search)。初值 true,遇到任何非侦察工具即置 false。
-        //
-        // 为什么按工具名判而非按「有无进度信号」判:后者会把 `echo`、`bash`
-        // 之类也归入"只读侦察"(它们同样不落盘),导致阈值被放宽到 40K/60K、
-        // 该催的时候不催。只读侦察是**工具属性**,不是"没产出"的副作用。
-        let mut turn_survey_only = true;
         // P2(成本反馈注记 · Task 5):turn 开头复位成本累计器 —— turn 级计数
         // (output tokens / 工具调用)与注记位点清零,全会话累计保留跨 turn。
         self.cost_meter.reset_turn();
@@ -4128,20 +4128,15 @@ where
         };
 
         // F1(批3):监管注记仲裁槽 —— 收敛控制回路"单动作原则"。
-        // 侦察护栏/充分性/成本/收敛四类 [runtime] 注记本质是同一收敛回路的
+        // 侦察护栏/充分性/进度播报等 [runtime] 注记本质是同一收敛回路的
         // 不同扳机(都在问"模型是否高效推进"),若各自独立 push,一轮请求会
-        // 收到互相矛盾的指令(一催写文档、一催少调用、一催收尾)。仲裁槽使
-        // 每轮请求至多注入一条:检测点只 stage(高优先级覆盖),请求构造前
-        // flush 单条。被压注记的 fire-once 标志已在检测点置位,本轮放弃
-        // 无害 —— 强收口类(预算硬收口/收敛soft2)优先级高必达,轻提醒
-        // (成本提示/充分性)丢失可接受。优先级:收敛soft2=90 > 预算硬收口=85
-        // > 成本警示=80 > 收敛soft1=70 > 侦察护栏=60 > 充分性=55 >
-        // 成本提示=50 > 预算倒数=45。注记在工具批后触发时对下一迭代可见,
-        // 在循环顶触发时对本迭代可见 —— 与改造前 push_message 语义一致。
-        // 站7(2026-09-19):`stage_note` 返回是否成功 —— 被高优先级压掉的
-        // 注记若携带 fire-once 语义(收敛 soft1/soft2、充分性),调用方应
-        // **回滚其注入标志**(仅成功才置位),否则该注记被占槽一次即永久
-        // 丢失(实证:soft1=70 被成本警示=80 抢占后从未注入过收敛声明)。
+        // 收到互相矛盾的指令。仲裁槽使每轮请求至多注入一条:检测点只 stage
+        // (高优先级覆盖),请求构造前 flush 单条。
+        // 优先级:预算硬收口=85 > 侦察护栏=60 > 充分性=55 > 进度播报=45 >
+        // 预算倒数=45。成本播报不再进仲裁槽(只走 diag,永不进模型上下文)。
+        // 注记在工具批后触发时对下一迭代可见,循环顶触发时对本迭代可见。
+        // `stage_note` 返回是否成功 —— 被高优先级压掉的 fire-once 注记
+        // (充分性/进度播报)仅在成功时置位,下轮空槽仍有机会注入。
         let mut arbiter_note: Option<(u8, String)> = None;
         /// stage 一条监管注记:槽位为空或本注记优先级更高时占槽并返回 `true`。
         /// 返回 `false` 表示被槽内更高优先级注记压掉(调用方应回滚 fire-once 标志)。
@@ -4158,40 +4153,44 @@ where
         loop {
             iterations += 1;
             self.emit_diag(format!("[diag] loop_start iter={iterations}"));
-            // 站7:本迭代是否注入了"成本×收敛"合并警示(每迭代重置)。
-            // 收敛 soft2 据此让位,避免同轮连发两条收敛注记。
-            let mut warn_merged_this_iter = false;
-            // 软阈值:达到时注入收敛警告,不中止。
-            // 模型在下一轮迭代即可看到该消息,被引导总结已有发现或询问用户,
-            // 避免"合法的长程分析仍在推进却被硬上限误杀"。仅在恰好的轮次
-            // 触发一次;走仲裁槽(pri 45)而非直推 —— 循环顶槽位为空必达,
-            // 与直推语义等价,但不再存在"绕过 F1 单动作原则"的旁路通道。
-            if iterations == turn_soft_max {
-                let warning = format!(
-                    "[runtime] 已运行 {} 次迭代仍未收敛。若已接近结论,请总结 \
-                     已有发现并输出最终答案;否则请改变策略或询问用户方向。",
-                    turn_soft_max
+            // 迭代软阈值(P0-2):轮次只是量级门,真正门控是"连续无进度信号"。
+            // 把 token 燃烧量/轮次当"未完成"的代理会催正在干活的长任务;
+            // 文案也去掉"询问用户方向"的指令性引导,避免模型把运行时提醒
+            // 当成停下来等用户的许可。走仲裁槽(pri 45);被抢占则下轮重试,
+            // 不丢 fire-once。
+            let turn_stalled =
+                convergence_stagnant_iters >= crate::convergence::CONVERGENCE_MIN_STAGNANT_ITERS;
+            if !iter_soft_injected && iterations >= turn_soft_max && turn_stalled {
+                let warning = runtime_note(
+                    "progress",
+                    &format!(
+                        "[runtime] 本 turn 已运行 {iterations} 轮(软阈值 {turn_soft_max})且近几轮\
+                         无落盘/测试进度。请自检是否空转:能给出可验证结论则收尾;否则收敛到\
+                         已确认结论并明确未完成项,禁止用猜测补齐,也不要因此跳过必要验证。"
+                    ),
                 );
-                let _ = stage_note(&mut arbiter_note, 45, warning);
+                if stage_note(&mut arbiter_note, 45, warning) {
+                    iter_soft_injected = true;
+                }
             }
 
             // 墙钟软阈值:与迭代计数**正交**的第二收敛信号。
-            // 根因(实测 runtime-6f4c0e4b):收敛控制全按迭代数计数,但推理型
-            // 长任务可在远低于软上限的轮次就耗时千秒(60 轮 / 95.6% 时间在推理,
-            // 单轮从 15s 涨到 27s 上下文膨胀)。迭代数信号此时静默 → 全程无收尾
-            // 触发 → 被外部预算强杀。此处在 turn 累计耗时跨过阈值时注入同构
-            // 收敛提醒(同一仲裁槽 pri 45),使模型获得"时间已花很多"的感知,
-            // 自主决定收尾或继续。仅跨阈值那一刻触发一次(fire-once)。
+            // 根因(实测 runtime-6f4c0e4b):推理型长任务可在远低于软上限的
+            // 轮次就耗时千秒。P0-2 同样接入停滞门控 —— 有落盘/测试进度时
+            // 耗时再长也不打断;文案不引导询问用户。跨阈值后若被抢占或仍在
+            // 推进,则在后续停滞的迭代再注入(fire-once,成功才置位)。
             let time_soft = turn_time_soft_secs();
             let elapsed_secs = self
                 .turn_start
                 .get()
                 .map(|s| s.elapsed().as_secs())
                 .unwrap_or(0);
-            if should_inject_time_soft(time_soft_injected, elapsed_secs, time_soft) {
-                time_soft_injected = true;
+            if turn_stalled && should_inject_time_soft(time_soft_injected, elapsed_secs, time_soft)
+            {
                 let warning = time_soft_warning(elapsed_secs, time_soft);
-                let _ = stage_note(&mut arbiter_note, 45, warning);
+                if stage_note(&mut arbiter_note, 45, warning) {
+                    time_soft_injected = true;
+                }
             }
 
             // 侦察护栏(2026-08-31):长程任务防侦察过度 + 强制调查成果落盘。
@@ -4230,11 +4229,17 @@ where
                             "<workspace>/.claw/trackers/<session_id>.md".to_string()
                         });
                     let open_items = self.tracker_open_item_count();
-                    let hint = format!(
-                        "[runtime] 已进行 {survey_count} 次代码侦察,但任务跟踪文档尚未创建或近期未更新。请立即:\n\
-                         1. 用 write_file 创建/更新 `{tracker_path}`,记录任务目标、已确认发现(文件+结论)、计划进度(每个 `- [ ]` 闭环时锚定证据 文件:行号);\n\
-                         2. 调用 `create_plan` 建立分阶段计划,按计划执行(文档落盘、跨压缩不丢,持续更新防重复调查)。\n\
-                         当前未闭环待办 {open_items} 项 —— 未打勾不计收敛,请优先闭环或明确放弃。"
+                    // P0-2:降为可选建议(不再"请立即"命令式)—— 正常调研
+                    // 仍在推进时不应被流程动作打断;已有关键发现再落盘。
+                    let hint = runtime_note(
+                        "guard",
+                        &format!(
+                            "[runtime] 已进行 {survey_count} 次代码侦察,本 turn 尚无写入产出。\
+                             建议(可选,不改变任务方向):若调研仍在推进可继续;已有关键发现则用 \
+                             write_file 记入 `{tracker_path}`(任务目标、已确认发现 文件+结论),\
+                             并可调用 `create_plan` 建立分阶段计划(文档落盘、跨压缩不丢)。\
+                             当前未闭环待办 {open_items} 项。"
+                        ),
                     );
                     stage_note(&mut arbiter_note, 60, hint);
                 }
@@ -4274,14 +4279,17 @@ where
                                 "<workspace>/.claw/trackers/<session_id>.md".to_string()
                             });
                         let open_items = self.tracker_open_item_count();
-                        let hint = format!(
-                            "[runtime] 侦察预算已耗尽(累计 {survey_count} 次只读侦察 ≥ 预算 {budget})。\
-                             请立即二选一收口,禁止继续无限只读侦察:\n\
-                             1. 提交证据式结论:把 `{tracker_path}` 的每个 `- [ ]` 待办项闭环 \
-                             (打勾并锚定证据:文件路径:行号 或 工具结果引用),然后输出最终答案;\n\
-                             2. 询问用户下一步方向。\n\
-                             当前 tracker 仍有 {open_items} 个未闭环待办项。\
-                             若后续仍持续只读侦察,本 turn 将被强制中止。"
+                        let hint = runtime_note(
+                            "guard",
+                            &format!(
+                                "[runtime] 侦察预算已耗尽(累计 {survey_count} 次只读侦察 ≥ 预算 {budget})。\
+                                 请立即二选一收口,禁止继续无限只读侦察:\n\
+                                 1. 提交证据式结论:把 `{tracker_path}` 的每个 `- [ ]` 待办项闭环 \
+                                 (打勾并锚定证据:文件路径:行号 或 工具结果引用),然后输出最终答案;\n\
+                                 2. 询问用户下一步方向。\n\
+                                 当前 tracker 仍有 {open_items} 个未闭环待办项。\
+                                 若后续仍持续只读侦察,本 turn 将被强制中止。"
+                            ),
                         );
                         stage_note(&mut arbiter_note, 85, hint);
                     } else if self.last_assistant_rounds_only_survey(SURVEY_STALL_LIMIT) {
@@ -4305,10 +4313,13 @@ where
                     survey_countdown_injected = true;
                     let remaining = budget.saturating_sub(survey_count);
                     let open_items = self.tracker_open_item_count();
-                    let hint = format!(
-                        "[runtime] 侦察预算接近耗尽(已用 {survey_count}/{budget},剩 {remaining} 次)。\
-                         请优先用已确认证据收敛结论:把 `- [ ]` 待办闭环进 tracker(锚定证据),\
-                         或改变策略/询问用户方向。当前 tracker 未闭环 {open_items} 项。"
+                    let hint = runtime_note(
+                        "guard",
+                        &format!(
+                            "[runtime] 侦察预算接近耗尽(已用 {survey_count}/{budget},剩 {remaining} 次)。\
+                             请优先用已确认证据收敛结论:把 `- [ ]` 待办闭环进 tracker(锚定证据),\
+                             或明确未完成项后收尾。当前 tracker 未闭环 {open_items} 项。"
+                        ),
                     );
                     stage_note(&mut arbiter_note, 45, hint);
                 }
@@ -4396,10 +4407,13 @@ where
             if self.upgrade_pending.load(Ordering::SeqCst) {
                 if !upgrade_notice_injected {
                     upgrade_notice_injected = true;
-                    let notice = "[runtime] 热升级请求已收到：框架即将升级为新版本。\
-                        请立即收尾：总结当前任务的已有发现与进度（已实时落盘，\
-                        新进程将无缝恢复并继续），不要再发起新的工具调用。\
-                        若正在执行长任务，请把已完成/待办写入 NOTEBOOK <plan> 段。";
+                    let notice = runtime_note(
+                        "upgrade",
+                        "[runtime] 热升级请求已收到：框架即将升级为新版本。\
+                         请立即收尾：总结当前任务的已有发现与进度（已实时落盘，\
+                         新进程将无缝恢复并继续），不要再发起新的工具调用。\
+                         若正在执行长任务，请把已完成/待办写入 NOTEBOOK <plan> 段。",
+                    );
                     let _ = self
                         .session
                         .push_message(ConversationMessage::user_text(notice));
@@ -4980,30 +4994,6 @@ where
                 .push_message(assistant_message.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
-            // P1 批5(收敛催缴冷却):模型本轮文本若含格式合法【收敛声明】
-            // (无论 claimed_complete true/false — false 表示"仍需继续/需用户
-            // 裁决",同样应视为已响应催缴),置位 acknowledged,soft1/soft2
-            // 不再重复注入。复用 parse 的宽松语义,与 break 前校验段一致。
-            if crate::convergence::convergence_enabled() && !convergence_acknowledged {
-                if let Some(last_assistant) = assistant_messages.last() {
-                    let text: String = last_assistant
-                        .blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if crate::convergence::parse_convergence_declaration(&text).is_some() {
-                        convergence_acknowledged = true;
-                        self.emit_diag(
-                            "[diag] convergence: declaration acknowledged, cooling soft-threshold prompts"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
 
             if pending_tool_uses.is_empty() {
                 // P3:完成声明校验 — 四条件严格 gating + 30s 超时
@@ -5060,91 +5050,6 @@ where
                             }
                         }
                     }
-                }
-                // 收敛契约 P1(§5.1 窄版,方案 A 事件驱动):模型无工具调用将
-                // 收尾时(此处 break 前),若本 turn 已注入过收敛提示,解析其
-                // 文本中的【收敛声明】。校验规则:
-                // - 未按格式声明(parse None)→ 静默放行(不强制,宽松原则);
-                // - claimed_complete && can_stop → evidence 校验:Verified 则
-                //   正常 break 收尾;Missing/Unverifiable → 打回注入
-                //   (上限 2 次,防死循环,超限放行交成本护栏);
-                // - claimed_complete=false 或 can_stop=false → 正常 break
-                //   (模型声明未完成/需用户裁决,不强停)。
-                if crate::convergence::convergence_enabled()
-                    && (convergence_soft1_injected || convergence_soft2_injected)
-                {
-                    let llm_text_full: String = assistant_messages
-                        .iter()
-                        .flat_map(|msg| msg.blocks.iter())
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if let Some(decl) =
-                        crate::convergence::parse_convergence_declaration(&llm_text_full)
-                    {
-                        if decl.claimed_complete && decl.can_stop {
-                            let mut available: Vec<crate::convergence::SignalKind> = Vec::new();
-                            for msg in &tool_results {
-                                for blk in &msg.blocks {
-                                    if let ContentBlock::ToolResult {
-                                        tool_use_id: _,
-                                        tool_name,
-                                        is_error,
-                                        output,
-                                    } = blk
-                                    {
-                                        let outcome = crate::convergence::ToolOutcome {
-                                            tool_name: tool_name.as_str(),
-                                            is_error: *is_error,
-                                            output: output.as_str(),
-                                        };
-                                        for kind in crate::convergence::project_one(outcome) {
-                                            if !available.contains(&kind) {
-                                                available.push(kind);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            match crate::convergence::validate_evidence(&decl, &available) {
-                                crate::convergence::EvidenceVerdict::Verified => {
-                                    self.emit_diag(
-                                        "[diag] convergence: declaration verified, stopping"
-                                            .to_string(),
-                                    );
-                                }
-                                _ if convergence_punchbacks
-                                    < crate::convergence::CONVERGENCE_MAX_PUNCHBACKS =>
-                                {
-                                    convergence_punchbacks += 1;
-                                    let hint = crate::convergence::render_missing_hint(&decl);
-                                    let _ = self
-                                        .session
-                                        .push_message(ConversationMessage::user_text(hint));
-                                    // 打回后不 break:置标志,循环回到顶部重新请求,
-                                    // 模型下轮看到 hint 后修正 evidence 或如实改 claimed_complete=false。
-                                    convergence_should_continue = true;
-                                }
-                                _ => {
-                                    // 超打回上限:放行,交既有成本护栏兜底。
-                                    self.emit_diag(
-                                        "[diag] convergence: punchback limit reached, letting through"
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                if convergence_should_continue {
-                    // 打回已注入:回到 loop 顶部重新请求,让模型下轮看到 hint
-                    // 后修正 evidence 或如实改 claimed_complete=false。标志每轮
-                    // 只消费一次(重置),防止 Verified 后仍被旧标志带偏。
-                    convergence_should_continue = false;
-                    continue;
                 }
                 break;
             }
@@ -5869,9 +5774,9 @@ where
                 tool_results.push(result_message);
             }
 
-            // 收敛停滞判定(c):本批是否产生任何进度信号。写文件/测试通过
-            // 都是"任务在推进"的客观证据 —— 此时不该催收尾。全部无信号才累加,
-            // 一旦有进展立即清零,回到"按 token 量催缴"的保守侧。
+            // 收敛停滞判定:本批是否产生任何进度信号。写文件/测试通过都是
+            // "任务在推进"的客观证据 —— 此时不该催收尾。全部无信号才累加,
+            // 一旦有进展立即清零。
             {
                 let mut produced_signal = false;
                 for msg in &tool_results[batch_start..] {
@@ -5883,12 +5788,6 @@ where
                             ..
                         } = blk
                         {
-                            // 有 ToolResult ⇒ 本 turn 确实调过工具。
-                            turn_called_tools = true;
-                            // 出现任何非侦察类工具 ⇒ 本 turn 不再是"纯只读侦察"。
-                            if !SURVEY_TOOLS.contains(&tool_name.as_str()) {
-                                turn_survey_only = false;
-                            }
                             let outcome = crate::convergence::ToolOutcome {
                                 tool_name: tool_name.as_str(),
                                 is_error: *is_error,
@@ -5916,118 +5815,30 @@ where
                 && self.sufficiency_contract.is_declared()
                 && self.sufficiency_contract.is_contract_satisfied()
             {
-                // 站7:仅 stage 成功才置 fire-once 标志 —— 被更高优先级
-                // (成本警示 80 / 收敛 70+)抢占时回滚,下轮空槽仍有机会注入,
-                // 修复"占槽一次即永久丢失"缺陷。
-                let hint = "[runtime] 已声明的充分性判据已满足(声明源均已读取),请基于现有信息直接作答,不要再发起新的只读侦察。";
-                if stage_note(&mut arbiter_note, 55, hint.to_string()) {
+                // 仅 stage 成功才置 fire-once 标志 —— 被更高优先级注记抢占时
+                // 回滚,下轮空槽仍有机会注入,避免"占槽一次即永久丢失"。
+                let hint = runtime_note(
+                    "sufficiency",
+                    "[runtime] 已声明的充分性判据已满足(声明源均已读取),请基于现有信息直接作答,不要再发起新的只读侦察。",
+                );
+                if stage_note(&mut arbiter_note, 55, hint) {
                     sufficiency_notice_injected = true;
                 }
             }
 
-            // P2(成本反馈注记 · Task 5):本迭代工具批处理结束 → 评估成本累计,
-            // 默认把成本提示/警示写进 diag/面板(不进模型上下文)。频率上限在
-            // meter 内部(普通提示每 ~5 次工具调用一条、警示每 ~10K output
-            // 一条),防止注记本身刷屏变成新的成本。
+            // P2(成本反馈注记 · Task 5):本迭代工具批处理结束 → 评估成本累计。
+            // 成本提示/警示**始终只写 diag/面板**,永不进模型上下文(P0-3):
+            // 它不携带任务信息,注入只会牵引注意力、诱发提前收口。频率上限
+            // 仍在 meter 内部生效(普通提示每 ~5 次工具调用、警示每 ~10K
+            // output 一条),防止注记本身刷屏变成新的成本。
             // 阈值复用 turn 开头读取的 `cost_warn_threshold`(见 run_turn 入口)。
             if let Some(note) = self.cost_meter.poll_note(cost_warn_threshold) {
-                if note.contains("成本警示") {
-                    // 2026-10-26:成本警示默认不再注入模型 —— 它同样属于
-                    // “中途催收尾”,实证会把任务拽向提前收口。只进 diag/面板;
-                    // `CLAW_CONVERGENCE_NAG=1` 可回滚旧的「成本+收敛声明」合并注记。
-                    if crate::convergence::convergence_nag_enabled() {
-                        let note = if crate::convergence::convergence_enabled()
-                            && turn_tier != TriageTier::Trivial
-                            && !convergence_acknowledged
-                            && !convergence_soft1_injected
-                        {
-                            convergence_soft1_injected = true;
-                            warn_merged_this_iter = true;
-                            crate::convergence::merged_cost_warning(&note)
-                        } else {
-                            note
-                        };
-                        stage_note(&mut arbiter_note, 80, note);
-                    } else {
-                        self.emit_diag(format!("[diag] cost_warn {note}"));
-                    }
+                let tag = if note.contains("成本警示") {
+                    "cost_warn"
                 } else {
-                    // 普通提示(≥5K):改走面板/日志(diag_callback),不进模型
-                    // 上下文 —— 成本反馈对任务零信息量,注入只会牵引注意力、
-                    // 与收敛契约抢仲裁槽。频率上限(每 ~5 次工具调用一条)与
-                    // 注记位点更新仍在 meter 内生效,不产生新开销。
-                    self.emit_diag(format!("[diag] cost_hint {note}"));
-                }
-            }
-
-            // 收敛契约 P1(§5.1 窄版,方案 A):软阈值门控注入【收敛声明】提示。
-            // 2026-10-26 默认**停用**“中途催收尾”:实证模型会把该注入当成用户
-            // 意图而中途停下反问。保留实现供回滚,`CLAW_CONVERGENCE_NAG=1` 启用。
-            if crate::convergence::convergence_nag_enabled()
-                && crate::convergence::convergence_enabled()
-                && turn_tier != TriageTier::Trivial
-            {
-                let turn_output = self.cost_meter.turn_output_tokens();
-                // 批5:acknowledged(模型已输出合法声明)后不再重复催缴 ——
-                // 消除"催缴 → 重复输出声明段 → 再催缴"微循环。false 声明
-                // (仍需继续/需用户裁决)同样视为已响应,不注入 soft2。
-                // 新增第二道门:除 token 量级外还需连续无进度信号 —— 正在
-                // 产出文件/测试通过的长任务不催收尾(见 CONVERGENCE_MIN_STAGNANT_ITERS)。
-                let convergence_stalled = convergence_stagnant_iters
-                    >= crate::convergence::CONVERGENCE_MIN_STAGNANT_ITERS;
-                // 按「本 turn 是否只读侦察轮」选软阈值对:干活轮用 15K/25K,
-                // 纯侦察轮(只调 read_file/grep_search/glob_search)用 40K/60K
-                // (见 convergence::soft_thresholds)。侦察轮天然烧 token 却不
-                // 落盘,用干活轮的阈值判它停滞在语义上不成立。
-                // 纯推理轮(一次工具都没调)不算侦察轮 —— 保留原按量催缴护栏。
-                let readonly_turn = turn_called_tools && turn_survey_only;
-                let (soft1_output, soft2_output) =
-                    crate::convergence::soft_thresholds(readonly_turn);
-                if !convergence_acknowledged
-                    && !convergence_soft1_injected
-                    && convergence_stalled
-                    && turn_output >= soft1_output
-                {
-                    // 站7:仅 stage 成功才置 fire-once 标志 —— 修复 soft1(70)
-                    // 被更高优先级(如成本警示 80)抢占后 `claimed` 已置位、
-                    // 后续轮次永不注入的缺陷。抢占时回滚,下轮空槽再试。
-                    let hint = crate::convergence::convergence_prompt_text(true);
-                    let staged = stage_note(&mut arbiter_note, 70, hint);
-                    // 埋点:契约"帮忙还是添乱"只能靠日志判定 —— 记录注入时刻的
-                    // 迭代号/输出量/阈值/是否只读轮,回看时可与后续 `tool_start
-                    // iter=N` 对齐,数出"催缴后还跑了几轮才收尾"。
-                    // 抢占同样记录:soft1 被更高优先级注记挤掉说明仲裁在杀收敛,
-                    // 这种"该催没催"与"乱催"一样是判断契约有效性的证据。
-                    self.emit_diag(format!(
-                        "[diag] convergence: soft1 {} iter={iterations} output={turn_output} \
-                         threshold={soft1_output} readonly={readonly_turn}",
-                        if staged { "injected" } else { "preempted" }
-                    ));
-                    if staged {
-                        convergence_soft1_injected = true;
-                    }
-                } else if !convergence_acknowledged
-                    && convergence_soft1_injected
-                    && !convergence_soft2_injected
-                    && !warn_merged_this_iter
-                    && convergence_stalled
-                    && turn_output >= soft2_output
-                {
-                    // 站7:同轮内 merged warn 已表达收敛要求(soft1 语义注入),
-                    // soft2 让位下一迭代 —— 避免"输出跳变至 25K+"时同轮连发
-                    // merged warn(80)与 soft2(90,文案言"已多次提示"但模型其实
-                    // 一条都没见过)两条收敛注记,破坏渐进语义。
-                    let hint = crate::convergence::convergence_prompt_text(false);
-                    let staged = stage_note(&mut arbiter_note, 90, hint);
-                    self.emit_diag(format!(
-                        "[diag] convergence: soft2 {} iter={iterations} output={turn_output} \
-                         threshold={soft2_output} readonly={readonly_turn}",
-                        if staged { "injected" } else { "preempted" }
-                    ));
-                    if staged {
-                        convergence_soft2_injected = true;
-                    }
-                }
+                    "cost_hint"
+                };
+                self.emit_diag(format!("[diag] {tag} {note}"));
             }
 
             // 阶段 2b:分支重试成功 → 跳出主循环,让 turn 正常收尾。
@@ -10769,9 +10580,9 @@ mod tests {
         drop_value_outside_async_ctx, extract_file_path_from_tool_input, is_repetition_warning,
         microcompact_preserve_recent, parse_auto_compaction_threshold,
         parse_auto_compaction_threshold_opt, process_tool_uses, rewrite_path_to_workspace_relative,
-        should_inject_time_soft, time_soft_warning, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind, RuntimeError,
-        StaticToolExecutor, SubagentContext, ToolExecutor,
+        runtime_note, should_inject_time_soft, time_soft_warning, ApiClient, ApiRequest,
+        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RequestKind,
+        RuntimeError, StaticToolExecutor, SubagentContext, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_ITERATIONS,
         MICROCOMPACT_PRESERVE_RECENT, RUNTIME_HINTS_HEADER, SESSION_SEARCH_TOOL_SPEC,
         SOFT_MAX_ITERATIONS, SURVEY_GUARD_THRESHOLD,
@@ -12817,7 +12628,23 @@ mod tests {
         let w = time_soft_warning(1234, 600);
         assert!(w.contains("1234"), "应含实际耗时: {w}");
         assert!(w.contains("600"), "应含阈值: {w}");
-        assert!(w.contains("轮次"), "应点明收敛不应仅看轮次: {w}");
+        assert!(
+            w.contains("空转") && w.contains("进度"),
+            "应点明耗时须结合进度自判: {w}"
+        );
+        assert!(!w.contains("询问用户"), "不得引导模型停下来询问用户: {w}");
+    }
+
+    /// P0-1:运行时注记必须带来源/类型封套,模型才能把它与真实用户输入区分。
+    #[test]
+    fn runtime_note_wraps_source_and_kind() {
+        let note = runtime_note("progress", "[runtime] 已运行 64 轮");
+        assert!(
+            note.starts_with("<runtime-note source=\"runtime\" kind=\"progress\">"),
+            "封套缺失或格式漂移: {note}"
+        );
+        assert!(note.contains("[runtime] 已运行 64 轮"), "正文丢失: {note}");
+        assert!(note.ends_with("</runtime-note>"), "封套未闭合: {note}");
     }
 
     #[test]
@@ -12890,458 +12717,6 @@ mod tests {
         assert_eq!(
             warning_count, 1,
             "第 {SOFT_MAX_ITERATIONS} 轮应恰好注入一次收敛警告,实际 {warning_count} 次"
-        );
-    }
-
-    /// 批5(收敛催缴冷却)回归:模型输出格式合法【收敛声明】(claimed_complete=false,
-    /// 仍需继续调查)后,soft1/soft2 不再重复催缴 —— 消除"催缴 → 被迫重复输出
-    /// 声明段 → output 增长 → 再催缴"微循环(审计实证见 tracker)。
-    #[test]
-    fn convergence_declaration_acknowledged_suppresses_soft2_prompt() {
-        // mock:迭代1 达 soft1(15K);迭代2 再 10K(累计 25K ≥ soft2 阈值)且输出
-        // 合法 false 声明 + 继续调工具(改前:soft2 在此重复催缴);迭代3 收尾。
-        struct DeclApi {
-            calls: usize,
-        }
-
-        impl ApiClient for DeclApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                self.calls += 1;
-                Ok(match self.calls {
-                    // 迭代1:15K output(触发 soft1 注入)+ 一次工具调用。
-                    1 => vec![
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 0,
-                            output_tokens: 15_000,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: 0,
-                        }),
-                        AssistantEvent::TextDelta("starting investigation".to_string()),
-                        AssistantEvent::ToolUse {
-                            id: "d-1".to_string(),
-                            name: "echo".to_string(),
-                            input: "probe-1".to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ],
-                    // 迭代2:累计 25K ≥ soft2,输出合法 false 声明并继续调工具。
-                    2 => vec![
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 0,
-                            output_tokens: 10_000,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: 0,
-                        }),
-                        AssistantEvent::TextDelta(
-                            "[收敛声明]\ngoal: 调查进行中\nclaimed_complete: false\n\
-                             evidence: 尚无结论\ntodos:\n- 继续侦察\ncan_stop: false\n"
-                                .to_string(),
-                        ),
-                        AssistantEvent::ToolUse {
-                            id: "d-2".to_string(),
-                            name: "echo".to_string(),
-                            input: "probe-2".to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ],
-                    // 迭代3:收尾作答(无工具 → turn 结束)。
-                    _ => vec![
-                        AssistantEvent::TextDelta("wrapping up the investigation".to_string()),
-                        AssistantEvent::MessageStop,
-                    ],
-                })
-            }
-        }
-
-        // env 隔离:抬高成本警示阈值(soft2=25K 天然越过默认 20K 警示线,
-        // 警示文本含"收敛"字样会污染断言),持共享锁与并行测试互斥。
-        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
-        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
-        std::env::set_var(
-            crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
-            "100000000",
-        );
-        // 显式启用收敛契约:本测试验证 soft1/soft2 与 acknowledged 的交互,前提
-        // 是收敛开着。不 pin 该 env 会被**外部环境**污染 —— `.claw.json` 的
-        // `env` 块注入进程后,claw 派生的 `cargo test` 子进程会继承
-        // `CLAW_CONVERGENCE_P1=0`,于是收敛被静默关闭、注入 0 条提示而失败
-        // (实测:基线 stash 后同样失败,去掉该 env 即通过)。
-        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
-        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
-        // 2026-10-26:中途催缴默认停用;本测试验证的是回滚路径(P1 旧行为)。
-        let saved_nag_env = std::env::var("CLAW_CONVERGENCE_NAG").ok();
-        std::env::set_var("CLAW_CONVERGENCE_NAG", "1");
-
-        let diag_log: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let diag_captured = diag_log.clone();
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            DeclApi { calls: 0 },
-            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_diag_callback(Box::new(move |msg| {
-            diag_captured.lock().expect("diag lock").push(msg);
-        }));
-
-        runtime
-            .run_turn("请调查该问题并给出结论", None)
-            .expect("turn should succeed");
-
-        match saved_warn_env {
-            Some(value) => {
-                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
-            }
-            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
-        }
-        match saved_convergence_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
-        }
-        match saved_nag_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_NAG", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_NAG"),
-        }
-
-        // then:收敛提示(user 注入的催缴模板)全程恰好 1 条 —— 模型声明后 soft2 被冷却。
-        let prompt_count = runtime
-            .session
-            .messages
-            .iter()
-            .filter(|m| {
-                matches!(m.role, MessageRole::User)
-                    && m.blocks
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("收敛")))
-            })
-            .count();
-        assert_eq!(
-            prompt_count, 1,
-            "模型输出合法声明后 soft2 不应重复催缴,实际注入 {prompt_count} 条收敛提示"
-        );
-
-        // acknowledged 置位由 diag 记录佐证(模型自身的 false 声明在 assistant 消息,
-        // 不计入上方 user 提示计数)。
-        let ack = diag_log
-            .lock()
-            .expect("diag lock")
-            .iter()
-            .any(|m| m.contains("convergence: declaration acknowledged"));
-        assert!(
-            ack,
-            "acknowledged 置位应通过 diag 记录,实际日志: {diag_log:?}"
-        );
-    }
-
-    /// (c) 直证:高 token 但**持续产生进度信号**的 turn 不应被催缴收尾。
-    ///
-    /// 这是「用任务进度而非 token 燃量触发收敛」的核心行为。改前:只要
-    /// output ≥ 15K 就注 soft1,不论模型是否正在写文件推进任务。改后:本批有
-    /// file_produced 信号即清零停滞计数 ⇒ soft1 门控的 `convergence_stalled`
-    /// 不成立 ⇒ 0 条催缴。
-    #[test]
-    fn high_output_with_progress_signals_is_not_nagged_to_converge() {
-        struct ProgressApi {
-            calls: usize,
-        }
-
-        impl ApiClient for ProgressApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                self.calls += 1;
-                Ok(match self.calls {
-                    // 迭代1/2:各 16K output(累计 32K,已越过 soft1=15K 与
-                    // soft2=25K),但每次都在成功写文件 = 任务确实在推进。
-                    1 | 2 => vec![
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 0,
-                            output_tokens: 16_000,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: 0,
-                        }),
-                        AssistantEvent::TextDelta("writing the fix".to_string()),
-                        AssistantEvent::ToolUse {
-                            id: format!("w-{}", self.calls),
-                            name: "write_file".to_string(),
-                            input: "src/lib.rs".to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ],
-                    // 迭代3:收尾(无工具 → turn 结束)。
-                    _ => vec![
-                        AssistantEvent::TextDelta("done".to_string()),
-                        AssistantEvent::MessageStop,
-                    ],
-                })
-            }
-        }
-
-        // env 隔离:抬高成本警示阈值,避免 [runtime] 成本注记污染计数;并显式
-        // 启用收敛契约 —— 外部 `CLAW_CONVERGENCE_P1=0` 会被子进程继承。
-        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
-        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
-        std::env::set_var(
-            crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
-            "100000000",
-        );
-        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
-        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            ProgressApi { calls: 0 },
-            StaticToolExecutor::new().register("write_file", |input| Ok(input.to_string())),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        );
-
-        runtime
-            .run_turn("重构该模块", None)
-            .expect("turn should succeed");
-
-        match saved_warn_env {
-            Some(value) => {
-                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
-            }
-            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
-        }
-        match saved_convergence_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
-        }
-
-        // then:累计 output 32K 却全程在产出文件 → 不应收到任何收敛催缴。
-        let prompt_count = runtime
-            .session
-            .messages
-            .iter()
-            .filter(|m| {
-                matches!(m.role, MessageRole::User)
-                    && m.blocks.iter().any(
-                        |b| matches!(b, ContentBlock::Text { text } if text.contains("收敛声明")),
-                    )
-            })
-            .count();
-        assert_eq!(
-            prompt_count, 0,
-            "有进度信号时不应催缴收尾,实际注入 {prompt_count} 条"
-        );
-    }
-
-    /// 只读侦察轮直证:全程只调 `read_file`(从不落盘)、累计 output 已越过
-    /// 旧的 15K/25K,但未越过放宽后的 40K ⇒ 不应被催缴收尾。
-    ///
-    /// 这是方案 C 的核心行为:`project_one` 只把「写文件 / 测试通过」当作进度,
-    /// 纯读取必然被判为停滞。若沿用干活轮的 15K 阈值,这种轮次会被催收尾。
-    #[test]
-    fn readonly_reconnaissance_turn_is_not_nagged_at_legacy_threshold() {
-        struct ReadOnlyApi {
-            calls: usize,
-        }
-
-        impl ApiClient for ReadOnlyApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                self.calls += 1;
-                Ok(match self.calls {
-                    // 迭代1/2:各 16K output(累计 32K —— 已越过旧 soft1=15K
-                    // 与旧 soft2=25K),但只做读取,不产生任何进度信号。
-                    1 | 2 => vec![
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 0,
-                            output_tokens: 16_000,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: 0,
-                        }),
-                        AssistantEvent::TextDelta("inspecting".to_string()),
-                        AssistantEvent::ToolUse {
-                            id: format!("r-{}", self.calls),
-                            name: "read_file".to_string(),
-                            input: "src/lib.rs".to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ],
-                    // 迭代3:收尾(无工具 → turn 结束)。
-                    _ => vec![
-                        AssistantEvent::TextDelta("done".to_string()),
-                        AssistantEvent::MessageStop,
-                    ],
-                })
-            }
-        }
-
-        // env 隔离:启用收敛契约(否则本测试在 P1=0 下退化为空测试),并抬高
-        // 成本警示阈值避免 [runtime] 注记污染计数。
-        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
-        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
-        std::env::set_var(
-            crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
-            "100000000",
-        );
-        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
-        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            ReadOnlyApi { calls: 0 },
-            StaticToolExecutor::new().register("read_file", |input| Ok(input.to_string())),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        );
-
-        runtime
-            .run_turn("调查这个模块", None)
-            .expect("turn should succeed");
-
-        match saved_warn_env {
-            Some(value) => {
-                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
-            }
-            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
-        }
-        match saved_convergence_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
-        }
-
-        // then:累计 32K 全只读 → 落在只读轮阈值(40K)之内,不应被催缴。
-        let prompt_count = runtime
-            .session
-            .messages
-            .iter()
-            .filter(|m| {
-                matches!(m.role, MessageRole::User)
-                    && m.blocks.iter().any(
-                        |b| matches!(b, ContentBlock::Text { text } if text.contains("收敛声明")),
-                    )
-            })
-            .count();
-        assert_eq!(
-            prompt_count, 0,
-            "只读侦察轮越过旧 15K/25K 但未越过放宽阈值时不应催缴,实际注入 {prompt_count} 条"
-        );
-    }
-
-    /// 埋点回归:soft1 注入必须留下可判定的 diag 记录。
-    ///
-    /// 为什么需要:收敛契约已默认开启(P1 未设即开),但触发时若零埋点,
-    /// "契约是帮忙还是添乱"只能靠猜 —— 无法回答"本次 turn 催了几次、
-    /// 催在多少 token、催完又跑了几轮才收尾"。本测试锁住日志契约:
-    /// tag 形如 `convergence: soft1 injected iter=… output=… threshold=…
-    /// readonly=…`,四要素缺一不可,回看时才能与 `tool_start iter=N` 对齐。
-    #[test]
-    fn convergence_soft1_emits_auditable_diag_record() {
-        struct ProbeApi {
-            calls: usize,
-        }
-
-        impl ApiClient for ProbeApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                self.calls += 1;
-                Ok(match self.calls {
-                    // 迭代1:16K output 越过干活轮 soft1=15K。用 `echo` 而非
-                    // read_file —— 侦察类工具会把只读轮阈值放宽到 40K,于是
-                    // 本 turn 拿的是 readonly=false 的 15K,**正是干活轮场景**。
-                    1 => vec![
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 0,
-                            output_tokens: 16_000,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: 0,
-                        }),
-                        AssistantEvent::TextDelta("investigating".to_string()),
-                        AssistantEvent::ToolUse {
-                            id: "p-1".to_string(),
-                            name: "echo".to_string(),
-                            input: "probe".to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ],
-                    _ => vec![
-                        AssistantEvent::TextDelta("done".to_string()),
-                        AssistantEvent::MessageStop,
-                    ],
-                })
-            }
-        }
-
-        // env 隔离:契约必须开着(否则整测退化为空测);成本警示阈值抬高,
-        // 避免 [runtime] 警示注记以更高优先权抢占 soft1 注记槽。
-        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
-        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
-        std::env::set_var(
-            crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV,
-            "100000000",
-        );
-        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
-        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
-        // 2026-10-26:中途催缴默认停用;本测试验证回滚路径的埋点契约。
-        let saved_nag_env = std::env::var("CLAW_CONVERGENCE_NAG").ok();
-        std::env::set_var("CLAW_CONVERGENCE_NAG", "1");
-
-        let diag_log: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let diag_captured = diag_log.clone();
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            ProbeApi { calls: 0 },
-            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_diag_callback(Box::new(move |msg| {
-            diag_captured.lock().expect("diag lock").push(msg);
-        }));
-
-        runtime
-            .run_turn("调查这个模块", None)
-            .expect("turn should succeed");
-
-        match saved_warn_env {
-            Some(value) => {
-                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
-            }
-            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
-        }
-        match saved_convergence_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
-        }
-        match saved_nag_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_NAG", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_NAG"),
-        }
-
-        let log = diag_log.lock().expect("diag lock");
-        let soft1 = log
-            .iter()
-            .find(|m| m.contains("convergence: soft1 injected"))
-            .unwrap_or_else(|| {
-                panic!("soft1 注入应留下 diag 记录,便于回看判定契约有效性,实际日志: {log:?}")
-            });
-        // 四要素齐备 = 记录可审计:何时(iter)、多贵(output)、按哪个阈值
-        // (threshold)、走的哪档语义(readonly) —— 缺任一项都无法复算"该不该催"。
-        for field in ["iter=", "output=", "threshold=", "readonly=false"] {
-            assert!(
-                soft1.contains(field),
-                "soft1 diag 记录缺少 {field} 字段,记录={soft1}"
-            );
-        }
-        assert!(
-            soft1.contains("output=16000") && soft1.contains("threshold=15000"),
-            "干活轮应按 15K 阈值触发并记录真实输出量,记录={soft1}"
         );
     }
 
@@ -14289,12 +13664,12 @@ mod tests {
         );
     }
 
-    // ===== P2 成本反馈注记(Task 5):成本提示/警示注入 =====
+    // ===== P2 成本反馈注记(Task 5):成本提示/警示仅写 diag =====
 
-    /// 成本反馈集成(2026-09,Task 5):脚本化 API 逐步返回大 usage(15K →
-    /// 累计 25K)→ 第一轮工具批处理后注入「成本提示」(output 15K ≥ 5K),
-    /// 第二轮工具批处理后注入升级「成本警示」(累计 25K ≥ 20K 阈值)。
-    /// 注记作为 [runtime] user 消息,下一次请求构造对模型可见。
+    /// 成本反馈集成(2026-09,Task 5;P0-3 加严):脚本化 API 逐步返回大
+    /// usage(15K → 累计 25K)。成本提示与警示**都只进 diag/面板**,任何
+    /// 请求的模型上下文都不得出现成本注记 —— 成本信息对任务零信息量,
+    /// 注入只会牵引注意力并诱发提前收口。
     #[test]
     fn cost_meter_injects_hint_then_warning_for_large_usage() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14315,7 +13690,7 @@ mod tests {
                     .push(request.messages.clone());
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 match n {
-                    // 迭代 1:15K output + 一次读(批处理后应注入成本提示)。
+                    // 迭代 1:15K output + 一次读(批处理后应记录成本提示)。
                     0 => Ok(vec![
                         AssistantEvent::Usage(TokenUsage {
                             input_tokens: 0,
@@ -14331,7 +13706,7 @@ mod tests {
                         },
                         AssistantEvent::MessageStop,
                     ]),
-                    // 迭代 2:再 10K output(累计 25K ≥ 20K)→ 注入成本警示。
+                    // 迭代 2:再 10K output(累计 25K ≥ 20K)→ 记录成本警示。
                     1 => Ok(vec![
                         AssistantEvent::Usage(TokenUsage {
                             input_tokens: 0,
@@ -14361,15 +13736,6 @@ mod tests {
         let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
         let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
         std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV);
-        // F1 仲裁隔离:本测试意图验证**纯成本通道**(提示→警示逐轮注入)。
-        // 收敛契约 soft1(15K,pri 70)会压过成本提示(50),使断言失败 ——
-        // 这是 F1 单动作原则的预期行为,故禁用收敛,让成本通道独占验证。
-        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
-        std::env::set_var("CLAW_CONVERGENCE_P1", "0");
-        // 2026-10-26:成本警示默认随中途催缴一起停用;本测试验证该通道本身,
-        // 显式启用(收敛仍由上面的 P1=0 隔离,保证走纯成本分支)。
-        let saved_nag_env = std::env::var("CLAW_CONVERGENCE_NAG").ok();
-        std::env::set_var("CLAW_CONVERGENCE_NAG", "1");
 
         let diag_log: Arc<Mutex<Vec<String>>> = diag_captured.clone();
         let mut runtime = ConversationRuntime::new(
@@ -14397,19 +13763,11 @@ mod tests {
             }
             None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
         }
-        match saved_convergence_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
-        }
-        match saved_nag_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_NAG", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_NAG"),
-        }
 
         let requests = captured.lock().expect("lock");
         assert!(requests.len() >= 3, "至少 3 次请求, got {}", requests.len());
 
-        // 文本统计辅助:某次请求中文本块含子串的 user/assistant 消息数。
+        // 文本统计辅助:某次请求中文本块含子串的消息数。
         let count_text_msgs = |msgs: &[ConversationMessage], needle: &str| -> usize {
             msgs.iter()
                 .filter(|m| {
@@ -14421,21 +13779,15 @@ mod tests {
                 .count()
         };
 
-        let last = requests.last().expect("at least one request");
-        // 普通提示(≥5K)已改走 diag 面板/日志通道,不进模型上下文 ——
-        // user 消息中不得再出现成本提示(成本反馈对任务零信息量)。
-        assert_eq!(
-            count_text_msgs(last, "成本提示"),
-            0,
-            "成本提示应走 diag 通道而非 user 消息, got: {last:?}"
-        );
-        // 升级警示(累计 25K ≥ 20K)仍注入 user 消息 —— 强收口防线。
-        assert_eq!(
-            count_text_msgs(last, "成本警示:本 turn output 已超 25000 tokens"),
-            1,
-            "累计 25K ≥ 20K 阈值应注入成本警示, got: {last:?}"
-        );
-        // diag 面板应收到普通成本提示(带实际 output 数)。
+        // 成本注记(提示与警示)在**任何**请求中都不得进入模型上下文。
+        for (idx, req) in requests.iter().enumerate() {
+            assert_eq!(
+                count_text_msgs(req, "成本提示") + count_text_msgs(req, "成本警示"),
+                0,
+                "成本注记应只走 diag 通道,第 {idx} 次请求却包含成本文本: {req:?}"
+            );
+        }
+        // diag 面板应收到普通提示与升级警示(带实际 output 数)。
         let diags = diag_captured.lock().expect("lock");
         assert!(
             diags
@@ -14443,158 +13795,11 @@ mod tests {
                 .any(|d| d.contains("cost_hint") && d.contains("~15000 tokens")),
             "普通成本提示应出现在 diag 通道, got: {diags:?}"
         );
-        // 警示携带收敛指令。
         assert!(
-            count_text_msgs(last, "建议立即收敛") >= 1,
-            "警示应携带收敛引导, got: {last:?}"
-        );
-        // 首次请求(尚未有任何工具批处理结束)不应出现成本注记。
-        assert_eq!(
-            count_text_msgs(&requests[0], "成本提示") + count_text_msgs(&requests[0], "成本警示"),
-            0,
-            "首轮请求构造前不应有成本注记"
-        );
-    }
-
-    /// 站7:成本警示 × 收敛契约合并去重 —— 输出跳变场景(一次迭代 output
-    /// 直达 30K,soft1(15K) 从未独立触发)。要求:
-    /// - 成本警示升格为「成本 + 收敛声明」合并注记(一条同含两个职能);
-    /// - 同轮不再追加 soft2(90 文案"可校验的收敛声明"让位下一迭代),
-    ///   避免"输出跳变后同轮连发两条收敛注记、且 soft2 言'已多次提示'
-    ///   而模型实际一条未见过"的失实渐进;
-    /// - 独立 soft1 文案("本 turn 输出已较高")不重复出现(被合并注记取代)。
-    #[test]
-    fn station7_cost_warning_merges_convergence_on_output_jump() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Mutex;
-
-        let captured = Arc::new(Mutex::new(Vec::<Vec<ConversationMessage>>::new()));
-        let diag_captured = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        struct JumpApi {
-            calls: AtomicUsize,
-            captured: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
-        }
-        impl ApiClient for JumpApi {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                self.captured
-                    .lock()
-                    .expect("lock")
-                    .push(request.messages.clone());
-                let n = self.calls.fetch_add(1, Ordering::SeqCst);
-                match n {
-                    // 迭代 1:单次 30K output(跳变越过 soft1=15K)→ 应触发合并警示。
-                    0 => Ok(vec![
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 0,
-                            output_tokens: 30_000,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: 0,
-                        }),
-                        AssistantEvent::TextDelta("先读取材料。".to_string()),
-                        AssistantEvent::ToolUse {
-                            id: "j-a".to_string(),
-                            name: "read_file".to_string(),
-                            input: r#"{"file_path":"a.md"}"#.to_string(),
-                        },
-                        AssistantEvent::MessageStop,
-                    ]),
-                    // 迭代 2:收尾(无收敛声明,未 ack → 触发路径全走仲裁)。
-                    _ => Ok(vec![
-                        AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 0,
-                            output_tokens: 1_000,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: 0,
-                        }),
-                        AssistantEvent::TextDelta("已基于材料作答。".to_string()),
-                        AssistantEvent::MessageStop,
-                    ]),
-                }
-            }
-        }
-
-        let _env_guard = crate::cost_meter::COST_ENV_LOCK.lock().expect("env lock");
-        let saved_warn_env = std::env::var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV).ok();
-        std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV);
-        // 显式启用收敛契约,避免 CI 残留 env 停用之。
-        let saved_convergence_env = std::env::var("CLAW_CONVERGENCE_P1").ok();
-        std::env::set_var("CLAW_CONVERGENCE_P1", "1");
-        // 2026-10-26:中途催缴默认停用;合并注记属于回滚路径,显式启用。
-        let saved_nag_env = std::env::var("CLAW_CONVERGENCE_NAG").ok();
-        std::env::set_var("CLAW_CONVERGENCE_NAG", "1");
-
-        let diag_log: Arc<Mutex<Vec<String>>> = diag_captured.clone();
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            JumpApi {
-                calls: AtomicUsize::new(0),
-                captured: captured.clone(),
-            },
-            StaticToolExecutor::new().register("read_file", |_| Ok("材料内容".to_string())),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_diag_callback(Box::new(move |msg| {
-            diag_log.lock().expect("diag lock").push(msg);
-        }));
-
-        runtime
-            .run_turn("请查证后回答", None)
-            .expect("turn should succeed");
-
-        match saved_warn_env {
-            Some(value) => {
-                std::env::set_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV, value)
-            }
-            None => std::env::remove_var(crate::cost_meter::COST_WARN_OUTPUT_THRESHOLD_ENV),
-        }
-        match saved_convergence_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_P1", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_P1"),
-        }
-        match saved_nag_env {
-            Some(value) => std::env::set_var("CLAW_CONVERGENCE_NAG", value),
-            None => std::env::remove_var("CLAW_CONVERGENCE_NAG"),
-        }
-
-        let requests = captured.lock().expect("lock");
-        assert!(requests.len() >= 2, "至少 2 次请求, got {}", requests.len());
-
-        let count_text_msgs = |msgs: &[ConversationMessage], needle: &str| -> usize {
-            msgs.iter()
-                .filter(|m| {
-                    m.blocks.iter().any(|b| match b {
-                        ContentBlock::Text { text } => text.contains(needle),
-                        _ => false,
-                    })
-                })
-                .count()
-        };
-
-        // 第二次请求(工具批处理后):同步含"成本警示"与"[收敛声明]"格式段
-        // —— 合并注记一条完成报成本+催收敛两个职能。
-        let second = &requests[1];
-        assert_eq!(
-            count_text_msgs(second, "[收敛声明]"),
-            1,
-            "jump 场景收敛要求应恰好一条(合并注记), got: {second:?}"
-        );
-        assert!(
-            count_text_msgs(second, "成本警示") >= 1,
-            "合并注记必须保留成本警示前缀, got: {second:?}"
-        );
-        // 同轮互斥:soft2(文案"可校验的收敛声明")让位下一迭代,不得与本轮
-        // 合并警示连发;独立 soft1("本 turn 输出已较高")也不再出现(被取代)。
-        assert_eq!(
-            count_text_msgs(second, "可校验的收敛声明"),
-            0,
-            "soft2 不应与合并警示同轮连发, got: {second:?}"
-        );
-        assert_eq!(
-            count_text_msgs(second, "本 turn 输出已较高"),
-            0,
-            "soft1 文案不应重复出现(合并注记已含其语义), got: {second:?}"
+            diags
+                .iter()
+                .any(|d| d.contains("cost_warn") && d.contains("25000 tokens")),
+            "累计 25K ≥ 20K 阈值应记录成本警示, got: {diags:?}"
         );
     }
 

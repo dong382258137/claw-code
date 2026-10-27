@@ -569,7 +569,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 启动最早期把 `.claw.json` 的 `env` 块应用到当前进程。
     //
     // 必须早于任何 `std::env::var` 读取的功能开关判定 —— 例如
-    // `convergence::convergence_enabled()` 读 `CLAW_CONVERGENCE_P1`。
+    // `parse_survey_budget` 读 `CLAW_SURVEY_BUDGET`。
     // 在此之前 `env` 块只被 MCP 子进程消费(`mcp_stdio::apply_env`),
     // 进程自身从不 set_var, 故该键在配置里是死键。
     // 外部真实环境变量优先(见 `RuntimeConfig::apply_env_to_process`)。

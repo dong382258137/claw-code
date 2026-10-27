@@ -594,7 +594,7 @@ impl RuntimeConfig {
     ///
     /// 背景:在此之前 `env` 块只被 MCP 子进程消费(`mcp_stdio::apply_env`),
     /// 进程自身从不 `set_var` —— 于是在 `.claw.json` 写
-    /// `env.CLAW_CONVERGENCE_P1 = "0"` 时,`convergence_enabled()` 读
+    /// `env.CLAW_SURVEY_BUDGET = "0"` 时,`survey_budget()` 读
     /// `std::env::var` 永远读不到,该键实际是死键。
     pub fn apply_env_to_process(&self) -> usize {
         let Some(env) = self.merged.get("env").and_then(JsonValue::as_object) else {
@@ -605,8 +605,8 @@ impl RuntimeConfig {
             // 显式 null ⇒ 「确保该变量不存在」。用于清除**上一进程注入、被本
             // 进程继承**的旧值 —— 热升级时新进程继承父进程全部环境,而下面的
             // "外部优先"规则会把继承值当成用户显式设置,于是删掉配置键也无法
-            // 让它失效(实测:`.claw.json` 删掉 `CLAW_CONVERGENCE_P1` 后,
-            // `convergence_enabled()` 仍读到继承来的 "0")。写 null 是唯一能
+            // 让它失效(实测:`.claw.json` 删掉 `CLAW_SURVEY_BUDGET` 后,
+            // `survey_budget()` 仍读到继承来的 "0")。写 null 是唯一能
             // 表达"要它不存在"的方式,且幂等,跨多次热升级自我维持。
             if matches!(value, JsonValue::Null) {
                 std::env::remove_var(key);
@@ -1962,8 +1962,8 @@ mod tests {
     /// null 值 ⇒ 「确保该变量不存在」。
     ///
     /// 场景是热升级:新进程继承旧进程环境,旧进程由配置注入的
-    /// `CLAW_CONVERGENCE_P1=0` 会被"外部优先"规则当成用户显式设置,于是
-    /// **删掉配置键也无效**。写 null 才能清掉它,使开关回到默认开启。
+    /// `CLAW_SURVEY_BUDGET=0` 会被"外部优先"规则当成用户显式设置,于是
+    /// **删掉配置键也无效**。写 null 才能清掉它,使开关回退默认值。
     #[test]
     fn apply_env_to_process_null_value_clears_inherited_var() {
         let _guard = config_env_lock();
