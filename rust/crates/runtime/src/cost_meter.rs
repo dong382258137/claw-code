@@ -133,6 +133,12 @@ impl CostMeter {
         self.warns_this_turn = 0;
     }
 
+    /// 当前 turn 累计 output tokens(只读;供效果埋点记录燃烧量)。
+    #[must_use]
+    pub fn turn_output_tokens(&self) -> u64 {
+        self.turn_output_tokens
+    }
+
     /// 工具批处理迭代末尾调用:决策 + 更新注记位点 + 渲染注记文本。
     ///
     /// 返回需要写入 diag/面板的 `[runtime]` 注记(至多一条);`None` = 本轮

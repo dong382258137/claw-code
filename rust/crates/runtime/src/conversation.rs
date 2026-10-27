@@ -3980,6 +3980,7 @@ where
                         &self.session.session_id,
                         &user_input,
                         class,
+                        crate::convergence::is_resume_intent(&user_input),
                     );
                 }
             }
@@ -4137,14 +4138,22 @@ where
         // 注记在工具批后触发时对下一迭代可见,循环顶触发时对本迭代可见。
         // `stage_note` 返回是否成功 —— 被高优先级压掉的 fire-once 注记
         // (充分性/进度播报)仅在成功时置位,下轮空槽仍有机会注入。
-        let mut arbiter_note: Option<(u8, String)> = None;
+        // P2(效果埋点):记录本 turn **实际 flush**(真正注入模型)的注记,
+        // 而非 stage 次数 —— 被覆盖的注记未进入上下文,不应计入效果。
+        let mut nag_stats = crate::convergence::TurnNagStats::default();
+        let mut arbiter_note: Option<(u8, crate::convergence::NagKind, String)> = None;
         /// stage 一条监管注记:槽位为空或本注记优先级更高时占槽并返回 `true`。
         /// 返回 `false` 表示被槽内更高优先级注记压掉(调用方应回滚 fire-once 标志)。
-        fn stage_note(arbiter: &mut Option<(u8, String)>, pri: u8, hint: String) -> bool {
+        fn stage_note(
+            arbiter: &mut Option<(u8, crate::convergence::NagKind, String)>,
+            pri: u8,
+            kind: crate::convergence::NagKind,
+            hint: String,
+        ) -> bool {
             match arbiter {
-                Some((cur, _)) if *cur >= pri => false,
+                Some((cur, _, _)) if *cur >= pri => false,
                 _ => {
-                    *arbiter = Some((pri, hint));
+                    *arbiter = Some((pri, kind, hint));
                     true
                 }
             }
@@ -4169,7 +4178,12 @@ where
                          已确认结论并明确未完成项,禁止用猜测补齐,也不要因此跳过必要验证。"
                     ),
                 );
-                if stage_note(&mut arbiter_note, 45, warning) {
+                if stage_note(
+                    &mut arbiter_note,
+                    45,
+                    crate::convergence::NagKind::Progress,
+                    warning,
+                ) {
                     iter_soft_injected = true;
                 }
             }
@@ -4188,7 +4202,12 @@ where
             if turn_stalled && should_inject_time_soft(time_soft_injected, elapsed_secs, time_soft)
             {
                 let warning = time_soft_warning(elapsed_secs, time_soft);
-                if stage_note(&mut arbiter_note, 45, warning) {
+                if stage_note(
+                    &mut arbiter_note,
+                    45,
+                    crate::convergence::NagKind::Progress,
+                    warning,
+                ) {
                     time_soft_injected = true;
                 }
             }
@@ -4241,7 +4260,12 @@ where
                              当前未闭环待办 {open_items} 项。"
                         ),
                     );
-                    stage_note(&mut arbiter_note, 60, hint);
+                    stage_note(
+                        &mut arbiter_note,
+                        60,
+                        crate::convergence::NagKind::Guard,
+                        hint,
+                    );
                 }
             }
 
@@ -4291,7 +4315,12 @@ where
                                  若后续仍持续只读侦察,本 turn 将被强制中止。"
                             ),
                         );
-                        stage_note(&mut arbiter_note, 85, hint);
+                        stage_note(
+                            &mut arbiter_note,
+                            85,
+                            crate::convergence::NagKind::Guard,
+                            hint,
+                        );
                     } else if self.last_assistant_rounds_only_survey(SURVEY_STALL_LIMIT) {
                         survey_stall_rounds += 1;
                         if survey_stall_rounds >= SURVEY_STALL_LIMIT {
@@ -4321,7 +4350,12 @@ where
                              或明确未完成项后收尾。当前 tracker 未闭环 {open_items} 项。"
                         ),
                     );
-                    stage_note(&mut arbiter_note, 45, hint);
+                    stage_note(
+                        &mut arbiter_note,
+                        45,
+                        crate::convergence::NagKind::Guard,
+                        hint,
+                    );
                 }
             }
 
@@ -4427,7 +4461,8 @@ where
             // 作为单条 user 消息注入(收敛控制回路单动作原则:每轮请求至多
             // 一条 [runtime] 注记,避免多类监管互搏)。staged 在循环顶的注记
             // 对本迭代可见(与改造前一致);工具批后 staged 的对下一迭代可见。
-            if let Some((_pri, note)) = arbiter_note.take() {
+            if let Some((_pri, kind, note)) = arbiter_note.take() {
+                nag_stats.record(kind, iterations);
                 let _ = self
                     .session
                     .push_message(ConversationMessage::user_text(note));
@@ -5821,7 +5856,12 @@ where
                     "sufficiency",
                     "[runtime] 已声明的充分性判据已满足(声明源均已读取),请基于现有信息直接作答,不要再发起新的只读侦察。",
                 );
-                if stage_note(&mut arbiter_note, 55, hint) {
+                if stage_note(
+                    &mut arbiter_note,
+                    55,
+                    crate::convergence::NagKind::Sufficiency,
+                    hint,
+                ) {
                     sufficiency_notice_injected = true;
                 }
             }
@@ -6026,6 +6066,21 @@ where
             auto_compaction,
         };
         self.record_turn_completed(&summary);
+
+        // P2(效果埋点):落盘本 turn 的注记注入统计 —— `iterations` 与
+        // `first_nag_iter` 之差即"注记注入后到收尾"的迭代距离,用于判断
+        // 催缴是促成了收尾还是只增加了噪音。非关键路径,失败静默。
+        if let Some(root) = &self.workspace_root {
+            if let Ok(sessions_dir) = crate::session::workspace_sessions_dir(root) {
+                let _ = crate::convergence::record_turn_stats(
+                    &sessions_dir,
+                    &self.session.session_id,
+                    summary.iterations,
+                    &nag_stats,
+                    self.cost_meter.turn_output_tokens(),
+                );
+            }
+        }
 
         // Task State 自动维护(episodic memory):turn 结束更新任务锚点并
         // 持久化到 `.claw/task_state.json`。不依赖 AI 主动调用 notebook_update,

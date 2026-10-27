@@ -263,6 +263,53 @@ pub fn classify_punchback(text: &str) -> PunchbackClass {
     PunchbackClass::None
 }
 
+/// 纯承接/推进词(精确匹配整条输入 → 视为「续接」而非新任务)。
+///
+/// P2(2026-10-27):`继续` 类输入此前只归入 ACK(None),无法量化"上一轮
+/// 收尾后用户被迫续做"的比例。`is_resume_intent` 单独识别它,作为
+/// 完成度不足的弱信号(与打回区分:续接是"没做完",打回是"做错了")。
+const RESUME_EXACT: &[&str] = &[
+    "继续",
+    "继续吧",
+    "继续做",
+    "继续干",
+    "继续推进",
+    "接着",
+    "接着做",
+    "往下",
+    "直接开始",
+    "开始吧",
+];
+
+/// 续接前缀:短输入且以这些词开头,视为续做同一任务。
+const RESUME_PREFIXES: &[&str] = &[
+    "继续",
+    "接着",
+    "直接开始",
+    "好的继续",
+    "好的,继续",
+    "好的，继续",
+];
+
+/// 判定一条 user 输入是否为「续接」(要求继续上一轮未完成的工作)。
+///
+/// 保守口径:仅短输入(≤40 字符)且精确命中/前缀命中续接词才计;长输入
+/// 默认视为新任务,避免把"继续查一下 A、B、C…"这类新指令误计为续接。
+#[must_use]
+pub fn is_resume_intent(text: &str) -> bool {
+    let normalized = text.replace(['\u{2028}', '\r'], "");
+    let trimmed = normalized
+        .trim()
+        .trim_end_matches(['。', '!', '！', '?', '？', '.', ',', '，']);
+    if trimmed.is_empty() || trimmed.chars().count() > 40 {
+        return false;
+    }
+    RESUME_EXACT.contains(&trimmed)
+        || RESUME_PREFIXES
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+}
+
 /// 会话级埋点记录。
 #[derive(Debug, Serialize)]
 struct PunchbackRecord {
@@ -270,6 +317,8 @@ struct PunchbackRecord {
     session: String,
     turn_input: String, // 截断预览,避免膨胀
     class: PunchbackClass,
+    /// 是否为「续接」(P2):上一轮收尾后用户要求继续,而非新任务/打回。
+    resume: bool,
 }
 
 /// 转意(append)一条 turn 埋点到会话级文件。失败返回 Err(非关键路径,调用方忽略)。
@@ -278,6 +327,7 @@ pub fn record_turn(
     session_id: &str,
     turn_input: &str,
     class: PunchbackClass,
+    resume: bool,
 ) -> std::io::Result<()> {
     use std::io::Write;
     let path = session_punchback_path(sessions_dir, session_id);
@@ -290,6 +340,98 @@ pub fn record_turn(
         session: session_id.to_string(),
         turn_input: preview,
         class,
+        resume,
+    };
+    let json = serde_json::to_string(&record)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{json}")
+}
+
+/// 监管注记类型(P2 效果埋点):区分进度播报/侦察护栏/充分性提醒。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NagKind {
+    /// 迭代/墙钟进度播报。
+    Progress,
+    /// 侦察护栏/预算倒数/预算硬收口。
+    Guard,
+    /// 充分性判据已满足提醒。
+    Sufficiency,
+}
+
+/// 单 turn 实际注入(占用仲裁槽并 flush)的监管注记统计。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TurnNagStats {
+    pub progress: u32,
+    pub guard: u32,
+    pub sufficiency: u32,
+    /// 首次注入所在迭代(0 = 本 turn 未注入任何注记)。
+    pub first_iter: usize,
+}
+
+impl TurnNagStats {
+    /// 记录一条实际注入的注记。
+    pub fn record(&mut self, kind: NagKind, iterations: usize) {
+        match kind {
+            NagKind::Progress => self.progress = self.progress.saturating_add(1),
+            NagKind::Guard => self.guard = self.guard.saturating_add(1),
+            NagKind::Sufficiency => self.sufficiency = self.sufficiency.saturating_add(1),
+        }
+        if self.first_iter == 0 {
+            self.first_iter = iterations;
+        }
+    }
+
+    /// 本 turn 实际注入的注记总数。
+    #[must_use]
+    pub fn total(&self) -> u32 {
+        self.progress
+            .saturating_add(self.guard)
+            .saturating_add(self.sufficiency)
+    }
+}
+
+/// 单 turn 效果埋点记录(P2):用于计算"首次注记 → 收尾"的迭代距离。
+#[derive(Debug, Serialize)]
+struct TurnStatsRecord {
+    ts_ms: u64,
+    session: String,
+    iterations: usize,
+    nag_progress: u32,
+    nag_guard: u32,
+    nag_sufficiency: u32,
+    first_nag_iter: usize, // 0 = 未注入
+    output_tokens: u64,
+}
+
+/// 追加一条 turn 效果埋点到 `<session_id>-turn_stats.jsonl`。
+///
+/// 与 punchback 同位点、同生命周期;失败静默(非关键路径)。分析口径:
+/// `iterations - first_nag_iter` = 注记注入后到收尾又跑了多少轮。
+pub fn record_turn_stats(
+    sessions_dir: &Path,
+    session_id: &str,
+    iterations: usize,
+    stats: &TurnNagStats,
+    output_tokens: u64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = sessions_dir.join(format!("{session_id}-turn_stats.jsonl"));
+    let record = TurnStatsRecord {
+        ts_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        session: session_id.to_string(),
+        iterations,
+        nag_progress: stats.progress,
+        nag_guard: stats.guard,
+        nag_sufficiency: stats.sufficiency,
+        first_nag_iter: stats.first_iter,
+        output_tokens,
     };
     let json = serde_json::to_string(&record)?;
     let mut file = std::fs::OpenOptions::new()
@@ -341,6 +483,92 @@ mod tests {
     fn force_is_separate_bucket() {
         assert_eq!(cls("还有另外一个问题需要排查"), PunchbackClass::Force); // "还有"/"另外一个"
         assert_eq!(cls("继续修复才能收尾"), PunchbackClass::Force); // "继续修"
+    }
+
+    fn temp_sessions_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "claw-convergence-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp sessions dir");
+        dir
+    }
+
+    /// P2:续接与"新任务/打回"必须可区分,长指令不误计。
+    #[test]
+    fn resume_intent_is_separate_from_new_task() {
+        for text in [
+            "继续",
+            "继续吧",
+            "继续 B1 > B2 > B3",
+            "直接开始。",
+            "好的，继续",
+            "接着做",
+        ] {
+            assert!(is_resume_intent(text), "应判为续接: {text}");
+        }
+        for text in [
+            "好的",
+            "谢谢",
+            "不对",
+            "帮我检查并修复登录接口的 401 问题",
+            "继续之前那个任务，但这次先只做静态分析，不要改代码，也不要跑测试，也不要更新文档，只给出结论和文件行号",
+        ] {
+            assert!(!is_resume_intent(text), "不应判为续接: {text}");
+        }
+    }
+
+    #[test]
+    fn record_turn_persists_resume_flag() {
+        let dir = temp_sessions_dir("punchback-resume");
+        record_turn(&dir, "s1", "继续 B1", PunchbackClass::None, true).expect("record");
+        let text =
+            std::fs::read_to_string(session_punchback_path(&dir, "s1")).expect("read punchback");
+        assert!(text.contains("\"resume\":true"), "resume 标记缺失: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2:turn 效果埋点必须可回算「首次注记位置 → 收尾轮数」。
+    #[test]
+    fn record_turn_stats_appends_machine_readable_line() {
+        let dir = temp_sessions_dir("turn-stats");
+        let mut stats = TurnNagStats::default();
+        stats.record(NagKind::Progress, 64);
+        stats.record(NagKind::Guard, 70);
+        assert_eq!(stats.total(), 2);
+        record_turn_stats(&dir, "s1", 80, &stats, 12_345).expect("record stats");
+        record_turn_stats(&dir, "s1", 10, &TurnNagStats::default(), 0).expect("record zero stats");
+        let text =
+            std::fs::read_to_string(dir.join("s1-turn_stats.jsonl")).expect("read turn stats");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "应追加两行: {text}");
+        assert!(lines[0].contains("\"iterations\":80"), "记录: {}", lines[0]);
+        assert!(
+            lines[0].contains("\"nag_progress\":1"),
+            "记录: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("\"nag_guard\":1"), "记录: {}", lines[0]);
+        assert!(
+            lines[0].contains("\"first_nag_iter\":64"),
+            "记录: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("\"output_tokens\":12345"),
+            "记录: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("\"first_nag_iter\":0"),
+            "记录: {}",
+            lines[1]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
