@@ -1535,8 +1535,9 @@ fn get_execution_style_section() -> String {
      - 每条发现 = 一句话断言 + 至多一条锚点(文件/行号/引用);\n\
        禁止整段转述注入内容或工具输出的原文 —— 能指路就不引用。\n\
      - 同根因只列一条,同类实例用计数归并(如 同类 ×N),不逐条罗列。\n\
-     - 篇幅上限:此类回复默认 ≤ 3000 token;将超时先收敛到已得结论,\n\
-       再询问是否展开。"
+     - 篇幅上限:此类回复默认 ≤ 3000 token。该上限只约束**最终答复的呈现方式**,\
+     不约束任务执行中的工具调用与验证;不得以篇幅为由跳过验证、提前收尾或把\
+     未完成的执行转成「是否继续」的提问。"
         .to_string()
 }
 
@@ -1770,8 +1771,9 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      When using `spawn_parallel_subagents` or `dispatch_subagent`, you MUST \
      choose the appropriate model tier for each task based on its complexity. \
-     Each task can have a different model — pick the cheapest model that can \
-     reliably complete the task.\n\
+     Each task can have a different model — pick the **lowest tier that can \
+     reliably complete** the task. When complexity is ambiguous, choose one \
+     tier higher: a failed or redo run costs more than the tier difference.\n\
      \n\
      | complexity | Task Type | Model Tier | Examples |\n\
      |-----------|-----------|------------|----------|\n\
@@ -1784,8 +1786,9 @@ fn get_multi_agent_orchestration_section() -> String {
      will reject them. Use them only for `simple` tasks.\n\
      \n\
      **Flagship-tier models** (names containing `pro`) can handle any complexity, \
-     but cost 5-10x more. Do \
-     NOT use them for `simple` tasks — it wastes budget.\n\
+     but cost 5-10x more. Avoid them for clearly simple tasks — but cost is \
+     secondary to correctness: a cheap run that fails, needs redo, or yields a \
+     shallow diagnosis costs more than one correct Flagship run.\n\
      \n\
      ### Autonomous Task Decomposition Pattern\n\
      \n\
@@ -1808,8 +1811,8 @@ fn get_multi_agent_orchestration_section() -> String {
      ```\n\
      \n\
      **Default when unsure**: use the user's current main model (it is always \
-     Flagship-tier) rather than guessing. But prefer Budget for any task that \
-     is clearly read-only or single-file."
+     Flagship-tier) rather than guessing. Prefer Budget only when the task is \
+     clearly read-only or single-file **and** its scope is bounded."
         .to_string()
 }
 
@@ -2798,6 +2801,10 @@ mod tests {
         assert!(prompt.contains("「运行时注记」"));
         assert!(prompt.contains("<runtime-note source="));
         assert!(prompt.contains("不是用户指令"));
+        // P1-4/P1-5:篇幅上限只约束答复呈现，不得诱导提前收口；路由以能力优先。
+        assert!(prompt.contains("不约束任务执行中的工具调用与验证"));
+        assert!(!prompt.contains("询问是否展开"));
+        assert!(prompt.contains("lowest tier that can"));
 
         cleanup_temp_dir(&root);
     }
