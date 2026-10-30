@@ -137,7 +137,9 @@ impl RecoveryStepExecutor for RealStepExecutor {
             }
             RecoveryStep::CleanBuild => {
                 // cargo clean
-                let clean = std::process::Command::new("cargo").args(["clean"]).output();
+                let clean = crate::sandbox::quiet_command("cargo")
+                    .args(["clean"])
+                    .output();
                 match clean {
                     Ok(o) if o.status.success() => {}
                     Ok(o) => {
@@ -147,7 +149,9 @@ impl RecoveryStepExecutor for RealStepExecutor {
                     Err(e) => return (false, format!("cargo clean error: {e}")),
                 }
                 // cargo build
-                let build = std::process::Command::new("cargo").args(["build"]).output();
+                let build = crate::sandbox::quiet_command("cargo")
+                    .args(["build"])
+                    .output();
                 match build {
                     Ok(o) if o.status.success() => {
                         (true, "cargo clean + build succeeded".to_string())

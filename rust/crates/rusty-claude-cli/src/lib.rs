@@ -717,6 +717,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            // 未显式传 --model 时，在派发点解析 CLAW_MODEL / settings.json
+            // model / 自动探测；解析留在执行侧而非 parse_args，保持参数解析
+            // 的纯函数语义（`claw status` 另在 print_status_snapshot 内解析）。
+            let model = resolve_repl_model(model);
             let mut cli = LiveCli::new(
                 model,
                 true,

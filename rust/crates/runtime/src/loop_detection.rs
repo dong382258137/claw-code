@@ -60,13 +60,16 @@ pub const SAME_OUTPUT_ABORT_THRESHOLD: u32 = 10;
 /// 针对"探索循环":每次调用不同命令/工具(相同-input 与相同-output 通道
 /// 均无法命中),但从不修改任何文件、任务无进展。达到该次数注入提示,
 /// 引导模型改变策略或询问用户。
-pub const NO_OUTPUT_WARN_THRESHOLD: u32 = 15;
+pub const NO_OUTPUT_WARN_THRESHOLD: u32 = 40;
 
 /// 连续无产出工具调用触发中止的阈值。
 ///
 /// 高于警告阈值:给"边探索边思考"的复杂分析留足空间(文本输出/文件修改
 /// 都会清零 streak),同时保留硬终止兜底,防止模型无视警告后无限空转。
-pub const NO_OUTPUT_ABORT_THRESHOLD: u32 = 30;
+/// 大型仓库的性能/架构调研常在单个 turn 内产生 30+ 次不同的读/搜/基准
+/// 调用而尚无文件修改;30 过低会误杀正常分析,故放宽到 80。真正的重复
+/// 循环仍由相同-input(3/6)与相同-output(5/10)通道更早拦截。
+pub const NO_OUTPUT_ABORT_THRESHOLD: u32 = 80;
 
 /// MCP Tools 注册数量上限(经验法则)。
 pub const MCP_TOOLS_MAX: usize = 80;

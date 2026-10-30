@@ -391,7 +391,8 @@ pub fn purge(workspace: &Path, pid: u32) -> Result<(), BgError> {
 pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        let output = Command::new("tasklist")
+        // quiet_command:后台存活探测可能被周期性调用,不能每次都弹控制台窗口。
+        let output = crate::sandbox::quiet_command("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -422,7 +423,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
 fn kill_process(pid: u32) -> Result<(), BgError> {
     #[cfg(windows)]
     {
-        let output = Command::new("taskkill")
+        let output = crate::sandbox::quiet_command("taskkill")
             .args(["/PID", &pid.to_string(), "/F", "/T"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

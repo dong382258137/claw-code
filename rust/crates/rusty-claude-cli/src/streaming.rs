@@ -29,8 +29,8 @@ use api::{
 };
 use runtime::{
     multi_agent::SubagentCapability, ApiClient, ApiRequest, AssistantEvent, ContentBlock,
-    ConversationMessage, MessageRole, PermissionMode, PermissionPolicy, RequestKind, RuntimeError,
-    SystemPromptSplit, TokenUsage,
+    ConversationMessage, MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent,
+    RequestKind, RuntimeError, SystemPromptSplit, TokenUsage,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
@@ -172,6 +172,14 @@ pub(crate) struct AnthropicRuntimeClient {
     /// 以便 `&self` 的 [`ApiClient::last_time_to_first_chunk_ms`] 读取;
     /// 每次流式请求在首个 chunk 到达时写入(见 `consume_stream_attempt`)。
     last_ttft_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// 「上游不返回 prompt cache 指标」诊断只上报一次,避免每次请求刷屏。
+    ///
+    /// Trae `llm_utils_chat` 的 `token_usage` 固定返回
+    /// `cache_read_input_tokens=0 / cache_creation_input_tokens=0`(实测相同
+    /// 长前缀连发两次仍为 0),因此 `prompt_cache_events` 恒为 0 不代表缓存
+    /// 命中,而是上游根本不提供该能力。首个达到阈值的请求上报一次
+    /// `PromptCacheEvent`(reason 明确说明),让 turn_completed/doctor 可见。
+    cache_unavailable_reported: std::sync::atomic::AtomicBool,
 }
 
 impl AnthropicRuntimeClient {
@@ -191,9 +199,10 @@ impl AnthropicRuntimeClient {
         // needed here.
         let resolved_model = api::resolve_model_alias(&model);
         let client = ApiProviderClient::from_model(&resolved_model)?;
-        // P0-2:渐进式工具加载默认关闭(全量注入),`RUSTY_CLAUDE_PROGRESSIVE_TOOLS=1`
-        // 开启后只注入核心工具 + 已激活工具。在 registry 进入共享前启用,确保
-        // 主/子 client 行为一致。
+        // P0-2:渐进式工具加载。本构造函数只认显式环境变量
+        // `RUSTY_CLAUDE_PROGRESSIVE_TOOLS=1/0`;「trae/ 模型默认开启」的
+        // provider 策略由主 client 装配点(app.rs::build_api_client)决定,
+        // 避免子智能体 client(经 with_model* 构造)被意外裁剪工具集。
         let progressive_tools = std::env::var("RUSTY_CLAUDE_PROGRESSIVE_TOOLS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         let tool_registry = if progressive_tools {
@@ -221,6 +230,7 @@ impl AnthropicRuntimeClient {
             progressive_tools,
             request_divergence_probe: api::RequestDivergenceProbe::new(session_id),
             last_ttft_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            cache_unavailable_reported: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -282,10 +292,8 @@ impl AnthropicRuntimeClient {
         kind: RequestKind,
         request: &MessageRequest,
         usage: Option<TokenUsage>,
-    ) {
-        let Some(usage) = usage else {
-            return;
-        };
+    ) -> Option<api::CacheBreakEvent> {
+        let usage = usage?;
         let api_usage = api::Usage {
             input_tokens: usage.input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
@@ -302,11 +310,39 @@ impl AnthropicRuntimeClient {
         let detector = self.detector_for(kind);
         let is_tool_loop =
             kind == RequestKind::Subagent || request_ends_with_tool_result_msg(request);
-        let _ = if is_tool_loop {
+        let record = if is_tool_loop {
             detector.record_usage_multi_turn(request, &api_usage)
         } else {
             detector.record_usage(request, &api_usage)
         };
+        if let Some(event) = record.cache_break {
+            return Some(event);
+        }
+        // 上游不提供 prompt cache 指标时(典型:Trae llm_utils_chat),
+        // `cache_break` 永远无法触发(token_drop=0),`prompt_cache_events`
+        // 恒为 0 会被误读成"缓存一直命中"。首个输入规模足够大的请求上报
+        // 一次显式诊断事件,把"零命中"归因为能力缺失而非命中率问题。
+        const CACHE_UNAVAILABLE_MIN_INPUT_TOKENS: u32 = 2_000;
+        if self.model.trim().starts_with("trae/")
+            && usage.cache_read_input_tokens == 0
+            && usage.cache_creation_input_tokens == 0
+            && usage.input_tokens >= CACHE_UNAVAILABLE_MIN_INPUT_TOKENS
+            && !self
+                .cache_unavailable_reported
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Some(api::CacheBreakEvent {
+                unexpected: false,
+                reason: format!(
+                    "provider reports zero prompt-cache tokens (cache_read=0, cache_creation=0, input={}); upstream prefix cache unavailable, prompt_cache_events will stay 0",
+                    usage.input_tokens
+                ),
+                previous_cache_read_input_tokens: 0,
+                current_cache_read_input_tokens: 0,
+                token_drop: 0,
+            });
+        }
+        None
     }
 }
 
@@ -406,6 +442,12 @@ impl ApiClient for AnthropicRuntimeClient {
 
     fn set_status_emitter(&mut self, emitter: StatusEmitter) {
         self.status_emitter = Some(emitter);
+    }
+
+    fn activate_tool(&mut self, name: &str) {
+        // P0-2 渐进式工具加载:ToolSearch 命中的工具加入下一请求的 tools 数组。
+        // 非渐进模式(`enabled_overlay=None`)下 `activate_tool` 为 no-op。
+        self.tool_registry.activate_tool(name);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -642,12 +684,37 @@ impl ApiClient for AnthropicRuntimeClient {
     }
 }
 
-/// 传输层瞬时故障的自动重试预算（同轮最多自动重试 1 次）。
+/// 传输层瞬时故障的自动重试预算（同轮最多自动重试 2 次）。
 ///
 /// 仅当流在产生任何 UI 可见内容（思考/文本）之前就断掉时才自动重发；
 /// 一旦已有内容被渲染，重发会导致输出重复，故只把错误上报为"可重试"，
 /// 由上层决定是否手动重跑当前轮。
-const MAX_TRANSPORT_RETRIES: usize = 1;
+///
+/// 重试之间带指数退避：网络瞬断（DNS/TLS/连接被重置）往往持续数秒，
+/// 两次零间隔重发会落在同一个故障窗口里，等价于没有重试。
+const MAX_TRANSPORT_RETRIES: usize = 2;
+
+/// 传输层重试的退避基准（毫秒）：500ms → 1s，带 ±25% 抖动。
+/// 可用 `CLAW_TRANSPORT_RETRY_BASE_MS` 覆盖。
+const TRANSPORT_RETRY_BASE_MS: u64 = 500;
+
+/// 传输层重试退避：基准值按重试序号指数翻倍，上限 4s，带 ±25% 抖动。
+fn transport_retry_delay(retry_index: usize) -> Duration {
+    let base_ms = std::env::var("CLAW_TRANSPORT_RETRY_BASE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TRANSPORT_RETRY_BASE_MS);
+    let shift = u32::try_from(retry_index.saturating_sub(1).min(3)).unwrap_or(3);
+    let base = base_ms.saturating_mul(1u64 << shift).min(4_000);
+    let jitter_ms = base / 4;
+    if jitter_ms == 0 {
+        return Duration::from_millis(base);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::from(elapsed.subsec_nanos()));
+    Duration::from_millis(base + nanos % jitter_ms)
+}
 
 /// 单次流式尝试的失败类型，交给外层 [`consume_stream`] 决定是否干净重试。
 enum StreamAttemptError {
@@ -706,12 +773,16 @@ impl AnthropicRuntimeClient {
                     message,
                     emitted_any_event,
                 }) => {
-                    // 未产生任何内容且重试预算未耗尽 → 同轮自动重发一次。
+                    // 未产生任何内容且重试预算未耗尽 → 退避后同轮自动重发。
                     if should_auto_retry_transport(emitted_any_event, retries) {
                         retries += 1;
+                        tokio::time::sleep(transport_retry_delay(retries)).await;
                         continue;
                     }
                     // 已产生内容或预算耗尽 → 作为可重试错误上报，由上层/用户决定。
+                    // 带上实际尝试次数，便于区分「一次失败」与「连续失败」。
+                    let attempts = retries + 1;
+                    let message = format!("{message} (transport attempts: {attempts})");
                     return Err(self.emit_stream_error(message, true));
                 }
             }
@@ -1093,7 +1164,10 @@ impl AnthropicRuntimeClient {
             .iter()
             .any(|event| matches!(event, AssistantEvent::MessageStop))
         {
-            self.record_cache_break(request_kind, message_request, final_usage);
+            push_prompt_cache_event(
+                &mut events,
+                self.record_cache_break(request_kind, message_request, final_usage),
+            );
             return Ok(events);
         }
 
@@ -1111,9 +1185,28 @@ impl AnthropicRuntimeClient {
             })?;
         // 非流式回退路径:从 response.usage 记录 cache break。
         let fallback_usage = response.usage.token_usage();
-        let events = response_to_events(response, out)?;
-        self.record_cache_break(request_kind, message_request, Some(fallback_usage));
+        let mut events = response_to_events(response, out)?;
+        push_prompt_cache_event(
+            &mut events,
+            self.record_cache_break(request_kind, message_request, Some(fallback_usage)),
+        );
         Ok(events)
+    }
+}
+
+/// 把 cache break / 上游无缓存诊断事件转成 [`AssistantEvent::PromptCache`]。
+///
+/// 之前 `record_cache_break` 丢弃了 `CacheBreakRecord.cache_break`,导致
+/// `turn_completed.prompt_cache_events` 永远为 0(即使真实发生了 break)。
+fn push_prompt_cache_event(events: &mut Vec<AssistantEvent>, event: Option<api::CacheBreakEvent>) {
+    if let Some(event) = event {
+        events.push(AssistantEvent::PromptCache(PromptCacheEvent {
+            unexpected: event.unexpected,
+            reason: event.reason,
+            previous_cache_read_input_tokens: event.previous_cache_read_input_tokens,
+            current_cache_read_input_tokens: event.current_cache_read_input_tokens,
+            token_drop: event.token_drop,
+        }));
     }
 }
 
@@ -1157,8 +1250,44 @@ pub(crate) fn format_user_visible_api_error(session_id: &str, error: &api::ApiEr
             error
         )
     } else {
-        error.to_string()
+        match error {
+            api::ApiError::Http(http) => format_http_transport_error(http),
+            _ => error.to_string(),
+        }
     }
+}
+
+/// 格式化 reqwest 传输错误，展开被 Display 吞掉的 source 链。
+///
+/// `reqwest::Error` 的 Display 只给顶层文案（如 "error sending request for
+/// url (...)"），真正的失败原因（timeout / dns / tls / connection reset）
+/// 藏在 `source()` 里。不展开的话，用户和服务日志都无法区分这几种情况。
+fn format_http_transport_error(error: &reqwest::Error) -> String {
+    let class = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "http"
+    };
+    let mut message = format!("http error: {error} [class={class}]");
+    let mut causes: Vec<String> = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        if causes.len() >= 3 {
+            break;
+        }
+        source = cause.source();
+    }
+    if !causes.is_empty() {
+        message.push_str(&format!(" (cause: {})", causes.join(" -> ")));
+    }
+    message
 }
 
 pub(crate) fn format_context_window_blocked_error(

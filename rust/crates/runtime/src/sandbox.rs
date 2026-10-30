@@ -481,6 +481,23 @@ pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Comm
     command
 }
 
+/// tokio 版本的 [`quiet_command`]，语义与 flag 完全一致。
+///
+/// 用于 bash 工具等异步 spawn 路径:服务端进程若由热升级以
+/// `DETACHED_PROCESS` 重启(无控制台),每个未带 `CREATE_NO_WINDOW` 的
+/// 控制台子进程都会由系统新开一个可见的黑色命令行窗口——用户看到的就是
+/// 「执行任务时命令行窗口一直闪」。
+#[must_use]
+pub fn quiet_tokio_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut command = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 impl Default for WindowsSandboxBuilder {
     fn default() -> Self {
         Self {

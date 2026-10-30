@@ -25,6 +25,10 @@ runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+# 流式错误格式化需要展开 reqwest::Error 的 source 链。配置与 api 对齐
+# （default-features=false + rustls-tls），确保与 api::ApiError::Http
+# 持有同一个 reqwest 实例。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Myers diff 算法,供 tui-ports/diff_view.rs 使用(从 grok-build 移植)
 similar = "2"
 syntect = "5"
@@ -65,9 +69,6 @@ mock-deepseek-service = { path = "../mock-deepseek-service" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tempfile = "3"
-# 与 api 的 reqwest 对齐（default-features=false + rustls-tls），确保测试里
-# reqwest::Error 与 api::ApiError::Http 持的是同一个 reqwest 实例。
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

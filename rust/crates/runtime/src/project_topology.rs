@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -902,7 +902,8 @@ fn has_python_project_from_meta(root: &Path) -> bool {
 
 /// 通过 `cargo metadata` 构建 ModuleGraph。
 fn build_module_graph(root: &Path) -> Result<ModuleGraph, String> {
-    let output = Command::new("cargo")
+    // quiet_command:拓扑构建在 Web 端会周期性触发,不能弹控制台窗口。
+    let output = crate::sandbox::quiet_command("cargo")
         .args([
             "metadata",
             "--format-version",

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
@@ -1148,7 +1148,7 @@ fn install_hint_for_command(command: &str) -> Option<&'static str> {
 /// 返回 `true` 表示命令存在且可执行。
 fn is_command_available(command: &str) -> bool {
     let checker = if cfg!(windows) { "where" } else { "which" };
-    Command::new(checker)
+    crate::sandbox::quiet_command(checker)
         .arg(command)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1301,7 +1301,8 @@ impl ProcessLspTransport {
     /// 配置 stdin/stdout 为 piped,stderr 为 inherit。
     /// 启动后自动发送 `initialize` 请求并等待响应。
     pub fn spawn(&mut self) -> Result<(), String> {
-        let mut cmd = Command::new(&self.server_command);
+        // quiet_command:语言服务器是控制台程序,Web 服务无控制台时会弹窗。
+        let mut cmd = crate::sandbox::quiet_command(&self.server_command);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());

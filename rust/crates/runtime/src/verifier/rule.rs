@@ -13,7 +13,7 @@
 //! 不阻塞 plan,与 v1.0 placeholder 行为一致。
 
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -192,13 +192,14 @@ impl RuleVerifier {
     fn execute_command(&self, command: &str) -> Result<CommandOutput, String> {
         #[cfg(windows)]
         let mut cmd = {
-            let mut c = Command::new("cmd");
+            // quiet_command:验证命令在 Web 端执行,不能弹控制台窗口。
+            let mut c = crate::sandbox::quiet_command("cmd");
             c.arg("/C").arg(command);
             c
         };
         #[cfg(not(windows))]
         let mut cmd = {
-            let mut c = Command::new("sh");
+            let mut c = crate::sandbox::quiet_command("sh");
             c.arg("-c").arg(command);
             c
         };
@@ -269,7 +270,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 fn kill_process(pid: u32) {
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let _ = crate::sandbox::quiet_command("taskkill")
             .args(["/PID", &pid.to_string(), "/F", "/T"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

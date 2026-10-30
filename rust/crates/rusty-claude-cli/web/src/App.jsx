@@ -96,9 +96,24 @@ export default function App() {
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false)
   const [filter, setFilter] = useState('')
   const [current, setCurrent] = useState(null)
+  // 未选中会话时用户手选的目标工作区：只记意图、不立刻建会话，
+  // 等用户真正发出第一条消息时再在该工作区新建。
+  const [draftWorkspace, setDraftWorkspace] = useState('')
+  // running 是 React state，重渲染前第二次 Enter 仍会进 send：用同步闸门挡住，
+  // 否则第二个 prompt 会在第一个 turn 运行时撞工作区锁，弹出误导性错误。
+  const sendLockRef = useRef(false)
+  // 最近一次提交的原文：流式失败时把原文回填输入框，并提供「重试」动作，
+  // 避免错误把用户刚打的字连同上下文一起丢掉。
+  const lastPromptRef = useRef('')
+  // SSE 订阅 effect 不能依赖 send（每次渲染都是新闭包），用 ref 拿最新实现。
+  const sendRef = useRef(null)
   const [messages, setMessages] = useState([])
   const [optimistic, setOptimistic] = useState(null)
   const [running, setRunning] = useState(false)
+  // SSE 回调里读 running 会拿到创建闭包时的旧值（该 effect 只依赖 currentId/push），
+  // 用 ref 同步最新运行态，供「重试」动作判断本轮是否仍在跑。
+  const runningRef = useRef(false)
+  runningRef.current = running
   const [live, setLive] = useState('')
   const [liveThinking, setLiveThinking] = useState('')
   const [liveTools, setLiveTools] = useState([])
@@ -121,16 +136,14 @@ export default function App() {
   // 语音讨论「结束并整理」→ 输入框的通道。整理结果只填入待编辑，绝不直接发送；
   // 语音转写难免有错字，直接发出去用户没有任何纠正机会（这正是本通道存在的原因）。
   const [pendingDraft, setPendingDraft] = useState(null)
-  // 语音讨论进入前的原会话快照。讨论期间所有轮次发往专用会话，
-  // 结束后切回这里，主会话历史不被讨论内容污染。
-  const voiceReturnRef = useRef(null)
   // 稳定的错误回调：面板的 load 依赖它，若每次渲染换新函数会触发无限重取。
   const panelError = useCallback((message) => {
     if (message) push(message, 'error')
   }, [push])
 
   const currentId = current?.id || null
-  const activeWorkspace = current?.workspace || meta.workspace || ''
+  // 「当前工作区」在没有选中会话时取用户手选的目标工作区，其次退回服务端默认工作区。
+  const activeWorkspace = current?.workspace || draftWorkspace || meta.workspace || ''
 
   /* ---------- 初始化：设置 / 元信息 / 会话列表 ---------- */
   useEffect(() => {
@@ -198,7 +211,9 @@ export default function App() {
   useEffect(() => {
     if (!currentId) return undefined
     let closed = false
-    setOptimistic(null)
+    // 无会话时输入会自动新建会话并立刻发消息：这条待发消息带着目标 sessionId，
+    // 不能因为 currentId 刚切换到它就被清掉，否则用户刚打的字会闪一下消失。
+    setOptimistic((pending) => (pending && pending.sessionId === currentId ? pending : null))
     setLive('')
     setMessages([])
     setLoadingSession(true)
@@ -275,7 +290,22 @@ export default function App() {
         }
         else if (data.kind === 'done') { setRunning(false) }
         else if (data.kind === 'upgrading') { setUpgrading(data.message || '正在热升级：重建并重启 Web 服务…'); setRunning(false) }
-        else if (data.kind === 'error') { setLive(''); setLiveThinking(''); setLiveTools([]); push(`流式错误：${data.message}`, 'error') }
+        else if (data.kind === 'error') {
+          // 可恢复错误（传输层已做退避重试、runtime 还可能再恢复一次）不清屏：
+          // 清空已流式内容会让用户误以为整轮作废，而且恢复成功后内容会从空开始。
+          if (!data.recoverable) {
+            setLive(''); setLiveThinking(''); setLiveTools([])
+            // 原文回填输入框，用户可直接重发或修改后重发。
+            if (lastPromptRef.current) setPendingDraft(lastPromptRef.current)
+          }
+          const retryText = lastPromptRef.current
+          push(`流式错误${data.recoverable ? '（可重试）' : ''}：${data.message}`, 'error',
+            retryText ? {
+              label: '重试',
+              // 可恢复错误时本轮可能还在跑，重试会撞会话锁；等 done 后再允许。
+              run: () => { if (!runningRef.current) sendRef.current?.(retryText, currentId) },
+            } : null)
+        }
       } catch (_) {}
     })
     events.onerror = () => { setConnected(false); reconcile() }
@@ -411,7 +441,9 @@ export default function App() {
     setApprovals([])
   }, [])
 
-  const createSession = useCallback(async (workspace) => {
+  // 返回新建的会话（失败返回 null）。发送路径需要在「没有选中会话」时自动建会话，
+  // 并立刻用返回的 id 发消息 —— 不能依赖 React state 在下一帧才更新。
+  const createSession = useCallback(async (workspace, options = {}) => {
     try {
       const created = await postJson('/api/sessions', { workspace: workspace || activeWorkspace || undefined })
       const session = {
@@ -423,9 +455,11 @@ export default function App() {
       setSessions((list) => [session, ...list.filter((item) => item.id !== session.id)])
       selectSession(session)
       setTimeout(() => document.querySelector('.composer textarea')?.focus(), 80)
-      push('已新建会话')
+      if (!options.silent) push('已新建会话')
+      return session
     } catch (error) {
       push(`新建会话失败：${error.message}`, 'error')
+      return null
     }
   }, [activeWorkspace, push, selectSession])
 
@@ -433,6 +467,13 @@ export default function App() {
     setWorkspacePickerOpen(false)
     createSession(path)
   }, [createSession])
+
+  // 没有选中会话时，底栏切换工作区只记「目标工作区」，不立刻建空会话 ——
+  // 用户此时往往只是想换个地方开新任务，先建一个空会话会白占一条历史。
+  const pickTargetWorkspace = useCallback((path) => {
+    setDraftWorkspace(path)
+    push(`已选择工作区：${basename(path)}，直接输入即可发送`)
+  }, [push])
 
   const pickAndStart = useCallback(async () => {
     try {
@@ -497,27 +538,46 @@ export default function App() {
     }
   }, [currentId, push])
 
-  const send = useCallback(async (text) => {
-    if (!currentId) { push('请先在左侧选择一个会话', 'error'); return }
+  // 没有选中会话时也能直接发消息：自动在当前工作区新建一个会话再发。
+  // 「先建会话才能输入」是最常见的操作摩擦——用户想说的是话，不是先做一次管理动作。
+  // retrySessionId：重试时复用已建好的会话，避免重试路径再建一个空会话。
+  const send = useCallback(async (text, retrySessionId) => {
+    if (sendLockRef.current) return
     const trimmed = text.trim()
     if (!trimmed) return
-    setLive('')
-    setLiveThinking('')
-    setLiveTools([])
-    setOptimistic({ text: trimmed, at: Date.now() })
-    setRunning(true)
+    lastPromptRef.current = trimmed
+    sendLockRef.current = true
     try {
-      await postJson(`/api/session/${encodeURIComponent(currentId)}/prompt`, {
-        text: trimmed,
-        permission: webSettings.permission || 'workspace-write',
-        model: webSettings.model || undefined,
-      })
-    } catch (error) {
-      setOptimistic(null)
-      setRunning(false)
-      push(`发送失败：${error.message}`, 'error', { label: '重试', run: () => send(text) })
+      let sessionId = retrySessionId || currentId
+      if (!sessionId) {
+        // 先置 running：建会话是异步的，期间再按一次 Enter 会再建一个会话。
+        setRunning(true)
+        const created = await createSession(activeWorkspace, { silent: true })
+        if (!created) { setRunning(false); return }
+        sessionId = created.id
+      }
+      setLive('')
+      setLiveThinking('')
+      setLiveTools([])
+      // 带上 sessionId：新会话的订阅 effect 会立刻跑一次，不能把刚输入的内容清掉。
+      setOptimistic({ text: trimmed, at: Date.now(), sessionId })
+      setRunning(true)
+      try {
+        await postJson(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
+          text: trimmed,
+          permission: webSettings.permission || 'workspace-write',
+          model: webSettings.model || undefined,
+        })
+      } catch (error) {
+        setOptimistic(null)
+        setRunning(false)
+        push(`发送失败：${error.message}`, 'error', { label: '重试', run: () => send(text, sessionId) })
+      }
+    } finally {
+      sendLockRef.current = false
     }
-  }, [currentId, push, webSettings.permission])
+  }, [activeWorkspace, createSession, currentId, push, webSettings.model, webSettings.permission])
+  sendRef.current = send
 
   const stop = useCallback(async () => {
     if (!currentId || !running) return
@@ -530,50 +590,17 @@ export default function App() {
     }
   }, [currentId, push, running])
 
-  const openVoiceDiscussion = useCallback(async () => {
+  // 语音讨论不是任务，也不该是 agent 会话：
+  // 它只需要一个纯对话通道（/api/voice/chat，无工具、不落盘），
+  // 因此这里不再创建 session、不切 currentId、不动主会话的任何状态。
+  // 打开后主界面照旧，讨论内容只活在 VoiceDiscussion 组件内存里。
+  const openVoiceDiscussion = useCallback(() => {
     if (running) { push('请等待当前回复结束后再开始语音讨论', 'error'); return }
-    // 讨论期间切到专用会话：语音轮次不再写进主会话，
-    // 聊天界面也就不会出现讨论内容（用户要求独立上下文）。
-    // 原会话快照留到 voiceReturnRef，关闭时切回。
-    voiceReturnRef.current = current?.id
-      ? { id: current.id, title: current.title, modified: current.modified, workspace: current.workspace }
-      : null
-    try {
-      const created = await postJson('/api/sessions', { workspace: activeWorkspace || undefined })
-      const session = {
-        id: created.id,
-        title: '语音讨论',
-        modified: Math.floor(Date.now() / 1000),
-        workspace: created.workspace || activeWorkspace,
-      }
-      // 刻意不加入 sessions 列表：讨论会话是临时的，混进侧边栏会与工作会话混淆。
-      setCurrent(session)
-      setMessages([])
-      setRunning(false)
-      setLive('')
-      setLiveThinking('')
-      setLiveTools([])
-      setOptimistic(null)
-      setVoiceDiscussionOpen(true)
-    } catch (error) {
-      push(`创建语音讨论会话失败：${error.message}`, 'error')
-    }
-  }, [current, activeWorkspace, push, running])
+    setVoiceDiscussionOpen(true)
+  }, [push, running])
 
-  // 关闭语音讨论：切回进入前的会话，主会话重新可见。
   const closeVoiceDiscussion = useCallback(() => {
     setVoiceDiscussionOpen(false)
-    const back = voiceReturnRef.current
-    voiceReturnRef.current = null
-    if (back?.id) {
-      setCurrent(back)
-      setMessages([])
-      setRunning(false)
-      setLive('')
-      setLiveThinking('')
-      setLiveTools([])
-      setOptimistic(null)
-    }
   }, [])
 
   const runQuickAction = useCallback((action) => {
@@ -644,6 +671,7 @@ export default function App() {
         sessionModel={current?.model || ''}
         onVoiceDiscussion={openVoiceDiscussion}
         onNewInWorkspace={startInFolder}
+        onPickWorkspace={pickTargetWorkspace}
         onOpenWorkspacePicker={() => setWorkspacePickerOpen(true)}
         stats={current?.stats}
         pendingRef={pendingRef}
@@ -716,13 +744,9 @@ export default function App() {
           </div>
         </div>
       )}
-      {voiceDiscussionOpen && currentId && (
+      {voiceDiscussionOpen && (
         <VoiceDiscussion
-          running={running}
-          live={live}
-          messages={messages}
-          onSend={send}
-          onStop={stop}
+          model={webSettings.model}
           onClose={closeVoiceDiscussion}
           onError={(message) => push(message, 'error')}
           onDraft={setPendingDraft}
@@ -785,7 +809,11 @@ function Toasts({ toasts }) {
 }
 
 function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, onSelect, onNew, onNewIn, onAddWorkspace, onOpenPicker, workspaces, activeWorkspace, onRename, onDelete, total, onLoadMore, onSettings, onTheme, theme }) {
-  const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
+  // 侧栏项目组默认全部收起：首次打开只列出项目本身，便于先选工作区再看会话。
+  // 这里只记录用户手动「展开」过的项目（空集 = 全收起），比记录收起集合少一次
+  // 依赖 sessions 异步加载的初始化时序。搜索时忽略收起状态，否则命中的会话会被
+  // 藏在收起的分组里、搜索看起来像失效。
+  const [expandedGroups, setExpandedGroups] = useState(() => new Set())
   const query = filter.trim().toLowerCase()
   const filtered = sessions.filter((session) =>
     !query ||
@@ -810,7 +838,7 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
   }, [workspaces, sessions, filtered, query])
 
   const toggleGroup = (path) => {
-    setCollapsedGroups((current) => {
+    setExpandedGroups((current) => {
       const next = new Set(current)
       if (next.has(path)) next.delete(path)
       else next.add(path)
@@ -855,13 +883,14 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
           <div className="session-list">
             {projects.length === 0 && <div className="empty">没有匹配的会话</div>}
             {projects.map((project) => {
-              const isCollapsed = collapsedGroups.has(project.path)
+              // 搜索时强制展开：否则命中的会话藏在收起的项目里，搜索看起来像失效。
+              const isExpanded = expandedGroups.has(project.path) || Boolean(query)
               const active = project.path === activeWorkspace
               return (
                 <div className={`project ${active ? 'active-workspace' : ''}`} key={project.path}>
                   <div className="project-head" title={project.path}>
                     <button className="project-toggle" onClick={() => toggleGroup(project.path)}>
-                      {isCollapsed ? '▸' : '▾'} 📁 {project.label}
+                      {isExpanded ? '▾' : '▸'} 📁 {project.label}
                       <span className="project-count">{project.count}</span>
                     </button>
                     <button
@@ -870,7 +899,7 @@ function Sidebar({ sessions, filter, onFilter, currentId, collapsed, onToggle, o
                       onClick={() => onNewIn(project.path)}
                     >＋</button>
                   </div>
-                  {!isCollapsed && project.sessions.map((session) => (
+                  {isExpanded && project.sessions.map((session) => (
                     <div key={session.id} className={`session-row nested ${session.id === currentId ? 'active' : ''}`}>
                       <button className="session" onClick={() => onSelect(session)} title={session.workspace || ''}>
                         <span className="title">{session.title || session.id}</span>
@@ -1004,7 +1033,7 @@ function Conversation({ messages, optimistic, live, liveThinking, liveTools, loa
         )}
         {!loading && visible.length === 0 && !optimistic && !live && (
           <div className="empty">
-            <div>选择一个会话，或直接在下方输入。</div>
+            <div>直接输入即可发送 —— 未选会话时会在当前工作区新建任务。</div>
             <div className="empty-hint">Enter 发送 · Shift+Enter 换行 · / 快捷操作 · @ 引用文件</div>
           </div>
         )}
@@ -1145,11 +1174,12 @@ function LiveTurn({ thinking, tools, text }) {
 /* ---------------- 输入区（Trae 风格） ---------------- */
 
 const MODEL_PRESETS = [
-  { id: '', label: '默认模型', hint: '跟随工作区配置' },
-  { id: 'deepseek-v4-flash', label: 'DeepSeek-V4.1-Flash', badge: 'Max', hint: '速度优先，日常默认' },
-  { id: 'deepseek-v4-pro', label: 'DeepSeek-V4.1-Pro', hint: '质量优先，响应较慢' },
-  { id: 'deepseek-chat', label: 'DeepSeek-Chat', hint: '通用对话' },
-  { id: 'deepseek-reasoner', label: 'DeepSeek-Reasoner', hint: '深度思考' },
+  { id: '', label: '默认模型', hint: '跟随工作区配置（当前 Trae）' },
+  { id: 'trae/deepseek-v4.1-flash', label: 'Trae · DeepSeek-V4.1-Flash', badge: '0.06', hint: 'Trae 内置额度，推荐' },
+  { id: 'deepseek-v4-flash', label: 'DeepSeek-V4-Flash（官方 API）', hint: '官方 API，需要 DeepSeek 余额' },
+  { id: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro（官方 API）', hint: '官方 API，质量优先' },
+  { id: 'deepseek-chat', label: 'DeepSeek-Chat（官方 API）', hint: '官方 API，通用对话' },
+  { id: 'deepseek-reasoner', label: 'DeepSeek-Reasoner（官方 API）', hint: '官方 API，深度思考' },
 ]
 const MODEL_LOOKUP = Object.fromEntries(MODEL_PRESETS.filter((item) => item.id).map((item) => [item.id, item]))
 
@@ -1191,20 +1221,6 @@ const ICONS = {
   pause: <><path d="M8 5v14M16 5v14" /></>,
   volume: <><path d="M4 9.5v5h3l4 3.5V6L7 9.5H4Z" /><path d="M15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11" /></>,
   volumeOff: <><path d="M4 9.5v5h3l4 3.5V6L7 9.5H4Z" /><path d="m15 9 6 6M21 9l-6 6" /></>,
-}
-
-function assistantReplyAfter(messages, cursor) {
-  for (let index = (messages || []).length - 1; index >= cursor; index -= 1) {
-    const message = messages[index]
-    if (!message || message.role !== 'assistant') continue
-    const text = (message.blocks || [])
-      .filter((block) => block.kind === 'text')
-      .map((block) => block.text || '')
-      .join('\n')
-      .trim()
-    if (text) return text
-  }
-  return ''
 }
 
 function speechText(text) {
@@ -1270,7 +1286,7 @@ function resolveModelLabel(model, sessionModel) {
   return { label: id, badge: '' }
 }
 
-function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, workspaces = [], sessionModel = '', onVoiceDiscussion, onNewInWorkspace, onOpenWorkspacePicker, stats, pendingRef, onRefUsed, pendingDraft, onDraftUsed }) {
+function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, permission, onPermission, model, onModel, workspace, workspaces = [], sessionModel = '', onVoiceDiscussion, onNewInWorkspace, onPickWorkspace, onOpenWorkspacePicker, stats, pendingRef, onRefUsed, pendingDraft, onDraftUsed }) {
   const [value, setValue] = useState('')
   const [files, setFiles] = useState([])
   const [suggest, setSuggest] = useState(null)
@@ -1439,7 +1455,6 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
   }
 
   const submit = () => {
-    if (!currentId) { onError?.('请先在左侧选择或新建一个会话'); return }
     if (running || voiceActiveRef.current) return
     const text = value
     if (!text.trim()) return
@@ -1447,6 +1462,7 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
     setOpenMenu(null)
     setFooterMenu(null)
     setValue('')
+    // 没有选中会话时不再拦下用户：交给上层自动在当前工作区新建会话再发送。
     onSend(text)
   }
 
@@ -1691,7 +1707,7 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
 
   const perm = PERMISSION_LOOKUP[permission] || PERMISSION_PRESETS[1]
   const shownModel = resolveModelLabel(model, sessionModel)
-  const canSend = Boolean(value.trim()) && Boolean(currentId)
+  const canSend = Boolean(value.trim())
 
   return (
     <form className="composer" ref={rootRef} onSubmit={(event) => { event.preventDefault(); submit() }}>
@@ -1751,7 +1767,7 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
           rows={1}
           readOnly={voiceActive}
           className={voiceActive ? 'voice-input' : ''}
-          placeholder={voiceActive ? '正在聆听…' : currentId ? '@ 添加上下文，/ 使用命令和技能' : '先选择一个会话，或新建任务'}
+          placeholder={voiceActive ? '正在聆听…' : currentId ? '@ 添加上下文，/ 使用命令和技能' : '直接输入即可发送，会在当前工作区新建任务'}
           onChange={(event) => setValue(event.target.value)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
@@ -1905,7 +1921,7 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
           </button>
           {running
             ? <button type="button" className="send-btn stop" onClick={onStop} title="停止" aria-label="停止"><Icon name="stop" size={16} /></button>
-            : <button type="submit" className="send-btn" disabled={!canSend} title={!currentId ? '请先选择会话' : canSend ? '发送（Enter）' : '输入内容后发送（Enter）'} aria-label="发送"><Icon name="arrowUp" /></button>}
+            : <button type="submit" className="send-btn" disabled={!canSend} title={!canSend ? '输入内容后发送（Enter）' : currentId ? '发送（Enter）' : '发送（Enter）· 会在当前工作区新建任务'} aria-label="发送"><Icon name="arrowUp" /></button>}
         </div>
         )}
         <input ref={uploadRef} type="file" multiple style={{ display: 'none' }} onChange={(event) => uploadFile(event.target.files)} />
@@ -1933,7 +1949,7 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
           </button>
           {footerMenu === 'workspace' && (
             <Popover className="left footer-pop workspace-pop">
-              <div className="popover-head">工作区 · 切换会新建任务</div>
+              <div className="popover-head">{currentId ? '工作区 · 切换会新建任务' : '工作区 · 首个消息在此新建任务'}</div>
               {workspaces.map((item) => (
                 <PopoverItem
                   key={item.path}
@@ -1941,7 +1957,14 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
                   label={basename(item.path)}
                   hint={item.path}
                   selected={item.path === workspace}
-                  onClick={() => { setFooterMenu(null); if (item.path !== workspace) onNewInWorkspace?.(item.path) }}
+                  onClick={() => {
+                    setFooterMenu(null)
+                    if (item.path === workspace) return
+                    // 没有选中会话时切换工作区不该建空会话：先只记住目标工作区，
+                    // 用户发出第一条消息时再在那个工作区里新建。
+                    if (!currentId) onPickWorkspace?.(item.path)
+                    else onNewInWorkspace?.(item.path)
+                  }}
                 />
               ))}
               {workspaces.length === 0 && <div className="popover-empty">还没有工作区</div>}
@@ -1963,46 +1986,39 @@ function Composer({ running, onSend, onStop, onQuickAction, onError, currentId, 
 
 /* ---------------- 语音讨论 ---------------- */
 
-function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onError, onDraft }) {
+// 语音讨论 = 纯对话，不是 agent 任务。
+// 后端 /api/voice/chat 不走 LiveCli、不带工具、不写会话文件，
+// 讨论历史只存在本组件内存里。这样「陪你理思路」才不会被工具调用打断，
+// 也不会出现工具状态识别。
+function VoiceDiscussion({ model, onClose, onError, onDraft }) {
   const [phase, setPhase] = useState('listening')
   const [log, setLog] = useState([])
   const [interim, setInterim] = useState('')
   const [elapsed, setElapsed] = useState(0)
   const [waveBars, setWaveBars] = useState(VOICE_FLAT_BARS)
   const [ttsOn, setTtsOn] = useState(true)
+  const [busy, setBusy] = useState(false)
 
   const bodyRef = useRef(null)
   const openRef = useRef(true)
   const listeningRef = useRef(false)
-  const phaseRef = useRef('listening')
   const recognitionRef = useRef(null)
   const finalRef = useRef('')
   const interimRef = useRef('')
   const sessionBaseRef = useRef('')
-  const turnTimerRef = useRef(0)
   const restartTimerRef = useRef(0)
-  const watchdogRef = useRef(0)
   const startedRef = useRef(Date.now())
   const elapsedTimerRef = useRef(0)
   const waveTimerRef = useRef(0)
   const mediaStreamRef = useRef(null)
   const audioCtxRef = useRef(null)
   const analyserRef = useRef(null)
-  const pendingSendRef = useRef(false)
-  const seenRunningRef = useRef(false)
-  const cursorRef = useRef(0)
-  const lastLiveRef = useRef('')
-  const interruptedRef = useRef(false)
   const ttsOnRef = useRef(true)
-  const messagesRef = useRef(messages)
   const logRef = useRef(log)
-  messagesRef.current = messages
+  const abortRef = useRef(null)
   logRef.current = log
 
-  const changePhase = (next) => {
-    phaseRef.current = next
-    setPhase(next)
-  }
+  const changePhase = (next) => setPhase(next)
 
   const stopWaveform = () => {
     if (waveTimerRef.current) { clearInterval(waveTimerRef.current); waveTimerRef.current = 0 }
@@ -2067,19 +2083,25 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
     }, 70)
   }
 
-  const stopAll = () => {
-    openRef.current = false
+  // 只停采集（麦克风 + 波形 + 朗读），不关闭面板、不中止在途请求。
+  const stopCapture = () => {
     listeningRef.current = false
-    clearTimeout(turnTimerRef.current)
     clearTimeout(restartTimerRef.current)
-    clearTimeout(watchdogRef.current)
-    clearInterval(elapsedTimerRef.current)
+    restartTimerRef.current = 0
     const recognition = recognitionRef.current
     recognitionRef.current = null
     if (recognition) { try { recognition.stop() } catch (_) {} }
     stopWaveform()
     try { window.speechSynthesis?.cancel() } catch (_) {}
-    pendingSendRef.current = false
+  }
+
+  const stopAll = () => {
+    openRef.current = false
+    stopCapture()
+    clearInterval(elapsedTimerRef.current)
+    const controller = abortRef.current
+    abortRef.current = null
+    if (controller) controller.abort()
   }
 
   const speakReply = (text, done) => {
@@ -2105,35 +2127,69 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
     startListening()
   }
 
+  // 纯对话调用：把完整讨论历史发给后端，拿回一句回复。
+  // summarize=true 时后端换成总结提示词，返回结构化总结。
+  const callVoiceChat = async (history, summarize) => {
+    const controller = new AbortController()
+    abortRef.current = controller
+    try {
+      const response = await fetch(withToken('/api/voice/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: history.map((item) => ({ role: item.role, text: item.text })),
+          model: model || undefined,
+          summarize: Boolean(summarize),
+        }),
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        const text = await response.text().catch(() => '')
+        throw new Error(`HTTP ${response.status}${text ? ' · ' + text.slice(0, 200) : ''}`)
+      }
+      const data = await response.json()
+      return String(data.reply || '').trim()
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null
+    }
+  }
+
   const submitUtterance = () => {
+    if (busy) return
     const text = (finalRef.current + interimRef.current).trim()
     if (!text) return
+    finalRef.current = ''
+    interimRef.current = ''
+    sessionBaseRef.current = ''
     sendUtterance(text)
   }
 
   const sendUtterance = (text) => {
-    clearTimeout(turnTimerRef.current)
-    listeningRef.current = false
-    const recognition = recognitionRef.current
-    recognitionRef.current = null
-    if (recognition) { try { recognition.stop() } catch (_) {} }
-    stopWaveform()
+    stopCapture()
     setInterim('')
+    const next = [...logRef.current, { role: 'user', text }]
+    setLog(next)
     changePhase('thinking')
-    setLog((previous) => [...previous, { role: 'user', text }])
-    cursorRef.current = messagesRef.current.length
-    pendingSendRef.current = true
-    seenRunningRef.current = false
-    interruptedRef.current = false
-    lastLiveRef.current = ''
-    onSend(text)
-    clearTimeout(watchdogRef.current)
-    watchdogRef.current = window.setTimeout(() => {
-      if (pendingSendRef.current && !seenRunningRef.current) {
-        pendingSendRef.current = false
+    setBusy(true)
+    ;(async () => {
+      try {
+        const reply = await callVoiceChat(next, false)
+        if (!openRef.current) return
+        setBusy(false)
+        setLog((previous) => [...previous, { role: 'assistant', text: reply }])
+        if (ttsOnRef.current && window.speechSynthesis) {
+          changePhase('speaking')
+          speakReply(reply, resumeListening)
+        } else {
+          resumeListening()
+        }
+      } catch (error) {
+        if (!openRef.current || error.name === 'AbortError') return
+        setBusy(false)
+        onError?.(`语音讨论失败：${error.message}`)
         resumeListening()
       }
-    }, 3000)
+    })()
   }
 
   const startListening = () => {
@@ -2169,9 +2225,7 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
       interimRef.current = interimText
       const total = (finalRef.current + interimText).trim()
       setInterim(total)
-      // 刻意不在此处自动提交:原先静默 1.4s 就 sendUtterance,导致
-      // 说话中途的思考停顿被当成"说完了",半句话被送出且无法撤回。
-      // 现在只在本地累积,由用户点「发送这句」显式提交。
+      // 刻意不自动提交：停顿时长不能代表「说完了」，由用户点「发送这句」显式提交。
     }
     recognition.onerror = (event) => {
       const code = event.error
@@ -2210,46 +2264,21 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
     }
   }
 
-  const finalizeReply = () => {
-    if (!pendingSendRef.current) return
-    pendingSendRef.current = false
-    seenRunningRef.current = false
-    clearTimeout(watchdogRef.current)
-    const reply = assistantReplyAfter(messagesRef.current, cursorRef.current) || lastLiveRef.current
-    lastLiveRef.current = ''
-    if (reply) {
-      setLog((previous) => [...previous, { role: 'assistant', text: reply }])
-    }
-    if (!reply || interruptedRef.current) {
-      interruptedRef.current = false
-      resumeListening()
-      return
-    }
-    if (ttsOnRef.current && window.speechSynthesis) {
-      changePhase('speaking')
-      speakReply(reply, resumeListening)
-    } else {
-      resumeListening()
-    }
-  }
-
   const pauseListening = () => {
     if (!listeningRef.current) return
-    listeningRef.current = false
-    clearTimeout(turnTimerRef.current)
-    clearTimeout(restartTimerRef.current)
-    const recognition = recognitionRef.current
-    recognitionRef.current = null
-    if (recognition) { try { recognition.stop() } catch (_) {} }
-    stopWaveform()
+    stopCapture()
     setInterim('')
     changePhase('paused')
   }
 
+  // 打断：优先中止在途的模型请求；否则只是跳过朗读继续听。
   const interruptReply = () => {
-    if (running) {
-      interruptedRef.current = true
-      onStop?.()
+    const controller = abortRef.current
+    if (controller) {
+      controller.abort()
+      abortRef.current = null
+      setBusy(false)
+      resumeListening()
       return
     }
     try { window.speechSynthesis?.cancel() } catch (_) {}
@@ -2263,24 +2292,40 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
     if (!next) { try { window.speechSynthesis?.cancel() } catch (_) {} }
   }
 
+  // 结束讨论：让模型出总结，只填入输入框等待用户修改后自行发送。
+  // 绝不直接发送——总结与语音转写都可能失真，用户必须保留最后决定权。
+  const finishDiscussion = () => {
+    if (busy) return
+    stopCapture()
+    const items = [...logRef.current]
+    const tail = interimRef.current.trim()
+    if (tail) items.push({ role: 'user', text: tail })
+    setInterim('')
+    finalRef.current = ''
+    interimRef.current = ''
+    sessionBaseRef.current = ''
+    if (!items.length) { onClose(); return }
+    setBusy(true)
+    changePhase('thinking')
+    ;(async () => {
+      try {
+        const summary = await callVoiceChat(items, true)
+        if (!openRef.current) return
+        setBusy(false)
+        if (summary) onDraft?.(summary)
+        onClose()
+      } catch (error) {
+        if (!openRef.current || error.name === 'AbortError') return
+        setBusy(false)
+        onError?.(`总结失败：${error.message}`)
+        resumeListening()
+      }
+    })()
+  }
+
   const closeDiscussion = () => {
     stopAll()
     onClose()
-  }
-
-  const finishDiscussion = () => {
-    if (pendingSendRef.current) return
-    const items = [...logRef.current]
-    if (interim.trim()) items.push({ role: 'user', text: interim.trim() })
-    stopAll()
-    onClose()
-    if (!items.length) return
-    const transcript = items
-      .map((item) => `${item.role === 'user' ? '我' : 'AI'}：${item.text}`)
-      .join('\n')
-    // 只填入输入框等待编辑，绝不直接发送：语音转写难免有错字与断句错误，
-    // 直接发出去用户没有任何纠正机会（原先 onSend 此处即发送，是缺陷根源）。
-    onDraft?.(`请把我们刚才的语音讨论整理成清晰的思路，按以下结构输出：\n1. 核心问题\n2. 关键观点与取舍\n3. 结论\n4. 下一步行动\n\n讨论记录：\n${transcript}`)
   }
 
   useEffect(() => {
@@ -2298,23 +2343,9 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
   }, [])
 
   useEffect(() => {
-    if (live) lastLiveRef.current = live
-    if (running) {
-      if (!pendingSendRef.current) return
-      seenRunningRef.current = true
-      clearTimeout(watchdogRef.current)
-      changePhase(live ? 'replying' : 'thinking')
-      return
-    }
-    if (!pendingSendRef.current || !seenRunningRef.current) return
-    const timer = window.setTimeout(finalizeReply, 600)
-    return () => clearTimeout(timer)
-  }, [running, live, messages])
-
-  useEffect(() => {
     const node = bodyRef.current
     if (node) node.scrollTop = node.scrollHeight
-  }, [log, interim, live, phase])
+  }, [log, interim, phase])
 
   useEffect(() => {
     const onKey = (event) => {
@@ -2331,7 +2362,6 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
     listening: '正在聆听…',
     paused: '已暂停',
     thinking: '思考中…',
-    replying: '回答中…',
     speaking: '朗读中…',
   }[phase] || ''
 
@@ -2341,7 +2371,7 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
         <div className="vd-head">
           <div>
             <div className="vd-title">语音讨论</div>
-            <div className="vd-sub">说完点「发送这句」，AI 才会接话；结束时可整理成思路</div>
+            <div className="vd-sub">AI 只陪你聊清思路，不调用任何工具；结束后生成总结填进输入框，由你改完再发</div>
           </div>
           <div className="vd-head-actions">
             <button
@@ -2359,10 +2389,10 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
           </div>
         </div>
         <div className="vd-body" ref={bodyRef}>
-          {log.length === 0 && !interim && !live && (
+          {log.length === 0 && !interim && (
             <div className="vd-empty">
               <div className="vd-empty-icon"><Icon name="wave" size={24} /></div>
-              点击下方麦克风开始说话。你说完点「发送这句」，AI 才会接话帮你梳理；结束时会生成结构化思路。
+              想到什么就说什么，说完点「发送这句」。AI 会追问、帮你补全没想到的角度；聊够了点「结束并整理」。
             </div>
           )}
           {log.map((item, index) => (
@@ -2371,12 +2401,6 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
               <div className="vd-text">{item.text}</div>
             </div>
           ))}
-          {phase === 'replying' && live && (
-            <div className="vd-msg assistant">
-              <span className="vd-who">AI</span>
-              <div className="vd-text">{live}<span className="cursor" /></div>
-            </div>
-          )}
           {interim && (
             <div className="vd-msg user interim">
               <span className="vd-who">你</span>
@@ -2411,7 +2435,7 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
           <button
             type="button"
             className="vd-send"
-            disabled={!interim.trim() || phase === 'thinking' || phase === 'replying'}
+            disabled={!interim.trim() || busy || phase === 'thinking' || phase === 'speaking'}
             onClick={submitUtterance}
             title="把这句话发给 AI"
           >
@@ -2420,10 +2444,10 @@ function VoiceDiscussion({ running, live, messages, onSend, onStop, onClose, onE
           <button
             type="button"
             className="vd-end"
-            disabled={phase === 'thinking' || phase === 'replying'}
+            disabled={busy}
             onClick={finishDiscussion}
           >
-            结束并整理
+            {busy ? '整理中…' : '结束并整理'}
           </button>
         </div>
       </div>

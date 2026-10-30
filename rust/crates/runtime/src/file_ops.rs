@@ -908,7 +908,8 @@ pub fn run_cargo_check_for_file(file_path: &Path) -> Option<String> {
 
     let project_root = cargo_toml.parent()?;
 
-    let mut child = std::process::Command::new("cargo")
+    // quiet_command:每次 .rs 编辑后都会跑 cargo check,不能每次都弹控制台窗口。
+    let mut child = crate::sandbox::quiet_command("cargo")
         .arg("check")
         .arg("--message-format=short")
         .current_dir(project_root)

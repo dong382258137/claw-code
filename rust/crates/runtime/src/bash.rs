@@ -544,7 +544,7 @@ pub(crate) fn kill_process_tree(pid: u32) {
         // /T 递归终止子进程树,/F 强制终止。/PID 的进程可能已被 child.kill()
         // 终止,taskkill 对已死进程返回非零,但 /T 仍会清理存活的后代;
         // 忽略返回值(尽力而为)。
-        let _ = std::process::Command::new("taskkill")
+        let _ = crate::sandbox::quiet_command("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -873,7 +873,9 @@ fn prepare_command(
     }
 
     if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = Command::new(launcher.program);
+        // quiet_command:Windows 下不新建控制台窗口(Web 服务常为无控制台的
+        // 游离进程,否则每条命令都会闪一个黑框)。
+        let mut prepared = crate::sandbox::quiet_command(launcher.program);
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
@@ -883,7 +885,7 @@ fn prepare_command(
     }
 
     let kind = shell_kind();
-    let mut prepared = Command::new(&kind.program);
+    let mut prepared = crate::sandbox::quiet_command(&kind.program);
     // cmd.exe 路径加 `chcp 65001` 前缀切换代码页到 UTF-8，
     // 避免 cmd 默认 GBK 代码页导致中文输出乱码。
     // 仅影响 cmd /C 路径，bash -c / sh -lc 路径不受影响。
@@ -913,7 +915,8 @@ fn prepare_tokio_command(
     }
 
     if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = TokioCommand::new(launcher.program);
+        // 同 prepare_command:必须静默,否则 Web 端每条命令都会新开控制台窗口。
+        let mut prepared = crate::sandbox::quiet_tokio_command(launcher.program);
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
@@ -923,7 +926,7 @@ fn prepare_tokio_command(
     }
 
     let kind = shell_kind();
-    let mut prepared = TokioCommand::new(&kind.program);
+    let mut prepared = crate::sandbox::quiet_tokio_command(&kind.program);
     // cmd.exe 路径加 `chcp 65001` 前缀切换代码页到 UTF-8
     let final_command = if kind.kind == ShellType::Cmd {
         format!("chcp 65001 >nul && {}", command)

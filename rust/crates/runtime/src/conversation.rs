@@ -1385,6 +1385,13 @@ pub trait ApiClient: Send {
     /// 注入流式状态回调(供 TUI 状态栏/输出视图实时消费;默认 no-op)。
     /// 该类型上移自 CLI 的 streaming.rs,使得 box 成 trait object 后仍可注入。
     fn set_status_emitter(&mut self, _emitter: StatusEmitter) {}
+
+    /// P0-2 渐进式工具加载:把 `name` 加入下一请求的工具注入集。
+    ///
+    /// 运行时在 `ToolSearch` 成功后对返回的每个工具名调用本方法;实现方
+    /// (`AnthropicRuntimeClient`)转发给 `GlobalToolRegistry::activate_tool`。
+    /// 非渐进模式 / 不支持注册表的后端命中默认 no-op。
+    fn activate_tool(&mut self, _name: &str) {}
 }
 
 /// `ApiClient` 的 trait-object 包装:让 `ConversationRuntime<Box<dyn ApiClient>>`
@@ -1435,6 +1442,10 @@ impl ApiClient for Box<dyn ApiClient + 'static> {
 
     fn thinking_mode(&self) -> Option<bool> {
         (**self).thinking_mode()
+    }
+
+    fn activate_tool(&mut self, name: &str) {
+        (**self).activate_tool(name);
     }
 
     fn reasoning_effort(&self) -> Option<String> {
@@ -5459,6 +5470,20 @@ where
                                 }
                             }
                         };
+                        // P0-2 渐进式工具加载:ToolSearch 命中的工具必须加入
+                        // 下一请求的 tools 数组(否则模型"发现"了工具却无法调用)。
+                        // 非渐进模式 register 内的 activate_tool 为 no-op。
+                        if !is_error && tool_name.eq_ignore_ascii_case("ToolSearch") {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) {
+                                if let Some(matches) =
+                                    parsed.get("matches").and_then(|value| value.as_array())
+                                {
+                                    for name in matches.iter().filter_map(|value| value.as_str()) {
+                                        self.api_client.activate_tool(name);
+                                    }
+                                }
+                            }
+                        }
                         // SlopScanner:在 merge_hook_feedback 污染前扫描原始产物。
                         // write_file/edit_file 的 output 是 JSON,含 content/newString。
                         // 命中占位标记(unimplemented!/placeholder/TODO)时生成 warning,

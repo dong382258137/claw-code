@@ -1224,7 +1224,8 @@ impl std::fmt::Debug for McpStdioProcess {
 
 impl McpStdioProcess {
     pub fn spawn(transport: &McpStdioTransport) -> io::Result<Self> {
-        let mut command = Command::new(&transport.command);
+        // quiet_tokio_command:MCP server 是控制台程序,Web 服务无控制台时会弹窗。
+        let mut command = crate::sandbox::quiet_tokio_command(&transport.command);
         command
             .args(&transport.args)
             .stdin(Stdio::piped())

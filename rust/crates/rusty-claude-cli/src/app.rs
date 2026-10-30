@@ -3824,7 +3824,7 @@ fn build_api_client(
     // 混合分工已停用(2026-10-03):曾把 Trivial 纯推理回合(含分诊)路由到网页
     // 零 token,但网页端高频调用被 DeepSeek 官方风控、账号被禁两天。所有档位
     // 一律走 API 端;`--model deepseek-web` 仍为显式完整网页模式(见上分支)。
-    Ok(Box::new(AnthropicRuntimeClient::new(
+    let mut client = AnthropicRuntimeClient::new(
         session_id,
         model.to_string(),
         enable_tools,
@@ -3832,7 +3832,20 @@ fn build_api_client(
         allowed_tools,
         tool_registry,
         progress_reporter,
-    )?))
+    )?;
+    // P0-2:Trae 上游不返回 prompt cache(实测相同 947-token 前缀两次请求
+    // cache_read 均为 0),全量 85 个工具 schema(~63k 字符)会在每次迭代
+    // 重复 prefill。主 client 默认启用渐进式工具加载:只注入核心集 +
+    // ToolSearch/WebSearch/WebFetch,其余工具经 ToolSearch 发现后激活
+    // (激活链路见 runtime `ApiClient::activate_tool`)。
+    // 显式设置 RUSTY_CLAUDE_PROGRESSIVE_TOOLS 时尊重环境变量,不再自动开启。
+    if enable_tools
+        && model.trim().starts_with("trae/")
+        && std::env::var_os("RUSTY_CLAUDE_PROGRESSIVE_TOOLS").is_none()
+    {
+        client.set_progressive_tools(true);
+    }
+    Ok(Box::new(client))
 }
 
 /// 解析「质量敏感」辅助 LLM 子件应使用的模型。

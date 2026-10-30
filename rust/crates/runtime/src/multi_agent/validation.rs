@@ -157,7 +157,7 @@ impl ValidationGate for CommandValidationGate {
             .with_field("command", serde_json::Value::String(self.command.join(" "))),
         );
 
-        let output = std::process::Command::new(&self.command[0])
+        let output = crate::sandbox::quiet_command(&self.command[0])
             .args(&self.command[1..])
             .current_dir(&self.workspace_root)
             .output();

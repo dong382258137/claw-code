@@ -7,6 +7,7 @@ use crate::types::MessageRequest;
 
 pub mod model_tier;
 pub mod openai_compat;
+pub mod trae;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ProviderKind {

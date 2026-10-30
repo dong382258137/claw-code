@@ -15,7 +15,7 @@
 //!   per-sample exit code 跟踪,`timeout_seconds` 控制单次运行上限。
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -358,11 +358,12 @@ fn run_one(
     index: usize,
 ) -> Result<Sample, String> {
     let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
+        // quiet_command:采样命令不允许在 Web 端弹出控制台窗口。
+        let mut c = crate::sandbox::quiet_command("cmd");
         c.arg("/c").arg(command);
         c
     } else {
-        let mut c = Command::new("sh");
+        let mut c = crate::sandbox::quiet_command("sh");
         c.arg("-c").arg(command);
         c
     };

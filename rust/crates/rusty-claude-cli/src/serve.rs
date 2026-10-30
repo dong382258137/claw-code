@@ -28,6 +28,11 @@ use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use api::{
+    InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, ProviderClient,
+    SystemContent,
+};
+
 use crate::session_mgr::PRIMARY_SESSION_EXTENSION;
 
 // React 前端的单文件构建产物（web/dist/index.html，由 web/ 下的 Vite 工程生成并提交）。
@@ -127,6 +132,29 @@ struct PromptBody {
     permission: Option<String>,
     /// 本轮使用的模型；缺省时用工作区配置的默认模型。
     model: Option<String>,
+}
+
+/// 语音讨论的单轮对话记录（前端持有，后端不落盘）。
+#[derive(Deserialize)]
+struct VoiceTurn {
+    /// "user" 或 "assistant"。
+    role: String,
+    text: String,
+}
+
+/// 语音讨论请求体。
+///
+/// 与 [`PromptBody`] 的关键差别：这里**没有** permission / session 概念。
+/// 语音讨论是纯对话，不执行任何工具、不写任何会话文件，因此不需要权限模式。
+#[derive(Deserialize)]
+struct VoiceChatBody {
+    /// 讨论历史，按时间顺序；最后一条通常是用户刚说完的话。
+    messages: Vec<VoiceTurn>,
+    /// 本轮模型；缺省用工作区配置的默认模型。
+    model: Option<String>,
+    /// `true` 表示本次请求是「结束讨论，生成总结」。
+    #[serde(default)]
+    summarize: bool,
 }
 
 #[derive(Deserialize)]
@@ -636,6 +664,8 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             )
             .route("/api/session/{id}/events", get(api_events))
             .route("/api/session/{id}/approval", post(api_approval))
+            // 语音讨论：无工具纯对话，与 agent 会话完全隔离（不落盘、不碰工作区）。
+            .route("/api/voice/chat", post(api_voice_chat))
             .route(
                 "/api/web-settings",
                 get(api_web_settings_get).post(api_web_settings_set),
@@ -1305,6 +1335,130 @@ async fn api_events(
         }
     });
     Sse::new(stream).into_response()
+}
+
+/// 语音讨论的引导式系统提示词。
+///
+/// 关键约束「绝不调用工具」不是客套：语音讨论若挂上工具与工作区上下文，
+/// 模型会开始查证代码、把对话变成任务执行，用户就失去了「聊天理思路」
+/// 这个产品意图。因此该端点刻意不经过 `LiveCli`。
+const VOICE_CHAT_SYSTEM: &str = "\
+你是用户的思路整理伙伴，正在通过语音与他对话。
+
+规则：
+1. 绝不调用任何工具，不读文件、不查代码、不执行命令。你只负责聊天。
+2. 用户的话来自语音识别，可能有错字、断句错误和口语重复。按最合理的理解往下接，不要纠错、不要打断。
+3. 你的任务不是替他回答，而是帮他把想法理清楚：追问含糊的地方、指出自相矛盾之处、补全他没想到的角度、在岔路口给出两三个方向让他挑。
+4. 回复必须短，一到三句，像真人在说话，不要分点罗列长文——这段文字会被朗读出来。一次只问一个问题。
+5. 不要复述他说过的话，直接推进。";
+
+/// 结束讨论时的总结提示词。
+const VOICE_SUMMARY_SYSTEM: &str = "\
+把用户这轮语音讨论整理成一份可以直接拿去用的需求描述。
+
+要求：
+- 用中文，markdown，严格按下面的结构，不要增删小节；
+- 直接给结论，不要寒暄，不要复述讨论过程；
+- 只写讨论中真实出现过的内容，没聊到的写「未定」，不要替他编造；
+- 全文控制在 400 字以内。
+
+## 目标
+## 关键决策
+## 待确认
+## 下一步";
+
+/// 总结轮追加的 user 消息（触发模型收尾）。
+const VOICE_SUMMARY_INSTRUCTION: &str = "讨论到这里，请按约定结构输出总结。";
+
+/// 语音讨论：纯对话端点（无工具、无会话、不落盘）。
+///
+/// 与 `/api/session/{id}/prompt` 的本质区别：
+/// - 不走 `LiveCli`，因此没有工具循环、没有 repomap 系统提示词、不写会话 JSONL；
+/// - 讨论历史由前端持有，后端每次收全量再转发给模型（无状态）。
+async fn api_voice_chat(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+    Json(body): Json<VoiceChatBody>,
+) -> Response {
+    if !authorize(&state, &auth) {
+        return unauthorized();
+    }
+    if body.messages.is_empty() {
+        return (StatusCode::BAD_REQUEST, "讨论内容为空").into_response();
+    }
+    let model = body
+        .model
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| {
+            crate::config_model_for_current_dir()
+                .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+        });
+
+    let mut messages: Vec<InputMessage> = body
+        .messages
+        .iter()
+        .map(|turn| InputMessage {
+            role: if turn.role == "assistant" {
+                "assistant".to_string()
+            } else {
+                "user".to_string()
+            },
+            content: vec![InputContentBlock::Text {
+                text: turn.text.clone(),
+            }],
+        })
+        .collect();
+    if body.summarize {
+        messages.push(InputMessage::user_text(VOICE_SUMMARY_INSTRUCTION));
+    }
+
+    let request = MessageRequest {
+        model: model.clone(),
+        // 讨论轮短（要朗读），总结轮才需要更长篇幅。
+        max_tokens: if body.summarize { 2000 } else { 800 },
+        messages,
+        system: Some(SystemContent::from_text(if body.summarize {
+            VOICE_SUMMARY_SYSTEM
+        } else {
+            VOICE_CHAT_SYSTEM
+        })),
+        stream: false,
+        // 语音对话要求低延迟，关掉思维链。
+        thinking_mode: Some(false),
+        ..Default::default()
+    };
+
+    let client = match ProviderClient::from_model(&model) {
+        Ok(client) => client,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("创建模型客户端失败：{error}"),
+            )
+                .into_response()
+        }
+    };
+    let response = match client.send_message(&request).await {
+        Ok(response) => response,
+        Err(error) => {
+            return (StatusCode::BAD_GATEWAY, format!("模型调用失败：{error}")).into_response()
+        }
+    };
+    let reply = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string();
+    if reply.is_empty() {
+        return (StatusCode::BAD_GATEWAY, "模型返回了空回复").into_response();
+    }
+    Json(json!({ "reply": reply })).into_response()
 }
 
 async fn api_interrupt(
@@ -3393,7 +3547,8 @@ fn generate_token() -> String {
 fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd")
+        // quiet_command:打开浏览器不应在 Web 服务后面闪一个控制台窗口。
+        let _ = runtime::sandbox::quiet_command("cmd")
             .args(["/C", "start", "", url])
             .spawn();
     }

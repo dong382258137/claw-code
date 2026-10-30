@@ -33,7 +33,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -304,7 +304,8 @@ fn attach_session(args: &mut Value, session: &str) {
 }
 
 fn invoke_once(exe: &Path, tool: &str, args: &Value) -> Result<String, String> {
-    let mut cmd = Command::new(exe);
+    // quiet_command:每个动作都是一次性进程,Web 服务无控制台时不能弹窗。
+    let mut cmd = runtime::sandbox::quiet_command(exe);
     cmd.arg("call").arg(tool).arg("--json");
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -347,7 +348,7 @@ fn invoke_once(exe: &Path, tool: &str, args: &Value) -> Result<String, String> {
 
 /// Start the cua-driver daemon in the background (`cua-driver serve`).
 fn start_daemon(exe: &Path) -> Result<(), String> {
-    let mut cmd = Command::new(exe);
+    let mut cmd = runtime::sandbox::quiet_command(exe);
     cmd.arg("serve");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -535,7 +536,7 @@ fn cdp_open(input: &WindowsControlInput) -> Result<String, String> {
 /// Run a PowerShell one-liner and return trimmed stdout ("" when the command
 /// produced no output).
 fn ps_capture(script: &str) -> Result<String, String> {
-    let out = Command::new("powershell.exe")
+    let out = runtime::sandbox::quiet_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdin(Stdio::null())
         .output()
@@ -655,7 +656,7 @@ fn detect_mode(exe: &Path, pid: u64) -> Result<CdpMode, String> {
 
 /// Kill a process and its whole child tree (`taskkill /PID <pid> /T /F`).
 fn kill_tree(pid: u64) -> Result<(), String> {
-    let status = Command::new("taskkill")
+    let status = runtime::sandbox::quiet_command("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .status()
@@ -689,7 +690,8 @@ fn relaunch_with_debug(
     port: u16,
     mode: CdpMode,
 ) -> Result<(), String> {
-    let mut cmd = Command::new(exe);
+    // 注:目标是 GUI 应用,这里仍显式静默,避免 WebView2 宿主带控制台时闪现。
+    let mut cmd = runtime::sandbox::quiet_command(exe);
     cmd.args(launch_args(exe, orig_cmdline, port));
     if mode == CdpMode::WebView2 {
         cmd.env(

@@ -822,7 +822,8 @@ impl HookRunner {
         timeout_ms: Option<u64>,
     ) -> HookCommandOutcome {
         let (program, flag) = crate::bash::shell_launcher();
-        let mut child = CommandWithStdin::new(Command::new(&program));
+        // quiet_command:Web 服务无控制台时,hook 子进程不弹命令行窗口。
+        let mut child = CommandWithStdin::new(crate::sandbox::quiet_command(&program));
         child.command.arg(flag);
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
@@ -921,7 +922,8 @@ impl HookRunner {
             event.as_str(), tool_name, url
         );
         let (program, flag) = crate::bash::shell_launcher();
-        let mut child = CommandWithStdin::new(Command::new(&program));
+        // quiet_command:Web 服务无控制台时,hook 子进程不弹命令行窗口。
+        let mut child = CommandWithStdin::new(crate::sandbox::quiet_command(&program));
         child.command.arg(flag).arg(&curl_cmd);
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
@@ -1258,7 +1260,7 @@ fn shell_command(command: &str) -> CommandWithStdin {
     // 避免 hooks 与 execute_bash 行为不一致(之前硬编码 cmd /C 导致
     // printf/sleep 等 Unix 命令在 Windows 上失败)。
     let (program, flag) = crate::bash::shell_launcher();
-    let mut command_builder = Command::new(&program);
+    let mut command_builder = crate::sandbox::quiet_command(&program);
     command_builder.arg(flag).arg(command);
     CommandWithStdin::new(command_builder)
 }

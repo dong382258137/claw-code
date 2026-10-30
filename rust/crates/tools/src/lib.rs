@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -690,7 +689,7 @@ impl GlobalToolRegistry {
         // P0-2 渐进模式:`enabled_overlay = Some` 时只注入核心工具 + 已激活工具。
         // `None` 时保持全量注入(默认行为,向后兼容)。
         let overlay = self.enabled_overlay.as_ref();
-        let is_core = |name: &str| core_tool_names().contains(&name);
+        let is_core = |name: &str| progressive_always_injected_tool_names().contains(&name);
         let allowed = |name: &str| allowed_tools.is_none_or(|allowed| allowed.contains(name));
         // builtin:核心工具无条件注入;非核心工具仅在已激活(或全量模式)时注入。
         let builtin_active =
@@ -3348,14 +3347,17 @@ fn resolve_main_ref(branch: &str) -> Option<String> {
 }
 
 fn git_ref_exists(reference: &str) -> bool {
-    Command::new("git")
+    runtime::sandbox::quiet_command("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
         .output()
         .is_ok_and(|output| output.status.success())
 }
 
 fn git_stdout(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    let output = runtime::sandbox::quiet_command("git")
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -3649,7 +3651,8 @@ fn run_python_syntax_check(file_path: &Path) -> Option<String> {
     let file_clone = file_path.to_path_buf();
     for interpreter in ["python", "python3"] {
         // 本机无该解释器(命令不存在)则继续尝试下一个,而非提前返回 None。
-        let Ok(output) = Command::new(interpreter)
+        // quiet_command:编辑 .py 后的内置语法校验不能弹控制台窗口。
+        let Ok(output) = runtime::sandbox::quiet_command(interpreter)
             .args(["-m", "py_compile"])
             .arg(&file_clone)
             .output()
@@ -3893,7 +3896,7 @@ mod python_syntax_fallback_tests {
 
     fn has_python() -> bool {
         ["python", "python3"].iter().any(|cmd| {
-            std::process::Command::new(cmd)
+            runtime::sandbox::quiet_command(cmd)
                 .arg("--version")
                 .output()
                 .is_ok_and(|o| o.status.success())
@@ -5295,6 +5298,33 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut hit_source: Option<String> = None;
 
+        // Prefer Tavily when a key is configured: it is a JSON API, unlike the
+        // HTML-scraping fallbacks below. If Tavily fails or returns no hits,
+        // fall through to the original DuckDuckGo/Bing/Baidu chain.
+        //
+        // 显式 `CLAWD_WEB_SEARCH_BASE_URL` 表示调用方指定了唯一后端(自建网关
+        // 或离线测试注入),此时 Tavily 不得抢先,否则覆盖与注入都会失效。
+        let explicit_backend =
+            std::env::var("CLAWD_WEB_SEARCH_BASE_URL").is_ok_and(|value| !value.trim().is_empty());
+        let tavily_key = (!explicit_backend)
+            .then(|| std::env::var("TAVILY_API_KEY").ok())
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        if let Some(key) = tavily_key {
+            match search_tavily(&client, &input, &key) {
+                Ok(tavily_hits) if !tavily_hits.is_empty() => {
+                    return Ok(web_search_output(
+                        &input.query,
+                        tavily_hits,
+                        Some("tavily".to_string()),
+                        started,
+                    ));
+                }
+                Ok(_) => attempts.push("tavily -> 0 hits".to_string()),
+                Err(error) => attempts.push(format!("tavily -> {error}")),
+            }
+        }
+
         for url in candidate_urls {
             let url_text = url.to_string();
             let response = match client.get(url).send() {
@@ -5356,31 +5386,101 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
             ));
         }
 
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let source_note = hit_source
-            .map(|source| format!(" (source: {source})"))
-            .unwrap_or_default();
-        let summary = format!(
-            "Search results for {:?}. Include a Sources section in the final answer.{}\n{}",
-            input.query, source_note, rendered_hits
-        );
-
-        Ok(WebSearchOutput {
-            query: input.query.clone(),
-            results: vec![
-                WebSearchResultItem::Commentary(summary),
-                WebSearchResultItem::SearchResult {
-                    tool_use_id: String::from("web_search_1"),
-                    content: hits,
-                },
-            ],
-            duration_seconds: started.elapsed().as_secs_f64(),
-        })
+        Ok(web_search_output(&input.query, hits, hit_source, started))
     })
+}
+
+fn web_search_output(
+    query: &str,
+    hits: Vec<SearchHit>,
+    hit_source: Option<String>,
+    started: Instant,
+) -> WebSearchOutput {
+    let rendered_hits = hits
+        .iter()
+        .map(|hit| format!("- [{}]({})", hit.title, hit.url))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source_note = hit_source
+        .map(|source| format!(" (source: {source})"))
+        .unwrap_or_default();
+    let summary = format!(
+        "Search results for {:?}. Include a Sources section in the final answer.{}\n{}",
+        query, source_note, rendered_hits
+    );
+
+    WebSearchOutput {
+        query: query.to_string(),
+        results: vec![
+            WebSearchResultItem::Commentary(summary),
+            WebSearchResultItem::SearchResult {
+                tool_use_id: String::from("web_search_1"),
+                content: hits,
+            },
+        ],
+        duration_seconds: started.elapsed().as_secs_f64(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilySearchResponse {
+    #[serde(default)]
+    results: Vec<TavilySearchResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilySearchResult {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+fn search_tavily(
+    client: &Client,
+    input: &WebSearchInput,
+    api_key: &str,
+) -> Result<Vec<SearchHit>, String> {
+    let body = json!({
+        "api_key": api_key,
+        "query": input.query,
+        "max_results": 8,
+        "search_depth": "basic",
+        "include_answer": false
+    });
+    let response = client
+        .post("https://api.tavily.com/search")
+        .json(&body)
+        .send()
+        .map_err(|error| format!("request: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    let payload: TavilySearchResponse = response
+        .json()
+        .map_err(|error| format!("decode: {error}"))?;
+
+    let mut hits = Vec::new();
+    for result in payload.results {
+        let Some(url) = result.url.filter(|url| !url.trim().is_empty()) else {
+            continue;
+        };
+        let title = result
+            .title
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| url.clone());
+        hits.push(SearchHit { title, url });
+    }
+    if let Some(allowed) = input.allowed_domains.as_ref() {
+        hits.retain(|hit| host_matches_list(&hit.url, allowed));
+    }
+    if let Some(blocked) = input.blocked_domains.as_ref() {
+        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
+    }
+    dedupe_hits(&mut hits);
+    hits.truncate(8);
+    Ok(hits)
 }
 
 fn empty_web_search_output(query: &str, summary: String, started: Instant) -> WebSearchOutput {
@@ -7304,7 +7404,7 @@ fn extract_commit_sha(result: &str) -> Option<String> {
 }
 
 fn current_git_branch() -> Option<String> {
-    let output = Command::new("git")
+    let output = runtime::sandbox::quiet_command("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()?;
@@ -8202,19 +8302,19 @@ fn run_skill_search(input: SkillSearchInput) -> Result<String, String> {
 fn deferred_tool_specs() -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
-        .filter(|spec| {
-            !matches!(
-                spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
-            )
-        })
+        .filter(|spec| !progressive_always_injected_tool_names().contains(&spec.name))
         .collect()
 }
 
-/// P0-2 渐进式工具加载:始终注入的核心工具名(与 [`deferred_tool_specs`] 排除集一致)。
+/// P0-2 渐进式工具加载:始终注入的核心工具名。
 ///
 /// 这 6 个工具是每次任务几乎必然用到的高频基础能力,永远进入请求的 tools 数组;
 /// 其余工具在渐进模式下默认延迟,经 `ToolSearch` 发现后按需激活。
+///
+/// 注意:渐进模式的**实际**注入集见
+/// [`progressive_always_injected_tool_names`] —— 它在此基础上追加了
+/// `ToolSearch`(发现入口,否则模型无法激活任何长尾工具)与
+/// `WebSearch`/`WebFetch`(只读/执行子代理白名单内需要,且不在核心集)。
 #[must_use]
 pub fn core_tool_names() -> [&'static str; 6] {
     [
@@ -8224,6 +8324,26 @@ pub fn core_tool_names() -> [&'static str; 6] {
         "edit_file",
         "glob_search",
         "grep_search",
+    ]
+}
+
+/// 渐进模式下**始终**注入的工具名(核心集 + 发现入口 + 子代理常用网络工具)。
+///
+/// `ToolSearch` 必须常驻:渐进模式其余工具只有经它发现后才会被
+/// [`GlobalToolRegistry::activate_tool`] 激活;若它也被延迟,模型将
+/// 没有任何发现入口(渐进模式会退化为"只有 6 个工具")。
+#[must_use]
+pub fn progressive_always_injected_tool_names() -> &'static [&'static str] {
+    &[
+        "bash",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob_search",
+        "grep_search",
+        "ToolSearch",
+        "WebSearch",
+        "WebFetch",
     ]
 }
 
@@ -9027,7 +9147,7 @@ fn execute_im_bridge_service(input: ImBridgeServiceInput) -> Result<ImBridgeServ
                 .try_clone()
                 .map_err(|e| format!("复制日志句柄失败: {e}"))?;
 
-            let child = std::process::Command::new(&bin)
+            let child = runtime::sandbox::quiet_command(&bin)
                 .stdout(std::process::Stdio::from(log_err))
                 .stderr(std::process::Stdio::from(log))
                 .spawn()
@@ -9107,7 +9227,7 @@ fn im_bridge_probe_running(
 fn im_bridge_find_pid() -> Option<u32> {
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("powershell")
+        let output = runtime::sandbox::quiet_command("powershell")
             .args([
                 "-NoProfile",
                 "-Command",
@@ -9123,7 +9243,7 @@ fn im_bridge_find_pid() -> Option<u32> {
     }
     #[cfg(not(windows))]
     {
-        let output = std::process::Command::new("pgrep")
+        let output = runtime::sandbox::quiet_command("pgrep")
             .arg("-f")
             .arg("claw-im-bridge")
             .output()
@@ -9142,7 +9262,7 @@ fn im_bridge_find_pid() -> Option<u32> {
 fn kill_im_bridge_process(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("taskkill")
+        let status = runtime::sandbox::quiet_command("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .status()
             .map_err(|e| format!("调用 taskkill 失败: {e}"))?;
@@ -9214,7 +9334,7 @@ fn resolve_im_bridge_binary() -> Option<std::path::PathBuf> {
         }
     }
     let name = exe_names[0];
-    if let Ok(output) = std::process::Command::new("where").arg(name).output() {
+    if let Ok(output) = runtime::sandbox::quiet_command("where").arg(name).output() {
         if output.status.success() {
             let first = String::from_utf8_lossy(&output.stdout)
                 .lines()
@@ -9390,7 +9510,8 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     }
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
-    let mut process = Command::new(runtime.program);
+    // 注意:局部变量 `runtime` 遮蔽了 runtime crate,这里用 `::runtime` 强制走 crate 路径。
+    let mut process = ::runtime::sandbox::quiet_command(runtime.program);
     process
         .args(runtime.args)
         .arg(&input.code)
@@ -9775,7 +9896,7 @@ fn clear_plan_mode_state(path: &Path) -> Result<(), String> {
 }
 
 fn iso8601_timestamp() -> String {
-    if let Ok(output) = Command::new("date")
+    if let Ok(output) = runtime::sandbox::quiet_command("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()
     {
@@ -9818,7 +9939,7 @@ fn command_exists(command: &str) -> bool {
     if cfg!(target_os = "windows") {
         // Windows 没有 sh，用 where.exe 检测命令是否存在。
         // where.exe 是 cmd 内置工具，能搜索 PATH 中的可执行文件。
-        std::process::Command::new("where")
+        runtime::sandbox::quiet_command("where")
             .arg(command)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -9875,7 +9996,8 @@ fn execute_shell_command(
     run_in_background: Option<bool>,
 ) -> std::io::Result<runtime::BashCommandOutput> {
     if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
+        // quiet_command:PowerShell 工具是控制台程序,Web 服务无控制台时会弹窗。
+        let child = runtime::sandbox::quiet_command(shell)
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
@@ -9904,7 +10026,7 @@ fn execute_shell_command(
         });
     }
 
-    let mut process = std::process::Command::new(shell);
+    let mut process = runtime::sandbox::quiet_command(shell);
     process
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -10128,7 +10250,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -10202,7 +10323,7 @@ mod tests {
         assert!(registry.enabled_tool_names().is_none());
     }
 
-    /// 渐进模式默认只注入 6 个核心工具(长尾工具被延迟)。
+    /// 渐进模式默认只注入核心集 + 常驻发现/网络工具(长尾工具被延迟)。
     #[test]
     fn progressive_definitions_core_only_by_default() {
         let registry = GlobalToolRegistry::builtin().with_progressive_tools();
@@ -10220,10 +10341,17 @@ mod tests {
                 "write_file",
                 "edit_file",
                 "glob_search",
-                "grep_search"
+                "grep_search",
+                "WebFetch",
+                "WebSearch",
+                "ToolSearch"
             ],
-            "渐进模式应只注入核心工具: {:?}",
+            "渐进模式应注入核心集 + ToolSearch/WebSearch/WebFetch: {:?}",
             names
+        );
+        assert!(
+            names.contains(&"ToolSearch".to_string()),
+            "ToolSearch 必须常驻,否则模型无法发现其余工具"
         );
     }
 
@@ -10232,8 +10360,8 @@ mod tests {
     fn progressive_definitions_activate_adds_tool() {
         let mut registry = GlobalToolRegistry::builtin().with_progressive_tools();
         assert!(
-            registry.activate_tool("ToolSearch"),
-            "ToolSearch 是 mvp 工具,激活应成功"
+            registry.activate_tool("replace_lines"),
+            "replace_lines 是 mvp 工具,激活应成功"
         );
         let names: Vec<String> = registry
             .definitions(None)
@@ -10241,11 +10369,11 @@ mod tests {
             .map(|tool| tool.name)
             .collect();
         assert!(
-            names.contains(&"ToolSearch".to_string()),
-            "激活后应注入 ToolSearch: {:?}",
+            names.contains(&"replace_lines".to_string()),
+            "激活后应注入 replace_lines: {:?}",
             names
         );
-        assert_eq!(names.len(), 7, "6 核心 + 1 激活");
+        assert_eq!(names.len(), 10, "9 常驻 + 1 激活");
     }
 
     /// 渐进模式对 runtime(MCP)工具同样生效:默认延迟,激活后注入。
@@ -10497,7 +10625,7 @@ mod tests {
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = runtime::sandbox::quiet_command("git")
             .args(args)
             .current_dir(cwd)
             .status()
@@ -12452,12 +12580,16 @@ mod tests {
     fn tool_search_supports_keyword_and_select_queries() {
         let keyword = execute_tool(
             "ToolSearch",
-            &json!({"query": "web current", "max_results": 3}),
+            &json!({"query": "powershell", "max_results": 3}),
         )
         .expect("ToolSearch should succeed");
         let keyword_output: serde_json::Value = serde_json::from_str(&keyword).expect("valid json");
         let matches = keyword_output["matches"].as_array().expect("matches");
-        assert!(matches.iter().any(|value| value == "WebSearch"));
+        assert!(matches.iter().any(|value| value == "PowerShell"));
+        // 渐进模式的常驻工具（核心 6 件 + ToolSearch/WebSearch/WebFetch）
+        // 每次请求已注入，不应再出现在延迟工具搜索结果里。
+        assert!(!matches.iter().any(|value| value == "WebSearch"));
+        assert!(!matches.iter().any(|value| value == "WebFetch"));
 
         let selected = execute_tool("ToolSearch", &json!({"query": "select:Agent,Skill"}))
             .expect("ToolSearch should succeed");

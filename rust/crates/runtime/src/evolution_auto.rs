@@ -175,7 +175,8 @@ pub fn committed_file_list(source_root: &Path) -> String {
 /// (runtime 层)与 CLI 手动入口共用同一实现,避免"自动部署"与"手动部署"
 /// 两条路径行为漂移。失败回滚旧 exe,绝不留下半截二进制。
 pub fn install_binary(source_root: &Path) -> Result<std::path::PathBuf, String> {
-    let status = std::process::Command::new("cargo")
+    // quiet_command:进化构建在 Web 端后台执行,不能弹控制台窗口。
+    let status = crate::sandbox::quiet_command("cargo")
         .args(["build", "--release", "-p", "rusty-claude-cli"])
         .current_dir(source_root)
         .status()
@@ -236,7 +237,7 @@ fn run_test_gate(source_root: &Path) -> Option<String> {
         let mut parts = cmd.split_whitespace();
         let prog = parts.next().ok_or_else(|| "空命令".to_string())?;
         let args: Vec<&str> = parts.collect();
-        let status = std::process::Command::new(prog)
+        let status = crate::sandbox::quiet_command(prog)
             .args(&args)
             .current_dir(root)
             .status()
@@ -365,7 +366,7 @@ pub fn run_pipeline(source_root: &Path) -> Result<String, String> {
     // 1. 在源码根拉起 claw 子进程修复(继承其自身可执行文件, 不依赖 PATH)。
     let head_before = head_sha(source_root);
     let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 失败: {e}"))?;
-    let status = std::process::Command::new(&exe)
+    let status = crate::sandbox::quiet_command(&exe)
         .current_dir(source_root)
         .env(ACTIVE_ENV, "1")
         .args(["--dangerously-skip-permissions", "-p", &prompt])
@@ -454,7 +455,7 @@ pub fn spawn_pipeline_detached(workspace: &Path) -> Result<(), String> {
         return Ok(());
     }
     let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 失败: {e}"))?;
-    std::process::Command::new(&exe)
+    crate::sandbox::quiet_command(&exe)
         .current_dir(&source_root)
         // 复用已存在的 `evolve-source` 子命令而非新隐藏参数: 旧二进制不认
         // `auto` 动作会直接报错退出(安全无副作用), 新版才真正执行全管道。

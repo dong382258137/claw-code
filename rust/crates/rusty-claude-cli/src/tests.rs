@@ -2932,9 +2932,28 @@ fn format_connected_line_renders_deepseek_provider_for_deepseek_model() {
 
 #[test]
 fn resolve_repl_model_returns_user_supplied_model_unchanged_when_explicit() {
-    let user_model = "deepseek-v4-flash".to_string();
+    // 用与 DEFAULT_MODEL 相同的字面量验证「显式传值不被配置覆盖」。
+    // 必须隔离本机 ~/.claw/settings.json 的 model，否则该配置会参与解析。
+    let _guard = env_lock();
+    let root = temp_dir();
+    let config_home = root.join("config");
+    fs::create_dir_all(&config_home).expect("config home dir");
+    let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+    let original_model = std::env::var("CLAW_MODEL").ok();
+    std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+    std::env::remove_var("CLAW_MODEL");
 
-    let resolved = resolve_repl_model(user_model);
+    let resolved = resolve_repl_model("deepseek-v4-flash".to_string());
+
+    match original_config_home {
+        Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+        None => std::env::remove_var("CLAW_CONFIG_HOME"),
+    }
+    match original_model {
+        Some(value) => std::env::set_var("CLAW_MODEL", value),
+        None => std::env::remove_var("CLAW_MODEL"),
+    }
+    fs::remove_dir_all(root).expect("cleanup temp dir");
 
     assert_eq!(resolved, "deepseek-v4-flash");
 }
