@@ -35,6 +35,10 @@ use api::{
 
 use crate::session_mgr::PRIMARY_SESSION_EXTENSION;
 
+mod scheduler;
+
+use scheduler::{ConcurrencyConfig, EnqueueError, EventHub, PromptJob, Scheduler, SessionState};
+
 // React 前端的单文件构建产物（web/dist/index.html，由 web/ 下的 Vite 工程生成并提交）。
 // 构建期不需要 Node：dist 已内联 JS/CSS。
 const INDEX_HTML: &str = include_str!("../web/dist/index.html");
@@ -50,13 +54,14 @@ struct AppState {
     workspace: PathBuf,
     /// 实际监听端口（热升级时传给 helper，重启后沿用同一端口）。
     port: u16,
-    /// 正在跑 turn 的会话（同一会话同时只允许一个写入者）。
-    running: Arc<Mutex<HashMap<String, RunningTurn>>>,
-    /// 流式事件广播：`{session, kind, ...}`，供 `/api/session/{id}/events` 订阅。
-    events: tokio::sync::broadcast::Sender<Value>,
+    /// 调度器：并发门闸 + 每会话排队 + 会话状态。
+    scheduler: Arc<Scheduler>,
+    /// 每会话独立事件流（不再是一条全局 broadcast 再按 session 过滤）。
+    events: Arc<EventHub>,
     /// 等待用户在 Web 端批准的越权工具调用（id → 会话 + 应答通道）。
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
     /// 多工作区下串行切换进程 cwd（LiveCli 以 cwd 作为工作区根）。
+    /// Phase 2 删除；Phase 1 并发度仍为 1，作为最后一道闸保留。
     turn_lock: Arc<Mutex<()>>,
 }
 
@@ -64,49 +69,6 @@ struct AppState {
 struct PendingApproval {
     session: String,
     sender: std::sync::mpsc::Sender<bool>,
-}
-
-#[derive(Clone)]
-struct RunningTurn {
-    signal: runtime::HookAbortSignal,
-}
-
-/// turn 线程的兜底守卫：无论正常结束、提前返回还是 panic 逃生，都必须
-/// 清掉 running 表并补发一次 `done`，避免前端永久停在“运行中”且该会话
-/// 后续请求全被 409 拒绝。
-struct TurnGuard {
-    running: Arc<Mutex<HashMap<String, RunningTurn>>>,
-    events: tokio::sync::broadcast::Sender<Value>,
-    session_id: String,
-    /// 与看门狗共享的“已收尾”标志：谁先 `swap` 成功谁负责发 done。
-    finished: Arc<AtomicBool>,
-    released: bool,
-}
-
-impl TurnGuard {
-    fn release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-        // 看门狗已先行收尾（发过 error+done、清过 running），这里不重复。
-        if self.finished.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        self.running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.session_id);
-        let _ = self
-            .events
-            .send(json!({ "session": self.session_id, "kind": "done" }));
-    }
-}
-
-impl Drop for TurnGuard {
-    fn drop(&mut self) {
-        self.release();
-    }
 }
 
 /// 提取 panic payload 的可读信息（`&str` / `String` 两种常见形态）。
@@ -619,17 +581,18 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // 默认它们会继承监听 socket。旧进程退出后，子进程仍持有 4399 的
         // LISTEN 句柄，新进程就永远 bind 不上。这里显式清掉继承标志。
         make_listener_non_inheritable(&listener);
-        let (events, _) = tokio::sync::broadcast::channel(256);
+        let scheduler = Arc::new(Scheduler::new(ConcurrencyConfig::from_env()));
         let state = AppState {
             token: token.clone(),
             sessions,
             workspace: cwd.clone(),
             port: actual_port,
-            running: Arc::new(Mutex::new(HashMap::new())),
-            events,
+            scheduler,
+            events: Arc::new(EventHub::default()),
             approvals: Arc::new(Mutex::new(HashMap::new())),
             turn_lock: Arc::new(Mutex::new(())),
         };
+        spawn_session_watchdog(state.clone());
         let app = Router::new()
             .route("/", get(index))
             .route("/api/sessions", get(api_sessions).post(api_create_session))
@@ -882,18 +845,14 @@ async fn api_session_delete(
         Ok(found) => found,
         Err((code, message)) => return (code, message).into_response(),
     };
-    {
-        let running = state
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if running.contains_key(&id) {
-            return (StatusCode::CONFLICT, "会话正在执行任务，不能删除").into_response();
-        }
+    if state.scheduler.is_active(&id) {
+        return (StatusCode::CONFLICT, "会话正在执行或仍在排队，不能删除").into_response();
     }
     if let Err(error) = std::fs::remove_file(&path) {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
+    state.scheduler.forget(&id);
+    state.events.forget(&id);
     remove_session_title(&workspace, &id);
     let _ = std::fs::remove_file(web_todos_path(&workspace, &id));
     Json(json!({ "deleted": id })).into_response()
@@ -964,9 +923,12 @@ const PERMISSION_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-ful
 struct WebPermissionPrompter {
     mode: runtime::PermissionMode,
     session_id: String,
-    events: tokio::sync::broadcast::Sender<Value>,
+    events: Arc<EventHub>,
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
 }
+
+/// 审批 id 的会话内序号：并发下毫秒时间戳会撞车，必须由单调计数器消歧。
+static APPROVAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn permission_label(mode: runtime::PermissionMode) -> &'static str {
     match mode {
@@ -986,7 +948,11 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
             return runtime::PermissionPromptDecision::Allow;
         }
 
-        let id = format!("approval-{}", now_ms());
+        let id = format!(
+            "approval-{}-{}",
+            self.session_id,
+            APPROVAL_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1
+        );
         let (sender, receiver) = std::sync::mpsc::channel::<bool>();
         {
             let mut map = self
@@ -1001,15 +967,17 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
                 },
             );
         }
-        let _ = self.events.send(json!({
-            "session": self.session_id,
-            "kind": "approval_request",
-            "id": id,
-            "tool": request.tool_name,
-            "input": truncate_chars(&request.input, 2000),
-            "required_mode": permission_label(request.required_mode),
-            "reason": request.reason,
-        }));
+        self.events.emit(
+            &self.session_id,
+            json!({
+                "kind": "approval_request",
+                "id": id,
+                "tool": request.tool_name,
+                "input": truncate_chars(&request.input, 2000),
+                "required_mode": permission_label(request.required_mode),
+                "reason": request.reason,
+            }),
+        );
 
         let allowed = receiver
             .recv_timeout(Duration::from_secs(120))
@@ -1038,7 +1006,7 @@ struct WebTurn<'a> {
     mode: runtime::PermissionMode,
     model_override: Option<String>,
     signal: runtime::HookAbortSignal,
-    events: tokio::sync::broadcast::Sender<Value>,
+    events: Arc<EventHub>,
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
     session_id: &'a str,
     /// 流式事件心跳，看门狗据此判断本轮是否还在推进。
@@ -1048,19 +1016,11 @@ struct WebTurn<'a> {
 /// 活动心跳：每个流式事件都会刷新，供看门狗判断“是否还有进展”。
 type ActivityClock = Arc<AtomicU64>;
 
-/// turn 看门狗：超过阈值没有任何流式事件就主动收尾。
-///
-/// Rust 线程无法被强杀，所以这里不能真正终止底层调用；但至少保证前端拿到
-/// error+done、`running` 被释放，不会像 2026-10-25 那次一样永久转圈。
-/// 阈值由 `CLAW_WEB_TURN_WATCHDOG_SECS` 覆盖，默认 900 秒，`0` 表示禁用。
-fn spawn_turn_watchdog(
-    events: tokio::sync::broadcast::Sender<Value>,
-    running: Arc<Mutex<HashMap<String, RunningTurn>>>,
-    session_id: String,
-    signal: runtime::HookAbortSignal,
-    finished: Arc<AtomicBool>,
-    activity: ActivityClock,
-) {
+/// 会话级看门狗：一个后台线程扫描所有在跑的会话，替代「每 turn 一个
+/// sleep 线程」的旧实现。语义保持不变：超过阈值没有任何流式事件就发
+/// error + done 并释放会话占用。阈值由 `CLAW_WEB_TURN_WATCHDOG_SECS`
+/// 覆盖，默认 900 秒，`0` 表示禁用。
+fn spawn_session_watchdog(state: AppState) {
     let threshold_secs = std::env::var("CLAW_WEB_TURN_WATCHDOG_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -1070,33 +1030,27 @@ fn spawn_turn_watchdog(
     }
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(5));
-        if finished.load(Ordering::SeqCst) {
-            return;
+        let threshold_ms = threshold_secs.saturating_mul(1000);
+        for turn in state.scheduler.expired(threshold_ms) {
+            // 抢占收尾权：失败说明 turn 刚好自己结束了，交给它正常收尾。
+            if turn.finished.swap(true, Ordering::SeqCst) {
+                continue;
+            }
+            // 尝试协作式中止（LLM/工具循环会检查该信号）。
+            turn.signal.abort();
+            state.events.emit(
+                &turn.session,
+                json!({
+                    "kind": "error",
+                    "message": format!(
+                        "[看门狗] 已 {} 秒没有任何输出，本轮已中止；后台线程可能仍在收尾。",
+                        turn.silent_ms / 1000
+                    ),
+                }),
+            );
+            state.scheduler.force_finish(&turn.session);
+            state.events.emit(&turn.session, json!({ "kind": "done" }));
         }
-        let silent_ms = now_ms().saturating_sub(activity.load(Ordering::SeqCst));
-        if silent_ms < threshold_secs.saturating_mul(1000) {
-            continue;
-        }
-        // 抢占收尾权：失败说明 turn 刚好自己结束了，交给它正常收尾。
-        if finished.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        // 尝试协作式中止（LLM/工具循环会检查该信号）。
-        signal.abort();
-        let _ = events.send(json!({
-            "session": session_id,
-            "kind": "error",
-            "message": format!(
-                "[看门狗] 已 {} 秒没有任何输出，本轮已中止；后台线程可能仍在收尾。",
-                silent_ms / 1000
-            ),
-        }));
-        running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&session_id);
-        let _ = events.send(json!({ "session": session_id, "kind": "done" }));
-        return;
     });
 }
 
@@ -1137,7 +1091,7 @@ fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     cli.set_external_abort_signal(signal);
 
-    let sender = events.clone();
+    let sender = Arc::clone(&events);
     let sid = session_id.to_string();
     let activity_clock = Arc::clone(&activity);
     cli.set_status_emitter(Arc::new(move |event: runtime::StatusEvent| {
@@ -1166,7 +1120,7 @@ fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
             runtime::StatusEvent::MessageStop => json!({ "session": sid, "kind": "message_stop" }),
             runtime::StatusEvent::Usage(_) => return,
         };
-        let _ = sender.send(payload);
+        sender.emit(&sid, payload);
     }));
 
     let mut prompter = WebPermissionPrompter {
@@ -1179,7 +1133,118 @@ fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// 写入通道：在 serve 进程内跑一轮，流式事件走 `/api/session/{id}/events`。
+/// 每会话 dispatcher：串行处理自己的队列，只有拿到全局 + 工作区许可后才真正开跑。
+///
+/// 排队本身不再是一次请求的生命周期：`POST /prompt` 入队后立即 202 返回，
+/// 真正等待许可发生在该线程里。
+fn spawn_session_dispatcher(state: AppState, session_id: String) {
+    let task_state = state.clone();
+    let worker_session = session_id.clone();
+    let thread_name = format!(
+        "claw-web-{}",
+        &worker_session[..worker_session.len().min(12)]
+    );
+    let spawned = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || loop {
+            let Some(turn) = task_state.scheduler.take_next(&worker_session) else {
+                return;
+            };
+            // 已被取消的排队项无需再等许可。
+            if turn.signal.is_aborted() {
+                if !turn.finished.swap(true, Ordering::SeqCst) {
+                    task_state
+                        .events
+                        .emit(&worker_session, json!({ "kind": "done" }));
+                }
+                task_state.scheduler.finish(&worker_session);
+                continue;
+            }
+            let permits = task_state.scheduler.acquire_permits(&turn.job.workspace);
+            // 等许可期间被 interrupt：直接放弃这一轮。
+            if turn.signal.is_aborted() {
+                if !turn.finished.swap(true, Ordering::SeqCst) {
+                    task_state
+                        .events
+                        .emit(&worker_session, json!({ "kind": "done" }));
+                }
+                task_state.scheduler.finish(&worker_session);
+                drop(permits);
+                continue;
+            }
+            task_state.scheduler.mark_running(&worker_session);
+
+            let workspace = turn.job.workspace.clone();
+            let session_path = turn.job.session_path;
+            let text = turn.job.text;
+            let mode = turn.job.permission;
+            let model = turn.job.model;
+            let activity = Arc::clone(&turn.activity);
+            let signal = turn.signal.clone();
+            // turn 线程一旦 panic，必须转成普通错误，否则前端永久转圈。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_web_turn(WebTurn {
+                    session_path: &session_path,
+                    workspace: workspace.clone(),
+                    lock: Arc::clone(&task_state.turn_lock),
+                    text: &text,
+                    mode,
+                    model_override: model,
+                    signal,
+                    events: Arc::clone(&task_state.events),
+                    approvals: Arc::clone(&task_state.approvals),
+                    session_id: &worker_session,
+                    activity,
+                })
+            }))
+            .unwrap_or_else(|payload| {
+                Err(format!(
+                    "本轮执行线程异常终止（panic）：{}",
+                    panic_payload_message(&*payload)
+                ))
+            });
+            let failed = outcome.is_err();
+            if let Err(message) = &outcome {
+                task_state.events.emit(
+                    &worker_session,
+                    json!({ "kind": "error", "message": message }),
+                );
+            }
+            // 收尾权由 dispatcher 与看门狗共享：谁先 swap 成功谁发 done。
+            if !turn.finished.swap(true, Ordering::SeqCst) {
+                task_state
+                    .events
+                    .emit(&worker_session, json!({ "kind": "done" }));
+            }
+            task_state.scheduler.finish(&worker_session);
+            drop(permits);
+
+            // Agent 在 turn 里调用了 `HotUpgrade`：只有全服务已安静
+            // （无执行中、无排队）时才允许重启，否则把请求留在原地。
+            if !failed && task_state.scheduler.is_quiet() && tools::take_hot_upgrade_request() {
+                begin_web_upgrade(
+                    &workspace,
+                    task_state.port,
+                    &task_state.token,
+                    &worker_session,
+                    &task_state.events,
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        // 线程起不来：清掉队列并明确告知，避免该会话永久停在 queued。
+        state.scheduler.interrupt(&session_id);
+        state.scheduler.force_finish(&session_id);
+        state.events.emit(
+            &session_id,
+            json!({ "kind": "error", "message": format!("调度线程启动失败：{error}") }),
+        );
+        state.events.emit(&session_id, json!({ "kind": "done" }));
+    }
+}
+
+/// 写入通道：入队后立即 202 返回状态与排队位置；流式事件走
+/// `/api/session/{id}/events`。不再返回「等待工作区锁」这类错误。
 async fn api_prompt(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -1205,104 +1270,49 @@ async fn api_prompt(
             .into_response();
     }
 
-    let signal = runtime::HookAbortSignal::new();
-    {
-        let mut running = state
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if running.contains_key(&id) {
-            return (StatusCode::CONFLICT, "该会话正在执行另一轮，请稍候").into_response();
-        }
-        running.insert(
-            id.clone(),
-            RunningTurn {
-                signal: signal.clone(),
-            },
-        );
-    }
-
-    let events = state.events.clone();
-    let worker_events = events.clone();
-    let approvals = Arc::clone(&state.approvals);
-    let running_map = Arc::clone(&state.running);
-    let session_id = id.clone();
-    let workspace = session_workspace.clone();
-    let lock = Arc::clone(&state.turn_lock);
-    let port = state.port;
-    let token = state.token.clone();
     // `@path:12-40` 这类引用直接展开成带行号的代码块，省掉 agent 首轮 read_file 往返。
     let expanded_text = expand_mentions(&session_workspace, &body.text);
     let text = prompt_with_web_todos(&session_workspace, &id, &expanded_text);
-    let mode = crate::permission_mode_from_label(permission);
-    let model = body.model.clone();
-    // 收尾权（guard 与看门狗共享）+ 活动心跳（每个流式事件刷新）。
-    let finished = Arc::new(AtomicBool::new(false));
-    let activity: ActivityClock = Arc::new(AtomicU64::new(now_ms()));
-    let watchdog_signal = signal.clone();
-    spawn_turn_watchdog(
-        events.clone(),
-        Arc::clone(&running_map),
-        session_id.clone(),
-        watchdog_signal,
-        Arc::clone(&finished),
-        Arc::clone(&activity),
-    );
-    std::thread::spawn(move || {
-        let mut guard = TurnGuard {
-            running: Arc::clone(&running_map),
-            events: events.clone(),
-            session_id: session_id.clone(),
-            finished: Arc::clone(&finished),
-            released: false,
-        };
-        // turn 线程一旦 panic，旧实现会直接消失：不发 error/done、不清 running，
-        // 前端永久转圈且该会话后续请求全被 409 拒绝。catch_unwind 把 panic
-        // 转成普通错误，统一走下面的收尾路径。
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_web_turn(WebTurn {
-                session_path: &path,
-                workspace: workspace.clone(),
-                lock,
-                text: &text,
-                mode,
-                model_override: model,
-                signal,
-                events: worker_events,
-                approvals,
-                session_id: &session_id,
-                activity,
-            })
-        }))
-        .unwrap_or_else(|payload| {
-            Err(format!(
-                "本轮执行线程异常终止（panic）：{}",
-                panic_payload_message(&*payload)
-            ))
-        });
-        let failed = outcome.is_err();
-        if let Err(message) = &outcome {
-            let _ =
-                events.send(json!({ "session": session_id, "kind": "error", "message": message }));
-        }
-        // release() 负责补发 done 并清 running；Drop 兜底不会重复执行。
-        guard.release();
+    let job = PromptJob {
+        session_id: id.clone(),
+        session_path: path,
+        workspace: session_workspace,
+        text,
+        permission: crate::permission_mode_from_label(permission),
+        model: body.model.clone(),
+    };
 
-        // Agent 在 turn 里调用了 `HotUpgrade`：状态已落盘，turn 也已收尾，
-        // 此刻执行 Web 热升级（重建 → 同端口重启 → 页面凭同一 token 重连）。
-        if !failed && tools::take_hot_upgrade_request() {
-            begin_web_upgrade(&workspace, port, &token, &session_id, &events);
+    match state.scheduler.enqueue(job) {
+        Err(EnqueueError::QueueFull) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "该会话排队已满（最多 {} 条），请等待前面的消息处理完成后再发送",
+                scheduler::MAX_QUEUE_PER_SESSION
+            ),
+        )
+            .into_response(),
+        Ok(enqueued) => {
+            if enqueued.start_worker {
+                spawn_session_dispatcher(state.clone(), id.clone());
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "queued",
+                    "state": SessionState::Queued.label(),
+                    "position": enqueued.position,
+                    "session": id,
+                })),
+            )
+                .into_response()
         }
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({ "status": "running", "session": id })),
-    )
-        .into_response()
+    }
 }
 
-/// 流式事件 SSE：只转发当前会话的事件。
+/// 流式事件 SSE：每个会话一条独立广播，只转发本会话事件。
+///
+/// 缓冲不足时不再静默 `continue`，而是补一条 `kind=reset` 事件（带当前
+/// 单调序号与丢弃条数），前端可据此重拉快照。
 async fn api_events(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -1311,25 +1321,29 @@ async fn api_events(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let receiver = state.events.subscribe();
-    let stream = futures_util::stream::unfold((receiver, id), |(mut receiver, id)| async move {
-        loop {
+    let receiver = state.events.subscribe(&id);
+    let hub = Arc::clone(&state.events);
+    let stream =
+        futures_util::stream::unfold((receiver, id, hub), |(mut receiver, id, hub)| async move {
             match receiver.recv().await {
-                Ok(value) => {
-                    if value["session"].as_str() == Some(id.as_str()) {
-                        return Some((
-                            Ok::<Event, Infallible>(
-                                Event::default().event("stream").data(value.to_string()),
-                            ),
-                            (receiver, id),
-                        ));
-                    }
+                Ok(value) => Some((
+                    Ok::<Event, Infallible>(
+                        Event::default().event("stream").data(value.to_string()),
+                    ),
+                    (receiver, id, hub),
+                )),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                    let reset = hub.next_reset(&id, dropped as usize);
+                    Some((
+                        Ok::<Event, Infallible>(
+                            Event::default().event("stream").data(reset.to_string()),
+                        ),
+                        (receiver, id, hub),
+                    ))
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
             }
-        }
-    });
+        });
     Sse::new(stream).into_response()
 }
 
@@ -1465,23 +1479,15 @@ async fn api_interrupt(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let interrupted = {
-        let mut running = state
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match running.remove(&id) {
-            Some(turn) => {
-                turn.signal.abort();
-                true
-            }
-            None => false,
-        }
-    };
-    if interrupted {
+    let interrupted = state.scheduler.interrupt(&id);
+    if interrupted.aborted || interrupted.dropped > 0 {
         (
             StatusCode::OK,
-            Json(json!({ "status": "interrupted", "session": id })),
+            Json(json!({
+                "status": "interrupted",
+                "session": id,
+                "dropped": interrupted.dropped,
+            })),
         )
             .into_response()
     } else {
@@ -1498,14 +1504,16 @@ async fn api_status(
     if !authorize(&state, &auth) {
         return unauthorized();
     }
-    let running = {
-        let guard = state
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.contains_key(&id)
-    };
-    Json(json!({ "session": id, "running": running })).into_response()
+    let status = state.scheduler.status(&id);
+    Json(json!({
+        "session": id,
+        "state": status.state.label(),
+        "position": status.position,
+        "queued": status.queued,
+        // 向后兼容：前端只用 running 判断是否禁用发送。
+        "running": status.state != SessionState::Idle,
+    }))
+    .into_response()
 }
 
 // ---------------- P3：终端面板（PTY + WebSocket） ----------------
@@ -3470,7 +3478,7 @@ fn begin_web_upgrade(
     port: u16,
     token: &str,
     session_id: &str,
-    events: &tokio::sync::broadcast::Sender<Value>,
+    events: &EventHub,
 ) {
     let old_pid = std::process::id();
     let request = crate::session_mgr::UpgradeRequest {
@@ -3483,29 +3491,35 @@ fn begin_web_upgrade(
         web_token: Some(token.to_string()),
     };
     if let Err(error) = crate::session_mgr::write_upgrade_request(workspace, &request) {
-        let _ = events.send(json!({
-            "session": session_id,
-            "kind": "error",
-            "message": format!("热升级请求写入失败：{error}"),
-        }));
+        events.emit(
+            session_id,
+            json!({
+                "kind": "error",
+                "message": format!("热升级请求写入失败：{error}"),
+            }),
+        );
         return;
     }
     if let Err(error) = crate::upgrade_helper::spawn(workspace) {
         crate::session_mgr::clear_upgrade_request(workspace);
-        let _ = events.send(json!({
-            "session": session_id,
-            "kind": "error",
-            "message": format!("热升级助手启动失败：{error}"),
-        }));
+        events.emit(
+            session_id,
+            json!({
+                "kind": "error",
+                "message": format!("热升级助手启动失败：{error}"),
+            }),
+        );
         return;
     }
 
-    let _ = events.send(json!({
-        "session": session_id,
-        "kind": "upgrading",
-        "port": port,
-        "message": "正在热升级：重建并重启 Web 服务，页面会自动恢复…",
-    }));
+    events.emit(
+        session_id,
+        json!({
+            "kind": "upgrading",
+            "port": port,
+            "message": "正在热升级：重建并重启 Web 服务，页面会自动恢复…",
+        }),
+    );
     // 给 SSE 一点时间把升级通知刷到浏览器，再写 exited 让 helper 开始迁移。
     std::thread::sleep(Duration::from_millis(700));
     let _ = crate::session_mgr::write_upgrade_exited(workspace, old_pid);

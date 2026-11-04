@@ -50,7 +50,7 @@ use crate::session_mgr::{
     current_session_store, default_export_filename, delete_managed_session,
     format_history_timestamp, format_session_modified_age, interactive_session_pick,
     latest_managed_session, list_managed_sessions, load_session_reference,
-    looks_like_slash_command_token, new_cli_session, new_cli_session_in,
+    load_session_reference_in, looks_like_slash_command_token, new_cli_session, new_cli_session_in,
     new_cli_session_with_roots, new_cli_session_with_roots_in, parse_history_count,
     read_upgrade_request, recent_user_context, render_prompt_history_report, render_session_list,
     render_session_markdown, resolve_export_path, resolve_managed_session_path,
@@ -2298,7 +2298,7 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, mut session) = load_session_reference(&session_ref)?;
+        let (handle, mut session) = load_session_reference_in(&self.workspace, &session_ref)?;
         // 上次 turn 若在工具执行中被中断（进程被杀/卡死），会话末尾会留下
         // 没有 tool_result 的 tool_use，API 会以 400 拒绝续聊。恢复时补齐。
         session.repair_dangling_tool_uses();

@@ -1365,6 +1365,28 @@ pub(crate) fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn 
     })
 }
 
+/// 按显式 workspace 恢复会话引用。`claw serve` 的进程 cwd 是中性临时目录，
+/// 必须走这个入口，否则会话会被拿去和临时目录做 workspace 校验。
+pub(crate) fn load_session_reference_in(
+    workspace: &Path,
+    reference: &str,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    let loaded = session_store_for(workspace)?
+        .load_session(reference)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok((
+        SessionHandle {
+            id: loaded.handle.id,
+            path: loaded.handle.path,
+        },
+        loaded.session,
+    ))
+}
+
+/// 兼容包装：从进程当前目录恢复会话引用。
+///
+/// 仅允许 CLI 入口/测试使用；Web/多工作区路径必须调用
+/// [`load_session_reference_in`]。`cwd-allowlist: cli-entry`
 pub(crate) fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
@@ -2497,5 +2519,42 @@ mod tests {
         // clear → read None。
         clear_upgrade_exited(dir.path());
         assert!(read_upgrade_exited(dir.path()).is_none());
+    }
+
+    /// 防回归：进程 cwd 与会话 workspace 不同时，恢复必须走 workspace 自己的
+    /// 存储根，不能回落到进程目录（`claw serve` 的 mismatch 根因）。
+    #[test]
+    fn load_session_reference_in_uses_workspace_store_not_process_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let handle = create_managed_session_handle_in(&workspace, "regression-session").unwrap();
+        let mut session = new_cli_session_in(&workspace).unwrap();
+        session.session_id = handle.id.clone();
+        session.save_to_path(&handle.path).unwrap();
+
+        // 进程目录（测试运行目录）必须与会话工作区不同，才构成回归场景。
+        let process_cwd = std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::current_dir().unwrap());
+        let workspace_real = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+        assert_ne!(process_cwd, workspace_real);
+
+        let reference = handle.path.to_string_lossy().to_string();
+        let loaded = load_session_reference_in(&workspace, &reference);
+        assert!(
+            loaded.is_ok(),
+            "显式 workspace 恢复应成功，实际：{:?}",
+            loaded.err().map(|e| e.to_string())
+        );
+
+        // 旧包装以进程目录为存储根，必须拒绝同一条会话 —— 这正是修复前的报错。
+        assert!(
+            load_session_reference(&reference).is_err(),
+            "进程目录包装不应能恢复其他工作区的会话"
+        );
     }
 }
