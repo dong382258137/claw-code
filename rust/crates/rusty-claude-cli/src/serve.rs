@@ -60,9 +60,6 @@ struct AppState {
     events: Arc<EventHub>,
     /// 等待用户在 Web 端批准的越权工具调用（id → 会话 + 应答通道）。
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
-    /// 多工作区下串行切换进程 cwd（LiveCli 以 cwd 作为工作区根）。
-    /// Phase 2 删除；Phase 1 并发度仍为 1，作为最后一道闸保留。
-    turn_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -590,7 +587,6 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             scheduler,
             events: Arc::new(EventHub::default()),
             approvals: Arc::new(Mutex::new(HashMap::new())),
-            turn_lock: Arc::new(Mutex::new(())),
         };
         spawn_session_watchdog(state.clone());
         let app = Router::new()
@@ -925,6 +921,9 @@ struct WebPermissionPrompter {
     session_id: String,
     events: Arc<EventHub>,
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+    scheduler: Arc<Scheduler>,
+    /// 本轮代际：已被看门狗回收的轮次不再把审批请求推给前端。
+    generation: u64,
 }
 
 /// 审批 id 的会话内序号：并发下毫秒时间戳会撞车，必须由单调计数器消歧。
@@ -946,6 +945,12 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
     ) -> runtime::PermissionPromptDecision {
         if self.mode == runtime::PermissionMode::DangerFullAccess {
             return runtime::PermissionPromptDecision::Allow;
+        }
+        // 本轮已被看门狗回收：立即拒绝，避免僵死线程继续向前端发请求。
+        if !self.scheduler.is_current(&self.session_id, self.generation) {
+            return runtime::PermissionPromptDecision::Deny {
+                reason: "本轮已被调度器回收".to_string(),
+            };
         }
 
         let id = format!(
@@ -997,24 +1002,25 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
     }
 }
 
-/// 一次 Web turn 的输入。
-struct WebTurn<'a> {
-    session_path: &'a Path,
-    workspace: PathBuf,
-    lock: Arc<Mutex<()>>,
-    text: &'a str,
+/// 会话常驻 worker 复用的运行态。
+///
+/// `LiveCli` 内部持有 system prompt、仓库拓扑与 MCP 客户端，重建成本很高；
+/// 只要模型 / 权限 / 工作区 / 会话路径没变，就沿用上一轮的对象。
+struct CachedCli {
+    cli: crate::app::LiveCli,
+    model: String,
     mode: runtime::PermissionMode,
-    model_override: Option<String>,
-    signal: runtime::HookAbortSignal,
-    events: Arc<EventHub>,
-    approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
-    session_id: &'a str,
-    /// 流式事件心跳，看门狗据此判断本轮是否还在推进。
-    activity: ActivityClock,
+    workspace: PathBuf,
+    session_path: PathBuf,
 }
 
-/// 活动心跳：每个流式事件都会刷新，供看门狗判断“是否还有进展”。
-type ActivityClock = Arc<AtomicU64>;
+struct SessionWorker {
+    state: AppState,
+    session_id: String,
+    cached: Option<CachedCli>,
+    /// 连续 panic 次数；达到 2 次时丢弃缓存，下一轮重建运行态。
+    panic_streak: u32,
+}
 
 /// 会话级看门狗：一个后台线程扫描所有在跑的会话，替代「每 turn 一个
 /// sleep 线程」的旧实现。语义保持不变：超过阈值没有任何流式事件就发
@@ -1036,205 +1042,301 @@ fn spawn_session_watchdog(state: AppState) {
             if turn.finished.swap(true, Ordering::SeqCst) {
                 continue;
             }
-            // 尝试协作式中止（LLM/工具循环会检查该信号）。
+            // ① 置取消（LLM/工具循环会在下一个检查点停下）。
             turn.signal.abort();
+            // ② 杀进程树：沿用运行时现有的中止路径。注意 bash 只响应进程级
+            //    中止标志（TUI Ctrl+C 才会置位），Web 侧拿不到 per-turn 的
+            //    进程树入口；该缺口留给 S3 取消链路。
+            // ③ 标记 failed、④ 摘除运行句柄并归还槽位、⑤ generation+1
+            //    在 reclaim 内一次完成（许可归调度器所有，僵死线程不再占槽）。
+            let reclaimed = state.scheduler.reclaim(&turn.session, turn.generation);
+            // ⑥ 通知前端：error + done。
             state.events.emit(
                 &turn.session,
                 json!({
                     "kind": "error",
                     "message": format!(
-                        "[看门狗] 已 {} 秒没有任何输出，本轮已中止；后台线程可能仍在收尾。",
-                        turn.silent_ms / 1000
+                        "[看门狗] 已 {} 秒没有任何输出，本轮已中止并强制回收槽位（僵死线程 {}）。",
+                        turn.silent_ms / 1000,
+                        state.scheduler.orphan_count()
                     ),
                 }),
             );
-            state.scheduler.force_finish(&turn.session);
             state.events.emit(&turn.session, json!({ "kind": "done" }));
+            // 排队项还在：补一个 worker 继续消费（原子认领避免出现两个 worker）。
+            if let Some(info) = reclaimed {
+                if info.queued > 0 && state.scheduler.claim_worker(&turn.session) {
+                    spawn_session_worker(state.clone(), turn.session.clone());
+                }
+            }
         }
     });
 }
 
-/// 在 serve 进程内跑一轮（不再拉子进程），从而拿到 token 级流式事件。
-fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
-    let WebTurn {
-        session_path,
-        workspace,
-        lock,
-        text,
-        mode,
-        model_override,
-        signal,
-        events,
-        approvals,
-        session_id,
-        activity,
-    } = turn;
-    // 进程 cwd 固定在启动时的中性临时目录；这里不再切换，所有路径都由
-    // `workspace` 显式传入 LiveCli / 工具层。
-    let _turn_guard = acquire_turn_lock(&lock, Duration::from_secs(10))?;
-    let model = model_override
-        .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| {
-            crate::config_model_for(&workspace).unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+impl SessionWorker {
+    /// 本轮生效模型：请求显式指定优先，否则取工作区配置的默认值。
+    fn effective_model(requested: &Option<String>, workspace: &Path) -> String {
+        requested
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                crate::config_model_for(workspace)
+                    .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+            })
+    }
+
+    /// 取本轮使用的 `LiveCli`：模型 / 权限 / 工作区 / 会话路径都一致才复用，
+    /// 否则新建并 `resume_from_path` 载入同一会话。
+    fn cli_for_turn(&mut self, job: &PromptJob) -> Result<&mut crate::app::LiveCli, String> {
+        let model = Self::effective_model(&job.model, &job.workspace);
+        let reusable = self.cached.as_ref().is_some_and(|cached| {
+            cached.model == model
+                && cached.mode == job.permission
+                && cached.workspace == job.workspace
+                && cached.session_path == job.session_path
         });
-    let mut cli = crate::app::LiveCli::new(
-        model,
-        true,
-        None,
-        mode,
-        Vec::new(),
-        crate::render::OutputVerbosity::default(),
-        &workspace,
-    )
-    .map_err(|error| error.to_string())?;
-    cli.resume_from_path(session_path)
-        .map_err(|error| error.to_string())?;
-    cli.set_external_abort_signal(signal);
+        if reusable {
+            // 复用证据：日志里出现 `reuse` 即表示本轮没有重建 LiveCli。
+            eprintln!(
+                "[serve] session={} live_cli=reuse model={}",
+                self.session_id, model
+            );
+        } else {
+            eprintln!(
+                "[serve] session={} live_cli=rebuild model={}",
+                self.session_id, model
+            );
+            let mut cli = crate::app::LiveCli::new(
+                model.clone(),
+                true,
+                None,
+                job.permission,
+                Vec::new(),
+                crate::render::OutputVerbosity::default(),
+                &job.workspace,
+            )
+            .map_err(|error| error.to_string())?;
+            cli.resume_from_path(&job.session_path)
+                .map_err(|error| error.to_string())?;
+            self.cached = Some(CachedCli {
+                cli,
+                model,
+                mode: job.permission,
+                workspace: job.workspace.clone(),
+                session_path: job.session_path.clone(),
+            });
+        }
+        Ok(&mut self.cached.as_mut().expect("缓存刚写入").cli)
+    }
 
-    let sender = Arc::clone(&events);
-    let sid = session_id.to_string();
-    let activity_clock = Arc::clone(&activity);
-    cli.set_status_emitter(Arc::new(move |event: runtime::StatusEvent| {
-        // 任何流式事件都算“有进展”，刷新看门狗的心跳。
-        activity_clock.store(now_ms(), Ordering::SeqCst);
-        let payload = match event {
-            runtime::StatusEvent::TextDelta(text) => {
-                json!({ "session": sid, "kind": "delta", "text": text })
+    /// 在常驻 worker 里跑一轮：进程 cwd 保持中性临时目录，所有路径都由
+    /// `workspace` 显式传入，不再需要全局 turn 锁。
+    fn run_turn(&mut self, turn: &scheduler::TakenPrompt) -> Result<(), String> {
+        let events = Arc::clone(&self.state.events);
+        let approvals = Arc::clone(&self.state.approvals);
+        let scheduler = Arc::clone(&self.state.scheduler);
+        let signal = turn.signal.clone();
+        let activity = Arc::clone(&turn.activity);
+        let job = &turn.job;
+        let sid = self.session_id.clone();
+        let cli = self.cli_for_turn(job)?;
+        cli.set_external_abort_signal(signal);
+
+        let sender = Arc::clone(&events);
+        let emit_sid = sid.clone();
+        let gate_scheduler = Arc::clone(&scheduler);
+        let gate_generation = turn.generation;
+        cli.set_status_emitter(Arc::new(move |event: runtime::StatusEvent| {
+            // 任何流式事件都算“有进展”，刷新看门狗的心跳。
+            activity.store(now_ms(), Ordering::SeqCst);
+            // 代际失效（已被看门狗回收）：迟到事件一律不进前端流。
+            if !gate_scheduler.is_current(&emit_sid, gate_generation) {
+                return;
             }
-            runtime::StatusEvent::ToolUse { id, name, input } => {
-                json!({ "session": sid, "kind": "tool_use", "id": id, "name": name, "input": input })
-            }
-            runtime::StatusEvent::ToolResult {
-                id,
-                name,
-                output,
-                is_error,
-            } => json!({ "session": sid, "kind": "tool_result", "id": id, "name": name, "output": output, "is_error": is_error }),
-            runtime::StatusEvent::Thinking { text, done, .. } => {
-                json!({ "session": sid, "kind": "thinking", "text": text, "done": done })
-            }
-            runtime::StatusEvent::StreamError { message, recoverable } => {
-                json!({ "session": sid, "kind": "error", "message": message, "recoverable": recoverable })
-            }
-            runtime::StatusEvent::StreamStart => json!({ "session": sid, "kind": "start" }),
-            runtime::StatusEvent::MessageStop => json!({ "session": sid, "kind": "message_stop" }),
-            runtime::StatusEvent::Usage(_) => return,
+            let payload = match event {
+                runtime::StatusEvent::TextDelta(text) => {
+                    json!({ "session": emit_sid, "kind": "delta", "text": text })
+                }
+                runtime::StatusEvent::ToolUse { id, name, input } => {
+                    json!({ "session": emit_sid, "kind": "tool_use", "id": id, "name": name, "input": input })
+                }
+                runtime::StatusEvent::ToolResult {
+                    id,
+                    name,
+                    output,
+                    is_error,
+                } => json!({ "session": emit_sid, "kind": "tool_result", "id": id, "name": name, "output": output, "is_error": is_error }),
+                runtime::StatusEvent::Thinking { text, done, .. } => {
+                    json!({ "session": emit_sid, "kind": "thinking", "text": text, "done": done })
+                }
+                runtime::StatusEvent::StreamError { message, recoverable } => {
+                    json!({ "session": emit_sid, "kind": "error", "message": message, "recoverable": recoverable })
+                }
+                runtime::StatusEvent::StreamStart => {
+                    json!({ "session": emit_sid, "kind": "start" })
+                }
+                runtime::StatusEvent::MessageStop => {
+                    json!({ "session": emit_sid, "kind": "message_stop" })
+                }
+                runtime::StatusEvent::Usage(_) => return,
+            };
+            sender.emit(&emit_sid, payload);
+        }));
+
+        let mut prompter = WebPermissionPrompter {
+            mode: job.permission,
+            session_id: sid,
+            events,
+            approvals,
+            scheduler: Arc::clone(&scheduler),
+            generation: turn.generation,
         };
-        sender.emit(&sid, payload);
-    }));
-
-    let mut prompter = WebPermissionPrompter {
-        mode,
-        session_id: session_id.to_string(),
-        events: events.clone(),
-        approvals,
-    };
-    cli.run_turn_silent_with(text, &mut prompter)
-        .map_err(|error| error.to_string())
+        cli.run_turn_silent_with(&job.text, &mut prompter)
+            .map_err(|error| error.to_string())
+    }
 }
 
-/// 每会话 dispatcher：串行处理自己的队列，只有拿到全局 + 工作区许可后才真正开跑。
+/// 每会话常驻 worker：串行消费自己的队列，跨轮复用 `LiveCli`。
 ///
-/// 排队本身不再是一次请求的生命周期：`POST /prompt` 入队后立即 202 返回，
-/// 真正等待许可发生在该线程里。
-fn spawn_session_dispatcher(state: AppState, session_id: String) {
+/// 只有队列为空且空闲超过 `WORKER_IDLE_TIMEOUT_MS`（或被 LRU 回收）才退出
+/// 线程并释放运行态；最多保留 `MAX_HOT_WORKERS` 个热 worker。
+fn spawn_session_worker(state: AppState, session_id: String) {
     let task_state = state.clone();
     let worker_session = session_id.clone();
+    task_state.scheduler.register_worker(&worker_session);
     let thread_name = format!(
         "claw-web-{}",
         &worker_session[..worker_session.len().min(12)]
     );
     let spawned = std::thread::Builder::new()
         .name(thread_name)
-        .spawn(move || loop {
-            let Some(turn) = task_state.scheduler.take_next(&worker_session) else {
-                return;
+        .spawn(move || {
+            let mut worker = SessionWorker {
+                state: task_state.clone(),
+                session_id: worker_session.clone(),
+                cached: None,
+                panic_streak: 0,
             };
-            // 已被取消的排队项无需再等许可。
-            if turn.signal.is_aborted() {
+            loop {
+                let Some(turn) = task_state.scheduler.take_next(&worker_session) else {
+                    if task_state
+                        .scheduler
+                        .worker_should_exit(&worker_session, scheduler::WORKER_IDLE_TIMEOUT_MS)
+                    {
+                        task_state.scheduler.worker_exit(&worker_session);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(scheduler::WORKER_POLL_MS));
+                    continue;
+                };
+                // 已被取消的排队项无需再等许可。
+                if turn.signal.is_aborted() {
+                    if !turn.finished.swap(true, Ordering::SeqCst) {
+                        task_state
+                            .events
+                            .emit(&worker_session, json!({ "kind": "done" }));
+                    }
+                    task_state
+                        .scheduler
+                        .complete_turn(&worker_session, turn.generation);
+                    continue;
+                }
+                // 许可由调度器持有：begin_turn 成功后本轮进入 running，
+                // 看门狗可在超时后直接摘除许可并归还槽位。
+                if !task_state.scheduler.begin_turn(
+                    &worker_session,
+                    turn.generation,
+                    &turn.job.workspace,
+                ) {
+                    // 等许可期间已被回收：迟到轮次不再发任何事件。
+                    continue;
+                }
+                task_state.scheduler.touch_worker(&worker_session);
+                // 等许可期间被 interrupt：直接放弃这一轮。
+                if turn.signal.is_aborted() {
+                    if !turn.finished.swap(true, Ordering::SeqCst) {
+                        task_state
+                            .events
+                            .emit(&worker_session, json!({ "kind": "done" }));
+                    }
+                    task_state
+                        .scheduler
+                        .complete_turn(&worker_session, turn.generation);
+                    continue;
+                }
+
+                // 单轮 panic 只影响本轮：转成普通错误，worker 继续接下一轮。
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker.run_turn(&turn)
+                }));
+                let (outcome, panicked) = match attempt {
+                    Ok(result) => (result, false),
+                    Err(payload) => (
+                        Err(format!(
+                            "本轮执行线程异常终止（panic）：{}",
+                            panic_payload_message(&*payload)
+                        )),
+                        true,
+                    ),
+                };
+                if panicked {
+                    worker.panic_streak += 1;
+                    // 连续 2 次 panic：丢弃可能已损坏的运行态，下一轮重建。
+                    if worker.panic_streak >= 2 {
+                        worker.cached = None;
+                        worker.panic_streak = 0;
+                    }
+                } else {
+                    worker.panic_streak = 0;
+                }
+                let failed = outcome.is_err();
+                if let Err(message) = &outcome {
+                    // 迟到错误同样按代际丢弃。
+                    if task_state
+                        .scheduler
+                        .is_current(&worker_session, turn.generation)
+                    {
+                        task_state.events.emit(
+                            &worker_session,
+                            json!({ "kind": "error", "message": message }),
+                        );
+                    }
+                }
+                // 收尾权由 worker 与看门狗共享：谁先 swap 成功谁发 done。
                 if !turn.finished.swap(true, Ordering::SeqCst) {
                     task_state
                         .events
                         .emit(&worker_session, json!({ "kind": "done" }));
                 }
-                task_state.scheduler.finish(&worker_session);
-                continue;
-            }
-            let permits = task_state.scheduler.acquire_permits(&turn.job.workspace);
-            // 等许可期间被 interrupt：直接放弃这一轮。
-            if turn.signal.is_aborted() {
-                if !turn.finished.swap(true, Ordering::SeqCst) {
-                    task_state
-                        .events
-                        .emit(&worker_session, json!({ "kind": "done" }));
+                let completed = task_state
+                    .scheduler
+                    .complete_turn(&worker_session, turn.generation);
+                task_state.scheduler.touch_worker(&worker_session);
+                if completed == scheduler::TurnOutcome::Orphan {
+                    // 本轮已被看门狗回收：线程不再拥有任何会话状态，直接退出。
+                    return;
                 }
-                task_state.scheduler.finish(&worker_session);
-                drop(permits);
-                continue;
-            }
-            task_state.scheduler.mark_running(&worker_session);
 
-            let workspace = turn.job.workspace.clone();
-            let session_path = turn.job.session_path;
-            let text = turn.job.text;
-            let mode = turn.job.permission;
-            let model = turn.job.model;
-            let activity = Arc::clone(&turn.activity);
-            let signal = turn.signal.clone();
-            // turn 线程一旦 panic，必须转成普通错误，否则前端永久转圈。
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_web_turn(WebTurn {
-                    session_path: &session_path,
-                    workspace: workspace.clone(),
-                    lock: Arc::clone(&task_state.turn_lock),
-                    text: &text,
-                    mode,
-                    model_override: model,
-                    signal,
-                    events: Arc::clone(&task_state.events),
-                    approvals: Arc::clone(&task_state.approvals),
-                    session_id: &worker_session,
-                    activity,
-                })
-            }))
-            .unwrap_or_else(|payload| {
-                Err(format!(
-                    "本轮执行线程异常终止（panic）：{}",
-                    panic_payload_message(&*payload)
-                ))
-            });
-            let failed = outcome.is_err();
-            if let Err(message) = &outcome {
-                task_state.events.emit(
-                    &worker_session,
-                    json!({ "kind": "error", "message": message }),
-                );
-            }
-            // 收尾权由 dispatcher 与看门狗共享：谁先 swap 成功谁发 done。
-            if !turn.finished.swap(true, Ordering::SeqCst) {
-                task_state
-                    .events
-                    .emit(&worker_session, json!({ "kind": "done" }));
-            }
-            task_state.scheduler.finish(&worker_session);
-            drop(permits);
-
-            // Agent 在 turn 里调用了 `HotUpgrade`：只有全服务已安静
-            // （无执行中、无排队）时才允许重启，否则把请求留在原地。
-            if !failed && task_state.scheduler.is_quiet() && tools::take_hot_upgrade_request() {
-                begin_web_upgrade(
-                    &workspace,
-                    task_state.port,
-                    &task_state.token,
-                    &worker_session,
-                    &task_state.events,
-                );
+                // Agent 在 turn 里调用了 `HotUpgrade`：只有全服务已安静
+                // （无执行中、无排队）时才允许重启，否则把请求留在原地。
+                if !failed && task_state.scheduler.is_quiet() && tools::take_hot_upgrade_request() {
+                    begin_web_upgrade(
+                        &turn.job.workspace,
+                        task_state.port,
+                        &task_state.token,
+                        &worker_session,
+                        &task_state.events,
+                    );
+                }
             }
         });
     if let Err(error) = spawned {
         // 线程起不来：清掉队列并明确告知，避免该会话永久停在 queued。
         state.scheduler.interrupt(&session_id);
         state.scheduler.force_finish(&session_id);
+        state.scheduler.discard_worker(&session_id);
         state.events.emit(
             &session_id,
             json!({ "kind": "error", "message": format!("调度线程启动失败：{error}") }),
@@ -1291,9 +1393,16 @@ async fn api_prompt(
             ),
         )
             .into_response(),
+        Err(EnqueueError::OrphanLimit { active, limit }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "当前有 {active} 个僵死会话线程尚未退出（上限 {limit}），已暂停接收新消息；请等待其自行退出或重启 serve 进程后再试"
+            ),
+        )
+            .into_response(),
         Ok(enqueued) => {
             if enqueued.start_worker {
-                spawn_session_dispatcher(state.clone(), id.clone());
+                spawn_session_worker(state.clone(), id.clone());
             }
             (
                 StatusCode::ACCEPTED,
@@ -1927,32 +2036,6 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
-}
-
-/// 带超时地获取 turn 全局锁。
-///
-/// 该锁串行化“切换进程 cwd + 跑一轮”，一旦某个 turn 卡死，无限 `lock()`
-/// 会让后续所有会话静默挂起。超时后直接报错，把问题暴露给用户。
-fn acquire_turn_lock<'a>(
-    lock: &'a Mutex<()>,
-    timeout: Duration,
-) -> Result<std::sync::MutexGuard<'a, ()>, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match lock.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if Instant::now() >= deadline {
-                    return Err(format!(
-                        "上一个 turn 仍在执行（等待工作区锁 {} 秒未释放），请稍后重试",
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
 }
 
 fn modified_ms(path: &Path) -> Option<u64> {
@@ -3795,19 +3878,6 @@ mod tests {
         assert!(prompt.contains("- [ ] 写测试"), "prompt: {prompt}");
         assert!(prompt.contains("- [x] 跑测试"), "prompt: {prompt}");
         assert!(prompt.ends_with("继续"));
-    }
-
-    #[test]
-    fn acquire_turn_lock_times_out_instead_of_blocking_forever() {
-        let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
-        let shared = std::sync::Arc::clone(&lock);
-        let held = lock.lock().unwrap();
-        let started = std::time::Instant::now();
-        let result = super::acquire_turn_lock(&shared, std::time::Duration::from_millis(200));
-        assert!(result.is_err(), "卡住的 turn 不应让后续 turn 无限等待");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        drop(held);
-        assert!(super::acquire_turn_lock(&shared, std::time::Duration::from_millis(200)).is_ok());
     }
 
     /// 一个真实形状的 patch：两文件、多 hunk，含 section 标题。
