@@ -214,18 +214,12 @@ fn windows_style_absolute_paths_are_denied_before_execution() {
 
 /// 防回归：生产代码不得回退到"读进程 cwd / 临时切目录再恢复"的兼容路径。
 ///
-/// 允许清单只包含显式的兼容包装（CLI/测试入口或 S2b 待办），其余命中即失败。
+/// 允许清单只包含显式的兼容包装（CLI/测试入口），其余命中即失败。
 #[test]
 fn production_code_does_not_depend_on_process_cwd() {
     const ALLOWED_FNS: &[&str] = &[
-        // 兼容构造器：CLI/测试包装，等价于 `TurnEnv::new(env::current_dir(), vec![])`
+        // 仅供 CLI/测试从进程目录构造 TurnEnv；serve 路径不得使用。
         "for_current_dir",
-        // 旧工具执行入口的默认 env
-        "builtin",
-        "with_plugin_tools",
-        "execute_tool",
-        // 明确留给 S2b 的 lane 溯源链路
-        "maybe_commit_provenance",
     ];
 
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

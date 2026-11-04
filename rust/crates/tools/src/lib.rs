@@ -466,9 +466,9 @@ impl TurnEnv {
         }
     }
 
-    /// 兼容包装：从进程当前目录构造。
+    /// 仅供 CLI 从进程目录构造 `TurnEnv` 的兼容包装；serve 路径不得使用。
     ///
-    /// 仅允许 CLI 入口/测试使用；工具执行路径必须使用显式 workspace。
+    /// 工具执行路径必须显式传入会话 workspace（`TurnEnv::new`）。
     #[must_use]
     pub fn for_current_dir() -> Self {
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -550,6 +550,8 @@ pub struct RuntimeToolDefinition {
 }
 
 impl GlobalToolRegistry {
+    /// 兼容入口：仅供 CLI/测试从进程目录构造 registry；serve 路径必须使用
+    /// [`GlobalToolRegistry::with_turn_env`] 显式注入工作区。
     #[must_use]
     pub fn builtin() -> Self {
         Self {
@@ -561,6 +563,8 @@ impl GlobalToolRegistry {
         }
     }
 
+    /// 兼容入口：仅供 CLI/测试从进程目录构造 registry；serve 路径必须使用
+    /// [`GlobalToolRegistry::with_turn_env`] 显式注入工作区。
     pub fn with_plugin_tools(plugin_tools: Vec<PluginTool>) -> Result<Self, String> {
         let builtin_names = mvp_tool_specs()
             .into_iter()
@@ -2137,6 +2141,8 @@ pub fn enforce_permission_check(
     }
 }
 
+/// 兼容入口：仅供 CLI/测试从进程目录构造 [`TurnEnv`]；serve 路径必须调用
+/// [`execute_tool_in`] 并显式传入会话工作区。
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_in(&TurnEnv::for_current_dir(), name, input)
 }
@@ -6450,7 +6456,13 @@ where
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
-        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+        persist_agent_terminal_state(
+            &manifest,
+            "failed",
+            None,
+            Some(error.clone()),
+            env.workspace(),
+        )?;
         return Err(error);
     }
 
@@ -6467,8 +6479,13 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+                    let _ = persist_agent_terminal_state(
+                        &job.manifest,
+                        "failed",
+                        None,
+                        Some(error),
+                        job.env.workspace(),
+                    );
                 }
                 Err(_) => {
                     let _ = persist_agent_terminal_state(
@@ -6476,6 +6493,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         "failed",
                         None,
                         Some(String::from("sub-agent thread panicked")),
+                        job.env.workspace(),
                     );
                 }
             }
@@ -6490,7 +6508,13 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+    persist_agent_terminal_state(
+        &job.manifest,
+        "completed",
+        Some(final_text.as_str()),
+        None,
+        job.env.workspace(),
+    )
 }
 
 fn build_agent_runtime(
@@ -6728,6 +6752,7 @@ fn persist_agent_terminal_state(
     status: &str,
     result: Option<&str>,
     error: Option<String>,
+    workspace: &Path,
 ) -> Result<(), String> {
     let blocker = error.as_deref().map(classify_lane_blocker);
     append_agent_output(
@@ -6762,7 +6787,7 @@ fn persist_agent_terminal_state(
         // 此前 detect_lane_completion/evaluate_completed_lane 是死代码,
         // 现在在 agent 成功完成(无 blocker)的路径上调用,把 CloseoutLane
         // 策略动作落地为 lane.closed 事件(由 lane_bridge 推送给 IDE)。
-        let has_pushed = maybe_commit_provenance(result).is_some();
+        let has_pushed = maybe_commit_provenance(result, workspace).is_some();
         let test_green = finished_summary.data.review_verdict.as_deref() == Some("approve");
         if let Some(context) =
             crate::lane_completion::detect_lane_completion(&next_manifest, test_green, has_pushed)
@@ -6778,7 +6803,7 @@ fn persist_agent_terminal_state(
                 ));
             }
         }
-        if let Some(provenance) = maybe_commit_provenance(result) {
+        if let Some(provenance) = maybe_commit_provenance(result, workspace) {
             next_manifest.lane_events.push(LaneEvent::commit_created(
                 iso8601_now(),
                 Some(format!("commit {}", provenance.commit)),
@@ -7390,16 +7415,13 @@ fn derive_agent_state(
     "truly_idle"
 }
 
-fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance> {
+fn maybe_commit_provenance(result: Option<&str>, workspace: &Path) -> Option<LaneCommitProvenance> {
     let commit = extract_commit_sha(result?)?;
-    let branch = current_git_branch().unwrap_or_else(|| "unknown".to_string());
-    let worktree = std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string());
+    let branch = current_git_branch(workspace).unwrap_or_else(|| "unknown".to_string());
     Some(LaneCommitProvenance {
         commit: commit.clone(),
         branch,
-        worktree,
+        worktree: Some(workspace.display().to_string()),
         canonical_commit: Some(commit.clone()),
         superseded_by: None,
         lineage: vec![commit],
@@ -7413,9 +7435,10 @@ fn extract_commit_sha(result: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn current_git_branch() -> Option<String> {
+fn current_git_branch(workspace: &Path) -> Option<String> {
     let output = runtime::sandbox::quiet_command("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(workspace)
         .output()
         .ok()?;
     output
@@ -12742,6 +12765,7 @@ mod tests {
                     "completed",
                     Some("Finished successfully in commit abc1234"),
                     None,
+                    job.env.workspace(),
                 )
             },
         )
@@ -12801,6 +12825,7 @@ mod tests {
                     "failed",
                     None,
                     Some(String::from("tool failed: simulated failure")),
+                    job.env.workspace(),
                 )
             },
         )
@@ -12850,6 +12875,7 @@ mod tests {
                     "completed",
                     Some("commit push everyting, keep sweeping $ralph"),
                     None,
+                    job.env.workspace(),
                 )
             },
         )
@@ -12899,6 +12925,7 @@ mod tests {
                         "Team read-only-audit-only-for-roadm: worker panes stalled, no progress 2m30s. Next: omx team status read-only-audit-only-for-roadm; read worker messages; unblock/reassign or shutdown. [OMX_TMUX_INJECT]",
                     ),
                     None,
+                    job.env.workspace(),
                 )
             },
         )
@@ -12947,6 +12974,7 @@ mod tests {
                     "completed",
                     Some("APPROVE\n\nTarget: commit 1234abcd\nRationale: scoped diff is safe."),
                     None,
+                    job.env.workspace(),
                 )
             },
         )
@@ -12991,6 +13019,7 @@ mod tests {
                         "Selected next backlog target.\nChosen: ROADMAP #65\nSkipped: ROADMAP #63, ROADMAP #64\nAction: execute\nRationale: #65 is the next repo-local lane-finished metadata task.",
                     ),
                     None,
+                    job.env.workspace(),
                 )
             },
         )
@@ -13039,6 +13068,7 @@ mod tests {
                         "Completed ROADMAP #64. Files: rust/crates/tools/src/lib.rs ROADMAP.md. Diff stat: 2 files, +12/-1. Tested, committed, pushed as commit deadbee.",
                     ),
                     None,
+                    job.env.workspace(),
                 )
             },
         )
@@ -13109,6 +13139,7 @@ mod tests {
                     "completed",
                     Some("Completed ROADMAP #66 after verification."),
                     None,
+                    job.env.workspace(),
                 )
             },
         )
@@ -13217,8 +13248,11 @@ mod tests {
 
     #[test]
     fn commit_provenance_is_extracted_from_agent_results() {
-        let provenance = maybe_commit_provenance(Some("landed as commit deadbee with clean push"))
-            .expect("commit provenance");
+        let provenance = maybe_commit_provenance(
+            Some("landed as commit deadbee with clean push"),
+            Path::new("."),
+        )
+        .expect("commit provenance");
         assert_eq!(provenance.commit, "deadbee");
         assert_eq!(provenance.canonical_commit.as_deref(), Some("deadbee"));
         assert_eq!(provenance.lineage, vec!["deadbee".to_string()]);

@@ -1,4 +1,3 @@
-mod hooks;
 pub mod test_isolation;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,8 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-
-pub use hooks::{HookEvent, HookRunResult, HookRunner};
 
 const EXTERNAL_MARKETPLACE: &str = "external";
 const BUILTIN_MARKETPLACE: &str = "builtin";

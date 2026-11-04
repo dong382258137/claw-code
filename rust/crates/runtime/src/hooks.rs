@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -267,6 +268,11 @@ pub struct HookRunner {
     /// 配置经 `Arc<RwLock>` 共享可变：支持配置热重载（`reload` 原子替换），
     /// 运行时所有 run_* 方法从读锁获取最新配置。
     config: Arc<RwLock<RuntimeHookConfig>>,
+    /// 显式工作区：hook 子进程启动时 `current_dir` 到这里。
+    ///
+    /// `None` 只用于 CLI/测试从进程目录构造的兼容路径；serve 路径必须经
+    /// [`HookRunner::set_workspace`] 注入会话工作区，不得依赖继承的进程目录。
+    workspace: Option<PathBuf>,
 }
 
 impl HookRunner {
@@ -274,7 +280,13 @@ impl HookRunner {
     pub fn new(config: RuntimeHookConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            workspace: None,
         }
+    }
+
+    /// 注入 hook 子进程的工作目录（serve / 多工作区路径必须调用）。
+    pub fn set_workspace(&mut self, workspace: PathBuf) {
+        self.workspace = Some(workspace);
     }
 
     #[must_use]
@@ -318,9 +330,19 @@ impl HookRunner {
         if definitions.is_empty() {
             return;
         }
+        let workspace = self.workspace.clone();
         thread::spawn(move || {
-            let _ =
-                Self::run_definitions(event, &definitions, &context, "{}", None, false, None, None);
+            let _ = Self::run_definitions_in(
+                event,
+                &definitions,
+                &context,
+                "{}",
+                None,
+                false,
+                None,
+                None,
+                workspace.as_deref(),
+            );
         });
     }
 
@@ -337,7 +359,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_definitions(
+        Self::run_definitions_in(
             HookEvent::PreToolUse,
             self.config
                 .read()
@@ -349,6 +371,7 @@ impl HookRunner {
             false,
             abort_signal,
             reporter,
+            self.workspace.as_deref(),
         )
     }
 
@@ -390,7 +413,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_definitions(
+        Self::run_definitions_in(
             HookEvent::PostToolUse,
             self.config
                 .read()
@@ -402,6 +425,7 @@ impl HookRunner {
             is_error,
             abort_signal,
             reporter,
+            self.workspace.as_deref(),
         )
     }
 
@@ -443,7 +467,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_definitions(
+        Self::run_definitions_in(
             HookEvent::PostToolUseFailure,
             self.config
                 .read()
@@ -455,6 +479,7 @@ impl HookRunner {
             true,
             abort_signal,
             reporter,
+            self.workspace.as_deref(),
         )
     }
 
@@ -491,7 +516,17 @@ impl HookRunner {
         if definitions.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
-        Self::run_definitions(event, &definitions, context, "{}", None, false, None, None)
+        Self::run_definitions_in(
+            event,
+            &definitions,
+            context,
+            "{}",
+            None,
+            false,
+            None,
+            None,
+            self.workspace.as_deref(),
+        )
     }
 
     #[must_use]
@@ -538,7 +573,7 @@ impl HookRunner {
         if definitions.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
-        Self::run_definitions(
+        Self::run_definitions_in(
             HookEvent::PostCustomToolCall,
             &definitions,
             tool_name,
@@ -547,8 +582,13 @@ impl HookRunner {
             false,
             None,
             None,
+            self.workspace.as_deref(),
         )
     }
+
+    /// 仅供测试使用：从进程目录构造 workspace 的兼容包装。
+    /// 生产/serve 路径必须走 [`HookRunner::run_definitions_in`] 显式传入工作区。
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn run_definitions(
         event: HookEvent,
@@ -558,7 +598,33 @@ impl HookRunner {
         tool_output: Option<&str>,
         is_error: bool,
         abort_signal: Option<&HookAbortSignal>,
+        reporter: Option<&mut dyn HookProgressReporter>,
+    ) -> HookRunResult {
+        let cwd = std::env::current_dir().ok();
+        Self::run_definitions_in(
+            event,
+            definitions,
+            tool_name,
+            tool_input,
+            tool_output,
+            is_error,
+            abort_signal,
+            reporter,
+            cwd.as_deref(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_definitions_in(
+        event: HookEvent,
+        definitions: &[HookDefinition],
+        tool_name: &str,
+        tool_input: &str,
+        tool_output: Option<&str>,
+        is_error: bool,
+        abort_signal: Option<&HookAbortSignal>,
         mut reporter: Option<&mut dyn HookProgressReporter>,
+        workspace: Option<&Path>,
     ) -> HookRunResult {
         if definitions.is_empty() {
             return HookRunResult::allow(Vec::new());
@@ -630,6 +696,7 @@ impl HookRunner {
                     &payload,
                     abort_signal,
                     effective_timeout_ms,
+                    workspace,
                 ),
                 HookHandlerType::Script => Self::run_script_handler(
                     &def.value,
@@ -639,6 +706,7 @@ impl HookRunner {
                     &payload,
                     abort_signal,
                     effective_timeout_ms,
+                    workspace,
                 ),
                 HookHandlerType::Http => Self::run_http_handler(
                     &def.value,
@@ -647,6 +715,7 @@ impl HookRunner {
                     &payload,
                     abort_signal,
                     effective_timeout_ms,
+                    workspace,
                 ),
                 HookHandlerType::Mcp => {
                     Self::run_mcp_handler(&def.value, event, tool_name, &payload)
@@ -726,8 +795,9 @@ impl HookRunner {
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
         timeout_ms: Option<u64>,
+        workspace: Option<&Path>,
     ) -> HookCommandOutcome {
-        let mut child = shell_command(command);
+        let mut child = shell_command(command, workspace);
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
         child.stderr(Stdio::piped());
@@ -820,11 +890,15 @@ impl HookRunner {
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
         timeout_ms: Option<u64>,
+        workspace: Option<&Path>,
     ) -> HookCommandOutcome {
         let (program, flag) = crate::bash::shell_launcher();
         // quiet_command:Web 服务无控制台时,hook 子进程不弹命令行窗口。
         let mut child = CommandWithStdin::new(crate::sandbox::quiet_command(&program));
         child.command.arg(flag);
+        if let Some(workspace) = workspace {
+            child.command.current_dir(workspace);
+        }
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
         child.stderr(Stdio::piped());
@@ -910,6 +984,7 @@ impl HookRunner {
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
         timeout_ms: Option<u64>,
+        workspace: Option<&Path>,
     ) -> HookCommandOutcome {
         if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
             return HookCommandOutcome::Cancelled {
@@ -925,6 +1000,9 @@ impl HookRunner {
         // quiet_command:Web 服务无控制台时,hook 子进程不弹命令行窗口。
         let mut child = CommandWithStdin::new(crate::sandbox::quiet_command(&program));
         child.command.arg(flag).arg(&curl_cmd);
+        if let Some(workspace) = workspace {
+            child.command.current_dir(workspace);
+        }
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
         child.stderr(Stdio::piped());
@@ -1255,13 +1333,16 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
     message
 }
 
-fn shell_command(command: &str) -> CommandWithStdin {
+fn shell_command(command: &str, workspace: Option<&Path>) -> CommandWithStdin {
     // P11-2:复用 bash::shell_launcher() 的 shell 探测逻辑(Git Bash 优先),
     // 避免 hooks 与 execute_bash 行为不一致(之前硬编码 cmd /C 导致
     // printf/sleep 等 Unix 命令在 Windows 上失败)。
     let (program, flag) = crate::bash::shell_launcher();
     let mut command_builder = crate::sandbox::quiet_command(&program);
     command_builder.arg(flag).arg(command);
+    if let Some(workspace) = workspace {
+        command_builder.current_dir(workspace);
+    }
     CommandWithStdin::new(command_builder)
 }
 

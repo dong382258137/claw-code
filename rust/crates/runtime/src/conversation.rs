@@ -2764,6 +2764,7 @@ where
         if let Some(coordinator) = &self.multi_agent_coordinator {
             coordinator.set_workspace_root(root.clone());
         }
+        self.hook_runner.set_workspace(root.clone());
         self.workspace_root = Some(root);
         self
     }
@@ -3365,6 +3366,7 @@ where
         if let Some(coordinator) = &self.multi_agent_coordinator {
             coordinator.set_workspace_root(root.clone());
         }
+        self.hook_runner.set_workspace(root.clone());
         self.workspace_root = Some(root);
     }
 
