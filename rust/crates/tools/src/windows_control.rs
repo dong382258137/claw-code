@@ -110,7 +110,10 @@ pub struct WindowsControlInput {
 }
 
 /// Main entry point used by the tool executor.
-pub fn run_windows_control(input: WindowsControlInput) -> Result<String, String> {
+pub fn run_windows_control(
+    input: WindowsControlInput,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     // `cdp_open` is a native action (process + CDP orchestration), not a
     // cua-driver call, so it bypasses the build_call/invoke_tool path.
     if input.action == "cdp_open" {
@@ -118,7 +121,7 @@ pub fn run_windows_control(input: WindowsControlInput) -> Result<String, String>
     }
     let (tool, args) = build_call(&input)?;
     let raw = invoke_tool(&tool, &args)?;
-    postprocess(&tool, &input, &raw)
+    postprocess(&tool, &input, &raw, workspace)
 }
 
 /// Map the native action onto a cua-driver tool name + JSON arguments.
@@ -362,7 +365,12 @@ fn start_daemon(exe: &Path) -> Result<(), String> {
 /// - strip the `screenshot_png_b64` blob, save it to
 ///   `<cwd>/.claw/windows_shots/<ts>.png`, and report `screenshot_path`
 ///   instead (keeps the model context small, mirroring browser_control).
-fn postprocess(tool: &str, input: &WindowsControlInput, raw: &str) -> Result<String, String> {
+fn postprocess(
+    tool: &str,
+    input: &WindowsControlInput,
+    raw: &str,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     if !(tool == "get_window_state" || tool == "get_desktop_state") {
         return Ok(raw.to_string());
     }
@@ -374,7 +382,7 @@ fn postprocess(tool: &str, input: &WindowsControlInput, raw: &str) -> Result<Str
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(b64)
                     .map_err(|e| format!("failed to decode screenshot base64: {e}"))?;
-                let path = resolve_screenshot_path(input.save_path.as_deref())?;
+                let path = resolve_screenshot_path(input.save_path.as_deref(), workspace)?;
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -392,7 +400,10 @@ fn postprocess(tool: &str, input: &WindowsControlInput, raw: &str) -> Result<Str
     serde_json::to_string(&v).map_err(|e| format!("failed to serialize result: {e}"))
 }
 
-fn resolve_screenshot_path(save_path: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_screenshot_path(
+    save_path: Option<&str>,
+    workspace: &std::path::Path,
+) -> Result<PathBuf, String> {
     if let Some(p) = save_path {
         let p = p.trim();
         if !p.is_empty() {
@@ -403,8 +414,7 @@ fn resolve_screenshot_path(save_path: Option<&str>) -> Result<PathBuf, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("system clock error: {e}"))?
         .as_millis();
-    let cwd = std::env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?;
-    Ok(cwd
+    Ok(workspace
         .join(".claw")
         .join("windows_shots")
         .join(format!("{ts}.png")))
@@ -937,7 +947,13 @@ mod tests {
             "screenshot_png_b64": "aGVsbG8="  // "hello"
         })
         .to_string();
-        let out = postprocess("get_window_state", &input("snapshot"), &raw).unwrap();
+        let out = postprocess(
+            "get_window_state",
+            &input("snapshot"),
+            &raw,
+            std::path::Path::new("."),
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("screenshot_png_b64").is_none());
         assert!(v["screenshot_path"].as_str().unwrap().ends_with(".png"));
@@ -952,7 +968,7 @@ mod tests {
     #[test]
     fn postprocess_passthrough_for_actions() {
         let raw = json!({"status": "clicked"}).to_string();
-        let out = postprocess("click", &input("click"), &raw).unwrap();
+        let out = postprocess("click", &input("click"), &raw, std::path::Path::new(".")).unwrap();
         assert_eq!(out, raw);
     }
 

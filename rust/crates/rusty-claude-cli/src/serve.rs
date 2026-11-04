@@ -562,9 +562,12 @@ pub fn run_web(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => strip_verbatim(path),
         None => strip_verbatim(default_workspace()),
     };
-    // serve 进程内跑 turn 时，LiveCli 以进程 cwd 作为工作区；因此把 cwd 对齐到
-    // `--cwd`（同时让 `.env` 从工作区加载）。serve 是单工作区进程，这样是安全的。
-    let _ = std::env::set_current_dir(&cwd);
+    // 进程 cwd 固定到中性临时目录：工具层/hooks/LSP 的任何“漏改”隐式 cwd
+    // 都会落到这里而不是某个用户工作区，便于测试暴露跨工作区串味。
+    // 真正的执行目录由 `TurnEnv` 逐会话显式传入。
+    let neutral_dir = std::env::temp_dir().join("claw-serve");
+    std::fs::create_dir_all(&neutral_dir)?;
+    std::env::set_current_dir(&neutral_dir)?;
     // 默认工作区自动登记，侧栏才能把它的会话与其它工作区一起展示。
     register_workspace(&cwd);
     let store = runtime::SessionStore::from_cwd(&cwd)?;
@@ -1112,21 +1115,13 @@ fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
         session_id,
         activity,
     } = turn;
-    // LiveCli 以进程 cwd 作为工作区根，而 serve 可能服务多个工作区；
-    // 用全局锁串行切换 cwd，turn 结束后不恢复（其他 API 都用绝对路径）。
-    // 带超时等待：若上一轮卡死，这里不能无限阻塞，否则所有会话一起静默。
+    // 进程 cwd 固定在启动时的中性临时目录；这里不再切换，所有路径都由
+    // `workspace` 显式传入 LiveCli / 工具层。
     let _turn_guard = acquire_turn_lock(&lock, Duration::from_secs(10))?;
-    if let Err(error) = std::env::set_current_dir(&workspace) {
-        return Err(format!(
-            "切换工作区失败（{}）：{error}",
-            workspace.display()
-        ));
-    }
     let model = model_override
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| {
-            crate::config_model_for_current_dir()
-                .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+            crate::config_model_for(&workspace).unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
         });
     let mut cli = crate::app::LiveCli::new(
         model,
@@ -1135,6 +1130,7 @@ fn run_web_turn(turn: WebTurn<'_>) -> Result<(), String> {
         mode,
         Vec::new(),
         crate::render::OutputVerbosity::default(),
+        &workspace,
     )
     .map_err(|error| error.to_string())?;
     cli.resume_from_path(session_path)
@@ -1390,7 +1386,7 @@ async fn api_voice_chat(
         .model
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| {
-            crate::config_model_for_current_dir()
+            crate::config_model_for(&state.workspace)
                 .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
         });
 
@@ -1881,7 +1877,7 @@ async fn api_create_session(
     let sessions_dir = store.sessions_dir().to_path_buf();
     let now = now_ms();
     let model =
-        crate::config_model_for_current_dir().unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
+        crate::config_model_for(&workspace).unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
     let mut attempt = 0u32;
     let (id, path) = loop {
         let id = if attempt == 0 {

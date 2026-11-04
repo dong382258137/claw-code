@@ -1108,9 +1108,20 @@ pub(crate) fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(current_session_store()?.sessions_dir().to_path_buf())
 }
 
+pub(crate) fn session_store_for(
+    workspace: &Path,
+) -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
+    runtime::SessionStore::from_cwd(workspace)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// 兼容包装：从进程当前目录解析会话存储。
+///
+/// 仅允许 CLI 入口/测试使用；Web/多工作区路径必须调用 [`session_store_for`]。
+/// `cwd-allowlist: cli-entry`
 pub(crate) fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    session_store_for(&cwd)
 }
 
 /// 热升级请求(双大脑收官基石):旧进程 `/upgrade` 写入,新进程启动检测。
@@ -1211,8 +1222,8 @@ pub(crate) fn clear_upgrade_exited(workspace_root: &Path) {
     let _ = fs::remove_file(path);
 }
 
-pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
+pub(crate) fn new_cli_session_in(workspace: &Path) -> Result<Session, Box<dyn std::error::Error>> {
+    let cwd = workspace.to_path_buf();
     let mut session = Session::new().with_workspace_root(cwd.clone());
     // Attach a SQLite FTS5 history index so the `session_search` tool can
     // recall past messages. Best-effort: if the DB cannot be opened (e.g.
@@ -1229,12 +1240,19 @@ pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     Ok(session)
 }
 
+/// 兼容包装：从进程当前目录创建会话。`cwd-allowlist: cli-entry`
+pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    new_cli_session_in(&cwd)
+}
+
 /// 与 [`new_cli_session`] 类似，但额外附加 `--add-dir` 提供的工作区根。
 /// 这些根与主工作区根一起构成多根校验集合（见 `WorkspacePathScope`）。
-pub(crate) fn new_cli_session_with_roots(
+pub(crate) fn new_cli_session_with_roots_in(
+    workspace: &Path,
     additional_roots: Vec<PathBuf>,
 ) -> Result<Session, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
+    let cwd = workspace.to_path_buf();
     let mut session = Session::new()
         .with_workspace_root(cwd.clone())
         .with_additional_workspace_roots(additional_roots);
@@ -1254,14 +1272,31 @@ pub(crate) fn new_cli_session_with_roots(
     Ok(session)
 }
 
-pub(crate) fn create_managed_session_handle(
+/// 兼容包装：从进程当前目录创建会话。`cwd-allowlist: cli-entry`
+pub(crate) fn new_cli_session_with_roots(
+    additional_roots: Vec<PathBuf>,
+) -> Result<Session, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    new_cli_session_with_roots_in(&cwd, additional_roots)
+}
+
+pub(crate) fn create_managed_session_handle_in(
+    workspace: &Path,
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?.create_handle(session_id);
+    let handle = session_store_for(workspace)?.create_handle(session_id);
     Ok(SessionHandle {
         id: handle.id,
         path: handle.path,
     })
+}
+
+/// 兼容包装：从进程当前目录创建会话句柄。`cwd-allowlist: cli-entry`
+pub(crate) fn create_managed_session_handle(
+    session_id: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    create_managed_session_handle_in(&cwd, session_id)
 }
 
 pub(crate) fn resolve_session_reference(

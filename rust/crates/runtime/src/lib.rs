@@ -188,7 +188,7 @@ pub use approval_tokens::{
     ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
 };
-pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use bash::{execute_bash, execute_bash_in, BashCommandInput, BashCommandOutput};
 pub use bg::{bg_dir, BgError, BgRecord, BgStatus};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

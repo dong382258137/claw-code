@@ -101,11 +101,7 @@ pub fn apply_policy(freshness: &BranchFreshness, policy: StaleBranchPolicy) -> S
     }
 }
 
-pub(crate) fn check_freshness_in(
-    branch: &str,
-    main_ref: &str,
-    repo_path: &Path,
-) -> BranchFreshness {
+pub fn check_freshness_in(branch: &str, main_ref: &str, repo_path: &Path) -> BranchFreshness {
     let behind = rev_list_count(main_ref, branch, repo_path);
     let ahead = rev_list_count(branch, main_ref, repo_path);
 

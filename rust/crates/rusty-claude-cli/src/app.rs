@@ -37,25 +37,26 @@ use crate::paste::{
 };
 use crate::plugin_state::{
     build_plugin_manager, build_runtime_mcp_state, build_runtime_plugin_state,
-    build_runtime_plugin_state_with_loader, mcp_annotation_flag, mcp_runtime_tool_definition,
-    mcp_wrapper_tool_definitions, permission_mode_for_mcp_tool, plugins_command_payload_for,
-    plugins_command_payload_from_result, resolve_plugin_path,
+    build_runtime_plugin_state_for, build_runtime_plugin_state_with_loader, mcp_annotation_flag,
+    mcp_runtime_tool_definition, mcp_wrapper_tool_definitions, permission_mode_for_mcp_tool,
+    plugins_command_payload_for, plugins_command_payload_from_result, resolve_plugin_path,
     runtime_hook_config_from_plugin_hooks, RuntimeMcpState, RuntimePluginState,
     RuntimePluginStateBuildOutput,
 };
 use crate::render::{MarkdownStreamState, OutputVerbosity, Spinner, TerminalRenderer};
 use crate::session_mgr::{
     civil_from_days, clear_upgrade_request, collect_session_prompt_history,
-    confirm_session_deletion, create_managed_session_handle, current_session_store,
-    default_export_filename, delete_managed_session, format_history_timestamp,
-    format_session_modified_age, interactive_session_pick, latest_managed_session,
-    list_managed_sessions, load_session_reference, looks_like_slash_command_token, new_cli_session,
-    new_cli_session_with_roots, parse_history_count, read_upgrade_request, recent_user_context,
-    render_prompt_history_report, render_session_list, render_session_markdown,
-    resolve_export_path, resolve_managed_session_path, resolve_session_reference,
-    resume_command_can_absorb_token, resume_session, run_export, run_resume_command,
-    run_resumed_session_command, session_clear_backup_path, session_details_json,
-    session_exists_json, session_reference_exists, sessions_dir,
+    confirm_session_deletion, create_managed_session_handle, create_managed_session_handle_in,
+    current_session_store, default_export_filename, delete_managed_session,
+    format_history_timestamp, format_session_modified_age, interactive_session_pick,
+    latest_managed_session, list_managed_sessions, load_session_reference,
+    looks_like_slash_command_token, new_cli_session, new_cli_session_in,
+    new_cli_session_with_roots, new_cli_session_with_roots_in, parse_history_count,
+    read_upgrade_request, recent_user_context, render_prompt_history_report, render_session_list,
+    render_session_markdown, resolve_export_path, resolve_managed_session_path,
+    resolve_session_reference, resume_command_can_absorb_token, resume_session, run_export,
+    run_resume_command, run_resumed_session_command, session_clear_backup_path,
+    session_details_json, session_exists_json, session_reference_exists, sessions_dir,
     summarize_tool_payload_for_markdown, write_session_clear_backup, write_upgrade_exited,
     write_upgrade_request, ManagedSessionSummary, PromptHistoryEntry, ResumeCommandOutcome,
     SessionHandle, SessionLifecycleKind, SessionLifecycleSummary, UpgradeRequest,
@@ -380,6 +381,7 @@ pub(crate) fn build_live_cli_for_repl(
     thinking_mode: Option<bool>,
 ) -> Result<LiveCli, Box<dyn std::error::Error>> {
     let resolved_model = resolve_repl_model(model);
+    let workspace = env::current_dir()?;
     let mut cli = LiveCli::new(
         resolved_model,
         true,
@@ -387,6 +389,7 @@ pub(crate) fn build_live_cli_for_repl(
         permission_mode,
         additional_workspace_roots,
         output_verbosity,
+        &workspace,
     )?;
     cli.set_reasoning_effort(reasoning_effort);
     cli.set_thinking_mode(thinking_mode);
@@ -675,6 +678,9 @@ pub(crate) struct LiveCli {
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
+    /// 本 CLI 绑定的工作区根；所有需要 cwd 的内部路径都从这里派生，
+    /// 不读取进程级当前目录（Web 多工作区下进程 cwd 是中性临时目录）。
+    workspace: PathBuf,
     prompt_history: Vec<PromptHistoryEntry>,
     output_verbosity: OutputVerbosity,
     // P2 富状态栏：累计本会话所有回合的 token usage，用于状态栏持续显示 cost/token。
@@ -865,21 +871,22 @@ impl LiveCli {
         permission_mode: PermissionMode,
         additional_workspace_roots: Vec<PathBuf>,
         output_verbosity: OutputVerbosity,
+        workspace: &Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(feature = "full-tui")]
         crate::diag_log(&format!("[LiveCli::new] start, model={model}"));
         let t0 = std::time::Instant::now();
         #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] calling build_system_prompt");
-        let system_prompt = build_system_prompt(&model)?;
+        let system_prompt = build_system_prompt(&model, workspace)?;
         #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] build_system_prompt OK");
         let t_sp = t0.elapsed();
-        let session_state = new_cli_session_with_roots(additional_workspace_roots)?;
+        let session_state = new_cli_session_with_roots_in(workspace, additional_workspace_roots)?;
         #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] new_cli_session_with_roots OK");
         let t_sess = t0.elapsed();
-        let session = create_managed_session_handle(&session_state.session_id)?;
+        let session = create_managed_session_handle_in(workspace, &session_state.session_id)?;
         #[cfg(feature = "full-tui")]
         crate::diag_log("[LiveCli::new] create_managed_session_handle OK");
         let t_handle = t0.elapsed();
@@ -895,6 +902,7 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            workspace,
         )?;
         let t_rt = t0.elapsed();
         eprintln!(
@@ -906,7 +914,8 @@ impl LiveCli {
         // 加载失败时保持默认（inactive），不阻断启动。
         // Tier S #1 Goal 持续驱动：从 `<cwd>/.claw/goal.json` 加载已持久化的 goal，
         // 恢复上次会话的 goal 状态。文件不存在或解析失败时为空管理器。
-        let goal_manager = if let Ok(cwd) = env::current_dir() {
+        let goal_manager = {
+            let cwd = workspace.to_path_buf();
             // workspace_root 对所有工具路径都需要(notebook_update/recall_full/
             // subagent 等),且与 config 解析正交——config 解析失败时不应导致
             // workspace_root 缺失。因此无条件设置,不嵌套在 loader.load() 分支内。
@@ -927,8 +936,6 @@ impl LiveCli {
                 let _ = init_lsp_from_config(&config, &cwd);
             }
             runtime::GoalManager::load(runtime::goal_json_path(&cwd))
-        } else {
-            runtime::GoalManager::new(PathBuf::from(".claw/goal.json"))
         };
         let cli = Self {
             model,
@@ -938,6 +945,7 @@ impl LiveCli {
             system_prompt,
             runtime,
             session,
+            workspace: workspace.to_path_buf(),
             prompt_history: Vec::new(),
             cumulative_usage: runtime::TokenUsage::default(),
             goal_manager,
@@ -1112,6 +1120,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            &self.workspace,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone())
         .with_upgrade_signal(self.upgrade_signal.clone())
@@ -2051,6 +2060,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            &self.workspace,
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
@@ -2105,6 +2115,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            &self.workspace,
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -2226,8 +2237,9 @@ impl LiveCli {
         }
 
         let previous_session = self.session.clone();
-        let session_state = new_cli_session()?;
-        self.session = create_managed_session_handle(&session_state.session_id)?;
+        let session_state = new_cli_session_in(&self.workspace)?;
+        self.session =
+            create_managed_session_handle_in(&self.workspace, &session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(self.session.path.clone()),
             &self.session.id,
@@ -2238,6 +2250,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            &self.workspace,
         )?;
         self.replace_runtime(runtime)?;
         // 走 tui_println 以避免在 TUI 模式下破坏 alternate screen
@@ -2301,6 +2314,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            &self.workspace,
         )?;
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
@@ -2534,6 +2548,7 @@ impl LiveCli {
                             self.allowed_tools.clone(),
                             self.permission_mode,
                             None,
+                            &self.workspace,
                         )?;
                         self.replace_runtime(runtime)?;
                         self.session = SessionHandle {
@@ -2608,6 +2623,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    &self.workspace,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
@@ -2629,7 +2645,7 @@ impl LiveCli {
             Some("fork") => {
                 let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
                 let parent_session_id = self.session.id.clone();
-                let handle = create_managed_session_handle(&forked.session_id)?;
+                let handle = create_managed_session_handle_in(&self.workspace, &forked.session_id)?;
                 let branch_name = forked
                     .fork
                     .as_ref()
@@ -2647,6 +2663,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    &self.workspace,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
@@ -2793,6 +2810,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            &self.workspace,
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()
@@ -2813,6 +2831,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            &self.workspace,
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
@@ -2837,6 +2856,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
+            &self.workspace,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
@@ -3045,6 +3065,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            &self.workspace,
         )?;
         if compacted.removed_message_count > 0 {
             crate::diag_log(&format!(
@@ -3159,7 +3180,7 @@ impl LiveCli {
 
     fn run_pr(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         let branch =
-            resolve_git_branch_for(&env::current_dir()?).unwrap_or_else(|| "unknown".to_string());
+            resolve_git_branch_for(&self.workspace).unwrap_or_else(|| "unknown".to_string());
         println!("{}", format_pr_report(&branch, context));
         Ok(())
     }
@@ -3369,10 +3390,13 @@ fn topology_for(cwd: &Path) -> Arc<runtime::project_topology::ProjectTopology> {
     })
 }
 
-pub(crate) fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+pub(crate) fn build_system_prompt(
+    model: &str,
+    workspace: &Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     #[cfg(feature = "full-tui")]
     crate::diag_log(&format!("[build_system_prompt] start, model={model}"));
-    let cwd = env::current_dir()?;
+    let cwd = workspace.to_path_buf();
     #[cfg(feature = "full-tui")]
     crate::diag_log(&format!("[build_system_prompt] cwd={}", cwd.display()));
 
@@ -3774,8 +3798,9 @@ pub(crate) fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    workspace: &Path,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = build_runtime_plugin_state()?;
+    let runtime_plugin_state = build_runtime_plugin_state_for(workspace)?;
     build_runtime_with_plugin_state(
         session,
         session_id,
@@ -3787,6 +3812,7 @@ pub(crate) fn build_runtime(
         permission_mode,
         progress_reporter,
         runtime_plugin_state,
+        workspace,
     )
 }
 
@@ -3901,6 +3927,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
+    workspace: &Path,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
@@ -3918,7 +3945,9 @@ pub(crate) fn build_runtime_with_plugin_state(
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
-    let tool_registry = tool_registry.with_workspace_roots(workspace_roots);
+    // 显式 turn 环境：主工作区根 + `--add-dir` 额外根；子智能体与 DAG 执行器共享同一份。
+    let turn_env = tools::TurnEnv::new(workspace.to_path_buf(), workspace_roots);
+    let tool_registry = tool_registry.with_turn_env(turn_env.clone());
     plugin_registry.initialize()?;
     // MCP 服务器健康总览注入:runtime registry 已在 RuntimeMcpState::new 中完成
     // best-effort 连接,把每个服务器的实时状态(connected / error / unsupported)
@@ -3934,7 +3963,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 现在提前创建，共享同一个 Arc。
     // D1:改用线程局部注册表按规范化 cwd 复用 build_system_prompt 已构造的实例
     // （同一 cwd 下不重复建，多个 build_runtime 调用点共享同一拓扑）。
-    let shared_topology = env::current_dir().ok().map(|cwd| topology_for(&cwd));
+    let shared_topology = Some(topology_for(workspace));
     // v0.2 生产接入:在 model 被 move 进 AnthropicRuntimeClient 之前先 clone 一份,
     // 稍后用于构造独立的 subagent api_client(DAG dispatch 用)。
     // AnthropicRuntimeClient 不是 Clone(内含 tokio::runtime::Runtime),只能重建。
@@ -3975,9 +4004,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     // design-gaps #1:启用 hooks 配置热重载 — 每 turn 检查配置源
     // (settings.json / .claw.json 等)的 mtime,变化则原子替换 hooks 配置,
     // 无需重启会话。加载失败(如 cwd 不可用)时静默保持默认行为。
-    if let Ok(cwd) = env::current_dir() {
-        runtime = runtime.with_hooks_hot_reload(ConfigLoader::default_for(cwd));
-    }
+    runtime = runtime.with_hooks_hot_reload(ConfigLoader::default_for(workspace.to_path_buf()));
     // 建议2(统一收口):易变运行时内容不再经 ContextAssembler 注入
     // system_prompt 变动区,统一由 runtime 内部的 render_runtime_hints
     // 渲染成 messages 末尾的冻结槽位块(见 conversation.rs)。旧架构
@@ -4012,9 +4039,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 让会话运行时每 evolution_interval turn 自动执行 weakness mining +
     // 规则式 Proposer + 两重门控验证,失败教训跨会话沉淀。
     // 打开失败只静默跳过(archive 是可选增强,不应阻塞启动)。
-    if let Ok(cwd) = env::current_dir() {
-        runtime = runtime.with_harness_evolution(cwd);
-    }
+    runtime = runtime.with_harness_evolution(workspace.to_path_buf());
     // P0(2026-08-13 Pro 0813):注入 LLM harness Proposer(Phase 3)。
     // 规则式 Proposer 未命中时,用 LLM 从失败模式提出新 harness 规则,
     // 突破硬编码规则覆盖上限。构造失败(无 API key)静默跳过,
@@ -4048,8 +4073,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     //
     // 失败处理:单个 checkpoint 恢复失败只 log,不中止整个启动
     // (避免一个损坏文件阻塞整个 CLI)。
-    if let Ok(cwd) = env::current_dir() {
-        let ckpt_dir = cwd.join(".claw").join("checkpoints");
+    {
+        let ckpt_dir = workspace.join(".claw").join("checkpoints");
         if let Ok(entries) = std::fs::read_dir(&ckpt_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -4072,7 +4097,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     // - 命令不存在时跳过注册(避免 retryable=false 中止 validation 链),
     //   借鉴 PATH 探测模式:有 cargo/npm/python 才注册对应 gate
     // - 无 workspace_root 时全部跳过(CommandValidationGate 需要 cwd)
-    if let Ok(workspace_root) = env::current_dir() {
+    {
+        let workspace_root = workspace.to_path_buf();
         if crate::command_exists("cargo") {
             coordinator.add_validation_gate(Box::new(
                 runtime::multi_agent::validation::rust_compile_gate(workspace_root.clone()),
@@ -4291,7 +4317,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     // enable_tools=false(subagent system prompt 明确不需要工具),
     // emit_output=false(避免子 agent 输出污染主 CLI),
     // progress_reporter=None(subagent 不需要进度回调)。
-    if let Ok(workspace_root) = env::current_dir() {
+    let workspace_root = workspace.to_path_buf();
+    if workspace_root.is_dir() {
         let subagent_api_client = build_api_client(
             session_id,
             &model_for_subagent,
@@ -4310,6 +4337,7 @@ pub(crate) fn build_runtime_with_plugin_state(
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
+            turn_env.clone(),
         );
         runtime = runtime.with_dag_coordinator(
             coordinator_arc,
@@ -4331,8 +4359,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     // YAML 声明式 DAG 预注册:启动时扫描 <workspace>/.claw/dags/*.yaml,
     // 注入全局 DagStore。与 dag_define 工具共用同一套校验/默认值逻辑,
     // 让模型无需工具调用即可对预定义依赖图执行 dag_run。
-    if let Ok(workspace_root) = env::current_dir() {
-        let dags_dir = workspace_root.join(".claw").join("dags");
+    if workspace.is_dir() {
+        let dags_dir = workspace.join(".claw").join("dags");
         let (dags, errors) =
             runtime::multi_agent::dag::yaml_loader::load_dag_definitions_with_errors(&dags_dir);
         for err in &errors {
@@ -4354,7 +4382,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     // nudge layer can write new entries to disk while the prompt's frozen
     // snapshot (loaded separately in load_prompt_extras) stays byte-stable
     // for the session — preserving the prompt-cache prefix.
-    if let Ok(cwd) = env::current_dir() {
+    let cwd = workspace.to_path_buf();
+    {
         let memory_path = cwd.join(".claw").join("memory.json");
         // load_and_freeze 内部已处理文件不存在的情况（返回空记忆），
         // 始终注入 PersistentMemory 以启用 nudge → add_entry → persist 链路，
@@ -4395,8 +4424,8 @@ pub(crate) fn build_runtime_with_plugin_state(
     // 现在用 JsonlTelemetrySink 写入 <cwd>/.claw/telemetry.jsonl,
     // 为后续 trace 分析 / 失败模式聚类 / CSV 导出提供数据依据。
     // 失败(无 cwd / 目录不可写)时静默跳过,不阻塞启动。
-    if let Ok(cwd) = env::current_dir() {
-        let telemetry_path = cwd.join(".claw").join("telemetry.jsonl");
+    {
+        let telemetry_path = workspace.join(".claw").join("telemetry.jsonl");
         match JsonlTelemetrySink::new(&telemetry_path) {
             Ok(sink) => {
                 let tracer = SessionTracer::new(session_id, Arc::new(sink));

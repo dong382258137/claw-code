@@ -37,8 +37,8 @@ use crate::{
     format_connected_line, normalize_allowed_tools, parse_export_args, parse_permission_mode_arg,
     parse_resume_args, parse_system_prompt_args, permission_mode_from_label,
     permission_mode_from_resolved, provider_label, render_version_report, resolve_model_alias,
-    resolve_model_alias_with_config, validate_model_syntax, AllowedToolSet,
-    CliOutputFormat, BUILD_TARGET, DEFAULT_DATE, DEFAULT_MODEL, GIT_SHA, VERSION,
+    resolve_model_alias_with_config, validate_model_syntax, AllowedToolSet, CliOutputFormat,
+    BUILD_TARGET, DEFAULT_DATE, DEFAULT_MODEL, GIT_SHA, VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

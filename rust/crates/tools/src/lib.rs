@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -14,9 +15,8 @@ use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::multi_agent::dag;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace_with_roots,
-    execute_bash, glob_search_in_workspace_with_roots, grep_search_in_workspace_with_roots,
-    load_system_prompt,
+    dedupe_superseded_commit_events, edit_file_in_workspace_with_roots, execute_bash_in,
+    glob_search_in_workspace_with_roots, grep_search_in_workspace_with_roots, load_system_prompt,
     lsp_client::{LspAutoDiagOutcome, LspDiagnostic, LspRegistry},
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -445,15 +445,77 @@ pub struct ToolSpec {
     pub required_permission: PermissionMode,
 }
 
+/// 单个 turn 的工具执行环境。
+///
+/// 显式携带工作区根、额外工作区根与取消信号，避免工具层读取进程级 cwd。
+/// 权限判定与工具执行必须使用同一个 `TurnEnv` 实例，否则跨工作区会越权。
+#[derive(Debug, Clone)]
+pub struct TurnEnv {
+    workspace: PathBuf,
+    roots: Vec<PathBuf>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl TurnEnv {
+    #[must_use]
+    pub fn new(workspace: impl Into<PathBuf>, roots: Vec<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            roots,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// 兼容包装：从进程当前目录构造。
+    ///
+    /// 仅允许 CLI 入口/测试使用；工具执行路径必须使用显式 workspace。
+    #[must_use]
+    pub fn for_current_dir() -> Self {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::new(workspace, Vec::new())
+    }
+
+    #[must_use]
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    #[must_use]
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    #[must_use]
+    pub fn cancel_flag(&self) -> &Arc<AtomicBool> {
+        &self.cancel
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.roots = roots;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalToolRegistry {
     plugin_tools: Vec<PluginTool>,
     runtime_tools: Vec<RuntimeToolDefinition>,
     enforcer: Option<PermissionEnforcer>,
-    /// 多根工作区白名单（来自 `Session::workspace_roots()`）。
-    /// 为空时 `classify_*_permission_with_roots` 退化为单根 cwd 行为。
-    /// 非空时，路径落在任一根内即视为工作区内，允许 WorkspaceWrite/ReadOnly。
-    workspace_roots: Vec<PathBuf>,
+    /// 当前轮次工具执行环境（工作区根 + 额外根 + 取消信号）。
+    /// `roots` 为空时路径校验只认主工作区根。
+    env: TurnEnv,
     /// 渐进式工具加载(P0-2):启用覆盖集。
     ///
     /// - `None`:全量注入(默认,向后兼容)——`definitions()` 返回所有工具。
@@ -494,7 +556,7 @@ impl GlobalToolRegistry {
             plugin_tools: Vec::new(),
             runtime_tools: Vec::new(),
             enforcer: None,
-            workspace_roots: Vec::new(),
+            env: TurnEnv::for_current_dir(),
             enabled_overlay: None,
         }
     }
@@ -522,7 +584,7 @@ impl GlobalToolRegistry {
             plugin_tools,
             runtime_tools: Vec::new(),
             enforcer: None,
-            workspace_roots: Vec::new(),
+            env: TurnEnv::for_current_dir(),
             enabled_overlay: None,
         })
     }
@@ -560,18 +622,30 @@ impl GlobalToolRegistry {
         self
     }
 
-    /// 设置工作区根白名单。传入空 Vec 等价于不调用（退化为单根 cwd 行为）。
-    /// 来自 `Session::workspace_roots()`，通常包含主 cwd 根 + `--add-dir` 额外根。
+    /// 设置额外工作区根白名单。传入空 Vec 等价于不调用（只认主工作区根）。
+    /// 来自 `Session::workspace_roots()`，通常包含主根 + `--add-dir` 额外根。
     #[must_use]
     pub fn with_workspace_roots(mut self, roots: Vec<PathBuf>) -> Self {
-        self.workspace_roots = roots;
+        self.env = self.env.with_roots(roots);
         self
     }
 
-    /// 返回工作区根白名单的引用。
+    /// 绑定显式 turn 环境（主工作区根 + 额外根 + 取消信号）。
+    #[must_use]
+    pub fn with_turn_env(mut self, env: TurnEnv) -> Self {
+        self.env = env;
+        self
+    }
+
+    #[must_use]
+    pub fn turn_env(&self) -> &TurnEnv {
+        &self.env
+    }
+
+    /// 返回额外工作区根白名单的引用。
     #[must_use]
     pub fn workspace_roots(&self) -> &[PathBuf] {
-        &self.workspace_roots
+        self.env.roots()
     }
 
     /// P0-2:开启渐进式工具加载(owned 形式)。
@@ -793,17 +867,7 @@ impl GlobalToolRegistry {
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            let roots = if self.workspace_roots.is_empty() {
-                None
-            } else {
-                Some(self.workspace_roots.as_slice())
-            };
-            return execute_tool_with_enforcer_and_roots(
-                self.enforcer.as_ref(),
-                name,
-                input,
-                roots,
-            );
+            return execute_tool_in_with_enforcer(&self.env, self.enforcer.as_ref(), name, input);
         }
         self.plugin_tools
             .iter()
@@ -836,9 +900,8 @@ impl GlobalToolRegistry {
         // namespaced with `skill:` prefix to distinguish them from tools
         // (e.g. `skill:frontend-design`). The model can then call the
         // `Skill` tool with the bare name (without prefix) to load it.
-        let skills = std::env::current_dir()
+        let skills = commands::list_skill_summaries(self.env.workspace())
             .ok()
-            .and_then(|cwd| commands::list_skill_summaries(&cwd).ok())
             .map(|skills| {
                 skills.into_iter().map(|skill| SearchableToolSpec {
                     name: format!("skill:{}", skill.name()),
@@ -2075,152 +2138,104 @@ pub fn enforce_permission_check(
 }
 
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
-    execute_tool_with_enforcer(None, name, input)
+    execute_tool_in(&TurnEnv::for_current_dir(), name, input)
 }
 
-/// 与 [`execute_tool_with_enforcer`] 相同，但接受工作区根白名单。
-/// `extra_roots` 为 None 或空时，行为完全等价于 [`execute_tool_with_enforcer`]。
-/// 非空时，路径校验使用 `classify_*_permission_with_roots` 变体，任一根包含即放行。
-///
-/// 设计意图：让 `--add-dir` 添加的额外工作区根真正在工具执行路径生效，
-/// 而不是只在 Session 上记录。
-#[allow(clippy::too_many_lines)]
-fn execute_tool_with_enforcer_and_roots(
-    enforcer: Option<&PermissionEnforcer>,
-    name: &str,
-    input: &Value,
-    extra_roots: Option<&[PathBuf]>,
-) -> Result<String, String> {
-    // 无额外根时直接走原路径，保持行为完全等价
-    if extra_roots.is_none_or(|roots| roots.is_empty()) {
-        return execute_tool_with_enforcer(enforcer, name, input);
-    }
-    match name {
-        "bash" => {
-            let bash_input: BashCommandInput = from_value(input)?;
-            let classified_mode = classify_bash_permission(&bash_input.command);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            validate_bash_before_run(&bash_input.command, enforcer)?;
-            run_bash(bash_input)
-        }
-        "read_file" => {
-            let file_input: ReadFileInput = from_value(input)?;
-            let required_mode =
-                classify_read_path_permission_with_roots(&file_input.path, false, extra_roots);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_read_file(file_input, extra_roots)
-        }
-        "write_file" => {
-            let file_input: WriteFileInput = from_value(input)?;
-            let required_mode =
-                classify_file_path_permission_with_roots(&file_input.path, true, extra_roots);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_write_file(file_input, extra_roots)
-        }
-        "edit_file" => {
-            let file_input: EditFileInput = from_value(input)?;
-            let required_mode =
-                classify_file_path_permission_with_roots(&file_input.path, false, extra_roots);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_edit_file(file_input, extra_roots)
-        }
-        "replace_lines" => {
-            let replace_input: ReplaceLinesInput = from_value(input)?;
-            let required_mode =
-                classify_file_path_permission_with_roots(&replace_input.path, true, extra_roots);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_replace_lines(replace_input, extra_roots)
-        }
-        "glob_search" => {
-            let glob_input: GlobSearchInputValue = from_value(input)?;
-            let required_mode = classify_glob_permission_with_roots(&glob_input, extra_roots);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_glob_search(glob_input, extra_roots)
-        }
-        "grep_search" => {
-            let grep_input: GrepSearchInput = from_value(input)?;
-            let required_mode = classify_grep_permission_with_roots(&grep_input, extra_roots);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_grep_search(grep_input, extra_roots)
-        }
-        // 非路径类工具不受 extra_roots 影响，直接走原路径
-        _ => execute_tool_with_enforcer(enforcer, name, input),
-    }
+/// 在显式 [`TurnEnv`] 内执行工具（无权限强制）。
+pub fn execute_tool_in(env: &TurnEnv, name: &str, input: &Value) -> Result<String, String> {
+    execute_tool_in_with_enforcer(env, None, name, input)
 }
 
+/// 单工具执行入口：权限分类与工具执行共用同一个 [`TurnEnv`]。
 #[allow(clippy::too_many_lines)]
-fn execute_tool_with_enforcer(
+fn execute_tool_in_with_enforcer(
+    env: &TurnEnv,
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    let workspace = env.workspace();
+    let extra_roots = if env.roots().is_empty() {
+        None
+    } else {
+        Some(env.roots())
+    };
     match name {
         "bash" => {
             // Parse input to get the command for permission classification
             let bash_input: BashCommandInput = from_value(input)?;
-            let classified_mode = classify_bash_permission(&bash_input.command);
+            let classified_mode = classify_bash_permission(&bash_input.command, workspace);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            validate_bash_before_run(&bash_input.command, enforcer)?;
-            run_bash(bash_input)
+            validate_bash_before_run(&bash_input.command, enforcer, workspace)?;
+            run_bash(bash_input, env)
         }
         "read_file" => {
             let file_input: ReadFileInput = from_value(input)?;
-            let required_mode = classify_read_path_permission(&file_input.path, false);
+            let required_mode =
+                classify_read_path_permission(&file_input.path, false, workspace, extra_roots);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_read_file(file_input, None)
+            run_read_file(file_input, env)
         }
         "write_file" => {
             let file_input: WriteFileInput = from_value(input)?;
-            let required_mode = classify_file_path_permission(&file_input.path, true);
+            let required_mode =
+                classify_file_path_permission(&file_input.path, true, workspace, extra_roots);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_write_file(file_input, None)
+            run_write_file(file_input, env)
         }
         "edit_file" => {
             let file_input: EditFileInput = from_value(input)?;
-            let required_mode = classify_file_path_permission(&file_input.path, false);
+            let required_mode =
+                classify_file_path_permission(&file_input.path, false, workspace, extra_roots);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_edit_file(file_input, None)
+            run_edit_file(file_input, env)
         }
         "replace_lines" => {
             let replace_input: ReplaceLinesInput = from_value(input)?;
-            let required_mode = classify_file_path_permission(&replace_input.path, true);
+            let required_mode =
+                classify_file_path_permission(&replace_input.path, true, workspace, extra_roots);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_replace_lines(replace_input, None)
+            run_replace_lines(replace_input, env)
         }
         "glob_search" => {
             let glob_input: GlobSearchInputValue = from_value(input)?;
-            let required_mode = classify_glob_permission(&glob_input);
+            let required_mode = classify_glob_permission(&glob_input, workspace, extra_roots);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_glob_search(glob_input, None)
+            run_glob_search(glob_input, env)
         }
         "grep_search" => {
             let grep_input: GrepSearchInput = from_value(input)?;
-            let required_mode = classify_grep_permission(&grep_input);
+            let required_mode = classify_grep_permission(&grep_input, workspace, extra_roots);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_grep_search(grep_input, None)
+            run_grep_search(grep_input, env)
         }
         "browser_control" => from_value::<browser_control::BrowserControlInput>(input)
-            .and_then(browser_control::run_browser_control),
+            .and_then(|input| browser_control::run_browser_control(input, workspace)),
         "windows_control" => from_value::<windows_control::WindowsControlInput>(input)
-            .and_then(windows_control::run_windows_control),
+            .and_then(|input| windows_control::run_windows_control(input, workspace)),
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
-        "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
-        "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
-        "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
+        "TodoWrite" => {
+            from_value::<TodoWriteInput>(input).and_then(|input| run_todo_write(input, workspace))
+        }
+        "Skill" => from_value::<SkillInput>(input).and_then(|input| run_skill(input, workspace)),
+        "Agent" => from_value::<AgentInput>(input).and_then(|input| run_agent(input, env)),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
-        "SkillSearch" => from_value::<SkillSearchInput>(input).and_then(run_skill_search),
+        "SkillSearch" => from_value::<SkillSearchInput>(input)
+            .and_then(|input| run_skill_search(input, workspace)),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "HotUpgrade" => from_value::<HotUpgradeInput>(input).and_then(run_hot_upgrade),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
-        "Config" => from_value::<ConfigInput>(input).and_then(run_config),
+        "Config" => from_value::<ConfigInput>(input).and_then(|input| run_config(input, workspace)),
         "ImBridgeSetup" => from_value::<ImBridgeSetupInput>(input).and_then(run_im_bridge_setup),
         "ImBridgeService" => {
             from_value::<ImBridgeServiceInput>(input).and_then(run_im_bridge_service)
         }
-        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
-        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
+        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input)
+            .and_then(|input| run_enter_plan_mode(input, workspace)),
+        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input)
+            .and_then(|input| run_exit_plan_mode(input, workspace)),
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
@@ -2228,16 +2243,15 @@ fn execute_tool_with_enforcer(
         "PowerShell" => {
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
-            let classified_mode = classify_powershell_permission(&ps_input.command);
+            let classified_mode = classify_powershell_permission(&ps_input.command, workspace);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_powershell(ps_input)
+            run_powershell(ps_input, workspace)
         }
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
-        "report_framework_gap" => {
-            from_value::<FrameworkGapInput>(input).and_then(run_report_framework_gap)
-        }
+        "report_framework_gap" => from_value::<FrameworkGapInput>(input)
+            .and_then(|input| run_report_framework_gap(input, workspace)),
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
         "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
@@ -2439,7 +2453,7 @@ fn ask_timeout_json(question: &str, timeout_secs: u64) -> String {
 /// `<源码根>/.claw/evolution/inbox/`,供进化子智能体(P2/P3)消费。
 ///
 /// 与"收敛后元认知总结"互补:本通道是**进行中**的即时观察,零额外 LLM 往返。
-fn run_report_framework_gap(input: FrameworkGapInput) -> Result<String, String> {
+fn run_report_framework_gap(input: FrameworkGapInput, workspace: &Path) -> Result<String, String> {
     if input.observation.trim().is_empty() {
         return Err("observation 不能为空".to_string());
     }
@@ -2450,7 +2464,7 @@ fn run_report_framework_gap(input: FrameworkGapInput) -> Result<String, String> 
                 .to_string(),
         );
     }
-    let cwd = std::env::current_dir().map_err(|e| format!("读取 cwd 失败: {e}"))?;
+    let cwd = workspace.to_path_buf();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -3116,7 +3130,7 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 /// Scans **every** sub-command in the chain (split on `;`, `|`, `&&`, `||`,
 /// `&`) so that bypasses like `cat README.md && rm workspace_file.txt` are
 /// detected: any non-read-only sub-command forces `DangerFullAccess`.
-fn classify_bash_permission(command: &str) -> PermissionMode {
+fn classify_bash_permission(command: &str, workspace: &Path) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
         "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
@@ -3146,7 +3160,7 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
         }
 
         // Check if any path argument in this sub-command is outside workspace.
-        if has_dangerous_paths(trimmed) {
+        if has_dangerous_paths(trimmed, workspace) {
             return PermissionMode::DangerFullAccess;
         }
     }
@@ -3166,12 +3180,10 @@ fn has_sed_inplace(sed_command: &str) -> bool {
 }
 
 /// Check if command has dangerous paths (outside workspace).
-fn has_dangerous_paths(command: &str) -> bool {
+fn has_dangerous_paths(command: &str, workspace: &Path) -> bool {
     // Look for absolute paths
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|cwd| cwd.canonicalize().unwrap_or(cwd));
+    let cwd = workspace.canonicalize().ok();
 
     for token in tokens {
         let token = token.trim_matches(|ch: char| {
@@ -3245,12 +3257,15 @@ fn looks_like_windows_absolute_path(token: &str) -> bool {
         || token.starts_with(r"\\")
 }
 
-fn run_bash(input: BashCommandInput) -> Result<String, String> {
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+fn run_bash(input: BashCommandInput, env: &TurnEnv) -> Result<String, String> {
+    if let Some(output) = workspace_test_branch_preflight(&input.command, env.workspace()) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    serde_json::to_string_pretty(
+        &execute_bash_in(input, env.workspace().to_path_buf())
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Run the bash validation pipeline (mode/sed/destructive/path checks) on
@@ -3260,13 +3275,14 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
 fn validate_bash_before_run(
     command: &str,
     enforcer: Option<&PermissionEnforcer>,
+    workspace: &Path,
 ) -> Result<(), String> {
     let active_mode = enforcer
         .map(|e| e.active_mode())
         .unwrap_or(PermissionMode::WorkspaceWrite);
-    let workspace = std::env::current_dir()
-        .map(|cwd| cwd.canonicalize().unwrap_or(cwd))
-        .unwrap_or_else(|_| PathBuf::from("."));
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     if let runtime::bash_validation::ValidationResult::Block { reason } =
         runtime::bash_validation::validate_command(command, active_mode, &workspace)
     {
@@ -3275,14 +3291,14 @@ fn validate_bash_before_run(
     Ok(())
 }
 
-fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
+fn workspace_test_branch_preflight(command: &str, workspace: &Path) -> Option<BashCommandOutput> {
     if !is_workspace_test_command(command) {
         return None;
     }
 
-    let branch = git_stdout(&["branch", "--show-current"])?;
-    let main_ref = resolve_main_ref(&branch)?;
-    let freshness = check_freshness(&branch, &main_ref);
+    let branch = git_stdout(&["branch", "--show-current"], workspace)?;
+    let main_ref = resolve_main_ref(&branch, workspace)?;
+    let freshness = runtime::stale_branch::check_freshness_in(&branch, &main_ref, workspace);
     match freshness {
         BranchFreshness::Fresh => None,
         BranchFreshness::Stale {
@@ -3331,9 +3347,9 @@ fn normalize_shell_command(command: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn resolve_main_ref(branch: &str) -> Option<String> {
-    let has_local_main = git_ref_exists("main");
-    let has_remote_main = git_ref_exists("origin/main");
+fn resolve_main_ref(branch: &str, workspace: &Path) -> Option<String> {
+    let has_local_main = git_ref_exists("main", workspace);
+    let has_remote_main = git_ref_exists("origin/main", workspace);
 
     if branch == "main" && has_remote_main {
         Some("origin/main".to_string())
@@ -3346,16 +3362,18 @@ fn resolve_main_ref(branch: &str) -> Option<String> {
     }
 }
 
-fn git_ref_exists(reference: &str) -> bool {
+fn git_ref_exists(reference: &str, workspace: &Path) -> bool {
     runtime::sandbox::quiet_command("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(workspace)
         .output()
         .is_ok_and(|output| output.status.success())
 }
 
-fn git_stdout(args: &[&str]) -> Option<String> {
+fn git_stdout(args: &[&str], workspace: &Path) -> Option<String> {
     let output = runtime::sandbox::quiet_command("git")
         .args(args)
+        .current_dir(workspace)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -3424,20 +3442,31 @@ fn branch_divergence_output(
     }
 }
 
+/// 把工具入参的相对路径按 turn workspace 解析为绝对路径。
+///
+/// runtime 的文件 API(`file_ops.rs`)内部仍用 `env::current_dir()` 规范化相对路径；
+/// serve 模式下进程目录被固定到临时目录，因此必须在进入 runtime 之前完成
+/// workspace 相对化。绝对路径（含 Git Bash 的 `/d/...` 形式）原样透传，
+/// 由 runtime 自行转换。
+fn resolve_tool_path(workspace: &Path, raw: &str) -> String {
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() || raw.starts_with('/') || raw.starts_with('\\') {
+        raw.to_string()
+    } else {
+        workspace.join(candidate).to_string_lossy().into_owned()
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput, extra_roots: Option<&[PathBuf]>) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    let extra = extra_roots.unwrap_or(&[]);
-    let result = read_file_in_workspace_with_roots(
-        &input.path,
-        input.offset,
-        input.limit,
-        &workspace,
-        extra,
-    )
-    .map_err(io_to_string)?;
+fn run_read_file(input: ReadFileInput, env: &TurnEnv) -> Result<String, String> {
+    let workspace = env.workspace();
+    let extra = env.roots();
+    let path = resolve_tool_path(workspace, &input.path);
+    let result =
+        read_file_in_workspace_with_roots(&path, input.offset, input.limit, workspace, extra)
+            .map_err(io_to_string)?;
     // F4:成功读取该文件即解除门禁——模型已拿到最新内容，可安全重新规划后续编辑。
-    clear_edit_gate(Path::new(&input.path));
+    clear_edit_gate(Path::new(&path));
     to_pretty_json(&result)
 }
 
@@ -3790,7 +3819,7 @@ mod lsp_auto_diagnostics_tests {
 #[cfg(test)]
 mod diag_cooldown_tests {
     use super::tests::{env_lock, temp_path};
-    use super::{execute_tool, mark_diag_done, within_diag_cooldown};
+    use super::{execute_tool_in, mark_diag_done, within_diag_cooldown, TurnEnv};
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -3859,11 +3888,10 @@ mod diag_cooldown_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("cooldown-e2e");
         fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
         fs::write(root.join("demo.rs"), "fn main() {}\n").expect("seed rs file");
 
-        let first = execute_tool(
+        let first = execute_tool_in(&env,
             "edit_file",
             &json!({ "path": "demo.rs", "old_string": "fn main() {}", "new_string": "fn main() { println!(\"a\"); }" }),
         )
@@ -3874,7 +3902,8 @@ mod diag_cooldown_tests {
             "first edit should be JSON-headed: {first}"
         );
 
-        let second = execute_tool(
+        let second = execute_tool_in(
+            &env,
             "edit_file",
             &json!({ "path": "demo.rs", "old_string": "println!", "new_string": "eprintln!" }),
         )
@@ -3885,7 +3914,6 @@ mod diag_cooldown_tests {
             serde_json::from_str(&second).expect("cooldown-hit output must stay pure JSON");
         assert_eq!(parsed["replaceAll"], false);
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 }
@@ -3947,105 +3975,94 @@ mod python_syntax_fallback_tests {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_write_file(
-    input: WriteFileInput,
-    extra_roots: Option<&[PathBuf]>,
-) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    let extra = extra_roots.unwrap_or(&[]);
-    let result = write_file_in_workspace_with_roots(&input.path, &input.content, &workspace, extra)
+fn run_write_file(input: WriteFileInput, env: &TurnEnv) -> Result<String, String> {
+    let workspace = env.workspace();
+    let extra = env.roots();
+    let path = resolve_tool_path(workspace, &input.path);
+    let result = write_file_in_workspace_with_roots(&path, &input.content, workspace, extra)
         .map_err(io_to_string)?;
     // F4:统一写后诊断 + 门禁(软警告,old_string 无匹配概念,不阻断写入)。
     let json_out = to_pretty_json(&result)?;
-    let (output, _) = append_post_write_checks(
-        Path::new(&result.file_path),
-        json_out,
-        Path::new(&input.path),
-    );
+    let (output, _) =
+        append_post_write_checks(Path::new(&result.file_path), json_out, Path::new(&path));
     Ok(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput, extra_roots: Option<&[PathBuf]>) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    let extra = extra_roots.unwrap_or(&[]);
+fn run_edit_file(input: EditFileInput, env: &TurnEnv) -> Result<String, String> {
+    let workspace = env.workspace();
+    let extra = env.roots();
+    let path = resolve_tool_path(workspace, &input.path);
     let result = edit_file_in_workspace_with_roots(
-        &input.path,
+        &path,
         &input.old_string,
         &input.new_string,
         input.replace_all.unwrap_or(false),
-        &workspace,
+        workspace,
         extra,
     )
     .map_err(io_to_string)?;
     // F4:统一写后诊断 + 门禁(软警告,old_string 匹配本身可自纠,不阻断编辑)。
     let json_out = to_pretty_json(&result)?;
-    let (output, _) = append_post_write_checks(
-        Path::new(&result.file_path),
-        json_out,
-        Path::new(&input.path),
-    );
+    let (output, _) =
+        append_post_write_checks(Path::new(&result.file_path), json_out, Path::new(&path));
     Ok(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_replace_lines(
-    input: ReplaceLinesInput,
-    extra_roots: Option<&[PathBuf]>,
-) -> Result<String, String> {
+fn run_replace_lines(input: ReplaceLinesInput, env: &TurnEnv) -> Result<String, String> {
+    let workspace = env.workspace();
+    let path = resolve_tool_path(workspace, &input.path);
     // F4:硬拦截——若门禁命中(该文件上次写入后诊断失败,行号已漂移),直接返回错误,
     // 强制模型先 read_file 拿到最新内容,再做一次精确的 edit_file/write_file 修复。
-    if let Some(warning) = check_edit_gate(Path::new(&input.path)) {
+    if let Some(warning) = check_edit_gate(Path::new(&path)) {
         return Err(warning);
     }
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    let extra = extra_roots.unwrap_or(&[]);
+    let extra = env.roots();
     let result = replace_lines_in_workspace_with_roots(
-        &input.path,
+        &path,
         input.start_line,
         input.end_line,
         &input.new_content,
-        &workspace,
+        workspace,
         extra,
     )
     .map_err(io_to_string)?;
     // F4:统一写后诊断 + 门禁(本次若诊断失败,再次 replace_lines 会被硬拦截)。
     let json_out = to_pretty_json(&result)?;
-    let (output, _) = append_post_write_checks(
-        Path::new(&result.file_path),
-        json_out,
-        Path::new(&input.path),
-    );
+    let (output, _) =
+        append_post_write_checks(Path::new(&result.file_path), json_out, Path::new(&path));
     Ok(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_search(
-    input: GlobSearchInputValue,
-    extra_roots: Option<&[PathBuf]>,
-) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    let extra = extra_roots.unwrap_or(&[]);
+fn run_glob_search(input: GlobSearchInputValue, env: &TurnEnv) -> Result<String, String> {
+    let workspace = env.workspace();
+    let base = input
+        .path
+        .as_deref()
+        .map(|raw| resolve_tool_path(workspace, raw))
+        .unwrap_or_else(|| workspace.to_string_lossy().into_owned());
     to_pretty_json(
-        glob_search_in_workspace_with_roots(
-            &input.pattern,
-            input.path.as_deref(),
-            &workspace,
-            extra,
-        )
-        .map_err(io_to_string)?,
+        glob_search_in_workspace_with_roots(&input.pattern, Some(&base), workspace, env.roots())
+            .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(
-    input: GrepSearchInput,
-    extra_roots: Option<&[PathBuf]>,
-) -> Result<String, String> {
-    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    let extra = extra_roots.unwrap_or(&[]);
+fn run_grep_search(input: GrepSearchInput, env: &TurnEnv) -> Result<String, String> {
+    let workspace = env.workspace();
+    let mut input = input;
+    input.path = Some(
+        input
+            .path
+            .as_deref()
+            .map(|raw| resolve_tool_path(workspace, raw))
+            .unwrap_or_else(|| workspace.to_string_lossy().into_owned()),
+    );
     to_pretty_json(
-        grep_search_in_workspace_with_roots(&input, &workspace, extra).map_err(io_to_string)?,
+        grep_search_in_workspace_with_roots(&input, workspace, env.roots())
+            .map_err(io_to_string)?,
     )
 }
 
@@ -4059,16 +4076,16 @@ fn run_web_search(input: WebSearchInput) -> Result<String, String> {
     to_pretty_json(execute_web_search(&input)?)
 }
 
-fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
-    to_pretty_json(execute_todo_write(input)?)
+fn run_todo_write(input: TodoWriteInput, workspace: &Path) -> Result<String, String> {
+    to_pretty_json(execute_todo_write(input, workspace)?)
 }
 
-fn run_skill(input: SkillInput) -> Result<String, String> {
-    to_pretty_json(execute_skill(input)?)
+fn run_skill(input: SkillInput, workspace: &Path) -> Result<String, String> {
+    to_pretty_json(execute_skill(input, workspace)?)
 }
 
-fn run_agent(input: AgentInput) -> Result<String, String> {
-    to_pretty_json(execute_agent(input)?)
+fn run_agent(input: AgentInput, env: &TurnEnv) -> Result<String, String> {
+    to_pretty_json(execute_agent(input, env)?)
 }
 
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
@@ -4087,8 +4104,8 @@ fn run_brief(input: BriefInput) -> Result<String, String> {
     to_pretty_json(execute_brief(input)?)
 }
 
-fn run_config(input: ConfigInput) -> Result<String, String> {
-    to_pretty_json(execute_config(input)?)
+fn run_config(input: ConfigInput, workspace: &Path) -> Result<String, String> {
+    to_pretty_json(execute_config(input, workspace)?)
 }
 
 fn run_im_bridge_setup(input: ImBridgeSetupInput) -> Result<String, String> {
@@ -4099,12 +4116,12 @@ fn run_im_bridge_service(input: ImBridgeServiceInput) -> Result<String, String> 
     to_pretty_json(execute_im_bridge_service(input)?)
 }
 
-fn run_enter_plan_mode(input: EnterPlanModeInput) -> Result<String, String> {
-    to_pretty_json(execute_enter_plan_mode(input)?)
+fn run_enter_plan_mode(input: EnterPlanModeInput, workspace: &Path) -> Result<String, String> {
+    to_pretty_json(execute_enter_plan_mode(input, workspace)?)
 }
 
-fn run_exit_plan_mode(input: ExitPlanModeInput) -> Result<String, String> {
-    to_pretty_json(execute_exit_plan_mode(input)?)
+fn run_exit_plan_mode(input: ExitPlanModeInput, workspace: &Path) -> Result<String, String> {
+    to_pretty_json(execute_exit_plan_mode(input, workspace)?)
 }
 
 fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
@@ -4115,51 +4132,42 @@ fn run_repl(input: ReplInput) -> Result<String, String> {
     to_pretty_json(execute_repl(input)?)
 }
 
-fn classify_file_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
-    classify_file_path_permission_with_roots(path, allow_missing, None)
-}
-
-fn classify_file_path_permission_with_roots(
+fn classify_file_path_permission(
     path: &str,
     allow_missing: bool,
+    workspace: &Path,
     extra_roots: Option<&[PathBuf]>,
 ) -> PermissionMode {
-    if path_within_workspace_roots(path, allow_missing, extra_roots) {
+    if path_within_workspace_roots(path, allow_missing, workspace, extra_roots) {
         PermissionMode::WorkspaceWrite
     } else {
         PermissionMode::DangerFullAccess
     }
 }
 
-fn classify_read_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
-    classify_read_path_permission_with_roots(path, allow_missing, None)
-}
-
-fn classify_read_path_permission_with_roots(
+fn classify_read_path_permission(
     path: &str,
     allow_missing: bool,
+    workspace: &Path,
     extra_roots: Option<&[PathBuf]>,
 ) -> PermissionMode {
-    if path_within_workspace_roots(path, allow_missing, extra_roots) {
+    if path_within_workspace_roots(path, allow_missing, workspace, extra_roots) {
         PermissionMode::ReadOnly
     } else {
         PermissionMode::DangerFullAccess
     }
 }
 
-fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
-    classify_glob_permission_with_roots(input, None)
-}
-
-fn classify_glob_permission_with_roots(
+fn classify_glob_permission(
     input: &GlobSearchInputValue,
+    workspace: &Path,
     extra_roots: Option<&[PathBuf]>,
 ) -> PermissionMode {
     let base_allowed = input
         .path
         .as_deref()
-        .is_none_or(|path| path_within_workspace_roots(path, false, extra_roots));
-    let pattern_allowed = path_within_workspace_roots(&input.pattern, true, extra_roots);
+        .is_none_or(|path| path_within_workspace_roots(path, false, workspace, extra_roots));
+    let pattern_allowed = path_within_workspace_roots(&input.pattern, true, workspace, extra_roots);
     if base_allowed && pattern_allowed {
         PermissionMode::ReadOnly
     } else {
@@ -4167,18 +4175,15 @@ fn classify_glob_permission_with_roots(
     }
 }
 
-fn classify_grep_permission(input: &GrepSearchInput) -> PermissionMode {
-    classify_grep_permission_with_roots(input, None)
-}
-
-fn classify_grep_permission_with_roots(
+fn classify_grep_permission(
     input: &GrepSearchInput,
+    workspace: &Path,
     extra_roots: Option<&[PathBuf]>,
 ) -> PermissionMode {
     if input
         .path
         .as_deref()
-        .is_none_or(|path| path_within_workspace_roots(path, false, extra_roots))
+        .is_none_or(|path| path_within_workspace_roots(path, false, workspace, extra_roots))
     {
         PermissionMode::ReadOnly
     } else {
@@ -4186,8 +4191,7 @@ fn classify_grep_permission_with_roots(
     }
 }
 
-/// 多根版本的工作区路径校验。`extra_roots` 为 None 或空时退化为单根（cwd）行为。
-/// `extra_roots` 非空时，路径在 cwd 或任一 extra_root 内都算放行。
+/// 多根版本的工作区路径校验。路径在 `workspace` 或任一 `extra_roots` 内都算放行。
 ///
 /// Windows 兼容：比较前两端都 `strip_verbatim_prefix`，避免 `canonicalize()` 返回的
 /// `\\?\D:\...` 与 `current_dir()` 返回的 `D:\...` 因前缀 component 不同而 `starts_with` 失败。
@@ -4196,6 +4200,7 @@ fn classify_grep_permission_with_roots(
 fn path_within_workspace_roots(
     path: &str,
     allow_missing: bool,
+    workspace: &Path,
     extra_roots: Option<&[PathBuf]>,
 ) -> bool {
     let trimmed = path.trim_matches(|ch: char| {
@@ -4205,16 +4210,15 @@ fn path_within_workspace_roots(
         )
     });
 
-    let Ok(cwd_raw) = std::env::current_dir() else {
-        return false;
-    };
-    let cwd = cwd_raw.canonicalize().unwrap_or(cwd_raw);
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
 
     let candidate = PathBuf::from(trimmed);
     let absolute = if candidate.is_absolute() {
         candidate
     } else {
-        cwd.join(candidate)
+        workspace.join(candidate)
     };
 
     let resolved = if allow_missing {
@@ -4230,7 +4234,7 @@ fn path_within_workspace_roots(
         }
     };
 
-    resolved_within_any_root(&resolved, &cwd, extra_roots)
+    resolved_within_any_root(&resolved, &workspace, extra_roots)
 }
 
 /// 检查 resolved 路径是否落在 cwd 或任一 extra_root 内。
@@ -4256,7 +4260,7 @@ fn resolved_within_any_root(resolved: &Path, cwd: &Path, extra_roots: Option<&[P
 /// Classify `PowerShell` command permission based on command type and path.
 /// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
 /// all others remain `DangerFullAccess`.
-fn classify_powershell_permission(command: &str) -> PermissionMode {
+fn classify_powershell_permission(command: &str, workspace: &Path) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
         "Get-Content",
@@ -4282,7 +4286,7 @@ fn classify_powershell_permission(command: &str) -> PermissionMode {
     // Extract path from command - look for -Path or positional parameter
     let path = extract_powershell_path(command);
     match path {
-        Some(p) if is_within_workspace(&p) => PermissionMode::WorkspaceWrite,
+        Some(p) if is_within_workspace(&p, workspace) => PermissionMode::WorkspaceWrite,
         _ => PermissionMode::DangerFullAccess,
     }
 }
@@ -4316,7 +4320,7 @@ fn extract_powershell_path(command: &str) -> Option<String> {
 /// `\\?\D:\...` 与 `current_dir()` 返回的 `D:\...` 因前缀 component 不同而 `starts_with` 失败。
 /// 此前的 `looks_like_windows_absolute_path` 守卫会对所有 Windows 绝对路径直接返回 false，
 /// 导致在 cwd 内的绝对路径被误判为越界——已移除。
-fn is_within_workspace(path: &str) -> bool {
+fn is_within_workspace(path: &str, workspace: &Path) -> bool {
     let trimmed = path.trim_matches(|ch: char| {
         matches!(
             ch,
@@ -4326,23 +4330,23 @@ fn is_within_workspace(path: &str) -> bool {
 
     let path = PathBuf::from(trimmed);
 
-    // If path is absolute, check if it starts with CWD
+    // If path is absolute, check if it starts with the workspace root
     if path.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            let cwd = cwd.canonicalize().unwrap_or(cwd);
-            let resolved = path.canonicalize().unwrap_or(path);
-            let resolved_stripped = strip_verbatim_prefix(&resolved);
-            let cwd_stripped = strip_verbatim_prefix(&cwd);
-            return resolved_stripped.starts_with(&cwd_stripped);
-        }
+        let workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        let resolved = path.canonicalize().unwrap_or(path);
+        let resolved_stripped = strip_verbatim_prefix(&resolved);
+        let workspace_stripped = strip_verbatim_prefix(&workspace);
+        return resolved_stripped.starts_with(&workspace_stripped);
     }
 
     // Relative paths are assumed to be within workspace
     !path.starts_with("/") && !path.starts_with("\\") && !path.starts_with("..")
 }
 
-fn run_powershell(input: PowerShellInput) -> Result<String, String> {
-    to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
+fn run_powershell(input: PowerShellInput, workspace: &Path) -> Result<String, String> {
+    to_pretty_json(execute_powershell(input, workspace).map_err(|error| error.to_string())?)
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
@@ -5052,6 +5056,8 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    /// 父 turn 的工具执行环境（工作区根 + 额外根 + 取消信号）。
+    env: TurnEnv,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -5967,9 +5973,9 @@ fn dedupe_hits(hits: &mut Vec<SearchHit>) {
     hits.retain(|hit| seen.insert(hit.url.clone()));
 }
 
-fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> {
+fn execute_todo_write(input: TodoWriteInput, workspace: &Path) -> Result<TodoWriteOutput, String> {
     validate_todos(&input.todos)?;
-    let store_path = todo_store_path()?;
+    let store_path = todo_store_path(workspace)?;
     let old_todos = if store_path.exists() {
         serde_json::from_str::<Vec<TodoItem>>(
             &std::fs::read_to_string(&store_path).map_err(|error| error.to_string())?,
@@ -6013,8 +6019,8 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
     })
 }
 
-fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
-    let skill_path = resolve_skill_path(&input.skill)?;
+fn execute_skill(input: SkillInput, workspace: &Path) -> Result<SkillOutput, String> {
+    let skill_path = resolve_skill_path(&input.skill, workspace)?;
     let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
     let description = parse_skill_description(&prompt);
 
@@ -6041,29 +6047,30 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
     Ok(())
 }
 
-fn todo_store_path() -> Result<std::path::PathBuf, String> {
+fn todo_store_path(workspace: &Path) -> Result<std::path::PathBuf, String> {
     if let Ok(path) = std::env::var("CLAWD_TODO_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".clawd-todos.json"))
+    Ok(workspace.join(".clawd-todos.json"))
 }
 
-fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    match commands::resolve_skill_path(&cwd, skill) {
+fn resolve_skill_path(skill: &str, workspace: &Path) -> Result<std::path::PathBuf, String> {
+    match commands::resolve_skill_path(workspace, skill) {
         Ok(path) => Ok(path),
-        Err(_) => resolve_skill_path_from_compat_roots(skill),
+        Err(_) => resolve_skill_path_from_compat_roots(skill, workspace),
     }
 }
 
-fn resolve_skill_path_from_compat_roots(skill: &str) -> Result<std::path::PathBuf, String> {
+fn resolve_skill_path_from_compat_roots(
+    skill: &str,
+    workspace: &Path,
+) -> Result<std::path::PathBuf, String> {
     let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
     if requested.is_empty() {
         return Err(String::from("skill must not be empty"));
     }
 
-    for root in skill_lookup_roots() {
+    for root in skill_lookup_roots(workspace) {
         if let Some(path) = resolve_skill_path_in_root(&root, requested) {
             return Ok(path);
         }
@@ -6084,19 +6091,17 @@ struct SkillLookupRoot {
     origin: SkillLookupOrigin,
 }
 
-fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
+fn skill_lookup_roots(cwd: &Path) -> Vec<SkillLookupRoot> {
     let mut roots = Vec::new();
 
-    if let Ok(cwd) = std::env::current_dir() {
-        push_project_skill_lookup_roots(&mut roots, &cwd);
-        // Built-in skills shipped with the claw binary (dev mode: rust/skills).
-        for ancestor in cwd.ancestors() {
-            push_skill_lookup_root(
-                &mut roots,
-                ancestor.join("rust").join("skills"),
-                SkillLookupOrigin::SkillsDir,
-            );
-        }
+    push_project_skill_lookup_roots(&mut roots, cwd);
+    // Built-in skills shipped with the claw binary (dev mode: rust/skills).
+    for ancestor in cwd.ancestors() {
+        push_skill_lookup_root(
+            &mut roots,
+            ancestor.join("rust").join("skills"),
+            SkillLookupOrigin::SkillsDir,
+        );
     }
 
     // Built-in skills co-located with the binary (install mode).
@@ -6334,11 +6339,15 @@ const DEFAULT_AGENT_MODEL: &str = "deepseek-v4-pro";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
-fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+fn execute_agent(input: AgentInput, env: &TurnEnv) -> Result<AgentOutput, String> {
+    execute_agent_with_spawn(input, env, spawn_agent_job)
 }
 
-fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
+fn execute_agent_with_spawn<F>(
+    input: AgentInput,
+    env: &TurnEnv,
+    spawn_fn: F,
+) -> Result<AgentOutput, String>
 where
     F: FnOnce(AgentJob) -> Result<(), String>,
 {
@@ -6350,7 +6359,7 @@ where
     }
 
     let agent_id = make_agent_id();
-    let output_dir = agent_store_dir()?;
+    let output_dir = agent_store_dir(env.workspace())?;
     std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
@@ -6391,8 +6400,9 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let system_prompt =
+        build_agent_system_prompt(&normalized_subagent_type, &model, env.workspace())?;
+    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type, env.workspace());
 
     let output_contents = format!(
         "# Agent Task
@@ -6436,6 +6446,7 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        env: env.clone(),
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -6491,9 +6502,9 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone(), job.env.workspace())?;
     let permission_policy = agent_permission_policy();
-    let tool_executor = SubagentToolExecutor::new(allowed_tools)
+    let tool_executor = SubagentToolExecutor::new(allowed_tools, job.env.clone())
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
     Ok(ConversationRuntime::new(
         Session::new(),
@@ -6560,10 +6571,13 @@ const GENERAL_PURPOSE_ROLE: &str = "You are a general-purpose sub-agent with ful
 - Respect blast radius: the more call sites a change touches, the more you must check. Prefer the smallest change that satisfies the task.\n\
 - Output: what you changed (files), the evidence it works, and anything left undone or uncertain.";
 
-fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+fn build_agent_system_prompt(
+    subagent_type: &str,
+    model: &str,
+    workspace: &Path,
+) -> Result<Vec<String>, String> {
     let mut prompt = load_system_prompt(
-        cwd,
+        workspace.to_path_buf(),
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
         std::env::consts::OS,
         "unknown",
@@ -6576,10 +6590,8 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
     // 文件化角色提示词:.claw/agents/<type>.md(frontmatter 后正文)按 type 名
     // 注入 —— 让使用者无需改代码即可为某类子智能体定制系统提示词。文件是
     // 静态内容,同一 type 的所有子智能体注入相同字节,不破坏前缀缓存。
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(custom) = commands::agent_instructions_for(&cwd, subagent_type) {
-            prompt.push(custom);
-        }
+    if let Some(custom) = commands::agent_instructions_for(workspace, subagent_type) {
+        prompt.push(custom);
     }
     // 按 type 注入专属角色提示词:每个子智能体都有明确的职责边界、工具纪律
     // 与产出契约(此前仅 Explore 有,其余 5 类共用一句通用说明)。静态字节 ⇒
@@ -6607,14 +6619,12 @@ fn resolve_agent_model(model: Option<&str>) -> String {
         .to_string()
 }
 
-fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
+fn allowed_tools_for_subagent(subagent_type: &str, workspace: &Path) -> BTreeSet<String> {
     // 文件化覆盖优先:.claw/agents/<type>.md 的 frontmatter `tools:` 若存在,
     // 完全取代内置白名单(而非并集)—— 让使用者可精确收敛/扩展某类子智能体的
     // 工具集,无需改代码。无覆盖时回退内置 6 类默认(向后兼容)。
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(custom) = commands::agent_tools_for(&cwd, subagent_type) {
-            return custom.into_iter().collect();
-        }
+    if let Some(custom) = commands::agent_tools_for(workspace, subagent_type) {
+        return custom.into_iter().collect();
     }
     let tools = match subagent_type {
         "Explore" => vec![
@@ -7510,8 +7520,12 @@ struct ProviderRuntimeClient {
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
-    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let fallback_config = load_provider_fallback_config();
+    fn new(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        workspace: &Path,
+    ) -> Result<Self, String> {
+        let fallback_config = load_provider_fallback_config(workspace);
         Self::new_with_fallback_config(model, allowed_tools, &fallback_config)
     }
 
@@ -7551,10 +7565,10 @@ fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     })
 }
 
-fn load_provider_fallback_config() -> ProviderFallbackConfig {
-    std::env::current_dir()
+fn load_provider_fallback_config(workspace: &Path) -> ProviderFallbackConfig {
+    ConfigLoader::default_for(workspace.to_path_buf())
+        .load()
         .ok()
-        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
         .map_or_else(ProviderFallbackConfig::default, |config| {
             config.provider_fallbacks().clone()
         })
@@ -7960,13 +7974,16 @@ fn tolerant_fix_json(raw: &str) -> Option<String> {
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     enforcer: Option<PermissionEnforcer>,
+    /// 父 turn 的执行环境；子智能体所有工具调用都使用它，不继承进程 cwd。
+    env: TurnEnv,
 }
 
 impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>) -> Self {
+    fn new(allowed_tools: BTreeSet<String>, env: TurnEnv) -> Self {
         Self {
             allowed_tools,
             enforcer: None,
+            env,
         }
     }
 
@@ -7984,7 +8001,7 @@ impl ToolExecutor for SubagentToolExecutor {
             )));
         }
         let value = crate::parse_tool_call_input(tool_name, input).map_err(ToolError::new)?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+        execute_tool_in_with_enforcer(&self.env, self.enforcer.as_ref(), tool_name, &value)
             .map_err(ToolError::new)
     }
 }
@@ -7997,8 +8014,9 @@ impl ToolExecutor for SubagentToolExecutor {
 #[must_use]
 pub fn make_subagent_tool_executor(
     allowed_tools: BTreeSet<String>,
+    env: TurnEnv,
 ) -> Box<dyn ToolExecutor + Send> {
-    Box::new(SubagentToolExecutor::new(allowed_tools))
+    Box::new(SubagentToolExecutor::new(allowed_tools, env))
 }
 
 fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
@@ -8164,12 +8182,8 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
 /// Returns matches even when scores are 0 (lets the model see nearby
 /// candidates). `total_skills_indexed` is the total active skill count
 /// regardless of `max_results`.
-fn execute_skill_search(input: SkillSearchInput) -> SkillSearchOutput {
-    let cwd = std::env::current_dir().ok();
-    let skills = cwd
-        .as_deref()
-        .and_then(|c| commands::list_skill_summaries(c).ok())
-        .unwrap_or_default();
+fn execute_skill_search(input: SkillSearchInput, workspace: &Path) -> SkillSearchOutput {
+    let skills = commands::list_skill_summaries(workspace).unwrap_or_default();
 
     let query = input.query.trim();
     let max_results = input.max_results.unwrap_or(5);
@@ -8295,8 +8309,8 @@ fn score_skill_match(
     (score, best_reason)
 }
 
-fn run_skill_search(input: SkillSearchInput) -> Result<String, String> {
-    to_pretty_json(execute_skill_search(input))
+fn run_skill_search(input: SkillSearchInput, workspace: &Path) -> Result<String, String> {
+    to_pretty_json(execute_skill_search(input, workspace))
 }
 
 fn deferred_tool_specs() -> Vec<ToolSpec> {
@@ -8464,15 +8478,14 @@ fn canonical_tool_token(value: &str) -> String {
     canonical
 }
 
-fn agent_store_dir() -> Result<std::path::PathBuf, String> {
+fn agent_store_dir(workspace: &Path) -> Result<std::path::PathBuf, String> {
     if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
+    if let Some(workspace_root) = workspace.ancestors().nth(2) {
         return Ok(workspace_root.join(".clawd-agents"));
     }
-    Ok(cwd.join(".clawd-agents"))
+    Ok(workspace.join(".clawd-agents"))
 }
 
 fn make_agent_id() -> String {
@@ -8764,7 +8777,7 @@ fn is_image_path(path: &Path) -> bool {
     )
 }
 
-fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
+fn execute_config(input: ConfigInput, workspace: &Path) -> Result<ConfigOutput, String> {
     let setting = input.setting.trim();
     if setting.is_empty() {
         return Err(String::from("setting must not be empty"));
@@ -8781,7 +8794,7 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
         });
     };
 
-    let path = config_file_for_scope(spec.scope)?;
+    let path = config_file_for_scope(spec.scope, workspace)?;
     let mut document = read_json_object(&path)?;
 
     if let Some(value) = input.value {
@@ -9352,9 +9365,12 @@ fn resolve_im_bridge_binary() -> Option<std::path::PathBuf> {
 
 const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
 
-fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput, String> {
-    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
-    let state_path = plan_mode_state_file()?;
+fn execute_enter_plan_mode(
+    _input: EnterPlanModeInput,
+    workspace: &Path,
+) -> Result<PlanModeOutput, String> {
+    let settings_path = config_file_for_scope(ConfigScope::Settings, workspace)?;
+    let state_path = plan_mode_state_file(workspace)?;
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
@@ -9421,9 +9437,12 @@ fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput,
     })
 }
 
-fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, String> {
-    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
-    let state_path = plan_mode_state_file()?;
+fn execute_exit_plan_mode(
+    _input: ExitPlanModeInput,
+    workspace: &Path,
+) -> Result<PlanModeOutput, String> {
+    let settings_path = config_file_for_scope(ConfigScope::Settings, workspace)?;
+    let state_path = plan_mode_state_file(workspace)?;
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
@@ -9749,11 +9768,10 @@ fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result
     Ok(normalized)
 }
 
-fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+fn config_file_for_scope(scope: ConfigScope, workspace: &Path) -> Result<PathBuf, String> {
     Ok(match scope {
         ConfigScope::Global => config_home_dir()?.join("settings.json"),
-        ConfigScope::Settings => cwd.join(".claw").join("settings.local.json"),
+        ConfigScope::Settings => workspace.join(".claw").join("settings.local.json"),
     })
 }
 
@@ -9853,8 +9871,8 @@ fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str])
     removed
 }
 
-fn plan_mode_state_file() -> Result<PathBuf, String> {
-    Ok(config_file_for_scope(ConfigScope::Settings)?
+fn plan_mode_state_file(workspace: &Path) -> Result<PathBuf, String> {
+    Ok(config_file_for_scope(ConfigScope::Settings, workspace)?
         .parent()
         .ok_or_else(|| String::from("settings.local.json has no parent directory"))?
         .join("tool-state")
@@ -9908,9 +9926,12 @@ fn iso8601_timestamp() -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
+fn execute_powershell(
+    input: PowerShellInput,
+    workspace: &Path,
+) -> std::io::Result<runtime::BashCommandOutput> {
     let _ = &input.description;
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+    if let Some(output) = workspace_test_branch_preflight(&input.command, workspace) {
         return Ok(output);
     }
     let shell = detect_powershell_shell()?;
@@ -9919,6 +9940,7 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
         &input.command,
         input.timeout,
         input.run_in_background,
+        workspace,
     )
 }
 
@@ -9994,6 +10016,7 @@ fn execute_shell_command(
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
+    cwd: &Path,
 ) -> std::io::Result<runtime::BashCommandOutput> {
     if run_in_background.unwrap_or(false) {
         // quiet_command:PowerShell 工具是控制台程序,Web 服务无控制台时会弹窗。
@@ -10002,6 +10025,7 @@ fn execute_shell_command(
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(command)
+            .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -10031,7 +10055,8 @@ fn execute_shell_command(
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
-        .arg(command);
+        .arg(command)
+        .current_dir(cwd);
     // 输出捕获用临时文件而非管道（见 capture_output_files 的第一性原理说明）：
     // 命令完成由主 shell 进程退出决定（std `wait()`），不依赖管道 EOF。
     let (out_path, err_path, out_file, err_file) = capture_output_files()?;
@@ -10257,12 +10282,12 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
         build_http_client, classify_lane_failure, derive_agent_state, execute_agent_with_spawn,
-        execute_tool, extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        make_subagent_tool_executor, maybe_commit_provenance, mvp_tool_specs,
+        execute_tool, execute_tool_in, extract_recovery_outcome, final_assistant_text,
+        global_cron_registry, make_subagent_tool_executor, maybe_commit_provenance, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
         run_task_packet, run_web_sync_guarded, AgentInput, AgentJob, GlobalToolRegistry,
         LaneEventName, LaneFailureClass, ProviderRuntimeClient, RuntimeToolDefinition,
-        SubagentToolExecutor,
+        SubagentToolExecutor, TurnEnv,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -10525,7 +10550,7 @@ mod tests {
             end_line: 5,
             new_content: "x".to_string(),
         };
-        let res = super::run_replace_lines(input, None);
+        let res = super::run_replace_lines(input, &TurnEnv::for_current_dir());
         assert!(
             res.is_err(),
             "门禁命中时 replace_lines 应被硬拦截,不应访问磁盘"
@@ -10551,7 +10576,7 @@ mod tests {
             end_line: 1,
             new_content: "y".to_string(),
         };
-        let res = super::run_replace_lines(input, None);
+        let res = super::run_replace_lines(input, &TurnEnv::for_current_dir());
         assert!(res.is_err(), "文件不在工作区应报 io 错误");
         let err = res.unwrap_err();
         assert!(
@@ -11429,8 +11454,11 @@ mod tests {
     fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
         // given
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
-            .with_enforcer(PermissionEnforcer::new(policy));
+        let mut executor = SubagentToolExecutor::new(
+            BTreeSet::from([String::from("write_file")]),
+            TurnEnv::for_current_dir(),
+        )
+        .with_enforcer(PermissionEnforcer::new(policy));
 
         // when
         let error = executor
@@ -12161,7 +12189,7 @@ mod tests {
         let store = temp_path("todos-tolerance.json");
         std::env::set_var("CLAWD_TODO_STORE", &store);
         let allowed: BTreeSet<String> = ["TodoWrite"].into_iter().map(str::to_string).collect();
-        let mut executor = make_subagent_tool_executor(allowed);
+        let mut executor = make_subagent_tool_executor(allowed, TurnEnv::for_current_dir());
         let raw = r#"{"todos":[{"content":"ok""activeForm":"OK""status":"pending"}]}"#;
         let result = executor.execute("TodoWrite", raw);
         std::env::remove_var("CLAWD_TODO_STORE");
@@ -12249,10 +12277,9 @@ mod tests {
         )
         .expect("command file should exist");
 
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
-        let skill_result = execute_tool("Skill", &json!({ "skill": "$plan" }))
+        let skill_result = execute_tool_in(&env, "Skill", &json!({ "skill": "$plan" }))
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
@@ -12261,7 +12288,7 @@ mod tests {
             ".claw/skills/plan/SKILL.md"
         ));
 
-        let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
+        let command_result = execute_tool_in(&env, "Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
@@ -12270,7 +12297,6 @@ mod tests {
             ".claw/commands/handoff.md"
         ));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");
     }
 
@@ -12294,13 +12320,12 @@ mod tests {
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
-        std::env::set_current_dir(&nested).expect("set cwd");
+        let env = TurnEnv::new(nested.clone(), Vec::new());
 
-        let result = execute_tool("Skill", &json!({ "skill": "trace" }))
+        let result = execute_tool_in(&env, "Skill", &json!({ "skill": "trace" }))
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
@@ -12310,7 +12335,6 @@ mod tests {
         ));
         assert_eq!(output["description"], "Project-local trace helper");
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -12353,15 +12377,14 @@ mod tests {
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
-        std::env::set_current_dir(&nested).expect("set cwd");
+        let env = TurnEnv::new(nested.clone(), Vec::new());
 
-        let omc_result =
-            execute_tool("Skill", &json!({ "skill": "hud" })).expect("omc skill should resolve");
-        let agents_result = execute_tool("Skill", &json!({ "skill": "trace" }))
+        let omc_result = execute_tool_in(&env, "Skill", &json!({ "skill": "hud" }))
+            .expect("omc skill should resolve");
+        let agents_result = execute_tool_in(&env, "Skill", &json!({ "skill": "trace" }))
             .expect("agents skill should resolve");
 
         let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
@@ -12381,7 +12404,6 @@ mod tests {
             "Project-local agents compatibility helper"
         );
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -12544,13 +12566,12 @@ mod tests {
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
-        std::env::set_current_dir(&nested).expect("set cwd");
+        let env = TurnEnv::new(nested.clone(), Vec::new());
 
-        let result = execute_tool("Skill", &json!({ "skill": "team" }))
+        let result = execute_tool_in(&env, "Skill", &json!({ "skill": "team" }))
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
@@ -12560,7 +12581,6 @@ mod tests {
         ));
         assert_eq!(output["description"], "Legacy team workflow");
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -12632,6 +12652,7 @@ mod tests {
                 model: None,
                 complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             move |job| {
                 *captured_for_spawn
                     .lock()
@@ -12714,6 +12735,7 @@ mod tests {
                 model: Some("deepseek-v4-pro".to_string()),
                 complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |job| {
                 persist_agent_terminal_state(
                     &job.manifest,
@@ -12772,6 +12794,7 @@ mod tests {
                 model: None,
                 complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |job| {
                 persist_agent_terminal_state(
                     &job.manifest,
@@ -12820,6 +12843,7 @@ mod tests {
                 model: None,
                 complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |job| {
                 persist_agent_terminal_state(
                     &job.manifest,
@@ -12866,6 +12890,7 @@ mod tests {
                 model: None,
             complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |job| {
                 persist_agent_terminal_state(
                     &job.manifest,
@@ -12915,6 +12940,7 @@ mod tests {
                 model: None,
                 complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |job| {
                 persist_agent_terminal_state(
                     &job.manifest,
@@ -12956,6 +12982,7 @@ mod tests {
                 model: None,
             complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |job| {
                 persist_agent_terminal_state(
                     &job.manifest,
@@ -13003,6 +13030,7 @@ mod tests {
                 model: None,
             complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |job| {
                 persist_agent_terminal_state(
                     &job.manifest,
@@ -13074,6 +13102,7 @@ mod tests {
                 model: None,
                 complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |job| {
                 persist_agent_terminal_state(
                     &job.manifest,
@@ -13116,6 +13145,7 @@ mod tests {
                 model: None,
                 complexity: None,
             },
+            &TurnEnv::for_current_dir(),
             |_| Err(String::from("thread creation failed")),
         )
         .expect_err("spawn errors should surface");
@@ -13273,22 +13303,22 @@ mod tests {
 
     #[test]
     fn agent_tool_subset_mapping_is_expected() {
-        let general = allowed_tools_for_subagent("general-purpose");
+        let general = allowed_tools_for_subagent("general-purpose", Path::new("."));
         assert!(general.contains("bash"));
         assert!(general.contains("write_file"));
         assert!(!general.contains("Agent"));
 
-        let explore = allowed_tools_for_subagent("Explore");
+        let explore = allowed_tools_for_subagent("Explore", Path::new("."));
         assert!(explore.contains("read_file"));
         assert!(explore.contains("grep_search"));
         assert!(!explore.contains("bash"));
 
-        let plan = allowed_tools_for_subagent("Plan");
+        let plan = allowed_tools_for_subagent("Plan", Path::new("."));
         assert!(plan.contains("TodoWrite"));
         assert!(plan.contains("StructuredOutput"));
         assert!(!plan.contains("Agent"));
 
-        let verification = allowed_tools_for_subagent("Verification");
+        let verification = allowed_tools_for_subagent("Verification", Path::new("."));
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("write_file"));
@@ -13301,14 +13331,11 @@ mod tests {
         let _guard = env_guard();
         let root = temp_path("subagent-prompt-identity");
         fs::create_dir_all(&root).expect("create temp workspace");
-        let previous = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(&root).expect("enter temp workspace");
 
         // when: building the subagent system prompt
-        let prompt = build_agent_system_prompt("Explore", "openai/gpt-4.1-mini")
+        let prompt = build_agent_system_prompt("Explore", "openai/gpt-4.1-mini", &root)
             .expect("subagent system prompt should build")
             .join("\n");
-        std::env::set_current_dir(previous).expect("restore current dir");
 
         // then: the prompt renders a generic model family identity
         assert!(prompt.contains("Model family: an AI assistant"));
@@ -13378,8 +13405,6 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create root");
         let path = root.join("subagent-input.txt");
         std::fs::write(&path, "hello from child").expect("write input file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -13387,7 +13412,10 @@ mod tests {
                 calls: 0,
                 input_path: path.display().to_string(),
             },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
+            SubagentToolExecutor::new(
+                BTreeSet::from([String::from("read_file")]),
+                TurnEnv::new(root.clone(), Vec::new()),
+            ),
             agent_permission_policy(),
             vec![String::from("system prompt")],
         );
@@ -13411,7 +13439,6 @@ mod tests {
                     if output.contains("hello from child")
             )));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -13625,7 +13652,6 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("workspace-test-preflight");
-        let original_dir = std::env::current_dir().expect("cwd");
         init_git_repo(&root);
         run_git(&root, &["checkout", "-b", "feature/stale-tests"]);
         run_git(&root, &["checkout", "main"]);
@@ -13636,9 +13662,10 @@ mod tests {
             "fix: unblock workspace tests",
         );
         run_git(&root, &["checkout", "feature/stale-tests"]);
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
-        let output = execute_tool(
+        let output = execute_tool_in(
+            &env,
             "bash",
             &json!({ "command": "cargo test --workspace --all-targets" }),
         )
@@ -13665,7 +13692,6 @@ mod tests {
             "fix: unblock workspace tests"
         );
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -13676,7 +13702,6 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("targeted-test-no-preflight");
-        let original_dir = std::env::current_dir().expect("cwd");
         init_git_repo(&root);
         run_git(&root, &["checkout", "-b", "feature/targeted-tests"]);
         run_git(&root, &["checkout", "main"]);
@@ -13687,9 +13712,10 @@ mod tests {
             "fix: only broad tests should block",
         );
         run_git(&root, &["checkout", "feature/targeted-tests"]);
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
-        let output = execute_tool(
+        let output = execute_tool_in(
+            &env,
             "bash",
             &json!({ "command": "printf 'targeted ok'; cargo test -p runtime stale_branch" }),
         )
@@ -13700,7 +13726,6 @@ mod tests {
             "preflight_blocked:branch_divergence"
         );
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -13712,10 +13737,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("fs-suite");
         fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
-        let write_create = execute_tool(
+        let write_create = execute_tool_in(
+            &env,
             "write_file",
             &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
         )
@@ -13725,7 +13750,8 @@ mod tests {
         assert_eq!(write_create_output["type"], "create");
         assert!(root.join("nested/demo.txt").exists());
 
-        let write_update = execute_tool(
+        let write_update = execute_tool_in(
+            &env,
             "write_file",
             &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
         )
@@ -13735,13 +13761,14 @@ mod tests {
         assert_eq!(write_update_output["type"], "update");
         assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
 
-        let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
+        let read_full = execute_tool_in(&env, "read_file", &json!({ "path": "nested/demo.txt" }))
             .expect("read full should succeed");
         let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
         assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
         assert_eq!(read_full_output["file"]["startLine"], 1);
 
-        let read_slice = execute_tool(
+        let read_slice = execute_tool_in(
+            &env,
             "read_file",
             &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
         )
@@ -13750,7 +13777,8 @@ mod tests {
         assert_eq!(read_slice_output["file"]["content"], "beta");
         assert_eq!(read_slice_output["file"]["startLine"], 2);
 
-        let read_past_end = execute_tool(
+        let read_past_end = execute_tool_in(
+            &env,
             "read_file",
             &json!({ "path": "nested/demo.txt", "offset": 50 }),
         )
@@ -13760,11 +13788,12 @@ mod tests {
         assert_eq!(read_past_end_output["file"]["content"], "");
         assert_eq!(read_past_end_output["file"]["startLine"], 4);
 
-        let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
+        let read_error = execute_tool_in(&env, "read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
         assert!(!read_error.is_empty());
 
-        let edit_once = execute_tool(
+        let edit_once = execute_tool_in(
+            &env,
             "edit_file",
             &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
         )
@@ -13776,12 +13805,14 @@ mod tests {
             "omega\nbeta\ngamma\n"
         );
 
-        execute_tool(
+        execute_tool_in(
+            &env,
             "write_file",
             &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("reset file");
-        let edit_all = execute_tool(
+        let edit_all = execute_tool_in(
+            &env,
             "edit_file",
             &json!({
                 "path": "nested/demo.txt",
@@ -13798,21 +13829,22 @@ mod tests {
             "omega\nbeta\nomega\n"
         );
 
-        let edit_same = execute_tool(
+        let edit_same = execute_tool_in(
+            &env,
             "edit_file",
             &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
         )
         .expect_err("identical old/new should fail");
         assert!(edit_same.contains("must differ"));
 
-        let edit_missing = execute_tool(
+        let edit_missing = execute_tool_in(
+            &env,
             "edit_file",
             &json!({ "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
         )
         .expect_err("missing substring should fail");
         assert!(edit_missing.contains("old_string not found"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -13824,8 +13856,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("search-suite");
         fs::create_dir_all(root.join("nested")).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
         fs::write(
             root.join("nested/lib.rs"),
@@ -13834,7 +13865,7 @@ mod tests {
         .expect("write rust file");
         fs::write(root.join("nested/notes.txt"), "alpha\nbeta\n").expect("write txt file");
 
-        let globbed = execute_tool("glob_search", &json!({ "pattern": "nested/*.rs" }))
+        let globbed = execute_tool_in(&env, "glob_search", &json!({ "pattern": "nested/*.rs" }))
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
@@ -13844,11 +13875,12 @@ mod tests {
                 .ends_with("nested/lib.rs")
         );
 
-        let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
+        let glob_error = execute_tool_in(&env, "glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
         assert!(!glob_error.is_empty());
 
-        let grep_content = execute_tool(
+        let grep_content = execute_tool_in(
+            &env,
             "grep_search",
             &json!({
                 "pattern": "alpha",
@@ -13871,7 +13903,8 @@ mod tests {
             .expect("content")
             .contains("let alpha = 2;"));
 
-        let grep_count = execute_tool(
+        let grep_count = execute_tool_in(
+            &env,
             "grep_search",
             &json!({ "pattern": "alpha", "path": "nested", "output_mode": "count" }),
         )
@@ -13879,14 +13912,14 @@ mod tests {
         let grep_count_output: serde_json::Value = serde_json::from_str(&grep_count).expect("json");
         assert_eq!(grep_count_output["numMatches"], 3);
 
-        let grep_error = execute_tool(
+        let grep_error = execute_tool_in(
+            &env,
             "grep_search",
             &json!({ "pattern": "(alpha", "path": "nested" }),
         )
         .expect_err("invalid regex should fail");
         assert!(!grep_error.is_empty());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -13901,17 +13934,17 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         fs::create_dir_all(&outside).expect("create outside");
         fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
-        let read_error = execute_tool(
+        let read_error = execute_tool_in(
+            &env,
             "read_file",
             &json!({ "path": outside.join("secret.txt").display().to_string() }),
         )
         .expect_err("read outside workspace should fail");
         assert!(read_error.contains("escapes workspace"));
 
-        let write_error = execute_tool(
+        let write_error = execute_tool_in(&env,
             "write_file",
             &json!({ "path": outside.join("created.txt").display().to_string(), "content": "nope" }),
         )
@@ -13919,21 +13952,22 @@ mod tests {
         assert!(write_error.contains("escapes workspace"));
         assert!(!outside.join("created.txt").exists());
 
-        let glob_error = execute_tool(
+        let glob_error = execute_tool_in(
+            &env,
             "glob_search",
             &json!({ "pattern": outside.join("*.txt").display().to_string() }),
         )
         .expect_err("absolute glob outside workspace should fail");
         assert!(glob_error.contains("escapes workspace"));
 
-        let grep_error = execute_tool(
+        let grep_error = execute_tool_in(
+            &env,
             "grep_search",
             &json!({ "pattern": "secret", "path": outside.display().to_string() }),
         )
         .expect_err("grep outside workspace should fail");
         assert!(grep_error.contains("escapes workspace"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
     }
@@ -13952,14 +13986,12 @@ mod tests {
         fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
         std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt"))
             .expect("create symlink");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
-        let error = execute_tool("read_file", &json!({ "path": "link.txt" }))
+        let error = execute_tool_in(&env, "read_file", &json!({ "path": "link.txt" }))
             .expect_err("symlink outside workspace should fail");
         assert!(error.contains("escapes workspace"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
     }
@@ -14047,16 +14079,17 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let env = TurnEnv::new(cwd.clone(), Vec::new());
 
-        let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
+        let get =
+            execute_tool_in(&env, "Config", &json!({"setting": "verbose"})).expect("get config");
         let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
         assert_eq!(get_output["value"], false);
 
-        let set = execute_tool(
+        let set = execute_tool_in(
+            &env,
             "Config",
             &json!({"setting": "permissions.defaultMode", "value": "plan"}),
         )
@@ -14065,19 +14098,19 @@ mod tests {
         assert_eq!(set_output["operation"], "set");
         assert_eq!(set_output["newValue"], "plan");
 
-        let invalid = execute_tool(
+        let invalid = execute_tool_in(
+            &env,
             "Config",
             &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
         )
         .expect_err("invalid config value should error");
         assert!(invalid.contains("Invalid value"));
 
-        let unknown =
-            execute_tool("Config", &json!({"setting": "nope"})).expect("unknown setting result");
+        let unknown = execute_tool_in(&env, "Config", &json!({"setting": "nope"}))
+            .expect("unknown setting result");
         let unknown_output: serde_json::Value = serde_json::from_str(&unknown).expect("json");
         assert_eq!(unknown_output["success"], false);
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -14114,12 +14147,11 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let env = TurnEnv::new(cwd.clone(), Vec::new());
 
-        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
+        let enter = execute_tool_in(&env, "EnterPlanMode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
         assert_eq!(enter_output["changed"], true);
         assert_eq!(enter_output["managed"], true);
@@ -14135,7 +14167,7 @@ mod tests {
         assert!(state.contains(r#""hadLocalOverride": true"#));
         assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
 
-        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit = execute_tool_in(&env, "ExitPlanMode", &json!({})).expect("exit plan mode");
         let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["managed"], false);
@@ -14151,7 +14183,6 @@ mod tests {
             .join("plan-mode.json")
             .exists());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -14183,17 +14214,16 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let env = TurnEnv::new(cwd.clone(), Vec::new());
 
-        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
+        let enter = execute_tool_in(&env, "EnterPlanMode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
         assert_eq!(enter_output["previousLocalMode"], serde_json::Value::Null);
         assert_eq!(enter_output["currentLocalMode"], "plan");
 
-        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit = execute_tool_in(&env, "ExitPlanMode", &json!({})).expect("exit plan mode");
         let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
@@ -14213,7 +14243,6 @@ mod tests {
             .join("plan-mode.json")
             .exists());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -14448,8 +14477,7 @@ printf 'pwsh:%s' "$1"
         fs::write(outside.join("secret.txt"), "secret\n").expect("outside fixture");
         std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt"))
             .expect("create symlink");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
         let registry = workspace_write_registry();
         let err = registry
@@ -14460,7 +14488,6 @@ printf 'pwsh:%s' "$1"
             "should require elevated mode: {err}"
         );
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
     }
@@ -14505,14 +14532,12 @@ printf 'pwsh:%s' "$1"
         fs::create_dir_all(&root).expect("create root");
         let file = root.join("readable.txt");
         fs::write(&file, "content\n").expect("write test file");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let env = TurnEnv::new(root.clone(), Vec::new());
 
-        let registry = read_only_registry();
+        let registry = read_only_registry().with_turn_env(env);
         let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -15113,18 +15138,18 @@ mod skill_search_tests {
         .expect("write skill");
     }
 
-    /// Save cwd + relevant env vars, then point cwd/HOME at `home` so skill
-    /// discovery only sees skills created under `home/.claw/skills`.
+    /// Save relevant env vars, then point HOME at `home` so skill discovery
+    /// only sees skills created under `home/.claw/skills`.
     /// Returns a closure that restores the original environment.
+    ///
+    /// 工作区不再通过进程 cwd 传递：调用方须把 `home` 作为显式 workspace 传入。
     fn isolate_skill_env(home: &Path) -> Box<dyn FnOnce() + '_> {
-        let original_dir = std::env::current_dir().expect("cwd");
         let original_home = std::env::var_os("HOME");
         let original_userprofile = std::env::var_os("USERPROFILE");
         let original_claw_config = std::env::var_os("CLAW_CONFIG_HOME");
         let original_codex_home = std::env::var_os("CODEX_HOME");
         let original_claude_config = std::env::var_os("CLAUDE_CONFIG_DIR");
 
-        std::env::set_current_dir(home).expect("set cwd");
         std::env::set_var("HOME", home);
         std::env::set_var("USERPROFILE", home);
         std::env::remove_var("CLAW_CONFIG_HOME");
@@ -15132,7 +15157,6 @@ mod skill_search_tests {
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         Box::new(move || {
-            std::env::set_current_dir(&original_dir).expect("restore cwd");
             match original_home {
                 Some(v) => std::env::set_var("HOME", v),
                 None => std::env::remove_var("HOME"),
@@ -15165,10 +15189,13 @@ mod skill_search_tests {
         write_skill(&skills_dir, "pdf-extractor", "Extract text from PDF files");
 
         let restore = isolate_skill_env(&home);
-        let output = execute_skill_search(SkillSearchInput {
-            query: "pdf-extractor".to_string(),
-            max_results: None,
-        });
+        let output = execute_skill_search(
+            SkillSearchInput {
+                query: "pdf-extractor".to_string(),
+                max_results: None,
+            },
+            &home,
+        );
         restore();
         let _ = fs::remove_dir_all(&home);
 
@@ -15208,10 +15235,13 @@ mod skill_search_tests {
         write_skill(&skills_dir, "image-resizer", "Resize and crop images");
 
         let restore = isolate_skill_env(&home);
-        let output = execute_skill_search(SkillSearchInput {
-            query: "extract data from documents".to_string(),
-            max_results: None,
-        });
+        let output = execute_skill_search(
+            SkillSearchInput {
+                query: "extract data from documents".to_string(),
+                max_results: None,
+            },
+            &home,
+        );
         restore();
         let _ = fs::remove_dir_all(&home);
 
@@ -15231,10 +15261,13 @@ mod skill_search_tests {
         write_skill(&skills_dir, "image-resizer", "Resize and crop images");
 
         let restore = isolate_skill_env(&home);
-        let output = execute_skill_search(SkillSearchInput {
-            query: "quantum computing flux capacitor".to_string(),
-            max_results: None,
-        });
+        let output = execute_skill_search(
+            SkillSearchInput {
+                query: "quantum computing flux capacitor".to_string(),
+                max_results: None,
+            },
+            &home,
+        );
         restore();
         let _ = fs::remove_dir_all(&home);
 
@@ -15264,10 +15297,13 @@ mod skill_search_tests {
         write_skill(&skills_dir, "search-delta", "Search and index delta data");
 
         let restore = isolate_skill_env(&home);
-        let output = execute_skill_search(SkillSearchInput {
-            query: "search".to_string(),
-            max_results: Some(2),
-        });
+        let output = execute_skill_search(
+            SkillSearchInput {
+                query: "search".to_string(),
+                max_results: Some(2),
+            },
+            &home,
+        );
         restore();
         let _ = fs::remove_dir_all(&home);
 

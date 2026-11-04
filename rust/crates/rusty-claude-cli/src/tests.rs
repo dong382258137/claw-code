@@ -2908,6 +2908,7 @@ fn startup_banner_mentions_workflow_completions() {
             PermissionMode::DangerFullAccess,
             Vec::new(),
             OutputVerbosity::default(),
+            &root,
         )
         .expect("cli should initialize")
         .startup_banner()

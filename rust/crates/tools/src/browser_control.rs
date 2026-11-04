@@ -109,7 +109,10 @@ struct BrowserSession {
 static SESSION: OnceLock<Mutex<Option<BrowserSession>>> = OnceLock::new();
 
 /// Main entry point used by the tool executor.
-pub fn run_browser_control(input: BrowserControlInput) -> Result<String, String> {
+pub fn run_browser_control(
+    input: BrowserControlInput,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     let mutex = SESSION.get_or_init(|| Mutex::new(None));
     let mut guard = mutex
         .lock()
@@ -149,8 +152,9 @@ pub fn run_browser_control(input: BrowserControlInput) -> Result<String, String>
         let runtime = session.runtime.clone();
         let handle = runtime.handle().clone();
         // 闭包返回 (结果, 会话),便于 join 后放回 guard。
+        let workspace = workspace.to_path_buf();
         let joined = std::thread::spawn(move || {
-            let out = handle.block_on(dispatch(&mut session, &input));
+            let out = handle.block_on(dispatch(&mut session, &input, &workspace));
             (out, session)
         })
         .join()
@@ -163,7 +167,7 @@ pub fn run_browser_control(input: BrowserControlInput) -> Result<String, String>
         // Arc: Clone is a cheap reference bump, so we can hold the runtime handle
         // while `dispatch` reborrows the session mutably.
         let runtime = session.runtime.clone();
-        runtime.block_on(dispatch(session, &input))
+        runtime.block_on(dispatch(session, &input, workspace))
     }
 }
 
@@ -285,6 +289,7 @@ fn connect_target_parts(url: Option<String>, port: Option<u16>) -> Result<String
 async fn dispatch(
     session: &mut BrowserSession,
     input: &BrowserControlInput,
+    workspace: &std::path::Path,
 ) -> Result<String, String> {
     match input.action.as_str() {
         // ------------------------------------------------------------------
@@ -418,7 +423,7 @@ async fn dispatch(
                 .screenshot(ScreenshotParams::builder().build())
                 .await
                 .map_err(|e| format!("screenshot failed: {e}"))?;
-            let path = resolve_screenshot_path(input.save_path.as_deref())?;
+            let path = resolve_screenshot_path(input.save_path.as_deref(), workspace)?;
             fs::write(&path, &bytes)
                 .map_err(|e| format!("failed to write screenshot {}: {e}", path.display()))?;
             let (url, title) = page_basics(&page).await;
@@ -1542,15 +1547,17 @@ fn key_code(key: &str) -> (String, String, i64) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn resolve_screenshot_path(save_path: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_screenshot_path(
+    save_path: Option<&str>,
+    workspace: &std::path::Path,
+) -> Result<PathBuf, String> {
     if let Some(p) = save_path {
         if p.trim().is_empty() {
             return Err("save_path must not be empty".to_string());
         }
         return Ok(PathBuf::from(p));
     }
-    let cwd = std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
-    let dir = cwd.join(".claw").join("browser_shots");
+    let dir = workspace.join(".claw").join("browser_shots");
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1644,7 +1651,8 @@ mod tests {
                 "headless": true,
             }))
             .unwrap();
-            let launch = match run_browser_control(input) {
+            let workspace = std::path::Path::new(".");
+            let launch = match run_browser_control(input, workspace) {
                 Ok(ok) => ok,
                 Err(e) => {
                     eprintln!("browser_control smoke skip (launch failed): {e}");
@@ -1660,13 +1668,13 @@ mod tests {
                 "action": "goto",
                 "url": "https://example.com",
             }))
-            .map(run_browser_control)
+            .map(|input| run_browser_control(input, workspace))
             .unwrap()
             .unwrap_or_else(|e| panic!("goto failed: {e}"));
             assert!(gone.contains("example.com"), "goto: {gone}");
 
             let close = serde_json::from_value(json!({ "action": "close" }))
-                .map(run_browser_control)
+                .map(|input| run_browser_control(input, workspace))
                 .unwrap()
                 .unwrap();
             assert!(close.contains("closed"), "close: {close}");
@@ -1689,9 +1697,10 @@ mod tests {
 
     #[test]
     fn resolves_explicit_save_path() {
-        let path = resolve_screenshot_path(Some("d:/shots/a.png")).unwrap();
+        let workspace = Path::new(".");
+        let path = resolve_screenshot_path(Some("d:/shots/a.png"), workspace).unwrap();
         assert_eq!(path, PathBuf::from("d:/shots/a.png"));
-        assert!(resolve_screenshot_path(Some("  ")).is_err());
+        assert!(resolve_screenshot_path(Some("  "), workspace).is_err());
     }
 
     #[test]
@@ -1814,16 +1823,17 @@ mod tests {
             headless: Some(headless),
             port: None,
         };
+        let workspace = std::path::Path::new(".");
         let run = |action: &str| {
             let mut i = base.clone();
             i.action = action.into();
-            run_browser_control(i)
+            run_browser_control(i, workspace)
         };
         let run_with = |action: &str, patch: &dyn Fn(&mut BrowserControlInput)| {
             let mut i = base.clone();
             i.action = action.into();
             patch(&mut i);
-            run_browser_control(i)
+            run_browser_control(i, workspace)
         };
 
         let launch = match run("launch") {
@@ -1852,7 +1862,7 @@ mod tests {
         assert!(state.contains("example.com"), "get_state: {state}");
 
         base.action = "close".into();
-        let close = run_browser_control(base).unwrap();
+        let close = run_browser_control(base, workspace).unwrap();
         assert!(close.contains("closed"), "close: {close}");
     }
 
@@ -1862,21 +1872,26 @@ mod tests {
     #[test]
     #[ignore]
     fn browser_control_smoke_stealth() {
+        let workspace = std::path::Path::new(".");
         let launch = run_browser_control(
             serde_json::from_value(json!({
                 "action": "launch",
                 "headless": true,
             }))
             .unwrap(),
+            workspace,
         )
         .unwrap_or_else(|e| panic!("launch failed: {e}"));
         assert!(launch.contains("\"status\":\"ready\""), "launch: {launch}");
 
-        let probe = run_browser_control(serde_json::from_value(json!({
-            "action": "evaluate_js",
-            "script": "JSON.stringify({ webdriver: navigator.webdriver, innerWidth: window.innerWidth, innerHeight: window.innerHeight, ua: navigator.userAgent, lang: navigator.language })",
-        }))
-        .unwrap())
+        let probe = run_browser_control(
+            serde_json::from_value(json!({
+                "action": "evaluate_js",
+                "script": "JSON.stringify({ webdriver: navigator.webdriver, innerWidth: window.innerWidth, innerHeight: window.innerHeight, ua: navigator.userAgent, lang: navigator.language })",
+            }))
+            .unwrap(),
+            workspace,
+        )
         .unwrap_or_else(|e| panic!("probe failed: {e}"));
 
         // evaluate_js 返回 {"result": "<JSON 字符串>"},解析两层。
@@ -1916,9 +1931,11 @@ mod tests {
             "language should be zh-CN or en-US: {probe}"
         );
 
-        let close =
-            run_browser_control(serde_json::from_value(json!({ "action": "close" })).unwrap())
-                .unwrap();
+        let close = run_browser_control(
+            serde_json::from_value(json!({ "action": "close" })).unwrap(),
+            workspace,
+        )
+        .unwrap();
         assert!(close.contains("closed"), "close: {close}");
     }
 
@@ -1928,6 +1945,7 @@ mod tests {
     #[test]
     #[ignore]
     fn browser_control_smoke_goto_ready_wait() {
+        let workspace = std::path::Path::new(".");
         let run = |action: &str, extra: &serde_json::Value| {
             let mut v = json!({ "action": action });
             if let Some(obj) = extra.as_object() {
@@ -1936,7 +1954,7 @@ mod tests {
                 }
             }
             let input: BrowserControlInput = serde_json::from_value(v).unwrap();
-            run_browser_control(input)
+            run_browser_control(input, workspace)
         };
 
         run("launch", &json!({ "headless": true }))
@@ -2011,6 +2029,7 @@ mod tests {
         // Give Chrome time to open the debugging endpoint.
         std::thread::sleep(Duration::from_millis(2500));
 
+        let workspace = std::path::Path::new(".");
         let run = |action: &str, extra: &serde_json::Value| {
             let mut v = json!({ "action": action });
             if let Some(obj) = extra.as_object() {
@@ -2019,7 +2038,7 @@ mod tests {
                 }
             }
             let input: BrowserControlInput = serde_json::from_value(v).unwrap();
-            run_browser_control(input)
+            run_browser_control(input, workspace)
         };
 
         let connect = run("connect", &json!({ "port": port }))

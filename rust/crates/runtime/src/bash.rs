@@ -103,9 +103,8 @@ pub struct BashCommandOutput {
     pub shell_type: Option<String>,
 }
 
-/// 解析执行 bash 的工作目录。进程继承的 CWD 可能已失效(目录被删除,实测 Windows
-/// os error 267「目录名称无效」会让整个 bash 工具**完全不可用**),此时回退到用户
-/// 家目录,再退到临时目录,保证 bash 仍可执行(命令自身 cwd 语义退化为家目录)。
+/// 解析执行 bash 的工作目录。**仅**供 `execute_bash` 兼容包装使用；
+/// 工具执行路径必须走 `execute_bash_in` 显式 cwd。`cwd-allowlist: cli-entry`
 fn resolve_exec_cwd() -> PathBuf {
     resolve_exec_cwd_from(env::current_dir().ok())
 }
@@ -123,8 +122,15 @@ fn resolve_exec_cwd_from(current: Option<PathBuf>) -> PathBuf {
 }
 
 /// Executes a shell command with the requested sandbox settings.
+///
+/// 兼容包装：从进程当前目录解析执行目录。工具层必须使用 [`execute_bash_in`]
+/// 显式传入 turn 的 workspace，不得依赖进程 cwd。
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = resolve_exec_cwd();
+    execute_bash_in(input, resolve_exec_cwd())
+}
+
+/// 显式执行目录版本：`cwd` 由调用方（`TurnEnv::workspace`）提供。
+pub fn execute_bash_in(input: BashCommandInput, cwd: PathBuf) -> io::Result<BashCommandOutput> {
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     // 每次执行前清除中止标志,避免上一轮的 abort 残留影响本次。

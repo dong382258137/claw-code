@@ -579,12 +579,20 @@ pub(crate) fn plugins_command_payload_from_result(
     }
 }
 
-pub(crate) fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>>
-{
-    let cwd = env::current_dir()?;
+pub(crate) fn build_runtime_plugin_state_for(
+    workspace: &Path,
+) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    let cwd = workspace.to_path_buf();
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;
     build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
+}
+
+/// 兼容包装：从进程当前目录构造插件/hook 状态。`cwd-allowlist: cli-entry`
+pub(crate) fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>>
+{
+    let cwd = env::current_dir()?;
+    build_runtime_plugin_state_for(&cwd)
 }
 
 pub(crate) fn build_runtime_plugin_state_with_loader(

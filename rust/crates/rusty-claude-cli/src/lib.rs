@@ -721,6 +721,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // model / 自动探测；解析留在执行侧而非 parse_args，保持参数解析
             // 的纯函数语义（`claw status` 另在 print_status_snapshot 内解析）。
             let model = resolve_repl_model(model);
+            let workspace = std::env::current_dir()?;
             let mut cli = LiveCli::new(
                 model,
                 true,
@@ -728,6 +729,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 permission_mode,
                 additional_workspace_roots,
                 output_verbosity,
+                &workspace,
             )?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.set_thinking_mode(thinking_mode);
@@ -1462,10 +1464,15 @@ pub fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
         .map(permission_mode_from_resolved)
 }
 
+pub fn config_model_for(workspace: &Path) -> Option<String> {
+    let loader = ConfigLoader::default_for(workspace);
+    loader.load().ok()?.model().map(ToOwned::to_owned)
+}
+
+/// 兼容包装：从进程当前目录读取配置模型。`cwd-allowlist: cli-entry`
 pub fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
-    let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
+    config_model_for(&cwd)
 }
 
 pub fn resolve_repl_model(cli_model: String) -> String {
