@@ -720,15 +720,16 @@ pub(crate) struct LiveCli {
     /// TUI 中断支持：当前 turn 的 abort signal handle。
     /// run_turn 开始时设置，turn 结束（成功/失败/中断）时清空。
     /// TUI 层 Ctrl+C（busy 时）通过此 handle 取消当前 turn。
-    #[cfg(feature = "full-tui")]
     current_abort_signal: Option<runtime::HookAbortSignal>,
-    /// TUI 中断支持：外部注入的 abort signal。
-    /// TUI 层在启动 worker thread 前设置（保留 clone 用于 Ctrl+C abort），
+    /// 外部注入的 abort signal。
+    /// TUI / Web 层在启动本轮执行前设置（保留 clone 用于「停止」），
     /// prepare_turn_runtime 优先使用此 signal（而非创建新的），
-    /// prepare_turn_runtime 优先使用此 signal（而非创建新的），
-    /// 让 TUI 主线程能取消正在执行的 turn。
-    #[cfg(feature = "full-tui")]
+    /// 让调用方能在 turn 执行期间取消当前轮。
     external_abort_signal: Option<runtime::HookAbortSignal>,
+    /// S3-M2:会话级子进程登记表（Web worker 每会话一份，跨轮复用）。
+    /// prepare_turn_runtime 注入到本轮工具注册表，worker 退出 / 看门狗回收 /
+    /// 会话删除时由调度器统一终止登记的进程树。
+    session_processes: Option<std::sync::Arc<runtime::process_registry::SessionProcesses>>,
     /// 细粒度诊断回调：在 run_turn 关键路径埋点，写入 claw-diag.log。
     #[cfg(feature = "full-tui")]
     diag_callback: Option<Box<dyn Fn(String) + Send>>,
@@ -767,11 +768,29 @@ impl BuiltRuntime {
     }
 
     fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
-        let runtime = self
+        // 同一份令牌同时驱动 agent loop 检查点与 bash 轮询循环：
+        // 「停止」不再依赖进程级全局标志，且按 turn 隔离（并发会话互不影响）。
+        let token = hook_abort_signal.token();
+        let mut runtime = self
             .runtime
             .take()
-            .expect("runtime should exist before installing hook abort signal");
-        self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
+            .expect("runtime should exist before installing hook abort signal")
+            .with_hook_abort_signal(hook_abort_signal);
+        runtime.tool_executor_mut().set_turn_cancel(token);
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// S3-M2:注入会话级子进程登记表（Web worker 跨轮复用的同一份）。
+    fn with_session_processes(
+        mut self,
+        processes: Option<std::sync::Arc<runtime::process_registry::SessionProcesses>>,
+    ) -> Self {
+        if let Some(processes) = processes {
+            if let Some(runtime) = self.runtime.as_mut() {
+                runtime.tool_executor_mut().set_session_processes(processes);
+            }
+        }
         self
     }
 
@@ -957,8 +976,8 @@ impl LiveCli {
             tui_output: None,
             #[cfg(feature = "full-tui")]
             current_abort_signal: None,
-            #[cfg(feature = "full-tui")]
             external_abort_signal: None,
+            session_processes: None,
             #[cfg(feature = "full-tui")]
             diag_callback: None,
             #[cfg(feature = "full-tui")]
@@ -1103,13 +1122,10 @@ impl LiveCli {
         (BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal),
         Box<dyn std::error::Error>,
     > {
-        // TUI 中断支持：优先使用外部注入的 abort signal（由 TUI 层在 spawn
-        // worker thread 前设置），让 TUI 主线程能通过 Ctrl+C 取消当前 turn。
-        // 非中断模式（CLI/JSON 等）创建新的 signal。
-        #[cfg(feature = "full-tui")]
+        // 中断支持（TUI 与 Web 共用）：优先使用外部注入的 abort signal
+        // （由调用方在 spawn worker / 入队前设置），让主线程/HTTP 层能通过
+        // 保留的 clone 取消当前 turn。非中断模式（CLI/JSON 等）创建新的 signal。
         let hook_abort_signal = self.external_abort_signal.clone().unwrap_or_default();
-        #[cfg(not(feature = "full-tui"))]
-        let hook_abort_signal = runtime::HookAbortSignal::new();
         let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
@@ -1123,6 +1139,7 @@ impl LiveCli {
             &self.workspace,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone())
+        .with_session_processes(self.session_processes.clone())
         .with_upgrade_signal(self.upgrade_signal.clone())
         .with_steer_inbox(self.steer_inbox.clone());
         runtime.set_tool_verbosity(self.output_verbosity);
@@ -3260,12 +3277,10 @@ impl LiveCli {
         self.status_emitter = None;
     }
 
-    /// TUI 中断支持：取消当前正在执行的 turn。
+    /// 取消当前正在执行的 turn（TUI Ctrl+C / Web「停止」共用）。
     /// 通过 abort hook_abort_signal，agent loop 在下一次迭代顶部检测到
-    /// 后退出。正在进行的 API 流式请求无法中断（阻塞 IO），但可以阻止
-    /// 下一轮迭代（不再发起新请求、不再执行新工具）。
+    /// 后退出；bash 轮询循环同时（≤100ms）终止子进程树。
     /// 返回 true 表示已发送取消信号，false 表示当前没有正在执行的 turn。
-    #[cfg(feature = "full-tui")]
     pub(crate) fn abort_current_turn(&mut self) -> bool {
         if let Some(signal) = &self.current_abort_signal {
             signal.abort();
@@ -3275,17 +3290,23 @@ impl LiveCli {
         }
     }
 
-    /// TUI 中断支持：设置外部 abort signal。
-    /// TUI 层在启动 worker thread 前调用此方法，传入 abort signal 的 clone。
-    /// prepare_turn_runtime 会优先使用此 signal，让 TUI 主线程能通过保留的
-    /// clone 取消当前 turn。turn 结束后由 clear_external_abort_signal 清空。
-    #[cfg(feature = "full-tui")]
+    /// 设置外部 abort signal。
+    /// 调用方在启动本轮执行前调用此方法，传入 abort signal 的 clone。
+    /// prepare_turn_runtime 会优先使用此 signal，让调用方在 turn 执行期间
+    /// 取消当前 turn。turn 结束后由 clear_external_abort_signal 清空。
     pub(crate) fn set_external_abort_signal(&mut self, signal: runtime::HookAbortSignal) {
         self.external_abort_signal = Some(signal);
     }
 
-    /// TUI 中断支持：清空外部 abort signal（turn 结束后调用）。
-    #[cfg(feature = "full-tui")]
+    /// S3-M2:设置会话级进程登记表（Web worker 每会话一份，跨轮复用）。
+    pub(crate) fn set_session_processes(
+        &mut self,
+        processes: std::sync::Arc<runtime::process_registry::SessionProcesses>,
+    ) {
+        self.session_processes = Some(processes);
+    }
+
+    /// 清空外部 abort signal（turn 结束后调用）。
     pub(crate) fn clear_external_abort_signal(&mut self) {
         self.external_abort_signal = None;
     }

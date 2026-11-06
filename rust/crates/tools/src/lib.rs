@@ -15,7 +15,7 @@ use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::multi_agent::dag;
 use runtime::{
-    dedupe_superseded_commit_events, edit_file_in_workspace_with_roots, execute_bash_in,
+    dedupe_superseded_commit_events, edit_file_in_workspace_with_roots,
     glob_search_in_workspace_with_roots, grep_search_in_workspace_with_roots, load_system_prompt,
     lsp_client::{LspAutoDiagOutcome, LspDiagnostic, LspRegistry},
     mcp_tool_bridge::McpToolRegistry,
@@ -454,6 +454,9 @@ pub struct TurnEnv {
     workspace: PathBuf,
     roots: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
+    /// S3-M2:会话级子进程登记表。工具 spawn 子进程（bash/后台命令）时登记，
+    /// worker 退出 / 看门狗回收 / 会话删除时由会话侧统一终止。
+    processes: Option<Arc<runtime::process_registry::SessionProcesses>>,
 }
 
 impl TurnEnv {
@@ -463,6 +466,7 @@ impl TurnEnv {
             workspace: workspace.into(),
             roots,
             cancel: Arc::new(AtomicBool::new(false)),
+            processes: None,
         }
     }
 
@@ -504,6 +508,20 @@ impl TurnEnv {
     #[must_use]
     pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    #[must_use]
+    pub fn processes(&self) -> Option<&Arc<runtime::process_registry::SessionProcesses>> {
+        self.processes.as_ref()
+    }
+
+    #[must_use]
+    pub fn with_processes(
+        mut self,
+        processes: Arc<runtime::process_registry::SessionProcesses>,
+    ) -> Self {
+        self.processes = Some(processes);
         self
     }
 }
@@ -639,6 +657,19 @@ impl GlobalToolRegistry {
     pub fn with_turn_env(mut self, env: TurnEnv) -> Self {
         self.env = env;
         self
+    }
+
+    /// 替换当前 turn 的取消令牌（CLI/serve 在运行态重建后注入本轮 signal）。
+    pub fn set_turn_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.env = self.env.clone().with_cancel(cancel);
+    }
+
+    /// S3-M2:注入会话级子进程登记表（跨轮复用同一份）。
+    pub fn set_session_processes(
+        &mut self,
+        processes: Arc<runtime::process_registry::SessionProcesses>,
+    ) {
+        self.env = self.env.clone().with_processes(processes);
     }
 
     #[must_use]
@@ -2562,7 +2593,7 @@ fn current_ask_user_question_handler() -> Option<AskUserQuestionHandler> {
 
 /// 热升级请求标志(agent 自触发)。
 ///
-/// 与 [`set_bash_abort`](../../runtime/src/bash.rs) 同构的跨 crate 信号:`HotUpgrade`
+/// 与 runtime 的 per-turn 取消令牌同构的跨 crate 信号:`HotUpgrade`
 /// 工具**只置位**此标志,绝不自行重启。host 主循环在**当前 turn 正常收尾后**检测到
 /// 标志,才调用 `LiveCli::run_upgrade()`(持久化计划 → 写升级标记 → spawn 升级助手
 /// 重建/重启 → 退出)。新进程经 `maybe_resume_from_upgrade()` 自动 resume 本会话,
@@ -3268,8 +3299,13 @@ fn run_bash(input: BashCommandInput, env: &TurnEnv) -> Result<String, String> {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
     serde_json::to_string_pretty(
-        &execute_bash_in(input, env.workspace().to_path_buf())
-            .map_err(|error| error.to_string())?,
+        &runtime::bash::execute_bash_in_with_context(
+            input,
+            env.workspace().to_path_buf(),
+            Some(Arc::clone(env.cancel_flag())),
+            env.processes().cloned(),
+        )
+        .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }
@@ -8026,6 +8062,11 @@ impl ToolExecutor for SubagentToolExecutor {
         let value = crate::parse_tool_call_input(tool_name, input).map_err(ToolError::new)?;
         execute_tool_in_with_enforcer(&self.env, self.enforcer.as_ref(), tool_name, &value)
             .map_err(ToolError::new)
+    }
+
+    fn set_cancel_token(&mut self, token: runtime::bash::CancelToken) {
+        // S3-M2:替换 TurnEnv 的取消令牌，后续工具调用（尤其 bash）与父 turn 共享。
+        self.env = self.env.clone().with_cancel(token);
     }
 }
 

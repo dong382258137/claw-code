@@ -8,6 +8,7 @@ mod approval_tokens;
 pub mod bash;
 pub mod bash_validation;
 pub mod bg;
+// S3-M2:会话级子进程登记与兜底清理（PID 登记 + 进程树终止）。
 mod bootstrap;
 pub mod branch_lock;
 pub mod cache_alignment;
@@ -18,6 +19,7 @@ pub mod content_classifier;
 pub mod content_compression;
 pub mod context_source;
 mod conversation;
+pub mod process_registry;
 // 轮次感知上下文编译器 P2:充分性契约(Sufficiency Contract)— 让模型
 // 在侦察链前显式声明停止判据(`[SUFFICIENCY: ...]`),框架机械校验"判据
 // 是否已满足",给"何时足够"装上可验证的价格。
@@ -188,7 +190,9 @@ pub use approval_tokens::{
     ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
 };
-pub use bash::{execute_bash, execute_bash_in, BashCommandInput, BashCommandOutput};
+pub use bash::{
+    execute_bash, execute_bash_in, execute_bash_in_with_cancel, BashCommandInput, BashCommandOutput,
+};
 pub use bg::{bg_dir, BgError, BgRecord, BgStatus};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

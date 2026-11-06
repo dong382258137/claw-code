@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -17,31 +18,25 @@ use crate::sandbox::{
 };
 use crate::ConfigLoader;
 
-/// 全局 bash 中止标志。
+/// 取消令牌：由 turn 上下文（`TurnEnv` / `HookAbortSignal`）持有，随本轮执行
+/// 传入 bash。轮询循环每 100ms 检查一次，命中后立即终止整棵进程树并返回
+/// `interrupted` 结果。
 ///
-/// TUI 在 Ctrl+C 时调用 `set_bash_abort()`,`execute_bash_async` 的 select! loop
-/// 每 100ms 轮询此标志,命中后 kill 子进程并返回 interrupted 输出。
-///
-/// 设计理由:不改 `ToolExecutor::execute` 同步 trait 签名(避免 breaking change),
-/// 用全局 AtomicBool 让 TUI 层的 Ctrl+C 信号穿透到 bash.rs 的子进程 kill。
-/// 一个 turn 内多次 bash 调用串行执行,每次开始前 clear,语义清晰。
-/// subagent 场景:用户 Ctrl+C 中断整个 turn,所有子任务的 bash 都应停止,
-/// 全局标志正好满足此语义。
-static BASH_ABORT_FLAG: AtomicBool = AtomicBool::new(false);
+/// 令牌按 turn 独立创建，不再使用进程级全局标志：并发会话之间互不影响，
+/// 也不存在"下一次 bash 开始时 clear 掉别的会话取消意图"的问题。
+pub type CancelToken = Arc<AtomicBool>;
 
-/// 设置全局 bash 中止标志(TUI Ctrl+C 时调用)。
-pub fn set_bash_abort() {
-    BASH_ABORT_FLAG.store(true, Ordering::SeqCst);
+/// 前台子进程登记守卫：正常/超时/取消退出时自动从会话进程表摘除 PID，
+/// 避免 PID 复用后在会话清理阶段误杀无关进程。
+struct ProcessRegistration {
+    registry: Arc<crate::process_registry::SessionProcesses>,
+    pid: u32,
 }
 
-/// 清除全局 bash 中止标志(每次 execute_bash 开始前调用)。
-pub fn clear_bash_abort() {
-    BASH_ABORT_FLAG.store(false, Ordering::SeqCst);
-}
-
-/// 检查 bash 是否被中止。
-pub fn is_bash_aborted() -> bool {
-    BASH_ABORT_FLAG.load(Ordering::SeqCst)
+impl Drop for ProcessRegistration {
+    fn drop(&mut self) {
+        self.registry.unregister(self.pid);
+    }
 }
 
 /// Input schema for the built-in bash execution tool.
@@ -130,12 +125,33 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
 }
 
 /// 显式执行目录版本：`cwd` 由调用方（`TurnEnv::workspace`）提供。
+/// 不带取消令牌（兼容调用；工具执行路径必须走 [`execute_bash_in_with_cancel`]）。
 pub fn execute_bash_in(input: BashCommandInput, cwd: PathBuf) -> io::Result<BashCommandOutput> {
-    let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    execute_bash_in_with_cancel(input, cwd, None)
+}
 
-    // 每次执行前清除中止标志,避免上一轮的 abort 残留影响本次。
-    // TUI 在 Ctrl+C 时 set,这里 clear 确保 turn 内后续 bash 命令正常执行。
-    clear_bash_abort();
+/// 带 per-turn 取消令牌的执行入口。`cancel` 为 `None` 表示本轮不可取消
+/// （仅兼容/测试路径使用）；工具执行路径始终传入 `TurnEnv` 的令牌。
+pub fn execute_bash_in_with_cancel(
+    input: BashCommandInput,
+    cwd: PathBuf,
+    cancel: Option<CancelToken>,
+) -> io::Result<BashCommandOutput> {
+    execute_bash_in_with_context(input, cwd, cancel, None)
+}
+
+/// S3-M2：带会话级进程登记的执行入口。
+///
+/// `processes` 非空时，子进程 spawn 后立即登记到会话进程表（Windows 加入
+/// 会话 Job Object，Unix 记录 PID）。worker 退出 / 看门狗回收 / 会话删除
+/// 时由会话侧统一终止整棵进程树。
+pub fn execute_bash_in_with_context(
+    input: BashCommandInput,
+    cwd: PathBuf,
+    cancel: Option<CancelToken>,
+    processes: Option<Arc<crate::process_registry::SessionProcesses>>,
+) -> io::Result<BashCommandOutput> {
+    let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
         let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
@@ -150,6 +166,11 @@ pub fn execute_bash_in(input: BashCommandInput, cwd: PathBuf) -> io::Result<Bash
         // Linux 在 prepare_command 阶段用 unshare 包装,不在此处理。
         // std::process::Child::id() 返回 u32(非 Option)
         try_assign_sandbox_job(&sandbox_status, child.id());
+        // S3-M2:后台命令登记到会话进程表（不 unregister：它本就应跨 turn 存活，
+        // 仅在会话级清理时统一终止）。
+        if let Some(registry) = processes.as_ref() {
+            registry.register(child.id());
+        }
 
         return Ok(BashCommandOutput {
             stdout: String::new(),
@@ -181,7 +202,13 @@ pub fn execute_bash_in(input: BashCommandInput, cwd: PathBuf) -> io::Result<Bash
         std::thread::spawn(move || {
             let result = (|| {
                 let runtime = Builder::new_current_thread().enable_all().build()?;
-                runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+                runtime.block_on(execute_bash_async(
+                    input,
+                    sandbox_status,
+                    cwd,
+                    cancel,
+                    processes,
+                ))
             })();
             let _ = tx.send(result);
         });
@@ -191,7 +218,13 @@ pub fn execute_bash_in(input: BashCommandInput, cwd: PathBuf) -> io::Result<Bash
     }
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    runtime.block_on(execute_bash_async(
+        input,
+        sandbox_status,
+        cwd,
+        cancel,
+        processes,
+    ))
 }
 
 /// Detect git push to main and emit ship provenance event.
@@ -316,6 +349,8 @@ async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
+    cancel: Option<CancelToken>,
+    processes: Option<Arc<crate::process_registry::SessionProcesses>>,
 ) -> io::Result<BashCommandOutput> {
     // Detect and emit ship provenance for git push operations
     detect_and_emit_ship_prepared(&input.command);
@@ -354,6 +389,16 @@ async fn execute_bash_async(
     if let Some(pid) = child.id() {
         try_assign_sandbox_job(&sandbox_status, pid);
     }
+    // S3-M2:前台命令登记到会话进程表；`_registration` 在本函数返回时摘除。
+    let _registration = child.id().and_then(|pid| {
+        processes.as_ref().map(|registry| {
+            registry.register(pid);
+            ProcessRegistration {
+                registry: Arc::clone(registry),
+                pid,
+            }
+        })
+    });
 
     let start = Instant::now();
     let timeout_dur = Duration::from_millis(timeout_ms);
@@ -402,11 +447,14 @@ async fn execute_bash_async(
             }
         }
 
-        // 2. abort / 智能或固定超时检查 → 提前到循环顶部。
-        if is_bash_aborted() {
+        // 2. 取消令牌 / 智能或固定超时检查 → 提前到循环顶部。
+        let cancelled = cancel
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::SeqCst));
+        if cancelled {
             aborted = true;
             if !child_exited {
-                // abort 时立即终止进程树，快速退出（不等残留数据）。
+                // 取消时立即终止整棵进程树，快速退出（不等残留数据/超时）。
                 terminate_child_tree(&mut child, &mut child_exited).await;
             }
         } else if !child_exited {
@@ -461,13 +509,15 @@ async fn execute_bash_async(
     let stdout_text = String::from_utf8_lossy(&stdout_raw);
     let stderr_text = String::from_utf8_lossy(&stderr_raw);
 
-    // abort：用户 Ctrl+C 中断
+    // abort：本轮被用户/调度器取消（TUI Ctrl+C 或 Web「停止」）
     if aborted {
         let stdout = truncate_output(&stdout_text);
         let stderr = truncate_output(&stderr_text);
         return Ok(BashCommandOutput {
             stdout,
-            stderr: format!("[interrupt] Command interrupted by user (Ctrl+C)\n{stderr}"),
+            stderr: format!(
+                "[interrupt] Command cancelled by user; process tree terminated\n{stderr}"
+            ),
             raw_output_path: None,
             interrupted: true,
             is_image: None,
@@ -1215,8 +1265,53 @@ pub(crate) static BASH_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, has_shell_syntax_error, resolve_exec_cwd_from, BashCommandInput};
+    use super::{
+        execute_bash, execute_bash_in_with_cancel, has_shell_syntax_error, resolve_exec_cwd_from,
+        BashCommandInput,
+    };
     use crate::sandbox::FilesystemIsolationMode;
+
+    /// 回归：per-turn 取消令牌命中后，长时间命令应在轮询周期（≤100ms）
+    /// 内被终止并返回 interrupted，而不是等命令自然结束。
+    #[test]
+    fn cancel_token_terminates_long_command_promptly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let token = Arc::new(AtomicBool::new(false));
+        let canceller = Arc::clone(&token);
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            canceller.store(true, Ordering::SeqCst);
+        });
+
+        let start = Instant::now();
+        let output = execute_bash_in_with_cancel(
+            BashCommandInput {
+                command: "sleep 20".to_string(),
+                timeout: None,
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(false),
+                namespace_restrictions: Some(false),
+                isolate_network: Some(false),
+                filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+                allowed_mounts: None,
+            },
+            std::env::temp_dir(),
+            Some(token),
+        )
+        .expect("cancelled command should return an output");
+        trigger.join().expect("canceller thread");
+
+        assert!(output.interrupted, "命令应被标记为 interrupted");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "取消后应在毫秒级收尾，实际 {:?}",
+            start.elapsed()
+        );
+    }
 
     /// 第一性原理回归(2026-09-01):输出捕获改为临时文件后,后台启动命令
     /// (`cmd &` / nohup / Start-Process)在 bash 本体退出后**立即返回**,

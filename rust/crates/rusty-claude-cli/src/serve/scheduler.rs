@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use runtime::process_registry::SessionProcesses;
 use runtime::HookAbortSignal;
 
 /// 每会话等待队列上限（不含正在执行的那一轮）。
@@ -278,6 +279,9 @@ pub struct Scheduler {
     workers: Mutex<HashMap<String, WorkerRecord>>,
     /// 已被看门狗回收、但线程尚未退出的 worker 数量。
     orphans: AtomicUsize,
+    /// S3-M2:每会话的子进程登记表（bash 前台/后台）。worker 退出、看门狗
+    /// 回收、会话删除时整体终止该会话的进程树。
+    processes: Mutex<HashMap<String, Arc<SessionProcesses>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -294,6 +298,28 @@ impl Scheduler {
             sessions: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
             orphans: AtomicUsize::new(0),
+            processes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// S3-M2:取得（或创建）该会话的子进程登记表，供 worker 注入本轮运行态。
+    pub fn processes_for(&self, session: &str) -> Arc<SessionProcesses> {
+        let mut processes = self
+            .processes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(processes.entry(session.to_string()).or_default())
+    }
+
+    /// S3-M2:终止该会话登记的所有子进程树并摘除登记（幂等）。
+    pub fn kill_processes(&self, session: &str) {
+        let registry = self
+            .processes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session);
+        if let Some(registry) = registry {
+            registry.terminate_all();
         }
     }
 
@@ -469,6 +495,8 @@ impl Scheduler {
         };
         // 释放槽位在锁外完成：新 prompt 可立刻进入 running。
         drop(released);
+        // S3-M2:看门狗回收后终止该会话残留的工具子进程树。
+        self.kill_processes(session);
         self.orphans.fetch_add(1, Ordering::SeqCst);
         Some(ReclaimedTurn { queued })
     }
@@ -605,6 +633,8 @@ impl Scheduler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session);
+        // S3-M2:worker 退出时终止该会话残留的工具子进程树。
+        self.kill_processes(session);
         true
     }
 
@@ -669,6 +699,10 @@ impl Scheduler {
         })
     }
 
+    /// 中断：清空排队项并中止当前轮。
+    ///
+    /// 幂等：重复点「停止」时（`signal` 已被第一次调用取走、但本轮仍在
+    /// 收尾路上）返回 `aborted=true`，HTTP 层仍按正常状态响应，不报错。
     pub fn interrupt(&self, session: &str) -> Interrupted {
         let mut sessions = self
             .sessions
@@ -679,10 +713,15 @@ impl Scheduler {
         };
         let dropped = slot.queue.len();
         slot.queue.clear();
-        let aborted = slot.signal.take().is_some_and(|signal| {
-            signal.abort();
-            true
-        });
+        let aborted = match slot.signal.take() {
+            Some(signal) => {
+                signal.abort();
+                true
+            }
+            // 第一次中断已取走 signal，但本轮尚未收尾（仍在 running 或
+            // 等待许可）→ 视为已中断，重复点停止返回正常。
+            None => slot.pending_head || slot.state == SessionState::Running,
+        };
         // 只清掉排队项且没有在跑/待许可的一轮时，会话直接回到 idle。
         if !aborted && !slot.pending_head {
             slot.state = SessionState::Idle;
@@ -697,6 +736,9 @@ impl Scheduler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         sessions.remove(session);
+        drop(sessions);
+        // S3-M2:删除会话即终止其登记的全部子进程树。
+        self.kill_processes(session);
     }
 
     /// 取工作区 + 全局许可。固定「先工作区后全局」：同一工作区的后来者
@@ -1009,6 +1051,32 @@ mod tests {
             TurnOutcome::Done
         );
         assert!(scheduler.is_quiet());
+    }
+
+    /// 幂等：第一次中断取走 signal 后本轮仍在收尾路上，重复点「停止」
+    /// 仍返回 aborted=true（HTTP 200），收尾完成后不再可中断。
+    #[test]
+    fn interrupt_is_idempotent_while_turn_is_finishing() {
+        let scheduler = Scheduler::new(ConcurrencyConfig {
+            global: 1,
+            per_workspace: 1,
+        });
+        scheduler.enqueue(job("s1", "head")).expect("accepted");
+        let taken = scheduler.take_next("s1").expect("head taken");
+        assert!(scheduler.begin_turn("s1", taken.generation, Path::new("w1")));
+
+        let first = scheduler.interrupt("s1");
+        assert!(first.aborted, "首次中断应命中运行中的轮次");
+        let second = scheduler.interrupt("s1");
+        assert!(second.aborted, "重复停止仍应视为已中断（幂等）");
+        assert_eq!(second.dropped, 0);
+
+        // 正常收尾后（signal 已被中断取走）不再可中断。
+        assert_eq!(
+            scheduler.complete_turn("s1", taken.generation),
+            TurnOutcome::Done
+        );
+        assert!(!scheduler.interrupt("s1").aborted);
     }
 
     #[test]

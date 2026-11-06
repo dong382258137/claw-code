@@ -103,6 +103,23 @@ impl CliToolExecutor {
         self.status_emitter = Some(emitter);
     }
 
+    /// 注入本轮取消令牌：bash 轮询循环据此在 Web「停止」/TUI Ctrl+C 后
+    /// 立即终止子进程树（不再是进程级全局标志）。
+    pub(crate) fn set_turn_cancel(
+        &mut self,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.tool_registry.set_turn_cancel(cancel);
+    }
+
+    /// S3-M2:注入会话级进程登记表，bash/后台命令 spawn 后据此登记。
+    pub(crate) fn set_session_processes(
+        &mut self,
+        processes: std::sync::Arc<runtime::process_registry::SessionProcesses>,
+    ) {
+        self.tool_registry.set_session_processes(processes);
+    }
+
     #[cfg(feature = "full-tui")]
     pub(crate) fn clear_status_emitter(&mut self) {
         self.status_emitter = None;

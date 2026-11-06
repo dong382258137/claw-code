@@ -118,6 +118,12 @@ impl HookAbortSignal {
         self.aborted.load(Ordering::SeqCst)
     }
 
+    /// 取底层令牌句柄，供工具层（bash 轮询循环）在 turn 内共享同一份取消信号。
+    #[must_use]
+    pub fn token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.aborted)
+    }
+
     /// Reset the abort flag to false.
     ///
     /// Used by `ClawAgent::prompt` to clear a sticky abort state from a

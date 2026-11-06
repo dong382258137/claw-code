@@ -33,7 +33,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -85,11 +86,18 @@ pub type SubagentRunner = Arc<
 /// Per the v0.2 scheduler contract, `execute` is called once per attempt.
 /// The scheduler handles retry / backoff; this executor must NOT retry
 /// internally.
+/// 取消槽位：父 turn 的取消令牌由 `ConversationRuntime` 写入，DAG runner
+/// 每次派发时读取并传给子代理执行链（含 bash 轮询）。用槽位而非构造期注入，
+/// 是因为 runtime 的 per-turn 令牌在构建 DAG executor 之后才由调度器创建。
+pub type CancelSlot = Arc<Mutex<Option<Arc<AtomicBool>>>>;
+
 pub struct CoordinatorExecutor {
     coordinator: Arc<MultiAgentCoordinator>,
     /// Optional runner. When `None`, `execute` returns an error indicating
     /// that `ConversationRuntime` integration is required.
     runner: Option<SubagentRunner>,
+    /// 父 turn 取消令牌槽位（与 runner 闭包共享）。
+    cancel_slot: CancelSlot,
 }
 
 impl CoordinatorExecutor {
@@ -103,7 +111,29 @@ impl CoordinatorExecutor {
         Self {
             coordinator,
             runner: None,
+            cancel_slot: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 与 runner 闭包共享的取消槽位（供 [`with_dag_coordinator`] 构造）。
+    #[must_use]
+    pub fn cancel_slot(&self) -> CancelSlot {
+        Arc::clone(&self.cancel_slot)
+    }
+
+    /// 替换共享取消槽位（构造期由调用方传入与 runner 相同的 Arc）。
+    #[must_use]
+    pub fn with_cancel_slot(mut self, slot: CancelSlot) -> Self {
+        self.cancel_slot = slot;
+        self
+    }
+
+    /// 写入父 turn 取消令牌；已存在的子代理在下一个检查点/工具轮询处停止。
+    pub fn set_cancel_token(&self, token: Arc<AtomicBool>) {
+        *self
+            .cancel_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
     }
 
     /// Inject a runner function that executes a subagent's LLM turn.

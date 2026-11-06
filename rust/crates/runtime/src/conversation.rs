@@ -607,6 +607,10 @@ pub struct SubagentContext {
     /// `Some(n)` 时覆盖 `capability.max_iterations()`(如调研类任务放宽到 15+);
     /// `None` 保持能力默认上限,向后兼容。
     pub max_iterations: Option<usize>,
+    /// 父 turn 的取消令牌。S3-M2:子代理继承父 turn 的令牌,父会话「停止」后
+    /// 子代理轮询循环（以及经执行器传给 bash 的同一令牌）立即收尾。
+    /// `None` 表示不可取消（仅旧测试/兼容路径）。
+    pub cancel: Option<crate::bash::CancelToken>,
 }
 
 /// Epic 1(§3.2):工具签名摘要(不含完整 schema,减少 token 占用)。
@@ -1491,6 +1495,10 @@ async fn drop_value_outside_async_ctx<T: Send + 'static>(value: T) {
 /// 的 handler 签名需加 `+ Send`。
 pub trait ToolExecutor: Send {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    /// S3-M2:绑定父 turn 的取消令牌。默认空实现，保持既有执行器零改动；
+    /// DAG 子代理执行器覆盖该方法，使 bash 轮询循环继承父会话「停止」信号。
+    fn set_cancel_token(&mut self, _token: crate::bash::CancelToken) {}
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -2124,6 +2132,30 @@ pub(crate) async fn execute_subagent_llm(
     let mut final_text = String::new();
 
     loop {
+        // S3-M2:父 turn 取消令牌在每个子代理迭代边界检查一次。命中即落盘
+        // Cancelled handoff 并返回，不再发起新的 LLM/工具调用（bash 轮询由
+        // 工具执行器共享的同一令牌负责杀进程树）。
+        if let Some(cancel) = ctx.cancel.as_ref() {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                let handoff = SubagentHandoff::new(
+                    subagent_id,
+                    name,
+                    capability,
+                    complexity,
+                    iterations,
+                    tools_used.clone(),
+                    changed_files.clone(),
+                    &final_text,
+                    &final_text,
+                )
+                .with_status(HandoffStatus::Cancelled)
+                .with_task(task);
+                let _ = write_handoff(handoff_root, &handoff);
+                return Err(format!(
+                    "subagent {subagent_id} cancelled by parent; partial result at .claw/subagents/{subagent_id}.md"
+                ));
+            }
+        }
         iterations += 1;
         if iterations > max_iter {
             // §8.1:截断 → 落盘 Truncated handoff + Err
@@ -2608,7 +2640,13 @@ where
 
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
+        // S3-M2:同一 per-turn 令牌同时传给 DAG 子代理执行器，父会话「停止」
+        // 时并行子代理在下一个迭代边界/工具轮询处收尾，而不是继续跑。
+        let token = hook_abort_signal.token();
         self.hook_abort_signal = hook_abort_signal;
+        if let Some(executor) = &self.coordinator_executor {
+            executor.set_cancel_token(token);
+        }
         self
     }
 
@@ -2975,17 +3013,29 @@ where
         if let Some(te) = tool_executor {
             dispatcher = dispatcher.with_tool_executor(Arc::new(Mutex::new(te)));
         }
+        // S3-M2:父 turn 取消令牌槽位。runtime 在 `with_hook_abort_signal` 时写入，
+        // runner 每次派发时读取并下传给子代理（含 bash 轮询）。
+        let cancel_slot: crate::multi_agent::dag::coordinator_executor::CancelSlot =
+            Arc::new(Mutex::new(None));
+        let runner_slot = Arc::clone(&cancel_slot);
         let runner: SubagentRunner = Arc::new(move |id, task, capability, max_iterations| {
             // 2026-09-03:max_iterations(来自 DagNode)经 dispatcher 覆盖能力默认
             // 上限(如网络调研类任务放宽到 15+);None 保持 capability 默认,向后兼容。
+            let token = runner_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let d = dispatcher
                 .clone()
                 .with_capability(capability)
-                .with_max_iterations(max_iterations);
+                .with_max_iterations(max_iterations)
+                .with_cancel(token);
             Box::pin(async move { d.dispatch(id, task).await })
         });
         self.coordinator_executor = Some(Arc::new(
-            CoordinatorExecutor::new(coordinator).with_runner(runner),
+            CoordinatorExecutor::new(coordinator)
+                .with_runner(runner)
+                .with_cancel_slot(cancel_slot),
         ));
         self
     }
@@ -7285,6 +7335,8 @@ where
         if max_iterations.is_some() {
             ctx.max_iterations = max_iterations;
         }
+        // S3-M2:子代理继承父 turn 的取消令牌（单发 dispatch_subagent 路径）。
+        ctx.cancel = Some(self.hook_abort_signal.token());
 
         // model 为 None:走原 run_subagent_turn 路径(复用主 agent client)
         let model = match model {
@@ -18403,6 +18455,7 @@ mod tests {
             }),
             tool_summaries: Vec::new(),
             max_iterations: None,
+            cancel: None,
         };
         let split = build_subagent_system_prompt(
             crate::multi_agent::TaskComplexity::Simple,
@@ -18458,6 +18511,7 @@ mod tests {
                 description: "Read a file".to_string(),
             }],
             max_iterations: None,
+            cancel: None,
         };
         let split_ro = build_subagent_system_prompt(
             crate::multi_agent::TaskComplexity::Simple,

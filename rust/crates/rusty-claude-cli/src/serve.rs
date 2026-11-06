@@ -924,6 +924,8 @@ struct WebPermissionPrompter {
     scheduler: Arc<Scheduler>,
     /// 本轮代际：已被看门狗回收的轮次不再把审批请求推给前端。
     generation: u64,
+    /// 本轮取消令牌：用户「停止」或看门狗回收后，审批等待立即按拒绝返回。
+    signal: runtime::HookAbortSignal,
 }
 
 /// 审批 id 的会话内序号：并发下毫秒时间戳会撞车，必须由单调计数器消歧。
@@ -958,6 +960,7 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
             self.session_id,
             APPROVAL_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1
         );
+        let deadline = Instant::now() + Duration::from_secs(120);
         let (sender, receiver) = std::sync::mpsc::channel::<bool>();
         {
             let mut map = self
@@ -984,9 +987,24 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
             }),
         );
 
-        let allowed = receiver
-            .recv_timeout(Duration::from_secs(120))
-            .unwrap_or(false);
+        let allowed = loop {
+            // 审批等待也是取消检查点：用户点「停止」或看门狗回收后立即返回，
+            // 不再干等 120 秒。
+            if self.signal.is_aborted()
+                || !self.scheduler.is_current(&self.session_id, self.generation)
+            {
+                break false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(value) => break value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
+            }
+        };
         self.approvals
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -994,6 +1012,14 @@ impl runtime::PermissionPrompter for WebPermissionPrompter {
 
         if allowed {
             runtime::PermissionPromptDecision::Allow
+        } else if self.signal.is_aborted() {
+            runtime::PermissionPromptDecision::Deny {
+                reason: "本轮已被用户取消".to_string(),
+            }
+        } else if !self.scheduler.is_current(&self.session_id, self.generation) {
+            runtime::PermissionPromptDecision::Deny {
+                reason: "本轮已被调度器回收".to_string(),
+            }
         } else {
             runtime::PermissionPromptDecision::Deny {
                 reason: "用户拒绝或审批超时（120 秒）".to_string(),
@@ -1044,9 +1070,9 @@ fn spawn_session_watchdog(state: AppState) {
             }
             // ① 置取消（LLM/工具循环会在下一个检查点停下）。
             turn.signal.abort();
-            // ② 杀进程树：沿用运行时现有的中止路径。注意 bash 只响应进程级
-            //    中止标志（TUI Ctrl+C 才会置位），Web 侧拿不到 per-turn 的
-            //    进程树入口；该缺口留给 S3 取消链路。
+            // ② 杀进程树：per-turn 令牌同时传给 bash 轮询循环（≤100ms 检查），
+            //    取消后工具子进程树（bash 等）会被立即终止；③ 的 reclaim 同时
+            //    清理该会话登记的残留进程树（S3-M2）。
             // ③ 标记 failed、④ 摘除运行句柄并归还槽位、⑤ generation+1
             //    在 reclaim 内一次完成（许可归调度器所有，僵死线程不再占槽）。
             let reclaimed = state.scheduler.reclaim(&turn.session, turn.generation);
@@ -1138,17 +1164,26 @@ impl SessionWorker {
         let approvals = Arc::clone(&self.state.approvals);
         let scheduler = Arc::clone(&self.state.scheduler);
         let signal = turn.signal.clone();
+        let emit_signal = signal.clone();
+        let prompter_signal = signal.clone();
         let activity = Arc::clone(&turn.activity);
         let job = &turn.job;
         let sid = self.session_id.clone();
         let cli = self.cli_for_turn(job)?;
         cli.set_external_abort_signal(signal);
+        // S3-M2:注入该会话的子进程登记表（跨轮复用，会话级清理时统一终止）。
+        cli.set_session_processes(scheduler.processes_for(&sid));
 
         let sender = Arc::clone(&events);
         let emit_sid = sid.clone();
         let gate_scheduler = Arc::clone(&scheduler);
         let gate_generation = turn.generation;
         cli.set_status_emitter(Arc::new(move |event: runtime::StatusEvent| {
+            // 本轮已被用户「停止」或看门狗回收：迟到事件（含 bash 取消后
+            // 的 tool_result）一律不再进入前端流。
+            if emit_signal.is_aborted() {
+                return;
+            }
             // 任何流式事件都算“有进展”，刷新看门狗的心跳。
             activity.store(now_ms(), Ordering::SeqCst);
             // 代际失效（已被看门狗回收）：迟到事件一律不进前端流。
@@ -1192,6 +1227,7 @@ impl SessionWorker {
             approvals,
             scheduler: Arc::clone(&scheduler),
             generation: turn.generation,
+            signal: prompter_signal,
         };
         cli.run_turn_silent_with(&job.text, &mut prompter)
             .map_err(|error| error.to_string())
@@ -1298,6 +1334,12 @@ fn spawn_session_worker(state: AppState, session_id: String) {
                         .scheduler
                         .is_current(&worker_session, turn.generation)
                     {
+                        // 用户主动停止：给出明确的中文收尾语义，而不是原始英文错误。
+                        let message = if message.contains("interrupted by user") {
+                            "本轮已被用户停止（工具子进程树已终止）".to_string()
+                        } else {
+                            message.clone()
+                        };
                         task_state.events.emit(
                             &worker_session,
                             json!({ "kind": "error", "message": message }),

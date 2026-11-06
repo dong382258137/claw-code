@@ -55,6 +55,9 @@ pub struct SubagentDispatcher {
     /// `Some(n)` 时覆盖 `capability.max_iterations()`(如调研类任务放宽到 15+);
     /// `None` 保持能力默认上限,向后兼容。
     max_iterations: Option<usize>,
+    /// S3-M2:父 turn 取消令牌。DAG 并行子代理继承父会话令牌;父端「停止」
+    /// 后子代理在下一个迭代边界收尾，bash 工具经执行器共享同一令牌杀进程树。
+    cancel: Option<crate::bash::CancelToken>,
 }
 
 impl SubagentDispatcher {
@@ -67,7 +70,15 @@ impl SubagentDispatcher {
             workspace_override: None,
             model: None,
             max_iterations: None,
+            cancel: None,
         }
+    }
+
+    /// S3-M2:注入父 turn 取消令牌，DAG 子代理据此在迭代边界收尾。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: Option<crate::bash::CancelToken>) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// 设置子 agent 模型名,使 `dispatch_impl` 能按 capability 重建 client
@@ -146,6 +157,7 @@ impl SubagentDispatcher {
             &task,
             self.model.as_deref(),
             self.max_iterations,
+            self.cancel.clone(),
         )
         .await
     }
@@ -171,6 +183,7 @@ impl SubagentDispatcher {
         task: &str,
         model: Option<&str>,
         max_iterations: Option<usize>,
+        cancel: Option<crate::bash::CancelToken>,
     ) -> Result<String, String> {
         // DAG 路径无 complexity 概念,与现状一致走 Simple(无 SOP)。
         let complexity = crate::multi_agent::TaskComplexity::Simple;
@@ -182,6 +195,7 @@ impl SubagentDispatcher {
                 .filter(|ts| capability.allowed_tools().contains(&ts.name.as_str()))
                 .collect(),
             max_iterations,
+            cancel: cancel.clone(),
             ..SubagentContext::default()
         };
 
@@ -232,6 +246,15 @@ impl SubagentDispatcher {
                     }
                 }
 
+                // S3-M2:把父 turn 取消令牌绑定到子代理工具执行器的 TurnEnv，
+                // 使 bash 轮询循环与父会话「停止」共享同一份信号。
+                if let Some(token) = &cancel {
+                    if let Some(te) = &tool_executor {
+                        if let Ok(mut guard) = te.lock() {
+                            guard.set_cancel_token(token.clone());
+                        }
+                    }
+                }
                 // 工具执行器:共享锁借用;None 时注入拒绝型 stub(保持统一签名完整 —
                 // 白名单外工具先被 Guard 2 拦,白名单内工具经 stub 报"no tool_executor configured")。
                 let mut te_guard = match &tool_executor {
