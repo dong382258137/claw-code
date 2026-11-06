@@ -91,9 +91,8 @@ impl LlmBridge {
     /// 从 `MessageResponse.content` 提取所有 `Text` 块拼接为字符串。
     ///
     /// 注:2026-10-04 起移除网页优先路由 — DeepSeek 官方已禁止通过
-    /// chat.deepseek.com 网页端做程序化调用(曾触发风控/账号封禁,
-    /// 见 `triage_llm.rs` 中 RoutingApiClient 停用说明)。所有
-    /// 一次性总结/判断子件一律走 API `ProviderClient`。
+    /// chat.deepseek.com 网页端做程序化调用(曾触发风控/账号封禁)。
+    /// 所有一次性总结/判断子件一律走 API `ProviderClient`。
     ///
     /// # 错误
     /// 网络/API/超时等返回 `Err(String)`,由上层降级处理。

@@ -3868,9 +3868,9 @@ fn build_api_client(
             web_bridge::deepseek_web::DeepseekWebClient::new(auth),
         ))));
     }
-    // 混合分工已停用(2026-10-03):曾把 Trivial 纯推理回合(含分诊)路由到网页
-    // 零 token,但网页端高频调用被 DeepSeek 官方风控、账号被禁两天。所有档位
-    // 一律走 API 端;`--model deepseek-web` 仍为显式完整网页模式(见上分支)。
+    // 混合分工已停用(2026-10-03):曾把轻量回合路由到网页端零 token,但网页端
+    // 高频调用被 DeepSeek 官方风控、账号被禁两天。所有请求一律走 API 端;
+    // `--model deepseek-web` 仍为显式完整网页模式(见上分支)。
     let mut client = AnthropicRuntimeClient::new(
         session_id,
         model.to_string(),

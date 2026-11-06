@@ -377,7 +377,6 @@ impl CacheBreakDetector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeMeta {
     pub request_kind: String,
-    pub triage_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1973,7 +1972,6 @@ mod tests {
         let probe = RequestDivergenceProbe::new("unit-test-probe");
         let meta = ProbeMeta {
             request_kind: "Main".to_string(),
-            triage_tier: Some("Standard".to_string()),
         };
 
         // 1) 会话首请求:仅建基线,不落盘。
@@ -2117,7 +2115,6 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
         let meta = ProbeMeta {
             request_kind: "Main".to_string(),
-            triage_tier: Some("Standard".to_string()),
         };
         // turn1 末请求 [fm, u0, a1(tool_use), u2(tool_result), S, H] → 基线观察。
         let turn1_last = MessageRequest {
@@ -2219,7 +2216,6 @@ mod tests {
         let probe = RequestDivergenceProbe::new("unit-test-probe-off");
         let meta = ProbeMeta {
             request_kind: "Main".to_string(),
-            triage_tier: None,
         };
         let first = MessageRequest {
             model: "deepseek-v4-flash".to_string(),

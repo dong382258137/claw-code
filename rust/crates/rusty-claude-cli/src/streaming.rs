@@ -393,28 +393,6 @@ pub(crate) fn mark_last_tool_with_cache_control(tools: &mut [ToolDefinition]) {
     }
 }
 
-/// P1(轮次感知上下文编译器 · Task 3):按分诊档位裁剪主对话 tools。
-///
-/// Trivial 档(状态/问答短轮)只注入核心工具集 —— 复用渐进式工具加载的
-/// `tools::core_tool_names()` 清单(与 `GlobalToolRegistry` 渐进模式下
-/// 「核心工具无条件注入」口径一致),跳过能力层长尾工具;Standard 档与
-/// 子智能体请求(`triage_tier = None`)保持现状全量,与 P0 等价。
-fn tools_for_triage(
-    tool_registry: &GlobalToolRegistry,
-    allowed_tools: Option<&AllowedToolSet>,
-    triage_tier: Option<runtime::triage::TriageTier>,
-) -> Vec<ToolDefinition> {
-    if triage_tier == Some(runtime::triage::TriageTier::Trivial) {
-        let core: AllowedToolSet = tools::core_tool_names()
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
-        filter_tool_specs(tool_registry, Some(&core))
-    } else {
-        filter_tool_specs(tool_registry, allowed_tools)
-    }
-}
-
 impl ApiClient for AnthropicRuntimeClient {
     fn last_time_to_first_chunk_ms(&self) -> Option<u64> {
         // `u64::MAX` 哨兵 = 尚无测量(未收到首 chunk / 非流式)。
@@ -461,8 +439,6 @@ impl ApiClient for AnthropicRuntimeClient {
         // (eligible for prompt caching) instead of being flattened into messages.
         let (system_text, filtered_messages) = extract_system_messages(&request.messages);
         let request_kind = request.request_kind;
-        // P1(Task 3):主对话分诊档位 —— Trivial 档 tools 裁剪为核心工具集。
-        let triage_tier = request.triage_tier;
         let mut split = request.system_prompt;
         if !system_text.is_empty() {
             split.dynamic_sections.push(system_text);
@@ -487,11 +463,7 @@ impl ApiClient for AnthropicRuntimeClient {
             messages: convert_messages(&filtered_messages, &self.model),
             system: build_system_blocks(&split),
             tools: self.enable_tools.then(|| {
-                let mut tools = tools_for_triage(
-                    &self.tool_registry,
-                    self.allowed_tools.as_ref(),
-                    triage_tier,
-                );
+                let mut tools = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
                 mark_last_tool_with_cache_control(&mut tools);
                 tools
             }),
@@ -514,7 +486,6 @@ impl ApiClient for AnthropicRuntimeClient {
             &message_request,
             api::ProbeMeta {
                 request_kind: format!("{request_kind:?}"),
-                triage_tier: triage_tier.map(|tier| format!("{tier:?}")),
             },
         );
 
@@ -561,8 +532,6 @@ impl ApiClient for AnthropicRuntimeClient {
             // 与同步 `stream` 一致:抽离 system 角色消息走 system 字段(prompt cache)
             let (system_text, filtered_messages) = extract_system_messages(&request.messages);
             let request_kind = request.request_kind;
-            // P1(Task 3):主对话分诊档位 —— Trivial 档 tools 裁剪为核心工具集。
-            let triage_tier = request.triage_tier;
             let mut split = request.system_prompt;
             if !system_text.is_empty() {
                 split.dynamic_sections.push(system_text);
@@ -582,11 +551,8 @@ impl ApiClient for AnthropicRuntimeClient {
                 messages: convert_messages(&filtered_messages, &self.model),
                 system: build_system_blocks(&split),
                 tools: self.enable_tools.then(|| {
-                    let mut tools = tools_for_triage(
-                        &self.tool_registry,
-                        self.allowed_tools.as_ref(),
-                        triage_tier,
-                    );
+                    let mut tools =
+                        filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
                     mark_last_tool_with_cache_control(&mut tools);
                     tools
                 }),
@@ -606,7 +572,6 @@ impl ApiClient for AnthropicRuntimeClient {
                 &message_request,
                 api::ProbeMeta {
                     request_kind: format!("{request_kind:?}"),
-                    triage_tier: triage_tier.map(|tier| format!("{tier:?}")),
                 },
             );
 

@@ -911,40 +911,6 @@ impl SystemPromptBuilder {
     }
 }
 
-/// P1(轮次感知上下文编译器 · Task 3):能力层 section 的首行标题前缀表。
-///
-/// 与 [`SectionTier::CapabilityLayer`] 的归类完全一致(见
-/// [`SystemPromptBuilder::collect_fragments`] 中每个 CapabilityLayer 片段)。
-/// conversation.rs 请求构造在 Trivial 档用 [`is_capability_layer_section`]
-/// 从**已渲染**的 section 文本过滤能力层 —— 该表是能力层 section 标题的
-/// 单一事实来源,避免判定逻辑与 builder 标注两处漂移。
-pub const CAPABILITY_LAYER_HEADING_PREFIXES: &[&str] = &[
-    "## Framework Switching",
-    "## Memory Verification",
-    "## History & Decisions",
-    "## Multi-Agent Orchestration",
-    "## Session Bus",
-    "## Agent Subagent Types",
-    "## Worker Lifecycle",
-    "## Tool Usage Guidance",
-];
-
-/// P1:判定一个已渲染的 system prompt section 文本是否属于能力层。
-///
-/// 基于首行标题前缀匹配(每个能力层 section 一律以其唯一标题开头,
-/// 见 [`CAPABILITY_LAYER_HEADING_PREFIXES`]);其余(不变核/状态层/
-/// dynamic boundary 标记)一律返回 `false`。
-///
-/// 用途:Trivial 档请求构造时从 `Vec<String>` sections 过滤能力层,
-/// 只注入「不变核 + 状态层」。判定与 builder 标注的一致性由
-/// `capability_layer_heading_prefixes_match_fragment_tiers` 测试守护。
-#[must_use]
-pub fn is_capability_layer_section(section: &str) -> bool {
-    CAPABILITY_LAYER_HEADING_PREFIXES
-        .iter()
-        .any(|heading| section.starts_with(heading))
-}
-
 /// Formats each item as an indented bullet for prompt sections.
 #[must_use]
 pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
@@ -2188,15 +2154,14 @@ mod tests {
         get_memory_verification_section, get_multi_agent_orchestration_section,
         get_session_bus_section, get_simple_doing_tasks_section, get_simple_intro_section,
         get_simple_system_section, get_tool_usage_guidance_section, get_worker_lifecycle_section,
-        is_blueprint_skeleton, is_capability_layer_section, normalize_instruction_content,
+        is_blueprint_skeleton, normalize_instruction_content,
         parse_project_context_instruction_count, render_blueprint_section, render_config_section,
         render_instruction_content, render_instruction_files, render_mcp_catalog_section,
         render_persistent_memory_section, render_project_context, render_project_context_fresh,
         render_repomap_section, render_skill_catalog_section, truncate_instruction_content,
         ContextFile, ModelFamilyIdentity, ProjectContext, PromptFragment, SectionTier,
-        SystemPromptBuilder, SystemPromptSplit, CAPABILITY_LAYER_HEADING_PREFIXES,
-        MAX_INSTRUCTION_FILE_CHARS, MAX_TOTAL_INSTRUCTION_CHARS, PLACEHOLDER_POINTER_MARKER,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        SystemPromptBuilder, SystemPromptSplit, MAX_INSTRUCTION_FILE_CHARS,
+        MAX_TOTAL_INSTRUCTION_CHARS, PLACEHOLDER_POINTER_MARKER, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::cache_alignment::DynamicValueExtractor;
     use crate::config::{ConfigLoader, RuntimeConfig};
@@ -4031,51 +3996,6 @@ mod tests {
         assert_eq!(tier_of("## Available Skills"), SectionTier::StateLayer);
         assert_eq!(tier_of("## MCP Servers"), SectionTier::StateLayer);
         assert_eq!(tier_of("# Appended"), SectionTier::StateLayer);
-    }
-
-    /// Task 3 守护:文本判定 [`is_capability_layer_section`] 必须与
-    /// builder 的 [`SectionTier::CapabilityLayer`] 标注**完全一致** ——
-    /// 遍历全部片段,`is_capability_layer_section(content)`
-    /// 当且仅当 `tier == CapabilityLayer`。防止 conversation.rs 的
-    /// Trivial 档裁剪(基于已渲染文本)与 prompt.rs 的层级标注漂移。
-    #[test]
-    fn capability_layer_heading_prefixes_match_fragment_tiers() {
-        let fixture = RepresentativePromptFixture::new();
-        let builder = fixture.builder();
-        for fragment in builder.collect_fragments() {
-            if fragment.tier == SectionTier::Boundary {
-                continue;
-            }
-            assert_eq!(
-                is_capability_layer_section(&fragment.content),
-                fragment.tier == SectionTier::CapabilityLayer,
-                "section 文本判定与层级标注不一致: tier={:?} content_prefix={:?}",
-                fragment.tier,
-                fragment
-                    .content
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(48)
-                    .collect::<String>()
-            );
-        }
-    }
-
-    /// Task 3 守护:前缀表无孤儿条目 —— 每个 heading 前缀都能在真实
-    /// `build()` 产出中命中一个能力层 section(删改能力层 section 时
-    /// 必须同步更新 [`CAPABILITY_LAYER_HEADING_PREFIXES`],否则此处失败)。
-    #[test]
-    fn capability_layer_heading_prefixes_all_hit_real_sections() {
-        let fixture = RepresentativePromptFixture::new();
-        let sections = fixture.builder().build();
-        for heading in CAPABILITY_LAYER_HEADING_PREFIXES {
-            assert!(
-                sections.iter().any(|section| section.starts_with(heading)),
-                "前缀 {heading:?} 未命中任何真实 section —— 需同步前缀表"
-            );
-        }
     }
 }
 
