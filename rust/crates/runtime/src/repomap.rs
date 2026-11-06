@@ -889,6 +889,32 @@ fn walk_source_files(root: &Path) -> Vec<(PathBuf, SystemTime)> {
     out
 }
 
+/// 工作区源码指纹(路径 + mtime),与 [`walk_source_files`] 使用同一套遍历规则。
+///
+/// 供跨会话只读产物缓存失效:调用方只需比较指纹是否变化,即可决定复用
+/// 上次渲染的 repomap 文本,还是重新构建。不解析文件内容,不读写缓存文件。
+#[must_use]
+pub fn source_fingerprint(root: &Path) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut files = walk_source_files(root);
+    files.sort();
+    let mut hash = FNV_OFFSET;
+    for (path, modified) in files {
+        for byte in path.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        let mtime_ms = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        hash ^= mtime_ms;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 /// P1/诊断:Repomap 性能分段时间(门控,`CLAW_REPOMAP_VERBOSE=1` 时输出 stderr)。
 /// 用于定位缓存命中路径的耗时组成,默认关闭零开销。
 fn cache_verbose_timer() -> Option<std::time::Instant> {

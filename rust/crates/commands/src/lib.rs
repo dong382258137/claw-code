@@ -2833,6 +2833,61 @@ pub fn resolve_skill_invocation(
     Ok(dispatch)
 }
 
+/// 技能目录指纹:各技能根下每个条目对应的定义文件(路径, mtime_ms, 长度)。
+///
+/// 供跨会话只读产物缓存失效:指纹不变即可复用上次渲染的技能目录文本。
+/// 只读取目录项与文件元数据,不解析 frontmatter。
+#[must_use]
+pub fn skill_catalog_fingerprint(cwd: &Path) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut files: Vec<(PathBuf, u64, u64)> = Vec::new();
+    for root in discover_skill_roots(cwd) {
+        let Ok(entries) = fs::read_dir(root.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let definition = match root.origin() {
+                SkillOrigin::SkillsDir if path.is_dir() => path.join("SKILL.md"),
+                SkillOrigin::LegacyCommandsDir if path.is_dir() => path.join("SKILL.md"),
+                SkillOrigin::LegacyCommandsDir
+                    if path
+                        .extension()
+                        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md")) =>
+                {
+                    path
+                }
+                _ => continue,
+            };
+            let Ok(metadata) = fs::metadata(&definition) else {
+                continue;
+            };
+            let mtime_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as u64);
+            files.push((definition, mtime_ms, metadata.len()));
+        }
+    }
+    files.sort();
+
+    let mut hash = FNV_OFFSET;
+    for (path, mtime_ms, len) in files {
+        for byte in path.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        for value in [mtime_ms, len] {
+            hash ^= value;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
 pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
     let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
     if requested.is_empty() {
