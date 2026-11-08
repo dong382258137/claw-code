@@ -4,10 +4,18 @@
 //! endpoint uses a Trae-specific SSE envelope (not OpenAI Chat Completions),
 //! so this module owns request conversion, SSE decoding and event mapping.
 //!
-//! Credentials are read from the DSH Trae connector cache
-//! (`~/.dsh/.trae-auth.cn.json`) by default, or from `TRAE_ACCESS_TOKEN`.
-//! The cache is written by `dsh-connect-trae`; run DSH once after logging into
-//! Trae if the file is missing or the token expired.
+//! Credentials come from the first of these that yields a non-expired token:
+//!
+//! 1. `TRAE_ACCESS_TOKEN` (manual override for one-off experiments);
+//! 2. the Trae desktop client's `storage.json`
+//!    (`%APPDATA%\Trae CN\User\globalStorage\storage.json` on Windows), whose
+//!    `iCubeAuthInfo://icube.cloudide` value is the account credential,
+//!    sealed with a fixed-salt AES-128-CBC envelope;
+//! 3. the legacy DSH connector cache (`~/.dsh/.trae-auth.cn.json`), written by
+//!    `dsh-connect-trae`.
+//!
+//! The desktop client refreshes (2) while it is running, so it is the only
+//! source that stays valid without re-running another tool.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
@@ -15,10 +23,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aes::Aes128;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
+use base64::Engine as _;
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha512};
 
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
@@ -58,7 +71,7 @@ pub struct TraeClient {
 
 impl TraeClient {
     pub fn from_env() -> Result<Self, ApiError> {
-        let cached = read_cached_credential();
+        let cached = read_desktop_credential().or_else(read_cached_credential);
         let access_token = env::var("TRAE_ACCESS_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -66,8 +79,8 @@ impl TraeClient {
             .ok_or_else(|| {
                 ApiError::missing_credentials_with_hint(
                     "Trae",
-                    &["TRAE_ACCESS_TOKEN", "TRAE_AUTH_FILE"],
-                    "登录 Trae 并启动一次 DSH（dsh-connect-trae 会生成 ~/.dsh/.trae-auth.cn.json），或设置 TRAE_ACCESS_TOKEN",
+                    &["TRAE_ACCESS_TOKEN", "TRAE_AUTH_FILE", "TRAE_STORAGE_FILE"],
+                    "登录 Trae CN 客户端并保持其运行（它会持续刷新 storage.json 里的凭证），或设置 TRAE_ACCESS_TOKEN",
                 )
             })?;
         let user_id = cached
@@ -1011,6 +1024,134 @@ fn default_auth_path() -> PathBuf {
     PathBuf::from(home).join(".dsh").join(".trae-auth.cn.json")
 }
 
+/// Key in the desktop client's `storage.json` that holds the account credential.
+const AUTH_STORAGE_KEY: &str = "iCubeAuthInfo://icube.cloudide";
+
+/// Fixed salts for the storage value envelope. The 6-byte header selects the
+/// salt pair; every value shipped today uses the first one.
+const AUTH_HEADER_AES: [u8; 6] = [116, 99, 5, 16, 0, 0];
+const AUTH_HEADER_AES_PRIVATE: [u8; 6] = [18, 57, 32, 32, 2, 3];
+const SALT_A: [u8; 64] = [
+    82, 9, 106, 213, 48, 54, 165, 56, 191, 64, 163, 158, 129, 243, 215, 251, 124, 227, 57, 130,
+    155, 47, 255, 135, 52, 142, 67, 68, 196, 222, 233, 203, 84, 123, 148, 50, 166, 194, 35, 61,
+    238, 76, 149, 11, 66, 250, 195, 78, 8, 46, 161, 102, 40, 217, 36, 178, 118, 91, 162, 73, 109,
+    139, 209, 37,
+];
+const SALT_B: [u8; 64] = [
+    31, 221, 168, 51, 136, 7, 199, 49, 177, 18, 16, 89, 39, 128, 236, 95, 96, 81, 127, 169, 25,
+    181, 74, 13, 45, 229, 122, 159, 147, 201, 156, 239, 160, 224, 59, 77, 174, 42, 245, 176, 200,
+    235, 187, 60, 131, 83, 153, 97, 23, 43, 4, 126, 186, 119, 214, 38, 225, 105, 20, 99, 85, 33,
+    12, 125,
+];
+const SALT_C: [u8; 64] = [
+    191, 192, 216, 250, 122, 246, 220, 97, 31, 254, 98, 27, 8, 72, 71, 176, 135, 99, 96, 18, 127,
+    101, 203, 104, 211, 102, 191, 125, 37, 72, 150, 156, 51, 229, 121, 35, 17, 153, 141, 177, 110,
+    131, 150, 128, 172, 255, 254, 6, 18, 140, 55, 62, 236, 249, 135, 64, 135, 12, 117, 4, 89, 149,
+    168, 209,
+];
+const SALT_D: [u8; 64] = [
+    246, 204, 26, 232, 232, 70, 129, 109, 223, 146, 169, 242, 23, 241, 105, 145, 50, 196, 165, 42,
+    254, 120, 3, 54, 244, 207, 209, 85, 53, 6, 138, 106, 175, 148, 31, 204, 186, 186, 165, 182, 87,
+    142, 49, 10, 39, 110, 26, 154, 86, 56, 173, 125, 18, 64, 198, 225, 99, 99, 83, 82, 191, 134,
+    76, 170,
+];
+
+/// Read the account credential from the Trae desktop client's `storage.json`.
+///
+/// The value under [`AUTH_STORAGE_KEY`] is `[6-byte header][32-byte random]
+/// [AES-128-CBC ciphertext]`; the key and IV come from
+/// `sha512(sha512(random) || salt)` and the plaintext is
+/// `sha512(body) || body`. Expired entries are skipped so a running client
+/// that has not refreshed yet falls through to the next source.
+fn read_desktop_credential() -> Option<AuthCredential> {
+    let path = env::var("TRAE_STORAGE_FILE")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_storage_path);
+    let text = fs::read_to_string(path).ok()?;
+    let storage: Value = serde_json::from_str(&text).ok()?;
+    let encoded = storage.get(AUTH_STORAGE_KEY)?.as_str()?;
+    let auth = decrypt_auth_storage_value(encoded)?;
+    let access_token = auth.get("token")?.as_str()?.trim().to_string();
+    if access_token.is_empty() {
+        return None;
+    }
+    let user_id = auth
+        .get("userId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let expires_at_ms = jwt_expiry_ms(&access_token);
+    if expires_at_ms.is_some_and(|expires| now_ms() >= expires) {
+        return None;
+    }
+    Some(AuthCredential {
+        access_token,
+        edition: Some("cn".to_string()),
+        expires_at_ms,
+        user_id,
+    })
+}
+
+fn decrypt_auth_storage_value(encoded: &str) -> Option<Value> {
+    let buffer = BASE64_STANDARD.decode(encoded.trim()).ok()?;
+    if buffer.len() <= 102 {
+        return None;
+    }
+    let header = &buffer[..6];
+    let salt = if header == AUTH_HEADER_AES.as_slice() {
+        xor64(&SALT_A, &SALT_B)
+    } else if header == AUTH_HEADER_AES_PRIVATE.as_slice() {
+        xor64(&SALT_C, &SALT_D)
+    } else {
+        return None;
+    };
+    let random = &buffer[6..38];
+    let encrypted = &buffer[38..];
+    let first = Sha512::digest(random);
+    let mut hasher = Sha512::new();
+    hasher.update(first);
+    hasher.update(salt);
+    let derived = hasher.finalize();
+    let decryptor =
+        cbc::Decryptor::<Aes128>::new_from_slices(&derived[..16], &derived[16..32]).ok()?;
+    let mut plaintext = encrypted.to_vec();
+    let decrypted = decryptor.decrypt_padded_mut::<Pkcs7>(&mut plaintext).ok()?;
+    if decrypted.len() < 64 {
+        return None;
+    }
+    let (expected, body) = decrypted.split_at(64);
+    if expected != Sha512::digest(body).as_slice() {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
+}
+
+fn xor64(a: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = a[index] ^ b[index];
+    }
+    out
+}
+
+/// Expiry (`exp`) from a JWT payload, in milliseconds since the epoch.
+fn jwt_expiry_ms(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| URL_SAFE.decode(payload))
+        .ok()?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    value.get("exp")?.as_u64().map(|seconds| seconds * 1_000)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 #[derive(Debug, Default)]
 struct TraeIdentity {
     machine_id: Option<String>,
@@ -1127,5 +1268,17 @@ mod tests {
         let capped = send_backoff(9);
         assert!(capped >= Duration::from_secs(8));
         assert!(capped < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn decrypts_desktop_auth_storage_value() {
+        // 合成密文：同样的盐/格式，明文是 {"token":"fixture-token","userId":"42"}。
+        let encoded = "dGMFEAAABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBweRKPSg6g63I9MjtfJao11QobNmPTgXi9nEuMFe1ortri6AKueuxxeoS+4lQboYAIywuuBb83XQ5/msMXnMspNWScxdrzleQZuQ8iK0FbFpdrZwJXPgLeeiAeBMULBKE4ox2adp6uoRMTZ7mbD+AAQ/";
+        let decoded = decrypt_auth_storage_value(encoded).expect("fixture must decrypt");
+        assert_eq!(
+            decoded.get("token").and_then(Value::as_str),
+            Some("fixture-token")
+        );
+        assert_eq!(decoded.get("userId").and_then(Value::as_str), Some("42"));
     }
 }
