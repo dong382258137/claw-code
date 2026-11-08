@@ -457,16 +457,28 @@ impl ApiClient for AnthropicRuntimeClient {
             _ => self.reasoning_effort.clone(),
         };
 
+        let tools = self.enable_tools.then(|| {
+            let mut tools = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+            mark_last_tool_with_cache_control(&mut tools);
+            tools
+        });
+        // 条件注入的唯一判据:本次请求实际发送的 tools 数组(含渐进式加载结果)。
+        let tool_names: Vec<&str> = tools
+            .as_ref()
+            .map(|defs| {
+                defs.iter()
+                    .map(|definition| definition.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        runtime::retune_tool_usage_guidance(&mut split, &tool_names);
+
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&filtered_messages, &self.model),
             system: build_system_blocks(&split),
-            tools: self.enable_tools.then(|| {
-                let mut tools = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
-                mark_last_tool_with_cache_control(&mut tools);
-                tools
-            }),
+            tools,
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: effective_effort,
@@ -545,17 +557,28 @@ impl ApiClient for AnthropicRuntimeClient {
                 _ => self.reasoning_effort.clone(),
             };
 
+            let tools = self.enable_tools.then(|| {
+                let mut tools = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+                mark_last_tool_with_cache_control(&mut tools);
+                tools
+            });
+            // 条件注入的唯一判据:本次请求实际发送的 tools 数组(含渐进式加载结果)。
+            let tool_names: Vec<&str> = tools
+                .as_ref()
+                .map(|defs| {
+                    defs.iter()
+                        .map(|definition| definition.name.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            runtime::retune_tool_usage_guidance(&mut split, &tool_names);
+
             let message_request = MessageRequest {
                 model: self.model.clone(),
                 max_tokens: max_tokens_for_model(&self.model),
                 messages: convert_messages(&filtered_messages, &self.model),
                 system: build_system_blocks(&split),
-                tools: self.enable_tools.then(|| {
-                    let mut tools =
-                        filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
-                    mark_last_tool_with_cache_control(&mut tools);
-                    tools
-                }),
+                tools,
                 tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
                 stream: true,
                 reasoning_effort: effective_effort,

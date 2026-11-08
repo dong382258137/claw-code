@@ -494,19 +494,16 @@ impl PersistentMemory {
 
     /// Render the three typed blocks in fixed order (Persona → Human → Tasks).
     ///
-    /// Empty blocks are still emitted with their label so the rendered bytes
-    /// stay stable across runs even when a block is later filled in. 注入端
-    /// 是否携带本段由 [`Self::has_content`] 决定:全空时整段省略(P1-5a),
-    /// 有内容后(会话启动捕获)前缀字节保持稳定。
+    /// Empty blocks are skipped entirely: a `## X\n_(empty)_` slot carries no
+    /// knowledge and costs tokens every turn. Order of non-empty blocks stays
+    /// fixed, so the rendered bytes remain stable for the same input.
     #[must_use]
     pub fn render_blocks(&self) -> String {
         let mut sections = Vec::new();
         for block in &self.blocks {
             let label = block.label();
             let content = block.content();
-            if content.is_empty() {
-                sections.push(format!("## {label}\n_(empty)_"));
-            } else {
+            if !content.is_empty() {
                 sections.push(format!("## {label}\n{content}"));
             }
         }
@@ -1477,13 +1474,31 @@ mod tests {
 
     #[test]
     fn memory_blocks_persona_human_tasks_order() {
-        let mem = PersistentMemory::empty(temp_path());
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.blocks_mut()[0].replace_content("persona".to_string());
+        mem.blocks_mut()[1].replace_content("human".to_string());
+        mem.blocks_mut()[2].replace_content("tasks".to_string());
         let rendered = mem.render_blocks();
         let persona_pos = rendered.find("## Persona").expect("Persona label");
         let human_pos = rendered.find("## Human").expect("Human label");
         let tasks_pos = rendered.find("## Tasks").expect("Tasks label");
         assert!(persona_pos < human_pos);
         assert!(human_pos < tasks_pos);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_blocks_are_not_rendered() {
+        let path = temp_path();
+        let mut mem = PersistentMemory::empty(&path);
+        mem.blocks_mut()[1].replace_content("human".to_string());
+        let rendered = mem.render_blocks();
+        assert!(rendered.contains("## Human\nhuman"));
+        assert!(!rendered.contains("## Persona"));
+        assert!(!rendered.contains("## Tasks"));
+        assert!(!rendered.contains("_(empty)_"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

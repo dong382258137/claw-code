@@ -1553,13 +1553,9 @@ fn get_framework_switching_section() -> String {
      and re-derive — admitting a wrong turn is rigor, not weakness.\n\
      - **Guess loop (猜测循环)**: You keep re-deriving the same uncertain point \
      in your thinking (\"wait\", \"I can't be sure\", \"need to confirm\") without \
-     converging. Stop guessing and trace the uncertainty to its source: \
-     (1) only the user knows → ask a concrete question immediately; \
-     (2) code/docs know → one precise search, and if repeated searches still \
-     don't resolve it, the answer may not be there; \
-     (3) logic can derive it → derive once and conclude; \
-     (4) no source can answer → mark as an assumption and proceed. \
-     Never use reasoning to guess a fact that only an external source can answer.\n\
+     converging. Stop guessing and trace the uncertainty to its source: use the \
+     four-class triage in `### 确定性预算` below — never reason out a fact that \
+     only an external source can answer.\n\
      \n\
      Trigger protocol:\n\
      1. State the problem definition explicitly.\n\
@@ -1719,20 +1715,6 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      **Pre-defined DAGs**: DAGs may already be registered at startup from YAML files in the workspace `.claw` dags directory. Prefer reusing an existing `dag_id` over re-defining the same graph.\n\
      \n\
-     ### Parallelism Decision Tree\n\
-     \n\
-     ```\n\
-     Can sub-tasks edit the same files?\n\
-     ├─ Yes → Use worktree mode (or serialize them)\n\
-     └─ No → Are all tasks read-only?\n\
-              ├─ Yes → Use fork mode (lightweight, fast)\n\
-              └─ No, but they touch different files → Use fork mode\n\
-     ```\n\
-     \n\
-     **Default rule**: prefer `worktree` for any multi-agent write task unless \
-     you are certain the files do not overlap. A file conflict between two \
-     fork-mode agents can cause data loss.\n\
-     \n\
      ### Model Selection Guide (模型选择指南)\n\
      \n\
      When using `spawn_parallel_subagents` or `dispatch_subagent`, you MUST \
@@ -1764,21 +1746,7 @@ fn get_multi_agent_orchestration_section() -> String {
      \n\
      **Key principle**: parallelizable simple tasks use Budget models; the \
      final synthesis/judgment step uses a Flagship model. This cuts cost by \
-     5-10x while keeping quality.\n\
-     \n\
-     ### Model Selection Decision Tree\n\
-     \n\
-     ```\n\
-     Does the task need deep reasoning (debug/design/multi-file analysis)?\n\
-     ├─ No  → Budget model  (flash)  + complexity=\"simple\"\n\
-     └─ Yes → Flagship model (pro)\n\
-              ├─ Root-cause / debugging?        → complexity=\"diagnostic\"\n\
-              └─ Design / refactor / planning?  → complexity=\"architectural\"\n\
-     ```\n\
-     \n\
-     **Default when unsure**: use the user's current main model (it is always \
-     Flagship-tier) rather than guessing. Prefer Budget only when the task is \
-     clearly read-only or single-file **and** its scope is bounded."
+     5-10x while keeping quality."
         .to_string()
 }
 
@@ -1991,6 +1959,74 @@ fn get_tool_usage_guidance_section() -> String {
      protocol, no second rulebook). A single probe takes ~1-3s; a guess\n\
      loop costs 10-30s of tokens and is often wrong."
         .to_string()
+}
+
+/// 按**本次请求实际发送的工具集**重渲染 Tool Usage Guidance。
+///
+/// 建 prompt 时仍注入全量文本（不经过请求工具集的调用方——测试、IM 桥、
+/// 子智能体——行为保持不变）；请求组装阶段用本函数按真实 `tools` 数组重渲染：
+/// - 对应工具在本次工具集中：该段原样保留（取自同一段原文切片，逐字节一致）；
+/// - 不在：该段整段不注入（0 字节）。
+///
+/// 判定依据是调用方传入的实际工具名，不是写死的工具清单，因此渐进式加载
+/// 激活/停用工具时，指引会随请求同步变化。
+pub fn retune_tool_usage_guidance(split: &mut SystemPromptSplit, tool_names: &[&str]) {
+    let has = |name: &str| {
+        tool_names
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    };
+    let has_task_tool = [
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskOutput",
+        "TaskGet",
+        "TaskStop",
+    ]
+    .iter()
+    .any(|name| has(name));
+    let keep = |heading: &str| {
+        if heading.starts_with("代码编辑后 LSP 诊断") {
+            return has("LSP");
+        }
+        if heading.starts_with("任务生命周期") || heading.starts_with("任务 ID 来源") {
+            return has_task_tool;
+        }
+        if heading.starts_with("replace_lines 行号漂移护栏") {
+            return has("replace_lines");
+        }
+        if heading.starts_with("复杂任务规划(create_plan)") || heading.starts_with("规划机制分水岭")
+        {
+            return has("create_plan");
+        }
+        true
+    };
+
+    if let Some(section) = split
+        .static_sections
+        .iter_mut()
+        .find(|section| section.contains("## Tool Usage Guidance"))
+    {
+        // 该段可能带静态前缀(build_split 的占位符就地指针行)，保留前缀不动。
+        if let Some(heading_at) = section.find("## Tool Usage Guidance") {
+            let rendered = {
+                let prefix = &section[..heading_at];
+                let guidance = &section[heading_at..];
+                let mut pieces = guidance.split("\n\n### ");
+                let mut rendered = String::with_capacity(section.len());
+                rendered.push_str(prefix);
+                rendered.push_str(pieces.next().unwrap_or_default());
+                for piece in pieces {
+                    if keep(piece) {
+                        rendered.push_str("\n\n### ");
+                        rendered.push_str(piece);
+                    }
+                }
+                rendered
+            };
+            *section = rendered;
+        }
+    }
 }
 /// session even as new entries are written to disk.
 fn render_persistent_memory_section(memory: &PersistentMemory) -> String {
@@ -4040,4 +4076,71 @@ fn sensitive_key_detection() {
     assert!(!is_sensitive_config_key("model"));
     assert!(!is_sensitive_config_key("defaultMode"));
     assert!(!is_sensitive_config_key("permissions"));
+}
+
+/// 条件注入验收:工具全部在本次请求工具集里时,渲染结果与原文逐字节一致。
+#[test]
+fn retune_tool_guidance_keeps_full_text_when_all_tools_present() {
+    let full = get_tool_usage_guidance_section();
+    let mut split = SystemPromptSplit {
+        static_sections: vec![full.clone()],
+        dynamic_sections: Vec::new(),
+    };
+    retune_tool_usage_guidance(
+        &mut split,
+        &["LSP", "TaskCreate", "replace_lines", "create_plan"],
+    );
+    assert_eq!(split.static_sections[0], full);
+}
+
+/// 条件注入验收:对应工具不在本次请求工具集里时,该段字节数为 0。
+#[test]
+fn retune_tool_guidance_drops_latent_sections_when_tools_absent() {
+    let full = get_tool_usage_guidance_section();
+    let mut split = SystemPromptSplit {
+        static_sections: vec![full.clone()],
+        dynamic_sections: Vec::new(),
+    };
+    retune_tool_usage_guidance(&mut split, &["bash", "read_file", "grep_search"]);
+    let rendered = &split.static_sections[0];
+    for heading in [
+        "### 代码编辑后 LSP 诊断",
+        "### 任务生命周期",
+        "### 任务 ID 来源",
+        "### replace_lines 行号漂移护栏",
+        "### 复杂任务规划(create_plan)",
+        "### 规划机制分水岭",
+    ] {
+        assert!(!rendered.contains(heading), "不应出现: {heading}");
+    }
+    // 四段(含前置 "\n\n### " 分隔符)合计恰为 3,228 字符。
+    let removed = full.chars().count() - rendered.chars().count();
+    assert_eq!(removed, 3_228, "removed={removed}");
+    // 非条件段仍在。
+    assert!(rendered.contains("### Web 搜索优先"));
+    assert!(rendered.contains("### 确定性预算"));
+}
+
+/// 该段实际会被 build_split 前置占位符指针行；重渲染必须保留前缀。
+#[test]
+fn retune_tool_guidance_preserves_placeholder_prefix() {
+    let full = get_tool_usage_guidance_section();
+    let prefixed = format!("{PLACEHOLDER_POINTER_MARKER}\n{full}");
+    let mut split = SystemPromptSplit {
+        static_sections: vec![prefixed.clone()],
+        dynamic_sections: Vec::new(),
+    };
+    retune_tool_usage_guidance(
+        &mut split,
+        &["LSP", "TaskCreate", "replace_lines", "create_plan"],
+    );
+    assert_eq!(split.static_sections[0], prefixed);
+
+    let mut split = SystemPromptSplit {
+        static_sections: vec![prefixed],
+        dynamic_sections: Vec::new(),
+    };
+    retune_tool_usage_guidance(&mut split, &["bash"]);
+    assert!(split.static_sections[0].starts_with(PLACEHOLDER_POINTER_MARKER));
+    assert!(!split.static_sections[0].contains("### 代码编辑后 LSP 诊断"));
 }

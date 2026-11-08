@@ -2003,12 +2003,6 @@ pub struct ConversationRuntime<C, T> {
     /// 注入 "Previous Session Digest" 槽位后由请求构造清空(一次性消费)。
     /// 无 digest 文件时为 None(不注入)。零 LLM;读失败静默降级。
     pending_session_digest: Option<String>,
-    /// 双大脑 · 执行脑自写总结提示(试点):turn 首轮请求注入一次。
-    ///
-    /// 引导执行脑在**最终答复**末尾输出 [`SESSION_SUMMARY`](crate::management_brain::SESSION_SUMMARY_MARKER)
-    /// 标记总结;digest 写侧解析后落盘"会话总结"段。渲染后由请求构造清空
-    /// (一次性消费;后续迭代不再注入,避免工具循环重复提示)。
-    pending_summary_prompt: bool,
     /// Q4(2026-10-13):热升级债务标志 —— 本会话是否改过 claw 自身源码。
     ///
     /// 根因(defect class):`maybe_hot_upgrade_note` 是**无状态**的每条
@@ -2573,7 +2567,6 @@ where
             pending_cog_stall: None,
             pending_failure_advice: None,
             pending_session_digest: None,
-            pending_summary_prompt: true,
             own_source_dirty: false,
             decision_log: None,
             detection_strategy: crate::decision_log::DetectionStrategy::Heuristic,
@@ -3814,10 +3807,6 @@ where
         self.hook_runner
             .spawn_lifecycle_event(HookEvent::SessionStart, self.session.session_id.clone());
 
-        // 执行脑自写总结提示(试点):每个 turn 开头重置 flag,使 turn 首轮
-        // 请求注入 [SESSION_SUMMARY] 引导(见 render_runtime_hints 槽位 7d)。
-        self.pending_summary_prompt = true;
-
         // 双大脑架构(批次 3):新会话首 turn 读取上一会话 digest 注入。
         // 本会话首条消息触发前(即本 turn 开头)读取最近一份管理脑 digest,
         // 存入 pending_session_digest;render_runtime_hints 注入
@@ -4582,7 +4571,6 @@ where
                 self.pending_cog_stall = None;
                 self.pending_failure_advice = None;
                 self.pending_session_digest = None;
-                self.pending_summary_prompt = false;
                 ApiRequest {
                     system_prompt: system_split,
                     messages,
@@ -6191,12 +6179,7 @@ where
             // 去重:同工具同签名只留一条(避免 digest 刷屏)。
             failures.sort();
             failures.dedup();
-            // 2. 用量成本行。
-            let usage_lines = self
-                .usage_tracker
-                .cumulative_usage()
-                .summary_lines("session-total");
-            // 3. 执行脑自写总结段(试点):解析本 turn 最终答复中的 [SESSION_SUMMARY]。
+            // 2. 执行脑自写总结段(试点):解析本 turn 最终答复中的 [SESSION_SUMMARY]。
             let mut extra_sections: Vec<(&str, String)> = Vec::new();
             let mut exec_summary: Option<String> = None;
             if let Some(final_text) = self.last_assistant_text() {
@@ -6230,11 +6213,10 @@ where
                     let _ = nb.save(&workspace_root);
                 }
             }
-            // 4. 渲染 + 落盘。
+            // 3. 渲染 + 落盘。
             let digest = crate::management_brain::render_digest(
                 &self.session.session_id,
                 &failures,
-                &usage_lines,
                 &extra_sections,
             );
             let _ = crate::management_brain::write_digest(
@@ -7400,21 +7382,10 @@ where
 
         // 槽位 7c:双大脑上一会话 digest(批次 3)——新会话首 turn 感知遗留。
         // run_turn_async 开头读取最近一份管理脑 digest 存入 pending_session_digest;
-        // 此处注入让执行脑感知上一会话的失败模式与用量参考(架构守护的跨会话面)。
+        // 此处注入让执行脑感知上一会话的失败模式(架构守护的跨会话面)。
         // 读取后由请求构造清空(一次性消费;同会话后续 turn 不再注入)。
         if let Some(digest) = &self.pending_session_digest {
             slots.push(("Previous Session Digest", digest.clone()));
-        }
-
-        // 槽位 7d:执行脑自写总结提示(试点)——turn 首轮请求注入一次。
-        // 引导执行脑在最终答复末尾输出 [SESSION_SUMMARY] 标记总结(用完整上下文
-        // 而非独立提炼通道);digest 写侧解析后落盘"会话总结"段。渲染后由请求
-        // 构造清空 flag,工具循环的后续迭代不再重复注入。
-        if self.pending_summary_prompt {
-            slots.push((
-                "Session Summary Prompt",
-                crate::management_brain::SESSION_SUMMARY_PROMPT.to_string(),
-            ));
         }
 
         // 槽位 8:压缩后 NOTEBOOK 刷新提醒(flag 由 execute_notebook_update 清除)。

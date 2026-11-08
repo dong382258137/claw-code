@@ -75,13 +75,12 @@ pub type ToolFailure = (String, String);
 
 /// 会话收尾聚合文本(纯函数,便于单测)。
 ///
-/// 输入本会话的失败记录、用量成本行与附加段(执行脑总结等),
-/// 输出一份紧凑的 Markdown digest。失败为空时省略失败段(不产生噪音);
-/// 附加段内容为空时同样省略。
+/// 输入本会话的失败记录与附加段(执行脑总结等),输出一份紧凑的 Markdown
+/// digest。失败为空时省略失败段(不产生噪音);附加段内容为空时同样省略。
+/// 成本注记只进面板/diag,永不写入模型上下文。
 pub fn render_digest(
     session_id: &str,
     failures: &[ToolFailure],
-    usage_summary: &[String],
     extra_sections: &[(&str, String)],
 ) -> String {
     let mut out = String::with_capacity(1024);
@@ -104,14 +103,6 @@ pub fn render_digest(
         }
     } else {
         out.push_str("\n## 失败模式\n- (本会话无工具失败)\n");
-    }
-
-    if !usage_summary.is_empty() {
-        out.push_str("\n## 用量与成本\n");
-        for line in usage_summary {
-            out.push_str(line);
-            out.push('\n');
-        }
     }
 
     // 附加段(会话结论 / LLM 提炼等):按出现顺序渲染,空内容跳过。
@@ -138,10 +129,9 @@ pub const MAX_DIGEST_FILES: usize = 50;
 
 /// 判断一份 digest 是否含**实质交接内容**。
 ///
-/// 背景:实测最新一份 digest 全文只有「失败模式:本会话无工具失败」+
-/// 「用量与成本」两段 —— 新会话首 turn 花一个槽位读到的是上一会话的账单,
-/// 而非交接。若最新一份是这种空转 digest 而更早有一份真交接,按 mtime
-/// 取最新会让**空转覆盖有效交接**。
+/// 背景:一份 digest 若全文只有「失败模式:本会话无工具失败」,新会话首 turn
+/// 花一个槽位读到的是空转内容,而非交接。若最新一份是这种空转 digest 而
+/// 更早有一份真交接,按 mtime 取最新会让**空转覆盖有效交接**。
 ///
 /// 判定(保守:不确定为实质,宁可注入也不静默丢信息):
 /// - 符合本模块 [`render_digest`] 输出格式(含 `## 失败模式`):有真实失败
@@ -285,7 +275,6 @@ mod tests {
                 ("bash".to_string(), "command not found".to_string()),
             ],
             &[],
-            &[],
         );
         assert!(text.contains("Session Digest"), "text: {text}");
         assert!(text.contains("**edit_file** × 2"), "text: {text}");
@@ -295,27 +284,21 @@ mod tests {
 
     #[test]
     fn render_digest_omits_failures_when_empty() {
-        let text = render_digest("sess-2", &[], &[], &[]);
+        let text = render_digest("sess-2", &[], &[]);
         assert!(text.contains("无工具失败"), "text: {text}");
     }
 
     #[test]
-    fn render_digest_includes_usage_lines() {
-        let text = render_digest(
-            "sess-3",
-            &[],
-            &["session-total: total_tokens=100 input=80 output=20".to_string()],
-            &[],
-        );
-        assert!(text.contains("用量与成本"), "text: {text}");
-        assert!(text.contains("total_tokens=100"), "text: {text}");
+    fn render_digest_omits_usage_lines() {
+        let text = render_digest("sess-3", &[], &[]);
+        assert!(!text.contains("用量与成本"), "text: {text}");
+        assert!(!text.contains("total_tokens="), "text: {text}");
     }
 
     #[test]
     fn render_digest_includes_extra_sections_in_order() {
         let text = render_digest(
             "sess-4",
-            &[],
             &[],
             &[
                 ("会话目标与结论(规则提取)", "目标: 修 bug".to_string()),
@@ -377,19 +360,18 @@ mod tests {
 
     #[test]
     fn latest_digest_skips_substantive_less_recent_in_favor_of_real_handoff() {
-        // 病灶:最新一份 digest 只有「无工具失败 + 用量账单」,新会话首 turn
-        // 花槽位读到的是账单而非交接。修复后应回退到更早的实质 digest。
+        // 病灶:最新一份 digest 只有「无工具失败」,新会话首 turn
+        // 花槽位读到的是空转内容而非交接。修复后应回退到更早的实质 digest。
         let dir = tempfile::tempdir().unwrap();
         let substantive = render_digest(
             "real-handoff",
             &[("bash".to_string(), "command failed".to_string())],
             &[],
-            &[],
         );
         write_digest(dir.path(), "real-handoff", &substantive).expect("write real");
         std::thread::sleep(std::time::Duration::from_millis(20));
         // 更新的一份:无失败、无总结 ⇒ 空转。
-        let hollow = render_digest("hollow-newer", &[], &["total=1".to_string()], &[]);
+        let hollow = render_digest("hollow-newer", &[], &[]);
         write_digest(dir.path(), "hollow-newer", &hollow).expect("write hollow");
 
         let got = latest_digest_text(dir.path(), None).expect("should fall back to real");
@@ -403,7 +385,7 @@ mod tests {
     fn latest_digest_none_when_all_are_hollow() {
         // 全为空转时不注入:否则会误导模型「上一会话什么都没做」。
         let dir = tempfile::tempdir().unwrap();
-        let hollow = render_digest("only-hollow", &[], &["total=1".to_string()], &[]);
+        let hollow = render_digest("only-hollow", &[], &[]);
         write_digest(dir.path(), "only-hollow", &hollow).expect("write");
         assert!(
             latest_digest_text(dir.path(), None).is_none(),
@@ -417,23 +399,16 @@ mod tests {
         assert!(digest_is_substantive(&render_digest(
             "s1",
             &[("bash".to_string(), "boom".to_string())],
-            &[],
             &[]
         )));
         // 只有会话总结 ⇒ 实质。
         assert!(digest_is_substantive(&render_digest(
             "s2",
             &[],
-            &[],
             &[("会话总结(执行脑)", "- 目标: 修 X".to_string())]
         )));
         // 无失败无总结 ⇒ 空转。
-        assert!(!digest_is_substantive(&render_digest(
-            "s3",
-            &[],
-            &["total=1".to_string()],
-            &[]
-        )));
+        assert!(!digest_is_substantive(&render_digest("s3", &[], &[])));
         // 非本模块格式(手写)⇒ 保守放行。
         assert!(digest_is_substantive("手写交接: 明天继续"));
     }

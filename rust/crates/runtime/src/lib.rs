@@ -306,9 +306,9 @@ pub use policy_engine::{
 };
 pub use prompt::{
     load_system_prompt, load_system_prompt_with_extras, prepend_bullets,
-    render_mcp_catalog_section, ContextFile, ModelFamilyIdentity, ProjectContext, PromptBuildError,
-    PromptLayers, SectionTier, SystemPromptBuilder, SystemPromptExtras, SystemPromptSplit,
-    FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    render_mcp_catalog_section, retune_tool_usage_guidance, ContextFile, ModelFamilyIdentity,
+    ProjectContext, PromptBuildError, PromptLayers, SectionTier, SystemPromptBuilder,
+    SystemPromptExtras, SystemPromptSplit, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_orchestrator::{RecoveryOrchestrator, RecoveryOutcome};
 pub use recovery_recipes::{
@@ -490,4 +490,10 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[allow(dead_code)]
+fn claw_lsp_probe() -> i32 {
+    let value: i32 = "not an int";
+    value
 }
