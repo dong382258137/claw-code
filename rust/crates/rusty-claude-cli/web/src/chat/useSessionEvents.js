@@ -1,0 +1,144 @@
+import { useEffect } from 'react'
+import { api, withToken } from '../api'
+
+// 会话事件订阅：唯一一条 /api/session/:id/events EventSource。
+// 快照不再轮询 /stream —— 连接建立（含重连）、收到 done、收到 reset 时，
+// 主动通过 GET /api/session/:id 拉取一次完整快照做状态对齐，其余时间只吃增量。
+export function useSessionEvents({
+  currentId,
+  push,
+  setCurrent,
+  setMessages,
+  setLive,
+  setLiveThinking,
+  setLiveTools,
+  setOptimistic,
+  setRunning,
+  setApprovals,
+  setUpgrading,
+  setLoadingSession,
+  setConnected,
+  setPendingDraft,
+  lastPromptRef,
+  runningRef,
+  sendRef,
+}) {
+  useEffect(() => {
+    if (!currentId) return undefined
+    let closed = false
+    // 无会话时输入会自动新建会话并立刻发消息：这条待发消息带着目标 sessionId，
+    // 不能因为 currentId 刚切换到它就被清掉，否则用户刚打的字会闪一下消失。
+    setOptimistic((pending) => (pending && pending.sessionId === currentId ? pending : null))
+    setLive('')
+    setMessages([])
+    setLoadingSession(true)
+
+    // 与旧 /stream snapshot 完全一致的落地方式，保证终态渲染行为不变。
+    const applySnapshot = (view) => {
+      if (closed || !view) return
+      setCurrent((current) => ({ ...view, title: current?.title || view.id }))
+      setMessages(view.messages || [])
+      setLoadingSession(false)
+      const last = view.messages?.[view.messages.length - 1]
+      if (last && last.role === 'assistant') { setLive(''); setLiveThinking(''); setLiveTools([]) }
+      setOptimistic((pending) => {
+        if (!pending) return null
+        return last && last.role === 'user' ? null : pending
+      })
+    }
+
+    const loadSnapshot = () => api(`/api/session/${encodeURIComponent(currentId)}`)
+      .then((view) => applySnapshot(view))
+      .catch(() => {})
+
+    // 首次加载：失败要提示用户，这是「会话打不开」而不是「重连抖动」。
+    api(`/api/session/${encodeURIComponent(currentId)}`)
+      .then((view) => { if (!closed) { setCurrent((current) => ({ ...view, title: current?.title || view.id })); setMessages(view.messages || []); setLoadingSession(false) } })
+      .catch((error) => { setLoadingSession(false); push(`读取会话失败：${error.message}`, 'error') })
+
+    // 服务端可能已经退出或重启（token 随之更换）：断线时对账一次真实 running
+    // 状态，别让 UI 永远停在“运行中”。
+    let lastReconcile = 0
+    const reconcile = () => {
+      if (closed) return
+      const now = Date.now()
+      if (now - lastReconcile < 5000) return
+      lastReconcile = now
+      api(`/api/session/${encodeURIComponent(currentId)}/status`)
+        .then((status) => {
+          if (status?.running) return
+          setRunning(false)
+          setLive('')
+          setLiveThinking('')
+          setLiveTools([])
+          setOptimistic(null)
+        })
+        .catch(() => {
+          setRunning(false)
+          push('与本地服务断开：服务可能已重启（token 已更换），请用新打开的页面继续。', 'error')
+        })
+    }
+
+    const events = new EventSource(withToken(`/api/session/${encodeURIComponent(currentId)}/events`))
+    let openedOnce = false
+    events.onopen = () => {
+      setConnected(true)
+      // 重连后先拿完整快照，补齐断线期间漏掉的终态；首次连接由上面的初始 GET 负责，
+      // 避免同一时刻重复请求。
+      if (openedOnce) loadSnapshot()
+      openedOnce = true
+    }
+    events.addEventListener('stream', (event) => {
+      if (closed) return
+      try {
+        const data = JSON.parse(event.data)
+        if (data.kind === 'delta') setLive((previous) => previous + data.text)
+        else if (data.kind === 'start') setRunning(true)
+        else if (data.kind === 'thinking') setLiveThinking((previous) => (data.done && data.text ? data.text : previous + (data.done ? '' : data.text)))
+        else if (data.kind === 'approval_request') setApprovals((list) => (list.some((item) => item.id === data.id) ? list : [...list, data]))
+        else if (data.kind === 'tool_use') setLiveTools((list) => [...list, { id: data.id, name: data.name, input: data.input, output: '', done: false, is_error: false }])
+        else if (data.kind === 'tool_result') {
+          setLiveTools((list) => {
+            // runtime 的 ToolResult 事件可能不带 id：退化为匹配最近的同名未完成工具。
+            let index = data.id ? list.findIndex((tool) => tool.id === data.id) : -1
+            if (index === -1) {
+              for (let i = list.length - 1; i >= 0; i -= 1) {
+                if (!list[i].done && list[i].name === data.name) { index = i; break }
+              }
+            }
+            if (index === -1) return [...list, { id: data.id || `${data.name}-${Date.now()}`, name: data.name, input: '', output: data.output, done: true, is_error: data.is_error }]
+            const next = list.slice()
+            next[index] = { ...next[index], output: data.output, done: true, is_error: data.is_error }
+            return next
+          })
+        }
+        else if (data.kind === 'done') {
+          setRunning(false)
+          // 终态落地：turn 结束时 Rust 侧已把完整消息写盘，拉一次快照把
+          // 流式内容替换成持久化消息（等价旧 /stream 的终态 snapshot）。
+          loadSnapshot()
+        }
+        else if (data.kind === 'reset') { loadSnapshot() }
+        else if (data.kind === 'upgrading') { setUpgrading(data.message || '正在热升级：重建并重启 Web 服务…'); setRunning(false) }
+        else if (data.kind === 'error') {
+          // 可恢复错误（传输层已做退避重试、runtime 还可能再恢复一次）不清屏：
+          // 清空已流式内容会让用户误以为整轮作废，而且恢复成功后内容会从空开始。
+          if (!data.recoverable) {
+            setLive(''); setLiveThinking(''); setLiveTools([])
+            // 原文回填输入框，用户可直接重发或修改后重发。
+            if (lastPromptRef.current) setPendingDraft(lastPromptRef.current)
+          }
+          const retryText = lastPromptRef.current
+          push(`流式错误${data.recoverable ? '（可重试）' : ''}：${data.message}`, 'error',
+            retryText ? {
+              label: '重试',
+              // 可恢复错误时本轮可能还在跑，重试会撞会话锁；等 done 后再允许。
+              run: () => { if (!runningRef.current) sendRef.current?.(retryText, currentId) },
+            } : null)
+        }
+      } catch (_) {}
+    })
+    events.onerror = () => { setConnected(false); reconcile() }
+    return () => { closed = true; events.close() }
+  }, [currentId, push])
+}
