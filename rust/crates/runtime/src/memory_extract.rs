@@ -402,6 +402,7 @@ impl MemoryWorker {
             state_dir: state_dir.clone(),
             pending_path: pending_path.clone(),
             shadow_path: shadow_path.clone(),
+            taxonomy: Arc::new(crate::memory_taxonomy::MemoryTaxonomy::load(&state_dir)),
         };
         let _ = std::thread::Builder::new()
             .name("claw-memory-extractor".to_string())
@@ -497,6 +498,7 @@ struct WorkerHandles {
     state_dir: PathBuf,
     pending_path: PathBuf,
     shadow_path: PathBuf,
+    taxonomy: Arc<crate::memory_taxonomy::MemoryTaxonomy>,
 }
 
 fn worker_loop(rx: Receiver<WorkerMsg>, handles: WorkerHandles) {
@@ -573,7 +575,7 @@ fn flush_window(
     let Some(client) = GLOBAL_EXTRACTOR.get().and_then(|slot| slot.as_ref()) else {
         return;
     };
-    let prompt = build_extraction_prompt(&window, urgent);
+    let prompt = build_extraction_prompt(&window, urgent, &handles.taxonomy);
     let Some(ops) = extract_with_retry(client.as_ref(), &prompt) else {
         handles.dropped.fetch_add(1, Ordering::Relaxed);
         return;
@@ -581,7 +583,12 @@ fn flush_window(
 
     let mut accepted: Vec<MemoryOp> = Vec::new();
     for op in ops {
-        let Some(op) = op.sanitize() else { continue };
+        let Some(mut op) = op.sanitize() else {
+            continue;
+        };
+        // 受控词表：subject 必须落到枚举，attribute 收敛到同义名。
+        // 必须在二现门槛之前做，否则同一事实的不同写法会各占一个候选键。
+        handles.taxonomy.normalize_op(&mut op);
         match gate_op(op, candidates) {
             Gate::Pass(op) => accepted.push(op),
             Gate::Pending => {}
@@ -784,7 +791,11 @@ fn strip_code_fence(raw: &str) -> String {
 }
 
 /// 提取器 prompt（附录 B 的收敛实现）。
-fn build_extraction_prompt(window: &[TurnEvidence], urgent: bool) -> String {
+fn build_extraction_prompt(
+    window: &[TurnEvidence],
+    urgent: bool,
+    taxonomy: &crate::memory_taxonomy::MemoryTaxonomy,
+) -> String {
     let mut evidence = String::new();
     for ev in window {
         evidence.push_str(&format!(
@@ -802,12 +813,19 @@ fn build_extraction_prompt(window: &[TurnEvidence], urgent: bool) -> String {
          3) 踩坑根因：失败原因非显然且可复用；\n\
          4) 长期约束：截止、环境、政策、依赖限制。\n\
          \n\
-         禁止写入：任务临时状态、一次性指令、可从代码直接读出的事实、密钥/隐私原文。\n\
+         禁止写入：任务临时状态、一次性指令（只对当前这一次操作有效，例如「这次不要合成一个 commit」\
+         「这一步必须用 bash 读完整日志」「每一步都要先调用工具」「期间我不在电脑前，先按此执行」）、\
+         对助手的提问、尚未采纳的方案设想、可从代码直接读出的事实、密钥/隐私原文。\n\
          每条 op 必须给出 basis：\n\
          - user_stated：用户第一人称自述稳定属性（我喜欢/我讨厌/我通常/我做某类工作）；\n\
          - inferred：从行为或失败模式推测；\n\
-         - constraint：不要动某目录 / 必须用某工具 / 环境或政策限制。\n\
+         - constraint：跨任务持续有效的环境 / 政策 / 依赖限制（不要动某目录、团队禁用某工具、\
+         必须遵守的发布流程）；本轮某一步的工具选择或操作要求不算。\n\
          若用户以显式祈使要求记住（记住/以后都/不要再/记错了），explicit=true。\n\
+         **一条事实只输出一条 op**：不要把同一件事拆成版本 / 端口 / 引擎等多条；\
+         content 必须能独立读懂（带主体和值，例如「主数据库用 PostgreSQL 16，端口 5432」）。\n\
+         \n\
+         {catalog}\
          \n\
          输出严格 JSON：{{\"ops\":[{{\"op\":\"upsert|retract\",\"kind\":\"user_profile|lesson|fact\",\
          \"subject\":\"...\",\"attribute\":\"...\",\"content\":\"<=200字\",\
@@ -823,7 +841,8 @@ fn build_extraction_prompt(window: &[TurnEvidence], urgent: bool) -> String {
             "提示：用户可能正在陈述稳定偏好或约束。\n\n"
         } else {
             ""
-        }
+        },
+        catalog = taxonomy.prompt_block(),
     )
 }
 

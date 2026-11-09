@@ -60,6 +60,8 @@ pub mod mcp_tool_bridge;
 pub mod memory;
 pub mod memory_extract;
 pub mod memory_store;
+// 受控 subject / attribute 词表：收敛提取器自由生成的类目，防长程漂移。
+pub mod memory_taxonomy;
 // Harness C(上下文管理)层:Memory 语义检索(L1/L2/L3 三级层级 + keyword fallback)。
 // 详见 docs/harness-engineering-optimization-plan.md Step 2.4。
 pub mod memory_semantic;

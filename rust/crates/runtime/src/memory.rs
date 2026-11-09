@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory_extract::{Basis, Confidence, EntryKind, MemoryOp, OpKind};
 use crate::memory_semantic::SemanticRecaller;
 use crate::memory_store::MemoryStore;
+use crate::memory_taxonomy::{classify_subject, MemoryTaxonomy};
 
 /// Seven days expressed in milliseconds — entries whose `last_verified_at` is
 /// older than this threshold are rendered with an `[unverified]` marker.
@@ -37,6 +38,11 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// `memory.json` 所在目录（词表 / 候选 / journal 都放在这里）。
+fn state_dir_for(file_path: &Path) -> &Path {
+    file_path.parent().unwrap_or_else(|| Path::new("."))
 }
 
 /// 180 天未被召回 / 验证的活跃条目降级归档（R4）。
@@ -228,6 +234,17 @@ pub struct MemoryEntry {
     /// 最后一次被召回命中的时间（ms），供 180 天降级判定。
     #[serde(default)]
     pub last_recalled_at: Option<i64>,
+    /// 词表迁移时无法映射的 subject 被标为孤儿（保留原值供人工审阅）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub orphan: bool,
+    /// 孤儿条目的原始 subject 文本（迁移前），仅用于审阅。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_subject: Option<String>,
+}
+
+/// `skip_serializing_if` helper：`false` 不落盘，保持 `memory.json` 干净。
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl MemoryEntry {
@@ -248,6 +265,8 @@ impl MemoryEntry {
             basis: Basis::Inferred,
             evidence_count: 1,
             last_recalled_at: None,
+            orphan: false,
+            legacy_subject: None,
         }
     }
 
@@ -344,6 +363,10 @@ pub struct PersistentMemory {
     /// 保证永不写入 `memory.json`（重启即消失）。
     #[serde(skip)]
     shadow_entries: Vec<MemoryEntry>,
+    /// 受控 subject/attribute 词表（由 `<memory.json 所在目录>` 配置加载，
+    /// 不随 `memory.json` 序列化）。
+    #[serde(skip)]
+    taxonomy: MemoryTaxonomy,
 }
 
 /// Maximum number of archived (superseded / expired) entries to retain
@@ -372,16 +395,19 @@ impl PersistentMemory {
     /// prompt-cache prefix stability guarantee (B4).
     #[must_use]
     pub fn empty(file_path: impl Into<PathBuf>) -> Self {
+        let file_path = file_path.into();
+        let taxonomy = MemoryTaxonomy::load(state_dir_for(&file_path));
         let mut memory = Self {
             blocks: default_blocks(),
             entries: Vec::new(),
             archive: Vec::new(),
             retracted_subjects: Vec::new(),
             blocks_migrated: false,
-            file_path: file_path.into(),
+            file_path,
             frozen_snapshot: None,
             semantic: SemanticRecaller::new(),
             shadow_entries: Vec::new(),
+            taxonomy,
         };
         memory.frozen_snapshot = Some(memory.render_current());
         memory
@@ -407,6 +433,10 @@ impl PersistentMemory {
             // overwrite the bad file.
             Err(_) => Self::empty(file_path),
         };
+        // 词表加载 + 旧数据迁移：自由文本 subject 映射到枚举，映射不了的标孤儿。
+        // 孤儿通过 `/memory` 面板展示（见 orphan_entries），这里不重复刷日志。
+        memory.taxonomy = MemoryTaxonomy::load(state_dir_for(file_path));
+        let _ = memory.migrate_taxonomy();
         // R5:旧 Persona/Human/Tasks 块一次性迁移到 entries，之后 block 写入冻结。
         memory.migrate_blocks_once();
         // 崩溃回放：apply 只写内存 + 追加日志，全量快照在边界落盘后才清空日志。
@@ -458,6 +488,63 @@ impl PersistentMemory {
     fn with_file_path(mut self, path: PathBuf) -> Self {
         self.file_path = path;
         self
+    }
+
+    /// 把既有条目的自由文本 subject 迁移到受控词表。
+    ///
+    /// 能映射的改成规范 subject / attribute；映射不了的把原值保留到
+    /// `legacy_subject` 并标 `orphan = true`，不静默当正常条目继续使用。
+    /// 返回被标记为孤儿的条目数（活跃 + 归档）。
+    fn migrate_taxonomy(&mut self) -> usize {
+        let taxonomy = self.taxonomy.clone();
+        let mut orphans = 0usize;
+        for entry in self.entries.iter_mut().chain(self.archive.iter_mut()) {
+            let Some(original) = entry.subject.clone() else {
+                continue;
+            };
+            // 孤儿条目优先用迁移前原文重新解析：用户以后补词表类目时可自动归位。
+            let raw = if entry.orphan {
+                entry.legacy_subject.clone().unwrap_or(original)
+            } else {
+                original
+            };
+            let (subject, is_orphan) =
+                classify_subject(&taxonomy, Some(&raw), entry.attribute.as_deref());
+            if let Some(subject) = subject.as_deref() {
+                entry.attribute = taxonomy.normalize_attribute(subject, entry.attribute.as_deref());
+            }
+            entry.subject = subject;
+            if is_orphan {
+                // 只在首次标记时计数，避免每轮 load 重复刷日志。
+                if !entry.orphan {
+                    orphans += 1;
+                }
+                entry.orphan = true;
+                if entry.legacy_subject.is_none() {
+                    entry.legacy_subject = Some(raw);
+                }
+            } else {
+                // 词表补了类目后可以自动归位，不再算孤儿。
+                entry.orphan = false;
+            }
+        }
+        orphans
+    }
+
+    /// 孤儿条目（subject 不在词表，需人工审阅；`/memory` 会给出计数）。
+    #[must_use]
+    pub fn orphan_entries(&self) -> Vec<&MemoryEntry> {
+        self.entries
+            .iter()
+            .chain(self.archive.iter())
+            .filter(|entry| entry.orphan)
+            .collect()
+    }
+
+    /// 当前生效的 subject 词表（诊断 / 测试用）。
+    #[must_use]
+    pub fn taxonomy(&self) -> &MemoryTaxonomy {
+        &self.taxonomy
     }
 
     /// Borrow the three typed blocks.
@@ -957,6 +1044,11 @@ impl PersistentMemory {
         let now = now_ms();
         let mut report = ApplyReport::default();
         for op in ops {
+            // 写入前统一归一化：worker、journal 回放、工具路径都走这里，
+            // 保证 (subject, attribute) 在入库前已经落到受控词表。
+            let mut op = op.clone();
+            self.taxonomy.normalize_op(&mut op);
+            let op = &op;
             if op.shadow {
                 if self.apply_shadow_op(op, now, &mut report) {
                     report.applied += 1;
@@ -2148,6 +2240,80 @@ mod phase1_tests {
             .collect();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].content, "缩进用 spaces");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn free_text_subjects_collapse_and_old_value_is_auditable() {
+        let path = temp_path("taxonomy-collapse");
+        let mut memory = PersistentMemory::empty(&path);
+        let cases = [
+            ("主数据库", "主数据库", "我们用 PostgreSQL 16 作为主数据库"),
+            ("项目数据库", "用哪个", "主数据库是 PostgreSQL 16"),
+            ("项目技术栈", "技术栈选了", "技术栈里的数据库是 MySQL 8.0"),
+            ("project", "主数据库", "主数据库换成 MySQL 8.0"),
+            ("数据库", "primary", "最终主数据库是 PostgreSQL 16"),
+        ];
+        for (subject, attribute, content) in cases {
+            let mut op = upsert(content);
+            op.subject = Some(subject.to_string());
+            op.attribute = Some(attribute.to_string());
+            memory.apply_ops(std::slice::from_ref(&op), ACTIVE_MAX_ENTRIES);
+        }
+
+        let active = memory.active_entries(now_ms());
+        assert_eq!(active.len(), 1, "同一事实漂移后只能剩 1 条活跃: {active:?}");
+        assert!(active[0].content.contains("PostgreSQL"));
+        assert_eq!(active[0].subject.as_deref(), Some("database"));
+        assert_eq!(active[0].attribute.as_deref(), Some("primary"));
+
+        // MySQL 旧值必须仍可查（supersede，不是删除）。
+        let mysql = memory
+            .entries()
+            .iter()
+            .chain(memory.archive().iter())
+            .find(|entry| entry.content.contains("MySQL"))
+            .expect("MySQL 旧值应保留为失效记录");
+        assert!(mysql.superseded_by.is_some());
+        assert!(mysql.valid_until.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_free_text_subject_migrates_or_is_flagged_orphan() {
+        let path = temp_path("taxonomy-migrate");
+        let mut memory = PersistentMemory::empty(&path);
+        memory.add_entry("主数据库是 PostgreSQL", "test");
+        if let Some(entry) = memory.entries.first_mut() {
+            entry.subject = Some("项目数据库".to_string());
+            entry.attribute = Some("主数据库".to_string());
+        }
+        memory.add_entry("某个未归类事实", "test");
+        if let Some(entry) = memory.entries.last_mut() {
+            entry.subject = Some("完全未知类目".to_string());
+        }
+        memory.flush().expect("persist baseline");
+
+        let reloaded = PersistentMemory::load_and_freeze(&path);
+        let mapped = reloaded
+            .entries()
+            .iter()
+            .find(|entry| entry.content.contains("PostgreSQL"))
+            .expect("mapped entry");
+        assert_eq!(mapped.subject.as_deref(), Some("database"));
+        assert_eq!(mapped.attribute.as_deref(), Some("primary"));
+        assert!(!mapped.orphan);
+
+        let orphan = reloaded
+            .entries()
+            .iter()
+            .find(|entry| entry.content.contains("未归类"))
+            .expect("orphan entry");
+        assert!(orphan.orphan);
+        assert_eq!(orphan.legacy_subject.as_deref(), Some("完全未知类目"));
+        assert_eq!(orphan.subject.as_deref(), Some("other"));
+
         let _ = std::fs::remove_file(&path);
     }
 

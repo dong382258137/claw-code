@@ -1268,6 +1268,20 @@ pub(crate) fn render_memory_report() -> Result<String, Box<dyn std::error::Error
             memory.retracted_subjects().len()
         ));
         lines.push(format!("  归档条目         {}", memory.archive().len()));
+        let orphans = memory.orphan_entries();
+        if !orphans.is_empty() {
+            lines.push(format!(
+                "  孤儿条目         {}（subject 不在词表，已标记待审阅）",
+                orphans.len()
+            ));
+            for entry in orphans {
+                lines.push(format!(
+                    "    ! {} -> {}",
+                    entry.legacy_subject.as_deref().unwrap_or("<unknown>"),
+                    entry.content.lines().next().unwrap_or("").trim()
+                ));
+            }
+        }
         let shadow = memory.shadow_entries();
         if !shadow.is_empty() {
             lines.push(format!(
